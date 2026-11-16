@@ -437,13 +437,6 @@ def check_readable(conn):
     conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
 
 
-def running_runs(conn):
-    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='runs'").fetchone():
-        return []
-    conn.row_factory = sqlite3.Row
-    return [dict(r) for r in conn.execute("SELECT * FROM runs WHERE status='running'")]
-
-
 def vacuum_into(conn, target):
     conn.execute("VACUUM INTO ?", (str(target),))
 

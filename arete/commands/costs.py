@@ -7,6 +7,7 @@ from collections import Counter
 
 from .. import config, paths
 from ..store import db as foundation
+from ..store import runs as run_store
 from .common import Parser, print_lines, print_table, steering
 
 
@@ -66,7 +67,7 @@ def cmd_hold(args) -> int:
 def cmd_costs(args) -> int:
     from pathlib import Path
 
-    from .. import control, record, state, util
+    from .. import control, record, util
 
     correct = getattr(args, "correct", None)
     backfill = getattr(args, "backfill", False)
@@ -90,7 +91,7 @@ def cmd_costs(args) -> int:
             values = json.loads(Path(before).read_text()) if before else None
             if before and not isinstance(values, dict):
                 raise ValueError("before must map run IDs to finite dollar amounts")
-            count = state.backfill_legacy_cost(values)
+            count = run_store.backfill_legacy_cost(values)
             print(f"backfilled {count} steps")
             return 0
     except (ValueError, OSError) as e:

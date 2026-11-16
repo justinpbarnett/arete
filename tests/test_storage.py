@@ -50,7 +50,7 @@ if mode == "kill":
 else:
     found = rows("killed")
     assert len(found) == 1 and found[0]["cost_usd"] == 2.5, found
-    assert state.run_get("killed")["cost_usd"] == 2.5
+    assert run_store.run_get("killed")["cost_usd"] == 2.5
     assert all(rows("killed") for m in marks("killed") if m.get("cost_usd"))
 ''', ("kill", "inspect"))
 

@@ -16,6 +16,7 @@ from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from arete.store import runs as run_store
 from arete import (
     child,
     cli,
@@ -98,7 +99,7 @@ class BudgetTests(Isolated):
         run = self.made_run()
         record.note(run.id, started=util.iso(util.now() - timedelta(minutes=90)))
         record.settle(run.id, "interrupted")
-        row = state.run_get(run.id)
+        row = run_store.run_get(run.id)
         saved = runlimits.metadata(run.id, "budget.json")
         saved["verification_active_since"] = row["started"]
         for field, read in (("run_seconds", runlimits.active_seconds),
@@ -192,7 +193,7 @@ class BudgetTests(Isolated):
     def delayed_start(self, concurrent, drive):
         before_lock, finished = threading.Event(), threading.Event()
         original_lock, failures = util.lock, []
-        ticket_lock = state.run_lock("pipeline", self.repo.name, self.ticket)
+        ticket_lock = run_store.run_lock("pipeline", self.repo.name, self.ticket)
         def worker():
             try:
                 if not before_lock.wait(5):
@@ -242,7 +243,7 @@ class BudgetTests(Isolated):
         def drive(flow):
             flow.ctx.run.agent("repair", "one repair too many", self.repo.path, role="review_repair")
         self.assertEqual(self.delayed_start(concurrent, drive), 1)
-        latest = state.ticket_runs(self.repo.name, self.ticket)[0]
+        latest = run_store.ticket_runs(self.repo.name, self.ticket)[0]
         self.assertIn("repair cycles", latest["summary"])
         self.assertTrue((paths.RUNS_DIR / latest["id"] / "parked.json").exists())
 
@@ -261,7 +262,7 @@ class BudgetTests(Isolated):
         def drive(flow):
             flow.ctx.run.agent("repair", "stale reset must not run", self.repo.path, role="review_repair")
         self.assertEqual(self.delayed_start(concurrent, drive), 2)
-        self.assertEqual(len(state.ticket_runs(self.repo.name, self.ticket)), 2)
+        self.assertEqual(len(run_store.ticket_runs(self.repo.name, self.ticket)), 2)
 
     def test_interrupted_atomic_publish_keeps_previous_authoritative_files(self):
         run = self.made_run()
@@ -309,7 +310,7 @@ class BudgetTests(Isolated):
             "STATE_DIR", "RUNS_DIR", "DB_FILE", "LOCKS_DIR", "CONFIG_DIR", "CONFIG_FILE", "LOG_DIR",
             "EVENTS_FILE", "WORKTREES_DIR")}
         code = (f"import sys;sys.path.insert(0,{str(Path(__file__).resolve().parents[1])!r});"
-                "from pathlib import Path;from arete import config,paths,pipeline,record,runlimits,tracker;"
+                "from pathlib import Path;from arete.store import runs as run_store; from arete import config,paths,pipeline,record,runlimits,tracker;"
                 f"overrides={overrides!r};"
                 "\nfor name,value in overrides.items():setattr(paths,name,Path(value))\n"
                 f"repo=config.Repo(name='fixture',path=Path({str(self.repo.path)!r}),tracker='local');"
@@ -343,7 +344,7 @@ class BudgetTests(Isolated):
             "EVENTS_FILE", "WORKTREES_DIR")}
         before = util.iso(util.now() - timedelta(minutes=21))
         code = (f"import os,sys;sys.path.insert(0,{str(Path(__file__).resolve().parents[1])!r});"
-                "from pathlib import Path;from arete import config,paths,pipeline,record,runlimits,tracker,util,run_lines;"
+                "from pathlib import Path;from arete.store import runs as run_store; from arete import config,paths,pipeline,record,runlimits,tracker,util,run_lines;"
                 f"overrides={overrides!r};"
                 "\nfor name,value in overrides.items():setattr(paths,name,Path(value))\n"
                 f"util.now=lambda:util.parse_iso({before!r});"
@@ -363,7 +364,7 @@ class BudgetTests(Isolated):
                               env={**{k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "TMPDIR")},
                                    "HOME": str(self.root)})
         self.assertEqual(done.returncode, 0, done.stderr)
-        previous = state.ticket_runs(self.repo.name, self.ticket)[0]
+        previous = run_store.ticket_runs(self.repo.name, self.ticket)[0]
         record.settle(previous["id"], "interrupted")
         next_run = self.made_run(previous["id"])
         with self.assertRaisesRegex(runlimits.Parked, "verification"):
@@ -520,7 +521,7 @@ class BudgetTests(Isolated):
         for invalid in (-1, float("nan"), "unknown"):
             util.write_json(path, {**original, "verification_seconds": invalid})
             with self.assertRaises(ValueError):
-                runlimits.verification_seconds(run.id, state.run_get(run.id))
+                runlimits.verification_seconds(run.id, run_store.run_get(run.id))
 
     def test_individual_step_reruns_cannot_reset_the_ticket_budget(self):
         first = self.made_run()
@@ -538,7 +539,7 @@ class BudgetTests(Isolated):
                 patch.object(pipeline.runner, "run", side_effect=lambda *a, **k: called.append(True)):
             self.assertEqual(pipeline.run_issue(self.repo.name, self.ticket, force=True,
                              script=pipeline.Script("feature", drive, continues=first.id)), 1)
-        latest = state.ticket_runs(self.repo.name, self.ticket)[0]
+        latest = run_store.ticket_runs(self.repo.name, self.ticket)[0]
         self.assertEqual(called, [])
         self.assertIn("repair cycles", latest["summary"])
         self.assertTrue((paths.RUNS_DIR / latest["id"] / "parked.json").exists())
@@ -562,7 +563,7 @@ class BudgetTests(Isolated):
                 patch.object(pipeline, "run_refusal", return_value=(True, "")):
             code = pipeline.run_issue(self.repo.name, self.ticket, force=force,
                                       script=pipeline.Script("feature", drive))
-        latest = state.ticket_runs(self.repo.name, self.ticket)[0]
+        latest = run_store.ticket_runs(self.repo.name, self.ticket)[0]
         directory = paths.RUNS_DIR / latest["id"]
         return code, latest, (directory / "run.log").read_text(), runlimits.metadata(latest["id"], "budget.json")
 
@@ -677,13 +678,13 @@ class BudgetTests(Isolated):
                 patch.object(runlimits.Policy, "of", return_value=runlimits.Policy(max_run_minutes=.05)), \
                 patch.object(pipeline.runner, "run", side_effect=transport):
             self.assertEqual(pipeline.run_issue(self.repo.name, self.ticket, force=True, script=script), 1)
-        row = state.ticket_runs(self.repo.name, self.ticket, whole=True)[0]
+        row = run_store.ticket_runs(self.repo.name, self.ticket, whole=True)[0]
         self.assertEqual(row["status"], "failed")
         self.assertIn("parked", row["summary"])
         self.assertEqual(owner.read_text(), "keep this work")
         self.assertTrue((paths.RUNS_DIR / row["id"] / "parked.json").is_file())
         self.assertTrue((paths.RUNS_DIR / row["id"] / "proof.json").is_file())
-        self.assertFalse(util.lock_is_held(state.run_lock("slot", self.repo.name, self.ticket)))
+        self.assertFalse(util.lock_is_held(run_store.run_lock("slot", self.repo.name, self.ticket)))
         self.assertEqual(state.task_get(self.ticket)["state"], "failed")
         self.assertTrue(pid_file.exists())
         with self.assertRaises(ProcessLookupError):
@@ -1142,7 +1143,7 @@ class RecordRetentionTests(Isolated):
         self.written("pip-a", 1)
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(cli.main(["record", "pin", "pip-a"]), 0)
-            self.assertEqual(state.record_pins(), {"pip-a"})
+            self.assertEqual(run_store.record_pins(), {"pip-a"})
             self.assertEqual(cli.main(["record", "pin", "nope"]), 1)
             self.assertEqual(cli.main(["record", "pin"]), 2)
             self.assertEqual(cli.main(["record", "unpin", "pip-a"]), 0)
@@ -1257,7 +1258,7 @@ class RouteABTests(Isolated):
                     patch.object(pipeline, "run_refusal", return_value=(True, "")), \
                     patch.object(pipeline.runner, "run", side_effect=call):
                 pipeline.run_issue(self.repo.name, tid, force=True, script=pipeline.Script("feature", drive))
-            return state.ticket_runs(self.repo.name, tid, limit=1, whole=True)[0]["id"]
+            return run_store.ticket_runs(self.repo.name, tid, limit=1, whole=True)[0]["id"]
 
         first = run_with(self.configured(), interrupted_call)
         removed = self.configured()
@@ -1265,8 +1266,8 @@ class RouteABTests(Isolated):
         second = run_with(removed, interrupted_call)
         self.assertEqual(models, ["haiku", "haiku"])
         self.assertNotEqual(first, second)
-        self.assertEqual(state.ab_held(second), state.ab_held(first))
-        self.assertEqual(state.ab_held(first)["plan"][:2], ("cheap-plan", "arm"))
+        self.assertEqual(run_store.ab_held(second), run_store.ab_held(first))
+        self.assertEqual(run_store.ab_held(first)["plan"][:2], ("cheap-plan", "arm"))
 
     def test_the_seam_envelope_carries_the_labels(self):
         found = factory.envelope([{"ab": "cheap-plan", "ab_side": "arm", "atom": "plan"}])

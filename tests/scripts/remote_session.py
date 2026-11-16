@@ -1,6 +1,7 @@
 
 import contextlib, json, os, shlex, shutil, subprocess, sys, urllib.request
 from pathlib import Path
+from arete.store import runs as run_store
 from arete import config, devices, gh, record, sessions, state, util
 root = Path(sys.argv[1])
 state.migrate()
@@ -146,7 +147,7 @@ print(json.dumps({"status": status, "hub": ref_in(hub), "tip": tip, "asked": ask
                   "fetched": saved.fetched, "held": saved.held, "controller_branch": ref_in(here),
                   "tree": git("ls-tree", "-r", "--name-only", tip, cwd=Path(spec.cwd)).split(), "calls": calls,
                   "pushes": pushes, "pushed": saved.pushed, "unreturned": saved.unreturned,
-                  "summary": state.run_get(spec.id)["summary"], "report": state.report(spec.id),
+                  "summary": run_store.run_get(spec.id)["summary"], "report": run_store.report(spec.id),
                   "pushes_when_asked": pushes_when_asked, "lease_exits": lease_exits,
                   "leaks": [str(f) for d in ("state", "logs") for f in (root / d).rglob("*")
                             if f.is_file() and VALUE.encode() in f.read_bytes()]}))

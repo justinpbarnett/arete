@@ -85,6 +85,7 @@ def step_events(run_id, steps, report=None):
 
 
 def seed_runs(instance):
+    from arete.store import runs as run_store
     from arete import paths, state
 
     ids = {}
@@ -110,10 +111,10 @@ def seed_runs(instance):
     feeding = alive()
     add_run(named("feed", "fix-feed"), kind="loop", status="running", minutes=4, pid=feeding.pid, loop="fixture-loop", summary="Watch the feed")
     for text in ("started the loop", "line one\nline two\nline three", "<script>alert(1)</script> is literal"):
-        state.add_feed("fix-feed", "note", text)
+        run_store.add_feed("fix-feed", "note", text)
     add_run(named("failed", "fix-failed"), status="failed", minutes=30, issue=13, summary="Break the build")
     step_events("fix-failed", [("prepare", 1, "pass", ""), ("build", 1, "fail", "AssertionError: tests failed")])
-    state.add_feed("fix-failed", "end", "failed: tests failed")
+    run_store.add_feed("fix-failed", "end", "failed: tests failed")
     add_run(named("waiting", "fix-waiting"), status="needs-info", minutes=20, issue=14, summary="Needs an answer")
     step_events("fix-waiting", [("prepare", 1, "pass", ""), ("plan", 1, "ask", "")])
     add_run(named("interrupted", "fix-interrupted"), status="interrupted", minutes=25, issue=15, summary="Cut short")
@@ -135,11 +136,12 @@ def seed_runs(instance):
 
 
 def watch(run_id, process):
+    from arete.store import runs as run_store
     from arete import record, state
 
     def settle():
         process.wait()
-        if row := state.run_get(run_id):
+        if row := run_store.run_get(run_id):
             record.interrupt(row)
 
     threading.Thread(target=settle, daemon=True).start()
@@ -165,6 +167,7 @@ def fault_for(control, target):
 
 
 def run_answer(handler, method, path, query):
+    from arete.store import runs as run_store
     from arete import control, dashboard, record, state, tasks
 
     server = handler.server
@@ -175,13 +178,13 @@ def run_answer(handler, method, path, query):
         data = handler.body()
         action = data.get("action")
         if action == "append-feed":
-            state.add_feed(server.ids["feed"], "note", str(data.get("text", "")))
+            run_store.add_feed(server.ids["feed"], "note", str(data.get("text", "")))
         elif action == "fault":
             with server.fixture_lock:
                 faults = {**server.run_control.get("faults", {}), str(data.get("target")): data}
                 server.run_control = {**server.run_control, "faults": faults}
         elif action == "settle-gone":
-            record.interrupt(state.run_get(data.get("id", server.ids["gone"])))
+            record.interrupt(run_store.run_get(data.get("id", server.ids["gone"])))
         elif action == "reset":
             with server.fixture_lock:
                 server.run_control = {}
@@ -207,7 +210,7 @@ def run_answer(handler, method, path, query):
         if fault["mode"] == "empty":
             return {"now": "", "runs": [], "more": False, "facets": {}}
     if (action := RUN_ACTION.fullmatch(path)) and method == "POST":
-        row = state.run_get(action[1])
+        row = run_store.run_get(action[1])
         if row and row["kind"] == "pipeline":
             if row["status"] == "running":
                 raise control.Refused(f"run {row['id']} is running; stop it first")

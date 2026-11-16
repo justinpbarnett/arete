@@ -1,7 +1,9 @@
 
 import json, os, runpy, shutil, subprocess, sys, time
 from pathlib import Path
+from arete.store import runs as run_store
 from arete import config, factory, gh, heartbeat, paths, pipeline, record, replay, sandbox, scratch, state, util, workspace
+from arete.store import runs as run_store
 from arete import ci
 root, scenario = Path(sys.argv[1]), sys.argv[2]
 state.migrate()
@@ -40,7 +42,7 @@ if scenario == "pr":
         factory.main(feature, ["replay-sample", task, "--force"])
     except SystemExit:
         pass
-    row = state.ticket_runs("replay-sample", task, whole=True)[0]
+    row = run_store.ticket_runs("replay-sample", task, whole=True)[0]
     log = (paths.RUNS_DIR / row["id"] / "run.log").read_text()
     result |= {"status": row["status"], "pr_url": row["pr_url"], "folder": (paths.WORKTREES_DIR / f"replay-sample-{task}").exists(),
                "records": records(), "registered": len(registered()), "kept": "workspace kept" in log, "log": log[-1500:]}
@@ -66,7 +68,7 @@ else:
     os.utime(a, (old, old))
     b_task, b, b_c, b_run = make("b", "arete/b")
     workspace.note_made(b, [b_c], owner(b_task, b_run, b))
-    held_lock = util.hold_lock(state.run_lock("pipeline", "replay-sample", b_task))
+    held_lock = util.hold_lock(run_store.run_lock("pipeline", "replay-sample", b_task))
     c_task, cw, c_c, c_run = make("c", "arete/c")
     record.settle(c_run, "merged", finished=util.iso())
     workspace.note_made(cw, [c_c], owner(c_task, c_run, cw))

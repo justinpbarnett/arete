@@ -3,6 +3,7 @@ import contextlib, io, json, sys
 from datetime import timedelta
 from pathlib import Path
 from unittest import mock
+from arete.store import runs as run_store
 from arete import config, jev, miner, paths, record, replay, state, util
 state.migrate()
 root, source = Path(sys.argv[1]), sys.argv[2]

@@ -1,3 +1,4 @@
+from arete.store import runs as run_store
 from arete.store import db as foundation
 
 rid = record.start("pipeline")
@@ -23,5 +24,5 @@ except sqlite3.OperationalError as e:
 finally:
     lock.rollback()
     lock.close()
-assert rows(rid) == [] and state.run_get(rid)["cost_usd"] == 0
+assert rows(rid) == [] and run_store.run_get(rid)["cost_usd"] == 0
 assert marks(rid)[0]["cost_usd"] == 2.5 and "cost is not in steps" in marks(rid)[0]["error"]

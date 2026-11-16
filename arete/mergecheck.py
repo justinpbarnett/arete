@@ -17,6 +17,7 @@ from pathlib import Path
 from . import config, environment, factory, loops, paths, record, state, tracker, util, workspace
 from .lab import verifier_suites
 from .pipeline import AgentRun, TicketWork, use_product
+from .store import runs as run_store
 
 PR = re.compile(r"https://github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)", re.IGNORECASE)
 CHECK = re.compile(r"^- \*\*(?:Passed|Failed(?: \(environment\))?)\*\*:\s*(.+)$")
@@ -39,7 +40,7 @@ def builtin(loop: loops.Loop) -> bool:
 def merged(cfg: config.Config) -> list[dict]:
     repos = {r.name: r for r in cfg.repos if r.pipeline}
     found: dict[str, dict] = {}
-    for row in state.merged_runs():
+    for row in run_store.merged_runs():
         if row["repo"] not in repos or not row.get("finished"):
             continue
         for match in PR.finditer(row["pr_url"]):

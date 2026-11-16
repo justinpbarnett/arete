@@ -40,6 +40,7 @@ from . import (
 from .agent import Result
 from .loops import Loop
 from .store import db as foundation
+from .store import runs as run_store
 
 KNOWN_FINDINGS_SHOWN = 30
 KNOWN_FINDINGS_ASKED = 200
@@ -128,7 +129,7 @@ class LoopRun:
 
     def log(self, kind: str, text: str) -> None:
         self.write_log(text)
-        state.add_feed(self.id, kind, text)
+        run_store.add_feed(self.id, kind, text)
 
     def write_log(self, text: str) -> None:
         self.log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -322,19 +323,19 @@ def launch(name: str, *, item: int | None = None, events: list[dict] | None = No
            detach: bool = True, run_id: str = "", cfg: config.Config | None = None) -> dict:
     cfg = cfg or config.load()
     loop = control.working_loop(name, cfg)
-    with util.lock_file(state.loop_lock(loop.name)) as held:
+    with util.lock_file(run_store.loop_lock(loop.name)) as held:
         if not util.take_lock(held, wait=False):
             raise control.Busy(loop.name)
         fire = state.queue_item(item) if item is not None else None
         if item is not None and (not fire or fire["run_id"] is not None):
             raise control.NotFound(f"queue item {item} is gone or already claimed")
-        for stale in state.runs_marked_running():
+        for stale in run_store.runs_marked_running():
             if stale["kind"] == "loop" and stale["loop"] == loop.name:
                 record.interrupt(stale)
         run = LoopRun(loop, run_id or record.new_id(loop.name), cfg, trial=trial,
                       trigger="try" if trial else (fire["trigger"] if fire else "manual"),
                       events=list(events or (fire["payload"] if fire else [])))
-        record.start("loop", run_id=run.id, lock=state.loop_lock(loop.name), pid=None if detach else os.getpid(),
+        record.start("loop", run_id=run.id, lock=run_store.loop_lock(loop.name), pid=None if detach else os.getpid(),
                      repo=loop.repo or None, loop=loop.name, loop_kind=loop.kind, trigger=run.trigger,
                      device=loop.device, queue=loop.queue_name, grp=fire["grp"] if fire else "",
                      log=paths.short_path(run.log_file), model=loop.model_for(cfg) if loop.agent else "",
@@ -347,7 +348,7 @@ def launch(name: str, *, item: int | None = None, events: list[dict] | None = No
             util.write_json(run.events_file, run.events)
         if not detach:
             carry(run)
-            return state.run_get(run.id)
+            return run_store.run_get(run.id)
         proc = control.detach(["loop", "exec", "--run-id", run.id], keep=(held.fileno(),))
         util.mark_holder(held, proc.pid)
     return began(run, proc)
@@ -357,7 +358,7 @@ def began(run: LoopRun, proc: subprocess.Popen) -> dict:
     deadline = time.monotonic() + START_WAIT_SECONDS
     while time.monotonic() < deadline:
         exited = proc.poll() is not None
-        r = state.run_get(run.id)
+        r = run_store.run_get(run.id)
         if r["pid"] or r["status"] != "running":
             return r
         if exited:
@@ -366,11 +367,11 @@ def began(run: LoopRun, proc: subprocess.Popen) -> dict:
             settle(run, "failed", why)
             raise NeverBegan(why)
         time.sleep(0.1)
-    return state.run_get(run.id)
+    return run_store.run_get(run.id)
 
 
 def carry_opened(run_id: str) -> str:
-    r = state.run_get(run_id)
+    r = run_store.run_get(run_id)
     if not r or r["kind"] != "loop" or r["status"] != "running":
         raise control.NotFound(f"no loop run {run_id} waits to begin")
     cfg = config.load()
@@ -420,9 +421,9 @@ def feed_output(run: LoopRun):
             return
         shown += 1
         if shown <= FEED_OUTPUT_LINES:
-            state.add_feed(run.id, "out", line[:FEED_LINE_CHARS])
+            run_store.add_feed(run.id, "out", line[:FEED_LINE_CHARS])
         elif shown == FEED_OUTPUT_LINES + 1:
-            state.add_feed(run.id, "out", f"the rest is in {paths.short_path(run.log_file)}")
+            run_store.add_feed(run.id, "out", f"the rest is in {paths.short_path(run.log_file)}")
     return show
 
 
@@ -893,7 +894,7 @@ def narrowing_goal(goal: str, ws: Workspace, holds: dict[str, str], proof_name: 
 
 
 def landed_fixes(run: LoopRun, ws: Workspace, found: list[dict]) -> list[tuple[str, str]]:
-    starts = [util.parse_iso(r["started"]).timestamp() for f in found if (r := state.run_get(f.get("from_run") or ""))]
+    starts = [util.parse_iso(r["started"]).timestamp() for f in found if (r := run_store.run_get(f.get("from_run") or ""))]
     if not starts:
         return []
     log = util.git(["log", "--no-merges", "--format=%H %ct %s", "-n", str(COMMITS_READ), ws.start], ws.wt, check=False)

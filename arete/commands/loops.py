@@ -6,6 +6,7 @@ import json
 import sys
 
 from .. import config, paths
+from ..store import runs as run_store
 from .common import Parser, follow, loop_line, print_feed_line, print_table, serve_line, when
 
 
@@ -34,12 +35,12 @@ def events_from_file(file: str) -> list[dict] | None:
 
 
 def latest_run(name_or_run: str) -> str:
-    from .. import control, state
+    from .. import control
 
-    if state.run_get(name_or_run):
+    if run_store.run_get(name_or_run):
         return name_or_run
     loop = control.find_loop(name_or_run)
-    last = next(iter(state.runs(kind="loop", loop=loop.name, limit=1, firings=True)), None)
+    last = next(iter(run_store.runs(kind="loop", loop=loop.name, limit=1, firings=True)), None)
     if not last:
         raise control.NotFound(f"{loop.name} has not run yet")
     return last["id"]
@@ -137,12 +138,12 @@ def loop_start(args) -> int:
 
 @loop_errors
 def loop_stop(args) -> int:
-    from .. import control, state
+    from .. import control
 
     target = args.name
-    if not state.run_get(target):
+    if not run_store.run_get(target):
         loop = control.find_loop(target)
-        running = [r for r in state.runs_marked_running() if r["kind"] == "loop" and r["loop"] == loop.name]
+        running = [r for r in run_store.runs_marked_running() if r["kind"] == "loop" and r["loop"] == loop.name]
         if not running:
             raise control.Refused(f"{target} has no run going")
         target = running[0]["id"]
@@ -187,15 +188,13 @@ def loop_status(args) -> int:
 
 @loop_errors
 def loop_feed(args) -> int:
-    from .. import state
-
     run_id = latest_run(args.name)
-    r = state.run_get(run_id)
+    r = run_store.run_get(run_id)
     print(f"{run_id} {r['status']} {r.get('loop') or r['kind']}")
     if args.follow:
         follow(run_id)
     else:
-        for line in state.feed(run_id):
+        for line in run_store.feed(run_id):
             print_feed_line(line)
     return 0
 

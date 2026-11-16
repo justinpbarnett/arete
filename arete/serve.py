@@ -47,6 +47,7 @@ from . import (
 )
 from .loops import Loop
 from .store import db as foundation
+from .store import runs as run_store
 
 TICK_SECONDS = 20
 PRUNE_SECONDS = 3600
@@ -575,7 +576,7 @@ class Server:
             return self.say
 
         def log(text: str) -> None:
-            state.add_feed(run_id, "device", f"arete serve: {text}")
+            run_store.add_feed(run_id, "device", f"arete serve: {text}")
             self.say(f"{run_id}: {text}")
         return log
 
@@ -596,7 +597,7 @@ class Server:
             self.say(f"{sid}: {util.count(len(found), 'new event')}, {util.count(len(items), 'queue item')}")
 
     def dispatch(self, by_name: dict[str, Loop]) -> None:
-        slots = QueueSlots(state.runs_marked_running())
+        slots = QueueSlots(run_store.runs_marked_running())
         pending = state.pending()
         ids = {item["id"] for item in pending}
         self.waiting = {i: why for i, why in self.waiting.items() if i in ids}
@@ -776,7 +777,7 @@ class Server:
         except Exception:
             pending = None
         try:
-            running = sum(r["kind"] == "loop" for r in state.runs_marked_running())
+            running = sum(r["kind"] == "loop" for r in run_store.runs_marked_running())
         except Exception:
             running = None
         util.write_json(control.BEAT_FILE, {

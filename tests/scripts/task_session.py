@@ -1,6 +1,7 @@
 
 import json, subprocess, sys
 from pathlib import Path
+from arete.store import runs as run_store
 from arete import config, devices, gh, record, replay, sessions, state
 root, scenario = Path(sys.argv[1]), sys.argv[2]
 state.migrate()
@@ -95,9 +96,9 @@ origin = root / "sample" / "origin.git"
 def origin_git(*args):
     return subprocess.run(["git", "--git-dir", str(origin), *args], capture_output=True, text=True).stdout.strip()
 log = (root / "state" / "sessions" / spec.id / "session.log").read_text()
-print(json.dumps({"status": status, "report": state.report(spec.id), "row": state.run_get(spec.id), "id": spec.id,
+print(json.dumps({"status": status, "report": run_store.report(spec.id), "row": run_store.run_get(spec.id), "id": spec.id,
                   "origin": origin_git("rev-parse", "--verify", "-q", f"refs/heads/session/{spec.id}"),
                   "files": origin_git("ls-tree", "-r", "--name-only", f"session/{spec.id}").split(),
                   "log_tail": log.strip().splitlines()[-1], "made": len(made), "looked": len(looked),
-                  "report_steps": [s for s in state.steps(spec.id) if s["step"] == "report"], "strangers": strangers,
+                  "report_steps": [s for s in run_store.steps(spec.id) if s["step"] == "report"], "strangers": strangers,
                   "told": told}))

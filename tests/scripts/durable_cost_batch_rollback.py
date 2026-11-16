@@ -1,3 +1,4 @@
+from arete.store import runs as run_store
 
 def batch(*a, **kw):
     return agent.Result(ok=True, calls=[
@@ -9,7 +10,7 @@ attempt(rid)
 found = rows(rid)
 assert [(r["seconds"], r["auth_mode"]) for r in found] == [(1.25, "api_key"), (2.75, "subscription")], found
 assert [r["try"] for r in found] == [1, 2]
-assert state.run_get(rid)["cost_usd"] == marks(rid)[0]["cost_usd"] == 2.5
+assert run_store.run_get(rid)["cost_usd"] == marks(rid)[0]["cost_usd"] == 2.5
 rid = record.start("pipeline")
 with state.db() as c:
     c.execute("CREATE TRIGGER reject_second BEFORE INSERT ON steps WHEN NEW.cost_usd = 1.5 "
@@ -19,5 +20,5 @@ try:
     raise AssertionError("batch should fail")
 except sqlite3.IntegrityError:
     pass
-assert rows(rid) == [] and state.run_get(rid)["cost_usd"] == 0
+assert rows(rid) == [] and run_store.run_get(rid)["cost_usd"] == 0
 assert marks(rid)[0]["cost_usd"] == 2.5 and "cost is not in steps" in marks(rid)[0]["error"]
