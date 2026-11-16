@@ -356,6 +356,9 @@ class Flow:
         line = self.earlier[self.at] if self.at < len(self.earlier) else {}
         if line.get("step") != name or not self.takable(line):
             return None
+        accepts = getattr(self.ctx, "accepts", None)
+        if accepts is not None and not accepts(name, outcome_of(line), kw):
+            return None
         if (self.only or self.again) and line.get("tree") and not os.path.isdir(line["tree"]):
             why = self.ctx.restore(line)
             if why or not os.path.isdir(line["tree"]):

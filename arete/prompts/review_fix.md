@@ -13,8 +13,10 @@ The reviewer also left notes. Fix a note only when the fix is small and inside t
 
 $notes
 
-After your last edit, rerun every check that edit could affect, in the foreground, and read its output as well as its
-exit code. Name in your summary any check you did not rerun and why.
+Use a focused reproduction when it helps establish that a blocker is fixed, and read its output and exit code.
+Arete runs targeted checks after each repair and the full repository suite on the final tree before publication.
+Do not duplicate the full suite in this repair step.
+Name exactly what you ran and any environmental limitation; never report an unrun check as passed.
 
 Do not expand scope beyond the issue. End with one line per blocker id: `B1 fixed: how` or `B1 left open: why`. The
 next reviewer reads it.

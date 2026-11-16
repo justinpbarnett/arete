@@ -9,7 +9,9 @@ date matters: a check that passed on the base weeks ago may fail there now. Comp
 changes: $diff. Run each command on its own, with no pipe or `&&`, since Bash allows only the listed commands.
 
 - Caused by the PR, in a round before round $max_rounds: fix the cause in the code. Do not weaken, skip, or delete
-  tests, and do not change the CI setup. Run the checks yourself before you finish: $checks.
+  tests, and do not change the CI setup.
+  Arete runs the full check gate after you finish: $checks.
+  Do not duplicate the full suite here; use a focused reproduction when helpful and report its real result.
 - Caused by the PR, in round $max_rounds: change nothing. This is the last round, so arete will not push again. It
   fails the run and turns the PRs to drafts for a person to pick up.
 - Not caused by the PR: change nothing for that check.

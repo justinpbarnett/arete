@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
@@ -12,6 +14,7 @@ from . import (
     factory,
     gh,
     owner_asks,
+    patching,
     paths,
     pipeline,
     prompt_loader,
@@ -39,7 +42,7 @@ REVIEW_FIX = "review_fix"
 CHECK_REPAIR = "check_repair"
 REVIEW_REPAIR = "review_repair"
 CI_REPAIR = "ci_repair"
-ROLE_OF = {"plan": "plan", "implement": BUILD, "revise": BUILD, "repair": BUILD, "verify": "verify", "review": "review", "learn": "learn",
+ROLE_OF = {"plan": "plan", "patch": BUILD, "implement": BUILD, "revise": BUILD, "repair": BUILD, "verify": "verify", "review": "review", "learn": "learn",
            "document": "document"}
 SETTABLE = {**ROLE_OF, CHECK_REPAIR: CHECK_REPAIR, REVIEW_REPAIR: REVIEW_REPAIR, CI_REPAIR: CI_REPAIR}
 
@@ -293,6 +296,14 @@ class Job:
     only: str = ""
     noted: bool = False
     moved_base: str = ""
+    patch_mode: bool = False
+
+    @property
+    def held_reason(self) -> str:
+        if self.verified.verdict == "blocked" and (self.patch_mode or patching.specification_refusal(self.ticket)
+                or patching.sensitive_files(self.layer.patch, self.b.staged.files)):
+            return "the check in use was blocked; this change requires behavioral evidence"
+        return pipeline.draft_reason(self.review, self.verified, self.reviews)
 
     def merge_moved_base(self, name: str) -> None:
         moved, self.moved_base = self.moved_base, ""
@@ -360,9 +371,24 @@ class Job:
             raise workspace.RunFailed(why)
         return why
 
+    def policy(self, name: str, kw: dict) -> str:
+        if name == "checks":
+            value = (self.layer.checks, self.layer.quick_checks, self.layer.targeted_checks, bool(kw.get("quick")))
+        elif name == "verify":
+            value = (asdict(self.layer.verify) if self.layer.verify else None, self.goal, self.left_for_a_person)
+        else:
+            return ""
+        return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+    def accepts(self, name: str, outcome: Outcome, kw: dict) -> bool:
+        if (expected := self.policy(name, kw)) and outcome.data.get("policy") != expected:
+            self.run.log(f"{name}: stored evidence used a different policy; rerunning is required")
+            return False
+        return True
+
     def keeps(self, name: str, kw: dict) -> bool:
         return any(c.onto for c in self.checkouts) and (
-            name in ("plan", "revise", "repair") or name == "implement" and kw.get("round") == BUILD)
+            name in ("plan", "patch", "revise", "repair") or name == "implement" and kw.get("round") == BUILD)
 
     def labels(self, name: str, kw: dict | None = None) -> dict:
         atom = atom_of(name, kw or {})
@@ -388,9 +414,17 @@ class Job:
             run.story = list(data["story"])
         if name == "prepare" and outcome.passed:
             self.prepared(data, stored)
-        elif name == "plan" and outcome.passed:
+        elif name in ("plan", "patch") and outcome.passed:
+            self.patch_mode = name == "patch" and not data.get("escalate")
             self.plan_text, self.goal, self.estimate = data["plan"], data["goal"], data["estimate"]
             self.left_for_a_person = data["left_for_a_person"]
+            if name == "patch":
+                self.build_summary = data.get("summary", "")
+                if outcome.session.id:
+                    run.sessions[BUILD] = outcome.session
+            if self.built is not None:
+                self.built.plan_text = self.plan_text
+                self.built.build_summary = self.build_summary
         elif name in ("revise", "repair") and outcome.passed:
             self.plan_text, self.goal, self.estimate = data["plan"], data["goal"], 0
             self.left_for_a_person, self.build_summary, self.replies = (data["left_for_a_person"], data["summary"],
@@ -405,12 +439,17 @@ class Job:
                 run.sessions[BUILD] = outcome.session
         elif name == "checks" and "report" in data:
             self.b.report = data["report"]
+            if outcome.passed and data.get("full"):
+                self.b.checked = {"tree": str(data.get("checked_tree") or ""), "commands": data.get("commands", {}),
+                                  "report": data["report"]}
             if not data.get("after"):
                 self.attempts = data["attempts"]
                 if stored:
                     record.note(run.id, attempts=self.attempts)
         elif name == "verify" and outcome.passed:
             self.verified = Verified.stored(data["verified"])
+            if "checked" in data:
+                self.b.checked = data["checked"]
             self.b.steps = Counter(data["names"])
         elif name == "review" and "review" in data:
             self.review, self.reviews = Review.stored(data["review"]), data.get("attempt", 0)
@@ -663,6 +702,33 @@ def plan(flow: factory.Flow) -> Outcome:
         "assumptions": pipeline.assumptions_of(found)})
 
 
+@factory.step("patch")
+def patch(flow: factory.Flow, tree: str) -> Outcome:
+    job: Job = flow.ctx
+    policy = job.layer.patch
+    res = job.run.agent(BUILD, job.brief.prompt(
+        "patch", patch_files=policy.max_files, patch_lines=min(policy.max_lines, job.layer.max_diff_lines),
+        denied=prompt_loader.code_list(diffguard.denied_paths(job.layer))), job.ws, role=BUILD,
+        allowed_tools=prompt_loader.bash_rules(job.builder_bash), disallowed_tools=routing.NO_GIT_WRITES,
+        json_schema=patching.SCHEMA)
+    if not res.ok or not isinstance(res.structured, dict):
+        return end_as("fail", "failed", why="patch step failed", said=res.text)
+    said = res.structured
+    staged = pipeline.stage(job.checkouts, diffguard.denied_paths(job.layer))
+    why = (str(said.get("reason") or "the builder requested a full plan") if said.get("needs_feature") else
+           patching.change_refusal(policy, staged.files, staged.lines))
+    if not why and staged.empty:
+        return end_as("stop", "nothing", summary=str(said.get("summary") or "No patch was needed."))
+    if why:
+        job.run.log(f"patch: escalating to the feature flow: {why}")
+    return Outcome("pass", data={
+        "plan": str(said.get("plan") or "Implement the repair specified by the issue."),
+        "goal": str(said.get("verify") or "Check the issue's acceptance criteria and one nearby behavior."),
+        "estimate": min(policy.max_lines, job.layer.max_diff_lines), "left_for_a_person": "",
+        "summary": str(said.get("summary") or res.text), "escalate": why,
+    }, session=job.run.sessions.get(BUILD, NO_SESSION))
+
+
 @factory.step("revise")
 def revision(flow: factory.Flow, tree: str) -> Outcome:
     job: Job = flow.ctx
@@ -766,10 +832,11 @@ def build(job: Job) -> Outcome:
 
 
 @factory.step("checks")
-def checks(flow: factory.Flow, tree: str, attempt: int = 1, tries: int = 1, after: str = "") -> Outcome:
+def checks(flow: factory.Flow, tree: str, attempt: int = 1, tries: int = 1, after: str = "",
+           quick: bool = False) -> Outcome:
     job: Job = flow.ctx
     run, b = job.run, job.b
-    ok = b.check()
+    ok = b.check(quick=True) if quick else b.check()
     if not after:
         run.save("checks.md", b.report)
         record.note(run.id, attempts=attempt)
@@ -778,10 +845,16 @@ def checks(flow: factory.Flow, tree: str, attempt: int = 1, tries: int = 1, afte
             run.story.append(f"Checks failed on attempt {attempt}:\n{util.tail(b.report, 2500)}" if attempt < tries
                              else "Checks still failing after the last attempt.")
         return Outcome("fail", next="implement", feedback=b.report,
-                       data={"report": b.report, "attempts": attempt, "after": after, "story": run.story})
+                       data={"report": b.report, "attempts": attempt, "after": after, "story": run.story,
+                             "policy": job.policy("checks", {"quick": quick})})
     planned = f" (the plan estimated {job.estimate})" if job.estimate and not after else ""
     b.require_valid_diff(after or "the build and its fixes", planned)
-    return Outcome("pass", data={"report": b.report, "attempts": attempt, "after": after, "story": run.story})
+    checked_tree = factory.fingerprint(job.ws)
+    full = (b.checked.get("tree") == checked_tree and b.checked.get("commands") == job.layer.checks
+            and b.checked.get("report") == b.report)
+    return Outcome("pass", data={"report": b.report, "attempts": attempt, "after": after, "story": run.story,
+                                 "full": full, "checked_tree": checked_tree,
+                                 "commands": job.layer.checks, "policy": job.policy("checks", {"quick": quick})})
 
 
 @factory.step("verify")
@@ -789,7 +862,8 @@ def verify(flow: factory.Flow, tree: str) -> Outcome:
     job: Job = flow.ctx
     b = job.staged()
     verified = pipeline.verify_in_use(b, job.with_left(job.goal), job.build_summary)
-    return Outcome("pass", data={"verified": asdict(verified), "names": dict(b.steps), "story": job.run.story})
+    return Outcome("pass", data={"verified": asdict(verified), "names": dict(b.steps), "story": job.run.story,
+                                 "policy": job.policy("verify", {}), "checked": b.checked})
 
 
 @factory.step("review")
@@ -827,7 +901,7 @@ def write_document(flow: factory.Flow, tree: str) -> Outcome:
     staged = job.staged().staged
     size = pipeline.change_size(staged)
     text = document.pr_text(job.run, job.ticket, pipeline.summary_of(job.review, job.build_summary), job.review,
-                            job.verified, size, pipeline.draft_reason(job.review, job.verified, job.reviews),
+                            job.verified, size, job.held_reason,
                             job.cfg, job.layer)
     return Outcome("pass", data={"text": text})
 
@@ -899,7 +973,7 @@ def publish_branch(job: Job, fresh, staged, unpushed):
         b.committed_lines = max(b.committed_lines, staged.lines)
     committed = not fresh.empty or bool(unpushed)
     subject = prompt_loader.fill_template(job.layer.subject, config.RepoLayer.subject, kind=t.kind, id=t.id, title=t.title)
-    draft_why = pipeline.draft_reason(job.review, job.verified, job.reviews)
+    draft_why = job.held_reason
     revised = ("Revised for the review feedback on the PR.\n\n" if run.feedback else
                f"Repairs the review findings of run {run.repairs}.\n\n" if run.repairs else "")
     if not fresh.empty:
@@ -1091,7 +1165,7 @@ def end_dry_run(flow: factory.Flow) -> tuple[str, str, str]:
     staged, size, outcome_text = change(job)
     job.run.save("diff.patch", staged.patch)
     job.run.save("pr_body.md", gh.outgoing(report(
-        job, size, {}, pipeline.draft_reason(job.review, job.verified, job.reviews))))
+        job, size, {}, job.held_reason)))
     return finish(flow, "dry-run", summary=outcome_text)
 
 

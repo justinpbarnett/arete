@@ -926,12 +926,14 @@ The order of an adw run's steps lives in short scripts in `adws/` at the top of 
 | script | holds |
 |---|---|
 | `adws/feature.py` | The feature flow: `prepare`, `plan`, `implement`, the `checks` and fix loop, `verify`, `review` and the review fix, `learn`, `document` when on, then `pr`, `ci` and `publish`. |
+| `adws/patch.py` | The small-patch flow: `prepare`, direct implementation, targeted checks, independent review, final full checks and focused verification, then the usual publication steps; escalates to the feature flow when needed. |
 | `adws/revise.py` | The revise flow: the same order with `revise` in place of `plan` and `implement`. |
 | `adws/repair.py` | The repair flow: the same order with `repair` in place of `plan` and `implement`, on the branch of an open held PR. |
 | `adws/step.py` | Runs one step of an earlier run alone. |
 
 ```
 python adws/feature.py <repo> <ticket> [--force] [--dry-run] [--continue RUN] [--from STEP] [--only STEP] [--set step.key=value ...]
+python adws/patch.py   <repo> <ticket> [same options]
 python adws/revise.py  <repo> <ticket> [same options]
 python adws/repair.py  <repo> <ticket> --repair RUN [--force] [--set step.key=value ...]
 python adws/step.py    <run id> <step> [key=value ...]
@@ -949,6 +951,82 @@ Run them with the Python that has arete installed (`uv run python adws/feature.p
 `arete run` on a repo whose layer sets `[factory] path = "adw"` replaces itself with `adws/revise.py` when the ticket has review feedback due and `adws/feature.py` otherwise, run by the same Python. The poller, and a skipped ticket run from the dashboard, start runs the same way; `pipeline.run_command(repo, ticket)` returns the command they use. Every other repo starts `arete run` as before.
 
 To change a flow, copy `adws/` to a folder of your own, edit the scripts there and set `[factory] adws = "<folder>"` in `~/.config/arete/config.toml` (a relative folder counts from the config's folder). A script defines a function named after its file (`feature` in `feature.py`), which takes the run's `factory.Flow`. When the folder or the script is missing, the run fails before it starts with `adws folder <folder> does not exist` or `no adw script <file>`.
+
+### Throughput without weaker final gates
+
+The feature script takes the patch path for tickets labeled `patch`; running `adws/patch.py` requests it explicitly.
+The default budget is five files, 200 changed lines and two review attempts, still subject to the repo's tighter limits and cumulative run budgets.
+The builder implements directly from the ticket and returns its short approach and focused acceptance checks, without a separate planner call.
+Ambiguous requirements, architectural work, sensitive ticket content, sensitive changed paths, an oversized diff or a review that does not converge escalate to the full feature flow.
+Auth, secrets, permissions, storage, migrations, financial operations and confinement remain outside this shortcut.
+No ticket labels, dependencies or live settings are rewritten to opt work into it.
+
+```toml
+[factory.patch]
+labels = ["patch"]
+max_files = 5
+max_lines = 200
+review_tries = 2
+sensitive = ["src/payroll/*"]
+```
+
+Custom sensitive patterns add to the built-in exclusions rather than replacing them.
+An empty `labels` list disables automatic selection; the explicit script still performs the same risk and scope checks.
+
+Checks run cheap commands first, even when `[checks]` lists the behavior suite first.
+The default quick names, in order, are `lint`, `format`, `compile`, `imports`, `web` and `types`; absent names are ignored.
+A cheap failure prevents the expensive group from starting.
+For repos that explicitly permit parallel checks, cheap checks need no machine-wide behavior-suite lane; serialized repos retain their existing per-repo lock for both groups.
+Run slots and the machine's check-lane limit are unchanged.
+
+Patch builds and intermediate ADW review repairs run the quick checks plus any checks selected by changed-file patterns.
+When no quick or targeted check applies, they fall back to the full suite.
+Feature builds still run the full suite before their initial verification and review.
+A passing full suite is required on the final tree, and a repair made during that last gate gets an independent review.
+An unchanged tree with the same configured commands can reuse its full pass within the flow; a different tree cannot.
+Resumed runs invalidate stored check and verification evidence when the relevant layer policy changes.
+Verification repairs are also checked and independently reviewed before publication.
+Builder and repair prompts leave the full-suite gate to Arete instead of asking the model to duplicate it.
+
+```toml
+[check_policy]
+quick = ["lint", "compile", "imports", "web"]
+
+[check_policy.targeted]
+"arete/tracker.py" = ["tracker-smoke"]
+"arete/poll.py" = ["poll-smoke"]
+```
+
+Every explicitly named check must exist in `[checks]`.
+Targeted passes are marked as partial evidence, not as a successful full suite.
+
+For disposable-fixture commands that the agent's irreversible-action classifier cannot authorize, an owner can configure named product probes separately from prerequisite preflight checks:
+
+```toml
+[verify]
+probe_seconds = 120
+allow_patch_gaps = false
+
+[verify.probes]
+fixture = ".venv/bin/python -I tools/fixture.py --root '{scratch}' smoke"
+```
+
+Only owner-configured commands take this route; agent-generated commands still use the normal guard.
+Probes run under the existing trusted-scratch service confinement, without credential environment variables, and refuse to run when that confinement is unavailable.
+They share one time budget, capped at 300 seconds, and save their observed command, exit and output in the run directory.
+A failed product assertion remains a verification failure; an unavailable runtime or confinement is blocked without another model call for that attempt.
+Successful probe evidence is given to the verifier so it checks uncovered acceptance criteria instead of repeating those commands.
+Fixture cleanup and retained-resource holds remain authoritative.
+
+Patch verification gaps stay blocking by default.
+An owner may explicitly set `allow_patch_gaps = true` for otherwise eligible patches, but only finished, environment-caused failures qualify.
+Guard refusals, missing credentials, probe failures, confinement problems, unresolved resources and sensitive changes do not qualify.
+A permitted gap is reported as unverified, never as a pass.
+Sensitive ADW changes also remain held when behavioral verification is blocked.
+
+The poller orders new candidates by the longest remaining downstream dependency chain, then by the number of downstream tickets, then by age.
+It uses queued ticket bodies and existing `Waits on` declarations without extra per-ticket API fetches for ranking.
+Approval, dependency, running-ticket and capacity checks still decide whether a candidate can start, and the existing cross-repo scheduling remains in place.
 
 ## Layout
 
