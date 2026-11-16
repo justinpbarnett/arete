@@ -760,12 +760,13 @@ Hook events rotate monthly from `events.jsonl` into `events-YYYYMM.jsonl`, named
 
 Each immutable migration lives in `arete/store/migrations/mNNNN_area_name.py`, with `PHASE` and exactly one `SQL` string or `apply(conn)`. Areas come from public store modules declaring literal `TABLES` dictionaries; `foundation` maps to `db`. Helpers and packages are not owners, and `outbox` is refused until its owner exists. Only the historical `m0004_work_event_routing.py` resolves `work` to `loops`; existing ledger rows stay unchanged. Numbers start at 1 without gaps or repeats. `latest.txt` names the highest file, so branches adding the same next number conflict there. The loader refuses a changed SHA-256 for any applied file. Add a new migration to repair an earlier one.
 
-Import connections with `from arete.store import db` and persistence functions through their owner modules. Runs owns recording SQL, history, billing readers, reports, feed, pins and folder-purge scheduling; `record.py` keeps IDs, timelines and filesystem cleanup. Loops owns queue recovery, events, loop state, findings and loop locking. Sources owns seen keys, cursors, source ownership and passed-over tickets. Incidents owns incidents, notes, aliases, repairs and alerts. `oncall.commit_scan` coordinates incident and cursor writes on one connection. `store.prune` calls runs, loops and incidents in order on one connection, after the server's checked backup. `state.py` temporarily exports moved names while the remaining aggregates move. The relocated numbered migrations and `latest.txt` retain their original bytes.
+Import connections with `from arete.store import db` and persistence functions through their owner modules. Runs owns recording SQL, history, billing readers, reports, feed, pins and folder-purge scheduling; `record.py` keeps IDs, timelines and filesystem cleanup. Loops owns queue recovery, events, loop state, findings and loop locking. Sources owns seen keys, cursors, source ownership and passed-over tickets. Incidents owns incidents, notes, aliases, repairs and alerts. Approvals owns approvals, proposals and mined results; chats owns chats, messages and linked sessions; tasks owns tasks and comments; triage owns current rows and triage approvals; devices owns VMs, probes and holds; insights owns usage, research, evals, feedback, verdicts and captures with their checks and evidence; asks owns owner asks and run messages; push owns subscriptions. The private `_rows` encoding helper is excluded from migration owners. Approval settlement updates verdicts through insights on the approval transaction's connection. `oncall.commit_scan` coordinates incident and cursor writes on one connection. `store.prune` calls runs, loops and incidents in order on one connection, after the server's checked backup. `state.py` explicitly exports compatibility names until consumers switch to their owners. The relocated numbered migrations and `latest.txt` retain their original bytes.
 
 The isolated persistence probes print exact inventories and rollback evidence as `BEHAVIOR_RESULT` JSON:
 
 ```sh
 python -I tests/scripts/store_contract.py ownership
+python -I tests/scripts/store_contract.py aggregate-joins
 python -I tests/scripts/store_contract.py run-retention
 python -I tests/scripts/store_contract.py scan-atomicity
 python -I tests/scripts/store_contract.py server-prune
@@ -779,6 +780,7 @@ The isolated foundation contract probes generate configuration with `replay.samp
 
 ```sh
 python tests/scripts/store_contract.py ownership
+python tests/scripts/store_contract.py aggregate-joins
 python tests/scripts/store_contract.py unknown-area
 python tests/scripts/store_contract.py upgrade
 python tests/scripts/store_contract.py record-readers

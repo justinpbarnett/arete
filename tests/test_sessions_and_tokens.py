@@ -153,7 +153,7 @@ class RemoteSessionTests(unittest.TestCase):
         self.assertIn("device went away", out["unreturned"])
         self.assertIn("did not come back", out["summary"])
         kept, log, forgotten = SimpleNamespace(device=SimpleNamespace(keep=False), name="vm", delete_command=lambda: "rm"), [], []
-        with mock.patch.object(devices.state, "forget_vm", forgotten.append), \
+        with mock.patch.object(devices.device_store, "forget_vm", forgotten.append), \
                 mock.patch.object(devices, "delete_or_say_why", side_effect=AssertionError("deleted")), \
                 devices.kept_or_deleted(kept, log.append, lambda: "the work is not back"):
             pass
