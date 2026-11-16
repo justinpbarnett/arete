@@ -11,6 +11,7 @@ from unittest import mock
 
 SOURCE = Path(__file__).resolve().parents[2]
 BASELINE = "56706fe2c07d36fd9d7c00d227f9f68caffeda29"
+BEFORE_BUDGET = "0090e09dc89ccca0b96250ce6a2e4e64cb84999b"
 AGGREGATE_BASELINE = "5d0900bbb326cf9a896575959e32877c0e969903"
 
 
@@ -179,7 +180,7 @@ def unknown_area(root):
 def historical_chain(root, revision, names):
     folder = root / revision.replace("/", "-")
     folder.mkdir()
-    location = "arete/store/migrations" if revision == "origin/main" else "arete/migrations"
+    location = "arete/migrations" if revision == "9c8019c" else "arete/store/migrations"
     for name in names:
         data = subprocess.run(["git", "show", f"{revision}:{location}/{name}"],
                               cwd=SOURCE, capture_output=True, check=True).stdout
@@ -214,13 +215,13 @@ def upgrade(root):
     assert full[:2] == original and [r[0] for r in full[2:]] == suffix, full
     db.migrate()
     assert ledger(db) == full
-    available = subprocess.run(["git", "ls-tree", "--name-only", "origin/main:arete/store/migrations"],
+    available = subprocess.run(["git", "ls-tree", "--name-only", f"{BEFORE_BUDGET}:arete/store/migrations"],
                                cwd=SOURCE, capture_output=True, check=True, text=True).stdout.splitlines()
     old_names = sorted(name for name in available if name.startswith("m") and name.endswith(".py"))
-    old_location = historical_chain(root, "origin/main", old_names)
+    old_location = historical_chain(root, BEFORE_BUDGET, old_names)
     for name in old_names:
         assert (old_location / name).read_bytes() == (migrations.FOLDER / name).read_bytes(), name
-    other = paths.STATE_DIR / "origin-main" / "arete.db"
+    other = paths.STATE_DIR / "before-budget" / "arete.db"
     other.parent.mkdir()
     with mock.patch.object(paths, "DB_FILE", other):
         with mock.patch.object(migrations, "FOLDER", old_location):
