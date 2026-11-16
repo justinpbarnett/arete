@@ -430,9 +430,7 @@ def run(dry_run: bool = False) -> int:
         return refresh(cfg, dry_run)
 
 
-def refresh(cfg: config.Config, dry_run: bool) -> int:
-    old = {r["ref"]: r for r in state.triage_rows()}
-    srcs = sources(cfg)
+def read_all(srcs):
     read: dict[str, list[Candidate]] = {}
     errors: list[str] = []
     for src in srcs:
@@ -441,49 +439,53 @@ def refresh(cfg: config.Config, dry_run: bool) -> int:
         except tracker.ERRORS as e:
             errors.append(f"{src.name}: {e}")
             print(f"{util.iso()} {errors[-1]}")
-    todo = sorted(((src, c) for src in srcs for c in read.get(src.name, []) if due(c, old.get(c.ref))),
-                  key=lambda sc: moment(sc[1].updated), reverse=True)
-    if dry_run:
-        preview(srcs, read, old, todo[:MAX_CALLS], todo[MAX_CALLS:])
-        ready = ", ".join(r["ref"] for r in approvable(srcs, list(old.values()))) or "none"
-        print(f"would approve up to {cfg.jira.auto_per_refresh} now ready: {ready}" if cfg.jira.auto
-              else f"ready now, approved only with `[jira] auto = true`: {ready}")
-        return 1 if errors else 0
+    return read, errors
 
-    answered: dict[str, dict] = {}
-    failed: dict[str, str] = {}
-    waiting: list[str] = []
-    spent = 0.0
-    calls = 0
+
+@dataclass
+class Triaged:
+    answered: dict[str, dict] = field(default_factory=dict)
+    failed: dict[str, str] = field(default_factory=dict)
+    waiting: list[str] = field(default_factory=list)
+    spent: float = 0.0
+    calls: int = 0
+
+
+def triage_due(cfg, todo) -> Triaged:
+    triaged = Triaged()
     for src, c in todo:
-        if calls >= MAX_CALLS:
-            waiting.append(c.ref)
+        if triaged.calls >= MAX_CALLS:
+            triaged.waiting.append(c.ref)
             continue
         print(f"{util.iso()} {c.ref}: triaging", flush=True)
         try:
             ticket = src.ticket_text(c)
         except tracker.ERRORS as e:
-            calls += 1
-            failed[c.ref] = f"could not read it: {e}"
-            print(f"{util.iso()} {c.ref}: triage failed: {failed[c.ref]}")
+            triaged.calls += 1
+            triaged.failed[c.ref] = f"could not read it: {e}"
+            print(f"{util.iso()} {c.ref}: triage failed: {triaged.failed[c.ref]}")
             continue
         if settled := not_code_by_jev(cfg, src, c, ticket):
-            answered[c.ref] = settled
-            spent += settled["cost"]
+            triaged.answered[c.ref] = settled
+            triaged.spent += settled["cost"]
             print(f"{util.iso()} {c.ref}: {verdict(settled)} by JEV, no model call")
             continue
-        calls += 1
+        triaged.calls += 1
         try:
             answer, cost, error = triage_one(cfg, src, c, ticket)
         except tracker.ERRORS as e:
             answer, cost, error = None, 0.0, f"could not read it: {e}"
-        spent += cost
+        triaged.spent += cost
         if answer:
-            answered[c.ref] = settle(src, c, answer, cost)
-            print(f"{util.iso()} {c.ref}: {verdict(answered[c.ref])} ({util.paid_note(cost, 3)})")
+            triaged.answered[c.ref] = settle(src, c, answer, cost)
+            print(f"{util.iso()} {c.ref}: {verdict(triaged.answered[c.ref])} ({util.paid_note(cost, 3)})")
         else:
-            failed[c.ref] = error
+            triaged.failed[c.ref] = error
             print(f"{util.iso()} {c.ref}: triage failed: {error}")
+    return triaged
+
+
+def write_board(srcs, read, triaged):
     with util.lock(BOARD_LOCK, wait=True):
         board = {r["ref"]: r for r in state.triage_rows()}
         sent = {a["ref"]: a["ts"] for a in state.triage_approvals()}
@@ -491,19 +493,42 @@ def refresh(cfg: config.Config, dry_run: bool) -> int:
         for src in srcs:
             if src.name in read:
                 state.triage_replace(src.name, [
-                    answered.get(c.ref) or kept(src, c, board.get(c.ref),
-                                                f"triage failed: {failed[c.ref]}" if c.ref in failed else WAITING)
+                    triaged.answered.get(c.ref) or kept(src, c, board.get(c.ref),
+                                                f"triage failed: {triaged.failed[c.ref]}" if c.ref in triaged.failed else WAITING)
                     for c in read[src.name] if not sent_since_read(c, sent)]
                     + still_shown(src, read[src.name], board, delivered))
         state.triage_prune([s.name for s in srcs])
-    approved, held = approve_ready(cfg, srcs)
+
+
+def prune_records():
     keep = {record_file(r["ref"]).name for r in state.triage_rows()}
     for f in TICKET_RECORDS_DIR.glob("*.md"):
         if f.name not in keep:
             f.unlink()
 
+
+def preview_refresh(cfg, srcs, read, old, todo):
+    preview(srcs, read, old, todo[:MAX_CALLS], todo[MAX_CALLS:])
+    ready = ", ".join(r["ref"] for r in approvable(srcs, list(old.values()))) or "none"
+    print(f"would approve up to {cfg.jira.auto_per_refresh} now ready: {ready}" if cfg.jira.auto
+          else f"ready now, approved only with `[jira] auto = true`: {ready}")
+
+
+def refresh(cfg: config.Config, dry_run: bool) -> int:
+    old = {r["ref"]: r for r in state.triage_rows()}
+    srcs = sources(cfg)
+    read, errors = read_all(srcs)
+    todo = sorted(((src, c) for src in srcs for c in read.get(src.name, []) if due(c, old.get(c.ref))),
+                  key=lambda sc: moment(sc[1].updated), reverse=True)
+    if dry_run:
+        preview_refresh(cfg, srcs, read, old, todo)
+        return 1 if errors else 0
+    triaged = triage_due(cfg, todo)
+    write_board(srcs, read, triaged)
+    approved, held = approve_ready(cfg, srcs)
+    prune_records()
     meta = util.read_json(META_FILE, {})
-    meta.update(refreshed=util.iso(), errors=errors, waiting=waiting, failed=failed, approved=approved, held=held)
+    meta.update(refreshed=util.iso(), errors=errors, waiting=triaged.waiting, failed=triaged.failed, approved=approved, held=held)
     problems = list(errors)
     try:
         posted = publish(cfg, view(), meta)
@@ -512,10 +537,10 @@ def refresh(cfg: config.Config, dry_run: bool) -> int:
         posted = f"not posted: {e}"
     meta.update(posted=posted)
     util.write_json(META_FILE, meta)
-    print(f"{util.iso()} triage: {util.count(calls, 'model call')} ({util.paid_note(spent, 3)}), "
-          f"{len(failed)} failed, {len(waiting)} waiting, {len(approved)} approved; board {posted}")
-    if waiting:
-        print(f"waiting for the next refresh: {', '.join(waiting)}")
+    print(f"{util.iso()} triage: {util.count(triaged.calls, 'model call')} ({util.paid_note(triaged.spent, 3)}), "
+          f"{len(triaged.failed)} failed, {len(triaged.waiting)} waiting, {len(approved)} approved; board {posted}")
+    if triaged.waiting:
+        print(f"waiting for the next refresh: {', '.join(triaged.waiting)}")
     mark_loop("triage", not problems, "; ".join(problems))
     return 1 if problems else 0
 

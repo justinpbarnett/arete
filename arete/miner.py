@@ -339,13 +339,9 @@ def collect_runs(since: str, until: str = "9999") -> tuple[list[dict], int]:
     return [run_digest(run) for _, run in flagged[:MAX_RECORDED_RUNS]], clean_runs
 
 
-def render_runs(digests: list[dict], limit: int) -> tuple[str, int]:
+def fit_blocks(blocks, limit: int) -> tuple[str, int]:
     parts, used, n = [], 0, 0
-    for d in digests:
-        head = (f"## run {clean(d['session'], 120)} ({clean(d['kind'], 30)}, repo: {clean(d['repo'], 60) or 'none'}, "
-                f"ticket: {clean(d['issue'], 60) if d['issue'] not in (None, '') else 'none'}, "
-                f"status: {clean(d['status'], 30)}, {d['minutes']:.0f} min; signals: {', '.join(d['signals'])})")
-        block = head + "\n" + "\n".join(d["items"]) + "\n"
+    for block in blocks:
         if used + len(block) > limit:
             block = block[: max(0, limit - used)]
             if len(block) < 400:
@@ -354,22 +350,22 @@ def render_runs(digests: list[dict], limit: int) -> tuple[str, int]:
         used += len(block)
         n += 1
     return "\n".join(parts), n
+
+
+def render_runs(digests: list[dict], limit: int) -> tuple[str, int]:
+    return fit_blocks((
+        f"## run {clean(d['session'], 120)} ({clean(d['kind'], 30)}, repo: {clean(d['repo'], 60) or 'none'}, "
+        f"ticket: {clean(d['issue'], 60) if d['issue'] not in (None, '') else 'none'}, "
+        f"status: {clean(d['status'], 30)}, {d['minutes']:.0f} min; signals: {', '.join(d['signals'])})"
+        + "\n" + "\n".join(d["items"]) + "\n"
+        for d in digests), limit)
 
 
 def render_digest(cfg: config.Config, sessions: list[dict], limit: int) -> tuple[str, int]:
-    parts, used, n = [], 0, 0
-    for s in sessions:
-        repo = cfg.repo_for_path(s["cwd"]) if s["cwd"] else None
-        head = f"## session {s['session']} in {s['cwd'] or '?'} (repo: {repo.name if repo else 'none'})"
-        block = head + "\n" + "\n".join(s["items"]) + "\n"
-        if used + len(block) > limit:
-            block = block[: max(0, limit - used)]
-            if len(block) < 400:
-                break
-        parts.append(block)
-        used += len(block)
-        n += 1
-    return "\n".join(parts), n
+    return fit_blocks((
+        f"## session {s['session']} in {s['cwd'] or '?'} (repo: {repo.name if repo else 'none'})"
+        + "\n" + "\n".join(s["items"]) + "\n"
+        for s in sessions for repo in [cfg.repo_for_path(s["cwd"]) if s["cwd"] else None]), limit)
 
 
 def render_events(cfg: config.Config, since: datetime, until: datetime) -> str:
@@ -731,6 +727,17 @@ def window(cfg: config.Config, hours: float | None, now: datetime) -> tuple[date
     return until - MAX_CATCHUP, until, True, lost
 
 
+def proposal_status(cfg, p, flagged) -> tuple[str, str]:
+    ok, why = allowed(cfg, p, flagged)
+    if not ok:
+        return "memory" if p["layer"] == "memory" else "skipped", f"  [skip: {why}]"
+    if util.matches_any(p["file"], diffguard.CLAUDE_CODE_GUARDED):
+        return "hand", f"  [by hand: {HAND_EDIT_WHY}]"
+    if awaits_approval(cfg, p):
+        return "approve", "  [waits for approval]"
+    return "pending", ""
+
+
 def _run(cfg: config.Config, run_id: str, since: datetime, until: datetime, checkpointed: bool, lost: str,
          dry_run: bool, apply: bool) -> int:
     if lost:
@@ -785,23 +792,14 @@ def _run(cfg: config.Config, run_id: str, since: datetime, until: datetime, chec
     props = res.structured.get("proposals", [])[:MAX_PROPOSALS]
     by_repo: dict[str, list[dict]] = defaultdict(list)
     for p in props:
-        ok, why = allowed(cfg, p, flagged)
-        by_hand = ok and util.matches_any(p["file"], diffguard.CLAUDE_CODE_GUARDED)
-        held = ok and awaits_approval(cfg, p)
-        mark = "->" if ok and not by_hand and not held else "  "
-        note = (f"  [skip: {why}]" if not ok else f"  [by hand: {HAND_EDIT_WHY}]" if by_hand
-                else "  [waits for approval]" if held else "")
-        print(f"{mark} [{p['layer']}] {p['repo']}/{p['file']} ({p.get('confidence', 0):.2f}) {_short(p['change'], 140)}{note}")
+        status, note = proposal_status(cfg, p, flagged)
+        print(f"{'->' if status == 'pending' else '  '} [{p['layer']}] {p['repo']}/{p['file']} ({p.get('confidence', 0):.2f}) {_short(p['change'], 140)}{note}")
         if dry_run:
             continue
-        if by_hand:
-            state.add_proposal(run_id, p, "hand")
-        elif held:
-            state.add_proposal(run_id, p, "approve")
-        elif ok and apply:
+        if status == "pending" and apply:
             by_repo[p["repo"]].append(p)
         else:
-            state.add_proposal(run_id, p, "memory" if p["layer"] == "memory" else "pending" if ok else "skipped")
+            state.add_proposal(run_id, p, status)
     if dry_run:
         print(f"miner: dry run, {len(props)} proposals, {util.paid_note(res.paid_usd)}")
         return 0

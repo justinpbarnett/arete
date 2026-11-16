@@ -542,6 +542,10 @@ def write_json(p: Path, data) -> None:
     write_bytes_atomic(p, json.dumps(data, indent=2, default=str).encode())
 
 
+def log_ref(ref: str, line: str) -> None:
+    print(f"{iso()} {ref}: {line}", flush=True)
+
+
 GROUP_STOP_SECONDS = 10
 
 
