@@ -62,7 +62,7 @@ class WorkerRecoveryTests(unittest.TestCase):
             self.assertIn("never counted as free", r["report"]["against"][arm]["verdict"], shown)
 
     def test_a_trial_line_without_worker_attempts_is_not_priced(self):
-        from arete import workers
+        from arete.lab import workers
 
         design = {"accept": {"confidence": 0.95}, "workers": {"kinds": {"t": "patch"}}}
         lost = {"event": "trial", "task": "t", "arm": "a", "repeat": 1, "status": "interrupted",
@@ -71,7 +71,7 @@ class WorkerRecoveryTests(unittest.TestCase):
         self.assertEqual(workers.arm_row("a", [{**lost, "attempts": []}], design)["tariff_usd"], 0)
 
     def test_an_arm_with_an_unaccounted_trial_prices_no_phase(self):
-        from arete import workers
+        from arete.lab import workers
 
         design = {"accept": {"confidence": 0.95}, "workers": {"kinds": {"t": "patch"}}}
         lost = {"event": "trial", "task": "t", "arm": "a", "repeat": 1, "status": "interrupted",

@@ -7,22 +7,9 @@ import tomllib
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from . import (
-    config,
-    evals,
-    experiment,
-    implbench,
-    paths,
-    pipeline,
-    record,
-    replay,
-    routing,
-    runner,
-    steps,
-    util,
-    workspace,
-)
-from .agent import Result, traits_of
+from .. import config, evals, paths, pipeline, record, replay, routing, runner, steps, util, workspace
+from ..agent import Result, traits_of
+from . import experiment, implbench
 
 KINDS = ("patch", "test", "explore", "extract")
 RULES = ("unchanged_patch", "same_failure", "either")
@@ -128,7 +115,7 @@ def load(path: Path) -> implbench.Bench:
                            references)
 
 
-def declared(path: Path) -> bool:
+def is_workers_manifest(path: Path) -> bool:
     try:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -138,7 +125,7 @@ def declared(path: Path) -> bool:
         isinstance(e, dict) and {"attempts", "no_progress", "escalation"} & set(e) for e in arms.values())
 
 
-def holds(path: Path) -> bool:
+def is_workers_results(path: Path) -> bool:
     manifest = next((e for e in experiment.events(path) if e.get("event") == "manifest"), None)
     return bool(manifest) and "workers" in (manifest.get("design") or {})
 
@@ -357,7 +344,7 @@ def run(manifest: Path, out: str = "", dry: bool = False) -> int:
         return 0
     hands_off = frozenset(arm for arm, b in bench.exp.design["workers"]["arms"].items() if b["escalation"])
     return experiment.exclusive(bench.exp.repo.name, lambda: implbench.drive(
-        bench, path, hands_off=hands_off, shown=lambda p: render(report(p))))
+        bench, path, hands_off=hands_off, shown=lambda p: render(summary(p))))
 
 
 def tariff_of(attempts: list[dict], phase: str) -> float | None:
@@ -419,7 +406,7 @@ def verdict(row: dict, base: dict) -> str:
     return (f"tariff per accepted task {experiment.money(ours)} against {experiment.money(theirs)}: {word}")
 
 
-def report(path: Path) -> dict:
+def summary(path: Path) -> dict:
     found = experiment.events(path)
     manifest = next((e for e in found if e.get("event") == "manifest"), None)
     if manifest is None:
@@ -477,7 +464,7 @@ def render(found: dict) -> str:
 
 
 def show(path: Path, as_json: bool) -> int:
-    found = report(path)
+    found = summary(path)
     print(json.dumps(found) if as_json else render(found))
     return 0
 

@@ -44,21 +44,23 @@ assert experiment.sha is util.digest
 assert experiment.sha("a", b"bc") == util.digest("a", b"bc")
 assert util.digest("a", "bc") != util.digest("ab", "c")
 assert util.digest("") != util.digest()
-table = evals.results_md("repo", "worktree", [{"passed": False, "why": "a|b", "task": "t", "seconds": 0,
-                                            "paid": 0, "regressed": True, "changed": ["build model a|b to c"]}])
+table = evals.results_md("repo", "worktree", [evals.TaskResult("t", False, "a|b", seconds=0, paid=0, regressed=True,
+                                                               changed=["build model a|b to c"])])
 assert r"a\|b" in table and r"build model a\|b to c" in table, table
+def eval_run(task):
+    return evals.EvalRun(id=task.name, repo=repo, dir=paths.RUNS_DIR / task.name / task.name, task=task.name)
 task = evals.Task("no-check", "No check", "Nothing")
-result = evals.run_task(cfg, repo, src, task, "early", False, evals.Prompts())
-assert [result[k] for k in ("base_commit", "context_sha", "settings")] == ["", "", ""], result
+result = evals.run_task(cfg, src, task, evals.Prompts(), eval_run(task))
+assert [getattr(result, k) for k in ("base_commit", "context_sha", "settings")] == ["", "", ""], result
 task = evals.Task("bad-base", "Bad base", "Nothing", check="true", base="does-not-exist")
-result = evals.run_task(cfg, repo, src, task, "bad-base", False, evals.Prompts())
-assert [result[k] for k in ("base_commit", "context_sha", "settings")] == ["", "", ""], result
+result = evals.run_task(cfg, src, task, evals.Prompts(), eval_run(task))
+assert [getattr(result, k) for k in ("base_commit", "context_sha", "settings")] == ["", "", ""], result
 with (repo.layer / "config.toml").open("a") as f:
     f.write('\n[setup]\ncommands = ["false"]\n')
 task = evals.Task("bad-setup", "Bad setup", "Nothing", check="true")
-result = evals.run_task(cfg, repo, src, task, "bad-setup", False, evals.Prompts())
-assert result["base_commit"] and result["context_sha"] == result["settings"] == "", result
-assert "setup" in result["why"], result
+result = evals.run_task(cfg, src, task, evals.Prompts(), eval_run(task))
+assert result.base_commit and result.context_sha == result.settings == "", result
+assert "setup" in result.why, result
 (repo.layer / "evals/no-check.toml").write_text('title = "No check"\nprompt = "Nothing"\n')
 code, out = call("no-check")
 row = state.eval_rows(latest())[0]

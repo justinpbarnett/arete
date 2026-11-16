@@ -187,13 +187,13 @@ def cmd_ask(args) -> int:
 
 def cmd_jev(args) -> int:
     if args.action != "report":
-        from .. import calibrate
+        from ..lab import calibrate
 
         return calibrate.main(args)
 
     from .. import jev_verdicts
 
-    data = jev_verdicts.report(args.days, config.load())
+    data = jev_verdicts.summary(args.days, config.load())
     print(json.dumps(data, indent=2) if args.json else jev_verdicts.render(data))
     return 0
 

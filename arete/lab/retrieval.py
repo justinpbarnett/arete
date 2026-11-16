@@ -11,8 +11,8 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import codebase, config, environment, evals, paths, pipeline, record, replay, routing, runner, util
-from .agent import REPLAY
+from .. import codebase, config, environment, evals, paths, pipeline, record, replay, routing, runner, util
+from ..agent import REPLAY
 
 SPLITS = ("train", "validation", "holdout")
 KINDS = ("embedding", "rerank")
@@ -718,7 +718,7 @@ def missing_lines(results: list[dict]) -> list[str]:
     return lines
 
 
-def report(data: dict, where: str) -> list[str]:
+def render(data: dict, where: str) -> list[str]:
     corpus = data["corpus"]
     head = (f"{data['repo']} {data['suite']}  commit {corpus['commit'][:12]}  corpus {corpus['fingerprint']}  "
             f"files {corpus['files']}  passages {corpus['passages']}  budget {data['budget_tokens']} tokens  "
@@ -800,7 +800,7 @@ def run(repo_name: str, suite: str, split: str = "", dry_run: bool = False, as_j
         if out:
             Path(paths.expand(out)).write_text(payload)
         record.settle(run_id, "done", summary=f"retrieval {suite}: {len(spec.arms)} arms, {len(queries)} queries")
-    print(json.dumps(data) if as_json else "\n".join(report(data, str(where / "retrieval.json"))))
+    print(json.dumps(data) if as_json else "\n".join(render(data, str(where / "retrieval.json"))))
     return 0
 
 

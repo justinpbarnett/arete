@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,6 +31,7 @@ from .pipeline import (
 )
 from .util import git
 
+TASK_FILE = "task.toml"
 WRITER_SCHEMA = {
     "type": "object",
     "properties": {
@@ -83,9 +85,29 @@ class Draft:
         lines = [f"{k} = {toml_string(v)}" for k, v in fields.items()]
         return "\n".join(lines + [f"prompt = {toml_text(self.prompt)}", f"verify = {toml_text(self.verify)}", ""])
 
+    @classmethod
+    def from_toml(cls, text: str) -> Draft:
+        data = tomllib.loads(text)
+        return cls(str(data.get("title", "")), str(data.get("prompt", "")).strip(), str(data.get("verify", "")).strip(),
+                   str(data.get("base", "")), str(data.get("source", "")))
+
     def matches(self, task) -> bool:
         return ((task.title, task.prompt.strip(), task.verify.strip(), task.base, task.source)
                 == (self.title, self.prompt, self.verify, self.base, self.source))
+
+
+def accepted_unchanged(repo_name: str, task) -> bool:
+    row = state.mined_row(task.source) if task.source else {}
+    if row.get("status") != "accepted" or row.get("repo") != repo_name or not row.get("run_id"):
+        return False
+    for saved in (paths.RUNS_DIR / row["run_id"]).glob(f"*/{TASK_FILE}"):
+        try:
+            draft = Draft.from_toml(saved.read_text())
+        except (OSError, ValueError):
+            continue
+        if draft.matches(task):
+            return True
+    return False
 
 
 def toml_string(text: str) -> str:
@@ -161,7 +183,7 @@ def write(cfg: config.Config, run: EvalRun, c: Candidate, ticket: tracker.Ticket
                   base, c.pr_url)
     if not (draft.title and draft.prompt and draft.verify):
         raise RuntimeError("the writer left the title, the prompt or the steps empty")
-    run.save("task.toml", draft.toml)
+    run.save(TASK_FILE, draft.toml)
     return draft
 
 

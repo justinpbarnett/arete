@@ -1,7 +1,8 @@
 
 import contextlib, importlib.util, io, json, os, shutil, sys
 from pathlib import Path
-from arete import cli, experiment, optimize, paths, state
+from arete import cli, paths, state
+from arete.lab import experiment, optimize
 root = Path(sys.argv[1])
 state.migrate()
 if importlib.util.find_spec("arete.scratch"):

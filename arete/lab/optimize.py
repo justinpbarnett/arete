@@ -12,7 +12,8 @@ from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 
-from . import config, experiment, paths, replay, settings, steps, util
+from .. import config, paths, replay, settings, steps, util
+from . import experiment
 from .experiment import NAME, Refused, Totals, append, events
 
 BASELINE = "baseline"

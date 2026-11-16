@@ -14,7 +14,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from . import config, environment, factory, loops, paths, record, state, tracker, util, verifier_suites, workspace
+from . import config, environment, factory, loops, paths, record, state, tracker, util, workspace
+from .lab import verifier_suites
 from .pipeline import AgentRun, TicketWork, use_product
 
 PR = re.compile(r"https://github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)", re.IGNORECASE)

@@ -1,7 +1,8 @@
 
 import contextlib, importlib.util, io, json, os, sys
 from pathlib import Path
-from arete import cli, experiment, paths, record, state, workers
+from arete import cli, paths, record, state
+from arete.lab import experiment, workers
 root, mode = Path(sys.argv[1]), sys.argv[2]
 state.migrate()
 if importlib.util.find_spec("arete.scratch"):
@@ -31,4 +32,4 @@ if mode != "finish":
     record.Recorder.finish = dies
 ran = call("benchmark", "run", str(manifest), "--out", str(results))
 trials = [e for e in experiment.events(results) if e.get("event") == "trial"]
-print("BEHAVIOR_RESULT=" + json.dumps({"run": ran, "trials": trials, "report": workers.report(results)}))
+print("BEHAVIOR_RESULT=" + json.dumps({"run": ran, "trials": trials, "report": workers.summary(results)}))

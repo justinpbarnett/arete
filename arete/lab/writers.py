@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass
 from itertools import combinations
 from pathlib import Path
 
-from . import config, document, paths, record, replay, steps, util
+from .. import config, document, paths, record, replay, steps, util
 
 KINDS = ("message", "ticket", "doc")
 MIN_CASES, MAX_CASES = 15, 20
@@ -375,7 +375,7 @@ def group(saved: dict, given: dict, needed: int, names: list[str]) -> dict:
             "unrated": unrated, "candidates": rows, "proposal": found, "why": why}
 
 
-def report(run_id: str) -> dict:
+def summary(run_id: str) -> dict:
     saved = load(run_id)
     given = ratings_of(run_id)
     channels = {AGGREGATE: list(saved["cases"])}
@@ -394,7 +394,7 @@ def money(value) -> str:
     return "unknown" if value is None else f"${value:.4f}"
 
 
-def report_lines(found: dict) -> list[str]:
+def render(found: dict) -> list[str]:
     lines = [f"writers {found['run']} ({found['repo']}): {found['result']}", found["note"],
              f"raters: {', '.join(found['raters']) or 'none'}; {found['needed_raters']} needed for each text"]
     for name, g in found["channels"].items():
