@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from arete import config, gh, outbound, paths, pipeline, sandbox, scratch, verify
+from arete import browser, config, gh, outbound, paths, pipeline, sandbox, scratch, verify
 
 from tests import support
 
@@ -517,7 +517,7 @@ class EvidenceLinkTests(unittest.TestCase):
             self.assertEqual(verify.push_evidence(self.root, "o/r", "run", [self.evidence / "leak.png"]), {})
 
     def test_the_claude_browser_config_keeps_chromes_own_sandbox(self):
-        config_text = verify.mcp_config(self.evidence)
+        config_text = browser.mcp_config(self.evidence)
         self.assertNotIn("--no-sandbox", config_text)
         self.assertIn("npx", config_text)
         self.assertNotIn("browser_evaluate", verify.PLAYWRIGHT_TOOLS)

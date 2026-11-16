@@ -4,7 +4,6 @@ import hashlib
 import json
 import os
 import shlex
-import signal
 import subprocess
 import threading
 import time
@@ -163,13 +162,6 @@ def feed_stdin(proc: subprocess.Popen, text: str) -> None:
         pass
 
 
-def kill_group(proc: subprocess.Popen) -> None:
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
-
-
 def copy_output(proc: subprocess.Popen, output: Path | None, lines: list[str], on_line) -> None:
     with open(output or os.devnull, "a") as out:
         for line in proc.stdout:
@@ -212,7 +204,7 @@ def run_command(argv: list[str], cwd: Path | str, *, timeout: float, env: dict, 
         expired = copier.is_alive() or not exits_by(proc, deadline)
     finally:
         if expired:
-            kill_group(proc)
+            util.kill_group(proc)
     if not expired:
         return proc.returncode, "".join(lines)
     copier.join(OUTPUT_GRACE_SECONDS)

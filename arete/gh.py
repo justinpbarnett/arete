@@ -39,14 +39,6 @@ def has_arete_mark(body: str | None) -> bool:
     return ARETE_MARK in (body or "")
 
 
-@functools.cache
-def auth_token() -> str:
-    if paths.ISOLATED:
-        return ""
-    res = util.sh(["gh", "auth", "token"], timeout=10)
-    return res.stdout.strip() if res.returncode == 0 else ""
-
-
 class Outgoing(str):
     pass
 
