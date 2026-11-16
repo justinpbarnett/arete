@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
 import time
 from collections import Counter
 from collections.abc import Callable
@@ -34,6 +35,7 @@ from . import (
 from .refusals import TrackerFailed
 from .store import asks as ask_store
 from .store import db as foundation
+from .store import idempotency as claims
 from .store import runs as run_store
 from .store import sources as source_store
 from .store import tasks as task_store
@@ -46,6 +48,8 @@ POLLER_LATER = "the poller starts it when a slot frees"
 RESUMABLE = ("interrupted", "stopped", "failed")
 MAX_ANSWER_CHARS = 20000
 TICKET_CLOSED = "its ticket closed while it waited for an answer"
+PENDING = {}
+PENDING_LOCK = threading.RLock()
 
 
 class AlreadyResolved(control.Refused):
@@ -73,7 +77,7 @@ def repo_named(cfg: config.Config, name: str) -> config.Repo:
 
 
 def start(repo_name: str, prompt: str = "", title: str = "", kind: str = "", ticket: str = "",
-          force: bool = True) -> dict:
+          force: bool = True, claim=None) -> dict:
     prompt, ticket = prompt.strip(), ticket.strip()
     if not prompt and not ticket:
         raise control.Refused("Give a prompt to add a task and start it, or a ticket to start one that exists.")
@@ -86,15 +90,19 @@ def start(repo_name: str, prompt: str = "", title: str = "", kind: str = "", tic
     if kind not in ("", *config.KINDS):
         raise control.Refused(f"The kind is {' or '.join(config.KINDS)}, not '{kind}'.")
     if ticket:
-        return start_ticket(cfg, repo, ticket, force)
-    tid = task_store.task_add(repo.name, prompt, title.strip() or title_of(prompt), kind or "feat")
+        return start_ticket(cfg, repo, ticket, force, claim=claim)
+    tid = task_store.task_add(repo.name, prompt, title.strip() or title_of(prompt), kind or "feat", claim=claim)
+    return begin_prompt(cfg, repo, tid)
+
+
+def begin_prompt(cfg, repo, tid):
     if waits := tracker.LocalTracker(repo).blocker(tid):
         return answer(tid, repo.name, "", "queued", f"{waits}; " + ("the poller starts it once the wait ends"
                                                                     if repo.pipeline else "send its ticket to start it"))
     return begin(cfg, repo, tid, force=False, poller_picks=repo.pipeline)
 
 
-def start_ticket(cfg: config.Config, repo: config.Repo, ticket: str, force: bool = True) -> dict:
+def start_ticket(cfg: config.Config, repo: config.Repo, ticket: str, force: bool = True, claim=None) -> dict:
     try:
         tid = tracker.for_ticket(cfg, repo, ticket).normalize(ticket)
     except ValueError as e:
@@ -106,7 +114,22 @@ def start_ticket(cfg: config.Config, repo: config.Repo, ticket: str, force: bool
             raise control.Refused(f"{tid} is a task of {row['repo']}, not {repo.name}")
         if row["state"] in config.TASK_FINISHED:
             raise control.Refused(f"task {tid} is {row['state']}, so it does not start again; add a new task")
+    if claim:
+        with writes.atomic():
+            seq = events.emit("task.start_requested", f"task:{tid}", cls="derived", task=tid,
+                              data={"repo": repo.name, "ticket": tid})
+            claims.claim(claim, seq)
     return begin(cfg, repo, tid, force=force, poller_picks=False)
+
+
+def recover_start(claim, force=True):
+    name, tid, prompt = claims.target(claim)
+    cfg = config.load()
+    repo = repo_named(cfg, name)
+    if rows := run_store.ticket_runs(name, tid, limit=1):
+        row = rows[0]
+        return answer(tid, name, row["id"], row["status"], "recovered task start")
+    return begin_prompt(cfg, repo, tid) if prompt else begin(cfg, repo, tid, force, False)
 
 
 def live_run(repo: str, tid: str) -> dict | None:
@@ -131,7 +154,9 @@ def queued(repo: config.Repo, tid: str, why: str, poller_picks: bool) -> dict:
 
 
 def begin(cfg: config.Config, repo: config.Repo, tid: str, force: bool, poller_picks: bool) -> dict:
-    with util.lock(START_LOCK, wait=True):
+    with PENDING_LOCK, util.lock(START_LOCK, wait=True):
+        if pending := pending_start(repo.name, tid):
+            return pending
         if run := live_run(repo.name, tid):
             return answer(tid, repo.name, run["id"], "running", "already running")
         if why := held(cfg, repo):
@@ -140,25 +165,48 @@ def begin(cfg: config.Config, repo: config.Repo, tid: str, force: bool, poller_p
                                      runlimits.Policy.of(config.load_layer(repo.layer_dir)), force)
         if why:
             raise control.Refused(why)
-        if new := spawned(repo.name, tid, lambda: pipeline.spawn_run(repo.name, tid, force)):
-            return answer(tid, repo.name, new, "running", "started")
+        new, state = spawned(repo.name, tid, lambda: pipeline.spawn_run(repo.name, tid, force))
+        if state != "exited":
+            return answer(tid, repo.name, new, state, "started" if new else "child is starting")
         if why := held(cfg, repo):
             return queued(repo, tid, why, poller_picks)
     raise did_not_show(repo, tid)
 
 
-def spawned(repo_name: str, tid: str, spawn: Callable[[], subprocess.Popen]) -> str:
+def pending_start(repo_name, tid):
+    identity = repo_name, tid
+    if identity not in PENDING:
+        return None
+    proc, before = PENDING[identity]
+    new = next((r for r in run_ids(repo_name, tid) if r not in before), "")
+    if new or proc.poll() is not None:
+        del PENDING[identity]
+        return answer(tid, repo_name, new, "running", "started") if new else None
+    return answer(tid, repo_name, "", "starting", "child is starting")
+
+
+def spawn_pending(repo_name: str, tid: str, spawn: Callable[[], subprocess.Popen]) -> subprocess.Popen:
     before = set(run_ids(repo_name, tid))
     proc = spawn()
+    PENDING[repo_name, tid] = proc, before
+    return proc
+
+
+def spawned(repo_name: str, tid: str, spawn: Callable[[], subprocess.Popen]) -> tuple[str, str]:
+    proc = spawn_pending(repo_name, tid, spawn)
+    before = PENDING[repo_name, tid][1]
     give_up = time.monotonic() + pipeline.RUN_START_SECONDS
     while time.monotonic() < give_up:
         exited = proc.poll() is not None
         if new := next((r for r in run_ids(repo_name, tid) if r not in before), ""):
-            return new
+            del PENDING[repo_name, tid]
+            return new, "running"
         if exited:
             break
         time.sleep(0.1)
-    return ""
+    if found := pending_start(repo_name, tid):
+        return found["run"], found["state"]
+    return "", "exited"
 
 
 def did_not_show(repo: config.Repo, tid: str) -> control.Refused:
@@ -184,10 +232,13 @@ def launch(cfg: config.Config, repo: config.Repo, tid: str, command: list[str], 
             raise control.NotFound(f"no run {admission[0]}")
         return control.launch(command, pipeline.RUNS_LOG)
 
-    with util.lock(START_LOCK, wait=True):
+    with PENDING_LOCK, util.lock(START_LOCK, wait=True):
+        if pending := pending_start(repo.name, tid):
+            return pending
         free_to_start(cfg, repo, tid, ahead=ahead)
-        if new := spawned(repo.name, tid, admitted_spawn):
-            return answer(tid, repo.name, new, "running", "started")
+        new, state = spawned(repo.name, tid, admitted_spawn)
+        if state != "exited":
+            return answer(tid, repo.name, new, state, "started" if new else "child is starting")
     raise did_not_show(repo, tid)
 
 

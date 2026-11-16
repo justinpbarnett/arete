@@ -24,6 +24,7 @@ from . import (
     event_stream,
     events,
     gh,
+    idempotency,
     install_files,
     jira,
     loop_run,
@@ -49,6 +50,7 @@ from .refusals import Stated as Refusal
 from .store import approvals as approvals_store
 from .store import db as foundation
 from .store import events as event_store
+from .store import idempotency as claims
 from .store import insights as insights_store
 from .store import runs as run_store
 from .store import writes
@@ -222,6 +224,8 @@ class Handler(BaseHTTPRequestHandler):
     def answer(self, method: str) -> None:
         with principals.acting("hand"), event_store.request_scope(f"{method} {urlsplit(self.path).path}"):
             self.write_receipt = None
+            self.keyed_delivery = False
+            self.idempotent_replayed = False
             return self.answer_as_person(method)
 
     def answer_as_person(self, method: str) -> None:
@@ -238,6 +242,8 @@ class Handler(BaseHTTPRequestHandler):
                 got = webhooks.receive(unquote(path[len(webhooks.HOOK_PATH):]), self.headers, self.raw_body())
                 return self.send_json(202 if got["queued"] else 200, got)
             query = {k: v[-1] for k, v in parse_qs(parts.query).items()}
+            if method == "POST" and path == "/api/tasks" and "Idempotency-Key" in self.headers:
+                return self.keyed_start()
             if method == "GET" and path in ("/api/events", "/api/v1/events"):
                 return event_stream.serve(self, query, WEB_CODE)
             if method == "POST" and path == EVIDENCE_PATH:
@@ -253,13 +259,54 @@ class Handler(BaseHTTPRequestHandler):
                     self.write_receipt = writes.receipt(f"run:{result['run']}", kind="run.started") or self.write_receipt
             self.send_json(200, result)
         except Exception as e:
+            if self.keyed_delivery:
+                raise
             if status := refusal_status(e):
                 if isinstance(e, Restarting):
                     return self.send_json(status, refusal_answer(e), retry_after=RESTART_RETRY_SECONDS)
+                if isinstance(e, idempotency.InFlight):
+                    return self.send_json(status, refusal_answer(e), retry_after=1)
                 return self.send_json(status, refusal_answer(e))
             said = type(e).__name__ if self.path.startswith((ASK_PATH, PUSH_PATH)) else f"{type(e).__name__}: {e}"
             self.log_error("%s", said)
             self.send_json(500, {"error": as_sentence(util.first_line(said, 300))})
+
+    def keyed_start(self):
+        body = self.body()
+        sha = idempotency.fingerprint("POST", "/api/tasks", {}, body)
+        with idempotency.owning(principals.current(), self.headers["Idempotency-Key"], sha) as context:
+            row = claims.lookup(*context[:2])
+            if row and row["request_sha"] != sha:
+                raise idempotency.Reused("This key was used with different content")
+            if row and row["status"]:
+                self.write_receipt = claims.receipt(row["last_seq"])
+                self.idempotent_replayed = True
+                self.keyed_delivery = True
+                return self.send(row["status"], bytes(row["response"]), "application/json", "no-store")
+            try:
+                result = (tasks.recover_start(row, body.get("force") is not False) if row else
+                          tasks.start(*(str(body.get(k) or "") for k in ("repo", "prompt", "title", "kind", "ticket")),
+                                      force=body.get("force") is not False, claim=context))
+                status = 200
+            except Exception as e:
+                status = refusal_status(e)
+                if status is None:
+                    status = 500
+                    said = f"{type(e).__name__}: {e}"
+                    self.log_error("%s", said)
+                    result = {"error": as_sentence(util.first_line(said, 300))}
+                else:
+                    result = refusal_answer(e)
+            self.write_receipt = event_store.committed_receipt()
+            if not row and status == 200 and result.get("run"):
+                self.write_receipt = writes.receipt(f"run:{result['run']}", kind="run.started") or self.write_receipt
+            if not self.write_receipt and (saved := claims.lookup(*context[:2])):
+                self.write_receipt = claims.receipt(saved["first_seq"])
+            payload = json.dumps(result, default=str).encode()
+            seq = int(self.write_receipt["event_seq"].rsplit(".", 1)[1]) if self.write_receipt else None
+            claims.complete(context, status, payload, seq)
+            self.keyed_delivery = True
+            return self.send(status, payload, "application/json", "no-store")
 
     def admit(self, method: str, path: str) -> None:
         node: tailnet.Node = self.server.node
@@ -465,6 +512,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(length))
         self.send_header("Cache-Control", cache)
         self.send_header("X-Arete-Code", WEB_CODE)
+        if getattr(self, "idempotent_replayed", False):
+            self.send_header("Idempotent-Replayed", "true")
         if 200 <= status < 300 and getattr(self, "write_receipt", None):
             self.send_header("Arete-Seq", self.write_receipt["event_seq"])
         self.send_header("Content-Security-Policy", PAGE_POLICY)

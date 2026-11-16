@@ -3028,6 +3028,8 @@ def spawn_run(repo_name: str, tid: str, force: bool = False) -> subprocess.Popen
 
 
 def run_skipped(name: str) -> dict:
+    from . import tasks
+
     entry = skipped_tickets().get(name)
     if not entry:
         raise control.NotFound(f"{name} is not on the skipped list; the last poll either ran it or no longer skips it")
@@ -3035,18 +3037,18 @@ def run_skipped(name: str) -> dict:
         raise control.Refused(f"{name} names no repo to run in; a ticket the pipeline routes to a repo gets one at "
                               "the next poll")
     cfg = config.load()
-    if run_store.issue_running(entry["repo"], entry["id"]):
-        raise control.Busy(name)
-    if slots.slots_free_to_start(cfg.max_parallel) <= 0:
-        raise slots.NoFreeSlot(f"{name} was not started: {slots.no_free_slot(cfg.max_parallel)}; wait for a run to finish or "
-                         "raise max_parallel in Settings")
-    run = spawn_run(entry["repo"], entry["id"], force=True)
-    give_up = time.monotonic() + RUN_START_SECONDS
-    while not run_store.issue_running(entry["repo"], entry["id"]) and time.monotonic() < give_up:
-        if run.poll() is not None:
-            raise control.Refused(f"{name} ended before it showed as running; the end of "
-                                  f"{paths.short_path(paths.LOG_DIR / RUNS_LOG)} says why")
-        time.sleep(0.1)
+    with tasks.PENDING_LOCK, util.lock(tasks.START_LOCK, wait=True):
+        if run_store.issue_running(entry["repo"], entry["id"]):
+            raise control.Busy(name)
+        if not tasks.pending_start(entry["repo"], str(entry["id"])):
+            if slots.slots_free_to_start(cfg.max_parallel) <= 0:
+                raise slots.NoFreeSlot(f"{name} was not started: {slots.no_free_slot(cfg.max_parallel)}; wait for a run "
+                                      "to finish or raise max_parallel in Settings")
+            _, state = tasks.spawned(entry["repo"], str(entry["id"]),
+                                     lambda: spawn_run(entry["repo"], entry["id"], force=True))
+            if state == "exited":
+                raise control.Refused(f"{name} ended before it showed as running; the end of "
+                                      f"{paths.short_path(paths.LOG_DIR / RUNS_LOG)} says why")
     return {"ticket": name, "repo": entry["repo"], "id": entry["id"]}
 
 

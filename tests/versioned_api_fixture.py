@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import http.client
+import io
 import json
 import os
 import signal
@@ -14,6 +16,7 @@ import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -22,7 +25,8 @@ from tests.events_principals_fixture import Fixture as EventsFixture, isolated, 
 from tests.harness import SOURCE
 
 EXERCISES = ("migration-rollback", "writes", "stale-stop", "concurrent-stop", "run-commands", "grace",
-             "status-races", "ask-races", "carried-landings", "clients", "nearby")
+             "status-races", "ask-races", "carried-landings", "clients", "nearby", "keyed-replay",
+             "keyed-concurrency", "keyed-clients", "keyed-recovery", "slow-start", "idempotency-prune")
 
 
 def forbidden(*args, **kwargs):
@@ -91,7 +95,8 @@ class Fixture(EventsFixture):
                 super().send(status, payload, kind, cache, retry_after)
                 if kind == "application/json":
                     evidence = {"path": self.path, "request": self.evidence_body, "status": status,
-                                "headers": self.evidence_headers, "body": json.loads(payload)}
+                                "headers": self.evidence_headers, "body": json.loads(payload), "raw": payload.hex(),
+                                "key": self.headers.get("Idempotency-Key")}
                     with fixture.evidence_lock, (fixture.root / "http.jsonl").open("a") as out:
                         out.write(json.dumps(evidence) + "\n")
 
@@ -105,12 +110,15 @@ class Fixture(EventsFixture):
         offline_workflow.create_replay_config(SimpleNamespace(root=self.root, scenario="pass", replay=replay,
                                                              paths=self.paths))
 
-    def post(self, path, body=None):
-        conn, response = self.request(path, method="POST", headers={"X-Arete": "1", "Content-Type": "application/json"},
-                                      body=json.dumps(body or {}))
+    def post(self, path, body=None, key=None):
+        headers = {"X-Arete": "1", "Content-Type": "application/json"}
+        if key is not None:
+            headers["Idempotency-Key"] = key
+        conn, response = self.request(path, method="POST", headers=headers,
+                                      body=body if isinstance(body, str) else json.dumps(body or {}))
         raw = response.read()
         record = {"path": path, "request": body, "status": response.status,
-                  "headers": dict(response.getheaders()), "body": json.loads(raw)}
+                  "headers": dict(response.getheaders()), "body": json.loads(raw), "raw": raw.hex()}
         with self.transcript.open("a") as out:
             out.write(json.dumps(record) + "\n")
         conn.close()
@@ -148,6 +156,14 @@ class Fixture(EventsFixture):
         record.start("pipeline", repo=old["repo"], issue=old["issue"], pid=child.pid)
         return child
 
+    def fake_spawn(self, repo, tid, force=False):
+        from arete import record
+
+        child = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        self.children.append(child)
+        record.start("pipeline", repo=repo, issue=tid, pid=child.pid)
+        return child
+
     def close(self):
         super().close()
         for proc in self.children:
@@ -160,7 +176,8 @@ class Fixture(EventsFixture):
         super().save()
         tables = ("runs", "tasks", "task_comments", "events_log", "schema_migrations", "schema_meta", "idempotency")
         (self.root / "canonical.json").write_text(json.dumps({t: self.rows(f"SELECT rowid, * FROM {t}")
-                                                            for t in tables}, indent=2))
+                                                            for t in tables}, indent=2,
+                                                           default=lambda v: {"bytes_hex": v.hex()}))
 
 
 def refuses(kind, action):
@@ -233,7 +250,7 @@ def migration(root):
             "INSERT INTO idempotency (actor,key,route,request_sha,status,response,at) VALUES ('hand','key','r','s',0,'','bad')"))
         refuses(sqlite3.IntegrityError, lambda: c.execute(
             "UPDATE schema_meta SET value = 'bad' WHERE key = 'versioned_api_grace_deadline'"))
-    assert migrations.owners()["writes"] == {"idempotency": "30 days"}
+    assert migrations.owners()["idempotency"] == {"idempotency": "30 days"}
     (root / "migration.json").write_text(json.dumps({"old": old, "ledger": ledger, "schema": schema,
                                                     "rollback": True}, indent=2))
 
@@ -649,6 +666,532 @@ def clients(f):
     ui.test_versioned_run_actions()
 
 
+def keyed_replay(f):
+    from arete import control, pipeline, record, tasks
+    from arete.store import idempotency
+
+    body = {"repo": "replay-sample", "prompt": "Add kumquat"}
+    with mock.patch.object(pipeline, "spawn_run", side_effect=f.fake_spawn), mock.patch.object(tasks, "held", return_value=""):
+        first = f.post("/api/tasks", body, "replay-572")
+        assert first["status"] == 200 and first["body"]["state"] == "running", first
+        second = f.post("/api/tasks", ' { "prompt": "Add kumquat", "repo": "replay-sample" } ', "replay-572")
+        assert second["raw"] == first["raw"] and second["status"] == first["status"]
+        assert second["headers"]["Idempotent-Replayed"] == "true"
+        assert second["headers"]["Arete-Seq"] == first["headers"]["Arete-Seq"]
+        assert f.post("/api/tasks", {**body, "prompt": "changed"}, "replay-572")["body"]["code"] == "idempotency_key_reused"
+        assert len(f.rows("SELECT * FROM tasks")) == len(f.rows("SELECT * FROM runs")) == 1
+        claim = idempotency.lookup(f.person, "replay-572")
+        assert claim["via"] == "POST /api/tasks" and claim["response"].hex() == first["raw"]
+        event = f.rows("SELECT * FROM events_log WHERE seq = ?", (claim["first_seq"],))[0]
+        assert event["kind"] == "task.created" and event["actor"] == f.person
+        with mock.patch.object(tasks, "begin", side_effect=control.Refused("handled start error")):
+            failed = f.post("/api/tasks", body, "error-572")
+        assert failed["status"] == 400
+        count = len(f.rows())
+        f.server.shutdown()
+        f.server.server_close()
+        f.thread.join(5)
+        f.open()
+        for key, original in (("replay-572", first), ("error-572", failed)):
+            replayed = f.post("/api/tasks", body, key)
+            assert replayed["raw"] == original["raw"] and replayed["status"] == original["status"]
+        assert len(f.rows()) == count
+        for key in ("_.:/-aZ0", "a" * 128):
+            assert f.post("/api/tasks", body, key)["status"] == 200
+        count = len(f.rows("SELECT * FROM tasks"))
+        for key in ("", "short", "a" * 129, "bad key-572", "nonascii-é"):
+            assert f.post("/api/tasks", body, key)["status"] == 400
+        from arete import idempotency as coordinator
+
+        refuses(control.Refused, lambda: coordinator.owning(f.person, "newline\n", "sha").__enter__())
+        assert len(f.rows("SELECT * FROM tasks")) == count
+        with mock.patch.object(tasks, "held", return_value="capacity"):
+            queued = f.post("/api/tasks", body, "queued-572")
+            assert f.post("/api/tasks", body)["body"]["state"] == "queued"
+        assert queued["body"]["state"] == "queued"
+        assert f.post("/api/tasks", body, "queued-572")["raw"] == queued["raw"]
+        for _ in range(2):
+            assert f.post("/api/tasks", body)["body"]["state"] == "running"
+        blocked = f.post("/api/tasks", {**body, "prompt": f"Waits on {first['body']['task']}.\nAdd another word"})
+        assert blocked["body"]["state"] == "queued"
+        assert len(f.rows("SELECT * FROM tasks")) == count + 5
+        record.note(first["body"]["run"], summary="later unrelated event")
+        assert f.post("/api/tasks", body, "replay-572")["headers"]["Arete-Seq"] == first["headers"]["Arete-Seq"]
+
+
+def keyed_concurrency(f):
+    from arete import pipeline, tasks, util
+    from arete.store import idempotency
+
+    body = {"repo": "replay-sample", "prompt": "Add kumquat"}
+    entered, release = threading.Event(), threading.Event()
+    begin = tasks.begin
+
+    def paused(*args, **kwargs):
+        entered.set()
+        assert release.wait(10)
+        return begin(*args, **kwargs)
+
+    with mock.patch.object(tasks, "begin", side_effect=paused), mock.patch.object(tasks, "held", return_value=""), \
+            mock.patch.object(pipeline, "spawn_run", side_effect=f.fake_spawn), ThreadPoolExecutor() as pool:
+        first = pool.submit(f.post, "/api/tasks", body, "concurrent-572")
+        assert entered.wait(5)
+        try:
+            started = time.monotonic()
+            duplicate = f.post("/api/tasks", body, "concurrent-572")
+            assert time.monotonic() - started < 2
+            assert duplicate["status"] == 409 and duplicate["body"]["code"] == "idempotency_in_flight"
+            assert duplicate["headers"]["Retry-After"] == "1"
+            changed = f.post("/api/tasks", {**body, "prompt": "different"}, "concurrent-572")
+            assert changed["status"] == 422
+        finally:
+            release.set()
+        original = first.result(10)
+    assert f.post("/api/tasks", body, "concurrent-572")["raw"] == original["raw"]
+    with f.db.tx() as c:
+        c.execute("INSERT INTO schema_meta VALUES ('multi_user', 'ready')")
+        c.execute("INSERT INTO principals (id,kind,role,name,status,created) VALUES "
+                  "('u:second','human','owner','Second','active',?)", (util.iso(),))
+        for identity, person, login in (("second", "u:second", "second@example.test"),
+                                        ("alias", f.person, "alias@example.test")):
+            c.execute("INSERT INTO principal_logins (id,principal,method,subject,created) VALUES (?,?,'tailnet',?,?)",
+                      (identity, person, login, util.iso()))
+    with mock.patch.object(pipeline, "spawn_run", side_effect=f.fake_spawn), mock.patch.object(tasks, "held", return_value=""):
+        f.who("second@example.test")
+        second = f.post("/api/tasks", body, "concurrent-572")
+        assert second["status"] == 200 and second["body"]["task"] != original["body"]["task"]
+        f.who("alias@example.test")
+        assert f.post("/api/tasks", body, "concurrent-572")["raw"] == original["raw"]
+        for key, module, name in (("failure-execute", tasks, "begin"), ("failure-persist", idempotency, "complete")):
+            with mock.patch.object(module, name, side_effect=RuntimeError("injected failure")):
+                assert f.post("/api/tasks", body, key)["status"] == 500
+            recovered = f.post("/api/tasks", body, key)
+            assert recovered["status"] == (500 if name == "begin" else 200), recovered
+            assert f.post("/api/tasks", body, key)["raw"] == recovered["raw"]
+
+
+def slow_start(f):
+    from collections import Counter
+    from dataclasses import replace
+
+    from arete import config, control, pipeline, poll, record, repairs, slots, tasks, tracker
+    from arete.store import runs
+
+    registrations, spawned = [], []
+    register_first = threading.Event()
+    cfg = config.load()
+    repo = replace(cfg.repo("replay-sample"), pipeline=True)
+    cfg = replace(cfg, repos=[repo])
+
+    def delayed(repo, tid, force=False):
+        child = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        f.children.append(child)
+        spawned.append(tid)
+        first = len(spawned) == 1
+        register_at = time.monotonic() + 2
+
+        def register():
+            if first:
+                assert register_first.wait(10)
+            time.sleep(max(0, register_at - time.monotonic()))
+            record.start("pipeline", repo=repo, issue=tid, pid=child.pid)
+
+        thread = threading.Thread(target=register)
+        registrations.append(thread)
+        thread.start()
+        return child
+
+    with mock.patch.object(config, "load", return_value=cfg), \
+            mock.patch.object(pipeline, "RUN_START_SECONDS", 1), mock.patch.object(tasks, "held", return_value=""), \
+            mock.patch.object(pipeline, "spawn_run", side_effect=delayed):
+        with ThreadPoolExecutor() as pool:
+            started = pool.submit(f.post, "/api/tasks", {"repo": "replay-sample", "prompt": "slow"}, "slow-572")
+            deadline = time.monotonic() + 5
+            while not spawned and time.monotonic() < deadline:
+                time.sleep(.01)
+            writer = pool.submit(record.start, "fixture", tag="writer-during-wait")
+            assert writer.result(.8)
+            initial = started.result(5)
+        assert initial["status"] == 200 and initial["body"]["state"] == "starting" and not initial["body"]["run"]
+        tid = initial["body"]["task"]
+        duplicate = f.post("/api/tasks", {"repo": "replay-sample", "ticket": tid}, "slow-other-572")
+        assert duplicate["body"]["state"] == "starting" and len(spawned) == 1
+        with mock.patch.object(pipeline, "skipped_tickets", return_value={tid: {"repo": repo.name, "id": tid}}):
+            skipped_after_http = f.post(f"/api/skipped/{tid}/run")
+        assert skipped_after_http["status"] == 200 and skipped_after_http["body"]["id"] == tid
+        assert len(spawned) == 1 and not runs.ticket_runs(repo.name, tid)
+        queue = poll.RepoQueue(repo, tracker.LocalTracker(repo), set(), config.load_layer(repo.layer_dir), None)
+        skips = pipeline.SkipLog({})
+        pick = poll.next_pick(repo, queue.tracker, skips, set())
+        assert pick and pick[0] == tid and not runs.ticket_runs(repo.name, tid)
+        with mock.patch.object(poll, "spawn_run", side_effect=delayed) as poll_spawn, \
+                mock.patch.object(poll, "step_without_route", return_value=""):
+            result = poll.start_pick(cfg, queue, pick, skips, False, Counter(), 1)
+            assert result == "refused" and len(spawned) == 1
+            poll_spawn.assert_not_called()
+            register_first.set()
+            registrations[-1].join(5)
+            assert not poll.spawn_unparked(repo.name, tid)
+            poll_spawn.assert_not_called()
+            polled = f.tasks.task_add(repo.name, "poller starts before HTTP")
+            assert poll.spawn_unparked(repo.name, polled)
+            assert not runs.ticket_runs(repo.name, polled)
+            duplicate = f.post("/api/tasks", {"repo": repo.name, "ticket": polled}, "polled-slow-572")
+            assert duplicate["body"]["state"] == "starting" and poll_spawn.call_count == 1
+            assert len(spawned) == 2
+            registrations[-1].join(5)
+            assert len(runs.ticket_runs(repo.name, polled)) == 1
+        (f.root / "pending-poll.json").write_text(json.dumps({"http_task": tid, "poll_task": polled,
+                                                            "overlap": result, "children": list(spawned)}))
+        registrations[-1].join(5)
+        replayed = f.post("/api/tasks", {"repo": "replay-sample", "prompt": "slow"}, "slow-572")
+        assert replayed["raw"] == initial["raw"]
+        assert len(runs.ticket_runs("replay-sample", tid)) == 1
+        skipped = f.tasks.task_add(repo.name, "Run anyway starts before keyed HTTP")
+        with mock.patch.object(pipeline, "skipped_tickets", return_value={skipped: {"repo": repo.name, "id": skipped}}), \
+                mock.patch.object(slots, "slots_free_to_start", return_value=1):
+            skipped_first = f.post(f"/api/skipped/{skipped}/run")
+            assert skipped_first["status"] == 200 and not runs.ticket_runs(repo.name, skipped)
+            before = len(spawned)
+            duplicate = f.post("/api/tasks", {"repo": repo.name, "ticket": skipped}, "skipped-slow-572")
+            assert duplicate["body"]["state"] == "starting" and not duplicate["body"]["run"]
+            assert len(spawned) == before
+            assert f.post(f"/api/skipped/{skipped}/run")["status"] == 200
+            assert len(spawned) == before
+        registrations[-1].join(5)
+        assert len(runs.ticket_runs(repo.name, skipped)) == 1
+        (f.root / "pending-skipped.json").write_text(json.dumps({"http_first": skipped_after_http,
+                                                               "skipped_first": skipped_first, "duplicate": duplicate,
+                                                               "children": list(spawned)}))
+        for action in ("resume", "repair", "steps/implement"):
+            original = f.made(action.split("/")[0], pr_url="https://example.test/fixture/pull/1", branch="fixture")
+            row = runs.run_get(original)
+            target = row["issue"]
+            with mock.patch.object(tasks, "free_to_start"), \
+                    mock.patch.object(repairs, "open_heads"), mock.patch.object(pipeline, "script_refusal", return_value=""), \
+                    mock.patch.object(control, "launch", side_effect=lambda *a: delayed(repo.name, target)):
+                path = f"/api/runs/{original}/{action}"
+                accepted = f.post(path, {"base_version": row["version"]})
+                assert accepted["status"] == 200 and accepted["body"]["state"] == "starting", accepted
+                assert f.post(path, {"base_version": row["version"]})["body"]["state"] == "starting"
+            registrations[-1].join(5)
+        def exited(*args):
+            child = subprocess.Popen(["false"], start_new_session=True)
+            f.children.append(child)
+            child.wait()
+            return child
+
+        target = f.tasks.task_add(repo.name, "exited")
+        with mock.patch.object(pipeline, "spawn_run", side_effect=exited):
+            result = f.post("/api/tasks", {"repo": repo.name, "ticket": target}, "exited-572")
+            assert result["status"] == 400 and "did not show" in result["body"]["error"]
+        with mock.patch.object(pipeline, "spawn_run", side_effect=f.fake_spawn):
+            assert f.post("/api/tasks", {"repo": repo.name, "ticket": target}, "retry-exited-572")["body"]["state"] == "running"
+        target = f.tasks.task_add(repo.name, "pending then exited")
+        child = subprocess.Popen(["sleep", "1.3"], start_new_session=True)
+        f.children.append(child)
+        with mock.patch.object(pipeline, "spawn_run", return_value=child):
+            accepted = f.post("/api/tasks", {"repo": repo.name, "ticket": target}, "pending-exit-572")
+            assert accepted["body"]["state"] == "starting"
+        child.wait(5)
+        with mock.patch.object(pipeline, "spawn_run", side_effect=f.fake_spawn):
+            assert f.post("/api/tasks", {"repo": repo.name, "ticket": target}, "after-pending-exit-572")["body"]["state"] == "running"
+    for thread in registrations:
+        thread.join(5)
+
+
+def crash_server(root, mode):
+    from arete import accounts, gh, record, tasks, tracker
+
+    with mock.patch.object(urllib.request, "urlopen", forbidden), mock.patch.object(accounts, "read", forbidden), \
+            mock.patch.object(gh, "gh", forbidden):
+        f = Fixture(root)
+
+        def die(cfg, repo, tid, *args, **kwargs):
+            if mode in ("registered", "terminal"):
+                run = record.start("pipeline", repo=repo.name, issue=tid)
+                if mode == "terminal":
+                    record.settle(run, "done")
+            os._exit(9)
+
+        external = (mock.patch.object(tracker, "for_ticket", return_value=SimpleNamespace(normalize=lambda ticket: ticket))
+                    if mode == "external" else contextlib.nullcontext())
+        with mock.patch.object(tasks, "begin", side_effect=die), external:
+            (root / "crash-ready.json").write_text(json.dumps({"port": f.server.server_port}))
+            while True:
+                time.sleep(.1)
+
+
+def keyed_recovery(f):
+    from arete import pipeline, runlimits, tasks, tracker
+    from arete.store import idempotency
+
+    cases = (("empty", False), ("registered", False), ("terminal", False), ("empty", True), ("external", True))
+    for i, (mode, ticket) in enumerate(cases):
+        body = {"repo": "replay-sample"}
+        if ticket:
+            body["ticket"] = "42" if mode == "external" else f.tasks.task_add("replay-sample", "existing")
+        else:
+            body["prompt"] = "recover " + mode
+        key = f"crash-572-{i}"
+        ready = f.root / "crash-ready.json"
+        ready.unlink(missing_ok=True)
+        f.server.shutdown()
+        f.server.server_close()
+        f.thread.join(5)
+        f.server = None
+        proc = subprocess.Popen([sys.executable, "-I", str(SOURCE / "docs/versioned-api-fixture.py"),
+                                 "--child", "crash-server", "--root", str(f.root), "--crash-mode", mode],
+                                cwd=SOURCE, env=os.environ.copy(), stdout=(f.root / f"crash-{i}.out").open("w"),
+                                stderr=(f.root / f"crash-{i}.err").open("w"))
+        try:
+            deadline = time.monotonic() + 15
+            while not ready.exists() and proc.poll() is None and time.monotonic() < deadline:
+                time.sleep(.02)
+            assert ready.exists(), (f.root / f"crash-{i}.err").read_text()
+            port = json.loads(ready.read_text())["port"]
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            conn.request("POST", "/api/tasks", json.dumps(body),
+                         {"X-Arete": "1", "Content-Type": "application/json", "Idempotency-Key": key})
+            try:
+                conn.getresponse()
+                raise AssertionError("crash server returned a response")
+            except (OSError, http.client.HTTPException):
+                pass
+            finally:
+                conn.close()
+            assert proc.wait(10) == 9
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        claim = idempotency.lookup(f.person, key)
+        assert claim and claim["status"] == 0 and not claim["response"]
+        repo, tid, prompt = idempotency.target(claim)
+        assert prompt != ticket and repo == "replay-sample"
+        before = len(f.rows("SELECT * FROM tasks"))
+        runs_before = f.runs.ticket_runs(repo, tid)
+        f.open()
+        with mock.patch.object(tasks, "held", return_value=""), mock.patch.object(runlimits, "admission", return_value=("", None)), \
+                mock.patch.object(pipeline, "spawn_run", side_effect=f.fake_spawn) as spawn:
+            recovered = f.post("/api/tasks", body, key)
+            assert recovered["status"] == 200 and recovered["body"]["task"] == tid, recovered
+            if runs_before:
+                spawn.assert_not_called()
+                assert recovered["body"]["run"] == runs_before[0]["id"]
+            else:
+                assert spawn.call_count == 1
+            assert len(f.runs.ticket_runs(repo, tid)) == 1
+        assert len(f.rows("SELECT * FROM tasks")) == before
+        (f.root / f"crash-{i}.json").write_text(json.dumps({"exit": 9, "target": tid, "first_seq": claim["first_seq"],
+                                                         "actor": claim["actor"], "via": claim["via"], "runs_before": len(runs_before)}))
+    before = {table: len(f.rows(f"SELECT * FROM {table}")) for table in ("tasks", "events_log", "idempotency")}
+    with mock.patch.object(idempotency, "claim", side_effect=RuntimeError("claim transaction failure")):
+        assert f.post("/api/tasks", {"repo": "replay-sample", "prompt": "rollback"}, "rollback-572")["status"] == 500
+    assert before == {table: len(f.rows(f"SELECT * FROM {table}")) for table in before}
+    assert tracker.is_task_id(tid) is False
+
+
+class DropProxy:
+    def __init__(self, f, mode, repeat=False):
+        self.requests = []
+        proxy = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                proxy.requests.append({"key": self.headers.get("Idempotency-Key"), "body": raw.hex(), "path": self.path})
+                if mode == "in-flight":
+                    payload = b'{"error":"waiting","code":"idempotency_in_flight"}'
+                    self.send_response(409)
+                    self.send_header("Retry-After", "0")
+                else:
+                    conn = http.client.HTTPConnection("127.0.0.1", f.server.server_port, timeout=10)
+                    conn.request("POST", self.path, raw, dict(self.headers))
+                    response = conn.getresponse()
+                    payload = response.read()
+                    status, headers = response.status, response.getheaders()
+                    conn.close()
+                    if mode == "headers" and (repeat or len(proxy.requests) == 1):
+                        self.close_connection = True
+                        return
+                    self.send_response(status)
+                    for name, value in headers:
+                        if name.lower() not in ("content-length", "server", "date"):
+                            self.send_header(name, value)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                if mode == "body" and (repeat or len(proxy.requests) == 1):
+                    self.wfile.write(payload[:len(payload) // 2])
+                    self.close_connection = True
+                    return
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *args):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(5)
+
+
+def keyed_clients(f):
+    from arete import client, pipeline, tasks
+
+    evidence = []
+
+    def cli(arguments, server, env_key=None):
+        env = {k: v for k, v in os.environ.items() if k != "ARETE_IDEMPOTENCY_KEY"}
+        env["ARETE_SERVER"] = f"http://127.0.0.1:{server.server_port}"
+        if env_key is not None:
+            env["ARETE_IDEMPOTENCY_KEY"] = env_key
+        result = subprocess.run([sys.executable, "-m", "arete.cli", *arguments], cwd=SOURCE, env=env,
+                                capture_output=True, text=True, timeout=35)
+        evidence.append({"args": arguments, "stdout": result.stdout, "stderr": result.stderr, "exit": result.returncode})
+        assert "Idempotency-Key: " in result.stderr, result
+        return result, result.stderr.split("Idempotency-Key: ", 1)[1].splitlines()[0]
+
+    with mock.patch.object(tasks, "held", return_value=""), mock.patch.object(pipeline, "spawn_run", side_effect=f.fake_spawn):
+        keys = []
+        for mode in ("headers", "body"):
+            for command in ("start", "task-run", "run"):
+                args = ["task", "start", "--repo", "replay-sample", "client " + mode] if command == "start" else []
+                if command != "start":
+                    tid = f.tasks.task_add("replay-sample", "client " + command)
+                    args = (["task", "run"] if command == "task-run" else ["run"]) + ["replay-sample", tid]
+                if command == "run":
+                    def starting(*args, **kwargs):
+                        return tasks.answer(args[2], args[1].name, "", "starting", "fixture accepted")
+                    context = mock.patch.object(tasks, "begin", side_effect=starting)
+                else:
+                    context = contextlib.nullcontext()
+                with context, DropProxy(f, mode) as proxy:
+                    before = len(f.rows("SELECT * FROM tasks"))
+                    result, key = cli(args, proxy.server)
+                    assert result.returncode == 0, result
+                    assert len(proxy.requests) == 2 and proxy.requests[0] == proxy.requests[1]
+                    keys.append(key)
+                    evidence.append({"proxy": mode, "requests": proxy.requests})
+                    assert len(f.rows("SELECT * FROM tasks")) == before + (command == "start")
+                if command == "start":
+                    repeated, repeated_key = cli([*args, "--key", key], f.server)
+                    assert repeated.returncode == 0 and repeated.stdout == result.stdout and repeated_key == key
+        assert len(set(keys)) == len(keys)
+        for explicit, environment, expected in (("explicit-572", "environment-572", "explicit-572"),
+                                                 (None, "environment-572", "environment-572")):
+            args = ["task", "start", "--repo", "replay-sample", "key selection"]
+            result, key = cli(args + (["--key", explicit] if explicit else []), f.server, environment)
+            assert result.returncode == 0 and key == expected
+        for mode in ("headers", "body", "in-flight"):
+            with DropProxy(f, mode, repeat=True) as proxy:
+                started = time.monotonic()
+                result, key = cli(["task", "start", "--repo", "replay-sample", "exhaust " + mode], proxy.server)
+                assert result.returncode == 1 and time.monotonic() - started < 30
+                assert len(proxy.requests) == 3 and len({r["key"] for r in proxy.requests}) == 1
+                evidence.append({"exhaust": mode, "requests": proxy.requests})
+        with DropProxy(f, "headers", repeat=True) as proxy, \
+                mock.patch.dict(os.environ, ARETE_SERVER=f"http://127.0.0.1:{proxy.server.server_port}"):
+            refuses(client.Broken, lambda: client.call("POST", "/api/fixture/stale/missing", {}))
+            assert len(proxy.requests) == 1
+    attempts, clock = [], [0.0]
+
+    def broken(*args, **kwargs):
+        attempts.append(kwargs)
+        clock[0] += 16
+        raise client.Broken({"error": "simulated broken connection"})
+
+    with mock.patch.object(client, "request_once", side_effect=broken), \
+            mock.patch.object(client.time, "monotonic", side_effect=lambda: clock[0]), \
+            mock.patch.object(client.time, "sleep"):
+        refuses(client.Broken, lambda: client.call("POST", "/api/tasks", {}, key="budget-572"))
+    assert len(attempts) == 2 and attempts[1]["within"] == 14
+    redirects = []
+
+    def connect(where, seconds):
+        transport = mock.Mock()
+        raw = (b"HTTP/1.1 308 Permanent Redirect\r\nLocation: https://fixture.test:1234/api/tasks\r\nContent-Length: 0\r\n\r\n"
+               if where.scheme == "http" else b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+        transport.makefile.return_value = io.BytesIO(raw)
+        response = http.client.HTTPResponse(transport)
+        response.begin()
+        return SimpleNamespace(sock=transport, getresponse=lambda: response, close=lambda: None,
+                               request=lambda method, path, body, headers: redirects.append(
+                                   {"method": method, "path": path, "body": body.hex(), "headers": headers}))
+
+    with mock.patch.object(client, "server", return_value=client.Server("http", "127.0.0.1", 1234, "fixture.test")), \
+            mock.patch.object(client, "connect", side_effect=connect):
+        assert client.call("POST", "/api/tasks", {"prompt": "redirect"}, key="redirect-572") == {}
+    assert len(redirects) == 2
+    assert redirects[0]["body"] == redirects[1]["body"]
+    assert all(r["headers"]["Idempotency-Key"] == "redirect-572" for r in redirects)
+    evidence.append({"redirects": redirects})
+    (f.root / "cli.json").write_text(json.dumps(evidence, indent=2))
+
+
+def idempotency_prune(f):
+    from arete import backup, config, serve, util
+    from arete.store import idempotency, incidents
+
+    instant = datetime(2026, 6, 1, tzinfo=UTC)
+    ledger = f.rows("SELECT * FROM schema_migrations")
+    with f.db.tx() as c:
+        for status in (0, 200):
+            for seconds in (-1, 0, 1):
+                c.execute("INSERT INTO idempotency (actor,key,route,request_sha,status,response,at) VALUES (?,?,?,?,?,?,?)",
+                          (f.person, f"boundary-{status}-{seconds}", "/api/tasks", "sha", status, b"{}",
+                           util.iso(instant - timedelta(days=30) + timedelta(seconds=seconds))))
+    before = f.rows("SELECT key,at,status FROM idempotency")
+    server = SimpleNamespace(cfg=config.load(), say=lambda text: messages.append(text), copy_off_machine=lambda path: None)
+    messages = []
+    with mock.patch.object(util, "now", return_value=instant), \
+            mock.patch.object(backup, "snapshot", side_effect=RuntimeError("backup failure")):
+        serve.Server.prune_data(server)
+    assert f.rows("SELECT key,at,status FROM idempotency") == before
+    ordered = []
+    original = idempotency.prune
+
+    def snapshot(*args):
+        assert f.rows("SELECT key,at,status FROM idempotency") == before
+        ordered.append("backup")
+        target = f.root / f"prune-backup-{len(ordered)}.db"
+        destination = sqlite3.connect(target)
+        try:
+            with f.db.reader() as source:
+                source.backup(destination)
+            assert destination.execute("SELECT COUNT(*) FROM idempotency").fetchone()[0] == 6
+        finally:
+            destination.close()
+        return target
+
+    def prune():
+        assert ordered[-1] == "backup"
+        ordered.append("prune")
+        original()
+
+    with mock.patch.object(util, "now", return_value=instant), mock.patch.object(backup, "snapshot", side_effect=snapshot), \
+            mock.patch.object(idempotency, "prune", side_effect=prune), \
+            mock.patch.object(incidents, "prune", side_effect=RuntimeError("transaction failure")):
+        serve.Server.prune_data(server)
+    assert f.rows("SELECT key,at,status FROM idempotency") == before
+    with mock.patch.object(util, "now", return_value=instant), mock.patch.object(backup, "snapshot", side_effect=snapshot), \
+            mock.patch.object(idempotency, "prune", side_effect=prune):
+        serve.Server.prune_data(server)
+    after = f.rows("SELECT key,at,status FROM idempotency")
+    assert len(after) == 4 and all(not r["key"].endswith("--1") for r in after)
+    assert f.rows("SELECT * FROM schema_migrations") == ledger
+    assert ordered == ["backup", "prune", "backup", "prune"]
+    (f.root / "prune.json").write_text(json.dumps({"before": before, "after": after, "order": ordered, "messages": messages,
+                                                 "backups": [p.name for p in f.root.glob("prune-backup-*.db")]}))
+
+
 def seed_serve(f):
     ids = {"stop": f.made("live", "running", live=True), "retry": f.made("retry"),
            "repair": f.made("repair", pr_url="https://example.test/fixture/pull/1", branch="fixture"),
@@ -662,7 +1205,7 @@ def seed_serve(f):
 
 
 def child(name, root, port):
-    from arete import accounts, control, gh, principals, repairs, tasks
+    from arete import accounts, control, gh, pipeline, principals, repairs, tasks
 
     def stop(*args):
         raise SystemExit(0)
@@ -683,12 +1226,16 @@ def child(name, root, port):
                     actions = {"migration-rollback": lambda _: None, "writes": writes_exercise, "stale-stop": stale_stop,
                                "concurrent-stop": concurrent_stop, "run-commands": run_commands, "grace": grace,
                                "status-races": status_races, "ask-races": ask_races,
-                               "carried-landings": carried_landings, "clients": clients}
+                               "carried-landings": carried_landings, "clients": clients, "keyed-replay": keyed_replay,
+                               "keyed-concurrency": keyed_concurrency, "keyed-clients": keyed_clients,
+                               "keyed-recovery": keyed_recovery, "slow-start": slow_start, "idempotency-prune": idempotency_prune}
                     if name == "serve":
                         seed_serve(f)
                         f.save()
                         with mock.patch.object(tasks, "free_to_start"), mock.patch.object(repairs, "open_heads"), \
-                                mock.patch.object(control, "launch", side_effect=f.fake_launch):
+                                mock.patch.object(tasks, "held", return_value=""), \
+                                mock.patch.object(control, "launch", side_effect=f.fake_launch), \
+                                mock.patch.object(pipeline, "spawn_run", side_effect=f.fake_spawn):
                             while True:
                                 time.sleep(1)
                     else:
@@ -707,11 +1254,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", nargs="?", choices=("exercise", "serve", "inspect"))
     parser.add_argument("exercise", nargs="?", choices=EXERCISES)
-    parser.add_argument("--child", choices=(*EXERCISES, "serve"))
+    parser.add_argument("--child", choices=(*EXERCISES, "serve", "crash-server"))
+    parser.add_argument("--crash-mode", default="empty")
     parser.add_argument("--root", type=Path)
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
-    if args.child:
+    if args.child == "crash-server":
+        crash_server(args.root, args.crash_mode)
+    elif args.child:
         child(args.child, args.root, args.port)
     elif args.mode == "exercise" and args.exercise:
         exercise(args.exercise, args.root)
@@ -728,7 +1278,8 @@ def main():
         roots = [args.root] if args.root else sorted(Path(tempfile.gettempdir()).glob("arete-versioned-api-*"))
         for root in roots:
             print(root)
-            for name in ("result.json", "seed.json", "migration.json", "stdout.txt", "stderr.txt"):
+            for name in ("result.json", "seed.json", "migration.json", "stdout.txt", "stderr.txt", "http.jsonl",
+                         "cli.json", "prune.json", "canonical.json", *(p.name for p in sorted(root.glob("crash-*.json")))):
                 path = root / name
                 if path.exists():
                     print(f"{name}: {path.read_text()[-5000:]}")

@@ -76,6 +76,24 @@ class EventStreamTests(unittest.TestCase):
 
 
 class VersionedApiTests(unittest.TestCase):
+    def test_keyed_replay(self):
+        self.exercise("keyed-replay")
+
+    def test_keyed_concurrency(self):
+        self.exercise("keyed-concurrency")
+
+    def test_keyed_clients(self):
+        self.exercise("keyed-clients")
+
+    def test_keyed_recovery(self):
+        self.exercise("keyed-recovery")
+
+    def test_slow_start(self):
+        self.exercise("slow-start")
+
+    def test_idempotency_prune(self):
+        self.exercise("idempotency-prune")
+
     def exercise(self, name):
         from tests.versioned_api_fixture import exercise
 

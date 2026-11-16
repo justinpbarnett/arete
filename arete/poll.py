@@ -144,11 +144,16 @@ def tracker_reply(repo: config.Repo, tk: tracker.Tracker, tid: str, dry_run: boo
 
 
 def spawn_unparked(repo_name: str, tid: str | int) -> bool:
+    from . import tasks
+
     with util.lock("oncall") as got:
         if not got or str(tid) in oncall.parked(repo_name):
             return False
-        spawn_run(repo_name, tid)
-        return True
+        with tasks.PENDING_LOCK, util.lock(tasks.START_LOCK, wait=True):
+            if tasks.pending_start(repo_name, str(tid)) or run_store.issue_running(repo_name, tid):
+                return False
+            tasks.spawn_pending(repo_name, str(tid), lambda: spawn_run(repo_name, tid))
+            return True
 
 
 def failed(errors: list[str], where: str, error: Exception) -> None:

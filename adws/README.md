@@ -38,7 +38,7 @@ With no `code`, the recipe failed on its own side. The start of `error` says why
 |---|---|---|
 | `no arete server is up`, `the arete server is not up`, `the arete server named in` | no server works on this checkout's state and config | tell the person; do not start arete yourself |
 | `ARETE_SERVER=` | `ARETE_SERVER` is not `http://HOST:PORT` or `https://HOST:PORT` | tell the person |
-| `the server` … `broke off`, `the server answered` … `with no JSON` | the call dropped halfway, so a start, answer, resume, step or stop may have gone through | look with `just adw-status <id>` before you send it again |
+| `the server` … `broke off`, `the server answered` … `with no JSON` | the call dropped halfway and may have gone through | resend a keyed task start with its original key and identical arguments; for answer, resume, step or stop, look with `just adw-status <id>` before sending again |
 | `run` … `with no report line` | the run ended and wrote no report | read `just adw-logs <id>` and tell the person |
 | `the server stopped sending run` | the run's lines stopped for 2 minutes, and the run may still be going | `just adw-wait <id>` again |
 | `write each setting as key=value` | an `adw-step` setting has no `=` | fix the call |
@@ -65,7 +65,13 @@ When the server restarts on new code, `just adw-wait` connects again by itself a
 | `just adw-costs [days]` | cost and time by step, kind and model, then the wait minutes |
 | `just adw-steps [repo]` | the step sheet with each step's resolved settings |
 
-`adw`, `adw-ticket`, `adw-answer`, `adw-resume`, `adw-repair` and `adw-step` print one line: `{"task", "repo", "run", "state", "why"}`. `state` is `running` with the new run's id in `run`, or `queued` with an empty `run`, and `why` says which.
+`adw`, `adw-ticket`, `adw-answer`, `adw-resume`, `adw-repair` and `adw-step` print one line: `{"task", "repo", "run", "state", "why"}`. `state` is `running` with the new run's id in `run`, `queued` with an empty `run`, or `starting` with an empty `run` while a living child registers. `starting` is accepted and exits 0; look up the task to find its run once registration finishes. `why` explains the result.
+
+`arete task start`, `arete task run` and remote `arete run` choose `--key` first, then `ARETE_IDEMPOTENCY_KEY`, otherwise mint a key for that invocation. They print `Idempotency-Key: KEY` on stderr once. Keys contain 8–128 ASCII letters, digits or `_ . : / -`. The recipes inherit `ARETE_IDEMPOTENCY_KEY`; direct CLI commands also accept `--key`.
+
+Task starts automatically retry broken connections, including truncated response bodies, at most twice within one 30-second budget. They keep the same key and body through retries and HTTPS redirects. After an uncertain result, resend the identical command with its printed `--key` (or the same environment key). The server returns the original response bytes, status and receipt with `Idempotent-Replayed: true`, even after restarting. Keys belong to the admitted principal, so another login for the same person shares the answer.
+
+A live duplicate gets HTTP 409 `idempotency_in_flight` and `Retry-After: 1`; the CLI retries within the same budget. Changed content under the same key gets HTTP 422 `idempotency_key_reused`; use a new key for a new operation. Completed `queued`, `starting` and handled-error answers remain the answer for that key. To start a queued task after capacity changes, use a fresh key with `task run` and its ticket. Claims expire after 30 days, so keep recovery resends within that period. Other writes retain their existing behavior; check their state before resending after a disconnect.
 
 ## One whole session
 

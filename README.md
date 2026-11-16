@@ -2650,6 +2650,26 @@ one canonical URL. Delete nothing from real state to reset a fixture; use a fres
 
 ## Versioned write fixture
 
+Keyed task-start exercises use the same disposable fixture and evidence format:
+
+```sh
+"$SB" python docs/versioned-api-fixture.py exercise keyed-replay
+"$SB" python docs/versioned-api-fixture.py exercise keyed-concurrency
+"$SB" python docs/versioned-api-fixture.py exercise keyed-clients
+"$SB" python docs/versioned-api-fixture.py exercise keyed-recovery
+"$SB" python docs/versioned-api-fixture.py exercise slow-start
+"$SB" python docs/versioned-api-fixture.py exercise idempotency-prune
+```
+
+These cover canonical request hashing and exact response replay, live duplicate rejection and principal
+separation, real CLI proxy disconnects before headers and during bodies, server subprocess exit 9 after
+claim insertion, delayed child registration, and strict 30-day expiration through serve pruning.
+`http.jsonl` retains raw response bytes as hexadecimal; `canonical.json` represents response BLOBs as
+`bytes_hex`. `cli.json` records command stderr and proxy requests, `crash-*.json` links child exits to
+saved target events, and `prune.json` records the boundary rows and backup ordering. Use
+`inspect --root PATH` on the printed evidence directory. Serve mode includes a fake task launcher for
+direct keyed `POST /api/tasks` calls as well as the run-action controls below.
+
 Run these through the verification sandbox, from a checkout:
 
 ```sh

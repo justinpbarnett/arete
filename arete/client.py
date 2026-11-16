@@ -4,6 +4,7 @@ import getpass
 import http.client
 import json
 import os
+import secrets
 import socket
 import ssl
 import sys
@@ -33,6 +34,14 @@ class Failed(Exception):
     def __init__(self, answer: dict, code: int = 0):
         super().__init__(str(answer.get("error", "")))
         self.answer, self.code = answer, code
+
+
+class Broken(Failed):
+    pass
+
+
+class InFlight(Failed):
+    seconds = 1
 
 
 class Restarting(Exception):
@@ -109,7 +118,7 @@ def connect(where: Server, seconds: float = CONNECT_SECONDS) -> http.client.HTTP
 
 
 def request(method: str, path: str, body: dict | None = None,
-            read_seconds: float | None = CALL_SECONDS) -> http.client.HTTPResponse:
+            read_seconds: float | None = CALL_SECONDS, key: str | None = None) -> http.client.HTTPResponse:
     deadline = None
     restart = None
     while True:
@@ -117,7 +126,7 @@ def request(method: str, path: str, body: dict | None = None,
         if within is not None and within <= 0:
             raise Failed(restart.answer, 503)
         try:
-            return request_once(method, path, body, read_seconds, within)
+            return request_once(method, path, body, read_seconds, within, **({"key": key} if key is not None else {}))
         except Restarting as e:
             restart, pause = e, e.seconds
         except Down:
@@ -133,31 +142,48 @@ def request(method: str, path: str, body: dict | None = None,
 
 
 def request_once(method: str, path: str, body: dict | None = None,
-                 read_seconds: float | None = CALL_SECONDS, within: float | None = None) -> http.client.HTTPResponse:
+                 read_seconds: float | None = CALL_SECONDS, within: float | None = None,
+                 key: str | None = None) -> http.client.HTTPResponse:
+    deadline = None if within is None else time.monotonic() + within
     where = server()
     payload = json.dumps(body or {}).encode() if method == "POST" else None
     followed = False
     if within is not None:
         read_seconds = within if read_seconds is None else min(read_seconds, within)
     while True:
+        if deadline is not None:
+            within = deadline - time.monotonic()
+            if within <= 0:
+                raise Broken({"error": "task start retry budget expired"})
+            read_seconds = within if read_seconds is None else min(read_seconds, within)
         conn = connect(where, CONNECT_SECONDS if within is None else min(CONNECT_SECONDS, within))
-        conn.sock.settimeout(read_seconds)
+        transport = conn.sock
+        transport.settimeout(read_seconds if deadline is None else max(.001, deadline - time.monotonic()))
         headers = headers_for(where)
+        if key is not None:
+            headers["Idempotency-Key"] = key
         if payload is not None:
             headers["Content-Type"] = "application/json"
         try:
             conn.request(method, path, payload, headers)
+            if deadline is not None:
+                transport.settimeout(max(.001, deadline - time.monotonic()))
             resp = conn.getresponse()
+            resp.arete_transport = transport
             if not followed and (moved := util.https_upgrade(resp, where.port)):
-                resp.read()
+                read_response(resp, deadline) if key is not None else resp.read()
                 conn.close()
                 where, followed = Server("https", where.host, where.port, moved.hostname), True
                 continue
             if resp.status < 400:
                 return resp
-            text = resp.read()
+            text = read_response(resp, deadline) if key is not None else resp.read()
         except BROKE as e:
-            raise Failed({"error": f"the server at {address(where)} broke off: {e}"}) from None
+            conn.close()
+            raise Broken({"error": f"the server at {address(where)} broke off: {e}"}) from None
+        except Broken:
+            conn.close()
+            raise
         break
     try:
         answer = json.loads(text)
@@ -166,13 +192,39 @@ def request_once(method: str, path: str, body: dict | None = None,
     failure = (answer if isinstance(answer, dict) and "error" in answer
                else {"error": f"the server at {address(where)} answered {resp.status}"})
     wait = (resp.getheader("Retry-After") or "").strip()
+    conn.close()
+    if key is not None and resp.status == 409 and failure.get("code") == "idempotency_in_flight":
+        failure = InFlight(failure, resp.status)
+        failure.seconds = int(wait) if wait.isascii() and wait.isdigit() else 1
+        raise failure
     if resp.status == 503 and wait.isascii() and wait.isdigit():
         conn.close()
         raise Restarting(failure, int(wait))
     raise Failed(failure, resp.status)
 
 
-def call(method: str, path: str, body: dict | None = None) -> dict:
+def read_response(resp, deadline):
+    if deadline is None:
+        return resp.read()
+    chunks = []
+    while not resp.isclosed():
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise Broken({"error": "task start retry budget expired"})
+        resp.arete_transport.settimeout(left)
+        chunk = resp.read1(65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    payload = b"".join(chunks)
+    if resp.length:
+        raise http.client.IncompleteRead(payload, resp.length)
+    return payload
+
+
+def call(method: str, path: str, body: dict | None = None, key: str | None = None) -> dict:
+    if key is not None and method == "POST" and path == "/api/tasks":
+        return keyed_call(body, key)
     resp = request(method, path, body)
     try:
         answer = json.loads(resp.read())
@@ -181,6 +233,52 @@ def call(method: str, path: str, body: dict | None = None) -> dict:
     except ValueError:
         raise Failed({"error": f"the server answered {method} {path} with no JSON"}) from None
     return answer
+
+
+def keyed_call(body, key):
+    deadline = time.monotonic() + 30
+    retries, restart, failure = 0, None, None
+    uncertain = False
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise failure or Failed({"error": "task start retry budget expired"})
+        if uncertain:
+            if retries >= 2:
+                raise failure
+            retries += 1
+        resp = None
+        try:
+            resp = request_once("POST", "/api/tasks", body, within=left, key=key)
+            answer = json.loads(read_response(resp, deadline))
+            return answer
+        except BROKE as e:
+            failure = Broken({"error": f"the server broke off: {e}"})
+            uncertain, pause = True, 0
+        except (Broken, InFlight) as e:
+            failure, pause = e, getattr(e, "seconds", 0)
+            uncertain = True
+        except Restarting as e:
+            restart, failure, pause = e, Failed(e.answer, 503), e.seconds
+            time.sleep(min(pause, max(0, deadline - time.monotonic())))
+            continue
+        except Down as e:
+            if not uncertain and restart is None:
+                raise
+            failure, pause = Broken({"error": str(e)}), RETRY_SECONDS
+        except ValueError:
+            raise Failed({"error": "the server answered POST /api/tasks with no JSON"}) from None
+        finally:
+            if resp is not None:
+                resp.close()
+        time.sleep(min(pause, max(0, deadline - time.monotonic())))
+
+
+def start_task(body, key=None):
+    chosen = key if key is not None else os.environ.get("ARETE_IDEMPOTENCY_KEY")
+    chosen = chosen if chosen is not None else secrets.token_hex(16)
+    print(f"Idempotency-Key: {chosen}", file=sys.stderr, flush=True)
+    return call("POST", "/api/tasks", body, key=chosen)
 
 
 def stream(path: str, query: dict) -> Iterator[dict]:

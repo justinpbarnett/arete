@@ -25,7 +25,7 @@ def cmd_run(args) -> int:
 
     if not (args.local or args.dry_run):
         try:
-            started = client.call("POST", "/api/tasks", {"repo": args.repo, "ticket": args.issue, "force": args.force})
+            started = client.start_task({"repo": args.repo, "ticket": args.issue, "force": args.force}, args.key)
         except client.Down:
             started = None
         except client.Failed as e:
@@ -40,7 +40,7 @@ def run_followed(started: dict) -> int:
 
     client.emit(started)
     if not (run_id := started.get("run")):
-        return 0 if started.get("state") == "queued" else 1
+        return 0 if started.get("state") in ("queued", "starting") else 1
     try:
         for line in client.followed(run_id):
             client.emit(line)
@@ -154,6 +154,7 @@ def register(sub) -> None:
     p.add_argument("--local", action="store_true", help="run in this process even when the server is up; the server "
                                                         "and the poller start runs this way")
     p.set_defaults(fn=cmd_run)
+    p.add_argument("--key", default=None, help="reuse an identical remote task-start request safely")
 
     p = steering(sub.add_parser("resume", help="continue a run that ended interrupted, stopped or failed, through the "
                                                "server"))
