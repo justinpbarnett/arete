@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import re
 import shutil
-import signal
 import threading
 import tomllib
 from dataclasses import dataclass
@@ -163,19 +162,15 @@ def draft(request: DraftRequest, run_id: str = "", say=print) -> dict:
         say(text)
         state.add_feed(run_id, kind, text)
 
-    signal.signal(signal.SIGTERM, loop_run.stop_on_term)
-    try:
-        with record.failed_on_crash(run_id):
-            try:
-                made = write_draft(run_id, request, cfg, tell)
-            except (control.Refused, loop_run.Stopped) as e:
-                status, why = ("stopped", record.STOPPED) if isinstance(e, loop_run.Stopped) else ("failed", str(e))
-                record.settle(run_id, status, end_line=f"{status}: {why}", summary=why[:500])
-                raise control.Refused(why) from None
-            drafted = f"drafted {made['name']} in {paths.short_path(made['dir'])}"
-            record.settle(run_id, "done", end_line=f"done: {drafted}, off. Try it, then turn it on.", summary=drafted)
-    finally:
-        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    with record.stoppable(), record.failed_on_crash(run_id):
+        try:
+            made = write_draft(run_id, request, cfg, tell)
+        except (control.Refused, record.Stopped) as e:
+            status, why = ("stopped", record.STOPPED) if isinstance(e, record.Stopped) else ("failed", str(e))
+            record.settle(run_id, status, end_line=f"{status}: {why}", summary=why[:500])
+            raise control.Refused(why) from None
+        drafted = f"drafted {made['name']} in {paths.short_path(made['dir'])}"
+        record.settle(run_id, "done", end_line=f"done: {drafted}, off. Try it, then turn it on.", summary=drafted)
     return {**made, "paid": record.metered_spent(run_id)}
 
 

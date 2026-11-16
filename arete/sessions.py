@@ -5,7 +5,6 @@ import json
 import os
 import posixpath
 import shlex
-import signal
 import tempfile
 import time
 from dataclasses import asdict, dataclass, field
@@ -98,10 +97,6 @@ class Spec:
     turn_error: str = ""
     publish_error: str = ""
     chat: int = 0
-
-
-class SessionStopped(Exception):
-    pass
 
 
 def spec_file(session_id: str) -> Path:
@@ -275,10 +270,6 @@ def write_log(spec: Spec, kind: str, text: str) -> None:
     f.parent.mkdir(parents=True, exist_ok=True)
     with open(f, "a") as out:
         out.write(f"{util.iso()} [{kind}] {text}\n")
-
-
-def stop_on_term(*_) -> None:
-    raise SessionStopped
 
 
 def session_lock(session_id: str) -> str:
@@ -624,6 +615,40 @@ def conclude_task(spec: Spec, cfg: config.Config, answer: dict | None, error: st
     return "done", "reported: " + util.first_line(report["summary"], 200)
 
 
+def run_conversation(spec: Spec, cfg: config.Config, device: devices.Device) -> tuple[str, str]:
+    status, summary = "done", ""
+    if spec.github:
+        clone_repo(spec, cfg, device)
+    resume, turn, prompt, asked = NO_SESSION, 0, spec.prompt, None
+    idle_since = time.monotonic()
+    try:
+        while True:
+            if prompt:
+                turn += 1
+                resume = take_turn(spec, cfg, device, prompt, turn, resume)
+                if spec.github:
+                    return_work(spec, cfg, device, f"arete session {spec.id}, turn {turn}")
+                idle_since = time.monotonic()
+            prompt = "\n\n".join(state.take_messages(spec.id))
+            if prompt:
+                continue
+            if spec.task:
+                asked = publish_then_ask_report(spec, cfg, device, turn + 1, resume)
+                break
+            if time.monotonic() - idle_since > cfg.session_idle_hours * 3600:
+                summary = f"closed after {cfg.session_idle_hours:g}h with no message"
+                break
+            time.sleep(INBOX_POLL_SECONDS)
+    finally:
+        if spec.github and spec.cloned:
+            return_work(spec, cfg, device, f"arete session {spec.id}, last changes", last=True)
+    if asked:
+        status, summary = conclude_task(spec, cfg, *asked)
+    if spec.unreturned:
+        status, summary = "failed", "the session's work did not come back from the device"
+    return status, summary
+
+
 def execute(session_id: str) -> str:
     spec = load_spec(session_id)
     cfg = config.load()
@@ -633,50 +658,15 @@ def execute(session_id: str) -> str:
         if (ended := (state.run_get(session_id) or {}).get("status", "gone")) != "running":
             return ended
         record.note(session_id, pid=os.getpid(), engine_sha=codebase.STAMP, schema_version=state.LATEST)
-        signal.signal(signal.SIGTERM, stop_on_term)
-        status, summary = "done", ""
         try:
-            with devices.lease(spec.device, spec.id, lambda text: log_line(spec, "device", text),
-                               lambda: unreturned_reason(spec)) as device:
-                if spec.github:
-                    clone_repo(spec, cfg, device)
-                resume, turn, prompt, asked = NO_SESSION, 0, spec.prompt, None
-                idle_since = time.monotonic()
-                try:
-                    while True:
-                        if prompt:
-                            turn += 1
-                            resume = take_turn(spec, cfg, device, prompt, turn, resume)
-                            if spec.github:
-                                return_work(spec, cfg, device, f"arete session {spec.id}, turn {turn}")
-                            idle_since = time.monotonic()
-                        prompt = "\n\n".join(state.take_messages(session_id))
-                        if prompt:
-                            continue
-                        if spec.task:
-                            asked = publish_then_ask_report(spec, cfg, device, turn + 1, resume)
-                            break
-                        if time.monotonic() - idle_since > cfg.session_idle_hours * 3600:
-                            summary = f"closed after {cfg.session_idle_hours:g}h with no message"
-                            break
-                        time.sleep(INBOX_POLL_SECONDS)
-                finally:
-                    if spec.github and spec.cloned:
-                        return_work(spec, cfg, device, f"arete session {spec.id}, last changes", last=True)
-                if asked:
-                    status, summary = conclude_task(spec, cfg, *asked)
-                if spec.unreturned:
-                    status, summary = "failed", "the session's work did not come back from the device"
+            with (record.stoppable(),
+                  devices.lease(spec.device, spec.id, lambda text: log_line(spec, "device", text),
+                                lambda: unreturned_reason(spec)) as device):
+                status, summary = run_conversation(spec, cfg, device)
                 if summary:
                     close(spec, status, summary)
-        except SessionStopped:
-            status, summary = "stopped", record.STOPPED if record.stop_asked(session_id) else "stopped by a signal"
-        except devices.DeviceError as e:
-            status, summary = "failed", util.one_line(str(e), 500)
         except Exception as e:
-            status, summary = "failed", f"{type(e).__name__}: {util.first_line(str(e), 300)}"
-        finally:
-            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            status, summary = devices.outcome_of(e, session_id)
         close(spec, status, devices.with_left_up(summary, session_id))
         return status
 
