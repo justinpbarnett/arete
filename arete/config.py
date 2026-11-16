@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from . import outbound, paths
+from . import outbound, paths, util
 
 MODEL_ROLES = ("plan", "build", "verify", "review", "learn", "uat", "miner", "apply", "eval_mine", "triage", "chat",
                "classify", "loop", "session", "research", "research_plan", "research_search",
@@ -92,7 +92,6 @@ RUN_LABELS = (*STATES, DELIVERED)
 TASK_STATES = ("todo", *STATES, DELIVERED, "closed")
 TASK_FINISHED = (DELIVERED, "closed")
 RESEARCH_MOVES = ("running", "pr", "failed", DELIVERED)
-DASHBOARD_PORT = 8796
 
 
 @dataclass
@@ -260,7 +259,7 @@ class Config:
     max_parallel: int = 1
     max_parallel_per_repo: int = 1
     max_parallel_checks: int = 2
-    dashboard_port: int = DASHBOARD_PORT
+    dashboard_port: int = paths.DASHBOARD_PORT
     dashboard_owner: str = ""
     dashboard_https: bool = False
     loop_dirs: list[Path] = field(default_factory=lambda: [paths.CONFIG_DIR / "loops"])
@@ -568,9 +567,7 @@ def allowed_payment_modes(cfg: Config, layer: RepoLayer | None = None) -> tuple[
 
 
 def price_rate(value, where: str) -> float:
-    from .routing import number
-
-    found = number(value)
+    found = util.nonnegative_number(value)
     if found is None:
         raise ValueError(f"{where}: price must be a finite nonnegative number")
     return found
@@ -865,7 +862,7 @@ def load_or_problem(path: Path | None = None) -> tuple[Config, str]:
     except Exception:
         return fallback, problem
     with contextlib.suppress(Exception):
-        fallback.dashboard_port = int(dashboard.get("port", DASHBOARD_PORT))
+        fallback.dashboard_port = int(dashboard.get("port", paths.DASHBOARD_PORT))
     with contextlib.suppress(Exception):
         fallback.dashboard_https = dashboard_https(dashboard.get("https", False))
     if isinstance(dashboard.get("owner", ""), str):
@@ -890,7 +887,7 @@ def load(path: Path | None = None, strict: bool = False) -> Config:
         max_parallel=max(1, int(data.get("max_parallel", 1))),
         max_parallel_per_repo=max(1, int(data.get("max_parallel_per_repo", 1))),
         max_parallel_checks=max(1, int(data.get("max_parallel_checks", 2))),
-        dashboard_port=int(data.get("dashboard", {}).get("port", DASHBOARD_PORT)),
+        dashboard_port=int(data.get("dashboard", {}).get("port", paths.DASHBOARD_PORT)),
         dashboard_owner=data.get("dashboard", {}).get("owner", ""),
         dashboard_https=dashboard_https(data.get("dashboard", {}).get("https", False)),
     )

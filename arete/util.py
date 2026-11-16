@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import fcntl
 import fnmatch
+import functools
 import hashlib
+import http.client
 import json
+import math
 import os
 import re
+import shutil
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -16,8 +21,9 @@ from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO
+from urllib.parse import SplitResult, urlsplit
 
-from . import paths
+from . import paths, sandbox
 
 PROBE_GRACE_SECONDS = 0.2
 TIMED_OUT = 124
@@ -79,9 +85,7 @@ def sh(
     keeps: tuple[str, ...] = (),
 ) -> subprocess.CompletedProcess:
     full_env = foreground_maintenance({**(os.environ if inherit else {}), **(env or {})})
-    from . import scratch
-
-    command = scratch.protected_command(cmd, cwd, keeps)
+    command = sandbox.protected_command(cmd, cwd, keeps)
     try:
         res = run_whole_tree(
             command,
@@ -225,6 +229,41 @@ def repo_lock(src: Path):
     with open(paths.LOCKS_DIR / f"git-{name}.lock", "a") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         yield
+
+
+def add_worktree(src: Path, wt: Path, branch: str, start: str, reset: bool = False) -> None:
+    with repo_lock(src):
+        branch_existed = bool(git(["rev-parse", "--verify", "-q", f"refs/heads/{branch}"], src, check=False).strip())
+        path_existed = wt.exists()
+        try:
+            git(["worktree", "add", "-q", "--no-track", "-B" if reset else "-b", branch, str(wt), start], src)
+        except BaseException:
+            if not path_existed:
+                git(["worktree", "remove", "--force", str(wt)], src, check=False)
+                shutil.rmtree(wt, ignore_errors=True)
+            if not branch_existed:
+                _drop_branch(src, branch)
+            raise
+
+
+def delete_branch(src: Path, branch: str) -> None:
+    with repo_lock(src):
+        _drop_branch(src, branch)
+
+
+def _drop_branch(src: Path, branch: str) -> None:
+    git(["branch", "-D", branch], src, check=False)
+    if git(["rev-parse", "--verify", "-q", f"refs/heads/{branch}"], src, check=False).strip():
+        return
+    for attempt in range(5):
+        if not any(git(["config", "--get", f"branch.{branch}.{key}"], src, check=False).strip()
+                   for key in ("merge", "remote")):
+            break
+        removed = sh(["git", "config", "--remove-section", f"branch.{branch}"], cwd=src)
+        if removed.returncode == 0:
+            break
+        if attempt < 4:
+            time.sleep(0.1)
 
 
 def _s(b) -> str:
@@ -499,4 +538,85 @@ def write_durably(p: Path, data: bytes, mode: int | None = None, check=None) -> 
 
 
 def write_json(p: Path, data) -> None:
-    write_durably(p, json.dumps(data, indent=2, default=str).encode(), 0o600)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    write_bytes_atomic(p, json.dumps(data, indent=2, default=str).encode())
+
+
+GROUP_STOP_SECONDS = 10
+
+
+def group_alive(proc: subprocess.Popen) -> bool:
+    proc.poll()
+    try:
+        os.killpg(proc.pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
+def kill_group(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def stop_group(proc: subprocess.Popen) -> None:
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+        except OSError:
+            break
+        deadline = time.monotonic() + GROUP_STOP_SECONDS
+        while group_alive(proc) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        if not group_alive(proc):
+            break
+    proc.wait()
+
+
+def nonnegative_number(value) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        found = float(value)
+    except ValueError:
+        return None
+    return found if math.isfinite(found) and found >= 0 else None
+
+
+@functools.cache
+def github_token() -> str:
+    if paths.ISOLATED:
+        return ""
+    res = sh(["gh", "auth", "token"], timeout=10)
+    return res.stdout.strip() if res.returncode == 0 else ""
+
+
+class NamedTlsConnection(http.client.HTTPSConnection):
+    def __init__(self, address: str, port: int, hostname: str, timeout: float | None = None):
+        options = {} if timeout is None else {"timeout": timeout}
+        super().__init__(hostname, port, context=ssl.create_default_context(), **options)
+        self.address = address
+
+    def connect(self) -> None:
+        sock = socket.create_connection((self.address, self.port), self.timeout)
+        try:
+            self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+        except BaseException:
+            sock.close()
+            raise
+
+
+def https_upgrade(resp: http.client.HTTPResponse, port: int | None) -> SplitResult | None:
+    try:
+        moved = urlsplit(resp.getheader("Location") or "")
+        if resp.status not in (301, 302, 307, 308) or moved.scheme != "https" or not moved.hostname:
+            return None
+        return moved if (moved.port or 443) == port else None
+    except ValueError:
+        return None
+
+
+def write_bytes_atomic(path: Path, data: bytes) -> None:
+    write_durably(path, data, 0o600)

@@ -7,7 +7,22 @@ import urllib.request
 from dataclasses import dataclass, replace
 from datetime import UTC, timedelta
 
-from . import accounts, claude, codex, config, devices, environment, paths, pi, prices, record, runner, state, util
+from . import (
+    accounts,
+    claude,
+    codex,
+    config,
+    devices,
+    environment,
+    paths,
+    pi,
+    prices,
+    runner,
+    sandbox,
+    scrub,
+    state,
+    util,
+)
 from .agent import model_scope
 
 CLAUDE_PI_MODELS = {"fable": "claude-fable-5-2", "opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5-5",
@@ -69,7 +84,7 @@ class Quote:
 
     @property
     def total(self) -> float | None:
-        return None if self.input is None or self.output is None else number(self.input + self.output)
+        return None if self.input is None or self.output is None else util.nonnegative_number(self.input + self.output)
 
 
 @dataclass(frozen=True)
@@ -206,8 +221,8 @@ def incompatible(way: Way, settings, device: devices.Device) -> str:
             return f"mcp {', '.join(settings.mcp)} cannot load on pi, which runs with --no-mcp"
         if settings.instructions_on("pi"):
             return f"instructions {', '.join(settings.instructions_on('pi'))} cannot load on pi"
-        if runner.WRITING_TOOLS & set(settings.tools) and not pi.can_confine(False):
-            return pi.NO_CONFINEMENT_REASON
+        if runner.WRITING_TOOLS & set(settings.tools) and not sandbox.can_confine(False):
+            return sandbox.NO_CONFINEMENT_REASON
     fallback = not (way.link.requested and way.runner == way.link.runner)
     if way.runner == "pi" and fallback and "Bash" in settings.tools and not device.exe_sandbox:
         return runner.PI_HOLDS_NO_BASH_RULES
@@ -288,19 +303,9 @@ def fit_refusal(request: Request, device: devices.Device, modes: tuple[str, ...]
     return first
 
 
-def number(value) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
-        return None
-    try:
-        found = float(value)
-    except ValueError:
-        return None
-    return found if math.isfinite(found) and found >= 0 else None
-
-
 def per_million(value) -> float | None:
-    found = number(value)
-    scaled = None if found is None else number(found * 1e6)
+    found = util.nonnegative_number(value)
+    scaled = None if found is None else util.nonnegative_number(found * 1e6)
     return None if scaled is None else round(scaled, 6)
 
 
@@ -314,7 +319,7 @@ def names(value) -> list[str] | None:
 
 def listing(entry) -> dict:
     entry = accounts.mapping(entry)
-    return {**{key: number(entry.get(key)) for key in ("input", "output", "cache_read", "cache_write")},
+    return {**{key: util.nonnegative_number(entry.get(key)) for key in ("input", "output", "cache_read", "cache_write")},
             "context": whole(entry.get("context")), "modalities": names(entry.get("modalities")),
             "structured_output": entry["structured_output"] if type(entry.get("structured_output")) is bool else None}
 
@@ -362,8 +367,8 @@ def local_quote(model: str, selected: pi.Route) -> Quote | None:
         item = accounts.mapping(item)
         if item.get("id") == name and isinstance(item.get("cost"), dict):
             cost = item["cost"]
-            return Quote(number(cost.get("input")), number(cost.get("output")), number(cost.get("cacheRead")),
-                         number(cost.get("cacheWrite")), "models.json")
+            return Quote(util.nonnegative_number(cost.get("input")), util.nonnegative_number(cost.get("output")), util.nonnegative_number(cost.get("cacheRead")),
+                         util.nonnegative_number(cost.get("cacheWrite")), "models.json")
     return None
 
 
@@ -575,14 +580,14 @@ class Discovery:
         if way.runner == "pi":
             selected = self.probe(way.model, way.mode)
             if selected.token_error:
-                return "refused", record.scrub(selected.token_error, selected.hidden), ""
+                return "refused", scrub.scrub(selected.token_error, selected.hidden), ""
             if way.mode == "login" and not selected.login_available:
                 return "missing_login", f"no {selected.provider or 'pi'} login in pi's auth store", ""
             if way.mode == "api_key" and not selected.key_available:
                 found = f"no supported {selected.provider or 'pi'} key in {pi.KEYS_FILE.name} or the environment"
                 return "missing_key", found, ""
             if selected.error:
-                return "unavailable", record.scrub(selected.error, selected.hidden), ""
+                return "unavailable", scrub.scrub(selected.error, selected.hidden), ""
             auth, model = selected.auth, selected.model
         elif way.runner == "codex":
             auth, model = self.codex_auth(), way.model

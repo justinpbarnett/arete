@@ -9,7 +9,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Literal
 
-from . import alerts, config, paths, state, tool_events, tracker, util
+from . import alerts, config, doctor, paths, state, tool_events, tracker, util
 from .heartbeat import mark_loop
 
 AUDIT_DIR = paths.STATE_DIR / "audit"
@@ -257,19 +257,51 @@ def run_stats() -> list[str]:
     return lines
 
 
-def audit(cfg: config.Config) -> tuple[list[Finding], list[str]]:
+HEARTBEAT_OWNED = {"cost": "costs:drift", "backup": "backup:db"}
+DOCTOR_LINE = re.compile(r"^- (?:FAIL|WARN) \[doctor:")
+
+
+def heartbeat_failing() -> set[str]:
+    data = util.read_json(paths.HEARTBEAT_FILE, {})
+    listed = data.get("checks") if isinstance(data, dict) else None
+    if not isinstance(listed, list):
+        return set()
+    return {c["key"] for c in listed if isinstance(c, dict) and isinstance(c.get("key"), str)
+            and c.get("ok") is False and c.get("severity", "fail") == "fail"}
+
+
+def doctor_findings(results: list[doctor.Result]) -> list[Finding]:
+    owned = heartbeat_failing()
+    out = []
+    for r in results:
+        subject = ", ".join(r.ids) or r.name
+        detail = f"{r.count}: {r.detail}"
+        if r.name == "chat" and r.severity == "info":
+            if r.count:
+                out.append(Finding("doctor:chat", "info", subject, detail))
+        elif r.failing:
+            alerted = HEARTBEAT_OWNED.get(r.name) in owned
+            out.append(Finding(f"doctor:{r.name}", "warn" if alerted else "fail", subject, detail))
+    return out
+
+
+def audit(cfg: config.Config) -> tuple[list[Finding], list[str], list[doctor.Result]]:
     skills, names = check_skills(cfg)
-    findings = skills + check_hooks(cfg) + check_repos(cfg) + check_events(cfg, names)
-    return findings, run_stats()
+    results = doctor.run()
+    findings = skills + check_hooks(cfg) + check_repos(cfg) + check_events(cfg, names) + doctor_findings(results)
+    return findings, run_stats(), results
 
 
-def report(findings: list[Finding], stats: list[str]) -> str:
+def report(findings: list[Finding], stats: list[str], results: list[doctor.Result]) -> str:
     order = {"fail": 0, "warn": 1, "info": 2}
     lines = [f"# Harness audit {util.now():%Y-%m-%d}", ""]
     if not findings:
         lines.append("Nothing to fix.")
     for f in sorted(findings, key=lambda f: (order[f.severity], f.check, f.subject)):
         lines.append(" ".join(f"- {f.severity.upper()} [{f.check}] {f.subject}: {f.detail}".split()))
+    lines += ["", "## Doctor", ""]
+    for r in results:
+        lines.append(f"- {r.name}: {doctor.status(r)} {r.count} {doctor.summary(r)}")
     if stats:
         lines += ["", "## Arete runs, last 7 days", ""] + stats
     return "\n".join(lines) + "\n"
@@ -279,7 +311,8 @@ def latest_findings(max_chars: int = 4000) -> str:
     f = AUDIT_DIR / "latest.md"
     if not f.exists():
         return "(no audit yet)"
-    lines = [ln for ln in f.read_text().splitlines() if ln.startswith(("- FAIL", "- WARN"))]
+    lines = [ln for ln in f.read_text().splitlines()
+             if ln.startswith(("- FAIL", "- WARN")) and not DOCTOR_LINE.match(ln)]
     return "\n".join(lines)[:max_chars] or "(nothing to fix)"
 
 
@@ -291,13 +324,13 @@ def run(dry_run: bool = False) -> int:
             print("audit already running")
             return 0
         try:
-            findings, stats = audit(cfg)
+            findings, stats, results = audit(cfg)
         except Exception as e:
             print(f"audit crashed: {type(e).__name__}: {e}")
             if not dry_run:
                 mark_loop("audit", False, f"{type(e).__name__}: {e}")
             return 1
-        text = report(findings, stats)
+        text = report(findings, stats, results)
         fails = [f for f in findings if f.severity == "fail"]
         print(f"{util.iso()} audit: {len(fails)} fail, {sum(f.severity == 'warn' for f in findings)} warn")
         if dry_run:

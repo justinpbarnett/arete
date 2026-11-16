@@ -19,7 +19,7 @@ from . import (
     paths,
     record,
     runner,
-    scratch,
+    sandbox,
     state,
     steps,
     tracker,
@@ -201,7 +201,7 @@ class Source:
 
     def read(self, rel: str) -> bytes:
         if self.ref:
-            res = subprocess.run(scratch.protected_command(["git", "show", f"{self.ref}:{rel}"], self.repo.path),
+            res = subprocess.run(sandbox.protected_command(["git", "show", f"{self.ref}:{rel}"], self.repo.path),
                                  cwd=self.repo.path, capture_output=True,
                                  timeout=60, check=False)
             if res.returncode != 0:

@@ -12,7 +12,21 @@ from functools import partial
 from pathlib import Path
 from string import Template
 
-from . import config, control, jev, log_follower, outbound, paths, record, run_lines, screening, sources, state, util
+from . import (
+    config,
+    control,
+    jev,
+    log_follower,
+    outbound,
+    paths,
+    record,
+    run_lines,
+    screening,
+    scrub,
+    sources,
+    state,
+    util,
+)
 from .sighting import Sighting
 
 UNEXPECTED, HEARTBEAT, STALLED, ORCHESTRATION, EXPECTED = "unexpected", "heartbeat", "stalled", "orchestration", "expected"
@@ -736,14 +750,14 @@ class Watch:
 
     def store(self) -> tuple[int, int, int]:
         events = [e for e in self.found.values() if e.kind != EXPECTED]
-        hidden = record.secrets() if events else ()
+        hidden = scrub.secrets() if events else ()
         held = state.known_fingerprints() if events else {}
         rows = []
         for e in events:
-            signature = outbound.redact(sources.signature(record.scrub(e.signature, hidden)))
+            signature = outbound.redact(sources.signature(scrub.scrub(e.signature, hidden)))
             if e.kind == ORCHESTRATION:
                 signature = signature.removeprefix("<time> ")
-            evidence = outbound.redact(record.scrub("\n".join(e.window), hidden))[:MAX_EVIDENCE]
+            evidence = outbound.redact(scrub.scrub("\n".join(e.window), hidden))[:MAX_EVIDENCE]
             scope = e.scope
             fingerprint = fingerprint_of(e.kind, scope, signature)
             older = fingerprint_of(e.kind, e.legacy, signature)

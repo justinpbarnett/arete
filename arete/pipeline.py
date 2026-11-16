@@ -24,6 +24,7 @@ from typing import NamedTuple, TextIO
 
 from . import (
     alerts,
+    browser,
     ci,
     config,
     control,
@@ -44,6 +45,7 @@ from . import (
     run_lines,
     runlimits,
     runner,
+    sandbox,
     scratch,
     state,
     steps,
@@ -452,6 +454,7 @@ class Run(AgentRun):
     asks_made: int = 0
     answers_due: list[dict] = field(default_factory=list)
     base_note: str = ""
+    kept_note: str = ""
 
     @property
     def ref(self) -> str:
@@ -496,13 +499,15 @@ class Run(AgentRun):
         return [a for a in here if a["call"] == call] or here
 
     def fresh_text(self, text: str, due: list[dict]) -> str:
-        return "\n\n".join(part for part in (text, owner_asks.fresh_note(due), self.base_note) if part)
+        return "\n\n".join(part for part in (text, owner_asks.fresh_note(due), self.kept_note, self.base_note)
+                           if part)
 
     def with_answers(self, due: list[dict], text: str, kw: dict) -> tuple[str, dict]:
         session = Session(**due[0]["session"]) if due[0]["session"] else NO_SESSION
         fresh = self.fresh_text(text, due)
         if session.id and kw.get("persist", True):
-            parts = (owner_asks.answers_message(due), self.base_note, self.moved_folder_note(due[0]["run"]))
+            parts = (owner_asks.answers_message(due), self.kept_note, self.base_note,
+                     self.moved_folder_note(due[0]["run"]))
             message = "\n\n".join(part for part in parts if part)
             return message, {**kw, "resume": session, "fresh_prompt": lambda which: fresh}
         return fresh, {**kw, "resume": NO_SESSION}
@@ -684,8 +689,7 @@ def fetch(src: Path, ref: str) -> None:
 
 def add_worktree(c: Checkout, branch: str, start: str) -> None:
     c.wt.parent.mkdir(parents=True, exist_ok=True)
-    with util.repo_lock(c.src):
-        git(["worktree", "add", "-B", branch, str(c.wt), start], c.src)
+    util.add_worktree(c.src, c.wt, branch, start, reset=True)
 
 
 def scratch_named(names: set[str] | None, name: str) -> bool:
@@ -701,7 +705,7 @@ def scratch_view() -> scratch.View | None:
 
 def record_holds(view: scratch.View | None, d: Path) -> list[Path]:
     if view is None:
-        return [d] if os.path.lexists(scratch.AUTHORITY) else []
+        return [d] if os.path.lexists(sandbox.AUTHORITY) else []
     return [Path(scratch.path_of(h)) for h in scratch.holds(view, d)]
 
 
@@ -1526,7 +1530,7 @@ def script_command(cfg: config.Config, name: str, *args: str) -> list[str]:
                       "from arete import codebase; codebase.load(); "
                       f"runpy.run_path({str(script)!r}, run_name='__main__')")
         return [sys.executable, "-I", "-c", entrypoint, *args]
-    return scratch.protected_command([sys.executable, str(script), *args])
+    return sandbox.protected_command([sys.executable, str(script), *args])
 
 
 def answer_text(asked_id: str) -> str:
@@ -2632,6 +2636,17 @@ def merge_base_into_kept(run: AgentRun, checkouts: list[Checkout], layer: config
     return merged
 
 
+def kept_edits_note(held: list[Checkout]) -> str:
+    if not held:
+        return ""
+    ranges = ", ".join(f"`{c.onto[:12]}..HEAD` in `{c.prefix or './'}`" for c in held)
+    return (f"When the run stopped to wait for the answer, arete committed the edits made so far, so `git status` "
+            f"lists none of them and `HEAD` is that commit: `git log` and `git diff` over {ranges} show them. "
+            "The owner made no edits in the worktree, since arete refuses edits it did not make there. To put a "
+            "file back as it was before those edits, read it with `git show` at the commit before the range and "
+            "write it yourself.")
+
+
 def base_merge_note(merged: list[Checkout]) -> str:
     if not merged:
         return ""
@@ -2811,6 +2826,14 @@ def merge_moved_bases_for_ci_fix(b: Build, watched: list[Checkout]) -> str:
             "edit like any other.")
 
 
+def run_folder(run: Run, name: str) -> Path:
+    folder = run.dir / name
+    folder.mkdir(exist_ok=True)
+    if folder not in run.add_dirs:
+        run.add_dirs.append(folder)
+    return folder
+
+
 def judge_ci(b: Build, reds: list[ci.Red], n: int, max_rounds: int, watched: list[Checkout],
              fix: CiFix | None = None) -> str:
     run = b.run
@@ -2820,10 +2843,7 @@ def judge_ci(b: Build, reds: list[ci.Red], n: int, max_rounds: int, watched: lis
         for r in reds:
             r.reason = "Arete could not merge the moved base before judging this check."
         raise RunFailed(e.why, ci.red_list(reds))
-    logs = run.dir / "ci"
-    logs.mkdir(exist_ok=True)
-    if logs not in run.add_dirs:
-        run.add_dirs.append(logs)
+    logs = run_folder(run, "ci")
     failures = "\n\n".join(ci.failure_note(r, logs / f"round{n}-{i}-{slug(r.label)}.log")
                            for i, r in enumerate(reds, 1))
     diff = ", ".join(f"`{c.diff_from_base}`" for c in b.checkouts)
@@ -3116,10 +3136,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
             ready.saved = os.path.abspath(run.dir / f"{step}-preflight.md")
             run.save(f"{step}-preflight.md", ready.markdown())
             return ready
-    evidence = run.dir / "evidence"
-    evidence.mkdir(exist_ok=True)
-    if evidence not in run.add_dirs:
-        run.add_dirs.append(evidence)
+    evidence = run_folder(run, "evidence")
     untracked_before = untracked_by_dir(b.git_dirs)
     attempt = None
     try:
@@ -3140,8 +3157,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                 v = replace(v, start="", url="", notes=v.notes + "\n" + fixture_blocker)
         bash = b.read_bash + v.bash
         with verify.serving(
-                v, b.ws, run.dir / f"{step}-server.log", b.cfg, run.repo,
-                sets={scratch.ENV_NAME: attempt.root} if attempt else None, lifetime=lifetime,
+                v, b.ws, run.dir / f"{step}-server.log", b.cfg, run.repo, lifetime=lifetime,
                 attempt=attempt) as url:
             if url:
                 run.log(f"{step}: the app answers at {url}")
@@ -3155,13 +3171,13 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                             b.ws, role=role,
                             allowed_tools=bash_rules(bash) + ([f"mcp__playwright__{t}" for t in verify.PLAYWRIGHT_TOOLS] if url else []),
                             disallowed_tools=runner.NO_GIT_WRITES, json_schema=verify.SCHEMA,
-                            mcp_config=verify.mcp_config(evidence) if url else "",
+                            mcp_config=browser.mcp_config(evidence) if url else "",
                             scratch=attempt)
             agent_finished = True
     except owner_asks.Asked:
         agent_finished = True
         raise
-    except scratch.ConfinementUnavailable as e:
+    except sandbox.ConfinementUnavailable as e:
         return verify.Verified("blocked", "Trusted fixture verification could not start.", finished=False,
                                blocked_by=util.first_line(str(e), 300))
     except verify.ServerError as e:
@@ -3940,7 +3956,7 @@ def retry_scratch(days: float = 30) -> None:
     for root in finalize_scratch():
         print(f"preserved and finalized verification scratch {root}")
     for data in scratch.records():
-        if data["state"] in ("pending", "retained", "preserved") and data["diagnostic"]:
+        if data["state"] in ("pending", "retained") and data["diagnostic"]:
             print("verification scratch retained: " + json.dumps({"run": data["attempt"]["run_id"],
                   "attempt": data["attempt"]["selector"], "diagnostic": data["diagnostic"]}, ensure_ascii=True))
     try:
@@ -3951,7 +3967,7 @@ def retry_scratch(days: float = 30) -> None:
     try:
         for failure in scratch.settle(days):
             print(f"verification scratch settle failed: {failure}")
-    except scratch.ConfinementUnavailable:
+    except sandbox.ConfinementUnavailable:
         pass
     except OSError as e:
         print(f"verification scratch settle failed: {e}")

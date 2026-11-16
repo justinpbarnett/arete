@@ -1,11 +1,11 @@
 
 import contextlib, fcntl, hmac, io, json, os, sys
 from pathlib import Path
-from arete import browser, cli, webhooks, record, scratch, state, util
+from arete import browser, cli, webhooks, record, sandbox, scratch, state, util
 root, mode = Path(sys.argv[1]), sys.argv[2]
 state.migrate()
-scratch.AUTHORITY = root / "home/verification-authority"
-A = scratch.AUTHORITY
+sandbox.AUTHORITY = root / "home/verification-authority"
+A = sandbox.AUTHORITY
 def rotate():
     out, err = io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):

@@ -237,8 +237,8 @@ def backfill_legacy_cost(before: dict | None = None) -> int:
         return c.execute("SELECT changes()").fetchone()[0]
 
 
-def cost_drift() -> list[dict]:
-    with db() as c:
+def cost_drift(connect=db) -> list[dict]:
+    with connect() as c:
         return [dict(r) for r in c.execute("""
             SELECT runs.id, COALESCE(runs.cost_usd, 0) AS run_usd,
                    COALESCE(t.usd, 0) AS steps_usd,

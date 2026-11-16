@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from arete import launchd, paths, pipeline, scratch
+from arete import launchd, paths, pipeline, sandbox, scratch
 
 ON_MAC = sys.platform == "darwin"
 UID = os.getuid()
@@ -110,7 +110,7 @@ class FakeTableTests(unittest.TestCase):
         self.readable = True
         self.job_pid = 0
         for patch in (
-                mock.patch.object(scratch, "AUTHORITY", self.root / "authority-parent/verification-authority"),
+                mock.patch.object(sandbox, "AUTHORITY", self.root / "authority-parent/verification-authority"),
                 mock.patch.object(paths, "WORKTREES_DIR", self.root / "worktrees"),
                 mock.patch.object(scratch, "processes", lambda *workspaces: dict(self.table)),
                 mock.patch.object(scratch, "identity_of", self.identity_of),
@@ -361,7 +361,7 @@ class LiveTests(unittest.TestCase):
         self.ws, self.run_dir = self.root / "worktrees/ws", self.root / "runs/r1"
         self.ws.mkdir(parents=True)
         self.run_dir.mkdir(parents=True)
-        for patch in (mock.patch.object(scratch, "AUTHORITY", self.root / "authority-parent/verification-authority"),
+        for patch in (mock.patch.object(sandbox, "AUTHORITY", self.root / "authority-parent/verification-authority"),
                       mock.patch.object(paths, "WORKTREES_DIR", self.root / "worktrees")):
             patch.start()
             self.addCleanup(patch.stop)
@@ -373,7 +373,7 @@ class LiveTests(unittest.TestCase):
     def attempt(self):
         try:
             a = scratch.make("r1", "verify", self.ws, self.run_dir)
-        except (OSError, scratch.ConfinementUnavailable) as error:
+        except (OSError, sandbox.ConfinementUnavailable) as error:
             self.skipTest(f"cannot start an attempt: {error}")
         self.addCleanup(lambda: os.close(scratch.LEASES.pop(a.selector)) if a.selector in scratch.LEASES else None)
         return a

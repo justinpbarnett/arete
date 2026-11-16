@@ -115,7 +115,7 @@ class Push(Emit):
         with branch_worktree(src, item["branch"], f"push-{run_id}") as wt:
             sha = land(item, wt, src, base, cfg)
         state.set_verdict_sha(run_id, sha)
-        util.git(["branch", "-D", item["branch"]], src, check=False)
+        util.delete_branch(src, item["branch"])
         return f"pushed {sha[:10]} to {base}; {fast_forward(src, base, sha)}"
 
     def describe(self, item: dict) -> str:
@@ -133,7 +133,7 @@ class Push(Emit):
         return "\n\n".join(filter(None, [f"The problem it fixes:\n{problem}" if problem else "", self.detail(item)]))
 
     def rejected(self, item: dict) -> None:
-        util.git(["branch", "-D", item["branch"]], Path(item["workdir"]), check=False)
+        util.delete_branch(Path(item["workdir"]), item["branch"])
 
 
 def approve_rules(spec: dict) -> dict:
