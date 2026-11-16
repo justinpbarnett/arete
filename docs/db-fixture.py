@@ -611,7 +611,7 @@ def transaction_timing():
     for process in children:
         finish(process)
     rows = log_rows()
-    required = {"timestamp", "pid", "process_kind", "caller", "mode", "total_ms", "begin_ms", "commit_ms", "error"}
+    required = {"timestamp", "database", "pid", "process_kind", "caller", "mode", "total_ms", "begin_ms", "commit_ms", "error"}
     for row in rows:
         require(set(row) == required, row)
         require(row["mode"] in ("read", "write") and row["begin_ms"] <= row["total_ms"], row)
