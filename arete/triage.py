@@ -15,6 +15,7 @@ from . import (
     alerts,
     config,
     gh,
+    intake,
     jev,
     jira,
     paths,
@@ -36,7 +37,9 @@ from .store import triage as triage_store
 
 ISSUE_TITLE = "[arete] triage"
 ISSUE_LABEL = "arete-triage"
-SKIP_LABELS = {tracker.LABEL, alerts.LABEL, ISSUE_LABEL}
+SKIP_LABELS = {tracker.LABEL, alerts.LABEL, ISSUE_LABEL, "loop"}
+AUTO_SKIP_LABELS = {"no-agent", "agent:hold", "duplicate", "invalid", "wontfix",
+                    *(f"agent:{state}" for state in config.RUN_LABELS), *tracker.JIRA_STATE_LABELS}
 MAX_CALLS = 20
 PER_SOURCE = 50
 BUDGET_USD = 0.30
@@ -60,8 +63,8 @@ UNSPACED_SCRIPTS = r"\U00003040-\U000030ff\U00003400-\U00004dbf\U00004e00-\U0000
 WORDS = re.compile(rf"[{UNSPACED_SCRIPTS}]{{2}}|[^\W\d_{UNSPACED_SCRIPTS}]{{2,}}")
 SENT_DAYS = 7
 SIZES = ("S", "M", "L")
-FIX, FEATURE, RESEARCH, PERSON = "fix", "feature", "research", "person"
-KINDS = (FIX, FEATURE, RESEARCH, PERSON)
+FIX, FEATURE, RESEARCH, PERSON = intake.KINDS
+KINDS = intake.KINDS
 SCHEMA = {
     "type": "object",
     "properties": {
@@ -78,16 +81,9 @@ SCHEMA = {
     "required": ["kind", "ready", "questions", "assumptions", "checks", "size", "repos", "plan", "why"],
 }
 WAITING = f"waiting: more than {MAX_CALLS} tickets were due in one refresh"
-ASKS_FOR_CODE = "Does this ticket ask for a change to code, configuration or documentation in a software repository?"
-KIND_QUESTION = "What does this ticket ask for?"
-KIND_OPTIONS = {
-    RESEARCH: ("finding something out: investigate, compare options, estimate or recommend, where the answer is a "
-               "written report"),
-    PERSON: ("work only a person can do: a meeting, a decision, access or an account, a test or check done by hand, "
-             "data entry, a purchase, or settings in an outside tool"),
-    FIX: "a repair to software that is broken or wrong: a bug, an error, a crash, or wrong data shown",
-    FEATURE: "a new or changed screen, field, behavior, report, setting or document in a software repository",
-}
+ASKS_FOR_CODE = intake.ASKS_FOR_CODE
+KIND_QUESTION = intake.KIND_QUESTION
+KIND_OPTIONS = intake.KIND_OPTIONS
 EARLIEST = datetime.min.replace(tzinfo=UTC)
 READY, SENT, RESEARCH_WORK, WITH_QUESTIONS, NEEDS_PERSON, NOT_TRIAGED = (
     "Ready to build", "Sent to the pipeline", "Research", "With questions", "Needs a person", "Not triaged")
@@ -115,6 +111,7 @@ class TicketText:
     body: str
     comments: str
     updated: str = ""
+    labels: tuple[str, ...] = ()
 
     @property
     def text(self) -> str:
@@ -207,7 +204,7 @@ class JiraSource(Source):
         comments = [((cm.get("author") or {}).get("displayName", "someone"), cm.get("created", ""), cm.get("body") or "")
                     for cm in client.comments(c.id)]
         return TicketText("\n".join(facts), (f.get("description") or "").strip(), tracker.comments_text(comments),
-                          f.get("updated") or "")
+                          f.get("updated") or "", tuple(f.get("labels") or []))
 
     def brief(self, key: str) -> str:
         f = self.client.issue(key, ["summary", "description"]).get("fields") or {}
@@ -255,7 +252,8 @@ class GitHubSource(Source):
             raise gh.GhError(f"{self.repos[0].name} has no github repo set")
         tk = self.issues
         out = []
-        for i in gh.issues(self.key, author=tk.owner, limit=PER_SOURCE):
+        search = " ".join(f'-label:"{label}"' for label in sorted(SKIP_LABELS))
+        for i in gh.issues(self.key, author=tk.owner, limit=PER_SOURCE, search=search):
             names = {lb["name"] for lb in i.get("labels", [])}
             if names & SKIP_LABELS or not tk.by_owner(i):
                 continue
@@ -264,8 +262,17 @@ class GitHubSource(Source):
         return out
 
     def ticket(self, c: Candidate) -> TicketText:
-        t = self.issues.get(c.id)
-        return TicketText(f"Labels: {', '.join(t.labels) or 'none'}", (t.body or "").strip(), t.comments, t.updated)
+        tk = self.issues
+        issue = gh.issue(self.key, int(c.id))
+        if not tk.by_owner(issue):
+            raise gh.GhError(f"{c.ref} was not opened by {tk.owner}")
+        if issue.get("state") != "OPEN":
+            raise gh.GhError(f"{c.ref} is no longer open")
+        labels = tuple(lb["name"] for lb in issue.get("labels", []))
+        comments = [(tk.owner, cm.get("createdAt", ""), cm.get("body", ""))
+                    for cm in issue.get("comments", []) if tk.by_owner(cm)]
+        return TicketText(f"Labels: {', '.join(labels) or 'none'}", (issue.get("body") or "").strip(),
+                          tracker.comments_text(comments), issue.get("updatedAt") or "", labels)
 
     def brief(self, key: str) -> str:
         return ""
@@ -286,7 +293,7 @@ class GitHubSource(Source):
         gh.issue_comment(self.key, int(self.tid(ref)), text)
 
     def approve(self, r: dict) -> None:
-        self.issues.approve(self.tid(r["ref"]))
+        intake.add_labels(self.issues, self.tid(r["ref"]), labels_to_add(r))
 
 
 TriageSource = JiraSource | GitHubSource
@@ -326,32 +333,21 @@ def record_file(ref: str) -> Path:
     return TICKET_RECORDS_DIR / f"{tracker.safe_filename(ref)}.md"
 
 
-def not_code_by_jev(cfg: config.Config, src: TriageSource, c: Candidate, ticket: str) -> dict | None:
-    if not jev.ready(cfg, list(src.repos)):
-        return None
-    reply = jev.ask(f"{c.title}\n\n{ticket}",
-                    {"code": jev.yes_no(ASKS_FOR_CODE), "kind": jev.pick(KIND_QUESTION, KIND_OPTIONS)}, cfg,
-                    trace=("", f"triage {c.ref} jev"))
-    code, kind = reply.answers.get("code"), reply.answers.get("kind")
-    if not code:
-        return None
-    sure = str(kind.value) if kind and kind.value in (RESEARCH, PERSON) and kind.sure(cfg.jev.confidence) else ""
-    if code.yes <= cfg.jev.triage_skip:
-        settled = RESEARCH if sure == RESEARCH else PERSON
-        why = f"JEV reads it as asking for no change to a repo ({code.note()}, at or under {cfg.jev.triage_skip:g})"
-    elif code.yes < 0.5 and sure:
-        settled = sure
-        why = f"JEV reads it as asking for no change to a repo ({code.note()})"
+def classified_by_jev(cfg: config.Config, src: TriageSource, c: Candidate,
+                      ticket: str) -> tuple[dict | None, float]:
+    assessment = intake.classify(cfg, src.repos, c.title, ticket, trace=("", f"triage {c.ref} jev"))
+    if assessment.kind in (FIX, FEATURE) and assessment.ready:
+        settled = row(src, c, updated=c.updated, ready=1, code=1, kind=assessment.kind,
+                      repo=assessment.repo, repos=[assessment.repo], route=src.route(assessment.repo),
+                      why=assessment.why, cost=assessment.cost)
+    elif assessment.kind in (RESEARCH, PERSON):
+        settled = settle(src, c, {"kind": assessment.kind, "why": assessment.why}, assessment.cost)
     else:
-        return None
-    why += f" and as {settled} work ({kind.note()})" if kind and kind.value == settled else ""
-    cost = reply.cost_usd
-    answer = {"kind": settled, "ready": False, "questions": [], "assumptions": [], "checks": [], "plan": [], "repos": [],
-              "size": "", "why": why}
+        return None, assessment.cost
     TICKET_RECORDS_DIR.mkdir(parents=True, exist_ok=True)
-    record_file(c.ref).write_text(f"{ticket}\n\n## Triage result ({util.paid_note(cost, 5)})\n\n```json\n"
-                                  f"{json.dumps(answer, indent=2)}\n```\n")
-    return settle(src, c, answer, cost)
+    record_file(c.ref).write_text(f"{ticket}\n\n## Triage result ({util.paid_note(assessment.cost, 5)})\n\n```json\n"
+                                  f"{json.dumps(settled, indent=2)}\n```\n")
+    return settled, assessment.cost
 
 
 def triage_one(cfg: config.Config, src: TriageSource, c: Candidate, ticket: str) -> tuple[dict | None, float, str]:
@@ -466,26 +462,28 @@ class Triaged:
     waiting: list[str] = field(default_factory=list)
     spent: float = 0.0
     calls: int = 0
+    screened: int = 0
 
 
 def triage_due(cfg, todo) -> Triaged:
     triaged = Triaged()
     for src, c in todo:
-        if triaged.calls >= MAX_CALLS:
-            triaged.waiting.append(c.ref)
-            continue
         print(f"{util.iso()} {c.ref}: triaging", flush=True)
         try:
             ticket = src.ticket_text(c)
         except tracker.ERRORS as e:
-            triaged.calls += 1
             triaged.failed[c.ref] = f"could not read it: {e}"
             print(f"{util.iso()} {c.ref}: triage failed: {triaged.failed[c.ref]}")
             continue
-        if settled := not_code_by_jev(cfg, src, c, ticket):
+        settled, screening_cost = classified_by_jev(cfg, src, c, ticket)
+        triaged.screened += 1
+        triaged.spent += screening_cost
+        if settled:
             triaged.answered[c.ref] = settled
-            triaged.spent += settled["cost"]
             print(f"{util.iso()} {c.ref}: {verdict(settled)} by JEV, no model call")
+            continue
+        if triaged.calls >= MAX_CALLS:
+            triaged.waiting.append(c.ref)
             continue
         triaged.calls += 1
         try:
@@ -494,7 +492,7 @@ def triage_due(cfg, todo) -> Triaged:
             answer, cost, error = None, 0.0, f"could not read it: {e}"
         triaged.spent += cost
         if answer:
-            triaged.answered[c.ref] = settle(src, c, answer, cost)
+            triaged.answered[c.ref] = settle(src, c, answer, cost + screening_cost)
             print(f"{util.iso()} {c.ref}: {verdict(triaged.answered[c.ref])} ({util.paid_note(cost, 3)})")
         else:
             triaged.failed[c.ref] = error
@@ -525,27 +523,37 @@ def prune_records():
 
 
 def preview_refresh(cfg, srcs, read, old, todo):
-    preview(srcs, read, old, todo[:MAX_CALLS], todo[MAX_CALLS:])
-    ready = ", ".join(r["ref"] for r in approvable(srcs, list(old.values()))) or "none"
-    print(f"would approve up to {cfg.jira.auto_per_refresh} now ready: {ready}" if cfg.jira.auto
-          else f"ready now, approved only with `[jira] auto = true`: {ready}")
+    preview(srcs, read, old, todo, [])
+    print(f"at most {MAX_CALLS} uncertain tickets use the fallback agent")
+    by_name = {s.name: s for s in srcs}
+    ready = ", ".join(r["ref"] for r in approvable(srcs, list(old.values()))
+                      if auto_limit(cfg, by_name[r["source"]])) or "none"
+    print(f"automatic approval candidates within configured limits: {ready}; "
+          "fresh labels, issue versions and required screens still decide admission")
 
 
 def refresh(cfg: config.Config, dry_run: bool) -> int:
     old = {r["ref"]: r for r in triage_store.triage_rows()}
+    meta = util.read_json(META_FILE, {})
+    policy = intake.policy(cfg)
+    changed_policy = meta.get("policy") != policy
+    retry = set(meta.get("waiting", [])) | set(meta.get("failed", {}))
     srcs = sources(cfg)
     read, errors = read_all(srcs)
-    todo = sorted(((src, c) for src in srcs for c in read.get(src.name, []) if due(c, old.get(c.ref))),
+    todo = sorted(((src, c) for src in srcs for c in read.get(src.name, [])
+                   if changed_policy or c.ref in retry or due(c, old.get(c.ref))),
                   key=lambda sc: moment(sc[1].updated), reverse=True)
     if dry_run:
         preview_refresh(cfg, srcs, read, old, todo)
         return 1 if errors else 0
     triaged = triage_due(cfg, todo)
     write_board(srcs, read, triaged)
-    approved, held = approve_ready(cfg, srcs)
+    approved, held = approve_ready(cfg, srcs, excluded=set(triaged.failed) | set(triaged.waiting))
     prune_records()
-    meta = util.read_json(META_FILE, {})
-    meta.update(refreshed=util.iso(), errors=errors, waiting=triaged.waiting, failed=triaged.failed, approved=approved, held=held)
+    triaged.waiting += [r["ref"] for r in old.values() if r["source"] not in read
+                        and (changed_policy or r["ref"] in retry)]
+    meta.update(refreshed=util.iso(), policy=policy, errors=errors, waiting=triaged.waiting,
+                failed=triaged.failed, approved=approved, held=held)
     problems = list(errors)
     try:
         posted = publish(cfg, view(), meta)
@@ -554,7 +562,8 @@ def refresh(cfg: config.Config, dry_run: bool) -> int:
         posted = f"not posted: {e}"
     meta.update(posted=posted)
     util.write_json(META_FILE, meta)
-    print(f"{util.iso()} triage: {util.count(triaged.calls, 'model call')} ({util.paid_note(triaged.spent, 3)}), "
+    print(f"{util.iso()} triage: {util.count(triaged.calls, 'model call')}, {triaged.screened} JEV attempts "
+          f"({util.paid_note(triaged.spent, 3)}), "
           f"{len(triaged.failed)} failed, {len(triaged.waiting)} waiting, {len(approved)} approved; board {posted}")
     if triaged.waiting:
         print(f"waiting for the next refresh: {', '.join(triaged.waiting)}")
@@ -563,25 +572,35 @@ def refresh(cfg: config.Config, dry_run: bool) -> int:
 
 
 def approvable(srcs: list[TriageSource], rows: list[dict]) -> list[dict]:
-    jira_sources = {s.name for s in srcs if isinstance(s, JiraSource)}
-    ready = [r for r in rows if r["source"] in jira_sources and standing(r) == READY and r["route"] and in_sprint(r)]
+    by_name = {s.name: s for s in srcs}
+    ready = [r for r in rows if r["source"] in by_name and standing(r) == READY
+             and (not isinstance(by_name[r["source"]], JiraSource) or r["route"] and in_sprint(r))]
     return sorted(ready, key=lambda r: moment(r["updated"]), reverse=True)
 
 
-def approve_ready(cfg: config.Config, srcs: list[TriageSource]) -> tuple[list[str], dict[str, str]]:
+def auto_limit(cfg: config.Config, src: TriageSource) -> int:
+    if isinstance(src, JiraSource) and cfg.jira.auto:
+        return cfg.jira.auto_per_refresh
+    return cfg.triage.auto_per_refresh if cfg.triage.auto else 0
+
+
+def approve_ready(cfg: config.Config, srcs: list[TriageSource], *,
+                  excluded: set[str] = frozenset()) -> tuple[list[str], dict[str, str]]:
     approved: list[str] = []
     held: dict[str, str] = {}
-    if not cfg.jira.auto:
-        return approved, held
+    counts: dict[str, int] = {}
     by_name = {s.name: s for s in srcs}
     for r in approvable(srcs, triage_store.triage_rows()):
-        if len(approved) >= cfg.jira.auto_per_refresh:
-            break
+        if r["ref"] in excluded:
+            continue
+        src = by_name[r["source"]]
+        if counts.get(src.tracker, 0) >= auto_limit(cfg, src):
+            continue
         with util.lock(BOARD_LOCK, wait=True):
             if board_row(r["ref"]) != r:
                 continue
             try:
-                why = approve(cfg, by_name[r["source"]], r)
+                why = approve(cfg, src, r)
             except tracker.ERRORS as e:
                 why = f"could not approve it: {e}"
         if why:
@@ -589,17 +608,20 @@ def approve_ready(cfg: config.Config, srcs: list[TriageSource]) -> tuple[list[st
             print(f"{util.iso()} {r['ref']}: not approved: {why}")
         else:
             approved.append(r["ref"])
-            print(f"{util.iso()} {r['ref']}: approved, added {' '.join(labels_to_add(r))}")
+            counts[src.tracker] = counts.get(src.tracker, 0) + 1
+            print(f"{util.iso()} {r['ref']}: approved, added {' '.join(labels_to_add({**r, 'automatic': True}))}")
     return approved, held
 
 
-def approve(cfg: config.Config, src: JiraSource, r: dict) -> str:
+def approve(cfg: config.Config, src: TriageSource, r: dict) -> str:
     repo = src.by_name().get(r["repo"])
     if not repo:
         return f"{r['repo'] or 'no repo'} is not a pipeline repo of {src.name}"
     if not jev.ready(cfg, [repo]):
         return "JEV is not on for it, so nothing screens the ticket; add the labels by hand"
     now = src.ticket(src.candidate(r))
+    if stopped := sorted(set(now.labels) & AUTO_SKIP_LABELS):
+        return f"its {', '.join(stopped)} label requires a person to release it"
     if now.updated != r["updated"]:
         return "it changed since triage, so the next refresh triages it again"
     screened = screening.screen(f"{r['title']}\n\n{now.text}", cfg, [repo], ("", f"triage {r['ref']} injection jev"))
@@ -616,7 +638,7 @@ def approve(cfg: config.Config, src: JiraSource, r: dict) -> str:
 
 
 def to_pipeline(src: TriageSource, r: dict, sent_by: str) -> None:
-    src.approve(r)
+    src.approve({**r, "automatic": sent_by == "triage"})
     triage_store.triage_approve(r, sent_by)
     triage_store.triage_drop(r["ref"])
 
@@ -759,7 +781,9 @@ def groups(v: dict) -> dict[str, list[dict]]:
 
 
 def labels_to_add(r: dict) -> list[str]:
-    return [tracker.LABEL, r["route"]] if r["route"] else [tracker.LABEL]
+    return [tracker.LABEL, *([r["route"]] if r["route"] else []),
+            *([r["kind"]] if r.get("kind") in (FIX, FEATURE) else []),
+            *([intake.AUTO_LABEL] if r.get("automatic") else [])]
 
 
 def in_sprint(r: dict) -> bool:
@@ -864,6 +888,9 @@ def summary(v: dict) -> str:
 
 
 def auto_note(cfg: config.Config) -> str:
+    if cfg.triage.auto:
+        return (f"arete adds labels to up to {cfg.triage.auto_per_refresh} ready tickets per tracker each refresh; "
+                "the existing Jira auto limit and sprint scope still apply; add labels yourself to approve sooner")
     if cfg.jira.auto:
         scope = " in the open sprint or left over from a closed one" if cfg.jira.sprint_only else ""
         return (f"arete adds the labels to up to {cfg.jira.auto_per_refresh} Jira tickets{scope} each refresh; add "
@@ -967,8 +994,8 @@ def done_lines(r: dict, indent: str = "") -> list[str]:
 
 
 def issue_header(cfg: config.Config, changed: str) -> str:
-    approving = (f" Arete adds the labels to up to {cfg.jira.auto_per_refresh} ready Jira tickets each refresh and lists "
-                 "them under Sent to the pipeline." if cfg.jira.auto else "")
+    approving = (f" Automatic approval is on: {auto_note(cfg)}. Sent tickets appear under Sent to the pipeline."
+                 if cfg.triage.auto or cfg.jira.auto else "")
     return (f"Last change {stamp(changed)}. Arete refreshes this every 15 minutes from your open tickets that have no "
             f"`{tracker.LABEL}` label, and edits it only when something changes.{approving} To approve a ready ticket "
             "yourself, add the labels it names. Research tickets get a report here for your review. `arete triage "

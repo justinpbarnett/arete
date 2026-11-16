@@ -13,6 +13,7 @@ from . import (
     document,
     factory,
     gh,
+    intake,
     owner_asks,
     patching,
     paths,
@@ -609,7 +610,7 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
     cfg, run = job.cfg, job.run
     repo, tk = run.repo, run.tracker
     try:
-        t = tk.get(run.tid)
+        t = intake.route_ticket(cfg, repo, tk, tk.get(run.tid), dry_run=run.dry_run, log=run.log)
     except tracker.ERRORS as e:
         return end_as("stop", "quiet", status="failed", summary=f"could not read {run.ref}: {e}")
     opened(run, t)
@@ -1103,7 +1104,7 @@ def publish(flow: factory.Flow) -> Outcome:
     standing = [c for c in job.picked(job.changed) if c not in fresh]
     ready = pipeline.ready_pushed(run, standing, job.picked(job.ci_stopped), job.draft_why)
     pipeline.automerge(job.cfg, run, job.layer, job.approval, job.draft_why, fresh + ready,
-                       pipeline.automerge_about(job.ticket, job.build_summary))
+                       pipeline.automerge_about(job.ticket, job.build_summary), ticket=job.ticket)
     return end_as("pass", "pr", summary=f"{job.summary}, CI: {job.ci_result}")
 
 
