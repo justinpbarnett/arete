@@ -1,21 +1,37 @@
 "use strict";
 
 const FEED_KEEP_LINES = 2000;
-let feedOf = { id: "", after: 0, lines: [] };
+let feedOf = { id: "", epoch: null, after: 0, lines: [] };
+let feedRequest = 0;
 let sessionSending = false;
 const talkDrafts = new Map();
 
 async function loadRunDetail(id) {
+  const request = ++feedRequest;
+  if (feedOf.id !== id) feedOf = { id, epoch: null, after: 0, lines: [] };
   const board = await call(`/api/runs/${encodeURIComponent(id)}`);
   if (board.lines_from === "feed") {
-    const after = feedOf.id === id ? feedOf.after : 0;
-    return { board, feed: { data: await call(`/api/feed/${encodeURIComponent(id)}?after=${after}`), asked: after } };
+    let after = feedOf.id === id ? feedOf.after : 0;
+    let data = await call(`/api/feed/${encodeURIComponent(id)}?after=${after}`);
+    if (request !== feedRequest || feedOf.id !== id) return { board, feed: { data, asked: after, request } };
+    if (feedOf.epoch !== null && data.restore_epoch < feedOf.epoch) return { board, feed: { data, asked: after, request } };
+    if (feedOf.epoch !== null && data.restore_epoch !== feedOf.epoch) {
+      feedOf = { id, epoch: data.restore_epoch, after: 0, lines: [] };
+      after = 0;
+      data = await call(`/api/feed/${encodeURIComponent(id)}?after=0`);
+    }
+    return { board, feed: { data, asked: after, request } };
   }
   return { board, log: await call(`/api/log/${encodeURIComponent(id)}`) };
 }
 
-function mergeFeed(id, { data, asked }) {
-  if (feedOf.id !== id) feedOf = { id, after: 0, lines: [] };
+function mergeFeed(id, { data, asked, request }) {
+  if (request !== feedRequest || feedOf.id !== id) return feedOf.id === id ? feedOf.lines : [];
+  if (feedOf.epoch !== null && data.restore_epoch < feedOf.epoch) return feedOf.lines;
+  if (feedOf.epoch !== data.restore_epoch) {
+    feedOf = { id, epoch: data.restore_epoch, after: 0, lines: [] };
+    if (asked !== 0) return feedOf.lines;
+  }
   if (asked === feedOf.after) {
     const fresh = data.lines.filter((line) => line.id > feedOf.after);
     if (fresh.length) {

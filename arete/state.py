@@ -140,6 +140,7 @@ def migrate(contracts=True):
                     raise migrations.Refused(f"{migration.name}: {e}") from e
                 version = migration.n
                 print(f"applied {migration.name}", flush=True)
+            backup.finish_restore()
             return False
         finally:
             if conn is not None:
@@ -147,6 +148,10 @@ def migrate(contracts=True):
 
 
 def checked_connection():
+    from . import backup
+
+    if backup.pending_restore():
+        raise IncompatibleSchema("pending restore requires arete serve or arete migrate before writing")
     try:
         identity = paths.DB_FILE.stat()
     except FileNotFoundError:
@@ -459,13 +464,13 @@ def steps_since(since: str, connect=db) -> list[dict]:
 
 
 def add_feed(run_id: str, kind: str, text: str) -> None:
-    with db() as c:
-        insert_feed(c, run_id, kind, text)
+    insert_feed(run_id, kind, text)
 
 
-def insert_feed(c: sqlite3.Connection, run_id: str, kind: str, text: str) -> None:
-    c.execute("INSERT INTO feed (run_id, ts, kind, text) VALUES (?,?,?,?)",
-              (run_id, util.iso(), kind, util.both_ends(text, 4000)))
+def insert_feed(run_id: str, kind: str, text: str) -> None:
+    with tx() as c:
+        c.execute("INSERT INTO feed (run_id, ts, kind, text) VALUES (?,?,?,?)",
+                  (run_id, util.iso(), kind, util.both_ends(text, 4000)))
 
 
 def feed(run_id: str, after: int = 0, connect=db) -> list[dict]:

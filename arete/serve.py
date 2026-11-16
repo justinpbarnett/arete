@@ -768,7 +768,18 @@ def run(with_dashboard: bool = True) -> NoReturn:
         if beat.get("pid") == os.getpid():
             util.write_json(control.BEAT_FILE, {**beat, "schema": state.LATEST})
         try:
+            with util.lock("migrate", wait=True):
+                backup.recover_restore()
             contracts_waiting = state.migrate()
+            if backup.pending_restore():
+                raise backup.Refused("restore metadata could not finish migration; API startup refused")
+            if not paths.ISOLATED:
+                conn = paths.connect_db(paths.DB_FILE)
+                try:
+                    if conn.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() != "wal":
+                        raise RuntimeError("arete.db refused WAL mode")
+                finally:
+                    conn.close()
         except Exception as e:
             print(str(e), file=sys.stderr)
             raise SystemExit(1) from e

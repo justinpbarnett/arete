@@ -159,7 +159,7 @@ def settle(run_id: str, status: str, end_line: str = "", **fields) -> dict | Non
                          (*fields.values(), run_id)).rowcount:
             return None
         if end_line:
-            state.insert_feed(c, run_id, "end", end_line)
+            state.insert_feed(run_id, "end", end_line)
         settled = dict(c.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone())
     mark(run_id, "result", at=fields.pop("finished"), **fields)
     return settled
