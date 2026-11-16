@@ -1,4 +1,5 @@
 import re
+from dataclasses import dataclass
 
 _INLINE_NODES = {"text", "hardBreak", "inlineCard", "mention", "emoji", "status", "date"}
 _BLOCK_NODES = {"paragraph", "heading", "codeBlock", "bulletList", "orderedList", "blockquote", "panel",
@@ -21,6 +22,16 @@ _NODE_MARKS = {"text": _TEXT_MARKS | {"link", "annotation"},
 _MAX_RENDERED_CHARS = 1_000_000
 
 
+@dataclass(frozen=True, eq=False, slots=True)
+class _LinkTargets:
+    urls: tuple[str, ...]
+    parent: "_LinkTargets | None" = None
+
+
+def _link_targets(parent: _LinkTargets | None, urls: list[str]) -> _LinkTargets | None:
+    return _LinkTargets(tuple(dict.fromkeys(urls)), parent) if urls else parent
+
+
 def to_text(value: object) -> str:
     """Read plain/null descriptions or ADF v1, refusing content we cannot read completely."""
     if value is None:
@@ -30,7 +41,7 @@ def to_text(value: object) -> str:
     if (not isinstance(value, dict) or value.get("type") != "doc"
             or type(value.get("version")) is not int or value["version"] != 1):
         raise ValueError("expected plain text, null, or an ADF v1 document")
-    parts: list[tuple[str, list[str]]] = []
+    parts: list[tuple[str, _LinkTargets | None]] = []
     try:
         _read_node(value, "doc", {"doc"}, parts)
     except RecursionError:
@@ -38,8 +49,8 @@ def to_text(value: object) -> str:
     return _render_text(parts)
 
 
-def _read_node(node: object, path: str, allowed: set[str], parts: list[tuple[str, list[str]]],
-               inherited_links: list[str] | None = None) -> None:
+def _read_node(node: object, path: str, allowed: set[str], parts: list[tuple[str, _LinkTargets | None]],
+               inherited_links: _LinkTargets | None = None) -> None:
     def refuse(reason: str):
         raise ValueError(f"ADF {path}: {reason}")
 
@@ -63,7 +74,7 @@ def _read_node(node: object, path: str, allowed: set[str], parts: list[tuple[str
     marks = node.get("marks", [])
     if not isinstance(marks, list):
         refuse("marks must be a list")
-    links = list(inherited_links or [])
+    links: list[str] = []
     for mark in marks:
         if (not isinstance(mark, dict) or not isinstance(mark.get("type"), str)
                 or mark["type"] not in _NODE_MARKS.get(kind, set()) or not isinstance(mark.get("attrs", {}), dict)):
@@ -80,15 +91,18 @@ def _read_node(node: object, path: str, allowed: set[str], parts: list[tuple[str
             refuse(f"{kind} content must be a list")
         if not children and kind not in {"doc", "paragraph", "heading", "codeBlock", "caption"}:
             refuse(f"{kind} content is missing")
+        if kind == "mediaSingle" and (len(children) not in {1, 2}
+                or not isinstance(children[0], dict) or children[0].get("type") != "media"
+                or (len(children) == 2 and (not isinstance(children[1], dict) or children[1].get("type") != "caption"))):
+            refuse("mediaSingle requires one media node and an optional caption")
         separator = "" if kind in {"paragraph", "heading", "codeBlock", "taskItem", "decisionItem", "caption"} else "\n"
+        context = _link_targets(inherited_links, links)
         if kind in {"expand", "nestedExpand"}:
-            parts.append((attribute("title") + "\n", []))
+            parts.append((attribute("title") + "\n", None))
         for i, child in enumerate(children):
             if i and separator:
-                parts.append((separator, []))
-            _read_node(child, f"{path}.content[{i}]", _CHILDREN[kind], parts, links)
-        if not children and links:
-            parts.append(("", links))
+                parts.append((separator, None))
+            _read_node(child, f"{path}.content[{i}]", _CHILDREN[kind], parts, context)
         return
     else:
         if "content" in node:
@@ -97,6 +111,8 @@ def _read_node(node: object, path: str, allowed: set[str], parts: list[tuple[str
             text = node.get("text")
             if not isinstance(text, str):
                 refuse("text must be a string")
+            if links and not text.strip():
+                refuse("linked text has no readable content")
         elif kind in {"hardBreak", "rule"}:
             text = "\n"
         elif kind in {"inlineCard", "blockCard"}:
@@ -124,32 +140,42 @@ def _read_node(node: object, path: str, allowed: set[str], parts: list[tuple[str
             text = attribute("timestamp")
         else:
             refuse("unsupported node")
-    parts.append((text, links))
+    parts.append((text, _link_targets(inherited_links, links)))
 
 
-def _render_text(parts: list[tuple[str, list[str]]]) -> str:
+def _render_text(parts: list[tuple[str, _LinkTargets | None]]) -> str:
     output: list[str] = []
     line: list[str] = []
-    links: list[str] = []
+    links: dict[str, None] = {}
+    seen_contexts: set[_LinkTargets] = set()
     rendered_chars = 0
 
     def finish_line() -> None:
         nonlocal rendered_chars
         visible = "".join(line)
-        targets = list(dict.fromkeys(links))
-        rendered_chars += len(visible) + sum(len(href) + 3 for href in targets) + bool(output)
+        rendered_chars += len(visible) + sum(len(href) + 3 for href in links) + bool(output)
         if rendered_chars > _MAX_RENDERED_CHARS:
             raise ValueError("ADF text exceeds the readable size limit")
-        output.append(visible + "".join(f" ({href})" for href in targets))
+        output.append(visible + "".join(f" ({href})" for href in links))
         line.clear()
         links.clear()
+        seen_contexts.clear()
 
     for text, targets in parts:
         for i, segment in enumerate(text.split("\n")):
             if i:
                 finish_line()
             line.append(segment)
-            links.extend(targets)
+            if segment:
+                contexts = []
+                context = targets
+                while context is not None and context not in seen_contexts:
+                    seen_contexts.add(context)
+                    contexts.append(context)
+                    context = context.parent
+                for context in reversed(contexts):
+                    for href in context.urls:
+                        links.setdefault(href, None)
     finish_line()
     return "\n".join(output)
 
