@@ -1658,7 +1658,9 @@ def fixture_http(port=0):
     from arete import dashboard, tailnet
 
     server = ThreadingHTTPServer(("127.0.0.1", port), dashboard.Handler)
-    server.node = tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1", "localhost"}), "fixture", "")
+    from arete import principals
+    principals.seed_owner("fixture")
+    server.node = tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1", "localhost"}), "")
     server.logins = SimpleNamespace(of=lambda address: "fixture" if address == "127.0.0.1" else "")
     return server
 
@@ -1851,7 +1853,7 @@ def event_contract():
                 columns = [r[1] for r in conn.execute("PRAGMA table_info(events)")]
                 meta = dict(conn.execute("SELECT key,value FROM schema_meta"))
                 rows = [dict(r) for r in conn.execute("SELECT * FROM events")]
-                require("data" not in columns and int(meta["oldest_writer"]) == state.LATEST, meta)
+                require("data" not in columns and int(meta["oldest_writer"]) == 4, meta)
                 require(len(rows) == (3 if kind == "v0" else 2), rows)
             require(not state.migrate(), "migration repeated")
             evidence["cases"].append({"kind": kind, "columns": columns, "events": rows, "meta": meta})
@@ -2285,8 +2287,11 @@ def child_main(role, args):
             return lines
 
         class Host(tailnet.ScratchHost):
-            def node(self, owner):
-                return tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "fixture@example.com", "")
+            def node(self):
+                return tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "")
+
+            def seed_identity(self, login):
+                return "fixture@example.com", "Fixture"
 
             def whois(self, address):
                 return "fixture@example.com"

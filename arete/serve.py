@@ -27,6 +27,7 @@ from . import (
     delivery,
     devices,
     environment,
+    events,
     explain,
     hold_review,
     install,
@@ -34,6 +35,7 @@ from . import (
     loops,
     oncall,
     paths,
+    principals,
     record,
     routing,
     runner,
@@ -260,7 +262,8 @@ class Server:
 
     def guard(self, key: str, fn: Callable, *args):
         try:
-            result = fn(*args)
+            with principals.acting(f"rule:{key[5:]}" if key.startswith("loop:") else "hand"):
+                result = fn(*args)
         except state.NoDatabase:
             raise
         except Exception as e:
@@ -452,6 +455,8 @@ class Server:
             self.copy_off_machine(made)
         limits = self.cfg.retention
         try:
+            with state.tx():
+                events.trim()
             state.prune(lines_days=limits.lines_days, keep_days=self.cfg.oncall.keep_days)
         except Exception as e:
             self.say(f"state prune failed: {type(e).__name__}: {util.first_line(str(e), 300)}")
@@ -579,6 +584,10 @@ class Server:
         return log
 
     def poll_source(self, loop: Loop, index: int) -> None:
+        with principals.acting(f"rule:{loop.name}"):
+            return self.poll_source_as_rule(loop, index)
+
+    def poll_source_as_rule(self, loop: Loop, index: int) -> None:
         sid = sources.source_id(loop, index)
         try:
             found, items = sources.poll(loop, index, self.cfg, say=self.say)
@@ -604,6 +613,10 @@ class Server:
             self.guard(f"queue:{item['id']}", self.dispatch_queued, item, by_name, slots)
 
     def dispatch_queued(self, item: dict, by_name: dict[str, Loop], slots: QueueSlots) -> None:
+        with principals.acting(f"rule:{item['loop']}"):
+            return self.dispatch_queued_as_rule(item, by_name, slots)
+
+    def dispatch_queued_as_rule(self, item: dict, by_name: dict[str, Loop], slots: QueueSlots) -> None:
         loop = by_name.get(item["loop"])
         if not loop or not loop.enabled or loop.error:
             state.drop_queue_item(item["id"])
@@ -817,6 +830,11 @@ def cleanup_legacy() -> None:
 
 
 def run(with_dashboard: bool = True) -> NoReturn:
+    with principals.acting("hand"):
+        return run_as_hand(with_dashboard)
+
+
+def run_as_hand(with_dashboard: bool = True) -> NoReturn:
     rotation_notes = install.rotate_own_log()
     held = take_serve_lock()
     try:

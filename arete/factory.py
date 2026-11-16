@@ -12,7 +12,7 @@ from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from . import codebase, config, owner_asks, run_lines, state, util
+from . import codebase, config, owner_asks, principals, run_lines, state, util
 from .agent import NO_SESSION, Session
 
 RESULTS = ("pass", "fail", "ask", "stop")
@@ -395,6 +395,10 @@ class Flow:
         self.matching = False
 
     def run(self, name: str, args: tuple, kw: dict) -> Outcome:
+        with principals.acting(f"run:{self.run_id}/{name}"):
+            return self.run_as_step(name, args, kw)
+
+    def run_as_step(self, name: str, args: tuple, kw: dict) -> Outcome:
         n = self.tries[name] = self.tries.get(name, 0) + 1
         calls, started = Calls(self.run_id, name, n=n), time.monotonic()
         try:
@@ -509,7 +513,8 @@ def main(fn: Callable, argv: list[str] | None = None) -> None:
     script = pipeline.Script(Path(inspect.getfile(fn)).stem, fn, args.continues, args.only, table, args.again,
                              args.repairs)
     try:
-        code = pipeline.run_issue(args.repo, args.ticket, args.dry_run, args.force, script)
+        with principals.acting(principals.cli_actor()):
+            code = pipeline.run_issue(args.repo, args.ticket, args.dry_run, args.force, script)
     except config.UnknownRepo as e:
         raise SystemExit(str(e)) from None
     raise SystemExit(code)

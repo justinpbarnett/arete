@@ -16,6 +16,7 @@ from . import (
     outbound,
     paths,
     pipeline,
+    principals,
     refusals,
     sessions,
     slots,
@@ -403,7 +404,7 @@ def decisions(since: str) -> dict:
     pushes = Counter(push_decision(v) for v in state.verdicts_since(since, connect=state.reader) if v["kind"] == "push")
     sent = Counter(a["sent_by"] for a in state.triage_approvals(since, connect=state.reader))
     return {"pushes": {k: pushes[k] for k in ("auto", "approved", "rejected", "waiting", "other")},
-            "tickets": {"triage": sent["triage"], "owner": sent["owner"]}}
+            "tickets": {"triage": sent["triage"], "owner": sum(n for actor, n in sent.items() if principals.is_person(actor))}}
 
 
 def push_decision(v: dict) -> str:

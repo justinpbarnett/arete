@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Self
 
 from . import agent, codebase, paths, run_lines, scrub, state, util
+from . import events as event_log
 
 SETTLE_GRACE_SECONDS = 60
 INTERRUPTED = "stopped before it finished (the Mac restarted, lost power or the process was killed)"
@@ -46,13 +47,16 @@ def start(kind: str, *, run_id: str = "", tag: str = "", lock: str = "", **field
     cols, marks = ", ".join(row), ", ".join("?" * len(row))
     while True:
         minted = run_id or new_id(ID_PREFIX.get(kind, kind), tag)
-        try:
-            with state.db() as c:
+        with state.db() as c:
+            try:
                 c.execute(f"INSERT INTO runs (id, {cols}) VALUES (?, {marks})", (minted, *row.values()))
-            return minted
-        except sqlite3.IntegrityError:
-            if run_id:
-                raise
+            except sqlite3.IntegrityError as e:
+                if run_id or "runs.id" not in str(e):
+                    raise
+                continue
+            event_log.emit("run.started", f"run:{minted}", cls="derived", task=fields.get("issue"),
+                           data={"run": minted, **row})
+        return minted
 
 
 def step(run_id: str, name: str, res, seconds: float, effort: str = "", tier: str = "", kind: str = "",
@@ -125,8 +129,13 @@ def move(run_id: str, to: str, expect: tuple[str, ...], **fields) -> bool:
 
 def ask_stop(run_id: str) -> dict | None:
     with state.db() as c:
-        c.execute("UPDATE runs SET stop_asked = ? WHERE id = ? AND status = 'running'", (util.iso(), run_id))
+        changed = c.execute("UPDATE runs SET stop_asked = ? WHERE id = ? AND status = 'running' "
+                            "AND COALESCE(stop_asked, '') = ''",
+                            (util.iso(), run_id)).rowcount
         r = c.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if changed:
+            event_log.emit("run.changed", f"run:{run_id}", cls="derived", task=r["issue"],
+                           data={"run": run_id, "stop_asked": r["stop_asked"]})
     return dict(r) if r else None
 
 
@@ -161,6 +170,8 @@ def settle(run_id: str, status: str, end_line: str = "", **fields) -> dict | Non
         if end_line:
             state.insert_feed(run_id, "end", end_line)
         settled = dict(c.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone())
+        event_log.emit("run.ended", f"run:{run_id}", cls="derived", task=settled["issue"],
+                       data={"run": run_id, **fields})
     mark(run_id, "result", at=fields.pop("finished"), **fields)
     return settled
 

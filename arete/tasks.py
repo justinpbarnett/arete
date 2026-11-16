@@ -16,6 +16,7 @@ from . import (
     gh,
     jira,
     owner_asks,
+    principals,
     paths,
     pipeline,
     record,
@@ -233,7 +234,7 @@ def reply(run_id: str, text: str) -> dict:
 
 def store_answer(cfg: config.Config, repo: config.Repo, tid: str, text: str) -> str:
     if tracker.is_task_id(tid):
-        if not state.task_comment(tid, "owner", text):
+        if not state.task_comment(tid, principals.current(), text):
             raise control.NotFound(f"no task {tid}")
         return ""
     tk = tracker.for_ticket(cfg, repo, tid)

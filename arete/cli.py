@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import __version__, codebase, paths
+from . import __version__, codebase, paths, principals
 from .commands import costs, hooks, lab, loops, records, research, runs, sessions, setup, tasks
 from .commands.common import Parser, serve_line
 
@@ -36,7 +36,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd not in PER_CALL_HOOKS:
         codebase.load()
     try:
-        return args.fn(args) or 0
+        with principals.acting("hand" if args.cmd in ("init", "migrate") else principals.cli_actor()):
+            return args.fn(args) or 0
     except refusals.Refusal as e:
         print(e, file=sys.stderr)
         return 1

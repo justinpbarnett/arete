@@ -15,6 +15,7 @@ from . import (
     devices,
     loops,
     paths,
+    principals,
     record,
     refusals,
     run_lines,
@@ -84,7 +85,8 @@ def launch(command: list[str], log_name: str = DETACHED_LOG, keep: tuple[int, ..
     paths.ensure_dirs()
     with open(paths.LOG_DIR / log_name, "a") as log:
         proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log,
-                                stderr=subprocess.STDOUT, start_new_session=True, pass_fds=keep)
+                                stderr=subprocess.STDOUT, start_new_session=True, pass_fds=keep,
+                                env={**os.environ, "ARETE_ACTOR": principals.current()})
     threading.Thread(target=proc.wait, name=f"reap-{proc.pid}", daemon=True).start()
     return proc
 

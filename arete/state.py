@@ -184,7 +184,7 @@ def checked_connection():
                     raise IncompatibleSchema(f"schema {version} needs {NEEDED}; run arete serve or arete migrate")
                 time.sleep(0.5)
                 version = conn.execute("PRAGMA user_version").fetchone()[0]
-            oldest = int(conn.execute("SELECT value FROM schema_meta WHERE key = 'oldest_writer'").fetchone()[0])
+            oldest = int(conn.execute("SELECT value FROM schema_meta WHERE key = 'oldest_writer'").fetchone()[0] or 0)
             if oldest > LATEST:
                 raise IncompatibleSchema(f"oldest_writer {oldest} is above this code's schema {LATEST}")
             _CHECKED.add(key)
@@ -236,9 +236,9 @@ def owning_transaction(connect, begin="BEGIN IMMEDIATE", timing=None, *, commit=
                 timing.finished()
 
 
-def read_connection():
+def read_connection(*, streaming=False):
     try:
-        return paths.connect_db(paths.DB_FILE, readonly=True)
+        return paths.connect_db(paths.DB_FILE, readonly=True, streaming=streaming)
     except (sqlite3.OperationalError, FileNotFoundError):
         if not paths.DB_FILE.exists():
             raise missing_database() from None
@@ -281,9 +281,43 @@ def one_read():
 
 
 @contextmanager
-def reader():
-    with one_read() as conn:
+def reader(*, streaming=False):
+    if not streaming:
+        with one_read() as conn:
+            yield conn
+        return
+    conn = read_connection(streaming=True)
+    conn.row_factory = sqlite3.Row
+    try:
         yield conn
+    finally:
+        conn.close()
+
+
+@contextmanager
+def read_snapshot(conn):
+    timing = dbstats.Timing(paths.DB_FILE, "read")
+    try:
+        conn.execute("BEGIN")
+        timing.begun()
+        yield conn
+    except BaseException as e:
+        timing.error = type(e).__name__
+        timing.sqlite_error = isinstance(e, sqlite3.Error)
+        raise
+    finally:
+        try:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+        finally:
+            timing.finished()
+
+
+def write_connection():
+    active = getattr(_OWNER, "active", None)
+    if not active or active[:2] != (os.getpid(), "write") or not active[2].in_transaction:
+        raise RuntimeError("event emission needs an open write transaction")
+    return active[2]
 
 
 def ensure_schema() -> None:
@@ -2014,8 +2048,9 @@ def task_comments(tid: str, connect=reader) -> list[dict]:
 def tasks_replied(repo: str) -> list[dict]:
     with reader() as c:
         return [dict(r) for r in c.execute(
-            "SELECT * FROM tasks WHERE repo = ? AND state = 'needs-info' AND (SELECT author FROM task_comments c "
-            "WHERE c.task = tasks.id ORDER BY c.rowid DESC LIMIT 1) = 'owner' ORDER BY created, rowid", (repo,))]
+            "SELECT * FROM tasks WHERE repo = ? AND state = 'needs-info' AND "
+            "(SELECT author = 'owner' OR author LIKE 'u:%' FROM task_comments c "
+            "WHERE c.task = tasks.id ORDER BY c.rowid DESC LIMIT 1) ORDER BY created, rowid", (repo,))]
 
 
 def ask_row(r) -> dict:

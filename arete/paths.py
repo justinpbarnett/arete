@@ -139,7 +139,9 @@ class FixtureConnection(sqlite3.Connection):
             self.handles.close()
 
 
-def connect_db(p: Path, readonly: bool = False, create: bool = False) -> sqlite3.Connection:
+def connect_db(p: Path, readonly: bool = False, create: bool = False, *, streaming: bool = False) -> sqlite3.Connection:
+    if streaming and not readonly:
+        raise ValueError("a streaming database connection must be read-only")
     if not ISOLATED:
         mode = "ro" if readonly else "rwc" if create else "rw"
         conn = sqlite3.connect(f"{p.absolute().as_uri()}?mode={mode}", uri=True, timeout=30)
@@ -154,7 +156,7 @@ def connect_db(p: Path, readonly: bool = False, create: bool = False) -> sqlite3
     if getattr(DB_THREAD, "active", False) or not DB_LOCK.acquire(timeout=30):
         raise PermissionError("nested or busy isolated state access refused")
     DB_THREAD.active = True
-    handles, conn = ExitStack(), None
+    handles, retained, conn = ExitStack(), ExitStack(), None
     handles.callback(DB_LOCK.release)
     handles.callback(setattr, DB_THREAD, "active", False)
     try:
@@ -176,20 +178,25 @@ def connect_db(p: Path, readonly: bool = False, create: bool = False) -> sqlite3
             raise PermissionError("existing isolated database sidecar refused")
         flags = os.O_RDONLY if readonly else os.O_RDWR | (os.O_CREAT if create else 0)
         fd = os.open(p.name, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=parent)
-        handles.callback(os.close, fd)
+        (retained if streaming else handles).callback(os.close, fd)
         st = os.fstat(fd)
         if (not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid != os.getuid()
                 or os.pread(fd, 20, 0)[18:20] == b"\x02\x02"):
             raise PermissionError("linked, non-plain or WAL isolated state database refused")
         conn = sqlite3.connect(f"file:/dev/fd/{fd}?mode={'ro' if readonly else 'rw'}", uri=True,
                                timeout=30, factory=FixtureConnection)
-        conn.handles = handles
+        conn.handles = retained if streaming else handles
         if not readonly and conn.execute("PRAGMA journal_mode=MEMORY").fetchone()[0] != "memory":
             raise PermissionError("isolated state requires disposable memory journaling")
         conn.execute("PRAGMA synchronous=NORMAL")
+        if streaming:
+            handles.close()
         return conn
     except BaseException:
-        conn.close() if conn is not None else handles.close()
+        if conn is not None:
+            conn.close()
+        retained.close()
+        handles.close()
         raise
 
 

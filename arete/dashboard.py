@@ -21,6 +21,8 @@ from . import (
     config,
     control,
     devices,
+    event_stream,
+    events,
     gh,
     install_files,
     jira,
@@ -28,6 +30,7 @@ from . import (
     oncall,
     paths,
     pipeline,
+    principals,
     record,
     refusals,
     research,
@@ -208,6 +211,10 @@ class Handler(BaseHTTPRequestHandler):
             self.rfile.read(min(int(length), webhooks.MAX_HOOK_BODY))
 
     def answer(self, method: str) -> None:
+        with principals.acting("hand"):
+            return self.answer_as_person(method)
+
+    def answer_as_person(self, method: str) -> None:
         try:
             parts = urlsplit(self.path)
             path = parts.path
@@ -221,6 +228,8 @@ class Handler(BaseHTTPRequestHandler):
                 got = webhooks.receive(unquote(path[len(webhooks.HOOK_PATH):]), self.headers, self.raw_body())
                 return self.send_json(202 if got["queued"] else 200, got)
             query = {k: v[-1] for k, v in parse_qs(parts.query).items()}
+            if method == "GET" and path in ("/api/events", "/api/v1/events"):
+                return event_stream.serve(self, query, WEB_CODE)
             if method == "POST" and path == EVIDENCE_PATH:
                 return self.send_json(200, self.stage_evidence(query))
             if method == "GET" and (item := EVIDENCE_ITEM.fullmatch(path)):
@@ -245,12 +254,22 @@ class Handler(BaseHTTPRequestHandler):
             if method != "POST":
                 raise Refusal(405, "A webhook takes POST.")
             return
-        if self.server.logins.of(self.client_address[0]) != node.owner:
+        person = principals.for_login(self.server.logins.of(self.client_address[0]))
+        if not person:
             raise Refusal(403, "The dashboard opens only for its owner's tailnet login.")
+        principals.admit(person)
         if method == "POST" and self.headers.get("X-Arete") != "1":
             raise Refusal(403, "A change needs the X-Arete header, which the dashboard page sends.")
 
     def api(self, method: str, path: str, query: dict):
+        if method == "GET" and path == "/api/v1/principals":
+            return principals.listing(**{k: query[k] for k in ("kind", "role", "status") if k in query})
+        if method == "GET" and path.startswith("/api/v1/principals/"):
+            principal = unquote(path.removeprefix("/api/v1/principals/"))
+            rows = principals.listing(id=principals.current() if principal == "me" else principal)
+            if not rows:
+                raise Refusal(404, "No such principal.")
+            return rows[0]
         for verb, template, route in ROUTES:
             rest = route_rest(template, path) if verb == method else None
             if rest is not None:
@@ -553,9 +572,11 @@ def chat_session_parts(rest: str) -> list[str] | None:
 def get_meta(handler, rest, query):
     with state.reader() as conn:
         meta = dict(conn.execute("SELECT key, value FROM schema_meta"))
+        stream = events.metadata(conn)
     return {"instance": {key: meta[f"instance_{key}"] for key in ("id", "tag", "name", "created")},
             "schema": {"version": int(meta["schema_version"]),
-                       "oldest_writer": int(meta["oldest_writer"])}}
+                       "oldest_writer": int(meta["oldest_writer"]) if meta["oldest_writer"] is not None else None},
+            "stream": stream}
 
 
 def get_push(handler, rest, query):
@@ -751,7 +772,7 @@ def post_run(handler, rest, query):
 
 
 def post_push_subscribe(handler, rest, query):
-    return webpush.subscribe(handler.body(), handler.server.node.owner)
+    return webpush.subscribe(handler.body(), principals.contact(principals.current()))
 
 
 def post_push_remove(handler, rest, query):

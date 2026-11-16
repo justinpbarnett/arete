@@ -41,6 +41,59 @@ def environment(root):
                        HOME=str(root / "home"))
 
 
+class EventStreamTests(unittest.TestCase):
+    def exercise(self, name):
+        from tests.events_principals_fixture import exercise
+
+        exercise(name)
+
+    def test_live_replay(self):
+        self.exercise("live-replay")
+
+    def test_reconnect_formats(self):
+        self.exercise("reconnect-formats")
+
+    def test_filters_and_paging(self):
+        self.exercise("filters")
+
+    def test_restore_epoch_reset(self):
+        self.exercise("epoch-reset")
+
+    def test_retention_reset(self):
+        self.exercise("retention-reset")
+
+    def test_backlog_reset(self):
+        self.exercise("backlog-reset")
+
+    def test_atomicity(self):
+        self.exercise("atomicity")
+
+    def test_beats(self):
+        self.exercise("beats")
+
+    def test_existing_run_stream(self):
+        self.exercise("nearby")
+
+
+class PrincipalTests(unittest.TestCase):
+    def exercise(self, name):
+        from tests.events_principals_fixture import exercise
+
+        exercise(name)
+
+    def test_admission_and_seed(self):
+        self.exercise("admission-seed")
+
+    def test_principal_gate(self):
+        self.exercise("principal-gate")
+
+    def test_row_actors(self):
+        self.exercise("row-actors")
+
+    def test_completeness(self):
+        self.exercise("completeness")
+
+
 class LogRotationTests(unittest.TestCase):
     def scenario(self, body, timeout=180):
         with tempfile.TemporaryDirectory() as directory:

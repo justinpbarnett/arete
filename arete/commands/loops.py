@@ -237,7 +237,7 @@ def cmd_webhook(args) -> int:
               file=sys.stderr)
         return 1
     key = webhooks.secret(loop.name)
-    node = tailnet.this_node(config.load().dashboard_owner)
+    node = tailnet.this_node()
     print(f"POST {tailnet.url(node, config.load().dashboard_port)}{webhooks.hook_path(loop.name)}")
     print(f"X-Arete-Token: {key}")
     print("GitHub: use the same value as the webhook secret; arete checks X-Hub-Signature-256")
