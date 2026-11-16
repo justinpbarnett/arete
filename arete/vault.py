@@ -93,7 +93,7 @@ def holding(text: str, value: str) -> bool:
 ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "a": "\a", "b": "\b", "f": "\f", "v": "\v"}
 
 
-def unquoted(text: str) -> str:
+def git_unquoted(text: str) -> str:
     if len(text) < 2 or not (text.startswith('"') and text.endswith('"')):
         return text
     body, out, i = text[1:-1], bytearray(), 0
@@ -111,7 +111,7 @@ def unquoted(text: str) -> str:
 
 
 def patch_path(text: str) -> str:
-    return unquoted(text.rstrip("\t")).removeprefix("b/")
+    return git_unquoted(text.rstrip("\t")).removeprefix("b/")
 
 
 def held(patch: str) -> dict[str, list[str]]:

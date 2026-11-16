@@ -13,7 +13,7 @@ from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
 
-from . import accounts, background, config, devices, environment, paths, scratch, util
+from . import accounts, background, config, devices, environment, paths, scratch, ssh, util
 from .agent import (
     NO_SESSION,
     Cut,
@@ -402,7 +402,7 @@ def remote_root(folder: Path | str) -> str:
         return f"/{text}"
     if text == "~" or text.startswith("~/"):
         return text
-    return "." if devices.HOME_DIR.fullmatch(text.partition("/")[0]) else f"~/{text}"
+    return "." if ssh.HOME_DIR.fullmatch(text.partition("/")[0]) else f"~/{text}"
 
 
 def scoped_to(roots: list[str], rules: list[str]) -> list[str]:

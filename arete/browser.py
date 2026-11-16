@@ -20,12 +20,13 @@ import sys
 import tarfile
 import time
 import urllib.request
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote, urlsplit
 
-from . import paths, pi, scratch, util
+from . import paths, sandbox, scratch, util
 
 REGISTRY = "https://registry.npmjs.org/"
 PIN = "browser-server.pin"
@@ -37,8 +38,8 @@ PACKAGE = re.compile(r"(@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*")
 FAILURES = (OSError, ValueError, KeyError, TypeError, AttributeError, tarfile.TarError, EOFError)
 
 
-def refuse(reason: str) -> scratch.ConfinementUnavailable:
-    return scratch.ConfinementUnavailable("pinned browser server: " + reason)
+def refuse(reason: str) -> sandbox.ConfinementUnavailable:
+    return sandbox.ConfinementUnavailable("pinned browser server: " + reason)
 
 
 def fetch(url: str) -> bytes:
@@ -60,7 +61,7 @@ def server_folder() -> Path:
 
 def chrome() -> Path:
     if not CHROME.is_file():
-        raise scratch.ConfinementUnavailable(f"Google Chrome is not installed at {CHROME}")
+        raise sandbox.ConfinementUnavailable(f"Google Chrome is not installed at {CHROME}")
     return CHROME
 
 
@@ -68,7 +69,7 @@ def engine_node() -> Path:
     found = shutil.which("node")
     if not found:
         raise refuse("no node in the engine's environment")
-    return scratch.canonical(Path(found))
+    return sandbox.canonical(Path(found))
 
 
 def tarball_name(name: str, version: str) -> str:
@@ -195,7 +196,7 @@ def resolved() -> Path:
                 os.rename(build, folder)
             finally:
                 shutil.rmtree(build, ignore_errors=True)
-    except scratch.ConfinementUnavailable:
+    except sandbox.ConfinementUnavailable:
         raise
     except FAILURES as error:
         raise refuse(f"cannot resolve {PLAYWRIGHT_MCP}: {error}") from error
@@ -274,7 +275,7 @@ def checked() -> tuple[str, str]:
         if not os.access(found, os.X_OK) or scratch.exposure(found, (paths.WORKTREES_DIR,)) is not None:
             raise refuse("no trusted node in the engine's environment")
         return str(found), str(folder / "node_modules" / relative)
-    except scratch.ConfinementUnavailable:
+    except sandbox.ConfinementUnavailable:
         raise
     except FAILURES as error:
         raise refuse(f"verification failed: {type(error).__name__}: {error}") from error
@@ -323,7 +324,7 @@ def browser_folder(a: scratch.Attempt) -> Path:
     with paths.directory_fd(folder, create=True) as fd:
         st = os.fstat(fd)
         if st.st_uid != os.getuid() or st.st_mode & 0o077:
-            raise scratch.ConfinementUnavailable("the browser folder is not private")
+            raise sandbox.ConfinementUnavailable("the browser folder is not private")
         for leaf in ("home", "tmp"):
             with paths.directory_fd(Path(leaf), fd, create=True):
                 pass
@@ -335,17 +336,17 @@ def browser_profile(a: scratch.Attempt, port: int, folder: Path, listen: int | N
     hidden = (*scratch.hidden_folders(paths.STATE_DIR.resolve() != state_default.resolve()),
               *(scratch.home_dir() / n for n in BROWSER_HIDDEN))
     evidence = scratch.evidence_path(a.run_dir)
-    return pi.write_confinement(folder, [evidence], hidden=hidden, agent_roots=False, peers=paths.WORKTREES_DIR,
-                                secrets_denied=True, temp_writes=False,
-                                state=(paths.STATE_DIR, (evidence, folder, server_folder(), browser_log(a))),
-                                mach=(BROWSER_MACH, BROWSER_MACH_PATTERN), tcp_port=port, listen_port=listen)
+    return sandbox.write_confinement(
+        folder, [evidence], hidden=hidden, agent_roots=False, peers=paths.WORKTREES_DIR, secrets_denied=True,
+        temp_writes=False, state=(paths.STATE_DIR, (evidence, folder, server_folder(), browser_log(a))),
+        mach=(BROWSER_MACH, BROWSER_MACH_PATTERN), tcp_port=port, listen_port=listen)
 
 
 def listen_port(a: scratch.Attempt, app: int, avoid: frozenset[int] = frozenset()) -> int:
     avoid, port = avoid | {app}, 0
-    for _ in range(LISTEN_TRIES if pi.can_confine(False) else 1):
+    for _ in range(LISTEN_TRIES if sandbox.can_confine(False) else 1):
         port = free_port(avoid)
-        with suppress(OSError, scratch.ConfinementUnavailable):
+        with suppress(OSError, sandbox.ConfinementUnavailable):
             folder = browser_folder(a)
             if listens([*browser_profile(a, app, folder, port), "/usr/bin/nc", "-l", "127.0.0.1", str(port)], port,
                        folder):
@@ -377,7 +378,7 @@ def browser_exposure(a: scratch.Attempt, node: Path | None = None) -> None:
                                ("node", node or engine_node(), ("agent", "service", "browser"))):
         for actor in actors:
             if (root := scratch.exposure(tree, grants[actor])) is not None:
-                raise scratch.ConfinementUnavailable(f"the {name} {tree} can be changed through the {actor} write grant {root}")
+                raise sandbox.ConfinementUnavailable(f"the {name} {tree} can be changed through the {actor} write grant {root}")
 
 
 def browser_record(a: scratch.Attempt) -> dict:
@@ -392,7 +393,7 @@ def update_browser(a: scratch.Attempt, **fields) -> None:
     with scratch.registry() as (fd, key):
         fcntl.flock(fd, fcntl.LOCK_EX)
         data = scratch.load(fd, key, a.selector)
-        if data["attempt"] != asdict(a) or data["state"] not in ("prepared", "active"):
+        if data["attempt"] != asdict(a) or data["state"] not in scratch.LIVE:
             raise PermissionError("verification attempt authority revoked")
         data["browser"] = {**(data.get("browser") or {}), **fields}
         scratch.store(fd, key, data)
@@ -428,12 +429,12 @@ def browser_env(folder: Path, debug: bool = False) -> list[str]:
 
 def browser_command(a: scratch.Attempt, words: list[str], listen: int | None = None) -> list[str]:
     workspace, worktrees = Path(a.workspace), paths.WORKTREES_DIR.resolve()
-    if (not pi.can_confine(False) or scratch.sandboxed() or workspace == worktrees
+    if (not sandbox.can_confine(False) or sandbox.sandboxed() or workspace == worktrees
             or not workspace.is_relative_to(worktrees)):
-        raise scratch.ConfinementUnavailable("browser confinement cannot be applied in this process or workspace")
+        raise sandbox.ConfinementUnavailable("browser confinement cannot be applied in this process or workspace")
     port = browser_record(a).get("port")
     if not isinstance(port, int) or not 0 < port < 65536:
-        raise scratch.ConfinementUnavailable("no app port is recorded for browser confinement")
+        raise sandbox.ConfinementUnavailable("no app port is recorded for browser confinement")
     node, cli = checked()
     browser_exposure(a, Path(node))
     folder = browser_folder(a)
@@ -492,7 +493,7 @@ def browser_config(a: scratch.Attempt, config_json: str, add_dirs) -> str:
 
 def browser_start(argv: list[str]) -> None:
     selector, rest = argv[0], argv[1:]
-    if scratch.sandboxed() or not rest or rest[0] != "/usr/bin/sandbox-exec":
+    if sandbox.sandboxed() or not rest or rest[0] != "/usr/bin/sandbox-exec":
         raise SystemExit("browser server refused: it must start outside any sandbox with the engine's profile")
     try:
         os.setsid()
@@ -646,9 +647,9 @@ def start_served(a: scratch.Attempt, words: list[str]) -> Served:
         record = browser_record(a)
         listen = record.get("listen")
         if record.get("loopback") is not True:
-            raise scratch.ConfinementUnavailable("the verify URL is not a loopback address, so the confined browser cannot reach it")
+            raise sandbox.ConfinementUnavailable("the verify URL is not a loopback address, so the confined browser cannot reach it")
         if not isinstance(listen, int) or not 0 < listen < 65536:
-            raise scratch.ConfinementUnavailable("no browser port is recorded for the confined browser")
+            raise sandbox.ConfinementUnavailable("no browser port is recorded for the confined browser")
         browser_exposure(a)
         resolved()
         served = [*words, "--host", "127.0.0.1", "--port", str(listen), "--allowed-hosts", f"127.0.0.1:{listen}"]
@@ -722,3 +723,46 @@ def servers_allowed(a: scratch.Attempt, mcp_config: str) -> bool:
         return not servers or servers == {"playwright": browser_server(a)}
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return False
+
+
+def with_note(kw: dict, text: str) -> None:
+    kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), text]))
+
+
+def confine(kw: dict, attempt: scratch.Attempt, which: str, remote: bool,
+            say: Callable[[str], None]) -> tuple[dict, tuple]:
+    original = kw.get("mcp_config", "")
+    if which != "claude" or remote:
+        stop_served(attempt)
+    if which == "codex" and not remote:
+        try:
+            kw["mcp_config"] = browser_config(attempt, original, kw.get("add_dirs", ()))
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            kw["budget_error"] = f"browser confinement unavailable: {error}"
+    try:
+        hook = scratch.activate(attempt, which, bool(remote), kw.get("add_dirs", ()), kw.get("mcp_config", ""))
+    except (OSError, ValueError, KeyError, TypeError):
+        hook = ()
+    if (not hook and which == "codex" and not remote and has_servers(original)
+            and not kw.get("budget_error")
+            and (kw.get("mcp_config", "") != original or plain_config(attempt, original) is None)):
+        kw["budget_error"] = "browser confinement unavailable: the trusted browser could not be activated"
+    if not hook:
+        if "mcp_config" in kw:
+            kw["mcp_config"] = original
+        say("trusted scratch authority unavailable for this confinement; fixture-dependent checks may be blocked")
+        with_note(kw, scratch.note(None))
+    if which == "claude" and not remote:
+        try:
+            config_json, reason = serve_browser(attempt, original, kw.get("add_dirs", ()))
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            config_json = without_browser(original)
+            reason = str(error) or type(error).__name__
+        if reason:
+            kw["allowed_tools"] = [t for t in kw.get("allowed_tools") or [] if not t.startswith("mcp__playwright")]
+            with_note(kw, browser_blocked_note(reason))
+            say(f"the confined browser is unavailable for this verify: {reason}")
+        if "mcp_config" in kw:
+            kw["mcp_config"] = config_json
+    kw["verification_attempt"] = attempt
+    return kw, hook
