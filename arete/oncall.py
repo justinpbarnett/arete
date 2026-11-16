@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import timedelta
 from functools import partial
@@ -1258,7 +1259,12 @@ def scan(cfg: config.Config) -> dict | None:
     with util.lock("oncall") as got:
         if not got:
             return {"skipped": "another scan is running"}
-        return scan_once(cfg)
+        try:
+            return scan_once(cfg)
+        except BaseException as e:
+            with suppress(BaseException):
+                crashed(f"{type(e).__name__}: {util.first_line(str(e), 300)}")
+            raise
 
 
 def crashed(text: str) -> None:

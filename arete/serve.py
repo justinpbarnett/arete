@@ -511,7 +511,6 @@ class Server:
             found = oncall.scan(cfg)
         except Exception as e:
             text = f"{type(e).__name__}: {util.first_line(str(e), 300)}"
-            oncall.crashed(text)
             if self.oncall_error != text:
                 self.say(f"on-call scan failed: {text}")
             self.oncall_error = text

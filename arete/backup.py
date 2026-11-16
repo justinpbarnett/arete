@@ -325,8 +325,10 @@ def current_sequences() -> dict[str, int] | None:
 
 
 def raise_sequences(staged: Path, current: dict[str, int] | None) -> None:
-    conn = sqlite3.connect(staged, timeout=30)
-    try:
+    from . import dbstats, state
+
+    timing = dbstats.Timing(staged, "write")
+    with state.owning_transaction(lambda: sqlite3.connect(staged, timeout=30), timing=timing) as conn:
         held = sequences(conn)
         for name in set(held) | set(current or {}):
             wanted = max(held.get(name, 0), (current or {}).get(name, 0)) if current is not None else held[name] + RESTORE_GAP
@@ -334,9 +336,6 @@ def raise_sequences(staged: Path, current: dict[str, int] | None) -> None:
                 conn.execute("UPDATE sqlite_sequence SET seq = ? WHERE name = ?", (wanted, name))
             elif held or conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'sqlite_sequence'").fetchone():
                 conn.execute("INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)", (name, wanted))
-        conn.commit()
-    finally:
-        conn.close()
 
 
 def restore(source: Path) -> str:

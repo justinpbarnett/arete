@@ -78,16 +78,17 @@ def event(type_: str, source: str, key, title: str, *, repo: str = "", url: str 
             "url": url, "trust": trust, "data": data or {}}
 
 
-def fire(loop: Loop, how: str, events: list[dict] | None = None, connect=state.db) -> list[int]:
-    if events is None:
-        return [item] if (item := state.enqueue(loop.name, loop.queue_name, "", how, connect=connect)) else []
-    batches: dict[str, list[dict]] = {}
-    for e in events:
-        if not loop.trigger.refusal(e):
-            state.add_event(loop.name, e, connect)
-            batches.setdefault(loop.trigger.group_of(e), []).append(e)
-    return [state.enqueue(loop.name, loop.queue_name, group, how, batch, connect)
-            for group, batch in batches.items()]
+def fire(loop: Loop, how: str, events: list[dict] | None = None) -> list[int]:
+    with state.tx():
+        if events is None:
+            return [item] if (item := state.enqueue(loop.name, loop.queue_name, "", how)) else []
+        batches: dict[str, list[dict]] = {}
+        for e in events:
+            if not loop.trigger.refusal(e):
+                state.add_event(loop.name, e)
+                batches.setdefault(loop.trigger.group_of(e), []).append(e)
+        return [state.enqueue(loop.name, loop.queue_name, group, how, batch)
+                for group, batch in batches.items()]
 
 
 def github_name(cfg: config.Config, name: str) -> str:
@@ -147,8 +148,8 @@ def poll(loop: Loop, index: int, cfg: config.Config, say=lambda _: None) -> tupl
     cursor = None if first else kind.rescope(source, known["value"]) if changed or unsure else known["value"]
     found, value = kind.fetch(loop, source, cfg, sid, cursor)
     unique = {e["key"]: e for e in found}
-    with state.transaction() as connect:
-        claimed = set(state.claim_seen(sid, list(unique), connect))
+    with state.tx():
+        claimed = set(state.claim_seen(sid, list(unique)))
         fresh = [e for k, e in unique.items() if k in claimed]
         if first:
             forwarded, older = [], fresh
@@ -157,14 +158,14 @@ def poll(loop: Loop, index: int, cfg: config.Config, say=lambda _: None) -> tupl
         else:
             forwarded, older = fresh, []
         told = changed or unsure and bool(older)
-        items = fire(loop, "event", forwarded, connect)
+        items = fire(loop, "event", forwarded)
         detail = f"{len(found)} read, {len(fresh)} new"
         if first:
             detail += " (baseline)"
         elif told:
             detail += f", settings changed, {len(older)} older taken as seen"
-        state.set_cursor(sid, value, True, detail, connect, started)
-        state.set_source_owner(sid, owner, connect)
+        state.set_cursor(sid, value, True, detail, started=started)
+        state.set_source_owner(sid, owner)
     if first:
         say(f"{sid}: first read, {len(fresh)} existing events taken as the baseline"
             + (f": {shown([e['key'] for e in fresh])}" if fresh else ""))

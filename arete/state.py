@@ -5,12 +5,13 @@ import math
 import os
 import secrets
 import sqlite3
+import threading
 import time
 from collections.abc import Sequence
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, suppress
 from datetime import timedelta
 
-from . import migrations, paths, util
+from . import dbstats, migrations, paths, util
 from .agent import billing_of
 from .migrations import m0002_foundation_time_shape as time_shape
 from .sighting import Sighting
@@ -23,6 +24,7 @@ LATEST = _CHAIN[-1].n
 NEEDED = max(m.n for m in _CHAIN if m.phase != "contract")
 MIGRATE_WAIT_SECONDS = 60
 _CHECKED = set()
+_OWNER = threading.local()
 
 
 class NoDatabase(RuntimeError):
@@ -72,6 +74,17 @@ def contract_blockers(conn, n):
     return blockers
 
 
+def execute_statements(conn, sql):
+    pending = ""
+    for char in sql:
+        pending += char
+        if char == ";" and sqlite3.complete_statement(pending):
+            conn.execute(pending)
+            pending = ""
+    if pending.strip():
+        conn.execute(pending)
+
+
 def migrate(contracts=True):
     from . import backup
 
@@ -84,6 +97,8 @@ def migrate(contracts=True):
         try:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
             migrations.validate(conn, chain, version)
+            conn.close()
+            conn = None
             snapshot = None
             started_chain = False
             for migration in chain:
@@ -92,7 +107,14 @@ def migrate(contracts=True):
                 if migration.phase == "contract":
                     if not contracts:
                         return True
-                    if blockers := contract_blockers(conn, migration.n):
+                    conn = paths.connect_db(paths.DB_FILE)
+                    conn.row_factory = sqlite3.Row
+                    try:
+                        blockers = contract_blockers(conn, migration.n)
+                    finally:
+                        conn.close()
+                        conn = None
+                    if blockers:
                         print(f"migration {migration.name} waits for {', '.join(blockers)}", flush=True)
                         return True
                 if not started_chain:
@@ -101,27 +123,27 @@ def migrate(contracts=True):
                     started_chain = True
                 started = time.monotonic()
                 try:
-                    if migration.sql is not None:
-                        conn.executescript("BEGIN EXCLUSIVE; " + migration.sql)
-                    else:
-                        conn.execute("BEGIN EXCLUSIVE")
-                        migration.apply(conn)
-                    conn.execute("INSERT INTO schema_migrations "
-                                 "(n, name, area, phase, sha256, applied, backup, seconds) VALUES (?,?,?,?,?,?,?,?)",
-                                 (migration.n, migration.name, migration.area, migration.phase, migration.sha256,
-                                  util.iso(), snapshot.name if snapshot else "", time.monotonic() - started))
-                    conn.execute("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
-                                 (str(migration.n),))
-                    conn.execute(f"PRAGMA user_version = {migration.n}")
-                    conn.commit()
+                    timing = dbstats.Timing(paths.DB_FILE, "write")
+                    with owning_transaction(lambda: paths.connect_db(paths.DB_FILE), "BEGIN EXCLUSIVE", timing) as writer:
+                        if migration.sql is not None:
+                            execute_statements(writer, migration.sql)
+                        else:
+                            migration.apply(writer)
+                        writer.execute("INSERT INTO schema_migrations "
+                                       "(n, name, area, phase, sha256, applied, backup, seconds) VALUES (?,?,?,?,?,?,?,?)",
+                                       (migration.n, migration.name, migration.area, migration.phase, migration.sha256,
+                                        util.iso(), snapshot.name if snapshot else "", time.monotonic() - started))
+                        writer.execute("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
+                                       (str(migration.n),))
+                        writer.execute(f"PRAGMA user_version = {migration.n}")
                 except BaseException as e:
-                    conn.rollback()
                     raise migrations.Refused(f"{migration.name}: {e}") from e
                 version = migration.n
                 print(f"applied {migration.name}", flush=True)
             return False
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
 
 
 def checked_connection():
@@ -163,26 +185,85 @@ def checked_connection():
             _CHECKED.add(key)
         return conn
     except BaseException:
-        conn.close()
+        with suppress(BaseException):
+            conn.close()
         raise
 
 
 @contextmanager
-def db():
-    conn = checked_connection()
+def owning_transaction(connect, begin="BEGIN IMMEDIATE", timing=None, *, commit=True):
+    conn = None
+    failed = False
     try:
+        conn = connect()
         conn.row_factory = sqlite3.Row
+        conn.execute(begin)
+        if timing:
+            timing.begun()
         yield conn
-        conn.commit()
+        if commit:
+            if timing:
+                timing.committing()
+            try:
+                conn.execute("COMMIT")
+            finally:
+                if timing:
+                    timing.committed()
+    except BaseException as e:
+        failed = True
+        if timing:
+            timing.error = type(e).__name__
+            timing.sqlite_error = isinstance(e, sqlite3.Error)
+        if conn is not None:
+            with suppress(BaseException):
+                conn.execute("ROLLBACK")
+        raise
     finally:
-        conn.close()
+        try:
+            if conn is not None:
+                if failed:
+                    with suppress(BaseException):
+                        conn.close()
+                else:
+                    conn.close()
+        finally:
+            if timing:
+                timing.finished()
 
 
 @contextmanager
-def transaction():
-    with db() as c:
-        c.execute("BEGIN IMMEDIATE")
-        yield lambda: nullcontext(c)
+def owned(mode):
+    active = getattr(_OWNER, "active", None)
+    if active and active[0] == os.getpid():
+        _, held_mode, conn = active
+        if held_mode == "read" and mode == "write":
+            raise RuntimeError("cannot promote a read snapshot to a writer")
+        yield conn
+        return
+    timing = dbstats.Timing(paths.DB_FILE, mode)
+    connect = checked_connection if mode == "write" else lambda: paths.connect_db(paths.DB_FILE, readonly=True)
+    try:
+        with owning_transaction(connect, "BEGIN IMMEDIATE" if mode == "write" else "BEGIN", timing,
+                                commit=mode == "write") as conn:
+            _OWNER.active = (os.getpid(), mode, conn)
+            yield conn
+    finally:
+        _OWNER.active = None
+
+
+@contextmanager
+def tx():
+    with owned("write") as conn:
+        yield conn
+
+
+db = tx
+
+
+@contextmanager
+def one_read():
+    with owned("read") as conn:
+        yield conn
 
 
 def ensure_schema() -> None:
@@ -248,12 +329,8 @@ def cost_drift(connect=db) -> list[dict]:
 
 @contextmanager
 def reader():
-    conn = paths.connect_db(paths.DB_FILE, readonly=True)
-    conn.row_factory = sqlite3.Row
-    try:
+    with one_read() as conn:
         yield conn
-    finally:
-        conn.close()
 
 
 FIRINGS = ("(runs.kind = 'loop' AND runs.loop_kind = 'command' AND runs.status IN ('done', 'skipped') "
@@ -493,9 +570,10 @@ def cursor(source: str, connect=db) -> dict | None:
 
 
 def set_cursor(source: str, value: str | None, ok: bool, detail: str = "", connect=db, started=None) -> None:
-    prev = cursor(source, connect) or {}
-    last_ok = (started or util.iso()) if ok else prev.get("last_ok") or (prev.get("polled") if prev.get("ok") else None)
     with connect() as c:
+        row = c.execute("SELECT * FROM cursors WHERE source = ?", (source,)).fetchone()
+        prev = dict(row) if row else {}
+        last_ok = (started or util.iso()) if ok else prev.get("last_ok") or (prev.get("polled") if prev.get("ok") else None)
         c.execute("INSERT OR REPLACE INTO cursors (source, value, polled, ok, detail, last_ok) VALUES (?,?,?,?,?,?)",
                   (source, value if value is not None else prev.get("value"), util.iso(), int(ok), detail[:500],
                    last_ok))
@@ -525,8 +603,6 @@ def cursors(connect=db) -> list[dict]:
 
 def enqueue(loop: str, queue: str, grp: str, trigger: str, payload: list | None = None, connect=db) -> int:
     with connect() as c:
-        if not c.in_transaction:
-            c.execute("BEGIN IMMEDIATE")
         if not payload and c.execute("SELECT 1 FROM queue WHERE loop = ? AND run_id IS NULL AND payload = '[]' "
                                      "AND trigger = ?", (loop, trigger)).fetchone():
             return 0
@@ -583,14 +659,12 @@ def finish_claim(c, row: dict, how: str, summary: str) -> None:
 
 def end_claim(run_id: str, how: str, summary: str) -> None:
     with db() as c:
-        c.execute("BEGIN IMMEDIATE")
         for row in c.execute("SELECT * FROM queue WHERE run_id = ? AND dead_at IS NULL", (run_id,)).fetchall():
             finish_claim(c, dict(row), how, summary)
 
 
 def release_settled_claims() -> None:
     with db() as c:
-        c.execute("BEGIN IMMEDIATE")
         rows = c.execute("SELECT q.*, r.status, r.summary FROM queue q LEFT JOIN runs r ON r.id = q.run_id "
                          "WHERE q.run_id IS NOT NULL AND q.dead_at IS NULL "
                          "AND (r.status IS NULL OR r.status != 'running')").fetchall()
@@ -1063,10 +1137,8 @@ def loop_spent_since(since: str, loop: str | None = None, local_providers=()) ->
                    if billing_of(dict(r), local_providers) == "api_key")
 
 
-def hold(scope: str, until: str, why: str, connect=db) -> None:
-    with connect() as c:
-        if not c.in_transaction:
-            c.execute("BEGIN IMMEDIATE")
+def hold(scope: str, until: str, why: str) -> None:
+    with tx() as c:
         links = refresh_links(c)
         ts = util.iso()
         for linked in linked_scopes(scope, links):
@@ -1088,10 +1160,8 @@ def holds(connect=db) -> list[dict]:
                                            (REFRESH_SCOPE + "%", util.iso()))]
 
 
-def clear_holds(scopes: list[str], set_before: str, connect=db) -> None:
-    with connect() as c:
-        if not c.in_transaction:
-            c.execute("BEGIN IMMEDIATE")
+def clear_holds(scopes: list[str], set_before: str) -> None:
+    with tx() as c:
         links = refresh_links(c)
         linked = {s for scope in scopes for s in linked_scopes(scope, links)}
         c.executemany("DELETE FROM holds WHERE scope = ? AND ts < ?", [(s, set_before) for s in linked])
@@ -1144,12 +1214,10 @@ def refresh_continues(previous: str, latest: str, connect=db) -> bool:
     return False
 
 
-def record_refresh(before: str, after: str, previous: str, latest: str, connect=db) -> None:
+def record_refresh(before: str, after: str, previous: str, latest: str) -> None:
     if not all((before, after, previous, latest)) or before == after:
         return
-    with connect() as c:
-        if not c.in_transaction:
-            c.execute("BEGIN IMMEDIATE")
+    with tx() as c:
         c.execute("INSERT OR IGNORE INTO holds (scope, until, why, ts) VALUES (?,?,?,?)",
                   (REFRESH_SCOPE + before + ":" + after, "", json.dumps([previous, latest]), util.iso()))
         links = refresh_links(c)
@@ -1703,9 +1771,7 @@ def capture_draft(connect=db) -> dict | None:
 
 
 def capture_move(draft_id: int, revision: int, was: str, to: str, delivery: str | None = None) -> bool:
-    with db() as c:
-        if not c.in_transaction:
-            c.execute("BEGIN IMMEDIATE")
+    with tx() as c:
         note = "" if delivery is None else ", delivery = ?"
         args = (to, *(() if delivery is None else (delivery,)), draft_id, was, revision)
         return c.execute(f"UPDATE captures SET status = ?{note} WHERE id = ? AND status = ? AND revision = ?",
@@ -1713,9 +1779,7 @@ def capture_move(draft_id: int, revision: int, was: str, to: str, delivery: str 
 
 
 def capture_begin_checks(draft_id: int, prints: dict[str, str]) -> bool:
-    with db() as c:
-        if not c.in_transaction:
-            c.execute("BEGIN IMMEDIATE")
+    with tx() as c:
         if not c.execute("SELECT 1 FROM captures WHERE id = ? AND status = 'checking'", (draft_id,)).fetchone():
             return False
         for name, print_ in prints.items():
@@ -1743,9 +1807,7 @@ def capture_note(draft_id: int | None, text: str) -> None:
 
 def capture_filed(draft_id: int, number: int, url: str, title: str) -> bool:
     now = util.iso()
-    with db() as c:
-        if not c.in_transaction:
-            c.execute("BEGIN IMMEDIATE")
+    with tx() as c:
         changed = c.execute("UPDATE captures SET status = 'filed', issue = ?, issue_url = ?, issue_title = ?, filed = ?, "
                             "updated = ?, delivery = '' WHERE id = ? AND status = 'filing'",
                             (number, url, title, now, now, draft_id)).rowcount
@@ -1770,9 +1832,7 @@ def capture_filing(connect=db) -> bool:
 
 
 def capture_check_done(draft_id: int, name: str, result: str, reason: str, detail: dict, cost: float) -> bool:
-    with db() as c:
-        if not c.in_transaction:
-            c.execute("BEGIN IMMEDIATE")
+    with tx() as c:
         changed = c.execute(
             "UPDATE capture_checks SET result = ?, reason = ?, detail = ?, checked = ? WHERE capture = ? AND name = ? "
             "AND result = 'running' AND EXISTS (SELECT 1 FROM captures WHERE id = ? AND status = 'checking')",
@@ -1783,9 +1843,7 @@ def capture_check_done(draft_id: int, name: str, result: str, reason: str, detai
 
 
 def capture_inspected(evidence_id: int, sha256: str, inspection: dict, cost: float) -> bool:
-    with db() as c:
-        if not c.in_transaction:
-            c.execute("BEGIN IMMEDIATE")
+    with tx() as c:
         row = c.execute("SELECT capture FROM capture_evidence WHERE id = ? AND sha256 = ?",
                         (evidence_id, sha256)).fetchone()
         if not row:
@@ -1797,9 +1855,7 @@ def capture_inspected(evidence_id: int, sha256: str, inspection: dict, cost: flo
 
 
 def capture_end_checks(draft_id: int | None, reason: str) -> None:
-    with db() as c:
-        if not c.in_transaction:
-            c.execute("BEGIN IMMEDIATE")
+    with tx() as c:
         args = () if draft_id is None else (draft_id,)
         c.execute("UPDATE capture_checks SET result = 'interrupted', reason = ?, checked = ? WHERE result = 'running'"
                   + ("" if draft_id is None else " AND capture = ?"), (reason, util.iso(), *args))
@@ -1821,9 +1877,7 @@ def capture_evidence(evidence_id: int, connect=db) -> dict | None:
 
 def capture_stage(row: dict, admit, keep) -> tuple[dict, bool]:
     now = util.iso()
-    with db() as c:
-        if not c.in_transaction:
-            c.execute("BEGIN IMMEDIATE")
+    with tx() as c:
         draft = c.execute(f"SELECT id, status FROM captures WHERE {OPEN_CAPTURE}").fetchone()
         draft_id = draft["id"] if draft else c.execute(
             "INSERT INTO captures (status, revision, created, updated) VALUES ('draft', 0, ?, ?)", (now, now)).lastrowid
@@ -1841,9 +1895,7 @@ def capture_stage(row: dict, admit, keep) -> tuple[dict, bool]:
 
 
 def capture_drop_evidence(evidence_id: int) -> dict | None:
-    with db() as c:
-        if not c.in_transaction:
-            c.execute("BEGIN IMMEDIATE")
+    with tx() as c:
         r = c.execute("SELECT e.* FROM capture_evidence e JOIN captures k ON k.id = e.capture "
                       "WHERE e.id = ? AND k.status IN ('draft', 'checking')", (evidence_id,)).fetchone()
         if not r:
@@ -1857,9 +1909,7 @@ def capture_save(**fields) -> bool:
     now = util.iso()
     names = list(fields)
     sets = "".join(f"{n} = ?, " for n in names)
-    with db() as c:
-        if not c.in_transaction:
-            c.execute("BEGIN IMMEDIATE")
+    with tx() as c:
         changed = c.execute(f"UPDATE captures SET {sets}revision = revision + 1, updated = ? WHERE {EDITABLE_CAPTURE}",
                             (*fields.values(), now)).rowcount
         if changed:
@@ -1872,9 +1922,7 @@ def capture_save(**fields) -> bool:
 
 
 def capture_discard() -> int | None:
-    with db() as c:
-        if not c.in_transaction:
-            c.execute("BEGIN IMMEDIATE")
+    with tx() as c:
         draft = c.execute(f"SELECT id FROM captures WHERE {EDITABLE_CAPTURE}").fetchone()
         if not draft:
             return None

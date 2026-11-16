@@ -199,7 +199,6 @@ def run() -> list[Result]:
         conn, opened = None, None
         try:
             conn = stack.enter_context(state.reader())
-            conn.execute("BEGIN")
         except Exception as e:
             conn, opened = None, e
 
