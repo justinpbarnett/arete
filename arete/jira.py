@@ -147,14 +147,14 @@ class Client:
             if token:
                 params["nextPageToken"] = token
             res = self.get("/rest/api/3/search/jql", **params) or {}
-            out += res.get("issues", [])
+            out += [_read_description(issue) for issue in res.get("issues", [])]
             token = res.get("nextPageToken", "")
             if not token or res.get("isLast", True):
                 break
         return out[:limit]
 
     def issue(self, key: str, fields: list[str]) -> dict:
-        return self.get(f"/rest/api/2/issue/{_path_segment(key)}", fields=",".join(fields)) or {}
+        return _read_description(self.get(f"/rest/api/2/issue/{_path_segment(key)}", fields=",".join(fields)) or {})
 
     def statuses(self, project: str) -> set[str]:
         if project not in self._statuses:
@@ -230,6 +230,17 @@ class Client:
             if not status or status != (pick.get("to") or {}).get("name"):
                 raise
         return True
+
+
+def _read_description(issue: dict) -> dict:
+    fields = issue.get("fields")
+    if isinstance(fields, dict) and "description" in fields:
+        try:
+            text = adf.to_text(fields["description"])
+        except ValueError as e:
+            raise JiraError(f"Jira {issue.get('key', '(unknown issue)')} description could not be read: {e}") from e
+        return {**issue, "fields": {**fields, "description": text}}
+    return issue
 
 
 def _path_segment(key: str) -> str:
