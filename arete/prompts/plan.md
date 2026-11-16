@@ -30,11 +30,12 @@ issue names, and one thing nearby that must still work. After the build, a verif
 running product. Leave out the repo's own checks ($checks): arete runs those before the verifier starts. Plan new
 tests only where the repo's own docs ask for them.
 
+For every planned edit, check that the builder’s command allowlist can perform it.
 The builder edits files and may run only these shell commands: $commands.
 Anything else is refused: installing a package this allowlist does not cover, running a migration, calling a
 network service. If the work cannot be done within that, do not plan around it: set `ambiguous` and ask for
 exactly what a human must do first (for example, add the dependency on the base branch).
-The builder may not edit these paths either: $denied. Arete rejects a diff that touches them, so plan no edits
+For every planned edit, check that the path is not denied: $denied. Arete rejects a diff that touches them, so plan no edits
 there. If the work needs a change there, such as a CI workflow that asserts the old behavior, plan the rest and
 put the exact change a person must make in `left_for_a_person`: the path and the full content or edit. Arete shows
 it in the PR and links the PR to the issue without closing it. Leave `left_for_a_person` empty when the build covers
