@@ -40,6 +40,7 @@ from . import (
     owner_asks,
     paths,
     record,
+    refusals,
     routing,
     run_lines,
     runlimits,
@@ -4091,7 +4092,7 @@ def spawn_run(repo_name: str, tid: str, force: bool = False) -> subprocess.Popen
     return control.launch(run_command(repo_name, tid, force), RUNS_LOG)
 
 
-class NoFreeSlot(RuntimeError):
+class NoFreeSlot(refusals.Conflict, RuntimeError):
     pass
 
 

@@ -311,7 +311,7 @@ def cmd_backup(args) -> int:
 
 
 def cmd_oncall(args) -> int:
-    from . import control, oncall, state
+    from . import oncall, state
 
     cfg = config.load()
     if args.action == "scan":
@@ -332,10 +332,7 @@ def cmd_oncall(args) -> int:
             print(f"no incident {args.id}" if args.id else f"{args.action} needs an incident number", file=sys.stderr)
             return 1
         number = int(args.id)
-        try:
-            done = getattr(oncall, args.action)(number)
-        except (control.NotFound, control.Refused) as e:
-            return refused(e)
+        done = getattr(oncall, args.action)(number)
         if args.action == "cancel":
             stopped = f"stopped run {done['stopped']}" if done["stopped"] else "no run was live"
             print(f"cancelled incident {number}: {stopped}; cooling down until {done['cooldown_until'] or '-'}")
@@ -814,10 +811,6 @@ def cmd_dashboard(args) -> int:
 
     return dashboard.serve(args.port)
 
-def refused(e: Exception) -> int:
-    print(e, file=sys.stderr)
-    return 1
-
 
 def when(stamp: str | None) -> str:
     from . import util
@@ -931,128 +924,122 @@ def cmd_serve(args) -> int:
 
 
 def cmd_loop(args) -> int:
-    from . import control, loop_run, loops, scaffold, state, util
+    from . import control, loop_run, scaffold, state, util
 
-    try:
-        if args.action == "requeue":
-            try:
-                item_id = int(args.name)
-            except ValueError:
-                raise control.Refused("arete loop requeue needs a numeric queue ID") from None
-            state.requeue_item(item_id)
-            print(f"queue item {item_id} is pending again")
-            return 0
-        if args.action == "list":
-            print(serve_line(control.serve_beat()))
-            for v in control.loop_views():
-                print(loop_line(v))
-            return 0
-        if args.action == "new":
-            made = scaffold.draft(scaffold.DraftRequest(" ".join(args.words), args.name, args.repo, args.model),
-                                  run_id=args.run_id)
-            print(f"drafted {made['name']} in {paths.short_path(made['dir'])} (off, {util.paid_note(made['paid'])})\n")
-            print(made["loop_toml"])
-            if made["note"]:
-                print(f"note: {made['note']}")
-            print(f"next: `arete loop try {made['name']}`, then `arete loop enable {made['name']}`")
-            return 0
-        if args.action == "exec":
-            if not args.run_id:
-                print("arete loop exec needs --run-id; serve and `arete loop start` pass it", file=sys.stderr)
-                return 2
-            return 0 if loop_run.carry_opened(args.run_id) in ("done", "skipped") else 1
-        if not args.name:
-            print(f"arete loop {args.action} needs a NAME", file=sys.stderr)
+    if args.action == "requeue":
+        try:
+            item_id = int(args.name)
+        except ValueError:
+            raise control.Refused("arete loop requeue needs a numeric queue ID") from None
+        state.requeue_item(item_id)
+        print(f"queue item {item_id} is pending again")
+        return 0
+    if args.action == "list":
+        print(serve_line(control.serve_beat()))
+        for v in control.loop_views():
+            print(loop_line(v))
+        return 0
+    if args.action == "new":
+        made = scaffold.draft(scaffold.DraftRequest(" ".join(args.words), args.name, args.repo, args.model),
+                              run_id=args.run_id)
+        print(f"drafted {made['name']} in {paths.short_path(made['dir'])} (off, {util.paid_note(made['paid'])})\n")
+        print(made["loop_toml"])
+        if made["note"]:
+            print(f"note: {made['note']}")
+        print(f"next: `arete loop try {made['name']}`, then `arete loop enable {made['name']}`")
+        return 0
+    if args.action == "exec":
+        if not args.run_id:
+            print("arete loop exec needs --run-id; serve and `arete loop start` pass it", file=sys.stderr)
             return 2
-        if args.action == "try":
-            result = scaffold.try_loop(args.name, events_from_file(args.events), follow=follow)
-            print(f"\ntry {result['id']}: {result['status']}, every emit held"
-                  + (f", {util.count(result['events'], 'sample event')}" if result["events"] else ""))
-            return 0 if result["status"] in ("done", "skipped") else 1
-        if args.action in ("enable", "disable"):
-            done = control.switch(args.name, args.action == "enable")
-            print(f"{done['name']}: {'on' if done['enabled'] else 'off'}"
-                  + ("; serve is down, so it fires once serve runs again" if done["enabled"] and not done["serve_up"]
-                     else ""))
-            return 0
-        if args.action == "start":
-            r = loop_run.launch(args.name, events=events_from_file(args.events))
-            print(f"started {r['id']}")
-            if args.follow:
-                follow(r["id"])
-            return 0
-        if args.action == "stop":
-            target = args.name
-            if not state.run_get(target):
-                loop = control.find_loop(target)
-                running = [r for r in state.runs_marked_running() if r["kind"] == "loop" and r["loop"] == loop.name]
-                if not running:
-                    raise control.Refused(f"{target} has no run going")
-                target = running[0]["id"]
-            print(json.dumps(control.stop_run(target)))
-            return 0
-        if args.action == "status":
-            d = control.loop_detail(args.name)
-            print(loop_line(d))
-            print(f"  {d['description']}\n  dir {d['dir']}, origin {d['origin']}"
-                  + (f", repo {d['repo']}" if d["repo"] else ""))
-            if d["model"]:
-                budget = (f"budget {d['budget_usd'] or '-'} per run, {d['daily_budget_usd'] or '-'} per day"
-                          if d["metered"] else "no budget, it runs on a subscription")
-                print(f"  model {d['model']} {d['runner'] or ''} on {d['device']}, {budget}")
-            if d["held"]:
-                print(f"  {d['held']}")
-            if d["emits"]:
-                print(f"  emits {', '.join(d['emits'])}")
-            if d["webhook_path"]:
-                print(f"  webhook POST {d['webhook_path']}")
-            for c in d["cursors"]:
-                print(f"  source {c['source']}: {'ok' if c['ok'] else 'FAILING'} {c['detail'] or ''} at {when(c['polled'])}")
-            if d["waiting"]:
-                print(f"  waiting: {util.count(len(d['waiting']), 'firing')}")
-            for item in d["dead"]:
-                print(f"  dead item {item['id']}: run {item['run_id']}, {util.count(item['events'], 'event')}, "
-                      f"{item['dead_at']}: {item['dead_reason']}")
-            if d["state"]:
-                print(f"  memory: {json.dumps(d['state'])[:300]}")
-            for r in d["runs"][:8]:
-                print(f"  {r['id']:<34} {r['status']:<11} {r['trigger'] or '':<8} {util.paid_note(r['paid']):<12} "
-                      f"{util.first_line(r['summary'] or '', 90)}")
-            for f in d["findings"][:8]:
-                print(f"  finding {f['title'][:90]} {f['url'] or ''}")
-            return 0
-        if args.action == "feed":
-            run_id = latest_run(args.name)
-            r = state.run_get(run_id)
-            print(f"{run_id} {r['status']} {r.get('loop') or r['kind']}")
-            if args.follow:
-                follow(run_id)
-            else:
-                for line in state.feed(run_id):
-                    print_feed_line(line)
-            return 0
-    except (control.NotFound, control.Busy, control.Refused, loops.LoopError) as e:
-        return refused(e)
+        return 0 if loop_run.carry_opened(args.run_id) in ("done", "skipped") else 1
+    if not args.name:
+        print(f"arete loop {args.action} needs a NAME", file=sys.stderr)
+        return 2
+    if args.action == "try":
+        result = scaffold.try_loop(args.name, events_from_file(args.events), follow=follow)
+        print(f"\ntry {result['id']}: {result['status']}, every emit held"
+              + (f", {util.count(result['events'], 'sample event')}" if result["events"] else ""))
+        return 0 if result["status"] in ("done", "skipped") else 1
+    if args.action in ("enable", "disable"):
+        done = control.switch(args.name, args.action == "enable")
+        print(f"{done['name']}: {'on' if done['enabled'] else 'off'}"
+              + ("; serve is down, so it fires once serve runs again" if done["enabled"] and not done["serve_up"]
+                 else ""))
+        return 0
+    if args.action == "start":
+        r = loop_run.launch(args.name, events=events_from_file(args.events))
+        print(f"started {r['id']}")
+        if args.follow:
+            follow(r["id"])
+        return 0
+    if args.action == "stop":
+        target = args.name
+        if not state.run_get(target):
+            loop = control.find_loop(target)
+            running = [r for r in state.runs_marked_running() if r["kind"] == "loop" and r["loop"] == loop.name]
+            if not running:
+                raise control.Refused(f"{target} has no run going")
+            target = running[0]["id"]
+        print(json.dumps(control.stop_run(target)))
+        return 0
+    if args.action == "status":
+        d = control.loop_detail(args.name)
+        print(loop_line(d))
+        print(f"  {d['description']}\n  dir {d['dir']}, origin {d['origin']}"
+              + (f", repo {d['repo']}" if d["repo"] else ""))
+        if d["model"]:
+            budget = (f"budget {d['budget_usd'] or '-'} per run, {d['daily_budget_usd'] or '-'} per day"
+                      if d["metered"] else "no budget, it runs on a subscription")
+            print(f"  model {d['model']} {d['runner'] or ''} on {d['device']}, {budget}")
+        if d["held"]:
+            print(f"  {d['held']}")
+        if d["emits"]:
+            print(f"  emits {', '.join(d['emits'])}")
+        if d["webhook_path"]:
+            print(f"  webhook POST {d['webhook_path']}")
+        for c in d["cursors"]:
+            print(f"  source {c['source']}: {'ok' if c['ok'] else 'FAILING'} {c['detail'] or ''} at {when(c['polled'])}")
+        if d["waiting"]:
+            print(f"  waiting: {util.count(len(d['waiting']), 'firing')}")
+        for item in d["dead"]:
+            print(f"  dead item {item['id']}: run {item['run_id']}, {util.count(item['events'], 'event')}, "
+                  f"{item['dead_at']}: {item['dead_reason']}")
+        if d["state"]:
+            print(f"  memory: {json.dumps(d['state'])[:300]}")
+        for r in d["runs"][:8]:
+            print(f"  {r['id']:<34} {r['status']:<11} {r['trigger'] or '':<8} {util.paid_note(r['paid']):<12} "
+                  f"{util.first_line(r['summary'] or '', 90)}")
+        for f in d["findings"][:8]:
+            print(f"  finding {f['title'][:90]} {f['url'] or ''}")
+        return 0
+    if args.action == "feed":
+        run_id = latest_run(args.name)
+        r = state.run_get(run_id)
+        print(f"{run_id} {r['status']} {r.get('loop') or r['kind']}")
+        if args.follow:
+            follow(run_id)
+        else:
+            for line in state.feed(run_id):
+                print_feed_line(line)
+        return 0
     return 2
 
 
 def cmd_devices(args) -> int:
     from . import control, devices
 
-    try:
-        if args.probe:
-            info = devices.probe(args.probe)
-            print(json.dumps(info, indent=2))
-            return 0 if info["ok"] else 1
-        fleet = control.fleet()
-        print_table([(d["name"], d["kind"], d.get("host") or "", *probe_words(d.get("probe"))) for d in fleet], 220,
-                    indent="")
-        for d in fleet:
-            if d.get("error"):
-                print(f"  {d['error']}")
-        return 0
-    except devices.DeviceError as e:
-        return refused(e)
+    if args.probe:
+        info = devices.probe(args.probe)
+        print(json.dumps(info, indent=2))
+        return 0 if info["ok"] else 1
+    fleet = control.fleet()
+    print_table([(d["name"], d["kind"], d.get("host") or "", *probe_words(d.get("probe"))) for d in fleet], 220,
+                indent="")
+    for d in fleet:
+        if d.get("error"):
+            print(f"  {d['error']}")
+    return 0
 
 
 def probe_words(probe: dict | None) -> tuple[str, str]:
@@ -1074,62 +1061,59 @@ def cmd_session(args) -> int:
             print(f"--chat works with arete session {', '.join(CHAT_SESSION_ACTIONS)}", file=sys.stderr)
             return 2
         return chat_session(args)
-    try:
-        if args.action == "start":
-            tools = [t.strip() for t in args.tools.split(",") if t.strip()] if args.tools is not None else None
-            s = sessions.launch(" ".join(args.words), device=args.device, model=args.model, run_with=args.runner,
-                                tools=tools, repo=args.repo or "", budget_usd=args.budget, task=args.task,
-                                draft_pr=args.draft_pr)
-            print(f"session {s['id']}: {s['runner']} {s['model']} on {s['device']} in {paths.short_path(s['cwd'])}"
-                  + (f" on {s['branch']}" if s["branch"] else "") + f"; tools {', '.join(s['tools']) or 'none'}")
-            if s["task"] and not args.attach:
-                print(f"`arete session report {s['id']}` prints its report when it ends")
-                return 0
-            if not args.attach:
-                print(f"`arete session attach {s['id']}` follows it and sends what you type")
-                return 0
-            args.id = s["id"]
-        if args.action in ("start", "attach"):
-            r = state.run_get(args.id)
-            if not r or r["kind"] != "session":
-                raise control.NotFound(f"no session {args.id}")
-            stop = threading.Event()
-            print("following; type a line and press enter to send it, ctrl-c to detach", flush=True)
+    if args.action == "start":
+        tools = [t.strip() for t in args.tools.split(",") if t.strip()] if args.tools is not None else None
+        s = sessions.launch(" ".join(args.words), device=args.device, model=args.model, run_with=args.runner,
+                            tools=tools, repo=args.repo or "", budget_usd=args.budget, task=args.task,
+                            draft_pr=args.draft_pr)
+        print(f"session {s['id']}: {s['runner']} {s['model']} on {s['device']} in {paths.short_path(s['cwd'])}"
+              + (f" on {s['branch']}" if s["branch"] else "") + f"; tools {', '.join(s['tools']) or 'none'}")
+        if s["task"] and not args.attach:
+            print(f"`arete session report {s['id']}` prints its report when it ends")
+            return 0
+        if not args.attach:
+            print(f"`arete session attach {s['id']}` follows it and sends what you type")
+            return 0
+        args.id = s["id"]
+    if args.action in ("start", "attach"):
+        r = state.run_get(args.id)
+        if not r or r["kind"] != "session":
+            raise control.NotFound(f"no session {args.id}")
+        stop = threading.Event()
+        print("following; type a line and press enter to send it, ctrl-c to detach", flush=True)
 
-            def send_typed() -> None:
-                if stop.is_set() or not sys.stdin.isatty() and sys.stdin.closed:
-                    return
-                ready, _, _ = select.select([sys.stdin], [], [], 0)
-                if ready:
-                    line = sys.stdin.readline()
-                    if not line:
-                        stop.set()
-                    elif line.strip():
-                        sessions.send(args.id, line)
-            try:
-                follow(args.id, send=send_typed)
-            except KeyboardInterrupt:
-                print(f"\ndetached; the session keeps running. `arete session stop {args.id}` ends it")
-            return 0
-        if args.action == "report":
-            print(json.dumps(control.session_report(args.id)))
-            return 0
-        if args.action == "send":
-            print(json.dumps(sessions.send(args.id, " ".join(args.words))))
-            return 0
-        if args.action == "stop":
-            print(json.dumps(control.stop_run(args.id)))
-            return 0
-        if args.action == "exec":
-            return 0 if sessions.execute(args.id) in ("done", "stopped", "busy") else 1
-        for s in sessions.views():
-            print(f"{s['id']:<28} {s['status']:<11} {s['runner'] or '':<6} {s['model'] or '':<24} "
-                  f"{s['device'] or '':<10} {util.paid_note(s['paid']):<12}  {s['prompt'][:70]}")
-        if not state.runs(kind="session", limit=1):
-            print("no sessions yet; `arete session start \"what to do\"`")
+        def send_typed() -> None:
+            if stop.is_set() or not sys.stdin.isatty() and sys.stdin.closed:
+                return
+            ready, _, _ = select.select([sys.stdin], [], [], 0)
+            if ready:
+                line = sys.stdin.readline()
+                if not line:
+                    stop.set()
+                elif line.strip():
+                    sessions.send(args.id, line)
+        try:
+            follow(args.id, send=send_typed)
+        except KeyboardInterrupt:
+            print(f"\ndetached; the session keeps running. `arete session stop {args.id}` ends it")
         return 0
-    except (control.NotFound, control.Busy, control.Refused) as e:
-        return refused(e)
+    if args.action == "report":
+        print(json.dumps(control.session_report(args.id)))
+        return 0
+    if args.action == "send":
+        print(json.dumps(sessions.send(args.id, " ".join(args.words))))
+        return 0
+    if args.action == "stop":
+        print(json.dumps(control.stop_run(args.id)))
+        return 0
+    if args.action == "exec":
+        return 0 if sessions.execute(args.id) in ("done", "stopped", "busy") else 1
+    for s in sessions.views():
+        print(f"{s['id']:<28} {s['status']:<11} {s['runner'] or '':<6} {s['model'] or '':<24} "
+              f"{s['device'] or '':<10} {util.paid_note(s['paid']):<12}  {s['prompt'][:70]}")
+    if not state.runs(kind="session", limit=1):
+        print("no sessions yet; `arete session start \"what to do\"`")
+    return 0
 
 
 CHAT_SESSION_ACTIONS = ("start", "list", "report", "stop")
@@ -1145,7 +1129,7 @@ class ChatOnce(argparse.Action):
 def chat_session(args) -> int:
     from urllib.parse import quote
 
-    from . import chat, client, control
+    from . import chat, client
 
     base = f"/api/chats/{args.chat}/sessions"
     if args.action == "start":
@@ -1177,8 +1161,6 @@ def chat_session(args) -> int:
     except client.Failed as e:
         print(e, file=sys.stderr)
         return 1
-    except (control.NotFound, control.Busy, control.Refused, chat.NoChat) as e:
-        return refused(e)
     print(json.dumps(answer))
     return 0
 
@@ -1198,43 +1180,37 @@ def stop_on_sigterm(signum, frame) -> NoReturn:
 def cmd_approve(args) -> int:
     from . import control, delivery
 
-    try:
-        if args.id is None:
-            pending = delivery.waiting()
-            for a in pending:
-                print(textwrap.fill(f"#{a['id']:<4} {a['loop']:<20} {a['repo'] or 'none':<12} {when(a['created'])}  "
-                                    f"{a['plain_summary'] or a['what']}", shutil.get_terminal_size().columns,
-                                    subsequent_indent=" " * 6, break_on_hyphens=False, max_lines=4, placeholder=" …"))
-                for line in approval_notes(a):
-                    print(textwrap.fill(line, shutil.get_terminal_size().columns, initial_indent=" " * 6,
-                                        subsequent_indent=" " * 8, break_on_hyphens=False))
-            if not pending:
-                print("nothing waiting for approval")
-            return 0
-        before = signal.signal(signal.SIGTERM, stop_on_sigterm)
-        try:
-            print(json.dumps(control.decide(args.id, not args.reject)))
-        finally:
-            signal.signal(signal.SIGTERM, before)
+    if args.id is None:
+        pending = delivery.waiting()
+        for a in pending:
+            print(textwrap.fill(f"#{a['id']:<4} {a['loop']:<20} {a['repo'] or 'none':<12} {when(a['created'])}  "
+                                f"{a['plain_summary'] or a['what']}", shutil.get_terminal_size().columns,
+                                subsequent_indent=" " * 6, break_on_hyphens=False, max_lines=4, placeholder=" …"))
+            for line in approval_notes(a):
+                print(textwrap.fill(line, shutil.get_terminal_size().columns, initial_indent=" " * 6,
+                                    subsequent_indent=" " * 8, break_on_hyphens=False))
+        if not pending:
+            print("nothing waiting for approval")
         return 0
-    except (control.NotFound, control.Refused) as e:
-        return refused(e)
+    before = signal.signal(signal.SIGTERM, stop_on_sigterm)
+    try:
+        print(json.dumps(control.decide(args.id, not args.reject)))
+    finally:
+        signal.signal(signal.SIGTERM, before)
+    return 0
 
 
 def cmd_webhook(args) -> int:
-    from . import control, dashboard, webhooks
+    from . import control, tailnet, webhooks
 
-    try:
-        loop = control.working_loop(args.name)
-    except (control.NotFound, control.Refused) as e:
-        return refused(e)
+    loop = control.working_loop(args.name)
     if not loop.trigger.webhook:
         print(f"{loop.name} has no webhook; set `webhook = true` under [trigger] in {paths.short_path(loop.file)}",
               file=sys.stderr)
         return 1
     key = webhooks.secret(loop.name)
-    node = dashboard.this_node(config.load().dashboard_owner)
-    print(f"POST {dashboard.url(node, config.load().dashboard_port)}{webhooks.hook_path(loop.name)}")
+    node = tailnet.this_node(config.load().dashboard_owner)
+    print(f"POST {tailnet.url(node, config.load().dashboard_port)}{webhooks.hook_path(loop.name)}")
     print(f"X-Arete-Token: {key}")
     print("GitHub: use the same value as the webhook secret; arete checks X-Hub-Signature-256")
     return 0
@@ -1289,7 +1265,8 @@ def cmd_hold(args) -> int:
         print(f"held {args.subscription} until {runner.local_time(until)}; its steps take the next route in their tier")
         return 0
     except (ValueError, OSError) as e:
-        return refused(e)
+        print(e, file=sys.stderr)
+        return 1
 
 
 def cmd_costs(args) -> int:
@@ -1323,14 +1300,12 @@ def cmd_costs(args) -> int:
             print(f"backfilled {count} steps")
             return 0
     except (ValueError, OSError) as e:
-        return refused(e)
+        print(e, file=sys.stderr)
+        return 1
 
     if args.by or args.json:
         return print_step_costs(args.by or ["step"], args.days, args.json)
-    try:
-        c = control.costs(args.days)
-    except control.Refused as e:
-        return refused(e)
+    c = control.costs(args.days)
     print(f"{util.paid_note(c['total_usd']).capitalize()} in the last {c['days']:g} days; subscription calls count nothing")
     for group in ("model", "runner", "loop"):
         print(f"by {group}:")
@@ -1353,8 +1328,9 @@ def cmd_ab(args) -> int:
 
     try:
         report = control.ab_report(args.name or "", args.days)
-    except (control.Refused, ValueError, TypeError) as e:
-        return refused(e)
+    except (ValueError, TypeError) as e:
+        print(e, file=sys.stderr)
+        return 1
     if args.json:
         for test in report:
             print(json.dumps(test))
@@ -1385,10 +1361,7 @@ def cmd_ab(args) -> int:
 def print_step_costs(groupings: list[str], days: float | None, as_json: bool) -> int:
     from . import control
 
-    try:
-        found = [(by, control.step_costs(by, days)) for by in groupings]
-    except control.Refused as e:
-        return refused(e)
+    found = [(by, control.step_costs(by, days)) for by in groupings]
     c = found[-1][1]
     waits = {"wait_minutes": c["wait_minutes"], "days": c["days"], "since": c["since"], "paid_usd": c["paid_usd"],
              "subscription_usd": c["subscription_usd"]}
@@ -1822,21 +1795,27 @@ def steering(p: Parser) -> Parser:
     return p
 
 
+def cmd_mergecheck(args) -> int:
+    from . import mergecheck
+
+    return mergecheck.command(args)
+
+
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(prog="arete", description="arete: agents that keep running and keep getting better", formatter_class=argparse.RawDescriptionHelpFormatter)
+    from . import refusals
+
+    ap =argparse.ArgumentParser(prog="arete", description="arete: agents that keep running and keep getting better", formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--version", action=ShowVersion)
     sub = ap.add_subparsers(dest="cmd", required=True, parser_class=Parser)
 
-    from . import mergecheck
-
     p = sub.add_parser("merged", help="print newly merged pipeline PRs as JSON events")
     p.add_argument("--since-cursor", action="store_true", help="omit PRs already seen by this command source")
-    p.set_defaults(fn=mergecheck.command)
+    p.set_defaults(fn=cmd_mergecheck)
 
     p = sub.add_parser("merge-check", help="use the merged origin base for landed pipeline PRs")
     p.add_argument("repo", nargs="?", default="", help="configured repository; otherwise read events on stdin")
     p.add_argument("--dry-run", action="store_true", help="preview saved checks without starting anything")
-    p.set_defaults(fn=mergecheck.command)
+    p.set_defaults(fn=cmd_mergecheck)
 
     p = sub.add_parser("init", help="write the default global config")
     p.add_argument("--force", action="store_true")
@@ -2290,7 +2269,7 @@ def main(argv: list[str] | None = None) -> int:
         codebase.load()
     try:
         return args.fn(args) or 0
-    except config.UnknownRepo as e:
+    except refusals.Refusal as e:
         print(e, file=sys.stderr)
         return 1
 

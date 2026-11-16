@@ -218,7 +218,7 @@ def run_answer(handler, method, path, query):
 
 
 def server(port=0, live=False, runs=False):
-    from arete import dashboard, state
+    from arete import dashboard, state, tailnet
 
     state.migrate()
 
@@ -320,9 +320,9 @@ def server(port=0, live=False, runs=False):
                 status, data = self.fixture_response
             super().send_json(status, data)
 
-    node = dashboard.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "fixture@example.com", "")
+    node = tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "fixture@example.com", "")
     owner = type("Owner", (), {"of": lambda self, address: node.owner})()
-    instance = dashboard.Server("127.0.0.1", port, node, owner, False, handler=Handler)
+    instance = tailnet.Server("127.0.0.1", port, node, owner, False, handler=Handler, redirect=dashboard.Redirect)
     instance.requests, instance.next_response, instance.sequence = [], None, 0
     instance.fixture_lock = threading.Lock()
     instance.reads = []

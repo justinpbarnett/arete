@@ -5,7 +5,22 @@ import math
 import tempfile
 import threading
 
-from . import board, config, control, gh, paths, pipeline, record, routing, runner, sessions, settings, state, util
+from . import (
+    board,
+    config,
+    control,
+    gh,
+    paths,
+    pipeline,
+    record,
+    refusals,
+    routing,
+    runner,
+    sessions,
+    settings,
+    state,
+    util,
+)
 from .agent import Result
 
 CONTEXT_FILE = paths.RUNS_DIR / "chat" / "context" / "dashboard.json"
@@ -40,19 +55,19 @@ starting = threading.Lock()
 replying: dict[int, float] = {}
 
 
-class Busy(RuntimeError):
+class Busy(refusals.Conflict, RuntimeError):
     pass
 
 
-class NoDraft(RuntimeError):
+class NoDraft(refusals.Conflict, RuntimeError):
     pass
 
 
-class NoChat(LookupError):
+class NoChat(refusals.NotFound, LookupError):
     pass
 
 
-class BadProject(ValueError):
+class BadProject(refusals.Invalid, ValueError):
     pass
 
 

@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from . import outbound, paths
+from . import outbound, paths, refusals
 
 MODEL_ROLES = ("plan", "build", "verify", "review", "learn", "uat", "miner", "apply", "eval_mine", "triage", "chat",
                "classify", "loop", "session", "research", "research_plan", "research_search",
@@ -55,7 +55,7 @@ ENV_NAME = r"\*|[A-Za-z_][A-Za-z0-9_]*\*?"
 ENV_KEYS = ("pass", "providers")
 
 
-class UnknownRepo(KeyError):
+class UnknownRepo(refusals.Refusal, KeyError):
     def __str__(self) -> str:
         return self.args[0]
 

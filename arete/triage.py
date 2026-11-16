@@ -11,9 +11,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import ClassVar
 
-from . import alerts, config, gh, jev, jira, paths, runner, state, tracker, util
+from . import alerts, config, gh, jev, jira, paths, refusals, runner, state, tracker, util
 from .heartbeat import mark_loop, network_up_or_skip
 from .pipeline import TRIAGE_ANSWERS, prompt
+from .refusals import TrackerFailed
 
 ISSUE_TITLE = "[arete] triage"
 ISSUE_LABEL = "arete-triage"
@@ -581,19 +582,15 @@ def to_pipeline(src: TriageSource, r: dict, sent_by: str) -> None:
     state.triage_drop(r["ref"])
 
 
-class NotOnBoard(LookupError):
+class NotOnBoard(refusals.NotFound, LookupError):
     pass
 
 
-class NotSendable(RuntimeError):
+class NotSendable(refusals.Conflict, RuntimeError):
     pass
 
 
-class BadAnswers(ValueError):
-    pass
-
-
-class TrackerFailed(RuntimeError):
+class BadAnswers(refusals.Invalid, ValueError):
     pass
 
 

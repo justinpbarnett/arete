@@ -1,24 +1,14 @@
 from __future__ import annotations
 
-import atexit
-import glob
 import hashlib
 import json
-import math
-import os
 import re
-import shutil
-import socket
-import ssl
-import stat
-import subprocess
 import sys
-import tempfile
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import NoReturn
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -34,17 +24,18 @@ from . import (
     gh,
     jira,
     loop_run,
-    loops,
     oncall,
     paths,
     pipeline,
     record,
+    refusals,
     research,
     run_lines,
     scaffold,
     sessions,
     settings,
     state,
+    tailnet,
     tasks,
     triage,
     util,
@@ -52,6 +43,7 @@ from . import (
     webhooks,
     webpush,
 )
+from .refusals import Stated as Refusal
 
 WEB_DIR = paths.PACKAGE_DIR / "web"
 WEB_TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8",
@@ -59,35 +51,10 @@ WEB_TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf
              ".png": "image/png"}
 CODE_MARK = b'<meta name="arete-code" content="">'
 THEME_MARK = b'<meta name="theme-color" content="">'
-CERT_SECONDS = 120
-RENEW_SECONDS = 7 * 24 * 3600
-CERT_RETRY_SECONDS = 3600
-HANDSHAKE_SECONDS = 10
-TAILSCALE_APPS = ("/Applications/Tailscale.app/Contents/MacOS/Tailscale",
-                  "/Applications/*/Tailscale.app/Contents/MacOS/Tailscale")
-TAILSCALE_AS_CLI = {"TAILSCALE_BE_CLI": "1"}
-RETRY_SECONDS = 10
-WATCH_SECONDS = 30
-WHOIS_SECONDS = 60
-PROXY_SECONDS = 20
 MAX_BODY = 64 * 1024
-TLS_HANDSHAKE = b"\x16\x03"
-LOG_PATH = "/api/log/"
-LOOP_PATH = "/api/loops/"
-INCIDENT_PATH = "/api/incidents/"
 STEERING = ("dismiss", "retry", "cancel")
-FEED_PATH = "/api/feed/"
-RUN_PATH = "/api/runs/"
-APPROVAL_PATH = "/api/approvals/"
 ASK_PATH = "/api/asks/"
 PUSH_PATH = "/api/push"
-SESSION_PATH = "/api/sessions/"
-DEVICE_PATH = "/api/devices/"
-TRIAGE_PATH = "/api/triage/"
-SKIPPED_PATH = "/api/skipped/"
-PROPOSAL_PATH = "/api/proposals/"
-CHAT_PATH = "/api/chats/"
-TASK_PATH = "/api/tasks/"
 EVENTS_PATH = re.compile(r"/api/runs/([^/]+)/events")
 EVENTS_TYPE = "application/x-ndjson"
 EVIDENCE_PATH = "/api/capture/evidence"
@@ -143,110 +110,6 @@ def web_snapshot() -> tuple[str, dict[str, tuple[bytes, str]]]:
 WEB_CODE, WEB_BY_PATH = web_snapshot()
 
 
-def tailscale_exe() -> str:
-    return shutil.which("tailscale") or next((m for pattern in TAILSCALE_APPS for m in sorted(glob.glob(pattern))), "")
-
-
-def tailscale_run(*args: str, timeout: float) -> subprocess.CompletedProcess | None:
-    exe = tailscale_exe()
-    if not exe:
-        return None
-    try:
-        return subprocess.run([exe, *args], capture_output=True, text=True, errors="replace", timeout=timeout,
-                              check=False, env={**os.environ, **TAILSCALE_AS_CLI})
-    except subprocess.TimeoutExpired:
-        return None
-
-
-def tailscale(*args: str) -> dict:
-    proc = tailscale_run(*args, timeout=10)
-    try:
-        return json.loads(proc.stdout) if proc and proc.returncode == 0 else {}
-    except json.JSONDecodeError:
-        return {}
-
-
-@dataclass(frozen=True)
-class Node:
-    addresses: tuple[str, ...]
-    names: frozenset[str]
-    owner: str
-    name: str
-
-
-class CertError(Exception):
-    pass
-
-
-def serve_entries(status: dict) -> dict[int, dict[str, str]]:
-    found: dict[int, dict[str, str]] = {}
-    for scope in (status, *((status.get("Foreground") or {}).values())):
-        if not isinstance(scope, dict):
-            continue
-        for hostport, web in (scope.get("Web") or {}).items():
-            try:
-                port = int(str(hostport).rsplit(":", 1)[1])
-            except (IndexError, ValueError):
-                continue
-            found.setdefault(port, {})
-            for mount, handler in ((web or {}).get("Handlers") or {}).items():
-                target = (handler or {}).get("Proxy") if isinstance(handler, dict) else None
-                found.setdefault(port, {})[f"{hostport}{mount}"] = str(target or handler)
-        for key, tcp in (scope.get("TCP") or {}).items():
-            if str(key).isdecimal():
-                found.setdefault(int(key), {})["tcp"] = str(tcp)
-    return found
-
-
-class Tailscale:
-    def node(self, owner: str) -> Node | None:
-        status = tailscale("status", "--json")
-        me = status.get("Self") or {}
-        addresses = tuple(me.get("TailscaleIPs") or ())
-        dns_name = (me.get("DNSName") or "").rstrip(".").lower()
-        owner = owner or ((status.get("User") or {}).get(str(me.get("UserID"))) or {}).get("LoginName", "")
-        if status.get("BackendState") != "Running" or not addresses or not owner:
-            return None
-        return Node(addresses, frozenset({*addresses, dns_name, dns_name.split(".")[0]} - {""}), owner, dns_name)
-
-    def whois(self, address: str) -> str:
-        return (tailscale("whois", "--json", address).get("UserProfile") or {}).get("LoginName", "")
-
-    def certificate(self, name: str) -> str:
-        proc = tailscale_run("cert", "--cert-file", "-", "--key-file", "-", name, timeout=CERT_SECONDS)
-        if proc is None:
-            raise CertError("tailscale is missing or did not finish in time")
-        if proc.returncode != 0:
-            raise CertError(util.first_line(proc.stderr or "", 200) or f"tailscale cert exited {proc.returncode}")
-        return proc.stdout
-
-    def served(self) -> dict[int, dict[str, str]] | None:
-        proc = tailscale_run("serve", "status", "--json", timeout=PROXY_SECONDS)
-        if proc is None or proc.returncode != 0:
-            return None
-        try:
-            status = json.loads(proc.stdout)
-        except json.JSONDecodeError:
-            return None
-        return serve_entries(status) if isinstance(status, dict) else None
-
-
-class ScratchHost(Tailscale):
-    def certificate(self, name: str) -> str:
-        raise CertError("scratch state asks for no certificate")
-
-    def served(self) -> dict[int, dict[str, str]] | None:
-        return None
-
-
-def host_services() -> Tailscale:
-    return ScratchHost() if paths.ISOLATED else Tailscale()
-
-
-def this_node(owner: str, host: Tailscale | None = None) -> Node | None:
-    return (host or host_services()).node(owner)
-
-
 @dataclass
 class Gauge:
     count: int = 0
@@ -276,95 +139,10 @@ class Gauge:
 POSTS_IN_FLIGHT = Gauge()
 
 
-@dataclass
-class Logins:
-    host: Tailscale
-    seen: dict[str, tuple[float, str]] = field(default_factory=dict)
-    guard: threading.Lock = field(default_factory=threading.Lock)
-
-    def of(self, address: str) -> str:
-        with self.guard:
-            seen = self.seen.get(address)
-        if seen and time.monotonic() - seen[0] < WHOIS_SECONDS:
-            return seen[1]
-        login = self.host.whois(address)
-        if login:
-            with self.guard:
-                self.seen[address] = (time.monotonic(), login)
-        return login
-
-
-PEM_BLOCK = re.compile(r"-----BEGIN ([A-Z ]+)-----.*?-----END \1-----\n?", re.DOTALL)
-
-
-def pem_parts(text: str) -> tuple[bytes, bytes]:
-    blocks = [(m[1], m[0]) for m in PEM_BLOCK.finditer(text)]
-    key = "".join(b for label, b in blocks if "PRIVATE KEY" in label)
-    chain = "".join(b for label, b in blocks if "CERTIFICATE" in label)
-    return chain.encode(), key.encode()
-
-
-def store_private(path: Path, content: bytes) -> bool:
-    try:
-        current = path.read_bytes()
-    except OSError:
-        current = None
-    if current == content:
-        if stat.S_IMODE(path.stat().st_mode) & 0o077:
-            path.chmod(0o600)
-        return False
-    fd, temp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(content)
-        os.replace(temp, path)
-    except BaseException:
-        try:
-            os.unlink(temp)
-        except OSError:
-            pass
-        raise
-    return True
-
-
-def fetch_certificate(host: Tailscale, name: str) -> bool:
-    if not name:
-        raise CertError("this machine has no tailnet name")
-    chain, key = pem_parts(host.certificate(name))
-    if not chain or not key:
-        raise CertError("tailscale cert did not give a certificate and a key")
-    try:
-        paths.STATE_DIR.mkdir(parents=True, exist_ok=True)
-        changed = store_private(paths.TLS_KEY_FILE, key)
-        return store_private(paths.TLS_CERT_FILE, chain) or changed
-    except OSError as e:
-        raise CertError(f"cannot store the certificate: {e.strerror or e}") from None
-
-
-def tls_context() -> ssl.SSLContext:
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    context.minimum_version = ssl.TLSVersion.TLSv1_2
-    context.load_cert_chain(paths.TLS_CERT_FILE, paths.TLS_KEY_FILE)
-    return context
-
-
-def host_name(host: str) -> str:
-    host = host.strip().lower()
-    if host.startswith("["):
-        return host[1:host.find("]")]
-    return host.rsplit(":", 1)[0] if host.count(":") == 1 else host
-
-
 def whole_number(text: str) -> int:
     if not str(text).strip().isdecimal():
         raise Refusal(400, f"'{text}' is not a whole number.")
     return int(text)
-
-
-class Refusal(Exception):
-    def __init__(self, status: int, text: str):
-        super().__init__(text)
-        self.status = status
 
 
 RESTART_RETRY_SECONDS = 3
@@ -375,17 +153,14 @@ class Restarting(Refusal):
     pass
 
 
-STATUS_OF_REFUSAL = {capture.TooLarge: 413, capture.Refused: 400, capture.NotStaged: 404, capture.Conflict: 409,board.NotARunId: 400, board.UnknownFilter: 400, settings.Refused: 400, chat.Busy: 409,
-                     chat.NoDraft: 409, chat.NoChat: 404, chat.BadProject: 400, gh.GhError: 502, jira.JiraError: 502,
-                     control.NotFound: 404, control.Busy: 409, control.Refused: 400, loops.LoopError: 400,
-                     devices.DeviceError: 400, triage.NotOnBoard: 404, triage.NotSendable: 409, triage.BadAnswers: 400,
-                     triage.TrackerFailed: 502, pipeline.NoFreeSlot: 409, tasks.TrackerFailed: 502,
-                     webpush.Refused: 400}
+class NoRoute(Exception):
+    pass
 
 
 def refusal_status(e: Exception) -> int | None:
-    return e.status if isinstance(e, Refusal | webhooks.HookRefused) else next(
-        (status for kind, status in STATUS_OF_REFUSAL.items() if isinstance(e, kind)), None)
+    if isinstance(e, refusals.Refusal) and e.status is not None:
+        return e.status
+    return 502 if isinstance(e, (gh.GhError, jira.JiraError)) else None
 
 
 def refusal_answer(e: Exception) -> dict:
@@ -403,9 +178,11 @@ def as_sentence(text: str) -> str:
     return text if text.endswith((".", "?", "!")) else f"{text}."
 
 
-def last_part(path: str, prefix: str) -> tuple[str, str]:
-    name, _, action = unquote(path[len(prefix):]).rpartition("/")
-    return name, action
+def route_rest(template: str, path: str) -> str | None:
+    if not template.endswith("/*"):
+        return "" if path == template else None
+    prefix = template[:-1]
+    return path[len(prefix):] if path.startswith(prefix) else None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -461,8 +238,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(500, {"error": as_sentence(util.first_line(said, 300))})
 
     def admit(self, method: str, path: str) -> None:
-        node: Node = self.server.node
-        if host_name(self.headers.get("Host", "")) not in node.names:
+        node: tailnet.Node = self.server.node
+        if tailnet.host_name(self.headers.get("Host", "")) not in node.names:
             raise Refusal(421, "This server answers only to its tailnet name or address.")
         if path.startswith(webhooks.HOOK_PATH):
             if method != "POST":
@@ -474,179 +251,13 @@ class Handler(BaseHTTPRequestHandler):
             raise Refusal(403, "A change needs the X-Arete header, which the dashboard page sends.")
 
     def api(self, method: str, path: str, query: dict):
-        if method == "GET":
-            if path == "/api/meta":
-                with state.reader() as conn:
-                    meta = dict(conn.execute("SELECT key, value FROM schema_meta"))
-                return {"instance": {key: meta[f"instance_{key}"] for key in ("id", "tag", "name", "created")},
-                        "schema": {"version": int(meta["schema_version"]),
-                                   "oldest_writer": int(meta["oldest_writer"])}}
-            if path == PUSH_PATH:
-                return webpush.view()
-            if path == "/api/sidebar":
-                return board.sidebar(chat.pulse())
-            if path == "/api/live":
-                return board.live_board(chat.pulse()["draft"])
-            if path == "/api/runs":
-                return board.runs_board(query, limit=whole_number(query.get("limit", str(board.RECENT_RUNS))))
-            if path.startswith(RUN_PATH):
-                return board.run_board(unquote(path[len(RUN_PATH):]))
-            if path.startswith(TASK_PATH):
-                return tasks.view(unquote(path[len(TASK_PATH):]), query.get("repo", ""))
-            if path == "/api/asks":
-                return tasks.asks_view()
-            if path == "/api/health":
-                return board.health_board()
-            if path == "/api/triage":
-                return board.panel(board.triage_board)
-            if path == "/api/outcomes":
-                return board.panel(board.outcomes)
-            if path == "/api/find":
-                return board.find()
-            if path == "/api/usage":
-                return board.usage_board(whole_number(query.get("days", str(board.USAGE_DAYS))))
-            if path == "/api/settings":
-                return settings.current()
-            if path == "/api/capture":
-                return capture.view(connect=state.reader)
-            if path == "/api/chats":
-                return chat.listing()
-            if path.startswith(CHAT_PATH) and "/sessions" in path:
-                parts = unquote(path[len(CHAT_PATH):]).split("/")
-                if len(parts) == 2 and parts[1] == "sessions":
-                    return chat.sessions_of(whole_number(parts[0]))
-                if len(parts) == 4 and parts[1] == "sessions" and parts[3] == "report":
-                    return chat.session_report(whole_number(parts[0]), parts[2])
-            if path.startswith(CHAT_PATH):
-                return chat.view(whole_number(unquote(path[len(CHAT_PATH):])))
-            if path.startswith(LOG_PATH):
-                run_id = unquote(path[len(LOG_PATH):])
-                return {"id": run_id, "lines": board.run_log(run_id)}
-            if path == "/api/loops":
-                return {"loops": control.loop_views(connect=state.reader), "serve": control.serve_beat(),
-                        "draft": draft_choices()}
-            if path.startswith(LOOP_PATH):
-                return control.loop_detail(unquote(path[len(LOOP_PATH):]), connect=state.reader)
-            if path == "/api/incidents":
-                return board.incidents_board()
-            if path.startswith(INCIDENT_PATH):
-                return board.incident_board(unquote(path[len(INCIDENT_PATH):]))
-            if path.startswith(FEED_PATH):
-                return control.feed(unquote(path[len(FEED_PATH):]), whole_number(query.get("after", "0")))
-            if path == "/api/sessions":
-                return {"sessions": sessions.views(connect=state.reader), "choices": sessions.choices()}
-        if method == "POST":
-            if path == "/api/usage":
-                state.add_usage(self.usage_row(), board.KEEP_USAGE_DAYS)
-                return {}
-            if path == "/api/capture":
-                return capture.save(self.body())
-            if path == "/api/capture/context":
-                return capture.add_context(self.body(), WEB_CODE)
-            if path == "/api/capture/submit":
-                return capture.submit(self.body())
-            if path == "/api/capture/context/drop":
-                return capture.drop_context()
-            if path == "/api/capture/discard":
-                return capture.discard()
-            if drop := EVIDENCE_DROP.fullmatch(path):
-                return capture.drop_evidence(int(drop[1]))
-            if path == "/api/settings":
-                return settings.save(self.body())
-            if path == "/api/chats/new":
-                return chat.new(str(self.body().get("project") or ""))
-            if path.startswith(CHAT_PATH) and "/sessions" in path:
-                parts = unquote(path[len(CHAT_PATH):]).split("/")
-                if len(parts) == 2 and parts[1] == "sessions":
-                    return self.start_chat_session(whole_number(parts[0]))
-                if len(parts) == 4 and parts[1] == "sessions" and parts[3] == "stop":
-                    return chat.stop_session(whole_number(parts[0]), parts[2])
-            if path.startswith(CHAT_PATH):
-                chat_id, action = last_part(path, CHAT_PATH)
-                if action == "send":
-                    return chat.send(whole_number(chat_id), self.chat_text())
-                if action == "file":
-                    return chat.file_draft(whole_number(chat_id))
-                if action == "drop":
-                    return chat.drop_draft(whole_number(chat_id))
-            if path == "/api/incidents/switch":
-                on = self.body().get("on")
-                if type(on) is not bool:
-                    raise control.Refused('switch takes {"on": true} or {"on": false}')
-                return oncall.switch(on)
-            if path.startswith(INCIDENT_PATH):
-                incident_id, action = last_part(path, INCIDENT_PATH)
-                if action in STEERING:
-                    return getattr(oncall, action)(board.incident_number(incident_id))
-            if path == "/api/loops/new":
-                return self.draft_loop()
-            if path.startswith(LOOP_PATH):
-                return self.loop_action(*last_part(path, LOOP_PATH))
-            if path.startswith(RUN_PATH):
-                run_id, _, action = unquote(path[len(RUN_PATH):]).partition("/")
-                if action == "stop":
-                    return control.stop_run(run_id)
-                if action == "answer":
-                    return tasks.reply(run_id, str(self.body().get("text") or ""))
-                if action == "resume":
-                    return tasks.resume(run_id, str(self.body().get("step") or ""))
-                if action == "repair":
-                    return tasks.repair(run_id)
-                if action.startswith("steps/"):
-                    return tasks.run_step(run_id, action[len("steps/"):], self.body().get("set") or {})
-            if path == f"{PUSH_PATH}/subscribe":
-                return webpush.subscribe(self.body(), self.server.node.owner)
-            if path == f"{PUSH_PATH}/remove":
-                return webpush.remove(str(self.body().get("id") or ""))
-            if path == f"{PUSH_PATH}/test":
-                return webpush.test(config.load_or_problem()[0])
-            if path.startswith(ASK_PATH):
-                ask_id, _, action = unquote(path[len(ASK_PATH):]).partition("/")
-                if action == "answer":
-                    return tasks.answer_ask(ask_id, self.body())
-            if path.startswith(APPROVAL_PATH):
-                return control.decide(whole_number(unquote(path[len(APPROVAL_PATH):])),
-                                      self.body().get("approve") is True)
-            if path == "/api/tasks":
-                b = self.body()
-                return tasks.start(*(str(b.get(k) or "") for k in ("repo", "prompt", "title", "kind", "ticket")),
-                                   force=b.get("force") is not False)
-            if path == "/api/sessions":
-                return self.launch_session()
-            if path.startswith(SESSION_PATH):
-                session_id, action = last_part(path, SESSION_PATH)
-                if action == "send":
-                    return sessions.send(session_id, str(self.body().get("text", "")))
-                if action == "stop":
-                    return control.stop_run(session_id)
-            if path.startswith(DEVICE_PATH):
-                name, action = last_part(path, DEVICE_PATH)
-                if action == "probe":
-                    return devices.probe(name)
-            if path == "/api/triage/refresh":
-                return {"run": loop_run.launch("triage")["id"]}
-            if path.startswith(TRIAGE_PATH):
-                ref, action = last_part(path, TRIAGE_PATH)
-                if action == "send":
-                    return self.send_ticket(ref)
-                if action == "research":
-                    return research_ticket(ref, self.body().get("force") is True)
-            if path == "/api/checks/run":
-                return {"run": loop_run.launch("heartbeat")["id"]}
-            if path.startswith(SKIPPED_PATH):
-                name, action = last_part(path, SKIPPED_PATH)
-                if action == "run":
-                    return pipeline.run_skipped(name)
-            if path.startswith(PROPOSAL_PATH):
-                proposal_id, action = last_part(path, PROPOSAL_PATH)
-                if action == "done":
-                    return forget_proposal(whole_number(proposal_id))
-                if action == "approve":
-                    return approve_rule(whole_number(proposal_id))
-                if action == "reject":
-                    return reject_rule(whole_number(proposal_id))
-            if path == "/api/serve/install":
-                return install_serve(self.server.inside_serve)
+        for verb, template, route in ROUTES:
+            rest = route_rest(template, path) if verb == method else None
+            if rest is not None:
+                try:
+                    return route(self, rest, query)
+                except NoRoute:
+                    break
         raise Refusal(404, f"Nothing at {method} {path}.")
 
     def loop_action(self, name: str, action: str):
@@ -837,13 +448,13 @@ class Handler(BaseHTTPRequestHandler):
         super().log_request(code, size)
 
     def log_message(self, format: str, *args) -> None:
-        if not getattr(self, "raw_requestline", b"").startswith(TLS_HANDSHAKE):
+        if not getattr(self, "raw_requestline", b"").startswith(tailnet.TLS_HANDSHAKE):
             super().log_message(format, *args)
 
 
 class Redirect(Handler):
     def answer(self, method: str) -> None:
-        node: Node = self.server.node
+        node: tailnet.Node = self.server.node
         length = (self.headers.get("Content-Length") or "0").strip()
         if length.isdigit():
             self.rfile.read(min(int(length), webhooks.MAX_HOOK_BODY))
@@ -852,38 +463,6 @@ class Redirect(Handler):
         self.send_header("Location", f"https://{node.name}:{self.server.server_port}{path}")
         self.send_header("Content-Length", "0")
         self.end_headers()
-
-
-class Server(ThreadingHTTPServer):
-    daemon_threads = True
-
-    def __init__(self, address: str, port: int, node: Node, logins: Logins, inside_serve: bool,
-                 tls: ssl.SSLContext | None = None, handler: type[Handler] = Handler):
-        self.address_family = socket.AF_INET6 if ":" in address else socket.AF_INET
-        self.node, self.logins, self.inside_serve, self.tls = node, logins, inside_serve, tls
-        super().__init__((address, port), handler)
-
-    def finish_request(self, request, client_address) -> None:
-        if self.tls is None:
-            return super().finish_request(request, client_address)
-        request.settimeout(HANDSHAKE_SECONDS)
-        try:
-            first = request.recv(1, socket.MSG_PEEK)
-            if first != b"\x16":
-                request.settimeout(None)
-                return Redirect(request, client_address, self)
-            secure = self.tls.wrap_socket(request, server_side=True)
-        except OSError:
-            return
-        try:
-            secure.settimeout(None)
-            self.RequestHandlerClass(secure, client_address, self)
-        finally:
-            try:
-                secure.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            secure.close()
 
 
 def event_line(line: dict) -> bytes:
@@ -964,116 +543,357 @@ def start_poll_without_failing_the_send() -> str:
     return "Started a poll to build it."
 
 
-@dataclass(frozen=True)
-class Front:
-    scheme: str
-    servers: list[Server]
-    tls: ssl.SSLContext | None = None
-    why: str = ""
-    mapping: str = ""
+def chat_session_parts(rest: str) -> list[str] | None:
+    return unquote(rest).split("/") if "/sessions" in f"/{rest}" else None
 
 
-def say(text: str) -> None:
-    print(f"{util.iso()} {text}", flush=True)
+def get_meta(handler, rest, query):
+    with state.reader() as conn:
+        meta = dict(conn.execute("SELECT key, value FROM schema_meta"))
+    return {"instance": {key: meta[f"instance_{key}"] for key in ("id", "tag", "name", "created")},
+            "schema": {"version": int(meta["schema_version"]),
+                       "oldest_writer": int(meta["oldest_writer"])}}
 
 
-def close_all(servers: list[Server]) -> None:
-    for s in servers:
-        s.server_close()
+def get_push(handler, rest, query):
+    return webpush.view()
 
 
-def stop_listener(server: Server | None) -> None:
-    if server is not None:
-        server.shutdown()
-        server.server_close()
+def get_sidebar(handler, rest, query):
+    return board.sidebar(chat.pulse())
 
 
-def open_servers(addresses: tuple[str, ...], port: int, node: Node, logins: Logins,
-                 inside_serve: bool) -> list[Server]:
-    servers: list[Server] = []
-    try:
-        for address in addresses:
-            servers.append(Server(address, port, node, logins, inside_serve))
-    except OSError:
-        close_all(servers)
-        raise
-    return servers
+def get_live(handler, rest, query):
+    return board.live_board(chat.pulse()["draft"])
 
 
-def serve_status(host: Tailscale) -> dict[int, dict[str, str]] | None:
-    try:
-        status = host.served()
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return None if status is None else {int(p): dict(e) for p, e in status.items()}
+def get_runs(handler, rest, query):
+    return board.runs_board(query, limit=whole_number(query.get("limit", str(board.RECENT_RUNS))))
 
 
-def open_front(host: Tailscale, node: Node, port: int, logins: Logins, inside_serve: bool,
-               secure: bool = False) -> Front:
-    status = serve_status(host)
-    mapping = (f"tailscale serve has a mapping on port {port}, which takes this port's tailnet traffic; "
-               f"turn it off (for an HTTPS mapping, `tailscale serve --https={port} off`)") \
-        if status is not None and port in status else ""
-    opened = open_servers(node.addresses, port, node, logins, inside_serve)
-    try:
-        tls, reason = None, ""
-        if secure:
-            try:
-                fetch_certificate(host, node.name)
-                tls = tls_context()
-            except (CertError, ssl.SSLError, OSError) as e:
-                reason = f"no certificate ({util.first_line(str(e), 200)})"
-        for s in opened:
-            s.tls = tls
-        return Front("https" if tls else "http", opened, tls=tls, why=reason, mapping=mapping)
-    except BaseException:
-        close_all(opened)
-        raise
+def get_run(handler, rest, query):
+    return board.run_board(unquote(rest))
 
 
-def record_server(node: Node, port: int, front: Front) -> None:
-    fields = {"pid": os.getpid(), "engine": codebase.STAMP, "addresses": list(node.addresses), "port": port,
-              "scheme": front.scheme, "host": node.name}
-    try:
-        util.write_json(paths.SERVER_FILE, {**fields, **paths.state_and_config(), "at": util.iso()})
-    except OSError as e:
-        say(f"cannot write the server file ({e.strerror or e}); the CLI will not find this dashboard")
+def get_task(handler, rest, query):
+    return tasks.view(unquote(rest), query.get("repo", ""))
 
 
-def watch(host: Tailscale, owner: str, node: Node, front: Front, secure: bool = False) -> str:
-    certificate_due = time.monotonic() + (RENEW_SECONDS if front.tls else CERT_RETRY_SECONDS) \
-        if secure else math.inf
-    renewal_failed = False
-    reload_pending = False
-    while True:
-        now = host.node(owner)
-        if now != node:
-            return "the tailnet address or owner changed"
-        time.sleep(WATCH_SECONDS)
-        if now is None or time.monotonic() < certificate_due:
-            continue
-        if not secure:
-            continue
-        try:
-            reload_pending = fetch_certificate(host, node.name) or reload_pending
-            if front.tls and reload_pending:
-                fresh = tls_context()
-                for s in front.servers:
-                    s.tls = fresh
-                reload_pending = False
-        except (CertError, ssl.SSLError, OSError) as e:
-            certificate_due = time.monotonic() + CERT_RETRY_SECONDS
-            if front.tls and not renewal_failed:
-                say(f"the certificate was not renewed ({util.first_line(str(e), 200)}); keeping the old one")
-            renewal_failed = True
-            continue
-        renewal_failed = False
-        if not front.tls:
-            return "a certificate is ready"
-        certificate_due = time.monotonic() + RENEW_SECONDS
+def get_asks(handler, rest, query):
+    return tasks.asks_view()
 
 
-def serve(port: int | None = None, inside_serve: bool = False, host: Tailscale | None = None) -> NoReturn:
+def get_health(handler, rest, query):
+    return board.health_board()
+
+
+def get_triage(handler, rest, query):
+    return board.panel(board.triage_board)
+
+
+def get_outcomes(handler, rest, query):
+    return board.panel(board.outcomes)
+
+
+def get_find(handler, rest, query):
+    return board.find()
+
+
+def get_usage(handler, rest, query):
+    return board.usage_board(whole_number(query.get("days", str(board.USAGE_DAYS))))
+
+
+def get_settings(handler, rest, query):
+    return settings.current()
+
+
+def get_capture(handler, rest, query):
+    return capture.view(connect=state.reader)
+
+
+def get_chats(handler, rest, query):
+    return chat.listing()
+
+
+def get_chat(handler, rest, query):
+    parts = chat_session_parts(rest)
+    if parts and len(parts) == 2 and parts[1] == "sessions":
+        return chat.sessions_of(whole_number(parts[0]))
+    if parts and len(parts) == 4 and parts[1] == "sessions" and parts[3] == "report":
+        return chat.session_report(whole_number(parts[0]), parts[2])
+    return chat.view(whole_number(unquote(rest)))
+
+
+def get_log(handler, rest, query):
+    run_id = unquote(rest)
+    return {"id": run_id, "lines": board.run_log(run_id)}
+
+
+def get_loops(handler, rest, query):
+    return {"loops": control.loop_views(connect=state.reader), "serve": control.serve_beat(),
+            "draft": draft_choices()}
+
+
+def get_loop(handler, rest, query):
+    return control.loop_detail(unquote(rest), connect=state.reader)
+
+
+def get_incidents(handler, rest, query):
+    return board.incidents_board()
+
+
+def get_incident(handler, rest, query):
+    return board.incident_board(unquote(rest))
+
+
+def get_feed(handler, rest, query):
+    return control.feed(unquote(rest), whole_number(query.get("after", "0")))
+
+
+def get_sessions(handler, rest, query):
+    return {"sessions": sessions.views(connect=state.reader), "choices": sessions.choices()}
+
+
+def post_usage(handler, rest, query):
+    state.add_usage(handler.usage_row(), board.KEEP_USAGE_DAYS)
+    return {}
+
+
+def post_capture(handler, rest, query):
+    return capture.save(handler.body())
+
+
+def post_capture_context(handler, rest, query):
+    return capture.add_context(handler.body(), WEB_CODE)
+
+
+def post_capture_submit(handler, rest, query):
+    return capture.submit(handler.body())
+
+
+def post_capture_context_drop(handler, rest, query):
+    return capture.drop_context()
+
+
+def post_capture_discard(handler, rest, query):
+    return capture.discard()
+
+
+def post_capture_evidence(handler, rest, query):
+    if drop := EVIDENCE_DROP.fullmatch(f"{EVIDENCE_PATH}/{rest}"):
+        return capture.drop_evidence(int(drop[1]))
+    raise NoRoute
+
+
+def post_settings(handler, rest, query):
+    return settings.save(handler.body())
+
+
+def post_chat_new(handler, rest, query):
+    return chat.new(str(handler.body().get("project") or ""))
+
+
+def post_chat(handler, rest, query):
+    parts = chat_session_parts(rest)
+    if parts and len(parts) == 2 and parts[1] == "sessions":
+        return handler.start_chat_session(whole_number(parts[0]))
+    if parts and len(parts) == 4 and parts[1] == "sessions" and parts[3] == "stop":
+        return chat.stop_session(whole_number(parts[0]), parts[2])
+    chat_id, _, action = unquote(rest).rpartition("/")
+    if action == "send":
+        return chat.send(whole_number(chat_id), handler.chat_text())
+    if action == "file":
+        return chat.file_draft(whole_number(chat_id))
+    if action == "drop":
+        return chat.drop_draft(whole_number(chat_id))
+    raise NoRoute
+
+
+def post_incident_switch(handler, rest, query):
+    on = handler.body().get("on")
+    if type(on) is not bool:
+        raise control.Refused('switch takes {"on": true} or {"on": false}')
+    return oncall.switch(on)
+
+
+def post_incident(handler, rest, query):
+    incident_id, _, action = unquote(rest).rpartition("/")
+    if action in STEERING:
+        return getattr(oncall, action)(board.incident_number(incident_id))
+    raise NoRoute
+
+
+def post_loop_new(handler, rest, query):
+    return handler.draft_loop()
+
+
+def post_loop(handler, rest, query):
+    name, _, action = unquote(rest).rpartition("/")
+    return handler.loop_action(name, action)
+
+
+def post_run(handler, rest, query):
+    run_id, _, action = unquote(rest).partition("/")
+    if action == "stop":
+        return control.stop_run(run_id)
+    if action == "answer":
+        return tasks.reply(run_id, str(handler.body().get("text") or ""))
+    if action == "resume":
+        return tasks.resume(run_id, str(handler.body().get("step") or ""))
+    if action == "repair":
+        return tasks.repair(run_id)
+    if action.startswith("steps/"):
+        return tasks.run_step(run_id, action[len("steps/"):], handler.body().get("set") or {})
+    raise NoRoute
+
+
+def post_push_subscribe(handler, rest, query):
+    return webpush.subscribe(handler.body(), handler.server.node.owner)
+
+
+def post_push_remove(handler, rest, query):
+    return webpush.remove(str(handler.body().get("id") or ""))
+
+
+def post_push_test(handler, rest, query):
+    return webpush.test(config.load_or_problem()[0])
+
+
+def post_ask(handler, rest, query):
+    ask_id, _, action = unquote(rest).partition("/")
+    if action == "answer":
+        return tasks.answer_ask(ask_id, handler.body())
+    raise NoRoute
+
+
+def post_approval(handler, rest, query):
+    return control.decide(whole_number(unquote(rest)), handler.body().get("approve") is True)
+
+
+def post_task(handler, rest, query):
+    b = handler.body()
+    return tasks.start(*(str(b.get(k) or "") for k in ("repo", "prompt", "title", "kind", "ticket")),
+                       force=b.get("force") is not False)
+
+
+def post_sessions(handler, rest, query):
+    return handler.launch_session()
+
+
+def post_session(handler, rest, query):
+    session_id, _, action = unquote(rest).rpartition("/")
+    if action == "send":
+        return sessions.send(session_id, str(handler.body().get("text", "")))
+    if action == "stop":
+        return control.stop_run(session_id)
+    raise NoRoute
+
+
+def post_device(handler, rest, query):
+    name, _, action = unquote(rest).rpartition("/")
+    if action == "probe":
+        return devices.probe(name)
+    raise NoRoute
+
+
+def post_triage_refresh(handler, rest, query):
+    return {"run": loop_run.launch("triage")["id"]}
+
+
+def post_triage(handler, rest, query):
+    ref, _, action = unquote(rest).rpartition("/")
+    if action == "send":
+        return handler.send_ticket(ref)
+    if action == "research":
+        return research_ticket(ref, handler.body().get("force") is True)
+    raise NoRoute
+
+
+def post_checks_run(handler, rest, query):
+    return {"run": loop_run.launch("heartbeat")["id"]}
+
+
+def post_skipped(handler, rest, query):
+    name, _, action = unquote(rest).rpartition("/")
+    if action == "run":
+        return pipeline.run_skipped(name)
+    raise NoRoute
+
+
+def post_proposal(handler, rest, query):
+    proposal_id, _, action = unquote(rest).rpartition("/")
+    if action == "done":
+        return forget_proposal(whole_number(proposal_id))
+    if action == "approve":
+        return approve_rule(whole_number(proposal_id))
+    if action == "reject":
+        return reject_rule(whole_number(proposal_id))
+    raise NoRoute
+
+
+def post_serve_install(handler, rest, query):
+    return install_serve(handler.server.inside_serve)
+
+
+ROUTES = (
+    ("GET", "/api/meta", get_meta),
+    ("GET", PUSH_PATH, get_push),
+    ("GET", "/api/sidebar", get_sidebar),
+    ("GET", "/api/live", get_live),
+    ("GET", "/api/runs", get_runs),
+    ("GET", "/api/runs/*", get_run),
+    ("GET", "/api/tasks/*", get_task),
+    ("GET", "/api/asks", get_asks),
+    ("GET", "/api/health", get_health),
+    ("GET", "/api/triage", get_triage),
+    ("GET", "/api/outcomes", get_outcomes),
+    ("GET", "/api/find", get_find),
+    ("GET", "/api/usage", get_usage),
+    ("GET", "/api/settings", get_settings),
+    ("GET", "/api/capture", get_capture),
+    ("GET", "/api/chats", get_chats),
+    ("GET", "/api/chats/*", get_chat),
+    ("GET", "/api/log/*", get_log),
+    ("GET", "/api/loops", get_loops),
+    ("GET", "/api/loops/*", get_loop),
+    ("GET", "/api/incidents", get_incidents),
+    ("GET", "/api/incidents/*", get_incident),
+    ("GET", "/api/feed/*", get_feed),
+    ("GET", "/api/sessions", get_sessions),
+    ("POST", "/api/usage", post_usage),
+    ("POST", "/api/capture", post_capture),
+    ("POST", "/api/capture/context", post_capture_context),
+    ("POST", "/api/capture/submit", post_capture_submit),
+    ("POST", "/api/capture/context/drop", post_capture_context_drop),
+    ("POST", "/api/capture/discard", post_capture_discard),
+    ("POST", "/api/capture/evidence/*", post_capture_evidence),
+    ("POST", "/api/settings", post_settings),
+    ("POST", "/api/chats/new", post_chat_new),
+    ("POST", "/api/chats/*", post_chat),
+    ("POST", "/api/incidents/switch", post_incident_switch),
+    ("POST", "/api/incidents/*", post_incident),
+    ("POST", "/api/loops/new", post_loop_new),
+    ("POST", "/api/loops/*", post_loop),
+    ("POST", "/api/runs/*", post_run),
+    ("POST", f"{PUSH_PATH}/subscribe", post_push_subscribe),
+    ("POST", f"{PUSH_PATH}/remove", post_push_remove),
+    ("POST", f"{PUSH_PATH}/test", post_push_test),
+    ("POST", "/api/asks/*", post_ask),
+    ("POST", "/api/approvals/*", post_approval),
+    ("POST", "/api/tasks", post_task),
+    ("POST", "/api/sessions", post_sessions),
+    ("POST", "/api/sessions/*", post_session),
+    ("POST", "/api/devices/*", post_device),
+    ("POST", "/api/triage/refresh", post_triage_refresh),
+    ("POST", "/api/triage/*", post_triage),
+    ("POST", "/api/checks/run", post_checks_run),
+    ("POST", "/api/skipped/*", post_skipped),
+    ("POST", "/api/proposals/*", post_proposal),
+    ("POST", "/api/serve/install", post_serve_install),
+)
+
+
+def serve(port: int | None = None, inside_serve: bool = False, host: tailnet.Tailscale | None = None) -> NoReturn:
     cfg = config.load_or_problem()[0]
     port = port or cfg.dashboard_port
     state.ensure_schema()
@@ -1086,82 +906,4 @@ def serve(port: int | None = None, inside_serve: bool = False, host: Tailscale |
         with util.lock(serve.SERVE_LOCK) as free:
             if free:
                 capture.recover()
-    host = host or host_services()
-    logins = Logins(host)
-    hold = util.lock_file(f"dashboard-{port}")
-    held = False
-    waiting_for = ""
-    last_line = ""
-    atexit.register(forget_server)
-    try:
-        while True:
-            node = host.node(cfg.dashboard_owner)
-            try:
-                if node is None:
-                    raise OSError("tailscale is not running or reports no address")
-                if not held:
-                    held = util.flock_now(hold)
-                    if held:
-                        try:
-                            (paths.STATE_DIR / f"dashboard-proxy-{port}.json").unlink(missing_ok=True)
-                        except OSError as e:
-                            say(f"cannot remove the old dashboard proxy record ({e.strerror or e})")
-                if not held:
-                    raise OSError(f"another dashboard on this state holds port {port}")
-                front = open_front(host, node, port, logins, inside_serve, cfg.dashboard_https)
-            except OSError as e:
-                if str(e) != waiting_for:
-                    say(f"cannot listen yet ({e}); trying again every {RETRY_SECONDS} s")
-                    waiting_for = str(e)
-                time.sleep(RETRY_SECONDS)
-                continue
-            waiting_for = ""
-            for s in front.servers:
-                threading.Thread(target=s.serve_forever, daemon=True).start()
-            last_line = announce(node, port, front, last_line)
-            reason = watch(host, cfg.dashboard_owner, node, front, cfg.dashboard_https)
-            say(f"{reason}; listening again")
-            for s in front.servers:
-                stop_listener(s)
-            forget_server()
-    finally:
-        forget_server()
-
-
-def announce(node: Node, port: int, front: Front, last_line: str) -> str:
-    line = listening_line(node, port, front)
-    if line != last_line:
-        say(line)
-    record_server(node, port, front)
-    return line
-
-
-def listening_line(node: Node, port: int, front: Front) -> str:
-    if front.tls:
-        line = f"dashboard listening on port {port} at {', '.join(node.addresses)} over HTTPS as {node.name}"
-    else:
-        line = f"dashboard listening on port {port} at {', '.join(node.addresses)} over plain HTTP"
-    if front.why:
-        line += f"; {front.why}; trying again every hour"
-    if front.mapping:
-        line += f"; {front.mapping}"
-    return line
-
-
-def url(node: Node | None, port: int) -> str:
-    found = util.read_json(paths.SERVER_FILE, None)
-    mine = paths.state_and_config()
-    recorded = isinstance(found, dict) and {k: found.get(k) for k in mine} == mine
-    fallback = "https" if config.load_or_problem()[0].dashboard_https else "http"
-    scheme = found["scheme"] if recorded and found.get("scheme") in ("http", "https") else fallback
-    if node is None and scheme == "http":
-        return f"http://<this machine's tailnet address>:{port}"
-    if node is None:
-        return f"{scheme}://<this machine's tailnet name>:{port}"
-    return f"{scheme}://{node.name if scheme == 'https' else node.addresses[0]}:{port}"
-
-
-def forget_server() -> None:
-    found = util.read_json(paths.SERVER_FILE, None)
-    if isinstance(found, dict) and found.get("pid") == os.getpid():
-        paths.SERVER_FILE.unlink(missing_ok=True)
+    tailnet.serve(tailnet.Handlers(Handler, Redirect), cfg, port, inside_serve, host)

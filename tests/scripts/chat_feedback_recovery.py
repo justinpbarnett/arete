@@ -28,8 +28,8 @@ assert draft["delivery"] == capture.RESTARTED
 assert state.capture_move(draft["id"], draft["revision"], "filing", "draft")
 begin()
 with serve.take_serve_lock(), \
-     mock.patch.object(dashboard.Tailscale, "node", return_value=None), \
-     mock.patch.object(dashboard.time, "sleep", side_effect=RuntimeError("stop dashboard")):
+     mock.patch.object(tailnet.Tailscale, "node", return_value=None), \
+     mock.patch.object(tailnet.time, "sleep", side_effect=RuntimeError("stop dashboard")):
     try:
         dashboard.serve(inside_serve=True)
     except RuntimeError as e:

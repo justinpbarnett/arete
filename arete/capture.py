@@ -21,6 +21,7 @@ from . import (
     outbound,
     paths,
     pipeline,
+    refusals,
     runner,
     state,
     steps,
@@ -98,19 +99,19 @@ NOT_INSPECTED_YET = "Not inspected yet. Submit inspects it."
 ROUTE_CHANGED = "The model or data handling it was inspected under has changed. Submit inspects it again."
 
 
-class Refused(ValueError):
+class Refused(refusals.Invalid, ValueError):
     pass
 
 
-class Conflict(RuntimeError):
+class Conflict(refusals.Conflict, RuntimeError):
     pass
 
 
-class TooLarge(Refused):
+class TooLarge(refusals.TooLarge, Refused):
     pass
 
 
-class NotStaged(LookupError):
+class NotStaged(refusals.NotFound, LookupError):
     pass
 
 

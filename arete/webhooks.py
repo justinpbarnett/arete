@@ -9,6 +9,7 @@ from datetime import timedelta
 from urllib.parse import parse_qs
 
 from . import loops, paths, sources, state, util
+from .refusals import Stated
 
 HOOKS_DIR = paths.CONFIG_DIR / "hooks"
 HOOK_PATH = "/hook/"
@@ -16,12 +17,6 @@ BODY_KEY_WINDOW = timedelta(minutes=10)
 MAX_HOOK_BODY = 1024 * 1024
 MAX_EVENT_BODY = 60_000
 FORM_CONTENT_TYPE = "application/x-www-form-urlencoded"
-
-
-class HookRefused(Exception):
-    def __init__(self, status: int, text: str):
-        super().__init__(text)
-        self.status = status
 
 
 def hook_path(name: str) -> str:
@@ -53,18 +48,18 @@ def bearer_token(authorization: str) -> str:
 def check(name: str, headers, body: bytes) -> None:
     key = secret(name, create=False)
     if not key:
-        raise HookRefused(404, f"No webhook for {name}.")
+        raise Stated(404, f"No webhook for {name}.")
     signature = headers.get("X-Hub-Signature-256", "")
     token = headers.get("X-Arete-Token", "") or bearer_token(headers.get("Authorization", ""))
     if signature:
         expected = "sha256=" + hmac.new(key.encode(), body, hashlib.sha256).hexdigest()
         if not hmac.compare_digest(signature.encode(), expected.encode()):
-            raise HookRefused(403, "The signature does not match the webhook secret.")
+            raise Stated(403, "The signature does not match the webhook secret.")
         return
     if not token:
-        raise HookRefused(401, "A webhook needs the X-Arete-Token header, a Bearer token, or a GitHub signature.")
+        raise Stated(401, "A webhook needs the X-Arete-Token header, a Bearer token, or a GitHub signature.")
     if not hmac.compare_digest(token.encode(), key.encode()):
-        raise HookRefused(403, "The token does not match the webhook secret.")
+        raise Stated(403, "The token does not match the webhook secret.")
 
 
 def body_text(headers, body: bytes) -> str:
@@ -101,13 +96,13 @@ def event_of(name: str, headers, body: bytes) -> dict:
 def receive(name: str, headers, body: bytes) -> dict:
     loop = next((x for x in loops.load_all() if x.name == name), None)
     if not loop or not loop.trigger.webhook:
-        raise HookRefused(404, f"No webhook for {name}.")
+        raise Stated(404, f"No webhook for {name}.")
     check(name, headers, body)
     if not loop.enabled or loop.error:
-        raise HookRefused(409, f"The loop {name} is turned off.")
+        raise Stated(409, f"The loop {name} is turned off.")
     e = event_of(name, headers, body)
     if why := loop.trigger.refusal(e):
-        raise HookRefused(403, f"The loop {name} {why}.")
+        raise Stated(403, f"The loop {name} {why}.")
     with state.transaction() as connect:
         if not delivery_id(headers):
             state.forget_seen(e["source"], e["key"], util.now() - BODY_KEY_WINDOW, connect)

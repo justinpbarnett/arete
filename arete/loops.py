@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 
-from . import config, cron, devices, paths, runner, state, util
+from . import config, cron, devices, paths, refusals, runner, state, util
 
 BUNDLED_LOOPS_DIR = paths.PACKAGE_DIR / "loops"
 SWITCHES_FILE = paths.CONFIG_DIR / "loop-switches.json"
@@ -240,7 +240,7 @@ def github_remote(path: Path) -> str:
     return m.group(1) if m else ""
 
 
-class LoopError(ValueError):
+class LoopError(refusals.Invalid, ValueError):
     pass
 
 

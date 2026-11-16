@@ -16,6 +16,7 @@ from . import (
     outbound,
     paths,
     pipeline,
+    refusals,
     sessions,
     state,
     tracker,
@@ -43,11 +44,11 @@ KEEP_USAGE_DAYS = 90
 LANDED = ("landed", "replaced", "approved")
 
 
-class NotARunId(ValueError):
+class NotARunId(refusals.Invalid, ValueError):
     pass
 
 
-class UnknownFilter(ValueError):
+class UnknownFilter(refusals.Invalid, ValueError):
     pass
 
 
