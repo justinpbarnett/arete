@@ -11,6 +11,7 @@ from unittest import mock
 
 SOURCE = Path(__file__).resolve().parents[2]
 BASELINE = "56706fe2c07d36fd9d7c00d227f9f68caffeda29"
+BEFORE_BUDGET = "0090e09dc89ccca0b96250ce6a2e4e64cb84999b"
 
 
 def ledger(db):
@@ -40,8 +41,8 @@ def ownership(root):
     assert migrations.area_owner("work", "m0004_work_event_routing.py") == "loops"
     before = ledger(db)
     assert all(migrations.area_owner(row[2], row[1]) for row in before), before
-    assert before[3][2] == "loops", before[3]
-    assert before[-1][0] == 5 and before[-1][2] == "foundation", before[-1]
+    assert next(row for row in before if row[0] == 4)[2] == "loops", before
+    assert before[-1][0] == 8 and before[-1][2] == "foundation", before[-1]
     assert owners["events"]["events_log"]
     assert set(owners["principals"]) == {"principals", "principal_logins"}
     db.migrate()
@@ -131,7 +132,7 @@ def unknown_area(root):
 def historical_chain(root, revision, names):
     folder = root / revision.replace("/", "-")
     folder.mkdir()
-    location = "arete/store/migrations" if revision == "origin/main" else "arete/migrations"
+    location = "arete/migrations" if revision == "9c8019c" else "arete/store/migrations"
     for name in names:
         data = subprocess.run(["git", "show", f"{revision}:{location}/{name}"],
                               cwd=SOURCE, capture_output=True, check=True).stdout
@@ -162,11 +163,17 @@ def upgrade(root):
     assert ledger(db) == original
     db.migrate()
     full = ledger(db)
-    assert full[:2] == original and [r[0] for r in full[2:]] == [3, 4, 5], full
+    suffix = [m.n for m in chain[2:]]
+    assert full[:2] == original and [r[0] for r in full[2:]] == suffix, full
     db.migrate()
     assert ledger(db) == full
-    old_location = historical_chain(root, "origin/main", names[:4])
-    other = paths.STATE_DIR / "origin-main" / "arete.db"
+    available = subprocess.run(["git", "ls-tree", "--name-only", f"{BEFORE_BUDGET}:arete/store/migrations"],
+                               cwd=SOURCE, capture_output=True, check=True, text=True).stdout.splitlines()
+    old_names = sorted(name for name in available if name.startswith("m") and name.endswith(".py"))
+    old_location = historical_chain(root, BEFORE_BUDGET, old_names)
+    for name in old_names:
+        assert (old_location / name).read_bytes() == (migrations.FOLDER / name).read_bytes(), name
+    other = paths.STATE_DIR / "before-budget" / "arete.db"
     other.parent.mkdir()
     with mock.patch.object(paths, "DB_FILE", other):
         with mock.patch.object(migrations, "FOLDER", old_location):
@@ -176,12 +183,15 @@ def upgrade(root):
         previous = ledger(db)
         db.migrate()
         upgraded = ledger(db)
-        assert upgraded[:4] == previous and [r[0] for r in upgraded[4:]] == [5], upgraded
-        assert previous[-1][2] == "work"
+        assert upgraded[:len(previous)] == previous
+        added = [m.n for m in chain if m.name not in old_names]
+        assert [row[0] for row in upgraded[len(previous):]] == added
+        assert next(row for row in previous if row[0] == 4)[2] == "work"
         db.migrate()
         assert ledger(db) == upgraded
     return {"historical_rows": len(original), "hashes_unchanged": True, "relocated_rows_added": 0,
-            "applied_once": [3, 4, 5], "origin_main_rows_added": 1, "historical_work_preserved": True}
+            "applied_once": suffix, "expected_suffix": suffix, "origin_main_rows_added": len(added),
+            "budget_applied_once": added, "historical_work_preserved": True}
 
 
 

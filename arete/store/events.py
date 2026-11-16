@@ -9,7 +9,7 @@ from . import db as foundation
 
 TABLES = {"events_log": "durable kept; derived 90 days; notice 7 days"}
 
-VERSION = 5
+VERSION = 8
 CLASSES = ("durable", "derived", "notice")
 
 

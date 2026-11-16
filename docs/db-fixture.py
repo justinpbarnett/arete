@@ -1898,7 +1898,7 @@ def event_contract():
                 columns = [r[1] for r in conn.execute("PRAGMA table_info(events)")]
                 meta = dict(conn.execute("SELECT key,value FROM schema_meta"))
                 rows = [dict(r) for r in conn.execute("SELECT * FROM events")]
-                require("data" not in columns and int(meta["oldest_writer"]) == 4, meta)
+                require("data" not in columns and int(meta["oldest_writer"]) == 7, meta)
                 require(len(rows) == (3 if kind == "v0" else 2), rows)
             require(not foundation.migrate(), "migration repeated")
             evidence["cases"].append({"kind": kind, "columns": columns, "events": rows, "meta": meta})

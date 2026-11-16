@@ -640,7 +640,7 @@ def completeness(f):
     from arete import state
 
     identity = f.get("/api/meta")["instance"]
-    for value, expected in (("4", False), ("5", True), (None, True)):
+    for value, expected in (("7", False), ("8", True), (None, True)):
         with state.tx() as c:
             c.execute("UPDATE schema_meta SET value = ? WHERE key = 'oldest_writer'", (value,))
         answer = f.get("/api/meta")

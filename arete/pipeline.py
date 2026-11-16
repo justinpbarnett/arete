@@ -2227,6 +2227,9 @@ def resolve_conflicts(run: AgentRun, c: workspace.Checkout, conflicts: list[str]
                         f"({', '.join(protected)}), which a person must merge")
     own = {p for p in util.git_records(["diff", "--name-only", f"{commit}...HEAD"], c.wt)
            if p not in conflicts and not (util.matches_any(p, deny) or util.matches_any(c.prefix + p, deny))}
+    incoming_paths = {p for p in util.git_records(["diff", "--name-only", f"HEAD...{commit}"], c.wt)
+                      if p not in conflicts and not (util.matches_any(p, deny) or util.matches_any(c.prefix + p, deny))}
+    supplemental = own | incoming_paths
     tries = max(1, run.settings("build").tries)
     feedback = "this is the first attempt"
     for n in range(1, tries + 1):
@@ -2265,7 +2268,7 @@ def resolve_conflicts(run: AgentRun, c: workspace.Checkout, conflicts: list[str]
                            if ignored_before.get(n) != ignored_after.get(n)}
         touched = (set(util.git_records(["diff", "--name-only"], c.wt)) | (workspace.untracked_files(c.wt) - untracked_before)
                    | changed_ignored)
-        if outside := sorted(touched - set(conflicts) - own):
+        if outside := sorted(touched - set(conflicts) - supplemental):
             raise workspace.RunFailed(f"the resolver edited files outside the conflict in {c.github}: {', '.join(outside)}")
         if left := marked(c.wt, conflicts):
             feedback = f"conflict markers remain in {', '.join(left)}; remove every one"
@@ -2273,7 +2276,7 @@ def resolve_conflicts(run: AgentRun, c: workspace.Checkout, conflicts: list[str]
                 raise workspace.RunFailed(f"conflict markers remain in {', '.join(left)} after {util.count(n, 'attempt')} "
                                 f"in {c.github}")
             continue
-        git(["add", "-A", "--", *conflicts, *sorted(touched & own)], c.wt)
+        git(["add", "-A", "--", *conflicts, *sorted(touched & supplemental)], c.wt)
         if unmerged_paths(c.wt):
             raise workspace.RunFailed(f"files are still unmerged in {c.github} after the resolver ran")
         with util.repo_lock(c.src):
