@@ -115,6 +115,9 @@ class StoreContractTests(unittest.TestCase):
         self.assertTrue(found["aggregate_compatibility"])
         self.assertEqual(found["loop_lock_owner"], "loops")
         self.assertEqual(found["readers"]["state"], {"remember": 7})
+        self.assertTrue(found["private_helper_excluded"])
+        self.assertEqual(set(found["implementations"]),
+                         {"approvals", "asks", "chats", "devices", "insights", "push", "tasks", "triage", "_rows"})
 
     def test_record_readers_and_billing(self):
         found = self.scenario("record-readers")
@@ -122,6 +125,17 @@ class StoreContractTests(unittest.TestCase):
         self.assertEqual(found["finished_ids"], ["readers"])
         self.assertEqual(found["whole_ids"], ["second", "readers"])
         self.assertTrue(all(found[k] for k in ("stamps", "steps", "reports", "feed", "pins", "backfill")))
+
+    def test_aggregate_joins_and_approval_transaction(self):
+        found = self.scenario("aggregate-joins")
+        self.assertTrue(found["baseline_compatible"])
+        self.assertEqual(found["inventories"], found["baseline_inventories"])
+        self.assertEqual(set(found["queries"]), {"approvals", "vms_left_over", "open_asks", "feedback_due"})
+        self.assertTrue(all(row["reader"] and row["listing_selects"] == 1 for row in found["queries"].values()))
+        transaction = found["approval_transactions"]
+        self.assertEqual(transaction["before"], transaction["after_failure"])
+        self.assertEqual(transaction["before"], transaction["after_rejected"])
+        self.assertTrue(all(transaction[key] for key in ("rollback", "rejected_unchanged", "unjudged_unchanged", "settled")))
 
     def test_record_failures_roll_back_and_settle_once(self):
         found = self.scenario("record-failures")
@@ -160,6 +174,7 @@ class StoreContractTests(unittest.TestCase):
         self.assertEqual(set(found["refusals"]), {"outbox", "helper", "work"})
         self.assertFalse(found["executed"])
         self.assertTrue(found["schema_unchanged"] and found["ledger_unchanged"])
+        self.assertEqual(set(found["private_refusals"]), {"_rows"})
 
     def test_immutable_historical_chains_upgrade_once(self):
         found = self.scenario("upgrade")

@@ -818,7 +818,8 @@ class CutOffTests(unittest.TestCase):
 
     def test_sigterm_after_the_push_leaves_it_failed_with_the_fix_on_origin(self):
         self.held_push()
-        done = self.cut_off("state.set_verdict_sha = lambda run_id, sha: os.kill(os.getpid(), signal.SIGTERM)\n"
+        done = self.cut_off("from arete.store import insights as insight_store\n"
+                            "insight_store.set_verdict_sha = lambda run_id, sha: os.kill(os.getpid(), signal.SIGTERM)\n"
                             "cli.main(['approve', '1'])")
         self.assertEqual(done.returncode, 143)
         facts = self.listed()

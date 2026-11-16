@@ -32,6 +32,7 @@ from . import (
     workspace,
 )
 from .refusals import TrackerFailed
+from .store import asks as ask_store
 from .store import db as foundation
 from .store import runs as run_store
 from .store import sources as source_store
@@ -257,7 +258,7 @@ def reply_to_asks(cfg: config.Config, repo: config.Repo, row: dict, waiting: lis
     command = continuing(cfg, repo, row)
     kept = store_answer(cfg, repo, tid, text)
     for a in waiting:
-        state.ask_close(a["id"], "answered", owner_asks.text_answers(a, text))
+        ask_store.ask_close(a["id"], "answered", owner_asks.text_answers(a, text))
     started = continue_asked(cfg, repo, row, command)
     return {**started, "why": f"{started['why']}; {kept}"} if kept else started
 
@@ -299,7 +300,7 @@ def answer_ask(ask_id: str, body) -> dict:
             vault.put_all(repo.name, given)
         except OSError as e:
             raise control.Refused(f"could not store {', '.join(given)} ({e.strerror}); the ask stays open") from None
-        if not state.ask_close(ask_id, "answered", answers):
+        if not ask_store.ask_close(ask_id, "answered", answers):
             raise control.Refused(f"ask {ask_id} was answered from the tracker a moment ago, so this answer was not stored")
         if more := state.asks_of(row["id"], "open"):
             return answer(tid, repo.name, "", "waiting",
