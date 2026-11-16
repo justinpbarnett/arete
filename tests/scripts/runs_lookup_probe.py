@@ -2,6 +2,7 @@ from arete.store import db as foundation
 import json
 from datetime import UTC, datetime, timedelta
 
+from arete.store import runs as run_store
 from arete import paths, state
 
 BASE = datetime(2026, 1, 1, tzinfo=UTC)
@@ -92,29 +93,29 @@ def call(name, function, *args, **kwargs):
 
 
 counts["progress"] = 0
-interrupted = call("interrupted_tickets", state.interrupted_tickets, "arete")
+interrupted = call("interrupted_tickets", run_store.interrupted_tickets, "arete")
 first_progress = counts["progress"]
 
 first_interrupted = ids[1001][0]
 results = {
     "interrupted_tickets": interrupted,
-    "issue_running": call("issue_running", state.issue_running, "arete", 1001),
-    "running_run": call("running_run", state.running_run, "arete", 1001),
-    "ticket_runs": [r["id"] for r in call("ticket_runs", state.ticket_runs, "arete", 1036, whole=True)],
-    "open_runs": [r["id"] for r in call("open_runs", state.open_runs, "arete", 1021)],
-    "later_run": (call("later_run", state.later_run, "arete", 1021, ids[1021][0]) or {}).get("id"),
-    "last_pipeline_starts": call("last_pipeline_starts", state.last_pipeline_starts),
+    "issue_running": call("issue_running", run_store.issue_running, "arete", 1001),
+    "running_run": call("running_run", run_store.running_run, "arete", 1001),
+    "ticket_runs": [r["id"] for r in call("ticket_runs", run_store.ticket_runs, "arete", 1036, whole=True)],
+    "open_runs": [r["id"] for r in call("open_runs", run_store.open_runs, "arete", 1021)],
+    "later_run": (call("later_run", run_store.later_run, "arete", 1021, ids[1021][0]) or {}).get("id"),
+    "last_pipeline_starts": call("last_pipeline_starts", run_store.last_pipeline_starts),
     "feedback_due": call("feedback_due", state.feedback_due, "arete", "2100-01-01"),
-    "runs": [r["id"] for r in call("runs", state.runs, limit=50)],
-    "runs_since": len(call("runs_since", state.runs_since, stamp(0))),
+    "runs": [r["id"] for r in call("runs", run_store.runs, limit=50)],
+    "runs_since": len(call("runs_since", run_store.runs_since, stamp(0))),
 }
 with state.db() as c:
     results["history"] = {
-        "default_has_firings": any(r["kind"] == "loop" for r in state.runs(limit=20000)),
-        "firings_has_firings": any(r["kind"] == "loop" for r in state.runs(limit=20000, firings=True)),
+        "default_has_firings": any(r["kind"] == "loop" for r in run_store.runs(limit=20000)),
+        "firings_has_firings": any(r["kind"] == "loop" for r in run_store.runs(limit=20000, firings=True)),
     }
     results["latest_whole"] = {
-        str(t): state.ticket_runs("arete", t, limit=1, whole=True)[0]["id"] for t in (1031, 1036, 1037, 1038, 1001, 1002)}
+        str(t): run_store.ticket_runs("arete", t, limit=1, whole=True)[0]["id"] for t in (1031, 1036, 1037, 1038, 1001, 1002)}
     results["expected_latest_whole"] = {str(t): ids[t][1 if t >= 1036 else 0] for t in (1031, 1036, 1037, 1038, 1001, 1002)}
 
 plans = {}

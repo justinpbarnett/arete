@@ -60,6 +60,25 @@ class StoreContractTests(unittest.TestCase):
         self.assertTrue(found["ledger_unchanged"])
         self.assertEqual(found["foundation"], "db")
 
+    def test_record_readers_and_billing(self):
+        found = self.scenario("record-readers")
+        self.assertEqual(found["paid"], 2.25)
+        self.assertEqual(found["finished_ids"], ["readers"])
+        self.assertEqual(found["whole_ids"], ["second", "readers"])
+        self.assertTrue(all(found[k] for k in ("stamps", "steps", "reports", "feed", "pins", "backfill")))
+
+    def test_record_failures_roll_back_and_settle_once(self):
+        found = self.scenario("record-failures")
+        self.assertTrue(all(found[k] for k in ("collision_retry", "explicit_collision", "batch_rollback",
+                                             "end_rollback", "repeated_settle", "missing_settle",
+                                             "committed_timeline_failure", "invalid_unchanged", "crash_reraised")))
+
+    def test_run_retention_protections_and_atomicity(self):
+        found = self.scenario("run-retention")
+        self.assertEqual(found["deleted_ids"], ["old-done", "old-skipped"])
+        self.assertTrue(all(found[k] for k in ("rollback", "history_retained", "merged_raw_kept",
+                                             "custom_windows", "deletion_retry", "unsafe_refused")))
+
     def test_unknown_areas_cannot_execute_or_mutate(self):
         found = self.scenario("unknown-area")
         self.assertEqual(set(found["refusals"]), {"outbox", "helper", "work"})

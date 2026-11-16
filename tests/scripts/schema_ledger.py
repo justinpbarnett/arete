@@ -20,6 +20,7 @@ from unittest import mock
 
 CHECKOUT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(CHECKOUT))
+from arete.store import runs as run_store
 from arete import backup, cli, control, dashboard, loop_run, paths, record, serve, state, tailnet, util
 from arete.store import db as foundation, migrations
 
@@ -203,7 +204,7 @@ def test_add_feed_issues_no_ddl():
     init()
     foundation.ensure_schema()
     TRACE.clear()
-    state.add_feed("run", "out", "x")
+    run_store.add_feed("run", "out", "x")
     statements = []
     for statement in TRACE:
         statement = statement.strip().upper()
@@ -211,7 +212,7 @@ def test_add_feed_issues_no_ddl():
             statements.append(statement)
     assert len(statements) == 3, TRACE
     assert statements[0] == "BEGIN IMMEDIATE" and statements[1].startswith("INSERT INTO FEED") and statements[2] == "COMMIT", TRACE
-    assert state.feed("run")[-1]["text"] == "x"
+    assert run_store.feed("run")[-1]["text"] == "x"
 
 
 def test_no_serve_makes_no_file():
@@ -349,6 +350,7 @@ def test_a_second_serve_waits_its_turn():
     program.write_text(f"""
 import sys, time
 sys.path.insert(0, {str(CHECKOUT)!r})
+from arete.store import runs as run_store
 from arete import serve
 held = serve.take_serve_lock()
 from pathlib import Path
@@ -458,7 +460,7 @@ def test_runs_name_their_schema():
     with mock.patch.object(foundation, "LATEST", PROBE), mock.patch.object(loop_run, "LoopRun", return_value=run), \
             mock.patch.object(loop_run.loops, "find"), mock.patch.object(loop_run, "carry", return_value="done"):
         loop_run.carry_opened(rid)
-    row = state.run_get(rid)
+    row = run_store.run_get(rid)
     assert row["schema_version"] == PROBE and row["engine_sha"] == loop_run.codebase.STAMP, row
     record.move(rid, "done", ("running",), finished=util.iso())
     (paths.STATE_DIR.parent / "authority-parent").mkdir()

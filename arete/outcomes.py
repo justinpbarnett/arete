@@ -22,6 +22,7 @@ from . import (
     util,
     workspace,
 )
+from .store import runs as run_store
 from .util import git
 
 FEEDBACK_ASKS = "Does this comment ask for a change to the pull request, or ask a question the author should answer?"
@@ -121,7 +122,7 @@ def record_feedback(cfg: config.Config, r: dict, urls: list[str], prs: list[dict
 
 def sync_outcomes(cfg: config.Config) -> None:
     seen, fresh = util.read_json(PR_SEEN_FILE, {}), {}
-    for r in state.runs_reading_pr_comments(util.iso(util.now() - REJECTED_PR_LISTEN)):
+    for r in run_store.runs_reading_pr_comments(util.iso(util.now() - REJECTED_PR_LISTEN)):
         urls = r["pr_url"].split()
         try:
             prs = [gh.pr_view(url) for url in urls]
@@ -157,7 +158,7 @@ def sync_moves(cfg: config.Config) -> None:
     if not any(cfg.jira.transitions.get(s) for s in CATCH_UP):
         return
     seen: set[tuple[str, str]] = set()
-    for r in state.runs(kind="pipeline", limit=200):
+    for r in run_store.runs(kind="pipeline", limit=200):
         key = (r["repo"] or "", str(r["issue"]))
         if key in seen:
             continue
@@ -196,7 +197,7 @@ def sync_landings(cfg: config.Config) -> None:
     branches = list(cfg.jira.landed)
     if not branches:
         return
-    rows = state.runs(kind="pipeline", limit=200)
+    rows = run_store.runs(kind="pipeline", limit=200)
     for i, r in enumerate(rows):
         if (r["status"] != "merged" or not r.get("pr_url") or r.get("landed") == branches[-1]
                 or carried_by_newer(rows, i)):
@@ -286,7 +287,7 @@ def branch_holds_work(repo: str, branch: str, merge_sha: str, key: str) -> bool:
 
 def streak(repo_name: str, since: str = "") -> int:
     n = 0
-    rows = state.runs(kind="pipeline", repo=repo_name, limit=100)
+    rows = run_store.runs(kind="pipeline", repo=repo_name, limit=100)
     for i, r in enumerate(rows):
         if (r["status"] == "merged" and (not since or (r["finished"] or "") > since)
                 and not carried_by_newer(rows, i)):

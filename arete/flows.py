@@ -29,6 +29,7 @@ from . import (
 from .agent import NO_SESSION, Result
 from .factory import Outcome
 from .review import Review
+from .store import runs as run_store
 from .verify import Verified
 
 TICKET_FIELDS = ("id", "ref", "title", "body", "comments", "kind", "url", "labels")
@@ -149,10 +150,10 @@ STEP_RUNS_READ = 500
 
 
 def step_runs(run_id: str) -> dict[str, list[dict]]:
-    row, known, found = state.run_get(run_id) or {}, factory.chain_runs(run_id), {}
+    row, known, found = run_store.run_get(run_id) or {}, factory.chain_runs(run_id), {}
     if not row:
         return found
-    for other in reversed(state.ticket_runs(row["repo"], row["issue"], limit=STEP_RUNS_READ)):
+    for other in reversed(run_store.ticket_runs(row["repo"], row["issue"], limit=STEP_RUNS_READ)):
         if not other.get("only_step") or other["id"] in known:
             continue
         read = run_lines.read(other["id"])
@@ -572,7 +573,7 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
     except tracker.ERRORS as e:
         return end_as("stop", "quiet", status="failed", summary=f"could not read {run.ref}: {e}")
     opened(run, t)
-    mended = state.run_get(run.repairs) or {} if run.repairs else {}
+    mended = run_store.run_get(run.repairs) or {} if run.repairs else {}
     if run.feedback or run.repairs:
         urls = run.feedback_prs or str(mended.get("pr_url") or "").split()
         if closed := [url for url in urls if gh.pr_view(url).get("state") != "OPEN"]:
@@ -690,7 +691,7 @@ def repair(flow: factory.Flow, tree: str) -> Outcome:
     if not run.repairs:
         return end_as("fail", "failed", why="this run names no run to repair; start it with arete repair RUN")
     try:
-        found = repairs.source(state.run_get(run.repairs) or {})
+        found = repairs.source(run_store.run_get(run.repairs) or {})
         targets = [c for c in job.checkouts if c.pr in found.prs]
         if missing := [url for url in found.prs if url not in {c.pr for c in targets}]:
             raise repairs.Refused(f"{', '.join(missing)} is not an open PR of this run's checkouts")

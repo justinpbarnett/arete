@@ -44,6 +44,7 @@ from .pipeline import (
     use_product,
 )
 from .review import REVIEW_SCHEMA, review_problems
+from .store import runs as run_store
 from .util import git
 
 EVALS = ".agents/evals"
@@ -542,7 +543,7 @@ def run_task(cfg: config.Config, src: Source, task: Task, prompts: Prompts, run:
                 session, summary = res.session, res.text
                 ok, report = run.gate(layer, wt, task, timeout)
         except workspace.RunFailed:
-            result.repairs = sum(state.step_tries(run.id, f"fix{n}") > 0 for n in range(2, attempts + 1))
+            result.repairs = sum(run_store.step_tries(run.id, f"fix{n}") > 0 for n in range(2, attempts + 1))
             raise
         result.repairs = attempts - 1
         result.checks = "pass" if ok else "fail"
@@ -609,7 +610,7 @@ def run(repo_name: str, task: str = "", ref: str = "", dry_run: bool = False, pr
             print(f"{t.name}: base {t.base or 'default branch'}, graded by {t.graded_by}, "
                   f"{len(t.hidden_files)} hidden files")
         return 0
-    with util.lock(state.run_lock("eval", repo.name)) as got:
+    with util.lock(run_store.run_lock("eval", repo.name)) as got:
         if not got:
             print(f"evals already running for {repo.name}")
             return 0
@@ -622,16 +623,16 @@ def run_suite(cfg: config.Config, repo: config.Repo, src: Source, tasks: list[Ta
     label = prompts.applied_to(src.label)
     engine = codebase.load()
     lineage = {"engine_sha": engine, "prompts_sha": prompts_digest(prompts), "prompts_from": prompts_from(prompts)}
-    run_id = record.start("eval", tag=tag, lock=state.run_lock("eval", repo.name), repo=repo.name)
+    run_id = record.start("eval", tag=tag, lock=run_store.run_lock("eval", repo.name), repo=repo.name)
     results = []
     with record.failed_on_crash(run_id):
         for t in tasks:
             prior = state.task_history(repo.name, t.name, 3)
-            after_step = state.last_step_id(run_id)
+            after_step = run_store.last_step_id(run_id)
             r = run_task(cfg, src, t, prompts, EvalRun(id=run_id, repo=repo, dir=paths.RUNS_DIR / run_id / t.name,
                                                        task=t.name))
             current = {**lineage, "base_commit": r.base_commit, "context_sha": r.context_sha,
-                       "settings": r.settings, "after_step": after_step, "last_step": state.last_step_id(run_id)}
+                       "settings": r.settings, "after_step": after_step, "last_step": run_store.last_step_id(run_id)}
             state.add_eval(run_id, repo.name, t.name, r.passed, r.seconds, r.cost, label, current)
             r.regressed = len(prior) == 3 and all(p["passed"] for p in prior) and not r.passed
             if r.regressed:
@@ -743,7 +744,7 @@ def compare_prompts(cfg: config.Config, arete: config.Repo, branch: str) -> str:
             continue
         if not tasks:
             continue
-        with util.lock(state.run_lock("eval", repo.name)) as got:
+        with util.lock(run_store.run_lock("eval", repo.name)) as got:
             if not got:
                 skipped.append((repo, "its evals were already running"))
                 continue

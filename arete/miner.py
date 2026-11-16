@@ -28,6 +28,7 @@ from . import (
 )
 from .agent import EDIT_TOOLS, READ_TOOLS
 from .heartbeat import mark_loop
+from .store import runs as run_store
 from .util import git
 
 MAX_PROPOSALS = 8
@@ -688,13 +689,13 @@ def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[d
 def run(hours: float | None = None, dry_run: bool = False, apply: bool = True) -> int:
     paths.ensure_dirs()
     cfg = config.load()
-    with util.lock(state.run_lock("miner")) as got:
+    with util.lock(run_store.run_lock("miner")) as got:
         if not got:
             print("miner already running")
             return 0
         since, until, checkpointed, lost = window(cfg, hours, util.now())
         run_id = (record.new_id("min") if dry_run else
-                  record.start("miner", lock=state.run_lock("miner"), trigger=WINDOW_TRIGGER if checkpointed else HOURS_TRIGGER))
+                  record.start("miner", lock=run_store.run_lock("miner"), trigger=WINDOW_TRIGGER if checkpointed else HOURS_TRIGGER))
         try:
             code = _run(cfg, run_id, since, until, checkpointed and not dry_run, lost, dry_run, apply)
             if not dry_run:
@@ -716,7 +717,7 @@ def window(cfg: config.Config, hours: float | None, now: datetime) -> tuple[date
     until = now - SETTLE_LAG
     if marked := state.mined_until():
         since = util.parse_iso(marked)
-    elif legacy := [r for r in state.runs(kind="miner", statuses=("pr", "noop"), limit=50)
+    elif legacy := [r for r in run_store.runs(kind="miner", statuses=("pr", "noop"), limit=50)
                     if r["trigger"] not in (WINDOW_TRIGGER, HOURS_TRIGGER)]:
         since = util.parse_iso(legacy[0]["started"])
     else:

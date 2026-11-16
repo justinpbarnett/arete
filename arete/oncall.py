@@ -30,6 +30,7 @@ from . import (
 )
 from .sighting import Sighting
 from .store import db as foundation
+from .store import runs as run_store
 
 UNEXPECTED, HEARTBEAT, STALLED, ORCHESTRATION, EXPECTED = "unexpected", "heartbeat", "stalled", "orchestration", "expected"
 WAKE, IGNORE, UNSURE = "wake", "ignore", "unsure"
@@ -153,12 +154,12 @@ def own_step(row: dict) -> bool:
 def other_live_run(run_id, found: dict) -> dict | None:
     if not (found.get("repo") and found.get("issue")):
         return None
-    other = state.running_run(found["repo"], found["issue"])
+    other = run_store.running_run(found["repo"], found["issue"])
     return other if other and other["id"] != run_id else None
 
 
 def ticket_has_live_run(row: dict) -> bool:
-    return bool(other_live_run(row["run"], state.run_get(str(row["run"])) or {}))
+    return bool(other_live_run(row["run"], run_store.run_get(str(row["run"])) or {}))
 
 
 def classify(text: str, row: dict | None) -> str:
@@ -422,7 +423,7 @@ def owner_run(row: dict) -> str:
         (str(r["run"]) for r in map(run_line, str(row.get("evidence") or "").splitlines()) if r), "")
     if not run_id:
         return ""
-    found = state.run_get(run_id) or {}
+    found = run_store.run_get(run_id) or {}
     if found.get("status") == "running" and not process_gone(found):
         return run_id
     other = other_live_run(run_id, found)
@@ -487,7 +488,7 @@ def origin_repo(source: str, repo: str) -> str:
     if repo:
         return repo
     run_id = run_lines.run_of_path(Path(source)) or (source.removeprefix("run ") if source.startswith("run ") else "")
-    return ((state.run_get(run_id) or {}).get("repo") or "") if run_id else ""
+    return ((run_store.run_get(run_id) or {}).get("repo") or "") if run_id else ""
 
 
 def refused(cfg: config.Config, repo: str) -> str:
@@ -629,7 +630,7 @@ class Watch:
         if not self.owned:
             return 0
         if run_id not in self.runs:
-            self.runs[run_id] = state.run_get(run_id) or {}
+            self.runs[run_id] = run_store.run_get(run_id) or {}
         found = self.runs[run_id]
         return self.owned.get((found.get("repo"), found.get("issue")), 0)
 
@@ -677,7 +678,7 @@ class Watch:
             window = [r for r in near if same_owner(r, row)]
             repo, scope = origin.repo, policy_scope
             if row and not repo:
-                repo = (state.run_get(str(row["run"])) or {}).get("repo") or ""
+                repo = (run_store.run_get(str(row["run"])) or {}).get("repo") or ""
                 if repo:
                     scope = f"{policy_scope}:{repo}"
             self.add(classify(text, row), scope, text, name, repo, window, rule=rule, legacy=origin.scope)
@@ -702,8 +703,8 @@ class Watch:
         self.cursors.append((PREFIX + name, value, True, detail))
 
     def run_files(self, since: str | None) -> list[str]:
-        ids = [r["id"] for r in state.runs_marked_running()]
-        ids += [r["id"] for r in state.runs_since(since)] if since else []
+        ids = [r["id"] for r in run_store.runs_marked_running()]
+        ids += [r["id"] for r in run_store.runs_since(since)] if since else []
         return [str(run_lines.path(run_id)) for run_id in dict.fromkeys(ids)]
 
     def heartbeat(self) -> None:
@@ -737,7 +738,7 @@ class Watch:
         _, flagged = cursor_value(PREFIX + "stalls")
         flagged = flagged or []
         stalled = []
-        for row in state.runs_marked_running():
+        for row in run_store.runs_marked_running():
             if (util.now() - util.parse_iso(row["started"])).total_seconds() <= record.SETTLE_GRACE_SECONDS:
                 continue
             rows, texts = tail_of(run_lines.path(row["id"]))
@@ -857,7 +858,7 @@ def reread(cfg: config.Config, policies: Policies, row: dict) -> tuple[bool, str
             return False, f"heartbeat read of {beat['ts']} has no result for the check"
         return all(c.get("ok") for c in mine), f"heartbeat read of {beat['ts']}"
     if row["class"] == STALLED:
-        found = state.run_get(row["source"].removeprefix("run ")) or {}
+        found = run_store.run_get(row["source"].removeprefix("run ")) or {}
         gone = found.get("status") != "running" or not (process_gone(found) or silent(tail_of(run_lines.path(found["id"]))[0]))
         return gone, f"run {found.get('id', '-')} {found.get('status', 'is unknown')}"
     if row["source"] == "serve":
@@ -897,12 +898,12 @@ def cooling(cfg: config.Config, row: dict) -> str:
 
 
 def spent(cfg: config.Config, repairs: list[dict]) -> float:
-    ids = [r["id"] for x in repairs if x["task"] for r in state.ticket_runs(x["repo"], x["task"], limit=50)]
-    return sum(state.paid_by_run(ids, local_providers=cfg.local_providers).values())
+    ids = [r["id"] for x in repairs if x["task"] for r in run_store.ticket_runs(x["repo"], x["task"], limit=50)]
+    return sum(run_store.paid_by_run(ids, local_providers=cfg.local_providers).values())
 
 
 def last_run_id(repair: dict) -> str:
-    return next((r["id"] for r in state.ticket_runs(repair["repo"], repair["task"], limit=1)), "-")
+    return next((r["id"] for r in run_store.ticket_runs(repair["repo"], repair["task"], limit=1)), "-")
 
 
 def repair_line(row: dict) -> str:
@@ -976,7 +977,7 @@ def day_spent(cfg: config.Config, repairs: list[dict] | None = None) -> str:
 def interrupted_run(repair: dict) -> dict | None:
     if not repair["task"]:
         return None
-    run = state.newest_whole_run(repair["repo"], repair["task"])
+    run = run_store.newest_whole_run(repair["repo"], repair["task"])
     return run if run and run["status"] == "interrupted" else None
 
 
@@ -1114,7 +1115,7 @@ def held_for_owner(cfg: config.Config, repair: dict, run_id: str) -> bool:
 
 
 def track_repair(cfg: config.Config, row: dict, repair: dict) -> bool:
-    run = state.newest_whole_run(repair["repo"], repair["task"])
+    run = run_store.newest_whole_run(repair["repo"], repair["task"])
     if run is None:
         return resume(cfg, row, repair, "the repair task has no run yet")
     status = run["status"]
@@ -1173,7 +1174,7 @@ def cancel(incident_id: int) -> dict:
         repair = live_repair(steered(incident_id))
         if repair is None:
             raise control.Refused(f"incident {incident_id} has no repair running")
-        run = state.running_run(repair["repo"], repair["task"]) if repair["task"] else None
+        run = run_store.running_run(repair["repo"], repair["task"]) if repair["task"] else None
         if run:
             stop_run(run["id"])
         if repair["task"]:

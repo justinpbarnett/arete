@@ -45,6 +45,7 @@ from . import (
 )
 from .refusals import Stated as Refusal
 from .store import db as foundation
+from .store import runs as run_store
 
 WEB_DIR = paths.PACKAGE_DIR / "web"
 WEB_TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8",
@@ -405,7 +406,7 @@ class Handler(BaseHTTPRequestHandler):
     def send_events(self, run_id: str, query: dict) -> None:
         if not RUN_ID.fullmatch(run_id):
             raise board.NotARunId(f"'{run_id}' is not a run id.")
-        if not run_lines.path(run_id).exists() and not state.run_get(run_id, connect=foundation.reader):
+        if not run_lines.path(run_id).exists() and not run_store.run_get(run_id, connect=foundation.reader):
             raise control.NotFound(f"nothing has the id {run_id}")
         start = whole_number(query.get("from", "0"))
         if query.get("follow") != "1":
@@ -478,7 +479,7 @@ def run_ended(run_id: str) -> Callable[[], bool]:
 
     def ended() -> bool:
         nonlocal quiet_since
-        row = state.run_get(run_id, connect=foundation.reader) or {}
+        row = run_store.run_get(run_id, connect=foundation.reader) or {}
         if row.get("status") == "running":
             with record.dead(row) as run_is_dead:
                 if not run_is_dead:
@@ -899,6 +900,8 @@ ROUTES = (
 def serve(port: int | None = None, inside_serve: bool = False, host: tailnet.Tailscale | None = None) -> NoReturn:
     cfg = config.load_or_problem()[0]
     port = port or cfg.dashboard_port
+    if not inside_serve and not paths.DB_FILE.exists():
+        foundation.migrate()
     foundation.ensure_schema()
     chat.recover()
     if inside_serve:

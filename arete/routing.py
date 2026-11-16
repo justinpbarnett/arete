@@ -11,6 +11,7 @@ from datetime import UTC, timedelta
 from . import accounts, claude, codex, config, devices, environment, paths, pi, prices, sandbox, scrub, state, util
 from .agent import REPLAY, TRAITS, model_scope, traits_of
 from .store import db as foundation
+from .store import runs as run_store
 
 RUNNERS = tuple(TRAITS)
 CODEX_NAMES = ("gpt-", "codex-")
@@ -904,5 +905,5 @@ def described_selection(selection: Selection, settings, request_tokens: int) -> 
 def loop_budget_left(cfg: config.Config) -> float | None:
     if not cfg.daily_budget_usd:
         return None
-    return cfg.daily_budget_usd - state.loop_spent_since(util.iso(util.now() - timedelta(days=1)), None,
+    return cfg.daily_budget_usd - run_store.loop_spent_since(util.iso(util.now() - timedelta(days=1)), None,
                                                          cfg.local_providers)

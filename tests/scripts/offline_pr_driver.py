@@ -2,6 +2,7 @@ import json, os, runpy, signal, subprocess, sys, threading, time, urllib.request
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from arete.store import runs as run_store
 from arete import accounts, agent, owner_asks, config, control, factory, gh, run_lines, paths, pipeline, record, replay, runlimits, sandbox, scratch, state, util, workspace, outcomes, prompt_loader
 root, scenario, role = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
 state.migrate()
@@ -74,22 +75,22 @@ def run_ticket(*extra):
         factory.main(feature, ["replay-sample", task, "--force", *extra])
     except SystemExit:
         pass
-    return state.ticket_runs("replay-sample", task, whole=True)[0]
+    return run_store.ticket_runs("replay-sample", task, whole=True)[0]
 def killed_run():
     subprocess.run([sys.executable, "-I", str(root / "driver.py"), str(root), scenario, "kill", task],
                    env=os.environ, cwd=root, start_new_session=True, timeout=100)
     pipeline.settle_abandoned_runs(cfg)
-    return state.ticket_runs("replay-sample", task, whole=True)[0]
+    return run_store.ticket_runs("replay-sample", task, whole=True)[0]
 since = util.iso(util.now() - timedelta(days=30))
 def snapshot(row):
-    row = state.run_get(row["id"])
+    row = run_store.run_get(row["id"])
     read = run_lines.read(row["id"])
     reports = [e for e in read if e.get("event") == "report"]
     routes = [e for e in read if e.get("event") == "route"]
     return {"id": row["id"], "status": row["status"], "summary": row["summary"], "pr_url": row["pr_url"],
             "report_prs": reports[-1]["prs"] if reports else None,
-            "reading": row["id"] in [r["id"] for r in state.runs_reading_pr_comments(since)],
-            "open": row["id"] in [r["id"] for r in state.open_runs("replay-sample", task)],
+            "reading": row["id"] in [r["id"] for r in run_store.runs_reading_pr_comments(since)],
+            "open": row["id"] in [r["id"] for r in run_store.open_runs("replay-sample", task)],
             "skipped": routes[-1].get("skipped") if routes else None,
             "started_steps": [e["step"] for e in read if e.get("event") == "step_start"]}
 snaps = []
@@ -131,9 +132,9 @@ elif scenario == "repair-stop":
     pipeline.git(["push", "-q", "origin", f"HEAD:refs/heads/{branch}"], root / "sample/repo")
     (root / "found").write_text("")
     take(run_ticket())
-    extra["open_before"] = [r["id"] for r in state.open_runs("replay-sample", task)]
+    extra["open_before"] = [r["id"] for r in run_store.open_runs("replay-sample", task)]
     extra["older"] = older
-    extra["older_before"] = state.run_get(older)["status"]
+    extra["older_before"] = run_store.run_get(older)["status"]
 elif scenario == "answer-stop":
     first = take(run_ticket())
     for ask in state.asks_of(first["id"], "open"):
@@ -149,7 +150,7 @@ else:
 if scenario in ("stop", "repair-stop"):
     (root / "merged").write_text("")
     outcomes.sync_outcomes(cfg)
-    extra["after_merge"] = {r["id"]: state.run_get(r["id"])["status"] for r in state.runs(kind="pipeline", limit=10)}
+    extra["after_merge"] = {r["id"]: run_store.run_get(r["id"])["status"] for r in run_store.runs(kind="pipeline", limit=10)}
     extra["streak"] = outcomes.streak("replay-sample")
 if scenario == "stopped-feedback":
     comment = {"pr_url": URL, "kind": "comment", "gh_id": 11, "repo": "replay-sample", "issue": task,

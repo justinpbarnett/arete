@@ -11,6 +11,7 @@ from .emits import Emit, PullRequest, Ticket, ToLoop
 from .loops import Loop
 from .push import Push
 from .store import db as foundation
+from .store import runs as run_store
 
 CLAIM_SECONDS = 120
 RETRIED = ("screen", "proof")
@@ -209,7 +210,7 @@ def decide(approval_id: int, yes: bool, by: str = "", came_from: tuple[str, ...]
 
     def log(kind: str, text: str) -> None:
         if row["run_id"]:
-            state.add_feed(row["run_id"], kind, f"{verb} #{approval_id}{by and f' by {by}'}, {text}")
+            run_store.add_feed(row["run_id"], kind, f"{verb} #{approval_id}{by and f' by {by}'}, {text}")
 
     if not yes:
         if not state.settle_approval(approval_id, "rejected", "rejected", judged=emit.judged, came_from=came_from):

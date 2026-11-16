@@ -26,6 +26,7 @@ from . import (
 from .agent import billing_of
 from .loops import Loop
 from .store import db as foundation
+from .store import runs as run_store
 
 AB_DAYS = 30
 AB_MIN_TICKETS = 20
@@ -62,10 +63,10 @@ class KeptFailure(Refused):
 
 
 def session_report(run_id: str, connect=foundation.reader) -> dict:
-    row = state.run_get(run_id, connect)
+    row = run_store.run_get(run_id, connect)
     if not row or row["kind"] != "session":
         raise NotFound(f"no session {run_id}")
-    report = state.report(run_id, connect)
+    report = run_store.report(run_id, connect)
     if report is None:
         why = "it is still running" if row["status"] == "running" else f"it ended {row['status']} without one"
         raise Refused(f"session {run_id} has no report: {why}")
@@ -105,7 +106,7 @@ def working_loop(name: str, cfg: config.Config | None = None) -> Loop:
 
 
 def stop_run(run_id: str) -> dict:
-    r = state.run_get(run_id)
+    r = run_store.run_get(run_id)
     if not r:
         raise NotFound(f"no run {run_id}")
     if r["status"] != "running":
@@ -114,7 +115,7 @@ def stop_run(run_id: str) -> dict:
         if gone:
             if not (r := record.ask_stop(run_id)):
                 raise NotFound(f"no run {run_id}")
-            devices.release(run_id, lambda text: state.add_feed(run_id, "device", text))
+            devices.release(run_id, lambda text: run_store.add_feed(run_id, "device", text))
             if r["kind"] in record.TICKET_KINDS:
                 return {"id": run_id, "stopped": True, "was": "gone", "ticket": "told by the next pipeline poll"}
             record.interrupt(r, devices.left_up(run_id))
@@ -152,16 +153,16 @@ def loop_views(cfg: config.Config | None = None, connect=foundation.reader) -> l
     cfg = cfg or config.load_or_problem()[0]
     every_loop = loops.load_all(cfg)
     states = state.loop_states(connect)
-    running = {r["loop"]: r["id"] for r in state.runs_marked_running(connect) if r["kind"] == "loop"}
+    running = {r["loop"]: r["id"] for r in run_store.runs_marked_running(connect) if r["kind"] == "loop"}
     waiting = Counter(item["loop"] for item in state.pending(connect))
     dead = Counter(item["loop"] for item in state.dead_items(connect))
     spent: dict[str, float] = defaultdict(float)
-    for s in state.steps_since(day_ago(), connect):
+    for s in run_store.steps_since(day_ago(), connect):
         if billing_of(s, cfg.local_providers) == "api_key":
             spent[s.get("loop") or ""] += s["cost_usd"] or 0
     out = []
     for loop in every_loop:
-        last = next(iter(state.runs(kind="loop", loop=loop.name, limit=1, firings=True, connect=connect)), None)
+        last = next(iter(run_store.runs(kind="loop", loop=loop.name, limit=1, firings=True, connect=connect)), None)
         st = states.get(loop.name) or {}
         out.append({**loop.view(), "running": running.get(loop.name, ""), "pending": waiting[loop.name],
                     "dead": dead[loop.name],
@@ -177,8 +178,8 @@ def loop_detail(name: str, connect=foundation.reader) -> dict:
     loop = find_loop(name, cfg)
     view = next(v for v in loop_views(cfg, connect) if v["name"] == loop.name)
     source_ids = {sources.source_id(loop, i) for i in range(len(loop.sources))}
-    runs = state.runs(kind="loop", loop=loop.name, limit=25, firings=True, connect=connect)
-    paid = state.paid_by_run([r["id"] for r in runs], connect)
+    runs = run_store.runs(kind="loop", loop=loop.name, limit=25, firings=True, connect=connect)
+    paid = run_store.paid_by_run([r["id"] for r in runs], connect)
     return {**view, "prompt": loops.prompt_text(loop), "state": state.loop_state(loop.name, connect)["data"],
             "runs": [{**r, "paid": paid.get(r["id"], 0)} for r in runs],
             "findings": state.findings(loop.name, 40, connect),
@@ -200,8 +201,8 @@ def switch(name: str, enabled: bool) -> dict:
 def feed(run_id: str, after: int = 0) -> dict:
     with foundation.one_read() as conn:
         epoch = int(conn.execute("SELECT value FROM schema_meta WHERE key = 'restore_epoch'").fetchone()[0])
-        lines = state.feed(run_id, after, connect=foundation.reader)
-        run_read_after_its_lines = state.run_get(run_id, connect=foundation.reader)
+        lines = run_store.feed(run_id, after, connect=foundation.reader)
+        run_read_after_its_lines = run_store.run_get(run_id, connect=foundation.reader)
     if not run_read_after_its_lines:
         raise NotFound(f"no run {run_id}")
     return {"run": run_read_after_its_lines, "lines": lines, "restore_epoch": epoch}
@@ -259,7 +260,7 @@ def step_costs(by: str, days: float | None = None, connect=foundation.reader, cf
     cfg = cfg or config.load_or_problem()[0]
     groups: dict[str, dict] = {}
     paid = subscribed = 0.0
-    for s in state.steps_since(since, connect):
+    for s in run_store.steps_since(since, connect):
         route = route_of(s, cfg)
         name = route["name"] if by == "route" else s[STEP_FIELD_OF[by]] or f"no {by}"
         row = groups.setdefault(name, {"by": by, "name": name, "runs": set(), "calls": 0, "cost_usd": 0.0,
@@ -286,7 +287,7 @@ def step_costs(by: str, days: float | None = None, connect=foundation.reader, cf
             "subscription_usd": round(r["subscription_usd"], 4), "minutes": round(r["minutes"], 2),
             "api_minutes": round(r["api_minutes"], 2)} for r in groups.values()]
     waits = dict.fromkeys(run_lines.WAIT_CAUSES, 0.0)
-    for r in state.runs_since(since, connect):
+    for r in run_store.runs_since(since, connect):
         try:
             recorded = json.loads(r.get("wait_minutes") or "{}")
         except ValueError:
@@ -319,7 +320,7 @@ def rate_difference(arm: tuple[int, int], base: tuple[int, int]) -> tuple[float,
 
 
 def ab_side(tickets: set, steps_by_run: dict[str, list[dict]], since: str, connect, cfg: config.Config) -> dict:
-    runs = [r for repo, issue in tickets for r in state.ticket_runs_since(repo, issue, since, connect)]
+    runs = [r for repo, issue in tickets for r in run_store.ticket_runs_since(repo, issue, since, connect)]
     merged = {(r["repo"], r["issue"]) for r in runs if r["status"] == "merged"}
     rows = [(r["id"], s) for r in runs for s in steps_by_run.get(r["id"], ())]
     cost = {"api_key": 0.0, "subscription": 0.0}
@@ -346,12 +347,12 @@ def ab_report(name: str = "", days: float | None = None, connect=foundation.read
     days, since = cost_window(AB_DAYS if days is None else days)
     cfg = cfg or config.load_or_problem()[0]
     placed: dict[str, dict] = {}
-    for p in state.ab_placements(since, name, connect):
+    for p in run_store.ab_placements(since, name, connect):
         test = placed.setdefault(p["ab"], {"step": p["atom"], "arm": set(), "baseline": set()})
         if p["ab_side"] in ("arm", "baseline"):
             test[p["ab_side"]].add((p["repo"], p["issue"]))
     steps_by_run: dict[str, list[dict]] = defaultdict(list)
-    for s in state.steps_since(since, connect):
+    for s in run_store.steps_since(since, connect):
         steps_by_run[s["run_id"]].append(s)
     report = []
     for ab, test in sorted(placed.items()):
@@ -367,7 +368,7 @@ def paid_since(since: str, connect=foundation.reader, cfg: config.Config | None 
     groups: dict[str, dict[str, dict]] = {"model": {}, "runner": {}, "loop": {}, "day": {}}
     total = 0.0
     cfg = cfg or config.load_or_problem()[0]
-    for s in state.steps_since(since, connect):
+    for s in run_store.steps_since(since, connect):
         if billing_of(s, cfg.local_providers) != "api_key":
             continue
         cost = s["cost_usd"] or 0

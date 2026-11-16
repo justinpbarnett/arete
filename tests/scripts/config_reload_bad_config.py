@@ -1,3 +1,4 @@
+from arete.store import runs as run_store
 
 import subprocess
 mode = {"config": 1}
@@ -28,7 +29,7 @@ with mock.patch.object(serve, "code_stamp", lambda: changed), mock.patch.object(
     server.load_new_code()
     beat = util.read_json(control.BEAT_FILE, {})
     refused = {"execs": len(execs), "said": len([s for s in said if "new code cannot read config.toml" in s]),
-               "beat": beat.get("code_problem", ""), "running": state.runs_marked_running()}
+               "beat": beat.get("code_problem", ""), "running": run_store.runs_marked_running()}
     mode["config"] = 0
     server.load_new_code()
     passed = {"execs": len(execs), "problem": server.code_problem}

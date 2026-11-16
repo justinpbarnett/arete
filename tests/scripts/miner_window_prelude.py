@@ -1,3 +1,4 @@
+from arete.store import runs as run_store
 
 import dataclasses, os, re
 from datetime import UTC, datetime
@@ -41,7 +42,7 @@ def mine(h, hours=None, dry_run=False, apply=False):
     text = out.getvalue()
     found = re.search(r"miner ([^\s:]+): \d+ sessions", text)
     prompt = (paths.RUNS_DIR / found.group(1) / "prompt.md").read_text() if found else ""
-    row = {} if dry_run else next(iter(state.runs(kind="miner", limit=1)), {})
+    row = {} if dry_run else next(iter(run_store.runs(kind="miner", limit=1)), {})
     return {"code": code, "out": text, "prompt": prompt, "status": row.get("status"),
             "mined_until": row.get("mined_until"), "summary": row.get("summary"),
             "heard": sorted(re.findall(r"\[tag:([^\]]+)\]", prompt)),

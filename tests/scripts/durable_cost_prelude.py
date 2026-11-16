@@ -2,6 +2,7 @@
 import contextlib, gzip, io, json, os, sqlite3, sys
 from pathlib import Path
 from unittest import mock
+from arete.store import runs as run_store
 from arete import accounts, agent, claude, cli, codex, config, devices, gh, heartbeat, paths, pi, record, runner, scrub, state, util
 state.migrate()
 root, mode = Path(sys.argv[1]), sys.argv[2]

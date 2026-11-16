@@ -41,7 +41,9 @@ def scenario(name):
 class Rig:
     def __init__(self, oncall=False, real_launch=False, build=True):
         from unittest import mock
+        from arete.store import runs as run_store
         from arete import config, loop_run, explain, loops, paths, routing, state, tasks, util, webpush, alerts
+        self.run_store = run_store
         self.mock, self.state, self.util, self.loops, self.paths, self.config = mock, state, util, loops, paths, config
         self.wipe()
         paths.ensure_dirs()
@@ -182,7 +184,7 @@ class Rig:
                 "approvals": {i: {"status": a["status"], "plain_summary": a.get("plain_summary")} for i in range(1, 6) if (a := state.approval(i))},
                 "housekeeping": {"ask_expiry_passes": self.asks, "passes": len(self.beats)},
                 "alerts": self.alert_calls, "readers": self.readers(), "log": self.log_lines(),
-                "runs": [{"id": r["id"], "loop": r.get("loop"), "status": r.get("status")} for r in state.runs(limit=50, firings=True)]}
+                "runs": [{"id": r["id"], "loop": r.get("loop"), "status": r.get("status")} for r in self.run_store.runs(limit=50, firings=True)]}
 
 
 rig = None
@@ -430,11 +432,12 @@ def states(passes):
 
 @scenario("beat")
 def beat_scenario(passes):
+    from arete.store import runs as run_store
     from arete import control, util
     r = fresh()
     with r.mock.patch.object(r.state, "pending", r.mock.Mock(side_effect=OSError("busy"))):
         first = r.step(due=False)
-    with r.mock.patch.object(r.state, "runs_marked_running", r.mock.Mock(side_effect=OSError("busy"))):
+    with r.mock.patch.object(run_store, "runs_marked_running", r.mock.Mock(side_effect=OSError("busy"))):
         second = r.step(due=False)
     real = util.write_json
 
@@ -529,9 +532,9 @@ def command(passes):
     for _ in range(passes):
         r.step(due=False)
     deadline = time.time() + 60
-    while time.time() < deadline and not [x for x in r.state.runs(loop="real", firings=True) if x["status"] not in ("running", "starting")]:
+    while time.time() < deadline and not [x for x in r.run_store.runs(loop="real", firings=True) if x["status"] not in ("running", "starting")]:
         time.sleep(0.5)
-    runs = [{"id": x["id"], "status": x["status"]} for x in r.state.runs(loop="real", firings=True)]
+    runs = [{"id": x["id"], "status": x["status"]} for x in r.run_store.runs(loop="real", firings=True)]
     return {"runs": runs, "queue_left": len(r.state.pending()), "failing": failing_of(r.beats[-1])}
 
 

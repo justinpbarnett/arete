@@ -3,6 +3,7 @@ from concurrent.futures import wait
 from datetime import timedelta
 from pathlib import Path
 from unittest import mock
+from arete.store import runs as run_store
 from arete import alerts, board, cli, config, control, loop_run, explain, heartbeat, loops, oncall, paths, routing, serve, state, tasks, util, webpush
 
 root, mode = Path(sys.argv[1]), sys.argv[2]
@@ -343,7 +344,7 @@ elif mode == "extras":
 elif mode == "beat":
     with mock.patch.object(state, "pending", mock.Mock(side_effect=OSError("busy"))):
         first = run(server, due=False)
-    with mock.patch.object(state, "runs_marked_running", mock.Mock(side_effect=OSError("busy"))):
+    with mock.patch.object(run_store, "runs_marked_running", mock.Mock(side_effect=OSError("busy"))):
         second = run(server, due=False)
     real = util.write_json
 

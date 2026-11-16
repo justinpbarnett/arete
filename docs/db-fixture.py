@@ -922,6 +922,7 @@ def cli_output(*args):
 
 
 def wal_startup():
+    from arete.store import runs as run_store
     from arete import paths, state, util
 
     paths.ensure_dirs()
@@ -947,7 +948,7 @@ def wal_startup():
             require(found["journal_mode"] == "wal" and found["synchronous"] == 1, found)
             require(found["epoch"] == 0 and found["version"] == foundation.LATEST, found)
             if legacy:
-                require(state.run_get("seed", connect=foundation.reader), "legacy row lost")
+                require(run_store.run_get("seed", connect=foundation.reader), "legacy row lost")
             evidence["cases"].append({"legacy": legacy, **found})
         finally:
             stop_child(process)
@@ -957,7 +958,7 @@ def wal_startup():
         before = reader.execute("SELECT count(*) FROM feed").fetchone()[0]
         began = time.monotonic()
         with ThreadPoolExecutor(1) as pool:
-            pool.submit(state.add_feed, "seed", "note", "outside-reader").result(timeout=1)
+            pool.submit(run_store.add_feed, "seed", "note", "outside-reader").result(timeout=1)
         elapsed = time.monotonic() - began
         require(reader.execute("SELECT count(*) FROM feed").fetchone()[0] == before, "reader snapshot changed")
     finally:
@@ -1028,6 +1029,7 @@ def close_server(server):
 
 
 def prune_restore():
+    from arete.store import runs as run_store
     from arete import backup, paths, state, util
 
     evidence = setup()
@@ -1037,7 +1039,7 @@ def prune_restore():
                                     ("pipeline", "pipeline", 0, old), ("recent", "loop", 0, util.iso())):
             conn.execute("INSERT INTO runs(id,kind,loop_kind,status,started,cost_usd) VALUES (?,?,'command','done',?,?)",
                          (rid, kind, at, cost))
-            state.add_feed(rid, "note", rid)
+            run_store.add_feed(rid, "note", rid)
     baseline_snapshot = backup.snapshot("pre-prune")
     server = fixture_server()
     try:
@@ -1046,8 +1048,8 @@ def prune_restore():
             server.prune()
         require(backup.inspect(paths.DB_FILE)["counts"] == before, "failed snapshot pruned")
         server.prune()
-        require(state.run_get("paid") and state.run_get("pipeline") and state.run_get("recent"), "eligibility changed")
-        with mock.patch.object(state, "FIRINGS", "(1 = 1)"):
+        require(run_store.run_get("paid") and run_store.run_get("pipeline") and run_store.run_get("recent"), "eligibility changed")
+        with mock.patch.object(run_store, "FIRINGS", "(1 = 1)"):
             server.prune()
         snapshot = baseline_snapshot
         require(backup.inspect(snapshot)["quick_check"] == "ok", "unchecked snapshot")
@@ -1055,7 +1057,7 @@ def prune_restore():
         rc, output = cli_output("backup", "--check")
         require(rc == 0 and "runs" in output and "feed" in output, output)
         for i in range(20):
-            state.add_feed("later", "note", str(i))
+            run_store.add_feed("later", "note", str(i))
         previous = db_values()
         snapshot_identity = "f" * 32
         with sqlite3.connect(snapshot) as conn:
@@ -1102,6 +1104,7 @@ def retention_policy():
 
 
 def consistent_counts():
+    from arete.store import runs as run_store
     from arete import backup, paths, state, util
 
     daemon, _ = start_fixture_serve()
@@ -1114,7 +1117,7 @@ def consistent_counts():
         try:
             with foundation.tx() as conn:
                 conn.execute("INSERT INTO runs(id,kind,status,started) VALUES ('count-barrier','loop','done',?)", (util.iso(),))
-                state.add_feed("count-barrier", "note", "committed together")
+                run_store.add_feed("count-barrier", "note", "committed together")
         except BaseException as e:
             errors.append(str(e))
 
@@ -1142,12 +1145,13 @@ def consistent_counts():
 
 
 def restore_safety():
+    from arete.store import runs as run_store
     from arete import backup, control, paths, state, util
 
     evidence = setup()
     with foundation.tx() as conn:
         conn.execute("INSERT INTO runs(id,kind,status,started) VALUES ('safety','loop','done',?)", (util.iso(),))
-        state.add_feed("safety", "note", "snapshot")
+        run_store.add_feed("safety", "note", "snapshot")
     snapshot = backup.snapshot("safety")
     hot = hot_journal_probe()
     refusals = {}
@@ -1250,12 +1254,12 @@ def restore_safety():
     conn.close()
     rc, output = cli_output("backup", "--restore", str(legacy))
     require(rc == 0 and "startup" in output and backup.pending_restore(), output)
-    expect(foundation.IncompatibleSchema, lambda: state.add_feed("legacy", "note", "blocked"))
+    expect(foundation.IncompatibleSchema, lambda: run_store.add_feed("legacy", "note", "blocked"))
     process, first = start_fixture_serve()
     stop_child(process)
     process, second = start_fixture_serve()
     stop_child(process)
-    require(first["epoch"] == second["epoch"] and state.run_get("legacy"), "pre-ledger completion repeated")
+    require(first["epoch"] == second["epoch"] and run_store.run_get("legacy"), "pre-ledger completion repeated")
     interruptions = interrupted_restores(snapshot)
     receipt = backup.receipt_epoch()
     paths.DB_FILE.write_bytes(b"unreadable after preledger recovery")
@@ -1361,6 +1365,7 @@ def http_feed_snapshot(run_id):
 
 
 def feed_cursors():
+    from arete.store import runs as run_store
     from arete import backup, control, paths, record, state, util
     from arete.commands import common
 
@@ -1372,7 +1377,7 @@ def feed_cursors():
 
     def writer(n):
         for i in range(300):
-            state.add_feed(rid, "note", f"{n}:{i}")
+            run_store.add_feed(rid, "note", f"{n}:{i}")
 
     def poller():
         after = 0
@@ -1407,8 +1412,8 @@ def feed_cursors():
     try:
         with mock.patch.object(foundation, "connect_db", side_effect=traced):
             with foundation.tx() as conn:
-                state.insert_feed(rid, "note", "rollback-insert")
-                state.add_feed(rid, "note", "rollback-add")
+                run_store.insert_feed(rid, "note", "rollback-insert")
+                run_store.add_feed(rid, "note", "rollback-add")
                 written = conn.execute("SELECT text, count(*) FROM feed WHERE run_id=? "
                                        "AND text IN ('rollback-insert','rollback-add') GROUP BY text ORDER BY text",
                                        (rid,)).fetchall()
@@ -1423,9 +1428,9 @@ def feed_cursors():
     require(statements[0] == "BEGIN IMMEDIATE" and statements[-1] == "ROLLBACK"
             and sum(s.startswith("INSERT INTO feed") for s in statements) == 2, trace)
     require(db_values()["feed"] == before["feed"], "feed entry point escaped transaction")
-    with mock.patch.object(state, "insert_feed", side_effect=ValueError("end line failure")):
+    with mock.patch.object(run_store, "insert_feed", side_effect=ValueError("end line failure")):
         expect(ValueError, lambda: record.settle(rid, "done", end_line="done"))
-    require(state.run_get(rid)["status"] == "running", "settlement escaped end line rollback")
+    require(run_store.run_get(rid)["status"] == "running", "settlement escaped end line rollback")
     http = http_feed_snapshot(rid)
     require(http["settlement_committed"], "HTTP snapshot did not overlap a committed settlement")
     with foundation.tx() as conn:
@@ -1443,7 +1448,7 @@ def feed_cursors():
             backup.restore(snapshot)
             with foundation.tx() as conn:
                 conn.execute("UPDATE runs SET status='done',pid=NULL WHERE id=?", (rid,))
-            state.add_feed(rid, "note", "first restored generation")
+            run_store.add_feed(rid, "note", "first restored generation")
         return real_feed(run, after)
 
     with mock.patch.object(control, "feed", side_effect=changing), \
@@ -1457,7 +1462,7 @@ def feed_cursors():
         backup.restore(snapshot)
         with foundation.tx() as conn:
             conn.execute("UPDATE runs SET status='done',pid=NULL WHERE id=?", (rid,))
-        state.add_feed(rid, "note", "first polling generation")
+        run_store.add_feed(rid, "note", "first polling generation")
 
     alive = iter((True, False))
     polled = []
@@ -1629,6 +1634,7 @@ def backup_health_cli():
 
 
 def page_seed():
+    from arete.store import runs as run_store
     from arete import paths, sessions, state, util
 
     now = util.iso()
@@ -1650,7 +1656,7 @@ def page_seed():
     chat_id = state.chat_add("")
     state.chat_say(chat_id, "user", "Read snapshots and billing")
     state.chat_link_session(chat_id, "session", 10)
-    state.save_report("session", {"summary": "Fixture report", "body": "A complete offline session report"})
+    run_store.save_report("session", {"summary": "Fixture report", "body": "A complete offline session report"})
     util.write_json(sessions.spec_file("session"), {"prompt": "Fixture session", "tools": [], "chat": chat_id})
     return {"runs": [*modes, "mixed", "session"], "chat": chat_id, "session": "session"}
 
@@ -1685,6 +1691,7 @@ def http_json(server, path, body=None, admitted=True):
 
 
 def coherent_reads():
+    from arete.store import runs as run_store
     from arete import board, chat, control, paths, sessions, state, tasks, util
     from arete.commands import costs
 
@@ -1694,7 +1701,7 @@ def coherent_reads():
     conn.execute("PRAGMA journal_mode=WAL")
     conn.close()
     connections, windows = [], []
-    connect, steps_since = foundation.connect_db, state.steps_since
+    connect, steps_since = foundation.connect_db, run_store.steps_since
 
     def tracked(*args, **kw):
         connections.append({"thread": threading.current_thread().name, "readonly": kw.get("readonly", False)})
@@ -1710,7 +1717,7 @@ def coherent_reads():
         require(len(connections) == 1 and connections[0]["readonly"], connections)
         return result
 
-    with mock.patch.object(foundation, "connect_db", tracked), mock.patch.object(state, "steps_since", steps):
+    with mock.patch.object(foundation, "connect_db", tracked), mock.patch.object(run_store, "steps_since", steps):
         evidence["snapshot"] = read_once(board.snapshot)
         evidence["run"] = read_once(lambda: board.run_board("mixed"))
         require(evidence["run"]["run"]["paid"] == sum(m["paid"] for m in evidence["run"]["models"]), "paid mismatch")
@@ -1755,7 +1762,7 @@ def coherent_reads():
     evidence["report_delivery"] = chat.session_report(seeded["chat"], "session")
 
     def concurrent_read(target, read_name, commit):
-        original = getattr(state, read_name)
+        original = getattr(run_store, read_name)
         reached, released = threading.Event(), threading.Event()
         once = False
 
@@ -1768,7 +1775,7 @@ def coherent_reads():
                 require(released.wait(10), "read barrier timed out")
             return answer
 
-        with ThreadPoolExecutor(1) as pool, mock.patch.object(state, read_name, paused):
+        with ThreadPoolExecutor(1) as pool, mock.patch.object(run_store, read_name, paused):
             future = pool.submit(target)
             try:
                 require(reached.wait(10), "read barrier not reached")
@@ -1798,7 +1805,7 @@ def coherent_reads():
         with foundation.one_read():
             return control.costs(connect=foundation.reader)
 
-    with mock.patch.object(state, "steps_since", steps):
+    with mock.patch.object(run_store, "steps_since", steps):
         report = concurrent_read(cost_report, "steps_since", add_step)
     require(windows[-1] == windows[-2], windows)
     require(round(report["total_usd"], 2) == round(sum(r["paid_usd"] for r in report["by_route"]), 2), report)
@@ -1812,6 +1819,7 @@ def coherent_reads():
 def event_contract():
     import hashlib
 
+    from arete.store import runs as run_store
     from arete import backup, config, control, loop_run, loops, paths, state, util
 
     paths.ensure_dirs()
@@ -2158,6 +2166,7 @@ def timed_writer():
 
 
 def child_main(role, args):
+    from arete.store import runs as run_store
     from arete import paths, state
 
     require(ROOT in paths.DB_FILE.resolve().parents, "child refuses production database")
@@ -2263,9 +2272,10 @@ def child_main(role, args):
         conn.execute("UPDATE feed SET text='uncommitted'")
         os._exit(0)
     elif role == "feed-http":
+        from arete.store import runs as run_store
         from arete import dashboard, record, tailnet
 
-        original = state.feed
+        original = run_store.feed
         once = False
 
         def paused_feed(*a, **kw):
@@ -2294,7 +2304,7 @@ def child_main(role, args):
             def whois(self, address):
                 return "fixture@example.com"
 
-        state.feed = paused_feed
+        run_store.feed = paused_feed
         dashboard.serve(port=int(args[0]), host=Host(), inside_serve=True)
     elif role == "interrupt-restore":
         from arete import backup, util

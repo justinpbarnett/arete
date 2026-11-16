@@ -3,6 +3,7 @@ import contextlib, io, json, os, signal, subprocess, sys, time
 from datetime import timedelta
 from pathlib import Path
 from unittest import mock
+from arete.store import runs as run_store
 from arete import cli, config, control, loop_run, loops, paths, record, sandbox, scratch, serve, state, util
 root, mode = Path(sys.argv[1]), sys.argv[2]
 sandbox.AUTHORITY = root / "authority-parent/verification-authority"
@@ -122,7 +123,7 @@ if mode == "outcomes":
         else:
             raise AssertionError("lost claim launched")
     assert not (root / "received").exists()
-    assert state.runs(kind="loop", loop="ok", firings=True)[0]["status"] == "skipped"
+    assert run_store.runs(kind="loop", loop="ok", firings=True)[0]["status"] == "skipped"
     item = enqueue("ok")
     with mock.patch.object(loop_run, "spent_limit", return_value="daily budget"):
         loop_run.launch("ok", item=item, detach=False)
@@ -230,7 +231,7 @@ elif mode == "never":
             pool.shutdown()
 elif mode == "race":
     state.ensure_schema()
-    code = "import sys,time; from pathlib import Path; from arete import state; "
+    code = "import sys,time; from pathlib import Path; from arete.store import runs as run_store; from arete import state; "
     code += "p=Path(sys.argv[1]); Path(sys.argv[2]).touch(); "
     code += "\nwhile not p.exists(): time.sleep(.001)\n"
     code += "print(state.enqueue('race','race','','every'))"

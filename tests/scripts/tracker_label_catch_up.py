@@ -1,6 +1,7 @@
 
 import json, os, subprocess, sys, time, urllib.request
 from pathlib import Path
+from arete.store import runs as run_store
 from arete import accounts, config, gh, paths, pipeline, record, replay, state, tracker, util, poll
 root, scenario = Path(sys.argv[1]), sys.argv[2]
 state.migrate()
@@ -32,12 +33,12 @@ def row(issue, status, pending, started="2026-01-01T00:00:00Z"):
         record.settle(run, status)
     return run
 def pending(run):
-    return state.run_get(run)["label_pending"]
+    return run_store.run_get(run)["label_pending"]
 result = {}
 if scenario == "catch-up":
     ISSUES[5] = {"agent", "agent:running"}
     run = row(5, "pr", "pr")
-    result["before"] = [state.pending_label(REPO, 5)]
+    result["before"] = [run_store.pending_label(REPO, 5)]
     pipeline.sync_labels(cfg)
     result |= {"labels": sorted(ISSUES[5]), "pending": pending(run), "edits": len(EDITS)}
     pipeline.sync_labels(cfg)
@@ -77,7 +78,7 @@ elif scenario == "latest-marker-governs":
     row(5, "failed", "failed", "2026-01-01T00:00:00Z")
     row(5, "pr", "", "2026-01-02T00:00:00Z")
     row(5, "pr", None, "2026-01-03T00:00:00Z")
-    result["pending"] = state.pending_label(REPO, 5)
+    result["pending"] = run_store.pending_label(REPO, 5)
     pipeline.sync_labels(cfg)
     result["edits"] = len(EDITS)
 elif scenario == "ties-and-unknown-repo":
@@ -87,7 +88,7 @@ elif scenario == "ties-and-unknown-repo":
     gone = record.start("pipeline", repo="gone", issue=9)
     record.note(gone, label_pending="pr")
     record.settle(gone, "pr")
-    result["pending"] = state.pending_label(REPO, 5)
+    result["pending"] = run_store.pending_label(REPO, 5)
     pipeline.sync_labels(cfg)
     result |= {"labels": sorted(ISSUES[5]), "edits": len(EDITS)}
 elif scenario == "local-task":
@@ -100,8 +101,8 @@ elif scenario == "held-lock":
     run = row(5, "pr", "pr")
     ready = root / "ready"
     holder = subprocess.Popen([sys.executable, "-I", "-c",
-        "import sys,time;from pathlib import Path;from arete import state, util\n"
-        "with util.lock(state.run_lock('pipeline', sys.argv[1], 5)):\n"
+        "import sys,time;from pathlib import Path;from arete.store import runs as run_store; from arete import state, util\n"
+        "with util.lock(run_store.run_lock('pipeline', sys.argv[1], 5)):\n"
         "    Path(sys.argv[2]).write_text('x')\n"
         "    sys.stdin.readline()", REPO, str(ready)], stdin=subprocess.PIPE, text=True)
     deadline = time.monotonic() + 30

@@ -11,6 +11,7 @@ from typing import Literal
 
 from . import alerts, config, doctor, paths, state, tool_events, tracker, util
 from .heartbeat import mark_loop
+from .store import runs as run_store
 
 AUDIT_DIR = paths.STATE_DIR / "audit"
 MAX_SKILL_LINES = 500
@@ -241,7 +242,7 @@ def check_events(cfg: config.Config, skill_names: list[str]) -> list[Finding]:
 
 def run_stats() -> list[str]:
     week_ago = util.iso(util.now() - timedelta(days=7))
-    rs = [r for r in state.runs(limit=500) if (r.get("started") or "") >= week_ago]
+    rs = [r for r in run_store.runs(limit=500) if (r.get("started") or "") >= week_ago]
     lines = []
     by = Counter((r["kind"], r["status"]) for r in rs)
     for kind in sorted({k for k, _ in by}):

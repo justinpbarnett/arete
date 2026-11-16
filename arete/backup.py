@@ -18,6 +18,7 @@ from pathlib import Path
 
 from . import config, paths, util
 from .store import db as foundation
+from .store import runs as run_store
 
 KEEP_NEWEST = 24
 KEEP_DAYS = 14
@@ -311,7 +312,7 @@ def probe_current() -> dict | None:
     try:
         with private_database(paths.DB_FILE) as conn:
             meta = metadata(conn)
-            runs = foundation.running_runs(conn)
+            runs = run_store.running_runs(conn)
             return {"sequences": sequences(conn), "meta": meta, "runs": runs}
     except (sqlite3.Error, OSError):
         return None

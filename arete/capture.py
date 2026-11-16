@@ -30,6 +30,7 @@ from . import (
     util,
 )
 from .store import db as foundation
+from .store import runs as run_store
 
 MB = 1024 * 1024
 MOST_IMAGE_BYTES = 5 * MB
@@ -258,10 +259,10 @@ def safe(value) -> str:
 
 
 def run_facts(run_id: str) -> dict:
-    run = state.run_get(run_id, connect=foundation.reader)
+    run = run_store.run_get(run_id, connect=foundation.reader)
     if not run:
         return {}
-    rows = state.steps(run_id, connect=foundation.reader)
+    rows = run_store.steps(run_id, connect=foundation.reader)
     facts = {key: run.get(key) for key in RUN_FACTS}
     facts["step"] = rows[-1]["step"] if rows else ""
     facts["error"] = next((r["error"] for r in reversed(rows) if r.get("error")), "")

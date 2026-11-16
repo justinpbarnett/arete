@@ -16,6 +16,7 @@ from .agent import READ_TOOLS
 from .heartbeat import mark_loop, network_up_or_skip
 from .refusals import TrackerFailed
 from .store import db as foundation
+from .store import runs as run_store
 
 ISSUE_TITLE = "[arete] triage"
 ISSUE_LABEL = "arete-triage"
@@ -724,7 +725,7 @@ def standing(r: dict) -> str:
 def sent(connect=foundation.db) -> list[dict]:
     out = []
     for a in state.triage_approvals(util.iso(util.now() - timedelta(days=SENT_DAYS)), connect):
-        runs = [r for r in state.ticket_runs(a["repo"], issue_id(a["tracker"], a["ref"]), limit=1, connect=connect)
+        runs = [r for r in run_store.ticket_runs(a["repo"], issue_id(a["tracker"], a["ref"]), limit=1, connect=connect)
                 if r["started"] >= a["ts"]]
         out.append({**a, "run": runs[0] if runs else None})
     return out

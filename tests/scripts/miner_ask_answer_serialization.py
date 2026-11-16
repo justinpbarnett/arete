@@ -1,13 +1,14 @@
 
 import threading
 from types import SimpleNamespace
+from arete.store import runs as run_store
 from arete import owner_asks, control, pipeline, tasks, poll
 repo = config.Repo("asking", root)
 cfg = config.Config(repos=[repo])
 rid = made("asking", "needs-info", repo=repo.name, issue="R-1")
 state.ask_add("ask", rid, repo.name, "R-1", "build", "call", "why", "tried",
               [{"kind": "text", "header": "Choice", "question": "Which?"}], {})
-row = state.run_get(rid)
+row = run_store.run_get(rid)
 fetched, threads, errors, launches = threading.Event(), [], [], []
 lock_requested, tracker_closes = threading.Event(), []
 original_lock, original_close = util.lock, state.ask_close

@@ -1,6 +1,7 @@
 
 import json, sys, time
 from pathlib import Path
+from arete.store import runs as run_store
 from arete import chat, config, paths, record, state
 
 root = Path(sys.argv[1])

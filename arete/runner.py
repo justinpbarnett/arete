@@ -50,6 +50,7 @@ from .agent import (
     subscription,
     traits_of,
 )
+from .store import runs as run_store
 
 SECRET_SEARCH_SKIPS = frozenset({".git", "node_modules", ".venv", "venv", "__pycache__"})
 SECRET_SEARCH_DEPTH = 4
@@ -194,7 +195,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
     target = devices.LOCAL if which == REPLAY else devices.resolve(device)
     trace = trace if trace[0] else (os.environ.get("ARETE_RUN_ID", ""), trace[1] or "agent")
     record_id = trace[0] or record.new_id("call")
-    try_no = try_no or (state.step_tries(trace[0], trace[1]) + 1 if trace[0] else 1)
+    try_no = try_no or (run_store.step_tries(trace[0], trace[1]) + 1 if trace[0] else 1)
     prior = route
     chosen_by = {"launch": 1, "selection": prior} if prior else None
     atom = settings.step if settings else ""

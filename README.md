@@ -756,11 +756,11 @@ Hook events rotate monthly from `events.jsonl` into `events-YYYYMM.jsonl`, named
 
 ### Schema
 
-`arete serve` owns schema changes. After taking the serve lock it runs the same migrator as `arete migrate`, before starting workers or the dashboard. An ordinary writer never creates the database or changes its schema. If it finds an older schema, it prints `schema 2 waits for schema 3; run arete serve or arete migrate` once, then waits up to 60 seconds for serve. A missing database names those commands; if a snapshot exists, it instead names the newest snapshot and `arete backup --restore FILE`. A deleted database stops serve.
+`arete serve` owns schema changes. After taking the serve lock it runs the same migrator as `arete migrate`, before starting workers or the dashboard. A standalone `arete dashboard` initializes a missing database with that migrator before opening its readers; an existing snapshot still requires restoration. An ordinary writer never creates the database or changes its schema. If it finds an older schema, it prints `schema 2 waits for schema 3; run arete serve or arete migrate` once, then waits up to 60 seconds for serve. A missing database names those commands; if a snapshot exists, it instead names the newest snapshot and `arete backup --restore FILE`. A deleted database stops serve.
 
 Each immutable migration lives in `arete/store/migrations/mNNNN_area_name.py`, with `PHASE` and exactly one `SQL` string or `apply(conn)`. Areas come from public store modules declaring literal `TABLES` dictionaries; `foundation` maps to `db`. Helpers and packages are not owners, and `outbox` is refused until its owner exists. Only the historical `m0004_work_event_routing.py` resolves `work` to `loops`; existing ledger rows stay unchanged. Numbers start at 1 without gaps or repeats. `latest.txt` names the highest file, so branches adding the same next number conflict there. The loader refuses a changed SHA-256 for any applied file. Add a new migration to repair an earlier one.
 
-Import the foundation module with `from arete.store import db`; `state.py` retains compatibility exports while aggregate SQL moves in later stages. The relocated numbered migrations and `latest.txt` retain their original bytes.
+Import connections with `from arete.store import db` and run history with `from arete.store import runs as run_store`. Call through the owner module so patches reach its implementation. Runs owns recording SQL, history, billing readers, reports, feed, pins and folder-purge scheduling; `record.py` keeps IDs, timelines and filesystem cleanup. `state.py` temporarily exports the moved names and coordinates pruning on one connection while the remaining aggregates move. The relocated numbered migrations and `latest.txt` retain their original bytes.
 
 The isolated foundation contract probes generate configuration with `replay.sample` and place all six environment paths under a disposable directory. Run through the supplied sandbox:
 
@@ -768,6 +768,9 @@ The isolated foundation contract probes generate configuration with `replay.samp
 python tests/scripts/store_contract.py ownership
 python tests/scripts/store_contract.py unknown-area
 python tests/scripts/store_contract.py upgrade
+python tests/scripts/store_contract.py record-readers
+python tests/scripts/store_contract.py record-failures
+python tests/scripts/store_contract.py run-retention
 ```
 
 The phases are `expand` (compatible additions), `backfill` (data conversion) and `contract` (removals or incompatible changes). `arete migrate --no-contracts` stops before the first contract. A contract waits for live runs and serve processes that name an older schema, including runs without a schema stamp. A stale heartbeat does not release a still-running older serve's contract gate. Serve retries a waiting contract on each tick. Each migration and its ledger row commit together, with `user_version`, duration and the snapshot filename. A failure rolls back that migration and preserves earlier successful versions. Retention also keeps the snapshot named by the newest migration.

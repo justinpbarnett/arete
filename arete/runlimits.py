@@ -11,7 +11,8 @@ from dataclasses import asdict, dataclass
 from functools import wraps
 from pathlib import Path
 
-from . import paths, run_lines, state, util
+from . import paths, run_lines, util
+from .store import runs as run_store
 
 IDLE_WAITS = ("limit", "slot")
 CHECKPOINT_SECONDS = 30
@@ -114,11 +115,11 @@ def heads(repo, branch: str) -> dict[str, str]:
 
 
 def latest_park(repo: str, tid: str) -> tuple[dict, dict]:
-    rows = state.ticket_runs(repo, tid, limit=1)
+    rows = run_store.ticket_runs(repo, tid, limit=1)
     row = rows[0] if rows else {}
     for rid in family(row["id"]) if row else ():
         if saved := metadata(rid, "parked.json"):
-            return state.run_get(rid) or row, saved
+            return run_store.run_get(rid) or row, saved
     return row, {}
 
 
@@ -236,7 +237,7 @@ def verification_seconds(run_id: str, row: dict) -> float:
                 active = None
         return spent + (max(0, (util.parse_iso(row.get("finished") or util.iso()) -
                                 util.parse_iso(active)).total_seconds()) if active else 0)
-    return sum(max(0, float(step.get("seconds") or 0)) for step in state.steps(run_id)
+    return sum(max(0, float(step.get("seconds") or 0)) for step in run_store.steps(run_id)
                if str(step.get("step") or "").startswith(("verify", "grade")))
 
 
@@ -244,7 +245,7 @@ class Budget:
     def __init__(self, run, policy: Policy, previous: str, ticket=None, forced: bool = False) -> None:
         self.run, self.policy = run, policy
         chain = family(previous)
-        rows = {rid: state.run_get(rid) for rid in chain}
+        rows = {rid: run_store.run_get(rid) for rid in chain}
         if any(row is None or (row["repo"], str(row["issue"])) != (run.repo.name, str(run.tid))
                for row in rows.values()):
             raise ValueError("the repair budget chain names a different or missing ticket run")
@@ -262,7 +263,7 @@ class Budget:
         for row in kept:
             for cause, seconds in idle_waits(row["id"], row).items():
                 self.earlier_idle[cause] += seconds
-        own_row = state.run_get(run.id)
+        own_row = run_store.run_get(run.id)
         self.idle = idle_waits(run.id, own_row)
         self.idle_since = None
         self.idle_cause = ""
@@ -437,15 +438,15 @@ class Budget:
         run_lines.write(self.run.id, "budget_repair", call=step, atom=role, used=count + 1)
 
     def park(self, reason: str, kept: dict | None = None) -> dict:
-        row = state.run_get(self.run.id) or {}
+        row = run_store.run_get(self.run.id) or {}
         branch = str(row.get("branch") or next((r.get("branch") for rid in self.parents
-                     if (r := state.run_get(rid)) and r.get("branch")), ""))
+                     if (r := run_store.run_get(rid)) and r.get("branch")), ""))
         try:
             published = heads(self.run.repo, branch)
         except (OSError, ValueError, TimeoutError):
             published = None
         pr_url = str(row.get("pr_url") or next((r.get("pr_url") for rid in self.parents
-                     if (r := state.run_get(rid)) and r.get("pr_url")), ""))
+                     if (r := run_store.run_get(rid)) and r.get("pr_url")), ""))
         util.write_json(artifact(self.run.id, "parked.json"), {
             "reason": reason, "policy": asdict(self.policy), "specification": self.specification,
             "heads": published, "branch": branch, "pr_url": pr_url, "kept": kept or {},

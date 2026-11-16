@@ -4,6 +4,7 @@ import sys
 
 from .. import __version__, config, paths
 from ..store import db as foundation
+from ..store import runs as run_store
 from .common import (
     loop_line,
     print_alerts,
@@ -130,9 +131,9 @@ def status_lines(run_id: str) -> int:
         try:
             panel = client.call("GET", "/api/live")["live"]
         except client.Down:
-            from .. import board, state
+            from .. import board
 
-            panel = board.panel(lambda: board.live(state.runs_marked_running(connect=foundation.reader)))
+            panel = board.panel(lambda: board.live(run_store.runs_marked_running(connect=foundation.reader)))
         if "error" in panel:
             client.emit({"error": panel["error"]})
             return 1

@@ -1,8 +1,9 @@
+from arete.store import runs as run_store
 
 seed()
 s = server()
 pre = counts()
-with mock.patch.object(state, "FIRINGS", "(1 = 1)"):
+with mock.patch.object(run_store, "FIRINGS", "(1 = 1)"):
     prune(s)
 snap = max(paths.backups_dir().glob("arete-*.db"))
 out["deleted"] = "pipe-old" not in column("SELECT id FROM runs")

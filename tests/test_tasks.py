@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+from arete.store import runs as run_store
 from arete import config, control, sessions, state
 
 from tests import support
@@ -141,8 +142,8 @@ class TaskSessionTests(unittest.TestCase):
                 "s-stopped": {"kind": "session", "status": "stopped", "finished": "t", "pr_url": None},
                 "s-done": {"kind": "session", "status": "done", "finished": "t", "pr_url": "u"},
                 "loop": {"kind": "loop", "status": "done", "finished": "t", "pr_url": None}}
-        with mock.patch.object(state, "run_get", side_effect=lambda rid, connect=None: rows.get(rid)), \
-                mock.patch.object(state, "report", side_effect=lambda rid, connect=None: (
+        with mock.patch.object(run_store, "run_get", side_effect=lambda rid, connect=None: rows.get(rid)), \
+                mock.patch.object(run_store, "report", side_effect=lambda rid, connect=None: (
                     {"summary": "s"} if rid == "s-done" else None)):
             for rid, word in (("nope", "no session nope"), ("loop", "no session loop"),
                               ("s-run", "still running"), ("s-stopped", "ended stopped without one")):
@@ -257,6 +258,7 @@ result(ok=True)
 
     def test_summaries_use_empty_temporary_folders_without_tools(self):
         self.scratch(self.FRUITS + r'''
+from arete.store import runs as run_store
 from arete import explain, guard, runner
 for n in range(1, 5):
     put(answer_of(n), reply(f"Reply {n}."))
@@ -289,6 +291,7 @@ result(ok=True)
     def test_no_repo_research_and_triage_use_temporary_working_folders(self):
         self.scratch(r'''
 from types import SimpleNamespace
+from arete.store import runs as run_store
 from arete import guard, research, runner, triage
 cfg = config.load()
 closed = guard.floor("", root, []).closed
