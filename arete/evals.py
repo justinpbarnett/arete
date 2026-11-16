@@ -93,7 +93,13 @@ class EvalRun(AgentRun):
         return f"eval {self.repo.name}/{self.task}"
 
     def repair_limit(self, layer) -> int:
-        return self.settings("check_repair").tries if self.trial else layer.max_attempts
+        return layer.max_attempts
+
+    def call_kw(self, cfg: config.Config, role: str, tools: list[str], rules: list[str]) -> dict:
+        return {"model": cfg.model(config.INHERITS.get(role, role)), "allowed_tools": tools + rules}
+
+    def adopt(self, cfg: config.Config, layer: config.RepoLayer) -> None:
+        return None
 
     def gate(self, layer, wt: Path, task, timeout: float) -> tuple[bool, str]:
         return run_checks(layer, wt, [wt], self, self.time_for(timeout))
@@ -151,17 +157,38 @@ def has_lineage(row: dict) -> bool:
 
 
 @dataclass
+class TaskResult:
+    task: str
+    passed: bool = False
+    why: str = ""
+    cost: float = 0.0
+    paid: float = 0.0
+    seconds: float = 0.0
+    repairs: int = 0
+    failures: list[str] = field(default_factory=list)
+    checks: str = ""
+    verify: str = ""
+    hidden: str = ""
+    blocking: int | None = None
+    base_commit: str = ""
+    context_sha: str = ""
+    settings: str = ""
+    regressed: bool = False
+    changed: list[str] = field(default_factory=list)
+
+
+@dataclass
 class Arm:
     run_id: str
-    results: list[dict]
+    results: list[TaskResult]
 
     @property
     def score(self) -> str:
-        return f"{sum(r['passed'] for r in self.results)}/{len(self.results)}"
+        return f"{sum(r.passed for r in self.results)}/{len(self.results)}"
 
     @property
     def paid(self) -> float:
-        return sum(r["paid"] for r in self.results)
+        return sum(r.paid for r in self.results)
 
 
 class Source:
@@ -402,12 +429,6 @@ def grade_failure(graded: verify.Verified) -> str:
     return f"failed in use: {util.first_line(failed[0]['what'] if failed else graded.summary, 200)}"
 
 
-def step_call(cfg: config.Config, run: EvalRun, role: str, tools: list[str], rules: list[str]) -> dict:
-    if run.trial:
-        return {"role": role, "allowed_tools": rules}
-    return {"model": cfg.model(config.INHERITS.get(role, role)), "allowed_tools": tools + rules}
-
-
 def context_digest(src: Source, repo: config.Repo, run: EvalRun, expertise: str) -> str:
     parts = []
     for name in sorted(run.harness_paths):
@@ -456,35 +477,30 @@ def review(run: EvalRun, wt: Path, task: Task, plan: str, report: str, evidence:
     return sum(p["severity"] == "blocker" for p in review_problems(res.structured.get("problems")))
 
 
-def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run_id: str, dry_run: bool,
-             prompts: Prompts, run: EvalRun | None = None) -> dict:
-    run = run or EvalRun(id=run_id, repo=repo, dir=paths.RUNS_DIR / run_id / task.name, dry_run=dry_run,
-                         task=task.name)
+def run_task(cfg: config.Config, src: Source, task: Task, prompts: Prompts, run: EvalRun) -> TaskResult:
+    repo = run.repo
     run_dir = run.dir
     run_dir.mkdir(parents=True, exist_ok=True)
     base = task.base or f"origin/{gh.default_branch(repo.github) if repo.github else 'main'}"
     wt = paths.WORKTREES_DIR / "-".join(filter(None, ["eval", repo.name, task.name, run.trial]))
     started = time.time()
-    result = {"task": task.name, "passed": False, "why": "", "cost": 0.0, "paid": 0.0, "seconds": 0.0,
-              "repairs": 0, "failures": [], "checks": "", "verify": "", "hidden": "", "blocking": None,
-              "base_commit": "", "context_sha": "", "settings": ""}
+    result = TaskResult(task.name)
     try:
         if not task.check and not task.verify:
             raise workspace.RunFailed("the task has neither `check` nor `verify`")
         fetch_origin(repo)
-        result["base_commit"] = checkout_without_origin_refs(repo.path, base, wt)
-        run.log(f"checkout at {base} ({result['base_commit'][:12]})")
+        result.base_commit = checkout_without_origin_refs(repo.path, base, wt)
+        run.log(f"checkout at {base} ({result.base_commit[:12]})")
         layer = prepare(repo, src, wt, run)
-        if run.trial:
-            run.cfg, run.layer = cfg, layer
+        run.adopt(cfg, layer)
         if prompts.label:
             run.log(f"plan, build and fix prompts from {prompts.label}")
         if task.verify and not layer.verify:
             raise workspace.RunFailed("the task has `verify` steps but the layer has no `[verify]` section")
 
         expertise = layer.expertise_file.read_text() if layer.expertise_file.exists() else "(none yet)"
-        result["context_sha"] = context_digest(src, repo, run, expertise)
-        result["settings"] = eval_settings(cfg, layer)
+        result.context_sha = context_digest(src, repo, run, expertise)
+        result.settings = eval_settings(cfg, layer)
         checks = check_list(layer)
         timeout = task.timeout_minutes * 60
         check_commands, check_rules = check_script(run_dir, layer, wt)
@@ -496,10 +512,10 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
                                         body=task.prompt, comments="", attachments="", triage="", expertise=expertise,
                                         commands=commands, denied=code_list(denied_paths(layer)),
                                         max_lines=layer.max_diff_lines, checks=checks),
-                        wt, **step_call(cfg, run, "plan", READ_TOOLS, bash_rules(config.DEFAULT_ALLOW_BASH)),
+                        wt, **run.call_kw(cfg, "plan", READ_TOOLS, bash_rules(config.DEFAULT_ALLOW_BASH)),
                         json_schema=PLAN_SCHEMA, timeout=timeout)
         if not res.ok or not isinstance(res.structured, dict):
-            result["why"] = "plan step failed"
+            result.why = "plan step failed"
             return result
         plan = res.structured.get("plan", "")
         estimate = int(res.structured.get("estimated_lines") or 0)
@@ -510,10 +526,10 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
                                          expertise=expertise, checks=runs_checks, commands=commands,
                                          max_lines=layer.max_diff_lines, estimate=estimate,
                                          verify=in_use),
-                        wt, **step_call(cfg, run, "build", BUILD_TOOLS, rules),
+                        wt, **run.call_kw(cfg, "build", BUILD_TOOLS, rules),
                         disallowed_tools=routing.NO_GIT_WRITES, timeout=timeout)
         if not res.ok:
-            result["why"] = "build step failed"
+            result.why = "build step failed"
             return result
         session, attempts, summary = res.session, 1, res.text
         max_attempts = run.repair_limit(layer)
@@ -524,17 +540,17 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
                 fix = prompt("fix", prompts.dir, attempt=attempts, max_attempts=max_attempts, failures=report,
                              checks=runs_checks)
                 res = run.agent(f"fix{attempts}", fix, wt,
-                                **step_call(cfg, run, "check_repair", BUILD_TOOLS, rules),
+                                **run.call_kw(cfg, "check_repair", BUILD_TOOLS, rules),
                                 disallowed_tools=routing.NO_GIT_WRITES, resume=session, timeout=timeout,
                                 fresh_prompt=lambda which, fix=fix, summary=summary: switched_prompt(
                                     which, wt, task, plan, summary, fix))
                 session, summary = res.session, res.text
                 ok, report = run.gate(layer, wt, task, timeout)
         except workspace.RunFailed:
-            result["repairs"] = sum(state.step_tries(run.id, f"fix{n}") > 0 for n in range(2, attempts + 1))
+            result.repairs = sum(state.step_tries(run.id, f"fix{n}") > 0 for n in range(2, attempts + 1))
             raise
-        result["repairs"] = attempts - 1
-        result["checks"] = "pass" if ok else "fail"
+        result.repairs = attempts - 1
+        result.checks = "pass" if ok else "fail"
         git(["add", "-A"], wt)
         diff = vault.hidden(git(["diff", "--cached", "HEAD"], wt))
         (run_dir / "diff.patch").write_text(diff)
@@ -542,37 +558,37 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
         evidence ="No check in use ran for this task."
         if task.verify:
             graded = grade(cfg, run, layer, wt, task.title, task.prompt, task.verify, run.time_for(timeout))
-            result["verify"] = graded.verdict
+            result.verify = graded.verdict
             evidence = graded.markdown()
             if graded.verdict != "pass":
                 failures.append(grade_failure(graded))
         if run.reviews:
             blocking = review(run, wt, task, plan, report, evidence, diff, workspace_text, run.time_for(timeout))
-            result["blocking"] = blocking
+            result.blocking = blocking
             if blocking:
                 failures.append(util.count(blocking, "blocking review finding"))
         if task.check:
             res = hidden_check(cfg, repo, task, wt, run.time_for(timeout))
-            result["hidden"] = "pass" if res.returncode == 0 else "fail"
+            result.hidden = "pass" if res.returncode == 0 else "fail"
             (run_dir / "check.log").write_text(res.stdout + res.stderr)
             run.log(f"held out check: {'PASS' if res.returncode == 0 else 'FAIL'}")
             if res.returncode != 0:
                 failures.append(f"check exit {res.returncode}")
-        result["passed"] = not failures
-        result["failures"] = failures
-        result["why"] = "; ".join(failures) + ("" if ok or not failures or run.checks_required else ", repo checks failing")
+        result.passed = not failures
+        result.failures = failures
+        result.why = "; ".join(failures) + ("" if ok or not failures or run.checks_required else ", repo checks failing")
         return result
     except workspace.RunFailed as e:
-        result["why"] = e.why
+        result.why = e.why
         run.log(f"stopped: {e.why}")
         return result
     except Exception as e:
-        result["why"] = f"{type(e).__name__}: {util.first_line(str(e), 200)}"
-        run.log(f"crashed: {result['why']}")
+        result.why = f"{type(e).__name__}: {util.first_line(str(e), 200)}"
+        run.log(f"crashed: {result.why}")
         return result
     finally:
-        result["cost"], result["paid"] = run.cost, run.paid
-        result["seconds"] = round(time.time() - started, 1)
+        result.cost, result.paid = run.cost, run.paid
+        result.seconds = round(time.time() - started, 1)
         shutil.rmtree(wt, ignore_errors=True)
 
 
@@ -617,37 +633,37 @@ def run_suite(cfg: config.Config, repo: config.Repo, src: Source, tasks: list[Ta
         for t in tasks:
             prior = state.task_history(repo.name, t.name, 3)
             after_step = state.last_step_id(run_id)
-            r = run_task(cfg, repo, src, t, run_id, False, prompts)
-            current = {**lineage, **{k: r[k] for k in ("base_commit", "context_sha", "settings")},
-                       "after_step": after_step, "last_step": state.last_step_id(run_id)}
-            state.add_eval(run_id, repo.name, t.name, r["passed"], r["seconds"], r["cost"], label, current)
-            r["regressed"] = len(prior) == 3 and all(p["passed"] for p in prior) and not r["passed"]
-            if r["regressed"]:
-                r["changed"] = (lineage_changes(prior[0], current) or ["nothing recorded changed"]
-                                if has_lineage(prior[0]) else ["the last pass predates lineage"])
+            r = run_task(cfg, src, t, prompts, EvalRun(id=run_id, repo=repo, dir=paths.RUNS_DIR / run_id / t.name,
+                                                       task=t.name))
+            current = {**lineage, "base_commit": r.base_commit, "context_sha": r.context_sha,
+                       "settings": r.settings, "after_step": after_step, "last_step": state.last_step_id(run_id)}
+            state.add_eval(run_id, repo.name, t.name, r.passed, r.seconds, r.cost, label, current)
+            r.regressed = len(prior) == 3 and all(p["passed"] for p in prior) and not r.passed
+            if r.regressed:
+                r.changed = (lineage_changes(prior[0], current) or ["nothing recorded changed"]
+                             if has_lineage(prior[0]) else ["the last pass predates lineage"])
             results.append(r)
         arm = Arm(run_id, results)
         summary = f"{arm.score} passed on {label}"
         record.settle(run_id, "done", summary=summary)
     print(f"{repo.name}: {summary}, {util.paid_note(record.metered_spent(run_id))}")
     for r in results:
-        print(f"  {'PASS' if r['passed'] else 'FAIL'} {r['task']:<28} {r['seconds']:>6.0f}s {util.paid_note(r['paid']):>12} {r['why']}"
-              + (f"  REGRESSED: {', '.join(r['changed'])}" if r["regressed"] else ""))
+        print(f"  {'PASS' if r.passed else 'FAIL'} {r.task:<28} {r.seconds:>6.0f}s {util.paid_note(r.paid):>12} {r.why}"
+              + (f"  REGRESSED: {', '.join(r.changed)}" if r.regressed else ""))
     (paths.RUNS_DIR / run_id / "results.md").write_text(results_md(repo.name, label, results))
     return arm
 
 
-def results_md(repo: str, source: str, results: list[dict]) -> str:
-    passed = sum(r["passed"] for r in results)
+def results_md(repo: str, source: str, results: list[TaskResult]) -> str:
+    passed = sum(r.passed for r in results)
     lines = [f"Evals for {repo} on `{source}`: {passed}/{len(results)} passed.", "",
              "| task | result | time | paid |", "|---|---|---|---|"]
     for r in results:
-        why = r["why"]
-        res = "pass" if r["passed"] else f"fail ({why})"
-        if r.get("regressed"):
-            res += f", passed the three runs before; REGRESSED: {', '.join(r['changed'])}"
+        res = "pass" if r.passed else f"fail ({r.why})"
+        if r.regressed:
+            res += f", passed the three runs before; REGRESSED: {', '.join(r.changed)}"
         res = res.replace("|", "\\|")
-        lines.append(f"| {r['task']} | {res} | {r['seconds']:.0f}s | ${r['paid']:.2f} |")
+        lines.append(f"| {r.task} | {res} | {r.seconds:.0f}s | ${r.paid:.2f} |")
     return "\n".join(lines) + "\n"
 
 
@@ -742,13 +758,13 @@ def compare_prompts(cfg: config.Config, arete: config.Repo, branch: str) -> str:
 
 
 def flipped_tasks(main: Arm, pr: Arm, private: bool) -> str:
-    before = {r["task"]: r["passed"] for r in main.results}
-    flips = [r for r in pr.results if before.get(r["task"], r["passed"]) != r["passed"]]
+    before = {r.task: r.passed for r in main.results}
+    flips = [r for r in pr.results if before.get(r.task, r.passed) != r.passed]
     if not flips:
         return "none"
     if not private:
-        return ", ".join(f"`{r['task']}` now {'passes' if r['passed'] else 'fails'}" for r in flips)
-    up = sum(r["passed"] for r in flips)
+        return ", ".join(f"`{r.task}` now {'passes' if r.passed else 'fails'}" for r in flips)
+    up = sum(r.passed for r in flips)
     down = len(flips) - up
     return ", ".join(filter(None, [f"{util.count(up, 'task')} now {'passes' if up == 1 else 'pass'}" if up else "",
                                    f"{util.count(down, 'task')} now {'fails' if down == 1 else 'fail'}" if down else ""]))

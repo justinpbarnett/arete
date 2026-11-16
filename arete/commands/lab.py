@@ -28,7 +28,7 @@ def refusing(caught):
 def experiment_errors() -> tuple[type[BaseException], ...]:
     import tomllib
 
-    from .. import experiment
+    from ..lab import experiment
 
     return experiment.Refused, tomllib.TOMLDecodeError, OSError
 
@@ -36,7 +36,7 @@ def experiment_errors() -> tuple[type[BaseException], ...]:
 def verifier_errors() -> tuple[type[BaseException], ...]:
     import tomllib
 
-    from .. import verifier_suites
+    from ..lab import verifier_suites
 
     return verifier_suites.Refused, tomllib.TOMLDecodeError, OSError, RuntimeError
 
@@ -44,35 +44,35 @@ def verifier_errors() -> tuple[type[BaseException], ...]:
 def retrieval_errors() -> tuple[type[BaseException], ...]:
     import tomllib
 
-    from .. import retrieval
+    from ..lab import retrieval
 
     return retrieval.Refused, tomllib.TOMLDecodeError, OSError, RuntimeError, config.UnknownRepo
 
 
 @refusing(experiment_errors)
 def experiment_run(args) -> int:
-    from .. import experiment
+    from ..lab import experiment
 
     return experiment.run(paths.expand(args.manifest), args.out, args.dry_run)
 
 
 @refusing(experiment_errors)
 def experiment_optimize(args) -> int:
-    from .. import optimize
+    from ..lab import optimize
 
     return optimize.run(paths.expand(args.plan), args.out, args.dry_run)
 
 
 @refusing(experiment_errors)
 def experiment_summary(args) -> int:
-    from .. import experiment
+    from ..lab import experiment
 
     return experiment.show(paths.expand(args.file), args.json)
 
 
 @refusing(experiment_errors)
 def experiment_sample(args) -> int:
-    from .. import optimize
+    from ..lab import optimize
 
     print_lines(optimize.sample(paths.expand(args.folder)))
     return 0
@@ -80,14 +80,14 @@ def experiment_sample(args) -> int:
 
 @refusing(experiment_errors)
 def experiment_promote(args) -> int:
-    from .. import optimize
+    from ..lab import optimize
 
     return optimize.promote(paths.expand(args.folder), args.apply, args.rollback)
 
 
 @refusing(verifier_errors)
 def verifiers_sample(args) -> int:
-    from .. import verifier_suites
+    from ..lab import verifier_suites
 
     print_lines(verifier_suites.sample(paths.expand(args.folder)))
     return 0
@@ -95,21 +95,21 @@ def verifiers_sample(args) -> int:
 
 @refusing(verifier_errors)
 def verifiers_run(args) -> int:
-    from .. import verifier_suites
+    from ..lab import verifier_suites
 
     return verifier_suites.run(paths.expand(args.suite), dry=args.dry_run)
 
 
 @refusing(verifier_errors)
 def verifiers_report(args) -> int:
-    from .. import verifier_suites
+    from ..lab import verifier_suites
 
-    return verifier_suites.report(paths.expand(args.file), as_json=args.json)
+    return verifier_suites.show(paths.expand(args.file), as_json=args.json)
 
 
 @refusing(retrieval_errors)
 def retrieval_sample(args) -> int:
-    from .. import retrieval
+    from ..lab import retrieval
 
     print_lines(retrieval.sample(paths.expand(args.folder)))
     return 0
@@ -117,7 +117,7 @@ def retrieval_sample(args) -> int:
 
 @refusing(retrieval_errors)
 def retrieval_run(args) -> int:
-    from .. import retrieval
+    from ..lab import retrieval
 
     return retrieval.run(args.repo, args.suite, split=args.split, dry_run=args.dry_run, as_json=args.json,
                          out=args.out)
@@ -126,7 +126,8 @@ def retrieval_run(args) -> int:
 def writers_errors(handler):
     @functools.wraps(handler)
     def guarded(args) -> int:
-        from .. import util, writers
+        from .. import util
+        from ..lab import writers
 
         try:
             return handler(args)
@@ -141,7 +142,7 @@ def writers_errors(handler):
 def writers_sample(args) -> int:
     from pathlib import Path
 
-    from .. import writers
+    from ..lab import writers
 
     print_lines(writers.sample(Path(args.folder)))
     return 0
@@ -149,7 +150,7 @@ def writers_sample(args) -> int:
 
 @writers_errors
 def writers_run(args) -> int:
-    from .. import writers
+    from ..lab import writers
 
     return writers.run(args.repo, args.dry_run)
 
@@ -158,7 +159,8 @@ def writers_run(args) -> int:
 def writers_export(args) -> int:
     from pathlib import Path
 
-    from .. import util, writers
+    from .. import util
+    from ..lab import writers
 
     found = writers.export(args.run)
     if args.out:
@@ -172,7 +174,7 @@ def writers_export(args) -> int:
 
 @writers_errors
 def writers_rate(args) -> int:
-    from .. import writers
+    from ..lab import writers
 
     print(json.dumps(writers.rate(args.run, args.file, args.rater)))
     return 0
@@ -180,10 +182,10 @@ def writers_rate(args) -> int:
 
 @writers_errors
 def writers_report(args) -> int:
-    from .. import writers
+    from ..lab import writers
 
-    found = writers.report(args.run)
-    print(json.dumps(found) if args.json else "\n".join(writers.report_lines(found)))
+    found = writers.summary(args.run)
+    print(json.dumps(found) if args.json else "\n".join(writers.render(found)))
     return 0
 
 
@@ -200,7 +202,7 @@ def implementation_manifest(path) -> bool:
 def cmd_implementations(args) -> int:
     import tomllib
 
-    from .. import experiment, implbench, workers
+    from ..lab import experiment, implbench, workers
 
     if args.action == "run" and args.json:
         print("usage: arete benchmark run MANIFEST [--dry-run] [--out FILE] | report FILE [--json] | "
@@ -212,9 +214,9 @@ def cmd_implementations(args) -> int:
             return 0
         if args.action == "report":
             file = paths.expand(args.file)
-            return (workers.show if workers.holds(file) else implbench.show)(file, args.json)
+            return (workers.show if workers.is_workers_results(file) else implbench.show)(file, args.json)
         manifest = paths.expand(args.manifest)
-        return (workers.run if workers.declared(manifest) else implbench.run)(manifest, args.out or "", args.dry_run)
+        return (workers.run if workers.is_workers_manifest(manifest) else implbench.run)(manifest, args.out or "", args.dry_run)
     except (experiment.Refused, tomllib.TOMLDecodeError, OSError, RuntimeError) as e:
         print(e, file=sys.stderr)
         return 1
@@ -223,7 +225,8 @@ def cmd_implementations(args) -> int:
 def cmd_benchmark(args) -> int:
     from pathlib import Path
 
-    from .. import benchmark, devices, util
+    from .. import devices, util
+    from ..lab import benchmark
 
     if args.action in ("report", "sample") or (args.action == "run" and implementation_manifest(
             paths.expand(args.manifest))):
@@ -251,7 +254,7 @@ def cmd_benchmark(args) -> int:
     if args.json:
         print(json.dumps(found))
     else:
-        print_lines(benchmark.report_lines(found))
+        print_lines(benchmark.render(found))
     return 0
 
 

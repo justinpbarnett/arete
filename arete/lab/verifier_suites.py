@@ -12,7 +12,7 @@ import tomllib
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from . import (
+from .. import (
     browser,
     config,
     devices,
@@ -29,8 +29,8 @@ from . import (
     verify,
     workspace,
 )
-from .agent import REPLAY, Result
-from .pipeline import AgentRun, TicketWork, use_product
+from ..agent import REPLAY, Result
+from ..pipeline import AgentRun, TicketWork, use_product
 
 NAME = re.compile(r"[A-Za-z0-9_-]+")
 RESERVED = ("record", "scratch")
@@ -593,7 +593,7 @@ def render(found: dict) -> str:
     return "\n".join(out)
 
 
-def report(path: Path | str, as_json: bool = False) -> int:
+def show(path: Path | str, as_json: bool = False) -> int:
     found = summary(read(path))
     print(json.dumps(found) if as_json else render(found))
     return 0

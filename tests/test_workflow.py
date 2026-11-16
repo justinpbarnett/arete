@@ -1254,12 +1254,12 @@ class CodeIdentityTests(unittest.TestCase):
 
     def test_serve_keeps_its_code_when_new_code_cannot_load_whole(self):
         tree = self.tree()
-        with open(tree / "arete/benchmark.py", "a") as f:
+        with open(tree / "arete/lab/benchmark.py", "a") as f:
             f.write("\ndef broken(:\n")
         notes = json.loads(self.run_child(support.SOURCE, self.BAD_RELOAD, str(tree)))
         self.assertEqual(len(notes), 1)
         self.assertIn("new code does not import", notes[0])
-        self.assertIn("arete.benchmark", notes[0])
+        self.assertIn("arete.lab.benchmark", notes[0])
 
 
 class ConfigForwardCompatTests(unittest.TestCase):

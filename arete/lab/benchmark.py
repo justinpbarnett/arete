@@ -21,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import accounts, config, devices, outbound, pi, util
+from .. import accounts, config, devices, outbound, pi, util
 
 SCENARIOS = ("ok", "oom", "overflow", "malformed", "offline")
 SERVED = ("ok", "oom", "overflow", "malformed")
@@ -579,7 +579,7 @@ def shown(value, template: str = "{}") -> str:
     return "unknown" if value is None else template.format(value)
 
 
-def report_lines(report: dict) -> list[str]:
+def render(report: dict) -> list[str]:
     lines = [f"benchmark {report['benchmark']} started {report['started']}", report["note"]]
     ran = 0
     for name, c in report["candidates"].items():

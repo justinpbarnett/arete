@@ -351,7 +351,7 @@ class OptimizeTests(unittest.TestCase):
     slow = True
 
     def decision(self, champion, candidate, reference=0.01, charged=0.0, seconds=1.0):
-        from arete import experiment, optimize
+        from arete.lab import experiment, optimize
 
         def trials(arm, outcomes, cost):
             return [{"event": "trial", "task": "t", "split": "validation", "arm": arm, "repeat": n, "status": "done",
@@ -394,7 +394,7 @@ class OptimizeTests(unittest.TestCase):
     def test_a_multiline_list_is_replaced_whole_and_nothing_else_moves(self):
         import tomllib
 
-        from arete import optimize
+        from arete.lab import optimize
 
         text = '[a]\nx = 1\n\n[steps.build]\nmodel = "m"\ntools = [\n  "Read",\n  "Edit",\n]\neffort = "low"\n\n[z]\ny = 2\n'
         after = optimize.edited(text, "steps.build", {"tools": ["Read", "Grep"], "mcp": ["one"]})
@@ -407,7 +407,7 @@ class OptimizeTests(unittest.TestCase):
         self.assertEqual(tomllib.loads("".join(lines))["z"], {"y": 2})
 
     def test_a_winner_that_needs_prompts_is_not_applied_in_part(self):
-        from arete import optimize
+        from arete.lab import optimize
 
         end = {"champion": "p", "overrides": {"model": "m", "prompts": "/x"}}
         self.assertIn("prompts", optimize.undeployable(end))

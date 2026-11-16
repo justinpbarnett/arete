@@ -11,8 +11,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from . import evals, experiment, paths, pipeline, record, replay, routing, state, steps, util, workspace
-from .agent import REPLAY, traits_of
+from .. import eval_mine, evals, paths, pipeline, record, replay, routing, steps, util, workspace
+from ..agent import REPLAY, traits_of
+from . import experiment
 
 GROUPS = ("ordinary", "difficult")
 DECIDES = "holdout"
@@ -69,27 +70,6 @@ def reviewer(exp: experiment.Experiment) -> tuple[dict, list[str]]:
             "prompt": experiment.sha((paths.PROMPTS_DIR / "review.md").read_bytes())}, routes
 
 
-def content_of(title: str, prompt: str, verify: str, base: str, source: str) -> tuple:
-    return title, prompt.strip(), verify.strip(), base, source
-
-
-def mined_unchanged(exp: experiment.Experiment, task: evals.Task) -> bool:
-    row = state.mined_row(task.source) if task.source else {}
-    if row.get("status") != "accepted" or row.get("repo") != exp.repo.name or not row.get("run_id"):
-        return False
-    now = content_of(task.title, task.prompt, task.verify, task.base, task.source)
-    for saved in (paths.RUNS_DIR / row["run_id"]).glob("*/task.toml"):
-        try:
-            data = tomllib.loads(saved.read_text())
-        except (OSError, ValueError):
-            continue
-        then = content_of(str(data.get("title", "")), str(data.get("prompt", "")), str(data.get("verify", "")),
-                          str(data.get("base", "")), str(data.get("source", "")))
-        if then == now:
-            return True
-    return False
-
-
 def resolved_references(exp: experiment.Experiment, references: dict[str, str]) -> dict[str, str]:
     found = {}
     for name, task in exp.tasks.items():
@@ -100,7 +80,7 @@ def resolved_references(exp: experiment.Experiment, references: dict[str, str]) 
             found[name] = experiment.base_commit(exp.repo, name, references[name], "reference")
             if found[name] == task.base:
                 raise experiment.Refused(f"tasks.{name}: reference is the base, so the change is empty")
-        elif mined_unchanged(exp, task):
+        elif eval_mine.accepted_unchanged(exp.repo.name, task):
             found[name] = ""
         else:
             raise experiment.Refused(f"tasks.{name}: its steps were never shown to pass on the merged change and fail "
@@ -138,12 +118,11 @@ class Clock:
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def left(self) -> float:
-        return self.exp.limits["minutes"] * 60 - self.used.seconds - (time.monotonic() - self.began)
+        return experiment.seconds_left(self.exp.limits, self.used) - (time.monotonic() - self.began)
 
     def check(self) -> None:
         if self.left() <= 0:
-            spent = replace(self.used, seconds=self.exp.limits["minutes"] * 60)
-            raise experiment.Capped(experiment.reached(self.exp.limits, spent, launching=False))
+            raise experiment.Capped(experiment.timed_out(self.exp.limits, self.used, launching=False))
 
     def note(self) -> None:
         with self.lock:
@@ -155,19 +134,10 @@ class Clock:
 
     @contextmanager
     def saving(self):
-        stop = threading.Event()
-
-        def beat() -> None:
-            while not stop.wait(experiment.ALIVE_SECONDS):
-                self.note()
-
-        beater = threading.Thread(target=beat, name="benchmark setup", daemon=True)
-        beater.start()
         try:
-            yield
+            with util.repeating(experiment.ALIVE_SECONDS, self.note, "benchmark setup"):
+                yield
         finally:
-            stop.set()
-            beater.join()
             self.note()
 
 
@@ -307,7 +277,7 @@ def drive(bench: Bench, path: Path, hands_off: frozenset = frozenset(), shown=No
     except (KeyboardInterrupt, pipeline.Stopped):
         experiment.append(path, {"event": "stop", "why": "interrupted", "at": util.iso()})
         code = experiment.INTERRUPT_EXIT
-    print(shown(path) if shown else render(report(path)))
+    print(shown(path) if shown else render(summary(path)))
     return code
 
 
@@ -394,7 +364,7 @@ def group_report(design: dict, group: str, trials: list[dict], missing: dict[str
             "recommendation": recommend(baseline, verdicts, rows, decided, order)}
 
 
-def report(path: Path) -> dict:
+def summary(path: Path) -> dict:
     found = experiment.events(path)
     manifest = next((e for e in found if e.get("event") == "manifest"), None)
     if manifest is None:
@@ -456,7 +426,7 @@ def render(found: dict) -> str:
 
 
 def show(path: Path, as_json: bool) -> int:
-    found = report(path)
+    found = summary(path)
     print(json.dumps(found) if as_json else render(found))
     return 0
 

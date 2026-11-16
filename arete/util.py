@@ -16,6 +16,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
@@ -624,3 +625,20 @@ def https_upgrade(resp: http.client.HTTPResponse, port: int | None) -> SplitResu
 
 def write_bytes_atomic(path: Path, data: bytes) -> None:
     write_durably(path, data, 0o600)
+
+
+@contextmanager
+def repeating(seconds: float, action, name: str):
+    stop = threading.Event()
+
+    def beat() -> None:
+        while not stop.wait(seconds):
+            action()
+
+    beater = threading.Thread(target=beat, name=name, daemon=True)
+    beater.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        beater.join()
