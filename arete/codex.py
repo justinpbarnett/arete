@@ -339,9 +339,8 @@ def owner_hooks_off() -> dict[str, dict]:
 
 
 def guard_hook(judge: bool, scratch: tuple[str, ...] = (), opened=()) -> list[str]:
-    entrypoint = f"import sys; sys.path.insert(0, {str(paths.PACKAGE_DIR.parent)!r}); from arete.cli import main; raise SystemExit(main())"
-    hook = shlex.join([sys.executable, "-I", "-c", entrypoint, "codex-guard", *(["--judge"] if judge else []),
-                       *(arg for path in opened for arg in ("--open", str(path))), *scratch])
+    hook = shlex.join(paths.cli_command("codex-guard", *(["--judge"] if judge else []),
+                                        *(arg for path in opened for arg in ("--open", str(path))), *scratch))
     entry = [{"matcher": "*", "hooks": [{"type": "command", "command": hook, "timeout": guard.HOOK_TIMEOUT_SECONDS}]}]
     off = owner_hooks_off()
     return [*setting("hooks.PreToolUse", entry), *(setting("hooks.state", off) if off else [])]
