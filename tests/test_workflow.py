@@ -16,7 +16,7 @@ import unittest
 from unittest import mock
 import arete
 
-from arete import config, control, paths, pipeline, util, verify, cli
+from arete import config, control, paths, pipeline, util, verify, cli, workspace
 
 from tests import support
 from tests.harness import behavior_result, bootstrap, make_folders, run_script, scratch_env
@@ -48,7 +48,7 @@ lock = src / '.git' / 'config.lock'
 before = (src / '.git' / 'config').read_bytes()
 lock.touch()
 ws = loop_run.open_workspace(run)
-wt = pipeline.make_worktree(repo, 'main', 'arete/probe', 'probe')
+wt = workspace.make_worktree(repo, 'main', 'arete/probe', 'probe')
 for folder, branch in ((ws.wt, 'loop/probe'), (wt, 'arete/probe')):
     assert git('-C', folder, 'branch', '--show-current').stdout.strip() == branch
     for key in ('merge', 'remote'):
@@ -92,9 +92,9 @@ assert_no_loop()
 held = paths.WORKTREES_DIR / 'held'
 util.add_worktree(src, held, 'held', 'origin/main')
 (held / 'untracked.txt').write_text('preserve me')
-c = pipeline.Checkout('', '', src, held, 'main')
+c = workspace.Checkout('', '', src, held, 'main')
 try:
-    pipeline.add_worktree(c, 'arete/new', 'origin/main')
+    workspace.add_worktree(c, 'arete/new', 'origin/main')
 except RuntimeError:
     pass
 else:
@@ -180,9 +180,9 @@ hook = hooks / 'post-checkout'
 hook.write_text('#!/bin/sh\nexit 1\n')
 hook.chmod(0o700)
 os.environ['GIT_CONFIG_VALUE_0'] = str(hooks)
-c = pipeline.Checkout('', '', src, paths.WORKTREES_DIR / 'failed-reset', 'main')
+c = workspace.Checkout('', '', src, paths.WORKTREES_DIR / 'failed-reset', 'main')
 try:
-    pipeline.add_worktree(c, 'arete/kept', 'origin/main')
+    workspace.add_worktree(c, 'arete/kept', 'origin/main')
 except RuntimeError:
     pass
 else:
@@ -195,7 +195,7 @@ assert not list(paths.WORKTREES_DIR.iterdir())
     def test_existing_pipeline_branch_and_kept_loop_branch(self):
         self.run_body('''
 assert git('branch', '--no-track', 'arete/reset', 'origin/main').returncode == 0
-wt = pipeline.make_worktree(repo, 'main', 'arete/reset', 'reset')
+wt = workspace.make_worktree(repo, 'main', 'arete/reset', 'reset')
 assert git('-C', wt, 'rev-parse', 'HEAD').stdout == git('rev-parse', 'origin/main').stdout
 assert git('-C', wt, 'branch', '--show-current').stdout.strip() == 'arete/reset'
 ws = loop_run.open_workspace(run)

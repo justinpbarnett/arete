@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from arete import browser, config, gh, outbound, paths, pipeline, sandbox, scratch, verify
+from arete import browser, config, gh, outbound, paths, pipeline, sandbox, scratch, verify, workspace
 
 from tests import support
 
@@ -365,7 +365,7 @@ class VerificationOutputTests(unittest.TestCase):
         self.assertEqual((self.ws / "owner.txt").read_text(), "owner data\n")
         self.assertEqual((self.ws / "owner-dir/kept.txt").read_text(), "kept\n")
         self.assertFalse(self.scratch.pending(self.ws))
-        self.assertEqual(pipeline.scratch_left(self.ws, []), [])
+        self.assertEqual(workspace.scratch_left(self.ws, []), [])
         self.attempt()
 
     def test_look_alike_is_free_and_a_folder_made_again_at_the_recorded_root_is_held(self):
@@ -377,9 +377,9 @@ class VerificationOutputTests(unittest.TestCase):
         look.mkdir(mode=0o700)
         (look / ".gitignore").write_text("*\n")
         self.assertTrue(paths.valid_scratch(str(look)))
-        self.assertEqual(pipeline.scratch_left(self.ws, []), [])
+        self.assertEqual(workspace.scratch_left(self.ws, []), [])
         Path(a.root).mkdir(mode=0o700)
-        self.assertEqual(pipeline.scratch_left(self.ws, []), [Path(a.root)])
+        self.assertEqual(workspace.scratch_left(self.ws, []), [Path(a.root)])
 
     def retained(self, a, name):
         self.assertEqual(self.scratch.end(a, Path(a.run_dir))[2], [a.root])
@@ -394,7 +394,7 @@ class VerificationOutputTests(unittest.TestCase):
         self.assertEqual(diagnostic["unknown_entries"], ["owner.txt"])
         self.assertEqual(diagnostic["reasons"]["owner.txt"], self.scratch.EXISTED)
         self.assertEqual((Path(a.root) / "owner.txt").read_text(), "owner data\n")
-        self.assertTrue(pipeline.scratch_left(self.ws, []))
+        self.assertTrue(workspace.scratch_left(self.ws, []))
         with self.assertRaises(OSError) as raised:
             self.attempt()
         self.assertEqual(raised.exception.errno, 16)

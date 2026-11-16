@@ -25,10 +25,11 @@ from . import (
     tracker,
     triage,
     util,
+    workspace,
 )
 from .agent import Result
 from .heartbeat import mark_loop, network_up_or_skip
-from .pipeline import fill_template, make_worktree, prompt, remove_worktree, slug
+from .pipeline import fill_template, prompt, slug
 
 REPORTS_DIR = paths.STATE_DIR / "research"
 TOOLS = [*runner.READ_TOOLS, "WebSearch", "WebFetch"]
@@ -132,7 +133,7 @@ def file_report(cfg: config.Config, h: Home, r: dict, report: dict) -> str:
             f"Arete researched [{r['ref']}]({r['url']}) ({util.paid_note(report['cost'])}) and files the report as `{path}`. "
             "When the ticket changes, arete researches it again and pushes the new report here.")
     base = h.base
-    wt = make_worktree(h.repo, base, branch, key)
+    wt = workspace.make_worktree(h.repo, base, branch, key)
     try:
         (wt / path).parent.mkdir(parents=True, exist_ok=True)
         (wt / path).write_text(report_file(r["ref"]).read_text())
@@ -146,7 +147,7 @@ def file_report(cfg: config.Config, h: Home, r: dict, report: dict) -> str:
             return url
         return gh.pr_create(h.repo.github, branch, base, subject, body, labels=tk.pr_labels, cwd=wt, link=link)
     finally:
-        remove_worktree(h.repo, wt)
+        workspace.remove_worktree(h.repo, wt)
 
 
 def file_in_home(cfg: config.Config, h: Home, r: dict) -> tuple[bool, str]:

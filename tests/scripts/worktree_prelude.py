@@ -6,7 +6,7 @@ import threading
 from types import SimpleNamespace as NS
 from unittest.mock import patch
 
-from arete import config, loop_run, paths, pipeline, replay, sandbox, util
+from arete import config, loop_run, paths, pipeline, replay, sandbox, util, workspace
 
 root = Path(sys.argv[1])
 sandbox.AUTHORITY = root / 'authority-parent' / 'verification-authority'

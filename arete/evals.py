@@ -26,6 +26,7 @@ from . import (
     util,
     vault,
     verify,
+    workspace,
 )
 from .diffguard import denied_paths
 from .heartbeat import mark_loop
@@ -34,8 +35,6 @@ from .pipeline import (
     PLAN_SCHEMA,
     REVIEW_SCHEMA,
     AgentRun,
-    Checkout,
-    RunFailed,
     TicketWork,
     bash_rules,
     check_calls,
@@ -381,7 +380,7 @@ def prepare(repo: config.Repo, src: Source, wt: Path, run: EvalRun) -> config.Re
             shutil.copy2(s, wt / c)
     for cmd in layer.setup:
         if environment.sh(cmd, run.config, repo, cwd=wt, timeout=run.time_for(1200)).returncode != 0:
-            raise RunFailed(f"setup `{cmd}` failed")
+            raise workspace.RunFailed(f"setup `{cmd}` failed")
     commit_overlay(wt)
     return layer
 
@@ -390,7 +389,7 @@ def grade(cfg: config.Config, run: EvalRun, layer: config.RepoLayer, wt: Path, t
           timeout: float, step: str = "grade") -> verify.Verified:
     ticket = tracker.Ticket(id=run.task, ref=run.task, title=title, body=ask)
     run.cfg, run.layer, run.overrides = cfg, layer, {"timeout_minutes": max(1, round(timeout / 60))}
-    work = TicketWork(cfg, run, ticket, wt, [Checkout("", run.repo.github, run.repo.path, wt, "")], layer, timeout,
+    work = TicketWork(cfg, run, ticket, wt, [workspace.Checkout("", run.repo.github, run.repo.path, wt, "")], layer, timeout,
                       workspace="You are in a checkout of its code.")
     return use_product(work, step, "grade", role="eval_grade", goal=steps)
 
@@ -443,16 +442,16 @@ def hidden_check(cfg: config.Config, repo: config.Repo, task: Task, wt: Path, ti
     return environment.sh(task.check, cfg, repo, cwd=wt, timeout=timeout)
 
 
-def review(run: EvalRun, wt: Path, task: Task, plan: str, report: str, evidence: str, diff: str, workspace: str,
+def review(run: EvalRun, wt: Path, task: Task, plan: str, report: str, evidence: str, diff: str, workspace_text: str,
            timeout: float) -> int:
-    res = run.agent("review", prompt("review", repo=run.repo.name, workspace=workspace, ref=task.name,
+    res = run.agent("review", prompt("review", repo=run.repo.name, workspace=workspace_text, ref=task.name,
                                      title=task.title, body=task.prompt, comments="", attachments="", plan=plan,
                                      checks=report, evidence=evidence, diff=util.tail(diff, MAX_DIFF_IN_PROMPT),
                                      compare="`git diff HEAD`", earlier=""),
                     wt, role="review", allowed_tools=bash_rules(config.DEFAULT_ALLOW_BASH),
                     json_schema=REVIEW_SCHEMA, timeout=timeout)
     if not res.ok or not isinstance(res.structured, dict):
-        raise RunFailed("review step failed")
+        raise workspace.RunFailed("review step failed")
     return sum(p["severity"] == "blocker" for p in review_problems(res.structured.get("problems")))
 
 
@@ -470,7 +469,7 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
               "base_commit": "", "context_sha": "", "settings": ""}
     try:
         if not task.check and not task.verify:
-            raise RunFailed("the task has neither `check` nor `verify`")
+            raise workspace.RunFailed("the task has neither `check` nor `verify`")
         fetch_origin(repo)
         result["base_commit"] = checkout_without_origin_refs(repo.path, base, wt)
         run.log(f"checkout at {base} ({result['base_commit'][:12]})")
@@ -480,7 +479,7 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
         if prompts.label:
             run.log(f"plan, build and fix prompts from {prompts.label}")
         if task.verify and not layer.verify:
-            raise RunFailed("the task has `verify` steps but the layer has no `[verify]` section")
+            raise workspace.RunFailed("the task has `verify` steps but the layer has no `[verify]` section")
 
         expertise = layer.expertise_file.read_text() if layer.expertise_file.exists() else "(none yet)"
         result["context_sha"] = context_digest(src, repo, run, expertise)
@@ -490,9 +489,9 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
         check_commands, check_rules = check_script(run_dir, layer, wt)
         runs_checks = check_calls(check_commands)
         commands = code_list(layer.builder_bash + check_commands)
-        workspace = ("You are in a checkout of its code on branch `main`. It has no `origin` remote, so compare with "
+        workspace_text = ("You are in a checkout of its code on branch `main`. It has no `origin` remote, so compare with "
                      "`HEAD`, as in `git diff HEAD`.")
-        res = run.agent("plan", prompt("plan", prompts.dir, repo=repo.name, workspace=workspace, ref=task.name, title=task.title,
+        res = run.agent("plan", prompt("plan", prompts.dir, repo=repo.name, workspace=workspace_text, ref=task.name, title=task.title,
                                         body=task.prompt, comments="", attachments="", triage="", expertise=expertise,
                                         commands=commands, denied=code_list(denied_paths(layer)),
                                         max_lines=layer.max_diff_lines, checks=checks),
@@ -505,7 +504,7 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
         estimate = int(res.structured.get("estimated_lines") or 0)
         in_use = res.structured.get("verify", "")
         rules = bash_rules(layer.builder_bash + check_rules)
-        res = run.agent("build", prompt("build", prompts.dir, repo=repo.name, workspace=workspace, ref=task.name,
+        res = run.agent("build", prompt("build", prompts.dir, repo=repo.name, workspace=workspace_text, ref=task.name,
                                          title=task.title, body=task.prompt, comments="", attachments="", plan=plan,
                                          expertise=expertise, checks=runs_checks, commands=commands,
                                          max_lines=layer.max_diff_lines, estimate=estimate,
@@ -530,7 +529,7 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
                                     which, wt, task, plan, summary, fix))
                 session, summary = res.session, res.text
                 ok, report = run.gate(layer, wt, task, timeout)
-        except RunFailed:
+        except workspace.RunFailed:
             result["repairs"] = sum(state.step_tries(run.id, f"fix{n}") > 0 for n in range(2, attempts + 1))
             raise
         result["repairs"] = attempts - 1
@@ -547,7 +546,7 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
             if graded.verdict != "pass":
                 failures.append(grade_failure(graded))
         if run.reviews:
-            blocking = review(run, wt, task, plan, report, evidence, diff, workspace, run.time_for(timeout))
+            blocking = review(run, wt, task, plan, report, evidence, diff, workspace_text, run.time_for(timeout))
             result["blocking"] = blocking
             if blocking:
                 failures.append(util.count(blocking, "blocking review finding"))
@@ -562,7 +561,7 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
         result["failures"] = failures
         result["why"] = "; ".join(failures) + ("" if ok or not failures or run.checks_required else ", repo checks failing")
         return result
-    except RunFailed as e:
+    except workspace.RunFailed as e:
         result["why"] = e.why
         run.log(f"stopped: {e.why}")
         return result
