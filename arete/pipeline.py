@@ -795,9 +795,14 @@ def selected_checks(layer: config.RepoLayer, files: list[str]) -> set[str]:
 
 def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: AgentRun,
                timeout: float, *, selected: set[str] | None = None) -> tuple[bool, str]:
-    if not layer.checks:
+    commands = layer.checks
+    if selected is not None:
+        available = layer.checks | layer.targeted_commands
+        if missing := selected - available.keys():
+            raise ValueError(f"unknown selected checks: {', '.join(sorted(missing))}")
+        commands = {name: command for name, command in available.items() if name in selected}
+    if not commands:
         return True, "no checks configured"
-    commands = {name: command for name, command in layer.checks.items() if selected is None or name in selected}
     quick = [(name, commands[name]) for name in layer.quick_checks if name in commands]
     slow = [(name, command) for name, command in commands.items() if name not in layer.quick_checks]
     untracked_before = untracked_by_dir(git_dirs)

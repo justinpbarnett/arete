@@ -374,7 +374,8 @@ class Job:
 
     def policy(self, name: str, kw: dict) -> str:
         if name == "checks":
-            value = (self.layer.checks, self.layer.quick_checks, self.layer.targeted_checks, bool(kw.get("quick")))
+            value = (self.layer.checks, self.layer.quick_checks, self.layer.targeted_checks,
+                     self.layer.targeted_commands, bool(kw.get("quick")))
         elif name == "verify":
             value = (asdict(self.layer.verify) if self.layer.verify else None, self.goal, self.left_for_a_person)
         else:

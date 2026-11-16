@@ -1001,12 +1001,20 @@ Builder and repair prompts leave the full-suite gate to Arete instead of asking 
 [check_policy]
 quick = ["lint", "compile", "imports", "web"]
 
+[targeted_commands]
+tracker-smoke = ".venv/bin/python -m unittest tests.test_tasks"
+poll-smoke = ".venv/bin/python -m unittest tests.test_process_limits.QueueTests"
+
 [check_policy.targeted]
 "arete/tracker.py" = ["tracker-smoke"]
 "arete/poll.py" = ["poll-smoke"]
 ```
 
-Every explicitly named check must exist in `[checks]`.
+`[checks]` contains the required commands for every final full run.
+`[targeted_commands]` contains owner-configured commands used only when selected for an intermediate check; they are excluded from final full runs.
+Targeted patterns may name commands from either table, while explicit quick names must exist in `[checks]`.
+Commands must be nonempty strings, selected names must exist, and the two command tables cannot share names.
+Changing a targeted command invalidates stored check evidence on resume.
 Targeted passes are marked as partial evidence, not as a successful full suite.
 
 For disposable-fixture commands that the agent's irreversible-action classifier cannot authorize, an owner can configure named product probes separately from prerequisite preflight checks:
