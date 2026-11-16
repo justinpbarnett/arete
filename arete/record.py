@@ -569,7 +569,7 @@ def normalized(source: Iterable[dict]) -> Iterator[dict]:
         own = line.pop("arete", None)
         if own == "clock":
             seconds = line.get("seconds", seconds)
-        elif own in ("header", "result"):
+        elif own in ("header", "result", "attach", "lost"):
             if own == "header":
                 read = READERS.get(line.get("runner"), lambda header: unread)(line)
             yield {"kind": own, "seconds": seconds, **line}

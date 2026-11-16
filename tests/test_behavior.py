@@ -241,7 +241,7 @@ class StoreContractTests(unittest.TestCase):
         self.assertEqual(found["historical_rows"], 2)
         self.assertTrue(found["hashes_unchanged"] and found["historical_work_preserved"])
         self.assertEqual(found["applied_once"], found["expected_suffix"])
-        self.assertEqual(found["budget_applied_once"][:5], [5, 6, 7, 8, 9])
+        self.assertEqual(found["budget_applied_once"][:6], [5, 6, 7, 8, 9, 10])
         self.assertEqual(found["budget_applied_once"], found["budget_expected_suffix"])
         self.assertEqual((found["relocated_rows_added"], found["pre_budget_rows_added"]),
                          (0, len(found["budget_expected_suffix"])))
@@ -249,6 +249,71 @@ class StoreContractTests(unittest.TestCase):
         self.assertEqual(found["origin_main_rows_added"], len(found["origin_main_expected_suffix"]))
         self.assertTrue(found["origin_main_unchanged"] and found["latest_valid"])
         self.assertEqual(len(found["historical_files"]), len(found["origin_main_ledger"]))
+
+
+class RemoteTurnTests(unittest.TestCase):
+    def scenario(self, mode):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            make_folders(root, "config", "state", "logs", "worktrees", "tmp", "home")
+            env = scratch_env(root, ARETE_WORKTREES_DIR=str(root / "worktrees"), TMPDIR=str(root / "tmp"),
+                              HOME=str(root / "home"), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                              GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0=os.devnull)
+            result = run_script("from tests.scripts.remote_turn import main; main()", root, str(root), mode,
+                                env=env, timeout=120)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            return behavior_result(result)
+
+    def test_reset_replays_once_at_the_byte_offset(self):
+        self.scenario("reset")
+
+    def test_half_open_expires_without_client_heartbeats(self):
+        self.scenario("half-open")
+
+    def test_stop_kills_the_whole_group(self):
+        self.scenario("stop")
+
+    def test_timeout_kills_the_whole_group(self):
+        self.scenario("timeout")
+
+    def test_cut_kills_the_whole_group(self):
+        self.scenario("cut")
+
+    def test_loop_replays_and_preserves_io(self):
+        self.scenario("loop")
+
+    def test_lost_refused_keeps_session_and_usage(self):
+        self.scenario("lost-refused")
+
+    def test_lost_folder_keeps_session_and_usage(self):
+        self.scenario("lost-folder")
+
+    def test_cleanup_and_removal_contract(self):
+        self.scenario("cleanup")
+
+    def test_original_bytes_and_launch_failure(self):
+        self.scenario("bytes")
+
+    def test_watchdog_survives_orchestrator_death(self):
+        self.scenario("watchdog")
+
+    def test_contract_waits_for_all_old_writers(self):
+        self.scenario("contract")
+
+    def test_local_and_refused_runners(self):
+        self.scenario("local")
+
+    def test_process_groups_do_not_depend_on_login_shell_job_control(self):
+        self.scenario("groups")
+
+    def test_relative_device_and_working_directories(self):
+        self.scenario("relative")
+
+    def test_completed_structured_answers_settle_remote_claude(self):
+        self.scenario("answered")
+
+    def test_slow_uploads_complete_and_truncated_inputs_never_launch(self):
+        self.scenario("upload")
 
 
 class LogRotationTests(unittest.TestCase):

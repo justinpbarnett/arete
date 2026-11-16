@@ -411,6 +411,10 @@ note = "Hetzner box"
 
 `arete devices` lists them with their last probe; `arete devices probe NAME` checks the device answers and lists which of `claude`, `pi`, `codex`, `arete` and `ollama` it has.
 Arete's ssh never forwards your ssh agent, so an agent on a device cannot use your keys.
+A remote turn survives a dropped ssh session; its prompt and output live under `.arete/turns` in the device dir until it ends, and a turn whose orchestrator is gone stops within the lease TTL (currently 10 minutes), followed by the existing stop grace before forced KILL.
+Remote turns use `setsid`, or Bash job control on macOS, and verify the process group before starting work; devices need one of these launchers and `ps`. Relative device and working directories resolve from the remote login directory.
+
+The offline remote-turn fixture runs real launch, attach and cleanup code against fake SSH and Claude processes. Run `python docs/remote-turn-fixture.py MODE` through the verification sandbox with `MODE` set to `reset`, `half-open`, `stop`, `timeout`, `cut`, `loop`, `lost-refused`, `lost-folder`, `cleanup`, `bytes`, `watchdog`, `contract`, `local`, `groups`, `relative`, `answered` or `upload`. Each mode asserts its outcome and prints `BEHAVIOR_RESULT` with retained evidence under `.arete-sandbox/remote-turn-fixture`; `inspect` reads the saved evidence. The fixture uses a three-second heartbeat window and one-second stop grace. New remote turns wait for the remote-turn schema contract: older runs, loops, sessions and serve processes must end before `arete migrate` can apply it.
 
 A device of kind `exe` is a sandbox on [exe.dev](https://exe.dev).
 Each run gets a VM of its own, works on it over ssh, and deletes it when the run ends.

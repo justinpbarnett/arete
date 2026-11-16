@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-import shlex
 import signal
 import tempfile
 import threading
@@ -22,9 +21,6 @@ CACHE_FILE = paths.STATE_DIR / "devices.json"
 KINDS = ("local", "ssh", "exe", "proxmox")
 PROBE = ("uname -sm; echo \"$HOME\"; for t in claude pi codex arete ollama; do command -v $t >/dev/null && echo has:$t; "
          "done; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null | sed 's/^/gpu:/'")
-END_WITH_SESSION = ("( (kill -0 $PPID && while kill -0 $PPID && kill -0 $$; do sleep 1; done && kill -0 $$ && kill -KILL -$$)"
-                    " </dev/null >/dev/null 2>&1 & ); exec \"$@\"")
-ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 VM_NAME_CHARS = 60
 VM_PREFIX = "arete-"
 EXE_EGRESS = ("integrations", "all")
@@ -78,17 +74,6 @@ def get(name: str) -> Device:
 
 def resolve(device: Device | str) -> Device:
     return device if isinstance(device, Device) else get(device)
-
-
-def wrap(device: Device | str, argv: list[str], cwd, env: dict | None = None, mkdirs: tuple = ()) -> list[str]:
-    d = resolve(device)
-    if not d.remote:
-        return argv
-    exports = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in (env or {}).items() if ENV_NAME.match(k))
-    argv = ["sh", "-c", END_WITH_SESSION, "sh", *argv]
-    steps = [f"mkdir -p {ssh.remote_dir(m)}" for m in mkdirs]
-    steps += [f"cd {ssh.remote_dir(cwd or d.dir)}", f"exec {'env ' + exports + ' ' if exports else ''}{shlex.join(argv)}"]
-    return [*ssh.ssh_argv(d), " && ".join(steps)]
 
 
 def probe(device: Device | str, timeout: float = 20) -> dict:
@@ -169,18 +154,32 @@ def vm_name(label: str) -> str:
 
 @contextmanager
 def lease(device: Device | str, run_id: str, log=lambda text: None, hold=lambda: ""):
+    from . import device_turns
+    from .store import db
+
     d = resolve(device)
+    turns = device_turns.component(f"{db.schema_metadata()['instance_tag']}-{run_id}-1") if d.remote else ""
     if d.kind == "proxmox":
         with proxmox_clone(d, run_id, log, hold) as clone:
             record.mark(run_id, "lease", device=d.name, device_kind=d.kind, address=clone.host)
-            yield clone
+            yield replace(clone, turns=turns)
     elif d.kind == "exe":
         with fresh_sandbox(d, run_id, log, hold) as vm:
             record.mark(run_id, "lease", device=d.name, device_kind=d.kind, address=vm.host)
-            yield vm
+            yield replace(vm, turns=turns)
     else:
         record.mark(run_id, "lease", device=d.name, device_kind=d.kind)
-        yield d
+        leased = replace(d, turns=turns)
+        try:
+            yield leased
+        finally:
+            if d.remote:
+                try:
+                    res = device_turns.control(leased, f"rm -rf {device_turns.folder(leased)}")
+                    if res.returncode:
+                        log(f"remote turn cleanup: {ssh.failure(res)}")
+                except Exception as e:
+                    log(f"remote turn cleanup: {e}")
 
 
 @contextmanager

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import os
 import shlex
@@ -18,6 +19,7 @@ from . import (
     config,
     control,
     delivery,
+    device_turns,
     devices,
     diffguard,
     emits,
@@ -47,6 +49,7 @@ from .store import runs as run_store
 KNOWN_FINDINGS_SHOWN = 30
 KNOWN_FINDINGS_ASKED = 200
 OUTPUT_TAIL = 6000
+COMMAND_LEAVES = itertools.count(1)
 PROBLEM_FIELDS = ("title", "summary", "location", "evidence")
 PROBLEM_SHOWN = 6000
 COMMITS_READ = 60
@@ -246,11 +249,34 @@ def exits_by(proc: subprocess.Popen, deadline: float) -> bool:
 
 def run_command(argv: list[str], cwd: Path | str, *, timeout: float, env: dict, device: devices.Device,
                 stdin: str = "", output: Path | None = None, on_line=None) -> tuple[int, str]:
+    if device.remote:
+        lines = []
+        sinks = OutputSinks(output, on_line)
+
+        def line(text):
+            lines.append(text)
+            sinks.write(text)
+
+        def mark(kind, offset):
+            line(f"[arete] {'reattached' if kind == 'attach' else 'lost the device'} at byte {offset}\n")
+
+        try:
+            result = device_turns.run(device, argv, cwd, env, stdin, timeout=timeout, on_line=line,
+                                     on_mark=mark, leaf=f"command-{next(COMMAND_LEAVES)}", merge_stderr=True)
+            return result.returncode, "".join(lines)
+        except device_turns.Lost:
+            return devices.ssh.SSH_FAILED, "".join(lines)
+        except subprocess.TimeoutExpired:
+            note = f"\n[arete] stopped after {timeout:g}s\n"
+            sinks.write(note, callback=False)
+            return util.TIMED_OUT, "".join(lines) + note
+        finally:
+            sinks.close()
     local = not device.remote
     trusted = bool(argv and argv[0] == "arete" and local)
     if trusted:
         argv = control.command(argv[1:])
-    full = devices.wrap(device, argv, cwd, env)
+    full = argv
     deadline = time.monotonic() + timeout
     from . import scratch
 
