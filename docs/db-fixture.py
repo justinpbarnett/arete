@@ -1064,18 +1064,44 @@ def prune_restore():
         snapshot_identity = "f" * 32
         with sqlite3.connect(snapshot) as conn:
             conn.execute("UPDATE schema_meta SET value=? WHERE key='instance_id'", (snapshot_identity,))
-        rc, restored = cli_output("backup", "--restore", str(snapshot))
-        require(rc == 0, restored)
+        paths.DB_FILE.write_bytes(b"corrupt current database before public CLI restore")
+        recovery = public_restore(snapshot)
+        restored = recovery["output"]
         require(sql_rows("SELECT * FROM runs ORDER BY id") == expected, "restore lost runs")
         after = db_values()
         require(all(after["sequences"].get(k, 0) >= v for k, v in previous["sequences"].items()), "sequence regression")
         require(after["meta"]["instance_id"] == previous["meta"]["instance_id"], "identity replaced")
         require(int(after["meta"]["restore_epoch"]) > int(previous["meta"]["restore_epoch"]), "epoch did not increase")
         evidence.update(journal_mode="wal", check_output=output, restore_output=restored, before=previous, after=after,
+                        corrupt_cli_restore=recovery,
                         retention=retention_policy(), consistent_counts=consistent_counts())
     finally:
         close_server(server)
     return evidence
+
+
+def public_restore(snapshot):
+    from arete import backup, paths
+
+    expected = sql_rows("SELECT * FROM runs ORDER BY id", file=snapshot)
+    floors = dict(sql_rows("SELECT name,seq FROM sqlite_sequence", file=snapshot))
+    originals = {s: Path(str(paths.DB_FILE) + s).read_bytes() for s in backup.SIDECARS
+                 if Path(str(paths.DB_FILE) + s).exists()}
+    archives = set(paths.STATE_DIR.glob("arete.db.before-restore-*"))
+    rc, output = cli_output("backup", "--restore", str(snapshot))
+    require(rc == 0, (rc, output))
+    added = set(paths.STATE_DIR.glob("arete.db.before-restore-*")) - archives
+    paired = [p for p in added if all(Path(str(p) + s).exists()
+                                    and Path(str(p) + s).read_bytes() == value for s, value in originals.items())]
+    require(len(paired) == 1, ("replaced database/sidecar pair", added))
+    rows = sql_rows("SELECT * FROM runs ORDER BY id")
+    checked = backup.inspect(paths.DB_FILE)
+    after = db_values()
+    require(rows == expected and checked["quick_check"] == "ok", checked)
+    require(all(after["sequences"].get(k, 0) >= v for k, v in floors.items()), after)
+    return {"exit_status": rc, "output": output, "restored_rows": rows, "quick_check": checked["quick_check"],
+            "sequence_floors": floors, "sequences": after["sequences"], "archive": str(paired[0]),
+            "preserved_sidecars": list(originals)}
 
 
 def retention_policy():
@@ -1244,7 +1270,7 @@ def restore_safety():
     cached = (paths.backups_dir() / "instance.json").read_bytes()
     snap_values = dict(sql_rows("SELECT name,seq FROM sqlite_sequence", file=snapshot))
     paths.DB_FILE.write_bytes(b"unreadable current database")
-    backup.restore(snapshot)
+    corrupt_cli = public_restore(snapshot)
     after = db_values()
     require(after["sequences"] == {k: v + 10000 for k, v in snap_values.items()}, "unreadable gap")
     require((paths.backups_dir() / "instance.json").read_bytes() == cached, "identity cache changed")
@@ -1268,7 +1294,8 @@ def restore_safety():
     backup.restore(snapshot)
     require(int(db_values()["meta"]["restore_epoch"]) > receipt, "durable receipt generation regressed")
     evidence.update(refusals=refusals, rename_faults=faults, installed_sync_rollback=True, interruptions=interruptions, hot_journal=hot,
-                    unreadable_sequences=after["sequences"], preledger_output=output, first=first, second=second)
+                    corrupt_cli_restore=corrupt_cli, unreadable_sequences=after["sequences"],
+                    preledger_output=output, first=first, second=second)
     backup.restore_record().write_text("{broken")
     retained = inventory()
     output = finish(child("serve-contender"))
@@ -1322,6 +1349,7 @@ def hot_journal_probe():
     with foundation.tx() as conn:
         conn.executemany("INSERT INTO feed(run_id,ts,kind,text) VALUES ('hot',?,'note',?)",
                          [(util.iso(), "original" * 100)] * 1000)
+    snapshot = backup.snapshot("hot-cli")
     process = child("hot-journal")
     finish(process)
     journal = Path(str(paths.DB_FILE) + "-journal")
@@ -1333,7 +1361,11 @@ def hot_journal_probe():
     with backup.private_database(paths.DB_FILE) as conn:
         require(conn.execute("SELECT count(*) FROM feed WHERE text='uncommitted'").fetchone()[0] == 0, "uncommitted hot rows leaked")
     require(all(Path(str(paths.DB_FILE) + s).read_bytes() == value for s, value in before.items()), "hot discovery changed originals")
-    return {"hot_journal": True, "private_recovery": True, "original_bytes_preserved": True}
+    recovered = public_restore(snapshot)
+    require("-journal" in recovered["preserved_sidecars"], recovered)
+    require(all(recovered["sequences"].get(k, 0) >= v for k, v in found["sequences"].items()), recovered)
+    return {"hot_journal": True, "private_recovery": True, "original_bytes_preserved": True,
+            "public_cli_restore": recovered}
 
 
 def http_feed_snapshot(run_id):
@@ -1669,7 +1701,9 @@ def fixture_http(port=0):
     from arete import dashboard, tailnet
 
     server = ThreadingHTTPServer(("127.0.0.1", port), dashboard.Handler)
-    server.node = tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1", "localhost"}), "fixture", "")
+    from arete import principals
+    principals.seed_owner("fixture")
+    server.node = tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1", "localhost"}), "")
     server.logins = SimpleNamespace(of=lambda address: "fixture" if address == "127.0.0.1" else "")
     return server
 
@@ -1864,7 +1898,7 @@ def event_contract():
                 columns = [r[1] for r in conn.execute("PRAGMA table_info(events)")]
                 meta = dict(conn.execute("SELECT key,value FROM schema_meta"))
                 rows = [dict(r) for r in conn.execute("SELECT * FROM events")]
-                require("data" not in columns and int(meta["oldest_writer"]) == foundation.LATEST, meta)
+                require("data" not in columns and int(meta["oldest_writer"]) == 7, meta)
                 require(len(rows) == (3 if kind == "v0" else 2), rows)
             require(not foundation.migrate(), "migration repeated")
             evidence["cases"].append({"kind": kind, "columns": columns, "events": rows, "meta": meta})
@@ -2300,8 +2334,11 @@ def child_main(role, args):
             return lines
 
         class Host(tailnet.ScratchHost):
-            def node(self, owner):
-                return tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "fixture@example.com", "")
+            def node(self):
+                return tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "")
+
+            def seed_identity(self, login):
+                return "fixture@example.com", "Fixture"
 
             def whois(self, address):
                 return "fixture@example.com"

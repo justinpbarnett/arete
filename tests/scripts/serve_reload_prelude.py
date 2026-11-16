@@ -3,11 +3,13 @@ import http.client, http.server, socket, subprocess, types
 from arete import client, dashboard, delivery, tailnet
 state.migrate()
 OWNER = "owner@example.test"
+from arete import principals
+principals.seed_owner(OWNER)
 CHANGED = frozenset({("changed", 1, 1)})
 real_sh = util.sh
 who = [OWNER]
 tailnet.Logins.of = lambda self, address: who[0]
-NODE = tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), OWNER, "127.0.0.1")
+NODE = tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "127.0.0.1")
 def listen(logins, handler):
     web = tailnet.Server("127.0.0.1", 0, NODE, logins, True, handler, dashboard.Redirect)
     threading.Thread(target=web.serve_forever, daemon=True).start()

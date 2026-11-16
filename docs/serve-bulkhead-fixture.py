@@ -560,8 +560,10 @@ def serve(port):
         shutil.rmtree(folder, ignore_errors=True)
         folder.mkdir(parents=True)
     fresh()
-    node = tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "fixture@example.com", "")
-    owner = type("Owner", (), {"of": lambda self, address: node.owner})()
+    from arete import principals
+    principals.seed_owner("fixture@example.com")
+    node = tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "")
+    owner = type("Owner", (), {"of": lambda self, address: "fixture@example.com"})()
     server = tailnet.Server("127.0.0.1", port, node, owner, False, dashboard.Handler, dashboard.Redirect)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     SERVING.write_text(str(os.getpid()))

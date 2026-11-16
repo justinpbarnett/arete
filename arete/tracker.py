@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
-from . import config, gh, jira, state, util
+from . import config, gh, jira, principals, state, util
 
 LABEL = "agent"
 APPROVAL_LABEL_STYLE = ("0052cc", "Approved for arete to build")
@@ -425,7 +425,7 @@ class LocalTracker:
 
     def reply_since(self, tid: str, since: str) -> str:
         return reply_text([(util.parse_iso(c["ts"]), c["body"] or "") for c in state.task_comments(tid)
-                           if c["author"] == "owner" and c["ts"]], since)
+                           if principals.is_person(c["author"]) and c["ts"]], since)
 
     def save_images(self, t: Ticket, dest: Path) -> SavedImages:
         return SavedImages()

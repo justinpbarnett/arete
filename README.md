@@ -2049,6 +2049,50 @@ When `alert_repo` is set and private, the board is also one issue there, "[arete
 `arete serve` serves one page from this machine to its owner over Tailscale, so it opens from a phone or another computer on the tailnet; `arete dashboard` serves it alone.
 It listens only on the machine's tailnet addresses.
 A request from any other tailnet login gets 403, and a change also needs the `X-Arete` header that the page sends.
+Admission maps the whois login through `principal_logins` to an active human principal.
+`[dashboard] owner` seeds the first person once; if empty, the seed uses the node's own login.
+The person gets a random `u:` id and the Tailscale display name (or the login's local part).
+Editing `owner` after seeding changes neither admission nor the person's login binding.
+`GET /api/v1/principals` lists people, with optional `kind`, `role` and `status` filters;
+`GET /api/v1/principals/me` identifies the caller, and `/api/v1/principals/ID` reads one principal.
+These answers expose the name and version, never a login subject.
+
+`GET /api/v1/events` (alias `/api/events`) streams committed changes. Run and step events are derived;
+principal changes are durable. Today's pages continue polling, and `/api/runs/ID/events` still follows run lines.
+SSE is the default (`retry: 2000`); `Accept: application/x-ndjson` gives one object per line,
+and `Accept: application/json` long polls with `{"events", "next", "reset"}`.
+The long poll's `timeout` is capped at 25 seconds. With no cursor a connection starts at the head.
+Save each opaque `restore_epoch.seq` id and reconnect with `Last-Event-ID`, or `since` when headers are unavailable;
+the header wins. A numeric snapshot sequence is also accepted as `since`.
+Filters intersect: `kinds` (comma separated, with terminal `.*` for a family), `subject` (comma separated),
+`task`, `run`, `class` (`durable`, `derived`, `notice`) and `idem`.
+`turn.appended` is excluded unless its run is selected by `turns`; `named=1` supplies SSE event names.
+Each event includes its current `actor_name`, resolved when sent. Events retain actor ids, never names or logins.
+A reset has no id and closes the connection: `epoch` follows a restore, `too_old` means a requested class was trimmed,
+and `too_far` means more than 10,000 matching rows wait. Fetch a fresh snapshot before reconnecting after reset.
+`schema` is reserved. Unstored `serve.beat` messages arrive every 15 seconds with the scan cursor as their SSE id.
+Derived events are retained for 90 days, notices for seven, and durable events indefinitely.
+`GET /api/meta` includes `stream.complete`, class trim ids and the head; completeness remains false while older writers may run.
+
+Offline stream exercises use disposable folders, fake Tailscale and the replay runner, and print their evidence directory:
+
+```sh
+python docs/events-fixture.py serve --port 8765
+python docs/events-fixture.py exercise live-replay
+python docs/events-fixture.py exercise reconnect-formats
+python docs/events-fixture.py exercise filters
+python docs/events-fixture.py exercise epoch-reset
+python docs/events-fixture.py exercise retention-reset
+python docs/events-fixture.py exercise backlog-reset
+python docs/events-fixture.py exercise atomicity
+python docs/events-fixture.py exercise admission-seed
+python docs/events-fixture.py exercise principal-gate
+python docs/events-fixture.py exercise row-actors
+python docs/events-fixture.py exercise completeness
+python docs/events-fixture.py exercise beats
+python docs/events-fixture.py exercise nearby
+python docs/events-fixture.py inspect
+```
 
 By default it answers plain HTTP on the machine's tailnet addresses, calls no `tailscale cert` and makes no `tailscale serve` mapping.
 HTTPS is off until the owner turns it on with `https = true` under `[dashboard]` in the config; the key takes `true` or `false` and defaults to `false`.
