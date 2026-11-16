@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import sys
 
-from . import gh, outbound, state, util
+from . import gh, outbound, util
+from .store import incidents as incident_store
 
 LABEL = "arete-alert"
 NOTIFY_SCRIPT = ("-e", "on run argv", "-e", "display notification (item 1 of argv) with title (item 2 of argv)",
@@ -23,23 +24,23 @@ def ask_notice(where: str, summary: str) -> None:
 
 def raise_alert(repo: str, key: str, title: str, status: str, dry_run: bool = False) -> str:
     status = outbound.sanitize(status)
-    prev = state.alert_get(key)
+    prev = incident_store.alert_get(key)
     if dry_run:
         return f"would {'refresh' if prev else 'open'} alert {key}: {status}"
     if not repo:
         if not prev:
             notify("arete", f"{title}: {status}")
-        state.alert_set(key, (prev or {}).get("issue"))
+        incident_store.alert_set(key, (prev or {}).get("issue"))
         return f"notified {key}"
     left = ""
     try:
         if prev and prev.get("issue"):
             if (issue_repo := opened_in(prev, repo)) != repo:
                 left = close_issue(issue_repo, prev["issue"], f"Arete now files its alerts in {repo}, so this alert moves there.")
-                state.alert_set(key, None, repo)
-                prev = state.alert_get(key)
+                incident_store.alert_set(key, None, repo)
+                prev = incident_store.alert_get(key)
             elif gh.issue_state(repo, prev["issue"]) == "OPEN":
-                state.alert_set(key, prev["issue"], repo)
+                incident_store.alert_set(key, prev["issue"], repo)
                 return f"alert {key} still open (#{prev['issue']})"
         pages = gh.gh_json(["api", f"repos/{repo}/issues?labels={LABEL}&state=open&per_page=100",
                             "--paginate", "--slurp"])
@@ -48,7 +49,7 @@ def raise_alert(repo: str, key: str, title: str, status: str, dry_run: bool = Fa
         for page in pages:
             for row in page:
                 if f"Check `{key}` is failing." in (row.get("body") or ""):
-                    state.alert_set(key, row["number"], repo)
+                    incident_store.alert_set(key, row["number"], repo)
                     return f"alert {key} still open (#{row['number']})"
         gh.ensure_label(repo, LABEL, "d93f0b", "Opened by arete heartbeat")
         body = (
@@ -58,17 +59,17 @@ def raise_alert(repo: str, key: str, title: str, status: str, dry_run: bool = Fa
             "Arete closes this issue when the check passes again. Details: `arete status` on the Mac."
         )
         num = gh.issue_create(repo, f"[arete] {title}", body, [LABEL])
-        state.alert_set(key, num, repo)
+        incident_store.alert_set(key, num, repo)
         return f"opened #{num} for {key}{left}"
     except (gh.GhError, ValueError, TypeError, KeyError, AttributeError) as e:
         if not prev:
             notify("arete", f"{title}: {status}")
-        state.alert_set(key, (prev or {}).get("issue"))
+        incident_store.alert_set(key, (prev or {}).get("issue"))
         return f"gh failed for {key} ({e}){'' if prev else '; notified locally'}{left}"
 
 
 def clear_alert(repo: str, key: str, dry_run: bool = False) -> str | None:
-    prev = state.alert_get(key)
+    prev = incident_store.alert_get(key)
     if not prev:
         return None
     if dry_run:
@@ -80,7 +81,7 @@ def clear_alert(repo: str, key: str, dry_run: bool = False) -> str | None:
             left = close_issue(issue_repo, prev["issue"], f"Recovered at {util.iso()}.")
         except gh.GhError as e:
             return f"gh failed closing {issue_repo}#{prev['issue']} for {key} ({e}); retrying next pass"
-    state.alert_clear(key)
+    incident_store.alert_clear(key)
     return f"cleared {key}{left}"
 
 

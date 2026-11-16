@@ -4,6 +4,8 @@ from datetime import timedelta
 from pathlib import Path
 from unittest import mock
 from arete.store import runs as run_store
+from arete.store import loops as loop_store
+from arete import store
 from arete import cli, config, control, loop_run, loops, paths, record, sandbox, scratch, serve, state, util
 root, mode = Path(sys.argv[1]), sys.argv[2]
 sandbox.AUTHORITY = root / "authority-parent/verification-authority"
@@ -23,7 +25,7 @@ folder("silent", "pass")
 folder("slow", "import os,time; from pathlib import Path; Path(" + repr(str(root / "ready")) +
        ").write_text(str(os.getpid())); time.sleep(60)")
 def enqueue(name="fail", payload=None, trigger="event"):
-    return state.enqueue(name, name, "", trigger, [event] if payload is None else payload)
+    return loop_store.enqueue(name, name, "", trigger, [event] if payload is None else payload)
 def call(*args):
     out = io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
@@ -56,23 +58,23 @@ if mode == "outcomes":
                   (json.dumps([event]), util.iso()))
         legacy = c.execute("SELECT last_insert_rowid()").fetchone()[0]
     for _ in range(2):
-        row = state.queue_item(legacy)
+        row = loop_store.queue_item(legacy)
         assert row["payload"] == [event] and row["attempts"] == 0
         assert row["dead_at"] is None and row["dead_reason"] == ""
-    state.drop_queue_item(legacy)
+    loop_store.drop_queue_item(legacy)
     item = enqueue()
     for _ in range(2):
         with state.db() as c:
             row = dict(c.execute("SELECT * FROM queue WHERE id = ?", (item,)).fetchone())
         assert (row["attempts"], row["dead_at"], row["dead_reason"]) == (0, None, "")
     r = loop_run.launch("fail", item=item, detach=False)
-    assert r["status"] == "failed" and not state.pending()
+    assert r["status"] == "failed" and not loop_store.pending()
     for args in (("list",), ("status", "fail")):
         rc, shown = call(*args)
         assert rc == 0 and "1 dead" in shown, shown
     assert str(item) in shown and r["id"] in shown and "1 event" in shown and "exit 1" in shown, shown
     assert call("requeue", str(item))[0] == 0
-    row = state.queue_item(item)
+    row = loop_store.queue_item(item)
     assert row["payload"] == [event] and row["run_id"] is None and row["attempts"] == 0
     assert row["dead_at"] is None and row["dead_reason"] == ""
     for invalid in (str(item), "9999999", "bad"):
@@ -84,24 +86,24 @@ if mode == "outcomes":
     folder("fail", "raise SystemExit(1)")
     item = enqueue("ok")
     assert loop_run.launch("ok", item=item, detach=False)["status"] == "done"
-    assert state.queue_item(item) is None
+    assert loop_store.queue_item(item) is None
     assert json.loads((root / "received").read_text()) == event
     item = enqueue(payload=[], trigger="every")
     loop_run.launch("fail", item=item, detach=False)
-    assert state.queue_item(item) is None
+    assert loop_store.queue_item(item) is None
     assert loop_run.launch("ok", detach=False)["status"] == "done"
     item = enqueue("silent")
     with mock.patch.object(loop_run.delivery, "deliver", side_effect=AssertionError("silent command delivered")), \
             mock.patch.object(loop_run.runner, "run", side_effect=AssertionError("silent command called a model")):
         silent = loop_run.launch("silent", item=item, detach=False)
     assert silent["status"] == "skipped" and "no output" in silent["summary"], silent
-    assert state.queue_item(item) is None
+    assert loop_store.queue_item(item) is None
     item = enqueue("ok")
-    assert state.take_queue_item(item, "first") is True
-    assert state.take_queue_item(item, "second") is False
-    assert state.queue_item(item)["run_id"] == "first"
+    assert loop_store.take_queue_item(item, "first") is True
+    assert loop_store.take_queue_item(item, "second") is False
+    assert loop_store.queue_item(item)["run_id"] == "first"
     assert call("requeue", str(item))[0] != 0
-    assert state.queue_item(item)["run_id"] == "first"
+    assert loop_store.queue_item(item)["run_id"] == "first"
     (root / "received").unlink()
     for value in (item, 999999):
         try:
@@ -111,11 +113,11 @@ if mode == "outcomes":
         else:
             raise AssertionError("claimed or missing item launched")
     item = enqueue("ok")
-    take = state.take_queue_item
+    take = loop_store.take_queue_item
     def compete(item, run_id):
         assert take(item, "competitor")
         return take(item, run_id)
-    with mock.patch.object(state, "take_queue_item", side_effect=compete):
+    with mock.patch.object(loop_store, "take_queue_item", side_effect=compete):
         try:
             loop_run.launch("ok", item=item, detach=False)
         except control.NotFound as e:
@@ -127,14 +129,14 @@ if mode == "outcomes":
     item = enqueue("ok")
     with mock.patch.object(loop_run, "spent_limit", return_value="daily budget"):
         loop_run.launch("ok", item=item, detach=False)
-    assert state.queue_item(item)["run_id"] is None and state.queue_item(item)["attempts"] == 0
+    assert loop_store.queue_item(item)["run_id"] is None and loop_store.queue_item(item)["attempts"] == 0
     with mock.patch.object(loop_run, "run_command", side_effect=loop_run.OverBudget("during execution")):
         loop_run.launch("ok", item=item, detach=False)
-    assert "during execution" in state.queue_item(item)["dead_reason"]
+    assert "during execution" in loop_store.queue_item(item)["dead_reason"]
     item = enqueue("ok")
     with mock.patch.object(loop_run, "screened", return_value=("skipped", "kind skipped")):
         loop_run.launch("ok", item=item, detach=False)
-    assert state.queue_item(item) is None
+    assert loop_store.queue_item(item) is None
 elif mode == "signals":
     item = enqueue("slow")
     for attempt in (1, 2):
@@ -142,15 +144,15 @@ elif mode == "signals":
         try:
             kill(r, child)
             reap()
-            row = state.queue_item(item)
+            row = loop_store.queue_item(item)
             assert row["payload"] == [event]
             if attempt == 1:
                 assert row["run_id"] is None and row["attempts"] == 1
             else:
                 assert row["run_id"] == r["id"] and row["dead_at"] and row["dead_reason"]
                 reap()
-                state.prune()
-                assert state.queue_item(item) == row
+                store.prune()
+                assert loop_store.queue_item(item) == row
         finally:
             with contextlib.suppress(ProcessLookupError):
                 os.kill(child, signal.SIGKILL)
@@ -169,14 +171,14 @@ elif mode == "signals":
                 os.kill(r["pid"], signal.SIGTERM)
             wait(lambda: not util.lock_is_held(r["lock"]))
             reap()
-            row = state.queue_item(item)
+            row = loop_store.queue_item(item)
             if action in ("stop", "gone"):
                 assert row["dead_at"] and row["run_id"] == r["id"], row
             elif action == "term":
                 assert row["run_id"] is None and row["attempts"] == 1, row
             else:
                 assert row is None
-                assert {i["id"] for i in state.pending() if i["loop"] == "slow"} >= {newer, other}
+                assert {i["id"] for i in loop_store.pending() if i["loop"] == "slow"} >= {newer, other}
         finally:
             with contextlib.suppress(ProcessLookupError):
                 os.kill(child, signal.SIGKILL)
@@ -189,30 +191,30 @@ elif mode == "retention":
             record.start("loop", run_id=status, loop="fail")
             if status != "running":
                 record.settle(status, status, summary="settled " + status)
-        state.take_queue_item(item, status)
+        loop_store.take_queue_item(item, status)
     reap()
     for status in ("failed", "missing"):
-        row = state.queue_item(ids[status])
+        row = loop_store.queue_item(ids[status])
         assert row["run_id"] is None and row["attempts"] == 1
-    assert state.queue_item(ids["stopped"])["dead_at"]
-    before = [state.queue_item(i) for i in ids.values()]
+    assert loop_store.queue_item(ids["stopped"])["dead_at"]
+    before = [loop_store.queue_item(i) for i in ids.values()]
     reap()
-    assert before == [state.queue_item(i) for i in ids.values()]
+    assert before == [loop_store.queue_item(i) for i in ids.values()]
     waiting = enqueue()
     with state.db() as c:
         c.execute("UPDATE queue SET enqueued = ?", (old,))
         c.execute("INSERT INTO events (loop, type, ts) VALUES ('fail', 'old', ?)", (old,))
-    state.prune()
-    assert all(state.queue_item(i) for i in [*ids.values(), waiting])
+    store.prune()
+    assert all(loop_store.queue_item(i) for i in [*ids.values(), waiting])
     with state.db() as c:
         assert c.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
         c.execute("UPDATE queue SET dead_at = ? WHERE id = ?", (old, ids["stopped"]))
-    state.prune()
-    assert state.queue_item(ids["stopped"]) is None
+    store.prune()
+    assert loop_store.queue_item(ids["stopped"]) is None
 elif mode == "never":
-    pending = state.pending()
+    pending = loop_store.pending()
     item = pending[0]["id"] if pending else enqueue()
-    attempt = state.queue_item(item)["attempts"]
+    attempt = loop_store.queue_item(item)["attempts"]
     def fails(args, keep=()):
         return control.launch([sys.executable, "-c", "raise SystemExit(7)"], keep=keep)
     server = serve.Server()
@@ -220,11 +222,11 @@ elif mode == "never":
         with mock.patch.object(control, "detach", side_effect=fails):
             server.dispatch({"fail": loops.find("fail", config.load())})
         reap()
-        row = state.queue_item(item)
+        row = loop_store.queue_item(item)
         assert (row["dead_at"] is not None) == (attempt == 1), row
         assert row["payload"] == [event]
         reap()
-        assert state.queue_item(item) == row
+        assert loop_store.queue_item(item) == row
     finally:
         server.pool.shutdown()
         for pool in server.job_pools.values():
@@ -234,7 +236,7 @@ elif mode == "race":
     code = "import sys,time; from pathlib import Path; from arete.store import runs as run_store; from arete import state; "
     code += "p=Path(sys.argv[1]); Path(sys.argv[2]).touch(); "
     code += "\nwhile not p.exists(): time.sleep(.001)\n"
-    code += "print(state.enqueue('race','race','','every'))"
+    code += "from arete.store import loops as loop_store; print(loop_store.enqueue('race','race','','every'))"
     prefix = "import sys; sys.path.insert(0," + repr(str(paths.PACKAGE_DIR.parent)) + ");"
     for n in range(20):
         gate = root / str(n)
@@ -247,9 +249,9 @@ elif mode == "race":
             results = [p.communicate(timeout=15) for p in procs]
             assert all(p.returncode == 0 for p in procs), results
             assert sum(int(out.strip()) == 0 for out, err in results) == 1, results
-            rows = [i for i in state.pending() if i["loop"] == "race"]
+            rows = [i for i in loop_store.pending() if i["loop"] == "race"]
             assert len(rows) == 1
-            state.drop_queue_item(rows[0]["id"])
+            loop_store.drop_queue_item(rows[0]["id"])
         finally:
             for p in procs:
                 if p.poll() is None:

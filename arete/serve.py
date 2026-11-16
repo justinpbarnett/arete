@@ -40,6 +40,7 @@ from . import (
     sessions,
     sources,
     state,
+    store,
     tasks,
     tool_events,
     util,
@@ -47,7 +48,10 @@ from . import (
 )
 from .loops import Loop
 from .store import db as foundation
+from .store import incidents as incident_store
+from .store import loops as loop_store
 from .store import runs as run_store
+from .store import sources as source_store
 
 TICK_SECONDS = 20
 PRUNE_SECONDS = 3600
@@ -61,7 +65,7 @@ POLL_THREADS = 8
 def mergecheck_reset(loop: Loop, item: dict) -> str:
     from . import mergecheck
 
-    payload = state.queue_item(item["id"])
+    payload = loop_store.queue_item(item["id"])
     names = {e.get("repo", "") for e in payload["payload"]} if payload else set()
     return max((mergecheck.held_until(loop.dir, name) for name in names), default="")
 
@@ -305,7 +309,7 @@ class Server:
         if not self.guard("tick:load", self.load) or self.code_problem:
             return
         self.guard("stage:reap", self.reap)
-        states = self.guard("stage:states", state.loop_states)
+        states = self.guard("stage:states", loop_store.loop_states)
         if states is not None:
             now = util.now()
             for loop in self.live:
@@ -392,7 +396,7 @@ class Server:
         if self.failing or fresh:
             return
         if self.alert_open or not self.alert_checked:
-            was_open = self.alert_open or bool(state.alert_get(ALERT_KEY))
+            was_open = self.alert_open or bool(incident_store.alert_get(ALERT_KEY))
             self.alert_open = False
             self.alert_checked = True
             if was_open:
@@ -454,7 +458,7 @@ class Server:
             self.copy_off_machine(made)
         limits = self.cfg.retention
         try:
-            state.prune(lines_days=limits.lines_days, keep_days=self.cfg.oncall.keep_days)
+            store.prune(lines_days=limits.lines_days, keep_days=self.cfg.oncall.keep_days)
         except Exception as e:
             self.say(f"state prune failed: {type(e).__name__}: {util.first_line(str(e), 300)}")
         try:
@@ -504,16 +508,16 @@ class Server:
         if not (t.cron or t.every):
             return
         if not st.get("last_fire"):
-            state.set_loop_state(loop.name, last_fire=util.iso(now), next_due=next_due(loop, now))
+            loop_store.set_loop_state(loop.name, last_fire=util.iso(now), next_due=next_due(loop, now))
             return
         if is_due(loop, st["last_fire"], now):
             self.fire(loop, "cron" if t.cron else "every", now)
         elif st.get("next_due") != (due := next_due(loop, util.parse_iso(st["last_fire"]))):
-            state.set_loop_state(loop.name, next_due=due)
+            loop_store.set_loop_state(loop.name, next_due=due)
 
     def fire(self, loop: Loop, trigger: str, now: datetime) -> None:
         queued = sources.fire(loop, trigger)
-        state.set_loop_state(loop.name, last_fire=util.iso(now), next_due=next_due(loop, now))
+        loop_store.set_loop_state(loop.name, last_fire=util.iso(now), next_due=next_due(loop, now))
         self.say(f"{loop.name}: fired by {trigger}" if queued else f"{loop.name}: {trigger} fire joins the one that waits")
 
     def poll(self, loop: Loop) -> None:
@@ -586,8 +590,8 @@ class Server:
             found, items = sources.poll(loop, index, self.cfg, say=self.say)
         except Exception as e:
             text = f"{type(e).__name__}: {util.first_line(str(e), 300)}"
-            if (c := state.cursor(sid)) is not None:
-                state.set_cursor(sid, c["value"], False, text)
+            if (c := source_store.cursor(sid)) is not None:
+                source_store.set_cursor(sid, c["value"], False, text)
             if self.errors.get(sid) != text:
                 self.say(f"{sid}: poll failed: {text}")
             self.errors[sid] = text
@@ -598,7 +602,7 @@ class Server:
 
     def dispatch(self, by_name: dict[str, Loop]) -> None:
         slots = QueueSlots(run_store.runs_marked_running())
-        pending = state.pending()
+        pending = loop_store.pending()
         ids = {item["id"] for item in pending}
         self.waiting = {i: why for i, why in self.waiting.items() if i in ids}
         self.settle("queue:", {str(i) for i in ids})
@@ -608,7 +612,7 @@ class Server:
     def dispatch_queued(self, item: dict, by_name: dict[str, Loop], slots: QueueSlots) -> None:
         loop = by_name.get(item["loop"])
         if not loop or not loop.enabled or loop.error:
-            state.drop_queue_item(item["id"])
+            loop_store.drop_queue_item(item["id"])
             self.say(f"{item['loop']}: dropped queue item {item['id']}, the loop is off or gone")
             return
         why = self.dispatch_item(item, loop, slots)
@@ -773,7 +777,7 @@ class Server:
         if not failing:
             self.last_ok = at
         try:
-            pending = len(state.pending())
+            pending = len(loop_store.pending())
         except Exception:
             pending = None
         try:

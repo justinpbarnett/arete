@@ -103,7 +103,7 @@ before = counts()
 def boom(reason):
     raise RuntimeError("distinctive-boom-17")
 s = server()
-with mock.patch.object(backup, "snapshot", boom), mock.patch.object(state, "prune") as pruned, \
+with mock.patch.object(backup, "snapshot", boom), mock.patch.object(store, "prune") as pruned, \
         mock.patch.object(serve.record, "prune") as records:
     s.prune()
 out |= {"said": s.said, "state_pruned": pruned.called, "records_pruned": records.called, "same": counts() == before}

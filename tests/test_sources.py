@@ -83,7 +83,7 @@ poll(server, loop)
     def test_a_poll_that_fails_before_queueing_keeps_its_events_for_the_next_try(self):
         found = self.result(self.BASELINE + self.THREE + '''
 base = snap()
-state.enqueue = failing_once(state.enqueue)
+loop_store.enqueue = failing_once(loop_store.enqueue)
 error = poll(server, loop)
 failed = snap()
 lines = list(server.lines)
@@ -117,11 +117,11 @@ finish({"base": base, "failed": failed, "lines": lines, "healed": healed, "third
         done, _ = self.run_script('''
 loop = make_loop()
 ''' + self.THREE + '''
-real = state.add_event
+real = loop_store.add_event
 def dies(*a, **k):
     real(*a, **k)
     os.kill(os.getpid(), signal.SIGKILL)
-state.add_event = dies
+loop_store.add_event = dies
 server = make_server()
 server.poll(loop)
 server.polls["intake#0"].result(timeout=60)
@@ -150,7 +150,7 @@ def no_enqueue(*a, **k):
     raise sqlite3.OperationalError("enqueue is locked")
 def no_cursor(*a, **k):
     raise sqlite3.OperationalError("cursor is locked")
-state.enqueue, state.set_cursor = no_enqueue, no_cursor
+loop_store.enqueue, source_store.set_cursor = no_enqueue, no_cursor
 error = poll(server, loop)
 finish({"error": str(error), "lines": server.lines})
 ''')
@@ -180,7 +180,7 @@ finish({"snap": snap(), "lines": server.lines})
 loop = make_loop(webhook=True)
 state.migrate()
 body = b'{"title": "hello"}'
-state.enqueue = failing_once(state.enqueue)
+loop_store.enqueue = failing_once(loop_store.enqueue)
 server = web()
 try:
     out = []

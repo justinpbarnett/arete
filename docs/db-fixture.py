@@ -27,6 +27,8 @@ ACTIONS = ("transactions", "concurrent-intake", "transaction-timing", "output-si
 sys.path.insert(0, str(REPO))
 
 from arete.store import db as foundation
+from arete.store import loops as loop_store
+from arete.store import sources as source_store
 
 
 def require(value, detail):
@@ -121,10 +123,10 @@ def transactions():
 
     with mock.patch.object(foundation, "connect_db", connect):
         with foundation.tx() as c:
-            item = state.enqueue("nested", "default", "", "fixture")
+            item = loop_store.enqueue("nested", "default", "", "fixture")
             with foundation.db() as joined, foundation.reader() as read:
                 require(c is joined is read, "writer ownership was not shared")
-                require(state.queue_item(item)["loop"] == "nested", "joined helper lost uncommitted write")
+                require(loop_store.queue_item(item)["loop"] == "nested", "joined helper lost uncommitted write")
                 require(c.in_transaction, "nested exit committed")
             require(c.in_transaction, "nested scope ended ownership")
     require(len(connections) == 1, connections)
@@ -135,15 +137,15 @@ def transactions():
     for error in (ValueError, KeyboardInterrupt):
         try:
             with foundation.tx():
-                state.enqueue("rollback", "default", "", "fixture")
-                state.add_event("rollback", event)
+                loop_store.enqueue("rollback", "default", "", "fixture")
+                loop_store.add_event("rollback", event)
                 raise error("rollback")
         except error:
             pass
         with foundation.one_read() as c:
             require(c.execute("SELECT count(*) FROM queue WHERE loop='rollback'").fetchone()[0] == 0, "queue committed")
             require(c.execute("SELECT count(*) FROM events WHERE loop='rollback'").fetchone()[0] == 0, "event committed")
-        state.set_cursor("after-error", "ok", True)
+        source_store.set_cursor("after-error", "ok", True)
 
     class CommitFailure(sqlite3.Connection):
         def execute(self, sql, *args):
@@ -156,12 +158,12 @@ def transactions():
 
     def failed_write():
         with foundation.tx():
-            state.enqueue("commit-failure", "default", "", "fixture")
+            loop_store.enqueue("commit-failure", "default", "", "fixture")
 
     with mock.patch.object(foundation, "checked_connection", failing):
         expect(sqlite3.OperationalError, failed_write)
-    require(not any(r["loop"] == "commit-failure" for r in state.pending()), "failed commit persisted")
-    parallel(lambda i: state.set_cursor(f"thread-{i}", "ok", True))
+    require(not any(r["loop"] == "commit-failure" for r in loop_store.pending()), "failed commit persisted")
+    parallel(lambda i: source_store.set_cursor(f"thread-{i}", "ok", True))
     trace.clear()
     connections.clear()
     ready, done = threading.Event(), threading.Event()
@@ -170,16 +172,16 @@ def transactions():
     def writer():
         try:
             ready.set()
-            state.set_cursor("snapshot", "new", True)
+            source_store.set_cursor("snapshot", "new", True)
             done.set()
         except BaseException as e:
             faults.append(str(e))
 
-    state.set_cursor("snapshot", "old", True)
+    source_store.set_cursor("snapshot", "old", True)
     with mock.patch.object(foundation, "connect_db", connect):
         with foundation.one_read() as c, foundation.reader() as nested:
             require(c is nested, "read snapshots did not join")
-            require(state.cursor("snapshot", foundation.reader)["value"] == "old", "initial snapshot")
+            require(source_store.cursor("snapshot", foundation.reader)["value"] == "old", "initial snapshot")
             before = len(connections)
             for scope in (foundation.tx, foundation.db):
                 expect(RuntimeError, lambda: scope().__enter__())
@@ -189,7 +191,7 @@ def transactions():
             require(ready.wait(5), "writer did not start")
             time.sleep(.15)
             require(not done.is_set(), "writer committed through a read snapshot")
-            require(state.cursor("snapshot", foundation.reader)["value"] == "old", "snapshot changed")
+            require(source_store.cursor("snapshot", foundation.reader)["value"] == "old", "snapshot changed")
         worker.join(10)
         require(not worker.is_alive() and done.is_set() and not faults, faults)
     evidence["snapshot"] = {"connections": connections[:], "trace": trace[:]}
@@ -206,22 +208,22 @@ def transactions():
     state.clear_holds(["new-auth"], "9999")
     require(not state.holds(), "linked holds were not cleared")
     evidence["capture"] = captures()
-    retry = state.enqueue("retry", "default", "", "fixture", [event])
-    require(state.take_queue_item(retry, "missing-run"), "claim failed")
-    state.release_settled_claims()
-    require(state.queue_item(retry)["run_id"] is None, "settled claim not released")
-    state.take_queue_item(retry, "dead-run")
-    state.end_claim("dead-run", "dead", "fixture")
-    require(any(r["id"] == retry for r in state.dead_items()), "dead item lost")
-    state.requeue_item(retry)
-    require(state.queue_item(retry)["attempts"] == 0, "requeue did not reset attempts")
+    retry = loop_store.enqueue("retry", "default", "", "fixture", [event])
+    require(loop_store.take_queue_item(retry, "missing-run"), "claim failed")
+    loop_store.release_settled_claims()
+    require(loop_store.queue_item(retry)["run_id"] is None, "settled claim not released")
+    loop_store.take_queue_item(retry, "dead-run")
+    loop_store.end_claim("dead-run", "dead", "fixture")
+    require(any(r["id"] == retry for r in loop_store.dead_items()), "dead item lost")
+    loop_store.requeue_item(retry)
+    require(loop_store.queue_item(retry)["attempts"] == 0, "requeue did not reset attempts")
     staged = paths.STATE_DIR / "staged.db"
     shutil.copyfile(paths.DB_FILE, staged)
     with foundation.tx() as live:
         live_before = backup.sequences(live)
         backup.raise_sequences(staged, {"queue": 100000})
         require(backup.sequences(live) == live_before, "restore touched live database")
-        require(state.enqueue("after-restore", "default", "", "fixture") < 100000, "live sequence changed")
+        require(loop_store.enqueue("after-restore", "default", "", "fixture") < 100000, "live sequence changed")
         with sqlite3.connect(staged) as c:
             require(backup.sequences(c)["queue"] >= 100000, "staged sequence did not rise")
     backup.raise_sequences(staged, None)
@@ -392,14 +394,14 @@ def oncall_exercise():
             except ValueError as e:
                 require(e is failure, "original failure replaced")
         require(order == ["acquired", "crashed", "released"], order)
-    require(not state.cursor(oncall.SCAN)["ok"], "crash unrecorded")
+    require(not source_store.cursor(oncall.SCAN)["ok"], "crash unrecorded")
     def successful(cfg):
-        state.set_cursor(oncall.SCAN, "success", True)
+        source_store.set_cursor(oncall.SCAN, "success", True)
         return {"ok": True}
 
     with mock.patch.object(oncall, "scan_once", successful):
         require(oncall.scan(cfg) == {"ok": True}, "subsequent scan failed")
-    require(state.cursor(oncall.SCAN)["ok"], "successful scan remained crashed")
+    require(source_store.cursor(oncall.SCAN)["ok"], "successful scan remained crashed")
     with mock.patch.object(oncall, "scan_once", side_effect=failure), \
             mock.patch.object(oncall, "crashed", side_effect=OSError("crash record unavailable")):
         try:
@@ -447,13 +449,13 @@ def concurrent_intake():
             c.execute("UPDATE seen SET ts=? WHERE source=? AND key=?",
                       (util.iso(util.now() - timedelta(minutes=11)), loop.name + "#webhook", first["key"]))
         require(webhooks.receive(loop.name, {}, b'{"title":"body"}')["queued"], "body key did not expire")
-    before = state.cursor(sid)
-    owner = state.source_owner(sid)
+    before = source_store.cursor(sid)
+    owner = source_store.source_owner(sid)
     event = sources.event("command", sid, "retry", "retry")
     with mock.patch.object(source, "fetch", return_value=([event], "retry")):
-        with mock.patch.object(state, "enqueue", side_effect=ValueError("after seen")):
+        with mock.patch.object(loop_store, "enqueue", side_effect=ValueError("after seen")):
             expect(ValueError, lambda: sources.poll(loop, 0, cfg))
-        require(state.cursor(sid) == before and state.source_owner(sid) == owner, "failed poll partially committed")
+        require(source_store.cursor(sid) == before and source_store.source_owner(sid) == owner, "failed poll partially committed")
         with foundation.reader() as c:
             require(not c.execute("SELECT 1 FROM seen WHERE source=? AND key='retry'", (sid,)).fetchone(), "seen leaked")
             require(not c.execute("SELECT 1 FROM events WHERE key='retry'").fetchone(), "events leaked")
@@ -470,37 +472,37 @@ def concurrent_intake():
         future = pool.submit(sources.poll, loop, 0, cfg)
         try:
             require(fetching.wait(5), "fetch did not start")
-            state.set_cursor("network-independent", "ok", True)
+            source_store.set_cursor("network-independent", "ok", True)
         finally:
             release.set()
         future.result(timeout=10)
-    state.set_cursor("serialized", "old", True, started="2026-01-01T00:00:00Z")
+    source_store.set_cursor("serialized", "old", True, started="2026-01-01T00:00:00Z")
     ready = threading.Event()
 
     def failed_poll():
         ready.set()
-        state.set_cursor("serialized", None, False)
+        source_store.set_cursor("serialized", None, False)
 
     with ThreadPoolExecutor(max_workers=1) as pool:
         with foundation.tx():
             future = pool.submit(failed_poll)
             require(ready.wait(5), "cursor waiter not started")
-            state.set_cursor("serialized", "new", True, started="2026-01-01T01:00:00Z")
+            source_store.set_cursor("serialized", "new", True, started="2026-01-01T01:00:00Z")
         future.result(timeout=10)
-    row = state.cursor("serialized")
+    row = source_store.cursor("serialized")
     require(row["value"] == "new" and row["last_ok"] == "2026-01-01T01:00:00Z" and not row["ok"], row)
     old = replace(loop, name="legacy", sources=[{"type": "command", "command": "fake"}])
-    state.set_cursor("legacy#0", "history", True)
-    state.set_source_owner("legacy#0", sources.legacy_fingerprint(old.sources[0]))
+    source_store.set_cursor("legacy#0", "history", True)
+    source_store.set_source_owner("legacy#0", sources.legacy_fingerprint(old.sources[0]))
     named = replace(old, sources=[{**old.sources[0], "name": "named"}])
     sources.adopt_history(named, 0, named.sources[0], "legacy#named")
-    require(state.cursor("legacy#named")["value"] == "history", "named adoption lost history")
+    require(source_store.cursor("legacy#named")["value"] == "history", "named adoption lost history")
     changed = replace(named, sources=[{**named.sources[0], "name": "edited", "timeout": 3}])
     sources.adopt_history(changed, 0, changed.sources[0], "legacy#edited")
-    require(state.cursor("legacy#edited") is None, "name plus settings edit adopted legacy history")
+    require(source_store.cursor("legacy#edited") is None, "name plus settings edit adopted legacy history")
     evidence.update({"source_polls": results, "empty_fire": empty, "webhooks": hooks,
                      "cursor_serialization": row, "rollback_and_retry": True, "fetch_outside_tx": True,
-                     "identity_adoption": True, "pending": state.pending()})
+                     "identity_adoption": True, "pending": loop_store.pending()})
     return evidence
 
 
@@ -631,7 +633,7 @@ def summary_exercise():
         return sum(g["count"] for s in dbstats.SUMMARIES.values() for g in s["transactions"].values())
 
     before = count()
-    parallel(lambda i: state.set_cursor(f"summary-{i}", "fast", True), count=8)
+    parallel(lambda i: source_store.set_cursor(f"summary-{i}", "fast", True), count=8)
     require(count() == before + 8, "thread summary updates lost")
     identity = dbstats.database_identity(paths.DB_FILE)
     other = paths.STATE_DIR / "other.db"
@@ -1848,7 +1850,7 @@ def event_contract():
             with foundation.tx() as conn:
                 conn.execute("UPDATE runs SET schema_version=NULL WHERE id='older'")
             require(foundation.migrate(), "unstamped run did not block contract")
-            state.add_event("pending", {"type": "finding", "source": "fixture", "key": kind})
+            loop_store.add_event("pending", {"type": "finding", "source": "fixture", "key": kind})
             with foundation.tx() as conn:
                 conn.execute("UPDATE runs SET status='done' WHERE id='older'")
             for stamp in (3, None):
@@ -1857,7 +1859,7 @@ def event_contract():
             stop_child(sleeper)
             require(not foundation.migrate(), "contract did not finish")
             control.BEAT_FILE.unlink()
-            state.add_event("after", {"type": "finding", "source": "fixture", "key": kind})
+            loop_store.add_event("after", {"type": "finding", "source": "fixture", "key": kind})
             with foundation.one_read() as conn:
                 columns = [r[1] for r in conn.execute("PRAGMA table_info(events)")]
                 meta = dict(conn.execute("SELECT key,value FROM schema_meta"))
@@ -1878,7 +1880,7 @@ def event_contract():
     events = [sources.event(kind, "fixture", kind, kind, trust="internal", data={"text": "x" * 30000})
               for kind in ("command", "finding")]
     item = sources.fire(loop, "fixture", events)[0]
-    require(state.queue_item(item)["payload"] == events, "queue truncated events")
+    require(loop_store.queue_item(item)["payload"] == events, "queue truncated events")
     from arete.agent import Result
 
     with mock.patch.object(control, "working_loop", return_value=loop), \
@@ -2162,7 +2164,7 @@ def timed_writer():
     from arete import state
 
     with foundation.tx():
-        state.set_cursor("timed-writer", "ok", True)
+        source_store.set_cursor("timed-writer", "ok", True)
 
 
 def child_main(role, args):
@@ -2366,7 +2368,7 @@ def child_main(role, args):
         Path(args[1]).touch()
     elif role == "commit-writer":
         with foundation.tx():
-            state.set_cursor("commit-wait", "ok", True)
+            source_store.set_cursor("commit-wait", "ok", True)
             Path(args[0]).touch()
     elif role == "timed-error":
         def operation():

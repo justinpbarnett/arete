@@ -11,6 +11,7 @@ from typing import Literal
 
 from . import alerts, config, doctor, paths, state, tool_events, tracker, util
 from .heartbeat import mark_loop
+from .store import incidents as incident_store
 from .store import runs as run_store
 
 AUDIT_DIR = paths.STATE_DIR / "audit"
@@ -349,7 +350,7 @@ def run(dry_run: bool = False) -> int:
                                      f"{n} broken; first: {first.subject}", dry_run)
             if msg:
                 print(msg)
-        for a in state.alerts():
+        for a in incident_store.alerts():
             if a["key"].startswith("audit:") and a["key"][6:] not in fails_per_check:
                 msg = alerts.clear_alert(cfg.alert_repo, a["key"], dry_run)
                 if msg:

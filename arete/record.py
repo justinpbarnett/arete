@@ -23,6 +23,7 @@ from typing import Self
 
 from . import agent, codebase, paths, run_lines, scrub, state, util
 from .store import db as foundation
+from .store import loops as loop_store
 from .store import runs as run_store
 
 SETTLE_GRACE_SECONDS = 60
@@ -186,7 +187,7 @@ def reap(*, tickets: bool, then: Callable[[dict], None] = lambda row: None) -> l
                 then(done)
                 settled.append(done)
     if not tickets:
-        state.release_settled_claims()
+        loop_store.release_settled_claims()
     return settled
 
 

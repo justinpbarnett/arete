@@ -2,7 +2,8 @@
 import hashlib, hmac, json, os, signal, sqlite3, sys, threading, urllib.error, urllib.request
 from datetime import timedelta
 from pathlib import Path
-from arete import config, dashboard, webhooks, loops, paths, serve, sources, state, tailnet, util
+from arete.store import loops as loop_store, sources as source_store
+from arete import store, config, dashboard, webhooks, loops, paths, serve, sources, state, tailnet, util
 state.migrate()
 root = Path(os.environ["INTAKE_ROOT"])
 rows = root / "rows.jsonl"

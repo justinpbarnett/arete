@@ -27,6 +27,8 @@ from . import (
 )
 from .alerts import issue_link, opened_in
 from .store import db as foundation
+from .store import incidents as incident_store
+from .store import loops as loop_store
 from .store import runs as run_store
 
 RECENT_RUNS = 25
@@ -154,7 +156,7 @@ def checks() -> dict:
         "heartbeat": beat.get("ts", ""), "running": "heartbeat" in loops_running(),
         "checks": [{**c, "state": "ok" if c["ok"] else STATE_OF_SEVERITY.get(c["severity"], "fault")}
                    for c in sorted(beat.get("checks", []), key=lambda c: (c["ok"], c["key"]))],
-        "loops": [{"name": k, **v} for k, v in sorted(state.loop_marks(connect=foundation.reader).items())],
+        "loops": [{"name": k, **v} for k, v in sorted(loop_store.loop_marks(connect=foundation.reader).items())],
     }
 
 
@@ -162,7 +164,7 @@ def alerts() -> dict:
     alert_repo = config.load_or_problem()[0].alert_repo
     return {
         "alerts": [{**a, "repo": opened_in(a, alert_repo), "url": issue_link(a, alert_repo)}
-                   for a in state.alerts(connect=foundation.reader)],
+                   for a in incident_store.alerts(connect=foundation.reader)],
         "probes": state.probes(connect=foundation.reader),
     }
 
@@ -254,7 +256,7 @@ def ready_in_one_click(v: dict) -> list[dict]:
 
 def checks_and_alerts() -> dict:
     return {"checks": panel(checks), "alerts": panel(alerts),
-            "incidents": panel(lambda: state.blocked_incidents(connect=foundation.reader))}
+            "incidents": panel(lambda: incident_store.blocked_incidents(connect=foundation.reader))}
 
 
 def health_word(beat: dict, found: dict) -> str:
@@ -291,7 +293,7 @@ def incident_row(r: dict) -> dict:
 
 def incidents_board() -> dict:
     cfg = config.load_or_problem()[0]
-    rows = state.incidents(connect=foundation.reader, open_first=True)
+    rows = incident_store.incidents(connect=foundation.reader, open_first=True)
     return {"now": util.iso(), "watcher": watcher(cfg), "incidents": [incident_row(r) for r in rows]}
 
 
@@ -305,7 +307,7 @@ def incident_repair(repair: dict, number: int, runs: list[dict], paid: dict[str,
 
 def incident_board(text: str) -> dict:
     cfg = config.load_or_problem()[0]
-    r = state.incident(incident_number(text), connect=foundation.reader, last_notes=INCIDENT_NOTES)
+    r = incident_store.incident(incident_number(text), connect=foundation.reader, last_notes=INCIDENT_NOTES)
     if r is None:
         raise control.NotFound(f"no incident {text}")
     made = {x["id"]: [] if not x["task"] else run_store.ticket_runs(x["repo"], x["task"], limit=50, connect=foundation.reader)

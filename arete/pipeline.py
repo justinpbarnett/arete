@@ -55,6 +55,7 @@ from . import (
 from .agent import NO_SESSION, Result, Session
 from .review import REVIEW_SCHEMA, Review, numbered
 from .store import runs as run_store
+from .store import sources as source_store
 from .util import git
 
 ADW = "adw"
@@ -1205,7 +1206,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 run_lines.write(done["id"], "error", step=run_lines.last_step(done["id"]), message=done.get("summary") or "")
             write_report(done)
         opening_waits(run_id, run.answering,
-                      "" if dry_run or run.alone else state.take_passed_over(repo.name, str(tid)))
+                      "" if dry_run or run.alone else source_store.take_passed_over(repo.name, str(tid)))
         if restarting:
             run.log(f"restarting after run {earlier['id']} was interrupted")
         flow = (flows.start(cfg, run, earlier if restarting else {}, slot, script.continues, script.only,

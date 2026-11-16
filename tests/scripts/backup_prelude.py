@@ -4,7 +4,8 @@ from datetime import timedelta
 from pathlib import Path
 from unittest import mock
 from arete.store import runs as run_store
-from arete import backup, cli, config, control, heartbeat, install, paths, serve, settings, state, util
+from arete.store import loops as loop_store, sources as source_store
+from arete import store, backup, cli, config, control, heartbeat, install, paths, serve, settings, state, util
 from arete.lab import optimize
 root = Path(sys.argv[1])
 util.last_wake = lambda: 0.0

@@ -155,10 +155,6 @@ def run_lock(kind: str, repo: str | None = None, issue: int | str | None = None)
             "eval": f"eval-{repo}", "experiment": f"experiment-{repo}", "eval-mine": "eval-mine", "miner": "mine"}[kind]
 
 
-def loop_lock(name: str) -> str:
-    return "loop-" + name.replace("/", ".")
-
-
 def run_get(run_id: str, connect=reader) -> dict | None:
     with connect() as c:
         r = c.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()

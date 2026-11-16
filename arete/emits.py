@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from . import config, gh, outbound, screening, sources, state, util
+from . import config, gh, outbound, screening, sources, util
 from .loops import FINDING_EVENT, Loop, as_list, find, trust_rank, worktree_kinds
+from .store import loops as loop_store
 
 SEVERITIES = ("low", "medium", "high", "critical")
 FALL_BACK_TO_RUN_CONFIG_REPO = ""
@@ -152,7 +153,7 @@ class Ticket(Emit):
 
     def landed(self, batch: list[dict], loop_name: str, url: str) -> None:
         for f in batch:
-            state.set_finding_url(loop_name, f["fingerprint_key"], url)
+            loop_store.set_finding_url(loop_name, f["fingerprint_key"], url)
 
     def describe(self, item: dict) -> str:
         return f"file a ticket on {item['repo']} [{', '.join(item['labels'])}]: {item['title']}"

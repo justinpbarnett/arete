@@ -35,6 +35,7 @@ from .pipeline import (
 )
 from .slots import slots_free_to_start
 from .store import runs as run_store
+from .store import sources as source_store
 from .workspace import cleanup_worktrees
 
 MAX_STARTS_PER_POLL = 64
@@ -194,7 +195,7 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: tuple[str, str], skip
     answering = not reply and pipeline.answered_run(repo.name, str(tid)) is not None
     if not answering and not reply and (waiting := held_back(cfg, repo.name, going, slots)):
         if not dry_run:
-            state.pass_over(repo.name, str(tid))
+            source_store.pass_over(repo.name, str(tid))
         print(f"{util.iso()} {name}: waiting, {waiting}")
         return "held"
     blocked, _ = runlimits.admission(repo, str(tid), source, runlimits.Policy.of(layer), False)
@@ -207,7 +208,7 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: tuple[str, str], skip
         return "blocked"
     print(f"{util.iso()} {name}: {why}" + (" (dry run, not started)" if dry_run else ""))
     if not dry_run:
-        state.drop_passed_over(repo.name, keep=str(tid))
+        source_store.drop_passed_over(repo.name, keep=str(tid))
         if not spawn_unparked(repo.name, tid):
             return "refused"
     return "started"
@@ -227,7 +228,7 @@ def fill_slots(cfg: config.Config, queues: list[RepoQueue], skips: pipeline.Skip
                 if not pick:
                     exhausted.add(repo.name)
                     if not dry_run:
-                        state.drop_passed_over(repo.name)
+                        source_store.drop_passed_over(repo.name)
                     continue
                 queue.selected.add(str(pick[0]))
                 examined += 1

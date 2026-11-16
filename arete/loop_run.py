@@ -40,6 +40,7 @@ from . import (
 from .agent import Result
 from .loops import Loop
 from .store import db as foundation
+from .store import loops as loop_store
 from .store import runs as run_store
 
 KNOWN_FINDINGS_SHOWN = 30
@@ -323,10 +324,10 @@ def launch(name: str, *, item: int | None = None, events: list[dict] | None = No
            detach: bool = True, run_id: str = "", cfg: config.Config | None = None) -> dict:
     cfg = cfg or config.load()
     loop = control.working_loop(name, cfg)
-    with util.lock_file(run_store.loop_lock(loop.name)) as held:
+    with util.lock_file(loop_store.loop_lock(loop.name)) as held:
         if not util.take_lock(held, wait=False):
             raise control.Busy(loop.name)
-        fire = state.queue_item(item) if item is not None else None
+        fire = loop_store.queue_item(item) if item is not None else None
         if item is not None and (not fire or fire["run_id"] is not None):
             raise control.NotFound(f"queue item {item} is gone or already claimed")
         for stale in run_store.runs_marked_running():
@@ -335,12 +336,12 @@ def launch(name: str, *, item: int | None = None, events: list[dict] | None = No
         run = LoopRun(loop, run_id or record.new_id(loop.name), cfg, trial=trial,
                       trigger="try" if trial else (fire["trigger"] if fire else "manual"),
                       events=list(events or (fire["payload"] if fire else [])))
-        record.start("loop", run_id=run.id, lock=run_store.loop_lock(loop.name), pid=None if detach else os.getpid(),
+        record.start("loop", run_id=run.id, lock=loop_store.loop_lock(loop.name), pid=None if detach else os.getpid(),
                      repo=loop.repo or None, loop=loop.name, loop_kind=loop.kind, trigger=run.trigger,
                      device=loop.device, queue=loop.queue_name, grp=fire["grp"] if fire else "",
                      log=paths.short_path(run.log_file), model=loop.model_for(cfg) if loop.agent else "",
                      runner=routing.route(loop.model_for(cfg), loop.runner)[0] if loop.agent else "")
-        if fire and not state.take_queue_item(item, run.id):
+        if fire and not loop_store.take_queue_item(item, run.id):
             why = f"queue item {item} was taken by another run"
             settle(run, "skipped", why)
             raise control.NotFound(why)
@@ -383,7 +384,7 @@ def carry_opened(run_id: str) -> str:
 
 def carry(run: LoopRun) -> str:
     if spent := spent_limit(run.loop, run.cfg):
-        state.release_claimed_items(run.id)
+        loop_store.release_claimed_items(run.id)
         return settle(run, "skipped", f"budget: {spent} is spent, so its input waits in the queue")
     run.scratch.mkdir(parents=True, exist_ok=True)
     how = "drop"
@@ -401,7 +402,7 @@ def carry(run: LoopRun) -> str:
         if status == "stopped":
             how = "dead" if summary == record.STOPPED else "retry"
     summary = devices.with_left_up(summary, run.id)
-    state.end_claim(run.id, "dead" if status == "failed" else how, summary)
+    loop_store.end_claim(run.id, "dead" if status == "failed" else how, summary)
     return settle(run, status, summary)
 
 
@@ -465,7 +466,7 @@ def command_loop(run: LoopRun) -> tuple[str, str]:
         from . import mergecheck
 
         if mergecheck.builtin(loop) and code == mergecheck.HOLD_EXIT:
-            state.release_claimed_items(run.id)
+            loop_store.release_claimed_items(run.id)
             return "skipped", "merge-check quota hold; input waits until the next UTC day"
         return "failed", f"{took}: {util.first_line(lines[-1] if lines else '', 300)}"
     from . import mergecheck
@@ -529,7 +530,7 @@ def known_twins(run: LoopRun, unseen: list[dict]) -> dict[int, dict]:
         return {}
     if not unseen or not jev.ready(run.cfg, [loop_repo(run)]):
         return {}
-    known = state.findings(run.loop.name, KNOWN_FINDINGS_ASKED)
+    known = loop_store.findings(run.loop.name, KNOWN_FINDINGS_ASKED)
     if not known:
         return {}
     options = {"new": "a different problem from every known finding below",
@@ -553,20 +554,20 @@ def new_findings(run: LoopRun, found: list[dict]) -> list[dict]:
     fresh = []
     for f in found:
         f["fingerprint_key"] = fingerprint_key(run.loop, f)
-    twins = known_twins(run, [f for f in found if not state.finding_seen(run.loop.name, f["fingerprint_key"])])
+    twins = known_twins(run, [f for f in found if not loop_store.finding_seen(run.loop.name, f["fingerprint_key"])])
     for f in found:
         if twin := twins.get(id(f)):
             if run.trial:
                 continue
             f["fingerprint_key"] = twin["fingerprint"]
-            is_new = state.record_finding(run.loop.name, twin["fingerprint"], twin.get("fingerprint_text") or "",
+            is_new = loop_store.record_finding(run.loop.name, twin["fingerprint"], twin.get("fingerprint_text") or "",
                                           twin["title"], twin.get("url") or "", run.id)
             if not is_new:
                 continue
         elif run.trial:
-            is_new = mergecheck.builtin(run.loop) or not state.finding_seen(run.loop.name, f["fingerprint_key"])
+            is_new = mergecheck.builtin(run.loop) or not loop_store.finding_seen(run.loop.name, f["fingerprint_key"])
         else:
-            is_new = state.record_finding(run.loop.name, f["fingerprint_key"], fingerprint_text(f),
+            is_new = loop_store.record_finding(run.loop.name, f["fingerprint_key"], fingerprint_text(f),
                                           outbound.plain(f.get("title"), 200), "", run.id)
         run.log("finding", f"{'new' if is_new else 'seen before'}: {outbound.plain(f.get('title'), 200)}")
         if is_new:
@@ -576,7 +577,7 @@ def new_findings(run: LoopRun, found: list[dict]) -> list[dict]:
 
 def hand_on(run: LoopRun, fresh: list[dict]) -> None:
     if fresh and not run.trial:
-        state.mark_emitted(run.loop.name, [f["fingerprint_key"] for f in fresh], run.id)
+        loop_store.mark_emitted(run.loop.name, [f["fingerprint_key"] for f in fresh], run.id)
 
 
 def watch_input(run: LoopRun) -> list[dict]:
@@ -648,7 +649,7 @@ def known_finding(row: dict) -> str:
 
 def watch_prompt(run: LoopRun, events: list[dict], memory: dict) -> str:
     loop = run.loop
-    known = state.findings(loop.name, KNOWN_FINDINGS_SHOWN)
+    known = loop_store.findings(loop.name, KNOWN_FINDINGS_SHOWN)
     parts = [loops.prompt_text(loop).strip(), "---",
              f"Loop `{loop.name}`, run `{run.id}`, at {util.iso()}."]
     parts.append("## Memory from the last run\n\n" + (fenced(memory) if memory else "Nothing yet; this is the first "
@@ -681,7 +682,7 @@ def watch_loop(run: LoopRun) -> tuple[str, str]:
     events = classify(run, events)
     if arrived and not events:
         return "skipped", f"the classifier passed none of {util.count(arrived, 'event')}"
-    memory = state.loop_state(loop.name)["data"]
+    memory = loop_store.loop_state(loop.name)["data"]
     res = run.agent("watch", watch_prompt(run, events, memory), agent_dir(run), tools=loop.tools,
                     json_schema=WATCH_SCHEMA)
     if not res.ok:
@@ -693,7 +694,7 @@ def watch_loop(run: LoopRun) -> tuple[str, str]:
     found = [f for f in answer.get("findings") or [] if isinstance(f, dict) and f.get("title")]
     fresh = new_findings(run, found)
     if not run.trial and isinstance(answer.get("state"), dict):
-        state.set_loop_state(loop.name, data=answer["state"])
+        loop_store.set_loop_state(loop.name, data=answer["state"])
     summary = util.first_line(answer["summary"] if isinstance(answer.get("summary"), str) else "", 300)
     outcome = {"summary": summary, "trust": weakest_trust(events)}
     if fresh:

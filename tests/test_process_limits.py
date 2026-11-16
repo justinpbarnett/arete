@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from arete.store import runs as run_store
+from arete import store
 from arete import (
     child,
     cli,
@@ -1153,7 +1154,7 @@ class RecordRetentionTests(Isolated):
     def test_serve_prune_removes_records_and_prunes_state_once(self):
         old = self.written("pip-old", 40)
         server = serve.Server()
-        with patch.object(state, "prune") as pruned:
+        with patch.object(store, "prune") as pruned:
             server.prune()
         pruned.assert_called_once_with(lines_days=90, keep_days=server.cfg.oncall.keep_days)
         self.assertFalse(old.exists())

@@ -19,14 +19,15 @@ from . import (
     refusals,
     run_lines,
     sources,
-    state,
     util,
     webhooks,
 )
 from .agent import billing_of
 from .loops import Loop
 from .store import db as foundation
+from .store import loops as loop_store
 from .store import runs as run_store
+from .store import sources as source_store
 
 AB_DAYS = 30
 AB_MIN_TICKETS = 20
@@ -152,10 +153,10 @@ def day_ago() -> str:
 def loop_views(cfg: config.Config | None = None, connect=foundation.reader) -> list[dict]:
     cfg = cfg or config.load_or_problem()[0]
     every_loop = loops.load_all(cfg)
-    states = state.loop_states(connect)
+    states = loop_store.loop_states(connect)
     running = {r["loop"]: r["id"] for r in run_store.runs_marked_running(connect) if r["kind"] == "loop"}
-    waiting = Counter(item["loop"] for item in state.pending(connect))
-    dead = Counter(item["loop"] for item in state.dead_items(connect))
+    waiting = Counter(item["loop"] for item in loop_store.pending(connect))
+    dead = Counter(item["loop"] for item in loop_store.dead_items(connect))
     spent: dict[str, float] = defaultdict(float)
     for s in run_store.steps_since(day_ago(), connect):
         if billing_of(s, cfg.local_providers) == "api_key":
@@ -180,13 +181,13 @@ def loop_detail(name: str, connect=foundation.reader) -> dict:
     source_ids = {sources.source_id(loop, i) for i in range(len(loop.sources))}
     runs = run_store.runs(kind="loop", loop=loop.name, limit=25, firings=True, connect=connect)
     paid = run_store.paid_by_run([r["id"] for r in runs], connect)
-    return {**view, "prompt": loops.prompt_text(loop), "state": state.loop_state(loop.name, connect)["data"],
+    return {**view, "prompt": loops.prompt_text(loop), "state": loop_store.loop_state(loop.name, connect)["data"],
             "runs": [{**r, "paid": paid.get(r["id"], 0)} for r in runs],
-            "findings": state.findings(loop.name, 40, connect),
-            "waiting": [i for i in state.pending(connect) if i["loop"] == loop.name],
+            "findings": loop_store.findings(loop.name, 40, connect),
+            "waiting": [i for i in loop_store.pending(connect) if i["loop"] == loop.name],
             "dead": [{k: v for k, v in i.items() if k != "loop"}
-                     for i in state.dead_items(connect) if i["loop"] == loop.name],
-            "cursors": [c for c in state.cursors(connect) if c["source"] in source_ids],
+                     for i in loop_store.dead_items(connect) if i["loop"] == loop.name],
+            "cursors": [c for c in source_store.cursors(connect) if c["source"] in source_ids],
             "webhook_path": webhooks.hook_path(loop.name) if loop.trigger.webhook else "",
             "model": loop.model_for(cfg) if loop.agent and not loop.error else "",
             "metered": loop.meters_spend(cfg) if loop.agent else None, "held": loop.usage_hold(cfg, connect)}
