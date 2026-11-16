@@ -11,6 +11,10 @@ from . import config, gh, jira, principals, util
 from .store import tasks as tasks_store
 
 LABEL = "agent"
+BATCH_LABEL = "agent:batch"
+BATCH_LINE = re.compile(r"Batch issues:[ \t]*(.*)")
+BATCH_REFS = re.compile(r"#[1-9][0-9]*(?:[ \t]*,[ \t]*#[1-9][0-9]*)*")
+BATCH_FENCE = re.compile(r"[ \t>]*(?:(?:[-*+]|\d+[.)])[ \t>]+)*(`{3,}|~{3,})(.*)$")
 APPROVAL_LABEL_STYLE = ("0052cc", "Approved for arete to build")
 STATE_COLORS = {"running": "fbca04", "pr": "0e8a16", "failed": "d93f0b", "needs-info": "c5def5"}
 FIX_LABELS = {"bug", "fix"}
@@ -109,6 +113,42 @@ def error_of(call: Callable[[], object]) -> str:
     return ""
 
 
+def batch_ids(t: Ticket) -> list[str]:
+    if BATCH_LABEL not in t.labels:
+        return [t.id]
+    lines = []
+    fence = ""
+    comment = False
+    for line in t.body.splitlines():
+        mark = BATCH_FENCE.fullmatch(line)
+        if fence:
+            if mark and mark[1][0] == fence[0] and len(mark[1]) >= len(fence) and not mark[2].strip():
+                fence = ""
+            continue
+        if not comment and mark and (mark[1][0] != "`" or "`" not in mark[2]):
+            fence = mark[1]
+            continue
+        plain = not comment and "<!--" not in line
+        at = 0
+        while at < len(line):
+            token = "-->" if comment else "<!--"
+            found = line.find(token, at)
+            if found < 0:
+                break
+            comment = not comment
+            at = found + len(token)
+        if plain and (directive := BATCH_LINE.fullmatch(line)):
+            lines.append(directive[1].strip())
+    if len(lines) != 1 or not BATCH_REFS.fullmatch(lines[0]):
+        raise TaskError("a batch needs one visible plain Batch issues: line of comma-separated #numbers from this repo, "
+                        "outside code fences and HTML comments")
+    named = re.findall(r"#([0-9]+)", lines[0])
+    own = str(int(t.id))
+    if own not in named or len(named) > 20:
+        raise TaskError("a batch must include its own issue and name at most 20 issues")
+    return list(dict.fromkeys([own, *named]))
+
+
 _clients: dict[str, jira.Client] = {}
 
 
@@ -133,6 +173,7 @@ class GitHubTracker:
         self.repo = repo
         self.owner = repo.github.split("/")[0]
         self._bodies: dict[str, str] = {}
+        self._labels: dict[str, list[str]] = {}
         self._open: dict[int, bool | None] = {}
 
     @property
@@ -154,11 +195,12 @@ class GitHubTracker:
     def todo(self) -> list[Ticket]:
         skip = {self.label_name(s) for s in config.RUN_LABELS}
         out = []
-        self._bodies, self._open = {}, {}
+        self._bodies, self._labels, self._open = {}, {}, {}
         for i in gh.issues(self.repo.github, LABEL, limit=MAX_AGENT_ISSUES):
             self._bodies[str(i["number"])] = i.get("body") or ""
             self._open[int(i["number"])] = True
             names = {lb["name"] for lb in i.get("labels", [])}
+            self._labels[str(i["number"])] = sorted(names)
             if names & skip or not self.by_owner(i):
                 continue
             out.append(Ticket(str(i["number"]), f"#{i['number']}", i["title"], body=self._bodies[str(i["number"])],
@@ -172,8 +214,11 @@ class GitHubTracker:
     def blocker(self, tid: str) -> str:
         body = self._bodies.get(tid)
         if body is None:
-            body = (gh.issue(self.repo.github, int(tid)) or {}).get("body") or ""
-        return wait_blocker(waits_on(body), self.is_open)
+            issue = gh.issue(self.repo.github, int(tid)) or {}
+            body = issue.get("body") or ""
+            self._labels[tid] = [lb["name"] for lb in issue.get("labels", [])]
+        ticket = Ticket(tid, self.ref(tid), "", body=body, labels=self._labels.get(tid, []))
+        return error_of(lambda: batch_ids(ticket)) or wait_blocker(waits_on(body), self.is_open)
 
     def is_open(self, number: int) -> bool | None:
         if number not in self._open:
@@ -191,6 +236,7 @@ class GitHubTracker:
                 continue
             full = gh.issue(self.repo.github, int(i["number"]))
             self._bodies[str(i["number"])] = full.get("body") or ""
+            self._labels[str(i["number"])] = [lb["name"] for lb in full.get("labels", [])]
             mine = [(datetime.fromisoformat(c["createdAt"]), c.get("body") or "") for c in full.get("comments", [])
                     if self.by_owner(c) and c.get("createdAt")]
             if answered(mine):
@@ -215,10 +261,12 @@ class GitHubTracker:
         blocker = ("" if self.by_owner(i) else f"it was opened by {author or 'someone else'}, not {self.owner}") or (
             "" if LABEL in labels else f"it has no `{LABEL}` label") or wait_blocker(
             waits_on(i.get("body") or ""), self.is_open)
-        return Ticket(str(i["number"]), f"#{i['number']}", i["title"], body=i.get("body") or "(no description)",
+        ticket = Ticket(str(i["number"]), f"#{i['number']}", i["title"], body=i.get("body") or "(no description)",
                       comments=comments_text(comments), open=i.get("state") == "OPEN",
                       kind="fix" if FIX_LABELS & set(labels) else "feat", url=i.get("url", ""),
                       updated=i.get("updatedAt") or "", labels=labels, blocker=blocker)
+        batch_ids(ticket)
+        return ticket
 
     def prepare(self) -> list[str]:
         made = [gh.ensure_label(self.repo.github, LABEL, *APPROVAL_LABEL_STYLE),
@@ -246,7 +294,10 @@ class GitHubTracker:
         return subject
 
     def pr_link(self, t: Ticket, whole: bool) -> str:
-        return f"Closes #{t.id}" if whole else f"Part of #{t.id}"
+        ids = batch_ids(t)
+        if not whole:
+            return f"Part of #{t.id}"
+        return "\n".join(f"Closes #{tid}" for tid in ids)
 
 
 class JiraTracker:

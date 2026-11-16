@@ -1040,6 +1040,7 @@ def open_or_refresh_prs(job: Job, found, staged, size, outcome, subject, draft_w
 @factory.step("pr")
 def pr(flow: factory.Flow, tree: str) -> Outcome:
     job: Job = flow.ctx
+    job.run.tracker.pr_link(job.ticket, whole=not job.left_for_a_person)
     found = adopt_open_prs(job)
     refuse_closed_repair_prs(job)
     fresh, staged, size, outcome, unpushed = settle_unpushed_checkouts(job)
@@ -1176,6 +1177,8 @@ def driven(flow: factory.Flow, drive: Callable[[factory.Flow], tuple[str, str, s
         return drive(flow)
     except workspace.RunFailed as e:
         return finish(flow, "failed", why=e.why, detail=e.detail)
+    except tracker.ERRORS as e:
+        return finish(flow, "failed", why=f"tracker refused {flow.ctx.run.ref}: {e}")
     except owner_asks.Asked as e:
         reached = f"ask limit of {e.limit} reached: " if e.limit is not None else ""
         parks = e.limit is None

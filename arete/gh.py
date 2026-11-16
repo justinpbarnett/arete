@@ -154,9 +154,9 @@ def keyed_comment(args: list[str], body: str, path: str, mark: bool = False, env
 
 
 def split_link(body: str, links) -> tuple[str, str]:
-    first, _, rest = body.partition("\n")
-    if first and first in links:
-        return first, rest.lstrip("\n")
+    for link in sorted(filter(None, links), key=len, reverse=True):
+        if body == link or body.startswith(f"{link}\n"):
+            return link, body[len(link):].lstrip("\n")
     return "", body
 
 

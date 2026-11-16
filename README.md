@@ -1128,6 +1128,14 @@ A body line that starts with `Waits on`, such as `Waits on #7.` or `Waits on #7 
 Poll skips an issue that waits on such a number, with the reason in the serve log and the dashboard's queue; `arete run` skips it too, and `--force` or Run on the queue runs it anyway.
 A `#N` anywhere but a `Waits on` line holds nothing, and Jira tickets order work with their own links, not `Waits on` lines.
 
+A maintainer can consolidate a bounded group into one execution issue labelled `agent:batch`.
+Put one plain body line such as `Batch issues: #12, #13` on that issue, including its own number and at most 20 issues from the same repository.
+The directive must be visible outside code fences and HTML comments; missing, malformed or multiple directives refuse the batch before execution or any branch push, even for partial work.
+Keep every requirement in the execution issue and remove `agent` from the tracking children; `no-agent` prevents automatic readmission.
+Dependent execution issues should wait on the execution issue rather than a separately queued child.
+A complete PR closes every listed issue; a PR with work left for a person closes none of them.
+The batch retains the repository's diff limit, review, full checks, verification and publication policy.
+
 ## Jira tickets
 
 ```toml
