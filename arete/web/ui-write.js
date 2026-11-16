@@ -14,7 +14,7 @@ export function postBody(url, body, type) {
   return fetch(url, { method: "POST", headers: headers({ key: crypto.randomUUID(), type }), body });
 }
 
-export async function sendWrite(request) {
+export async function sendWrite(request, onResponse = null) {
   let response;
   try {
     response = await fetch(request.url, { method: request.method, headers: headers(request), body: request.body,
@@ -22,6 +22,7 @@ export async function sendWrite(request) {
   } catch (cause) {
     throw new Error(`Request failed: ${cause.message}`);
   }
+  onResponse?.(response);
   let data;
   try { data = await response.json(); }
   catch { throw new Error(`Invalid response (${response.status})`); }
@@ -31,6 +32,7 @@ export async function sendWrite(request) {
     error.status = response.status;
     error.conflict = response.status === 409 && (data.error === "version_conflict" || data.code === "version_conflict");
     error.current = data.current;
+    error.answer = data;
     throw error;
   }
   return data;

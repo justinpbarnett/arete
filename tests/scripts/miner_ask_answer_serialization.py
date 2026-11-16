@@ -54,6 +54,7 @@ with mock.patch.object(util, "lock", side_effect=lock), mock.patch.object(ask_st
         assert in_flight and answer["state"] == "started", answer
     except control.Refused as e:
         assert not in_flight and "was answered from the tracker a moment ago" in str(e), str(e)
+        assert e.status == 409 and e.code == "already_resolved"
     for thread in threads:
         thread.join(5)
         assert not thread.is_alive(), "tracker deadlocked"

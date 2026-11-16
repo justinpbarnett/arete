@@ -92,7 +92,8 @@ export function runPageContext(run, { refresh, go, openLink }) {
     return { label: action.name === "stop" ? `Asked ${run.id} to stop` : `${action.label} ${run.id}` };
   };
   return {
-    item: { id: run.id, verb: "stop" }, compatible: `run-page:${run.id}`,
+    item: { ...run, verb: "stop" }, compatible: `run-page:${run.id}`,
+    stale: () => refresh(),
     request: (action) => ({ url: target(action), data: {} }),
     commit: settled,
     run: { retry: ["failed", "interrupted", "stopped"].includes(run.status) ? retryRun : null, open: openLink },

@@ -45,7 +45,7 @@ def ownership(root):
     before = ledger(db)
     assert all(migrations.area_owner(row[2], row[1]) for row in before), before
     assert next(row for row in before if row[0] == 4)[2] == "loops", before
-    assert before[-1][0] == 8 and before[-1][2] == "foundation", before[-1]
+    assert before[-1][0] == 9 and before[-1][2] == "foundation", before[-1]
     assert owners["events"]["events_log"]
     assert set(owners["principals"]) == {"principals", "principal_logins"}
     db.migrate()
@@ -234,8 +234,12 @@ def upgrade(root):
         assert next(row for row in previous if row[0] == 4)[2] == "work"
         db.migrate()
         assert ledger(db) == upgraded
+    available = subprocess.run(["git", "ls-tree", "--name-only", "origin/main:arete/store/migrations"],
+                               cwd=SOURCE, capture_output=True, check=True, text=True).stdout.splitlines()
+    origin_names = sorted(name for name in available if name.startswith("m") and name.endswith(".py"))
+    assert names[:len(origin_names)] == origin_names
     historical_files = {}
-    for name in names:
+    for name in origin_names:
         original_file = None
         for location in (f"arete/store/migrations/{name}", f"arete/migrations/{name}"):
             history = subprocess.run(
@@ -256,22 +260,30 @@ def upgrade(root):
         historical_files[name] = {"original": original_file, "sha256": hashlib.sha256(content).hexdigest()}
     latest = subprocess.run(["git", "show", "origin/main:arete/store/migrations/latest.txt"],
                             cwd=SOURCE, capture_output=True, check=True).stdout
-    assert latest == (migrations.FOLDER / "latest.txt").read_bytes()
-    origin_chain = historical_chain(root, "origin/main", names)
+    origin_chain = historical_chain(root, "origin/main", origin_names)
+    assert latest == (origin_chain / "latest.txt").read_bytes()
+    assert (migrations.FOLDER / "latest.txt").read_text().strip() == names[-1]
     origin_db = paths.STATE_DIR / "origin-main" / "arete.db"
     origin_db.parent.mkdir()
     with mock.patch.object(paths, "DB_FILE", origin_db):
         with mock.patch.object(migrations, "FOLDER", origin_chain):
             db.migrate()
-        origin_ledger, origin_schema = ledger(db), schema(db)
+            origin_ledger, origin_schema = ledger(db), schema(db)
+            db.migrate()
+            assert ledger(db) == origin_ledger and schema(db) == origin_schema
+            db.migrate()
+            assert ledger(db) == origin_ledger and schema(db) == origin_schema
         db.migrate()
-        assert ledger(db) == origin_ledger and schema(db) == origin_schema
+        origin_upgraded, upgraded_schema = ledger(db), schema(db)
+        assert origin_upgraded[:len(origin_ledger)] == origin_ledger
+        assert [row[0] for row in origin_upgraded[len(origin_ledger):]] == [m.n for m in chain[len(origin_names):]]
         db.migrate()
-        assert ledger(db) == origin_ledger and schema(db) == origin_schema
+        assert ledger(db) == origin_upgraded and schema(db) == upgraded_schema
     return {"historical_rows": len(original), "hashes_unchanged": True, "relocated_rows_added": 0,
             "applied_once": suffix, "expected_suffix": suffix, "pre_budget_rows_added": len(added),
-            "origin_main_rows_added": 0, "origin_main_ledger": origin_ledger, "origin_main_unchanged": True,
-            "historical_files": historical_files, "latest_unchanged": True,
+            "origin_main_rows_added": len(origin_upgraded) - len(origin_ledger),
+            "origin_main_ledger": origin_ledger, "origin_main_unchanged": True,
+            "historical_files": historical_files, "latest_valid": True,
             "budget_applied_once": added, "historical_work_preserved": True}
 
 

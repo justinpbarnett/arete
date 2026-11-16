@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import timedelta
 
 from .. import principals, util
@@ -11,18 +14,68 @@ TABLES = {"events_log": "durable kept; derived 90 days; notice 7 days"}
 
 VERSION = 8
 CLASSES = ("durable", "derived", "notice")
+VIA = ContextVar("event_via", default=None)
+RECEIPTS = ContextVar("event_receipts", default=None)
 
 
-def emit(kind, subject, *, cls, data, ver=None, task=None, cause_seq=None):
+def provenance():
+    return VIA.get() if VIA.get() is not None else os.environ.get("ARETE_VIA")
+
+
+@contextmanager
+def collect_receipts():
+    parent = RECEIPTS.get()
+    collected = []
+    token = RECEIPTS.set(collected)
+    try:
+        yield collected
+    finally:
+        RECEIPTS.reset(token)
+        if parent is not None:
+            parent.extend(collected)
+
+
+@contextmanager
+def request_scope(via):
+    origin = VIA.set(via)
+    receipts = RECEIPTS.set([])
+    try:
+        yield
+    finally:
+        VIA.reset(origin)
+        RECEIPTS.reset(receipts)
+
+
+def committed_receipt(subject=None, *, first=False):
+    if foundation.in_write() or not RECEIPTS.get():
+        return None
+    with foundation.reader() as c:
+        collected = RECEIPTS.get() or []
+        pending = collected if first else reversed(collected)
+        for seq, found, ver in pending:
+            if subject is not None and found != subject:
+                continue
+            if c.execute("SELECT 1 FROM events_log WHERE seq = ? AND subject = ? AND ver = ?",
+                         (seq, found, ver)).fetchone():
+                epoch = c.execute("SELECT value FROM schema_meta WHERE key = 'restore_epoch'").fetchone()[0]
+                return {"event_seq": f"{epoch}.{seq}", "subject": found, "ver": ver}
+    return None
+
+
+def emit(kind, subject, *, cls, data, ver=None, task=None, cause_seq=None, via=None):
     c = foundation.write_connection()
     actor = principals.current()
     if actor == "owner" or "@" in actor:
         raise ValueError("events need a principal id, not a login or owner")
     if cls not in CLASSES:
         raise ValueError("invalid event class")
-    return c.execute("INSERT INTO events_log (at, kind, subject, ver, task, class, shape, actor, cause_seq, data) "
-                     "VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
-                     (util.iso(), kind, subject, ver, task, cls, actor, cause_seq, json.dumps(data))).lastrowid
+    seq = c.execute("INSERT INTO events_log (at, kind, subject, ver, task, class, shape, actor, cause_seq, data, via) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)",
+                    (util.iso(), kind, subject, ver, task, cls, actor, cause_seq, json.dumps(data),
+                     provenance() if via is None else via)).lastrowid
+    if RECEIPTS.get() is not None and ver is not None:
+        RECEIPTS.get().append((seq, subject, ver))
+    return seq
 
 
 def metadata(c):

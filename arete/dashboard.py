@@ -48,8 +48,10 @@ from . import (
 from .refusals import Stated as Refusal
 from .store import approvals as approvals_store
 from .store import db as foundation
+from .store import events as event_store
 from .store import insights as insights_store
 from .store import runs as run_store
+from .store import writes
 
 WEB_DIR = paths.PACKAGE_DIR / "web"
 WEB_TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8",
@@ -171,6 +173,10 @@ def refusal_status(e: Exception) -> int | None:
 
 def refusal_answer(e: Exception) -> dict:
     answer = {"error": as_sentence(str(e))}
+    if getattr(e, "code", None):
+        answer["code"] = e.code
+    if hasattr(e, "current"):
+        answer["current"] = e.current
     if isinstance(e, control.KeptFailure):
         answer["kept"] = True
     return answer
@@ -214,7 +220,8 @@ class Handler(BaseHTTPRequestHandler):
             self.rfile.read(min(int(length), webhooks.MAX_HOOK_BODY))
 
     def answer(self, method: str) -> None:
-        with principals.acting("hand"):
+        with principals.acting("hand"), event_store.request_scope(f"{method} {urlsplit(self.path).path}"):
+            self.write_receipt = None
             return self.answer_as_person(method)
 
     def answer_as_person(self, method: str) -> None:
@@ -239,7 +246,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_evidence(int(item[1]))
             if method == "GET" and (events := EVENTS_PATH.fullmatch(path)):
                 return self.send_events(unquote(events[1]), query)
-            self.send_json(200, self.api(method, path, query))
+            result = self.api(method, path, query)
+            if method == "POST" and self.write_receipt is None:
+                self.write_receipt = event_store.committed_receipt()
+                if isinstance(result, dict) and isinstance(result.get("run"), str) and result["run"]:
+                    self.write_receipt = writes.receipt(f"run:{result['run']}", kind="run.started") or self.write_receipt
+            self.send_json(200, result)
         except Exception as e:
             if status := refusal_status(e):
                 if isinstance(e, Restarting):
@@ -453,6 +465,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(length))
         self.send_header("Cache-Control", cache)
         self.send_header("X-Arete-Code", WEB_CODE)
+        if 200 <= status < 300 and getattr(self, "write_receipt", None):
+            self.send_header("Arete-Seq", self.write_receipt["event_seq"])
         self.send_header("Content-Security-Policy", PAGE_POLICY)
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
@@ -761,17 +775,25 @@ def post_loop(handler, rest, query):
 
 def post_run(handler, rest, query):
     run_id, _, action = unquote(rest).partition("/")
+    body = handler.body()
+    base_version = body.get("base_version")
+    result = None
     if action == "stop":
-        return control.stop_run(run_id)
-    if action == "answer":
-        return tasks.reply(run_id, str(handler.body().get("text") or ""))
-    if action == "resume":
-        return tasks.resume(run_id, str(handler.body().get("step") or ""))
-    if action == "repair":
-        return tasks.repair(run_id)
-    if action.startswith("steps/"):
-        return tasks.run_step(run_id, action[len("steps/"):], handler.body().get("set") or {})
-    raise NoRoute
+        result = control.stop_run(run_id, base_version, public=True)
+    elif action == "answer":
+        result = tasks.reply(run_id, str(body.get("text") or ""))
+    elif action == "resume":
+        result = tasks.resume(run_id, str(body.get("step") or ""), base_version)
+    elif action == "repair":
+        result = tasks.repair(run_id, base_version)
+    elif action.startswith("steps/"):
+        result = tasks.run_step(run_id, action[len("steps/"):], body.get("set") or {}, base_version)
+    else:
+        raise NoRoute
+    handler.write_receipt = event_store.committed_receipt(f"run:{run_id}", first=action == "stop")
+    if result.get("run") and result["run"] != run_id:
+        handler.write_receipt = writes.receipt(f"run:{result['run']}", kind="run.started")
+    return result
 
 
 def post_push_subscribe(handler, rest, query):

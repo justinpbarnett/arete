@@ -206,6 +206,15 @@ def run_path(run_id: str, action: str) -> str:
     return f"/api/runs/{quote(run_id, safe='')}/{action}"
 
 
+def run_command(run_id: str, action: str, body: dict | None = None) -> int:
+    def selected():
+        run = call("GET", f"/api/runs/{quote(run_id, safe='')}")["run"]
+        emit(call("POST", run_path(run_id, action), {**(body or {}), "base_version": run["version"]}))
+        return 0
+
+    return steered(selected)
+
+
 def events(run_id: str, start: int = 0, follow: bool = False) -> Iterator[dict]:
     return stream(run_path(run_id, "events"), {"from": start, **({"follow": "1"} if follow else {})})
 
@@ -252,7 +261,7 @@ def emit(line: dict) -> None:
 
 
 def failed(e: Failed) -> int:
-    emit({**e.answer, **({"code": e.code} if e.code else {})})
+    emit({**e.answer, **({"code": e.code} if e.code and "code" not in e.answer else {})})
     return 1
 
 

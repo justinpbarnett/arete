@@ -25,6 +25,11 @@ def setUpModule():
 
 
 class NewUIShellTests(unittest.TestCase):
+    def test_versioned_run_actions(self):
+        script = (SCRIPTS / "versioned_run_actions.mjs").read_text()
+        self.run_module_script(script, ("ui-actions.js", "ui-data.js", "ui-undo.js", "ui-notice.js", "ui-write.js",
+                                        "common.js", "said-line.js", "live.js", "run-page.js"))
+
     def test_action_write_boundary(self):
         web = support.SOURCE / "arete" / "web"
         names = ("ui-actions.js", "ui-undo.js", "ui-notice.js", "ui-write.js")

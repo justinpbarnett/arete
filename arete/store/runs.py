@@ -5,8 +5,9 @@ import math
 import sqlite3
 from datetime import timedelta
 
-from .. import events, util
+from .. import util
 from ..agent import billing_of
+from . import writes
 from .db import db, reader, tx
 
 TABLES = {
@@ -337,12 +338,18 @@ def last_step_id(run_id: str) -> int:
 
 
 def prune(c, days: float = 14, lines_days: float = 90) -> None:
+    with writes.atomic():
+        _prune(c, days, lines_days)
+
+
+def _prune(c, days, lines_days):
     since = util.iso(util.now() - timedelta(days=days))
     lines_since, now = util.iso(util.now() - timedelta(days=lines_days)), util.iso()
     c.execute(f"INSERT OR IGNORE INTO run_purges SELECT id, 'firing', ? FROM runs "
               f"WHERE {FIRINGS} AND started < ?", (now, since))
     c.execute(f"DELETE FROM feed WHERE run_id IN (SELECT id FROM runs WHERE {FIRINGS} AND started < ?)", (since,))
-    c.execute(f"DELETE FROM runs WHERE {FIRINGS} AND started < ?", (since,))
+    for row in c.execute(f"SELECT id FROM runs WHERE {FIRINGS} AND started < ?", (since,)).fetchall():
+        writes.update("runs", row["id"], {}, delete=True, kind="run.deleted")
     eligible = c.execute(
         "SELECT id FROM runs WHERE files_purged IS NULL AND COALESCE(finished, started) < ? "
         "AND status NOT IN ('running', 'pr', 'needs-info') "
@@ -356,7 +363,7 @@ def prune(c, days: float = 14, lines_days: float = 90) -> None:
         "AND recent.issue = runs.issue AND recent.started >= ?)", (lines_since, lines_since)).fetchall()
     for row in eligible:
         c.execute("INSERT OR IGNORE INTO run_purges VALUES (?, 'lines', ?)", (row["id"], now))
-        c.execute("UPDATE runs SET files_purged = ? WHERE id = ?", (now, row["id"]))
+        writes.update("runs", row["id"], {"files_purged": now})
 
 
 def running_runs(conn):
@@ -367,16 +374,12 @@ def running_runs(conn):
 
 
 def insert_run(run_id: str, row: dict) -> None:
-    cols, marks = ", ".join(row), ", ".join("?" * len(row))
-    with db() as c:
-        c.execute(f"INSERT INTO runs (id, {cols}) VALUES (?, {marks})", (run_id, *row.values()))
-        events.emit("run.started", f"run:{run_id}", cls="derived", task=row.get("issue"),
-                    data={"run": run_id, **row})
+    writes.insert("runs", row, run_id, "run.started")
 
 
 def insert_steps(run_id: str, name: str, calls, effort: str = "", tier: str = "", kind: str = "",
                  try_no: int = 0, auth_mode: str = "") -> None:
-    with db() as c:
+    with writes.atomic() as c:
         for res, seconds in calls:
             c.execute("INSERT INTO steps (run_id, step, runner, model, provider, ok, cost_usd, tokens_in, tokens_out,"
                       " turns, seconds, error, ts, first_context_tokens, effort, tier, try, kind, cache_read, cache_write,"
@@ -387,9 +390,8 @@ def insert_steps(run_id: str, name: str, calls, effort: str = "", tier: str = ""
                        res.tokens_out, res.turns, round(seconds, 2), (res.error or "")[:500], util.iso(),
                        res.first_context_tokens, effort or "", tier or "", try_no, run_id, name, kind or "", res.cache_read,
                        res.cache_write, round(res.api_seconds, 2), auth_mode or res.auth_mode))
-            c.execute("UPDATE runs SET cost_usd = COALESCE(cost_usd, 0) + ?, tokens_in = COALESCE(tokens_in, 0) + ?, "
-                      "tokens_out = COALESCE(tokens_out, 0) + ? WHERE id = ?",
-                      (res.cost_usd, res.tokens_in, res.tokens_out, run_id))
+            writes.update("runs", run_id, {}, increments={"cost_usd": res.cost_usd, "tokens_in": res.tokens_in,
+                                                         "tokens_out": res.tokens_out})
 
 
 def label_step(run_id: str, step: str, try_no: int, **labels) -> None:
@@ -399,56 +401,48 @@ def label_step(run_id: str, step: str, try_no: int, **labels) -> None:
 
 
 def hold_ab(run_id: str, role: str, name: str, side: str, arm: dict) -> None:
-    with db() as c:
+    with writes.atomic() as c:
         row = c.execute("SELECT ab_held FROM runs WHERE id = ?", (run_id,)).fetchone()
         held = {**json.loads((row["ab_held"] if row else "") or "{}"), role: [name, side, arm]}
-        c.execute("UPDATE runs SET ab_held = ? WHERE id = ?", (json.dumps(held), run_id))
+        writes.update("runs", run_id, {"ab_held": json.dumps(held)})
 
 
-def note(run_id: str, **fields) -> None:
+def note(run_id: str, *, base_version=None, **fields) -> None:
     if "status" in fields:
         raise ValueError("use move to change a run's status")
-    with db() as c:
-        c.execute(f"UPDATE runs SET {', '.join(f'{k} = ?' for k in fields)} WHERE id = ?", (*fields.values(), run_id))
+    writes.update("runs", run_id, fields, base_version=base_version)
 
 
 def checkpoint(run_id: str, active: float, verified: float, opened: float, repairs: int, at: str) -> None:
-    with tx() as conn:
-        conn.execute("UPDATE runs SET active_seconds=?, verify_seconds=?, verify_open_seconds=?, "
-                     "repair_calls=?, measured_at=? WHERE id=?", (active, verified, opened, repairs, at, run_id))
+    writes.update("runs", run_id, {"active_seconds": active, "verify_seconds": verified, "verify_open_seconds": opened,
+                                  "repair_calls": repairs, "measured_at": at})
 
 
-def move(run_id: str, to: str, expect: tuple[str, ...], **fields) -> bool:
+def move(run_id: str, to: str, expect: tuple[str, ...], *, base_version=None, **fields) -> bool:
     if not expect:
+        if base_version is not None:
+            writes.check_run(run_id, base_version)
         return False
     fields = {**fields, "status": to}
-    with db() as c:
-        return c.execute(f"UPDATE runs SET {', '.join(f'{k} = ?' for k in fields)} "
-                         f"WHERE id = ? AND status IN ({','.join('?' * len(expect))})",
-                         (*fields.values(), run_id, *expect)).rowcount > 0
+    return writes.update("runs", run_id, fields, expect=expect, base_version=base_version) is not None
 
 
-def ask_stop(run_id: str) -> dict | None:
-    with db() as c:
-        changed = c.execute("UPDATE runs SET stop_asked = ? WHERE id = ? AND status = 'running' "
-                            "AND COALESCE(stop_asked, '') = ''", (util.iso(), run_id)).rowcount
-        r = c.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
-        if changed:
-            events.emit("run.changed", f"run:{run_id}", cls="derived", task=r["issue"],
-                        data={"run": run_id, "stop_asked": r["stop_asked"]})
-    return dict(r) if r else None
+def ask_stop(run_id: str, base_version=None) -> dict | None:
+    with writes.atomic():
+        row = writes.check_run(run_id, base_version)
+        if not row or row["status"] != "running" or row["stop_asked"]:
+            return row
+        return writes.update("runs", run_id, {"stop_asked": util.iso()}, base_version=base_version,
+                             expect=("running",))
 
 
-def settle(run_id: str, fields: dict, end_line: str = "") -> dict | None:
-    with db() as c:
-        if not c.execute(f"UPDATE runs SET {', '.join(f'{k} = ?' for k in fields)} WHERE id = ? AND status = 'running'",
-                         (*fields.values(), run_id)).rowcount:
+def settle(run_id: str, fields: dict, end_line: str = "", base_version=None) -> dict | None:
+    with writes.atomic():
+        settled = writes.update("runs", run_id, fields, expect=("running",), kind="run.ended", base_version=base_version)
+        if not settled:
             return None
         if end_line:
             insert_feed(run_id, "end", end_line)
-        settled = dict(c.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone())
-        events.emit("run.ended", f"run:{run_id}", cls="derived", task=settled["issue"],
-                    data={"run": run_id, **fields})
         return settled
 
 

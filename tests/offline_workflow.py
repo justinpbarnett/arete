@@ -892,7 +892,7 @@ def fix_ask_conflict(fx, row, result):
     pipeline, tasks = fx.pipeline, fx.tasks
     result |= {"kept_head": fx.kept_head, "head": pipeline.git(["rev-parse", "HEAD"], fx.ws).strip(),
                "dirty": pipeline.git(["status", "--short"], fx.ws).strip()}
-    with mock.patch.object(tasks, "launch", side_effect=lambda cfg, repo, tid, command, ahead=False: command):
+    with mock.patch.object(tasks, "launch", side_effect=lambda cfg, repo, tid, command, ahead=False, **kw: command):
         result["resume"] = tasks.resume(row["id"])
 
 
@@ -1034,7 +1034,7 @@ def slot_wait(fx, result, continuing):
         tasks.answer_ask(waiting[0]["id"], {"answers": [{"text": "again"}]})
     except control.Refused as e:
         result["refusal_names_it"] = f"arete resume {waited['id']}" in str(e)
-    with mock.patch.object(tasks, "launch", side_effect=lambda cfg, repo, tid, command, ahead=False: command):
+    with mock.patch.object(tasks, "launch", side_effect=lambda cfg, repo, tid, command, ahead=False, **kw: command):
         command = tasks.resume(waited["id"])
     result["resumes_it"] = command[-2:] == ["--continue", waited["id"]] and "feature.py" in " ".join(command)
     return [*continuing[:-1], waited["id"]]

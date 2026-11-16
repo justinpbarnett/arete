@@ -94,13 +94,13 @@ def cmd_answer(args) -> int:
 def cmd_resume(args) -> int:
     from .. import client
 
-    return client.say("POST", client.run_path(args.run_id, "resume"), {"step": args.step} if args.step else {})
+    return client.run_command(args.run_id, "resume", {"step": args.step} if args.step else {})
 
 
 def cmd_repair(args) -> int:
     from .. import client
 
-    return client.say("POST", client.run_path(args.run_id, "repair"), {})
+    return client.run_command(args.run_id, "repair")
 
 
 def cmd_step(args) -> int:
@@ -115,13 +115,13 @@ def cmd_step(args) -> int:
             client.emit({"error": f"write each setting as key=value, not '{setting}'"})
             return 1
         sets[key.strip()] = value
-    return client.say("POST", client.run_path(args.run_id, f"steps/{quote(args.step, safe='')}"), {"set": sets})
+    return client.run_command(args.run_id, f"steps/{quote(args.step, safe='')}", {"set": sets})
 
 
 def cmd_stop(args) -> int:
     from .. import client
 
-    return client.say("POST", client.run_path(args.run_id, "stop"))
+    return client.run_command(args.run_id, "stop")
 
 
 def cmd_replay(args) -> int:

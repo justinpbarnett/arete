@@ -13,6 +13,7 @@ from . import (
     config,
     delivery,
     devices,
+    events,
     loops,
     paths,
     principals,
@@ -29,6 +30,7 @@ from .store import db as foundation
 from .store import loops as loop_store
 from .store import runs as run_store
 from .store import sources as source_store
+from .store import writes
 
 AB_DAYS = 30
 AB_MIN_TICKETS = 20
@@ -89,7 +91,8 @@ def launch(command: list[str], log_name: str = DETACHED_LOG, keep: tuple[int, ..
     with open(paths.LOG_DIR / log_name, "a") as log:
         proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log,
                                 stderr=subprocess.STDOUT, start_new_session=True, pass_fds=keep,
-                                env={**os.environ, "ARETE_ACTOR": principals.current()})
+                                env={**os.environ, "ARETE_ACTOR": principals.current(),
+                                     "ARETE_VIA": events.provenance() or ""})
     threading.Thread(target=proc.wait, name=f"reap-{proc.pid}", daemon=True).start()
     return proc
 
@@ -108,16 +111,18 @@ def working_loop(name: str, cfg: config.Config | None = None) -> Loop:
     return loop
 
 
-def stop_run(run_id: str) -> dict:
-    r = run_store.run_get(run_id)
+def stop_run(run_id: str, base_version=None, *, public=False) -> dict:
+    r = writes.check_run(run_id, base_version, public=public)
     if not r:
         raise NotFound(f"no run {run_id}")
     if r["status"] != "running":
         raise Refused(f"{run_id} is not running; it ended {r['status']}")
     with record.dead(r) as gone:
         if gone:
-            if not (r := record.ask_stop(run_id)):
+            if not (r := record.ask_stop(run_id, base_version)):
                 raise NotFound(f"no run {run_id}")
+            if r["status"] != "running":
+                raise Refused(f"{run_id} is not running; it ended {r['status']}")
             devices.release(run_id, lambda text: run_store.add_feed(run_id, "device", text))
             if r["kind"] in record.TICKET_KINDS:
                 return {"id": run_id, "stopped": True, "was": "gone", "ticket": "told by the next pipeline poll"}
@@ -125,7 +130,7 @@ def stop_run(run_id: str) -> dict:
             return {"id": run_id, "stopped": True, "was": "gone"}
     if not r["pid"]:
         raise Refused(f"{run_id} is still starting; stop it again in a moment")
-    r = record.ask_stop(run_id) or r
+    r = record.ask_stop(run_id, base_version) or r
     if r["status"] != "running":
         raise Refused(f"{run_id} is not running; it ended {r['status']}")
     pid = int(r["pid"])
