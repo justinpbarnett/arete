@@ -1407,7 +1407,7 @@ write(GOOD + "\n[dashboard]\nport = 4321\nhttps = 'yes'\n")
 kept_port = config.load_or_problem()[0].dashboard_port
 result(mixed=[mixed.dashboard_https, mixed.dashboard_owner], kept_port=kept_port,
        port=cfg.dashboard_port, https=cfg.dashboard_https, owner=cfg.dashboard_owner, problem=problem,
-       broken=[broken.dashboard_port == config.DASHBOARD_PORT, why], bad_port=[bad_port.dashboard_port, bad_port_why])
+       broken=[broken.dashboard_port == paths.DASHBOARD_PORT, why], bad_port=[bad_port.dashboard_port, bad_port_why])
 ''')
         self.assertEqual((found["port"], found["https"], found["owner"]), (4321, True, "me@example.com"))
         self.assertTrue(found["problem"].startswith("ValueError: [routing]"))

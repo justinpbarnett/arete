@@ -193,6 +193,7 @@ class Kind:
     agent: bool = True
     worktree: bool = False
     run: Callable[..., tuple[str, str]] | None = None
+    check: Callable[[Loop], list[str]] | None = None
 
     def problems(self, loop: Loop, remote: bool) -> list[str]:
         problems = []
@@ -211,13 +212,27 @@ class Kind:
             if not loop.repo:
                 problems.append(f"a {self.name} loop needs [run] repo, a repo name from the config or a path to a git "
                                 "repo")
+        if self.check:
+            problems += self.check(loop)
         return problems
+
+
+def proof_problems(loop: Loop) -> list[str]:
+    if "proof" not in loop.spec:
+        return []
+    name, problems = loop.spec["proof"], []
+    if not isinstance(name, str) or blank(name) or Path(name).is_absolute() or ".." in Path(name).parts:
+        problems.append('[search] proof must name a file in the scratch folder, such as "repro.py"')
+    if not any(e.get("type") == "push" for e in loop.emits):
+        problems.append("[search] proof is checked before a push lands, so the loop needs a push emit")
+    return problems
 
 
 KINDS = {kind.name: kind for kind in (
     Kind("command", table="run", needs="command", agent=False),
     Kind("watch"),
-    Kind("search", table="search", needs="check", needs_hint="a command that exits 0 on a hit", worktree=True),
+    Kind("search", table="search", needs="check", needs_hint="a command that exits 0 on a hit", worktree=True,
+         check=proof_problems),
 )}
 
 
@@ -359,15 +374,6 @@ def as_list(value) -> list[str]:
     return [value] if isinstance(value, str) else [str(v) for v in value]
 
 
-def proof_problems(loop: Loop) -> list[str]:
-    name, problems = loop.spec["proof"], []
-    if not isinstance(name, str) or blank(name) or Path(name).is_absolute() or ".." in Path(name).parts:
-        problems.append('[search] proof must name a file in the scratch folder, such as "repro.py"')
-    if not any(e.get("type") == "push" for e in loop.emits):
-        problems.append("[search] proof is checked before a push lands, so the loop needs a push emit")
-    return problems
-
-
 def tightest_limit(loop: Loop, cfg: config.Config, spent_this_run: float = 0.0) -> tuple[str, float] | None:
     day_ago = util.iso(util.now() - timedelta(days=1))
     limits = []
@@ -422,8 +428,6 @@ def validate(loop: Loop, cfg: config.Config) -> None:
         problems.append(f"[trigger] trust '{loop.trigger.trust}' is not one of {', '.join(TRUST_ORDER)}")
     if kind:
         problems += kind.problems(loop, device.remote)
-    if loop.kind == "search" and "proof" in loop.spec:
-        problems += proof_problems(loop)
     problems += runner.agent_problems(loop.runner, loop.tools)
     problems += [device_problem] if device_problem else []
     if loop.agent and not cfg.replay.all:

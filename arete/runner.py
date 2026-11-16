@@ -13,6 +13,7 @@ from pathlib import Path
 
 from . import (
     accounts,
+    browser,
     claude,
     codex,
     config,
@@ -28,6 +29,8 @@ from . import (
     record,
     replay,
     routing,
+    sandbox,
+    scrub,
     state,
     uploads,
     util,
@@ -639,47 +642,11 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
     hook = ()
     kw.pop("verification_attempt", None)
     if trip.scratch:
-        original = kw.get("mcp_config", "")
-        if which != "claude" or target.remote:
-            verification_scratch.stop_served(trip.scratch)
-        if which == "codex" and not target.remote:
-            try:
-                kw["mcp_config"] = verification_scratch.browser_config(trip.scratch, original, kw.get("add_dirs", ()))
-            except (OSError, ValueError, KeyError, TypeError) as error:
-                kw["budget_error"] = f"browser confinement unavailable: {error}"
-        try:
-            hook = verification_scratch.activate(trip.scratch, which, bool(target.remote), kw.get("add_dirs", ()),
-                                                 kw.get("mcp_config", ""))
-        except (OSError, ValueError, KeyError, TypeError):
-            hook = ()
-        if (not hook and which == "codex" and not target.remote and verification_scratch.has_servers(original)
-                and not kw.get("budget_error")
-                and (kw.get("mcp_config", "") != original
-                     or verification_scratch.plain_config(trip.scratch, original) is None)):
-            kw["budget_error"] = "browser confinement unavailable: the trusted browser could not be activated"
-        if not hook:
-            if "mcp_config" in kw:
-                kw["mcp_config"] = original
-            say("trusted scratch authority unavailable for this confinement; fixture-dependent checks may be blocked")
-            kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), verification_scratch.note(None)]))
-        if which == "claude" and not target.remote:
-            try:
-                config_json, reason = verification_scratch.serve_browser(trip.scratch, original, kw.get("add_dirs", ()))
-            except (OSError, ValueError, KeyError, TypeError) as error:
-                config_json = verification_scratch.without_browser(original)
-                reason = str(error) or type(error).__name__
-            if reason:
-                kw["allowed_tools"] = [t for t in kw.get("allowed_tools") or [] if not t.startswith("mcp__playwright")]
-                kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""),
-                                                         verification_scratch.browser_blocked_note(reason)]))
-                say(f"the confined browser is unavailable for this verify: {reason}")
-            if "mcp_config" in kw:
-                kw["mcp_config"] = config_json
-        kw["verification_attempt"] = trip.scratch
+        kw, hook = browser.confine(kw, trip.scratch, which, bool(target.remote), say)
     if asking and hook:
-        kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), owner_asks.WITHHELD]))
+        browser.with_note(kw, owner_asks.WITHHELD)
     elif asking:
-        kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), owner_asks.NOTE]))
+        browser.with_note(kw, owner_asks.NOTE)
         if which in ("claude", "codex"):
             kw["mcp_config"] = owner_asks.with_server(kw.get("mcp_config") or "")
             kw["allowed_tools"] = [*(kw.get("allowed_tools") or []), owner_asks.RULE]
@@ -707,7 +674,7 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
             kw["floor"] = floor
     if uploads.granted(kw.get("allowed_tools")) and (not TRAITS[which].uploads_supported or target.remote):
         kw["allowed_tools"] = uploads.without(kw["allowed_tools"])
-        kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), uploads.WITHHELD]))
+        browser.with_note(kw, uploads.WITHHELD)
     return kw
 
 
@@ -746,6 +713,13 @@ def described_servers(mcp_config: str) -> dict:
     return found
 
 
+def refresh_redactions(hidden: scrub.Redactions, selected: pi.Route | None) -> None:
+    if selected and selected.using_login:
+        hidden.add([*pi.credential_values(accounts.read(selected.owner)), *selected.refreshed_secrets])
+    if selected:
+        hidden.add(v for path in selected.sensitive_files for v in scrub.file_secrets(path, every_value=True))
+
+
 def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session, cfg: config.Config,
             trace: tuple[str, str], record_id: str, target: devices.Device, kw: dict, tier: str = "",
             kind: str = "", auth: accounts.Auth | None = None, route: dict | None = None, try_no: int = 0,
@@ -776,31 +750,16 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
     selected = kw.get("selected")
     if selected:
         found.extend(selected.sensitive_files)
-    hidden = list(record.secrets(*found, given=kw.pop("stored_values", ())))
-    escaped = set()
+    hidden = scrub.Redactions(scrub.secrets(*found, given=kw.pop("stored_values", ())), escape=bool(selected))
     if selected:
-        hidden.extend(selected.hidden)
-        hidden[:] = sorted(set(hidden) | {json.dumps(v, ensure_ascii=False)[1:-1] for v in hidden if v not in escaped},
-                           key=len, reverse=True)
-        escaped.update(hidden)
+        hidden.add(selected.hidden)
         header["env"] = route["env"]
         header["provider"] = selected.provider
-    def refresh_hidden():
-        if selected and selected.using_login:
-            hidden.extend(v for v in [*pi.credential_values(accounts.read(selected.owner)),
-                                     *tuple(selected.refreshed_secrets)] if len(v) >= 8
-                          and v not in hidden)
-        if selected:
-            hidden.extend(v for path in selected.sensitive_files for v in record.file_secrets(path, every_value=True)
-                          if len(v) >= 8 and v not in hidden)
-        if selected:
-            hidden[:] = sorted(set(hidden) | {json.dumps(v, ensure_ascii=False)[1:-1] for v in hidden if v not in escaped},
-                               key=len, reverse=True)
-            escaped.update(hidden)
+
     def safe_line(line):
-        refresh_hidden()
+        refresh_redactions(hidden, selected)
         rec.line(line)
-    refresh_hidden()
+    refresh_redactions(hidden, selected)
     started = time.monotonic()
     at = util.now()
     max_tokens = kw.pop("max_tokens", None)
@@ -814,14 +773,14 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
                               for call in res.calls or [res]], effort=kw.get("effort", ""),
                              tier=tier, kind=kind, try_no=try_no, auth_mode="local" if on_local else "")
         except BaseException as error:
-            rec.finish(replace(res, ok=False, error=record.scrub(
+            rec.finish(replace(res, ok=False, error=scrub.scrub(
                 f"cost is not in steps: {record.failure(error)}; {res.error}", hidden)), time.monotonic() - started)
             raise
 
     def keep_lost(error: BaseException) -> None:
-        refresh_hidden()
+        refresh_redactions(hidden, selected)
         seen = replace(meter.seen, provider=header["provider"],
-                       error=record.scrub(rec.exception_text(error), hidden))
+                       error=scrub.scrub(rec.exception_text(error), hidden))
         seen.cost_usd = 0.0 if on_local else priced(seen, cfg)
         persist(seen)
         rec.finish(seen, time.monotonic() - started)
@@ -838,7 +797,7 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
             elif which == REPLAY:
                 res = meter.guard(replay.run, cwd, trace, cfg, meter.watching(rec.line), resume, kw.get("timeout"))
             elif which == "codex":
-                protected = [verification_scratch.AUTHORITY, paths.WORKTREES_DIR]
+                protected = [sandbox.AUTHORITY, paths.WORKTREES_DIR]
                 res = meter.guard(codex.run, prompt, cwd, model=name, resume=resume,
                                   on_line=meter.watching(rec.line), hidden=[*found, *protected], auth=auth, **kw)
             else:
@@ -861,12 +820,12 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
                 res.cost_usd = 0.0 if on_local else priced(res, cfg)
             if not budget_error:
                 quote_calls(res, which, name, at)
-            refresh_hidden()
-            res.error = record.scrub(res.error, hidden)
-            res.text = record.scrub(res.text, hidden)
-            res.structured = record.scrub_value(res.structured, hidden)
+            refresh_redactions(hidden, selected)
+            res.error = scrub.scrub(res.error, hidden)
+            res.text = scrub.scrub(res.text, hidden)
+            res.structured = scrub.scrub_value(res.structured, hidden)
             for call in res.calls:
-                call.error = record.scrub(call.error, hidden)
+                call.error = scrub.scrub(call.error, hidden)
             res.effort, res.credential = kw.get("effort", ""), route.get("credential", "")
             res.requested_effort, res.skipped = route.get("requested_effort", ""), route.get("skipped", [])
             res.record = rec.path.name if rec.path else ""
@@ -909,7 +868,7 @@ def secret_files(folders: list[Path | str], target: devices.Device, cfg: config.
             if Path(here).relative_to(folder).parts[SECRET_SEARCH_DEPTH:]:
                 subfolders.clear()
                 continue
-            found += [Path(here, n) for n in names if guard.secret_path(n)]
+            found += [Path(here, n) for n in names if sandbox.secret_path(n)]
     return found
 
 
@@ -926,7 +885,7 @@ def local_claude(kw: dict, cfg: config.Config, run_id: str, ask_jev: bool, say: 
             say(note)
     if ask_jev and runs_bash(kw) and jev.ready(cfg, [repo], env=claude.agent_env(kw["passing"])):
         kw["allowed_tools"] = [*(kw.get("allowed_tools") or []), jev_ask.rule()]
-        kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), jev_ask.note()]))
+        browser.with_note(kw, jev_ask.note())
     if uploads.granted(kw.get("allowed_tools")):
         kw["settings"] = uploads.with_hook(kw.get("settings"))
     return kw

@@ -96,10 +96,10 @@ accounts.read = forbidden
 gh.gh = forbidden
 import importlib.util
 if importlib.util.find_spec("arete.scratch"):
-    from arete import scratch
+    from arete import sandbox
     probe = [sys.executable, "-V"]
-    if scratch.protected_command(probe) != probe:
-        scratch.AUTHORITY = Path(sys.argv[1]) / "authority-parent/verification-authority"
+    if sandbox.protected_command(probe) != probe:
+        sandbox.AUTHORITY = Path(sys.argv[1]) / "authority-parent/verification-authority"
 feature = runpy.run_path(str(paths.ADWS_DIR / "feature.py"))["feature"]
 try:
     factory.main(feature, sys.argv[2:])
@@ -114,16 +114,16 @@ def forbidden(*args, **kwargs):
 
 def main(root, scenario):
     from arete import (accounts, alerts, owner_asks, codebase, config, control, environment, factory, flows, gh, run_lines,
-                       paths, pipeline, record, replay, runlimits, runner, state, tasks, vault)
+                       paths, pipeline, record, replay, runlimits, runner, scrub, state, tasks, vault)
     state.migrate()
-    scratch = None
+    scratch = sandbox = None
     if importlib.util.find_spec("arete.scratch"):
-        from arete import scratch
+        from arete import sandbox, scratch
     fx = SimpleNamespace(root=Path(root), scenario=scenario, accounts=accounts, alerts=alerts, owner_asks=owner_asks,
                          codebase=codebase, config=config, control=control, environment=environment,
                          factory=factory, flows=flows, gh=gh, run_lines=run_lines, paths=paths, pipeline=pipeline,
-                         record=record, replay=replay, runlimits=runlimits, runner=runner, scratch=scratch,
-                         state=state, tasks=tasks, vault=vault)
+                         record=record, replay=replay, runlimits=runlimits, runner=runner, sandbox=sandbox,
+                         scratch=scratch, scrub=scrub, state=state, tasks=tasks, vault=vault)
     prohibit_transports(fx)
     redirect_authority(fx)
     create_foreign_record(fx)
@@ -142,22 +142,22 @@ def prohibit_transports(fx):
 
 
 def redirect_authority(fx):
-    scratch = fx.scratch
-    if scratch is not None:
+    sandbox = fx.sandbox
+    if sandbox is not None:
         probe = [sys.executable, "-V"]
-        if scratch.protected_command(probe) != probe:
-            scratch.AUTHORITY = fx.root / "authority-parent/verification-authority"
+        if sandbox.protected_command(probe) != probe:
+            sandbox.AUTHORITY = fx.root / "authority-parent/verification-authority"
 
 
 def create_foreign_record(fx):
-    root, scratch = fx.root, fx.scratch
+    root, scratch, sandbox = fx.root, fx.scratch, fx.sandbox
     fx.foreign = fx.foreign_bytes = None
-    if fx.scenario == "foreign-version-record" and scratch.AUTHORITY.parent == root / "authority-parent":
+    if fx.scenario == "foreign-version-record" and sandbox.AUTHORITY.parent == root / "authority-parent":
         import hmac
-        scratch.AUTHORITY = root.resolve() / "authority-parent/verification-authority"
-        scratch.AUTHORITY.mkdir(mode=0o700)
+        sandbox.AUTHORITY = root.resolve() / "authority-parent/verification-authority"
+        sandbox.AUTHORITY.mkdir(mode=0o700)
         key = os.urandom(32)
-        secret = os.open(scratch.AUTHORITY / "signing.secret", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        secret = os.open(sandbox.AUTHORITY / "signing.secret", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         os.write(secret, key)
         os.close(secret)
         selector = "ab" * 32
@@ -165,7 +165,7 @@ def create_foreign_record(fx):
         data = {"version": 3, "attempt": {"selector": selector, "workspace": elsewhere, "root": elsewhere + "/.arete-scratch-x"},
                 "state": "prepared"}
         fx.foreign_bytes = scratch.encoded({"data": data, "signature": hmac.digest(key, scratch.encoded(data), "sha256").hex()})
-        fx.foreign = scratch.AUTHORITY / (selector + ".json")
+        fx.foreign = sandbox.AUTHORITY / (selector + ".json")
         fx.foreign.write_bytes(fx.foreign_bytes)
 
 
@@ -883,7 +883,7 @@ def answer_secret(fx, result):
     result["diff_refusal"] = vault.refusals(f"diff --git a/notes.txt b/notes.txt\n+++ b/notes.txt\n@@ -1 +1 @@\n+kumquat {marker}\n")
     quoted = 'diff --git "a/caf\\303\\251.txt" "b/caf\\303\\251.txt"\n--- "a/caf\\303\\251.txt"\n+++ "b/caf\\303\\251.txt"\n@@ -1 +1 @@\n+' + marker + '\n'
     result["quoted"] = sorted(vault.held(quoted))
-    result["escaped"] = "caf\\u00e9-token-123" in fx.record.secrets(given=["café-token-123"])
+    result["escaped"] = "caf\\u00e9-token-123" in fx.scrub.secrets(given=["café-token-123"])
 
 
 def restore_replay(fx):

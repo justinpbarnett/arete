@@ -342,17 +342,16 @@ class Job:
     def merge_moved_base(self, name: str) -> None:
         moved, self.moved_base = self.moved_base, ""
         held = [c for c in self.checkouts if c.onto]
+        if moved and held:
+            self.run.log(f"{moved} since run {self.continues} prepared, so arete merges the new base into the edits "
+                         f"that run kept before {name} runs with the answers")
+            merged = pipeline.merge_base_into_kept(self.run, held, self.layer, self.ticket)
+            if merged:
+                self.run.base_note = pipeline.base_merge_note(merged)
+                if self.built is not None:
+                    self.built.workspace = self.workspace
+                pipeline.note_made(self.ws, self.checkouts)
         self.run.kept_note = pipeline.kept_edits_note(held) if self.run.answers_due else ""
-        if not moved or not held:
-            return
-        self.run.log(f"{moved} since run {self.continues} prepared, so arete merges the new base into the edits that "
-                     f"run kept before {name} runs with the answers")
-        merged = pipeline.merge_base_into_kept(self.run, held, self.layer, self.ticket)
-        if merged:
-            self.run.base_note = pipeline.base_merge_note(merged)
-            if self.built is not None:
-                self.built.workspace = self.workspace
-            pipeline.note_made(self.ws, self.checkouts)
 
     @property
     def with_prs(self) -> list[pipeline.Checkout]:

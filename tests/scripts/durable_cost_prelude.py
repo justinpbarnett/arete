@@ -2,20 +2,20 @@
 import contextlib, gzip, io, json, os, sqlite3, sys
 from pathlib import Path
 from unittest import mock
-from arete import accounts, agent, claude, cli, codex, config, devices, gh, heartbeat, paths, pi, record, runner, state, util
+from arete import accounts, agent, claude, cli, codex, config, devices, gh, heartbeat, paths, pi, record, runner, scrub, state, util
 state.migrate()
 root, mode = Path(sys.argv[1]), sys.argv[2]
 def forbidden(*a, **kw):
     raise AssertionError("offline cost test attempted a provider or credential lookup")
 claude.run = codex.run = pi.run = forbidden
-accounts.read = gh.auth_token = forbidden
+accounts.read = util.github_token = forbidden
 original_sh = util.sh
 def local_sh(cmd, *a, **kw):
     if isinstance(cmd, list) and cmd[:1] == ["git"]:
         return original_sh(cmd, *a, **kw)
     return forbidden(cmd, *a, **kw)
 util.sh = local_sh
-record.secrets = lambda *a, **kw: ()
+scrub.secrets = lambda *a, **kw: ()
 cfg = config.Config()
 def call(*argv):
     out, err = io.StringIO(), io.StringIO()

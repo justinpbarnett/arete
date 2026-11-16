@@ -81,14 +81,12 @@ def condition(data, where: str) -> dict:
 
 
 def rate_entry(data, where: str) -> dict:
-    from . import routing
-
     data = table(data, RATE_KEYS, where)
     found: dict = {}
     for name in COMPONENTS:
         if name in data:
             try:
-                price = routing.number(data[name])
+                price = util.nonnegative_number(data[name])
             except OverflowError:
                 price = None
             if price is None or price > MAX_PRICE:

@@ -111,7 +111,12 @@ def cached(generation: str, discover) -> Auth:
     return found
 
 
-def claude(status=None, account=None, token: str = "", source: str = "", lookup=None) -> Auth:
+def chatgpt_account_ids(claims: dict) -> list:
+    return [mapping(claims.get("https://api.openai.com/auth")).get("chatgpt_account_id"),
+            claims.get("chatgpt_account_id")]
+
+
+def claude(status=None, account=None, token: str = "", source: str = "") -> Auth:
     status, account = mapping(status), mapping(account)
     generation = fingerprint("claude", source, status, account, token)
 
@@ -125,7 +130,7 @@ def claude(status=None, account=None, token: str = "", source: str = "", lookup=
                   mapping(status.get("account")).get("uuid")]
         if token:
             try:
-                found = mapping((lookup or profile)(token))
+                found = mapping(profile(token))
             except Exception:
                 found = {}
             account_uuid = mapping(found.get("account")).get("uuid")
@@ -159,28 +164,23 @@ def codex(data=None, source: str = "", provider: str = "") -> Auth:
             continue
         claims = jwt(token)
         malformed |= not bool(claims)
-        values += [mapping(claims.get("https://api.openai.com/auth")).get("chatgpt_account_id"),
-                   claims.get("chatgpt_account_id")]
+        values += chatgpt_account_ids(claims)
     mode = "subscription" if tokens or provider == "chatgpt" or data.get("auth_mode") in ("chatgpt", "subscription") else ""
     return Auth(mode, "codex", "" if malformed else identity("codex", values), generation,
                 fingerprint("credential-v1", "codex", source, data), "openai-codex")
 
 
-def pi(provider: str, credential=None, source: str = "", lookup=None) -> Auth:
+def pi(provider: str, credential=None, source: str = "") -> Auth:
     credential = mapping(credential)
     generation = fingerprint("pi", source, provider, credential)
     local = fingerprint("credential-v1", "pi", source, provider, credential)
-    if credential.get("type") != "oauth":
-        return Auth("api_key", generation=generation, credential=local, provider=provider)
-    if provider not in PI_SUBSCRIPTIONS:
+    if credential.get("type") != "oauth" or provider not in PI_SUBSCRIPTIONS:
         return Auth("api_key", generation=generation, credential=local, provider=provider)
     family = "codex" if provider == "openai-codex" else ""
     if family == "codex":
         token = credential.get("access")
         claims = jwt(token) if token else {}
-        values = [credential.get("accountId"),
-                  mapping(claims.get("https://api.openai.com/auth")).get("chatgpt_account_id"),
-                  claims.get("chatgpt_account_id")]
+        values = [credential.get("accountId"), *chatgpt_account_ids(claims)]
         return Auth("subscription", family, "" if token and not claims else identity(family, values), generation,
                     local, provider)
     return Auth("subscription", generation=generation, credential=local, provider=provider)

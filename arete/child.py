@@ -57,9 +57,7 @@ def stream(cmd: list[str], cwd: str | None, prompt: str, env: dict[str, str], ti
 
 def release(proc: subprocess.Popen) -> None:
     if scratch.PRODUCING.get() is not None:
-        from . import verify
-
-        verify.stop(proc)
+        util.stop_group(proc)
 
 
 class Answer:
