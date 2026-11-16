@@ -14,6 +14,7 @@ from . import (
     config,
     devices,
     install,
+    launchd,
     paths,
     pi,
     routing,
@@ -35,12 +36,12 @@ class Check:
 
 
 def launchd_table() -> dict[str, tuple[str, str]]:
-    res = util.sh(["launchctl", "list"], timeout=20)
     table = {}
-    for line in res.stdout.splitlines()[1:]:
-        parts = line.split("\t")
+    for row in launchd.block(launchd.printed(install._domain()) or "", "services") or []:
+        parts = row.split(None, 2)
         if len(parts) == 3:
-            table[parts[2]] = (parts[0], parts[1])
+            pid, status, label = parts
+            table[label.strip()] = ("-" if pid == "0" else pid, "0" if status == "-" else status)
     return table
 
 
