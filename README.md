@@ -2642,6 +2642,56 @@ the preview must explicitly say no applicable neighbour. For a continuation use 
 To reproduce duplicate publication, record the same PR again with a distinct `--id`; discovery keeps
 one canonical URL. Delete nothing from real state to reset a fixture; use a fresh disposable workspace.
 
+## Versioned write fixture
+
+Run these through the verification sandbox, from a checkout:
+
+```sh
+SB=/Users/justin.barnett/Library/Developer/arete/verification-runtime/harness/sandbox
+"$SB" python docs/versioned-api-fixture.py exercise migration-rollback
+"$SB" python docs/versioned-api-fixture.py exercise writes
+"$SB" python docs/versioned-api-fixture.py exercise stale-stop
+"$SB" python docs/versioned-api-fixture.py exercise concurrent-stop
+"$SB" python docs/versioned-api-fixture.py exercise run-commands
+"$SB" python docs/versioned-api-fixture.py exercise grace
+"$SB" python docs/versioned-api-fixture.py exercise status-races
+"$SB" python docs/versioned-api-fixture.py exercise ask-races
+"$SB" python docs/versioned-api-fixture.py exercise carried-landings
+"$SB" python docs/versioned-api-fixture.py exercise clients
+"$SB" python docs/versioned-api-fixture.py exercise nearby
+"$SB" python docs/versioned-api-fixture.py inspect
+"$SB" python docs/versioned-api-fixture.py serve --port 8765
+```
+
+Each exercise starts an isolated subprocess with scratch config, state, logs, worktrees, HOME and
+TMPDIR, a replay sample repository and a fake admitted tailnet login. Network transports, account
+lookups and GitHub commands are forbidden. The printed evidence directory retains `http.jsonl`,
+`canonical.json`, `database.json`, `result.json`, stdout and stderr. `BEHAVIOR_RESULT` reports success
+only after assertions finish. `migration.json` includes the historical rows, rowids, ledger hashes,
+new table schema and rollback evidence. Pass `--root PATH` to choose a fresh evidence directory;
+use `inspect --root PATH` to inspect one exercise.
+
+Serve prints eligible run IDs and links to legacy Live, run detail and `/ui.html#run/ID`. Stop uses
+a disposable child; Retry, Repair and step admission use saved replay receipts and a fake launcher.
+Successful run writes retain their legacy response bodies and identify the committed event in
+`Arete-Seq`. Every displayed run action sends its selected `base_version`. To exercise a stale
+screen without refreshing, advance its run through the fixture-only endpoint:
+
+```sh
+curl -H 'X-Arete: 1' -X POST 'http://127.0.0.1:8765/api/fixture/stale/RUN_ID'
+```
+
+Press the displayed action before its next poll. It must show the conflict once, refresh, and send
+no second POST. A deliberate action after refresh uses the new displayed version. HTTP evidence
+is retained in the serve directory; stop the fixture with Ctrl-C to clean up its children.
+
+The missing-version grace deadline starts inactive. Migration and startup never activate it.
+The later v1 screen release must explicitly call `arete.store.writes.activate_grace()` once; it
+persists activation plus 30 days, and repeated activation cannot extend it. Before that deadline,
+legacy commands without versions work. At the exact deadline they return 409 `version_conflict`
+with the current persisted object. Explicit versions always compare; internal conditional writes
+remain versionless. The grace exercise uses a fixture clock and reopens the server to check persistence.
+
 ## Rules
 
 - Agents run through `claude -p`, `codex` or `pi`; subscription logins precede API keys. Claude execution never uses `--bare` or an `ANTHROPIC_API_KEY`, here or on a device.

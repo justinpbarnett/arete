@@ -1,6 +1,5 @@
 import ast
 import json
-import os
 import subprocess
 import sys
 import tempfile
@@ -72,6 +71,46 @@ class EventStreamTests(unittest.TestCase):
         self.exercise("beats")
 
     def test_existing_run_stream(self):
+        self.exercise("nearby")
+
+
+class VersionedApiTests(unittest.TestCase):
+    def exercise(self, name):
+        from tests.versioned_api_fixture import exercise
+
+        exercise(name)
+
+    def test_migration_rollback(self):
+        self.exercise("migration-rollback")
+
+    def test_writes(self):
+        self.exercise("writes")
+
+    def test_stale_stop(self):
+        self.exercise("stale-stop")
+
+    def test_concurrent_stop(self):
+        self.exercise("concurrent-stop")
+
+    def test_run_commands(self):
+        self.exercise("run-commands")
+
+    def test_grace(self):
+        self.exercise("grace")
+
+    def test_status_races(self):
+        self.exercise("status-races")
+
+    def test_ask_races(self):
+        self.exercise("ask-races")
+
+    def test_carried_landings(self):
+        self.exercise("carried-landings")
+
+    def test_clients(self):
+        self.exercise("clients")
+
+    def test_nearby(self):
         self.exercise("nearby")
 
 
@@ -202,10 +241,13 @@ class StoreContractTests(unittest.TestCase):
         self.assertEqual(found["historical_rows"], 2)
         self.assertTrue(found["hashes_unchanged"] and found["historical_work_preserved"])
         self.assertEqual(found["applied_once"], found["expected_suffix"])
-        self.assertEqual(found["budget_applied_once"], [5, 6, 7, 8])
-        self.assertEqual((found["relocated_rows_added"], found["pre_budget_rows_added"]), (0, 4))
-        self.assertEqual(found["origin_main_rows_added"], 0)
-        self.assertTrue(found["origin_main_unchanged"] and found["latest_unchanged"])
+        self.assertEqual(found["budget_applied_once"][:5], [5, 6, 7, 8, 9])
+        self.assertEqual(found["budget_applied_once"], found["budget_expected_suffix"])
+        self.assertEqual((found["relocated_rows_added"], found["pre_budget_rows_added"]),
+                         (0, len(found["budget_expected_suffix"])))
+        self.assertEqual(found["origin_main_actual_suffix"], found["origin_main_expected_suffix"])
+        self.assertEqual(found["origin_main_rows_added"], len(found["origin_main_expected_suffix"]))
+        self.assertTrue(found["origin_main_unchanged"] and found["latest_valid"])
         self.assertEqual(len(found["historical_files"]), len(found["origin_main_ledger"]))
 
 

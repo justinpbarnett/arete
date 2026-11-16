@@ -210,9 +210,9 @@ class Stream:
             sock = self.conn.sock or (self.response.fp.raw._sock if self.response.fp else None)
             if sock:
                 sock.shutdown(socket.SHUT_RDWR)
+        self.thread.join(2)
         self.response.close()
         self.conn.close()
-        self.thread.join(2)
         target = self.fixture.root / f"stream-{time.time_ns()}.json"
         target.write_text(json.dumps({"headers": self.headers, "raw": self.raw, "messages": self.messages}, indent=2))
 
@@ -261,10 +261,16 @@ def live_replay(f, nearby=False):
         time.sleep(.3)
         with mock.patch.object(run_lines, "write", timed):
             run = replay(f)
-        stream.wait(lambda rows: any(m["data"].get("kind") == "run.ended" for m in rows))
+        stream.wait(lambda rows: any(m["data"].get("subject") == f"run:{run['id']}"
+                                    and m["data"].get("ver") == run["version"] for m in rows))
         messages = [m for m in stream.messages if m["data"].get("data", {}).get("run") == run["id"]]
         rows = [m["data"] for m in messages]
-        assert rows[0]["kind"] == "run.started" and rows[-1]["kind"] == "run.ended", rows
+        assert rows[0]["kind"] == "run.started", rows
+        lifecycle = [r for r in rows if r["kind"] in ("run.started", "run.ended")]
+        assert [r["kind"] for r in lifecycle] == ["run.started", "run.ended"], lifecycle
+        assert lifecycle[-1]["data"]["status"] == run["status"]
+        versions = [r["ver"] for r in rows if r["subject"] == f"run:{run['id']}"]
+        assert versions == list(range(1, run["version"] + 1)), versions
         assert rows[0]["actor"] == f.person
         seqs = [r["seq"] for r in rows]
         assert seqs == sorted(set(seqs))
@@ -282,7 +288,7 @@ def live_replay(f, nearby=False):
             assert message["at"] - at < 1
         for row in rows:
             assert row["id"] == f"{row['epoch']}.{row['seq']}" and row["actor"] != "owner" and "@" not in row["actor"]
-        assert rows[0]["ver"] is None
+        assert rows[0]["ver"] == 1
         if nearby:
             conn, response = f.request(f"/api/runs/{run['id']}/events")
             old = [json.loads(line) for line in response.read().splitlines()]
@@ -859,15 +865,18 @@ def child(scenario, root, port):
         (root / "config/config.toml").write_text('[dashboard]\nowner=""\n')
     if scenario == "row-actors":
         from arete.store import db as foundation, migrations
-        from arete.store import tasks as tasks_store
 
         chain = migrations.load()
         with mock.patch.object(migrations, "load", return_value=chain[:4]), \
                 mock.patch.multiple(foundation, LATEST=4, NEEDED=4):
             foundation.migrate()
-            legacy = tasks_store.task_add("replay-sample", "A legacy question", "Legacy", "feat")
-            tasks_store.task_set_state(legacy, "needs-info")
-            tasks_store.task_comment(legacy, "owner", "A legacy answer")
+            legacy = "t-0001"
+            with foundation.tx() as c:
+                c.execute("INSERT INTO tasks (id, repo, body, title, kind, state, created, updated) "
+                          "VALUES (?, 'replay-sample', 'A legacy question', 'Legacy', 'feat', 'needs-info', ?, ?)",
+                          (legacy, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"))
+                c.execute("INSERT INTO task_comments (task, author, body, ts) VALUES (?, 'owner', 'A legacy answer', ?)",
+                          (legacy, "2026-01-01T00:00:00Z"))
             (root / "legacy-task.txt").write_text(legacy)
     fixture = Fixture(root, port)
     try:

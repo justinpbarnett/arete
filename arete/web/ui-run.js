@@ -1,7 +1,7 @@
 import { h, Component } from "./vendor-preact.js";
 import htm from "./vendor-htm.js";
 import { createList, ListHeader } from "./ui-list.js";
-import { syncList, selectItem, pane } from "./ui-keys.js";
+import { syncList, selectItem, pane, activatePane } from "./ui-keys.js";
 import { Empty, Fault, Loading } from "./ui-states.js";
 import { dispatch, actions, runPageContext, repairThisRun } from "./ui-actions.js";
 import { register } from "./ui-palette.js";
@@ -98,7 +98,11 @@ export class RunQueue extends Watching {
           return found.length ? h("div", { key: name, "data-group": name },
             h("div", { class: "ui-list-group" }, `${name} · ${found.length}`),
             found.map((row) => h("a", { key: row.id, class: `run-row${row.id === shown ? " selected" : ""}`, href: hashOf(row.id), "data-row": "", "data-item": row.id,
-              "data-group": name, "aria-current": row.id === shown ? "page" : undefined },
+              "data-group": name, "aria-current": row.id === shown ? "page" : undefined,
+              onClick: (event) => {
+                if (event.button === 0 && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey
+                  && globalThis.matchMedia?.("(width < 900px)").matches) activatePane("focus");
+              } },
             h("span", { class: `run-state ${name === "Fault" ? "fault" : ""}` }, row.state),
             h("span", { class: "run-title", title: row.title }, row.title),
             h("span", { class: "run-time" }, row.number)))) : null;
@@ -142,7 +146,7 @@ function failure(view) {
 function Steps({ view }) {
   const steps = reduceSteps(view.events);
   if (!steps.length) return h(Empty, { what: view.detail.run.status === "running" ? "Waiting for the first step" : "No steps recorded for this run" });
-  return html`<table class="run-steps"><thead><tr><th>Step</th><th>State</th><th>Took</th><th>Cost</th><th>Model</th><th>Turns</th></tr></thead>
+  return html`<div class="run-steps-scroll" tabindex="0" role="region" aria-label="Run steps"><table class="run-steps"><thead><tr><th>Step</th><th>State</th><th>Took</th><th>Cost</th><th>Model</th><th>Turns</th></tr></thead>
     <tbody>${steps.map((row) => row.kind !== "step" ? html`<tr key=${row.key} class=${`note ${row.kind}`} data-kind=${row.kind}>
       <td colspan="6">${row.kind === "error" ? "× error" : "report"}${row.step ? ` · ${row.step}` : ""} · ${row.text}</td></tr>`
     : html`<tr key=${row.key} data-kind="step" data-state=${row.state}>
@@ -150,7 +154,7 @@ function Steps({ view }) {
       <td class=${row.state === "fail" ? "fault" : ""}>${STEP_STATES[row.state] ?? row.state}${row.error ? html`<span class="muted step-error"> ${row.error}</span>` : null}</td>
       <td>${duration(row.seconds)}</td><td>${row.cost == null ? "" : money(row.cost)}</td>
       <td>${row.label}${row.tokensIn == null && row.tokensOut == null ? "" : html` <span class="muted">${count(row.tokensIn)} in · ${count(row.tokensOut)} out</span>`}</td>
-      <td>${row.turns ?? ""}</td></tr>`)}</tbody></table>`;
+      <td>${row.turns ?? ""}</td></tr>`)}</tbody></table></div>`;
 }
 
 export const stepsOf = (view) => view.events.filter((event) => event.event === "step_start").length;
@@ -244,7 +248,7 @@ export class RunFocus extends Component {
         <span class="strip-actions">
           ${group === "Waiting on you" && run.ticket ? html`<button type="button" data-act="open-task" onClick=${this.openTask}><kbd class="cap">gx</kbd> Open task</button>` : null}
           ${context?.run.retry ? html`<button type="button" data-act="retry-run" onClick=${() => dispatch(context.run.retry, context)}><kbd class="cap">⇧r</kbd> Retry</button>` : null}
-          ${run.status === "running" ? html`<button type="button" data-act="stop-run" onClick=${() => dispatch(actions.stop, context)}><kbd class="cap">dd</kbd> Stop the run</button>` : null}
+          ${run.status === "running" ? html`<button type="button" data-act="stop-run" disabled=${Boolean(run.stop_asked)} onClick=${() => dispatch(actions.stop, context)}><kbd class="cap">dd</kbd> ${run.stop_asked ? "Stopping" : "Stop the run"}</button>` : null}
         </span>
       </div>
       <div class="run-panel" id="run-panel" role="tabpanel" aria-labelledby=${`run-tab-${tab}`}

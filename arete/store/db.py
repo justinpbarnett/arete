@@ -87,7 +87,8 @@ def connect_db(p: Path, readonly: bool = False, create: bool = False, *, streami
         raise
 
 
-TIME_COLUMNS = {**time_shape.TIME_COLUMNS, "runs": (*time_shape.TIME_COLUMNS["runs"], "measured_at")}
+TIME_COLUMNS = {**time_shape.TIME_COLUMNS, "runs": (*time_shape.TIME_COLUMNS["runs"], "measured_at"),
+                "idempotency": ("at",)}
 TIME_GLOB = time_shape.TIME_GLOB
 
 _CHAIN = migrations.load()
@@ -381,6 +382,11 @@ def write_connection():
     if not active or active[:2] != (os.getpid(), "write") or not active[2].in_transaction:
         raise RuntimeError("event emission needs an open write transaction")
     return active[2]
+
+
+def in_write():
+    active = getattr(_OWNER, "active", None)
+    return bool(active and active[:2] == (os.getpid(), "write") and active[2].in_transaction)
 
 
 def ensure_schema() -> None:

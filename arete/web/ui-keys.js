@@ -75,13 +75,26 @@ export function writable(el) {
 const canonical = (name) => name === "auxiliary" ? "focus" : name;
 const usable = (el) => !el.hidden && !el.disabled && el.getAttribute("aria-disabled") !== "true" && el.getClientRects().length > 0;
 const itemId = (row) => row.dataset.item ?? row.dataset.row;
-const listRows = (list) => [...list.querySelectorAll("[data-row]")].filter(usable);
+const listRows = (list) => [...list.querySelectorAll("[data-row]")].filter((row) => usable(row)
+  || (list.dataset.list === "run-queue" && !row.hidden && !row.disabled && row.getAttribute("aria-disabled") !== "true"));
 const paneElements = (name) => [...document.querySelectorAll("[data-pane]")].filter((el) => canonical(el.dataset.pane) === name);
 const lists = (name) => paneElements(name).flatMap((el) => [...el.querySelectorAll("[data-list]"), ...(el.matches("[data-list]") ? [el] : [])]);
 
 function paneOf(target) {
   const el = target?.closest?.("[data-pane]");
   return el ? canonical(el.dataset.pane) : null;
+}
+
+const narrowRun = () => globalThis.matchMedia?.("(width < 900px)").matches && parse(location.hash).screen === "run";
+
+export function activatePane(name) {
+  pane.value = name;
+  marks();
+  if (narrowRun()) {
+    const target = paneElements(name)[0];
+    const row = name !== "focus" ? target?.querySelector('[data-cursor], [aria-current="page"]') : null;
+    (row ?? target)?.focus({ preventScroll: true });
+  }
 }
 
 function focusedList() {
@@ -147,6 +160,15 @@ export function syncList(list) {
 }
 
 export function marks() {
+  const app = narrowRun() ? document.querySelector('.ui-app[data-screen="run"]') : null;
+  if (app) {
+    if (pane.value !== "sidebar") app.dataset.runPane = pane.value;
+    else app.dataset.runPane ||= "queue";
+    const active = document.activeElement?.closest?.('[data-pane="queue"], [data-pane="focus"]');
+    if (active && active.dataset.pane !== app.dataset.runPane) {
+      paneElements(app.dataset.runPane)[0]?.focus({ preventScroll: true });
+    }
+  }
   for (const el of document.querySelectorAll("[data-pane]")) {
     el.toggleAttribute("data-focus", el.dataset.pane !== "auxiliary" && el.dataset.pane === pane.value);
   }
@@ -167,6 +189,7 @@ function openRow(row) {
   if (target?.startsWith("#")) go(target);
   else if (target === null) row.click();
   else link?.click();
+  if (narrowRun() && row.closest?.('[data-list="run-queue"]')) activatePane("focus");
 }
 
 function open() {
@@ -196,6 +219,7 @@ function neighbour(delta) {
 }
 
 function tab(delta) {
+  if (narrowRun() && pane.value !== "focus") activatePane("focus");
   const tabs = [...document.querySelectorAll(tabSelector)].filter(usable);
   if (!tabs.length) return;
   const selected = tabs.findIndex((el) => el.getAttribute("aria-selected") === "true");
@@ -208,6 +232,7 @@ function search() {
   const scopes = paneElements(pane.value);
   const field = scopes.flatMap((el) => [...el.querySelectorAll("[data-search]")]).find(writable)
     ?? [...document.querySelectorAll("[data-search]")].find(writable);
+  if (field && narrowRun()) activatePane(paneOf(field));
   field?.focus();
 }
 
@@ -221,8 +246,7 @@ function insert() {
 function step(delta) {
   const available = panes.filter((name) => paneElements(name).length);
   const at = available.indexOf(pane.value);
-  pane.value = available[Math.max(0, Math.min(available.length - 1, (at < 0 ? 0 : at) + delta))] ?? pane.value;
-  marks();
+  activatePane(available[Math.max(0, Math.min(available.length - 1, (at < 0 ? 0 : at) + delta))] ?? pane.value);
 }
 
 function closeSheet() {
@@ -365,8 +389,13 @@ export function startKeys() {
   document.addEventListener("pointerdown", touch, true);
   document.addEventListener("click", touch, true);
   window.addEventListener("blur", () => { pending.value = ""; });
-  window.addEventListener("hashchange", () => { pending.value = ""; paletteRouteChanged(); marks(); });
-  marks();
+  const routed = () => {
+    if (narrowRun()) activatePane(parse(location.hash).path[0] ? "focus" : "queue");
+    else marks();
+  };
+  window.addEventListener("hashchange", () => { pending.value = ""; paletteRouteChanged(); routed(); });
+  window.addEventListener("resize", marks);
+  routed();
 }
 
 export function hints() {

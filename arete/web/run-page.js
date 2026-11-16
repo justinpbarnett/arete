@@ -70,7 +70,7 @@ function drawRunDetail(pane, result, kind) {
   const stick = !shownLines || shownLines.scrollTop + shownLines.clientHeight >= shownLines.scrollHeight - 4;
   const s = board.session;
   fill(`${pane}-head`, detailHead(pane, kind, id, s?.prompt ? firstMessage(s.prompt, TITLE_CHARS) : r.ticket || id,
-    running ? button(r.stop_asked ? "Stopping" : "Stop", "stop", (b) => stopRun(id, place, b), { of: id, disabled: Boolean(r.stop_asked) }) : null));
+    running ? button(r.stop_asked ? "Stopping" : "Stop", "stop", (b) => stopRun(r, place, b), { of: id, disabled: Boolean(r.stop_asked) }) : null));
   fill(`${pane}-body`,
     saidLine(place),
     el("dl", { class: "w" },
@@ -99,8 +99,8 @@ function drawRunDetail(pane, result, kind) {
   return running ? LIVE_MS : SLOW_MS;
 }
 
-function stopRun(id, place, btn) {
-  return act(btn, place, `/api/runs/${encodeURIComponent(id)}/stop`, {}, (r) => stopWords(id, r, "The feed says when it has."));
+function stopRun(run, place, btn) {
+  return act(btn, place, `/api/runs/${encodeURIComponent(run.id)}/stop`, {}, (r) => stopWords(run.id, r, "The feed says when it has."), { object: run });
 }
 
 function talkForm(pane, id) {

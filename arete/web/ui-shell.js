@@ -1,7 +1,7 @@
 import { h } from "./vendor-preact.js";
 import htm from "./vendor-htm.js";
 import * as data from "./ui-data.js";
-import { screenKeys } from "./ui-keys.js";
+import { screenKeys, activatePane } from "./ui-keys.js";
 import { KeyBar, KeySheet } from "./ui-keybar.js";
 import { List, createList, demoQueue, demoFocus } from "./ui-list.js";
 import { Empty, Fault, Gate } from "./ui-states.js";
@@ -55,11 +55,11 @@ export function Sidebar({ route, snapshot, now }) {
     ? duration(serve.age_seconds + Math.max(0, now - snapshot.received) / 1000) : "";
   return html`<aside class="sidebar frame" data-pane="sidebar" aria-label="Sidebar">
     <div class="side-top"><span class="mark">A</span><span class="wordmark">arete</span><span class="version" aria-label="Server version"></span></div>
-    <button type="button" class="search" data-act="palette" onClick=${() => openPalette()}><kbd>:</kbd><span>Search</span><kbd>Cmd K</kbd></button>
+    <button type="button" class="search" data-act="palette" aria-label="Search (Cmd K)" title="Search (Cmd K)" onClick=${() => openPalette()}><kbd>:</kbd><span>Search</span><kbd>Cmd K</kbd></button>
     <nav class="side-nav" aria-label="Screens" data-list="screens">${navigation.map(([id, label, key, glyph, href]) => {
       const count = id === "triage" ? snapshot.needsYou : id === "runs" ? snapshot.running : null;
       return html`<a key=${id} data-row data-item=${id} data-act=${`go-${id}`} class=${`nav-row${route.active === id ? " selected" : ""}`} href=${href}
-        aria-current=${route.active === id ? "page" : undefined}>
+        aria-label=${label} title=${`${label} (${key})`} aria-current=${route.active === id ? "page" : undefined}>
         <kbd class="key-slot">${key}</kbd><span class="glyph" aria-hidden="true">${glyph}</span>
         <span class="nav-label">${label}</span><span class=${`count${id === "triage" && count > 0 ? " accent" : ""}`}>${count}</span>
       </a>`;
@@ -76,7 +76,7 @@ export function Sidebar({ route, snapshot, now }) {
 }
 
 function Pane({ name, label, children }) {
-  return html`<section class=${`pane frame ${name}`} data-pane=${name} aria-label=${label}>
+  return html`<section id=${`pane-${name}`} class=${`pane frame ${name}`} data-pane=${name} aria-label=${label} tabindex="-1">
     <h2 class="pane-label">${label}</h2>${children}
   </section>`;
 }
@@ -113,7 +113,7 @@ export function Shell({ route, snapshot, now, retry, runs }) {
     <main class="main">
       <div class="top-bar" aria-label="Top bar"></div>
       <header class="page-head">
-        <div class="head-row"><h1>${page.title}</h1><div class="head-tools"></div></div>
+        <div class="head-row"><h1>${page.title}</h1><div class="head-tools">${route.screen === "run" ? html`<button type="button" class="run-back" aria-controls="pane-queue" onClick=${() => activatePane("queue")}>← Back to runs</button>` : null}</div></div>
         <p class="subtitle">${page.subtitle}</p>
         ${counts ? html`<p class="subtitle">${counts.total} open · ${counts.needsYou} need you · ${counts.high} high · ${counts.med} med</p>` : null}
         ${page.tabs ? html`<div class="tabs-slot" aria-label="Tabs"></div>` : null}

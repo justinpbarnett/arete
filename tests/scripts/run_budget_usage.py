@@ -16,9 +16,10 @@ METADATA = {"version", "parents", "left_out", "policy", "specification",
             "wait_minutes_left_out", "earlier_wait_minutes_left_out"}
 
 
-def events_once_logged():
+def historical_writers():
     from arete import events
     from arete.store import db as foundation
+    from arete.store import runs
 
     emit = events.emit
 
@@ -28,13 +29,43 @@ def events_once_logged():
         return emit(*args, **kwargs) if logged else None
 
     events.emit = older_writers_skip
+    insert_run, checkpoint, settle = runs.insert_run, runs.checkpoint, runs.settle
+
+    def historical_insert(run_id, row):
+        with foundation.tx() as c:
+            if c.execute("PRAGMA user_version").fetchone()[0] >= 9:
+                return insert_run(run_id, row)
+            columns = ", ".join(row)
+            c.execute(f"INSERT INTO runs (id, {columns}) VALUES (?, {','.join('?' for _ in row)})",
+                      (run_id, *row.values()))
+
+    def historical_checkpoint(run_id, active, verified, opened, repairs, at):
+        with foundation.tx() as c:
+            if c.execute("PRAGMA user_version").fetchone()[0] >= 9:
+                return checkpoint(run_id, active, verified, opened, repairs, at)
+            c.execute("UPDATE runs SET active_seconds=?, verify_seconds=?, verify_open_seconds=?, "
+                      "repair_calls=?, measured_at=? WHERE id=?", (active, verified, opened, repairs, at, run_id))
+
+    def historical_settle(run_id, fields, end_line="", base_version=None):
+        with foundation.tx() as c:
+            if c.execute("PRAGMA user_version").fetchone()[0] >= 9:
+                return settle(run_id, fields, end_line, base_version)
+            if not c.execute(f"UPDATE runs SET {', '.join(f'{k} = ?' for k in fields)} "
+                             "WHERE id = ? AND status = 'running'", (*fields.values(), run_id)).rowcount:
+                return None
+            if end_line:
+                runs.insert_feed(run_id, "end", end_line)
+            return dict(c.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone())
+
+    runs.insert_run = historical_insert
+    runs.checkpoint = historical_checkpoint
+    runs.settle = historical_settle
 
 
 def expand(root):
-    from arete.store import db as foundation
     from arete.store import db as foundation, migrations
 
-    events_once_logged()
+    historical_writers()
     original = migrations.FOLDER
     folder = root / "expand-migrations"
     folder.mkdir()
@@ -212,7 +243,6 @@ BAD_BUDGETS = {
 
 def migration_error(root, case):
     from arete import paths, runlimits, util
-    from arete.store import db as foundation
     from arete.store import runs as runs_store
     from arete.store import db as foundation, migrations
 

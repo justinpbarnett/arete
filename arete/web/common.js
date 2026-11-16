@@ -1,5 +1,14 @@
 "use strict";
 
+async function versionedRunWrite(path, body, object) {
+  const selected = { ...object };
+  const { prepareWrite, sendWrite } = await import("./ui-write.js");
+  const request = prepareWrite(path, body, selected);
+  changesInFlight++;
+  try { return await sendWrite(request, noteServedCode); }
+  finally { setTimeout(() => changesInFlight--); }
+}
+
 const VIEWS = {
   live: { label: "Live", group: "Work", key: "l", sub: "What runs now, and what waits for you." },
   runs: { label: "Runs", group: "Work", key: "r", sub: "Every run of every kind, the running ones first, then the newest." },

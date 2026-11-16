@@ -23,10 +23,11 @@ async function answerPress(btn, place, answer, { sayingFault } = {}) {
   press?.settle();
 }
 
-function act(btn, place, path, body, saying, { meanwhile = null, sayingFault } = {}) {
+function act(btn, place, path, body, saying, { meanwhile = null, sayingFault, object } = {}) {
   return answerPress(btn, place, async () => {
     if (meanwhile) sayAt(place, null, meanwhile);
-    sayAt(place, "ok", saying(await call(path, body)));
+    const result = object ? await versionedRunWrite(path, body, object) : await call(path, body);
+    sayAt(place, "ok", saying(result));
   }, { sayingFault });
 }
 

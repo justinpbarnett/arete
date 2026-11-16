@@ -117,7 +117,7 @@ def live(running: list[dict]) -> dict:
     for r in running:
         lines = log_lines(r)
         rows.append({
-            "id": r["id"], "kind": r["kind"], "ticket": ticket(r), "repo": r["repo"] or "",
+            "id": r["id"], "version": r["version"], "kind": r["kind"], "ticket": ticket(r), "repo": r["repo"] or "",
             "started": r["started"], "seconds": seconds_between(r["started"], None),
             "step": LOG_PREFIX.sub("", lines[-1]) if lines else "",
             "slot": slot_note(r, in_slots, waiting_for_slot),

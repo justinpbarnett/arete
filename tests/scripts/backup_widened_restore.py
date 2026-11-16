@@ -1,6 +1,9 @@
 from arete.store import runs as run_store
 
 seed()
+from arete import events
+with foundation.tx():
+    events.emit("fixture.seeded", "fixture:backup", cls="derived", data={})
 s = server()
 pre = counts()
 with mock.patch.object(run_store, "FIRINGS", "(1 = 1)"):
