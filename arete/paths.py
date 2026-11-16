@@ -242,6 +242,16 @@ CLAUDE_PROJECTS_DIR = HOME / ".claude" / "projects"
 CLAUDE_SETTINGS = HOME / ".claude" / "settings.json"
 
 
+PER_CALL_HOOKS = ("hook", "guard", "codex-guard", "background")
+
+
+def cli_command(*args: str, flags: tuple[str, ...] = ()) -> list[str]:
+    pinned = "" if args[:1] and args[0] in PER_CALL_HOOKS else "from arete import codebase; codebase.load(); "
+    entrypoint = (f"import sys; sys.path.insert(0, {str(PACKAGE_DIR.parent)!r}); {pinned}"
+                  "from arete.cli import main; raise SystemExit(main())")
+    return [sys.executable, "-I", *flags, "-c", entrypoint, *args]
+
+
 def expand(p: str | Path) -> Path:
     return Path(os.path.expandvars(os.path.expanduser(str(p))))
 

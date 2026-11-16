@@ -5,7 +5,6 @@ import math
 import os
 import signal
 import subprocess
-import sys
 import threading
 from collections import Counter, defaultdict
 from datetime import timedelta
@@ -73,10 +72,7 @@ def session_report(run_id: str, connect=state.db) -> dict:
 
 
 def command(args: list[str]) -> list[str]:
-    entrypoint = (f"import sys; sys.path.insert(0, {str(paths.PACKAGE_DIR.parent)!r}); "
-                  "from arete import codebase; codebase.load(); "
-                  "from arete.cli import main; raise SystemExit(main())")
-    return [sys.executable, "-I", "-c", entrypoint, *args]
+    return paths.cli_command(*args)
 
 
 def detach(args: list[str], log_name: str = DETACHED_LOG, keep: tuple[int, ...] = ()) -> subprocess.Popen:

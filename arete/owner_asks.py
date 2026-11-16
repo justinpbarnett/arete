@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import re
-import sys
 from typing import TextIO
 
 from . import outbound, paths
@@ -187,10 +186,7 @@ def check(stdin: TextIO, stdout: TextIO) -> int:
 
 
 def server_command() -> list[str]:
-    entrypoint = (f"import sys; sys.path.insert(0, {str(paths.PACKAGE_DIR.parent)!r}); "
-                  "from arete import codebase; codebase.load(); "
-                  "from arete.cli import main; raise SystemExit(main())")
-    return [sys.executable, "-I", "-B", "-c", entrypoint, "mcp-ask"]
+    return paths.cli_command("mcp-ask", flags=("-B",))
 
 
 def with_server(mcp_config: str) -> str:
