@@ -69,6 +69,12 @@ five seconds in the rolling last hour and names its caller; `db:size` warns when
 `[retention] db_max_mb` (default 500 MiB); `runs:size` warns above half `max_gb` (decimal GB), counting record/
 and all other run-folder bytes. These checks read current files, so they also work before the first collection.
 
+Run the merge resolver exercises with `<sandbox> python docs/resolve-fixture.py base-moved`,
+`unrelated-edit`, `protected`, or `branch-moved` (replace the final scenario name). Each uses fresh offline Git
+repositories under `.arete-sandbox/resolve-fixture` and exits nonzero on a mismatch. Successful moves print clean
+merge parents and combined content; refusal cases print the rejected path and resolver call count. `base-moved`
+also checks an explicit incoming commit override and saves the emitted prompts beside each disposable repository.
+
 Run the offline exercises through the supplied verification sandbox, replacing `<sandbox>` with its executable path:
 
 ```sh
