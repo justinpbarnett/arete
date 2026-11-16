@@ -205,7 +205,7 @@ def test_add_feed_issues_no_ddl():
         if not statements or statement != statements[-1]:
             statements.append(statement)
     assert len(statements) == 3, TRACE
-    assert statements[0] == "BEGIN" and statements[1].startswith("INSERT INTO FEED") and statements[2] == "COMMIT", TRACE
+    assert statements[0] == "BEGIN IMMEDIATE" and statements[1].startswith("INSERT INTO FEED") and statements[2] == "COMMIT", TRACE
     assert state.feed("run")[-1]["text"] == "x"
 
 

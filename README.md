@@ -4,6 +4,56 @@ Agent loops that keep running and keep making the harness they run in better.
 
 Arete is one global engine for every repo on the machine. Each repo gets a thin layer that says how to set up, what checks must pass, and how much the agents are trusted there. The layer is `.agents/` in the repo, or a folder outside it when the rest of the team does not use arete. Agents edit files. Arete's own code commits, pushes and opens PRs, so no agent ever holds git write access.
 
+## Database transactions and the timing rollout
+
+Production remains in SQLite rollback journal mode with the existing synchronous (FULL) and busy-timeout settings.
+Retain at least one full day of rollback-mode measurements before deploying the WAL follow-up. This release does
+not enable WAL or aggregate timing across processes.
+
+`state.tx()` owns one checked connection and begins `BEGIN IMMEDIATE` before application reads. It commits once on
+successful outer exit, rolls back escaping exceptions (including interruptions), and closes the connection.
+`state.db` is its joining alias; ordinary writes issue no DDL. Nested `tx`, `db` and `reader` scopes share an active
+writer and its uncommitted changes, without savepoints or independent commits. Keep network operations outside these
+scopes. The migrator and staged-restore sequence updates use independent connection ownership.
+
+`state.one_read()` and `state.reader()` own a mode=ro connection and explicit `BEGIN`; nested readers share that
+snapshot until outer exit closes the connection, ending the read transaction without a commit. A reader inside a
+writer joins the writer. Attempting `tx` or `db` inside an existing
+read snapshot raises instead of promoting it. Reader entry never migrates or checks writer compatibility.
+
+Every outer transaction records monotonic elapsed time, including connection acquisition, BEGIN wait and COMMIT.
+Transactions above 500 ms and escaping SQLite errors append exactly one JSON line to `LOG_DIR/db.log`, using one
+O_APPEND write. Fields are `timestamp` (UTC), `pid`, `process_kind`, `caller` (first module.function outside the store
+and timing helpers), `mode` (`read` or `write`), `total_ms`, `begin_ms`, `commit_ms` and `error` (exception class or
+empty string). No SQL, parameters or payloads are recorded. Diagnostic failures never change application results.
+
+All outer transactions, including fast successes, also contribute to `LOG_DIR/dbstats/*.json`. Format 1 contains
+`database` (hash of absolute path and file identity), `incarnation` (new random token per process or fork), UTC `hour`,
+`pid`, `process_kind`, and `transactions` grouped by `mode:caller`. Each group retains `count`, summed `total_ms`,
+`begin_ms`, `commit_ms`, `max_ms`, exception-class `errors`, and a mergeable `histogram`. Histogram key `0` means
+0–1 ms; key N means greater than 2^(N−1) through 2^N ms. Counts nest only at the outer boundary. Updates are locked
+across threads and published atomically after every transaction, so normal short-lived processes need no exit flush.
+Database replacements, distinct databases, restarts, forks and UTC hours have separate records; PID is metadata,
+not identity. Retain these files as inputs for later hourly aggregation.
+
+Run the offline exercises through the supplied verification sandbox, replacing `<sandbox>` with its executable path:
+
+```sh
+<sandbox> python docs/db-fixture.py transactions
+<sandbox> python docs/db-fixture.py concurrent-intake
+<sandbox> python docs/db-fixture.py transaction-timing
+<sandbox> python docs/db-fixture.py output-sinks
+<sandbox> python docs/db-fixture.py durable-files
+<sandbox> python docs/db-fixture.py inspect
+```
+
+Each exercise starts a subprocess with disposable config, state, logs, worktrees, temporary files and HOME before
+importing arete, refuses production state, uses offline fakes and exits nonzero on a behavioral mismatch. Readable
+evidence, stdout and stderr remain under `.arete-sandbox/db-fixture/<exercise>-*/`; `inspect` reviews the latest
+results and journal/synchronous settings. Contention exercises use ordinary rollback-journal SQLite files, not the
+confined scratch connection's MEMORY journal. Source fetch barriers, transaction cleanup, snapshots, migrations,
+restore isolation, oncall ordering, output draining and durable replacement failures are exercised there.
+
 ## Serve
 
 `arete serve` is the one daemon. It fires each loop on its trigger (a cron line, an interval, a source with new events, a webhook), runs the fired loops through their queues, closes idle sessions, writes a beat to `serve.json` every 20 seconds, and serves the dashboard. `arete install` runs it at login: one launchd agent, `com.arete.serve`, on a Mac, or one systemd user unit, `arete-serve.service`, on Linux. It retires the old per loop agents (`com.arete.heartbeat`, `poll`, `mine`, `audit`, `eval`, `triage`, `dashboard`), since each of those now runs as a loop under serve. `arete install --dry-run` prints what it would write. A loop run killed with serve settles as interrupted; its queued input gets one recovery retry when serve starts again, then becomes dead if interrupted again.

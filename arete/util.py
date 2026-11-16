@@ -472,7 +472,7 @@ def env_value(raw: str) -> str:
     return re.split(r"\s#", raw, maxsplit=1)[0].strip().strip('"').strip("'")
 
 
-UNREADABLE_WARNED: dict[str, tuple[int, int]] = {}
+UNREADABLE_WARNED: dict[str, tuple] = {}
 
 
 def read_json(p: Path, default):
@@ -485,7 +485,8 @@ def read_json(p: Path, default):
     try:
         return json.loads(raw.decode())
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
-        version = (seen.st_mtime_ns, seen.st_size)
+        version = (seen.st_dev, seen.st_ino, seen.st_ctime_ns, seen.st_mtime_ns, seen.st_size,
+                   hashlib.sha256(raw).digest())
         key = str(Path(p).absolute())
         if UNREADABLE_WARNED.get(key) != version:
             UNREADABLE_WARNED[key] = version

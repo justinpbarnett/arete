@@ -5,9 +5,11 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 import threading
 import time
 import traceback
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -164,14 +166,70 @@ def feed_stdin(proc: subprocess.Popen, text: str) -> None:
         pass
 
 
-def copy_output(proc: subprocess.Popen, output: Path | None, lines: list[str], on_line) -> None:
+@contextmanager
+def output_log(output):
     with open(output or os.devnull, "a") as out:
+        yield out
+
+
+class OutputSinks:
+    def __init__(self, output, on_line):
+        self.stack = ExitStack()
+        self.out = None
+        self.on_line = on_line
+        try:
+            self.out = self.stack.enter_context(output_log(output))
+        except Exception as e:
+            self.stopped(e)
+
+    def stderr(self, text):
+        with suppress(Exception):
+            sys.stderr.write(text)
+            sys.stderr.flush()
+
+    def stopped(self, error):
+        note = f"[arete] feed stopped: {error}\n"
+        if self.out is not None:
+            try:
+                self.out.write(note)
+                self.out.flush()
+                return
+            except Exception as e:
+                self.close()
+                self.stderr(f"[arete] feed stopped: {e}\n")
+        self.stderr(note)
+
+    def write(self, line, callback=True):
+        if self.out is not None:
+            try:
+                self.out.write(line)
+                self.out.flush()
+            except Exception as e:
+                self.close()
+                self.stopped(e)
+        if callback and self.on_line is not None:
+            try:
+                self.on_line(line.rstrip("\n"))
+            except Exception as e:
+                self.on_line = None
+                self.stopped(e)
+
+    def close(self):
+        self.out = None
+        with suppress(Exception):
+            self.stack.close()
+
+
+def copy_output(proc: subprocess.Popen, output: Path | None, lines: list[str], on_line, sinks=None) -> None:
+    owns_sinks = sinks is None
+    sinks = sinks or OutputSinks(output, on_line)
+    try:
         for line in proc.stdout:
-            out.write(line)
-            out.flush()
             lines.append(line)
-            if on_line:
-                on_line(line.rstrip("\n"))
+            sinks.write(line)
+    finally:
+        if owns_sinks:
+            sinks.close()
 
 
 def exits_by(proc: subprocess.Popen, deadline: float) -> bool:
@@ -198,7 +256,8 @@ def run_command(argv: list[str], cwd: Path | str, *, timeout: float, env: dict, 
                             **util.own_group_args())
     threading.Thread(target=feed_stdin, args=(proc, stdin), daemon=True).start()
     lines: list[str] = []
-    copier = threading.Thread(target=copy_output, args=(proc, output, lines, on_line), daemon=True)
+    sinks = OutputSinks(output, on_line)
+    copier = threading.Thread(target=copy_output, args=(proc, output, lines, on_line, sinks), daemon=True)
     copier.start()
     expired = True
     try:
@@ -208,12 +267,13 @@ def run_command(argv: list[str], cwd: Path | str, *, timeout: float, env: dict, 
         if expired:
             util.kill_group(proc)
     if not expired:
+        sinks.close()
         return proc.returncode, "".join(lines)
     copier.join(OUTPUT_GRACE_SECONDS)
     exits_by(proc, time.monotonic() + OUTPUT_GRACE_SECONDS)
     note = f"\n[arete] stopped after {timeout:g}s\n"
-    with open(output or os.devnull, "a") as out:
-        out.write(note)
+    sinks.write(note, callback=False)
+    sinks.close()
     return util.TIMED_OUT, "".join(lines) + note
 
 

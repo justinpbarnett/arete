@@ -103,10 +103,10 @@ def receive(name: str, headers, body: bytes) -> dict:
     e = event_of(name, headers, body)
     if why := loop.trigger.refusal(e):
         raise Stated(403, f"The loop {name} {why}.")
-    with state.transaction() as connect:
+    with state.tx():
         if not delivery_id(headers):
-            state.forget_seen(e["source"], e["key"], util.now() - BODY_KEY_WINDOW, connect)
-        if not state.claim_seen(e["source"], [e["key"]], connect):
+            state.forget_seen(e["source"], e["key"], util.now() - BODY_KEY_WINDOW)
+        if not state.claim_seen(e["source"], [e["key"]]):
             return {"queued": False, "why": "already received", "key": e["key"]}
-        [item] = sources.fire(loop, "webhook", [e], connect)
+        [item] = sources.fire(loop, "webhook", [e])
     return {"queued": True, "item": item, "key": e["key"], "at": util.iso()}
