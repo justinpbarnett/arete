@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -291,7 +291,16 @@ class JiraTracker:
 
     def blocker(self, tid: str) -> str:
         issue = self.client.issue(tid, JIRA_FIELDS)
-        return check_approval(self.client.me().get("accountId", ""), issue, self.client.changelog(tid), self.route)[0]
+        return (check_approval(self.client.me().get("accountId", ""), issue, self.client.changelog(tid), self.route)[0]
+                or wait_blocker(waits_on_jira((issue.get("fields") or {}).get("description") or ""), self.is_open))
+
+    def is_open(self, key: str) -> bool | None:
+        try:
+            status = (self.client.issue(key, ["status"]).get("fields") or {}).get("status") or {}
+        except jira.JiraError:
+            return None
+        category = (status.get("statusCategory") or {}).get("key")
+        return category != "done" if category else None
 
     def replied(self) -> list[Ticket]:
         jql = candidates_jql(self.project, f'labels = "{self.route}" AND labels = "{self.label_name("needs-info")}"',
@@ -317,6 +326,7 @@ class JiraTracker:
         f = issue.get("fields") or {}
         labels = list(f.get("labels") or [])
         body = f.get("description") or "(no description)"
+        blocker = blocker or wait_blocker(waits_on_jira(body), self.is_open)
         parent = f.get("parent") or {}
         if parent.get("key"):
             body = f"Part of {parent['key']}: {(parent.get('fields') or {}).get('summary', '')}\n\n{body}"
@@ -622,9 +632,12 @@ def route_blocker(routes: set[str], labels: list[str]) -> str:
     return ""
 
 
-WAIT_LINE = re.compile(r"^[ \t]*waits[ \t]+on\b(.*)$", re.IGNORECASE | re.MULTILINE)
+WAIT_LINE = re.compile(r"^[ \t]*(?:[-*+][ \t]+|#{1,6}[ \t]+)?(?:\*\*|__)?"
+                       r"(?:waits[ \t]+on|blocked[ \t]+by)\b(?:\*\*|__)?[ \t]*:?[ \t]*(?:\*\*|__)?(.*)$",
+                       re.IGNORECASE | re.MULTILINE)
 WAIT_REF = re.compile(r"(?<![\w/])#(\d+)")
 WAIT_TASK = re.compile(r"(?<![\w-])t-[0-9a-f]{4,}(?![\w-])", re.IGNORECASE)
+WAIT_JIRA = re.compile(r"(?<![\w-])[A-Z][A-Z0-9_]+-\d+(?![\w-])", re.IGNORECASE)
 
 
 def waits_on(body: str) -> list[int]:
@@ -637,12 +650,17 @@ def waits_on_tasks(body: str) -> list[str]:
     return list(dict.fromkeys(found))
 
 
+def waits_on_jira(body: str) -> list[str]:
+    found = [key.upper() for rest in WAIT_LINE.findall(body or "") for key in WAIT_JIRA.findall(rest)]
+    return list(dict.fromkeys(found))
+
+
 def joined(names: list[str]) -> str:
     return names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
 
 
-def _refs(numbers: list[int]) -> str:
-    return joined([f"#{n}" for n in numbers])
+def _refs(references: Iterable[int | str]) -> str:
+    return joined([ref_for(ref) for ref in references])
 
 
 def task_wait_blocker(waits: list[str], state_of: Callable[[str], str | None]) -> str:
@@ -657,7 +675,7 @@ def task_wait_blocker(waits: list[str], state_of: Callable[[str], str | None]) -
     return "; ".join(parts)
 
 
-def wait_blocker(waits: list[int], is_open: Callable[[int], bool | None]) -> str:
+def wait_blocker[T: (int, str)](waits: list[T], is_open: Callable[[T], bool | None]) -> str:
     seen = {n: is_open(n) for n in waits}
     still = [n for n, v in seen.items() if v is True]
     unread = [n for n, v in seen.items() if v is None]

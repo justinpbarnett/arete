@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from collections import deque
 
 from . import tracker
@@ -11,8 +10,7 @@ def dependencies(ticket: tracker.Ticket) -> set[str]:
         return set(tracker.waits_on_tasks(ticket.body))
     if ticket.id.isdigit():
         return {str(number) for number in tracker.waits_on(ticket.body)}
-    return {key.upper() for line in tracker.WAIT_LINE.findall(ticket.body)
-            for key in re.findall(r"\b[A-Z][A-Z0-9_]*-\d+\b", line, re.IGNORECASE)}
+    return set(tracker.waits_on_jira(ticket.body))
 
 
 def scores(tickets: list[tracker.Ticket]) -> dict[str, tuple[int, int]]:

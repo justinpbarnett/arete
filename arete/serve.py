@@ -305,9 +305,11 @@ class Server:
         return True
 
     def tick(self) -> None:
-        foundation.ensure_schema()
         if self.contracts_waiting:
+            if not paths.DB_FILE.is_file() or not paths.DB_FILE.stat().st_size:
+                raise foundation.missing_database()
             self.contracts_waiting = foundation.migrate()
+        foundation.ensure_schema()
         if not self.guard("tick:load", self.load) or self.code_problem:
             return
         self.guard("stage:reap", self.reap)

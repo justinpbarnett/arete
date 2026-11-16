@@ -838,8 +838,8 @@ def checks(flow: factory.Flow, tree: str, attempt: int = 1, tries: int = 1, afte
     job: Job = flow.ctx
     run, b = job.run, job.b
     ok = b.check(quick=True) if quick else b.check()
+    run.save("checks.md", b.report)
     if not after:
-        run.save("checks.md", b.report)
         record.note(run.id, attempts=attempt)
     if not ok:
         if not after:
