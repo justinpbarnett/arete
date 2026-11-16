@@ -8,6 +8,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import sys
 import threading
@@ -139,6 +140,23 @@ def ask_stop(run_id: str) -> dict | None:
         c.execute("UPDATE runs SET stop_asked = ? WHERE id = ? AND status = 'running'", (util.iso(), run_id))
         r = c.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
     return dict(r) if r else None
+
+
+class Stopped(Exception):
+    pass
+
+
+def stop_on_term(*_) -> None:
+    raise Stopped
+
+
+@contextmanager
+def stoppable() -> Iterator[None]:
+    signal.signal(signal.SIGTERM, stop_on_term)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
 
 
 def stop_asked(run_id: str) -> bool:

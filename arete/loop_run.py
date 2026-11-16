@@ -259,14 +259,6 @@ def fenced(data) -> str:
     return "```json\n" + json.dumps(data, indent=2, default=str).replace("```", "'''") + "\n```"
 
 
-class Stopped(Exception):
-    pass
-
-
-def stop_on_term(*_) -> None:
-    raise Stopped
-
-
 class NeverBegan(control.Refused):
     pass
 
@@ -340,23 +332,18 @@ def carry(run: LoopRun) -> str:
     run.scratch.mkdir(parents=True, exist_ok=True)
     how = "drop"
     try:
-        signal.signal(signal.SIGTERM, stop_on_term)
-        with devices.lease(run.loop.device, run.id, lambda text: run.log("device", text)) as run.device:
+        with (record.stoppable(),
+              devices.lease(run.loop.device, run.id, lambda text: run.log("device", text)) as run.device):
             status, summary = screened(run) or loops.KINDS[run.loop.kind].run(run)
     except OverBudget as e:
         status, summary = "skipped", f"budget: {e}"
         how = "dead"
-    except Stopped:
-        asked = record.stop_asked(run.id)
-        status, summary = "stopped", record.STOPPED if asked else "stopped by a signal"
-        how = "dead" if asked else "retry"
-    except devices.DeviceError as e:
-        status, summary = "failed", util.one_line(str(e), 500)
     except Exception as e:
-        run.log("error", traceback.format_exc().strip())
-        status, summary = "failed", f"{type(e).__name__}: {util.first_line(str(e), 300)}"
-    finally:
-        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        if not isinstance(e, record.Stopped | devices.DeviceError):
+            run.log("error", traceback.format_exc().strip())
+        status, summary = devices.outcome_of(e, run.id)
+        if status == "stopped":
+            how = "dead" if summary == record.STOPPED else "retry"
     summary = devices.with_left_up(summary, run.id)
     state.end_claim(run.id, "dead" if status == "failed" else how, summary)
     return settle(run, status, summary)
@@ -452,7 +439,7 @@ def jev_readable(run: LoopRun, events: list[dict]) -> list[dict]:
 
 
 def screened(run: LoopRun) -> tuple[str, str] | None:
-    if run.loop.kind == "command":
+    if not run.loop.agent:
         return None
     outside = jev_readable(run, [e for e in run.events if e.get("trust") == "untrusted"])
     if not outside:
