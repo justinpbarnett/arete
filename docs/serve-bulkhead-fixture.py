@@ -45,7 +45,7 @@ class Rig:
         self.mock, self.state, self.util, self.loops, self.paths, self.config = mock, state, util, loops, paths, config
         self.wipe()
         paths.ensure_dirs()
-        state.ensure_schema()
+        state.migrate()
         self.config_text = GOOD + ("\n[oncall]\nenabled = true\n" if oncall else "")
         paths.CONFIG_FILE.write_text(self.config_text)
         loops.SWITCHES_FILE.write_text(json.dumps({p.name: False for p in loops.BUNDLED_LOOPS_DIR.iterdir() if p.is_dir()}))
