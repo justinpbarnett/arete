@@ -18,6 +18,7 @@ _CHILDREN = {
 _TEXT_MARKS = {"strong", "em", "strike", "underline", "code", "subsup", "textColor", "backgroundColor"}
 _NODE_MARKS = {"text": _TEXT_MARKS | {"link", "annotation"},
                "media": {"link", "border", "annotation", "dataConsumer"}, "mediaSingle": {"link"}}
+_MAX_RENDERED_CHARS = 1_000_000
 
 
 def to_text(value: object) -> str:
@@ -37,7 +38,8 @@ def to_text(value: object) -> str:
     return _render_text(parts)
 
 
-def _read_node(node: object, path: str, allowed: set[str], parts: list[tuple[str, list[str]]]) -> None:
+def _read_node(node: object, path: str, allowed: set[str], parts: list[tuple[str, list[str]]],
+               inherited_links: list[str] | None = None) -> None:
     def refuse(reason: str):
         raise ValueError(f"ADF {path}: {reason}")
 
@@ -61,7 +63,7 @@ def _read_node(node: object, path: str, allowed: set[str], parts: list[tuple[str
     marks = node.get("marks", [])
     if not isinstance(marks, list):
         refuse("marks must be a list")
-    links = []
+    links = list(inherited_links or [])
     for mark in marks:
         if (not isinstance(mark, dict) or not isinstance(mark.get("type"), str)
                 or mark["type"] not in _NODE_MARKS.get(kind, set()) or not isinstance(mark.get("attrs", {}), dict)):
@@ -84,8 +86,8 @@ def _read_node(node: object, path: str, allowed: set[str], parts: list[tuple[str
         for i, child in enumerate(children):
             if i and separator:
                 parts.append((separator, []))
-            _read_node(child, f"{path}.content[{i}]", _CHILDREN[kind], parts)
-        if links:
+            _read_node(child, f"{path}.content[{i}]", _CHILDREN[kind], parts, links)
+        if not children and links:
             parts.append(("", links))
         return
     else:
@@ -99,12 +101,14 @@ def _read_node(node: object, path: str, allowed: set[str], parts: list[tuple[str
             text = "\n"
         elif kind in {"inlineCard", "blockCard"}:
             text = attribute("url")
+            links.append(text)
         elif kind == "media":
             media_type = attribute("type")
             if media_type in {"file", "link"}:
                 text = f"[attachment {attribute('id')}]"
             elif media_type == "external":
                 text = attribute("url")
+                links.append(text)
             else:
                 refuse("unsupported media type")
             alt = attrs.get("alt", "")
@@ -120,17 +124,23 @@ def _read_node(node: object, path: str, allowed: set[str], parts: list[tuple[str
             text = attribute("timestamp")
         else:
             refuse("unsupported node")
-    parts.append((text, [href for href in links if href != text]))
+    parts.append((text, links))
 
 
 def _render_text(parts: list[tuple[str, list[str]]]) -> str:
     output: list[str] = []
     line: list[str] = []
     links: list[str] = []
+    rendered_chars = 0
 
     def finish_line() -> None:
+        nonlocal rendered_chars
         visible = "".join(line)
-        output.append(visible + "".join(f" ({href})" for href in dict.fromkeys(links)))
+        targets = list(dict.fromkeys(links))
+        rendered_chars += len(visible) + sum(len(href) + 3 for href in targets) + bool(output)
+        if rendered_chars > _MAX_RENDERED_CHARS:
+            raise ValueError("ADF text exceeds the readable size limit")
+        output.append(visible + "".join(f" ({href})" for href in targets))
         line.clear()
         links.clear()
 
