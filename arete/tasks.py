@@ -150,13 +150,13 @@ def spawned(repo_name: str, tid: str, spawn: Callable[[], subprocess.Popen]) -> 
 
 
 def did_not_show(repo: config.Repo, tid: str) -> control.Refused:
-    return control.Refused(f"{tracker.ticket_name(repo.name, tracker.ref_for(tid))} did not show as running; the end "
+    return control.Refused(f"{tracker.issue_name(repo.name, tid)} did not show as running; the end "
                            f"of {paths.short_path(paths.LOG_DIR / pipeline.RUNS_LOG)} says why")
 
 
 def free_to_start(cfg: config.Config, repo: config.Repo, tid: str, after: str = "", ahead: bool = False) -> None:
     if run := live_run(repo.name, tid):
-        raise control.Busy(f"run {run['id']} of {tracker.ticket_name(repo.name, tracker.ref_for(tid))}")
+        raise control.Busy(f"run {run['id']} of {tracker.issue_name(repo.name, tid)}")
     if not ahead and (why := held(cfg, repo)):
         raise slots.NoFreeSlot(why + after)
     why, _ = runlimits.admission(repo, tid, tracker.for_ticket(cfg, repo, tid),
@@ -276,7 +276,7 @@ def answer_ask(ask_id: str, body) -> dict:
         no_later_run(row)
         tid = str(row["issue"])
         if run := live_run(repo.name, tid):
-            raise control.Busy(f"run {run['id']} of {tracker.ticket_name(repo.name, tracker.ref_for(tid))}")
+            raise control.Busy(f"run {run['id']} of {tracker.issue_name(repo.name, tid)}")
         if isinstance(body, dict) and "stop" in body:
             if body != {"stop": True}:
                 raise control.Refused('To stop the run, send {"stop": true} alone')
@@ -304,9 +304,9 @@ def answer_ask(ask_id: str, body) -> dict:
 
 
 def answers_holder(ask: dict) -> dict | None:
-    newest = state.ticket_runs(ask["repo"], ask["ticket"], limit=1, whole=True)
-    if newest and ask["run"] in {newest[0]["id"], *flows.chain_runs(newest[0]["id"])}:
-        return newest[0]
+    newest = state.newest_whole_run(ask["repo"], ask["ticket"])
+    if newest and ask["run"] in {newest["id"], *factory.chain_runs(newest["id"])}:
+        return newest
     return None
 
 
@@ -358,7 +358,7 @@ def kept_folder_removed(repo: config.Repo, tid: str, run_id: str) -> bool:
 
 def let_go(cfg: config.Config, repo: config.Repo, row: dict, status: str) -> dict:
     tid, run_id = str(row["issue"]), row["id"]
-    name = tracker.ticket_name(repo.name, tracker.ref_for(tid))
+    name = tracker.issue_name(repo.name, tid)
     with util.lock(state.run_lock("pipeline", repo.name, tid)) as got:
         if not got:
             raise control.Busy(f"a run of {name}")

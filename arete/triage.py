@@ -11,10 +11,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import ClassVar
 
-from . import alerts, config, gh, jev, jira, paths, refusals, runner, screening, state, tracker, util
+from . import alerts, config, gh, jev, jira, paths, prompt_loader, refusals, runner, screening, state, tracker, util
 from .agent import READ_TOOLS
 from .heartbeat import mark_loop, network_up_or_skip
-from .pipeline import TRIAGE_ANSWERS, prompt
 from .refusals import TrackerFailed
 
 ISSUE_TITLE = "[arete] triage"
@@ -338,7 +337,7 @@ def not_code_by_jev(cfg: config.Config, src: TriageSource, c: Candidate, ticket:
 
 
 def triage_one(cfg: config.Config, src: TriageSource, c: Candidate, ticket: str) -> tuple[dict | None, float, str]:
-    text = prompt("triage", repos=src.repos_text(), ref=c.ref, title=c.title, ticket=ticket,
+    text = prompt_loader.prompt("triage", repos=src.repos_text(), ref=c.ref, title=c.title, ticket=ticket,
                   repo_rule=src.repo_rule())
     dirs = list(dict.fromkeys(r.path for r in src.repos if r.path.is_dir()))
     TICKET_RECORDS_DIR.mkdir(parents=True, exist_ok=True)
@@ -634,7 +633,7 @@ def repo_choices(src: TriageSource, r: dict) -> list[str]:
 
 
 def answers_comment(pairs: list[tuple[str, str]]) -> str:
-    return f"{TRIAGE_ANSWERS}:\n\n" + "\n\n".join(f"**{q}**\n{a}" for q, a in pairs)
+    return f"{prompt_loader.TRIAGE_ANSWERS}:\n\n" + "\n\n".join(f"**{q}**\n{a}" for q, a in pairs)
 
 
 def send(cfg: config.Config, ref: str, questions: list[str], answers: list[str], repo_name: str) -> str:

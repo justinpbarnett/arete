@@ -974,7 +974,7 @@ def day_spent(cfg: config.Config, repairs: list[dict] | None = None) -> str:
 def interrupted_run(repair: dict) -> dict | None:
     if not repair["task"]:
         return None
-    run = next(iter(state.ticket_runs(repair["repo"], repair["task"], limit=1, whole=True)), None)
+    run = state.newest_whole_run(repair["repo"], repair["task"])
     return run if run and run["status"] == "interrupted" else None
 
 
@@ -1112,7 +1112,7 @@ def held_for_owner(cfg: config.Config, repair: dict, run_id: str) -> bool:
 
 
 def track_repair(cfg: config.Config, row: dict, repair: dict) -> bool:
-    run = next(iter(state.ticket_runs(repair["repo"], repair["task"], limit=1, whole=True)), None)
+    run = state.newest_whole_run(repair["repo"], repair["task"])
     if run is None:
         return resume(cfg, row, repair, "the repair task has no run yet")
     status = run["status"]

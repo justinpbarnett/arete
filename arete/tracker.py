@@ -88,8 +88,12 @@ def ticket_name(repo: str, ref: str) -> str:
     return f"{repo}{ref}" if ref.startswith("#") else f"{repo} {ref}"
 
 
+def issue_name(repo_name: str, issue: int | str) -> str:
+    return ticket_name(repo_name, ref_for(issue))
+
+
 def run_ticket_name(run: dict) -> str:
-    return ticket_name(run["repo"] or "", ref_for(run["issue"]))
+    return issue_name(run["repo"] or "", run["issue"])
 
 
 def with_ref(subject: str, ref: str) -> str:

@@ -7,7 +7,21 @@ from collections.abc import Iterator
 from datetime import UTC, timedelta
 from pathlib import Path
 
-from . import config, gh, jev, jev_verdicts, jira, paths, pipeline, record, state, tracker, util, workspace
+from . import (
+    config,
+    gh,
+    jev,
+    jev_verdicts,
+    jira,
+    paths,
+    pipeline,
+    prompt_loader,
+    record,
+    state,
+    tracker,
+    util,
+    workspace,
+)
 from .util import git
 
 FEEDBACK_ASKS = "Does this comment ask for a change to the pull request, or ask a question the author should answer?"
@@ -234,7 +248,7 @@ def uat_steps(cfg: config.Config, run: pipeline.Run, row: dict, branch: str) -> 
     share = pipeline.MAX_DIFF_IN_PROMPT // len(urls)
     prs = "\n\n".join(f"### {url}\n\n{gh.pr_body(url).strip()}\n\n```diff\n{cut(gh.pr_diff(url), share)}\n```"
                        for url in urls)
-    res = run.agent("uat", pipeline.prompt("uat", ref=t.ref, title=t.title, ticket="\n\n".join(filter(None, [t.body, t.comments])),
+    res = run.agent("uat", prompt_loader.prompt("uat", ref=t.ref, title=t.title, ticket="\n\n".join(filter(None, [t.body, t.comments])),
                                   prs=prs, branch=branch),
                     run.repo.path, role="uat", json_schema=UAT_SCHEMA, persist=False)
     found = res.structured if res.ok and isinstance(res.structured, dict) else {}

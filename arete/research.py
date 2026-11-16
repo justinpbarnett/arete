@@ -16,6 +16,7 @@ from . import (
     jev,
     jev_verdicts,
     paths,
+    prompt_loader,
     research_budget,
     research_plan,
     research_search,
@@ -30,7 +31,6 @@ from . import (
 )
 from .agent import READ_TOOLS, Result
 from .heartbeat import mark_loop, network_up_or_skip
-from .pipeline import fill_template, prompt, slug
 
 REPORTS_DIR = paths.STATE_DIR / "research"
 TOOLS = [*READ_TOOLS,"WebSearch", "WebFetch"]
@@ -116,7 +116,7 @@ def claim_path(h: Home, name: str, title: str) -> str:
     util.git(["fetch", "-q", "origin", base], h.repo.path)
     taken = set(util.git_records(["ls-tree", "--name-only", f"origin/{base}", f"{h.folder}/"], h.repo.path))
     taken |= {report["filed_path"] for report in state.research_rows()}
-    stem = slug(name or title, 60)
+    stem = prompt_loader.slug(name or title, 60)
     return next(path for n in range(1, 100)
                 if (path := f"{h.folder}/{stem if n == 1 else f'{stem}-{n}'}.md") not in taken)
 
@@ -127,7 +127,7 @@ def file_report(cfg: config.Config, h: Home, r: dict, report: dict) -> str:
     t = tracker.Ticket(id=candidate(r).id, ref=r["ref"], title=r["title"], url=r["url"])
     key = f"research-{tracker.safe_filename(r['ref'])}"
     branch = f"arete/{key}"
-    subject = tk.pr_title(fill_template(h.layer.subject, config.RepoLayer.subject, kind="docs(research)", id=t.id,
+    subject = tk.pr_title(prompt_loader.fill_template(h.layer.subject, config.RepoLayer.subject, kind="docs(research)", id=t.id,
                                         title=r["title"]), t)
     link = tk.pr_link(t, whole=True)
     body = (f"**Summary:** {report['summary']}\n\n"
@@ -308,7 +308,7 @@ def source_of(cfg: config.Config, r: dict) -> triage.TriageSource | None:
 
 
 def candidate(r: dict) -> triage.Candidate:
-    tid = r["ref"].rsplit("#", 1)[-1] if r["tracker"] == "github" else r["ref"]
+    tid = triage.issue_id(r["tracker"], r["ref"])
     return triage.Candidate(r["ref"], tid, r["title"], r["url"], r["updated"])
 
 
@@ -443,7 +443,7 @@ def staged(cfg: config.Config, ref: str, values: dict, where: dict, cwd, add_dir
     budget = budget_for(cfg)
     if started is not None:
         budget.started = started
-    planned = research_plan.plan(cfg, budget, prompt("research_plan", **values), cwd, add_dirs, ref, family)
+    planned = research_plan.plan(cfg, budget, prompt_loader.prompt("research_plan", **values), cwd, add_dirs, ref, family)
     if not planned.plan:
         return Result(ok=False, error=planned.error), budget.spent_usd
     plan = planned.plan
@@ -470,7 +470,7 @@ def report_after(cfg, budget, plan, ref, judged, values, where, cwd, add_dirs):
             res = research_synthesis.run(cfg, budget, plan, found.evidence, ref, judged, values, where, cwd, add_dirs)
             return res, budget.spent_usd
         brief, tools = research_search.brief(plan, found.evidence), READ_TOOLS
-    res = budget.call(prompt("research", **values, **where) + "\n\n" + brief, cwd, usd, seconds,
+    res = budget.call(prompt_loader.prompt("research", **values, **where) + "\n\n" + brief, cwd, usd, seconds,
                       model=cfg.model("research"), tools=tools, allowed_tools=tools, json_schema=SCHEMA,
                       add_dirs=add_dirs, trace=("", f"research {ref} report"), cfg=cfg)
     return res, budget.spent_usd
@@ -557,7 +557,7 @@ def ask(cfg, ref, values, h, filed_path, dirs, done, started, judged):
             res, paid = staged(cfg, ref, values, filing(h, filed_path), cwd, dirs[1:],
                               [o["ref"] for _, o, _ in done], started, judged)
         else:
-            res = runner.run(prompt("research", **values, **filing(h, filed_path)),
+            res = runner.run(prompt_loader.prompt("research", **values, **filing(h, filed_path)),
                              cwd, model=cfg.model("research"), tools=TOOLS, allowed_tools=TOOLS,
                              json_schema=SCHEMA, max_budget_usd=BUDGET_USD,
                              timeout=TIMEOUT_SECONDS, persist=False, add_dirs=dirs[1:], trace=("", f"research {ref}"),

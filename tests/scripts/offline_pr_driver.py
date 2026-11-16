@@ -2,7 +2,7 @@ import json, os, runpy, signal, subprocess, sys, threading, time, urllib.request
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from arete import accounts, agent, owner_asks, config, control, factory, gh, run_lines, paths, pipeline, record, replay, runlimits, sandbox, scratch, state, util, workspace, outcomes
+from arete import accounts, agent, owner_asks, config, control, factory, gh, run_lines, paths, pipeline, record, replay, runlimits, sandbox, scratch, state, util, workspace, outcomes, prompt_loader
 root, scenario, role = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
 state.migrate()
 probe = [sys.executable, "-V"]
@@ -123,8 +123,8 @@ if scenario in ("kill", "kill-twice", "restart-stop"):
         pipeline.watch_ci = stopping
         take(run_ticket())
 elif scenario == "repair-stop":
-    branch = pipeline.fill_template(config.RepoLayer.branch, config.RepoLayer.branch, kind="feat", id=task,
-                                    slug=pipeline.slug("Add kumquat"))
+    branch = prompt_loader.fill_template(config.RepoLayer.branch, config.RepoLayer.branch, kind="feat", id=task,
+                                    slug=prompt_loader.slug("Add kumquat"))
     older = record.start("pipeline", repo="replay-sample", issue=task)
     record.note(older, branch=branch, pr_url=URL)
     record.settle(older, "pr", summary="older", pr_url=URL)

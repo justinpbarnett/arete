@@ -141,6 +141,15 @@ def chain(run_id: str) -> list[list[dict]]:
     return found
 
 
+def chain_runs(run_id: str) -> set[str]:
+    return {str(read[0].get("run") or "") for read in chain(run_id) if read} - {""}
+
+
+def passed_data(history: list[dict], *names: str) -> list[dict]:
+    return [line["data"] if isinstance(line.get("data"), dict) else {} for line in history
+            if line.get("step") in names and line.get("result") == "pass"]
+
+
 def unopened(read: list[dict]) -> bool:
     return any(line.get("step") == OPENING and line.get("result") != "pass" for line in ends(read))
 
@@ -214,13 +223,8 @@ def checked(name: str, value) -> Outcome:
 
 
 class Flow:
-    def __init__(self, run_id: str, continues: str = "", only: str = "", ctx=None,
-                 labels: Callable[[str, dict], dict] | None = None, again: str = "",
-                 restore: Callable[[dict], str] | None = None, refusal: str = "",
-                 hold: Callable[[str], str] | None = None, renew: str = "",
-                 keeps: Callable[[str, dict], bool] | None = None,
-                 step_runs: list[list[dict]] | None = None,
-                 entering: Callable[[str], None] | None = None) -> None:
+    def __init__(self, run_id: str, ctx, continues: str = "", only: str = "", again: str = "",
+                 refusal: str = "", renew: str = "", step_runs: list[list[dict]] | None = None) -> None:
         if only and only not in STEPS:
             raise KeyError(f"only {only}: no step by that name")
         if again and again not in STEPS:
@@ -228,9 +232,6 @@ class Flow:
         chained = chain(continues)
         self.run_id, self.continues, self.only, self.ctx, self.again = run_id, continues, only, ctx, again
         self.refusal = refusal
-        self.hold = hold or (lambda name: "")
-        self.labels = labels or (lambda name, kw: {})
-        self.restore = restore or (lambda line: "a step can run alone only on a run whose folder is kept")
         self.earlier = history(chained)
         self.again_at = max((i for i, line in enumerate(self.earlier) if again and line.get("step") == again),
                             default=-1)
@@ -239,8 +240,7 @@ class Flow:
                             for line in self.earlier if line.get("tree")}
         self.restamped = self.restamps(step_runs or [])
         self.prints: dict[str, str] = {}
-        self.renew, self.keeps = renew, keeps or (lambda name, kw: False)
-        self.entering = entering or (lambda name: None)
+        self.renew = renew
         self.carrying, self.carry = False, 0
         self.skipped, self.matching, self.done = 0, bool(continues or only), False
         self.redone, self.stepped = 0, False
@@ -276,11 +276,11 @@ class Flow:
                 if not any(line.get("step") == self.only for line in self.earlier):
                     raise Refused(f"only {self.only}: run {self.continues} never started {self.only}")
                 raise Refused(f"only {self.only}: {name} before it has no stored outcome it can take")
-            if why := self.hold(name):
+            if why := self.ctx.hold(name):
                 self.matching = False
                 raise Refused(why)
             self.route()
-            self.entering(name)
+            self.ctx.merge_moved_base(name)
         try:
             return self.run(name, args, kw)
         finally:
@@ -337,7 +337,7 @@ class Flow:
 
     def carried(self, name: str, kw: dict) -> Outcome | None:
         line = self.earlier[self.carry] if self.carry < len(self.earlier) else {}
-        if (line.get("step") == name and line.get("result") == "pass" and self.keeps(name, kw)
+        if (line.get("step") == name and line.get("result") == "pass" and self.ctx.keeps(name, kw)
                 and (not self.again or self.carry < self.again_at)):
             n = self.tries[name] = self.tries.get(name, 0) + 1
             outcome = outcome_of(line)
@@ -356,7 +356,7 @@ class Flow:
         if line.get("step") != name or not self.takable(line):
             return None
         if (self.only or self.again) and line.get("tree") and not os.path.isdir(line["tree"]):
-            why = self.restore(line)
+            why = self.ctx.restore(line)
             if why or not os.path.isdir(line["tree"]):
                 why = why or "its work folder is still missing after restoring from origin"
                 if not self.only:
@@ -398,7 +398,7 @@ class Flow:
         n = self.tries[name] = self.tries.get(name, 0) + 1
         calls, started = Calls(self.run_id, name, n=n), time.monotonic()
         try:
-            labels = self.labels(name, kw)
+            labels = self.ctx.labels(name, kw)
         except Exception as e:
             run_lines.write(self.run_id, "step_start", step=name, **{"try": n})
             self.failed(name, n, e, calls, started, kw)

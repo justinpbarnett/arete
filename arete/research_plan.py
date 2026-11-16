@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from . import config, research_budget, steps, util
-from .pipeline import prompt
+from . import config, prompt_loader, research_budget, steps, util
 
 TEXTS = {"type": "array", "items": {"type": "string"}}
 PLAN_SCHEMA = {
@@ -129,10 +128,10 @@ def bullets(items: list[str]) -> str:
 def brief(plan: dict) -> str:
     questions = bullets(plan["questions"])
     if not plan["needs_search"]:
-        return prompt("research_covered", covered=", ".join(plan["covered_by"]), questions=questions)
+        return prompt_loader.prompt("research_covered", covered=", ".join(plan["covered_by"]), questions=questions)
     tasks = "\n".join(
         f"{i}. {t['goal']} (at most {util.count(t['max_sources'], 'source')})\n"
         + "\n".join(f"   - search: {q}" for q in t["queries"])
         for i, t in enumerate(plan["tasks"], 1))
-    return prompt("research_planned", questions=questions, tasks=tasks, criteria=bullets(plan["source_criteria"]),
+    return prompt_loader.prompt("research_planned", questions=questions, tasks=tasks, criteria=bullets(plan["source_criteria"]),
                   claims=bullets(plan["claims"]))
