@@ -273,10 +273,10 @@ def run(cfg: config.Config, budget: research_plan.Budget, answer: dict, evidence
                 ({"claim": r["id"], "note": r["note"], "correction": r["correction"], "quote": r["quote"]}, r["screen"])
                 for r in made] + [({"issue": d["issue"]}, d["screen"]) for d in extra])
             for i, r in enumerate(made):
-                if r["screen"]["status"] in research_search.WITHHELD:
+                if research_search.is_withheld(r["screen"]["status"]):
                     made[i] = {**record(batch[i], None, WITHHELD), "screen": r["screen"]}
             audit.records += made
-            audit.disagreements += [d for d in extra if d["screen"]["status"] in research_search.PASSED_ON]
+            audit.disagreements += [d for d in extra if research_search.is_passed_on(d["screen"]["status"])]
             research_search.say(ref, f"audit batch {n}: {util.count(got.tries, 'try', 'tries')}, "
                                      f"{len(got.refused)} refused, {util.count(len(batch), 'claim')} checked")
     audit.records.sort(key=lambda r: int(r["id"][1:]))

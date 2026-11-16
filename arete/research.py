@@ -20,6 +20,7 @@ from . import (
     research_search,
     research_synthesis,
     runner,
+    screening,
     state,
     tracker,
     triage,
@@ -502,11 +503,12 @@ def research(cfg: config.Config, r: dict, force: bool = False, asked: bool = Fal
             why = "JEV is off, so nothing screens the ticket"
             state.research_set(ref, **base, status=HELD, error=why)
             return HELD, why
-        screened = jev.injection(f"{r['title']}\n\n{text}", cfg, trace=("", f"research {ref} injection jev"))
-        if screened is None:
-            return LATER, f"JEV could not screen {ref}"
-        if screened.yes >= cfg.jev.injection:
-            why = f"JEV reads text in it as instructions to an agent (p {screened.yes:.2f})"
+        screened = screening.screen(f"{r['title']}\n\n{text}", cfg, list(src.repos),
+                                    ("", f"research {ref} injection jev"))
+        if screening.held(screened, screening.Posture.REQUIRED):
+            if screened.status != screening.FLAGGED:
+                return LATER, f"JEV could not screen {ref}"
+            why = f"JEV reads text in it as instructions to an agent (p {screened.p:.2f})"
             state.research_set(ref, **base, status=HELD, error=why)
             return HELD, why
     state.research_set(ref, **base, status=RUNNING, error="", basis=basis,

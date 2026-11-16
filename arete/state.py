@@ -13,6 +13,7 @@ from datetime import timedelta
 from . import migrations, paths, util
 from .agent import billing_of
 from .migrations import m0002_foundation_time_shape as time_shape
+from .sighting import Sighting
 
 TIME_COLUMNS = time_shape.TIME_COLUMNS
 TIME_GLOB = time_shape.TIME_GLOB
@@ -654,8 +655,9 @@ def prune(days: float = 14, keep_days: float = 30, lines_days: float = 90) -> No
         c.execute("DELETE FROM incident_repairs WHERE incident NOT IN (SELECT id FROM incidents)")
 
 
-def write_incident(c, fingerprint: str, kind: str, source: str, repo: str, signature: str, count: int,
-                   evidence: str, policies: str) -> tuple[int, bool]:
+def write_incident(c, sighting: Sighting) -> tuple[int, bool]:
+    fingerprint, kind, source, repo = sighting.fingerprint, sighting.kind, sighting.source, sighting.repo
+    signature, count, evidence, policies = sighting.signature, sighting.count, sighting.evidence, sighting.policies
     now = util.iso()
     row = c.execute("SELECT id, count FROM incidents WHERE state = 'open' AND (fingerprint = ? OR id IN "
                     "(SELECT incident FROM incident_aliases WHERE fingerprint = ?)) ORDER BY fingerprint = ? DESC "
@@ -675,12 +677,12 @@ def write_incident(c, fingerprint: str, kind: str, source: str, repo: str, signa
     return incident_id, opened
 
 
-def record_incident(*args) -> tuple[int, bool]:
+def record_incident(sighting: Sighting) -> tuple[int, bool]:
     with db() as c:
-        return write_incident(c, *args)
+        return write_incident(c, sighting)
 
 
-def commit_scan(incident_rows: list[tuple], cursor_rows: list[tuple[str, str, bool, str]],
+def commit_scan(incident_rows: list[Sighting], cursor_rows: list[tuple[str, str, bool, str]],
                 aliases=(), marks=None) -> list[bool]:
     with db() as c:
         for fingerprint, incident_id, note in aliases:
@@ -690,10 +692,10 @@ def commit_scan(incident_rows: list[tuple], cursor_rows: list[tuple[str, str, bo
                       (incident_id, util.iso(), note))
         opened = []
         for row in incident_rows:
-            incident_id, new = write_incident(c, *row)
+            incident_id, new = write_incident(c, row)
             opened.append(new)
-            if new and row[0] in (marks or {}):
-                fields, note = marks[row[0]]
+            if new and row.fingerprint in (marks or {}):
+                fields, note = marks[row.fingerprint]
                 c.execute(f"UPDATE incidents SET {', '.join(f'{name} = ?' for name in fields)} WHERE id = ?",
                           (*fields.values(), incident_id))
                 c.execute("INSERT INTO incident_notes (incident, ts, note) VALUES (?,?,?)",

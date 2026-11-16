@@ -10,9 +10,11 @@ from decimal import Decimal
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from . import child, config, jev, paths, research_plan, routing, runner, steps, tracker, util
+from . import child, config, paths, research_plan, routing, runner, steps, tracker, util
 from .agent import WEB_TOOLS
 from .pipeline import prompt
+from .screening import Posture, Screen, screen_many
+from .screening import held as screen_held
 
 FOLDER = paths.STATE_DIR / "research"
 SOURCE_KEYS = ("question", "url", "title", "published", "event_date", "passage", "uncertainty")
@@ -28,8 +30,6 @@ RESULT_SCHEMA = {
 }
 DATE = re.compile(r"\d{4}(-\d{2}(-\d{2})?)?")
 PASSAGE_CHARS = 1500
-PASSED_ON = ("passed", "unscreened")
-WITHHELD = ("flagged", "failed")
 CAP_REACHED = "the search cap was reached"
 NO_ROOM = "the research budget left no room for another search round"
 ROUTING_SECONDS = 20
@@ -242,30 +242,23 @@ def collect(outcomes: dict[int, Outcome], ids: dict[str, str], earlier: list[dic
     return sorted(sources.values(), key=lambda source: int(source["id"][1:]))
 
 
-def whole(state) -> bool:
-    text = state if isinstance(state, str) else json.dumps(state, default=str)
-    return len(text) <= jev.STATE_CHARS
+def is_withheld(status: str) -> bool:
+    return screen_held(Screen(status), Posture.WHEN_ON)
+
+
+def is_passed_on(status: str) -> bool:
+    return status != "none" and not is_withheld(status)
 
 
 def screen(cfg: config.Config, ref: str, judged: bool, items: list[tuple[object, dict]]) -> None:
     if not items:
         return
+    screens = screen_many([state for state, _ in items], cfg, [], ("", f"research {ref} notes jev"),
+                                    ready=judged)
+    for (_, target), screened in zip(items, screens, strict=True):
+        target.update(status=screened.status, p=None if screened.p is None else round(screened.p, 3))
     if not judged:
-        for _, target in items:
-            target.update(status="unscreened", p=None)
         print(f"{util.iso()} {ref}: JEV is off, so search notes go on unscreened", flush=True)
-        return
-    questions = {"injection": jev.yes_no(jev.INJECTION)}
-    fits = [whole(state) for state, _ in items]
-    sent = [item for item, fit in zip(items, fits) if fit]
-    replies = iter(jev.ask_many([(state, questions) for state, _ in sent], cfg,
-                                trace=("", f"research {ref} notes jev")) if sent else [])
-    for (_, target), fit in zip(items, fits):
-        answer = next(replies).answers.get("injection") if fit else None
-        if answer is None:
-            target.update(status="failed", p=None)
-        else:
-            target.update(status="flagged" if answer.yes >= cfg.jev.injection else "passed", p=round(answer.yes, 3))
 
 
 def screening(cfg: config.Config, ref: str, judged: bool, workers: list[dict], sources: list[dict]) -> None:
@@ -276,7 +269,7 @@ def screening(cfg: config.Config, ref: str, judged: bool, workers: list[dict], s
     screen(cfg, ref, judged, items)
     for source in sources:
         for finding in source["findings"]:
-            if finding["screen"]["status"] in PASSED_ON:
+            if is_passed_on(finding["screen"]["status"]):
                 for key in ("title", "published", "event_date"):
                     source[key] = source[key] or finding[key]
 
@@ -292,7 +285,7 @@ def totals(workers: list[dict], sources: list[dict]) -> dict:
             sums[key] = research_plan.plus(sums[key], w[key]) if key == "cost_usd" else sums[key] + w[key]
     count = {status: sum(1 for w in workers if w["status"] == status) for status in ("ok", "failed", "cancelled")}
     return {"tasks": len(workers), **count, "sources": len(sources), "findings": len(findings),
-            "withheld": sum(1 for status in held if status in WITHHELD), "paid_usd": float(paid), **sums,
+            "withheld": sum(1 for status in held if is_withheld(status)), "paid_usd": float(paid), **sums,
             "seconds": round(sum(w["seconds"] for w in workers), 1)}
 
 
@@ -410,13 +403,14 @@ def run(cfg: config.Config, budget: research_plan.Budget, plan: dict, ref: str, 
     say(ref, f"search evidence {paths.short_path(evidence_file(ref))}")
     if gap:
         added = sum(1 for source in sources for f in source["findings"]
-                    if f["task"] >= first and f["screen"]["status"] in PASSED_ON)
+                    if f["task"] >= first and is_passed_on(f["screen"]["status"]))
         return Found(budget.error + NO_REPORT if budget.error else "", evidence, added, stop)
     return Found(verdict(budget, room, stop, workers, evidence), evidence)
 
 
 def passed_on(evidence: dict) -> list[tuple[dict, dict]]:
-    return [(s, f) for s in evidence["sources"] for f in s["findings"] if f["screen"]["status"] in PASSED_ON]
+    return [(s, f) for s in evidence["sources"] for f in s["findings"]
+            if is_passed_on(f["screen"]["status"])]
 
 
 def verdict(budget: research_plan.Budget, room: bool, stop: str, workers: list[dict], evidence: dict) -> str:
@@ -438,9 +432,9 @@ def supplied(evidence: dict) -> dict:
         if source["id"] not in [k["id"] for k in kept]:
             kept.append({**{k: source[k] for k in ("id", "url", "title", "published", "event_date", "retrieved")},
                          "findings": [{k: f[k] for k in ("task", "question", "passage", "uncertainty")}
-                                      for f in source["findings"] if f["screen"]["status"] in PASSED_ON]})
+                                      for f in source["findings"] if is_passed_on(f["screen"]["status"])]})
     notes = [{"task": w["task"], "text": w["notes"]} for w in evidence["workers"]
-             if w["notes"] and w["notes_screen"]["status"] in PASSED_ON]
+             if w["notes"] and is_passed_on(w["notes_screen"]["status"])]
     return {"sources": kept, "notes": notes}
 
 
@@ -471,7 +465,7 @@ def paid_words(paid: float) -> str:
 def finding_lines(f: dict, path: Path) -> list[str]:
     screen = f["screen"]
     chance = f" (p {screen['p']})" if screen.get("p") is not None else ""
-    if screen["status"] in WITHHELD:
+    if is_withheld(screen["status"]):
         return [f"  - task {f['task']}: {screen['status']}{chance}, withheld; the text is in {paths.short_path(path)}"]
     return [f"  - task {f['task']}: {screen['status']}{chance}", f"    question: {f['question']}",
             f"    passage: {f['passage']}", f"    uncertainty: {f['uncertainty']}"]
@@ -488,7 +482,7 @@ def render(e: dict, path: Path) -> str:
                      f"{util.count(w['tries'], 'try', 'tries')}, {paid_words(w['paid_usd'])} paid, {w['seconds']}s)"
                      + (f": {w['error']}" if w["error"] else ""))
         if w["notes"]:
-            held = w["notes_screen"]["status"] in WITHHELD
+            held = is_withheld(w["notes_screen"]["status"])
             lines.append(f"  notes ({w['notes_screen']['status']}): "
                          + (f"withheld; the text is in {paths.short_path(path)}" if held else w["notes"]))
     for r in e.get("rounds", []):
