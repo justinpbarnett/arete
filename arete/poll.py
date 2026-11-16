@@ -5,7 +5,21 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import timedelta
 
-from . import config, jira, oncall, owner_asks, paths, pipeline, routing, runlimits, state, steps, tracker, util
+from . import (
+    config,
+    jira,
+    oncall,
+    outcomes,
+    owner_asks,
+    paths,
+    pipeline,
+    routing,
+    runlimits,
+    state,
+    steps,
+    tracker,
+    util,
+)
 from .agent import REPLAY
 from .heartbeat import mark_loop, network_up_or_skip
 from .pipeline import (
@@ -251,8 +265,6 @@ def save_skips_and_landings(cfg: config.Config, skips: pipeline.SkipLog,
 
 
 def poll(dry_run: bool = False) -> int:
-    from . import outcomes
-
     paths.ensure_dirs()
     cfg = config.load()
     with util.lock("poll") as got:
