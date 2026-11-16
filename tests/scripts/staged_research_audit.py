@@ -94,7 +94,6 @@ seed("E", {"summary": "The limit was raised in June 2025 and the vendor guarante
 put("research-E-batch-1-audit", {"checks": [chk("C1", "supported", ["S2"], NEW), chk("C2", "supported", ["S3"], BETA)],
                                  "disagreements": []})
 out["e"] = drive("E", cfg)
-config.CONFIG_FILE = paths.CONFIG_FILE
 s = steps.resolve(config.load(), None, "research_audit")
 known = {f"S{n}": {"url": u} for n, u in enumerate(
     ("https://localhost/a", "https://example.org/b", "https://10.0.0.1/c", "https://exa_mple.org/d",
