@@ -3,8 +3,22 @@ import hashlib, hmac, json, os, signal, sqlite3, sys, threading, urllib.error, u
 from datetime import timedelta
 from pathlib import Path
 from arete.store import loops as loop_store, sources as source_store
-from arete import store, config, dashboard, webhooks, loops, paths, serve, sources, state, tailnet, util
-state.migrate()
+from arete import store, config, dashboard, webhooks, loops, paths, serve, sources, tailnet, util
+from arete.store import _rows as _rows_store
+from arete.store import approvals as approvals_store
+from arete.store import asks as asks_store
+from arete.store import chats as chats_store
+from arete.store import db as foundation
+from arete.store import devices as devices_store
+from arete.store import incidents as incidents_store
+from arete.store import insights as insights_store
+from arete.store import loops as loops_store
+from arete.store import push as push_store
+from arete.store import runs as runs_store
+from arete.store import sources as sources_store
+from arete.store import tasks as tasks_store
+from arete.store import triage as triage_store
+foundation.migrate()
 root = Path(os.environ["INTAKE_ROOT"])
 rows = root / "rows.jsonl"
 def make_loop(name="intake", trigger="", webhook=False):
@@ -19,7 +33,7 @@ def write_rows(*items):
 def issue(key, data=None):
     return {"key": key, "title": f"issue {key}", "data": data or {"number": key}}
 def snap(sid="intake#0"):
-    with state.db() as c:
+    with foundation.db() as c:
         out = {t: c.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in ("seen", "events", "queue")}
         out["queue_rows"] = [{"grp": r["grp"], "keys": [e["key"] for e in json.loads(r["payload"])]}
                              for r in c.execute("SELECT grp, payload FROM queue ORDER BY id")]

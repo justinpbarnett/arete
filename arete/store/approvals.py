@@ -176,3 +176,8 @@ def mined_row(pr_url: str) -> dict:
 def mined_urls() -> set[str]:
     with reader() as c:
         return {r["pr_url"] for r in c.execute("SELECT pr_url FROM mined")}
+
+
+def stale_approved(c, cutoff):
+    return c.execute("SELECT id FROM approvals WHERE status = 'approved' AND decided < ? ORDER BY id",
+                     (cutoff,)).fetchall()

@@ -5,7 +5,8 @@ import secrets
 import tempfile
 import textwrap
 
-from . import config, delivery, prompt_loader, runner, state
+from . import config, delivery, prompt_loader, runner
+from .store import approvals as approvals_store
 
 SCHEMA = {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]}
 MOST_SENTENCES = 2
@@ -22,7 +23,7 @@ class NoSummary(RuntimeError):
 
 
 def write_plain_summary(approval: dict, cfg: config.Config) -> str:
-    state.set_approval_note(approval["id"], "plain_summary", plain_summary(approval, cfg))
+    approvals_store.set_approval_note(approval["id"], "plain_summary", plain_summary(approval, cfg))
     return "plain summary written"
 
 

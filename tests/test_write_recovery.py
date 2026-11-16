@@ -10,7 +10,10 @@ import unittest
 import urllib.error
 from unittest import mock
 
-from arete import config, gh, outbound, paths, state, util
+from arete import config, gh, outbound, paths, util
+from arete.store import db as foundation
+from arete.store import incidents as incidents_store
+from arete.store import insights as insights_store
 
 from tests import support
 from tests.harness import make_folders, state_env
@@ -413,7 +416,7 @@ class AlertWriteRecoveryTests(unittest.TestCase):
                       mock.patch.object(util, "wait_for_network", return_value=True)):
             patch.start()
             self.addCleanup(patch.stop)
-        state.migrate()
+        foundation.migrate()
 
     def test_heartbeats_adopt_lost_create_and_clear_once(self):
         from arete import alerts
@@ -427,23 +430,23 @@ class AlertWriteRecoveryTests(unittest.TestCase):
             self.assertIn("gh failed", alerts.raise_alert("fixture/repo", "fixture", "Fixture", "broken"))
             for _ in range(2):
                 self.assertIn("still open", alerts.raise_alert("fixture/repo", "fixture", "Fixture", "broken"))
-            self.assertEqual(state.alert_get("fixture")["issue"], 1)
+            self.assertEqual(incidents_store.alert_get("fixture")["issue"], 1)
             alerts.clear_alert("fixture/repo", "fixture")
         self.assertEqual((len(ledger.issues), ledger.issues[0]["state"]), (1, "CLOSED"))
-        self.assertIsNone(state.alert_get("fixture"))
+        self.assertIsNone(incidents_store.alert_get("fixture"))
 
     def test_clear_retries_after_lost_state_lookup_without_duplicate_comment(self):
         from arete import alerts
         ledger = GithubWriteLedger(lookup_fails=True)
         ledger.issues = [{"number": 1, "state": "OPEN"}]
-        state.alert_set("fixture", 1, "fixture/repo")
+        incidents_store.alert_set("fixture", 1, "fixture/repo")
         with mock.patch.object(util, "sh", side_effect=ledger.sh):
             self.assertIn("retrying next pass", alerts.clear_alert("fixture/repo", "fixture"))
             ledger.lookup_fails = False
             alerts.clear_alert("fixture/repo", "fixture")
         self.assertEqual(len(ledger.comments), 1)
         self.assertEqual(ledger.issues[0]["state"], "CLOSED")
-        self.assertIsNone(state.alert_get("fixture"))
+        self.assertIsNone(incidents_store.alert_get("fixture"))
 
     def test_failed_adoption_cannot_create(self):
         from arete import alerts
@@ -457,7 +460,7 @@ class AlertWriteRecoveryTests(unittest.TestCase):
         ledger = GithubWriteLedger()
         ledger.issues = [{"number": 1, "state": "OPEN"}]
         ledger.close_comment_only = True
-        state.alert_set("fixture", 1, "fixture/repo")
+        incidents_store.alert_set("fixture", 1, "fixture/repo")
         with mock.patch.object(util, "sh", side_effect=ledger.sh):
             alerts.clear_alert("fixture/repo", "fixture")
             self.assertIsNone(alerts.clear_alert("fixture/repo", "fixture"))
@@ -465,10 +468,10 @@ class AlertWriteRecoveryTests(unittest.TestCase):
 
     def test_capture_failed_lookup_keeps_press_submit_note_and_resume_adopts(self):
         from arete import capture
-        state.capture_save(kind="idea", text="fixture")
-        draft = state.capture_draft()
+        insights_store.capture_save(kind="idea", text="fixture")
+        draft = insights_store.capture_draft()
         draft_id, revision = draft["id"], draft["revision"]
-        self.assertTrue(state.capture_move(draft_id, revision, "draft", "filing"))
+        self.assertTrue(insights_store.capture_move(draft_id, revision, "draft", "filing"))
         ledger = GithubWriteLedger(lookup_fails=True)
         with mock.patch.object(util, "sh", side_effect=ledger.sh), \
                 mock.patch.object(capture.chat, "arete_repo", return_value=SimpleNamespace(github="fixture/repo")), \
@@ -476,11 +479,11 @@ class AlertWriteRecoveryTests(unittest.TestCase):
                 mock.patch.object(capture, "upload", return_value=""), \
                 mock.patch.object(capture, "filing_text", return_value=("fixture", "body")):
             capture.deliver(draft_id, revision, config.Config(), False)
-            self.assertIn("Press Submit", state.capture_draft()["delivery"])
+            self.assertIn("Press Submit", insights_store.capture_draft()["delivery"])
             self.assertEqual(len(ledger.issues), 1)
             ledger.lookup_fails = False
             capture.deliver(draft_id, revision, config.Config(), True)
-            self.assertEqual(state.capture_filed_row(draft_id)["issue"], 1)
+            self.assertEqual(insights_store.capture_filed_row(draft_id)["issue"], 1)
         self.assertEqual(len(ledger.issues), 1)
 
 

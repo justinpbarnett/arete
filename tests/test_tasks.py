@@ -6,7 +6,8 @@ import unittest
 from unittest import mock
 
 from arete.store import runs as run_store
-from arete import config, control, sessions, state
+from arete import config, control, sessions
+from arete.store import chats as chats_store
 
 from tests import support
 from tests.harness import behavior_result, make_folders, run_script, scratch_env
@@ -337,7 +338,7 @@ result(ok=True)
 
     def test_failed_claim_and_thread_start_release_answer_lock(self):
         self.scratch(r'''
-state.chat_claim(1, "Stale claim", "Stale claim")
+chats_store.chat_claim(1, "Stale claim", "Stale claim")
 try:
     chat.send(1, "Refused")
     raise AssertionError("accepted busy claim")
@@ -423,8 +424,8 @@ records = summary_records()
 result(counts=[summary_header(k)["prompt"].count("汉") for k in range(1, len(records) + 1)],
        sizes=[chat.size_of(chat.render({"sender": "you", "text": "汉" * summary_header(k)["prompt"].count("汉")}))
               for k in range(1, len(records) + 1)],
-       summary_size=chat.size_of(last["summary"]), summarized_to=state.chat_get(1)["summarized_to"],
-       chinese_id=state.chat_messages(1)[0]["id"])
+       summary_size=chat.size_of(last["summary"]), summarized_to=chats_store.chat_get(1)["summarized_to"],
+       chinese_id=chats_store.chat_messages(1)[0]["id"])
 ''')
         self.assertGreaterEqual(len(found["counts"]), 2)
         self.assertEqual(sum(found["counts"]), 200)

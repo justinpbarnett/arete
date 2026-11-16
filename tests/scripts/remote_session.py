@@ -2,9 +2,10 @@
 import contextlib, json, os, shlex, shutil, subprocess, sys, urllib.request
 from pathlib import Path
 from arete.store import runs as run_store
-from arete import config, devices, gh, record, sessions, state, util
+from arete import config, devices, gh, record, sessions, util
+from arete.store import db as foundation
 root = Path(sys.argv[1])
-state.migrate()
+foundation.migrate()
 VALUE = "fake-clone-value-0001"
 shim_dir, shim_log = root / "device-bin", root / "shim.log"
 shim_dir.mkdir()

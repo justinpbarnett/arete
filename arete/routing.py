@@ -8,9 +8,10 @@ import urllib.request
 from dataclasses import dataclass, replace
 from datetime import UTC, timedelta
 
-from . import accounts, claude, codex, config, devices, environment, paths, pi, prices, sandbox, scrub, state, util
+from . import accounts, claude, codex, config, devices, environment, paths, pi, prices, sandbox, scrub, util
 from .agent import REPLAY, TRAITS, model_scope, traits_of
 from .store import db as foundation
+from .store import devices as devices_store
 from .store import runs as run_store
 
 RUNNERS = tuple(TRAITS)
@@ -272,7 +273,7 @@ def auth_hold(auth: accounts.Auth, model: str, connect=foundation.reader, unknow
     if not (auth.identity or auth.credential or unknown):
         return None
     scopes = [accounts.scope(auth, s, unknown) for s in limit_scopes(auth, model)]
-    found = [h for h in state.holds(connect) if h["scope"] in scopes]
+    found = [h for h in devices_store.holds(connect) if h["scope"] in scopes]
     return next((h for h in found if not h["until"]), found[-1] if found else None)
 
 

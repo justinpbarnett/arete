@@ -25,7 +25,6 @@ from . import (
     screening,
     scrub,
     sources,
-    state,
     util,
 )
 from .sighting import Sighting
@@ -33,6 +32,7 @@ from .store import db as foundation
 from .store import incidents as incident_store
 from .store import runs as run_store
 from .store import sources as source_store
+from .store import tasks as tasks_store
 
 UNEXPECTED, HEARTBEAT, STALLED, ORCHESTRATION, EXPECTED = "unexpected", "heartbeat", "stalled", "orchestration", "expected"
 WAKE, IGNORE, UNSURE = "wake", "ignore", "unsure"
@@ -1103,7 +1103,7 @@ def wake(cfg: config.Config, row: dict) -> bool:
 
 
 def created_task(repair: dict) -> str:
-    found = next((t for t in state.tasks(repair["repo"]) if t["title"] == repair_title(repair["incident"])
+    found = next((t for t in tasks_store.tasks(repair["repo"]) if t["title"] == repair_title(repair["incident"])
                   and t["created"] >= repair["started"]), None)
     return found["id"] if found else ""
 
@@ -1197,7 +1197,7 @@ def cancel(incident_id: int) -> dict:
         if run:
             stop_run(run["id"])
         if repair["task"]:
-            state.task_set_state(repair["task"], "closed", ("todo",))
+            tasks_store.task_set_state(repair["task"], "closed", ("todo",))
         incident_store.set_repair(repair["id"], ended=util.iso(), outcome="cancelled")
         until = cooling(config.load(), incident_store.incident(incident_id))
         stopped = f"stopped run {run['id']}" if run else "no run was live"

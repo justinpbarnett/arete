@@ -1,10 +1,11 @@
 
 import contextlib, importlib.util, io, json, shutil, sys
 from pathlib import Path
-from arete import cli, paths, replay, state, util
+from arete import cli, paths, replay, util
+from arete.store import db as foundation
 from arete.lab import optimize
 root = Path(sys.argv[1])
-state.migrate()
+foundation.migrate()
 if importlib.util.find_spec("arete.scratch"):
     from arete import sandbox, scratch
     probe = [sys.executable, "-V"]

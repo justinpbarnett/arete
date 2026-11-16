@@ -205,7 +205,7 @@ def switch(name: str, enabled: bool) -> dict:
 
 def feed(run_id: str, after: int = 0) -> dict:
     with foundation.one_read() as conn:
-        epoch = int(conn.execute("SELECT value FROM schema_meta WHERE key = 'restore_epoch'").fetchone()[0])
+        epoch = foundation.restore_epoch(conn)
         lines = run_store.feed(run_id, after, connect=foundation.reader)
         run_read_after_its_lines = run_store.run_get(run_id, connect=foundation.reader)
     if not run_read_after_its_lines:

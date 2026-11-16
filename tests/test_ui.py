@@ -10,7 +10,9 @@ import unittest
 from unittest import mock
 import arete
 
-from arete import paths, state, util
+from arete import paths, util
+from arete.store import db as foundation
+from arete.store import insights as insights_store
 
 from tests import support
 from tests.harness import bootstrap, make_folders, scratch_env
@@ -104,11 +106,11 @@ class NewUIShellTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder, mock.patch.object(paths, "STATE_DIR", Path(folder)), \
                 mock.patch.object(paths, "DB_FILE", Path(folder) / "arete.db"), \
                 mock.patch.object(util, "iso", return_value="2026-01-02T03:04:05Z"):
-            state.migrate()
+            foundation.migrate()
 
             def stored(body):
                 capture.add_context(body, "code123")
-                return state.capture_draft()["context"]
+                return insights_store.capture_draft()["context"]
 
             legacy = {"captured": "2026-01-02T03:04:05Z", "app": {"version": arete.__version__, "code": "code123"}, "view": "live"}
             self.assertEqual(stored({"view": "live"}), json.dumps(legacy, indent=2, ensure_ascii=False))
@@ -119,12 +121,12 @@ class NewUIShellTests(unittest.TestCase):
             longest = "#" + "a " * 99 + "a"
             self.assertEqual(len(longest), 200)
             self.assertEqual(json.loads(stored({"screen": longest}))["screen"], longest)
-            before = state.capture_draft()["context"]
+            before = insights_store.capture_draft()["context"]
             for body in ({"screen": "settings"}, {"screen": None}, {"screen": 4}, {"screen": longest + "a"},
                          {"screen": "#floor", "view": "floor"}, {"screen": "#floor", "view": None}):
                 with self.assertRaises(capture.Refused, msg=str(body)):
                     capture.add_context(body, "code123")
-            self.assertEqual(state.capture_draft()["context"], before)
+            self.assertEqual(insights_store.capture_draft()["context"], before)
 
     def test_palette_offline_behavior(self):
         script = (SCRIPTS / "ui_palette_offline.mjs").read_text()

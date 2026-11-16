@@ -3,7 +3,9 @@ import json
 from datetime import UTC, datetime, timedelta
 
 from arete.store import runs as run_store
-from arete import paths, state
+from arete import paths
+from arete.store import db as foundation
+from arete.store import insights as insights_store
 
 BASE = datetime(2026, 1, 1, tzinfo=UTC)
 rows = []
@@ -49,7 +51,7 @@ for ticket in range(1039, 2001):
 for n in range(7000):
     rows.append((f"loop{n:05d}", "loop", None, None, "done", stamp(), None, "", "tick", "command", 0))
 
-with state.db() as c:
+with foundation.db() as c:
     c.executemany("INSERT INTO runs (id, kind, repo, issue, status, started, only_step, pr_url, loop, loop_kind, "
                   "cost_usd) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
     c.execute("INSERT INTO feedback (pr_url, kind, gh_id, repo, issue, body, at_once, created, status) "
@@ -105,11 +107,11 @@ results = {
     "open_runs": [r["id"] for r in call("open_runs", run_store.open_runs, "arete", 1021)],
     "later_run": (call("later_run", run_store.later_run, "arete", 1021, ids[1021][0]) or {}).get("id"),
     "last_pipeline_starts": call("last_pipeline_starts", run_store.last_pipeline_starts),
-    "feedback_due": call("feedback_due", state.feedback_due, "arete", "2100-01-01"),
+    "feedback_due": call("feedback_due", insights_store.feedback_due, "arete", "2100-01-01"),
     "runs": [r["id"] for r in call("runs", run_store.runs, limit=50)],
     "runs_since": len(call("runs_since", run_store.runs_since, stamp(0))),
 }
-with state.db() as c:
+with foundation.db() as c:
     results["history"] = {
         "default_has_firings": any(r["kind"] == "loop" for r in run_store.runs(limit=20000)),
         "firings_has_firings": any(r["kind"] == "loop" for r in run_store.runs(limit=20000, firings=True)),
@@ -119,14 +121,14 @@ with state.db() as c:
     results["expected_latest_whole"] = {str(t): ids[t][1 if t >= 1036 else 0] for t in (1031, 1036, 1037, 1038, 1001, 1002)}
 
 plans = {}
-with state.db() as c:
+with foundation.db() as c:
     for name, statements in captured.items():
         plans[name] = [{"sql": sql, "plan": [r[3] for r in c.execute("EXPLAIN QUERY PLAN " + sql)]}
                        for sql in statements if "runs" in sql]
 
 
 def inspect():
-    with state.db() as c:
+    with foundation.db() as c:
         return {"runs": c.execute("SELECT COUNT(*) FROM runs").fetchone()[0],
                 "loops": c.execute("SELECT COUNT(*) FROM runs WHERE kind = 'loop'").fetchone()[0],
                 "indexes": {r[0]: r[1] for r in c.execute(

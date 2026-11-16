@@ -2,9 +2,11 @@
 import json, subprocess, sys
 from pathlib import Path
 from arete.store import runs as run_store
-from arete import config, devices, gh, record, replay, sessions, state
+from arete import config, devices, gh, record, replay, sessions
+from arete.store import asks as asks_store
+from arete.store import db as foundation
 root, scenario = Path(sys.argv[1]), sys.argv[2]
-state.migrate()
+foundation.migrate()
 lines = replay.sample(root / "sample")
 text = "\n".join(line for line in lines if not line.startswith("#")) + "\n"
 if scenario.startswith("draft"):
@@ -90,7 +92,7 @@ sessions.workspace(spec, devices.LOCAL, repo)
 sessions.save_spec(spec)
 record.start("session", run_id=spec.id, lock=sessions.session_lock(spec.id), pid=None, repo=repo.name, device="local")
 if scenario.endswith("-turn"):
-    state.add_message(spec.id, "Also add fig")
+    asks_store.add_message(spec.id, "Also add fig")
 status = sessions.execute(spec.id)
 origin = root / "sample" / "origin.git"
 def origin_git(*args):

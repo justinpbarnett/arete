@@ -4,7 +4,8 @@ import re
 from collections import Counter
 from datetime import timedelta
 
-from . import config, state, util
+from . import config, util
+from .store import insights as insights_store
 
 NEAR = 0.1
 REVERTS = re.compile(r"This reverts commit ([0-9a-f]{7,40})")
@@ -25,7 +26,7 @@ def distance(score: dict) -> float:
 def record(run_id: str, kind: str, subject: str, about: str, scores: dict[str, dict], held: str,
            outcome: str = "") -> None:
     if run_id:
-        state.add_verdict(run_id, kind, subject, about, scores, held, outcome)
+        insights_store.add_verdict(run_id, kind, subject, about, scores, held, outcome)
 
 
 def reverted_shas(cfg: config.Config, since: str) -> dict[str, str]:
@@ -51,7 +52,7 @@ def scored_row(r: dict, question: str, score: dict) -> dict:
 
 def summary(days: float, cfg: config.Config) -> dict:
     since = util.iso(util.now() - timedelta(days=days))
-    rows = state.verdicts_since(since)
+    rows = insights_store.verdicts_since(since)
     kinds: dict[str, dict] = {}
     questions: dict[str, dict] = {}
     near, close = [], []

@@ -31,7 +31,6 @@ from . import (
     routing,
     sandbox,
     scrub,
-    state,
     uploads,
     util,
 )
@@ -50,6 +49,7 @@ from .agent import (
     subscription,
     traits_of,
 )
+from .store import devices as devices_store
 from .store import runs as run_store
 
 SECRET_SEARCH_SKIPS = frozenset({".git", "node_modules", ".venv", "venv", "__pycache__"})
@@ -291,13 +291,13 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
                                   generation=picked.auth.generation)
         if not res.usage_limit:
             if res.ok:
-                state.clear_holds([accounts.scope(a, s, picked.unknown) for a in picked.auths
+                devices_store.clear_holds([accounts.scope(a, s, picked.unknown) for a in picked.auths
                                    for s in routing.limit_scopes(a, picked.name)], set_before=started)
             return with_spent(res, limited)
         limit = res.usage_limit
         why = f"{chosen_route.runner} {limit.kind or 'usage'} limit reached"
         for a in picked.auths:
-            state.hold(accounts.scope(a, limit.scope, picked.unknown), limit.until, why)
+            devices_store.hold(accounts.scope(a, limit.scope, picked.unknown), limit.until, why)
         limited.append(res)
         previous = Stopped(res, picked)
         key = routing.route_key(chosen_route)
@@ -589,7 +589,7 @@ def continues(stopped: Stopped, picked: Picked, persist: bool) -> bool:
     res = stopped.res
     return (stopped.picked.candidate.runner == picked.candidate.runner and bool(res.session.id) and res.turns > 1
             and persist and (before == now or (bool(account_of(before)) and account_of(before) == account_of(now))
-                             or state.refresh_continues(before.generation, now.generation)))
+                             or devices_store.refresh_continues(before.generation, now.generation)))
 
 
 def session_for(trip: Trip, picked: Picked, prompt: str, fresh_prompt: Callable[[str], str] | None,
@@ -598,7 +598,7 @@ def session_for(trip: Trip, picked: Picked, prompt: str, fresh_prompt: Callable[
     saved = trip.resume
     usable = saved.id and saved.runner == which and (
         not saved.account or saved.account == account_of(picked.auth)
-        or state.refresh_continues(saved.generation, picked.auth.generation))
+        or devices_store.refresh_continues(saved.generation, picked.auth.generation))
     fresh = fresh_prompt(which) if fresh_prompt and saved.id else prompt
     if previous is None:
         return (prompt, saved) if usable else (fresh, NO_SESSION)

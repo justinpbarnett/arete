@@ -1,6 +1,6 @@
 
 seed()
-with state.db() as c:
+with foundation.db() as c:
     c.executemany("INSERT INTO feed (run_id, ts, kind, text) VALUES ('bulk', ?, 'note', 'original')", [(ago(0),)] * 20000)
 CHILD = """
 import sqlite3, sys, time

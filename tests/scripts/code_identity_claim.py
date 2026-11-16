@@ -2,8 +2,9 @@
 import json, os
 from unittest import mock
 from arete.store import runs as run_store
-from arete import codebase, control, loop_run, record, scaffold, sessions, state
-state.migrate()
+from arete import codebase, control, loop_run, record, scaffold, sessions
+from arete.store import db as foundation
+foundation.migrate()
 codebase.STAMP = "a"
 loop = record.start("loop", pid=None, loop="x")
 session = record.start("session", pid=None)

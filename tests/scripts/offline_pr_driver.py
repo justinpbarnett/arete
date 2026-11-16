@@ -3,9 +3,13 @@ from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from arete.store import runs as run_store
-from arete import accounts, agent, owner_asks, config, control, factory, gh, run_lines, paths, pipeline, record, replay, runlimits, sandbox, scratch, state, util, workspace, outcomes, prompt_loader
+from arete import accounts, agent, owner_asks, config, control, factory, gh, run_lines, paths, pipeline, record, replay, runlimits, sandbox, scratch, util, workspace, outcomes, prompt_loader
+from arete.store import asks as asks_store
+from arete.store import db as foundation
+from arete.store import insights as insights_store
+from arete.store import tasks as tasks_store
 root, scenario, role = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
-state.migrate()
+foundation.migrate()
 probe = [sys.executable, "-V"]
 if sandbox.protected_command(probe) != probe:
     sandbox.AUTHORITY = root / "authority-parent/verification-authority"
@@ -67,7 +71,7 @@ lines_of_config = replay.sample(root / "sample", adw=True)
 paths.CONFIG_FILE.write_text("max_parallel=1\n\n" + "\n".join(lines_of_config) + '\ngithub = "octo/widgets"\n\n[jev]\nenabled=false\n')
 record.SETTLE_GRACE_SECONDS = 0
 cfg = config.load()
-task = state.task_add("replay-sample", "Add kumquat to the fixture notes", "Add kumquat", "feat")
+task = tasks_store.task_add("replay-sample", "Add kumquat to the fixture notes", "Add kumquat", "feat")
 feature = feature_of()
 pipeline.watch_ci = lambda *a, **k: "CI passed"
 def run_ticket(*extra):
@@ -137,8 +141,8 @@ elif scenario == "repair-stop":
     extra["older_before"] = run_store.run_get(older)["status"]
 elif scenario == "answer-stop":
     first = take(run_ticket())
-    for ask in state.asks_of(first["id"], "open"):
-        state.ask_close(ask["id"], "answered", owner_asks.text_answers(ask, "Spelled with a K."))
+    for ask in asks_store.asks_of(first["id"], "open"):
+        asks_store.ask_close(ask["id"], "answered", owner_asks.text_answers(ask, "Spelled with a K."))
     pipeline.watch_ci = stopping
     take(run_ticket("--continue", first["id"]))
 elif scenario == "retry-stop":
@@ -155,8 +159,8 @@ if scenario in ("stop", "repair-stop"):
 if scenario == "stopped-feedback":
     comment = {"pr_url": URL, "kind": "comment", "gh_id": 11, "repo": "replay-sample", "issue": task,
                "body": "Please rename it.", "at_once": 1, "created": util.iso(), "pr_state": "OPEN", "status": "new"}
-    extra["added"] = [state.add_feedback([comment]), state.add_feedback([comment])]
-    extra["feedback_due"] = state.feedback_due("replay-sample", util.iso())
+    extra["added"] = [insights_store.add_feedback([comment]), insights_store.add_feedback([comment])]
+    extra["feedback_due"] = insights_store.feedback_due("replay-sample", util.iso())
     extra["task"] = task
 calls = [json.loads(line) for line in CALLS.read_text().splitlines()] if CALLS.exists() else []
 print("BEHAVIOR_RESULT=" + json.dumps({"scenario": scenario, "runs": snaps,

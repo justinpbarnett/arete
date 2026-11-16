@@ -17,11 +17,11 @@ from . import (
     pipeline,
     prompt_loader,
     record,
-    state,
     tracker,
     util,
     workspace,
 )
+from .store import insights as insights_store
 from .store import runs as run_store
 from .util import git
 
@@ -75,7 +75,7 @@ def feedback_text(row: dict) -> str:
 
 
 def judge_feedback(cfg: config.Config, repo_name: str, url: str, rows: list[dict]) -> None:
-    known = state.feedback_keys(url)
+    known = insights_store.feedback_keys(url)
     fresh = [row for row in rows if row["status"] == "new" and (row["kind"], row["gh_id"]) not in known]
     try:
         repo = cfg.repo(repo_name)
@@ -111,7 +111,7 @@ def record_feedback(cfg: config.Config, r: dict, urls: list[str], prs: list[dict
         try:
             rows = owner_feedback(url, pr.get("state", ""), r["repo"], str(r["issue"]))
             judge_feedback(cfg, r["repo"], url, rows)
-            added = state.add_feedback(rows)
+            added = insights_store.add_feedback(rows)
         except gh.GhError as e:
             print(f"{util.iso()} {url}: could not read the review comments: {util.first_line(str(e), 300)}")
             continue
@@ -138,7 +138,7 @@ def sync_outcomes(cfg: config.Config) -> None:
         if not closed:
             continue
         for url, pr in zip(urls, prs):
-            state.close_feedback(url, pr["state"])
+            insights_store.close_feedback(url, pr["state"])
         closed_at = max((util.iso(util.parse_iso(pr["closedAt"]).astimezone(UTC))
                          for pr in prs if pr.get("closedAt")), default=util.iso())
         record.move(r["id"], "merged" if merged else "rejected", expect=(r["status"],), finished=closed_at)

@@ -16,9 +16,9 @@ for i in range(20):
     finally:
         stop.write_text("x")
         code = research.wait(timeout=60)
-    marks = state.loop_marks()
+    marks = loops_store.loop_marks()
     shown = {c["name"]: c for c in board.checks()["loops"]}
     trials.append([poll.returncode, code, marks["poll"]["ok"], marks["poll"]["detail"], marks["research"]["ok"],
                    shown["poll"]["ok"]])
-    state.set_loop_state("poll", mark_ok=None, mark_detail="", mark_at=None)
+    loops_store.set_loop_state("poll", mark_ok=None, mark_detail="", mark_at=None)
 print("RESULT:" + json.dumps({"trials": trials, "legacy": (paths.STATE_DIR / "loops.json").exists()}))

@@ -11,12 +11,14 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import ClassVar
 
-from . import alerts, config, gh, jev, jira, paths, prompt_loader, refusals, runner, screening, state, tracker, util
+from . import alerts, config, gh, jev, jira, paths, prompt_loader, refusals, runner, screening, tracker, util
 from .agent import READ_TOOLS
 from .heartbeat import mark_loop, network_up_or_skip
 from .refusals import TrackerFailed
 from .store import db as foundation
+from .store import insights as insights_store
 from .store import runs as run_store
+from .store import triage as triage_store
 
 ISSUE_TITLE = "[arete] triage"
 ISSUE_LABEL = "arete-triage"
@@ -399,7 +401,7 @@ def kept(src: TriageSource, c: Candidate, prev: dict | None, reason: str) -> dic
 
 def delivered_since() -> dict[str, dict]:
     since = util.iso(util.now() - timedelta(days=SENT_DAYS))
-    return {x["ref"]: x for x in state.research_rows() if (x.get("delivered") or "") >= since}
+    return {x["ref"]: x for x in insights_store.research_rows() if (x.get("delivered") or "") >= since}
 
 
 def still_shown(src: TriageSource, read: list[Candidate], old: dict[str, dict],
@@ -488,21 +490,21 @@ def triage_due(cfg, todo) -> Triaged:
 
 def write_board(srcs, read, triaged):
     with util.lock(BOARD_LOCK, wait=True):
-        board = {r["ref"]: r for r in state.triage_rows()}
-        sent = {a["ref"]: a["ts"] for a in state.triage_approvals()}
+        board = {r["ref"]: r for r in triage_store.triage_rows()}
+        sent = {a["ref"]: a["ts"] for a in triage_store.triage_approvals()}
         delivered = delivered_since()
         for src in srcs:
             if src.name in read:
-                state.triage_replace(src.name, [
+                triage_store.triage_replace(src.name, [
                     triaged.answered.get(c.ref) or kept(src, c, board.get(c.ref),
                                                 f"triage failed: {triaged.failed[c.ref]}" if c.ref in triaged.failed else WAITING)
                     for c in read[src.name] if not sent_since_read(c, sent)]
                     + still_shown(src, read[src.name], board, delivered))
-        state.triage_prune([s.name for s in srcs])
+        triage_store.triage_prune([s.name for s in srcs])
 
 
 def prune_records():
-    keep = {record_file(r["ref"]).name for r in state.triage_rows()}
+    keep = {record_file(r["ref"]).name for r in triage_store.triage_rows()}
     for f in TICKET_RECORDS_DIR.glob("*.md"):
         if f.name not in keep:
             f.unlink()
@@ -516,7 +518,7 @@ def preview_refresh(cfg, srcs, read, old, todo):
 
 
 def refresh(cfg: config.Config, dry_run: bool) -> int:
-    old = {r["ref"]: r for r in state.triage_rows()}
+    old = {r["ref"]: r for r in triage_store.triage_rows()}
     srcs = sources(cfg)
     read, errors = read_all(srcs)
     todo = sorted(((src, c) for src in srcs for c in read.get(src.name, []) if due(c, old.get(c.ref))),
@@ -558,7 +560,7 @@ def approve_ready(cfg: config.Config, srcs: list[TriageSource]) -> tuple[list[st
     if not cfg.jira.auto:
         return approved, held
     by_name = {s.name: s for s in srcs}
-    for r in approvable(srcs, state.triage_rows()):
+    for r in approvable(srcs, triage_store.triage_rows()):
         if len(approved) >= cfg.jira.auto_per_refresh:
             break
         with util.lock(BOARD_LOCK, wait=True):
@@ -591,7 +593,7 @@ def approve(cfg: config.Config, src: JiraSource, r: dict) -> str:
         if screened.status != screening.FLAGGED:
             return "JEV could not screen it this time"
         labels = " and ".join(f"`{lb}`" for lb in labels_to_add(r))
-        state.triage_put({**r, "ready": 0, "questions": [
+        triage_store.triage_put({**r, "ready": 0, "questions": [
             (f"JEV reads text in it as instructions to an agent (p {screened.p:.2f}). Check the ticket, then add "
              f"{labels} by hand to approve it.")]})
         return f"held for the injection screen (p {screened.p:.2f})"
@@ -601,8 +603,8 @@ def approve(cfg: config.Config, src: JiraSource, r: dict) -> str:
 
 def to_pipeline(src: TriageSource, r: dict, sent_by: str) -> None:
     src.approve(r)
-    state.triage_approve(r, sent_by)
-    state.triage_drop(r["ref"])
+    triage_store.triage_approve(r, sent_by)
+    triage_store.triage_drop(r["ref"])
 
 
 class NotOnBoard(refusals.NotFound, LookupError):
@@ -622,7 +624,7 @@ def tracker_said(e: Exception) -> str:
 
 
 def board_row(ref: str) -> dict | None:
-    return next((r for r in state.triage_rows() if r["ref"].lower() == ref.strip().lower()), None)
+    return next((r for r in triage_store.triage_rows() if r["ref"].lower() == ref.strip().lower()), None)
 
 
 def repo_question(r: dict) -> str:
@@ -642,7 +644,7 @@ def send(cfg: config.Config, ref: str, questions: list[str], answers: list[str],
     with util.lock(BOARD_LOCK, wait=True):
         r = board_row(ref)
         if not r:
-            if a := state.triage_approval(ref.strip()):
+            if a := triage_store.triage_approval(ref.strip()):
                 raise NotOnBoard(f"{a['ref']} went to the pipeline {stamp(a['ts'])}, so there is nothing left to send.")
             raise NotOnBoard(f"{ref} is not on the triage board.")
         if standing(r) not in SENDABLE:
@@ -724,7 +726,7 @@ def standing(r: dict) -> str:
 
 def sent(connect=foundation.db) -> list[dict]:
     out = []
-    for a in state.triage_approvals(util.iso(util.now() - timedelta(days=SENT_DAYS)), connect):
+    for a in triage_store.triage_approvals(util.iso(util.now() - timedelta(days=SENT_DAYS)), connect):
         runs = [r for r in run_store.ticket_runs(a["repo"], issue_id(a["tracker"], a["ref"]), limit=1, connect=connect)
                 if r["started"] >= a["ts"]]
         out.append({**a, "run": runs[0] if runs else None})
@@ -732,8 +734,8 @@ def sent(connect=foundation.db) -> list[dict]:
 
 
 def view(connect=foundation.db) -> dict:
-    return {"rows": sorted(state.triage_rows(connect), key=lambda r: natural(r["ref"])), "sent": sent(connect),
-            "research": {r["ref"]: r for r in state.research_rows(connect)}}
+    return {"rows": sorted(triage_store.triage_rows(connect), key=lambda r: natural(r["ref"])), "sent": sent(connect),
+            "research": {r["ref"]: r for r in insights_store.research_rows(connect)}}
 
 
 def groups(v: dict) -> dict[str, list[dict]]:
@@ -907,9 +909,9 @@ def board() -> str:
 
 def ticket(ref: str) -> str | None:
     want = ref.strip().lower()
-    r = next((r for r in state.triage_rows() if r["ref"].lower() == want), None)
+    r = next((r for r in triage_store.triage_rows() if r["ref"].lower() == want), None)
     if not r:
-        a = next((a for a in sent() if a["ref"].lower() == want), None) or state.triage_approval(want)
+        a = next((a for a in sent() if a["ref"].lower() == want), None) or triage_store.triage_approval(want)
         if not a:
             return None
         by = " by you" if a["sent_by"] == "owner" else " by triage"
@@ -927,7 +929,7 @@ def ticket(ref: str) -> str | None:
     if kind == NEEDS_PERSON:
         return "\n".join(lines + ["Needs a person: nothing for arete to build or research.", f"Why: {r['why']}"])
     if kind == RESEARCH_WORK:
-        report = state.research_get(r["ref"])
+        report = insights_store.research_get(r["ref"])
         lines += [f"Research: {research_note(r, report)}.", f"Why: {r['why']}"]
         if report and report["summary"]:
             lines += [f"Summary: {report['summary']}", f"`arete research {r['ref']}` prints the report."]

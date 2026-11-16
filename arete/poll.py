@@ -15,7 +15,6 @@ from . import (
     pipeline,
     routing,
     runlimits,
-    state,
     steps,
     tracker,
     util,
@@ -35,6 +34,8 @@ from .pipeline import (
 )
 from .slots import slots_free_to_start
 from .store import asks as ask_store
+from .store import asks as asks_store
+from .store import insights as insights_store
 from .store import runs as run_store
 from .store import sources as source_store
 from .workspace import cleanup_worktrees
@@ -79,7 +80,7 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
     for tid in run_store.interrupted_tickets(repo.name):
         if str(tid) not in excluded and not run_store.issue_running(repo.name, tid):
             return tid, "restarting after an interruption"
-    for tid in state.feedback_due(repo.name, util.iso(util.now() - timedelta(minutes=pipeline.FEEDBACK_QUIET_MINUTES))):
+    for tid in insights_store.feedback_due(repo.name, util.iso(util.now() - timedelta(minutes=pipeline.FEEDBACK_QUIET_MINUTES))):
         if str(tid) not in excluded and not run_store.issue_running(repo.name, tid):
             return tid, "revising the PR for your review comments"
     for source in ticket_queues(repo, tk):
@@ -122,7 +123,7 @@ def tracker_reply(repo: config.Repo, tk: tracker.Tracker, tid: str, dry_run: boo
     newest = run_store.newest_whole_run(repo.name, str(tid))
     if not newest or newest["status"] != "needs-info":
         return ""
-    waiting = state.asks_of(newest["id"], "open")
+    waiting = asks_store.asks_of(newest["id"], "open")
     if not waiting:
         return ""
     if any(owner_asks.has_secret(a["questions"]) for a in waiting):
@@ -130,7 +131,7 @@ def tracker_reply(repo: config.Repo, tk: tracker.Tracker, tid: str, dry_run: boo
     text = tk.reply_since(tid, waiting[0]["asked"])
     if text and not dry_run:
         with util.lock(owner_asks.STEER_LOCK, wait=True):
-            for a in state.asks_of(newest["id"], "open"):
+            for a in asks_store.asks_of(newest["id"], "open"):
                 ask_store.ask_close(a["id"], "answered", owner_asks.text_answers(a, text))
     return ""
 

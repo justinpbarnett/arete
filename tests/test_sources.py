@@ -178,7 +178,7 @@ finish({"snap": snap(), "lines": server.lines})
     def test_a_webhook_whose_fire_fails_queues_on_redelivery(self):
         found = self.result('''
 loop = make_loop(webhook=True)
-state.migrate()
+foundation.migrate()
 body = b'{"title": "hello"}'
 loop_store.enqueue = failing_once(loop_store.enqueue)
 server = web()
@@ -224,7 +224,7 @@ finish(out)
     def test_a_refused_post_leaves_nothing_and_a_plain_fire_still_coalesces(self):
         found = self.result('''
 loop = make_loop(webhook=True)
-state.ensure_schema()
+foundation.ensure_schema()
 webhooks.secret("intake")
 server = web()
 try:
@@ -379,7 +379,7 @@ class LoopMarkAndDurableWriteTests(unittest.TestCase):
                        ARETE_CONFIG_DIR=str(root / "config"),
                        ARETE_LOG_DIR=str(root / "logs"), ARETE_WORKTREES_DIR=str(root / "worktrees"),
                        TMPDIR=str(root / "tmp"), HOME=str(root / "home"), PYTHONPATH=str(support.SOURCE))
-            script = self.PRELUDE + ("state.migrate()\n" if setup else "") + body
+            script = self.PRELUDE + ("foundation.migrate()\n" if setup else "") + body
             done = subprocess.run([sys.executable, "-c", script, str(root)], env=env, cwd=support.SOURCE,
                                   capture_output=True, text=True, timeout=300)
             self.assertEqual(done.returncode, 0, done.stderr)

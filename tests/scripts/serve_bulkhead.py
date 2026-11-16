@@ -6,14 +6,16 @@ from unittest import mock
 from arete.store import runs as run_store
 from arete.store import loops as loop_store
 from arete.store import incidents as incident_store
-from arete import alerts, board, cli, config, control, loop_run, explain, heartbeat, loops, oncall, paths, routing, serve, state, tasks, util, webpush
+from arete import alerts, board, cli, config, control, loop_run, explain, heartbeat, loops, oncall, paths, routing, serve, tasks, util, webpush
+from arete.store import approvals as approvals_store
+from arete.store import db as foundation
 
 root, mode = Path(sys.argv[1]), sys.argv[2]
 real_out = sys.stdout
 LOG = paths.LOG_DIR / "serve.log"
 GOOD = '[replay]\nall = true\n\n[jev]\nenabled = false\n'
 paths.ensure_dirs()
-state.migrate()
+foundation.migrate()
 paths.CONFIG_FILE.write_text(GOOD + ('\n[oncall]\nenabled = true\n' if mode == "oncall" else ''))
 loops.SWITCHES_FILE.write_text(json.dumps({p.name: False for p in loops.BUNDLED_LOOPS_DIR.iterdir() if p.is_dir()}))
 EVENT = {"type": "test", "title": "item", "data": {"value": 1}, "trust": "internal"}
@@ -135,8 +137,8 @@ if mode in ("fault", "oncall"):
     finish(server)
 
 elif mode == "approvals":
-    state.add_approval("aaa", "r1", {"type": "push", "item": {"repo": "x"}}, "one")
-    state.add_approval("aaa", "r2", {"type": "renamed_emit", "item": {}}, "two")
+    approvals_store.add_approval("aaa", "r1", {"type": "push", "item": {"repo": "x"}}, "one")
+    approvals_store.add_approval("aaa", "r2", {"type": "renamed_emit", "item": {}}, "two")
     asks = []
     real_asks = tasks.expire_asks
     with mock.patch.object(explain, "plain_summary", lambda a, c: "fixed text"), \
@@ -144,8 +146,8 @@ elif mode == "approvals":
         beats = [run(server, due=False) for _ in range(3)]
     check = tick_check()
     failing = beats[-1]["failing"]
-    summary = state.approval(1)["plain_summary"]
-    with state.db() as c:
+    summary = approvals_store.approval(1)["plain_summary"]
+    with foundation.db() as c:
         c.execute("UPDATE approvals SET status = 'rejected' WHERE id = 2")
     with mock.patch.object(explain, "plain_summary", lambda a, c: "fixed text"):
         after = run(server, due=False)
@@ -219,7 +221,7 @@ elif mode == "waits":
     finish(server)
 
 elif mode in ("alerts", "alert_order"):
-    state.add_approval("aaa", "r1", {"type": "push", "item": {"repo": "x"}}, "one")
+    approvals_store.add_approval("aaa", "r1", {"type": "push", "item": {"repo": "x"}}, "one")
     order, asks = [], []
     gate = threading.Event()
 
@@ -253,7 +255,7 @@ elif mode in ("alerts", "alert_order"):
             run(fresh, due=False)
             run(fresh, due=False)
             done(seen=seen, ticks=[b["ticks"] for b in beats], tick_ok=calm["tick_ok"], closed=closed, asks=expired,
-                 fresh=len([o for o in order if o[0] == "clear"]) - closed, summary=state.approval(1)["plain_summary"])
+                 fresh=len([o for o in order if o[0] == "clear"]) - closed, summary=approvals_store.approval(1)["plain_summary"])
             finish(fresh)
         else:
             done(order=[o[0] for o in order])

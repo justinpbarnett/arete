@@ -9,7 +9,11 @@ from datetime import datetime, timedelta
 from fnmatch import fnmatchcase
 
 from . import backup, install, paths, util
+from .store import approvals as approvals_store
+from .store import chats as chats_store
 from .store import db as foundation
+from .store import insights as insights_store
+from .store import loops as loops_store
 from .store import runs as run_store
 
 SAMPLE_LIMIT = 5
@@ -89,29 +93,22 @@ def check_cost(conn: sqlite3.Connection) -> Result:
     return result("cost", "fail", [d["id"] for d in drift], detail)
 
 
-def orphan_query(table: str, extra: str) -> str:
-    return (f"FROM {table} t LEFT JOIN runs ON runs.id = t.run_id "
-            f"WHERE t.run_id IS NOT NULL AND t.run_id <> '' AND runs.id IS NULL{extra}")
-
-
 def check_orphans(conn: sqlite3.Connection) -> Result:
     total, ids, per_table = 0, [], []
     for table in ORPHAN_TABLES:
-        extra = f" AND t.run_id <> '{CHAT_STEPS}'" if table == "steps" else ""
-        n = conn.execute(f"SELECT COUNT(*) {orphan_query(table, extra)}").fetchone()[0]
+        owner = run_store if table in ("steps", "feed") else insights_store
+        n, rows = owner.orphan_rows(conn, table, SAMPLE_LIMIT if len(ids) < SAMPLE_LIMIT else 0)
         if n:
             per_table.append(f"{n} in {table}")
         total += n
         if len(ids) < SAMPLE_LIMIT:
-            rows = conn.execute(f"SELECT t.rowid, t.run_id {orphan_query(table, extra)} ORDER BY t.rowid LIMIT ?",
-                                (SAMPLE_LIMIT,)).fetchall()
             ids += [f"{table}#{r[0]}:{r[1]}" for r in rows]
     detail = ", ".join(per_table) + " with no runs row" if per_table else "every row names a run"
     return result("orphans", "fail", ids, detail, total)
 
 
 def check_chat(conn: sqlite3.Connection) -> Result:
-    rows = conn.execute("SELECT id FROM steps WHERE run_id = ? ORDER BY id", (CHAT_STEPS,)).fetchall()
+    rows = run_store.pseudo_chat_steps(conn, CHAT_STEPS)
     return result("chat", "info", [f"steps#{r[0]}" for r in rows],
                   "steps filed under the pseudo run 'chat'" if rows else "no steps under 'chat'")
 
@@ -124,7 +121,7 @@ def check_folders(conn: sqlite3.Connection, listing: Listing, now: datetime) -> 
     if listing.error:
         raise listing.error
     cutoff = now - timedelta(minutes=YOUNG_MINUTES)
-    rows = conn.execute("SELECT id, kind, started, log, files_purged FROM runs ORDER BY id").fetchall()
+    rows = run_store.folder_rows(conn)
     known = {r["id"] for r in rows}
     stray = sorted(n for n, mtime in listing.folders.items()
                    if n not in known and not unrecorded(n) and mtime < cutoff.timestamp())
@@ -152,21 +149,16 @@ def check_stuck(conn: sqlite3.Connection, now: datetime) -> Result:
 
     chat_cutoff = util.iso(now - timedelta(seconds=chat.TIMEOUT_SECONDS + CHAT_GRACE_SECONDS))
     approval_cutoff = util.iso(now - timedelta(hours=APPROVAL_HOURS))
-    chats = [f"chat#{r[0]}" for r in conn.execute(
-        "SELECT id FROM chats WHERE busy = 1 AND updated < ? ORDER BY id", (chat_cutoff,))]
-    queue = [f"queue#{r[0]}" for r in conn.execute(
-        "SELECT q.id FROM queue q LEFT JOIN runs ON runs.id = q.run_id "
-        "WHERE q.run_id IS NOT NULL AND q.run_id <> '' AND q.dead_at IS NULL "
-        "AND (runs.id IS NULL OR runs.status <> 'running') ORDER BY q.id")]
-    approvals = [f"approval#{r[0]}" for r in conn.execute(
-        "SELECT id FROM approvals WHERE status = 'approved' AND decided < ? ORDER BY id", (approval_cutoff,))]
+    chats = [f"chat#{r[0]}" for r in chats_store.stale_busy(conn, chat_cutoff)]
+    queue = [f"queue#{r[0]}" for r in loops_store.settled_claims(conn)]
+    approvals = [f"approval#{r[0]}" for r in approvals_store.stale_approved(conn, approval_cutoff)]
     parts = [f"{len(v)} {label}" for v, label in ((chats, "busy chats"), (queue, "queue claims on settled runs"),
                                                  (approvals, "approvals left approved")) if v]
     return result("stuck", "fail", chats + queue + approvals, ", ".join(parts) or "nothing is stuck")
 
 
 def check_store(conn: sqlite3.Connection) -> Result:
-    messages = [r[0] for r in conn.execute("PRAGMA quick_check")]
+    messages = foundation.quick_check(conn)
     if messages == ["ok"]:
         return Result("store", "fail", 0, [], "quick_check ok")
     return Result("store", "fail", len(messages) or 1, [], f"quick_check: {(messages or ['no answer'])[0]}")

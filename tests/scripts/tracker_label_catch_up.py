@@ -2,9 +2,11 @@
 import json, os, subprocess, sys, time, urllib.request
 from pathlib import Path
 from arete.store import runs as run_store
-from arete import accounts, config, gh, paths, pipeline, record, replay, state, tracker, util, poll
+from arete import accounts, config, gh, paths, pipeline, record, replay, tracker, util, poll
+from arete.store import db as foundation
+from arete.store import tasks as tasks_store
 root, scenario = Path(sys.argv[1]), sys.argv[2]
-state.migrate()
+foundation.migrate()
 def forbidden(*args, **kwargs):
     raise AssertionError("offline workflow attempted an external transport or credential lookup")
 urllib.request.urlopen = forbidden
@@ -92,16 +94,16 @@ elif scenario == "ties-and-unknown-repo":
     pipeline.sync_labels(cfg)
     result |= {"labels": sorted(ISSUES[5]), "edits": len(EDITS)}
 elif scenario == "local-task":
-    task = state.task_add(REPO, "Local", "Local body", "feat")
+    task = tasks_store.task_add(REPO, "Local", "Local body", "feat")
     run = row(task, "pr", "pr")
     pipeline.sync_labels(cfg)
-    result |= {"state": state.task_get(task)["state"], "pending": pending(run), "edits": len(EDITS)}
+    result |= {"state": tasks_store.task_get(task)["state"], "pending": pending(run), "edits": len(EDITS)}
 elif scenario == "held-lock":
     ISSUES[5] = {"agent"}
     run = row(5, "pr", "pr")
     ready = root / "ready"
     holder = subprocess.Popen([sys.executable, "-I", "-c",
-        "import sys,time;from pathlib import Path;from arete.store import runs as run_store; from arete import state, util\n"
+        "import sys,time;from pathlib import Path;from arete.store import runs as run_store; from arete import util; from arete.store import db as foundation; from arete.store import tasks as tasks_store\n"
         "with util.lock(run_store.run_lock('pipeline', sys.argv[1], 5)):\n"
         "    Path(sys.argv[2]).write_text('x')\n"
         "    sys.stdin.readline()", REPO, str(ready)], stdin=subprocess.PIPE, text=True)

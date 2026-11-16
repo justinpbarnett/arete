@@ -1172,7 +1172,7 @@ class CodeIdentityTests(unittest.TestCase):
                           ARETE_WORKTREES_DIR=str(self.root / "worktrees"),
                           TMPDIR=str(self.root / "tmp"), HOME=str(self.root / "home"),
                           GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
-        self.run_child(support.SOURCE, "from arete import state; state.migrate()")
+        self.run_child(support.SOURCE, "from arete.store import db as foundation; foundation.migrate()")
 
     def tree(self, name="tree") -> Path:
         copy = self.root / name

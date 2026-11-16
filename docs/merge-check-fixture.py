@@ -13,7 +13,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from arete.store import runs as run_store
 from arete.store import loops as loop_store
-from arete import config, control, delivery, loop_run, loops, mergecheck, paths, record, run_lines, sources, state, util
+from arete import config, control, delivery, loop_run, loops, mergecheck, paths, record, run_lines, sources, util
+from arete.store import db as foundation
 
 ROOT = Path(__file__).resolve().parents[1] / ".arete-sandbox" / "merge-check-fixture"
 
@@ -75,7 +76,7 @@ def add(args):
                  pr_url="" if args.kind == "no-pr" else f"https://github.com/offline/{args.repo}/pull/{args.pr}")
     record.settle(run_id, "pr" if args.kind == "open" else "merged", finished=stamp)
     if args.kind == "nonpipeline":
-        with state.db() as c:
+        with foundation.db() as c:
             c.execute("UPDATE runs SET kind = 'loop' WHERE id = ?", (run_id,))
     folder = paths.RUNS_DIR / run_id
     folder.mkdir(parents=True, exist_ok=True)

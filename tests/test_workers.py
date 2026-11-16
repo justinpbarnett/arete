@@ -161,11 +161,11 @@ from arete import owner_asks, poll, tasks
 repo = config.Repo("asking", root)
 cfg = config.Config(repos=[repo])
 rid = made("asking", "needs-info", repo=repo.name, issue="R-1")
-state.ask_add("ask", rid, repo.name, "R-1", "build", "call", "why", "tried",
+asks_store.ask_add("ask", rid, repo.name, "R-1", "build", "call", "why", "tried",
               [{"kind": "text", "header": "Choice", "question": "Which?"}], {})
 tk = SimpleNamespace(reply_since=mock.Mock(return_value="tracker text"))
 assert poll.tracker_reply(repo, tk, "R-1", True) == ""
-assert state.ask_get("ask")["status"] == "open"
+assert asks_store.ask_get("ask")["status"] == "open"
 with mock.patch.object(tasks, "run_of", return_value=(cfg, repo, run_store.run_get(rid))), \
         mock.patch.object(tasks, "no_later_run"), mock.patch.object(tasks, "live_run", return_value=None), \
         mock.patch.object(tasks, "free_to_start"), mock.patch.object(tasks, "continuing", return_value=["resume"]), \
@@ -173,13 +173,13 @@ with mock.patch.object(tasks, "run_of", return_value=(cfg, repo, run_store.run_g
     answer = tasks.answer_ask("ask", {"answers": [{"text": "dashboard text"}]})
     assert answer["state"] == "started"
     launch.assert_called_once()
-assert "dashboard text" in json.dumps(state.ask_get("ask")["answers"])
-state.ask_add("secret", rid, repo.name, "R-1", "build", "secret", "why", "tried",
+assert "dashboard text" in json.dumps(asks_store.ask_get("ask")["answers"])
+asks_store.ask_add("secret", rid, repo.name, "R-1", "build", "secret", "why", "tried",
               [{"kind": "secret", "header": "Key", "question": "Key?", "name": "EXAMPLE_TOKEN"}], {})
 tk.reply_since.reset_mock()
 assert "secret" in poll.tracker_reply(repo, tk, "R-1", False)
 tk.reply_since.assert_not_called()
-assert state.ask_get("secret")["status"] == "open"
+assert asks_store.ask_get("secret")["status"] == "open"
 assert tasks.STEER_LOCK == owner_asks.STEER_LOCK
 result(status=answer["state"])
 ''')
@@ -210,7 +210,7 @@ result(order=[next(t for t in tags if d["session"].endswith(t)) for d in digests
 spanning = made("spanning", minutes=90)
 running = made("running", minutes=90, settled=False)
 old = made("old", minutes=300)
-with state.db() as c:
+with foundation.db() as c:
     from tests.harness import age_run
     age_run(old, finished=since(200), connection=c)
 result(listed=[r["id"] for r in record.runs_since(since(60))], spanning=spanning, running=running, old=old)
@@ -414,7 +414,7 @@ result(heard=nums(m))
         found = self.scratch(r'''
 mine(0)
 with mock.patch.object(util, "now", return_value=at(1)):
-    state.add_feedback([{"pr_url": "https://github.com/example/arete/pull/1", "kind": "comment", "gh_id": 1,
+    insights_store.add_feedback([{"pr_url": "https://github.com/example/arete/pull/1", "kind": "comment", "gh_id": 1,
                          "repo": "arete", "issue": "1", "body": "late-comment", "created": util.iso(at(-5)),
                          "pr_state": "OPEN", "status": "new"}])
 first = mine(24)
@@ -430,8 +430,8 @@ row = {"pr_url": "https://github.com/example/arete/pull/1", "kind": "comment", "
        "issue": "1", "body": "again", "created": util.iso(at(-5)), "pr_state": "OPEN", "status": "new"}
 for h in (1, 5):
     with mock.patch.object(util, "now", return_value=at(h)):
-        state.add_feedback([row])
-with state.db() as c:
+        insights_store.add_feedback([row])
+with foundation.db() as c:
     c.execute("INSERT INTO feedback (pr_url, kind, gh_id, repo, issue, body, created, pr_state, status) "
               "VALUES ('https://github.com/example/arete/pull/2', 'comment', 2, 'arete', '2', 'legacy-comment', ?, "
               "'OPEN', 'new')", (util.iso(at(3)),))
@@ -460,7 +460,7 @@ result(heard=nums(m), summary=m["summary"], out=m["out"], mined=m["mined_until"]
     def test_proposals_done_before_and_skipped_before_are_listed_apart(self):
         found = self.scratch(r'''
 for status in ("memory", "filed", "merged", "skipped"):
-    state.add_proposal("seed", {"layer": "repo", "repo": "arete", "file": "a.md", "change": f"fact-{status}",
+    approvals_store.add_proposal("seed", {"layer": "repo", "repo": "arete", "file": "a.md", "change": f"fact-{status}",
                                 "why": "w"}, status)
 both(3)
 m = mine(24)
@@ -774,7 +774,7 @@ class CutOffTests(unittest.TestCase):
         self.child("exec(SEED)")
 
     def command(self, code, before_migrate=""):
-        prelude = CHILD_PRELUDE.replace("state.migrate()\n", before_migrate + "state.migrate()\n")
+        prelude = CHILD_PRELUDE.replace("foundation.migrate()\n", before_migrate + "foundation.migrate()\n")
         return [sys.executable, "-c", prelude + code, str(self.root)]
 
     def child(self, code, timeout=120, before_migrate=""):
@@ -789,7 +789,7 @@ class CutOffTests(unittest.TestCase):
 
     def approve_again(self):
         done = self.child('set_check("true")\nrc = cli.main(["approve", "1"])\n'
-                          'report(rc=rc, row=state.approval(1), verdicts=verdicts())')
+                          'report(rc=rc, row=approvals_store.approval(1), verdicts=verdicts())')
         facts = self.facts(done)
         self.assertEqual(facts["rc"], 0, done.stderr)
         self.assertEqual(facts["row"]["status"], "done")
@@ -803,7 +803,7 @@ class CutOffTests(unittest.TestCase):
 
     def listed(self):
         return self.facts(self.child("report(waiting=delivery.waiting(), verdicts=verdicts(), decisions=["
-                                     "board.push_decision(v) for v in verdicts()], row=state.approval(1))"))
+                                     "board.push_decision(v) for v in verdicts()], row=approvals_store.approval(1))"))
 
     def test_sigint_in_the_check_lists_the_approval_as_failed_and_approving_again_lands_once(self):
         self.held_push()
@@ -839,11 +839,11 @@ class CutOffTests(unittest.TestCase):
             self.assertEqual(refused.stdout.strip(), "1")
             self.assertIn("still sending", refused.stderr)
         facts = self.facts(self.child(
-            "no_wake()\nbefore = delivery.release_lapsed()\nstayed = state.approval(1)['status']\nlater(300)\n"
+            "no_wake()\nbefore = delivery.release_lapsed()\nstayed = approvals_store.approval(1)['status']\nlater(300)\n"
             "util.last_wake = lambda: util.now().timestamp() - 10\nawake_briefly = delivery.release_lapsed()\n"
             "util.last_wake = lambda: 0.0\nreleased = delivery.release_lapsed()\nagain = delivery.release_lapsed()\n"
             "report(before=before, stayed=stayed, awake_briefly=awake_briefly, released=released, again=again, "
-            "row=state.approval(1))"))
+            "row=approvals_store.approval(1))"))
         self.assertEqual((facts["before"], facts["stayed"], facts["awake_briefly"]), ([], "approved", []))
         self.assertEqual((facts["released"], facts["again"], facts["row"]["status"]), ([1], [], "failed"))
         self.assertIn("claim expired", facts["row"]["result"])
@@ -863,7 +863,7 @@ class CutOffTests(unittest.TestCase):
         for at in (8, 13):
             time.sleep(max(0, entered + at - time.monotonic()))
             seen.append(self.facts(self.child("delivery.CLAIM_SECONDS = 6\nno_wake()\nreleased = delivery.release_lapsed()"
-                                              "\nreport(released=released, row=state.approval(1))")))
+                                              "\nreport(released=released, row=approvals_store.approval(1))")))
         out, err = approving.communicate(timeout=90)
         self.assertEqual([s["released"] for s in seen], [[], []], err)
         self.assertEqual([s["row"]["status"] for s in seen], ["approved", "approved"])
@@ -881,10 +881,10 @@ class CutOffTests(unittest.TestCase):
             (folder / "loop.toml").write_text(text.format(command=command))
 
     HUNTS = ("def hunt():\n    run = loop_run.launch('hunt', detach=False)\n"
-             "    with state.db() as c:\n"
+             "    with foundation.db() as c:\n"
              "        queued = [r['key'] if 'key' in r.keys() else r['payload'] for r in "
              "c.execute(\"SELECT * FROM queue WHERE loop = 'fix'\")]\n"
-             "    return {'status': run['status'], 'queued': queued, 'finding': state.findings('hunt'), "
+             "    return {'status': run['status'], 'queued': queued, 'finding': loops_store.findings('hunt'), "
              "'log': [f['text'] for f in run_store.feed(run['id'])]}\n")
 
     def test_a_hunt_stopped_during_delivery_hands_its_finding_on_at_the_next_run(self):
@@ -913,7 +913,7 @@ class CutOffTests(unittest.TestCase):
             "db.execute(\"INSERT INTO findings (loop, fingerprint, title, url, run_id) VALUES ('hunt', ?, 'leak', '', "
             "'old')\", (key,))\ndb.commit()\ndb.close()\n")
         facts = self.facts(self.child(
-            self.HUNTS + "report(rows=state.findings('hunt'), hunted=hunt())", before_migrate=legacy))
+            self.HUNTS + "report(rows=loops_store.findings('hunt'), hunted=hunt())", before_migrate=legacy))
         self.assertEqual([f["emitted"] for f in facts["rows"]], ["legacy"])
         self.assertEqual(facts["hunted"]["queued"], [])
         self.assertTrue(any(line.startswith("seen before") for line in facts["hunted"]["log"]))
@@ -930,7 +930,7 @@ for rid in (old, young):
     (folder(rid) / "run.jsonl").unlink()
     (folder(rid) / "scratch").mkdir()
 server.prune()
-with state.db() as c:
+with foundation.db() as c:
     feed = [c.execute("SELECT COUNT(*) FROM feed WHERE run_id = ?", (rid,)).fetchone()[0] for rid in (old, young)]
 snap = backup.newest_snapshot()
 checked = backup.inspect(snap)
@@ -965,7 +965,7 @@ old = made("old", 91, "merged")
 young = made("young", 89, "merged")
 failed = made("failed", 91)
 recent_finish = made("recent-finish", 100)
-with state.db() as c:
+with foundation.db() as c:
     from tests.harness import age_run
     age_run(recent_finish, finished=age(2), connection=c)
 server.prune()
@@ -974,7 +974,7 @@ try:
     tasks.resume(failed)
 except control.Refused as e:
     refusal = str(e)
-with state.db() as c:
+with foundation.db() as c:
     steps = c.execute("SELECT COUNT(*) FROM steps WHERE run_id = ?", (old,)).fetchone()[0]
 with mock.patch.object(tasks, "script_path", return_value="feature"), mock.patch.object(tasks, "launch", return_value={"ok": True}):
     resumed = tasks.resume(recent_finish)
@@ -999,7 +999,7 @@ made("new", 10, issue="ticket")
 record.pin(ids["pin"])
 proposal(ids["cited"], "pending")
 proposal(ids["evidence"], "pending")
-with state.db() as c:
+with foundation.db() as c:
     c.execute("UPDATE proposals SET run_id = 'miner', status = NULL WHERE run_id = ?", (ids["evidence"],))
     for status in ("open", "answered"):
         c.execute("INSERT INTO asks (id, run, repo, ticket, step, questions, status, asked) "
@@ -1047,11 +1047,11 @@ merged, rejected = [made(s, 40) for s in ("merged", "rejected")]
 proposal(merged, "merged"); proposal(rejected, "rejected")
 server.prune()
 first = [paths.record_dir(r).exists() for r in (merged, rejected)]
-with state.db() as c:
+with foundation.db() as c:
     from tests.harness import age_run
     age_run(merged, started=age(91), finished=age(91), connection=c)
 server.prune()
-result(first=first, folder=folder(merged).exists(), history=bool(run_store.run_get(merged)), proposals=len(state.proposals()))
+result(first=first, folder=folder(merged).exists(), history=bool(run_store.run_get(merged)), proposals=len(approvals_store.proposals()))
 ''')
         self.assertEqual(found["first"], [True, False])
         self.assertFalse(found["folder"])
@@ -1125,7 +1125,7 @@ sentinel = root / "sentinel"
 sentinel.mkdir(); (sentinel / "keep").write_text("safe")
 (folder("linked") / "record").symlink_to(sentinel, target_is_directory=True)
 folder("alias").symlink_to(sentinel, target_is_directory=True)
-with state.db() as c:
+with foundation.db() as c:
     for rid in ("../sentinel", "alias", "missing"):
         c.execute("INSERT INTO run_purges VALUES (?, 'lines', ?)", (rid, age(0)))
 server.prune()

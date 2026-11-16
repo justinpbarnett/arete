@@ -21,7 +21,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Self
 
-from . import agent, codebase, paths, run_lines, scrub, state, util
+from . import agent, codebase, paths, run_lines, scrub, util
+from .store import approvals as approvals_store
 from .store import db as foundation
 from .store import loops as loop_store
 from .store import runs as run_store
@@ -868,7 +869,7 @@ def purge_folders() -> Purged:
 def kept(records: Sequence[Stored]) -> set[str]:
     ids = [r.run_id for r in records]
     recent = time.time() - LIVE_SECONDS
-    return (run_store.record_pins() | state.runs_cited_by_kept_proposals(ids)
+    return (run_store.record_pins() | approvals_store.runs_cited_by_kept_proposals(ids)
             | {r["id"] for r in run_store.runs_marked_running()} | {r.run_id for r in records if r.written > recent})
 
 

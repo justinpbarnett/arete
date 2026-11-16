@@ -3,10 +3,11 @@ import contextlib, hashlib, io, json, os, sys, threading
 from datetime import timedelta
 from pathlib import Path
 from unittest import mock
-from arete import config, jira, loops, paths, serve, sources, state, util
+from arete import config, jira, loops, paths, serve, sources, util
+from arete.store import db as foundation
 from arete.store import loops as loop_store
 from arete.store import sources as source_store
-state.migrate()
+foundation.migrate()
 root = Path(os.environ["IDENT_ROOT"])
 cfg = config.load()
 server = serve.Server()
@@ -39,7 +40,7 @@ def poll(loop, index=0):
     return {"ran": bool(returned), "keys": [e["key"] for e in events], "titles": [e["title"] for e in events],
             "lines": buffer.getvalue().splitlines()}
 def sql(query, *args):
-    with state.db() as c:
+    with foundation.db() as c:
         return [tuple(r) for r in c.execute(query, args)]
 def seen(sid):
     return sorted(r[0] for r in sql("SELECT key FROM seen WHERE source = ?", sid))
@@ -188,8 +189,8 @@ source_store.set_cursor("legacy#9", None, True, "x")
 sql("UPDATE cursors SET last_ok = NULL, polled = '2026-01-01T00:00:00Z' WHERE source = 'legacy#9'")
 source_store.set_cursor("legacy#9", None, False, "boom")
 kept = source_store.cursor("legacy#9")["last_ok"]
-state.migrate()
-state.ensure_schema()
+foundation.migrate()
+foundation.ensure_schema()
 out["legacy"] = {"poll": legacy, "owner": source_store.source_owner("legacy#0"), "kept": kept, "seen": seen("legacy#0"),
                  "queued": queued("legacy"), "old_owner": old_owner}
 

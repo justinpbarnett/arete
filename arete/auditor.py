@@ -9,8 +9,9 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Literal
 
-from . import alerts, config, doctor, paths, state, tool_events, tracker, util
+from . import alerts, config, doctor, paths, tool_events, tracker, util
 from .heartbeat import mark_loop
+from .store import approvals as approvals_store
 from .store import incidents as incident_store
 from .store import runs as run_store
 
@@ -249,7 +250,7 @@ def run_stats() -> list[str]:
     for kind in sorted({k for k, _ in by}):
         parts = ", ".join(f"{n} {s}" for (k, s), n in sorted(by.items()) if k == kind)
         lines.append(f"- {kind}: {parts}")
-    props = Counter(p["status"] for p in state.proposals(limit=500))
+    props = Counter(p["status"] for p in approvals_store.proposals(limit=500))
     if props:
         lines.append("- miner proposals all time: " + ", ".join(f"{n} {s}" for s, n in props.most_common()))
     for r in rs:

@@ -5,8 +5,9 @@ import secrets
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from . import config, delivery, outbound, prompt_loader, push, runner, state, util
+from . import config, delivery, outbound, prompt_loader, push, runner, util
 from .agent import READ_TOOLS
+from .store import approvals as approvals_store
 
 DECISIONS = ("approve", "reject")
 CONFIDENCES = ("high", "medium", "low")
@@ -80,7 +81,7 @@ def why_kept(approval: dict, diff: str) -> str:
 def settle(approval: dict, found: Review, kept: str) -> str:
     sure = found.sure_approve()
     noted = Review(**{**asdict(found), "kept": kept if sure else ""})
-    if not state.set_approval_note(approval["id"], "review", json.dumps(asdict(noted)), while_in=STILL_PENDING):
+    if not approvals_store.set_approval_note(approval["id"], "review", json.dumps(asdict(noted)), while_in=STILL_PENDING):
         return f"{found.said()}, but a person decided it first"
     if not sure:
         return f"{found.said()}, so it waits for you"

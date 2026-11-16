@@ -1,8 +1,9 @@
 
 import json, os, sys
 from unittest import mock
-from arete import serve, state
-state.migrate()
+from arete import serve
+from arete.store import db as foundation
+foundation.migrate()
 os.chdir(sys.argv[1])
 server = serve.Server()
 server.code, server.code_seen = frozenset(), serve.code_stamp()

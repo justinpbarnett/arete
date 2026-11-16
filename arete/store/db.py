@@ -412,6 +412,10 @@ def quick_check(conn):
     return [r[0] for r in conn.execute("PRAGMA quick_check")]
 
 
+def restore_epoch(conn):
+    return int(conn.execute("SELECT value FROM schema_meta WHERE key = 'restore_epoch'").fetchone()[0])
+
+
 def inspect_database(path, check=True):
     conn = connect_db(path, readonly=True)
     try:

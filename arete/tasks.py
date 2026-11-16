@@ -24,7 +24,6 @@ from . import (
     runlimits,
     runner,
     slots,
-    state,
     tracker,
     util,
     vault,
@@ -35,6 +34,7 @@ from .store import asks as ask_store
 from .store import db as foundation
 from .store import runs as run_store
 from .store import sources as source_store
+from .store import tasks as task_store
 
 TITLE_CHARS = 80
 START_LOCK = "task-start"
@@ -79,7 +79,7 @@ def start(repo_name: str, prompt: str = "", title: str = "", kind: str = "", tic
         raise control.Refused(f"The kind is {' or '.join(config.KINDS)}, not '{kind}'.")
     if ticket:
         return start_ticket(cfg, repo, ticket, force)
-    tid = state.task_add(repo.name, prompt, title.strip() or title_of(prompt), kind or "feat")
+    tid = task_store.task_add(repo.name, prompt, title.strip() or title_of(prompt), kind or "feat")
     if waits := tracker.LocalTracker(repo).blocker(tid):
         return answer(tid, repo.name, "", "queued", f"{waits}; " + ("the poller starts it once the wait ends"
                                                                     if repo.pipeline else "send its ticket to start it"))
@@ -92,7 +92,7 @@ def start_ticket(cfg: config.Config, repo: config.Repo, ticket: str, force: bool
     except ValueError as e:
         raise control.Refused(f"{repo.name}: {e}") from None
     if tracker.is_task_id(tid):
-        if (row := state.task_get(tid)) is None:
+        if (row := task_store.task_get(tid)) is None:
             raise control.NotFound(f"no task {tid}")
         if row["repo"] != repo.name:
             raise control.Refused(f"{tid} is a task of {row['repo']}, not {repo.name}")
@@ -225,7 +225,7 @@ def reply(run_id: str, text: str) -> dict:
             raise control.Refused(f"run {run_id} is {row['status']}, so it has no question to answer")
         no_later_run(row)
         tid = str(row["issue"])
-        if waiting := state.asks_of(run_id, "open"):
+        if waiting := ask_store.asks_of(run_id, "open"):
             return reply_to_asks(cfg, repo, row, waiting, text)
         free_to_start(cfg, repo, tid, "; the answer was not stored")
         kept = store_answer(cfg, repo, tid, text)
@@ -237,7 +237,7 @@ def reply(run_id: str, text: str) -> dict:
 
 def store_answer(cfg: config.Config, repo: config.Repo, tid: str, text: str) -> str:
     if tracker.is_task_id(tid):
-        if not state.task_comment(tid, "owner", text):
+        if not task_store.task_comment(tid, "owner", text):
             raise control.NotFound(f"no task {tid}")
         return ""
     tk = tracker.for_ticket(cfg, repo, tid)
@@ -264,12 +264,12 @@ def reply_to_asks(cfg: config.Config, repo: config.Repo, row: dict, waiting: lis
 
 def asks_view() -> dict:
     keys = ("id", "repo", "ticket", "run", "step", "asked", "why", "tried", "questions", "reminded")
-    return {"asks": [{k: a[k] for k in keys} for a in state.open_asks(connect=foundation.reader)]}
+    return {"asks": [{k: a[k] for k in keys} for a in ask_store.open_asks(connect=foundation.reader)]}
 
 
 def answer_ask(ask_id: str, body) -> dict:
     with util.lock(STEER_LOCK, wait=True):
-        ask = state.ask_get(ask_id)
+        ask = ask_store.ask_get(ask_id)
         if not ask:
             raise control.NotFound(f"no ask {ask_id}")
         if ask["status"] != "open":
@@ -301,7 +301,7 @@ def answer_ask(ask_id: str, body) -> dict:
             raise control.Refused(f"could not store {', '.join(given)} ({e.strerror}); the ask stays open") from None
         if not ask_store.ask_close(ask_id, "answered", answers):
             raise control.Refused(f"ask {ask_id} was answered from the tracker a moment ago, so this answer was not stored")
-        if more := state.asks_of(row["id"], "open"):
+        if more := ask_store.asks_of(row["id"], "open"):
             return answer(tid, repo.name, "", "waiting",
                           f"{util.count(len(more), 'more ask')} of run {row['id']} wait for an answer")
         return continue_asked(cfg, repo, row, command)
@@ -321,7 +321,7 @@ def answers_held(ask: dict) -> str:
     held = f"; its answers are stored for run {run_id}"
     if still_running(holder):
         return f"{held}, which is starting with them"
-    if more := len(state.asks_of(run_id, "open")):
+    if more := len(ask_store.asks_of(run_id, "open")):
         waiting = f"{util.count(more, 'other ask')} {'is' if more == 1 else 'are'}"
         return f"{held}, which goes on with them when its {waiting} answered"
     if holder["status"] in (*RESUMABLE, "running") or parked_with_answers(holder):
@@ -370,7 +370,7 @@ def let_go(cfg: config.Config, repo: config.Repo, row: dict, status: str) -> dic
             raise control.Refused(f"run {run_id} is no longer waiting for an answer, so it was not stopped")
         if status == "closed" and not record.move(run_id, "stopped", expect=("needs-info",), summary=TICKET_CLOSED):
             raise control.Refused(f"run {run_id} is no longer waiting for an answer, so it was not stopped")
-        state.asks_retire(run_id, "stopped" if status == "closed" else status)
+        ask_store.asks_retire(run_id, "stopped" if status == "closed" else status)
         latest = not run_store.later_run(repo.name, tid, run_id)
         removed = latest and kept_folder_removed(repo, tid, run_id)
         folder = "its work folder is removed" if removed else "its work folder was left in place"
@@ -392,16 +392,16 @@ def let_go(cfg: config.Config, repo: config.Repo, row: dict, status: str) -> dic
 def expire_asks(cfg: config.Config) -> list[str]:
     cutoff = util.iso(util.now() - timedelta(days=cfg.ask.expire_days))
     notes = []
-    for run_id in dict.fromkeys(a["run"] for a in state.asks_asked_before(cutoff)):
+    for run_id in dict.fromkeys(a["run"] for a in ask_store.asks_asked_before(cutoff)):
         with util.lock(STEER_LOCK, wait=True):
-            if not state.asks_of(run_id, "open"):
+            if not ask_store.asks_of(run_id, "open"):
                 continue
             try:
                 _, repo, row = run_of(run_id)
             except (control.NotFound, control.Refused):
                 row = None
             if row is None or row["status"] != "needs-info" or run_store.later_run(row["repo"], row["issue"], run_id):
-                state.asks_retire(run_id, "expired")
+                ask_store.asks_retire(run_id, "expired")
                 notes.append(f"asks of run {run_id} expired; the run is not the ticket's latest")
                 continue
             if live_run(repo.name, str(row["issue"])):
@@ -415,7 +415,7 @@ def expire_asks(cfg: config.Config) -> list[str]:
 
 def release_closed(cfg: config.Config) -> list[str]:
     notes = []
-    for run_id in dict.fromkeys(a["run"] for a in state.open_asks()):
+    for run_id in dict.fromkeys(a["run"] for a in ask_store.open_asks()):
         try:
             _, repo, row = run_of(run_id)
         except (control.NotFound, control.Refused):
@@ -427,7 +427,7 @@ def release_closed(cfg: config.Config) -> list[str]:
             continue
         with util.lock(STEER_LOCK, wait=True):
             row = run_store.run_get(run_id) or row
-            if (not state.asks_of(run_id, "open") or row["status"] != "needs-info"
+            if (not ask_store.asks_of(run_id, "open") or row["status"] != "needs-info"
                     or run_store.later_run(repo.name, row["issue"], run_id) or live_run(repo.name, tid)):
                 continue
             try:
@@ -540,15 +540,15 @@ def view(task_id: str, repo_name: str = "") -> dict:
     tid = task_id.strip()
     if tracker.is_task_id(tid):
         tid = tid.lower()
-        if (row := state.task_get(tid, connect=foundation.reader)) is None:
+        if (row := task_store.task_get(tid, connect=foundation.reader)) is None:
             raise control.NotFound(f"no task {tid}")
-        item, repo, refs = {**row, "comments": state.task_comments(tid, connect=foundation.reader)}, row["repo"], [tid]
+        item, repo, refs = {**row, "comments": task_store.task_comments(tid, connect=foundation.reader)}, row["repo"], [tid]
     else:
         item, repo = tracker_item(config.load(), tid, repo_name.strip())
         refs = [item["id"], item["ref"]]
     runs = run_store.ticket_runs(repo, item["id"], limit=50, connect=foundation.reader)
     paid = run_store.paid_by_run([r["id"] for r in runs], connect=foundation.reader)
-    children = {c["id"]: c for ref in dict.fromkeys(refs) for c in state.task_children(ref, connect=foundation.reader)}
+    children = {c["id"]: c for ref in dict.fromkeys(refs) for c in task_store.task_children(ref, connect=foundation.reader)}
     return {**item,
             "runs": [{"id": r["id"], "status": r["status"], "started": r["started"], "finished": r["finished"],
                       "prs": (r["pr_url"] or "").split(), "cost_usd": paid.get(r["id"], 0.0),

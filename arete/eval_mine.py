@@ -7,7 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import config, gh, paths, prompt_loader, record, state, tracker, util, verify, workspace
+from . import config, gh, paths, prompt_loader, record, tracker, util, verify, workspace
 from .agent import READ_TOOLS
 from .evals import (
     EVALS,
@@ -25,6 +25,7 @@ from .pipeline import (
     MAX_DIFF_IN_PROMPT,
     commit_layer,
 )
+from .store import approvals as approvals_store
 from .store import runs as run_store
 from .util import git
 
@@ -94,7 +95,7 @@ class Draft:
 
 
 def accepted_unchanged(repo_name: str, task) -> bool:
-    row = state.mined_row(task.source) if task.source else {}
+    row = approvals_store.mined_row(task.source) if task.source else {}
     if row.get("status") != "accepted" or row.get("repo") != repo_name or not row.get("run_id"):
         return False
     for saved in (paths.RUNS_DIR / row["run_id"]).glob(f"*/{TASK_FILE}"):
@@ -129,7 +130,7 @@ def unminable(repo: config.Repo, layer: config.RepoLayer) -> str:
 
 def find(cfg: config.Config, repo_name: str) -> tuple[list[Candidate], list[str]]:
     repos = [cfg.repo(repo_name)] if repo_name else [r for r in cfg.repos if r.pipeline]
-    done = state.mined_urls()
+    done = approvals_store.mined_urls()
     found, skips = [], []
     for repo in repos:
         layer = config.load_layer(repo.layer_dir)
@@ -321,7 +322,7 @@ def run(repo_name: str, limit: int, dry_run: bool = False) -> int:
                 except Exception as e:
                     o = Outcome("crashed", f"{type(e).__name__}: {util.first_line(str(e), 300)}; the next mine retries it")
                 else:
-                    state.add_mined(c.pr_url, c.repo.name, str(c.run["issue"]), run_id, o.status, o.why, o.task)
+                    approvals_store.add_mined(c.pr_url, c.repo.name, str(c.run["issue"]), run_id, o.status, o.why, o.task)
                 job.log(f"{o.status}: {o.task or o.why}")
                 tally[o.status] = tally.get(o.status, 0) + 1
             summary = f"mined {util.count(len(picked), 'merged PR')}: " + ", ".join(f"{n} {s}" for s, n in tally.items())

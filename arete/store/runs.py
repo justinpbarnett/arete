@@ -465,3 +465,22 @@ def forget_purge(run_id: str) -> None:
 def mined_until() -> str | None:
     with reader() as c:
         return c.execute("SELECT MAX(mined_until) FROM runs WHERE kind = 'miner'").fetchone()[0]
+
+
+def orphan_rows(c, table, limit):
+    if table not in ("steps", "feed"):
+        raise ValueError(table)
+    extra = " AND t.run_id <> 'chat'" if table == "steps" else ""
+    query = (f"FROM {table} t LEFT JOIN runs ON runs.id = t.run_id "
+             f"WHERE t.run_id IS NOT NULL AND t.run_id <> '' AND runs.id IS NULL{extra}")
+    count = c.execute(f"SELECT COUNT(*) {query}").fetchone()[0]
+    rows = c.execute(f"SELECT t.rowid, t.run_id {query} ORDER BY t.rowid LIMIT ?", (limit,)).fetchall() if limit else []
+    return count, rows
+
+
+def pseudo_chat_steps(c, run_id):
+    return c.execute("SELECT id FROM steps WHERE run_id = ? ORDER BY id", (run_id,)).fetchall()
+
+
+def folder_rows(c):
+    return c.execute("SELECT id, kind, started, log, files_purged FROM runs ORDER BY id").fetchall()

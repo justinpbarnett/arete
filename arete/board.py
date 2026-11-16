@@ -19,17 +19,20 @@ from . import (
     refusals,
     sessions,
     slots,
-    state,
     tracker,
     triage,
     util,
     workspace,
 )
 from .alerts import issue_link, opened_in
+from .store import approvals as approvals_store
 from .store import db as foundation
+from .store import devices as devices_store
 from .store import incidents as incident_store
+from .store import insights as insights_store
 from .store import loops as loop_store
 from .store import runs as run_store
+from .store import triage as triage_store
 
 RECENT_RUNS = 25
 TREND_DAYS = 30
@@ -141,7 +144,7 @@ def skipped(running: list[dict]) -> list[dict]:
 def waiting() -> dict:
     return {
         "tickets": [{"ticket": tracker.run_ticket_name(w), "comments": w["n"], "at_once": bool(w["at_once"]),
-                     "submitted": w["submitted"], "last": w["last"]} for w in state.feedback_waiting(connect=foundation.reader)],
+                     "submitted": w["submitted"], "last": w["last"]} for w in insights_store.feedback_waiting(connect=foundation.reader)],
         "quiet_minutes": pipeline.FEEDBACK_QUIET_MINUTES,
     }
 
@@ -165,7 +168,7 @@ def alerts() -> dict:
     return {
         "alerts": [{**a, "repo": opened_in(a, alert_repo), "url": issue_link(a, alert_repo)}
                    for a in incident_store.alerts(connect=foundation.reader)],
-        "probes": state.probes(connect=foundation.reader),
+        "probes": devices_store.probes(connect=foundation.reader),
     }
 
 
@@ -208,7 +211,7 @@ def send_form(r: dict, src: triage.TriageSource | None) -> dict | None:
 
 def proposals() -> dict:
     return {kind: [{k: p[k] for k in ("id", "repo", "file", "change", "status")}
-                   for p in state.proposals(status=statuses, limit=PROPOSALS_SHOWN, connect=foundation.reader)]
+                   for p in approvals_store.proposals(status=statuses, limit=PROPOSALS_SHOWN, connect=foundation.reader)]
             for kind, statuses in (("memory", ["memory"]), ("hand", ["hand"]), ("approve", ["approve", "filing"]))}
 
 
@@ -404,8 +407,8 @@ def outcomes() -> dict:
 
 
 def decisions(since: str) -> dict:
-    pushes = Counter(push_decision(v) for v in state.verdicts_since(since, connect=foundation.reader) if v["kind"] == "push")
-    sent = Counter(a["sent_by"] for a in state.triage_approvals(since, connect=foundation.reader))
+    pushes = Counter(push_decision(v) for v in insights_store.verdicts_since(since, connect=foundation.reader) if v["kind"] == "push")
+    sent = Counter(a["sent_by"] for a in triage_store.triage_approvals(since, connect=foundation.reader))
     return {"pushes": {k: pushes[k] for k in ("auto", "approved", "rejected", "waiting", "other")},
             "tickets": {"triage": sent["triage"], "owner": sent["owner"]}}
 
@@ -420,7 +423,7 @@ def push_decision(v: dict) -> str:
 
 def usage_board(days: int = USAGE_DAYS) -> dict:
     days = max(1, min(days, KEEP_USAGE_DAYS))
-    rows = state.usage_since(util.iso(util.now() - timedelta(days=days)), connect=foundation.reader)
+    rows = insights_store.usage_since(util.iso(util.now() - timedelta(days=days)), connect=foundation.reader)
     visits = whole_visits([r for r in rows if r["kind"] == "visit"])
     by_view: dict[str, list[dict]] = defaultdict(list)
     for v in visits:
@@ -467,7 +470,7 @@ def trend_figures() -> dict:
     days = [(first_day + timedelta(days=n)).isoformat() for n in range(TREND_DAYS)]
     since = util.iso(datetime.combine(first_day, time.min).astimezone().astimezone(UTC))
     runs = run_store.runs_since(since, connect=foundation.reader)
-    evals = state.evals_since(since, connect=foundation.reader)
+    evals = insights_store.evals_since(since, connect=foundation.reader)
 
     spend = control.paid_since(since, foundation.reader)
     paid_on = {d["name"]: d["cost_usd"] for d in spend["by_day"]}
@@ -483,7 +486,7 @@ def trend_figures() -> dict:
 
     eval_repos: dict[str, list[dict]] = defaultdict(list)
     for e in evals:
-        if e["source"] == state.BASELINE_SOURCE:
+        if e["source"] == insights_store.BASELINE_SOURCE:
             eval_repos[e["repo"]].append(e)
     return {
         "since": since,

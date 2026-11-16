@@ -35,7 +35,6 @@ from . import (
     scaffold,
     sessions,
     settings,
-    state,
     tailnet,
     tasks,
     triage,
@@ -44,7 +43,9 @@ from . import (
     webpush,
 )
 from .refusals import Stated as Refusal
+from .store import approvals as approvals_store
 from .store import db as foundation
+from .store import insights as insights_store
 from .store import runs as run_store
 
 WEB_DIR = paths.PACKAGE_DIR / "web"
@@ -505,20 +506,20 @@ def research_ticket(ref: str, force: bool) -> dict:
 
 
 def forget_proposal(proposal_id: int) -> dict:
-    if not state.forget_proposal(proposal_id):
+    if not approvals_store.forget_proposal(proposal_id):
         raise control.NotFound(f"#{proposal_id} is not an open memory fact or harness fix")
     return {"id": proposal_id}
 
 
 def approve_rule(proposal_id: int) -> dict:
-    if (state.proposal(proposal_id, connect=foundation.reader) or {}).get("status") not in ("approve", "filing"):
+    if (approvals_store.proposal(proposal_id, connect=foundation.reader) or {}).get("status") not in ("approve", "filing"):
         raise control.NotFound(f"#{proposal_id} is not a rule waiting for approval")
     control.detach(["file-rule", str(proposal_id)])
     return {"id": proposal_id}
 
 
 def reject_rule(proposal_id: int) -> dict:
-    if not state.move_proposal(proposal_id, ("approve",), "rejected"):
+    if not approvals_store.move_proposal(proposal_id, ("approve",), "rejected"):
         raise control.NotFound(f"#{proposal_id} is not a rule waiting for approval")
     return {"id": proposal_id}
 
@@ -659,7 +660,7 @@ def get_sessions(handler, rest, query):
 
 
 def post_usage(handler, rest, query):
-    state.add_usage(handler.usage_row(), board.KEEP_USAGE_DAYS)
+    insights_store.add_usage(handler.usage_row(), board.KEEP_USAGE_DAYS)
     return {}
 
 

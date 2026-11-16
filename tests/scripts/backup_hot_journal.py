@@ -1,9 +1,9 @@
 
 seed()
-with state.db() as c:
+with foundation.db() as c:
     c.executemany("INSERT INTO feed (run_id, ts, kind, text) VALUES ('bulk', ?, 'note', 'original')", [(ago(0),)] * 20000)
 snap = backup.snapshot("hand")
-with state.db() as c:
+with foundation.db() as c:
     c.execute("INSERT INTO runs (id, kind, status, started, pid) VALUES ('live', 'pipeline', 'running', ?, ?)", (ago(0), os.getpid()))
 CHILD = """
 import os, sqlite3, sys
@@ -17,7 +17,7 @@ journal = Path(str(paths.DB_FILE) + "-journal")
 out["hot"] = journal.exists()
 with dead():
     out["refused"] = run_cli("backup", "--restore", str(snap))[0]
-with state.db() as c:
+with foundation.db() as c:
     c.execute("DELETE FROM runs WHERE id = 'live'")
 with dead():
     out["rc"] = run_cli("backup", "--restore", str(snap))[0]

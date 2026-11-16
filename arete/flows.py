@@ -21,7 +21,6 @@ from . import (
     run_lines,
     runner,
     slots,
-    state,
     tracker,
     util,
     workspace,
@@ -29,7 +28,9 @@ from . import (
 from .agent import NO_SESSION, Result
 from .factory import Outcome
 from .review import Review
+from .store import asks as asks_store
 from .store import runs as run_store
+from .store import triage as triage_store
 from .verify import Verified
 
 TICKET_FIELDS = ("id", "ref", "title", "body", "comments", "kind", "url", "labels")
@@ -66,7 +67,7 @@ def start(cfg: config.Config, run: pipeline.Run, earlier: dict, slot: slots.RunS
     continues = continues or (earlier["id"] if earlier.get("status") == "interrupted" and ran_on_seam(earlier["id"])
                               else "")
     if continues and not only:
-        run.answers_due = state.asks_due(sorted(factory.chain_runs(continues)))
+        run.answers_due = asks_store.asks_due(sorted(factory.chain_runs(continues)))
     job = Job(cfg, run, ws, slot=slot, continues=continues, only=only)
     refusal = guard(job, continues) if continues else ""
     renew = ""
@@ -619,7 +620,7 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
     if why := pipeline.furnish(cfg, run, layer, job.ws):
         return end_as("fail", "failed", why=why)
     workspace.note_made(job.ws, checkouts, pipeline.workspace_owner(run, job.ws, checkouts))
-    approval = state.triage_approval(run.triage_key)
+    approval = triage_store.triage_approval(run.triage_key)
     return Outcome("pass", data={
         "ticket": {k: getattr(t, k) for k in TICKET_FIELDS}, "branch": branch,
         "checkouts": [c.to_row() for c in checkouts],

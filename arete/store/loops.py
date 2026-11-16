@@ -188,3 +188,9 @@ def loop_lock(name: str) -> str:
 def prune(c, days: float = 14) -> None:
     c.execute("DELETE FROM queue WHERE dead_at < ?", (util.iso(util.now() - timedelta(days=days * 4)),))
     c.execute("DELETE FROM events WHERE ts < ?", (util.iso(util.now() - timedelta(days=days * 4)),))
+
+
+def settled_claims(c):
+    return c.execute("SELECT q.id FROM queue q LEFT JOIN runs ON runs.id = q.run_id "
+                     "WHERE q.run_id IS NOT NULL AND q.run_id <> '' AND q.dead_at IS NULL "
+                     "AND (runs.id IS NULL OR runs.status <> 'running') ORDER BY q.id").fetchall()

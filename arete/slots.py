@@ -6,7 +6,8 @@ from contextlib import AbstractContextManager, ExitStack, nullcontext
 from dataclasses import dataclass
 from typing import TextIO
 
-from . import config, paths, record, refusals, state, util
+from . import config, paths, record, refusals, util
+from .store import chats as chats_store
 from .store import runs as run_store
 
 SLOTS_LOCK = "run-slots"
@@ -21,7 +22,7 @@ def holding(rows: list[dict], lock_kind: str, kinds: tuple[str, ...] = ("pipelin
 
 
 def chat_sessions_going(running: list[dict]) -> list[dict]:
-    linked = {link["run_id"] for link in state.chat_sessions()}
+    linked = {link["run_id"] for link in chats_store.chat_sessions()}
     return [r for r in running if r["kind"] == "session" and r["id"] in linked
             and ((util.now() - util.parse_iso(r["started"])).total_seconds() < record.SETTLE_GRACE_SECONDS
                  or (r["lock"] and util.lock_is_held(r["lock"])))]

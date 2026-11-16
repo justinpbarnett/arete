@@ -9,7 +9,7 @@ link = repo.path / "AGENTS.md"
 link.symlink_to("CLAUDE.md")
 def context():
     code, out = call("word-train")
-    row = state.eval_rows(latest())[0]
+    row = insights_store.eval_rows(latest())[0]
     assert row["passed"], (row, out)
     return row["context_sha"]
 digests = [context()]
@@ -63,11 +63,11 @@ assert result.base_commit and result.context_sha == result.settings == "", resul
 assert "setup" in result.why, result
 (repo.layer / "evals/no-check.toml").write_text('title = "No check"\nprompt = "Nothing"\n')
 code, out = call("no-check")
-row = state.eval_rows(latest())[0]
+row = insights_store.eval_rows(latest())[0]
 assert not row["passed"] and [row[k] for k in ("base_commit", "context_sha", "settings")] == ["", "", ""]
-before = state.eval_history(repo.name)
+before = insights_store.eval_history(repo.name)
 (folder / "build.md").unlink()
 code, out = call("word-train", prompts=p)
 assert code == 1 and "build.md" in out and "all need a prompt" in out, out
-assert state.eval_history(repo.name) == before
+assert insights_store.eval_history(repo.name) == before
 print("BEHAVIOR_RESULT=" + json.dumps({"contexts": len(set(digests))}))

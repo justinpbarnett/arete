@@ -37,7 +37,7 @@ def caller():
     try:
         while frame:
             module = frame.f_globals.get("__name__", "")
-            if module not in (__name__, "arete.state", "contextlib") and not module.startswith("arete.store."):
+            if module not in (__name__, "contextlib") and not module.startswith("arete.store."):
                 return f"{module}.{frame.f_code.co_name}"
             frame = frame.f_back
     finally:

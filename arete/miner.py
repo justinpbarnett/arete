@@ -21,14 +21,16 @@ from . import (
     record,
     runlimits,
     runner,
-    state,
     tool_events,
     util,
     workspace,
 )
 from .agent import EDIT_TOOLS, READ_TOOLS
 from .heartbeat import mark_loop
+from .store import approvals as approvals_store
+from .store import insights as insights_store
 from .store import runs as run_store
+from .store import runs as runs_store
 from .util import git
 
 MAX_PROPOSALS = 8
@@ -428,7 +430,7 @@ def render_feedback(rows: list[dict], limit: int = 8000) -> str:
 
 
 def sync_feedback() -> None:
-    for p in state.proposals(status=["applied"]):
+    for p in approvals_store.proposals(status=["applied"]):
         if not p.get("pr_url"):
             continue
         try:
@@ -436,9 +438,9 @@ def sync_feedback() -> None:
         except gh.GhError:
             continue
         if pr.get("mergedAt"):
-            state.set_proposal_status_by_pr(p["pr_url"], "merged")
+            approvals_store.set_proposal_status_by_pr(p["pr_url"], "merged")
         elif pr.get("state") == "CLOSED":
-            state.set_proposal_status_by_pr(p["pr_url"], "rejected")
+            approvals_store.set_proposal_status_by_pr(p["pr_url"], "rejected")
 
 
 def _fmt(props: list[dict]) -> str:
@@ -596,17 +598,17 @@ def awaits_approval(cfg: config.Config, p: dict) -> bool:
 
 def file_rule(proposal_id: int) -> str:
     with util.lock(RULE_LOCK, wait=True):
-        p = state.proposal(proposal_id)
-        if not p or not state.move_proposal(proposal_id, ("approve", "filing"), "filing"):
+        p = approvals_store.proposal(proposal_id)
+        if not p or not approvals_store.move_proposal(proposal_id, ("approve", "filing"), "filing"):
             raise LookupError(f"#{proposal_id} is not a rule waiting for approval")
         cfg = config.load()
         repo = cfg.repo(p["repo"])
         try:
             base = push_rule(cfg, repo, p)
         except Exception:
-            state.move_proposal(proposal_id, ("filing",), "approve")
+            approvals_store.move_proposal(proposal_id, ("filing",), "approve")
             raise
-        state.move_proposal(proposal_id, ("filing",), "merged")
+        approvals_store.move_proposal(proposal_id, ("filing",), "merged")
         return catch_up(repo, base)
 
 
@@ -715,7 +717,7 @@ def window(cfg: config.Config, hours: float | None, now: datetime) -> tuple[date
         until = now + timedelta(seconds=1)
         return until - timedelta(hours=hours), until, False, ""
     until = now - SETTLE_LAG
-    if marked := state.mined_until():
+    if marked := runs_store.mined_until():
         since = util.parse_iso(marked)
     elif legacy := [r for r in run_store.runs(kind="miner", statuses=("pr", "noop"), limit=50)
                     if r["trigger"] not in (WINDOW_TRIGGER, HOURS_TRIGGER)]:
@@ -759,15 +761,15 @@ def _run(cfg: config.Config, run_id: str, since: datetime, until: datetime, chec
           f"{recorded_used} in digest, {len(digest) + len(records)} chars")
     records = records or f"(no recorded run since {since_iso} failed, needed a retry, hit a budget or ran long)"
     audit_wants_fixes = not auditor.latest_findings().startswith("(")
-    pr_feedback = state.feedback_between(since_iso, until_iso)
+    pr_feedback = insights_store.feedback_between(since_iso, until_iso)
     mine_repos = [r for r in cfg.repos if r.mine and r.path.is_dir()]
     repos ="\n".join(f"- {r.name}: {r.path} {'(public)' if r.public else ''}" for r in mine_repos)
     text = prompt_loader.prompt(
         "mine", hours=f"{hours:g}", global_repo=cfg.global_repo, arete_repo=cfg.arete_repo,
         arete_prompts=minable_prompts(), repos=repos, max=MAX_PROPOSALS,
-        pending=_fmt(state.proposals(status=["applied", "pending", "hand", "approve", "filing"])),
-        done=_fmt(state.proposals(status=["memory", "filed", "merged"])),
-        rejected=_fmt(state.proposals(status=["rejected", "skipped"])),
+        pending=_fmt(approvals_store.proposals(status=["applied", "pending", "hand", "approve", "filing"])),
+        done=_fmt(approvals_store.proposals(status=["memory", "filed", "merged"])),
+        rejected=_fmt(approvals_store.proposals(status=["rejected", "skipped"])),
         events=render_events(cfg, since, until), digest=digest, audit=auditor.latest_findings(),
         feedback=render_feedback(pr_feedback), records=records, since=since_iso,
     )
@@ -800,7 +802,7 @@ def _run(cfg: config.Config, run_id: str, since: datetime, until: datetime, chec
         if status == "pending" and apply:
             by_repo[p["repo"]].append(p)
         else:
-            state.add_proposal(run_id, p, status)
+            approvals_store.add_proposal(run_id, p, status)
     if dry_run:
         print(f"miner: dry run, {len(props)} proposals, {util.paid_note(res.paid_usd)}")
         return 0
@@ -815,9 +817,9 @@ def _run(cfg: config.Config, run_id: str, since: datetime, until: datetime, chec
             print(failures[-1])
         for p in ps:
             if p in landed:
-                state.add_proposal(run_id, p, "applied", url)
+                approvals_store.add_proposal(run_id, p, "applied", url)
             else:
-                state.add_proposal(run_id, p, "skipped")
+                approvals_store.add_proposal(run_id, p, "skipped")
         if url:
             opened.append(url)
             print(f"{name}: {url}")

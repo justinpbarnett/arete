@@ -17,6 +17,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from arete.store import asks as asks_store
+from arete.store import db as foundation
+from arete.store import runs as runs_store
+from arete.store import tasks as tasks_store
 from arete.store import runs as run_store
 from arete import slots, workspace, prompt_loader
 
@@ -118,10 +122,9 @@ def forbidden(*args, **kwargs):
 
 
 def main(root, scenario):
-    from arete.store import runs as run_store
     from arete import (accounts, alerts, owner_asks, codebase, config, control, environment, factory, flows, gh, run_lines,
-                       paths, pipeline, record, replay, runlimits, runner, scrub, state, tasks, vault)
-    state.migrate()
+                       paths, pipeline, record, replay, runlimits, runner, scrub, tasks, vault)
+    foundation.migrate()
     scratch = sandbox = None
     if importlib.util.find_spec("arete.scratch"):
         from arete import sandbox, scratch
@@ -129,7 +132,8 @@ def main(root, scenario):
                          codebase=codebase, config=config, control=control, environment=environment,
                          factory=factory, flows=flows, gh=gh, run_lines=run_lines, paths=paths, pipeline=pipeline,
                          record=record, replay=replay, runlimits=runlimits, runner=runner, sandbox=sandbox,
-                         scratch=scratch, scrub=scrub, state=state, tasks=tasks, vault=vault)
+                         scratch=scratch, scrub=scrub, foundation=foundation, asks_store=asks_store,
+                         runs_store=runs_store, tasks_store=tasks_store, tasks=tasks, vault=vault)
     prohibit_transports(fx)
     redirect_authority(fx)
     create_foreign_record(fx)
@@ -336,7 +340,7 @@ def blocked_check_replay(fx):
 
 def create_task(fx):
     fx.cfg = fx.config.load()
-    fx.task = fx.state.task_add("replay-sample", "Add kumquat to the fixture notes", "Add kumquat", "feat")
+    fx.task = fx.tasks_store.task_add("replay-sample", "Add kumquat to the fixture notes", "Add kumquat", "feat")
     if fx.scenario == "edited-after-held-pr":
         add_held_pr_history(fx)
     if fx.scenario in REFACTOR:
@@ -352,7 +356,7 @@ def add_held_pr_history(fx):
         fx.run_lines.write(old, "step_start", step="implement", call=f"review_fix{n}", atom="review_repair", **{"try": n})
     fx.record.settle(old, "pr")
     run_store.note(old, repair_calls=3)
-    with fx.state.db() as connection:
+    with fx.foundation.db() as connection:
         set_task_body(fx.task, "Add kumquat to the fixture notes\n\n## Follow up\nAlso list it first.", connection=connection)
     fx.old = old
 
@@ -423,7 +427,7 @@ def commit_in_src(fx, name, message, ref):
 
 
 def edit_spec(fx, text):
-    with fx.state.db() as c:
+    with fx.foundation.db() as c:
         set_task_body(fx.task, text, connection=c)
 
 
@@ -461,7 +465,7 @@ def fail_first_run(fx):
 
 
 def kill_at_verify(fx):
-    pipeline, runner, record, state, runlimits, ws = fx.pipeline, fx.runner, fx.record, fx.state, fx.runlimits, fx.ws
+    pipeline, runner, record, runlimits, ws = fx.pipeline, fx.runner, fx.record, fx.runlimits, fx.ws
     mock.patch.object(runlimits.Policy, "of", return_value=runlimits.Policy(max_run_minutes=1, max_verify_minutes=1)).start()
     ready, notify = os.pipe()
     child = os.fork()
@@ -553,7 +557,7 @@ def final_continuation(fx):
 
 
 def continuation_result(fx, row):
-    scenario, pipeline, runlimits, state, ws, failed, mid = fx.scenario, fx.pipeline, fx.runlimits, fx.state, fx.ws, fx.failed, fx.mid
+    scenario, pipeline, runlimits, ws, failed, mid = fx.scenario, fx.pipeline, fx.runlimits, fx.ws, fx.failed, fx.mid
     branch, origin, before, kept_head = fx.branch, fx.origin, fx.before, fx.kept_head
     log = (fx.paths.RUNS_DIR / row["id"] / "run.log").read_text()
     published = "refs/heads/" + branch in og(fx, "for-each-ref", "--format=%(refname)", "refs/heads")
@@ -590,17 +594,17 @@ def budget_columns(fx):
     rid = fx.failed["id"]
     saved = fx.runlimits.metadata(rid, "budget.json")
     high = fx.scenario.endswith("-high")
-    with fx.state.tx() as conn:
+    with fx.foundation.tx() as conn:
         conn.execute("UPDATE runs SET active_seconds=? WHERE id=?", (3660 if high else 10, rid))
     if not high:
         fx.pipeline.util.write_json(fx.paths.RUNS_DIR / rid / "budget.json", {**saved, "run_seconds": 3660})
-    fx.failed = fx.state.run_get(rid)
+    fx.failed = fx.runs_store.run_get(rid)
     (fx.replays / "build.patch").write_text(QUINCE)
     with mock.patch.object(fx.runlimits.Policy, "of", return_value=fx.runlimits.Policy(max_run_minutes=1)):
         row = forced(fx)
     result = continuation_result(fx, row)
     result["forced_arguments"] = ["replay-sample", fx.task, "--force"]
-    result["parent_row"] = fx.state.run_get(rid)
+    result["parent_row"] = fx.runs_store.run_get(rid)
     result["parent_budget"] = fx.runlimits.metadata(rid, "budget.json")
     result["parked"] = fx.runlimits.metadata(row["id"], "parked.json")
     result["record_page"] = fx.record.read_run(row["id"])
@@ -624,7 +628,7 @@ def budget_precedence(fx):
     fail_first_run(fx)
     rid, util = fx.failed["id"], fx.pipeline.util
     finish = util.parse_iso(fx.failed["finished"])
-    with fx.state.tx() as conn:
+    with fx.foundation.tx() as conn:
         conn.execute("UPDATE runs SET started=?, active_seconds=10, verify_seconds=3, verify_open_seconds=2, "
                      "repair_calls=1 WHERE id=?", (util.iso(finish - timedelta(hours=2)), rid))
     saved = fx.runlimits.metadata(rid, "budget.json")
@@ -653,7 +657,7 @@ def budget_precedence(fx):
         assert rid in lineage_error
     else:
         raise AssertionError("malformed lineage accepted")
-    parent = fx.state.run_get(rid)
+    parent = fx.runs_store.run_get(rid)
     span = (util.parse_iso(parent["finished"]) - util.parse_iso(parent["started"])).total_seconds()
     assert span == 7200
     return {"prior_seconds": before[0], "verify_seconds": before[1], "prior_repairs": before[2],
@@ -701,7 +705,7 @@ def park_first_run(fx):
 def resume_parked(fx, result):
     scenario, pipeline, ws, branch = fx.scenario, fx.pipeline, fx.ws, fx.branch
     if scenario == "budget-waits-admission":
-        count = len(fx.state.ticket_runs("replay-sample", fx.task))
+        count = len(fx.runs_store.ticket_runs("replay-sample", fx.task))
         calls = len(fx.prompts)
         repo = fx.config.load().repo("replay-sample")
         local = pipeline.tracker.LocalTracker(repo)
@@ -711,12 +715,12 @@ def resume_parked(fx, result):
                      "heads": fx.runlimits.heads(repo, branch), "rows_before": count, "calls_before": calls}
         with mock.patch.object(fx.runlimits.Policy, "of", return_value=policy):
             refused = forced(fx)
-        admission.update(id=refused["id"], rows_after=len(fx.state.ticket_runs("replay-sample", fx.task)),
+        admission.update(id=refused["id"], rows_after=len(fx.runs_store.ticket_runs("replay-sample", fx.task)),
                          calls_after=len(fx.prompts))
         pipeline.util.write_json(fx.root / "admission.json", admission)
         result["admission"] = admission
         assert refused["id"] == result["parked_id"]
-        assert count == len(fx.state.ticket_runs("replay-sample", fx.task))
+        assert count == len(fx.runs_store.ticket_runs("replay-sample", fx.task))
         assert len(fx.prompts) == calls
         result["unchanged_refused"] = True
     edit_spec(fx, "Add kumquat on a last line of its own, and quince")
@@ -768,7 +772,7 @@ def park_with_held_scratch(fx):
 
 def release_held_scratch(fx, result):
     root, paths, pipeline, scratch, ws = fx.root, fx.paths, fx.pipeline, fx.scratch, fx.ws
-    with fx.state.db() as c:
+    with fx.foundation.db() as c:
         set_task_body(fx.task, "Add kumquat on a last line of its own", connection=c)
     refused = forced(fx)
     result["while_held"] = refused["summary"]
@@ -809,7 +813,7 @@ def fix_ask(fx):
 
 
 def fix_ask_park(fx):
-    root, paths, pipeline, state = fx.root, fx.paths, fx.pipeline, fx.state
+    root, paths, pipeline = fx.root, fx.paths, fx.pipeline
     fx.alerts.notify = lambda title, message: None
     fx.src, fx.origin, fx.answers = root / "sample/repo", root / "sample/origin.git", root / "sample/replay"
     two_repair_tries(fx)
@@ -822,7 +826,7 @@ def fix_ask_park(fx):
     fx.ws = paths.WORKTREES_DIR / f"replay-sample-{fx.task}"
     fx.kept_head = pipeline.git(["rev-parse", "HEAD"], fx.ws).strip()
     fx.first = run_events(fx, fx.parked["id"])
-    fx.waiting = state.asks_of(fx.parked["id"], "open")
+    fx.waiting = asks_store.asks_of(fx.parked["id"], "open")
 
 
 def commit_on_main(fx, name, text, message):
@@ -845,9 +849,9 @@ def fix_ask_base(fx):
 
 
 def fix_ask_continue(fx):
-    state, runlimits = fx.state, fx.runlimits
+    runlimits = fx.runlimits
     for ask in fx.waiting:
-        state.ask_close(ask["id"], "answered", fx.owner_asks.text_answers(ask, "Main now has the fix."))
+        asks_store.ask_close(ask["id"], "answered", fx.owner_asks.text_answers(ask, "Main now has the fix."))
     (fx.answers / "fix2.json").write_text(json.dumps({"text": "Fixed.", "ok": True}))
     with mock.patch.object(runlimits.Policy, "of", return_value=runlimits.Policy(max_repair_cycles=5)):
         continue_ignoring_exit(fx, ["replay-sample", fx.task, "--force", "--continue", fx.parked["id"]])
@@ -855,7 +859,7 @@ def fix_ask_continue(fx):
 
 
 def fix_ask_result(fx, row):
-    paths, record, state, parked, first = fx.paths, fx.record, fx.state, fx.parked, fx.first
+    paths, record, parked, first = fx.paths, fx.record, fx.parked, fx.first
     events = run_events(fx, row["id"])
     marks = [json.loads(line) for line in record.raw_lines(paths.record_dir(row["id"]) / record.TIMELINE)]
     merges = [m for m in marks if m.get("kind") == "base_merge"]
@@ -871,7 +875,7 @@ def fix_ask_result(fx, row):
             "merges": [{k: m.get(k) for k in ("outcome", "error")} for m in merges], "merged_first": merged_first,
             "same_session": bool(session(first)) and session(first) == session(events),
             "answered": "Main now has the fix." in prompt, "prompt": prompt, "parked_id": parked["id"],
-            "taken": [a["taken_by"] for a in state.asks_of(parked["id"])]}
+            "taken": [a["taken_by"] for a in asks_store.asks_of(parked["id"])]}
 
 
 def fix_ask_published(fx, result):
@@ -933,7 +937,7 @@ def asked_park(fx):
     pipeline = fx.pipeline
     fx.parked = forced(fx)
     fx.ws = ws = fx.paths.WORKTREES_DIR / f"replay-sample-{fx.task}"
-    fx.waiting = fx.state.asks_of(fx.parked["id"], "open")
+    fx.waiting = fx.asks_store.asks_of(fx.parked["id"], "open")
     fx.first = run_events(fx, fx.parked["id"])
     return {"parked": fx.parked["status"], "worktree": ws.is_dir(), "open": len(fx.waiting), "notices": len(fx.notices),
             "parked_id": fx.parked["id"], "kept": pipeline.git(["log", "-1", "--format=%B"], ws).strip() if ws.is_dir() else "",
@@ -941,7 +945,7 @@ def asked_park(fx):
 
 
 def asked_answers(fx, result):
-    scenario, state, tasks, waiting = fx.scenario, fx.state, fx.tasks, fx.waiting
+    scenario, tasks, waiting = fx.scenario, fx.tasks, fx.waiting
     if scenario == "asked-moved":
         fx.src = fx.root / "sample/repo"
         fx.pipeline.git(["checkout", "-q", "main"], fx.src)
@@ -958,7 +962,7 @@ def asked_answers(fx, result):
             tasks.answer_ask(waiting[0]["id"], {"answers": [{"declined": True}]})
     else:
         for ask in waiting:
-            state.ask_close(ask["id"], "answered", fx.owner_asks.text_answers(ask, "Spelled with a K, as in kumquat-7."))
+            asks_store.ask_close(ask["id"], "answered", fx.owner_asks.text_answers(ask, "Spelled with a K, as in kumquat-7."))
 
 
 def answer_twice(fx, result):
@@ -1014,7 +1018,7 @@ def restore_replay(fx):
 
 
 def slot_wait(fx, result, continuing):
-    scenario, state, tasks, control, parked, waiting = fx.scenario, fx.state, fx.tasks, fx.control, fx.parked, fx.waiting
+    scenario, tasks, control, parked, waiting = fx.scenario, fx.tasks, fx.control, fx.parked, fx.waiting
     if scenario == "asked-stopped-waiting":
         stop_while_waiting_for_slot(fx, result, continuing)
     else:
@@ -1023,7 +1027,7 @@ def slot_wait(fx, result, continuing):
     lines_of = run_events(fx, waited["id"])
     result |= {"waited": waited["status"],
                "waited_continues": [e.get("continues") for e in lines_of if e.get("event") == "route"] == [parked["id"]],
-               "untaken": [a["taken_by"] for a in state.asks_of(parked["id"])]}
+               "untaken": [a["taken_by"] for a in asks_store.asks_of(parked["id"])]}
     if scenario != "asked-stopped-waiting":
         return continuing[:3]
     try:
@@ -1062,7 +1066,7 @@ def kill_while_waiting_for_slot(fx, continuing):
 
 
 def asked_continue(fx, result, continuing):
-    paths, record, state, parked, first = fx.paths, fx.record, fx.state, fx.parked, fx.first
+    paths, record, parked, first = fx.paths, fx.record, fx.parked, fx.first
     continue_ignoring_exit(fx, continuing)
     row = run_store.ticket_runs("replay-sample", fx.task, whole=True)[0]
     events = run_events(fx, row["id"])
@@ -1073,7 +1077,7 @@ def asked_continue(fx, result, continuing):
                "skipped": next((e["skipped"] for e in events if e.get("event") == "route" and "skipped" in e), None),
                "same_session": session(first) == session(events),
                "answered": "Spelled with a K, as in kumquat-7." in prompts,
-               "taken": [a["taken_by"] == row["id"] for a in state.asks_of(parked["id"])],
+               "taken": [a["taken_by"] == row["id"] for a in asks_store.asks_of(parked["id"])],
                "renewed": [e.get("renew") for e in events if e.get("event") == "route" and e.get("renew")],
                "log": (paths.RUNS_DIR / row["id"] / "run.log").read_text(),
                "heard": [w for w in ("`REPLAY_SECRET` is set for this repo", fx.owner_asks.DECLINED) if w in prompts]}
@@ -1149,7 +1153,7 @@ def start_overlapping_run(fx):
     fx.other, fx.child = None, []
     if not fx.overlapping:
         return
-    fx.other = other = fx.state.task_add("replay-sample", "Add kumquat again", "Add kumquat again", "feat")
+    fx.other = other = fx.tasks_store.task_add("replay-sample", "Add kumquat again", "Add kumquat again", "feat")
     source = str(Path(fx.pipeline.__file__).resolve().parent.parent)
     real_launch, started = runner.run, []
     def overlapping_launch(prompt, cwd, **kw):
@@ -1202,7 +1206,7 @@ def instrument_future_step(fx):
 
 
 def ordinary(fx):
-    scenario, paths, pipeline, state = fx.scenario, fx.paths, fx.pipeline, fx.state
+    scenario, paths, pipeline = fx.scenario, fx.paths, fx.pipeline
     if scenario == "future-step-appended":
         instrument_future_step(fx)
     dry = scenario in ("review-notes-dry-run", "refactor-dry-run")
@@ -1285,7 +1289,7 @@ def doctor_clean(fx, result):
 
 
 def ordinary_extras(fx, row, events, result):
-    scenario, paths, pipeline, runlimits, record, state = fx.scenario, fx.paths, fx.pipeline, fx.runlimits, fx.record, fx.state
+    scenario, paths, pipeline, runlimits, record = fx.scenario, fx.paths, fx.pipeline, fx.runlimits, fx.record
     if scenario in ("limit-wait", "work-over-budget"):
         wall = (pipeline.util.parse_iso(row["finished"]) - pipeline.util.parse_iso(row["started"])).total_seconds() / 60
         result |= {"budget": runlimits.metadata(row["id"], "budget.json"),
@@ -1305,7 +1309,7 @@ def ordinary_extras(fx, row, events, result):
     if scenario == "future-step-appended":
         result["appended"] = bool(fx.appended)
     if scenario in ("pass", "doctor-clean"):
-        assert run_store.run_get(row["id"])["schema_version"] == state.LATEST
+        assert run_store.run_get(row["id"])["schema_version"] == foundation.LATEST
         branches = [b for b in result["origin"].splitlines() if b != "refs/heads/main"]
         assert len(branches) == 1, result
         result["published"] = pipeline.git(["show", branches[0] + ":notes.txt"], fx.root / "sample/origin.git")

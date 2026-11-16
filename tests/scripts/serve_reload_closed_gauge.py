@@ -3,7 +3,7 @@ gate.set()
 a = approval()
 dashboard.POSTS_IN_FLIGHT.close()
 refused = post(a)
-during = {"status": status_of(a), "listed": a in [x["id"] for x in state.approvals()],
+during = {"status": status_of(a), "listed": a in [x["id"] for x in approvals_store.approvals()],
           "count": dashboard.POSTS_IN_FLIGHT.count}
 foreign = post(a, host="foreign.invalid")
 who[0] = "someone@else.test"

@@ -33,13 +33,14 @@ from . import (
     runner,
     screening,
     sources,
-    state,
     util,
     vault,
 )
 from .agent import Result
 from .loops import Loop
+from .store import approvals as approvals_store
 from .store import db as foundation
+from .store import insights as insights_store
 from .store import loops as loop_store
 from .store import runs as run_store
 
@@ -909,7 +910,7 @@ def landed_fixes(run: LoopRun, ws: Workspace, found: list[dict]) -> list[tuple[s
 
 
 def waiting_fixes(run: LoopRun) -> list[tuple[str, str]]:
-    return [(f"waiting for approval #{a['id']}", a["emit"]["item"]["patch"]) for a in state.approvals()
+    return [(f"waiting for approval #{a['id']}", a["emit"]["item"]["patch"]) for a in approvals_store.approvals()
             if a["loop"] == run.loop.name and a["status"] == "pending" and a["emit"].get("type") == "push"
             and a["emit"].get("item", {}).get("patch")]
 
@@ -986,7 +987,7 @@ def search_loop(run: LoopRun) -> tuple[str, str]:
                 run.log("miss", f"try {i}: exit {code}: {idea}")
                 continue
             if fix:
-                state.settle_verdicts(run.id, "replaced")
+                insights_store.settle_verdicts(run.id, "replaced")
                 replace_held_commit(ws)
             commit(ws.wt, commit_message(run, ws, idea[:72]))
             held_proof = read_proof(run)

@@ -28,7 +28,6 @@ from . import (
     paths,
     sandbox,
     scratch,
-    state,
     util,
     vault,
 )
@@ -44,6 +43,7 @@ from .agent import (
     provider_reset,
     usage_totals,
 )
+from .store import devices as devices_store
 
 if TYPE_CHECKING:
     from . import guard
@@ -645,7 +645,7 @@ def login_unchanged(route: Route) -> bool:
         return False
     latest = accounts.pi(route.provider, credential, str(route.owner))
     return (latest.generation in {route.auth.generation, *route.refreshed}
-            or state.refresh_continues(route.auth.generation, latest.generation)
+            or devices_store.refresh_continues(route.auth.generation, latest.generation)
             or (route.auth.mode == latest.mode == "subscription" and
                 route.auth.provider == latest.provider == route.provider and route.auth.family == latest.family and
                 bool(route.auth.identity) and latest.identity == route.auth.identity))
@@ -660,7 +660,7 @@ def observed_refresh(route: Route, event: dict) -> None:
         return
     previous = accounts.fingerprint("pi", str(route.owner), route.provider, before)
     if (previous not in {route.auth.generation, *route.refreshed}
-            and not state.refresh_continues(route.auth.generation, previous)):
+            and not devices_store.refresh_continues(route.auth.generation, previous)):
         return
     latest = accounts.pi(route.provider, after, str(route.owner))
     markers = ("accountId", "accountUuid", "account_id", "account_uuid", "userId", "user_id")
@@ -672,7 +672,7 @@ def observed_refresh(route: Route, event: dict) -> None:
     earlier = accounts.pi(route.provider, before, str(route.owner))
     prefixes = [accounts.scope(a, "")[:-2] if a.mode == "subscription" else accounts.scope(a, "credit")
                 for a in (earlier, latest)]
-    state.record_refresh(previous, latest.generation, *prefixes)
+    devices_store.record_refresh(previous, latest.generation, *prefixes)
     route.refreshed.add(latest.generation)
     route.refreshed_auths.add(latest)
 

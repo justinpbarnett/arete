@@ -75,7 +75,8 @@ def wait_file(path, process=None):
 
 
 def setup():
-    from arete import paths, state
+    from arete import paths
+    from arete.store import db as foundation
 
     require(not paths.ISOLATED, "rollback evidence must use ordinary disposable SQLite files")
     require(ROOT in paths.DB_FILE.resolve().parents, "refusing non-fixture database")
@@ -109,7 +110,9 @@ def parallel(fn, count=4):
 
 
 def transactions():
-    from arete import backup, doctor, paths, state
+    from arete import backup, doctor, paths
+    from arete.store import db as foundation
+    from arete.store import devices as devices_store
 
     evidence = setup()
     trace, connections = [], []
@@ -202,11 +205,11 @@ def transactions():
     require(not any("within a transaction" in r.detail for r in report), [r.detail for r in report])
     require(not any(s.upper().startswith(("INSERT", "UPDATE", "DELETE")) for s in trace), trace)
     evidence["doctor"] = [r.__dict__ for r in report]
-    state.record_refresh("old-generation", "new-generation", "old-auth", "new-auth")
-    state.hold("old-auth", "", "fixture")
-    require({r["scope"] for r in state.holds()} >= {"old-auth", "new-auth"}, "refresh did not propagate")
-    state.clear_holds(["new-auth"], "9999")
-    require(not state.holds(), "linked holds were not cleared")
+    devices_store.record_refresh("old-generation", "new-generation", "old-auth", "new-auth")
+    devices_store.hold("old-auth", "", "fixture")
+    require({r["scope"] for r in devices_store.holds()} >= {"old-auth", "new-auth"}, "refresh did not propagate")
+    devices_store.clear_holds(["new-auth"], "9999")
+    require(not devices_store.holds(), "linked holds were not cleared")
     evidence["capture"] = captures()
     retry = loop_store.enqueue("retry", "default", "", "fixture", [event])
     require(loop_store.take_queue_item(retry, "missing-run"), "claim failed")
@@ -237,41 +240,43 @@ def transactions():
 
 
 def captures():
-    from arete import state
+    from arete.store import db as foundation
+    from arete.store import insights as insights_store
 
-    require(state.capture_discard() is None, "empty discard")
-    require(state.capture_save(text="fixture"), "save")
+    require(insights_store.capture_discard() is None, "empty discard")
+    require(insights_store.capture_save(text="fixture"), "save")
     with foundation.reader() as c:
         draft = dict(c.execute("SELECT * FROM captures WHERE status='draft'").fetchone())
     key, revision = draft["id"], draft["revision"]
-    require(not state.capture_move(key, revision + 1, "draft", "checking"), "stale move")
-    require(state.capture_move(key, revision, "draft", "checking"), "move")
-    require(state.capture_begin_checks(key, {"fixture": "digest"}), "begin checks")
-    require(state.capture_check_done(key, "fixture", "pass", "", {}, .1), "check result")
-    require(not state.capture_check_done(key, "fixture", "pass", "", {}, .1), "repeated result")
-    state.capture_end_checks(key, "fixture")
+    require(not insights_store.capture_move(key, revision + 1, "draft", "checking"), "stale move")
+    require(insights_store.capture_move(key, revision, "draft", "checking"), "move")
+    require(insights_store.capture_begin_checks(key, {"fixture": "digest"}), "begin checks")
+    require(insights_store.capture_check_done(key, "fixture", "pass", "", {}, .1), "check result")
+    require(not insights_store.capture_check_done(key, "fixture", "pass", "", {}, .1), "repeated result")
+    insights_store.capture_end_checks(key, "fixture")
     row = {"sha256": "a" * 64, "kind": "text", "name": "fixture.txt", "type": "text/plain", "bytes": 5}
     calls = []
-    held, same = state.capture_stage(row, lambda *a: calls.append("admit"), lambda *a: calls.append("keep"))
-    again, duplicate = state.capture_stage(row, lambda *a: calls.append("admit"), lambda *a: calls.append("keep"))
+    held, same = insights_store.capture_stage(row, lambda *a: calls.append("admit"), lambda *a: calls.append("keep"))
+    again, duplicate = insights_store.capture_stage(row, lambda *a: calls.append("admit"), lambda *a: calls.append("keep"))
     require(not same and duplicate and held["id"] == again["id"] and calls == ["admit", "keep", "admit"], calls)
-    require(state.capture_inspected(held["id"], row["sha256"], {"ok": True}, .1), "inspect")
-    require(not state.capture_inspected(held["id"], "stale", {}, .1), "stale inspect")
-    require(state.capture_drop_evidence(held["id"])["id"] == held["id"], "drop")
-    require(state.capture_drop_evidence(held["id"]) is None, "repeated drop")
+    require(insights_store.capture_inspected(held["id"], row["sha256"], {"ok": True}, .1), "inspect")
+    require(not insights_store.capture_inspected(held["id"], "stale", {}, .1), "stale inspect")
+    require(insights_store.capture_drop_evidence(held["id"])["id"] == held["id"], "drop")
+    require(insights_store.capture_drop_evidence(held["id"]) is None, "repeated drop")
     with foundation.reader() as c:
         revision = c.execute("SELECT revision FROM captures WHERE id=?", (key,)).fetchone()[0]
-    require(state.capture_move(key, revision, "draft", "filing"), "filing")
-    require(not state.capture_save(text="blocked"), "filing save")
-    require(state.capture_filed(key, 1, "offline/1", "filed"), "filed")
-    require(not state.capture_filed(key, 1, "offline/1", "filed"), "repeat filed")
-    state.capture_save(text="next")
-    require(state.capture_discard() is not None and state.capture_discard() is None, "discard")
+    require(insights_store.capture_move(key, revision, "draft", "filing"), "filing")
+    require(not insights_store.capture_save(text="blocked"), "filing save")
+    require(insights_store.capture_filed(key, 1, "offline/1", "filed"), "filed")
+    require(not insights_store.capture_filed(key, 1, "offline/1", "filed"), "repeat filed")
+    insights_store.capture_save(text="next")
+    require(insights_store.capture_discard() is not None and insights_store.capture_discard() is None, "discard")
     return {"writers": 10, "stale_and_noop": True, "callbacks": calls}
 
 
 def migration_exercise():
-    from arete import backup, paths, state, util
+    from arete import backup, paths, util
+    from arete.store import db as foundation
     from arete.store import migrations
 
     original = paths.DB_FILE
@@ -365,7 +370,7 @@ def confined_exercise():
 
 
 def oncall_exercise():
-    from arete import config, oncall, serve, state, util
+    from arete import config, oncall, serve, util
 
     cfg = config.load()
     cfg.oncall = replace(cfg.oncall, enabled=True)
@@ -422,7 +427,8 @@ def oncall_exercise():
 
 
 def concurrent_intake():
-    from arete import config, loops, paths, sources, state, util, webhooks
+    from arete import config, loops, paths, sources, util, webhooks
+    from arete.store import db as foundation
 
     evidence = setup()
     loop = loops.Loop("intake", paths.CONFIG_DIR, "fixture", trigger=loops.Trigger(webhook=True),
@@ -514,7 +520,8 @@ def log_rows():
 
 
 def transaction_timing():
-    from arete import dbstats, paths, state
+    from arete import dbstats, paths
+    from arete.store import db as foundation
 
     evidence = setup()
     initial_rows = log_rows()
@@ -627,7 +634,8 @@ def transaction_timing():
 
 
 def summary_exercise():
-    from arete import dbstats, paths, state
+    from arete import dbstats, paths
+    from arete.store import db as foundation
 
     def count():
         return sum(g["count"] for s in dbstats.SUMMARIES.values() for g in s["transactions"].values())
@@ -888,7 +896,8 @@ def sql_rows(query, args=(), file=None):
 
 
 def db_values():
-    from arete import backup, state
+    from arete import backup
+    from arete.store import db as foundation
 
     with foundation.one_read() as conn:
         return {"sequences": backup.sequences(conn), "meta": backup.metadata(conn),
@@ -925,7 +934,8 @@ def cli_output(*args):
 
 def wal_startup():
     from arete.store import runs as run_store
-    from arete import paths, state, util
+    from arete import paths, util
+    from arete.store import db as foundation
 
     paths.ensure_dirs()
     paths.CONFIG_FILE.write_text('[replay]\nall = true\n[jev]\nenabled = false\n')
@@ -1032,7 +1042,8 @@ def close_server(server):
 
 def prune_restore():
     from arete.store import runs as run_store
-    from arete import backup, paths, state, util
+    from arete import backup, paths, util
+    from arete.store import db as foundation
 
     evidence = setup()
     old = util.iso(util.now() - timedelta(days=60))
@@ -1079,7 +1090,8 @@ def prune_restore():
 
 
 def retention_policy():
-    from arete import backup, paths, state, util
+    from arete import backup, paths, util
+    from arete.store import db as foundation
 
     folder = paths.STATE_DIR.parent / "retention"
     folder.mkdir()
@@ -1107,7 +1119,8 @@ def retention_policy():
 
 def consistent_counts():
     from arete.store import runs as run_store
-    from arete import backup, paths, state, util
+    from arete import backup, paths, util
+    from arete.store import db as foundation
 
     daemon, _ = start_fixture_serve()
     stop_child(daemon)
@@ -1148,7 +1161,8 @@ def consistent_counts():
 
 def restore_safety():
     from arete.store import runs as run_store
-    from arete import backup, control, paths, state, util
+    from arete import backup, control, paths, util
+    from arete.store import db as foundation
 
     evidence = setup()
     with foundation.tx() as conn:
@@ -1317,7 +1331,8 @@ def interrupted_restores(snapshot):
 
 
 def hot_journal_probe():
-    from arete import backup, paths, state, util
+    from arete import backup, paths, util
+    from arete.store import db as foundation
 
     with foundation.tx() as conn:
         conn.executemany("INSERT INTO feed(run_id,ts,kind,text) VALUES ('hot',?,'note',?)",
@@ -1368,7 +1383,8 @@ def http_feed_snapshot(run_id):
 
 def feed_cursors():
     from arete.store import runs as run_store
-    from arete import backup, control, paths, record, state, util
+    from arete import backup, control, paths, record, util
+    from arete.store import db as foundation
     from arete.commands import common
 
     evidence = setup()
@@ -1637,7 +1653,9 @@ def backup_health_cli():
 
 def page_seed():
     from arete.store import runs as run_store
-    from arete import paths, sessions, state, util
+    from arete import paths, sessions, util
+    from arete.store import chats as chats_store
+    from arete.store import db as foundation
 
     now = util.iso()
     modes = {"local": ("pi", "ollama", "api_key"), "replay": ("replay", "", ""),
@@ -1655,9 +1673,9 @@ def page_seed():
                              (name, runner, provider, "shared-model" if name == "mixed" else provider + "/fixture",
                               auth, now))
         conn.execute("INSERT INTO runs (id,kind,status,started) VALUES ('settling','pipeline','running',?)", (now,))
-    chat_id = state.chat_add("")
-    state.chat_say(chat_id, "user", "Read snapshots and billing")
-    state.chat_link_session(chat_id, "session", 10)
+    chat_id = chats_store.chat_add("")
+    chats_store.chat_say(chat_id, "user", "Read snapshots and billing")
+    chats_store.chat_link_session(chat_id, "session", 10)
     run_store.save_report("session", {"summary": "Fixture report", "body": "A complete offline session report"})
     util.write_json(sessions.spec_file("session"), {"prompt": "Fixture session", "tools": [], "chat": chat_id})
     return {"runs": [*modes, "mixed", "session"], "chat": chat_id, "session": "session"}
@@ -1694,7 +1712,9 @@ def http_json(server, path, body=None, admitted=True):
 
 def coherent_reads():
     from arete.store import runs as run_store
-    from arete import board, chat, control, paths, sessions, state, tasks, util
+    from arete import board, chat, control, paths, sessions, tasks, util
+    from arete.store import chats as chats_store
+    from arete.store import db as foundation
     from arete.commands import costs
 
     evidence = setup()
@@ -1759,8 +1779,8 @@ def coherent_reads():
             server.shutdown()
             server.server_close()
             worker.join(10)
-    require(not state.chat_sessions(seeded["chat"])[0]["told"], "GET delivered a report")
-    require(sessions.tell_chats() >= 1 and state.chat_sessions(seeded["chat"])[0]["told"], "writer did not deliver")
+    require(not chats_store.chat_sessions(seeded["chat"])[0]["told"], "GET delivered a report")
+    require(sessions.tell_chats() >= 1 and chats_store.chat_sessions(seeded["chat"])[0]["told"], "writer did not deliver")
     evidence["report_delivery"] = chat.session_report(seeded["chat"], "session")
 
     def concurrent_read(target, read_name, commit):
@@ -1821,8 +1841,8 @@ def coherent_reads():
 def event_contract():
     import hashlib
 
-    from arete.store import runs as run_store
-    from arete import backup, config, control, loop_run, loops, paths, state, util
+    from arete import backup, config, control, loop_run, loops, paths, util
+    from arete.store import db as foundation
 
     paths.ensure_dirs()
     paths.CONFIG_FILE.write_text('[replay]\nall = true\n[jev]\nenabled = false\n')
@@ -1897,7 +1917,8 @@ def event_contract():
 
 
 def database_health():
-    from arete import backup, config, dbstats, heartbeat, install, paths, state, util
+    from arete import backup, config, dbstats, heartbeat, install, paths, util
+    from arete.store import db as foundation
 
     evidence = setup()
     anchor = foundation.connect_db(paths.DB_FILE)
@@ -2103,7 +2124,8 @@ def database_health():
 
 
 def legacy_cleanup():
-    from arete import paths, state
+    from arete import paths
+    from arete.store import db as foundation
 
     evidence = setup()
     legacy, marker = paths.STATE_DIR / "state.db", paths.STATE_DIR / "chat.json.moved"
@@ -2161,7 +2183,7 @@ def browser_serve(port):
 
 
 def timed_writer():
-    from arete import state
+    from arete.store import db as foundation
 
     with foundation.tx():
         source_store.set_cursor("timed-writer", "ok", True)
@@ -2169,7 +2191,8 @@ def timed_writer():
 
 def child_main(role, args):
     from arete.store import runs as run_store
-    from arete import paths, state
+    from arete import paths
+    from arete.store import db as foundation
 
     require(ROOT in paths.DB_FILE.resolve().parents, "child refuses production database")
     if role in ACTIONS:
