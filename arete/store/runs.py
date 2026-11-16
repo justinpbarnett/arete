@@ -460,3 +460,8 @@ def purge_inventory() -> tuple[set[str], set[str]]:
 def forget_purge(run_id: str) -> None:
     with db() as c:
         c.execute("DELETE FROM run_purges WHERE run_id = ?", (run_id,))
+
+
+def mined_until() -> str | None:
+    with reader() as c:
+        return c.execute("SELECT MAX(mined_until) FROM runs WHERE kind = 'miner'").fetchone()[0]

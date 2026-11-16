@@ -12,6 +12,7 @@ from unittest import mock
 SOURCE = Path(__file__).resolve().parents[2]
 BASELINE = "56706fe2c07d36fd9d7c00d227f9f68caffeda29"
 BEFORE_BUDGET = "0090e09dc89ccca0b96250ce6a2e4e64cb84999b"
+AGGREGATE_BASELINE = "5d0900bbb326cf9a896575959e32877c0e969903"
 
 
 def ledger(db):
@@ -74,6 +75,53 @@ def ownership(root):
              alert_set alert_clear alerts""".split()
     assert all(getattr(state, name) is getattr(incidents_owner, name) for name in names)
     assert all(getattr(incidents_owner, name).__module__ == "arete.store.incidents" for name in names)
+
+    from importlib import import_module
+
+    remaining = {
+        "approvals": ("DECIDABLE APPROVAL_NOTES add_approval approvals set_approval_note approval approval_of "
+            "claim_approval renew_claim lapsed_claims settle_approval add_proposal RELEASING_PROPOSALS "
+            "runs_cited_by_kept_proposals proposals proposal move_proposal forget_proposal "
+            "set_proposal_status_by_pr add_mined mined_row mined_urls").split(),
+        "chats": ("CHAT_USAGE chat_add chat_get chats chat_messages chat_claim chat_say CHAT_SESSION_COLUMNS "
+            "chat_link_session chat_sessions chat_of_session chat_sessions_untold chat_tell_session "
+            "chat_summarize chat_drop_draft chat_newest_draft busy_chats").split(),
+        "tasks": ("task_add task_get tasks task_children task_set_state task_comment task_comments "
+            "tasks_replied").split(),
+        "triage": ("TRIAGE_COLUMNS TRIAGE_LISTS APPROVAL_COLUMNS APPROVAL_LISTS triage_rows triage_replace "
+            "triage_put triage_drop triage_approve triage_approvals triage_approval triage_prune").split(),
+        "devices": ("REFRESH_SCOPE hold save_hold holds clear_holds refresh_links linked_scopes "
+            "refresh_continues record_refresh add_vm note_vm_answered forget_vm forget_gone_vm "
+            "note_delete_failed vms_of_run vms_left_over probe_get probe_set probes").split(),
+        "insights": ("USAGE_COLUMNS add_verdict settle_verdicts set_verdict_sha verdicts_since EVAL_LINEAGE "
+            "add_eval BASELINE_SOURCE task_history eval_rows eval_history evals_since FEEDBACK_COLUMNS "
+            "feedback_keys add_feedback feedback_due close_feedback feedback_waiting open_feedback "
+            "take_feedback settle_feedback feedback_between RESEARCH_COLUMNS research_rows research_get "
+            "research_set research_keep add_usage OPEN_CAPTURE EDITABLE_CAPTURE capture_draft "
+            "capture_move capture_begin_checks capture_written capture_linked capture_note "
+            "capture_filed capture_filed_row capture_filing capture_check_done capture_inspected "
+            "capture_end_checks capture_checking capture_evidence capture_stage capture_drop_evidence "
+            "capture_save capture_discard usage_since").split(),
+        "asks": ("add_message take_messages ask_row ask_add ask_get asks_of open_asks asks_due ask_close "
+            "asks_retire asks_taken ask_remind asks_asked_before").split(),
+        "push": ("push_add push_list push_drop push_succeeded").split(),
+        "_rows": ("lists_read lists_written insert_sql").split(),
+    }
+    implementations = {}
+    for owner, names in remaining.items():
+        module = import_module('arete.store.' + owner)
+        for name in names:
+            value = getattr(module, name)
+            assert getattr(state, name) is value, (owner, name)
+            if callable(value):
+                assert value.__module__ == 'arete.store.' + owner, (owner, name)
+        implementations[owner] = names
+    assert state.mined_until is run_store.mined_until
+    assert run_store.mined_until.__module__ == 'arete.store.runs'
+    assert '_rows' not in owners and migrations.area_owner('_rows') is None
+    state_tree = ast.parse(Path(state.__file__).read_text())
+    assert [n.name for n in state_tree.body if isinstance(n, ast.FunctionDef)] == ['prune']
+
     reader_results = owner_readers(root)
     tree = ast.parse(Path(record.__file__).read_text())
     sql = ("SELECT ", "INSERT ", "UPDATE ", "DELETE ", "CREATE ", "ALTER ", "DROP ", "PRAGMA ", "REPLACE ", "WITH ")
@@ -88,7 +136,8 @@ def ownership(root):
     return {"tables": len(actual), "complete": True, "unique": True, "foundation": "db",
             "historical_work": "loops", "ledger_unchanged": True, "record_compatibility": True,
             "owners": owners, "ledger": before,
-            "aggregate_compatibility": True, "loop_lock_owner": "loops", "readers": reader_results}
+            "aggregate_compatibility": True, "implementations": implementations,
+            "private_helper_excluded": True, "loop_lock_owner": "loops", "readers": reader_results}
 
 
 def unknown_area(root):
@@ -102,7 +151,7 @@ def unknown_area(root):
         shutil.copyfile(path, store / path.name)
     (store / "helper.py").write_text("raise RuntimeError('helper implementation imported')\n")
     refusals = {}
-    for area in ("outbox", "helper", "work"):
+    for area in ("outbox", "helper", "_rows", "work"):
         folder = root / area
         shutil.copytree(migrations.FOLDER, folder)
         name = f"m{db.LATEST + 1:04d}_{area}_injected.py"
@@ -122,7 +171,9 @@ def unknown_area(root):
         assert not marker.exists()
         assert ledger(db) == before and schema(db) == before_schema
     assert migrations.area_owner("work", "m0004_work_event_routing.py") == "loops"
-    return {"refusals": refusals, "executed": False, "schema_unchanged": True, "ledger_unchanged": True,
+    private_refusals = {"_rows": refusals.pop("_rows")}
+    return {"refusals": refusals, "private_refusals": private_refusals,
+            "executed": False, "schema_unchanged": True, "ledger_unchanged": True,
             "historical_work": "loops"}
 
 
@@ -817,10 +868,189 @@ def server_prune(root):
             "continuations": continuations, "diagnostics": messages, "health_requested": True}
 
 
+def original_join(name):
+    from arete.store import approvals, db, runs
+
+    source = subprocess.run(["git", "show", f"{AGGREGATE_BASELINE}:arete/state.py"], cwd=SOURCE,
+                            text=True, capture_output=True, check=True).stdout
+    namespace = {"reader": db.reader, "json": json, "run_store": runs, "DECIDABLE": approvals.DECIDABLE}
+    helpers = {"approvals": "approval_of", "open_asks": "ask_row"}
+    wanted = {name, helpers.get(name)}
+    nodes = [n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name in wanted]
+    assert len(nodes) == (2 if name in helpers else 1)
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), f"<{AGGREGATE_BASELINE}>", "exec"), namespace)
+    return namespace[name]
+
+
+def aggregate_joins(root):
+    from datetime import UTC, datetime, timedelta
+
+    from arete import record, util
+    from arete.store import approvals, asks, db, devices, insights
+
+    db.migrate()
+    instant = datetime(2026, 11, 1, 12, tzinfo=UTC)
+    quiet = util.iso(instant - timedelta(minutes=10))
+    old = util.iso(instant - timedelta(minutes=11))
+    recent = util.iso(instant - timedelta(minutes=9))
+
+    def run(name, issue, status="done", repo="demo", kind="pipeline", **fields):
+        record.start(kind, run_id=name, issue=issue, repo=repo, status=status, **fields)
+
+    with mock.patch.object(util, "now", return_value=instant):
+        run("approval-run", "approval", repo="approval-repo")
+        pending = approvals.add_approval("loop", "approval-run", {"nested": [1, "two"]}, "pending")
+        failed = approvals.add_approval("loop", "missing", {"missing": True}, "failed", "failure")
+        settled = approvals.add_approval("loop", "approval-run", {}, "settled")
+        assert approvals.settle_approval(settled, "skipped", "", judged=False, came_from=("pending",))
+        approvals.set_approval_note(failed, "review", json.dumps({"ok": False}))
+        run("vm-live", "vm", "running")
+        run("vm-done", "vm", "done")
+        for name, owner, stamp in (("probe-old", None, old), ("probe-equal", None, quiet),
+                                   ("probe-new", None, recent), ("live-old", "vm-live", old),
+                                   ("done-new", "vm-done", recent), ("missing-new", "missing", recent)):
+            devices.add_vm(name, owner, {"kind": "exe", "name": name}, vmid=7)
+            with db.db() as c:
+                c.execute("UPDATE vms SET created = ? WHERE name = ?", (stamp, name))
+
+        for name, issue in (("ask-whole", "superseded"), ("ask-step", "single-step"),
+                            ("ask-unrelated", "unrelated"), ("ask-closed", "closed")):
+            run(name, issue, "needs-info")
+            asks.ask_add(name, name, "demo", issue, "build", "call", "why", "tried",
+                         [{"kind": "text", "question": name}], {"resume": name})
+        asks.ask_close("ask-closed", "answered", [{"answer": "done"}])
+        asks.ask_add("ask-missing", "missing", "demo", "missing", "build", "call", "why", "tried", [], {})
+        run("later-whole", "superseded")
+        run("later-step", "single-step", only_step="build")
+        run("later-other-issue", "elsewhere")
+        run("later-other-repo", "unrelated", repo="other")
+        run("later-other-kind", "unrelated", kind="eval")
+
+        feedback_fixture = []
+
+        def feedback(issue, stamp, *, at_once=0, status="new", run_status="pr", repo="demo",
+                     run_repo=None, urls=None, run_issue=None, owner=True):
+            url = "https://example.test/pull/" + issue
+            if owner:
+                run("feedback-" + issue, run_issue or issue, run_status, repo=run_repo or repo,
+                    pr_url=urls if urls is not None else url)
+            row = {k: "" for k in insights.FEEDBACK_COLUMNS}
+            row.update(pr_url=url, kind="comment", gh_id=len(feedback_fixture) + 1, repo=repo, issue=issue,
+                       body="feedback", line=None, at_once=at_once, created=stamp, pr_state="OPEN", status=status)
+            feedback_fixture.append(row)
+            return row
+
+        feedback("quiet", old)
+        feedback("equal", quiet)
+        feedback("noisy", recent)
+        feedback("immediate", recent, at_once=1)
+        grouped = feedback("grouped", old)
+        feedback_fixture.append({**grouped, "gh_id": 999, "created": recent})
+        feedback("failed-run", old, run_status="failed")
+        feedback("stopped-run", old, run_status="stopped")
+        feedback("done-run", old, run_status="done")
+        feedback("running-run", old, run_status="running")
+        feedback("failed-row", old, status="failed")
+        feedback("taken-row", old, status="taken")
+        feedback("other-repo", old, repo="other")
+        feedback("wrong-run-repo", old, run_repo="other")
+        feedback("wrong-run-issue", old, run_issue="different")
+        feedback("missing-run", old, owner=False)
+        feedback("prefix", old, urls="https://example.test/pull/prefix0")
+        feedback("suffix", old, urls="xhttps://example.test/pull/suffix")
+        feedback("multi", old, urls="https://example.test/pull/other https://example.test/pull/multi")
+        insights.add_feedback(feedback_fixture)
+
+        calls = (("approvals", approvals, approvals.approvals, ()),
+                 ("vms_left_over", devices, devices.vms_left_over, (quiet,)),
+                 ("open_asks", asks, asks.open_asks, ()),
+                 ("feedback_due", insights, insights.feedback_due, ("demo", quiet)))
+        inventories, expected, evidence = {}, {}, {}
+        for name, owner, function, args in calls:
+            expected[name] = original_join(name)(*args, **({} if name == "feedback_due" else {"connect": db.reader}))
+            statements = []
+            with db.one_read(), db.reader() as c:
+                c.set_trace_callback(statements.append)
+                try:
+                    if name == "feedback_due":
+                        with mock.patch.object(owner, "reader", wraps=db.reader) as reader:
+                            inventories[name] = function(*args)
+                            reader.assert_called_once_with()
+                    else:
+                        inventories[name] = function(*args, connect=db.reader)
+                finally:
+                    c.set_trace_callback(None)
+            selects = [sql for sql in statements if sql.lstrip().startswith("SELECT ")]
+            assert len(selects) == 1, (name, statements)
+            assert inventories[name] == expected[name], name
+            evidence[name] = {"reader": True, "selects": selects, "listing_selects": len(selects)}
+
+        assert [r["id"] for r in inventories["approvals"]] == [failed, pending]
+        assert [r["run_repo"] for r in inventories["approvals"]] == ["", "approval-repo"]
+        assert [r["name"] for r in inventories["vms_left_over"]] == ["probe-old", "done-new", "missing-new"]
+        assert [r["id"] for r in inventories["open_asks"]] == ["ask-step", "ask-unrelated", "ask-missing"]
+        assert inventories["feedback_due"] == ["failed-run", "multi", "quiet", "stopped-run", "equal", "immediate"]
+        transactions = approval_transactions(pending)
+    return {"baseline": AGGREGATE_BASELINE, "baseline_compatible": True, "inventories": inventories,
+            "baseline_inventories": expected, "queries": evidence, "approval_transactions": transactions,
+            "feedback_fixture": feedback_fixture, "vm_cutoff": quiet}
+
+
+def approval_transactions(approval_id):
+    from arete.store import approvals, insights
+
+    for kind, outcome in (("push", "waiting"), ("proof", "failed"), ("other", "waiting"),
+                          ("push", "approved"), ("proof", "replaced")):
+        insights.add_verdict("approval-run", kind, kind + outcome, "about", {}, "", outcome)
+    token = approvals.claim_approval(approval_id, "2026-11-01T13:00:00Z")
+    assert token
+    before = snapshot_tables("approvals", "verdicts")
+    write = insights.judge_approval
+
+    def fails(c, *args):
+        assert c.execute("SELECT status FROM approvals WHERE id = ?", (approval_id,)).fetchone()[0] == "done"
+        write(c, *args)
+        raise RuntimeError("insights settlement sentinel")
+
+    def settle(**kwargs):
+        return approvals.settle_approval(approval_id, "done", "landed", **kwargs)
+
+    with mock.patch.object(insights, "judge_approval", side_effect=fails):
+        refuses(RuntimeError, lambda: settle(judged=True, token=token))
+    after_failure = snapshot_tables("approvals", "verdicts")
+    assert after_failure == before
+    with mock.patch.object(insights, "judge_approval", wraps=write) as judged:
+        assert not settle(judged=True, token="wrong")
+        assert not settle(judged=True, token=token, until="2026-11-01T14:00:00Z")
+        assert not settle(judged=True, came_from=("pending",))
+        judged.assert_not_called()
+    after_rejected = snapshot_tables("approvals", "verdicts")
+    assert after_rejected == before
+    unjudged = approvals.add_approval("loop", "approval-run", {}, "unjudged")
+    with mock.patch.object(insights, "judge_approval", wraps=write) as judged:
+        assert approvals.settle_approval(unjudged, "skipped", "ignored", judged=False, came_from=("pending",))
+        judged.assert_not_called()
+    after_unjudged = snapshot_tables("verdicts")
+    assert after_unjudged["verdicts"] == before["verdicts"]
+    assert settle(judged=True, token=token, until="2026-11-01T13:00:00Z")
+    committed = snapshot_tables("approvals", "verdicts")
+    assert approvals.approval(approval_id)["status"] == "done"
+    assert len(committed["verdicts"]) == len(before["verdicts"]) == 5
+    for previous, current in zip(before["verdicts"], committed["verdicts"]):
+        if previous["kind"] in ("push", "proof") and previous["outcome"] in ("waiting", "failed", "approved"):
+            assert current == {**previous, "outcome": "landed", "outcome_at": "2026-11-01T12:00:00Z",
+                               "approval": approval_id}
+        else:
+            assert current == previous
+    return {"rollback": True, "before": before, "after_failure": after_failure,
+            "after_rejected": after_rejected, "after_unjudged": after_unjudged,
+            "rejected_unchanged": True, "unjudged_unchanged": True, "settled": True, "committed": committed}
+
+
 def main():
     case = sys.argv[1]
     assert case in ("ownership", "unknown-area", "upgrade", "record-readers", "record-failures", "run-retention",
-                    "scan-atomicity", "server-prune"), case
+                    "scan-atomicity", "server-prune", "aggregate-joins"), case
     with tempfile.TemporaryDirectory(prefix="arete-store-contract-") as directory:
         root = Path(directory).resolve()
         env = {name: os.environ[name] for name in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")
@@ -843,7 +1073,7 @@ def main():
         result.update({"ownership": ownership, "unknown-area": unknown_area, "upgrade": upgrade,
                        "record-readers": record_readers, "record-failures": record_failures,
                        "run-retention": run_retention, "scan-atomicity": scan_atomicity,
-                       "server-prune": server_prune}[case](root))
+                       "server-prune": server_prune, "aggregate-joins": aggregate_joins}[case](root))
         print("BEHAVIOR_RESULT=" + json.dumps(result))
 
 

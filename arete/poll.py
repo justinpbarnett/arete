@@ -34,6 +34,7 @@ from .pipeline import (
     sync_labels,
 )
 from .slots import slots_free_to_start
+from .store import asks as ask_store
 from .store import runs as run_store
 from .store import sources as source_store
 from .workspace import cleanup_worktrees
@@ -130,7 +131,7 @@ def tracker_reply(repo: config.Repo, tk: tracker.Tracker, tid: str, dry_run: boo
     if text and not dry_run:
         with util.lock(owner_asks.STEER_LOCK, wait=True):
             for a in state.asks_of(newest["id"], "open"):
-                state.ask_close(a["id"], "answered", owner_asks.text_answers(a, text))
+                ask_store.ask_close(a["id"], "answered", owner_asks.text_answers(a, text))
     return ""
 
 

@@ -13,8 +13,9 @@ from dataclasses import asdict, fields, replace
 from datetime import timedelta
 from pathlib import Path
 
-from . import exedev, paths, proxmox, record, ssh, state, util
+from . import exedev, paths, proxmox, record, ssh, util
 from .ssh import LOCAL, Device, DeviceError, NeverSent, NoAnswer
+from .store import devices as device_store
 
 DEVICES_FILE = paths.CONFIG_DIR / "devices.toml"
 CACHE_FILE = paths.STATE_DIR / "devices.json"
@@ -220,31 +221,31 @@ def fresh_sandbox(d: Device, run_id: str, log, hold=lambda: ""):
 
 @contextmanager
 def creating(vm: proxmox.Clone | exedev.Sandbox, run_id: str | None, log):
-    state.add_vm(run_id=run_id, **asdict(vm))
+    device_store.add_vm(run_id=run_id, **asdict(vm))
     try:
         yield
     except NeverSent:
-        state.forget_vm(vm.name)
+        device_store.forget_vm(vm.name)
         raise
     except BaseException as e:
         if isinstance(e, DeviceError) and not isinstance(e, NoAnswer):
-            state.note_vm_answered(vm.name)
+            device_store.note_vm_answered(vm.name)
         delete_or_say_why(vm, log)
         raise
-    state.note_vm_answered(vm.name)
+    device_store.note_vm_answered(vm.name)
 
 
 @contextmanager
 def kept_or_deleted(vm: proxmox.Clone | exedev.Sandbox, log, hold=lambda: ""):
     if vm.device.keep:
-        state.forget_vm(vm.name)
+        device_store.forget_vm(vm.name)
     try:
         yield
     finally:
         if vm.device.keep:
             log(f"keeping {vm} up until {vm.delete_command()} deletes it")
         elif reason := hold():
-            state.forget_vm(vm.name)
+            device_store.forget_vm(vm.name)
             log(f"keeping {vm} up because {reason}; {vm.delete_command()} deletes it")
         else:
             delete_or_say_why(vm, log)
@@ -268,9 +269,9 @@ def delete_listed(vm: proxmox.Clone | exedev.Sandbox, log) -> str:
     with ignoring_stops():
         not_deleted = vm.delete(log)
     if not_deleted:
-        state.note_delete_failed(vm.name)
+        device_store.note_delete_failed(vm.name)
     else:
-        state.forget_gone_vm(vm.name, util.iso(util.now() - timedelta(minutes=CREATE_MAY_FINISH_MINUTES)))
+        device_store.forget_gone_vm(vm.name, util.iso(util.now() - timedelta(minutes=CREATE_MAY_FINISH_MINUTES)))
     return not_deleted
 
 
@@ -294,25 +295,25 @@ def ignoring_stops():
 
 
 def release(run_id: str, log=lambda text: None) -> None:
-    for row in state.vms_of_run(run_id):
+    for row in device_store.vms_of_run(run_id):
         delete_or_say_why(listed_vm(row), log)
 
 
 def sweep(log_for: Callable[[str | None], Callable[[str], None]]) -> None:
     now = util.now()
     give_up_before = util.iso(now - timedelta(days=SWEEP_GIVES_UP_DAYS))
-    for row in state.vms_left_over(util.iso(now - timedelta(minutes=PROBE_SANDBOX_MINUTES))):
+    for row in device_store.vms_left_over(util.iso(now - timedelta(minutes=PROBE_SANDBOX_MINUTES))):
         vm, log = listed_vm(row), log_for(row["run_id"])
         if not row["failing_since"]:
             delete_or_say_why(vm, log)
         elif (not_deleted := delete_listed(vm, log)) and row["failing_since"] < give_up_before:
-            state.forget_vm(vm.name)
+            device_store.forget_vm(vm.name)
             log(f"{not_deleted}; arete serve stops trying after {SWEEP_GIVES_UP_DAYS} days, and "
                 f"{vm.delete_command()} deletes it if it is still there")
 
 
 def left_up(run_id: str) -> list[str]:
-    vms = [listed_vm(row) for row in state.vms_of_run(run_id) if row["failing_since"]]
+    vms = [listed_vm(row) for row in device_store.vms_of_run(run_id) if row["failing_since"]]
     return [f"{vm} is still up until {vm.delete_command()} deletes it" for vm in vms]
 
 
