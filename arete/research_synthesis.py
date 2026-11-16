@@ -6,7 +6,7 @@ import string
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit, urlunsplit
 
-from . import config, research_plan, research_search, runner, steps, util
+from . import config, research_budget, research_plan, research_search, runner, steps, util
 from .agent import Result
 from .pipeline import prompt
 
@@ -156,7 +156,7 @@ def more_text(round_no: int, may_search: bool, why: str) -> str:
             f"evidence cannot settle; {util.count(left, 'search round')} left. Return [] when the evidence is enough.")
 
 
-def ask(cfg: config.Config, budget: research_plan.Budget, s: steps.Settings, tools: list[str], plan: dict,
+def ask(cfg: config.Config, budget: research_budget.Budget, s: steps.Settings, tools: list[str], plan: dict,
         evidence: dict, ref: str, values: dict, where: dict, cwd, add_dirs: list, round_no: int) -> Asked:
     got = Asked()
     label = f"research {ref} synthesis" if round_no == 0 else f"research {ref} gap {round_no} synthesis"
@@ -166,7 +166,7 @@ def ask(cfg: config.Config, budget: research_plan.Budget, s: steps.Settings, too
         got.tries = n
         usd, seconds = budget.stage(s.timeout_minutes * 60)
         got.may_search = round_no < MAX_ROUNDS and not budget.short(
-            usd, seconds - research_search.GRACE_SECONDS - research_plan.MIN_CALL_SECONDS)
+            usd, seconds - research_search.GRACE_SECONDS - research_budget.MIN_CALL_SECONDS)
         if not got.may_search:
             usd, seconds = budget.final()
             seconds = min(seconds, s.timeout_minutes * 60)
@@ -191,7 +191,7 @@ def ask(cfg: config.Config, budget: research_plan.Budget, s: steps.Settings, too
             return got
         got.why = "; ".join(found)
         got.refused.append(f"try {n}: {got.why}"[:300])
-        research_search.say(ref, f"synthesis round {round_no} try {n} refused: {got.why[:300]}")
+        util.log_ref(ref, f"synthesis round {round_no} try {n} refused: {got.why[:300]}")
         if res.usage_limit:
             break
         feedback = refusal(found)
@@ -275,7 +275,7 @@ def assemble(answer: dict, evidence: dict, extra: list[tuple[str, str]],
     return report(answer, {sid: written(source["url"]) for sid, source in sources.items()}, extra, sources, audit)
 
 
-def audited(cfg: config.Config, budget: research_plan.Budget, last: dict, current: dict, extra: list, ref: str,
+def audited(cfg: config.Config, budget: research_budget.Budget, last: dict, current: dict, extra: list, ref: str,
             judged: bool) -> Result:
     from . import research_audit
 
@@ -295,7 +295,7 @@ def audited(cfg: config.Config, budget: research_plan.Budget, last: dict, curren
     return Result(ok=True, structured={"summary": summary, "report": text, "name": last["name"]})
 
 
-def run(cfg: config.Config, budget: research_plan.Budget, plan: dict, evidence: dict, ref: str, judged: bool,
+def run(cfg: config.Config, budget: research_budget.Budget, plan: dict, evidence: dict, ref: str, judged: bool,
         values: dict, where: dict, cwd, add_dirs: list) -> Result:
     s = steps.resolve(cfg, None, "research_synthesis")
     tools = [t for t in s.tools if t not in runner.WEB_TOOLS]
@@ -325,12 +325,12 @@ def run(cfg: config.Config, budget: research_plan.Budget, plan: dict, evidence: 
                 current = found.evidence or current
                 if found.added:
                     entry["outcome"] = f"searched; {util.count(found.added, 'new finding')}"
-                    research_search.say(ref, f"synthesis round {round_no}: {entry['outcome']}")
+                    util.log_ref(ref, f"synthesis round {round_no}: {entry['outcome']}")
                     continue
                 reason = found.stop or NOTHING_NEW
             extra += [(r["goal"], reason) for r in requests]
             entry["outcome"] = reason if requests else "complete"
-        research_search.say(ref, f"synthesis round {round_no}: {util.count(got.tries, 'try', 'tries')}, "
+        util.log_ref(ref, f"synthesis round {round_no}: {util.count(got.tries, 'try', 'tries')}, "
                                  f"{len(got.refused)} refused, {util.count(len(entry['requests']), 'request')}; "
                                  f"{entry['outcome']}")
         break

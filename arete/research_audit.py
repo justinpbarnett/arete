@@ -6,7 +6,7 @@ import tempfile
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
-from . import config, outbound, research_plan, research_search, runner, steps, util
+from . import config, outbound, research_budget, research_search, runner, steps, util
 from . import research_synthesis as synth
 from .pipeline import prompt
 
@@ -198,7 +198,7 @@ def fetch_text(fetchable: dict[str, list[str]], sources: dict) -> str:
             "only when its retained passage does not settle a claim:\n" + "\n".join(lines))
 
 
-def ask(cfg: config.Config, budget: research_plan.Budget, s: steps.Settings, read: list[str], batch: list[dict],
+def ask(cfg: config.Config, budget: research_budget.Budget, s: steps.Settings, read: list[str], batch: list[dict],
         n: int, evidence: dict, ref: str, cwd) -> Asked:
     supplied = research_search.supplied(evidence)
     known = {source["id"]: source for source in supplied["sources"]}
@@ -233,7 +233,7 @@ def ask(cfg: config.Config, budget: research_plan.Budget, s: steps.Settings, rea
             return got
         got.why = "; ".join(found)
         got.refused.append(f"try {attempt}: {got.why}"[:300])
-        research_search.say(ref, f"audit batch {n} try {attempt} refused: {got.why[:300]}")
+        util.log_ref(ref, f"audit batch {n} try {attempt} refused: {got.why[:300]}")
         if res.usage_limit:
             got.stop = LIMITED
             return got
@@ -241,7 +241,7 @@ def ask(cfg: config.Config, budget: research_plan.Budget, s: steps.Settings, rea
     return got
 
 
-def run(cfg: config.Config, budget: research_plan.Budget, answer: dict, evidence: dict, ref: str,
+def run(cfg: config.Config, budget: research_budget.Budget, answer: dict, evidence: dict, ref: str,
         judged: bool) -> Audit:
     s = steps.resolve(cfg, None, "research_audit")
     read = [t for t in s.tools if t not in runner.WEB_TOOLS]
@@ -263,7 +263,7 @@ def run(cfg: config.Config, budget: research_plan.Budget, answer: dict, evidence
                 failed = failed or got.tries > 0
                 reason = got.stop or got.why
                 audit.records += [record(c, None, reason) for c in batch]
-                research_search.say(ref, f"audit batch {n}: not audited, {reason[:200]}")
+                util.log_ref(ref, f"audit batch {n}: not audited, {reason[:200]}")
                 continue
             by_id = {c["claim"]: c for c in got.answer["checks"]}
             made = [record(c, by_id[c["id"]]) for c in batch]
@@ -276,18 +276,18 @@ def run(cfg: config.Config, budget: research_plan.Budget, answer: dict, evidence
                     made[i] = {**record(batch[i], None, WITHHELD), "screen": r["screen"]}
             audit.records += made
             audit.disagreements += [d for d in extra if d["screen"]["status"] in research_search.PASSED_ON]
-            research_search.say(ref, f"audit batch {n}: {util.count(got.tries, 'try', 'tries')}, "
+            util.log_ref(ref, f"audit batch {n}: {util.count(got.tries, 'try', 'tries')}, "
                                      f"{len(got.refused)} refused, {util.count(len(batch), 'claim')} checked")
     audit.records.sort(key=lambda r: int(r["id"][1:]))
     if not audit.records:
         audit.status, audit.why = INCOMPLETE, NO_CLAIMS
-        research_search.say(ref, f"audit {audit.status}: {audit.why}")
+        util.log_ref(ref, f"audit {audit.status}: {audit.why}")
         return audit
     unchecked = [r for r in audit.records if r["verdict"] == NOT_AUDITED]
     audit.why = unchecked[0]["why"] if unchecked else ""
     audit.status = FAILED if failed else INCOMPLETE if unchecked else COMPLETE
-    audit.paid_usd = research_plan.plus(budget.spent_usd, -started)
-    research_search.say(ref, f"audit {audit.status}" + (f": {audit.why[:200]}" if audit.why else ""))
+    audit.paid_usd = research_budget.plus(budget.spent_usd, -started)
+    util.log_ref(ref, f"audit {audit.status}" + (f": {audit.why[:200]}" if audit.why else ""))
     return audit
 
 

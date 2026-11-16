@@ -534,3 +534,7 @@ def write_durably(p: Path, data: bytes, mode: int | None = None, check=None) -> 
 
 def write_json(p: Path, data) -> None:
     write_durably(p, json.dumps(data, indent=2, default=str).encode(), 0o600)
+
+
+def log_ref(ref: str, line: str) -> None:
+    print(f"{iso()} {ref}: {line}", flush=True)

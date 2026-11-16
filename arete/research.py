@@ -16,6 +16,7 @@ from . import (
     jev,
     jev_verdicts,
     paths,
+    research_budget,
     research_plan,
     research_search,
     research_synthesis,
@@ -171,13 +172,13 @@ def move(cfg: config.Config, r: dict, to: str) -> None:
     try:
         m = tracker.JiraTracker(src.repos[0], cfg.jira).shift(r["ref"], target, stamps=True)
     except tracker.ERRORS as e:
-        print(f"{util.iso()} {r['ref']}: could not move it to {target}, trying next tick: "
-              f"{util.first_line(str(e), 300)}", flush=True)
+        util.log_ref(r['ref'], f"could not move it to {target}, trying next tick: "
+              f"{util.first_line(str(e), 300)}")
         return
     if m.error:
-        print(f"{util.iso()} {r['ref']}: not moved: {util.first_line(m.error, 300)}", flush=True)
+        util.log_ref(r['ref'], f"not moved: {util.first_line(m.error, 300)}")
     elif m.moved:
-        print(f"{util.iso()} {r['ref']}: moved to {target}", flush=True)
+        util.log_ref(r['ref'], f"moved to {target}")
         own_move(r, m)
     fields = {"moved": to}
     if to in ("pr", config.DELIVERED):
@@ -229,8 +230,7 @@ def settle_status(cfg: config.Config, r: dict) -> None:
     try:
         to = wanted(r, report)
     except gh.GhError as e:
-        print(f"{util.iso()} {r['ref']}: could not read {report['filed_url']}: {util.first_line(str(e), 300)}",
-              flush=True)
+        util.log_ref(r['ref'], f"could not read {report['filed_url']}: {util.first_line(str(e), 300)}")
         return
     if not to or to == report.get("moved"):
         return
@@ -254,7 +254,7 @@ def file_unfiled(cfg: config.Config) -> list[str]:
             continue
         if (src := source_of(cfg, r)) and (h := home_of(src, r)):
             ok, why = file_in_home(cfg, h, r)
-            print(f"{util.iso()} {r['ref']}: {why}", flush=True)
+            util.log_ref(r['ref'], f"{why}")
             failed += [] if ok else [f"{r['ref']}: {why}"]
     return failed
 
@@ -408,7 +408,7 @@ def related(src: triage.TriageSource, r: dict, done: list[tuple[str, dict, dict]
             if brief := src.brief(r["parent"]):
                 parts.append(f"### Its parent ticket, {brief}")
         except tracker.ERRORS as e:
-            print(f"{util.iso()} {r['ref']}: could not read its parent {r['parent']}: {e}", flush=True)
+            util.log_ref(r['ref'], f"could not read its parent {r['parent']}: {e}")
     for relation, o, report in done:
         text = report["report"]
         if len(text) > RELATED_CHARS:
@@ -421,38 +421,49 @@ def related(src: triage.TriageSource, r: dict, done: list[tuple[str, dict, dict]
             + "\n\n".join(parts))
 
 
-def staged(cfg: config.Config, ref: str, values: dict, where: dict, cwd, add_dirs: list,
-           family: list[str], started: float | None = None, judged: bool = False) -> tuple[Result, float]:
+def budget_for(cfg: config.Config) -> research_budget.Budget:
     searching = cfg.research_search
     audited = searching and cfg.research_audit
-    budget = research_plan.Budget(BUDGET_USD, TIMEOUT_SECONDS,
+    return research_budget.Budget(BUDGET_USD, TIMEOUT_SECONDS,
                                   (SEARCHED_RESERVE_USD if searching else REPORT_RESERVE_USD)
                                   + (AUDIT_RESERVE_USD if audited else 0),
                                   (SEARCHED_RESERVE_SECONDS if searching else REPORT_RESERVE_SECONDS)
                                   + (AUDIT_RESERVE_SECONDS if audited else 0))
+
+
+def spent_error(budget: research_budget.Budget) -> tuple[Result, float]:
+    return Result(ok=False, error=f"the research budget is spent ({budget.spent_words()}), "
+                                  "so no report was written"), budget.spent_usd
+
+
+def staged(cfg: config.Config, ref: str, values: dict, where: dict, cwd, add_dirs: list,
+           family: list[str], started: float | None = None, judged: bool = False) -> tuple[Result, float]:
+    budget = budget_for(cfg)
     if started is not None:
         budget.started = started
     planned = research_plan.plan(cfg, budget, prompt("research_plan", **values), cwd, add_dirs, ref, family)
     if not planned.plan:
         return Result(ok=False, error=planned.error), budget.spent_usd
     plan = planned.plan
-    print(f"{util.iso()} {ref}: " + (
+    util.log_ref(ref, (
         f"planned {util.count(len(plan['tasks']), 'search task')} (try {planned.tries})" if plan["needs_search"]
-        else f"planned no search: the reports for {', '.join(plan['covered_by'])} cover it"), flush=True)
+        else f"planned no search: the reports for {', '.join(plan['covered_by'])} cover it"))
+    return report_after(cfg, budget, plan, ref, judged, values, where, cwd, add_dirs)
+
+
+def report_after(cfg, budget, plan, ref, judged, values, where, cwd, add_dirs):
     usd, seconds = budget.final()
     if budget.short(usd, seconds):
-        return Result(ok=False, error=f"the research budget is spent ({budget.spent_words()}), "
-                                      "so no report was written"), budget.spent_usd
+        return spent_error(budget)
     brief = research_plan.brief(plan)
     tools = TOOLS if plan["needs_search"] else runner.READ_TOOLS
-    if plan["needs_search"] and searching:
+    if plan["needs_search"] and cfg.research_search:
         found = research_search.run(cfg, budget, plan, ref, judged)
         if found.error:
             return Result(ok=False, error=found.error), budget.spent_usd
         usd, seconds = budget.final()
         if budget.short(usd, seconds):
-            return Result(ok=False, error=f"the research budget is spent ({budget.spent_words()}), "
-                                          "so no report was written"), budget.spent_usd
+            return spent_error(budget)
         if cfg.research_synthesis:
             res = research_synthesis.run(cfg, budget, plan, found.evidence, ref, judged, values, where, cwd, add_dirs)
             return res, budget.spent_usd
@@ -484,6 +495,15 @@ def research(cfg: config.Config, r: dict, force: bool = False, asked: bool = Fal
     done = [(relation, o, reports[o["ref"]]) for relation, o in kin
             if o["ref"] in reports and reports[o["ref"]]["status"] == DONE and reports[o["ref"]]["report"]]
     judged = jev.ready(cfg, list(src.repos))
+    if skipped := screen(cfg, r, ticket, prior, said, basis, judged, rows, kin, done, base, force, asked):
+        return skipped
+    dirs, h, filed_path, values = begin(cfg, r, src, prior, basis, text, done, base)
+    res, paid = ask(cfg, ref, values, h, filed_path, dirs, done, started, judged)
+    return finish_report(cfg, r, res, paid, h, filed_path, said, basis)
+
+
+def screen(cfg, r, ticket, prior, said, basis, judged, rows, kin, done, base, force, asked):
+    ref, text = r["ref"], ticket.text
     if not force:
         if not asked and (why := still_stands(cfg, r, prior, said, basis, judged)):
             state.research_keep(ref, title=r["title"], url=r["url"], updated=r["updated"], basis=basis)
@@ -509,6 +529,10 @@ def research(cfg: config.Config, r: dict, force: bool = False, asked: bool = Fal
             why = f"JEV reads text in it as instructions to an agent (p {screened.yes:.2f})"
             state.research_set(ref, **base, status=HELD, error=why)
             return HELD, why
+
+
+def begin(cfg, r, src, prior, basis, text, done, base):
+    ref = r["ref"]
     state.research_set(ref, **base, status=RUNNING, error="", basis=basis,
                        **({} if r.get("closed") else {"moved": "", "delivered": ""}))
     move(cfg, r, "running")
@@ -518,9 +542,13 @@ def research(cfg: config.Config, r: dict, force: bool = False, asked: bool = Fal
     h = home_of(src, r)
     filed_path = kept_path(h, prior)
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"{util.iso()} {ref}: researching", flush=True)
+    util.log_ref(ref, "researching")
     values = {"ref": ref, "title": r["title"], "ticket": text, "related": related(src, r, done),
               "repos": "\n".join(f"- `{repo.name}` at {repo.path}" for repo in repos) or "none"}
+    return dirs, h, filed_path, values
+
+
+def ask(cfg, ref, values, h, filed_path, dirs, done, started, judged):
     with nullcontext(dirs[0]) if dirs else tempfile.TemporaryDirectory() as cwd:
         if cfg.research_planner:
             res, paid = staged(cfg, ref, values, filing(h, filed_path), cwd, dirs[1:],
@@ -532,6 +560,11 @@ def research(cfg: config.Config, r: dict, force: bool = False, asked: bool = Fal
                              timeout=TIMEOUT_SECONDS, persist=False, add_dirs=dirs[1:], trace=("", f"research {ref}"),
                              cfg=cfg)
             paid = res.paid_usd
+    return res, paid
+
+
+def finish_report(cfg, r, res, paid, h, filed_path, said, basis):
+    ref = r["ref"]
     answer = res.structured if res.ok and isinstance(res.structured, dict) else {}
     report = str(answer.get("report") or "").strip()
     if not report:
@@ -540,27 +573,31 @@ def research(cfg: config.Config, r: dict, force: bool = False, asked: bool = Fal
         move(cfg, r, "failed")
         return FAILED, why
     summary = " ".join(str(answer.get("summary") or "").split())
-    if not h:
-        report_file(ref).write_text(f"# {ref}: {r['title']}\n\n{r['url']}\n\nResearched {triage.stamp(util.iso())} "
-                                    f"({util.paid_note(paid)}).\n\n**Summary:** {summary}\n\n{report}\n")
-        state.research_set(ref, status=DONE, summary=summary, report=report, error="", cost=paid,
-                           ticket=said, basis=basis, filed_path="", filed_url="")
-        settle_status(cfg, r)
-        return DONE, f"report written to {paths.short_path(report_file(ref))} ({util.paid_note(paid)})"
-    titled = report if TITLE_LINE.match(report) else f"# {r['title']}\n\n{report}"
-    report_file(ref).write_text(f"{titled.rstrip()}\n")
-    try:
-        filed_path = filed_path or claim_path(h, str(answer.get("name") or ""), r["title"])
-    except RuntimeError as e:
-        state.research_set(ref, status=FAILED, error=f"could not read {h.repo.name}: {e}", cost=paid,
-                           summary=summary, report=TITLE_LINE.sub("", titled, count=1))
-        move(cfg, r, "failed")
-        return FAILED, f"could not read {h.repo.name}: {util.first_line(str(e), 300)}"
-    state.research_set(ref, status=DONE, summary=summary, report=TITLE_LINE.sub("", titled, count=1), error="",
-                       cost=paid, ticket=said, basis=basis, filed_path=filed_path, filed_url="")
-    ok, why = file_in_home(cfg, h, r)
+    if h:
+        titled = report if TITLE_LINE.match(report) else f"# {r['title']}\n\n{report}"
+        contents = f"{titled.rstrip()}\n"
+        report = TITLE_LINE.sub("", titled, count=1)
+    else:
+        contents = (f"# {ref}: {r['title']}\n\n{r['url']}\n\nResearched {triage.stamp(util.iso())} "
+                    f"({util.paid_note(paid)}).\n\n**Summary:** {summary}\n\n{report}\n")
+    report_file(ref).write_text(contents)
+    if h:
+        try:
+            filed_path = filed_path or claim_path(h, str(answer.get("name") or ""), r["title"])
+        except RuntimeError as e:
+            state.research_set(ref, status=FAILED, error=f"could not read {h.repo.name}: {e}", cost=paid,
+                               summary=summary, report=report)
+            move(cfg, r, "failed")
+            return FAILED, f"could not read {h.repo.name}: {util.first_line(str(e), 300)}"
+    state.research_set(ref, status=DONE, summary=summary, report=report, error="", cost=paid,
+                       ticket=said, basis=basis, filed_path=filed_path, filed_url="")
+    if h:
+        ok, why = file_in_home(cfg, h, r)
+        outcome, why = DONE if ok else FAILED, f"{why} ({util.paid_note(paid)})"
+    else:
+        outcome, why = DONE, f"report written to {paths.short_path(report_file(ref))} ({util.paid_note(paid)})"
     settle_status(cfg, r)
-    return DONE if ok else FAILED, f"{why} ({util.paid_note(paid)})"
+    return outcome, why
 
 
 def next_due(dry_run: bool = False, asked: list[dict] | None = None) -> int:
@@ -590,7 +627,7 @@ def next_due(dry_run: bool = False, asked: list[dict] | None = None) -> int:
             return 1 if unfiled else 0
         for r in todo:
             outcome, why = research(cfg, r)
-            print(f"{util.iso()} {r['ref']}: {outcome}: {why}", flush=True)
+            util.log_ref(r['ref'], f"{outcome}: {why}")
             if outcome not in NO_RUN:
                 break
         ok = outcome in (DONE, *NO_RUN)
@@ -608,7 +645,7 @@ def research_asked(cfg: config.Config, asked: list[dict], unfiled: list[str]) ->
         else:
             ref = r["ref"]
             outcome, why = research(cfg, r, force=event.get("force") is True, asked=True)
-        print(f"{util.iso()} {ref}: {outcome}: {why}", flush=True)
+        util.log_ref(ref, f"{outcome}: {why}")
         if outcome in (FAILED, LATER):
             failures.append(f"{ref}: {why}")
     mark_loop("research", not failures and not unfiled, failures[0] if failures else unfiled[0] if unfiled else why)
