@@ -84,7 +84,6 @@ html, body, #app { height: 100%; }
   [data-screen="run"] .search { justify-content: center; padding: 0; }
   [data-screen="run"] .side-nav { padding: 4px; }
   [data-screen="run"] .nav-row { justify-content: center; height: 36px; padding: 0; }
-  [data-screen="run"] .pane-grid { grid-template-columns: minmax(0, 1fr); }
   [data-screen="run"] .queue { border-right: 0; }
   [data-screen="run"]:not([data-run-pane="focus"]) .focus,
   [data-screen="run"][data-run-pane="focus"] .queue { display: none; }

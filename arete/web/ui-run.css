@@ -41,6 +41,7 @@
 .run-back { display: none; }
 .strip-actions button:disabled { color: var(--muted); cursor: default; }
 @media (width < 900px) {
+  [data-screen="run"] .pane-grid { grid-template-columns: minmax(0, 1fr); }
   [data-screen="run"] .run-row { height: auto; min-height: var(--row); padding: 6px 8px; white-space: normal; }
   [data-screen="run"] .run-title { overflow: visible; overflow-wrap: anywhere; }
   [data-screen="run"][data-run-pane="focus"] .run-back { display: inline-flex; padding: 2px 8px; border: 1px solid var(--rule-strong); background: none; cursor: pointer; font-size: var(--text-s); }
