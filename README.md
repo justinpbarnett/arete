@@ -2123,7 +2123,8 @@ It adds `agent`, `fix` or `feature`, and `agent:auto` together; Jira also receiv
 JEV must be enabled for the repo, its required injection screen must pass, the issue must still be open and owned, and its version must match the one triage read.
 `no-agent`, `agent:hold`, `duplicate`, `invalid`, `wontfix` and existing pipeline-state labels prevent automatic admission.
 Issues labelled `loop` stay with their dedicated loop-intake workflow.
-Dependencies can enter the queue but still block execution until resolved.
+Concrete repository work can enter the queue even when it is large or its dependencies have not landed.
+Dependencies still block execution until resolved.
 Research and person work stay on their existing routes rather than acquiring `agent`.
 
 The default admission allowance is 50 tickets per tracker per refresh; zero disables that allowance.
@@ -2136,7 +2137,9 @@ Sent tickets remain on the board for seven days with their pipeline status and P
 Explicit `fix`, `bug` and `feature` labels are respected; otherwise JEV decides and saves a `fix` or `feature` label for subsequent starts.
 Remove that kind label to request a fresh classification after changing the issue's purpose.
 Confident fixes request the ADW patch flow, subject to its scope, sensitive-work, review, verification and final-check gates.
-Features use the full planning flow, and an uncertain or unavailable classifier keeps the existing route.
+Features use the full planning flow.
+Clear, actionable repository work also takes the full flow when JEV is uncertain whether it is a fix or feature; that uncertainty never enables the patch shortcut.
+Otherwise an uncertain or unavailable classifier keeps the existing route.
 Poll dry runs make no classification calls or label writes.
 
 You can also send a ticket yourself from the dashboard's Triage view.

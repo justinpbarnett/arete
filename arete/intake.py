@@ -20,7 +20,8 @@ KIND_OPTIONS = {
     FEATURE: "a new or changed capability, screen, field, behavior, setting, refactoring or document in a repository",
     "none": "the text gives no identifiable task",
 }
-ACTIONABLE = "Is the next action requested by this ticket work a coding agent can perform in a software repository?"
+ACTIONABLE = ("Does this ticket request concrete work in a software repository that a coding agent can implement? "
+              "Size and unfinished dependencies do not make repository work a human-only task.")
 LABEL_STYLES = {
     tracker.LABEL: tracker.APPROVAL_LABEL_STYLE,
     AUTO_LABEL: ("c5def5", "Approved by automatic triage; a person merges the PR"),
@@ -39,7 +40,8 @@ class Assessment:
 
 
 def policy(cfg: config.Config) -> str:
-    data = {"code": ASKS_FOR_CODE, "kind": KIND_OPTIONS, "actionable": ACTIONABLE,
+    data = {"version": 2, "code": ASKS_FOR_CODE, "kind_question": KIND_QUESTION,
+            "kind": KIND_OPTIONS, "actionable": ACTIONABLE,
             "model": cfg.jev.model, "confidence": cfg.jev.confidence, "skip": cfg.jev.triage_skip,
             "available": jev.ready(cfg),
             "repos": [(r.name, r.pipeline, r.jev, r.tracker, r.github, r.jira_project, r.jira_label) for r in cfg.repos]}
@@ -62,6 +64,10 @@ def classify(cfg: config.Config, repos: list[config.Repo], title: str, text: str
     if not code:
         return Assessment(why=reply.error or "JEV gave no code assessment", cost=reply.cost_usd)
     sure = str(kind.value) if kind and kind.value in KINDS and kind.sure(cfg.jev.confidence) else ""
+    clear_code = code.yes >= 0.5 and code.sure(cfg.jev.confidence)
+    can_implement = bool(actionable and actionable.value is True and actionable.sure(cfg.jev.confidence))
+    if not sure and kind and kind.value in (FIX, FEATURE) and clear_code and can_implement:
+        sure = FEATURE
     if code.yes <= cfg.jev.triage_skip or code.yes < 0.5 and sure in (RESEARCH, PERSON):
         settled = RESEARCH if sure == RESEARCH else PERSON
         return Assessment(settled, why=f"JEV reads it as {settled} work ({code.note()})", cost=reply.cost_usd)
@@ -71,8 +77,7 @@ def classify(cfg: config.Config, repos: list[config.Repo], title: str, text: str
     repo = repos[0].name if len(repos) == 1 else (
         str(named.value) if named and named.sure(cfg.jev.confidence)
         and named.value != "none" and named.value in {r.name for r in repos} else "")
-    ready = bool(repo and code.sure(cfg.jev.confidence) and actionable and actionable.value is True
-                 and actionable.sure(cfg.jev.confidence))
+    ready = bool(repo and clear_code and can_implement)
     evidence = f"kind {kind.note()}; code {code.note()}; actionable {actionable.note() if actionable else 'unknown'}"
     if named:
         evidence += f"; repo {named.note()}"
