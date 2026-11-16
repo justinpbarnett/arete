@@ -900,8 +900,6 @@ ROUTES = (
 def serve(port: int | None = None, inside_serve: bool = False, host: tailnet.Tailscale | None = None) -> NoReturn:
     cfg = config.load_or_problem()[0]
     port = port or cfg.dashboard_port
-    if not inside_serve and not paths.DB_FILE.exists():
-        foundation.migrate()
     foundation.ensure_schema()
     chat.recover()
     if inside_serve:
