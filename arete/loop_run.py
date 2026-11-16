@@ -10,8 +10,8 @@ import sys
 import threading
 import time
 import traceback
-from contextlib import ExitStack, contextmanager, suppress
 from concurrent.futures import CancelledError
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 
