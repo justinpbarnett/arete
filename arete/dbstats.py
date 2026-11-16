@@ -5,12 +5,15 @@ import inspect
 import json
 import math
 import os
+import stat
 import sys
 import threading
 import time
 import uuid
+from collections import Counter
 from contextlib import suppress
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from . import paths, util
 
@@ -86,7 +89,8 @@ class Timing:
         with suppress(BaseException):
             ended = time.monotonic()
             total = (ended - self.started) * 1000
-            row = {"timestamp": self.timestamp, "pid": os.getpid(), "process_kind": process_kind(),
+            row = {"timestamp": self.timestamp, "database": self.database,
+                   "pid": os.getpid(), "process_kind": process_kind(),
                    "caller": self.caller, "mode": self.mode, "total_ms": total,
                    "begin_ms": total if self.begin_ms is None else self.begin_ms,
                    "commit_ms": self.commit_ms,
@@ -128,3 +132,133 @@ def retain(database, hour, row):
         folder.mkdir(parents=True, exist_ok=True)
         name = f"{database}-{INCARNATION}-{hour[:13].replace(':', '')}.json"
         util.write_durably(folder / name, json.dumps(summary).encode(), 0o600)
+
+
+def log_records(start, end, database=None):
+    database = database or database_identity(paths.DB_FILE)
+    for file in paths.LOG_DIR.glob("db.log*"):
+        if file.name != "db.log" and not file.name.removeprefix("db.log.").isdigit():
+            continue
+        try:
+            with file.open(errors="replace") as stream:
+                for line in stream:
+                    if not line.endswith("\n"):
+                        continue
+                    try:
+                        row = json.loads(line)
+                        at = datetime.fromisoformat(row["timestamp"])
+                        ms = row["total_ms"]
+                        if (start <= at < end and row.get("database", database) == database
+                                and type(ms) in (float, int) and math.isfinite(ms) and ms >= 0):
+                            yield row
+                    except (ValueError, TypeError, KeyError, AttributeError):
+                        continue
+        except (OSError, UnicodeError):
+            continue
+
+
+def file_bytes(file):
+    try:
+        info = file.lstat()
+        return info.st_size if stat.S_ISREG(info.st_mode) else 0
+    except OSError:
+        return 0
+
+
+def database_bytes():
+    return {"db_bytes": file_bytes(paths.DB_FILE),
+            "wal_bytes": file_bytes(paths.DB_FILE.with_name(paths.DB_FILE.name + "-wal"))}
+
+
+def runs_bytes():
+    record = other = 0
+    if paths.RUNS_DIR.is_symlink():
+        return {"record_bytes": 0, "other_bytes": 0, "total_bytes": 0}
+    for folder, dirs, files in os.walk(paths.RUNS_DIR, followlinks=False):
+        dirs[:] = [name for name in dirs if not (Path(folder) / name).is_symlink()]
+        relative = Path(folder).relative_to(paths.RUNS_DIR)
+        for name in files:
+            size = file_bytes(Path(folder) / name)
+            if len(relative.parts) >= 2 and relative.parts[1] == "record":
+                record += size
+            else:
+                other += size
+    return {"record_bytes": record, "other_bytes": other, "total_bytes": record + other}
+
+
+def transaction_totals(start, end, database):
+    count = 0
+    maximum = 0.0
+    histogram = Counter()
+    kinds = Counter()
+    seen = set()
+    for file in (paths.LOG_DIR / "dbstats").glob("*.json"):
+        try:
+            summary = json.loads(file.read_text())
+            hour = datetime.fromisoformat(summary["hour"])
+            identity = (summary["incarnation"], hour)
+            if (summary["format"] != 1 or summary["database"] != database
+                    or not start <= hour < end or identity in seen
+                    or hour.utcoffset() != timedelta(0) or hour.minute or hour.second or hour.microsecond
+                    or not isinstance(summary["incarnation"], str) or not summary["incarnation"]):
+                continue
+            groups = list(summary["transactions"].values())
+            for group in groups:
+                if (type(group["count"]) is not int or group["count"] < 0
+                        or not math.isfinite(group["max_ms"]) or group["max_ms"] < 0
+                        or sum(group["histogram"].values()) != group["count"]
+                        or any(type(n) is not int or n < 0 or not 0 <= int(b) <= 64
+                               for b, n in group["histogram"].items())):
+                    raise ValueError("invalid transaction summary")
+            kind = summary["process_kind"]
+            if not isinstance(kind, str):
+                continue
+            seen.add(identity)
+            for group in groups:
+                count += group["count"]
+                kinds[kind] += group["count"]
+                maximum = max(maximum, group["max_ms"])
+                histogram.update({int(b): n for b, n in group["histogram"].items()})
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            continue
+    rank, accumulated, p95 = math.ceil(count * .95), 0, None
+    for bucket, n in sorted(histogram.items()):
+        accumulated += n
+        if rank and accumulated >= rank:
+            p95 = min(maximum, 2 ** bucket)
+            break
+    return {"transaction_count": count, "p95_ms": p95, "max_ms": maximum if count else None,
+            "transactions_by_kind": dict(kinds)}
+
+
+def empty_collection():
+    return dict.fromkeys(("window_start", "window_end", "collected_at", "transaction_count", "p95_ms", "max_ms",
+                          "transactions_by_kind", "slow_by_kind", "errors_by_kind", "errors_by_class",
+                          "db_bytes", "wal_bytes", "record_bytes", "other_bytes", "total_bytes", "tables"))
+
+
+def collect(now=None):
+    from . import state
+
+    now = (now or datetime.now(UTC)).astimezone(UTC)
+    end = now.replace(minute=0, second=0, microsecond=0)
+    start = end - timedelta(hours=1)
+    database = database_identity(paths.DB_FILE)
+    totals = transaction_totals(start, end, database)
+    slow, error_kinds, errors = Counter(), Counter(), Counter()
+    for row in log_records(start, end, database):
+        kind = str(row.get("process_kind") or "unknown")
+        if row["total_ms"] > 500:
+            slow[kind] += 1
+        if error := row.get("error"):
+            error_kinds[kind] += 1
+            errors[str(error)] += 1
+    with state.one_read() as conn:
+        names = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")]
+        tables = {}
+        for name in names:
+            quoted = '"' + name.replace('"', '""') + '"'
+            tables[name] = conn.execute(f"SELECT COUNT(*) FROM {quoted}").fetchone()[0]
+    return {**totals, "window_start": start.isoformat(), "window_end": end.isoformat(),
+            "collected_at": now.isoformat(), "slow_by_kind": dict(slow), "errors_by_kind": dict(error_kinds),
+            "errors_by_class": dict(errors), **database_bytes(), **runs_bytes(), "tables": tables}

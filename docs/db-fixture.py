@@ -22,7 +22,8 @@ from unittest import mock
 REPO = Path(__file__).resolve().parents[1]
 ROOT = REPO / ".arete-sandbox" / "db-fixture"
 ACTIONS = ("transactions", "concurrent-intake", "transaction-timing", "output-sinks", "durable-files",
-           "wal-startup", "prune-restore", "restore-safety", "feed-cursors", "backup-health")
+           "wal-startup", "prune-restore", "restore-safety", "feed-cursors", "backup-health",
+           "coherent-reads", "event-contract", "database-health", "legacy-cleanup")
 sys.path.insert(0, str(REPO))
 
 
@@ -1492,11 +1493,17 @@ def backup_health():
         os.utime(snapshot, (stale, stale))
         checked["stale"] = heartbeat.check_backup_db().ok
         outputs["stale"] = backup_health_cli()
+        with mock.patch.object(install, "serve_installed", return_value=False):
+            require(not heartbeat.check_backup_db().ok, "stale snapshot passed with serve uninstalled")
+            outputs["stale_uninstalled"] = backup_health_cli()
         snapshot = backup.snapshot("health")
         with snapshot.open("r+b") as file:
             file.truncate(snapshot.stat().st_size // 2)
         checked["truncated"] = heartbeat.check_backup_db().ok
         outputs["truncated"] = backup_health_cli()
+        with mock.patch.object(install, "serve_installed", return_value=False):
+            require(not heartbeat.check_backup_db().ok, "corrupt snapshot passed with serve uninstalled")
+            outputs["corrupt_uninstalled"] = backup_health_cli()
         snapshot = backup.snapshot("health")
         backup.update_last(quick_check="fixture failed check")
         checked["recorded"] = heartbeat.check_backup_db().ok
@@ -1618,6 +1625,510 @@ def backup_health_cli():
     return rc, output
 
 
+def page_seed():
+    from arete import paths, sessions, state, util
+
+    now = util.iso()
+    modes = {"local": ("pi", "ollama", "api_key"), "replay": ("replay", "", ""),
+             "subscription": ("claude", "anthropic", "subscription"), "api-key": ("pi", "openai", "api_key")}
+    with state.tx() as conn:
+        for name in (*modes, "mixed", "session"):
+            conn.execute("INSERT OR IGNORE INTO runs (id,kind,status,started,finished,summary) VALUES (?,?,?,?,?,?)",
+                         (name, "session" if name == "session" else "pipeline", "done", now, now, name))
+            for billing in modes if name == "mixed" else (("subscription",) if name == "session" else (name,)):
+                runner, provider, auth = modes[billing]
+                if name == "mixed" and billing == "subscription":
+                    runner = "pi"
+                conn.execute("INSERT INTO steps (run_id,step,runner,provider,model,auth_mode,cost_usd,ts,ok) "
+                             "VALUES (?,'build',?,?,?,?,1.2345,?,1)",
+                             (name, runner, provider, "shared-model" if name == "mixed" else provider + "/fixture",
+                              auth, now))
+        conn.execute("INSERT INTO runs (id,kind,status,started) VALUES ('settling','pipeline','running',?)", (now,))
+    chat_id = state.chat_add("")
+    state.chat_say(chat_id, "user", "Read snapshots and billing")
+    state.chat_link_session(chat_id, "session", 10)
+    state.save_report("session", {"summary": "Fixture report", "body": "A complete offline session report"})
+    util.write_json(sessions.spec_file("session"), {"prompt": "Fixture session", "tools": [], "chat": chat_id})
+    return {"runs": [*modes, "mixed", "session"], "chat": chat_id, "session": "session"}
+
+
+def fixture_http(port=0):
+    from http.server import ThreadingHTTPServer
+
+    from arete import dashboard, tailnet
+
+    server = ThreadingHTTPServer(("127.0.0.1", port), dashboard.Handler)
+    server.node = tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1", "localhost"}), "fixture", "")
+    server.logins = SimpleNamespace(of=lambda address: "fixture" if address == "127.0.0.1" else "")
+    return server
+
+
+def http_json(server, path, body=None, admitted=True):
+    import urllib.error
+    import urllib.request
+
+    url = f"http://127.0.0.1:{server.server_port}"
+    headers = {"Origin": url, "Content-Type": "application/json"}
+    if admitted:
+        headers["X-Arete"] = "1"
+    request = urllib.request.Request(url + path, data=None if body is None else json.dumps(body).encode(),
+                                     headers=headers)
+    try:
+        response = urllib.request.urlopen(request, timeout=10)
+    except urllib.error.HTTPError as error:
+        response = error
+    with response:
+        return response.status, json.load(response)
+
+
+def coherent_reads():
+    from arete import board, chat, control, paths, sessions, state, tasks, util
+    from arete.commands import costs
+
+    evidence = setup()
+    seeded = page_seed()
+    conn = paths.connect_db(paths.DB_FILE)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.close()
+    connections, windows = [], []
+    connect, steps_since = paths.connect_db, state.steps_since
+
+    def tracked(*args, **kw):
+        connections.append({"thread": threading.current_thread().name, "readonly": kw.get("readonly", False)})
+        return connect(*args, **kw)
+
+    def steps(since, connect=state.reader):
+        windows.append(since)
+        return steps_since(since, connect)
+
+    def read_once(call):
+        connections.clear()
+        result = call()
+        require(len(connections) == 1 and connections[0]["readonly"], connections)
+        return result
+
+    with mock.patch.object(paths, "connect_db", tracked), mock.patch.object(state, "steps_since", steps):
+        evidence["snapshot"] = read_once(board.snapshot)
+        evidence["run"] = read_once(lambda: board.run_board("mixed"))
+        require(evidence["run"]["run"]["paid"] == sum(m["paid"] for m in evidence["run"]["models"]), "paid mismatch")
+        for args in ([], ["--by", "route", "model", "--json"]):
+            code, output = read_once(lambda: cli_output("costs", *args))
+            require(code == 0, output)
+        require(windows[-1] == windows[-2], windows)
+        evidence["windows"] = windows[:]
+        server = fixture_http()
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            urls = ["/api/meta", "/api/runs/mixed", "/api/chats", f"/api/chats/{seeded['chat']}",
+                    f"/api/chats/{seeded['chat']}/sessions",
+                    f"/api/chats/{seeded['chat']}/sessions/session/report", "/api/sidebar", "/api/push",
+                    "/api/sessions", "/api/feed/session", "/api/live", "/api/find"]
+            evidence["gets"] = {}
+            for url in urls:
+                status, result = read_once(lambda: http_json(server, url))
+                require(status == 200, (url, status, result))
+                evidence["gets"][url] = {"status": status, "connections": connections[:]}
+            for url, status in (("/api/runs/does-not-exist", 404), ("/api/not-a-route", 404),
+                                ("/api/runs?limit=bad", 400)):
+                got, result = http_json(server, url)
+                require(got == status and "error" in result, (url, got, result))
+            require(http_json(server, "/api/chats/new", {"project": ""})[0] == 200, "POST failed")
+            require(http_json(server, "/api/chats/new", {"project": ""}, admitted=False)[0] == 403, "admission bypass")
+
+            def remote(*args):
+                active = getattr(state._OWNER, "active", None)
+                require(active and active[1] == "read", active)
+                return {"id": 42, "ref": "fake#42", "title": "remote"}, "fake"
+
+            with mock.patch.object(tasks, "tracker_item", remote):
+                require(read_once(lambda: http_json(server, "/api/tasks/42"))[0] == 200, "remote GET")
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(10)
+    require(not state.chat_sessions(seeded["chat"])[0]["told"], "GET delivered a report")
+    require(sessions.tell_chats() >= 1 and state.chat_sessions(seeded["chat"])[0]["told"], "writer did not deliver")
+    evidence["report_delivery"] = chat.session_report(seeded["chat"], "session")
+
+    def concurrent_read(target, read_name, commit):
+        original = getattr(state, read_name)
+        reached, released = threading.Event(), threading.Event()
+        once = False
+
+        def paused(*a, **kw):
+            nonlocal once
+            answer = original(*a, **kw)
+            if not once:
+                once = True
+                reached.set()
+                require(released.wait(10), "read barrier timed out")
+            return answer
+
+        with ThreadPoolExecutor(1) as pool, mock.patch.object(state, read_name, paused):
+            future = pool.submit(target)
+            try:
+                require(reached.wait(10), "read barrier not reached")
+                commit()
+            finally:
+                released.set()
+            return future.result(10)
+
+    def settle():
+        with state.tx() as conn:
+            conn.execute("UPDATE runs SET status='done', finished=? WHERE id='settling'", (util.iso(),))
+
+    snap = concurrent_read(board.snapshot, "runs_marked_running", settle)
+    live = snap["live"]["rows"]["runs"]
+    recent = snap["recent"]["rows"]
+    require(any(r["id"] == "settling" for r in live)
+            and next(r for r in recent if r["id"] == "settling")["status"] == "running", snap)
+
+    def add_step():
+        with state.tx() as conn:
+            conn.execute("INSERT INTO steps (run_id,step,runner,provider,auth_mode,cost_usd,ts) "
+                         "VALUES ('mixed','late','pi','openai','api_key',2,?)", (util.iso(),))
+
+    run = concurrent_read(lambda: board.run_board("mixed"), "steps", add_step)
+    require(run["run"]["paid"] == sum(m["paid"] for m in run["models"]), run)
+    def cost_report():
+        with state.one_read():
+            return control.costs(connect=state.reader)
+
+    with mock.patch.object(state, "steps_since", steps):
+        report = concurrent_read(cost_report, "steps_since", add_step)
+    require(windows[-1] == windows[-2], windows)
+    require(round(report["total_usd"], 2) == round(sum(r["paid_usd"] for r in report["by_route"]), 2), report)
+    evidence["barriers"] = {"snapshot": snap, "run": run, "costs": report}
+    with mock.patch.object(costs, "print_step_costs", side_effect=AssertionError("writer entered report")):
+        require(cli_output("costs", "--correct", "mixed", "-0.25", "--why", "fixture")[0] == 0, "correction failed")
+        require(cli_output("costs", "--backfill")[0] == 0, "backfill failed")
+    return evidence
+
+
+def event_contract():
+    import hashlib
+
+    from arete import backup, config, control, loop_run, loops, paths, state, util
+
+    paths.ensure_dirs()
+    paths.CONFIG_FILE.write_text('[replay]\nall = true\n[jev]\nenabled = false\n')
+    hashes = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+              for p in (REPO / "arete/migrations").glob("m000[1-3]*.py")}
+    original = paths.DB_FILE
+    evidence = {"journal_mode": "delete", "synchronous": 1, "cases": [], "historical_hashes": hashes}
+    sleeper = child("sleep")
+    try:
+        for kind in ("fresh", "v0", "v3"):
+            paths.DB_FILE = original.parent / kind / "arete.db"
+            paths.DB_FILE.parent.mkdir()
+            if kind == "v0":
+                conn = paths.connect_db(paths.DB_FILE, create=True)
+                conn.executescript((REPO / "tests/fixtures/schema-v0.sql").read_text())
+                conn.execute("INSERT INTO events(loop,type,source,key,data,ts) VALUES "
+                             "('history','command','old','kept','payload',?)", (util.iso(),))
+                conn.commit()
+                conn.close()
+            state.migrate(contracts=False)
+            with state.tx() as conn:
+                conn.execute("INSERT INTO runs(id,kind,status,started,pid,schema_version) "
+                             "VALUES ('older','loop','running',?,?,3)", (util.iso(), sleeper.pid))
+            require(state.migrate(), "older run did not block contract")
+            with state.tx() as conn:
+                conn.execute("UPDATE runs SET schema_version=NULL WHERE id='older'")
+            require(state.migrate(), "unstamped run did not block contract")
+            state.add_event("pending", {"type": "finding", "source": "fixture", "key": kind})
+            with state.tx() as conn:
+                conn.execute("UPDATE runs SET status='done' WHERE id='older'")
+            for stamp in (3, None):
+                util.write_json(control.BEAT_FILE, {"pid": sleeper.pid, "schema": stamp})
+                require(state.migrate(), "older serve did not block contract")
+            stop_child(sleeper)
+            require(not state.migrate(), "contract did not finish")
+            control.BEAT_FILE.unlink()
+            state.add_event("after", {"type": "finding", "source": "fixture", "key": kind})
+            with state.one_read() as conn:
+                columns = [r[1] for r in conn.execute("PRAGMA table_info(events)")]
+                meta = dict(conn.execute("SELECT key,value FROM schema_meta"))
+                rows = [dict(r) for r in conn.execute("SELECT * FROM events")]
+                require("data" not in columns and int(meta["oldest_writer"]) == state.LATEST, meta)
+                require(len(rows) == (3 if kind == "v0" else 2), rows)
+            require(not state.migrate(), "migration repeated")
+            evidence["cases"].append({"kind": kind, "columns": columns, "events": rows, "meta": meta})
+            sleeper = child("sleep")
+    finally:
+        stop_child(sleeper)
+        paths.DB_FILE = original
+    state.migrate()
+    from arete import sources
+
+    loop = loops.Loop("event-fixture", paths.CONFIG_DIR, "fixture", trigger=loops.Trigger(webhook=True))
+    loop.prompt_file.write_text("Report the supplied event data.")
+    events = [sources.event(kind, "fixture", kind, kind, trust="internal", data={"text": "x" * 30000})
+              for kind in ("command", "finding")]
+    item = sources.fire(loop, "fixture", events)[0]
+    require(state.queue_item(item)["payload"] == events, "queue truncated events")
+    from arete.agent import Result
+
+    with mock.patch.object(control, "working_loop", return_value=loop), \
+            mock.patch.object(loop_run.runner, "run", return_value=Result(
+                ok=True, runner="replay", structured={"summary": "fixture", "findings": [], "state": {}})):
+        run = loop_run.launch(loop.name, item=item, detach=False, cfg=config.load())
+    require(run["status"] == "done" and run["runner"] == "replay", run)
+    require(util.read_json(paths.RUNS_DIR / run["id"] / "events.json", []) == events, "run events truncated")
+    require(hashes == {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                       for p in (REPO / "arete/migrations").glob("m000[1-3]*.py")}, "historical migration edited")
+    evidence["payload_lengths"] = [len(e["data"]["text"]) for e in events]
+    evidence["snapshot"] = backup.inspect(paths.DB_FILE)
+    return evidence
+
+
+def database_health():
+    from arete import backup, config, dbstats, heartbeat, install, paths, state, util
+
+    evidence = setup()
+    anchor = paths.connect_db(paths.DB_FILE)
+    anchor.execute("PRAGMA journal_mode=WAL")
+    anchor.execute("BEGIN")
+    anchor.execute("SELECT COUNT(*) FROM schema_meta").fetchone()
+    evidence["journal_mode"] = "wal"
+    with state.tx() as conn:
+        conn.execute('CREATE TABLE "odd""table" (value TEXT)')
+        conn.execute('INSERT INTO "odd""table" VALUES (\'kept\')')
+    now = datetime.now(UTC)
+    end = now.replace(minute=0, second=0, microsecond=0)
+    start = end - timedelta(hours=1)
+    identity = dbstats.database_identity(paths.DB_FILE)
+    publishers = [child("summary-publisher", start.isoformat(), i) for i in range(3)]
+    evidence["publishers"] = [json.loads(finish(p)) for p in publishers]
+    count = sum(p["count"] for p in evidence["publishers"])
+    durations = [ms for p in evidence["publishers"] for ms in p["durations"]]
+    expected = sorted(durations)[int(len(durations) * .95 + .999999) - 1]
+    summaries = paths.LOG_DIR / "dbstats"
+    (summaries / "corrupt.json").write_text('{"format":')
+    sample = json.loads(next(summaries.glob(identity + "-*.json")).read_text())
+    sample["database"] = "unrelated"
+    (summaries / "unrelated.json").write_text(json.dumps(sample))
+    sample["database"] = identity
+    sample["hour"] = (start - timedelta(hours=1)).isoformat()
+    (summaries / "adjacent.json").write_text(json.dumps(sample))
+    sample["hour"] = start.isoformat()
+    sample["incarnation"] = "invalid"
+    sample["transactions"] = {"bad": {"count": 1000, "max_ms": 50, "histogram": {"6": 1}}}
+    (summaries / "invalid.json").write_text(json.dumps(sample))
+    rotated = paths.LOG_DIR / "db.log.1"
+    row = {"timestamp": (start + timedelta(minutes=1)).isoformat(), "database": identity,
+           "total_ms": 6000, "process_kind": "serve", "caller": "fixture.rotated", "error": "OperationalError"}
+    rows = [row, {**row, "timestamp": end.isoformat()}, {**row, "database": "another"},
+            {**row, "timestamp": (start - timedelta(seconds=1)).isoformat()},
+            {k: v for k, v in {**row, "process_kind": "run", "error": "", "total_ms": 700}.items()
+             if k != "database"}]
+    rotated.write_text("bad\n[]\n" + "\n".join(json.dumps(r) for r in rows) + '\n{"truncated":')
+    root = paths.RUNS_DIR / "size-fixture"
+    (root / "record").mkdir(parents=True)
+    (root / "record" / "data").write_bytes(b"r" * 101)
+    (root / "run.log").write_bytes(b"l" * 203)
+    external = paths.STATE_DIR.parent / "external"
+    external.mkdir()
+    (external / "large").write_bytes(b"x" * 10000)
+    (root / "link-dir").symlink_to(external, target_is_directory=True)
+    (root / "record" / "link-file").symlink_to(external / "large")
+    measured = dbstats.collect(now)
+    require(measured["transaction_count"] == count, measured)
+    require(measured["transactions_by_kind"] == {"cli": 108, "serve": 108, "run": 108}, measured)
+    require(expected <= measured["p95_ms"] <= expected * 2, (expected, measured))
+    require(measured["max_ms"] == max(durations), measured)
+    require(measured["slow_by_kind"] == {"serve": 1, "run": 1}
+            and measured["errors_by_class"] == {"OperationalError": 1}, measured)
+    require(measured["record_bytes"] == 101 and measured["other_bytes"] == 203
+            and measured["total_bytes"] == 304, measured)
+    require(measured["db_bytes"] == paths.DB_FILE.stat().st_size and measured["tables"]["events"] == 0, measured)
+    require(measured["tables"]['odd"table'] == 1
+            and measured["wal_bytes"] == Path(str(paths.DB_FILE) + "-wal").stat().st_size > 0, measured)
+    require(dbstats.transaction_totals(start, end, "replaced-file")["transaction_count"] == 0, "identity leaked")
+    evidence["hourly"] = measured
+    with ThreadPoolExecutor(1) as pool:
+        future = pool.submit(dbstats.runs_bytes)
+        (root / "record" / "data").unlink()
+        future.result(10)
+
+    marker = paths.STATE_DIR.parent / "held"
+    release = paths.STATE_DIR.parent / "release"
+    holder = child("raw-writer", marker, release)
+    wait_file(marker, holder)
+    waiting_marker = paths.STATE_DIR.parent / "waiting"
+    waiter = child("timed-writer", waiting_marker)
+    wait_file(waiting_marker, waiter)
+    try:
+        time.sleep(6)
+    finally:
+        release.touch()
+    finish(holder)
+    finish(waiter)
+    recent = list(dbstats.log_records(util.now() - timedelta(hours=1), util.now()))
+    waiting = [r for r in recent if r.get("caller", "").endswith("timed_writer") and r["total_ms"] > 5000]
+    require(len(waiting) == 1 and waiting[0]["begin_ms"] > 5900, recent)
+    slow = heartbeat.check_db_slow()[0]
+    require(not slow.ok and slow.severity == "warn" and "timed_writer" in slow.detail, slow)
+    cfg = config.load()
+    tiny = replace(cfg, retention=replace(cfg.retention, db_max_mb=.0001, max_gb=.00000001))
+    checks = []
+    for installed in (True, False):
+        with mock.patch.object(install, "serve_installed", return_value=installed):
+            found = heartbeat.check_db_slow() + heartbeat.check_db_size(tiny) + heartbeat.check_runs_size(tiny)
+            require({c.key for c in found} == {"db:slow", "db:size", "runs:size"}
+                    and all(not c.ok and c.severity == "warn" for c in found), found)
+            checks.append([vars(c) for c in found])
+    evidence["heartbeat_warnings"] = checks
+    evidence["heartbeat_dry_run"] = backup_health_cli()
+    require(all(key in evidence["heartbeat_dry_run"][1] for key in ("db:slow", "db:size", "runs:size")),
+            evidence["heartbeat_dry_run"])
+    for file in paths.LOG_DIR.glob("db.log*"):
+        if file.is_file():
+            file.unlink()
+    old = {**row, "database": identity, "timestamp": (util.now() - timedelta(hours=2)).isoformat()}
+    (paths.LOG_DIR / "db.log").write_text(json.dumps(old) + "\n")
+    marker.unlink()
+    release.unlink()
+    holder = child("raw-writer", marker, release)
+    wait_file(marker, holder)
+    waiting_marker.unlink(missing_ok=True)
+    waiter = child("timed-writer", waiting_marker)
+    wait_file(waiting_marker, waiter)
+    time.sleep(.2)
+    release.touch()
+    finish(holder)
+    finish(waiter)
+    healthy = heartbeat.check_db_slow() + heartbeat.check_db_size(cfg) + heartbeat.check_runs_size(cfg)
+    require(all(c.ok for c in healthy), healthy)
+    evidence["healthy"] = [vars(c) for c in healthy]
+    require(config.retention_table({}).db_max_mb == 500, "default")
+    require(config.retention_table({"db_max_mb": .5}).db_max_mb == .5, "fraction")
+    for value in (0, -1, True, float("inf"), float("nan")):
+        expect(ValueError, lambda: config.retention_table({"db_max_mb": value}))
+
+    server = fixture_server()
+    output = []
+    server.say = output.append
+    beats = []
+    started, released = threading.Event(), threading.Event()
+    calls = []
+    collect = dbstats.collect
+
+    def blocked():
+        calls.append(1)
+        started.set()
+        require(released.wait(10), "collector barrier timed out")
+        return collect()
+
+    def beat():
+        began = time.monotonic()
+        server.beat()
+        require(time.monotonic() - began < 1, "beat blocked on collection")
+        data = util.read_json(paths.STATE_DIR / "serve.json", {})
+        require("db" in data and set(dbstats.empty_collection()) <= data["db"].keys(), data)
+        beats.append(data)
+        return data["db"]
+
+    try:
+        require(beat()["status"] == "initial", beats)
+        with mock.patch.object(dbstats, "collect", blocked), \
+                mock.patch.object(backup, "snapshot", side_effect=OSError("no prune")):
+            server.prune()
+            require(started.wait(5), "collector not scheduled after skipped prune")
+            parallel(lambda _: server.collect_db())
+            require(beat()["status"] == "pending" and len(calls) == 1, calls)
+            released.set()
+            server.db_future.result(10)
+        first = beat()
+        require(first["status"] == "complete", first)
+        started.clear()
+        released.clear()
+        with mock.patch.object(dbstats, "collect", blocked):
+            server.collect_db()
+            require(started.wait(5), "second collection")
+            pending = beat()
+            require(pending["collected_at"] == first["collected_at"]
+                    and pending["total_bytes"] == first["total_bytes"], pending)
+            released.set()
+            server.db_future.result(10)
+        require(beat()["status"] == "complete", beats)
+        completed = beats[-1]["db"]
+        with mock.patch.object(dbstats, "collect", side_effect=OSError("fixture collection failure")):
+            server.collect_db()
+            expect(OSError, lambda: server.db_future.result(10))
+        failed = beat()
+        require(failed["status"] == "failed" and failed["collected_at"] == completed["collected_at"]
+                and failed["total_bytes"] == completed["total_bytes"], failed)
+        require(sum(s.startswith("db ") for s in output) == 2, output)
+    finally:
+        released.set()
+        close_server(server)
+    (paths.STATE_DIR.parent / "serve-beats.json").write_text(json.dumps(beats, indent=2))
+    (paths.STATE_DIR.parent / "serve.log").write_text("\n".join(output) + "\n")
+    evidence["collection"] = {"beats": beats, "log": output}
+    anchor.close()
+    return evidence
+
+
+def legacy_cleanup():
+    from arete import paths, state
+
+    evidence = setup()
+    legacy, marker = paths.STATE_DIR / "state.db", paths.STATE_DIR / "chat.json.moved"
+    unrelated = paths.STATE_DIR / "unrelated"
+    unrelated.write_text("keep")
+    cases = []
+    for kind in ("empty", "nonempty", "symlink", "missing"):
+        legacy.unlink(missing_ok=True)
+        marker.unlink(missing_ok=True)
+        if kind == "empty":
+            legacy.touch()
+            marker.write_text("obsolete")
+        elif kind == "nonempty":
+            legacy.write_text("legacy data")
+            marker.write_text("obsolete")
+        elif kind == "symlink":
+            legacy.symlink_to(unrelated)
+            marker.symlink_to(unrelated)
+        server, found = start_fixture_serve()
+        stop_child(server)
+        require(unrelated.read_text() == "keep", "unrelated file removed")
+        require(legacy.exists() == (kind in ("nonempty", "symlink")), kind)
+        require(marker.exists() == (kind == "symlink"), kind)
+        require(found["version"] == state.LATEST, found)
+        cases.append({"kind": kind, "legacy_exists": legacy.exists(), "marker_exists": marker.exists(), **found})
+    evidence["cases"] = cases
+    return evidence
+
+
+def browser_seed():
+    evidence = setup()
+    evidence.update(page_seed())
+    print(json.dumps(evidence, indent=2))
+    for run in evidence["runs"]:
+        print(f"http://127.0.0.1:8765/#run/{run}")
+    print(f"http://127.0.0.1:8765/api/chats/{evidence['chat']}")
+    print("http://127.0.0.1:8765/#live (open the chat console and select the seeded chat)")
+    print(f"http://127.0.0.1:8765/api/chats/{evidence['chat']}/sessions/session/report")
+    print("http://127.0.0.1:8765/ui.html")
+    return evidence
+
+
+def browser_serve(port):
+    from arete import paths
+
+    conn = paths.connect_db(paths.DB_FILE)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.close()
+    server = fixture_http(port)
+    print(f"Offline fixture: http://127.0.0.1:{server.server_port}/", flush=True)
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+
+
 def timed_writer():
     from arete import state
 
@@ -1634,9 +2145,49 @@ def child_main(role, args):
                      "transaction-timing": transaction_timing, "output-sinks": output_sinks,
                      "durable-files": durable_files, "wal-startup": wal_startup, "prune-restore": prune_restore,
                      "restore-safety": restore_safety, "feed-cursors": feed_cursors, "backup-health": backup_health}
+        functions.update({"coherent-reads": coherent_reads, "event-contract": event_contract,
+                          "database-health": database_health, "legacy-cleanup": legacy_cleanup})
         result = functions[role]()
         (paths.STATE_DIR.parent / "evidence.json").write_text(json.dumps(result, indent=2, default=str) + "\n")
         print(f"{role}: passed")
+    elif role == "browser-seed":
+        browser_seed()
+    elif role == "browser-serve":
+        browser_serve(int(args[0]))
+    elif role == "sleep":
+        time.sleep(120)
+    elif role == "summary-publisher":
+        from arete import dbstats
+
+        hour, publisher = args
+        durations = [1] * 90 + [3] * 6 + [512, 8192]
+        kind = ("cli", "serve", "run")[int(publisher)]
+        for ms in durations:
+            dbstats.retain(dbstats.database_identity(paths.DB_FILE), hour,
+                           {"mode": "read", "caller": "fixture.publisher", "process_kind": kind,
+                            "total_ms": ms, "begin_ms": 0, "commit_ms": 0, "error": ""})
+        retain = dbstats.retain
+
+        def observed(database, at, row):
+            durations.append(row["total_ms"])
+            retain(database, at, row)
+
+        with mock.patch.object(dbstats, "datetime") as clock, \
+                mock.patch.object(dbstats, "process_kind", return_value=kind), \
+                mock.patch.object(dbstats, "retain", observed):
+            clock.now.return_value = datetime.fromisoformat(hour) + timedelta(minutes=10)
+            for _ in range(10):
+                with state.tx() as conn:
+                    conn.execute("SELECT COUNT(*) FROM events").fetchone()
+        print(json.dumps({"publisher": publisher, "pid": os.getpid(), "incarnation": dbstats.INCARNATION,
+                          "count": len(durations), "durations": durations}))
+    elif role == "raw-writer":
+        conn = paths.connect_db(paths.DB_FILE)
+        conn.execute("BEGIN IMMEDIATE")
+        Path(args[0]).touch()
+        wait_file(Path(args[1]))
+        conn.execute("COMMIT")
+        conn.close()
     elif role == "serve-live":
         from arete import backup, serve, util
 
@@ -1775,6 +2326,8 @@ def child_main(role, args):
             Path(args[0]).touch()
             wait_file(Path(args[1]))
     elif role == "timed-writer":
+        if args:
+            Path(args[0]).touch()
         timed_writer()
     elif role == "migrate-marker":
         Path(args[0]).touch()
@@ -1813,7 +2366,8 @@ def inspect_evidence():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", nargs="?", choices=[*ACTIONS, "inspect"])
+    parser.add_argument("action", nargs="?", choices=[*ACTIONS, "inspect", "browser-seed", "browser-serve"])
+    parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--child", nargs="+")
     args = parser.parse_args()
     sandbox = REPO / ".arete-sandbox"
@@ -1824,12 +2378,25 @@ def main():
         child_main(args.child[0], args.child[1:])
         return
     ROOT.mkdir(parents=True, exist_ok=True)
+    if args.action == "browser-serve":
+        folder = Path(json.loads((ROOT / "browser.json").read_text())["folder"])
+        require(folder.resolve().is_relative_to(ROOT.resolve()) and not folder.is_symlink(), folder)
+        process = subprocess.Popen([sys.executable, "-I", str(Path(__file__).resolve()), "--child",
+                                    "browser-serve", str(args.port)], cwd=REPO, env=environment(folder))
+        try:
+            raise SystemExit(process.wait())
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=10)
     if args.action == "inspect":
         inspect_evidence()
         return
-    require(args.action in ACTIONS, "choose an exercise")
+    require(args.action in (*ACTIONS, "browser-seed"), "choose an exercise")
     folder = Path(tempfile.mkdtemp(prefix=args.action + "-", dir=ROOT))
     env = environment(folder)
+    if args.action == "browser-seed":
+        (ROOT / "browser.json").write_text(json.dumps({"folder": str(folder)}))
     process = subprocess.Popen([sys.executable, "-I", str(Path(__file__).resolve()), "--child", args.action],
                                cwd=REPO, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:

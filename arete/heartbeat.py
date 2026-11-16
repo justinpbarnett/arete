@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 from dataclasses import asdict, dataclass, field
+from datetime import timedelta
 from typing import Literal
 
 from . import (
@@ -12,6 +13,7 @@ from . import (
     backup,
     codex,
     config,
+    dbstats,
     devices,
     install,
     launchd,
@@ -327,6 +329,30 @@ def check_backups(cfg: config.Config) -> list[Check]:
     return [check_backup_db(), check_backup_offsite(cfg)]
 
 
+def check_db_slow() -> list[Check]:
+    end = util.now()
+    slow = list(dbstats.log_records(end - timedelta(hours=1), end))
+    worst = max((r for r in slow if r["total_ms"] > 5000), key=lambda r: r["total_ms"], default=None)
+    detail = (f"{worst['total_ms'] / 1000:.1f}s transaction at {worst.get('caller', 'unknown')}"
+              if worst else "no transaction above five seconds in the last hour")
+    return [Check("db:slow", worst is None, detail, "warn")]
+
+
+def check_db_size(cfg: config.Config) -> list[Check]:
+    sizes = dbstats.database_bytes()
+    total = sizes["db_bytes"] + sizes["wal_bytes"]
+    limit = cfg.retention.db_max_mb * 1024 ** 2
+    return [Check("db:size", total <= limit,
+                  f"DB + WAL {total / 1024 ** 2:.2f} MiB; limit {cfg.retention.db_max_mb:g} MiB", "warn")]
+
+
+def check_runs_size(cfg: config.Config) -> list[Check]:
+    total = dbstats.runs_bytes()["total_bytes"]
+    limit = cfg.retention.max_gb * 10 ** 9 / 2
+    return [Check("runs:size", total <= limit,
+                  f"runs/ {total / 10 ** 9:.3f} GB; half max_gb {cfg.retention.max_gb / 2:g} GB", "warn")]
+
+
 def check_backup_db() -> Check:
     newest = backup.newest_snapshot()
     installed = install.serve_installed()
@@ -340,7 +366,7 @@ def check_backup_db() -> Check:
     if recorded != "ok":
         return Check("backup:db", False, f"the last snapshot failed its check: {recorded}")
     hours = util.hours_awake_since(newest.stat().st_mtime)
-    if installed and hours > BACKUP_STALE_HOURS:
+    if hours > BACKUP_STALE_HOURS:
         return Check("backup:db", False, f"newest snapshot {newest.name} is {hours:.1f} awake hours old")
     return Check("backup:db", True, f"{newest.name}, {hours:.1f} awake hours old")
 
@@ -419,6 +445,9 @@ def run(dry_run: bool = False, force_probes: bool = False, quiet: bool = False) 
         (check_hook,),
         (check_disk,),
         (check_serve,),
+        (check_db_slow,),
+        (check_db_size, cfg),
+        (check_runs_size, cfg),
         (check_backups, cfg),
         (check_costs,),
         (check_loops, cfg),

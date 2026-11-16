@@ -133,7 +133,7 @@ class Loop:
         repo = self.work_repo(cfg) if self.repo else None
         return (cfg.repo_for_path(repo.path) or repo) if repo else None
 
-    def outlooks(self, cfg: config.Config, connect=state.db) -> list[list]:
+    def outlooks(self, cfg: config.Config, connect=state.reader) -> list[list]:
         from . import routing
 
         if not self.agent:
@@ -152,7 +152,7 @@ class Loop:
 
         return any(routing.can_charge(found) for found in self.outlooks(cfg))
 
-    def usage_hold(self, cfg: config.Config, connect=state.db) -> str:
+    def usage_hold(self, cfg: config.Config, connect=state.reader) -> str:
         from . import routing
 
         return next(filter(None, (routing.held_words(found) for found in self.outlooks(cfg, connect))), "")
