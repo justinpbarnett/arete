@@ -56,7 +56,9 @@ def failing_once(real):
     return flaky
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 def web():
-    node = tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "me@example.com", "")
+    from arete import principals
+    principals.seed_owner("me@example.com")
+    node = tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "")
     owner = type("Owner", (), {"of": lambda self, address: "me@example.com"})()
     server = tailnet.Server("127.0.0.1", 0, node, owner, False, dashboard.Handler, dashboard.Redirect)
     threading.Thread(target=server.serve_forever, daemon=True).start()

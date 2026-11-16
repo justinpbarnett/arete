@@ -53,10 +53,11 @@ def start(kind: str, *, run_id: str = "", tag: str = "", lock: str = "", **field
         minted = run_id or new_id(ID_PREFIX.get(kind, kind), tag)
         try:
             run_store.insert_run(minted, row)
-            return minted
-        except sqlite3.IntegrityError:
-            if run_id:
+        except sqlite3.IntegrityError as e:
+            if run_id or "runs.id" not in str(e):
                 raise
+            continue
+        return minted
 
 
 def step(run_id: str, name: str, res, seconds: float, effort: str = "", tier: str = "", kind: str = "",
@@ -131,8 +132,9 @@ def stop_asked(run_id: str) -> bool:
 def settle(run_id: str, status: str, end_line: str = "", **fields) -> dict | None:
     fields = {"status": status, "finished": util.iso(), **fields}
     settled = run_store.settle(run_id, fields, end_line)
-    if settled is not None:
-        mark(run_id, "result", at=fields.pop("finished"), **fields)
+    if settled is None:
+        return None
+    mark(run_id, "result", at=fields.pop("finished"), **fields)
     return settled
 
 

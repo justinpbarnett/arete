@@ -11,7 +11,22 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import ClassVar
 
-from . import alerts, config, gh, jev, jira, paths, prompt_loader, refusals, runner, screening, state, tracker, util
+from . import (
+    alerts,
+    config,
+    gh,
+    jev,
+    jira,
+    paths,
+    principals,
+    prompt_loader,
+    refusals,
+    runner,
+    screening,
+    state,
+    tracker,
+    util,
+)
 from .agent import READ_TOOLS
 from .heartbeat import mark_loop, network_up_or_skip
 from .refusals import TrackerFailed
@@ -687,7 +702,7 @@ def send(cfg: config.Config, ref: str, questions: list[str], answers: list[str],
             except tracker.ERRORS as e:
                 raise TrackerFailed(f"Could not post your answers to {r['ref']} ({tracker_said(e)}).") from e
         try:
-            to_pipeline(src, sent_row, "owner")
+            to_pipeline(src, sent_row, principals.current())
         except tracker.ERRORS as e:
             if pairs:
                 raise TrackerFailed(f"Posted your answers, but could not add {labels} to {r['ref']} ({tracker_said(e)}). "
@@ -819,7 +834,7 @@ def sent_prs(a: dict) -> list[str]:
 
 def sent_note(a: dict, with_prs: bool = True) -> str:
     run = a.get("run")
-    by_you = a["sent_by"] == "owner"
+    by_you = principals.is_person(a["sent_by"])
     if not run:
         return f"{'sent by you' if by_you else 'approved'} {stamp(a['ts'])}, waiting for the pipeline"
     prs = sent_prs(a) if with_prs else []
@@ -912,7 +927,7 @@ def ticket(ref: str) -> str | None:
         a = next((a for a in sent() if a["ref"].lower() == want), None) or state.triage_approval(want)
         if not a:
             return None
-        by = " by you" if a["sent_by"] == "owner" else " by triage"
+        by = " by you" if principals.is_person(a["sent_by"]) else " by triage"
         lines = [f"{a['ref']}: {a['title']}", a["url"], f"Sent to the pipeline{by} {stamp(a['ts'])} for `{a['repo']}`."]
         if "run" in a:
             lines.append(f"Run: {a['run']['status']} {' '.join(sent_prs(a))}".rstrip() if a["run"] else "Run: none yet")

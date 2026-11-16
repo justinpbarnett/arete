@@ -74,5 +74,6 @@ def task_comments(tid: str, connect=reader) -> list[dict]:
 def tasks_replied(repo: str) -> list[dict]:
     with reader() as c:
         return [dict(r) for r in c.execute(
-            "SELECT * FROM tasks WHERE repo = ? AND state = 'needs-info' AND (SELECT author FROM task_comments c "
-            "WHERE c.task = tasks.id ORDER BY c.rowid DESC LIMIT 1) = 'owner' ORDER BY created, rowid", (repo,))]
+            "SELECT * FROM tasks WHERE repo = ? AND state = 'needs-info' AND "
+            "(SELECT author = 'owner' OR author LIKE 'u:%' FROM task_comments c "
+            "WHERE c.task = tasks.id ORDER BY c.rowid DESC LIMIT 1) ORDER BY created, rowid", (repo,))]

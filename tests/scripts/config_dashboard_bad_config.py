@@ -4,8 +4,10 @@ write(BAD)
 server, said = quiet_server()
 server.run_pass()
 class Host(tailnet.ScratchHost):
-    def node(self, owner):
-        return tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "me@example.com", "")
+    def node(self):
+        return tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "")
+    def seed_identity(self, login):
+        return "me@example.com", "Me"
     def whois(self, address):
         return "me@example.com"
 import socket
