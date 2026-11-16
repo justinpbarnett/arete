@@ -41,6 +41,39 @@ def environment(root):
                        HOME=str(root / "home"))
 
 
+class StoreContractTests(unittest.TestCase):
+    def scenario(self, case):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            done = subprocess.run(
+                [sys.executable, "-I", str(SOURCE / "tests/scripts/store_contract.py"), case],
+                cwd=SOURCE, env=environment(root), text=True, capture_output=True, timeout=180)
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            found = behavior_result(done)
+            self.assertEqual(found["case"], case)
+            self.assertEqual(len(set(found["isolated_paths"].values())), 6)
+            return found
+
+    def test_unique_table_ownership_and_compatibility(self):
+        found = self.scenario("ownership")
+        self.assertTrue(found["complete"] and found["unique"] and found["record_compatibility"])
+        self.assertTrue(found["ledger_unchanged"])
+        self.assertEqual(found["foundation"], "db")
+
+    def test_unknown_areas_cannot_execute_or_mutate(self):
+        found = self.scenario("unknown-area")
+        self.assertEqual(set(found["refusals"]), {"outbox", "helper", "work"})
+        self.assertFalse(found["executed"])
+        self.assertTrue(found["schema_unchanged"] and found["ledger_unchanged"])
+
+    def test_immutable_historical_chains_upgrade_once(self):
+        found = self.scenario("upgrade")
+        self.assertEqual(found["historical_rows"], 2)
+        self.assertTrue(found["hashes_unchanged"] and found["historical_work_preserved"])
+        self.assertEqual(found["applied_once"], [3, 4])
+        self.assertEqual((found["relocated_rows_added"], found["origin_main_rows_added"]), (0, 0))
+
+
 class LogRotationTests(unittest.TestCase):
     def scenario(self, body, timeout=180):
         with tempfile.TemporaryDirectory() as directory:

@@ -11,6 +11,7 @@ from pathlib import Path
 
 from . import config, cron, devices, paths, refusals, runner, state, util
 from .agent import EDIT_TOOLS, READ_ONLY_TOOLS, READ_TOOLS
+from .store import db as foundation
 
 BUNDLED_LOOPS_DIR = paths.PACKAGE_DIR / "loops"
 SWITCHES_FILE = paths.CONFIG_DIR / "loop-switches.json"
@@ -133,7 +134,7 @@ class Loop:
         repo = self.work_repo(cfg) if self.repo else None
         return (cfg.repo_for_path(repo.path) or repo) if repo else None
 
-    def outlooks(self, cfg: config.Config, connect=state.reader) -> list[list]:
+    def outlooks(self, cfg: config.Config, connect=foundation.reader) -> list[list]:
         from . import routing
 
         if not self.agent:
@@ -152,7 +153,7 @@ class Loop:
 
         return any(routing.can_charge(found) for found in self.outlooks(cfg))
 
-    def usage_hold(self, cfg: config.Config, connect=state.reader) -> str:
+    def usage_hold(self, cfg: config.Config, connect=foundation.reader) -> str:
         from . import routing
 
         return next(filter(None, (routing.held_words(found) for found in self.outlooks(cfg, connect))), "")

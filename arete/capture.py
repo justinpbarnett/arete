@@ -29,6 +29,7 @@ from . import (
     tracker,
     util,
 )
+from .store import db as foundation
 
 MB = 1024 * 1024
 MOST_IMAGE_BYTES = 5 * MB
@@ -117,7 +118,7 @@ class NotStaged(refusals.NotFound, LookupError):
 
 
 def refuse_while_filing() -> None:
-    if state.capture_filing(state.reader):
+    if state.capture_filing(foundation.reader):
         raise Conflict(FILING)
 
 
@@ -128,7 +129,7 @@ def filed_view(row: dict | None) -> dict | None:
             "filed": row["filed"]}
 
 
-def view(connect=state.db, filed: dict | None = None) -> dict:
+def view(connect=foundation.db, filed: dict | None = None) -> dict:
     limits = {**LIMITS, "context_bytes": MOST_CONTEXT_BYTES, "image_bytes": MOST_IMAGE_BYTES, "video_bytes": MOST_VIDEO_BYTES,
               "evidence_items": MOST_ITEMS, "evidence_bytes": MOST_DRAFT_BYTES, "video_seconds": MOST_VIDEO_SECONDS}
     draft = state.capture_draft(connect)
@@ -209,7 +210,7 @@ def stage(data: bytes, name: str, source: str, seconds: str) -> dict:
 
 
 def staged_file(evidence_id: int) -> tuple[Path, dict]:
-    row = state.capture_evidence(evidence_id, state.reader)
+    row = state.capture_evidence(evidence_id, foundation.reader)
     path = CAPTURES_DIR / str(row["capture"]) / row["sha256"] if row else None
     if not path or not path.is_file():
         raise NotStaged(f"No staged evidence has the id {evidence_id}.")
@@ -246,7 +247,7 @@ def checked_fields(body: dict) -> dict:
 def save(body: dict) -> dict:
     fields = checked_fields(body)
     refuse_while_filing()
-    held = state.capture_draft(state.reader) or EMPTY_DRAFT
+    held = state.capture_draft(foundation.reader) or EMPTY_DRAFT
     if any(held[k] != v for k, v in fields.items()) and not state.capture_save(**fields):
         raise Conflict(FILING)
     return view()
@@ -257,10 +258,10 @@ def safe(value) -> str:
 
 
 def run_facts(run_id: str) -> dict:
-    run = state.run_get(run_id, connect=state.reader)
+    run = state.run_get(run_id, connect=foundation.reader)
     if not run:
         return {}
-    rows = state.steps(run_id, connect=state.reader)
+    rows = state.steps(run_id, connect=foundation.reader)
     facts = {key: run.get(key) for key in RUN_FACTS}
     facts["step"] = rows[-1]["step"] if rows else ""
     facts["error"] = next((r["error"] for r in reversed(rows) if r.get("error")), "")
@@ -309,7 +310,7 @@ def add_context(body: dict, code: str) -> dict:
 
 def drop_context() -> dict:
     refuse_while_filing()
-    draft = state.capture_draft(state.reader)
+    draft = state.capture_draft(foundation.reader)
     if draft and draft["context"] and not state.capture_save(context=""):
         raise Conflict(FILING)
     return view()
@@ -890,7 +891,7 @@ def deliver(draft_id: int, revision: int, cfg: config.Config, resumed: bool) -> 
             state.capture_note(draft_id, f"GitHub did not answer ({unfinished(e)}), so arete cannot tell whether the "
                                          f"issue was filed. Submit again.")
             return
-    draft = state.capture_draft(state.reader)
+    draft = state.capture_draft(foundation.reader)
     if not draft or draft["id"] != draft_id or draft["status"] != "filing":
         return
     if not repo:
@@ -904,7 +905,7 @@ def deliver(draft_id: int, revision: int, cfg: config.Config, resumed: bool) -> 
         if failed := upload(draft, repo, cfg):
             hold_delivery(draft_id, revision, failed)
             return
-        draft = state.capture_draft(state.reader)
+        draft = state.capture_draft(foundation.reader)
         title, body = filing_text(draft, cfg, linked=True)
     except Exception as e:
         hold_delivery(draft_id, revision, f"Not filed: {unfinished(e)}")
@@ -921,11 +922,11 @@ def deliver(draft_id: int, revision: int, cfg: config.Config, resumed: bool) -> 
 def work(draft_id: int, revision: int, cfg: config.Config, resumed: bool) -> None:
     try:
         if not resumed:
-            draft = state.capture_draft(state.reader)
+            draft = state.capture_draft(foundation.reader)
             if not draft or draft["id"] != draft_id or draft["status"] != "checking":
                 return
             write_first(draft, cfg)
-            draft = state.capture_draft(state.reader)
+            draft = state.capture_draft(foundation.reader)
             if not draft or draft["id"] != draft_id or draft["status"] != "checking":
                 return
             prints = fingerprints(draft, cfg)
@@ -934,7 +935,7 @@ def work(draft_id: int, revision: int, cfg: config.Config, resumed: bool) -> Non
                 if not state.capture_begin_checks(draft_id, {n: prints[n] for n in due}):
                     return
                 run_checks(draft, cfg, due)
-                draft = state.capture_draft(state.reader)
+                draft = state.capture_draft(foundation.reader)
                 if not draft or draft["id"] != draft_id or draft["status"] != "checking":
                     return
             if due_checks(draft, fingerprints(draft, cfg), route):
@@ -960,9 +961,9 @@ def submit(body: dict) -> dict:
         raise Refused("Send the draft's id as a whole number.")
     cfg = config.load()
     with SUBMITTING:
-        if wanted is not None and (row := state.capture_filed_row(wanted, state.reader)):
+        if wanted is not None and (row := state.capture_filed_row(wanted, foundation.reader)):
             return view(filed=row)
-        draft = state.capture_draft(state.reader)
+        draft = state.capture_draft(foundation.reader)
         if not draft:
             raise Conflict("There is no draft to check.")
         if wanted is not None and draft["id"] != wanted:

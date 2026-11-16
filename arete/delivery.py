@@ -10,6 +10,7 @@ from . import config, state, util
 from .emits import Emit, PullRequest, Ticket, ToLoop
 from .loops import Loop
 from .push import Push
+from .store import db as foundation
 
 CLAIM_SECONDS = 120
 RETRIED = ("screen", "proof")
@@ -112,7 +113,7 @@ def why_failed(kind: str, e: Exception) -> str:
     return f"{kind} failed: {named}: {said}" if said else f"{kind} failed: {named}"
 
 
-def waiting(connect=state.db) -> list[dict]:
+def waiting(connect=foundation.db) -> list[dict]:
     return [{"id": a["id"], "loop": a["loop"], "run_id": a["run_id"], "created": a["created"], "repo": repo_of(a),
              "what": a["summary"], "plain_summary": a["plain_summary"],
              "failed": a["result"] if a["status"] == "failed" else "", "held": a["emit"].get("held", ""),

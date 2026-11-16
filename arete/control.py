@@ -25,6 +25,7 @@ from . import (
 )
 from .agent import billing_of
 from .loops import Loop
+from .store import db as foundation
 
 AB_DAYS = 30
 AB_MIN_TICKETS = 20
@@ -60,7 +61,7 @@ class KeptFailure(Refused):
     pass
 
 
-def session_report(run_id: str, connect=state.reader) -> dict:
+def session_report(run_id: str, connect=foundation.reader) -> dict:
     row = state.run_get(run_id, connect)
     if not row or row["kind"] != "session":
         raise NotFound(f"no session {run_id}")
@@ -147,7 +148,7 @@ def day_ago() -> str:
     return util.iso(util.now() - timedelta(days=1))
 
 
-def loop_views(cfg: config.Config | None = None, connect=state.reader) -> list[dict]:
+def loop_views(cfg: config.Config | None = None, connect=foundation.reader) -> list[dict]:
     cfg = cfg or config.load_or_problem()[0]
     every_loop = loops.load_all(cfg)
     states = state.loop_states(connect)
@@ -171,7 +172,7 @@ def loop_views(cfg: config.Config | None = None, connect=state.reader) -> list[d
     return out
 
 
-def loop_detail(name: str, connect=state.reader) -> dict:
+def loop_detail(name: str, connect=foundation.reader) -> dict:
     cfg = config.load_or_problem()[0]
     loop = find_loop(name, cfg)
     view = next(v for v in loop_views(cfg, connect) if v["name"] == loop.name)
@@ -197,10 +198,10 @@ def switch(name: str, enabled: bool) -> dict:
 
 
 def feed(run_id: str, after: int = 0) -> dict:
-    with state.one_read() as conn:
+    with foundation.one_read() as conn:
         epoch = int(conn.execute("SELECT value FROM schema_meta WHERE key = 'restore_epoch'").fetchone()[0])
-        lines = state.feed(run_id, after, connect=state.reader)
-        run_read_after_its_lines = state.run_get(run_id, connect=state.reader)
+        lines = state.feed(run_id, after, connect=foundation.reader)
+        run_read_after_its_lines = state.run_get(run_id, connect=foundation.reader)
     if not run_read_after_its_lines:
         raise NotFound(f"no run {run_id}")
     return {"run": run_read_after_its_lines, "lines": lines, "restore_epoch": epoch}
@@ -234,7 +235,7 @@ def cost_window(days: float | None) -> tuple[float, str]:
         raise Refused(f"cannot look back {days:g} days: {e}") from e
 
 
-def costs(days: float | None = None, connect=state.reader, cfg: config.Config | None = None) -> dict:
+def costs(days: float | None = None, connect=foundation.reader, cfg: config.Config | None = None) -> dict:
     days, since = cost_window(days)
     by_route = step_costs("route", days, connect, cfg, since=since)["groups"]
     return {"days": days, **paid_since(since, connect, cfg), "by_route": by_route}
@@ -249,7 +250,7 @@ def route_of(step: dict, cfg: config.Config) -> dict:
             "name": f"{which or 'no runner'}/{provider or '-'}/{model or 'no model'}/{billing}"}
 
 
-def step_costs(by: str, days: float | None = None, connect=state.reader, cfg: config.Config | None = None, *,
+def step_costs(by: str, days: float | None = None, connect=foundation.reader, cfg: config.Config | None = None, *,
               since: str | None = None) -> dict:
     if by not in COST_GROUPS:
         raise Refused(f"cannot group costs by {by}; pick one of {', '.join(COST_GROUPS)}")
@@ -341,7 +342,7 @@ def ab_side(tickets: set, steps_by_run: dict[str, list[dict]], since: str, conne
             "merge_rate": round(len(merged) / len(tickets), 4) if tickets else 0.0}
 
 
-def ab_report(name: str = "", days: float | None = None, connect=state.reader, cfg: config.Config | None = None) -> list[dict]:
+def ab_report(name: str = "", days: float | None = None, connect=foundation.reader, cfg: config.Config | None = None) -> list[dict]:
     days, since = cost_window(AB_DAYS if days is None else days)
     cfg = cfg or config.load_or_problem()[0]
     placed: dict[str, dict] = {}
@@ -362,7 +363,7 @@ def ab_report(name: str = "", days: float | None = None, connect=state.reader, c
     return report
 
 
-def paid_since(since: str, connect=state.reader, cfg: config.Config | None = None) -> dict:
+def paid_since(since: str, connect=foundation.reader, cfg: config.Config | None = None) -> dict:
     groups: dict[str, dict[str, dict]] = {"model": {}, "runner": {}, "loop": {}, "day": {}}
     total = 0.0
     cfg = cfg or config.load_or_problem()[0]

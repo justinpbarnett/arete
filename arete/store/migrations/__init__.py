@@ -1,3 +1,4 @@
+import ast
 import hashlib
 import re
 import runpy
@@ -5,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 FOLDER = Path(__file__).resolve().parent
-AREAS = {"foundation", "work", "runs", "config", "connections", "secrets", "devices", "outbox"}
+STORE_FOLDER = FOLDER.parent
 PHASES = {"expand", "backfill", "contract"}
 NAME = re.compile(r"m([0-9]{4})_([a-z]+)_([a-z][a-z0-9_]*).py")
 
@@ -25,6 +26,28 @@ class Migration:
     apply: object
 
 
+def owners():
+    found = {}
+    for path in STORE_FOLDER.glob("*.py"):
+        if path.stem.startswith("_"):
+            continue
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in tree.body:
+            if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Dict)
+                    and any(isinstance(t, ast.Name) and t.id == "TABLES" for t in node.targets)):
+                tables = ast.literal_eval(node.value)
+                if isinstance(tables, dict):
+                    found[path.stem] = tables
+    return found
+
+
+def area_owner(area, name=""):
+    if area == "work" and name == "m0004_work_event_routing.py":
+        area = "loops"
+    owner = "db" if area == "foundation" else area
+    return owner if owner in owners() else None
+
+
 def load(folder=None):
     folder = FOLDER if folder is None else Path(folder)
     found = {}
@@ -33,19 +56,19 @@ def load(folder=None):
         if not match:
             raise Refused(f"{path.name}: expected mNNNN_area_name.py")
         n, area = int(match[1]), match[2]
-        if area not in AREAS:
+        if area_owner(area, path.name) is None:
             raise Refused(f"{path.name}: unknown area {area}")
         if n in found:
             raise Refused(f"{found[n].name}, {path.name}: repeated migration {n}")
         data = path.read_bytes()
-        namespace = runpy.run_path(str(path), run_name=f"arete.migrations.{path.stem}")
+        namespace = runpy.run_path(str(path), run_name=f"arete.store.migrations.{path.stem}")
         phase, sql, apply = namespace.get("PHASE"), namespace.get("SQL"), namespace.get("apply")
         if phase not in PHASES:
             raise Refused(f"{path.name}: unknown phase {phase!r}")
         if (("SQL" in namespace) + ("apply" in namespace) != 1
                 or not (isinstance(sql, str) or callable(apply))):
             raise Refused(f"{path.name}: provide exactly one SQL string or apply(conn)")
-        found[n] = Migration(n, path.name, area, phase, hashlib.sha256(data).hexdigest(), sql, apply)
+        found[n] = Migration(n, path.name, "loops" if area == "work" else area, phase, hashlib.sha256(data).hexdigest(), sql, apply)
     if not found or sorted(found) != list(range(1, max(found) + 1)):
         names = ", ".join(m.name for m in found.values())
         raise Refused(f"{names}: migration numbers must run from 1 without gaps")

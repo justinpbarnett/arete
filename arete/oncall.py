@@ -29,6 +29,7 @@ from . import (
     util,
 )
 from .sighting import Sighting
+from .store import db as foundation
 
 UNEXPECTED, HEARTBEAT, STALLED, ORCHESTRATION, EXPECTED = "unexpected", "heartbeat", "stalled", "orchestration", "expected"
 WAKE, IGNORE, UNSURE = "wake", "ignore", "unsure"
@@ -212,7 +213,7 @@ def process_gone(row: dict) -> bool:
     return not util.lock_is_held(row["lock"]) if row.get("lock") else not util.pid_alive(row.get("pid"))
 
 
-def cursor_value(name: str, connect=state.db):
+def cursor_value(name: str, connect=foundation.db):
     row = state.cursor(name, connect)
     return row, (json.loads(row["value"]) if row and row["value"] else None)
 
@@ -231,7 +232,7 @@ def stop_run(run_id: str) -> dict:
     return control.stop_run(run_id)
 
 
-def switched_off(connect=state.db) -> bool:
+def switched_off(connect=foundation.db) -> bool:
     return cursor_value(SWITCH, connect)[1] == "off"
 
 
@@ -1289,7 +1290,7 @@ def health() -> tuple[bool, str]:
     return True, f"last scan {seconds}s ago"
 
 
-def status(cfg: config.Config, connect=state.db) -> dict:
+def status(cfg: config.Config, connect=foundation.db) -> dict:
     row, value = cursor_value(SCAN, connect)
     switch_row = state.cursor(SWITCH, connect)
     return {"enabled": cfg.oncall.enabled, "last_scan": row["polled"] if row else "", "ok": bool(row and row["ok"]),

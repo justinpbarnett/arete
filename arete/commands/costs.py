@@ -6,6 +6,7 @@ import sys
 from collections import Counter
 
 from .. import config, paths
+from ..store import db as foundation
 from .common import Parser, print_lines, print_table, steering
 
 
@@ -98,8 +99,8 @@ def cmd_costs(args) -> int:
 
     if args.by or args.json:
         return print_step_costs(args.by or ["step"], args.days, args.json)
-    with state.one_read():
-        c = control.costs(args.days, connect=state.reader)
+    with foundation.one_read():
+        c = control.costs(args.days, connect=foundation.reader)
     print(f"{util.paid_note(c['total_usd']).capitalize()} in the last {c['days']:g} days; subscription calls count nothing")
     for group in ("model", "runner", "loop"):
         print(f"by {group}:")
@@ -153,11 +154,11 @@ def cmd_ab(args) -> int:
 
 
 def print_step_costs(groupings: list[str], days: float | None, as_json: bool) -> int:
-    from .. import control, state
+    from .. import control
 
     days, since = control.cost_window(days)
-    with state.one_read():
-        found = [(by, control.step_costs(by, days, connect=state.reader, since=since)) for by in groupings]
+    with foundation.one_read():
+        found = [(by, control.step_costs(by, days, connect=foundation.reader, since=since)) for by in groupings]
     c = found[-1][1]
     waits = {"wait_minutes": c["wait_minutes"], "days": c["days"], "since": c["since"], "paid_usd": c["paid_usd"],
              "subscription_usd": c["subscription_usd"]}
