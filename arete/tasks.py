@@ -30,6 +30,7 @@ from . import (
     vault,
     workspace,
 )
+from .refusals import TrackerFailed
 
 TITLE_CHARS = 80
 START_LOCK = "task-start"
@@ -38,10 +39,6 @@ POLLER_LATER = "the poller starts it when a slot frees"
 RESUMABLE = ("interrupted", "stopped", "failed")
 MAX_ANSWER_CHARS = 20000
 TICKET_CLOSED = "its ticket closed while it waited for an answer"
-
-
-class TrackerFailed(RuntimeError):
-    pass
 
 
 def title_of(prompt: str) -> str:

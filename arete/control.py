@@ -5,7 +5,6 @@ import math
 import os
 import signal
 import subprocess
-import sys
 import threading
 from collections import Counter, defaultdict
 from datetime import timedelta
@@ -17,13 +16,14 @@ from . import (
     loops,
     paths,
     record,
+    refusals,
     run_lines,
     sources,
     state,
     util,
     webhooks,
 )
-from .agent import subscription
+from .agent import billing_of
 from .loops import Loop
 
 AB_DAYS = 30
@@ -43,16 +43,16 @@ STEP_FIELD_OF = {"step": "step", "kind": "task_kind", "model": "model"}
 TOKEN_FIELDS = ("tokens_in", "cache_read", "cache_write", "tokens_out")
 
 
-class NotFound(LookupError):
+class NotFound(refusals.NotFound, LookupError):
     pass
 
 
-class Busy(RuntimeError):
+class Busy(refusals.Conflict, RuntimeError):
     def __init__(self, name: str) -> None:
         super().__init__(f"{name} is running; stop it or wait")
 
 
-class Refused(ValueError):
+class Refused(refusals.Invalid, ValueError):
     pass
 
 
@@ -73,10 +73,7 @@ def session_report(run_id: str, connect=state.db) -> dict:
 
 
 def command(args: list[str]) -> list[str]:
-    entrypoint = (f"import sys; sys.path.insert(0, {str(paths.PACKAGE_DIR.parent)!r}); "
-                  "from arete import codebase; codebase.load(); "
-                  "from arete.cli import main; raise SystemExit(main())")
-    return [sys.executable, "-I", "-c", entrypoint, *args]
+    return paths.cli_command(*args)
 
 
 def detach(args: list[str], log_name: str = DETACHED_LOG, keep: tuple[int, ...] = ()) -> subprocess.Popen:
@@ -158,8 +155,8 @@ def loop_views(cfg: config.Config | None = None, connect=state.db) -> list[dict]
     waiting = Counter(item["loop"] for item in state.pending(connect))
     dead = Counter(item["loop"] for item in state.dead_items(connect))
     spent: dict[str, float] = defaultdict(float)
-    for s in state.steps_since(day_ago(), connect, paid_only=True):
-        if billing_of(s, cfg) not in ("local", "replay"):
+    for s in state.steps_since(day_ago(), connect):
+        if billing_of(s, cfg.local_providers) == "api_key":
             spent[s.get("loop") or ""] += s["cost_usd"] or 0
     out = []
     for loop in every_loop:
@@ -241,17 +238,8 @@ def costs(days: float | None = None, connect=state.db, cfg: config.Config | None
     return {"days": days, **paid_since(since, connect, cfg), "by_route": by_route}
 
 
-def billing_of(step: dict, cfg: config.Config) -> str:
-    which, mode = step.get("runner") or "", step.get("auth_mode") or ""
-    if which == "replay":
-        return "replay"
-    if state.local_step(step, cfg.local_providers):
-        return "local"
-    return "subscription" if subscription(which, step.get("provider") or "", mode) else "api_key"
-
-
 def route_of(step: dict, cfg: config.Config) -> dict:
-    which, model, billing = step.get("runner") or "", step.get("model") or "", billing_of(step, cfg)
+    which, model, billing = step.get("runner") or "", step.get("model") or "", billing_of(step, cfg.local_providers)
     fallback = {"claude": "anthropic", "codex": "openai" if step.get("auth_mode") == "api_key" else "chatgpt",
                 "pi": model.partition("/")[0] if "/" in model else ""}.get(which, "")
     provider = step.get("provider") or fallback
@@ -331,7 +319,7 @@ def ab_side(tickets: set, steps_by_run: dict[str, list[dict]], since: str, conne
     rows = [(r["id"], s) for r in runs for s in steps_by_run.get(r["id"], ())]
     cost = {"api_key": 0.0, "subscription": 0.0}
     for _, s in rows:
-        billing = billing_of(s, cfg)
+        billing = billing_of(s, cfg.local_providers)
         if billing in cost:
             cost[billing] += s["cost_usd"] or 0
 
@@ -374,8 +362,8 @@ def paid_since(since: str, connect=state.db, cfg: config.Config | None = None) -
     groups: dict[str, dict[str, dict]] = {"model": {}, "runner": {}, "loop": {}, "day": {}}
     total = 0.0
     cfg = cfg or config.load_or_problem()[0]
-    for s in state.steps_since(since, connect, paid_only=True):
-        if billing_of(s, cfg) in ("local", "replay"):
+    for s in state.steps_since(since, connect):
+        if billing_of(s, cfg.local_providers) != "api_key":
             continue
         cost = s["cost_usd"] or 0
         total += cost

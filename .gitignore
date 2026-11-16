@@ -5,3 +5,4 @@ dist/
 .env
 .env.*
 arete/loops/merge-check/.state/
+.arete-sandbox/

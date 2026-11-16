@@ -13,6 +13,7 @@ from . import (
     paths,
     pipeline,
     record,
+    refusals,
     routing,
     runner,
     sessions,
@@ -21,7 +22,7 @@ from . import (
     state,
     util,
 )
-from .agent import Result
+from .agent import READ_TOOLS, Result
 
 CONTEXT_FILE = paths.RUNS_DIR / "chat" / "context" / "dashboard.json"
 BUDGET_USD = 2
@@ -55,19 +56,19 @@ starting = threading.Lock()
 replying: dict[int, float] = {}
 
 
-class Busy(RuntimeError):
+class Busy(refusals.Conflict, RuntimeError):
     pass
 
 
-class NoDraft(RuntimeError):
+class NoDraft(refusals.Conflict, RuntimeError):
     pass
 
 
-class NoChat(LookupError):
+class NoChat(refusals.NotFound, LookupError):
     pass
 
 
-class BadProject(ValueError):
+class BadProject(refusals.Invalid, ValueError):
     pass
 
 
@@ -99,8 +100,8 @@ def view(chat_id: int) -> dict:
     except config.UnknownRepo:
         repo = None
     return {**summary(row), "folder": folder(row["project"]), "draft": draft_of(row, cfg),
-            "metered": runner.metered(cfg.model("chat"), cfg=cfg, repo=repo,
-                                     tools=[*runner.READ_TOOLS, "Bash"]) if repo else None,
+            "metered": routing.metered(cfg.model("chat"), cfg=cfg, repo=repo,
+                                       tools=[*READ_TOOLS, "Bash"]) if repo else None,
             "summary": row["summary"], "messages": state.chat_messages(chat_id),
             "sessions": sessions_of(chat_id)}
 
@@ -513,8 +514,8 @@ def ask(chat_id: int, prompt: str, project: str, cfg: config.Config, budget_usd:
         cfg=cfg,
         repo=work,
         model=model,
-        tools=[*runner.READ_TOOLS, "Bash"],
-        allowed_tools=[*runner.READ_TOOLS, "Bash(arete status*)", "Bash(arete events*)", "Bash(git log*)",
+        tools=[*READ_TOOLS, "Bash"],
+        allowed_tools=[*READ_TOOLS, "Bash(arete status*)", "Bash(arete events*)", "Bash(git log*)",
                        "Bash(arete record*)", "Bash(arete lines*)",
                        "Bash(git show*)", *reads_issues, *session_rules(chat_id)],
         json_schema=REPLY_SCHEMA,

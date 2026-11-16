@@ -5,7 +5,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import timedelta
 
-from . import config, jira, oncall, owner_asks, paths, pipeline, routing, runlimits, runner, state, steps, tracker, util
+from . import config, jira, oncall, owner_asks, paths, pipeline, routing, runlimits, state, steps, tracker, util
+from .agent import REPLAY
 from .heartbeat import mark_loop, network_up_or_skip
 from .pipeline import (
     held_back,
@@ -91,7 +92,7 @@ def route_blocker(cfg: config.Config, repo: config.Repo, ticket: tracker.Ticket,
         first = ("build",)
     for role in (*first, *(("verify",) if layer.verify else ()), "review"):
         setting = steps.resolve(cfg, layer, role, ticket.kind, ticket=(repo.name, str(ticket.id)))
-        if setting.runner == runner.REPLAY:
+        if setting.runner == REPLAY:
             continue
         routes = discovery.routes(setting)
         if not any(route.state == "ready" for route in routes):

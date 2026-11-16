@@ -886,7 +886,7 @@ class BrowserServerTests(unittest.TestCase):
         error = sandbox.ConfinementUnavailable("pinned browser server: gone")
         with scratch.producing(self.a), mock.patch.object(browser, "browser_server", side_effect=error), \
                 mock.patch.object(codex, "home", return_value=self.root), \
-                mock.patch.object(codex.claude, "run_streaming", side_effect=AssertionError("launched")):
+                mock.patch.object(codex.child, "stream", side_effect=AssertionError("launched")):
             with mock.patch.object(sandbox, "protected_command", side_effect=AssertionError("fallback")), \
                     self.assertRaises(ValueError):
                 codex.mcp_settings(text, [])
@@ -896,7 +896,7 @@ class BrowserServerTests(unittest.TestCase):
 
     def test_run_turns_a_command_oserror_into_a_failed_result(self):
         with mock.patch.object(codex, "command", side_effect=PermissionError("nope")), \
-                mock.patch.object(codex.claude, "run_streaming", side_effect=AssertionError("launched")):
+                mock.patch.object(codex.child, "stream", side_effect=AssertionError("launched")):
             res = codex._run("p", self.ws)
         self.assertFalse(res.ok)
         self.assertEqual(res.error, "nope")

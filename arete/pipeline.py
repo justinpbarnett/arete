@@ -289,30 +289,17 @@ class AgentRun:
             kw = {**s.call, **reach,
                   "resume": self.sessions.get(config.INHERITS.get(s.step, s.step), NO_SESSION)
                   if s.session == "resume" else NO_SESSION, **kw}
-        cfg = kw.get("cfg") or self.config
-        if s and s.requires.declared and not cfg.replay.all:
-            size = routing.request_tokens(text, kw.get("system", ""), kw.get("json_schema"))
-            found = routing.Discovery(cfg, self.repo, kw.get("device", "local"), layer=self.layer)
-            servers = json.loads(kw.get("mcp_config") or "{}").get("mcpServers", {})
-            bare, denied = runner.reach(kw)
-            effective = replace(s, tools=bare, denied=denied, mcp=tuple(servers))
-            picked = routing.select(found, effective, request_tokens=size)
-            kw["route"] = routing.described_selection(picked, effective, size)
-            if picked.error:
-                kw["refusal"] = picked.error
-            elif alternative := picked.route:
-                kw.update(model=alternative.model, runner=alternative.runner, effort=alternative.effort,
-                          instructions=list(alternative.instructions), mode=alternative.mode)
-                self.log(f"{step}: {picked.reason}")
+        kw = self.fit_route(step, text, s, kw)
         run_with = kw.get("runner", "") or kw.get("resume", NO_SESSION).runner
-        which, model = runner.chosen(kw.get("model", ""), run_with, cfg)
-        effort, started, spent = kw.get("effort", ""), time.monotonic(), self.cost
-        tier, kind = kw.setdefault("tier", s.tier if s else ""), kw.setdefault("kind", self.kind)
+        which, model = routing.chosen(kw.get("model", ""), run_with, kw.get("cfg") or self.config)
+        chosen = (which, model, kw.get("effort", ""))
+        started, spent = time.monotonic(), self.cost
+        kw.setdefault("tier", s.tier if s else "")
+        kw.setdefault("kind", self.kind)
         kw.setdefault("waits", self.waiting)
         kw.setdefault("repo", self.repo)
         kw.setdefault("layer", self.layer)
         seam = factory.inside(self.id)
-        lined = self.writes_lines and seam is None
         if s:
             kw.setdefault("settings", s)
         if self.writes_lines:
@@ -323,9 +310,10 @@ class AgentRun:
                 if s:
                     fields["atom"] = s.step
                 if seam is None:
-                    self.write_line("step_start", step=step, kind=kind, **fields)
+                    self.write_line("step_start", step=step, kind=kw["kind"], **fields)
                 else:
-                    self.write_line("step_start", step=seam.step, call=step, **{"try": seam.n}, kind=kind, **fields)
+                    self.write_line("step_start", step=seam.step, call=step, **{"try": seam.n}, kind=kw["kind"],
+                                    **fields)
 
             kw["on_launch"] = announce
         if s and s.ab_name:
@@ -334,6 +322,30 @@ class AgentRun:
         kw["try_no"] = attempt_no
         self.log(f"{step}: starting")
         kw.setdefault("say", lambda note: self.log(f"{step}: {note}"))
+        res = self.through_drops(step, text, cwd, kw, self.writes_lines and seam is None, s, attempt_no)
+        return self.record_step(step, res, s, kw, seam, attempt_no, started, spent, chosen)
+
+    def fit_route(self, step: str, text: str, s: steps.Settings | None, kw: dict) -> dict:
+        cfg = kw.get("cfg") or self.config
+        if not (s and s.requires.declared and not cfg.replay.all):
+            return kw
+        size = routing.request_tokens(text, kw.get("system", ""), kw.get("json_schema"))
+        found = routing.Discovery(cfg, self.repo, kw.get("device", "local"), layer=self.layer)
+        servers = json.loads(kw.get("mcp_config") or "{}").get("mcpServers", {})
+        bare, denied = routing.reach(kw)
+        effective = replace(s, tools=bare, denied=denied, mcp=tuple(servers))
+        picked = routing.select(found, effective, request_tokens=size)
+        kw = {**kw, "route": routing.described_selection(picked, effective, size)}
+        if picked.error:
+            kw["refusal"] = picked.error
+        elif alternative := picked.route:
+            kw.update(model=alternative.model, runner=alternative.runner, effort=alternative.effort,
+                      instructions=list(alternative.instructions), mode=alternative.mode)
+            self.log(f"{step}: {picked.reason}")
+        return kw
+
+    def through_drops(self, step: str, text: str, cwd: Path, kw: dict, lined: bool, s: steps.Settings | None,
+                      attempt_no: int) -> Result:
         try:
             with run_lines.beating(self.id, step) if lined else nullcontext():
                 res = runner.run(text, cwd, add_dirs=self.add_dirs, trace=(self.id, step), **kw)
@@ -349,17 +361,22 @@ class AgentRun:
                             res = runner.run(text, cwd, add_dirs=self.add_dirs, trace=(self.id, step),
                                              **{**kw, **self.retry_kw()})
                         res = runner.with_spent(res, [dropped])
+            return res
         finally:
             if s:
                 record.label_step(self.id, step, attempt_no, atom=s.step, ab=s.ab_name, ab_side=s.ab_side)
+
+    def record_step(self, step: str, res: Result, s: steps.Settings | None, kw: dict, seam, attempt_no: int,
+                    started: float, spent: float, chosen: tuple[str, str, str]) -> Result:
+        which, model, effort = chosen
         if s and res.session.id:
             self.sessions[config.INHERITS.get(s.step, s.step)] = res.session
         self.cost += res.cost_usd
         self.paid += res.paid_usd
-        usage = {"runner": res.runner or which, "model": res.model or model, "effort": res.effort or effort, "tier": tier,
-                 "credential": res.credential, "auth_mode": ", ".join(res.modes),
+        usage = {"runner": res.runner or which, "model": res.model or model, "effort": res.effort or effort,
+                 "tier": kw["tier"], "credential": res.credential, "auth_mode": ", ".join(res.modes),
                  "provider": res.provider,
-                 "kind": kind, "cost_usd": round(self.cost - spent, 6), "tokens_in": res.tokens_in,
+                 "kind": kw["kind"], "cost_usd": round(self.cost - spent, 6), "tokens_in": res.tokens_in,
                  "tokens_out": res.tokens_out, "turns": res.turns, "cache_read": res.cache_read,
                  "cache_write": res.cache_write, "api_seconds": round(res.api_seconds, 2)}
         if s:
@@ -860,7 +877,7 @@ class Build(TicketWork):
         elif saved.id and saved.runner != settings.runner:
             text = switched(settings.runner)
         return self.run.agent(step, text, self.ws, role=role, allowed_tools=self.tools,
-                              disallowed_tools=runner.NO_GIT_WRITES, **kw)
+                              disallowed_tools=routing.NO_GIT_WRITES, **kw)
 
     def check(self) -> bool:
         ok, self.report = run_checks(self.layer, self.ws, self.git_dirs, self.run, self.timeout)
@@ -1437,7 +1454,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
                                          body=t.body, comments=t.comments, attachments=attachments,
                                          feedback=feedback, expertise=expertise, checks=runs_checks,
                                          commands=commands, max_lines=limit),
-                        ws, role="build", allowed_tools=build_rules, disallowed_tools=runner.NO_GIT_WRITES,
+                        ws, role="build", allowed_tools=build_rules, disallowed_tools=routing.NO_GIT_WRITES,
                         json_schema=REVISE_SCHEMA)
         if not res.ok or not isinstance(res.structured, dict):
             return _fail(run, "revise step failed", res.text)
@@ -1477,7 +1494,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
                                          body=t.body, comments=t.comments, attachments=attachments, plan=plan_text,
                                          expertise=expertise, checks=runs_checks, commands=commands, max_lines=limit,
                                          estimate=estimate, verify=goal),
-                        ws, role="build", allowed_tools=build_rules, disallowed_tools=runner.NO_GIT_WRITES)
+                        ws, role="build", allowed_tools=build_rules, disallowed_tools=routing.NO_GIT_WRITES)
         if not res.ok:
             return _fail(run, "build step failed", res.text)
         build_summary = res.text
@@ -2180,7 +2197,7 @@ def resolve_conflicts(run: AgentRun, c: workspace.Checkout, conflicts: list[str]
                       owner=run.owner_note)
         try:
             res = run.agent(round_name("resolve", n), text, c.wt, role="build",
-                            allowed_tools=bash_rules(layer.builder_bash), disallowed_tools=runner.NO_GIT_WRITES,
+                            allowed_tools=bash_rules(layer.builder_bash), disallowed_tools=routing.NO_GIT_WRITES,
                             json_schema=RESOLVE_SCHEMA, resume=NO_SESSION, extra_env=dict(RESOLVER_SETS))
         finally:
             if previous is None:
@@ -2514,7 +2531,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                                          compare=compare_with_fork(b.checkouts), owner=run.owner_note, **values),
                             b.ws, role=role,
                             allowed_tools=bash_rules(bash) + ([f"mcp__playwright__{t}" for t in verify.PLAYWRIGHT_TOOLS] if url else []),
-                            disallowed_tools=runner.NO_GIT_WRITES, json_schema=verify.SCHEMA,
+                            disallowed_tools=routing.NO_GIT_WRITES, json_schema=verify.SCHEMA,
                             mcp_config=browser.mcp_config(evidence) if url else "",
                             scratch=attempt)
             agent_finished = True

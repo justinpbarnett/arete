@@ -41,11 +41,11 @@ def scenario(name):
 class Rig:
     def __init__(self, oncall=False, real_launch=False, build=True):
         from unittest import mock
-        from arete import config, loop_run, explain, loops, paths, runner, state, tasks, util, webpush, alerts
+        from arete import config, loop_run, explain, loops, paths, routing, state, tasks, util, webpush, alerts
         self.mock, self.state, self.util, self.loops, self.paths, self.config = mock, state, util, loops, paths, config
         self.wipe()
         paths.ensure_dirs()
-        state.ensure_schema()
+        state.migrate()
         self.config_text = GOOD + ("\n[oncall]\nenabled = true\n" if oncall else "")
         paths.CONFIG_FILE.write_text(self.config_text)
         loops.SWITCHES_FILE.write_text(json.dumps({p.name: False for p in loops.BUNDLED_LOOPS_DIR.iterdir() if p.is_dir()}))
@@ -55,7 +55,7 @@ class Rig:
         self.gate = None
         self.expire = tasks.expire_asks
         self.patches = [
-            mock.patch.object(runner, "usage_hold", lambda *a, **k: ""), mock.patch.object(webpush, "remind", lambda cfg: []),
+            mock.patch.object(routing, "usage_hold", lambda *a, **k: ""), mock.patch.object(webpush, "remind", lambda cfg: []),
             mock.patch.object(state, "release_settled_claims", lambda: None),
             mock.patch.object(explain, "plain_summary", lambda a, c: "fixed plain summary"),
             mock.patch.object(tasks, "expire_asks", self.spy_asks),
@@ -548,14 +548,14 @@ def run_request(request):
 
 
 def serve(port):
-    from arete import dashboard
+    from arete import dashboard, tailnet
     for folder in (REQUESTS, RESULTS):
         shutil.rmtree(folder, ignore_errors=True)
         folder.mkdir(parents=True)
     fresh()
-    node = dashboard.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "fixture@example.com", "")
+    node = tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "fixture@example.com", "")
     owner = type("Owner", (), {"of": lambda self, address: node.owner})()
-    server = dashboard.Server("127.0.0.1", port, node, owner, False)
+    server = tailnet.Server("127.0.0.1", port, node, owner, False, dashboard.Handler, dashboard.Redirect)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     SERVING.write_text(str(os.getpid()))
     print(f"fixture serving on http://127.0.0.1:{port}  (Ctrl-C stops it)", file=sys.__stdout__, flush=True)

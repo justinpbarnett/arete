@@ -2,7 +2,7 @@
 import json, re, threading, unittest, urllib.request
 from html.parser import HTMLParser
 from pathlib import Path
-from arete import dashboard, state
+from arete import dashboard, state, tailnet
 
 class Assets(HTMLParser):
     def __init__(self):
@@ -20,9 +20,9 @@ class Assets(HTMLParser):
 
 check = unittest.TestCase()
 state.migrate()
-node = dashboard.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "ui@example.com", "")
+node = tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "ui@example.com", "")
 owner = type("Owner", (), {"of": lambda self, address: "ui@example.com"})()
-server = dashboard.Server("127.0.0.1", 0, node, owner, False)
+server = tailnet.Server("127.0.0.1", 0, node, owner, False, dashboard.Handler, dashboard.Redirect)
 thread = threading.Thread(target=server.serve_forever, daemon=True)
 thread.start()
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))

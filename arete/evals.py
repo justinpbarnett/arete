@@ -18,7 +18,7 @@ from . import (
     gh,
     paths,
     record,
-    runner,
+    routing,
     sandbox,
     state,
     steps,
@@ -28,6 +28,7 @@ from . import (
     verify,
     workspace,
 )
+from .agent import BUILD_TOOLS, READ_TOOLS
 from .diffguard import denied_paths
 from .heartbeat import mark_loop
 from .pipeline import (
@@ -494,7 +495,7 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
                                         body=task.prompt, comments="", attachments="", triage="", expertise=expertise,
                                         commands=commands, denied=code_list(denied_paths(layer)),
                                         max_lines=layer.max_diff_lines, checks=checks),
-                        wt, **step_call(cfg, run, "plan", runner.READ_TOOLS, bash_rules(config.DEFAULT_ALLOW_BASH)),
+                        wt, **step_call(cfg, run, "plan", READ_TOOLS, bash_rules(config.DEFAULT_ALLOW_BASH)),
                         json_schema=PLAN_SCHEMA, timeout=timeout)
         if not res.ok or not isinstance(res.structured, dict):
             result["why"] = "plan step failed"
@@ -508,8 +509,8 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
                                          expertise=expertise, checks=runs_checks, commands=commands,
                                          max_lines=layer.max_diff_lines, estimate=estimate,
                                          verify=in_use),
-                        wt, **step_call(cfg, run, "build", runner.BUILD_TOOLS, rules),
-                        disallowed_tools=runner.NO_GIT_WRITES, timeout=timeout)
+                        wt, **step_call(cfg, run, "build", BUILD_TOOLS, rules),
+                        disallowed_tools=routing.NO_GIT_WRITES, timeout=timeout)
         if not res.ok:
             result["why"] = "build step failed"
             return result
@@ -522,8 +523,8 @@ def run_task(cfg: config.Config, repo: config.Repo, src: Source, task: Task, run
                 fix = prompt("fix", prompts.dir, attempt=attempts, max_attempts=max_attempts, failures=report,
                              checks=runs_checks)
                 res = run.agent(f"fix{attempts}", fix, wt,
-                                **step_call(cfg, run, "check_repair", runner.BUILD_TOOLS, rules),
-                                disallowed_tools=runner.NO_GIT_WRITES, resume=session, timeout=timeout,
+                                **step_call(cfg, run, "check_repair", BUILD_TOOLS, rules),
+                                disallowed_tools=routing.NO_GIT_WRITES, resume=session, timeout=timeout,
                                 fresh_prompt=lambda which, fix=fix, summary=summary: switched_prompt(
                                     which, wt, task, plan, summary, fix))
                 session, summary = res.session, res.text

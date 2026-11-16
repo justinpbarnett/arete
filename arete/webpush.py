@@ -15,7 +15,7 @@ from datetime import timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import accounts, config, outbound, paths, state, util
+from . import accounts, config, outbound, paths, refusals, state, util
 
 TIMEOUT_SECONDS = 10
 TTL_SECONDS = 86400
@@ -30,7 +30,7 @@ SPKI_POINT_BYTES = 65
 known_key: tuple[tuple[int, int], str] | None = None
 
 
-class Refused(ValueError):
+class Refused(refusals.Invalid, ValueError):
     pass
 
 
