@@ -26,11 +26,12 @@ from . import (
     runner,
     settings,
     ssh,
-    state,
     util,
     vault,
 )
 from .agent import EDIT_TOOLS, NO_SESSION, Session
+from .store import asks as asks_store
+from .store import chats as chats_store
 from .store import db as foundation
 from .store import runs as run_store
 
@@ -236,7 +237,7 @@ def launch(prompt: str, *, device: str = "local", model: str = "", run_with: str
                  log=paths.short_path(SESSIONS_DIR / spec.id / "session.log"), summary=util.first_line(prompt, 200),
                  branch=spec.branch or None)
     if chat:
-        state.chat_link_session(chat, spec.id, budget_usd)
+        chats_store.chat_link_session(chat, spec.id, budget_usd)
     clone = f" (a clone of {spec.github} on {spec.branch} from {spec.base})" if spec.github else ""
     run_store.add_feed(spec.id, "start", f"{which} {name} on {spec.device} in {paths.short_path(spec.cwd)}{clone}; tools "
                                      f"{', '.join(tools) or 'none'}" + "".join(f"; {', '.join(withheld)} off: {reason}"
@@ -258,7 +259,7 @@ def send(session_id: str, text: str) -> dict:
         raise control.NotFound(f"no session {session_id}")
     if r["status"] != "running":
         raise control.Refused(f"session {session_id} has ended ({r['status']}); start a new one")
-    state.add_message(session_id, text)
+    asks_store.add_message(session_id, text)
     return {"id": session_id, "queued": True}
 
 
@@ -631,7 +632,7 @@ def run_conversation(spec: Spec, cfg: config.Config, device: devices.Device) -> 
                 if spec.github:
                     return_work(spec, cfg, device, f"arete session {spec.id}, turn {turn}")
                 idle_since = time.monotonic()
-            prompt = "\n\n".join(state.take_messages(spec.id))
+            prompt = "\n\n".join(asks_store.take_messages(spec.id))
             if prompt:
                 continue
             if spec.task:
@@ -718,7 +719,7 @@ def ended_message(link: dict) -> str:
 
 
 def tell_chats() -> int:
-    return sum(state.chat_tell_session(link["run_id"], ended_message(link)) for link in state.chat_sessions_untold())
+    return sum(chats_store.chat_tell_session(link["run_id"], ended_message(link)) for link in chats_store.chat_sessions_untold())
 
 
 def views(limit: int = 30, connect=foundation.reader) -> list[dict]:

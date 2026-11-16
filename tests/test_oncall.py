@@ -25,7 +25,7 @@ class Scratch(unittest.TestCase):
                     "ARETE_STATE_DIR": str(self.state), "ARETE_CONFIG_DIR": str(self.config),
                     "ARETE_LOG_DIR": str(self.logs), "ARETE_WORKTREES_DIR": str(self.wt)}
         self.write_config(ON)
-        done = self.py("from arete import state; state.migrate()")
+        done = self.py("from arete.store import db as foundation; from arete.store import incidents as incidents_store; from arete.store import tasks as tasks_store; foundation.migrate()")
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.log = self.logs / "app.log"
 
@@ -152,7 +152,7 @@ class Files(Scratch):
         self.assertEqual(one["class"], "orchestration")
 
     def test_failing_run_line_for_a_ticket_with_another_live_run_is_expected(self):
-        script = ("from arete import record, state\n"
+        script = ("from arete import record; from arete.store import db as foundation; from arete.store import incidents as incidents_store; from arete.store import tasks as tasks_store\n"
                   "a = record.start('pipeline', repo='demo', issue=7, pid=__import__('os').getpid())\n"
                   "b = record.start('pipeline', repo='demo', issue=7, pid=__import__('os').getpid())\n"
                   "print(a)")
@@ -518,13 +518,13 @@ class Backlogs(Scratch):
     def test_a_run_that_starts_and_ends_during_a_slow_scan_is_read_by_the_next(self):
         self.baseline()
         code = ("import time\n"
-                "from arete import config, run_lines, oncall, record, state\n"
+                "from arete import config, run_lines, oncall, record; from arete.store import db as foundation; from arete.store import incidents as incidents_store; from arete.store import tasks as tasks_store\n"
                 "original = oncall.Watch.run_files\n"
                 "def slow(self, since):\n"
                 "    found = original(self, since)\n"
                 "    run = record.start('pipeline', repo='demo', issue=9)\n"
                 "    run_lines.write(run, 'error', step='build', message='boom during the scan')\n"
-                "    with state.db() as c:\n"
+                "    with foundation.db() as c:\n"
                 "        c.execute(\"UPDATE runs SET status = 'failed' WHERE id = ?\", (run,))\n"
                 "    time.sleep(1.2)\n"
                 "    return found\n"
@@ -542,7 +542,7 @@ class Backlogs(Scratch):
     def test_scan_interrupted_before_recording_loses_nothing(self):
         self.baseline()
         self.append(self.error(1))
-        code = ("from arete import config, oncall, state\n"
+        code = ("from arete import config, oncall; from arete.store import db as foundation; from arete.store import incidents as incidents_store; from arete.store import tasks as tasks_store\n"
                 "def broken(*a): raise RuntimeError('storage failed')\n"
                 "oncall.commit_scan = broken\n"
                 "oncall.scan(config.load())")
@@ -643,7 +643,7 @@ class Others(Scratch):
         self.append(self.error(1))
         self.scan()
         self.age_incidents()
-        self.assertEqual(self.py("from arete import state, store; store.prune()").returncode, 0)
+        self.assertEqual(self.py("from arete import store; from arete.store import db as foundation; from arete.store import incidents as incidents_store; from arete.store import tasks as tasks_store; store.prune()").returncode, 0)
         self.assertEqual(self.sql("SELECT (SELECT count(*) FROM incidents), (SELECT count(*) FROM incident_notes)"),
                          [(0, 0)])
 
@@ -811,8 +811,8 @@ class Decisions(Scratch):
         self.scanned({"mailer": {"error": "down"}})
         self.sql("UPDATE incidents SET tries = 30, retry_at = '2020-01-01T00:00:00Z'")
         self.scanned({"mailer": {"error": "down"}})
-        out = self.py("from arete import oncall, util, state\n"
-                      "row = state.open_incidents()[0]\n"
+        out = self.py("from arete import oncall, util; from arete.store import db as foundation; from arete.store import incidents as incidents_store; from arete.store import tasks as tasks_store\n"
+                      "row = incidents_store.open_incidents()[0]\n"
                       "print(row['tries'], (util.parse_iso(row['retry_at']) - util.now()).total_seconds())")
         tries, wait = out.stdout.split()
         self.assertEqual(tries, "31")
@@ -994,7 +994,7 @@ class Decisions(Scratch):
                  "class TEXT NOT NULL, source TEXT NOT NULL, repo TEXT DEFAULT '', signature TEXT DEFAULT '', "
                  "state TEXT NOT NULL DEFAULT 'open', first_seen TEXT NOT NULL, last_seen TEXT NOT NULL, "
                  "count INTEGER DEFAULT 1, evidence TEXT DEFAULT '')")
-        done = self.py("from arete import state; state.migrate()")
+        done = self.py("from arete.store import db as foundation; from arete.store import incidents as incidents_store; from arete.store import tasks as tasks_store; foundation.migrate()")
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertTrue({"decision", "policies"} <= {r[1] for r in self.sql("PRAGMA table_info(incidents)")})
         self.baseline()
@@ -1627,14 +1627,17 @@ class Decisions(Scratch):
 HEAD = FAKE.rsplit("print(", 1)[0]
 SEAMS = """
 import os
-from arete import record, routing, state
+from arete import record, routing
+from arete.store import db as foundation
+from arete.store import incidents as incidents_store
+from arete.store import tasks as tasks_store
 
 def log(*a):
     with open(SEAM_LOG, "a") as f:
         f.write(json.dumps(a) + "\\n")
 
 def start(repo, prompt="", title="", ticket=""):
-    tid = ticket or state.task_add(repo, prompt, title, "fix")
+    tid = ticket or tasks_store.task_add(repo, prompt, title, "fix")
     run = record.start("pipeline", repo=repo, issue=tid, pid=os.getppid())
     log("start", repo, tid, run, prompt, ticket)
     return {"task": tid, "repo": repo, "run": run, "state": "running", "why": "started"}
@@ -1931,7 +1934,7 @@ class Repairs(Scratch):
         self.assertEqual(self.picked()[0], task)
         self.arete("off")
         self.assertIsNone(self.picked())
-        plain = self.py("from arete import state\nprint(state.task_add('demo', 'plain work', 'plain', 'feat'))"
+        plain = self.py("from arete.store import db as foundation; from arete.store import incidents as incidents_store; from arete.store import tasks as tasks_store\nprint(tasks_store.task_add('demo', 'plain work', 'plain', 'feat'))"
                         ).stdout.strip()
         self.assertEqual(self.picked()[0], plain)
         self.sql("UPDATE tasks SET state = 'closed' WHERE id = ?", plain)
@@ -2105,9 +2108,12 @@ class Repairs(Scratch):
 SERVER = '''
 import json, os, threading, urllib.error, urllib.request
 from datetime import timedelta
-from arete import board, dashboard, oncall, record, state, tailnet, util
+from arete import board, dashboard, oncall, record, tailnet, util
+from arete.store import db as foundation
+from arete.store import incidents as incidents_store
+from arete.store import tasks as tasks_store
 from arete.sighting import Sighting
-state.migrate()
+foundation.migrate()
 ALERTS = []
 oncall.raise_alert = lambda *a: ALERTS.append(a)
 
@@ -2137,31 +2143,31 @@ def call(method, path, body=None, header=True):
 
 
 def new(n, evidence="payment job failed: db"):
-    return state.record_incident(Sighting(f"seed{n}", "unexpected", "/tmp/app.log", "demo",
+    return incidents_store.record_incident(Sighting(f"seed{n}", "unexpected", "/tmp/app.log", "demo",
                                           f"<time> ERROR seed {n} failed", n, evidence,
                                           json.dumps([["v", "s"]])))[0]
 
 
 def wake(i, **fields):
     answers = json.dumps({"actionable": {"value": True, "confidence": 0.95, "p": 0.95}})
-    state.update_incident(i, "decided wake (confidence 0.94): actionable", decision="wake", confidence=0.94,
+    incidents_store.update_incident(i, "decided wake (confidence 0.94): actionable", decision="wake", confidence=0.94,
                           reason="actionable and in scope", decided=util.iso(), answers=answers, **fields)
 
 
 def repair(i, status, ended, outcome="", mode="api_key", runner="pi"):
-    made = state.add_repair(i, "demo")
-    task = state.task_add("demo", f"repair {i}", f"On-call incident {i}: repair", "fix")
+    made = incidents_store.add_repair(i, "demo")
+    task = tasks_store.task_add("demo", f"repair {i}", f"On-call incident {i}: repair", "fix")
     run = record.start("pipeline", repo="demo", issue=task, pid=999999)
-    with state.db() as c:
+    with foundation.db() as c:
         c.execute("UPDATE runs SET status = ?, finished = ? WHERE id = ?", (status, util.iso(), run))
         c.execute("INSERT INTO steps (run_id, step, runner, model, provider, auth_mode, cost_usd) "
                   "VALUES (?, 'build', ?, 'm', 'openai', ?, 2.0)", (run, runner, mode))
-    state.set_repair(made, task=task, **({"ended": util.iso(), "outcome": outcome} if ended else {}))
+    incidents_store.set_repair(made, task=task, **({"ended": util.iso(), "outcome": outcome} if ended else {}))
     return run
 
 
 def notes(i):
-    return [n["note"] for n in state.incident(i)["notes"]]
+    return [n["note"] for n in incidents_store.incident(i)["notes"]]
 
 
 def show(value):
@@ -2177,10 +2183,10 @@ class Dashboard(Scratch):
 
     def test_list_puts_open_first_and_tells_what_the_watcher_is_doing(self):
         body = ("resolved = new(1)\n"
-                "state.update_incident(resolved, 'resolved: check passed', state='resolved', recovery='check passed')\n"
+                "incidents_store.update_incident(resolved, 'resolved: check passed', state='resolved', recovery='check passed')\n"
                 "open_one = new(2)\n"
                 "dismissed = new(3)\n"
-                "state.update_incident(dismissed, 'dismissed by the owner', state='dismissed')\n"
+                "incidents_store.update_incident(dismissed, 'dismissed by the owner', state='dismissed')\n"
                 "listed = call('GET', '/api/incidents')\n"
                 "off = call('POST', '/api/incidents/switch', {'on': False})\n"
                 "after = call('GET', '/api/incidents')\n"
@@ -2202,7 +2208,7 @@ class Dashboard(Scratch):
                 "wake(i, phase='blocked', waiting='2 of 2 attempts used')\n"
                 "paid = repair(i, 'failed', True, 'failed')\n"
                 "free = repair(i, 'failed', True, 'failed', mode='subscription', runner='claude')\n"
-                "state.update_incident(i, recovery='check passed')\n"
+                "incidents_store.update_incident(i, recovery='check passed')\n"
                 "show([paid, free, call('GET', f'/api/incidents/{i}')])\n")
         paid, free, got = self.serve(body)
         self.assertEqual(got[0], 200)
@@ -2230,7 +2236,7 @@ class Dashboard(Scratch):
                 "plain = new(3)\n"
                 "answers = [call('POST', f'/api/incidents/{blocked}/retry'), call('POST', f'/api/incidents/{live}/cancel'),\n"
                 "           call('POST', f'/api/incidents/{plain}/dismiss'), call('POST', '/api/incidents/switch', {'on': True})]\n"
-                "rows = {i: state.incident(i) for i in (blocked, live, plain)}\n"
+                "rows = {i: incidents_store.incident(i) for i in (blocked, live, plain)}\n"
                 "show([answers, {i: [r['state'], r['phase'], r['rearmed'], r['closed'], [x['outcome'] for x in r['repairs']],\n"
                 "                  [n['note'] for n in r['notes']]] for i, r in rows.items()}, len(ALERTS)])\n")
         answers, rows, alerts = self.serve(body)
@@ -2248,9 +2254,9 @@ class Dashboard(Scratch):
 
     def test_unknown_and_refused_steering_answer_404_and_400_and_a_missing_header_403(self):
         body = ("closed = new(1)\n"
-                "state.update_incident(closed, 'dismissed by the owner', state='dismissed')\n"
+                "incidents_store.update_incident(closed, 'dismissed by the owner', state='dismissed')\n"
                 "ignored = new(2)\n"
-                "state.update_incident(ignored, 'decided ignore', decision='ignore', confidence=0.9, reason='noise')\n"
+                "incidents_store.update_incident(ignored, 'decided ignore', decision='ignore', confidence=0.9, reason='noise')\n"
                 "idle = new(3)\n"
                 "wake(idle)\n"
                 "show([call('POST', '/api/incidents/nope/dismiss'), call('POST', '/api/incidents/999/retry'),\n"
@@ -2259,7 +2265,7 @@ class Dashboard(Scratch):
                 "      call('POST', f'/api/incidents/{idle}/cancel'), call('POST', '/api/incidents/switch', {}),\n"
                 "      call('POST', '/api/incidents/switch', {'on': 'yes'}),\n"
                 "      call('POST', f'/api/incidents/{idle}/dismiss', header=False), call('POST', '/api/incidents/switch', {'on': False}, header=False),\n"
-                "      [state.incident(idle)['state'], oncall.switched_off()]])\n")
+                "      [incidents_store.incident(idle)['state'], oncall.switched_off()]])\n")
         *answers, last = self.serve(body)
         self.assertEqual([a[0] for a in answers], [404, 404, 404, 404, 400, 400, 400, 400, 400, 403, 403])
         self.assertTrue(all(a[1].get("error") for a in answers))
@@ -2284,7 +2290,7 @@ class Dashboard(Scratch):
                 "wake(i, phase='waiting', waiting='cooling down')\n"
                 "calm = call('GET', '/api/health')\n"
                 "calm_word = board.health_word(control.serve_beat(), board.checks_and_alerts())\n"
-                "state.update_incident(i, phase='blocked', waiting='2 of 2 attempts used')\n"
+                "incidents_store.update_incident(i, phase='blocked', waiting='2 of 2 attempts used')\n"
                 "blocked = call('GET', '/api/health')\n"
                 "show([calm[1]['state'], calm[1]['incidents'], calm_word, blocked[1]['state'], blocked[1]['incidents'],\n"
                 "      board.health_word(control.serve_beat(), board.checks_and_alerts())])\n")
@@ -2297,27 +2303,27 @@ class Dashboard(Scratch):
     def test_closed_incidents_keep_notes_and_evidence_for_keep_days_and_open_ones_drop_repeats(self):
         body = ("def age(i, days):\n"
                 "    when = util.iso(util.now() - timedelta(days=days))\n"
-                "    with state.db() as c:\n"
+                "    with foundation.db() as c:\n"
                 "        c.execute('UPDATE incident_notes SET ts = ? WHERE incident = ?', (when, i))\n"
                 "        c.execute('UPDATE incidents SET last_seen = ? WHERE id = ?', (when, i))\n"
                 "closed = new(1)\n"
-                "state.update_incident(closed, 'dismissed by the owner', state='dismissed')\n"
-                "stamped = state.incident(closed)['closed']\n"
-                "with state.db() as c:\n"
+                "incidents_store.update_incident(closed, 'dismissed by the owner', state='dismissed')\n"
+                "stamped = incidents_store.incident(closed)['closed']\n"
+                "with foundation.db() as c:\n"
                 "    c.execute('UPDATE incidents SET closed = ? WHERE id = ?', (util.iso(util.now() - timedelta(days=10)), closed))\n"
                 "age(closed, 20)\n"
                 "open_one = new(2)\n"
-                "state.update_incident(open_one, 'decided wake (confidence 0.94): actionable', decision='wake')\n"
-                "state.add_incident_note(open_one, state.SEEN_AGAIN + ': 2 more from /tmp/app.log, 3 in all')\n"
+                "incidents_store.update_incident(open_one, 'decided wake (confidence 0.94): actionable', decision='wake')\n"
+                "incidents_store.add_incident_note(open_one, incidents_store.SEEN_AGAIN + ': 2 more from /tmp/app.log, 3 in all')\n"
                 "age(open_one, 20)\n"
                 "def held():\n"
-                "    c = state.incident(closed)\n"
-                "    return [len(c['notes']), c['evidence'], state.incident(closed) is not None,\n"
-                "            [n['note'][:7] for n in state.incident(open_one)['notes']]]\n"
+                "    c = incidents_store.incident(closed)\n"
+                "    return [len(c['notes']), c['evidence'], incidents_store.incident(closed) is not None,\n"
+                "            [n['note'][:7] for n in incidents_store.incident(open_one)['notes']]]\n"
                 "from arete import store\nstore.prune(keep_days=30)\n"
                 "kept = held()\n"
                 "store.prune(keep_days=5)\n"
-                "show([stamped, kept, held(), state.incident(open_one)['evidence']])\n")
+                "show([stamped, kept, held(), incidents_store.incident(open_one)['evidence']])\n")
         stamped, kept, dropped, open_evidence = self.serve(body)
         self.assertTrue(stamped)
         self.assertEqual(kept[:3], [2, "payment job failed: db", True])

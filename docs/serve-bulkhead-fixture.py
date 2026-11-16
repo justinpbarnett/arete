@@ -44,14 +44,16 @@ class Rig:
         from arete.store import runs as run_store
         from arete.store import loops as loop_store
         from arete.store import incidents as incident_store
-        from arete import config, loop_run, explain, loops, paths, routing, state, tasks, util, webpush, alerts
+        from arete import config, loop_run, explain, loops, paths, routing, tasks, util, webpush, alerts
+        from arete.store import approvals as approvals_store
+        from arete.store import db as foundation
         self.run_store = run_store
         self.loop_store = loop_store
         self.incident_store = incident_store
-        self.mock, self.state, self.util, self.loops, self.paths, self.config = mock, state, util, loops, paths, config
+        self.mock, self.approvals_store, self.foundation, self.util, self.loops, self.paths, self.config = mock, approvals_store, foundation, util, loops, paths, config
         self.wipe()
         paths.ensure_dirs()
-        state.migrate()
+        foundation.migrate()
         self.config_text = GOOD + ("\n[oncall]\nenabled = true\n" if oncall else "")
         paths.CONFIG_FILE.write_text(self.config_text)
         loops.SWITCHES_FILE.write_text(json.dumps({p.name: False for p in loops.BUNDLED_LOOPS_DIR.iterdir() if p.is_dir()}))
@@ -182,10 +184,10 @@ class Rig:
         store.append({"pass": len(self.beats), "severity": check.severity if check else None, "ok": check.ok if check else None})
 
     def snapshot(self):
-        state = self.state
+        approvals_store = self.approvals_store
         return {"beats": self.beats, "launches": self.launched, "claims": self.claims,
                 "queue": [{"id": i["id"], "loop": i["loop"], "grp": i["grp"]} for i in self.loop_store.pending()],
-                "approvals": {i: {"status": a["status"], "plain_summary": a.get("plain_summary")} for i in range(1, 6) if (a := state.approval(i))},
+                "approvals": {i: {"status": a["status"], "plain_summary": a.get("plain_summary")} for i in range(1, 6) if (a := approvals_store.approval(i))},
                 "housekeeping": {"ask_expiry_passes": self.asks, "passes": len(self.beats)},
                 "alerts": self.alert_calls, "readers": self.readers(), "log": self.log_lines(),
                 "runs": [{"id": r["id"], "loop": r.get("loop"), "status": r.get("status")} for r in self.run_store.runs(limit=50, firings=True)]}
@@ -237,9 +239,9 @@ def loop(passes):
 @scenario("recover")
 def recover(passes):
     r = rig or fresh()
-    for approval in r.state.approvals():
+    for approval in r.approvals_store.approvals():
         if approval["status"] == "pending" and approval["emit"].get("type") == "renamed_emit":
-            with r.state.db() as c:
+            with r.foundation.db() as c:
                 c.execute("UPDATE approvals SET status = 'rejected' WHERE id = ?", (approval["id"],))
     r.clear_faults()
     r.pending_faults.clear()
@@ -272,12 +274,12 @@ def oncall(passes):
 @scenario("approvals")
 def approvals(passes):
     r = fresh()
-    r.state.add_approval("aaa", "r1", {"type": "push", "item": {"repo": "x"}}, "one")
-    bad = r.state.add_approval("aaa", "r2", {"type": "renamed_emit", "item": {}}, "two")
+    r.approvals_store.add_approval("aaa", "r1", {"type": "push", "item": {"repo": "x"}}, "one")
+    bad = r.approvals_store.add_approval("aaa", "r2", {"type": "renamed_emit", "item": {}}, "two")
     for _ in range(passes):
         r.step(due=False)
         r.checks_per_pass(r.errors)
-    return {"bad_approval": bad, "failing": failing_of(r.beats[-1]), "valid_summary": r.state.approval(1)["plain_summary"],
+    return {"bad_approval": bad, "failing": failing_of(r.beats[-1]), "valid_summary": r.approvals_store.approval(1)["plain_summary"],
             "ask_expiry_passes": len(r.asks), "severity": r.errors[-1]["severity"]}
 
 
@@ -366,7 +368,7 @@ def waits(passes):
 
 
 def alert_run(r, passes, gate=False):
-    r.state.add_approval("aaa", "r1", {"type": "push", "item": {"repo": "x"}}, "one")
+    r.approvals_store.add_approval("aaa", "r1", {"type": "push", "item": {"repo": "x"}}, "one")
     r.fault(r.server, "dispatch", r.mock.Mock(side_effect=RuntimeError("dispatch down")))
     seen = []
     for _ in range(passes):
@@ -379,7 +381,7 @@ def alert_run(r, passes, gate=False):
 def alerts_scenario(passes):
     r = fresh()
     seen = alert_run(r, passes)
-    return {"raises_after_each_pass": seen, "ask_expiry_passes": len(r.asks), "summary": r.state.approval(1)["plain_summary"],
+    return {"raises_after_each_pass": seen, "ask_expiry_passes": len(r.asks), "summary": r.approvals_store.approval(1)["plain_summary"],
             "failing": failing_of(r.beats[-1]), "note": "run `scenario recover --passes 1` for the one clear"}
 
 
@@ -497,7 +499,7 @@ def retirement(passes):
     r = fresh()
     r.step()
     r.poll_fault()
-    bad = r.state.add_approval("aaa", "r2", {"type": "renamed_emit", "item": {}}, "two")
+    bad = r.approvals_store.add_approval("aaa", "r2", {"type": "renamed_emit", "item": {}}, "two")
     item = r.loop_store.enqueue("bbb", "bbb", "", "event", [EVENT])
 
     def hold(self, cfg, connect=None):
@@ -513,7 +515,7 @@ def retirement(passes):
     out["loop_off"] = list(r.step(due=False)["failing"])
     r.loop_store.drop_queue_item(item)
     out["item_gone"] = list(r.step(due=False)["failing"])
-    with r.state.db() as c:
+    with r.foundation.db() as c:
         c.execute("UPDATE approvals SET status = 'rejected' WHERE id = ?", (bad,))
     out["approval_decided"] = list(r.step(due=False)["failing"])
     loops.SWITCHES_FILE.write_text(json.dumps({**loops.switches(), "aaa": True}))

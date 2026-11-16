@@ -53,18 +53,19 @@ def ago(minutes):
 
 
 def add_run(run_id, kind="pipeline", status="running", minutes=10, issue=None, pid=None, **fields):
-    from arete import state
+    from arete.store import db as foundation
 
     row = {"id": run_id, "kind": kind, "repo": "arete", "issue": issue, "status": status, "started": ago(minutes),
            "finished": None if status == "running" else ago(max(minutes - 5, 0)), "pid": pid, **fields}
-    with state.db() as c:
+    with foundation.db() as c:
         c.execute(f"INSERT INTO runs ({', '.join(row)}) VALUES ({', '.join('?' * len(row))})", tuple(row.values()))
 
 
 def add_usage(run_id, step, tokens_in, tokens_out, cost):
-    from arete import state, util
+    from arete import util
+    from arete.store import db as foundation
 
-    with state.db() as c:
+    with foundation.db() as c:
         c.execute("INSERT INTO steps (run_id, step, runner, model, provider, auth_mode, ok, cost_usd, tokens_in, tokens_out, turns, "
                   "seconds, ts, try) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                   (run_id, step, "claude", "sonnet", "anthropic", "api_key", 1, cost, tokens_in, tokens_out, 3, 12.0, util.iso(), 1))
@@ -86,7 +87,7 @@ def step_events(run_id, steps, report=None):
 
 def seed_runs(instance):
     from arete.store import runs as run_store
-    from arete import paths, state
+    from arete import paths
 
     ids = {}
     producers = instance.producers
@@ -137,7 +138,7 @@ def seed_runs(instance):
 
 def watch(run_id, process):
     from arete.store import runs as run_store
-    from arete import record, state
+    from arete import record
 
     def settle():
         process.wait()
@@ -168,7 +169,7 @@ def fault_for(control, target):
 
 def run_answer(handler, method, path, query):
     from arete.store import runs as run_store
-    from arete import control, dashboard, record, state, tasks
+    from arete import control, dashboard, record, tasks
 
     server = handler.server
     if path == "/__ui_runs/requests" and method == "GET":
@@ -221,9 +222,10 @@ def run_answer(handler, method, path, query):
 
 
 def server(port=0, live=False, runs=False):
-    from arete import dashboard, state, tailnet
+    from arete import dashboard, tailnet
+    from arete.store import db as foundation
 
-    state.migrate()
+    foundation.migrate()
 
     class Handler(dashboard.Handler):
         def body(self):

@@ -105,7 +105,28 @@ class StoreContractTests(unittest.TestCase):
             found = behavior_result(done)
             self.assertEqual(found["case"], case)
             self.assertEqual(len(set(found["isolated_paths"].values())), 6)
+            disposable = Path(found["isolated_root"])
+            self.assertTrue(disposable.is_relative_to(root.resolve()))
+            self.assertTrue(all(Path(path).is_relative_to(disposable) for path in found["isolated_paths"].values()))
             return found
+
+    def test_store_sql_boundary(self):
+        found = self.scenario("boundary")
+        self.assertTrue(found["state_absent"] and found["harmless_passed"])
+        self.assertEqual(found["violations"], [])
+        self.assertEqual(found["files_inspected"], len(found["inspected"]))
+        self.assertTrue({"arete/backup.py", "arete/dashboard.py", "arete/record.py", "arete/doctor.py",
+                         "arete/control.py"}.issubset(found["inspected"]))
+        for filename, violations in found["scanner_examples"].items():
+            self.assertTrue(violations)
+            self.assertTrue(all(v["file"] == filename and v["line"] > 0 for v in violations))
+
+    def test_prune_rolls_back_every_owner(self):
+        found = self.scenario("rollback")
+        self.assertTrue(found["rollback"])
+        self.assertEqual(found["rollback_before"], found["rollback_after"])
+        self.assertEqual(set(found["rollback_tables"]), {"runs", "feed", "run_purges", "queue", "events",
+                                                       "incidents", "incident_notes", "incident_aliases", "incident_repairs"})
 
     def test_unique_table_ownership_and_compatibility(self):
         found = self.scenario("ownership")
@@ -120,7 +141,7 @@ class StoreContractTests(unittest.TestCase):
                          {"approvals", "asks", "chats", "devices", "insights", "push", "tasks", "triage", "_rows"})
 
     def test_record_readers_and_billing(self):
-        found = self.scenario("record-readers")
+        found = self.scenario("record-and-readers")
         self.assertEqual(found["paid"], 2.25)
         self.assertEqual(found["finished_ids"], ["readers"])
         self.assertEqual(found["whole_ids"], ["second", "readers"])
@@ -144,7 +165,7 @@ class StoreContractTests(unittest.TestCase):
                                              "committed_timeline_failure", "invalid_unchanged", "crash_reraised")))
 
     def test_run_retention_protections_and_atomicity(self):
-        found = self.scenario("run-retention")
+        found = self.scenario("prune")
         self.assertEqual(found["deleted_ids"], ["old-done", "old-skipped"])
         self.assertTrue(all(found[k] for k in ("rollback", "history_retained", "merged_raw_kept",
                                              "custom_windows", "deletion_retry", "unsafe_refused")))
@@ -177,12 +198,15 @@ class StoreContractTests(unittest.TestCase):
         self.assertEqual(set(found["private_refusals"]), {"_rows"})
 
     def test_immutable_historical_chains_upgrade_once(self):
-        found = self.scenario("upgrade")
+        found = self.scenario("base-upgrade")
         self.assertEqual(found["historical_rows"], 2)
         self.assertTrue(found["hashes_unchanged"] and found["historical_work_preserved"])
         self.assertEqual(found["applied_once"], found["expected_suffix"])
         self.assertEqual(found["budget_applied_once"], [5, 6, 7, 8])
-        self.assertEqual((found["relocated_rows_added"], found["origin_main_rows_added"]), (0, 4))
+        self.assertEqual((found["relocated_rows_added"], found["pre_budget_rows_added"]), (0, 4))
+        self.assertEqual(found["origin_main_rows_added"], 0)
+        self.assertTrue(found["origin_main_unchanged"] and found["latest_unchanged"])
+        self.assertEqual(len(found["historical_files"]), len(found["origin_main_ledger"]))
 
 
 class LogRotationTests(unittest.TestCase):
@@ -570,9 +594,9 @@ class LogRotationTests(unittest.TestCase):
     def test_tick_rotates_on_its_own_timer_before_prune(self):
         found = self.scenario("""
             clock = [10_000.0]
-            from arete import state
+            from arete.store import db as foundation
             with contextlib.redirect_stdout(io.StringIO()):
-                state.migrate()
+                foundation.migrate()
             server = serve.Server()
             events = []
             server.rotate = lambda: events.append("rotate")

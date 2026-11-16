@@ -7,7 +7,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
-from . import config, gh, jira, principals, state, util
+from . import config, gh, jira, principals, util
+from .store import tasks as tasks_store
 
 LABEL = "agent"
 APPROVAL_LABEL_STYLE = ("0052cc", "Approved for arete to build")
@@ -410,31 +411,31 @@ class LocalTracker:
         return tid
 
     def todo(self) -> list[Ticket]:
-        return [task_ticket(row) for row in state.tasks(self.repo.name, "todo")]
+        return [task_ticket(row) for row in tasks_store.tasks(self.repo.name, "todo")]
 
     def by_owner(self, item: dict) -> bool:
         return True
 
     def blocker(self, tid: str) -> str:
-        if (row := state.task_get(tid)) is None:
+        if (row := tasks_store.task_get(tid)) is None:
             return f"there is no task {tid}"
         return task_wait_blocker(waits_on_tasks(row["body"]), task_state)
 
     def replied(self) -> list[Ticket]:
-        return [task_ticket(row) for row in state.tasks_replied(self.repo.name)]
+        return [task_ticket(row) for row in tasks_store.tasks_replied(self.repo.name)]
 
     def reply_since(self, tid: str, since: str) -> str:
-        return reply_text([(util.parse_iso(c["ts"]), c["body"] or "") for c in state.task_comments(tid)
+        return reply_text([(util.parse_iso(c["ts"]), c["body"] or "") for c in tasks_store.task_comments(tid)
                            if principals.is_person(c["author"]) and c["ts"]], since)
 
     def save_images(self, t: Ticket, dest: Path) -> SavedImages:
         return SavedImages()
 
     def get(self, tid: str) -> Ticket:
-        if (row := state.task_get(tid)) is None:
+        if (row := tasks_store.task_get(tid)) is None:
             raise TaskError(f"no task {tid}")
         comments = [("Arete" if c["author"] == "arete" else "Owner", c["ts"] or "", c["body"] or "")
-                    for c in state.task_comments(tid)]
+                    for c in tasks_store.task_comments(tid)]
         blocker = (f"it is a task of {row['repo']}, not {self.repo.name}" if row["repo"] != self.repo.name
                    else task_wait_blocker(waits_on_tasks(row["body"]), task_state))
         return task_ticket(row, comments_text(comments), blocker)
@@ -443,22 +444,22 @@ class LocalTracker:
         return []
 
     def approve(self, tid: str) -> None:
-        if not state.task_set_state(tid, "todo"):
+        if not tasks_store.task_set_state(tid, "todo"):
             raise TaskError(f"no task {tid}")
 
     def label(self, tid: str, add=(), remove=()) -> str:
-        if state.task_get(tid) is None:
+        if tasks_store.task_get(tid) is None:
             return f"no task {tid}"
         if add:
             if add[0] not in config.TASK_STATES:
                 return f"'{add[0]}' is not a task state; use {', '.join(config.TASK_STATES)}"
-            state.task_set_state(tid, add[0])
+            tasks_store.task_set_state(tid, add[0])
         elif remove:
-            state.task_set_state(tid, "todo", from_states=tuple(remove))
+            tasks_store.task_set_state(tid, "todo", from_states=tuple(remove))
         return ""
 
     def comment(self, tid: str, body: str) -> str:
-        return "" if state.task_comment(tid, "arete", body) else f"no task {tid}"
+        return "" if tasks_store.task_comment(tid, "arete", body) else f"no task {tid}"
 
     def move(self, tid: str, state: str) -> str:
         return ""
@@ -478,7 +479,7 @@ def item_state(tk: Tracker, t: Ticket) -> str:
 
 
 def task_state(tid: str) -> str | None:
-    return (state.task_get(tid) or {}).get("state")
+    return (tasks_store.task_get(tid) or {}).get("state")
 
 
 def task_ticket(row: dict, comments: str = "", blocker: str = "") -> Ticket:

@@ -38,21 +38,22 @@ def task_shown(task_id: str, repo: str, one_line: bool) -> int:
 
 
 def task_add(args) -> int:
-    from .. import chat, state
+    from .. import chat
+    from ..store import tasks as tasks_store
 
     body = " ".join(args.body).strip()
     if not body:
         print('arete task add --repo NAME "what to do"', file=sys.stderr)
         return 2
     config.load().repo(args.repo)
-    print(state.task_add(args.repo, body, title=args.title.strip() or chat.title_of(body), kind=args.kind))
+    print(tasks_store.task_add(args.repo, body, title=args.title.strip() or chat.title_of(body), kind=args.kind))
     return 0
 
 
 def task_list(args) -> int:
-    from .. import state
+    from ..store import tasks as tasks_store
 
-    print_lines(json.dumps(row, ensure_ascii=False) for row in state.tasks(args.repo, args.state))
+    print_lines(json.dumps(row, ensure_ascii=False) for row in tasks_store.tasks(args.repo, args.state))
     return 0
 
 
@@ -63,17 +64,17 @@ def task_show(args) -> int:
 
 
 def existing_task(args) -> str | None:
-    from .. import state
+    from ..store import tasks as tasks_store
 
     tid = args.id.strip().lower()
-    if state.task_get(tid) is None:
+    if tasks_store.task_get(tid) is None:
         print(f"no task {tid}", file=sys.stderr)
         return None
     return tid
 
 
 def task_reply(args) -> int:
-    from .. import state
+    from ..store import tasks as tasks_store
 
     if (tid := existing_task(args)) is None:
         return 1
@@ -81,17 +82,17 @@ def task_reply(args) -> int:
     if not text:
         print('arete task reply ID "your reply"', file=sys.stderr)
         return 2
-    state.task_comment(tid, principals.current(), text)
+    tasks_store.task_comment(tid, principals.current(), text)
     print(f"{tid}: reply saved")
     return 0
 
 
 def task_close(args) -> int:
-    from .. import state
+    from ..store import tasks as tasks_store
 
     if (tid := existing_task(args)) is None:
         return 1
-    state.task_set_state(tid, "closed")
+    tasks_store.task_set_state(tid, "closed")
     print(f"{tid}: closed")
     return 0
 
@@ -110,9 +111,9 @@ def task_run(args) -> int:
 
 
 def cmd_forget(args) -> int:
-    from .. import state
+    from ..store import approvals as approvals_store
 
-    if not state.forget_proposal(args.id):
+    if not approvals_store.forget_proposal(args.id):
         print(f"no open proposal #{args.id}")
         return 1
     return 0
@@ -130,9 +131,9 @@ def cmd_file_rule(args) -> int:
 
 
 def cmd_reject_rule(args) -> int:
-    from .. import state
+    from ..store import approvals as approvals_store
 
-    if not state.move_proposal(args.id, ("approve",), "rejected"):
+    if not approvals_store.move_proposal(args.id, ("approve",), "rejected"):
         print(f"#{args.id} is not a rule waiting for approval")
         return 1
     return 0

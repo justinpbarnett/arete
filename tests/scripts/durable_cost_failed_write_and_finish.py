@@ -1,7 +1,7 @@
 from arete.store import runs as run_store
 
 rid = record.start("pipeline")
-with state.db() as c:
+with foundation.db() as c:
     c.execute("CREATE TRIGGER reject_call BEFORE INSERT ON steps BEGIN SELECT RAISE(ABORT, 'refused'); END")
 def interrupted(*a, **kw):
     kw["on_line"](json.dumps({"type": "assistant", "message": {"id": "one", "usage": {
@@ -17,7 +17,7 @@ except sqlite3.IntegrityError:
 assert rows(rid) == [] and run_store.run_get(rid)["cost_usd"] == 0
 mark, = marks(rid)
 assert abs(mark["cost_usd"] - .0004) < 1e-12 and "cost is not in steps" in mark["error"], mark
-with state.db() as c:
+with foundation.db() as c:
     c.execute("DROP TRIGGER reject_call")
 cfg.pricing = {}
 claude.run = lambda *a, **kw: result()

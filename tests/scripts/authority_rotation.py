@@ -1,9 +1,10 @@
 
 import contextlib, fcntl, hmac, io, json, os, sys
 from pathlib import Path
-from arete import browser, cli, webhooks, record, sandbox, scratch, state, util
+from arete import browser, cli, webhooks, record, sandbox, scratch, util
+from arete.store import db as foundation
 root, mode = Path(sys.argv[1]), sys.argv[2]
-state.migrate()
+foundation.migrate()
 sandbox.AUTHORITY = root / "home/verification-authority"
 A = sandbox.AUTHORITY
 def rotate():

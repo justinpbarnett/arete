@@ -21,12 +21,12 @@ from . import (
     pi,
     routing,
     runner,
-    state,
     steps,
     tool_events,
     util,
     workspace,
 )
+from .store import devices as devices_store
 from .store import loops as loop_store
 from .store import runs as run_store
 
@@ -99,7 +99,7 @@ def check_probes(cfg: config.Config, force: bool = False) -> list[Check]:
     out = []
     for p in cfg.probes:
         key = f"probe:{p.name}"
-        prev = state.probe_get(p.name)
+        prev = devices_store.probe_get(p.name)
         if not force and not probe_due(p, prev):
             out.append(Check(key, True, f"ok at {prev['last_run']} (cached)"))
             continue
@@ -107,7 +107,7 @@ def check_probes(cfg: config.Config, force: bool = False) -> list[Check]:
         text = (res.stdout or "") + (res.stderr or "")
         ok = res.returncode == 0 and p.expect.lower() in text.lower()
         detail = "ok" if ok else f"exit {res.returncode}: {util.last_line(res.stderr) or util.last_line(res.stdout) or 'no output'}"
-        state.probe_set(p.name, ok, detail)
+        devices_store.probe_set(p.name, ok, detail)
         out.append(Check(key, ok, detail))
     return out
 

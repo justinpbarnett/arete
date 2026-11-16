@@ -6,11 +6,13 @@ import traceback
 from contextlib import contextmanager, suppress
 from datetime import timedelta
 
-from . import config, state, util
+from . import config, util
 from .emits import Emit, PullRequest, Ticket, ToLoop
 from .loops import Loop
 from .push import Push
+from .store import approvals as approvals_store
 from .store import db as foundation
+from .store import insights as insights_store
 from .store import runs as run_store
 
 CLAIM_SECONDS = 120
@@ -54,7 +56,7 @@ def deliver(loop: Loop, run_id: str, findings: list[dict], outcome: dict, *, tri
                 log("held", f"would {what}")
             elif why := emit.held(spec, delivery["item"], cfg):
                 delivery |= {"held": why, "reviewer": emit.reviewer(spec, delivery["item"], cfg)}
-                waiting_id = state.add_approval(loop.name, run_id, delivery, what)
+                waiting_id = approvals_store.add_approval(loop.name, run_id, delivery, what)
                 settle_judged(emit, run_id, "waiting", waiting_id)
                 log("emit", f"waiting for approval #{waiting_id} ({why}): {what}")
             else:
@@ -62,7 +64,7 @@ def deliver(loop: Loop, run_id: str, findings: list[dict], outcome: dict, *, tri
                     done = send(delivery, loop.name, run_id, cfg)
                 except Failed as e:
                     if e.kept_by(emit):
-                        failed_id = state.add_approval(loop.name, run_id, delivery, what, str(e))
+                        failed_id = approvals_store.add_approval(loop.name, run_id, delivery, what, str(e))
                         settle_judged(emit, run_id, "failed", failed_id)
                         e.log_to(log)
                         log("emit", f"kept as approval #{failed_id} to try again or reject")
@@ -77,7 +79,7 @@ def deliver(loop: Loop, run_id: str, findings: list[dict], outcome: dict, *, tri
 def settle_judged(emit: Emit, run_id: str, outcome: str, approval: int | None = None,
                   was: tuple[str, ...] = ("",)) -> None:
     if emit.judged:
-        state.settle_verdicts(run_id, outcome, approval, was)
+        insights_store.settle_verdicts(run_id, outcome, approval, was)
 
 
 def objections(loop: Loop, run_id: str, outcome: dict, cfg: config.Config) -> dict[str, str]:
@@ -119,7 +121,7 @@ def waiting(connect=foundation.db) -> list[dict]:
              "what": a["summary"], "plain_summary": a["plain_summary"],
              "failed": a["result"] if a["status"] == "failed" else "", "held": a["emit"].get("held", ""),
              "review": review_shown(a), "approving": emit_of(a).approving,
-             "detail": emit_of(a).detail(a["emit"]["item"])} for a in state.approvals(connect)]
+             "detail": emit_of(a).detail(a["emit"]["item"])} for a in approvals_store.approvals(connect)]
 
 
 def reviewer_of(approval: dict) -> str:
@@ -162,7 +164,7 @@ def claim_deadline() -> str:
 
 
 def already_decided(approval_id: int) -> AlreadyDecided:
-    row = state.approval(approval_id)
+    row = approvals_store.approval(approval_id)
     if row["status"] == "approved":
         return AlreadyDecided(f"approval #{approval_id} is still sending since {row['decided']}; it returns to the "
                               f"approval list within {CLAIM_SECONDS} seconds of the send stopping")
@@ -176,7 +178,7 @@ def renewed(approval_id: int, token: str):
     def renew() -> None:
         while not stopped.wait(CLAIM_SECONDS / 4):
             with suppress(sqlite3.Error):
-                state.renew_claim(approval_id, token, claim_deadline())
+                approvals_store.renew_claim(approval_id, token, claim_deadline())
 
     thread = threading.Thread(target=renew, daemon=True)
     thread.start()
@@ -188,20 +190,20 @@ def renewed(approval_id: int, token: str):
 
 
 def release_lapsed() -> list[int]:
-    lapsed = state.lapsed_claims()
+    lapsed = approvals_store.lapsed_claims()
     if not lapsed or util.now().timestamp() - util.last_wake() <= CLAIM_SECONDS:
         return []
     released = []
     for claim in lapsed:
-        row = state.approval(claim["id"])
-        if state.settle_approval(claim["id"], "failed", "failed", cut_off("claim expired"),
+        row = approvals_store.approval(claim["id"])
+        if approvals_store.settle_approval(claim["id"], "failed", "failed", cut_off("claim expired"),
                                  judged=emit_of(row).judged, token=claim["claimed_by"], until=claim["claimed_until"]):
             released.append(claim["id"])
     return released
 
 
-def decide(approval_id: int, yes: bool, by: str = "", came_from: tuple[str, ...] = state.DECIDABLE) -> str:
-    row = state.approval(approval_id)
+def decide(approval_id: int, yes: bool, by: str = "", came_from: tuple[str, ...] = approvals_store.DECIDABLE) -> str:
+    row = approvals_store.approval(approval_id)
     if not row:
         raise LookupError(f"no approval #{approval_id}")
     delivery, verb = row["emit"], "approved" if yes else "rejected"
@@ -213,17 +215,17 @@ def decide(approval_id: int, yes: bool, by: str = "", came_from: tuple[str, ...]
             run_store.add_feed(row["run_id"], kind, f"{verb} #{approval_id}{by and f' by {by}'}, {text}")
 
     if not yes:
-        if not state.settle_approval(approval_id, "rejected", "rejected", judged=emit.judged, came_from=came_from):
+        if not approvals_store.settle_approval(approval_id, "rejected", "rejected", judged=emit.judged, came_from=came_from):
             raise already_decided(approval_id)
         emit.rejected(delivery["item"])
         log("emit", f"nothing sent: {row['summary']}")
         return "rejected"
-    token = state.claim_approval(approval_id, claim_deadline(), came_from)
+    token = approvals_store.claim_approval(approval_id, claim_deadline(), came_from)
     if not token:
         raise already_decided(approval_id)
 
     def settle_as(status: str, outcome: str, why: str) -> bool:
-        return state.settle_approval(approval_id, status, outcome, why, judged=emit.judged, token=token)
+        return approvals_store.settle_approval(approval_id, status, outcome, why, judged=emit.judged, token=token)
 
     with renewed(approval_id, token):
         try:

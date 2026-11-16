@@ -119,7 +119,7 @@ with contextlib.ExitStack() as stack:
     for name, value in {"STATE_DIR": b, "RUNS_DIR": b / "runs", "DB_FILE": b / "arete.db", "LOCKS_DIR": b / "locks",
                         "WORKTREES_DIR": b / "worktrees", "EVENTS_FILE": b / "events.jsonl"}.items():
         stack.enter_context(mock.patch.object(paths, name, value))
-    state.migrate()
+    foundation.migrate()
     out["b_db"] = (b / "arete.db").exists()
     prune()
     out["b_files"] = listing(b)
@@ -131,7 +131,7 @@ seed()
 snap = backup.snapshot("hand")
 def attempt():
     try:
-        state.ensure_schema()
+        foundation.ensure_schema()
     except RuntimeError as e:
         return str(e)
     return ""
@@ -148,7 +148,7 @@ out["snaps"] = len(backup.snapshots())
 ''',
 "fresh": r'''
 out["none"] = backup.snapshot("hand")
-state.migrate()
+foundation.migrate()
 out["created"] = paths.DB_FILE.exists()
 with mock.patch.object(paths, "ISOLATED", True):
     out["isolated"] = backup.snapshot("hand")
@@ -420,7 +420,7 @@ class RunsLookupTests(unittest.TestCase):
         env = scratch_env(root, ARETE_WORKTREES_DIR=str(root / "worktrees"),
                           TMPDIR=str(root / "tmp"), HOME=str(root / "home"))
         # The pre-ledger probe needs an initialized schema and canonical UTC stamps.
-        program = "from arete import state; state.migrate()\n"
+        program = "from arete.store import db as foundation; foundation.migrate()\n"
         program += (SCRIPTS / "runs_lookup_probe.py").read_text().replace(
             '.isoformat(timespec="seconds")', '.strftime("%Y-%m-%dT%H:%M:%SZ")')
         done = run_script(program, root, env=env, timeout=240)

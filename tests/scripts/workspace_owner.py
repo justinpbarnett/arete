@@ -2,11 +2,13 @@
 import json, os, runpy, shutil, subprocess, sys, time
 from pathlib import Path
 from arete.store import runs as run_store
-from arete import config, factory, gh, heartbeat, paths, pipeline, record, replay, sandbox, scratch, state, util, workspace
+from arete import config, factory, gh, heartbeat, paths, pipeline, record, replay, sandbox, scratch, util, workspace
+from arete.store import db as foundation
+from arete.store import tasks as tasks_store
 from arete.store import runs as run_store
 from arete import ci
 root, scenario = Path(sys.argv[1]), sys.argv[2]
-state.migrate()
+foundation.migrate()
 probe = [sys.executable, "-V"]
 if sandbox.protected_command(probe) != probe:
     sandbox.AUTHORITY = root / "authority-parent/verification-authority"
@@ -36,7 +38,7 @@ if scenario == "pr":
     gh.pr_draft_and_head, gh.pr_set_draft = lambda url: (False, ""), lambda *a, **k: None
     gh.commit_checks, gh.branch_sha = lambda *a, **k: {}, lambda *a, **k: ""
     ci.FIRST_CHECK_SECONDS = ci.SETTLE_SECONDS = ci.POLL_SECONDS = 0
-    task = state.task_add("replay-sample", "Add kumquat to the fixture notes", "Add kumquat", "feat")
+    task = tasks_store.task_add("replay-sample", "Add kumquat to the fixture notes", "Add kumquat", "feat")
     feature = runpy.run_path(str(paths.ADWS_DIR / "feature.py"))["feature"]
     try:
         factory.main(feature, ["replay-sample", task, "--force"])
@@ -48,7 +50,7 @@ if scenario == "pr":
                "records": records(), "registered": len(registered()), "kept": "workspace kept" in log, "log": log[-1500:]}
 else:
     def make(label, branch):
-        task = state.task_add("replay-sample", label, label, "feat")
+        task = tasks_store.task_add("replay-sample", label, label, "feat")
         ws = paths.WORKTREES_DIR / f"replay-sample-{task}"
         c = workspace.Checkout("", "octo/widgets", src, ws, "main")
         workspace.add_worktree(c, branch, "main")

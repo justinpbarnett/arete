@@ -1,10 +1,13 @@
 
 import json, sys
 from pathlib import Path
-from arete import config, paths, research, runner, state, triage, util
+from arete import config, paths, research, runner, triage, util
+from arete.store import db as foundation
+from arete.store import insights as insights_store
+from arete.store import triage as triage_store
 root = Path(sys.argv[1])
 paths.ensure_dirs()
-state.migrate()
+foundation.migrate()
 cfg = config.load()
 calls = []
 real = runner.run
@@ -48,16 +51,16 @@ def cli(ref):
 out = {}
 refresh()
 out["first"] = run(force=True)
-original = state.research_get("T-1")
+original = insights_store.research_get("T-1")
 text = research.report_file("T-1").read_text()
 out["initial_cli"] = cli("T-1")
 items = [candidate(n) for n in range(1, 52)]
 refresh()
 with util.lock("research", wait=True):
-    state.research_set("T-3", status=research.ANSWERED, answered_by="T-1", error="already answered")
+    insights_store.research_set("T-3", status=research.ANSWERED, answered_by="T-1", error="already answered")
 tidy()
 out["window"] = {"absent": triage.board_row("T-1") is None,
-    "same_row": state.research_get("T-1") == original, "row": state.research_get("T-1"),
+    "same_row": insights_store.research_get("T-1") == original, "row": insights_store.research_get("T-1"),
     "shown": research.shown("T-1"), "linked": research.shown("T-3"), "text": text,
     "listing": research.listing(), "cli": cli("T-1"), "linked_cli": cli("T-3")}
 items = [candidate(1)]
@@ -68,10 +71,10 @@ refresh()
 out["changed_stamp"] = run()
 active = []
 refresh()
-before_off = state.research_rows()
+before_off = insights_store.research_rows()
 tidy()
-out["off"] = {"board": state.triage_rows(), "same_rows": before_off == state.research_rows(),
-              "refs": [r["ref"] for r in state.research_rows()]}
+out["off"] = {"board": triage_store.triage_rows(), "same_rows": before_off == insights_store.research_rows(),
+              "refs": [r["ref"] for r in insights_store.research_rows()]}
 checkpoint = len(calls)
 active = [src]
 refresh()
@@ -89,14 +92,14 @@ files = {
 for ref, body in files.items():
     (research.REPORTS_DIR / f"{ref}.md").write_text(body)
 with util.lock("research", wait=True):
-    state.research_set("T-20", status=research.RUNNING)
+    insights_store.research_set("T-20", status=research.RUNNING)
 tidy()
-adopted = {ref: state.research_get(ref) for ref in files}
-out["orphans"] = {"files": files, "rows": adopted, "wrong_ref": state.research_get("T-7"),
-    "shown": research.shown("T-9"), "running": state.research_get("T-20"),
+adopted = {ref: insights_store.research_get(ref) for ref in files}
+out["orphans"] = {"files": files, "rows": adopted, "wrong_ref": insights_store.research_get("T-7"),
+    "shown": research.shown("T-9"), "running": insights_store.research_get("T-20"),
     "cli": cli("T-9"), "current_cli": cli("T-10"), "unknown_cli": cli("T-99")}
-before = state.research_rows()
+before = insights_store.research_rows()
 tidy()
-out["idempotent"] = before == state.research_rows()
+out["idempotent"] = before == insights_store.research_rows()
 out["calls"] = calls
 print("RESULT" + json.dumps(out))

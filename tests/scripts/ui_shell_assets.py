@@ -2,7 +2,8 @@
 import json, re, threading, unittest, urllib.request
 from html.parser import HTMLParser
 from pathlib import Path
-from arete import dashboard, state, tailnet
+from arete import dashboard, tailnet
+from arete.store import db as foundation
 
 class Assets(HTMLParser):
     def __init__(self):
@@ -19,7 +20,7 @@ class Assets(HTMLParser):
             self.styles.add(attrs["href"])
 
 check = unittest.TestCase()
-state.migrate()
+foundation.migrate()
 from arete import principals
 principals.seed_owner("ui@example.com")
 node = tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "")

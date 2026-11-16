@@ -1,4 +1,5 @@
 import ast
+import hashlib
 import json
 import os
 import shutil
@@ -26,7 +27,8 @@ def schema(db):
 
 
 def ownership(root):
-    from arete import record, state
+    from arete import record
+    from arete.store import db as foundation
     from arete.store import db, migrations
     from arete.store import runs as run_store
 
@@ -57,26 +59,22 @@ def ownership(root):
                ticket_runs_marked_running ab_placements ab_held ticket_runs_since later_run interrupted_tickets
                last_pipeline_starts running_run pending_label issue_running pin_record unpin_record record_pins
                last_step_id""".split()
-    assert all(getattr(state, name) is getattr(run_store, name) for name in moved)
     assert all(getattr(run_store, name).__module__ == "arete.store.runs" for name in moved)
     from arete.store import loops as loops_owner
     names = """loop_state loop_states loop_marks set_loop_state finding_seen record_finding mark_emitted
              set_finding_url findings add_event enqueue pending queue_item take_queue_item
              drop_queue_item release_claimed_items finish_claim end_claim release_settled_claims
              dead_items requeue_item loop_lock""".split()
-    assert all(getattr(state, name) is getattr(loops_owner, name) for name in names)
     assert all(getattr(loops_owner, name).__module__ == "arete.store.loops" for name in names)
     from arete.store import sources as sources_owner
     names = """source_seen claim_seen forget_seen cursor set_cursor adopt_source source_owner set_source_owner
              cursors pass_over tickets_passed_over take_passed_over drop_passed_over""".split()
-    assert all(getattr(state, name) is getattr(sources_owner, name) for name in names)
     assert all(getattr(sources_owner, name).__module__ == "arete.store.sources" for name in names)
     from arete.store import incidents as incidents_owner
     names = """write_incident record_incident add_incident_note open_incidents incidents_to_decide
              known_fingerprints update_incident woken_incidents closed_alerted add_repair
              set_repair incident_repairs parsed incidents blocked_incidents incident alert_get
              alert_set alert_clear alerts""".split()
-    assert all(getattr(state, name) is getattr(incidents_owner, name) for name in names)
     assert all(getattr(incidents_owner, name).__module__ == "arete.store.incidents" for name in names)
 
     from importlib import import_module
@@ -115,15 +113,11 @@ def ownership(root):
         module = import_module('arete.store.' + owner)
         for name in names:
             value = getattr(module, name)
-            assert getattr(state, name) is value, (owner, name)
             if callable(value):
                 assert value.__module__ == 'arete.store.' + owner, (owner, name)
         implementations[owner] = names
-    assert state.mined_until is run_store.mined_until
     assert run_store.mined_until.__module__ == 'arete.store.runs'
     assert '_rows' not in owners and migrations.area_owner('_rows') is None
-    state_tree = ast.parse(Path(state.__file__).read_text())
-    assert [n.name for n in state_tree.body if isinstance(n, ast.FunctionDef)] == ['prune']
 
     reader_results = owner_readers(root)
     tree = ast.parse(Path(record.__file__).read_text())
@@ -134,7 +128,7 @@ def ownership(root):
     assert not [node for node in ast.walk(tree) if isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute) and node.func.attr in ("execute", "executemany", "executescript")]
 
-    with state.db() as conn, db.reader() as joined:
+    with foundation.db() as conn, db.reader() as joined:
         assert conn is joined
     return {"tables": len(actual), "complete": True, "unique": True, "foundation": "db",
             "historical_work": "loops", "ledger_unchanged": True, "record_compatibility": True,
@@ -240,8 +234,44 @@ def upgrade(root):
         assert next(row for row in previous if row[0] == 4)[2] == "work"
         db.migrate()
         assert ledger(db) == upgraded
+    historical_files = {}
+    for name in names:
+        original_file = None
+        for location in (f"arete/store/migrations/{name}", f"arete/migrations/{name}"):
+            history = subprocess.run(
+                ["git", "log", "--follow", "--name-status", "--format=COMMIT %H", "origin/main", "--", location],
+                cwd=SOURCE, text=True, capture_output=True, check=True).stdout
+            commit = None
+            for line in history.splitlines():
+                if line.startswith("COMMIT "):
+                    commit = line.removeprefix("COMMIT ")
+                elif line.startswith("A\t"):
+                    original_file = f"{commit}:{line.split(chr(9), 1)[1]}"
+            if original_file:
+                break
+        assert original_file, name
+        content = subprocess.run(["git", "show", original_file], cwd=SOURCE,
+                                 capture_output=True, check=True).stdout
+        assert content == (migrations.FOLDER / name).read_bytes(), name
+        historical_files[name] = {"original": original_file, "sha256": hashlib.sha256(content).hexdigest()}
+    latest = subprocess.run(["git", "show", "origin/main:arete/store/migrations/latest.txt"],
+                            cwd=SOURCE, capture_output=True, check=True).stdout
+    assert latest == (migrations.FOLDER / "latest.txt").read_bytes()
+    origin_chain = historical_chain(root, "origin/main", names)
+    origin_db = paths.STATE_DIR / "origin-main" / "arete.db"
+    origin_db.parent.mkdir()
+    with mock.patch.object(paths, "DB_FILE", origin_db):
+        with mock.patch.object(migrations, "FOLDER", origin_chain):
+            db.migrate()
+        origin_ledger, origin_schema = ledger(db), schema(db)
+        db.migrate()
+        assert ledger(db) == origin_ledger and schema(db) == origin_schema
+        db.migrate()
+        assert ledger(db) == origin_ledger and schema(db) == origin_schema
     return {"historical_rows": len(original), "hashes_unchanged": True, "relocated_rows_added": 0,
-            "applied_once": suffix, "expected_suffix": suffix, "origin_main_rows_added": len(added),
+            "applied_once": suffix, "expected_suffix": suffix, "pre_budget_rows_added": len(added),
+            "origin_main_rows_added": 0, "origin_main_ledger": origin_ledger, "origin_main_unchanged": True,
+            "historical_files": historical_files, "latest_unchanged": True,
             "budget_applied_once": added, "historical_work_preserved": True}
 
 
@@ -406,10 +436,12 @@ def record_failures(root):
             "repeated_settle": True, "missing_settle": True, "committed_timeline_failure": True,
             "invalid_unchanged": True, "crash_reraised": True}
 
-def run_retention(root):
+def run_retention(root, rollback_only=False):
     from datetime import timedelta
 
-    from arete import agent, events, paths, record, state, store, util
+    from arete import agent, events, paths, record, store, util
+    from arete.store import approvals as approvals_store
+    from arete.store import asks as asks_store
     from arete.store import db, incidents, runs as run_store
     from tests.harness import age_run
 
@@ -429,7 +461,7 @@ def run_retention(root):
         return rid
 
     def proposal(rid, status, evidence=False):
-        state.add_proposal("other" if evidence else rid,
+        approvals_store.add_proposal("other" if evidence else rid,
                            {"repo": "demo", "layer": "repo", "file": "f", "change": "c", "why": "w",
                             "evidence": [rid] if evidence else [], "confidence": .9}, status)
 
@@ -463,11 +495,11 @@ def run_retention(root):
     run_store.pin_record("pinned")
     for suffix in ("open", "answered", "taken"):
         rid = "ask-" + suffix
-        state.ask_add(suffix, rid, "demo", rid, "build", "call", "why", "tried", [], {})
+        asks_store.ask_add(suffix, rid, "demo", rid, "build", "call", "why", "tried", [], {})
         if suffix != "open":
-            state.ask_close(suffix, "answered", [])
+            asks_store.ask_close(suffix, "answered", [])
         if suffix == "taken":
-            state.asks_taken([suffix], "consumer")
+            asks_store.asks_taken([suffix], "consumer")
     proposal("proposal-hand", "hand")
     proposal("proposal-evidence", "hand", evidence=True)
     for status in ("merged", "rejected", "skipped", "filed"):
@@ -498,6 +530,10 @@ def run_retention(root):
     after_failure = inventory()
     assert after_failure == before
     assert snapshot_tables("events_log", "schema_meta") == event_before
+    if rollback_only:
+        clock.stop()
+        return {"rollback": True, "rollback_before": before, "rollback_after": after_failure,
+                "rollback_tables": sorted(before), "rollback_failure": "incidents prune sentinel"}
     store.prune()
     with db.reader() as c:
         assert not c.execute("SELECT 1 FROM events_log WHERE seq = ?", (trimmed_seq,)).fetchone()
@@ -519,7 +555,7 @@ def run_retention(root):
     protected.add("folder-equal")
     assert all(run_store.run_get(r)["files_purged"] is None for r in protected)
     assert all(run_store.run_get(r)["files_purged"] for r in expired)
-    raw_kept = state.runs_cited_by_kept_proposals(all_ids)
+    raw_kept = approvals_store.runs_cited_by_kept_proposals(all_ids)
     assert {"proposal-merged", "proposal-hand", "proposal-evidence"} <= raw_kept
     assert not raw_kept & {"proposal-rejected", "proposal-skipped", "proposal-filed"}
     assert run_store.steps("expired") and run_store.report("expired") == {"summary": "history survives"}
@@ -1059,10 +1095,66 @@ def approval_transactions(approval_id):
             "rejected_unchanged": True, "unjudged_unchanged": True, "settled": True, "committed": committed}
 
 
+def sql_violations(source, filename):
+    prefixes = tuple(word + " " for word in
+                     ("SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "ALTER", "DROP", "PRAGMA", "REPLACE", "WITH"))
+    violations = set()
+    for node in ast.walk(ast.parse(source, filename=filename)):
+        value = None
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            value = node.value
+        elif isinstance(node, ast.JoinedStr):
+            pieces = []
+            for part in node.values:
+                if not isinstance(part, ast.Constant) or not isinstance(part.value, str):
+                    break
+                pieces.append(part.value)
+            value = "".join(pieces)
+        if value is not None and value.lstrip().startswith(prefixes):
+            violations.add((filename, node.lineno, "SQL"))
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name) and node.func.value.id == "sqlite3"
+                and node.func.attr == "connect"):
+            violations.add((filename, node.lineno, "sqlite3.connect"))
+    return [{"file": file, "line": line, "kind": kind} for file, line, kind in sorted(violations)]
+
+
+def boundary(root):
+    examples = {
+        "constant.py": 'value = "SELECT value"',
+        "multiline.py": 'value = """\n  DELETE FROM rows\n"""',
+        "formatted.py": 'value = f" UPDATE {table} SET x = 1"',
+        "connect.py": 'import sqlite3\nsqlite3.connect("fixture")',
+    }
+    detected = {name: sql_violations(source, name) for name, source in examples.items()}
+    assert all(detected.values()), detected
+    assert detected["constant.py"] == [{"file": "constant.py", "line": 1, "kind": "SQL"}]
+    assert detected["formatted.py"] == [{"file": "formatted.py", "line": 1, "kind": "SQL"}]
+    assert detected["connect.py"] == [{"file": "connect.py", "line": 2, "kind": "sqlite3.connect"}]
+    for prefix in ("SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "ALTER", "DROP", "PRAGMA", "REPLACE", "WITH"):
+        assert sql_violations(f'value = "  {prefix} example"', "prefix.py")
+    harmless = 'values = ["select value", "SELECTED value", "WITHIN", "ordinary text", f"status {status}"]'
+    assert not sql_violations(harmless, "harmless.py")
+    files = sorted(path for path in (SOURCE / "arete").rglob("*.py")
+                   if not path.is_relative_to(SOURCE / "arete/store"))
+    violations = [item for path in files for item in sql_violations(
+        path.read_text(), path.relative_to(SOURCE).as_posix())]
+    absent = not (SOURCE / "arete/state.py").exists()
+    assert absent, "arete/state.py must be absent"
+    assert not violations, json.dumps(violations)
+    return {"state_absent": absent, "inspected": [path.relative_to(SOURCE).as_posix() for path in files],
+            "files_inspected": len(files), "violations": violations, "scanner_examples": detected,
+            "harmless_passed": True}
+
+
 def main():
     case = sys.argv[1]
-    assert case in ("ownership", "unknown-area", "upgrade", "record-readers", "record-failures", "run-retention",
-                    "scan-atomicity", "server-prune", "aggregate-joins"), case
+    cases = {"ownership": ownership, "unknown-area": unknown_area, "upgrade": upgrade, "base-upgrade": upgrade,
+             "record-readers": record_readers, "record-and-readers": record_readers, "record-failures": record_failures,
+             "run-retention": run_retention, "prune": run_retention,
+             "rollback": lambda root: run_retention(root, rollback_only=True), "boundary": boundary,
+             "scan-atomicity": scan_atomicity, "server-prune": server_prune, "aggregate-joins": aggregate_joins}
+    assert case in cases, case
     with tempfile.TemporaryDirectory(prefix="arete-store-contract-") as directory:
         root = Path(directory).resolve()
         env = {name: os.environ[name] for name in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")
@@ -1080,12 +1172,9 @@ def main():
         from arete import paths, replay
 
         paths.CONFIG_FILE.write_text("\n".join(replay.sample(root / "sample")) + "\n")
-        result = {"case": case, "isolated_paths": {name: os.environ[name] for name in (
+        result = {"case": case, "isolated_root": str(root), "isolated_paths": {name: os.environ[name] for name in (
             "ARETE_CONFIG_DIR", "ARETE_STATE_DIR", "ARETE_LOG_DIR", "ARETE_WORKTREES_DIR", "TMPDIR", "HOME")}}
-        result.update({"ownership": ownership, "unknown-area": unknown_area, "upgrade": upgrade,
-                       "record-readers": record_readers, "record-failures": record_failures,
-                       "run-retention": run_retention, "scan-atomicity": scan_atomicity,
-                       "server-prune": server_prune, "aggregate-joins": aggregate_joins}[case](root))
+        result.update(cases[case](root))
         print("BEHAVIOR_RESULT=" + json.dumps(result))
 
 

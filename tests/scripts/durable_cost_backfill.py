@@ -4,7 +4,7 @@ from arete.store import runs as run_store
 for rid, started, usd, tin in (("A", "2020-01-01T00:00:00Z", 9, 900), ("B", "2020-01-02T00:00:00Z", 3, 300),
                                ("C", "2020-01-04T00:00:00Z", 2, 200)):
     record.start("pipeline", run_id=rid, started=started, cost_usd=usd, tokens_in=tin, tokens_out=tin // 10)
-with state.db() as c:
+with foundation.db() as c:
     for rid, usd, ts in (("B", 1, "2020-01-03T00:00:00Z"), ("C", 1.5, "2020-01-04T00:00:00Z")):
         c.execute("INSERT INTO steps (run_id, runner, cost_usd, tokens_in, tokens_out, ts) VALUES (?, 'claude', ?, 100, 10, ?)",
                   (rid, usd, ts))

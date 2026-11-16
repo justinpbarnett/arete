@@ -397,3 +397,13 @@ def judge_approval(c, approval_id: int, outcome: str) -> None:
               "AND outcome IN ('waiting', 'failed', 'approved') "
               "AND run_id = (SELECT run_id FROM approvals WHERE id = ?)",
               (outcome, util.iso(), approval_id, approval_id))
+
+
+def orphan_rows(c, table, limit):
+    if table not in ("evals", "verdicts"):
+        raise ValueError(table)
+    query = (f"FROM {table} t LEFT JOIN runs ON runs.id = t.run_id "
+             "WHERE t.run_id IS NOT NULL AND t.run_id <> '' AND runs.id IS NULL")
+    count = c.execute(f"SELECT COUNT(*) {query}").fetchone()[0]
+    rows = c.execute(f"SELECT t.rowid, t.run_id {query} ORDER BY t.rowid LIMIT ?", (limit,)).fetchall() if limit else []
+    return count, rows

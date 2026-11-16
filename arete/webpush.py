@@ -15,7 +15,9 @@ from datetime import timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import accounts, config, outbound, paths, refusals, state, util
+from . import accounts, config, outbound, paths, refusals, util
+from .store import asks as asks_store
+from .store import push as push_store
 
 TIMEOUT_SECONDS = 10
 TTL_SECONDS = 86400
@@ -161,8 +163,8 @@ def send_all(cfg: config.Config, rows: list[dict]) -> Sent:
         else:
             found.failed += 1
     found.sent, found.removed = len(delivered), len(gone)
-    state.push_succeeded(delivered)
-    state.push_drop(gone)
+    push_store.push_succeeded(delivered)
+    push_store.push_drop(gone)
     return found
 
 
@@ -177,7 +179,7 @@ def words(found: Sent) -> str:
 
 def ask_opened(cfg: config.Config, ask_ids: list[str]) -> list[str]:
     try:
-        rows = state.push_list()
+        rows = push_store.push_list()
         if not rows:
             return []
         return [f"push for ask {', '.join(ask_ids)}: {words(send_all(cfg, rows))}"]
@@ -186,15 +188,15 @@ def ask_opened(cfg: config.Config, ask_ids: list[str]) -> list[str]:
 
 
 def remind(cfg: config.Config) -> list[str]:
-    rows = state.push_list()
+    rows = push_store.push_list()
     if not rows:
         return []
     cutoff = util.iso(util.now() - timedelta(hours=cfg.ask.remind_hours))
     notes = []
-    for ask in state.open_asks():
-        if ask.get("reminded") or ask["asked"] > cutoff or not state.ask_remind(ask["id"]):
+    for ask in asks_store.open_asks():
+        if ask.get("reminded") or ask["asked"] > cutoff or not asks_store.ask_remind(ask["id"]):
             continue
-        rows = state.push_list()
+        rows = push_store.push_list()
         notes.append(f"reminder push for ask {ask['id']}: {words(send_all(cfg, rows))}")
     return notes
 
@@ -206,7 +208,7 @@ def device_key(endpoint: str) -> str:
 def subscription_state() -> dict:
     return {"key": public_key(),
             "devices": [{"id": device_key(r["endpoint"]), "label": r["label"], "created": r["created"],
-                         "last_success": r["last_success"]} for r in state.push_list()]}
+                         "last_success": r["last_success"]} for r in push_store.push_list()]}
 
 
 def checked_endpoint(endpoint) -> str:
@@ -235,20 +237,20 @@ def subscribe(body: dict, contact: str) -> dict:
     for value in (p256dh, auth):
         if not isinstance(value, str) or not KEY_FIELD.fullmatch(value):
             raise Refused("The subscription's keys are missing or not valid.")
-    rows = state.push_list()
+    rows = push_store.push_list()
     if endpoint not in {r["endpoint"] for r in rows} and len(rows) >= MAX_DEVICES:
         raise Refused(f"At most {MAX_DEVICES} devices can be subscribed; remove one first.")
-    state.push_add(endpoint, p256dh, auth, outbound.plain(body.get("label"), 40) or "Device", contact)
+    push_store.push_add(endpoint, p256dh, auth, outbound.plain(body.get("label"), 40) or "Device", contact)
     return subscription_state()
 
 
 def remove(device_id: str) -> dict:
-    state.push_drop([r["endpoint"] for r in state.push_list() if device_key(r["endpoint"]) == device_id])
+    push_store.push_drop([r["endpoint"] for r in push_store.push_list() if device_key(r["endpoint"]) == device_id])
     return subscription_state()
 
 
 def send_test(cfg: config.Config) -> dict:
-    rows = state.push_list()
+    rows = push_store.push_list()
     if not rows:
         raise Refused("No device is subscribed, so there is nothing to test.")
     found = send_all(cfg, rows)

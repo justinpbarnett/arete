@@ -1040,7 +1040,7 @@ class WalkTests(unittest.TestCase):
         env = {**os.environ, "ARETE_CONFIG_DIR": str(self.scratch_root / "config"), "ARETE_STATE_DIR": str(state),
                "ARETE_LOG_DIR": str(state / "logs"), "ARETE_WORKTREES_DIR": str(state / "worktrees"),
                scratch.ENV_NAME: str(self.scratch_root)}
-        boot = f"import sys; sys.path.insert(0, {str(SOURCE)!r}); from arete import state; state.migrate()"
+        boot = f"import sys; sys.path.insert(0, {str(SOURCE)!r}); from arete.store import db as foundation; foundation.migrate()"
         done = subprocess.run([sys.executable, "-I", "-c", boot], env=env, capture_output=True, text=True)
         self.assertEqual(done.returncode, 0, done.stderr[-2000:])
         self.assertTrue((state / "arete.db").exists())

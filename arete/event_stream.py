@@ -4,7 +4,8 @@ import json
 import math
 import time
 
-from . import control, events, state
+from . import control, events
+from .store import db as foundation
 
 
 def serve(handler, query, code):
@@ -28,8 +29,8 @@ def stream(handler, query, code):
         raise Refusal(400, str(e)) from None
     accept = handler.headers.get("Accept", "")
     fmt = "json" if "application/json" in accept else "ndjson" if "application/x-ndjson" in accept else "sse"
-    with state.reader(streaming=True) as c:
-        instance = c.execute("SELECT value FROM schema_meta WHERE key = 'instance_id'").fetchone()[0]
+    with foundation.reader(streaming=True) as c:
+        instance = foundation.metadata(c)["instance_id"]
         handler.send_response(200)
         handler.send_header("Content-Type", {"json": "application/json", "ndjson": "application/x-ndjson",
                                              "sse": "text/event-stream"}[fmt])

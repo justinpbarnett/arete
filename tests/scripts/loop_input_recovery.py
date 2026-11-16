@@ -6,11 +6,12 @@ from unittest import mock
 from arete.store import runs as run_store
 from arete.store import loops as loop_store
 from arete import store
-from arete import cli, config, control, loop_run, loops, paths, record, sandbox, scratch, serve, state, util
+from arete import cli, config, control, loop_run, loops, paths, record, sandbox, scratch, serve, util
+from arete.store import db as foundation
 root, mode = Path(sys.argv[1]), sys.argv[2]
 sandbox.AUTHORITY = root / "authority-parent/verification-authority"
 paths.ensure_dirs()
-state.migrate()
+foundation.migrate()
 paths.CONFIG_FILE.write_text('[jev]\nenabled = false\n')
 event = {"type": "test", "title": "keep me", "data": {"value": 17}, "trust": "internal"}
 def folder(name, code):
@@ -64,7 +65,7 @@ if mode == "outcomes":
     loop_store.drop_queue_item(legacy)
     item = enqueue()
     for _ in range(2):
-        with state.db() as c:
+        with foundation.db() as c:
             row = dict(c.execute("SELECT * FROM queue WHERE id = ?", (item,)).fetchone())
         assert (row["attempts"], row["dead_at"], row["dead_reason"]) == (0, None, "")
     r = loop_run.launch("fail", item=item, detach=False)
@@ -201,12 +202,12 @@ elif mode == "retention":
     reap()
     assert before == [loop_store.queue_item(i) for i in ids.values()]
     waiting = enqueue()
-    with state.db() as c:
+    with foundation.db() as c:
         c.execute("UPDATE queue SET enqueued = ?", (old,))
         c.execute("INSERT INTO events (loop, type, ts) VALUES ('fail', 'old', ?)", (old,))
     store.prune()
     assert all(loop_store.queue_item(i) for i in [*ids.values(), waiting])
-    with state.db() as c:
+    with foundation.db() as c:
         assert c.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
         c.execute("UPDATE queue SET dead_at = ? WHERE id = ?", (old, ids["stopped"]))
     store.prune()
@@ -232,8 +233,8 @@ elif mode == "never":
         for pool in server.job_pools.values():
             pool.shutdown()
 elif mode == "race":
-    state.ensure_schema()
-    code = "import sys,time; from pathlib import Path; from arete.store import runs as run_store; from arete import state; "
+    foundation.ensure_schema()
+    code = "import sys,time; from pathlib import Path; from arete.store import runs as run_store; from arete.store import db as foundation; "
     code += "p=Path(sys.argv[1]); Path(sys.argv[2]).touch(); "
     code += "\nwhile not p.exists(): time.sleep(.001)\n"
     code += "from arete.store import loops as loop_store; print(loop_store.enqueue('race','race','','every'))"

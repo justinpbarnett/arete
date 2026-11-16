@@ -130,3 +130,7 @@ def chat_newest_draft() -> dict | None:
 def busy_chats() -> list[int]:
     with reader() as c:
         return [r[0] for r in c.execute("SELECT id FROM chats WHERE busy = 1 ORDER BY id")]
+
+
+def stale_busy(c, cutoff):
+    return c.execute("SELECT id FROM chats WHERE busy = 1 AND updated < ? ORDER BY id", (cutoff,)).fetchall()

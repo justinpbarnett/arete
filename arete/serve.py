@@ -40,7 +40,6 @@ from . import (
     runner,
     sessions,
     sources,
-    state,
     store,
     tasks,
     tool_events,
@@ -48,6 +47,7 @@ from . import (
     webpush,
 )
 from .loops import Loop
+from .store import approvals as approvals_store
 from .store import db as foundation
 from .store import incidents as incident_store
 from .store import loops as loop_store
@@ -662,14 +662,14 @@ class Server:
 
     def start_approval_jobs(self) -> None:
         retry_from = util.iso(util.now() - timedelta(seconds=APPROVAL_RETRY_SECONDS))
-        decidable = state.approvals()
+        decidable = approvals_store.approvals()
         self.settle("approval:", {str(a["id"]) for a in decidable})
         for job in APPROVAL_JOBS:
             if self.job_running(job):
                 continue
             for approval in decidable:
                 if self.guard(f"approval:{approval['id']}:{job.note}", self.approval_due, job, approval, retry_from):
-                    state.set_approval_note(approval["id"], f"{job.note}_tried", util.iso())
+                    approvals_store.set_approval_note(approval["id"], f"{job.note}_tried", util.iso())
                     self.jobs[job.note] = self.job_pools[job.note].submit(self.do_approval_job, job, approval)
                     break
 
@@ -686,7 +686,7 @@ class Server:
         try:
             self.say(f"approval #{approval['id']}: {job.write(approval, self.cfg)}")
         except Exception as e:
-            state.set_approval_note(approval["id"], f"{job.note}_tried", util.iso())
+            approvals_store.set_approval_note(approval["id"], f"{job.note}_tried", util.iso())
             self.say(f"approval #{approval['id']}: {job.not_written} yet, it tries again in "
                      f"{APPROVAL_RETRY_SECONDS // 60} minutes: {util.first_line(str(e), 300)}")
 

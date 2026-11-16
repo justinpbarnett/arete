@@ -24,12 +24,12 @@ from . import (
     refusals,
     runner,
     screening,
-    state,
     steps,
     tracker,
     util,
 )
 from .store import db as foundation
+from .store import insights as insights_store
 from .store import runs as run_store
 
 MB = 1024 * 1024
@@ -119,7 +119,7 @@ class NotStaged(refusals.NotFound, LookupError):
 
 
 def refuse_while_filing() -> None:
-    if state.capture_filing(foundation.reader):
+    if insights_store.capture_filing(foundation.reader):
         raise Conflict(FILING)
 
 
@@ -133,9 +133,9 @@ def filed_view(row: dict | None) -> dict | None:
 def view(connect=foundation.db, filed: dict | None = None) -> dict:
     limits = {**LIMITS, "context_bytes": MOST_CONTEXT_BYTES, "image_bytes": MOST_IMAGE_BYTES, "video_bytes": MOST_VIDEO_BYTES,
               "evidence_items": MOST_ITEMS, "evidence_bytes": MOST_DRAFT_BYTES, "video_seconds": MOST_VIDEO_SECONDS}
-    draft = state.capture_draft(connect)
+    draft = insights_store.capture_draft(connect)
     return {"draft": shown(draft) if draft else None, "limits": limits, "kinds": list(KINDS),
-            "filed": filed_view(filed or state.capture_filed_row(connect=connect))}
+            "filed": filed_view(filed or insights_store.capture_filed_row(connect=connect))}
 
 
 def sniffed(data: bytes) -> tuple[str, str, str]:
@@ -206,12 +206,12 @@ def stage(data: bytes, name: str, source: str, seconds: str) -> dict:
         os.replace(temp, folder / digest)
 
     with FILES:
-        staged, existing = state.capture_stage(row, admit, keep)
+        staged, existing = insights_store.capture_stage(row, admit, keep)
     return {**view(), "evidence": staged, "existing": existing}
 
 
 def staged_file(evidence_id: int) -> tuple[Path, dict]:
-    row = state.capture_evidence(evidence_id, foundation.reader)
+    row = insights_store.capture_evidence(evidence_id, foundation.reader)
     path = CAPTURES_DIR / str(row["capture"]) / row["sha256"] if row else None
     if not path or not path.is_file():
         raise NotStaged(f"No staged evidence has the id {evidence_id}.")
@@ -221,7 +221,7 @@ def staged_file(evidence_id: int) -> tuple[Path, dict]:
 def drop_evidence(evidence_id: int) -> dict:
     refuse_while_filing()
     with FILES:
-        row = state.capture_drop_evidence(evidence_id)
+        row = insights_store.capture_drop_evidence(evidence_id)
         if row:
             (CAPTURES_DIR / str(row["capture"]) / row["sha256"]).unlink(missing_ok=True)
     if not row:
@@ -248,8 +248,8 @@ def checked_fields(body: dict) -> dict:
 def save(body: dict) -> dict:
     fields = checked_fields(body)
     refuse_while_filing()
-    held = state.capture_draft(foundation.reader) or EMPTY_DRAFT
-    if any(held[k] != v for k, v in fields.items()) and not state.capture_save(**fields):
+    held = insights_store.capture_draft(foundation.reader) or EMPTY_DRAFT
+    if any(held[k] != v for k, v in fields.items()) and not insights_store.capture_save(**fields):
         raise Conflict(FILING)
     return view()
 
@@ -304,15 +304,15 @@ def add_context(body: dict, code: str) -> dict:
     view_name = str(body.get("view") or "") if screen is ABSENT or "view" in body else ABSENT
     text = snapshot(view_name, body.get("detail"), code, screen)
     refuse_while_filing()
-    if not state.capture_save(context=text):
+    if not insights_store.capture_save(context=text):
         raise Conflict(FILING)
     return view()
 
 
 def drop_context() -> dict:
     refuse_while_filing()
-    draft = state.capture_draft(foundation.reader)
-    if draft and draft["context"] and not state.capture_save(context=""):
+    draft = insights_store.capture_draft(foundation.reader)
+    if draft and draft["context"] and not insights_store.capture_save(context=""):
         raise Conflict(FILING)
     return view()
 
@@ -320,7 +320,7 @@ def drop_context() -> dict:
 def discard() -> dict:
     refuse_while_filing()
     with FILES:
-        draft_id = state.capture_discard()
+        draft_id = insights_store.capture_discard()
         if draft_id is not None:
             shutil.rmtree(CAPTURES_DIR / str(draft_id), ignore_errors=True)
     if draft_id is None:
@@ -391,10 +391,10 @@ def write_first(draft: dict, cfg: config.Config) -> None:
     except Exception as e:
         done, problems = None, (util.first_line(str(e)) or type(e).__name__,)
     if done and done.source == "writer":
-        state.capture_written(draft["id"], print_, done.title, done.text, "")
+        insights_store.capture_written(draft["id"], print_, done.title, done.text, "")
         return
     why = util.first_line("; ".join(problems), 200) or "it gave no text"
-    state.capture_written(draft["id"], print_, "", "",
+    insights_store.capture_written(draft["id"], print_, "", "",
                           f"The writer's text was not used ({why}), so your own words are filed.")
 
 
@@ -518,7 +518,7 @@ def inspect_item(row: dict, draft_id: int, route: tuple[steps.Settings | None, s
         inspection, cost = look_at(row, draft_id, s, print_, cfg)
     else:
         inspection, cost = outcome(print_, "unavailable", f"Inspection is unavailable ({error})."), 0.0
-    state.capture_inspected(row["id"], row["sha256"], inspection, cost)
+    insights_store.capture_inspected(row["id"], row["sha256"], inspection, cost)
     row["inspection"] = inspection
 
 
@@ -818,12 +818,12 @@ def run_checks(draft: dict, cfg: config.Config, due: list[str]) -> None:
             result, reason, detail, cost = RUNNERS[name](draft, cfg)
         except Exception as e:
             result, reason, detail, cost = "hold", f"Not checked: {util.first_line(str(e)) or type(e).__name__}", {}, 0.0
-        if not state.capture_check_done(draft["id"], name, result, reason, detail, cost):
+        if not insights_store.capture_check_done(draft["id"], name, result, reason, detail, cost):
             return
 
 
 def hold_delivery(draft_id: int, revision: int, text: str) -> None:
-    state.capture_move(draft_id, revision, "filing", "draft", delivery=text)
+    insights_store.capture_move(draft_id, revision, "filing", "draft", delivery=text)
 
 
 def unfinished(error: Exception) -> str:
@@ -859,7 +859,7 @@ def upload(draft: dict, repo: str, cfg: config.Config) -> str:
             held = gh.file_sha(repo, path, branch)
             commit = (gh.branch_sha(repo, branch) if held == blob else gh.put_file(
                 repo, path, data, branch, f"Feedback evidence for capture {draft['id']}", replaces=held))
-            state.capture_linked(row["id"], row["sha256"], gh.blob_url(repo, commit, path))
+            insights_store.capture_linked(row["id"], row["sha256"], gh.blob_url(repo, commit, path))
     except Exception as e:
         what = f"{row['name']} was not uploaded" if row else f"The evidence branch {branch} could not be prepared"
         return (f"{what}: {unfinished(e)}. Nothing was filed. The draft, the evidence and the links "
@@ -868,7 +868,7 @@ def upload(draft: dict, repo: str, cfg: config.Config) -> str:
 
 
 def finish(draft_id: int, number: int, repo: str, title: str) -> None:
-    state.capture_filed(draft_id, number, gh.issue_url(repo, number), title)
+    insights_store.capture_filed(draft_id, number, gh.issue_url(repo, number), title)
     with FILES:
         shutil.rmtree(CAPTURES_DIR / str(draft_id), ignore_errors=True)
 
@@ -889,10 +889,10 @@ def deliver(draft_id: int, revision: int, cfg: config.Config, resumed: bool) -> 
                 finish(draft_id, found["number"], repo, str(found.get("title") or ""))
                 return
         except Exception as e:
-            state.capture_note(draft_id, f"GitHub did not answer ({unfinished(e)}), so arete cannot tell whether the "
+            insights_store.capture_note(draft_id, f"GitHub did not answer ({unfinished(e)}), so arete cannot tell whether the "
                                          f"issue was filed. Submit again.")
             return
-    draft = state.capture_draft(foundation.reader)
+    draft = insights_store.capture_draft(foundation.reader)
     if not draft or draft["id"] != draft_id or draft["status"] != "filing":
         return
     if not repo:
@@ -906,7 +906,7 @@ def deliver(draft_id: int, revision: int, cfg: config.Config, resumed: bool) -> 
         if failed := upload(draft, repo, cfg):
             hold_delivery(draft_id, revision, failed)
             return
-        draft = state.capture_draft(foundation.reader)
+        draft = insights_store.capture_draft(foundation.reader)
         title, body = filing_text(draft, cfg, linked=True)
     except Exception as e:
         hold_delivery(draft_id, revision, f"Not filed: {unfinished(e)}")
@@ -914,7 +914,7 @@ def deliver(draft_id: int, revision: int, cfg: config.Config, resumed: bool) -> 
     try:
         number = gh.issue_create(repo, title, f"{body}\n\n{MARK.format(draft_id)}")
     except Exception as e:
-        state.capture_note(draft_id, f"GitHub did not confirm the issue ({unfinished(e)}). Press Submit: arete looks "
+        insights_store.capture_note(draft_id, f"GitHub did not confirm the issue ({unfinished(e)}). Press Submit: arete looks "
                                      f"for it before it files again.")
         return
     finish(draft_id, number, repo, title)
@@ -923,32 +923,32 @@ def deliver(draft_id: int, revision: int, cfg: config.Config, resumed: bool) -> 
 def work(draft_id: int, revision: int, cfg: config.Config, resumed: bool) -> None:
     try:
         if not resumed:
-            draft = state.capture_draft(foundation.reader)
+            draft = insights_store.capture_draft(foundation.reader)
             if not draft or draft["id"] != draft_id or draft["status"] != "checking":
                 return
             write_first(draft, cfg)
-            draft = state.capture_draft(foundation.reader)
+            draft = insights_store.capture_draft(foundation.reader)
             if not draft or draft["id"] != draft_id or draft["status"] != "checking":
                 return
             prints = fingerprints(draft, cfg)
             route = evidence_route(cfg)
             if due := due_checks(draft, prints, route):
-                if not state.capture_begin_checks(draft_id, {n: prints[n] for n in due}):
+                if not insights_store.capture_begin_checks(draft_id, {n: prints[n] for n in due}):
                     return
                 run_checks(draft, cfg, due)
-                draft = state.capture_draft(foundation.reader)
+                draft = insights_store.capture_draft(foundation.reader)
                 if not draft or draft["id"] != draft_id or draft["status"] != "checking":
                     return
             if due_checks(draft, fingerprints(draft, cfg), route):
                 return
-            if not state.capture_move(draft_id, revision, "checking", "filing"):
+            if not insights_store.capture_move(draft_id, revision, "checking", "filing"):
                 return
         deliver(draft_id, revision, cfg, resumed)
     except Exception as e:
-        state.capture_note(draft_id, f"Filing stopped ({unfinished(e)}). Press Submit: arete looks for the issue "
+        insights_store.capture_note(draft_id, f"Filing stopped ({unfinished(e)}). Press Submit: arete looks for the issue "
                                      f"before it files again.")
     finally:
-        state.capture_end_checks(draft_id, INTERRUPTED)
+        insights_store.capture_end_checks(draft_id, INTERRUPTED)
         with SUBMITTING:
             working.discard(draft_id)
 
@@ -962,9 +962,9 @@ def submit(body: dict) -> dict:
         raise Refused("Send the draft's id as a whole number.")
     cfg = config.load()
     with SUBMITTING:
-        if wanted is not None and (row := state.capture_filed_row(wanted, foundation.reader)):
+        if wanted is not None and (row := insights_store.capture_filed_row(wanted, foundation.reader)):
             return view(filed=row)
-        draft = state.capture_draft(foundation.reader)
+        draft = insights_store.capture_draft(foundation.reader)
         if not draft:
             raise Conflict("There is no draft to check.")
         if wanted is not None and draft["id"] != wanted:
@@ -981,7 +981,7 @@ def submit(body: dict) -> dict:
                 raise Conflict("The draft changed since this page last read it. Read it again, then Submit.")
             if not draft["text"].strip():
                 raise Refused("Write the request before you submit it.")
-            if not state.capture_move(draft_id, revision, "draft", "checking", delivery=""):
+            if not insights_store.capture_move(draft_id, revision, "draft", "checking", delivery=""):
                 raise Conflict("The draft changed since this page last read it. Read it again, then Submit.")
             working.add(draft_id)
             resumed = False
@@ -990,9 +990,9 @@ def submit(body: dict) -> dict:
 
 
 def recover() -> None:
-    state.capture_end_checks(None, INTERRUPTED)
-    state.capture_note(None, RESTARTED)
+    insights_store.capture_end_checks(None, INTERRUPTED)
+    insights_store.capture_note(None, RESTARTED)
 
 
 def checking() -> bool:
-    return state.capture_checking() or bool(working)
+    return insights_store.capture_checking() or bool(working)

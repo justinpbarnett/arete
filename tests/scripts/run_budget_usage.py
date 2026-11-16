@@ -31,7 +31,7 @@ def events_once_logged():
 
 
 def expand(root):
-    from arete import state
+    from arete.store import db as foundation
     from arete.store import db as foundation, migrations
 
     events_once_logged()
@@ -45,7 +45,7 @@ def expand(root):
     migrations.FOLDER = folder
     foundation.NEEDED = 5
     foundation._CHECKED.clear()
-    state.migrate()
+    foundation.migrate()
     return original
 
 
@@ -58,17 +58,19 @@ def full(folder):
 
 
 def old_run(rid, seconds=200, status="failed", **fields):
-    from arete import paths, record, state, util
+    from arete import paths, record, util
+    from arete.store import db as foundation
+    from arete.store import runs as runs_store
 
     finish = util.now() - timedelta(minutes=5)
     record.start("pipeline", run_id=rid, repo="fixture", issue=fields.pop("issue", rid), **fields)
-    with state.tx() as conn:
+    with foundation.tx() as conn:
         conn.execute("UPDATE runs SET active_seconds=NULL, verify_seconds=NULL, verify_open_seconds=NULL, "
                      "repair_calls=NULL, measured_at=NULL, status=?, started=?, finished=?, schema_version=5 "
                      "WHERE id=?", (status, util.iso(finish - timedelta(seconds=seconds)),
                                     util.iso(finish) if status != "running" else None, rid))
     (paths.RUNS_DIR / rid).mkdir(parents=True, exist_ok=True)
-    return state.run_get(rid)
+    return runs_store.run_get(rid)
 
 
 def saved(rid, **numbers):
@@ -78,16 +80,17 @@ def saved(rid, **numbers):
 
 
 def row_values(rid):
-    from arete import state
+    from arete.store import runs as runs_store
 
-    row = state.run_get(rid)
+    row = runs_store.run_get(rid)
     return [row[k] for k in COUNTERS]
 
 
 def budget_after(rid):
-    from arete import config, paths, pipeline, record, runlimits, state, tracker
+    from arete import config, paths, pipeline, record, runlimits, tracker
+    from arete.store import runs as runs_store
 
-    parent = state.run_get(rid)
+    parent = runs_store.run_get(rid)
     repo = config.Repo(name="fixture", path=paths.STATE_DIR, tracker="local")
     own = record.start("pipeline", repo=repo.name, issue=parent["issue"])
     run = pipeline.Run(own, repo, paths.RUNS_DIR / own, tid=parent["issue"], tracker=tracker.LocalTracker(repo))
@@ -98,14 +101,16 @@ def budget_after(rid):
 
 
 def ledger():
-    from arete import state
+    from arete.store import db as foundation
 
-    with state.reader() as conn:
+    with foundation.reader() as conn:
         return [r[0] for r in conn.execute("SELECT n FROM schema_migrations ORDER BY n")]
 
 
 def migrations(root):
-    from arete import paths, record, run_lines, state, util
+    from arete import paths, record, run_lines, util
+    from arete.store import db as foundation
+    from arete.store import runs as runs_store
 
     folder = expand(root)
     at = util.iso()
@@ -121,7 +126,7 @@ def migrations(root):
     old_run("C")
     for n in (1, 2):
         run_lines.write("C", "step_start", step="implement", call="review_fix", atom="review_repair", **{"try": n})
-    with state.tx() as conn:
+    with foundation.tx() as conn:
         conn.execute("INSERT INTO steps (run_id, step, seconds) VALUES ('C', 'verify', 10)")
         conn.execute("INSERT INTO steps (run_id, step, seconds) VALUES ('C', 'grade', 5)")
     old_run("D", issue=a["issue"])
@@ -132,7 +137,7 @@ def migrations(root):
         before = {rid: budget_after(rid) for rid in "ABCD"}
         assert before["A"]["totals"] == [42, 9, 1]
         full(folder)
-        assert state.migrate()
+        assert foundation.migrate()
         blocked = ledger()
         assert blocked[-1] == 6 and row_values("E") == [None] * 5
         rows = {rid: row_values(rid) for rid in "ABCDE"}
@@ -151,9 +156,9 @@ def migrations(root):
         old_run("F", status="running", pid=sleeper.pid)
         saved("F", run_seconds=12, run_seconds_at=at, verification_seconds=3,
               verification_open_seconds=2, repair_calls=1)
-        assert not state.migrate()
+        assert not foundation.migrate()
         assert 7 in ledger()
-        assert state.run_get("E")["status"] == state.run_get("F")["status"] == "running"
+        assert runs_store.run_get("E")["status"] == runs_store.run_get("F")["status"] == "running"
         assert row_values("E")[-1] == ""
         assert row_values("F") == [12, 3, 2, 1, at]
         before_reap = {rid: row_values(rid) for rid in "EF"}
@@ -163,20 +168,20 @@ def migrations(root):
         assert inherited_dead["E"]["totals"] == [before_reap["E"][0], 0, 0]
         assert inherited_dead["F"]["totals"] == [12, 5, 1]
         frozen = {rid: row_values(rid) for rid in "ABCDE"}
-        assert not state.migrate()
+        assert not foundation.migrate()
         assert frozen == {rid: row_values(rid) for rid in frozen}
         for stamp in (None, "", at):
-            with state.tx() as conn:
+            with foundation.tx() as conn:
                 conn.execute("UPDATE runs SET measured_at=? WHERE id='C'", (stamp,))
         for stamp in ("2026-01-01T00:00:00+00:00", "2026-1-1T00:00:00Z"):
             try:
-                with state.tx() as conn:
+                with foundation.tx() as conn:
                     conn.execute("UPDATE runs SET measured_at=? WHERE id='C'", (stamp,))
             except sqlite3.IntegrityError:
                 pass
             else:
                 raise AssertionError(stamp)
-        with state.tx() as conn:
+        with foundation.tx() as conn:
             conn.execute("UPDATE runs SET active_seconds=NULL WHERE id='C'")
         try:
             budget_after("C")
@@ -206,7 +211,9 @@ BAD_BUDGETS = {
 
 
 def migration_error(root, case):
-    from arete import paths, runlimits, state, util
+    from arete import paths, runlimits, util
+    from arete.store import db as foundation
+    from arete.store import runs as runs_store
     from arete.store import db as foundation, migrations
 
     folder = expand(root)
@@ -216,7 +223,7 @@ def migration_error(root, case):
     (paths.RUNS_DIR / "Bad/budget.json").write_text(bad if isinstance(bad, str) else json.dumps(bad))
     full(folder)
     try:
-        state.migrate()
+        foundation.migrate()
     except migrations.Refused as e:
         refusal = str(e)
         assert "Bad" in refusal
@@ -230,17 +237,17 @@ def migration_error(root, case):
     for field in COUNTERS[:-1]:
         for bad in (-1, "unknown"):
             try:
-                with state.tx() as conn:
+                with foundation.tx() as conn:
                     conn.execute(f"UPDATE runs SET {field}=? WHERE id='Good'", (bad,))
             except sqlite3.IntegrityError:
                 refusals.append([field, bad])
             else:
                 raise AssertionError([field, bad])
-    with state.tx() as conn:
+    with foundation.tx() as conn:
         conn.execute("UPDATE runs SET active_seconds=?, measured_at=? WHERE id='Good'", (float("nan"), util.iso()))
     assert row_values("Good")[0] is None
     try:
-        runlimits.active_seconds("Good", state.run_get("Good"))
+        runlimits.active_seconds("Good", runs_store.run_get("Good"))
     except ValueError as e:
         nan_refusal = str(e)
         assert "Good" in nan_refusal
@@ -251,27 +258,29 @@ def migration_error(root, case):
 
 
 def checkpoints(root):
-    from arete import config, paths, pipeline, record, runlimits, state, tracker, util
+    from arete import config, paths, pipeline, record, runlimits, tracker, util
+    from arete.store import db as foundation
+    from arete.store import runs as runs_store
 
     folder = expand(root)
     repo = config.Repo(name="fixture", path=root, tracker="local")
     rid = record.start("pipeline", repo=repo.name, issue="probe")
-    assert row_values(rid) == [0, 0, 0, 0, state.run_get(rid)["started"]]
+    assert row_values(rid) == [0, 0, 0, 0, runs_store.run_get(rid)["started"]]
     early = record.start("pipeline", repo=repo.name, issue="before-budget")
     early_zero = row_values(early)
-    record.interrupt(state.run_get(early))
+    record.interrupt(runs_store.run_get(early))
     assert row_values(early) == early_zero
     other = record.start("eval", repo=repo.name)
     assert row_values(other) == [None] * 5
     run = pipeline.Run(rid, repo, paths.RUNS_DIR / rid, tid="probe", tracker=tracker.LocalTracker(repo))
-    initial = state.run_get(rid)
-    with state.reader() as conn:
+    initial = runs_store.run_get(rid)
+    with foundation.reader() as conn:
         event_tables = [row[0] for row in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('events_log', 'feed')")]
         events = {table: conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] for table in event_tables}
     clock = [100.0]
     sql = []
-    original_tx = state.tx
+    original_tx = foundation.tx
     @contextlib.contextmanager
     def traced():
         with original_tx() as conn:
@@ -280,19 +289,19 @@ def checkpoints(root):
     with patch.object(runlimits, "time", SimpleNamespace(monotonic=lambda: clock[0])):
         budget = runlimits.Budget(run, runlimits.Policy(), "")
         clock[0] += 10
-        with patch.object(state, "tx", side_effect=sqlite3.OperationalError("fixture write failed")):
+        with patch.object(foundation, "tx", side_effect=sqlite3.OperationalError("fixture write failed")):
             budget.checkpoint()
         assert row_values(rid)[0] == 0
         assert (run.dir / "run.log").read_text().count("budget checkpoint failed:") == 1
-        with patch.object(state, "tx", traced):
+        with patch.object(foundation, "tx", traced):
             budget.checkpoint()
         assert row_values(rid)[0] == 10
         updates = list(dict.fromkeys(s for s in sql if s.startswith("UPDATE")))
         assert len(updates) == 1 and updates[0].startswith("UPDATE runs SET active_seconds=")
         assert not any("INSERT" in s for s in sql)
-        assert {k: v for k, v in state.run_get(rid).items() if k not in COUNTERS} == {
+        assert {k: v for k, v in runs_store.run_get(rid).items() if k not in COUNTERS} == {
             k: v for k, v in initial.items() if k not in COUNTERS}
-        with state.reader() as conn:
+        with foundation.reader() as conn:
             assert {table: conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
                     for table in event_tables} == events
         compatibility = json.loads((run.dir / "budget.json").read_text())
@@ -312,7 +321,7 @@ def checkpoints(root):
                 budget.checkpoint()
             except BaseException as e:
                 failures.append(str(e))
-        with patch.object(state, "tx", held):
+        with patch.object(foundation, "tx", held):
             first = threading.Thread(target=checkpoint)
             first.start()
             assert entered.wait(5)
@@ -364,7 +373,7 @@ def checkpoints(root):
             assert signal.getitimer(signal.ITIMER_REAL) == timer
             assert not any(t.name == f"budget-{rid}" for t in threading.enumerate())
         full(folder)
-        assert not state.migrate()
+        assert not foundation.migrate()
         resumed.checkpoint()
         compact = json.loads((run.dir / "budget.json").read_text())
         assert set(compact) == METADATA

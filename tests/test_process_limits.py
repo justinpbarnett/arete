@@ -37,12 +37,15 @@ from arete import (
     runlimits,
     sandbox,
     serve,
-    state,
     steps,
     tracker,
     util,
     workspace,
 )
+from arete.store import approvals as approvals_store
+from arete.store import db as foundation
+from arete.store import runs as runs_store
+from arete.store import tasks as tasks_store
 from arete.agent import Result
 
 from tests.harness import behavior_result, make_folders, run_script, scratch_env, set_task_body
@@ -109,11 +112,11 @@ class Isolated(unittest.TestCase):
             self.patches.enter_context(patch.object(paths, name, value))
         paths.CONFIG_DIR.mkdir()
         paths.ensure_dirs()
-        state.migrate()
+        foundation.migrate()
         self.repo = config.Repo(name="fixture", path=self.root / "repo", tracker="local", pipeline=True)
         self.repo.path.mkdir()
         self.cfg = config.Config(repos=[self.repo], max_parallel=8, max_parallel_per_repo=8)
-        self.ticket = state.task_add(self.repo.name, "Fixture specification", "Fixture", "feat")
+        self.ticket = tasks_store.task_add(self.repo.name, "Fixture specification", "Fixture", "feat")
         self.local = tracker.LocalTracker(self.repo)
 
     def run(self, result=None):
@@ -145,16 +148,16 @@ class BudgetTests(Isolated):
                             ("repair_calls", lambda rid, row: runlimits.repair_count(rid))):
             for bad in (-1, "unknown"):
                 with self.subTest(field=field, bad=bad), self.assertRaises(sqlite3.IntegrityError):
-                    with state.tx() as conn:
+                    with foundation.tx() as conn:
                         conn.execute(f"UPDATE runs SET {field}=? WHERE id=?", (bad, run.id))
             for bad in ((None, float("nan")) if field == "repair_calls" else (None, float("nan"), float("inf"))):
-                with state.tx() as conn:
+                with foundation.tx() as conn:
                     conn.execute(f"UPDATE runs SET {field}=? WHERE id=?", (bad, run.id))
                 with self.assertRaisesRegex(ValueError, run.id):
-                    read(run.id, state.run_get(run.id))
-            with state.tx() as conn:
+                    read(run.id, runs_store.run_get(run.id))
+            with foundation.tx() as conn:
                 conn.execute(f"UPDATE runs SET {field}=0 WHERE id=?", (run.id,))
-            self.assertEqual(read(run.id, state.run_get(run.id)), 0)
+            self.assertEqual(read(run.id, runs_store.run_get(run.id)), 0)
 
     def test_measured_recovery_and_nested_open_idle_waits(self):
         clock = [100.0]
@@ -184,7 +187,7 @@ class BudgetTests(Isolated):
             snapshots = []
             def checkpoint():
                 original()
-                snapshots.append(state.run_get(run.id))
+                snapshots.append(runs_store.run_get(run.id))
                 observed.set()
             with patch.object(runlimits, "CHECKPOINT_SECONDS", .01), \
                     patch.object(run.budget, "checkpoint", side_effect=checkpoint):
@@ -209,13 +212,13 @@ class BudgetTests(Isolated):
             with run.budget.verifying(), run.budget.idling("limit"):
                 clock[0] += 20
                 run.budget.checkpoint()
-                first = state.run_get(run.id)
+                first = runs_store.run_get(run.id)
                 clock[0] += 30
                 run.budget.checkpoint()
-                second = state.run_get(run.id)
+                second = runs_store.run_get(run.id)
             self.assertEqual(first["active_seconds"], second["active_seconds"])
             self.assertEqual(second["verify_open_seconds"] - first["verify_open_seconds"], 30)
-            saved = state.run_get(run.id)
+            saved = runs_store.run_get(run.id)
             self.assertEqual(saved["verify_seconds"], 50)
             self.assertEqual(saved["verify_open_seconds"], 0)
             self.assertEqual(saved["active_seconds"], 10)
@@ -292,7 +295,7 @@ class BudgetTests(Isolated):
         first = self.made_run()
         first.budget.park("first epoch exhausted")
         record.settle(first.id, "failed")
-        with state.db() as connection:
+        with foundation.db() as connection:
             set_task_body(self.ticket, "A narrower specification", connection=connection)
         def concurrent():
             second = self.made_run()
@@ -422,7 +425,7 @@ class BudgetTests(Isolated):
 
     def test_cumulative_time_survives_continuation(self):
         first = self.made_run()
-        with state.tx() as conn:
+        with foundation.tx() as conn:
             conn.execute("UPDATE runs SET active_seconds=? WHERE id=?", (61 * 60, first.id))
         record.settle(first.id, "interrupted")
         second = self.made_run(first.id)
@@ -458,9 +461,9 @@ class BudgetTests(Isolated):
                 run_lines.waited(first.id, cause, util.iso(util.now() - timedelta(minutes=since)),
                              util.iso(util.now() - timedelta(minutes=until)))
         record.settle(first.id, "interrupted")
-        row = state.run_get(first.id)
+        row = runs_store.run_get(first.id)
         seconds = max(0, 61 * 60 - sum(runlimits.idle_waits(first.id, row).values()))
-        with state.tx() as conn:
+        with foundation.tx() as conn:
             conn.execute("UPDATE runs SET active_seconds=? WHERE id=?", (seconds, first.id))
         return first, self.made_run(first.id)
 
@@ -498,7 +501,7 @@ class BudgetTests(Isolated):
 
     def test_interrupted_verification_phase_is_counted_on_restart(self):
         first = self.made_run()
-        with state.tx() as conn:
+        with foundation.tx() as conn:
             conn.execute("UPDATE runs SET verify_open_seconds=? WHERE id=?", (21 * 60, first.id))
         record.settle(first.id, "interrupted")
         second = self.made_run(first.id)
@@ -514,7 +517,7 @@ class BudgetTests(Isolated):
             why, reset = runlimits.admission(self.repo, self.ticket, self.local, run.budget.policy, True)
             self.assertIn("parked", why)
             self.assertFalse(reset)
-            with state.db() as connection:
+            with foundation.db() as connection:
                 set_task_body(self.ticket, "A narrower specification", connection=connection)
             self.assertTrue(runlimits.admission(self.repo, self.ticket, self.local, run.budget.policy, False)[0])
             self.assertEqual(runlimits.admission(self.repo, self.ticket, self.local, run.budget.policy, True), ("", True))
@@ -549,12 +552,12 @@ class BudgetTests(Isolated):
     def test_corrupt_verification_usage_does_not_reset_spent_time(self):
         run = self.made_run()
         for invalid in (-1, "unknown"):
-            with self.assertRaises(sqlite3.IntegrityError), state.tx() as conn:
+            with self.assertRaises(sqlite3.IntegrityError), foundation.tx() as conn:
                 conn.execute("UPDATE runs SET verify_seconds=? WHERE id=?", (invalid, run.id))
-        with state.tx() as conn:
+        with foundation.tx() as conn:
             conn.execute("UPDATE runs SET verify_seconds=? WHERE id=?", (float("nan"), run.id))
         with self.assertRaisesRegex(ValueError, run.id):
-            runlimits.verification_seconds(run.id, state.run_get(run.id))
+            runlimits.verification_seconds(run.id, runs_store.run_get(run.id))
 
     def test_individual_step_reruns_cannot_reset_the_ticket_budget(self):
         first = self.made_run()
@@ -586,7 +589,7 @@ class BudgetTests(Isolated):
         for n in (1, 2, 3):
             run_lines.write(rid, "step_start", step="implement", call=f"review_fix{n}", atom="review_repair", **{"try": n})
         record.settle(rid, status)
-        with state.tx() as conn:
+        with foundation.tx() as conn:
             conn.execute("UPDATE runs SET repair_calls=3 WHERE id=?", (rid,))
         return rid
 
@@ -603,7 +606,7 @@ class BudgetTests(Isolated):
         return code, latest, (directory / "run.log").read_text(), runlimits.metadata(latest["id"], "budget.json")
 
     def edit_ticket(self):
-        with state.db() as connection:
+        with foundation.db() as connection:
             set_task_body(self.ticket, "Edited with a follow up", connection=connection)
 
     def test_forced_run_leaves_out_repairs_spent_under_another_specification(self):
@@ -644,9 +647,9 @@ class BudgetTests(Isolated):
 
     def exhausted_then_edited(self, **budget):
         old = self.made_run()
-        with state.db() as connection:
+        with foundation.db() as connection:
             set_task_body(self.ticket, "Edited with a follow up", connection=connection)
-        with state.tx() as conn:
+        with foundation.tx() as conn:
             if "verification_seconds" in budget:
                 conn.execute("UPDATE runs SET verify_seconds=? WHERE id=?", (budget["verification_seconds"], old.id))
             else:
@@ -672,7 +675,7 @@ class BudgetTests(Isolated):
                     pass
             record.settle(fresh.run.id, "failed")
             record.settle(kept.run.id, "failed")
-            with state.db() as connection:
+            with foundation.db() as connection:
                 set_task_body(self.ticket, "Original", connection=connection)
 
     def test_restarting_an_interrupted_run_keeps_inherited_usage_after_an_edit(self):
@@ -719,7 +722,7 @@ class BudgetTests(Isolated):
         self.assertTrue((paths.RUNS_DIR / row["id"] / "parked.json").is_file())
         self.assertTrue((paths.RUNS_DIR / row["id"] / "proof.json").is_file())
         self.assertFalse(util.lock_is_held(run_store.run_lock("slot", self.repo.name, self.ticket)))
-        self.assertEqual(state.task_get(self.ticket)["state"], "failed")
+        self.assertEqual(tasks_store.task_get(self.ticket)["state"], "failed")
         self.assertTrue(pid_file.exists())
         with self.assertRaises(ProcessLookupError):
             os.kill(int(pid_file.read_text()), 0)
@@ -775,8 +778,8 @@ class QueueTests(Isolated):
     def test_interrupted_ticket_rechecks_dependencies_before_starting(self):
         interrupted = self.made_run()
         record.settle(interrupted.id, "interrupted")
-        prerequisite = state.task_add(self.repo.name, "Prerequisite", "Prerequisite", "feat")
-        with state.db() as connection:
+        prerequisite = tasks_store.task_add(self.repo.name, "Prerequisite", "Prerequisite", "feat")
+        with foundation.db() as connection:
             set_task_body(self.ticket, f"Waits on {prerequisite}", connection=connection)
         self.cfg.replay = config.ReplayConfig(all=True)
         started = []
@@ -798,7 +801,7 @@ class QueueTests(Isolated):
         second.path.mkdir()
         for repo in (self.repo, second):
             for i in range(4):
-                state.task_add(repo.name, f"Task {i}", f"Task {i}", "feat")
+                tasks_store.task_add(repo.name, f"Task {i}", f"Task {i}", "feat")
         cfg = config.Config(repos=[self.repo, second], max_parallel=3, max_parallel_per_repo=2,
                             replay=config.ReplayConfig(all=True))
         started = []
@@ -809,12 +812,12 @@ class QueueTests(Isolated):
         self.assertLessEqual(sum(repo == self.repo.name for repo, _ in started), 2)
 
     def test_dependency_and_parked_ticket_do_not_block_other_ready_work(self):
-        prerequisite = state.task_add(self.repo.name, "Prerequisite", "Prerequisite", "feat")
-        blocked = state.task_add(self.repo.name, f"Waits on {prerequisite}", "Blocked", "feat")
+        prerequisite = tasks_store.task_add(self.repo.name, "Prerequisite", "Prerequisite", "feat")
+        blocked = tasks_store.task_add(self.repo.name, f"Waits on {prerequisite}", "Blocked", "feat")
         parked = self.made_run()
         parked.budget.park("repair limit")
         record.settle(parked.id, "failed")
-        extra = state.task_add(self.repo.name, "Ready", "Ready", "feat")
+        extra = tasks_store.task_add(self.repo.name, "Ready", "Ready", "feat")
         cfg = config.Config(repos=[self.repo], max_parallel=8, max_parallel_per_repo=8,
                             replay=config.ReplayConfig(all=True))
         started = []
@@ -826,7 +829,7 @@ class QueueTests(Isolated):
 
     def test_unavailable_routes_do_not_consume_slot_and_scan_is_bounded(self):
         for i in range(5):
-            state.task_add(self.repo.name, str(i), str(i), "feat")
+            tasks_store.task_add(self.repo.name, str(i), str(i), "feat")
         started = []
         with patch.object(poll, "step_without_route", return_value="verify is held"), \
                 patch.object(poll, "MAX_STARTS_PER_POLL", 3):
@@ -845,7 +848,7 @@ class QueueTests(Isolated):
 
     def test_route_readiness_is_rechecked_after_every_start(self):
         for i in range(3):
-            state.task_add(self.repo.name, str(i), str(i), "feat")
+            tasks_store.task_add(self.repo.name, str(i), str(i), "feat")
         ready, started = [True], []
         def routes(*args, **kw):
             return [SimpleNamespace(state="ready" if ready[0] else "held", detail="fixture quota hold", until="")]
@@ -1100,7 +1103,7 @@ class RecordRetentionTests(Isolated):
         return folder
 
     def proposal(self, run_id, evidence):
-        state.add_proposal(run_id, {"layer": "repo", "repo": "r", "file": "f", "change": "c", "why": "w",
+        approvals_store.add_proposal(run_id, {"layer": "repo", "repo": "r", "file": "f", "change": "c", "why": "w",
                                     "evidence": evidence, "confidence": 0.9}, "hand")
 
     def test_age_removes_only_the_old_record(self):
@@ -1125,10 +1128,10 @@ class RecordRetentionTests(Isolated):
         self.proposal("min-x", ["run pip-text at 10:00"])
         self.assertEqual(record.prune(30, 20).removed, ())
         record.unpin("pip-pinned")
-        state.move_proposal(1, ("hand",), "rejected")
+        approvals_store.move_proposal(1, ("hand",), "rejected")
         self.assertEqual([r.run_id for r in record.prune(30, 20).removed], ["pip-pinned", "pip-run"])
         self.assertTrue(by_text.exists())
-        state.move_proposal(2, ("hand",), "skipped")
+        approvals_store.move_proposal(2, ("hand",), "skipped")
         record.prune(30, 20)
         self.assertFalse(by_text.exists())
         self.assertFalse(pinned.exists() or by_run.exists())
@@ -1264,7 +1267,7 @@ class RouteABTests(Isolated):
             directory.mkdir()
             pipeline.Run(rid, self.repo, directory, tracker=self.local, tid=tid, cfg=cfg).agent(
                 "plan", "x", self.repo.path, role="plan")
-            with state.db() as c:
+            with foundation.db() as c:
                 return [dict(r) for r in c.execute("SELECT * FROM steps WHERE run_id = ?", (rid,))]
 
         arm, baseline, retry = rows(tids["arm"]), rows(tids["baseline"]), rows(tids["arm"])
@@ -1274,7 +1277,7 @@ class RouteABTests(Isolated):
         self.assertEqual([(r["model"], r["ab_side"]) for r in retry], [("haiku", "arm")])
 
     def test_a_continuation_keeps_its_route_after_the_table_is_removed(self):
-        tid = next(t for t in (state.task_add(self.repo.name, "Fixture", "Fixture", "feat") for _ in range(60))
+        tid = next(t for t in (tasks_store.task_add(self.repo.name, "Fixture", "Fixture", "feat") for _ in range(60))
                    if steps.in_arm("cheap-plan", 0.5, (self.repo.name, str(t))))
         models = []
 

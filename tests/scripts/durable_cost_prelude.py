@@ -3,8 +3,22 @@ import contextlib, gzip, io, json, os, sqlite3, sys
 from pathlib import Path
 from unittest import mock
 from arete.store import runs as run_store
-from arete import accounts, agent, claude, cli, codex, config, devices, gh, heartbeat, paths, pi, record, runner, scrub, state, util
-state.migrate()
+from arete import accounts, agent, claude, cli, codex, config, devices, gh, heartbeat, paths, pi, record, runner, scrub, util
+from arete.store import _rows as _rows_store
+from arete.store import approvals as approvals_store
+from arete.store import asks as asks_store
+from arete.store import chats as chats_store
+from arete.store import db as foundation
+from arete.store import devices as devices_store
+from arete.store import incidents as incidents_store
+from arete.store import insights as insights_store
+from arete.store import loops as loops_store
+from arete.store import push as push_store
+from arete.store import runs as runs_store
+from arete.store import sources as sources_store
+from arete.store import tasks as tasks_store
+from arete.store import triage as triage_store
+foundation.migrate()
 root, mode = Path(sys.argv[1]), sys.argv[2]
 def forbidden(*a, **kw):
     raise AssertionError("offline cost test attempted a provider or credential lookup")
@@ -27,7 +41,7 @@ def call(*argv):
             code = e.code
     return code, out.getvalue(), err.getvalue()
 def rows(rid):
-    with state.db() as c:
+    with foundation.db() as c:
         return [dict(r) for r in c.execute("SELECT * FROM steps WHERE run_id = ? ORDER BY id", (rid,))]
 def marks(rid):
     f = paths.record_dir(rid) / record.TIMELINE

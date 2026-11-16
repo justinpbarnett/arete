@@ -21,7 +21,6 @@ from . import (
     record,
     routing,
     sandbox,
-    state,
     steps,
     tracker,
     util,
@@ -44,6 +43,7 @@ from .pipeline import (
     use_product,
 )
 from .review import REVIEW_SCHEMA, review_problems
+from .store import insights as insights_store
 from .store import runs as run_store
 from .util import git
 
@@ -151,7 +151,7 @@ def lineage_changes(before: dict, after: dict, skip=()) -> list[str]:
 
 
 def has_lineage(row: dict) -> bool:
-    return any(row.get(k) for k in state.EVAL_LINEAGE[:6])
+    return any(row.get(k) for k in insights_store.EVAL_LINEAGE[:6])
 
 
 @dataclass
@@ -192,7 +192,7 @@ class Arm:
 class Source:
     def __init__(self, repo: config.Repo, ref: str = ""):
         self.repo, self.ref = repo, ref
-        self.label = ref or state.BASELINE_SOURCE
+        self.label = ref or insights_store.BASELINE_SOURCE
         self._modes: dict[str, str] | None = None
 
     def modes(self) -> dict[str, str]:
@@ -627,13 +627,13 @@ def run_suite(cfg: config.Config, repo: config.Repo, src: Source, tasks: list[Ta
     results = []
     with record.failed_on_crash(run_id):
         for t in tasks:
-            prior = state.task_history(repo.name, t.name, 3)
+            prior = insights_store.task_history(repo.name, t.name, 3)
             after_step = run_store.last_step_id(run_id)
             r = run_task(cfg, src, t, prompts, EvalRun(id=run_id, repo=repo, dir=paths.RUNS_DIR / run_id / t.name,
                                                        task=t.name))
             current = {**lineage, "base_commit": r.base_commit, "context_sha": r.context_sha,
                        "settings": r.settings, "after_step": after_step, "last_step": run_store.last_step_id(run_id)}
-            state.add_eval(run_id, repo.name, t.name, r.passed, r.seconds, r.cost, label, current)
+            insights_store.add_eval(run_id, repo.name, t.name, r.passed, r.seconds, r.cost, label, current)
             r.regressed = len(prior) == 3 and all(p["passed"] for p in prior) and not r.passed
             if r.regressed:
                 r.changed = (lineage_changes(prior[0], current) or ["nothing recorded changed"]
@@ -680,19 +680,19 @@ def run_all(dry_run: bool = False) -> int:
 def compare(repo_name: str, ref: str) -> str:
     cfg = config.load()
     repo = cfg.repo(repo_name)
-    before = {h["run_id"]: h for h in state.eval_history(repo.name, 50)}
+    before = {h["run_id"]: h for h in insights_store.eval_history(repo.name, 50)}
     run(repo_name, ref=ref)
-    after = [h for h in state.eval_history(repo.name, 50) if h["run_id"] not in before]
-    base = next((h for h in before.values() if h["source"] == state.BASELINE_SOURCE), None)
+    after = [h for h in insights_store.eval_history(repo.name, 50) if h["run_id"] not in before]
+    base = next((h for h in before.values() if h["source"] == insights_store.BASELINE_SOURCE), None)
     if not after:
         return ""
     a = after[0]
     line = f"Evals on this branch: {a['passed']}/{a['total']} passed"
     if base:
         line += f"; the last baseline run (`{base['source']}`, {base['ts'][:10]}) passed {base['passed']}/{base['total']}"
-        baseline = {r["task"]: r for r in state.eval_rows(base["run_id"])}
+        baseline = {r["task"]: r for r in insights_store.eval_rows(base["run_id"])}
         changes = []
-        for row in state.eval_rows(a["run_id"]):
+        for row in insights_store.eval_rows(a["run_id"]):
             if prior := baseline.get(row["task"]):
                 changes.extend(lineage_changes(prior, row, skip=("harness",)) if has_lineage(prior)
                                else ["the baseline predates lineage"])

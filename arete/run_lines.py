@@ -10,7 +10,8 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from . import codebase, events, paths, principals, state, util
+from . import codebase, events, paths, principals, util
+from .store import db as foundation
 from .store import runs as run_store
 
 FILE = "run.jsonl"
@@ -88,7 +89,7 @@ def write(run_id: str, event: str, **fields) -> dict:
         print(f"{util.iso()} could not write {event} to {target}: {e}", file=sys.stderr, flush=True)
     if event in ("step_start", "step_end"):
         step, attempt = str(fields.get("step", "")), fields.get("try", 1)
-        with principals.acting(f"run:{run_id}/{step}"), state.tx():
+        with principals.acting(f"run:{run_id}/{step}"), foundation.tx():
             row = run_store.run_get(run_id)
             events.emit("step.started" if event == "step_start" else "step.ended",
                         f"step:{run_id}/{step}/{attempt}", cls="derived", task=row["issue"] if row else None,

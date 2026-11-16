@@ -44,7 +44,6 @@ from . import (
     sandbox,
     scratch,
     slots,
-    state,
     steps,
     tracker,
     util,
@@ -55,8 +54,11 @@ from . import (
 )
 from .agent import NO_SESSION, Result, Session
 from .review import REVIEW_SCHEMA, Review, numbered
+from .store import asks as asks_store
+from .store import insights as insights_store
 from .store import runs as run_store
 from .store import sources as source_store
+from .store import triage as triage_store
 from .util import git
 
 ADW = "adw"
@@ -453,7 +455,7 @@ class Run(AgentRun):
             res = super().agent(step, self.fresh_text(plain, due), cwd, role, ask_owner=True,
                                 **{**kw, "resume": NO_SESSION})
         if due and res.ok:
-            state.asks_taken([a["id"] for a in due], self.id)
+            asks_store.asks_taken([a["id"] for a in due], self.id)
             self.answers_due = [a for a in self.answers_due if a not in due]
         while res.record and (sent := owner_asks.found(record.events(paths.record_dir(self.id) / res.record))):
             kept = res.session if kw.get("persist", True) else NO_SESSION
@@ -1112,7 +1114,7 @@ def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: boo
         run.say(f"I did not restart this after the interruption: {summary}. Remove "
                 f"`{run.tracker.label_name('failed')}` to retry.")
     if run.feedback and not run.dry_run and not run.alone:
-        state.settle_feedback(run.id, {"pr": "done", "noop": "recorded"}.get(status, "failed"))
+        insights_store.settle_feedback(run.id, {"pr": "done", "noop": "recorded"}.get(status, "failed"))
     if status == "failed":
         if flow and flow.matching and flow.stepped:
             flow.route()
@@ -1173,7 +1175,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         with slots.admitting():
             slot = slots.RunSlot(repo.name, str(tid), cfg.max_parallel)
             only = script.only if script else ""
-            due = state.asks_due([script.continues]) if script and script.continues and not only else []
+            due = asks_store.asks_due([script.continues]) if script and script.continues and not only else []
             if not dry_run:
                 if slots.slots_free_to_start(cfg.max_parallel) > 0:
                     slot.hold()
@@ -1220,7 +1222,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         if run.feedback:
             run.log(f"revising {', '.join(run.feedback_prs)} for {util.count(len(run.feedback), 'comment')}")
             if not dry_run and not run.alone:
-                state.take_feedback(run.feedback, run_id)
+                insights_store.take_feedback(run.feedback, run_id)
         signal.signal(signal.SIGTERM, stop_on_term(run_id))
         pr_url, passed = "", None
         try:
@@ -1344,7 +1346,7 @@ def _ask(run: Run, ws: Path, checkouts: list[workspace.Checkout], comment: str, 
         run_lines.write(run.id, "question", question=comment, summary=summary[:300], **ask)
     if asked and session is not None and not run.dry_run:
         for ask in asked:
-            state.ask_add(ask["ask_id"], run.id, run.repo.name, run.tid, ask["step"], ask["call"],
+            asks_store.ask_add(ask["ask_id"], run.id, run.repo.name, run.tid, ask["step"], ask["call"],
                           ask.get("why", ""), ask.get("tried", ""), ask["questions"], session)
         run.say(outbound.screen(comment))
         run.enter("needs-info")
@@ -1417,7 +1419,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
     if run.answering:
         run_lines.write(run.id, "answer", asked_in=run.answering["id"], question=run.answering.get("summary") or "",
                     text=answer_text(run.answering["id"]))
-    approval = state.triage_approval(run.triage_key)
+    approval = triage_store.triage_approval(run.triage_key)
     if run.feedback:
         closed = [url for url in run.feedback_prs if gh.pr_view(url).get("state") != "OPEN"]
         if closed:
@@ -2405,7 +2407,7 @@ def supersede_older_runs(run: Run, urls: list[str]) -> None:
 
 
 def pending_feedback(repo_name: str, tid: str) -> list[dict]:
-    return state.open_feedback([url for r in run_store.open_runs(repo_name, tid) for url in (r.get("pr_url") or "").split()])
+    return insights_store.open_feedback([url for r in run_store.open_runs(repo_name, tid) for url in (r.get("pr_url") or "").split()])
 
 
 def feedback_markdown(rows: list[dict]) -> str:
@@ -2989,8 +2991,8 @@ def run_skipped(name: str) -> dict:
 
 def answered_run(repo_name: str, tid: str) -> dict | None:
     newest = run_store.newest_whole_run(repo_name, tid)
-    if (newest and newest["status"] == "needs-info" and state.asks_due([newest["id"]])
-            and not state.asks_of(newest["id"], "open")):
+    if (newest and newest["status"] == "needs-info" and asks_store.asks_due([newest["id"]])
+            and not asks_store.asks_of(newest["id"], "open")):
         return newest
     return None
 

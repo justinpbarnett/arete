@@ -8,7 +8,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from arete import agent, alerts, auditor, backup, cli, gh, paths, record, state, util  # noqa: E402
+from arete import agent, alerts, auditor, backup, cli, gh, paths, record, util
+from arete.store import approvals as approvals_store
+from arete.store import chats as chats_store
+from arete.store import db as foundation
+from arete.store import incidents as incidents_store
+from arete.store import loops as loops_store  # noqa: E402
 import urllib.request  # noqa: E402
 
 NOTIFIED = paths.STATE_DIR / "notified.jsonl"
@@ -19,7 +24,7 @@ def ago(**delta):
 
 
 def set_row(run_id, **fields):
-    with state.db() as c:
+    with foundation.db() as c:
         c.execute(f"UPDATE runs SET {', '.join(f'{k} = ?' for k in fields)} WHERE id = ?", (*fields.values(), run_id))
 
 
@@ -40,7 +45,7 @@ def valid_run(run_id, kind="pipeline", cost=0.5):
 
 def clean():
     paths.ensure_dirs()
-    state.migrate()
+    foundation.migrate()
     valid_run("run-a")
     valid_run("run-b", cost=1.0)
     backup.snapshot("hand")
@@ -66,21 +71,21 @@ def faults():
     record.start("pipeline", run_id="young-row")
     (paths.RUNS_DIR / "young-folder").mkdir()
     age_folder(paths.RUNS_DIR / "young-folder", minutes=1)
-    chat_id = state.chat_add("")
-    state.chat_claim(chat_id, "hi", "t")
-    with state.db() as c:
+    chat_id = chats_store.chat_add("")
+    chats_store.chat_claim(chat_id, "hi", "t")
+    with foundation.db() as c:
         c.execute("UPDATE chats SET updated = ? WHERE id = ?", (ago(minutes=30), chat_id))
     valid_run("done-run")
-    item = state.enqueue("loop", "q", "g", "trigger", [1])
-    state.take_queue_item(item, "done-run")
-    approval = state.add_approval("loop", "run-a", {"kind": "x"}, "summary")
-    state.claim_approval(approval, util.iso(util.now() + timedelta(hours=1)))
-    with state.db() as c:
+    item = loops_store.enqueue("loop", "q", "g", "trigger", [1])
+    loops_store.take_queue_item(item, "done-run")
+    approval = approvals_store.add_approval("loop", "run-a", {"kind": "x"}, "summary")
+    approvals_store.claim_approval(approval, util.iso(util.now() + timedelta(hours=1)))
+    with foundation.db() as c:
         c.execute("UPDATE approvals SET decided = ? WHERE id = ?", (ago(hours=2), approval))
 
 
 def repair():
-    with state.db() as c:
+    with foundation.db() as c:
         c.execute("DELETE FROM steps WHERE run_id IN ('ghost-run', 'chat')")
         c.execute("DELETE FROM runs WHERE id IN ('sess-gone', 'young-row')")
         c.execute("UPDATE runs SET cost_usd = 1.25 WHERE id = 'cost-run'")
@@ -115,7 +120,7 @@ def offline_cli(argv):
 
 def inspect():
     notified = [json.loads(x) for x in NOTIFIED.read_text().splitlines()] if NOTIFIED.exists() else []
-    print(json.dumps({"alerts": sorted(a["key"] for a in state.alerts()), "notified": notified,
+    print(json.dumps({"alerts": sorted(a["key"] for a in incidents_store.alerts()), "notified": notified,
                       "latest": auditor.latest_findings()}))
 
 
@@ -137,7 +142,7 @@ def corrupt_store():
 
 
 def sql(statement, *args):
-    with state.db() as c:
+    with foundation.db() as c:
         c.execute(statement, args)
 
 
@@ -187,17 +192,17 @@ def settled_queue_entries():
     clean()
     record.start("loop", run_id="live-run")
     for run_id in ("live-run", "ghost-claim", "dead-claim"):
-        state.take_queue_item(state.enqueue("loop", "q", "g", "trigger", [1]), run_id)
+        loops_store.take_queue_item(loops_store.enqueue("loop", "q", "g", "trigger", [1]), run_id)
     sql("UPDATE queue SET dead_at = ?, dead_reason = 'x' WHERE run_id = 'dead-claim'", util.iso())
 
 
 def young_stuck():
     clean()
-    chat_id = state.chat_add("")
-    state.chat_claim(chat_id, "hi", "t")
+    chat_id = chats_store.chat_add("")
+    chats_store.chat_claim(chat_id, "hi", "t")
     sql("UPDATE chats SET updated = ? WHERE id = ?", ago(minutes=5), chat_id)
-    approval = state.add_approval("loop", "run-a", {"kind": "x"}, "summary")
-    state.claim_approval(approval, util.iso(util.now() + timedelta(hours=1)))
+    approval = approvals_store.add_approval("loop", "run-a", {"kind": "x"}, "summary")
+    approvals_store.claim_approval(approval, util.iso(util.now() + timedelta(hours=1)))
     sql("UPDATE approvals SET decided = ? WHERE id = ?", ago(minutes=10), approval)
 
 
@@ -226,7 +231,7 @@ def append_finding():
 
 
 def first_quick_check():
-    with state.reader() as conn:
+    with foundation.reader() as conn:
         print(conn.execute("PRAGMA quick_check").fetchone()[0])
 
 

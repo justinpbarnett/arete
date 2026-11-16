@@ -20,10 +20,10 @@ from . import (
     sessions,
     settings,
     slots,
-    state,
     util,
 )
 from .agent import READ_TOOLS, Result
+from .store import chats as chats_store
 from .store import runs as run_store
 
 CONTEXT_FILE = paths.RUNS_DIR / "chat" / "context" / "dashboard.json"
@@ -79,15 +79,15 @@ def summary(row: dict) -> dict:
             "updated": row["updated"], "spent": row["paid_usd"], "reported_cost": row["spent"],
             "unclassified_messages": row["unclassified_messages"], "busy": bool(row["busy"]),
             "drafted": bool(row["draft_title"]),
-            "running_sessions": sum(s["status"] == "running" for s in state.chat_sessions(row["id"]))}
+            "running_sessions": sum(s["status"] == "running" for s in chats_store.chat_sessions(row["id"]))}
 
 
 def listing() -> dict:
-    return {"chats": [summary(r) for r in state.chats()], "projects": [r.name for r in config.load_or_problem()[0].repos]}
+    return {"chats": [summary(r) for r in chats_store.chats()], "projects": [r.name for r in config.load_or_problem()[0].repos]}
 
 
 def chat_row(chat_id: int) -> dict:
-    row = state.chat_get(chat_id)
+    row = chats_store.chat_get(chat_id)
     if not row:
         raise NoChat(f"There is no chat {chat_id}")
     return row
@@ -103,7 +103,7 @@ def view(chat_id: int) -> dict:
     return {**summary(row), "folder": folder(row["project"]), "draft": draft_of(row, cfg),
             "metered": routing.metered(cfg.model("chat"), cfg=cfg, repo=repo,
                                        tools=[*READ_TOOLS, "Bash"]) if repo else None,
-            "summary": row["summary"], "messages": state.chat_messages(chat_id),
+            "summary": row["summary"], "messages": chats_store.chat_messages(chat_id),
             "sessions": sessions_of(chat_id)}
 
 
@@ -114,7 +114,7 @@ def draft_of(row: dict, cfg: config.Config) -> dict | None:
 
 
 def pulse() -> dict:
-    row = state.chat_newest_draft()
+    row = chats_store.chat_newest_draft()
     return {"busy": any_busy(), "draft": draft_of(row, config.load_or_problem()[0]) if row else None}
 
 
@@ -138,7 +138,7 @@ def new(project: str) -> dict:
             raise BadProject(f"'{project}' is not a repo in the config; {pick}") from None
         if not repo.path.is_dir():
             raise BadProject(f"{project}'s folder {paths.short_path(repo.path)} is not there")
-    return view(state.chat_add(project))
+    return view(chats_store.chat_add(project))
 
 
 def title_of(text: str, limit: int = TITLE_CHARS) -> str:
@@ -157,7 +157,7 @@ def send(chat_id: int, text: str) -> dict:
     sessions.tell_chats()
     held = util.lock_file(answer_lock(chat_id))
     try:
-        if not util.take_lock(held, wait=False) or not (message_id := state.chat_claim(chat_id, text, title_of(text))):
+        if not util.take_lock(held, wait=False) or not (message_id := chats_store.chat_claim(chat_id, text, title_of(text))):
             raise Busy("This chat is still waiting on its last answer. Wait for it, or start another chat.")
         row = chat_row(chat_id)
 
@@ -202,7 +202,7 @@ def reply_to(chat_id: int, text: str, message_id: int, project: str) -> None:
                     reply = f"The agent stopped: {result.error or result.text}"
     except Exception as e:
         reply = f"The agent stopped: {util.first_line(f'{type(e).__name__}: {e}', 300)}"
-    state.chat_say(chat_id, "arete", reply, cost, paid_usd=paid, busy=0, before=[("tool", n) for n in notes],
+    chats_store.chat_say(chat_id, "arete", reply, cost, paid_usd=paid, busy=0, before=[("tool", n) for n in notes],
                    **({"draft_title": draft["title"], "draft_body": draft["body"]} if draft else {}))
 
 
@@ -314,14 +314,14 @@ def context_for(chat_id: int, text: str, message_id: int, cfg: config.Config,
     row = chat_row(chat_id)
     budget = cfg.chat.context_tokens
     summary = capped(row["summary"] or "", summary_limit(cfg))
-    fresh = [m for m in state.chat_messages(chat_id) if row["summarized_to"] < m["id"] < message_id]
+    fresh = [m for m in chats_store.chat_messages(chat_id) if row["summarized_to"] < m["id"] < message_id]
     if size_of(summary, render_all(fresh)) <= budget:
         return sections_of(summary, fresh, 0, row, text), 0.0, 0.0
     recent = newest_within(fresh, budget // 2)
     old = fresh[:len(fresh) - len(recent)]
     written, cost, paid = summarize(chat_id, summary, old, cfg, allowance) if old else ("", 0.0, 0.0)
     if written:
-        state.chat_summarize(chat_id, written, old[-1]["id"])
+        chats_store.chat_summarize(chat_id, written, old[-1]["id"])
         return sections_of(written, recent, 0, row, text), cost, paid
     shown = newest_within(fresh, budget, summary)
     return sections_of(summary, shown, len(fresh) - len(shown), row, text), cost, paid
@@ -377,19 +377,19 @@ def file_draft(chat_id: int) -> dict:
         if not github:
             raise NoDraft("The config names no GitHub repo for arete, so the draft stays unfiled.")
         number = gh.issue_create(github, row["draft_title"], row["draft_body"])
-        state.chat_drop_draft(chat_id, row["draft_title"], row["draft_body"])
-        state.chat_say(chat_id, "arete", f"Filed {gh.issue_url(github, number)}")
+        chats_store.chat_drop_draft(chat_id, row["draft_title"], row["draft_body"])
+        chats_store.chat_say(chat_id, "arete", f"Filed {gh.issue_url(github, number)}")
     return view(chat_id)
 
 
 def drop_draft(chat_id: int) -> dict:
     row = chat_row(chat_id)
-    state.chat_drop_draft(chat_id, row["draft_title"], row["draft_body"])
+    chats_store.chat_drop_draft(chat_id, row["draft_title"], row["draft_body"])
     return view(chat_id)
 
 
 def limits(chat_id: int, row: dict, cfg: config.Config) -> dict:
-    links = state.chat_sessions(chat_id)
+    links = chats_store.chat_sessions(chat_id)
     paid = run_store.paid_by_run([link["run_id"] for link in links])
     running = [link for link in links if link["status"] == "running"]
     spent = row["paid_usd"] + replying.get(chat_id, 0) + sum(
@@ -441,7 +441,7 @@ def start_session(chat_id: int, prompt: str, *, repo: str | None = None, device:
 
 def sessions_of(chat_id: int) -> dict:
     row = chat_row(chat_id)
-    links = state.chat_sessions(chat_id)
+    links = chats_store.chat_sessions(chat_id)
     paid = run_store.paid_by_run([link["run_id"] for link in links])
     listed = [{"id": link["run_id"], "status": link["status"] or "gone", "started": link["started"],
                "finished": link["finished"], "repo": link["repo"] or "", "branch": link["branch"] or "",
@@ -456,7 +456,7 @@ def sessions_of(chat_id: int) -> dict:
 
 def own_session(chat_id: int, session_id: str) -> None:
     chat_row(chat_id)
-    if state.chat_of_session(session_id) != chat_id:
+    if chats_store.chat_of_session(session_id) != chat_id:
         raise control.NotFound(f"session {session_id} was not started by chat {chat_id}")
 
 
@@ -471,14 +471,14 @@ def stop_session(chat_id: int, session_id: str) -> dict:
 
 
 def recover() -> None:
-    for chat_id in state.busy_chats():
+    for chat_id in chats_store.busy_chats():
         with util.lock(answer_lock(chat_id)) as free:
             if free and chat_row(chat_id)["busy"]:
-                state.chat_say(chat_id, "arete", RESTARTED, busy=0)
+                chats_store.chat_say(chat_id, "arete", RESTARTED, busy=0)
 
 
 def any_busy() -> bool:
-    return any(util.lock_is_held(answer_lock(chat_id)) for chat_id in state.busy_chats())
+    return any(util.lock_is_held(answer_lock(chat_id)) for chat_id in chats_store.busy_chats())
 
 
 def arete_repo(cfg: config.Config) -> config.Repo:

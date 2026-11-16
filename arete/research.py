@@ -23,7 +23,6 @@ from . import (
     research_synthesis,
     runner,
     screening,
-    state,
     tracker,
     triage,
     util,
@@ -31,6 +30,8 @@ from . import (
 )
 from .agent import READ_TOOLS, Result
 from .heartbeat import mark_loop, network_up_or_skip
+from .store import insights as insights_store
+from .store import triage as triage_store
 
 REPORTS_DIR = paths.STATE_DIR / "research"
 TOOLS = [*READ_TOOLS,"WebSearch", "WebFetch"]
@@ -115,7 +116,7 @@ def claim_path(h: Home, name: str, title: str) -> str:
     base = h.base
     util.git(["fetch", "-q", "origin", base], h.repo.path)
     taken = set(util.git_records(["ls-tree", "--name-only", f"origin/{base}", f"{h.folder}/"], h.repo.path))
-    taken |= {report["filed_path"] for report in state.research_rows()}
+    taken |= {report["filed_path"] for report in insights_store.research_rows()}
     stem = prompt_loader.slug(name or title, 60)
     return next(path for n in range(1, 100)
                 if (path := f"{h.folder}/{stem if n == 1 else f'{stem}-{n}'}.md") not in taken)
@@ -152,13 +153,13 @@ def file_report(cfg: config.Config, h: Home, r: dict, report: dict) -> str:
 
 
 def file_in_home(cfg: config.Config, h: Home, r: dict) -> tuple[bool, str]:
-    report = state.research_get(r["ref"])
+    report = insights_store.research_get(r["ref"])
     try:
         url = file_report(cfg, h, r, report)
     except (RuntimeError, OSError) as e:
         return False, (f"report written to {paths.short_path(report_file(r['ref']))}, but filing it in {h.repo.name} "
                        f"failed, and the research loop tries again: {util.first_line(str(e), 300)}")
-    state.research_keep(r["ref"], filed_url=url)
+    insights_store.research_keep(r["ref"], filed_url=url)
     return True, f"report filed in {h.repo.name} as {report['filed_path']}: {url}"
 
 
@@ -187,7 +188,7 @@ def move(cfg: config.Config, r: dict, to: str) -> None:
         fields["error"] = f"not moved: {m.error}" if m.error else ""
     if to == config.DELIVERED and not m.error:
         fields["delivered"] = util.iso()
-    state.research_keep(r["ref"], **fields)
+    insights_store.research_keep(r["ref"], **fields)
 
 
 def own_move(r: dict, m: tracker.Moved) -> None:
@@ -197,10 +198,10 @@ def own_move(r: dict, m: tracker.Moved) -> None:
         row = triage.board_row(r["ref"])
         if not row or triage.moment(row["updated"]) != triage.moment(m.before):
             return
-        report = state.research_get(r["ref"])
-        state.triage_put({**row, "updated": m.after})
+        report = insights_store.research_get(r["ref"])
+        triage_store.triage_put({**row, "updated": m.after})
         if report and report["updated"] == row["updated"]:
-            state.research_keep(r["ref"], updated=m.after)
+            insights_store.research_keep(r["ref"], updated=m.after)
     r["updated"] = m.after
 
 
@@ -223,7 +224,7 @@ def wanted(r: dict, report: dict) -> str:
 
 
 def settle_status(cfg: config.Config, r: dict) -> None:
-    report = state.research_get(r["ref"])
+    report = insights_store.research_get(r["ref"])
     if (not report or report["status"] not in (DONE, FAILED) or report.get("moved") == config.DELIVERED
             or r.get("closed")):
         return
@@ -237,7 +238,7 @@ def settle_status(cfg: config.Config, r: dict) -> None:
     if not to or to == report.get("moved"):
         return
     if not jira_target(cfg, r, to):
-        state.research_keep(r["ref"], moved=to)
+        insights_store.research_keep(r["ref"], moved=to)
         return
     move(cfg, r, to)
 
@@ -250,7 +251,7 @@ def settle_statuses(cfg: config.Config) -> None:
 def file_unfiled(cfg: config.Config) -> list[str]:
     rows = {r["ref"]: r for r in tickets()}
     failed = []
-    for report in state.research_rows():
+    for report in insights_store.research_rows():
         r = rows.get(report["ref"])
         if not r or report["status"] != DONE or not report["filed_path"] or report["filed_url"]:
             continue
@@ -262,7 +263,7 @@ def file_unfiled(cfg: config.Config) -> list[str]:
 
 
 def tickets() -> list[dict]:
-    rows = [r for r in state.triage_rows() if triage.standing(r) == triage.RESEARCH_WORK]
+    rows = [r for r in triage_store.triage_rows() if triage.standing(r) == triage.RESEARCH_WORK]
     return sorted(rows, key=lambda r: triage.moment(r["updated"]), reverse=True)
 
 
@@ -273,7 +274,7 @@ def ticket(ref: str) -> dict | None:
 
 def due() -> list[dict]:
     return [r for r in tickets() if not r.get("closed") and triage.in_sprint(r)
-            and triage.research_due(r, state.research_get(r["ref"]))]
+            and triage.research_due(r, insights_store.research_get(r["ref"]))]
 
 
 def adopt_reports() -> None:
@@ -284,22 +285,22 @@ def adopt_reports() -> None:
         if not heading:
             continue
         ref, title = heading.groups()
-        if file.name != report_file(ref).name or state.research_get(ref):
+        if file.name != report_file(ref).name or insights_store.research_get(ref):
             continue
         url = lines[2] if len(lines) > 2 and lines[2].startswith("http") else ""
         summary = next((line.removeprefix("**Summary:** ") for line in lines
                         if line.startswith("**Summary:** ")), "")
         researched = next((line for line in lines if line.startswith("Researched")), "")
         cost = re.search(r"\$(\d+(?:\.\d+)?)", researched)
-        state.research_set(ref, status=DONE, title=title, url=url, summary=summary, report=text,
+        insights_store.research_set(ref, status=DONE, title=title, url=url, summary=summary, report=text,
                            cost=float(cost[1]) if cost else 0.0, updated="", source="", ticket="", basis="",
                            answered_by="", filed_path="", filed_url="", moved="", delivered="", error="", run_id="")
 
 
 def tidy() -> None:
-    for report in state.research_rows():
+    for report in insights_store.research_rows():
         if report["status"] == RUNNING:
-            state.research_set(report["ref"], status=FAILED, error="the run stopped before it finished")
+            insights_store.research_set(report["ref"], status=FAILED, error="the run stopped before it finished")
     adopt_reports()
 
 
@@ -490,9 +491,9 @@ def research(cfg: config.Config, r: dict, force: bool = False, asked: bool = Fal
         return LATER, f"could not read {ref}: {e}"
     text, said = ticket.text, ticket.said(r["title"])
     basis = digest(said)
-    prior = state.research_get(ref)
+    prior = insights_store.research_get(ref)
     rows = tickets()
-    reports = {x["ref"]: x for x in state.research_rows()}
+    reports = {x["ref"]: x for x in insights_store.research_rows()}
     kin = family(r, rows)
     done = [(relation, o, reports[o["ref"]]) for relation, o in kin
             if o["ref"] in reports and reports[o["ref"]]["status"] == DONE and reports[o["ref"]]["report"]]
@@ -508,21 +509,21 @@ def screen(cfg, r, src, ticket, prior, said, basis, judged, rows, kin, done, bas
     ref, text = r["ref"], ticket.text
     if not force:
         if not asked and (why := still_stands(cfg, r, prior, said, basis, judged)):
-            state.research_keep(ref, title=r["title"], url=r["url"], updated=r["updated"], basis=basis)
+            insights_store.research_keep(ref, title=r["title"], url=r["url"], updated=r["updated"], basis=basis)
             return KEPT, why
         fresh = not (prior and prior["status"] == DONE)
         if fresh and (why := parent_hold(r, ticket, kin)):
-            state.research_set(ref, **base, status=PARENT, error=why, basis=basis)
+            insights_store.research_set(ref, **base, status=PARENT, error=why, basis=basis)
             return PARENT, why
         if fresh and judged and done:
             link, p = answered_by(cfg, r, ticket, done, {o["ref"]: o["title"] for o in rows})
             if link:
                 why = f"the report for {link} already answers it (JEV p {p:.2f})"
-                state.research_set(ref, **(base | {"answered_by": link}), status=ANSWERED, error=why, basis=basis)
+                insights_store.research_set(ref, **(base | {"answered_by": link}), status=ANSWERED, error=why, basis=basis)
                 return ANSWERED, why
         if not judged:
             why = "JEV is off, so nothing screens the ticket"
-            state.research_set(ref, **base, status=HELD, error=why)
+            insights_store.research_set(ref, **base, status=HELD, error=why)
             return HELD, why
         screened = screening.screen(f"{r['title']}\n\n{text}", cfg, list(src.repos),
                                     ("", f"research {ref} injection jev"))
@@ -530,13 +531,13 @@ def screen(cfg, r, src, ticket, prior, said, basis, judged, rows, kin, done, bas
             if screened.status != screening.FLAGGED:
                 return LATER, f"JEV could not screen {ref}"
             why = f"JEV reads text in it as instructions to an agent (p {screened.p:.2f})"
-            state.research_set(ref, **base, status=HELD, error=why)
+            insights_store.research_set(ref, **base, status=HELD, error=why)
             return HELD, why
 
 
 def begin(cfg, r, src, prior, basis, text, done, base):
     ref = r["ref"]
-    state.research_set(ref, **base, status=RUNNING, error="", basis=basis,
+    insights_store.research_set(ref, **base, status=RUNNING, error="", basis=basis,
                        **({} if r.get("closed") else {"moved": "", "delivered": ""}))
     move(cfg, r, "running")
     named = set(r["repos"])
@@ -572,7 +573,7 @@ def finish_report(cfg, r, res, paid, h, filed_path, said, basis):
     report = str(answer.get("report") or "").strip()
     if not report:
         why = util.first_line(res.error or "the agent gave no report")
-        state.research_set(ref, status=FAILED, error=why, cost=paid)
+        insights_store.research_set(ref, status=FAILED, error=why, cost=paid)
         move(cfg, r, "failed")
         return FAILED, why
     summary = " ".join(str(answer.get("summary") or "").split())
@@ -588,11 +589,11 @@ def finish_report(cfg, r, res, paid, h, filed_path, said, basis):
         try:
             filed_path = filed_path or claim_path(h, str(answer.get("name") or ""), r["title"])
         except RuntimeError as e:
-            state.research_set(ref, status=FAILED, error=f"could not read {h.repo.name}: {e}", cost=paid,
+            insights_store.research_set(ref, status=FAILED, error=f"could not read {h.repo.name}: {e}", cost=paid,
                                summary=summary, report=report)
             move(cfg, r, "failed")
             return FAILED, f"could not read {h.repo.name}: {util.first_line(str(e), 300)}"
-    state.research_set(ref, status=DONE, summary=summary, report=report, error="", cost=paid,
+    insights_store.research_set(ref, status=DONE, summary=summary, report=report, error="", cost=paid,
                        ticket=said, basis=basis, filed_path=filed_path, filed_url="")
     if h:
         ok, why = file_in_home(cfg, h, r)
@@ -695,14 +696,14 @@ def listing() -> str:
     width = max(len(r["ref"]) for r in rows)
     lines = []
     for r in rows:
-        report = state.research_get(r["ref"])
+        report = insights_store.research_get(r["ref"])
         notes = [triage.research_note(r, report), report and report["status"] == DONE and report["filed_url"]]
         lines += [f"{r['ref']:<{width}}  {r['title']}", *(f"{'':<{width}}  {n}" for n in notes if n)]
     return "\n".join(lines + ["", "`arete research REF` prints a report; `--run` runs one now."])
 
 
 def shown(ref: str) -> str | None:
-    report = state.research_get(ref)
+    report = insights_store.research_get(ref)
     if report and report["status"] == ANSWERED and (linked := shown(report["answered_by"])):
         return f"{report['ref']}: not researched: {report['error']}\n\n{linked}"
     if report and report["report"]:

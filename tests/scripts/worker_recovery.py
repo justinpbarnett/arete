@@ -1,10 +1,11 @@
 
 import contextlib, importlib.util, io, json, os, sys
 from pathlib import Path
-from arete import cli, paths, record, state
+from arete import cli, paths, record
+from arete.store import db as foundation
 from arete.lab import experiment, workers
 root, mode = Path(sys.argv[1]), sys.argv[2]
-state.migrate()
+foundation.migrate()
 if importlib.util.find_spec("arete.scratch"):
     from arete import sandbox, scratch
     probe = [sys.executable, "-V"]

@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass
 from functools import wraps
 from pathlib import Path
 
-from . import budget_legacy, paths, run_lines, state, util
+from . import budget_legacy, paths, run_lines, util
 from .store import db as foundation
 from .store import runs as run_store
 
@@ -260,7 +260,7 @@ class Budget:
                 "specification": self.specification, **self.left_out_waits(now)}
             compatibility = getattr(self, "compatibility", True)
             try:
-                with state.tx() as conn:
+                with foundation.tx() as conn:
                     compatibility = not contracted(conn)
                     self.compatibility = compatibility
                     run_store.checkpoint(self.run.id, active, self.current_verification_seconds,

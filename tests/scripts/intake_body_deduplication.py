@@ -1,10 +1,10 @@
 
 loop = make_loop(webhook=True)
-state.migrate()
+foundation.migrate()
 a, b = b'{"title": "a"}', b'{"title": "b"}'
 source = "intake#webhook"
 def age(key):
-    with state.db() as c:
+    with foundation.db() as c:
         c.execute("UPDATE seen SET ts = ? WHERE source = ? AND key = ?",
                   (util.iso(util.now() - timedelta(minutes=11)), source, key))
 server = web()

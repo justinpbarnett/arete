@@ -12,7 +12,7 @@ assert [(r["seconds"], r["auth_mode"]) for r in found] == [(1.25, "api_key"), (2
 assert [r["try"] for r in found] == [1, 2]
 assert run_store.run_get(rid)["cost_usd"] == marks(rid)[0]["cost_usd"] == 2.5
 rid = record.start("pipeline")
-with state.db() as c:
+with foundation.db() as c:
     c.execute("CREATE TRIGGER reject_second BEFORE INSERT ON steps WHEN NEW.cost_usd = 1.5 "
               "BEGIN SELECT RAISE(ABORT, 'second insert refused'); END")
 try:

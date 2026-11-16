@@ -21,7 +21,10 @@ from unittest import mock
 CHECKOUT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(CHECKOUT))
 from arete.store import runs as run_store
-from arete import backup, cli, control, dashboard, loop_run, paths, record, serve, state, tailnet, util
+from arete import backup, cli, control, dashboard, loop_run, paths, record, serve, tailnet, util
+from arete.store import db as foundation
+from arete.store import insights as insights_store
+from arete.store import loops as loops_store
 from arete.store import db as foundation, migrations
 
 TRACE = []
@@ -265,7 +268,7 @@ def test_a_deleted_db_stops_serve():
 serve.TICK_SECONDS = 1
 serve.start_notes = lambda cfg: []
 def tick(self):
-    state.pending()
+    loops_store.pending()
     Path({str(marker)!r}).touch()
 serve.Server.tick = tick
 raise SystemExit(cli.main(['serve', '--no-dashboard']))
@@ -479,7 +482,7 @@ def test_the_instance_keeps_its_name():
     assert re.fullmatch("[0-9a-f]{32}", identity["instance_id"])
     assert identity["instance_tag"] == identity["instance_id"][:8]
     assert identity["instance_name"]
-    assert sql("SELECT ? GLOB ?", (identity["instance_created"], state.TIME_GLOB)) == [(1,)]
+    assert sql("SELECT ? GLOB ?", (identity["instance_created"], foundation.TIME_GLOB)) == [(1,)]
     finished(child("foundation.migrate()"))
     assert identity == dict(sql("SELECT key, value FROM schema_meta WHERE key LIKE 'instance_%'"))
     snapshot = next(p for p in backup.snapshots() if p.name.endswith("-m1.db"))
@@ -600,9 +603,9 @@ def test_times_have_one_shape():
     foundation.migrate()
     assert sql("SELECT at, outcome_at FROM verdicts") == [
         ("2026-11-08T15:04:51Z", "2026-11-08T15:04:51Z"), ("", ""), (None, None)]
-    assert len(state.verdicts_since("2026-11-08T15:00:00Z")) == 1
+    assert len(insights_store.verdicts_since("2026-11-08T15:00:00Z")) == 1
     with sqlite3.connect(paths.DB_FILE) as conn:
-        for table, columns in state.TIME_COLUMNS.items():
+        for table, columns in foundation.TIME_COLUMNS.items():
             if not conn.execute(f'SELECT 1 FROM "{table}" LIMIT 1').fetchone():
                 required = {r[1]: (1 if "INT" in r[2] else f"fixture-{table}")
                             for r in conn.execute(f'PRAGMA table_info("{table}")')
@@ -616,7 +619,7 @@ def test_times_have_one_shape():
                                   f'UPDATE "{table}" SET "{column}" = ?'):
                     if statement.startswith("UPDATE"):
                         invalid = " OR ".join(f'(NEW."{c}" IS NOT NULL AND NEW."{c}" != \'\' '
-                                              f'AND NEW."{c}" NOT GLOB \'{state.TIME_GLOB}\')' for c in columns)
+                                              f'AND NEW."{c}" NOT GLOB \'{foundation.TIME_GLOB}\')' for c in columns)
                         assert invalid in conn.execute("SELECT sql FROM sqlite_master WHERE name=?",
                                                        (f"{table}_time_update",)).fetchone()[0]
                     try:

@@ -31,13 +31,14 @@ def hold_end(text: str) -> str:
 def cmd_hold(args) -> int:
     from datetime import timedelta
 
-    from .. import accounts, claude, codex, environment, routing, state, util
+    from .. import accounts, claude, codex, environment, routing, util
+    from ..store import devices as devices_store
 
     try:
         if not args.subscription:
             if args.until or args.release:
                 raise ValueError("name the subscription: claude or codex")
-            found = state.holds()
+            found = devices_store.holds()
             for h in found:
                 print(f"{h['scope']}\n  {routing.hold_words(h)}")
             if not found:
@@ -50,13 +51,13 @@ def cmd_hold(args) -> int:
         if args.release:
             if args.until:
                 raise ValueError("--release takes no time")
-            state.clear_holds([scope], util.iso(util.now() + timedelta(seconds=1)))
+            devices_store.clear_holds([scope], util.iso(util.now() + timedelta(seconds=1)))
             print(f"released {args.subscription}; its routes are back in every chain")
             return 0
         if not args.until:
             raise ValueError("give a time like 6h, 90m, 2d or an ISO time, or --release")
         until = hold_end(args.until)
-        state.hold(scope, until, f"held with arete hold {args.subscription}")
+        devices_store.hold(scope, until, f"held with arete hold {args.subscription}")
         print(f"held {args.subscription} until {routing.local_time(until)}; its steps take the next route in their tier")
         return 0
     except (ValueError, OSError) as e:

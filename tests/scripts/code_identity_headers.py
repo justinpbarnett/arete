@@ -1,8 +1,9 @@
 
 import json, threading, urllib.request, urllib.error
-from arete import codebase, control, dashboard, paths, serve, state, tailnet, util
+from arete import codebase, control, dashboard, paths, serve, tailnet, util
+from arete.store import db as foundation
 codebase.load()
-state.migrate()
+foundation.migrate()
 beating = serve.Server()
 beating.beat()
 beating.pool.shutdown()

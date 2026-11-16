@@ -7,7 +7,7 @@ from arete import owner_asks, control, pipeline, tasks, poll
 repo = config.Repo("asking", root)
 cfg = config.Config(repos=[repo])
 rid = made("asking", "needs-info", repo=repo.name, issue="R-1")
-state.ask_add("ask", rid, repo.name, "R-1", "build", "call", "why", "tried",
+asks_store.ask_add("ask", rid, repo.name, "R-1", "build", "call", "why", "tried",
               [{"kind": "text", "header": "Choice", "question": "Which?"}], {})
 row = run_store.run_get(rid)
 fetched, threads, errors, launches = threading.Event(), [], [], []
@@ -38,7 +38,7 @@ def continuing(*args):
         assert fetched.wait(5), "tracker did not fetch"
         assert lock_requested.wait(5), "tracker did not take the steering lock"
     else:
-        ask = state.ask_get("ask")
+        ask = asks_store.ask_get("ask")
         ask_store.ask_close("ask", "answered", owner_asks.text_answers(ask, "tracker text"))
     return ["resume"]
 def launch(*args, **kwargs):
@@ -59,7 +59,7 @@ with mock.patch.object(util, "lock", side_effect=lock), mock.patch.object(ask_st
         assert not thread.is_alive(), "tracker deadlocked"
 assert not errors, errors
 assert not tracker_closes, tracker_closes
-stored = state.ask_get("ask")
+stored = asks_store.ask_get("ask")
 expected = "dashboard text" if in_flight else "tracker text"
 assert expected in json.dumps(stored["answers"]), stored
 assert len(launches) == int(in_flight)

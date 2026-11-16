@@ -7,7 +7,7 @@ with mock.patch.object(run_store, "FIRINGS", "(1 = 1)"):
     prune(s)
 snap = max(paths.backups_dir().glob("arete-*.db"))
 out["deleted"] = "pipe-old" not in column("SELECT id FROM runs")
-with state.db() as c:
+with foundation.db() as c:
     for n in range(5):
         c.execute("INSERT INTO feed (run_id, ts, kind, text) VALUES ('later', ?, 'note', 'later')", (ago(0),))
 seq = dict(sqlite3.connect(paths.DB_FILE).execute("SELECT name, seq FROM sqlite_sequence").fetchall())
@@ -19,10 +19,10 @@ def untouched(rc, patch):
 util.write_json(control.BEAT_FILE, {"pid": os.getpid(), "at": ago(30)})
 out["alive"] = untouched(0, contextlib.nullcontext())
 control.BEAT_FILE.unlink()
-with state.db() as c:
+with foundation.db() as c:
     c.execute("INSERT INTO runs (id, kind, status, started, pid) VALUES ('live', 'pipeline', 'running', ?, ?)", (ago(0), os.getpid()))
 out["running"] = untouched(0, dead())
-with state.db() as c:
+with foundation.db() as c:
     c.execute("DELETE FROM runs WHERE id = 'live'")
 with dead():
     out["missing"] = run_cli("backup", "--restore", str(root / "nope.db"))[0]

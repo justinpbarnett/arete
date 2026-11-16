@@ -4,8 +4,22 @@ from datetime import timedelta
 from pathlib import Path
 from unittest import mock
 from arete.store import runs as run_store
-from arete import config, jev, miner, paths, record, replay, state, util
-state.migrate()
+from arete import config, jev, miner, paths, record, replay, util
+from arete.store import _rows as _rows_store
+from arete.store import approvals as approvals_store
+from arete.store import asks as asks_store
+from arete.store import chats as chats_store
+from arete.store import db as foundation
+from arete.store import devices as devices_store
+from arete.store import incidents as incidents_store
+from arete.store import insights as insights_store
+from arete.store import loops as loops_store
+from arete.store import push as push_store
+from arete.store import runs as runs_store
+from arete.store import sources as sources_store
+from arete.store import tasks as tasks_store
+from arete.store import triage as triage_store
+foundation.migrate()
 root, source = Path(sys.argv[1]), sys.argv[2]
 repos = "".join(f'\n[[repo]]\nname = "{n}"\npath = {json.dumps(source)}\ngithub = "example/{n}"\njev = {j}\n'
                 for n, j in (("arete", "false"), ("open", "true")))
@@ -16,7 +30,7 @@ def made(tag, status="done", minutes=2, repo="replay-sample", kind="pipeline", p
     rid = record.start(kind, tag=tag, repo=repo, issue=tag if issue is None else issue)
     if settled:
         record.settle(rid, status, summary=tag + " summary")
-    with state.db() as c:
+    with foundation.db() as c:
         from tests.harness import age_run
         age_run(rid, started=util.iso(util.now() - timedelta(minutes=minutes)), connection=c)
     if parked:

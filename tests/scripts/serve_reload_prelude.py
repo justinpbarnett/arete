@@ -1,7 +1,7 @@
 
 import http.client, http.server, socket, subprocess, types
 from arete import client, dashboard, delivery, tailnet
-state.migrate()
+foundation.migrate()
 OWNER = "owner@example.test"
 from arete import principals
 principals.seed_owner(OWNER)
@@ -24,9 +24,9 @@ def fake_notify(item, batch, loop, run, cfg):
     return "sent"
 delivery.EMITS["ticket"].execute = fake_notify
 def approval():
-    return state.add_approval("demo", "", {"type": "ticket", "item": {"title": "t", "message": "m"}}, "summary")
+    return approvals_store.add_approval("demo", "", {"type": "ticket", "item": {"title": "t", "message": "m"}}, "summary")
 def status_of(n):
-    return state.approval(n)["status"]
+    return approvals_store.approval(n)["status"]
 def post(n, body=b'{"approve": true}', host="127.0.0.1", port=None, header=("X-Arete", "1"), extra=None):
     conn = http.client.HTTPConnection("127.0.0.1", port or PORT, timeout=20)
     conn.request("POST", f"/api/approvals/{n}", body, {"Host": host, **dict([header] if header else []), **(extra or {})})

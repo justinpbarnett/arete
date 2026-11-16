@@ -74,13 +74,17 @@ def exercise(scenario, root=None):
 
 class Fixture:
     def __init__(self, root, port=0):
-        from arete import codebase, config, dashboard, paths, principals, state, tailnet
+        from arete import codebase, config, dashboard, paths, principals, tailnet
         from arete.store import db as foundation
+        from arete.store import runs as runs_store
+        from arete.store import tasks as tasks_store
+        from arete.store import triage as triage_store
 
         self.root, self.server, self.thread = root, None, None
-        self.state, self.paths, self.principals, self.tailnet = state, paths, principals, tailnet
+        self.db, self.paths, self.principals, self.tailnet = foundation, paths, principals, tailnet
+        self.runs, self.tasks, self.triage = runs_store, tasks_store, triage_store
         codebase.load()
-        state.migrate()
+        foundation.migrate()
         if not paths.ISOLATED:
             connection = foundation.connect_db(paths.DB_FILE)
             try:
@@ -143,11 +147,11 @@ class Fixture:
     def emit(self, kind="fixture.changed", cls="derived", subject="task:142", **kw):
         from arete import events
 
-        with self.state.tx():
+        with self.db.tx():
             return events.emit(kind, subject, cls=cls, data=kw.pop("data", {}), **kw)
 
     def rows(self, sql="SELECT * FROM events_log ORDER BY seq", args=()):
-        with self.state.reader() as c:
+        with self.db.reader() as c:
             return [dict(r) for r in c.execute(sql, args)]
 
     def save(self):
@@ -222,20 +226,22 @@ class Stream:
 def replay(f):
     import runpy
 
-    from arete import accounts, config, factory, gh, paths, replay as runner_replay, sandbox, state
+    from arete import accounts, config, factory, gh, paths, replay as runner_replay, sandbox
+    from arete.store import runs as runs_store
+    from arete.store import tasks as tasks_store
     from tests import offline_workflow
 
     fx = SimpleNamespace(root=f.root, scenario="pass", replay=runner_replay, paths=paths, sandbox=sandbox)
     (f.root / "authority-parent").mkdir(exist_ok=True)
     offline_workflow.redirect_authority(fx)
     offline_workflow.create_replay_config(fx)
-    task = state.task_add("replay-sample", "Add kumquat to the fixture notes", "Add kumquat", "feat")
+    task = tasks_store.task_add("replay-sample", "Add kumquat to the fixture notes", "Add kumquat", "feat")
     feature = runpy.run_path(str(paths.ADWS_DIR / "feature.py"))["feature"]
     with mock.patch.object(accounts, "read", offline_workflow.forbidden), mock.patch.object(gh, "gh", offline_workflow.forbidden):
         with contextlib.suppress(SystemExit):
             factory.main(feature, ["replay-sample", task, "--force"])
     assert config.load().replay.all
-    run = state.ticket_runs("replay-sample", task, whole=True)[0]
+    run = runs_store.ticket_runs("replay-sample", task, whole=True)[0]
     assert run["status"] == "done", run
     return run
 
@@ -283,7 +289,7 @@ def live_replay(f, nearby=False):
             conn.close()
             assert [line["event"] for line in old] == [line["event"] for line in lines]
             assert f.get(f"/api/runs/{run['id']}")
-            assert any(row["kind"] == "end" for row in f.state.feed(run["id"]))
+            assert any(row["kind"] == "end" for row in f.runs.feed(run["id"]))
             assert f.get("/api/live")
     return rows
 
@@ -330,13 +336,13 @@ def filters(f):
     from arete import events
 
     start = f.poll()["next"]
-    with f.state.tx():
+    with f.db.tx():
         for n in range(1100):
             events.emit("task.changed" if n % 2 else "run.changed", "task:142" if n % 3 else "run:pip-1",
                         cls="derived" if n % 5 else "durable", task="142", data={"run": "pip-1", "n": n})
         for run in ("pip-1", "pip-2"):
             events.emit("turn.appended", f"run:{run}", cls="derived", data={"run": run})
-    original_reader, launched, workers, pages = f.state.reader, threading.Event(), [], []
+    original_reader, launched, workers, pages = f.db.reader, threading.Event(), [], []
 
     @contextlib.contextmanager
     def traced(*args, **kw):
@@ -356,7 +362,7 @@ def filters(f):
                 c.set_trace_callback(trace)
             yield c
 
-    with mock.patch.object(f.state, "reader", traced):
+    with mock.patch.object(f.db, "reader", traced):
         first = f.poll(start)
     for worker in workers:
         worker.join(5)
@@ -379,7 +385,7 @@ def filters(f):
     assert f.poll(start, subject="task:14_")["events"] == []
     assert f.poll(start, kinds="t%.*")["events"] == []
     seq = f.emit()
-    with f.state.tx() as c:
+    with f.db.tx() as c:
         c.execute("UPDATE events_log SET idem = 'fixture-key' WHERE seq = ?", (seq,))
     assert [r["seq"] for r in f.poll(start, idem="fixture-key")["events"]] == [seq]
     empty = f.poll(start, kinds="absent")
@@ -415,7 +421,7 @@ def epoch_reset(f):
     made = backup.snapshot("fixture")
     f.close()
     backup.restore(made)
-    f.state.migrate()
+    f.db.migrate()
     f.open()
     after = f.poll()["next"]
     assert events.cursor(after)[0] != events.cursor(before)[0]
@@ -446,7 +452,7 @@ def retention_reset(f):
 
     before = f.poll()["next"]
     old = {cls: f.emit(cls=cls) for cls in ("derived", "notice", "durable")}
-    with f.state.tx() as c:
+    with f.db.tx() as c:
         for cls, days in (("derived", 91), ("notice", 8), ("durable", 100)):
             c.execute("UPDATE events_log SET at = ? WHERE seq = ?", (util.iso(util.now() - timedelta(days=days)), old[cls]))
     saved = f.rows()
@@ -467,7 +473,7 @@ def backlog_reset(f):
     from arete import events
 
     start = f.poll()["next"]
-    with f.state.tx():
+    with f.db.tx():
         for _ in range(10000):
             events.emit("fixture.changed", "task:142", cls="derived", data={})
     assert len(f.poll(start)["events"]) == 10000
@@ -498,13 +504,13 @@ def atomicity(f):
     before = f.rows()
     with mock.patch.object(events, "emit", side_effect=RuntimeError("emit fault")):
         raises(lambda: record.settle(run, "done", "fixture end"))
-    assert f.state.run_get(run)["status"] == "running" and not f.state.feed(run)
+    assert f.runs.run_get(run)["status"] == "running" and not f.runs.feed(run)
     assert before == f.rows()
     raises(lambda: events.emit("test", "test", cls="durable", data={}))
-    with f.state.reader():
+    with f.db.reader():
         raises(lambda: events.emit("test", "test", cls="durable", data={}))
     for actor in ("owner", "x@example.com"):
-        with principals.acting(actor), f.state.tx():
+        with principals.acting(actor), f.db.tx():
             raises(lambda: events.emit("test", "test", cls="durable", data={}), ValueError)
     record.ask_stop(run)
     record.ask_stop(run)
@@ -513,7 +519,7 @@ def atomicity(f):
     record.settle(run, "done", "duplicate")
     record.ask_stop(run)
     record.ask_stop("missing")
-    assert len(f.state.feed(run)) == 1
+    assert len(f.runs.feed(run)) == 1
     assert len(f.rows("SELECT * FROM events_log WHERE kind = 'run.ended'")) == 1
 
 
@@ -605,7 +611,7 @@ def principal_gate(f):
     from arete import events, principals, util
 
     def insert(id="u:12345678", kind="human", role="owner", status="active"):
-        with f.state.tx() as c:
+        with f.db.tx() as c:
             c.execute("INSERT INTO principals (id, kind, role, status, name, created) VALUES (?, ?, ?, ?, 'Other', ?)",
                       (id, kind, role, status, util.iso()))
 
@@ -617,14 +623,14 @@ def principal_gate(f):
     raises(lambda: principals.update("rule:fixture", kind="human", role="owner"), sqlite3.IntegrityError)
     principals.update(f.person, name="Updated Person")
     raises(lambda: insert("bad", "human", None, "removed"), sqlite3.IntegrityError)
-    with f.state.tx() as c:
+    with f.db.tx() as c:
         c.execute("INSERT INTO schema_meta VALUES ('multi_user', 'ready')")
     principals.update("u:12345678", status="active")
     with ThreadPoolExecutor(4) as pool:
         ids = list(pool.map(lambda _: principals.seed_owner(SECOND, "Second"), range(8)))
     assert set(ids) == {f.person}
     assert len(f.rows("SELECT * FROM events_log WHERE kind = 'principal.changed' AND ver = 1")) == 1
-    with f.state.tx() as c:
+    with f.db.tx() as c:
         raises(lambda: c.execute("INSERT INTO principal_logins SELECT 'duplicate', principal, method, subject, "
                                  "public_key, expires, created, last_used FROM principal_logins"), sqlite3.IntegrityError)
         c.execute("DELETE FROM principal_logins")
@@ -637,11 +643,11 @@ def principal_gate(f):
 
 
 def completeness(f):
-    from arete import state
+    from arete.store import db as foundation
 
     identity = f.get("/api/meta")["instance"]
     for value, expected in (("7", False), ("8", True), (None, True)):
-        with state.tx() as c:
+        with foundation.tx() as c:
             c.execute("UPDATE schema_meta SET value = ? WHERE key = 'oldest_writer'", (value,))
         answer = f.get("/api/meta")
         assert answer["stream"]["complete"] is expected and answer["instance"] == identity
@@ -655,7 +661,7 @@ def completeness(f):
 def row_actors(f):
     from arete import board, cli, control, factory, pipeline, principals, record, screening, serve, tasks, tracker, triage
 
-    task = f.state.task_add("replay-sample", "Question", "Question", "feat")
+    task = f.tasks.task_add("replay-sample", "Question", "Question", "feat")
     with principals.acting(f.person):
         assert cli.main(["task", "reply", task, "An answer"]) == 0
         tasks.store_answer(None, None, task, "A stored answer")
@@ -667,18 +673,18 @@ def row_actors(f):
     source = SimpleNamespace(name="fixture", by_name=lambda: {repo.name: repo}, route=lambda name: "",
                              candidate=lambda r: r, ticket=lambda r: SimpleNamespace(updated="unchanged", text="A task"),
                              approve=lambda r: approved.append(r))
-    f.state.triage_put(row)
+    f.triage.triage_put(row)
     with principals.acting(f.person), mock.patch.object(triage, "sources", return_value=[source]), \
             mock.patch.object(screening, "screen", return_value=screening.Screen(screening.PASSED)):
         assert "Sent FIX-1" in triage.send(None, "FIX-1", [], [], repo.name)
     assert len(approved) == 1
-    approval = f.state.triage_approval("FIX-1")
+    approval = f.triage.triage_approval("FIX-1")
     assert approval["sent_by"] == f.person
     legacy = (f.root / "legacy-task.txt").read_text()
     for actor in (f.person, "owner"):
         checked_task = legacy if actor == "owner" else task
-        f.state.task_set_state(checked_task, "needs-info")
-        assert checked_task in [r["id"] for r in f.state.tasks_replied(repo.name)]
+        f.tasks.task_set_state(checked_task, "needs-info")
+        assert checked_task in [r["id"] for r in f.tasks.tasks_replied(repo.name)]
         assert tracker.LocalTracker(repo).reply_since(checked_task, "2000-01-01T00:00:00Z")
         historical = {**approval, "sent_by": actor, "run": None}
         assert "by you" in triage.sent_note(historical)
@@ -806,7 +812,7 @@ def blocked_socket(f, events):
 
     opened, closed = threading.Event(), threading.Event()
     times = {}
-    original = f.state.reader
+    original = f.db.reader
 
     @contextlib.contextmanager
     def tracked(*args, **kw):
@@ -822,14 +828,14 @@ def blocked_socket(f, events):
                 closed.set()
 
     since = f.poll()["next"]
-    with f.state.tx():
+    with f.db.tx():
         for _ in range(128):
             events.emit("socket.fixture", "socket:fixture", cls="derived", data={"blob": "x" * 65536})
     conn = http.client.HTTPConnection("127.0.0.1", f.server.server_port, timeout=40)
     conn.connect()
     conn.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
     try:
-        with mock.patch.object(f.state, "reader", tracked):
+        with mock.patch.object(f.db, "reader", tracked):
             conn.request("GET", "/api/events?since=" + since, headers={"Accept": "text/event-stream"})
             response = conn.getresponse()
             assert response.status == 200 and opened.wait(5)
@@ -852,16 +858,16 @@ def child(scenario, root, port):
     if scenario == "admission-empty":
         (root / "config/config.toml").write_text('[dashboard]\nowner=""\n')
     if scenario == "row-actors":
-        from arete import state
         from arete.store import db as foundation, migrations
+        from arete.store import tasks as tasks_store
 
         chain = migrations.load()
         with mock.patch.object(migrations, "load", return_value=chain[:4]), \
                 mock.patch.multiple(foundation, LATEST=4, NEEDED=4):
-            state.migrate()
-            legacy = state.task_add("replay-sample", "A legacy question", "Legacy", "feat")
-            state.task_set_state(legacy, "needs-info")
-            state.task_comment(legacy, "owner", "A legacy answer")
+            foundation.migrate()
+            legacy = tasks_store.task_add("replay-sample", "A legacy question", "Legacy", "feat")
+            tasks_store.task_set_state(legacy, "needs-info")
+            tasks_store.task_comment(legacy, "owner", "A legacy answer")
             (root / "legacy-task.txt").write_text(legacy)
     fixture = Fixture(root, port)
     try:
