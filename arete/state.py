@@ -14,7 +14,7 @@ from .store import runs as run_store
 LATEST = foundation.LATEST
 MIGRATE_WAIT_SECONDS = foundation.MIGRATE_WAIT_SECONDS
 NEEDED = foundation.NEEDED
-TIME_COLUMNS = {**foundation.TIME_COLUMNS, "runs": (*foundation.TIME_COLUMNS["runs"], "measured_at")}
+TIME_COLUMNS = foundation.TIME_COLUMNS
 TIME_GLOB = foundation.TIME_GLOB
 IncompatibleSchema = foundation.IncompatibleSchema
 NoDatabase = foundation.NoDatabase

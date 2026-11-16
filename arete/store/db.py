@@ -80,7 +80,7 @@ def connect_db(p: Path, readonly: bool = False, create: bool = False) -> sqlite3
         raise
 
 
-TIME_COLUMNS = time_shape.TIME_COLUMNS
+TIME_COLUMNS = {**time_shape.TIME_COLUMNS, "runs": (*time_shape.TIME_COLUMNS["runs"], "measured_at")}
 TIME_GLOB = time_shape.TIME_GLOB
 
 _CHAIN = migrations.load()
@@ -444,6 +444,13 @@ def vacuum_into(conn, target):
 def schema_metadata():
     with reader() as conn:
         return dict(conn.execute("SELECT key, value FROM schema_meta"))
+
+
+def migration_applied(n: int, conn=None) -> bool:
+    if conn is None:
+        with reader() as connection:
+            return migration_applied(n, connection)
+    return conn.execute("SELECT 1 FROM schema_migrations WHERE n = ?", (n,)).fetchone() is not None
 
 
 def enable_wal():

@@ -26,7 +26,7 @@ def metadata(run_id, name):
     except FileNotFoundError:
         return {}
     if not isinstance(value, dict):
-        raise ValueError(f"run {run_id} has invalid {name}")
+        raise TypeError(f"run {run_id} has invalid {name}")
     return value
 
 
@@ -133,7 +133,7 @@ def verification_seconds(run_id: str, row: dict, conn) -> float:
         raise ValueError(f"run {run_id} has invalid active verification checkpoint")
     if active or spent or opened is not None:
         if opened is not None:
-            return float(spent) + (opened if active else 0)
+            return float(spent) + opened
         return max(0, float(spent)) + (max(0, (parse_iso(row.get("finished") or iso()) -
                                              parse_iso(active)).total_seconds()) if active else 0)
     if saved:
@@ -151,12 +151,14 @@ def verification_seconds(run_id: str, row: dict, conn) -> float:
         if str(name or "").startswith(("verify", "grade")))
 
 
-def apply(conn):
+def apply(conn, *, running=()):
     columns = [r[1] for r in conn.execute("PRAGMA table_info(runs)")]
     for raw in conn.execute("SELECT * FROM runs WHERE kind IN ('pipeline') "
-                            "AND status != 'running' AND measured_at IS NULL").fetchall():
+                            "AND measured_at IS NULL").fetchall():
         row = dict(zip(columns, raw))
         rid = row["id"]
+        if row["status"] == "running" and rid not in running:
+            continue
         try:
             saved = metadata(rid, "budget.json")
             for field in ("run_seconds", "verification_seconds", "verification_open_seconds", "repair_calls"):

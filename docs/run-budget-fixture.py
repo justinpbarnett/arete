@@ -16,6 +16,7 @@ WORKFLOWS = {
     "forced-columns": ["failed-again-columns-high", "failed-again-columns-low"],
     "row-precedence": ["failed-again-row-precedence"],
     "killed-verify": ["failed-resume-killed"],
+    "admission": ["edited-after-held-pr", "budget-waits-admission"],
     "waits": ["limit-wait", "work-over-budget", "failed-again-prepare-limit-wait", "budget-waits-admission",
               "checkpoint-errors"],
 }
@@ -45,6 +46,18 @@ def validate(scenario, result):
         assert row["active_seconds"] < 60
         charge = result["charged"][result["failed_id"]]
         assert charge["run_minutes"] < 1 and charge["verification_minutes"] < 1
+        assert (f"{result['failed_id']}: {charge['run_minutes']:.1f} run minutes, "
+                f"{charge['verification_minutes']:.1f} verification minutes") in result["log"]
+    if scenario == "edited-after-held-pr":
+        assert result["status"] == "done", result["summary"]
+        assert "review_fix" in result["steps"]
+        assert "left out 3 earlier repair cycles" in result["log"]
+        assert result["budget"]["left_out"] == [result["old"]]
+        assert result["budget"]["parents"] == []
+    if scenario == "budget-waits-admission":
+        assert result["unchanged_refused"]
+        assert result["status"] == "done", result["summary"]
+        assert "quince" in result["published"]
     if scenario == "limit-wait":
         assert result["status"] == "done" and result["parked"] == {}
         assert abs(result["budget"]["wait_minutes_left_out"]["limit"] - 10) < .1

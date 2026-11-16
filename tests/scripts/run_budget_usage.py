@@ -96,7 +96,7 @@ def migrations(root):
     at = util.iso()
     a = old_run("A", issue="A")
     saved("A", run_seconds=42, run_seconds_at=at, verification_seconds=7,
-          verification_open_seconds=2, verification_active_since=at, repair_calls=1)
+          verification_open_seconds=2, repair_calls=1)
     b = old_run("B", seconds=300)
     until = util.parse_iso(b["finished"])
     run_lines.waited("B", "limit", util.iso(until - timedelta(seconds=200)),
@@ -115,6 +115,7 @@ def migrations(root):
     try:
         old_run("E", status="running", pid=sleeper.pid)
         before = {rid: budget_after(rid) for rid in "ABCD"}
+        assert before["A"]["totals"] == [42, 9, 1]
         full(folder)
         assert state.migrate()
         blocked = ledger()
@@ -125,15 +126,27 @@ def migrations(root):
         assert rows["C"] == [200, 15, 0, 2, ""]
         assert rows["D"] == [5, 0, 0, 0, at]
         after = {rid: budget_after(rid) for rid in "ABCD"}
+        assert after["A"]["totals"] == [42, 9, 1]
         for rid in before:
             assert all(abs(x - y) <= 1 for x, y in zip(before[rid]["totals"], after[rid]["totals"]))
         assert after["B"]["charged"]["B"]["estimate"]
         assert after["C"]["charged"]["C"]["estimate"]
         sleeper.kill()
         sleeper.wait()
-        assert any(r["id"] == "E" for r in record.reap(tickets=True))
+        old_run("F", status="running", pid=sleeper.pid)
+        saved("F", run_seconds=12, run_seconds_at=at, verification_seconds=3,
+              verification_open_seconds=2, repair_calls=1)
         assert not state.migrate()
+        assert ledger()[-1] == 7
+        assert state.run_get("E")["status"] == state.run_get("F")["status"] == "running"
         assert row_values("E")[-1] == ""
+        assert row_values("F") == [12, 3, 2, 1, at]
+        before_reap = {rid: row_values(rid) for rid in "EF"}
+        assert set("EF") <= {r["id"] for r in record.reap(tickets=True)}
+        assert before_reap == {rid: row_values(rid) for rid in "EF"}
+        inherited_dead = {rid: budget_after(rid) for rid in "EF"}
+        assert inherited_dead["E"]["totals"] == [before_reap["E"][0], 0, 0]
+        assert inherited_dead["F"]["totals"] == [12, 5, 1]
         frozen = {rid: row_values(rid) for rid in "ABCDE"}
         assert not state.migrate()
         assert frozen == {rid: row_values(rid) for rid in frozen}
@@ -159,6 +172,7 @@ def migrations(root):
             raise AssertionError("NULL counter accepted")
         return {"before": before, "after": after, "backfill": rows, "frozen": frozen,
                 "blocked_ledger": blocked, "ledger": ledger(), "null_refusal": refusal,
+                "before_reap": before_reap, "inherited_dead": inherited_dead,
                 "D_budget": json.loads((paths.RUNS_DIR / "D/budget.json").read_text())}
     finally:
         if sleeper.poll() is None:
@@ -235,6 +249,11 @@ def checkpoints(root):
     other = record.start("eval", repo=repo.name)
     assert row_values(other) == [None] * 5
     run = pipeline.Run(rid, repo, paths.RUNS_DIR / rid, tid="probe", tracker=tracker.LocalTracker(repo))
+    initial = state.run_get(rid)
+    with state.reader() as conn:
+        event_tables = [row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('events_log', 'feed')")]
+        events = {table: conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] for table in event_tables}
     clock = [100.0]
     sql = []
     original_tx = state.tx
@@ -256,6 +275,11 @@ def checkpoints(root):
         updates = list(dict.fromkeys(s for s in sql if s.startswith("UPDATE")))
         assert len(updates) == 1 and updates[0].startswith("UPDATE runs SET active_seconds=")
         assert not any("INSERT" in s for s in sql)
+        assert {k: v for k, v in state.run_get(rid).items() if k not in COUNTERS} == {
+            k: v for k, v in initial.items() if k not in COUNTERS}
+        with state.reader() as conn:
+            assert {table: conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+                    for table in event_tables} == events
         compatibility = json.loads((run.dir / "budget.json").read_text())
         assert compatibility["run_seconds"] == row_values(rid)[0]
         entered, release, second_ready = threading.Event(), threading.Event(), threading.Event()
@@ -320,6 +344,7 @@ def checkpoints(root):
                             raise RuntimeError("fixture exit")
                 except RuntimeError:
                     assert exceptional
+            assert observed.is_set()
             assert signal.getsignal(signal.SIGALRM) == handler
             assert signal.getitimer(signal.ITIMER_REAL) == timer
             assert not any(t.name == f"budget-{rid}" for t in threading.enumerate())
@@ -335,6 +360,7 @@ def checkpoints(root):
     return {"row": frozen, "startup_zero": early_zero, "non_ticket": row_values(other),
             "compatibility": compatibility, "compact": compact, "sql": sql,
             "failure_log": (run.dir / "run.log").read_text(), "ordered": True,
+            "version_unchanged": True, "event_count_unchanged": True,
             "settlement_unchanged": True, "signals_restored": True, "ledger": ledger()}
 
 

@@ -703,8 +703,18 @@ def resume_parked(fx, result):
     if scenario == "budget-waits-admission":
         count = len(fx.state.ticket_runs("replay-sample", fx.task))
         calls = len(fx.prompts)
-        with mock.patch.object(fx.runlimits.Policy, "of", return_value=fx.runlimits.Policy(max_repair_cycles=0)):
+        repo = fx.config.load().repo("replay-sample")
+        local = pipeline.tracker.LocalTracker(repo)
+        policy = fx.runlimits.Policy(max_repair_cycles=0)
+        admission = {"saved": result["recorded"], "policy": vars(policy),
+                     "specification": fx.runlimits.specification(local.get(fx.task)),
+                     "heads": fx.runlimits.heads(repo, branch), "rows_before": count, "calls_before": calls}
+        with mock.patch.object(fx.runlimits.Policy, "of", return_value=policy):
             refused = forced(fx)
+        admission.update(id=refused["id"], rows_after=len(fx.state.ticket_runs("replay-sample", fx.task)),
+                         calls_after=len(fx.prompts))
+        pipeline.util.write_json(fx.root / "admission.json", admission)
+        result["admission"] = admission
         assert refused["id"] == result["parked_id"]
         assert count == len(fx.state.ticket_runs("replay-sample", fx.task))
         assert len(fx.prompts) == calls

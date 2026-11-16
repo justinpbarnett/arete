@@ -13,6 +13,7 @@ from functools import wraps
 from pathlib import Path
 
 from . import budget_legacy, paths, run_lines, state, util
+from .store import db as foundation
 from .store import runs as run_store
 
 IDLE_WAITS = ("limit", "slot")
@@ -139,10 +140,7 @@ def admission(repo, tid: str, tracker, policy: Policy, explicit: bool) -> tuple[
 
 
 def contracted(conn=None) -> bool:
-    if conn is None:
-        with state.reader() as reader:
-            return contracted(reader)
-    return conn.execute("SELECT 1 FROM schema_migrations WHERE n = 7").fetchone() is not None
+    return foundation.migration_applied(7, conn)
 
 
 def measured(run_id: str, row: dict) -> bool:
@@ -265,9 +263,8 @@ class Budget:
                 with state.tx() as conn:
                     compatibility = not contracted(conn)
                     self.compatibility = compatibility
-                    run_store.note(self.run.id, active_seconds=active,
-                                   verify_seconds=self.current_verification_seconds,
-                                   verify_open_seconds=verify_open, repair_calls=self.repair_calls, measured_at=at)
+                    run_store.checkpoint(self.run.id, active, self.current_verification_seconds,
+                                         verify_open, self.repair_calls, at)
             except sqlite3.Error as e:
                 self.run.log(f"budget checkpoint failed: {e}")
             if compatibility:

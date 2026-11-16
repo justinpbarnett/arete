@@ -129,6 +129,12 @@ class Isolated(unittest.TestCase):
 
 
 class BudgetTests(Isolated):
+    def child_env(self):
+        make_folders(self.root, "tmp", "home")
+        return scratch_env(self.root, HOME=str(self.root / "home"), TMPDIR=str(self.root / "tmp"),
+                           ARETE_WORKTREES_DIR=str(paths.WORKTREES_DIR), GIT_CONFIG_NOSYSTEM="1",
+                           GIT_CONFIG_GLOBAL=os.devnull)
+
     def test_measured_usage_rejects_corruption_and_zero_overrides_wall_time(self):
         run = self.made_run()
         record.note(run.id, started=util.iso(util.now() - timedelta(minutes=90)))
@@ -344,7 +350,8 @@ class BudgetTests(Isolated):
             "STATE_DIR", "RUNS_DIR", "DB_FILE", "LOCKS_DIR", "CONFIG_DIR", "CONFIG_FILE", "LOG_DIR",
             "EVENTS_FILE", "WORKTREES_DIR")}
         code = (f"import sys;sys.path.insert(0,{str(Path(__file__).resolve().parents[1])!r});"
-                "from pathlib import Path;from arete.store import runs as run_store; from arete import config,paths,pipeline,record,runlimits,tracker;"
+                "from pathlib import Path;from arete.store import runs as run_store; from arete import config,paths,pipeline,record,runlimits,tracker,replay;"
+                f"replay.sample(Path({str(self.root / 'sample')!r}));"
                 f"overrides={overrides!r};"
                 "\nfor name,value in overrides.items():setattr(paths,name,Path(value))\n"
                 f"repo=config.Repo(name='fixture',path=Path({str(self.repo.path)!r}),tracker='local');"
@@ -353,14 +360,13 @@ class BudgetTests(Isolated):
                 "run=pipeline.Run(rid,repo,folder,tracker=local,tid=tid);"
                 f"budget=runlimits.Budget(run,runlimits.Policy(),{first.id!r},local.get(tid));"
                 "\ntry:budget.charge('repair','review_repair')"
-                "\nexcept runlimits.Parked:print('budget remained exhausted')"
+                "\nexcept runlimits.Parked:print('BEHAVIOR_RESULT={\"exhausted\":true}')"
                 "\nelse:raise AssertionError('restart reset the budget')")
-        done = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=5,
+        done = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=30,
                               cwd=str(self.root),
-                              env={**{k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "TMPDIR")},
-                                   "HOME": str(self.root)})
+                              env=self.child_env())
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertIn("budget remained exhausted", done.stdout)
+        self.assertTrue(behavior_result(done)["exhausted"])
 
     def test_repair_usage_is_durable_even_when_audit_event_cannot_be_written(self):
         first = self.made_run()
@@ -378,7 +384,8 @@ class BudgetTests(Isolated):
             "EVENTS_FILE", "WORKTREES_DIR")}
         before = util.iso(util.now() - timedelta(minutes=21))
         code = (f"import os,sys;sys.path.insert(0,{str(Path(__file__).resolve().parents[1])!r});"
-                "from pathlib import Path;from arete.store import runs as run_store; from arete import config,paths,pipeline,record,runlimits,tracker,util,run_lines;"
+                "from pathlib import Path;from arete.store import runs as run_store; from arete import config,paths,pipeline,record,runlimits,tracker,util,run_lines,replay;"
+                f"replay.sample(Path({str(self.root / 'sample')!r}));"
                 f"overrides={overrides!r};"
                 "\nfor name,value in overrides.items():setattr(paths,name,Path(value))\n"
                 f"util.now=lambda:util.parse_iso({before!r});"
@@ -392,12 +399,12 @@ class BudgetTests(Isolated):
                 "clock=[0.0];runlimits.time=SimpleNamespace(monotonic=lambda:clock[0]);"
                 "budget.started=0.0;budget.deadline=3600;"
                 "\nwith budget.watching(),budget.verifying():"
-                "\n clock[0]+=21*60;budget.checkpoint();os._exit(0)")
-        done = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=5,
+                "\n clock[0]+=21*60;budget.checkpoint();print('BEHAVIOR_RESULT={\"checkpoint\":true}',flush=True);os._exit(0)")
+        done = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=30,
                               cwd=str(self.root),
-                              env={**{k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "TMPDIR")},
-                                   "HOME": str(self.root)})
+                              env=self.child_env())
         self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue(behavior_result(done)["checkpoint"])
         previous = run_store.ticket_runs(self.repo.name, self.ticket)[0]
         record.settle(previous["id"], "interrupted")
         next_run = self.made_run(previous["id"])

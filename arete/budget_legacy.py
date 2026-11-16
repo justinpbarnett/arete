@@ -101,7 +101,7 @@ def verification_seconds(run_id: str, row: dict) -> float:
         raise ValueError(f"run {run_id} has invalid active verification checkpoint")
     if active or spent or opened is not None:
         if opened is not None:
-            return float(spent) + (opened if active else 0)
+            return float(spent) + opened
         return max(0, float(spent)) + (max(0, (util.parse_iso(row.get("finished") or util.iso()) -
                                              util.parse_iso(active)).total_seconds()) if active else 0)
     if saved:

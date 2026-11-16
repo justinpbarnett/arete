@@ -684,6 +684,7 @@ $SANDBOX python docs/run-budget-fixture.py killed-verify
 $SANDBOX python docs/run-budget-fixture.py migrations
 $SANDBOX python docs/run-budget-fixture.py migration-errors
 $SANDBOX python docs/run-budget-fixture.py checkpoint-errors
+$SANDBOX python docs/run-budget-fixture.py admission
 $SANDBOX python docs/run-budget-fixture.py waits
 $SANDBOX python docs/run-budget-fixture.py inspect
 ```
