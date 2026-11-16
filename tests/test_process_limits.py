@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shlex
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -44,7 +45,40 @@ from arete import (
 )
 from arete.agent import Result
 
-from tests.harness import set_task_body
+from tests.harness import behavior_result, make_folders, run_script, scratch_env, set_task_body
+
+
+class BudgetUsageExercises(unittest.TestCase):
+    def exercise(self, action):
+        with tempfile.TemporaryDirectory(prefix="arete-budget-usage-") as directory:
+            root = Path(directory)
+            make_folders(root, "config", "state", "logs", "worktrees", "tmp", "home", "authority-parent")
+            env = scratch_env(root, HOME=str(root / "home"), TMPDIR=str(root / "tmp"),
+                              ARETE_WORKTREES_DIR=str(root / "worktrees"), GIT_CONFIG_NOSYSTEM="1",
+                              GIT_CONFIG_GLOBAL=os.devnull)
+            code = "import sys;from tests.scripts.run_budget_usage import main;main(sys.argv[1],sys.argv[2])"
+            done = run_script(code, root, str(root), action, env=env, timeout=120)
+            self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+            return behavior_result(done)
+
+    def test_budget_backfill_and_live_writer_contract_gate(self):
+        result = self.exercise("migrations")
+        self.assertEqual(result["ledger"][-1], 7)
+        self.assertEqual(result["backfill"]["B"], [200, 50, 0, 2, ""])
+
+    def test_malformed_backfills_roll_back_and_sql_refuses_corrupt_counters(self):
+        from tests.scripts.run_budget_usage import BAD_BUDGETS
+
+        for case in BAD_BUDGETS:
+            with self.subTest(case=case):
+                result = self.exercise("migration-error-" + case)
+                self.assertTrue(result["nan_is_null"])
+                self.assertEqual(result["ledger"][-1], 5)
+
+    def test_checkpoint_retry_ordering_cleanup_and_contract_json(self):
+        result = self.exercise("checkpoint-errors")
+        self.assertTrue(result["ordered"])
+        self.assertTrue(result["settlement_unchanged"])
 
 
 def setUpModule():
@@ -96,25 +130,31 @@ class Isolated(unittest.TestCase):
 
 
 class BudgetTests(Isolated):
+    def child_env(self):
+        make_folders(self.root, "tmp", "home")
+        return scratch_env(self.root, HOME=str(self.root / "home"), TMPDIR=str(self.root / "tmp"),
+                           ARETE_WORKTREES_DIR=str(paths.WORKTREES_DIR), GIT_CONFIG_NOSYSTEM="1",
+                           GIT_CONFIG_GLOBAL=os.devnull)
+
     def test_measured_usage_rejects_corruption_and_zero_overrides_wall_time(self):
         run = self.made_run()
         record.note(run.id, started=util.iso(util.now() - timedelta(minutes=90)))
         record.settle(run.id, "interrupted")
-        row = run_store.run_get(run.id)
-        saved = runlimits.metadata(run.id, "budget.json")
-        saved["verification_active_since"] = row["started"]
-        for field, read in (("run_seconds", runlimits.active_seconds),
-                            ("verification_open_seconds", runlimits.verification_seconds)):
-            for bad in (-1, float("nan"), float("inf"), -float("inf"), True, "1", None):
-                with self.subTest(field=field, bad=bad):
-                    util.write_json(run.dir / "budget.json", {**saved, field: bad})
-                    with self.assertRaisesRegex(ValueError, run.id):
-                        read(run.id, row)
-            util.write_json(run.dir / "budget.json", {**saved, field: 0})
-            self.assertEqual(read(run.id, row), 0)
-        saved.pop("verification_open_seconds")
-        util.write_json(run.dir / "budget.json", saved)
-        self.assertGreater(runlimits.verification_seconds(run.id, row), 89 * 60)
+        for field, read in (("active_seconds", runlimits.active_seconds),
+                            ("verify_open_seconds", runlimits.verification_seconds),
+                            ("repair_calls", lambda rid, row: runlimits.repair_count(rid))):
+            for bad in (-1, "unknown"):
+                with self.subTest(field=field, bad=bad), self.assertRaises(sqlite3.IntegrityError):
+                    with state.tx() as conn:
+                        conn.execute(f"UPDATE runs SET {field}=? WHERE id=?", (bad, run.id))
+            for bad in ((None, float("nan")) if field == "repair_calls" else (None, float("nan"), float("inf"))):
+                with state.tx() as conn:
+                    conn.execute(f"UPDATE runs SET {field}=? WHERE id=?", (bad, run.id))
+                with self.assertRaisesRegex(ValueError, run.id):
+                    read(run.id, state.run_get(run.id))
+            with state.tx() as conn:
+                conn.execute(f"UPDATE runs SET {field}=0 WHERE id=?", (run.id,))
+            self.assertEqual(read(run.id, state.run_get(run.id)), 0)
 
     def test_measured_recovery_and_nested_open_idle_waits(self):
         clock = [100.0]
@@ -144,7 +184,7 @@ class BudgetTests(Isolated):
             snapshots = []
             def checkpoint():
                 original()
-                snapshots.append(runlimits.metadata(run.id, "budget.json"))
+                snapshots.append(state.run_get(run.id))
                 observed.set()
             with patch.object(runlimits, "CHECKPOINT_SECONDS", .01), \
                     patch.object(run.budget, "checkpoint", side_effect=checkpoint):
@@ -156,9 +196,9 @@ class BudgetTests(Isolated):
                 except RuntimeError:
                     self.assertTrue(exceptional)
             self.assertGreaterEqual(len(snapshots), 2)
-            self.assertGreaterEqual(snapshots[-1]["run_seconds"], snapshots[0]["run_seconds"])
-            self.assertGreater(snapshots[0]["verification_open_seconds"], 0)
-            self.assertEqual(snapshots[-1]["verification_open_seconds"], 0)
+            self.assertGreaterEqual(snapshots[-1]["active_seconds"], snapshots[0]["active_seconds"])
+            self.assertGreater(snapshots[0]["verify_open_seconds"], 0)
+            self.assertEqual(snapshots[-1]["verify_open_seconds"], 0)
             self.assertFalse(any(t.name == f"budget-{run.id}" for t in threading.enumerate()))
 
     def test_checkpoint_tracks_open_verification_without_charging_open_idle_time(self):
@@ -169,16 +209,16 @@ class BudgetTests(Isolated):
             with run.budget.verifying(), run.budget.idling("limit"):
                 clock[0] += 20
                 run.budget.checkpoint()
-                first = runlimits.metadata(run.id, "budget.json")
+                first = state.run_get(run.id)
                 clock[0] += 30
                 run.budget.checkpoint()
-                second = runlimits.metadata(run.id, "budget.json")
-            self.assertEqual(first["run_seconds"], second["run_seconds"])
-            self.assertEqual(second["verification_open_seconds"] - first["verification_open_seconds"], 30)
-            saved = runlimits.metadata(run.id, "budget.json")
-            self.assertEqual(saved["verification_seconds"], 50)
-            self.assertEqual(saved["verification_open_seconds"], 0)
-            self.assertEqual(saved["run_seconds"], 10)
+                second = state.run_get(run.id)
+            self.assertEqual(first["active_seconds"], second["active_seconds"])
+            self.assertEqual(second["verify_open_seconds"] - first["verify_open_seconds"], 30)
+            saved = state.run_get(run.id)
+            self.assertEqual(saved["verify_seconds"], 50)
+            self.assertEqual(saved["verify_open_seconds"], 0)
+            self.assertEqual(saved["active_seconds"], 10)
 
     def test_failed_final_checkpoint_restores_signal_and_stops_worker(self):
         run = self.made_run()
@@ -311,7 +351,8 @@ class BudgetTests(Isolated):
             "STATE_DIR", "RUNS_DIR", "DB_FILE", "LOCKS_DIR", "CONFIG_DIR", "CONFIG_FILE", "LOG_DIR",
             "EVENTS_FILE", "WORKTREES_DIR")}
         code = (f"import sys;sys.path.insert(0,{str(Path(__file__).resolve().parents[1])!r});"
-                "from pathlib import Path;from arete.store import runs as run_store; from arete import config,paths,pipeline,record,runlimits,tracker;"
+                "from pathlib import Path;from arete.store import runs as run_store; from arete import config,paths,pipeline,record,runlimits,tracker,replay;"
+                f"replay.sample(Path({str(self.root / 'sample')!r}));"
                 f"overrides={overrides!r};"
                 "\nfor name,value in overrides.items():setattr(paths,name,Path(value))\n"
                 f"repo=config.Repo(name='fixture',path=Path({str(self.repo.path)!r}),tracker='local');"
@@ -320,14 +361,13 @@ class BudgetTests(Isolated):
                 "run=pipeline.Run(rid,repo,folder,tracker=local,tid=tid);"
                 f"budget=runlimits.Budget(run,runlimits.Policy(),{first.id!r},local.get(tid));"
                 "\ntry:budget.charge('repair','review_repair')"
-                "\nexcept runlimits.Parked:print('budget remained exhausted')"
+                "\nexcept runlimits.Parked:print('BEHAVIOR_RESULT={\"exhausted\":true}')"
                 "\nelse:raise AssertionError('restart reset the budget')")
-        done = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=5,
+        done = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=30,
                               cwd=str(self.root),
-                              env={**{k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "TMPDIR")},
-                                   "HOME": str(self.root)})
+                              env=self.child_env())
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertIn("budget remained exhausted", done.stdout)
+        self.assertTrue(behavior_result(done)["exhausted"])
 
     def test_repair_usage_is_durable_even_when_audit_event_cannot_be_written(self):
         first = self.made_run()
@@ -345,7 +385,8 @@ class BudgetTests(Isolated):
             "EVENTS_FILE", "WORKTREES_DIR")}
         before = util.iso(util.now() - timedelta(minutes=21))
         code = (f"import os,sys;sys.path.insert(0,{str(Path(__file__).resolve().parents[1])!r});"
-                "from pathlib import Path;from arete.store import runs as run_store; from arete import config,paths,pipeline,record,runlimits,tracker,util,run_lines;"
+                "from pathlib import Path;from arete.store import runs as run_store; from arete import config,paths,pipeline,record,runlimits,tracker,util,run_lines,replay;"
+                f"replay.sample(Path({str(self.root / 'sample')!r}));"
                 f"overrides={overrides!r};"
                 "\nfor name,value in overrides.items():setattr(paths,name,Path(value))\n"
                 f"util.now=lambda:util.parse_iso({before!r});"
@@ -359,12 +400,12 @@ class BudgetTests(Isolated):
                 "clock=[0.0];runlimits.time=SimpleNamespace(monotonic=lambda:clock[0]);"
                 "budget.started=0.0;budget.deadline=3600;"
                 "\nwith budget.watching(),budget.verifying():"
-                "\n clock[0]+=21*60;budget.checkpoint();os._exit(0)")
-        done = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=5,
+                "\n clock[0]+=21*60;budget.checkpoint();print('BEHAVIOR_RESULT={\"checkpoint\":true}',flush=True);os._exit(0)")
+        done = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=30,
                               cwd=str(self.root),
-                              env={**{k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "TMPDIR")},
-                                   "HOME": str(self.root)})
+                              env=self.child_env())
         self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue(behavior_result(done)["checkpoint"])
         previous = run_store.ticket_runs(self.repo.name, self.ticket)[0]
         record.settle(previous["id"], "interrupted")
         next_run = self.made_run(previous["id"])
@@ -377,24 +418,17 @@ class BudgetTests(Isolated):
         run_lines.write(rid, "step_start", step="implement", atom="review_repair", **{"try": 2})
         run_lines.write(rid, "step_start", step="implement", call="review_fix1", atom="review_repair", **{"try": 2})
         run_lines.write(rid, "step_start", step="verify", call="verify2", **{"try": 2})
-        self.assertEqual(runlimits.repair_count(rid), 1)
+        self.assertEqual(runlimits.budget_legacy.repair_count(rid), 1)
 
     def test_cumulative_time_survives_continuation(self):
-        for measured in (False, True):
-            with self.subTest(measured=measured):
-                first = self.made_run()
-                saved = runlimits.metadata(first.id, "budget.json")
-                if measured:
-                    saved["run_seconds"] = 61 * 60
-                else:
-                    saved.pop("run_seconds")
-                    record.note(first.id, started=util.iso(util.now() - timedelta(minutes=61)))
-                util.write_json(first.dir / "budget.json", saved)
-                record.settle(first.id, "interrupted")
-                second = self.made_run(first.id)
-                with self.assertRaisesRegex(runlimits.Parked, "cumulative 60"):
-                    with second.budget.watching():
-                        self.fail("an exhausted chain must not run")
+        first = self.made_run()
+        with state.tx() as conn:
+            conn.execute("UPDATE runs SET active_seconds=? WHERE id=?", (61 * 60, first.id))
+        record.settle(first.id, "interrupted")
+        second = self.made_run(first.id)
+        with self.assertRaisesRegex(runlimits.Parked, "cumulative 60"):
+            with second.budget.watching():
+                self.fail("an exhausted chain must not run")
 
     def test_idle_waits_move_the_deadline_and_other_waits_do_not(self):
         for cause in ("limit", "slot"):
@@ -416,9 +450,6 @@ class BudgetTests(Isolated):
 
     def chained_after(self, *waits):
         first = self.made_run()
-        saved = runlimits.metadata(first.id, "budget.json")
-        saved.pop("run_seconds")
-        util.write_json(first.dir / "budget.json", saved)
         record.note(first.id, started=util.iso(util.now() - timedelta(minutes=61)))
         for cause, since, until in waits:
             if until is None:
@@ -427,6 +458,10 @@ class BudgetTests(Isolated):
                 run_lines.waited(first.id, cause, util.iso(util.now() - timedelta(minutes=since)),
                              util.iso(util.now() - timedelta(minutes=until)))
         record.settle(first.id, "interrupted")
+        row = state.run_get(first.id)
+        seconds = max(0, 61 * 60 - sum(runlimits.idle_waits(first.id, row).values()))
+        with state.tx() as conn:
+            conn.execute("UPDATE runs SET active_seconds=? WHERE id=?", (seconds, first.id))
         return first, self.made_run(first.id)
 
     def test_limit_wait_of_an_earlier_run_is_left_out_of_prior_seconds(self):
@@ -462,13 +497,9 @@ class BudgetTests(Isolated):
                 self.fail("verification time must not reset")
 
     def test_interrupted_verification_phase_is_counted_on_restart(self):
-        before = util.now() - timedelta(minutes=21)
-        with patch.object(util, "now", return_value=before):
-            first = self.made_run()
-            run_lines.write(first.id, "budget_verify_start")
-            saved = runlimits.metadata(first.id, "budget.json")
-            saved.pop("verification_open_seconds")
-            util.write_json(first.dir / "budget.json", saved)
+        first = self.made_run()
+        with state.tx() as conn:
+            conn.execute("UPDATE runs SET verify_open_seconds=? WHERE id=?", (21 * 60, first.id))
         record.settle(first.id, "interrupted")
         second = self.made_run(first.id)
         with self.assertRaisesRegex(runlimits.Parked, "verification"):
@@ -517,12 +548,13 @@ class BudgetTests(Isolated):
 
     def test_corrupt_verification_usage_does_not_reset_spent_time(self):
         run = self.made_run()
-        path = run.dir / "budget.json"
-        original = json.loads(path.read_text())
-        for invalid in (-1, float("nan"), "unknown"):
-            util.write_json(path, {**original, "verification_seconds": invalid})
-            with self.assertRaises(ValueError):
-                runlimits.verification_seconds(run.id, run_store.run_get(run.id))
+        for invalid in (-1, "unknown"):
+            with self.assertRaises(sqlite3.IntegrityError), state.tx() as conn:
+                conn.execute("UPDATE runs SET verify_seconds=? WHERE id=?", (invalid, run.id))
+        with state.tx() as conn:
+            conn.execute("UPDATE runs SET verify_seconds=? WHERE id=?", (float("nan"), run.id))
+        with self.assertRaisesRegex(ValueError, run.id):
+            runlimits.verification_seconds(run.id, state.run_get(run.id))
 
     def test_individual_step_reruns_cannot_reset_the_ticket_budget(self):
         first = self.made_run()
@@ -554,6 +586,8 @@ class BudgetTests(Isolated):
         for n in (1, 2, 3):
             run_lines.write(rid, "step_start", step="implement", call=f"review_fix{n}", atom="review_repair", **{"try": n})
         record.settle(rid, status)
+        with state.tx() as conn:
+            conn.execute("UPDATE runs SET repair_calls=3 WHERE id=?", (rid,))
         return rid
 
     def started_after(self, force):
@@ -612,12 +646,11 @@ class BudgetTests(Isolated):
         old = self.made_run()
         with state.db() as connection:
             set_task_body(self.ticket, "Edited with a follow up", connection=connection)
-        if "verification_seconds" in budget:
-            saved = runlimits.metadata(old.id, "budget.json")
-            util.write_json(paths.RUNS_DIR / old.id / "budget.json", {**saved, **budget})
-        else:
-            saved = runlimits.metadata(old.id, "budget.json")
-            util.write_json(old.dir / "budget.json", {**saved, "run_seconds": 61 * 60})
+        with state.tx() as conn:
+            if "verification_seconds" in budget:
+                conn.execute("UPDATE runs SET verify_seconds=? WHERE id=?", (budget["verification_seconds"], old.id))
+            else:
+                conn.execute("UPDATE runs SET active_seconds=? WHERE id=?", (61 * 60, old.id))
         record.settle(old.id, "pr")
         return old
 
