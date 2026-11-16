@@ -17,6 +17,7 @@ from . import (
     environment,
     gh,
     paths,
+    prompt_loader,
     record,
     routing,
     sandbox,
@@ -36,12 +37,9 @@ from .pipeline import (
     PLAN_SCHEMA,
     AgentRun,
     TicketWork,
-    bash_rules,
     check_calls,
     check_list,
     check_script,
-    code_list,
-    prompt,
     run_checks,
     use_product,
 )
@@ -463,13 +461,12 @@ def hidden_check(cfg: config.Config, repo: config.Repo, task: Task, wt: Path, ti
     return environment.sh(task.check, cfg, repo, cwd=wt, timeout=timeout)
 
 
-def review(run: EvalRun, wt: Path, task: Task, plan: str, report: str, evidence: str, diff: str, workspace_text: str,
+def review(run: EvalRun, wt: Path, brief: prompt_loader.Brief, plan: str, report: str, evidence: str, diff: str,
            timeout: float) -> int:
-    res = run.agent("review", prompt("review", repo=run.repo.name, workspace=workspace_text, ref=task.name,
-                                     title=task.title, body=task.prompt, comments="", attachments="", plan=plan,
-                                     checks=report, evidence=evidence, diff=util.tail(diff, MAX_DIFF_IN_PROMPT),
-                                     compare="`git diff HEAD`", earlier=""),
-                    wt, role="review", allowed_tools=bash_rules(config.DEFAULT_ALLOW_BASH),
+    res = run.agent("review", brief.prompt(
+        "review", plan=plan, checks=report, evidence=evidence, diff=util.tail(diff, MAX_DIFF_IN_PROMPT),
+        compare="`git diff HEAD`", earlier=""),
+                    wt, role="review", allowed_tools=prompt_loader.bash_rules(config.DEFAULT_ALLOW_BASH),
                     json_schema=REVIEW_SCHEMA, timeout=timeout)
     if not res.ok or not isinstance(res.structured, dict):
         raise workspace.RunFailed("review step failed")
@@ -504,14 +501,16 @@ def run_task(cfg: config.Config, src: Source, task: Task, prompts: Prompts, run:
         timeout = task.timeout_minutes * 60
         check_commands, check_rules = check_script(run_dir, layer, wt)
         runs_checks = check_calls(check_commands)
-        commands = code_list(layer.builder_bash + check_commands)
+        commands = prompt_loader.code_list(layer.builder_bash + check_commands)
         workspace_text = ("You are in a checkout of its code on branch `main`. It has no `origin` remote, so compare with "
                      "`HEAD`, as in `git diff HEAD`.")
-        res = run.agent("plan", prompt("plan", prompts.dir, repo=repo.name, workspace=workspace_text, ref=task.name, title=task.title,
-                                        body=task.prompt, comments="", attachments="", triage="", expertise=expertise,
-                                        commands=commands, denied=code_list(denied_paths(layer)),
-                                        max_lines=layer.max_diff_lines, checks=checks),
-                        wt, **run.call_kw(cfg, "plan", READ_TOOLS, bash_rules(config.DEFAULT_ALLOW_BASH)),
+        brief = prompt_loader.Brief(repo.name, workspace_text, task.name, task.title, task.prompt,
+                                    comments="",
+                                    attachments="", expertise=expertise, commands=commands,
+                                    max_lines=layer.max_diff_lines)
+        res = run.agent("plan", brief.prompt(
+            "plan", prompts.dir, triage="", denied=prompt_loader.code_list(denied_paths(layer)), checks=checks),
+                        wt, **run.call_kw(cfg, "plan", READ_TOOLS, prompt_loader.bash_rules(config.DEFAULT_ALLOW_BASH)),
                         json_schema=PLAN_SCHEMA, timeout=timeout)
         if not res.ok or not isinstance(res.structured, dict):
             result.why = "plan step failed"
@@ -519,12 +518,9 @@ def run_task(cfg: config.Config, src: Source, task: Task, prompts: Prompts, run:
         plan = res.structured.get("plan", "")
         estimate = int(res.structured.get("estimated_lines") or 0)
         in_use = res.structured.get("verify", "")
-        rules = bash_rules(layer.builder_bash + check_rules)
-        res = run.agent("build", prompt("build", prompts.dir, repo=repo.name, workspace=workspace_text, ref=task.name,
-                                         title=task.title, body=task.prompt, comments="", attachments="", plan=plan,
-                                         expertise=expertise, checks=runs_checks, commands=commands,
-                                         max_lines=layer.max_diff_lines, estimate=estimate,
-                                         verify=in_use),
+        rules = prompt_loader.bash_rules(layer.builder_bash + check_rules)
+        res = run.agent("build", brief.prompt(
+            "build", prompts.dir, plan=plan, checks=runs_checks, estimate=estimate, verify=in_use),
                         wt, **run.call_kw(cfg, "build", BUILD_TOOLS, rules),
                         disallowed_tools=routing.NO_GIT_WRITES, timeout=timeout)
         if not res.ok:
@@ -536,7 +532,7 @@ def run_task(cfg: config.Config, src: Source, task: Task, prompts: Prompts, run:
         try:
             while not ok and run.may_repair(attempts, max_attempts):
                 attempts += 1
-                fix = prompt("fix", prompts.dir, attempt=attempts, max_attempts=max_attempts, failures=report,
+                fix = prompt_loader.prompt("fix", prompts.dir, attempt=attempts, max_attempts=max_attempts, failures=report,
                              checks=runs_checks)
                 res = run.agent(f"fix{attempts}", fix, wt,
                                 **run.call_kw(cfg, "check_repair", BUILD_TOOLS, rules),
@@ -562,7 +558,7 @@ def run_task(cfg: config.Config, src: Source, task: Task, prompts: Prompts, run:
             if graded.verdict != "pass":
                 failures.append(grade_failure(graded))
         if run.reviews:
-            blocking = review(run, wt, task, plan, report, evidence, diff, workspace_text, run.time_for(timeout))
+            blocking = review(run, wt, brief, plan, report, evidence, diff, run.time_for(timeout))
             result.blocking = blocking
             if blocking:
                 failures.append(util.count(blocking, "blocking review finding"))
@@ -733,7 +729,7 @@ def compare_prompts(cfg: config.Config, arete: config.Repo, branch: str) -> str:
     if not changed:
         return ""
     if unmeasured == changed:
-        return f"No eval runs {code_list(changed)}, so this change is not measured.\n"
+        return f"No eval runs {prompt_loader.code_list(changed)}, so this change is not measured.\n"
     ran, skipped = [], []
     for repo in suites(cfg):
         if any(p.dir for p in repo.parts):
@@ -782,7 +778,7 @@ def prompt_comparison(arete: config.Repo, arms: dict[str, Prompts], changed: lis
     main_label = arms["main"].label
     lead = (f"each eval suite ran its tasks twice today, once with the prompts on `{main_label}` and once with this branch's"
             if ran else "no eval suite ran")
-    lines = [f"Prompt evals: {lead}. Changed: {code_list(changed)}.", ""]
+    lines = [f"Prompt evals: {lead}. Changed: {prompt_loader.code_list(changed)}.", ""]
     if ran:
         lines += [f"| suite | `{main_label}` | this branch | tasks that changed |", "|---|---|---|---|"]
         for repo, result in ran:
@@ -792,9 +788,9 @@ def prompt_comparison(arete: config.Repo, arms: dict[str, Prompts], changed: lis
         lines += [f"| all | {totals['main'].score} | {totals['pr'].score} | |", ""]
         ids = [a.run_id for repo, result in ran if not hidden(repo) for a in result.values()]
         lines.append(f"{util.paid_note(totals['main'].paid + totals['pr'].paid).capitalize()}."
-                     + (f" Runs {code_list(ids)}." if ids else ""))
+                     + (f" Runs {prompt_loader.code_list(ids)}." if ids else ""))
     if unmeasured:
-        lines.append(f"Not measured, as no eval runs them: {code_list(unmeasured)}.")
+        lines.append(f"Not measured, as no eval runs them: {prompt_loader.code_list(unmeasured)}.")
     if skipped:
         lines.append("Skipped: " + ", ".join(f"{shown(repo)} ({why})" for repo, why in skipped) + ".")
     return "\n".join(lines).rstrip() + "\n"

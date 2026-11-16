@@ -25,7 +25,7 @@ class Source:
     plan: str
     goal: str
     left_for_a_person: str
-    runs: list[str] = field(default_factory=list)
+    runs: set[str] = field(default_factory=set)
 
 
 def saved_review(run_id: str) -> tuple[Review, int]:
@@ -45,9 +45,8 @@ def saved_review(run_id: str) -> tuple[Review, int]:
 
 
 def saved_plan(run_id: str) -> tuple[str, str, str]:
-    for line in reversed(factory.history(factory.chain(run_id))):
-        data = line.get("data") if isinstance(line.get("data"), dict) else {}
-        if line.get("step") in PLAN_STEPS and line.get("result") == "pass" and data.get("plan"):
+    for data in reversed(factory.passed_data(factory.history(factory.chain(run_id)), *PLAN_STEPS)):
+        if data.get("plan"):
             return str(data["plan"]), str(data.get("goal") or ""), str(data.get("left_for_a_person") or "")
     folder = paths.RUNS_DIR / run_id
     try:
@@ -69,19 +68,27 @@ def source(row: dict) -> Source:
         raise Refused(f"run {run_id} ended {row.get('status')} with no open PR; only a run that left a PR is repaired")
     review, seq = saved_review(run_id)
     plan, goal, left = saved_plan(run_id)
-    runs = [run_id, *(str(read[0].get("run") or "") for read in factory.chain(run_id)[1:] if read)]
+    runs = {run_id} | factory.chain_runs(run_id)
     return Source(run_id, str(row["branch"]), str(row["pr_url"]).split(), review,
                   f"the review in the report line of run {run_id} (seq {seq})", plan, goal, left, runs)
 
 
+def run_commits(cwd: Path, log_args: list[str]) -> list[tuple[str, set[str]]]:
+    out = util.git(["log", "--first-parent", f"--format={TRAILER}", *log_args], cwd)
+    found = []
+    for row in out.splitlines():
+        sha, _, trailers = row.partition("\t")
+        found.append((sha, {v.strip() for v in trailers.split(",")}))
+    return found
+
+
 def matched_head(cwd: Path, rev: str, found: Source) -> str:
     try:
-        out = util.git(["log", "--first-parent", f"-n{MAX_LOG}", f"--format={TRAILER}", rev], cwd)
+        commits = run_commits(cwd, [f"-n{MAX_LOG}", rev])
     except RuntimeError as e:
         raise Refused(str(e)) from None
-    for record in out.splitlines():
-        sha, _, runs = record.partition("\t")
-        if sha and found.runs and {r.strip() for r in runs.split(",")} & set(found.runs):
+    for sha, runs in commits:
+        if sha and found.runs and runs & found.runs:
             return sha
     raise Refused(f"{rev} holds no commit of run {found.run_id}, so its review cannot be matched to the PR head; "
                   "the branch was rewritten")

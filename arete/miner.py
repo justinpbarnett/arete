@@ -17,6 +17,7 @@ from . import (
     gh,
     jev,
     paths,
+    prompt_loader,
     record,
     runlimits,
     runner,
@@ -27,7 +28,6 @@ from . import (
 )
 from .agent import EDIT_TOOLS, READ_TOOLS
 from .heartbeat import mark_loop
-from .pipeline import prompt
 from .util import git
 
 MAX_PROPOSALS = 8
@@ -585,7 +585,7 @@ def proposals_text(props: list[dict]) -> str:
 
 
 def apply_in(cfg: config.Config, run_id: str, wt: Path, props: list[dict]) -> runner.Result:
-    return runner.run(prompt("apply", proposals=proposals_text(props)), wt, model=cfg.model("apply"),
+    return runner.run(prompt_loader.prompt("apply", proposals=proposals_text(props)), wt, model=cfg.model("apply"),
                       allowed_tools=EDIT_TOOLS, timeout=1200, persist=False, trace=(run_id, "apply"))
 
 
@@ -761,7 +761,7 @@ def _run(cfg: config.Config, run_id: str, since: datetime, until: datetime, chec
     pr_feedback = state.feedback_between(since_iso, until_iso)
     mine_repos = [r for r in cfg.repos if r.mine and r.path.is_dir()]
     repos ="\n".join(f"- {r.name}: {r.path} {'(public)' if r.public else ''}" for r in mine_repos)
-    text = prompt(
+    text = prompt_loader.prompt(
         "mine", hours=f"{hours:g}", global_repo=cfg.global_repo, arete_repo=cfg.arete_repo,
         arete_prompts=minable_prompts(), repos=repos, max=MAX_PROPOSALS,
         pending=_fmt(state.proposals(status=["applied", "pending", "hand", "approve", "filing"])),

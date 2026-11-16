@@ -6,9 +6,8 @@ import string
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit, urlunsplit
 
-from . import config, research_budget, research_plan, research_search, steps, util
+from . import config, prompt_loader, research_budget, research_plan, research_search, steps, util
 from .agent import WEB_TOOLS, Result
-from .pipeline import prompt
 
 MAX_ROUNDS = 2
 GAP_TASKS = 3
@@ -170,7 +169,7 @@ def ask(cfg: config.Config, budget: research_budget.Budget, s: steps.Settings, t
         if not got.may_search:
             usd, seconds = budget.final()
             seconds = min(seconds, s.timeout_minutes * 60)
-        text = prompt("research_synthesis", **values, **where,
+        text = prompt_loader.prompt("research_synthesis", **values, **where,
                       questions=research_plan.bullets(plan["questions"]),
                       criteria=research_plan.bullets(plan["source_criteria"]),
                       claims=research_plan.bullets(plan["claims"]), tasks=research_search.task_lines(evidence),

@@ -17,7 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from arete import slots, workspace
+from arete import slots, workspace, prompt_loader
 
 from tests.harness import set_task_body
 
@@ -397,7 +397,7 @@ def prepare_kept_fixture(fx):
     fx.src, fx.origin = root / "sample/repo", root / "sample/origin.git"
     fx.plain, fx.stock = fx.layer.read_text(), (fx.replays / "build.patch").read_text()
     fx.ws = paths.WORKTREES_DIR / f"replay-sample-{fx.task}"
-    fx.branch = pipeline.fill_template(fx.config.RepoLayer.branch, fx.config.RepoLayer.branch, kind="feat", id=fx.task, slug=pipeline.slug("Add kumquat"))
+    fx.branch = prompt_loader.fill_template(fx.config.RepoLayer.branch, fx.config.RepoLayer.branch, kind="feat", id=fx.task, slug=prompt_loader.slug("Add kumquat"))
     fx.prompts, fx.real_run = [], fx.runner.run
     def spying(prompt, cwd, **kw):
         fx.prompts.append((kw.get("trace"), prompt))

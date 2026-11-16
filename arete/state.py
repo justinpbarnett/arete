@@ -1234,6 +1234,10 @@ def ticket_runs(repo: str, issue: int | str, limit: int = 10, connect=db, whole:
                                            + "ORDER BY started DESC, rowid DESC LIMIT ?", (repo, issue, limit))]
 
 
+def newest_whole_run(repo: str, issue: int | str) -> dict | None:
+    return next(iter(ticket_runs(repo, issue, limit=1, whole=True)), None)
+
+
 def ticket_runs_marked_running(repo: str, issue: int | str, connect=db) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "

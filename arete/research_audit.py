@@ -6,10 +6,9 @@ import tempfile
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
-from . import config, outbound, research_budget, research_search, runner, steps, util
+from . import config, outbound, prompt_loader, research_budget, research_search, runner, steps, util
 from . import research_synthesis as synth
 from .agent import WEB_TOOLS
-from .pipeline import prompt
 
 VERDICTS = ("supported", "contradicted", "inference", "unverifiable")
 NOT_AUDITED = "not audited"
@@ -208,7 +207,7 @@ def ask(cfg: config.Config, budget: research_budget.Budget, s: steps.Settings, r
     tools = [*read, "WebFetch"] if fetchable else read
     allowed = [*read, *(f"WebFetch(domain:{h})" for h in fetchable)]
     ids = {sid for sids in fetchable.values() for sid in sids}
-    text = prompt("research_audit", today=util.iso()[:10], sources=json.dumps(supplied, indent=2),
+    text = prompt_loader.prompt("research_audit", today=util.iso()[:10], sources=json.dumps(supplied, indent=2),
                   fetch=fetch_text(fetchable, known),
                   claims=json.dumps([{k: c[k] for k in ("id", "kind", "claim", "basis", "cited", "critical")}
                                      for c in batch], indent=2))

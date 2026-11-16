@@ -16,7 +16,6 @@ from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from string import Template
 from typing import NamedTuple, TextIO
 
 from . import (
@@ -35,6 +34,7 @@ from . import (
     outbound,
     owner_asks,
     paths,
+    prompt_loader,
     record,
     routing,
     run_lines,
@@ -56,6 +56,10 @@ from .agent import NO_SESSION, Result, Session
 from .review import REVIEW_SCHEMA, Review, numbered
 from .util import git
 
+ADW = "adw"
+ENDED = workspace.ENDED
+
+
 MAX_DIFF_IN_PROMPT = 60_000
 MAX_FIX_DIFF_IN_PROMPT = 20_000
 NO_FIX_REPLY = "The builder gave no reply."
@@ -67,7 +71,6 @@ SKIPPED_FILE = paths.STATE_DIR / "skipped.json"
 CONTINUE_AFTER_DROP = "The connection dropped mid step. Carry on from where you stopped and finish the step."
 CHECKS_LOCK = "checks"
 LEFT_TITLE = "Left for a person"
-TRIAGE_ANSWERS = "Answers to triage's questions"
 LEFT_HEADING = f"## {LEFT_TITLE}"
 LEFT_START, LEFT_END = "<!-- arete:left -->", "<!-- /arete:left -->"
 LEFT_FOR_A_PERSON = re.compile(rf"{re.escape(LEFT_START)}\n{LEFT_HEADING}\n\n(.*?)\n\n{re.escape(LEFT_END)}\n*", re.DOTALL)
@@ -166,36 +169,36 @@ MAX_CI_REASON_CHARS = 700
 FEEDBACK_QUIET_MINUTES = 10
 
 
-def prompt(name: str, prompts_dir: Path = paths.PROMPTS_DIR, **values) -> str:
-    text = (prompts_dir / f"{name}.md").read_text()
-    values.setdefault("owner", owner_asks.NOBODY)
-    return Template(text).safe_substitute({k: ("" if v is None else str(v)) for k, v in values.items()})
+def wanted(repo: config.Repo) -> str:
+    return config.load_layer(repo.layer_dir).factory_path
+
+
+def has_origin(repo: config.Repo) -> bool:
+    return repo.path.is_dir() and "origin" in util.git(["remote"], repo.path, check=False).split()
+
+
+def facts(name: str, data: dict) -> dict:
+    if name in ("plan", "revise", "repair"):
+        return {"assumptions": assumptions_of(data), "left_for_a_person": str(data.get("left_for_a_person") or "")}
+    if name == "pr":
+        return {"held": data.get("draft_why") or ""}
+    if name == "verify" and isinstance(data.get("verified"), dict):
+        return {"requirements": verify.Verified.stored(data["verified"]).requirements()}
+    if name == "review" and isinstance(data.get("review"), dict):
+        return {"review": Review.stored(data["review"]).report()}
+    return {}
+
+
+def seam_facts(run_id: str) -> dict:
+    found: dict = {}
+    for line in factory.history(factory.chain(run_id)):
+        if line.get("result") == "pass" or line.get("step") == "review":
+            found.update(facts(str(line.get("step") or ""), factory.outcome_of(line).data))
+    return found
 
 
 def public_text(run: AgentRun, text: str) -> str:
     return outbound.redact(text) if run.repo.public else text
-
-
-def bash_rules(patterns: list[str]) -> list[str]:
-    return [f"Bash({p})" for p in patterns]
-
-
-def code_list(names: list[str]) -> str:
-    return ", ".join(f"`{n}`" for n in names)
-
-
-def slug(text: str, n: int = 40) -> str:
-    s = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
-    if len(s) > n:
-        s = s[:n + 1].rpartition("-")[0] or s[:n]
-    return s or "change"
-
-
-def fill_template(template: str, default: str, **values) -> str:
-    try:
-        return template.format(**values)
-    except (KeyError, IndexError, ValueError, AttributeError, TypeError):
-        return default.format(**values)
 
 
 @dataclass
@@ -513,6 +516,10 @@ class Run(AgentRun):
         return tracker.ticket_name(self.repo.name, self.ref)
 
     @property
+    def triage_key(self) -> str:
+        return self.ref if self.repo.tracker == "jira" else self.where
+
+    @property
     def feedback_prs(self) -> list[str]:
         return list(dict.fromkeys(f["pr_url"] for f in self.feedback))
 
@@ -828,6 +835,12 @@ class TicketWork:
     steps: Counter = field(default_factory=Counter)
 
     @property
+    def brief(self) -> prompt_loader.Brief:
+        t = self.ticket
+        return prompt_loader.Brief(self.run.repo.name, self.workspace, t.ref, t.title, t.body,
+                                   comments=t.comments, attachments=self.attachments)
+
+    @property
     def git_dirs(self) -> list[Path]:
         return [c.wt for c in self.checkouts]
 
@@ -837,7 +850,7 @@ class TicketWork:
 
     def next_step(self, name: str) -> str:
         self.steps[name] += 1
-        return name if self.steps[name] == 1 else f"{name}{self.steps[name]}"
+        return round_name(name, self.steps[name])
 
 
 @dataclass(kw_only=True)
@@ -906,20 +919,21 @@ class Build(TicketWork):
         commit_and_push(self.checkouts, self.staged.changed, branch, message)
         self.committed_lines += self.staged.lines
 
-    def check_with_repairs(self) -> bool:
+    def check_with_repairs(self, step_name: Callable[[int], str] | None = None) -> tuple[bool, int]:
+        step_name = step_name or (lambda n: self.next_step("check_repair"))
         attempts, tries = 1, self.run.settings("check_repair").tries
         ok = self.check()
         while not ok and attempts < tries:
             self.run.story.append(f"Checks failed on attempt {attempts}:\n{util.tail(self.report, 2500)}")
             attempts += 1
-            self.resume(self.next_step("check_repair"),
-                        prompt("fix", attempt=attempts, max_attempts=tries, failures=self.report,
+            self.resume(step_name(attempts),
+                        prompt_loader.prompt("fix", attempt=attempts, max_attempts=tries, failures=self.report,
                                checks=self.check_commands), role="check_repair")
             ok = self.check()
-        return ok
+        return ok, attempts
 
     def recheck(self, after: str) -> None:
-        if not self.check_with_repairs():
+        if not self.check_with_repairs()[0]:
             raise workspace.RunFailed(f"the checks failed after {after}", self.report)
         self.require_valid_diff(after)
 
@@ -990,17 +1004,16 @@ def answer_text(asked_id: str) -> str:
 
 
 def run_command(repo_name: str, tid: str | int, force: bool = False, dry_run: bool = False) -> list[str]:
-    from . import flows
     cfg = config.load()
     flags = [*(["--force"] if force else []), *(["--dry-run"] if dry_run else [])]
     try:
-        adw = flows.wanted(cfg.repo(repo_name)) == flows.ADW
+        adw = wanted(cfg.repo(repo_name)) == ADW
     except (ValueError, TypeError):
         adw = False
     if not adw:
         return control.command(["run", repo_name, str(tid), "--local", *flags])
-    newest = state.ticket_runs(repo_name, str(tid), limit=1, whole=True)
-    if newest and newest[0]["status"] == "interrupted" and repaired_by(newest[0]["id"]):
+    newest = state.newest_whole_run(repo_name, str(tid))
+    if newest and newest["status"] == "interrupted" and repaired_by(newest["id"]):
         return script_command(cfg, "repair", repo_name, str(tid), *flags)
     name = "revise" if pending_feedback(repo_name, str(tid)) else "feature"
     if (asked := answered_run(repo_name, str(tid))) and not dry_run:
@@ -1050,13 +1063,12 @@ def script_refusal(cfg: config.Config, repo: config.Repo, tid: str, script: Scri
 
 
 def run_refusal(repo: config.Repo, script: bool = False) -> tuple[bool, str]:
-    from . import flows
     try:
-        path, broken = flows.wanted(repo), ""
+        path, broken = wanted(repo), ""
     except (ValueError, TypeError, OSError) as e:
         path, broken = "classic", f"; {paths.short_path(repo.layer_dir / 'config.toml')}: {e}"
-    adw = path == flows.ADW or script
-    if repo.parts or adw and flows.has_origin(repo):
+    adw = path == ADW or script
+    if repo.parts or adw and has_origin(repo):
         return adw, ""
     return adw, f"{repo.name} has no github remote configured" + (
         " and no git remote origin, which [factory] path = \"adw\" needs" if adw else broken)
@@ -1064,6 +1076,45 @@ def run_refusal(repo: config.Repo, script: bool = False) -> tuple[bool, str]:
 
 def runnable(repo: config.Repo) -> bool:
     return bool(repo.parts) or not run_refusal(repo)[1]
+
+
+def parent_run(script: Script | None, earlier: dict | None, budget_history: list[dict]) -> str:
+    parent = (script.repairs or script.continues if script else "") or (
+        earlier["id"] if earlier and earlier["status"] not in ENDED else "")
+    if budget_history and budget_history[0]["status"] not in ENDED:
+        parent = budget_history[0]["id"]
+    return parent
+
+
+def park_run(run: Run, reason: str) -> tuple[str, str, str]:
+    keep_edits(run)
+    held = kept_heads(run)
+    status, summary = "failed", (f"parked: {reason}; branch and evidence retained, workspace left in place"
+                                 f"{', edits kept in a local commit' if held else ''}. {runlimits.RETRY}")
+    kept = run.budget.park(reason, held)
+    record.note(run.id, **kept)
+    pr_url = kept["pr_url"]
+    run.log(summary)
+    run.enter("failed")
+    return status, summary, pr_url
+
+
+def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: bool, flow: factory.Flow | None) -> None:
+    if restarting and status in ("skipped", "noop") and not run.feedback:
+        run.enter("failed")
+        run.say(f"I did not restart this after the interruption: {summary}. Remove "
+                f"`{run.tracker.label_name('failed')}` to retry.")
+    if run.feedback and not run.dry_run and not run.alone:
+        state.settle_feedback(run.id, {"pr": "done", "noop": "recorded"}.get(status, "failed"))
+    if status == "failed":
+        if flow and flow.matching and flow.stepped:
+            flow.route()
+        if not run_lines.ended_in_error(run.id, reply="respond" if flow else ""):
+            run_lines.write(run.id, "error", step=run_lines.last_step(run.id), message=summary)
+    pr_url = pr_url or str((state.run_get(run.id) or {}).get("pr_url") or "")
+    run.log(f"done: {status} {pr_url or summary}")
+    record.settle(run.id, status, summary=summary, pr_url=pr_url)
+    write_report(state.run_get(run.id) or {"id": run.id, "status": status, "pr_url": pr_url}, flow, run)
 
 
 def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool = False,
@@ -1124,9 +1175,9 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     return 1
             settled = [done for dead_row in state.ticket_runs_marked_running(repo.name, tid)
                        if (done := record.interrupt(dead_row))]
-            earlier = [] if only else state.ticket_runs(repo.name, tid, limit=1, whole=True)
-            restarting = bool(earlier) and earlier[0]["status"] == "interrupted"
-            mending = (script.repairs or repaired_by(script.continues or (earlier[0]["id"] if restarting else ""))
+            earlier = None if only else state.newest_whole_run(repo.name, tid)
+            restarting = bool(earlier) and earlier["status"] == "interrupted"
+            mending = (script.repairs or repaired_by(script.continues or (earlier["id"] if restarting else ""))
                        ) if script else ""
             run_id = record.start("pipeline", tag=f"{repo.name}-{tid}", lock=lock, repo=repo.name, issue=tid,
                                   only_step=only)
@@ -1134,10 +1185,10 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             scratch.RUN_LABELS[run_id] = service_labels
             run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force,
                       feedback=[] if mending else pending_feedback(repo.name, tid), repairs=mending,
-                      answering=earlier[0] if earlier and earlier[0]["status"] == "needs-info" else {},
+                      answering=earlier if earlier and earlier["status"] == "needs-info" else {},
                       **(script.run_fields if script else {}))
             run.dir.mkdir(parents=True, exist_ok=True)
-            if held_from := earlier[0]["id"] if restarting or run.answering else (
+            if held_from := earlier["id"] if restarting or run.answering else (
                     script.continues or script.repairs if script else ""):
                 run.ab_held = state.ab_held(held_from)
                 for role, (ab, side, arm) in run.ab_held.items():
@@ -1155,8 +1206,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         opening_waits(run_id, run.answering,
                       "" if dry_run or run.alone else state.take_passed_over(repo.name, str(tid)))
         if restarting:
-            run.log(f"restarting after run {earlier[0]['id']} was interrupted")
-        flow = (flows.start(cfg, run, earlier[0] if restarting else {}, slot, script.continues, script.only,
+            run.log(f"restarting after run {earlier['id']} was interrupted")
+        flow = (flows.start(cfg, run, earlier if restarting else {}, slot, script.continues, script.only,
                             script.again) if script else None)
         if run.feedback:
             run.log(f"revising {', '.join(run.feedback_prs)} for {util.count(len(run.feedback), 'comment')}")
@@ -1167,10 +1218,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         try:
             if due and not slot.held and not dry_run and not flow.refusal:
                 slot.take(run.log, run.waiting, "answer")
-            parent = (script.repairs or script.continues if script else "") or (
-                earlier[0]["id"] if earlier and earlier[0]["status"] not in ("done", "merged", "rejected") else "")
-            if budget_history and budget_history[0]["status"] not in ("done", "merged", "rejected"):
-                parent = budget_history[0]["id"]
+            parent = parent_run(script, earlier, budget_history)
             previous = "" if reset_budget else parent
             fresh = bool(previous) and force and not restarting and not run.repairs and not run.alone and not (
                 flow and flow.continues)
@@ -1183,16 +1231,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             if flow and flow.only:
                 status, summary, passed = flows.alone(flow)
         except runlimits.Parked as e:
-            reason = str(e)
-            keep_edits(run)
-            held = kept_heads(run)
-            status, summary = "failed", (f"parked: {reason}; branch and evidence retained, workspace left in place"
-                                         f"{', edits kept in a local commit' if held else ''}. {runlimits.RETRY}")
-            kept = run.budget.park(reason, held)
-            record.note(run.id, **kept)
-            pr_url = kept["pr_url"]
-            run.log(summary)
-            run.enter("failed")
+            status, summary, pr_url = park_run(run, str(e))
         except factory.OnlyDone:
             status, summary, passed = flows.alone(flow)
         except factory.Refused as e:
@@ -1214,21 +1253,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 keep_edits(run)
                 workspace.note_made(*run.workspace, workspace_owner(run, *run.workspace))
             slot.free()
-        if restarting and status in ("skipped", "noop") and not run.feedback:
-            run.enter("failed")
-            run.say(f"I did not restart this after the interruption: {summary}. Remove "
-                    f"`{tk.label_name('failed')}` to retry.")
-        if run.feedback and not dry_run and not run.alone:
-            state.settle_feedback(run_id, {"pr": "done", "noop": "recorded"}.get(status, "failed"))
-        if status == "failed":
-            if flow and flow.matching and flow.stepped:
-                flow.route()
-            if not run_lines.ended_in_error(run_id, reply="respond" if flow else ""):
-                run_lines.write(run_id, "error", step=run_lines.last_step(run_id), message=summary)
-        pr_url = pr_url or str((state.run_get(run_id) or {}).get("pr_url") or "")
-        run.log(f"done: {status} {pr_url or summary}")
-        record.settle(run_id, status, summary=summary, pr_url=pr_url)
-        write_report(state.run_get(run_id) or {"id": run_id, "status": status, "pr_url": pr_url}, flow, run)
+        settle_run(run, status, summary, pr_url, restarting, flow)
         if status == "skipped":
             print(f"{name} was not run: {summary}. Pass --force to run it anyway.")
         return 0 if (status in SUCCEEDED if passed is None else passed) else 1
@@ -1248,9 +1273,8 @@ def _fail(run: Run, why: str, builder_said: str = "", detail: str = "") -> tuple
 
 
 def write_report(row: dict, flow: factory.Flow | None = None, run: Run | None = None) -> None:
-    from . import flows
-    facts = run.facts if run else flows.seam_facts(row["id"])
-    fields = report_fields(row, facts)
+    found = run.facts if run else seam_facts(row["id"])
+    fields = report_fields(row, found)
     record.note(row["id"], wait_minutes=json.dumps(fields["wait_minutes"]))
     if flow:
         flow.respond(**fields)
@@ -1358,7 +1382,7 @@ def triage_notes(approval: dict | None) -> str:
     if approval["sent_by"] == "owner":
         return (f"## Sent by its owner after triage\n\nIts owner sent this ticket to the pipeline from arete's triage "
                 f"board at {approval['ts']}, after reading triage's questions and assumptions. Any answers they gave are "
-                f"in their own comment that starts \"{TRIAGE_ANSWERS}\", and an answer wins over what triage assumed. "
+                f"in their own comment that starts \"{prompt_loader.TRIAGE_ANSWERS}\", and an answer wins over what triage assumed. "
                 f"Triage assumed:{assumed}\n\n{assumption_rule}")
     return (f"## Approved by triage, not by a person\n\nArete's triage approved this ticket on its own at "
             f"{approval['ts']}, so its owner has not read it closely. Triage assumed:{assumed}\n\n{assumption_rule}")
@@ -1385,7 +1409,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
     if run.answering:
         run_lines.write(run.id, "answer", asked_in=run.answering["id"], question=run.answering.get("summary") or "",
                     text=answer_text(run.answering["id"]))
-    approval = state.triage_approval(t.ref if repo.tracker == "jira" else tracker.ticket_name(repo.name, t.ref))
+    approval = state.triage_approval(run.triage_key)
     if run.feedback:
         closed = [url for url in run.feedback_prs if gh.pr_view(url).get("state") != "OPEN"]
         if closed:
@@ -1406,8 +1430,8 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
     attachments = images_note(images)
 
     main_layer = checked_layer(cfg, repo.layer_dir)
-    branch = open_branch(run) or fill_template(main_layer.branch, config.RepoLayer.branch, kind=t.kind, id=t.id,
-                                               slug=slug(t.title))
+    branch = open_branch(run) or prompt_loader.fill_template(main_layer.branch, config.RepoLayer.branch, kind=t.kind, id=t.id,
+                                               slug=prompt_loader.slug(t.title))
     if not run.dry_run:
         tk.prepare()
     run.enter("running")
@@ -1433,14 +1457,18 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
     runs_checks = check_calls(check_commands)
     reads = git_reads(checkouts)
     builder_bash = layer.builder_bash + reads + check_rules
-    commands = code_list(layer.builder_bash + reads + check_commands)
+    commands = prompt_loader.code_list(layer.builder_bash + reads + check_commands)
     workspace_text = workspace_note(branch, checkouts)
-    read_rules = bash_rules(config.DEFAULT_ALLOW_BASH + reads)
-    build_rules = bash_rules(builder_bash)
+    read_rules = prompt_loader.bash_rules(config.DEFAULT_ALLOW_BASH + reads)
+    build_rules = prompt_loader.bash_rules(builder_bash)
     deny = diffguard.denied_paths(layer)
     limit = layer.max_diff_lines
     info = tk.label_name("needs-info")
     replies: list[dict] = []
+
+    brief = prompt_loader.Brief(repo.name, workspace_text, t.ref, t.title, t.body,
+                                comments=t.comments, attachments=attachments, expertise=expertise,
+                                commands=commands, max_lines=limit)
 
     if run.feedback:
         feedback = feedback_markdown(run.feedback)
@@ -1450,10 +1478,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
                 + feedback)
         estimate = 0
         run.story.append(f"The owner reviewed the PR and left this feedback:\n\n{feedback}")
-        res = run.agent("revise", prompt("revise", repo=repo.name, workspace=workspace_text, ref=t.ref, title=t.title,
-                                         body=t.body, comments=t.comments, attachments=attachments,
-                                         feedback=feedback, expertise=expertise, checks=runs_checks,
-                                         commands=commands, max_lines=limit),
+        res = run.agent("revise", brief.prompt("revise", feedback=feedback, checks=runs_checks),
                         ws, role="build", allowed_tools=build_rules, disallowed_tools=routing.NO_GIT_WRITES,
                         json_schema=REVISE_SCHEMA)
         if not res.ok or not isinstance(res.structured, dict):
@@ -1464,10 +1489,8 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
         if stage(checkouts, deny).empty:
             return answer_without_changes(run, ws, checkouts, branch, build_summary, replies)
     else:
-        res = run.agent("plan", prompt("plan", repo=repo.name, workspace=workspace_text, ref=t.ref, title=t.title,
-                                        body=t.body, comments=t.comments, attachments=attachments,
-                                        triage=triage_notes(approval), expertise=expertise, commands=commands,
-                                        denied=code_list(deny), max_lines=limit, checks=checks),
+        res = run.agent("plan", brief.prompt(
+            "plan", triage=triage_notes(approval), denied=prompt_loader.code_list(deny), checks=checks),
                         ws, role="plan", allowed_tools=read_rules, json_schema=PLAN_SCHEMA)
         if not res.ok or not isinstance(res.structured, dict):
             return _fail(run, "planning step failed")
@@ -1490,10 +1513,8 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
                         f"plan estimates {estimate} lines, over the {limit} line limit; split proposed")
         run.facts.update(assumptions=assumptions_of(plan), left_for_a_person=left_for_a_person)
 
-        res = run.agent("build", prompt("build", repo=repo.name, workspace=workspace_text, ref=t.ref, title=t.title,
-                                         body=t.body, comments=t.comments, attachments=attachments, plan=plan_text,
-                                         expertise=expertise, checks=runs_checks, commands=commands, max_lines=limit,
-                                         estimate=estimate, verify=goal),
+        res = run.agent("build", brief.prompt(
+            "build", plan=plan_text, checks=runs_checks, estimate=estimate, verify=goal),
                         ws, role="build", allowed_tools=build_rules, disallowed_tools=routing.NO_GIT_WRITES)
         if not res.ok:
             return _fail(run, "build step failed", res.text)
@@ -1512,14 +1533,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
               left_for_a_person=left_for_a_person, check_commands=runs_checks,
               plan_text=plan_text, build_summary=build_summary)
 
-    attempts, tries = 1, run.settings("check_repair").tries
-    ok = b.check()
-    while not ok and attempts < tries:
-        run.story.append(f"Checks failed on attempt {attempts}:\n{util.tail(b.report, 2500)}")
-        attempts += 1
-        b.resume(f"fix{attempts}", prompt("fix", attempt=attempts, max_attempts=tries, failures=b.report,
-                                          checks=runs_checks), role="check_repair")
-        ok = b.check()
+    ok, attempts = b.check_with_repairs(lambda n: f"fix{n}")
     run.save("checks.md", b.report)
     record.note(run.id, attempts=attempts)
     if not ok:
@@ -1537,7 +1551,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
         if problems := review.findings():
             run.story.append(f"Review requested changes:\n{problems}")
             reply = b.resume(round_name("review_fix", n),
-                             prompt("review_fix", problems=problems, notes=review.fix_notes()),
+                             prompt_loader.prompt("review_fix", problems=problems, notes=review.fix_notes()),
                              role="review_repair").text
             b.recheck("the review fixes")
             verified = verify_in_use(b, goal, build_summary)
@@ -1549,7 +1563,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
     run.facts["held"] = draft_why
     _learn(run, ws, layer.expertise_file, t.title, apply=True)
     staged = b.restage()
-    size = f"{len(staged.files)} files, {staged.lines} lines"
+    size = change_size(staged)
     outcome = f"{size}, review {review.verdict}, in use {verified.verdict}"
     written = document.pr_text(run, t, summary_of(review, build_summary), review, verified, size, draft_why, cfg, layer)
 
@@ -1562,7 +1576,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
         run.log(f"dry run: {outcome}; worktree kept at {ws}")
         return "dry-run", outcome, ""
 
-    subject = fill_template(layer.subject, config.RepoLayer.subject, kind=t.kind, id=t.id, title=t.title)
+    subject = prompt_loader.fill_template(layer.subject, config.RepoLayer.subject, kind=t.kind, id=t.id, title=t.title)
     pr_report = report_body(run, summary=build_summary, review=review, verified=verified, left=left_for_a_person,
                             images=evidence_images(run, staged.changed[0], verified), approval=approval,
                             attempts=attempts, checks=checks, plan_text=plan_text, size=size,
@@ -1584,45 +1598,27 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
     pushed = [c for c in staged.changed if c not in opened]
     with_prs = [c for c in checkouts if c.pr]
     note_prs(run, branch, with_prs)
-    ci_stopped: list[workspace.Checkout] = []
-    for c in with_prs:
-        others = sibling_section(t.ref, c, with_prs)
-        if c in opened:
-            if others:
-                gh.pr_edit_body(c.pr, f"{pr_report}{others}", link=link)
-            continue
-        body = gh.pr_body(c.pr)
-        if c in pushed and ci.stopped(body):
-            ci_stopped.append(c)
-        kept, text = synced_pr_body(run, c.pr, body, t, left_for_a_person)
-        if opened:
-            text = with_siblings(text, others)
-        if gh.outgoing(text, kept) != body:
-            gh.pr_edit_body(c.pr, text, link=kept)
-        if c in pushed and c.pr not in run.feedback_prs:
-            gh.pr_comment(c.pr, f"Pushed more work for {t.ref}.\n\n{pr_report}")
+    ci_stopped = sync_pr_bodies(run, t, with_prs, opened, pushed, pushed, pr_report, left_for_a_person, link)
     drafted = hold_pushed(run, pushed, ci_stopped, draft_why)
     try:
         ci_result = watch_ci(b, slot, branch, staged.changed, with_prs, draft_why)
     except workspace.RunFailed as e:
         if run.feedback:
             raise
-        prs = "\n".join(f"- [{c.pr_name}]({c.pr})" for c in with_prs)
+        prs = pr_link_list(with_prs)
         status, why, _ = _fail(run, e.why, detail=f"{e.detail}\n\n### PRs\n\n{prs}\n\nReview comments on a PR "
                                                   "start a revision, as on any arete PR.")
         return status, why, record_prs(run, branch, with_prs)
     outcome += f", CI: {ci_result}"
     run.enter("pr")
-    pr_lines = "\n".join(f"- {'Opened' if c in opened else 'Pushed to' if c in pushed else 'Unchanged'} [{c.pr_name}]({c.pr})"
-                         for c in with_prs)
     if run.feedback:
         answer_feedback(run, replies, "Done in the latest push.")
         run.say(f"Revised for your review.\n\n{pr_report}\n\nCI: {ci_result}.")
     else:
-        run.say(f"PRs for this ticket:\n\n{pr_lines}\n\nCI: {ci_result}."
+        run.say(f"PRs for this ticket:\n\n{pr_status_lines(with_prs, opened, pushed)}\n\nCI: {ci_result}."
                 + published_note(draft_why, verified, opened, drafted))
     automerge(cfg, run, layer, approval, draft_why, opened + ready_pushed(run, pushed, ci_stopped, draft_why),
-              f"{t.title}\n\n{build_summary.strip()[:3000]}")
+              automerge_about(t, build_summary))
     urls = record_prs(run, branch, with_prs)
     release_workspace(run, ws, checkouts)
     return "pr", outcome, urls
@@ -1642,6 +1638,27 @@ def furnish(cfg: config.Config, run: Run, layer: config.RepoLayer, ws: Path) -> 
             run.save("setup.log", res.stdout + res.stderr)
             return f"setup command `{cmd}` failed"
     return ""
+
+
+def pr_link_list(with_prs) -> str:
+    return "\n".join(f"- [{c.pr_name}]({c.pr})" for c in with_prs)
+
+
+def pr_status_lines(with_prs, opened, pushed) -> str:
+    return "\n".join(f"- {'Opened' if c in opened else 'Pushed to' if c in pushed else 'Unchanged'} [{c.pr_name}]({c.pr})"
+                     for c in with_prs)
+
+
+def cut_summary(text: str) -> str:
+    return text.strip()[:SUMMARY_CHARS]
+
+
+def automerge_about(t: tracker.Ticket, build_summary: str) -> str:
+    return f"{t.title}\n\n{cut_summary(build_summary)}"
+
+
+def change_size(staged: Staged) -> str:
+    return f"{len(staged.files)} files, {staged.lines} lines"
 
 
 def summary_of(review: Review, build_summary: str) -> str:
@@ -1713,19 +1730,15 @@ def nothing_to_build(run: Run, t: tracker.Ticket, ws: Path, checkouts: list[work
     if run.dry_run:
         release_workspace(run, ws, checkouts)
         return "dry-run", f"nothing to build: {why}", ""
-    said = summary.strip()[:3000] + (f"\n\n{LEFT_HEADING}\n\n{left}" if left else "")
+    said = cut_summary(summary) + (f"\n\n{LEFT_HEADING}\n\n{left}" if left else "")
     if not with_prs:
         return _ask(run, ws, checkouts,
                     f"I made no change, since {why}.\n\n{said}\n\nClose this if it is done. If it is not, say here "
                     f"what is missing, then remove the `{run.tracker.label_name('needs-info')}` label and I will "
                     "pick it up.", f"nothing to build: {why}")
-    for c in with_prs:
-        body = gh.pr_body(c.pr)
-        kept, text = synced_pr_body(run, c.pr, body, t, left)
-        if gh.outgoing(text, kept) != body:
-            gh.pr_edit_body(c.pr, text, link=kept)
+    sync_pr_bodies(run, t, with_prs, [], [], [], "", left, "")
     run.enter("pr")
-    prs = "\n".join(f"- [{c.pr_name}]({c.pr})" for c in with_prs)
+    prs = pr_link_list(with_prs)
     run.say(f"Nothing more to build, since the open PRs already cover this:\n\n{prs}\n\n{said}")
     urls = record_prs(run, branch, with_prs)
     release_workspace(run, ws, checkouts)
@@ -1741,6 +1754,32 @@ def synced_pr_body(run: Run, pr: str, body: str, t: tracker.Ticket, left: str) -
     if left_synced != text:
         run.log(f"{pr}: {'wrote' if left else 'removed'} the {LEFT_TITLE} section")
     return (wanted if had else ""), public_text(run, left_synced)
+
+
+def sync_pr_bodies(run, t, with_prs, opened, standing, pushed, report, left, link, stops=None, committed=True):
+    stops = stops or {}
+    ci_stopped = []
+    for c in with_prs:
+        others = sibling_section(t.ref, c, with_prs)
+        if c in opened:
+            if others:
+                text = f"{report}{others}"
+                stop = stops.get(c.github, "")
+                gh.pr_edit_body(c.pr, ci.with_section(text, stop) if stop else text, link=link)
+            continue
+        body = gh.pr_body(c.pr)
+        if c in standing and ci.stopped(body):
+            ci_stopped.append(c)
+        kept, text = synced_pr_body(run, c.pr, body, t, left)
+        if opened:
+            text = with_siblings(text, others)
+        if gh.outgoing(text, kept) != body:
+            gh.pr_edit_body(c.pr, text, link=kept)
+        if c in pushed and c.pr not in run.feedback_prs:
+            gh.pr_comment(c.pr, f"Pushed more work for {t.ref}.\n\n{report}")
+        elif not committed and c in standing and c.pr not in run.feedback_prs:
+            gh.pr_comment(c.pr, f"Verified and reviewed {t.ref} again; nothing new was pushed.\n\n{report}")
+    return ci_stopped
 
 
 def left_section(run: Run, text: str) -> str:
@@ -1977,7 +2016,7 @@ def push_ci_fix(b: Build, branch: str, caused: list[ci.Red], names: str, n: int)
     if no_pr := [c.github for c in staged.changed if not c.pr]:
         raise workspace.RunFailed(f"the CI fix step changed {', '.join(no_pr)}, where this run has no PR, so arete pushed nothing",
                         ci.red_list(caused))
-    if not b.check_with_repairs():
+    if not b.check_with_repairs()[0]:
         report = f"checks-ci-round{n}.md"
         b.run.save(report, b.report)
         raise workspace.RunFailed("the checks failed after the CI fix",
@@ -2186,18 +2225,18 @@ def resolve_conflicts(run: AgentRun, c: workspace.Checkout, conflicts: list[str]
         untracked_before = workspace.untracked_files(c.wt)
         ignored_before = ignored_state(c.wt)
         previous = run.sessions.get("build")
-        text = prompt("resolve", repo=run.repo.name, github=c.github, base=named,
+        text = prompt_loader.prompt("resolve", repo=run.repo.name, github=c.github, base=named,
                       base_commit=commit[:12], head=git(["rev-parse", "HEAD"], c.wt).strip()[:12],
                       ref=ticket.ref, title=ticket.title, body=ticket.body,
                       conflicts="\n".join(f"- `{p}`" for p in conflicts),
                       own="\n".join(f"- `{p}`" for p in sorted(own)) or "- none",
                       branch_log=git(["log", "--oneline", "-n30", "MERGE_HEAD..HEAD"], c.wt),
                       base_log=git(["log", "--oneline", "-n30", "HEAD..MERGE_HEAD"], c.wt),
-                      commands=code_list(layer.builder_bash), attempt=n, tries=tries, feedback=feedback,
+                      commands=prompt_loader.code_list(layer.builder_bash), attempt=n, tries=tries, feedback=feedback,
                       owner=run.owner_note)
         try:
             res = run.agent(round_name("resolve", n), text, c.wt, role="build",
-                            allowed_tools=bash_rules(layer.builder_bash), disallowed_tools=routing.NO_GIT_WRITES,
+                            allowed_tools=prompt_loader.bash_rules(layer.builder_bash), disallowed_tools=routing.NO_GIT_WRITES,
                             json_schema=RESOLVE_SCHEMA, resume=NO_SESSION, extra_env=dict(RESOLVER_SETS))
         finally:
             if previous is None:
@@ -2273,12 +2312,12 @@ def judge_ci(b: Build, reds: list[ci.Red], n: int, max_rounds: int, watched: lis
             r.reason = "Arete could not merge the moved base before judging this check."
         raise workspace.RunFailed(e.why, ci.red_list(reds))
     logs = run_folder(run, "ci")
-    failures = "\n\n".join(ci.failure_note(r, logs / f"round{n}-{i}-{slug(r.label)}.log")
+    failures = "\n\n".join(ci.failure_note(r, logs / f"round{n}-{i}-{prompt_loader.slug(r.label)}.log")
                            for i, r in enumerate(reds, 1))
     diff = ", ".join(f"`{c.diff_from_base}`" for c in b.checkouts)
     left = NOT_CAUSED_LEFT_FOR_A_PERSON + b.left_for_a_person if b.left_for_a_person else ""
     name = b.next_step("ci_fix")
-    text = prompt("ci_fix", round=n, max_rounds=max_rounds, failures=failures, diff=diff, checks=b.check_commands,
+    text = prompt_loader.prompt("ci_fix", round=n, max_rounds=max_rounds, failures=failures, diff=diff, checks=b.check_commands,
                   merged_base=merged_base, left_for_a_person=left)
     res = fix(name, text, failures) if fix else b.resume(name, text, role="ci_repair", json_schema=CI_FIX_SCHEMA)
     if not res.ok or not isinstance(res.structured, dict):
@@ -2306,7 +2345,7 @@ def discard_edits(b: Build) -> None:
 
 def ci_fix_message(b: Build, caused: list[ci.Red]) -> str:
     names = ", ".join(dict.fromkeys(r.check.name for r in caused))
-    subject = fill_template(b.layer.subject, config.RepoLayer.subject, kind="fix", id=b.ticket.id,
+    subject = prompt_loader.fill_template(b.layer.subject, config.RepoLayer.subject, kind="fix", id=b.ticket.id,
                             title=f"make {names} pass in CI")
     return f"{tracker.with_ref(subject, b.ticket.ref)}\n\nArete-Run: {b.run.id}"
 
@@ -2397,7 +2436,7 @@ def answer_without_changes(run: Run, ws: Path, checkouts: list[workspace.Checkou
         return "dry-run", "no code changes for the review", ""
     run.log("revise: no code changes, answering the review")
     answer_feedback(run, replies, "No code change for this one; see the overall reply.")
-    run.say(f"No code changes for your review.\n\n{summary.strip()[:3000]}")
+    run.say(f"No code changes for your review.\n\n{cut_summary(summary)}")
     run.enter("pr")
     urls = record_prs(run, branch, [c for c in checkouts if c.pr])
     release_workspace(run, ws, checkouts)
@@ -2406,16 +2445,13 @@ def answer_without_changes(run: Run, ws: Path, checkouts: list[workspace.Checkou
 
 def _review(b: Build, plan: str, verified: verify.Verified, step: str = "review", before: Review | None = None,
             reply: str = "") -> Review:
-    t, before = b.ticket, before or Review.stored({})
+    before = before or Review.stored({})
     earlier = before.blocking()
-    res = b.run.agent(step, prompt("review", repo=b.run.repo.name, workspace=b.workspace, ref=t.ref, title=t.title,
-                                   body=t.body, comments=t.comments, attachments=b.attachments, plan=plan,
-                                   checks=b.report, evidence=verified.markdown(),
-                                   compare=compare_with_fork(b.checkouts),
-                                   diff=util.tail(diffguard.fold_moved(b.staged.patch), MAX_DIFF_IN_PROMPT),
-                                   earlier=earlier_review(earlier, reply,
-                                                          fixed_since(b, before.trees or {}))),
-                      b.ws, role="review", allowed_tools=bash_rules(b.read_bash),
+    res = b.run.agent(step, b.brief.prompt(
+        "review", plan=plan, checks=b.report, evidence=verified.markdown(), compare=compare_with_fork(b.checkouts),
+        diff=util.tail(diffguard.fold_moved(b.staged.patch), MAX_DIFF_IN_PROMPT),
+        earlier=earlier_review(earlier, reply, fixed_since(b, before.trees or {}))),
+                      b.ws, role="review", allowed_tools=prompt_loader.bash_rules(b.read_bash),
                       json_schema=REVIEW_SCHEMA)
     if not res.ok or not isinstance(res.structured, dict) or not isinstance(res.structured.get("problems"), list):
         return Review.failed_step(earlier, before.waived or [], before.trees or {})
@@ -2425,7 +2461,7 @@ def _review(b: Build, plan: str, verified: verify.Verified, step: str = "review"
 def earlier_review(earlier: list[dict], reply: str, fixed: str) -> str:
     if not earlier:
         return ""
-    return prompt("review_earlier", blockers=numbered(earlier), reply=util.tail(reply.strip(), MAX_FIX_REPLY_IN_PROMPT) or NO_FIX_REPLY,
+    return prompt_loader.prompt("review_earlier", blockers=numbered(earlier), reply=util.tail(reply.strip(), MAX_FIX_REPLY_IN_PROMPT) or NO_FIX_REPLY,
                   fixed=fixed or NO_FIX_DIFF)
 
 
@@ -2471,7 +2507,7 @@ def verify_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
 
 @runlimits.verification
 def repair_in_use(b: Build, attempt: int, tries: int, verified: verify.Verified) -> None:
-    b.resume(b.next_step("verify_fix"), prompt("verify_fix", attempt=attempt, max_attempts=tries,
+    b.resume(b.next_step("verify_fix"), prompt_loader.prompt("verify_fix", attempt=attempt, max_attempts=tries,
                                                failures=verified.markdown(), checks=b.check_commands),
              role="check_repair")
 
@@ -2484,7 +2520,7 @@ def check_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
 
 def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "verify",
                 require_released: bool = False, **values) -> verify.Verified:
-    run, v, t = b.run, verify.with_free_ports(b.layer.verify), b.ticket
+    run, v = b.run, verify.with_free_ports(b.layer.verify)
     step = b.next_step(step_name)
     if refusal := verify.port_refusal(v):
         run.log(f"{step}: {refusal}")
@@ -2523,14 +2559,12 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
             if url:
                 run.log(f"{step}: the app answers at {url}")
             agent_started = True
-            res = run.agent(step, prompt(prompt_name, repo=run.repo.name, workspace=b.workspace, ref=t.ref,
-                                         title=t.title, body=t.body, comments=t.comments, attachments=b.attachments,
-                                         surface=surface_note(v, url, evidence), notes=v.notes,
-                                         scratch=scratch.note(attempt),
-                                         commands=code_list(bash), checks=check_list(b.layer),
-                                         compare=compare_with_fork(b.checkouts), owner=run.owner_note, **values),
+            res = run.agent(step, b.brief.prompt(
+                prompt_name, surface=surface_note(v, url, evidence), notes=v.notes, scratch=scratch.note(attempt),
+                commands=prompt_loader.code_list(bash), checks=check_list(b.layer),
+                compare=compare_with_fork(b.checkouts), owner=run.owner_note, **values),
                             b.ws, role=role,
-                            allowed_tools=bash_rules(bash) + ([f"mcp__playwright__{t}" for t in verify.PLAYWRIGHT_TOOLS] if url else []),
+                            allowed_tools=prompt_loader.bash_rules(bash) + ([f"mcp__playwright__{t}" for t in verify.PLAYWRIGHT_TOOLS] if url else []),
                             disallowed_tools=routing.NO_GIT_WRITES, json_schema=verify.SCHEMA,
                             mcp_config=browser.mcp_config(evidence) if url else "",
                             scratch=attempt)
@@ -2664,7 +2698,7 @@ def check_list(layer: config.RepoLayer) -> str:
 
 
 def check_calls(commands: list[str]) -> str:
-    return code_list(commands) or NO_CHECKS
+    return prompt_loader.code_list(commands) or NO_CHECKS
 
 
 def check_script(folder: Path, layer: config.RepoLayer, cwd: Path) -> tuple[list[str], list[str]]:
@@ -2707,7 +2741,7 @@ def expertise_now(expertise_file: Path) -> str:
 
 
 def learned(run: AgentRun, wt: Path, title: str, expertise: str, call: str, **kw) -> Learned | None:
-    res = run.agent(call, prompt("learn", repo=run.repo.name, ref=run.ref, title=title,
+    res = run.agent(call, prompt_loader.prompt("learn", repo=run.repo.name, ref=run.ref, title=title,
                                   story="\n\n".join(run.story), expertise=expertise or "(none yet)",
                                   max_lines=EXPERTISE_MAX_LINES),
                     wt, role="learn", json_schema=LEARN_SCHEMA, persist=False, **kw)
@@ -2943,10 +2977,10 @@ def run_skipped(name: str) -> dict:
 
 
 def answered_run(repo_name: str, tid: str) -> dict | None:
-    newest = state.ticket_runs(repo_name, tid, limit=1, whole=True)
-    if (newest and newest[0]["status"] == "needs-info" and state.asks_due([newest[0]["id"]])
-            and not state.asks_of(newest[0]["id"], "open")):
-        return newest[0]
+    newest = state.newest_whole_run(repo_name, tid)
+    if (newest and newest["status"] == "needs-info" and state.asks_due([newest["id"]])
+            and not state.asks_of(newest["id"], "open")):
+        return newest
     return None
 
 

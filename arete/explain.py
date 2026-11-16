@@ -5,7 +5,7 @@ import secrets
 import tempfile
 import textwrap
 
-from . import config, delivery, pipeline, runner, state
+from . import config, delivery, prompt_loader, runner, state
 
 SCHEMA = {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]}
 MOST_SENTENCES = 2
@@ -28,7 +28,7 @@ def write_plain_summary(approval: dict, cfg: config.Config) -> str:
 
 def plain_summary(approval: dict, cfg: config.Config) -> str:
     item = approval["emit"]["item"]
-    text = pipeline.prompt("explain", loop=approval["loop"], repo=delivery.repo_of(approval) or "none",
+    text = prompt_loader.prompt("explain", loop=approval["loop"], repo=delivery.repo_of(approval) or "none",
                            mark=secrets.token_hex(8), action=approval["summary"],
                            briefing=delivery.emit_of(approval).briefing(item)[:BRIEFING_SHOWN])
     with tempfile.TemporaryDirectory() as cwd:

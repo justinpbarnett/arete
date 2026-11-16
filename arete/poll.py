@@ -39,7 +39,7 @@ from .workspace import cleanup_worktrees
 MAX_STARTS_PER_POLL = 64
 
 
-def sources(repo: config.Repo, tk: tracker.Tracker) -> list[tracker.Tracker]:
+def ticket_queues(repo: config.Repo, tk: tracker.Tracker) -> list[tracker.Tracker]:
     if isinstance(tk, tracker.LocalTracker):
         return [tk]
     return [*([tk] if repo.parts or isinstance(tk, tracker.JiraTracker) else []), tracker.LocalTracker(repo)]
@@ -47,7 +47,7 @@ def sources(repo: config.Repo, tk: tracker.Tracker) -> list[tracker.Tracker]:
 
 def next_ticket(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
                 other_routes: set[str] = frozenset(), excluded: set[str] = frozenset()) -> tracker.Ticket | None:
-    for source in sources(repo, tk):
+    for source in ticket_queues(repo, tk):
         for t in source.todo():
             if str(t.id) in excluded or other_routes & set(t.labels) or state.issue_running(repo.name, t.id):
                 continue
@@ -79,7 +79,7 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
     for tid in state.feedback_due(repo.name, util.iso(util.now() - timedelta(minutes=pipeline.FEEDBACK_QUIET_MINUTES))):
         if str(tid) not in excluded and not state.issue_running(repo.name, tid):
             return tid, "revising the PR for your review comments"
-    for source in sources(repo, tk):
+    for source in ticket_queues(repo, tk):
         for t in source.replied():
             if str(t.id) in excluded or state.issue_running(repo.name, t.id):
                 continue
@@ -93,14 +93,14 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
     return (fresh.id, fresh.title) if fresh else None
 
 
-def route_blocker(cfg: config.Config, repo: config.Repo, ticket: tracker.Ticket,
+def step_without_route(cfg: config.Config, repo: config.Repo, ticket: tracker.Ticket,
                   discovery: routing.Discovery, layer: config.RepoLayer) -> str:
     if cfg.replay.all:
         return ""
     first = ("plan", "build")
-    newest = state.ticket_runs(repo.name, ticket.id, limit=1, whole=True)
-    if (layer.factory_path == "adw" and newest and newest[0]["status"] == "interrupted"
-            and repaired_by(newest[0]["id"])):
+    newest = state.newest_whole_run(repo.name, ticket.id)
+    if (layer.factory_path == pipeline.ADW and newest and newest["status"] == "interrupted"
+            and repaired_by(newest["id"])):
         first = ("review_repair",)
     elif pending_feedback(repo.name, ticket.id):
         first = ("build",)
@@ -116,10 +116,10 @@ def route_blocker(cfg: config.Config, repo: config.Repo, ticket: tracker.Ticket,
 
 
 def tracker_reply(repo: config.Repo, tk: tracker.Tracker, tid: str, dry_run: bool) -> str:
-    newest = state.ticket_runs(repo.name, str(tid), limit=1, whole=True)
-    if not newest or newest[0]["status"] != "needs-info":
+    newest = state.newest_whole_run(repo.name, str(tid))
+    if not newest or newest["status"] != "needs-info":
         return ""
-    waiting = state.asks_of(newest[0]["id"], "open")
+    waiting = state.asks_of(newest["id"], "open")
     if not waiting:
         return ""
     if any(owner_asks.has_secret(a["questions"]) for a in waiting):
@@ -127,7 +127,7 @@ def tracker_reply(repo: config.Repo, tk: tracker.Tracker, tid: str, dry_run: boo
     text = tk.reply_since(tid, waiting[0]["asked"])
     if text and not dry_run:
         with util.lock(owner_asks.STEER_LOCK, wait=True):
-            for a in state.asks_of(newest[0]["id"], "open"):
+            for a in state.asks_of(newest["id"], "open"):
                 state.ask_close(a["id"], "answered", owner_asks.text_answers(a, text))
     return ""
 
@@ -198,7 +198,7 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: tuple[str, str], skip
         return "held"
     blocked, _ = runlimits.admission(repo, str(tid), source, runlimits.Policy.of(layer), False)
     ticket = source.get(tid)
-    blocked = (blocked or source.blocker(tid) or route_blocker(cfg, repo, ticket, queue.discovery, layer)
+    blocked = (blocked or source.blocker(tid) or step_without_route(cfg, repo, ticket, queue.discovery, layer)
                or reply)
     if blocked:
         skips.note(name, ticket, blocked, repo.name)

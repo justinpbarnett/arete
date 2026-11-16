@@ -7,7 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import config, gh, paths, record, state, tracker, util, verify, workspace
+from . import config, gh, paths, prompt_loader, record, state, tracker, util, verify, workspace
 from .agent import READ_TOOLS
 from .evals import (
     EVALS,
@@ -23,11 +23,7 @@ from .evals import (
 )
 from .pipeline import (
     MAX_DIFF_IN_PROMPT,
-    bash_rules,
-    code_list,
     commit_layer,
-    prompt,
-    slug,
 )
 from .util import git
 
@@ -61,7 +57,7 @@ class Candidate:
 
     @property
     def job(self) -> str:
-        return f"{slug(self.name)}-pr-{gh.pr_number(self.pr_url)}"
+        return f"{prompt_loader.slug(self.name)}-pr-{gh.pr_number(self.pr_url)}"
 
 
 @dataclass
@@ -168,11 +164,11 @@ def surface(v: config.Verify) -> str:
 def write(cfg: config.Config, run: EvalRun, c: Candidate, ticket: tracker.Ticket, wt: Path, base: str,
           merge: str) -> Draft | Outcome:
     v = c.layer.verify
-    res = run.agent("write", prompt("eval_mine", repo=c.repo.name, ref=ticket.ref, title=ticket.title,
+    res = run.agent("write", prompt_loader.prompt("eval_mine", repo=c.repo.name, ref=ticket.ref, title=ticket.title,
                                      body=ticket.body, comments=ticket.comments, pr_body=gh.pr_body(c.pr_url),
                                      diff=util.tail(git(["diff", base, merge], c.repo.path), MAX_DIFF_IN_PROMPT),
-                                     surface=surface(v), commands=code_list(config.DEFAULT_ALLOW_BASH + v.bash)),
-                    wt, model=cfg.model("eval_mine"), allowed_tools=READ_TOOLS + bash_rules(config.DEFAULT_ALLOW_BASH),
+                                     surface=surface(v), commands=prompt_loader.code_list(config.DEFAULT_ALLOW_BASH + v.bash)),
+                    wt, model=cfg.model("eval_mine"), allowed_tools=READ_TOOLS + prompt_loader.bash_rules(config.DEFAULT_ALLOW_BASH),
                     json_schema=WRITER_SCHEMA, timeout=c.layer.timeout_minutes * 60, persist=False)
     if not res.ok or not isinstance(res.structured, dict):
         raise RuntimeError(f"the writer did not finish: {util.first_line(res.error or 'no task came back', 200)}")
@@ -189,7 +185,7 @@ def write(cfg: config.Config, run: EvalRun, c: Candidate, ticket: tracker.Ticket
 
 def graded_on(cfg: config.Config, parent: EvalRun, where: str, layer: config.RepoLayer, wt: Path,
               draft: Draft) -> verify.Verified:
-    run = EvalRun(id=parent.id, repo=parent.repo, dir=parent.dir / slug(where), task=parent.task)
+    run = EvalRun(id=parent.id, repo=parent.repo, dir=parent.dir / prompt_loader.slug(where), task=parent.task)
     run.dir.mkdir(parents=True, exist_ok=True)
     graded = grade(cfg, run, layer, wt, draft.title, draft.prompt, draft.verify, layer.timeout_minutes * 60)
     if not graded.finished:
@@ -259,7 +255,7 @@ def read_back(src: DirSource, under: str, name: str, draft: Draft) -> None:
 
 def save(run: EvalRun, c: Candidate, ticket: tracker.Ticket, draft: Draft, on_merge: verify.Verified,
          on_base: verify.Verified) -> str:
-    wanted = slug(f"{ticket.ref} {draft.title}")
+    wanted = prompt_loader.slug(f"{ticket.ref} {draft.title}")
     summary = (f"An eval task mined from {c.pr_url} ({c.name}). The grader passed its steps on the merge commit and "
                f"failed them on the base `{draft.base[:10]}`.")
     if c.repo.layer:

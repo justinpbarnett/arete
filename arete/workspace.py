@@ -16,7 +16,7 @@ from .util import git
 SALT_KEY = "\0salt"
 OWNER_KEY = "\0owner"
 RETAINED_KEY = "\0retained"
-SWEPT = ("merged", "rejected", "done")
+ENDED = ("merged", "rejected", "done")
 WAITING = ("running", "pr", "needs-info")
 HELD_FILE = paths.STATE_DIR / "held-workspaces.json"
 
@@ -580,12 +580,12 @@ def sweep_owned(d: Path, owner: dict, cfg: config.Config) -> dict | None:
         return None
     checkouts = [Checkout(c["dir"], c["github"], Path(c["src"]), Path(c["wt"]), "") for c in owner["checkouts"]]
     row = ((state.run_get(owner["run"]) if owner.get("run") else None)
-           or next(iter(state.ticket_runs(repo, tid, limit=1, whole=True)), None))
+           or state.newest_whole_run(repo, tid))
     status = (row or {}).get("status") or ""
     run_id = (row or {}).get("id") or owner.get("run") or ""
-    closed = (status not in SWEPT and status not in WAITING and tracker.is_task_id(tid)
+    closed = (status not in ENDED and status not in WAITING and tracker.is_task_id(tid)
               and ticket_closed(cfg, repo, tid, status))
-    if status not in SWEPT and not closed:
+    if status not in ENDED and not closed:
         return held_entry(d, owner, row, False,
                           f"run {run_id} ended {status or 'unknown'}, so the workspace waits for the ticket")
     made = made_before(d)
@@ -601,7 +601,7 @@ def sweep_owned(d: Path, owner: dict, cfg: config.Config) -> dict | None:
         except (OSError, RuntimeError) as e:
             return held_entry(d, owner, row, True, util.first_line(str(e), 300), blocked_by(d, checkouts, edits=True))
     print(f"{util.iso()} removed the workspace {d}: "
-          + (f"run {run_id} is {status}" if status in SWEPT else f"task {tid} is closed"))
+          + (f"run {run_id} is {status}" if status in ENDED else f"task {tid} is closed"))
     return None
 
 

@@ -793,7 +793,7 @@ class QueueTests(Isolated):
         for i in range(5):
             state.task_add(self.repo.name, str(i), str(i), "feat")
         started = []
-        with patch.object(poll, "route_blocker", return_value="verify is held"), \
+        with patch.object(poll, "step_without_route", return_value="verify is held"), \
                 patch.object(poll, "MAX_STARTS_PER_POLL", 3):
             self.assertEqual(self.poll_with(self.cfg, lambda *args: started.append(args)), 0)
         self.assertEqual(started, [])
@@ -1029,7 +1029,11 @@ class KeptEditsTests(Isolated):
         fakes = {"prepare": lambda flow, tree: factory.Outcome("pass"),
                  "plan": lambda flow: made.append("plan") or factory.Outcome("pass")}
         with patch.dict(factory.STEPS, fakes):
-            flow = factory.Flow("later", continues=earlier, renew="prepare", keeps=lambda name, kw: name == "plan")
+            ctx = SimpleNamespace(labels=lambda name, kw: {}, hold=lambda name: "",
+                                  merge_moved_base=lambda name: None,
+                                  restore=lambda line: "a step can run alone only on a run whose folder is kept",
+                                  keeps=lambda name, kw: name == "plan")
+            flow = factory.Flow("later", ctx, continues=earlier, renew="prepare")
             flow.step("prepare", tree=str(container))
             carried = flow.step("plan")
         self.assertTrue(carried.passed)
