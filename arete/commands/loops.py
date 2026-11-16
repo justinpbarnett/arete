@@ -6,6 +6,7 @@ import json
 import sys
 
 from .. import config, paths
+from ..store import loops as loop_store
 from ..store import runs as run_store
 from .common import Parser, follow, loop_line, print_feed_line, print_table, serve_line, when
 
@@ -54,13 +55,13 @@ def cmd_serve(args) -> int:
 
 @loop_errors
 def loop_requeue(args) -> int:
-    from .. import control, state
+    from .. import control
 
     try:
         item_id = int(args.id)
     except ValueError:
         raise control.Refused("arete loop requeue needs a numeric queue ID") from None
-    state.requeue_item(item_id)
+    loop_store.requeue_item(item_id)
     print(f"queue item {item_id} is pending again")
     return 0
 

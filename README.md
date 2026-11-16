@@ -249,7 +249,7 @@ A repeat of an open incident's fingerprint, minutes or hours later, updates it i
 A failing row of a run carries the repo of its run, and rows from different repos never share an incident; a run with no row in state has no known repo.
 The same line from two files never shares an incident when the `[[oncall.source]]` entries matching each file give them different sets of `vision` and `scope`; an open incident is updated only by lines read under the set it was opened under, and only while its own file is still under that set, or, once that file is gone, while the config holds no other set.
 The append-only `incident_notes` table records what happened and when.
-Evidence is scrubbed of secrets and home paths before it is stored, and `state.prune` trims both tables.
+Evidence is scrubbed of secrets and home paths before it is stored, and `store.prune` trims both tables.
 
 **Decisions.** After each scan, JEV is asked four yes/no questions about every open incident that is due, oldest first however many are open, and the answers become one stored decision:
 
@@ -760,7 +760,20 @@ Hook events rotate monthly from `events.jsonl` into `events-YYYYMM.jsonl`, named
 
 Each immutable migration lives in `arete/store/migrations/mNNNN_area_name.py`, with `PHASE` and exactly one `SQL` string or `apply(conn)`. Areas come from public store modules declaring literal `TABLES` dictionaries; `foundation` maps to `db`. Helpers and packages are not owners, and `outbox` is refused until its owner exists. Only the historical `m0004_work_event_routing.py` resolves `work` to `loops`; existing ledger rows stay unchanged. Numbers start at 1 without gaps or repeats. `latest.txt` names the highest file, so branches adding the same next number conflict there. The loader refuses a changed SHA-256 for any applied file. Add a new migration to repair an earlier one.
 
-Import connections with `from arete.store import db` and run history with `from arete.store import runs as run_store`. Call through the owner module so patches reach its implementation. Runs owns recording SQL, history, billing readers, reports, feed, pins and folder-purge scheduling; `record.py` keeps IDs, timelines and filesystem cleanup. `state.py` temporarily exports the moved names and coordinates pruning on one connection while the remaining aggregates move. The relocated numbered migrations and `latest.txt` retain their original bytes.
+Import connections with `from arete.store import db` and persistence functions through their owner modules. Runs owns recording SQL, history, billing readers, reports, feed, pins and folder-purge scheduling; `record.py` keeps IDs, timelines and filesystem cleanup. Loops owns queue recovery, events, loop state, findings and loop locking. Sources owns seen keys, cursors, source ownership and passed-over tickets. Incidents owns incidents, notes, aliases, repairs and alerts. `oncall.commit_scan` coordinates incident and cursor writes on one connection. `store.prune` calls runs, loops and incidents in order on one connection, after the server's checked backup. `state.py` temporarily exports moved names while the remaining aggregates move. The relocated numbered migrations and `latest.txt` retain their original bytes.
+
+The isolated persistence probes print exact inventories and rollback evidence as `BEHAVIOR_RESULT` JSON:
+
+```sh
+python -I tests/scripts/store_contract.py ownership
+python -I tests/scripts/store_contract.py run-retention
+python -I tests/scripts/store_contract.py scan-atomicity
+python -I tests/scripts/store_contract.py server-prune
+python docs/db-fixture.py concurrent-intake
+python docs/db-fixture.py prune-restore
+```
+
+In the build sandbox, prefix each command with the supplied `verification-runtime/harness/sandbox` executable.
 
 The isolated foundation contract probes generate configuration with `replay.sample` and place all six environment paths under a disposable directory. Run through the supplied sandbox:
 

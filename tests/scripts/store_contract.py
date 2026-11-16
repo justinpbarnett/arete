@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 SOURCE = Path(__file__).resolve().parents[2]
+BASELINE = "56706fe2c07d36fd9d7c00d227f9f68caffeda29"
 
 
 def ledger(db):
@@ -46,13 +47,33 @@ def ownership(root):
     record.settle(run, "done")
     assert run_store.run_get(run)["status"] == "done"
     moved = """backfill_legacy_cost cost_drift runs run_facets paid_by_run merged_runs runs_since
-               runs_reading_pr_comments open_runs run_lock loop_lock run_get save_report report steps step_tries
+               runs_reading_pr_comments open_runs run_lock run_get save_report report steps step_tries
                steps_since add_feed insert_feed feed loop_spent_since runs_marked_running ticket_runs newest_whole_run
                ticket_runs_marked_running ab_placements ab_held ticket_runs_since later_run interrupted_tickets
                last_pipeline_starts running_run pending_label issue_running pin_record unpin_record record_pins
                last_step_id""".split()
     assert all(getattr(state, name) is getattr(run_store, name) for name in moved)
     assert all(getattr(run_store, name).__module__ == "arete.store.runs" for name in moved)
+    from arete.store import loops as loops_owner
+    names = """loop_state loop_states loop_marks set_loop_state finding_seen record_finding mark_emitted
+             set_finding_url findings add_event enqueue pending queue_item take_queue_item
+             drop_queue_item release_claimed_items finish_claim end_claim release_settled_claims
+             dead_items requeue_item loop_lock""".split()
+    assert all(getattr(state, name) is getattr(loops_owner, name) for name in names)
+    assert all(getattr(loops_owner, name).__module__ == "arete.store.loops" for name in names)
+    from arete.store import sources as sources_owner
+    names = """source_seen claim_seen forget_seen cursor set_cursor adopt_source source_owner set_source_owner
+             cursors pass_over tickets_passed_over take_passed_over drop_passed_over""".split()
+    assert all(getattr(state, name) is getattr(sources_owner, name) for name in names)
+    assert all(getattr(sources_owner, name).__module__ == "arete.store.sources" for name in names)
+    from arete.store import incidents as incidents_owner
+    names = """write_incident record_incident add_incident_note open_incidents incidents_to_decide
+             known_fingerprints update_incident woken_incidents closed_alerted add_repair
+             set_repair incident_repairs parsed incidents blocked_incidents incident alert_get
+             alert_set alert_clear alerts""".split()
+    assert all(getattr(state, name) is getattr(incidents_owner, name) for name in names)
+    assert all(getattr(incidents_owner, name).__module__ == "arete.store.incidents" for name in names)
+    reader_results = owner_readers(root)
     tree = ast.parse(Path(record.__file__).read_text())
     sql = ("SELECT ", "INSERT ", "UPDATE ", "DELETE ", "CREATE ", "ALTER ", "DROP ", "PRAGMA ", "REPLACE ", "WITH ")
     assert not [node.value for node in ast.walk(tree)
@@ -64,7 +85,9 @@ def ownership(root):
     with state.db() as conn, db.reader() as joined:
         assert conn is joined
     return {"tables": len(actual), "complete": True, "unique": True, "foundation": "db",
-            "historical_work": "loops", "ledger_unchanged": True, "record_compatibility": True}
+            "historical_work": "loops", "ledger_unchanged": True, "record_compatibility": True,
+            "owners": owners, "ledger": before,
+            "aggregate_compatibility": True, "loop_lock_owner": "loops", "readers": reader_results}
 
 
 def unknown_area(root):
@@ -317,14 +340,16 @@ def record_failures(root):
             "invalid_unchanged": True, "crash_reraised": True}
 
 def run_retention(root):
-    import sqlite3
     from datetime import timedelta
 
-    from arete import agent, paths, record, state, util
-    from arete.store import db, runs as run_store
+    from arete import agent, paths, record, state, store, util
+    from arete.store import db, incidents, runs as run_store
     from tests.harness import age_run
 
     db.migrate()
+    instant = util.now()
+    clock = mock.patch.object(util, "now", return_value=instant)
+    clock.start()
 
     def made(rid, days, status="done", kind="pipeline"):
         record.start(kind, run_id=rid, repo="demo", issue=rid,
@@ -344,14 +369,19 @@ def run_retention(root):
     def inventory():
         with db.reader() as c:
             return {table: [tuple(r) for r in c.execute(f"SELECT * FROM {table} ORDER BY rowid")]
-                    for table in ("runs", "feed", "run_purges")}
+                    for table in ("runs", "feed", "run_purges", "queue", "events", "incidents",
+                                  "incident_notes", "incident_aliases", "incident_repairs")}
 
     for status in ("done", "skipped"):
         made("old-" + status, 30, status, "loop")
         made("recent-" + status, 1, status, "loop")
     paid = made("paid", 120, kind="loop")
     record.step(paid, "paid", agent.Result(ok=True, cost_usd=1, auth_mode="api_key"), 0)
+    made("paid-30", 30, kind="loop")
+    record.step("paid-30", "paid", agent.Result(ok=True, cost_usd=1, auth_mode="api_key"), 0)
     made("pipeline", 30)
+    made("free-equal", 14, kind="loop")
+    made("folder-equal", 90)
     record.step("old-done", "history", agent.Result(ok=True, runner="replay"), 0)
     run_store.save_report("old-done", {"summary": "free history survives"})
     for rid in ("expired", "fallback", "pinned", "ask-open", "ask-answered", "ask-taken",
@@ -377,17 +407,27 @@ def run_retention(root):
         proposal("proposal-" + status, status)
     record.step("expired", "history", agent.Result(ok=True, runner="replay"), 0)
     run_store.save_report("expired", {"summary": "history survives"})
-    with db.db() as c:
-        c.execute("INSERT INTO events (loop, ts) VALUES ('old', ?)",
-                  (util.iso(util.now() - timedelta(days=100)),))
-        c.execute("CREATE TRIGGER later_owner_failure BEFORE DELETE ON events "
-                  "BEGIN SELECT RAISE(ABORT, 'later owner'); END")
+    seed_retention()
+    baseline = baseline_database(root, "retention-baseline")
+    with mock.patch.object(paths, "DB_FILE", baseline):
+        original_function("prune")()
+        expected = inventory()
     before = inventory()
-    refuses(sqlite3.IntegrityError, state.prune)
-    assert inventory() == before
-    with db.db() as c:
-        c.execute("DROP TRIGGER later_owner_failure")
-    state.prune()
+
+    def fail_incidents(c, *args):
+        assert not c.execute("SELECT 1 FROM runs WHERE id = 'old-done'").fetchone()
+        assert not c.execute("SELECT 1 FROM queue WHERE loop = 'dead-expired'").fetchone()
+        assert not c.execute("SELECT 1 FROM events WHERE loop = 'event-old'").fetchone()
+        assert c.execute("SELECT 1 FROM run_purges").fetchone()
+        raise RuntimeError("incidents prune sentinel")
+
+    with mock.patch.object(incidents, "prune", side_effect=fail_incidents):
+        refuses(RuntimeError, store.prune)
+    after_failure = inventory()
+    assert after_failure == before
+    store.prune()
+    assert inventory() == expected
+    retention = retained_inventory()
     all_ids = {r["id"] for r in run_store.runs(firings=True, limit=200)}
     deleted = {"old-done", "old-skipped"}
     assert all_ids == {r[0] for r in before["runs"]} - deleted
@@ -400,6 +440,7 @@ def run_retention(root):
     assert queued == deleted | expired, queued
     protected = {"pinned", "ask-open", "ask-answered", "proposal-hand", "proposal-evidence", "recent-ticket",
                  "active-running", "active-pr", "active-needs-info", "finish-recent"}
+    protected.add("folder-equal")
     assert all(run_store.run_get(r)["files_purged"] is None for r in protected)
     assert all(run_store.run_get(r)["files_purged"] for r in expired)
     raw_kept = state.runs_cited_by_kept_proposals(all_ids)
@@ -433,17 +474,340 @@ def run_retention(root):
     made("custom-free", 6, kind="loop")
     made("custom-folder", 11)
     made("custom-kept", 4)
-    state.prune(days=5, lines_days=10)
+    store.prune(days=5, keep_days=5, lines_days=10)
+    assert_custom_retention()
+    custom_retention = snapshot_tables("queue", "events", "incidents", "incident_notes")
     assert run_store.run_get("custom-free") is None
     assert run_store.run_get("custom-folder")["files_purged"]
     assert run_store.run_get("custom-kept")["files_purged"] is None
-    return {"deleted_ids": sorted(deleted), "retained_ids": sorted(all_ids), "folder_ids": sorted(expired),
+    clock.stop()
+    return {"retention": retention, "custom_retention": custom_retention, "baseline_compatible": True, "rollback_tables": sorted(before),
+            "rollback_before": before, "rollback_after": after_failure, "rollback_failure": "incidents prune sentinel",
+            "deleted_ids": sorted(deleted), "retained_ids": sorted(all_ids), "folder_ids": sorted(expired),
             "protected_ids": sorted(protected), "rollback": True, "history_retained": True,
             "merged_raw_kept": True, "custom_windows": True, "deletion_retry": True, "unsafe_refused": True}
 
+
+def snapshot_tables(*tables):
+    from arete.store import db
+
+    with db.reader() as c:
+        return {table: [dict(r) for r in c.execute(f"SELECT * FROM {table} ORDER BY rowid")] for table in tables}
+
+
+def baseline_database(root, name):
+    import sqlite3
+
+    from arete import paths
+    from arete.store import db
+
+    target = root / (name + ".db")
+    with db.reader() as c, sqlite3.connect(target) as other:
+        c.backup(other)
+    assert target != paths.DB_FILE
+    return target
+
+
+def original_function(name):
+    from datetime import timedelta
+
+    from arete import util
+    from arete.sighting import Sighting
+    from arete.store import db, incidents, runs
+
+    source = subprocess.run(["git", "show", f"{BASELINE}:arete/state.py"], cwd=SOURCE,
+                            text=True, capture_output=True, check=True).stdout
+    node = next(n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name == name)
+    namespace = {"db": db.db, "run_store": runs, "util": util, "timedelta": timedelta, "Sighting": Sighting,
+                 "SEEN_AGAIN": incidents.SEEN_AGAIN, "CLOSED_AT": incidents.CLOSED_AT,
+                 "write_incident": incidents.write_incident}
+    if name == "commit_scan":
+        write = next(n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name == "write_incident")
+        exec(compile(ast.Module(body=[write], type_ignores=[]), f"<{BASELINE}>", "exec"), namespace)
+    exec(compile(ast.Module(body=[node], type_ignores=[]), f"<{BASELINE}>", "exec"), namespace)
+    return namespace[name]
+
+
+def owner_readers(root):
+    from arete import board, config, control, loops, paths, util
+    from arete.sighting import Sighting
+    from arete.store import db, incidents, loops as loop_store, sources
+
+    folder = paths.CONFIG_DIR / "loops" / "owner-reader"
+    folder.mkdir(parents=True)
+    (folder / "loop.toml").write_text('kind = "command"\n[run]\ncommand = "true"\n'
+                                    '[[source]]\ntype = "command"\ncommand = "true"\n')
+    cfg = config.load()
+    loop = loops.load(folder, "private", "", cfg)
+    loop_store.set_loop_state(loop.name, data={"remember": 7}, mark_at=util.iso(), mark_ok=1, mark_detail="healthy")
+    item = loop_store.enqueue(loop.name, "default", "", "event", [{"key": "reader"}])
+    loop_store.record_finding(loop.name, "finding", "text", "title", "", "store-contract")
+    sources.set_cursor(loop.name + "#0", "position", True)
+    incident_id, _ = incidents.record_incident(Sighting("reader", "unexpected", "reader", "", "sig", 1, "e", None))
+    incidents.update_incident(incident_id, phase="blocked", waiting="owner")
+    incidents.alert_set("reader", 7, "demo")
+    with db.db() as c:
+        loop_store.add_event(loop.name, {"key": "reader"}, connect=db.db)
+        sources.claim_seen("reader", ["one"], connect=db.db)
+        assert sources.source_seen("reader", connect=db.reader) == {"one"}
+        assert loop_store.loop_states(connect=db.reader)[loop.name]["data"] == {"remember": 7}
+        assert incidents.incident(incident_id, connect=db.reader)["notes_total"] == 1
+        with db.db() as joined:
+            assert c is joined
+    with db.one_read(), mock.patch.object(loops, "load_all", return_value=[loop]), \
+            mock.patch.object(control, "find_loop", return_value=loop):
+        detail = control.loop_detail(loop.name, connect=db.reader)
+        checks, alerts = board.checks(), board.alerts()
+        blocked = board.checks_and_alerts()["incidents"]["rows"]
+    assert detail["state"] == {"remember": 7}
+    assert [r["id"] for r in detail["waiting"]] == [item]
+    assert [r["fingerprint"] for r in detail["findings"]] == ["finding"]
+    assert [r["value"] for r in detail["cursors"]] == ["position"]
+    assert checks["loops"] == [{"name": loop.name, "ts": loop_store.loop_marks()[loop.name]["ts"],
+                               "ok": True, "detail": "healthy"}]
+    assert [(r["key"], r["issue"], r["repo"]) for r in alerts["alerts"]] == [("reader", 7, "demo")]
+    assert [r["id"] for r in blocked] == [incident_id]
+    return {"state": detail["state"], "waiting": [item], "finding": "finding", "cursor": "position",
+            "marks": checks["loops"], "blocked": blocked, "alerts": alerts["alerts"]}
+
+
+def seed_retention():
+    from datetime import timedelta
+
+    from arete import util
+    from arete.sighting import Sighting
+    from arete.store import db, incidents, loops
+
+    def ago(days):
+        return util.iso(util.now() - timedelta(days=days))
+
+    for age in (30, 1, 500):
+        for claimed in (False, True):
+            name = f"live-{age}-{'claimed' if claimed else 'waiting'}"
+            item = loops.enqueue(name, "default", "", "event", [{"key": name}])
+            if claimed:
+                assert loops.take_queue_item(item, "claimed-run")
+            with db.db() as c:
+                c.execute("UPDATE queue SET enqueued = ? WHERE id = ?", (ago(age), item))
+    for name, age in (("dead-expired", 57), ("dead-recent", 1), ("dead-equal", 56)):
+        item = loops.enqueue(name, "default", "", "event", [{"key": name}])
+        with db.db() as c:
+            c.execute("UPDATE queue SET enqueued = ?, dead_at = ?, run_id = 'claim' WHERE id = ?",
+                      (ago(500), ago(age), item))
+    for name, age in (("event-old", 70), ("event-recent", 10), ("event-equal", 56)):
+        event = loops.add_event(name, {"key": name})
+        with db.db() as c:
+            c.execute("UPDATE events SET ts = ? WHERE id = ?", (ago(age), event))
+    for name, seen, closed in (("inactive", 70, None), ("dismissed", 40, 40),
+                               ("open", 1, None), ("recent-close", 70, 1),
+                               ("empty-close", 40, ""), ("null-close", 40, None),
+                               ("inactive-equal", 56, None), ("closed-equal", 40, 30),
+                               ("custom-close", 10, 10)):
+        incident_id, _ = incidents.record_incident(Sighting(name, "unexpected", "fixture", "", name, 1, "evidence", None))
+        is_closed = name not in ("inactive", "open", "inactive-equal")
+        with db.db() as c:
+            c.execute("UPDATE incidents SET first_seen = ?, last_seen = ?, state = ?, closed = ? WHERE id = ?",
+                      (ago(seen + 1), ago(seen), "dismissed" if is_closed else "open",
+                       ago(closed) if isinstance(closed, int) else closed, incident_id))
+            c.execute("UPDATE incident_notes SET ts = ?, note = ? WHERE incident = ?",
+                      (ago(20), name + " ordinary old", incident_id))
+        incidents.add_repair(incident_id, "demo")
+        with db.db() as c:
+            incidents.write_alias(c, name + "-alias", incident_id, name + " alias")
+        if name == "open":
+            for note, age in (("ordinary recent", 1), ("seen again: old", 20),
+                              ("seen again: recent", 1), ("seen again: equal", 14)):
+                incidents.add_incident_note(incident_id, note)
+                with db.db() as c:
+                    c.execute("UPDATE incident_notes SET ts = ? WHERE id = "
+                              "(SELECT MAX(id) FROM incident_notes)", (ago(age),))
+    with db.db() as c:
+        incidents.write_alias(c, "orphan", 9999, "orphan")
+        c.execute("INSERT INTO incident_repairs (incident, repo, started) VALUES (9999, 'demo', ?)", (ago(1),))
+
+
+def retained_inventory():
+    from arete.store import incidents
+
+    found = snapshot_tables("queue", "events", "incidents", "incident_notes", "incident_aliases", "incident_repairs")
+    assert sorted(r["loop"] for r in found["queue"]) == sorted(
+        [f"live-{age}-{claim}" for age in (30, 1, 500) for claim in ("claimed", "waiting")] +
+        ["dead-recent", "dead-equal"])
+    assert [r["loop"] for r in found["events"]] == ["event-recent", "event-equal"]
+    rows = {r["fingerprint"]: r for r in found["incidents"]}
+    assert set(rows) == {"dismissed", "open", "recent-close", "empty-close", "null-close",
+                         "inactive-equal", "closed-equal", "custom-close"}
+    for name in ("dismissed", "empty-close", "null-close"):
+        assert rows[name]["evidence"] == ""
+        assert not incidents.incident(rows[name]["id"])["notes"]
+    for name in ("recent-close", "inactive-equal", "closed-equal", "custom-close"):
+        assert rows[name]["evidence"] == "evidence"
+        assert incidents.incident(rows[name]["id"])["notes"]
+    notes = [r["note"] for r in incidents.incident(rows["open"]["id"])["notes"]]
+    assert notes == ["open ordinary old", "open alias", "ordinary recent", "seen again: recent", "seen again: equal"]
+    ids = {r["id"] for r in rows.values()}
+    assert all(r["incident"] in ids for table in ("incident_notes", "incident_aliases", "incident_repairs")
+               for r in found[table])
+    return found
+
+
+def assert_custom_retention():
+    from arete.store import incidents
+
+    rows = {r["fingerprint"]: r for r in incidents.incidents()}
+    assert rows["custom-close"]["evidence"] == ""
+    assert not incidents.incident(rows["custom-close"]["id"])["notes"]
+    assert "inactive-equal" not in rows
+    assert "recent-close" in rows and rows["recent-close"]["evidence"] == "evidence"
+
+
+def scan_atomicity(root):
+    from arete import oncall, paths, util
+    from arete.sighting import Sighting
+    from arete.store import db, incidents, sources
+
+    db.migrate()
+    instant = util.now()
+    with mock.patch.object(util, "now", return_value=instant):
+        def sighting(fp, count=1):
+            return Sighting(fp, "unexpected", "fixture", "demo", "sig", count, "evidence", None)
+        original, _ = incidents.record_incident(sighting("original"))
+        sources.set_cursor("existing", "old", True, started=util.iso())
+        tables = ("incidents", "incident_notes", "incident_aliases", "cursors")
+        before = snapshot_tables(*tables)
+        rows = [sighting("alias", 2), sighting("new"), sighting("original", 3), sighting("last")]
+        aliases = [("alias", original, "alias first"), ("second-alias", original, "alias second")]
+        marks = {"alias": ({"decision": "wake"}, "must not mark existing"),
+                 "new": ({"state": "dismissed", "reason": "marked"}, "new marked")}
+        cursors = [("existing", None, False, "x" * 600), ("later", "new", True, "later detail")]
+        baseline = baseline_database(root, "scan-baseline")
+        with mock.patch.object(paths, "DB_FILE", baseline):
+            expected_flags = original_function("commit_scan")(rows, cursors, aliases, marks)
+            expected = snapshot_tables(*tables)
+        write = sources.write_scan_cursor
+
+        def fails(c, source, *args):
+            if source == "later":
+                assert c.execute("SELECT value FROM cursors WHERE source = 'existing'").fetchone()[0] is None
+                assert c.execute("SELECT COUNT(*) FROM incidents").fetchone()[0] == 3
+                raise RuntimeError("later cursor sentinel")
+            write(c, source, *args)
+
+        with mock.patch.object(sources, "write_scan_cursor", side_effect=fails):
+            refuses(RuntimeError, lambda: oncall.commit_scan(rows, cursors, aliases, marks))
+        after_failure = snapshot_tables(*tables)
+        assert after_failure == before
+        flags = oncall.commit_scan(rows, cursors, aliases, marks)
+        after = snapshot_tables(*tables)
+        assert after == expected and flags == expected_flags == [False, True, False, True]
+        notes = [r["note"] for r in after["incident_notes"]]
+        assert notes == ["opened: unexpected, 1 from fixture", "alias first", "alias second",
+                         "seen again: 2 more from fixture, 3 in all", "opened: unexpected, 1 from fixture",
+                         "new marked", "seen again: 3 more from fixture, 6 in all",
+                         "opened: unexpected, 1 from fixture"]
+        assert incidents.incident(original)["decision"] == ""
+        new = next(r for r in after["incidents"] if r["fingerprint"] == "new")
+        assert new["state"] == "dismissed" and new["closed"] == "" and new["reason"] == "marked"
+        cursor = sources.cursor("existing")
+        assert cursor["value"] is None and cursor["last_ok"] is None and cursor["ok"] == 0
+        assert cursor["detail"] == "x" * 500
+        assert sources.cursor("later")["last_ok"] is None
+        assert len(after["incidents"]) == 3
+    return {"opened": flags, "notes": notes, "baseline_compatible": True, "rollback": before == after_failure,
+            "failure": "later cursor sentinel", "before": before, "after_failure": after_failure,
+            "committed": after, "cursor_detail_length": len(cursor["detail"]), "new_only_marks": True}
+
+
+def server_prune(root):
+    from dataclasses import replace
+
+    from arete import backup, record, serve, store, tool_events
+    from arete.store import db
+
+    db.migrate()
+    record.start("pipeline", run_id="backup-history")
+    record.settle("backup-history", "done")
+    server = serve.Server()
+    server.cfg = replace(server.cfg, retention=replace(server.cfg.retention, lines_days=17),
+                         oncall=replace(server.cfg.oncall, keep_days=9))
+    messages, phases, backups = [], [], []
+    server.say = messages.append
+    real_prune = store.prune
+
+    def checked_prune(**kwargs):
+        latest = backup.newest_snapshot()
+        assert latest.exists() and backup.inspect(latest)["quick_check"] == "ok"
+        assert backup.inspect(latest)["counts"]["runs"] == 1
+        backups.append(str(latest))
+        phases.append("store")
+        real_prune(**kwargs)
+
+    def records(*args):
+        phases.append("records")
+        return prune_records(*args)
+
+    def rotate(*args):
+        phases.append("rotate")
+
+    prune_records = record.prune
+    purge_folders = record.purge_folders
+
+    def folders():
+        phases.append("folders")
+        return purge_folders()
+
+    try:
+        with mock.patch.object(server, "collect_db") as collect, \
+                mock.patch.object(server, "copy_off_machine", side_effect=lambda made: phases.append("copy")), \
+                mock.patch.object(store, "prune", side_effect=checked_prune) as pruned, \
+                mock.patch.object(record, "purge_folders", side_effect=folders), \
+                mock.patch.object(record, "prune", side_effect=records), \
+                mock.patch.object(tool_events, "rotate_events", side_effect=rotate):
+            server.prune()
+            pruned.assert_called_once_with(lines_days=17, keep_days=9)
+            collect.assert_called_once()
+        assert phases == ["copy", "store", "folders", "records", "rotate"], phases
+        successful = list(phases)
+        phases.clear()
+        with mock.patch.object(server, "collect_db") as collect, \
+                mock.patch.object(backup, "snapshot", side_effect=OSError("snapshot sentinel")), \
+                mock.patch.object(store, "prune") as pruned, \
+                mock.patch.object(record, "purge_folders") as purge, \
+                mock.patch.object(record, "prune") as records_mock, \
+                mock.patch.object(tool_events, "rotate_events") as rotation:
+            server.prune()
+            assert not any(p.called for p in (pruned, purge, records_mock, rotation))
+            collect.assert_called_once()
+        assert any("backup failed, so nothing was pruned: OSError: snapshot sentinel" in m for m in messages)
+        continuations = {}
+        for target, name, message in ((store, "prune", "database sentinel"), (record, "prune", "record sentinel")):
+            phases.clear()
+            with mock.patch.object(server, "collect_db") as collect, \
+                    mock.patch.object(server, "copy_off_machine"), \
+                    mock.patch.object(record, "purge_folders", side_effect=folders), \
+                    mock.patch.object(record, "prune", side_effect=records), \
+                    mock.patch.object(tool_events, "rotate_events", side_effect=rotate), \
+                    mock.patch.object(target, name, side_effect=OSError(message)):
+                server.prune()
+                collect.assert_called_once()
+            expected = ["folders", "records", "rotate"] if target is store else ["folders", "rotate"]
+            assert phases == expected, phases
+            continuations[message] = list(phases)
+        assert any("state prune failed: OSError: database sentinel" in m for m in messages)
+        assert any("record prune failed: OSError: record sentinel" in m for m in messages)
+    finally:
+        server.pool.shutdown()
+        for pool in server.job_pools.values():
+            pool.shutdown()
+    return {"backup_checked": True, "backups": backups, "phases": successful,
+            "prune_calls": [{"lines_days": 17, "keep_days": 9}], "snapshot_failure_skipped": True,
+            "continuations": continuations, "diagnostics": messages, "health_requested": True}
+
+
 def main():
     case = sys.argv[1]
-    assert case in ("ownership", "unknown-area", "upgrade", "record-readers", "record-failures", "run-retention"), case
+    assert case in ("ownership", "unknown-area", "upgrade", "record-readers", "record-failures", "run-retention",
+                    "scan-atomicity", "server-prune"), case
     with tempfile.TemporaryDirectory(prefix="arete-store-contract-") as directory:
         root = Path(directory).resolve()
         env = {name: os.environ[name] for name in ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR")
@@ -458,7 +822,6 @@ def main():
         os.environ.clear()
         os.environ.update(env)
         sys.path.insert(0, str(SOURCE))
-        from arete.store import runs as run_store
         from arete import paths, replay
 
         paths.CONFIG_FILE.write_text("\n".join(replay.sample(root / "sample")) + "\n")
@@ -466,7 +829,8 @@ def main():
             "ARETE_CONFIG_DIR", "ARETE_STATE_DIR", "ARETE_LOG_DIR", "ARETE_WORKTREES_DIR", "TMPDIR", "HOME")}}
         result.update({"ownership": ownership, "unknown-area": unknown_area, "upgrade": upgrade,
                        "record-readers": record_readers, "record-failures": record_failures,
-                       "run-retention": run_retention}[case](root))
+                       "run-retention": run_retention, "scan-atomicity": scan_atomicity,
+                       "server-prune": server_prune}[case](root))
         print("BEHAVIOR_RESULT=" + json.dumps(result))
 
 

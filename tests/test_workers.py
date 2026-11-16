@@ -1142,13 +1142,13 @@ result(removed=[not folder(r).exists() for r in ("plain", "timeline")],
     def test_phase_failures_continue_and_snapshot_failure_stops_deletions(self):
         found = self.scratch(r'''
 old = made("old", 40)
-with mock.patch.object(state, "prune", side_effect=OSError("state unavailable")), mock.patch.object(record, "purge_folders", wraps=record.purge_folders) as purge, mock.patch.object(tool_events, "rotate_events", wraps=tool_events.rotate_events) as rotate:
+with mock.patch.object(store, "prune", side_effect=OSError("state unavailable")), mock.patch.object(record, "purge_folders", wraps=record.purge_folders) as purge, mock.patch.object(tool_events, "rotate_events", wraps=tool_events.rotate_events) as rotate:
     server.prune()
     continued = purge.call_count == rotate.call_count == 1 and not paths.record_dir(old).exists()
 with mock.patch.object(record, "prune", side_effect=OSError("record unavailable")), mock.patch.object(tool_events, "rotate_events") as rotate:
     server.prune()
     rotated = rotate.call_count == 1
-with mock.patch.object(backup, "snapshot", side_effect=OSError("backup unavailable")), mock.patch.object(state, "prune") as state_prune, mock.patch.object(record, "purge_folders") as purge, mock.patch.object(record, "prune") as records, mock.patch.object(tool_events, "rotate_events") as rotate:
+with mock.patch.object(backup, "snapshot", side_effect=OSError("backup unavailable")), mock.patch.object(store, "prune") as state_prune, mock.patch.object(record, "purge_folders") as purge, mock.patch.object(record, "prune") as records, mock.patch.object(tool_events, "rotate_events") as rotate:
     server.prune()
     stopped = not any(f.called for f in (state_prune, purge, records, rotate))
 result(continued=continued, rotated=rotated, stopped=stopped, messages=messages)

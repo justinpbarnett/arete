@@ -7,9 +7,11 @@ from collections.abc import Sequence
 from datetime import timedelta
 
 from . import util
-from .sighting import Sighting
 from .store import db as foundation
+from .store import incidents as incident_store
+from .store import loops as loop_store
 from .store import runs as run_store
+from .store import sources as source_store
 
 LATEST = foundation.LATEST
 MIGRATE_WAIT_SECONDS = foundation.MIGRATE_WAIT_SECONDS
@@ -62,9 +64,7 @@ paid_by_run = run_store.paid_by_run
 merged_runs = run_store.merged_runs
 
 
-def source_seen(source: str, connect=reader) -> set[str]:
-    with connect() as c:
-        return {r[0] for r in c.execute("SELECT key FROM seen WHERE source = ?", (source,))}
+source_seen = source_store.source_seen
 
 
 runs_since = run_store.runs_since
@@ -79,7 +79,7 @@ open_runs = run_store.open_runs
 run_lock = run_store.run_lock
 
 
-loop_lock = run_store.loop_lock
+loop_lock = loop_store.loop_lock
 
 
 run_get = run_store.run_get
@@ -109,393 +109,149 @@ insert_feed = run_store.insert_feed
 feed = run_store.feed
 
 
-def loop_state(name: str, connect=reader) -> dict:
-    with connect() as c:
-        r = c.execute("SELECT * FROM loop_state WHERE loop = ?", (name,)).fetchone()
-    if not r:
-        return {"loop": name, "data": {}, "last_fire": None, "next_due": None, "metric_on": 0}
-    return {**dict(r), "data": json.loads(r["data"] or "{}")}
+loop_state = loop_store.loop_state
 
 
-def loop_states(connect=reader) -> dict[str, dict]:
-    with connect() as c:
-        return {r["loop"]: {**dict(r), "data": json.loads(r["data"] or "{}")} for r in c.execute("SELECT * FROM loop_state")}
+loop_states = loop_store.loop_states
 
 
-def loop_marks(connect=reader) -> dict[str, dict]:
-    with connect() as c:
-        rows = [dict(r) for r in c.execute("SELECT * FROM loop_state")]
-    return {r["loop"]: {"ts": r["mark_at"], "ok": bool(r.get("mark_ok")), "detail": r.get("mark_detail") or ""}
-            for r in rows if r.get("mark_at")}
+loop_marks = loop_store.loop_marks
 
 
-def set_loop_state(name: str, **fields) -> None:
-    if "data" in fields:
-        fields["data"] = json.dumps(fields["data"], default=str)
-    fields["updated"] = util.iso()
-    with db() as c:
-        c.execute("INSERT OR IGNORE INTO loop_state (loop) VALUES (?)", (name,))
-        c.execute(f"UPDATE loop_state SET {', '.join(f'{k} = ?' for k in fields)} WHERE loop = ?",
-                  (*fields.values(), name))
+set_loop_state = loop_store.set_loop_state
 
 
-def finding_seen(loop: str, fingerprint: str) -> bool:
-    with reader() as c:
-        return c.execute("SELECT 1 FROM findings WHERE loop = ? AND fingerprint = ?", (loop, fingerprint)).fetchone() \
-            is not None
+finding_seen = loop_store.finding_seen
 
 
-def record_finding(loop: str, fingerprint: str, fingerprint_text: str, title: str, url: str, run_id: str) -> bool:
-    with db() as c:
-        before = c.total_changes
-        c.execute("INSERT OR IGNORE INTO findings (loop, fingerprint, fingerprint_text, title, url, run_id, first_seen, "
-                  "last_seen, emitted) VALUES (?,?,?,?,?,?,?,?,'')",
-                  (loop, fingerprint, fingerprint_text, title, url, run_id, util.iso(), util.iso()))
-        if c.total_changes > before:
-            return True
-        c.execute("UPDATE findings SET run_id = ? WHERE loop = ? AND fingerprint = ? AND emitted = '' "
-                  "AND COALESCE(url, '') = '' AND COALESCE(run_id, '') != ?", (run_id, loop, fingerprint, run_id))
-        taken_over = c.total_changes > before
-        c.execute("UPDATE findings SET seen = seen + 1, last_seen = ? WHERE loop = ? AND fingerprint = ?",
-                  (util.iso(), loop, fingerprint))
-        return taken_over
+record_finding = loop_store.record_finding
 
 
-def mark_emitted(loop: str, fingerprints: list[str], run_id: str) -> None:
-    with db() as c:
-        c.executemany("UPDATE findings SET emitted = ? WHERE loop = ? AND fingerprint = ? AND run_id = ? "
-                      "AND emitted = ''", [(run_id, loop, fingerprint, run_id) for fingerprint in fingerprints])
+mark_emitted = loop_store.mark_emitted
 
 
-def set_finding_url(loop: str, fingerprint: str, url: str) -> None:
-    with db() as c:
-        c.execute("UPDATE findings SET url = ? WHERE loop = ? AND fingerprint = ?", (url, loop, fingerprint))
+set_finding_url = loop_store.set_finding_url
 
 
-def findings(loop: str, limit: int = 50, connect=reader) -> list[dict]:
-    with connect() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM findings WHERE loop = ? ORDER BY last_seen DESC LIMIT ?",
-                                           (loop, limit))]
+findings = loop_store.findings
 
 
-def add_event(loop: str, e: dict, connect=db) -> int:
-    with connect() as c:
-        cur = c.execute("INSERT INTO events (loop, type, source, key, repo, title, url, trust, ts) "
-                        "VALUES (?,?,?,?,?,?,?,?,?)",
-                        (loop, e.get("type"), e.get("source"), str(e.get("key")), e.get("repo"), e.get("title"),
-                         e.get("url"), e.get("trust"), util.iso()))
-        return cur.lastrowid
+add_event = loop_store.add_event
 
 
-def claim_seen(source: str, keys: list[str], connect=db) -> list[str]:
-    with connect() as c:
-        return [str(k) for k in keys if c.execute("INSERT OR IGNORE INTO seen (source, key, ts) VALUES (?,?,?)",
-                                                 (source, str(k), util.iso())).rowcount == 1]
+claim_seen = source_store.claim_seen
 
 
-def forget_seen(source: str, key: str, before, connect=db) -> None:
-    with connect() as c:
-        c.execute("DELETE FROM seen WHERE source = ? AND key = ? AND ts < ?", (source, key, util.iso(before)))
+forget_seen = source_store.forget_seen
 
 
-def cursor(source: str, connect=reader) -> dict | None:
-    with connect() as c:
-        r = c.execute("SELECT * FROM cursors WHERE source = ?", (source,)).fetchone()
-        return dict(r) if r else None
+cursor = source_store.cursor
 
 
-def set_cursor(source: str, value: str | None, ok: bool, detail: str = "", connect=db, started=None) -> None:
-    with connect() as c:
-        row = c.execute("SELECT * FROM cursors WHERE source = ?", (source,)).fetchone()
-        prev = dict(row) if row else {}
-        last_ok = (started or util.iso()) if ok else prev.get("last_ok") or (prev.get("polled") if prev.get("ok") else None)
-        c.execute("INSERT OR REPLACE INTO cursors (source, value, polled, ok, detail, last_ok) VALUES (?,?,?,?,?,?)",
-                  (source, value if value is not None else prev.get("value"), util.iso(), int(ok), detail[:500],
-                   last_ok))
+set_cursor = source_store.set_cursor
 
 
-def adopt_source(old: str, new: str) -> None:
-    with db() as c:
-        for table in ("cursors", "seen", "source_owners"):
-            c.execute(f"UPDATE OR REPLACE {table} SET source = ? WHERE source = ?", (new, old))
+adopt_source = source_store.adopt_source
 
 
-def source_owner(source: str) -> str | None:
-    with reader() as c:
-        r = c.execute("SELECT fingerprint FROM source_owners WHERE source = ?", (source,)).fetchone()
-        return r[0] if r else None
+source_owner = source_store.source_owner
 
 
-def set_source_owner(source: str, fingerprint: str, connect=db) -> None:
-    with connect() as c:
-        c.execute("INSERT OR REPLACE INTO source_owners (source, fingerprint) VALUES (?,?)", (source, fingerprint))
+set_source_owner = source_store.set_source_owner
 
 
-def cursors(connect=reader) -> list[dict]:
-    with connect() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM cursors ORDER BY source")]
+cursors = source_store.cursors
 
 
-def enqueue(loop: str, queue: str, grp: str, trigger: str, payload: list | None = None, connect=db) -> int:
-    with connect() as c:
-        if not payload and c.execute("SELECT 1 FROM queue WHERE loop = ? AND run_id IS NULL AND payload = '[]' "
-                                     "AND trigger = ?", (loop, trigger)).fetchone():
-            return 0
-        cur = c.execute("INSERT INTO queue (loop, queue, grp, trigger, payload, enqueued) VALUES (?,?,?,?,?,?)",
-                        (loop, queue, grp, trigger, json.dumps(payload or [], default=str), util.iso()))
-        return cur.lastrowid
+enqueue = loop_store.enqueue
 
 
-def pending(connect=reader) -> list[dict]:
-    with connect() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM queue WHERE run_id IS NULL ORDER BY id")]
+pending = loop_store.pending
 
 
-def queue_item(item_id: int) -> dict | None:
-    with reader() as c:
-        r = c.execute("SELECT * FROM queue WHERE id = ?", (item_id,)).fetchone()
-    return {**dict(r), "payload": json.loads(r["payload"] or "[]")} if r else None
+queue_item = loop_store.queue_item
 
 
-def take_queue_item(item_id: int, run_id: str) -> bool:
-    with db() as c:
-        return c.execute("UPDATE queue SET run_id = ? WHERE id = ? AND run_id IS NULL",
-                         (run_id, item_id)).rowcount == 1
+take_queue_item = loop_store.take_queue_item
 
 
-def drop_queue_item(item_id: int) -> None:
-    with db() as c:
-        c.execute("DELETE FROM queue WHERE id = ?", (item_id,))
+drop_queue_item = loop_store.drop_queue_item
 
 
-def release_claimed_items(run_id: str) -> None:
-    with db() as c:
-        c.execute("UPDATE queue SET run_id = NULL WHERE run_id = ?", (run_id,))
+release_claimed_items = loop_store.release_claimed_items
 
 
-def finish_claim(c, row: dict, how: str, summary: str) -> None:
-    if how == "retry":
-        duplicate = not json.loads(row["payload"] or "[]") and c.execute(
-            "SELECT 1 FROM queue WHERE loop = ? AND trigger = ? AND payload = '[]' AND run_id IS NULL",
-            (row["loop"], row["trigger"])).fetchone()
-        if duplicate:
-            how = "drop"
-        elif row["attempts"] + 1 < 2:
-            c.execute("UPDATE queue SET run_id = NULL, attempts = attempts + 1 WHERE id = ?", (row["id"],))
-            return
-        else:
-            how = "dead"
-    if how == "drop" or not json.loads(row["payload"] or "[]"):
-        c.execute("DELETE FROM queue WHERE id = ?", (row["id"],))
-    else:
-        c.execute("UPDATE queue SET dead_at = ?, dead_reason = ? WHERE id = ?",
-                  (util.iso(), summary, row["id"]))
+finish_claim = loop_store.finish_claim
 
 
-def end_claim(run_id: str, how: str, summary: str) -> None:
-    with db() as c:
-        for row in c.execute("SELECT * FROM queue WHERE run_id = ? AND dead_at IS NULL", (run_id,)).fetchall():
-            finish_claim(c, dict(row), how, summary)
+end_claim = loop_store.end_claim
 
 
-def release_settled_claims() -> None:
-    with db() as c:
-        rows = c.execute("SELECT q.*, r.status, r.summary FROM queue q LEFT JOIN runs r ON r.id = q.run_id "
-                         "WHERE q.run_id IS NOT NULL AND q.dead_at IS NULL "
-                         "AND (r.status IS NULL OR r.status != 'running')").fetchall()
-        for row in rows:
-            finish_claim(c, dict(row), "dead" if row["status"] == "stopped" else "retry",
-                         row["summary"] or f"run {row['run_id']} {row['status'] or 'is missing'}")
+release_settled_claims = loop_store.release_settled_claims
 
 
-def dead_items(connect=reader) -> list[dict]:
-    with connect() as c:
-        return [{**{k: row[k] for k in ("id", "loop", "run_id", "dead_reason", "dead_at")},
-                 "events": len(json.loads(row["payload"] or "[]"))}
-                for row in c.execute("SELECT * FROM queue WHERE dead_at IS NOT NULL ORDER BY id")]
+dead_items = loop_store.dead_items
 
 
-def requeue_item(item_id: int) -> None:
-    from . import control
-
-    with db() as c:
-        if not c.execute("UPDATE queue SET run_id = NULL, attempts = 0, dead_at = NULL, dead_reason = '' "
-                         "WHERE id = ? AND dead_at IS NOT NULL", (item_id,)).rowcount:
-            raise control.NotFound(f"no dead queue item {item_id}")
+requeue_item = loop_store.requeue_item
 
 
-SEEN_AGAIN = "seen again"
-CLOSED_AT = "COALESCE(NULLIF(closed, ''), last_seen)"
+SEEN_AGAIN = incident_store.SEEN_AGAIN
+CLOSED_AT = incident_store.CLOSED_AT
 
 
 def prune(days: float = 14, keep_days: float = 30, lines_days: float = 90) -> None:
-    since = util.iso(util.now() - timedelta(days=days))
-    with db() as c:
-        run_store.prune(c, days, lines_days)
-        c.execute("DELETE FROM queue WHERE dead_at < ?", (util.iso(util.now() - timedelta(days=days * 4)),))
-        c.execute("DELETE FROM events WHERE ts < ?", (util.iso(util.now() - timedelta(days=days * 4)),))
-        old = util.iso(util.now() - timedelta(days=days * 4))
-        kept = util.iso(util.now() - timedelta(days=keep_days))
-        done = f"SELECT id FROM incidents WHERE state != 'open' AND {CLOSED_AT} < ?"
-        c.execute("DELETE FROM incident_notes WHERE ts < ? AND note LIKE ?", (since, f"{SEEN_AGAIN}:%"))
-        c.execute(f"DELETE FROM incident_notes WHERE incident IN ({done})", (kept,))
-        c.execute(f"UPDATE incidents SET evidence = '' WHERE id IN ({done})", (kept,))
-        c.execute(f"DELETE FROM incidents WHERE last_seen < ? AND (state = 'open' OR {CLOSED_AT} < ?)", (old, kept))
-        c.execute("DELETE FROM incident_notes WHERE incident NOT IN (SELECT id FROM incidents)")
-        c.execute("DELETE FROM incident_aliases WHERE incident NOT IN (SELECT id FROM incidents)")
-        c.execute("DELETE FROM incident_repairs WHERE incident NOT IN (SELECT id FROM incidents)")
+    from . import store
+
+    store.prune(days=days, keep_days=keep_days, lines_days=lines_days)
 
 
-def write_incident(c, sighting: Sighting) -> tuple[int, bool]:
-    fingerprint, kind, source, repo = sighting.fingerprint, sighting.kind, sighting.source, sighting.repo
-    signature, count, evidence, policies = sighting.signature, sighting.count, sighting.evidence, sighting.policies
-    now = util.iso()
-    row = c.execute("SELECT id, count FROM incidents WHERE state = 'open' AND (fingerprint = ? OR id IN "
-                    "(SELECT incident FROM incident_aliases WHERE fingerprint = ?)) ORDER BY fingerprint = ? DESC "
-                    "LIMIT 1", (fingerprint, fingerprint, fingerprint)).fetchone()
-    if row:
-        c.execute("UPDATE incidents SET count = count + ?, last_seen = ?, evidence = ?, "
-                  "policies = COALESCE(policies, ?) WHERE id = ?", (count, now, evidence, policies, row["id"]))
-        note = f"{SEEN_AGAIN}: {count} more from {source}, {row['count'] + count} in all"
-        opened, incident_id = False, row["id"]
-    else:
-        incident_id = c.execute("INSERT INTO incidents (fingerprint, class, source, repo, signature, first_seen, "
-                                "last_seen, count, evidence, policies) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                                (fingerprint, kind, source, repo, signature, now, now, count, evidence,
-                                 policies)).lastrowid
-        note, opened = f"opened: {kind}, {count} from {source}", True
-    c.execute("INSERT INTO incident_notes (incident, ts, note) VALUES (?,?,?)", (incident_id, now, note))
-    return incident_id, opened
+write_incident = incident_store.write_incident
 
 
-def record_incident(sighting: Sighting) -> tuple[int, bool]:
-    with db() as c:
-        return write_incident(c, sighting)
+record_incident = incident_store.record_incident
 
 
-def commit_scan(incident_rows: list[Sighting], cursor_rows: list[tuple[str, str, bool, str]],
-                aliases=(), marks=None) -> list[bool]:
-    with db() as c:
-        for fingerprint, incident_id, note in aliases:
-            c.execute("INSERT OR REPLACE INTO incident_aliases (fingerprint, incident, ts) VALUES (?,?,?)",
-                      (fingerprint, incident_id, util.iso()))
-            c.execute("INSERT INTO incident_notes (incident, ts, note) VALUES (?,?,?)",
-                      (incident_id, util.iso(), note))
-        opened = []
-        for row in incident_rows:
-            incident_id, new = write_incident(c, row)
-            opened.append(new)
-            if new and row.fingerprint in (marks or {}):
-                fields, note = marks[row.fingerprint]
-                c.execute(f"UPDATE incidents SET {', '.join(f'{name} = ?' for name in fields)} WHERE id = ?",
-                          (*fields.values(), incident_id))
-                c.execute("INSERT INTO incident_notes (incident, ts, note) VALUES (?,?,?)",
-                          (incident_id, util.iso(), note))
-        for source, value, ok, detail in cursor_rows:
-            c.execute("INSERT OR REPLACE INTO cursors (source, value, polled, ok, detail) VALUES (?,?,?,?,?)",
-                      (source, value, util.iso(), int(ok), detail[:500]))
-        return opened
+add_incident_note = incident_store.add_incident_note
 
 
-def add_incident_note(incident_id: int, note: str) -> None:
-    with db() as c:
-        c.execute("INSERT INTO incident_notes (incident, ts, note) VALUES (?,?,?)", (incident_id, util.iso(), note))
+open_incidents = incident_store.open_incidents
 
 
-def open_incidents(limit: int = 500) -> list[dict]:
-    with reader() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM incidents WHERE state = 'open' "
-                                           "ORDER BY last_seen DESC, id DESC LIMIT ?", (limit,))]
+incidents_to_decide = incident_store.incidents_to_decide
 
 
-def incidents_to_decide() -> list[dict]:
-    with reader() as c:
-        return [dict(r) for r in c.execute(
-            "SELECT * FROM incidents WHERE state = 'open' AND injection = 0 AND class != 'expected' "
-            "AND decision IN ('', 'ignore') ORDER BY id")]
+known_fingerprints = incident_store.known_fingerprints
 
 
-def known_fingerprints() -> dict[str, dict]:
-    with reader() as c:
-        held = {r[0]: {"source": r[1], "repo": r[2], "policies": r[3]} for r in c.execute(
-            "SELECT a.fingerprint, i.source, i.repo, i.policies FROM incident_aliases a JOIN incidents i "
-            "ON i.id = a.incident WHERE i.state = 'open'")}
-        held.update((r[0], {"source": r[1], "repo": r[2], "policies": r[3]}) for r in c.execute(
-            "SELECT fingerprint, source, repo, policies FROM incidents WHERE state = 'open'"))
-        return held
+update_incident = incident_store.update_incident
 
 
-def update_incident(incident_id: int, note: str = "", **fields) -> None:
-    if fields.get("state", "open") != "open" and "closed" not in fields:
-        fields["closed"] = util.iso()
-    with db() as c:
-        if fields:
-            c.execute(f"UPDATE incidents SET {', '.join(f'{name} = ?' for name in fields)} WHERE id = ?",
-                      (*fields.values(), incident_id))
-        if note:
-            c.execute("INSERT INTO incident_notes (incident, ts, note) VALUES (?,?,?)",
-                      (incident_id, util.iso(), note))
+woken_incidents = incident_store.woken_incidents
 
 
-def woken_incidents() -> list[dict]:
-    with reader() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM incidents WHERE state = 'open' AND decision = 'wake' "
-                                           "AND injection = 0 ORDER BY id")]
+closed_alerted = incident_store.closed_alerted
 
 
-def closed_alerted() -> list[int]:
-    with reader() as c:
-        return [r[0] for r in c.execute("SELECT id FROM incidents WHERE alerted = 1 AND state != 'open' ORDER BY id")]
+add_repair = incident_store.add_repair
 
 
-def add_repair(incident_id: int, repo: str) -> int:
-    with db() as c:
-        return c.execute("INSERT INTO incident_repairs (incident, repo, started) VALUES (?,?,?)",
-                         (incident_id, repo, util.iso())).lastrowid
+set_repair = incident_store.set_repair
 
 
-def set_repair(repair_id: int, **fields) -> None:
-    with db() as c:
-        c.execute(f"UPDATE incident_repairs SET {', '.join(f'{name} = ?' for name in fields)} WHERE id = ?",
-                  (*fields.values(), repair_id))
+incident_repairs = incident_store.incident_repairs
 
 
-def incident_repairs(connect=reader) -> list[dict]:
-    with connect() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM incident_repairs ORDER BY id")]
+parsed = incident_store.parsed
 
 
-def parsed(row: dict) -> dict:
-    return {**row, "answers": json.loads(row["answers"] or "{}")}
+incidents = incident_store.incidents
 
 
-def incidents(connect=reader, limit: int = 200, open_first: bool = False) -> list[dict]:
-    order = "state != 'open', " if open_first else ""
-    with connect() as c:
-        return [parsed(dict(r)) for r in c.execute(f"SELECT * FROM incidents ORDER BY {order}last_seen DESC, id DESC "
-                                                   "LIMIT ?", (limit,))]
+blocked_incidents = incident_store.blocked_incidents
 
 
-def blocked_incidents(connect=reader) -> list[dict]:
-    with connect() as c:
-        return [dict(r) for r in c.execute("SELECT id, class, source, signature, waiting, last_seen FROM incidents "
-                                           "WHERE state = 'open' AND phase = 'blocked' ORDER BY id")]
-
-
-def incident(incident_id: int, connect=reader, last_notes: int = 0) -> dict | None:
-    with connect() as c:
-        r = c.execute("SELECT * FROM incidents WHERE id = ?", (incident_id,)).fetchone()
-        if not r:
-            return None
-        total = c.execute("SELECT COUNT(*) FROM incident_notes WHERE incident = ?", (incident_id,)).fetchone()[0]
-        if last_notes > 0:
-            notes = c.execute("SELECT ts, note FROM (SELECT id, ts, note FROM incident_notes WHERE incident = ? "
-                              "ORDER BY id DESC LIMIT ?) ORDER BY id", (incident_id, last_notes))
-        else:
-            notes = c.execute("SELECT ts, note FROM incident_notes WHERE incident = ? ORDER BY id", (incident_id,))
-        repairs = c.execute("SELECT * FROM incident_repairs WHERE incident = ? ORDER BY id", (incident_id,))
-        return {**parsed(dict(r)), "notes": [dict(n) for n in notes], "notes_total": total,
-                "repairs": [dict(x) for x in repairs]}
+incident = incident_store.incident
 
 
 def add_approval(loop: str, run_id: str, emit: dict, summary: str, failed: str = "") -> int:
@@ -836,26 +592,16 @@ def record_refresh(before: str, after: str, previous: str, latest: str) -> None:
                 save_hold(c, scope, row["until"], row["why"], row["ts"])
 
 
-def pass_over(repo: str, issue: str) -> None:
-    with db() as c:
-        c.execute("INSERT OR IGNORE INTO passed_over (repo, issue, since) VALUES (?,?,?)", (repo, str(issue), util.iso()))
+pass_over = source_store.pass_over
 
 
-def tickets_passed_over() -> list[dict]:
-    with reader() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM passed_over ORDER BY since")]
+tickets_passed_over = source_store.tickets_passed_over
 
 
-def take_passed_over(repo: str, issue: str) -> str:
-    with db() as c:
-        r = c.execute("SELECT since FROM passed_over WHERE repo = ? AND issue = ?", (repo, str(issue))).fetchone()
-        c.execute("DELETE FROM passed_over WHERE repo = ? AND issue = ?", (repo, str(issue)))
-    return r["since"] if r else ""
+take_passed_over = source_store.take_passed_over
 
 
-def drop_passed_over(repo: str, keep: str = "") -> None:
-    with db() as c:
-        c.execute("DELETE FROM passed_over WHERE repo = ? AND issue != ?", (repo, str(keep)))
+drop_passed_over = source_store.drop_passed_over
 
 
 runs_marked_running = run_store.runs_marked_running
@@ -954,24 +700,13 @@ def probe_set(name: str, ok: bool, detail: str) -> None:
         )
 
 
-def alert_get(key: str) -> dict | None:
-    with reader() as c:
-        r = c.execute("SELECT * FROM alerts WHERE key = ?", (key,)).fetchone()
-        return dict(r) if r else None
+alert_get = incident_store.alert_get
 
 
-def alert_set(key: str, issue: int | None, repo: str = "") -> None:
-    prev = alert_get(key)
-    with db() as c:
-        c.execute(
-            "INSERT OR REPLACE INTO alerts (key, issue, opened, last_seen, repo) VALUES (?,?,?,?,?)",
-            (key, issue, (prev or {}).get("opened") or util.iso(), util.iso(), repo or (prev or {}).get("repo") or ""),
-        )
+alert_set = incident_store.alert_set
 
 
-def alert_clear(key: str) -> None:
-    with db() as c:
-        c.execute("DELETE FROM alerts WHERE key = ?", (key,))
+alert_clear = incident_store.alert_clear
 
 
 def probes(connect=reader) -> list[dict]:
@@ -979,9 +714,7 @@ def probes(connect=reader) -> list[dict]:
         return [dict(r) for r in c.execute("SELECT * FROM probes ORDER BY name")]
 
 
-def alerts(connect=reader) -> list[dict]:
-    with connect() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM alerts ORDER BY opened")]
+alerts = incident_store.alerts
 
 
 def add_proposal(run_id: str, p: dict, status: str, pr_url: str = "") -> None:

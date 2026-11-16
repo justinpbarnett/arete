@@ -33,6 +33,7 @@ from . import (
 from .refusals import TrackerFailed
 from .store import db as foundation
 from .store import runs as run_store
+from .store import sources as source_store
 
 TITLE_CHARS = 80
 START_LOCK = "task-start"
@@ -114,7 +115,7 @@ def held(cfg: config.Config, repo: config.Repo) -> str:
 
 
 def queued(repo: config.Repo, tid: str, why: str, poller_picks: bool) -> dict:
-    state.pass_over(repo.name, tid)
+    source_store.pass_over(repo.name, tid)
     later = POLLER_LATER if poller_picks else (
         f'start task {tid} with {{"repo": "{repo.name}", "ticket": "{tid}"}} when a slot frees')
     return answer(tid, repo.name, "", "queued", f"{why}; {later}")

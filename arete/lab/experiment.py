@@ -27,7 +27,6 @@ from .. import (
     run_lines,
     runner,
     slots,
-    state,
     steps,
     util,
     workspace,
@@ -35,6 +34,7 @@ from .. import (
 from ..agent import traits_of
 from ..diffguard import denied_paths
 from ..store import runs as run_store
+from ..store import sources as source_store
 from ..util import engine_commit
 
 ATOMS = ("plan", "build", "check_repair")
@@ -763,7 +763,7 @@ def take_slot(exp: Experiment, path: Path, waiting: dict, used: Totals) -> tuple
     while True:
         with slots.admitting():
             free = slots.slots_free_to_start(slots.live_max_parallel(exp.cfg.max_parallel))
-            passed = state.tickets_passed_over()
+            passed = source_store.tickets_passed_over()
             if free > 0 and not passed:
                 run_id = record.start("experiment", tag=tag, lock=run_store.run_lock("experiment", exp.repo.name),
                                       repo=exp.repo.name)

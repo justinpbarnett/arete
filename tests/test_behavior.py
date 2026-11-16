@@ -59,6 +59,9 @@ class StoreContractTests(unittest.TestCase):
         self.assertTrue(found["complete"] and found["unique"] and found["record_compatibility"])
         self.assertTrue(found["ledger_unchanged"])
         self.assertEqual(found["foundation"], "db")
+        self.assertTrue(found["aggregate_compatibility"])
+        self.assertEqual(found["loop_lock_owner"], "loops")
+        self.assertEqual(found["readers"]["state"], {"remember": 7})
 
     def test_record_readers_and_billing(self):
         found = self.scenario("record-readers")
@@ -78,6 +81,26 @@ class StoreContractTests(unittest.TestCase):
         self.assertEqual(found["deleted_ids"], ["old-done", "old-skipped"])
         self.assertTrue(all(found[k] for k in ("rollback", "history_retained", "merged_raw_kept",
                                              "custom_windows", "deletion_retry", "unsafe_refused")))
+        self.assertTrue(found["baseline_compatible"])
+        self.assertEqual(found["rollback_before"], found["rollback_after"])
+        self.assertEqual(found["rollback_failure"], "incidents prune sentinel")
+        self.assertEqual(len(found["retention"]["queue"]), 8)
+
+    def test_scan_writes_are_ordered_and_atomic(self):
+        found = self.scenario("scan-atomicity")
+        self.assertEqual(found["opened"], [False, True, False, True])
+        self.assertTrue(found["baseline_compatible"] and found["rollback"] and found["new_only_marks"])
+        self.assertEqual(found["before"], found["after_failure"])
+        self.assertEqual(found["cursor_detail_length"], 500)
+        self.assertEqual(found["failure"], "later cursor sentinel")
+
+    def test_server_prunes_once_after_backup_and_continues_cleanup(self):
+        found = self.scenario("server-prune")
+        self.assertTrue(found["backup_checked"] and found["snapshot_failure_skipped"] and found["health_requested"])
+        self.assertEqual(found["prune_calls"], [{"lines_days": 17, "keep_days": 9}])
+        self.assertEqual(found["phases"], ["copy", "store", "folders", "records", "rotate"])
+        self.assertEqual(found["continuations"], {"database sentinel": ["folders", "records", "rotate"],
+                                                "record sentinel": ["folders", "rotate"]})
 
     def test_unknown_areas_cannot_execute_or_mutate(self):
         found = self.scenario("unknown-area")
@@ -493,7 +516,7 @@ class LogRotationTests(unittest.TestCase):
                        mock.patch.object(serve.loops, "load_all", return_value=[]),
                        mock.patch.object(serve.record, "reap", return_value=[]),
                        mock.patch.object(serve.sessions, "tell_chats"),
-                       mock.patch.object(serve.state, "loop_states", return_value={}),
+                       mock.patch.object(serve.loop_store, "loop_states", return_value={}),
                        mock.patch.object(serve.delivery, "release_lapsed", return_value=[]),
                        mock.patch.object(serve.tasks, "expire_asks", return_value=[]),
                        mock.patch.object(serve.webpush, "remind", return_value=[])]

@@ -27,6 +27,7 @@ from . import (
     util,
     workspace,
 )
+from .store import loops as loop_store
 from .store import runs as run_store
 
 
@@ -388,7 +389,7 @@ def check_backup_offsite(cfg: config.Config) -> Check:
 def check_loops(cfg: config.Config) -> list[Check]:
     from . import loops
 
-    beats = state.loop_marks()
+    beats = loop_store.loop_marks()
     out = []
     for loop in loops.load_all(cfg):
         if not loop.enabled or loop.error or not loop.stale_hours or loop.name == os.environ.get("ARETE_LOOP"):
@@ -413,7 +414,7 @@ def check_loops(cfg: config.Config) -> list[Check]:
 
 
 def mark_loop(name: str, ok: bool, detail: str = "") -> None:
-    state.set_loop_state(name, mark_ok=int(ok), mark_detail=detail[:200], mark_at=util.iso())
+    loop_store.set_loop_state(name, mark_ok=int(ok), mark_detail=detail[:200], mark_at=util.iso())
 
 
 def network_up_or_skip(loop: str, dry_run: bool) -> bool:
