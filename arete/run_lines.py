@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from . import codebase, events, paths, principals, state, util
+from .store import runs as run_store
 
 FILE = "run.jsonl"
 HEARTBEAT_SECONDS = 30
@@ -87,10 +88,10 @@ def write(run_id: str, event: str, **fields) -> dict:
         print(f"{util.iso()} could not write {event} to {target}: {e}", file=sys.stderr, flush=True)
     if event in ("step_start", "step_end"):
         step, attempt = str(fields.get("step", "")), fields.get("try", 1)
-        with principals.acting(f"run:{run_id}/{step}"), state.tx() as c:
-            row = c.execute("SELECT issue FROM runs WHERE id = ?", (run_id,)).fetchone()
+        with principals.acting(f"run:{run_id}/{step}"), state.tx():
+            row = run_store.run_get(run_id)
             events.emit("step.started" if event == "step_start" else "step.ended",
-                        f"step:{run_id}/{step}/{attempt}", cls="derived", task=row[0] if row else None,
+                        f"step:{run_id}/{step}/{attempt}", cls="derived", task=row["issue"] if row else None,
                         data={**fields, "run": run_id, "step": step, "try": attempt})
     sys.stdout.write(text + "\n")
     sys.stdout.flush()

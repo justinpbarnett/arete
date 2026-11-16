@@ -5,7 +5,7 @@ import math
 import sqlite3
 from datetime import timedelta
 
-from .. import util
+from .. import events, util
 from ..agent import billing_of
 from .db import db, reader, tx
 
@@ -370,6 +370,8 @@ def insert_run(run_id: str, row: dict) -> None:
     cols, marks = ", ".join(row), ", ".join("?" * len(row))
     with db() as c:
         c.execute(f"INSERT INTO runs (id, {cols}) VALUES (?, {marks})", (run_id, *row.values()))
+        events.emit("run.started", f"run:{run_id}", cls="derived", task=row.get("issue"),
+                    data={"run": run_id, **row})
 
 
 def insert_steps(run_id: str, name: str, calls, effort: str = "", tier: str = "", kind: str = "",
@@ -422,8 +424,12 @@ def move(run_id: str, to: str, expect: tuple[str, ...], **fields) -> bool:
 
 def ask_stop(run_id: str) -> dict | None:
     with db() as c:
-        c.execute("UPDATE runs SET stop_asked = ? WHERE id = ? AND status = 'running'", (util.iso(), run_id))
+        changed = c.execute("UPDATE runs SET stop_asked = ? WHERE id = ? AND status = 'running' "
+                            "AND COALESCE(stop_asked, '') = ''", (util.iso(), run_id)).rowcount
         r = c.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if changed:
+            events.emit("run.changed", f"run:{run_id}", cls="derived", task=r["issue"],
+                        data={"run": run_id, "stop_asked": r["stop_asked"]})
     return dict(r) if r else None
 
 
@@ -434,7 +440,10 @@ def settle(run_id: str, fields: dict, end_line: str = "") -> dict | None:
             return None
         if end_line:
             insert_feed(run_id, "end", end_line)
-        return dict(c.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone())
+        settled = dict(c.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone())
+        events.emit("run.ended", f"run:{run_id}", cls="derived", task=settled["issue"],
+                    data={"run": run_id, **fields})
+        return settled
 
 
 def finished_runs_since(since: str, until: str = "9999") -> list[dict]:

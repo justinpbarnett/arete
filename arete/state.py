@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import json
-import os
 import secrets
 import sqlite3
 from collections.abc import Sequence
-from contextlib import contextmanager
 from datetime import timedelta
 
-from . import dbstats, paths, util
+from . import util
 from .store import db as foundation
 from .store import incidents as incident_store
 from .store import loops as loop_store
@@ -44,44 +42,9 @@ USAGE_COLUMNS = ("at", "tab", "device", "kind", "view", "name", "via", "ms")
 REFRESH_SCOPE = "credential-refresh-v1:"
 
 
-@contextmanager
-def reader(*, streaming=False):
-    if not streaming:
-        with one_read() as conn:
-            yield conn
-        return
-    conn = paths.connect_db(paths.DB_FILE, readonly=True, streaming=True)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-    finally:
-        conn.close()
-
-
-@contextmanager
-def read_snapshot(conn):
-    timing = dbstats.Timing(paths.DB_FILE, "read")
-    try:
-        conn.execute("BEGIN")
-        timing.begun()
-        yield conn
-    except BaseException as e:
-        timing.error = type(e).__name__
-        timing.sqlite_error = isinstance(e, sqlite3.Error)
-        raise
-    finally:
-        try:
-            if conn.in_transaction:
-                conn.execute("ROLLBACK")
-        finally:
-            timing.finished()
-
-
-def write_connection():
-    active = getattr(foundation._OWNER, "active", None)
-    if not active or active[:2] != (os.getpid(), "write") or not active[2].in_transaction:
-        raise RuntimeError("event emission needs an open write transaction")
-    return active[2]
+reader = foundation.reader
+read_snapshot = foundation.read_snapshot
+write_connection = foundation.write_connection
 
 
 backfill_legacy_cost = run_store.backfill_legacy_cost

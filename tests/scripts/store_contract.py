@@ -40,7 +40,10 @@ def ownership(root):
     assert migrations.area_owner("work", "m0004_work_event_routing.py") == "loops"
     before = ledger(db)
     assert all(migrations.area_owner(row[2], row[1]) for row in before), before
-    assert before[-1][2] == "loops", before[-1]
+    assert before[3][2] == "loops", before[3]
+    assert before[-1][0] == 5 and before[-1][2] == "foundation", before[-1]
+    assert owners["events"]["events_log"]
+    assert set(owners["principals"]) == {"principals", "principal_logins"}
     db.migrate()
     assert ledger(db) == before
     run = record.start("pipeline", run_id="store-contract")
@@ -159,23 +162,26 @@ def upgrade(root):
     assert ledger(db) == original
     db.migrate()
     full = ledger(db)
-    assert full[:2] == original and [r[0] for r in full[2:]] == [3, 4], full
+    assert full[:2] == original and [r[0] for r in full[2:]] == [3, 4, 5], full
     db.migrate()
     assert ledger(db) == full
-    old_location = historical_chain(root, "origin/main", names)
+    old_location = historical_chain(root, "origin/main", names[:4])
     other = paths.STATE_DIR / "origin-main" / "arete.db"
     other.parent.mkdir()
     with mock.patch.object(paths, "DB_FILE", other):
         with mock.patch.object(migrations, "FOLDER", old_location):
             db.migrate()
-        with db.db() as conn:
+        with db.owning_transaction(lambda: db.connect_db(other)) as conn:
             conn.execute("UPDATE schema_migrations SET area='work' WHERE n=4")
         previous = ledger(db)
         db.migrate()
-        assert ledger(db) == previous
+        upgraded = ledger(db)
+        assert upgraded[:4] == previous and [r[0] for r in upgraded[4:]] == [5], upgraded
         assert previous[-1][2] == "work"
+        db.migrate()
+        assert ledger(db) == upgraded
     return {"historical_rows": len(original), "hashes_unchanged": True, "relocated_rows_added": 0,
-            "applied_once": [3, 4], "origin_main_rows_added": 0, "historical_work_preserved": True}
+            "applied_once": [3, 4, 5], "origin_main_rows_added": 1, "historical_work_preserved": True}
 
 
 
@@ -342,7 +348,7 @@ def record_failures(root):
 def run_retention(root):
     from datetime import timedelta
 
-    from arete import agent, paths, record, state, store, util
+    from arete import agent, events, paths, record, state, store, util
     from arete.store import db, incidents, runs as run_store
     from tests.harness import age_run
 
@@ -408,6 +414,11 @@ def run_retention(root):
     record.step("expired", "history", agent.Result(ok=True, runner="replay"), 0)
     run_store.save_report("expired", {"summary": "history survives"})
     seed_retention()
+    with db.tx() as c:
+        trimmed_seq = events.emit("fixture.changed", "fixture:prune", cls="derived", data={})
+        c.execute("UPDATE events_log SET at = ? WHERE seq = ?",
+                  (util.iso(instant - timedelta(days=91)), trimmed_seq))
+    event_before = snapshot_tables("events_log", "schema_meta")
     baseline = baseline_database(root, "retention-baseline")
     with mock.patch.object(paths, "DB_FILE", baseline):
         original_function("prune")()
@@ -425,7 +436,11 @@ def run_retention(root):
         refuses(RuntimeError, store.prune)
     after_failure = inventory()
     assert after_failure == before
+    assert snapshot_tables("events_log", "schema_meta") == event_before
     store.prune()
+    with db.reader() as c:
+        assert not c.execute("SELECT 1 FROM events_log WHERE seq = ?", (trimmed_seq,)).fetchone()
+        assert int(c.execute("SELECT value FROM schema_meta WHERE key = 'trim_derived'").fetchone()[0]) == trimmed_seq
     assert inventory() == expected
     retention = retained_inventory()
     all_ids = {r["id"] for r in run_store.runs(firings=True, limit=200)}

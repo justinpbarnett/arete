@@ -27,7 +27,6 @@ from . import (
     delivery,
     devices,
     environment,
-    events,
     explain,
     hold_review,
     install,
@@ -461,8 +460,6 @@ class Server:
             self.copy_off_machine(made)
         limits = self.cfg.retention
         try:
-            with state.tx():
-                events.trim()
             store.prune(lines_days=limits.lines_days, keep_days=self.cfg.oncall.keep_days)
         except Exception as e:
             self.say(f"state prune failed: {type(e).__name__}: {util.first_line(str(e), 300)}")

@@ -75,13 +75,14 @@ def exercise(scenario, root=None):
 class Fixture:
     def __init__(self, root, port=0):
         from arete import codebase, config, dashboard, paths, principals, state, tailnet
+        from arete.store import db as foundation
 
         self.root, self.server, self.thread = root, None, None
         self.state, self.paths, self.principals, self.tailnet = state, paths, principals, tailnet
         codebase.load()
         state.migrate()
         if not paths.ISOLATED:
-            connection = paths.connect_db(paths.DB_FILE)
+            connection = foundation.connect_db(paths.DB_FILE)
             try:
                 assert connection.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
             finally:
@@ -723,7 +724,7 @@ def row_actors(f):
 
 
 def beats(f):
-    from arete import events, loops, serve
+    from arete import control, events, loops, serve
 
     loops.SWITCHES_FILE.write_text(json.dumps({p.name: False for p in loops.BUNDLED_LOOPS_DIR.iterdir() if p.is_dir()}))
     folder = f.paths.CONFIG_DIR / "loops/aaa"
@@ -732,6 +733,19 @@ def beats(f):
     server = serve.Server()
     release, blocked, stop = threading.Event(), threading.Event(), threading.Event()
     tick_thread = traffic = None
+    scanned = threading.local()
+    expected_ids = []
+    scan, serve_beat = events.scan, control.serve_beat
+
+    def observed_scan(*args):
+        result = scan(*args)
+        scanned.cursor = f"{result[0]}.{result[1]}"
+        return result
+
+    def observed_beat():
+        expected_ids.append(scanned.cursor)
+        return serve_beat()
+
     try:
         def broken(loop):
             raise RuntimeError("fixture watch_metric")
@@ -739,11 +753,14 @@ def beats(f):
         server.pruned = server.swept = server.rotated = server.checked_closed = time.monotonic()
         with mock.patch.object(server, "poll", broken), mock.patch.object(server, "load_new_code"):
             server.run_pass()
-        with Stream(f, "/api/events?kinds=absent") as stream:
+        with mock.patch.object(events, "scan", observed_scan), \
+                mock.patch.object(control, "serve_beat", observed_beat), \
+                Stream(f, "/api/events?kinds=absent") as stream:
             stream.wait(lambda ms: any(m["data"].get("kind") == "serve.beat" for m in ms), 40)
             first = stream.messages[-1]
             assert first["data"]["tick_ok"] is False
             assert "loop:aaa" in first["data"]["failing"]
+            assert first["id"] == expected_ids[0]
 
             def block():
                 blocked.set()
@@ -763,6 +780,8 @@ def beats(f):
                 second, third = stream.messages[1:3]
                 assert first["data"]["at"] == second["data"]["at"] == third["data"]["at"]
                 assert 14 <= third["at"] - second["at"] <= 17
+                assert [m["id"] for m in stream.messages[:3]] == expected_ids[:3]
+                assert int(third["id"].split(".")[1]) > int(first["id"].split(".")[1])
                 assert int(third["id"].split(".")[1]) <= int(third["data"]["head"].split(".")[1])
                 stop.set()
                 traffic.join(5)
@@ -833,11 +852,12 @@ def child(scenario, root, port):
     if scenario == "admission-empty":
         (root / "config/config.toml").write_text('[dashboard]\nowner=""\n')
     if scenario == "row-actors":
-        from arete import migrations, state
+        from arete import state
+        from arete.store import db as foundation, migrations
 
         chain = migrations.load()
         with mock.patch.object(migrations, "load", return_value=chain[:4]), \
-                mock.patch.multiple(state, LATEST=4, NEEDED=4):
+                mock.patch.multiple(foundation, LATEST=4, NEEDED=4):
             state.migrate()
             legacy = state.task_add("replay-sample", "A legacy question", "Legacy", "feat")
             state.task_set_state(legacy, "needs-info")

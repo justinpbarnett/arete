@@ -165,8 +165,8 @@ class StoreContractTests(unittest.TestCase):
         found = self.scenario("upgrade")
         self.assertEqual(found["historical_rows"], 2)
         self.assertTrue(found["hashes_unchanged"] and found["historical_work_preserved"])
-        self.assertEqual(found["applied_once"], [3, 4])
-        self.assertEqual((found["relocated_rows_added"], found["origin_main_rows_added"]), (0, 0))
+        self.assertEqual(found["applied_once"], [3, 4, 5])
+        self.assertEqual((found["relocated_rows_added"], found["origin_main_rows_added"]), (0, 1))
 
 
 class LogRotationTests(unittest.TestCase):

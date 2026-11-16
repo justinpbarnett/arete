@@ -22,7 +22,6 @@ from pathlib import Path
 from typing import Self
 
 from . import agent, codebase, paths, run_lines, scrub, state, util
-from . import events as event_log
 from .store import db as foundation
 from .store import loops as loop_store
 from .store import runs as run_store
@@ -47,18 +46,14 @@ def new_id(prefix: str, tag: str = "") -> str:
 def start(kind: str, *, run_id: str = "", tag: str = "", lock: str = "", **fields) -> str:
     row = {"kind": kind, "status": "running", "started": util.iso(), "lock": lock or None, "pid": os.getpid(),
            "engine_sha": codebase.STAMP, "schema_version": foundation.LATEST, **fields}
-    cols, marks = ", ".join(row), ", ".join("?" * len(row))
     while True:
         minted = run_id or new_id(ID_PREFIX.get(kind, kind), tag)
-        with state.db() as c:
-            try:
-                c.execute(f"INSERT INTO runs (id, {cols}) VALUES (?, {marks})", (minted, *row.values()))
-            except sqlite3.IntegrityError as e:
-                if run_id or "runs.id" not in str(e):
-                    raise
-                continue
-            event_log.emit("run.started", f"run:{minted}", cls="derived", task=fields.get("issue"),
-                           data={"run": minted, **row})
+        try:
+            run_store.insert_run(minted, row)
+        except sqlite3.IntegrityError as e:
+            if run_id or "runs.id" not in str(e):
+                raise
+            continue
         return minted
 
 
@@ -106,15 +101,7 @@ def move(run_id: str, to: str, expect: tuple[str, ...], **fields) -> bool:
 
 
 def ask_stop(run_id: str) -> dict | None:
-    with state.db() as c:
-        changed = c.execute("UPDATE runs SET stop_asked = ? WHERE id = ? AND status = 'running' "
-                            "AND COALESCE(stop_asked, '') = ''",
-                            (util.iso(), run_id)).rowcount
-        r = c.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
-        if changed:
-            event_log.emit("run.changed", f"run:{run_id}", cls="derived", task=r["issue"],
-                           data={"run": run_id, "stop_asked": r["stop_asked"]})
-    return dict(r) if r else None
+    return run_store.ask_stop(run_id)
 
 
 class Stopped(Exception):
@@ -141,15 +128,9 @@ def stop_asked(run_id: str) -> bool:
 
 def settle(run_id: str, status: str, end_line: str = "", **fields) -> dict | None:
     fields = {"status": status, "finished": util.iso(), **fields}
-    with state.db() as c:
-        if not c.execute(f"UPDATE runs SET {', '.join(f'{k} = ?' for k in fields)} WHERE id = ? AND status = 'running'",
-                         (*fields.values(), run_id)).rowcount:
-            return None
-        if end_line:
-            state.insert_feed(run_id, "end", end_line)
-        settled = dict(c.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone())
-        event_log.emit("run.ended", f"run:{run_id}", cls="derived", task=settled["issue"],
-                       data={"run": run_id, **fields})
+    settled = run_store.settle(run_id, fields, end_line)
+    if settled is None:
+        return None
     mark(run_id, "result", at=fields.pop("finished"), **fields)
     return settled
 
