@@ -23,7 +23,7 @@ PRELUDE = textwrap.dedent("""
     from unittest import mock
     root = Path(sys.argv[1])
     (root / "config" / "config.toml").write_text("")
-    from arete import control, heartbeat, install, oncall, paths, serve, util
+    from arete import control, heartbeat, install, log_follower, oncall, paths, serve, util
     logs = paths.LOG_DIR
     p = logs / "runs.log"
 
@@ -366,7 +366,7 @@ class LogRotationTests(unittest.TestCase):
             first = [f"first {i}" for i in range(10)]
             held_writer.write("".join(line + "\\n" for line in first))
             held_writer.flush()
-            older, current, mark = oncall.fresh(str(p), None, False)
+            older, current, mark = log_follower.fresh(str(p), None, False)
             seen_first = older + current
             assert install.rotate_logs(max_bytes=1, keep=5) == []
             inode_kept = (logs / "runs.log.1").stat().st_ino == mark[1]
@@ -376,12 +376,12 @@ class LogRotationTests(unittest.TestCase):
             new_lines = [f"new {i}" for i in range(10)]
             with p.open("a") as w:
                 w.write("".join(line + "\\n" for line in new_lines))
-            older, current, mark2 = oncall.fresh(str(p), mark, False)
+            older, current, mark2 = log_follower.fresh(str(p), mark, False)
             late_lines = [f"late {i}" for i in range(5)]
             held_writer.write("".join(line + "\\n" for line in late_lines))
             held_writer.close()
-            late = oncall.fresh(str(p), mark2, False)
-            again = oncall.fresh(str(p), late[2], False)
+            late = log_follower.fresh(str(p), mark2, False)
+            again = log_follower.fresh(str(p), late[2], False)
             finish({"first": seen_first == first, "inode": inode_kept, "got": older + current,
                     "want": held_lines + new_lines, "late": late[0] + late[1], "want_late": late_lines,
                     "again": [again[0], again[1]],

@@ -28,6 +28,7 @@ from . import (
     push,
     record,
     runner,
+    screening,
     sources,
     state,
     util,
@@ -436,18 +437,17 @@ def screened(run: LoopRun) -> tuple[str, str] | None:
     outside = jev_readable(run, [e for e in run.events if e.get("trust") == "untrusted"])
     if not outside:
         return None
-    question = {"injection": jev.yes_no(jev.INJECTION)}
-    replies = jev.ask_many([(fenced(e), question) for e in outside], run.cfg, trace=(run.id, "screen jev"))
+    screens = screening.screen_many([fenced(e) for e in outside], run.cfg, [], (run.id, "screen jev"),
+                                    whole=False, ready=True)
     flagged = set()
-    for e, reply in zip(outside, replies, strict=True):
-        a = reply.answers.get("injection")
-        if a and a.yes >= run.cfg.jev.injection:
+    for e, screened in zip(outside, screens, strict=True):
+        if screening.held(screened, screening.Posture.OPEN):
             flagged.add(id(e))
-            run.log("screen", f"dropped, it reads as instructions to an agent (JEV {a.note()}): "
+            run.log("screen", f"dropped, it reads as instructions to an agent (JEV {screened.answer.note()}): "
                               f"{util.first_line(e.get('title', ''), 120)}")
-        elif not a:
-            run.log("screen", f"JEV could not screen it ({util.first_line(reply.error, 200)}), so it goes on: "
-                              f"{util.first_line(e.get('title', ''), 120)}")
+        elif screened.status == screening.FAILED:
+            run.log("screen", f"JEV could not screen it ({util.first_line(screened.reply.error, 200)}), so it goes "
+                              f"on: {util.first_line(e.get('title', ''), 120)}")
     arrived = len(run.events)
     run.events = [e for e in run.events if id(e) not in flagged]
     if arrived and not run.events:
