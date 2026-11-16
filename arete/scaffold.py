@@ -20,9 +20,10 @@ from . import (
     record,
     runner,
     sources,
-    state,
     util,
 )
+from .store import db as foundation
+from .store import runs as run_store
 
 DRAFT_TRIES = 3
 REFERENCE = loops.BUNDLED_LOOPS_DIR / "README.md"
@@ -147,20 +148,20 @@ def start_draft(request: DraftRequest) -> dict:
         proc = control.detach(["loop", "new", "--name", request.name, "--repo", request.repo, "--model", request.model,
                                "--run-id", run_id, "--", request.sentence], DRAFTS_LOG)
     record.note(run_id, pid=proc.pid)
-    return state.run_get(run_id)
+    return run_store.run_get(run_id)
 
 
 def draft(request: DraftRequest, run_id: str = "", say=print) -> dict:
     cfg = config.load()
     if run_id:
-        record.note(run_id, pid=os.getpid(), engine_sha=codebase.STAMP, schema_version=state.LATEST)
+        record.note(run_id, pid=os.getpid(), engine_sha=codebase.STAMP, schema_version=foundation.LATEST)
     else:
         check_request(request, cfg, loop_names(cfg))
         run_id = record.start("draft", trigger="manual", summary=util.first_line(request.sentence, 200))
 
     def tell(kind: str, text: str) -> None:
         say(text)
-        state.add_feed(run_id, kind, text)
+        run_store.add_feed(run_id, kind, text)
 
     with record.stoppable(), record.failed_on_crash(run_id):
         try:
@@ -195,9 +196,9 @@ def write_draft(run_id: str, request: DraftRequest, cfg: config.Config, tell) ->
     loop = loops.find(folder.name)
     loops.set_enabled(loop, False)
     loop_toml = (dest / "loop.toml").read_text()
-    state.add_feed(run_id, "toml", loop_toml.rstrip())
+    run_store.add_feed(run_id, "toml", loop_toml.rstrip())
     if note := str(answer.get("note") or "").strip():
-        state.add_feed(run_id, "note", note)
+        run_store.add_feed(run_id, "note", note)
     return {"name": loop.name, "dir": str(dest), "note": note, "run": run_id, "loop_toml": loop_toml}
 
 

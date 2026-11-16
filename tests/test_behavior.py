@@ -94,6 +94,81 @@ class PrincipalTests(unittest.TestCase):
         self.exercise("completeness")
 
 
+class StoreContractTests(unittest.TestCase):
+    def scenario(self, case):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            done = subprocess.run(
+                [sys.executable, "-I", str(SOURCE / "tests/scripts/store_contract.py"), case],
+                cwd=SOURCE, env=environment(root), text=True, capture_output=True, timeout=180)
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            found = behavior_result(done)
+            self.assertEqual(found["case"], case)
+            self.assertEqual(len(set(found["isolated_paths"].values())), 6)
+            return found
+
+    def test_unique_table_ownership_and_compatibility(self):
+        found = self.scenario("ownership")
+        self.assertTrue(found["complete"] and found["unique"] and found["record_compatibility"])
+        self.assertTrue(found["ledger_unchanged"])
+        self.assertEqual(found["foundation"], "db")
+        self.assertTrue(found["aggregate_compatibility"])
+        self.assertEqual(found["loop_lock_owner"], "loops")
+        self.assertEqual(found["readers"]["state"], {"remember": 7})
+
+    def test_record_readers_and_billing(self):
+        found = self.scenario("record-readers")
+        self.assertEqual(found["paid"], 2.25)
+        self.assertEqual(found["finished_ids"], ["readers"])
+        self.assertEqual(found["whole_ids"], ["second", "readers"])
+        self.assertTrue(all(found[k] for k in ("stamps", "steps", "reports", "feed", "pins", "backfill")))
+
+    def test_record_failures_roll_back_and_settle_once(self):
+        found = self.scenario("record-failures")
+        self.assertTrue(all(found[k] for k in ("collision_retry", "explicit_collision", "batch_rollback",
+                                             "end_rollback", "repeated_settle", "missing_settle",
+                                             "committed_timeline_failure", "invalid_unchanged", "crash_reraised")))
+
+    def test_run_retention_protections_and_atomicity(self):
+        found = self.scenario("run-retention")
+        self.assertEqual(found["deleted_ids"], ["old-done", "old-skipped"])
+        self.assertTrue(all(found[k] for k in ("rollback", "history_retained", "merged_raw_kept",
+                                             "custom_windows", "deletion_retry", "unsafe_refused")))
+        self.assertTrue(found["baseline_compatible"])
+        self.assertEqual(found["rollback_before"], found["rollback_after"])
+        self.assertEqual(found["rollback_failure"], "incidents prune sentinel")
+        self.assertEqual(len(found["retention"]["queue"]), 8)
+
+    def test_scan_writes_are_ordered_and_atomic(self):
+        found = self.scenario("scan-atomicity")
+        self.assertEqual(found["opened"], [False, True, False, True])
+        self.assertTrue(found["baseline_compatible"] and found["rollback"] and found["new_only_marks"])
+        self.assertEqual(found["before"], found["after_failure"])
+        self.assertEqual(found["cursor_detail_length"], 500)
+        self.assertEqual(found["failure"], "later cursor sentinel")
+
+    def test_server_prunes_once_after_backup_and_continues_cleanup(self):
+        found = self.scenario("server-prune")
+        self.assertTrue(found["backup_checked"] and found["snapshot_failure_skipped"] and found["health_requested"])
+        self.assertEqual(found["prune_calls"], [{"lines_days": 17, "keep_days": 9}])
+        self.assertEqual(found["phases"], ["copy", "store", "folders", "records", "rotate"])
+        self.assertEqual(found["continuations"], {"database sentinel": ["folders", "records", "rotate"],
+                                                "record sentinel": ["folders", "rotate"]})
+
+    def test_unknown_areas_cannot_execute_or_mutate(self):
+        found = self.scenario("unknown-area")
+        self.assertEqual(set(found["refusals"]), {"outbox", "helper", "work"})
+        self.assertFalse(found["executed"])
+        self.assertTrue(found["schema_unchanged"] and found["ledger_unchanged"])
+
+    def test_immutable_historical_chains_upgrade_once(self):
+        found = self.scenario("upgrade")
+        self.assertEqual(found["historical_rows"], 2)
+        self.assertTrue(found["hashes_unchanged"] and found["historical_work_preserved"])
+        self.assertEqual(found["applied_once"], [3, 4])
+        self.assertEqual((found["relocated_rows_added"], found["origin_main_rows_added"]), (0, 0))
+
+
 class LogRotationTests(unittest.TestCase):
     def scenario(self, body, timeout=180):
         with tempfile.TemporaryDirectory() as directory:
@@ -494,7 +569,7 @@ class LogRotationTests(unittest.TestCase):
                        mock.patch.object(serve.loops, "load_all", return_value=[]),
                        mock.patch.object(serve.record, "reap", return_value=[]),
                        mock.patch.object(serve.sessions, "tell_chats"),
-                       mock.patch.object(serve.state, "loop_states", return_value={}),
+                       mock.patch.object(serve.loop_store, "loop_states", return_value={}),
                        mock.patch.object(serve.delivery, "release_lapsed", return_value=[]),
                        mock.patch.object(serve.tasks, "expire_asks", return_value=[]),
                        mock.patch.object(serve.webpush, "remind", return_value=[])]

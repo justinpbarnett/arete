@@ -1,3 +1,4 @@
+from arete.store import runs as run_store
 
 rid = record.start("pipeline")
 with state.db() as c:
@@ -13,7 +14,7 @@ try:
     raise AssertionError("write must fail")
 except sqlite3.IntegrityError:
     pass
-assert rows(rid) == [] and state.run_get(rid)["cost_usd"] == 0
+assert rows(rid) == [] and run_store.run_get(rid)["cost_usd"] == 0
 mark, = marks(rid)
 assert abs(mark["cost_usd"] - .0004) < 1e-12 and "cost is not in steps" in mark["error"], mark
 with state.db() as c:
@@ -33,4 +34,4 @@ try:
 except RuntimeError:
     pass
 r, = rows(rid)
-assert r["cost_usd"] == state.run_get(rid)["cost_usd"] == 2.5
+assert r["cost_usd"] == run_store.run_get(rid)["cost_usd"] == 2.5

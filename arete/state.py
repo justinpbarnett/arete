@@ -1,283 +1,47 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 import secrets
 import sqlite3
-import threading
-import time
 from collections.abc import Sequence
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from datetime import timedelta
 
-from . import dbstats, migrations, paths, util
-from .agent import billing_of
-from .migrations import m0002_foundation_time_shape as time_shape
-from .sighting import Sighting
+from . import dbstats, paths, util
+from .store import db as foundation
+from .store import incidents as incident_store
+from .store import loops as loop_store
+from .store import runs as run_store
+from .store import sources as source_store
 
-TIME_COLUMNS = time_shape.TIME_COLUMNS
-TIME_GLOB = time_shape.TIME_GLOB
+LATEST = foundation.LATEST
+MIGRATE_WAIT_SECONDS = foundation.MIGRATE_WAIT_SECONDS
+NEEDED = foundation.NEEDED
+TIME_COLUMNS = foundation.TIME_COLUMNS
+TIME_GLOB = foundation.TIME_GLOB
+IncompatibleSchema = foundation.IncompatibleSchema
+NoDatabase = foundation.NoDatabase
+checked_connection = foundation.checked_connection
+contract_blockers = foundation.contract_blockers
+db = foundation.db
+ensure_schema = foundation.ensure_schema
+execute_statements = foundation.execute_statements
+migrate = foundation.migrate
+missing_database = foundation.missing_database
+one_read = foundation.one_read
+owned = foundation.owned
+owning_transaction = foundation.owning_transaction
+read_connection = foundation.read_connection
+refuse_empty_file = foundation.refuse_empty_file
+tx = foundation.tx
 
-_CHAIN = migrations.load()
-LATEST = _CHAIN[-1].n
-NEEDED = max(m.n for m in _CHAIN if m.phase != "contract")
-MIGRATE_WAIT_SECONDS = 60
-_CHECKED = set()
-_OWNER = threading.local()
-
-
-class NoDatabase(RuntimeError):
-    pass
-
-
-class IncompatibleSchema(RuntimeError):
-    pass
-
-
-OPEN_PR_RUN = "(runs.status = 'pr' OR (runs.status IN ('failed', 'stopped') AND runs.pr_url != ''))"
+OPEN_PR_RUN = run_store.OPEN_PR_RUN
 DECIDABLE = ("pending", "failed")
 APPROVAL_NOTES = ("plain_summary", "plain_summary_tried", "review", "review_tried")
-WHOLE_RUN = "COALESCE(only_step, '') = ''"
+WHOLE_RUN = run_store.WHOLE_RUN
 USAGE_COLUMNS = ("at", "tab", "device", "kind", "view", "name", "via", "ms")
 REFRESH_SCOPE = "credential-refresh-v1:"
-
-
-def refuse_empty_file() -> None:
-    if paths.DB_FILE.exists() and paths.DB_FILE.stat().st_size > 0:
-        return
-    from . import backup
-
-    if newest := backup.newest_snapshot():
-        raise NoDatabase(f"{paths.DB_FILE} is missing or empty but {newest} exists; stop arete serve and run "
-                         f"`arete backup --restore {newest}` instead of starting over with an empty file")
-
-
-def missing_database():
-    refuse_empty_file()
-    return NoDatabase(f"{paths.DB_FILE} is missing; run arete serve or arete migrate")
-
-
-def contract_blockers(conn, n):
-    from . import control, record
-
-    blockers = []
-    for row in conn.execute("SELECT * FROM runs WHERE status = 'running' "
-                            "AND (schema_version IS NULL OR schema_version < ?)", (n,)):
-        row = dict(row)
-        with record.dead(row) as gone:
-            if not gone:
-                blockers.append(row["id"])
-    beat = util.read_json(control.BEAT_FILE, {})
-    if util.pid_alive(beat.get("pid")) and (beat.get("schema") or 0) < n:
-        blockers.append(f"serve {beat.get('pid')}")
-    return blockers
-
-
-def execute_statements(conn, sql):
-    pending = ""
-    for char in sql:
-        pending += char
-        if char == ";" and sqlite3.complete_statement(pending):
-            conn.execute(pending)
-            pending = ""
-    if pending.strip():
-        conn.execute(pending)
-
-
-def migrate(contracts=True):
-    from . import backup
-
-    chain = migrations.load()
-    paths.ensure_dirs()
-    with util.lock("migrate", wait=True):
-        refuse_empty_file()
-        conn = paths.connect_db(paths.DB_FILE, create=True)
-        conn.row_factory = sqlite3.Row
-        try:
-            version = conn.execute("PRAGMA user_version").fetchone()[0]
-            migrations.validate(conn, chain, version)
-            conn.close()
-            conn = None
-            snapshot = None
-            started_chain = False
-            for migration in chain:
-                if migration.n <= version:
-                    continue
-                if migration.phase == "contract":
-                    if not contracts:
-                        return True
-                    conn = paths.connect_db(paths.DB_FILE)
-                    conn.row_factory = sqlite3.Row
-                    try:
-                        blockers = contract_blockers(conn, migration.n)
-                    finally:
-                        conn.close()
-                        conn = None
-                    if blockers:
-                        print(f"migration {migration.name} waits for {', '.join(blockers)}", flush=True)
-                        return True
-                if not started_chain:
-                    if paths.DB_FILE.stat().st_size:
-                        snapshot = backup.snapshot(f"m{migration.n}")
-                    started_chain = True
-                started = time.monotonic()
-                try:
-                    timing = dbstats.Timing(paths.DB_FILE, "write")
-                    with owning_transaction(lambda: paths.connect_db(paths.DB_FILE), "BEGIN EXCLUSIVE", timing) as writer:
-                        if migration.sql is not None:
-                            execute_statements(writer, migration.sql)
-                        else:
-                            migration.apply(writer)
-                        writer.execute("INSERT INTO schema_migrations "
-                                       "(n, name, area, phase, sha256, applied, backup, seconds) VALUES (?,?,?,?,?,?,?,?)",
-                                       (migration.n, migration.name, migration.area, migration.phase, migration.sha256,
-                                        util.iso(), snapshot.name if snapshot else "", time.monotonic() - started))
-                        writer.execute("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
-                                       (str(migration.n),))
-                        writer.execute(f"PRAGMA user_version = {migration.n}")
-                except BaseException as e:
-                    raise migrations.Refused(f"{migration.name}: {e}") from e
-                version = migration.n
-                print(f"applied {migration.name}", flush=True)
-            backup.finish_restore()
-            return False
-        finally:
-            if conn is not None:
-                conn.close()
-
-
-def checked_connection():
-    from . import backup
-
-    if backup.pending_restore():
-        raise IncompatibleSchema("pending restore requires arete serve or arete migrate before writing")
-    try:
-        identity = paths.DB_FILE.stat()
-    except FileNotFoundError:
-        if not paths.ISOLATED:
-            raise missing_database() from None
-        migrate()
-        identity = paths.DB_FILE.stat()
-    if identity.st_size == 0:
-        refuse_empty_file()
-    try:
-        conn = paths.connect_db(paths.DB_FILE)
-    except (sqlite3.OperationalError, FileNotFoundError):
-        if not paths.DB_FILE.exists():
-            raise missing_database() from None
-        raise
-    try:
-        key = (os.getpid(), str(paths.DB_FILE), identity.st_dev, identity.st_ino,
-               getattr(identity, "st_birthtime", None), LATEST, NEEDED)
-        if key not in _CHECKED:
-            version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if paths.ISOLATED and version == 0:
-                conn.close()
-                migrate()
-                return checked_connection()
-            deadline = time.monotonic() + MIGRATE_WAIT_SECONDS
-            if version < NEEDED:
-                print(f"schema {version} waits for schema {NEEDED}; run arete serve or arete migrate", flush=True)
-            while version < NEEDED:
-                if time.monotonic() >= deadline:
-                    raise IncompatibleSchema(f"schema {version} needs {NEEDED}; run arete serve or arete migrate")
-                time.sleep(0.5)
-                version = conn.execute("PRAGMA user_version").fetchone()[0]
-            oldest = int(conn.execute("SELECT value FROM schema_meta WHERE key = 'oldest_writer'").fetchone()[0] or 0)
-            if oldest > LATEST:
-                raise IncompatibleSchema(f"oldest_writer {oldest} is above this code's schema {LATEST}")
-            _CHECKED.add(key)
-        return conn
-    except BaseException:
-        with suppress(BaseException):
-            conn.close()
-        raise
-
-
-@contextmanager
-def owning_transaction(connect, begin="BEGIN IMMEDIATE", timing=None, *, commit=True):
-    conn = None
-    failed = False
-    try:
-        conn = connect()
-        conn.row_factory = sqlite3.Row
-        conn.execute(begin)
-        if timing:
-            timing.begun()
-        yield conn
-        if commit:
-            if timing:
-                timing.committing()
-            try:
-                conn.execute("COMMIT")
-            finally:
-                if timing:
-                    timing.committed()
-    except BaseException as e:
-        failed = True
-        if timing:
-            timing.error = type(e).__name__
-            timing.sqlite_error = isinstance(e, sqlite3.Error)
-        if conn is not None:
-            with suppress(BaseException):
-                conn.execute("ROLLBACK")
-        raise
-    finally:
-        try:
-            if conn is not None:
-                if failed:
-                    with suppress(BaseException):
-                        conn.close()
-                else:
-                    conn.close()
-        finally:
-            if timing:
-                timing.finished()
-
-
-def read_connection(*, streaming=False):
-    try:
-        return paths.connect_db(paths.DB_FILE, readonly=True, streaming=streaming)
-    except (sqlite3.OperationalError, FileNotFoundError):
-        if not paths.DB_FILE.exists():
-            raise missing_database() from None
-        raise
-
-
-@contextmanager
-def owned(mode):
-    active = getattr(_OWNER, "active", None)
-    if active and active[0] == os.getpid():
-        _, held_mode, conn = active
-        if held_mode == "read" and mode == "write":
-            raise RuntimeError("cannot promote a read snapshot to a writer")
-        yield conn
-        return
-    timing = dbstats.Timing(paths.DB_FILE, mode)
-    connect = checked_connection if mode == "write" else read_connection
-    try:
-        with owning_transaction(connect, "BEGIN IMMEDIATE" if mode == "write" else "BEGIN", timing,
-                                commit=mode == "write") as conn:
-            _OWNER.active = (os.getpid(), mode, conn)
-            yield conn
-    finally:
-        _OWNER.active = None
-
-
-@contextmanager
-def tx():
-    with owned("write") as conn:
-        yield conn
-
-
-db = tx
-
-
-@contextmanager
-def one_read():
-    with owned("read") as conn:
-        yield conn
 
 
 @contextmanager
@@ -286,7 +50,7 @@ def reader(*, streaming=False):
         with one_read() as conn:
             yield conn
         return
-    conn = read_connection(streaming=True)
+    conn = paths.connect_db(paths.DB_FILE, readonly=True, streaming=True)
     conn.row_factory = sqlite3.Row
     try:
         yield conn
@@ -314,619 +78,221 @@ def read_snapshot(conn):
 
 
 def write_connection():
-    active = getattr(_OWNER, "active", None)
+    active = getattr(foundation._OWNER, "active", None)
     if not active or active[:2] != (os.getpid(), "write") or not active[2].in_transaction:
         raise RuntimeError("event emission needs an open write transaction")
     return active[2]
 
 
-def ensure_schema() -> None:
-    with db():
-        pass
-
-
-def backfill_legacy_cost(before: dict | None = None) -> int:
-    before = {} if before is None else before
-    if not isinstance(before, dict) or any(not isinstance(k, str) or isinstance(v, bool)
-                                         or not isinstance(v, (int, float))
-                                         for k, v in before.items()):
-        raise ValueError("before must map run IDs to finite dollar amounts")
-    try:
-        before = {k: float(v) for k, v in before.items()}
-    except OverflowError:
-        raise ValueError("before must map run IDs to finite dollar amounts") from None
-    if any(not math.isfinite(v) for v in before.values()):
-        raise ValueError("before must map run IDs to finite dollar amounts")
-    with db() as c:
-        missing = sorted(set(before) - {r[0] for r in c.execute("SELECT id FROM runs")})
-        if missing:
-            raise ValueError(f"no run: {missing[0]}")
-        c.execute("""
-            WITH totals AS MATERIALIZED (
-                SELECT run_id, SUM(cost_usd) AS usd, SUM(tokens_in) AS tin, SUM(tokens_out) AS tout
-                FROM steps GROUP BY run_id
-            ), eligible AS MATERIALIZED (
-                SELECT runs.id, runs.started, COALESCE(runs.cost_usd, 0) AS usd,
-                       COALESCE(totals.usd, 0) AS spent,
-                       COALESCE(runs.tokens_in, 0) - COALESCE(totals.tin, 0) AS tin,
-                       COALESCE(runs.tokens_out, 0) - COALESCE(totals.tout, 0) AS tout,
-                       edits.value AS old
-                FROM runs LEFT JOIN totals ON totals.run_id = runs.id
-                LEFT JOIN json_each(?) AS edits ON edits.key = runs.id
-                WHERE runs.started < (SELECT MIN(ts) FROM steps)
-                  AND COALESCE(runs.cost_usd, 0) != COALESCE(totals.usd, 0)
-            )
-            INSERT INTO steps (run_id, step, kind, runner, ok, auth_mode, ts,
-                               cost_usd, tokens_in, tokens_out, error)
-            SELECT id, 'legacy', 'legacy', 'legacy', 1, 'subscription', started,
-                   COALESCE(old, usd) - spent, tin, tout, '' FROM eligible
-            UNION ALL
-            SELECT id, 'correction', 'correction', 'correction', 1, 'subscription', started,
-                   usd - old, 0, 0, 'legacy repricing from supplied before value'
-            FROM eligible WHERE old IS NOT NULL AND usd != old
-        """, (json.dumps(before),))
-        return c.execute("SELECT changes()").fetchone()[0]
-
-
-def cost_drift(connect=reader) -> list[dict]:
-    with connect() as c:
-        return [dict(r) for r in c.execute("""
-            SELECT runs.id, COALESCE(runs.cost_usd, 0) AS run_usd,
-                   COALESCE(t.usd, 0) AS steps_usd,
-                   COALESCE(runs.cost_usd, 0) - COALESCE(t.usd, 0) AS difference
-            FROM runs LEFT JOIN (SELECT run_id, SUM(cost_usd) AS usd FROM steps GROUP BY run_id) t
-            ON t.run_id = runs.id
-            WHERE ABS(COALESCE(runs.cost_usd, 0) - COALESCE(t.usd, 0)) > 0.000001
-            ORDER BY runs.id
-        """)]
-
-
-FIRINGS = ("(runs.kind = 'loop' AND runs.loop_kind = 'command' AND runs.status IN ('done', 'skipped') "
-           "AND COALESCE(runs.cost_usd, 0) = 0)")
-
-
-def runs(kind: str | None = None, repo: str | None = None, limit: int = 50, connect=reader, loop: str | None = None,
-         firings: bool = False, statuses: tuple[str, ...] = (), running_first: bool = False) -> list[dict]:
-    q, args = "SELECT * FROM runs WHERE 1=1", []
-    if not firings:
-        q += f" AND NOT {FIRINGS}"
-    for column, value in (("kind", kind), ("loop", loop), ("repo", repo)):
-        if value:
-            q += f" AND {column} = ?"
-            args.append(value)
-    if statuses:
-        q += f" AND status IN ({','.join('?' * len(statuses))})"
-        args.extend(statuses)
-    q += " ORDER BY " + ("status = 'running' DESC, " if running_first else "") + "started DESC, rowid DESC LIMIT ?"
-    args.append(limit)
-    with connect() as c:
-        return [dict(r) for r in c.execute(q, args)]
-
-
-def run_facets(connect=reader) -> dict[str, list[str]]:
-    with connect() as c:
-        return {column: [r[0] for r in c.execute(f"SELECT DISTINCT {column} FROM runs WHERE NOT {FIRINGS} "
-                                                 f"AND COALESCE({column}, '') != '' ORDER BY 1")]
-                for column in ("kind", "repo", "loop")}
-
-
-def paid_by_run(run_ids: list[str], connect=reader, local_providers=None) -> dict[str, float]:
-    if not run_ids:
-        return {}
-    if local_providers is None:
-        from . import config
-
-        local_providers = config.load().local_providers
-    paid: dict[str, float] = {}
-    with connect() as c:
-        rows = c.execute("SELECT run_id, cost_usd, runner, provider, model, auth_mode FROM steps "
-                         f"WHERE run_id IN ({','.join('?' * len(run_ids))})", run_ids)
-        for r in rows:
-            if billing_of(dict(r), local_providers) == "api_key":
-                paid[r[0]] = paid.get(r[0], 0.0) + float(r["cost_usd"] or 0)
-    return {k: round(v, 6) for k, v in paid.items()}
+backfill_legacy_cost = run_store.backfill_legacy_cost
 
 
-def merged_runs(connect=reader) -> list[dict]:
-    with connect() as c:
-        return [dict(r) for r in c.execute(
-            f"SELECT * FROM runs WHERE kind = 'pipeline' AND status = 'merged' AND {WHOLE_RUN} "
-            "AND COALESCE(pr_url, '') != '' ORDER BY finished, id")]
+cost_drift = run_store.cost_drift
 
 
-def source_seen(source: str, connect=reader) -> set[str]:
-    with connect() as c:
-        return {r[0] for r in c.execute("SELECT key FROM seen WHERE source = ?", (source,))}
+FIRINGS = run_store.FIRINGS
 
 
-def runs_since(since: str, connect=reader) -> list[dict]:
-    with connect() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM runs WHERE started >= ? ORDER BY started", (since,))]
+runs = run_store.runs
 
 
-def runs_reading_pr_comments(rejected_since: str, limit: int = 200) -> list[dict]:
-    with reader() as c:
-        return [dict(r) for r in c.execute(f"SELECT * FROM runs WHERE kind = 'pipeline' AND pr_url != '' "
-                                           f"AND ({OPEN_PR_RUN} OR (status = 'rejected' AND finished >= ?)) "
-                                           "ORDER BY started DESC LIMIT ?", (rejected_since, limit))]
+run_facets = run_store.run_facets
 
 
-def open_runs(repo: str, issue: int | str) -> list[dict]:
-    with reader() as c:
-        return [dict(r) for r in c.execute(f"SELECT * FROM runs WHERE repo = ? AND issue = ? AND {OPEN_PR_RUN} "
-                                           "ORDER BY started DESC", (repo, issue))]
+paid_by_run = run_store.paid_by_run
 
 
-def run_lock(kind: str, repo: str | None = None, issue: int | str | None = None) -> str:
-    return {"pipeline": f"run-{repo}-{issue}", "slot": f"slot-{repo}-{issue}", "slot-wait": f"slot-wait-{repo}-{issue}",
-            "eval": f"eval-{repo}", "experiment": f"experiment-{repo}", "eval-mine": "eval-mine", "miner": "mine"}[kind]
+merged_runs = run_store.merged_runs
 
 
-def loop_lock(name: str) -> str:
-    return "loop-" + name.replace("/", ".")
+source_seen = source_store.source_seen
 
 
-def run_get(run_id: str, connect=reader) -> dict | None:
-    with connect() as c:
-        r = c.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
-        return dict(r) if r else None
+runs_since = run_store.runs_since
 
 
-def save_report(run_id: str, report: dict, connect=db) -> None:
-    with connect() as c:
-        c.execute("INSERT OR REPLACE INTO reports (run_id, saved, report) VALUES (?, ?, ?)",
-                  (run_id, util.iso(), json.dumps(report)))
+runs_reading_pr_comments = run_store.runs_reading_pr_comments
 
 
-def report(run_id: str, connect=reader) -> dict | None:
-    with connect() as c:
-        r = c.execute("SELECT report FROM reports WHERE run_id = ?", (run_id,)).fetchone()
-    try:
-        found = json.loads(r["report"]) if r else None
-    except ValueError:
-        return None
-    return found if isinstance(found, dict) else None
+open_runs = run_store.open_runs
 
 
-def steps(run_id: str, connect=reader) -> list[dict]:
-    with connect() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM steps WHERE run_id = ? ORDER BY id", (run_id,))]
+run_lock = run_store.run_lock
 
 
-def step_tries(run_id: str, step: str) -> int:
-    with reader() as c:
-        return c.execute("SELECT COALESCE(MAX(try), 0) FROM steps WHERE run_id = ? AND step = ?", (run_id, step)).fetchone()[0]
+loop_lock = loop_store.loop_lock
 
 
-def steps_since(since: str, connect=reader) -> list[dict]:
-    with connect() as c:
-        rows = [dict(r) for r in c.execute("SELECT steps.*, r.loop, r.kind AS run_kind, r.repo FROM steps "
-                                           "LEFT JOIN runs r ON r.id = steps.run_id WHERE steps.ts >= ? "
-                                           "ORDER BY steps.ts", (since,))]
-    return [{**d, "task_kind": d.get("kind") or "", "kind": d["run_kind"]} for d in rows]
+run_get = run_store.run_get
 
 
-def add_feed(run_id: str, kind: str, text: str) -> None:
-    insert_feed(run_id, kind, text)
+save_report = run_store.save_report
 
 
-def insert_feed(run_id: str, kind: str, text: str) -> None:
-    with tx() as c:
-        c.execute("INSERT INTO feed (run_id, ts, kind, text) VALUES (?,?,?,?)",
-                  (run_id, util.iso(), kind, util.both_ends(text, 4000)))
+report = run_store.report
 
 
-def feed(run_id: str, after: int = 0, connect=reader) -> list[dict]:
-    with connect() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM feed WHERE run_id = ? AND id > ? ORDER BY id",
-                                           (run_id, after))]
+steps = run_store.steps
 
 
-def loop_state(name: str, connect=reader) -> dict:
-    with connect() as c:
-        r = c.execute("SELECT * FROM loop_state WHERE loop = ?", (name,)).fetchone()
-    if not r:
-        return {"loop": name, "data": {}, "last_fire": None, "next_due": None, "metric_on": 0}
-    return {**dict(r), "data": json.loads(r["data"] or "{}")}
+step_tries = run_store.step_tries
 
 
-def loop_states(connect=reader) -> dict[str, dict]:
-    with connect() as c:
-        return {r["loop"]: {**dict(r), "data": json.loads(r["data"] or "{}")} for r in c.execute("SELECT * FROM loop_state")}
+steps_since = run_store.steps_since
 
 
-def loop_marks(connect=reader) -> dict[str, dict]:
-    with connect() as c:
-        rows = [dict(r) for r in c.execute("SELECT * FROM loop_state")]
-    return {r["loop"]: {"ts": r["mark_at"], "ok": bool(r.get("mark_ok")), "detail": r.get("mark_detail") or ""}
-            for r in rows if r.get("mark_at")}
+add_feed = run_store.add_feed
 
 
-def set_loop_state(name: str, **fields) -> None:
-    if "data" in fields:
-        fields["data"] = json.dumps(fields["data"], default=str)
-    fields["updated"] = util.iso()
-    with db() as c:
-        c.execute("INSERT OR IGNORE INTO loop_state (loop) VALUES (?)", (name,))
-        c.execute(f"UPDATE loop_state SET {', '.join(f'{k} = ?' for k in fields)} WHERE loop = ?",
-                  (*fields.values(), name))
+insert_feed = run_store.insert_feed
 
 
-def finding_seen(loop: str, fingerprint: str) -> bool:
-    with reader() as c:
-        return c.execute("SELECT 1 FROM findings WHERE loop = ? AND fingerprint = ?", (loop, fingerprint)).fetchone() \
-            is not None
+feed = run_store.feed
 
 
-def record_finding(loop: str, fingerprint: str, fingerprint_text: str, title: str, url: str, run_id: str) -> bool:
-    with db() as c:
-        before = c.total_changes
-        c.execute("INSERT OR IGNORE INTO findings (loop, fingerprint, fingerprint_text, title, url, run_id, first_seen, "
-                  "last_seen, emitted) VALUES (?,?,?,?,?,?,?,?,'')",
-                  (loop, fingerprint, fingerprint_text, title, url, run_id, util.iso(), util.iso()))
-        if c.total_changes > before:
-            return True
-        c.execute("UPDATE findings SET run_id = ? WHERE loop = ? AND fingerprint = ? AND emitted = '' "
-                  "AND COALESCE(url, '') = '' AND COALESCE(run_id, '') != ?", (run_id, loop, fingerprint, run_id))
-        taken_over = c.total_changes > before
-        c.execute("UPDATE findings SET seen = seen + 1, last_seen = ? WHERE loop = ? AND fingerprint = ?",
-                  (util.iso(), loop, fingerprint))
-        return taken_over
+loop_state = loop_store.loop_state
 
 
-def mark_emitted(loop: str, fingerprints: list[str], run_id: str) -> None:
-    with db() as c:
-        c.executemany("UPDATE findings SET emitted = ? WHERE loop = ? AND fingerprint = ? AND run_id = ? "
-                      "AND emitted = ''", [(run_id, loop, fingerprint, run_id) for fingerprint in fingerprints])
+loop_states = loop_store.loop_states
 
 
-def set_finding_url(loop: str, fingerprint: str, url: str) -> None:
-    with db() as c:
-        c.execute("UPDATE findings SET url = ? WHERE loop = ? AND fingerprint = ?", (url, loop, fingerprint))
+loop_marks = loop_store.loop_marks
 
 
-def findings(loop: str, limit: int = 50, connect=reader) -> list[dict]:
-    with connect() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM findings WHERE loop = ? ORDER BY last_seen DESC LIMIT ?",
-                                           (loop, limit))]
+set_loop_state = loop_store.set_loop_state
 
 
-def add_event(loop: str, e: dict, connect=db) -> int:
-    with connect() as c:
-        cur = c.execute("INSERT INTO events (loop, type, source, key, repo, title, url, trust, ts) "
-                        "VALUES (?,?,?,?,?,?,?,?,?)",
-                        (loop, e.get("type"), e.get("source"), str(e.get("key")), e.get("repo"), e.get("title"),
-                         e.get("url"), e.get("trust"), util.iso()))
-        return cur.lastrowid
+finding_seen = loop_store.finding_seen
 
 
-def claim_seen(source: str, keys: list[str], connect=db) -> list[str]:
-    with connect() as c:
-        return [str(k) for k in keys if c.execute("INSERT OR IGNORE INTO seen (source, key, ts) VALUES (?,?,?)",
-                                                 (source, str(k), util.iso())).rowcount == 1]
+record_finding = loop_store.record_finding
 
 
-def forget_seen(source: str, key: str, before, connect=db) -> None:
-    with connect() as c:
-        c.execute("DELETE FROM seen WHERE source = ? AND key = ? AND ts < ?", (source, key, util.iso(before)))
+mark_emitted = loop_store.mark_emitted
 
 
-def cursor(source: str, connect=reader) -> dict | None:
-    with connect() as c:
-        r = c.execute("SELECT * FROM cursors WHERE source = ?", (source,)).fetchone()
-        return dict(r) if r else None
+set_finding_url = loop_store.set_finding_url
 
 
-def set_cursor(source: str, value: str | None, ok: bool, detail: str = "", connect=db, started=None) -> None:
-    with connect() as c:
-        row = c.execute("SELECT * FROM cursors WHERE source = ?", (source,)).fetchone()
-        prev = dict(row) if row else {}
-        last_ok = (started or util.iso()) if ok else prev.get("last_ok") or (prev.get("polled") if prev.get("ok") else None)
-        c.execute("INSERT OR REPLACE INTO cursors (source, value, polled, ok, detail, last_ok) VALUES (?,?,?,?,?,?)",
-                  (source, value if value is not None else prev.get("value"), util.iso(), int(ok), detail[:500],
-                   last_ok))
+findings = loop_store.findings
 
 
-def adopt_source(old: str, new: str) -> None:
-    with db() as c:
-        for table in ("cursors", "seen", "source_owners"):
-            c.execute(f"UPDATE OR REPLACE {table} SET source = ? WHERE source = ?", (new, old))
+add_event = loop_store.add_event
 
 
-def source_owner(source: str) -> str | None:
-    with reader() as c:
-        r = c.execute("SELECT fingerprint FROM source_owners WHERE source = ?", (source,)).fetchone()
-        return r[0] if r else None
+claim_seen = source_store.claim_seen
 
 
-def set_source_owner(source: str, fingerprint: str, connect=db) -> None:
-    with connect() as c:
-        c.execute("INSERT OR REPLACE INTO source_owners (source, fingerprint) VALUES (?,?)", (source, fingerprint))
+forget_seen = source_store.forget_seen
 
 
-def cursors(connect=reader) -> list[dict]:
-    with connect() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM cursors ORDER BY source")]
+cursor = source_store.cursor
 
 
-def enqueue(loop: str, queue: str, grp: str, trigger: str, payload: list | None = None, connect=db) -> int:
-    with connect() as c:
-        if not payload and c.execute("SELECT 1 FROM queue WHERE loop = ? AND run_id IS NULL AND payload = '[]' "
-                                     "AND trigger = ?", (loop, trigger)).fetchone():
-            return 0
-        cur = c.execute("INSERT INTO queue (loop, queue, grp, trigger, payload, enqueued) VALUES (?,?,?,?,?,?)",
-                        (loop, queue, grp, trigger, json.dumps(payload or [], default=str), util.iso()))
-        return cur.lastrowid
+set_cursor = source_store.set_cursor
 
 
-def pending(connect=reader) -> list[dict]:
-    with connect() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM queue WHERE run_id IS NULL ORDER BY id")]
+adopt_source = source_store.adopt_source
 
 
-def queue_item(item_id: int) -> dict | None:
-    with reader() as c:
-        r = c.execute("SELECT * FROM queue WHERE id = ?", (item_id,)).fetchone()
-    return {**dict(r), "payload": json.loads(r["payload"] or "[]")} if r else None
+source_owner = source_store.source_owner
 
 
-def take_queue_item(item_id: int, run_id: str) -> bool:
-    with db() as c:
-        return c.execute("UPDATE queue SET run_id = ? WHERE id = ? AND run_id IS NULL",
-                         (run_id, item_id)).rowcount == 1
+set_source_owner = source_store.set_source_owner
 
 
-def drop_queue_item(item_id: int) -> None:
-    with db() as c:
-        c.execute("DELETE FROM queue WHERE id = ?", (item_id,))
+cursors = source_store.cursors
 
 
-def release_claimed_items(run_id: str) -> None:
-    with db() as c:
-        c.execute("UPDATE queue SET run_id = NULL WHERE run_id = ?", (run_id,))
+enqueue = loop_store.enqueue
 
 
-def finish_claim(c, row: dict, how: str, summary: str) -> None:
-    if how == "retry":
-        duplicate = not json.loads(row["payload"] or "[]") and c.execute(
-            "SELECT 1 FROM queue WHERE loop = ? AND trigger = ? AND payload = '[]' AND run_id IS NULL",
-            (row["loop"], row["trigger"])).fetchone()
-        if duplicate:
-            how = "drop"
-        elif row["attempts"] + 1 < 2:
-            c.execute("UPDATE queue SET run_id = NULL, attempts = attempts + 1 WHERE id = ?", (row["id"],))
-            return
-        else:
-            how = "dead"
-    if how == "drop" or not json.loads(row["payload"] or "[]"):
-        c.execute("DELETE FROM queue WHERE id = ?", (row["id"],))
-    else:
-        c.execute("UPDATE queue SET dead_at = ?, dead_reason = ? WHERE id = ?",
-                  (util.iso(), summary, row["id"]))
+pending = loop_store.pending
 
 
-def end_claim(run_id: str, how: str, summary: str) -> None:
-    with db() as c:
-        for row in c.execute("SELECT * FROM queue WHERE run_id = ? AND dead_at IS NULL", (run_id,)).fetchall():
-            finish_claim(c, dict(row), how, summary)
+queue_item = loop_store.queue_item
 
 
-def release_settled_claims() -> None:
-    with db() as c:
-        rows = c.execute("SELECT q.*, r.status, r.summary FROM queue q LEFT JOIN runs r ON r.id = q.run_id "
-                         "WHERE q.run_id IS NOT NULL AND q.dead_at IS NULL "
-                         "AND (r.status IS NULL OR r.status != 'running')").fetchall()
-        for row in rows:
-            finish_claim(c, dict(row), "dead" if row["status"] == "stopped" else "retry",
-                         row["summary"] or f"run {row['run_id']} {row['status'] or 'is missing'}")
+take_queue_item = loop_store.take_queue_item
 
 
-def dead_items(connect=reader) -> list[dict]:
-    with connect() as c:
-        return [{**{k: row[k] for k in ("id", "loop", "run_id", "dead_reason", "dead_at")},
-                 "events": len(json.loads(row["payload"] or "[]"))}
-                for row in c.execute("SELECT * FROM queue WHERE dead_at IS NOT NULL ORDER BY id")]
+drop_queue_item = loop_store.drop_queue_item
 
 
-def requeue_item(item_id: int) -> None:
-    from . import control
+release_claimed_items = loop_store.release_claimed_items
 
-    with db() as c:
-        if not c.execute("UPDATE queue SET run_id = NULL, attempts = 0, dead_at = NULL, dead_reason = '' "
-                         "WHERE id = ? AND dead_at IS NOT NULL", (item_id,)).rowcount:
-            raise control.NotFound(f"no dead queue item {item_id}")
 
+finish_claim = loop_store.finish_claim
 
-SEEN_AGAIN = "seen again"
-CLOSED_AT = "COALESCE(NULLIF(closed, ''), last_seen)"
+
+end_claim = loop_store.end_claim
+
+
+release_settled_claims = loop_store.release_settled_claims
+
+
+dead_items = loop_store.dead_items
+
+
+requeue_item = loop_store.requeue_item
+
+
+SEEN_AGAIN = incident_store.SEEN_AGAIN
+CLOSED_AT = incident_store.CLOSED_AT
 
 
 def prune(days: float = 14, keep_days: float = 30, lines_days: float = 90) -> None:
-    since = util.iso(util.now() - timedelta(days=days))
-    lines_since, now = util.iso(util.now() - timedelta(days=lines_days)), util.iso()
-    with db() as c:
-        c.execute(f"INSERT OR IGNORE INTO run_purges SELECT id, 'firing', ? FROM runs "
-                  f"WHERE {FIRINGS} AND started < ?", (now, since))
-        c.execute(f"DELETE FROM feed WHERE run_id IN (SELECT id FROM runs WHERE {FIRINGS} AND started < ?)", (since,))
-        c.execute(f"DELETE FROM runs WHERE {FIRINGS} AND started < ?", (since,))
-        eligible = c.execute(
-            "SELECT id FROM runs WHERE files_purged IS NULL AND COALESCE(finished, started) < ? "
-            "AND status NOT IN ('running', 'pr', 'needs-info') "
-            "AND NOT EXISTS (SELECT 1 FROM record_pins WHERE run_id = runs.id) "
-            "AND NOT EXISTS (SELECT 1 FROM asks WHERE run = runs.id AND "
-            "(status = 'open' OR (status = 'answered' AND COALESCE(taken_by, '') = ''))) "
-            "AND NOT EXISTS (SELECT 1 FROM proposals WHERE "
-            "(status IS NULL OR status NOT IN ('merged', 'rejected', 'skipped', 'filed')) "
-            "AND (run_id = runs.id OR instr(COALESCE(evidence, ''), runs.id) > 0)) "
-            "AND NOT EXISTS (SELECT 1 FROM runs recent WHERE recent.repo = runs.repo "
-            "AND recent.issue = runs.issue AND recent.started >= ?)", (lines_since, lines_since)).fetchall()
-        for row in eligible:
-            c.execute("INSERT OR IGNORE INTO run_purges VALUES (?, 'lines', ?)", (row["id"], now))
-            c.execute("UPDATE runs SET files_purged = ? WHERE id = ?", (now, row["id"]))
-        c.execute("DELETE FROM queue WHERE dead_at < ?", (util.iso(util.now() - timedelta(days=days * 4)),))
-        c.execute("DELETE FROM events WHERE ts < ?", (util.iso(util.now() - timedelta(days=days * 4)),))
-        old = util.iso(util.now() - timedelta(days=days * 4))
-        kept = util.iso(util.now() - timedelta(days=keep_days))
-        done = f"SELECT id FROM incidents WHERE state != 'open' AND {CLOSED_AT} < ?"
-        c.execute("DELETE FROM incident_notes WHERE ts < ? AND note LIKE ?", (since, f"{SEEN_AGAIN}:%"))
-        c.execute(f"DELETE FROM incident_notes WHERE incident IN ({done})", (kept,))
-        c.execute(f"UPDATE incidents SET evidence = '' WHERE id IN ({done})", (kept,))
-        c.execute(f"DELETE FROM incidents WHERE last_seen < ? AND (state = 'open' OR {CLOSED_AT} < ?)", (old, kept))
-        c.execute("DELETE FROM incident_notes WHERE incident NOT IN (SELECT id FROM incidents)")
-        c.execute("DELETE FROM incident_aliases WHERE incident NOT IN (SELECT id FROM incidents)")
-        c.execute("DELETE FROM incident_repairs WHERE incident NOT IN (SELECT id FROM incidents)")
+    from . import store
+
+    store.prune(days=days, keep_days=keep_days, lines_days=lines_days)
 
 
-def write_incident(c, sighting: Sighting) -> tuple[int, bool]:
-    fingerprint, kind, source, repo = sighting.fingerprint, sighting.kind, sighting.source, sighting.repo
-    signature, count, evidence, policies = sighting.signature, sighting.count, sighting.evidence, sighting.policies
-    now = util.iso()
-    row = c.execute("SELECT id, count FROM incidents WHERE state = 'open' AND (fingerprint = ? OR id IN "
-                    "(SELECT incident FROM incident_aliases WHERE fingerprint = ?)) ORDER BY fingerprint = ? DESC "
-                    "LIMIT 1", (fingerprint, fingerprint, fingerprint)).fetchone()
-    if row:
-        c.execute("UPDATE incidents SET count = count + ?, last_seen = ?, evidence = ?, "
-                  "policies = COALESCE(policies, ?) WHERE id = ?", (count, now, evidence, policies, row["id"]))
-        note = f"{SEEN_AGAIN}: {count} more from {source}, {row['count'] + count} in all"
-        opened, incident_id = False, row["id"]
-    else:
-        incident_id = c.execute("INSERT INTO incidents (fingerprint, class, source, repo, signature, first_seen, "
-                                "last_seen, count, evidence, policies) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                                (fingerprint, kind, source, repo, signature, now, now, count, evidence,
-                                 policies)).lastrowid
-        note, opened = f"opened: {kind}, {count} from {source}", True
-    c.execute("INSERT INTO incident_notes (incident, ts, note) VALUES (?,?,?)", (incident_id, now, note))
-    return incident_id, opened
+write_incident = incident_store.write_incident
 
 
-def record_incident(sighting: Sighting) -> tuple[int, bool]:
-    with db() as c:
-        return write_incident(c, sighting)
+record_incident = incident_store.record_incident
 
 
-def commit_scan(incident_rows: list[Sighting], cursor_rows: list[tuple[str, str, bool, str]],
-                aliases=(), marks=None) -> list[bool]:
-    with db() as c:
-        for fingerprint, incident_id, note in aliases:
-            c.execute("INSERT OR REPLACE INTO incident_aliases (fingerprint, incident, ts) VALUES (?,?,?)",
-                      (fingerprint, incident_id, util.iso()))
-            c.execute("INSERT INTO incident_notes (incident, ts, note) VALUES (?,?,?)",
-                      (incident_id, util.iso(), note))
-        opened = []
-        for row in incident_rows:
-            incident_id, new = write_incident(c, row)
-            opened.append(new)
-            if new and row.fingerprint in (marks or {}):
-                fields, note = marks[row.fingerprint]
-                c.execute(f"UPDATE incidents SET {', '.join(f'{name} = ?' for name in fields)} WHERE id = ?",
-                          (*fields.values(), incident_id))
-                c.execute("INSERT INTO incident_notes (incident, ts, note) VALUES (?,?,?)",
-                          (incident_id, util.iso(), note))
-        for source, value, ok, detail in cursor_rows:
-            c.execute("INSERT OR REPLACE INTO cursors (source, value, polled, ok, detail) VALUES (?,?,?,?,?)",
-                      (source, value, util.iso(), int(ok), detail[:500]))
-        return opened
+add_incident_note = incident_store.add_incident_note
 
 
-def add_incident_note(incident_id: int, note: str) -> None:
-    with db() as c:
-        c.execute("INSERT INTO incident_notes (incident, ts, note) VALUES (?,?,?)", (incident_id, util.iso(), note))
+open_incidents = incident_store.open_incidents
 
 
-def open_incidents(limit: int = 500) -> list[dict]:
-    with reader() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM incidents WHERE state = 'open' "
-                                           "ORDER BY last_seen DESC, id DESC LIMIT ?", (limit,))]
+incidents_to_decide = incident_store.incidents_to_decide
 
 
-def incidents_to_decide() -> list[dict]:
-    with reader() as c:
-        return [dict(r) for r in c.execute(
-            "SELECT * FROM incidents WHERE state = 'open' AND injection = 0 AND class != 'expected' "
-            "AND decision IN ('', 'ignore') ORDER BY id")]
+known_fingerprints = incident_store.known_fingerprints
 
 
-def known_fingerprints() -> dict[str, dict]:
-    with reader() as c:
-        held = {r[0]: {"source": r[1], "repo": r[2], "policies": r[3]} for r in c.execute(
-            "SELECT a.fingerprint, i.source, i.repo, i.policies FROM incident_aliases a JOIN incidents i "
-            "ON i.id = a.incident WHERE i.state = 'open'")}
-        held.update((r[0], {"source": r[1], "repo": r[2], "policies": r[3]}) for r in c.execute(
-            "SELECT fingerprint, source, repo, policies FROM incidents WHERE state = 'open'"))
-        return held
+update_incident = incident_store.update_incident
 
 
-def update_incident(incident_id: int, note: str = "", **fields) -> None:
-    if fields.get("state", "open") != "open" and "closed" not in fields:
-        fields["closed"] = util.iso()
-    with db() as c:
-        if fields:
-            c.execute(f"UPDATE incidents SET {', '.join(f'{name} = ?' for name in fields)} WHERE id = ?",
-                      (*fields.values(), incident_id))
-        if note:
-            c.execute("INSERT INTO incident_notes (incident, ts, note) VALUES (?,?,?)",
-                      (incident_id, util.iso(), note))
+woken_incidents = incident_store.woken_incidents
 
 
-def woken_incidents() -> list[dict]:
-    with reader() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM incidents WHERE state = 'open' AND decision = 'wake' "
-                                           "AND injection = 0 ORDER BY id")]
+closed_alerted = incident_store.closed_alerted
 
 
-def closed_alerted() -> list[int]:
-    with reader() as c:
-        return [r[0] for r in c.execute("SELECT id FROM incidents WHERE alerted = 1 AND state != 'open' ORDER BY id")]
+add_repair = incident_store.add_repair
 
 
-def add_repair(incident_id: int, repo: str) -> int:
-    with db() as c:
-        return c.execute("INSERT INTO incident_repairs (incident, repo, started) VALUES (?,?,?)",
-                         (incident_id, repo, util.iso())).lastrowid
+set_repair = incident_store.set_repair
 
 
-def set_repair(repair_id: int, **fields) -> None:
-    with db() as c:
-        c.execute(f"UPDATE incident_repairs SET {', '.join(f'{name} = ?' for name in fields)} WHERE id = ?",
-                  (*fields.values(), repair_id))
+incident_repairs = incident_store.incident_repairs
 
 
-def incident_repairs(connect=reader) -> list[dict]:
-    with connect() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM incident_repairs ORDER BY id")]
+parsed = incident_store.parsed
 
 
-def parsed(row: dict) -> dict:
-    return {**row, "answers": json.loads(row["answers"] or "{}")}
+incidents = incident_store.incidents
 
 
-def incidents(connect=reader, limit: int = 200, open_first: bool = False) -> list[dict]:
-    order = "state != 'open', " if open_first else ""
-    with connect() as c:
-        return [parsed(dict(r)) for r in c.execute(f"SELECT * FROM incidents ORDER BY {order}last_seen DESC, id DESC "
-                                                   "LIMIT ?", (limit,))]
+blocked_incidents = incident_store.blocked_incidents
 
 
-def blocked_incidents(connect=reader) -> list[dict]:
-    with connect() as c:
-        return [dict(r) for r in c.execute("SELECT id, class, source, signature, waiting, last_seen FROM incidents "
-                                           "WHERE state = 'open' AND phase = 'blocked' ORDER BY id")]
-
-
-def incident(incident_id: int, connect=reader, last_notes: int = 0) -> dict | None:
-    with connect() as c:
-        r = c.execute("SELECT * FROM incidents WHERE id = ?", (incident_id,)).fetchone()
-        if not r:
-            return None
-        total = c.execute("SELECT COUNT(*) FROM incident_notes WHERE incident = ?", (incident_id,)).fetchone()[0]
-        if last_notes > 0:
-            notes = c.execute("SELECT ts, note FROM (SELECT id, ts, note FROM incident_notes WHERE incident = ? "
-                              "ORDER BY id DESC LIMIT ?) ORDER BY id", (incident_id, last_notes))
-        else:
-            notes = c.execute("SELECT ts, note FROM incident_notes WHERE incident = ? ORDER BY id", (incident_id,))
-        repairs = c.execute("SELECT * FROM incident_repairs WHERE incident = ? ORDER BY id", (incident_id,))
-        return {**parsed(dict(r)), "notes": [dict(n) for n in notes], "notes_total": total,
-                "repairs": [dict(x) for x in repairs]}
+incident = incident_store.incident
 
 
 def add_approval(loop: str, run_id: str, emit: dict, summary: str, failed: str = "") -> int:
@@ -1173,16 +539,7 @@ def busy_chats() -> list[int]:
         return [r[0] for r in c.execute("SELECT id FROM chats WHERE busy = 1 ORDER BY id")]
 
 
-def loop_spent_since(since: str, loop: str | None = None, local_providers=()) -> float:
-    q = ("SELECT steps.cost_usd, steps.runner, steps.provider, steps.model, steps.auth_mode FROM steps "
-         "JOIN runs r ON r.id = steps.run_id WHERE steps.ts >= ? AND r.kind = 'loop'")
-    args: list = [since]
-    if loop:
-        q += " AND r.loop = ?"
-        args.append(loop)
-    with reader() as c:
-        return sum(float(r["cost_usd"] or 0) for r in c.execute(q, args)
-                   if billing_of(dict(r), local_providers) == "api_key")
+loop_spent_since = run_store.loop_spent_since
 
 
 def hold(scope: str, until: str, why: str) -> None:
@@ -1276,31 +633,19 @@ def record_refresh(before: str, after: str, previous: str, latest: str) -> None:
                 save_hold(c, scope, row["until"], row["why"], row["ts"])
 
 
-def pass_over(repo: str, issue: str) -> None:
-    with db() as c:
-        c.execute("INSERT OR IGNORE INTO passed_over (repo, issue, since) VALUES (?,?,?)", (repo, str(issue), util.iso()))
+pass_over = source_store.pass_over
 
 
-def tickets_passed_over() -> list[dict]:
-    with reader() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM passed_over ORDER BY since")]
+tickets_passed_over = source_store.tickets_passed_over
 
 
-def take_passed_over(repo: str, issue: str) -> str:
-    with db() as c:
-        r = c.execute("SELECT since FROM passed_over WHERE repo = ? AND issue = ?", (repo, str(issue))).fetchone()
-        c.execute("DELETE FROM passed_over WHERE repo = ? AND issue = ?", (repo, str(issue)))
-    return r["since"] if r else ""
+take_passed_over = source_store.take_passed_over
 
 
-def drop_passed_over(repo: str, keep: str = "") -> None:
-    with db() as c:
-        c.execute("DELETE FROM passed_over WHERE repo = ? AND issue != ?", (repo, str(keep)))
+drop_passed_over = source_store.drop_passed_over
 
 
-def runs_marked_running(connect=reader) -> list[dict]:
-    with connect() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM runs WHERE status = 'running' ORDER BY started")]
+runs_marked_running = run_store.runs_marked_running
 
 
 def add_vm(name: str, run_id: str | None, device: dict, vmid: int | None = None, connect=db) -> None:
@@ -1343,91 +688,40 @@ def vms_left_over(probes_created_before: str, connect=reader) -> list[dict]:
             (probes_created_before,))]
 
 
-def ticket_runs(repo: str, issue: int | str, limit: int = 10, connect=reader, whole: bool = False) -> list[dict]:
-    with connect() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "
-                                           + (f"AND {WHOLE_RUN} " if whole else "")
-                                           + "ORDER BY started DESC, rowid DESC LIMIT ?", (repo, issue, limit))]
+ticket_runs = run_store.ticket_runs
 
 
-def newest_whole_run(repo: str, issue: int | str) -> dict | None:
-    return next(iter(ticket_runs(repo, issue, limit=1, whole=True)), None)
+newest_whole_run = run_store.newest_whole_run
 
 
-def ticket_runs_marked_running(repo: str, issue: int | str, connect=reader) -> list[dict]:
-    with connect() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "
-                                           "AND status = 'running' ORDER BY started ASC, rowid ASC", (repo, issue))]
+ticket_runs_marked_running = run_store.ticket_runs_marked_running
 
 
-def ab_placements(since: str, name: str = "", connect=reader) -> list[dict]:
-    with connect() as c:
-        labelled = [dict(r) for r in c.execute(
-            "SELECT DISTINCT steps.ab, steps.ab_side, steps.atom, r.repo, r.issue FROM steps "
-            "JOIN runs r ON r.id = steps.run_id WHERE COALESCE(steps.ab, '') != '' AND r.kind = 'pipeline' "
-            "AND r.started >= ?" + (" AND steps.ab = ?" if name else ""), (since, *([name] if name else [])))]
-        held = c.execute("SELECT repo, issue, ab_held FROM runs WHERE kind = 'pipeline' AND started >= ? "
-                         "AND COALESCE(ab_held, '') != ''", (since,)).fetchall()
-    assigned = [{"ab": ab, "ab_side": side, "atom": role, "repo": r["repo"], "issue": r["issue"]}
-                for r in held for role, (ab, side, _) in json.loads(r["ab_held"]).items() if not name or ab == name]
-    return list({tuple(p.values()): p for p in labelled + assigned}.values())
+ab_placements = run_store.ab_placements
 
 
-def ab_held(run_id: str, connect=reader) -> dict[str, tuple[str, str, dict]]:
-    with connect() as c:
-        row = c.execute("SELECT ab_held FROM runs WHERE id = ?", (run_id,)).fetchone()
-    return {role: tuple(held) for role, held in json.loads(row["ab_held"] or "{}").items()} if row else {}
+ab_held = run_store.ab_held
 
 
-def ticket_runs_since(repo: str, issue: int | str, since: str, connect=reader) -> list[dict]:
-    with connect() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "
-                                           "AND started >= ? ORDER BY started", (repo, issue, since))]
+ticket_runs_since = run_store.ticket_runs_since
 
 
-def later_run(repo: str, issue: int | str, run_id: str, connect=reader) -> dict | None:
-    with connect() as c:
-        r = c.execute(f"SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? AND {WHOLE_RUN} "
-                      "AND rowid > (SELECT rowid FROM runs WHERE id = ?) ORDER BY rowid LIMIT 1",
-                      (repo, issue, run_id)).fetchone()
-        return dict(r) if r else None
+later_run = run_store.later_run
 
 
-def interrupted_tickets(repo: str) -> list[str]:
-    with reader() as c:
-        rows = c.execute(f"SELECT issue, status FROM runs WHERE kind = 'pipeline' AND repo = ? AND {WHOLE_RUN} "
-                         "AND rowid = (SELECT r2.rowid FROM runs r2 WHERE r2.kind = 'pipeline' "
-                         "AND r2.repo = runs.repo AND r2.issue = runs.issue AND COALESCE(r2.only_step, '') = '' "
-                         "ORDER BY r2.started DESC, r2.rowid DESC LIMIT 1) "
-                         "ORDER BY started, rowid", (repo,))
-        return [str(r["issue"]) for r in rows if r["status"] == "interrupted"]
+interrupted_tickets = run_store.interrupted_tickets
 
 
-def last_pipeline_starts() -> dict[str, str]:
-    with reader() as c:
-        return {r[0]: r[1] for r in c.execute("SELECT repo, MAX(started) FROM runs WHERE kind = 'pipeline' "
-                                              "GROUP BY repo")}
+last_pipeline_starts = run_store.last_pipeline_starts
 
 
-def running_run(repo: str, issue: int | str, connect=reader) -> dict | None:
-    with connect() as c:
-        r = c.execute("SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? AND status = 'running' "
-                      "ORDER BY started DESC, rowid DESC LIMIT 1", (repo, issue)).fetchone()
-        return dict(r) if r else None
+running_run = run_store.running_run
 
 
-def pending_label(repo: str, issue: int | str) -> str:
-    with reader() as c:
-        r = c.execute("SELECT label_pending FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "
-                      "AND label_pending IS NOT NULL ORDER BY started DESC, rowid DESC LIMIT 1",
-                      (repo, issue)).fetchone()
-        return r["label_pending"] if r else ""
+pending_label = run_store.pending_label
 
 
-def issue_running(repo: str, issue: int | str) -> bool:
-    with reader() as c:
-        return c.execute("SELECT 1 FROM runs WHERE repo = ? AND issue = ? AND status = 'running' LIMIT 1",
-                         (repo, issue)).fetchone() is not None
+issue_running = run_store.issue_running
 
 
 def probe_get(name: str) -> dict | None:
@@ -1447,24 +741,13 @@ def probe_set(name: str, ok: bool, detail: str) -> None:
         )
 
 
-def alert_get(key: str) -> dict | None:
-    with reader() as c:
-        r = c.execute("SELECT * FROM alerts WHERE key = ?", (key,)).fetchone()
-        return dict(r) if r else None
+alert_get = incident_store.alert_get
 
 
-def alert_set(key: str, issue: int | None, repo: str = "") -> None:
-    prev = alert_get(key)
-    with db() as c:
-        c.execute(
-            "INSERT OR REPLACE INTO alerts (key, issue, opened, last_seen, repo) VALUES (?,?,?,?,?)",
-            (key, issue, (prev or {}).get("opened") or util.iso(), util.iso(), repo or (prev or {}).get("repo") or ""),
-        )
+alert_set = incident_store.alert_set
 
 
-def alert_clear(key: str) -> None:
-    with db() as c:
-        c.execute("DELETE FROM alerts WHERE key = ?", (key,))
+alert_clear = incident_store.alert_clear
 
 
 def probes(connect=reader) -> list[dict]:
@@ -1472,9 +755,7 @@ def probes(connect=reader) -> list[dict]:
         return [dict(r) for r in c.execute("SELECT * FROM probes ORDER BY name")]
 
 
-def alerts(connect=reader) -> list[dict]:
-    with connect() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM alerts ORDER BY opened")]
+alerts = incident_store.alerts
 
 
 def add_proposal(run_id: str, p: dict, status: str, pr_url: str = "") -> None:
@@ -1501,20 +782,13 @@ def add_proposal(run_id: str, p: dict, status: str, pr_url: str = "") -> None:
 RELEASING_PROPOSALS = ("rejected", "skipped", "filed")
 
 
-def pin_record(run_id: str) -> bool:
-    with db() as c:
-        return c.execute("INSERT OR IGNORE INTO record_pins (run_id, pinned) VALUES (?, ?)",
-                         (run_id, util.iso())).rowcount > 0
+pin_record = run_store.pin_record
 
 
-def unpin_record(run_id: str) -> bool:
-    with db() as c:
-        return c.execute("DELETE FROM record_pins WHERE run_id = ?", (run_id,)).rowcount > 0
+unpin_record = run_store.unpin_record
 
 
-def record_pins(connect=reader) -> set[str]:
-    with connect() as c:
-        return {r["run_id"] for r in c.execute("SELECT run_id FROM record_pins")}
+record_pins = run_store.record_pins
 
 
 def runs_cited_by_kept_proposals(run_ids, connect=reader) -> set[str]:
@@ -1584,9 +858,7 @@ def task_history(repo: str, task: str, limit: int = 5, source: str = BASELINE_SO
         return [{**dict(r), "passed": bool(r["passed"])} for r in rows]
 
 
-def last_step_id(run_id: str) -> int:
-    with reader() as c:
-        return c.execute("SELECT COALESCE(MAX(id), 0) FROM steps WHERE run_id = ?", (run_id,)).fetchone()[0]
+last_step_id = run_store.last_step_id
 
 
 def eval_rows(run_id: str) -> list[dict]:
@@ -1632,7 +904,7 @@ def feedback_due(repo: str, quiet_since: str) -> list[str]:
     with reader() as c:
         rows = c.execute("SELECT issue, MAX(at_once) AS at_once, MAX(created) AS last FROM feedback f "
                          "WHERE repo = ? AND status = 'new' AND EXISTS (SELECT 1 FROM runs WHERE runs.repo = f.repo "
-                         f"AND runs.issue = f.issue AND {OPEN_PR_RUN} "
+                         f"AND runs.issue = f.issue AND {run_store.OPEN_PR_RUN} "
                          "AND ' ' || runs.pr_url || ' ' LIKE '% ' || f.pr_url || ' %') "
                          "GROUP BY issue ORDER BY last", (repo,))
         return [str(r["issue"]) for r in rows if r["at_once"] or r["last"] <= quiet_since]

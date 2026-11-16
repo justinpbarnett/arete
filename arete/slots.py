@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import TextIO
 
 from . import config, paths, record, refusals, state, util
+from .store import runs as run_store
 
 SLOTS_LOCK = "run-slots"
 SLOT_KINDS = ("pipeline", "experiment")
@@ -16,7 +17,7 @@ SLOT_POLL_SECONDS = 30
 
 def holding(rows: list[dict], lock_kind: str, kinds: tuple[str, ...] = ("pipeline",)) -> list[dict]:
     return [r for r in rows
-            if r["kind"] in kinds and util.lock_is_held(state.run_lock(lock_kind, r["repo"], r["issue"]))]
+            if r["kind"] in kinds and util.lock_is_held(run_store.run_lock(lock_kind, r["repo"], r["issue"]))]
 
 
 def chat_sessions_going(running: list[dict]) -> list[dict]:
@@ -27,12 +28,12 @@ def chat_sessions_going(running: list[dict]) -> list[dict]:
 
 
 def runs_in_slots(running: list[dict] | None = None) -> list[dict]:
-    running = state.runs_marked_running() if running is None else running
+    running = run_store.runs_marked_running() if running is None else running
     return [*holding(running, "slot", SLOT_KINDS), *chat_sessions_going(running)]
 
 
 def runs_waiting_for_a_slot() -> list[dict]:
-    return holding(state.runs_marked_running(), "slot-wait")
+    return holding(run_store.runs_marked_running(), "slot-wait")
 
 
 def slots_free_to_start(max_parallel: int) -> int:
@@ -78,7 +79,7 @@ class RunSlot:
                         return
                     if not waiting:
                         waiting = True
-                        stack.enter_context(util.hold_lock(state.run_lock("slot-wait", self.repo, self.tid)))
+                        stack.enter_context(util.hold_lock(run_store.run_lock("slot-wait", self.repo, self.tid)))
                         stack.enter_context(waits("slot"))
                         log(f"{what}: waiting for a free run slot (max_parallel {self.max_parallel}), ahead of new runs")
                 time.sleep(SLOT_POLL_SECONDS)
@@ -105,4 +106,4 @@ def admitting():
 
 
 def hold(repo: str, tid: str | None):
-    return util.hold_lock(state.run_lock("slot", repo, tid))
+    return util.hold_lock(run_store.run_lock("slot", repo, tid))

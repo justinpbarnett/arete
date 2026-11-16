@@ -9,8 +9,10 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 
-from . import config, cron, devices, paths, refusals, runner, state, util
+from . import config, cron, devices, paths, refusals, runner, util
 from .agent import EDIT_TOOLS, READ_ONLY_TOOLS, READ_TOOLS
+from .store import db as foundation
+from .store import runs as run_store
 
 BUNDLED_LOOPS_DIR = paths.PACKAGE_DIR / "loops"
 SWITCHES_FILE = paths.CONFIG_DIR / "loop-switches.json"
@@ -133,7 +135,7 @@ class Loop:
         repo = self.work_repo(cfg) if self.repo else None
         return (cfg.repo_for_path(repo.path) or repo) if repo else None
 
-    def outlooks(self, cfg: config.Config, connect=state.reader) -> list[list]:
+    def outlooks(self, cfg: config.Config, connect=foundation.reader) -> list[list]:
         from . import routing
 
         if not self.agent:
@@ -152,7 +154,7 @@ class Loop:
 
         return any(routing.can_charge(found) for found in self.outlooks(cfg))
 
-    def usage_hold(self, cfg: config.Config, connect=state.reader) -> str:
+    def usage_hold(self, cfg: config.Config, connect=foundation.reader) -> str:
         from . import routing
 
         return next(filter(None, (routing.held_words(found) for found in self.outlooks(cfg, connect))), "")
@@ -381,10 +383,10 @@ def tightest_limit(loop: Loop, cfg: config.Config, spent_this_run: float = 0.0) 
         limits.append(("run budget", loop.budget_usd - spent_this_run))
     if loop.daily_budget_usd:
         limits.append(("daily loop budget", loop.daily_budget_usd
-                       - state.loop_spent_since(day_ago, loop.name, cfg.local_providers)))
+                       - run_store.loop_spent_since(day_ago, loop.name, cfg.local_providers)))
     if cfg.daily_budget_usd:
         limits.append(("daily budget for all loops",
-                       cfg.daily_budget_usd - state.loop_spent_since(day_ago, None, cfg.local_providers)))
+                       cfg.daily_budget_usd - run_store.loop_spent_since(day_ago, None, cfg.local_providers)))
     return min(limits, key=lambda x: x[1]) if limits else None
 
 

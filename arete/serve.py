@@ -42,12 +42,18 @@ from . import (
     sessions,
     sources,
     state,
+    store,
     tasks,
     tool_events,
     util,
     webpush,
 )
 from .loops import Loop
+from .store import db as foundation
+from .store import incidents as incident_store
+from .store import loops as loop_store
+from .store import runs as run_store
+from .store import sources as source_store
 
 TICK_SECONDS = 20
 PRUNE_SECONDS = 3600
@@ -61,7 +67,7 @@ POLL_THREADS = 8
 def mergecheck_reset(loop: Loop, item: dict) -> str:
     from . import mergecheck
 
-    payload = state.queue_item(item["id"])
+    payload = loop_store.queue_item(item["id"])
     names = {e.get("repo", "") for e in payload["payload"]} if payload else set()
     return max((mergecheck.held_until(loop.dir, name) for name in names), default="")
 
@@ -264,7 +270,7 @@ class Server:
         try:
             with principals.acting(f"rule:{key[5:]}" if key.startswith("loop:") else "hand"):
                 result = fn(*args)
-        except state.NoDatabase:
+        except foundation.NoDatabase:
             raise
         except Exception as e:
             error = f"{type(e).__name__}: {util.first_line(str(e), 300)}"
@@ -300,13 +306,13 @@ class Server:
         return True
 
     def tick(self) -> None:
-        state.ensure_schema()
+        foundation.ensure_schema()
         if self.contracts_waiting:
-            self.contracts_waiting = state.migrate()
+            self.contracts_waiting = foundation.migrate()
         if not self.guard("tick:load", self.load) or self.code_problem:
             return
         self.guard("stage:reap", self.reap)
-        states = self.guard("stage:states", state.loop_states)
+        states = self.guard("stage:states", loop_store.loop_states)
         if states is not None:
             now = util.now()
             for loop in self.live:
@@ -393,7 +399,7 @@ class Server:
         if self.failing or fresh:
             return
         if self.alert_open or not self.alert_checked:
-            was_open = self.alert_open or bool(state.alert_get(ALERT_KEY))
+            was_open = self.alert_open or bool(incident_store.alert_get(ALERT_KEY))
             self.alert_open = False
             self.alert_checked = True
             if was_open:
@@ -457,7 +463,7 @@ class Server:
         try:
             with state.tx():
                 events.trim()
-            state.prune(lines_days=limits.lines_days, keep_days=self.cfg.oncall.keep_days)
+            store.prune(lines_days=limits.lines_days, keep_days=self.cfg.oncall.keep_days)
         except Exception as e:
             self.say(f"state prune failed: {type(e).__name__}: {util.first_line(str(e), 300)}")
         try:
@@ -507,16 +513,16 @@ class Server:
         if not (t.cron or t.every):
             return
         if not st.get("last_fire"):
-            state.set_loop_state(loop.name, last_fire=util.iso(now), next_due=next_due(loop, now))
+            loop_store.set_loop_state(loop.name, last_fire=util.iso(now), next_due=next_due(loop, now))
             return
         if is_due(loop, st["last_fire"], now):
             self.fire(loop, "cron" if t.cron else "every", now)
         elif st.get("next_due") != (due := next_due(loop, util.parse_iso(st["last_fire"]))):
-            state.set_loop_state(loop.name, next_due=due)
+            loop_store.set_loop_state(loop.name, next_due=due)
 
     def fire(self, loop: Loop, trigger: str, now: datetime) -> None:
         queued = sources.fire(loop, trigger)
-        state.set_loop_state(loop.name, last_fire=util.iso(now), next_due=next_due(loop, now))
+        loop_store.set_loop_state(loop.name, last_fire=util.iso(now), next_due=next_due(loop, now))
         self.say(f"{loop.name}: fired by {trigger}" if queued else f"{loop.name}: {trigger} fire joins the one that waits")
 
     def poll(self, loop: Loop) -> None:
@@ -579,7 +585,7 @@ class Server:
             return self.say
 
         def log(text: str) -> None:
-            state.add_feed(run_id, "device", f"arete serve: {text}")
+            run_store.add_feed(run_id, "device", f"arete serve: {text}")
             self.say(f"{run_id}: {text}")
         return log
 
@@ -593,8 +599,8 @@ class Server:
             found, items = sources.poll(loop, index, self.cfg, say=self.say)
         except Exception as e:
             text = f"{type(e).__name__}: {util.first_line(str(e), 300)}"
-            if (c := state.cursor(sid)) is not None:
-                state.set_cursor(sid, c["value"], False, text)
+            if (c := source_store.cursor(sid)) is not None:
+                source_store.set_cursor(sid, c["value"], False, text)
             if self.errors.get(sid) != text:
                 self.say(f"{sid}: poll failed: {text}")
             self.errors[sid] = text
@@ -604,8 +610,8 @@ class Server:
             self.say(f"{sid}: {util.count(len(found), 'new event')}, {util.count(len(items), 'queue item')}")
 
     def dispatch(self, by_name: dict[str, Loop]) -> None:
-        slots = QueueSlots(state.runs_marked_running())
-        pending = state.pending()
+        slots = QueueSlots(run_store.runs_marked_running())
+        pending = loop_store.pending()
         ids = {item["id"] for item in pending}
         self.waiting = {i: why for i, why in self.waiting.items() if i in ids}
         self.settle("queue:", {str(i) for i in ids})
@@ -619,7 +625,7 @@ class Server:
     def dispatch_queued_as_rule(self, item: dict, by_name: dict[str, Loop], slots: QueueSlots) -> None:
         loop = by_name.get(item["loop"])
         if not loop or not loop.enabled or loop.error:
-            state.drop_queue_item(item["id"])
+            loop_store.drop_queue_item(item["id"])
             self.say(f"{item['loop']}: dropped queue item {item['id']}, the loop is off or gone")
             return
         why = self.dispatch_item(item, loop, slots)
@@ -784,15 +790,15 @@ class Server:
         if not failing:
             self.last_ok = at
         try:
-            pending = len(state.pending())
+            pending = len(loop_store.pending())
         except Exception:
             pending = None
         try:
-            running = sum(r["kind"] == "loop" for r in state.runs_marked_running())
+            running = sum(r["kind"] == "loop" for r in run_store.runs_marked_running())
         except Exception:
             running = None
         util.write_json(control.BEAT_FILE, {
-            "schema": state.LATEST,
+            "schema": foundation.LATEST,
             "db": db,
             "pid": os.getpid(), "engine": codebase.STAMP, "at": at, "started": util.iso(self.started), "ticks": self.ticks,
             "tick_seconds": TICK_SECONDS, "loops": len(live), "off": len(every_loop) - len(live),
@@ -830,57 +836,48 @@ def cleanup_legacy() -> None:
 
 
 def run(with_dashboard: bool = True) -> NoReturn:
-    with principals.acting("hand"):
-        return run_as_hand(with_dashboard)
-
-
-def run_as_hand(with_dashboard: bool = True) -> NoReturn:
     rotation_notes = install.rotate_own_log()
-    held = take_serve_lock()
-    try:
-        beat = util.read_json(control.BEAT_FILE, {})
-        if beat.get("pid") == os.getpid():
-            util.write_json(control.BEAT_FILE, {**beat, "schema": state.LATEST,
-                                              "db": beat.get("db") or {
-                                                  **dbstats.empty_collection(), "status": "initial",
-                                                  "requested_at": None, "finished_at": None, "error": None}})
+    with principals.acting("hand"):
+        held = take_serve_lock()
         try:
-            with util.lock("migrate", wait=True):
-                backup.recover_restore()
-            contracts_waiting = state.migrate()
-            if backup.pending_restore():
-                raise backup.Refused("restore metadata could not finish migration; API startup refused")
-            if not paths.ISOLATED:
-                conn = paths.connect_db(paths.DB_FILE)
-                try:
-                    if conn.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() != "wal":
-                        raise RuntimeError("arete.db refused WAL mode")
-                finally:
-                    conn.close()
-            cleanup_legacy()
-        except Exception as e:
-            print(str(e), file=sys.stderr)
-            raise SystemExit(1) from e
-        server = Server()
-        server.contracts_waiting = contracts_waiting
-        server.lock = held
-    except BaseException:
-        held.close()
-        raise
-    server.say(f"arete serve {os.getpid()}: tick every {TICK_SECONDS}s")
-    for note in rotation_notes:
-        server.say(note)
-    server.report_config()
-    for note in start_notes(server.cfg):
-        server.say(note)
-    if with_dashboard:
-        threading.Thread(target=dashboard.serve, kwargs={"inside_serve": True}, name="dashboard", daemon=True).start()
-    while True:
-        started = time.monotonic()
-        try:
-            server.run_pass()
-        except state.NoDatabase as e:
-            server.say(str(e))
+            beat = util.read_json(control.BEAT_FILE, {})
+            if beat.get("pid") == os.getpid():
+                util.write_json(control.BEAT_FILE, {**beat, "schema": foundation.LATEST,
+                                                  "db": beat.get("db") or {
+                                                      **dbstats.empty_collection(), "status": "initial",
+                                                      "requested_at": None, "finished_at": None, "error": None}})
+            try:
+                with util.lock("migrate", wait=True):
+                    backup.recover_restore()
+                contracts_waiting = foundation.migrate()
+                if backup.pending_restore():
+                    raise backup.Refused("restore metadata could not finish migration; API startup refused")
+                if not paths.ISOLATED:
+                    foundation.enable_wal()
+                cleanup_legacy()
+            except Exception as e:
+                print(str(e), file=sys.stderr)
+                raise SystemExit(1) from e
+            server = Server()
+            server.contracts_waiting = contracts_waiting
+            server.lock = held
+        except BaseException:
             held.close()
-            raise SystemExit(1) from e
-        time.sleep(max(1.0, TICK_SECONDS - (time.monotonic() - started)))
+            raise
+        server.say(f"arete serve {os.getpid()}: tick every {TICK_SECONDS}s")
+        for note in rotation_notes:
+            server.say(note)
+        server.report_config()
+        for note in start_notes(server.cfg):
+            server.say(note)
+        if with_dashboard:
+            threading.Thread(target=dashboard.serve, kwargs={"inside_serve": True}, name="dashboard", daemon=True).start()
+        while True:
+            started = time.monotonic()
+            try:
+                server.run_pass()
+            except foundation.NoDatabase as e:
+                server.say(str(e))
+                held.close()
+                raise SystemExit(1) from e
+            time.sleep(max(1.0, TICK_SECONDS - (time.monotonic() - started)))

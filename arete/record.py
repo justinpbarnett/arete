@@ -23,6 +23,9 @@ from typing import Self
 
 from . import agent, codebase, paths, run_lines, scrub, state, util
 from . import events as event_log
+from .store import db as foundation
+from .store import loops as loop_store
+from .store import runs as run_store
 
 SETTLE_GRACE_SECONDS = 60
 INTERRUPTED = "stopped before it finished (the Mac restarted, lost power or the process was killed)"
@@ -43,7 +46,7 @@ def new_id(prefix: str, tag: str = "") -> str:
 
 def start(kind: str, *, run_id: str = "", tag: str = "", lock: str = "", **fields) -> str:
     row = {"kind": kind, "status": "running", "started": util.iso(), "lock": lock or None, "pid": os.getpid(),
-           "engine_sha": codebase.STAMP, "schema_version": state.LATEST, **fields}
+           "engine_sha": codebase.STAMP, "schema_version": foundation.LATEST, **fields}
     cols, marks = ", ".join(row), ", ".join("?" * len(row))
     while True:
         minted = run_id or new_id(ID_PREFIX.get(kind, kind), tag)
@@ -66,20 +69,7 @@ def step(run_id: str, name: str, res, seconds: float, effort: str = "", tier: st
 
 def steps(run_id: str, name: str, calls, effort: str = "", tier: str = "", kind: str = "",
           try_no: int = 0, auth_mode: str = "") -> None:
-    with state.db() as c:
-        for res, seconds in calls:
-            c.execute("INSERT INTO steps (run_id, step, runner, model, provider, ok, cost_usd, tokens_in, tokens_out,"
-                      " turns, seconds, error, ts, first_context_tokens, effort, tier, try, kind, cache_read, cache_write,"
-                      " api_seconds, auth_mode) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
-                      "COALESCE(NULLIF(?, 0), (SELECT COALESCE(MAX(try), 0) + 1 FROM steps WHERE run_id = ? AND step = ?)),"
-                      "?,?,?,?,?)",
-                      (run_id, name, res.runner, res.model, res.provider, int(res.ok), res.cost_usd, res.tokens_in,
-                       res.tokens_out, res.turns, round(seconds, 2), (res.error or "")[:500], util.iso(),
-                       res.first_context_tokens, effort or "", tier or "", try_no, run_id, name, kind or "", res.cache_read,
-                       res.cache_write, round(res.api_seconds, 2), auth_mode or res.auth_mode))
-            c.execute("UPDATE runs SET cost_usd = COALESCE(cost_usd, 0) + ?, tokens_in = COALESCE(tokens_in, 0) + ?, "
-                      "tokens_out = COALESCE(tokens_out, 0) + ? WHERE id = ?",
-                      (res.cost_usd, res.tokens_in, res.tokens_out, run_id))
+    run_store.insert_steps(run_id, name, calls, effort, tier, kind, try_no, auth_mode)
 
 
 def correct(run_id: str, usd: float, why: str, auth_mode: str = "subscription") -> None:
@@ -87,44 +77,32 @@ def correct(run_id: str, usd: float, why: str, auth_mode: str = "subscription") 
         raise ValueError("correction needs a finite amount and a reason")
     if auth_mode not in ("subscription", "api_key", "local"):
         raise ValueError("invalid auth mode")
-    if not state.run_get(run_id):
+    if not run_store.run_get(run_id):
         raise ValueError(f"no run: {run_id}")
     step(run_id, "correction", agent.Result(ok=True, runner="correction", cost_usd=usd, error=why,
                                            auth_mode=auth_mode), 0, kind="correction")
 
 
 def label_step(run_id: str, step: str, try_no: int, **labels) -> None:
-    with state.db() as c:
-        c.execute(f"UPDATE steps SET {', '.join(f'{k} = ?' for k in labels)} WHERE run_id = ? AND step = ? AND try = ?",
-                  (*labels.values(), run_id, step, try_no))
+    run_store.label_step(run_id, step, try_no, **labels)
 
 
 def hold_ab(run_id: str, role: str, name: str, side: str, arm: dict) -> None:
-    with state.db() as c:
-        row = c.execute("SELECT ab_held FROM runs WHERE id = ?", (run_id,)).fetchone()
-        held = {**json.loads((row["ab_held"] if row else "") or "{}"), role: [name, side, arm]}
-        c.execute("UPDATE runs SET ab_held = ? WHERE id = ?", (json.dumps(held), run_id))
+    run_store.hold_ab(run_id, role, name, side, arm)
 
 
 def metered_spent(run_id: str) -> float:
-    return state.paid_by_run([run_id]).get(run_id, 0.0)
+    return run_store.paid_by_run([run_id]).get(run_id, 0.0)
 
 
 def note(run_id: str, **fields) -> None:
     if "status" in fields:
-        raise ValueError("use move to change a run's status")
-    with state.db() as c:
-        c.execute(f"UPDATE runs SET {', '.join(f'{k} = ?' for k in fields)} WHERE id = ?", (*fields.values(), run_id))
+        raise ValueError("use move to change a run\'s status")
+    run_store.note(run_id, **fields)
 
 
 def move(run_id: str, to: str, expect: tuple[str, ...], **fields) -> bool:
-    if not expect:
-        return False
-    fields = {**fields, "status": to}
-    with state.db() as c:
-        return c.execute(f"UPDATE runs SET {', '.join(f'{k} = ?' for k in fields)} "
-                         f"WHERE id = ? AND status IN ({','.join('?' * len(expect))})",
-                         (*fields.values(), run_id, *expect)).rowcount > 0
+    return run_store.move(run_id, to, expect, **fields)
 
 
 def ask_stop(run_id: str) -> dict | None:
@@ -157,7 +135,7 @@ def stoppable() -> Iterator[None]:
 
 
 def stop_asked(run_id: str) -> bool:
-    r = state.run_get(run_id)
+    r = run_store.run_get(run_id)
     return bool(r and r["stop_asked"])
 
 
@@ -192,7 +170,7 @@ def dead_status(row: dict) -> str:
     if row.get("only_step"):
         return "interrupted"
     if row["kind"] == "pipeline":
-        earlier = [r for r in state.ticket_runs(row["repo"], row["issue"], limit=3, whole=True) if r["id"] != row["id"]]
+        earlier = [r for r in run_store.ticket_runs(row["repo"], row["issue"], limit=3, whole=True) if r["id"] != row["id"]]
         return "failed" if earlier and earlier[0]["status"] == "interrupted" else "interrupted"
     return "failed" if row["kind"] in FAILS_WHEN_DEAD else "interrupted"
 
@@ -221,7 +199,7 @@ def interrupt(row: dict, notes: Sequence[str] = ()) -> dict | None:
 
 def reap(*, tickets: bool, then: Callable[[dict], None] = lambda row: None) -> list[dict]:
     settled = []
-    for row in state.runs_marked_running():
+    for row in run_store.runs_marked_running():
         if ((row["kind"] in TICKET_KINDS) != tickets
                 or (util.now() - util.parse_iso(row["started"])).total_seconds() < SETTLE_GRACE_SECONDS):
             continue
@@ -230,7 +208,7 @@ def reap(*, tickets: bool, then: Callable[[dict], None] = lambda row: None) -> l
                 then(done)
                 settled.append(done)
     if not tickets:
-        state.release_settled_claims()
+        loop_store.release_settled_claims()
     return settled
 
 
@@ -476,7 +454,7 @@ def raw_lines(path: Path) -> Iterator[str]:
 
 def run_status(run_id: str) -> str:
     try:
-        row = state.run_get(run_id, connect=state.reader)
+        row = run_store.run_get(run_id, connect=foundation.reader)
     except sqlite3.Error:
         return ""
     return (row.get("status") or "") if row else ""
@@ -545,14 +523,11 @@ def numbered_events(path: Path) -> Iterator[dict]:
 
 
 def runs_since(since: str, until: str = "9999") -> list[dict]:
-    with state.db() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM runs WHERE status != 'running' "
-                                           "AND COALESCE(finished, started) >= ? AND COALESCE(finished, started) < ? "
-                                           "ORDER BY started", (since, until))]
+    return run_store.finished_runs_since(since, until)
 
 
 def read_run(run_id: str) -> dict | None:
-    row = state.run_get(run_id)
+    row = run_store.run_get(run_id)
     if not row:
         return None
     try:
@@ -567,7 +542,7 @@ def read_run(run_id: str) -> dict | None:
         waited = sum(run_lines.wait_minutes(run_id).values())
     except OSError:
         waited = 0
-    rows = state.steps(run_id)
+    rows = run_store.steps(run_id)
     tries: dict[str, int] = {}
     for r in rows:
         tries[r["step"]] = max(tries.get(r["step"], 0), r["try"] or 0)
@@ -880,9 +855,7 @@ def legacy_firing(folder: Path) -> bool:
 
 
 def purge_folders() -> Purged:
-    with state.db() as c:
-        queued = {r["run_id"] for r in c.execute("SELECT run_id FROM run_purges")}
-        known = {r["id"] for r in c.execute("SELECT id FROM runs")}
+    queued, known = run_store.purge_inventory()
     folders, size, errors = 0, 0, []
     for run_id in sorted(queued):
         folder = paths.RUNS_DIR / run_id
@@ -894,8 +867,7 @@ def purge_folders() -> Purged:
                 shutil.rmtree(folder)
                 folders, size = folders + 1, size + measured
             if not folder.exists():
-                with state.db() as c:
-                    c.execute("DELETE FROM run_purges WHERE run_id = ?", (run_id,))
+                run_store.forget_purge(run_id)
         except (OSError, ValueError) as e:
             errors.append(f"{run_id}: {type(e).__name__}: {e}")
     for folder in run_folders():
@@ -914,8 +886,8 @@ def purge_folders() -> Purged:
 def kept(records: Sequence[Stored]) -> set[str]:
     ids = [r.run_id for r in records]
     recent = time.time() - LIVE_SECONDS
-    return (state.record_pins() | state.runs_cited_by_kept_proposals(ids)
-            | {r["id"] for r in state.runs_marked_running()} | {r.run_id for r in records if r.written > recent})
+    return (run_store.record_pins() | state.runs_cited_by_kept_proposals(ids)
+            | {r["id"] for r in run_store.runs_marked_running()} | {r.run_id for r in records if r.written > recent})
 
 
 def prune(days: float, max_gb: float) -> Pruned:
@@ -943,11 +915,11 @@ def one_component(run_id: str) -> bool:
 def pin(run_id: str) -> None:
     if not one_component(run_id) or not paths.record_dir(run_id).is_dir():
         raise LookupError(f"no record for run {run_id}")
-    state.pin_record(run_id)
+    run_store.pin_record(run_id)
 
 
 def unpin(run_id: str) -> None:
-    if not state.unpin_record(run_id):
+    if not run_store.unpin_record(run_id):
         raise LookupError(f"run {run_id} is not pinned")
 
 
@@ -957,7 +929,7 @@ def store() -> dict:
     return {"bytes": sum(r.size for r in records), "runs_bytes": runs_bytes(), "records": len(records),
             "oldest": {"run_id": oldest.run_id, "written": util.iso(datetime.fromtimestamp(oldest.written, UTC))}
             if oldest else None,
-            "pins": len(state.record_pins())}
+            "pins": len(run_store.record_pins())}
 
 
 def size_text(n: int) -> str:

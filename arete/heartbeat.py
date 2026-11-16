@@ -27,6 +27,8 @@ from . import (
     util,
     workspace,
 )
+from .store import loops as loop_store
+from .store import runs as run_store
 
 
 @dataclass
@@ -48,7 +50,7 @@ def launchd_table() -> dict[str, tuple[str, str]]:
 
 
 def check_costs() -> list[Check]:
-    drift = state.cost_drift()
+    drift = run_store.cost_drift()
     detail = (f"{len(drift)} runs differ from steps by ${sum(abs(r['difference']) for r in drift):.6f}: "
               + ", ".join(r["id"] for r in drift[:5])) if drift else "run costs equal their steps"
     return [Check("costs:drift", not drift, detail)]
@@ -387,12 +389,12 @@ def check_backup_offsite(cfg: config.Config) -> Check:
 def check_loops(cfg: config.Config) -> list[Check]:
     from . import loops
 
-    beats = state.loop_marks()
+    beats = loop_store.loop_marks()
     out = []
     for loop in loops.load_all(cfg):
         if not loop.enabled or loop.error or not loop.stale_hours or loop.name == os.environ.get("ARETE_LOOP"):
             continue
-        last = next((r for r in state.runs(kind="loop", loop=loop.name, limit=10, firings=True)
+        last = next((r for r in run_store.runs(kind="loop", loop=loop.name, limit=10, firings=True)
                      if r["status"] != "running"), None)
         if not last:
             continue
@@ -412,7 +414,7 @@ def check_loops(cfg: config.Config) -> list[Check]:
 
 
 def mark_loop(name: str, ok: bool, detail: str = "") -> None:
-    state.set_loop_state(name, mark_ok=int(ok), mark_detail=detail[:200], mark_at=util.iso())
+    loop_store.set_loop_state(name, mark_ok=int(ok), mark_detail=detail[:200], mark_at=util.iso())
 
 
 def network_up_or_skip(loop: str, dry_run: bool) -> bool:

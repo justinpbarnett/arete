@@ -5,6 +5,7 @@ import sys
 from collections import Counter
 
 from .. import config, paths
+from ..store import incidents as incident_store
 from .common import when
 
 
@@ -69,9 +70,9 @@ def oncall_incident_action(args, cfg) -> int:
 
 
 def oncall_show(args, cfg) -> int:
-    from .. import oncall, state
+    from .. import oncall
 
-    found = state.incident(int(args.id)) if args.id.isdigit() else None
+    found = incident_store.incident(int(args.id)) if args.id.isdigit() else None
     if not found:
         print(f"no incident {args.id}", file=sys.stderr)
         return 1
@@ -95,9 +96,9 @@ def oncall_show(args, cfg) -> int:
 
 
 def oncall_list(args, cfg) -> int:
-    from .. import oncall, state
+    from .. import oncall
 
-    rows = state.incidents()
+    rows = incident_store.incidents()
     if args.json:
         for row in rows:
             print(json.dumps(row))

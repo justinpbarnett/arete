@@ -29,6 +29,10 @@ from . import (
     util,
 )
 from .sighting import Sighting
+from .store import db as foundation
+from .store import incidents as incident_store
+from .store import runs as run_store
+from .store import sources as source_store
 
 UNEXPECTED, HEARTBEAT, STALLED, ORCHESTRATION, EXPECTED = "unexpected", "heartbeat", "stalled", "orchestration", "expected"
 WAKE, IGNORE, UNSURE = "wake", "ignore", "unsure"
@@ -107,6 +111,23 @@ class Event:
     legacy: str = ""
 
 
+def commit_scan(incident_rows: list[Sighting], cursor_rows: list[tuple[str, str, bool, str]],
+                aliases=(), marks=None) -> list[bool]:
+    with foundation.db() as c:
+        for fingerprint, incident_id, note in aliases:
+            incident_store.write_alias(c, fingerprint, incident_id, note)
+        opened = []
+        for row in incident_rows:
+            incident_id, new = incident_store.write_incident(c, row)
+            opened.append(new)
+            if new and row.fingerprint in (marks or {}):
+                fields, note = marks[row.fingerprint]
+                incident_store.write_mark(c, incident_id, fields, note)
+        for source, value, ok, detail in cursor_rows:
+            source_store.write_scan_cursor(c, source, value, ok, detail)
+        return opened
+
+
 def traceback_end(rows: list[str], begin: int) -> tuple[int, str]:
     j = begin
     while True:
@@ -152,12 +173,12 @@ def own_step(row: dict) -> bool:
 def other_live_run(run_id, found: dict) -> dict | None:
     if not (found.get("repo") and found.get("issue")):
         return None
-    other = state.running_run(found["repo"], found["issue"])
+    other = run_store.running_run(found["repo"], found["issue"])
     return other if other and other["id"] != run_id else None
 
 
 def ticket_has_live_run(row: dict) -> bool:
-    return bool(other_live_run(row["run"], state.run_get(str(row["run"])) or {}))
+    return bool(other_live_run(row["run"], run_store.run_get(str(row["run"])) or {}))
 
 
 def classify(text: str, row: dict | None) -> str:
@@ -212,8 +233,8 @@ def process_gone(row: dict) -> bool:
     return not util.lock_is_held(row["lock"]) if row.get("lock") else not util.pid_alive(row.get("pid"))
 
 
-def cursor_value(name: str, connect=state.db):
-    row = state.cursor(name, connect)
+def cursor_value(name: str, connect=foundation.db):
+    row = source_store.cursor(name, connect)
     return row, (json.loads(row["value"]) if row and row["value"] else None)
 
 
@@ -231,16 +252,16 @@ def stop_run(run_id: str) -> dict:
     return control.stop_run(run_id)
 
 
-def switched_off(connect=state.db) -> bool:
+def switched_off(connect=foundation.db) -> bool:
     return cursor_value(SWITCH, connect)[1] == "off"
 
 
 def switch(on: bool) -> dict:
     word = "on" if on else "off"
     with util.lock("oncall", wait=True):
-        state.set_cursor(SWITCH, json.dumps(word), True, f"wakes {word}")
-        for row in state.woken_incidents():
-            state.add_incident_note(row["id"], f"wakes and rechecks switched {word} by the owner")
+        source_store.set_cursor(SWITCH, json.dumps(word), True, f"wakes {word}")
+        for row in incident_store.woken_incidents():
+            incident_store.add_incident_note(row["id"], f"wakes and rechecks switched {word} by the owner")
     return {"wakes": word}
 
 
@@ -259,7 +280,7 @@ def clear_alert(cfg: config.Config, key: str) -> bool:
     from . import alerts
 
     alerts.clear_alert(cfg.alert_repo, key)
-    return state.alert_get(key) is None
+    return incident_store.alert_get(key) is None
 
 
 def route_outlook(cfg: config.Config, repo: config.Repo, setting) -> list:
@@ -421,7 +442,7 @@ def owner_run(row: dict) -> str:
         (str(r["run"]) for r in map(run_line, str(row.get("evidence") or "").splitlines()) if r), "")
     if not run_id:
         return ""
-    found = state.run_get(run_id) or {}
+    found = run_store.run_get(run_id) or {}
     if found.get("status") == "running" and not process_gone(found):
         return run_id
     other = other_live_run(run_id, found)
@@ -486,7 +507,7 @@ def origin_repo(source: str, repo: str) -> str:
     if repo:
         return repo
     run_id = run_lines.run_of_path(Path(source)) or (source.removeprefix("run ") if source.startswith("run ") else "")
-    return ((state.run_get(run_id) or {}).get("repo") or "") if run_id else ""
+    return ((run_store.run_get(run_id) or {}).get("repo") or "") if run_id else ""
 
 
 def refused(cfg: config.Config, repo: str) -> str:
@@ -505,7 +526,7 @@ def failed(row: dict, reason: str) -> None:
         note = f"undecided: {reason}" if reason != row["reason"] else ""
     elif row["tries"] == 0:
         note = f"could not judge it again: {reason}"
-    state.update_incident(row["id"], note, **fields)
+    incident_store.update_incident(row["id"], note, **fields)
 
 
 def count_undecided(counts: dict[str, int], row: dict, reason: str) -> None:
@@ -519,7 +540,7 @@ def settle(row: dict, outcome: Verdict) -> None:
     seen = sorted(shapes(row["evidence"]))
     kept = list(dict.fromkeys([*seen, *json.loads(row["shapes"] or "[]")]))[:SHAPES_KEPT]
     detail = ", ".join(f"{name} {'yes' if a['value'] else 'no'} {a['confidence']:.2f}" for name, a in answers.items())
-    state.update_incident(row["id"], f"decided {decision} (confidence {confidence:.2f}): {reason}; {detail}",
+    incident_store.update_incident(row["id"], f"decided {decision} (confidence {confidence:.2f}): {reason}; {detail}",
                           decision=decision, confidence=confidence, reason=reason, answers=json.dumps(answers),
                           injection=flagged, decided=util.iso(), tries=0, retry_at="", decided_count=row["count"],
                           shapes=json.dumps(kept))
@@ -530,12 +551,12 @@ def decide(cfg: config.Config, policies: Policies | None = None, budget: int = M
     counts: dict[str, int] = {}
     now = util.iso()
     ask = []
-    for row in state.incidents_to_decide():
+    for row in incident_store.incidents_to_decide():
         if not due(row, now):
             continue
         if owner := owner_run(row):
             if row["decision"] == "" and (why := f"run {owner} owns it and is still live") != row["reason"]:
-                state.update_incident(row["id"], reason=why)
+                incident_store.update_incident(row["id"], reason=why)
         elif why := refused(cfg, origin_repo(row["source"], row["repo"])):
             count_undecided(counts, row, why)
         else:
@@ -563,7 +584,7 @@ def decision_line(row: dict) -> str:
 
 def known_twins(cfg: config.Config, policies: Policies, sightings: list[Sighting], known: dict[str, dict],
                 budget: int = MAX_ASKS) -> tuple[list, dict, int]:
-    open_rows = [r for r in state.open_incidents() if not r["injection"]]
+    open_rows = [r for r in incident_store.open_incidents() if not r["injection"]]
     line, injection_line = thresholds(cfg)
     fresh, candidates = [], []
     homes = {r["id"]: origin_repo(r["source"], r["repo"]) for r in open_rows}
@@ -620,7 +641,7 @@ class Watch:
         self.found: dict[tuple, Event] = {}
         self.sources = self.lines = self.asks = 0
         self.cursors: list[tuple[str, str, bool, str]] = []
-        self.owned = {(r["repo"], r["task"]): r["incident"] for r in state.incident_repairs() if r["task"]}
+        self.owned = {(r["repo"], r["task"]): r["incident"] for r in incident_store.incident_repairs() if r["task"]}
         self.runs: dict[str, dict] = {}
         self.quiet: dict[int, int] = {}
 
@@ -628,7 +649,7 @@ class Watch:
         if not self.owned:
             return 0
         if run_id not in self.runs:
-            self.runs[run_id] = state.run_get(run_id) or {}
+            self.runs[run_id] = run_store.run_get(run_id) or {}
         found = self.runs[run_id]
         return self.owned.get((found.get("repo"), found.get("issue")), 0)
 
@@ -676,7 +697,7 @@ class Watch:
             window = [r for r in near if same_owner(r, row)]
             repo, scope = origin.repo, policy_scope
             if row and not repo:
-                repo = (state.run_get(str(row["run"])) or {}).get("repo") or ""
+                repo = (run_store.run_get(str(row["run"])) or {}).get("repo") or ""
                 if repo:
                     scope = f"{policy_scope}:{repo}"
             self.add(classify(text, row), scope, text, name, repo, window, rule=rule, legacy=origin.scope)
@@ -701,8 +722,8 @@ class Watch:
         self.cursors.append((PREFIX + name, value, True, detail))
 
     def run_files(self, since: str | None) -> list[str]:
-        ids = [r["id"] for r in state.runs_marked_running()]
-        ids += [r["id"] for r in state.runs_since(since)] if since else []
+        ids = [r["id"] for r in run_store.runs_marked_running()]
+        ids += [r["id"] for r in run_store.runs_since(since)] if since else []
         return [str(run_lines.path(run_id)) for run_id in dict.fromkeys(ids)]
 
     def heartbeat(self) -> None:
@@ -736,7 +757,7 @@ class Watch:
         _, flagged = cursor_value(PREFIX + "stalls")
         flagged = flagged or []
         stalled = []
-        for row in state.runs_marked_running():
+        for row in run_store.runs_marked_running():
             if (util.now() - util.parse_iso(row["started"])).total_seconds() <= record.SETTLE_GRACE_SECONDS:
                 continue
             rows, texts = tail_of(run_lines.path(row["id"]))
@@ -752,7 +773,7 @@ class Watch:
     def store(self) -> tuple[int, int, int]:
         events = [e for e in self.found.values() if e.kind != EXPECTED]
         hidden = scrub.secrets() if events else ()
-        held = state.known_fingerprints() if events else {}
+        held = incident_store.known_fingerprints() if events else {}
         rows = []
         for e in events:
             signature = outbound.redact(sources.signature(scrub.scrub(e.signature, hidden)))
@@ -769,9 +790,9 @@ class Watch:
                 fingerprint = fingerprint_of(e.kind, scope, signature)
             rows.append(Sighting(fingerprint, e.kind, e.source, e.repo, signature, e.count, evidence, packed(e.rule)))
         matched, marks, self.asks = known_twins(self.cfg, self.policies, rows, held)
-        opened = sum(state.commit_scan(rows, self.cursors, matched, marks))
+        opened = sum(commit_scan(rows, self.cursors, matched, marks))
         for incident, n in self.quiet.items():
-            state.add_incident_note(incident, f"its repair wrote {util.count(n, 'failure line')}; none opened an incident")
+            incident_store.add_incident_note(incident, f"its repair wrote {util.count(n, 'failure line')}; none opened an incident")
         return opened, len(events) - opened, len(self.found) - len(events)
 
     def inherits(self, row: dict, e: Event) -> bool:
@@ -803,7 +824,7 @@ def attempts(row: dict) -> list[dict]:
 def moved(row: dict, phase: str, waiting: str = "", note: str = "", **fields) -> None:
     if (row["phase"], row["waiting"]) == (phase, waiting) and not fields:
         return
-    state.update_incident(row["id"], note or (f"{phase}: {waiting}" if waiting else phase),
+    incident_store.update_incident(row["id"], note or (f"{phase}: {waiting}" if waiting else phase),
                           phase=phase, waiting=waiting, **fields)
 
 
@@ -812,14 +833,14 @@ def alert_key(incident_id: int) -> str:
 
 
 def escalate(cfg: config.Config, row: dict, kind: str, run: str = "") -> None:
-    latest = state.incident(row["id"])
+    latest = incident_store.incident(row["id"])
     if latest["alerted"]:
         return
     line = outbound.sanitize(ESCALATIONS[kind].format(
         id=row["id"], repo=repair_repo(cfg, row) or "-", run=run or "-", n=len(attempts(latest)),
         budget=f"{cfg.oncall.incident_budget_usd:.2f}"))
     raise_alert(cfg, alert_key(row["id"]), f"on-call incident {row['id']} needs you", line)
-    state.update_incident(row["id"], f"escalated once: {line}", alerted=1)
+    incident_store.update_incident(row["id"], f"escalated once: {line}", alerted=1)
 
 
 def hold(cfg: config.Config, row: dict, why: str, kind: str, run: str) -> None:
@@ -828,11 +849,11 @@ def hold(cfg: config.Config, row: dict, why: str, kind: str, run: str) -> None:
 
 
 def end_repair(repair: dict, outcome: str) -> None:
-    state.set_repair(repair["id"], ended=util.iso(), outcome=outcome)
+    incident_store.set_repair(repair["id"], ended=util.iso(), outcome=outcome)
 
 
 def lose(cfg: config.Config, row: dict, why: str) -> None:
-    used = len(attempts(state.incident(row["id"])))
+    used = len(attempts(incident_store.incident(row["id"])))
     moved(row, "waiting", why, f"attempt failed: {why}; {used} of {cfg.oncall.max_attempts} attempts used", landed="")
 
 
@@ -856,7 +877,7 @@ def reread(cfg: config.Config, policies: Policies, row: dict) -> tuple[bool, str
             return False, f"heartbeat read of {beat['ts']} has no result for the check"
         return all(c.get("ok") for c in mine), f"heartbeat read of {beat['ts']}"
     if row["class"] == STALLED:
-        found = state.run_get(row["source"].removeprefix("run ")) or {}
+        found = run_store.run_get(row["source"].removeprefix("run ")) or {}
         gone = found.get("status") != "running" or not (process_gone(found) or silent(tail_of(run_lines.path(found["id"]))[0]))
         return gone, f"run {found.get('id', '-')} {found.get('status', 'is unknown')}"
     if row["source"] == "serve":
@@ -872,7 +893,7 @@ def reread(cfg: config.Config, policies: Policies, row: dict) -> tuple[bool, str
 
 def recover(row: dict, what: str) -> None:
     text = f"{what} passed at {util.iso()}; no recurrence since the repair landed at {row['landed']}"
-    state.update_incident(row["id"], f"resolved: {text}", state="resolved", phase="", waiting="", recovery=text)
+    incident_store.update_incident(row["id"], f"resolved: {text}", state="resolved", phase="", waiting="", recovery=text)
 
 
 def recheck(cfg: config.Config, policies: Policies, row: dict) -> None:
@@ -896,12 +917,12 @@ def cooling(cfg: config.Config, row: dict) -> str:
 
 
 def spent(cfg: config.Config, repairs: list[dict]) -> float:
-    ids = [r["id"] for x in repairs if x["task"] for r in state.ticket_runs(x["repo"], x["task"], limit=50)]
-    return sum(state.paid_by_run(ids, local_providers=cfg.local_providers).values())
+    ids = [r["id"] for x in repairs if x["task"] for r in run_store.ticket_runs(x["repo"], x["task"], limit=50)]
+    return sum(run_store.paid_by_run(ids, local_providers=cfg.local_providers).values())
 
 
 def last_run_id(repair: dict) -> str:
-    return next((r["id"] for r in state.ticket_runs(repair["repo"], repair["task"], limit=1)), "-")
+    return next((r["id"] for r in run_store.ticket_runs(repair["repo"], repair["task"], limit=1)), "-")
 
 
 def repair_line(row: dict) -> str:
@@ -965,7 +986,7 @@ def exhausted(cfg: config.Config, row: dict) -> str:
 
 
 def day_spent(cfg: config.Config, repairs: list[dict] | None = None) -> str:
-    every = state.incident_repairs() if repairs is None else repairs
+    every = incident_store.incident_repairs() if repairs is None else repairs
     day = [r for r in every if r["started"] >= util.iso(util.now() - timedelta(days=1))]
     if (money := spent(cfg, day)) >= cfg.oncall.daily_budget_usd:
         return f"{money:.2f} of {cfg.oncall.daily_budget_usd:.2f} USD spent on repairs today"
@@ -975,7 +996,7 @@ def day_spent(cfg: config.Config, repairs: list[dict] | None = None) -> str:
 def interrupted_run(repair: dict) -> dict | None:
     if not repair["task"]:
         return None
-    run = state.newest_whole_run(repair["repo"], repair["task"])
+    run = run_store.newest_whole_run(repair["repo"], repair["task"])
     return run if run and run["status"] == "interrupted" else None
 
 
@@ -1006,7 +1027,7 @@ def resume(cfg: config.Config, row: dict, repair: dict, why: str) -> bool:
 
 
 def parked(repo: str) -> set[str]:
-    rows = [r for r in state.incident_repairs() if r["task"] and r["repo"] == repo]
+    rows = [r for r in incident_store.incident_repairs() if r["task"] and r["repo"] == repo]
     if not rows:
         return set()
     off = switched_off()
@@ -1015,7 +1036,7 @@ def parked(repo: str) -> set[str]:
     for r in rows:
         if off or r["ended"]:
             held.add(r["task"])
-        elif interrupted_run(r) and (row := state.incident(r["incident"])):
+        elif interrupted_run(r) and (row := incident_store.incident(r["incident"])):
             cfg = cfg or config.load()
             if exhausted(cfg, row) or day_spent(cfg):
                 held.add(r["task"])
@@ -1041,7 +1062,7 @@ def hold_for(cfg: config.Config, row: dict) -> Hold | None:
     repo = next((r for r in cfg.repos if r.name == name), None)
     if repo is None:
         return Hold("waiting", f"{name!r} is not a [[repo]] to repair in" if name else "it has no repo to repair in")
-    every = state.incident_repairs()
+    every = incident_store.incident_repairs()
     if why := day_spent(cfg, every):
         return Hold("waiting", why)
     if len([r for r in every if not r["ended"]]) >= limits.max_repairs:
@@ -1063,11 +1084,11 @@ def wake(cfg: config.Config, row: dict) -> bool:
     limits = cfg.oncall
     mine = attempts(row)
     name = repair_repo(cfg, row)
-    repair = state.add_repair(row["id"], name)
+    repair = incident_store.add_repair(row["id"], name)
     try:
         started = start_task(name, repair_prompt(row, mine, limits.max_attempts), repair_title(row["id"]))
     except (control.Refused, control.NotFound) as e:
-        made = next(r for r in state.incident(row["id"])["repairs"] if r["id"] == repair)
+        made = next(r for r in incident_store.incident(row["id"])["repairs"] if r["id"] == repair)
         why = outbound.sanitize(str(e), 160)
         if task := adopt(made):
             moved(row, "repairing", note=f"woke repair attempt {len(mine) + 1} of {limits.max_attempts}: "
@@ -1075,7 +1096,7 @@ def wake(cfg: config.Config, row: dict) -> bool:
             return True
         moved(row, "waiting", f"the repair task would not start: {why}")
         return False
-    state.set_repair(repair, task=started["task"])
+    incident_store.set_repair(repair, task=started["task"])
     moved(row, "repairing", note=f"woke repair attempt {len(mine) + 1} of {limits.max_attempts}: task "
           f"{started['task']} in {name}, run {started.get('run') or '-'}")
     return True
@@ -1089,14 +1110,14 @@ def created_task(repair: dict) -> str:
 
 def adopt(repair: dict) -> str:
     if task := created_task(repair):
-        state.set_repair(repair["id"], task=task)
+        incident_store.set_repair(repair["id"], task=task)
         return task
-    state.set_repair(repair["id"], ended=util.iso(), outcome="not started")
+    incident_store.set_repair(repair["id"], ended=util.iso(), outcome="not started")
     return ""
 
 
 def adopt_unfinished() -> None:
-    for repair in state.incident_repairs():
+    for repair in incident_store.incident_repairs():
         if not (repair["ended"] or repair["task"]):
             adopt(repair)
 
@@ -1113,7 +1134,7 @@ def held_for_owner(cfg: config.Config, repair: dict, run_id: str) -> bool:
 
 
 def track_repair(cfg: config.Config, row: dict, repair: dict) -> bool:
-    run = state.newest_whole_run(repair["repo"], repair["task"])
+    run = run_store.newest_whole_run(repair["repo"], repair["task"])
     if run is None:
         return resume(cfg, row, repair, "the repair task has no run yet")
     status = run["status"]
@@ -1140,24 +1161,24 @@ def track_repair(cfg: config.Config, row: dict, repair: dict) -> bool:
 
 def tend(cfg: config.Config, policies: Policies) -> dict:
     counts = {"woken": 0, "resolved": 0, "restarted": 0}
-    for listed in [] if switched_off() else state.woken_incidents():
-        row = state.incident(listed["id"])
+    for listed in [] if switched_off() else incident_store.woken_incidents():
+        row = incident_store.incident(listed["id"])
         if live := live_repair(row):
             counts["restarted"] += track_repair(cfg, row, live)
         elif row["phase"] == "verifying":
             recheck(cfg, policies, row)
-        row = state.incident(row["id"])
+        row = incident_store.incident(row["id"])
         counts["resolved"] += row["state"] == "resolved"
         if row["state"] == "open" and row["phase"] != "verifying" and all(r["ended"] for r in row["repairs"]):
             counts["woken"] += wake(cfg, row)
-    for incident_id in state.closed_alerted():
+    for incident_id in incident_store.closed_alerted():
         if clear_alert(cfg, alert_key(incident_id)):
-            state.update_incident(incident_id, "its alert is cleared", alerted=0)
+            incident_store.update_incident(incident_id, "its alert is cleared", alerted=0)
     return {name: n for name, n in counts.items() if n}
 
 
 def steered(incident_id: int) -> dict:
-    row = state.incident(incident_id)
+    row = incident_store.incident(incident_id)
     if row is None:
         raise control.NotFound(f"no incident {incident_id}")
     return row
@@ -1172,15 +1193,15 @@ def cancel(incident_id: int) -> dict:
         repair = live_repair(steered(incident_id))
         if repair is None:
             raise control.Refused(f"incident {incident_id} has no repair running")
-        run = state.running_run(repair["repo"], repair["task"]) if repair["task"] else None
+        run = run_store.running_run(repair["repo"], repair["task"]) if repair["task"] else None
         if run:
             stop_run(run["id"])
         if repair["task"]:
             state.task_set_state(repair["task"], "closed", ("todo",))
-        state.set_repair(repair["id"], ended=util.iso(), outcome="cancelled")
-        until = cooling(config.load(), state.incident(incident_id))
+        incident_store.set_repair(repair["id"], ended=util.iso(), outcome="cancelled")
+        until = cooling(config.load(), incident_store.incident(incident_id))
         stopped = f"stopped run {run['id']}" if run else "no run was live"
-        state.update_incident(incident_id, f"cancelled by the owner: {stopped}; cooling down until {until or '-'}",
+        incident_store.update_incident(incident_id, f"cancelled by the owner: {stopped}; cooling down until {until or '-'}",
                               phase="waiting", waiting=f"cooling down until {until}" if until else "")
         return {"incident": incident_id, "stopped": run["id"] if run else "", "cooldown_until": until}
 
@@ -1197,7 +1218,7 @@ def closable(incident_id: int) -> dict:
 def dismiss(incident_id: int) -> dict:
     with util.lock("oncall", wait=True):
         closable(incident_id)
-        state.update_incident(incident_id, "dismissed by the owner", state="dismissed", phase="", waiting="")
+        incident_store.update_incident(incident_id, "dismissed by the owner", state="dismissed", phase="", waiting="")
         return {"incident": incident_id, "state": "dismissed"}
 
 
@@ -1206,7 +1227,7 @@ def retry(incident_id: int) -> dict:
         row = closable(incident_id)
         if row["decision"] != "wake":
             raise control.Refused(f"incident {incident_id} was not decided wake, so no repair is armed for it")
-        state.update_incident(incident_id, "re-armed by the owner: attempts, spend and the cooldown count from here",
+        incident_store.update_incident(incident_id, "re-armed by the owner: attempts, spend and the cooldown count from here",
                               rearmed=max((r["id"] for r in row["repairs"]), default=0), phase="", waiting="")
         return {"incident": incident_id, "rearmed": True}
 
@@ -1249,7 +1270,7 @@ def scan_once(cfg: config.Config) -> dict:
                "updated": updated, "expected": expected, "decisions": decisions,
                "repairs": repairs}
     total = (previous or {}).get("expected", 0) + expected
-    state.set_cursor(SCAN, json.dumps({"expected": total, "last": summary, "since": started}), True, said(summary))
+    source_store.set_cursor(SCAN, json.dumps({"expected": total, "last": summary, "since": started}), True, said(summary))
     return summary
 
 
@@ -1268,7 +1289,7 @@ def scan(cfg: config.Config) -> dict | None:
 
 
 def crashed(text: str) -> None:
-    state.set_cursor(SCAN, None, False, text)
+    source_store.set_cursor(SCAN, None, False, text)
 
 
 def age(stamp: str) -> int:
@@ -1276,7 +1297,7 @@ def age(stamp: str) -> int:
 
 
 def health() -> tuple[bool, str]:
-    row = state.cursor(SCAN)
+    row = source_store.cursor(SCAN)
     if row is None:
         beat = control.serve_beat()
         if beat.get("alive") and beat.get("started") and age(beat["started"]) < STALE_SECONDS:
@@ -1289,9 +1310,9 @@ def health() -> tuple[bool, str]:
     return True, f"last scan {seconds}s ago"
 
 
-def status(cfg: config.Config, connect=state.db) -> dict:
+def status(cfg: config.Config, connect=foundation.db) -> dict:
     row, value = cursor_value(SCAN, connect)
-    switch_row = state.cursor(SWITCH, connect)
+    switch_row = source_store.cursor(SWITCH, connect)
     return {"enabled": cfg.oncall.enabled, "last_scan": row["polled"] if row else "", "ok": bool(row and row["ok"]),
             "detail": row["detail"] if row else "", "expected": (value or {}).get("expected", 0),
             "wakes": "off" if switched_off(connect) else "on",

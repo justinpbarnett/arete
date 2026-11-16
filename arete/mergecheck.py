@@ -14,9 +14,11 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from . import config, environment, factory, loops, paths, record, state, tracker, util, workspace
+from . import config, environment, factory, loops, paths, record, tracker, util, workspace
 from .lab import verifier_suites
 from .pipeline import AgentRun, TicketWork, use_product
+from .store import runs as run_store
+from .store import sources as source_store
 
 PR = re.compile(r"https://github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)", re.IGNORECASE)
 CHECK = re.compile(r"^- \*\*(?:Passed|Failed(?: \(environment\))?)\*\*:\s*(.+)$")
@@ -39,7 +41,7 @@ def builtin(loop: loops.Loop) -> bool:
 def merged(cfg: config.Config) -> list[dict]:
     repos = {r.name: r for r in cfg.repos if r.pipeline}
     found: dict[str, dict] = {}
-    for row in state.merged_runs():
+    for row in run_store.merged_runs():
         if row["repo"] not in repos or not row.get("finished"):
             continue
         for match in PR.finditer(row["pr_url"]):
@@ -56,7 +58,7 @@ def events(cfg: config.Config, since_cursor: bool = True) -> list[dict]:
     if os.environ.get("ARETE_SOURCE_SAMPLE") == "1":
         rows = [r for repo in cfg.repos for r in [i for i in rows if i["repo"] == repo.name][-2:]]
     elif since_cursor:
-        seen = state.source_seen(os.environ.get("ARETE_SOURCE") or "merge-check#merged")
+        seen = source_store.source_seen(os.environ.get("ARETE_SOURCE") or "merge-check#merged")
         rows = [r for r in rows if r["key"] not in seen]
     return [{**r, "type": "command", "title": f"Merged {r['repo']} PR #{r['pr']}",
              "data": {**r, "at": r["merged_at"]}} for r in rows]

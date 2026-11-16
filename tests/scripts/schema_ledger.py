@@ -20,7 +20,9 @@ from unittest import mock
 
 CHECKOUT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(CHECKOUT))
-from arete import backup, cli, control, dashboard, loop_run, migrations, paths, record, serve, state, tailnet, util
+from arete.store import runs as run_store
+from arete import backup, cli, control, dashboard, loop_run, paths, record, serve, state, tailnet, util
+from arete.store import db as foundation, migrations
 
 TRACE = []
 BASE = max(m.n for m in migrations.load() if not m.name.endswith('_probe.py'))
@@ -30,14 +32,14 @@ PROBE_NAME = f"m{PROBE:04d}_foundation_probe.py"
 
 
 def install_trace():
-    connect = paths.connect_db
+    connect = foundation.connect_db
 
     def traced(*args, **kwargs):
         conn = connect(*args, **kwargs)
         conn.set_trace_callback(TRACE.append)
         return conn
 
-    paths.connect_db = traced
+    foundation.connect_db = traced
     atexit.register(lambda: (paths.STATE_DIR.parent / f"trace-{os.getpid()}.json").write_text(json.dumps(TRACE)))
 
 
@@ -80,7 +82,7 @@ def version():
 
 
 def probe(phase="expand", statement="ALTER TABLE feed ADD COLUMN probe TEXT;"):
-    folder = CHECKOUT / "arete/migrations"
+    folder = CHECKOUT / "arete/store/migrations"
     name = PROBE_NAME
     (folder / name).write_text(f"PHASE = {phase!r}\nSQL = {statement!r}\n")
     (folder / "latest.txt").write_text(name + "\n")
@@ -88,7 +90,7 @@ def probe(phase="expand", statement="ALTER TABLE feed ADD COLUMN probe TEXT;"):
 
 
 def init():
-    state.migrate()
+    foundation.migrate()
     assert version() == BASE
     assert dict(sql("SELECT key, value FROM schema_meta"))["schema_version"] == str(BASE)
     assert {r[1]: r[5] for r in sql("PRAGMA table_list")}["schema_migrations"] == 1
@@ -157,10 +159,10 @@ def meta_from_dashboard():
 
 def test_an_old_db_waits_for_serve():
     old_db()
-    process = child("state.ensure_schema(); print('OPENED')")
+    process = child("foundation.ensure_schema(); print('OPENED')")
     time.sleep(2)
     assert process.poll() is None
-    finished(child("state.migrate()"))
+    finished(child("foundation.migrate()"))
     output = finished(process)
     assert "OPENED" in output and output.count("waits for") == 1, output
     assert str(BASE) in output and str(PROBE) in output
@@ -172,9 +174,9 @@ def test_eight_openers_and_serve_migrate_once():
     old_db()
     gate = paths.STATE_DIR.parent / "go"
     wait = f"\nwhile not Path({str(gate)!r}).exists(): time.sleep(.01)\n"
-    writers = [child(wait + "state.ensure_schema()") for _ in range(8)]
+    writers = [child(wait + "foundation.ensure_schema()") for _ in range(8)]
     port = free_port()
-    daemon = child(wait + "held = serve.take_serve_lock(); state.migrate()\n"
+    daemon = child(wait + "held = serve.take_serve_lock(); foundation.migrate()\n"
                    + DASHBOARD.replace("PORT", str(port)))
     migrator = child(wait + "raise SystemExit(cli.main(['migrate']))")
     try:
@@ -202,9 +204,9 @@ def test_eight_openers_and_serve_migrate_once():
 
 def test_add_feed_issues_no_ddl():
     init()
-    state.ensure_schema()
+    foundation.ensure_schema()
     TRACE.clear()
-    state.add_feed("run", "out", "x")
+    run_store.add_feed("run", "out", "x")
     statements = []
     for statement in TRACE:
         statement = statement.strip().upper()
@@ -212,14 +214,14 @@ def test_add_feed_issues_no_ddl():
             statements.append(statement)
     assert len(statements) == 3, TRACE
     assert statements[0] == "BEGIN IMMEDIATE" and statements[1].startswith("INSERT INTO FEED") and statements[2] == "COMMIT", TRACE
-    assert state.feed("run")[-1]["text"] == "x"
+    assert run_store.feed("run")[-1]["text"] == "x"
 
 
 def test_no_serve_makes_no_file():
     process = child("""
 try:
-    state.ensure_schema()
-except state.NoDatabase as e:
+    foundation.ensure_schema()
+except foundation.NoDatabase as e:
     assert 'arete serve' in str(e) and 'arete migrate' in str(e), str(e)
 else:
     raise AssertionError('created a database')
@@ -230,10 +232,10 @@ assert not paths.DB_FILE.exists()
     old_db()
     started = time.monotonic()
     process = child("""
-state.MIGRATE_WAIT_SECONDS = 1
+foundation.MIGRATE_WAIT_SECONDS = 1
 try:
-    state.ensure_schema()
-except state.IncompatibleSchema as e:
+    foundation.ensure_schema()
+except foundation.IncompatibleSchema as e:
     assert all(s in str(e) for s in (str(BASE), str(PROBE), 'arete serve', 'arete migrate')), str(e)
 else:
     raise AssertionError('opened an old database')
@@ -241,16 +243,16 @@ else:
     finished(process)
     assert time.monotonic() - started < 3
     no_ddl(trace_of(process))
-    finished(child("state.migrate()"))
+    finished(child("foundation.migrate()"))
     sql("UPDATE schema_meta SET value = '99' WHERE key = 'oldest_writer'")
     finished(child("""
 try:
-    state.ensure_schema()
-except state.IncompatibleSchema as e:
-    assert '99' in str(e) and str(state.LATEST) in str(e), str(e)
+    foundation.ensure_schema()
+except foundation.IncompatibleSchema as e:
+    assert '99' in str(e) and str(foundation.LATEST) in str(e), str(e)
 else:
     raise AssertionError('allowed an old writer')
-with state.reader() as conn:
+with foundation.reader() as conn:
     assert conn.execute('PRAGMA user_version').fetchone()[0] == PROBE
 """))
 
@@ -290,7 +292,7 @@ def test_the_migration_snapshot_is_kept():
     start = util.now()
     count = iter(range(1000))
     with mock.patch.object(util, "now", side_effect=lambda: start + timedelta(minutes=next(count))):
-        state.migrate()
+        foundation.migrate()
         pinned = sql("SELECT backup FROM schema_migrations ORDER BY n DESC LIMIT 1")[0][0]
         assert pinned
         for _ in range(30):
@@ -350,6 +352,7 @@ def test_a_second_serve_waits_its_turn():
     program.write_text(f"""
 import sys, time
 sys.path.insert(0, {str(CHECKOUT)!r})
+from arete.store import runs as run_store
 from arete import serve
 held = serve.take_serve_lock()
 from pathlib import Path
@@ -358,7 +361,7 @@ time.sleep(60)
 """)
     first = child(f"""
 held = serve.take_serve_lock()
-state.migrate()
+foundation.migrate()
 server = serve.Server()
 server.lock = held
 Path({str(ready)!r}).touch()
@@ -397,8 +400,8 @@ try:
             "VALUES ('older', 'loop', 'running', ?, ?, ?)", (util.iso(), older_run.pid, stamp))
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            assert state.migrate()
-            state.ensure_schema()
+            assert foundation.migrate()
+            foundation.ensure_schema()
         assert "older" in output.getvalue() and "waits for" in output.getvalue(), output.getvalue()
         assert version() == BASE
     sql("UPDATE runs SET schema_version=?", (PROBE,))
@@ -410,17 +413,17 @@ try:
             util.write_json(control.BEAT_FILE, beat)
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
-                assert state.migrate()
+                assert foundation.migrate()
             assert f"serve {older_serve.pid}" in output.getvalue(), output.getvalue()
             assert version() == BASE
-    assert state.migrate(contracts=False)
+    assert foundation.migrate(contracts=False)
     assert version() == BASE
     server = serve.Server()
-    server.contracts_waiting = state.migrate()
-    with mock.patch.object(server, "load", return_value=False), mock.patch.object(state, "migrate", wraps=state.migrate) as migrate:
+    server.contracts_waiting = foundation.migrate()
+    with mock.patch.object(server, "load", return_value=False), mock.patch.object(foundation, "migrate", wraps=foundation.migrate) as migrate:
         server.run_pass()
         assert server.contracts_waiting and version() == BASE
-        assert util.read_json(control.BEAT_FILE, {})["schema"] == state.LATEST
+        assert util.read_json(control.BEAT_FILE, {})["schema"] == foundation.LATEST
         sql("UPDATE runs SET schema_version=?", (BASE,))
         sql("INSERT INTO runs (id, kind, status, started, pid, schema_version) "
             "VALUES ('unstamped', 'loop', 'running', ?, ?, NULL)", (util.iso(), older_run.pid))
@@ -453,36 +456,36 @@ finally:
 
 def test_runs_name_their_schema():
     init()
-    with mock.patch.object(state, "LATEST", BASE):
+    with mock.patch.object(foundation, "LATEST", BASE):
         rid = record.start("loop", pid=None, loop="fixture")
     run = SimpleNamespace(events_file=paths.STATE_DIR / "missing.json")
-    with mock.patch.object(state, "LATEST", PROBE), mock.patch.object(loop_run, "LoopRun", return_value=run), \
+    with mock.patch.object(foundation, "LATEST", PROBE), mock.patch.object(loop_run, "LoopRun", return_value=run), \
             mock.patch.object(loop_run.loops, "find"), mock.patch.object(loop_run, "carry", return_value="done"):
         loop_run.carry_opened(rid)
-    row = state.run_get(rid)
+    row = run_store.run_get(rid)
     assert row["schema_version"] == PROBE and row["engine_sha"] == loop_run.codebase.STAMP, row
     record.move(rid, "done", ("running",), finished=util.iso())
     (paths.STATE_DIR.parent / "authority-parent").mkdir()
     from tests import offline_workflow
     offline_workflow.main(paths.STATE_DIR.parent, "pass")
     rows = sql("SELECT schema_version FROM runs WHERE kind = 'pipeline'")
-    assert rows and all(row[0] == state.LATEST for row in rows), rows
+    assert rows and all(row[0] == foundation.LATEST for row in rows), rows
 
 
 def test_the_instance_keeps_its_name():
     legacy_db()
-    state.migrate()
+    foundation.migrate()
     identity = dict(sql("SELECT key, value FROM schema_meta WHERE key LIKE 'instance_%'"))
     assert re.fullmatch("[0-9a-f]{32}", identity["instance_id"])
     assert identity["instance_tag"] == identity["instance_id"][:8]
     assert identity["instance_name"]
     assert sql("SELECT ? GLOB ?", (identity["instance_created"], state.TIME_GLOB)) == [(1,)]
-    finished(child("state.migrate()"))
+    finished(child("foundation.migrate()"))
     assert identity == dict(sql("SELECT key, value FROM schema_meta WHERE key LIKE 'instance_%'"))
     snapshot = next(p for p in backup.snapshots() if p.name.endswith("-m1.db"))
     with mock.patch.object(control, "serve_beat", return_value={"alive": False}):
         assert cli.main(["backup", "--restore", str(snapshot)]) == 0
-    state.migrate()
+    foundation.migrate()
     assert identity == dict(sql("SELECT key, value FROM schema_meta WHERE key LIKE 'instance_%'"))
     meta = meta_from_dashboard()
     assert meta["instance"] == {k.removeprefix("instance_"): v for k, v in identity.items()}, meta
@@ -512,7 +515,7 @@ def test_the_chain_equals_a_fresh_db():
             if end == "legacy":
                 legacy_db()
             elif end:
-                conn = paths.connect_db(paths.DB_FILE, create=True)
+                conn = foundation.connect_db(paths.DB_FILE, create=True)
                 conn.execute("BEGIN EXCLUSIVE")
                 for migration in migrations.load()[:end]:
                     historical = CHECKOUT / "migration-history" / migration.name
@@ -526,7 +529,7 @@ def test_the_chain_equals_a_fresh_db():
                     conn.execute(f"PRAGMA user_version = {migration.n}")
                 conn.commit()
                 conn.close()
-            state.migrate()
+            foundation.migrate()
             assert shape() == expected, end
     finally:
         paths.DB_FILE = original
@@ -534,13 +537,13 @@ def test_the_chain_equals_a_fresh_db():
 
 def test_bad_folders_are_refused():
     init()
-    folder = CHECKOUT / "arete/migrations"
+    folder = CHECKOUT / "arete/store/migrations"
     latest = (folder / "latest.txt").read_bytes()
     m1 = folder / "m0001_foundation_ledger.py"
     original = m1.read_bytes()
     cases = [
-        (f"m{BASE:04d}_work_duplicate.py", "PHASE='expand'\nSQL='SELECT 1;'\n",
-         [f"m{BASE:04d}_work_duplicate.py", migrations.load()[-1].name]),
+        (f"m{BASE:04d}_loops_duplicate.py", "PHASE='expand'\nSQL='SELECT 1;'\n",
+         [f"m{BASE:04d}_loops_duplicate.py", migrations.load()[-1].name]),
         (f"m{PROBE + 1:04d}_foundation_gap.py", "PHASE='expand'\nSQL='SELECT 1;'\n", [f"m{PROBE + 1:04d}_foundation_gap.py"]),
         (f"m{PROBE:04d}_unknown_area.py", "PHASE='expand'\nSQL='SELECT 1;'\n", [f"m{PROBE:04d}_unknown_area.py"]),
         ("latest.txt", "m0001_foundation_ledger.py\n", ["latest.txt", migrations.load()[-1].name]),
@@ -551,7 +554,7 @@ def test_bad_folders_are_refused():
         target = folder / filename
         target.write_text(content)
         try:
-            output = finished(child("state.migrate()"), 1)
+            output = finished(child("foundation.migrate()"), 1)
             assert all(name in output for name in names), output
             assert paths.DB_FILE.read_bytes() == before
         finally:
@@ -566,7 +569,7 @@ def test_bad_folders_are_refused():
 def test_parallel_migrations_conflict():
     repo = paths.STATE_DIR.parent / "git"
     repo.mkdir()
-    shutil.copytree(CHECKOUT / "arete/migrations", repo / "migrations")
+    shutil.copytree(CHECKOUT / "arete/store/migrations", repo / "migrations")
     env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
            "GIT_AUTHOR_NAME": "Fixture", "GIT_AUTHOR_EMAIL": "fixture@example.com",
            "GIT_COMMITTER_NAME": "Fixture", "GIT_COMMITTER_EMAIL": "fixture@example.com"}
@@ -594,7 +597,7 @@ def test_times_have_one_shape():
     legacy_db()
     for value in ("2026-11-08T10:04:51-05:00", "", None):
         sql("INSERT INTO verdicts (at, outcome_at) VALUES (?, ?)", (value, value))
-    state.migrate()
+    foundation.migrate()
     assert sql("SELECT at, outcome_at FROM verdicts") == [
         ("2026-11-08T15:04:51Z", "2026-11-08T15:04:51Z"), ("", ""), (None, None)]
     assert len(state.verdicts_since("2026-11-08T15:00:00Z")) == 1
@@ -627,7 +630,7 @@ def test_times_have_one_shape():
     sql("UPDATE runs SET landed = 'main', moved = 'done', label_pending = 'triage', wait_minutes = '{}', ab_held = '{}'")
     probe(statement="ALTER TABLE feed ADD COLUMN rollback_probe TEXT; "
                     "INSERT INTO verdicts(at) VALUES ('2026-11-08T10:04:51-05:00');")
-    output = finished(child("state.migrate()"), 1)
+    output = finished(child("foundation.migrate()"), 1)
     assert "timestamp" in output and version() == BASE, output
     assert sql("SELECT count(*) FROM schema_migrations WHERE n=?", (PROBE,)) == [(0,)]
     assert "rollback_probe" not in {r[1] for r in sql("PRAGMA table_info(feed)")}
@@ -637,7 +640,7 @@ def test_times_have_one_shape():
         legacy_db()
         sql("INSERT INTO verdicts(at) VALUES ('yesterday')")
         try:
-            state.migrate()
+            foundation.migrate()
         except migrations.Refused as e:
             assert "verdicts.at" in str(e), str(e)
         else:

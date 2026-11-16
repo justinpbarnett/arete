@@ -10,6 +10,8 @@ from . import config, state, util
 from .emits import Emit, PullRequest, Ticket, ToLoop
 from .loops import Loop
 from .push import Push
+from .store import db as foundation
+from .store import runs as run_store
 
 CLAIM_SECONDS = 120
 RETRIED = ("screen", "proof")
@@ -112,7 +114,7 @@ def why_failed(kind: str, e: Exception) -> str:
     return f"{kind} failed: {named}: {said}" if said else f"{kind} failed: {named}"
 
 
-def waiting(connect=state.db) -> list[dict]:
+def waiting(connect=foundation.db) -> list[dict]:
     return [{"id": a["id"], "loop": a["loop"], "run_id": a["run_id"], "created": a["created"], "repo": repo_of(a),
              "what": a["summary"], "plain_summary": a["plain_summary"],
              "failed": a["result"] if a["status"] == "failed" else "", "held": a["emit"].get("held", ""),
@@ -208,7 +210,7 @@ def decide(approval_id: int, yes: bool, by: str = "", came_from: tuple[str, ...]
 
     def log(kind: str, text: str) -> None:
         if row["run_id"]:
-            state.add_feed(row["run_id"], kind, f"{verb} #{approval_id}{by and f' by {by}'}, {text}")
+            run_store.add_feed(row["run_id"], kind, f"{verb} #{approval_id}{by and f' by {by}'}, {text}")
 
     if not yes:
         if not state.settle_approval(approval_id, "rejected", "rejected", judged=emit.judged, came_from=came_from):

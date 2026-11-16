@@ -2,6 +2,7 @@
 import json, os, sys, threading, time, urllib.request
 from pathlib import Path
 from unittest import mock
+from arete.store import runs as run_store
 from arete import accounts, config, control, gh, paths, replay, serve, settings, state, util
 state.migrate()
 root = Path(sys.argv[1])

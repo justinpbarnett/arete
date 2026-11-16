@@ -47,6 +47,8 @@ from . import (
     webpush,
 )
 from .refusals import Stated as Refusal
+from .store import db as foundation
+from .store import runs as run_store
 
 WEB_DIR = paths.PACKAGE_DIR / "web"
 WEB_TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8",
@@ -275,7 +277,7 @@ class Handler(BaseHTTPRequestHandler):
             if rest is not None:
                 try:
                     if method == "GET":
-                        with state.one_read():
+                        with foundation.one_read():
                             return route(self, rest, query)
                     return route(self, rest, query)
                 except NoRoute:
@@ -423,7 +425,7 @@ class Handler(BaseHTTPRequestHandler):
     def send_events(self, run_id: str, query: dict) -> None:
         if not RUN_ID.fullmatch(run_id):
             raise board.NotARunId(f"'{run_id}' is not a run id.")
-        if not run_lines.path(run_id).exists() and not state.run_get(run_id, connect=state.reader):
+        if not run_lines.path(run_id).exists() and not run_store.run_get(run_id, connect=foundation.reader):
             raise control.NotFound(f"nothing has the id {run_id}")
         start = whole_number(query.get("from", "0"))
         if query.get("follow") != "1":
@@ -496,7 +498,7 @@ def run_ended(run_id: str) -> Callable[[], bool]:
 
     def ended() -> bool:
         nonlocal quiet_since
-        row = state.run_get(run_id, connect=state.reader) or {}
+        row = run_store.run_get(run_id, connect=foundation.reader) or {}
         if row.get("status") == "running":
             with record.dead(row) as run_is_dead:
                 if not run_is_dead:
@@ -528,7 +530,7 @@ def forget_proposal(proposal_id: int) -> dict:
 
 
 def approve_rule(proposal_id: int) -> dict:
-    if (state.proposal(proposal_id, connect=state.reader) or {}).get("status") not in ("approve", "filing"):
+    if (state.proposal(proposal_id, connect=foundation.reader) or {}).get("status") not in ("approve", "filing"):
         raise control.NotFound(f"#{proposal_id} is not a rule waiting for approval")
     control.detach(["file-rule", str(proposal_id)])
     return {"id": proposal_id}
@@ -632,7 +634,7 @@ def get_settings(handler, rest, query):
 
 
 def get_capture(handler, rest, query):
-    return capture.view(connect=state.reader)
+    return capture.view(connect=foundation.reader)
 
 
 def get_chats(handler, rest, query):
@@ -654,12 +656,12 @@ def get_log(handler, rest, query):
 
 
 def get_loops(handler, rest, query):
-    return {"loops": control.loop_views(connect=state.reader), "serve": control.serve_beat(),
+    return {"loops": control.loop_views(connect=foundation.reader), "serve": control.serve_beat(),
             "draft": draft_choices()}
 
 
 def get_loop(handler, rest, query):
-    return control.loop_detail(unquote(rest), connect=state.reader)
+    return control.loop_detail(unquote(rest), connect=foundation.reader)
 
 
 def get_incidents(handler, rest, query):
@@ -675,7 +677,7 @@ def get_feed(handler, rest, query):
 
 
 def get_sessions(handler, rest, query):
-    return {"sessions": sessions.views(connect=state.reader), "choices": sessions.choices()}
+    return {"sessions": sessions.views(connect=foundation.reader), "choices": sessions.choices()}
 
 
 def post_usage(handler, rest, query):
@@ -920,7 +922,7 @@ ROUTES = (
 def serve(port: int | None = None, inside_serve: bool = False, host: tailnet.Tailscale | None = None) -> NoReturn:
     cfg = config.load_or_problem()[0]
     port = port or cfg.dashboard_port
-    state.ensure_schema()
+    foundation.ensure_schema()
     chat.recover()
     if inside_serve:
         capture.recover()

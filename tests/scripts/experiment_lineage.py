@@ -2,6 +2,7 @@
 import contextlib, importlib.util, io, json, shutil, sys
 from pathlib import Path
 from unittest import mock
+from arete.store import runs as run_store
 from arete import cli, evals, paths, record, state, util
 from arete.lab import experiment, optimize
 root, mode = Path(sys.argv[1]), sys.argv[2]
@@ -90,7 +91,7 @@ elif mode == "during":
     trial = next(t for t in rows("trial") if t["arm"] == "stronger")
     assert trial["status"] == "drifted" and not trial["accepted"], trial
     assert "prompt" in trial["drift"], trial
-    assert state.run_get(trial["run"])["status"] == "stopped"
+    assert run_store.run_get(trial["run"])["status"] == "stopped"
     assert trial["fingerprints"]["prompt"] != rows("manifest")[0]["design"]["arms"]["stronger"]["fingerprints"]["prompt"]
     headers = [experiment.framed(f)[0] for f in record.record_files(trial["run"])]
     assert any(marker.decode().strip() in h.get("prompt", "") for h in headers if h.get("atom") == "build"), headers

@@ -55,6 +55,8 @@ from . import (
 )
 from .agent import NO_SESSION, Result, Session
 from .review import REVIEW_SCHEMA, Review, numbered
+from .store import runs as run_store
+from .store import sources as source_store
 from .util import git
 
 ADW = "adw"
@@ -326,7 +328,7 @@ class AgentRun:
             kw["on_launch"] = announce
         if s and s.ab_name:
             record.hold_ab(self.id, s.step, s.ab_name, s.ab_side, json.loads(s.ab_arm or "{}"))
-        attempt_no = self.step_calls[step] = max(state.step_tries(self.id, step), self.step_calls.get(step, 0)) + 1
+        attempt_no = self.step_calls[step] = max(run_store.step_tries(self.id, step), self.step_calls.get(step, 0)) + 1
         kw["try_no"] = attempt_no
         self.log(f"{step}: starting")
         kw.setdefault("say", lambda note: self.log(f"{step}: {note}"))
@@ -1017,7 +1019,7 @@ def run_command(repo_name: str, tid: str | int, force: bool = False, dry_run: bo
         adw = False
     if not adw:
         return control.command(["run", repo_name, str(tid), "--local", *flags])
-    newest = state.newest_whole_run(repo_name, str(tid))
+    newest = run_store.newest_whole_run(repo_name, str(tid))
     if newest and newest["status"] == "interrupted" and repaired_by(newest["id"]):
         return script_command(cfg, "repair", repo_name, str(tid), *flags)
     name = "revise" if pending_feedback(repo_name, str(tid)) else "feature"
@@ -1041,7 +1043,7 @@ def script_refusal(cfg: config.Config, repo: config.Repo, tid: str, script: Scri
     if script.repairs:
         if script.continues or script.only or script.again or dry_run:
             return "--repair does not go with --continue, --only, --from or --dry-run"
-        row = state.run_get(script.repairs) or {}
+        row = run_store.run_get(script.repairs) or {}
         if (row.get("repo"), str(row.get("issue"))) != (repo.name, str(tid)):
             return f"--repair {script.repairs}: no run of {repo.name} {tid} has that id"
     if script.again and not script.continues:
@@ -1049,7 +1051,7 @@ def script_refusal(cfg: config.Config, repo: config.Repo, tid: str, script: Scri
     if script.again and script.only:
         return "--from and --only do not go together"
     if script.continues:
-        row = state.run_get(script.continues) or {}
+        row = run_store.run_get(script.continues) or {}
         if (row.get("repo"), str(row.get("issue"))) != (repo.name, str(tid)):
             return f"--continue {script.continues}: no run of {repo.name} {tid} has that id"
     try:
@@ -1116,10 +1118,11 @@ def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: boo
             flow.route()
         if not run_lines.ended_in_error(run.id, reply="respond" if flow else ""):
             run_lines.write(run.id, "error", step=run_lines.last_step(run.id), message=summary)
-    pr_url = pr_url or str((state.run_get(run.id) or {}).get("pr_url") or "")
-    run.log(f"done: {status} {pr_url or summary}")
-    record.settle(run.id, status, summary=summary, pr_url=pr_url)
-    write_report(state.run_get(run.id) or {"id": run.id, "status": status, "pr_url": pr_url}, flow, run)
+    pr_url = pr_url or str((run_store.run_get(run.id) or {}).get("pr_url") or "")
+    end_line = f"done: {status} {pr_url or summary}"
+    run.log(end_line)
+    record.settle(run.id, status, end_line=end_line, summary=summary, pr_url=pr_url)
+    write_report(run_store.run_get(run.id) or {"id": run.id, "status": status, "pr_url": pr_url}, flow, run)
 
 
 def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool = False,
@@ -1149,14 +1152,14 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         print(refusal)
         return 2
     name = tracker.ticket_name(repo.name, tk.ref(tid))
-    lock = state.run_lock("pipeline", repo.name, tid)
+    lock = run_store.run_lock("pipeline", repo.name, tid)
     with util.lock(lock) as got:
         if not got:
             print(f"{name} is already running")
             return 0
         try:
             layer = config.load_layer(repo.layer_dir)
-            budget_history = state.ticket_runs(repo.name, tid, limit=1)
+            budget_history = run_store.ticket_runs(repo.name, tid, limit=1)
             blocked, reset_budget = runlimits.admission(repo, str(tid), tk, runlimits.Policy.of(layer), force)
         except (ValueError, OSError) as e:
             print(f"could not validate the process budget: {e}")
@@ -1164,7 +1167,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         if blocked and not dry_run:
             print(blocked)
             return 2
-        if script and script.repairs and (later := state.later_run(repo.name, tid, script.repairs)):
+        if script and script.repairs and (later := run_store.later_run(repo.name, tid, script.repairs)):
             print(f"run {later['id']} of {name} came after run {script.repairs}, so it is not repaired twice")
             return 1
         with slots.admitting():
@@ -1178,9 +1181,9 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     print(f"{name} was not started: {slots.no_free_slot(cfg.max_parallel)}. Wait for a run to "
                           f"finish or raise max_parallel in {paths.short_path(paths.CONFIG_FILE)}.")
                     return 1
-            settled = [done for dead_row in state.ticket_runs_marked_running(repo.name, tid)
+            settled = [done for dead_row in run_store.ticket_runs_marked_running(repo.name, tid)
                        if (done := record.interrupt(dead_row))]
-            earlier = None if only else state.newest_whole_run(repo.name, tid)
+            earlier = None if only else run_store.newest_whole_run(repo.name, tid)
             restarting = bool(earlier) and earlier["status"] == "interrupted"
             mending = (script.repairs or repaired_by(script.continues or (earlier["id"] if restarting else ""))
                        ) if script else ""
@@ -1195,7 +1198,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             run.dir.mkdir(parents=True, exist_ok=True)
             if held_from := earlier["id"] if restarting or run.answering else (
                     script.continues or script.repairs if script else ""):
-                run.ab_held = state.ab_held(held_from)
+                run.ab_held = run_store.ab_held(held_from)
                 for role, (ab, side, arm) in run.ab_held.items():
                     record.hold_ab(run_id, role, ab, side, arm)
             if mending:
@@ -1209,7 +1212,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 run_lines.write(done["id"], "error", step=run_lines.last_step(done["id"]), message=done.get("summary") or "")
             write_report(done)
         opening_waits(run_id, run.answering,
-                      "" if dry_run or run.alone else state.take_passed_over(repo.name, str(tid)))
+                      "" if dry_run or run.alone else source_store.take_passed_over(repo.name, str(tid)))
         if restarting:
             run.log(f"restarting after run {earlier['id']} was interrupted")
         flow = (flows.start(cfg, run, earlier if restarting else {}, slot, script.continues, script.only,
@@ -2377,7 +2380,7 @@ def images_note(images: tracker.SavedImages) -> str:
 
 
 def open_branch(run: Run) -> str:
-    return next((r["branch"] for r in state.open_runs(run.repo.name, run.tid) if r.get("branch")), "")
+    return next((r["branch"] for r in run_store.open_runs(run.repo.name, run.tid) if r.get("branch")), "")
 
 
 def with_siblings(body: str, section: str) -> str:
@@ -2392,14 +2395,14 @@ def sibling_section(ref: str, c: workspace.Checkout, with_prs: list[workspace.Ch
 
 
 def supersede_older_runs(run: Run, urls: list[str]) -> None:
-    for r in state.open_runs(run.repo.name, run.tid):
+    for r in run_store.open_runs(run.repo.name, run.tid):
         older = (r.get("pr_url") or "").split()
         if older and set(older) <= set(urls) and record.move(r["id"], "superseded", expect=(r["status"],)):
             run.log(f"run {r['id']} superseded: its PRs carry on in this run")
 
 
 def pending_feedback(repo_name: str, tid: str) -> list[dict]:
-    return state.open_feedback([url for r in state.open_runs(repo_name, tid) for url in (r.get("pr_url") or "").split()])
+    return state.open_feedback([url for r in run_store.open_runs(repo_name, tid) for url in (r.get("pr_url") or "").split()])
 
 
 def feedback_markdown(rows: list[dict]) -> str:
@@ -2836,7 +2839,7 @@ def commit_layer(layer_dir: Path, message: str, written: list[Path]) -> str:
 
 def sync_labels(cfg: config.Config) -> None:
     seen: set[tuple[str, str]] = set()
-    for r in state.runs(kind="pipeline", limit=200):
+    for r in run_store.runs(kind="pipeline", limit=200):
         if r.get("label_pending") is None:
             continue
         key = (r["repo"] or "", str(r["issue"]))
@@ -2844,7 +2847,7 @@ def sync_labels(cfg: config.Config) -> None:
             continue
         seen.add(key)
         want = r["label_pending"]
-        if not want or r["status"] == "running" or util.lock_is_held(state.run_lock("pipeline", *key)):
+        if not want or r["status"] == "running" or util.lock_is_held(run_store.run_lock("pipeline", *key)):
             continue
         if r["status"] == "interrupted":
             record.note(r["id"], label_pending="")
@@ -2944,7 +2947,7 @@ def tell_ticket_run_died(cfg: config.Config, row: dict) -> None:
 
 
 def live_pipeline_runs() -> list[dict]:
-    return slots.holding(state.runs_marked_running(), "pipeline")
+    return slots.holding(run_store.runs_marked_running(), "pipeline")
 
 
 def held_back(cfg: config.Config, repo_name: str, going: Counter, free_slots: int) -> str:
@@ -2966,14 +2969,14 @@ def run_skipped(name: str) -> dict:
         raise control.Refused(f"{name} names no repo to run in; a ticket the pipeline routes to a repo gets one at "
                               "the next poll")
     cfg = config.load()
-    if state.issue_running(entry["repo"], entry["id"]):
+    if run_store.issue_running(entry["repo"], entry["id"]):
         raise control.Busy(name)
     if slots.slots_free_to_start(cfg.max_parallel) <= 0:
         raise slots.NoFreeSlot(f"{name} was not started: {slots.no_free_slot(cfg.max_parallel)}; wait for a run to finish or "
                          "raise max_parallel in Settings")
     run = spawn_run(entry["repo"], entry["id"], force=True)
     give_up = time.monotonic() + RUN_START_SECONDS
-    while not state.issue_running(entry["repo"], entry["id"]) and time.monotonic() < give_up:
+    while not run_store.issue_running(entry["repo"], entry["id"]) and time.monotonic() < give_up:
         if run.poll() is not None:
             raise control.Refused(f"{name} ended before it showed as running; the end of "
                                   f"{paths.short_path(paths.LOG_DIR / RUNS_LOG)} says why")
@@ -2982,7 +2985,7 @@ def run_skipped(name: str) -> dict:
 
 
 def answered_run(repo_name: str, tid: str) -> dict | None:
-    newest = state.newest_whole_run(repo_name, tid)
+    newest = run_store.newest_whole_run(repo_name, tid)
     if (newest and newest["status"] == "needs-info" and state.asks_due([newest["id"]])
             and not state.asks_of(newest["id"], "open")):
         return newest

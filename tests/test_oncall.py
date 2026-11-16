@@ -544,7 +544,7 @@ class Backlogs(Scratch):
         self.append(self.error(1))
         code = ("from arete import config, oncall, state\n"
                 "def broken(*a): raise RuntimeError('storage failed')\n"
-                "state.commit_scan = broken\n"
+                "oncall.commit_scan = broken\n"
                 "oncall.scan(config.load())")
         self.assertNotEqual(self.py(code).returncode, 0)
         self.assertEqual(self.incidents(), [])
@@ -643,7 +643,7 @@ class Others(Scratch):
         self.append(self.error(1))
         self.scan()
         self.age_incidents()
-        self.assertEqual(self.py("from arete import state; state.prune()").returncode, 0)
+        self.assertEqual(self.py("from arete import state, store; store.prune()").returncode, 0)
         self.assertEqual(self.sql("SELECT (SELECT count(*) FROM incidents), (SELECT count(*) FROM incident_notes)"),
                          [(0, 0)])
 
@@ -2314,9 +2314,9 @@ class Dashboard(Scratch):
                 "    c = state.incident(closed)\n"
                 "    return [len(c['notes']), c['evidence'], state.incident(closed) is not None,\n"
                 "            [n['note'][:7] for n in state.incident(open_one)['notes']]]\n"
-                "state.prune(keep_days=30)\n"
+                "from arete import store\nstore.prune(keep_days=30)\n"
                 "kept = held()\n"
-                "state.prune(keep_days=5)\n"
+                "store.prune(keep_days=5)\n"
                 "show([stamped, kept, held(), state.incident(open_one)['evidence']])\n")
         stamped, kept, dropped, open_evidence = self.serve(body)
         self.assertTrue(stamped)

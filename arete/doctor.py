@@ -8,7 +8,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from fnmatch import fnmatchcase
 
-from . import backup, install, paths, state, util
+from . import backup, install, paths, util
+from .store import db as foundation
+from .store import runs as run_store
 
 SAMPLE_LIMIT = 5
 YOUNG_MINUTES = 10
@@ -80,7 +82,7 @@ def list_folders() -> Listing:
 
 
 def check_cost(conn: sqlite3.Connection) -> Result:
-    drift = state.cost_drift(connect=lambda: nullcontext(conn))
+    drift = run_store.cost_drift(connect=lambda: nullcontext(conn))
     first = drift[0] if drift else None
     detail = (f"{first['id']} records ${first['run_usd']:.2f} but its steps sum to ${first['steps_usd']:.2f}"
               if first else "run costs match their steps")
@@ -198,7 +200,7 @@ def run() -> list[Result]:
     with ExitStack() as stack:
         conn, opened = None, None
         try:
-            conn = stack.enter_context(state.reader())
+            conn = stack.enter_context(foundation.reader())
         except Exception as e:
             conn, opened = None, e
 

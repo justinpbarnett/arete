@@ -32,6 +32,9 @@ from . import (
     workspace,
 )
 from .refusals import TrackerFailed
+from .store import db as foundation
+from .store import runs as run_store
+from .store import sources as source_store
 
 TITLE_CHARS = 80
 START_LOCK = "task-start"
@@ -99,12 +102,12 @@ def start_ticket(cfg: config.Config, repo: config.Repo, ticket: str, force: bool
 
 
 def live_run(repo: str, tid: str) -> dict | None:
-    row = state.running_run(repo, tid)
+    row = run_store.running_run(repo, tid)
     return row if row and slots.holding([row], "pipeline") else None
 
 
 def run_ids(repo: str, tid: str) -> list[str]:
-    return [r["id"] for r in state.ticket_runs(repo, tid)]
+    return [r["id"] for r in run_store.ticket_runs(repo, tid)]
 
 
 def held(cfg: config.Config, repo: config.Repo) -> str:
@@ -113,7 +116,7 @@ def held(cfg: config.Config, repo: config.Repo) -> str:
 
 
 def queued(repo: config.Repo, tid: str, why: str, poller_picks: bool) -> dict:
-    state.pass_over(repo.name, tid)
+    source_store.pass_over(repo.name, tid)
     later = POLLER_LATER if poller_picks else (
         f'start task {tid} with {{"repo": "{repo.name}", "ticket": "{tid}"}} when a slot frees')
     return answer(tid, repo.name, "", "queued", f"{why}; {later}")
@@ -175,7 +178,7 @@ def launch(cfg: config.Config, repo: config.Repo, tid: str, command: list[str], 
 
 
 def run_of(run_id: str) -> tuple[config.Config, config.Repo, dict]:
-    if not (row := state.run_get(run_id)):
+    if not (row := run_store.run_get(run_id)):
         raise control.NotFound(f"no run {run_id}")
     if row["kind"] != "pipeline":
         raise control.Refused(f"run {run_id} is a {row['kind']} run, not the run of a ticket")
@@ -188,7 +191,7 @@ def run_of(run_id: str) -> tuple[config.Config, config.Repo, dict]:
 
 
 def no_later_run(row: dict) -> None:
-    if later := state.later_run(row["repo"], row["issue"], row["id"]):
+    if later := run_store.later_run(row["repo"], row["issue"], row["id"]):
         raise control.Refused(f"run {row['id']} is not the ticket's latest run: run {later['id']} "
                               f"({later['status']}) came after it")
 
@@ -261,7 +264,7 @@ def reply_to_asks(cfg: config.Config, repo: config.Repo, row: dict, waiting: lis
 
 def asks_view() -> dict:
     keys = ("id", "repo", "ticket", "run", "step", "asked", "why", "tried", "questions", "reminded")
-    return {"asks": [{k: a[k] for k in keys} for a in state.open_asks(connect=state.reader)]}
+    return {"asks": [{k: a[k] for k in keys} for a in state.open_asks(connect=foundation.reader)]}
 
 
 def answer_ask(ask_id: str, body) -> dict:
@@ -305,7 +308,7 @@ def answer_ask(ask_id: str, body) -> dict:
 
 
 def answers_holder(ask: dict) -> dict | None:
-    newest = state.newest_whole_run(ask["repo"], ask["ticket"])
+    newest = run_store.newest_whole_run(ask["repo"], ask["ticket"])
     if newest and ask["run"] in {newest["id"], *factory.chain_runs(newest["id"])}:
         return newest
     return None
@@ -360,7 +363,7 @@ def kept_folder_removed(repo: config.Repo, tid: str, run_id: str) -> bool:
 def let_go(cfg: config.Config, repo: config.Repo, row: dict, status: str) -> dict:
     tid, run_id = str(row["issue"]), row["id"]
     name = tracker.issue_name(repo.name, tid)
-    with util.lock(state.run_lock("pipeline", repo.name, tid)) as got:
+    with util.lock(run_store.run_lock("pipeline", repo.name, tid)) as got:
         if not got:
             raise control.Busy(f"a run of {name}")
         if status == "stopped" and not record.move(run_id, "stopped", expect=("needs-info",), summary=record.STOPPED):
@@ -368,17 +371,17 @@ def let_go(cfg: config.Config, repo: config.Repo, row: dict, status: str) -> dic
         if status == "closed" and not record.move(run_id, "stopped", expect=("needs-info",), summary=TICKET_CLOSED):
             raise control.Refused(f"run {run_id} is no longer waiting for an answer, so it was not stopped")
         state.asks_retire(run_id, "stopped" if status == "closed" else status)
-        latest = not state.later_run(repo.name, tid, run_id)
+        latest = not run_store.later_run(repo.name, tid, run_id)
         removed = latest and kept_folder_removed(repo, tid, run_id)
         folder = "its work folder is removed" if removed else "its work folder was left in place"
         if status == "closed":
-            pipeline.write_report(state.run_get(run_id) or row)
+            pipeline.write_report(run_store.run_get(run_id) or row)
             return answer(tid, repo.name, run_id, "stopped", f"run {run_id} stopped because {name} closed; {folder}")
         run = pipeline.Run(run_id, repo, paths.RUNS_DIR / run_id, tracker=tracker.for_ticket(cfg, repo, tid), tid=tid)
         run.dir.mkdir(parents=True, exist_ok=True)
         if status == "stopped":
             run.give_up("was stopped by its owner instead of an answer")
-            pipeline.write_report(state.run_get(run_id) or row)
+            pipeline.write_report(run_store.run_get(run_id) or row)
             return answer(tid, repo.name, run_id, "stopped", f"run {run_id} stopped; {folder}")
         if latest:
             run.say(f"No answer came in {cfg.ask.expire_days:g} days, so I let go of the kept work{'' if removed else ' as far as I could'}. "
@@ -397,7 +400,7 @@ def expire_asks(cfg: config.Config) -> list[str]:
                 _, repo, row = run_of(run_id)
             except (control.NotFound, control.Refused):
                 row = None
-            if row is None or row["status"] != "needs-info" or state.later_run(row["repo"], row["issue"], run_id):
+            if row is None or row["status"] != "needs-info" or run_store.later_run(row["repo"], row["issue"], run_id):
                 state.asks_retire(run_id, "expired")
                 notes.append(f"asks of run {run_id} expired; the run is not the ticket's latest")
                 continue
@@ -418,14 +421,14 @@ def release_closed(cfg: config.Config) -> list[str]:
         except (control.NotFound, control.Refused):
             continue
         tid = str(row["issue"])
-        if row["status"] != "needs-info" or state.later_run(repo.name, row["issue"], run_id) or live_run(repo.name, tid):
+        if row["status"] != "needs-info" or run_store.later_run(repo.name, row["issue"], run_id) or live_run(repo.name, tid):
             continue
         if not workspace.ticket_closed(cfg, repo.name, tid, row["status"]):
             continue
         with util.lock(STEER_LOCK, wait=True):
-            row = state.run_get(run_id) or row
+            row = run_store.run_get(run_id) or row
             if (not state.asks_of(run_id, "open") or row["status"] != "needs-info"
-                    or state.later_run(repo.name, row["issue"], run_id) or live_run(repo.name, tid)):
+                    or run_store.later_run(repo.name, row["issue"], run_id) or live_run(repo.name, tid)):
                 continue
             try:
                 notes.append(let_go(cfg, repo, row, "closed")["why"])
@@ -444,7 +447,7 @@ def resume(run_id: str, step: str = "") -> dict:
             with record.dead(row) as gone:
                 if gone and (settled := record.interrupt(row)):
                     pipeline.tell_ticket_run_died(cfg, settled)
-            row = state.run_get(run_id) or row
+            row = run_store.run_get(run_id) or row
         if row["status"] == "running":
             raise control.Refused(f"run {run_id} is running; stop it first")
         if parked_with_answers(row):
@@ -474,7 +477,7 @@ def repair(run_id: str) -> dict:
     with util.lock(STEER_LOCK, wait=True):
         cfg, repo, row = run_of(run_id)
         tid = str(row["issue"])
-        if (later := state.later_run(row["repo"], row["issue"], run_id)) and pipeline.repaired_by(later["id"]) == run_id:
+        if (later := run_store.later_run(row["repo"], row["issue"], run_id)) and pipeline.repaired_by(later["id"]) == run_id:
             return answer(tid, repo.name, later["id"], later["status"],
                           f"run {later['id']} already repairs run {run_id}")
         if row["status"] == "running":
@@ -537,15 +540,15 @@ def view(task_id: str, repo_name: str = "") -> dict:
     tid = task_id.strip()
     if tracker.is_task_id(tid):
         tid = tid.lower()
-        if (row := state.task_get(tid, connect=state.reader)) is None:
+        if (row := state.task_get(tid, connect=foundation.reader)) is None:
             raise control.NotFound(f"no task {tid}")
-        item, repo, refs = {**row, "comments": state.task_comments(tid, connect=state.reader)}, row["repo"], [tid]
+        item, repo, refs = {**row, "comments": state.task_comments(tid, connect=foundation.reader)}, row["repo"], [tid]
     else:
         item, repo = tracker_item(config.load(), tid, repo_name.strip())
         refs = [item["id"], item["ref"]]
-    runs = state.ticket_runs(repo, item["id"], limit=50, connect=state.reader)
-    paid = state.paid_by_run([r["id"] for r in runs], connect=state.reader)
-    children = {c["id"]: c for ref in dict.fromkeys(refs) for c in state.task_children(ref, connect=state.reader)}
+    runs = run_store.ticket_runs(repo, item["id"], limit=50, connect=foundation.reader)
+    paid = run_store.paid_by_run([r["id"] for r in runs], connect=foundation.reader)
+    children = {c["id"]: c for ref in dict.fromkeys(refs) for c in state.task_children(ref, connect=foundation.reader)}
     return {**item,
             "runs": [{"id": r["id"], "status": r["status"], "started": r["started"], "finished": r["finished"],
                       "prs": (r["pr_url"] or "").split(), "cost_usd": paid.get(r["id"], 0.0),
@@ -577,7 +580,7 @@ def newest_repo(cfg: config.Config, tid: str) -> config.Repo:
             issue = tracker.for_repo(cfg, r).normalize(tid)
         except ValueError:
             continue
-        found += [(run["started"] or "", r) for run in state.ticket_runs(r.name, issue, limit=1, connect=state.reader)]
+        found += [(run["started"] or "", r) for run in run_store.ticket_runs(r.name, issue, limit=1, connect=foundation.reader)]
     if not found:
         raise control.Refused(f"No run names {tid}, so say which repo it belongs to with ?repo=NAME")
     return max(found, key=lambda pair: pair[0])[1]

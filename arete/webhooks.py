@@ -8,8 +8,10 @@ import secrets
 from datetime import timedelta
 from urllib.parse import parse_qs
 
-from . import loops, paths, sources, state, util
+from . import loops, paths, sources, util
 from .refusals import Stated
+from .store import db as foundation
+from .store import sources as source_store
 
 HOOKS_DIR = paths.CONFIG_DIR / "hooks"
 HOOK_PATH = "/hook/"
@@ -103,10 +105,10 @@ def receive(name: str, headers, body: bytes) -> dict:
     e = event_of(name, headers, body)
     if why := loop.trigger.refusal(e):
         raise Stated(403, f"The loop {name} {why}.")
-    with state.tx():
+    with foundation.tx():
         if not delivery_id(headers):
-            state.forget_seen(e["source"], e["key"], util.now() - BODY_KEY_WINDOW)
-        if not state.claim_seen(e["source"], [e["key"]]):
+            source_store.forget_seen(e["source"], e["key"], util.now() - BODY_KEY_WINDOW)
+        if not source_store.claim_seen(e["source"], [e["key"]]):
             return {"queued": False, "why": "already received", "key": e["key"]}
         [item] = sources.fire(loop, "webhook", [e])
     return {"queued": True, "item": item, "key": e["key"], "at": util.iso()}

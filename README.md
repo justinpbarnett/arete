@@ -11,13 +11,13 @@ Serve enables WAL under its startup lock after migration and restore completion,
 Every helper connection uses synchronous=NORMAL with the existing busy timeout; helpers never enable WAL.
 Confined scratch state retains MEMORY journaling and refuses WAL inputs and existing sidecars.
 
-`state.tx()` owns one checked connection and begins `BEGIN IMMEDIATE` before application reads. It commits once on
+`store.db.tx()` owns one checked connection and begins `BEGIN IMMEDIATE` before application reads. It commits once on
 successful outer exit, rolls back escaping exceptions (including interruptions), and closes the connection.
-`state.db` is its joining alias; ordinary writes issue no DDL. Nested `tx`, `db` and `reader` scopes share an active
+`store.db.db` is its joining alias; ordinary writes issue no DDL. Nested `tx`, `db` and `reader` scopes share an active
 writer and its uncommitted changes, without savepoints or independent commits. Keep network operations outside these
 scopes. The migrator and staged-restore sequence updates use independent connection ownership.
 
-`state.one_read()` and `state.reader()` own a mode=ro connection and explicit `BEGIN`; nested readers share that
+`store.db.one_read()` and `store.db.reader()` own a mode=ro connection and explicit `BEGIN`; nested readers share that
 snapshot until outer exit closes the connection, ending the read transaction without a commit. A reader inside a
 writer joins the writer. Attempting `tx` or `db` inside an existing
 read snapshot raises instead of promoting it. Reader entry never migrates or checks writer compatibility.
@@ -249,7 +249,7 @@ A repeat of an open incident's fingerprint, minutes or hours later, updates it i
 A failing row of a run carries the repo of its run, and rows from different repos never share an incident; a run with no row in state has no known repo.
 The same line from two files never shares an incident when the `[[oncall.source]]` entries matching each file give them different sets of `vision` and `scope`; an open incident is updated only by lines read under the set it was opened under, and only while its own file is still under that set, or, once that file is gone, while the config holds no other set.
 The append-only `incident_notes` table records what happened and when.
-Evidence is scrubbed of secrets and home paths before it is stored, and `state.prune` trims both tables.
+Evidence is scrubbed of secrets and home paths before it is stored, and `store.prune` trims both tables.
 
 **Decisions.** After each scan, JEV is asked four yes/no questions about every open incident that is due, oldest first however many are open, and the answers become one stored decision:
 
@@ -758,11 +758,37 @@ Hook events rotate monthly from `events.jsonl` into `events-YYYYMM.jsonl`, named
 
 `arete serve` owns schema changes. After taking the serve lock it runs the same migrator as `arete migrate`, before starting workers or the dashboard. An ordinary writer never creates the database or changes its schema. If it finds an older schema, it prints `schema 2 waits for schema 3; run arete serve or arete migrate` once, then waits up to 60 seconds for serve. A missing database names those commands; if a snapshot exists, it instead names the newest snapshot and `arete backup --restore FILE`. A deleted database stops serve.
 
-Each immutable migration lives in `arete/migrations/mNNNN_area_name.py`, with `PHASE` and exactly one `SQL` string or `apply(conn)`. Areas are foundation, work, runs, config, connections, secrets, devices and outbox. Numbers start at 1 without gaps or repeats. `latest.txt` names the highest file, so branches adding the same next number conflict there. The loader refuses a changed SHA-256 for any applied file. Add a new migration to repair an earlier one.
+Each immutable migration lives in `arete/store/migrations/mNNNN_area_name.py`, with `PHASE` and exactly one `SQL` string or `apply(conn)`. Areas come from public store modules declaring literal `TABLES` dictionaries; `foundation` maps to `db`. Helpers and packages are not owners, and `outbox` is refused until its owner exists. Only the historical `m0004_work_event_routing.py` resolves `work` to `loops`; existing ledger rows stay unchanged. Numbers start at 1 without gaps or repeats. `latest.txt` names the highest file, so branches adding the same next number conflict there. The loader refuses a changed SHA-256 for any applied file. Add a new migration to repair an earlier one.
+
+Import connections with `from arete.store import db` and persistence functions through their owner modules. Runs owns recording SQL, history, billing readers, reports, feed, pins and folder-purge scheduling; `record.py` keeps IDs, timelines and filesystem cleanup. Loops owns queue recovery, events, loop state, findings and loop locking. Sources owns seen keys, cursors, source ownership and passed-over tickets. Incidents owns incidents, notes, aliases, repairs and alerts. `oncall.commit_scan` coordinates incident and cursor writes on one connection. `store.prune` calls runs, loops and incidents in order on one connection, after the server's checked backup. `state.py` temporarily exports moved names while the remaining aggregates move. The relocated numbered migrations and `latest.txt` retain their original bytes.
+
+The isolated persistence probes print exact inventories and rollback evidence as `BEHAVIOR_RESULT` JSON:
+
+```sh
+python -I tests/scripts/store_contract.py ownership
+python -I tests/scripts/store_contract.py run-retention
+python -I tests/scripts/store_contract.py scan-atomicity
+python -I tests/scripts/store_contract.py server-prune
+python docs/db-fixture.py concurrent-intake
+python docs/db-fixture.py prune-restore
+```
+
+In the build sandbox, prefix each command with the supplied `verification-runtime/harness/sandbox` executable.
+
+The isolated foundation contract probes generate configuration with `replay.sample` and place all six environment paths under a disposable directory. Run through the supplied sandbox:
+
+```sh
+python tests/scripts/store_contract.py ownership
+python tests/scripts/store_contract.py unknown-area
+python tests/scripts/store_contract.py upgrade
+python tests/scripts/store_contract.py record-readers
+python tests/scripts/store_contract.py record-failures
+python tests/scripts/store_contract.py run-retention
+```
 
 The phases are `expand` (compatible additions), `backfill` (data conversion) and `contract` (removals or incompatible changes). `arete migrate --no-contracts` stops before the first contract. A contract waits for live runs and serve processes that name an older schema, including runs without a schema stamp. A stale heartbeat does not release a still-running older serve's contract gate. Serve retries a waiting contract on each tick. Each migration and its ledger row commit together, with `user_version`, duration and the snapshot filename. A failure rolls back that migration and preserves earlier successful versions. Retention also keeps the snapshot named by the newest migration.
 
-A column, status, run.jsonl event or step_end data-key rename needs an earlier expand whose reader accepts both names. Writers use the new name only after the contract row applies; every later removal goes through this gate. Timestamp columns are listed in `state.TIME_COLUMNS` and use `state.TIME_GLOB`, the UTC shape emitted by `util.iso()`. Migration 2 normalizes legacy offsets and adds triggers rejecting malformed nonempty values. When adding a time column to an existing table, update the mapping and replace that table's triggers in the new migration; new tables declare a CHECK. Tracker equality stamps such as triage.updated and research.updated keep their original format.
+A column, status, run.jsonl event or step_end data-key rename needs an earlier expand whose reader accepts both names. Writers use the new name only after the contract row applies; every later removal goes through this gate. Timestamp columns are listed in `store.db.TIME_COLUMNS` and use `store.db.TIME_GLOB`, the UTC shape emitted by `util.iso()`. Migration 2 normalizes legacy offsets and adds triggers rejecting malformed nonempty values. When adding a time column to an existing table, update the mapping and replace that table's triggers in the new migration; new tables declare a CHECK. Tracker equality stamps such as triage.updated and research.updated keep their original format.
 
 `schema_meta` stores the instance id, short tag, name and creation time, plus schema version and oldest compatible writer. The initial name is the operating-system user. `GET /api/meta` returns these instance and schema blocks through the existing authenticated dashboard. Identity is also persisted in `backups/instance.json`, so restoring a snapshot from before the ledger keeps the same name and id.
 

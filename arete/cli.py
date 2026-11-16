@@ -36,7 +36,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd not in PER_CALL_HOOKS:
         codebase.load()
     try:
-        with principals.acting("hand" if args.cmd in ("init", "migrate") else principals.cli_actor()):
+        recovery = args.cmd in ("init", "migrate") or (args.cmd == "backup" and args.restore)
+        with principals.acting("hand" if recovery else principals.cli_actor()):
             return args.fn(args) or 0
     except refusals.Refusal as e:
         print(e, file=sys.stderr)

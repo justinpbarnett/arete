@@ -11,6 +11,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from arete.store import runs as run_store
+from arete.store import loops as loop_store
 from arete import config, control, delivery, loop_run, loops, mergecheck, paths, record, run_lines, sources, state, util
 
 ROOT = Path(__file__).resolve().parents[1] / ".arete-sandbox" / "merge-check-fixture"
@@ -162,13 +164,13 @@ def main():
                   "ordinary", "--id", args.id or "ordinary"], "trust": "internal"}
         print(json.dumps(sources.poll(replace(loop, name="fixture-ordinary", sources=[source]), 0, cfg, say=print)))
     elif args.action == "dispatch":
-        with util.lock(state.loop_lock("merge-check")) as taken:
+        with util.lock(loop_store.loop_lock("merge-check")) as taken:
             if not taken:
                 print("merge-check queue busy")
                 return 0
             loop = fixture_loop(cfg)
             loop.emits = [{**spec, "approve": True} if spec["type"] == "ticket" else spec for spec in loop.emits]
-            item = next((state.queue_item(i["id"]) for i in state.pending() if i["loop"] == loop.name), None)
+            item = next((loop_store.queue_item(i["id"]) for i in loop_store.pending() if i["loop"] == loop.name), None)
             if not item:
                 print("no pending input")
                 return 0
@@ -177,7 +179,7 @@ def main():
                 return 0
             run_id = record.new_id("fixture-dispatch")
             record.start("loop", run_id=run_id, loop=loop.name, loop_kind="command", queue="merge-check")
-            if not state.take_queue_item(item["id"], run_id):
+            if not loop_store.take_queue_item(item["id"], run_id):
                 raise ValueError("queue item already claimed")
             run = loop_run.LoopRun(loop, run_id, cfg, events=item["payload"])
             print(loop_run.carry(run))
@@ -188,7 +190,7 @@ def main():
             data[args.repo] = {"day": str(datetime.now(UTC).date() - timedelta(days=int(args.yesterday))), "attempts": 6}
             mergecheck.save_json(folder / "quota.json", data)
     elif args.action == "inspect":
-        print(json.dumps({"queue": state.pending(), "dead": state.dead_items(), "steps": state.runs(),
+        print(json.dumps({"queue": loop_store.pending(), "dead": loop_store.dead_items(), "steps": run_store.runs(),
                           "quota": mergecheck.read_json(ROOT / "loop" / ".state" / "quota.json", {}),
                           "checked": mergecheck.read_json(ROOT / "loop" / ".state" / "checked.json", {}),
                           "starts": [line for log in paths.RUNS_DIR.glob("merge-check-*/verify-server.log")

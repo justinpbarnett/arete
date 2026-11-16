@@ -10,6 +10,8 @@ from datetime import UTC, timedelta
 
 from . import accounts, claude, codex, config, devices, environment, paths, pi, prices, sandbox, scrub, state, util
 from .agent import REPLAY, TRAITS, model_scope, traits_of
+from .store import db as foundation
+from .store import runs as run_store
 
 RUNNERS = tuple(TRAITS)
 CODEX_NAMES = ("gpt-", "codex-")
@@ -266,7 +268,7 @@ def limit_applies(scope: str, model: str) -> bool:
     return scope in (claude.EVERY_MODEL, codex.LIMIT_SCOPE) or scope in re.split(r"[-_/.:]", model.lower())
 
 
-def auth_hold(auth: accounts.Auth, model: str, connect=state.reader, unknown: str = "") -> dict | None:
+def auth_hold(auth: accounts.Auth, model: str, connect=foundation.reader, unknown: str = "") -> dict | None:
     if not (auth.identity or auth.credential or unknown):
         return None
     scopes = [accounts.scope(auth, s, unknown) for s in limit_scopes(auth, model)]
@@ -285,7 +287,7 @@ def limit_scopes(auth: accounts.Auth, model: str) -> tuple[str, ...]:
     return (auth.provider or provider_of(model), model_scope(model))
 
 
-def pi_route(model: str, cfg: config.Config, repo=None, device="local", connect=state.reader,
+def pi_route(model: str, cfg: config.Config, repo=None, device="local", connect=foundation.reader,
              mode: str = "") -> pi.Route | None:
     if devices.resolve(device).remote:
         return pi.Route(provider_of(model), model, accounts.Auth(), error=pi.REMOTE_AUTH_UNVERIFIED)
@@ -309,7 +311,7 @@ def metered(model: str, run_with: str = "", *, cfg: config.Config | None = None,
     return can_charge(outlook(cfg, repo, device, model, run_with, tools, NO_GIT_WRITES))
 
 
-def usage_hold(model: str, run_with: str = "", connect=state.reader, cfg: config.Config | None = None,
+def usage_hold(model: str, run_with: str = "", connect=foundation.reader, cfg: config.Config | None = None,
                repo: config.Repo | None = None, device: devices.Device | str = "local",
                tools: list[str] | None = None, remaining: float | None = None, denied=NO_GIT_WRITES) -> str:
     cfg = cfg or config.load()
@@ -383,7 +385,7 @@ def layer_of(repo: config.Repo | None):
 
 def outlook(cfg: config.Config, repo: config.Repo | None, device: devices.Device | str, model: str, run_with: str = "",
             tools: list[str] | None = None, denied=(), remaining: float | None = None,
-            connect=state.reader) -> list[Candidate]:
+            connect=foundation.reader) -> list[Candidate]:
     which, name = chosen(model, run_with, cfg)
     if which == REPLAY:
         return []
@@ -525,7 +527,7 @@ def paid_key(found: Candidate) -> tuple:
 
 class Discovery:
     def __init__(self, cfg: config.Config, repo: config.Repo | None = None, device: devices.Device | str = "local",
-                 connect=state.reader, priced: bool = True, layer: config.RepoLayer | None = None):
+                 connect=foundation.reader, priced: bool = True, layer: config.RepoLayer | None = None):
         self.declared = {key: {**cfg.capabilities.get(key, {}), **(layer.capabilities.get(key, {}) if layer else {})}
                          for key in dict.fromkeys([*cfg.capabilities, *(layer.capabilities if layer else {})])}
         self.cfg = cfg
@@ -903,5 +905,5 @@ def described_selection(selection: Selection, settings, request_tokens: int) -> 
 def loop_budget_left(cfg: config.Config) -> float | None:
     if not cfg.daily_budget_usd:
         return None
-    return cfg.daily_budget_usd - state.loop_spent_since(util.iso(util.now() - timedelta(days=1)), None,
+    return cfg.daily_budget_usd - run_store.loop_spent_since(util.iso(util.now() - timedelta(days=1)), None,
                                                          cfg.local_providers)

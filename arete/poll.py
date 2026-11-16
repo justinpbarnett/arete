@@ -34,6 +34,8 @@ from .pipeline import (
     sync_labels,
 )
 from .slots import slots_free_to_start
+from .store import runs as run_store
+from .store import sources as source_store
 from .workspace import cleanup_worktrees
 
 MAX_STARTS_PER_POLL = 64
@@ -49,9 +51,9 @@ def next_ticket(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
                 other_routes: set[str] = frozenset(), excluded: set[str] = frozenset()) -> tracker.Ticket | None:
     for source in ticket_queues(repo, tk):
         for t in source.todo():
-            if str(t.id) in excluded or other_routes & set(t.labels) or state.issue_running(repo.name, t.id):
+            if str(t.id) in excluded or other_routes & set(t.labels) or run_store.issue_running(repo.name, t.id):
                 continue
-            if owed := state.pending_label(repo.name, t.id):
+            if owed := run_store.pending_label(repo.name, t.id):
                 skips.note(tracker.ticket_name(repo.name, t.ref), t, f"its {owed} label is not written yet", repo.name)
                 continue
             if blocker := source.blocker(t.id):
@@ -73,15 +75,15 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
               other_routes: set[str], excluded: set[str] = frozenset()) -> tuple[str, str] | None:
     excluded = excluded | oncall.parked(repo.name)
     fresh = next_ticket(repo, tk, skips, other_routes, excluded)
-    for tid in state.interrupted_tickets(repo.name):
-        if str(tid) not in excluded and not state.issue_running(repo.name, tid):
+    for tid in run_store.interrupted_tickets(repo.name):
+        if str(tid) not in excluded and not run_store.issue_running(repo.name, tid):
             return tid, "restarting after an interruption"
     for tid in state.feedback_due(repo.name, util.iso(util.now() - timedelta(minutes=pipeline.FEEDBACK_QUIET_MINUTES))):
-        if str(tid) not in excluded and not state.issue_running(repo.name, tid):
+        if str(tid) not in excluded and not run_store.issue_running(repo.name, tid):
             return tid, "revising the PR for your review comments"
     for source in ticket_queues(repo, tk):
         for t in source.replied():
-            if str(t.id) in excluded or state.issue_running(repo.name, t.id):
+            if str(t.id) in excluded or run_store.issue_running(repo.name, t.id):
                 continue
             if other_routes & set(t.labels):
                 skips.note(t.ref, t, tracker.route_blocker(other_routes | {tracker.route_label(repo)}, t.labels))
@@ -98,7 +100,7 @@ def step_without_route(cfg: config.Config, repo: config.Repo, ticket: tracker.Ti
     if cfg.replay.all:
         return ""
     first = ("plan", "build")
-    newest = state.newest_whole_run(repo.name, ticket.id)
+    newest = run_store.newest_whole_run(repo.name, ticket.id)
     if (layer.factory_path == pipeline.ADW and newest and newest["status"] == "interrupted"
             and repaired_by(newest["id"])):
         first = ("review_repair",)
@@ -116,7 +118,7 @@ def step_without_route(cfg: config.Config, repo: config.Repo, ticket: tracker.Ti
 
 
 def tracker_reply(repo: config.Repo, tk: tracker.Tracker, tid: str, dry_run: bool) -> str:
-    newest = state.newest_whole_run(repo.name, str(tid))
+    newest = run_store.newest_whole_run(repo.name, str(tid))
     if not newest or newest["status"] != "needs-info":
         return ""
     waiting = state.asks_of(newest["id"], "open")
@@ -164,8 +166,8 @@ class RepoQueue:
 
 def repo_queues(cfg: config.Config, pipeline_repos: list[config.Repo], routes: dict[str, set[str]],
                 skips: pipeline.SkipLog, errors: list[str]) -> tuple[list[RepoQueue], dict[str, jira.Client]]:
-    starts = state.last_pipeline_starts()
-    restarting = {r.name for r in pipeline_repos if state.interrupted_tickets(r.name)}
+    starts = run_store.last_pipeline_starts()
+    restarting = {r.name for r in pipeline_repos if run_store.interrupted_tickets(r.name)}
     queues, reached_clients = [], {}
     for repo in sorted(pipeline_repos, key=lambda r: (r.name not in restarting, starts.get(r.name, ""))):
         try:
@@ -193,7 +195,7 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: tuple[str, str], skip
     answering = not reply and pipeline.answered_run(repo.name, str(tid)) is not None
     if not answering and not reply and (waiting := held_back(cfg, repo.name, going, slots)):
         if not dry_run:
-            state.pass_over(repo.name, str(tid))
+            source_store.pass_over(repo.name, str(tid))
         print(f"{util.iso()} {name}: waiting, {waiting}")
         return "held"
     blocked, _ = runlimits.admission(repo, str(tid), source, runlimits.Policy.of(layer), False)
@@ -206,7 +208,7 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: tuple[str, str], skip
         return "blocked"
     print(f"{util.iso()} {name}: {why}" + (" (dry run, not started)" if dry_run else ""))
     if not dry_run:
-        state.drop_passed_over(repo.name, keep=str(tid))
+        source_store.drop_passed_over(repo.name, keep=str(tid))
         if not spawn_unparked(repo.name, tid):
             return "refused"
     return "started"
@@ -226,7 +228,7 @@ def fill_slots(cfg: config.Config, queues: list[RepoQueue], skips: pipeline.Skip
                 if not pick:
                     exhausted.add(repo.name)
                     if not dry_run:
-                        state.drop_passed_over(repo.name)
+                        source_store.drop_passed_over(repo.name)
                     continue
                 queue.selected.add(str(pick[0]))
                 examined += 1
