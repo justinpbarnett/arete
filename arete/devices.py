@@ -320,6 +320,14 @@ def with_left_up(summary: str, run_id: str) -> str:
     return "; ".join(filter(None, [summary, *left_up(run_id)]))
 
 
+def outcome_of(e: Exception, run_id: str) -> tuple[str, str]:
+    if isinstance(e, record.Stopped):
+        return "stopped", record.STOPPED if record.stop_asked(run_id) else "stopped by a signal"
+    if isinstance(e, DeviceError):
+        return "failed", util.one_line(str(e), 500)
+    return "failed", f"{type(e).__name__}: {util.first_line(str(e), 300)}"
+
+
 def listed_vm(row: dict) -> proxmox.Clone | exedev.Sandbox:
     saved = row["device"]
     d = Device(**{f.name: saved[f.name] for f in fields(Device) if f.name in saved})

@@ -8,7 +8,7 @@ import re
 from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
 
-from . import gh, paths, util, vault
+from . import paths, util, vault
 
 PRIVATE_KEY = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----", re.DOTALL)
 LARGEST_SECRET_FILE = 64 * 1024
@@ -43,7 +43,7 @@ class Redactions:
 
 def secrets(*files: Path, given: Iterable[str] = ()) -> tuple[str, ...]:
     found = {v for k, v in os.environ.items() if paths.CREDENTIAL_NAME.search(k)}
-    found |= {gh.auth_token(), *file_secrets(paths.PI_KEYS_FILE, every_value=True), *vault.values(), *given}
+    found |= {util.github_token(), *file_secrets(paths.PI_KEYS_FILE, every_value=True), *vault.values(), *given}
     for f in files:
         found |= file_secrets(f)
     found = {v for v in found if len(v) >= vault.SHORTEST}

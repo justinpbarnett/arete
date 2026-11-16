@@ -13,6 +13,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import (
+    browser,
     config,
     devices,
     environment,
@@ -272,7 +273,7 @@ def arm_status(suite: Suite, cfg: config.Config, arm: str) -> dict:
     s = steps.resolve(real, suite.layer, "verify", "", suite.arms[arm])
     which, name = runner.stands_for(s.model, s.runner)
     replayed = runner.chosen(s.model, s.runner, cfg)[0] == runner.REPLAY
-    own = verify.mcp_config(paths.RUNS_DIR) if suite.starts_app else ""
+    own = browser.mcp_config(paths.RUNS_DIR) if suite.starts_app else ""
     kw = {**s.agent_kw(real, ["mcp__playwright"] if suite.starts_app else [], own),
           "disallowed_tools": runner.NO_GIT_WRITES}
     asked = runner.request_for(real, suite.repo, which, name, s, False, kw, 0, suite.layer)
@@ -297,7 +298,7 @@ def browser_reason(suite: Suite, cfg: config.Config) -> str:
         return NO_CHROME_REASON
     real = real_config(cfg)
     probes = (("Chrome would not run headless", [chrome, "--headless", "--disable-gpu", "--dump-dom", "about:blank"]),
-              ("the browser's MCP server would not launch", ["npx", "-y", verify.PLAYWRIGHT_MCP, "--version"]))
+              ("the browser's MCP server would not launch", ["npx", "-y", browser.PLAYWRIGHT_MCP, "--version"]))
     for failure, command in probes:
         try:
             found = environment.sh(command, real, suite.repo, cwd=suite.folder, timeout=BROWSER_PROBE_SECONDS)

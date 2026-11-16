@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from arete import gh, outbound, paths, pipeline, util, verify, cli, codex, guard, runner, uploads
+from arete import browser, gh, outbound, paths, pipeline, util, verify, cli, codex, guard, runner, uploads
 
 from tests import support
 from tests.harness import make_folders, run_script, scratch_env
@@ -315,7 +315,7 @@ class UploadGuardTests(unittest.TestCase):
         self.assertIn("browser_file_upload", verify.PLAYWRIGHT_TOOLS)
         for name in ("browser_evaluate", "browser_run_code_unsafe"):
             self.assertNotIn(name, verify.PLAYWRIGHT_TOOLS)
-        self.assertNotIn("--allow-unrestricted-file-access", verify.mcp_config(self.evidence))
+        self.assertNotIn("--allow-unrestricted-file-access", browser.mcp_config(self.evidence))
         note = pipeline.surface_note(SimpleNamespace(start="x"), "http://127.0.0.1:1", self.evidence)
         self.assertIn("`browser_file_upload`", note)
         self.assertIn(f"copy a worktree file into `{self.evidence}`", note)

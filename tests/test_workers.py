@@ -885,7 +885,8 @@ class CutOffTests(unittest.TestCase):
     def test_a_hunt_stopped_during_delivery_hands_its_finding_on_at_the_next_run(self):
         self.write_loops()
         facts = self.facts(self.child(
-            self.HUNTS + "with mock.patch.object(sources, 'fire', side_effect=loop_run.Stopped):\n    first = hunt()\n"
+            self.HUNTS + "from arete import record\n"
+            "with mock.patch.object(sources, 'fire', side_effect=record.Stopped):\n    first = hunt()\n"
             "second, third = hunt(), hunt()\nreport(first=first, second=second, third=third)"))
         first, second, third = facts["first"], facts["second"], facts["third"]
         self.assertEqual(first["status"], "stopped")
