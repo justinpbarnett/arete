@@ -1,0 +1,224 @@
+from __future__ import annotations
+
+import ctypes
+import fcntl
+import os
+import pwd
+import re
+import sys
+from fnmatch import fnmatch
+from pathlib import Path
+
+from . import paths
+
+SESSIONS_DIR = paths.STATE_DIR / "pi-sessions"
+AGENT_DIR = paths.STATE_DIR / "pi-agent"
+LOGIN_DIR = paths.STATE_DIR / "pi-login"
+KEY_DIR = paths.STATE_DIR / "pi-key"
+WRITABLE_ALWAYS = ("/private/tmp", "/private/var/folders", "/dev")
+WRITABLE_DEVICES = ("/dev/null", "/dev/zero", "/dev/random", "/dev/urandom", "/dev/dtracehelper", "/dev/tty")
+NO_CONFINEMENT_REASON = "pi keeps file writes inside the work folder only with the macOS sandbox on this Mac"
+SECRET_NAMES = (".env", ".env.*", "*.env", ".envrc", ".netrc", ".pgpass", ".npmrc", ".pypirc", "id_rsa*", "id_dsa*",
+                "id_ecdsa*", "id_ed25519*", "*.pem", "*.p12", "*.pfx", "*.key", "credentials", "credentials.json",
+                "*.secret", "*.secrets", "secrets.toml", "secrets.json")
+SAFE_NAMES = ("*.example", "*.sample", "*.template", "*.dist")
+SECRET_DIRS = frozenset({".ssh", ".aws", ".gnupg", ".kube", ".docker", ".password-store"})
+try:
+    AUTHORITY = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".config/arete/verification-authority"
+except KeyError:
+    AUTHORITY = paths.NOWHERE
+
+
+class ConfinementUnavailable(PermissionError):
+    pass
+
+
+def secret_path(p: Path | str) -> bool:
+    p = Path(p)
+    if SECRET_DIRS & set(p.parts[:-1]):
+        return True
+    name = p.name
+    return any(fnmatch(name, n) for n in SECRET_NAMES) and not any(fnmatch(name, n) for n in SAFE_NAMES)
+
+
+def absolute(path: Path) -> Path:
+    try:
+        return Path(path) if Path(path).is_absolute() else Path.cwd() / path
+    except OSError as e:
+        raise ConfinementUnavailable(f"{path} cannot be located: {e.strerror}") from e
+
+
+def canonical(path: Path) -> Path:
+    try:
+        current, missing = absolute(path).resolve(), []
+    except (OSError, RuntimeError) as e:
+        raise ConfinementUnavailable(f"{path} cannot be resolved") from e
+    while True:
+        try:
+            fd = os.open(current, getattr(os, "O_SEARCH", os.O_RDONLY) | os.O_DIRECTORY)
+        except (FileNotFoundError, NotADirectoryError):
+            if current.parent == current:
+                raise ConfinementUnavailable(f"{path} cannot be located") from None
+            missing.append(current.name)
+            current = current.parent
+            continue
+        except OSError as e:
+            raise ConfinementUnavailable(f"{path} cannot be checked: {e.strerror}") from e
+        try:
+            getpath = getattr(fcntl, "F_GETPATH", None)
+            name = fcntl.fcntl(fd, getpath, bytes(1024)).split(b"\0", 1)[0] if getpath else os.fsencode(current)
+        except OSError as e:
+            raise ConfinementUnavailable(f"{path} cannot be checked: {e.strerror}") from e
+        finally:
+            os.close(fd)
+        return Path(os.fsdecode(name), *reversed(missing))
+
+
+def can_confine(remote: bool) -> bool:
+    return not remote and sys.platform == "darwin" and os.access("/usr/bin/sandbox-exec", os.X_OK)
+
+
+def sandboxed() -> bool:
+    lib = ctypes.CDLL(None)
+    lib.sandbox_check.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int)
+    return lib.sandbox_check(os.getpid(), None, 0) == 1
+
+
+def protected_command(command, cwd=None, keeps=()):
+    if not can_confine(False):
+        return command
+    if sandboxed():
+        lib = ctypes.CDLL(None)
+        lib.sandbox_check.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int)
+        try:
+            os.lstat(AUTHORITY)
+        except OSError:
+            return command
+        if all(lib.sandbox_check(os.getpid(), op, 1, ctypes.c_char_p(os.fsencode(AUTHORITY))) == 1
+               for op in (b"file-read-data", b"file-write-data")):
+            return command
+    words = ["/bin/sh", "-c", command] if isinstance(command, str) else list(command)
+    return write_confinement(Path(cwd or Path.cwd()), [], hidden=(AUTHORITY,), restrict_writes=False,
+                             keeps=tuple(keeps)) + words
+
+
+def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = None,
+                      *, hidden: tuple[Path, ...] = (), restrict_writes: bool = True,
+                      agent_roots: bool = True, peers: Path | None = None, secrets_denied: bool = False,
+                      keeps: tuple[str, ...] = (), unix_confined: bool = False, temp_writes: bool = True,
+                      state: tuple[Path, tuple[Path, ...]] | None = None,
+                      mach: tuple[tuple[str, ...], str] | None = None, tcp_port: int | None = None,
+                      denied_ports: tuple[int, ...] = (), listen_port: int | None = None) -> list[str]:
+    hidden = tuple(dict.fromkeys((*hidden, AUTHORITY)))
+    roots = [cwd, *add_dirs, *([AGENT_DIR, LOGIN_DIR, KEY_DIR, SESSIONS_DIR] if agent_roots else [])]
+    allow = " ".join(f'(subpath (param "W{i}"))' for i in range(len(roots)))
+    if temp_writes:
+        allow += " " + " ".join(f'(subpath "{p}")' for p in WRITABLE_ALWAYS)
+    else:
+        allow += " " + " ".join(f'(literal "{p}")' for p in WRITABLE_DEVICES)
+    profile = '(version 1)(allow default)'
+    if restrict_writes:
+        profile += f'(deny file-write* (subpath "/"))(allow file-write* {allow})'
+    if auth_path is not None:
+        profile += '(allow file-write* (literal (param "AUTH")) (literal (param "LOCK")))'
+    params = [arg for i, root in enumerate(roots) for arg in ("-D", f"W{i}={real_path(root)}")]
+    if auth_path is not None:
+        params += ["-D", f"AUTH={real_path(auth_path)}", "-D", f"LOCK={real_path(auth_path)}.lock"]
+    for i, path in enumerate(hidden):
+        params += ["-D", f"H{i}={real_path(path)}"]
+        profile += f'(deny file-read* file-write* file-link (subpath (param "H{i}")))'
+    if peers:
+        params += ["-D", f"PEERS={real_path(peers)}", "-D", f"WORK={real_path(cwd)}"]
+        profile += ('(deny file-read* file-write* (require-all (subpath (param "PEERS")) '
+                    '(require-not (literal (param "PEERS"))) (require-not (subpath (param "WORK")))))'
+                    '(deny file-read-data file-write* (literal (param "PEERS")))')
+    if state is not None:
+        profile += state_denials(params, *state)
+    if secrets_denied:
+        def pattern(names, descendants=False):
+            return "(^|/)(" + "|".join(re.escape(n).replace(r"\*", "[^/]*") for n in names) + (
+                ")($|/)" if descendants else ")$")
+
+        params += ["-D", "NAMES=" + pattern(SECRET_NAMES), "-D", "SAFE=" + pattern(SAFE_NAMES),
+                   "-D", "DIRS=" + pattern(SECRET_DIRS, True)]
+        profile += ('(deny file-read* file-write* (require-all (regex (param "NAMES")) '
+                    '(require-not (regex (param "SAFE")))))(deny file-read* file-write* (regex (param "DIRS")))')
+    params += ["-D", f"ENGINE={real_path(paths.PACKAGE_DIR)}", "-D", f"RUNTIME={real_path(sys.prefix)}"]
+    profile += '(deny file-write* (subpath (param "ENGINE")) (subpath (param "RUNTIME")))'
+    ancestors = {p for root in (*hidden, paths.PACKAGE_DIR, Path(sys.prefix)) for p in real_path(root).parents}
+    for i, path in enumerate(sorted(ancestors)):
+        params += ["-D", f"A{i}={path}"]
+        profile += f'(deny file-write* (literal (param "A{i}")))'
+    if "launch" not in keeps:
+        profile += '(deny lsopen)(deny appleevent-send)(deny job-creation)'
+    if mach is not None:
+        names, pattern = mach
+        params += ["-D", f"MACHRE={pattern}"]
+        profile += ("(deny mach-lookup)(allow mach-lookup " + "".join(f'(global-name "{n}")' for n in names)
+                    + '(global-name-regex (param "MACHRE")))')
+    if tcp_port is not None:
+        params += ["-D", f"UNIX={real_path(cwd)}"]
+        profile += (f'(deny network-outbound)(allow network-outbound (remote tcp "localhost:{int(tcp_port)}") '
+                    '(subpath (param "UNIX")))')
+    if listen_port is not None:
+        profile += ('(deny network-bind network-inbound (local ip "*:*"))'
+                    f'(allow network-bind network-inbound (local ip "localhost:{int(listen_port)}"))')
+    if unix_confined:
+        params += ["-D", f"UNIX={real_path(cwd)}"]
+        profile += ('(deny network-outbound (subpath "/"))(allow network-outbound (subpath (param "UNIX")) '
+                    '(subpath "/private/tmp") (subpath "/private/var/folders"))')
+    folders, sockets = command_sockets(keeps)
+    for i, folder in enumerate(folders):
+        params += ["-D", f"SF{i}={folder}"]
+        profile += f'(deny network-outbound (subpath (param "SF{i}")))'
+    for i, sock in enumerate(sockets):
+        params += ["-D", f"SL{i}={sock}"]
+        profile += f'(deny network-outbound (literal (param "SL{i}")))'
+    for port in sorted({*paths.dashboard_ports(), *denied_ports}):
+        profile += f'(deny network-outbound (remote tcp "*:{int(port)}"))'
+    return ["/usr/bin/sandbox-exec", *params, "-p", profile]
+
+
+def real_path(path) -> Path:
+    try:
+        return canonical(Path(path))
+    except ConfinementUnavailable:
+        return Path(path).resolve()
+
+
+def state_denials(params: list[str], folder: Path, opened: tuple[Path, ...]) -> str:
+    folder = canonical(folder)
+    kept = [canonical(Path(p)) for p in opened]
+    between = sorted({folder, *(q for p in kept for q in p.parents if q.is_relative_to(folder))})
+    params += ["-D", f"STATE={folder}"]
+    exempt = ""
+    for i, path in enumerate(kept):
+        params += ["-D", f"SO{i}={path}"]
+        exempt += f'(require-not (subpath (param "SO{i}")))'
+    listing = ""
+    for i, path in enumerate(between):
+        params += ["-D", f"SB{i}={path}"]
+        exempt += f'(require-not (literal (param "SB{i}")))'
+        listing += f'(literal (param "SB{i}"))'
+    return (f'(deny file-read* file-write* file-link (require-all (subpath (param "STATE")) {exempt}))'
+            f"(deny file-read-data file-write* {listing})")
+
+
+def command_sockets(keeps: tuple[str, ...] = ()) -> tuple[list[str], list[str]]:
+    uid = os.getuid()
+    folders = [f"/private/tmp/tmux-{uid}"]
+    if tmpdir := os.environ.get("TMUX_TMPDIR"):
+        folders.append(str(Path(tmpdir).resolve() / f"tmux-{uid}"))
+    folders += [str(paths.HOME / p) for p in (".docker/run", ".colima", ".orbstack/run", ".rd",
+                                              "Library/Containers/com.docker.docker/Data")]
+    sockets = []
+    if tmux := os.environ.get("TMUX", "").split(",")[0]:
+        sockets.append(tmux)
+    sockets += ["/private/var/run/docker.sock", str(Path("/var/run/docker.sock").resolve())]
+    host = os.environ.get("DOCKER_HOST", "")
+    if host.startswith("unix://"):
+        sockets.append(host.removeprefix("unix://"))
+    agent = os.environ.get("SSH_AUTH_SOCK", "")
+    if agent and "ssh-agent" not in keeps and os.path.isabs(agent):
+        sockets += [agent, str(Path(agent).resolve())]
+    return list(dict.fromkeys(folders)), list(dict.fromkeys(sockets))

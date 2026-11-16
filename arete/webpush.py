@@ -15,7 +15,7 @@ from datetime import timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import config, outbound, paths, state, util
+from . import accounts, config, outbound, paths, refusals, state, util
 
 TIMEOUT_SECONDS = 10
 TTL_SECONDS = 86400
@@ -30,7 +30,7 @@ SPKI_POINT_BYTES = 65
 known_key: tuple[tuple[int, int], str] | None = None
 
 
-class Refused(ValueError):
+class Refused(refusals.Invalid, ValueError):
     pass
 
 
@@ -104,7 +104,7 @@ def raw_signature(der: bytes) -> bytes:
     return r + s
 
 
-def token(audience: str, contact: str) -> str:
+def vapid_jwt(audience: str, contact: str) -> str:
     claims = {"aud": audience, "exp": int(util.now().timestamp()) + TOKEN_SECONDS}
     if contact:
         claims["sub"] = contact
@@ -121,15 +121,10 @@ def subject(cfg: config.Config, row: dict) -> str:
     return f"mailto:{row['contact']}" if EMAIL.fullmatch(row.get("contact") or "") else ""
 
 
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *args, **kw):
-        return None
-
-
 def post(endpoint: str, headers: dict) -> int:
     request = urllib.request.Request(endpoint, data=b"", headers=headers, method="POST")
     try:
-        with urllib.request.build_opener(NoRedirect).open(request, timeout=TIMEOUT_SECONDS) as reply:
+        with urllib.request.build_opener(accounts.NoRedirect).open(request, timeout=TIMEOUT_SECONDS) as reply:
             return reply.status
     except urllib.error.HTTPError as e:
         return e.code
@@ -149,15 +144,14 @@ def audience_of(endpoint: str) -> str:
     return f"{parts.scheme}://{parts.netloc}"
 
 
-def send_all(cfg: config.Config) -> Sent:
+def send_all(cfg: config.Config, rows: list[dict]) -> Sent:
     found = Sent()
-    rows = state.push_list()
     if not rows:
         return found
     key = public_key()
     delivered, gone = [], []
     for row in rows:
-        headers = {"Authorization": f"vapid t={token(audience_of(row['endpoint']), subject(cfg, row))}, k={key}",
+        headers = {"Authorization": f"vapid t={vapid_jwt(audience_of(row['endpoint']), subject(cfg, row))}, k={key}",
                    "TTL": str(TTL_SECONDS), "Urgency": "high", "Content-Length": "0"}
         status = post(row["endpoint"], headers)
         if 200 <= status < 300:
@@ -183,32 +177,35 @@ def words(found: Sent) -> str:
 
 def ask_opened(cfg: config.Config, ask_ids: list[str]) -> list[str]:
     try:
-        if not state.push_list():
+        rows = state.push_list()
+        if not rows:
             return []
-        return [f"push for ask {', '.join(ask_ids)}: {words(send_all(cfg))}"]
+        return [f"push for ask {', '.join(ask_ids)}: {words(send_all(cfg, rows))}"]
     except Exception as e:
         return [f"push for a new ask failed: {type(e).__name__}"]
 
 
 def remind(cfg: config.Config) -> list[str]:
-    if not state.push_list():
+    rows = state.push_list()
+    if not rows:
         return []
     cutoff = util.iso(util.now() - timedelta(hours=cfg.ask.remind_hours))
     notes = []
     for ask in state.open_asks():
         if ask.get("reminded") or ask["asked"] > cutoff or not state.ask_remind(ask["id"]):
             continue
-        notes.append(f"reminder push for ask {ask['id']}: {words(send_all(cfg))}")
+        rows = state.push_list()
+        notes.append(f"reminder push for ask {ask['id']}: {words(send_all(cfg, rows))}")
     return notes
 
 
-def device_id(endpoint: str) -> str:
+def device_key(endpoint: str) -> str:
     return hashlib.sha256(endpoint.encode()).hexdigest()[:16]
 
 
-def view() -> dict:
+def subscription_state() -> dict:
     return {"key": public_key(),
-            "devices": [{"id": device_id(r["endpoint"]), "label": r["label"], "created": r["created"],
+            "devices": [{"id": device_key(r["endpoint"]), "label": r["label"], "created": r["created"],
                          "last_success": r["last_success"]} for r in state.push_list()]}
 
 
@@ -238,19 +235,21 @@ def subscribe(body: dict, contact: str) -> dict:
     for value in (p256dh, auth):
         if not isinstance(value, str) or not KEY_FIELD.fullmatch(value):
             raise Refused("The subscription's keys are missing or not valid.")
-    if endpoint not in {r["endpoint"] for r in state.push_list()} and len(state.push_list()) >= MAX_DEVICES:
+    rows = state.push_list()
+    if endpoint not in {r["endpoint"] for r in rows} and len(rows) >= MAX_DEVICES:
         raise Refused(f"At most {MAX_DEVICES} devices can be subscribed; remove one first.")
     state.push_add(endpoint, p256dh, auth, outbound.plain(body.get("label"), 40) or "Device", contact)
-    return view()
+    return subscription_state()
 
 
-def remove(device_id_: str) -> dict:
-    state.push_drop([r["endpoint"] for r in state.push_list() if device_id(r["endpoint"]) == device_id_])
-    return view()
+def remove(device_id: str) -> dict:
+    state.push_drop([r["endpoint"] for r in state.push_list() if device_key(r["endpoint"]) == device_id])
+    return subscription_state()
 
 
-def test(cfg: config.Config) -> dict:
-    if not state.push_list():
+def send_test(cfg: config.Config) -> dict:
+    rows = state.push_list()
+    if not rows:
         raise Refused("No device is subscribed, so there is nothing to test.")
-    found = send_all(cfg)
-    return {"sent": found.sent, "removed": found.removed, "failed": found.failed, **view()}
+    found = send_all(cfg, rows)
+    return {"sent": found.sent, "removed": found.removed, "failed": found.failed, **subscription_state()}

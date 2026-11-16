@@ -7,7 +7,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import config, gh, paths, record, runner, state, tracker, util, verify
+from . import config, gh, paths, record, state, tracker, util, verify, workspace
+from .agent import READ_TOOLS
 from .evals import (
     EVALS,
     DirSource,
@@ -25,9 +26,7 @@ from .pipeline import (
     bash_rules,
     code_list,
     commit_layer,
-    make_worktree,
     prompt,
-    remove_worktree,
     slug,
 )
 from .util import git
@@ -173,7 +172,7 @@ def write(cfg: config.Config, run: EvalRun, c: Candidate, ticket: tracker.Ticket
                                      body=ticket.body, comments=ticket.comments, pr_body=gh.pr_body(c.pr_url),
                                      diff=util.tail(git(["diff", base, merge], c.repo.path), MAX_DIFF_IN_PROMPT),
                                      surface=surface(v), commands=code_list(config.DEFAULT_ALLOW_BASH + v.bash)),
-                    wt, model=cfg.model("eval_mine"), allowed_tools=runner.READ_TOOLS + bash_rules(config.DEFAULT_ALLOW_BASH),
+                    wt, model=cfg.model("eval_mine"), allowed_tools=READ_TOOLS + bash_rules(config.DEFAULT_ALLOW_BASH),
                     json_schema=WRITER_SCHEMA, timeout=c.layer.timeout_minutes * 60, persist=False)
     if not res.ok or not isinstance(res.structured, dict):
         raise RuntimeError(f"the writer did not finish: {util.first_line(res.error or 'no task came back', 200)}")
@@ -277,7 +276,7 @@ def save(run: EvalRun, c: Candidate, ticket: tracker.Ticket, draft: Draft, on_me
     pushed = set(git(["for-each-ref", "--format=%(refname:lstrip=3)", "refs/remotes/origin/arete"], c.repo.path).split())
     name = free_name(wanted, lambda n: f"{EVALS}/{n}.toml" in merged or f"arete/evals-{n}" in pushed)
     branch = f"arete/evals-{name}"
-    wt = make_worktree(c.repo, base, branch, f"evals-{name}")
+    wt = workspace.make_worktree(c.repo, base, branch, f"evals-{name}")
     try:
         rel = f"{EVALS}/{name}.toml"
         (wt / rel).parent.mkdir(parents=True, exist_ok=True)
@@ -293,7 +292,7 @@ def save(run: EvalRun, c: Candidate, ticket: tracker.Ticket, draft: Draft, on_me
         run.log(f"opened {url}")
         return f"{rel} in {url}"
     finally:
-        remove_worktree(c.repo, wt)
+        workspace.remove_worktree(c.repo, wt)
 
 
 def run(repo_name: str, limit: int, dry_run: bool = False) -> int:

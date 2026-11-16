@@ -362,7 +362,7 @@ class Rotation(Scratch):
 
     def test_comparing_a_large_copy_hashes_a_bounded_number_of_bytes(self):
         code = ("import hashlib, os, sys\n"
-                "from arete import oncall\n"
+                "from arete import log_follower, oncall\n"
                 "body = b'INFO ' + b'z' * 95 + b'\\n'\n"
                 "data = body * 30000\n"
                 "name = os.path.join(sys.argv[1], 'big.log')\n"
@@ -375,11 +375,12 @@ class Rotation(Scratch):
                 "    def update(self, b): seen.append(len(b)); self.h.update(b)\n"
                 "    def hexdigest(self): return self.h.hexdigest()\n"
                 "oncall.hashlib.sha1 = lambda *a: Counting() if not a else real(*a)\n"
-                "older = oncall.stamp(name)\n"
+                "older = log_follower.stamp(name)\n"
                 "inode = os.stat(name).st_ino\n"
-                "print(oncall.still_holds(name, len(data), older, inode, inode), sum(seen), oncall.MAX_READ)\n"
+                "print(log_follower.still_holds(name, len(data), older, inode, inode), sum(seen), "
+                "log_follower.MAX_READ)\n"
                 "open(name, 'r+b').write(b'X')\n"
-                "print(oncall.still_holds(name, len(data), older, inode, inode))")
+                "print(log_follower.still_holds(name, len(data), older, inode, inode))")
         res = subprocess.run([sys.executable, "-c", code, str(self.logs)], cwd=ROOT, text=True,
                              capture_output=True, env=self.env)
         first, second = res.stdout.splitlines()
@@ -2104,7 +2105,8 @@ class Repairs(Scratch):
 SERVER = '''
 import json, os, threading, urllib.error, urllib.request
 from datetime import timedelta
-from arete import board, dashboard, oncall, record, state, util
+from arete import board, dashboard, oncall, record, state, tailnet, util
+from arete.sighting import Sighting
 state.migrate()
 ALERTS = []
 oncall.raise_alert = lambda *a: ALERTS.append(a)
@@ -2115,8 +2117,8 @@ class Owner:
         return "me@example.com"
 
 
-server = dashboard.Server("127.0.0.1", 0, dashboard.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "me@example.com", ""),
-                          Owner(), False)
+server = tailnet.Server("127.0.0.1", 0, tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "me@example.com", ""),
+                        Owner(), False, dashboard.Handler, dashboard.Redirect)
 threading.Thread(target=server.serve_forever, daemon=True).start()
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -2133,8 +2135,9 @@ def call(method, path, body=None, header=True):
 
 
 def new(n, evidence="payment job failed: db"):
-    return state.record_incident(f"seed{n}", "unexpected", "/tmp/app.log", "demo", f"<time> ERROR seed {n} failed", n,
-                                 evidence, json.dumps([["v", "s"]]))[0]
+    return state.record_incident(Sighting(f"seed{n}", "unexpected", "/tmp/app.log", "demo",
+                                          f"<time> ERROR seed {n} failed", n, evidence,
+                                          json.dumps([["v", "s"]])))[0]
 
 
 def wake(i, **fields):

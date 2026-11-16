@@ -3,21 +3,31 @@ from __future__ import annotations
 import http.client
 import json
 import math
+import re
 import urllib.request
 from dataclasses import dataclass, replace
 from datetime import UTC, timedelta
 
-from . import accounts, claude, codex, config, devices, environment, paths, pi, prices, record, runner, state, util
-from .agent import model_scope
+from . import accounts, claude, codex, config, devices, environment, paths, pi, prices, sandbox, scrub, state, util
+from .agent import REPLAY, TRAITS, model_scope, traits_of
 
+RUNNERS = tuple(TRAITS)
+CODEX_NAMES = ("gpt-", "codex-")
+BUDGET_FLOOR_USD = 0.005
+WRITING_TOOLS = frozenset({"Edit", "MultiEdit", "Write"})
+NO_GIT_WRITES = [
+    "Bash(git commit*)", "Bash(git push*)", "Bash(git reset*)", "Bash(git checkout*)",
+    "Bash(git switch*)", "Bash(git rebase*)", "Bash(git merge*)", "Bash(gh *)",
+]
+PI_HOLDS_NO_BASH_RULES = "pi cannot hold the rules that stop git writes"
+SANDBOX_RUNS_PI = ("an exe device runs agents on pi, not claude; pick a provider/model such as exe-llm/gpt-5.4-mini "
+                   "or openrouter/<model id>")
 CLAUDE_PI_MODELS = {"fable": "claude-fable-5-2", "opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5-5",
                     "haiku": "claude-haiku-5-5"}
 VENDORS = {"openai-codex": "openai", "openai": "openai", "anthropic": "anthropic"}
 CLAUDE_FAMILIES = ("fable", "opus", "sonnet", "haiku")
 API_KEY_METHODS = ("api_key", "apiKey", "api-key")
 EFFORT_ORDER = ("off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
-EFFORT_LEVELS = {"claude": claude.EFFORTS, "pi": pi.THINKING_LEVELS, "codex": codex.EFFORTS,
-                 runner.REPLAY: EFFORT_ORDER}
 OPENROUTER_URL = "https://openrouter.ai/api/v1/models"
 OPENROUTER_PROVIDER = "openrouter"
 PRICE_FILE = "openrouter-prices.json"
@@ -69,7 +79,7 @@ class Quote:
 
     @property
     def total(self) -> float | None:
-        return None if self.input is None or self.output is None else number(self.input + self.output)
+        return None if self.input is None or self.output is None else util.nonnegative_number(self.input + self.output)
 
 
 @dataclass(frozen=True)
@@ -109,9 +119,7 @@ class Request:
         return nearest_effort(which, self.effort)
 
     def instructions_on(self, which: str) -> tuple[str, ...]:
-        from . import steps
-
-        return steps.default_instructions(which) if self.instructions is None else self.instructions
+        return traits_of(which).default_instructions if self.instructions is None else self.instructions
 
 
 @dataclass(frozen=True)
@@ -134,7 +142,7 @@ class Selection:
 
 
 def nearest_effort(which: str, effort: str) -> str:
-    levels = EFFORT_LEVELS.get(which, ())
+    levels = traits_of(which).efforts
     if effort in levels:
         return effort
     if effort not in EFFORT_ORDER:
@@ -143,8 +151,12 @@ def nearest_effort(which: str, effort: str) -> str:
     return lower[-1] if lower else ""
 
 
-def route_key(found: Candidate) -> tuple:
+def way_key(found: Way | Candidate) -> tuple:
     return found.runner, identity(found.runner, found.model), found.credential
+
+
+def route_key(found: Candidate) -> tuple:
+    return way_key(found)
 
 
 def claude_id(name: str) -> str:
@@ -168,8 +180,8 @@ def identity(which: str, model: str) -> tuple[str, str]:
 
 
 def source_route(source: dict) -> tuple[str, str, str]:
-    which, name = runner.route(source.get("model", ""), source.get("runner", ""))
-    provider = source.get("provider", "") or runner.provider_of(name)
+    which, name = route(source.get("model", ""), source.get("runner", ""))
+    provider = source.get("provider", "") or provider_of(name)
     if which == "pi" and source.get("provider") and not name.startswith(f"{provider}/"):
         name = f"{provider}/{name}"
     return which, name, provider
@@ -177,15 +189,15 @@ def source_route(source: dict) -> tuple[str, str, str]:
 
 def entry_problem(entry: dict) -> str:
     hint = entry.get("runner", "")
-    if hint and hint not in runner.RUNNERS:
-        return f"runner '{hint}' is not one of {', '.join(runner.RUNNERS)}"
+    if hint and hint not in RUNNERS:
+        return f"runner '{hint}' is not one of {', '.join(RUNNERS)}"
     if not entry.get("model"):
         return ""
     which, name, provider = source_route(entry)
     lowered = name.lower()
     wrong = False
     if which == "claude":
-        wrong = "/" in name or lowered.startswith(runner.CODEX_NAMES) or provider not in ("", "anthropic")
+        wrong = "/" in name or lowered.startswith(CODEX_NAMES) or provider not in ("", "anthropic")
     elif which == "codex":
         wrong = (lowered.startswith("claude-") or model_scope(name).removeprefix("model:") in CLAUDE_FAMILIES
                  or "/" in name or provider not in ("", "openai"))
@@ -201,34 +213,181 @@ def payment_of(credential: str, auth_mode: str = "") -> str:
 
 
 def incompatible(way: Way, settings, device: devices.Device) -> str:
-    if way.runner == "pi":
-        if settings.mcp:
-            return f"mcp {', '.join(settings.mcp)} cannot load on pi, which runs with --no-mcp"
-        if settings.instructions_on("pi"):
-            return f"instructions {', '.join(settings.instructions_on('pi'))} cannot load on pi"
-        if runner.WRITING_TOOLS & set(settings.tools) and not pi.can_confine(False):
-            return pi.NO_CONFINEMENT_REASON
+    traits = traits_of(way.runner)
+    wanted = settings.instructions_on(way.runner)
+    if not traits.takes_mcp and settings.mcp:
+        return f"mcp {', '.join(settings.mcp)} cannot load on {way.runner}, which runs with --no-mcp"
+    if wanted and not traits.instruction_scopes:
+        return f"instructions {', '.join(wanted)} cannot load on {way.runner}"
+    if not traits.takes_mcp and WRITING_TOOLS & set(settings.tools) and not sandbox.can_confine(False):
+        return sandbox.NO_CONFINEMENT_REASON
     fallback = not (way.link.requested and way.runner == way.link.runner)
-    if way.runner == "pi" and fallback and "Bash" in settings.tools and not device.exe_sandbox:
-        return runner.PI_HOLDS_NO_BASH_RULES
-    if (way.runner in ("pi", "codex") and fallback
-            and (missing := [t for t in runner.READ_TOOLS if t not in settings.tools])):
+    if not traits.takes_mcp and fallback and "Bash" in settings.tools and not device.exe_sandbox:
+        return PI_HOLDS_NO_BASH_RULES
+    if (traits.always_granted_tools and fallback
+            and (missing := [t for t in traits.always_granted_tools if t not in settings.tools])):
         return f"tools leave out {', '.join(missing)}, which {way.runner} always grants"
-    if way.runner == "codex" and fallback and (
-            loose := [d for d in settings.denied if d not in runner.NO_GIT_WRITES]):
-        return f"codex cannot hold the denial of {', '.join(loose)}"
-    if way.runner == "codex" and "user" in settings.instructions_on("codex"):
-        return "instructions user cannot load on codex, which runs without your own codex setup"
+    if traits.cannot_stop and fallback and (loose := [d for d in settings.denied if d not in NO_GIT_WRITES]):
+        return f"{way.runner} cannot hold the denial of {', '.join(loose)}"
+    if traits.instruction_scopes and (refused := [i for i in wanted if i not in traits.instruction_scopes]):
+        return (f"instructions {', '.join(refused)} cannot load on {way.runner}, which runs without your own "
+                f"{way.runner} setup")
     return ""
+
+
+def route(model: str, runner: str = "") -> tuple[str, str]:
+    prefix, _, rest = model.partition(":")
+    if prefix in RUNNERS and rest:
+        return prefix, rest
+    if runner in RUNNERS:
+        return runner, model
+    if "/" in model:
+        return "pi", model
+    return ("codex" if model.lower().startswith(CODEX_NAMES) else "claude"), model
+
+
+def chosen(model: str, run_with: str, cfg: config.Config) -> tuple[str, str]:
+    which, name = route(model, run_with)
+    return (REPLAY if cfg.replay.all else which), name
+
+
+def stands_for(model: str, run_with: str) -> tuple[str, str]:
+    which, name = route(model, "" if run_with == REPLAY else run_with)
+    return (which if which != REPLAY else route(name)[0]), name
+
+
+def provider_of(model: str) -> str:
+    return model.split("/", 1)[0] if "/" in model else ""
+
+
+def limit_applies(scope: str, model: str) -> bool:
+    if scope.startswith("model:"):
+        return scope == model_scope(model)
+    return scope in (claude.EVERY_MODEL, codex.LIMIT_SCOPE) or scope in re.split(r"[-_/.:]", model.lower())
+
+
+def auth_hold(auth: accounts.Auth, model: str, connect=state.db, unknown: str = "") -> dict | None:
+    if not (auth.identity or auth.credential or unknown):
+        return None
+    scopes = [accounts.scope(auth, s, unknown) for s in limit_scopes(auth, model)]
+    found = [h for h in state.holds(connect) if h["scope"] in scopes]
+    return next((h for h in found if not h["until"]), found[-1] if found else None)
+
+
+def limit_scopes(auth: accounts.Auth, model: str) -> tuple[str, ...]:
+    if auth.mode == "api_key":
+        return ("credit",)
+    if auth.family == "claude":
+        return (claude.EVERY_MODEL, *(s for s in claude.LIMIT_SCOPES.values() if limit_applies(s, model)),
+                model_scope(model))
+    if auth.family == "codex":
+        return (codex.LIMIT_SCOPE, model_scope(model))
+    return (auth.provider or provider_of(model), model_scope(model))
+
+
+def pi_route(model: str, cfg: config.Config, repo=None, device="local", connect=state.db,
+             mode: str = "") -> pi.Route | None:
+    if devices.resolve(device).remote:
+        return pi.Route(provider_of(model), model, accounts.Auth(), error=pi.REMOTE_AUTH_UNVERIFIED)
+    return pi.select(model, environment.passed(cfg, repo), cfg.environment.providers,
+                     held=lambda auth, name: auth_hold(auth, name, connect), mode=mode,
+                     local_providers=cfg.local_providers)
+
+
+def hold_words(hold: dict) -> str:
+    return (f"{hold['why']}, waiting until {local_time(hold['until'])}" if hold["until"] else
+            f"{hold['why']}, held until cleared")
+
+
+def local_time(stamp: str) -> str:
+    return util.parse_iso(stamp).astimezone().strftime("%a %b %d %H:%M")
+
+
+def metered(model: str, run_with: str = "", *, cfg: config.Config | None = None, repo: config.Repo | None = None,
+            device: devices.Device | str = "local", tools: list[str] | None = None) -> bool:
+    cfg = cfg or config.load()
+    return can_charge(outlook(cfg, repo, device, model, run_with, tools, NO_GIT_WRITES))
+
+
+def usage_hold(model: str, run_with: str = "", connect=state.db, cfg: config.Config | None = None,
+               repo: config.Repo | None = None, device: devices.Device | str = "local",
+               tools: list[str] | None = None, remaining: float | None = None, denied=NO_GIT_WRITES) -> str:
+    cfg = cfg or config.load()
+    return held_words(outlook(cfg, repo, device, model, run_with, tools, denied, remaining, connect))
+
+
+def device_refusal(model: str, run_with: str, device: devices.Device) -> str:
+    which = route(model, run_with)[0]
+    if which == "pi" and device.remote:
+        return pi.REMOTE_AUTH_UNVERIFIED
+    if which == "codex" and device.remote:
+        return codex.RUNS_LOCALLY
+    return SANDBOX_RUNS_PI if device.exe_sandbox and which == "claude" else ""
+
+
+def withheld(model: str, run_with: str, tools: list[str], device: devices.Device) -> dict[str, list[str]]:
+    if route(model, run_with)[0] != "pi" or device.exe_sandbox:
+        return {}
+    reasons: dict[str, list[str]] = {}
+    for tool in tools:
+        if tool == "Bash":
+            reasons.setdefault(PI_HOLDS_NO_BASH_RULES, []).append(tool)
+        elif tool in WRITING_TOOLS and not sandbox.can_confine(device.remote):
+            reasons.setdefault(sandbox.NO_CONFINEMENT_REASON, []).append(tool)
+    return reasons
+
+
+def reach(kw: dict) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    granted = kw["tools"] if kw.get("tools") is not None else (kw.get("allowed_tools") or [])
+    denied = tuple(dict.fromkeys(kw.get("disallowed_tools") or []))
+    bare = tuple(t for t in dict.fromkeys(granted)
+                 if "(" not in t and not t.startswith("mcp__") and t not in denied)
+    return bare, denied
+
+
+def routing_size(prompt: str, settings, kw: dict) -> int:
+    if not (settings and settings.requires.declared):
+        return 0
+    return request_tokens(prompt, kw.get("system", ""), kw.get("json_schema"))
+
+
+def request_for(cfg: config.Config, repo: config.Repo | None, which: str, name: str, settings, fallback: bool,
+                kw: dict, size: int = 0, layer: config.RepoLayer | None = None):
+    from . import steps
+
+    bare, denied = reach(kw)
+    try:
+        servers = json.loads(kw.get("mcp_config") or "{}").get("mcpServers") or {}
+    except (ValueError, AttributeError):
+        servers = {}
+    effort = settings.effort if settings else kw.get("effort", "")
+    given = kw.get("instructions")
+    explicit = (tuple(settings.instructions) if settings.instructions_explicit else None) if settings else (
+        None if given is None else tuple(given))
+    requires = settings.requires if settings else Requirements()
+    if settings and settings.chain and (requires.declared or identity(which, name) == identity(
+            settings.chain[0].runner, settings.chain[0].model)):
+        chain, allowed = settings.chain, settings.fallback
+    else:
+        layer = layer if layer is not None else layer_of(repo)
+        chain, allowed = steps.chain_for(cfg, layer, which, name, effort, explicit)
+    return Request(chain, allowed and fallback, bare, tuple(servers), effort, explicit, denied, requires, size)
+
+
+def layer_of(repo: config.Repo | None):
+    try:
+        return config.load_layer(repo.layer_dir) if repo else None
+    except (ValueError, OSError):
+        return None
 
 
 def outlook(cfg: config.Config, repo: config.Repo | None, device: devices.Device | str, model: str, run_with: str = "",
             tools: list[str] | None = None, denied=(), remaining: float | None = None,
             connect=state.db) -> list[Candidate]:
-    which, name = runner.chosen(model, run_with, cfg)
-    if which == runner.REPLAY:
+    which, name = chosen(model, run_with, cfg)
+    if which == REPLAY:
         return []
-    request = runner.request_for(cfg, repo, which, name, None, True, {"tools": tools, "disallowed_tools": list(denied)})
+    request = request_for(cfg, repo, which, name, None, True, {"tools": tools, "disallowed_tools": list(denied)})
     return Discovery(cfg, repo, device, connect, priced=False).routes(request, remaining)
 
 
@@ -262,12 +421,8 @@ def paid_for(cfg: config.Config, repo: config.Repo | None,
         return cfg.paid
 
 
-POSSIBLE_MODES = {"claude": ("subscription",), "codex": ("subscription", "api_key"),
-                  "pi": ("subscription", "api_key", "local")}
-
-
 def policy_fit(which: str, modes: tuple[str, ...]) -> str:
-    possible = POSSIBLE_MODES.get(which)
+    possible = traits_of(which).payment_modes
     if not possible or any(m in modes for m in possible):
         return ""
     return f"[routing] payment_modes allows {', '.join(modes) or 'no mode'}; {which} routes are {' or '.join(possible)}"
@@ -280,7 +435,7 @@ def fit_refusal(request: Request, device: devices.Device, modes: tuple[str, ...]
         serving = SERVES.get(vendor, (link.runner,)) if request.fallback else (link.runner,)
         for which in serving:
             way = Way(link, which, link.model, "", "")
-            why = (policy_fit(which, modes) if modes is not None else "") or runner.device_refusal(
+            why = (policy_fit(which, modes) if modes is not None else "") or device_refusal(
                 link.model, which, device) or incompatible(way, request, device)
             if not why:
                 return ""
@@ -288,19 +443,9 @@ def fit_refusal(request: Request, device: devices.Device, modes: tuple[str, ...]
     return first
 
 
-def number(value) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
-        return None
-    try:
-        found = float(value)
-    except ValueError:
-        return None
-    return found if math.isfinite(found) and found >= 0 else None
-
-
 def per_million(value) -> float | None:
-    found = number(value)
-    scaled = None if found is None else number(found * 1e6)
+    found = util.nonnegative_number(value)
+    scaled = None if found is None else util.nonnegative_number(found * 1e6)
     return None if scaled is None else round(scaled, 6)
 
 
@@ -314,7 +459,7 @@ def names(value) -> list[str] | None:
 
 def listing(entry) -> dict:
     entry = accounts.mapping(entry)
-    return {**{key: number(entry.get(key)) for key in ("input", "output", "cache_read", "cache_write")},
+    return {**{key: util.nonnegative_number(entry.get(key)) for key in ("input", "output", "cache_read", "cache_write")},
             "context": whole(entry.get("context")), "modalities": names(entry.get("modalities")),
             "structured_output": entry["structured_output"] if type(entry.get("structured_output")) is bool else None}
 
@@ -362,8 +507,8 @@ def local_quote(model: str, selected: pi.Route) -> Quote | None:
         item = accounts.mapping(item)
         if item.get("id") == name and isinstance(item.get("cost"), dict):
             cost = item["cost"]
-            return Quote(number(cost.get("input")), number(cost.get("output")), number(cost.get("cacheRead")),
-                         number(cost.get("cacheWrite")), "models.json")
+            return Quote(util.nonnegative_number(cost.get("input")), util.nonnegative_number(cost.get("output")), util.nonnegative_number(cost.get("cacheRead")),
+                         util.nonnegative_number(cost.get("cacheWrite")), "models.json")
     return None
 
 
@@ -400,7 +545,7 @@ class Discovery:
 
     def probe(self, model: str, mode: str) -> pi.Route:
         if (model, mode) not in self.probes:
-            self.probes[model, mode] = runner.pi_route(model, self.cfg, self.repo, self.device, self.connect, mode=mode)
+            self.probes[model, mode] = pi_route(model, self.cfg, self.repo, self.device, self.connect, mode=mode)
         return self.probes[model, mode]
 
     def claude_status(self) -> dict:
@@ -418,28 +563,48 @@ class Discovery:
             self.listed = openrouter_prices()
         return self.listed
 
+    def is_local(self, probe: pi.Route) -> bool:
+        return probe.local or probe.provider in self.cfg.local_providers
+
+    def keyed_way(self, link: Link, keyed: str) -> Way:
+        probe = self.probe(keyed, "")
+        return (Way(link, "pi", keyed, "local", "free") if self.is_local(probe)
+                else Way(link, "pi", keyed, "pi_key", "paid", "api_key"))
+
+    def codex_cli_way(self, link: Link, native: str) -> Way:
+        return (Way(link, "codex", native, "cli_key", "paid") if self.codex_auth().mode == "api_key"
+                else Way(link, "codex", native, "cli_login", "free"))
+
+    def requested_way(self, link: Link) -> Way:
+        if link.runner == "pi":
+            selected = self.probe(link.model, "")
+            local = self.is_local(selected)
+            paid = not local and selected.auth.mode != "subscription"
+            credential = ("local" if local else "pi_oauth" if selected.using_login and paid else
+                          "pi_login" if selected.using_login else "pi_key")
+            if (not local and "subscription" in self.modes and self.policy_refusal(credential)
+                    and selected.provider in accounts.PI_SUBSCRIPTIONS and self.probe(link.model, "login").login_available):
+                selected, credential, paid = self.probe(link.model, "login"), "pi_login", False
+            return Way(link, "pi", selected.model, credential, "paid" if paid else "free",
+                       "" if local else "login" if selected.using_login else "api_key")
+        if link.runner == "codex":
+            return self.codex_cli_way(link, link.model)
+        return Way(link, link.runner, link.model, "replay" if link.runner == REPLAY else "cli_login", "free")
+
     def ways(self, link: Link) -> list[Way]:
-        if link.runner == runner.REPLAY:
-            return [Way(link, runner.REPLAY, link.model, "replay", "free")]
+        if link.runner == REPLAY:
+            return [Way(link, REPLAY, link.model, "replay", "free")]
         vendor, ident = identity(link.runner, link.model)
         if vendor == "anthropic":
             native = link.model if link.runner == "claude" else link.model.partition("/")[2]
-            keyed = f"anthropic/{ident}"
-            probe = self.probe(keyed, "")
-            key = (Way(link, "pi", keyed, "local", "free") if probe.local or probe.provider in self.cfg.local_providers
-                   else Way(link, "pi", keyed, "pi_key", "paid", "api_key"))
-            return [Way(link, "claude", native, "cli_login", "free"), key]
+            return [Way(link, "claude", native, "cli_login", "free"), self.keyed_way(link, f"anthropic/{ident}")]
         if vendor == "openai":
             native = link.model if link.runner == "codex" else ident
-            cli = (Way(link, "codex", native, "cli_key", "paid") if self.codex_auth().mode == "api_key"
-                   else Way(link, "codex", native, "cli_login", "free"))
-            keyed = f"openai/{ident}"
-            probe = self.probe(keyed, "")
-            key = (Way(link, "pi", keyed, "local", "free") if probe.local or probe.provider in self.cfg.local_providers
-                   else Way(link, "pi", keyed, "pi_key", "paid", "api_key"))
-            return [cli, Way(link, "pi", f"openai-codex/{ident}", "pi_login", "free", "login"), key]
+            cli = self.codex_cli_way(link, native)
+            return [cli, Way(link, "pi", f"openai-codex/{ident}", "pi_login", "free", "login"),
+                    self.keyed_way(link, f"openai/{ident}")]
         probe = self.probe(link.model, "")
-        if probe.local or probe.provider in self.cfg.local_providers:
+        if self.is_local(probe):
             return [Way(link, "pi", link.model, "local", "free")]
         found = []
         if probe.provider in accounts.PI_SUBSCRIPTIONS:
@@ -503,7 +668,7 @@ class Discovery:
         have = self.capabilities(way)
         reasons = []
         if need.floor and not way.link.requested:
-            approved = {identity(*runner.route(m)) for m in need.approved}
+            approved = {identity(*route(m)) for m in need.approved}
             if identity(way.runner, way.model) not in approved:
                 reasons.append(f"is not in [routing.floors] {need.floor}")
         if need.modalities:
@@ -565,7 +730,7 @@ class Discovery:
     def judge(self, way: Way, settings, remaining: float | None, request_tokens: int = 0) -> tuple[str, str, str]:
         if why := self.policy_refusal(way.credential):
             return "policy", why, ""
-        if why := runner.device_refusal(way.model, way.runner, self.device):
+        if why := device_refusal(way.model, way.runner, self.device):
             return "excluded", why, ""
         if why := self.incompatible(way, settings):
             return "incompatible", why, ""
@@ -575,14 +740,14 @@ class Discovery:
         if way.runner == "pi":
             selected = self.probe(way.model, way.mode)
             if selected.token_error:
-                return "refused", record.scrub(selected.token_error, selected.hidden), ""
+                return "refused", scrub.scrub(selected.token_error, selected.hidden), ""
             if way.mode == "login" and not selected.login_available:
                 return "missing_login", f"no {selected.provider or 'pi'} login in pi's auth store", ""
             if way.mode == "api_key" and not selected.key_available:
                 found = f"no supported {selected.provider or 'pi'} key in {pi.KEYS_FILE.name} or the environment"
                 return "missing_key", found, ""
             if selected.error:
-                return "unavailable", record.scrub(selected.error, selected.hidden), ""
+                return "unavailable", scrub.scrub(selected.error, selected.hidden), ""
             auth, model = selected.auth, selected.model
         elif way.runner == "codex":
             auth, model = self.codex_auth(), way.model
@@ -599,10 +764,10 @@ class Discovery:
                 return "expired_login", "claude login expired; run `claude auth login`", ""
         else:
             return "ready", "", ""
-        if way.billing == "paid" and remaining is not None and remaining <= runner.BUDGET_FLOOR_USD:
+        if way.billing == "paid" and remaining is not None and remaining <= BUDGET_FLOOR_USD:
             return "budget_spent", f"the daily loop budget has {max(remaining, 0):.4f} USD left", ""
-        if hold := runner.auth_hold(auth, model, self.connect):
-            return "held", runner.hold_words(hold), hold["until"]
+        if hold := auth_hold(auth, model, self.connect):
+            return "held", hold_words(hold), hold["until"]
         return "ready", "", ""
 
     def candidate(self, way: Way, settings, remaining: float | None, request_tokens: int = 0) -> Candidate:
@@ -623,32 +788,15 @@ class Discovery:
             return "anthropic"
         if way.runner == "codex":
             return "openai" if way.credential == "cli_key" else "openai-codex"
-        return runner.provider_of(way.model) or way.link.provider
+        return provider_of(way.model) or way.link.provider
 
     def routes(self, settings, remaining_budget: float | None = None, request_tokens: int = 0) -> list[Candidate]:
         seen = set()
         found = []
         for link in settings.chain if settings.fallback else settings.chain[:1]:
-            if settings.fallback:
-                ways = self.ways(link)
-            elif link.runner == "pi":
-                selected = self.probe(link.model, "")
-                local = selected.local or selected.provider in self.cfg.local_providers
-                paid = not local and selected.auth.mode != "subscription"
-                credential = ("local" if local else "pi_oauth" if selected.using_login and paid else
-                              "pi_login" if selected.using_login else "pi_key")
-                if (not local and "subscription" in self.modes and self.policy_refusal(credential)
-                        and selected.provider in accounts.PI_SUBSCRIPTIONS and self.probe(link.model, "login").login_available):
-                    selected, credential, paid = self.probe(link.model, "login"), "pi_login", False
-                ways = [Way(link, "pi", selected.model, credential, "paid" if paid else "free",
-                            "" if local else "login" if selected.using_login else "api_key")]
-            elif link.runner == "codex" and self.codex_auth().mode == "api_key":
-                ways = [Way(link, link.runner, link.model, "cli_key", "paid")]
-            else:
-                ways = [Way(link, link.runner, link.model, "replay" if link.runner == runner.REPLAY else
-                            "cli_login", "free")]
+            ways = self.ways(link) if settings.fallback else [self.requested_way(link)]
             for way in ways:
-                key = (way.runner, identity(way.runner, way.model), way.credential)
+                key = way_key(way)
                 if key not in seen:
                     seen.add(key)
                     found.append(self.candidate(way, settings, remaining_budget, request_tokens))

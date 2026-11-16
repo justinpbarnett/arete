@@ -1,7 +1,7 @@
 
 import atexit, os, signal, subprocess, threading
 from unittest import mock
-from arete import capture, cli, dashboard, serve, util
+from arete import capture, cli, dashboard, serve, tailnet, util
 
 children = []
 outputs = {}
@@ -47,8 +47,8 @@ def wait_output(p, text):
 
 
 def dashboard_start():
-    p = child('from arete import cli, dashboard; '
-              'dashboard.Tailscale.node = lambda *a: None; cli.main(["dashboard"])')
+    p = child('from arete import cli, tailnet; '
+              'tailnet.Tailscale.node = lambda *a: None; cli.main(["dashboard"])')
     try:
         wait_output(p, "cannot listen yet")
     finally:

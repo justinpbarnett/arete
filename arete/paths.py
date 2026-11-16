@@ -1,5 +1,6 @@
 import errno
 import fcntl
+import json
 import os
 import re
 import sqlite3
@@ -7,6 +8,7 @@ import stat
 import sys
 import threading
 import time
+import tomllib
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
@@ -230,6 +232,7 @@ WORKTREES_DIR = Path(os.environ.get("ARETE_WORKTREES_DIR", HOME / "Library" / "D
                                     if ON_MAC and not ISOLATED else STATE_DIR / "worktrees"))
 HEARTBEAT_FILE = STATE_DIR / "heartbeat.json"
 SERVER_FILE = STATE_DIR / "server.json"
+DASHBOARD_PORT = 8796
 TLS_CERT_FILE = STATE_DIR / "dashboard.crt"
 TLS_KEY_FILE = STATE_DIR / "dashboard.key"
 PUSH_KEY_FILE = STATE_DIR / "webpush.key"
@@ -242,8 +245,34 @@ CLAUDE_PROJECTS_DIR = HOME / ".claude" / "projects"
 CLAUDE_SETTINGS = HOME / ".claude" / "settings.json"
 
 
+PER_CALL_HOOKS = ("hook", "guard", "codex-guard", "background")
+
+
+def cli_command(*args: str, flags: tuple[str, ...] = ()) -> list[str]:
+    pinned = "" if args[:1] and args[0] in PER_CALL_HOOKS else "from arete import codebase; codebase.load(); "
+    entrypoint = (f"import sys; sys.path.insert(0, {str(PACKAGE_DIR.parent)!r}); {pinned}"
+                  "from arete.cli import main; raise SystemExit(main())")
+    return [sys.executable, "-I", *flags, "-c", entrypoint, *args]
+
+
 def expand(p: str | Path) -> Path:
     return Path(os.path.expandvars(os.path.expanduser(str(p))))
+
+
+def dashboard_ports() -> frozenset[int]:
+    found = {DASHBOARD_PORT}
+    try:
+        data = tomllib.loads(read_confined(CONFIG_FILE).decode())
+        found.add(int(data.get("dashboard", {}).get("port", DASHBOARD_PORT)))
+    except (OSError, ValueError, TypeError):
+        pass
+    try:
+        record = json.loads(SERVER_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError):
+        record = None
+    if isinstance(record, dict) and isinstance(record.get("port"), int):
+        found.add(record["port"])
+    return frozenset(found)
 
 
 def state_and_config() -> dict:

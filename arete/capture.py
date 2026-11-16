@@ -21,7 +21,9 @@ from . import (
     outbound,
     paths,
     pipeline,
+    refusals,
     runner,
+    screening,
     state,
     steps,
     tracker,
@@ -98,19 +100,19 @@ NOT_INSPECTED_YET = "Not inspected yet. Submit inspects it."
 ROUTE_CHANGED = "The model or data handling it was inspected under has changed. Submit inspects it again."
 
 
-class Refused(ValueError):
+class Refused(refusals.Invalid, ValueError):
     pass
 
 
-class Conflict(RuntimeError):
+class Conflict(refusals.Conflict, RuntimeError):
     pass
 
 
-class TooLarge(Refused):
+class TooLarge(refusals.TooLarge, Refused):
     pass
 
 
-class NotStaged(LookupError):
+class NotStaged(refusals.NotFound, LookupError):
     pass
 
 
@@ -738,18 +740,18 @@ def check_injection(draft: dict, cfg: config.Config) -> tuple[str, str, dict, fl
     names = evidence_names(draft)
     text = "\n\n".join(filter(None, [request_text(draft), f"App state:\n{draft['context']}" if draft["context"] else "",
                                      "Evidence names:\n" + "\n".join(names) if names else ""]))
-    reply = asked(cfg, text, {"injection": jev.yes_no(jev.INJECTION)})
-    answer = reply.answers.get("injection")
-    if not answer:
+    screened = screening.screen(outbound.redact(text), cfg, [], ready=allowed(cfg))
+    reply = screened.reply or jev.Reply(error=JEV_OFF)
+    if screening.held(screened, screening.Posture.REQUIRED) and screened.status != screening.FLAGGED:
         return unavailable(reply)
-    line = cfg.jev.injection
-    scores = {"injection": jev_verdicts.scored(answer.yes, line)}
-    if answer.yes >= line:
-        reason = f"This text reads as instructions for an agent (p {answer.yes:.2f}, line {line:g}). Describe the problem only."
+    line = screened.line
+    scores = {"injection": jev_verdicts.scored(screened.p, line)}
+    if screened.status == screening.FLAGGED:
+        reason = f"This text reads as instructions for an agent (p {screened.p:.2f}, line {line:g}). Describe the problem only."
         keep_verdict(draft, "injection", scores, reason)
         return "fail", reason, detail, reply.cost_usd
     keep_verdict(draft, "injection", scores, "")
-    passed = f"No instructions for an agent found (p {answer.yes:.2f}, line {line:g})."
+    passed = f"No instructions for an agent found (p {screened.p:.2f}, line {line:g})."
     if unread:
         passed += f" {', '.join(unread)} was not read, and Publication safety holds it."
     return "pass", passed, detail, reply.cost_usd

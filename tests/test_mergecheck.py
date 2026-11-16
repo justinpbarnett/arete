@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from arete import config, mergecheck, paths, pipeline, record, runner, scratch, util, verify
+from arete import config, mergecheck, paths, pipeline, record, runner, sandbox, scratch, util, verify
 
 from tests import support
 
@@ -45,7 +45,7 @@ class MergeCheckEvidenceTests(unittest.TestCase):
                 steps = [mergecheck.Step("landed", 1, "New feature", "Use feature", 1),
                          mergecheck.Step("earlier", 2, "Neighbour", "Use neighbour", 2, neighbour=True)]
                 planned = mergecheck.Plan(repo, layer, [item], steps, "main", root / "worktree")
-                failure = (scratch.ConfinementUnavailable("fixture confinement unavailable") if infrastructure
+                failure = (sandbox.ConfinementUnavailable("fixture confinement unavailable") if infrastructure
                            else verify.ServerError("fixture product crashed PRIVATE_START_LOG"))
                 patches = [mock.patch.object(paths, "RUNS_DIR", root / "runs"),
                            mock.patch.object(mergecheck, "loop_dir", return_value=root / "loop"),

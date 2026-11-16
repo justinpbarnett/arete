@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from arete import config, gh, outbound, paths, pi, pipeline, scratch, verify
+from arete import browser, config, gh, outbound, paths, pipeline, sandbox, scratch, verify, workspace
 
 from tests import support
 
@@ -141,7 +141,7 @@ class AuthorityScopeTests(unittest.TestCase):
         if scratch.filesystem(os.open(self.root, os.O_RDONLY)) != "apfs":
             self.skipTest("needs APFS")
         (self.root / "home").mkdir()
-        for patch in (mock.patch.object(scratch, "AUTHORITY", self.root / "home/verification-authority"),
+        for patch in (mock.patch.object(sandbox, "AUTHORITY", self.root / "home/verification-authority"),
                       mock.patch.object(scratch, "holders", return_value=[])):
             patch.start()
             self.addCleanup(patch.stop)
@@ -171,7 +171,7 @@ class AuthorityScopeTests(unittest.TestCase):
         self.scratch.end(a, Path(a.run_dir))
 
     def file(self, a):
-        return self.scratch.AUTHORITY / (a.selector + ".json")
+        return sandbox.AUTHORITY / (a.selector + ".json")
 
     def sign(self, a, key, change=lambda data: None):
         envelope = json.loads(self.file(a).read_bytes())
@@ -180,7 +180,7 @@ class AuthorityScopeTests(unittest.TestCase):
         self.file(a).write_bytes(self.scratch.encoded(envelope))
 
     def key(self, name="signing.secret"):
-        return (self.scratch.AUTHORITY / name).read_bytes()
+        return (sandbox.AUTHORITY / name).read_bytes()
 
     def test_other_version_holds_only_its_workspace(self):
         a = self.attempt()
@@ -210,19 +210,19 @@ class AuthorityScopeTests(unittest.TestCase):
                              "attempt": {"selector": "x", "workspace": str(self.ws), "root": str(self.ws / ".gone")}},
                     "signature": "0"}
         self.finish(self.attempt(self.other))
-        (self.scratch.AUTHORITY / "x.json").write_bytes(self.scratch.encoded(envelope))
+        (sandbox.AUTHORITY / "x.json").write_bytes(self.scratch.encoded(envelope))
         self.assertTrue(self.scratch.pending(self.ws))
         self.assertFalse(self.scratch.pending(self.other))
 
     def test_lost_signing_secret_scopes_holds(self):
         self.finish(self.attempt())
         self.attempt()
-        (self.scratch.AUTHORITY / "signing.secret").unlink()
+        (sandbox.AUTHORITY / "signing.secret").unlink()
         with self.assertRaises(PermissionError) as raised:
             self.attempt(self.other)
-        self.assertIn(str(self.scratch.AUTHORITY), str(raised.exception))
+        self.assertIn(str(sandbox.AUTHORITY), str(raised.exception))
         self.assertIn("2 records", str(raised.exception))
-        self.assertFalse((self.scratch.AUTHORITY / "signing.secret").exists())
+        self.assertFalse((sandbox.AUTHORITY / "signing.secret").exists())
         self.assertFalse(self.scratch.pending(self.other))
         self.assertTrue(self.scratch.pending(self.ws))
 
@@ -230,8 +230,8 @@ class AuthorityScopeTests(unittest.TestCase):
         self.finish(self.attempt())
         b = self.attempt(self.other)
         following = secrets.token_bytes(32)
-        (self.scratch.AUTHORITY / "signing.secret.next").write_bytes(following)
-        (self.scratch.AUTHORITY / "signing.secret.next").chmod(0o600)
+        (sandbox.AUTHORITY / "signing.secret.next").write_bytes(following)
+        (sandbox.AUTHORITY / "signing.secret.next").chmod(0o600)
         self.sign(b, following)
         self.assertFalse(self.scratch.pending(self.ws))
         self.assertTrue(self.scratch.pending(self.other))
@@ -241,7 +241,7 @@ class AuthorityScopeTests(unittest.TestCase):
 
     def test_store_on_host_that_cannot_confine(self):
         a = self.attempt()
-        with mock.patch.object(pi, "can_confine", return_value=False):
+        with mock.patch.object(sandbox, "can_confine", return_value=False):
             self.assertFalse(self.scratch.pending(self.other))
             self.assertTrue(self.scratch.pending(self.ws))
             self.assertIn(Path(a.root).name, self.scratch.root_names())
@@ -268,13 +268,13 @@ class AuthorityScopeTests(unittest.TestCase):
         old = time.time() - 7200
         for a in (*done, locked, kept):
             os.utime(self.file(a), (old, old))
-        holder = os.open(self.scratch.AUTHORITY / (locked.selector + ".lease"), os.O_RDWR)
+        holder = os.open(sandbox.AUTHORITY / (locked.selector + ".lease"), os.O_RDWR)
         try:
             fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.assertEqual(self.scratch.settle(30), [])
         finally:
             os.close(holder)
-        settled = self.scratch.AUTHORITY / "settled"
+        settled = sandbox.AUTHORITY / "settled"
         self.assertEqual(sorted(p.name for p in settled.iterdir()), sorted(a.selector + ".json" for a in done))
         self.assertTrue(self.file(locked).exists() and self.file(kept).exists())
         self.assertEqual({r["attempt"]["selector"] for r in self.scratch.records()}, {locked.selector, kept.selector})
@@ -283,17 +283,17 @@ class AuthorityScopeTests(unittest.TestCase):
         sentinel = self.root / "sentinel"
         sentinel.mkdir()
         (sentinel / "keep.txt").write_text("keep")
-        evidence = self.scratch.AUTHORITY / expired.selector
+        evidence = sandbox.AUTHORITY / expired.selector
         self.assertTrue(any(p.stat().st_mode & 0o777 == 0o500 for p in evidence.rglob("*") if p.is_dir()))
         os.symlink(sentinel, evidence / "link")
         long_ago = time.time() - 31 * 86400
         os.utime(settled / (expired.selector + ".json"), (long_ago, long_ago))
         self.assertEqual(self.scratch.settle(30), [])
         self.assertFalse((settled / (expired.selector + ".json")).exists())
-        self.assertFalse(evidence.exists() or (self.scratch.AUTHORITY / (expired.selector + ".lease")).exists())
+        self.assertFalse(evidence.exists() or (sandbox.AUTHORITY / (expired.selector + ".lease")).exists())
         self.assertEqual((sentinel / "keep.txt").read_text(), "keep")
         self.assertTrue((settled / (done[1].selector + ".json")).exists())
-        self.assertTrue((self.scratch.AUTHORITY / done[1].selector).exists())
+        self.assertTrue((sandbox.AUTHORITY / done[1].selector).exists())
 
 
 @unittest.skipUnless(sys.platform == "darwin" and os.access("/usr/bin/sandbox-exec", os.X_OK) and os.getuid() != 0,
@@ -313,7 +313,7 @@ class VerificationOutputTests(unittest.TestCase):
         if scratch.filesystem(os.open(self.root, os.O_RDONLY)) != "apfs":
             self.skipTest("needs APFS")
         (self.root / "home").mkdir()
-        for patch in (mock.patch.object(scratch, "AUTHORITY", self.root / "home/verification-authority"),
+        for patch in (mock.patch.object(sandbox, "AUTHORITY", self.root / "home/verification-authority"),
                       mock.patch.object(scratch, "holders", return_value=[])):
             patch.start()
             self.addCleanup(patch.stop)
@@ -357,7 +357,7 @@ class VerificationOutputTests(unittest.TestCase):
         self.assertEqual(self.scratch.end(a, Path(a.run_dir))[2], [])
         data = self.record(a)
         self.assertEqual((data["state"], data["diagnostic"]), ("done", ""))
-        tree = self.scratch.AUTHORITY / a.selector / data["final_tree"]
+        tree = sandbox.AUTHORITY / a.selector / data["final_tree"]
         for name in ("config/predictions.jsonl", "fixture-a/nested/case.json", "out/scenario-1/result.json"):
             self.assertTrue((tree / name).exists())
         self.assertTrue((tree / "fixture-a/link-to-file").is_symlink())
@@ -365,7 +365,7 @@ class VerificationOutputTests(unittest.TestCase):
         self.assertEqual((self.ws / "owner.txt").read_text(), "owner data\n")
         self.assertEqual((self.ws / "owner-dir/kept.txt").read_text(), "kept\n")
         self.assertFalse(self.scratch.pending(self.ws))
-        self.assertEqual(pipeline.scratch_left(self.ws, []), [])
+        self.assertEqual(workspace.scratch_left(self.ws, []), [])
         self.attempt()
 
     def test_look_alike_is_free_and_a_folder_made_again_at_the_recorded_root_is_held(self):
@@ -377,9 +377,9 @@ class VerificationOutputTests(unittest.TestCase):
         look.mkdir(mode=0o700)
         (look / ".gitignore").write_text("*\n")
         self.assertTrue(paths.valid_scratch(str(look)))
-        self.assertEqual(pipeline.scratch_left(self.ws, []), [])
+        self.assertEqual(workspace.scratch_left(self.ws, []), [])
         Path(a.root).mkdir(mode=0o700)
-        self.assertEqual(pipeline.scratch_left(self.ws, []), [Path(a.root)])
+        self.assertEqual(workspace.scratch_left(self.ws, []), [Path(a.root)])
 
     def retained(self, a, name):
         self.assertEqual(self.scratch.end(a, Path(a.run_dir))[2], [a.root])
@@ -394,7 +394,7 @@ class VerificationOutputTests(unittest.TestCase):
         self.assertEqual(diagnostic["unknown_entries"], ["owner.txt"])
         self.assertEqual(diagnostic["reasons"]["owner.txt"], self.scratch.EXISTED)
         self.assertEqual((Path(a.root) / "owner.txt").read_text(), "owner data\n")
-        self.assertTrue(pipeline.scratch_left(self.ws, []))
+        self.assertTrue(workspace.scratch_left(self.ws, []))
         with self.assertRaises(OSError) as raised:
             self.attempt()
         self.assertEqual(raised.exception.errno, 16)
@@ -443,7 +443,7 @@ class VerificationOutputTests(unittest.TestCase):
         self.assertIn(a.root, out.getvalue())
         data = self.record(a)
         self.assertEqual(data["state"], "done")
-        self.assertTrue((self.scratch.AUTHORITY / a.selector / data["final_tree"] / "fixture-a/case.json").exists())
+        self.assertTrue((sandbox.AUTHORITY / a.selector / data["final_tree"] / "fixture-a/case.json").exists())
 
     def test_unclassifiable_filesystem_is_retained(self):
         a = self.attempt()
@@ -517,7 +517,7 @@ class EvidenceLinkTests(unittest.TestCase):
             self.assertEqual(verify.push_evidence(self.root, "o/r", "run", [self.evidence / "leak.png"]), {})
 
     def test_the_claude_browser_config_keeps_chromes_own_sandbox(self):
-        config_text = verify.mcp_config(self.evidence)
+        config_text = browser.mcp_config(self.evidence)
         self.assertNotIn("--no-sandbox", config_text)
         self.assertIn("npx", config_text)
         self.assertNotIn("browser_evaluate", verify.PLAYWRIGHT_TOOLS)

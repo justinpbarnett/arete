@@ -3,9 +3,9 @@ import contextlib, io, json, os, signal, subprocess, sys, time
 from datetime import timedelta
 from pathlib import Path
 from unittest import mock
-from arete import cli, config, control, loop_run, loops, paths, record, scratch, serve, state, util
+from arete import cli, config, control, loop_run, loops, paths, record, sandbox, scratch, serve, state, util
 root, mode = Path(sys.argv[1]), sys.argv[2]
-scratch.AUTHORITY = root / "authority-parent/verification-authority"
+sandbox.AUTHORITY = root / "authority-parent/verification-authority"
 paths.ensure_dirs()
 state.migrate()
 paths.CONFIG_FILE.write_text('[jev]\nenabled = false\n')

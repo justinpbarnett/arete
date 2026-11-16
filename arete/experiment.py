@@ -15,7 +15,24 @@ from pathlib import Path
 from statistics import NormalDist
 from typing import TextIO
 
-from . import config, evals, paths, pipeline, prices, record, replay, run_lines, runner, state, steps, util
+from . import (
+    config,
+    evals,
+    paths,
+    pipeline,
+    prices,
+    record,
+    replay,
+    routing,
+    run_lines,
+    runner,
+    slots,
+    state,
+    steps,
+    util,
+    workspace,
+)
+from .agent import traits_of
 from .diffguard import denied_paths
 from .util import engine_commit
 
@@ -270,7 +287,7 @@ def fingerprints(repo: config.Repo, layer: config.RepoLayer, prompts_dir: Path =
     expertise = layer.expertise_file.read_bytes() if layer.expertise_file.exists() else b""
     return {"prompt": sha(*[(prompts_dir / f"{n}.md").read_bytes() for n in evals.BUILDER_PROMPTS]),
             "context": sha(*harness, expertise),
-            "tools": sha_json([layer.builder_bash, layer.checks, denied_paths(layer), runner.NO_GIT_WRITES])}
+            "tools": sha_json([layer.builder_bash, layer.checks, denied_paths(layer), routing.NO_GIT_WRITES])}
 
 
 def mcp_definitions(cfg: config.Config, s: steps.Settings) -> str:
@@ -288,11 +305,11 @@ def effective(cfg: config.Config, s: steps.Settings) -> str:
 
 
 def codex_route(label: str, s: steps.Settings, limits: dict) -> list[str]:
-    which = runner.stands_for(s.model, s.runner)[0]
-    if which not in runner.CANNOT_STOP:
+    which = routing.stands_for(s.model, s.runner)[0]
+    if not (why := traits_of(which).cannot_stop):
         return []
     if HEADROOM not in limits:
-        raise Refused(f"{label}: {runner.CANNOT_STOP[which]}")
+        raise Refused(f"{label}: {why}")
     return [f"{label} ({which} {s.model})"]
 
 
@@ -303,8 +320,8 @@ def unstoppable(cfg: config.Config, atom: str, arms: dict, frozen: dict, grader:
     routes = []
     for label, (s, role) in held.items():
         routes += codex_route(label, s, limits)
-        which = runner.chosen(s.model, s.runner, cfg)[0]
-        if role in ("plan", "grade") and (why := runner.CANNOT_GATE.get(which)):
+        which = routing.chosen(s.model, s.runner, cfg)[0]
+        if role in ("plan", "grade") and (why := traits_of(which).cannot_gate):
             raise Refused(f"{label}: {why}")
     return routes
 
@@ -660,7 +677,7 @@ class TrialRun(evals.EvalRun):
 
     def stop(self, why: str):
         self.stopped_by = why
-        raise pipeline.RunFailed(why)
+        raise workspace.RunFailed(why)
 
     def write_line(self, event: str, **fields) -> None:
         if event == "step_start":
@@ -736,20 +753,20 @@ def replay_folder(exp: Experiment, task: str, arm: str, repeat: int):
 def slot_reason(exp: Experiment, free: int, passed: list[dict]) -> str:
     if passed:
         return f"{util.count(len(passed), 'ready ticket')} {'waits' if len(passed) == 1 else 'wait'} for one"
-    return pipeline.no_free_slot(exp.cfg.max_parallel) if free <= 0 else ""
+    return slots.no_free_slot(exp.cfg.max_parallel) if free <= 0 else ""
 
 
 def take_slot(exp: Experiment, path: Path, waiting: dict, used: Totals) -> tuple[str, TextIO, str, float]:
     tag = f"{exp.name}-{waiting['task']}-{waiting['arm']}-{waiting['repeat']}"
     began, noted, since, told = time.monotonic(), time.monotonic(), "", ""
     while True:
-        with util.lock(pipeline.SLOTS_LOCK, wait=True):
-            free = pipeline.slots_free_to_start(pipeline.live_max_parallel(exp.cfg.max_parallel))
+        with slots.admitting():
+            free = slots.slots_free_to_start(slots.live_max_parallel(exp.cfg.max_parallel))
             passed = state.tickets_passed_over()
             if free > 0 and not passed:
                 run_id = record.start("experiment", tag=tag, lock=state.run_lock("experiment", exp.repo.name),
                                       repo=exp.repo.name)
-                held = util.hold_lock(state.run_lock("slot", exp.repo.name, None))
+                held = slots.hold(exp.repo.name, None)
                 if since:
                     append(path, {**waiting, "seconds": round(time.monotonic() - noted, 2), "at": util.iso()})
                 return run_id, held, since, time.monotonic() - began
@@ -761,7 +778,7 @@ def take_slot(exp: Experiment, path: Path, waiting: dict, used: Totals) -> tuple
             raise Capped(timed_out(exp.limits, used))
         since = since or util.iso()
         try:
-            time.sleep(min(pipeline.SLOT_POLL_SECONDS, ALIVE_SECONDS, left))
+            time.sleep(min(slots.SLOT_POLL_SECONDS, ALIVE_SECONDS, left))
         finally:
             append(path, {**waiting, "seconds": round(time.monotonic() - noted, 2), "at": util.iso()})
             noted = time.monotonic()

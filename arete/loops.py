@@ -9,7 +9,8 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 
-from . import config, cron, devices, paths, runner, state, util
+from . import config, cron, devices, paths, refusals, runner, state, util
+from .agent import EDIT_TOOLS, READ_ONLY_TOOLS, READ_TOOLS
 
 BUNDLED_LOOPS_DIR = paths.PACKAGE_DIR / "loops"
 SWITCHES_FILE = paths.CONFIG_DIR / "loop-switches.json"
@@ -80,7 +81,7 @@ class Loop:
     script: list[str] = field(default_factory=list)
     model: str = ""
     runner: str = ""
-    tools: list[str] = field(default_factory=lambda: list(runner.READ_TOOLS))
+    tools: list[str] = field(default_factory=lambda: list(READ_TOOLS))
     device: str = "local"
     timeout_minutes: float = 30
     budget_usd: float | None = None
@@ -143,7 +144,7 @@ class Loop:
         if self.classify:
             calls.append((self.classify.get("model") or cfg.model("classify"), []))
         repo = self.routing_repo(cfg)
-        return [routing.outlook(cfg, repo, self.device, model, self.runner, tools, runner.NO_GIT_WRITES, left, connect)
+        return [routing.outlook(cfg, repo, self.device, model, self.runner, tools, routing.NO_GIT_WRITES, left, connect)
                 for model, tools in calls]
 
     def meters_spend(self, cfg: config.Config) -> bool:
@@ -192,6 +193,7 @@ class Kind:
     agent: bool = True
     worktree: bool = False
     run: Callable[..., tuple[str, str]] | None = None
+    check: Callable[[Loop], list[str]] | None = None
 
     def problems(self, loop: Loop, remote: bool) -> list[str]:
         problems = []
@@ -210,13 +212,27 @@ class Kind:
             if not loop.repo:
                 problems.append(f"a {self.name} loop needs [run] repo, a repo name from the config or a path to a git "
                                 "repo")
+        if self.check:
+            problems += self.check(loop)
         return problems
+
+
+def proof_problems(loop: Loop) -> list[str]:
+    if "proof" not in loop.spec:
+        return []
+    name, problems = loop.spec["proof"], []
+    if not isinstance(name, str) or blank(name) or Path(name).is_absolute() or ".." in Path(name).parts:
+        problems.append('[search] proof must name a file in the scratch folder, such as "repro.py"')
+    if not any(e.get("type") == "push" for e in loop.emits):
+        problems.append("[search] proof is checked before a push lands, so the loop needs a push emit")
+    return problems
 
 
 KINDS = {kind.name: kind for kind in (
     Kind("command", table="run", needs="command", agent=False),
     Kind("watch"),
-    Kind("search", table="search", needs="check", needs_hint="a command that exits 0 on a hit", worktree=True),
+    Kind("search", table="search", needs="check", needs_hint="a command that exits 0 on a hit", worktree=True,
+         check=proof_problems),
 )}
 
 
@@ -240,7 +256,7 @@ def github_remote(path: Path) -> str:
     return m.group(1) if m else ""
 
 
-class LoopError(ValueError):
+class LoopError(refusals.Invalid, ValueError):
     pass
 
 
@@ -322,7 +338,7 @@ def load(folder: Path, origin: str, repo: str, cfg: config.Config) -> Loop:
         script=as_argv(run.get("script")),
         model=str(run.get("model", "")),
         runner=str(run.get("runner", "")),
-        tools=list(run.get("tools", runner.EDIT_TOOLS if known and known.worktree else runner.READ_TOOLS)),
+        tools=list(run.get("tools", EDIT_TOOLS if known and known.worktree else READ_TOOLS)),
         device=str(run.get("device", "local")),
         timeout_minutes=float(run.get("timeout_minutes", 30)),
         budget_usd=float(run["budget_usd"]) if run.get("budget_usd") else None,
@@ -356,15 +372,6 @@ def as_list(value) -> list[str]:
     if not value:
         return []
     return [value] if isinstance(value, str) else [str(v) for v in value]
-
-
-def proof_problems(loop: Loop) -> list[str]:
-    name, problems = loop.spec["proof"], []
-    if not isinstance(name, str) or blank(name) or Path(name).is_absolute() or ".." in Path(name).parts:
-        problems.append('[search] proof must name a file in the scratch folder, such as "repro.py"')
-    if not any(e.get("type") == "push" for e in loop.emits):
-        problems.append("[search] proof is checked before a push lands, so the loop needs a push emit")
-    return problems
 
 
 def tightest_limit(loop: Loop, cfg: config.Config, spent_this_run: float = 0.0) -> tuple[str, float] | None:
@@ -421,24 +428,22 @@ def validate(loop: Loop, cfg: config.Config) -> None:
         problems.append(f"[trigger] trust '{loop.trigger.trust}' is not one of {', '.join(TRUST_ORDER)}")
     if kind:
         problems += kind.problems(loop, device.remote)
-    if loop.kind == "search" and "proof" in loop.spec:
-        problems += proof_problems(loop)
     problems += runner.agent_problems(loop.runner, loop.tools)
     problems += [device_problem] if device_problem else []
     if loop.agent and not cfg.replay.all:
-        which, name = runner.route(loop.model_for(cfg), loop.runner)
-        asked = runner.request_for(cfg, loop.routing_repo(cfg), which, name, None, True,
-                                   {"tools": loop.tools, "disallowed_tools": runner.NO_GIT_WRITES})
+        which, name = routing.route(loop.model_for(cfg), loop.runner)
+        asked = routing.request_for(cfg, loop.routing_repo(cfg), which, name, None, True,
+                                    {"tools": loop.tools, "disallowed_tools": routing.NO_GIT_WRITES})
         if refusal := routing.fit_refusal(asked, device, routing.modes_for(cfg, loop.routing_repo(cfg))):
             problems.append(refusal)
     if loop.agent:
-        problems += [f"{reason}, so a loop run by {runner.route(loop.model_for(cfg), loop.runner)[0]} cannot have {', '.join(tools)}"
-                     for reason, tools in runner.withheld(loop.model_for(cfg), loop.runner, loop.tools, device).items()]
-    if loop.agent and loop.fed_by_events and (acting := sorted(set(loop.tools) - runner.READ_ONLY_TOOLS)):
+        problems += [f"{reason}, so a loop run by {routing.route(loop.model_for(cfg), loop.runner)[0]} cannot have {', '.join(tools)}"
+                     for reason, tools in routing.withheld(loop.model_for(cfg), loop.runner, loop.tools, device).items()]
+    if loop.agent and loop.fed_by_events and (acting := sorted(set(loop.tools) - READ_ONLY_TOOLS)):
         problems.append(f"quarantine: a loop fed by events or a webhook reads untrusted text, so it cannot have "
                         f"the acting tools {', '.join(acting)}; emit a ticket and let the pipeline act")
     elif (loop.agent and loop.takes_findings and trust_rank(loop.trigger.trust) < trust_rank("internal")
-          and (acting := sorted(set(loop.tools) - runner.READ_ONLY_TOOLS))):
+          and (acting := sorted(set(loop.tools) - READ_ONLY_TOOLS))):
         problems.append(f"a loop that takes findings from other loops and has the acting tools {', '.join(acting)} "
                         f"needs [trigger] trust = \"internal\" or above, so a finding from untrusted text never "
                         f"reaches it")

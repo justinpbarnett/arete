@@ -5,8 +5,24 @@ import math
 import tempfile
 import threading
 
-from . import board, config, control, gh, paths, pipeline, record, routing, runner, sessions, settings, state, util
-from .agent import Result
+from . import (
+    board,
+    config,
+    control,
+    gh,
+    paths,
+    pipeline,
+    record,
+    refusals,
+    routing,
+    runner,
+    sessions,
+    settings,
+    slots,
+    state,
+    util,
+)
+from .agent import READ_TOOLS, Result
 
 CONTEXT_FILE = paths.RUNS_DIR / "chat" / "context" / "dashboard.json"
 BUDGET_USD = 2
@@ -40,19 +56,19 @@ starting = threading.Lock()
 replying: dict[int, float] = {}
 
 
-class Busy(RuntimeError):
+class Busy(refusals.Conflict, RuntimeError):
     pass
 
 
-class NoDraft(RuntimeError):
+class NoDraft(refusals.Conflict, RuntimeError):
     pass
 
 
-class NoChat(LookupError):
+class NoChat(refusals.NotFound, LookupError):
     pass
 
 
-class BadProject(ValueError):
+class BadProject(refusals.Invalid, ValueError):
     pass
 
 
@@ -84,8 +100,8 @@ def view(chat_id: int) -> dict:
     except config.UnknownRepo:
         repo = None
     return {**summary(row), "folder": folder(row["project"]), "draft": draft_of(row, cfg),
-            "metered": runner.metered(cfg.model("chat"), cfg=cfg, repo=repo,
-                                     tools=[*runner.READ_TOOLS, "Bash"]) if repo else None,
+            "metered": routing.metered(cfg.model("chat"), cfg=cfg, repo=repo,
+                                       tools=[*READ_TOOLS, "Bash"]) if repo else None,
             "summary": row["summary"], "messages": state.chat_messages(chat_id),
             "sessions": sessions_of(chat_id)}
 
@@ -398,8 +414,8 @@ def refuse_session(chat_id: int, name: str, budget_usd: float | None, cfg: confi
     if now["running"] >= cfg.chat.max_sessions:
         raise control.Refused(f"chat {chat_id} already has {util.count(now['running'], 'session')} running "
                               f"([chat] max_sessions {cfg.chat.max_sessions}); wait for one to end or stop one")
-    if pipeline.slots_free_to_start(cfg.max_parallel) <= 0:
-        raise control.Refused(pipeline.no_free_slot(cfg.max_parallel))
+    if slots.slots_free_to_start(cfg.max_parallel) <= 0:
+        raise control.Refused(slots.no_free_slot(cfg.max_parallel))
     if now["left"] <= 0:
         raise control.Refused(f"chat {chat_id} has no budget left (${now['left']:.2f} of [chat] budget_usd "
                               f"{cfg.chat.budget_usd:g})")
@@ -410,7 +426,7 @@ def refuse_session(chat_id: int, name: str, budget_usd: float | None, cfg: confi
 
 def start_session(chat_id: int, prompt: str, *, repo: str | None = None, device: str = "", model: str = "",
                   runner: str = "", budget_usd: float | None = None) -> dict:
-    with starting, util.lock(pipeline.SLOTS_LOCK, wait=True):
+    with starting, slots.admitting():
         row = chat_row(chat_id)
         cfg = config.load()
         name = session_repo_name(chat_id, repo)
@@ -498,8 +514,8 @@ def ask(chat_id: int, prompt: str, project: str, cfg: config.Config, budget_usd:
         cfg=cfg,
         repo=work,
         model=model,
-        tools=[*runner.READ_TOOLS, "Bash"],
-        allowed_tools=[*runner.READ_TOOLS, "Bash(arete status*)", "Bash(arete events*)", "Bash(git log*)",
+        tools=[*READ_TOOLS, "Bash"],
+        allowed_tools=[*READ_TOOLS, "Bash(arete status*)", "Bash(arete events*)", "Bash(git log*)",
                        "Bash(arete record*)", "Bash(arete lines*)",
                        "Bash(git show*)", *reads_issues, *session_rules(chat_id)],
         json_schema=REPLY_SCHEMA,

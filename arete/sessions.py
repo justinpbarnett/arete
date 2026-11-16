@@ -5,7 +5,6 @@ import json
 import os
 import posixpath
 import shlex
-import signal
 import tempfile
 import time
 from dataclasses import asdict, dataclass, field
@@ -31,7 +30,7 @@ from . import (
     util,
     vault,
 )
-from .agent import NO_SESSION, Session
+from .agent import EDIT_TOOLS, NO_SESSION, Session
 
 TOKEN_HELPER = ('!f() { test "$1" = get || return 0; p= h=; while IFS= read -r line && test -n "$line"; do '
                 'case $line in protocol=*) p=${line#*=} ;; host=*) h=${line#*=} ;; esac; done; '
@@ -44,7 +43,7 @@ GIT_WITH_TOKEN = ('ARETE_GIT_TOKEN="$arete_token" GIT_ALLOW_PROTOCOL=https GIT_T
 CLONE_SECONDS = 900
 
 SESSIONS_DIR = paths.STATE_DIR / "sessions"
-SESSION_TOOLS = [*runner.EDIT_TOOLS, "Bash"]
+SESSION_TOOLS = [*EDIT_TOOLS, "Bash"]
 TURN_TIMEOUT_SECONDS = 3600
 INBOX_POLL_SECONDS = 2
 SESSION_LOG = "sessions.log"
@@ -98,10 +97,6 @@ class Spec:
     turn_error: str = ""
     publish_error: str = ""
     chat: int = 0
-
-
-class SessionStopped(Exception):
-    pass
 
 
 def spec_file(session_id: str) -> Path:
@@ -223,11 +218,11 @@ def launch(prompt: str, *, device: str = "local", model: str = "", run_with: str
     work_repo = repo_named(repo, target, cfg)
     if draft_pr and work_repo and not work_repo.github:
         raise control.Refused(f"repo {work_repo.name} has no github setting, so arete cannot open a PR for it")
-    which, name = runner.route(model, run_with)
-    off = runner.withheld(model, run_with, tools, target)
+    which, name = routing.route(model, run_with)
+    off = routing.withheld(model, run_with, tools, target)
     tools = [t for t in tools if not any(t in withheld for withheld in off.values())]
-    asked = runner.request_for(cfg, work_repo, which, name, None, True,
-                               {"tools": tools, "disallowed_tools": runner.NO_GIT_WRITES})
+    asked = routing.request_for(cfg, work_repo, which, name, None, True,
+                                {"tools": tools, "disallowed_tools": routing.NO_GIT_WRITES})
     if (refusal := "" if cfg.replay.all else routing.fit_refusal(asked, target, routing.modes_for(cfg, work_repo))):
         raise control.Refused(refusal)
     spec = Spec(record.new_id("ses"), prompt, target.name, model, run_with, tools, work_repo.name if work_repo else "",
@@ -277,10 +272,6 @@ def write_log(spec: Spec, kind: str, text: str) -> None:
         out.write(f"{util.iso()} [{kind}] {text}\n")
 
 
-def stop_on_term(*_) -> None:
-    raise SessionStopped
-
-
 def session_lock(session_id: str) -> str:
     return f"session-{session_id}"
 
@@ -290,7 +281,7 @@ def turn_arguments(spec: Spec, cfg: config.Config, device: devices.Device) -> di
         return spec.budget_usd - record.metered_spent(spec.id) if spec.budget_usd else None
 
     return {"model": spec.model, "runner": spec.runner, "cfg": cfg, "device": device, "tools": spec.tools,
-            "allowed_tools": spec.tools, "disallowed_tools": runner.NO_GIT_WRITES, "remaining_budget": remaining_budget,
+            "allowed_tools": spec.tools, "disallowed_tools": routing.NO_GIT_WRITES, "remaining_budget": remaining_budget,
             "hard_cap": bool(spec.chat), "timeout": TURN_TIMEOUT_SECONDS, "say": lambda text: log_line(spec, "wait", text),
             "repo": session_repo(spec, cfg)}
 
@@ -624,6 +615,40 @@ def conclude_task(spec: Spec, cfg: config.Config, answer: dict | None, error: st
     return "done", "reported: " + util.first_line(report["summary"], 200)
 
 
+def run_conversation(spec: Spec, cfg: config.Config, device: devices.Device) -> tuple[str, str]:
+    status, summary = "done", ""
+    if spec.github:
+        clone_repo(spec, cfg, device)
+    resume, turn, prompt, asked = NO_SESSION, 0, spec.prompt, None
+    idle_since = time.monotonic()
+    try:
+        while True:
+            if prompt:
+                turn += 1
+                resume = take_turn(spec, cfg, device, prompt, turn, resume)
+                if spec.github:
+                    return_work(spec, cfg, device, f"arete session {spec.id}, turn {turn}")
+                idle_since = time.monotonic()
+            prompt = "\n\n".join(state.take_messages(spec.id))
+            if prompt:
+                continue
+            if spec.task:
+                asked = publish_then_ask_report(spec, cfg, device, turn + 1, resume)
+                break
+            if time.monotonic() - idle_since > cfg.session_idle_hours * 3600:
+                summary = f"closed after {cfg.session_idle_hours:g}h with no message"
+                break
+            time.sleep(INBOX_POLL_SECONDS)
+    finally:
+        if spec.github and spec.cloned:
+            return_work(spec, cfg, device, f"arete session {spec.id}, last changes", last=True)
+    if asked:
+        status, summary = conclude_task(spec, cfg, *asked)
+    if spec.unreturned:
+        status, summary = "failed", "the session's work did not come back from the device"
+    return status, summary
+
+
 def execute(session_id: str) -> str:
     spec = load_spec(session_id)
     cfg = config.load()
@@ -633,50 +658,15 @@ def execute(session_id: str) -> str:
         if (ended := (state.run_get(session_id) or {}).get("status", "gone")) != "running":
             return ended
         record.note(session_id, pid=os.getpid(), engine_sha=codebase.STAMP, schema_version=state.LATEST)
-        signal.signal(signal.SIGTERM, stop_on_term)
-        status, summary = "done", ""
         try:
-            with devices.lease(spec.device, spec.id, lambda text: log_line(spec, "device", text),
-                               lambda: unreturned_reason(spec)) as device:
-                if spec.github:
-                    clone_repo(spec, cfg, device)
-                resume, turn, prompt, asked = NO_SESSION, 0, spec.prompt, None
-                idle_since = time.monotonic()
-                try:
-                    while True:
-                        if prompt:
-                            turn += 1
-                            resume = take_turn(spec, cfg, device, prompt, turn, resume)
-                            if spec.github:
-                                return_work(spec, cfg, device, f"arete session {spec.id}, turn {turn}")
-                            idle_since = time.monotonic()
-                        prompt = "\n\n".join(state.take_messages(session_id))
-                        if prompt:
-                            continue
-                        if spec.task:
-                            asked = publish_then_ask_report(spec, cfg, device, turn + 1, resume)
-                            break
-                        if time.monotonic() - idle_since > cfg.session_idle_hours * 3600:
-                            summary = f"closed after {cfg.session_idle_hours:g}h with no message"
-                            break
-                        time.sleep(INBOX_POLL_SECONDS)
-                finally:
-                    if spec.github and spec.cloned:
-                        return_work(spec, cfg, device, f"arete session {spec.id}, last changes", last=True)
-                if asked:
-                    status, summary = conclude_task(spec, cfg, *asked)
-                if spec.unreturned:
-                    status, summary = "failed", "the session's work did not come back from the device"
+            with (record.stoppable(),
+                  devices.lease(spec.device, spec.id, lambda text: log_line(spec, "device", text),
+                                lambda: unreturned_reason(spec)) as device):
+                status, summary = run_conversation(spec, cfg, device)
                 if summary:
                     close(spec, status, summary)
-        except SessionStopped:
-            status, summary = "stopped", record.STOPPED if record.stop_asked(session_id) else "stopped by a signal"
-        except devices.DeviceError as e:
-            status, summary = "failed", util.one_line(str(e), 500)
         except Exception as e:
-            status, summary = "failed", f"{type(e).__name__}: {util.first_line(str(e), 300)}"
-        finally:
-            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            status, summary = devices.outcome_of(e, session_id)
         close(spec, status, devices.with_left_up(summary, session_id))
         return status
 
@@ -754,6 +744,6 @@ def choices() -> dict:
     cfg = config.load()
     fleet = devices.known()
     return {"devices": [d.name for d in fleet],
-            "repos": [r.name for r in cfg.repos], "models": known_models(cfg), "runners": list(runner.RUNNERS),
+            "repos": [r.name for r in cfg.repos], "models": known_models(cfg), "runners": list(routing.RUNNERS),
             "tools": sorted(runner.KNOWN_TOOLS), "default_tools": SESSION_TOOLS, "default_model": cfg.model("session"),
             "idle_hours": cfg.session_idle_hours}

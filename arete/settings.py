@@ -4,7 +4,7 @@ import json
 import re
 import stat
 
-from . import config, paths, util
+from . import config, paths, refusals, util
 
 PARALLEL_MAX = 8
 RUN_LIMITS = {"max_parallel": "Runs at once", "max_parallel_per_repo": "Runs per repo"}
@@ -14,7 +14,7 @@ MODEL_ID = re.compile(r"(claude:)?claude-[a-z0-9.-]+(\[1m\])?|(pi:)?[a-z0-9._-]+
 TABLE_HEADER = re.compile(r"\s*\[")
 
 
-class Refused(ValueError):
+class Refused(refusals.Invalid, ValueError):
     pass
 
 

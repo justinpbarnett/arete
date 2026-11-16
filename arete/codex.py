@@ -14,12 +14,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from . import accounts, claude, config, environment, guard, paths, uploads, util
+from . import accounts, browser, child, claude, config, environment, guard, paths, sandbox, uploads, util
 from . import scratch as verification_scratch
 from .agent import NO_SESSION, Result, Session, UsageLimit, credit_limit, json_from_text
 from .pi import SCHEMA_RULE
 
-EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
 LIMIT_SCOPE = "codex"
 LOGIN_VARS = ("CODEX_HOME",)
 NEVER = (*claude.PARENT_SESSION_VARS, "CODEX_API_KEY", "OPENAI_API_KEY")
@@ -268,10 +267,10 @@ def both(p: Path | str) -> list[str]:
 def kept_out(roots: list[Path], hidden: list[Path | str], floor: guard.Floor | None = None) -> dict[str, str]:
     floor = floor or guard.floor(os.environ.get("ARETE_RUN_ID", ""), roots[0] if roots else Path.cwd(), roots[1:])
     denied = {f"{root.rstrip('/')}/**/{name}": "deny" for r in [Path('/'), *roots, paths.HOME] for root in both(r)
-              for name in (*guard.SECRET_NAMES, *sorted(guard.SECRET_DIRS))}
-    denied |= {f"{p}/**": "deny" for p in denied if Path(p).name in guard.SECRET_DIRS}
+              for name in (*sandbox.SECRET_NAMES, *sorted(sandbox.SECRET_DIRS))}
+    denied |= {f"{p}/**": "deny" for p in denied if Path(p).name in sandbox.SECRET_DIRS}
     denied |= {path: "deny" for p in hidden for path in both(p)}
-    denied |= {str(paths.HOME / d): "deny" for d in sorted(guard.SECRET_DIRS)}
+    denied |= {str(paths.HOME / d): "deny" for d in sorted(sandbox.SECRET_DIRS)}
     denied |= {p: "deny" for d in (*floor.closed, *floor.files) for p in both(d)}
     if gh := shutil.which("gh"):
         denied |= {p: "deny" for p in both(gh)}
@@ -297,7 +296,7 @@ def executables(allowed_tools: list[str] | None, hidden: list[Path | str]) -> di
         resolved = path.resolve()
         if (not path.is_file() or not os.access(path, os.X_OK) or resolved in hidden_paths or
                 any(resolved.is_relative_to(root) for root in blocked) or
-                any(guard.secret_path(p) or p.name in ("auth.json", "config.toml") for p in (path, resolved))):
+                any(sandbox.secret_path(p) or p.name in ("auth.json", "config.toml") for p in (path, resolved))):
             continue
         granted |= {p: "read" for p in both(path)}
     return granted
@@ -317,8 +316,8 @@ def profile(cwd: Path, add_dirs: list[Path], writing: bool, hidden: list[Path | 
     if result.returncode == 0:
         metadata |= {path: "read" for p in result.stdout.splitlines() for path in both(p)}
     table = {"extends": PROFILE_BASE[name], "filesystem": {**granted, **metadata,
-             **kept_out([cwd, *add_dirs], [*hidden, verification_scratch.AUTHORITY], floor),
-             **executables(allowed_tools, [*hidden, verification_scratch.AUTHORITY])},
+             **kept_out([cwd, *add_dirs], [*hidden, sandbox.AUTHORITY], floor),
+             **executables(allowed_tools, [*hidden, sandbox.AUTHORITY])},
              "network": {"enabled": False}}
     return [*setting("default_permissions", name), "-c", f"permissions.{name}={toml_value(table)}"]
 
@@ -340,9 +339,8 @@ def owner_hooks_off() -> dict[str, dict]:
 
 
 def guard_hook(judge: bool, scratch: tuple[str, ...] = (), opened=()) -> list[str]:
-    entrypoint = f"import sys; sys.path.insert(0, {str(paths.PACKAGE_DIR.parent)!r}); from arete.cli import main; raise SystemExit(main())"
-    hook = shlex.join([sys.executable, "-I", "-c", entrypoint, "codex-guard", *(["--judge"] if judge else []),
-                       *(arg for path in opened for arg in ("--open", str(path))), *scratch])
+    hook = shlex.join(paths.cli_command("codex-guard", *(["--judge"] if judge else []),
+                                        *(arg for path in opened for arg in ("--open", str(path))), *scratch))
     entry = [{"matcher": "*", "hooks": [{"type": "command", "command": hook, "timeout": guard.HOOK_TIMEOUT_SECONDS}]}]
     off = owner_hooks_off()
     return [*setting("hooks.PreToolUse", entry), *(setting("hooks.state", off) if off else [])]
@@ -352,10 +350,10 @@ def mcp_settings(mcp_config: str, allowed_tools: list[str] | None = None) -> lis
     servers = (json.loads(mcp_config).get("mcpServers") or {}) if mcp_config else {}
     out: list[str] = []
     attempt = verification_scratch.PRODUCING.get()
-    browser = bool(servers) and attempt is not None and verification_scratch.activated(attempt)
-    if browser:
+    browser_wanted = bool(servers) and attempt is not None and verification_scratch.activated(attempt)
+    if browser_wanted:
         try:
-            expected = {"playwright": verification_scratch.browser_server(attempt)}
+            expected = {"playwright": browser.browser_server(attempt)}
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
             raise ValueError(f"browser confinement unavailable: {error}") from error
         if servers != expected:
@@ -365,10 +363,10 @@ def mcp_settings(mcp_config: str, allowed_tools: list[str] | None = None) -> lis
             continue
         table = ({"url": server["url"]} if server.get("url") else
                  {"command": server.get("command", ""), "args": list(server.get("args") or [])})
-        if browser:
+        if browser_wanted:
             table["cwd"] = server["cwd"]
         elif "command" in table:
-            confined = verification_scratch.protected_command([table["command"], *table["args"]])
+            confined = sandbox.protected_command([table["command"], *table["args"]])
             table["command"], table["args"] = confined[0], confined[1:]
         prefix = f"mcp__{name}"
         rules = set(allowed_tools or [])
@@ -487,10 +485,10 @@ def run(*args, auth: accounts.Auth | None = None, **kw) -> Result:
 def launch(cmd, cwd, prompt, env, timeout, on_line, *, hidden=(), scratch=(), add_dirs=None, mcp_config=""):
     attempt = verification_scratch.PRODUCING.get()
     protected = {Path(p).resolve() for p in hidden}
-    confined = (attempt is None or not scratch or (verification_scratch.AUTHORITY.resolve() in protected
+    confined = (attempt is None or not scratch or (sandbox.AUTHORITY.resolve() in protected
                      and paths.WORKTREES_DIR.resolve() in protected
                      and verification_scratch.isolation(attempt, "codex", False, add_dirs, mcp_config)))
-    return claude.run_streaming(cmd, str(cwd), prompt, env, timeout, on_line, actor_confined=confined)
+    return child.stream(cmd, str(cwd), prompt, env, timeout, on_line, actor_confined=confined)
 
 
 def _run(
