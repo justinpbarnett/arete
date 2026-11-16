@@ -2058,9 +2058,27 @@ def database_health():
             server.collect_db()
             expect(OSError, lambda: server.db_future.result(10))
         failed = beat()
-        require(failed["status"] == "failed" and failed["collected_at"] == completed["collected_at"]
-                and failed["total_bytes"] == completed["total_bytes"], failed)
-        require(sum(s.startswith("db ") for s in output) == 2, output)
+        require(failed["status"] == "failed" and failed["finished_at"]
+                and failed["error"] == "OSError: fixture collection failure", failed)
+        require(all(failed[key] == completed[key] for key in dbstats.empty_collection()), failed)
+        for _ in range(3):
+            require(beat() == failed, beats)
+        with mock.patch.object(server.pool, "submit", side_effect=RuntimeError("fixture submission failure")) as submit:
+            server.collect_db()
+            failed = beat()
+            require(failed["status"] == "failed" and failed["finished_at"]
+                    and failed["error"] == "RuntimeError: fixture submission failure", failed)
+            require(all(failed[key] == completed[key] for key in dbstats.empty_collection()), failed)
+            for _ in range(3):
+                require(beat() == failed, beats)
+            require(submit.call_count == 1 and server.db_future is None, submit.call_count)
+        summaries = [json.loads(s[3:]) for s in output if s.startswith("db {")]
+        require(len(summaries) == 2, output)
+        require(summaries == [{key: complete[key] for key in dbstats.empty_collection()}
+                              for complete in (first, completed)], summaries)
+        failures = [s for s in output if s.startswith("db collection failed:")]
+        require(failures == ["db collection failed: OSError: fixture collection failure",
+                             "db collection failed: RuntimeError: fixture submission failure"], output)
     finally:
         released.set()
         close_server(server)

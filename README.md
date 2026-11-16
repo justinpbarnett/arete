@@ -49,7 +49,8 @@ not identity. Retain these files as inputs for hourly aggregation.
 
 After each hourly prune attempt, serve collects database health on its existing worker pool, including when a failed
 snapshot prevents pruning. It never walks runs/ or counts tables in a beat. Each successful collection logs one
-structured `db` summary; every `serve.json` beat contains a `db` object. Collection `status` is `initial`, `pending`,
+structured summary starting with `db {`; a failed collection emits one `db collection failed: <error>` diagnostic
+and no summary. Every `serve.json` beat contains a `db` object. Collection `status` is `initial`, `pending`,
 `complete` or `failed`, with `requested_at`, `finished_at` and `error`. Uncollected metrics are null. Pending/failed
 collections retain the last successful metrics and `collected_at`.
 

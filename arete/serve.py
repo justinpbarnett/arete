@@ -423,7 +423,12 @@ class Server:
             try:
                 self.db_future = self.pool.submit(dbstats.collect)
             except Exception as e:
-                self.db_health.update(status="failed", finished_at=util.iso(), error=str(e))
+                self.fail_db(e)
+
+    def fail_db(self, error: Exception) -> None:
+        self.db_health.update(status="failed", finished_at=util.iso(),
+                              error=f"{type(error).__name__}: {util.first_line(str(error), 300)}")
+        self.say(f"db collection failed: {self.db_health['error']}")
 
     def finish_db(self) -> None:
         if self.db_future is None or not self.db_future.done():
@@ -432,9 +437,7 @@ class Server:
         try:
             values = done.result()
         except Exception as e:
-            self.db_health.update(status="failed", finished_at=util.iso(),
-                                  error=f"{type(e).__name__}: {util.first_line(str(e), 300)}")
-            self.say(f"db collection failed: {self.db_health['error']}")
+            self.fail_db(e)
         else:
             self.db_health.update(values, status="complete", finished_at=util.iso(), error=None)
             self.say("db " + json.dumps(values, sort_keys=True))
