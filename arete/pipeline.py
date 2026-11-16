@@ -1418,6 +1418,25 @@ def resolve_layer(cfg: config.Config, run: Run, ws: Path) -> config.RepoLayer:
     return checked_layer(cfg, repo.path / ".agents")
 
 
+def triage_checks(approval: dict | None) -> str:
+    checks = (approval or {}).get("checks")
+    if not isinstance(checks, list):
+        return ""
+    return "\n".join(f"{n}. {check}" for n, check in enumerate(checks, 1))
+
+
+def triage_goal(goal: str, approval: dict | None) -> str:
+    if not (checks := triage_checks(approval)):
+        return goal
+    return (f"{goal}\n\n## Triage checks\n\n{checks}\n\n"
+            "Report an explicit outcome and evidence for every triage check, including any omitted from the planner's "
+            "steps. Do not drop or weaken a check. An owner's comment starting "
+            f"\"{prompt_loader.TRIAGE_ANSWERS}\" overrides contradictory checks and assumptions. Keep the original "
+            "check identifiable, mark it superseded, and explain the replacement behavior and its evidence. "
+            "A check disputed by the plan still needs an outcome. Follow the existing blocked-result rules when a "
+            "check cannot be performed; never invent passing evidence.")
+
+
 def triage_notes(approval: dict | None) -> str:
     if not approval:
         return ""
@@ -1425,6 +1444,12 @@ def triage_notes(approval: dict | None) -> str:
     assumption_rule = ("Keep an assumption only where the ticket still leaves it open. End `plan` with an \"Assumed\" list "
                        "of every choice the ticket leaves open, these and your own, so the owner can check them in the "
                        "pull request.")
+    if checks := triage_checks(approval):
+        assumption_rule += (f"\n\n## Triage checks\n\n{checks}\n\n"
+                            "Your `verify` must cover every triage check. You may add steps, but may not drop or weaken "
+                            "a check. If the code shows a check is wrong, explain why in the plan's assumptions. "
+                            f"An owner's comment starting \"{prompt_loader.TRIAGE_ANSWERS}\" overrides contradictory "
+                            "checks and assumptions.")
     if principals.is_person(approval["sent_by"]):
         return (f"## Sent by its owner after triage\n\nIts owner sent this ticket to the pipeline from arete's triage "
                 f"board at {approval['ts']}, after reading triage's questions and assumptions. Any answers they gave are "
@@ -1438,11 +1463,15 @@ def triage_block(approval: dict | None) -> str:
     if not approval:
         return ""
     assumed = "".join(f"\n- {a}" for a in approval["assumptions"])
+    checks = triage_checks(approval)
+    checks_block = f"### Triage checks\n\n{checks}\n\n" if checks else ""
     if principals.is_person(approval["sent_by"]):
-        return (f"## Sent from the triage board\n\nIts owner sent this ticket from arete's triage board. Triage "
-                f"assumed:{assumed}\n\n") if assumed else ""
+        if not assumed and not checks:
+            return ""
+        return ("## Sent from the triage board\n\nIts owner sent this ticket from arete's triage board."
+                + (f" Triage assumed:{assumed}" if assumed else "") + "\n\n" + checks_block)
     return ("## Approved by triage\n\nArete's triage approved this ticket on its own, so check the choices it made"
-            + (f". It assumed:{assumed}" if assumed else "; the plan below lists them.") + "\n\n")
+            + (f". It assumed:{assumed}" if assumed else "; the plan below lists them.") + "\n\n" + checks_block)
 
 
 def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, str]:
@@ -1545,7 +1574,8 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
         left_for_a_person = left_section(run, (plan.get("left_for_a_person") or "").strip())
         run.save("plan.md", plan_text)
         estimate = int(plan.get("estimated_lines") or 0)
-        goal = plan.get("verify", "").strip() or "The planner gave no steps: check what the issue asks for."
+        goal = triage_goal(plan.get("verify", "").strip() or "The planner gave no steps: check what the issue asks for.",
+                           approval)
         if plan.get("ambiguous") and plan.get("question"):
             run.log("plan: ambiguous, asking the author")
             return _ask(run, ws, checkouts, f"Before I build this I need one answer:\n\n{plan['question']}\n\n"

@@ -368,6 +368,38 @@ class TrackerLabelCatchUpTests(unittest.TestCase):
         self.assertEqual((r["edits"], r["pending"], r["labels"]), (1, "", ["agent", "agent:pr"]))
 
 
+class TriageChecksWorkflowTests(unittest.TestCase):
+    def exercise(self, action):
+        script = support.SOURCE / "docs" / "triage-checks-fixture.py"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            code = "import runpy,sys;fixture=runpy.run_path(sys.argv[1]);fixture['child'](fixture['Path'](sys.argv[2]),sys.argv[3],sys.argv[4])"
+            for flow in (("adw",) if action == "patch" else ("classic", "adw")):
+                scenarios = {"approved": ("person", "automatic", "empty-plan"), "patch": ("patch",), "overrides": ("overrides",),
+                             "legacy": ("unapproved", "empty-checks", "legacy")}[action]
+                for scenario in scenarios:
+                    with self.subTest(flow=flow, scenario=scenario):
+                        folder = root / f"{flow}-{scenario}"
+                        done = run_script(code, root, str(script), str(folder), flow, scenario,
+                                          env=scratch_env(root), timeout=150)
+                        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                        evidence = json.loads((folder / "evidence.json").read_text())
+                        self.assertEqual(evidence["flow"], flow)
+                        self.assertEqual(evidence["scenario"], scenario)
+
+    def test_approved_checks_reach_both_flows_and_reports(self):
+        self.exercise("approved")
+
+    def test_owner_override_and_code_disproved_check_remain_visible(self):
+        self.exercise("overrides")
+
+    def test_tickets_without_checks_keep_their_verification(self):
+        self.exercise("legacy")
+
+    def test_patch_without_escalation_keeps_independent_triage_checks(self):
+        self.exercise("patch")
+
+
 class OfflineWorkflowTests(unittest.TestCase):
     def workflow(self, scenario):
         with tempfile.TemporaryDirectory() as directory:

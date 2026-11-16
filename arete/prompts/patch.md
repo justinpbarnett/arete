@@ -12,6 +12,8 @@ $comments
 
 $attachments
 
+$triage
+
 ## Scope
 
 This fast lane is limited to $patch_files files and $patch_lines changed lines.
