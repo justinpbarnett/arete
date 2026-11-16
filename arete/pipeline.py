@@ -931,17 +931,30 @@ class Build(TicketWork):
                               disallowed_tools=routing.NO_GIT_WRITES, fresh_prompt=primed, add_dirs=call_dirs, **kw)
 
     def check(self, *, quick: bool = False) -> bool:
-        selected = selected_checks(self.layer, self.restage().files) if quick else None
-        full = selected is None or selected == set(self.layer.checks)
-        before = factory.fingerprint(self.ws) if full else ""
-        ok, self.report = run_checks(self.layer, self.ws, self.git_dirs, self.run, self.timeout, selected=selected)
-        if ok and full:
-            after = factory.fingerprint(self.ws)
-            if before and after and before != after:
-                self.report += "\n\nChecks modified the source tree; rerun the full suite on the resulting tree."
-                return False
-            self.checked = {"tree": after, "commands": dict(self.layer.checks), "report": self.report}
-        return ok
+        previous, self.checked = self.checked, {}
+        self.report = "Checks started but did not complete; no passing result from this attempt."
+        try:
+            self.run.save("checks.md", self.report)
+            selected = selected_checks(self.layer, self.restage().files) if quick else None
+            full = selected is None or selected == set(self.layer.checks)
+            before = factory.fingerprint(self.ws)
+            ok, self.report = run_checks(self.layer, self.ws, self.git_dirs, self.run, self.timeout, selected=selected)
+            if ok:
+                after = factory.fingerprint(self.ws)
+                if before and after and before != after:
+                    self.report += "\n\nChecks modified the source tree; rerun the full suite on the resulting tree."
+                    return False
+                if full:
+                    self.checked = {"tree": after, "commands": dict(self.layer.checks), "report": self.report}
+                elif before and before == after == previous.get("tree") and previous.get("commands") == self.layer.checks:
+                    self.checked = previous
+            return ok
+        except BaseException as e:
+            self.checked = {}
+            self.report = f"Checks did not complete: {type(e).__name__}: {util.first_line(str(e), 300)}"
+            raise
+        finally:
+            self.run.save("checks.md", self.report)
 
     def restage(self, *, from_base: bool | None = None) -> Staged:
         self.staged = stage(self.checkouts, self.deny, self.from_base if from_base is None else from_base)
@@ -1588,7 +1601,6 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
               plan_text=plan_text, build_summary=build_summary)
 
     ok, attempts = b.check_with_repairs(lambda n: f"fix{n}")
-    run.save("checks.md", b.report)
     record.note(run.id, attempts=attempts)
     if not ok:
         run.story.append("Checks still failing after the last attempt.")

@@ -439,12 +439,16 @@ class Job:
                 self.fix_reply = str(data.get("reply") or "")
             if outcome.session.id:
                 run.sessions[BUILD] = outcome.session
-        elif name == "checks" and "report" in data:
-            self.b.report = data["report"]
-            if outcome.passed and data.get("full"):
+        elif name == "checks":
+            self.b.report = data.get("report", self.b.report)
+            if not outcome.passed:
+                self.b.checked = {}
+            elif "checked" in data:
+                self.b.checked = data["checked"]
+            elif data.get("full"):
                 self.b.checked = {"tree": str(data.get("checked_tree") or ""), "commands": data.get("commands", {}),
                                   "report": data["report"]}
-            if not data.get("after"):
+            if "attempts" in data and not data.get("after"):
                 self.attempts = data["attempts"]
                 if stored:
                     record.note(run.id, attempts=self.attempts)
@@ -839,7 +843,6 @@ def checks(flow: factory.Flow, tree: str, attempt: int = 1, tries: int = 1, afte
     job: Job = flow.ctx
     run, b = job.run, job.b
     ok = b.check(quick=True) if quick else b.check()
-    run.save("checks.md", b.report)
     if not after:
         record.note(run.id, attempts=attempt)
     if not ok:
@@ -848,7 +851,7 @@ def checks(flow: factory.Flow, tree: str, attempt: int = 1, tries: int = 1, afte
                              else "Checks still failing after the last attempt.")
         return Outcome("fail", next="implement", feedback=b.report,
                        data={"report": b.report, "attempts": attempt, "after": after, "story": run.story,
-                             "policy": job.policy("checks", {"quick": quick})})
+                             "policy": job.policy("checks", {"quick": quick}), "checked": b.checked})
     planned = f" (the plan estimated {job.estimate})" if job.estimate and not after else ""
     b.require_valid_diff(after or "the build and its fixes", planned)
     checked_tree = factory.fingerprint(job.ws)
@@ -856,7 +859,8 @@ def checks(flow: factory.Flow, tree: str, attempt: int = 1, tries: int = 1, afte
             and b.checked.get("report") == b.report)
     return Outcome("pass", data={"report": b.report, "attempts": attempt, "after": after, "story": run.story,
                                  "full": full, "checked_tree": checked_tree,
-                                 "commands": job.layer.checks, "policy": job.policy("checks", {"quick": quick})})
+                                 "commands": job.layer.checks, "policy": job.policy("checks", {"quick": quick}),
+                                 "checked": b.checked})
 
 
 @factory.step("verify")

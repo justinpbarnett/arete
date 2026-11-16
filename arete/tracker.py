@@ -14,7 +14,6 @@ LABEL = "agent"
 BATCH_LABEL = "agent:batch"
 BATCH_LINE = re.compile(r"Batch issues:[ \t]*(.*)")
 BATCH_REFS = re.compile(r"#[1-9][0-9]*(?:[ \t]*,[ \t]*#[1-9][0-9]*)*")
-BATCH_FENCE = re.compile(r"[ \t>]*(?:(?:[-*+]|\d+[.)])[ \t>]+)*(`{3,}|~{3,})(.*)$")
 APPROVAL_LABEL_STYLE = ("0052cc", "Approved for arete to build")
 STATE_COLORS = {"running": "fbca04", "pr": "0e8a16", "failed": "d93f0b", "needs-info": "c5def5"}
 FIX_LABELS = {"bug", "fix"}
@@ -116,37 +115,17 @@ def error_of(call: Callable[[], object]) -> str:
 def batch_ids(t: Ticket) -> list[str]:
     if BATCH_LABEL not in t.labels:
         return [t.id]
-    lines = []
-    fence = ""
-    comment = False
-    for line in t.body.splitlines():
-        mark = BATCH_FENCE.fullmatch(line)
-        if fence:
-            if mark and mark[1][0] == fence[0] and len(mark[1]) >= len(fence) and not mark[2].strip():
-                fence = ""
-            continue
-        if not comment and mark and (mark[1][0] != "`" or "`" not in mark[2]):
-            fence = mark[1]
-            continue
-        plain = not comment and "<!--" not in line
-        at = 0
-        while at < len(line):
-            token = "-->" if comment else "<!--"
-            found = line.find(token, at)
-            if found < 0:
-                break
-            comment = not comment
-            at = found + len(token)
-        if plain and (directive := BATCH_LINE.fullmatch(line)):
-            lines.append(directive[1].strip())
-    if len(lines) != 1 or not BATCH_REFS.fullmatch(lines[0]):
-        raise TaskError("a batch needs one visible plain Batch issues: line of comma-separated #numbers from this repo, "
-                        "outside code fences and HTML comments")
-    named = re.findall(r"#([0-9]+)", lines[0])
+    lines = [line for line in t.body.splitlines() if line.strip()]
+    header = BATCH_LINE.fullmatch(lines[0]) if lines else None
+    if (not header or not BATCH_REFS.fullmatch(header[1].strip())
+            or any(BATCH_LINE.fullmatch(line.lstrip()) for line in lines[1:])):
+        raise TaskError("a batch needs its only plain, unindented Batch issues: line first, before any nonblank content, "
+                        "with comma-separated #numbers from this repo; repeated directives, even in examples, are refused")
+    named = re.findall(r"#([0-9]+)", header[1])
     own = str(int(t.id))
     if own not in named or len(named) > 20:
         raise TaskError("a batch must include its own issue and name at most 20 issues")
-    return list(dict.fromkeys([own, *named]))
+    return [own, *sorted(set(named) - {own}, key=int)]
 
 
 _clients: dict[str, jira.Client] = {}

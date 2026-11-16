@@ -155,7 +155,15 @@ def keyed_comment(args: list[str], body: str, path: str, mark: bool = False, env
 
 def split_link(body: str, links) -> tuple[str, str]:
     for link in sorted(filter(None, links), key=len, reverse=True):
-        if body == link or body.startswith(f"{link}\n"):
+        if "\n" in link:
+            approved = link.split("\n")
+            if not all(re.fullmatch(r"Closes #[1-9][0-9]*", line) for line in approved):
+                continue
+            lines = body.split("\n")
+            prefix = list(itertools.takewhile(lambda line: re.fullmatch(r"Closes #[1-9][0-9]*", line), lines))
+            if len(prefix) == len(approved) and set(prefix) == set(approved):
+                return link, "\n".join(lines[len(prefix):]).lstrip("\n")
+        elif body == link or body.startswith(f"{link}\n"):
             return link, body[len(link):].lstrip("\n")
     return "", body
 
