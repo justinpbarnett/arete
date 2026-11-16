@@ -7,7 +7,7 @@ import tomllib
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from . import config, evals, experiment, implbench, paths, pipeline, record, replay, runner, steps, util
+from . import config, evals, experiment, implbench, paths, pipeline, record, replay, runner, steps, util, workspace
 from .agent import Result
 
 KINDS = ("patch", "test", "explore", "extract")
@@ -216,7 +216,7 @@ class WorkerRun(experiment.TrialRun):
         before = len(self.launches)
         try:
             res = super().agent(step, text, cwd, role, **kw)
-        except pipeline.RunFailed:
+        except workspace.RunFailed:
             if self.over and self.phase == WORKER and self.hand_off("attempt limit"):
                 self.over = False
                 return self.launched(step, text, cwd, role, kw)
@@ -237,7 +237,7 @@ class WorkerRun(experiment.TrialRun):
         launching = event == "step_start" and fields.get("atom") in ROLES
         if launching and self.in_phase() >= self.allowed():
             self.over = True
-            raise pipeline.RunFailed(f"the {self.phase} route is limited to {self.allowed()} launches")
+            raise workspace.RunFailed(f"the {self.phase} route is limited to {self.allowed()} launches")
         super().write_line(event, **fields)
         if launching:
             self.launches.append(self.launch_of(fields["step"], fields, True))
@@ -298,9 +298,9 @@ class WorkerRun(experiment.TrialRun):
             for rel, data in kept.items():
                 (wt / rel).write_bytes(data)
             for rel in task.hidden_files.keys() - existed:
-                pipeline.remove_untracked(wt, rel)
+                workspace.remove_untracked(wt, rel)
             for d, name in pipeline.untracked_added_since(before):
-                pipeline.remove_untracked(d, name)
+                workspace.remove_untracked(d, name)
         if res.returncode == 0:
             return True, ""
         return False, (f"### task check failed: `{task.check}` exit {res.returncode}\n```\n"

@@ -21,14 +21,16 @@ from . import (
     research_search,
     research_synthesis,
     runner,
+    screening,
     state,
     tracker,
     triage,
     util,
+    workspace,
 )
 from .agent import Result
 from .heartbeat import mark_loop, network_up_or_skip
-from .pipeline import fill_template, make_worktree, prompt, remove_worktree, slug
+from .pipeline import fill_template, prompt, slug
 
 REPORTS_DIR = paths.STATE_DIR / "research"
 TOOLS = [*runner.READ_TOOLS, "WebSearch", "WebFetch"]
@@ -132,7 +134,7 @@ def file_report(cfg: config.Config, h: Home, r: dict, report: dict) -> str:
             f"Arete researched [{r['ref']}]({r['url']}) ({util.paid_note(report['cost'])}) and files the report as `{path}`. "
             "When the ticket changes, arete researches it again and pushes the new report here.")
     base = h.base
-    wt = make_worktree(h.repo, base, branch, key)
+    wt = workspace.make_worktree(h.repo, base, branch, key)
     try:
         (wt / path).parent.mkdir(parents=True, exist_ok=True)
         (wt / path).write_text(report_file(r["ref"]).read_text())
@@ -146,7 +148,7 @@ def file_report(cfg: config.Config, h: Home, r: dict, report: dict) -> str:
             return url
         return gh.pr_create(h.repo.github, branch, base, subject, body, labels=tk.pr_labels, cwd=wt, link=link)
     finally:
-        remove_worktree(h.repo, wt)
+        workspace.remove_worktree(h.repo, wt)
 
 
 def file_in_home(cfg: config.Config, h: Home, r: dict) -> tuple[bool, str]:
@@ -495,14 +497,14 @@ def research(cfg: config.Config, r: dict, force: bool = False, asked: bool = Fal
     done = [(relation, o, reports[o["ref"]]) for relation, o in kin
             if o["ref"] in reports and reports[o["ref"]]["status"] == DONE and reports[o["ref"]]["report"]]
     judged = jev.ready(cfg, list(src.repos))
-    if skipped := screen(cfg, r, ticket, prior, said, basis, judged, rows, kin, done, base, force, asked):
+    if skipped := screen(cfg, r, src, ticket, prior, said, basis, judged, rows, kin, done, base, force, asked):
         return skipped
     dirs, h, filed_path, values = begin(cfg, r, src, prior, basis, text, done, base)
     res, paid = ask(cfg, ref, values, h, filed_path, dirs, done, started, judged)
     return finish_report(cfg, r, res, paid, h, filed_path, said, basis)
 
 
-def screen(cfg, r, ticket, prior, said, basis, judged, rows, kin, done, base, force, asked):
+def screen(cfg, r, src, ticket, prior, said, basis, judged, rows, kin, done, base, force, asked):
     ref, text = r["ref"], ticket.text
     if not force:
         if not asked and (why := still_stands(cfg, r, prior, said, basis, judged)):
@@ -522,11 +524,12 @@ def screen(cfg, r, ticket, prior, said, basis, judged, rows, kin, done, base, fo
             why = "JEV is off, so nothing screens the ticket"
             state.research_set(ref, **base, status=HELD, error=why)
             return HELD, why
-        screened = jev.injection(f"{r['title']}\n\n{text}", cfg, trace=("", f"research {ref} injection jev"))
-        if screened is None:
-            return LATER, f"JEV could not screen {ref}"
-        if screened.yes >= cfg.jev.injection:
-            why = f"JEV reads text in it as instructions to an agent (p {screened.yes:.2f})"
+        screened = screening.screen(f"{r['title']}\n\n{text}", cfg, list(src.repos),
+                                    ("", f"research {ref} injection jev"))
+        if screening.held(screened, screening.Posture.REQUIRED):
+            if screened.status != screening.FLAGGED:
+                return LATER, f"JEV could not screen {ref}"
+            why = f"JEV reads text in it as instructions to an agent (p {screened.p:.2f})"
             state.research_set(ref, **base, status=HELD, error=why)
             return HELD, why
 

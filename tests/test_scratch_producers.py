@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from arete import launchd, paths, pipeline, sandbox, scratch
+from arete import launchd, paths, pipeline, sandbox, scratch, workspace
 
 ON_MAC = sys.platform == "darwin"
 UID = os.getuid()
@@ -288,13 +288,13 @@ class FakeTableTests(unittest.TestCase):
         for part in ('"pid": 900', '"name": "sh"', '"reason": "submitted launchd job"'):
             self.assertIn(part, out.getvalue())
         self.assertTrue(scratch.pending(self.ws))
-        self.assertTrue(pipeline.scratch_left(self.ws, []))
+        self.assertTrue(workspace.scratch_left(self.ws, []))
         self.table.clear()
         self.release()
         self.assertEqual(scratch.recover_pending(), [self.attempt.root])
         self.assertEqual(scratch.records()[0]["state"], "done")
         self.assertFalse(scratch.pending(self.ws))
-        self.assertEqual(pipeline.scratch_left(self.ws, []), [])
+        self.assertEqual(workspace.scratch_left(self.ws, []), [])
 
     def test_live_producer_group_holds(self):
         child = subprocess.Popen(["/bin/sleep", "30"], start_new_session=True)
@@ -553,4 +553,4 @@ class LiveTests(unittest.TestCase):
         os.close(scratch.LEASES.pop(a.selector))
         self.assertEqual(scratch.recover_pending(), [a.root], self.record(a)["diagnostic"])
         self.assertEqual(self.record(a)["state"], "done")
-        self.assertEqual(pipeline.scratch_left(self.ws, []), [])
+        self.assertEqual(workspace.scratch_left(self.ws, []), [])

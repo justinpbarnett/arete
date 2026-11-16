@@ -5,7 +5,22 @@ import math
 import tempfile
 import threading
 
-from . import board, config, control, gh, paths, pipeline, record, routing, runner, sessions, settings, state, util
+from . import (
+    board,
+    config,
+    control,
+    gh,
+    paths,
+    pipeline,
+    record,
+    routing,
+    runner,
+    sessions,
+    settings,
+    slots,
+    state,
+    util,
+)
 from .agent import Result
 
 CONTEXT_FILE = paths.RUNS_DIR / "chat" / "context" / "dashboard.json"
@@ -398,8 +413,8 @@ def refuse_session(chat_id: int, name: str, budget_usd: float | None, cfg: confi
     if now["running"] >= cfg.chat.max_sessions:
         raise control.Refused(f"chat {chat_id} already has {util.count(now['running'], 'session')} running "
                               f"([chat] max_sessions {cfg.chat.max_sessions}); wait for one to end or stop one")
-    if pipeline.slots_free_to_start(cfg.max_parallel) <= 0:
-        raise control.Refused(pipeline.no_free_slot(cfg.max_parallel))
+    if slots.slots_free_to_start(cfg.max_parallel) <= 0:
+        raise control.Refused(slots.no_free_slot(cfg.max_parallel))
     if now["left"] <= 0:
         raise control.Refused(f"chat {chat_id} has no budget left (${now['left']:.2f} of [chat] budget_usd "
                               f"{cfg.chat.budget_usd:g})")
@@ -410,7 +425,7 @@ def refuse_session(chat_id: int, name: str, budget_usd: float | None, cfg: confi
 
 def start_session(chat_id: int, prompt: str, *, repo: str | None = None, device: str = "", model: str = "",
                   runner: str = "", budget_usd: float | None = None) -> dict:
-    with starting, util.lock(pipeline.SLOTS_LOCK, wait=True):
+    with starting, slots.admitting():
         row = chat_row(chat_id)
         cfg = config.load()
         name = session_repo_name(chat_id, repo)

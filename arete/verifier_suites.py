@@ -13,6 +13,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import (
+    browser,
     config,
     devices,
     environment,
@@ -27,9 +28,10 @@ from . import (
     tracker,
     util,
     verify,
+    workspace,
 )
 from .agent import Result
-from .pipeline import AgentRun, Checkout, TicketWork, use_product
+from .pipeline import AgentRun, TicketWork, use_product
 
 NAME = re.compile(r"[A-Za-z0-9_-]+")
 RESERVED = ("record", "scratch")
@@ -271,7 +273,7 @@ def arm_status(suite: Suite, cfg: config.Config, arm: str) -> dict:
     s = steps.resolve(real, suite.layer, "verify", "", suite.arms[arm])
     which, name = runner.stands_for(s.model, s.runner)
     replayed = runner.chosen(s.model, s.runner, cfg)[0] == runner.REPLAY
-    own = verify.mcp_config(paths.RUNS_DIR) if suite.starts_app else ""
+    own = browser.mcp_config(paths.RUNS_DIR) if suite.starts_app else ""
     kw = {**s.agent_kw(real, ["mcp__playwright"] if suite.starts_app else [], own),
           "disallowed_tools": runner.NO_GIT_WRITES}
     asked = runner.request_for(real, suite.repo, which, name, s, False, kw, 0, suite.layer)
@@ -296,7 +298,7 @@ def browser_reason(suite: Suite, cfg: config.Config) -> str:
         return NO_CHROME_REASON
     real = real_config(cfg)
     probes = (("Chrome would not run headless", [chrome, "--headless", "--disable-gpu", "--dump-dom", "about:blank"]),
-              ("the browser's MCP server would not launch", ["npx", "-y", verify.PLAYWRIGHT_MCP, "--version"]))
+              ("the browser's MCP server would not launch", ["npx", "-y", browser.PLAYWRIGHT_MCP, "--version"]))
     for failure, command in probes:
         try:
             found = environment.sh(command, real, suite.repo, cwd=suite.folder, timeout=BROWSER_PROBE_SECONDS)
@@ -348,7 +350,7 @@ def numbered(task: Task) -> str:
     return "\n".join(f"{k}. {text}" for k, text in enumerate(task.requirements, 1))
 
 
-def workspace(suite: Suite, cfg: config.Config, task: Task, wt: Path) -> None:
+def prepare_workspace(suite: Suite, cfg: config.Config, task: Task, wt: Path) -> None:
     shutil.rmtree(wt, ignore_errors=True)
     if task.state:
         shutil.copytree(suite.folder / task.state, wt, ignore=shutil.ignore_patterns(".git"))
@@ -396,7 +398,7 @@ def run_trial(suite: Suite, cfg: config.Config, run_id: str, n: int, task: Task,
     try:
         trial_dir.mkdir(parents=True)
         row["state_digest"] = state_digest(suite, task)
-        workspace(suite, cfg, task, wt)
+        prepare_workspace(suite, cfg, task, wt)
         repo = suite.repo or config.Repo(name=f"verifiers-{suite.name}", path=wt, tracker="local", jev=False,
                                          layer=suite.folder)
         layer = replace(suite.layer, verify=replace(suite.verify, preflight={}))
@@ -404,7 +406,7 @@ def run_trial(suite: Suite, cfg: config.Config, run_id: str, n: int, task: Task,
         run = TrialRun(id=run_id, repo=repo, dir=trial_dir, cfg=cfg, layer=layer,
                        overrides={**suite.arms[arm], "timeout_minutes": timeout, "budget_usd": round(spend_left, 6)})
         ticket = tracker.Ticket(id=f"trial-{n}", ref=f"trial-{n}", title=task.title, body=task.prompt)
-        work = TicketWork(cfg, run, ticket, wt, [Checkout("", repo.github, repo.path, wt, "")], layer, timeout * 60,
+        work = TicketWork(cfg, run, ticket, wt, [workspace.Checkout("", repo.github, repo.path, wt, "")], layer, timeout * 60,
                           workspace="You are in a checkout of its code.")
         stage = "verifier call"
         verified = use_product(work, step, "grade", role="verify", goal=numbered(task))

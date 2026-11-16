@@ -6,13 +6,13 @@ import re
 import struct
 import zlib
 
-TOKENS = ("ground", "ink", "act")
+COLOR_NAMES = ("ground", "ink", "act")
 ICON_SIZES = (180, 192, 512)
 
 
-def tokens(css: bytes) -> dict[str, str]:
+def colors_from_css(css: bytes) -> dict[str, str]:
     found = {}
-    for name in TOKENS:
+    for name in COLOR_NAMES:
         hit = re.search(rb"--" + name.encode() + rb"\s*:\s*(#[0-9a-fA-F]{6})\b", css)
         if not hit:
             raise RuntimeError(f"pattern.css lost the --{name} colour, so the app files could not use it.")

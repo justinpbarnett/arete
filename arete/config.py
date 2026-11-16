@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from . import outbound, paths
+from . import outbound, paths, util
 
 MODEL_ROLES = ("plan", "build", "verify", "review", "learn", "uat", "miner", "apply", "eval_mine", "triage", "chat",
                "classify", "loop", "session", "research", "research_plan", "research_search",
@@ -567,9 +567,7 @@ def allowed_payment_modes(cfg: Config, layer: RepoLayer | None = None) -> tuple[
 
 
 def price_rate(value, where: str) -> float:
-    from .routing import number
-
-    found = number(value)
+    found = util.nonnegative_number(value)
     if found is None:
         raise ValueError(f"{where}: price must be a finite nonnegative number")
     return found

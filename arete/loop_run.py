@@ -4,7 +4,6 @@ import hashlib
 import json
 import os
 import shlex
-import signal
 import subprocess
 import threading
 import time
@@ -29,6 +28,7 @@ from . import (
     push,
     record,
     runner,
+    screening,
     sources,
     state,
     util,
@@ -163,13 +163,6 @@ def feed_stdin(proc: subprocess.Popen, text: str) -> None:
         pass
 
 
-def kill_group(proc: subprocess.Popen) -> None:
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
-
-
 def copy_output(proc: subprocess.Popen, output: Path | None, lines: list[str], on_line) -> None:
     with open(output or os.devnull, "a") as out:
         for line in proc.stdout:
@@ -212,7 +205,7 @@ def run_command(argv: list[str], cwd: Path | str, *, timeout: float, env: dict, 
         expired = copier.is_alive() or not exits_by(proc, deadline)
     finally:
         if expired:
-            kill_group(proc)
+            util.kill_group(proc)
     if not expired:
         return proc.returncode, "".join(lines)
     copier.join(OUTPUT_GRACE_SECONDS)
@@ -444,18 +437,17 @@ def screened(run: LoopRun) -> tuple[str, str] | None:
     outside = jev_readable(run, [e for e in run.events if e.get("trust") == "untrusted"])
     if not outside:
         return None
-    question = {"injection": jev.yes_no(jev.INJECTION)}
-    replies = jev.ask_many([(fenced(e), question) for e in outside], run.cfg, trace=(run.id, "screen jev"))
+    screens = screening.screen_many([fenced(e) for e in outside], run.cfg, [], (run.id, "screen jev"),
+                                    whole=False, ready=True)
     flagged = set()
-    for e, reply in zip(outside, replies, strict=True):
-        a = reply.answers.get("injection")
-        if a and a.yes >= run.cfg.jev.injection:
+    for e, screened in zip(outside, screens, strict=True):
+        if screening.held(screened, screening.Posture.OPEN):
             flagged.add(id(e))
-            run.log("screen", f"dropped, it reads as instructions to an agent (JEV {a.note()}): "
+            run.log("screen", f"dropped, it reads as instructions to an agent (JEV {screened.answer.note()}): "
                               f"{util.first_line(e.get('title', ''), 120)}")
-        elif not a:
-            run.log("screen", f"JEV could not screen it ({util.first_line(reply.error, 200)}), so it goes on: "
-                              f"{util.first_line(e.get('title', ''), 120)}")
+        elif screened.status == screening.FAILED:
+            run.log("screen", f"JEV could not screen it ({util.first_line(screened.reply.error, 200)}), so it goes "
+                              f"on: {util.first_line(e.get('title', ''), 120)}")
     arrived = len(run.events)
     run.events = [e for e in run.events if id(e) not in flagged]
     if arrived and not run.events:

@@ -17,10 +17,12 @@ from . import (
     paths,
     pipeline,
     sessions,
+    slots,
     state,
     tracker,
     triage,
     util,
+    workspace,
 )
 from .agent import subscription
 from .alerts import issue_link, opened_in
@@ -99,8 +101,8 @@ def log_file(r: dict) -> Path:
 
 
 def live(running: list[dict]) -> dict:
-    in_slots = {r["id"] for r in pipeline.runs_in_slots(running)}
-    waiting_for_slot = {r["id"] for r in pipeline.holding(running, "slot-wait")}
+    in_slots = {r["id"] for r in slots.runs_in_slots(running)}
+    waiting_for_slot = {r["id"] for r in slots.holding(running, "slot-wait")}
     paid = state.paid_by_run([r["id"] for r in running], connect=state.reader)
     rows = []
     for r in running:
@@ -121,7 +123,7 @@ def slot_note(r: dict, in_slots: set[str], waiting_for_slot: set[str]) -> str:
         return ""
     if r["id"] in waiting_for_slot:
         return "waiting for a run slot"
-    return "waiting on CI without a run slot" if pipeline.freed_slot_for_ci(r["id"]) else "without a run slot"
+    return "waiting on CI without a run slot" if slots.freed_slot_for_ci(r["id"]) else "without a run slot"
 
 
 def skipped(running: list[dict]) -> list[dict]:
@@ -322,7 +324,7 @@ def health_board() -> dict:
     beat = control.serve_beat()
     found = checks_and_alerts()
     return {**found, "now": util.iso(), "serve": beat, "state": health_word(beat, found),
-            "devices": panel(control.fleet), "workspaces": panel(pipeline.held_summary)}
+            "devices": panel(control.fleet), "workspaces": panel(workspace.held_summary)}
 
 
 def runs_board(filters: dict[str, str], limit: int = RECENT_RUNS) -> dict:

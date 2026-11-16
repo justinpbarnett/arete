@@ -23,14 +23,10 @@ from . import (
     state,
     tool_events,
     util,
+    workspace,
 )
 from .heartbeat import mark_loop
-from .pipeline import (
-    make_worktree,
-    prompt,
-    remote_head,
-    remove_worktree,
-)
+from .pipeline import prompt
 from .util import git
 
 MAX_PROPOSALS = 8
@@ -614,7 +610,7 @@ def file_rule(proposal_id: int) -> str:
 
 def push_rule(cfg: config.Config, repo: config.Repo, p: dict) -> str:
     base = gh.default_branch(repo.github)
-    wt = make_worktree(repo, base, f"arete/rule-{p['id']}", f"rule-{p['id']}")
+    wt = workspace.make_worktree(repo, base, f"arete/rule-{p['id']}", f"rule-{p['id']}")
     try:
         res = apply_in(cfg, p["run_id"], wt, [p])
         if not res.ok:
@@ -630,7 +626,7 @@ def push_rule(cfg: config.Config, repo: config.Repo, p: dict) -> str:
         git(["push", "-q", "origin", f"HEAD:{base}"], wt, timeout=300)
         return base
     finally:
-        remove_worktree(repo, wt)
+        workspace.remove_worktree(repo, wt)
 
 
 def catch_up(repo: config.Repo, base: str) -> str:
@@ -648,7 +644,7 @@ def catch_up(repo: config.Repo, base: str) -> str:
 def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[dict],
                branch: str) -> tuple[str, list[dict]]:
     base = gh.default_branch(repo.github)
-    wt = make_worktree(repo, base, branch, "miner", resume=bool(gh.open_pr_url(repo.github, branch)))
+    wt = workspace.make_worktree(repo, base, branch, "miner", resume=bool(gh.open_pr_url(repo.github, branch)))
     try:
         res = apply_in(cfg, run_id, wt, props)
         if not res.ok:
@@ -665,7 +661,7 @@ def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[d
             return "", []
         fixes = util.count(len(landed), "mined fix", "mined fixes")
         util.git_as_owner(["commit", "-q", "-m", f"docs(harness): apply {fixes}\n\nArete-Run: {run_id}"], wt)
-        if not remote_head(repo.path, branch):
+        if not workspace.remote_head(repo.path, branch):
             with util.repo_lock(repo.path):
                 git(["update-ref", "-d", f"refs/remotes/origin/{branch}"], repo.path, check=False)
         git(["push", "-q", "--force-with-lease", "-u", "origin", branch], wt, timeout=300)
@@ -685,7 +681,7 @@ def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[d
         return gh.pr_create(repo.github, branch, base, f"docs(harness): {fixes} {util.now():%Y-%m-%d}",
                             "\n".join(body), labels=["arete-miner"], cwd=wt), landed
     finally:
-        remove_worktree(repo, wt)
+        workspace.remove_worktree(repo, wt)
 
 
 def run(hours: float | None = None, dry_run: bool = False, apply: bool = True) -> int:

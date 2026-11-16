@@ -532,6 +532,7 @@ result(base=base["mined_until"], base_expect=mark(0), crashed=slim(crashed), nor
     def test_a_failed_apply_model_call_keeps_the_checkpoint(self):
         found = self.scratch(r'''
 from types import SimpleNamespace
+from arete import workspace
 mine(0)
 both(3)
 reply({"ok": True, "structured": {"proposals": [{"layer": "repo", "repo": "arete", "file": "notes.md",
@@ -540,8 +541,8 @@ failed = SimpleNamespace(ok=False, error="apply broke", text="")
 with mock.patch.object(miner, "allowed", return_value=(True, "")), \
         mock.patch.object(miner.gh, "default_branch", return_value="main"), \
         mock.patch.object(miner.gh, "open_pr_url", return_value=""), \
-        mock.patch.object(miner, "make_worktree", return_value=root), \
-        mock.patch.object(miner, "remove_worktree"), \
+        mock.patch.object(workspace, "make_worktree", return_value=root), \
+        mock.patch.object(workspace, "remove_worktree"), \
         mock.patch.object(miner, "apply_in", return_value=failed):
     applying = mine(24, apply=True)
 reply(GOOD)
