@@ -5,7 +5,8 @@ import re
 from . import config, tracker, util
 
 SENSITIVE_WORK = re.compile(
-    r"\b(auth(?:entication|orization)?|credentials?|secrets?|permissions?|security|payments?|billing|"
+    r"\b(auth(?:entication|orization)?|credentials?|secrets?|passwords?|tokens?|jwt|oauth|"
+    r"log(?:in|out)|sign[ -]?(?:in|out)|sessions?|permissions?|privileges?|security|payments?|billing|"
     r"migrations?|restore|backups?|encryption|keychain|data loss|schema|idempotency|sandbox|confinement|"
     r"storage|database|persistence|destructive|data retention)\b",
     re.IGNORECASE)
@@ -22,8 +23,9 @@ SCHEMA = {
 }
 
 
-def requested(layer: config.RepoLayer, ticket: tracker.Ticket) -> bool:
-    return bool(set(layer.patch.labels) & set(ticket.labels))
+def requested(layer: config.RepoLayer, ticket: tracker.Ticket, *, automatic: bool = False) -> bool:
+    return bool(set(layer.patch.labels) & set(ticket.labels)) or (
+        automatic and ticket.kind == "fix" and "feature" not in ticket.labels)
 
 
 def specification_refusal(ticket: tracker.Ticket) -> str:

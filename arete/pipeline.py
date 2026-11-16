@@ -30,6 +30,7 @@ from . import (
     environment,
     factory,
     gh,
+    intake,
     jev,
     outbound,
     owner_asks,
@@ -1447,7 +1448,7 @@ def triage_block(approval: dict | None) -> str:
 def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, str]:
     repo, tk = run.repo, run.tracker
     try:
-        t = tk.get(run.tid)
+        t = intake.route_ticket(cfg, repo, tk, tk.get(run.tid), dry_run=run.dry_run, log=run.log)
     except tracker.ERRORS as e:
         return "failed", f"could not read {run.ref}: {e}", ""
     run_lines.write(run.id, "task", ticket=t.ref, kind=t.kind, repo=repo.name, title=t.title)
@@ -1663,7 +1664,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
         run.say(f"PRs for this ticket:\n\n{pr_status_lines(with_prs, opened, pushed)}\n\nCI: {ci_result}."
                 + published_note(draft_why, verified, opened, drafted))
     automerge(cfg, run, layer, approval, draft_why, opened + ready_pushed(run, pushed, ci_stopped, draft_why),
-              automerge_about(t, build_summary))
+              automerge_about(t, build_summary), ticket=t)
     urls = record_prs(run, branch, with_prs)
     release_workspace(run, ws, checkouts)
     return "pr", outcome, urls
@@ -1730,10 +1731,10 @@ def report_body(run: Run, *, summary: str, review: Review, verified: verify.Veri
 
 
 def automerge(cfg: config.Config, run: Run, layer: config.RepoLayer, approval: dict | None, draft_why: str,
-              opened: list[workspace.Checkout], about: str) -> None:
+              opened: list[workspace.Checkout], about: str, *, ticket: tracker.Ticket | None = None) -> None:
     if draft_why or layer.trust_level != "automerge":
         return
-    if approval and approval["sent_by"] == "triage":
+    if (approval and approval["sent_by"] == "triage") or (ticket and intake.AUTO_LABEL in ticket.labels):
         run.log("automerge left off: triage approved the ticket, so a person merges it")
         run.facts["merge_held"] = "triage approved the ticket, so a person merges it"
         return

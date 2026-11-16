@@ -93,13 +93,16 @@ def ensure_label(repo: str, name: str, color: str = "5319e7", description: str =
         return f"{name}: {e}"
 
 
-def issues(repo: str, label: str = "", state: str = "open", limit: int = 30, author: str = "") -> list[dict]:
+def issues(repo: str, label: str = "", state: str = "open", limit: int = 30, author: str = "", *,
+           search: str = "") -> list[dict]:
     args = ["issue", "list", "--repo", repo, "--state", state, "--limit", str(limit),
             "--json", "number,title,body,labels,url,createdAt,updatedAt,author"]
     if label:
         args += ["--label", label]
     if author:
         args += ["--author", author]
+    if search:
+        args += ["--search", search]
     return gh_json(args) or []
 
 

@@ -19,7 +19,7 @@ def start(flow, request_patch=False):
     ws = str(job.ws)
     if not (outcome := step(flow, "prepare", tree=ws)).passed:
         return ended(flow, outcome)
-    requested = request_patch or patching.requested(job.layer, job.ticket)
+    requested = request_patch or patching.requested(job.layer, job.ticket, automatic=job.cfg.triage.route_fixes)
     refusal = ("multi-repository changes require a full plan" if len(job.checkouts) != 1 else
                patching.specification_refusal(job.ticket))
     if requested and not refusal:

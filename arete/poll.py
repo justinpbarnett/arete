@@ -7,6 +7,7 @@ from datetime import timedelta
 
 from . import (
     config,
+    intake,
     jira,
     oncall,
     outcomes,
@@ -104,7 +105,8 @@ def step_without_route(cfg: config.Config, repo: config.Repo, ticket: tracker.Ti
     if cfg.replay.all:
         return ""
     first = ("plan", "build")
-    if (layer.factory_path == pipeline.ADW and len(repo.parts) <= 1 and patching.requested(layer, ticket)
+    if (layer.factory_path == pipeline.ADW and len(repo.parts) <= 1
+            and patching.requested(layer, ticket, automatic=cfg.triage.route_fixes)
             and not patching.specification_refusal(ticket)):
         first = ("build",)
     newest = run_store.newest_whole_run(repo.name, ticket.id)
@@ -207,8 +209,10 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: tuple[str, str], skip
         return "held"
     blocked, _ = runlimits.admission(repo, str(tid), source, runlimits.Policy.of(layer), False)
     ticket = source.get(tid)
-    blocked = (blocked or source.blocker(tid) or step_without_route(cfg, repo, ticket, queue.discovery, layer)
-               or reply)
+    blocked = blocked or source.blocker(tid) or reply
+    if not blocked:
+        ticket = intake.route_ticket(cfg, repo, source, ticket, dry_run=dry_run)
+        blocked = step_without_route(cfg, repo, ticket, queue.discovery, layer)
     if blocked:
         skips.note(name, ticket, blocked, repo.name)
         print(f"{util.iso()} {name}: {blocked}")

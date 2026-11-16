@@ -107,6 +107,13 @@ class JiraConfig:
     skip_types: list[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class TriageConfig:
+    auto: bool = False
+    route_fixes: bool = False
+    auto_per_refresh: int = 50
+
+
 @dataclass
 class GithubApp:
     app_id: str = ""
@@ -251,6 +258,7 @@ class Config:
     jobs: list[Job] = field(default_factory=list)
     probes: list[Probe] = field(default_factory=list)
     jira: JiraConfig = field(default_factory=JiraConfig)
+    triage: TriageConfig = field(default_factory=TriageConfig)
     jev: JevConfig = field(default_factory=JevConfig)
     github_app: GithubApp = field(default_factory=GithubApp)
     replay: ReplayConfig = field(default_factory=ReplayConfig)
@@ -804,6 +812,18 @@ def word_range(kind: str, value) -> tuple[int, int]:
     return value[0], value[1]
 
 
+def triage_table(data, ignored: list[str] | None = None) -> TriageConfig:
+    defaults = TriageConfig()
+    table = known(table_of(data, "triage"), defaults.__dict__, "triage", ignored)
+    for name in ("auto", "route_fixes"):
+        if type(table.get(name, False)) is not bool:
+            raise ValueError(f"[triage] {name} must be true or false")
+    limit = table.get("auto_per_refresh", defaults.auto_per_refresh)
+    if type(limit) is not int or not 0 <= limit <= 1000:
+        raise ValueError("[triage] auto_per_refresh must be a whole number from 0 to 1000")
+    return TriageConfig(**table)
+
+
 def jev_names(jv: dict, name: str, noun: str, ignored: list[str] | None) -> dict:
     return known(jv.get(name) or {}, JevConfig().__dict__[name], f"jev.{name}", ignored, noun)
 
@@ -1014,6 +1034,7 @@ def load(path: Path | None = None, strict: bool = False) -> Config:
     cfg.research_search_workers = research["search_workers"]
     cfg.research_search_share = research["search_share"]
     cfg.ask = ask_table(data.get("ask") or {}, ignored)
+    cfg.triage = triage_table(data.get("triage", {}), ignored)
     cfg.retention = retention_table(data.get("retention") or {}, ignored)
     cfg.backup = backup_table(data.get("backup") or {})
     cfg.chat = chat_table(data.get("chat") or {}, ignored)
@@ -1061,7 +1082,8 @@ class PatchPolicy:
     max_lines: int = 200
     max_files: int = 5
     review_tries: int = 2
-    sensitive: tuple[str, ...] = ("*auth*", "*secret*", "*credential*", "*migration*", "*backup*", "*restore*",
+    sensitive: tuple[str, ...] = ("*auth*", "*secret*", "*credential*", "*password*", "*token*", "*login*", "*session*",
+                                  "*jwt*", "*oauth*", "*privilege*", "*migration*", "*backup*", "*restore*",
                                   "*payment*", "*billing*", "*guard*", "*sandbox*", "*scratch*", "*permission*",
                                   "*security*", "*routing*", "*config*", "*runlimit*", "*principal*",
                                   "*outbox*", "*store/*", "*database*", "*storage*", "*persist*", "*schema*",

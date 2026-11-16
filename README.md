@@ -145,7 +145,7 @@ A loop is a folder with a `loop.toml`, a `prompt.md` when an agent does the work
 | `audit` | command | nightly | Deterministic checks of skills, hooks and `.agents` configs, plus skills that fail or never get used, and the [doctor](#doctor)'s read of arete's own state. |
 | `poll` | command | every 5 min | Tickets labeled `agent`, from GitHub issues or Jira, go through plan, build, checks, fix, verify in use, review, learn, then a GitHub PR, then a watch on the PR's CI. Review comments on that PR start a revision. `arete run REPO TICKET` runs one ticket by hand. |
 | `eval` | command | weekly | Runs eval tasks against a fixed commit and records the pass rate, so harness changes are measured, not guessed. `arete eval mine` writes new tasks from merged arete PRs. |
-| `triage` | command | every 15 min | Reads your open tickets that do not have the `agent` label yet and sorts each one: a fix or a feature with its repo, size, plan and assumptions, a research ticket, or work for a person. With `[jira] auto` it sends ready Jira tickets in the sprint to the pipeline. See [Triage](#triage). |
+| `triage` | command | every 15 min | JEV sorts open tickets into fixes, features, research and person work, falls back to read-only model triage when unsure, and with `[triage] auto` adds pipeline labels to ready issues under the [triage admission policy](#triage). |
 | `research` | command | every 10 min | Researches the next research ticket on the triage board and writes a report for you to review. See [Triage](#triage). |
 | `loop-intake` | watch | on each new issue | Turns an issue labeled `loop` that you opened on the arete repo into an `agent` ticket that specs the new loop folder, so the pipeline builds it. |
 
@@ -650,7 +650,10 @@ JEV is a classifier model from TypeSafe, reached through OpenRouter. It reads te
   The usage an adapter prints is kept whatever the outcome, also on a timeout, a nonzero exit, a missing `response` or an extra key, and a call that reports a token count or a cost counts as a billed question, without an answer unless it was answered.
   A usage value that is negative, over 1e9 or not a finite number is ignored, a response that is such a number is malformed, and a spec that holds such a number, or a `timeout_seconds` over 3600, is refused.
   The spec, labels and credentials stay outside the repo.
-- Triage: JEV asks whether a ticket asks for a change to a repo and what kind of ticket it is. A ticket it gives a chance of a code change at or under `triage_skip` settles with no model call, as research when JEV is sure it is research and as work for a person otherwise; one under even odds settles the same way when JEV is sure of research or person. Before arete sends a ticket to the pipeline or the research agent, JEV screens its text for instructions to an agent, and a ticket it flags waits for you.
+- Triage: JEV asks whether a ticket asks for a repo change, whether an agent can begin, and whether it is a fix, feature, research or work for a person.
+  Confident actionable fixes and features settle without a planning-model call; an unclear kind, readiness or repository falls back to the read-only triage agent.
+  A ticket with a chance of a code change at or under `triage_skip` settles as research when JEV is sure it is research and as work for a person otherwise; one under even odds settles the same way when JEV is sure of research or person.
+  Before automatic approval or research, the existing required injection screen still applies.
 - Research: when a researched ticket changes, JEV reads what changed in its text against the report's summary and asks whether the change asks something different or adds a fact, decision, limit, deadline or resource the report should use. Under a chance of `research_rerun`, the report stands with no agent call. Before a ticket's first report, JEV reads it against the reports already done for its parent, its siblings and its children, and picks the one that already delivers what it asks, or none. At a chance of `research_answered` or more that one does, the ticket links that report instead of a new run. See [Triage](#triage).
 - Feedback checks: Submit in the feedback composer runs five checks, and files the issue only when all five pass. A JEV that is off, has no key, fails or leaves an answer out holds the check as unavailable; nothing passes by default. A check that holds or fails does not stop the others.
   Vision and scope reads `[capture] vision` and asks whether it supports, conflicts with or does not address the request: supports at `[jev] confidence` passes, conflicts at that confidence fails, anything else holds. It never judges without the file, and shows the file's path and version (the first 12 hex digits of its SHA-256 and its modified date).
@@ -955,6 +958,8 @@ To change a flow, copy `adws/` to a folder of your own, edit the scripts there a
 ### Throughput without weaker final gates
 
 The feature script takes the patch path for tickets labeled `patch`; running `adws/patch.py` requests it explicitly.
+With `[triage] route_fixes = true`, tickets classified or explicitly labelled `fix` also request that guarded path.
+Sensitive work and changes beyond the patch budget still escalate to the full feature flow.
 The default budget is five files, 200 changed lines and two review attempts, still subject to the repo's tighter limits and cumulative run budgets.
 The builder implements directly from the ticket and returns its short approach and focused acceptance checks, without a separate planner call.
 Ambiguous requirements, architectural work, sensitive ticket content, sensitive changed paths, an oversized diff or a review that does not converge escalate to the full feature flow.
@@ -1081,6 +1086,7 @@ private_key = "~/.config/arete/github-app.pem"
 | `[jira]` | See [Jira tickets](#jira-tickets). |
 | `[dashboard]` | `port` (default 8796), `owner`, the tailnet login the page opens for (default: the login that owns this machine), and `https` (default `false`; `true` fetches a tailscale certificate that lists the machine and tailnet name in public certificate transparency logs, and plain HTTP then gets a 308). See [Dashboard](#dashboard). |
 | `[serve]` | `loop_dirs` (the private loop folders, default `~/.config/arete/loops`), `queues` (a table of queue name to how many runs at once, default 1), `daily_budget_usd` (most pi spend across all loops in a rolling 24 hours), `session_idle_hours` (default 2). |
+| `[triage]` | `auto` (false), `route_fixes` (false), and `auto_per_refresh` (50, from 0 to 1000) control automatic issue admission and guarded fix routing; existing Jira auto limits and sprint scope remain in force. |
 | `[jev]` | `enabled` (default true), `model` (`jev-latest`), `confidence` (0.8, how sure JEV must be to settle a question alone; on a yes or no question, a chance of yes at 0.9 or more, or at 0.1 or less), `injection` (0.5, the chance of an injection at which an event drops or a ticket waits), `risk_hold` and `irreversible_hold` (0.5 each, the first for pipeline automerge only, the second also the guard's line for a command git cannot undo), `secrets_hold` (0.55, the guard's line for a command that shows or sends a credential), `triage_skip` (0.2, the chance of a code change at or under which triage settles a ticket as not code without the agent), `[jev.screen_lines]` (the chance at which each push screen question holds a push: `weakens` 0.5, `secrets` 0.7, `outside` 0.7, `irreversible` 0.5, `feature` 0.6, `removes` 0.5, `renames` 0.5, and `reach` 0.8, how far past the fix it names a push may reach before it waits), `proof_hold` (0.5, the proof check's line), `fixed_skip` (0.7, the chance at which a search run fed by findings ends as already fixed), `research_rerun` (0.4, the chance that a change to a researched ticket matters, under which its report stands), `research_answered` (0.8, the chance at which a ticket links a report done for its family instead of a new run) and `feedback_skip` (0.0, the chance that a PR comment asks for a change or an answer, under which it starts no revision; 0 logs only), `[jev.risk_weights]` (`blast` 0.4, `sensitivity` 0.4, `surprise` 0.2), `guard` (true) and `compact_tokens` (120000). See [JEV](#jev). |
 | `[pricing]` | `local_providers` (default `["ollama"]`, priced at zero) and `[pricing.models."<model>"]` with `input` and `output` in USD per million tokens, for a model whose runner reports no cost; it outranks an imported [price snapshot](#price-snapshots) in route sorting. A component you leave out stays unknown in `arete steps`, not zero, and a call still charges it as zero. |
 | `[routing]` | `fallback` (default true) and `payment_modes` (a list of `subscription`, `api_key` and `local`; default all three). The engine's and a repo layer's `fallback` are combined with AND, so either can turn it off; a layer's `payment_modes` can only restrict the engine's. `arete steps` shows the result, and runs act on it. `capabilities` (per-route tables) and `floors` (named model lists) feed the step requirements. `paid` limits paid routes by provider and price. See [Steps](#steps). |
@@ -2076,7 +2082,13 @@ Arete then runs each eval suite twice on the same day, once with main's prompts 
 
 ## Triage
 
-`arete triage` shows a board of your open tickets that are not yet labeled `agent`: Jira tickets assigned to you in the projects of your Jira pipeline repos, and issues you opened in your GitHub pipeline repos. For each one, a read only haiku step looks at the ticket and the repo code and answers:
+`arete triage` shows open tickets not yet labelled `agent`: Jira tickets assigned to you in the projects of your Jira pipeline repos, and issues you opened in your GitHub pipeline repos.
+JEV first classifies each ticket and asks whether it gives an agent concrete work to begin.
+Repository work includes code, configuration, documentation, refactoring and bug investigation; size, routine implementation choices and declared dependencies alone do not prevent admission.
+A confident actionable fix or feature for one known repository needs no separate triage agent call.
+Its row leaves size, plan and acceptance checks empty rather than pretending the classifier investigated the code.
+The pipeline supplies those details when it plans or implements the change.
+Uncertain classifications fall back to a read-only haiku step that reads the ticket and repo code and answers:
 
 - Kind: `fix`, `feature`, `research` (find something out and report it) or `person` (a meeting, a decision, an account, a check done by hand, a change in an outside tool). A ticket that asks for research and then a change that depends on it is research.
 - Repos: the one it belongs in. A code ticket that names none, or needs more than one, gets a question to name it or split it.
@@ -2087,9 +2099,45 @@ Arete then runs each eval suite twice on the same day, once with main's prompts 
 - Size S, M or L. L means split it, so it is never ready.
 - A plan of up to 6 steps.
 
-The step may read only inside the repos it is given, has no MCP servers, and costs at most $0.30 a ticket. A ticket gets a new call only when its updated time changes, at most 20 calls a refresh; the rest wait for the next. With [JEV](#jev) on, JEV settles many research and person tickets with no model call, and those do not count toward the 20. The board puts each ticket under one heading: Ready to build, Sent to the pipeline, Research, With questions, Needs a person, Not triaged. `--refresh` triages what changed, then shows the board; `--refresh --dry-run` lists what it would triage and approve with no model call and no writes; `arete triage REF` shows one ticket in full. The `triage` loop refreshes every 15 minutes under serve.
+The fallback agent reads only inside its repos, has no MCP servers, and costs at most $0.30 a ticket.
+A ticket is assessed again when its updated time changes or the classifier's policy changes.
+Unfinished and failed assessments retry on a later refresh.
+At most 20 fallback agent calls run per refresh; confident JEV decisions do not consume that allowance, even after it is exhausted.
+The board groups tickets under Ready to build, Sent to the pipeline, Research, With questions, Needs a person and Not triaged.
+`--refresh` triages changes and shows the board; `--refresh --dry-run` previews with no model calls or tracker writes.
+`arete triage REF` shows one ticket in full.
+The triage loop refreshes every 15 minutes under serve.
 
-With `[jira] auto = true`, each refresh sends up to `auto_per_refresh` ready Jira tickets, newest first, to the pipeline by adding `agent` and the route label. That is the approval the pipeline needs, so the next poll builds the ticket, tests it and opens a PR, and the ticket gets the pipeline's usual labels and comments. A ticket goes only when it is in the sprint scope of `[jira] sprint_only`, its repo is a pipeline repo with JEV on, JEV finds no instructions to an agent in its text, and it has not changed since triage read it; otherwise the board says why it waits, and marks a ready ticket outside the sprint as such. A PR from a ticket triage sent never automerges, whatever the repo's trust level, and its body lists what triage assumed. Triage never sends a GitHub issue on its own: send it from the dashboard, or add `agent` yourself. Sent tickets stay on the board for 7 days with their pipeline status and PR.
+Enable automatic admission and fix routing in the engine configuration:
+
+```toml
+[triage]
+auto = true
+route_fixes = true
+auto_per_refresh = 50
+```
+
+`auto` defaults to false and allows ready owner-authored GitHub issues and assigned Jira tickets into their configured pipeline repos.
+It adds `agent`, `fix` or `feature`, and `agent:auto` together; Jira also receives its repository route label.
+`agent:auto` preserves the requirement for a person to merge even if label publication succeeds before the local approval record is saved.
+JEV must be enabled for the repo, its required injection screen must pass, the issue must still be open and owned, and its version must match the one triage read.
+`no-agent`, `agent:hold`, `duplicate`, `invalid`, `wontfix` and existing pipeline-state labels prevent automatic admission.
+Issues labelled `loop` stay with their dedicated loop-intake workflow.
+Dependencies can enter the queue but still block execution until resolved.
+Research and person work stay on their existing routes rather than acquiring `agent`.
+
+The default admission allowance is 50 tickets per tracker per refresh; zero disables that allowance.
+Existing `[jira] auto = true` remains supported and retains its own `auto_per_refresh` limit and sprint scope, including when the new general switch is on.
+Automatic admission never increases concurrency, bypasses dependencies or changes run budgets.
+A PR from automatic triage never automerges, whatever the repo's trust level.
+Sent tickets remain on the board for seven days with their pipeline status and PR.
+
+`route_fixes` defaults to false and independently enables classification of already-approved issues before scheduling or direct execution.
+Explicit `fix`, `bug` and `feature` labels are respected; otherwise JEV decides and saves a `fix` or `feature` label for subsequent starts.
+Remove that kind label to request a fresh classification after changing the issue's purpose.
+Confident fixes request the ADW patch flow, subject to its scope, sensitive-work, review, verification and final-check gates.
+Features use the full planning flow, and an uncertain or unavailable classifier keeps the existing route.
+Poll dry runs make no classification calls or label writes.
 
 You can also send a ticket yourself from the dashboard's Triage view.
 A ticket with questions has an Answer the questions fold, with a box for each question and Send to the pipeline under them, and a ready ticket has the button alone.
@@ -2110,7 +2158,7 @@ With `[research] synthesis = true` too (it needs `search = true`), a collator, t
 
 With `[research] audit = true` too (it needs `synthesis = true`), a fresh read-only auditor, the `research_audit` step, checks the collator's last valid synthesis before the report is written. It sees the claims (every conclusion, then every inference) and the passed-on sources with their URLs, dates and retained passages, and never the ticket, the repositories or the collator's lead. Claims go in batches of 5, decision-critical ones first, one call per batch. Each claim gets one verdict: `supported`, `contradicted`, `inference` or `unverifiable`, with the sources, a quote, a note and, where the quote supports a narrower claim, a correction. Arete refuses an answer, and asks again up to `tries` times, when a claim is missing or repeated, a verdict, source or note is missing, or a quote is not word for word in a retained passage of its sources (at least 20 characters, or the whole passage). A claim may be checked against a fresh fetch of its source instead: the auditor gets `WebFetch` limited, through `WebFetch(domain:HOST)` rules, to the public hosts of the sources its batch cites, lists at most 3 sources a call as fetched, and has no `WebSearch`; a runner without `WebFetch` checks the retained passages only. A supported claim stays; a claim with a correction is rewritten to it and marked; an `inference` verdict moves a conclusion to `Inference`; a contradicted or unverifiable claim without a correction becomes a gap that names the verdict and the auditor's note. Sources the auditor finds in disagreement join `Unresolved contradictions`. While the audit is on, the collator's own lead and summary are never published, because the audit does not check them; Arete writes both from the audited claims. The lead opens with `**Audit note:**`, lists the decision-critical claims that passed (all that passed when none is decision-critical) in their audited wording with their sources, `Inference:` before an inference, and says how many decision-critical claims did not pass. The summary is the first of those claims without source IDs. When no claim passed, both say so. The report gains an `Audit` section before `Sources`, with a line per claim, and the summary gains one sentence starting `Audit complete:`, `Audit incomplete:` or `Audit failed:`. The audit is `complete` only when every claim was checked; it is `incomplete` when the budget or a usage limit left claims unchecked, and `failed` when a batch got no valid answer. An incomplete or failed audit still publishes, with every unaudited claim marked `Not audited`; it never reads as a pass. The audit draws from the same $5 and 40 minute cap as the rest of the run; planning, search and gap rounds leave $0.50 and 5 minutes for it, and a call that cannot fit is not made. JEV screens each finding of the auditor as it screens search notes, and a flagged one leaves its claim not audited. The calls are recorded as `research REF batch N audit` (replay files `research-REF-batch-N-audit.json` and `research-REF-batch-N-audit2.json`). `arete research REF --evidence` shows each batch's tries, refusals and fetch hosts, and each claim's verdict, outcome, sources with their dates, quote, note and correction. A filed report is still reviewed by a person: its pull request never automerges.
 
-When `alert_repo` is set and private, the board is also one issue there, "[arete] triage", labeled `arete-triage`, edited only when the board changes. A public or unreadable `alert_repo` gets nothing, and the output says why. Triage writes nothing to a ticket on its own except the two labels of an auto approval, and your answers reach a ticket only when you send it.
+When `alert_repo` is set and private, the board is also one issue there, "[arete] triage", labeled `arete-triage`, edited only when the board changes. A public or unreadable `alert_repo` gets nothing, and the output says why. Triage writes only admission, kind and routing labels automatically; your answers reach a ticket only when you send it.
 
 ## Dashboard
 
