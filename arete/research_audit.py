@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 
 from . import config, outbound, research_plan, research_search, runner, steps, util
 from . import research_synthesis as synth
+from .agent import WEB_TOOLS
 from .pipeline import prompt
 
 VERDICTS = ("supported", "contradicted", "inference", "unverifiable")
@@ -244,7 +245,7 @@ def ask(cfg: config.Config, budget: research_plan.Budget, s: steps.Settings, rea
 def run(cfg: config.Config, budget: research_plan.Budget, answer: dict, evidence: dict, ref: str,
         judged: bool) -> Audit:
     s = steps.resolve(cfg, None, "research_audit")
-    read = [t for t in s.tools if t not in runner.WEB_TOOLS]
+    read = [t for t in s.tools if t not in WEB_TOOLS]
     audit = Audit()
     started = budget.spent_usd
     stop, failed = "", False
@@ -272,10 +273,10 @@ def run(cfg: config.Config, budget: research_plan.Budget, answer: dict, evidence
                 ({"claim": r["id"], "note": r["note"], "correction": r["correction"], "quote": r["quote"]}, r["screen"])
                 for r in made] + [({"issue": d["issue"]}, d["screen"]) for d in extra])
             for i, r in enumerate(made):
-                if r["screen"]["status"] in research_search.WITHHELD:
+                if research_search.is_withheld(r["screen"]["status"]):
                     made[i] = {**record(batch[i], None, WITHHELD), "screen": r["screen"]}
             audit.records += made
-            audit.disagreements += [d for d in extra if d["screen"]["status"] in research_search.PASSED_ON]
+            audit.disagreements += [d for d in extra if research_search.is_passed_on(d["screen"]["status"])]
             research_search.say(ref, f"audit batch {n}: {util.count(got.tries, 'try', 'tries')}, "
                                      f"{len(got.refused)} refused, {util.count(len(batch), 'claim')} checked")
     audit.records.sort(key=lambda r: int(r["id"][1:]))

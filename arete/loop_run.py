@@ -4,7 +4,6 @@ import hashlib
 import json
 import os
 import shlex
-import signal
 import subprocess
 import threading
 import time
@@ -28,7 +27,9 @@ from . import (
     paths,
     push,
     record,
+    routing,
     runner,
+    screening,
     sources,
     state,
     util,
@@ -72,7 +73,7 @@ class OverBudget(Exception):
 
 def spent_limit(loop: Loop, cfg: config.Config) -> str:
     tightest = loops.tightest_limit(loop, cfg)
-    return tightest[0] if tightest and tightest[1] <= runner.BUDGET_FLOOR_USD and loop.budget_blocked(cfg) else ""
+    return tightest[0] if tightest and tightest[1] <= routing.BUDGET_FLOOR_USD and loop.budget_blocked(cfg) else ""
 
 
 class StoppedByAgent(Exception):
@@ -136,13 +137,13 @@ class LoopRun:
         if not tightest:
             return None
         left = tightest[1]
-        return left if left <= runner.BUDGET_FLOOR_USD else round(left, 2)
+        return left if left <= routing.BUDGET_FLOOR_USD else round(left, 2)
 
     def agent(self, step: str, prompt: str, cwd: Path, *, model: str = "", tools: list[str] | None = None,
               **kw) -> Result:
         model = model or self.loop.model_for(self.cfg)
         res = runner.run(prompt, cwd, model=model, runner=self.loop.runner, trace=(self.id, step), cfg=self.cfg,
-                         tools=tools, allowed_tools=tools, disallowed_tools=runner.NO_GIT_WRITES,
+                         tools=tools, allowed_tools=tools, disallowed_tools=routing.NO_GIT_WRITES,
                          remaining_budget=self.room,
                          persist=False, timeout=self.loop.timeout_minutes * 60, device=self.device,
                          say=lambda text: self.log("wait", f"{step}: {text}"), repo=loop_repo(self), **kw)
@@ -160,13 +161,6 @@ def feed_stdin(proc: subprocess.Popen, text: str) -> None:
         proc.stdin.write(text)
         proc.stdin.close()
     except (BrokenPipeError, OSError, ValueError):
-        pass
-
-
-def kill_group(proc: subprocess.Popen) -> None:
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
         pass
 
 
@@ -212,7 +206,7 @@ def run_command(argv: list[str], cwd: Path | str, *, timeout: float, env: dict, 
         expired = copier.is_alive() or not exits_by(proc, deadline)
     finally:
         if expired:
-            kill_group(proc)
+            util.kill_group(proc)
     if not expired:
         return proc.returncode, "".join(lines)
     copier.join(OUTPUT_GRACE_SECONDS)
@@ -259,14 +253,6 @@ def fenced(data) -> str:
     return "```json\n" + json.dumps(data, indent=2, default=str).replace("```", "'''") + "\n```"
 
 
-class Stopped(Exception):
-    pass
-
-
-def stop_on_term(*_) -> None:
-    raise Stopped
-
-
 class NeverBegan(control.Refused):
     pass
 
@@ -291,7 +277,7 @@ def launch(name: str, *, item: int | None = None, events: list[dict] | None = No
                      repo=loop.repo or None, loop=loop.name, loop_kind=loop.kind, trigger=run.trigger,
                      device=loop.device, queue=loop.queue_name, grp=fire["grp"] if fire else "",
                      log=paths.short_path(run.log_file), model=loop.model_for(cfg) if loop.agent else "",
-                     runner=runner.route(loop.model_for(cfg), loop.runner)[0] if loop.agent else "")
+                     runner=routing.route(loop.model_for(cfg), loop.runner)[0] if loop.agent else "")
         if fire and not state.take_queue_item(item, run.id):
             why = f"queue item {item} was taken by another run"
             settle(run, "skipped", why)
@@ -340,23 +326,18 @@ def carry(run: LoopRun) -> str:
     run.scratch.mkdir(parents=True, exist_ok=True)
     how = "drop"
     try:
-        signal.signal(signal.SIGTERM, stop_on_term)
-        with devices.lease(run.loop.device, run.id, lambda text: run.log("device", text)) as run.device:
+        with (record.stoppable(),
+              devices.lease(run.loop.device, run.id, lambda text: run.log("device", text)) as run.device):
             status, summary = screened(run) or loops.KINDS[run.loop.kind].run(run)
     except OverBudget as e:
         status, summary = "skipped", f"budget: {e}"
         how = "dead"
-    except Stopped:
-        asked = record.stop_asked(run.id)
-        status, summary = "stopped", record.STOPPED if asked else "stopped by a signal"
-        how = "dead" if asked else "retry"
-    except devices.DeviceError as e:
-        status, summary = "failed", util.one_line(str(e), 500)
     except Exception as e:
-        run.log("error", traceback.format_exc().strip())
-        status, summary = "failed", f"{type(e).__name__}: {util.first_line(str(e), 300)}"
-    finally:
-        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        if not isinstance(e, record.Stopped | devices.DeviceError):
+            run.log("error", traceback.format_exc().strip())
+        status, summary = devices.outcome_of(e, run.id)
+        if status == "stopped":
+            how = "dead" if summary == record.STOPPED else "retry"
     summary = devices.with_left_up(summary, run.id)
     state.end_claim(run.id, "dead" if status == "failed" else how, summary)
     return settle(run, status, summary)
@@ -452,23 +433,22 @@ def jev_readable(run: LoopRun, events: list[dict]) -> list[dict]:
 
 
 def screened(run: LoopRun) -> tuple[str, str] | None:
-    if run.loop.kind == "command":
+    if not run.loop.agent:
         return None
     outside = jev_readable(run, [e for e in run.events if e.get("trust") == "untrusted"])
     if not outside:
         return None
-    question = {"injection": jev.yes_no(jev.INJECTION)}
-    replies = jev.ask_many([(fenced(e), question) for e in outside], run.cfg, trace=(run.id, "screen jev"))
+    screens = screening.screen_many([fenced(e) for e in outside], run.cfg, [], (run.id, "screen jev"),
+                                    whole=False, ready=True)
     flagged = set()
-    for e, reply in zip(outside, replies, strict=True):
-        a = reply.answers.get("injection")
-        if a and a.yes >= run.cfg.jev.injection:
+    for e, screened in zip(outside, screens, strict=True):
+        if screening.held(screened, screening.Posture.OPEN):
             flagged.add(id(e))
-            run.log("screen", f"dropped, it reads as instructions to an agent (JEV {a.note()}): "
+            run.log("screen", f"dropped, it reads as instructions to an agent (JEV {screened.answer.note()}): "
                               f"{util.first_line(e.get('title', ''), 120)}")
-        elif not a:
-            run.log("screen", f"JEV could not screen it ({util.first_line(reply.error, 200)}), so it goes on: "
-                              f"{util.first_line(e.get('title', ''), 120)}")
+        elif screened.status == screening.FAILED:
+            run.log("screen", f"JEV could not screen it ({util.first_line(screened.reply.error, 200)}), so it goes "
+                              f"on: {util.first_line(e.get('title', ''), 120)}")
     arrived = len(run.events)
     run.events = [e for e in run.events if id(e) not in flagged]
     if arrived and not run.events:

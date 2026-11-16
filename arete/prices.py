@@ -81,14 +81,12 @@ def condition(data, where: str) -> dict:
 
 
 def rate_entry(data, where: str) -> dict:
-    from . import routing
-
     data = table(data, RATE_KEYS, where)
     found: dict = {}
     for name in COMPONENTS:
         if name in data:
             try:
-                price = routing.number(data[name])
+                price = util.nonnegative_number(data[name])
             except OverflowError:
                 price = None
             if price is None or price > MAX_PRICE:
@@ -112,7 +110,7 @@ def rate_entry(data, where: str) -> dict:
 
 
 def route_entry(data, where: str, top: dict, claimed: dict) -> dict:
-    from . import routing, runner
+    from . import routing
 
     data = table(data, ROUTE_KEYS, where)
     for key in ("route", "kind", "provider", "model", "currency", "unit", "rates"):
@@ -131,12 +129,12 @@ def route_entry(data, where: str, top: dict, claimed: dict) -> dict:
     if not isinstance(rates, list) or not rates:
         raise ValueError(f"{where} rates: must be a nonempty list")
     aliases = items(data.get("aliases", []), f"{where} aliases")
-    vendor = routing.identity(*runner.route(name))[0]
+    vendor = routing.identity(*routing.route(name))[0]
     names = [("route", name), *[(f"aliases[{n}]", text(a, f"{where} aliases[{n}]")) for n, a in enumerate(aliases)]]
     for label, key in names:
         if key in claimed:
             raise ValueError(f"{where} {label}: name {key!r} is already used by {claimed[key]}")
-        if label != "route" and routing.identity(*runner.route(key))[0] != vendor:
+        if label != "route" and routing.identity(*routing.route(key))[0] != vendor:
             raise ValueError(f"{where} {label}: alias {key!r} is a different vendor than {name!r}")
         claimed[key] = where
     entry = {"route": name, "kind": data["kind"], "provider": text(data["provider"], f"{where} provider"),

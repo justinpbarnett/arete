@@ -20,17 +20,19 @@ from . import (
     research_search,
     research_synthesis,
     runner,
+    screening,
     state,
     tracker,
     triage,
     util,
+    workspace,
 )
-from .agent import Result
+from .agent import READ_TOOLS, Result
 from .heartbeat import mark_loop, network_up_or_skip
-from .pipeline import fill_template, make_worktree, prompt, remove_worktree, slug
+from .pipeline import fill_template, prompt, slug
 
 REPORTS_DIR = paths.STATE_DIR / "research"
-TOOLS = [*runner.READ_TOOLS, "WebSearch", "WebFetch"]
+TOOLS = [*READ_TOOLS,"WebSearch", "WebFetch"]
 TIMEOUT_SECONDS = 40 * 60
 BUDGET_USD = 5.0
 REPORT_RESERVE_USD = 4.0
@@ -131,7 +133,7 @@ def file_report(cfg: config.Config, h: Home, r: dict, report: dict) -> str:
             f"Arete researched [{r['ref']}]({r['url']}) ({util.paid_note(report['cost'])}) and files the report as `{path}`. "
             "When the ticket changes, arete researches it again and pushes the new report here.")
     base = h.base
-    wt = make_worktree(h.repo, base, branch, key)
+    wt = workspace.make_worktree(h.repo, base, branch, key)
     try:
         (wt / path).parent.mkdir(parents=True, exist_ok=True)
         (wt / path).write_text(report_file(r["ref"]).read_text())
@@ -145,7 +147,7 @@ def file_report(cfg: config.Config, h: Home, r: dict, report: dict) -> str:
             return url
         return gh.pr_create(h.repo.github, branch, base, subject, body, labels=tk.pr_labels, cwd=wt, link=link)
     finally:
-        remove_worktree(h.repo, wt)
+        workspace.remove_worktree(h.repo, wt)
 
 
 def file_in_home(cfg: config.Config, h: Home, r: dict) -> tuple[bool, str]:
@@ -444,7 +446,7 @@ def staged(cfg: config.Config, ref: str, values: dict, where: dict, cwd, add_dir
         return Result(ok=False, error=f"the research budget is spent ({budget.spent_words()}), "
                                       "so no report was written"), budget.spent_usd
     brief = research_plan.brief(plan)
-    tools = TOOLS if plan["needs_search"] else runner.READ_TOOLS
+    tools = TOOLS if plan["needs_search"] else READ_TOOLS
     if plan["needs_search"] and searching:
         found = research_search.run(cfg, budget, plan, ref, judged)
         if found.error:
@@ -456,7 +458,7 @@ def staged(cfg: config.Config, ref: str, values: dict, where: dict, cwd, add_dir
         if cfg.research_synthesis:
             res = research_synthesis.run(cfg, budget, plan, found.evidence, ref, judged, values, where, cwd, add_dirs)
             return res, budget.spent_usd
-        brief, tools = research_search.brief(plan, found.evidence), runner.READ_TOOLS
+        brief, tools = research_search.brief(plan, found.evidence), READ_TOOLS
     res = budget.call(prompt("research", **values, **where) + "\n\n" + brief, cwd, usd, seconds,
                       model=cfg.model("research"), tools=tools, allowed_tools=tools, json_schema=SCHEMA,
                       add_dirs=add_dirs, trace=("", f"research {ref} report"), cfg=cfg)
@@ -502,11 +504,12 @@ def research(cfg: config.Config, r: dict, force: bool = False, asked: bool = Fal
             why = "JEV is off, so nothing screens the ticket"
             state.research_set(ref, **base, status=HELD, error=why)
             return HELD, why
-        screened = jev.injection(f"{r['title']}\n\n{text}", cfg, trace=("", f"research {ref} injection jev"))
-        if screened is None:
-            return LATER, f"JEV could not screen {ref}"
-        if screened.yes >= cfg.jev.injection:
-            why = f"JEV reads text in it as instructions to an agent (p {screened.yes:.2f})"
+        screened = screening.screen(f"{r['title']}\n\n{text}", cfg, list(src.repos),
+                                    ("", f"research {ref} injection jev"))
+        if screening.held(screened, screening.Posture.REQUIRED):
+            if screened.status != screening.FLAGGED:
+                return LATER, f"JEV could not screen {ref}"
+            why = f"JEV reads text in it as instructions to an agent (p {screened.p:.2f})"
             state.research_set(ref, **base, status=HELD, error=why)
             return HELD, why
     state.research_set(ref, **base, status=RUNNING, error="", basis=basis,

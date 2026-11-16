@@ -6,7 +6,6 @@ import time
 from collections import Counter
 from collections.abc import Callable
 from datetime import timedelta
-from pathlib import Path
 
 from . import (
     chat,
@@ -24,10 +23,12 @@ from . import (
     run_lines,
     runlimits,
     runner,
+    slots,
     state,
     tracker,
     util,
     vault,
+    workspace,
 )
 from .refusals import TrackerFailed
 
@@ -98,7 +99,7 @@ def start_ticket(cfg: config.Config, repo: config.Repo, ticket: str, force: bool
 
 def live_run(repo: str, tid: str) -> dict | None:
     row = state.running_run(repo, tid)
-    return row if row and pipeline.holding([row], "pipeline") else None
+    return row if row and slots.holding([row], "pipeline") else None
 
 
 def run_ids(repo: str, tid: str) -> list[str]:
@@ -107,7 +108,7 @@ def run_ids(repo: str, tid: str) -> list[str]:
 
 def held(cfg: config.Config, repo: config.Repo) -> str:
     going = Counter(r["repo"] for r in pipeline.live_pipeline_runs())
-    return pipeline.held_back(cfg, repo.name, going, pipeline.slots_free_to_start(cfg.max_parallel))
+    return pipeline.held_back(cfg, repo.name, going, slots.slots_free_to_start(cfg.max_parallel))
 
 
 def queued(repo: config.Repo, tid: str, why: str, poller_picks: bool) -> dict:
@@ -157,7 +158,7 @@ def free_to_start(cfg: config.Config, repo: config.Repo, tid: str, after: str = 
     if run := live_run(repo.name, tid):
         raise control.Busy(f"run {run['id']} of {tracker.ticket_name(repo.name, tracker.ref_for(tid))}")
     if not ahead and (why := held(cfg, repo)):
-        raise pipeline.NoFreeSlot(why + after)
+        raise slots.NoFreeSlot(why + after)
     why, _ = runlimits.admission(repo, tid, tracker.for_ticket(cfg, repo, tid),
                                  runlimits.Policy.of(config.load_layer(repo.layer_dir)), True)
     if why:
@@ -348,11 +349,11 @@ def continue_asked(cfg: config.Config, repo: config.Repo, row: dict, command: li
 
 def kept_folder_removed(repo: config.Repo, tid: str, run_id: str) -> bool:
     try:
-        checkouts = [pipeline.Checkout(**{**c, "src": Path(c["src"]), "wt": Path(c["wt"])})
+        checkouts = [workspace.Checkout.from_row(c)
                      for c in flows.prepared_data(run_id).get("checkouts") or []]
     except (TypeError, KeyError):
         return False
-    return pipeline.remove_workspace(paths.WORKTREES_DIR / f"{repo.name}-{tid}", checkouts)
+    return workspace.remove_workspace(paths.WORKTREES_DIR / f"{repo.name}-{tid}", checkouts)
 
 
 def let_go(cfg: config.Config, repo: config.Repo, row: dict, status: str) -> dict:
@@ -418,7 +419,7 @@ def release_closed(cfg: config.Config) -> list[str]:
         tid = str(row["issue"])
         if row["status"] != "needs-info" or state.later_run(repo.name, row["issue"], run_id) or live_run(repo.name, tid):
             continue
-        if not pipeline.ticket_closed(cfg, repo.name, tid, row["status"]):
+        if not workspace.ticket_closed(cfg, repo.name, tid, row["status"]):
             continue
         with util.lock(STEER_LOCK, wait=True):
             row = state.run_get(run_id) or row

@@ -5,10 +5,10 @@ from arete import cli, experiment, optimize, paths, state
 root = Path(sys.argv[1])
 state.migrate()
 if importlib.util.find_spec("arete.scratch"):
-    from arete import scratch
+    from arete import sandbox, scratch
     probe = [sys.executable, "-V"]
-    if scratch.protected_command(probe) != probe:
-        scratch.AUTHORITY = root / "authority-parent/verification-authority"
+    if sandbox.protected_command(probe) != probe:
+        sandbox.AUTHORITY = root / "authority-parent/verification-authority"
 def call(*argv):
     out, err = io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):

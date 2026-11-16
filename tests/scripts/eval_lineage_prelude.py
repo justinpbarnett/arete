@@ -1,11 +1,11 @@
 
 import contextlib, io, json, os, shutil, sqlite3, sys
 from pathlib import Path
-from arete import board, codebase, config, evals, experiment, optimize, paths, scratch, state, util
+from arete import board, codebase, config, evals, experiment, optimize, paths, sandbox, scratch, state, util
 root = Path(sys.argv[1])
 probe = [sys.executable, "-V"]
-if scratch.protected_command(probe) != probe:
-    scratch.AUTHORITY = root / "authority-parent/verification-authority"
+if sandbox.protected_command(probe) != probe:
+    sandbox.AUTHORITY = root / "authority-parent/verification-authority"
 paths.ensure_dirs()
 def sample():
     state.migrate()

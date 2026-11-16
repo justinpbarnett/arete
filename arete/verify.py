@@ -4,9 +4,6 @@ import http.client
 import json
 import os
 import re
-import signal
-import socket
-import ssl
 import stat
 import subprocess
 import threading
@@ -19,16 +16,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import SplitResult, urlsplit
 
-from . import config, environment, paths, scratch, util, vault
+from . import browser, config, environment, paths, sandbox, scratch, util, vault
 from .util import git
 
-PLAYWRIGHT_MCP = "@playwright/mcp@0.0.75"
 PLAYWRIGHT_TOOLS = tuple("browser_" + n for n in (
     "navigate", "navigate_back", "snapshot", "click", "type", "press_key", "hover", "select_option", "fill_form",
     "wait_for", "take_screenshot", "console_messages", "network_requests", "resize", "handle_dialog", "tabs", "close", "file_upload"))
 PORT_FIELD = re.compile(r"\{(port\d*)\}")
 SCRATCH_FIELD = "{scratch}"
-STOP_GRACE_SECONDS = 10
 HOP_BY_HOP = frozenset(("connection", "keep-alive", "proxy-connection", "proxy-authorization", "te", "trailer",
                         "transfer-encoding", "upgrade"))
 EVIDENCE_BRANCH = "arete/evidence"
@@ -65,15 +60,6 @@ class ServerError(RuntimeError):
     pass
 
 
-def free_port(avoid: frozenset[int] = frozenset()) -> int:
-    while True:
-        with socket.socket() as s:
-            s.bind(("127.0.0.1", 0))
-            port = s.getsockname()[1]
-        if port not in avoid:
-            return port
-
-
 def port_refusal(v: config.Verify) -> str:
     if not v.start:
         return ""
@@ -82,15 +68,15 @@ def port_refusal(v: config.Verify) -> str:
         port = parts.port or (443 if parts.scheme == "https" else 80)
     except ValueError:
         return ""
-    if port not in scratch.dashboard_ports():
+    if port not in paths.dashboard_ports():
         return ""
     return (f"The verify URL {v.url} uses port {port}, which the live dashboard or a running arete serve uses; "
             "use {port} so verification gets a free port.")
 
 
 def with_free_ports(v: config.Verify) -> config.Verify:
-    avoid = scratch.dashboard_ports()
-    ports = {name: free_port(avoid) for name in dict.fromkeys(PORT_FIELD.findall(v.start + v.url + v.notes))}
+    avoid = paths.dashboard_ports()
+    ports = {name: browser.free_port(avoid) for name in dict.fromkeys(PORT_FIELD.findall(v.start + v.url + v.notes))}
 
     def filled(text: str) -> str:
         return PORT_FIELD.sub(lambda m: str(ports[m.group(1)]), text)
@@ -126,30 +112,6 @@ def preflight(v: config.Verify, cwd: Path, cfg: config.Config, repo: config.Repo
                     blocked_by=f"{failed['what']}: {failed['saw']}" if failed else "", finished=not bool(failed))
 
 
-class NamedTlsConnection(http.client.HTTPSConnection):
-    def __init__(self, address: str, port: int, hostname: str):
-        super().__init__(address, port, context=ssl.create_default_context())
-        self.hostname = hostname
-
-    def connect(self) -> None:
-        sock = socket.create_connection((self.host, self.port), self.timeout)
-        try:
-            self.sock = self._context.wrap_socket(sock, server_hostname=self.hostname)
-        except OSError:
-            sock.close()
-            raise
-
-
-def upgrade_target(resp: http.client.HTTPResponse, port: int | None) -> SplitResult | None:
-    moved = urlsplit(resp.getheader("Location") or "")
-    if resp.status not in (301, 302, 307, 308) or moved.scheme != "https" or not moved.hostname:
-        return None
-    try:
-        return moved if (moved.port or 443) == port else None
-    except ValueError:
-        return None
-
-
 def relay_server(url: str) -> ThreadingHTTPServer:
     target = urlsplit(url)
     secure: dict[str, SplitResult] = {}
@@ -158,7 +120,7 @@ def relay_server(url: str) -> ThreadingHTTPServer:
 
     def connect(address: str, port: int | None) -> http.client.HTTPConnection:
         if "via" in secure and secure["via"] is not target:
-            return NamedTlsConnection(address, port or 443, secure["via"].hostname)
+            return util.NamedTlsConnection(address, port or 443, secure["via"].hostname)
         if target.scheme == "https":
             return http.client.HTTPSConnection(address, port)
         return http.client.HTTPConnection(address, port)
@@ -174,7 +136,7 @@ def relay_server(url: str) -> ThreadingHTTPServer:
                 upstream = connect(target.hostname, target.port)
                 upstream.request(self.command, self.path, body, headers)
                 resp = upstream.getresponse()
-                if plain and (moved := upgrade_target(resp, target.port)):
+                if plain and (moved := util.https_upgrade(resp, target.port)):
                     upstream.close()
                     secure.setdefault("via", moved)
                     moved = secure["via"]
@@ -227,7 +189,7 @@ def relayed(url: str):
 
 @contextmanager
 def serving(v: config.Verify, cwd: Path, log: Path, cfg: config.Config | None = None,
-            repo: config.Repo | None = None, sets: dict[str, str] | None = None, lifetime: dict | None = None,
+            repo: config.Repo | None = None, lifetime: dict | None = None,
             attempt: scratch.Attempt | None = None):
     if lifetime is not None:
         lifetime["stopped"] = True
@@ -235,19 +197,17 @@ def serving(v: config.Verify, cwd: Path, log: Path, cfg: config.Config | None = 
         yield ""
         return
     url = v.url.rstrip("/")
-    with relayed(url) if attempt and not scratch.loopback(url) else nullcontext(url) as reach:
+    with relayed(url) if attempt and not browser.loopback(url) else nullcontext(url) as reach:
         listen = None
         if attempt:
-            app = scratch.app_port(attempt, reach)
-            listen = scratch.listen_port(attempt, app, scratch.dashboard_ports())
-            scratch.update_browser(attempt, listen=listen)
+            app = browser.app_port(attempt, reach)
+            listen = browser.listen_port(attempt, app, paths.dashboard_ports())
+            browser.update_browser(attempt, listen=listen)
         command = scratch.service_command(attempt, v.start, listen) if attempt else v.start
-        env, kept = environment.started(cfg or config.load(), repo, sets)
+        env, kept = environment.started(cfg or config.load(), repo)
         if attempt:
             env = {k: v for k, v in env.items() if not paths.CREDENTIAL_NAME.search(k) or kept.get(k) == v}
-            env.update({scratch.ENV_NAME: attempt.root, "ARETE_CONFIG_DIR": attempt.root + "/config",
-                        "ARETE_STATE_DIR": attempt.root + "/state", "ARETE_LOG_DIR": attempt.root + "/state/logs",
-                        "ARETE_WORKTREES_DIR": attempt.root + "/state/worktrees"})
+            env.update(scratch.attempt_env(attempt))
         log.write_text("")
         with scratch.producing(attempt):
             proc = scratch.spawn(command, shell=isinstance(command, str), cwd=cwd, stdout=subprocess.PIPE,
@@ -261,8 +221,8 @@ def serving(v: config.Verify, cwd: Path, log: Path, cfg: config.Config | None = 
             wait_until_ready(proc, url + "/" + v.ready.lstrip("/"), v.ready_seconds, log)
             yield reach
         finally:
-            stop(proc)
-            pump.join(STOP_GRACE_SECONDS)
+            util.stop_group(proc)
+            pump.join(util.GROUP_STOP_SECONDS)
             if lifetime is not None:
                 try:
                     os.killpg(proc.pid, 0)
@@ -310,32 +270,6 @@ def environment_fault(error: str) -> str:
 def output(log: Path) -> str:
     text = vault.hidden(util.tail(log.read_text(errors="replace").strip(), 3000))
     return f"\n\n```\n{text}\n```" if text else "; the start command printed nothing"
-
-
-def stop(proc: subprocess.Popen) -> None:
-    for sig in (signal.SIGTERM, signal.SIGKILL):
-        try:
-            os.killpg(proc.pid, sig)
-        except (ProcessLookupError, PermissionError):
-            break
-        deadline = time.monotonic() + STOP_GRACE_SECONDS
-        while time.monotonic() < deadline and group_alive(proc):
-            time.sleep(0.2)
-    proc.wait()
-
-
-def group_alive(proc: subprocess.Popen) -> bool:
-    proc.poll()
-    try:
-        os.killpg(proc.pid, 0)
-        return True
-    except (ProcessLookupError, PermissionError):
-        return False
-
-
-def mcp_config(output_dir: Path) -> str:
-    args = ["-y", PLAYWRIGHT_MCP, "--headless", "--isolated", "--browser", "chrome", "--output-dir", str(output_dir)]
-    return json.dumps({"mcpServers": {"playwright": {"command": "npx", "args": args}}})
 
 
 @dataclass
@@ -439,7 +373,7 @@ def push_evidence(src: Path, github: str, run_id: str, files: list[Path]) -> dic
         return {}
     blobs = ""
     for f in files:
-        command = scratch.protected_command(["git", "hash-object", "-w", "--stdin"], src)
+        command = sandbox.protected_command(["git", "hash-object", "-w", "--stdin"], src)
         done = subprocess.run(command, check=False, cwd=src, input=contents[f], capture_output=True, timeout=300)
         if done.returncode != 0:
             raise RuntimeError(f"git hash-object: {util.git_error(done.stderr.decode(errors='replace'))}")

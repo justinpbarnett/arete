@@ -17,7 +17,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from arete import (
-    claude,
+    child,
     cli,
     config,
     control,
@@ -27,16 +27,16 @@ from arete import (
     gh,
     run_lines,
     paths,
-    pi,
     pipeline,
     record,
     runlimits,
-    scratch,
+    sandbox,
     serve,
     state,
     steps,
     tracker,
     util,
+    workspace,
 )
 from arete.agent import Result
 
@@ -47,10 +47,10 @@ def setUpModule():
     folder = tempfile.TemporaryDirectory(prefix="arete-no-live-")
     unittest.addModuleCleanup(folder.cleanup)
     root = Path(folder.name).resolve()
-    for pointer in (patch.object(scratch, "AUTHORITY", root / "authority" / "verification-authority"),
+    for pointer in (patch.object(sandbox, "AUTHORITY", root / "authority" / "verification-authority"),
                     patch.object(paths, "SERVER_FILE", root / "state" / "server.json"),
                     patch.object(paths, "PI_KEYS_FILE", root / "config" / "pi.env"),
-                    *(patch.object(pi, name, root / "state" / getattr(pi, name).name)
+                    *(patch.object(sandbox, name, root / "state" / getattr(sandbox, name).name)
                       for name in ("AGENT_DIR", "LOGIN_DIR", "KEY_DIR", "SESSIONS_DIR"))):
         pointer.start()
         unittest.addModuleCleanup(pointer.stop)
@@ -661,7 +661,7 @@ class BudgetTests(Isolated):
         def transport(*args, **kw):
             code = (f"import os,time;from pathlib import Path;Path({str(pid_file)!r}).write_text(str(os.getpid()));"
                     "time.sleep(20)")
-            return claude.run_streaming([sys.executable, "-I", "-c", code], str(workspace), "", {}, 30, lambda _: None)
+            return child.stream([sys.executable, "-I", "-c", code], str(workspace), "", {}, 30, lambda _: None)
 
         def drive(flow):
             run = flow.ctx.run
@@ -752,7 +752,7 @@ class QueueTests(Isolated):
                 patch.object(pipeline, "spawn_run", side_effect=spawn), \
                 patch.object(pipeline, "settle_abandoned_runs"), patch.object(pipeline, "sync_outcomes"), \
                 patch.object(pipeline, "sync_moves"), patch.object(pipeline, "sync_landings"), \
-                patch.object(pipeline, "cleanup_worktrees"), patch.object(pipeline, "mark_loop"), \
+                patch.object(workspace, "cleanup_worktrees"), patch.object(pipeline, "mark_loop"), \
                 patch.object(pipeline, "SKIPPED_FILE", self.root / "skipped.json"):
             return pipeline.poll()
 
@@ -882,7 +882,7 @@ class KeptEditsTests(Isolated):
         return util.git(["rev-parse", "HEAD"], where).strip()
 
     def start(self, run):
-        made = pipeline.make_workspace(run.id, self.repo, "main", self.BRANCH, "t1", [])
+        made = workspace.make_workspace(run.id, self.repo, "main", self.BRANCH, "t1", [])
         run.workspace = made
         return made
 
@@ -891,7 +891,7 @@ class KeptEditsTests(Isolated):
         ws, checkouts = self.start(run)
         (checkouts[0].wt / name).write_text(text)
         pipeline.keep_edits(run)
-        pipeline.note_made(ws, checkouts)
+        workspace.note_made(ws, checkouts)
         return ws, checkouts[0]
 
     def push_from_elsewhere(self, name, text, ref=BRANCH):
@@ -920,7 +920,7 @@ class KeptEditsTests(Isolated):
         _, first = self.parked_edit()
         kept = self.head(first.wt)
         util.git(["reset", "-q", "--hard", "HEAD~1"], first.wt)
-        with self.assertRaises(pipeline.RunFailed) as refused:
+        with self.assertRaises(workspace.RunFailed) as refused:
             self.start(self.made_run())
         self.assertIn(kept[:12], refused.exception.why)
         self.assertIn(self.head(first.wt)[:12], refused.exception.why)
@@ -969,11 +969,11 @@ class KeptEditsTests(Isolated):
         self.assertEqual(util.git(["show", "--name-only", "--format=", "HEAD"], wt).split(), ["edit.txt"])
         self.assertTrue((wt / ".env").exists())
         self.assertEqual(pipeline.stage(checkouts, diffguard.denied_paths(self.layer)).denied, [".env"])
-        pipeline.note_made(ws, checkouts)
+        workspace.note_made(ws, checkouts)
         self.push_from_elsewhere("moved.txt", "moved\n")
         again = self.made_run()
         _, second = self.start(again)
-        with self.assertRaises(pipeline.RunFailed) as refused:
+        with self.assertRaises(workspace.RunFailed) as refused:
             pipeline.settle_starts(again, second, self.layer, self.ticket_data, self.BRANCH)
         self.assertIn(".env", refused.exception.why)
         self.assertTrue((wt / ".env").exists())
@@ -984,13 +984,13 @@ class KeptEditsTests(Isolated):
         wt, pr_head = checkouts[0].wt, self.head(checkouts[0].wt)
         (wt / "edit.txt").write_text("edit\n")
         staged = pipeline.stage(checkouts, [])
-        with patch.object(pipeline, "remote_head", return_value="someone-else"), \
-                self.assertRaises(pipeline.RunFailed):
+        with patch.object(workspace, "remote_head", return_value="someone-else"), \
+                self.assertRaises(workspace.RunFailed):
             pipeline.commit_and_push(checkouts, staged.changed, self.BRANCH, "work")
         committed = self.head(wt)
         self.assertNotEqual(committed, pr_head)
         pipeline.keep_edits(run)
-        pipeline.note_made(ws, checkouts)
+        workspace.note_made(ws, checkouts)
         again = self.made_run()
         _, second = self.start(again)
         pipeline.settle_starts(again, second, self.layer, self.ticket_data, self.BRANCH)
@@ -1005,7 +1005,7 @@ class KeptEditsTests(Isolated):
         (wt / "edit.txt").write_text("edit\n")
         with patch.object(pipeline, "commit_kept", side_effect=RuntimeError("hook failed")):
             pipeline.keep_edits(run)
-        pipeline.note_made(ws, checkouts)
+        workspace.note_made(ws, checkouts)
         again = self.made_run()
         _, second = self.start(again)
         pipeline.settle_starts(again, second, self.layer, self.ticket_data, self.BRANCH)
@@ -1040,8 +1040,8 @@ class KeptEditsTests(Isolated):
         self.push_from_elsewhere("shared.txt", "theirs\n")
         run = self.made_run()
         _, checkouts = self.start(run)
-        with patch.object(pipeline, "resolve_conflicts", side_effect=pipeline.RunFailed("resolver failed")), \
-                self.assertRaises(pipeline.RunFailed):
+        with patch.object(pipeline, "resolve_conflicts", side_effect=workspace.RunFailed("resolver failed")), \
+                self.assertRaises(workspace.RunFailed):
             pipeline.settle_starts(run, checkouts, self.layer, self.ticket_data, self.BRANCH)
         self.assertEqual(self.head(checkouts[0].wt), kept)
         self.assertEqual(util.git(["status", "--short"], checkouts[0].wt).strip(), "")
@@ -1309,8 +1309,8 @@ class RouteABTests(Isolated):
 class NoLiveStateTests(unittest.TestCase):
     def test_no_test_here_points_at_the_live_authority_or_state(self):
         live = (Path.home() / ".config" / "arete", Path.home() / ".local" / "share" / "arete")
-        for path in (scratch.AUTHORITY, paths.SERVER_FILE, paths.PI_KEYS_FILE, pi.AGENT_DIR, pi.LOGIN_DIR, pi.KEY_DIR,
-                     pi.SESSIONS_DIR):
+        for path in (sandbox.AUTHORITY, paths.SERVER_FILE, paths.PI_KEYS_FILE, sandbox.AGENT_DIR, sandbox.LOGIN_DIR,
+                     sandbox.KEY_DIR, sandbox.SESSIONS_DIR):
             self.assertFalse(any(path.resolve().is_relative_to(r.resolve()) for r in live), path)
 
 

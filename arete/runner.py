@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import secrets
 import sys
 import time
@@ -14,6 +13,7 @@ from pathlib import Path
 
 from . import (
     accounts,
+    browser,
     claude,
     codex,
     config,
@@ -28,6 +28,9 @@ from . import (
     prices,
     record,
     replay,
+    routing,
+    sandbox,
+    scrub,
     state,
     uploads,
     util,
@@ -36,43 +39,24 @@ from . import scratch as verification_scratch
 from .agent import (
     NO_SESSION,
     READ_ONLY_TOOLS,
-    READ_TOOLS,
+    REPLAY,
+    TRAITS,
+    USAGE,
     Cut,
     Result,
     Session,
     UsageLimit,
-    model_scope,
     streamed_turn,
     subscription,
+    traits_of,
 )
 
-REPLAY = replay.RUNNER
-RUNNERS = ("claude", "pi", "codex", REPLAY)
-CODEX_NAMES = ("gpt-", "codex-")
 SECRET_SEARCH_SKIPS = frozenset({".git", "node_modules", ".venv", "venv", "__pycache__"})
 SECRET_SEARCH_DEPTH = 4
-BUDGET_FLOOR_USD = 0.005
-WEB_TOOLS = ("WebSearch", "WebFetch")
-WEB_TOOLS_OF = {"claude": WEB_TOOLS}
-EDIT_TOOLS = [*READ_TOOLS, "Edit", "Write"]
-BUILD_TOOLS = [*EDIT_TOOLS, "TodoWrite"]
-WRITING_TOOLS = frozenset({"Edit", "MultiEdit", "Write"})
-KNOWN_TOOLS = READ_ONLY_TOOLS | WRITING_TOOLS | {"Bash"}
-NO_GIT_WRITES = [
-    "Bash(git commit*)", "Bash(git push*)", "Bash(git reset*)", "Bash(git checkout*)",
-    "Bash(git switch*)", "Bash(git rebase*)", "Bash(git merge*)", "Bash(gh *)",
-]
-PI_HOLDS_NO_BASH_RULES = "pi cannot hold the rules that stop git writes"
-SANDBOX_RUNS_PI = ("an exe device runs agents on pi, not claude; pick a provider/model such as exe-llm/gpt-5.4-mini "
-                   "or openrouter/<model id>")
+KNOWN_TOOLS = READ_ONLY_TOOLS | routing.WRITING_TOOLS | {"Bash"}
 LOGIN_WARNING_DAYS = 7
 HOLD_CHECK_SECONDS = 60
 NO_ROUTE = "no route can run this call"
-CANNOT_GATE = {"pi": "pi restates a structured answer in a second launch that cannot be gated against the calls "
-                     "and time limits"}
-NO_SERVER_ACCESS = {"codex": "codex runs with the network off, so it cannot reach the arete server",
-                    "pi": "pi has no restricted Bash, so it cannot run the arete session commands"}
-CANNOT_STOP = {"codex": "codex reports usage only when its turn ends, so it cannot stop a call at a token or spend limit"}
 HEADROOM_STATE = "headroom"
 CONTINUE_AFTER_LIMIT = "The usage limit cut the last step short. Carry on from where you stopped and finish the step."
 
@@ -87,36 +71,15 @@ def short_of_headroom(headroom: dict, tokens_left: int, dollars_left: float | No
 
 def codex_refusal(which: str, headroom: dict | None, tokens: Callable[[], int],
                   budget: float | None) -> tuple[str, str]:
-    if which not in CANNOT_STOP:
+    if not (why := traits_of(which).cannot_stop):
         return "", ""
     if headroom is None:
-        return "ineligible", CANNOT_STOP[which]
+        return "ineligible", why
     return HEADROOM_STATE, short_of_headroom(headroom, tokens(), budget)
 
 
-def route(model: str, runner: str = "") -> tuple[str, str]:
-    prefix, _, rest = model.partition(":")
-    if prefix in RUNNERS and rest:
-        return prefix, rest
-    if runner in RUNNERS:
-        return runner, model
-    if "/" in model:
-        return "pi", model
-    return ("codex" if model.lower().startswith(CODEX_NAMES) else "claude"), model
-
-
-def chosen(model: str, run_with: str, cfg: config.Config) -> tuple[str, str]:
-    which, name = route(model, run_with)
-    return (REPLAY if cfg.replay.all else which), name
-
-
-def stands_for(model: str, run_with: str) -> tuple[str, str]:
-    which, name = route(model, "" if run_with == REPLAY else run_with)
-    return (which if which != REPLAY else route(name)[0]), name
-
-
 def web_tools(model: str, run_with: str) -> tuple[str, ...]:
-    return WEB_TOOLS_OF.get(stands_for(model, run_with)[0], ())
+    return traits_of(routing.stands_for(model, run_with)[0]).web_tools
 
 
 def run_env(run_id: str) -> dict[str, str]:
@@ -125,7 +88,7 @@ def run_env(run_id: str) -> dict[str, str]:
 
 def env_names(model: str, run_with: str, cfg: config.Config, repo: config.Repo | None, run_id: str,
               extra: dict | None = None) -> list[str]:
-    which, _ = stands_for(model, run_with)
+    which, _ = routing.stands_for(model, run_with)
     passing = environment.passed(cfg, repo)
     if which == "pi":
         return sorted({*environment.build(passing), *(extra or {})})
@@ -146,7 +109,7 @@ def judge_note(cfg: config.Config, passing: list[str] | None = None, repo: confi
 def authentication(model: str, run_with: str = "", *, cfg: config.Config | None = None,
                    repo: config.Repo | None = None, device: devices.Device | str = "local",
                    mode: str = "") -> accounts.Auth:
-    which, name = route(model, run_with)
+    which, name = routing.route(model, run_with)
     if which == REPLAY or (cfg and cfg.replay.all):
         return accounts.Auth()
     cfg = cfg or config.load()
@@ -154,107 +117,21 @@ def authentication(model: str, run_with: str = "", *, cfg: config.Config | None 
     passing = environment.passed(cfg, repo)
     remote = target if target.remote else None
     if which == "pi":
-        return pi_route(name, cfg, repo, target, mode=mode).auth
+        return routing.pi_route(name, cfg, repo, target, mode=mode).auth
     return (codex if which == "codex" else claude).authentication(passing, remote=remote)
-
-
-def metered(model: str, run_with: str = "", *, cfg: config.Config | None = None, repo: config.Repo | None = None,
-            device: devices.Device | str = "local", tools: list[str] | None = None) -> bool:
-    from . import routing
-
-    cfg = cfg or config.load()
-    return routing.can_charge(routing.outlook(cfg, repo, device, model, run_with, tools, NO_GIT_WRITES))
-
-
-def limit_applies(scope: str, model: str) -> bool:
-    if scope.startswith("model:"):
-        return scope == model_scope(model)
-    return scope in (claude.EVERY_MODEL, codex.LIMIT_SCOPE) or scope in re.split(r"[-_/.:]", model.lower())
-
-
-def auth_hold(auth: accounts.Auth, model: str, connect=state.db, unknown: str = "") -> dict | None:
-    if not (auth.identity or auth.credential or unknown):
-        return None
-    scopes = [accounts.scope(auth, s, unknown) for s in limit_scopes(auth, model)]
-    found = [h for h in state.holds(connect) if h["scope"] in scopes]
-    return next((h for h in found if not h["until"]), found[-1] if found else None)
-
-
-def limit_scopes(auth: accounts.Auth, model: str) -> tuple[str, ...]:
-    if auth.mode == "api_key":
-        return ("credit",)
-    if auth.family == "claude":
-        return (claude.EVERY_MODEL, *(s for s in claude.LIMIT_SCOPES.values() if limit_applies(s, model)),
-                model_scope(model))
-    if auth.family == "codex":
-        return (codex.LIMIT_SCOPE, model_scope(model))
-    return (auth.provider or provider_of(model), model_scope(model))
-
-
-def pi_route(model: str, cfg: config.Config, repo=None, device="local", connect=state.db,
-             mode: str = "") -> pi.Route | None:
-    if devices.resolve(device).remote:
-        return pi.Route(provider_of(model), model, accounts.Auth(), error=pi.REMOTE_AUTH_UNVERIFIED)
-    return pi.select(model, environment.passed(cfg, repo), cfg.environment.providers,
-                     held=lambda auth, name: auth_hold(auth, name, connect), mode=mode,
-                     local_providers=cfg.local_providers)
-
-
-def usage_hold(model: str, run_with: str = "", connect=state.db, cfg: config.Config | None = None,
-               repo: config.Repo | None = None, device: devices.Device | str = "local",
-               tools: list[str] | None = None, remaining: float | None = None, denied=NO_GIT_WRITES) -> str:
-    from . import routing
-
-    cfg = cfg or config.load()
-    return routing.held_words(routing.outlook(cfg, repo, device, model, run_with, tools, denied, remaining,
-                                               connect))
-
-
-def hold_words(hold: dict) -> str:
-    return (f"{hold['why']}, waiting until {local_time(hold['until'])}" if hold["until"] else
-            f"{hold['why']}, held until cleared")
-
-
-def local_time(stamp: str) -> str:
-    return util.parse_iso(stamp).astimezone().strftime("%a %b %d %H:%M")
 
 
 def tell_stderr(text: str) -> None:
     print(f"{util.iso()} {text}", file=sys.stderr, flush=True)
 
 
-def provider_of(model: str) -> str:
-    return model.split("/", 1)[0] if "/" in model else ""
-
-
 def agent_problems(run_with: str, tools: list[str]) -> list[str]:
     problems = []
-    if run_with and run_with not in RUNNERS:
-        problems.append(f"runner '{run_with}' is not one of {', '.join(RUNNERS)}")
+    if run_with and run_with not in routing.RUNNERS:
+        problems.append(f"runner '{run_with}' is not one of {', '.join(routing.RUNNERS)}")
     if unknown := sorted(set(tools) - KNOWN_TOOLS):
         problems.append(f"unknown tools {', '.join(unknown)}; use {', '.join(sorted(KNOWN_TOOLS))}")
     return problems
-
-
-def device_refusal(model: str, run_with: str, device: devices.Device) -> str:
-    which = route(model, run_with)[0]
-    if which == "pi" and device.remote:
-        return pi.REMOTE_AUTH_UNVERIFIED
-    if which == "codex" and device.remote:
-        return codex.RUNS_LOCALLY
-    return SANDBOX_RUNS_PI if device.exe_sandbox and which == "claude" else ""
-
-
-def withheld(model: str, run_with: str, tools: list[str], device: devices.Device) -> dict[str, list[str]]:
-    if route(model, run_with)[0] != "pi" or device.exe_sandbox:
-        return {}
-    reasons: dict[str, list[str]] = {}
-    for tool in tools:
-        if tool == "Bash":
-            reasons.setdefault(PI_HOLDS_NO_BASH_RULES, []).append(tool)
-        elif tool in WRITING_TOOLS and not pi.can_confine(device.remote):
-            reasons.setdefault(pi.NO_CONFINEMENT_REASON, []).append(tool)
-    return reasons
 
 
 def claude_login() -> tuple[bool, str]:
@@ -292,7 +169,7 @@ def priced(res: Result, cfg: config.Config) -> float:
     rate = cfg.pricing.get(res.model) or cfg.pricing.get(f"{res.runner}:{res.model}")
     if rate:
         return (res.tokens_in * (rate[0] or 0) + res.tokens_out * (rate[1] or 0)) / 1_000_000
-    if res.runner == "pi" and (res.provider or provider_of(res.model)) in cfg.local_providers:
+    if res.runner == "pi" and (res.provider or routing.provider_of(res.model)) in cfg.local_providers:
         return 0.0
     return res.cost_usd
 
@@ -312,7 +189,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
     if max_steps is not None:
         kw["action_limit"] = ActionLimit(max_steps)
     run_with = runner or (resume.runner if not model else "")
-    which, name = chosen(model, run_with, cfg)
+    which, name = routing.chosen(model, run_with, cfg)
     kept = resume if resume.runner == which else NO_SESSION
     target = devices.LOCAL if which == REPLAY else devices.resolve(device)
     trace = trace if trace[0] else (os.environ.get("ARETE_RUN_ID", ""), trace[1] or "agent")
@@ -329,7 +206,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         if resume_only and not kept.id:
             return unresumable(which, name, resume)
         if remaining_tokens:
-            stood = stands_for(model, run_with)[0]
+            stood = routing.stands_for(model, run_with)[0]
             verdict, why = codex_refusal(stood, codex_headroom, remaining_tokens,
                                          remaining_budget() if remaining_budget else kw.get("max_budget_usd"))
             if why:
@@ -347,14 +224,13 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
                        atom)
     if not target.remote:
         repo = repo or cfg.repo_for_work_dir(cwd)
-    size = routing_size(prompt, settings, kw)
-    active = layer if layer is not None else layer_of(repo)
-    trip = Trip(cfg, repo, target, request_for(cfg, repo, which, name, settings, fallback, kw, size, active), resume,
+    size = routing.routing_size(prompt, settings, kw)
+    active = layer if layer is not None else routing.layer_of(repo)
+    trip = Trip(cfg, repo, target,
+                routing.request_for(cfg, repo, which, name, settings, fallback, kw, size, active), resume,
                 remaining_budget, kw.get("max_budget_usd"), layer=active, scratch=scratch,
                 tokens=remaining_tokens, structured=kw.get("json_schema") is not None,
                 hard_cap=hard_cap, needs_server=needs_server, headroom=codex_headroom)
-    from . import routing
-
     limited: list[Result] = []
     previous: Stopped | None = None
     launches, measured = 0, size
@@ -365,7 +241,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         if not picked:
             wake = wake_up(skipped)
             if wait_out_limits and wake:
-                say(f"{NO_ROUTE}, waiting until {local_time(util.iso(wake))}: {route_reasons(skipped)}")
+                say(f"{NO_ROUTE}, waiting until {routing.local_time(util.iso(wake))}: {route_reasons(skipped)}")
                 with waits("limit"):
                     wait_until(trip, wake)
                 continue
@@ -381,7 +257,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         chosen_route = picked.candidate
         text, session = session_for(trip, picked, prompt, fresh_prompt, previous, kw, record_id)
         launch_kw = launch_kwargs(kw, picked, trip, trace, ask_jev, say, cwd=cwd)
-        final_size = routing_size(text, settings, launch_kw)
+        final_size = routing.routing_size(text, settings, launch_kw)
         measured = max(measured, final_size)
         if (trip.request.requires.declared and final_size > trip.request.size
                 and (why := outgrown(trip, chosen_route, final_size))):
@@ -415,7 +291,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         if not res.usage_limit:
             if res.ok:
                 state.clear_holds([accounts.scope(a, s, picked.unknown) for a in picked.auths
-                                   for s in limit_scopes(a, picked.name)], set_before=started)
+                                   for s in routing.limit_scopes(a, picked.name)], set_before=started)
             return with_spent(res, limited)
         limit = res.usage_limit
         why = f"{chosen_route.runner} {limit.kind or 'usage'} limit reached"
@@ -430,7 +306,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
             ends = util.parse_iso(limit.until)
             trip.floors[key] = (ends if ends > util.now() else util.now() + timedelta(seconds=HOLD_CHECK_SECONDS),
                                 picked.auth)
-        say(f"{hold_words({'why': why, 'until': limit.until})}, trying another route")
+        say(f"{routing.hold_words({'why': why, 'until': limit.until})}, trying another route")
 
 
 def unresumable(which: str, name: str, resume: Session) -> Result:
@@ -516,8 +392,7 @@ class Meter:
     def add(self, turn: dict) -> None:
         seen = self.seen
         seen.turns += turn.get("turns", 1)
-        seen.cost_usd += turn["cost_usd"]
-        for key in ("tokens_in", "tokens_out", "cache_read", "cache_write"):
+        for key in USAGE:
             setattr(seen, key, getattr(seen, key) + turn[key])
         used = seen.tokens_in + seen.tokens_out
         if self.tokens is not None and used >= self.tokens:
@@ -533,7 +408,7 @@ class Meter:
         reported = res.tokens_in or res.tokens_out or res.cost_usd or res.calls
         if reported or not self.seen.turns:
             return res
-        keys = ("turns", "cost_usd", "tokens_in", "tokens_out", "cache_read", "cache_write")
+        keys = ("turns", *USAGE)
         return replace(res, **{k: getattr(self.seen, k) for k in keys})
 
 
@@ -554,48 +429,7 @@ class Stopped:
     picked: Picked
 
 
-def reach(kw: dict) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    granted = kw["tools"] if kw.get("tools") is not None else (kw.get("allowed_tools") or [])
-    denied = tuple(dict.fromkeys(kw.get("disallowed_tools") or []))
-    bare = tuple(t for t in dict.fromkeys(granted)
-                 if "(" not in t and not t.startswith("mcp__") and t not in denied)
-    return bare, denied
-
-
-def routing_size(prompt: str, settings, kw: dict) -> int:
-    from . import routing
-
-    if not (settings and settings.requires.declared):
-        return 0
-    return routing.request_tokens(prompt, kw.get("system", ""), kw.get("json_schema"))
-
-
-def request_for(cfg: config.Config, repo: config.Repo | None, which: str, name: str, settings, fallback: bool,
-                kw: dict, size: int = 0, layer: config.RepoLayer | None = None):
-    from . import routing, steps
-
-    bare, denied = reach(kw)
-    try:
-        servers = json.loads(kw.get("mcp_config") or "{}").get("mcpServers") or {}
-    except (ValueError, AttributeError):
-        servers = {}
-    effort = settings.effort if settings else kw.get("effort", "")
-    given = kw.get("instructions")
-    explicit = (tuple(settings.instructions) if settings.instructions_explicit else None) if settings else (
-        None if given is None else tuple(given))
-    requires = settings.requires if settings else routing.Requirements()
-    if settings and settings.chain and (requires.declared or routing.identity(which, name) == routing.identity(
-            settings.chain[0].runner, settings.chain[0].model)):
-        chain, allowed = settings.chain, settings.fallback
-    else:
-        layer = layer if layer is not None else layer_of(repo)
-        chain, allowed = steps.chain_for(cfg, layer, which, name, effort, explicit)
-    return routing.Request(chain, allowed and fallback, bare, tuple(servers), effort, explicit, denied, requires, size)
-
-
 def outgrown(trip: Trip, chosen, size: int) -> str:
-    from . import routing
-
     discovery = routing.Discovery(trip.cfg, trip.repo, trip.target, layer=trip.layer)
     key = routing.route_key(chosen)
     again = discovery.routes(replace(trip.request, size=size), request_tokens=size)
@@ -604,8 +438,6 @@ def outgrown(trip: Trip, chosen, size: int) -> str:
 
 def launched_selection(trip: Trip, prior: dict | None, skipped: list[dict], size: int, chosen=None, name: str = "",
                        error: str = "") -> dict | None:
-    from . import routing
-
     if not trip.request.requires.declared:
         return prior
     base = prior or routing.described_selection(routing.Selection(None, False, ""), trip.request, size)
@@ -633,21 +465,12 @@ def refused(which: str, name: str, prompt: str, cwd: Path | str, session: Sessio
                    tier, kind, accounts.Auth(), route, try_no, atom)
 
 
-def layer_of(repo: config.Repo | None):
-    try:
-        return config.load_layer(repo.layer_dir) if repo else None
-    except (ValueError, OSError):
-        return None
-
-
 def passed_over(found, why: str, detail: str, until: str = "") -> dict:
     return {"runner": found.runner, "model": found.model, "credential": found.credential, "state": why,
             "detail": detail, "until": until}
 
 
 def pick(trip: Trip) -> tuple[Picked | None, list[dict]]:
-    from . import routing
-
     discovery = routing.Discovery(trip.cfg, trip.repo, trip.target, layer=trip.layer)
     found = discovery.routes(trip.request, request_tokens=trip.request.size)
     wanted = trip.resume
@@ -666,19 +489,20 @@ def pick(trip: Trip) -> tuple[Picked | None, list[dict]]:
             if why:
                 skipped.append(passed_over(candidate, verdict, why))
                 continue
-        if trip.tokens is not None and trip.structured and (why := CANNOT_GATE.get(candidate.runner)):
-            skipped.append(passed_over(candidate, "ineligible", why))
+        traits = traits_of(candidate.runner)
+        if trip.tokens is not None and trip.structured and traits.cannot_gate:
+            skipped.append(passed_over(candidate, "ineligible", traits.cannot_gate))
             continue
         remaining = None
-        if trip.needs_server and candidate.runner in NO_SERVER_ACCESS:
-            skipped.append(passed_over(candidate, "ineligible", NO_SERVER_ACCESS[candidate.runner]))
+        if trip.needs_server and traits.no_server_access:
+            skipped.append(passed_over(candidate, "ineligible", traits.no_server_access))
             continue
         if trip.hard_cap and candidate.billing == "paid" and candidate.runner == "codex":
             skipped.append(passed_over(candidate, "ineligible", "codex cannot stop a paid call at a dollar limit"))
             continue
         if candidate.billing == "paid" and candidate.state in ("ready", "held"):
             remaining = trip.budget() if trip.budget else trip.max_budget
-            if remaining is not None and remaining <= BUDGET_FLOOR_USD:
+            if remaining is not None and remaining <= routing.BUDGET_FLOOR_USD:
                 skipped.append(passed_over(candidate, "budget_spent", "API-key budget is spent"))
                 continue
         if candidate.state != "ready":
@@ -699,14 +523,15 @@ def pick(trip: Trip) -> tuple[Picked | None, list[dict]]:
             continue
         unknown = "local-" + accounts.fingerprint(trip.invocation, auth.generation)
         auths = {auth, *(selected.refreshed_auths if selected else ())}
-        active = [h for a in auths if (h := auth_hold(a, name, unknown=unknown))]
+        active = [h for a in auths if (h := routing.auth_hold(a, name, unknown=unknown))]
         held = max(active, key=lambda h: (not h["until"], h["until"]), default=None)
         if held:
-            skipped.append(passed_over(candidate, "held", hold_words(held), held["until"]))
+            skipped.append(passed_over(candidate, "held", routing.hold_words(held), held["until"]))
             continue
         floor = trip.floors.get(key)
         if floor and floor[0] > util.now() and floor[1] == auth:
-            skipped.append(passed_over(candidate, "held", f"limit reported, rechecking after {local_time(util.iso(floor[0]))}",
+            skipped.append(passed_over(candidate, "held",
+                                       f"limit reported, rechecking after {routing.local_time(util.iso(floor[0]))}",
                                        util.iso(floor[0])))
             continue
         return Picked(candidate, auth, selected, name, unknown, auths, remaining), skipped
@@ -733,7 +558,7 @@ def route_reasons(skipped: list[dict]) -> str:
 def exhausted(trip: Trip, skipped: list[dict], limited: list[Result], which: str, name: str, wake) -> Result:
     held = any(s["state"] == "held" for s in skipped)
     return Result(ok=False, error=" ".join(f"{NO_ROUTE}: {route_reasons(skipped)}".split()),
-                  runner=which, model=name, provider=provider_of(name),
+                  runner=which, model=name, provider=routing.provider_of(name),
                   session=limited[-1].session if limited else trip.resume, skipped=skipped,
                   usage_limit=UsageLimit(util.iso(wake) if wake else "", "", "usage") if held else None)
 
@@ -817,47 +642,11 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
     hook = ()
     kw.pop("verification_attempt", None)
     if trip.scratch:
-        original = kw.get("mcp_config", "")
-        if which != "claude" or target.remote:
-            verification_scratch.stop_served(trip.scratch)
-        if which == "codex" and not target.remote:
-            try:
-                kw["mcp_config"] = verification_scratch.browser_config(trip.scratch, original, kw.get("add_dirs", ()))
-            except (OSError, ValueError, KeyError, TypeError) as error:
-                kw["budget_error"] = f"browser confinement unavailable: {error}"
-        try:
-            hook = verification_scratch.activate(trip.scratch, which, bool(target.remote), kw.get("add_dirs", ()),
-                                                 kw.get("mcp_config", ""))
-        except (OSError, ValueError, KeyError, TypeError):
-            hook = ()
-        if (not hook and which == "codex" and not target.remote and verification_scratch.has_servers(original)
-                and not kw.get("budget_error")
-                and (kw.get("mcp_config", "") != original
-                     or verification_scratch.plain_config(trip.scratch, original) is None)):
-            kw["budget_error"] = "browser confinement unavailable: the trusted browser could not be activated"
-        if not hook:
-            if "mcp_config" in kw:
-                kw["mcp_config"] = original
-            say("trusted scratch authority unavailable for this confinement; fixture-dependent checks may be blocked")
-            kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), verification_scratch.note(None)]))
-        if which == "claude" and not target.remote:
-            try:
-                config_json, reason = verification_scratch.serve_browser(trip.scratch, original, kw.get("add_dirs", ()))
-            except (OSError, ValueError, KeyError, TypeError) as error:
-                config_json = verification_scratch.without_browser(original)
-                reason = str(error) or type(error).__name__
-            if reason:
-                kw["allowed_tools"] = [t for t in kw.get("allowed_tools") or [] if not t.startswith("mcp__playwright")]
-                kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""),
-                                                         verification_scratch.browser_blocked_note(reason)]))
-                say(f"the confined browser is unavailable for this verify: {reason}")
-            if "mcp_config" in kw:
-                kw["mcp_config"] = config_json
-        kw["verification_attempt"] = trip.scratch
+        kw, hook = browser.confine(kw, trip.scratch, which, bool(target.remote), say)
     if asking and hook:
-        kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), owner_asks.WITHHELD]))
+        browser.with_note(kw, owner_asks.WITHHELD)
     elif asking:
-        kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), owner_asks.NOTE]))
+        browser.with_note(kw, owner_asks.NOTE)
         if which in ("claude", "codex"):
             kw["mcp_config"] = owner_asks.with_server(kw.get("mcp_config") or "")
             kw["allowed_tools"] = [*(kw.get("allowed_tools") or []), owner_asks.RULE]
@@ -883,9 +672,9 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
         if not target.remote:
             kw["providers"] = cfg.environment.providers
             kw["floor"] = floor
-    if uploads.granted(kw.get("allowed_tools")) and (which != "claude" or target.remote):
+    if uploads.granted(kw.get("allowed_tools")) and (not TRAITS[which].uploads_supported or target.remote):
         kw["allowed_tools"] = uploads.without(kw["allowed_tools"])
-        kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), uploads.WITHHELD]))
+        browser.with_note(kw, uploads.WITHHELD)
     return kw
 
 
@@ -902,11 +691,7 @@ def with_spent(res: Result, earlier: list[Result]) -> Result:
     if earlier:
         res.aggregate_paid_usd = res.paid_usd + sum(r.paid_usd for r in earlier)
         res.auth_modes = tuple(dict.fromkeys(mode for r in [*earlier, res] for mode in r.modes))
-    res.cost_usd += sum(r.cost_usd for r in earlier)
-    res.tokens_in += sum(r.tokens_in for r in earlier)
-    res.tokens_out += sum(r.tokens_out for r in earlier)
-    res.cache_read += sum(r.cache_read for r in earlier)
-    res.cache_write += sum(r.cache_write for r in earlier)
+    res.add_usage(earlier)
     res.api_seconds += sum(r.api_seconds for r in earlier)
     return res
 
@@ -928,6 +713,13 @@ def described_servers(mcp_config: str) -> dict:
     return found
 
 
+def refresh_redactions(hidden: scrub.Redactions, selected: pi.Route | None) -> None:
+    if selected and selected.using_login:
+        hidden.add([*pi.credential_values(accounts.read(selected.owner)), *selected.refreshed_secrets])
+    if selected:
+        hidden.add(v for path in selected.sensitive_files for v in scrub.file_secrets(path, every_value=True))
+
+
 def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session, cfg: config.Config,
             trace: tuple[str, str], record_id: str, target: devices.Device, kw: dict, tier: str = "",
             kind: str = "", auth: accounts.Auth | None = None, route: dict | None = None, try_no: int = 0,
@@ -939,7 +731,7 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
               "requested_effort": route.get("requested_effort", ""), "tier": route.get("tier", tier),
               "position": route.get("position", 0), "requested": route.get("requested", True),
               "launch": route.get("launch", 1), "skipped": route.get("skipped", []),
-              "provider": provider_of(name) or ("anthropic" if which == "claude" else
+              "provider": routing.provider_of(name) or ("anthropic" if which == "claude" else
                                                 ("openai" if auth.mode == "api_key" else "chatgpt")
                                                 if which == "codex" else ""),
               "prompt": prompt, "system": kw.get("system", ""), "tools": kw.get("tools"),
@@ -958,32 +750,16 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
     selected = kw.get("selected")
     if selected:
         found.extend(selected.sensitive_files)
-    hidden = list(record.secrets(*found, given=kw.pop("stored_values", ())))
-    escaped = set()
+    hidden = scrub.Redactions(scrub.secrets(*found, given=kw.pop("stored_values", ())), escape=bool(selected))
     if selected:
-        hidden.extend(selected.hidden)
-        hidden[:] = sorted(set(hidden) | {json.dumps(v, ensure_ascii=False)[1:-1] for v in hidden if v not in escaped},
-                           key=len, reverse=True)
-        escaped.update(hidden)
-        header["env"] = sorted({*pi.launch_env_names(selected), *(kw.get("extra_env") or {}),
-                                *(["ARETE_ASK_TOOL"] if kw.get("ask_owner") else [])})
+        hidden.add(selected.hidden)
+        header["env"] = route["env"]
         header["provider"] = selected.provider
-    def refresh_hidden():
-        if selected and selected.using_login:
-            hidden.extend(v for v in [*pi.credential_values(accounts.read(selected.owner)),
-                                     *tuple(selected.refreshed_secrets)] if len(v) >= 8
-                          and v not in hidden)
-        if selected:
-            hidden.extend(v for path in selected.sensitive_files for v in record.file_secrets(path, every_value=True)
-                          if len(v) >= 8 and v not in hidden)
-        if selected:
-            hidden[:] = sorted(set(hidden) | {json.dumps(v, ensure_ascii=False)[1:-1] for v in hidden if v not in escaped},
-                               key=len, reverse=True)
-            escaped.update(hidden)
+
     def safe_line(line):
-        refresh_hidden()
+        refresh_redactions(hidden, selected)
         rec.line(line)
-    refresh_hidden()
+    refresh_redactions(hidden, selected)
     started = time.monotonic()
     at = util.now()
     max_tokens = kw.pop("max_tokens", None)
@@ -997,14 +773,14 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
                               for call in res.calls or [res]], effort=kw.get("effort", ""),
                              tier=tier, kind=kind, try_no=try_no, auth_mode="local" if on_local else "")
         except BaseException as error:
-            rec.finish(replace(res, ok=False, error=record.scrub(
+            rec.finish(replace(res, ok=False, error=scrub.scrub(
                 f"cost is not in steps: {record.failure(error)}; {res.error}", hidden)), time.monotonic() - started)
             raise
 
     def keep_lost(error: BaseException) -> None:
-        refresh_hidden()
+        refresh_redactions(hidden, selected)
         seen = replace(meter.seen, provider=header["provider"],
-                       error=record.scrub(rec.exception_text(error), hidden))
+                       error=scrub.scrub(rec.exception_text(error), hidden))
         seen.cost_usd = 0.0 if on_local else priced(seen, cfg)
         persist(seen)
         rec.finish(seen, time.monotonic() - started)
@@ -1021,7 +797,7 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
             elif which == REPLAY:
                 res = meter.guard(replay.run, cwd, trace, cfg, meter.watching(rec.line), resume, kw.get("timeout"))
             elif which == "codex":
-                protected = [verification_scratch.AUTHORITY, paths.WORKTREES_DIR]
+                protected = [sandbox.AUTHORITY, paths.WORKTREES_DIR]
                 res = meter.guard(codex.run, prompt, cwd, model=name, resume=resume,
                                   on_line=meter.watching(rec.line), hidden=[*found, *protected], auth=auth, **kw)
             else:
@@ -1029,10 +805,10 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
                                   on_line=meter.watching(safe_line if selected else rec.line), auth=auth, **kw)
             res.runner = which
             res.model = res.model or name
-            res.provider = res.provider or provider_of(res.model)
+            res.provider = res.provider or routing.provider_of(res.model)
             if which != REPLAY:
                 res.auth_mode = auth.mode
-                if res.usage_limit and (res.usage_limit.scope not in limit_scopes(auth, name) or
+                if res.usage_limit and (res.usage_limit.scope not in routing.limit_scopes(auth, name) or
                                        res.usage_limit.billing != ("subscription" if auth.mode == "subscription" else "credit")):
                     res.usage_limit = None
             if res.calls:
@@ -1044,12 +820,12 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
                 res.cost_usd = 0.0 if on_local else priced(res, cfg)
             if not budget_error:
                 quote_calls(res, which, name, at)
-            refresh_hidden()
-            res.error = record.scrub(res.error, hidden)
-            res.text = record.scrub(res.text, hidden)
-            res.structured = record.scrub_value(res.structured, hidden)
+            refresh_redactions(hidden, selected)
+            res.error = scrub.scrub(res.error, hidden)
+            res.text = scrub.scrub(res.text, hidden)
+            res.structured = scrub.scrub_value(res.structured, hidden)
             for call in res.calls:
-                call.error = record.scrub(call.error, hidden)
+                call.error = scrub.scrub(call.error, hidden)
             res.effort, res.credential = kw.get("effort", ""), route.get("credential", "")
             res.requested_effort, res.skipped = route.get("requested_effort", ""), route.get("skipped", [])
             res.record = rec.path.name if rec.path else ""
@@ -1092,7 +868,7 @@ def secret_files(folders: list[Path | str], target: devices.Device, cfg: config.
             if Path(here).relative_to(folder).parts[SECRET_SEARCH_DEPTH:]:
                 subfolders.clear()
                 continue
-            found += [Path(here, n) for n in names if guard.secret_path(n)]
+            found += [Path(here, n) for n in names if sandbox.secret_path(n)]
     return found
 
 
@@ -1109,7 +885,7 @@ def local_claude(kw: dict, cfg: config.Config, run_id: str, ask_jev: bool, say: 
             say(note)
     if ask_jev and runs_bash(kw) and jev.ready(cfg, [repo], env=claude.agent_env(kw["passing"])):
         kw["allowed_tools"] = [*(kw.get("allowed_tools") or []), jev_ask.rule()]
-        kw["system"] = "\n\n".join(filter(None, [kw.get("system", ""), jev_ask.note()]))
+        browser.with_note(kw, jev_ask.note())
     if uploads.granted(kw.get("allowed_tools")):
         kw["settings"] = uploads.with_hook(kw.get("settings"))
     return kw

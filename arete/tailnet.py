@@ -11,7 +11,6 @@ import socket
 import ssl
 import stat
 import subprocess
-import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -176,17 +175,7 @@ def store_private(path: Path, content: bytes) -> bool:
         if stat.S_IMODE(path.stat().st_mode) & 0o077:
             path.chmod(0o600)
         return False
-    fd, temp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(content)
-        os.replace(temp, path)
-    except BaseException:
-        try:
-            os.unlink(temp)
-        except OSError:
-            pass
-        raise
+    util.write_bytes_atomic(path, content)
     return True
 
 

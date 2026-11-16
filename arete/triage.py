@@ -11,7 +11,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import ClassVar
 
-from . import alerts, config, gh, jev, jira, paths, refusals, runner, state, tracker, util
+from . import alerts, config, gh, jev, jira, paths, refusals, runner, screening, state, tracker, util
+from .agent import READ_TOOLS
 from .heartbeat import mark_loop, network_up_or_skip
 from .pipeline import TRIAGE_ANSWERS, prompt
 from .refusals import TrackerFailed
@@ -342,8 +343,8 @@ def triage_one(cfg: config.Config, src: TriageSource, c: Candidate, ticket: str)
     dirs = list(dict.fromkeys(r.path for r in src.repos if r.path.is_dir()))
     TICKET_RECORDS_DIR.mkdir(parents=True, exist_ok=True)
     with nullcontext(dirs[0]) if dirs else tempfile.TemporaryDirectory() as cwd:
-        res = runner.run(text, cwd, model=cfg.model("triage"), tools=runner.READ_TOOLS,
-                         allowed_tools=runner.READ_TOOLS, json_schema=SCHEMA,
+        res = runner.run(text, cwd, model=cfg.model("triage"), tools=READ_TOOLS,
+                         allowed_tools=READ_TOOLS, json_schema=SCHEMA,
                          max_budget_usd=BUDGET_USD, timeout=TIMEOUT_SECONDS, persist=False, add_dirs=dirs[1:],
                          trace=("", f"triage {c.ref}"), cfg=cfg)
     answer = res.structured if res.ok and isinstance(res.structured, dict) else None
@@ -559,21 +560,17 @@ def approve(cfg: config.Config, src: JiraSource, r: dict) -> str:
     now = src.ticket(src.candidate(r))
     if now.updated != r["updated"]:
         return "it changed since triage, so the next refresh triages it again"
-    screened = screen(cfg, r, now, "injection")
-    if screened is None:
-        return "JEV could not screen it this time"
-    if screened.yes >= cfg.jev.injection:
+    screened = screening.screen(f"{r['title']}\n\n{now.text}", cfg, [repo], ("", f"triage {r['ref']} injection jev"))
+    if screening.held(screened, screening.Posture.REQUIRED):
+        if screened.status != screening.FLAGGED:
+            return "JEV could not screen it this time"
         labels = " and ".join(f"`{lb}`" for lb in labels_to_add(r))
         state.triage_put({**r, "ready": 0, "questions": [
-            (f"JEV reads text in it as instructions to an agent (p {screened.yes:.2f}). Check the ticket, then add "
+            (f"JEV reads text in it as instructions to an agent (p {screened.p:.2f}). Check the ticket, then add "
              f"{labels} by hand to approve it.")]})
-        return f"held for the injection screen (p {screened.yes:.2f})"
+        return f"held for the injection screen (p {screened.p:.2f})"
     to_pipeline(src, r, "triage")
     return ""
-
-
-def screen(cfg: config.Config, r: dict, now: TicketText, step: str) -> jev.Answer | None:
-    return jev.injection(f"{r['title']}\n\n{now.text}", cfg, trace=("", f"triage {r['ref']} {step} jev"))
 
 
 def to_pipeline(src: TriageSource, r: dict, sent_by: str) -> None:
@@ -650,13 +647,13 @@ def send(cfg: config.Config, ref: str, questions: list[str], answers: list[str],
             raise TrackerFailed(f"Could not read {r['ref']} ({tracker_said(e)}).") from e
         if now.updated != r["updated"]:
             raise NotSendable(f"{r['ref']} changed since triage read it, so the next refresh triages it again.")
-        if jev.ready(cfg, [repo]):
-            screened = screen(cfg, r, now, "send injection")
-            if screened is None:
+        screened = screening.screen(f"{r['title']}\n\n{now.text}", cfg, [repo],
+                                    ("", f"triage {r['ref']} send injection jev"))
+        if screening.held(screened, screening.Posture.WHEN_ON):
+            if screened.status != screening.FLAGGED:
                 raise NotSendable(f"JEV could not screen {r['ref']} for injected instructions this time. Try again.")
-            if screened.yes >= cfg.jev.injection:
-                raise NotSendable(f"JEV reads text in {r['ref']} as instructions to an agent (p {screened.yes:.2f}). "
-                                  f"Read the ticket, then add {labels} by hand to send it.")
+            raise NotSendable(f"JEV reads text in {r['ref']} as instructions to an agent (p {screened.p:.2f}). "
+                              f"Read the ticket, then add {labels} by hand to send it.")
         pairs = [(q, a.strip()) for q, a in zip(questions, answers, strict=True) if q != repo_question(r) and a.strip()]
         if pairs:
             try:

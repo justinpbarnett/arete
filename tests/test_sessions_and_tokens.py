@@ -10,7 +10,7 @@ import unittest
 import urllib.error
 from unittest import mock
 
-from arete import config, control, devices, gh, pipeline, sessions, verify
+from arete import config, control, devices, gh, pipeline, sessions, verify, workspace
 
 from tests import support
 from tests.harness import behavior_result, make_folders, run_script, scratch_env
@@ -351,7 +351,7 @@ class PushedPrDraftTests(unittest.TestCase):
                                    facts={}, log=self.logs.append)
         self.layer = SimpleNamespace(trust_level="automerge")
         self.cfg = config.Config()
-        self.c = pipeline.Checkout("", "fixture/repo", self.root, self.root, "main", pr=self.URL, lease=self.head)
+        self.c = workspace.Checkout("", "fixture/repo", self.root, self.root, "main", pr=self.URL, lease=self.head)
         for target, name, fake in [(gh, "gh", self.fake_gh), (jev, "ready", lambda *a, **k: True),
                                    (jev, "ask", self.fake_ask)]:
             patcher = mock.patch.object(target, name, fake)
@@ -413,7 +413,7 @@ class PushedPrDraftTests(unittest.TestCase):
         (wt / "a.txt").write_text("b\n")
         sh(wt, "commit", "-qam", "change by the earlier run")
         sh(wt, "push", "-q", "-u", "origin", "work")
-        c = pipeline.Checkout("", "fixture/repo", wt, wt, "main", pr=self.URL if preset else "",
+        c = workspace.Checkout("", "fixture/repo", wt, wt, "main", pr=self.URL if preset else "",
                               lease=sh(wt, "rev-parse", "HEAD"), resumes=True)
         self.remote_head = "f" * 40 if moved else c.lease
         self.calls.clear()

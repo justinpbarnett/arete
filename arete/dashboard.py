@@ -22,6 +22,7 @@ from . import (
     control,
     devices,
     gh,
+    install_files,
     jira,
     loop_run,
     oncall,
@@ -39,7 +40,6 @@ from . import (
     tasks,
     triage,
     util,
-    webapp,
     webhooks,
     webpush,
 )
@@ -87,7 +87,7 @@ def web_snapshot() -> tuple[str, dict[str, tuple[bytes, str]]]:
         digest.update(f"{f.name}\0{len(body)}\0".encode())
         digest.update(body)
     code = digest.hexdigest()[:12]
-    colors = webapp.tokens(next(body for f, body in bodies.items() if f.name == "pattern.css"))
+    colors = install_files.colors_from_css(next(body for f, body in bodies.items() if f.name == "pattern.css"))
     served = {}
     for f, body in bodies.items():
         if f.name == "index.html":
@@ -99,10 +99,10 @@ def web_snapshot() -> tuple[str, dict[str, tuple[bytes, str]]]:
             served["/"] = (page.replace(THEME_MARK, f'<meta name="theme-color" content="{colors["ground"]}">'.encode()),
                            WEB_TYPES[f.suffix])
         elif f.suffix == ".webmanifest":
-            served[f"/{f.name}"] = (webapp.manifest(body, colors), WEB_TYPES[f.suffix])
+            served[f"/{f.name}"] = (install_files.manifest(body, colors), WEB_TYPES[f.suffix])
         else:
             served[f"/{f.name}"] = (body, WEB_TYPES[f.suffix])
-    for path, png in webapp.icons(colors).items():
+    for path, png in install_files.icons(colors).items():
         served[path] = (png, WEB_TYPES[".png"])
     return code, served
 
@@ -556,7 +556,7 @@ def get_meta(handler, rest, query):
 
 
 def get_push(handler, rest, query):
-    return webpush.view()
+    return webpush.subscription_state()
 
 
 def get_sidebar(handler, rest, query):
@@ -756,7 +756,7 @@ def post_push_remove(handler, rest, query):
 
 
 def post_push_test(handler, rest, query):
-    return webpush.test(config.load_or_problem()[0])
+    return webpush.send_test(config.load_or_problem()[0])
 
 
 def post_ask(handler, rest, query):

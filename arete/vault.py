@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
-import tempfile
 from pathlib import Path
 from urllib.parse import quote
 
@@ -41,15 +39,7 @@ def save(repo: str, found: dict[str, str]) -> None:
         return
     FOLDER.mkdir(mode=0o700, parents=True, exist_ok=True)
     FOLDER.chmod(0o700)
-    fd, temp = tempfile.mkstemp(dir=FOLDER, prefix=".", suffix=SUFFIX)
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write(json.dumps(found))
-        os.replace(temp, target)
-    except BaseException:
-        Path(temp).unlink(missing_ok=True)
-        raise
+    util.write_bytes_atomic(target, json.dumps(found).encode())
 
 
 def put_all(repo: str, given: dict[str, str]) -> None:
@@ -103,7 +93,7 @@ def holding(text: str, value: str) -> bool:
 ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "a": "\a", "b": "\b", "f": "\f", "v": "\v"}
 
 
-def unquoted(text: str) -> str:
+def git_unquoted(text: str) -> str:
     if len(text) < 2 or not (text.startswith('"') and text.endswith('"')):
         return text
     body, out, i = text[1:-1], bytearray(), 0
@@ -121,7 +111,7 @@ def unquoted(text: str) -> str:
 
 
 def patch_path(text: str) -> str:
-    return unquoted(text.rstrip("\t")).removeprefix("b/")
+    return git_unquoted(text.rstrip("\t")).removeprefix("b/")
 
 
 def held(patch: str) -> dict[str, list[str]]:

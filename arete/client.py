@@ -94,23 +94,8 @@ def address(where: Server) -> str:
     return f"{where.scheme}://{f'[{where.host}]' if ':' in where.host else where.host}:{where.port}"
 
 
-class SecureConnection(http.client.HTTPSConnection):
-    def __init__(self, where: Server, timeout: float):
-        self.tls = ssl.create_default_context()
-        super().__init__(where.name, where.port, timeout=timeout, context=self.tls)
-        self.address = where.host
-
-    def connect(self) -> None:
-        sock = socket.create_connection((self.address, self.port), self.timeout)
-        try:
-            self.sock = self.tls.wrap_socket(sock, server_hostname=self.host)
-        except OSError:
-            sock.close()
-            raise
-
-
 def connect(where: Server, seconds: float = CONNECT_SECONDS) -> http.client.HTTPConnection:
-    conn = SecureConnection(where, seconds) if where.scheme == "https" \
+    conn = util.NamedTlsConnection(where.host, where.port, where.name, seconds) if where.scheme == "https" \
         else http.client.HTTPConnection(where.host, where.port, timeout=seconds)
     try:
         conn.connect()
@@ -121,19 +106,6 @@ def connect(where: Server, seconds: float = CONNECT_SECONDS) -> http.client.HTTP
         raise Down(f"the arete server is not up at {address(where)} ({e.strerror or e}); start it with "
                    f"`arete serve`, or set {ENV}") from None
     return conn
-
-
-def moved_to(resp: http.client.HTTPResponse, where: Server) -> Server | None:
-    target = urlsplit(resp.getheader("Location") or "")
-    if resp.status not in (301, 302, 307, 308) or target.scheme != "https" or not target.hostname:
-        return None
-    try:
-        port = target.port or 443
-    except ValueError:
-        return None
-    if port != where.port:
-        return None
-    return Server("https", where.host, where.port, target.hostname)
 
 
 def request(method: str, path: str, body: dict | None = None,
@@ -176,10 +148,10 @@ def request_once(method: str, path: str, body: dict | None = None,
         try:
             conn.request(method, path, payload, headers)
             resp = conn.getresponse()
-            if not followed and (moved := moved_to(resp, where)):
+            if not followed and (moved := util.https_upgrade(resp, where.port)):
                 resp.read()
                 conn.close()
-                where, followed = moved, True
+                where, followed = Server("https", where.host, where.port, moved.hostname), True
                 continue
             if resp.status < 400:
                 return resp

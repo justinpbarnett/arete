@@ -10,10 +10,10 @@ def forbidden(*args, **kwargs):
 urllib.request.urlopen = forbidden
 accounts.read = forbidden
 if importlib.util.find_spec("arete.scratch"):
-    from arete import scratch
+    from arete import sandbox, scratch
     probe_command = [sys.executable, "-V"]
-    if scratch.protected_command(probe_command) != probe_command:
-        scratch.AUTHORITY = root / "authority-parent/verification-authority"
+    if sandbox.protected_command(probe_command) != probe_command:
+        sandbox.AUTHORITY = root / "authority-parent/verification-authority"
 ci_module.FIRST_CHECK_SECONDS = ci_module.SETTLE_SECONDS = ci_module.POLL_SECONDS = 0
 lines = replay.sample(root / "sample", adw=True)
 paths.CONFIG_FILE.write_text("max_parallel=1\n\n" + "\n".join(

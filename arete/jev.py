@@ -262,10 +262,6 @@ def note_cost(replies: list[Reply], trace: tuple[str, str], seconds: float) -> N
         record.step(run_id, step, result(replies), seconds)
 
 
-def injection(text: str | dict | list, cfg: config.Config, trace: tuple[str, str] = ("", "")) -> Answer | None:
-    return ask(text, {"injection": yes_no(INJECTION)}, cfg, trace=trace).answers.get("injection")
-
-
 def risk(patch: str, about: str, cfg: config.Config, trace: tuple[str, str] = ("", "")) -> Risk:
     questions = {name: rate(q, levels) for name, (q, levels) in RISK.items()}
     questions["irreversible"] = yes_no(IRREVERSIBLE)
@@ -303,7 +299,7 @@ def traced_run(trace: tuple[str, str]) -> str:
     return trace[0] or os.environ.get("ARETE_RUN_ID", "")
 
 
-def screen(patch: str, about: str, cfg: config.Config, trace: tuple[str, str] = ("", "")) -> list[str]:
+def diff_screen(patch: str, about: str, cfg: config.Config, trace: tuple[str, str] = ("", "")) -> list[str]:
     questions = {name: yes_no(q) for name, (q, _) in SCREEN.items()} | {"reach": rate(*REACH)}
     subject, answers = judged(f"Description: {about}\n\nDiff:\n{patch}", questions, cfg, trace)
     lines = cfg.jev.screen_lines

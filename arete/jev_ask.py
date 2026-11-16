@@ -7,7 +7,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from . import config, guard, jev, paths
+from . import config, jev, paths, sandbox
 
 NOTE = ("You can run `{ask}`, which puts a question to JEV, a fast classifier that costs next to nothing, over text you "
         "pipe in or over files you name, and gives an answer and a confidence for each. Use it to sort or check many "
@@ -64,8 +64,8 @@ def main(args) -> int:
         return fail("no files match")
     here = Path.cwd().resolve()
     inside = os.environ.get("ARETE_AGENT") != "1"
-    refused = {f: "looks like a secret file" if guard.secret_path(f) else "outside the working directory"
-               for f in files if guard.secret_path(f) or not (inside or here in f.resolve().parents)}
+    refused = {f: "looks like a secret file" if sandbox.secret_path(f) else "outside the working directory"
+               for f in files if sandbox.secret_path(f) or not (inside or here in f.resolve().parents)}
     files = [f for f in files if f not in refused]
     if not cfg.jev_allowed([cfg.repo_for_work_dir(here), *map(cfg.repo_for_work_dir, files)]):
         return fail("JEV is off for this repo in the arete config")

@@ -73,7 +73,6 @@ seed("D")
 put("research-D-report", {"summary": "S", "report": "Plain report."})
 cfg.research_synthesis = False
 out["d"] = drive("D", "run-d", cfg)
-config.CONFIG_FILE = paths.CONFIG_FILE
 with paths.CONFIG_FILE.open("a") as f:
     f.write('\n[steps.research_synthesis]\ntools = ["Read", "Glob", "Grep", "WebSearch"]\n')
 try:
