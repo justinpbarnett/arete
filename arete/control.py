@@ -197,11 +197,13 @@ def switch(name: str, enabled: bool) -> dict:
 
 
 def feed(run_id: str, after: int = 0) -> dict:
-    lines = state.feed(run_id, after, connect=state.reader)
-    run_read_after_its_lines = state.run_get(run_id, connect=state.reader)
+    with state.one_read() as conn:
+        epoch = int(conn.execute("SELECT value FROM schema_meta WHERE key = 'restore_epoch'").fetchone()[0])
+        lines = state.feed(run_id, after, connect=state.reader)
+        run_read_after_its_lines = state.run_get(run_id, connect=state.reader)
     if not run_read_after_its_lines:
         raise NotFound(f"no run {run_id}")
-    return {"run": run_read_after_its_lines, "lines": lines}
+    return {"run": run_read_after_its_lines, "lines": lines, "restore_epoch": epoch}
 
 
 def decide(approval_id: int, yes: bool) -> dict:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fcntl
 import io
+import json
 import os
 import re
 import shutil
@@ -10,6 +11,7 @@ import subprocess
 import tarfile
 import tempfile
 import threading
+import uuid
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -91,6 +93,7 @@ def inspect(p: Path, check: bool = True) -> dict:
             return found
         conn = paths.connect_db(p, readonly=True)
         try:
+            conn.execute("BEGIN")
             if check:
                 found["quick_check"] = "; ".join(r[0] for r in conn.execute("PRAGMA quick_check")) or "no answer"
             tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")]
@@ -171,7 +174,8 @@ def retain(folder: Path) -> None:
 
 def forbidden_name(name: str) -> bool:
     name = name.lower()
-    return name == "verification-authority" or name == "pi.env" or name.endswith(".env")
+    return (name == "verification-authority" or name == ".env" or name.startswith(".env.")
+            or name == "pi.env" or name.endswith(".env"))
 
 
 def add_tree(tar: tarfile.TarFile, root: Path, arcname: str) -> None:
@@ -194,13 +198,24 @@ def layers_bundle() -> bytes | None:
         return None
     if layers.is_symlink() or (layers / ".git").is_symlink() or not (layers / ".git").is_dir():
         raise RuntimeError("layers is linked or has no plain .git folder, so it is not bundled")
-    listed = subprocess.run(["git", "log", "--all", "-m", "--no-renames", "--name-only", "--format=", "-z"],
+    listed = subprocess.run(["git", "log", "--all", "--root", "-m", "--no-renames", "--raw", "--format=", "-z"],
                             check=False, cwd=layers, capture_output=True, timeout=300)
     if listed.returncode != 0:
         raise RuntimeError(f"listing layers history failed ({listed.returncode})")
-    for path in listed.stdout.decode(errors="replace").split("\0"):
-        path = path.strip("\n")
-        if path and any(forbidden_name(part) for part in path.split("/")):
+    records = iter(listed.stdout.decode(errors="replace").split("\0"))
+    for header in records:
+        header = header.lstrip("\n")
+        if not header:
+            continue
+        modes = re.fullmatch(r":([0-7]{6}) ([0-7]{6}) [0-9a-f]+ [0-9a-f]+ [A-Z][0-9]*", header)
+        if modes is None:
+            raise RuntimeError("layers history has an unrecognized raw header; the bundle was not made")
+        path = next(records, None)
+        if not path:
+            raise RuntimeError("layers history has a missing pathname; the bundle was not made")
+        if "120000" in modes.groups():
+            raise RuntimeError("layers history holds a symlink; the bundle was not made")
+        if any(forbidden_name(part) for part in path.split("/")):
             raise RuntimeError(f"layers history holds {path}, which never leaves the machine; the bundle was not made")
     res =subprocess.run(["git", "bundle", "create", "-", "--all"], check=False, cwd=layers, capture_output=True, timeout=300)
     if res.returncode != 0 or not res.stdout:
@@ -283,18 +298,63 @@ def daily_copy(snapshot_file: Path, copy_to: str, submit=None):
         raise
 
 
-def live_runs() -> list[str]:
-    if not paths.DB_FILE.exists():
-        return []
-    try:
-        conn = sqlite3.connect(paths.DB_FILE, timeout=30)
+SIDECARS = ("", "-journal", "-wal", "-shm")
+
+
+@contextmanager
+def private_database(source: Path):
+    with tempfile.TemporaryDirectory(prefix="arete-probe-") as folder:
+        target = Path(folder) / "arete.db"
+        for suffix in SIDECARS:
+            original = Path(str(source) + suffix)
+            if original.exists():
+                shutil.copyfile(original, Path(str(target) + suffix))
+        conn = paths.connect_db(target)
         try:
-            rows = conn.execute("SELECT id, pid FROM runs WHERE status = 'running'").fetchall()
+            conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+            yield conn
         finally:
             conn.close()
-    except sqlite3.Error:
-        return []
-    return [r[0] for r in rows if util.pid_alive(r[1])]
+
+
+def metadata(conn) -> dict:
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'schema_meta'").fetchone():
+        return {}
+    return dict(conn.execute("SELECT key, value FROM schema_meta"))
+
+
+def probe_current() -> dict | None:
+    try:
+        with private_database(paths.DB_FILE) as conn:
+            meta = metadata(conn)
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            runs = []
+            if "runs" in tables:
+                conn.row_factory = sqlite3.Row
+                runs = [dict(r) for r in conn.execute("SELECT * FROM runs WHERE status='running'")]
+            return {"sequences": sequences(conn), "meta": meta, "runs": runs}
+    except (sqlite3.Error, OSError):
+        return None
+
+
+def lock_holder(name):
+    try:
+        return (paths.LOCKS_DIR / f"{name}.lock").read_text().strip()
+    except OSError:
+        return "unknown"
+
+
+def live_runs(current=None) -> list[str]:
+    current = probe_current() if current is None else current
+    busy = []
+    for row in (current or {}).get("runs", []):
+        held = row.get("lock") and util.lock_is_held(row["lock"])
+        if held or util.pid_alive(row.get("pid")):
+            busy.append(f"{row['id']} pid {lock_holder(row['lock']) if held else row['pid']}")
+    for file in paths.LOCKS_DIR.glob("*.lock"):
+        if file.stem not in ("serve", "migrate") and util.lock_is_held(file.stem):
+            busy.append(f"{file.stem} pid {lock_holder(file.stem)}")
+    return busy
 
 
 def stop_hint() -> str:
@@ -311,24 +371,15 @@ def sequences(conn: sqlite3.Connection) -> dict[str, int]:
 
 
 def current_sequences() -> dict[str, int] | None:
-    if not paths.DB_FILE.exists():
-        return None
-    try:
-        conn = sqlite3.connect(paths.DB_FILE, timeout=30)
-        try:
-            conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
-            return sequences(conn)
-        finally:
-            conn.close()
-    except sqlite3.Error:
-        return None
+    found = probe_current()
+    return found["sequences"] if found is not None else None
 
 
 def raise_sequences(staged: Path, current: dict[str, int] | None) -> None:
     from . import dbstats, state
 
     timing = dbstats.Timing(staged, "write")
-    with state.owning_transaction(lambda: sqlite3.connect(staged, timeout=30), timing=timing) as conn:
+    with state.owning_transaction(lambda: paths.connect_db(staged), timing=timing) as conn:
         held = sequences(conn)
         for name in set(held) | set(current or {}):
             wanted = max(held.get(name, 0), (current or {}).get(name, 0)) if current is not None else held[name] + RESTORE_GAP
@@ -338,54 +389,252 @@ def raise_sequences(staged: Path, current: dict[str, int] | None) -> None:
                 conn.execute("INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)", (name, wanted))
 
 
+def restore_record() -> Path:
+    return paths.backups_dir() / "restore-install.json"
+
+
+def pending_restore() -> dict:
+    file = restore_record()
+    if not file.exists():
+        return {}
+    try:
+        data = json.loads(file.read_text())
+        live = paths.DB_FILE
+        valid = (data["state"] in ("prepared", "installed", "rolling-back", "complete")
+                 and data["archive"].startswith(live.name + ".before-restore-")
+                 and Path(data["archive"]).name == data["archive"]
+                 and Path(data["stage"]).name == data["stage"]
+                 and data["stage"].startswith(live.name + ".restoring-")
+                 and set(data["inventory"]) <= set(SIDECARS)
+                 and set(data["originals"]) == set(data["inventory"])
+                 and all(isinstance(v, list) and len(v) == 2 and all(isinstance(n, int) for n in v)
+                         for v in data["originals"].values())
+                 and isinstance(data["epoch"], int) and data["epoch"] > 0
+                 and isinstance(data["sequences"], dict)
+                 and all(isinstance(k, str) and isinstance(v, int) and v >= 0 for k, v in data["sequences"].items())
+                 and isinstance(data["identity"], dict)
+                 and all(k.startswith("instance_") and isinstance(v, str) for k, v in data["identity"].items())
+                 and isinstance(data["inode"], int))
+        if not valid:
+            raise ValueError("invalid installation fields")
+        return {} if data["state"] == "complete" else data
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+        raise Refused(f"{file}: corrupt restore recovery metadata; preserve database, stage and archives: {e}") from e
+
+
+def save_restore(data, **fields):
+    data.update(fields)
+    util.write_json(restore_record(), data)
+
+
+def receipt_epoch():
+    file = paths.backups_dir() / "restore-receipt.json"
+    if not file.exists():
+        return 0
+    try:
+        epoch = int(json.loads(file.read_text())["epoch"])
+        if epoch < 0:
+            raise ValueError("negative generation")
+        return epoch
+    except (OSError, ValueError, KeyError, TypeError, OverflowError) as e:
+        raise Refused(f"{file}: unreadable generation receipt; preserve it for recovery") from e
+
+
+def apply_metadata(target, data):
+    from . import dbstats, state
+
+    with state.owning_transaction(lambda: paths.connect_db(target), timing=dbstats.Timing(target, "write")) as conn:
+        held = sequences(conn)
+        has_sequence = conn.execute("SELECT 1 FROM sqlite_master WHERE name='sqlite_sequence'").fetchone()
+        if has_sequence:
+            for name, floor in data["sequences"].items():
+                if name in held:
+                    conn.execute("UPDATE sqlite_sequence SET seq=? WHERE name=?", (max(held[name], floor), name))
+                else:
+                    conn.execute("INSERT INTO sqlite_sequence(name,seq) VALUES (?,?)", (name, floor))
+        meta = metadata(conn)
+        if "restore_epoch" not in meta:
+            return False
+        for key, value in {**data["identity"], "restore_epoch": str(data["epoch"])}.items():
+            conn.execute("INSERT INTO schema_meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                         (key, value))
+    return True
+
+
+def finish_restore():
+    data = pending_restore()
+    if not data:
+        return
+    if data["state"] != "installed":
+        raise Refused("interrupted restore requires arete serve before migration")
+    if not paths.DB_FILE.exists() or paths.DB_FILE.stat().st_ino != data["inode"]:
+        raise Refused("installed restore database was replaced; preserve files for recovery")
+    validate_archives(data)
+    if not apply_metadata(paths.DB_FILE, data):
+        return
+    util.flush_file(paths.DB_FILE)
+    if data["identity"]:
+        util.write_json(paths.backups_dir() / "instance.json", data["identity"])
+    util.write_json(paths.backups_dir() / "restore-receipt.json", {"epoch": data["epoch"]})
+    save_restore(data, state="complete")
+
+
 def restore(source: Path) -> str:
     from . import control
 
-    if control.serve_beat().get("alive"):
-        raise Refused(f"arete serve is running; {stop_hint()}")
-    if busy := live_runs():
-        raise Refused(f"{util.count(len(busy), 'run')} still running ({', '.join(busy[:3])}); wait for them to end "
-                      f"or stop them, and {stop_hint()}")
-    if not source.is_file():
-        raise Refused(f"{source} is not a file")
-    if (found := inspect(source))["quick_check"] != "ok":
-        raise Refused(f"{source} failed its check: {found['quick_check']}")
+    with util.lock("serve") as mine:
+        if not mine:
+            raise Refused(f"arete serve pid {lock_holder('serve')} holds the startup lock; {stop_hint()}")
+        with util.lock("migrate", wait=True):
+            recover_restore()
+            if pending_restore():
+                raise Refused("previous restore needs normal serve startup completion")
+            beat = util.read_json(control.BEAT_FILE, {})
+            if util.pid_alive(beat.get("pid")):
+                raise Refused(f"arete serve pid {beat.get('pid')} is running; {stop_hint()}")
+            current = probe_current()
+            if busy := live_runs(current):
+                raise Refused(f"runs still running ({', '.join(busy)}); {stop_hint()}")
+            return prepare_restore(source, current)
+
+
+def prepare_restore(source, current):
     live = paths.DB_FILE
-    staged = live.with_name(live.name + ".restoring")
-    staged.unlink(missing_ok=True)
+    token = uuid.uuid4().hex
+    staged = live.with_name(live.name + ".restoring-" + token)
+    prepared = False
     try:
-        shutil.copyfile(source, staged)
-        if (found := inspect(staged))["quick_check"] != "ok":
-            raise Refused(f"the staged copy failed its check: {found['quick_check']}")
-        raise_sequences(staged, current_sequences())
+        if not source.is_file():
+            raise Refused(f"{source} is not a file")
+        with private_database(source) as conn:
+            if [r[0] for r in conn.execute("PRAGMA quick_check")] != ["ok"]:
+                raise Refused(f"{source} failed its check")
+            snap_meta, held = metadata(conn), sequences(conn)
+            conn.execute("VACUUM INTO ?", (str(staged),))
+        previous = (current or {}).get("sequences", {})
+        floors = {name: max(held.get(name, 0), previous.get(name, 0)) if current is not None
+                  else held[name] + RESTORE_GAP for name in set(held) | set(previous)}
+        identity = {k: v for k, v in (current or {}).get("meta", {}).items() if k.startswith("instance_")}
+        if not identity:
+            from .migrations.m0001_foundation_ledger import identity as new_identity
+
+            try:
+                identity = new_identity()
+            except ValueError as e:
+                raise Refused(str(e)) from e
+        epoch = 1 + max(int(snap_meta.get("restore_epoch", 0)),
+                        int((current or {}).get("meta", {}).get("restore_epoch", 0)), receipt_epoch())
+        data = {"state": "prepared", "stage": staged.name, "inode": staged.stat().st_ino,
+                "archive": live.name + ".before-restore-" + token,
+                "inventory": [s for s in SIDECARS if Path(str(live) + s).exists()],
+                "sequences": floors, "identity": identity, "epoch": epoch}
+        data["originals"] = {s: file_identity(Path(str(live) + s)) for s in data["inventory"]}
+        apply_metadata(staged, data)
+        if inspect(staged)["quick_check"] != "ok":
+            raise Refused("prepared restore failed its check")
         util.flush_file(staged)
-    except BaseException:
-        staged.unlink(missing_ok=True)
-        raise
-    return install_staged(staged)
+        util.write_json(paths.backups_dir() / "instance.json", identity)
+        save_restore(data)
+        prepared = True
+        return install_staged(staged)
+    finally:
+        if not prepared or not staged.exists():
+            for suffix in SIDECARS:
+                Path(str(staged) + suffix).unlink(missing_ok=True)
 
 
 def install_staged(staged: Path) -> str:
-    live = paths.DB_FILE
-    journal = live.with_name(live.name + "-journal")
-    taken = util.now().strftime("%Y%m%dT%H%M%S%fZ")
-    old = live.with_name(f"{live.name}.before-restore-{taken}")
-    old_journal = live.with_name(f"{old.name}-journal")
-    moved: list[tuple[Path, Path]] = []
+    live, data = paths.DB_FILE, pending_restore()
+    old = live.with_name(data["archive"])
+    for suffix in data["inventory"]:
+        here, there = Path(str(live) + suffix), Path(str(old) + suffix)
+        if there.exists():
+            if file_identity(there) != data["originals"][suffix] or here.exists():
+                raise Refused(f"ambiguous restore archive {there}; preserve files for recovery")
+        elif not here.exists() or file_identity(here) != data["originals"][suffix]:
+            raise Refused(f"restore original {here} was replaced; preserve files for recovery")
     try:
-        for here, there in ((live, old), (journal, old_journal)):
-            if here.exists():
+        for suffix in data["inventory"]:
+            here, there = Path(str(live) + suffix), Path(str(old) + suffix)
+            if not there.exists():
                 os.rename(here, there)
-                moved.append((there, here))
-        os.rename(staged, live)
+                util.flush_folder(live.parent)
+        if staged.exists():
+            os.rename(staged, live)
+        util.flush_file(live)
         util.flush_folder(live.parent)
+        save_restore(data, state="installed")
+        finish_restore()
     except BaseException:
-        for there, here in reversed(moved):
-            if not here.exists():
-                os.rename(there, here)
-        staged.unlink(missing_ok=True)
+        rollback_install(data)
         raise
-    return str(old) if moved else "no earlier file"
+    return str(old) if data["inventory"] else "no earlier file"
+
+
+def file_identity(file):
+    stat = file.stat()
+    return [stat.st_dev, stat.st_ino]
+
+
+def validate_archives(data):
+    for suffix in data["inventory"]:
+        archive = paths.DB_FILE.with_name(data["archive"] + suffix)
+        if not archive.exists() or file_identity(archive) != data["originals"][suffix]:
+            raise Refused(f"restore archive {archive} is missing or replaced; preserve files for recovery")
+
+
+def rollback_install(data):
+    live = paths.DB_FILE
+    if data["state"] != "rolling-back":
+        try:
+            save_restore(data, state="rolling-back")
+        except OSError:
+            pass
+    for suffix in data["inventory"]:
+        archive, original = live.with_name(data["archive"] + suffix), Path(str(live) + suffix)
+        held = archive if archive.exists() else original
+        if not held.exists() or file_identity(held) != data["originals"][suffix]:
+            raise Refused(f"restore original {held} was replaced; preserve files for recovery")
+    installed = live.exists() and live.stat().st_ino == data["inode"]
+    if installed:
+        for suffix in SIDECARS:
+            Path(str(live) + suffix).unlink(missing_ok=True)
+    for suffix in reversed(data["inventory"]):
+        archive = live.with_name(data["archive"] + suffix)
+        if archive.exists():
+            if file_identity(archive) != data["originals"][suffix]:
+                raise Refused(f"restore archive {archive} was replaced; preserve files for recovery")
+            os.rename(archive, Path(str(live) + suffix))
+    for suffix in SIDECARS:
+        Path(str(live.with_name(data["stage"])) + suffix).unlink(missing_ok=True)
+    util.flush_folder(live.parent)
+    restore_record().unlink(missing_ok=True)
+    util.flush_folder(paths.backups_dir())
+
+
+def recover_restore():
+    data = pending_restore()
+    if not data:
+        return
+    live = paths.DB_FILE
+    if data["state"] == "rolling-back":
+        rollback_install(data)
+        return
+    if data["state"] == "installed":
+        if not live.exists() or live.stat().st_ino != data["inode"]:
+            raise Refused("installed restore database was replaced; preserve files for recovery")
+        validate_archives(data)
+        return
+    staged = live.with_name(data["stage"])
+    if staged.exists() and staged.stat().st_ino == data["inode"]:
+        install_staged(staged)
+    elif live.exists() and live.stat().st_ino == data["inode"]:
+        validate_archives(data)
+        util.flush_file(live)
+        util.flush_folder(live.parent)
+        save_restore(data, state="installed")
+    else:
+        raise Refused("interrupted restore has no matching staged database; preserve files for recovery")
 
 
 def newest_line() -> str:
@@ -412,6 +661,8 @@ def command(check: bool, restore_from: str | None) -> int:
             print(f"arete backup: restore failed: {type(e).__name__}: {util.first_line(str(e), 200)}")
             return 1
         print(f"restored {restore_from}; the replaced file is {old}")
+        if pending_restore():
+            print("normal arete serve startup must finish migration and restore metadata before the API opens")
         return 0
     if check:
         newest = newest_snapshot()

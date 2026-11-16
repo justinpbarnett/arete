@@ -6,9 +6,10 @@ Arete is one global engine for every repo on the machine. Each repo gets a thin 
 
 ## Database transactions and the timing rollout
 
-Production remains in SQLite rollback journal mode with the existing synchronous (FULL) and busy-timeout settings.
-Retain at least one full day of rollback-mode measurements before deploying the WAL follow-up. This release does
-not enable WAL or aggregate timing across processes.
+Retain at least one full day of rollback-mode measurements before deploying this WAL release.
+Serve enables WAL under its startup lock after migration and restore completion, before workers or the API open.
+Every helper connection uses synchronous=NORMAL with the existing busy timeout; helpers never enable WAL.
+Confined scratch state retains MEMORY journaling and refuses WAL inputs and existing sidecars.
 
 `state.tx()` owns one checked connection and begins `BEGIN IMMEDIATE` before application reads. It commits once on
 successful outer exit, rolls back escaping exceptions (including interruptions), and closes the connection.
@@ -44,6 +45,11 @@ Run the offline exercises through the supplied verification sandbox, replacing `
 <sandbox> python docs/db-fixture.py transaction-timing
 <sandbox> python docs/db-fixture.py output-sinks
 <sandbox> python docs/db-fixture.py durable-files
+<sandbox> python docs/db-fixture.py wal-startup
+<sandbox> python docs/db-fixture.py prune-restore
+<sandbox> python docs/db-fixture.py restore-safety
+<sandbox> python docs/db-fixture.py feed-cursors
+<sandbox> python docs/db-fixture.py backup-health
 <sandbox> python docs/db-fixture.py inspect
 ```
 
@@ -718,10 +724,14 @@ A plain file copy of the live database is not a backup, because it can hold a ha
 
 `arete backup` takes a snapshot now. `arete backup --check` checks the newest snapshot and prints its row count per table beside the live file's; it exits 1 when the check fails.
 `arete backup --restore FILE` replaces `arete.db` with a snapshot. It refuses while `arete serve` is alive or a run is running, so stop serve first.
-It keeps the replaced file, and its rollback journal under a matching name, as `arete.db.before-restore-<stamp>`, and raises every `sqlite_sequence` value to at least its current value so no id is reused.
+It holds the serve startup exclusion lock throughout validation and installation, checks live serve/run PIDs and held run locks, and keeps the replaced database and every existing `-journal`, `-wal` and `-shm` under one unique `arete.db.before-restore-<id>` basename. Discovery recovers private copies, preserving original and archived sidecar bytes. Every sequence keeps at least the snapshot and replaced database values; an unreadable replaced database uses the snapshot value plus 10,000. Destination instance identity is preserved. A durable generation receipt makes `restore_epoch` increase even after unreadable databases or older snapshots.
+
+Durable installation metadata recovers an interruption between renames before serve opens the database. Ordinary installation failures restore the complete original file set. Preserve the metadata, stage and archives if recovery reports corrupt metadata. A pre-ledger snapshot needs normal serve startup to migrate and finish the recorded identity, sequences and generation exactly once; the restore command says when this completion is required.
+
+Within a restore generation a reader that has seen N never receives a newly allocated line below N; a generation change restarts that run's feed. The CLI follower and both dashboard feed clients reset their cursor to zero when `restore_epoch` changes.
 While `arete.db` is missing or empty and a snapshot exists, Arete refuses to start a new empty file and names the newest snapshot instead.
 
-After the first snapshot of each UTC day Arete builds `config-<day>.tar.gz` in `backups/` from `config.toml`, `loop-switches.json`, `loops/` and a `git bundle` of `layers/`; links, `pi.env`, `*.env` files and `verification-authority/` are left out.
+After the first snapshot of each UTC day Arete builds `config-<day>.tar.gz` in `backups/` from `config.toml`, `loop-switches.json`, `loops/` and a `git bundle` of `layers/`; links, `.env`, `.env.*`, `pi.env`, `*.env` files and `verification-authority/` are left out. Layers history containing forbidden names or symlinks, including deleted entries, refuses bundling.
 Set the destination to copy the day's snapshot and archive with `rsync -t`:
 
 ```toml

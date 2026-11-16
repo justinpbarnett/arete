@@ -96,7 +96,7 @@ function pause() {
 }
 
 const blankRuns = () => ({ queue: null, more: false, queueError: null, id: "", detail: null, detailError: null, events: [],
-  seqs: new Set(), seq: 0, eventsDone: false, eventsError: null, turns: [], turnsAfter: 0, turnsSource: "", turnsError: null,
+  seqs: new Set(), seq: 0, eventsDone: false, eventsError: null, turns: [], turnsAfter: 0, turnsEpoch: null, turnsRequest: 0, turnsSource: "", turnsError: null,
   turnsDone: false, stream: null, selection: 0, force: false, settled: false });
 const rs = blankRuns();
 
@@ -182,10 +182,22 @@ function logTurns(lines) {
 }
 
 async function readTurns(selection, token, run) {
+  const request = (rs.turnsRequest ?? 0) + 1;
+  rs.turnsRequest = request;
   const id = rs.id;
   const source = rs.detail.lines_from;
-  const found = await read(source === "feed" ? data.run(id).feed(rs.turnsAfter) : data.run(id).log, { say: true });
-  if (token !== generation || active !== run || selection !== rs.selection) return false;
+  let found = await read(source === "feed" ? data.run(id).feed(rs.turnsAfter) : data.run(id).log, { say: true });
+  const stale = () => token !== generation || active !== run || selection !== rs.selection || request !== rs.turnsRequest;
+  if (stale()) return false;
+  if (source === "feed" && found.data && rs.turnsEpoch != null && found.data.restore_epoch !== rs.turnsEpoch) {
+    if (found.data.restore_epoch < rs.turnsEpoch) return false;
+    rs.turns = [];
+    rs.turnsAfter = 0;
+    rs.turnsEpoch = found.data.restore_epoch;
+    publishRuns();
+    found = await read(data.run(id).feed(0), { say: true });
+    if (stale()) return false;
+  }
   const lines = found.data?.lines;
   if (!Array.isArray(lines)) {
     rs.turnsError = found.error ?? { status: null, message: "Malformed response" };
@@ -194,6 +206,8 @@ async function readTurns(selection, token, run) {
   rs.turnsError = null;
   rs.turnsSource = source;
   if (source === "feed") {
+    if (rs.turnsEpoch != null && found.data.restore_epoch < rs.turnsEpoch) return false;
+    rs.turnsEpoch = found.data.restore_epoch;
     const fresh = lines.filter((line) => line && Number.isFinite(line.id) && line.id > rs.turnsAfter);
     rs.turns = [...rs.turns, ...fresh.map((line) => ({ id: `f:${line.id}`, at: line.ts ?? "", kind: line.kind ?? "", text: String(line.text ?? "") }))];
     rs.turnsAfter = Math.max(rs.turnsAfter, ...fresh.map((line) => line.id));

@@ -188,16 +188,30 @@ def print_feed_line(line: dict) -> None:
 def follow(run_id: str, alive=None, after: int = 0, send=None) -> int:
     import time
 
-    from .. import state
+    from .. import control
+
+    epoch = None
+
+    def drain():
+        nonlocal after, epoch
+        while True:
+            found = control.feed(run_id, after)
+            current = found["restore_epoch"]
+            if epoch != current:
+                changed = epoch is not None
+                epoch = current
+                if changed:
+                    after = 0
+                    continue
+            for line in found["lines"]:
+                print_feed_line(line)
+                after = line["id"]
+            return found["run"]
 
     while True:
-        for line in state.feed(run_id, after):
-            print_feed_line(line)
-            after = line["id"]
-        r = state.run_get(run_id) or {}
+        r = drain()
         if not (alive() if alive else r.get("status") == "running"):
-            for line in state.feed(run_id, after):
-                print_feed_line(line)
+            drain()
             return after
         if send:
             send()

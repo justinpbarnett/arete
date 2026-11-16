@@ -21,7 +21,8 @@ from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
 ROOT = REPO / ".arete-sandbox" / "db-fixture"
-ACTIONS = ("transactions", "concurrent-intake", "transaction-timing", "output-sinks", "durable-files")
+ACTIONS = ("transactions", "concurrent-intake", "transaction-timing", "output-sinks", "durable-files",
+           "wal-startup", "prune-restore", "restore-safety", "feed-cursors", "backup-health")
 sys.path.insert(0, str(REPO))
 
 
@@ -79,7 +80,7 @@ def setup():
     with state.one_read() as c:
         journal = c.execute("PRAGMA journal_mode").fetchone()[0]
         sync = c.execute("PRAGMA synchronous").fetchone()[0]
-    require(journal == "delete" and sync == 2, (journal, sync))
+    require(journal == "delete" and sync == 1, (journal, sync))
     return {"journal_mode": journal, "synchronous": sync}
 
 
@@ -870,6 +871,753 @@ def durable_files():
     return evidence
 
 
+def sql_rows(query, args=(), file=None):
+    from arete import paths
+
+    conn = paths.connect_db(file or paths.DB_FILE)
+    try:
+        return conn.execute(query, args).fetchall()
+    finally:
+        conn.close()
+
+
+def db_values():
+    from arete import backup, state
+
+    with state.one_read() as conn:
+        return {"sequences": backup.sequences(conn), "meta": backup.metadata(conn),
+                "feed": [tuple(r) for r in conn.execute("SELECT * FROM feed ORDER BY id")]}
+
+
+def stop_child(process):
+    if process.poll() is None:
+        process.terminate()
+    process.communicate(timeout=10)
+
+
+def start_fixture_serve():
+    from arete import paths
+
+    marker = paths.STATE_DIR.parent / ("serve-" + str(time.time_ns()))
+    process = child("serve-live", marker)
+    try:
+        wait_file(marker, process)
+        return process, json.loads(marker.read_text())
+    except BaseException:
+        stop_child(process)
+        raise
+
+
+def cli_output(*args):
+    from arete import cli
+
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+        result = cli.main(list(args))
+    return result, output.getvalue()
+
+
+def wal_startup():
+    from arete import paths, state, util
+
+    paths.ensure_dirs()
+    paths.CONFIG_FILE.write_text('[replay]\nall = true\n[jev]\nenabled = false\n')
+    evidence = {"cases": []}
+    for legacy in (False, True):
+        if legacy:
+            for suffix in ("", "-wal", "-shm", "-journal"):
+                Path(str(paths.DB_FILE) + suffix).unlink(missing_ok=True)
+            conn = sqlite3.connect(paths.DB_FILE)
+            conn.executescript((REPO / "tests/fixtures/schema-v0.sql").read_text())
+            conn.execute("INSERT INTO runs(id,kind,status,started) VALUES ('seed','loop','done',?)", (util.iso(),))
+            conn.commit()
+            conn.close()
+        else:
+            conn = paths.connect_db(paths.DB_FILE, create=True)
+            conn.close()
+        conn = paths.connect_db(paths.DB_FILE)
+        require(conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete", "helper enabled WAL")
+        conn.close()
+        process, found = start_fixture_serve()
+        try:
+            require(found["journal_mode"] == "wal" and found["synchronous"] == 1, found)
+            require(found["epoch"] == 0 and found["version"] == state.LATEST, found)
+            if legacy:
+                require(state.run_get("seed", connect=state.reader), "legacy row lost")
+            evidence["cases"].append({"legacy": legacy, **found})
+        finally:
+            stop_child(process)
+    reader = paths.connect_db(paths.DB_FILE, readonly=True)
+    try:
+        reader.execute("BEGIN")
+        before = reader.execute("SELECT count(*) FROM feed").fetchone()[0]
+        began = time.monotonic()
+        with ThreadPoolExecutor(1) as pool:
+            pool.submit(state.add_feed, "seed", "note", "outside-reader").result(timeout=1)
+        elapsed = time.monotonic() - began
+        require(reader.execute("SELECT count(*) FROM feed").fetchone()[0] == before, "reader snapshot changed")
+    finally:
+        reader.close()
+    failed = child("wal-failure")
+    failure_output = finish(failed)
+    evidence.update(journal_mode="wal", synchronous=1, reader_write_seconds=elapsed, switch_failure=failure_output,
+                    confined=confined_connections())
+    return evidence
+
+
+def confined_connections():
+    from arete import paths
+
+    if not paths.ON_MAC:
+        with mock.patch.object(paths, "ISOLATED", True):
+            expect(PermissionError, lambda: paths.connect_db(paths.DB_FILE))
+        return {"unsupported_platform_refused": True}
+    root = Path(tempfile.mkdtemp(prefix=".arete-scratch-", dir=ROOT))
+    target = root.with_name(".arete-scratch-" + os.urandom(8).hex())
+    root.rename(target)
+    target.chmod(0o700)
+    file = target / "arete.db"
+    with mock.patch.object(paths, "ISOLATED", True):
+        conn = paths.connect_db(file, create=True)
+        try:
+            require(conn.execute("PRAGMA journal_mode").fetchone()[0] == "memory", "confined journal changed")
+            require(conn.execute("PRAGMA synchronous").fetchone()[0] == 1, "confined sync changed")
+            expect(PermissionError, lambda: paths.connect_db(file))
+        finally:
+            conn.close()
+        for suffix in ("-journal", "-wal", "-shm"):
+            sidecar = Path(str(file) + suffix)
+            sidecar.write_bytes(b"fixture")
+            expect(PermissionError, lambda: paths.connect_db(file))
+            sidecar.unlink()
+        linked = target / "linked.db"
+        linked.symlink_to(file)
+        expect(PermissionError, lambda: paths.connect_db(linked))
+        linked.unlink()
+        os.link(file, linked)
+        expect(PermissionError, lambda: paths.connect_db(file))
+        linked.unlink()
+        with mock.patch.object(paths, "ON_MAC", False):
+            expect(PermissionError, lambda: paths.connect_db(file))
+    conn = sqlite3.connect(file)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("CREATE TABLE fixture(value)")
+    conn.close()
+    with mock.patch.object(paths, "ISOLATED", True):
+        expect(PermissionError, lambda: paths.connect_db(file))
+    return {"journal_mode": "memory", "synchronous": 1, "sidecars_links_nested_WAL_platform_refused": True}
+
+
+def fixture_server():
+    from arete import serve
+
+    server = serve.Server()
+    server.say = lambda text: print(text)
+    server.copy_off_machine = lambda file: None
+    return server
+
+
+def close_server(server):
+    server.pool.shutdown(wait=True)
+    for pool in server.job_pools.values():
+        pool.shutdown(wait=True)
+
+
+def prune_restore():
+    from arete import backup, paths, state, util
+
+    evidence = setup()
+    old = util.iso(util.now() - timedelta(days=60))
+    with state.tx() as conn:
+        for rid, kind, cost, at in (("old", "loop", 0, old), ("paid", "loop", 1, old),
+                                    ("pipeline", "pipeline", 0, old), ("recent", "loop", 0, util.iso())):
+            conn.execute("INSERT INTO runs(id,kind,loop_kind,status,started,cost_usd) VALUES (?,?,'command','done',?,?)",
+                         (rid, kind, at, cost))
+            state.add_feed(rid, "note", rid)
+    baseline_snapshot = backup.snapshot("pre-prune")
+    server = fixture_server()
+    try:
+        before = backup.inspect(paths.DB_FILE)["counts"]
+        with mock.patch.object(backup, "snapshot", side_effect=OSError("fixture snapshot failure")):
+            server.prune()
+        require(backup.inspect(paths.DB_FILE)["counts"] == before, "failed snapshot pruned")
+        server.prune()
+        require(state.run_get("paid") and state.run_get("pipeline") and state.run_get("recent"), "eligibility changed")
+        with mock.patch.object(state, "FIRINGS", "(1 = 1)"):
+            server.prune()
+        snapshot = baseline_snapshot
+        require(backup.inspect(snapshot)["quick_check"] == "ok", "unchecked snapshot")
+        expected = sql_rows("SELECT * FROM runs ORDER BY id", file=snapshot)
+        rc, output = cli_output("backup", "--check")
+        require(rc == 0 and "runs" in output and "feed" in output, output)
+        for i in range(20):
+            state.add_feed("later", "note", str(i))
+        previous = db_values()
+        snapshot_identity = "f" * 32
+        with sqlite3.connect(snapshot) as conn:
+            conn.execute("UPDATE schema_meta SET value=? WHERE key='instance_id'", (snapshot_identity,))
+        rc, restored = cli_output("backup", "--restore", str(snapshot))
+        require(rc == 0, restored)
+        require(sql_rows("SELECT * FROM runs ORDER BY id") == expected, "restore lost runs")
+        after = db_values()
+        require(all(after["sequences"].get(k, 0) >= v for k, v in previous["sequences"].items()), "sequence regression")
+        require(after["meta"]["instance_id"] == previous["meta"]["instance_id"], "identity replaced")
+        require(int(after["meta"]["restore_epoch"]) > int(previous["meta"]["restore_epoch"]), "epoch did not increase")
+        evidence.update(journal_mode="wal", check_output=output, restore_output=restored, before=previous, after=after,
+                        retention=retention_policy(), consistent_counts=consistent_counts())
+    finally:
+        close_server(server)
+    return evidence
+
+
+def retention_policy():
+    from arete import backup, paths, state, util
+
+    folder = paths.STATE_DIR.parent / "retention"
+    folder.mkdir()
+    target = folder / "arete.db"
+    conn = sqlite3.connect(target)
+    conn.executescript((REPO / "tests/fixtures/schema-v0.sql").read_text())
+    conn.close()
+    with mock.patch.object(paths, "DB_FILE", target):
+        state.migrate()
+        pinned = sql_rows("SELECT backup FROM schema_migrations ORDER BY n DESC LIMIT 1")[0][0]
+        require(pinned, "migration snapshot not pinned")
+        snapshots = paths.backups_dir()
+        for day in range(1, 21):
+            for hour in (6, 18):
+                stamp = util.now() - timedelta(days=day)
+                (snapshots / f"arete-{stamp:%Y%m%d}T{hour:02d}0000Z-hand.db").write_bytes(b"fixture retention")
+        every = backup.snapshots()
+        by_day = {backup.stamp_of(p).date(): p for p in every}
+        first = (util.now() - timedelta(days=13)).date()
+        expected = set(every[-24:]) | {p for day, p in by_day.items() if day >= first} | {snapshots / pinned}
+        backup.retain(snapshots)
+        require(set(backup.snapshots()) == expected, "retention changed newest/day policy or lost pin")
+        return {"pin": pinned, "kept": len(expected), "newest": 24, "days": 14}
+
+
+def consistent_counts():
+    from arete import backup, paths, state, util
+
+    daemon, _ = start_fixture_serve()
+    stop_child(daemon)
+    before = backup.inspect(paths.DB_FILE)["counts"]
+    connect = paths.connect_db
+    errors, once = [], []
+
+    def writer():
+        try:
+            with state.tx() as conn:
+                conn.execute("INSERT INTO runs(id,kind,status,started) VALUES ('count-barrier','loop','done',?)", (util.iso(),))
+                state.add_feed("count-barrier", "note", "committed together")
+        except BaseException as e:
+            errors.append(str(e))
+
+    def traced(file, **kw):
+        conn = connect(file, **kw)
+        if file == paths.DB_FILE and kw.get("readonly"):
+            def trace(statement):
+                if 'SELECT count(*) FROM "feed"' in statement and not once:
+                    once.append(True)
+                    thread = threading.Thread(target=writer)
+                    thread.start()
+                    thread.join(5)
+                    if thread.is_alive():
+                        errors.append("concurrent count writer blocked")
+            conn.set_trace_callback(trace)
+        return conn
+
+    with mock.patch.object(paths, "connect_db", side_effect=traced):
+        found = backup.inspect(paths.DB_FILE)
+    after = backup.inspect(paths.DB_FILE)["counts"]
+    require(once and not errors and found["quick_check"] == "ok", errors)
+    require(all(found["counts"][name] == before[name] and after[name] == before[name] + 1 for name in ("runs", "feed")),
+            {"before": before, "found": found, "after": after})
+    return {"before": before, "snapshot": found["counts"], "after": after}
+
+
+def restore_safety():
+    from arete import backup, control, paths, state, util
+
+    evidence = setup()
+    with state.tx() as conn:
+        conn.execute("INSERT INTO runs(id,kind,status,started) VALUES ('safety','loop','done',?)", (util.iso(),))
+        state.add_feed("safety", "note", "snapshot")
+    snapshot = backup.snapshot("safety")
+    hot = hot_journal_probe()
+    refusals = {}
+
+    def inventory():
+        return {s: Path(str(paths.DB_FILE) + s).read_bytes() for s in backup.SIDECARS
+                if Path(str(paths.DB_FILE) + s).exists()}
+
+    def refused(name, expected_pid=None):
+        before = inventory()
+        rc, output = cli_output("backup", "--restore", str(snapshot))
+        require(rc == 1 and before == inventory(), (name, rc, output))
+        if expected_pid:
+            require(str(expected_pid) in output, output)
+        refusals[name] = output
+
+    holder = child("hold-lock", "serve", paths.STATE_DIR.parent / "serve-held")
+    try:
+        wait_file(paths.STATE_DIR.parent / "serve-held", holder)
+        refused("serve-lock", holder.pid)
+    finally:
+        stop_child(holder)
+    util.write_json(control.BEAT_FILE, {"pid": os.getpid(), "at": util.iso(util.now() - timedelta(days=30))})
+    refused("stale-live-heartbeat", os.getpid())
+    control.BEAT_FILE.unlink()
+    with state.tx() as conn:
+        conn.execute("UPDATE runs SET status='running',pid=? WHERE id='safety'", (os.getpid(),))
+    refused("run-pid", os.getpid())
+    with state.tx() as conn:
+        conn.execute("UPDATE runs SET pid=NULL,lock='fixture-detached' WHERE id='safety'")
+    holder = child("hold-lock", "fixture-detached", paths.STATE_DIR.parent / "run-held")
+    try:
+        wait_file(paths.STATE_DIR.parent / "run-held", holder)
+        refused("detached-lock", holder.pid)
+    finally:
+        stop_child(holder)
+    util.write_json(control.BEAT_FILE, {"pid": holder.pid, "at": util.iso()})
+    require(cli_output("backup", "--restore", str(snapshot))[0] == 0, "dead records blocked restore")
+    invalid = paths.STATE_DIR.parent / "invalid.db"
+    invalid.write_bytes(b"invalid")
+    truncated = invalid.with_name("truncated.db")
+    truncated.write_bytes(snapshot.read_bytes()[:snapshot.stat().st_size // 2])
+    for source in (invalid, invalid.with_name("missing.db"), truncated):
+        before = inventory()
+        require(cli_output("backup", "--restore", str(source))[0] == 1 and before == inventory(), "invalid restore changed target")
+    conn = paths.connect_db(paths.DB_FILE)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("INSERT INTO feed(run_id,ts,kind,text) VALUES ('safety',?,'note','wal-only')", (util.iso(),))
+    conn.execute("COMMIT")
+    try:
+        original = inventory()
+        probe = backup.probe_current()
+        require(probe and original == inventory(), "private WAL discovery changed originals")
+        require(probe["sequences"]["feed"] > dict(sql_rows("SELECT name,seq FROM sqlite_sequence", file=snapshot))["feed"], "WAL data missed")
+    finally:
+        conn.close()
+    faults = []
+    for fail_at in range(1, 6):
+        for suffix in backup.SIDECARS[1:]:
+            Path(str(paths.DB_FILE) + suffix).write_bytes(b"\0" * 512)
+        original = inventory()
+        real_rename, calls = os.rename, []
+
+        def rename(source, target):
+            calls.append((str(source), str(target)))
+            if len(calls) == fail_at:
+                raise OSError("fixture rename failure")
+            return real_rename(source, target)
+
+        with mock.patch.object(os, "rename", side_effect=rename):
+            expect(OSError, lambda: backup.restore(snapshot))
+        require(inventory() == original, {"rename": fail_at, "calls": calls})
+        require(not list(paths.STATE_DIR.glob("*.restoring-*")), "stage leaked")
+        faults.append({"rename": fail_at, "original_restored": True})
+        for suffix in backup.SIDECARS[1:]:
+            Path(str(paths.DB_FILE) + suffix).unlink(missing_ok=True)
+    original = inventory()
+    flush_file = util.flush_file
+
+    def fail_installed(file):
+        if file == paths.DB_FILE:
+            raise OSError("fixture installed sync failure")
+        return flush_file(file)
+
+    with mock.patch.object(util, "flush_file", side_effect=fail_installed):
+        expect(OSError, lambda: backup.restore(snapshot))
+    require(inventory() == original, "installed sync failure lost originals")
+    cached = (paths.backups_dir() / "instance.json").read_bytes()
+    snap_values = dict(sql_rows("SELECT name,seq FROM sqlite_sequence", file=snapshot))
+    paths.DB_FILE.write_bytes(b"unreadable current database")
+    backup.restore(snapshot)
+    after = db_values()
+    require(after["sequences"] == {k: v + 10000 for k, v in snap_values.items()}, "unreadable gap")
+    require((paths.backups_dir() / "instance.json").read_bytes() == cached, "identity cache changed")
+    legacy = paths.STATE_DIR.parent / "legacy.db"
+    conn = sqlite3.connect(legacy)
+    conn.executescript((REPO / "tests/fixtures/schema-v0.sql").read_text())
+    conn.execute("INSERT INTO runs(id,kind,status,started) VALUES ('legacy','loop','done',?)", (util.iso(),))
+    conn.commit()
+    conn.close()
+    rc, output = cli_output("backup", "--restore", str(legacy))
+    require(rc == 0 and "startup" in output and backup.pending_restore(), output)
+    expect(state.IncompatibleSchema, lambda: state.add_feed("legacy", "note", "blocked"))
+    process, first = start_fixture_serve()
+    stop_child(process)
+    process, second = start_fixture_serve()
+    stop_child(process)
+    require(first["epoch"] == second["epoch"] and state.run_get("legacy"), "pre-ledger completion repeated")
+    interruptions = interrupted_restores(snapshot)
+    receipt = backup.receipt_epoch()
+    paths.DB_FILE.write_bytes(b"unreadable after preledger recovery")
+    backup.restore(snapshot)
+    require(int(db_values()["meta"]["restore_epoch"]) > receipt, "durable receipt generation regressed")
+    evidence.update(refusals=refusals, rename_faults=faults, installed_sync_rollback=True, interruptions=interruptions, hot_journal=hot,
+                    unreadable_sequences=after["sequences"], preledger_output=output, first=first, second=second)
+    backup.restore_record().write_text("{broken")
+    retained = inventory()
+    output = finish(child("serve-contender"))
+    require("corrupt restore recovery metadata" in output and retained == inventory(), output)
+    expect(backup.Refused, backup.recover_restore)
+    backup.restore_record().unlink()
+    return evidence
+
+
+def interrupted_restores(snapshot):
+    from arete import backup, paths
+
+    results = []
+    for phase in ("rename-1", "rename-2", "rename-3", "rename-4", "rename-5", "metadata", "receipt"):
+        for suffix in backup.SIDECARS[1:]:
+            Path(str(paths.DB_FILE) + suffix).write_bytes(b"\0" * 512)
+        original = {s: Path(str(paths.DB_FILE) + s).read_bytes() for s in backup.SIDECARS}
+        process = child("interrupt-restore", phase, snapshot)
+        out, err = process.communicate(timeout=30)
+        require(process.returncode == 72, (phase, process.returncode, out, err))
+        data = backup.pending_restore()
+        epoch = data["epoch"]
+        daemon, found = start_fixture_serve()
+        stop_child(daemon)
+        require(found["epoch"] == epoch and not backup.pending_restore(), (phase, found))
+        archive = paths.DB_FILE.with_name(data["archive"])
+        require(all(Path(str(archive) + s).read_bytes() == value for s, value in original.items()), phase)
+        daemon, repeated = start_fixture_serve()
+        stop_child(daemon)
+        require(repeated["epoch"] == epoch, "recovery incremented twice")
+        results.append({"phase": phase, "epoch": epoch, "archive": archive.name, "original_bytes_preserved": True})
+    ready, release = paths.STATE_DIR.parent / "restore-ready", paths.STATE_DIR.parent / "restore-release"
+    process = child("restore-barrier", snapshot, ready, release)
+    try:
+        wait_file(ready, process)
+        contender = child("serve-contender")
+        output = finish(contender)
+        require("startup excluded" in output, output)
+        release.touch()
+        finish(process)
+    finally:
+        if process.poll() is None:
+            stop_child(process)
+    results.append({"startup_exclusion_barrier": True})
+    return results
+
+
+def hot_journal_probe():
+    from arete import backup, paths, state, util
+
+    with state.tx() as conn:
+        conn.executemany("INSERT INTO feed(run_id,ts,kind,text) VALUES ('hot',?,'note',?)",
+                         [(util.iso(), "original" * 100)] * 1000)
+    process = child("hot-journal")
+    finish(process)
+    journal = Path(str(paths.DB_FILE) + "-journal")
+    require(journal.exists(), "child left no hot journal")
+    before = {s: Path(str(paths.DB_FILE) + s).read_bytes() for s in backup.SIDECARS
+              if Path(str(paths.DB_FILE) + s).exists()}
+    found = backup.probe_current()
+    require(found and found["sequences"]["feed"] >= 1000, "hot journal could not be recovered privately")
+    with backup.private_database(paths.DB_FILE) as conn:
+        require(conn.execute("SELECT count(*) FROM feed WHERE text='uncommitted'").fetchone()[0] == 0, "uncommitted hot rows leaked")
+    require(all(Path(str(paths.DB_FILE) + s).read_bytes() == value for s, value in before.items()), "hot discovery changed originals")
+    return {"hot_journal": True, "private_recovery": True, "original_bytes_preserved": True}
+
+
+def http_feed_snapshot(run_id):
+    import socket
+    import urllib.request
+
+    from arete import paths
+
+    daemon, _ = start_fixture_serve()
+    stop_child(daemon)
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    process = child("feed-http", port, run_id)
+    try:
+        deadline = time.monotonic() + 15
+        while True:
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/feed/{run_id}?after=0", timeout=2) as response:
+                    found = json.load(response)
+                break
+            except OSError:
+                require(time.monotonic() < deadline and process.poll() is None, "HTTP feed did not start")
+                time.sleep(.02)
+        require(found["run"]["status"] == "running" and not any(r["kind"] == "end" for r in found["lines"]), found)
+        require(isinstance(found["restore_epoch"], int), "HTTP generation absent")
+        return {"status": found["run"]["status"], "generation": found["restore_epoch"], "lines": len(found["lines"]),
+                "settlement_committed": sql_rows("SELECT status FROM runs WHERE id=?", (run_id,))[0][0] == "done"}
+    finally:
+        stop_child(process)
+
+
+def feed_cursors():
+    from arete import backup, control, paths, record, state, util
+    from arete.commands import common
+
+    evidence = setup()
+    rid = record.start("loop", loop="fixture")
+    snapshot = backup.snapshot("feed")
+    got, errors = [], []
+    done = threading.Event()
+
+    def writer(n):
+        for i in range(300):
+            state.add_feed(rid, "note", f"{n}:{i}")
+
+    def poller():
+        after = 0
+        try:
+            while not done.is_set():
+                lines = control.feed(rid, after)["lines"]
+                got.extend(lines)
+                after = lines[-1]["id"] if lines else after
+                time.sleep(.001)
+            got.extend(control.feed(rid, after)["lines"])
+        except BaseException as e:
+            errors.append(str(e))
+
+    polling = threading.Thread(target=poller)
+    polling.start()
+    try:
+        parallel(writer)
+    finally:
+        done.set()
+        polling.join(10)
+    require(not errors and len(got) == 1200 and len({r["text"] for r in got}) == 1200, (len(got), errors))
+    require([r["id"] for r in got] == sorted({r["id"] for r in got}), "feed ordering")
+    before = db_values()
+    trace = []
+    connect = paths.connect_db
+
+    def traced(*a, **kw):
+        conn = connect(*a, **kw)
+        conn.set_trace_callback(trace.append)
+        return conn
+
+    try:
+        with mock.patch.object(paths, "connect_db", side_effect=traced):
+            with state.tx() as conn:
+                state.insert_feed(rid, "note", "rollback-insert")
+                state.add_feed(rid, "note", "rollback-add")
+                written = conn.execute("SELECT text, count(*) FROM feed WHERE run_id=? "
+                                       "AND text IN ('rollback-insert','rollback-add') GROUP BY text ORDER BY text",
+                                       (rid,)).fetchall()
+                require([tuple(row) for row in written] == [("rollback-add", 1), ("rollback-insert", 1)], written)
+                raise ValueError("rollback")
+    except ValueError:
+        pass
+    statements = []
+    for statement in trace:
+        if not statements or statement != statements[-1]:
+            statements.append(statement)
+    require(statements[0] == "BEGIN IMMEDIATE" and statements[-1] == "ROLLBACK"
+            and sum(s.startswith("INSERT INTO feed") for s in statements) == 2, trace)
+    require(db_values()["feed"] == before["feed"], "feed entry point escaped transaction")
+    with mock.patch.object(state, "insert_feed", side_effect=ValueError("end line failure")):
+        expect(ValueError, lambda: record.settle(rid, "done", end_line="done"))
+    require(state.run_get(rid)["status"] == "running", "settlement escaped end line rollback")
+    http = http_feed_snapshot(rid)
+    require(http["settlement_committed"], "HTTP snapshot did not overlap a committed settlement")
+    with state.tx() as conn:
+        conn.executemany("INSERT INTO feed(run_id,ts,kind,text) VALUES (?,?,'note','later')", [(rid, util.iso())] * 15001)
+        conn.execute("UPDATE runs SET status='done',pid=NULL WHERE id=?", (rid,))
+    high = db_values()["sequences"]["feed"]
+    emitted = []
+    real_feed = control.feed
+    calls = []
+
+    def changing(run, after):
+        calls.append(after)
+        if len(calls) == 2:
+            paths.DB_FILE.write_bytes(b"unreadable")
+            backup.restore(snapshot)
+            with state.tx() as conn:
+                conn.execute("UPDATE runs SET status='done',pid=NULL WHERE id=?", (rid,))
+            state.add_feed(rid, "note", "first restored generation")
+        return real_feed(run, after)
+
+    with mock.patch.object(control, "feed", side_effect=changing), \
+            mock.patch.object(common, "print_feed_line", side_effect=lambda line: emitted.append(line["text"])):
+        cursor = common.follow(rid, after=high)
+    require("first restored generation" in emitted and 0 in calls, (emitted, calls))
+    require(cursor < high and cursor == db_values()["sequences"]["feed"], "final drain cursor stale")
+
+    def restore_during_poll():
+        paths.DB_FILE.write_bytes(b"unreadable poll boundary")
+        backup.restore(snapshot)
+        with state.tx() as conn:
+            conn.execute("UPDATE runs SET status='done',pid=NULL WHERE id=?", (rid,))
+        state.add_feed(rid, "note", "first polling generation")
+
+    alive = iter((True, False))
+    polled = []
+    with mock.patch.object(time, "sleep"), \
+            mock.patch.object(common, "print_feed_line", side_effect=lambda line: polled.append(line["text"])):
+        polling_cursor = common.follow(rid, alive=lambda: next(alive), after=cursor, send=restore_during_poll)
+    require("first polling generation" in polled and polling_cursor == db_values()["sequences"]["feed"], polled)
+    evidence.update(lines=len(got), unique=len({r["text"] for r in got}), old_cursor=high, returned_cursor=cursor,
+                    poll_cursors=calls, emitted=emitted, polling_emitted=polled, polling_cursor=polling_cursor,
+                    feed_trace=trace, settlement_rollback=True,
+                    generation=real_feed(rid)["restore_epoch"], http=http, node=feed_node())
+    return evidence
+
+
+def feed_node():
+    program = REPO / "docs/db-feed-fixture.mjs"
+    result = subprocess.run(["node", str(program), str(REPO)], text=True, capture_output=True, timeout=20)
+    require(result.returncode == 0, result.stdout + result.stderr)
+    return json.loads(result.stdout)
+
+
+def backup_health():
+    import tarfile
+
+    from arete import backup, config, heartbeat, install, paths, serve, util
+
+    evidence = setup()
+    cfg = config.load()
+    checked = {}
+    outputs = {}
+    with mock.patch.object(install, "serve_installed", return_value=True), mock.patch.object(util, "last_wake", return_value=0):
+        snapshot = backup.snapshot("health")
+        checked["fresh"] = heartbeat.check_backup_db().ok
+        outputs["fresh"] = backup_health_cli()
+        stale = time.time() - 4 * 3600
+        os.utime(snapshot, (stale, stale))
+        checked["stale"] = heartbeat.check_backup_db().ok
+        outputs["stale"] = backup_health_cli()
+        snapshot = backup.snapshot("health")
+        with snapshot.open("r+b") as file:
+            file.truncate(snapshot.stat().st_size // 2)
+        checked["truncated"] = heartbeat.check_backup_db().ok
+        outputs["truncated"] = backup_health_cli()
+        snapshot = backup.snapshot("health")
+        backup.update_last(quick_check="fixture failed check")
+        checked["recorded"] = heartbeat.check_backup_db().ok
+        outputs["recorded"] = backup_health_cli()
+    require(checked == {"fresh": True, "stale": False, "truncated": False, "recorded": False}, checked)
+    loops = paths.CONFIG_DIR / "loops"
+    loops.mkdir()
+    (loops / "allowed.toml").write_text('name = "fixture"')
+    (loops / "linked.toml").symlink_to(loops / "allowed.toml")
+    authority = loops / "verification-authority"
+    authority.mkdir()
+    (authority / "receipt.json").write_text('{}')
+    for name in (".env", ".env.test", "secret.env", "pi.env"):
+        (loops / name).write_text("fixture only")
+    day = util.now().strftime("%Y-%m-%d")
+    layers_git("init", "-q", "-b", "main")
+    (paths.CONFIG_DIR / "layers" / "allowed.txt").write_text("allowed history")
+    (paths.CONFIG_DIR / "layers" / ":allowed.txt").write_text("allowed colon pathname")
+    layers_git("add", ".")
+    layers_git("commit", "-qm", "allowed")
+    calls = []
+    destination = paths.STATE_DIR.parent / "away"
+    destination.mkdir()
+
+    def transport(argv, **kwargs):
+        calls.append(argv)
+        if len(calls) == 1:
+            return subprocess.CompletedProcess(argv, 1, "", "fixture failure")
+        for name in argv[2:4]:
+            shutil.copyfile(name, destination / Path(name).name)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    snapshot = backup.snapshot("health")
+    with mock.patch.object(util, "sh", side_effect=transport):
+        backup.daily_copy(snapshot, "")
+        require(not calls and not heartbeat.check_backup_offsite(cfg).ok, "empty destination copied")
+        server = serve.Server()
+        server.cfg = replace(cfg, backup=config.BackupConfig(str(destination)))
+        server.tick = server.prune
+        server.load_new_code = lambda: None
+        server.reap_inherited = lambda: None
+        server.watch_alerts = lambda: None
+        try:
+            for expected_exit in (1, 0, 0):
+                server.run_pass()
+                deadline = time.monotonic() + 10
+                while backup.COPYING:
+                    require(time.monotonic() < deadline, "serve copy did not finish")
+                    time.sleep(.01)
+                require(backup.read_last().get("copy_exit") == expected_exit, "serve copy/retry result")
+        finally:
+            close_server(server)
+        snapshot = backup.newest_snapshot()
+    require(len(calls) == 2, "successful copy repeated")
+    with tarfile.open(destination / f"config-{day}.tar.gz") as tar:
+        members = tar.getnames()
+        require("loops/allowed.toml" in members and "config.toml" in members, members)
+        require(all(not m.issym() and not any(backup.forbidden_name(p) for p in Path(m.name).parts) for m in tar), members)
+        bundle = destination / "layers.bundle"
+        bundle.write_bytes(tar.extractfile("layers.bundle").read())
+    layers_git("bundle", "verify", str(bundle))
+    away = replace(cfg, backup=config.BackupConfig(str(destination)))
+    backup.update_last(copied_at=util.iso(util.now() - timedelta(hours=49)))
+    with mock.patch.object(util, "last_wake", return_value=0):
+        require(not heartbeat.check_backup_offsite(away).ok, "old offsite receipt passed")
+    history = []
+    for name in (".env", ".env.test", "private.env", "pi.env", "verification-authority/receipt.json", "linked.txt",
+                 ":private/.env.production", ":private/pi.env"):
+        shutil.rmtree(paths.CONFIG_DIR / "layers")
+        layers_git("init", "-q", "-b", "main")
+        (paths.CONFIG_DIR / "layers" / "allowed.txt").write_text("allowed")
+        layers_git("add", ".")
+        layers_git("commit", "-qm", "allowed")
+        forbidden = paths.CONFIG_DIR / "layers" / name
+        forbidden.parent.mkdir(parents=True, exist_ok=True)
+        if name == "linked.txt":
+            forbidden.symlink_to("allowed.txt")
+        else:
+            forbidden.write_text("fixture only")
+        layers_git("add", "-f", ".")
+        layers_git("commit", "-qm", "forbidden history")
+        layers_git("--literal-pathspecs", "rm", "-q", name)
+        layers_git("commit", "-qm", "deleted history")
+        expect(RuntimeError, backup.layers_bundle)
+        backup.update_last(copied_at="")
+        with mock.patch.object(util, "sh", side_effect=AssertionError("forbidden bundle reached transport")):
+            failure = backup.run_copy(snapshot, str(destination), day)
+        require(failure and not backup.read_last().get("copied_at"), (name, failure))
+        history.append({"deleted_name": name, "refused": failure})
+    require(outputs["fresh"][0] == 0 and all(outputs[n][0] == 1 for n in ("stale", "truncated", "recorded")), outputs)
+    evidence.update(health=checked, heartbeat_output=outputs, copy_attempts=len(calls), archive_members=members, layers_history=history)
+    return evidence
+
+
+def layers_git(*args):
+    from arete import paths
+
+    folder = paths.CONFIG_DIR / "layers"
+    folder.mkdir(exist_ok=True)
+    result = subprocess.run(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.com",
+                             "-c", "commit.gpgsign=false", *args], cwd=folder, text=True, capture_output=True, timeout=20)
+    require(result.returncode == 0, (args, result.stdout, result.stderr))
+    return result.stdout
+
+
+def backup_health_cli():
+    from arete import heartbeat
+
+    with contextlib.ExitStack() as stack:
+        for name in ("check_jobs", "check_probes", "check_claude_auth", "check_codex_auth", "check_codex_cleanup",
+                     "check_pi_auth", "check_hook", "check_disk", "check_serve", "check_costs", "check_loops",
+                     "check_oncall", "check_workspaces", "check_scratch"):
+            stack.enter_context(mock.patch.object(heartbeat, name, autospec=True, return_value=[]))
+        stack.enter_context(mock.patch.object(heartbeat, "network_up_or_skip", return_value=True))
+        stack.enter_context(mock.patch.object(heartbeat.alerts, "clear_alert", return_value=None))
+        stack.enter_context(mock.patch.object(heartbeat.alerts, "raise_alert", return_value=None))
+        rc, output = cli_output("heartbeat", "--dry-run")
+    require("backup:db" in output and "backup:offsite" in output, output)
+    return rc, output
+
+
 def timed_writer():
     from arete import state
 
@@ -884,10 +1632,144 @@ def child_main(role, args):
     if role in ACTIONS:
         functions = {"transactions": transactions, "concurrent-intake": concurrent_intake,
                      "transaction-timing": transaction_timing, "output-sinks": output_sinks,
-                     "durable-files": durable_files}
+                     "durable-files": durable_files, "wal-startup": wal_startup, "prune-restore": prune_restore,
+                     "restore-safety": restore_safety, "feed-cursors": feed_cursors, "backup-health": backup_health}
         result = functions[role]()
         (paths.STATE_DIR.parent / "evidence.json").write_text(json.dumps(result, indent=2, default=str) + "\n")
         print(f"{role}: passed")
+    elif role == "serve-live":
+        from arete import backup, serve, util
+
+        serve.start_notes = lambda cfg: []
+        serve.Server.report_config = lambda self: None
+
+        def tick(self):
+            with state.one_read() as conn:
+                found = {"journal_mode": conn.execute("PRAGMA journal_mode").fetchone()[0],
+                         "synchronous": conn.execute("PRAGMA synchronous").fetchone()[0],
+                         "epoch": int(backup.metadata(conn)["restore_epoch"]),
+                         "version": conn.execute("PRAGMA user_version").fetchone()[0]}
+            util.write_json(Path(args[0]), found)
+            time.sleep(30)
+
+        serve.Server.run_pass = tick
+        serve.run(with_dashboard=False)
+    elif role == "wal-failure":
+        from arete import serve
+
+        connect = paths.connect_db
+
+        class FailingConnection:
+            def __init__(self, conn):
+                object.__setattr__(self, "conn", conn)
+
+            def __getattr__(self, name):
+                return getattr(self.conn, name)
+
+            def __setattr__(self, name, value):
+                setattr(self.conn, name, value)
+
+            def execute(self, query, *args):
+                if query == "PRAGMA journal_mode=WAL":
+                    raise sqlite3.OperationalError("fixture WAL failure")
+                return self.conn.execute(query, *args)
+
+        paths.connect_db = lambda *a, **kw: FailingConnection(connect(*a, **kw))
+        serve.Server = lambda: (_ for _ in ()).throw(AssertionError("workers constructed after WAL failure"))
+        expect(SystemExit, lambda: serve.run(with_dashboard=False))
+        print("WAL failure stopped startup before workers/API")
+    elif role == "hold-lock":
+        from arete import util
+
+        with util.lock(args[0]) as held:
+            require(held, "fixture could not acquire lock")
+            Path(args[1]).touch()
+            time.sleep(60)
+    elif role == "hot-journal":
+        conn = sqlite3.connect(paths.DB_FILE)
+        conn.execute("PRAGMA cache_size=10")
+        conn.execute("UPDATE feed SET text='uncommitted'")
+        os._exit(0)
+    elif role == "feed-http":
+        from arete import dashboard, record, tailnet
+
+        original = state.feed
+        once = False
+
+        def paused_feed(*a, **kw):
+            nonlocal once
+            lines = original(*a, **kw)
+            if not once:
+                once = True
+                errors = []
+
+                def settle():
+                    try:
+                        record.settle(args[1], "done", end_line="done")
+                    except BaseException as e:
+                        errors.append(str(e))
+
+                writer = threading.Thread(target=settle)
+                writer.start()
+                writer.join(5)
+                require(not writer.is_alive() and not errors, ("concurrent HTTP settlement", errors))
+            return lines
+
+        class Host(tailnet.ScratchHost):
+            def node(self, owner):
+                return tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "fixture@example.com", "")
+
+            def whois(self, address):
+                return "fixture@example.com"
+
+        state.feed = paused_feed
+        dashboard.serve(port=int(args[0]), host=Host(), inside_serve=True)
+    elif role == "interrupt-restore":
+        from arete import backup, util
+
+        phase, source = args
+        rename, apply, write_json = os.rename, backup.apply_metadata, util.write_json
+        count = 0
+
+        def interrupted_rename(source, target):
+            nonlocal count
+            rename(source, target)
+            count += 1
+            if phase == f"rename-{count}":
+                os._exit(72)
+
+        def interrupted_metadata(target, data):
+            result = apply(target, data)
+            if phase == "metadata" and target == paths.DB_FILE:
+                os._exit(72)
+            return result
+
+        def interrupted_receipt(file, data):
+            write_json(file, data)
+            if phase == "receipt" and file.name == "restore-receipt.json":
+                os._exit(72)
+
+        os.rename, backup.apply_metadata, util.write_json = interrupted_rename, interrupted_metadata, interrupted_receipt
+        backup.restore(Path(source))
+        raise AssertionError("restore interruption point was not reached")
+    elif role == "restore-barrier":
+        from arete import backup
+
+        install = backup.install_staged
+
+        def paused_install(staged):
+            Path(args[1]).touch()
+            wait_file(Path(args[2]))
+            return install(staged)
+
+        backup.install_staged = paused_install
+        backup.restore(Path(args[0]))
+    elif role == "serve-contender":
+        from arete import serve
+
+        with contextlib.redirect_stderr(sys.stdout):
+            expect(SystemExit, lambda: serve.run(with_dashboard=False))
+        print("startup excluded")
     elif role == "hold-writer":
         with state.tx():
             Path(args[0]).touch()
@@ -920,12 +1802,13 @@ def inspect_evidence():
         file = latest / "evidence.json"
         require(file.exists(), f"exercise did not pass: {latest}")
         data = json.loads(file.read_text())
-        require(data["journal_mode"] == "delete" and data["synchronous"] == 2, file)
+        require(data["journal_mode"] in ("delete", "wal") and data["synchronous"] == 1, file)
         found[action] = {"evidence": str(file), "journal_mode": data["journal_mode"], "synchronous": data["synchronous"]}
     readme = (REPO / "README.md").read_text()
     require("one full day" in readme and "rollback" in readme, "rollout documentation missing")
     (ROOT / "inspect.json").write_text(json.dumps(found, indent=2) + "\n")
     print(json.dumps(found, indent=2))
+    print("inspect: passed")
 
 
 def main():

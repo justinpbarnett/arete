@@ -142,7 +142,13 @@ class FixtureConnection(sqlite3.Connection):
 def connect_db(p: Path, readonly: bool = False, create: bool = False) -> sqlite3.Connection:
     if not ISOLATED:
         mode = "ro" if readonly else "rwc" if create else "rw"
-        return sqlite3.connect(f"{p.absolute().as_uri()}?mode={mode}", uri=True, timeout=30)
+        conn = sqlite3.connect(f"{p.absolute().as_uri()}?mode={mode}", uri=True, timeout=30)
+        try:
+            conn.execute("PRAGMA synchronous=NORMAL")
+            return conn
+        except BaseException:
+            conn.close()
+            raise
     if not ON_MAC or confined(p) is None:
         raise PermissionError("isolated state requires a supported confined database path")
     if getattr(DB_THREAD, "active", False) or not DB_LOCK.acquire(timeout=30):
@@ -180,6 +186,7 @@ def connect_db(p: Path, readonly: bool = False, create: bool = False) -> sqlite3
         conn.handles = handles
         if not readonly and conn.execute("PRAGMA journal_mode=MEMORY").fetchone()[0] != "memory":
             raise PermissionError("isolated state requires disposable memory journaling")
+        conn.execute("PRAGMA synchronous=NORMAL")
         return conn
     except BaseException:
         conn.close() if conn is not None else handles.close()
