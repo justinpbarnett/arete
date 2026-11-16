@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from . import evals, experiment, paths, pipeline, record, replay, routing, state, steps, util
+from . import evals, experiment, paths, pipeline, record, replay, routing, state, steps, util, workspace
 from .agent import REPLAY, traits_of
 
 GROUPS = ("ordinary", "difficult")
@@ -195,7 +195,7 @@ def exit_code(exp: experiment.Experiment, task: evals.Task, commit: str, run: Pr
         evals.checkout_without_origin_refs(exp.repo.path, commit, wt)
         try:
             evals.prepare(exp.repo, evals.Source(exp.repo), wt, run)
-        except pipeline.RunFailed as e:
+        except workspace.RunFailed as e:
             run.clock.check()
             raise experiment.Refused(f"tasks.{task.name}: {e.why} on {commit[:7]}") from e
         code = evals.hidden_check(exp.cfg, exp.repo, task, wt, run.time_for(task.timeout_minutes * 60)).returncode

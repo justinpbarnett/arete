@@ -27,9 +27,10 @@ from . import (
     tracker,
     util,
     verify,
+    workspace,
 )
 from .agent import REPLAY, Result
-from .pipeline import AgentRun, Checkout, TicketWork, use_product
+from .pipeline import AgentRun, TicketWork, use_product
 
 NAME = re.compile(r"[A-Za-z0-9_-]+")
 RESERVED = ("record", "scratch")
@@ -348,7 +349,7 @@ def numbered(task: Task) -> str:
     return "\n".join(f"{k}. {text}" for k, text in enumerate(task.requirements, 1))
 
 
-def workspace(suite: Suite, cfg: config.Config, task: Task, wt: Path) -> None:
+def prepare_workspace(suite: Suite, cfg: config.Config, task: Task, wt: Path) -> None:
     shutil.rmtree(wt, ignore_errors=True)
     if task.state:
         shutil.copytree(suite.folder / task.state, wt, ignore=shutil.ignore_patterns(".git"))
@@ -396,7 +397,7 @@ def run_trial(suite: Suite, cfg: config.Config, run_id: str, n: int, task: Task,
     try:
         trial_dir.mkdir(parents=True)
         row["state_digest"] = state_digest(suite, task)
-        workspace(suite, cfg, task, wt)
+        prepare_workspace(suite, cfg, task, wt)
         repo = suite.repo or config.Repo(name=f"verifiers-{suite.name}", path=wt, tracker="local", jev=False,
                                          layer=suite.folder)
         layer = replace(suite.layer, verify=replace(suite.verify, preflight={}))
@@ -404,7 +405,7 @@ def run_trial(suite: Suite, cfg: config.Config, run_id: str, n: int, task: Task,
         run = TrialRun(id=run_id, repo=repo, dir=trial_dir, cfg=cfg, layer=layer,
                        overrides={**suite.arms[arm], "timeout_minutes": timeout, "budget_usd": round(spend_left, 6)})
         ticket = tracker.Ticket(id=f"trial-{n}", ref=f"trial-{n}", title=task.title, body=task.prompt)
-        work = TicketWork(cfg, run, ticket, wt, [Checkout("", repo.github, repo.path, wt, "")], layer, timeout * 60,
+        work = TicketWork(cfg, run, ticket, wt, [workspace.Checkout("", repo.github, repo.path, wt, "")], layer, timeout * 60,
                           workspace="You are in a checkout of its code.")
         stage = "verifier call"
         verified = use_product(work, step, "grade", role="verify", goal=numbered(task))

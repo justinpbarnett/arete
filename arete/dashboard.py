@@ -44,6 +44,7 @@ from . import (
     scaffold,
     sessions,
     settings,
+    slots,
     state,
     tasks,
     triage,
@@ -368,7 +369,7 @@ STATUS_OF_REFUSAL = {capture.TooLarge: 413, capture.Refused: 400, capture.NotSta
                      chat.NoDraft: 409, chat.NoChat: 404, chat.BadProject: 400, gh.GhError: 502, jira.JiraError: 502,
                      control.NotFound: 404, control.Busy: 409, control.Refused: 400, loops.LoopError: 400,
                      devices.DeviceError: 400, triage.NotOnBoard: 404, triage.NotSendable: 409, triage.BadAnswers: 400,
-                     triage.TrackerFailed: 502, pipeline.NoFreeSlot: 409, tasks.TrackerFailed: 502,
+                     triage.TrackerFailed: 502, slots.NoFreeSlot: 409, tasks.TrackerFailed: 502,
                      webpush.Refused: 400}
 
 

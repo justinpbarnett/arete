@@ -8,16 +8,15 @@ import re
 import shlex
 import shutil
 import signal
-import stat
 import subprocess
 import sys
 import time
 import tomllib
 from collections import Counter
 from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, timedelta
 from pathlib import Path
 from string import Template
 from typing import NamedTuple, TextIO
@@ -47,6 +46,7 @@ from . import (
     runner,
     sandbox,
     scratch,
+    slots,
     state,
     steps,
     tracker,
@@ -54,6 +54,7 @@ from . import (
     vault,
     verify,
     webpush,
+    workspace,
 )
 from .agent import NO_SESSION, REPLAY, Result, Session
 from .heartbeat import mark_loop, network_up_or_skip
@@ -87,14 +88,10 @@ NOT_CAUSED_LEFT_FOR_A_PERSON = (f"{LEFT_HEADING}\n\n{LEFT_BY_A_PERSON} A red che
                                 "is not caused by the PR: set `caused_by_pr` to false, say in its reason that it waits "
                                 "on the change left for a person, and do not make it pass another way.\n\n")
 CHECKED_IN_USE_HEADING = "## Checked in use"
-SLOTS_LOCK = "run-slots"
-SLOT_KINDS = ("pipeline", "experiment")
 RUNS_LOG = "runs.log"
 RUN_START_SECONDS = 10
 SUCCEEDED = ("pr", "noop", "needs-info", "dry-run", "done")
 ANSWER_FILE = "answer.md"
-FREED_SLOT_FOR_CI = "ci: freed the run slot for the wait"
-SLOT_POLL_SECONDS = 30
 CHECK_LANE_POLL_SECONDS = 2
 MAX_STARTS_PER_POLL = 64
 CHECKS_SCRIPT = "checks"
@@ -467,7 +464,7 @@ class Run(AgentRun):
     alone: bool = False
     facts: dict = field(default_factory=dict)
     repairs: str = ""
-    workspace: tuple[Path, list[Checkout]] | None = None
+    workspace: tuple[Path, list[workspace.Checkout]] | None = None
     asks_made: int = 0
     answers_due: list[dict] = field(default_factory=list)
     base_note: str = ""
@@ -629,416 +626,28 @@ class Run(AgentRun):
         self.say(f"Run `{self.id}` {why}. {self.retry_hint}.")
 
 
-@dataclass
-class Checkout:
-    dir: str
-    github: str
-    src: Path
-    wt: Path
-    base: str
-    pr: str = ""
-    lease: str = ""
-    resumes: bool = False
-    merged_base: bool = False
-    revision: str = ""
-    base_commit: str = ""
-    resolved: list[str] = field(default_factory=list)
-    merge: str = ""
-    resolved_lines: int = 0
-    onto: str = ""
-    kept: str = ""
-
-    @property
-    def prefix(self) -> str:
-        return f"{self.dir}/" if self.dir else ""
-
-    @property
-    def starting_point(self) -> str:
-        if not self.onto:
-            return self.start_note
-        diff = f"git {f'-C {self.dir} ' if self.dir else ''}diff {self.onto[:12]} HEAD"
-        return (f"{self.start_note}; the worktree also holds edits that an earlier run of this ticket left unpushed, "
-                f"committed locally since `{self.onto[:12]}` (`{diff}` shows them), and they are part of this change")
-
-    @property
-    def start_note(self) -> str:
-        if not self.resumes:
-            return f"fresh from `{self.base}`"
-        start = (f"continuing the open PR {self.pr}" if self.pr
-                 else "continuing commits already pushed to the branch, with no PR yet")
-        if not self.merged_base:
-            return start
-        at = f" at `{self.base_commit[:12]}`" if self.base_commit else ""
-        fixed = (f"; arete resolved its merge conflicts in {', '.join(f'`{p}`' for p in self.resolved)}"
-                 if self.resolved else "")
-        return start + f", with `{self.origin_base}`{at} merged in since the base moved after the last push" + fixed
-
-    @property
-    def pr_name(self) -> str:
-        return f"{self.github.split('/')[-1]}#{gh.pr_number(self.pr)}"
-
-    @property
-    def origin_base(self) -> str:
-        return f"origin/{self.base}"
-
-    @property
-    def diff_from_base(self) -> str:
-        return f"git {f'-C {self.dir} ' if self.dir else ''}diff {self.origin_base}...HEAD"
-
-    @property
-    def diff_from_fork(self) -> str:
-        try:
-            fork = git(["merge-base", self.origin_base, "HEAD"], self.wt).strip()[:12]
-        except (RuntimeError, OSError):
-            fork = ""
-        return f"git {f'-C {self.dir} ' if self.dir else ''}diff {fork or self.origin_base}"
-
-
-def remote_head(src: Path, branch: str) -> str:
-    out = git(["ls-remote", "origin", f"refs/heads/{branch}"], src).split()
-    return out[0] if out else ""
-
-
-def fetch(src: Path, ref: str) -> None:
-    with util.repo_lock(src):
-        git(["fetch", "origin", ref], src)
-
-
-def add_worktree(c: Checkout, branch: str, start: str) -> None:
-    c.wt.parent.mkdir(parents=True, exist_ok=True)
-    util.add_worktree(c.src, c.wt, branch, start, reset=True)
-
-
-def scratch_named(names: set[str] | None, name: str) -> bool:
-    return name.startswith(paths.SCRATCH_PREFIX) and (names is None or name in names)
-
-
-def scratch_view() -> scratch.View | None:
-    try:
-        return scratch.survey()
-    except (OSError, ValueError, KeyError, TypeError):
-        return None
-
-
-def record_holds(view: scratch.View | None, d: Path) -> list[Path]:
-    if view is None:
-        return [d] if os.path.lexists(sandbox.AUTHORITY) else []
-    return [Path(scratch.path_of(h)) for h in scratch.holds(view, d)]
-
-
-def held_words(left: list[Path]) -> str:
-    return ", ".join(list(dict.fromkeys(str(p) for p in left))[:5])
-
-
-def scratch_left(ws: Path, checkouts: list[Checkout]) -> list[Path]:
-    found, unproven = [], []
-    view = scratch_view()
-    names = scratch.root_names(view) if view is not None else None
-    scanned = {ws, *(c.wt for c in checkouts)}
-    for d in scanned:
-        if records := record_holds(view, d):
-            found += [d, *records]
-
-        def unreadable(e: OSError, d: Path = d, found: list[Path] = found) -> None:
-            found.append(Path(e.filename) if e.filename else d)
-
-        try:
-            try:
-                d.lstat()
-            except FileNotFoundError:
-                continue
-            if d.is_symlink():
-                found.append(d)
-                continue
-            for root, dirs, files in os.walk(d, onerror=unreadable):
-                held = [n for n in dirs + files if scratch_named(names, n)]
-                found += [Path(root, n) for n in held]
-                unproven += [Path(root, n) for n in dirs + files
-                             if n.startswith(paths.SCRATCH_PREFIX) and n not in held]
-                dirs[:] = [n for n in dirs if n != ".git" and n not in held]
-        except OSError:
-            found.append(d)
-    late_view = scratch_view()
-    late = scratch.root_names(late_view) if late_view is not None else None
-    for d in scanned:
-        if records := record_holds(late_view, d):
-            found += [d, *records]
-    return list(dict.fromkeys(found + [p for p in unproven if scratch_named(late, p.name)]))
-
-
-def scratch_held(ws: Path, checkouts: list[Checkout]) -> list[Path]:
-    if held := scratch_left(ws, checkouts):
-        finalize_scratch()
-        held = scratch_left(ws, checkouts)
-    return held
-
-
-def finalize_scratch() -> list[str]:
-    done = scratch.recover_pending()
-    for root in done:
-        refresh_released(Path(root).parent, Path(root).name)
-    return done
-
-
-def refresh_released(ws: Path, root: str) -> None:
-    made = made_before(ws)
-    held, salt = made.get(RETAINED_KEY), str(made.get(SALT_KEY) or "")
-    if not isinstance(held, dict) or not isinstance(held.get("roots"), list) or root not in held["roots"]:
-        return
-    del made[RETAINED_KEY]
-    names = [n for n in held.get("names") or [] if isinstance(n, str) and n in made]
-    try:
-        made |= {n: fingerprint(ws / n, salt) for n in names}
-    except OSError:
-        pass
-    try:
-        made_record(ws).write_text(json.dumps(made))
-    except OSError:
-        pass
-
-
-def retained(ws: Path, checkouts: list[Checkout], names: list[str], held: list[Path]) -> dict:
-    examined = {c.wt for c in checkouts if (c.wt / ".git").exists()}
-    loose = {c.prefix + n for c in checkouts if c.wt in examined for n in ignored_files(c.wt)}
-    loose |= set(unexamined(ws, examined))
-    return {"roots": sorted({p.name for p in held if p.name.startswith(paths.SCRATCH_PREFIX)}),
-            "names": [n for n in names if n in loose]}
-
-
-def remove_workspace(ws: Path, checkouts: list[Checkout]) -> bool:
-    if scratch_left(ws, checkouts):
-        return False
-    made = made_before(ws)
-
-    def unknown_outside(examined: set[Path]) -> bool:
-        try:
-            return any(not recorded(made, ws, n) for n in unexamined(ws, examined))
-        except OSError:
-            return True
-
-    if unknown_outside({c.wt for c in checkouts if (c.wt / ".git").exists()}):
-        return False
-    for c in checkouts:
-        with util.repo_lock(c.src):
-            if scratch_left(ws, checkouts):
-                return False
-            if (c.wt / ".git").exists():
-                try:
-                    if any(not recorded(made, c.wt, n, c.prefix)
-                           for n in [*ignored_files(c.wt), *untracked_files(c.wt)]):
-                        return False
-                except (OSError, RuntimeError):
-                    return False
-            git(["worktree", "remove", "--force", str(c.wt)], c.src, check=False)
-    if scratch_left(ws, checkouts) or unknown_outside(set()):
-        return False
-    shutil.rmtree(ws, ignore_errors=True)
-    if os.path.lexists(ws):
-        return False
-    made_record(ws).unlink(missing_ok=True)
-    for c in checkouts:
-        with util.repo_lock(c.src):
-            git(["worktree", "prune"], c.src, check=False)
-    return True
-
-
-def recorded(made: dict, base: Path, name: str, prefix: str = "") -> bool:
-    salt = str(made.get(SALT_KEY) or "")
-    return bool(salt) and made.get(prefix + name) == fingerprint(base / name, salt)
-
-
-def blocked_by(ws: Path, checkouts: list[Checkout], edits: bool = False) -> list[str]:
-    try:
-        if left := scratch_left(ws, checkouts):
-            return list(dict.fromkeys(str(p) for p in left))
-        made = made_before(ws)
-        examined = {c.wt for c in checkouts if (c.wt / ".git").exists()}
-        names = [n for n in unexamined(ws, examined) if not recorded(made, ws, n)]
-        for c in checkouts:
-            if (c.wt / ".git").exists():
-                found = ([*uncommitted(c.wt), *ignored_files(c.wt)] if edits
-                         else [*ignored_files(c.wt), *untracked_files(c.wt)])
-                names += [c.prefix + n for n in dict.fromkeys(found)
-                          if not recorded(made, c.wt, n, c.prefix)]
-        return names
-    except (OSError, RuntimeError) as e:
-        return [util.first_line(str(e), 200)]
-
-
-def made_copy(ws: Path, source: Path, copies: list[str], rel: str) -> bool:
-    return (rel in copies and (source / rel).is_file() and (ws / rel).is_file()
-            and (ws / rel).read_bytes() == (source / rel).read_bytes())
-
-
-def made_record(ws: Path) -> Path:
-    return paths.STATE_DIR / "workspaces" / f"{ws.name}.json"
-
-
-def fingerprint(p: Path, salt: str) -> str:
-    if not p.exists() and not p.is_symlink():
-        return "missing"
-    walked = os.walk(p) if p.is_dir() and not p.is_symlink() else [(str(p.parent), [], [p.name])]
-    h = hashlib.sha256(salt.encode())
-    for root, dirs, files in walked:
-        dirs.sort()
-        for name in sorted(dirs + files):
-            q = Path(root, name)
-            st = q.lstat()
-            h.update(f"{q.relative_to(p.parent).as_posix()}\0{st.st_mode}\0{st.st_size}\0{st.st_mtime_ns}\n".encode())
-            if stat.S_ISLNK(st.st_mode):
-                h.update(os.readlink(q).encode())
-            elif stat.S_ISREG(st.st_mode):
-                with open(q, "rb") as f:
-                    while chunk := f.read(1 << 20):
-                        h.update(chunk)
-    return h.hexdigest()
-
-
-def made_before(ws: Path) -> dict:
-    try:
-        made = json.loads(made_record(ws).read_text())
-    except (OSError, ValueError):
-        return {}
-    return made if isinstance(made, dict) else {}
-
-
-def ignored_files(wt: Path) -> list[str]:
-    return [r[3:] for r in util.git_records(["status", "--porcelain", "--ignored=matching",
-                                             "--untracked-files=normal"], wt) if r.startswith("!! ")]
-
-
-def unexamined(ws: Path, examined: set[Path]) -> list[str]:
-    if ws in examined or not ws.is_dir():
-        return []
-    found = []
-    for root, dirs, files in os.walk(ws):
-        dirs[:] = [d for d in dirs if Path(root, d) not in examined]
-        found += [Path(root, f).relative_to(ws).as_posix() for f in files]
-        found += [Path(root, d).relative_to(ws).as_posix() for d in dirs if Path(root, d).is_symlink()]
-    return sorted(found)
-
-
-def leftovers(ws: Path, checkouts: list[Checkout]) -> list[str]:
-    examined = {c.wt for c in checkouts if (c.wt / ".git").exists()}
-    found = [c.prefix + n for c in checkouts if c.wt in examined for n in uncommitted(c.wt) + ignored_files(c.wt)]
-    return found + unexamined(ws, examined)
-
-
-def head_key(c: Checkout) -> str:
-    return f"\0head {c.prefix}"
-
-
-SALT_KEY = "\0salt"
-OWNER_KEY = "\0owner"
-RETAINED_KEY = "\0retained"
-
-
-def outside_scratch(ws: Path, names: list[str], held: list[Path]) -> list[str]:
-    roots = scratch.root_names()
-    return [n for n in names
-            if not any(scratch_named(roots, part) for part in Path(n).parts)
-            and not any(h.is_relative_to(ws / n) for h in held)]
-
-
-def onto_key(c: Checkout) -> str:
-    return f"\0onto {c.prefix}"
-
-
-def workspace_owner(run: Run, ws: Path, checkouts: list[Checkout]) -> dict | None:
-    earlier = made_before(ws).get(OWNER_KEY)
+def workspace_owner(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> dict | None:
+    earlier = workspace.owner_in(workspace.made_before(ws))
     if run.alone:
-        return earlier if isinstance(earlier, dict) else None
-    created = earlier.get("created") if isinstance(earlier, dict) else None
+        return earlier
+    created = earlier.get("created") if earlier else None
     return {"run": run.id, "repo": run.repo.name, "ticket": str(run.tid), "created": created or util.iso(),
             "checkouts": [{"dir": c.dir, "github": c.github, "src": str(c.src), "wt": str(c.wt)} for c in checkouts]}
 
 
-def release_workspace(run: Run, ws: Path, checkouts: list[Checkout]) -> bool:
-    note_made(ws, checkouts, workspace_owner(run, ws, checkouts))
-    if remove_workspace(ws, checkouts):
+def release_workspace(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> bool:
+    workspace.note_made(ws, checkouts, workspace_owner(run, ws, checkouts))
+    if workspace.remove_workspace(ws, checkouts):
         return True
-    names = blocked_by(ws, checkouts)
+    names = workspace.blocked_by(ws, checkouts)
     shown = ", ".join(names[:10]) + (f" and {len(names) - 10} more" if len(names) > 10 else "")
     run.log(f"workspace kept at {ws}: removal blocked by {shown or 'the folder could not be deleted'}")
     return False
 
 
-def note_made(ws: Path, checkouts: list[Checkout], owner: dict | None = None) -> None:
-    try:
-        owner = owner or made_before(ws).get(OWNER_KEY)
-        names, held = [], []
-        if ws.is_dir():
-            names, held = leftovers(ws, checkouts), scratch_left(ws, checkouts)
-            names = outside_scratch(ws, names, held)
-        heads = {head_key(c): git(["rev-parse", "HEAD"], c.wt).strip() for c in checkouts if (c.wt / ".git").exists()}
-        heads |= {onto_key(c): c.onto for c in checkouts if c.onto and (c.wt / ".git").exists()}
-        if names or heads:
-            salt = os.urandom(16).hex()
-            made = {n: fingerprint(ws / n, salt) for n in names} | heads | {SALT_KEY: salt}
-            if owner:
-                made[OWNER_KEY] = owner
-            if held:
-                made[RETAINED_KEY] = retained(ws, checkouts, names, held)
-            made_record(ws).parent.mkdir(parents=True, exist_ok=True)
-            made_record(ws).write_text(json.dumps(made))
-            if held and not scratch_left(ws, checkouts):
-                for root in made[RETAINED_KEY]["roots"]:
-                    refresh_released(ws, root)
-            return
-    except (OSError, RuntimeError):
-        pass
-    made_record(ws).unlink(missing_ok=True)
-
-
-def kept_work(ws: Path, checkouts: list[Checkout], source: Path, copies: list[str], commits: bool = True) -> str:
-    made = made_before(ws)
-    salt = str(made.get(SALT_KEY) or "")
-
-    def unknown(names: list[str]) -> list[str]:
-        return [n for n in names if not made_copy(ws, source, copies, n)
-                and not (salt and made.get(n) == fingerprint(ws / n, salt))]
-
-    examined = {c.wt for c in checkouts if (c.wt / ".git").exists()}
-    for c in checkouts:
-        if c.wt not in examined:
-            continue
-        try:
-            edits = unknown([c.prefix + n for n in uncommitted(c.wt)])
-            ignored = unknown([c.prefix + n for n in ignored_files(c.wt)])
-            ahead = git(["rev-list", "--count", "HEAD", "--not", "--remotes=origin"], c.wt).strip() if commits else "0"
-            if made.get(head_key(c)) == git(["rev-parse", "HEAD"], c.wt).strip():
-                ahead = "0"
-        except (RuntimeError, OSError) as e:
-            return f"arete could not read the existing worktree {c.wt} of {c.github}, so it left it as it is: {e}"
-        if edits or ignored or ahead != "0":
-            what = (f"uncommitted edits that arete has no record of leaving there ({', '.join(edits[:5])})" if edits
-                    else (f"git-ignored files that arete has no record of leaving there ({', '.join(ignored[:5])})"
-                          if ignored else f"{util.count(int(ahead), 'commit')} that are not on origin"))
-            return (f"the existing worktree {c.wt} of {c.github} holds {what}, so arete did not make it again and "
-                    "left them as they are; move or remove them, then run again")
-    try:
-        others = unknown(unexamined(ws, examined))
-    except OSError as e:
-        return f"arete could not read the existing workspace {ws}, so it left it as it is: {e}"
-    if others:
-        return (f"the existing workspace {ws} holds files outside this repo's worktrees ({', '.join(others[:5])}), "
-                "so arete did not make it again and left them as they are; move or remove them, then run again")
-    return ""
-
-
-def clear_workspace(ws: Path, checkouts: list[Checkout], source: Path, copies: list[str]) -> None:
-    if left := scratch_held(ws, checkouts):
-        raise RunFailed(
-            f"unresolved or unknown scratch resources keep the existing workspace retained ({held_words(left)})")
-    if why := kept_work(ws, checkouts, source, copies):
-        raise RunFailed(why)
-    if not remove_workspace(ws, checkouts):
-        raise RunFailed("workspace removal withheld to preserve scratch resources")
-
-
-def commit_kept(run_id: str, c: Checkout, layer: config.RepoLayer | None) -> None:
+def commit_kept(run_id: str, c: workspace.Checkout, layer: config.RepoLayer | None) -> None:
     head = git(["rev-parse", "HEAD"], c.wt).strip()
-    drop_untracked_bytecode(c.wt)
+    workspace.drop_untracked_bytecode(c.wt)
     diffguard.add(c.wt)
     deny = diffguard.denied_paths(layer) if layer else diffguard.ALWAYS_DENY
     holding = vault.held(git(["diff", *vault.SCAN, "--cached", "--no-renames", "--src-prefix=a/", "--dst-prefix=b/"],
@@ -1078,109 +687,12 @@ def kept_heads(run: Run) -> dict:
         return {}
 
 
-def kept_onto(ws: Path, checkouts: list[Checkout], branch: str) -> dict[str, str]:
-    made = made_before(ws)
-    kept = {}
-    for c in checkouts:
-        onto = str(made.get(onto_key(c)) or "")
-        if not onto or not (c.wt / ".git").exists():
-            continue
-        try:
-            head = git(["rev-parse", "HEAD"], c.wt).strip()
-            on = git(["symbolic-ref", "-q", "--short", "HEAD"], c.wt, check=False).strip()
-        except (RuntimeError, OSError) as e:
-            raise RunFailed(f"arete could not read the existing worktree {c.wt} of {c.github}, so it left it as it "
-                            f"is: {e}") from e
-        recorded = str(made.get(head_key(c)) or "")
-        if head != recorded:
-            what = f"is at `{head[:12]}`, not at `{recorded[:12]}` where arete kept the last run's edits"
-        elif on != branch:
-            what = f"has `{on or 'a detached HEAD'}` checked out, not `{branch}`"
-        else:
-            kept[str(c.wt)] = onto
-            continue
-        raise RunFailed(f"the existing worktree {c.wt} of {c.github} {what}, so arete did not continue from it or "
-                        f"make it again; put it back with `git -C {c.wt} checkout -B {branch} {recorded}`, or remove "
-                        f"the worktree and the local branch `{branch}` to start from origin, then run again")
-    return kept
-
-
-def kept_or_cleared(ws: Path, checkouts: list[Checkout], source: Path, copies: list[str],
-                    branch: str) -> dict[str, str]:
-    if left := scratch_held(ws, checkouts):
-        raise RunFailed(
-            f"unresolved or unknown scratch resources keep the existing workspace retained ({held_words(left)})")
-    kept = kept_onto(ws, checkouts, branch)
-    if not kept:
-        clear_workspace(ws, checkouts, source, copies)
-        return {}
-    if why := kept_work(ws, checkouts, source, copies):
-        raise RunFailed(why)
-    return kept
-
-
-def start_of(c: Checkout, branch: str) -> str:
-    return f"origin/{branch}" if c.resumes else c.origin_base
-
-
-def continue_from(c: Checkout, branch: str, onto: str) -> None:
-    c.onto = onto
-    behind = [start_of(c, branch), *([c.origin_base] if c.resumes else [])]
-    if any(git(["rev-list", "--count", f"HEAD..{ref}"], c.wt).strip() != "0" for ref in behind):
-        c.kept = git(["rev-parse", "HEAD"], c.wt).strip()
-
-
-def make_workspace(run_id: str, repo: config.Repo, base: str, branch: str, key: str,
-                   copies: list[str]) -> tuple[Path, list[Checkout]]:
-    ws = paths.WORKTREES_DIR / f"{repo.name}-{key}"
-    checkouts = [Checkout(p.dir, p.github, repo.path / p.dir, ws / p.dir, base or gh.default_branch(p.github))
-                 for p in repo.parts]
-    kept = kept_or_cleared(ws, checkouts, repo.path, copies, branch)
-    for c in checkouts:
-        with record.timed(run_id, "clone", repo=c.github, base=c.base, branch=branch, path=str(c.wt)) as clone:
-            fetch(c.src, c.base)
-            c.pr = gh.open_pr_url(c.github, branch)
-            c.lease = remote_head(c.src, branch)
-            c.resumes = bool(c.pr) or (bool(c.lease) and c.lease not in gh.closed_pr_heads(c.github, branch))
-            if c.resumes:
-                fetch(c.src, branch)
-            if str(c.wt) in kept:
-                continue_from(c, branch, kept[str(c.wt)])
-                clone["continued"] = True
-            else:
-                if kept and (c.wt / ".git").exists():
-                    with util.repo_lock(c.src):
-                        git(["worktree", "remove", "--force", str(c.wt)], c.src)
-                add_worktree(c, branch, f"origin/{branch}" if c.resumes else c.origin_base)
-            clone["resumed"] = c.resumes
-    return ws, checkouts
-
-
-def make_worktree(repo: config.Repo, base: str, branch: str, key: str, resume: bool = False) -> Path:
-    c = Checkout("", repo.github, repo.path, paths.WORKTREES_DIR / f"{repo.name}-{key}", base)
-    if not remove_workspace(c.wt, [c]):
-        left = scratch_left(c.wt, [c])
-        raise RunFailed("worktree removal withheld to preserve existing resources"
-                        + (f" ({held_words(left)})" if left else ""))
-    fetch(c.src, base)
-    if resume:
-        fetch(c.src, branch)
-    add_worktree(c, branch, f"origin/{branch}" if resume else c.origin_base)
-    return c.wt
-
-
-def remove_worktree(repo: config.Repo, wt: Path) -> None:
-    checkouts = [Checkout("", repo.github, repo.path, wt, "")]
-    if not remove_workspace(wt, checkouts):
-        print(f"{util.iso()} worktree kept at {wt}: removal blocked by {', '.join(blocked_by(wt, checkouts)[:10])}")
-
-
-def stale_base_note(c: Checkout) -> str:
+def stale_base_note(c: workspace.Checkout) -> str:
     return (f"Compare with `origin/<base>`, as in `{c.diff_from_base}`, never with the local base branch: arete "
             "fetched `origin`, but the local base branch can be days old.")
 
 
-def workspace_note(branch: str, checkouts: list[Checkout]) -> str:
+def workspace_note(branch: str, checkouts: list[workspace.Checkout]) -> str:
     if len(checkouts) == 1 and not checkouts[0].dir:
         c = checkouts[0]
         return (f"You are in a worktree on branch `{branch}`, {c.starting_point}. PRs target `{c.base}`. "
@@ -1193,29 +705,29 @@ def workspace_note(branch: str, checkouts: list[Checkout]) -> str:
     ])
 
 
-def compare_with_fork(checkouts: list[Checkout]) -> str:
+def compare_with_fork(checkouts: list[workspace.Checkout]) -> str:
     return ", ".join(f"`{c.diff_from_fork}`" for c in checkouts)
 
 
-def git_reads(checkouts: list[Checkout]) -> list[str]:
+def git_reads(checkouts: list[workspace.Checkout]) -> list[str]:
     return [f"git -C {c.dir} {cmd}*" for c in checkouts if c.dir for cmd in ("status", "diff", "log", "show")]
 
 
 @dataclass
 class Staged(diffguard.Diff):
     patch: str = ""
-    changed: list[Checkout] = field(default_factory=list)
-    merged: list[Checkout] = field(default_factory=list)
+    changed: list[workspace.Checkout] = field(default_factory=list)
+    merged: list[workspace.Checkout] = field(default_factory=list)
 
     @property
     def empty(self) -> bool:
         return not self.files and not self.merged
 
 
-def stage(checkouts: list[Checkout], deny: list[str], from_base: bool = False) -> Staged:
+def stage(checkouts: list[workspace.Checkout], deny: list[str], from_base: bool = False) -> Staged:
     out = Staged()
     for c in checkouts:
-        drop_untracked_bytecode(c.wt)
+        workspace.drop_untracked_bytecode(c.wt)
         against = git(["merge-base", c.origin_base, "HEAD"], c.wt).strip() if from_base else (c.onto or "HEAD")
         diff = diffguard.stage(c.wt, deny, against=against, prefix=c.prefix)
         merged = pending_merge(c)
@@ -1239,22 +751,22 @@ def stage(checkouts: list[Checkout], deny: list[str], from_base: bool = False) -
     return out
 
 
-def resolved_patch(c: Checkout, *flags: str) -> str:
+def resolved_patch(c: workspace.Checkout, *flags: str) -> str:
     return git(["diff", "--no-renames", *flags, f"--src-prefix=a/{c.prefix}", f"--dst-prefix=b/{c.prefix}",
                 c.base_commit, "HEAD", "--", *c.resolved], c.wt)
 
 
-def pending_merge(c: Checkout) -> bool:
+def pending_merge(c: workspace.Checkout) -> bool:
     return bool(c.merge and c.lease) and git(["rev-list", "--count", f"{c.lease}..{c.merge}"], c.wt).strip() != "0"
 
 
-def checkout_patch(c: Checkout, locks: list[str], *revs: str) -> str:
+def checkout_patch(c: workspace.Checkout, locks: list[str], *revs: str) -> str:
     patch = git(["diff", "--no-renames", f"--src-prefix=a/{c.prefix}", f"--dst-prefix=b/{c.prefix}", *revs,
                  "--", ".", *(f":(exclude){name.removeprefix(c.prefix)}" for name in locks)], c.wt)
     return patch + (f"\n(lockfile changes not shown: {', '.join(locks)})\n" if locks else "")
 
 
-def patch_from_base(checkouts: list[Checkout]) -> str:
+def patch_from_base(checkouts: list[workspace.Checkout]) -> str:
     patch = ""
     for c in checkouts:
         since_base = f"{c.origin_base}...HEAD"
@@ -1270,37 +782,18 @@ def lines_by_file(staged: Staged, top: int = 12) -> str:
     return "\n".join(out)
 
 
-def untracked_files(wt: Path) -> set[str]:
-    return set(util.git_records(["ls-files", "--others", "--exclude-standard"], wt))
-
-
 def ignored_state(wt: Path) -> dict[str, str]:
     names = util.git_records(["ls-files", "--others", "--ignored", "--exclude-standard"], wt)
-    return {n: fingerprint(wt / n, "") for n in names
+    return {n: workspace.fingerprint(wt / n, "") for n in names
             if not (Path(n).parent.name == "__pycache__" and Path(n).suffix == ".pyc")}
 
 
 def untracked_by_dir(dirs: list[Path]) -> dict[Path, set[str]]:
-    return {d: untracked_files(d) for d in dirs}
+    return {d: workspace.untracked_files(d) for d in dirs}
 
 
 def untracked_added_since(before: dict[Path, set[str]]) -> list[tuple[Path, str]]:
-    return [(d, name) for d, names in before.items() for name in sorted(untracked_files(d) - names)]
-
-
-def remove_untracked(wt: Path, name: str) -> None:
-    f = wt / name
-    f.unlink(missing_ok=True)
-    for d in f.parents:
-        if d == wt or not d.is_dir() or any(d.iterdir()):
-            break
-        d.rmdir()
-
-
-def drop_untracked_bytecode(wt: Path) -> None:
-    for name in untracked_files(wt):
-        if Path(name).parent.name == "__pycache__":
-            remove_untracked(wt, name)
+    return [(d, name) for d, names in before.items() for name in sorted(workspace.untracked_files(d) - names)]
 
 
 def check_lanes(layer: config.RepoLayer, run: AgentRun) -> list[str]:
@@ -1355,7 +848,7 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
             else:
                 report.append(f"### {name} passed: `{cmd}`")
     for d, name in untracked_added_since(untracked_before):
-        remove_untracked(d, name)
+        workspace.remove_untracked(d, name)
     return ok, "\n\n".join(report)
 
 
@@ -1376,19 +869,13 @@ def stop_on_term(run_id: str) -> Callable:
     return stop
 
 
-class RunFailed(Exception):
-    def __init__(self, why: str, detail: str = ""):
-        super().__init__(why)
-        self.why, self.detail = why, detail
-
-
 @dataclass
 class TicketWork:
     cfg: config.Config
     run: AgentRun
     ticket: tracker.Ticket
     ws: Path
-    checkouts: list[Checkout]
+    checkouts: list[workspace.Checkout]
     layer: config.RepoLayer
     timeout: float
     workspace: str
@@ -1460,14 +947,14 @@ class Build(TicketWork):
     def require_valid_diff(self, after: str, planned: str = "") -> None:
         staged = self.restage()
         if staged.empty:
-            raise RunFailed(f"{after} undid every change")
+            raise workspace.RunFailed(f"{after} undid every change")
         earlier = 0 if self.from_base else self.committed_lines + sum(c.resolved_lines for c in self.checkouts)
         why = staged.refusal(self.layer.max_diff_lines, earlier=earlier)
         if staged.denied:
-            raise RunFailed(f"{after} {why}")
+            raise workspace.RunFailed(f"{after} {why}")
         if why:
             pushed = f"\n- pushed earlier in this run: {earlier}" if earlier else ""
-            raise RunFailed(f"after {after} {why}{planned}; split the work",
+            raise workspace.RunFailed(f"after {after} {why}{planned}; split the work",
                             f"### Lines changed by file\n\n{lines_by_file(staged)}{pushed}")
 
     def push(self, branch: str, message: str) -> None:
@@ -1488,7 +975,7 @@ class Build(TicketWork):
 
     def recheck(self, after: str) -> None:
         if not self.check_with_repairs():
-            raise RunFailed(f"the checks failed after {after}", self.report)
+            raise workspace.RunFailed(f"the checks failed after {after}", self.report)
         self.require_valid_diff(after)
 
 
@@ -1679,15 +1166,15 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         if script and script.repairs and (later := state.later_run(repo.name, tid, script.repairs)):
             print(f"run {later['id']} of {name} came after run {script.repairs}, so it is not repaired twice")
             return 1
-        with util.lock(SLOTS_LOCK, wait=True):
-            slot = RunSlot(repo.name, str(tid), cfg.max_parallel)
+        with slots.admitting():
+            slot = slots.RunSlot(repo.name, str(tid), cfg.max_parallel)
             only = script.only if script else ""
             due = state.asks_due([script.continues]) if script and script.continues and not only else []
             if not dry_run:
-                if slots_free_to_start(cfg.max_parallel) > 0:
+                if slots.slots_free_to_start(cfg.max_parallel) > 0:
                     slot.hold()
                 elif not due:
-                    print(f"{name} was not started: {no_free_slot(cfg.max_parallel)}. Wait for a run to "
+                    print(f"{name} was not started: {slots.no_free_slot(cfg.max_parallel)}. Wait for a run to "
                           f"finish or raise max_parallel in {paths.short_path(paths.CONFIG_FILE)}.")
                     return 1
             settled = [done for dead_row in state.ticket_runs_marked_running(repo.name, tid)
@@ -1770,7 +1257,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             status, summary, pr_url = "stopped", record.STOPPED, ""
             run.log(record.STOPPED)
             run.give_up("was stopped by request")
-        except RunFailed as e:
+        except workspace.RunFailed as e:
             status, summary, pr_url = _fail(run, e.why, detail=e.detail)
         except Exception as e:
             run.log(f"crashed: {type(e).__name__}: {e}")
@@ -1780,7 +1267,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
             if run.workspace:
                 keep_edits(run)
-                note_made(*run.workspace, workspace_owner(run, *run.workspace))
+                workspace.note_made(*run.workspace, workspace_owner(run, *run.workspace))
             slot.free()
         if restarting and status in ("skipped", "noop") and not run.feedback:
             run.enter("failed")
@@ -1889,7 +1376,7 @@ def run_minutes(row: dict) -> float:
     return round((util.parse_iso(row["finished"]) - util.parse_iso(row["started"])).total_seconds() / 60, 1)
 
 
-def _ask(run: Run, ws: Path, checkouts: list[Checkout], comment: str, summary: str,
+def _ask(run: Run, ws: Path, checkouts: list[workspace.Checkout], comment: str, summary: str,
          asked: list[dict] | None = None, session: dict | None = None) -> tuple[str, str, str]:
     for ask in asked or [{}]:
         run_lines.write(run.id, "question", question=comment, summary=summary[:300], **ask)
@@ -1917,7 +1404,7 @@ def checked_layer(cfg: config.Config, layer_dir: Path) -> config.RepoLayer:
         layer = config.load_layer(layer_dir)
         steps.check(cfg, layer)
     except (ValueError, TypeError) as e:
-        raise RunFailed(f"{paths.short_path(layer_dir / 'config.toml')}: {e}") from e
+        raise workspace.RunFailed(f"{paths.short_path(layer_dir / 'config.toml')}: {e}") from e
     return layer
 
 
@@ -1958,7 +1445,7 @@ def triage_block(approval: dict | None) -> str:
             + (f". It assumed:{assumed}" if assumed else "; the plan below lists them.") + "\n\n")
 
 
-def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
+def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, str]:
     repo, tk = run.repo, run.tracker
     try:
         t = tk.get(run.tid)
@@ -1996,19 +1483,19 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     run.enter("running")
 
     try:
-        ws, checkouts = make_workspace(run.id, repo, main_layer.base_branch, branch, t.id, main_layer.copy)
+        ws, checkouts = workspace.make_workspace(run.id, repo, main_layer.base_branch, branch, t.id, main_layer.copy)
         run.workspace = ws, checkouts
         for c in checkouts:
             run.log(f"worktree {c.wt} on {branch}, {c.starting_point}")
         run.cfg, run.layer, run.kind = cfg, main_layer, t.kind
         settle_starts(run, checkouts, main_layer, t, branch)
-    except RunFailed as e:
+    except workspace.RunFailed as e:
         return _fail(run, e.why, detail=e.detail)
     layer = resolve_layer(cfg, run, ws)
     run.cfg, run.layer, run.kind = cfg, layer, t.kind
     if why := furnish(cfg, run, layer, ws):
         return _fail(run, why)
-    note_made(ws, checkouts, workspace_owner(run, ws, checkouts))
+    workspace.note_made(ws, checkouts, workspace_owner(run, ws, checkouts))
 
     expertise = layer.expertise_file.read_text() if layer.expertise_file.exists() else "(none yet)"
     checks = check_list(layer)
@@ -2017,7 +1504,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     reads = git_reads(checkouts)
     builder_bash = layer.builder_bash + reads + check_rules
     commands = code_list(layer.builder_bash + reads + check_commands)
-    workspace = workspace_note(branch, checkouts)
+    workspace_text = workspace_note(branch, checkouts)
     read_rules = bash_rules(config.DEFAULT_ALLOW_BASH + reads)
     build_rules = bash_rules(builder_bash)
     deny = diffguard.denied_paths(layer)
@@ -2033,7 +1520,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
                 + feedback)
         estimate = 0
         run.story.append(f"The owner reviewed the PR and left this feedback:\n\n{feedback}")
-        res = run.agent("revise", prompt("revise", repo=repo.name, workspace=workspace, ref=t.ref, title=t.title,
+        res = run.agent("revise", prompt("revise", repo=repo.name, workspace=workspace_text, ref=t.ref, title=t.title,
                                          body=t.body, comments=t.comments, attachments=attachments,
                                          feedback=feedback, expertise=expertise, checks=runs_checks,
                                          commands=commands, max_lines=limit),
@@ -2047,7 +1534,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
         if stage(checkouts, deny).empty:
             return answer_without_changes(run, ws, checkouts, branch, build_summary, replies)
     else:
-        res = run.agent("plan", prompt("plan", repo=repo.name, workspace=workspace, ref=t.ref, title=t.title,
+        res = run.agent("plan", prompt("plan", repo=repo.name, workspace=workspace_text, ref=t.ref, title=t.title,
                                         body=t.body, comments=t.comments, attachments=attachments,
                                         triage=triage_notes(approval), expertise=expertise, commands=commands,
                                         denied=code_list(deny), max_lines=limit, checks=checks),
@@ -2073,7 +1560,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
                         f"plan estimates {estimate} lines, over the {limit} line limit; split proposed")
         run.facts.update(assumptions=assumptions_of(plan), left_for_a_person=left_for_a_person)
 
-        res = run.agent("build", prompt("build", repo=repo.name, workspace=workspace, ref=t.ref, title=t.title,
+        res = run.agent("build", prompt("build", repo=repo.name, workspace=workspace_text, ref=t.ref, title=t.title,
                                          body=t.body, comments=t.comments, attachments=attachments, plan=plan_text,
                                          expertise=expertise, checks=runs_checks, commands=commands, max_lines=limit,
                                          estimate=estimate, verify=goal),
@@ -2091,7 +1578,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
         not_checked = NOT_CHECKED_LEFT_FOR_A_PERSON + left_for_a_person
         goal, plan_to_review = f"{goal}\n\n{not_checked}", f"{plan_text}\n\n{not_checked}"
     b = Build(cfg=cfg, run=run, ticket=t, ws=ws, checkouts=checkouts, layer=layer, timeout=layer.timeout_minutes * 60,
-              workspace=workspace, attachments=attachments, tools=build_rules, deny=deny,
+              workspace=workspace_text, attachments=attachments, tools=build_rules, deny=deny,
               left_for_a_person=left_for_a_person, check_commands=runs_checks,
               plan_text=plan_text, build_summary=build_summary)
 
@@ -2154,7 +1641,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     link = tk.pr_link(t, whole=not left_for_a_person)
     message = f"{tracker.with_ref(subject, t.ref)}\n\n{revised}Arete-Run: {run.id}"
     b.push(branch, message)
-    opened: list[Checkout] = []
+    opened: list[workspace.Checkout] = []
     for c in staged.changed:
         if not c.pr:
             c.pr = gh.pr_create(c.github, branch, c.base, tk.pr_title(subject, t), pr_report,
@@ -2167,7 +1654,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     pushed = [c for c in staged.changed if c not in opened]
     with_prs = [c for c in checkouts if c.pr]
     note_prs(run, branch, with_prs)
-    ci_stopped: list[Checkout] = []
+    ci_stopped: list[workspace.Checkout] = []
     for c in with_prs:
         others = sibling_section(t.ref, c, with_prs)
         if c in opened:
@@ -2187,7 +1674,7 @@ def _run(cfg: config.Config, run: Run, slot: RunSlot) -> tuple[str, str, str]:
     drafted = hold_pushed(run, pushed, ci_stopped, draft_why)
     try:
         ci_result = watch_ci(b, slot, branch, staged.changed, with_prs, draft_why)
-    except RunFailed as e:
+    except workspace.RunFailed as e:
         if run.feedback:
             raise
         prs = "\n".join(f"- [{c.pr_name}]({c.pr})" for c in with_prs)
@@ -2252,7 +1739,7 @@ def report_body(run: Run, *, summary: str, review: dict, verified: verify.Verifi
 
 
 def automerge(cfg: config.Config, run: Run, layer: config.RepoLayer, approval: dict | None, draft_why: str,
-              opened: list[Checkout], about: str) -> None:
+              opened: list[workspace.Checkout], about: str) -> None:
     if draft_why or layer.trust_level != "automerge":
         return
     if approval and approval["sent_by"] == "triage":
@@ -2289,7 +1776,7 @@ def automerge(cfg: config.Config, run: Run, layer: config.RepoLayer, approval: d
             run.log(f"automerge failed on {c.pr}: {e}")
 
 
-def nothing_to_build(run: Run, t: tracker.Ticket, ws: Path, checkouts: list[Checkout], branch: str, summary: str,
+def nothing_to_build(run: Run, t: tracker.Ticket, ws: Path, checkouts: list[workspace.Checkout], branch: str, summary: str,
                      left: str) -> tuple[str, str, str]:
     with_prs = [c for c in checkouts if c.pr]
     why = f"the open PRs already cover {t.ref}" if with_prs else "the plan found no code change to make"
@@ -2365,18 +1852,18 @@ def left_on_prs(urls: list[str]) -> str:
     return ""
 
 
-def record_prs(run: Run, branch: str, with_prs: list[Checkout]) -> str:
+def record_prs(run: Run, branch: str, with_prs: list[workspace.Checkout]) -> str:
     urls = [c.pr for c in with_prs]
     supersede_older_runs(run, urls)
     record.note(run.id, branch=branch)
     return " ".join(urls)
 
 
-def note_prs(run: Run, branch: str, with_prs: list[Checkout]) -> None:
+def note_prs(run: Run, branch: str, with_prs: list[workspace.Checkout]) -> None:
     record.note(run.id, branch=branch, pr_url=" ".join(c.pr for c in with_prs))
 
 
-def commit_and_push(checkouts: list[Checkout], changed: list[Checkout], branch: str, message: str) -> None:
+def commit_and_push(checkouts: list[workspace.Checkout], changed: list[workspace.Checkout], branch: str, message: str) -> None:
     for c in changed:
         if not git(["diff", "--cached", "--name-only"], c.wt).strip():
             continue
@@ -2384,19 +1871,19 @@ def commit_and_push(checkouts: list[Checkout], changed: list[Checkout], branch: 
         try:
             util.git_as_owner(["commit", "-q", "-m", message], c.wt)
         except RuntimeError as e:
-            raise RunFailed(f"the commit in {c.github} failed, so arete pushed nothing", str(e)) from e
+            raise workspace.RunFailed(f"the commit in {c.github} failed, so arete pushed nothing", str(e)) from e
         c.onto = c.onto or before
-    moved = [c.github for c in checkouts if remote_head(c.src, branch) != c.lease]
+    moved = [c.github for c in checkouts if workspace.remote_head(c.src, branch) != c.lease]
     if moved:
-        raise RunFailed(f"`{branch}` moved on {', '.join(moved)} while this run worked, so arete pushed nothing",
+        raise workspace.RunFailed(f"`{branch}` moved on {', '.join(moved)} while this run worked, so arete pushed nothing",
                         "Someone pushed to that branch after this run started. A retry builds on top of their work.")
-    pushed: list[Checkout] = []
+    pushed: list[workspace.Checkout] = []
     for c in changed:
         try:
             git(["push", "-q", f"--force-with-lease={branch}:{c.lease}", "-u", "origin", branch], c.wt, timeout=600)
         except RuntimeError as e:
             done = ", ".join(p.github for p in pushed) or "nothing"
-            raise RunFailed(f"the push to {c.github} failed after arete pushed {done}",
+            raise workspace.RunFailed(f"the push to {c.github} failed after arete pushed {done}",
                             f"{e}\n\nA retry builds on whatever reached the branch.") from e
         c.lease = git(["rev-parse", "HEAD"], c.wt).strip()
         c.onto = ""
@@ -2406,7 +1893,7 @@ def commit_and_push(checkouts: list[Checkout], changed: list[Checkout], branch: 
 CiFix = Callable[[str, str, str], Result]
 
 
-def watch_ci(b: Build, slot: RunSlot, branch: str, pushed: list[Checkout], with_prs: list[Checkout],
+def watch_ci(b: Build, slot: slots.RunSlot, branch: str, pushed: list[workspace.Checkout], with_prs: list[workspace.Checkout],
              draft_why: str, fix: CiFix | None = None) -> str:
     run, max_rounds = b.run, b.run.settings("ci_repair").tries
     stopped_before = [c for c in pushed if stopped_by_ci(run, c)]
@@ -2418,7 +1905,7 @@ def watch_ci(b: Build, slot: RunSlot, branch: str, pushed: list[Checkout], with_
     except owner_asks.Asked:
         raise
     except Exception as e:
-        failed = e if isinstance(e, RunFailed) else RunFailed(f"the CI watch crashed: {type(e).__name__}: {e}")
+        failed = e if isinstance(e, workspace.RunFailed) else workspace.RunFailed(f"the CI watch crashed: {type(e).__name__}: {e}")
         drafted = [c for c in with_prs if set_draft(run, c, True)]
         ending = f"{ci.STOPPED} {failed.why}. {drafted_note(drafted, with_prs)}"
         publish_ci(run, b.ticket, with_prs, ci.section(rounds, max_rounds, ending))
@@ -2436,7 +1923,7 @@ def watch_ci(b: Build, slot: RunSlot, branch: str, pushed: list[Checkout], with_
     return last.summary()
 
 
-def stopped_by_ci(run: AgentRun, c: Checkout) -> bool:
+def stopped_by_ci(run: AgentRun, c: workspace.Checkout) -> bool:
     try:
         return ci.stopped(gh.pr_body(c.pr))
     except gh.GhError as e:
@@ -2444,13 +1931,13 @@ def stopped_by_ci(run: AgentRun, c: Checkout) -> bool:
         return False
 
 
-def drafted_note(drafted: list[Checkout], with_prs: list[Checkout]) -> str:
+def drafted_note(drafted: list[workspace.Checkout], with_prs: list[workspace.Checkout]) -> str:
     if drafted != with_prs:
         return "Arete could not turn every PR to a draft."
     return "The PR is now a draft." if len(with_prs) == 1 else "The PRs are now drafts."
 
 
-def set_draft(run: AgentRun, c: Checkout, draft: bool, by: str = "ci") -> bool:
+def set_draft(run: AgentRun, c: workspace.Checkout, draft: bool, by: str = "ci") -> bool:
     now = "a draft" if draft else "ready for review"
     try:
         gh.pr_set_draft(c.pr, draft)
@@ -2461,7 +1948,7 @@ def set_draft(run: AgentRun, c: Checkout, draft: bool, by: str = "ci") -> bool:
     return True
 
 
-def own_draft_state(run: AgentRun, c: Checkout) -> bool | None:
+def own_draft_state(run: AgentRun, c: workspace.Checkout) -> bool | None:
     try:
         draft, head = gh.pr_draft_and_head(c.pr)
     except gh.GhError as e:
@@ -2477,8 +1964,8 @@ def own_draft_state(run: AgentRun, c: Checkout) -> bool | None:
     return draft
 
 
-def hold_pushed(run: AgentRun, pushed: list[Checkout], ci_stopped: list[Checkout],
-                draft_why: str) -> list[Checkout]:
+def hold_pushed(run: AgentRun, pushed: list[workspace.Checkout], ci_stopped: list[workspace.Checkout],
+                draft_why: str) -> list[workspace.Checkout]:
     if not draft_why or run.repairs or run.feedback:
         return []
     held = []
@@ -2493,8 +1980,8 @@ def hold_pushed(run: AgentRun, pushed: list[Checkout], ci_stopped: list[Checkout
     return held
 
 
-def ready_pushed(run: AgentRun, pushed: list[Checkout], ci_stopped: list[Checkout],
-                 draft_why: str) -> list[Checkout]:
+def ready_pushed(run: AgentRun, pushed: list[workspace.Checkout], ci_stopped: list[workspace.Checkout],
+                 draft_why: str) -> list[workspace.Checkout]:
     if draft_why or run.repairs or run.feedback:
         return []
     ready = []
@@ -2509,21 +1996,21 @@ def ready_pushed(run: AgentRun, pushed: list[Checkout], ci_stopped: list[Checkou
     return ready
 
 
-def published_note(draft_why: str, verified: verify.Verified, opened: list[Checkout],
-                   drafted: list[Checkout]) -> str:
+def published_note(draft_why: str, verified: verify.Verified, opened: list[workspace.Checkout],
+                   drafted: list[workspace.Checkout]) -> str:
     if drafted:
         return draft_note(draft_why, verified, pushed=True)
     return draft_note(draft_why, verified) if opened else ""
 
 
-def ci_rounds(b: Build, slot: RunSlot, branch: str, pushed: list[Checkout], max_rounds: int,
+def ci_rounds(b: Build, slot: slots.RunSlot, branch: str, pushed: list[workspace.Checkout], max_rounds: int,
               fix: CiFix | None = None) -> Iterator[ci.Round]:
     run = b.run
     watched = list(pushed)
     not_caused: dict[tuple[str, str, str], str] = {}
     for n in range(1, max_rounds + 1):
         slot.free()
-        run.log(FREED_SLOT_FOR_CI)
+        run.log(slots.FREED_SLOT_FOR_CI)
         with run.waiting("ci"):
             current = ci.Round(n, [ci.compare_with_base(ci.watch(ci_target(c), run.log), run.log) for c in watched])
         judged = [r for r in current.reds if r.kind != "base"]
@@ -2535,7 +2022,7 @@ def ci_rounds(b: Build, slot: RunSlot, branch: str, pushed: list[Checkout], max_
             slot.take(run.log, run.waiting)
         try:
             fix_summary = judge_ci(b, fresh, n, max_rounds, watched, fix) if fresh else ""
-        except RunFailed:
+        except workspace.RunFailed:
             yield current
             raise
         not_caused.update({r.key: r.reason for r in judged if not r.caused})
@@ -2547,7 +2034,7 @@ def ci_rounds(b: Build, slot: RunSlot, branch: str, pushed: list[Checkout], max_
             return
         names = ", ".join(r.label for r in caused)
         if n == max_rounds:
-            raise RunFailed(f"CI still fails after {util.count(max_rounds, 'round')}: {names}", ci.red_list(caused))
+            raise workspace.RunFailed(f"CI still fails after {util.count(max_rounds, 'round')}: {names}", ci.red_list(caused))
         push_ci_fix(b, branch, caused, names, n)
         watched += [c for c in b.staged.changed if c not in watched]
         current.story = f"{names} failed, caused by this PR, and arete pushed a fix: {fix_summary}".rstrip(": ")
@@ -2557,29 +2044,25 @@ def ci_rounds(b: Build, slot: RunSlot, branch: str, pushed: list[Checkout], max_
 def push_ci_fix(b: Build, branch: str, caused: list[ci.Red], names: str, n: int) -> None:
     staged = b.restage()
     if staged.empty:
-        raise RunFailed(f"{names} failed, caused by this PR, and the CI fix step changed nothing", ci.red_list(caused))
+        raise workspace.RunFailed(f"{names} failed, caused by this PR, and the CI fix step changed nothing", ci.red_list(caused))
     if no_pr := [c.github for c in staged.changed if not c.pr]:
-        raise RunFailed(f"the CI fix step changed {', '.join(no_pr)}, where this run has no PR, so arete pushed nothing",
+        raise workspace.RunFailed(f"the CI fix step changed {', '.join(no_pr)}, where this run has no PR, so arete pushed nothing",
                         ci.red_list(caused))
     if not b.check_with_repairs():
         report = f"checks-ci-round{n}.md"
         b.run.save(report, b.report)
-        raise RunFailed("the checks failed after the CI fix",
+        raise workspace.RunFailed("the checks failed after the CI fix",
                         f"{ci.red_list(caused)}\n\nThe check output is in `{report}` of run `{b.run.id}`.")
     b.require_valid_diff("the CI fix")
     b.push(branch, ci_fix_message(b, caused))
 
 
-def ci_target(c: Checkout) -> ci.Target:
+def ci_target(c: workspace.Checkout) -> ci.Target:
     return ci.Target(c.github, c.pr, c.pr_name, c.lease, c.base)
 
 
 def unmerged_paths(wt: Path) -> list[str]:
     return util.git_records(["diff", "--name-only", "--diff-filter=U"], wt)
-
-
-def uncommitted(wt: Path) -> list[str]:
-    return [r[3:] for r in util.git_records(["status", "--porcelain", "--no-renames", "--untracked-files=all"], wt)]
 
 
 def marked(wt: Path, names: list[str]) -> list[str]:
@@ -2592,49 +2075,49 @@ def abort_merge(wt: Path) -> None:
         git(["merge", "--abort"], wt, check=False)
 
 
-def resolution_diff(c: Checkout) -> diffguard.Diff:
+def resolution_diff(c: workspace.Checkout) -> diffguard.Diff:
     if not c.resolved:
         return diffguard.Diff()
     return diffguard.between(c.wt, c.base_commit, "HEAD", "--", *c.resolved, prefix=c.prefix, moves=True)
 
 
-def note_fresh_bases(checkouts: list[Checkout]) -> None:
+def note_fresh_bases(checkouts: list[workspace.Checkout]) -> None:
     for c in checkouts:
         if not c.resumes:
             c.base_commit = git(["rev-parse", c.origin_base if c.onto else "HEAD"], c.wt).strip()
 
 
-def note_kept_head(c: Checkout) -> None:
+def note_kept_head(c: workspace.Checkout) -> None:
     c.kept = git(["rev-parse", "HEAD"], c.wt).strip()
 
 
-def commit_edits_before_merge(run: AgentRun, checkouts: list[Checkout], layer: config.RepoLayer,
-                              committed: Callable[[Checkout], None] = lambda c: None) -> None:
+def commit_edits_before_merge(run: AgentRun, checkouts: list[workspace.Checkout], layer: config.RepoLayer,
+                              committed: Callable[[workspace.Checkout], None] = lambda c: None) -> None:
     try:
         for c in checkouts:
-            drop_untracked_bytecode(c.wt)
-            if uncommitted(c.wt):
+            workspace.drop_untracked_bytecode(c.wt)
+            if workspace.uncommitted(c.wt):
                 commit_kept(run.id, c, layer)
                 committed(c)
-                if left := uncommitted(c.wt):
-                    raise RunFailed(f"{c.github} holds edits to protected paths that arete does not keep "
+                if left := workspace.uncommitted(c.wt):
+                    raise workspace.RunFailed(f"{c.github} holds edits to protected paths that arete does not keep "
                                     f"({', '.join(left[:5])}), so it merged nothing into them and left them as they are")
     except RuntimeError as e:
-        raise RunFailed(f"the commit of the kept edits failed, so arete merged nothing into them: {e}") from e
+        raise workspace.RunFailed(f"the commit of the kept edits failed, so arete merged nothing into them: {e}") from e
 
 
-class ConflictUnresolved(RunFailed):
+class ConflictUnresolved(workspace.RunFailed):
     def __init__(self, why: str, detail: str, paths: list[str]):
         super().__init__(why, detail)
         self.paths = paths
 
 
-def merge_base_into_kept(run: AgentRun, checkouts: list[Checkout], layer: config.RepoLayer,
-                         ticket: tracker.Ticket) -> list[Checkout]:
+def merge_base_into_kept(run: AgentRun, checkouts: list[workspace.Checkout], layer: config.RepoLayer,
+                         ticket: tracker.Ticket) -> list[workspace.Checkout]:
     merged = []
     for c in checkouts:
         try:
-            fetch(c.src, c.base)
+            workspace.fetch(c.src, c.base)
         except RuntimeError as e:
             run.log(f"could not fetch `{c.origin_base}` in {c.github}, so the step resumes on the base it has: {e}")
             continue
@@ -2642,9 +2125,9 @@ def merge_base_into_kept(run: AgentRun, checkouts: list[Checkout], layer: config
             commit_edits_before_merge(run, [c], layer)
             merged += merge_moved_bases(run, [c], layer, ticket,
                                         reason="since the base moved while the run waited for its answer")
-        except RunFailed as e:
+        except workspace.RunFailed as e:
             files = f" in {', '.join(e.paths)}" if isinstance(e, ConflictUnresolved) else ""
-            raise RunFailed(f"merging `{c.origin_base}` into the edits kept in {c.github} failed{files}: {e.why}. "
+            raise workspace.RunFailed(f"merging `{c.origin_base}` into the edits kept in {c.github} failed{files}: {e.why}. "
                             f"The worktree is back at the kept commit and the answers are kept, so "
                             f"`arete resume {run.id}` continues with them", e.detail) from e
     for c in merged:
@@ -2653,7 +2136,7 @@ def merge_base_into_kept(run: AgentRun, checkouts: list[Checkout], layer: config
     return merged
 
 
-def kept_edits_note(held: list[Checkout]) -> str:
+def kept_edits_note(held: list[workspace.Checkout]) -> str:
     if not held:
         return ""
     ranges = ", ".join(f"`{c.onto[:12]}..HEAD` in `{c.prefix or './'}`" for c in held)
@@ -2664,7 +2147,7 @@ def kept_edits_note(held: list[Checkout]) -> str:
             "write it yourself.")
 
 
-def base_merge_note(merged: list[Checkout]) -> str:
+def base_merge_note(merged: list[workspace.Checkout]) -> str:
     if not merged:
         return ""
     names = ", ".join(f"`{c.origin_base}` into `{c.prefix or './'}`" for c in merged)
@@ -2675,17 +2158,17 @@ def base_merge_note(merged: list[Checkout]) -> str:
             "it held.")
 
 
-def settle_starts(run: AgentRun, checkouts: list[Checkout], layer: config.RepoLayer, ticket: tracker.Ticket,
+def settle_starts(run: AgentRun, checkouts: list[workspace.Checkout], layer: config.RepoLayer, ticket: tracker.Ticket,
                   branch: str) -> None:
     moved = [c for c in checkouts if c.kept]
     commit_edits_before_merge(run, moved, layer, note_kept_head)
     try:
         for c in moved:
-            git(["reset", "-q", "--hard", start_of(c, branch)], c.wt)
+            git(["reset", "-q", "--hard", workspace.start_of(c, branch)], c.wt)
         note_fresh_bases(checkouts)
         merge_moved_bases(run, [c for c in checkouts if c.resumes], layer, ticket)
         for c in moved:
-            merge_kept(run, c, layer, ticket, start_of(c, branch))
+            merge_kept(run, c, layer, ticket, workspace.start_of(c, branch))
     except BaseException:
         for c in moved:
             if c.kept:
@@ -2694,7 +2177,7 @@ def settle_starts(run: AgentRun, checkouts: list[Checkout], layer: config.RepoLa
         raise
 
 
-def merge_kept(run: AgentRun, c: Checkout, layer: config.RepoLayer, ticket: tracker.Ticket, start: str) -> None:
+def merge_kept(run: AgentRun, c: workspace.Checkout, layer: config.RepoLayer, ticket: tracker.Ticket, start: str) -> None:
     arrived = git(["rev-parse", "HEAD"], c.wt).strip()
     git(["reset", "-q", "--hard", c.kept], c.wt)
     if git(["rev-list", "--count", f"HEAD..{arrived}"], c.wt).strip() != "0":
@@ -2704,7 +2187,7 @@ def merge_kept(run: AgentRun, c: Checkout, layer: config.RepoLayer, ticket: trac
             except RuntimeError as e:
                 conflicts = unmerged_paths(c.wt)
                 if not conflicts:
-                    raise RunFailed(f"git could not merge `{start}` into the edits the last run kept in {c.github}: "
+                    raise workspace.RunFailed(f"git could not merge `{start}` into the edits the last run kept in {c.github}: "
                                     f"{e}") from e
                 resolve_conflicts(run, c, conflicts, layer, ticket, incoming=(start, arrived))
         c.onto = arrived
@@ -2712,21 +2195,21 @@ def merge_kept(run: AgentRun, c: Checkout, layer: config.RepoLayer, ticket: trac
     c.kept = ""
 
 
-def merge_as_run(run_id: str, c: Checkout, commit: str, named: str) -> None:
+def merge_as_run(run_id: str, c: workspace.Checkout, commit: str, named: str) -> None:
     with util.repo_lock(c.src):
         util.git_as_owner(["merge", "-q", "--no-edit", "-m", f"Merge {named} at {commit[:12]}",
                            "-m", f"Arete-Run: {run_id}", commit], c.wt)
 
 
-def merge_moved_bases(run: AgentRun, checkouts: list[Checkout], layer: config.RepoLayer, ticket: tracker.Ticket,
-                      log_prefix: str = "", reason: str = "since the base moved after the last push") -> list[Checkout]:
+def merge_moved_bases(run: AgentRun, checkouts: list[workspace.Checkout], layer: config.RepoLayer, ticket: tracker.Ticket,
+                      log_prefix: str = "", reason: str = "since the base moved after the last push") -> list[workspace.Checkout]:
     merged = []
     for c in checkouts:
         c.base_commit = git(["rev-parse", c.origin_base], c.wt).strip()
         if git(["rev-list", "--count", f"HEAD..{c.base_commit}"], c.wt).strip() == "0":
             continue
-        if edits := uncommitted(c.wt):
-            raise RunFailed(f"{c.github} has uncommitted edits ({', '.join(edits[:5])}), so arete merged nothing into "
+        if edits := workspace.uncommitted(c.wt):
+            raise workspace.RunFailed(f"{c.github} has uncommitted edits ({', '.join(edits[:5])}), so arete merged nothing into "
                             "them and left them as they are")
         head = git(["rev-parse", "HEAD"], c.wt).strip()
         with record.timed(run.id, "base_merge", repo=c.github, base=c.base, base_commit=c.base_commit,
@@ -2737,11 +2220,11 @@ def merge_moved_bases(run: AgentRun, checkouts: list[Checkout], layer: config.Re
                 except RuntimeError as e:
                     conflicts = unmerged_paths(c.wt)
                     if not conflicts:
-                        raise RunFailed(f"git could not merge `{c.origin_base}` into the branch in {c.github}: {e}")
+                        raise workspace.RunFailed(f"git could not merge `{c.origin_base}` into the branch in {c.github}: {e}")
                     rec["conflicts"] = conflicts
                     try:
                         resolve_conflicts(run, c, conflicts, layer, ticket)
-                    except RunFailed as e:
+                    except workspace.RunFailed as e:
                         raise ConflictUnresolved(e.why, e.detail, conflicts) from e
                 else:
                     conflicts = []
@@ -2759,19 +2242,19 @@ def merge_moved_bases(run: AgentRun, checkouts: list[Checkout], layer: config.Re
     return merged
 
 
-def resolve_conflicts(run: AgentRun, c: Checkout, conflicts: list[str], layer: config.RepoLayer,
+def resolve_conflicts(run: AgentRun, c: workspace.Checkout, conflicts: list[str], layer: config.RepoLayer,
                       ticket: tracker.Ticket, incoming: tuple[str, str] | None = None) -> None:
     deny = diffguard.denied_paths(layer)
     named, commit = incoming or (c.origin_base, c.base_commit)
     if protected := [p for p in conflicts if util.matches_any(p, deny) or util.matches_any(c.prefix + p, deny)]:
-        raise RunFailed(f"merging `{named}` conflicts in protected paths in {c.github} "
+        raise workspace.RunFailed(f"merging `{named}` conflicts in protected paths in {c.github} "
                         f"({', '.join(protected)}), which a person must merge")
     own = {p for p in util.git_records(["diff", "--name-only", f"{commit}...HEAD"], c.wt)
            if p not in conflicts and not (util.matches_any(p, deny) or util.matches_any(c.prefix + p, deny))}
     tries = max(1, run.settings("build").tries)
     feedback = "this is the first attempt"
     for n in range(1, tries + 1):
-        untracked_before = untracked_files(c.wt)
+        untracked_before = workspace.untracked_files(c.wt)
         ignored_before = ignored_state(c.wt)
         previous = run.sessions.get("build")
         text = prompt("resolve", repo=run.repo.name, github=c.github, base=named,
@@ -2793,40 +2276,40 @@ def resolve_conflicts(run: AgentRun, c: Checkout, conflicts: list[str], layer: c
             else:
                 run.sessions["build"] = previous
         if not res.ok:
-            raise RunFailed(f"the conflict resolution step failed: {res.error}", res.text)
+            raise workspace.RunFailed(f"the conflict resolution step failed: {res.error}", res.text)
         answer = res.structured if isinstance(res.structured, dict) else {}
         if answer.get("resolved") is not True:
-            raise RunFailed(f"the resolver could not keep both the branch's work and the base's in {c.github}: "
+            raise workspace.RunFailed(f"the resolver could not keep both the branch's work and the base's in {c.github}: "
                             f"{answer.get('summary') or 'no reason given'}", res.text)
-        for name in untracked_files(c.wt) - untracked_before:
+        for name in workspace.untracked_files(c.wt) - untracked_before:
             if Path(name).parent.name == "__pycache__" and Path(name).suffix == ".pyc":
-                remove_untracked(c.wt, name)
+                workspace.remove_untracked(c.wt, name)
         ignored_after = ignored_state(c.wt)
         changed_ignored = {n for n in ignored_before.keys() | ignored_after.keys()
                            if ignored_before.get(n) != ignored_after.get(n)}
-        touched = (set(util.git_records(["diff", "--name-only"], c.wt)) | (untracked_files(c.wt) - untracked_before)
+        touched = (set(util.git_records(["diff", "--name-only"], c.wt)) | (workspace.untracked_files(c.wt) - untracked_before)
                    | changed_ignored)
         if outside := sorted(touched - set(conflicts) - own):
-            raise RunFailed(f"the resolver edited files outside the conflict in {c.github}: {', '.join(outside)}")
+            raise workspace.RunFailed(f"the resolver edited files outside the conflict in {c.github}: {', '.join(outside)}")
         if left := marked(c.wt, conflicts):
             feedback = f"conflict markers remain in {', '.join(left)}; remove every one"
             if n == tries:
-                raise RunFailed(f"conflict markers remain in {', '.join(left)} after {util.count(n, 'attempt')} "
+                raise workspace.RunFailed(f"conflict markers remain in {', '.join(left)} after {util.count(n, 'attempt')} "
                                 f"in {c.github}")
             continue
         git(["add", "-A", "--", *conflicts, *sorted(touched & own)], c.wt)
         if unmerged_paths(c.wt):
-            raise RunFailed(f"files are still unmerged in {c.github} after the resolver ran")
+            raise workspace.RunFailed(f"files are still unmerged in {c.github} after the resolver ran")
         with util.repo_lock(c.src):
             util.git_as_owner(["commit", "-q", "--no-edit"], c.wt)
         return
 
 
-def merge_moved_bases_for_ci_fix(b: Build, watched: list[Checkout]) -> str:
+def merge_moved_bases_for_ci_fix(b: Build, watched: list[workspace.Checkout]) -> str:
     fetched = []
     for c in watched:
         try:
-            fetch(c.src, c.base)
+            workspace.fetch(c.src, c.base)
         except RuntimeError as e:
             b.run.log(f"ci: could not fetch `{c.origin_base}` in {c.github}, so the CI fix works on the branch as it "
                       f"is: {e}")
@@ -2851,15 +2334,15 @@ def run_folder(run: Run, name: str) -> Path:
     return folder
 
 
-def judge_ci(b: Build, reds: list[ci.Red], n: int, max_rounds: int, watched: list[Checkout],
+def judge_ci(b: Build, reds: list[ci.Red], n: int, max_rounds: int, watched: list[workspace.Checkout],
              fix: CiFix | None = None) -> str:
     run = b.run
     try:
         merged_base = merge_moved_bases_for_ci_fix(b, watched)
-    except RunFailed as e:
+    except workspace.RunFailed as e:
         for r in reds:
             r.reason = "Arete could not merge the moved base before judging this check."
-        raise RunFailed(e.why, ci.red_list(reds))
+        raise workspace.RunFailed(e.why, ci.red_list(reds))
     logs = run_folder(run, "ci")
     failures = "\n\n".join(ci.failure_note(r, logs / f"round{n}-{i}-{slug(r.label)}.log")
                            for i, r in enumerate(reds, 1))
@@ -2872,7 +2355,7 @@ def judge_ci(b: Build, reds: list[ci.Red], n: int, max_rounds: int, watched: lis
     if not res.ok or not isinstance(res.structured, dict):
         for r in reds:
             r.reason = "The CI fix step failed before it judged this check."
-        raise RunFailed("the CI fix step failed", ci.red_list(reds))
+        raise workspace.RunFailed("the CI fix step failed", ci.red_list(reds))
     verdicts = {name_key(v.get("name", "")): v for v in res.structured.get("checks", []) if isinstance(v, dict)}
     for r in reds:
         v = verdicts.get(name_key(r.label)) or verdicts.get(name_key(r.check.name)) or {}
@@ -2899,7 +2382,7 @@ def ci_fix_message(b: Build, caused: list[ci.Red]) -> str:
     return f"{tracker.with_ref(subject, b.ticket.ref)}\n\nArete-Run: {b.run.id}"
 
 
-def publish_ci(run: AgentRun, t: tracker.Ticket, pushed: list[Checkout], ci_section: str) -> None:
+def publish_ci(run: AgentRun, t: tracker.Ticket, pushed: list[workspace.Checkout], ci_section: str) -> None:
     links = (run.tracker.pr_link(t, whole=True), run.tracker.pr_link(t, whole=False))
     for c in pushed:
         try:
@@ -2928,7 +2411,7 @@ def with_siblings(body: str, section: str) -> str:
     return SIBLINGS.sub("", body).rstrip() + section
 
 
-def sibling_section(ref: str, c: Checkout, with_prs: list[Checkout]) -> str:
+def sibling_section(ref: str, c: workspace.Checkout, with_prs: list[workspace.Checkout]) -> str:
     others = [o for o in with_prs if o is not c]
     if not others:
         return ""
@@ -2977,7 +2460,7 @@ def answer_feedback(run: Run, replies: list[dict], fallback: str) -> None:
             run.log(f"reply to comment {thread} on {url} failed: {util.first_line(str(e), 300)}")
 
 
-def answer_without_changes(run: Run, ws: Path, checkouts: list[Checkout], branch: str, summary: str,
+def answer_without_changes(run: Run, ws: Path, checkouts: list[workspace.Checkout], branch: str, summary: str,
                            replies: list[dict]) -> tuple[str, str, str]:
     if run.dry_run:
         run.log("revise: no code changes; a dry run leaves the review unanswered")
@@ -3075,7 +2558,7 @@ def earlier_review(earlier: list[dict], reply: str, fixed: str) -> str:
                   fixed=fixed or NO_FIX_DIFF)
 
 
-def index_trees(checkouts: list[Checkout]) -> dict[str, str]:
+def index_trees(checkouts: list[workspace.Checkout]) -> dict[str, str]:
     try:
         return {c.prefix: git(["write-tree"], c.wt).strip() for c in checkouts}
     except RuntimeError:
@@ -3121,7 +2604,7 @@ def verify_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
         b.recheck("fixing what the check in use found")
     b.run.story.append("Still failing in use after the last attempt.")
     _learn(b.run, b.ws, b.layer.expertise_file, b.ticket.title, apply=False)
-    raise RunFailed(f"it still does not work in use after {util.count(tries, 'attempt')}",
+    raise workspace.RunFailed(f"it still does not work in use after {util.count(tries, 'attempt')}",
                     verified.markdown())
 
 
@@ -3261,21 +2744,21 @@ def surface_note(v: config.Verify, url: str, evidence: Path) -> str:
 
 
 def restore_worktrees(untracked_before: dict[Path, set[str]], evidence: Path) -> None:
-    view = scratch_view()
+    view = workspace.scratch_view()
     for d, name in untracked_added_since(untracked_before):
         f = d / name
-        if record_holds(view, d) or any(p.startswith(paths.SCRATCH_PREFIX) for p in Path(name).parts):
+        if workspace.record_holds(view, d) or any(p.startswith(paths.SCRATCH_PREFIX) for p in Path(name).parts):
             continue
         if f.suffix == ".png" and not (evidence / f.name).exists():
             shutil.move(f, evidence / f.name)
         else:
-            remove_untracked(d, name)
+            workspace.remove_untracked(d, name)
     for d in untracked_before:
-        if not record_holds(view, d):
+        if not workspace.record_holds(view, d):
             git(["checkout", "-q", "--", "."], d)
 
 
-def evidence_images(run: Run, c: Checkout, verified: verify.Verified) -> dict[str, str]:
+def evidence_images(run: Run, c: workspace.Checkout, verified: verify.Verified) -> dict[str, str]:
     if run.layer and run.layer.verify and not run.layer.verify.publish_evidence:
         run.log("evidence: publication disabled by the layer; screenshots stay in the run folder")
         return {}
@@ -3776,7 +3259,7 @@ def _maybe_propose_trust(repo: config.Repo) -> None:
             return
     base = layer.base_branch or gh.default_branch(repo.github)
     labels = ["arete-trust"] if repo.tracker == "github" else []
-    wt = make_worktree(repo, base, branch, "trust")
+    wt = workspace.make_worktree(repo, base, branch, "trust")
     try:
         f = wt / ".agents" / "config.toml"
         if not f.exists():
@@ -3799,139 +3282,7 @@ def _maybe_propose_trust(repo: config.Repo) -> None:
                      "Merging this lets arete enable automerge on PRs that pass checks and review. "
                      "Close it to keep every PR waiting for you.", labels=labels)
     finally:
-        remove_worktree(repo, wt)
-
-
-SWEPT = ("merged", "rejected", "done")
-WAITING = ("running", "pr", "needs-info")
-HELD_FILE = paths.STATE_DIR / "held-workspaces.json"
-
-
-def parts_of(repo: config.Repo) -> list[config.Part]:
-    return repo.parts or [config.Part("", repo.name)]
-
-
-def owner_of(d: Path, cfg: config.Config) -> dict | None:
-    owner = made_before(d).get(OWNER_KEY)
-    if isinstance(owner, dict) and owner.get("repo") and owner.get("checkouts"):
-        return owner
-    for repo in sorted(cfg.repos, key=lambda r: len(r.name), reverse=True) if made_record(d).is_file() else []:
-        tid = d.name.removeprefix(f"{repo.name}-")
-        if tid != d.name and state.ticket_runs(repo.name, tid, limit=1):
-            return {"run": "", "repo": repo.name, "ticket": tid, "created": "",
-                    "checkouts": [{"dir": p.dir, "github": p.github, "src": str(repo.path / p.dir),
-                                   "wt": str(d / p.dir)} for p in parts_of(repo)]}
-    return None
-
-
-def tree_bytes(d: Path) -> int:
-    total = 0
-    for root, dirs, files in os.walk(d):
-        for n in dirs + files:
-            try:
-                total += Path(root, n).lstat().st_size
-            except OSError:
-                pass
-    return total
-
-
-def held_entry(d: Path, owner: dict, row: dict | None, blocked: bool, why: str, names: list[str] | None = None) -> dict:
-    row = row or {}
-    try:
-        modified = util.iso(datetime.fromtimestamp(d.stat().st_mtime, UTC))
-    except OSError:
-        modified = ""
-    return {"name": d.name, "path": str(d), "repo": owner["repo"], "ticket": owner["ticket"],
-            "run": row.get("id") or owner.get("run") or "", "status": row.get("status") or "",
-            "since": row.get("finished") or row.get("started") or owner.get("created") or modified,
-            "bytes": tree_bytes(d), "blocked": blocked, "why": why, "names": (names or [])[:10]}
-
-
-def ticket_closed(cfg: config.Config, repo: str, tid: str, status: str) -> bool:
-    if tracker.is_task_id(tid):
-        return tracker.task_state(tid) == "closed"
-    configured = next((r for r in cfg.repos if r.name == repo), None)
-    if configured is None or status == "pr":
-        return False
-    try:
-        return not tracker.for_repo(cfg, configured).get(tid).open
-    except Exception:
-        return False
-
-
-def sweep_owned(d: Path, owner: dict, cfg: config.Config) -> dict | None:
-    repo, tid = owner["repo"], str(owner["ticket"])
-    lock_name = state.run_lock("pipeline", repo, tid)
-    if util.lock_is_held(lock_name) or state.issue_running(repo, tid):
-        return None
-    checkouts = [Checkout(c["dir"], c["github"], Path(c["src"]), Path(c["wt"]), "") for c in owner["checkouts"]]
-    row = ((state.run_get(owner["run"]) if owner.get("run") else None)
-           or next(iter(state.ticket_runs(repo, tid, limit=1, whole=True)), None))
-    status = (row or {}).get("status") or ""
-    run_id = (row or {}).get("id") or owner.get("run") or ""
-    closed = (status not in SWEPT and status not in WAITING and tracker.is_task_id(tid)
-              and ticket_closed(cfg, repo, tid, status))
-    if status not in SWEPT and not closed:
-        return held_entry(d, owner, row, False,
-                          f"run {run_id} ended {status or 'unknown'}, so the workspace waits for the ticket")
-    made = made_before(d)
-    if any(made.get(onto_key(c)) and (c.wt / ".git").exists() for c in checkouts):
-        return held_entry(d, owner, row, False, f"run {run_id} kept edits in the workspace, so it waits for a resume")
-    with util.lock(lock_name) as got:
-        if not got:
-            return None
-        try:
-            clear_workspace(d, checkouts, checkouts[0].src, [])
-        except RunFailed as e:
-            return held_entry(d, owner, row, True, e.why, blocked_by(d, checkouts, edits=True))
-        except (OSError, RuntimeError) as e:
-            return held_entry(d, owner, row, True, util.first_line(str(e), 300), blocked_by(d, checkouts, edits=True))
-    print(f"{util.iso()} removed the workspace {d}: "
-          + (f"run {run_id} is {status}" if status in SWEPT else f"task {tid} is closed"))
-    return None
-
-
-def sweep_unowned(d: Path, cutoff: float) -> None:
-    if d.stat().st_mtime < cutoff and not scratch_left(d, []) and not unexamined(d, set()):
-        shutil.rmtree(d, ignore_errors=True)
-
-
-def prune_repos(cfg: config.Config) -> None:
-    for repo in cfg.repos:
-        for src in [repo.path / p.dir for p in repo.parts] or [repo.path]:
-            try:
-                if (src / ".git").exists():
-                    with util.repo_lock(src):
-                        git(["worktree", "prune"], src, check=False)
-            except (OSError, RuntimeError):
-                pass
-
-
-def cleanup_worktrees(days: float = 7, cfg: config.Config | None = None) -> None:
-    cfg = cfg or config.load()
-    cutoff = util.now().timestamp() - days * 86400
-    held = []
-    for d in paths.WORKTREES_DIR.glob("*"):
-        try:
-            if not d.is_dir() or d.is_symlink():
-                continue
-            owner = owner_of(d, cfg)
-            if owner is None:
-                sweep_unowned(d, cutoff)
-            elif entry := sweep_owned(d, owner, cfg):
-                held.append(entry)
-        except Exception as e:
-            print(f"{util.iso()} sweeping {d}: {type(e).__name__}: {e}")
-    prune_repos(cfg)
-    util.write_json(HELD_FILE, sorted(held, key=lambda h: h["since"]))
-
-
-def held_summary() -> dict:
-    rows = util.read_json(HELD_FILE, [])
-    rows = rows if isinstance(rows, list) else []
-    oldest = rows[0] if rows else {}
-    return {"count": len(rows), "bytes": sum(r.get("bytes") or 0 for r in rows), "oldest": oldest.get("since", ""),
-            "oldest_name": oldest.get("name", ""), "blocked": sum(1 for r in rows if r.get("blocked")), "rows": rows}
+        workspace.remove_worktree(repo, wt)
 
 
 class SkipLog:
@@ -3970,7 +3321,7 @@ def retained_line(step: str, attempt: scratch.Attempt) -> str:
 
 
 def retry_scratch(days: float = 30) -> None:
-    for root in finalize_scratch():
+    for root in workspace.finalize_scratch():
         print(f"preserved and finalized verification scratch {root}")
     for data in scratch.records():
         if data["state"] in ("pending", "retained") and data["diagnostic"]:
@@ -4014,105 +3365,19 @@ def tell_ticket_run_died(cfg: config.Config, row: dict) -> None:
         run.say(f"Run `{run.id}` {record.INTERRUPTED}; I will start it again.")
 
 
-def holding(rows: list[dict], lock_kind: str, kinds: tuple[str, ...] = ("pipeline",)) -> list[dict]:
-    return [r for r in rows
-            if r["kind"] in kinds and util.lock_is_held(state.run_lock(lock_kind, r["repo"], r["issue"]))]
-
-
 def live_pipeline_runs() -> list[dict]:
-    return holding(state.runs_marked_running(), "pipeline")
+    return slots.holding(state.runs_marked_running(), "pipeline")
 
 
-def chat_sessions_going(running: list[dict]) -> list[dict]:
-    linked = {link["run_id"] for link in state.chat_sessions()}
-    return [r for r in running if r["kind"] == "session" and r["id"] in linked
-            and ((util.now() - util.parse_iso(r["started"])).total_seconds() < record.SETTLE_GRACE_SECONDS
-                 or (r["lock"] and util.lock_is_held(r["lock"])))]
-
-
-def runs_in_slots(running: list[dict] | None = None) -> list[dict]:
-    running = state.runs_marked_running() if running is None else running
-    return [*holding(running, "slot", SLOT_KINDS), *chat_sessions_going(running)]
-
-
-def runs_waiting_for_a_slot() -> list[dict]:
-    return holding(state.runs_marked_running(), "slot-wait")
-
-
-def slots_free_to_start(max_parallel: int) -> int:
-    if runs_waiting_for_a_slot():
-        return 0
-    return max_parallel - len(runs_in_slots())
-
-
-def freed_slot_for_ci(run_id: str) -> bool:
-    log = paths.RUNS_DIR / run_id / "run.log"
-    return log.exists() and FREED_SLOT_FOR_CI in log.read_text()
-
-
-def live_max_parallel(last_read: int) -> int:
-    try:
-        return config.load().max_parallel
-    except (OSError, ValueError):
-        return last_read
-
-
-@dataclass
-class RunSlot:
-    repo: str
-    tid: str
-    max_parallel: int
-    held: TextIO | None = None
-
-    def hold(self) -> None:
-        self.held = util.hold_lock(state.run_lock("slot", self.repo, self.tid))
-
-    def take(self, log: Callable[[str], None],
-             waits: Callable[[str], AbstractContextManager] = lambda cause: nullcontext(), what: str = "ci") -> None:
-        if self.held:
-            return
-        waiting = False
-        with ExitStack() as stack:
-            while True:
-                with util.lock(SLOTS_LOCK, wait=True):
-                    self.max_parallel = live_max_parallel(self.max_parallel)
-                    if len(runs_in_slots()) < self.max_parallel:
-                        self.hold()
-                        log(f"{what}: took a run slot back" + (" after waiting for one" if waiting else ""))
-                        return
-                    if not waiting:
-                        waiting = True
-                        stack.enter_context(util.hold_lock(state.run_lock("slot-wait", self.repo, self.tid)))
-                        stack.enter_context(waits("slot"))
-                        log(f"{what}: waiting for a free run slot (max_parallel {self.max_parallel}), ahead of new runs")
-                time.sleep(SLOT_POLL_SECONDS)
-
-    def free(self) -> None:
-        if self.held:
-            self.held.close()
-            self.held = None
-
-
-def no_free_slot(max_parallel: int) -> str:
-    if waiting := len(runs_waiting_for_a_slot()):
-        return (f"{util.count(waiting, 'run')} {'waits' if waiting == 1 else 'wait'} to take a run slot back first "
-                f"(max_parallel {max_parallel})")
-    return f"no run slot is free (max_parallel {max_parallel})"
-
-
-def held_back(cfg: config.Config, repo_name: str, going: Counter, slots: int) -> str:
+def held_back(cfg: config.Config, repo_name: str, going: Counter, free_slots: int) -> str:
     if going[repo_name] >= cfg.max_parallel_per_repo:
         return (f"{repo_name} already has {util.count(going[repo_name], 'run')} going "
                 f"(max_parallel_per_repo {cfg.max_parallel_per_repo})")
-    return no_free_slot(cfg.max_parallel) if slots <= 0 else ""
+    return slots.no_free_slot(cfg.max_parallel) if free_slots <= 0 else ""
 
 
 def spawn_run(repo_name: str, tid: str, force: bool = False) -> subprocess.Popen:
     return control.launch(run_command(repo_name, tid, force), RUNS_LOG)
-
-
-class NoFreeSlot(RuntimeError):
-    pass
 
 
 def run_skipped(name: str) -> dict:
@@ -4125,8 +3390,8 @@ def run_skipped(name: str) -> dict:
     cfg = config.load()
     if state.issue_running(entry["repo"], entry["id"]):
         raise control.Busy(name)
-    if slots_free_to_start(cfg.max_parallel) <= 0:
-        raise NoFreeSlot(f"{name} was not started: {no_free_slot(cfg.max_parallel)}; wait for a run to finish or "
+    if slots.slots_free_to_start(cfg.max_parallel) <= 0:
+        raise slots.NoFreeSlot(f"{name} was not started: {slots.no_free_slot(cfg.max_parallel)}; wait for a run to finish or "
                          "raise max_parallel in Settings")
     run = spawn_run(entry["repo"], entry["id"], force=True)
     give_up = time.monotonic() + RUN_START_SECONDS
@@ -4282,7 +3547,7 @@ def poll(dry_run: bool = False) -> int:
             except Exception as e:
                 failed("labeling tickets", e)
         going = Counter(r["repo"] for r in live_pipeline_runs())
-        slots = slots_free_to_start(cfg.max_parallel)
+        free_slots = slots.slots_free_to_start(cfg.max_parallel)
         starts = state.last_pipeline_starts()
         pipeline_repos = [r for r in cfg.repos if r.pipeline and runnable(r)]
         restarting = {r.name for r in pipeline_repos if state.interrupted_tickets(r.name)}
@@ -4324,7 +3589,7 @@ def poll(dry_run: bool = False) -> int:
                     name = tracker.ticket_name(repo.name, source.ref(tid))
                     reply = tracker_reply(repo, source, str(tid), dry_run)
                     answering = not reply and answered_run(repo.name, str(tid)) is not None
-                    if not answering and not reply and (waiting := held_back(cfg, repo.name, going, slots)):
+                    if not answering and not reply and (waiting := held_back(cfg, repo.name, going, free_slots)):
                         exhausted.add(repo.name)
                         if not dry_run:
                             state.pass_over(repo.name, str(tid))
@@ -4344,7 +3609,7 @@ def poll(dry_run: bool = False) -> int:
                         if not spawn_unparked(repo.name, tid):
                             exhausted.add(repo.name)
                             continue
-                    slots -= 1
+                    free_slots -= 1
                     going[repo.name] += 1
                 except Exception as e:
                     failed(repo.name, e)
@@ -4372,7 +3637,7 @@ def poll(dry_run: bool = False) -> int:
             except Exception as e:
                 failed("poll", e)
             try:
-                cleanup_worktrees(cfg=cfg)
+                workspace.cleanup_worktrees(cfg=cfg)
             except Exception as e:
                 failed("sweeping worktrees", e)
             mark_loop("poll", not errors, "; ".join(errors))

@@ -15,7 +15,23 @@ from pathlib import Path
 from statistics import NormalDist
 from typing import TextIO
 
-from . import config, evals, paths, pipeline, prices, record, replay, routing, run_lines, runner, state, steps, util
+from . import (
+    config,
+    evals,
+    paths,
+    pipeline,
+    prices,
+    record,
+    replay,
+    routing,
+    run_lines,
+    runner,
+    slots,
+    state,
+    steps,
+    util,
+    workspace,
+)
 from .agent import traits_of
 from .diffguard import denied_paths
 from .util import engine_commit
@@ -644,7 +660,7 @@ class TrialRun(evals.EvalRun):
 
     def stop(self, why: str):
         self.stopped_by = why
-        raise pipeline.RunFailed(why)
+        raise workspace.RunFailed(why)
 
     def write_line(self, event: str, **fields) -> None:
         if event == "step_start":
@@ -720,20 +736,20 @@ def replay_folder(exp: Experiment, task: str, arm: str, repeat: int):
 def slot_reason(exp: Experiment, free: int, passed: list[dict]) -> str:
     if passed:
         return f"{util.count(len(passed), 'ready ticket')} {'waits' if len(passed) == 1 else 'wait'} for one"
-    return pipeline.no_free_slot(exp.cfg.max_parallel) if free <= 0 else ""
+    return slots.no_free_slot(exp.cfg.max_parallel) if free <= 0 else ""
 
 
 def take_slot(exp: Experiment, path: Path, waiting: dict, used: Totals) -> tuple[str, TextIO, str, float]:
     tag = f"{exp.name}-{waiting['task']}-{waiting['arm']}-{waiting['repeat']}"
     began, noted, since, told = time.monotonic(), time.monotonic(), "", ""
     while True:
-        with util.lock(pipeline.SLOTS_LOCK, wait=True):
-            free = pipeline.slots_free_to_start(pipeline.live_max_parallel(exp.cfg.max_parallel))
+        with slots.admitting():
+            free = slots.slots_free_to_start(slots.live_max_parallel(exp.cfg.max_parallel))
             passed = state.tickets_passed_over()
             if free > 0 and not passed:
                 run_id = record.start("experiment", tag=tag, lock=state.run_lock("experiment", exp.repo.name),
                                       repo=exp.repo.name)
-                held = util.hold_lock(state.run_lock("slot", exp.repo.name, None))
+                held = slots.hold(exp.repo.name, None)
                 if since:
                     append(path, {**waiting, "seconds": round(time.monotonic() - noted, 2), "at": util.iso()})
                 return run_id, held, since, time.monotonic() - began
@@ -745,7 +761,7 @@ def take_slot(exp: Experiment, path: Path, waiting: dict, used: Totals) -> tuple
             raise Capped(reached(exp.limits, replace(used, seconds=exp.limits["minutes"] * 60)))
         since = since or util.iso()
         try:
-            time.sleep(min(pipeline.SLOT_POLL_SECONDS, ALIVE_SECONDS, left))
+            time.sleep(min(slots.SLOT_POLL_SECONDS, ALIVE_SECONDS, left))
         finally:
             append(path, {**waiting, "seconds": round(time.monotonic() - noted, 2), "at": util.iso()})
             noted = time.monotonic()
