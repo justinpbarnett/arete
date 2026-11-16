@@ -14,14 +14,14 @@ def piped_events() -> list[dict]:
 
 
 def cmd_jira_check(args) -> int:
-    from .. import jira, pipeline, tracker
+    from .. import jira, poll, tracker
 
     cfg = config.load()
     try:
         client = jira.Client.from_env(cfg.jira.env_file)
         me = client.me()
         print(f"jira {client.base} as {me.get('displayName') or me.get('emailAddress') or '?'}")
-        routes = pipeline.jira_routes_by_project(cfg)
+        routes = poll.jira_routes_by_project(cfg)
         targets = [(f"[jira.transitions] {k}", k, v) for k, v in cfg.jira.transitions.items()]
         targets += [(f"[jira.research] {k}", f"research {k}", v) for k, v in cfg.jira.research.items()]
         targets += [(f"[jira.landed] {k}", f"landed on {k}", v) for k, v in cfg.jira.landed.items()]
@@ -44,9 +44,9 @@ def cmd_jira_check(args) -> int:
 
 
 def cmd_poll(args) -> int:
-    from .. import pipeline
+    from .. import poll
 
-    return pipeline.poll(dry_run=args.dry_run)
+    return poll.poll(dry_run=args.dry_run)
 
 
 def cmd_mine(args) -> int:

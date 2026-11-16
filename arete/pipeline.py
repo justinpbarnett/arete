@@ -11,12 +11,10 @@ import signal
 import subprocess
 import sys
 import time
-import tomllib
 from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, replace
-from datetime import UTC, timedelta
 from pathlib import Path
 from string import Template
 from typing import NamedTuple, TextIO
@@ -34,8 +32,6 @@ from . import (
     factory,
     gh,
     jev,
-    jev_verdicts,
-    jira,
     outbound,
     owner_asks,
     paths,
@@ -56,16 +52,12 @@ from . import (
     webpush,
     workspace,
 )
-from .agent import NO_SESSION, REPLAY, Result, Session
-from .heartbeat import mark_loop, network_up_or_skip
+from .agent import NO_SESSION, Result, Session
+from .review import REVIEW_SCHEMA, Review, numbered
 from .util import git
 
 MAX_DIFF_IN_PROMPT = 60_000
 MAX_FIX_DIFF_IN_PROMPT = 20_000
-BLOCKER_CATEGORIES = ("issue", "regression", "security", "data_loss")
-UNWAIVABLE = ("security", "data_loss")
-EARLIER_STATUSES = ("fixed", "open", "waived")
-NOTE_SEVERITIES = ("major", "minor")
 NO_FIX_REPLY = "The builder gave no reply."
 MAX_FIX_REPLY_IN_PROMPT = 4000
 NO_FIX_DIFF = "Arete could not read what changed; judge the diff above."
@@ -76,7 +68,6 @@ CONTINUE_AFTER_DROP = "The connection dropped mid step. Carry on from where you 
 CHECKS_LOCK = "checks"
 LEFT_TITLE = "Left for a person"
 TRIAGE_ANSWERS = "Answers to triage's questions"
-FEEDBACK_ASKS = "Does this comment ask for a change to the pull request, or ask a question the author should answer?"
 LEFT_HEADING = f"## {LEFT_TITLE}"
 LEFT_START, LEFT_END = "<!-- arete:left -->", "<!-- /arete:left -->"
 LEFT_FOR_A_PERSON = re.compile(rf"{re.escape(LEFT_START)}\n{LEFT_HEADING}\n\n(.*?)\n\n{re.escape(LEFT_END)}\n*", re.DOTALL)
@@ -93,7 +84,6 @@ RUN_START_SECONDS = 10
 SUCCEEDED = ("pr", "noop", "needs-info", "dry-run", "done")
 ANSWER_FILE = "answer.md"
 CHECK_LANE_POLL_SECONDS = 2
-MAX_STARTS_PER_POLL = 64
 CHECKS_SCRIPT = "checks"
 NO_CHECKS = "(none configured)"
 SUMMARY_CHARS = 3000
@@ -122,39 +112,6 @@ PLAN_SCHEMA = {
     },
     "required": ["plan", "ambiguous", "risk", "estimated_lines", "verify"],
 }
-REVIEW_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "summary": {"type": "string"},
-        "changes": {"type": "string"},
-        "problems": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "file": {"type": "string"},
-                    "problem": {"type": "string"},
-                    "severity": {"type": "string", "enum": ["blocker", "major", "minor"]},
-                    "category": {"type": "string", "enum": list(BLOCKER_CATEGORIES)},
-                },
-                "required": ["problem", "severity"],
-            },
-        },
-        "earlier": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string"},
-                    "status": {"type": "string", "enum": list(EARLIER_STATUSES)},
-                    "why": {"type": "string"},
-                },
-                "required": ["id", "status", "why"],
-            },
-        },
-    },
-    "required": ["summary", "problems"],
-}
 LEARN_SCHEMA = {
     "type": "object",
     "properties": {
@@ -169,14 +126,6 @@ LEARN_SCHEMA = {
     "required": ["expertise", "added", "removed"],
 }
 EXPERTISE_MAX_LINES = 80
-UAT_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "before": {"type": "string"},
-        "steps": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 10},
-    },
-    "required": ["before", "steps"],
-}
 REVISE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -215,10 +164,6 @@ CI_FIX_SCHEMA = {
 }
 MAX_CI_REASON_CHARS = 700
 FEEDBACK_QUIET_MINUTES = 10
-HUNK_LINES = 6
-PR_SEEN_FILE = paths.STATE_DIR / "pr_seen.json"
-PR_SEEN_SETTLE = timedelta(minutes=1)
-REJECTED_PR_LISTEN = timedelta(days=7)
 
 
 def prompt(name: str, prompts_dir: Path = paths.PROMPTS_DIR, **values) -> str:
@@ -1322,7 +1267,7 @@ def report_fields(row: dict, facts: dict) -> dict:
             "assumptions": [*(facts.get("assumptions") or []), *owner_asks.assumed(factory.chain(row["id"]))],
             "left_for_a_person": facts.get("left_for_a_person") or "", "held": facts.get("held") or "",
             "merge_held": facts.get("merge_held") or "",
-            "review": facts.get("review") or report_review({}), "question": str(asked.get("summary") or ""),
+            "review": facts.get("review") or Review.stored({}).report(), "question": str(asked.get("summary") or ""),
             "steps": factory.tally(row["id"]), "minutes": run_minutes(row),
             "cost_usd": round(float(row.get("cost_usd") or 0), 4), "wait_minutes": run_lines.wait_minutes(row["id"])}
 
@@ -1331,27 +1276,12 @@ def round_name(name: str, n: int) -> str:
     return name if n == 1 else f"{name}{n}"
 
 
-def review_findings(review: dict) -> str:
-    return "" if review.get("failed") else numbered(blocking(review))
-
-
 def repaired_by(run_id: str) -> str:
     return str(factory.first(run_lines.read(run_id), "repair").get("source") or "") if run_id else ""
 
 
-def report_review(review: dict) -> dict:
-    return {"verdict": str(review.get("verdict") or ""), "summary": str(review.get("summary") or ""),
-            "unresolved": review.get("verdict") == "request_changes",
-            "problems": reported(blocking(review)), "notes": reported(review_notes(review))}
-
-
-def reported(listed: list[dict]) -> list[dict]:
-    return [{"file": p["file"], "text": p["problem"], "severity": p["severity"], "category": p.get("category") or ""}
-            for p in listed]
-
-
-def note_review(run: Run, review: dict, verified: verify.Verified) -> None:
-    run.facts.update(requirements=verified.requirements(), review=report_review(review))
+def note_review(run: Run, review: Review, verified: verify.Verified) -> None:
+    run.facts.update(requirements=verified.requirements(), review=review.report())
 
 
 def assumptions_of(plan: dict) -> list[str]:
@@ -1603,11 +1533,11 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
     reviews, n = max(1, run.settings("review").tries), 1
     review, reply = _review(b, plan_to_review, verified), ""
     note_review(run, review, verified)
-    while review.get("verdict") == "request_changes" and n < reviews:
-        if problems := review_findings(review):
+    while review.verdict == "request_changes" and n < reviews:
+        if problems := review.findings():
             run.story.append(f"Review requested changes:\n{problems}")
             reply = b.resume(round_name("review_fix", n),
-                             prompt("review_fix", problems=problems, notes=notes_text(review)),
+                             prompt("review_fix", problems=problems, notes=review.fix_notes()),
                              role="review_repair").text
             b.recheck("the review fixes")
             verified = verify_in_use(b, goal, build_summary)
@@ -1620,7 +1550,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
     _learn(run, ws, layer.expertise_file, t.title, apply=True)
     staged = b.restage()
     size = f"{len(staged.files)} files, {staged.lines} lines"
-    outcome = f"{size}, review {review.get('verdict')}, in use {verified.verdict}"
+    outcome = f"{size}, review {review.verdict}, in use {verified.verdict}"
     written = document.pr_text(run, t, summary_of(review, build_summary), review, verified, size, draft_why, cfg, layer)
 
     if run.dry_run:
@@ -1714,11 +1644,11 @@ def furnish(cfg: config.Config, run: Run, layer: config.RepoLayer, ws: Path) -> 
     return ""
 
 
-def summary_of(review: dict, build_summary: str) -> str:
-    return cut_at_end(str(review.get("changes") or "").strip() or build_summary, SUMMARY_CHARS)
+def summary_of(review: Review, build_summary: str) -> str:
+    return cut_at_end(str(review.changes or "").strip() or build_summary, SUMMARY_CHARS)
 
 
-def report_body(run: Run, *, summary: str, review: dict, verified: verify.Verified, left: str,
+def report_body(run: Run, *, summary: str, review: Review, verified: verify.Verified, left: str,
                 images: dict[str, str], approval: dict | None, attempts: int, checks: str, plan_text: str,
                 size: str, held: str = "", written: str = "") -> str:
     return public_text(run, (
@@ -1727,8 +1657,7 @@ def report_body(run: Run, *, summary: str, review: dict, verified: verify.Verifi
         + left_block(left)
         + assumed_block(run)
         + f"{CHECKED_IN_USE_HEADING}\n\n{verified.markdown(images)}\n\n"
-        f"## Review\n\n**{review.get('verdict', 'none')}**: {review.get('summary', '')}\n"
-        + review_lists(review)
+        + review.markdown()
         + (f"\n\nHeld as a draft: {held}." if held else "")
         + f"\n\n## Checks\n\nAll passed after {util.count(attempts, 'attempt')}: {checks}\n\n"
         + ("" if run.feedback else
@@ -2447,12 +2376,12 @@ def feedback_markdown(rows: list[dict]) -> str:
 
 
 def answer_feedback(run: Run, replies: list[dict], fallback: str) -> None:
-    said = {r["comment_id"]: r["reply"].strip() for r in replies if r.get("reply", "").strip()}
+    by_comment = {r["comment_id"]: r["reply"].strip() for r in replies if r.get("reply", "").strip()}
     threads: dict[tuple[str, int], str] = {}
     for f in run.feedback:
         if f["kind"] == "line":
             key = (f["pr_url"], f["thread"])
-            threads[key] = said.get(f["gh_id"]) or said.get(f["thread"]) or threads.get(key) or fallback
+            threads[key] = by_comment.get(f["gh_id"]) or by_comment.get(f["thread"]) or threads.get(key) or fallback
     for (url, thread), text in threads.items():
         try:
             gh.pr_reply(url, thread, public_text(run, text))
@@ -2475,80 +2404,22 @@ def answer_without_changes(run: Run, ws: Path, checkouts: list[workspace.Checkou
     return "pr", "answered the review without code changes", urls
 
 
-def _review(b: Build, plan: str, verified: verify.Verified, step: str = "review", before: dict | None = None,
-            reply: str = "") -> dict:
-    t, before = b.ticket, before or {}
-    earlier = blocking(before)
+def _review(b: Build, plan: str, verified: verify.Verified, step: str = "review", before: Review | None = None,
+            reply: str = "") -> Review:
+    t, before = b.ticket, before or Review.stored({})
+    earlier = before.blocking()
     res = b.run.agent(step, prompt("review", repo=b.run.repo.name, workspace=b.workspace, ref=t.ref, title=t.title,
                                    body=t.body, comments=t.comments, attachments=b.attachments, plan=plan,
                                    checks=b.report, evidence=verified.markdown(),
                                    compare=compare_with_fork(b.checkouts),
                                    diff=util.tail(diffguard.fold_moved(b.staged.patch), MAX_DIFF_IN_PROMPT),
                                    earlier=earlier_review(earlier, reply,
-                                                          fixed_since(b, before.get("trees") or {}))),
+                                                          fixed_since(b, before.trees or {}))),
                       b.ws, role="review", allowed_tools=bash_rules(b.read_bash),
                       json_schema=REVIEW_SCHEMA)
     if not res.ok or not isinstance(res.structured, dict) or not isinstance(res.structured.get("problems"), list):
-        return {"verdict": "request_changes", "summary": "review step failed", "problems": [], "failed": True,
-                "earlier": [{**p, "id": f"B{n}", "status": "open", "why": "the review step failed"}
-                            for n, p in enumerate(earlier, 1)],
-                "waived": before.get("waived") or [], "trees": before.get("trees") or {}}
-    return judged(res.structured, earlier, before.get("waived") or [], index_trees(b.checkouts))
-
-
-def judged(said: dict, earlier: list[dict], waived: list[dict], trees: dict) -> dict:
-    answered = settled(earlier, said.get("earlier"))
-    found = {**said, "problems": review_problems(said.get("problems")), "earlier": answered, "trees": trees,
-             "waived": waived + [e for e in answered if e["status"] == "waived"]}
-    return {**found, "verdict": "request_changes" if blocking(found) else "approve"}
-
-
-def settled(earlier: list[dict], answers) -> list[dict]:
-    said = ({str(a.get("id") or "").strip().upper(): a for a in answers if isinstance(a, dict)}
-            if isinstance(answers, list) else {})
-    out = []
-    for n, p in enumerate(earlier, 1):
-        answer = said.get(f"B{n}", {})
-        status = answer.get("status") if answer.get("status") in EARLIER_STATUSES else "open"
-        if status == "waived" and (p.get("category") or "") in (*UNWAIVABLE, ""):
-            status = "open"
-        out.append({**p, "id": f"B{n}", "status": status, "why": str(answer.get("why") or "")})
-    return out
-
-
-def stored_before_blockers(review: dict) -> bool:
-    return "earlier" not in review and review.get("verdict") == "request_changes"
-
-
-def is_note(review: dict, p: dict) -> bool:
-    return p["severity"] in NOTE_SEVERITIES and not stored_before_blockers(review)
-
-
-def blocking(review: dict) -> list[dict]:
-    return ([p for p in review_problems(review.get("problems")) if not is_note(review, p)]
-            + [e for e in review.get("earlier") or [] if e.get("status") == "open"])
-
-
-def review_notes(review: dict) -> list[dict]:
-    return [p for p in review_problems(review.get("problems")) if is_note(review, p)]
-
-
-def numbered(listed: list[dict]) -> str:
-    return "\n".join(f"- B{n} [{p.get('category') or 'unstated'}] {p.get('file', '')}: {p['problem']}"
-                     for n, p in enumerate(listed, 1))
-
-
-def notes_text(review: dict) -> str:
-    return "\n".join(f"- [{p['severity']}] {p['file']}: {p['problem']}" for p in review_notes(review)) or "None."
-
-
-def review_lists(review: dict) -> str:
-    notes = ([f"[{p['severity']}] {p['file']}: {p['problem']}" for p in review_notes(review)]
-             + [f"[waived {p.get('category') or 'blocker'}] {p.get('file', '')}: {p['problem']} ({p['why']})"
-                for p in review.get("waived") or []])
-    return ("".join(f"\n- [blocker, {p.get('category') or 'unstated'}] {p.get('file', '')}: {p['problem']}"
-                    for p in blocking(review))
-            + ("\n\n### Review notes (not blocking)\n" + "".join(f"\n- {n}" for n in notes) if notes else ""))
+        return Review.failed_step(earlier, before.waived or [], before.trees or {})
+    return Review.judged(res.structured, earlier, before.waived or [], index_trees(b.checkouts))
 
 
 def earlier_review(earlier: list[dict], reply: str, fixed: str) -> str:
@@ -2576,16 +2447,6 @@ def fixed_since(b: Build, trees: dict[str, str]) -> str:
         except RuntimeError:
             continue
     return util.tail(vault.hidden("".join(parts)), MAX_FIX_DIFF_IN_PROMPT)
-
-
-def review_problems(listed) -> list[dict]:
-    if not isinstance(listed, list):
-        return []
-    return [{"file": p.get("file") or "", "problem": p.get("problem") or "",
-             "severity": str(p.get("severity") or "unrated").strip().lower(),
-             "category": str(p.get("category") or "").strip().lower()
-             if str(p.get("category") or "").strip().lower() in BLOCKER_CATEGORIES else ""}
-            for p in listed if isinstance(p, dict)]
 
 
 def verify_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
@@ -2775,16 +2636,16 @@ def evidence_images(run: Run, c: workspace.Checkout, verified: verify.Verified) 
     return images
 
 
-def draft_reason(review: dict, verified: verify.Verified, reviews: int = 0) -> str:
-    approved = review.get("verdict") == "approve"
+def draft_reason(review: Review, verified: verify.Verified, reviews: int = 0) -> str:
+    approved = review.approved()
     refused = REFUSAL_WORDS.search(f"{verified.blocked_by} {verified.summary}")
     if verified.verdict == "blocked" and (not approved or refused):
         return "the check in use was blocked"
     if approved:
         return ""
-    if review.get("verdict") == "request_changes" and reviews:
-        left = len(blocking(review))
-        if review.get("failed"):
+    if review.verdict == "request_changes" and reviews:
+        left = len(review.blocking())
+        if review.failed:
             return (f"the last review failed after {util.count(reviews, 'review')}, with {util.count(left, 'earlier blocker')} "
                     f"not rechecked")
         return (f"the review still requested changes after {util.count(reviews, 'review')}, the most the review "
@@ -2934,152 +2795,6 @@ def commit_layer(layer_dir: Path, message: str, written: list[Path]) -> str:
         return commit_written(layer_dir, message, written)
 
 
-def owner_feedback(url: str, pr_state: str, repo_name: str, issue: str) -> list[dict]:
-    owner = gh.me()
-    talk = gh.pr_discussion(url)
-
-    def from_owner(item: dict) -> bool:
-        return (item.get("user") or {}).get("login") == owner and not gh.has_arete_mark(item.get("body"))
-
-    reviews = {r["id"]: r for r in talk.reviews}
-    lines_in_review = Counter(c.get("pull_request_review_id") for c in talk.line_comments)
-    base = {"pr_url": url, "repo": repo_name, "issue": issue, "pr_state": pr_state,
-            "status": "new" if pr_state == "OPEN" else "recorded"}
-    rows = [{**base, "kind": "review", "gh_id": r["id"], "body": r["body"], "at_once": 1, "created": r.get("submitted_at")}
-            for r in talk.reviews if from_owner(r) and r.get("state") != "PENDING" and (r.get("body") or "").strip()]
-    for c in talk.line_comments:
-        review = reviews.get(c.get("pull_request_review_id")) or {}
-        if not from_owner(c) or review.get("state") == "PENDING":
-            continue
-        grouped = bool((review.get("body") or "").strip()) or lines_in_review[c.get("pull_request_review_id")] > 1
-        rows.append({**base, "kind": "line", "gh_id": c["id"], "body": c.get("body") or "", "path": c.get("path"),
-                     "line": c.get("line") or c.get("original_line"),
-                     "hunk": "\n".join((c.get("diff_hunk") or "").splitlines()[-HUNK_LINES:]),
-                     "thread": c.get("in_reply_to_id") or c["id"], "at_once": int(grouped),
-                     "created": c.get("created_at")})
-    rows += [{**base, "kind": "comment", "gh_id": c["id"], "body": c.get("body") or "", "at_once": 0,
-              "created": c.get("created_at")} for c in talk.comments if from_owner(c)]
-    return rows
-
-
-def feedback_text(row: dict) -> str:
-    kind = (f"Kind: line comment on {row.get('path')} line {row.get('line')}\n\nCode:\n```\n{row.get('hunk') or ''}\n```"
-            if row["kind"] == "line" else f"Kind: {row['kind']}")
-    return f"A comment from the repo's owner on a pull request an agent opened.\n\n{kind}\n\nComment:\n{row['body']}"
-
-
-def judge_feedback(cfg: config.Config, repo_name: str, url: str, rows: list[dict]) -> None:
-    known = state.feedback_keys(url)
-    fresh = [row for row in rows if row["status"] == "new" and (row["kind"], row["gh_id"]) not in known]
-    try:
-        repo = cfg.repo(repo_name)
-    except config.UnknownRepo:
-        return
-    if not fresh or not jev.ready(cfg, [repo]):
-        return
-    trace = ("", f"feedback {url} jev")
-    replies = jev.ask_many([(feedback_text(row), {"asks": jev.yes_no(FEEDBACK_ASKS)}) for row in fresh], cfg,
-                           trace=trace)
-    for row, reply in zip(fresh, replies, strict=True):
-        if (a := reply.answers.get("asks")) is None:
-            continue
-        score = jev_verdicts.scored(a.yes, cfg.jev.feedback_skip, over=False)
-        skip = jev_verdicts.holds(score)
-        row["asks"] = score["p"]
-        if skip:
-            row["status"] = "skipped"
-        jev_verdicts.record(jev.traced_run(trace), "feedback", f"{url} {row['kind']} {row['gh_id']}", row["body"] or "",
-                        {"asks": score}, f"asks for no change and no answer (p {a.yes:.2f})" if skip else "",
-                        "skipped" if skip else "went on")
-        print(f"{util.iso()} {url}: JEV reads your {row['kind']} comment {row['gh_id']} as asking for a change or an "
-              f"answer at p {a.yes:.2f}" + (f", under the {cfg.jev.feedback_skip:g} skip line, so no run takes it"
-                                           if skip else ""))
-
-
-def record_feedback(cfg: config.Config, r: dict, urls: list[str], prs: list[dict], seen: dict, fresh: dict) -> None:
-    for url, pr in zip(urls, prs):
-        updated = pr.get("updatedAt", "")
-        fresh[url] = seen.get(url, "")
-        if updated and seen.get(url) == updated:
-            continue
-        try:
-            rows = owner_feedback(url, pr.get("state", ""), r["repo"], str(r["issue"]))
-            judge_feedback(cfg, r["repo"], url, rows)
-            added = state.add_feedback(rows)
-        except gh.GhError as e:
-            print(f"{util.iso()} {url}: could not read the review comments: {util.first_line(str(e), 300)}")
-            continue
-        fresh[url] = updated if util.iso(util.now() - PR_SEEN_SETTLE) > updated else ""
-        if added:
-            print(f"{util.iso()} {url}: {util.count(added, 'new comment')} from you")
-
-
-def sync_outcomes(cfg: config.Config) -> None:
-    seen, fresh = util.read_json(PR_SEEN_FILE, {}), {}
-    for r in state.runs_reading_pr_comments(util.iso(util.now() - REJECTED_PR_LISTEN)):
-        urls = r["pr_url"].split()
-        try:
-            prs = [gh.pr_view(url) for url in urls]
-        except gh.GhError:
-            continue
-        record_feedback(cfg, r, urls, prs, seen, fresh)
-        closed = all(pr.get("state") in ("MERGED", "CLOSED") for pr in prs)
-        merged = all(pr.get("mergedAt") for pr in prs)
-        if r["status"] == "rejected" and not merged:
-            if not closed:
-                record.move(r["id"], "pr", expect=("rejected",))
-            continue
-        if not closed:
-            continue
-        for url, pr in zip(urls, prs):
-            state.close_feedback(url, pr["state"])
-        closed_at = max((util.iso(util.parse_iso(pr["closedAt"]).astimezone(UTC))
-                         for pr in prs if pr.get("closedAt")), default=util.iso())
-        record.move(r["id"], "merged" if merged else "rejected", expect=(r["status"],), finished=closed_at)
-    util.write_json(PR_SEEN_FILE, fresh)
-    for repo in cfg.repos:
-        if repo.pipeline and repo.github and not repo.layer:
-            try:
-                _maybe_propose_trust(repo)
-            except (RuntimeError, OSError) as e:
-                print(f"{util.iso()} {repo.name}: trust proposal failed: {util.first_line(str(e), 300)}")
-
-
-CATCH_UP = ("pr", "needs-info", "failed")
-
-
-def sync_moves(cfg: config.Config) -> None:
-    if not any(cfg.jira.transitions.get(s) for s in CATCH_UP):
-        return
-    seen: set[tuple[str, str]] = set()
-    for r in state.runs(kind="pipeline", limit=200):
-        key = (r["repo"] or "", str(r["issue"]))
-        if key in seen:
-            continue
-        seen.add(key)
-        status = r["status"]
-        target = cfg.jira.transitions.get(status, "") if status in CATCH_UP else ""
-        if not target or r.get("moved") == status:
-            continue
-        try:
-            repo = cfg.repo(r["repo"])
-        except KeyError:
-            continue
-        tk = tracker.for_ticket(cfg, repo, str(r["issue"]))
-        if not isinstance(tk, tracker.JiraTracker):
-            continue
-        try:
-            m = tk.shift(str(r["issue"]), target, keep_done=True)
-        except jira.JiraError as e:
-            print(f"{util.iso()} {tracker.run_ticket_name(r)}: could not move it to {target}, trying next poll: "
-                  f"{util.first_line(str(e), 300)}")
-            continue
-        record.note(r["id"], moved=status)
-        if m.error or m.moved:
-            print(f"{util.iso()} {tracker.run_ticket_name(r)}: "
-                  + (f"not moved: {util.first_line(m.error, 300)}" if m.error else f"{status}, moved to {target}"))
-
-
 def sync_labels(cfg: config.Config) -> None:
     seen: set[tuple[str, str]] = set()
     for r in state.runs(kind="pipeline", limit=200):
@@ -3107,182 +2822,6 @@ def sync_labels(cfg: config.Config) -> None:
             continue
         record.note(r["id"], label_pending="")
         print(f"{util.iso()} {tracker.run_ticket_name(r)}: labeled {want}")
-
-
-def carried_by_newer(rows: list[dict], i: int) -> bool:
-    row = rows[i]
-    prs = set((row.get("pr_url") or "").split())
-    return bool(prs) and any(r["status"] == "merged" and r["repo"] == row["repo"] and r["issue"] == row["issue"]
-                             and prs <= set((r.get("pr_url") or "").split()) for r in rows[:i])
-
-
-def sync_landings(cfg: config.Config) -> None:
-    branches = list(cfg.jira.landed)
-    if not branches:
-        return
-    rows = state.runs(kind="pipeline", limit=200)
-    for i, r in enumerate(rows):
-        if (r["status"] != "merged" or not r.get("pr_url") or r.get("landed") == branches[-1]
-                or carried_by_newer(rows, i)):
-            continue
-        try:
-            repo = cfg.repo(r["repo"])
-        except KeyError:
-            continue
-        if repo.tracker != "jira" or tracker.is_task_id(r["issue"]):
-            continue
-        try:
-            reached = furthest_branch(branches, r["pr_url"].split(), str(r["issue"]))
-            progress = [older.get("landed") for older in rows[i:]
-                        if older["status"] == "merged" and older["repo"] == r["repo"] and older["issue"] == r["issue"]
-                        and set((older.get("pr_url") or "").split()) == set(r["pr_url"].split())]
-            already = max((branches.index(b) for b in progress if b in branches), default=-1)
-            if reached is None or branches.index(reached) <= already:
-                continue
-            target = cfg.jira.landed[reached]
-            tk = tracker.for_repo(cfg, repo)
-            err = tk.move_to(str(r["issue"]), target)
-            if reached != branches[-1]:
-                run = Run(r["id"], repo, paths.RUNS_DIR / r["id"], tracker=tk, tid=str(r["issue"]), writes_lines=False)
-                moved = "" if err else f" and moved to {target}"
-                if say_err := run.say(f"This reached `{reached}`{moved}. To test it there:\n\n"
-                                      + uat_steps(cfg, run, r, reached)):
-                    raise RetryNextPoll(say_err)
-        except (gh.GhError, jira.JiraError, RetryNextPoll) as e:
-            print(f"{util.iso()} {tracker.run_ticket_name(r)}: landing check failed, trying next poll: {util.first_line(str(e), 300)}")
-            continue
-        record.note(r["id"], landed=reached)
-        print(f"{util.iso()} {tracker.run_ticket_name(r)}: landed on {reached}, " + (err or f"moved to {target}"))
-
-
-def uat_steps(cfg: config.Config, run: Run, row: dict, branch: str) -> str:
-    saved = run.dir / f"uat-{tracker.safe_filename(branch)}.md"
-    if saved.exists():
-        return saved.read_text()
-    run.dir.mkdir(parents=True, exist_ok=True)
-    tries_file = run.dir / f"uat-{tracker.safe_filename(branch)}.tries"
-    tries = int(tries_file.read_text() or 0) + 1 if tries_file.exists() else 1
-    t = run.tracker.get(run.tid)
-    try:
-        run.cfg, run.layer, run.kind = cfg, config.load_layer(run.repo.layer_dir), t.kind
-        most = run.settings("uat").tries
-    except (ValueError, TypeError) as e:
-        raise RetryNextPoll(f"{paths.short_path(run.repo.layer_dir / 'config.toml')}: {e}") from e
-    urls = row["pr_url"].split()
-    share = MAX_DIFF_IN_PROMPT // len(urls)
-    prs = "\n\n".join(f"### {url}\n\n{gh.pr_body(url).strip()}\n\n```diff\n{cut(gh.pr_diff(url), share)}\n```"
-                       for url in urls)
-    res = run.agent("uat", prompt("uat", ref=t.ref, title=t.title, ticket="\n\n".join(filter(None, [t.body, t.comments])),
-                                  prs=prs, branch=branch),
-                    run.repo.path, role="uat", json_schema=UAT_SCHEMA, persist=False)
-    found = res.structured if res.ok and isinstance(res.structured, dict) else {}
-    listed = [re.sub(r"^\s*\d+[.)]\s*", "", s).strip() for s in found.get("steps", []) if s.strip()]
-    failure = util.first_line(res.error or "none came back")
-    if listed:
-        before = found.get("before", "").strip()
-        text = (f"**Before you start:** {before}\n\n" if before else "") + "\n".join(
-            f"{i}. {s}" for i, s in enumerate(listed, 1))
-    elif tries < most:
-        tries_file.write_text(str(tries))
-        raise RetryNextPoll(f"no test steps came back, try {tries} of {most}: {failure}")
-    else:
-        text = (f"I could not write the steps ({failure}); "
-                f"the PR shows what changed: {' '.join(urls)}")
-    saved.write_text(text)
-    return text
-
-
-def cut(text: str, n: int) -> str:
-    return text if len(text) <= n else text[:n] + "\n... (cut)"
-
-
-def furthest_branch(branches: list[str], pr_urls: list[str], key: str) -> str | None:
-    merges = [(gh.pr_repo(url), (gh.pr_view(url).get("mergeCommit") or {}).get("oid", "")) for url in pr_urls]
-    for branch in reversed(branches):
-        if all(branch_holds_work(repo, branch, sha, key) for repo, sha in merges):
-            return branch
-    return None
-
-
-def branch_holds_work(repo: str, branch: str, merge_sha: str, key: str) -> bool:
-    return bool(merge_sha) and gh.branch_contains(repo, branch, merge_sha) or gh.merged_pr_names(repo, branch, key)
-
-
-def streak(repo_name: str, since: str = "") -> int:
-    n = 0
-    rows = state.runs(kind="pipeline", repo=repo_name, limit=100)
-    for i, r in enumerate(rows):
-        if (r["status"] == "merged" and (not since or (r["finished"] or "") > since)
-                and not carried_by_newer(rows, i)):
-            n += 1
-        elif r["status"] in ("rejected", "failed"):
-            break
-    return n
-
-
-def layer_is_committed(root: Path) -> bool:
-    return bool(git(["ls-files", ".agents/config.toml"], root, check=False).strip())
-
-
-def with_automerge_trust(text: str) -> str | None:
-    data = tomllib.loads(text)
-    if data.get("trust", {}).get("level") == "automerge":
-        return text
-    want = data | {"trust": data.get("trust", {}) | {"level": "automerge"}}
-    for new in automerge_trust_edits(text if not text or text.endswith("\n") else text + "\n"):
-        try:
-            if tomllib.loads(new) == want:
-                return new
-        except tomllib.TOMLDecodeError:
-            continue
-    return None
-
-
-def automerge_trust_edits(text: str) -> Iterator[str]:
-    for m in re.finditer(r"""\blevel[ \t]*=[ \t]*("[^"\n]*"|'[^'\n]*')""", text):
-        yield text[:m.start(1)] + '"automerge"' + text[m.end(1):]
-    for m in re.finditer(r"(?m)^[ \t]*\[[ \t]*trust[ \t]*\][^\n]*\n", text):
-        yield text[:m.end()] + 'level = "automerge"\n' + text[m.end():]
-    yield text + '\n[trust]\nlevel = "automerge"\n'
-
-
-def _maybe_propose_trust(repo: config.Repo) -> None:
-    layer = config.load_layer(repo.layer_dir)
-    if layer.trust_level != "pr" or streak(repo.name) < layer.automerge_after or not layer_is_committed(repo.path):
-        return
-    branch = "arete/trust-automerge"
-    if gh.open_pr_url(repo.github, branch):
-        return
-    if gh.closed_pr_heads(repo.github, branch):
-        closed_at = gh.pr_view(branch, repo.github).get("closedAt") or ""
-        if streak(repo.name, since=closed_at) < layer.automerge_after:
-            return
-    base = layer.base_branch or gh.default_branch(repo.github)
-    labels = ["arete-trust"] if repo.tracker == "github" else []
-    wt = workspace.make_worktree(repo, base, branch, "trust")
-    try:
-        f = wt / ".agents" / "config.toml"
-        if not f.exists():
-            return
-        text = f.read_text()
-        new = with_automerge_trust(text)
-        if new is None:
-            raise RuntimeError(f".agents/config.toml on {base} sets trust in a form arete cannot edit, "
-                               'so set trust.level = "automerge" there by hand')
-        if new == text:
-            return
-        f.write_text(new)
-        util.git_as_owner(["commit", "-q", "-am", "chore(agents): raise trust to automerge"], wt)
-        git(["push", "-q", "--force-with-lease", "-u", "origin", branch], wt)
-        for lb in labels:
-            gh.ensure_label(repo.github, lb, "0e8a16", "Trust level change proposed by arete")
-        n = streak(repo.name)
-        gh.pr_create(repo.github, branch, base, "chore(agents): raise trust to automerge",
-                     f"The last {n} arete PRs in this repo merged with none rejected or failed in between.\n\n"
-                     "Merging this lets arete enable automerge on PRs that pass checks and review. "
-                     "Close it to keep every PR waiting for you.", labels=labels)
-    finally:
-        workspace.remove_worktree(repo, wt)
 
 
 class SkipLog:
@@ -3403,245 +2942,12 @@ def run_skipped(name: str) -> dict:
     return {"ticket": name, "repo": entry["repo"], "id": entry["id"]}
 
 
-def sources(repo: config.Repo, tk: tracker.Tracker) -> list[tracker.Tracker]:
-    if isinstance(tk, tracker.LocalTracker):
-        return [tk]
-    return [*([tk] if repo.parts or isinstance(tk, tracker.JiraTracker) else []), tracker.LocalTracker(repo)]
-
-
-def next_ticket(repo: config.Repo, tk: tracker.Tracker, skips: SkipLog,
-                other_routes: set[str] = frozenset(), excluded: set[str] = frozenset()) -> tracker.Ticket | None:
-    for source in sources(repo, tk):
-        for t in source.todo():
-            if str(t.id) in excluded or other_routes & set(t.labels) or state.issue_running(repo.name, t.id):
-                continue
-            if owed := state.pending_label(repo.name, t.id):
-                skips.note(tracker.ticket_name(repo.name, t.ref), t, f"its {owed} label is not written yet", repo.name)
-                continue
-            if blocker := source.blocker(t.id):
-                skips.note(tracker.ticket_name(repo.name, t.ref), t, blocker, repo.name)
-                continue
-            return t
-    return None
-
-
-def jira_routes_by_project(cfg: config.Config) -> dict[str, set[str]]:
-    out: dict[str, set[str]] = {}
-    for r in cfg.repos:
-        if r.pipeline and runnable(r) and r.tracker == "jira":
-            out.setdefault(r.jira_project or cfg.jira.project, set()).add(tracker.route_label(r))
-    return out
-
-
-def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: SkipLog,
-              other_routes: set[str], excluded: set[str] = frozenset()) -> tuple[str, str] | None:
-    from . import oncall
-
-    excluded = excluded | oncall.parked(repo.name)
-    fresh = next_ticket(repo, tk, skips, other_routes, excluded)
-    for tid in state.interrupted_tickets(repo.name):
-        if str(tid) not in excluded and not state.issue_running(repo.name, tid):
-            return tid, "restarting after an interruption"
-    for tid in state.feedback_due(repo.name, util.iso(util.now() - timedelta(minutes=FEEDBACK_QUIET_MINUTES))):
-        if str(tid) not in excluded and not state.issue_running(repo.name, tid):
-            return tid, "revising the PR for your review comments"
-    for source in sources(repo, tk):
-        for t in source.replied():
-            if str(t.id) in excluded or state.issue_running(repo.name, t.id):
-                continue
-            if other_routes & set(t.labels):
-                skips.note(t.ref, t, tracker.route_blocker(other_routes | {tracker.route_label(repo)}, t.labels))
-                continue
-            if blocker := source.blocker(t.id):
-                skips.note(tracker.ticket_name(repo.name, t.ref), t, blocker, repo.name)
-                continue
-            return t.id, f"{t.title} (you replied to the question)"
-    return (fresh.id, fresh.title) if fresh else None
-
-
-def route_blocker(cfg: config.Config, repo: config.Repo, ticket: tracker.Ticket,
-                  discovery: routing.Discovery, layer: config.RepoLayer) -> str:
-    if cfg.replay.all:
-        return ""
-    first = ("plan", "build")
-    newest = state.ticket_runs(repo.name, ticket.id, limit=1, whole=True)
-    if (layer.factory_path == "adw" and newest and newest[0]["status"] == "interrupted"
-            and repaired_by(newest[0]["id"])):
-        first = ("review_repair",)
-    elif pending_feedback(repo.name, ticket.id):
-        first = ("build",)
-    for role in (*first, *(("verify",) if layer.verify else ()), "review"):
-        setting = steps.resolve(cfg, layer, role, ticket.kind, ticket=(repo.name, str(ticket.id)))
-        if setting.runner == REPLAY:
-            continue
-        routes = discovery.routes(setting)
-        if not any(route.state == "ready" for route in routes):
-            reason = routing.held_words(routes) or "; ".join(dict.fromkeys(route.detail for route in routes))
-            return f"{role} has no eligible route" + (f": {reason}" if reason else "")
-    return ""
-
-
 def answered_run(repo_name: str, tid: str) -> dict | None:
     newest = state.ticket_runs(repo_name, tid, limit=1, whole=True)
     if (newest and newest[0]["status"] == "needs-info" and state.asks_due([newest[0]["id"]])
             and not state.asks_of(newest[0]["id"], "open")):
         return newest[0]
     return None
-
-
-def tracker_reply(repo: config.Repo, tk: tracker.Tracker, tid: str, dry_run: bool) -> str:
-    newest = state.ticket_runs(repo.name, str(tid), limit=1, whole=True)
-    if not newest or newest[0]["status"] != "needs-info":
-        return ""
-    waiting = state.asks_of(newest[0]["id"], "open")
-    if not waiting:
-        return ""
-    if any(owner_asks.has_secret(a["questions"]) for a in waiting):
-        return "its ask holds a secret, which a tracker reply cannot answer; answer it on the dashboard"
-    text = tk.reply_since(tid, waiting[0]["asked"])
-    if text and not dry_run:
-        with util.lock(owner_asks.STEER_LOCK, wait=True):
-            for a in state.asks_of(newest[0]["id"], "open"):
-                state.ask_close(a["id"], "answered", owner_asks.text_answers(a, text))
-    return ""
-
-
-def spawn_unparked(repo_name: str, tid: str | int) -> bool:
-    from . import oncall
-
-    with util.lock("oncall") as got:
-        if not got or str(tid) in oncall.parked(repo_name):
-            return False
-        spawn_run(repo_name, tid)
-        return True
-
-
-def poll(dry_run: bool = False) -> int:
-    paths.ensure_dirs()
-    cfg = config.load()
-    with util.lock("poll") as got:
-        if not got:
-            print(f"{util.iso()} poll already running")
-            return 0
-        if not dry_run:
-            retry_scratch(cfg.retention.days)
-        if any(r.parts or r.tracker != "local" for r in cfg.repos) and not network_up_or_skip("poll", dry_run):
-            return 0
-        errors: list[str] = []
-
-        def failed(where: str, e: Exception) -> None:
-            errors.append(f"{where}: {type(e).__name__}: {e}")
-            print(f"{util.iso()} {errors[-1]}")
-
-        if not dry_run:
-            try:
-                settle_abandoned_runs(cfg)
-            except Exception as e:
-                failed("settling abandoned runs", e)
-            try:
-                sync_outcomes(cfg)
-            except Exception as e:
-                failed("syncing PR outcomes", e)
-            try:
-                sync_labels(cfg)
-            except Exception as e:
-                failed("labeling tickets", e)
-        going = Counter(r["repo"] for r in live_pipeline_runs())
-        free_slots = slots.slots_free_to_start(cfg.max_parallel)
-        starts = state.last_pipeline_starts()
-        pipeline_repos = [r for r in cfg.repos if r.pipeline and runnable(r)]
-        restarting = {r.name for r in pipeline_repos if state.interrupted_tickets(r.name)}
-        skips = SkipLog({} if dry_run else util.read_json(SKIPPED_FILE, {}))
-        routes = jira_routes_by_project(cfg)
-        reached_clients: dict[str, jira.Client] = {}
-        contexts = []
-        for repo in sorted(pipeline_repos, key=lambda r: (r.name not in restarting, starts.get(r.name, ""))):
-            try:
-                tk = tracker.for_repo(cfg, repo)
-                other_routes: set[str] = set()
-                if isinstance(tk, tracker.JiraTracker):
-                    other_routes = routes.get(tk.project, set()) - {tk.route}
-                    reached_clients.setdefault(tk.project, tk.client)
-                layer = config.load_layer(repo.layer_dir)
-                contexts.append((repo, tk, other_routes, layer,
-                                 routing.Discovery(cfg, repo, priced=False, layer=layer), set()))
-            except Exception as e:
-                failed(repo.name, e)
-                skips.keep_repo(repo.name)
-        examined, exhausted = 0, set()
-        while examined < MAX_STARTS_PER_POLL:
-            progressed = False
-            for repo, tk, other_routes, layer, discovery, selected in contexts:
-                if repo.name in exhausted or examined >= MAX_STARTS_PER_POLL:
-                    continue
-                try:
-                    pick = next_pick(repo, tk, skips, other_routes, selected)
-                    if not pick:
-                        exhausted.add(repo.name)
-                        if not dry_run:
-                            state.drop_passed_over(repo.name)
-                        continue
-                    tid, why = pick
-                    selected.add(str(tid))
-                    examined += 1
-                    progressed = True
-                    source = tracker.for_ticket(cfg, repo, tid)
-                    name = tracker.ticket_name(repo.name, source.ref(tid))
-                    reply = tracker_reply(repo, source, str(tid), dry_run)
-                    answering = not reply and answered_run(repo.name, str(tid)) is not None
-                    if not answering and not reply and (waiting := held_back(cfg, repo.name, going, free_slots)):
-                        exhausted.add(repo.name)
-                        if not dry_run:
-                            state.pass_over(repo.name, str(tid))
-                        print(f"{util.iso()} {name}: waiting, {waiting}")
-                        continue
-                    blocked, _ = runlimits.admission(repo, str(tid), source, runlimits.Policy.of(layer), False)
-                    ticket = source.get(tid)
-                    blocked = (blocked or source.blocker(tid) or route_blocker(cfg, repo, ticket, discovery, layer)
-                               or reply)
-                    if blocked:
-                        skips.note(name, ticket, blocked, repo.name)
-                        print(f"{util.iso()} {name}: {blocked}")
-                        continue
-                    print(f"{util.iso()} {name}: {why}" + (" (dry run, not started)" if dry_run else ""))
-                    if not dry_run:
-                        state.drop_passed_over(repo.name, keep=str(tid))
-                        if not spawn_unparked(repo.name, tid):
-                            exhausted.add(repo.name)
-                            continue
-                    free_slots -= 1
-                    going[repo.name] += 1
-                except Exception as e:
-                    failed(repo.name, e)
-                    skips.keep_repo(repo.name)
-                    exhausted.add(repo.name)
-            if not progressed:
-                break
-        for project, client in reached_clients.items():
-            try:
-                for t in tracker.jira_unrouted(project, routes.get(project, set()), client):
-                    skips.note(t.ref, t, t.blocker)
-            except Exception as e:
-                failed(f"jira {project}", e)
-                skips.keep_project(project)
-        for project in routes.keys() - reached_clients.keys():
-            skips.keep_project(project)
-        if not dry_run:
-            try:
-                sync_moves(cfg)
-            except Exception as e:
-                failed("moving tickets", e)
-            try:
-                util.write_json(SKIPPED_FILE, skips.current)
-                sync_landings(cfg)
-            except Exception as e:
-                failed("poll", e)
-            try:
-                workspace.cleanup_worktrees(cfg=cfg)
-            except Exception as e:
-                failed("sweeping worktrees", e)
-            mark_loop("poll", not errors, "; ".join(errors))
-        return 1 if errors else 0
 
 
 def skipped_tickets() -> dict:

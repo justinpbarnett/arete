@@ -1,6 +1,6 @@
 
 from types import SimpleNamespace
-from arete import pipeline
+from arete import pipeline, outcomes
 repo = config.Repo("race", root, github="example/race")
 cfg = config.Config(repos=[repo])
 logs = []
@@ -16,8 +16,8 @@ def view(url):
         pipeline.supersede_older_runs(run, ["one", "two"])
     return {"state": "MERGED", "mergedAt": closed, "closedAt": closed}
 with mock.patch.object(pipeline.gh, "pr_view", side_effect=view), \
-        mock.patch.object(pipeline, "record_feedback"):
-    pipeline.sync_outcomes(cfg)
+        mock.patch.object(outcomes, "record_feedback"):
+    outcomes.sync_outcomes(cfg)
 row = state.run_get(first)
 assert row["status"] == "superseded" and row["finished"] == finished, row
 third = made("third", "pr", minutes=0, repo=repo.name, issue=run.tid)
@@ -25,12 +25,12 @@ record.note(third, pr_url="three")
 original = state.open_runs
 def snapshot(*args):
     rows = original(*args)
-    pipeline.sync_outcomes(cfg)
+    outcomes.sync_outcomes(cfg)
     return rows
 logs.clear()
 with mock.patch.object(state, "open_runs", side_effect=snapshot), \
         mock.patch.object(pipeline.gh, "pr_view", return_value=view("three")), \
-        mock.patch.object(pipeline, "record_feedback"):
+        mock.patch.object(outcomes, "record_feedback"):
     pipeline.supersede_older_runs(run, ["three"])
 assert state.run_get(third)["status"] == "merged"
 assert state.run_get(third)["finished"] == "2099-01-01T05:00:00Z"

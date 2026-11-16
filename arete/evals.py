@@ -34,7 +34,6 @@ from .heartbeat import mark_loop
 from .pipeline import (
     MAX_DIFF_IN_PROMPT,
     PLAN_SCHEMA,
-    REVIEW_SCHEMA,
     AgentRun,
     TicketWork,
     bash_rules,
@@ -43,10 +42,10 @@ from .pipeline import (
     check_script,
     code_list,
     prompt,
-    review_problems,
     run_checks,
     use_product,
 )
+from .review import REVIEW_SCHEMA, review_problems
 from .util import git
 
 EVALS = ".agents/evals"

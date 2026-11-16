@@ -1,7 +1,7 @@
 
 import threading
 from types import SimpleNamespace
-from arete import owner_asks, control, pipeline, tasks
+from arete import owner_asks, control, pipeline, tasks, poll
 repo = config.Repo("asking", root)
 cfg = config.Config(repos=[repo])
 rid = made("asking", "needs-info", repo=repo.name, issue="R-1")
@@ -25,7 +25,7 @@ def reply(*args):
 tk = SimpleNamespace(reply_since=reply)
 def tracker_thread():
     try:
-        pipeline.tracker_reply(repo, tk, "R-1", False)
+        poll.tracker_reply(repo, tk, "R-1", False)
     except BaseException as e:
         errors.append(repr(e))
 def continuing(*args):

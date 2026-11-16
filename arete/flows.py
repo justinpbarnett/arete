@@ -27,6 +27,7 @@ from . import (
 )
 from .agent import NO_SESSION, Result
 from .factory import Outcome
+from .review import Review
 from .verify import Verified
 
 ADW = "adw"
@@ -281,7 +282,7 @@ def facts(name: str, data: dict) -> dict:
     if name == "verify" and isinstance(data.get("verified"), dict):
         return {"requirements": Verified.stored(data["verified"]).requirements()}
     if name == "review" and isinstance(data.get("review"), dict):
-        return {"review": pipeline.report_review(data["review"])}
+        return {"review": Review.stored(data["review"]).report()}
     return {}
 
 
@@ -311,7 +312,7 @@ class Job:
     left_for_a_person: str = ""
     build_summary: str = ""
     verified: Verified = field(default_factory=lambda: Verified("unverified"))
-    review: dict = field(default_factory=dict)
+    review: Review = field(default_factory=lambda: Review.stored({}))
     fix_reply: str = ""
     reviews: int = 0
     built: pipeline.Build | None = None
@@ -443,7 +444,7 @@ class Job:
             self.verified = Verified.stored(data["verified"])
             self.b.steps = Counter(data["names"])
         elif name == "review" and "review" in data:
-            self.review, self.reviews = data["review"], data.get("attempt", 0)
+            self.review, self.reviews = Review.stored(data["review"]), data.get("attempt", 0)
         elif name == "document" and outcome.passed:
             self.document = data.get("text", "")
         elif name == "pr" and outcome.passed:
@@ -738,8 +739,8 @@ def repair(flow: factory.Flow, tree: str) -> Outcome:
     except repairs.Refused as e:
         return end_as("fail", "failed", why=str(e))
     moved = [c.github for c in targets if heads[c.github] != c.lease]
-    findings = pipeline.review_findings(found.review)
-    count = len(found.review["problems"])
+    findings = found.review.findings()
+    count = len(found.review.problems)
     run.log(f"repair: run {found.run_id}, {found.evidence}, {util.count(count, 'finding')}")
     for github in moved:
         run.log(f"repair: the PR head of {github} moved since run {found.run_id}; checks, verify and review run "
@@ -778,7 +779,7 @@ def implement(flow: factory.Flow, tree: str, round: str, feedback: str = "", att
                        data={"round": round, "failures": feedback, "verdicts": res.structured, "said": res.text},
                        session=run.sessions.get(BUILD, NO_SESSION))
     if round.startswith(REVIEW_FIX):
-        res = job.b.resume(round, pipeline.prompt(REVIEW_FIX, problems=feedback, notes=pipeline.notes_text(job.review)),
+        res = job.b.resume(round, pipeline.prompt(REVIEW_FIX, problems=feedback, notes=job.review.fix_notes()),
                            role=atom)
     elif round != BUILD:
         res = job.b.resume(round, pipeline.prompt("fix", attempt=attempt, max_attempts=tries, failures=feedback,
@@ -846,10 +847,10 @@ def review(flow: factory.Flow, second: bool = False, attempt: int = 1, tries: in
     said = pipeline._review(job.staged(), job.with_left(job.plan_text), job.verified,
                             pipeline.round_name("review", attempt), job.review if attempt > 1 else None,
                             job.fix_reply)
-    data = {"review": said, "attempt": attempt, "story": run.story}
-    if said.get("verdict") != "request_changes":
+    data = {"review": said.asdict(), "attempt": attempt, "story": run.story}
+    if said.verdict != "request_changes":
         return Outcome("pass", data=data)
-    problems = pipeline.review_findings(said)
+    problems = said.findings()
     last = second or bool(tries and attempt >= tries)
     run.story.append(f"Review still requested changes after {util.count(attempt, 'review')}, the limit:\n{problems}"
                      if last else f"Review requested changes:\n{problems}")
@@ -883,7 +884,7 @@ def change(job: Job, staged: pipeline.Staged | None = None) -> tuple[pipeline.St
     if staged.empty:
         raise workspace.RunFailed("nothing was left to push, since the workspace holds no change")
     size = f"{len(staged.files)} files, {staged.lines} lines"
-    return staged, size, f"{size}, review {job.review.get('verdict')}, in use {job.verified.verdict}"
+    return staged, size, f"{size}, review {job.review.verdict}, in use {job.verified.verdict}"
 
 
 def publishing(run: pipeline.Run, branch: str, push: Callable[[], None]) -> None:
@@ -1094,11 +1095,10 @@ def respond(flow: factory.Flow, ending: str, why: str = "", said: str = "", deta
 
 def done_comment(job: Job, summary: str) -> str:
     said = job.review
-    problems = pipeline.review_lists(said)
     return (f"Done: {summary}.\n\n## Summary\n\n{job.document or pipeline.summary_of(said, job.build_summary)}\n\n"
             f"{pipeline.assumed_block(job.run)}"
             f"{pipeline.CHECKED_IN_USE_HEADING}\n\n{job.verified.markdown()}\n\n"
-            f"## Review\n\n**{said.get('verdict', 'none')}**: {said.get('summary', '')}\n{problems}\n\n"
+            f"{said.markdown()}\n\n"
             f"Run `{job.run.id}`, {util.paid_note(record.metered_spent(job.run.id))}.")
 
 
