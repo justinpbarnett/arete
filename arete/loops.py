@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 
-from . import config, cron, devices, paths, runner, state, util
+from . import config, cron, devices, paths, refusals, runner, state, util
 from .agent import EDIT_TOOLS, READ_ONLY_TOOLS, READ_TOOLS
 
 BUNDLED_LOOPS_DIR = paths.PACKAGE_DIR / "loops"
@@ -256,7 +256,7 @@ def github_remote(path: Path) -> str:
     return m.group(1) if m else ""
 
 
-class LoopError(ValueError):
+class LoopError(refusals.Invalid, ValueError):
     pass
 
 

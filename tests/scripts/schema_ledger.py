@@ -20,7 +20,7 @@ from unittest import mock
 
 CHECKOUT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(CHECKOUT))
-from arete import backup, cli, control, dashboard, loop_run, migrations, paths, record, serve, state, util
+from arete import backup, cli, control, dashboard, loop_run, migrations, paths, record, serve, state, tailnet, util
 
 TRACE = []
 
@@ -123,9 +123,9 @@ def free_port():
 
 
 DASHBOARD = """
-class Host(dashboard.ScratchHost):
+class Host(tailnet.ScratchHost):
     def node(self, owner):
-        return dashboard.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "me@example.com", "")
+        return tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), "me@example.com", "")
     def whois(self, address):
         return "me@example.com"
 dashboard.serve(port=PORT, host=Host(), inside_serve=True)

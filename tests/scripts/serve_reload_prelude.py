@@ -1,18 +1,18 @@
 
 import http.client, http.server, socket, subprocess, types
-from arete import client, dashboard, delivery
+from arete import client, dashboard, delivery, tailnet
 state.migrate()
 OWNER = "owner@example.test"
 CHANGED = frozenset({("changed", 1, 1)})
 real_sh = util.sh
 who = [OWNER]
-dashboard.Logins.of = lambda self, address: who[0]
-NODE = dashboard.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), OWNER, "127.0.0.1")
+tailnet.Logins.of = lambda self, address: who[0]
+NODE = tailnet.Node(("127.0.0.1",), frozenset({"127.0.0.1"}), OWNER, "127.0.0.1")
 def listen(logins, handler):
-    web = dashboard.Server("127.0.0.1", 0, NODE, logins, True, handler=handler)
+    web = tailnet.Server("127.0.0.1", 0, NODE, logins, True, handler, dashboard.Redirect)
     threading.Thread(target=web.serve_forever, daemon=True).start()
     return web
-web = listen(dashboard.Logins(None), dashboard.Handler)
+web = listen(tailnet.Logins(None), dashboard.Handler)
 PORT = web.server_address[1]
 gate, sending = threading.Event(), threading.Event()
 def fake_notify(item, batch, loop, run, cfg):
