@@ -34,7 +34,7 @@ PRICE_FILE = "openrouter-prices.json"
 PRICE_FRESH = timedelta(hours=6)
 PRICE_TIMEOUT_SECONDS = 5
 PRICE_MAX_BYTES = 8 * 1024 * 1024
-PAID_RANK = {"pi_oauth": 0, "pi_key": 1, "cli_key": 2}
+PAID_RANK = {"claude_key": -1, "pi_oauth": 0, "pi_key": 1, "cli_key": 2}
 PAYMENT_OF = {"cli_login": "subscription", "pi_login": "subscription", "cli_key": "api_key", "pi_key": "api_key",
               "pi_oauth": "api_key", "local": "local"}
 SERVES = {"anthropic": ("claude", "pi"), "openai": ("codex", "pi")}
@@ -518,7 +518,9 @@ def free_key(found: Candidate) -> tuple:
 
 def paid_key(found: Candidate) -> tuple:
     total = found.price.total
-    return (total is None, total or 0.0, not found.requested, found.position, PAID_RANK.get(found.credential, 9))
+    rank = PAID_RANK.get("claude_key" if found.runner == "claude" and found.credential == "cli_key"
+                         else found.credential, 9)
+    return (total is None, total or 0.0, not found.requested, found.position, rank)
 
 
 class Discovery:
@@ -557,6 +559,16 @@ class Discovery:
 
     def codex_auth(self) -> accounts.Auth:
         return self.remembered("codex_auth", lambda: codex.authentication(self.passing))
+
+    def cli_key_route(self, way: Way | Candidate) -> pi.Route:
+        vendor, ident = identity(way.runner, way.model)
+        return self.probe(f"{vendor}/{ident}", "api_key")
+
+    def cli_key_auth(self, way: Way | Candidate) -> accounts.Auth:
+        selected = self.cli_key_route(way)
+        return accounts.Auth("api_key", generation=accounts.fingerprint("cli-key", selected.provider, selected.key),
+                             credential=accounts.fingerprint("credential-v1", way.runner, selected.provider, selected.key),
+                             provider=selected.provider)
 
     def openrouter(self) -> dict:
         if self.listed is None:
@@ -597,12 +609,18 @@ class Discovery:
         vendor, ident = identity(link.runner, link.model)
         if vendor == "anthropic":
             native = link.model if link.runner == "claude" else link.model.partition("/")[2]
-            return [Way(link, "claude", native, "cli_login", "free"), self.keyed_way(link, f"anthropic/{ident}")]
+            found = [Way(link, "claude", native, "cli_login", "free")]
+            if not self.device.remote and self.probe(f"anthropic/{ident}", "api_key").key:
+                found.append(Way(link, "claude", native, "cli_key", "paid", "api_key"))
+            return [*found, self.keyed_way(link, f"anthropic/{ident}")]
         if vendor == "openai":
             native = link.model if link.runner == "codex" else ident
             cli = self.codex_cli_way(link, native)
-            return [cli, Way(link, "pi", f"openai-codex/{ident}", "pi_login", "free", "login"),
-                    self.keyed_way(link, f"openai/{ident}")]
+            found = [cli, Way(link, "pi", f"openai-codex/{ident}", "pi_login", "free", "login")]
+            if not self.device.remote and self.codex_auth().mode == "subscription" and self.probe(
+                    f"openai/{ident}", "api_key").key:
+                found.append(Way(link, "codex", native, "cli_key", "paid", "api_key"))
+            return [*found, self.keyed_way(link, f"openai/{ident}")]
         probe = self.probe(link.model, "")
         if self.is_local(probe):
             return [Way(link, "pi", link.model, "local", "free")]
@@ -618,7 +636,9 @@ class Discovery:
     def quote(self, way: Way, request_tokens: int = 0) -> Quote:
         if not (self.priced or self.paid.capped):
             return Quote()
-        rate = self.cfg.pricing.get(way.model) or self.cfg.pricing.get(f"{way.runner}:{way.model}")
+        vendor, ident = identity(way.runner, way.model)
+        name = f"{vendor}/{ident}" if way.credential == "cli_key" else way.model
+        rate = self.cfg.pricing.get(name) or self.cfg.pricing.get(f"{way.runner}:{way.model}")
         if rate:
             return Quote(rate[0], rate[1], source="pricing")
         snapshot = self.remembered("price_snapshot", prices.load)
@@ -749,6 +769,15 @@ class Discovery:
             if selected.error:
                 return "unavailable", scrub.scrub(selected.error, selected.hidden), ""
             auth, model = selected.auth, selected.model
+        elif way.credential == "cli_key" and way.mode == "api_key":
+            selected = self.cli_key_route(way)
+            if selected.token_error:
+                return "refused", scrub.scrub(selected.token_error, selected.hidden), ""
+            if not selected.key:
+                return "missing_key", f"no supported {selected.provider} key in {pi.KEYS_FILE.name} or the environment", ""
+            if selected.error:
+                return "unavailable", scrub.scrub(selected.error, selected.hidden), ""
+            auth, model = self.cli_key_auth(way), way.model
         elif way.runner == "codex":
             auth, model = self.codex_auth(), way.model
             if auth.mode == "":
