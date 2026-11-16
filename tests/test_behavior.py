@@ -1,5 +1,6 @@
 import ast
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -139,7 +140,7 @@ class StoreContractTests(unittest.TestCase):
             root = Path(directory)
             done = subprocess.run(
                 [sys.executable, "-I", str(SOURCE / "tests/scripts/store_contract.py"), case],
-                cwd=SOURCE, env=environment(root), text=True, capture_output=True, timeout=180)
+                cwd=SOURCE, env=environment(root), text=True, capture_output=True, timeout=180, check=False)
             self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
             found = behavior_result(done)
             self.assertEqual(found["case"], case)
@@ -589,7 +590,7 @@ class LogRotationTests(unittest.TestCase):
 
     def run_child(self, root, env, source, *, stdout, stderr):
         return subprocess.run([sys.executable, "-I", "-c", bootstrap(source), str(root)], cwd=root, env=env,
-                              stdout=stdout, stderr=stderr, timeout=60)
+                              stdout=stdout, stderr=stderr, timeout=60, check=False)
 
     def test_serve_log_rotates_in_its_own_process_by_descriptor(self):
         child = textwrap.dedent("""
