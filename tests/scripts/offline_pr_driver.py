@@ -3,7 +3,7 @@ from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from arete.store import runs as run_store
-from arete import accounts, agent, owner_asks, config, control, factory, gh, run_lines, paths, pipeline, record, replay, runlimits, sandbox, scratch, util, workspace, outcomes, prompt_loader
+from arete import accounts, agent, alerts, owner_asks, config, control, factory, gh, run_lines, paths, pipeline, record, replay, runlimits, sandbox, scratch, util, workspace, outcomes, prompt_loader
 from arete.store import asks as asks_store
 from arete.store import db as foundation
 from arete.store import insights as insights_store
@@ -20,6 +20,7 @@ def forbidden(*args, **kwargs):
 urllib.request.urlopen = forbidden
 accounts.read = forbidden
 gh.gh = forbidden
+alerts.notify = lambda title, message: None
 def fake(name, answer):
     def call(*args, **kw):
         with CALLS.open("a") as out:
