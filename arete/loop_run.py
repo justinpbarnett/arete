@@ -267,7 +267,7 @@ def run_command(argv: list[str], cwd: Path | str, *, timeout: float, env: dict, 
             emit(text)
 
         def mark(kind, offset):
-            emit(f"[arete] {'reattached' if kind == 'attach' else 'lost the device'} at byte {offset}\n")
+            emit(f"[arete] {'reattaching' if kind == 'attach' else 'lost the device'} at byte {offset}\n")
 
         try:
             result = device_turns.run(device, argv, cwd, env, stdin, timeout=timeout, on_line=line,
