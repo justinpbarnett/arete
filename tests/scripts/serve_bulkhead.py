@@ -1,30 +1,9 @@
-import json
-import sys
-import threading
+import json, sys, threading
 from concurrent.futures import wait
 from datetime import timedelta
 from pathlib import Path
 from unittest import mock
-
-from arete import (
-    alerts,
-    board,
-    cli,
-    config,
-    control,
-    explain,
-    heartbeat,
-    loop_run,
-    loops,
-    oncall,
-    paths,
-    routing,
-    serve,
-    state,
-    tasks,
-    util,
-    webpush,
-)
+from arete import alerts, board, cli, config, control, loop_run, explain, heartbeat, loops, oncall, paths, routing, serve, state, tasks, util, webpush
 
 root, mode = Path(sys.argv[1]), sys.argv[2]
 real_out = sys.stdout

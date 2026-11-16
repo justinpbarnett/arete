@@ -1,10 +1,10 @@
 import json
 import os
+from pathlib import Path
 import sys
 import tempfile
 import tomllib
 import unittest
-from pathlib import Path
 
 from tests import support
 from tests.harness import behavior_result, make_folders, run_script, scratch_env
@@ -393,6 +393,7 @@ class OptimizeTests(unittest.TestCase):
         self.assertTrue(slower["promote"])
 
     def test_a_multiline_list_is_replaced_whole_and_nothing_else_moves(self):
+        import tomllib
 
         from arete import optimize
 

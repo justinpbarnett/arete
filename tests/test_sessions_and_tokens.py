@@ -2,15 +2,16 @@ import base64
 import io
 import json
 import os
+from pathlib import Path
 import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
 import urllib.error
-from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 from arete import config, control, devices, gh, pipeline, sessions, verify
+
 from tests import support
 from tests.harness import behavior_result, make_folders, run_script, scratch_env
 

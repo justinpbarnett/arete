@@ -1,16 +1,17 @@
 import json
 import os
+from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
-from pathlib import Path
 from unittest import mock
-
 import arete
+
 from arete import paths, state, util
+
 from tests import support
 from tests.harness import bootstrap, make_folders, scratch_env
 

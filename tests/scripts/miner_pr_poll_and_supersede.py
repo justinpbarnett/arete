@@ -1,8 +1,6 @@
 
 from types import SimpleNamespace
-
 from arete import pipeline
-
 repo = config.Repo("race", root, github="example/race")
 cfg = config.Config(repos=[repo])
 logs = []

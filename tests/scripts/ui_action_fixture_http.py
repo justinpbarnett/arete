@@ -1,14 +1,8 @@
 
-import json
-import threading
-import unittest
-import urllib.error
-import urllib.request
+import json, threading, unittest, urllib.request, urllib.error
 from unittest import mock
-
 from arete import dashboard
 from tests.ui_action_fixture import server
-
 check = unittest.TestCase()
 instance = server()
 check.assertEqual(instance.server_address[0], '127.0.0.1')

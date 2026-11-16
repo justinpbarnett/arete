@@ -1,10 +1,10 @@
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
-from pathlib import Path
 
 from tests import support
 from tests.harness import behavior_result, inherited_env, make_folders, run_script, scratch_env, state_env

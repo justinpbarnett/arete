@@ -1,9 +1,9 @@
+from contextlib import nullcontext
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
-from contextlib import nullcontext
-from pathlib import Path
 
 SOURCE = Path(__file__).resolve().parent.parent
 TESTS = SOURCE / "tests"

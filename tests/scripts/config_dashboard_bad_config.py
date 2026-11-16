@@ -1,6 +1,5 @@
 
 from arete import dashboard
-
 write(BAD)
 server, said = quiet_server()
 server.run_pass()
@@ -10,7 +9,6 @@ class Host(dashboard.ScratchHost):
     def whois(self, address):
         return "me@example.com"
 import socket
-
 probe = socket.socket()
 probe.bind(("127.0.0.1", 0))
 port = probe.getsockname()[1]

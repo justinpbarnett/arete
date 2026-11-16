@@ -1,8 +1,6 @@
 
 from types import SimpleNamespace
-
 from arete import pipeline
-
 repo = config.Repo("landing", root, tracker="jira")
 cfg = config.Config(repos=[repo])
 cfg.jira.landed = {"staging": "Testing", "main": "Done"}

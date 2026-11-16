@@ -1,5 +1,7 @@
 import atexit
+import contextlib
 import hashlib
+import io
 import json
 import os
 import re
@@ -8,6 +10,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from datetime import timedelta
@@ -17,7 +20,7 @@ from unittest import mock
 
 CHECKOUT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(CHECKOUT))
-from arete import backup, cli, control, loop_run, migrations, paths, record, serve, state, util
+from arete import backup, cli, control, dashboard, loop_run, migrations, paths, record, serve, state, util
 
 TRACE = []
 

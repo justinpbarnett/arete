@@ -1,14 +1,16 @@
 import json
 import os
+from pathlib import Path
 import re
 import signal
 import subprocess
 import sys
 import tempfile
 import time
-import unittest
-from pathlib import Path
 from types import SimpleNamespace
+import unittest
+
+from arete import runner
 
 from tests import support
 from tests.harness import behavior_result, inherited_env, make_folders, run_script, scratch_env

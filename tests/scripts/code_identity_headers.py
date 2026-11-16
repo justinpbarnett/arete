@@ -1,11 +1,6 @@
 
-import json
-import threading
-import urllib.error
-import urllib.request
-
+import json, threading, urllib.request, urllib.error
 from arete import codebase, control, dashboard, paths, serve, state, util
-
 codebase.load()
 state.migrate()
 beating = serve.Server()

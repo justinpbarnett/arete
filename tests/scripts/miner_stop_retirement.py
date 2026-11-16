@@ -1,6 +1,5 @@
 
 from arete import control, pipeline, tasks
-
 repo = config.Repo("stopping", root)
 cfg = config.Config(repos=[repo])
 rid = made("stop", "needs-info", repo=repo.name, issue="R-1")

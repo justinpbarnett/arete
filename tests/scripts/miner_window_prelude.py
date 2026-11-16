@@ -1,8 +1,6 @@
 
-import os
-import re
+import dataclasses, os, re
 from datetime import UTC, datetime
-
 T0 = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
 GOOD = {"ok": True, "structured": {"proposals": []}}
 BAD = {"ok": False, "error": "model call failed"}
@@ -47,7 +45,7 @@ def mine(h, hours=None, dry_run=False, apply=False):
     return {"code": code, "out": text, "prompt": prompt, "status": row.get("status"),
             "mined_until": row.get("mined_until"), "summary": row.get("summary"),
             "heard": sorted(re.findall(r"\[tag:([^\]]+)\]", prompt)),
-            "events": sum(int(n) for n in re.findall(r"^- (\d+) x none tool/error", prompt, re.MULTILINE))}
+            "events": sum(int(n) for n in re.findall(r"^- (\d+) x none tool/error", prompt, re.M))}
 def nums(m):
     return sorted(float(x) for x in m["heard"])
 def slim(m):

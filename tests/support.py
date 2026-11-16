@@ -1,8 +1,8 @@
 import shlex
 import sys
 import tempfile
-import unittest
 from pathlib import Path
+import unittest
 from unittest import mock
 
 from arete import paths, pi, scratch, state

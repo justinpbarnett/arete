@@ -1,9 +1,11 @@
 import contextlib
+from dataclasses import asdict
 import functools
 import http.server
 import io
 import json
 import os
+from pathlib import Path
 import select
 import shlex
 import shutil
@@ -16,12 +18,10 @@ import tarfile
 import tempfile
 import threading
 import time
-import unittest
-import urllib.request
-from dataclasses import asdict
-from pathlib import Path
 from types import SimpleNamespace
+import unittest
 from unittest import mock
+import urllib.request
 
 import arete
 from arete import browser, codex, config, paths, pi, pipeline, runner, scratch, util, verify
@@ -1031,8 +1031,9 @@ class WalkTests(unittest.TestCase):
         with paths.directory_fd(self.scratch_root) as fd:
             self.assertEqual(sorted(os.listdir(fd)), ["config", "state"])
         (self.root / "link").symlink_to(self.closed)
-        with self.assertRaises(OSError), paths.directory_fd(self.root / "link" / "ws"):
-            pass
+        with self.assertRaises(OSError):
+            with paths.directory_fd(self.root / "link" / "ws"):
+                pass
 
     def test_isolated_state_opens_below_a_folder_it_cannot_list(self):
         state = self.scratch_root / "state"

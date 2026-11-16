@@ -1,6 +1,5 @@
 
 import subprocess
-
 mode = {"config": 1}
 execs = []
 def fake_sh(argv, **kw):

@@ -1,10 +1,7 @@
 
-import json
-import sys
-import time
+import json, sys, time
 from pathlib import Path
-
-from arete import chat, paths, record, state
+from arete import chat, config, paths, record, state
 
 root = Path(sys.argv[1])
 answers = root / "replay"

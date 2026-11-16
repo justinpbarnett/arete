@@ -1,12 +1,13 @@
 import argparse
 import os
+from pathlib import Path
 import re
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-from pathlib import Path
+
 
 LIVE_PATHS = ("/api/sidebar", "/api/live")
 
@@ -46,7 +47,6 @@ def sleeper():
 
 def ago(minutes):
     from datetime import timedelta
-
     from arete import util
 
     return util.iso(util.now() - timedelta(minutes=minutes))
@@ -146,6 +146,7 @@ def watch(run_id, process):
 
 
 def continuation(instance, row):
+    from arete import record
 
     with instance.fixture_lock:
         instance.sequence += 1

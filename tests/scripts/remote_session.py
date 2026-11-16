@@ -1,16 +1,7 @@
 
-import contextlib
-import json
-import os
-import shlex
-import shutil
-import subprocess
-import sys
-import urllib.request
+import contextlib, json, os, shlex, shutil, subprocess, sys, urllib.request
 from pathlib import Path
-
 from arete import config, devices, gh, record, sessions, state, util
-
 root = Path(sys.argv[1])
 state.migrate()
 VALUE = "fake-clone-value-0001"

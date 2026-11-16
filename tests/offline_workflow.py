@@ -113,28 +113,8 @@ def forbidden(*args, **kwargs):
 
 
 def main(root, scenario):
-    from arete import (
-        accounts,
-        alerts,
-        codebase,
-        config,
-        control,
-        environment,
-        factory,
-        flows,
-        gh,
-        owner_asks,
-        paths,
-        pipeline,
-        record,
-        replay,
-        run_lines,
-        runlimits,
-        runner,
-        state,
-        tasks,
-        vault,
-    )
+    from arete import (accounts, alerts, owner_asks, codebase, config, control, environment, factory, flows, gh, run_lines,
+                       paths, pipeline, record, replay, runlimits, runner, state, tasks, vault)
     state.migrate()
     scratch = None
     if importlib.util.find_spec("arete.scratch"):
