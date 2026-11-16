@@ -34,6 +34,7 @@ from .. import (
 )
 from ..agent import traits_of
 from ..diffguard import denied_paths
+from ..store import runs as run_store
 from ..util import engine_commit
 
 ATOMS = ("plan", "build", "check_repair")
@@ -575,8 +576,8 @@ def faults(exp: Experiment, run_id: str) -> dict:
 
 
 def usage(exp: Experiment, arm: str, run_id: str) -> dict:
-    rows = state.steps(run_id)
-    charged = state.paid_by_run([run_id], local_providers=exp.cfg.local_providers).get(run_id, 0.0)
+    rows = run_store.steps(run_id)
+    charged = run_store.paid_by_run([run_id], local_providers=exp.cfg.local_providers).get(run_id, 0.0)
     records = [framed(f) for f in record.record_files(run_id)]
     header, result = next(((h, r) for h, r in records if h.get("atom") == exp.atom), ({}, None))
     launched = bool(header) and not header.get("refused")
@@ -657,8 +658,8 @@ class TrialRun(evals.EvalRun):
         return {}
 
     def used(self) -> Totals:
-        rows = state.steps(self.id)
-        paid = state.paid_by_run([self.id], local_providers=self.config.local_providers).get(self.id, 0.0)
+        rows = run_store.steps(self.id)
+        paid = run_store.paid_by_run([self.id], local_providers=self.config.local_providers).get(self.id, 0.0)
         return Totals(self.before.spend + paid, self.before.calls + len(rows),
                       self.before.tokens + sum((r["tokens_in"] or 0) + (r["tokens_out"] or 0) for r in rows),
                       self.before.seconds + time.monotonic() - self.began)
@@ -764,7 +765,7 @@ def take_slot(exp: Experiment, path: Path, waiting: dict, used: Totals) -> tuple
             free = slots.slots_free_to_start(slots.live_max_parallel(exp.cfg.max_parallel))
             passed = state.tickets_passed_over()
             if free > 0 and not passed:
-                run_id = record.start("experiment", tag=tag, lock=state.run_lock("experiment", exp.repo.name),
+                run_id = record.start("experiment", tag=tag, lock=run_store.run_lock("experiment", exp.repo.name),
                                       repo=exp.repo.name)
                 held = slots.hold(exp.repo.name, None)
                 if since:
@@ -946,7 +947,7 @@ def dry_run(exp: Experiment, path: Path) -> int:
 
 def exclusive(repo_name: str, job) -> int:
     paths.ensure_dirs()
-    with util.lock(state.run_lock("experiment", repo_name)) as got:
+    with util.lock(run_store.run_lock("experiment", repo_name)) as got:
         if not got:
             print(f"an experiment is already running for {repo_name}")
             return 0

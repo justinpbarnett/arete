@@ -13,6 +13,7 @@ from functools import wraps
 from pathlib import Path
 
 from . import budget_legacy, paths, run_lines, state, util
+from .store import runs as run_store
 
 IDLE_WAITS = ("limit", "slot")
 CHECKPOINT_SECONDS = 30
@@ -115,11 +116,11 @@ def heads(repo, branch: str) -> dict[str, str]:
 
 
 def latest_park(repo: str, tid: str) -> tuple[dict, dict]:
-    rows = state.ticket_runs(repo, tid, limit=1)
+    rows = run_store.ticket_runs(repo, tid, limit=1)
     row = rows[0] if rows else {}
     for rid in family(row["id"]) if row else ():
         if saved := metadata(rid, "parked.json"):
-            return state.run_get(rid) or row, saved
+            return run_store.run_get(rid) or row, saved
     return row, {}
 
 
@@ -162,7 +163,7 @@ def counter(run_id: str, row: dict, field: str) -> float:
 
 
 def repair_count(run_id: str) -> int:
-    row = state.run_get(run_id) or {}
+    row = run_store.run_get(run_id) or {}
     if measured(run_id, row):
         return counter(run_id, row, "repair_calls")
     return budget_legacy.repair_count(run_id)
@@ -187,7 +188,7 @@ class Budget:
     def __init__(self, run, policy: Policy, previous: str, ticket=None, forced: bool = False) -> None:
         self.run, self.policy = run, policy
         chain = family(previous)
-        rows = {rid: state.run_get(rid) for rid in chain}
+        rows = {rid: run_store.run_get(rid) for rid in chain}
         if any(row is None or (row["repo"], str(row["issue"])) != (run.repo.name, str(run.tid))
                for row in rows.values()):
             raise ValueError("the repair budget chain names a different or missing ticket run")
@@ -205,7 +206,7 @@ class Budget:
         for row in kept:
             for cause, seconds in idle_waits(row["id"], row).items():
                 self.earlier_idle[cause] += seconds
-        own_row = state.run_get(run.id)
+        own_row = run_store.run_get(run.id)
         self.idle = idle_waits(run.id, own_row)
         self.idle_since = None
         self.idle_cause = ""
@@ -264,10 +265,9 @@ class Budget:
                 with state.tx() as conn:
                     compatibility = not contracted(conn)
                     self.compatibility = compatibility
-                    conn.execute("UPDATE runs SET active_seconds=?, verify_seconds=?, verify_open_seconds=?, "
-                                 "repair_calls=?, measured_at=? WHERE id=?",
-                                 (active, self.current_verification_seconds, verify_open,
-                                  self.repair_calls, at, self.run.id))
+                    run_store.note(self.run.id, active_seconds=active,
+                                   verify_seconds=self.current_verification_seconds,
+                                   verify_open_seconds=verify_open, repair_calls=self.repair_calls, measured_at=at)
             except sqlite3.Error as e:
                 self.run.log(f"budget checkpoint failed: {e}")
             if compatibility:
@@ -407,15 +407,15 @@ class Budget:
         run_lines.write(self.run.id, "budget_repair", call=step, atom=role, used=count + 1)
 
     def park(self, reason: str, kept: dict | None = None) -> dict:
-        row = state.run_get(self.run.id) or {}
+        row = run_store.run_get(self.run.id) or {}
         branch = str(row.get("branch") or next((r.get("branch") for rid in self.parents
-                     if (r := state.run_get(rid)) and r.get("branch")), ""))
+                     if (r := run_store.run_get(rid)) and r.get("branch")), ""))
         try:
             published = heads(self.run.repo, branch)
         except (OSError, ValueError, TimeoutError):
             published = None
         pr_url = str(row.get("pr_url") or next((r.get("pr_url") for rid in self.parents
-                     if (r := state.run_get(rid)) and r.get("pr_url")), ""))
+                     if (r := run_store.run_get(rid)) and r.get("pr_url")), ""))
         util.write_json(artifact(self.run.id, "parked.json"), {
             "reason": reason, "charged": self.charged, "policy": asdict(self.policy), "specification": self.specification,
             "heads": published, "branch": branch, "pr_url": pr_url, "kept": kept or {},

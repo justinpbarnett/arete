@@ -1,403 +1,65 @@
 from __future__ import annotations
 
 import json
-import math
-import os
 import secrets
 import sqlite3
-import threading
-import time
 from collections.abc import Sequence
-from contextlib import contextmanager, suppress
 from datetime import timedelta
 
-from . import dbstats, migrations, paths, util
-from .agent import billing_of
-from .migrations import m0002_foundation_time_shape as time_shape
+from . import util
 from .sighting import Sighting
+from .store import db as foundation
+from .store import runs as run_store
 
-TIME_COLUMNS = {**time_shape.TIME_COLUMNS, "runs": (*time_shape.TIME_COLUMNS["runs"], "measured_at")}
-TIME_GLOB = time_shape.TIME_GLOB
+LATEST = foundation.LATEST
+MIGRATE_WAIT_SECONDS = foundation.MIGRATE_WAIT_SECONDS
+NEEDED = foundation.NEEDED
+TIME_COLUMNS = {**foundation.TIME_COLUMNS, "runs": (*foundation.TIME_COLUMNS["runs"], "measured_at")}
+TIME_GLOB = foundation.TIME_GLOB
+IncompatibleSchema = foundation.IncompatibleSchema
+NoDatabase = foundation.NoDatabase
+checked_connection = foundation.checked_connection
+contract_blockers = foundation.contract_blockers
+db = foundation.db
+ensure_schema = foundation.ensure_schema
+execute_statements = foundation.execute_statements
+migrate = foundation.migrate
+missing_database = foundation.missing_database
+one_read = foundation.one_read
+owned = foundation.owned
+owning_transaction = foundation.owning_transaction
+read_connection = foundation.read_connection
+reader = foundation.reader
+refuse_empty_file = foundation.refuse_empty_file
+tx = foundation.tx
 
-_CHAIN = migrations.load()
-LATEST = _CHAIN[-1].n
-NEEDED = max(m.n for m in _CHAIN if m.phase != "contract")
-MIGRATE_WAIT_SECONDS = 60
-_CHECKED = set()
-_OWNER = threading.local()
-
-
-class NoDatabase(RuntimeError):
-    pass
-
-
-class IncompatibleSchema(RuntimeError):
-    pass
-
-
-OPEN_PR_RUN = "(runs.status = 'pr' OR (runs.status IN ('failed', 'stopped') AND runs.pr_url != ''))"
+OPEN_PR_RUN = run_store.OPEN_PR_RUN
 DECIDABLE = ("pending", "failed")
 APPROVAL_NOTES = ("plain_summary", "plain_summary_tried", "review", "review_tried")
-WHOLE_RUN = "COALESCE(only_step, '') = ''"
+WHOLE_RUN = run_store.WHOLE_RUN
 USAGE_COLUMNS = ("at", "tab", "device", "kind", "view", "name", "via", "ms")
 REFRESH_SCOPE = "credential-refresh-v1:"
 
 
-def refuse_empty_file() -> None:
-    if paths.DB_FILE.exists() and paths.DB_FILE.stat().st_size > 0:
-        return
-    from . import backup
-
-    if newest := backup.newest_snapshot():
-        raise NoDatabase(f"{paths.DB_FILE} is missing or empty but {newest} exists; stop arete serve and run "
-                         f"`arete backup --restore {newest}` instead of starting over with an empty file")
+backfill_legacy_cost = run_store.backfill_legacy_cost
 
 
-def missing_database():
-    refuse_empty_file()
-    return NoDatabase(f"{paths.DB_FILE} is missing; run arete serve or arete migrate")
+cost_drift = run_store.cost_drift
 
 
-def contract_blockers(conn, n):
-    from . import control, record
-
-    blockers = []
-    for row in conn.execute("SELECT * FROM runs WHERE status = 'running' "
-                            "AND (schema_version IS NULL OR schema_version < ?)", (n,)):
-        row = dict(row)
-        with record.dead(row) as gone:
-            if not gone:
-                blockers.append(row["id"])
-    beat = util.read_json(control.BEAT_FILE, {})
-    if util.pid_alive(beat.get("pid")) and (beat.get("schema") or 0) < n:
-        blockers.append(f"serve {beat.get('pid')}")
-    return blockers
+FIRINGS = run_store.FIRINGS
 
 
-def execute_statements(conn, sql):
-    pending = ""
-    for char in sql:
-        pending += char
-        if char == ";" and sqlite3.complete_statement(pending):
-            conn.execute(pending)
-            pending = ""
-    if pending.strip():
-        conn.execute(pending)
+runs = run_store.runs
 
 
-def migrate(contracts=True):
-    from . import backup
-
-    chain = migrations.load()
-    paths.ensure_dirs()
-    with util.lock("migrate", wait=True):
-        refuse_empty_file()
-        conn = paths.connect_db(paths.DB_FILE, create=True)
-        conn.row_factory = sqlite3.Row
-        try:
-            version = conn.execute("PRAGMA user_version").fetchone()[0]
-            migrations.validate(conn, chain, version)
-            conn.close()
-            conn = None
-            snapshot = None
-            started_chain = False
-            for migration in chain:
-                if migration.n <= version:
-                    continue
-                if migration.phase == "contract":
-                    if not contracts:
-                        return True
-                    conn = paths.connect_db(paths.DB_FILE)
-                    conn.row_factory = sqlite3.Row
-                    try:
-                        blockers = contract_blockers(conn, migration.n)
-                    finally:
-                        conn.close()
-                        conn = None
-                    if blockers:
-                        print(f"migration {migration.name} waits for {', '.join(blockers)}", flush=True)
-                        return True
-                if not started_chain:
-                    if paths.DB_FILE.stat().st_size:
-                        snapshot = backup.snapshot(f"m{migration.n}")
-                    started_chain = True
-                started = time.monotonic()
-                try:
-                    timing = dbstats.Timing(paths.DB_FILE, "write")
-                    with owning_transaction(lambda: paths.connect_db(paths.DB_FILE), "BEGIN EXCLUSIVE", timing) as writer:
-                        if migration.sql is not None:
-                            execute_statements(writer, migration.sql)
-                        else:
-                            migration.apply(writer)
-                        writer.execute("INSERT INTO schema_migrations "
-                                       "(n, name, area, phase, sha256, applied, backup, seconds) VALUES (?,?,?,?,?,?,?,?)",
-                                       (migration.n, migration.name, migration.area, migration.phase, migration.sha256,
-                                        util.iso(), snapshot.name if snapshot else "", time.monotonic() - started))
-                        writer.execute("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'",
-                                       (str(migration.n),))
-                        writer.execute(f"PRAGMA user_version = {migration.n}")
-                except BaseException as e:
-                    raise migrations.Refused(f"{migration.name}: {e}") from e
-                version = migration.n
-                print(f"applied {migration.name}", flush=True)
-            backup.finish_restore()
-            return False
-        finally:
-            if conn is not None:
-                conn.close()
+run_facets = run_store.run_facets
 
 
-def checked_connection():
-    from . import backup
-
-    if backup.pending_restore():
-        raise IncompatibleSchema("pending restore requires arete serve or arete migrate before writing")
-    try:
-        identity = paths.DB_FILE.stat()
-    except FileNotFoundError:
-        if not paths.ISOLATED:
-            raise missing_database() from None
-        migrate()
-        identity = paths.DB_FILE.stat()
-    if identity.st_size == 0:
-        refuse_empty_file()
-    try:
-        conn = paths.connect_db(paths.DB_FILE)
-    except (sqlite3.OperationalError, FileNotFoundError):
-        if not paths.DB_FILE.exists():
-            raise missing_database() from None
-        raise
-    try:
-        key = (os.getpid(), str(paths.DB_FILE), identity.st_dev, identity.st_ino,
-               getattr(identity, "st_birthtime", None), LATEST, NEEDED)
-        if key not in _CHECKED:
-            version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if paths.ISOLATED and version == 0:
-                conn.close()
-                migrate()
-                return checked_connection()
-            deadline = time.monotonic() + MIGRATE_WAIT_SECONDS
-            if version < NEEDED:
-                print(f"schema {version} waits for schema {NEEDED}; run arete serve or arete migrate", flush=True)
-            while version < NEEDED:
-                if time.monotonic() >= deadline:
-                    raise IncompatibleSchema(f"schema {version} needs {NEEDED}; run arete serve or arete migrate")
-                time.sleep(0.5)
-                version = conn.execute("PRAGMA user_version").fetchone()[0]
-            oldest = int(conn.execute("SELECT value FROM schema_meta WHERE key = 'oldest_writer'").fetchone()[0])
-            if oldest > LATEST:
-                raise IncompatibleSchema(f"oldest_writer {oldest} is above this code's schema {LATEST}")
-            _CHECKED.add(key)
-        return conn
-    except BaseException:
-        with suppress(BaseException):
-            conn.close()
-        raise
+paid_by_run = run_store.paid_by_run
 
 
-@contextmanager
-def owning_transaction(connect, begin="BEGIN IMMEDIATE", timing=None, *, commit=True):
-    conn = None
-    failed = False
-    try:
-        conn = connect()
-        conn.row_factory = sqlite3.Row
-        conn.execute(begin)
-        if timing:
-            timing.begun()
-        yield conn
-        if commit:
-            if timing:
-                timing.committing()
-            try:
-                conn.execute("COMMIT")
-            finally:
-                if timing:
-                    timing.committed()
-    except BaseException as e:
-        failed = True
-        if timing:
-            timing.error = type(e).__name__
-            timing.sqlite_error = isinstance(e, sqlite3.Error)
-        if conn is not None:
-            with suppress(BaseException):
-                conn.execute("ROLLBACK")
-        raise
-    finally:
-        try:
-            if conn is not None:
-                if failed:
-                    with suppress(BaseException):
-                        conn.close()
-                else:
-                    conn.close()
-        finally:
-            if timing:
-                timing.finished()
-
-
-def read_connection():
-    try:
-        return paths.connect_db(paths.DB_FILE, readonly=True)
-    except (sqlite3.OperationalError, FileNotFoundError):
-        if not paths.DB_FILE.exists():
-            raise missing_database() from None
-        raise
-
-
-@contextmanager
-def owned(mode):
-    active = getattr(_OWNER, "active", None)
-    if active and active[0] == os.getpid():
-        _, held_mode, conn = active
-        if held_mode == "read" and mode == "write":
-            raise RuntimeError("cannot promote a read snapshot to a writer")
-        yield conn
-        return
-    timing = dbstats.Timing(paths.DB_FILE, mode)
-    connect = checked_connection if mode == "write" else read_connection
-    try:
-        with owning_transaction(connect, "BEGIN IMMEDIATE" if mode == "write" else "BEGIN", timing,
-                                commit=mode == "write") as conn:
-            _OWNER.active = (os.getpid(), mode, conn)
-            yield conn
-    finally:
-        _OWNER.active = None
-
-
-@contextmanager
-def tx():
-    with owned("write") as conn:
-        yield conn
-
-
-db = tx
-
-
-@contextmanager
-def one_read():
-    with owned("read") as conn:
-        yield conn
-
-
-@contextmanager
-def reader():
-    with one_read() as conn:
-        yield conn
-
-
-def ensure_schema() -> None:
-    with db():
-        pass
-
-
-def backfill_legacy_cost(before: dict | None = None) -> int:
-    before = {} if before is None else before
-    if not isinstance(before, dict) or any(not isinstance(k, str) or isinstance(v, bool)
-                                         or not isinstance(v, (int, float))
-                                         for k, v in before.items()):
-        raise ValueError("before must map run IDs to finite dollar amounts")
-    try:
-        before = {k: float(v) for k, v in before.items()}
-    except OverflowError:
-        raise ValueError("before must map run IDs to finite dollar amounts") from None
-    if any(not math.isfinite(v) for v in before.values()):
-        raise ValueError("before must map run IDs to finite dollar amounts")
-    with db() as c:
-        missing = sorted(set(before) - {r[0] for r in c.execute("SELECT id FROM runs")})
-        if missing:
-            raise ValueError(f"no run: {missing[0]}")
-        c.execute("""
-            WITH totals AS MATERIALIZED (
-                SELECT run_id, SUM(cost_usd) AS usd, SUM(tokens_in) AS tin, SUM(tokens_out) AS tout
-                FROM steps GROUP BY run_id
-            ), eligible AS MATERIALIZED (
-                SELECT runs.id, runs.started, COALESCE(runs.cost_usd, 0) AS usd,
-                       COALESCE(totals.usd, 0) AS spent,
-                       COALESCE(runs.tokens_in, 0) - COALESCE(totals.tin, 0) AS tin,
-                       COALESCE(runs.tokens_out, 0) - COALESCE(totals.tout, 0) AS tout,
-                       edits.value AS old
-                FROM runs LEFT JOIN totals ON totals.run_id = runs.id
-                LEFT JOIN json_each(?) AS edits ON edits.key = runs.id
-                WHERE runs.started < (SELECT MIN(ts) FROM steps)
-                  AND COALESCE(runs.cost_usd, 0) != COALESCE(totals.usd, 0)
-            )
-            INSERT INTO steps (run_id, step, kind, runner, ok, auth_mode, ts,
-                               cost_usd, tokens_in, tokens_out, error)
-            SELECT id, 'legacy', 'legacy', 'legacy', 1, 'subscription', started,
-                   COALESCE(old, usd) - spent, tin, tout, '' FROM eligible
-            UNION ALL
-            SELECT id, 'correction', 'correction', 'correction', 1, 'subscription', started,
-                   usd - old, 0, 0, 'legacy repricing from supplied before value'
-            FROM eligible WHERE old IS NOT NULL AND usd != old
-        """, (json.dumps(before),))
-        return c.execute("SELECT changes()").fetchone()[0]
-
-
-def cost_drift(connect=reader) -> list[dict]:
-    with connect() as c:
-        return [dict(r) for r in c.execute("""
-            SELECT runs.id, COALESCE(runs.cost_usd, 0) AS run_usd,
-                   COALESCE(t.usd, 0) AS steps_usd,
-                   COALESCE(runs.cost_usd, 0) - COALESCE(t.usd, 0) AS difference
-            FROM runs LEFT JOIN (SELECT run_id, SUM(cost_usd) AS usd FROM steps GROUP BY run_id) t
-            ON t.run_id = runs.id
-            WHERE ABS(COALESCE(runs.cost_usd, 0) - COALESCE(t.usd, 0)) > 0.000001
-            ORDER BY runs.id
-        """)]
-
-
-FIRINGS = ("(runs.kind = 'loop' AND runs.loop_kind = 'command' AND runs.status IN ('done', 'skipped') "
-           "AND COALESCE(runs.cost_usd, 0) = 0)")
-
-
-def runs(kind: str | None = None, repo: str | None = None, limit: int = 50, connect=reader, loop: str | None = None,
-         firings: bool = False, statuses: tuple[str, ...] = (), running_first: bool = False) -> list[dict]:
-    q, args = "SELECT * FROM runs WHERE 1=1", []
-    if not firings:
-        q += f" AND NOT {FIRINGS}"
-    for column, value in (("kind", kind), ("loop", loop), ("repo", repo)):
-        if value:
-            q += f" AND {column} = ?"
-            args.append(value)
-    if statuses:
-        q += f" AND status IN ({','.join('?' * len(statuses))})"
-        args.extend(statuses)
-    q += " ORDER BY " + ("status = 'running' DESC, " if running_first else "") + "started DESC, rowid DESC LIMIT ?"
-    args.append(limit)
-    with connect() as c:
-        return [dict(r) for r in c.execute(q, args)]
-
-
-def run_facets(connect=reader) -> dict[str, list[str]]:
-    with connect() as c:
-        return {column: [r[0] for r in c.execute(f"SELECT DISTINCT {column} FROM runs WHERE NOT {FIRINGS} "
-                                                 f"AND COALESCE({column}, '') != '' ORDER BY 1")]
-                for column in ("kind", "repo", "loop")}
-
-
-def paid_by_run(run_ids: list[str], connect=reader, local_providers=None) -> dict[str, float]:
-    if not run_ids:
-        return {}
-    if local_providers is None:
-        from . import config
-
-        local_providers = config.load().local_providers
-    paid: dict[str, float] = {}
-    with connect() as c:
-        rows = c.execute("SELECT run_id, cost_usd, runner, provider, model, auth_mode FROM steps "
-                         f"WHERE run_id IN ({','.join('?' * len(run_ids))})", run_ids)
-        for r in rows:
-            if billing_of(dict(r), local_providers) == "api_key":
-                paid[r[0]] = paid.get(r[0], 0.0) + float(r["cost_usd"] or 0)
-    return {k: round(v, 6) for k, v in paid.items()}
-
-
-def merged_runs(connect=reader) -> list[dict]:
-    with connect() as c:
-        return [dict(r) for r in c.execute(
-            f"SELECT * FROM runs WHERE kind = 'pipeline' AND status = 'merged' AND {WHOLE_RUN} "
-            "AND COALESCE(pr_url, '') != '' ORDER BY finished, id")]
+merged_runs = run_store.merged_runs
 
 
 def source_seen(source: str, connect=reader) -> set[str]:
@@ -405,87 +67,46 @@ def source_seen(source: str, connect=reader) -> set[str]:
         return {r[0] for r in c.execute("SELECT key FROM seen WHERE source = ?", (source,))}
 
 
-def runs_since(since: str, connect=reader) -> list[dict]:
-    with connect() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM runs WHERE started >= ? ORDER BY started", (since,))]
+runs_since = run_store.runs_since
 
 
-def runs_reading_pr_comments(rejected_since: str, limit: int = 200) -> list[dict]:
-    with reader() as c:
-        return [dict(r) for r in c.execute(f"SELECT * FROM runs WHERE kind = 'pipeline' AND pr_url != '' "
-                                           f"AND ({OPEN_PR_RUN} OR (status = 'rejected' AND finished >= ?)) "
-                                           "ORDER BY started DESC LIMIT ?", (rejected_since, limit))]
+runs_reading_pr_comments = run_store.runs_reading_pr_comments
 
 
-def open_runs(repo: str, issue: int | str) -> list[dict]:
-    with reader() as c:
-        return [dict(r) for r in c.execute(f"SELECT * FROM runs WHERE repo = ? AND issue = ? AND {OPEN_PR_RUN} "
-                                           "ORDER BY started DESC", (repo, issue))]
+open_runs = run_store.open_runs
 
 
-def run_lock(kind: str, repo: str | None = None, issue: int | str | None = None) -> str:
-    return {"pipeline": f"run-{repo}-{issue}", "slot": f"slot-{repo}-{issue}", "slot-wait": f"slot-wait-{repo}-{issue}",
-            "eval": f"eval-{repo}", "experiment": f"experiment-{repo}", "eval-mine": "eval-mine", "miner": "mine"}[kind]
+run_lock = run_store.run_lock
 
 
-def loop_lock(name: str) -> str:
-    return "loop-" + name.replace("/", ".")
+loop_lock = run_store.loop_lock
 
 
-def run_get(run_id: str, connect=reader) -> dict | None:
-    with connect() as c:
-        r = c.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
-        return dict(r) if r else None
+run_get = run_store.run_get
 
 
-def save_report(run_id: str, report: dict, connect=db) -> None:
-    with connect() as c:
-        c.execute("INSERT OR REPLACE INTO reports (run_id, saved, report) VALUES (?, ?, ?)",
-                  (run_id, util.iso(), json.dumps(report)))
+save_report = run_store.save_report
 
 
-def report(run_id: str, connect=reader) -> dict | None:
-    with connect() as c:
-        r = c.execute("SELECT report FROM reports WHERE run_id = ?", (run_id,)).fetchone()
-    try:
-        found = json.loads(r["report"]) if r else None
-    except ValueError:
-        return None
-    return found if isinstance(found, dict) else None
+report = run_store.report
 
 
-def steps(run_id: str, connect=reader) -> list[dict]:
-    with connect() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM steps WHERE run_id = ? ORDER BY id", (run_id,))]
+steps = run_store.steps
 
 
-def step_tries(run_id: str, step: str) -> int:
-    with reader() as c:
-        return c.execute("SELECT COALESCE(MAX(try), 0) FROM steps WHERE run_id = ? AND step = ?", (run_id, step)).fetchone()[0]
+step_tries = run_store.step_tries
 
 
-def steps_since(since: str, connect=reader) -> list[dict]:
-    with connect() as c:
-        rows = [dict(r) for r in c.execute("SELECT steps.*, r.loop, r.kind AS run_kind, r.repo FROM steps "
-                                           "LEFT JOIN runs r ON r.id = steps.run_id WHERE steps.ts >= ? "
-                                           "ORDER BY steps.ts", (since,))]
-    return [{**d, "task_kind": d.get("kind") or "", "kind": d["run_kind"]} for d in rows]
+steps_since = run_store.steps_since
 
 
-def add_feed(run_id: str, kind: str, text: str) -> None:
-    insert_feed(run_id, kind, text)
+add_feed = run_store.add_feed
 
 
-def insert_feed(run_id: str, kind: str, text: str) -> None:
-    with tx() as c:
-        c.execute("INSERT INTO feed (run_id, ts, kind, text) VALUES (?,?,?,?)",
-                  (run_id, util.iso(), kind, util.both_ends(text, 4000)))
+insert_feed = run_store.insert_feed
 
 
-def feed(run_id: str, after: int = 0, connect=reader) -> list[dict]:
-    with connect() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM feed WHERE run_id = ? AND id > ? ORDER BY id",
-                                           (run_id, after))]
+feed = run_store.feed
 
 
 def loop_state(name: str, connect=reader) -> dict:
@@ -709,26 +330,8 @@ CLOSED_AT = "COALESCE(NULLIF(closed, ''), last_seen)"
 
 def prune(days: float = 14, keep_days: float = 30, lines_days: float = 90) -> None:
     since = util.iso(util.now() - timedelta(days=days))
-    lines_since, now = util.iso(util.now() - timedelta(days=lines_days)), util.iso()
     with db() as c:
-        c.execute(f"INSERT OR IGNORE INTO run_purges SELECT id, 'firing', ? FROM runs "
-                  f"WHERE {FIRINGS} AND started < ?", (now, since))
-        c.execute(f"DELETE FROM feed WHERE run_id IN (SELECT id FROM runs WHERE {FIRINGS} AND started < ?)", (since,))
-        c.execute(f"DELETE FROM runs WHERE {FIRINGS} AND started < ?", (since,))
-        eligible = c.execute(
-            "SELECT id FROM runs WHERE files_purged IS NULL AND COALESCE(finished, started) < ? "
-            "AND status NOT IN ('running', 'pr', 'needs-info') "
-            "AND NOT EXISTS (SELECT 1 FROM record_pins WHERE run_id = runs.id) "
-            "AND NOT EXISTS (SELECT 1 FROM asks WHERE run = runs.id AND "
-            "(status = 'open' OR (status = 'answered' AND COALESCE(taken_by, '') = ''))) "
-            "AND NOT EXISTS (SELECT 1 FROM proposals WHERE "
-            "(status IS NULL OR status NOT IN ('merged', 'rejected', 'skipped', 'filed')) "
-            "AND (run_id = runs.id OR instr(COALESCE(evidence, ''), runs.id) > 0)) "
-            "AND NOT EXISTS (SELECT 1 FROM runs recent WHERE recent.repo = runs.repo "
-            "AND recent.issue = runs.issue AND recent.started >= ?)", (lines_since, lines_since)).fetchall()
-        for row in eligible:
-            c.execute("INSERT OR IGNORE INTO run_purges VALUES (?, 'lines', ?)", (row["id"], now))
-            c.execute("UPDATE runs SET files_purged = ? WHERE id = ?", (now, row["id"]))
+        run_store.prune(c, days, lines_days)
         c.execute("DELETE FROM queue WHERE dead_at < ?", (util.iso(util.now() - timedelta(days=days * 4)),))
         c.execute("DELETE FROM events WHERE ts < ?", (util.iso(util.now() - timedelta(days=days * 4)),))
         old = util.iso(util.now() - timedelta(days=days * 4))
@@ -1139,16 +742,7 @@ def busy_chats() -> list[int]:
         return [r[0] for r in c.execute("SELECT id FROM chats WHERE busy = 1 ORDER BY id")]
 
 
-def loop_spent_since(since: str, loop: str | None = None, local_providers=()) -> float:
-    q = ("SELECT steps.cost_usd, steps.runner, steps.provider, steps.model, steps.auth_mode FROM steps "
-         "JOIN runs r ON r.id = steps.run_id WHERE steps.ts >= ? AND r.kind = 'loop'")
-    args: list = [since]
-    if loop:
-        q += " AND r.loop = ?"
-        args.append(loop)
-    with reader() as c:
-        return sum(float(r["cost_usd"] or 0) for r in c.execute(q, args)
-                   if billing_of(dict(r), local_providers) == "api_key")
+loop_spent_since = run_store.loop_spent_since
 
 
 def hold(scope: str, until: str, why: str) -> None:
@@ -1264,9 +858,7 @@ def drop_passed_over(repo: str, keep: str = "") -> None:
         c.execute("DELETE FROM passed_over WHERE repo = ? AND issue != ?", (repo, str(keep)))
 
 
-def runs_marked_running(connect=reader) -> list[dict]:
-    with connect() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM runs WHERE status = 'running' ORDER BY started")]
+runs_marked_running = run_store.runs_marked_running
 
 
 def add_vm(name: str, run_id: str | None, device: dict, vmid: int | None = None, connect=db) -> None:
@@ -1309,91 +901,40 @@ def vms_left_over(probes_created_before: str, connect=reader) -> list[dict]:
             (probes_created_before,))]
 
 
-def ticket_runs(repo: str, issue: int | str, limit: int = 10, connect=reader, whole: bool = False) -> list[dict]:
-    with connect() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "
-                                           + (f"AND {WHOLE_RUN} " if whole else "")
-                                           + "ORDER BY started DESC, rowid DESC LIMIT ?", (repo, issue, limit))]
+ticket_runs = run_store.ticket_runs
 
 
-def newest_whole_run(repo: str, issue: int | str) -> dict | None:
-    return next(iter(ticket_runs(repo, issue, limit=1, whole=True)), None)
+newest_whole_run = run_store.newest_whole_run
 
 
-def ticket_runs_marked_running(repo: str, issue: int | str, connect=reader) -> list[dict]:
-    with connect() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "
-                                           "AND status = 'running' ORDER BY started ASC, rowid ASC", (repo, issue))]
+ticket_runs_marked_running = run_store.ticket_runs_marked_running
 
 
-def ab_placements(since: str, name: str = "", connect=reader) -> list[dict]:
-    with connect() as c:
-        labelled = [dict(r) for r in c.execute(
-            "SELECT DISTINCT steps.ab, steps.ab_side, steps.atom, r.repo, r.issue FROM steps "
-            "JOIN runs r ON r.id = steps.run_id WHERE COALESCE(steps.ab, '') != '' AND r.kind = 'pipeline' "
-            "AND r.started >= ?" + (" AND steps.ab = ?" if name else ""), (since, *([name] if name else [])))]
-        held = c.execute("SELECT repo, issue, ab_held FROM runs WHERE kind = 'pipeline' AND started >= ? "
-                         "AND COALESCE(ab_held, '') != ''", (since,)).fetchall()
-    assigned = [{"ab": ab, "ab_side": side, "atom": role, "repo": r["repo"], "issue": r["issue"]}
-                for r in held for role, (ab, side, _) in json.loads(r["ab_held"]).items() if not name or ab == name]
-    return list({tuple(p.values()): p for p in labelled + assigned}.values())
+ab_placements = run_store.ab_placements
 
 
-def ab_held(run_id: str, connect=reader) -> dict[str, tuple[str, str, dict]]:
-    with connect() as c:
-        row = c.execute("SELECT ab_held FROM runs WHERE id = ?", (run_id,)).fetchone()
-    return {role: tuple(held) for role, held in json.loads(row["ab_held"] or "{}").items()} if row else {}
+ab_held = run_store.ab_held
 
 
-def ticket_runs_since(repo: str, issue: int | str, since: str, connect=reader) -> list[dict]:
-    with connect() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "
-                                           "AND started >= ? ORDER BY started", (repo, issue, since))]
+ticket_runs_since = run_store.ticket_runs_since
 
 
-def later_run(repo: str, issue: int | str, run_id: str, connect=reader) -> dict | None:
-    with connect() as c:
-        r = c.execute(f"SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? AND {WHOLE_RUN} "
-                      "AND rowid > (SELECT rowid FROM runs WHERE id = ?) ORDER BY rowid LIMIT 1",
-                      (repo, issue, run_id)).fetchone()
-        return dict(r) if r else None
+later_run = run_store.later_run
 
 
-def interrupted_tickets(repo: str) -> list[str]:
-    with reader() as c:
-        rows = c.execute(f"SELECT issue, status FROM runs WHERE kind = 'pipeline' AND repo = ? AND {WHOLE_RUN} "
-                         "AND rowid = (SELECT r2.rowid FROM runs r2 WHERE r2.kind = 'pipeline' "
-                         "AND r2.repo = runs.repo AND r2.issue = runs.issue AND COALESCE(r2.only_step, '') = '' "
-                         "ORDER BY r2.started DESC, r2.rowid DESC LIMIT 1) "
-                         "ORDER BY started, rowid", (repo,))
-        return [str(r["issue"]) for r in rows if r["status"] == "interrupted"]
+interrupted_tickets = run_store.interrupted_tickets
 
 
-def last_pipeline_starts() -> dict[str, str]:
-    with reader() as c:
-        return {r[0]: r[1] for r in c.execute("SELECT repo, MAX(started) FROM runs WHERE kind = 'pipeline' "
-                                              "GROUP BY repo")}
+last_pipeline_starts = run_store.last_pipeline_starts
 
 
-def running_run(repo: str, issue: int | str, connect=reader) -> dict | None:
-    with connect() as c:
-        r = c.execute("SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? AND status = 'running' "
-                      "ORDER BY started DESC, rowid DESC LIMIT 1", (repo, issue)).fetchone()
-        return dict(r) if r else None
+running_run = run_store.running_run
 
 
-def pending_label(repo: str, issue: int | str) -> str:
-    with reader() as c:
-        r = c.execute("SELECT label_pending FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "
-                      "AND label_pending IS NOT NULL ORDER BY started DESC, rowid DESC LIMIT 1",
-                      (repo, issue)).fetchone()
-        return r["label_pending"] if r else ""
+pending_label = run_store.pending_label
 
 
-def issue_running(repo: str, issue: int | str) -> bool:
-    with reader() as c:
-        return c.execute("SELECT 1 FROM runs WHERE repo = ? AND issue = ? AND status = 'running' LIMIT 1",
-                         (repo, issue)).fetchone() is not None
+issue_running = run_store.issue_running
 
 
 def probe_get(name: str) -> dict | None:
@@ -1467,20 +1008,13 @@ def add_proposal(run_id: str, p: dict, status: str, pr_url: str = "") -> None:
 RELEASING_PROPOSALS = ("rejected", "skipped", "filed")
 
 
-def pin_record(run_id: str) -> bool:
-    with db() as c:
-        return c.execute("INSERT OR IGNORE INTO record_pins (run_id, pinned) VALUES (?, ?)",
-                         (run_id, util.iso())).rowcount > 0
+pin_record = run_store.pin_record
 
 
-def unpin_record(run_id: str) -> bool:
-    with db() as c:
-        return c.execute("DELETE FROM record_pins WHERE run_id = ?", (run_id,)).rowcount > 0
+unpin_record = run_store.unpin_record
 
 
-def record_pins(connect=reader) -> set[str]:
-    with connect() as c:
-        return {r["run_id"] for r in c.execute("SELECT run_id FROM record_pins")}
+record_pins = run_store.record_pins
 
 
 def runs_cited_by_kept_proposals(run_ids, connect=reader) -> set[str]:
@@ -1550,9 +1084,7 @@ def task_history(repo: str, task: str, limit: int = 5, source: str = BASELINE_SO
         return [{**dict(r), "passed": bool(r["passed"])} for r in rows]
 
 
-def last_step_id(run_id: str) -> int:
-    with reader() as c:
-        return c.execute("SELECT COALESCE(MAX(id), 0) FROM steps WHERE run_id = ?", (run_id,)).fetchone()[0]
+last_step_id = run_store.last_step_id
 
 
 def eval_rows(run_id: str) -> list[dict]:
@@ -1598,7 +1130,7 @@ def feedback_due(repo: str, quiet_since: str) -> list[str]:
     with reader() as c:
         rows = c.execute("SELECT issue, MAX(at_once) AS at_once, MAX(created) AS last FROM feedback f "
                          "WHERE repo = ? AND status = 'new' AND EXISTS (SELECT 1 FROM runs WHERE runs.repo = f.repo "
-                         f"AND runs.issue = f.issue AND {OPEN_PR_RUN} "
+                         f"AND runs.issue = f.issue AND {run_store.OPEN_PR_RUN} "
                          "AND ' ' || runs.pr_url || ' ' LIKE '% ' || f.pr_url || ' %') "
                          "GROUP BY issue ORDER BY last", (repo,))
         return [str(r["issue"]) for r in rows if r["at_once"] or r["last"] <= quiet_since]

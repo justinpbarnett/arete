@@ -27,6 +27,7 @@ from . import (
     util,
     workspace,
 )
+from .store import runs as run_store
 
 
 @dataclass
@@ -48,7 +49,7 @@ def launchd_table() -> dict[str, tuple[str, str]]:
 
 
 def check_costs() -> list[Check]:
-    drift = state.cost_drift()
+    drift = run_store.cost_drift()
     detail = (f"{len(drift)} runs differ from steps by ${sum(abs(r['difference']) for r in drift):.6f}: "
               + ", ".join(r["id"] for r in drift[:5])) if drift else "run costs equal their steps"
     return [Check("costs:drift", not drift, detail)]
@@ -392,7 +393,7 @@ def check_loops(cfg: config.Config) -> list[Check]:
     for loop in loops.load_all(cfg):
         if not loop.enabled or loop.error or not loop.stale_hours or loop.name == os.environ.get("ARETE_LOOP"):
             continue
-        last = next((r for r in state.runs(kind="loop", loop=loop.name, limit=10, firings=True)
+        last = next((r for r in run_store.runs(kind="loop", loop=loop.name, limit=10, firings=True)
                      if r["status"] != "running"), None)
         if not last:
             continue

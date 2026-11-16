@@ -31,6 +31,8 @@ from . import (
     vault,
 )
 from .agent import EDIT_TOOLS, NO_SESSION, Session
+from .store import db as foundation
+from .store import runs as run_store
 
 TOKEN_HELPER = ('!f() { test "$1" = get || return 0; p= h=; while IFS= read -r line && test -n "$line"; do '
                 'case $line in protocol=*) p=${line#*=} ;; host=*) h=${line#*=} ;; esac; done; '
@@ -236,7 +238,7 @@ def launch(prompt: str, *, device: str = "local", model: str = "", run_with: str
     if chat:
         state.chat_link_session(chat, spec.id, budget_usd)
     clone = f" (a clone of {spec.github} on {spec.branch} from {spec.base})" if spec.github else ""
-    state.add_feed(spec.id, "start", f"{which} {name} on {spec.device} in {paths.short_path(spec.cwd)}{clone}; tools "
+    run_store.add_feed(spec.id, "start", f"{which} {name} on {spec.device} in {paths.short_path(spec.cwd)}{clone}; tools "
                                      f"{', '.join(tools) or 'none'}" + "".join(f"; {', '.join(withheld)} off: {reason}"
                                                                 for reason, withheld in off.items())
                    + ("; a task: it ends with a report" if task else ""))
@@ -251,7 +253,7 @@ def send(session_id: str, text: str) -> dict:
     text = text.strip()
     if not text:
         raise control.Refused("write a message first")
-    r = state.run_get(session_id)
+    r = run_store.run_get(session_id)
     if not r or r["kind"] != "session":
         raise control.NotFound(f"no session {session_id}")
     if r["status"] != "running":
@@ -262,7 +264,7 @@ def send(session_id: str, text: str) -> dict:
 
 def log_line(spec: Spec, kind: str, text: str) -> None:
     write_log(spec, kind, text)
-    state.add_feed(spec.id, kind, text)
+    run_store.add_feed(spec.id, kind, text)
 
 
 def write_log(spec: Spec, kind: str, text: str) -> None:
@@ -313,7 +315,7 @@ def handover(spec: Spec, prompt: str, recent: str) -> str:
 
 def compacted(spec: Spec, cfg: config.Config, device: devices.Device, prompt: str, recent: str, turn: int,
               resume: Session) -> Session:
-    row = state.run_get(spec.id) or {}
+    row = run_store.run_get(spec.id) or {}
     if not resume.id or resume.runner != "claude" or row.get("runner") != "claude" or device.remote or not recent:
         return resume
     if not jev.ready(cfg, [cfg.repo_for_work_dir(spec.cwd)]):
@@ -598,7 +600,7 @@ def conclude_task(spec: Spec, cfg: config.Config, answer: dict | None, error: st
     pr_problem = ""
     if spec.draft_pr:
         pr_problem = draft_pr_problem(spec, cfg, report, answer, blank)
-    row = state.run_get(spec.id) or {}
+    row = run_store.run_get(spec.id) or {}
     problems = [p for p in (f"the last turn failed: {spec.turn_error}" if spec.turn_error else "",
                             f"the report turn gave no report: {error}" if error else "",
                             NO_SUMMARY if blank else "",
@@ -606,7 +608,7 @@ def conclude_task(spec: Spec, cfg: config.Config, answer: dict | None, error: st
     report |= {"branch": spec.branch, "commit": spec.pushed, "pr_url": spec.pr,
                "cost_usd": round(row.get("cost_usd") or 0, 4), "paid_usd": record.metered_spent(spec.id),
                "problems": problems}
-    state.save_report(spec.id, report)
+    run_store.save_report(spec.id, report)
     log_line(spec, "report", json.dumps(report))
     if error:
         return "failed", f"the report turn gave no report: {error}"
@@ -655,9 +657,9 @@ def execute(session_id: str) -> str:
     with util.lock(session_lock(session_id)) as free:
         if not free:
             return "busy"
-        if (ended := (state.run_get(session_id) or {}).get("status", "gone")) != "running":
+        if (ended := (run_store.run_get(session_id) or {}).get("status", "gone")) != "running":
             return ended
-        record.note(session_id, pid=os.getpid(), engine_sha=codebase.STAMP, schema_version=state.LATEST)
+        record.note(session_id, pid=os.getpid(), engine_sha=codebase.STAMP, schema_version=foundation.LATEST)
         try:
             with (record.stoppable(),
                   devices.lease(spec.device, spec.id, lambda text: log_line(spec, "device", text),
@@ -712,17 +714,17 @@ def close(spec: Spec, status: str, summary: str) -> None:
 def ended_message(link: dict) -> str:
     run_id = link["run_id"]
     return json.dumps({"id": run_id, "status": link["status"] or "gone", "finished": link["finished"],
-                       "pr_url": link["pr_url"] or "", "note": link["summary"] or "", "report": state.report(run_id)})
+                       "pr_url": link["pr_url"] or "", "note": link["summary"] or "", "report": run_store.report(run_id)})
 
 
 def tell_chats() -> int:
     return sum(state.chat_tell_session(link["run_id"], ended_message(link)) for link in state.chat_sessions_untold())
 
 
-def views(limit: int = 30, connect=state.reader) -> list[dict]:
+def views(limit: int = 30, connect=foundation.reader) -> list[dict]:
     out = []
-    rows = state.runs(kind="session", limit=limit, connect=connect)
-    paid = state.paid_by_run([r["id"] for r in rows], connect)
+    rows = run_store.runs(kind="session", limit=limit, connect=connect)
+    paid = run_store.paid_by_run([r["id"] for r in rows], connect)
     for r in rows:
         spec = util.read_json(spec_file(r["id"]), {})
         out.append({k: r.get(k) for k in ("id", "status", "started", "finished", "model", "runner", "device",
@@ -736,7 +738,7 @@ def views(limit: int = 30, connect=state.reader) -> list[dict]:
 
 def known_models(cfg: config.Config) -> list[str]:
     since = util.iso(util.now() - timedelta(days=SEEN_MODEL_DAYS))
-    seen = {s["model"] for s in state.steps_since(since, connect=state.reader) if s["model"]}
+    seen = {s["model"] for s in run_store.steps_since(since, connect=foundation.reader) if s["model"]}
     return sorted({*settings.MODEL_ALIASES, *(m for m in cfg.models.values() if m), *cfg.pricing, *seen})
 
 

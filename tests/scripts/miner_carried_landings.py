@@ -1,5 +1,6 @@
 
 from types import SimpleNamespace
+from arete.store import runs as run_store
 from arete import pipeline, outcomes
 repo = config.Repo("landing", root, tracker="jira")
 cfg = config.Config(repos=[repo])
@@ -32,7 +33,7 @@ with mock.patch.object(pipeline.tracker, "for_repo", return_value=tk), \
     assert len(comments) == expected and len(moves) == expected + 1
     outcomes.sync_landings(cfg)
     assert len(moves) == expected + 1
-rows = state.runs(kind="pipeline", repo=repo.name)
+rows = run_store.runs(kind="pipeline", repo=repo.name)
 assert outcomes.carried_by_newer(rows, 1)
 for field, value in (("repo", "other"), ("issue", "R-2"), ("pr_url", "")):
     changed = [rows[0], rows[1] | {field: value}]

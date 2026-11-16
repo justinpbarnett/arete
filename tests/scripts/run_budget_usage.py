@@ -17,7 +17,8 @@ METADATA = {"version", "parents", "left_out", "policy", "specification",
 
 
 def expand(root):
-    from arete import migrations, state
+    from arete import state
+    from arete.store import db as foundation, migrations
 
     original = migrations.FOLDER
     folder = root / "expand-migrations"
@@ -27,18 +28,18 @@ def expand(root):
             shutil.copyfile(file, folder / file.name)
     (folder / "latest.txt").write_text("m0005_runs_budget_usage.py\n")
     migrations.FOLDER = folder
-    state.NEEDED = 5
-    state._CHECKED.clear()
+    foundation.NEEDED = 5
+    foundation._CHECKED.clear()
     state.migrate()
     return original
 
 
 def full(folder):
-    from arete import migrations, state
+    from arete.store import db as foundation, migrations
 
     migrations.FOLDER = folder
-    state.NEEDED = 6
-    state._CHECKED.clear()
+    foundation.NEEDED = 6
+    foundation._CHECKED.clear()
 
 
 def old_run(rid, seconds=200, status="failed", **fields):
@@ -176,7 +177,8 @@ BAD_BUDGETS = {
 
 
 def migration_error(root, case):
-    from arete import migrations, paths, runlimits, state, util
+    from arete import paths, runlimits, state, util
+    from arete.store import db as foundation, migrations
 
     folder = expand(root)
     old_run("Good")
@@ -191,8 +193,8 @@ def migration_error(root, case):
         assert "Bad" in refusal
     else:
         raise AssertionError("malformed budget accepted")
-    state.NEEDED = 5
-    state._CHECKED.clear()
+    foundation.NEEDED = 5
+    foundation._CHECKED.clear()
     assert ledger()[-1] == 5
     assert row_values("Good") == row_values("Bad") == [None] * 5
     refusals = []

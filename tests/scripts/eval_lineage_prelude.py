@@ -1,6 +1,7 @@
 
 import contextlib, io, json, os, shutil, sqlite3, sys
 from pathlib import Path
+from arete.store import runs as run_store
 from arete import board, codebase, config, evals, paths, sandbox, scratch, state, util
 from arete.lab import experiment, optimize
 root = Path(sys.argv[1])

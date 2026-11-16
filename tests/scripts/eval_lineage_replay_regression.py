@@ -1,3 +1,4 @@
+from arete.store import runs as run_store
 
 replies = sample()
 head = util.git(["rev-parse", "HEAD"], root / "sample/repo").strip()
@@ -70,5 +71,5 @@ assert state.eval_rows(run_id) == suite
 history = state.eval_history("replay-sample")
 code, out = call("word-train", dry_run=True)
 assert "word-train" in out and state.eval_history("replay-sample") == history
-assert state.last_step_id(run_id) == steps[-1]["id"]
+assert run_store.last_step_id(run_id) == steps[-1]["id"]
 print("BEHAVIOR_RESULT=" + json.dumps({"tasks": len(suite), "regression": md}))

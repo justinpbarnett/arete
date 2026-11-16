@@ -17,6 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from arete.store import runs as run_store
 from arete import slots, workspace, prompt_loader
 
 from tests.harness import set_task_body
@@ -70,6 +71,7 @@ LESSON_A, LESSON_B = "- `notes.txt`: lesson A from the first run.", "- `notes.tx
 KILLED_WHILE_WAITING = """
 import os, runpy, signal, sys, urllib.request
 from unittest import mock
+from arete.store import runs as run_store
 from arete import accounts, factory, gh, paths, pipeline, slots
 def forbidden(*args, **kwargs):
     raise AssertionError("offline workflow attempted an external transport or credential lookup")
@@ -90,6 +92,7 @@ with mock.patch.multiple(slots, runs_in_slots=mock.Mock(return_value=[{}]),
 SECOND_LEARNING_RUN = """
 import runpy, sys, urllib.request
 from pathlib import Path
+from arete.store import runs as run_store
 from arete import accounts, factory, gh, paths
 def forbidden(*args, **kwargs):
     raise AssertionError("offline workflow attempted an external transport or credential lookup")
@@ -115,6 +118,7 @@ def forbidden(*args, **kwargs):
 
 
 def main(root, scenario):
+    from arete.store import runs as run_store
     from arete import (accounts, alerts, owner_asks, codebase, config, control, environment, factory, flows, gh, run_lines,
                        paths, pipeline, record, replay, runlimits, runner, scrub, state, tasks, vault)
     state.migrate()
@@ -347,6 +351,7 @@ def add_held_pr_history(fx):
     for n in (1, 2, 3):
         fx.run_lines.write(old, "step_start", step="implement", call=f"review_fix{n}", atom="review_repair", **{"try": n})
     fx.record.settle(old, "pr")
+    run_store.note(old, repair_calls=3)
     with fx.state.db() as connection:
         set_task_body(fx.task, "Add kumquat to the fixture notes\n\n## Follow up\nAlso list it first.", connection=connection)
     fx.old = old
@@ -357,7 +362,7 @@ def forced(fx, *extra):
         fx.factory.main(fx.feature, ["replay-sample", fx.task, "--force", *extra])
     except SystemExit:
         pass
-    return fx.state.ticket_runs("replay-sample", fx.task, whole=True)[0]
+    return run_store.ticket_runs("replay-sample", fx.task, whole=True)[0]
 
 
 def continue_ignoring_exit(fx, arguments):
@@ -483,10 +488,10 @@ def kill_at_verify(fx):
         os.close(ready)
     real_now = pipeline.util.now
     pipeline.util.now = lambda: real_now() + timedelta(seconds=600)
-    failed = state.ticket_runs("replay-sample", fx.task, whole=True)[0]
+    failed = run_store.ticket_runs("replay-sample", fx.task, whole=True)[0]
     before = {k: failed[k] for k in ("active_seconds", "verify_seconds", "verify_open_seconds", "repair_calls", "measured_at")}
     record.interrupt(failed)
-    failed = state.run_get(failed["id"])
+    failed = run_store.run_get(failed["id"])
     assert before == {k: failed[k] for k in before}
     fx.settlement_unchanged = True
     pipeline.git(["add", "-A"], ws)
@@ -514,7 +519,7 @@ def prepare_continuation(fx):
         fx.mid["log"] = (fx.paths.RUNS_DIR / fx.mid["id"] / "run.log").read_text()
     if "only-prepare" in scenario:
         continue_ignoring_exit(fx, ["replay-sample", fx.task, "--continue", failed["id"], "--only", "prepare"])
-        fx.mid = fx.state.ticket_runs("replay-sample", fx.task)[0]
+        fx.mid = run_store.ticket_runs("replay-sample", fx.task)[0]
         fx.mid["unmoved"] = pipeline.git(["rev-parse", "HEAD"], ws).strip() == fx.before
 
 
@@ -522,12 +527,12 @@ def stepped_edits(fx):
     scenario, pipeline, ws, failed, mid = fx.scenario, fx.pipeline, fx.ws, fx.failed, fx.mid
     (fx.replays / "build.patch").write_text(LIME if "broken" in scenario else QUINCE)
     continue_ignoring_exit(fx, ["replay-sample", fx.task, "--continue", failed["id"], "--only", "implement"])
-    fx.mid = mid = fx.state.ticket_runs("replay-sample", fx.task)[0]
+    fx.mid = mid = run_store.ticket_runs("replay-sample", fx.task)[0]
     mid["head"] = pipeline.git(["rev-parse", "HEAD"], ws).strip()
     if "broken-" in scenario:
         continue_ignoring_exit(fx, ["replay-sample", fx.task, "--continue", failed["id"], "--only",
                                     scenario.rsplit("-", 1)[1]])
-        later = fx.state.ticket_runs("replay-sample", fx.task)[0]
+        later = run_store.ticket_runs("replay-sample", fx.task)[0]
         mid["later"] = {k: later.get(k) for k in ("only_step", "status", "summary")}
     if scenario.endswith(("-hand", "-forged")):
         trailer = "\n\nArete-Run: " + mid["id"] if scenario.endswith("-forged") else ""
@@ -554,7 +559,7 @@ def continuation_result(fx, row):
     published = "refs/heads/" + branch in og(fx, "for-each-ref", "--format=%(refname)", "refs/heads")
     return {"failed": failed["summary"], "status": row["status"], "summary": row["summary"], "log": log,
             "kept": pipeline.git(["log", "-1", "--format=%B"], ws).strip() if ws.exists() else "",
-            "steps": [s["step"] for s in state.steps(row["id"])],
+            "steps": [s["step"] for s in run_store.steps(row["id"])],
             "started": [l["step"] for l in fx.run_lines.read(row["id"]) if l.get("event") == "step_start"],
             "failed_id": failed["id"], "failed_status": failed["status"],
             "failed_span": (pipeline.util.parse_iso(failed["finished"]) - pipeline.util.parse_iso(failed["started"])).total_seconds(),
@@ -698,7 +703,8 @@ def resume_parked(fx, result):
     if scenario == "budget-waits-admission":
         count = len(fx.state.ticket_runs("replay-sample", fx.task))
         calls = len(fx.prompts)
-        refused = forced(fx)
+        with mock.patch.object(fx.runlimits.Policy, "of", return_value=fx.runlimits.Policy(max_repair_cycles=0)):
+            refused = forced(fx)
         assert refused["id"] == result["parked_id"]
         assert count == len(fx.state.ticket_runs("replay-sample", fx.task))
         assert len(fx.prompts) == calls
@@ -835,7 +841,7 @@ def fix_ask_continue(fx):
     (fx.answers / "fix2.json").write_text(json.dumps({"text": "Fixed.", "ok": True}))
     with mock.patch.object(runlimits.Policy, "of", return_value=runlimits.Policy(max_repair_cycles=5)):
         continue_ignoring_exit(fx, ["replay-sample", fx.task, "--force", "--continue", fx.parked["id"]])
-    return state.ticket_runs("replay-sample", fx.task, whole=True)[0]
+    return run_store.ticket_runs("replay-sample", fx.task, whole=True)[0]
 
 
 def fix_ask_result(fx, row):
@@ -1003,7 +1009,7 @@ def slot_wait(fx, result, continuing):
         stop_while_waiting_for_slot(fx, result, continuing)
     else:
         kill_while_waiting_for_slot(fx, continuing)
-    waited = state.ticket_runs("replay-sample", fx.task, limit=1, whole=True)[0]
+    waited = run_store.ticket_runs("replay-sample", fx.task, limit=1, whole=True)[0]
     lines_of = run_events(fx, waited["id"])
     result |= {"waited": waited["status"],
                "waited_continues": [e.get("continues") for e in lines_of if e.get("event") == "route"] == [parked["id"]],
@@ -1042,13 +1048,13 @@ def kill_while_waiting_for_slot(fx, continuing):
     source = str(Path(fx.pipeline.__file__).resolve().parent.parent)
     subprocess.run([sys.executable, "-I", "-c", f"import sys;sys.path.insert(0,{source!r});" + KILLED_WHILE_WAITING,
                     *continuing], start_new_session=True, timeout=60)
-    fx.record.interrupt(fx.state.ticket_runs("replay-sample", fx.task, limit=1, whole=True)[0])
+    fx.record.interrupt(run_store.ticket_runs("replay-sample", fx.task, limit=1, whole=True)[0])
 
 
 def asked_continue(fx, result, continuing):
     paths, record, state, parked, first = fx.paths, fx.record, fx.state, fx.parked, fx.first
     continue_ignoring_exit(fx, continuing)
-    row = state.ticket_runs("replay-sample", fx.task, whole=True)[0]
+    row = run_store.ticket_runs("replay-sample", fx.task, whole=True)[0]
     events = run_events(fx, row["id"])
     session = lambda read: next(e["session"]["id"] for e in read if e.get("event") == "step_end" and e.get("step") == "implement" and e.get("session"))
     header = json.loads(next(record.raw_lines([f for f in record.record_files(row["id"]) if "build" in f.name][-1])))
@@ -1159,7 +1165,7 @@ def learn_result(fx, row):
               "head": pipeline.git(["rev-parse", "HEAD"], layer_dir).strip() if (layer_dir / ".git").exists() else "",
               "recorded": (paths.RUNS_DIR / row["id"] / "expertise-commit.txt").read_text().strip()
                           if (paths.RUNS_DIR / row["id"] / "expertise-commit.txt").exists() else "",
-              "other": fx.state.ticket_runs("replay-sample", other, whole=True)[0]["status"] if other else "",
+              "other": run_store.ticket_runs("replay-sample", other, whole=True)[0]["status"] if other else "",
               "learn2_prompt": ""}
     for file in record.record_files(row["id"]):
         if "learn2" in file.name:
@@ -1194,7 +1200,7 @@ def ordinary(fx):
     events = run_events(fx, row["id"])
     verification = [e.get("data", {}).get("verified") for e in events
                     if e.get("event") == "step_end" and e.get("step") == "verify"]
-    result = {"status":row["status"], "summary":row["summary"], "steps":[s["step"] for s in state.steps(row["id"])],
+    result = {"status":row["status"], "summary":row["summary"], "steps":[s["step"] for s in run_store.steps(row["id"])],
               "verified":[v["verdict"] for v in verification if v],
               "origin":pipeline.git(["for-each-ref", "--format=%(refname)", "refs/heads"], fx.root / "sample/origin.git")}
     if scenario == "secret-in-patch":
@@ -1277,11 +1283,11 @@ def ordinary_extras(fx, row, events, result):
     if scenario == "code-identity":
         codebase = fx.codebase
         second = (f"import sys; sys.path.insert(0, {str(Path(codebase.__file__).parent.parent)!r}); "
-                  "from arete import codebase, run_lines; codebase.STAMP = 'second-engine'; "
+                  "from arete.store import runs as run_store; from arete import codebase, run_lines; codebase.STAMP = 'second-engine'; "
                   "run_lines.write(sys.argv[1], 'first'); run_lines.write(sys.argv[1], 'second')")
         subprocess.run([sys.executable, "-I", "-c", second, row["id"]], env=os.environ, check=True, capture_output=True)
         result["identity"] = {
-            "stamp": codebase.STAMP, "row": state.run_get(row["id"])["engine_sha"],
+            "stamp": codebase.STAMP, "row": run_store.run_get(row["id"])["engine_sha"],
             "first": events[0].get("engine"),
             "headers": [json.loads(next(record.raw_lines(f))).get("engine") for f in record.record_files(row["id"])],
             "later": [e.get("engine") for e in events[1:]],
@@ -1289,7 +1295,7 @@ def ordinary_extras(fx, row, events, result):
     if scenario == "future-step-appended":
         result["appended"] = bool(fx.appended)
     if scenario in ("pass", "doctor-clean"):
-        assert state.run_get(row["id"])["schema_version"] == state.LATEST
+        assert run_store.run_get(row["id"])["schema_version"] == state.LATEST
         branches = [b for b in result["origin"].splitlines() if b != "refs/heads/main"]
         assert len(branches) == 1, result
         result["published"] = pipeline.git(["show", branches[0] + ":notes.txt"], fx.root / "sample/origin.git")

@@ -46,6 +46,8 @@ from . import (
     webpush,
 )
 from .loops import Loop
+from .store import db as foundation
+from .store import runs as run_store
 
 TICK_SECONDS = 20
 PRUNE_SECONDS = 3600
@@ -261,7 +263,7 @@ class Server:
     def guard(self, key: str, fn: Callable, *args):
         try:
             result = fn(*args)
-        except state.NoDatabase:
+        except foundation.NoDatabase:
             raise
         except Exception as e:
             error = f"{type(e).__name__}: {util.first_line(str(e), 300)}"
@@ -297,9 +299,9 @@ class Server:
         return True
 
     def tick(self) -> None:
-        state.ensure_schema()
+        foundation.ensure_schema()
         if self.contracts_waiting:
-            self.contracts_waiting = state.migrate()
+            self.contracts_waiting = foundation.migrate()
         if not self.guard("tick:load", self.load) or self.code_problem:
             return
         self.guard("stage:reap", self.reap)
@@ -574,7 +576,7 @@ class Server:
             return self.say
 
         def log(text: str) -> None:
-            state.add_feed(run_id, "device", f"arete serve: {text}")
+            run_store.add_feed(run_id, "device", f"arete serve: {text}")
             self.say(f"{run_id}: {text}")
         return log
 
@@ -595,7 +597,7 @@ class Server:
             self.say(f"{sid}: {util.count(len(found), 'new event')}, {util.count(len(items), 'queue item')}")
 
     def dispatch(self, by_name: dict[str, Loop]) -> None:
-        slots = QueueSlots(state.runs_marked_running())
+        slots = QueueSlots(run_store.runs_marked_running())
         pending = state.pending()
         ids = {item["id"] for item in pending}
         self.waiting = {i: why for i, why in self.waiting.items() if i in ids}
@@ -775,11 +777,11 @@ class Server:
         except Exception:
             pending = None
         try:
-            running = sum(r["kind"] == "loop" for r in state.runs_marked_running())
+            running = sum(r["kind"] == "loop" for r in run_store.runs_marked_running())
         except Exception:
             running = None
         util.write_json(control.BEAT_FILE, {
-            "schema": state.LATEST,
+            "schema": foundation.LATEST,
             "db": db,
             "pid": os.getpid(), "engine": codebase.STAMP, "at": at, "started": util.iso(self.started), "ticks": self.ticks,
             "tick_seconds": TICK_SECONDS, "loops": len(live), "off": len(every_loop) - len(live),
@@ -822,23 +824,18 @@ def run(with_dashboard: bool = True) -> NoReturn:
     try:
         beat = util.read_json(control.BEAT_FILE, {})
         if beat.get("pid") == os.getpid():
-            util.write_json(control.BEAT_FILE, {**beat, "schema": state.LATEST,
+            util.write_json(control.BEAT_FILE, {**beat, "schema": foundation.LATEST,
                                               "db": beat.get("db") or {
                                                   **dbstats.empty_collection(), "status": "initial",
                                                   "requested_at": None, "finished_at": None, "error": None}})
         try:
             with util.lock("migrate", wait=True):
                 backup.recover_restore()
-            contracts_waiting = state.migrate()
+            contracts_waiting = foundation.migrate()
             if backup.pending_restore():
                 raise backup.Refused("restore metadata could not finish migration; API startup refused")
             if not paths.ISOLATED:
-                conn = paths.connect_db(paths.DB_FILE)
-                try:
-                    if conn.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() != "wal":
-                        raise RuntimeError("arete.db refused WAL mode")
-                finally:
-                    conn.close()
+                foundation.enable_wal()
             cleanup_legacy()
         except Exception as e:
             print(str(e), file=sys.stderr)
@@ -861,7 +858,7 @@ def run(with_dashboard: bool = True) -> NoReturn:
         started = time.monotonic()
         try:
             server.run_pass()
-        except state.NoDatabase as e:
+        except foundation.NoDatabase as e:
             server.say(str(e))
             held.close()
             raise SystemExit(1) from e

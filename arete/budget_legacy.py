@@ -1,6 +1,7 @@
 import math
 
-from . import run_lines, state, util
+from . import run_lines, util
+from .store import runs as run_store
 
 IDLE_WAITS = ("limit", "slot")
 REPAIRS = {"check_repair", "review_repair", "ci_repair"}
@@ -113,7 +114,7 @@ def verification_seconds(run_id: str, row: dict) -> float:
                 active = None
         return spent + (max(0, (util.parse_iso(row.get("finished") or util.iso()) -
                                 util.parse_iso(active)).total_seconds()) if active else 0)
-    return sum(max(0, float(step.get("seconds") or 0)) for step in state.steps(run_id)
+    return sum(max(0, float(step.get("seconds") or 0)) for step in run_store.steps(run_id)
                if str(step.get("step") or "").startswith(("verify", "grade")))
 
 

@@ -25,6 +25,7 @@ from .pipeline import (
     MAX_DIFF_IN_PROMPT,
     commit_layer,
 )
+from .store import runs as run_store
 from .util import git
 
 TASK_FILE = "task.toml"
@@ -137,7 +138,7 @@ def find(cfg: config.Config, repo_name: str) -> tuple[list[Candidate], list[str]
             skips.append(f"{repo.name}: {why}")
             continue
         seen, before = set(), 0
-        for r in state.runs(kind="pipeline", repo=repo.name, limit=1000):
+        for r in run_store.runs(kind="pipeline", repo=repo.name, limit=1000):
             url = r["pr_url"] or ""
             if r["status"] != "merged" or not url or url in seen:
                 continue
@@ -304,7 +305,7 @@ def run(repo_name: str, limit: int, dry_run: bool = False) -> int:
         print(f"skip {s}")
     if dry_run or not picked:
         return 0
-    lock = state.run_lock("eval-mine")
+    lock = run_store.run_lock("eval-mine")
     with util.lock(lock) as got:
         if not got:
             print("an eval mine is already running")

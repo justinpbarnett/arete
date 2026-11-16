@@ -1,4 +1,4 @@
-from arete.migrations.m0002_foundation_time_shape import TIME_COLUMNS, TIME_GLOB
+from arete.store.migrations.m0002_foundation_time_shape import TIME_COLUMNS, TIME_GLOB
 
 PHASE = "expand"
 

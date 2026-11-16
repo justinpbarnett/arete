@@ -1,15 +1,11 @@
 import errno
-import fcntl
 import json
 import os
 import re
-import sqlite3
 import stat
 import sys
-import threading
-import time
 import tomllib
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from pathlib import Path
 
 HOME = Path.home()
@@ -25,8 +21,6 @@ ISOLATED_LOGINS = "scratch config and state never use this machine's logins, key
 ISOLATED_REFUSAL = (f"arete: refusing to start: with {SCRATCH_ENV}, or ARETE_CONFIG_DIR or ARETE_STATE_DIR in a scratch "
                     f"folder, the config and state folders must both sit, without links, in the one scratch folder "
                     f"selected for isolation (unset ones go to its config and state folders)")
-DB_LOCK = threading.Lock()
-DB_THREAD = threading.local()
 
 
 def inside_scratch(d: Path) -> bool:
@@ -129,68 +123,6 @@ def read_confined(p: Path, limit: int | None = None) -> bytes:
                     return f.read(-1 if limit is None else limit)
     except OSError as e:
         raise FileNotFoundError(errno.ENOENT, "not a file inside a scratch folder", str(p)) from e
-
-
-class FixtureConnection(sqlite3.Connection):
-    def close(self):
-        try:
-            super().close()
-        finally:
-            self.handles.close()
-
-
-def connect_db(p: Path, readonly: bool = False, create: bool = False) -> sqlite3.Connection:
-    if not ISOLATED:
-        mode = "ro" if readonly else "rwc" if create else "rw"
-        conn = sqlite3.connect(f"{p.absolute().as_uri()}?mode={mode}", uri=True, timeout=30)
-        try:
-            conn.execute("PRAGMA synchronous=NORMAL")
-            return conn
-        except BaseException:
-            conn.close()
-            raise
-    if not ON_MAC or confined(p) is None:
-        raise PermissionError("isolated state requires a supported confined database path")
-    if getattr(DB_THREAD, "active", False) or not DB_LOCK.acquire(timeout=30):
-        raise PermissionError("nested or busy isolated state access refused")
-    DB_THREAD.active = True
-    handles, conn = ExitStack(), None
-    handles.callback(DB_LOCK.release)
-    handles.callback(setattr, DB_THREAD, "active", False)
-    try:
-        parent = handles.enter_context(directory_fd(p.absolute().parent))
-        deadline = time.monotonic() + 30
-        while True:
-            try:
-                fcntl.flock(parent, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise PermissionError("busy isolated state directory refused") from None
-                time.sleep(0.05)
-        for suffix in ("-wal", "-shm", "-journal"):
-            try:
-                os.stat(p.name + suffix, dir_fd=parent, follow_symlinks=False)
-            except FileNotFoundError:
-                continue
-            raise PermissionError("existing isolated database sidecar refused")
-        flags = os.O_RDONLY if readonly else os.O_RDWR | (os.O_CREAT if create else 0)
-        fd = os.open(p.name, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=parent)
-        handles.callback(os.close, fd)
-        st = os.fstat(fd)
-        if (not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid != os.getuid()
-                or os.pread(fd, 20, 0)[18:20] == b"\x02\x02"):
-            raise PermissionError("linked, non-plain or WAL isolated state database refused")
-        conn = sqlite3.connect(f"file:/dev/fd/{fd}?mode={'ro' if readonly else 'rw'}", uri=True,
-                               timeout=30, factory=FixtureConnection)
-        conn.handles = handles
-        if not readonly and conn.execute("PRAGMA journal_mode=MEMORY").fetchone()[0] != "memory":
-            raise PermissionError("isolated state requires disposable memory journaling")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        return conn
-    except BaseException:
-        conn.close() if conn is not None else handles.close()
-        raise
 
 
 def isolated_dirs() -> tuple[Path, Path]:

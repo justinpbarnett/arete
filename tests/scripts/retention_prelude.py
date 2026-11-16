@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
+from arete.store import runs as run_store
 from arete import backup, config, control, heartbeat, tool_events, paths, record, replay, serve, state, tasks, util
 root = Path(sys.argv[1])
 paths.CONFIG_FILE.write_text("\n".join(replay.sample(root / "sample")))

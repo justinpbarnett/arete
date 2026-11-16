@@ -10,7 +10,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
-from . import config, gh, paths, record, sandbox, scratch, state, tracker, util
+from . import config, gh, paths, record, sandbox, scratch, tracker, util
+from .store import runs as run_store
 from .util import git
 
 SALT_KEY = "\0salt"
@@ -531,7 +532,7 @@ def owner_of(d: Path, cfg: config.Config) -> dict | None:
         return owner
     for repo in sorted(cfg.repos, key=lambda r: len(r.name), reverse=True) if made_record(d).is_file() else []:
         tid = d.name.removeprefix(f"{repo.name}-")
-        if tid != d.name and state.ticket_runs(repo.name, tid, limit=1):
+        if tid != d.name and run_store.ticket_runs(repo.name, tid, limit=1):
             return {"run": "", "repo": repo.name, "ticket": tid, "created": "",
                     "checkouts": [{"dir": p.dir, "github": p.github, "src": str(repo.path / p.dir),
                                    "wt": str(d / p.dir)} for p in parts_of(repo)]}
@@ -575,12 +576,12 @@ def ticket_closed(cfg: config.Config, repo: str, tid: str, status: str) -> bool:
 
 def sweep_owned(d: Path, owner: dict, cfg: config.Config) -> dict | None:
     repo, tid = owner["repo"], str(owner["ticket"])
-    lock_name = state.run_lock("pipeline", repo, tid)
-    if util.lock_is_held(lock_name) or state.issue_running(repo, tid):
+    lock_name = run_store.run_lock("pipeline", repo, tid)
+    if util.lock_is_held(lock_name) or run_store.issue_running(repo, tid):
         return None
     checkouts = [Checkout(c["dir"], c["github"], Path(c["src"]), Path(c["wt"]), "") for c in owner["checkouts"]]
-    row = ((state.run_get(owner["run"]) if owner.get("run") else None)
-           or state.newest_whole_run(repo, tid))
+    row = ((run_store.run_get(owner["run"]) if owner.get("run") else None)
+           or run_store.newest_whole_run(repo, tid))
     status = (row or {}).get("status") or ""
     run_id = (row or {}).get("id") or owner.get("run") or ""
     closed = (status not in ENDED and status not in WAITING and tracker.is_task_id(tid)

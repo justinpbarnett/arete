@@ -1445,7 +1445,7 @@ server.run_pass()
 server.run_pass()
 beat = util.read_json(control.BEAT_FILE, {})
 paused = {"said": [s for s in said if "does not load" in s], "problem": beat.get("config_problem", ""),
-          "ticks": beat.get("ticks"), "running": state.runs_marked_running()}
+          "ticks": beat.get("ticks"), "running": run_store.runs_marked_running()}
 write(GOOD)
 server.run_pass()
 again = util.read_json(control.BEAT_FILE, {})

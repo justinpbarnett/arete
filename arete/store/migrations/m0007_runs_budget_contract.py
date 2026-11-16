@@ -1,4 +1,4 @@
-from arete.migrations.m0006_runs_budget_backfill import apply as backfill
+from arete.store.migrations.m0006_runs_budget_backfill import apply as backfill
 
 PHASE = "contract"
 
