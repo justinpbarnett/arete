@@ -10,7 +10,8 @@ from decimal import Decimal
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from . import claude, config, paths, research_budget, research_plan, runner, steps, tracker, util
+from . import child, config, paths, research_budget, research_plan, routing, runner, steps, tracker, util
+from .agent import WEB_TOOLS
 from .pipeline import prompt
 from .screening import Posture, Screen, screen_many
 from .screening import held as screen_held
@@ -32,7 +33,7 @@ PASSAGE_CHARS = 1500
 CAP_REACHED = "the search cap was reached"
 NO_ROOM = "the research budget left no room for another search round"
 ROUTING_SECONDS = 20
-GRACE_SECONDS = ROUTING_SECONDS + claude.STOP_GRACE_SECONDS + claude.DRAIN_SECONDS
+GRACE_SECONDS = ROUTING_SECONDS + child.OVERRUN_SECONDS
 NO_REPORT =", so no report was written"
 USAGE_KEYS = ("cost_usd", "tokens_in", "tokens_out", "turns")
 
@@ -63,12 +64,12 @@ def dec(value) -> Decimal:
 
 
 def unavailable(s: steps.Settings) -> str:
-    wanted = [t for t in s.tools if t in runner.WEB_TOOLS]
+    wanted = [t for t in s.tools if t in WEB_TOOLS]
     if "WebSearch" not in wanted:
         return "[steps.research_search] tools leave out WebSearch, so a worker cannot search"
     has = runner.web_tools(s.model, s.runner)
     if missing := [t for t in wanted if t not in has]:
-        return (f"{runner.stands_for(s.model, s.runner)[0]} has no {', '.join(missing)} tool, "
+        return (f"{routing.stands_for(s.model, s.runner)[0]} has no {', '.join(missing)} tool, "
                 "and arete grants a worker nothing in its place")
     return ""
 
@@ -172,7 +173,7 @@ def account_call(worker, res, paid, allowance, deadline):
 
 def work(cfg: config.Config, s: steps.Settings, task: dict, criteria: list[str], ref: str, n: int, cwd: Path,
          allowance: float, seconds: float, round_no: int = 0) -> Outcome:
-    which = runner.chosen(s.model, s.runner, cfg)[0]
+    which = routing.chosen(s.model, s.runner, cfg)[0]
     text = prompt("research_search", goal=task["goal"], queries=research_plan.bullets(task["queries"]),
                   max_sources=task["max_sources"], criteria=research_plan.bullets(criteria))
     started = time.monotonic()
@@ -182,7 +183,7 @@ def work(cfg: config.Config, s: steps.Settings, task: dict, criteria: list[str],
     answer = None
     for _ in range(s.tries):
         remaining, left = float(dec(allowance) - dec(paid)), deadline - time.monotonic() - GRACE_SECONDS
-        if remaining <= runner.BUDGET_FLOOR_USD or left < research_budget.MIN_CALL_SECONDS:
+        if remaining <= routing.BUDGET_FLOOR_USD or left < research_budget.MIN_CALL_SECONDS:
             faults = faults or ["the worker's share of the search cap was used up"]
             break
         worker["tries"] += 1
@@ -358,7 +359,7 @@ def search_workers(cfg, budget, s, plan, ref, first, round_no, cap, stage_deadli
     running: dict = {}
     spent = committed = Decimal(0)
     status, stop = ("done", "") if room else ("capped", "planning left no room for search")
-    floor = dec(runner.BUDGET_FLOOR_USD)
+    floor = dec(routing.BUDGET_FLOOR_USD)
     with tempfile.TemporaryDirectory(prefix="arete-search-") as cwd, ThreadPoolExecutor(size) as pool:
         while room and (pending or running):
             while pending and not stop and len(running) < size:

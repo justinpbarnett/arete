@@ -6,7 +6,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import config, gh, paths, record, runner, state, tracker, util, verify, workspace
+from . import config, gh, paths, record, state, tracker, util, verify, workspace
+from .agent import READ_TOOLS
 from .evals import (
     EVALS,
     DirSource,
@@ -149,7 +150,7 @@ def write(cfg: config.Config, run: EvalRun, c: Candidate, ticket: tracker.Ticket
                                      body=ticket.body, comments=ticket.comments, pr_body=gh.pr_body(c.pr_url),
                                      diff=util.tail(git(["diff", base, merge], c.repo.path), MAX_DIFF_IN_PROMPT),
                                      surface=surface(v), commands=code_list(config.DEFAULT_ALLOW_BASH + v.bash)),
-                    wt, model=cfg.model("eval_mine"), allowed_tools=runner.READ_TOOLS + bash_rules(config.DEFAULT_ALLOW_BASH),
+                    wt, model=cfg.model("eval_mine"), allowed_tools=READ_TOOLS + bash_rules(config.DEFAULT_ALLOW_BASH),
                     json_schema=WRITER_SCHEMA, timeout=c.layer.timeout_minutes * 60, persist=False)
     if not res.ok or not isinstance(res.structured, dict):
         raise RuntimeError(f"the writer did not finish: {util.first_line(res.error or 'no task came back', 200)}")

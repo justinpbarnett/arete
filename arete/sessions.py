@@ -30,7 +30,7 @@ from . import (
     util,
     vault,
 )
-from .agent import NO_SESSION, Session
+from .agent import EDIT_TOOLS, NO_SESSION, Session
 
 TOKEN_HELPER = ('!f() { test "$1" = get || return 0; p= h=; while IFS= read -r line && test -n "$line"; do '
                 'case $line in protocol=*) p=${line#*=} ;; host=*) h=${line#*=} ;; esac; done; '
@@ -43,7 +43,7 @@ GIT_WITH_TOKEN = ('ARETE_GIT_TOKEN="$arete_token" GIT_ALLOW_PROTOCOL=https GIT_T
 CLONE_SECONDS = 900
 
 SESSIONS_DIR = paths.STATE_DIR / "sessions"
-SESSION_TOOLS = [*runner.EDIT_TOOLS, "Bash"]
+SESSION_TOOLS = [*EDIT_TOOLS, "Bash"]
 TURN_TIMEOUT_SECONDS = 3600
 INBOX_POLL_SECONDS = 2
 SESSION_LOG = "sessions.log"
@@ -218,11 +218,11 @@ def launch(prompt: str, *, device: str = "local", model: str = "", run_with: str
     work_repo = repo_named(repo, target, cfg)
     if draft_pr and work_repo and not work_repo.github:
         raise control.Refused(f"repo {work_repo.name} has no github setting, so arete cannot open a PR for it")
-    which, name = runner.route(model, run_with)
-    off = runner.withheld(model, run_with, tools, target)
+    which, name = routing.route(model, run_with)
+    off = routing.withheld(model, run_with, tools, target)
     tools = [t for t in tools if not any(t in withheld for withheld in off.values())]
-    asked = runner.request_for(cfg, work_repo, which, name, None, True,
-                               {"tools": tools, "disallowed_tools": runner.NO_GIT_WRITES})
+    asked = routing.request_for(cfg, work_repo, which, name, None, True,
+                                {"tools": tools, "disallowed_tools": routing.NO_GIT_WRITES})
     if (refusal := "" if cfg.replay.all else routing.fit_refusal(asked, target, routing.modes_for(cfg, work_repo))):
         raise control.Refused(refusal)
     spec = Spec(record.new_id("ses"), prompt, target.name, model, run_with, tools, work_repo.name if work_repo else "",
@@ -281,7 +281,7 @@ def turn_arguments(spec: Spec, cfg: config.Config, device: devices.Device) -> di
         return spec.budget_usd - record.metered_spent(spec.id) if spec.budget_usd else None
 
     return {"model": spec.model, "runner": spec.runner, "cfg": cfg, "device": device, "tools": spec.tools,
-            "allowed_tools": spec.tools, "disallowed_tools": runner.NO_GIT_WRITES, "remaining_budget": remaining_budget,
+            "allowed_tools": spec.tools, "disallowed_tools": routing.NO_GIT_WRITES, "remaining_budget": remaining_budget,
             "hard_cap": bool(spec.chat), "timeout": TURN_TIMEOUT_SECONDS, "say": lambda text: log_line(spec, "wait", text),
             "repo": session_repo(spec, cfg)}
 
@@ -744,6 +744,6 @@ def choices() -> dict:
     cfg = config.load()
     fleet = devices.known()
     return {"devices": [d.name for d in fleet],
-            "repos": [r.name for r in cfg.repos], "models": known_models(cfg), "runners": list(runner.RUNNERS),
+            "repos": [r.name for r in cfg.repos], "models": known_models(cfg), "runners": list(routing.RUNNERS),
             "tools": sorted(runner.KNOWN_TOOLS), "default_tools": SESSION_TOOLS, "default_model": cfg.model("session"),
             "idle_hours": cfg.session_idle_hours}

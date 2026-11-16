@@ -6,8 +6,8 @@ import string
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit, urlunsplit
 
-from . import config, research_budget, research_plan, research_search, runner, steps, util
-from .agent import Result
+from . import config, research_budget, research_plan, research_search, steps, util
+from .agent import WEB_TOOLS, Result
 from .pipeline import prompt
 
 MAX_ROUNDS = 2
@@ -298,7 +298,7 @@ def audited(cfg: config.Config, budget: research_budget.Budget, last: dict, curr
 def run(cfg: config.Config, budget: research_budget.Budget, plan: dict, evidence: dict, ref: str, judged: bool,
         values: dict, where: dict, cwd, add_dirs: list) -> Result:
     s = steps.resolve(cfg, None, "research_synthesis")
-    tools = [t for t in s.tools if t not in runner.WEB_TOOLS]
+    tools = [t for t in s.tools if t not in WEB_TOOLS]
     current, last, rounds, extra = evidence, None, [], []
     for round_no in range(MAX_ROUNDS + 1):
         got = ask(cfg, budget, s, tools, plan, current, ref, values, where, cwd, add_dirs, round_no)

@@ -41,7 +41,7 @@ def scenario(name):
 class Rig:
     def __init__(self, oncall=False, real_launch=False, build=True):
         from unittest import mock
-        from arete import config, loop_run, explain, loops, paths, runner, state, tasks, util, webpush, alerts
+        from arete import config, loop_run, explain, loops, paths, routing, state, tasks, util, webpush, alerts
         self.mock, self.state, self.util, self.loops, self.paths, self.config = mock, state, util, loops, paths, config
         self.wipe()
         paths.ensure_dirs()
@@ -55,7 +55,7 @@ class Rig:
         self.gate = None
         self.expire = tasks.expire_asks
         self.patches = [
-            mock.patch.object(runner, "usage_hold", lambda *a, **k: ""), mock.patch.object(webpush, "remind", lambda cfg: []),
+            mock.patch.object(routing, "usage_hold", lambda *a, **k: ""), mock.patch.object(webpush, "remind", lambda cfg: []),
             mock.patch.object(state, "release_settled_claims", lambda: None),
             mock.patch.object(explain, "plain_summary", lambda a, c: "fixed plain summary"),
             mock.patch.object(tasks, "expire_asks", self.spy_asks),

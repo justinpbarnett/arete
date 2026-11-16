@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass, field
 from decimal import Decimal
 
-from . import agent, runner, util
+from . import agent, routing, runner, util
 from .agent import Result
 
 MIN_CALL_SECONDS = 60
@@ -48,7 +48,7 @@ class Budget:
 
     def short(self, usd: float, seconds: float) -> bool:
         return bool(self.error) or not (math.isfinite(usd) and math.isfinite(seconds)) or (
-            usd <= runner.BUDGET_FLOOR_USD or seconds < MIN_CALL_SECONDS)
+            usd <= routing.BUDGET_FLOOR_USD or seconds < MIN_CALL_SECONDS)
 
     def add(self, paid: float) -> None:
         self.spent_usd = plus(self.spent_usd, paid)
@@ -69,7 +69,7 @@ class Budget:
         usd = min(usd, self.usd - self.spent_usd - (self.reserve_usd if reserve else 0))
         deadline = min(self.started + self.seconds - (self.reserve_seconds if reserve else 0),
                        time.monotonic() + seconds)
-        which = runner.chosen(kw.get("model", ""), kw.get("runner", ""), kw["cfg"])[0]
+        which = routing.chosen(kw.get("model", ""), kw.get("runner", ""), kw["cfg"])[0]
         while True:
             remaining, seconds = usd - spent, deadline - time.monotonic()
             if self.short(remaining, seconds):

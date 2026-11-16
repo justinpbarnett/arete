@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 
 from . import config, outbound, research_budget, research_search, runner, steps, util
 from . import research_synthesis as synth
+from .agent import WEB_TOOLS
 from .pipeline import prompt
 
 VERDICTS = ("supported", "contradicted", "inference", "unverifiable")
@@ -244,7 +245,7 @@ def ask(cfg: config.Config, budget: research_budget.Budget, s: steps.Settings, r
 def run(cfg: config.Config, budget: research_budget.Budget, answer: dict, evidence: dict, ref: str,
         judged: bool) -> Audit:
     s = steps.resolve(cfg, None, "research_audit")
-    read = [t for t in s.tools if t not in runner.WEB_TOOLS]
+    read = [t for t in s.tools if t not in WEB_TOOLS]
     audit = Audit()
     started = budget.spent_usd
     stop, failed = "", False

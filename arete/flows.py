@@ -16,6 +16,7 @@ from . import (
     pipeline,
     record,
     repairs,
+    routing,
     run_lines,
     runner,
     slots,
@@ -709,7 +710,7 @@ def revision(flow: factory.Flow, tree: str) -> Outcome:
                                               checks=job.checks, commands=job.commands,
                                               max_lines=layer.max_diff_lines, owner=run.owner_note),
                     job.ws, role=BUILD, allowed_tools=pipeline.bash_rules(job.builder_bash),
-                    disallowed_tools=runner.NO_GIT_WRITES, json_schema=pipeline.REVISE_SCHEMA)
+                    disallowed_tools=routing.NO_GIT_WRITES, json_schema=pipeline.REVISE_SCHEMA)
     if not res.ok or not isinstance(res.structured, dict):
         return end_as("fail", "failed", why="revise step failed", said=res.text)
     summary, replies = res.structured.get("summary", ""), res.structured.get("replies") or []
@@ -751,7 +752,7 @@ def repair(flow: factory.Flow, tree: str) -> Outcome:
                                               commands=job.commands, max_lines=layer.max_diff_lines,
                                               owner=run.owner_note),
                     job.ws, role=REVIEW_REPAIR, allowed_tools=pipeline.bash_rules(job.builder_bash),
-                    disallowed_tools=runner.NO_GIT_WRITES)
+                    disallowed_tools=routing.NO_GIT_WRITES)
     if not res.ok:
         return end_as("fail", "failed", why="repair step failed", said=res.text)
     if pipeline.stage(job.checkouts, diffguard.denied_paths(layer)).empty:
@@ -797,7 +798,7 @@ def build(job: Job) -> Outcome:
                                            max_lines=layer.max_diff_lines, estimate=job.estimate, verify=job.goal,
                                            owner=run.owner_note),
                     job.ws, role=BUILD, allowed_tools=pipeline.bash_rules(job.builder_bash),
-                    disallowed_tools=runner.NO_GIT_WRITES)
+                    disallowed_tools=routing.NO_GIT_WRITES)
     if not res.ok:
         return end_as("fail", "failed", why="build step failed", said=res.text)
     if not pipeline.stage(job.checkouts, diffguard.denied_paths(layer)).files:

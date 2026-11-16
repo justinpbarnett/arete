@@ -14,12 +14,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from . import accounts, browser, claude, config, environment, guard, paths, sandbox, uploads, util
+from . import accounts, browser, child, claude, config, environment, guard, paths, sandbox, uploads, util
 from . import scratch as verification_scratch
 from .agent import NO_SESSION, Result, Session, UsageLimit, credit_limit, json_from_text
 from .pi import SCHEMA_RULE
 
-EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
 LIMIT_SCOPE = "codex"
 LOGIN_VARS = ("CODEX_HOME",)
 NEVER = (*claude.PARENT_SESSION_VARS, "CODEX_API_KEY", "OPENAI_API_KEY")
@@ -490,7 +489,7 @@ def launch(cmd, cwd, prompt, env, timeout, on_line, *, hidden=(), scratch=(), ad
     confined = (attempt is None or not scratch or (sandbox.AUTHORITY.resolve() in protected
                      and paths.WORKTREES_DIR.resolve() in protected
                      and verification_scratch.isolation(attempt, "codex", False, add_dirs, mcp_config)))
-    return claude.run_streaming(cmd, str(cwd), prompt, env, timeout, on_line, actor_confined=confined)
+    return child.stream(cmd, str(cwd), prompt, env, timeout, on_line, actor_confined=confined)
 
 
 def _run(

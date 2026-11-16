@@ -914,18 +914,19 @@ def repair_line(row: dict) -> str:
 
 
 def route_refusal(cfg: config.Config, repo: config.Repo) -> tuple[str, bool]:
-    from . import devices, routing, runner, steps
+    from . import devices, routing, steps
+    from .agent import REPLAY
 
     try:
         layer = config.load_layer(repo.layer_dir)
         modes = routing.modes_for(cfg, repo)
         for role in ("plan", "build", *(("verify",) if layer.verify else ()), "review", *REPAIR_STEPS):
             setting = steps.resolve(cfg, layer, role, "fix")
-            which, name = runner.chosen(setting.model, setting.runner, cfg)
-            if which == runner.REPLAY:
+            which, name = routing.chosen(setting.model, setting.runner, cfg)
+            if which == REPLAY:
                 continue
-            request = runner.request_for(cfg, repo, which, name, None, True,
-                                         {"tools": list(setting.tools), "disallowed_tools": list(setting.denied)})
+            request = routing.request_for(cfg, repo, which, name, None, True,
+                                          {"tools": list(setting.tools), "disallowed_tools": list(setting.denied)})
             if why := routing.fit_refusal(request, devices.LOCAL, modes):
                 return f"{role}: {why}", True
             routes = route_outlook(cfg, repo, setting)

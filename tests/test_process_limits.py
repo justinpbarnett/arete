@@ -17,7 +17,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from arete import (
-    claude,
+    child,
     cli,
     config,
     control,
@@ -661,7 +661,7 @@ class BudgetTests(Isolated):
         def transport(*args, **kw):
             code = (f"import os,time;from pathlib import Path;Path({str(pid_file)!r}).write_text(str(os.getpid()));"
                     "time.sleep(20)")
-            return claude.run_streaming([sys.executable, "-I", "-c", code], str(workspace), "", {}, 30, lambda _: None)
+            return child.stream([sys.executable, "-I", "-c", code], str(workspace), "", {}, 30, lambda _: None)
 
         def drive(flow):
             run = flow.ctx.run

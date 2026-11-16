@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Literal
 
 from . import (
@@ -16,6 +16,7 @@ from . import (
     install,
     paths,
     pi,
+    routing,
     runner,
     state,
     steps,
@@ -133,9 +134,42 @@ def check_oncall(cfg: config.Config) -> list[Check]:
     return [Check("oncall:scan", ok, detail)]
 
 
-def check_pi_auth(cfg: config.Config) -> list[Check]:
+@dataclass(frozen=True)
+class Call:
+    runner: str
+    model: str
+    repo_name: str
+    device: str
+    repo: config.Repo | None = field(default=None, compare=False)
+
+
+def configured_calls(cfg: config.Config) -> list[Call]:
     from . import loops
 
+    found = []
+    for repo in [None, *cfg.repos]:
+        try:
+            layer = config.load_layer(repo.layer_dir) if repo else None
+        except (ValueError, TypeError, OSError):
+            continue
+        for kind in ("", *config.KINDS):
+            for role in config.STEP_ROLES:
+                try:
+                    step = steps.resolve(cfg, layer, role, kind)
+                except ValueError:
+                    continue
+                found.append(Call(step.runner, step.model, repo.name if repo else "", "local", repo))
+    for loop in loops.load_all(cfg):
+        if loop.error:
+            continue
+        repo = loop.work_repo(cfg) if loop.repo else None
+        for model in loop.agent_models(cfg):
+            which, name = routing.route(model, loop.runner)
+            found.append(Call(which, name, repo.name if repo else "", loop.device, repo))
+    return list(dict.fromkeys(found))
+
+
+def check_pi_auth(cfg: config.Config) -> list[Check]:
     if cfg.replay.all:
         return []
     configured = accounts.mapping(pi.model_configuration().get("providers"))
@@ -147,29 +181,12 @@ def check_pi_auth(cfg: config.Config) -> list[Check]:
     if default := pi.default_provider():
         names.add(default)
     calls = [(f"{p}/*", None, "local", False) for p in names]
-    for repo in [None, *cfg.repos]:
-        try:
-            layer = config.load_layer(repo.layer_dir) if repo else None
-        except (ValueError, TypeError, OSError):
-            continue
-        for kind in ("", *config.KINDS):
-            for role in config.STEP_ROLES:
-                try:
-                    step = steps.resolve(cfg, layer, role, kind)
-                    if step.runner == "pi":
-                        calls.append((step.model, repo, "local", True))
-                except ValueError:
-                    continue
-    for loop in loops.load_all(cfg):
-        if not loop.error:
-            repo = loop.work_repo(cfg) if loop.repo else None
-            calls += [(runner.route(m, loop.runner)[1], repo, loop.device, True) for m in loop.agent_models(cfg)
-                      if runner.route(m, loop.runner)[0] == "pi"]
+    calls += [(c.model, c.repo, c.device, True) for c in configured_calls(cfg) if c.runner == "pi"]
     out = {}
     for model, repo, device, required in calls:
-        selected = runner.pi_route(model, cfg, repo, device)
+        selected = routing.pi_route(model, cfg, repo, device)
         provider = selected.provider or "unspecified"
-        hold = runner.auth_hold(selected.auth, selected.model)
+        hold = routing.auth_hold(selected.auth, selected.model)
         source = f"SDK-managed {selected.managed.kind}" if selected.managed else "key"
         detail = (selected.error if selected.error else "held login; waiting" if hold else
                   f"login-backed ({'subscription' if selected.auth.mode == 'subscription' else 'metered'})"
@@ -196,26 +213,7 @@ def check_pi_auth(cfg: config.Config) -> list[Check]:
 
 
 def uses_codex(cfg: config.Config) -> bool:
-    from . import loops
-
-    if cfg.replay.all:
-        return False
-    layers = [None]
-    for repo in cfg.repos:
-        try:
-            layers.append(config.load_layer(repo.layer_dir))
-        except (ValueError, TypeError, OSError):
-            continue
-    for layer in layers:
-        for kind in ("", *config.KINDS):
-            for role in config.STEP_ROLES:
-                try:
-                    if steps.resolve(cfg, layer, role, kind).runner == "codex":
-                        return True
-                except ValueError:
-                    continue
-    return any(not loop.error and any(runner.route(model, loop.runner)[0] == "codex"
-                                     for model in loop.agent_models(cfg)) for loop in loops.load_all(cfg))
+    return not cfg.replay.all and any(call.runner == "codex" for call in configured_calls(cfg))
 
 
 def check_hook() -> list[Check]:

@@ -7,8 +7,22 @@ import tomllib
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from . import config, evals, experiment, implbench, paths, pipeline, record, replay, runner, steps, util, workspace
-from .agent import Result
+from . import (
+    config,
+    evals,
+    experiment,
+    implbench,
+    paths,
+    pipeline,
+    record,
+    replay,
+    routing,
+    runner,
+    steps,
+    util,
+    workspace,
+)
+from .agent import Result, traits_of
 
 KINDS = ("patch", "test", "explore", "extract")
 RULES = ("unchanged_patch", "same_failure", "either")
@@ -108,7 +122,7 @@ def load(path: Path) -> implbench.Bench:
     held = {arm: {**b, "escalation": resolved_escalation(exp, arm, b["escalation"])} for arm, b in arms.items()}
     design = {**exp.design, "workers": {"kinds": kinds, "references": references, "arms": held}}
     codex = [f"arms.{arm}.escalation ({w} {e['model']})" for arm, b in held.items() if (e := b["escalation"])
-             and (w := runner.stands_for(e["model"], e["runner"])[0]) in runner.CANNOT_STOP]
+             and traits_of(w := routing.stands_for(e["model"], e["runner"])[0]).cannot_stop]
     return implbench.Bench(replace(exp, design=design, digest=experiment.sha_json(design)[:12], checks_required=True,
                                    make_run=worker_run, recovered=recovered, codex=[*exp.codex, *codex]), kinds,
                            references)
