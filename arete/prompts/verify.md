@@ -33,7 +33,7 @@ $diff
 ## How to check
 
 Arete already ran the repo's checks, and they pass: $checks. Do not run them again.
-Keep each shell command short enough to finish inside the step budget. Do not wait with chained sleeps; poll a background run with a single short command at a time.
+Before starting a check, identify whether it fits the remaining step budget. Do not start or repeat a check that cannot finish in that budget; report it as blocked if essential. Do not wait with chained sleeps; poll a background run with a single short command at a time.
 
 $surface
 

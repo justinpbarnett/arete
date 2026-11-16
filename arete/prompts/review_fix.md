@@ -9,7 +9,7 @@ loss blocker for that reason.
 Shell commands can be refused. Do not get around a refusal with another interpreter or shell command. If a check
 cannot run, say so on its line and do not report it as passed.
 
-The reviewer also left notes. Fix a note only when the fix is small and inside the issue; leave the rest.
+Fix every reviewer note that identifies a real defect, including minor findings, when it is within the issue and your tools. Leave preferences and out-of-scope notes. State why any real finding remains open.
 
 $notes
 
