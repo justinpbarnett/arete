@@ -10,6 +10,7 @@ from .agent import BUILD_TOOLS, READ_ONLY_TOOLS, READ_TOOLS, REPLAY, TRAITS, WEB
 
 DEFAULTS = {"tools": tuple(READ_TOOLS), "mcp": (), "session": "fresh"}
 BUILT_IN = {"verify": {"directory_cleanup": True}, "build": {"tools": tuple(BUILD_TOOLS), "session": "resume"},
+            "orchestrate": {"tools": (), "mcp": (), "instructions": (), "session": "fresh"},
             "learn": {"timeout_minutes": 15}, "uat": {"timeout_minutes": 10, "tries": 3},
             "research_plan": {"timeout_minutes": 10, "tries": 2},
             "research_search": {"timeout_minutes": 10, "tries": 2, "tools": WEB_TOOLS},
@@ -200,7 +201,9 @@ def check_reach(where: str, cfg: config.Config, role: str, which: str, found: di
     if bad := [t for t in tools if t not in STEP_TOOLS and t not in web]:
         raise ValueError(f"{where}: tools {', '.join(bad)} is not a built in tool a step takes; use "
                          f"{', '.join(STEP_TOOLS)}, since shell rules come from the layer and servers from mcp")
-    if (role not in SEARCHES and traits.always_granted_tools
+    if role == "orchestrate" and (tools or mcp or instructions):
+        raise ValueError(f"{where}: the controller takes no tools, MCP servers or instruction scopes")
+    if (role != "orchestrate" and role not in SEARCHES and traits.always_granted_tools
             and (missing := [t for t in traits.always_granted_tools if t not in tools])):
         raise ValueError(f"{where}: tools {', '.join(tools) or '[]'} leaves out {', '.join(missing)}, which {which} always "
                          "grants; list them")
@@ -286,7 +289,8 @@ def resolve(cfg: config.Config, layer: config.RepoLayer | None, step: str, kind:
     requires = routing.Requirements(
         modalities=tuple(found.get("modalities", ())), min_context=found.get("min_context", 0),
         structured_output=found.get("structured_output", False), data_handling=tuple(found.get("data_handling", ())),
-        floor=floor, approved=floors.get(floor, ()), directory_cleanup=found.get("directory_cleanup", False))
+        floor=floor, approved=floors.get(floor, ()), directory_cleanup=found.get("directory_cleanup", False),
+        delegation_only=role == "orchestrate")
     return Settings(step=role, tier=tier, runner=which, provider=provider, model=name, effort=effort,
                     timeout_minutes=found["timeout_minutes"], tries=found["tries"], tools=found["tools"],
                     mcp=found["mcp"], instructions=instructions, session=found["session"], notes=notes,

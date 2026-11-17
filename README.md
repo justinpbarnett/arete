@@ -808,7 +808,12 @@ The run log, the `<step>.json` files, the tables and the records stay as they we
 
 ## The seam
 
-`arete/factory.py` is one seam that a run's steps can go through. The steps in `arete/flows.py` run on it, in the order the [scripts in `adws/`](#the-adw-scripts) give, when a repo's layer sets `[factory] path = "adw"`, on any repo; every other run takes the classic pipeline and behaves as before.
+New delivery runs default to the [delegation-only orchestrator](docs/orchestration.md), which chooses bounded worker actions while Arete owns safety, evidence and publication.
+Explicit `[factory] path = "classic"` and `path = "adw"` retain their fixed pipelines, and explicitly invoked scripts retain their own strategy.
+Existing private layer pins are not rewritten.
+
+`arete/factory.py` is the shared lifecycle seam.
+The fixed [scripts in `adws/`](#the-adw-scripts) call ordered steps from `arete/flows.py`; the adaptive script uses those atomic helpers with a separate durable SQLite action ledger, not positional step replay.
 
 - `factory.Outcome(result, next="", feedback="", data={}, session=NO_SESSION)` is what a step returns. `result` is `pass`, `fail`, `ask` or `stop`, and any other value raises. `next` names the step to run next, or is empty for the flow's own order. `data` is a JSON object. `outcome.passed` is true for `pass` alone.
 - `@factory.step("name")` registers `fn(flow, *args, **kw) -> Outcome` in `factory.STEPS`. A name registers once.
@@ -824,7 +829,10 @@ Every agent step of an adw run has the `ask_owner` tool (claude and codex throug
 
 ### The adw flow
 
-`[factory] path` in a layer is `classic` (the default) or `adw`; any other value fails the layer's load. The switch works on every repo. A repo with a `github` name gets its PRs, CI watch, ticket comment and merge as a classic run does. A repo with no `github` name needs a git remote `origin`, or `arete run` refuses it as before, and gets a pushed branch.
+`[factory] path` in a layer is `orchestrated` (the default), `classic` or `adw`; any other value fails the layer's load.
+The following section describes explicitly selected fixed ADW runs.
+A repo with a `github` name gets its PRs, CI watch, ticket comment and merge as a classic run does.
+A repo with no `github` name still needs a git remote `origin` and gets a pushed branch.
 
 A run with open review feedback takes the revise flow (`adws/revise.py`); any other run takes the feature flow (`adws/feature.py`). The flows run these seam steps, each with the pipeline's own helpers and the agent call names of the classic run (`plan`, `build`, `revise`, `fix2`, `review_fix`, `ci_fix`, `verify`, `verify2`, `review`, `review2`, `learn`, `learn2`):
 
@@ -855,6 +863,8 @@ The order of an adw run's steps lives in short scripts in `adws/` at the top of 
 
 | script | holds |
 |---|---|
+| `adws/orchestrate.py` | Delegation-only adaptive delivery, the implicit default for new runs. |
+| `adws/single_worker.py` | One implementation worker without planning, retaining the adaptive engine gates; used for whole-workflow comparisons. |
 | `adws/feature.py` | The feature flow: `prepare`, `plan`, `implement`, the `checks` and fix loop, `verify`, `review` and the review fix, `learn`, `document` when on, then `pr`, `ci` and `publish`. |
 | `adws/patch.py` | The small-patch flow: `prepare`, direct implementation, targeted checks, independent review, final full checks and focused verification, then the usual publication steps; escalates to the feature flow when needed. |
 | `adws/revise.py` | The revise flow: the same order with `revise` in place of `plan` and `implement`. |
@@ -878,7 +888,8 @@ Run them with the Python that has arete installed (`uv run python adws/feature.p
 - `--set step.key=value` overrides one setting of one step for this run, with the keys and values of `[steps]` (see [Steps](#steps)); repeat it for more. The step names are the seam's (`plan`, `implement`, `revise`, `verify`, `review`, `learn`, `document`); `implement`, `revise` and `repair` set the build step, and `check_repair`, `review_repair` and `ci_repair` set the repair steps. A value `[steps]` would not take is refused before any run starts.
 - `step.py <run id> <step> [key=value ...]` reads the script the earlier run used from the `path` on its `task` line and runs it with `--continue <run id> --only <step>`, each `key=value` as `--set <step>.key=value`. It refuses a run that did not come from a script, a step the run never started, and settings for a step that calls no agent. The step runs in the earlier run's work folder. A run that ended `done` or with a PR has removed it, so the step makes it again from the run's branch on origin and runs the setup commands; when the branch is not on origin, it refuses and names the folder.
 
-`arete run` on a repo whose layer sets `[factory] path = "adw"` replaces itself with `adws/revise.py` when the ticket has review feedback due and `adws/feature.py` otherwise, run by the same Python. The poller, and a skipped ticket run from the dashboard, start runs the same way; `pipeline.run_command(repo, ticket)` returns the command they use. Every other repo starts `arete run` as before.
+`arete run` on a repo whose layer sets `[factory] path = "adw"` replaces itself with `adws/revise.py` when the ticket has review feedback due and `adws/feature.py` otherwise, run by the same Python. The poller, and a skipped ticket run from the dashboard, start runs the same way; `pipeline.run_command(repo, ticket)` returns the command they use. An unpinned repo starts `adws/orchestrate.py`; an explicitly classic repo retains the classic pipeline.
+Resumes, owner answers and feedback retain their source execution mode.
 
 To change a flow, copy `adws/` to a folder of your own, edit the scripts there and set `[factory] adws = "<folder>"` in `~/.config/arete/config.toml` (a relative folder counts from the config's folder). A script defines a function named after its file (`feature` in `feature.py`), which takes the run's `factory.Flow`. When the folder or the script is missing, the run fails before it starts with `adws folder <folder> does not exist` or `no adw script <file>`.
 
@@ -1016,6 +1027,7 @@ private_key = "~/.config/arete/github-app.pem"
 | `[[job]]` | launchd jobs the heartbeat watches, by `label`. A `keepalive` job must have a pid; others must have last exited 0. `log` with `max_age_hours` flags a stale log. |
 | `[[probe]]` | Real calls the heartbeat makes every `every_hours`: a `command` whose output must contain `expect`. A real call, because an auth check can say ready while real calls fail on an expired token. |
 | `[research]` | `planner` (default false) turns on the planning stage of a research run. `search` (default false, needs `planner = true`) runs the plan's tasks as bounded search workers; `search_workers` (default 3, from 1 to 8) is how many run at once and `search_share` (default 0.6, above 0 and under 1) the share of the run's remaining money and time they may use. `synthesis` (default false, needs `search = true`) has a collator with no web tools write the report from the workers' evidence. `audit` (default false, needs `synthesis = true`) has a fresh auditor check the collator's claims against their sources before the report is written. See [Triage](#triage). |
+| `[orchestration]` | Finite adaptive limits: `max_decisions = 64`, `max_actions = 128`, `max_workers = 3`, `progress_seconds = 30`; each is an integer from 1 to 10000. See [Orchestration](docs/orchestration.md). |
 | `[ask]` | `max_per_run` (default 3) is how many asks an adw run may send; the next one ends the run `needs-info` and names the limit. `settle` (default true) lets JEV take the recommended options of an ask made only of `choice` questions, at 0.9 or more, without the owner. `expire_days` (default 7, a number above 0 and at most 3650) is how long a parked ask waits for an answer. `remind_hours` (default 24, a number above 0) is when one reminder push goes for an ask still open. `push_contact` (default empty, `mailto:` or `https://`) is the contact a push token carries. See [The seam](#the-seam). |
 | `[oncall]` | `enabled` (default false) turns on the log watcher; `vision`, `scope`, `confidence` and `injection` steer JEV's decision on each incident; `max_repairs`, `wakes_per_hour`, `max_attempts`, `incident_budget_usd`, `daily_budget_usd` and `cooldown_minutes` bound the repairs it wakes, and `keep_days` how long a closed incident keeps its notes and evidence; `[[oncall.source]]` adds other logs, each with its own `vision` and `scope`. See [On-call](#on-call). |
 | `[jira]` | See [Jira tickets](#jira-tickets). |

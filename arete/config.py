@@ -18,7 +18,8 @@ MODEL_FALLBACKS = {"triage": "haiku", "chat": "opus", "classify": "haiku", "loop
                    "research_synthesis": "opus", "research_audit": "opus", "explain": "haiku",
                    "capture_evidence": "sonnet"}
 STEP_ALIASES = {"implement": "build"}
-INHERITS = {"check_repair": "build", "review_repair": "build", "ci_repair": "build", "eval_grade": "verify"}
+INHERITS = {"check_repair": "build", "review_repair": "build", "ci_repair": "build", "eval_grade": "verify",
+            "orchestrate": "plan"}
 STEP_ROLES = (*MODEL_ROLES, *INHERITS)
 STEP_NAMES = (*STEP_ROLES, *STEP_ALIASES)
 AB_KEYS = ("step", "kind", "share", "arm")
@@ -50,7 +51,25 @@ MAX_ASK_EXPIRE_DAYS = 3650
 RETENTION_KEYS = ("days", "max_gb", "lines_days", "db_max_mb")
 BACKUP_KEYS = ("copy_to",)
 CHAT_KEYS = ("context_tokens", "summary_model", "max_sessions", "budget_usd")
-FACTORY_PATHS = ("classic", "adw")
+FACTORY_PATHS = ("orchestrated", "classic", "adw")
+
+
+@dataclass(frozen=True)
+class Orchestration:
+    max_decisions: int = 64
+    max_actions: int = 128
+    max_workers: int = 3
+    progress_seconds: int = 30
+
+
+def orchestration_table(data) -> Orchestration:
+    defaults = Orchestration()
+    if not isinstance(data, dict) or set(data) - defaults.__dataclass_fields__.keys():
+        raise ValueError("[orchestration] contains unknown settings")
+    values = {name: data.get(name, getattr(defaults, name)) for name in defaults.__dataclass_fields__}
+    if any(type(value) is not int or not 0 < value <= 10000 for value in values.values()):
+        raise ValueError("[orchestration] limits must be integers between 1 and 10000")
+    return Orchestration(**values)
 ENV_NAME = r"\*|[A-Za-z_][A-Za-z0-9_]*\*?"
 ENV_KEYS = ("pass", "providers")
 
@@ -1146,6 +1165,7 @@ class RepoLayer:
     steps: dict[str, dict] = field(default_factory=dict)
     kinds: dict[str, dict[str, dict]] = field(default_factory=dict)
     factory_path: str = FACTORY_PATHS[0]
+    orchestration: Orchestration = field(default_factory=Orchestration)
     tier_map: str = ""
     passes: tuple[str, ...] = ()
     document: dict = field(default_factory=dict)
@@ -1170,7 +1190,7 @@ class RepoLayer:
 
 
 LAYER_SECTIONS = {"setup", "checks", "targeted_commands", "check_policy", "limits", "agent", "trust", "git", "verify", "research", "steps", "kinds", "tiers",
-                  "factory", "environment", "routing", "document", "ab"}
+                  "factory", "environment", "routing", "document", "ab", "orchestration"}
 
 
 def string_list(value, where: str) -> tuple[str, ...]:
@@ -1264,6 +1284,7 @@ def load_layer(layer_dir: Path, strict: bool = False) -> RepoLayer:
     layer.steps = step_tables(section(data, "steps"), "steps", ignored)
     layer.kinds = kind_tables(section(data, "kinds"), "kinds", ignored)
     layer.ab = ab_tables(section(data, "ab"))
+    layer.orchestration = orchestration_table(section(data, "orchestration"))
     layer.factory_path = str(section(data, "factory").get("path", layer.factory_path)).strip()
     layer.tier_map = str(section(data, "factory").get("tier_map", "")).strip()
     layer.patch = patch_policy(table_of(section(data, "factory").get("patch", {}), "factory.patch"))

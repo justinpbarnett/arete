@@ -30,6 +30,7 @@ class RunnerTraits:
     cannot_gate: str = ""
     no_server_access: str = ""
     uploads_supported: bool = False
+    delegation_only: bool = False
 
 
 TRAITS = {
@@ -38,6 +39,7 @@ TRAITS = {
     "pi": RunnerTraits(
         efforts=("off", "minimal", "low", "medium", "high", "xhigh", "max"), payment_modes=("subscription", "api_key", "local"), takes_mcp=False,
         instruction_scopes=(), default_instructions=(), always_granted_tools=tuple(READ_TOOLS),
+        delegation_only=True,
         cannot_gate="pi restates a structured answer in a second launch that cannot be gated against the calls "
                     "and time limits",
         no_server_access="pi has no restricted Bash, so it cannot run the arete session commands"),
@@ -48,7 +50,8 @@ TRAITS = {
         cannot_stop="codex reports usage only when its turn ends, so it cannot stop a call at a token or spend limit",
         no_server_access="codex runs with the network off, so it cannot reach the arete server"),
 }
-TRAITS[REPLAY] = RunnerTraits(efforts=tuple(dict.fromkeys(level for found in TRAITS.values() for level in found.efforts)))
+TRAITS[REPLAY] = RunnerTraits(efforts=tuple(dict.fromkeys(level for found in TRAITS.values() for level in found.efforts)),
+                             delegation_only=True)
 OPEN_TRAITS = RunnerTraits()
 
 

@@ -128,7 +128,7 @@ def cmd_replay(args) -> int:
     from .. import replay
 
     try:
-        lines = replay.sample(paths.expand(args.folder), adw=args.adw)
+        lines = replay.sample(paths.expand(args.folder), adw=args.adw, orchestrated=args.orchestrated)
     except (OSError, RuntimeError) as e:
         print(e, file=sys.stderr)
         return 1
@@ -181,7 +181,9 @@ def register(sub) -> None:
                                       "bare origin, a layer and an answer per ticket step")
     p.add_argument("action", choices=("sample",))
     p.add_argument("folder")
-    p.add_argument("--adw", action="store_true", help="turn on [factory] path = \"adw\" in the sample layer")
+    modes = p.add_mutually_exclusive_group()
+    modes.add_argument("--adw", action="store_true", help="pin the sample to the fixed adw flow")
+    modes.add_argument("--orchestrated", action="store_true", help="write adaptive controller/worker replay answers")
     p.set_defaults(fn=cmd_replay)
 
     p = steering(sub.add_parser("wait", help="follow a run through the server, printing its step_end, question, "

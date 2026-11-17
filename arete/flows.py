@@ -45,7 +45,8 @@ REVIEW_REPAIR = "review_repair"
 CI_REPAIR = "ci_repair"
 ROLE_OF = {"plan": "plan", "patch": BUILD, "implement": BUILD, "revise": BUILD, "repair": BUILD, "verify": "verify", "review": "review", "learn": "learn",
            "document": "document"}
-SETTABLE = {**ROLE_OF, CHECK_REPAIR: CHECK_REPAIR, REVIEW_REPAIR: REVIEW_REPAIR, CI_REPAIR: CI_REPAIR}
+SETTABLE = {**ROLE_OF, "orchestrate": "orchestrate", CHECK_REPAIR: CHECK_REPAIR,
+            REVIEW_REPAIR: REVIEW_REPAIR, CI_REPAIR: CI_REPAIR}
 
 
 def atom_of(name: str, kw: dict) -> str:
@@ -111,6 +112,12 @@ def kept_pending(job: Job, continues: str) -> bool:
 
 
 def guard(job: Job, continues: str) -> str:
+    from .store import orchestration
+
+    if orchestration.publication_pending(continues):
+        return "publication was interrupted; reconcile its branch/PR effects before resuming"
+    if getattr(job.run, "action", "") and (why := action_workspace_refusal(continues)):
+        return why
     data = prepared_data(continues)
     branch, listed = str(data.get("branch") or ""), data.get("checkouts")
     if not continues or not branch or not isinstance(listed, list):
@@ -133,9 +140,24 @@ def guard(job: Job, continues: str) -> str:
     return ""
 
 
+def adaptive_state(run_id: str) -> dict:
+    from .store import orchestration
+
+    return orchestration.find(run_id).get("data", {})
+
+
 def prepared_data(continues: str) -> dict:
+    if prepared := adaptive_state(continues).get("prepared"):
+        return prepared
     prepared = factory.passed_data(factory.history(factory.chain(continues)), "prepare")
     return prepared[-1] if prepared else {}
+
+
+def action_workspace_refusal(run_id: str) -> str:
+    checkouts = prepared_data(run_id).get("checkouts") or []
+    if checkouts and all(c.get("wt") and (Path(c["wt"]) / ".git").exists() for c in checkouts):
+        return ""
+    return "adaptive action reruns need retained worktrees; the saved workspace was removed"
 
 
 def base_moved(continues: str) -> str:
@@ -173,6 +195,8 @@ def authors(run_id: str) -> set[str]:
 
 
 def publication(run_id: str) -> dict:
+    if published := adaptive_state(run_id).get("publication"):
+        return published
     for read in factory.chain(run_id):
         for line in reversed(factory.ends(read)):
             data = line.get("data")
@@ -864,10 +888,16 @@ def checks(flow: factory.Flow, tree: str, attempt: int = 1, tries: int = 1, afte
 
 
 @factory.step("verify")
-def verify(flow: factory.Flow, tree: str) -> Outcome:
+def verify(flow: factory.Flow, tree: str, single: bool = False) -> Outcome:
     job: Job = flow.ctx
     b = job.staged()
-    verified = pipeline.verify_in_use(b, job.with_left(job.goal), job.build_summary)
+    if single and "refactor" in job.ticket.labels:
+        verified = Verified("unverified", "Check in use skipped because the ticket is labeled `refactor`.")
+    elif single and not job.layer.verify:
+        verified = pipeline.verify.not_configured(job.layer.dir, job.ws)
+    else:
+        check = pipeline.check_in_use if single else pipeline.verify_in_use
+        verified = check(b, job.with_left(job.goal), job.build_summary)
     return Outcome("pass", data={"verified": asdict(verified), "names": dict(b.steps), "story": job.run.story,
                                  "policy": job.policy("verify", {}), "checked": b.checked})
 

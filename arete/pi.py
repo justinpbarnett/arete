@@ -474,7 +474,7 @@ def private_dir(path: Path) -> None:
         raise ValueError("pi route directory must be a private directory")
 
 
-def prepare(route: Route) -> Path:
+def prepare(route: Route, *, delegation_only: bool = False) -> Path:
     root = sandbox.LOGIN_DIR if route.using_login else sandbox.KEY_DIR
     private_dir(root)
     auth = root / "auth.json"
@@ -487,7 +487,11 @@ def prepare(route: Route) -> Path:
         with (folder / "auth.json").open("x") as out:
             out.write("{}")
         (folder / "auth.json").chmod(0o600)
-    for name, value in (("models.json", route.models), ("settings.json", route.settings)):
+    settings = route.settings
+    if delegation_only:
+        settings = {**settings, "retry": {"enabled": False, "provider": {"maxRetries": 0}},
+                    "compaction": {"enabled": False}, "cacheWarming": "off", "transport": "sse"}
+    for name, value in (("models.json", route.models), ("settings.json", settings)):
         with (folder / name).open("x") as out:
             json.dump(value, out)
     return folder
@@ -546,7 +550,7 @@ def launch_env_names(route: Route) -> list[str]:
 
 
 def guard_env(floor: guard.Floor, auth_paths: list[Path] | None = None,
-              secret_paths: tuple[Path, ...] = ()) -> dict[str, str]:
+              secret_paths: tuple[Path, ...] = (), *, delegation_only: bool = False) -> dict[str, str]:
     sources = {PI_HOME / "agent", owner_dir(), *(path.parent for path in auth_paths or [])}
     roots = [*floor.closed, PI_HOME, *sorted(sources), sandbox.AGENT_DIR, sandbox.LOGIN_DIR, sandbox.KEY_DIR,
              Path("/proc"), Path("/dev")]
@@ -557,7 +561,8 @@ def guard_env(floor: guard.Floor, auth_paths: list[Path] | None = None,
     for path in auth:
         files.extend((path, path.resolve(), Path(str(path) + ".lock"), Path(str(path.resolve()) + ".lock")))
     files.extend(path for source in secret_paths for path in (source, source.resolve()))
-    return {"ARETE_PI_GUARD_PATHS": json.dumps({"roots": list(map(str, roots)), "files": list(map(str, files)),
+    return {"ARETE_PI_GUARD_PATHS": json.dumps({"delegation_only": delegation_only,
+                                              "roots": list(map(str, roots)), "files": list(map(str, files)),
                                               "open": list(map(str, floor.open)),
                                               "write_roots": [str(paths.PACKAGE_DIR)],
                                               "write_files": [str(GUARD_FILE), str(ASK_FILE)]})}
@@ -741,7 +746,7 @@ def run(*args, auth: accounts.Auth | None = None, selected: Route | None = None,
         folder = None
         try:
             if selected and selected.view is None:
-                folder = prepare(selected)
+                folder = prepare(selected, delegation_only=kw.get("delegation_only", False))
                 selected = replace(selected, view=folder)
             result = _run(*args, auth=auth, selected=selected, **kw)
         except (OSError, ValueError) as e:
@@ -791,6 +796,7 @@ def _run(
     extra_env: dict[str, str] | None = None,
     ask_owner: bool = False,
     floor: guard.Floor | None = None,
+    delegation_only: bool = False,
 ) -> Result:
     auth = auth if auth is not None else accounts.Auth("api_key")
     if mcp_servers(mcp_config):
@@ -806,6 +812,8 @@ def _run(
 
         floor = guard.floor(os.environ.get("ARETE_RUN_ID", ""), cwd, add_dirs)
     names = [name for name in tool_names(tools, allowed_tools, disallowed_tools) if name in GUARDED_TOOLS]
+    if delegation_only and (names or ask_owner or resume.id or json_schema or system or add_dirs or persist):
+        raise ValueError("controller requires a fresh tool-free, non-restating invocation")
     if persist or resume.id:
         sandbox.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     launch_model = selected.model.partition("/")[2] if selected else model
@@ -828,7 +836,8 @@ def _run(
     cmd = [*cmd, "--", prompt]
     folder = selected.view
     env = {**selected.env, **(extra_env or {}), "PI_CODING_AGENT_DIR": str(folder),
-           **guard_env(floor, [selected.owner, folder / "auth.json"], selected.sensitive_files),
+           **guard_env(floor, [selected.owner, folder / "auth.json"], selected.sensitive_files,
+                       delegation_only=delegation_only),
            **({"ARETE_ASK_TOOL": json.dumps(owner_asks.pi_tool())} if ask_owner else {})}
     try:
         with refresh_channel(selected, env) as descriptors:

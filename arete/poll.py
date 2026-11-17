@@ -104,8 +104,10 @@ def step_without_route(cfg: config.Config, repo: config.Repo, ticket: tracker.Ti
                   discovery: routing.Discovery, layer: config.RepoLayer) -> str:
     if cfg.replay.all:
         return ""
-    first = ("plan", "build")
-    if (layer.factory_path == pipeline.ADW and len(repo.parts) <= 1
+    mode = pipeline.dispatch_path(repo, str(ticket.id))
+    adaptive = mode in (pipeline.ORCHESTRATED, "orchestrate")
+    first = ("orchestrate", "build") if adaptive else ("plan", "build")
+    if (not adaptive and layer.factory_path == pipeline.ADW and len(repo.parts) <= 1
             and patching.requested(layer, ticket, automatic=cfg.triage.route_fixes)
             and not patching.specification_refusal(ticket)):
         first = ("build",)
@@ -114,7 +116,9 @@ def step_without_route(cfg: config.Config, repo: config.Repo, ticket: tracker.Ti
             and repaired_by(newest["id"])):
         first = ("review_repair",)
     elif pending_feedback(repo.name, ticket.id):
-        first = ("build",)
+        source = next(iter(run_store.open_runs(repo.name, ticket.id)), None)
+        if not source or pipeline.recorded_path(source["id"]) not in (pipeline.ORCHESTRATED, "orchestrate"):
+            first = ("build",)
     for role in (*first, *(("verify",) if layer.verify else ()), "review"):
         setting = steps.resolve(cfg, layer, role, ticket.kind, ticket=(repo.name, str(ticket.id)))
         if setting.runner == REPLAY:
