@@ -85,8 +85,13 @@ class Catalog:
             for n, link in enumerate(setting.chain):
                 overrides = {"runner": link.runner, "provider": link.provider, "model": link.model,
                              "effort": link.effort}
-                selected = steps.resolve(job.cfg, job.layer, role, job.run.kind, overrides,
-                                         job.run.step_overrides.get(config.INHERITS.get(role, ""), {}))
+                try:
+                    selected = steps.resolve(job.cfg, job.layer, role, job.run.kind, overrides,
+                                             job.run.step_overrides.get(config.INHERITS.get(role, ""), {}))
+                except ValueError:
+                    if link.requested:
+                        raise
+                    continue
                 if role in ("verify", "review"):
                     selected = replace(selected, requires=replace(selected.requires, gated_launches=True))
                 key = f"model:{role}:{n}"
