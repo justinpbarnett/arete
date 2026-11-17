@@ -60,8 +60,9 @@ class Worker:
         log = run.dir / f"{action}-driver.log"
         try:
             with log.open("ab") as output:
-                self.proc = scratch.spawn(command, stdin=subprocess.PIPE, stdout=output, stderr=output,
-                                          pass_fds=(peer.fileno(),), start_new_session=True)
+                # The trusted SDK broker applies the runner's sandbox; nesting it prevents native startup on macOS.
+                self.proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=output, stderr=output,
+                                             pass_fds=(peer.fileno(),), start_new_session=True)
             self.proc.stdin.write(json.dumps(request).encode())
             self.proc.stdin.close()
             self.pid = self.proc.pid

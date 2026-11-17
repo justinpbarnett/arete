@@ -1,9 +1,13 @@
+function idempotencyKey() {
+  return Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
 export function prepareWrite(url, data = {}, object = null, options = {}) {
   const body = { ...data };
   delete body.base_version;
   if (object?.version != null) body.base_version = object.version;
   return Object.freeze({ url, method: options.method ?? "POST", body: JSON.stringify(body),
-    key: crypto.randomUUID(), keepalive: Boolean(options.keepalive) });
+    key: idempotencyKey(), keepalive: Boolean(options.keepalive) });
 }
 
 function headers(request) {
@@ -11,7 +15,7 @@ function headers(request) {
 }
 
 export function postBody(url, body, type) {
-  return fetch(url, { method: "POST", headers: headers({ key: crypto.randomUUID(), type }), body });
+  return fetch(url, { method: "POST", headers: headers({ key: idempotencyKey(), type }), body });
 }
 
 export async function sendWrite(request, onResponse = null) {

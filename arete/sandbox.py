@@ -15,7 +15,8 @@ SESSIONS_DIR = paths.STATE_DIR / "pi-sessions"
 AGENT_DIR = paths.STATE_DIR / "pi-agent"
 LOGIN_DIR = paths.STATE_DIR / "pi-login"
 KEY_DIR = paths.STATE_DIR / "pi-key"
-WRITABLE_ALWAYS = ("/private/tmp", "/private/var/folders", "/dev")
+TEMPORARY_ROOTS = ("/private/tmp", "/private/var/folders")
+WRITABLE_ALWAYS = (*TEMPORARY_ROOTS, "/dev")
 WRITABLE_DEVICES = ("/dev/null", "/dev/zero", "/dev/random", "/dev/urandom", "/dev/dtracehelper", "/dev/tty")
 NO_CONFINEMENT_REASON = "pi keeps file writes inside the work folder only with the macOS sandbox on this Mac"
 SECRET_NAMES = (".env", ".env.*", "*.env", ".envrc", ".netrc", ".pgpass", ".npmrc", ".pypirc", "id_rsa*", "id_dsa*",
@@ -108,11 +109,12 @@ def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = 
                       keeps: tuple[str, ...] = (), unix_confined: bool = False, temp_writes: bool = True,
                       state: tuple[Path, tuple[Path, ...]] | None = None,
                       mach: tuple[tuple[str, ...], str] | None = None, tcp_port: int | None = None,
-                      denied_ports: tuple[int, ...] = (), listen_port: int | None = None) -> list[str]:
+                      denied_ports: tuple[int, ...] = (), listen_port: int | None = None,
+                      private_temporary: bool = False, read_roots: tuple[Path, ...] | None = None) -> list[str]:
     hidden = tuple(dict.fromkeys((*hidden, AUTHORITY)))
     roots = [cwd, *add_dirs, *([AGENT_DIR, LOGIN_DIR, KEY_DIR, SESSIONS_DIR] if agent_roots else [])]
     allow = " ".join(f'(subpath (param "W{i}"))' for i in range(len(roots)))
-    if temp_writes:
+    if temp_writes and not private_temporary:
         allow += " " + " ".join(f'(subpath "{p}")' for p in WRITABLE_ALWAYS)
     else:
         allow += " " + " ".join(f'(literal "{p}")' for p in WRITABLE_DEVICES)
@@ -122,6 +124,16 @@ def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = 
     if auth_path is not None:
         profile += '(allow file-write* (literal (param "AUTH")) (literal (param "LOCK")))'
     params = [arg for i, root in enumerate(roots) for arg in ("-D", f"W{i}={real_path(root)}")]
+    if read_roots is not None:
+        readable = tuple(dict.fromkeys(path for root in (*roots, *read_roots)
+                                       for path in (absolute(root), real_path(root))))
+        params += [arg for i, root in enumerate(readable) for arg in ("-D", f"RD{i}={root}")]
+        reads = " ".join(f'(subpath (param "RD{i}"))' for i in range(len(readable)))
+        # dyld opens the root directory while locating its shared cache.
+        profile += f'(deny file-read* (subpath "/"))(allow file-read* (literal "/") {reads})'
+        for i, path in enumerate(sorted({p for root in readable for p in root.parents})):
+            params += ["-D", f"RA{i}={path}"]
+            profile += f'(allow file-read* (literal (param "RA{i}")))'
     if auth_path is not None:
         params += ["-D", f"AUTH={real_path(auth_path)}", "-D", f"LOCK={real_path(auth_path)}.lock"]
     for i, path in enumerate(hidden):
@@ -134,6 +146,9 @@ def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = 
                     '(deny file-read-data file-write* (literal (param "PEERS")))')
     if state is not None:
         profile += state_denials(params, *state)
+    if private_temporary:
+        for i, folder in enumerate(TEMPORARY_ROOTS):
+            profile += state_denials(params, Path(folder), (*roots, *(read_roots or ())), prefix=f"TMP{i}_")
     if secrets_denied:
         def pattern(names, descendants=False):
             return "(^|/)(" + "|".join(re.escape(n).replace(r"\*", "[^/]*") for n in names) + (
@@ -186,21 +201,21 @@ def real_path(path) -> Path:
         return Path(path).resolve()
 
 
-def state_denials(params: list[str], folder: Path, opened: tuple[Path, ...]) -> str:
+def state_denials(params: list[str], folder: Path, opened: tuple[Path, ...], *, prefix: str = "") -> str:
     folder = canonical(folder)
     kept = [canonical(Path(p)) for p in opened]
     between = sorted({folder, *(q for p in kept for q in p.parents if q.is_relative_to(folder))})
-    params += ["-D", f"STATE={folder}"]
+    params += ["-D", f"{prefix}STATE={folder}"]
     exempt = ""
     for i, path in enumerate(kept):
-        params += ["-D", f"SO{i}={path}"]
-        exempt += f'(require-not (subpath (param "SO{i}")))'
+        params += ["-D", f"{prefix}SO{i}={path}"]
+        exempt += f'(require-not (subpath (param "{prefix}SO{i}")))'
     listing = ""
     for i, path in enumerate(between):
-        params += ["-D", f"SB{i}={path}"]
-        exempt += f'(require-not (literal (param "SB{i}")))'
-        listing += f'(literal (param "SB{i}"))'
-    return (f'(deny file-read* file-write* file-link (require-all (subpath (param "STATE")) {exempt}))'
+        params += ["-D", f"{prefix}SB{i}={path}"]
+        exempt += f'(require-not (literal (param "{prefix}SB{i}")))'
+        listing += f'(literal (param "{prefix}SB{i}"))'
+    return (f'(deny file-read* file-write* file-link (require-all (subpath (param "{prefix}STATE")) {exempt}))'
             f"(deny file-read-data file-write* {listing})")
 
 

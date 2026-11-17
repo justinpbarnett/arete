@@ -26,6 +26,7 @@ from . import (
     environment,
     owner_asks,
     paths,
+    pi_shell,
     sandbox,
     scratch,
     util,
@@ -55,16 +56,10 @@ PI_HOME = paths.HOME / ".pi"
 KEYS_FILE = paths.PI_KEYS_FILE
 GUARD_FILE = paths.PACKAGE_DIR / "pi_guard.mjs"
 ASK_FILE = paths.PACKAGE_DIR / "pi_ask.mjs"
-GUARDED_TOOLS = frozenset({"read", "edit", "write", "grep", "find", "ls"})
+SHELL_FILE = paths.PACKAGE_DIR / "pi_shell.mjs"
+GUARDED_TOOLS = frozenset({"read", "edit", "write", "grep", "find", "ls", "bash"})
 SCHEMA_RULE = ("No tool takes this answer, so write it as the text of your last reply. Reply with only one JSON value "
                "that matches this JSON schema, in a ```json fence, and nothing after it:\n\n{schema}")
-RESTATE = ("An agent finished a task but did not write its answer as the JSON it was asked for. Below is how its run "
-           "ended: its last replies, the tool calls it tried, and its last thoughts when it ended on a thought. Write "
-           "the answer it gave as that JSON, using only what it said.")
-NO_ANSWER = "A tool call is not an answer. If the ending holds no answer, reply with only the words: no answer."
-ENDING_REPLIES = 3
-ENDING_CHARS = 12000
-RESTATE_TIMEOUT = 600
 PARENT_SESSION_VARS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")
 ANTHROPIC_LOGIN_REASON = "a Claude plan login runs only on the claude runner"
 ANTHROPIC_KEY_REQUIRED = (f"pi anthropic: {ANTHROPIC_LOGIN_REASON}; "
@@ -328,7 +323,7 @@ def child_env(provider: str, available: dict, passing: list[str], providers: dic
     env = environment.build(names, {"ARETE_AGENT": "1"}, never=(*PARENT_SESSION_VARS, *never), source=available)
     for n in ("PI_CODING_AGENT_DIR", "ARETE_PI_GUARD_PATHS", "ARETE_PI_REFRESH_FD", "ARETE_PI_REFRESH_ACK_FD",
               "ARETE_PI_REFRESH_PROVIDER",
-              "NODE_OPTIONS", "NODE_PATH"):
+              "ARETE_PI_SHELL_FD", "NODE_OPTIONS", "NODE_PATH"):
         env.pop(n, None)
     if not chosen_login and managed:
         env.update(managed.env)
@@ -474,7 +469,7 @@ def private_dir(path: Path) -> None:
         raise ValueError("pi route directory must be a private directory")
 
 
-def prepare(route: Route, *, delegation_only: bool = False) -> Path:
+def prepare(route: Route, *, delegation_only: bool = False, structured: bool = False) -> Path:
     root = sandbox.LOGIN_DIR if route.using_login else sandbox.KEY_DIR
     private_dir(root)
     auth = root / "auth.json"
@@ -488,7 +483,7 @@ def prepare(route: Route, *, delegation_only: bool = False) -> Path:
             out.write("{}")
         (folder / "auth.json").chmod(0o600)
     settings = route.settings
-    if delegation_only:
+    if delegation_only or structured:
         settings = {**settings, "retry": {"enabled": False, "provider": {"maxRetries": 0}},
                     "compaction": {"enabled": False}, "cacheWarming": "off", "transport": "sse"}
     for name, value in (("models.json", route.models), ("settings.json", settings)):
@@ -518,7 +513,8 @@ def is_pattern_rule(rule: str) -> bool:
 def tool_names(tools: list[str] | None, allowed_tools: list[str] | None, disallowed_tools: list[str] | None) -> list[str]:
     granted = tools if tools is not None else [*(allowed_tools or []), *READ_TOOLS]
     allowed = set(allowed_tools or []) | set(READ_TOOLS)
-    denied = {t.split("(", 1)[0] for t in disallowed_tools or []}
+    denied = {t.split("(", 1)[0] for t in disallowed_tools or []
+              if not t.startswith("Bash(")}
     names: list[str] = []
     for tool in granted:
         if tool in denied or is_pattern_rule(tool):
@@ -526,6 +522,9 @@ def tool_names(tools: list[str] | None, allowed_tools: list[str] | None, disallo
         if tool not in allowed and tool not in READ_ONLY_TOOLS:
             continue
         names += [n for n in TOOLS_OF.get(tool, ()) if n not in names]
+    if "Bash" not in denied and (tools is None or "Bash" in tools) and any(
+            t.startswith("Bash(") for t in allowed_tools or []) and "bash" not in names:
+        names.append("bash")
     return names
 
 
@@ -550,7 +549,8 @@ def launch_env_names(route: Route) -> list[str]:
 
 
 def guard_env(floor: guard.Floor, auth_paths: list[Path] | None = None,
-              secret_paths: tuple[Path, ...] = (), *, delegation_only: bool = False) -> dict[str, str]:
+              secret_paths: tuple[Path, ...] = (), *, delegation_only: bool = False,
+              shell: bool = False) -> dict[str, str]:
     sources = {PI_HOME / "agent", owner_dir(), *(path.parent for path in auth_paths or [])}
     roots = [*floor.closed, PI_HOME, *sorted(sources), sandbox.AGENT_DIR, sandbox.LOGIN_DIR, sandbox.KEY_DIR,
              Path("/proc"), Path("/dev")]
@@ -561,11 +561,22 @@ def guard_env(floor: guard.Floor, auth_paths: list[Path] | None = None,
     for path in auth:
         files.extend((path, path.resolve(), Path(str(path) + ".lock"), Path(str(path.resolve()) + ".lock")))
     files.extend(path for source in secret_paths for path in (source, source.resolve()))
-    return {"ARETE_PI_GUARD_PATHS": json.dumps({"delegation_only": delegation_only,
+    inodes = []
+    if not delegation_only:
+        for path in files:
+            try:
+                stat = path.stat()
+                inodes.append(f"{stat.st_dev}:{stat.st_ino}")
+            except OSError:
+                pass
+    return {"ARETE_PI_GUARD_PATHS": json.dumps({"delegation_only": delegation_only, "shell": shell,
+                                              "inodes": inodes, "shell_file": str(SHELL_FILE),
+                                              "secret_names": sandbox.SECRET_NAMES, "safe_names": sandbox.SAFE_NAMES,
+                                              "secret_dirs": sorted(sandbox.SECRET_DIRS),
                                               "roots": list(map(str, roots)), "files": list(map(str, files)),
                                               "open": list(map(str, floor.open)),
                                               "write_roots": [str(paths.PACKAGE_DIR)],
-                                              "write_files": [str(GUARD_FILE), str(ASK_FILE)]})}
+                                              "write_files": [str(GUARD_FILE), str(ASK_FILE), str(SHELL_FILE)]})}
 
 
 def confinement(cwd: Path, add_dirs: list[Path], floor: guard.Floor, selected: Route | None) -> list[str]:
@@ -582,6 +593,8 @@ def command(names: list[str], *, model: str = "", effort: str = "", resume: Sess
            "--no-prompt-templates", "--no-themes", "--no-approve", "--no-mcp", "--extension", str(GUARD_FILE)]
     if ask_owner:
         cmd += ["--extension", str(ASK_FILE)]
+    if "bash" in names:
+        cmd += ["--extension", str(SHELL_FILE)]
     names = [*names, owner_asks.TOOL] if ask_owner else names
     cmd += ["--tools", ",".join(names)] if names else ["--no-tools"]
     if model:
@@ -746,7 +759,8 @@ def run(*args, auth: accounts.Auth | None = None, selected: Route | None = None,
         folder = None
         try:
             if selected and selected.view is None:
-                folder = prepare(selected, delegation_only=kw.get("delegation_only", False))
+                folder = prepare(selected, delegation_only=kw.get("delegation_only", False),
+                                 structured=kw.get("json_schema") is not None)
                 selected = replace(selected, view=folder)
             result = _run(*args, auth=auth, selected=selected, **kw)
         except (OSError, ValueError) as e:
@@ -797,6 +811,8 @@ def _run(
     ask_owner: bool = False,
     floor: guard.Floor | None = None,
     delegation_only: bool = False,
+    judge: bool = False,
+    read_roots: tuple[Path, ...] = (),
 ) -> Result:
     auth = auth if auth is not None else accounts.Auth("api_key")
     if mcp_servers(mcp_config):
@@ -812,7 +828,7 @@ def _run(
 
         floor = guard.floor(os.environ.get("ARETE_RUN_ID", ""), cwd, add_dirs)
     names = [name for name in tool_names(tools, allowed_tools, disallowed_tools) if name in GUARDED_TOOLS]
-    if delegation_only and (names or ask_owner or resume.id or json_schema or system or add_dirs or persist):
+    if delegation_only and (names or ask_owner or resume.id or json_schema is not None or system or add_dirs or read_roots or persist):
         raise ValueError("controller requires a fresh tool-free, non-restating invocation")
     if persist or resume.id:
         sandbox.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
@@ -821,7 +837,7 @@ def _run(
                   ask_owner=ask_owner)
     if selected and selected.provider:
         cmd += ["--provider", selected.provider]
-    if json_schema:
+    if json_schema is not None:
         prompt = f"{prompt}\n\n{SCHEMA_RULE.format(schema=json.dumps(json_schema))}"
     confined = False
     if writing := sorted(WRITING & set(names)):
@@ -837,10 +853,17 @@ def _run(
     folder = selected.view
     env = {**selected.env, **(extra_env or {}), "PI_CODING_AGENT_DIR": str(folder),
            **guard_env(floor, [selected.owner, folder / "auth.json"], selected.sensitive_files,
-                       delegation_only=delegation_only),
+                       delegation_only=delegation_only, shell="bash" in names),
            **({"ARETE_ASK_TOOL": json.dumps(owner_asks.pi_tool())} if ask_owner else {})}
+    protection = json.loads(env["ARETE_PI_GUARD_PATHS"])
+    shell = (pi_shell.Shell(cwd, tuple(add_dirs), floor, tuple(allowed_tools or ()), tuple(disallowed_tools or ()),
+                            pi_shell.command_env(passing, extra_env, selected.hidden),
+                            (selected.owner, folder, *selected.sensitive_files, *map(Path, protection["files"])),
+                            judge, time.monotonic() + timeout, tuple(read_roots))
+             if "bash" in names else None)
     try:
-        with refresh_channel(selected, env) as descriptors:
+        with refresh_channel(selected, env) as refresh, pi_shell.channel(shell, env) as terminal:
+            descriptors = (*refresh, *terminal)
             if error := plan_token_error(env.items()):
                 return Result(ok=False, session=resume, error=error, runner="pi", model=model)
             proc, cut_short_by = stream(cmd, str(cwd), env, timeout, max_budget_usd,
@@ -855,55 +878,10 @@ def _run(
     if selected and result.session.id:
         result.session = replace(result.session, spent_usd=resume.spent_usd +
                                  (0 if auth.mode == "subscription" else price(result)))
-    if json_schema and result.ok and result.structured is None:
-        restate(result, ending(proc.stdout), json_schema, model, cwd, min(timeout, RESTATE_TIMEOUT), on_line,
-                passing, providers, price,
-                max(0, max_budget_usd - (0 if auth.mode == "subscription" else price(result)))
-                if max_budget_usd is not None else None, selected=selected)
-    return result
-
-
-def ending(stdout: str) -> str:
-    end = next((e for e in reversed(events(stdout)) if e.get("type") == "agent_end"), {})
-    replies = [m for m in end.get("messages", []) if m.get("role") == "assistant"][-ENDING_REPLIES:]
-    said = []
-    for reply in replies:
-        for block in reply.get("content", []):
-            if block.get("type") == "text" and block.get("text", "").strip():
-                said.append(block["text"].strip())
-            elif block.get("type") == "toolCall":
-                said.append(f"tool call {block.get('name')}: {json.dumps(block.get('arguments'))}")
-    last_blocks = replies[-1].get("content", []) if replies else []
-    if not any(b.get("type") == "text" and b.get("text", "").strip() for b in last_blocks):
-        said += [f"its last thoughts, which it never wrote as a reply:\n{b['thinking'].strip()}" for b in last_blocks
-                 if b.get("type") == "thinking" and b.get("thinking", "").strip()]
-    return util.tail("\n\n".join(said), ENDING_CHARS)
-
-
-def restate(result: Result, ending_text: str, json_schema: dict, model: str, cwd: Path | str,
-            timeout: float, on_line: Callable[[str], None],
-            passing: list[str] | None = None, providers: dict[str, tuple[str, ...]] | None = None,
-            price: Callable[[Result], float] = lambda reply: reply.cost_usd,
-            max_budget_usd: float | None = None, selected: Route | None = None) -> None:
-    if not ending_text:
-        return
-    auth = selected.auth if selected else authentication(model, passing, providers)
-    if auth.mode != "subscription" and max_budget_usd is not None and max_budget_usd <= 0:
-        return
-    prompt = (f"{RESTATE}\n\n<ending>\n{ending_text}\n</ending>\n\n"
-              f"{SCHEMA_RULE.format(schema=json.dumps(json_schema))}\n\n{NO_ANSWER}")
-    again = run(prompt, cwd, model=model, tools=[], timeout=timeout, persist=False, on_line=on_line,
-                passing=passing, providers=providers, auth=auth, selected=selected, price=price,
-                max_budget_usd=max_budget_usd)
-    result.calls = [replace(result, calls=[]), again]
-    result.aggregate_paid_usd = result.paid_usd + again.paid_usd
-    result.auth_modes = tuple(dict.fromkeys([*result.modes, *again.modes]))
-    result.add_usage([again])
-    result.structured = json_from_text(again.text) if again.ok else None
-    if again.usage_limit:
+    if json_schema is not None and result.ok and result.structured is None:
         result.ok = False
-        result.error = again.error
-        result.usage_limit = again.usage_limit
+        result.error = "pi returned no structured answer; no unadmitted restatement was launched"
+    return result
 
 
 def mcp_servers(mcp_config: str) -> dict:
@@ -1044,7 +1022,7 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
         ok=not failed,
         text=text,
         session=session_after(stream, resume, totals["cost_usd"]),
-        structured=json_from_text(text) if json_schema and not failed else None,
+        structured=json_from_text(text) if json_schema is not None and not failed else None,
         turns=len(replies),
         error=error,
         connection_failed=failed and util.is_network_error(error),
