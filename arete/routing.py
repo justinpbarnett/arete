@@ -625,7 +625,8 @@ class Discovery:
         if vendor == "openai":
             native = link.model if link.runner == "codex" else ident
             cli = self.codex_cli_way(link, native)
-            found = [cli, Way(link, "pi", f"openai-codex/{ident}", "pi_login", "free", "login")]
+            found = [cli, Way(link, "pi", f"openai/{ident}", "pi_login", "free", "login"),
+                     Way(link, "pi", f"openai-codex/{ident}", "pi_login", "free", "login")]
             if not self.device.remote and self.codex_auth().mode == "subscription" and self.probe(
                     f"openai/{ident}", "api_key").key:
                 found.append(Way(link, "codex", native, "cli_key", "paid", "api_key"))

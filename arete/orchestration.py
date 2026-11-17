@@ -273,9 +273,13 @@ class Controller:
                 ledger.reject(self.lease, turn, "controller stopped; admitted usage may be unknown")
             if self.run.launch_done:
                 self.run.launch_done(controller.step, bool(result.get("ok")))
+        if not result.get("ok"):
+            error = str(result.get("error") or "controller returned no decision")[:2000]
+            ledger.reject(self.lease, turn, error)
+            self.data["error"] = error
+            self.persist()
+            raise workspace.RunFailed(error)
         try:
-            if not result.get("ok"):
-                raise ValueError(result.get("error") or "controller returned no decision")
             response = result.get("structured")
             if response is None:
                 response = json_from_text(result.get("text", ""))
