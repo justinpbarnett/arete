@@ -1171,6 +1171,7 @@ class RepoLayer:
     document: dict = field(default_factory=dict)
     ab: dict[str, dict] = field(default_factory=dict)
     ignored: tuple[str, ...] = ()
+    read_roots: tuple[str, ...] = ()
 
     @property
     def builder_bash(self) -> list[str]:
@@ -1268,6 +1269,9 @@ def load_layer(layer_dir: Path, strict: bool = False) -> RepoLayer:
         raise ValueError("[limits] parallel_checks must be true or false")
     agent = section(data, "agent")
     layer.allow_bash = list(DEFAULT_ALLOW_BASH) + list(agent.get("allow_bash", []))
+    layer.read_roots = string_list(agent.get("read_roots", []), "agent.read_roots")
+    if any(not Path(root).is_absolute() for root in layer.read_roots):
+        raise ValueError("[agent] read_roots must contain absolute paths")
     trust = section(data, "trust")
     layer.trust_level = trust.get("level", "pr")
     layer.automerge_after = int(trust.get("automerge_after", 5))

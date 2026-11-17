@@ -673,6 +673,9 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
         kw["remote"] = target
     else:
         kw["passing"] = environment.passed(cfg, repo)
+        if which == "pi":
+            roots = trip.layer.read_roots if trip.layer and not (request and request.requires.delegation_only) else ()
+            kw["read_roots"] = tuple(Path(root) for root in roots)
         kept = {n: v for n, v in environment.stored(repo).items() if not reserved(n)}
         if picked.selected:
             kept = {n: v for n, v in kept.items() if n not in picked.selected.env}
