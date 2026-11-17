@@ -81,6 +81,8 @@ class EvalRun(AgentRun):
     reviews: bool = False
     checks_required: bool = False
     harness_paths: list[str] = field(default_factory=list)
+    executor: str = ""
+    execution: dict = field(default_factory=dict)
 
     @property
     def ref(self) -> str:
@@ -475,6 +477,36 @@ def review(run: EvalRun, wt: Path, brief: prompt_loader.Brief, plan: str, report
     return sum(p["severity"] == "blocker" for p in review_problems(res.structured.get("problems")))
 
 
+def acceptance(cfg, run, layer, wt, task, brief, result, plan, report, ok, timeout):
+    git(["add", "-A"], wt)
+    diff = vault.hidden(git(["diff", "--cached", "HEAD"], wt))
+    (run.dir / "diff.patch").write_text(diff)
+    failures = result.failures + (["repo checks failing"] if run.checks_required and not ok else [])
+    evidence = "No check in use ran for this task."
+    if task.verify:
+        graded = grade(cfg, run, layer, wt, task.title, task.prompt, task.verify, run.time_for(timeout))
+        result.verify = graded.verdict
+        evidence = graded.markdown()
+        if graded.verdict != "pass":
+            failures.append(grade_failure(graded))
+    if run.reviews:
+        blocking = review(run, wt, brief, plan, report, evidence, diff, run.time_for(timeout))
+        result.blocking = blocking
+        if blocking:
+            failures.append(util.count(blocking, "blocking review finding"))
+    if task.check:
+        res = hidden_check(cfg, run.repo, task, wt, run.time_for(timeout))
+        result.hidden = "pass" if res.returncode == 0 else "fail"
+        (run.dir / "check.log").write_text(res.stdout + res.stderr)
+        run.log(f"held out check: {'PASS' if res.returncode == 0 else 'FAIL'}")
+        if res.returncode != 0:
+            failures.append(f"check exit {res.returncode}")
+    result.passed = not failures
+    result.failures = failures
+    result.why = "; ".join(failures) + ("" if ok or not failures or run.checks_required else ", repo checks failing")
+    return result
+
+
 def run_task(cfg: config.Config, src: Source, task: Task, prompts: Prompts, run: EvalRun) -> TaskResult:
     repo = run.repo
     run_dir = run.dir
@@ -482,6 +514,7 @@ def run_task(cfg: config.Config, src: Source, task: Task, prompts: Prompts, run:
     base = task.base or f"origin/{gh.default_branch(repo.github) if repo.github else 'main'}"
     wt = paths.WORKTREES_DIR / "-".join(filter(None, ["eval", repo.name, task.name, run.trial]))
     started = time.time()
+    original = wt
     result = TaskResult(task.name)
     try:
         if not task.check and not task.verify:
@@ -510,6 +543,16 @@ def run_task(cfg: config.Config, src: Source, task: Task, prompts: Prompts, run:
                                     comments="",
                                     attachments="", expertise=expertise, commands=commands,
                                     max_lines=layer.max_diff_lines)
+        if run.executor:
+            from .lab import workflows
+
+            wt, facts = workflows.execute(cfg, run, layer, wt, task)
+            result.checks = "pass"
+            if facts.get("review", {}).get("unresolved") or any(r.get("passed") is not True
+                                                               for r in facts.get("requirements", [])):
+                result.failures.append("workflow retained unresolved final evidence")
+            return acceptance(cfg, run, layer, wt, task, brief, result, "", "Engine workflow gates completed.",
+                              True, timeout)
         res = run.agent("plan", brief.prompt(
             "plan", prompts.dir, triage="", denied=prompt_loader.code_list(denied_paths(layer)), checks=checks),
                         wt, **run.call_kw(cfg, "plan", READ_TOOLS, prompt_loader.bash_rules(config.DEFAULT_ALLOW_BASH)),
@@ -548,33 +591,7 @@ def run_task(cfg: config.Config, src: Source, task: Task, prompts: Prompts, run:
             raise
         result.repairs = attempts - 1
         result.checks = "pass" if ok else "fail"
-        git(["add", "-A"], wt)
-        diff = vault.hidden(git(["diff", "--cached", "HEAD"], wt))
-        (run_dir / "diff.patch").write_text(diff)
-        failures = ["repo checks failing"] if run.checks_required and not ok else []
-        evidence ="No check in use ran for this task."
-        if task.verify:
-            graded = grade(cfg, run, layer, wt, task.title, task.prompt, task.verify, run.time_for(timeout))
-            result.verify = graded.verdict
-            evidence = graded.markdown()
-            if graded.verdict != "pass":
-                failures.append(grade_failure(graded))
-        if run.reviews:
-            blocking = review(run, wt, brief, plan, report, evidence, diff, run.time_for(timeout))
-            result.blocking = blocking
-            if blocking:
-                failures.append(util.count(blocking, "blocking review finding"))
-        if task.check:
-            res = hidden_check(cfg, repo, task, wt, run.time_for(timeout))
-            result.hidden = "pass" if res.returncode == 0 else "fail"
-            (run_dir / "check.log").write_text(res.stdout + res.stderr)
-            run.log(f"held out check: {'PASS' if res.returncode == 0 else 'FAIL'}")
-            if res.returncode != 0:
-                failures.append(f"check exit {res.returncode}")
-        result.passed = not failures
-        result.failures = failures
-        result.why = "; ".join(failures) + ("" if ok or not failures or run.checks_required else ", repo checks failing")
-        return result
+        return acceptance(cfg, run, layer, wt, task, brief, result, plan, report, ok, timeout)
     except workspace.RunFailed as e:
         result.why = e.why
         run.log(f"stopped: {e.why}")
@@ -587,6 +604,8 @@ def run_task(cfg: config.Config, src: Source, task: Task, prompts: Prompts, run:
         result.cost, result.paid = run.cost, run.paid
         result.seconds = round(time.time() - started, 1)
         shutil.rmtree(wt, ignore_errors=True)
+        if original != wt:
+            shutil.rmtree(original, ignore_errors=True)
 
 
 def run(repo_name: str, task: str = "", ref: str = "", dry_run: bool = False, prompts: Prompts | None = None) -> int:

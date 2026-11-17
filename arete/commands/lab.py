@@ -259,7 +259,7 @@ def cmd_benchmark(args) -> int:
 
 
 def register(sub) -> None:
-    p = sub.add_parser("experiment", help="run a manifest of paired model and effort trials, summarize its results, "
+    p = sub.add_parser("experiment", help="run paired atom or fixed/single-worker/orchestrated workflow trials, summarize results, "
                                           "or search for a better setting and promote the winner")
     esub = p.add_subparsers(dest="action", required=True, parser_class=Parser)
     a = esub.add_parser("run", help="run a manifest of paired trials")

@@ -316,8 +316,8 @@ def step_named(step: str) -> str:
 
 
 def script_path(row: dict) -> str:
-    return next((str(path) for read in factory.chain(row["id"]) if (path := factory.first(read, "task").get("path"))),
-                "")
+    path = pipeline.recorded_path(row["id"])
+    return "" if path == "classic" else path
 
 
 def command_of(cfg: config.Config, name: str, *args: str) -> list[str]:
@@ -590,6 +590,12 @@ def resume(run_id: str, step: str = "", base_version=None) -> dict:
             raise control.Refused(f"run {run_id} ended {row['status']}; a run resumes only when it ended "
                                   f"{', '.join(RESUMABLE[:-1])} or {RESUMABLE[-1]}")
         no_later_run(row)
+        if script_path(row) == "orchestrate":
+            if step:
+                adaptive_action(row, step)
+            return launch(cfg, repo, str(row["issue"]), command_of(
+                cfg, "orchestrate", repo.name, str(row["issue"]), "--force", "--continue", run_id,
+                *(["--action", step] if step else [])), admission=(run_id, base_version))
         if step and step_named(step) and not factory.started(run_id, step):
             raise control.Refused(f"run {run_id} never started {step}, so it cannot resume from it")
         if not (path := script_path(row)) and flows.ran_on_seam(run_id):
@@ -621,10 +627,24 @@ def repair(run_id: str, base_version=None) -> dict:
             repairs.open_heads(repo, found)
         except repairs.Refused as e:
             raise control.Refused(str(e)) from None
-        if refusal := pipeline.script_refusal(cfg, repo, tid, pipeline.Script("repair", None, repairs=run_id)):
+        path = "orchestrate" if script_path(row) == "orchestrate" else "repair"
+        if refusal := pipeline.script_refusal(cfg, repo, tid, pipeline.Script(path, None, repairs=run_id)):
             raise control.Refused(refusal)
-        return launch(cfg, repo, tid, command_of(cfg, "repair", repo.name, tid, "--force", "--repair", run_id),
+        return launch(cfg, repo, tid, command_of(cfg, path, repo.name, tid, "--force", "--repair", run_id),
                       admission=(run_id, base_version))
+
+
+def adaptive_action(row: dict, action: str) -> dict:
+    from .store import orchestration
+
+    source = orchestration.find(row["id"])
+    if source:
+        lease = orchestration.Lease(source["root"], source["current_run"], source["generation"])
+        found = next((a for a in orchestration.actions(lease) if a["id"] == action), None)
+        if found and found["op"] in ("worker.start", "worker.continue", "checks.run", "verification.run", "review.run"):
+            return found
+    raise control.Refused("adaptive controls require a worker/check/review/verification action ID from run details, "
+                          "not a phase name or publication action")
 
 
 def run_step(run_id: str, step: str, sets, base_version=None) -> dict:
@@ -634,6 +654,16 @@ def run_step(run_id: str, step: str, sets, base_version=None) -> dict:
             raise control.Refused(f"run {run_id} is running; a step runs alone only on a run that ended")
         if not (path := script_path(row)):
             raise control.Refused(f"run {run_id} did not run from a script in adws/, so a step cannot run alone on it")
+        if path == "orchestrate":
+            no_later_run(row)
+            adaptive_action(row, step)
+            if why := flows.action_workspace_refusal(run_id):
+                raise control.Refused(why)
+            if sets:
+                raise control.Refused("adaptive action reruns keep their accepted settings; select new settings through a resumed controller")
+            return launch(cfg, repo, str(row["issue"]), command_of(
+                cfg, "orchestrate", repo.name, str(row["issue"]), "--force", "--continue", run_id,
+                "--action", step, "--only-action"), admission=(run_id, base_version))
         step_named(step)
         if not factory.started(run_id, step):
             raise control.Refused(f"run {run_id} never started {step}, so it cannot run it alone")

@@ -3,7 +3,7 @@ import htm from "./vendor-htm.js";
 import { createList, ListHeader } from "./ui-list.js";
 import { syncList, selectItem, pane, activatePane } from "./ui-keys.js";
 import { Empty, Fault, Loading } from "./ui-states.js";
-import { dispatch, actions, runPageContext, repairThisRun } from "./ui-actions.js";
+import { dispatch, actions, runContext, runPageContext, repairThisRun, step as retryStep } from "./ui-actions.js";
 import { register } from "./ui-palette.js";
 import { notice } from "./ui-notice.js";
 import { parse } from "./ui-router.js";
@@ -12,7 +12,7 @@ const html = htm.bind(h);
 export const GROUPS = ["Running", "Waiting on you", "Fault", "Done"];
 const GLYPHS = { Running: "▷", "Waiting on you": "◆", Fault: "×", Done: "✓" };
 const FAULTS = ["failed", "interrupted", "stopped"];
-const STEP_STATES = { running: "▷ RUNNING", pass: "✓ PASS", fail: "× FAIL", ask: "◆ ASK", stop: "■ STOP" };
+const STEP_STATES = { running: "▷ RUNNING", pass: "✓ PASS", fail: "× FAIL", ask: "◆ ASK", stop: "■ STOP", interrupted: "■ INTERRUPTED" };
 const hashOf = (id) => `#run/${encodeURIComponent(id)}`;
 const taskHash = (ticket) => `#task/${encodeURIComponent(ticket)}`;
 const safeLink = (url) => /^https?:\/\//i.test(String(url ?? "")) ? url : "";
@@ -111,7 +111,7 @@ export class RunQueue extends Watching {
   }
 }
 
-const labelOf = (event) => event.model || event.runner || "";
+const labelOf = (event) => [event.runner, event.provider, event.model, event.effort].filter(Boolean).join(" · ");
 
 export function reduceSteps(events) {
   const rows = [];
@@ -119,6 +119,11 @@ export function reduceSteps(events) {
   for (const event of events) {
     const key = `${event.step}#${event.try ?? 1}`;
     if (event.event === "step_start") {
+      if (open.has(key)) {
+        const row = open.get(key);
+        row.label = labelOf(event) || row.label;
+        continue;
+      }
       const row = { kind: "step", key: `s${event.seq}`, step: String(event.step ?? ""), attempt: event.try ?? 1, label: labelOf(event), state: "running",
         seconds: null, cost: null, tokensIn: null, tokensOut: null, turns: null, error: "" };
       rows.push(row);
@@ -133,7 +138,13 @@ export function reduceSteps(events) {
       const row = [...open.values()].find((one) => one.step === event.step);
       if (row && Number.isFinite(event.seconds)) row.seconds = event.seconds;
     } else if (event.event === "error") rows.push({ kind: "error", key: `e${event.seq}`, step: event.step ?? "", text: String(event.message ?? "") });
-    else if (event.event === "report") rows.push({ kind: "report", key: `r${event.seq}`, step: "", text: String(event.status ?? "report") });
+    else if (event.event === "report") {
+      if (event.status && event.status !== "running") {
+        for (const row of open.values()) Object.assign(row, { state: "interrupted", error: "No completion receipt; usage may be unknown" });
+        open.clear();
+      }
+      rows.push({ kind: "report", key: `r${event.seq}`, step: "", text: String(event.status ?? "report") });
+    }
   }
   return rows;
 }
@@ -157,7 +168,7 @@ function Steps({ view }) {
       <td>${row.turns ?? ""}</td></tr>`)}</tbody></table></div>`;
 }
 
-export const stepsOf = (view) => view.events.filter((event) => event.event === "step_start").length;
+export const stepsOf = (view) => reduceSteps(view.events).filter((row) => row.kind === "step").length;
 const recordedTurns = (view) => view.events.reduce((sum, event) => sum + (event.event === "step_end" && Number.isFinite(event.turns) ? event.turns : 0), 0);
 
 function Head({ view, now }) {
@@ -178,6 +189,25 @@ function Head({ view, now }) {
       <span>${models.length ? `${count(tokensIn)} in · ${count(tokensOut)} out` : "no tokens recorded"}</span><span>${recordedTurns(view)} turns</span>
       ${link ? html`<a href=${link} target="_blank" rel="noopener noreferrer">PR</a>` : null}</p>
   </header>`;
+}
+
+function Orchestration({ view, retry }) {
+  const data = view.detail.orchestration;
+  if (!data) return null;
+  const run = view.detail.run;
+  const rerun = (id) => dispatch(retryStep(), { ...runContext(run, "steps", {}, id), stale: retry,
+    commit: (_, result) => { retry(); if (result.run) location.hash = hashOf(result.run); return { label: `Started ${id} alone; dependent evidence must be refreshed` }; } });
+  const eligible = (a) => data.mode === "orchestrate" && data.workspace_retained && run.status !== "running" && data.current_run === run.id
+    && ["succeeded", "failed", "cancelled", "interrupted"].includes(a.state)
+    && ["worker.start", "worker.continue", "checks.run", "verification.run", "review.run"].includes(a.op);
+  return html`<section class="run-orchestration" aria-label="Orchestration"><h3>Orchestration</h3>
+    <p class="mono">${data.mode} · ${data.decisions} decisions · ${data.launches} controller launches · generation ${data.generation}</p>
+    <div class="run-steps-scroll" tabindex="0" role="region" aria-label="Adaptive actions"><table class="run-steps">
+      <thead><tr><th>Action</th><th>Operation</th><th>State</th><th>Result</th><th></th></tr></thead>
+      <tbody>${data.actions.map((a) => html`<tr key=${a.id}><td data-label="Action">${a.id}</td><td data-label="Operation">${a.op}</td><td data-label="State">${a.state}</td>
+        <td data-label="Result"><details><summary>Result and requested settings</summary><pre>${JSON.stringify({ request: a.request, result: a.result }, null, 2)}</pre></details></td>
+        <td data-label="">${eligible(a) ? html`<button type="button" onClick=${() => rerun(a.id)}>Rerun alone</button>` : null}</td></tr>`)}</tbody>
+    </table></div></section>`;
 }
 
 function turnTime(turn) { return turn.at ? String(turn.at).slice(11, 19) : ""; }
@@ -234,7 +264,8 @@ export class RunFocus extends Component {
     const context = this.actionOf();
     const turns = view.turns;
     const recorded = Math.max(turns.length, recordedTurns(view));
-    const tabs = [["steps", "Steps"], ["turns", `Turns (${turns.length} of ${recorded})`], ["sandbox", "Sandbox (0)"]];
+    const tabs = [["steps", "Steps"], ...(view.detail.orchestration ? [["actions", `Actions (${view.detail.orchestration.actions.length})`]] : []),
+      ["turns", `Turns (${turns.length} of ${recorded})`], ["sandbox", "Sandbox (0)"]];
     const fault = failure(view);
     const key = (turn) => `${run.id}|${turn.id}`;
     return html`<div class="run-page" data-run=${run.id}>
@@ -254,6 +285,7 @@ export class RunFocus extends Component {
       <div class="run-panel" id="run-panel" role="tabpanel" aria-labelledby=${`run-tab-${tab}`}
         data-list=${tab === "turns" && turns.length ? undefined : "run-panel"} ref=${(el) => { if (el) el.uiContext = this.actionOf; }}>
         ${tab === "steps" ? html`${view.eventsError ? html`<${Fault} what="Steps" fault=${view.eventsError} retry=${retry} />` : null}<${Steps} view=${view} />`
+    : tab === "actions" ? html`<${Orchestration} view=${view} retry=${retry} />`
     : tab === "sandbox" ? html`<${Empty} what="No sandbox recorded" />`
     : html`${view.turnsError ? html`<${Fault} what="Turns" fault=${view.turnsError} retry=${retry} />` : null}
         ${turns.length ? html`<div class="run-turns" data-list="run-turns" ref=${(el) => { if (el) { el.uiContext = this.actionOf; el.uiDismiss = this.fold; } }}>

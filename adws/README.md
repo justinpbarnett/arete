@@ -6,7 +6,9 @@ This is the guide for an agent that starts and follows arete's runs: a session l
 
 A **task** is one piece of work in a repo from the config. It is a local task with an id like `t-1a2b`, made from a prompt, or a tracker item: a GitHub issue number or a Jira key.
 
-A **run** is one process that takes a task through the steps of the [adw flow](../README.md#the-adw-flow): `prepare`, `plan`, `implement`, `checks`, `verify`, `review`, `learn`, `document` (when `[document]` is on), `pr`, `ci`, `publish` and `respond`. A run has an id of its own, and every recipe after the first one takes that id.
+A **run** is one delivery lifecycle with its own ID, taken by every recipe after the first one.
+New unpinned runs use the [orchestrator](../docs/orchestration.md): its controller delegates work but cannot edit the repository or publish.
+Explicit `classic` and `adw` layers retain the fixed [ADW flow](../README.md#the-adw-flow), including its planning and repair order.
 
 A task has many runs. An answer, a resume and a step each start a **new** run with a **new** id. Always wait on the id the last recipe printed, never on the old one.
 
@@ -58,9 +60,9 @@ When the server restarts on new code, `just adw-wait` connects again by itself a
 | `just adw-wait <id>` | follows the run until it ends or asks a question |
 | `just adw-logs <id> [step]` | all of the run's lines, or one step's lines |
 | `just adw-answer <id> "<text>"` | answers a text question and continues the asking run, which keeps its folder and session |
-| `just adw-resume <id> [step]` | continues at the first unfinished step, or from a named one |
+| `just adw-resume <id> [step]` | continues the recorded strategy; adaptive runs accept a durable action ID, fixed runs a step name |
 | `just adw-repair <id>` | repairs the open held PR of a run from its saved review findings, with no new plan; prints the repair run |
-| `just adw-step <id> <step> [key=value ...]` | runs one step alone, with overrides such as `model=opus` or `effort=high` |
+| `just adw-step <id> <step> [key=value ...]` | runs a fixed step alone with overrides; adaptive runs require an action ID and retain its accepted settings |
 | `just adw-stop <id>` | stops a run |
 | `just adw-costs [days]` | cost and time by step, kind and model, then the wait minutes |
 | `just adw-steps [repo]` | the step sheet with each step's resolved settings |

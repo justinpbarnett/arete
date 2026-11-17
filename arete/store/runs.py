@@ -364,6 +364,9 @@ def _prune(c, days, lines_days):
     for row in eligible:
         c.execute("INSERT OR IGNORE INTO run_purges VALUES (?, 'lines', ?)", (row["id"], now))
         writes.update("runs", row["id"], {"files_purged": now})
+        from . import orchestration
+
+        orchestration.purge(c, row["id"])
 
 
 def running_runs(conn):

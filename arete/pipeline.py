@@ -65,6 +65,7 @@ from .store import triage as triage_store
 from .util import git
 
 ADW = "adw"
+ORCHESTRATED = "orchestrated"
 ENDED = workspace.ENDED
 
 
@@ -217,6 +218,10 @@ class AgentRun:
     step_calls: dict[str, int] = field(default_factory=dict)
     budget: runlimits.Budget | None = None
     ab_held: dict[str, tuple[str, str, dict]] = field(default_factory=dict)
+    launch_gate: Callable | None = None
+    launch_done: Callable | None = None
+    closed_context: tuple[str, ...] = ()
+    resolved_settings: dict[str, steps.Settings] = field(default_factory=dict)
 
     @property
     def ref(self) -> str:
@@ -265,6 +270,8 @@ class AgentRun:
 
     def settings(self, role: str) -> steps.Settings:
         role = config.STEP_ALIASES.get(role, role)
+        if role in self.resolved_settings:
+            return self.resolved_settings[role]
         return steps.resolve(self.config, self.layer, role, self.kind,
                              {**self.overrides, **self.step_overrides.get(role, {})},
                              self.step_overrides.get(config.INHERITS.get(role, ""), {}), ticket=self.ab_ticket,
@@ -302,11 +309,16 @@ class AgentRun:
         kw.setdefault("waits", self.waiting)
         kw.setdefault("repo", self.repo)
         kw.setdefault("layer", self.layer)
+        if self.closed_context:
+            kw.setdefault("closed_context", self.closed_context)
         seam = factory.inside(self.id)
         if s:
             kw.setdefault("settings", s)
-        if self.writes_lines:
-            def announce(route: dict) -> None:
+        if self.writes_lines or self.launch_gate:
+            def announce(route: dict) -> dict | None:
+                grant = self.launch_gate(step, s.step if s else role, route) if self.launch_gate else None
+                if not self.writes_lines:
+                    return grant
                 fields = {k: route.get(k) for k in ("runner", "model", "provider", "auth_mode", "credential",
                                                     "billing", "effort", "requested_effort", "tier", "position",
                                                     "requested", "env", "skipped", "launch") if k in route}
@@ -317,6 +329,7 @@ class AgentRun:
                 else:
                     self.write_line("step_start", step=seam.step, call=step, **{"try": seam.n}, kind=kw["kind"],
                                     **fields)
+                return grant
 
             kw["on_launch"] = announce
         if s and s.ab_name:
@@ -325,8 +338,13 @@ class AgentRun:
         kw["try_no"] = attempt_no
         self.log(f"{step}: starting")
         kw.setdefault("say", lambda note: self.log(f"{step}: {note}"))
-        res = self.through_drops(step, text, cwd, kw, self.writes_lines and seam is None, s, attempt_no)
-        return self.record_step(step, res, s, kw, seam, attempt_no, started, spent, chosen)
+        res = None
+        try:
+            res = self.through_drops(step, text, cwd, kw, self.writes_lines and seam is None, s, attempt_no)
+            return self.record_step(step, res, s, kw, seam, attempt_no, started, spent, chosen)
+        finally:
+            if self.launch_done:
+                self.launch_done(step, bool(res and (res.ok or res.turns)))
 
     def fit_route(self, step: str, text: str, s: steps.Settings | None, kw: dict) -> dict:
         cfg = kw.get("cfg") or self.config
@@ -412,6 +430,8 @@ class Run(AgentRun):
     alone: bool = False
     facts: dict = field(default_factory=dict)
     repairs: str = ""
+    action: str = ""
+    action_only: bool = False
     workspace: tuple[Path, list[workspace.Checkout]] | None = None
     asks_made: int = 0
     answers_due: list[dict] = field(default_factory=list)
@@ -1020,14 +1040,17 @@ class Script:
     overrides: dict[str, dict] = field(default_factory=dict)
     again: str = ""
     repairs: str = ""
+    action: str = ""
+    action_only: bool = False
 
     @property
     def run_fields(self) -> dict:
-        return {"path": self.path, "alone": bool(self.only), "step_overrides": self.overrides}
+        return {"path": self.path, "alone": bool(self.only or self.action_only), "step_overrides": self.overrides,
+                "action": self.action, "action_only": self.action_only}
 
 
 def script_file(cfg: config.Config, name: str) -> Path:
-    folder = cfg.adws or paths.ADWS_DIR
+    folder = paths.ADWS_DIR if name in ("orchestrate", "single_worker") else cfg.adws or paths.ADWS_DIR
     if not folder.is_dir():
         raise FileNotFoundError(f"adws folder {folder} does not exist")
     if not (found := folder / f"{name}.py").is_file():
@@ -1064,22 +1087,46 @@ def answer_text(asked_id: str) -> str:
         return ""
 
 
+def recorded_path(run_id: str) -> str:
+    from .store import orchestration
+
+    if found := orchestration.find(run_id):
+        return found["data"].get("mode", "orchestrate")
+    for read in factory.chain(run_id):
+        if execution := factory.first(read, "execution"):
+            return str(execution.get("path") or "classic")
+        if path := factory.first(read, "task").get("path"):
+            return str(path)
+    return "classic"
+
+
+def dispatch_path(repo: config.Repo, tid: str) -> str:
+    newest = run_store.newest_whole_run(repo.name, tid)
+    if newest and newest["status"] == "interrupted":
+        return recorded_path(newest["id"])
+    if pending_feedback(repo.name, tid) and (source := next(iter(run_store.open_runs(repo.name, tid)), None)):
+        return recorded_path(source["id"])
+    return wanted(repo)
+
+
 def run_command(repo_name: str, tid: str | int, force: bool = False, dry_run: bool = False) -> list[str]:
     cfg = config.load()
     flags = [*(["--force"] if force else []), *(["--dry-run"] if dry_run else [])]
-    try:
-        adw = wanted(cfg.repo(repo_name)) == ADW
-    except (ValueError, TypeError):
-        adw = False
-    if not adw:
+    mode = dispatch_path(cfg.repo(repo_name), str(tid))
+    if (asked := answered_run(repo_name, str(tid))) and not dry_run:
+        mode = recorded_path(asked["id"])
+        if mode != "classic":
+            return script_command(cfg, mode, repo_name, str(tid), *flags, "--continue", asked["id"])
+    if mode == "classic":
         return control.command(["run", repo_name, str(tid), "--local", *flags])
+    if mode in (ORCHESTRATED, "orchestrate"):
+        return script_command(cfg, "orchestrate", repo_name, str(tid), *flags)
+    if mode != ADW:
+        return script_command(cfg, mode, repo_name, str(tid), *flags)
     newest = run_store.newest_whole_run(repo_name, str(tid))
     if newest and newest["status"] == "interrupted" and repaired_by(newest["id"]):
         return script_command(cfg, "repair", repo_name, str(tid), *flags)
     name = "revise" if pending_feedback(repo_name, str(tid)) else "feature"
-    if (asked := answered_run(repo_name, str(tid))) and not dry_run:
-        path = str(factory.first(run_lines.read(asked["id"]), "task").get("path") or "") or name
-        return script_command(cfg, path, repo_name, str(tid), *flags, "--continue", asked["id"])
     return script_command(cfg, name, repo_name, str(tid), *flags)
 
 
@@ -1094,6 +1141,10 @@ def exec_script(repo_name: str, tid: str, dry_run: bool, force: bool) -> int:
 
 
 def script_refusal(cfg: config.Config, repo: config.Repo, tid: str, script: Script, dry_run: bool = False) -> str:
+    if script.action and (script.path != "orchestrate" or not script.continues or script.only or script.again):
+        return "--action needs an orchestrated --continue without --only or --from"
+    if script.action_only and not script.action:
+        return "--only-action needs --action"
     if script.repairs:
         if script.continues or script.only or script.again or dry_run:
             return "--repair does not go with --continue, --only, --from or --dry-run"
@@ -1128,11 +1179,11 @@ def run_refusal(repo: config.Repo, script: bool = False) -> tuple[bool, str]:
         path, broken = wanted(repo), ""
     except (ValueError, TypeError, OSError) as e:
         path, broken = "classic", f"; {paths.short_path(repo.layer_dir / 'config.toml')}: {e}"
-    adw = path == ADW or script
+    adw = path in (ADW, ORCHESTRATED) or script
     if repo.parts or adw and has_origin(repo):
         return adw, ""
     return adw, f"{repo.name} has no github remote configured" + (
-        " and no git remote origin, which [factory] path = \"adw\" needs" if adw else broken)
+        " and no git remote origin, which a scripted factory needs" if adw else broken)
 
 
 def runnable(repo: config.Repo) -> bool:
@@ -1180,7 +1231,8 @@ def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: boo
 
 
 def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool = False,
-              script: Script | None = None) -> int:
+              script: Script | None = None, admission: Callable | None = None,
+              launch_done: Callable | None = None, closed_context: tuple[str, ...] = ()) -> int:
     try:
         producer_baseline = scratch.process_ids()
     except OSError:
@@ -1200,6 +1252,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
     except ValueError as e:
         print(f"{repo_name}: {e}")
         return 1
+    if not script:
+        adw = dispatch_path(repo, str(tid)) != "classic"
     if adw and not script:
         return exec_script(repo.name, tid, dry_run, force)
     if script and (refusal := script_refusal(cfg, repo, tid, script, dry_run)):
@@ -1229,7 +1283,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             return 1
         with slots.admitting():
             slot = slots.RunSlot(repo.name, str(tid), cfg.max_parallel)
-            only = script.only if script else ""
+            only = (script.only or (script.action if script.action_only else "")) if script else ""
             due = asks_store.asks_due([script.continues]) if script and script.continues and not only else []
             if not dry_run:
                 if slots.slots_free_to_start(cfg.max_parallel) > 0:
@@ -1251,8 +1305,10 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force,
                       feedback=[] if mending else pending_feedback(repo.name, tid), repairs=mending,
                       answering=earlier if earlier and earlier["status"] == "needs-info" else {},
-                      **(script.run_fields if script else {}))
+                      launch_gate=admission, launch_done=launch_done, closed_context=closed_context,
+                **(script.run_fields if script else {}))
             run.dir.mkdir(parents=True, exist_ok=True)
+            run_lines.write(run.id, "execution", path=run.path or "classic", protocol=1 if run.path == "orchestrate" else 0)
             if held_from := earlier["id"] if restarting or run.answering else (
                     script.continues or script.repairs if script else ""):
                 run.ab_held = run_store.ab_held(held_from)
@@ -1295,6 +1351,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 status, summary, pr_url = flows.driven(flow, script.drive) if script else _run(cfg, run, slot)
             if flow and flow.only:
                 status, summary, passed = flows.alone(flow)
+            elif run.action_only:
+                passed = status == "step"
         except runlimits.Parked as e:
             status, summary, pr_url = park_run(run, str(e))
         except factory.OnlyDone:

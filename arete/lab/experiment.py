@@ -107,6 +107,7 @@ class Experiment:
     make_run: Callable | None = None
     recovered: Callable | None = None
     codex: list[str] = field(default_factory=list)
+    executors: dict[str, str] = field(default_factory=dict)
 
 
 def unknown(table: dict, allowed: tuple[str, ...], where: str) -> None:
@@ -302,7 +303,11 @@ def arm_fingerprints(base: dict, cfg: config.Config, s: steps.Settings) -> dict:
 
 
 def effective(cfg: config.Config, s: steps.Settings) -> str:
-    return sha(json.dumps(asdict(s), sort_keys=True, default=str), mcp_definitions(cfg, s))
+    settings = asdict(s)
+    for name in ("delegation_only", "gated_launches"):
+        if not settings["requires"].get(name):
+            settings["requires"].pop(name, None)
+    return sha(json.dumps(settings, sort_keys=True, default=str), mcp_definitions(cfg, s))
 
 
 def codex_route(label: str, s: steps.Settings, limits: dict) -> list[str]:
@@ -358,6 +363,10 @@ def load(path: Path) -> Experiment:
 
 
 def designed(data: dict, carried: Totals | None = None, follow: bool = False) -> Experiment:
+    if "executor" in data:
+        from . import workflows
+
+        return workflows.designed(data, carried, follow)
     unknown(data, TOP_KEYS, "the manifest")
     name = text(data, "name")
     if not NAME.fullmatch(name):
@@ -434,13 +443,20 @@ def observed(exp: Experiment, arm: str) -> dict:
     found = arm_fingerprints(base, exp.cfg, exp.settings[arm])
     if invalid:
         found["context"] = "unreadable layer"
+    workflow = {}
+    if exp.executors:
+        from . import workflows
+
+        workflow = {"workflow": workflows.fingerprint(config.load(), layer)}
     return {"fingerprints": found, "grader": sha((paths.PROMPTS_DIR / "grade.md").read_bytes()),
-            "engine": engine_code(), "prices": (prices.load() or {}).get("version", "")}
+            "engine": engine_code(), "prices": (prices.load() or {}).get("version", ""), **workflow}
 
 
 def drift(exp: Experiment, arm: str, seen: dict) -> list[str]:
     changed = [k for k in ("prompt", "context", "tools")
                if seen["fingerprints"][k] != exp.design["arms"][arm]["fingerprints"][k]]
+    if exp.executors and seen.get("workflow") != exp.design["workflow_sha"]:
+        changed.append("workflow")
     return changed + [k for k, expected in (("grader", exp.design["grader"]["prompt"]),
                                            ("engine", exp.design["engine"]),
                                            ("prices", exp.design["money"]["prices"])) if seen[k] != expected]
@@ -622,6 +638,9 @@ def trial_line(exp: Experiment, path: Path, begun: dict, status: str, wall: floa
     task, arm = begun["task"], begun["arm"]
     seen = seen if seen is not None else begun["seen"]
     used = usage(exp, arm, begun["run"])
+    if (outcomes or {}).get("usage_unknown"):
+        used.update(charged_usd=None, reference_usd=None,
+                    reference_unknown_calls=max(1, used["reference_unknown_calls"]))
     used["wait_seconds"] = round(used["wait_seconds"] + slot_seconds(events(path), begun), 2)
     return {"event": "trial", "at": util.iso(), "task": task, "split": exp.splits[task],
             "base": exp.tasks[task].base, "arm": arm, "repeat": begun["repeat"], "attempt": begun["attempt"],
@@ -640,8 +659,10 @@ def settle_interrupted(exp: Experiment, path: Path) -> None:
     written = {e.get("run") for e in found if e.get("event") == "trial"}
     for begun in (e for e in found if e.get("event") == "start" and e.get("run") not in written):
         record.settle(begun["run"], "interrupted", summary=record.INTERRUPTED)
-        append(path, trial_line(exp, path, begun, "interrupted", last_alive(found, begun["run"]),
-                                outcomes=exp.recovered(begun["run"]) if exp.recovered else None))
+        outcomes = exp.recovered(begun["run"]) if exp.recovered else {}
+        if exp.executors:
+            outcomes = {**(outcomes or {}), "executor": exp.executors[begun["arm"]], "usage_unknown": True}
+        append(path, trial_line(exp, path, begun, "interrupted", last_alive(found, begun["run"]), outcomes=outcomes))
 
 
 @dataclass
@@ -655,7 +676,7 @@ class TrialRun(evals.EvalRun):
     follow: bool = False
 
     def outcomes(self) -> dict:
-        return {}
+        return self.execution
 
     def used(self) -> Totals:
         rows = run_store.steps(self.id)
@@ -903,6 +924,8 @@ def drive(exp: Experiment, path: Path) -> int:
     append(path, {"event": "session", "at": util.iso(), "limits": exp.limits, "pid": os.getpid(),
                   "engine": engine_commit()})
     settle_interrupted(exp, path)
+    if exp.executors and any(e.get("usage_unknown") for e in events(path) if e.get("event") == "trial"):
+        raise Refused("workflow usage is unresolved; reconcile retained receipts before authorizing a new output file")
     if done := len(completed(events(path))):
         print(f"{done} of {len(schedule(exp))} trials already done in {paths.short_path(path)}", flush=True)
     try:
@@ -918,7 +941,8 @@ def plan_lines(exp: Experiment, path: Path, label: str = "experiment") -> list[s
     found = events(path)
     check_design(exp, path, found)
     grader, accept = exp.design["grader"], exp.accept
-    out = [f"{label} {exp.name} (design {exp.digest}): atom {exp.atom} on {exp.repo.name}",
+    mode = "whole workflow" if exp.executors else f"atom {exp.atom}"
+    out = [f"{label} {exp.name} (design {exp.digest}): {mode} on {exp.repo.name}",
            f"results file: {paths.short_path(path)}"]
     for name, s in exp.settings.items():
         extra = "".join(f", {k} {paths.short_path(v) if k == 'prompts' else v[:12]}"
@@ -1001,7 +1025,9 @@ def arm_summary(arm: str, trials: list[dict], confidence: float) -> dict:
                                                                             "wait_seconds")}
     charged, reference = total_of(mine, "charged_usd"), total_of(mine, "reference_usd")
     return {"arm": arm, "attempts": len(mine), "done": n, "accepted": k, "rate": k / n if n else None,
-            "interval": wilson(k, n, confidence), **sums, **seconds, "charged_usd": charged,
+            "interval": wilson(k, n, confidence), **sums, **seconds,
+            **({"usage_unknown": any(t.get("usage_unknown") for t in mine)}
+               if any("executor" in t for t in mine) else {}), "charged_usd": charged,
             "reference_usd": reference, "charged_per_accepted": per_accepted(charged, k),
             "reference_per_accepted": per_accepted(reference, k)}
 
@@ -1056,6 +1082,11 @@ def summary(path: Path) -> dict:
     design = manifest["design"]
     accept = design["accept"]
     trials = [e for e in found if e.get("event") == "trial"]
+    if design.get("executor") == "workflow":
+        settled = {t["run"] for t in trials}
+        trials += [{**e, "status": "pending", "usage_unknown": True, "charged_usd": None, "reference_usd": None,
+                    "executor": design["arms"][e["arm"]]["executor"]}
+                   for e in found if e.get("event") == "start" and e["run"] not in settled]
     done = {key_of(t): t for t in trials if t.get("status") == "done"}
     baseline = accept["baseline"]
     splits = [s for s in SPLITS if s in {t["split"] for t in design["tasks"].values()}]
@@ -1063,7 +1094,8 @@ def summary(path: Path) -> dict:
     pairs = {s: [pairing(done, baseline, arm, s, accept["confidence"]) for arm in candidates] for s in splits}
     verdicts = {p["candidate"]: judge(p, accept) for p in pairs[accept["split"]]}
     planned = len(design["tasks"]) * design["repeats"] * len(design["arms"])
-    return {"name": design["name"], "digest": manifest["digest"], "atom": design["atom"], "accept": accept,
+    return {"name": design["name"], "digest": manifest["digest"], "atom": design.get("atom", ""), "accept": accept,
+            **({"executor": design["executor"]} if "executor" in design else {}),
             "planned": planned, "done": len(done), "drifted": sum(t.get("status") == "drifted" for t in trials),
             "arms": {arm: arm_summary(arm, trials, accept["confidence"]) for arm in design["arms"]},
             "pairs": pairs, "verdict": {"split": accept["split"], "candidates": verdicts,
@@ -1099,7 +1131,8 @@ def render_arm(a: dict, confidence: float, baseline: str) -> list[str]:
     return [(f"arm {a['arm']}{' (baseline)' if a['arm'] == baseline else ''}: accepted {a['accepted']} of "
              f"{a['done']} done trials ({rate}), {a['attempts']} attempts"),
             (f"  repairs {a['repairs']}, calls {a['calls']}, tokens {a['tokens_in']} in and {a['tokens_out']} out, "
-             f"cache {a['cache_read']} read and {a['cache_write']} written"),
+             f"cache {a['cache_read']} read and {a['cache_write']} written"
+             f"{'; known usage only, outstanding receipts need reconciliation' if a.get('usage_unknown') else ''}"),
             f"  seconds: api {a['api_seconds']:g}, wall {a['wall_seconds']:g}, wait {a['wait_seconds']:g}",
             cost_line("charged", a["charged_usd"], a["charged_per_accepted"], a["accepted"]),
             cost_line("reference", a["reference_usd"], a["reference_per_accepted"], a["accepted"])]
@@ -1117,7 +1150,8 @@ def render_pair(p: dict, baseline: str, confidence: float) -> str:
 def render(found: dict) -> str:
     accept = found["accept"]
     baseline, confidence = accept["baseline"], accept["confidence"]
-    out = [f"experiment {found['name']} (design {found['digest']}), atom {found['atom']}",
+    mode = "whole workflow" if found.get("executor") == "workflow" else f"atom {found['atom']}"
+    out = [f"experiment {found['name']} (design {found['digest']}), {mode}",
            f"{found['done']} of {found['planned']} trials done",
            f"{util.count(found['drifted'], 'drifted trial')} left out of rates and pairs"]
     for a in found["arms"].values():

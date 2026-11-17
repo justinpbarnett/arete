@@ -64,11 +64,13 @@ class Requirements:
     floor: str = ""
     approved: tuple[str, ...] = ()
     directory_cleanup: bool = False
+    delegation_only: bool = False
+    gated_launches: bool = False
 
     @property
     def declared(self) -> bool:
         return bool(self.modalities or self.min_context or self.structured_output or self.data_handling or self.floor
-                    or self.directory_cleanup)
+                    or self.directory_cleanup or self.delegation_only or self.gated_launches)
 
 
 @dataclass(frozen=True)
@@ -218,6 +220,10 @@ def payment_of(credential: str, auth_mode: str = "") -> str:
 def incompatible(way: Way, settings, device: devices.Device) -> str:
     traits = traits_of(way.runner)
     wanted = settings.instructions_on(way.runner)
+    if settings.requires.delegation_only and not traits.delegation_only:
+        return f"{way.runner} has no tool-free controller profile"
+    if settings.requires.gated_launches and traits.cannot_gate:
+        return traits.cannot_gate
     if not traits.takes_mcp and settings.mcp:
         return f"mcp {', '.join(settings.mcp)} cannot load on {way.runner}, which runs with --no-mcp"
     if wanted and not traits.instruction_scopes:
@@ -227,7 +233,7 @@ def incompatible(way: Way, settings, device: devices.Device) -> str:
     fallback = not (way.link.requested and way.runner == way.link.runner)
     if not traits.takes_mcp and fallback and "Bash" in settings.tools and not device.exe_sandbox:
         return PI_HOLDS_NO_BASH_RULES
-    if (traits.always_granted_tools and fallback
+    if (not settings.requires.delegation_only and traits.always_granted_tools and fallback
             and (missing := [t for t in traits.always_granted_tools if t not in settings.tools])):
         return f"tools leave out {', '.join(missing)}, which {way.runner} always grants"
     if traits.cannot_stop and fallback and (loose := [d for d in settings.denied if d not in NO_GIT_WRITES]):

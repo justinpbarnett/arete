@@ -57,11 +57,13 @@ def failed(error: str) -> Result:
 
 
 def run(cwd: Path | str, trace: tuple[str, str], cfg: config.Config, on_line: Callable[[str], None],
-        resume: Session = NO_SESSION, timeout: float | None = None) -> Result:
+        resume: Session = NO_SESSION, timeout: float | None = None, *, prompt: str = "") -> Result:
     if not (where := folder(cfg)):
         return failed(f"replay: no answer folder; set [replay] dir in {paths.short_path(paths.CONFIG_FILE)} or {ENV}")
     name = answer_name(*trace)
     answer_file, patch_file = where / f"{name}.json", where / f"{name}.patch"
+    if trace[1].startswith("worker-") and not answer_file.exists():
+        answer_file, patch_file = where / "worker.json", where / "worker.patch"
     patched = patch_file.exists()
     on_line(json.dumps({"type": "replay", "answer": str(answer_file), "patch": str(patch_file) if patched else ""}))
     try:
@@ -74,6 +76,17 @@ def run(cwd: Path | str, trace: tuple[str, str], cfg: config.Config, on_line: Ca
         return failed(f"replay: {answer_file} is not JSON: {e}")
     if not isinstance(answer, dict):
         return failed(f"replay: {answer_file} is not one JSON object")
+    controller = trace[1].startswith("orchestrate-")
+    if controller and (patched or answer.get("tool_calls")):
+        return failed("replay: controller answers cannot apply patches or execute tool calls")
+    if controller and "decision" in answer:
+        try:
+            observed = json.loads(prompt.rsplit("## Current observation\n\n", 1)[1])
+            answer = {**answer, "structured": {"version": 1, "decision_id": observed["decision_id"],
+                      "state_version": observed["state_version"], "rationale": "Replay the selected next action.",
+                      "calls": answer["decision"]}}
+        except (ValueError, KeyError, IndexError) as error:
+            return failed(f"replay: invalid controller observation: {error}")
     try:
         res = Result(ok=bool(answer.get("ok", True)), text=str(answer.get("text") or ""),
                      structured=answer.get("structured"), error=str(answer.get("error") or ""),
@@ -116,7 +129,7 @@ def run(cwd: Path | str, trace: tuple[str, str], cfg: config.Config, on_line: Ca
     return res
 
 
-def sample(where: Path, adw: bool = False) -> list[str]:
+def sample(where: Path, adw: bool = False, orchestrated: bool = False) -> list[str]:
     where = Path(os.path.abspath(where))
     if where.exists() and any(where.iterdir()):
         raise FileExistsError(f"{where} is not empty")
@@ -136,9 +149,24 @@ def sample(where: Path, adw: bool = False) -> list[str]:
     (answers / "build.patch").write_text(patch)
     for step, answer in SAMPLE_ANSWERS.items():
         (answers / f"{step}.json").write_text(json.dumps({**answer, **SAMPLE_USAGE}, indent=2) + "\n")
+    if orchestrated:
+        (answers / "worker.patch").write_text(patch)
+        (answers / "worker.json").write_text(json.dumps({**SAMPLE_ANSWERS["build"], **SAMPLE_USAGE}))
+        decisions = [
+            [{"op": "worker.start", "args": {"goal": f"Add {SAMPLE_WORD} to {SAMPLE_FILE}.",
+               "route_id": "model:build:0", "effort": "low"}}],
+            [{"op": "run.wait", "args": {"timeout_seconds": 60}}],
+            [{"op": "checks.run", "args": {}},
+             {"op": "verification.run", "args": {"route_id": "model:verify:0", "effort": "low"}},
+             {"op": "review.run", "args": {"route_id": "model:review:0", "effort": "low"}}],
+            [{"op": "publication.request", "args": {}}],
+        ]
+        for n, calls in enumerate(decisions, 1):
+            (answers / f"orchestrate-d{n:04d}.json").write_text(json.dumps({**SAMPLE_USAGE, "decision": calls}))
+    mode = "orchestrated" if orchestrated else "adw" if adw else "classic"
     (layer / "config.toml").write_text(f"[checks]\nword = {json.dumps(SAMPLE_CHECK)}\n\n[git]\nbase = \"main\"\n\n"
                                        f"[verify]\nnotes = {json.dumps(SAMPLE_NOTES)}\n"
-                                       + ("\n[factory]\npath = \"adw\"\n" if adw else ""))
+                                       f"\n[factory]\npath = {json.dumps(mode)}\n")
     return [f"# wrote {repo}, {origin}, {layer} and {answers}",
             f"# add these lines to {paths.short_path(paths.CONFIG_FILE)}, best in a scratch {SCRATCH_CONFIG}:",
             "",

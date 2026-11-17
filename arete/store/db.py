@@ -88,7 +88,8 @@ def connect_db(p: Path, readonly: bool = False, create: bool = False, *, streami
 
 
 TIME_COLUMNS = {**time_shape.TIME_COLUMNS, "runs": (*time_shape.TIME_COLUMNS["runs"], "measured_at"),
-                "idempotency": ("at",)}
+                "idempotency": ("at",), "orchestrations": ("at",), "orchestration_turns": ("at",),
+                "orchestration_actions": ("at",)}
 TIME_GLOB = time_shape.TIME_GLOB
 
 _CHAIN = migrations.load()
