@@ -498,7 +498,6 @@ class Controller:
                 progress = {key: worker.observations() for key, worker in self.workers.items()}
                 if progress != self.progress and time.monotonic() - self.last_progress >= self.policy.progress_seconds:
                     self.progress, self.last_progress = progress, time.monotonic()
-                    break
                 time.sleep(0.05)
             return {"active": list(self.workers)}
         self.barrier()

@@ -51,6 +51,9 @@ Use the ordinary task-start, status, wait, lines, stop, answer, resume, records 
 The controller has no owner-question tool; its validated `owner.ask` operation uses the existing owner-question lifecycle.
 Steering queues durable next-turn guidance and does not claim to interrupt an active tool call.
 Cancellation retains edits and requires the worker process group to become quiescent before another producer can take its place.
+A controller `run.wait` returns on worker completion or failure, no active workers, or its requested timeout of 1–120 seconds.
+Routine model progress and heartbeats remain available in records and viewers without ending that wait or spending another controller decision.
+Stop and run deadlines still interrupt the wait promptly.
 
 Run details include an additive `orchestration` object with lineage, generation, state version, controller decisions/launches and stable action IDs.
 Both run viewers list those actions, their results and effective requested settings.
@@ -77,6 +80,8 @@ Existing latest-run, version, purged-workspace and PR-head checks still apply.
 
 The catalog is an allowlist of role routes, registered prompts, tool bundles and opaque context references.
 The operation registry in `arete/orchestration_api.py` is the authoritative API reference.
+Operation descriptions expose the same enum and numeric constraints used for admission.
+Model entries identify their permitted operations and worker prompts; a refused route reports approved IDs for the requested roles.
 Decisions carry engine-issued turn/state identities and at most eight strictly validated calls.
 Unknown fields, unauthorized routes/context, oversized payloads and invalid dependencies are rejected before any part of a batch dispatches.
 Repeated identical receipts are idempotent; conflicting content under the same identity is refused.
