@@ -447,11 +447,12 @@ def eval_settings(cfg: config.Config, layer: config.RepoLayer) -> str:
 
 
 def switched_prompt(which: str, wt: Path, task: Task, plan: str, summary: str, feedback: str) -> str:
-    return (f"The earlier session cannot continue on {which}. Continue the existing work in {wt}; inspect its "
+    text = (f"The earlier session cannot continue on {which}. Continue the existing work in {wt}; inspect its "
             f"current diff before editing.\n\n## Task {task.name}: {task.title}\n\n{task.prompt}\n\n"
             f"## Saved plan\n\n{plan}\n\n## Earlier builder summary\n\n{summary}\n\n"
             "Keep the current task's tool restrictions and never write git metadata or secret files."
             f"\n\n## Current feedback\n\n{feedback}")
+    return prompt_loader.task_prompt(text)
 
 
 def hidden_check(cfg: config.Config, repo: config.Repo, task: Task, wt: Path, timeout: float):
@@ -535,7 +536,7 @@ def run_task(cfg: config.Config, src: Source, task: Task, prompts: Prompts, run:
                 attempts += 1
                 fix = prompt_loader.prompt("fix", prompts.dir, attempt=attempts, max_attempts=max_attempts, failures=report,
                              checks=runs_checks)
-                res = run.agent(f"fix{attempts}", fix, wt,
+                res = run.agent(f"fix{attempts}", prompt_loader.task_prompt(fix), wt,
                                 **run.call_kw(cfg, "check_repair", BUILD_TOOLS, rules),
                                 disallowed_tools=routing.NO_GIT_WRITES, resume=session, timeout=timeout,
                                 fresh_prompt=lambda which, fix=fix, summary=summary: switched_prompt(

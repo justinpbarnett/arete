@@ -30,7 +30,6 @@ Shell commands you may run: $commands.
 Denied paths: $denied.
 Never write Git metadata, secrets, agent configuration or CI workflows.
 Follow the repository's instructions.
-Add or change tests only when those instructions or the ticket request them.
 Do not run the full repository suite yourself; Arete owns that gate and runs it on the final tree.
 Use short targeted commands if they help, and report a refused command rather than finding a bypass.
 

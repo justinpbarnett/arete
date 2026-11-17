@@ -61,10 +61,11 @@ or what does what, and what goes wrong. If you cannot name that path, it is not 
 Everything else is a note. Notes never stop the merge; they go on the PR.
 
 - `major`: a real defect outside the four tests, such as an input the issue never asked about that did not work
-  before either, a missing test, a weak error message, or a design you would do differently.
+  before either, a weak error message, or a design you would do differently.
 - `minor`: a small thing worth knowing.
 
-Leave `category` out of notes. Do not list style preferences, or tests the repo's own docs do not ask for.
+Leave `category` out of notes.
+Do not list style preferences or requests for extra test coverage outside the shared Behavior-first policy.
 
 ## Evidence
 
