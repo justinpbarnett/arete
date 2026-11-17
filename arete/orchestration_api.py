@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 
 from . import config, owner_asks, prompt_loader, routing, steps
 from .agent import BUILD_TOOLS, READ_TOOLS, traits_of
@@ -19,6 +19,7 @@ OPTIONAL = object()
 class Operation:
     description: str
     fields: dict[str, tuple[type, object]]
+    constraints: dict[str, dict] = field(default_factory=dict)
 
     def arguments(self, value) -> dict:
         if not isinstance(value, dict) or value.keys() - self.fields.keys():
@@ -32,12 +33,20 @@ class Operation:
                 raise ValueError(f"{name} must be {kind.__name__}")
             if kind is str and (not item.strip() or len(item) > 16000):
                 raise ValueError(f"{name} must be nonempty and at most 16000 characters")
+            constraints = self.constraints.get(name, {})
+            if "enum" in constraints and item not in constraints["enum"]:
+                raise ValueError(f"{name} must be one of: {', '.join(constraints['enum'])}")
+            if "minimum" in constraints and item < constraints["minimum"]:
+                raise ValueError(f"{name} must be at least {constraints['minimum']}")
+            if "maximum" in constraints and item > constraints["maximum"]:
+                raise ValueError(f"{name} must be at most {constraints['maximum']}")
             found[name] = item
         return found
 
     def describe(self) -> dict:
         return {"description": self.description, "arguments": {
-            name: {"type": kind.__name__, **({"required": True} if default is OPTIONAL else {"default": default})}
+            name: {"type": kind.__name__, **({"required": True} if default is OPTIONAL else {"default": default}),
+                   **self.constraints.get(name, {})}
             for name, (kind, default) in self.fields.items()}}
 
 
@@ -47,12 +56,16 @@ def required(kind):
 
 OPERATIONS = {
     "catalog.list": Operation("Page approved entries; kinds are models, prompts, tools, context.",
-                              {"kind": required(str), "cursor": (int, 0), "limit": (int, 10)}),
+                              {"kind": required(str), "cursor": (int, 0), "limit": (int, 10)},
+                              {"kind": {"enum": ["models", "prompts", "tools", "context"]},
+                               "cursor": {"minimum": 0}, "limit": {"minimum": 1, "maximum": 20}}),
     "catalog.describe": Operation("Describe catalog IDs or operation names without loading everything.",
                                   {"ids": required(list)}),
     "context.read": Operation("Read a bounded authorized context reference, never a filesystem path.",
-                              {"ref": required(str), "offset": (int, 0), "limit": (int, 8000)}),
-    "run.observe": Operation("Observe actual action results and progress.", {"after": (int, 0), "limit": (int, 20)}),
+                              {"ref": required(str), "offset": (int, 0), "limit": (int, 8000)},
+                              {"offset": {"minimum": 0}, "limit": {"minimum": 1, "maximum": 16000}}),
+    "run.observe": Operation("Observe actual action results and progress.", {"after": (int, 0), "limit": (int, 20)},
+                             {"after": {"minimum": 0}, "limit": {"minimum": 1, "maximum": 20}}),
     "worker.start": Operation("Delegate a nonblocking goal; read/write capabilities cannot exceed the catalog.", {
         "goal": required(str), "prompt_id": (str, "delegate"), "inputs": (dict, {}), "route_id": required(str),
         "effort": required(str), "tool_bundle": (str, "write"), "context_refs": (list, []), "depends_on": (list, [])}),
@@ -63,17 +76,20 @@ OPERATIONS = {
     "worker.cancel": Operation("Stop a worker and confirm producer cleanup before releasing its lease.",
                                {"worker_id": required(str), "reason": required(str)}),
     "checks.run": Operation("Run owner-configured checks; full checks are required before publication.",
-                            {"scope": (str, "full")}),
+                            {"scope": (str, "full")}, {"scope": {"enum": ["quick", "full"]}}),
     "verification.run": Operation("One independent in-use attempt; never silently repairs implementation.",
                                    {"goal_refs": (list, []), "route_id": required(str), "effort": required(str)}),
     "review.run": Operation("One independent review of the current tree.",
                              {"context_refs": (list, []), "route_id": required(str), "effort": required(str)}),
     "owner.ask": Operation("Ask through the existing owner-question lifecycle.", {"request": required(dict)}),
-    "run.wait": Operation("Wait for meaningful progress without inference on every heartbeat.",
-                          {"after": (int, 0), "timeout_seconds": (int, 60)}),
+    "run.wait": Operation("Wait for worker completion or failure, or the bounded timeout; routine progress stays visible "
+                          "without waking the controller. Use the longest useful timeout for active work.",
+                          {"after": (int, 0), "timeout_seconds": (int, 60)},
+                          {"after": {"minimum": 0}, "timeout_seconds": {"minimum": 1, "maximum": 120}}),
     "publication.request": Operation("Request existing engine publication; current evidence and authority are required.", {}),
     "run.finish": Operation("Finish failed, noop or delivered; delivered requires engine publication.",
-                             {"reason": required(str), "evidence_refs": (list, [])}),
+                             {"reason": required(str), "evidence_refs": (list, [])},
+                             {"reason": {"enum": ["failed", "noop", "delivered"]}}),
 }
 
 
@@ -98,7 +114,11 @@ class Catalog:
                 self.settings[key] = selected
                 self.entries[key] = {"id": key, "kind": "models", "role": role, "runner": selected.runner,
                                      "model": selected.model, "efforts": list(traits_of(selected.runner).efforts),
-                                     "fallback": selected.fallback, "price": None}
+                                     "fallback": selected.fallback, "price": None,
+                                     "operations": ["verification.run" if role == "verify" else "review.run"]
+                                     if role in ("verify", "review") else ["worker.start", "worker.continue"],
+                                     "prompt_ids": [f"prompt:{name}" for name, (prompt_role, _) in PROMPTS.items()
+                                                    if prompt_role == ("build" if role.endswith("_repair") else role)]}
         for name, (role, writing) in PROMPTS.items():
             template = prompt_loader.template("delegate" if name == "investigate" else name)
             key = f"prompt:{name}"
@@ -116,8 +136,7 @@ class Catalog:
         self.context[name] = text
 
     def list(self, kind: str, cursor: int, limit: int) -> dict:
-        if kind not in ("models", "prompts", "tools", "context") or cursor < 0 or not 1 <= limit <= 20:
-            raise ValueError("invalid catalog kind or page bounds")
+        OPERATIONS["catalog.list"].arguments({"kind": kind, "cursor": cursor, "limit": limit})
         entries = ([{"id": ref, "kind": "context", "characters": len(text)} for ref, text in self.context.items()]
                    if kind == "context" else [entry for entry in self.entries.values() if entry["kind"] == kind])
         return {"entries": entries[cursor:cursor + limit],
@@ -151,15 +170,16 @@ class Catalog:
 
     def read(self, ref: str, offset: int, limit: int) -> dict:
         self.refs([ref])
-        if offset < 0 or not 1 <= limit <= 16000:
-            raise ValueError("invalid context excerpt bounds")
+        OPERATIONS["context.read"].arguments({"ref": ref, "offset": offset, "limit": limit})
         text = self.context[ref]
         return {"ref": ref, "text": text[offset:offset + limit], "characters": len(text),
                 "next": offset + limit if offset + limit < len(text) else None}
 
     def route(self, key: str, effort: str, roles: tuple[str, ...]) -> steps.Settings:
         if key not in self.settings or self.settings[key].step not in roles:
-            raise ValueError("route is not approved for this operation")
+            approved = [name for name, setting in self.settings.items() if setting.step in roles]
+            raise ValueError(f"route {key!r} is not approved for roles {', '.join(roles)}; "
+                             f"approved route IDs: {', '.join(approved) or 'none'}")
         setting = self.settings[key]
         if effort not in traits_of(setting.runner).efforts:
             raise ValueError("unsupported reasoning effort")
@@ -221,8 +241,6 @@ class Catalog:
                     if not effective:
                         raise ValueError("the prior worker has no recoverable invocation settings")
                     self.worker({**effective, **args["settings"], "goal": args["message"]})
-            if op == "catalog.list":
-                self.list(**args)
             if op == "catalog.describe":
                 ids = args["ids"]
                 if (not 1 <= len(ids) <= 10 or any(type(key) is not str or key not in self.entries
@@ -230,19 +248,11 @@ class Catalog:
                     raise ValueError("describe needs between 1 and 10 known catalog or operation IDs")
             if op == "context.read":
                 self.read(**args)
-            if op == "run.observe" and (args["after"] < 0 or not 1 <= args["limit"] <= 20):
-                raise ValueError("invalid observation bounds")
             if op == "owner.ask":
                 _, errors = owner_asks.validate(args["request"])
                 if errors:
                     raise ValueError("; ".join(errors))
-            if op == "checks.run" and args["scope"] not in ("quick", "full"):
-                raise ValueError("check scope must be quick or full")
-            if op == "run.wait" and (args["after"] < 0 or not 1 <= args["timeout_seconds"] <= 120):
-                raise ValueError("wait must be between 1 and 120 seconds")
             if op == "run.finish":
-                if args["reason"] not in ("failed", "noop", "delivered"):
-                    raise ValueError("finish reason must be failed, noop or delivered")
                 self.refs(args["evidence_refs"])
             calls.append({"op": op, "args": args})
         return {**response, "calls": calls}
