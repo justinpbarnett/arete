@@ -69,59 +69,11 @@ five seconds in the rolling last hour and names its caller; `db:size` warns when
 `[retention] db_max_mb` (default 500 MiB); `runs:size` warns above half `max_gb` (decimal GB), counting record/
 and all other run-folder bytes. These checks read current files, so they also work before the first collection.
 
-Run the merge resolver exercises with `<sandbox> python docs/resolve-fixture.py base-moved`,
-`unrelated-edit`, `protected`, or `branch-moved` (replace the final scenario name). Each uses fresh offline Git
-repositories under `.arete-sandbox/resolve-fixture` and exits nonzero on a mismatch. Successful moves print clean
-merge parents and combined content; refusal cases print the rejected path and resolver call count. `base-moved`
-also checks an explicit incoming commit override and saves the emitted prompts beside each disposable repository.
-
-Run the offline exercises through the supplied verification sandbox, replacing `<sandbox>` with its executable path:
-
-```sh
-<sandbox> python docs/db-fixture.py transactions
-<sandbox> python docs/db-fixture.py concurrent-intake
-<sandbox> python docs/db-fixture.py transaction-timing
-<sandbox> python docs/db-fixture.py output-sinks
-<sandbox> python docs/db-fixture.py durable-files
-<sandbox> python docs/db-fixture.py wal-startup
-<sandbox> python docs/db-fixture.py prune-restore
-<sandbox> python docs/db-fixture.py restore-safety
-<sandbox> python docs/db-fixture.py feed-cursors
-<sandbox> python docs/db-fixture.py backup-health
-<sandbox> python docs/db-fixture.py coherent-reads
-<sandbox> python docs/db-fixture.py event-contract
-<sandbox> python docs/db-fixture.py database-health
-<sandbox> python docs/db-fixture.py legacy-cleanup
-<sandbox> python docs/db-fixture.py browser-seed
-<sandbox> python docs/db-fixture.py browser-serve --port 8765
-<sandbox> python docs/db-fixture.py inspect
-```
-
-Each exercise starts a subprocess with disposable config, state, logs, worktrees, temporary files and HOME before
-importing arete, refuses production state, uses offline fakes and exits nonzero on a behavioral mismatch. Readable
-evidence, stdout and stderr remain under `.arete-sandbox/db-fixture/<exercise>-*/`; `inspect` reviews the latest
-results and journal/synchronous settings. Contention exercises use ordinary rollback-journal SQLite files, not the
-confined scratch connection's MEMORY journal. Source fetch barriers, transaction cleanup, snapshots, migrations,
-restore isolation, oncall ordering, output draining and durable replacement failures are exercised there.
-
-The new exercises retain read-connection/cutoff evidence, concurrent-commit barriers, event-contract blockers,
-health aggregation/collection beats and real startup cleanup evidence. Reuse prune-restore, restore-safety,
-backup-health and feed-cursors for backup retention, copy and restore regressions.
-
-`browser-seed` records a shared disposable fixture directory in `db-fixture/browser.json`; `browser-serve`
-uses it until Ctrl-C and is excluded from the finite exercise list. Open http://127.0.0.1:8765/ and the printed
-`/#run/local`, `/#run/replay`, `/#run/subscription`, `/#run/api-key` and `/#run/mixed` links. Open the chat console
-on `/#live` to select the seeded chat; its messages, session list and report also have printed API links.
-http://127.0.0.1:8765/ui.html uses the same data. The fixture binds loopback with a fake owner identity and uses
-the real Handler and admission checks; it does not change production routes or authentication.
-
 ## Serve
 
 `arete serve` is the one daemon. It fires each loop on its trigger (a cron line, an interval, a source with new events, a webhook), runs the fired loops through their queues, closes idle sessions, writes a beat to `serve.json` every 20 seconds, and serves the dashboard. `arete install` runs it at login: one launchd agent, `com.arete.serve`, on a Mac, or one systemd user unit, `arete-serve.service`, on Linux. It retires the old per loop agents (`com.arete.heartbeat`, `poll`, `mine`, `audit`, `eval`, `triage`, `dashboard`), since each of those now runs as a loop under serve. `arete install --dry-run` prints what it would write. A loop run killed with serve settles as interrupted; its queued input gets one recovery retry when serve starts again, then becomes dead if interrupted again.
 
 A failing loop, stage, queue item or approval costs only itself: serve logs `<key>: tick failed: <error>` once, keeps going with everything else, and the beat names the failing keys (`failing`, `tick_ok`, `last_ok`) with the error, when it began and how many passes in a row. `arete status`, the dashboard and the heartbeat then say serve is up but its tick fails at that key; three passes in a row make the beat stuck. When a loop, the dispatcher or the whole tick fails for 3 minutes, serve raises the `serve:tick` alert and clears it on the first clean pass. Every stage added to serve's tick runs under its own guard key (`Server.guard`), never bare in `tick`.
-
-`docs/serve-bulkhead-fixture.py` exercises this offline, with real HTTP responses and rendered pages, in a sandbox under `.arete-sandbox/serve-bulkhead` (replay on, JEV off, no provider, VM, notification or tracker calls). `python docs/serve-bulkhead-fixture.py serve --port 8765` starts it; `scenario NAME --passes N` drives that many real `Server.run_pass` calls (names: clean, loop, recover, oncall, approvals, queue, waits, alerts, fresh-alert, bad-config, states, beat, guard, retirement, command), and `inspect` prints the raw beats, launches, claims, summaries, heartbeat checks and alert calls of the last scenario. `recover` clears the faults the last scenario injected. Production still ticks every 20 seconds; the fixture runs its passes at once.
 
 A killed loop's queued input gets one automatic recovery retry when serve reaps it; a second interrupted attempt becomes a dead item. Failed runs and requested stops keep event input as dead items for inspection and manual requeue. Empty schedule inputs are discarded on failure or coalesced with an already waiting fire on recovery.
 
@@ -282,14 +234,14 @@ Before a new incident is opened, JEV may match a differently worded symptom to a
 A symptom whose twin check reads as an injection is opened already marked and can never wake a model.
 Twin checks and decisions share one budget: at most 20 JEV evaluations per scan, and the rest wait for the next.
 A symptom from a run that is still live gets no twin check and no decision until the run ends.
-All calls go through `oncall.ask_jev`, one function a test harness can replace.
+All calls go through `oncall.ask_jev`.
 
 **Repairs.** Each scan, an incident decided `wake` starts one local task of kind `fix` with `tasks.start`, in the config's `arete_repo` for Arete's own sources (the heartbeat, serve, a run, or Arete's log and run folders) and in the source's `repo` otherwise.
 So planning, the isolated worktree, checks, verify, review, the PR, automerge and the permission rules are the ones every task has.
 The task prompt is `arete/prompts/oncall_repair.md`: diagnose and reproduce first, then make the smallest repair; the redacted evidence is a fenced block marked as untrusted data.
 Before a wake, Arete resolves the plan, build, verify, review and repair steps of that repo with `steps.resolve` and checks each with `routing.fit_refusal`, `routing.modes_for` and `routing.outlook`.
 A hold, a spent budget or a payment mode refusal leaves the incident `waiting` with that reason; with `payment_modes = ["subscription"]` no paid route is used, and no hold is bypassed.
-Task start, run stop, the route lookup, the check run and the alerts go through `oncall.start_task`, `oncall.stop_run`, `oncall.route_outlook`, `oncall.run_check`, `oncall.raise_alert` and `oncall.clear_alert`, which a harness can replace.
+Task start, run stop, the route lookup, the check run and the alerts go through `oncall.start_task`, `oncall.stop_run`, `oncall.route_outlook`, `oncall.run_check`, `oncall.raise_alert` and `oncall.clear_alert`.
 
 | `[oncall]` key | Default | Bound |
 | --- | --- | --- |
@@ -342,7 +294,6 @@ arete oncall on
 
 `--json` prints one JSON line per incident (`scan --json` prints the summary).
 While the watcher is on, the heartbeat's `oncall:scan` check fails when the last scan crashed or is more than five minutes old.
-The regression checks are in `tests/test_oncall.py` and run with `uv run python -m unittest discover -s tests -v`.
 
 ## Runners, devices and sessions
 
@@ -416,7 +367,7 @@ Remote turns require Bash, including when launched through `setsid`, plus `ps` a
 They use `setsid`, or Bash job control on macOS, and verify the process group before starting work.
 Relative device and working directories resolve from the remote login directory.
 
-The offline remote-turn fixture runs real launch, attach and cleanup code against fake SSH and Claude processes. Run `python docs/remote-turn-fixture.py MODE` through the verification sandbox with `MODE` set to `reset`, `half-open`, `stop`, `timeout`, `cut`, `loop`, `lost-refused`, `lost-folder`, `cleanup`, `bytes`, `watchdog`, `contract`, `local`, `groups`, `relative`, `answered` or `upload`. Each mode asserts its outcome and prints `BEHAVIOR_RESULT` with retained evidence under `.arete-sandbox/remote-turn-fixture`; `inspect` reads the saved evidence. The fixture uses a three-second heartbeat window and one-second stop grace. New remote turns wait for the remote-turn schema contract: older runs, loops, sessions and serve processes must end before `arete migrate` can apply it.
+New remote turns wait for the remote-turn schema contract: older runs, loops, sessions and serve processes must end before `arete migrate` can apply it.
 
 A device of kind `exe` is a sandbox on [exe.dev](https://exe.dev).
 Each run gets a VM of its own, works on it over ssh, and deletes it when the run ends.
@@ -688,24 +639,6 @@ Poll starts detached runs and fills the available capacity round robin across re
 
 Pipeline budgets span repairs, continuations and individual step reruns. The defaults allow two repair calls, 60 minutes of total active run time and 20 minutes inside verification, including verification repairs and service waits. The checks that run again after a verification repair count as run time, not verification time. A deadline interrupts the current call through its existing cleanup and parks the ticket as failed, leaving its available workspace, branch and evidence in place and releasing its slot. Active time is measured on the run's own clock and stored on its database row: machine sleep, a suspended VM and the time before a dead run is reaped are free. A killed run and its open verification phase count up to their last checkpoint, at most 30 seconds short. Runs from before this change receive a frozen wall-clock estimate. The run log and a `budget_chain` event name each parent's charged run minutes, verification minutes and repair calls, marking estimates; `parked.json` keeps the same map under `charged` beside the reason it stopped. After the budget schema contract applies, `budget.json` holds only lineage, policy, specification and excluded wait minutes. A `limit` wait (a usage limit or credit hold) and a `slot` wait for a free run slot are left out, in the run and in the earlier runs of its chain. The deadline does not fire during such a wait and moves out by its length. `ci` waits and time inside verification, service waits included, still count, and `max_verify_minutes` keeps counting during a `limit` wait. `budget.json` and `parked.json` list the minutes left out by cause under `wait_minutes_left_out` (this run) and `earlier_wait_minutes_left_out` (earlier runs of the chain). Repeating an unchanged parked request starts no model call. Change the ticket's title or body, published branch head, or budget settings and retry with `arete run REPO TICKET --force` to begin a new budget. A forced run of a chain that did not park leaves out the repair calls, run minutes and verification minutes that earlier runs spent under a different title or body, writes one log line saying how much it left out, and lists those runs under `left_out` in `budget.json`. A run whose specification was not recorded still counts, and so does every run when the specification is unchanged or the run is a repair, a continuation or started by poll. Parking does not approve a review, remove a hold or enable a merge. A run that ends with its workspace left in place, parked or failed, commits its uncommitted edits to the local branch with an `Arete-Run: RUN_ID` trailer and pushes nothing; `parked.json` lists the kept head and the commit beneath it under `kept`, and the workspace record keeps them for any later run. The next run of the ticket, forced, resumed or prepared again, continues from that commit when the worktree still matches the record, merged with `origin/BRANCH` or the base when either moved, and tells the build that the worktree holds those edits; the diff limit, the checks and the review count them as part of the change, and the next push sends them. A worktree that was reset, moved to another branch or edited by hand is refused with what changed; remove the worktree and the local branch to start from origin.
 
-Exercise stored run budgets offline with the sandbox launcher:
-
-```sh
-SANDBOX=/Users/justin.barnett/Library/Developer/arete/verification-runtime/harness/sandbox
-$SANDBOX python docs/run-budget-fixture.py sleep
-$SANDBOX python docs/run-budget-fixture.py forced-columns
-$SANDBOX python docs/run-budget-fixture.py row-precedence
-$SANDBOX python docs/run-budget-fixture.py killed-verify
-$SANDBOX python docs/run-budget-fixture.py migrations
-$SANDBOX python docs/run-budget-fixture.py migration-errors
-$SANDBOX python docs/run-budget-fixture.py checkpoint-errors
-$SANDBOX python docs/run-budget-fixture.py admission
-$SANDBOX python docs/run-budget-fixture.py waits
-$SANDBOX python docs/run-budget-fixture.py inspect
-```
-
-Each exercise uses fresh disposable state and a local replay sample, prints `BEHAVIOR_RESULT` JSON, and retains database rows, logs, migration evidence and local published branches beneath `.arete-sandbox/run-budget-fixture/`. `inspect` reads the retained evidence. These exercises never use production state or a model.
-
 A laptop sleeps and drops its network. When poll, triage or the heartbeat start offline, most often just after a wake, they wait up to 3 minutes for the network; if it does not come back they skip with an "offline" note and exit 0. A git or gh call that fails on a network error waits up to 30 minutes for the network, then tries once more. An agent step cut off by a dropped connection resumes its own session when the network is back. A run whose process died is put back in the queue with a comment on the ticket, and the next poll starts it again; a second death in a row fails the run as before. Heartbeat ages count only time awake, so a night asleep never reads as a stale log.
 
 ## When a worktree is kept and when it is removed
@@ -798,22 +731,6 @@ Hook events rotate monthly from `events.jsonl` into `events-YYYYMM.jsonl`, named
 Each immutable migration lives in `arete/store/migrations/mNNNN_area_name.py`, with `PHASE` and exactly one `SQL` string or `apply(conn)`. Areas come from public store modules declaring literal `TABLES` dictionaries; `foundation` maps to `db`. Each table appears in exactly one owner's `TABLES`, mapped to its retention policy. A future aggregate gains a valid migration area by adding its public module and literal `TABLES` dictionary before adding its migration. Helpers and packages are not owners, and `outbox` is refused until its owner exists. Only the historical `m0004_work_event_routing.py` resolves `work` to `loops`; existing ledger rows stay unchanged. Numbers start at 1 without gaps or repeats. `latest.txt` names the highest file, so branches adding the same next number conflict there. The loader refuses a changed SHA-256 for any applied file. Add a new migration to repair an earlier one.
 
 Import connections with `from arete.store import db` and persistence functions through their owner modules. `store.runs` owns recording SQL, history, billing helpers (`paid_by_run`, `loop_spent_since`), reports, feed, pins and folder-purge scheduling; `record.py` keeps IDs, timelines and filesystem cleanup. Loops owns queue recovery, events, loop state, findings and loop locking. Sources owns seen keys, cursors, source ownership and passed-over tickets. Incidents owns incidents, notes, aliases, repairs and alerts. Approvals owns approvals, proposals and mined results; chats owns chats, messages and linked sessions; tasks owns tasks and comments; triage owns current rows and triage approvals; devices owns VMs, probes and holds; insights owns usage, research, evals, feedback, verdicts and captures with their checks and evidence; asks owns owner asks and run messages; push owns subscriptions. The private `_rows` encoding helper is excluded from migration owners. Approval settlement updates verdicts through insights on the approval transaction's connection. `oncall.commit_scan` coordinates incident and cursor writes on one connection. `store.prune` calls runs, loops and incidents in order on one connection, after the server's checked backup. The relocated numbered migrations and `latest.txt` retain their original bytes.
-
-The isolated persistence probes print exact inventories and rollback evidence as `BEHAVIOR_RESULT` JSON:
-
-```sh
-python -I tests/scripts/store_contract.py ownership
-python -I tests/scripts/store_contract.py unknown-area
-python -I tests/scripts/store_contract.py base-upgrade
-python -I tests/scripts/store_contract.py prune
-python -I tests/scripts/store_contract.py rollback
-python -I tests/scripts/store_contract.py record-and-readers
-python -I tests/scripts/store_contract.py boundary
-```
-
-In the build sandbox, prefix each command with the supplied `verification-runtime/harness/sandbox` executable.
-
-Every mode generates configuration with `replay.sample` and confines all six environment paths to a disposable directory. `boundary` inspects every Python file outside `store`, requires `state.py` to be absent and reports SQL or SQLite connection violations with filenames and lines. `base-upgrade` compares every numbered migration with its historical adding commit and proves an `origin/main` database gains no ledger rows; this extraction adds no migration. Additional modes `record-failures`, `aggregate-joins`, `scan-atomicity` and `server-prune` cover rollback, reader joins, atomic scans and backup ordering. Nearby backup and coherent-read exercises live in `docs/db-fixture.py`.
 
 The phases are `expand` (compatible additions), `backfill` (data conversion) and `contract` (removals or incompatible changes). `arete migrate --no-contracts` stops before the first contract. A contract waits for live runs and serve processes that name an older schema, including runs without a schema stamp. A stale heartbeat does not release a still-running older serve's contract gate. Serve retries a waiting contract on each tick. Each migration and its ledger row commit together, with `user_version`, duration and the snapshot filename. A failure rolls back that migration and preserves earlier successful versions. Retention also keeps the snapshot named by the newest migration.
 
@@ -1008,7 +925,7 @@ Builder and repair prompts leave the full-suite gate to Arete instead of asking 
 quick = ["lint", "compile", "imports", "web"]
 
 [targeted_commands]
-tracker-smoke = ".venv/bin/python -m unittest tests.test_tasks"
+tracker-smoke = ".venv/bin/python -m unittest tests.test_sessions_and_tokens.PushedPrDraftTests"
 poll-smoke = ".venv/bin/python -m unittest tests.test_process_limits.QueueTests"
 
 [check_policy.targeted]
@@ -1634,9 +1551,18 @@ Chat reads a dashboard snapshot with settings and trends at `runs/chat/context/d
 
 ## Verify in use
 
-Run Arete's durable behavioral checks with `uv run python -m unittest discover -s tests -v`. They exercise complete offline workflows against a local tracker and a local bare Git origin, including rejected checks, blocked verification, rejected reviews and a run parked with scratch held. Writer regressions preserve warning and prerequisite bodies, complete commands and code indentation, and keep synthetic private voice text out of captured GitHub publication. Scratch checks cover finalization of created, imported, hard-linked and re-dated entries. Add the same command under `[checks]` in Arete's layer so these cases run before model verification on every candidate branch.
+Run the essential business checks with `uv run python -m tests.parallel`.
+The suite covers budgets, accounting, admission, permissions, approval, idempotency and quality promotion.
+It intentionally trades end-to-end, browser, operating-system, Git and migration-runtime coverage for a small business-rule suite.
+Product behavior, migration compatibility and limits are unchanged by the coverage removal.
+`uv run python -m unittest discover -s tests -v` runs the same business cases serially.
 
-`uv run python -m tests.parallel [-j N] [-v] [--timeout S] [--slowest N]` runs the same tests across worker processes, 4 by default, each test in a process of its own. A class with `serial = True` (today `LiveTests` in `tests/test_scratch_producers.py`) waits for the pool and then runs one test at a time. A class with `slow = True` (today `OptimizeTests` in `tests/test_scratch_and_optimize.py`) starts first, so its longest test does not begin late. `--timeout` (default 300 seconds) kills a hung test and counts it as an error that names it. It prints failures and errors with tracebacks, then one line with the counts, and exits non zero on any failure or error. `--slowest N` prints the N test classes that took longest before that line. Each worker leads its own process group, which the runner kills when the test ends, hangs, or the runner is interrupted (exit 130, naming the tests in flight), and workers end themselves when the runner is killed, so no worker outlives it. It can replace the serial command under `[checks]` in the layer.
+`uv run python -m tests.parallel [-j N] [-v] [--timeout S] [--slowest N]` uses four workers by default and runs each test class's existing cases together in a separate interpreter.
+`--timeout` defaults to 10 seconds per class; a timeout fails the run and cleans up the worker's process group.
+`--slowest N` reports the slowest classes.
+Workers own process groups that the runner cleans up on completion or interruption, and a lifeline ends workers if the runner dies.
+The runner exits nonzero on any failure or error and does not retry; the first failure is authoritative.
+Either command can serve as the business-suite command under `[checks]` in Arete's layer.
 
 Configure cheap environment prerequisites under `[verify.preflight]`:
 
@@ -2278,26 +2204,6 @@ and `too_far` means more than 10,000 matching rows wait. Fetch a fresh snapshot 
 Derived events are retained for 90 days, notices for seven, and durable events indefinitely.
 `GET /api/meta` includes `stream.complete`, class trim ids and the head; completeness remains false while older writers may run.
 
-Offline stream exercises use disposable folders, fake Tailscale and the replay runner, and print their evidence directory:
-
-```sh
-python docs/events-fixture.py serve --port 8765
-python docs/events-fixture.py exercise live-replay
-python docs/events-fixture.py exercise reconnect-formats
-python docs/events-fixture.py exercise filters
-python docs/events-fixture.py exercise epoch-reset
-python docs/events-fixture.py exercise retention-reset
-python docs/events-fixture.py exercise backlog-reset
-python docs/events-fixture.py exercise atomicity
-python docs/events-fixture.py exercise admission-seed
-python docs/events-fixture.py exercise principal-gate
-python docs/events-fixture.py exercise row-actors
-python docs/events-fixture.py exercise completeness
-python docs/events-fixture.py exercise beats
-python docs/events-fixture.py exercise nearby
-python docs/events-fixture.py inspect
-```
-
 By default it answers plain HTTP on the machine's tailnet addresses, calls no `tailscale cert` and makes no `tailscale serve` mapping.
 HTTPS is off until the owner turns it on with `https = true` under `[dashboard]` in the config; the key takes `true` or `false` and defaults to `false`.
 With it on, the dashboard answers over HTTPS on the machine's tailnet name (`https://NAME:PORT`) with a tailnet certificate from `tailscale cert`.
@@ -2530,199 +2436,51 @@ Run `arete loop try merge-check` to preview held tickets before enabling it
 with `arete loop enable merge-check`. See [the loop guide](arete/loops/README.md#merged-base-use-checks)
 for checkpoints, UTC quotas, blocked-input recovery, the `$finding.repo` ticket selector and queue capacity.
 
-## Offline merge-check fixture
+An unknown repo exits nonzero with one diagnostic.
+Empty-history discovery prints nothing, and a trial with no work finishes skipped with zero model calls.
+The initial source baseline enqueues no old input; later polling enqueues each new merged pipeline PR once, including equal timestamps and late discoveries.
+Discovery keeps one canonical PR URL, even when the same PR is recorded under distinct ids.
+Command-scope catch-up uses `data.at` and retains old seen identities.
+Trial mode holds tickets and metrics and changes no consumer state.
+Its preview names the pinned base, serving configuration, recent PRs, numbered checks and applicable older neighbours, or explicitly says there is no applicable neighbour.
 
-Use a disposable checkout and the verification sandbox. The helper creates only scratch configuration,
-state, two local bare origins, two deliberately stale local main branches, a small local HTTP product
-and replay answers. It never contacts a tracker or provider. Keep the shipped loop disabled. Every
-delivery below uses trial mode, which holds both tickets and metrics. Do not run these commands
-against normal state. Start from an empty fixture directory; retain it for inspection afterward.
+`manifest.json` records the pinned SHA, worktree and steps; `result.json`, `verify.md` and `record/` preserve evidence in the merge-check run folder.
+A passing check emits metric 1, a failed check emits its regression finding followed by metric 0, and a redundant event emits nothing.
+Findings name the failed checks, including overlapping neighbours, and exclude the verifier's private summary, How and Saw text.
+For a continuation, the latest run owns the merge while the earlier run owns its report.
+Merges arriving during a check wait for the next batch.
+Concurrent checks serialize on the consumer lock, and the server's `merge-check = 1` queue limit allows at most one product to serve at once.
 
-```sh
-SB="$HOME/Library/Developer/arete/verification-runtime/harness/sandbox"
-"$SB" python docs/merge-check-fixture.py setup
-"$SB" arete merged --help
-"$SB" arete merge-check --help
-"$SB" arete loop list
-"$SB" arete loop status merge-check
-"$SB" arete merge-check arete-placeholder-missing --dry-run
-"$SB" arete merged --since-cursor
-"$SB" python docs/merge-check-fixture.py check --dry-run
-"$SB" arete loop try merge-check
-"$SB" python docs/merge-check-fixture.py inspect
-```
+Missing reports or diffs, malformed checks, absent verify configuration and failed preflight block without a metric or ticket and leave the batch unchecked.
+Failed preflight starts no service or verifier.
+A product startup crash emits a regression finding and metric 0, naming the checks it prevented; sandbox and confinement failures remain blocked.
+Unavailable, incomplete or unknown verification results remain blocked.
+After restoring prerequisites, retry the event; inspect scheduler dead input with `arete loop status merge-check` and requeue it with `arete loop requeue ID`.
+The hard cutoff interrupts the verifier at 40 actions, keeps usage and evidence, and blocks without repair.
+Interruption and timeout share the cleanup path; unresolved ownership retains and reports the worktree without advancing checked history.
 
-The unknown repo exits nonzero with one diagnostic. Empty-history discovery prints nothing; try
-finishes skipped with zero model calls. `inspect` shows no quota, checked identities or product starts.
-The fixture helper's `check` action sets `ARETE_LOOP_DIR` to its disposable loop folder. For the
-public command, use `"$SB" env ARETE_LOOP_DIR="$PWD/.arete-sandbox/merge-check-fixture/loop"
-arete merge-check fixture` with the same stdin (on one shell line).
+Quota holds exit 75 without starting work or recording a result.
+Scheduler dispatch releases the claimed input and consults the persisted reset before trying again; a concurrent dispatch reports busy.
+Dry-run displays a quota hold without reserving.
 
-Establish the source baseline with an older neighbour, then add two merges. Polling uses the existing
-engine source transaction. `--at` accepts a recorded UTC timestamp, so equal timestamps and late
-discoveries can be reproduced without changing clocks.
+## Versioned writes
 
-```sh
-"$SB" python docs/merge-check-fixture.py add --pr 1 --at 2026-01-01T00:00:00+00:00
-"$SB" python docs/merge-check-fixture.py poll
-"$SB" python docs/merge-check-fixture.py add --pr 2
-"$SB" python docs/merge-check-fixture.py add --pr 3
-"$SB" python docs/merge-check-fixture.py add --pr 90 --kind nonpipeline
-"$SB" python docs/merge-check-fixture.py add --pr 91 --kind open
-"$SB" python docs/merge-check-fixture.py add --pr 92 --kind no-pr
-"$SB" arete merged --since-cursor
-"$SB" python docs/merge-check-fixture.py poll
-"$SB" python docs/merge-check-fixture.py poll
-"$SB" arete loop try merge-check
-"$SB" arete loop try merge-check
-"$SB" python docs/merge-check-fixture.py event --pr 2 > .arete-sandbox/event.json
-"$SB" python docs/merge-check-fixture.py answer
-"$SB" python docs/merge-check-fixture.py check < .arete-sandbox/event.json
-"$SB" python docs/merge-check-fixture.py check < .arete-sandbox/event.json
-"$SB" python docs/merge-check-fixture.py inspect
-```
+Keyed task starts hash the canonical request and replay the exact committed response for the same principal and key.
+A live duplicate is rejected while its request is in flight; keys are separate for each principal.
+Idempotency records expire strictly after 30 days through serve pruning.
+CLI task starts print their `Idempotency-Key` on stderr and use `ARETE_IDEMPOTENCY_KEY` when supplied, otherwise a fresh key.
+Keyed CLI requests share a 30-second deadline across connection, headers, response bodies and waits, with at most two resends after an uncertain result and the same key throughout.
 
-Baseline enqueues no old input. The next poll enqueues the two new PRs once; repeated polling is
-empty. Excluded rows never appear. Try shows origin/main, start and URL templates, the two recent
-PRs, numbered checks and the older neighbour with `version` as the shared file. Try changes no
-consumer state. The first check prints only `{"value":1}`; the redundant event prints nothing.
-Inspect run folders under `.arete-sandbox/state/runs/merge-check-*`: `manifest.json` records the
-pinned SHA, worktree and steps; `result.json`, `verify.md` and `record/` preserve evidence.
-The disposable worktree is released and the server stops. `inspect` extracts START lines from the saved
-server logs to list the actual serving directories.
+Successful run writes retain their legacy response bodies and identify the committed event in `Arete-Seq`.
+Every displayed run action sends its selected `base_version`.
+A stale action shows the conflict once, refreshes and sends no second POST; a deliberate action after refresh uses the new displayed version.
 
-For a failure add PR 4, select `answer --verdict fail`, supply its event and check again. The answer
-contains PRIVATE markers in its summary, How and Saw; none may appear in emitted findings. The
-finding names the manifest's failed steps, including the neighbour, followed by metric 0. Repeat
-with `--repo fixture-two` on add, event, answer and check to inspect routing to the second repo.
-`arete loop try merge-check` previews the sample failure through the held dynamic ticket emit.
-For an ordinary fixed target and explicit numeric metric, run:
-
-```sh
-"$SB" python docs/merge-check-fixture.py emit
-"$SB" python docs/merge-check-fixture.py emit-dynamic --repo fixture-two
-"$SB" python docs/merge-check-fixture.py emit-dynamic --repo unknown
-"$SB" python docs/merge-check-fixture.py emit-dynamic --repo ''
-```
-
-For late delivery add PR 5 using the same `--at` as PR 4, then poll; add PR 6 with an earlier `--at`
-and poll again. Both keys must be observed once despite their timestamps. `poll --scope-change`
-changes command scope without changing its output; catch-up uses `data.at` and retains old seen
-identities. For an ordinary command source, use the same `sources.poll` helper with a different
-source name/command that prints a constant JSON key: run `poll-ordinary` twice (baseline, then empty),
-then `poll-ordinary --id another` (new scope, recent catch-up follows the ordinary command rules).
-
-For arrivals during a check use `answer --seconds 20`, start `check` in one terminal, and add another
-PR in a second terminal while the server runs. Fetch `/version` at the address in `verify-server.log`:
-it must read `origin-new`, even though local main reads `local-old`. After the first result, create a
-new answer and dispatch the new event: only the next batch includes that merge. Two concurrent
-helper `check` processes serialize on the consumer lock. Run `dispatch` to claim the next polled queue
-item through `loop_run.carry`, with every ticket held. A second concurrent dispatch reports busy;
-repeated dispatch after quota is capped reports a hold without a subprocess. This uses the existing
-queue and claim recovery while keeping the shipped loop off. The server uses the same queue with
-`merge-check = 1`, so at most one product serves at once.
-
-For prerequisites and incomplete verification add a new PR, then use `fault --pr N --fault report`,
-`malformed`, `diff`, `verify`, `preflight` or `start`. Each saves a `.bak` alongside the affected
-fixture file; `fault --pr N --fault restore` restores it. Missing reports/diffs, malformed checks,
-absent verify configuration and failed preflight must block with no metric or ticket and leave
-the batch unchecked. Failed preflight starts no service or verifier. A product startup crash emits a
-regression finding and metric 0, naming the checks it prevented; sandbox and confinement failures
-remain blocked. `answer --verdict unavailable`,
-`incomplete` or `unknown` exercises unavailable or unaccounted-for results. Restore prerequisites,
-select a passing answer and retry the same event; for scheduler dead input, inspect `arete loop status
-merge-check` and use `arete loop requeue ID` on the scratch server.
-
-Use `answer --verdict limit` for 45 replay actions: the hard cutoff interrupts the call at 40, keeps
-usage/evidence, and blocks without repair. Use a delayed answer and SIGTERM the check process
-to inspect interruption cleanup; a timeout uses the same cleanup path. Unresolved ownership must
-retain and report the worktree, and never advance checked history.
-
-```sh
-"$SB" python docs/merge-check-fixture.py quota
-"$SB" python docs/merge-check-fixture.py check --dry-run
-"$SB" python docs/merge-check-fixture.py check < .arete-sandbox/event.json
-"$SB" python docs/merge-check-fixture.py quota --yesterday
-```
-
-With a new pending PR, quota exits 75 (held), starting nothing and recording no result. Scheduler
-dispatch releases the claimed input and consults the persisted reset before attempting again.
-Dry-run displays the hold without reserving. Moving the scratch quota to yesterday makes one
-new check eligible. For no overlap use `add --file unrelated.txt` on an otherwise fresh history;
-the preview must explicitly say no applicable neighbour. For a continuation use `add --pr N
---continues fixture-fixture-1`: the latest run owns the merge but the earlier run owns its report.
-To reproduce duplicate publication, record the same PR again with a distinct `--id`; discovery keeps
-one canonical URL. Delete nothing from real state to reset a fixture; use a fresh disposable workspace.
-
-## Versioned write fixture
-
-Keyed task-start exercises use the same disposable fixture and evidence format:
-
-```sh
-"$SB" python docs/versioned-api-fixture.py exercise keyed-replay
-"$SB" python docs/versioned-api-fixture.py exercise keyed-concurrency
-"$SB" python docs/versioned-api-fixture.py exercise keyed-clients
-"$SB" python docs/versioned-api-fixture.py exercise keyed-recovery
-"$SB" python docs/versioned-api-fixture.py exercise slow-start
-"$SB" python docs/versioned-api-fixture.py exercise idempotency-prune
-```
-
-These cover canonical request hashing and exact response replay, live duplicate rejection and principal
-separation, real CLI proxy disconnects before headers and during bodies, server subprocess exit 9 after
-claim insertion, delayed child registration, and strict 30-day expiration through serve pruning.
-`http.jsonl` retains raw response bytes as hexadecimal; `canonical.json` represents response BLOBs as
-`bytes_hex`. `cli.json` records command stderr and proxy requests, `crash-*.json` links child exits to
-saved target events, and `prune.json` records the boundary rows and backup ordering. Use
-`inspect --root PATH` on the printed evidence directory. Serve mode includes a fake task launcher for
-direct keyed `POST /api/tasks` calls as well as the run-action controls below.
-
-Run these through the verification sandbox, from a checkout:
-
-```sh
-SB=/Users/justin.barnett/Library/Developer/arete/verification-runtime/harness/sandbox
-"$SB" python docs/versioned-api-fixture.py exercise migration-rollback
-"$SB" python docs/versioned-api-fixture.py exercise writes
-"$SB" python docs/versioned-api-fixture.py exercise stale-stop
-"$SB" python docs/versioned-api-fixture.py exercise concurrent-stop
-"$SB" python docs/versioned-api-fixture.py exercise run-commands
-"$SB" python docs/versioned-api-fixture.py exercise grace
-"$SB" python docs/versioned-api-fixture.py exercise status-races
-"$SB" python docs/versioned-api-fixture.py exercise ask-races
-"$SB" python docs/versioned-api-fixture.py exercise carried-landings
-"$SB" python docs/versioned-api-fixture.py exercise clients
-"$SB" python docs/versioned-api-fixture.py exercise nearby
-"$SB" python docs/versioned-api-fixture.py inspect
-"$SB" python docs/versioned-api-fixture.py serve --port 8765
-```
-
-Each exercise starts an isolated subprocess with scratch config, state, logs, worktrees, HOME and
-TMPDIR, a replay sample repository and a fake admitted tailnet login. Network transports, account
-lookups and GitHub commands are forbidden. The printed evidence directory retains `http.jsonl`,
-`canonical.json`, `database.json`, `result.json`, stdout and stderr. `BEHAVIOR_RESULT` reports success
-only after assertions finish. `migration.json` includes the historical rows, rowids, ledger hashes,
-new table schema and rollback evidence. Pass `--root PATH` to choose a fresh evidence directory;
-use `inspect --root PATH` to inspect one exercise.
-
-Serve prints eligible run IDs and links to legacy Live, run detail and `/ui.html#run/ID`. Stop uses
-a disposable child; Retry, Repair and step admission use saved replay receipts and a fake launcher.
-Successful run writes retain their legacy response bodies and identify the committed event in
-`Arete-Seq`. Every displayed run action sends its selected `base_version`. To exercise a stale
-screen without refreshing, advance its run through the fixture-only endpoint:
-
-```sh
-curl -H 'X-Arete: 1' -X POST 'http://127.0.0.1:8765/api/fixture/stale/RUN_ID'
-```
-
-Press the displayed action before its next poll. It must show the conflict once, refresh, and send
-no second POST. A deliberate action after refresh uses the new displayed version. HTTP evidence
-is retained in the serve directory; stop the fixture with Ctrl-C to clean up its children.
-
-The missing-version grace deadline starts inactive. Migration and startup never activate it.
-The later v1 screen release must explicitly call `arete.store.writes.activate_grace()` once; it
-persists activation plus 30 days, and repeated activation cannot extend it. Before that deadline,
-legacy commands without versions work. At the exact deadline they return 409 `version_conflict`
-with the current persisted object. Explicit versions always compare; internal conditional writes
-remain versionless. The grace exercise uses a fixture clock and reopens the server to check persistence.
+The missing-version grace deadline starts inactive.
+Migration and startup never activate it.
+The later v1 screen release must explicitly call `arete.store.writes.activate_grace()` once; it persists activation plus 30 days, and repeated activation cannot extend it.
+Before that deadline, legacy commands without versions work.
+At the exact deadline they return 409 `version_conflict` with the current persisted object.
+Explicit versions always compare; internal conditional writes remain versionless.
 
 ## Rules
 
