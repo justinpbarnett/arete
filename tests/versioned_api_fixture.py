@@ -774,7 +774,7 @@ def slow_start(f):
     from collections import Counter
     from dataclasses import replace
 
-    from arete import config, control, pipeline, poll, record, repairs, slots, tasks, tracker
+    from arete import config, control, pipeline, poll, record, repairs, run_lines, slots, tasks, tracker
     from arete.store import runs
 
     registrations, spawned = [], []
@@ -815,6 +815,8 @@ def slow_start(f):
         assert initial["status"] == 200 and initial["body"]["state"] == "starting" and not initial["body"]["run"]
         tid = initial["body"]["task"]
         duplicate = f.post("/api/tasks", {"repo": "replay-sample", "ticket": tid}, "slow-other-572")
+        assert duplicate["body"]["state"] == "starting" and len(spawned) == 1
+        duplicate = f.post("/api/tasks", {"repo": "replay-sample", "ticket": tid})
         assert duplicate["body"]["state"] == "starting" and len(spawned) == 1
         with mock.patch.object(pipeline, "skipped_tickets", return_value={tid: {"repo": repo.name, "id": tid}}):
             skipped_after_http = f.post(f"/api/skipped/{tid}/run")
@@ -880,6 +882,61 @@ def slow_start(f):
             f.children.append(child)
             child.wait()
             return child
+
+        def finished(repo_name, target, force=False):
+            child = exited()
+            run = record.start("pipeline", repo=repo_name, issue=target, pid=child.pid,
+                               pr_url="https://example.test/fixture/pull/1", branch="fixture")
+            run_lines.write(run, "task", path="feature", title="finished pending child")
+            run_lines.write(run, "step_start", step="implement", try_no=1)
+            run_lines.write(run, "step_end", step="implement", result="fail", data={})
+            record.settle(run, "failed", end_line="failed")
+            run_lines.write(run, "report", status="failed", review={"verdict": "request_changes", "problems": [
+                {"text": "Fix the fixture", "file": "notes.txt", "category": "issue"}]})
+            (f.paths.RUNS_DIR / run / "plan.md").write_text("Add kumquat to notes.txt")
+            return child
+
+        completed = []
+        for action in ("start", "skipped", "resume", "repair", "steps/implement"):
+            target = f.tasks.task_add(repo.name, "Restart after the pending poller child finishes")
+            with mock.patch.object(poll, "spawn_run", side_effect=finished):
+                assert poll.spawn_unparked(repo.name, target)
+            old = runs.ticket_runs(repo.name, target)[0]
+            assert old["status"] == "failed" and (repo.name, target) in tasks.PENDING
+            with mock.patch.object(control, "launch", side_effect=f.fake_launch) as launch, \
+                    mock.patch.object(pipeline, "spawn_run", side_effect=f.fake_spawn) as spawn, \
+                    mock.patch.object(repairs, "open_heads"), \
+                    mock.patch.object(pipeline, "script_refusal", return_value=""), \
+                    mock.patch.object(pipeline, "skipped_tickets", return_value={target: {"repo": repo.name, "id": target}}), \
+                    mock.patch.object(slots, "slots_free_to_start", return_value=1):
+                if action == "start":
+                    result = f.post("/api/tasks", {"repo": repo.name, "ticket": target}, "completed-pending-572")
+                elif action == "skipped":
+                    result = f.post(f"/api/skipped/{target}/run")
+                else:
+                    path = f"/api/runs/{old['id']}/{action}"
+                    stale = f.post(path, {"base_version": old["version"] - 1})
+                    assert stale["status"] == 409 and stale["body"]["code"] == "version_conflict", stale
+                    launch.assert_not_called()
+                    assert (repo.name, target) in tasks.PENDING
+                    result = f.post(path, {"base_version": old["version"]})
+                assert result["status"] == 200 and spawn.call_count + launch.call_count == 1, result
+                new = runs.ticket_runs(repo.name, target)[0]
+                assert new["id"] != old["id"] and new["status"] == "running"
+                assert runs.run_get(old["id"]) == old
+                if action != "skipped":
+                    assert result["body"]["run"] == new["id"] and result["body"]["state"] == "running", result
+                assert (repo.name, target) not in tasks.PENDING
+                completed.append({"action": action, "old": old["id"], "new": new["id"], "response": result})
+        (f.root / "pending-completed.json").write_text(json.dumps(completed, indent=2))
+        completed_body = {"repo": repo.name, "prompt": "finishes during spawn"}
+        with mock.patch.object(pipeline, "spawn_run", side_effect=finished) as spawn:
+            completed = f.post("/api/tasks", completed_body, "finished-start-572")
+            assert completed["status"] == 200 and completed["body"]["state"] == "failed", completed
+            assert completed["body"]["run"] == runs.ticket_runs(repo.name, completed["body"]["task"])[0]["id"]
+            replayed = f.post("/api/tasks", completed_body, "finished-start-572")
+            assert replayed["raw"] == completed["raw"] and replayed["headers"]["Idempotent-Replayed"] == "true"
+            assert spawn.call_count == 1
 
         target = f.tasks.task_add(repo.name, "exited")
         with mock.patch.object(pipeline, "spawn_run", side_effect=exited):
@@ -979,6 +1036,7 @@ def keyed_recovery(f):
             if runs_before:
                 spawn.assert_not_called()
                 assert recovered["body"]["run"] == runs_before[0]["id"]
+                assert recovered["body"]["state"] == runs_before[0]["status"]
             else:
                 assert spawn.call_count == 1
             assert len(f.runs.ticket_runs(repo, tid)) == 1

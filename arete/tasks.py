@@ -174,15 +174,23 @@ def begin(cfg: config.Config, repo: config.Repo, tid: str, force: bool, poller_p
 
 
 def pending_start(repo_name, tid):
+    run, state = pending_state(repo_name, tid)
+    if state in ("running", "starting"):
+        return answer(tid, repo_name, run, state, "started" if run else "child is starting")
+    return None
+
+
+def pending_state(repo_name: str, tid: str) -> tuple[str, str]:
     identity = repo_name, tid
     if identity not in PENDING:
-        return None
+        return "", "exited"
     proc, before = PENDING[identity]
-    new = next((r for r in run_ids(repo_name, tid) if r not in before), "")
-    if new or proc.poll() is not None:
+    exited = proc.poll() is not None
+    row = next((r for r in run_store.ticket_runs(repo_name, tid) if r["id"] not in before), None)
+    if row or exited:
         del PENDING[identity]
-        return answer(tid, repo_name, new, "running", "started") if new else None
-    return answer(tid, repo_name, "", "starting", "child is starting")
+        return (row["id"], row["status"]) if row else ("", "exited")
+    return "", "starting"
 
 
 def spawn_pending(repo_name: str, tid: str, spawn: Callable[[], subprocess.Popen]) -> subprocess.Popen:
@@ -193,20 +201,13 @@ def spawn_pending(repo_name: str, tid: str, spawn: Callable[[], subprocess.Popen
 
 
 def spawned(repo_name: str, tid: str, spawn: Callable[[], subprocess.Popen]) -> tuple[str, str]:
-    proc = spawn_pending(repo_name, tid, spawn)
-    before = PENDING[repo_name, tid][1]
+    spawn_pending(repo_name, tid, spawn)
     give_up = time.monotonic() + pipeline.RUN_START_SECONDS
-    while time.monotonic() < give_up:
-        exited = proc.poll() is not None
-        if new := next((r for r in run_ids(repo_name, tid) if r not in before), ""):
-            del PENDING[repo_name, tid]
-            return new, "running"
-        if exited:
-            break
+    while True:
+        run, state = pending_state(repo_name, tid)
+        if state != "starting" or time.monotonic() >= give_up:
+            return run, state
         time.sleep(0.1)
-    if found := pending_start(repo_name, tid):
-        return found["run"], found["state"]
-    return "", "exited"
 
 
 def did_not_show(repo: config.Repo, tid: str) -> control.Refused:
