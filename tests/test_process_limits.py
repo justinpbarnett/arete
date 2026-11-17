@@ -38,6 +38,7 @@ from arete import (
     sandbox,
     serve,
     steps,
+    tasks,
     tracker,
     util,
     workspace,
@@ -105,7 +106,7 @@ class Isolated(unittest.TestCase):
         self.patches = contextlib.ExitStack()
         self.addCleanup(self.patches.close)
         for name, value in {"STATE_DIR": self.root / "state", "RUNS_DIR": self.root / "runs",
-                            "DB_FILE": self.root / "state/arete.db", "LOCKS_DIR": self.root / "locks",
+                            "DB_FILE": self.root / "state/arete.db", "LOCKS_DIR": self.root / "state/locks",
                             "CONFIG_DIR": self.root / "config", "CONFIG_FILE": self.root / "config/config.toml",
                             "LOG_DIR": self.root / "logs", "EVENTS_FILE": self.root / "state/events.jsonl",
                             "WORKTREES_DIR": self.root / "worktrees"}.items():
@@ -789,7 +790,7 @@ class QueueTests(Isolated):
 
     def poll_with(self, cfg, spawn):
         with patch.object(config, "load", return_value=cfg), patch.object(poll, "runnable", return_value=True), \
-                patch.object(poll, "spawn_run", side_effect=spawn), \
+                patch.object(tasks, "spawn_pending", side_effect=lambda repo, tid, launch: spawn(repo, tid)), \
                 patch.object(poll, "settle_abandoned_runs"), patch.object(outcomes, "sync_outcomes"), \
                 patch.object(outcomes, "sync_moves"), patch.object(outcomes, "sync_landings"), \
                 patch.object(poll, "cleanup_worktrees"), patch.object(poll, "mark_loop"), \

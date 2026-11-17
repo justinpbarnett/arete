@@ -8,6 +8,7 @@ import stat
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from pathlib import Path
 
 from . import paths
 
@@ -31,20 +32,44 @@ def private_directory(fd: int) -> None:
         raise PermissionError("unsafe task launch state directory")
 
 
+def state_path() -> Path:
+    p = paths.STATE_DIR.absolute()
+    if not paths.ON_MAC or p.parts[1:2] not in (("var",), ("tmp",), ("etc",)):
+        return p
+    alias = p.parts[1]
+    with paths.directory_fd(Path("/")) as root:
+        st = os.fstat(root)
+        if st.st_uid != 0 or st.st_mode & 0o022:
+            raise PermissionError("unsafe system root for task launch state")
+        link = os.stat(alias, dir_fd=root, follow_symlinks=False)
+        if not stat.S_ISLNK(link.st_mode):
+            return p
+        if (link.st_uid != 0
+                or os.readlink(alias, dir_fd=root) not in (f"private/{alias}", f"/private/{alias}")):
+            raise PermissionError("unsafe system alias for task launch state")
+        with paths.directory_fd(Path("private"), root) as private:
+            st = os.fstat(private)
+            if st.st_uid != 0 or st.st_mode & 0o022:
+                raise PermissionError("unsafe private system root for task launch state")
+    # macOS supplies these root aliases; every remaining component stays nofollow.
+    return Path("/private", alias, *p.parts[2:])
+
+
 @contextmanager
-def opened(repo: str, tid: str):
+def opened(repo: str, tid: str, *, create: bool = True):
     # Never unlink these files: replacing an inode would split the launch lock.
-    with paths.directory_fd(paths.STATE_DIR, create=True) as state:
+    with paths.directory_fd(state_path(), create=create) as state:
         private_directory(state)
-        with paths.directory_fd(paths.LOCKS_DIR.relative_to(paths.STATE_DIR), state, create=True) as parent:
+        with paths.directory_fd(paths.LOCKS_DIR.relative_to(paths.STATE_DIR), state, create=create) as parent:
             private_directory(parent)
-            with opened_file(parent, filename(repo, tid)) as fd:
+            with opened_file(parent, filename(repo, tid), create=create) as fd:
                 yield fd
 
 
 @contextmanager
-def opened_file(parent: int, name: str):
-    fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=parent)
+def opened_file(parent: int, name: str, *, create: bool):
+    flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | (os.O_CREAT if create else 0)
+    fd = os.open(name, flags, 0o600, dir_fd=parent)
     try:
         if fd < 3:
             duplicate = fcntl.fcntl(fd, fcntl.F_DUPFD_CLOEXEC, 3)
@@ -68,8 +93,11 @@ def take(fd: int) -> bool:
 
 
 def held(repo: str, tid: str) -> bool:
-    with opened(repo, tid) as fd:
-        return not take(fd)
+    try:
+        with opened(repo, tid, create=False) as fd:
+            return not take(fd)
+    except FileNotFoundError:
+        return False
 
 
 @dataclass
@@ -125,7 +153,7 @@ def registered(repo: str, tid: str) -> None:
         st = os.fstat(fd)
         if not plain(st) or (st.st_dev, st.st_ino) != (device, inode):
             raise ValueError("descriptor was replaced")
-        with opened(repo, tid) as probe:
+        with opened(repo, tid, create=False) as probe:
             named = os.fstat(probe)
             if ((named.st_dev, named.st_ino) != (device, inode)
                     or os.pread(fd, 65, 0) != nonce.encode() or len(nonce) != 64):

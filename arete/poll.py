@@ -143,7 +143,8 @@ def tracker_reply(repo: config.Repo, tk: tracker.Tracker, tid: str, dry_run: boo
     return ""
 
 
-def spawn_unparked(repo_name: str, tid: str | int) -> bool:
+def spawn_unparked(repo_name: str, tid: str | int) -> bool | None:
+    """Return True for a spawn, None for existing work, False for an oncall refusal."""
     from . import tasks
 
     with util.lock("oncall") as got:
@@ -151,7 +152,7 @@ def spawn_unparked(repo_name: str, tid: str | int) -> bool:
             return False
         with tasks.PENDING_LOCK, util.lock(tasks.START_LOCK, wait=True):
             if tasks.pending_start(repo_name, str(tid)) or run_store.issue_running(repo_name, tid):
-                return False
+                return None
             tasks.spawn_pending(repo_name, str(tid), lambda: spawn_run(repo_name, tid))
             return True
 
@@ -201,8 +202,12 @@ def repo_queues(cfg: config.Config, pipeline_repos: list[config.Repo], routes: d
 
 def start_pick(cfg: config.Config, queue: RepoQueue, pick: tuple[str, str], skips: pipeline.SkipLog,
                dry_run: bool, going: Counter, slots: int) -> str:
+    from . import tasks
+
     repo, layer = queue.repo, queue.layer
     tid, why = pick
+    if tasks.pending_start(repo.name, str(tid)) or run_store.issue_running(repo.name, tid):
+        return "skipped"
     source = tracker.for_ticket(cfg, repo, tid)
     name = tracker.ticket_name(repo.name, source.ref(tid))
     reply = tracker_reply(repo, source, str(tid), dry_run)
@@ -225,7 +230,10 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: tuple[str, str], skip
     print(f"{util.iso()} {name}: {why}" + (" (dry run, not started)" if dry_run else ""))
     if not dry_run:
         source_store.drop_passed_over(repo.name, keep=str(tid))
-        if not spawn_unparked(repo.name, tid):
+        spawned = spawn_unparked(repo.name, tid)
+        if spawned is None:
+            return "skipped"
+        if not spawned:
             return "refused"
     return "started"
 

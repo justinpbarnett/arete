@@ -1185,10 +1185,36 @@ def keyed_recovery(f):
         assert len(f.rows("SELECT * FROM tasks")) == before
         (f.root / f"crash-{i}.json").write_text(json.dumps({"exit": 9, "target": tid, "first_seq": claim["first_seq"],
                                                          "actor": claim["actor"], "via": claim["via"], "runs_before": len(runs_before)}))
-    before = {table: len(f.rows(f"SELECT * FROM {table}")) for table in ("tasks", "events_log", "idempotency")}
-    with mock.patch.object(idempotency, "claim", side_effect=RuntimeError("claim transaction failure")):
-        assert f.post("/api/tasks", {"repo": "replay-sample", "prompt": "rollback"}, "rollback-572")["status"] == 500
-    assert before == {table: len(f.rows(f"SELECT * FROM {table}")) for table in before}
+    before = {table: f.rows(f"SELECT * FROM {table}") for table in ("tasks", "events_log", "idempotency")}
+    body, key = {"repo": "replay-sample", "prompt": "rollback"}, "rollback-572"
+    with mock.patch.object(idempotency, "claim", side_effect=RuntimeError("claim transaction failure")) as failed_claim:
+        failed = f.post("/api/tasks", body, key)
+        assert failed["status"] == 500
+        assert failed["body"] == {"error": "RuntimeError: claim transaction failure."}
+        failed_claim.assert_called_once()
+    for table in ("tasks", "events_log"):
+        assert f.rows(f"SELECT * FROM {table}") == before[table]
+    claim = idempotency.lookup(f.person, key)
+    assert claim and claim["status"] == 500 and claim["response"].hex() == failed["raw"]
+    assert claim["first_seq"] is None and claim["last_seq"] is None
+    assert claim["route"] == claim["via"] == "POST /api/tasks"
+    assert "Arete-Seq" not in failed["headers"]
+    try:
+        idempotency.target(claim)
+    except RuntimeError as error:
+        assert str(error) == "idempotency target event is missing"
+    else:
+        raise AssertionError("rolled back claim has a fabricated target")
+    after = {table: f.rows(f"SELECT * FROM {table}") for table in before}
+    assert len(after["idempotency"]) == len(before["idempotency"]) + 1
+    existing = [row for row in after["idempotency"] if (row["actor"], row["key"]) != (f.person, key)]
+    assert existing == before["idempotency"]
+    with mock.patch.object(tasks, "start", side_effect=AssertionError("completed error must replay")) as start:
+        replayed = f.post("/api/tasks", body, key)
+        start.assert_not_called()
+    assert replayed["status"] == 500 and replayed["raw"] == failed["raw"]
+    assert replayed["headers"]["Idempotent-Replayed"] == "true" and "Arete-Seq" not in replayed["headers"]
+    assert after == {table: f.rows(f"SELECT * FROM {table}") for table in after}
     assert tracker.is_task_id(tid) is False
 
 
