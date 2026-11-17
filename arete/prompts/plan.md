@@ -27,8 +27,8 @@ Then return a plan a separate builder agent will follow without you:
 Put in `verify` how a person will see the change work, as numbered steps: the commands to run, the requests to
 send, or the pages to open and what to do there, and what each step must show. Cover the edge and error cases the
 issue names, and one thing nearby that must still work. After the build, a verifier follows these steps on the
-running product. Leave out the repo's own checks ($checks): arete runs those before the verifier starts. Plan new
-tests only where the repo's own docs ask for them.
+running product.
+Leave out the repo's own checks ($checks): arete runs those before the verifier starts.
 
 For every planned edit, check that the builder’s command allowlist can perform it.
 The builder edits files and may run only these shell commands: $commands.

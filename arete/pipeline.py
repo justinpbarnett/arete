@@ -2304,7 +2304,7 @@ def resolve_conflicts(run: AgentRun, c: workspace.Checkout, conflicts: list[str]
                       commands=prompt_loader.code_list(layer.builder_bash), attempt=n, tries=tries, feedback=feedback,
                       owner=run.owner_note)
         try:
-            res = run.agent(round_name("resolve", n), text, c.wt, role="build",
+            res = run.agent(round_name("resolve", n), prompt_loader.task_prompt(text), c.wt, role="build",
                             allowed_tools=prompt_loader.bash_rules(layer.builder_bash), disallowed_tools=routing.NO_GIT_WRITES,
                             json_schema=RESOLVE_SCHEMA, resume=NO_SESSION, extra_env=dict(RESOLVER_SETS))
         finally:

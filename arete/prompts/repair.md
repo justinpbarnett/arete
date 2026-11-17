@@ -29,7 +29,6 @@ $expertise
   before you edit.
 - Fix every finding listed: each is a blocker from the last review. Where a finding and the plan disagree, the finding wins.
 - Keep the change to what the findings ask. No scope growth, no drive by refactors, no formatting churn.
-- Add or change tests only where the repo's own docs ask for them.
 - Arete runs the full check gate after you finish: $checks.
   Do not duplicate the full suite here.
   Use focused reproductions when helpful and report what you ran; never work around a sandbox refusal.

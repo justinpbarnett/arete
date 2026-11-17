@@ -25,7 +25,6 @@ $expertise
   before you edit.
 - Change the code so it does what the feedback asks. Where the feedback and the issue disagree, the feedback wins.
 - A comment that asks a question, or that needs no code change, gets an answer in your reply, not an edit.
-- Add or change tests only where the repo's own docs ask for them.
 - Arete runs the full check gate after you finish: $checks.
   Do not duplicate the full suite here.
   Use focused reproductions when helpful and report what you ran; never work around a sandbox refusal.

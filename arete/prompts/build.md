@@ -20,7 +20,7 @@ $expertise
 
 ## Rules
 
-- Make the change the plan describes. Add or change tests only where the repo's own docs ask for them.
+- Make the change the plan describes.
 - Write self-documenting code: no docstrings, and a comment only for what the code cannot show, such as a line that looks wrong and is right. Follow the repo's own docs where they ask for more.
 - Arete owns the full check gate and runs it after you finish: $checks.
   Do not duplicate the full suite in this builder step.
