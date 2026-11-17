@@ -85,6 +85,16 @@ class Shell:
     hidden: tuple[Path, ...]
     judge: bool
     deadline: float
+    read_roots: tuple[Path, ...] = ()
+
+    def __post_init__(self):
+        writable = (self.cwd, *self.add_dirs, *map(Path, sandbox.WRITABLE_ALWAYS), sandbox.AGENT_DIR,
+                    sandbox.LOGIN_DIR, sandbox.KEY_DIR, sandbox.SESSIONS_DIR)
+        for root in self.read_roots:
+            if changed_through := scratch.exposure(root, writable):
+                raise ValueError(f"read-only command runtime {root} can be changed through {changed_through}")
+        object.__setattr__(self, "read_roots", tuple(dict.fromkeys(path for root in self.read_roots
+                                                                 for path in (root.absolute(), root.resolve()))))
 
     def aliases(self, roots: tuple[Path, ...], stopped: threading.Event, until: float) -> tuple[Path, ...]:
         linked = []
@@ -120,7 +130,9 @@ class Shell:
 
     def profile(self, stopped: threading.Event, until: float) -> list[str]:
         closed = tuple(path for path in self.floor.closed if path not in (paths.STATE_DIR, paths.WORKTREES_DIR))
-        runtimes = runtime_roots()
+        if any(root.resolve() not in self.read_roots for root in self.read_roots):
+            raise ValueError("read-only command runtime changed after admission")
+        runtimes = tuple(dict.fromkeys((*runtime_roots(), *self.read_roots)))
         profile = sandbox.write_confinement(
             self.cwd, list(self.add_dirs), agent_roots=False, secrets_denied=True, unix_confined=True,
             state=(paths.STATE_DIR, self.floor.open), peers=paths.WORKTREES_DIR, private_temporary=True,

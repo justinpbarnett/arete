@@ -812,6 +812,7 @@ def _run(
     floor: guard.Floor | None = None,
     delegation_only: bool = False,
     judge: bool = False,
+    read_roots: tuple[Path, ...] = (),
 ) -> Result:
     auth = auth if auth is not None else accounts.Auth("api_key")
     if mcp_servers(mcp_config):
@@ -827,7 +828,7 @@ def _run(
 
         floor = guard.floor(os.environ.get("ARETE_RUN_ID", ""), cwd, add_dirs)
     names = [name for name in tool_names(tools, allowed_tools, disallowed_tools) if name in GUARDED_TOOLS]
-    if delegation_only and (names or ask_owner or resume.id or json_schema is not None or system or add_dirs or persist):
+    if delegation_only and (names or ask_owner or resume.id or json_schema is not None or system or add_dirs or read_roots or persist):
         raise ValueError("controller requires a fresh tool-free, non-restating invocation")
     if persist or resume.id:
         sandbox.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
@@ -858,7 +859,7 @@ def _run(
     shell = (pi_shell.Shell(cwd, tuple(add_dirs), floor, tuple(allowed_tools or ()), tuple(disallowed_tools or ()),
                             pi_shell.command_env(passing, extra_env, selected.hidden),
                             (selected.owner, folder, *selected.sensitive_files, *map(Path, protection["files"])),
-                            judge, time.monotonic() + timeout)
+                            judge, time.monotonic() + timeout, tuple(read_roots))
              if "bash" in names else None)
     try:
         with refresh_channel(selected, env) as refresh, pi_shell.channel(shell, env) as terminal:
