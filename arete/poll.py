@@ -202,10 +202,13 @@ def repo_queues(cfg: config.Config, pipeline_repos: list[config.Repo], routes: d
 
 def start_pick(cfg: config.Config, queue: RepoQueue, pick: tuple[str, str], skips: pipeline.SkipLog,
                dry_run: bool, going: Counter, slots: int) -> str:
+    from . import tasks
+
     repo, layer = queue.repo, queue.layer
     tid, why = pick
-    if run_store.issue_running(repo.name, tid):
-        return "skipped"
+    with tasks.PENDING_LOCK, util.lock(tasks.START_LOCK, wait=True):
+        if tasks.pending_start(repo.name, str(tid)) or run_store.issue_running(repo.name, tid):
+            return "skipped"
     source = tracker.for_ticket(cfg, repo, tid)
     name = tracker.ticket_name(repo.name, source.ref(tid))
     reply = tracker_reply(repo, source, str(tid), dry_run)
