@@ -682,10 +682,11 @@ def clients(f):
             spawn.assert_not_called()
         assert [r[0] for r in requests] == ["GET", "POST"]
         assert requests[-1][2]["base_version"] == runs.run_get(target)["version"] - 1
-    attempts = []
+    attempts, restart_deadlines = [], []
 
-    def restarted(method, path, body, *args):
+    def restarted(method, path, body, *args, deadline=None):
         attempts.append((method, path, json.dumps(body, sort_keys=True)))
+        restart_deadlines.append(deadline)
         if len(attempts) == 1:
             raise client.Restarting({"error": "restart"}, 0)
         return SimpleNamespace(read=lambda: b"{}")
@@ -693,6 +694,7 @@ def clients(f):
     with mock.patch.object(client, "request_once", side_effect=restarted):
         client.call("POST", stop_path(run), {"base_version": selected})
     assert len(attempts) == 2 and attempts[0] == attempts[1]
+    assert restart_deadlines[0] is None and isinstance(restart_deadlines[1], float)
     ui = NewUIShellTests()
     ui.test_versioned_run_actions()
 
@@ -861,7 +863,7 @@ def slow_start(f):
         with mock.patch.object(poll, "spawn_run", side_effect=delayed) as poll_spawn, \
                 mock.patch.object(poll, "step_without_route", return_value=""):
             result = poll.start_pick(cfg, queue, pick, skips, False, Counter(), 1)
-            assert result == "refused" and len(spawned) == 1
+            assert result == "skipped" and len(spawned) == 1
             poll_spawn.assert_not_called()
             register_first.set()
             registrations[-1].join(5)
@@ -1197,7 +1199,7 @@ def keyed_recovery(f):
     claim = idempotency.lookup(f.person, key)
     assert claim and claim["status"] == 500 and claim["response"].hex() == failed["raw"]
     assert claim["first_seq"] is None and claim["last_seq"] is None
-    assert claim["route"] == claim["via"] == "POST /api/tasks"
+    assert claim["route"] == "/api/tasks" and claim["via"] == "POST /api/tasks"
     assert "Arete-Seq" not in failed["headers"]
     try:
         idempotency.target(claim)
