@@ -40,6 +40,11 @@ A bounded native probe on Pi's `openai/gpt-6.1-sol` subscription route confirmed
 Repeat this native boundary check after changing the installed Pi adapter or controller profile.
 Use the current Pi `openai` provider for that subscription, not its deprecated `openai-codex` provider.
 
+The isolated Python delegation subprocess is a trusted Arete SDK broker, not the model producer.
+Like the main engine, it applies the selected runner's model confinement rather than inheriting a generic subprocess sandbox; nested macOS profiles prevent native startup.
+Its fixed engine entrypoint, isolated imports, immutable policy checks, parent-admitted launches and supervised process group remain separate from model tools and execution.
+The model retains the runner's filesystem confinement, JEV/tool checks and closed-context restrictions.
+
 ## Follow and control
 
 Use the ordinary task-start, status, wait, lines, stop, answer, resume, records and cost surfaces.
