@@ -48,7 +48,7 @@ function info(path) {
     try {
         return statSync(path, { bigint: true });
     } catch (error) {
-        if (error.code !== "ENOENT" && error.code !== "ENOTDIR") throw error;
+        if (!["ENOENT", "ENOTDIR", "EACCES", "EPERM"].includes(error.code)) throw error;
         return undefined;
     }
 }
@@ -99,7 +99,24 @@ export default function (pi) {
         metadata.roots.push(agent);
         metadata.files.push(auth, auth + ".lock", canonical(auth), canonical(auth) + ".lock");
     }
-    const inodes = new Set();
+    if (metadata.shell) {
+        pi.on("before_agent_start", () => {
+            const shell = pi.getAllTools().find(tool => tool.name === "bash");
+            if (!shell?.sourceInfo?.path || resolve(shell.sourceInfo.path) !== resolve(metadata.shell_file)) {
+                writeSync(2, "Arete refused an unguarded shell implementation.\n");
+                process.exit(78);
+            }
+        });
+    }
+    const glob = pattern => new RegExp("^" + pattern.split("*")
+        .map(part => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$");
+    const secretNames = (metadata.secret_names ?? []).map(glob);
+    const safeNames = (metadata.safe_names ?? []).map(glob);
+    const secretDirs = new Set(metadata.secret_dirs ?? []);
+    const secret = path => path.split(sep).slice(0, -1).some(part => secretDirs.has(part))
+        || (secretNames.some(pattern => pattern.test(basename(path)))
+            && !safeNames.some(pattern => pattern.test(basename(path))));
+    const inodes = new Set(metadata.inodes ?? []);
     const writeInodes = new Set();
     const remember = (path, identities = inodes) => {
         const stat = info(path);
@@ -150,7 +167,7 @@ export default function (pi) {
         });
     }
     pi.on("tool_call", (event, ctx) => {
-        if (event.toolName === "ask_owner") return undefined;
+        if (event.toolName === "ask_owner" || (event.toolName === "bash" && metadata.shell)) return undefined;
         try {
             if (!tools.has(event.toolName)) return { block: true, reason };
             const writing = event.toolName === "edit" || event.toolName === "write";
@@ -168,6 +185,7 @@ export default function (pi) {
             if (writing) rememberWrites();
             const blocked = (path, stat = info(path)) => {
                 const real = canonical(path);
+                if (secret(path) || secret(real) || (stat?.isFile() && stat.nlink > 1)) return true;
                 if (writing && metadata.write_roots.some(root => within(resolve(root), path)
                     || within(canonical(root), real))) return true;
                 if (protectedFiles.some(file => within(file, path) || within(file, real))) return true;

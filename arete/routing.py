@@ -22,7 +22,6 @@ NO_GIT_WRITES = [
     "Bash(git commit*)", "Bash(git push*)", "Bash(git reset*)", "Bash(git checkout*)",
     "Bash(git switch*)", "Bash(git rebase*)", "Bash(git merge*)", "Bash(gh *)",
 ]
-PI_HOLDS_NO_BASH_RULES = "pi cannot hold the rules that stop git writes"
 SANDBOX_RUNS_PI = ("an exe device runs agents on pi, not claude; pick a provider/model such as exe-llm/gpt-5.4-mini "
                    "or openrouter/<model id>")
 CLAUDE_PI_MODELS = {"fable": "claude-fable-5-2", "opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5-5",
@@ -228,11 +227,10 @@ def incompatible(way: Way, settings, device: devices.Device) -> str:
         return f"mcp {', '.join(settings.mcp)} cannot load on {way.runner}, which runs with --no-mcp"
     if wanted and not traits.instruction_scopes:
         return f"instructions {', '.join(wanted)} cannot load on {way.runner}"
-    if not traits.takes_mcp and WRITING_TOOLS & set(settings.tools) and not sandbox.can_confine(False):
+    if (not traits.takes_mcp and (WRITING_TOOLS & set(settings.tools) or "Bash" in settings.tools
+                                  or settings.requires.directory_cleanup) and not sandbox.can_confine(device.remote)):
         return sandbox.NO_CONFINEMENT_REASON
     fallback = not (way.link.requested and way.runner == way.link.runner)
-    if not traits.takes_mcp and fallback and "Bash" in settings.tools and not device.exe_sandbox:
-        return PI_HOLDS_NO_BASH_RULES
     if (not settings.requires.delegation_only and traits.always_granted_tools and fallback
             and (missing := [t for t in traits.always_granted_tools if t not in settings.tools])):
         return f"tools leave out {', '.join(missing)}, which {way.runner} always grants"
@@ -339,9 +337,7 @@ def withheld(model: str, run_with: str, tools: list[str], device: devices.Device
         return {}
     reasons: dict[str, list[str]] = {}
     for tool in tools:
-        if tool == "Bash":
-            reasons.setdefault(PI_HOLDS_NO_BASH_RULES, []).append(tool)
-        elif tool in WRITING_TOOLS and not sandbox.can_confine(device.remote):
+        if tool in {*WRITING_TOOLS, "Bash"} and not sandbox.can_confine(device.remote):
             reasons.setdefault(sandbox.NO_CONFINEMENT_REASON, []).append(tool)
     return reasons
 
