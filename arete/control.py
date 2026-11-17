@@ -14,6 +14,7 @@ from . import (
     delivery,
     devices,
     events,
+    launch_lease,
     loops,
     paths,
     principals,
@@ -88,11 +89,13 @@ def detach(args: list[str], log_name: str = DETACHED_LOG, keep: tuple[int, ...] 
 
 def launch(command: list[str], log_name: str = DETACHED_LOG, keep: tuple[int, ...] = ()) -> subprocess.Popen:
     paths.ensure_dirs()
+    keep, env = launch_lease.child_environment(keep)
     with open(paths.LOG_DIR / log_name, "a") as log:
         proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log,
                                 stderr=subprocess.STDOUT, start_new_session=True, pass_fds=keep,
-                                env={**os.environ, "ARETE_ACTOR": principals.current(),
+                                env={**env, "ARETE_ACTOR": principals.current(),
                                      "ARETE_VIA": events.provenance() or ""})
+    launch_lease.passed()
     threading.Thread(target=proc.wait, name=f"reap-{proc.pid}", daemon=True).start()
     return proc
 

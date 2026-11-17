@@ -1949,8 +1949,8 @@ class Repairs(Scratch):
         self.failing()
         task = self.seam("start")[0][2]
         self.set_run("failed")
-        code = ("import json\nfrom arete import oncall, poll, util\nspawned = []\n"
-                "poll.spawn_run = lambda repo, tid: spawned.append(tid)\n"
+        code = ("import json\nfrom arete import oncall, poll, tasks, util\nspawned = []\n"
+                "tasks.spawn_pending = lambda repo, tid, spawn: spawned.append(tid)\n"
                 f"task = {task!r}\nout = []\n"
                 "with util.lock('oncall') as held:\n    out.append(poll.spawn_unparked('demo', task))\n"
                 "out.append(poll.spawn_unparked('demo', task))\noncall.switch(False)\n"

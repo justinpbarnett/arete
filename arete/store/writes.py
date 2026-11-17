@@ -6,7 +6,7 @@ from datetime import timedelta
 from .. import events, refusals, util
 from .db import in_write, reader, tx
 
-TABLES = {"idempotency": "30 days"}
+TABLES = {}
 FIELDS = {
     "runs": frozenset(("kind", "repo", "issue", "loop", "loop_kind", "pid", "started", "finished", "status",
                        "summary", "cost_usd", "tokens_in", "tokens_out", "pr_url", "branch", "only_step",
@@ -141,11 +141,6 @@ def activate_grace():
         c.execute("UPDATE schema_meta SET value = ? WHERE key = 'versioned_api_grace_deadline' AND value = ''",
                   (deadline,))
         return c.execute("SELECT value FROM schema_meta WHERE key = 'versioned_api_grace_deadline'").fetchone()[0]
-
-
-def prune():
-    with tx() as c:
-        c.execute("DELETE FROM idempotency WHERE at < ?", (util.iso(util.now() - timedelta(days=30)),))
 
 
 def receipt(subject, ver=None, kind=None):
