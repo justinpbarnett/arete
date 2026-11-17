@@ -1,22 +1,21 @@
-import shlex
-import sys
 import tempfile
-from pathlib import Path
 import unittest
+from pathlib import Path
 from unittest import mock
 
-from arete import paths, sandbox
+from arete import dbstats, paths, sandbox
 from arete.store import db as foundation
-from tests.harness import SOURCE as SOURCE
-
-PYTHON = shlex.quote(sys.executable)
 
 
 def isolate_live_state():
     folder = tempfile.TemporaryDirectory(prefix="arete-no-live-")
     unittest.addModuleCleanup(folder.cleanup)
     root = Path(folder.name).resolve()
-    for patch in (mock.patch.object(sandbox, "AUTHORITY", root / "authority" / "verification-authority"),
+    for patch in (mock.patch.object(dbstats.Timing, "finished"),
+                  mock.patch.object(sandbox, "AUTHORITY", root / "authority" / "verification-authority"),
+                  mock.patch.object(paths, "CONFIG_DIR", root / "config"),
+                  mock.patch.object(paths, "CONFIG_FILE", root / "config/config.toml"),
+                  mock.patch.object(paths, "PI_KEYS_FILE", root / "config/pi.env"),
                   mock.patch.object(paths, "STATE_DIR", root / "state"),
                   mock.patch.object(paths, "LOCKS_DIR", root / "state" / "locks"),
                   mock.patch.object(paths, "WORKTREES_DIR", root / "worktrees"),
