@@ -40,9 +40,7 @@ TRAITS = {
         efforts=("off", "minimal", "low", "medium", "high", "xhigh", "max"), payment_modes=("subscription", "api_key", "local"), takes_mcp=False,
         instruction_scopes=(), default_instructions=(), always_granted_tools=tuple(READ_TOOLS),
         delegation_only=True,
-        cannot_gate="pi restates a structured answer in a second launch that cannot be gated against the calls "
-                    "and time limits",
-        no_server_access="pi has no restricted Bash, so it cannot run the arete session commands"),
+        no_server_access="pi keeps the arete server and its state outside its shell's reach"),
     "codex": RunnerTraits(
         efforts=("low", "medium", "high", "xhigh", "max", "ultra"), payment_modes=("subscription", "api_key"),
         instruction_scopes=("repo",),

@@ -93,6 +93,27 @@ Controller turns and actual controller launches have finite ceilings; malformed 
 Writing again consumes a semantic repair allowance regardless of the worker's name.
 Existing run/verification deadlines, data/payment policy and device/run admission remain authoritative.
 Adaptive structured review/verification excludes transports with hidden ungateable schema-restatement launches.
+Pi returns its structured answer from the admitted invocation or fails that call without launching a restatement.
+Its structured calls disable automatic retry, compaction and cache warming; an engine-authorized retry still needs normal admission.
+
+### Pi CLI verification
+
+Local Pi verification can execute the step's Bash grants on macOS through a private descriptor to a trusted engine-side shell broker.
+The broker is privileged engine code, not a model-controlled process or an unrestricted host shell.
+It validates the command, applies the existing directory/secret/Keychain/JEV guard and git-mutation refusals, then launches the command inside a separate filesystem profile.
+The model cannot choose the profile, working directory, environment or additional writable roots.
+Patterned grants accept one simple command, not shell chaining, substitution or redirection; a denied form must be rewritten within the existing grants, not retried unchanged.
+Commands receive no provider credentials or loader hooks and cannot read engine authority, configuration, peer worktrees or login stores.
+Recursive secret exclusions remain active while ordinary directory creation and cleanup work.
+Reads are limited to the granted workspace/directories, the installed Arete/Python/Node/uv runtimes and operating-system-managed tool/library/configuration roots, not arbitrary host directories.
+Hard-linked regular files in granted workspaces and mutable runtime read roots are excluded and commands cannot create hard links; hard-link-dependent fixtures are unsupported on this route.
+Additional project directories require existing engine-admitted directory grants.
+Commands use the workspace for temporary storage and cannot access shared system temporary files outside their granted roots.
+Commands cannot inspect host processes or send signals outside themselves and their children.
+Each command is bounded by 120 seconds, the admitted invocation's deadline and 32 KiB of output; interruption closes the channel and kills the command group.
+The Pi process retains its existing confinement and file-tool guard, including protected-file identities supplied before entering confinement.
+The broker copies verification producer context so command groups retain the existing scratch lifetime accounting.
+This grants neither trusted fixture ownership nor browser/MCP tools, production server access, publication authority or a broader default rollout.
 
 Publication requires current full checks, independent review, applicable in-use verification and a stable, quiescent delivery tree.
 Evidence binds tree, policy, original acceptance inputs, producer and observation time.

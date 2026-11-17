@@ -206,7 +206,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
                   ask_owner=False, persist=False)
         resume = NO_SESSION
         ask_jev = False
-        if kw.get("json_schema"):
+        if kw.get("json_schema") is not None:
             raise ValueError("controller JSON validation belongs to the engine, without hidden restatement calls")
     if max_steps is not None:
         kw["action_limit"] = ActionLimit(max_steps)
@@ -717,6 +717,7 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
         if not target.remote:
             kw["providers"] = cfg.environment.providers
             kw["floor"] = floor
+            kw["judge"] = cfg.jev.guard
     if uploads.granted(kw.get("allowed_tools")) and (not TRAITS[which].uploads_supported or target.remote):
         kw["allowed_tools"] = uploads.without(kw["allowed_tools"])
         browser.with_note(kw, uploads.WITHHELD)
