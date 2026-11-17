@@ -2442,7 +2442,13 @@ A chat's sessions have four routes: `GET /api/chats/N/sessions` lists them with 
 - `{"repo": "web", "prompt": "...", "title": "...", "kind": "feat"}` adds a local task and starts it. `title` defaults to the prompt's first line that is not a `Waits on` line, cut to 80 characters, and `kind` is `feat` or `fix`, `feat` by default.
 - `{"repo": "web", "ticket": "123"}` starts a tracker issue, a Jira key or a `t-` task that exists, past its waits, as `arete run --force` does. With `"force": false`, its `Waits on` line holds it and the run ends `skipped`, as `arete run` without `--force` does.
 
-It answers `{"task", "repo", "run", "state", "why"}`. `state` is `running` with the run's id, or `queued` with an empty `run` when no slot is free (`max_parallel` or `max_parallel_per_repo`) or the prompt's `Waits on` line still holds; `why` says which. In a repo the poller does not pick, `why` names the task and the `ticket` body that starts it. A queued task in a `pipeline = true` repo starts at a later poll. A ticket whose run is going on answers that run's id with `already running` and never starts twice.
+It answers `{"task", "repo", "run", "state", "why"}`.
+`state` is `running` with the run's id, `starting` with an empty `run` while a living child registers, or `queued` with an empty `run` when no slot is free (`max_parallel` or `max_parallel_per_repo`) or the prompt's `Waits on` line still holds; `why` says which.
+If a child finishes during registration or recovery finds an ended run, the answer can carry that run's terminal state, such as `failed`, with its run id.
+In a repo the poller does not pick, `why` names the task and the `ticket` body that starts it.
+A queued task in a `pipeline = true` repo starts at a later poll.
+A ticket whose run is going on answers that run's id with `already running` and never starts twice.
+Once a keyed response is committed, identical resends replay that answer unchanged; use a fresh key with the task's ticket to request a new start.
 
 `GET /api/tasks/ID` returns the task: a local task's row with its `comments`, or a tracker item's `id`, `ref`, `title`, `url` and `state`, with `?repo=NAME` when no run names it yet. Both add `runs` (`id`, `status`, `started`, `finished`, `prs`, `cost_usd`, and `report`, the run's [`report` line](#run-lines), or `{}` while it has none), newest first, and `children`, the local tasks whose parent it is.
 

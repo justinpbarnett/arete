@@ -276,7 +276,7 @@ class Handler(BaseHTTPRequestHandler):
         sha = idempotency.fingerprint("POST", "/api/tasks", {}, body)
         with idempotency.owning(principals.current(), self.headers["Idempotency-Key"], sha) as context:
             row = claims.lookup(*context[:2])
-            if row and row["request_sha"] != sha:
+            if row and (row["route"], row["request_sha"]) != context[2:]:
                 raise idempotency.Reused("This key was used with different content")
             if row and row["status"]:
                 self.write_receipt = claims.receipt(row["last_seq"])
@@ -304,9 +304,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.write_receipt = claims.receipt(saved["first_seq"])
             payload = json.dumps(result, default=str).encode()
             seq = int(self.write_receipt["event_seq"].rsplit(".", 1)[1]) if self.write_receipt else None
-            claims.complete(context, status, payload, seq)
+            saved = claims.complete(context, status, payload, seq)
+            if (saved["route"], saved["request_sha"]) != context[2:]:
+                raise idempotency.Reused("This key was used with different content")
+            self.write_receipt = claims.receipt(saved["last_seq"])
             self.keyed_delivery = True
-            return self.send(status, payload, "application/json", "no-store")
+            return self.send(saved["status"], bytes(saved["response"]), "application/json", "no-store")
 
     def admit(self, method: str, path: str) -> None:
         node: tailnet.Node = self.server.node

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import subprocess
 import threading
 import time
@@ -17,6 +18,7 @@ from . import (
     flows,
     gh,
     jira,
+    launch_lease,
     owner_asks,
     paths,
     pipeline,
@@ -50,6 +52,8 @@ MAX_ANSWER_CHARS = 20000
 TICKET_CLOSED = "its ticket closed while it waited for an answer"
 PENDING = {}
 PENDING_LOCK = threading.RLock()
+PENDING_SWEEP_SECONDS = 1
+PENDING_REAPER = None
 
 
 class AlreadyResolved(control.Refused):
@@ -181,23 +185,58 @@ def pending_start(repo_name, tid):
 
 
 def pending_state(repo_name: str, tid: str) -> tuple[str, str]:
-    identity = repo_name, tid
-    if identity not in PENDING:
-        return "", "exited"
-    proc, before = PENDING[identity]
-    exited = proc.poll() is not None
-    row = next((r for r in run_store.ticket_runs(repo_name, tid) if r["id"] not in before), None)
-    if row or exited:
-        del PENDING[identity]
-        return (row["id"], row["status"]) if row else ("", "exited")
-    return "", "starting"
+    with PENDING_LOCK:
+        identity = repo_name, tid
+        if identity in PENDING:
+            proc, before = PENDING[identity]
+            exited = proc.poll() is not None
+            row = next((r for r in run_store.ticket_runs(repo_name, tid) if r["id"] not in before), None)
+            if row or exited:
+                del PENDING[identity]
+                return (row["id"], row["status"]) if row else ("", "exited")
+            return "", "starting"
+        return "", "starting" if launch_lease.held(repo_name, tid) else "exited"
+
+
+def prune_pending() -> None:
+    with PENDING_LOCK:
+        for (repo, tid), (proc, before) in list(PENDING.items()):
+            if proc.poll() is not None:
+                del PENDING[repo, tid]
+                continue
+            try:
+                if any(r["id"] not in before for r in run_store.ticket_runs(repo, tid)):
+                    del PENDING[repo, tid]
+            except (OSError, sqlite3.Error, foundation.NoDatabase, foundation.IncompatibleSchema):
+                # A temporarily unavailable database is not proof of exit.
+                continue
+
+
+def reap_pending() -> None:
+    global PENDING_REAPER
+
+    while True:
+        time.sleep(PENDING_SWEEP_SECONDS)
+        prune_pending()
+        with PENDING_LOCK:
+            if not PENDING:
+                PENDING_REAPER = None
+                return
 
 
 def spawn_pending(repo_name: str, tid: str, spawn: Callable[[], subprocess.Popen]) -> subprocess.Popen:
-    before = set(run_ids(repo_name, tid))
-    proc = spawn()
-    PENDING[repo_name, tid] = proc, before
-    return proc
+    global PENDING_REAPER
+
+    with PENDING_LOCK, launch_lease.acquiring(repo_name, tid) as lease:
+        before = set(run_ids(repo_name, tid))
+        proc = spawn()
+        if not lease.passed:
+            raise RuntimeError("task launch must inherit its lease through control.launch")
+        PENDING[repo_name, tid] = proc, before
+        if PENDING_REAPER is None:
+            PENDING_REAPER = threading.Thread(target=reap_pending, name="pending-starts", daemon=True)
+            PENDING_REAPER.start()
+        return proc
 
 
 def spawned(repo_name: str, tid: str, spawn: Callable[[], subprocess.Popen]) -> tuple[str, str]:

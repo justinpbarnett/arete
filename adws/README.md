@@ -65,13 +65,22 @@ When the server restarts on new code, `just adw-wait` connects again by itself a
 | `just adw-costs [days]` | cost and time by step, kind and model, then the wait minutes |
 | `just adw-steps [repo]` | the step sheet with each step's resolved settings |
 
-`adw`, `adw-ticket`, `adw-answer`, `adw-resume`, `adw-repair` and `adw-step` print one line: `{"task", "repo", "run", "state", "why"}`. `state` is `running` with the new run's id in `run`, `queued` with an empty `run`, or `starting` with an empty `run` while a living child registers. `starting` is accepted and exits 0; look up the task to find its run once registration finishes. `why` explains the result.
+`adw`, `adw-ticket`, `adw-answer`, `adw-resume`, `adw-repair` and `adw-step` print one line: `{"task", "repo", "run", "state", "why"}`.
+`state` is `running` with the new run's id in `run`, `queued` with an empty `run`, or `starting` with an empty `run` while a living child registers.
+If a child finishes during registration or task-start recovery finds an ended run, the answer can carry that run's terminal state, such as `failed`, with its run id.
+`starting` is accepted and exits 0; look up the task to find its run once registration finishes.
+`why` explains the result.
 
 `arete task start`, `arete task run` and remote `arete run` choose `--key` first, then `ARETE_IDEMPOTENCY_KEY`, otherwise mint a key for that invocation. They print `Idempotency-Key: KEY` on stderr once. Keys contain 8–128 ASCII letters, digits or `_ . : / -`. The recipes inherit `ARETE_IDEMPOTENCY_KEY`; direct CLI commands also accept `--key`.
 
 Task starts automatically retry broken connections, including truncated response bodies, at most twice within one 30-second budget. They keep the same key and body through retries and HTTPS redirects. After an uncertain result, resend the identical command with its printed `--key` (or the same environment key). The server returns the original response bytes, status and receipt with `Idempotent-Replayed: true`, even after restarting. Keys belong to the admitted principal, so another login for the same person shares the answer.
 
-A live duplicate gets HTTP 409 `idempotency_in_flight` and `Retry-After: 1`; the CLI retries within the same budget. Changed content under the same key gets HTTP 422 `idempotency_key_reused`; use a new key for a new operation. Completed `queued`, `starting` and handled-error answers remain the answer for that key. To start a queued task after capacity changes, use a fresh key with `task run` and its ticket. Claims expire after 30 days, so keep recovery resends within that period. Other writes retain their existing behavior; check their state before resending after a disconnect.
+A live duplicate gets HTTP 409 `idempotency_in_flight` and `Retry-After: 1`; the CLI retries within the same budget.
+Changed content under the same key gets HTTP 422 `idempotency_key_reused`; use a new key for a new operation.
+Every committed response remains the answer for that key, including `queued`, `starting`, terminal-state and handled-error answers.
+To request a new start, including for a queued task after capacity changes, use a fresh key with `task run` and its ticket.
+Claims expire after 30 days, so keep recovery resends within that period.
+Other writes retain their existing behavior; check their state before resending after a disconnect.
 
 ## One whole session
 

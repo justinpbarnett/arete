@@ -26,11 +26,33 @@ from tests.harness import SOURCE
 
 EXERCISES = ("migration-rollback", "writes", "stale-stop", "concurrent-stop", "run-commands", "grace",
              "status-races", "ask-races", "carried-landings", "clients", "nearby", "keyed-replay",
-             "keyed-concurrency", "keyed-clients", "keyed-recovery", "slow-start", "idempotency-prune")
+             "keyed-concurrency", "keyed-clients", "keyed-recovery", "slow-start", "launch-boundaries", "idempotency-prune")
 
 
 def forbidden(*args, **kwargs):
     raise AssertionError("external transport or credential lookup forbidden")
+
+
+def registration_command(repo, tid, ready, *, gate=None, finish=False, fields=None, stop=None):
+    code = ("import json,sys,time\n"
+            f"sys.path.insert(0, {str(SOURCE)!r})\n"
+            "from pathlib import Path\n"
+            "from arete import record,util\n"
+            "from arete.store import runs\n"
+            "repo,tid,gate,ready,finish,fields,stop=json.loads(sys.argv[1])\n"
+            "deadline=time.monotonic()+30\n"
+            "def stopping():\n"
+            " return time.monotonic()>deadline or (stop and Path(stop).exists())\n"
+            "while gate and not Path(gate).exists():\n"
+            " if stopping(): sys.exit(0)\n"
+            " time.sleep(.01)\n"
+            "with util.lock(runs.run_lock('pipeline',repo,tid),wait=True):\n"
+            " run=record.start('pipeline',repo=repo,issue=tid,**fields)\n"
+            " Path(ready).write_text(json.dumps({'run':run}))\n"
+            " while not finish and not stopping(): time.sleep(.01)\n")
+    return [sys.executable, "-I", "-c", code,
+            json.dumps([repo, str(tid), str(gate) if gate else "", str(ready), finish, fields or {},
+                        str(stop) if stop else ""])]
 
 
 def launch(name, root=None, port=0):
@@ -59,8 +81,11 @@ def exercise(name, root=None):
 
 class Fixture(EventsFixture):
     def __init__(self, root, port=0):
+        from arete import control
+
         self.children = []
         self.evidence_lock = threading.Lock()
+        self.launch_process = control.launch
         super().__init__(root, port)
 
     def open(self, port=0):
@@ -147,22 +172,28 @@ class Fixture(EventsFixture):
         return run
 
     def fake_launch(self, command, *args, **kw):
-        from arete import record
-
         old = next((r for r in self.rows("SELECT * FROM runs") if r["id"] in command), None)
         assert old, command
-        child = subprocess.Popen(["sleep", "30"], start_new_session=True)
-        self.children.append(child)
-        record.start("pipeline", repo=old["repo"], issue=old["issue"], pid=child.pid)
-        return child
+        return self.fake_spawn(old["repo"], old["issue"])
 
     def fake_spawn(self, repo, tid, force=False):
-        from arete import record
-
-        child = subprocess.Popen(["sleep", "30"], start_new_session=True)
-        self.children.append(child)
-        record.start("pipeline", repo=repo, issue=tid, pid=child.pid)
+        child, ready = self.pipeline_child(repo, tid)
+        self.wait_registration(child, ready)
         return child
+
+    def pipeline_child(self, repo, tid, *, gate=None, finish=False, fields=None):
+        ready = self.root / f"registration-{os.urandom(8).hex()}.json"
+        child = self.launch_process(registration_command(repo, tid, ready, gate=gate, finish=finish, fields=fields),
+                                    "fixture-children.log")
+        self.children.append(child)
+        return child, ready
+
+    def wait_registration(self, child, ready):
+        deadline = time.monotonic() + 10
+        while not ready.exists() and child.poll() is None and time.monotonic() < deadline:
+            time.sleep(.01)
+        assert ready.exists(), (child.poll(), ready)
+        return json.loads(ready.read_text())["run"]
 
     def close(self):
         super().close()
@@ -784,8 +815,8 @@ def slow_start(f):
     cfg = replace(cfg, repos=[repo])
 
     def delayed(repo, tid, force=False):
-        child = subprocess.Popen(["sleep", "30"], start_new_session=True)
-        f.children.append(child)
+        gate = f.root / f"register-{os.urandom(8).hex()}"
+        child, ready = f.pipeline_child(repo, tid, gate=gate)
         spawned.append(tid)
         first = len(spawned) == 1
         register_at = time.monotonic() + 2
@@ -794,7 +825,8 @@ def slow_start(f):
             if first:
                 assert register_first.wait(10)
             time.sleep(max(0, register_at - time.monotonic()))
-            record.start("pipeline", repo=repo, issue=tid, pid=child.pid)
+            gate.touch()
+            f.wait_registration(child, ready)
 
         thread = threading.Thread(target=register)
         registrations.append(thread)
@@ -849,6 +881,11 @@ def slow_start(f):
         replayed = f.post("/api/tasks", {"repo": "replay-sample", "prompt": "slow"}, "slow-572")
         assert replayed["raw"] == initial["raw"]
         assert len(runs.ticket_runs("replay-sample", tid)) == 1
+        deadline = time.monotonic() + 5
+        while (repo.name, tid) in tasks.PENDING and time.monotonic() < deadline:
+            time.sleep(.01)
+        assert (repo.name, tid) not in tasks.PENDING
+        assert f.post("/api/tasks", {"repo": "replay-sample", "prompt": "slow"}, "slow-572")["raw"] == initial["raw"]
         skipped = f.tasks.task_add(repo.name, "Run anyway starts before keyed HTTP")
         with mock.patch.object(pipeline, "skipped_tickets", return_value={skipped: {"repo": repo.name, "id": skipped}}), \
                 mock.patch.object(slots, "slots_free_to_start", return_value=1):
@@ -878,15 +915,16 @@ def slow_start(f):
                 assert f.post(path, {"base_version": row["version"]})["body"]["state"] == "starting"
             registrations[-1].join(5)
         def exited(*args):
-            child = subprocess.Popen(["false"], start_new_session=True)
+            child = f.launch_process(["false"], "fixture-children.log")
             f.children.append(child)
             child.wait()
             return child
 
         def finished(repo_name, target, force=False):
-            child = exited()
-            run = record.start("pipeline", repo=repo_name, issue=target, pid=child.pid,
-                               pr_url="https://example.test/fixture/pull/1", branch="fixture")
+            child, ready = f.pipeline_child(repo_name, target, finish=True, fields={
+                "pr_url": "https://example.test/fixture/pull/1", "branch": "fixture"})
+            run = f.wait_registration(child, ready)
+            child.wait(5)
             run_lines.write(run, "task", path="feature", title="finished pending child")
             run_lines.write(run, "step_start", step="implement", try_no=1)
             run_lines.write(run, "step_end", step="implement", result="fail", data={})
@@ -897,37 +935,39 @@ def slow_start(f):
             return child
 
         completed = []
-        for action in ("start", "skipped", "resume", "repair", "steps/implement"):
-            target = f.tasks.task_add(repo.name, "Restart after the pending poller child finishes")
-            with mock.patch.object(poll, "spawn_run", side_effect=finished):
-                assert poll.spawn_unparked(repo.name, target)
-            old = runs.ticket_runs(repo.name, target)[0]
-            assert old["status"] == "failed" and (repo.name, target) in tasks.PENDING
-            with mock.patch.object(control, "launch", side_effect=f.fake_launch) as launch, \
-                    mock.patch.object(pipeline, "spawn_run", side_effect=f.fake_spawn) as spawn, \
-                    mock.patch.object(repairs, "open_heads"), \
-                    mock.patch.object(pipeline, "script_refusal", return_value=""), \
-                    mock.patch.object(pipeline, "skipped_tickets", return_value={target: {"repo": repo.name, "id": target}}), \
-                    mock.patch.object(slots, "slots_free_to_start", return_value=1):
-                if action == "start":
-                    result = f.post("/api/tasks", {"repo": repo.name, "ticket": target}, "completed-pending-572")
-                elif action == "skipped":
-                    result = f.post(f"/api/skipped/{target}/run")
-                else:
-                    path = f"/api/runs/{old['id']}/{action}"
-                    stale = f.post(path, {"base_version": old["version"] - 1})
-                    assert stale["status"] == 409 and stale["body"]["code"] == "version_conflict", stale
-                    launch.assert_not_called()
-                    assert (repo.name, target) in tasks.PENDING
-                    result = f.post(path, {"base_version": old["version"]})
-                assert result["status"] == 200 and spawn.call_count + launch.call_count == 1, result
-                new = runs.ticket_runs(repo.name, target)[0]
-                assert new["id"] != old["id"] and new["status"] == "running"
-                assert runs.run_get(old["id"]) == old
-                if action != "skipped":
-                    assert result["body"]["run"] == new["id"] and result["body"]["state"] == "running", result
-                assert (repo.name, target) not in tasks.PENDING
-                completed.append({"action": action, "old": old["id"], "new": new["id"], "response": result})
+        # Pin stale entries while the existing admission/status assertions exercise them.
+        with mock.patch.object(tasks, "prune_pending"):
+            for action in ("start", "skipped", "resume", "repair", "steps/implement"):
+                target = f.tasks.task_add(repo.name, "Restart after the pending poller child finishes")
+                with mock.patch.object(poll, "spawn_run", side_effect=finished):
+                    assert poll.spawn_unparked(repo.name, target)
+                old = runs.ticket_runs(repo.name, target)[0]
+                assert old["status"] == "failed" and (repo.name, target) in tasks.PENDING
+                with mock.patch.object(control, "launch", side_effect=f.fake_launch) as launch, \
+                        mock.patch.object(pipeline, "spawn_run", side_effect=f.fake_spawn) as spawn, \
+                        mock.patch.object(repairs, "open_heads"), \
+                        mock.patch.object(pipeline, "script_refusal", return_value=""), \
+                        mock.patch.object(pipeline, "skipped_tickets", return_value={target: {"repo": repo.name, "id": target}}), \
+                        mock.patch.object(slots, "slots_free_to_start", return_value=1):
+                    if action == "start":
+                        result = f.post("/api/tasks", {"repo": repo.name, "ticket": target}, "completed-pending-572")
+                    elif action == "skipped":
+                        result = f.post(f"/api/skipped/{target}/run")
+                    else:
+                        path = f"/api/runs/{old['id']}/{action}"
+                        stale = f.post(path, {"base_version": old["version"] - 1})
+                        assert stale["status"] == 409 and stale["body"]["code"] == "version_conflict", stale
+                        launch.assert_not_called()
+                        assert (repo.name, target) in tasks.PENDING
+                        result = f.post(path, {"base_version": old["version"]})
+                    assert result["status"] == 200 and spawn.call_count + launch.call_count == 1, result
+                    new = runs.ticket_runs(repo.name, target)[0]
+                    assert new["id"] != old["id"] and new["status"] == "running"
+                    assert runs.run_get(old["id"]) == old
+                    if action != "skipped":
+                        assert result["body"]["run"] == new["id"] and result["body"]["state"] == "running", result
+                    assert (repo.name, target) not in tasks.PENDING
+                    completed.append({"action": action, "old": old["id"], "new": new["id"], "response": result})
         (f.root / "pending-completed.json").write_text(json.dumps(completed, indent=2))
         completed_body = {"repo": repo.name, "prompt": "finishes during spawn"}
         with mock.patch.object(pipeline, "spawn_run", side_effect=finished) as spawn:
@@ -945,16 +985,118 @@ def slow_start(f):
         with mock.patch.object(pipeline, "spawn_run", side_effect=f.fake_spawn):
             assert f.post("/api/tasks", {"repo": repo.name, "ticket": target}, "retry-exited-572")["body"]["state"] == "running"
         target = f.tasks.task_add(repo.name, "pending then exited")
-        child = subprocess.Popen(["sleep", "1.3"], start_new_session=True)
-        f.children.append(child)
-        with mock.patch.object(pipeline, "spawn_run", return_value=child):
+        def exiting(*args):
+            child = f.launch_process(["sleep", "1.3"], "fixture-children.log")
+            f.children.append(child)
+            return child
+
+        with mock.patch.object(pipeline, "spawn_run", side_effect=exiting):
             accepted = f.post("/api/tasks", {"repo": repo.name, "ticket": target}, "pending-exit-572")
             assert accepted["body"]["state"] == "starting"
+        child = f.children[-1]
         child.wait(5)
+        deadline = time.monotonic() + 5
+        while (repo.name, target) in tasks.PENDING and time.monotonic() < deadline:
+            replayed = f.post("/api/tasks", {"repo": repo.name, "ticket": target}, "pending-exit-572")
+            assert replayed["raw"] == accepted["raw"]
+            time.sleep(.01)
+        assert (repo.name, target) not in tasks.PENDING
         with mock.patch.object(pipeline, "spawn_run", side_effect=f.fake_spawn):
             assert f.post("/api/tasks", {"repo": repo.name, "ticket": target}, "after-pending-exit-572")["body"]["state"] == "running"
     for thread in registrations:
         thread.join(5)
+
+
+def launch_boundaries(f):
+    from arete import launch_lease, pipeline, util
+    from arete.store import runs
+
+    def eventually(predicate):
+        deadline = time.monotonic() + 10
+        while not predicate() and time.monotonic() < deadline:
+            time.sleep(.02)
+        assert predicate()
+
+    evidence = []
+    repo = "replay-sample"
+    for mode in ("live-parent", "after-fork", "before-fork"):
+        children_before = len(f.children)
+        tid = f.tasks.task_add(repo, f"Separate poller {mode}")
+        gate, ready, stop, marker = (f.root / f"{mode}-{suffix}" for suffix in ("gate", "ready", "stop", "poller"))
+        command = registration_command(repo, tid, ready, gate=gate, stop=stop)
+        code = ("import json,os,sys\n"
+                f"sys.path.insert(0, {str(SOURCE)!r})\n"
+                "from pathlib import Path\n"
+                "from unittest import mock\n"
+                "from arete import control,poll,principals\n"
+                "repo,tid,mode,command,marker=json.loads(sys.argv[1])\n"
+                "def spawn(*args):\n"
+                " if mode=='before-fork':\n"
+                "  Path(marker).write_text('before fork')\n"
+                "  os._exit(0)\n"
+                " child=control.launch(command,'boundary-child.log')\n"
+                " Path(marker).write_text('after fork')\n"
+                " if mode=='after-fork': os._exit(0)\n"
+                " return child\n"
+                "with principals.acting(principals.owner()),mock.patch.object(poll,'spawn_run',side_effect=spawn):\n"
+                " assert poll.spawn_unparked(repo,tid)\n"
+                " sys.stdin.read(1)\n")
+        parent = subprocess.Popen([sys.executable, "-I", "-c", code,
+                                   json.dumps([repo, tid, mode, command, str(marker)])],
+                                  stdin=subprocess.PIPE, start_new_session=True)
+        f.children.append(parent)
+        try:
+            eventually(marker.exists)
+            assert not runs.ticket_runs(repo, tid)
+            if mode != "live-parent":
+                assert parent.wait(5) == 0
+            assert launch_lease.held(repo, tid) == (mode != "before-fork")
+            body, key = {"repo": repo, "ticket": tid}, f"boundary-{mode}"
+            with mock.patch.object(pipeline, "spawn_run", side_effect=f.fake_spawn) as spawn:
+                initial = f.post("/api/tasks", body, key)
+                assert initial["status"] == 200, initial
+                if mode == "before-fork":
+                    assert initial["body"]["state"] == "running" and spawn.call_count == 1
+                    assert len(runs.ticket_runs(repo, tid)) == 1
+                else:
+                    assert initial["body"]["state"] == "starting" and not initial["body"]["run"]
+                    assert spawn.call_count == 0 and not runs.ticket_runs(repo, tid)
+                    if mode == "live-parent":
+                        parent.stdin.close()
+                        assert parent.wait(5) == 0
+                        assert launch_lease.held(repo, tid)
+                        duplicate = f.post("/api/tasks", body, key + "-after-parent")
+                        assert duplicate["body"]["state"] == "starting" and spawn.call_count == 0
+                        gate.touch()
+                        eventually(ready.exists)
+                        assert not launch_lease.held(repo, tid)
+                        registered = f.post("/api/tasks", body, key + "-registered")
+                        assert registered["body"]["state"] == "running" and spawn.call_count == 0
+                        assert registered["body"]["run"] == json.loads(ready.read_text())["run"]
+                        assert len(runs.ticket_runs(repo, tid)) == 1
+                    else:
+                        stop.touch()
+                        eventually(lambda: not launch_lease.held(repo, tid))
+                        assert not runs.ticket_runs(repo, tid)
+                        retry = f.post("/api/tasks", body, key + "-new")
+                        assert retry["body"]["state"] == "running" and spawn.call_count == 1
+                        assert len(runs.ticket_runs(repo, tid)) == 1
+                replay = f.post("/api/tasks", body, key)
+                assert replay["raw"] == initial["raw"] and replay["headers"]["Idempotent-Replayed"] == "true"
+                evidence.append({"mode": mode, "initial": initial, "replayed": replay, "http_spawns": spawn.call_count})
+        finally:
+            stop.touch()
+            if parent.stdin and not parent.stdin.closed:
+                parent.stdin.close()
+            parent.wait(5)
+            eventually(lambda: not launch_lease.held(repo, tid))
+            if mode == "live-parent":
+                eventually(lambda: not util.lock_is_held(runs.run_lock("pipeline", repo, tid)))
+            for child in f.children[children_before:]:
+                if child.poll() is None:
+                    child.terminate()
+                child.wait(5)
+    (f.root / "launch-boundaries.json").write_text(json.dumps(evidence, indent=2))
 
 
 def crash_server(root, mode):
@@ -1286,7 +1428,8 @@ def child(name, root, port):
                                "status-races": status_races, "ask-races": ask_races,
                                "carried-landings": carried_landings, "clients": clients, "keyed-replay": keyed_replay,
                                "keyed-concurrency": keyed_concurrency, "keyed-clients": keyed_clients,
-                               "keyed-recovery": keyed_recovery, "slow-start": slow_start, "idempotency-prune": idempotency_prune}
+                               "keyed-recovery": keyed_recovery, "slow-start": slow_start,
+                               "launch-boundaries": launch_boundaries, "idempotency-prune": idempotency_prune}
                     if name == "serve":
                         seed_serve(f)
                         f.save()

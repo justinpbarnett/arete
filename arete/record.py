@@ -21,7 +21,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Self
 
-from . import agent, codebase, paths, run_lines, scrub, util
+from . import agent, codebase, launch_lease, paths, run_lines, scrub, util
 from .store import approvals as approvals_store
 from .store import db as foundation
 from .store import loops as loop_store
@@ -45,6 +45,7 @@ def new_id(prefix: str, tag: str = "") -> str:
 
 
 def start(kind: str, *, run_id: str = "", tag: str = "", lock: str = "", **fields) -> str:
+    nested = foundation.in_write()
     row = {"kind": kind, "status": "running", "started": util.iso(), "lock": lock or None, "pid": os.getpid(),
            "engine_sha": codebase.STAMP, "schema_version": foundation.LATEST, **fields}
     if kind in TICKET_KINDS:
@@ -58,6 +59,9 @@ def start(kind: str, *, run_id: str = "", tag: str = "", lock: str = "", **field
             if run_id or "runs.id" not in str(e):
                 raise
             continue
+        # A nested writer has not committed yet; retain its lease until exit.
+        if kind in TICKET_KINDS and not nested:
+            launch_lease.registered(row.get("repo", ""), str(row.get("issue", "")))
         return minted
 
 

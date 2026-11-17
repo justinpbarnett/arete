@@ -24,8 +24,14 @@ def claim(context, seq):
 
 def complete(context, status, payload, seq):
     with tx() as c:
-        c.execute("UPDATE idempotency SET status = ?, response = ?, last_seq = ? "
-                  "WHERE actor = ? AND key = ? AND status = 0", (status, payload, seq, *context[:2]))
+        c.execute("INSERT INTO idempotency (actor,key,route,request_sha,status,response,last_seq,at,via) "
+                  "VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT (actor,key) DO UPDATE SET "
+                  "status = excluded.status, response = excluded.response, last_seq = excluded.last_seq "
+                  "WHERE idempotency.status = 0 AND idempotency.route = excluded.route "
+                  "AND idempotency.request_sha = excluded.request_sha",
+                  (*context, status, payload, seq, util.iso(), events.provenance()))
+        row = c.execute("SELECT * FROM idempotency WHERE actor = ? AND key = ?", context[:2]).fetchone()
+        return dict(row)
 
 
 def target(row):
