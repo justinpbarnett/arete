@@ -737,6 +737,8 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
             kind: str = "", auth: accounts.Auth | None = None, route: dict | None = None, try_no: int = 0,
             atom: str = "") -> Result:
     auth = auth or (authentication(name, which, cfg=cfg, device=target) if which != REPLAY else accounts.Auth())
+    if target.remote and which == "claude":
+        kw["leaf"] = f"{record.slug(trace[1])}-{try_no}"
     route = route or {}
     header = {"runner": which, "model": name, "device": target.name, **origin(cwd, cfg, target), "cwd": str(cwd),
               "auth_mode": auth.mode, "credential": route.get("credential", ""), "billing": route.get("billing", ""),

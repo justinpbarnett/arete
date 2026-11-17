@@ -48,6 +48,7 @@ def ownership(root):
     assert before[-1][0] == db.LATEST, before[-1]
     assert next(row for row in before if row[0] == 8)[2] == "foundation"
     assert next(row for row in before if row[0] == 9)[2] == "foundation"
+    assert next(row for row in before if row[0] == 10)[2] == "foundation"
     assert owners["events"]["events_log"]
     assert set(owners["principals"]) == {"principals", "principal_logins"}
     db.migrate()

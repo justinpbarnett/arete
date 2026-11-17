@@ -33,6 +33,7 @@ class Device:
     note: str = ""
     via: Device | None = None
     known_hosts: str = ""
+    turns: str = ""
 
     @property
     def remote(self) -> bool:
