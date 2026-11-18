@@ -1005,7 +1005,27 @@ Approval, dependency, running-ticket and capacity checks still decide whether a 
 
 ## Develop
 
-`uv run arete status` runs from the checkout without the installed tool. `uv tool install --editable . --python 3.13 --force` refreshes the `arete` on PATH that launchd uses.
+`uv run arete status` runs from the checkout without the installed tool.
+`uv tool install --editable . --python 3.13 --force` refreshes the `arete` on PATH that launchd uses.
+
+To inspect a fresh local database without using your regular Arete config or state, run this from the checkout:
+
+```sh
+(
+  set -eu
+  sandbox=$(mktemp -d "${TMPDIR:-/tmp}/arete-status.XXXXXX")
+  trap 'rm -rf -- "$sandbox"' EXIT
+  export ARETE_CONFIG_DIR="$sandbox/config"
+  export ARETE_STATE_DIR="$sandbox/state"
+  export ARETE_LOG_DIR="$sandbox/logs"
+  export ARETE_WORKTREES_DIR="$sandbox/worktrees"
+  uv run arete migrate
+  uv run arete status
+)
+```
+
+`migrate` initializes the disposable database without starting a service.
+If you add a pipeline repository to that config, the delivery rows show the configured strategy and controller route, not whether the provider is currently available.
 
 No runtime dependencies: stdlib only, so the tool install needs nothing from PyPI. Add one with `uv add`, never pip. The verifier's browser is `@playwright/mcp`, pinned in `arete/verify.py` and started with `npx`, so it needs node and Chrome on the machine. Under trusted scratch on the Codex runner the engine instead resolves that pinned version once, from the npm registry, into a private folder under its state (`browser-server/<version>`), checks it against the published integrity at every launch, and starts it with the engine's own `node` and no `npx`. On the Claude runner the engine starts that same pinned server itself, under the browser profile and outside the Claude process tree, as an HTTP MCP server on a loopback port it picks before the app starts; the app's profile denies outbound TCP to that port, and Claude gets one `http` entry named `playwright`. Before it starts the server, a preflight dumps `about:blank` with headless Chrome under the same profile within 30 seconds. When the preflight or the server start fails, the verify runs without browser tools and its prompt carries Chrome's first error line, so the browser checks are recorded as blocked with that line. The output of the server and of Chrome goes to `<step>-browser.log` in the run folder.
 
