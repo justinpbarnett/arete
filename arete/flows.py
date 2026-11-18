@@ -730,7 +730,8 @@ def plan(flow: factory.Flow) -> Outcome:
                                                      layer.config_file))
     return Outcome("pass", data={
         "plan": plan_text, "estimate": estimate,
-        "goal": found.get("verify", "").strip() or "The planner gave no steps: check what the issue asks for.",
+        "goal": pipeline.triage_goal(
+            found.get("verify", "").strip() or "The planner gave no steps: check what the issue asks for.", job.approval),
         "left_for_a_person": pipeline.left_section(run, (found.get("left_for_a_person") or "").strip()),
         "assumptions": pipeline.assumptions_of(found)})
 
@@ -740,7 +741,7 @@ def patch(flow: factory.Flow, tree: str) -> Outcome:
     job: Job = flow.ctx
     policy = job.layer.patch
     res = job.run.agent(BUILD, job.brief.prompt(
-        "patch", patch_files=policy.max_files, patch_lines=min(policy.max_lines, job.layer.max_diff_lines),
+        "patch", triage=job.triage, patch_files=policy.max_files, patch_lines=min(policy.max_lines, job.layer.max_diff_lines),
         denied=prompt_loader.code_list(diffguard.denied_paths(job.layer))), job.ws, role=BUILD,
         allowed_tools=prompt_loader.bash_rules(job.builder_bash), disallowed_tools=routing.NO_GIT_WRITES,
         json_schema=patching.SCHEMA)
@@ -756,7 +757,8 @@ def patch(flow: factory.Flow, tree: str) -> Outcome:
         job.run.log(f"patch: escalating to the feature flow: {why}")
     return Outcome("pass", data={
         "plan": str(said.get("plan") or "Implement the repair specified by the issue."),
-        "goal": str(said.get("verify") or "Check the issue's acceptance criteria and one nearby behavior."),
+        "goal": pipeline.triage_goal(
+            str(said.get("verify") or "Check the issue's acceptance criteria and one nearby behavior."), job.approval),
         "estimate": min(policy.max_lines, job.layer.max_diff_lines), "left_for_a_person": "",
         "summary": str(said.get("summary") or res.text), "escalate": why,
     }, session=job.run.sessions.get(BUILD, NO_SESSION))

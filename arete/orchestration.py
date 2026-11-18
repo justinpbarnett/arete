@@ -9,6 +9,7 @@ from pathlib import Path
 from . import (
     codebase,
     delegation,
+    diffguard,
     factory,
     flows,
     gh,
@@ -155,7 +156,9 @@ class Controller:
             answer = owner_asks.fresh_note(self.run.answers_due)
             self.run.story.append(answer)
             self.data.setdefault("owner_answers", []).append(answer)
-        self.job.goal = self.data["goal_base"] + "\n" + "\n".join(self.data.get("owner_answers", []))
+        goal = self.data["goal_base"] + "\n" + "\n".join(self.data.get("owner_answers", []))
+        self.job.goal = pipeline.triage_goal(goal, self.job.approval)
+        self.job.triage = pipeline.triage_notes(self.job.approval)
         self.job.b.plan_text, self.job.b.left_for_a_person = self.job.plan_text, self.job.left_for_a_person
         self.data.update(self.lineage())
         self.data["overrides"], self.data["step_overrides"] = self.run.overrides, self.run.step_overrides
@@ -257,6 +260,7 @@ class Controller:
         return {"version": PROTOCOL, "state_version": snapshot["version"], "cursor": snapshot["version"],
                 "root": self.lease.root,
                 "task": self.catalog.read("task", 0, 8000), "owner_context": self.run.story[-8:],
+                **({"triage": self.job.triage} if self.job.triage else {}),
                 "catalog_sha": self.catalog.fingerprint,
                 "catalog": {kind: self.catalog.list(kind, 0, 10) for kind in ("models", "prompts", "tools", "context")},
                 "actions": [{**{k: a[k] for k in ("id", "op", "state")},
@@ -366,8 +370,13 @@ class Controller:
         goal = args["goal"]
         queued = self.data.setdefault("steering", {}).pop((prior or action)["id"], [])
         goal += "\n" + "\n".join(queued) if queued else ""
+        if name in ("delegate", "investigate") and self.job.triage:
+            contexts = "\n\n".join(filter(None, (self.job.triage, contexts)))
         inputs = {"goal": goal, "context": contexts, "plan": self.job.plan_text, "checks": self.job.checks,
-                  "estimate": self.job.estimate, "verify": self.job.goal, **args["inputs"]}
+                  "denied": prompt_loader.code_list(diffguard.denied_paths(self.job.layer)),
+                  "estimate": self.job.estimate, "verify": self.job.goal, "triage": self.job.triage, **args["inputs"]}
+        if "verify" in args["inputs"] and pipeline.triage_checks(self.job.approval):
+            inputs["verify"] = pipeline.triage_goal(str(inputs["verify"]), self.job.approval)
         prompt = self.job.brief.prompt("delegate" if name in ("delegate", "investigate") else name, **inputs)
         session = NO_SESSION
         previous = (prior or {}).get("result", {})

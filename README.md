@@ -2167,10 +2167,26 @@ Uncertain classifications fall back to a read-only haiku step that reads the tic
 - Repos: the one it belongs in. A code ticket that names none, or needs more than one, gets a question to name it or split it.
 - Ready: the pipeline could build it as written.
 - Questions: only real blockers. The ticket does not say what to change and the code does not settle it, an attachment or copy it mentions is missing, a business decision changes the whole build, it needs an account or setup outside the repos, or it says it is parked, blocked or a duplicate.
-- Checks: up to six acceptance checks for a fix or feature, each one thing a person does on the running product and what it must show, so you see what done means before the build. Empty for research and work for a person. Triage writes and shows them; it does not yet feed them to the plan or verify steps.
+- Checks: up to six acceptance checks for a fix or feature, each describing an action on the running product and what it must show.
+  Research and work for a person have no checks.
+  After approval, classic, ADW and orchestrated planners receive the checks and must not drop or weaken them.
+  If the code disproves a check, the plan explains why in its assumptions.
+  The verifier receives the original checks as a separate numbered list even when the planner omitted a check or the run skipped planning.
+  The verifier reports an outcome for each check, and the PR lists the checks in their original order.
+  The owner's board answers override contradictory checks and assumptions; verification identifies the superseded check and gives evidence for the replacement behavior.
+  Tickets without approved checks keep their existing behavior.
 - Assumptions: the small choices the build will make where the ticket leaves them open, such as wording, placement or a default. They are not questions; the pipeline's plan reads them, and the PR lists them for you to check.
 - Size S, M or L. L means split it, so it is never ready.
 - A plan of up to 6 steps.
+
+Exercise the classic and ADW handoff offline with `<sandbox> python docs/triage-checks-fixture.py approved`, then `overrides`, `legacy`, `patch` and `inspect` with the same prefix.
+Use the configured verification sandbox executable for `<sandbox>`.
+The `patch` exercise covers an approved fix routed through `route_fixes` that completes without escalating to planning.
+Each exercise creates fresh disposable state and local bare origins beneath `.arete-sandbox/triage-checks-fixture/`, uses replay answers and dry-run publication, and prints the retained evidence paths.
+Inspect the plan, build and verify prompts, the plan outcome, `verify.md` and `pr_body.md` there.
+The exercises cover a planner-omitted check, a nearby planner-added check, empty planner verification, owner overrides, code-disproved checks and legacy tickets.
+They refuse external transports and credential lookup.
+Replay proves prompt propagation and report persistence, not that a live model obeyed the instructions.
 
 The fallback agent reads only inside its repos, has no MCP servers, and costs at most $0.30 a ticket.
 A ticket is assessed again when its updated time changes or the classifier's policy changes.
