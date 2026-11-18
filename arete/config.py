@@ -1237,12 +1237,13 @@ def section(data: dict, name: str) -> dict:
         raise ValueError(f"[{name}] is not a table") from None
 
 
-def load_layer(layer_dir: Path, strict: bool = False) -> RepoLayer:
+def load_layer(layer_dir: Path, strict: bool = False, *, source_file: Path | None = None) -> RepoLayer:
     ignored: list[str] | None = None if strict else []
     layer = RepoLayer(dir=layer_dir)
-    if not layer.config_file.exists():
+    config_file = source_file or layer.config_file
+    if not config_file.exists():
         return layer
-    data = tomllib.loads(layer.config_file.read_text())
+    data = tomllib.loads(config_file.read_text())
     setup = section(data, "setup")
     layer.setup = list(setup.get("commands", []))
     layer.copy = list(setup.get("copy", []))
@@ -1295,7 +1296,11 @@ def load_layer(layer_dir: Path, strict: bool = False) -> RepoLayer:
     if layer.factory_path not in FACTORY_PATHS:
         raise ValueError(f"[factory] path '{layer.factory_path}' is not one of {', '.join(FACTORY_PATHS)}")
     layer.passes = environment_table(section(data, "environment"), layer=True).passes
-    layer.document = document_table(section(data, "document"), layer_dir, ignored)
+    source_dir = source_file.parent if source_file else layer_dir
+    layer.document = document_table(section(data, "document"), source_dir, ignored)
+    if source_file and "voice" in layer.document:
+        layer.document["voice"] = tuple(str((layer_dir / Path(name).relative_to(source_dir.resolve())).resolve())
+                                        for name in layer.document["voice"])
     if "verify" in data:
         v = section(data, "verify")
         publish_evidence = v.get("publish_evidence", True)

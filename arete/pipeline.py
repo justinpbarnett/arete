@@ -1120,7 +1120,15 @@ def run_command(repo_name: str, tid: str | int, force: bool = False, dry_run: bo
     if mode == "classic":
         return control.command(["run", repo_name, str(tid), "--local", *flags])
     if mode in (ORCHESTRATED, "orchestrate"):
-        return script_command(cfg, "orchestrate", repo_name, str(tid), *flags)
+        from .store import orchestration
+
+        newest = run_store.newest_whole_run(repo_name, str(tid))
+        source = newest if newest and newest["status"] == "interrupted" else (
+            next(iter(run_store.open_runs(repo_name, str(tid))), None)
+            if not force and pending_feedback(repo_name, str(tid)) else None)
+        previous = (orchestration.find(source["id"]) or {}).get("current_run", source["id"]) if source else ""
+        return script_command(cfg, "orchestrate", repo_name, str(tid), *flags,
+                              *(["--continue", previous] if previous else []))
     if mode != ADW:
         return script_command(cfg, mode, repo_name, str(tid), *flags)
     newest = run_store.newest_whole_run(repo_name, str(tid))
@@ -1478,9 +1486,9 @@ def _ask(run: Run, ws: Path, checkouts: list[workspace.Checkout], comment: str, 
     return "needs-info", summary[:300], ""
 
 
-def checked_layer(cfg: config.Config, layer_dir: Path) -> config.RepoLayer:
+def checked_layer(cfg: config.Config, layer_dir: Path, *, source_file: Path | None = None) -> config.RepoLayer:
     try:
-        layer = config.load_layer(layer_dir)
+        layer = config.load_layer(layer_dir, source_file=source_file)
         steps.check(cfg, layer)
     except (ValueError, TypeError) as e:
         raise workspace.RunFailed(f"{paths.short_path(layer_dir / 'config.toml')}: {e}") from e
