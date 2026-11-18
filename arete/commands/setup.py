@@ -94,8 +94,12 @@ def cmd_status(args) -> int:
         print("arete status --json RUN_ID prints one run's steps", file=sys.stderr)
         return 2
     cfg, problem = config.load_or_problem()
-    views = control.loop_views(cfg)
-    snap = board.snapshot(recent_runs=args.limit)
+    try:
+        views = control.loop_views(cfg)
+        snap = board.snapshot(recent_runs=args.limit)
+    except foundation.NoDatabase as e:
+        print(e, file=sys.stderr)
+        return 1
     print(f"arete {__version__}  config {paths.CONFIG_FILE}")
     if problem:
         print(f"config does not load: {problem}")
