@@ -244,8 +244,9 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: tuple[str, str], skip
 
 
 def fill_slots(cfg: config.Config, queues: list[RepoQueue], skips: pipeline.SkipLog, dry_run: bool,
-               errors: list[str], going: Counter, slots: int) -> None:
+               errors: list[str], going: Counter, slots: int) -> bool:
     examined, exhausted = 0, set()
+    selected_work = False
     while examined < MAX_STARTS_PER_POLL:
         progressed = False
         for queue in queues:
@@ -266,6 +267,7 @@ def fill_slots(cfg: config.Config, queues: list[RepoQueue], skips: pipeline.Skip
                 if result in ("held", "refused"):
                     exhausted.add(repo.name)
                 elif result == "started":
+                    selected_work = True
                     slots -= 1
                     going[repo.name] += 1
             except Exception as e:
@@ -274,6 +276,7 @@ def fill_slots(cfg: config.Config, queues: list[RepoQueue], skips: pipeline.Skip
                 exhausted.add(repo.name)
         if not progressed:
             break
+    return selected_work
 
 
 def report_unrouted(routes: dict[str, set[str]], reached_clients: dict[str, jira.Client],
@@ -317,11 +320,13 @@ def poll(dry_run: bool = False) -> int:
         skips = pipeline.SkipLog({} if dry_run else util.read_json(pipeline.SKIPPED_FILE, {}))
         routes = jira_routes_by_project(cfg)
         queues, reached_clients = repo_queues(cfg, pipeline_repos, routes, skips, errors)
-        fill_slots(cfg, queues, skips, dry_run, errors, going, slots)
+        selected_work = fill_slots(cfg, queues, skips, dry_run, errors, going, slots)
         report_unrouted(routes, reached_clients, skips, errors)
         if not dry_run:
             guard(errors, "moving tickets", lambda: outcomes.sync_moves(cfg))
             guard(errors, "poll", lambda: save_skips_and_landings(cfg, skips, outcomes.sync_landings))
             guard(errors, "sweeping worktrees", lambda: cleanup_worktrees(cfg=cfg))
             mark_loop("poll", not errors, "; ".join(errors))
+        elif not errors and not selected_work:
+            print(f"{util.iso()} poll dry run: no new run would start")
         return 1 if errors else 0
