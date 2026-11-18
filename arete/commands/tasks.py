@@ -100,14 +100,14 @@ def task_close(args) -> int:
 def task_start(args) -> int:
     from .. import client
 
-    return client.say("POST", "/api/tasks", {"repo": args.repo, "prompt": " ".join(args.prompt),
-                                             "title": args.title, "kind": args.kind})
+    return client.steered(lambda: client.emit(client.start_task(
+        {"repo": args.repo, "prompt": " ".join(args.prompt), "title": args.title, "kind": args.kind}, args.key)) or 0)
 
 
 def task_run(args) -> int:
     from .. import client
 
-    return client.say("POST", "/api/tasks", {"repo": args.repo, "ticket": args.ticket})
+    return client.steered(lambda: client.emit(client.start_task({"repo": args.repo, "ticket": args.ticket}, args.key)) or 0)
 
 
 def cmd_forget(args) -> int:
@@ -213,11 +213,13 @@ def register(sub) -> None:
     t.add_argument("--title", default="", help="the prompt's first line by default")
     t.add_argument("prompt", nargs="+", help="what to do")
     t.set_defaults(fn=task_start)
+    t.add_argument("--key", default=None, help="reuse an identical task-start request safely")
     t = steering(tsub.add_parser("run", help="start a tracker item or a task through the server, past its waits; one "
                                              "JSON line"))
     t.add_argument("repo")
     t.add_argument("ticket", help="an issue number, a Jira key or a task id")
     t.set_defaults(fn=task_run)
+    t.add_argument("--key", default=None, help="reuse an identical task-start request safely")
 
     p = sub.add_parser("forget", help="mark a memory fact or hand edit from the miner as done")
     p.add_argument("id", type=int)

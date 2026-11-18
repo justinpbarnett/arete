@@ -53,6 +53,25 @@ function modelTable(models) {
       cell(m.tokens_out.toLocaleString(), "num"), cell(["local", "replay"].includes(m.billing) ? m.billing : m.metered ? money(m.paid) : "subscription", "num"))), { stack: true });
 }
 
+function orchestrationDetail(board, place) {
+  const data = board.orchestration;
+  if (!data) return null;
+  const run = board.run;
+  const retry = (action, btn) => act(btn, place,
+    `/api/runs/${encodeURIComponent(run.id)}/steps/${encodeURIComponent(action.id)}`, {},
+    (result) => { if (result.run) go(detailHash("run", result.run), "action");
+      return `Started ${action.id} alone. Dependent evidence must be refreshed before publication.`; }, { object: run });
+  const eligible = (a) => data.mode === "orchestrate" && data.workspace_retained && run.status !== "running" && data.current_run === run.id
+    && ["succeeded", "failed", "cancelled", "interrupted"].includes(a.state)
+    && ["worker.start", "worker.continue", "checks.run", "verification.run", "review.run"].includes(a.op);
+  return [el("h3", { text: "Orchestration" }),
+    el("p", { text: `${data.mode} · ${data.decisions} decisions · ${data.launches} controller launches · generation ${data.generation}` }),
+    table("", [["Action"], ["Operation"], ["State"], ["Result"], [""]], data.actions.map((a) => el("tr", {},
+      cell(a.id), cell(a.op), cell(a.state),
+      cell(foldText(`action:${run.id}:${a.id}`, "Inspect result and requested settings", JSON.stringify({ request: a.request, result: a.result }, null, 2))),
+      cell(eligible(a) ? button("Rerun alone", "rerun-action", (b) => retry(a, b), { of: a.id }) : null))), { stack: true })];
+}
+
 function drawRunDetail(pane, result, kind) {
   const id = route.detail.id;
   const place = `detail:${kind}:${id}`;
@@ -70,7 +89,7 @@ function drawRunDetail(pane, result, kind) {
   const stick = !shownLines || shownLines.scrollTop + shownLines.clientHeight >= shownLines.scrollHeight - 4;
   const s = board.session;
   fill(`${pane}-head`, detailHead(pane, kind, id, s?.prompt ? firstMessage(s.prompt, TITLE_CHARS) : r.ticket || id,
-    running ? button(r.stop_asked ? "Stopping" : "Stop", "stop", (b) => stopRun(id, place, b), { of: id, disabled: Boolean(r.stop_asked) }) : null));
+    running ? button(r.stop_asked ? "Stopping" : "Stop", "stop", (b) => stopRun(r, place, b), { of: id, disabled: Boolean(r.stop_asked) }) : null));
   fill(`${pane}-body`,
     saidLine(place),
     el("dl", { class: "w" },
@@ -87,6 +106,7 @@ function drawRunDetail(pane, result, kind) {
       fact("Folder", s.cwd ? pathCode(s.cwd) : ""), fact("Repo", s.repo), fact("Tools", s.tools.join(", ") || "none")),
     s.prompt ? foldText(`prompt:${id}`, "Show the first message", s.prompt) : null] : null,
     board.models.length ? [el("h3", { text: "Models" }), modelTable(board.models)] : null,
+    orchestrationDetail(board, place),
     el("h3", { text: feed ? "Feed" : "Log" }),
     el("pre", { class: `lines ${feed ? "feed" : "log"}`, tabindex: "0", "data-focus": "lines", "aria-label": feed ? "The feed" : "The log" },
       lines.length ? lines.map((text) => el("span", { text })) : feed ? "Nothing in the feed yet." : "This run has no log yet."));
@@ -99,8 +119,8 @@ function drawRunDetail(pane, result, kind) {
   return running ? LIVE_MS : SLOW_MS;
 }
 
-function stopRun(id, place, btn) {
-  return act(btn, place, `/api/runs/${encodeURIComponent(id)}/stop`, {}, (r) => stopWords(id, r, "The feed says when it has."));
+function stopRun(run, place, btn) {
+  return act(btn, place, `/api/runs/${encodeURIComponent(run.id)}/stop`, {}, (r) => stopWords(run.id, r, "The feed says when it has."), { object: run });
 }
 
 function talkForm(pane, id) {

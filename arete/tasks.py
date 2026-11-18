@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import subprocess
+import threading
 import time
 from collections import Counter
 from collections.abc import Callable
@@ -11,10 +13,12 @@ from . import (
     chat,
     config,
     control,
+    events,
     factory,
     flows,
     gh,
     jira,
+    launch_lease,
     owner_asks,
     paths,
     pipeline,
@@ -33,9 +37,11 @@ from . import (
 from .refusals import TrackerFailed
 from .store import asks as ask_store
 from .store import db as foundation
+from .store import idempotency as claims
 from .store import runs as run_store
 from .store import sources as source_store
 from .store import tasks as task_store
+from .store import writes
 
 TITLE_CHARS = 80
 START_LOCK = "task-start"
@@ -44,6 +50,15 @@ POLLER_LATER = "the poller starts it when a slot frees"
 RESUMABLE = ("interrupted", "stopped", "failed")
 MAX_ANSWER_CHARS = 20000
 TICKET_CLOSED = "its ticket closed while it waited for an answer"
+PENDING = {}
+PENDING_LOCK = threading.RLock()
+PENDING_SWEEP_SECONDS = 1
+PENDING_REAPER = None
+
+
+class AlreadyResolved(control.Refused):
+    status = 409
+    code = "already_resolved"
 
 
 def title_of(prompt: str) -> str:
@@ -66,7 +81,7 @@ def repo_named(cfg: config.Config, name: str) -> config.Repo:
 
 
 def start(repo_name: str, prompt: str = "", title: str = "", kind: str = "", ticket: str = "",
-          force: bool = True) -> dict:
+          force: bool = True, claim=None) -> dict:
     prompt, ticket = prompt.strip(), ticket.strip()
     if not prompt and not ticket:
         raise control.Refused("Give a prompt to add a task and start it, or a ticket to start one that exists.")
@@ -79,15 +94,19 @@ def start(repo_name: str, prompt: str = "", title: str = "", kind: str = "", tic
     if kind not in ("", *config.KINDS):
         raise control.Refused(f"The kind is {' or '.join(config.KINDS)}, not '{kind}'.")
     if ticket:
-        return start_ticket(cfg, repo, ticket, force)
-    tid = task_store.task_add(repo.name, prompt, title.strip() or title_of(prompt), kind or "feat")
+        return start_ticket(cfg, repo, ticket, force, claim=claim)
+    tid = task_store.task_add(repo.name, prompt, title.strip() or title_of(prompt), kind or "feat", claim=claim)
+    return begin_prompt(cfg, repo, tid)
+
+
+def begin_prompt(cfg, repo, tid):
     if waits := tracker.LocalTracker(repo).blocker(tid):
         return answer(tid, repo.name, "", "queued", f"{waits}; " + ("the poller starts it once the wait ends"
                                                                     if repo.pipeline else "send its ticket to start it"))
     return begin(cfg, repo, tid, force=False, poller_picks=repo.pipeline)
 
 
-def start_ticket(cfg: config.Config, repo: config.Repo, ticket: str, force: bool = True) -> dict:
+def start_ticket(cfg: config.Config, repo: config.Repo, ticket: str, force: bool = True, claim=None) -> dict:
     try:
         tid = tracker.for_ticket(cfg, repo, ticket).normalize(ticket)
     except ValueError as e:
@@ -99,7 +118,22 @@ def start_ticket(cfg: config.Config, repo: config.Repo, ticket: str, force: bool
             raise control.Refused(f"{tid} is a task of {row['repo']}, not {repo.name}")
         if row["state"] in config.TASK_FINISHED:
             raise control.Refused(f"task {tid} is {row['state']}, so it does not start again; add a new task")
+    if claim:
+        with writes.atomic():
+            seq = events.emit("task.start_requested", f"task:{tid}", cls="derived", task=tid,
+                              data={"repo": repo.name, "ticket": tid})
+            claims.claim(claim, seq)
     return begin(cfg, repo, tid, force=force, poller_picks=False)
+
+
+def recover_start(claim, force=True):
+    name, tid, prompt = claims.target(claim)
+    cfg = config.load()
+    repo = repo_named(cfg, name)
+    if rows := run_store.ticket_runs(name, tid, limit=1):
+        row = rows[0]
+        return answer(tid, name, row["id"], row["status"], "recovered task start")
+    return begin_prompt(cfg, repo, tid) if prompt else begin(cfg, repo, tid, force, False)
 
 
 def live_run(repo: str, tid: str) -> dict | None:
@@ -124,7 +158,9 @@ def queued(repo: config.Repo, tid: str, why: str, poller_picks: bool) -> dict:
 
 
 def begin(cfg: config.Config, repo: config.Repo, tid: str, force: bool, poller_picks: bool) -> dict:
-    with util.lock(START_LOCK, wait=True):
+    with PENDING_LOCK, util.lock(START_LOCK, wait=True):
+        if pending := pending_start(repo.name, tid):
+            return pending
         if run := live_run(repo.name, tid):
             return answer(tid, repo.name, run["id"], "running", "already running")
         if why := held(cfg, repo):
@@ -133,25 +169,84 @@ def begin(cfg: config.Config, repo: config.Repo, tid: str, force: bool, poller_p
                                      runlimits.Policy.of(config.load_layer(repo.layer_dir)), force)
         if why:
             raise control.Refused(why)
-        if new := spawned(repo.name, tid, lambda: pipeline.spawn_run(repo.name, tid, force)):
-            return answer(tid, repo.name, new, "running", "started")
+        new, state = spawned(repo.name, tid, lambda: pipeline.spawn_run(repo.name, tid, force))
+        if state != "exited":
+            return answer(tid, repo.name, new, state, "started" if new else "child is starting")
         if why := held(cfg, repo):
             return queued(repo, tid, why, poller_picks)
     raise did_not_show(repo, tid)
 
 
-def spawned(repo_name: str, tid: str, spawn: Callable[[], subprocess.Popen]) -> str:
-    before = set(run_ids(repo_name, tid))
-    proc = spawn()
+def pending_start(repo_name, tid):
+    run, state = pending_state(repo_name, tid)
+    if state in ("running", "starting"):
+        return answer(tid, repo_name, run, state, "started" if run else "child is starting")
+    return None
+
+
+def pending_state(repo_name: str, tid: str) -> tuple[str, str]:
+    with PENDING_LOCK:
+        identity = repo_name, tid
+        if identity in PENDING:
+            proc, before = PENDING[identity]
+            exited = proc.poll() is not None
+            row = next((r for r in run_store.ticket_runs(repo_name, tid) if r["id"] not in before), None)
+            if row or exited:
+                del PENDING[identity]
+                return (row["id"], row["status"]) if row else ("", "exited")
+            return "", "starting"
+        return "", "starting" if launch_lease.held(repo_name, tid) else "exited"
+
+
+def prune_pending() -> None:
+    with PENDING_LOCK:
+        for (repo, tid), (proc, before) in list(PENDING.items()):
+            if proc.poll() is not None:
+                del PENDING[repo, tid]
+                continue
+            try:
+                if any(r["id"] not in before for r in run_store.ticket_runs(repo, tid)):
+                    del PENDING[repo, tid]
+            except (OSError, sqlite3.Error, foundation.NoDatabase, foundation.IncompatibleSchema):
+                # A temporarily unavailable database is not proof of exit.
+                continue
+
+
+def reap_pending() -> None:
+    global PENDING_REAPER
+
+    while True:
+        time.sleep(PENDING_SWEEP_SECONDS)
+        prune_pending()
+        with PENDING_LOCK:
+            if not PENDING:
+                PENDING_REAPER = None
+                return
+
+
+def spawn_pending(repo_name: str, tid: str, spawn: Callable[[], subprocess.Popen]) -> subprocess.Popen:
+    global PENDING_REAPER
+
+    with PENDING_LOCK, launch_lease.acquiring(repo_name, tid) as lease:
+        before = set(run_ids(repo_name, tid))
+        proc = spawn()
+        if not lease.passed:
+            raise RuntimeError("task launch must inherit its lease through control.launch")
+        PENDING[repo_name, tid] = proc, before
+        if PENDING_REAPER is None:
+            PENDING_REAPER = threading.Thread(target=reap_pending, name="pending-starts", daemon=True)
+            PENDING_REAPER.start()
+        return proc
+
+
+def spawned(repo_name: str, tid: str, spawn: Callable[[], subprocess.Popen]) -> tuple[str, str]:
+    spawn_pending(repo_name, tid, spawn)
     give_up = time.monotonic() + pipeline.RUN_START_SECONDS
-    while time.monotonic() < give_up:
-        exited = proc.poll() is not None
-        if new := next((r for r in run_ids(repo_name, tid) if r not in before), ""):
-            return new
-        if exited:
-            break
+    while True:
+        run, state = pending_state(repo_name, tid)
+        if state != "starting" or time.monotonic() >= give_up:
+            return run, state
         time.sleep(0.1)
-    return ""
 
 
 def did_not_show(repo: config.Repo, tid: str) -> control.Refused:
@@ -170,11 +265,20 @@ def free_to_start(cfg: config.Config, repo: config.Repo, tid: str, after: str = 
         raise control.Refused(why)
 
 
-def launch(cfg: config.Config, repo: config.Repo, tid: str, command: list[str], ahead: bool = False) -> dict:
-    with util.lock(START_LOCK, wait=True):
+def launch(cfg: config.Config, repo: config.Repo, tid: str, command: list[str], ahead: bool = False,
+           admission=None) -> dict:
+    def admitted_spawn():
+        if admission and not writes.check_run(*admission, public=True):
+            raise control.NotFound(f"no run {admission[0]}")
+        return control.launch(command, pipeline.RUNS_LOG)
+
+    with PENDING_LOCK, util.lock(START_LOCK, wait=True):
+        if pending := pending_start(repo.name, tid):
+            return pending
         free_to_start(cfg, repo, tid, ahead=ahead)
-        if new := spawned(repo.name, tid, lambda: control.launch(command, pipeline.RUNS_LOG)):
-            return answer(tid, repo.name, new, "running", "started")
+        new, state = spawned(repo.name, tid, admitted_spawn)
+        if state != "exited":
+            return answer(tid, repo.name, new, state, "started" if new else "child is starting")
     raise did_not_show(repo, tid)
 
 
@@ -191,6 +295,14 @@ def run_of(run_id: str) -> tuple[config.Config, config.Repo, dict]:
                               f"{paths.short_path(paths.CONFIG_FILE)}") from None
 
 
+def command_run(run_id, base_version):
+    writes.check_run(run_id, base_version, public=True)
+    cfg, repo, row = run_of(run_id)
+    if base_version is not None and row["version"] != base_version:
+        raise writes.VersionConflict(row)
+    return cfg, repo, row
+
+
 def no_later_run(row: dict) -> None:
     if later := run_store.later_run(row["repo"], row["issue"], row["id"]):
         raise control.Refused(f"run {row['id']} is not the ticket's latest run: run {later['id']} "
@@ -204,8 +316,8 @@ def step_named(step: str) -> str:
 
 
 def script_path(row: dict) -> str:
-    return next((str(path) for read in factory.chain(row["id"]) if (path := factory.first(read, "task").get("path"))),
-                "")
+    path = pipeline.recorded_path(row["id"])
+    return "" if path == "classic" else path
 
 
 def command_of(cfg: config.Config, name: str, *args: str) -> list[str]:
@@ -222,11 +334,14 @@ def reply(run_id: str, text: str) -> dict:
         raise control.Refused(f"the answer is {len(text)} characters; the most is {MAX_ANSWER_CHARS}")
     with util.lock(STEER_LOCK, wait=True):
         cfg, repo, row = run_of(run_id)
+        waiting = ask_store.asks_of(run_id, "open")
+        if not waiting and ask_store.asks_of(run_id):
+            raise AlreadyResolved(f"run {run_id}'s asks were already resolved, so this answer was not stored")
         if row["status"] != "needs-info":
             raise control.Refused(f"run {run_id} is {row['status']}, so it has no question to answer")
         no_later_run(row)
         tid = str(row["issue"])
-        if waiting := ask_store.asks_of(run_id, "open"):
+        if waiting:
             return reply_to_asks(cfg, repo, row, waiting, text)
         free_to_start(cfg, repo, tid, "; the answer was not stored")
         kept = store_answer(cfg, repo, tid, text)
@@ -256,9 +371,19 @@ def reply_to_asks(cfg: config.Config, repo: config.Repo, row: dict, waiting: lis
     tid = str(row["issue"])
     free_to_start(cfg, repo, tid, "; the answer was not stored", ahead=True)
     command = continuing(cfg, repo, row)
+    # Admission can resolve an ask. Check again before posting, and leave asks
+    # open until persistence succeeds so the poller cannot consume a failed reply.
+    with foundation.reader():
+        for a in waiting:
+            current = ask_store.ask_get(a["id"])
+            if not current or current["status"] != "open":
+                raise AlreadyResolved(f"ask {a['id']} was already resolved, so this answer was not stored")
     kept = store_answer(cfg, repo, tid, text)
-    for a in waiting:
-        ask_store.ask_close(a["id"], "answered", owner_asks.text_answers(a, text))
+    with writes.atomic():
+        for a in waiting:
+            if not ask_store.ask_close(a["id"], "answered", owner_asks.text_answers(a, text)):
+                raise AlreadyResolved(f"ask {a['id']} was already resolved; the answer was stored as a comment, "
+                                      "but this reply did not update the asks or resume the run")
     started = continue_asked(cfg, repo, row, command)
     return {**started, "why": f"{started['why']}; {kept}"} if kept else started
 
@@ -274,7 +399,7 @@ def answer_ask(ask_id: str, body) -> dict:
         if not ask:
             raise control.NotFound(f"no ask {ask_id}")
         if ask["status"] != "open":
-            raise control.Refused(f"ask {ask_id} is {ask['status']}, so it takes no answer{answers_held(ask)}")
+            raise AlreadyResolved(f"ask {ask_id} is {ask['status']}, so it takes no answer{answers_held(ask)}")
         cfg, repo, row = run_of(ask["run"])
         if row["status"] != "needs-info":
             raise control.Refused(f"run {row['id']} is {row['status']}, so ask {ask_id} takes no answer")
@@ -301,7 +426,7 @@ def answer_ask(ask_id: str, body) -> dict:
         except OSError as e:
             raise control.Refused(f"could not store {', '.join(given)} ({e.strerror}); the ask stays open") from None
         if not ask_store.ask_close(ask_id, "answered", answers):
-            raise control.Refused(f"ask {ask_id} was answered from the tracker a moment ago, so this answer was not stored")
+            raise AlreadyResolved(f"ask {ask_id} was answered from the tracker a moment ago, so this answer was not stored")
         if more := ask_store.asks_of(row["id"], "open"):
             return answer(tid, repo.name, "", "waiting",
                           f"{util.count(len(more), 'more ask')} of run {row['id']} wait for an answer")
@@ -348,8 +473,10 @@ def continuing(cfg: config.Config, repo: config.Repo, row: dict) -> list[str]:
     return command_of(cfg, path, repo.name, tid, "--force", "--continue", row["id"])
 
 
-def continue_asked(cfg: config.Config, repo: config.Repo, row: dict, command: list[str] | None = None) -> dict:
-    return launch(cfg, repo, str(row["issue"]), command or continuing(cfg, repo, row), ahead=True)
+def continue_asked(cfg: config.Config, repo: config.Repo, row: dict, command: list[str] | None = None,
+                   admission=None) -> dict:
+    return launch(cfg, repo, str(row["issue"]), command or continuing(cfg, repo, row), ahead=True,
+                  admission=admission)
 
 
 def kept_folder_removed(repo: config.Repo, tid: str, run_id: str) -> bool:
@@ -438,27 +565,37 @@ def release_closed(cfg: config.Config) -> list[str]:
     return notes
 
 
-def resume(run_id: str, step: str = "") -> dict:
+def resume(run_id: str, step: str = "", base_version=None) -> dict:
     with util.lock(STEER_LOCK, wait=True):
-        cfg, repo, row = run_of(run_id)
+        cfg, repo, row = command_run(run_id, base_version)
         if row.get("files_purged"):
             raise control.Refused(f"run {run_id} files were removed on {row['files_purged']}; "
                                   "start the ticket again with POST /api/tasks")
         if row["status"] == "running":
             with record.dead(row) as gone:
-                if gone and (settled := record.interrupt(row)):
-                    pipeline.tell_ticket_run_died(cfg, settled)
+                if gone:
+                    with events.collect_receipts() as recovered:
+                        if settled := record.interrupt(row, base_version=base_version):
+                            pipeline.tell_ticket_run_died(cfg, settled)
+                    if base_version is not None:
+                        base_version += sum(subject == f"run:{run_id}" for _, subject, _ in recovered)
             row = run_store.run_get(run_id) or row
         if row["status"] == "running":
             raise control.Refused(f"run {run_id} is running; stop it first")
         if parked_with_answers(row):
-            return continue_asked(cfg, repo, row)
+            return continue_asked(cfg, repo, row, admission=(run_id, base_version))
         if row.get("only_step"):
             raise control.Refused(f"run {run_id} ran {row['only_step']} alone; resume the run it continued")
         if row["status"] not in RESUMABLE:
             raise control.Refused(f"run {run_id} ended {row['status']}; a run resumes only when it ended "
                                   f"{', '.join(RESUMABLE[:-1])} or {RESUMABLE[-1]}")
         no_later_run(row)
+        if script_path(row) == "orchestrate":
+            if step:
+                adaptive_action(row, step)
+            return launch(cfg, repo, str(row["issue"]), command_of(
+                cfg, "orchestrate", repo.name, str(row["issue"]), "--force", "--continue", run_id,
+                *(["--action", step] if step else [])), admission=(run_id, base_version))
         if step and step_named(step) and not factory.started(run_id, step):
             raise control.Refused(f"run {run_id} never started {step}, so it cannot resume from it")
         if not (path := script_path(row)) and flows.ran_on_seam(run_id):
@@ -471,12 +608,13 @@ def resume(run_id: str, step: str = "") -> dict:
             step = next((str(line.get("step") or "") for line in reversed(factory.history(factory.chain(run_id)))
                          if line.get("result") != "pass"), "")
         return launch(cfg, repo, tid, command_of(cfg, path, repo.name, tid, "--force", "--continue", run_id,
-                                                 *(["--from", step] if step else [])))
+                                                 *(["--from", step] if step else [])),
+                      admission=(run_id, base_version))
 
 
-def repair(run_id: str) -> dict:
+def repair(run_id: str, base_version=None) -> dict:
     with util.lock(STEER_LOCK, wait=True):
-        cfg, repo, row = run_of(run_id)
+        cfg, repo, row = command_run(run_id, base_version)
         tid = str(row["issue"])
         if (later := run_store.later_run(row["repo"], row["issue"], run_id)) and pipeline.repaired_by(later["id"]) == run_id:
             return answer(tid, repo.name, later["id"], later["status"],
@@ -489,18 +627,43 @@ def repair(run_id: str) -> dict:
             repairs.open_heads(repo, found)
         except repairs.Refused as e:
             raise control.Refused(str(e)) from None
-        if refusal := pipeline.script_refusal(cfg, repo, tid, pipeline.Script("repair", None, repairs=run_id)):
+        path = "orchestrate" if script_path(row) == "orchestrate" else "repair"
+        if refusal := pipeline.script_refusal(cfg, repo, tid, pipeline.Script(path, None, repairs=run_id)):
             raise control.Refused(refusal)
-        return launch(cfg, repo, tid, command_of(cfg, "repair", repo.name, tid, "--force", "--repair", run_id))
+        return launch(cfg, repo, tid, command_of(cfg, path, repo.name, tid, "--force", "--repair", run_id),
+                      admission=(run_id, base_version))
 
 
-def run_step(run_id: str, step: str, sets) -> dict:
+def adaptive_action(row: dict, action: str) -> dict:
+    from .store import orchestration
+
+    source = orchestration.find(row["id"])
+    if source:
+        lease = orchestration.Lease(source["root"], source["current_run"], source["generation"])
+        found = next((a for a in orchestration.actions(lease) if a["id"] == action), None)
+        if found and found["op"] in ("worker.start", "worker.continue", "checks.run", "verification.run", "review.run"):
+            return found
+    raise control.Refused("adaptive controls require a worker/check/review/verification action ID from run details, "
+                          "not a phase name or publication action")
+
+
+def run_step(run_id: str, step: str, sets, base_version=None) -> dict:
     with util.lock(STEER_LOCK, wait=True):
-        cfg, repo, row = run_of(run_id)
+        cfg, repo, row = command_run(run_id, base_version)
         if row["status"] == "running":
             raise control.Refused(f"run {run_id} is running; a step runs alone only on a run that ended")
         if not (path := script_path(row)):
             raise control.Refused(f"run {run_id} did not run from a script in adws/, so a step cannot run alone on it")
+        if path == "orchestrate":
+            no_later_run(row)
+            adaptive_action(row, step)
+            if why := flows.action_workspace_refusal(run_id):
+                raise control.Refused(why)
+            if sets:
+                raise control.Refused("adaptive action reruns keep their accepted settings; select new settings through a resumed controller")
+            return launch(cfg, repo, str(row["issue"]), command_of(
+                cfg, "orchestrate", repo.name, str(row["issue"]), "--force", "--continue", run_id,
+                "--action", step, "--only-action"), admission=(run_id, base_version))
         step_named(step)
         if not factory.started(run_id, step):
             raise control.Refused(f"run {run_id} never started {step}, so it cannot run it alone")
@@ -520,7 +683,7 @@ def run_step(run_id: str, step: str, sets) -> dict:
         if gone := removed_tree(run_id, step):
             raise control.Refused(f"run {run_id} ended {row['status']} and removed its work folder {gone}, so a step "
                                   "cannot run alone on it")
-        return launch(cfg, repo, tid, command_of(cfg, "step", run_id, step, *settings))
+        return launch(cfg, repo, tid, command_of(cfg, "step", run_id, step, *settings), admission=(run_id, base_version))
 
 
 def removed_tree(run_id: str, step: str) -> str:
@@ -535,6 +698,10 @@ def removed_tree(run_id: str, step: str) -> str:
 
 def last_report(run_id: str) -> dict:
     return next((line for line in reversed(run_lines.read(run_id)) if line.get("event") == run_lines.END), {})
+
+
+def task_summaries() -> list[dict]:
+    return task_store.task_summaries(connect=foundation.reader)
 
 
 def view(task_id: str, repo_name: str = "") -> dict:

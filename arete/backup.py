@@ -279,7 +279,10 @@ def daily_copy(snapshot_file: Path, copy_to: str, submit=None):
             return None
         COPYING.add(day)
         IN_FLIGHT.add(snapshot_file)
-    job = (lambda: run_copy(snapshot_file, copy_to, day))
+
+    def job():
+        return run_copy(snapshot_file, copy_to, day)
+
     try:
         return submit(job) if submit else job()
     except BaseException:

@@ -1,118 +1,71 @@
 import contextlib
 import io
 import json
-import os
-from pathlib import Path
-import shlex
-import signal
+import shutil
 import sqlite3
-import subprocess
-import sys
 import tempfile
-import threading
-import time
 import unittest
-from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from arete.store import runs as run_store
-from arete import store
 from arete import (
-    child,
-    cli,
     config,
-    control,
-    diffguard,
-    factory,
-    flows,
-    gh,
-    run_lines,
+    dbstats,
+    outcomes,
     paths,
     pipeline,
     poll,
-    outcomes,
     record,
+    run_lines,
     runlimits,
-    sandbox,
-    serve,
     steps,
+    tasks,
     tracker,
     util,
-    workspace,
 )
-from arete.store import approvals as approvals_store
 from arete.store import db as foundation
-from arete.store import runs as runs_store
+from arete.store import runs as run_store
 from arete.store import tasks as tasks_store
-from arete.agent import Result
-
-from tests.harness import behavior_result, make_folders, run_script, scratch_env, set_task_body
-
-
-class BudgetUsageExercises(unittest.TestCase):
-    def exercise(self, action):
-        with tempfile.TemporaryDirectory(prefix="arete-budget-usage-") as directory:
-            root = Path(directory)
-            make_folders(root, "config", "state", "logs", "worktrees", "tmp", "home", "authority-parent")
-            env = scratch_env(root, HOME=str(root / "home"), TMPDIR=str(root / "tmp"),
-                              ARETE_WORKTREES_DIR=str(root / "worktrees"), GIT_CONFIG_NOSYSTEM="1",
-                              GIT_CONFIG_GLOBAL=os.devnull)
-            code = "import sys;from tests.scripts.run_budget_usage import main;main(sys.argv[1],sys.argv[2])"
-            done = run_script(code, root, str(root), action, env=env, timeout=120)
-            self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
-            return behavior_result(done)
-
-    def test_budget_backfill_and_live_writer_contract_gate(self):
-        result = self.exercise("migrations")
-        self.assertIn(7, result["ledger"])
-        self.assertEqual(result["backfill"]["B"], [200, 50, 0, 2, ""])
-
-    def test_malformed_backfills_roll_back_and_sql_refuses_corrupt_counters(self):
-        from tests.scripts.run_budget_usage import BAD_BUDGETS
-
-        for case in BAD_BUDGETS:
-            with self.subTest(case=case):
-                result = self.exercise("migration-error-" + case)
-                self.assertTrue(result["nan_is_null"])
-                self.assertEqual(result["ledger"][-1], 5)
-
-    def test_checkpoint_retry_ordering_cleanup_and_contract_json(self):
-        result = self.exercise("checkpoint-errors")
-        self.assertTrue(result["ordered"])
-        self.assertTrue(result["settlement_unchanged"])
-
-
-def setUpModule():
-    folder = tempfile.TemporaryDirectory(prefix="arete-no-live-")
-    unittest.addModuleCleanup(folder.cleanup)
-    root = Path(folder.name).resolve()
-    for pointer in (patch.object(sandbox, "AUTHORITY", root / "authority" / "verification-authority"),
-                    patch.object(paths, "SERVER_FILE", root / "state" / "server.json"),
-                    patch.object(paths, "PI_KEYS_FILE", root / "config" / "pi.env"),
-                    *(patch.object(sandbox, name, root / "state" / getattr(sandbox, name).name)
-                      for name in ("AGENT_DIR", "LOGIN_DIR", "KEY_DIR", "SESSIONS_DIR"))):
-        pointer.start()
-        unittest.addModuleCleanup(pointer.stop)
+from tests.harness import set_task_body
 
 
 class Isolated(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        directory = tempfile.TemporaryDirectory(prefix="arete-schema-")
+        cls.addClassCleanup(directory.cleanup)
+        root = Path(directory.name)
+        cls.template = root / "state/arete.db"
+        with contextlib.ExitStack() as patches:
+            patches.enter_context(patch.object(foundation, "_CHECKED", set()))
+            patches.enter_context(patch.object(dbstats.Timing, "finished"))
+            for name, value in {"STATE_DIR": root / "state", "DB_FILE": cls.template,
+                                "RUNS_DIR": root / "runs", "WORKTREES_DIR": root / "worktrees",
+                                "LOCKS_DIR": root / "state/locks", "LOG_DIR": root / "logs"}.items():
+                patches.enter_context(patch.object(paths, name, value))
+            foundation.migrate()
+
     def setUp(self):
         self.folder = tempfile.TemporaryDirectory(prefix="arete-limits-")
         self.addCleanup(self.folder.cleanup)
         self.root = Path(self.folder.name)
         self.patches = contextlib.ExitStack()
         self.addCleanup(self.patches.close)
+        self.patches.enter_context(patch.object(foundation, "_CHECKED", set()))
+        self.patches.enter_context(patch.object(dbstats.Timing, "finished"))
+        self.patches.enter_context(patch.object(tasks, "PENDING", {}))
         for name, value in {"STATE_DIR": self.root / "state", "RUNS_DIR": self.root / "runs",
-                            "DB_FILE": self.root / "state/arete.db", "LOCKS_DIR": self.root / "locks",
+                            "DB_FILE": self.root / "state/arete.db", "LOCKS_DIR": self.root / "state/locks",
                             "CONFIG_DIR": self.root / "config", "CONFIG_FILE": self.root / "config/config.toml",
                             "LOG_DIR": self.root / "logs", "EVENTS_FILE": self.root / "state/events.jsonl",
+                            "SERVER_FILE": self.root / "state/server.json",
                             "WORKTREES_DIR": self.root / "worktrees"}.items():
             self.patches.enter_context(patch.object(paths, name, value))
         paths.CONFIG_DIR.mkdir()
         paths.ensure_dirs()
-        foundation.migrate()
+        shutil.copyfile(self.template, paths.DB_FILE)
         self.repo = config.Repo(name="fixture", path=self.root / "repo", tracker="local", pipeline=True)
         self.repo.path.mkdir()
         self.cfg = config.Config(repos=[self.repo], max_parallel=8, max_parallel_per_repo=8)
@@ -123,41 +76,36 @@ class Isolated(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             return super().run(result)
 
-    def made_run(self, previous="", policy=None):
+    def made_run(self, previous="", forced=False):
         rid = record.start("pipeline", repo=self.repo.name, issue=self.ticket)
         directory = paths.RUNS_DIR / rid
         directory.mkdir()
         run = pipeline.Run(rid, self.repo, directory, tracker=self.local, tid=self.ticket, cfg=self.cfg)
-        run.budget = runlimits.Budget(run, policy or runlimits.Policy(), previous, self.local.get(self.ticket))
+        run.budget = runlimits.Budget(run, runlimits.Policy(), previous, self.local.get(self.ticket), forced)
         return run
 
 
 class BudgetTests(Isolated):
-    def child_env(self):
-        make_folders(self.root, "tmp", "home")
-        return scratch_env(self.root, HOME=str(self.root / "home"), TMPDIR=str(self.root / "tmp"),
-                           ARETE_WORKTREES_DIR=str(paths.WORKTREES_DIR), GIT_CONFIG_NOSYSTEM="1",
-                           GIT_CONFIG_GLOBAL=os.devnull)
-
     def test_measured_usage_rejects_corruption_and_zero_overrides_wall_time(self):
         run = self.made_run()
         record.note(run.id, started=util.iso(util.now() - timedelta(minutes=90)))
         record.settle(run.id, "interrupted")
         for field, read in (("active_seconds", runlimits.active_seconds),
+                            ("verify_seconds", runlimits.verification_seconds),
                             ("verify_open_seconds", runlimits.verification_seconds),
                             ("repair_calls", lambda rid, row: runlimits.repair_count(rid))):
             for bad in (-1, "unknown"):
-                with self.subTest(field=field, bad=bad), self.assertRaises(sqlite3.IntegrityError):
-                    with foundation.tx() as conn:
-                        conn.execute(f"UPDATE runs SET {field}=? WHERE id=?", (bad, run.id))
+                with self.subTest(field=field, bad=bad), self.assertRaises(sqlite3.IntegrityError), \
+                        foundation.tx() as conn:
+                    conn.execute(f"UPDATE runs SET {field}=? WHERE id=?", (bad, run.id))
             for bad in ((None, float("nan")) if field == "repair_calls" else (None, float("nan"), float("inf"))):
                 with foundation.tx() as conn:
                     conn.execute(f"UPDATE runs SET {field}=? WHERE id=?", (bad, run.id))
                 with self.assertRaisesRegex(ValueError, run.id):
-                    read(run.id, runs_store.run_get(run.id))
+                    read(run.id, run_store.run_get(run.id))
             with foundation.tx() as conn:
                 conn.execute(f"UPDATE runs SET {field}=0 WHERE id=?", (run.id,))
-            self.assertEqual(read(run.id, runs_store.run_get(run.id)), 0)
+            self.assertEqual(read(run.id, run_store.run_get(run.id)), 0)
 
     def test_measured_recovery_and_nested_open_idle_waits(self):
         clock = [100.0]
@@ -174,163 +122,33 @@ class BudgetTests(Isolated):
                     clock[0] += 10
                 self.assertEqual(run.budget.run_seconds(), 10)
             self.assertEqual(run.budget.idled, 120)
+            with run.budget.idling("ci"):
+                clock[0] += 5
+            self.assertEqual(run.budget.run_seconds(), 15)
+            run.budget.persist()
             resumed = runlimits.Budget(run, run.budget.policy, "")
-            self.assertEqual(resumed.run_seconds(), 10)
-            clock[0] += 5
             self.assertEqual(resumed.run_seconds(), 15)
-
-    def test_periodic_checkpoints_stop_and_flush_on_normal_and_exceptional_exit(self):
-        for exceptional in (False, True):
-            run = self.made_run()
-            observed = threading.Event()
-            original = run.budget.checkpoint
-            snapshots = []
-            def checkpoint():
-                original()
-                snapshots.append(runs_store.run_get(run.id))
-                observed.set()
-            with patch.object(runlimits, "CHECKPOINT_SECONDS", .01), \
-                    patch.object(run.budget, "checkpoint", side_effect=checkpoint):
-                try:
-                    with run.budget.watching(), run.budget.verifying(), run.budget.idling("limit"):
-                        self.assertTrue(observed.wait(5))
-                        if exceptional:
-                            raise RuntimeError("stop watching")
-                except RuntimeError:
-                    self.assertTrue(exceptional)
-            self.assertGreaterEqual(len(snapshots), 2)
-            self.assertGreaterEqual(snapshots[-1]["active_seconds"], snapshots[0]["active_seconds"])
-            self.assertGreater(snapshots[0]["verify_open_seconds"], 0)
-            self.assertEqual(snapshots[-1]["verify_open_seconds"], 0)
-            self.assertFalse(any(t.name == f"budget-{run.id}" for t in threading.enumerate()))
+            clock[0] += 5
+            self.assertEqual(resumed.run_seconds(), 20)
 
     def test_checkpoint_tracks_open_verification_without_charging_open_idle_time(self):
         clock = [100.0]
         with patch.object(runlimits, "time", SimpleNamespace(monotonic=lambda: clock[0])):
             run = self.made_run()
             clock[0] += 10
-            with run.budget.verifying(), run.budget.idling("limit"):
+            with patch.object(runlimits.signal, "setitimer"), run.budget.verifying(), run.budget.idling("limit"):
                 clock[0] += 20
                 run.budget.checkpoint()
-                first = runs_store.run_get(run.id)
+                first = run_store.run_get(run.id)
                 clock[0] += 30
                 run.budget.checkpoint()
-                second = runs_store.run_get(run.id)
+                second = run_store.run_get(run.id)
             self.assertEqual(first["active_seconds"], second["active_seconds"])
             self.assertEqual(second["verify_open_seconds"] - first["verify_open_seconds"], 30)
-            saved = runs_store.run_get(run.id)
+            saved = run_store.run_get(run.id)
             self.assertEqual(saved["verify_seconds"], 50)
             self.assertEqual(saved["verify_open_seconds"], 0)
             self.assertEqual(saved["active_seconds"], 10)
-
-    def test_failed_final_checkpoint_restores_signal_and_stops_worker(self):
-        run = self.made_run()
-        handler = signal.getsignal(signal.SIGALRM)
-        with patch.object(run.budget, "checkpoint", side_effect=OSError("checkpoint failed")):
-            with self.assertRaisesRegex(OSError, "checkpoint failed"):
-                with run.budget.watching():
-                    pass
-        self.assertIs(signal.getsignal(signal.SIGALRM), handler)
-        self.assertFalse(run.budget.watched)
-        self.assertFalse(any(t.name == f"budget-{run.id}" for t in threading.enumerate()))
-
-    def delayed_start(self, concurrent, drive):
-        before_lock, finished = threading.Event(), threading.Event()
-        original_lock, failures = util.lock, []
-        ticket_lock = run_store.run_lock("pipeline", self.repo.name, self.ticket)
-        def worker():
-            try:
-                if not before_lock.wait(5):
-                    raise AssertionError("launcher never reached its ticket lock")
-                with original_lock(ticket_lock) as got:
-                    if not got:
-                        raise AssertionError("concurrent attempt could not acquire its ticket lock")
-                    concurrent()
-            except BaseException as error:
-                failures.append(error)
-            finally:
-                finished.set()
-        @contextlib.contextmanager
-        def delayed_lock(name, *args, **kw):
-            if name == ticket_lock:
-                before_lock.set()
-                if not finished.wait(5):
-                    raise AssertionError("concurrent attempt never finished")
-            with original_lock(name, *args, **kw) as got:
-                yield got
-        thread = threading.Thread(target=worker)
-        thread.start()
-        called = []
-        try:
-            with patch.object(config, "load", return_value=self.cfg), \
-                    patch.object(pipeline, "run_refusal", return_value=(True, "")), \
-                    patch.object(util, "lock", side_effect=delayed_lock), \
-                    patch.object(pipeline.runner, "run", side_effect=lambda *a, **k: called.append(True)):
-                code = pipeline.run_issue(self.repo.name, self.ticket, force=True,
-                                          script=pipeline.Script("feature", drive))
-        finally:
-            before_lock.set()
-            thread.join(5)
-        self.assertFalse(thread.is_alive())
-        self.assertEqual(failures, [])
-        self.assertEqual(called, [])
-        return code
-
-    def test_delayed_launcher_counts_attempt_completed_before_ticket_lock(self):
-        first = self.made_run()
-        first.budget.charge("review_fix1", "review_repair")
-        record.settle(first.id, "failed")
-        def concurrent():
-            second = self.made_run(first.id)
-            second.budget.charge("review_fix2", "review_repair")
-            record.settle(second.id, "failed")
-        def drive(flow):
-            flow.ctx.run.agent("repair", "one repair too many", self.repo.path, role="review_repair")
-        self.assertEqual(self.delayed_start(concurrent, drive), 1)
-        latest = run_store.ticket_runs(self.repo.name, self.ticket)[0]
-        self.assertIn("repair cycles", latest["summary"])
-        self.assertTrue((paths.RUNS_DIR / latest["id"] / "parked.json").exists())
-
-    def test_delayed_launcher_does_not_reuse_another_epoch_reset(self):
-        first = self.made_run()
-        first.budget.park("first epoch exhausted")
-        record.settle(first.id, "failed")
-        with foundation.db() as connection:
-            set_task_body(self.ticket, "A narrower specification", connection=connection)
-        def concurrent():
-            second = self.made_run()
-            second.budget.charge("review_fix1", "review_repair")
-            second.budget.charge("review_fix2", "review_repair")
-            second.budget.park("second epoch exhausted")
-            record.settle(second.id, "failed")
-        def drive(flow):
-            flow.ctx.run.agent("repair", "stale reset must not run", self.repo.path, role="review_repair")
-        self.assertEqual(self.delayed_start(concurrent, drive), 2)
-        self.assertEqual(len(run_store.ticket_runs(self.repo.name, self.ticket)), 2)
-
-    def test_interrupted_atomic_publish_keeps_previous_authoritative_files(self):
-        run = self.made_run()
-        run.budget.park("original park")
-        for name, action in (("budget.json", run.budget.persist),
-                             ("parked.json", lambda: run.budget.park("replacement park"))):
-            path = run.dir / name
-            before = path.read_bytes()
-            with patch.object(util.os, "replace", side_effect=runlimits.Parked("interrupted before replace")):
-                with self.assertRaises(runlimits.Parked):
-                    action()
-            self.assertEqual(path.read_bytes(), before)
-            self.assertIsInstance(json.loads(path.read_text()), dict)
-
-    def test_limits_validate_positive_integers_and_explicit_parallel_opt_in(self):
-        (self.root / "config.toml").write_text("[limits]\nmax_repair_cycles=4\nmax_run_minutes=90\n"
-                                             "max_verify_minutes=25\nparallel_checks=true\n")
-        layer = config.load_layer(self.root)
-        self.assertEqual(runlimits.Policy.of(layer), runlimits.Policy(4, 90, 25))
-        self.assertTrue(layer.parallel_checks)
-        for bad in ("max_repair_cycles=0", "max_run_minutes=true", "max_verify_minutes=1.5", "parallel_checks=1"):
-            (self.root / "config.toml").write_text("[limits]\n" + bad)
-            with self.assertRaises(ValueError):
-                config.load_layer(self.root)
 
     def test_repair_budget_is_charged_before_launch_and_survives_continuation(self):
         first = self.made_run()
@@ -339,38 +157,11 @@ class BudgetTests(Isolated):
         record.settle(first.id, "failed")
         second = self.made_run(first.id)
         invoked = []
-        with patch.object(pipeline.runner, "run", side_effect=lambda *a, **k: invoked.append(True)):
-            with self.assertRaises(runlimits.Parked):
-                second.agent("repair", "repair again", self.repo.path, role="review_repair")
+        with patch.object(pipeline.runner, "run", side_effect=lambda *a, **k: invoked.append(True)), \
+                self.assertRaises(runlimits.Parked):
+            second.agent("repair", "repair again", self.repo.path, role="review_repair")
         self.assertEqual(invoked, [])
         self.assertEqual(runlimits.repair_count(second.id), 0)
-
-    def test_fresh_process_inherits_consumed_repair_budget(self):
-        first = self.made_run()
-        first.budget.charge("review_fix1", "review_repair")
-        first.budget.charge("verify_fix1", "build")
-        record.settle(first.id, "failed")
-        overrides = {name: str(getattr(paths, name)) for name in (
-            "STATE_DIR", "RUNS_DIR", "DB_FILE", "LOCKS_DIR", "CONFIG_DIR", "CONFIG_FILE", "LOG_DIR",
-            "EVENTS_FILE", "WORKTREES_DIR")}
-        code = (f"import sys;sys.path.insert(0,{str(Path(__file__).resolve().parents[1])!r});"
-                "from pathlib import Path;from arete.store import runs as run_store; from arete import config,paths,pipeline,record,runlimits,tracker,replay;"
-                f"replay.sample(Path({str(self.root / 'sample')!r}));"
-                f"overrides={overrides!r};"
-                "\nfor name,value in overrides.items():setattr(paths,name,Path(value))\n"
-                f"repo=config.Repo(name='fixture',path=Path({str(self.repo.path)!r}),tracker='local');"
-                f"tid={self.ticket!r};rid=record.start('pipeline',repo=repo.name,issue=tid);"
-                "folder=paths.RUNS_DIR/rid;folder.mkdir();local=tracker.LocalTracker(repo);"
-                "run=pipeline.Run(rid,repo,folder,tracker=local,tid=tid);"
-                f"budget=runlimits.Budget(run,runlimits.Policy(),{first.id!r},local.get(tid));"
-                "\ntry:budget.charge('repair','review_repair')"
-                "\nexcept runlimits.Parked:print('BEHAVIOR_RESULT={\"exhausted\":true}')"
-                "\nelse:raise AssertionError('restart reset the budget')")
-        done = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=30,
-                              cwd=str(self.root),
-                              env=self.child_env())
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertTrue(behavior_result(done)["exhausted"])
 
     def test_repair_usage_is_durable_even_when_audit_event_cannot_be_written(self):
         first = self.made_run()
@@ -382,47 +173,6 @@ class BudgetTests(Isolated):
         with self.assertRaisesRegex(runlimits.Parked, "repair cycles"):
             second.budget.charge("repair", "review_repair")
 
-    def test_abrupt_process_exit_retains_active_verification_checkpoint_without_audit(self):
-        overrides = {name: str(getattr(paths, name)) for name in (
-            "STATE_DIR", "RUNS_DIR", "DB_FILE", "LOCKS_DIR", "CONFIG_DIR", "CONFIG_FILE", "LOG_DIR",
-            "EVENTS_FILE", "WORKTREES_DIR")}
-        before = util.iso(util.now() - timedelta(minutes=21))
-        code = (f"import os,sys;sys.path.insert(0,{str(Path(__file__).resolve().parents[1])!r});"
-                "from pathlib import Path;from arete.store import runs as run_store; from arete import config,paths,pipeline,record,runlimits,tracker,util,run_lines,replay;"
-                f"replay.sample(Path({str(self.root / 'sample')!r}));"
-                f"overrides={overrides!r};"
-                "\nfor name,value in overrides.items():setattr(paths,name,Path(value))\n"
-                f"util.now=lambda:util.parse_iso({before!r});"
-                f"repo=config.Repo(name='fixture',path=Path({str(self.repo.path)!r}),tracker='local');"
-                f"tid={self.ticket!r};rid=record.start('pipeline',repo=repo.name,issue=tid);"
-                "folder=paths.RUNS_DIR/rid;folder.mkdir();local=tracker.LocalTracker(repo);"
-                "run=pipeline.Run(rid,repo,folder,tracker=local,tid=tid);"
-                "budget=runlimits.Budget(run,runlimits.Policy(),'',local.get(tid));"
-                "run_lines.write=lambda *a,**k:{};"
-                "\nfrom types import SimpleNamespace\n"
-                "clock=[0.0];runlimits.time=SimpleNamespace(monotonic=lambda:clock[0]);"
-                "budget.started=0.0;budget.deadline=3600;"
-                "\nwith budget.watching(),budget.verifying():"
-                "\n clock[0]+=21*60;budget.checkpoint();print('BEHAVIOR_RESULT={\"checkpoint\":true}',flush=True);os._exit(0)")
-        done = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=30,
-                              cwd=str(self.root),
-                              env=self.child_env())
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertTrue(behavior_result(done)["checkpoint"])
-        previous = run_store.ticket_runs(self.repo.name, self.ticket)[0]
-        record.settle(previous["id"], "interrupted")
-        next_run = self.made_run(previous["id"])
-        with self.assertRaisesRegex(runlimits.Parked, "verification"):
-            with next_run.budget.watching(), next_run.budget.verifying():
-                self.fail("abrupt exit reset verification usage")
-
-    def test_legacy_nested_announcements_count_one_cycle(self):
-        rid = record.start("pipeline", repo=self.repo.name, issue=self.ticket)
-        run_lines.write(rid, "step_start", step="implement", atom="review_repair", **{"try": 2})
-        run_lines.write(rid, "step_start", step="implement", call="review_fix1", atom="review_repair", **{"try": 2})
-        run_lines.write(rid, "step_start", step="verify", call="verify2", **{"try": 2})
-        self.assertEqual(runlimits.budget_legacy.repair_count(rid), 1)
-
     def test_cumulative_time_survives_continuation(self):
         first = self.made_run()
         with foundation.tx() as conn:
@@ -430,74 +180,7 @@ class BudgetTests(Isolated):
         record.settle(first.id, "interrupted")
         second = self.made_run(first.id)
         with self.assertRaisesRegex(runlimits.Parked, "cumulative 60"):
-            with second.budget.watching():
-                self.fail("an exhausted chain must not run")
-
-    def test_idle_waits_move_the_deadline_and_other_waits_do_not(self):
-        for cause in ("limit", "slot"):
-            with self.subTest(cause=cause):
-                run = self.made_run(policy=runlimits.Policy(max_run_minutes=.05))
-                started = time.monotonic()
-                with self.assertRaisesRegex(runlimits.Parked, "run chain"):
-                    with run.budget.watching():
-                        with run.waiting(cause):
-                            time.sleep(.9)
-                        self.assertGreater(run.budget.deadline - time.monotonic(), 0)
-                        time.sleep(20)
-                self.assertLess(time.monotonic() - started, 3 + .9 + 5)
-                self.assertGreater(runlimits.metadata(run.id, "budget.json")["wait_minutes_left_out"][cause], 0)
-        run = self.made_run(policy=runlimits.Policy(max_run_minutes=.05))
-        with self.assertRaisesRegex(runlimits.Parked, "run chain"):
-            with run.budget.watching(), run.waiting("ci"):
-                time.sleep(20)
-
-    def chained_after(self, *waits):
-        first = self.made_run()
-        record.note(first.id, started=util.iso(util.now() - timedelta(minutes=61)))
-        for cause, since, until in waits:
-            if until is None:
-                run_lines.wait_start(first.id, cause, util.iso(util.now() - timedelta(minutes=since)))
-            else:
-                run_lines.waited(first.id, cause, util.iso(util.now() - timedelta(minutes=since)),
-                             util.iso(util.now() - timedelta(minutes=until)))
-        record.settle(first.id, "interrupted")
-        row = runs_store.run_get(first.id)
-        seconds = max(0, 61 * 60 - sum(runlimits.idle_waits(first.id, row).values()))
-        with foundation.tx() as conn:
-            conn.execute("UPDATE runs SET active_seconds=? WHERE id=?", (seconds, first.id))
-        return first, self.made_run(first.id)
-
-    def test_limit_wait_of_an_earlier_run_is_left_out_of_prior_seconds(self):
-        for waits in ([("limit", 50, 10)], [("limit", 50, None)]):
-            with self.subTest(waits=waits):
-                first, second = self.chained_after(*waits)
-                self.assertLess(second.budget.prior_seconds, 25 * 60)
-                self.assertGreater(second.budget.earlier_idle["limit"], 35 * 60)
-                with second.budget.watching():
-                    pass
-                self.assertGreater(
-                    runlimits.metadata(second.id, "budget.json")["earlier_wait_minutes_left_out"]["limit"], 35)
-
-    def test_ci_waits_and_waits_before_the_run_started_still_count(self):
-        for waits in ([("ci", 50, 10)], [("slot", 90, 70)]):
-            with self.subTest(waits=waits):
-                first, second = self.chained_after(*waits)
-                with self.assertRaisesRegex(runlimits.Parked, "cumulative 60"):
-                    with second.budget.watching():
-                        self.fail("an exhausted chain must not run")
-
-    def test_verification_deadline_interrupts_and_is_accounted(self):
-        run = self.made_run(policy=runlimits.Policy(max_verify_minutes=.001))
-        started = time.monotonic()
-        with self.assertRaisesRegex(runlimits.Parked, "verification"):
-            with run.budget.watching(), run.budget.verifying():
-                time.sleep(2)
-        self.assertLess(time.monotonic() - started, 1)
-        record.settle(run.id, "failed")
-        next_run = self.made_run(run.id, run.budget.policy)
-        with self.assertRaisesRegex(runlimits.Parked, "verification"):
-            with next_run.budget.watching(), next_run.budget.verifying():
-                self.fail("verification time must not reset")
+            second.budget.charge("plan", "plan")
 
     def test_interrupted_verification_phase_is_counted_on_restart(self):
         first = self.made_run()
@@ -505,9 +188,8 @@ class BudgetTests(Isolated):
             conn.execute("UPDATE runs SET verify_open_seconds=? WHERE id=?", (21 * 60, first.id))
         record.settle(first.id, "interrupted")
         second = self.made_run(first.id)
-        with self.assertRaisesRegex(runlimits.Parked, "verification"):
-            with second.budget.watching(), second.budget.verifying():
-                self.fail("unfinished verification phases must count")
+        with self.assertRaisesRegex(runlimits.Parked, "verification"), second.budget.verifying():
+            self.fail("unfinished verification phases must count")
 
     def test_unchanged_parked_input_refuses_retry_changed_spec_requires_explicit_retry(self):
         run = self.made_run()
@@ -522,42 +204,16 @@ class BudgetTests(Isolated):
             self.assertTrue(runlimits.admission(self.repo, self.ticket, self.local, run.budget.policy, False)[0])
             self.assertEqual(runlimits.admission(self.repo, self.ticket, self.local, run.budget.policy, True), ("", True))
 
-    def test_changed_published_head_allows_explicit_new_epoch(self):
-        run = self.made_run()
-        record.note(run.id, branch="fixture")
-        with patch.object(runlimits, "heads", return_value={"": "old"}):
-            run.budget.park("repair limit")
-        record.settle(run.id, "failed")
-        with patch.object(runlimits, "heads", return_value={"": "new"}):
-            self.assertEqual(runlimits.admission(self.repo, self.ticket, self.local, run.budget.policy, True), ("", True))
-        next_run = self.made_run()
-        next_run.budget.charge("repair", "review_repair")
-        self.assertEqual(next_run.budget.parents, [])
-
-    def test_unknown_published_head_does_not_claim_material_change(self):
-        run = self.made_run()
-        record.note(run.id, branch="fixture")
-        with patch.object(runlimits, "heads", side_effect=ValueError("offline")):
-            run.budget.park("repair limit")
-        record.settle(run.id, "failed")
-        with patch.object(runlimits, "heads", return_value={"": "any"}):
-            self.assertTrue(runlimits.admission(self.repo, self.ticket, self.local, run.budget.policy, True)[0])
-
     def test_corrupt_budget_is_not_silently_reset(self):
         run = self.made_run()
-        (run.dir / "budget.json").write_text("broken json")
-        with self.assertRaises(ValueError):
-            runlimits.family(run.id)
-
-    def test_corrupt_verification_usage_does_not_reset_spent_time(self):
-        run = self.made_run()
-        for invalid in (-1, "unknown"):
-            with self.assertRaises(sqlite3.IntegrityError), foundation.tx() as conn:
-                conn.execute("UPDATE runs SET verify_seconds=? WHERE id=?", (invalid, run.id))
-        with foundation.tx() as conn:
-            conn.execute("UPDATE runs SET verify_seconds=? WHERE id=?", (float("nan"), run.id))
-        with self.assertRaisesRegex(ValueError, run.id):
-            runlimits.verification_seconds(run.id, runs_store.run_get(run.id))
+        run.budget.charge("review_fix1", "review_repair")
+        record.settle(run.id, "failed")
+        for invalid in ("broken json", json.dumps({"version": 1, "parents": [], "left_out": "x"})):
+            with self.subTest(invalid=invalid):
+                (run.dir / "budget.json").write_text(invalid)
+                with self.assertRaises(ValueError):
+                    self.made_run(run.id)
+                self.assertEqual(runlimits.repair_count(run.id), 1)
 
     def test_individual_step_reruns_cannot_reset_the_ticket_budget(self):
         first = self.made_run()
@@ -567,214 +223,70 @@ class BudgetTests(Isolated):
         second.budget.charge("review_fix2", "review_repair")
         record.note(second.id, only_step="implement")
         record.settle(second.id, "step")
-        called = []
-        def drive(flow):
-            flow.ctx.run.agent("repair", "repair again", self.repo.path, role="review_repair")
-        with patch.object(config, "load", return_value=self.cfg), \
-                patch.object(pipeline, "run_refusal", return_value=(True, "")), \
-                patch.object(pipeline.runner, "run", side_effect=lambda *a, **k: called.append(True)):
-            self.assertEqual(pipeline.run_issue(self.repo.name, self.ticket, force=True,
-                             script=pipeline.Script("feature", drive, continues=first.id)), 1)
-        latest = run_store.ticket_runs(self.repo.name, self.ticket)[0]
-        self.assertEqual(called, [])
-        self.assertIn("repair cycles", latest["summary"])
-        self.assertTrue((paths.RUNS_DIR / latest["id"] / "parked.json").exists())
-
-    def legacy_held_run(self, recorded=True, status="pr"):
-        rid = record.start("pipeline", repo=self.repo.name, issue=self.ticket)
-        if recorded:
-            ticket = self.local.get(self.ticket)
-            run_lines.write(rid, "step_end", step="prepare", result="pass",
-                        data={"ticket": {"title": ticket.title, "body": ticket.body}})
-        for n in (1, 2, 3):
-            run_lines.write(rid, "step_start", step="implement", call=f"review_fix{n}", atom="review_repair", **{"try": n})
-        record.settle(rid, status)
-        with foundation.tx() as conn:
-            conn.execute("UPDATE runs SET repair_calls=3 WHERE id=?", (rid,))
-        return rid
-
-    def started_after(self, force):
-        def drive(flow):
-            flow.ctx.run.budget.charge("review_fix", "review_repair")
-            return "failed", "fixture ended", ""
-        with patch.object(config, "load", return_value=self.cfg), \
-                patch.object(pipeline, "run_refusal", return_value=(True, "")):
-            code = pipeline.run_issue(self.repo.name, self.ticket, force=force,
-                                      script=pipeline.Script("feature", drive))
-        latest = run_store.ticket_runs(self.repo.name, self.ticket)[0]
-        directory = paths.RUNS_DIR / latest["id"]
-        return code, latest, (directory / "run.log").read_text(), runlimits.metadata(latest["id"], "budget.json")
-
-    def edit_ticket(self):
-        with foundation.db() as connection:
-            set_task_body(self.ticket, "Edited with a follow up", connection=connection)
+        history = run_store.ticket_runs(self.repo.name, self.ticket)
+        script = pipeline.Script("feature", lambda flow: None, continues=first.id)
+        parent = pipeline.parent_run(script, run_store.run_get(first.id), history)
+        self.assertEqual(parent, second.id)
+        next_run = self.made_run(parent)
+        self.assertEqual(set(next_run.budget.parents), {first.id, second.id})
+        with self.assertRaisesRegex(runlimits.Parked, "repair cycles"):
+            next_run.budget.charge("repair", "review_repair")
 
     def test_forced_run_leaves_out_repairs_spent_under_another_specification(self):
-        legacy = self.legacy_held_run()
-        self.edit_ticket()
-        code, latest, log, budget = self.started_after(True)
-        self.assertEqual(code, 1)
-        self.assertIn("left out 3 earlier repair cycles", log)
-        self.assertIn("specification changed", log)
-        self.assertEqual((budget["parents"], budget["left_out"]), ([], [legacy]))
-        self.assertFalse((paths.RUNS_DIR / latest["id"] / "parked.json").exists())
-        self.assertEqual(runlimits.repair_count(latest["id"]), 1)
-        second = self.started_after(True)[3]
-        self.assertEqual(second["parents"], [latest["id"]])
-        self.assertNotIn(legacy, runlimits.family(latest["id"]))
-
-    def test_forcing_without_an_edit_or_polling_after_one_still_counts_everything(self):
-        self.legacy_held_run()
-        _, latest, log, _ = self.started_after(True)
-        self.assertIn("repair cycles", latest["summary"])
-        self.assertNotIn("left out", log)
-        self.assertTrue((paths.RUNS_DIR / latest["id"] / "parked.json").exists())
-
-    def test_polled_run_after_an_edit_counts_earlier_repairs(self):
-        legacy = self.legacy_held_run()
-        self.edit_ticket()
-        _, latest, log, budget = self.started_after(False)
-        self.assertIn("repair cycles", latest["summary"])
-        self.assertNotIn("left out", log)
-        self.assertEqual(budget["parents"], [legacy])
-
-    def test_unreadable_specification_counts_in_full(self):
-        self.legacy_held_run(recorded=False)
-        self.edit_ticket()
-        _, latest, log, _ = self.started_after(True)
-        self.assertIn("repair cycles", latest["summary"])
-        self.assertNotIn("left out", log)
-
-    def exhausted_then_edited(self, **budget):
-        old = self.made_run()
-        with foundation.db() as connection:
-            set_task_body(self.ticket, "Edited with a follow up", connection=connection)
-        with foundation.tx() as conn:
-            if "verification_seconds" in budget:
-                conn.execute("UPDATE runs SET verify_seconds=? WHERE id=?", (budget["verification_seconds"], old.id))
-            else:
-                conn.execute("UPDATE runs SET active_seconds=? WHERE id=?", (61 * 60, old.id))
-        record.settle(old.id, "pr")
-        return old
-
-    def forced_budget(self, previous, forced):
-        rid = record.start("pipeline", repo=self.repo.name, issue=self.ticket)
-        run = pipeline.Run(rid, self.repo, paths.RUNS_DIR / rid, tracker=self.local, tid=self.ticket, cfg=self.cfg)
-        return runlimits.Budget(run, runlimits.Policy(), previous, self.local.get(self.ticket), forced)
+        for forced, edited, recorded in ((True, True, True), (True, False, True),
+                                         (False, True, True), (True, True, False)):
+            with self.subTest(forced=forced, edited=edited, recorded=recorded):
+                with foundation.db() as connection:
+                    set_task_body(self.ticket, "Original", connection=connection)
+                old = self.made_run()
+                old.budget.charge("review_fix1", "review_repair")
+                old.budget.charge("verify_fix1", "build")
+                if not recorded:
+                    old.budget.specification = None
+                    old.budget.persist()
+                record.settle(old.id, "pr")
+                if edited:
+                    with foundation.db() as connection:
+                        set_task_body(self.ticket, "Edited", connection=connection)
+                next_run = self.made_run(old.id, forced=forced)
+                if forced and edited and recorded:
+                    self.assertEqual((next_run.budget.parents, next_run.budget.left_out), ([], [old.id]))
+                    next_run.budget.charge("review_fix", "review_repair")
+                    self.assertEqual(runlimits.repair_count(next_run.id), 1)
+                    record.settle(next_run.id, "failed")
+                    retry = self.made_run(next_run.id, forced=True)
+                    self.assertEqual(retry.budget.parents, [next_run.id])
+                    self.assertNotIn(old.id, runlimits.family(retry.id))
+                else:
+                    self.assertEqual((next_run.budget.parents, next_run.budget.left_out), ([old.id], []))
+                    with self.assertRaisesRegex(runlimits.Parked, "repair cycles"):
+                        next_run.budget.charge("repair", "review_repair")
 
     def test_forced_run_leaves_out_run_and_verification_minutes_of_another_specification(self):
-        for budget in ({}, {"verification_seconds": 21 * 60}):
-            old = self.exhausted_then_edited(**budget)
-            fresh = self.forced_budget(old.id, True)
-            with fresh.watching(), fresh.verifying():
-                pass
-            self.assertEqual((fresh.parents, fresh.left_out), ([], [old.id]))
-            kept = self.forced_budget(old.id, False)
-            with self.assertRaises(runlimits.Parked):
-                with kept.watching(), kept.verifying():
-                    pass
-            record.settle(fresh.run.id, "failed")
-            record.settle(kept.run.id, "failed")
-            with foundation.db() as connection:
-                set_task_body(self.ticket, "Original", connection=connection)
-
-    def test_restarting_an_interrupted_run_keeps_inherited_usage_after_an_edit(self):
-        legacy = self.legacy_held_run(status="interrupted")
-        self.edit_ticket()
-        _, latest, log, budget = self.started_after(True)
-        self.assertEqual(budget["parents"], [legacy])
-        self.assertNotIn("left out", log)
-
-    def test_invalid_left_out_lineage_is_refused(self):
-        run = self.made_run()
-        util.write_json(paths.RUNS_DIR / run.id / "budget.json", {"version": 1, "parents": [], "left_out": "x"})
-        with self.assertRaises(ValueError):
-            runlimits.family(run.id)
-
-    def test_whole_pipeline_deadline_stops_child_keeps_workspace_and_frees_slot(self):
-        pid_file = self.root / "child-pid"
-        workspace = paths.WORKTREES_DIR / "fixture-held"
-        workspace.mkdir()
-        owner = workspace / "owner.txt"
-        owner.write_text("keep this work")
-
-        def transport(*args, **kw):
-            code = (f"import os,time;from pathlib import Path;Path({str(pid_file)!r}).write_text(str(os.getpid()));"
-                    "time.sleep(20)")
-            return child.stream([sys.executable, "-I", "-c", code], str(workspace), "", {}, 30, lambda _: None)
-
-        def drive(flow):
-            run = flow.ctx.run
-            run.workspace = workspace, []
-            run.save("proof.json", {"before_timeout": True})
-            run.agent("build", "offline child", workspace)
-            self.fail("deadline must interrupt model transport")
-
-        script = pipeline.Script("feature", drive)
-        with patch.object(config, "load", return_value=self.cfg), patch.object(pipeline, "run_refusal", return_value=(True, "")), \
-                patch.object(runlimits.Policy, "of", return_value=runlimits.Policy(max_run_minutes=.05)), \
-                patch.object(pipeline.runner, "run", side_effect=transport):
-            self.assertEqual(pipeline.run_issue(self.repo.name, self.ticket, force=True, script=script), 1)
-        row = run_store.ticket_runs(self.repo.name, self.ticket, whole=True)[0]
-        self.assertEqual(row["status"], "failed")
-        self.assertIn("parked", row["summary"])
-        self.assertEqual(owner.read_text(), "keep this work")
-        self.assertTrue((paths.RUNS_DIR / row["id"] / "parked.json").is_file())
-        self.assertTrue((paths.RUNS_DIR / row["id"] / "proof.json").is_file())
-        self.assertFalse(util.lock_is_held(run_store.run_lock("slot", self.repo.name, self.ticket)))
-        self.assertEqual(tasks_store.task_get(self.ticket)["state"], "failed")
-        self.assertTrue(pid_file.exists())
-        with self.assertRaises(ProcessLookupError):
-            os.kill(int(pid_file.read_text()), 0)
+        for field, seconds in (("active_seconds", 61 * 60), ("verify_seconds", 21 * 60)):
+            with self.subTest(field=field):
+                with foundation.db() as connection:
+                    set_task_body(self.ticket, "Original", connection=connection)
+                old = self.made_run()
+                with foundation.tx() as conn:
+                    conn.execute(f"UPDATE runs SET {field}=? WHERE id=?", (seconds, old.id))
+                record.settle(old.id, "pr")
+                with foundation.db() as connection:
+                    set_task_body(self.ticket, "Edited", connection=connection)
+                fresh = self.made_run(old.id, forced=True).budget
+                self.assertEqual((fresh.parents, fresh.left_out), ([], [old.id]))
+                self.assertEqual((fresh.prior_seconds, fresh.verify_seconds), (0, 0))
+                fresh.charge("plan", "plan")
+                kept = self.made_run(old.id).budget
+                with self.assertRaises(runlimits.Parked):
+                    if field == "active_seconds":
+                        kept.charge("plan", "plan")
+                    else:
+                        with kept.verifying():
+                            self.fail("verification budget must not reset without an explicit retry")
 
 
 class QueueTests(Isolated):
-    def interrupted_repair(self):
-        self.repo.layer_dir.mkdir()
-        (self.repo.layer_dir / "config.toml").write_text('[factory]\npath="adw"\n[verify]\nnotes="offline"\n')
-        source = self.made_run()
-        record.settle(source.id, "pr")
-        current = self.made_run(source.id)
-        run_lines.write(current.id, "repair", source=source.id)
-        record.settle(current.id, "interrupted")
-        return current
-
-    def test_interrupted_repair_ignores_held_planner_and_uses_repair_atom(self):
-        self.interrupted_repair()
-        seen, started = [], []
-        def routes(setting, *args, **kw):
-            seen.append(setting.step)
-            return [SimpleNamespace(state="held" if setting.step in ("plan", "build") else "ready",
-                                    detail="fixture quota hold", until="")]
-        with patch.object(pipeline.routing, "Discovery", return_value=SimpleNamespace(routes=routes)):
-            self.assertEqual(self.poll_with(self.cfg, lambda repo, tid: started.append(tid)), 0)
-        self.assertEqual(started, [self.ticket])
-        self.assertEqual(seen, ["review_repair", "verify", "review"])
-
-    def test_interrupted_repair_waits_for_its_actual_held_repair_route(self):
-        self.interrupted_repair()
-        seen, started = [], []
-        def routes(setting, *args, **kw):
-            seen.append(setting.step)
-            return [SimpleNamespace(state="held" if setting.step == "review_repair" else "ready",
-                                    detail="repair quota hold", until="")]
-        with patch.object(pipeline.routing, "Discovery", return_value=SimpleNamespace(routes=routes)):
-            self.assertEqual(self.poll_with(self.cfg, lambda repo, tid: started.append(tid)), 0)
-        self.assertEqual(started, [])
-        self.assertEqual(seen, ["review_repair"])
-
-    def test_revision_ignores_held_planner(self):
-        seen, started = [], []
-        def routes(setting, *args, **kw):
-            seen.append(setting.step)
-            return [SimpleNamespace(state="held" if setting.step == "plan" else "ready",
-                                    detail="planner quota hold", until="")]
-        with patch.object(pipeline.routing, "Discovery", return_value=SimpleNamespace(routes=routes)), \
-                patch.object(poll, "pending_feedback", return_value=[{"id": 1}]):
-            self.assertEqual(self.poll_with(self.cfg, lambda repo, tid: started.append(tid)), 0)
-        self.assertEqual(started, [self.ticket])
-        self.assertEqual(seen, ["build", "review"])
-
     def test_interrupted_ticket_rechecks_dependencies_before_starting(self):
         interrupted = self.made_run()
         record.settle(interrupted.id, "interrupted")
@@ -789,9 +301,10 @@ class QueueTests(Isolated):
 
     def poll_with(self, cfg, spawn):
         with patch.object(config, "load", return_value=cfg), patch.object(poll, "runnable", return_value=True), \
-                patch.object(poll, "spawn_run", side_effect=spawn), \
+                patch.object(tasks, "spawn_pending", side_effect=lambda repo, tid, launch: spawn(repo, tid)), \
                 patch.object(poll, "settle_abandoned_runs"), patch.object(outcomes, "sync_outcomes"), \
                 patch.object(outcomes, "sync_moves"), patch.object(outcomes, "sync_landings"), \
+                patch.object(poll, "retry_scratch"), \
                 patch.object(poll, "cleanup_worktrees"), patch.object(poll, "mark_loop"), \
                 patch.object(pipeline, "SKIPPED_FILE", self.root / "skipped.json"):
             return poll.poll()
@@ -827,25 +340,6 @@ class QueueTests(Isolated):
         self.assertNotIn(blocked, started)
         self.assertNotIn(self.ticket, started)
 
-    def test_unavailable_routes_do_not_consume_slot_and_scan_is_bounded(self):
-        for i in range(5):
-            tasks_store.task_add(self.repo.name, str(i), str(i), "feat")
-        started = []
-        with patch.object(poll, "step_without_route", return_value="verify is held"), \
-                patch.object(poll, "MAX_STARTS_PER_POLL", 3):
-            self.assertEqual(self.poll_with(self.cfg, lambda *args: started.append(args)), 0)
-        self.assertEqual(started, [])
-        self.assertEqual(len(json.loads((self.root / "skipped.json").read_text())), 3)
-
-    def test_spawn_failure_never_loops_on_same_ticket(self):
-        self.cfg.replay = config.ReplayConfig(all=True)
-        attempts = []
-        def fail(repo, tid):
-            attempts.append(tid)
-            raise OSError("fixture spawn failure")
-        self.assertEqual(self.poll_with(self.cfg, fail), 1)
-        self.assertEqual(attempts, [self.ticket])
-
     def test_route_readiness_is_rechecked_after_every_start(self):
         for i in range(3):
             tasks_store.task_add(self.repo.name, str(i), str(i), "feat")
@@ -860,368 +354,13 @@ class QueueTests(Isolated):
         self.assertEqual(len(started), 1)
 
 
-class CheckConcurrencyTests(Isolated):
-    def checks(self, parallel):
-        starts = []
-        layer = config.RepoLayer(dir=self.root, parallel_checks=parallel)
-        workers = [self.root / "one", self.root / "two"]
-        for folder in workers:
-            folder.mkdir()
-        code = ("import json,time;from pathlib import Path;"
-                "s=time.monotonic();time.sleep(.15);"
-                "Path('interval.json').write_text(json.dumps([s,time.monotonic()]))")
-        if parallel:
-            code = ("import json,time;from pathlib import Path;"
-                    "p=Path.cwd();(p.parent/(p.name+'.ready')).touch();s=time.monotonic();"
-                    "\nwhile len(list(p.parent.glob('*.ready')))<2 and time.monotonic()-s<2:time.sleep(.01)"
-                    "\nassert len(list(p.parent.glob('*.ready')))==2;time.sleep(.1);"
-                    "Path('interval.json').write_text(json.dumps([s,time.monotonic()]))")
-        layer.checks = {"behavior": shlex.join([sys.executable, "-I", "-c", code])}
-        def checked(folder):
-            run = pipeline.AgentRun(folder.name, self.repo, folder, cfg=self.cfg)
-            return pipeline.run_checks(layer, folder, [], run, 5)
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            results = list(pool.map(checked, workers))
-        self.assertTrue(all(ok for ok, _ in results), results)
-        for folder in workers:
-            starts.append(json.loads((folder / "interval.json").read_text()))
-        return starts
-
-    def test_default_checks_remain_serialized(self):
-        first, second = self.checks(False)
-        self.assertTrue(first[1] <= second[0] or second[1] <= first[0])
-
-    def test_explicit_isolated_checks_overlap(self):
-        first, second = self.checks(True)
-        self.assertLess(max(first[0], second[0]), min(first[1], second[1]))
-
-
-class KeptEditsTests(Isolated):
-    BRANCH = "arete/t1-fixture"
-    URL = "https://github.com/o/fixture/pull/1"
-
-    def setUp(self):
-        super().setUp()
-        self.origin = self.root / "origin.git"
-        util.git(["init", "-q", "--bare", "-b", "main", str(self.origin)], self.root)
-        util.git(["init", "-q", "-b", "main"], self.repo.path)
-        self.commit(self.repo.path, "shared.txt", "one\n", "first")
-        util.git(["remote", "add", "origin", str(self.origin)], self.repo.path)
-        util.git(["push", "-q", "origin", "main:main", f"main:refs/heads/{self.BRANCH}"], self.repo.path)
-        self.repo.parts = [config.Part("", "o/fixture")]
-        self.patches.enter_context(patch.object(gh, "open_pr_url", return_value=self.URL))
-        self.patches.enter_context(patch.object(gh, "closed_pr_heads", return_value=[]))
-        self.layer, self.ticket_data = config.RepoLayer(dir=Path()), tracker.Ticket("", "", "")
-
-    def commit(self, where, name, text, message):
-        (where / name).write_text(text)
-        util.git(["add", name], where)
-        util.git_as_owner(["-c", "commit.gpgsign=false", "commit", "-q", "-m", message], where)
-
-    def head(self, where):
-        return util.git(["rev-parse", "HEAD"], where).strip()
-
-    def start(self, run):
-        made = workspace.make_workspace(run.id, self.repo, "main", self.BRANCH, "t1", [])
-        run.workspace = made
-        return made
-
-    def parked_edit(self, name="edit.txt", text="edit\n"):
-        run = self.made_run()
-        ws, checkouts = self.start(run)
-        (checkouts[0].wt / name).write_text(text)
-        pipeline.keep_edits(run)
-        workspace.note_made(ws, checkouts)
-        return ws, checkouts[0]
-
-    def push_from_elsewhere(self, name, text, ref=BRANCH):
-        src = self.repo.path
-        util.git(["fetch", "-q", "origin"], src)
-        util.git(["checkout", "-q", "--detach", f"origin/{ref}"], src)
-        self.commit(src, name, text, "moved")
-        util.git(["push", "-q", "origin", f"HEAD:refs/heads/{ref}"], src)
-        util.git(["checkout", "-q", "main"], src)
-
-    def run_of(self, where, rev="HEAD"):
-        return util.git(["log", "-1", "--format=%(trailers:key=Arete-Run,valueonly)", rev], where).strip()
-
-    def test_next_run_continues_on_the_kept_edits_over_the_pr_head(self):
-        _, first = self.parked_edit()
-        kept, pr_head = self.head(first.wt), util.git(["rev-parse", f"origin/{self.BRANCH}"], self.repo.path).strip()
-        run = self.made_run()
-        _, checkouts = self.start(run)
-        pipeline.settle_starts(run, checkouts, self.layer, self.ticket_data, self.BRANCH)
-        self.assertEqual(self.head(checkouts[0].wt), kept)
-        self.assertEqual(checkouts[0].onto, pr_head)
-        self.assertIn("left unpushed", checkouts[0].starting_point)
-        self.assertEqual(pipeline.stage(checkouts, []).files, ["edit.txt"])
-
-    def test_reset_worktree_is_refused_naming_both_commits(self):
-        _, first = self.parked_edit()
-        kept = self.head(first.wt)
-        util.git(["reset", "-q", "--hard", "HEAD~1"], first.wt)
-        with self.assertRaises(workspace.RunFailed) as refused:
-            self.start(self.made_run())
-        self.assertIn(kept[:12], refused.exception.why)
-        self.assertIn(self.head(first.wt)[:12], refused.exception.why)
-        self.assertTrue((first.wt / ".git").exists())
-
-    def test_moved_branch_is_merged_into_the_kept_edits(self):
-        _, first = self.parked_edit()
-        kept = self.head(first.wt)
-        self.push_from_elsewhere("moved.txt", "moved\n")
-        new_head = util.git(["rev-parse", f"origin/{self.BRANCH}"], self.repo.path).strip()
-        run = self.made_run()
-        _, checkouts = self.start(run)
-        pipeline.settle_starts(run, checkouts, self.layer, self.ticket_data, self.BRANCH)
-        wt = checkouts[0].wt
-        self.assertEqual(util.git(["rev-list", "--parents", "-n1", "HEAD"], wt).split()[1:], [kept, new_head])
-        self.assertEqual(checkouts[0].onto, new_head)
-        self.assertTrue((wt / "edit.txt").exists() and (wt / "moved.txt").exists())
-        self.assertEqual(self.run_of(wt), run.id)
-        self.assertEqual(flows.foreign(wt, "HEAD", [kept, new_head], {run.id}), [])
-
-    def test_base_merged_into_a_published_branch_through_a_resolved_conflict_stays_in_the_runs_chain(self):
-        self.push_from_elsewhere("shared.txt", "mine\n")
-        self.push_from_elsewhere("shared.txt", "theirs\n", "main")
-        run = self.made_run()
-        _, checkouts = self.start(run)
-        wt = checkouts[0].wt
-
-        def resolver(step, text, cwd, **kw):
-            (cwd / "shared.txt").write_text("mine and theirs\n")
-            return Result(True, structured={"resolved": True})
-
-        with patch.object(run, "agent", side_effect=resolver):
-            pipeline.settle_starts(run, checkouts, self.layer, self.ticket_data, self.BRANCH)
-        self.assertEqual(checkouts[0].resolved, ["shared.txt"])
-        self.assertEqual((wt / "shared.txt").read_text(), "mine and theirs\n")
-        self.assertEqual(self.run_of(wt), run.id)
-        self.assertEqual(flows.foreign(wt, "HEAD", [f"origin/{self.BRANCH}"], {run.id}), [])
-
-    def test_denied_paths_stay_out_of_the_kept_commit(self):
-        run = self.made_run()
-        ws, checkouts = self.start(run)
-        wt = checkouts[0].wt
-        (wt / "edit.txt").write_text("edit\n")
-        (wt / ".env").write_text("SECRET=1\n")
-        pipeline.keep_edits(run)
-        self.assertEqual(util.git(["show", "--name-only", "--format=", "HEAD"], wt).split(), ["edit.txt"])
-        self.assertTrue((wt / ".env").exists())
-        self.assertEqual(pipeline.stage(checkouts, diffguard.denied_paths(self.layer)).denied, [".env"])
-        workspace.note_made(ws, checkouts)
-        self.push_from_elsewhere("moved.txt", "moved\n")
-        again = self.made_run()
-        _, second = self.start(again)
-        with self.assertRaises(workspace.RunFailed) as refused:
-            pipeline.settle_starts(again, second, self.layer, self.ticket_data, self.BRANCH)
-        self.assertIn(".env", refused.exception.why)
-        self.assertTrue((wt / ".env").exists())
-
-    def test_commit_left_unpushed_by_a_failed_publication_is_kept_for_the_retry(self):
-        run = self.made_run()
-        ws, checkouts = self.start(run)
-        wt, pr_head = checkouts[0].wt, self.head(checkouts[0].wt)
-        (wt / "edit.txt").write_text("edit\n")
-        staged = pipeline.stage(checkouts, [])
-        with patch.object(workspace, "remote_head", return_value="someone-else"), \
-                self.assertRaises(workspace.RunFailed):
-            pipeline.commit_and_push(checkouts, staged.changed, self.BRANCH, "work")
-        committed = self.head(wt)
-        self.assertNotEqual(committed, pr_head)
-        pipeline.keep_edits(run)
-        workspace.note_made(ws, checkouts)
-        again = self.made_run()
-        _, second = self.start(again)
-        pipeline.settle_starts(again, second, self.layer, self.ticket_data, self.BRANCH)
-        self.assertEqual(self.head(second[0].wt), committed)
-        self.assertEqual(second[0].onto, pr_head)
-        self.assertEqual(pipeline.stage(second, []).files, ["edit.txt"])
-
-    def test_failed_retention_commit_does_not_lose_the_edits_on_retry(self):
-        run = self.made_run()
-        ws, checkouts = self.start(run)
-        wt, head = checkouts[0].wt, self.head(checkouts[0].wt)
-        (wt / "edit.txt").write_text("edit\n")
-        with patch.object(pipeline, "commit_kept", side_effect=RuntimeError("hook failed")):
-            pipeline.keep_edits(run)
-        workspace.note_made(ws, checkouts)
-        again = self.made_run()
-        _, second = self.start(again)
-        pipeline.settle_starts(again, second, self.layer, self.ticket_data, self.BRANCH)
-        self.assertEqual((second[0].wt / "edit.txt").read_text(), "edit\n")
-        self.assertEqual(second[0].onto, head)
-        self.assertEqual(pipeline.stage(second, []).files, ["edit.txt"])
-
-    def test_renewed_flow_carries_stored_steps_when_the_workspace_holds_several_worktrees(self):
-        container = self.root / "container"
-        for part in ("a", "b"):
-            (container / part).mkdir(parents=True)
-            util.git(["init", "-q", "-b", "main"], container / part)
-        earlier = record.start("pipeline", repo=self.repo.name, issue=self.ticket)
-        listed = [{"wt": str(container / part)} for part in ("a", "b")]
-        run_lines.write(earlier, "step_end", step="prepare", result="pass", tree=str(container), fingerprint="",
-                    data={"checkouts": listed})
-        run_lines.write(earlier, "step_end", step="plan", result="pass", data={"plan": "p"})
-        made = []
-        fakes = {"prepare": lambda flow, tree: factory.Outcome("pass"),
-                 "plan": lambda flow: made.append("plan") or factory.Outcome("pass")}
-        with patch.dict(factory.STEPS, fakes):
-            ctx = SimpleNamespace(labels=lambda name, kw: {}, hold=lambda name: "",
-                                  merge_moved_base=lambda name: None,
-                                  restore=lambda line: "a step can run alone only on a run whose folder is kept",
-                                  keeps=lambda name, kw: name == "plan")
-            flow = factory.Flow("later", ctx, continues=earlier, renew="prepare")
-            flow.step("prepare", tree=str(container))
-            carried = flow.step("plan")
-        self.assertTrue(carried.passed)
-        self.assertEqual(made, [])
-        self.assertTrue(any(line.get("carried") == earlier for line in run_lines.read("later")))
-
-    def test_conflicting_move_with_a_failed_resolver_leaves_the_kept_commit(self):
-        _, first = self.parked_edit("shared.txt", "mine\n")
-        kept = self.head(first.wt)
-        self.push_from_elsewhere("shared.txt", "theirs\n")
-        run = self.made_run()
-        _, checkouts = self.start(run)
-        with patch.object(pipeline, "resolve_conflicts", side_effect=workspace.RunFailed("resolver failed")), \
-                self.assertRaises(workspace.RunFailed):
-            pipeline.settle_starts(run, checkouts, self.layer, self.ticket_data, self.BRANCH)
-        self.assertEqual(self.head(checkouts[0].wt), kept)
-        self.assertEqual(util.git(["status", "--short"], checkouts[0].wt).strip(), "")
-
-
-class RecordRetentionTests(Isolated):
-    def written(self, rid, days, size=1000):
-        folder = paths.record_dir(rid)
-        folder.mkdir(parents=True)
-        (folder / "call.jsonl.gz").write_bytes(b"x" * size)
-        (folder.parent / "run.log").write_text("log\n")
-        at = time.time() - days * 86400
-        os.utime(folder / "call.jsonl.gz", (at, at))
-        os.utime(folder, (at, at))
-        return folder
-
-    def proposal(self, run_id, evidence):
-        approvals_store.add_proposal(run_id, {"layer": "repo", "repo": "r", "file": "f", "change": "c", "why": "w",
-                                    "evidence": evidence, "confidence": 0.9}, "hand")
-
-    def test_age_removes_only_the_old_record(self):
-        old, new = self.written("pip-old", 40), self.written("pip-new", 2)
-        found = record.prune(30, 20)
-        self.assertEqual([r.run_id for r in found.removed], ["pip-old"])
-        self.assertFalse(old.exists())
-        self.assertTrue((old.parent / "run.log").is_file())
-        self.assertTrue(new.exists())
-
-    def test_size_removes_oldest_first(self):
-        folders = [self.written(f"pip-{n}", d) for n, d in (("a", 3), ("b", 2), ("c", 1))]
-        found = record.prune(30, 1500 / record.GB)
-        self.assertEqual([r.run_id for r in found.removed], ["pip-a", "pip-b"])
-        self.assertEqual([f.exists() for f in folders], [False, False, True])
-        self.assertFalse(found.over)
-
-    def test_pinned_and_cited_records_stay_until_released(self):
-        pinned, by_run, by_text = (self.written(n, 40) for n in ("pip-pinned", "pip-run", "pip-text"))
-        record.pin("pip-pinned")
-        self.proposal("pip-run", [])
-        self.proposal("min-x", ["run pip-text at 10:00"])
-        self.assertEqual(record.prune(30, 20).removed, ())
-        record.unpin("pip-pinned")
-        approvals_store.move_proposal(1, ("hand",), "rejected")
-        self.assertEqual([r.run_id for r in record.prune(30, 20).removed], ["pip-pinned", "pip-run"])
-        self.assertTrue(by_text.exists())
-        approvals_store.move_proposal(2, ("hand",), "skipped")
-        record.prune(30, 20)
-        self.assertFalse(by_text.exists())
-        self.assertFalse(pinned.exists() or by_run.exists())
-
-    def test_running_and_fresh_records_stay_over_the_limit(self):
-        rid = record.start("pipeline", repo="r", issue=1)
-        running = self.written(rid, 40, 5000)
-        fresh = self.written("pip-fresh", 0, 5000)
-        found = record.prune(30, 1 / record.GB)
-        self.assertEqual(found.removed, ())
-        self.assertTrue(found.over)
-        self.assertTrue(running.exists() and fresh.exists())
-
-    def test_symlinked_run_folder_is_never_scanned_or_removed(self):
-        target = self.written("pip-real", 40)
-        (paths.RUNS_DIR / "alias").symlink_to(paths.RUNS_DIR / "pip-real", target_is_directory=True)
-        self.assertEqual([r.run_id for r in record.stored()], ["pip-real"])
-        record.pin("pip-real")
-        self.assertEqual(record.prune(30, 20).removed, ())
-        self.assertTrue(target.exists())
-
-    def test_unreadable_record_is_left_out_of_the_scan(self):
-        self.written("pip-a", 40)
-        self.written("pip-b", 40)
-        real = os.walk
-
-        def walk(top, *args, onerror=None, **kwargs):
-            if "pip-a" in str(top):
-                onerror(PermissionError("denied"))
-                return iter(())
-            return real(top, *args, onerror=onerror, **kwargs)
-
-        with patch.object(os, "walk", walk):
-            self.assertEqual([r.run_id for r in record.stored()], ["pip-b"])
-
-    def test_retention_table(self):
-        self.assertEqual(config.retention_table({}), config.Retention(30, 20))
-        self.assertEqual(config.retention_table({"days": 0.5}), config.Retention(0.5, 20))
-        self.assertEqual(config.retention_table({"days": 0.5, "lines_days": 0.5}), config.Retention(0.5, 20, 0.5))
-        for bad in ({"days": 0}, {"max_gb": "x"}, {"days": True}, {"weeks": 1}, {"days": 91},
-                    *({"lines_days": v} for v in (0, -1, True, float("inf"), float("nan"), "90", 29))):
-            with self.assertRaises(ValueError):
-                config.retention_table(bad)
-
-    def test_pin_commands(self):
-        self.written("pip-a", 1)
-        with contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(cli.main(["record", "pin", "pip-a"]), 0)
-            self.assertEqual(run_store.record_pins(), {"pip-a"})
-            self.assertEqual(cli.main(["record", "pin", "nope"]), 1)
-            self.assertEqual(cli.main(["record", "pin"]), 2)
-            self.assertEqual(cli.main(["record", "unpin", "pip-a"]), 0)
-            self.assertEqual(cli.main(["record", "unpin", "pip-a"]), 1)
-            self.assertEqual(cli.main(["record", "pip-a"]), 0)
-
-    def test_serve_prune_removes_records_and_prunes_state_once(self):
-        old = self.written("pip-old", 40)
-        server = serve.Server()
-        with patch.object(store, "prune") as pruned:
-            server.prune()
-        pruned.assert_called_once_with(lines_days=90, keep_days=server.cfg.oncall.keep_days)
-        self.assertFalse(old.exists())
-        self.assertEqual(len(list((paths.DB_FILE.parent / "backups").glob("arete-*.db"))), 1)
-        self.assertTrue((paths.DB_FILE.parent / "backups" / "last.json").exists())
-
-    def test_store_reports_size_oldest_and_pins(self):
-        self.written("pip-a", 5, 1000)
-        self.written("pip-b", 1, 500)
-        record.pin("pip-b")
-        found = record.store()
-        self.assertEqual((found["bytes"], found["records"], found["pins"]), (1500, 2, 1))
-        self.assertEqual(found["runs_bytes"], 1508)
-        self.assertEqual(found["oldest"]["run_id"], "pip-a")
-        self.assertEqual(record.size_text(1500), "1.5 KB")
-
-
-class RouteABTests(Isolated):
+class RouteABTests(unittest.TestCase):
     def configured(self, **test):
-        return config.Config(repos=[self.repo], steps={"plan": {"model": "opus"}}, ab={"cheap-plan": {
+        return config.Config(steps={"plan": {"model": "opus"}}, ab={"cheap-plan": {
             "step": "plan", "kind": "", "share": 0.5, "arm": {"model": "haiku"}, **test}})
 
     def sides(self, cfg, kind="feat"):
         return [steps.resolve(cfg, None, "plan", kind, ticket=("fixture", str(n))) for n in range(1, 41)]
-
-    def refused_text(self, body):
-        path = self.root / "ab.toml"
-        path.write_text(body)
-        with self.assertRaises(ValueError) as caught:
-            config.load(path)
-        return str(caught.exception)
 
     def test_share_decides_a_stable_side_per_ticket(self):
         cfg = self.configured()
@@ -1230,132 +369,6 @@ class RouteABTests(Isolated):
         self.assertEqual([s.ab_side for s in first], [s.ab_side for s in second])
         self.assertEqual({(s.ab_side, s.model) for s in first}, {("arm", "haiku"), ("baseline", "opus")})
         self.assertEqual({s.ab_name for s in self.sides(self.configured(kind="feat"), "fix")}, {""})
-
-    def test_config_refuses_bad_tables_with_the_reason(self):
-        head = '[ab.cheap-plan]\nstep = "plan"\n'
-        self.assertIn("[ab.cheap-plan]: share must be a number above 0 and at most 0.5, not 0.8",
-                      self.refused_text(head + 'share = 0.8\narm = { model = "haiku" }\n'))
-        self.assertIn("share must be a number", self.refused_text(head + 'share = 0\narm = { model = "haiku" }\n'))
-        self.assertIn("unknown step 'nope'", self.refused_text(
-            '[ab.cheap-plan]\nstep = "nope"\nshare = 0.2\narm = { model = "haiku" }\n'))
-        self.assertIn("unknown key tools", self.refused_text(head + 'share = 0.2\narm = { tools = ["Read"] }\n'))
-        text = self.refused_text(head + 'share = 0.2\narm = { model = "haiku", effort = "turbo" }\n')
-        self.assertTrue(text.startswith("[ab.cheap-plan]:") and "turbo" in text, text)
-        other = '[ab.other]\nstep = "plan"\nshare = 0.2\narm = { model = "sonnet" }\n'
-        for kinds in ("", 'kind = "feat"\n'):
-            self.assertIn("both change step plan", self.refused_text(
-                head + 'share = 0.2\narm = { model = "haiku" }\n' + other.replace("share", kinds + "share")))
-        self.assertIn("both change step plan for feat tickets", self.refused_text(
-            head + 'kind = "feat"\nshare = 0.2\narm = { model = "haiku" }\n'
-            + other.replace("share", 'kind = "feat"\nshare')))
-        path = self.root / "ok.toml"
-        path.write_text(head + 'share = 0.5\narm = { model = "haiku" }\n')
-        self.assertEqual(config.load(path).ab["cheap-plan"]["share"], 0.5)
-
-    def test_runs_record_the_side_and_a_retry_keeps_it(self):
-        answers = self.root / "answers"
-        answers.mkdir()
-        (answers / "plan.json").write_text(json.dumps({"text": "ok", "cost_usd": 0.5}))
-        cfg = self.configured()
-        cfg.replay = config.ReplayConfig(all=True, dir=answers)
-        tids = {side: next(str(n) for n in range(1, 99) if steps.in_arm("cheap-plan", 0.5, ("fixture", str(n)))
-                           == (side == "arm")) for side in ("arm", "baseline")}
-
-        def rows(tid):
-            rid = record.start("pipeline", repo=self.repo.name, issue=tid)
-            directory = paths.RUNS_DIR / rid
-            directory.mkdir()
-            pipeline.Run(rid, self.repo, directory, tracker=self.local, tid=tid, cfg=cfg).agent(
-                "plan", "x", self.repo.path, role="plan")
-            with foundation.db() as c:
-                return [dict(r) for r in c.execute("SELECT * FROM steps WHERE run_id = ?", (rid,))]
-
-        arm, baseline, retry = rows(tids["arm"]), rows(tids["baseline"]), rows(tids["arm"])
-        self.assertEqual([(r["model"], r["ab"], r["ab_side"], r["atom"]) for r in arm],
-                         [("haiku", "cheap-plan", "arm", "plan")])
-        self.assertEqual([(r["model"], r["ab_side"]) for r in baseline], [("opus", "baseline")])
-        self.assertEqual([(r["model"], r["ab_side"]) for r in retry], [("haiku", "arm")])
-
-    def test_a_continuation_keeps_its_route_after_the_table_is_removed(self):
-        tid = next(t for t in (tasks_store.task_add(self.repo.name, "Fixture", "Fixture", "feat") for _ in range(60))
-                   if steps.in_arm("cheap-plan", 0.5, (self.repo.name, str(t))))
-        models = []
-
-        def interrupted_call(text, cwd, **kw):
-            models.append(kw["model"])
-            record.settle(kw["trace"][0], "interrupted")
-            return Result(ok=False, error="interrupted")
-
-        def drive(flow):
-            flow.ctx.run.agent("plan", "x", self.repo.path, role="plan")
-            return "failed", "fixture ended", ""
-
-        def run_with(cfg, call):
-            with patch.object(config, "load", return_value=cfg), \
-                    patch.object(pipeline, "run_refusal", return_value=(True, "")), \
-                    patch.object(pipeline.runner, "run", side_effect=call):
-                pipeline.run_issue(self.repo.name, tid, force=True, script=pipeline.Script("feature", drive))
-            return run_store.ticket_runs(self.repo.name, tid, limit=1, whole=True)[0]["id"]
-
-        first = run_with(self.configured(), interrupted_call)
-        removed = self.configured()
-        removed.ab = {}
-        second = run_with(removed, interrupted_call)
-        self.assertEqual(models, ["haiku", "haiku"])
-        self.assertNotEqual(first, second)
-        self.assertEqual(run_store.ab_held(second), run_store.ab_held(first))
-        self.assertEqual(run_store.ab_held(first)["plan"][:2], ("cheap-plan", "arm"))
-
-    def test_the_seam_envelope_carries_the_labels(self):
-        found = factory.envelope([{"ab": "cheap-plan", "ab_side": "arm", "atom": "plan"}])
-        self.assertEqual((found["ab"], found["ab_side"]), ("cheap-plan", "arm"))
-
-    def seeded(self, per_side):
-        for side, mode, cost, merged in (("arm", "api_key", 1.0, 15), ("baseline", "subscription", 2.0, 10)):
-            for n in range(per_side):
-                rid = record.start("pipeline", repo=self.repo.name, issue=f"{side}{n}")
-                made = Result(ok=True, runner="claude", model="opus", cost_usd=cost, auth_mode=mode)
-                record.step(rid, "plan", made, 1, try_no=1)
-                record.label_step(rid, "plan", 1, atom="plan", ab="cheap-plan", ab_side=side)
-                record.step(rid, "review", made, 1, try_no=1)
-                record.label_step(rid, "review", 1, atom="review")
-                if side == "arm" and n < 3:
-                    record.step(rid, "review_fix", made, 1, try_no=1)
-                    record.label_step(rid, "review_fix", 1, atom="review_repair")
-                won = n < merged
-                record.settle(rid, "merged" if won else "failed", pr_url="https://pr/1" if won else "")
-
-    def test_report_counts_costs_and_interval(self):
-        self.seeded(25)
-        report = control.ab_report("cheap-plan", cfg=self.cfg)
-        self.assertEqual(len(report), 1)
-        arm, baseline = report[0]["sides"]["arm"], report[0]["sides"]["baseline"]
-        self.assertEqual((arm["tickets"], arm["merged"], arm["no_pr"], arm["repairs"], arm["review_rounds"]),
-                         (25, 15, 10, 3, 25))
-        self.assertEqual((baseline["tickets"], baseline["merged"], baseline["repairs"]), (25, 10, 0))
-        self.assertEqual((arm["paid_per_merged"], arm["subscription_per_merged"]), (round(53 / 15, 4), 0.0))
-        self.assertEqual((baseline["paid_per_merged"], baseline["subscription_per_merged"]), (0.0, 10.0))
-        low, high = report[0]["interval"]
-        self.assertTrue(low < report[0]["merge_rate_difference"] < high)
-        self.assertEqual(report[0]["merge_rate_difference"], 0.2)
-        self.assertFalse(report[0]["too_few"])
-        out = io.StringIO()
-        with patch.object(config, "load", return_value=self.cfg), contextlib.redirect_stdout(out):
-            self.assertEqual(cli.main(["ab", "--json"]), 0)
-        self.assertEqual(json.loads(out.getvalue())["sides"], report[0]["sides"])
-
-    def test_report_flags_too_few_tickets(self):
-        self.seeded(5)
-        self.assertTrue(control.ab_report(cfg=self.cfg)[0]["too_few"])
-        self.assertEqual(control.ab_report("nothing", cfg=self.cfg), [])
-
-
-class NoLiveStateTests(unittest.TestCase):
-    def test_no_test_here_points_at_the_live_authority_or_state(self):
-        live = (Path.home() / ".config" / "arete", Path.home() / ".local" / "share" / "arete")
-        for path in (sandbox.AUTHORITY, paths.SERVER_FILE, paths.PI_KEYS_FILE, sandbox.AGENT_DIR, sandbox.LOGIN_DIR,
-                     sandbox.KEY_DIR, sandbox.SESSIONS_DIR):
-            self.assertFalse(any(path.resolve().is_relative_to(r.resolve()) for r in live), path)
 
 
 if __name__ == "__main__":

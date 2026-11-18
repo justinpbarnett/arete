@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 import sys
 
-from .. import __version__, config, paths
+from .. import __version__, config, paths, routing, steps
 from ..store import db as foundation
 from ..store import runs as run_store
 from .common import (
@@ -93,8 +94,12 @@ def cmd_status(args) -> int:
         print("arete status --json RUN_ID prints one run's steps", file=sys.stderr)
         return 2
     cfg, problem = config.load_or_problem()
-    views = control.loop_views(cfg)
-    snap = board.snapshot(recent_runs=args.limit)
+    try:
+        views = control.loop_views(cfg)
+        snap = board.snapshot(recent_runs=args.limit)
+    except foundation.NoDatabase as e:
+        print(e, file=sys.stderr)
+        return 1
     print(f"arete {__version__}  config {paths.CONFIG_FILE}")
     if problem:
         print(f"config does not load: {problem}")
@@ -119,8 +124,32 @@ def cmd_status(args) -> int:
     show(snap["triage"], "triage", print_triage)
     pipeline_repos = [f"{r.name} ({r.tracker})" for r in cfg.repos if r.pipeline]
     print(f"pipeline repos: {', '.join(pipeline_repos) or 'none'}")
+    print_delivery(cfg)
     show(snap["live"], "the live runs", print_live)
     return 0
+
+
+def print_delivery(cfg: config.Config) -> None:
+    repos = [repo for repo in cfg.repos if repo.pipeline]
+    if not repos:
+        return
+    print("delivery configuration (availability not checked):")
+    for repo in repos:
+        try:
+            layer = config.load_layer(repo.layer_dir)
+            steps.check(cfg, layer)
+            detail = layer.factory_path
+            if layer.factory_path == "orchestrated":
+                setting = steps.resolve(cfg, layer, "orchestrate")
+                provider = setting.provider or routing.identity(setting.runner, setting.model)[0]
+                model = setting.model or "(runner default)"
+                qualified = model if "/" in model else f"{provider}/{model}"
+                detail += (f"; controller runner={setting.runner} model={qualified}"
+                           f" effort={setting.effort_on(setting.runner) or 'default'}")
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError) as error:
+            detail = (f"configuration problem ({type(error).__name__}); "
+                      f"check {paths.short_path(repo.layer_dir / 'config.toml')}")
+        print(f"  {repo.name}: {detail}")
 
 
 def status_lines(run_id: str) -> int:
@@ -186,6 +215,29 @@ def cmd_doctor(args) -> int:
     return 1 if any(r.failing for r in results) else 0
 
 
+def cmd_prompts(args) -> int:
+    from .. import prompt_loader
+
+    names = [args.name] if args.name else sorted(p.stem for p in paths.PROMPTS_DIR.glob("*.md"))
+    failed = not names
+    if not names:
+        print("no prompt templates found", file=sys.stderr)
+    for name in names:
+        try:
+            inputs = prompt_loader.template(name).get_identifiers()
+            row = {"name": name, "valid": True, "inputs": inputs}
+        except (OSError, ValueError) as error:
+            row = {"name": name, "valid": False, "error": str(error)}
+            failed = True
+        if args.json:
+            print(json.dumps(row))
+        elif row["valid"]:
+            print(f"{name}: {', '.join(row['inputs']) or '(no inputs)'}")
+        else:
+            print(row["error"], file=sys.stderr)
+    return int(failed)
+
+
 def cmd_dashboard(args) -> int:
     from .. import dashboard
 
@@ -216,6 +268,11 @@ def register(sub) -> None:
     p = sub.add_parser("migrate", help="apply pending database migrations")
     p.add_argument("--no-contracts", action="store_true", help="stop before the first contract migration")
     p.set_defaults(fn=cmd_migrate)
+
+    p = sub.add_parser("prompts", help="validate prompt templates and list their required inputs, without model calls")
+    p.add_argument("name", nargs="?", default="", help="one template's file stem; omit to inspect every template")
+    p.add_argument("--json", action="store_true", help="one JSON object per template, including validation errors")
+    p.set_defaults(fn=cmd_prompts)
 
     p = sub.add_parser("doctor", help="read only check of arete's own state: cost drift, orphan rows, stray folders, "
                                       "stuck work, the database and its backup; it reports and never repairs")

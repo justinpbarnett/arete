@@ -10,7 +10,7 @@ from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
 
-from . import accounts, background, child, config, devices, environment, paths, ssh, util
+from . import accounts, background, child, config, device_turns, devices, environment, paths, ssh, util
 from .agent import (
     NO_SESSION,
     Result,
@@ -22,6 +22,7 @@ from .agent import (
     model_scope,
     provider_reset,
     rate_limit_type,
+    streamed_turn,
 )
 
 PARENT_SESSION_VARS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT", "ANTHROPIC_API_KEY")
@@ -179,6 +180,7 @@ def _run(
     on_line: Callable[[str], None] = lambda line: None,
     auth: accounts.Auth | None = None,
     api_key: str = "",
+    leaf: str = "",
 ) -> Result:
     fresh_session = "" if resume.id or not persist else str(uuid.uuid4())
     cmd = command(cwd, model=model, effort=effort, tools=tools, allowed_tools=allowed_tools,
@@ -188,18 +190,35 @@ def _run(
                   instructions=instructions)
     if remote:
         extra = {k: v for k, v in (extra_env or {}).items() if k not in PARENT_SESSION_VARS}
-        env = {**{k: v for k, v in os.environ.items() if k not in PARENT_SESSION_VARS}, **AGENT_SETS, **extra}
-        cmd = devices.wrap(remote, ["env", "-u", "ANTHROPIC_API_KEY", *cmd], cwd, {**AGENT_SETS, **extra})
+        env = {**AGENT_SETS, **extra}
+        cmd = ["env", "-u", "ANTHROPIC_API_KEY", *cmd]
     else:
         env = agent_env(passing, extra_env, api_key=api_key)
     try:
-        proc = child.stream(cmd, None if remote else str(cwd), prompt, env, timeout, on_line)
-    except subprocess.TimeoutExpired:
+        if remote:
+            proc = device_turns.run(remote, cmd, cwd, env, prompt, timeout=timeout, on_line=on_line,
+                                    on_mark=lambda kind, n: on_line(json.dumps({"arete": kind, "offset": n}) + "\n"),
+                                    leaf=leaf or f"agent-{os.getpid()}-{uuid.uuid4().hex}", settle_answer=True)
+        else:
+            proc = child.stream(cmd, str(cwd), prompt, env, timeout, on_line)
+    except device_turns.Lost as e:
+        session = Session(fresh_session, 0.0, "claude") if e.started and fresh_session else resume
+        result = parse(subprocess.CompletedProcess(cmd, 1, e.output, ""), session, model, json_schema)
+        result.error = e.why
+        return result
+    except subprocess.TimeoutExpired as e:
         session = Session(fresh_session, 0.0, "claude") if fresh_session else resume
-        return Result(ok=False, session=session, error=f"timed out after {timeout}s")
+        out = e.output or ""
+        err = e.stderr or ""
+        result = parse(subprocess.CompletedProcess(cmd, 1, out.decode(errors="replace") if isinstance(out, bytes) else out,
+                                                  err.decode(errors="replace") if isinstance(err, bytes) else err),
+                       session, model, json_schema)
+        result.error = f"timed out after {timeout}s"
+        return result
     except FileNotFoundError as e:
         return Result(ok=False, session=resume, error=f"claude not found: {e}")
-    result = parse(proc, resume, model, json_schema)
+    fallback = Session(fresh_session, 0.0, "claude") if remote and proc.started and fresh_session else resume
+    result = parse(proc, fallback, model, json_schema)
     if auth and auth.mode == "api_key":
         result.usage_limit = credit_limit([result.error, failure_reason(result.raw), proc.stderr]) if not result.ok else None
     return result
@@ -209,8 +228,14 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
     out = proc.stdout.strip()
     if not (data := result_event(out)):
         error = util.tail(proc.stderr or out or f"exit {proc.returncode}", 1500)
-        return Result(ok=False, session=resume, error=error,
-                      usage_limit=usage_limit({}, proc.stderr + out, model))
+        result = Result(ok=False, session=resume, error=error,
+                        usage_limit=usage_limit({}, proc.stderr + out, model))
+        seen = {}
+        for line in out.splitlines():
+            if turn := streamed_turn(line, seen):
+                for key in ("turns", "cost_usd", "tokens_in", "tokens_out", "cache_read", "cache_write"):
+                    setattr(result, key, getattr(result, key) + turn.get(key, 0))
+        return result
 
     structured = data.get("structured_output")
     if structured is None and json_schema:

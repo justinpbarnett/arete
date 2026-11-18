@@ -328,6 +328,7 @@ class Verified:
     blocked_by: str = ""
     finished: bool = True
     saved: str = ""
+    native_trees: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_agent(cls, found: dict) -> Verified:

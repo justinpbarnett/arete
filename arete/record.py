@@ -21,7 +21,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Self
 
-from . import agent, codebase, paths, run_lines, scrub, util
+from . import agent, codebase, launch_lease, paths, run_lines, scrub, util
 from .store import approvals as approvals_store
 from .store import db as foundation
 from .store import loops as loop_store
@@ -45,6 +45,7 @@ def new_id(prefix: str, tag: str = "") -> str:
 
 
 def start(kind: str, *, run_id: str = "", tag: str = "", lock: str = "", **fields) -> str:
+    nested = foundation.in_write()
     row = {"kind": kind, "status": "running", "started": util.iso(), "lock": lock or None, "pid": os.getpid(),
            "engine_sha": codebase.STAMP, "schema_version": foundation.LATEST, **fields}
     if kind in TICKET_KINDS:
@@ -58,6 +59,9 @@ def start(kind: str, *, run_id: str = "", tag: str = "", lock: str = "", **field
             if run_id or "runs.id" not in str(e):
                 raise
             continue
+        # A nested writer has not committed yet; retain its lease until exit.
+        if kind in TICKET_KINDS and not nested:
+            launch_lease.registered(row.get("repo", ""), str(row.get("issue", "")))
         return minted
 
 
@@ -94,18 +98,18 @@ def metered_spent(run_id: str) -> float:
     return run_store.paid_by_run([run_id]).get(run_id, 0.0)
 
 
-def note(run_id: str, **fields) -> None:
+def note(run_id: str, *, base_version=None, **fields) -> None:
     if "status" in fields:
         raise ValueError("use move to change a run\'s status")
-    run_store.note(run_id, **fields)
+    run_store.note(run_id, base_version=base_version, **fields)
 
 
-def move(run_id: str, to: str, expect: tuple[str, ...], **fields) -> bool:
-    return run_store.move(run_id, to, expect, **fields)
+def move(run_id: str, to: str, expect: tuple[str, ...], *, base_version=None, **fields) -> bool:
+    return run_store.move(run_id, to, expect, base_version=base_version, **fields)
 
 
-def ask_stop(run_id: str) -> dict | None:
-    return run_store.ask_stop(run_id)
+def ask_stop(run_id: str, base_version=None) -> dict | None:
+    return run_store.ask_stop(run_id, base_version)
 
 
 class Stopped(Exception):
@@ -130,9 +134,9 @@ def stop_asked(run_id: str) -> bool:
     return bool(r and r["stop_asked"])
 
 
-def settle(run_id: str, status: str, end_line: str = "", **fields) -> dict | None:
+def settle(run_id: str, status: str, end_line: str = "", *, base_version=None, **fields) -> dict | None:
     fields = {"status": status, "finished": util.iso(), **fields}
-    settled = run_store.settle(run_id, fields, end_line)
+    settled = run_store.settle(run_id, fields, end_line, base_version)
     if settled is None:
         return None
     mark(run_id, "result", at=fields.pop("finished"), **fields)
@@ -171,12 +175,12 @@ def dead(row: dict):
             yield free
 
 
-def interrupt(row: dict, notes: Sequence[str] = ()) -> dict | None:
-    if not util.pid_alive(row.get("pid")):
-        util.end_session(row.get("pid"))
+def interrupt(row: dict, notes: Sequence[str] = (), *, base_version=None) -> dict | None:
     status = dead_status(row)
     summary = "; ".join([STOPPED if status == "stopped" else INTERRUPTED, *notes])
-    settled = settle(row["id"], status, end_line=f"{status}: {summary}", summary=summary)
+    settled = settle(row["id"], status, end_line=f"{status}: {summary}", summary=summary, base_version=base_version)
+    if settled and not util.pid_alive(row.get("pid")):
+        util.end_session(row.get("pid"))
     if settled and row["kind"] == "draft":
         shutil.rmtree(paths.draft_dir(row["id"]), ignore_errors=True)
     return settled
@@ -569,7 +573,7 @@ def normalized(source: Iterable[dict]) -> Iterator[dict]:
         own = line.pop("arete", None)
         if own == "clock":
             seconds = line.get("seconds", seconds)
-        elif own in ("header", "result"):
+        elif own in ("header", "result", "attach", "lost"):
             if own == "header":
                 read = READERS.get(line.get("runner"), lambda header: unread)(line)
             yield {"kind": own, "seconds": seconds, **line}

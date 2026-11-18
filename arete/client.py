@@ -4,11 +4,14 @@ import getpass
 import http.client
 import json
 import os
+import secrets
 import socket
 import ssl
 import sys
+import threading
 import time
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from urllib.parse import quote, urlencode, urlsplit
 
@@ -23,6 +26,8 @@ RESTART_WAIT_SECONDS = 30
 RECONNECT_SECONDS = 120
 WAIT_EVENTS = ("step_end", "question", "error", run_lines.END)
 BROKE = (OSError, http.client.HTTPException)
+_ACQUISITION_LOCK = threading.Lock()
+_acquisition_thread: threading.Thread | None = None
 
 
 class Down(Exception):
@@ -33,6 +38,14 @@ class Failed(Exception):
     def __init__(self, answer: dict, code: int = 0):
         super().__init__(str(answer.get("error", "")))
         self.answer, self.code = answer, code
+
+
+class Broken(Failed):
+    pass
+
+
+class InFlight(Failed):
+    seconds = 1
 
 
 class Restarting(Exception):
@@ -100,16 +113,88 @@ def connect(where: Server, seconds: float = CONNECT_SECONDS) -> http.client.HTTP
     try:
         conn.connect()
     except ssl.SSLError as e:
+        conn.close()
         raise Down(f"the certificate of the arete server at {address(where)} was not accepted "
                    f"({getattr(e, 'verify_message', None) or e.reason or e})") from None
     except OSError as e:
+        conn.close()
         raise Down(f"the arete server is not up at {address(where)} ({e.strerror or e}); start it with "
                    f"`arete serve`, or set {ENV}") from None
+    except BaseException:
+        conn.close()
+        raise
     return conn
 
 
+@contextmanager
+def acquired_connection(where, deadline):
+    if deadline is None:
+        conn = connect(where)
+        try:
+            yield where, conn
+        except BaseException:
+            conn.close()
+            raise
+        return
+
+    global _acquisition_thread
+    lock, done = threading.Lock(), threading.Event()
+    abandoned, delivered = False, False
+    result, error = None, None
+
+    def acquire():
+        nonlocal result, error
+        conn = None
+        try:
+            with lock:
+                if abandoned or time.monotonic() >= deadline:
+                    return
+            found = server() if where is None else where
+            with lock:
+                if abandoned or time.monotonic() >= deadline:
+                    return
+            conn = connect(found, min(CONNECT_SECONDS, budget_left(deadline)))
+            with lock:
+                if not abandoned and time.monotonic() < deadline:
+                    result, conn = (found, conn), None
+        except BaseException as e:
+            error = e
+        finally:
+            try:
+                if conn is not None:
+                    conn.close()
+            finally:
+                done.set()
+
+    try:
+        with _ACQUISITION_LOCK:
+            budget_left(deadline)
+            # One live acquisition thread, no queue, even if a resolver never returns.
+            if _acquisition_thread is not None and _acquisition_thread.is_alive():
+                raise Down("a previous arete server connection is still being acquired; try again later")
+            worker = threading.Thread(target=acquire, name="arete-http-acquire", daemon=True)
+            _acquisition_thread = worker
+            worker.start()
+        done.wait(budget_left(deadline))
+        budget_left(deadline)
+        worker.join(budget_left(deadline))
+        budget_left(deadline)
+        if error is not None:
+            raise error
+        if result is None:
+            raise Broken({"error": "task start retry budget expired"})
+        yield result
+        delivered = True
+    finally:
+        with lock:
+            abandoned = True
+            unused, result = result, None
+        if not delivered and unused is not None:
+            unused[1].close()
+
+
 def request(method: str, path: str, body: dict | None = None,
-            read_seconds: float | None = CALL_SECONDS) -> http.client.HTTPResponse:
+            read_seconds: float | None = CALL_SECONDS, key: str | None = None) -> http.client.HTTPResponse:
     deadline = None
     restart = None
     while True:
@@ -117,7 +202,9 @@ def request(method: str, path: str, body: dict | None = None,
         if within is not None and within <= 0:
             raise Failed(restart.answer, 503)
         try:
-            return request_once(method, path, body, read_seconds, within)
+            return request_once(method, path, body, read_seconds, within,
+                                **({"key": key} if key is not None else {}),
+                                **({"deadline": deadline} if deadline is not None else {}))
         except Restarting as e:
             restart, pause = e, e.seconds
         except Down:
@@ -133,31 +220,54 @@ def request(method: str, path: str, body: dict | None = None,
 
 
 def request_once(method: str, path: str, body: dict | None = None,
-                 read_seconds: float | None = CALL_SECONDS, within: float | None = None) -> http.client.HTTPResponse:
-    where = server()
+                 read_seconds: float | None = CALL_SECONDS, within: float | None = None,
+                 key: str | None = None, *, deadline: float | None = None) -> http.client.HTTPResponse:
+    if deadline is None and within is not None:
+        deadline = time.monotonic() + within
+    where = server() if deadline is None else None
     payload = json.dumps(body or {}).encode() if method == "POST" else None
     followed = False
     if within is not None:
         read_seconds = within if read_seconds is None else min(read_seconds, within)
     while True:
-        conn = connect(where, CONNECT_SECONDS if within is None else min(CONNECT_SECONDS, within))
-        conn.sock.settimeout(read_seconds)
-        headers = headers_for(where)
-        if payload is not None:
-            headers["Content-Type"] = "application/json"
-        try:
-            conn.request(method, path, payload, headers)
-            resp = conn.getresponse()
-            if not followed and (moved := util.https_upgrade(resp, where.port)):
-                resp.read()
-                conn.close()
-                where, followed = Server("https", where.host, where.port, moved.hostname), True
-                continue
-            if resp.status < 400:
-                return resp
-            text = resp.read()
-        except BROKE as e:
-            raise Failed({"error": f"the server at {address(where)} broke off: {e}"}) from None
+        if deadline is not None:
+            within = budget_left(deadline)
+            read_seconds = within if read_seconds is None else min(read_seconds, within)
+        with acquired_connection(where, deadline) as (where, conn):
+            transport = conn.sock
+            resp, returned = None, False
+            try:
+                with transport_budget(transport, deadline):
+                    transport.settimeout(read_seconds if deadline is None else budget_left(deadline))
+                    headers = headers_for(where)
+                    if key is not None:
+                        headers["Idempotency-Key"] = key
+                    if payload is not None:
+                        headers["Content-Type"] = "application/json"
+                    if deadline is not None:
+                        budget_left(deadline)
+                    conn.request(method, path, payload, headers)
+                    if deadline is not None:
+                        transport.settimeout(budget_left(deadline))
+                    resp = conn.getresponse()
+                    resp.arete_transport = transport
+                if not followed and (moved := util.https_upgrade(resp, where.port)):
+                    read_response(resp, deadline)
+                    where, followed = Server("https", where.host, where.port, moved.hostname), True
+                    continue
+                if resp.status < 400:
+                    returned = True
+                    return resp
+                text = read_response(resp, deadline)
+            except BROKE as e:
+                raise Broken({"error": f"the server at {address(where)} broke off: {e}"}) from None
+            finally:
+                if not returned:
+                    try:
+                        if resp is not None:
+                            close_response(resp)
+                    finally:
+                        conn.close()
         break
     try:
         answer = json.loads(text)
@@ -166,13 +276,84 @@ def request_once(method: str, path: str, body: dict | None = None,
     failure = (answer if isinstance(answer, dict) and "error" in answer
                else {"error": f"the server at {address(where)} answered {resp.status}"})
     wait = (resp.getheader("Retry-After") or "").strip()
+    if key is not None and resp.status == 409 and failure.get("code") == "idempotency_in_flight":
+        failure = InFlight(failure, resp.status)
+        failure.seconds = int(wait) if wait.isascii() and wait.isdigit() else 1
+        raise failure
     if resp.status == 503 and wait.isascii() and wait.isdigit():
-        conn.close()
         raise Restarting(failure, int(wait))
     raise Failed(failure, resp.status)
 
 
-def call(method: str, path: str, body: dict | None = None) -> dict:
+def budget_left(deadline):
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise Broken({"error": "task start retry budget expired"})
+    return left
+
+
+@contextmanager
+def transport_budget(transport, deadline):
+    if deadline is None:
+        yield
+        return
+
+    def expire():
+        # Closing alone leaves makefile() reads alive; interrupt this socket object.
+        try:
+            transport.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    timer = threading.Timer(budget_left(deadline), expire)
+    timer.name = "arete-http-deadline"
+    timer.daemon = True
+    try:
+        timer.start()
+        budget_left(deadline)
+        try:
+            yield
+        except BROKE:
+            budget_left(deadline)
+            raise
+    finally:
+        timer.cancel()
+        if timer.ident is not None:
+            timer.join()
+    budget_left(deadline)
+
+
+def close_response(resp):
+    try:
+        resp.close()
+    finally:
+        if transport := getattr(resp, "arete_transport", None):
+            transport.close()
+
+
+def read_response(resp, deadline):
+    if deadline is None:
+        return resp.read()
+    chunks = []
+    try:
+        with transport_budget(resp.arete_transport, deadline):
+            while not resp.isclosed():
+                resp.arete_transport.settimeout(budget_left(deadline))
+                chunk = resp.read1(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            payload = b"".join(chunks)
+            if resp.length:
+                raise http.client.IncompleteRead(payload, resp.length)
+        return payload
+    finally:
+        close_response(resp)
+
+
+def call(method: str, path: str, body: dict | None = None, key: str | None = None) -> dict:
+    if key is not None and method == "POST" and path == "/api/tasks":
+        return keyed_call(body, key)
     resp = request(method, path, body)
     try:
         answer = json.loads(resp.read())
@@ -181,6 +362,53 @@ def call(method: str, path: str, body: dict | None = None) -> dict:
     except ValueError:
         raise Failed({"error": f"the server answered {method} {path} with no JSON"}) from None
     return answer
+
+
+def keyed_call(body, key):
+    deadline = time.monotonic() + 30
+    retries, restart, failure = 0, None, None
+    uncertain = False
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise failure or Failed({"error": "task start retry budget expired"})
+        if uncertain:
+            if retries >= 2:
+                raise failure
+            retries += 1
+        resp = None
+        try:
+            resp = request_once("POST", "/api/tasks", body, within=left, key=key, deadline=deadline)
+            answer = json.loads(read_response(resp, deadline))
+            budget_left(deadline)
+            return answer
+        except BROKE as e:
+            failure = Broken({"error": f"the server broke off: {e}"})
+            uncertain, pause = True, 0
+        except (Broken, InFlight) as e:
+            failure, pause = e, getattr(e, "seconds", 0)
+            uncertain = True
+        except Restarting as e:
+            restart, failure, pause = e, Failed(e.answer, 503), e.seconds
+            time.sleep(min(pause, max(0, deadline - time.monotonic())))
+            continue
+        except Down as e:
+            if not uncertain and restart is None:
+                raise
+            failure, pause = Broken({"error": str(e)}), RETRY_SECONDS
+        except ValueError:
+            raise Failed({"error": "the server answered POST /api/tasks with no JSON"}) from None
+        finally:
+            if resp is not None:
+                close_response(resp)
+        time.sleep(min(pause, max(0, deadline - time.monotonic())))
+
+
+def start_task(body, key=None):
+    chosen = key if key is not None else os.environ.get("ARETE_IDEMPOTENCY_KEY")
+    chosen = chosen if chosen is not None else secrets.token_hex(16)
+    print(f"Idempotency-Key: {chosen}", file=sys.stderr, flush=True)
+    return call("POST", "/api/tasks", body, key=chosen)
 
 
 def stream(path: str, query: dict) -> Iterator[dict]:
@@ -204,6 +432,15 @@ def parsed(resp: http.client.HTTPResponse) -> Iterator[dict]:
 
 def run_path(run_id: str, action: str) -> str:
     return f"/api/runs/{quote(run_id, safe='')}/{action}"
+
+
+def run_command(run_id: str, action: str, body: dict | None = None) -> int:
+    def selected():
+        run = call("GET", f"/api/runs/{quote(run_id, safe='')}")["run"]
+        emit(call("POST", run_path(run_id, action), {**(body or {}), "base_version": run["version"]}))
+        return 0
+
+    return steered(selected)
 
 
 def events(run_id: str, start: int = 0, follow: bool = False) -> Iterator[dict]:
@@ -252,7 +489,7 @@ def emit(line: dict) -> None:
 
 
 def failed(e: Failed) -> int:
-    emit({**e.answer, **({"code": e.code} if e.code else {})})
+    emit({**e.answer, **({"code": e.code} if e.code and "code" not in e.answer else {})})
     return 1
 
 

@@ -585,7 +585,7 @@ def auto_limit(cfg: config.Config, src: TriageSource) -> int:
 
 
 def approve_ready(cfg: config.Config, srcs: list[TriageSource], *,
-                  excluded: set[str] = frozenset()) -> tuple[list[str], dict[str, str]]:
+                  excluded: set[str] | frozenset[str] = frozenset()) -> tuple[list[str], dict[str, str]]:
     approved: list[str] = []
     held: dict[str, str] = {}
     counts: dict[str, int] = {}

@@ -142,6 +142,7 @@ def cmd_guard(args) -> int:
     from .. import guard, scratch
 
     scratch.HOOK.update(root=args.scratch, id=args.scratch_id, saves=args.scratch_saves)
+    guard.LOGIN_FOLDERS = (*guard.LOGIN_FOLDERS, *(paths.expand(path) for path in getattr(args, "closed", ())))
     return guard.main(args.judge, args.open)
 
 
@@ -208,6 +209,7 @@ def register(sub) -> None:
                                      "stops shell commands git cannot undo (reads a payload on stdin)")
     p.add_argument("--judge", action="store_true")
     p.add_argument("--open", action="append", default=[])
+    p.add_argument("--closed", action="append", default=[], help="add a protected grading-context folder")
     scratch_hook(p)
     p.set_defaults(fn=cmd_guard)
 

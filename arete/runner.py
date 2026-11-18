@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import shlex
 import sys
 import time
 from collections.abc import Callable
@@ -17,6 +18,7 @@ from . import (
     claude,
     codex,
     config,
+    context,
     devices,
     environment,
     guard,
@@ -175,18 +177,37 @@ def priced(res: Result, cfg: config.Config) -> float:
     return res.cost_usd
 
 
+def admitted(kw: dict, limits: dict | None) -> dict:
+    if limits is None:
+        return kw
+    if type(limits) is not dict or limits.keys() - {"timeout", "max_tokens", "max_budget_usd"}:
+        raise ValueError("launch admission may narrow only timeout, tokens and spend")
+    for key, value in limits.items():
+        if util.nonnegative_number(value) is None or value <= 0 or (key == "max_tokens" and type(value) is not int):
+            raise ValueError("launch limits must be positive finite numbers, with whole tokens")
+    return {**kw, **{key: min(value, kw[key]) if kw.get(key) is not None else value
+                    for key, value in limits.items()}}
+
+
 def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trace: tuple[str, str] = ("", ""),
         resume: Session = NO_SESSION, cfg: config.Config | None = None, device: devices.Device | str = "local",
         wait_out_limits: bool = True, say: Callable[[str], None] = tell_stderr, ask_jev: bool = True, tier: str = "",
         kind: str = "", waits: Callable[[str], AbstractContextManager] = lambda cause: nullcontext(),
         repo: config.Repo | None = None, remaining_budget: Callable[[], float | None] | None = None,
-        on_launch: Callable[[dict], None] = lambda route: None, settings=None, fallback: bool = True,
+        on_launch: Callable[[dict], dict | None] = lambda route: None, settings=None, fallback: bool = True,
         fresh_prompt: Callable[[str], str] | None = None, try_no: int = 0, resume_only: bool = False,
         route: dict | None = None, refusal: str = "", mode: str = "", layer: config.RepoLayer | None = None,
         scratch: verification_scratch.Attempt | None = None, remaining_tokens: Callable[[], int] | None = None,
         hard_cap: bool = False, needs_server: bool = False, codex_headroom: dict | None = None,
         max_steps: int | None = None, **kw) -> Result:
     cfg = cfg or config.load()
+    if settings and settings.requires.delegation_only:
+        kw.update(tools=[], allowed_tools=[], disallowed_tools=[], instructions=[], mcp_config="", add_dirs=[],
+                  ask_owner=False, persist=False)
+        resume = NO_SESSION
+        ask_jev = False
+        if kw.get("json_schema") is not None:
+            raise ValueError("controller JSON validation belongs to the engine, without hidden restatement calls")
     if max_steps is not None:
         kw["action_limit"] = ActionLimit(max_steps)
     run_with = runner or (resume.runner if not model else "")
@@ -215,11 +236,12 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
                             "until": ""}]
                 return Result(ok=False, runner=which, model=name, session=resume, skipped=skipped,
                               error=" ".join(f"{NO_ROUTE}: {route_reasons(skipped)}".split()))
-        on_launch({"runner": which, "model": name, "effort": kw.get("effort", ""), "skipped": [], "launch": 1,
-                   "env": env_names(model, run_with, cfg, repo, trace[0], kw.get("extra_env"))})
-        text = fresh_prompt(which) if fresh_prompt and resume.id and not kept.id else prompt
+        kw = admitted(kw, on_launch({"runner": which, "model": name, "effort": kw.get("effort", ""), "skipped": [],
+                       "launch": 1, "env": env_names(model, run_with, cfg, repo, trace[0], kw.get("extra_env"))}))
+        text = fresh_prompt(which) if fresh_prompt and not kept.id else prompt
         if remaining_tokens:
-            kw = {**kw, "max_tokens": remaining_tokens()}
+            remaining = remaining_tokens()
+            kw = {**kw, "max_tokens": min(kw.get("max_tokens") or remaining, remaining)}
         return attempt(which, name, text, cwd, kept, cfg, trace, record_id, target, kw, tier, kind,
                        accounts.Auth(), {"launch": 1, **({"selection": route} if route else {})}, try_no,
                        atom)
@@ -279,7 +301,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
                                    launch_kw.get("ask_owner", False)),
                  "skipped": skipped, "launch": launches,
                  **({"request_tokens": final_size} if trip.request.requires.declared else {})}
-        on_launch(route)
+        launch_kw = admitted(launch_kw, on_launch(route))
         started = util.iso()
         with verification_scratch.producing(launch_kw.pop("verification_attempt", None)):
             res = attempt(chosen_route.runner, picked.name, text, cwd, session, cfg, trace, record_id, target, launch_kw,
@@ -599,11 +621,13 @@ def session_for(trip: Trip, picked: Picked, prompt: str, fresh_prompt: Callable[
     usable = saved.id and saved.runner == which and (
         not saved.account or saved.account == account_of(picked.auth)
         or devices_store.refresh_continues(saved.generation, picked.auth.generation))
-    fresh = fresh_prompt(which) if fresh_prompt and saved.id else prompt
-    if previous is None:
-        return (prompt, saved) if usable else (fresh, NO_SESSION)
-    if continues(previous, picked, kw.get("persist", True)):
+    if previous is None and usable:
+        return prompt, saved
+    if previous is not None and continues(previous, picked, kw.get("persist", True)):
         return CONTINUE_AFTER_LIMIT, previous.res.session
+    fresh = fresh_prompt(which) if fresh_prompt else prompt
+    if previous is None:
+        return fresh, NO_SESSION
     stopped = previous.res
     last = (record.last_message(paths.record_dir(record_id) / stopped.record, claude.USAGE_LIMIT_TEXT)
             if stopped.record else "") or stopped.text
@@ -632,13 +656,26 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
     cfg, repo, target = trip.cfg, trip.repo, trip.target
     which = picked.candidate.runner
     floor = None if target.remote else guard.floor(trace[0], cwd or Path.cwd(), kw.get("add_dirs") or [])
+    closed_context = tuple(Path(path).absolute() for path in kw.pop("closed_context", ()))
+    if closed_context:
+        if target.remote:
+            raise ValueError("closed grading context requires a local runner")
+        floor = replace(floor, closed=(*floor.closed, *closed_context))
     kw["effort"] = picked.candidate.effort
     kw["instructions"] = list(picked.candidate.instructions)
+    request = getattr(trip, "request", None)
+    if request and request.requires.delegation_only:
+        if target.remote or not traits_of(which).delegation_only:
+            raise ValueError("controller route lacks local tool-free execution")
+        kw.update(tools=[], allowed_tools=[], instructions=[], mcp_config="", add_dirs=[], ask_owner=False)
     asking = bool(kw.pop("ask_owner", False)) and not target.remote
     if target.remote:
         kw["remote"] = target
     else:
         kw["passing"] = environment.passed(cfg, repo)
+        if which == "pi":
+            roots = trip.layer.read_roots if trip.layer and not (request and request.requires.delegation_only) else ()
+            kw["read_roots"] = tuple(Path(root) for root in roots)
         kept = {n: v for n, v in environment.stored(repo).items() if not reserved(n)}
         if picked.selected:
             kept = {n: v for n, v in kept.items() if n not in picked.selected.env}
@@ -669,18 +706,21 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
         else:
             kw.pop("max_budget_usd", None)
         if not target.remote:
-            kw = local_claude(kw, cfg, trace[0], ask_jev, say, repo, hook, floor=floor)
+            kw = local_claude(kw, cfg, trace[0], ask_jev, say, repo, hook, floor=floor, closed_context=closed_context)
     elif which == "codex":
         kw.pop("max_budget_usd", None)
         if not target.remote:
             kw = local_codex(kw, cfg, trace[0], say, repo, hook, floor=floor)
     elif which == "pi":
+        if request and request.requires.delegation_only:
+            kw["delegation_only"] = True
         kw["price"] = lambda reply: priced(reply, cfg)
         kw["max_budget_usd"] = picked.budget
         kw["selected"] = picked.selected
         if not target.remote:
             kw["providers"] = cfg.environment.providers
             kw["floor"] = floor
+            kw["judge"] = cfg.jev.guard
     if uploads.granted(kw.get("allowed_tools")) and (not TRAITS[which].uploads_supported or target.remote):
         kw["allowed_tools"] = uploads.without(kw["allowed_tools"])
         browser.with_note(kw, uploads.WITHHELD)
@@ -734,6 +774,8 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
             kind: str = "", auth: accounts.Auth | None = None, route: dict | None = None, try_no: int = 0,
             atom: str = "") -> Result:
     auth = auth or (authentication(name, which, cfg=cfg, device=target) if which != REPLAY else accounts.Auth())
+    if target.remote and which == "claude":
+        kw["leaf"] = f"{record.slug(trace[1])}-{try_no}"
     route = route or {}
     header = {"runner": which, "model": name, "device": target.name, **origin(cwd, cfg, target), "cwd": str(cwd),
               "auth_mode": auth.mode, "credential": route.get("credential", ""), "billing": route.get("billing", ""),
@@ -751,6 +793,9 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
               "budget_tokens": kw.get("max_tokens"), "refused": kw.get("budget_error", ""),
               "timeout": kw.get("timeout"), "effort": kw.get("effort", ""),
               "resume": {"runner": resume.runner, "id": resume.id, "spent_usd": resume.spent_usd} if resume.id else None}
+    header["context"] = context.inventory(
+        prompt, kw.get("system", ""), kw.get("json_schema"), resumed=bool(resume.id),
+        instructions=kw.get("instructions"), allowed_tools=kw.get("allowed_tools"), mcp_servers=header["mcp_servers"])
     if atom:
         header["atom"] = atom
     if route.get("selection"):
@@ -804,7 +849,8 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
             if budget_error:
                 res = Result(ok=False, error=budget_error, session=resume, runner=which, model=name)
             elif which == REPLAY:
-                res = meter.guard(replay.run, cwd, trace, cfg, meter.watching(rec.line), resume, kw.get("timeout"))
+                res = meter.guard(replay.run, cwd, trace, cfg, meter.watching(rec.line), resume, kw.get("timeout"),
+                                  prompt=prompt)
             elif which == "codex":
                 protected = [sandbox.AUTHORITY, paths.WORKTREES_DIR]
                 res = meter.guard(codex.run, prompt, cwd, model=name, resume=resume,
@@ -882,10 +928,15 @@ def secret_files(folders: list[Path | str], target: devices.Device, cfg: config.
 
 
 def local_claude(kw: dict, cfg: config.Config, run_id: str, ask_jev: bool, say: Callable[[str], None],
-                 repo: config.Repo | None, scratch: tuple[str, ...] = (), *, floor: guard.Floor) -> dict:
+                 repo: config.Repo | None, scratch: tuple[str, ...] = (), *, floor: guard.Floor,
+                 closed_context: tuple[Path, ...] = ()) -> dict:
     kw = {**kw, "extra_env": {**(kw.get("extra_env") or {}), **run_env(run_id)}}
     if guard.wanted(kw.get("tools")):
         kw["settings"] = guard.settings(cfg.jev.guard, floor.open)
+        if closed_context:
+            for group in kw["settings"]["hooks"]["PreToolUse"]:
+                for hook in group["hooks"]:
+                    hook["command"] += " " + shlex.join([arg for path in closed_context for arg in ("--closed", str(path))])
         if scratch:
             for group in kw["settings"]["hooks"]["PreToolUse"]:
                 for hook in group["hooks"]:

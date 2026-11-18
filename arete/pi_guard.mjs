@@ -48,7 +48,7 @@ function info(path) {
     try {
         return statSync(path, { bigint: true });
     } catch (error) {
-        if (error.code !== "ENOENT" && error.code !== "ENOTDIR") throw error;
+        if (!["ENOENT", "ENOTDIR", "EACCES", "EPERM"].includes(error.code)) throw error;
         return undefined;
     }
 }
@@ -75,13 +75,48 @@ export default function (pi) {
             .some(path => typeof path !== "string" || !isAbsolute(path))) {
         throw new Error("Arete's credential boundary requires absolute protected paths");
     }
+    if (metadata.delegation_only) {
+        const refuse = () => {
+            writeSync(2, "Arete controller refused tools, ambient context or an unadmitted provider request.\n");
+            process.exit(78);
+        };
+        let requests = 0;
+        pi.on("before_agent_start", event => {
+            const options = event.systemPromptOptions;
+            if (!options || pi.getActiveTools().length || options.contextFiles?.length || options.skills?.length) refuse();
+            writeSync(1, JSON.stringify({ type: "arete_controller_profile", tools: pi.getActiveTools(),
+                context_files: options.contextFiles?.length ?? 0, skills: options.skills?.length ?? 0 }) + "\n");
+        });
+        pi.on("before_provider_request", event => {
+            if (++requests > 1 || pi.getActiveTools().length || !event.payload
+                || !Array.isArray(event.payload.tools ?? []) || event.payload.tools?.length) refuse();
+        });
+        pi.on("tool_call", () => ({ block: true, reason: "Controllers delegate through Arete only.", terminate: true }));
+    }
     if (process.env.PI_CODING_AGENT_DIR) {
         const agent = resolve(process.env.PI_CODING_AGENT_DIR);
         const auth = join(agent, "auth.json");
         metadata.roots.push(agent);
         metadata.files.push(auth, auth + ".lock", canonical(auth), canonical(auth) + ".lock");
     }
-    const inodes = new Set();
+    if (metadata.shell) {
+        pi.on("before_agent_start", () => {
+            const shell = pi.getAllTools().find(tool => tool.name === "bash");
+            if (!shell?.sourceInfo?.path || resolve(shell.sourceInfo.path) !== resolve(metadata.shell_file)) {
+                writeSync(2, "Arete refused an unguarded shell implementation.\n");
+                process.exit(78);
+            }
+        });
+    }
+    const glob = pattern => new RegExp("^" + pattern.split("*")
+        .map(part => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$");
+    const secretNames = (metadata.secret_names ?? []).map(glob);
+    const safeNames = (metadata.safe_names ?? []).map(glob);
+    const secretDirs = new Set(metadata.secret_dirs ?? []);
+    const secret = path => path.split(sep).slice(0, -1).some(part => secretDirs.has(part))
+        || (secretNames.some(pattern => pattern.test(basename(path)))
+            && !safeNames.some(pattern => pattern.test(basename(path))));
+    const inodes = new Set(metadata.inodes ?? []);
     const writeInodes = new Set();
     const remember = (path, identities = inodes) => {
         const stat = info(path);
@@ -95,8 +130,10 @@ export default function (pi) {
             });
         }
     };
-    metadata.files.forEach(path => remember(path));
-    rememberWrites();
+    if (!metadata.delegation_only) {
+        metadata.files.forEach(path => remember(path));
+        rememberWrites();
+    }
     if (process.env.ARETE_PI_REFRESH_FD !== undefined) {
         const descriptor = Number(process.env.ARETE_PI_REFRESH_FD);
         const acknowledgement = Number(process.env.ARETE_PI_REFRESH_ACK_FD);
@@ -130,7 +167,7 @@ export default function (pi) {
         });
     }
     pi.on("tool_call", (event, ctx) => {
-        if (event.toolName === "ask_owner") return undefined;
+        if (event.toolName === "ask_owner" || (event.toolName === "bash" && metadata.shell)) return undefined;
         try {
             if (!tools.has(event.toolName)) return { block: true, reason };
             const writing = event.toolName === "edit" || event.toolName === "write";
@@ -148,6 +185,7 @@ export default function (pi) {
             if (writing) rememberWrites();
             const blocked = (path, stat = info(path)) => {
                 const real = canonical(path);
+                if (secret(path) || secret(real) || (stat?.isFile() && stat.nlink > 1)) return true;
                 if (writing && metadata.write_roots.some(root => within(resolve(root), path)
                     || within(canonical(root), real))) return true;
                 if (protectedFiles.some(file => within(file, path) || within(file, real))) return true;

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import os
 import shlex
@@ -9,6 +10,7 @@ import sys
 import threading
 import time
 import traceback
+from concurrent.futures import CancelledError
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,6 +20,7 @@ from . import (
     config,
     control,
     delivery,
+    device_turns,
     devices,
     diffguard,
     emits,
@@ -36,7 +39,7 @@ from . import (
     util,
     vault,
 )
-from .agent import Result
+from .agent import Cut, Result
 from .loops import Loop
 from .store import approvals as approvals_store
 from .store import db as foundation
@@ -47,6 +50,7 @@ from .store import runs as run_store
 KNOWN_FINDINGS_SHOWN = 30
 KNOWN_FINDINGS_ASKED = 200
 OUTPUT_TAIL = 6000
+COMMAND_LEAVES = itertools.count(1)
 PROBLEM_FIELDS = ("title", "summary", "location", "evidence")
 PROBLEM_SHOWN = 6000
 COMMITS_READ = 60
@@ -183,11 +187,11 @@ class OutputSinks:
         self.on_line = on_line
         try:
             self.out = self.stack.enter_context(output_log(output))
-        except Exception as e:
+        except (OSError, ValueError) as e:
             self.stopped(e)
 
     def stderr(self, text):
-        with suppress(Exception):
+        with suppress(OSError, ValueError):
             sys.stderr.write(text)
             sys.stderr.flush()
 
@@ -198,7 +202,7 @@ class OutputSinks:
                 self.out.write(note)
                 self.out.flush()
                 return
-            except Exception as e:
+            except (OSError, ValueError) as e:
                 self.close()
                 self.stderr(f"[arete] feed stopped: {e}\n")
         self.stderr(note)
@@ -208,19 +212,21 @@ class OutputSinks:
             try:
                 self.out.write(line)
                 self.out.flush()
-            except Exception as e:
+            except (OSError, ValueError) as e:
                 self.close()
                 self.stopped(e)
         if callback and self.on_line is not None:
             try:
                 self.on_line(line.rstrip("\n"))
+            except (record.Stopped, StoppedByAgent, OverBudget, Cut, CancelledError):
+                raise
             except Exception as e:
                 self.on_line = None
                 self.stopped(e)
 
     def close(self):
         self.out = None
-        with suppress(Exception):
+        with suppress(OSError, ValueError):
             self.stack.close()
 
 
@@ -246,11 +252,45 @@ def exits_by(proc: subprocess.Popen, deadline: float) -> bool:
 
 def run_command(argv: list[str], cwd: Path | str, *, timeout: float, env: dict, device: devices.Device,
                 stdin: str = "", output: Path | None = None, on_line=None) -> tuple[int, str]:
+    if device.remote:
+        lines = []
+        delivered = 0
+        sinks = OutputSinks(output, on_line)
+
+        def emit(text):
+            lines.append(text)
+            sinks.write(text)
+
+        def line(text):
+            nonlocal delivered
+            delivered += len(text)
+            emit(text)
+
+        def mark(kind, offset):
+            emit(f"[arete] {'reattaching' if kind == 'attach' else 'lost the device'} at byte {offset}\n")
+
+        try:
+            result = device_turns.run(device, argv, cwd, env, stdin, timeout=timeout, on_line=line,
+                                     on_mark=mark, leaf=f"command-{next(COMMAND_LEAVES)}", merge_stderr=True)
+            return result.returncode, "".join(lines)
+        except (device_turns.Lost, subprocess.TimeoutExpired) as error:
+            retained = error.output or ""
+            if isinstance(retained, bytes):
+                retained = retained.decode(errors="replace")
+            if suffix := retained[delivered:]:
+                emit(suffix)
+            if isinstance(error, device_turns.Lost):
+                return devices.ssh.SSH_FAILED, "".join(lines)
+            note = f"\n[arete] stopped after {timeout:g}s\n"
+            sinks.write(note, callback=False)
+            return util.TIMED_OUT, "".join(lines) + note
+        finally:
+            sinks.close()
     local = not device.remote
     trusted = bool(argv and argv[0] == "arete" and local)
     if trusted:
         argv = control.command(argv[1:])
-    full = devices.wrap(device, argv, cwd, env)
+    full = argv
     deadline = time.monotonic() + timeout
     from . import scratch
 

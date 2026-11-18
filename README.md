@@ -69,59 +69,11 @@ five seconds in the rolling last hour and names its caller; `db:size` warns when
 `[retention] db_max_mb` (default 500 MiB); `runs:size` warns above half `max_gb` (decimal GB), counting record/
 and all other run-folder bytes. These checks read current files, so they also work before the first collection.
 
-Run the merge resolver exercises with `<sandbox> python docs/resolve-fixture.py base-moved`,
-`unrelated-edit`, `protected`, or `branch-moved` (replace the final scenario name). Each uses fresh offline Git
-repositories under `.arete-sandbox/resolve-fixture` and exits nonzero on a mismatch. Successful moves print clean
-merge parents and combined content; refusal cases print the rejected path and resolver call count. `base-moved`
-also checks an explicit incoming commit override and saves the emitted prompts beside each disposable repository.
-
-Run the offline exercises through the supplied verification sandbox, replacing `<sandbox>` with its executable path:
-
-```sh
-<sandbox> python docs/db-fixture.py transactions
-<sandbox> python docs/db-fixture.py concurrent-intake
-<sandbox> python docs/db-fixture.py transaction-timing
-<sandbox> python docs/db-fixture.py output-sinks
-<sandbox> python docs/db-fixture.py durable-files
-<sandbox> python docs/db-fixture.py wal-startup
-<sandbox> python docs/db-fixture.py prune-restore
-<sandbox> python docs/db-fixture.py restore-safety
-<sandbox> python docs/db-fixture.py feed-cursors
-<sandbox> python docs/db-fixture.py backup-health
-<sandbox> python docs/db-fixture.py coherent-reads
-<sandbox> python docs/db-fixture.py event-contract
-<sandbox> python docs/db-fixture.py database-health
-<sandbox> python docs/db-fixture.py legacy-cleanup
-<sandbox> python docs/db-fixture.py browser-seed
-<sandbox> python docs/db-fixture.py browser-serve --port 8765
-<sandbox> python docs/db-fixture.py inspect
-```
-
-Each exercise starts a subprocess with disposable config, state, logs, worktrees, temporary files and HOME before
-importing arete, refuses production state, uses offline fakes and exits nonzero on a behavioral mismatch. Readable
-evidence, stdout and stderr remain under `.arete-sandbox/db-fixture/<exercise>-*/`; `inspect` reviews the latest
-results and journal/synchronous settings. Contention exercises use ordinary rollback-journal SQLite files, not the
-confined scratch connection's MEMORY journal. Source fetch barriers, transaction cleanup, snapshots, migrations,
-restore isolation, oncall ordering, output draining and durable replacement failures are exercised there.
-
-The new exercises retain read-connection/cutoff evidence, concurrent-commit barriers, event-contract blockers,
-health aggregation/collection beats and real startup cleanup evidence. Reuse prune-restore, restore-safety,
-backup-health and feed-cursors for backup retention, copy and restore regressions.
-
-`browser-seed` records a shared disposable fixture directory in `db-fixture/browser.json`; `browser-serve`
-uses it until Ctrl-C and is excluded from the finite exercise list. Open http://127.0.0.1:8765/ and the printed
-`/#run/local`, `/#run/replay`, `/#run/subscription`, `/#run/api-key` and `/#run/mixed` links. Open the chat console
-on `/#live` to select the seeded chat; its messages, session list and report also have printed API links.
-http://127.0.0.1:8765/ui.html uses the same data. The fixture binds loopback with a fake owner identity and uses
-the real Handler and admission checks; it does not change production routes or authentication.
-
 ## Serve
 
 `arete serve` is the one daemon. It fires each loop on its trigger (a cron line, an interval, a source with new events, a webhook), runs the fired loops through their queues, closes idle sessions, writes a beat to `serve.json` every 20 seconds, and serves the dashboard. `arete install` runs it at login: one launchd agent, `com.arete.serve`, on a Mac, or one systemd user unit, `arete-serve.service`, on Linux. It retires the old per loop agents (`com.arete.heartbeat`, `poll`, `mine`, `audit`, `eval`, `triage`, `dashboard`), since each of those now runs as a loop under serve. `arete install --dry-run` prints what it would write. A loop run killed with serve settles as interrupted; its queued input gets one recovery retry when serve starts again, then becomes dead if interrupted again.
 
 A failing loop, stage, queue item or approval costs only itself: serve logs `<key>: tick failed: <error>` once, keeps going with everything else, and the beat names the failing keys (`failing`, `tick_ok`, `last_ok`) with the error, when it began and how many passes in a row. `arete status`, the dashboard and the heartbeat then say serve is up but its tick fails at that key; three passes in a row make the beat stuck. When a loop, the dispatcher or the whole tick fails for 3 minutes, serve raises the `serve:tick` alert and clears it on the first clean pass. Every stage added to serve's tick runs under its own guard key (`Server.guard`), never bare in `tick`.
-
-`docs/serve-bulkhead-fixture.py` exercises this offline, with real HTTP responses and rendered pages, in a sandbox under `.arete-sandbox/serve-bulkhead` (replay on, JEV off, no provider, VM, notification or tracker calls). `python docs/serve-bulkhead-fixture.py serve --port 8765` starts it; `scenario NAME --passes N` drives that many real `Server.run_pass` calls (names: clean, loop, recover, oncall, approvals, queue, waits, alerts, fresh-alert, bad-config, states, beat, guard, retirement, command), and `inspect` prints the raw beats, launches, claims, summaries, heartbeat checks and alert calls of the last scenario. `recover` clears the faults the last scenario injected. Production still ticks every 20 seconds; the fixture runs its passes at once.
 
 A killed loop's queued input gets one automatic recovery retry when serve reaps it; a second interrupted attempt becomes a dead item. Failed runs and requested stops keep event input as dead items for inspection and manual requeue. Empty schedule inputs are discarded on failure or coalesced with an already waiting fire on recovery.
 
@@ -282,14 +234,14 @@ Before a new incident is opened, JEV may match a differently worded symptom to a
 A symptom whose twin check reads as an injection is opened already marked and can never wake a model.
 Twin checks and decisions share one budget: at most 20 JEV evaluations per scan, and the rest wait for the next.
 A symptom from a run that is still live gets no twin check and no decision until the run ends.
-All calls go through `oncall.ask_jev`, one function a test harness can replace.
+All calls go through `oncall.ask_jev`.
 
 **Repairs.** Each scan, an incident decided `wake` starts one local task of kind `fix` with `tasks.start`, in the config's `arete_repo` for Arete's own sources (the heartbeat, serve, a run, or Arete's log and run folders) and in the source's `repo` otherwise.
 So planning, the isolated worktree, checks, verify, review, the PR, automerge and the permission rules are the ones every task has.
 The task prompt is `arete/prompts/oncall_repair.md`: diagnose and reproduce first, then make the smallest repair; the redacted evidence is a fenced block marked as untrusted data.
 Before a wake, Arete resolves the plan, build, verify, review and repair steps of that repo with `steps.resolve` and checks each with `routing.fit_refusal`, `routing.modes_for` and `routing.outlook`.
 A hold, a spent budget or a payment mode refusal leaves the incident `waiting` with that reason; with `payment_modes = ["subscription"]` no paid route is used, and no hold is bypassed.
-Task start, run stop, the route lookup, the check run and the alerts go through `oncall.start_task`, `oncall.stop_run`, `oncall.route_outlook`, `oncall.run_check`, `oncall.raise_alert` and `oncall.clear_alert`, which a harness can replace.
+Task start, run stop, the route lookup, the check run and the alerts go through `oncall.start_task`, `oncall.stop_run`, `oncall.route_outlook`, `oncall.run_check`, `oncall.raise_alert` and `oncall.clear_alert`.
 
 | `[oncall]` key | Default | Bound |
 | --- | --- | --- |
@@ -342,7 +294,6 @@ arete oncall on
 
 `--json` prints one JSON line per incident (`scan --json` prints the summary).
 While the watcher is on, the heartbeat's `oncall:scan` check fails when the last scan crashed or is more than five minutes old.
-The regression checks are in `tests/test_oncall.py` and run with `uv run python -m unittest discover -s tests -v`.
 
 ## Runners, devices and sessions
 
@@ -411,6 +362,12 @@ note = "Hetzner box"
 
 `arete devices` lists them with their last probe; `arete devices probe NAME` checks the device answers and lists which of `claude`, `pi`, `codex`, `arete` and `ollama` it has.
 Arete's ssh never forwards your ssh agent, so an agent on a device cannot use your keys.
+A remote turn survives a dropped ssh session; its prompt and output live under `.arete/turns` in the device dir until it ends, and a turn whose orchestrator is gone stops within the lease TTL (currently 10 minutes), followed by the existing stop grace before forced KILL.
+Remote turns require Bash, including when launched through `setsid`, plus `ps` and standard Unix tools such as `sh`, `cat`, `wc`, `tail`, `head`, `sleep`, `mkdir`, `mv`, `touch` and `rm`.
+They use `setsid`, or Bash job control on macOS, and verify the process group before starting work.
+Relative device and working directories resolve from the remote login directory.
+
+New remote turns wait for the remote-turn schema contract: older runs, loops, sessions and serve processes must end before `arete migrate` can apply it.
 
 A device of kind `exe` is a sandbox on [exe.dev](https://exe.dev).
 Each run gets a VM of its own, works on it over ssh, and deletes it when the run ends.
@@ -622,7 +579,7 @@ The agent runs as your user, so it can still read a file your user can; the guar
 JEV is a classifier model from TypeSafe, reached through OpenRouter. It reads text and answers a yes or no question, picks one of a few labels, or rates on a scale, each with a confidence, fast and for $0.042 per million input tokens. Arete asks it first where a classifier can settle the question, and leaves the question to the model only when JEV is unsure:
 
 - Loops: a loop fed by outside text drops each event JEV reads as instructions to an agent before the agent sees it, and a ticket emit drawn from outside text waits for approval on the same check. A `[classify]` step asks JEV first and sends only the events it is unsure of to the model. A finding JEV matches to a known one, even worded another way, counts as that finding, not a new one.
-- Risk: the automerge of a pipeline PR, opened, pushed to or checked again by the run, waits for a person when JEV rates the diff risky (how much depends on what it changes, how near it comes to credentials, money or data, and how far it strays from its description), or reads it as a change a revert will not undo.
+- Risk: a pipeline PR waits for a person if JEV is unavailable, cannot judge the diff, rates it risky, or reads it as a change a revert will not undo.
 - Push screen: a `push` emit under `automerge` that no static rule holds lands only when JEV reads its diff as a narrow fix.
   It waits for approval when JEV's chance for one screen question reaches that question's line in `[jev.screen_lines]`: the diff weakens a protection, exposes credentials or personal data, sends data somewhere new or builds a command from outside text, does harm a revert will not undo, adds a capability, removes a behavior instead of fixing it, or renames something other code or config uses, or it reaches past the fix it names.
   The approval names each question that held it, with JEV's chance and the question's line.
@@ -668,7 +625,9 @@ JEV is a classifier model from TypeSafe, reached through OpenRouter. It reads te
 - `arete ask QUESTION [PATHS] [--choice A B] [--score LOW HIGH] [-r] [--only ANSWER] [--json]` asks JEV about piped text, or about each file, sixteen at a time. Agents that can run commands get it, with a short note on when it pays: sort files before reading them, sort a test failure before digging in, check a diff against its task. An agent may ask only about files inside its working folder, and never about secret files.
 
 JEV uses the OpenRouter key the pi runner uses: `OPENROUTER_API_KEY` in `~/.config/arete/pi.env`, or in arete's environment.
-The guard runs inside the agent, which no longer gets the server's environment (see [An agent's environment](#an-agents-environment)), so a key set only in arete's environment leaves the guard with no judge. Its directory floor and secret file rules remain active.
+The Claude and Codex guard hooks run inside the agent, which no longer gets the server's environment (see [An agent's environment](#an-agents-environment)), so a key set only in arete's environment leaves those hooks with no judge.
+Their directory floor and secret file rules remain active.
+Pi's shell guard runs in the trusted engine-side broker and can use the engine's configured JEV key without passing it to commands.
 `arete serve` says so when it starts, and so does the run log of each claude step that can run commands; put the key in `pi.env` to give the guard its judge back.
 With no key, with JEV off, or when a call fails, each step does what it did before JEV, with one exception: when the push screen's or the proof check's call fails, the push waits for approval, because a push lands with no PR to review.
 When the already fixed check fails, the run goes on.
@@ -681,24 +640,6 @@ Set `jev = false` on a repo whose code or tickets must not leave the machine.
 Poll starts detached runs and fills the available capacity round robin across repos, checking each ticket's dependencies, process budget and model routes before launch. Each poll examines at most 64 distinct tickets, so blocked tickets and failed starts cannot create an unbounded loop. A ticket selected in this poll stays excluded while its child process initializes. `max_parallel` sets how many runs go at once on the machine, manual runs included; an `arete experiment` trial holds a slot too, and starts only on a free one with no run waiting to take a slot back and no ready ticket passed over. A run frees its slot while it waits on its PR's CI, and takes one back before a CI fix step. A run that waits to take its slot back goes ahead of new runs: while it waits, no new run starts, even on a free slot. It reads `max_parallel` again every 30 seconds, so a raised limit lets it go at once. `arete status` lists it as waiting for a run slot, and a run in its CI wait as waiting on CI without a run slot. A repo with `max_parallel_per_repo` runs going, counting runs in their CI wait and manual runs, gets no new one from poll; `arete run` by hand is held only by `max_parallel`.
 
 Pipeline budgets span repairs, continuations and individual step reruns. The defaults allow two repair calls, 60 minutes of total active run time and 20 minutes inside verification, including verification repairs and service waits. The checks that run again after a verification repair count as run time, not verification time. A deadline interrupts the current call through its existing cleanup and parks the ticket as failed, leaving its available workspace, branch and evidence in place and releasing its slot. Active time is measured on the run's own clock and stored on its database row: machine sleep, a suspended VM and the time before a dead run is reaped are free. A killed run and its open verification phase count up to their last checkpoint, at most 30 seconds short. Runs from before this change receive a frozen wall-clock estimate. The run log and a `budget_chain` event name each parent's charged run minutes, verification minutes and repair calls, marking estimates; `parked.json` keeps the same map under `charged` beside the reason it stopped. After the budget schema contract applies, `budget.json` holds only lineage, policy, specification and excluded wait minutes. A `limit` wait (a usage limit or credit hold) and a `slot` wait for a free run slot are left out, in the run and in the earlier runs of its chain. The deadline does not fire during such a wait and moves out by its length. `ci` waits and time inside verification, service waits included, still count, and `max_verify_minutes` keeps counting during a `limit` wait. `budget.json` and `parked.json` list the minutes left out by cause under `wait_minutes_left_out` (this run) and `earlier_wait_minutes_left_out` (earlier runs of the chain). Repeating an unchanged parked request starts no model call. Change the ticket's title or body, published branch head, or budget settings and retry with `arete run REPO TICKET --force` to begin a new budget. A forced run of a chain that did not park leaves out the repair calls, run minutes and verification minutes that earlier runs spent under a different title or body, writes one log line saying how much it left out, and lists those runs under `left_out` in `budget.json`. A run whose specification was not recorded still counts, and so does every run when the specification is unchanged or the run is a repair, a continuation or started by poll. Parking does not approve a review, remove a hold or enable a merge. A run that ends with its workspace left in place, parked or failed, commits its uncommitted edits to the local branch with an `Arete-Run: RUN_ID` trailer and pushes nothing; `parked.json` lists the kept head and the commit beneath it under `kept`, and the workspace record keeps them for any later run. The next run of the ticket, forced, resumed or prepared again, continues from that commit when the worktree still matches the record, merged with `origin/BRANCH` or the base when either moved, and tells the build that the worktree holds those edits; the diff limit, the checks and the review count them as part of the change, and the next push sends them. A worktree that was reset, moved to another branch or edited by hand is refused with what changed; remove the worktree and the local branch to start from origin.
-
-Exercise stored run budgets offline with the sandbox launcher:
-
-```sh
-SANDBOX=/Users/justin.barnett/Library/Developer/arete/verification-runtime/harness/sandbox
-$SANDBOX python docs/run-budget-fixture.py sleep
-$SANDBOX python docs/run-budget-fixture.py forced-columns
-$SANDBOX python docs/run-budget-fixture.py row-precedence
-$SANDBOX python docs/run-budget-fixture.py killed-verify
-$SANDBOX python docs/run-budget-fixture.py migrations
-$SANDBOX python docs/run-budget-fixture.py migration-errors
-$SANDBOX python docs/run-budget-fixture.py checkpoint-errors
-$SANDBOX python docs/run-budget-fixture.py admission
-$SANDBOX python docs/run-budget-fixture.py waits
-$SANDBOX python docs/run-budget-fixture.py inspect
-```
-
-Each exercise uses fresh disposable state and a local replay sample, prints `BEHAVIOR_RESULT` JSON, and retains database rows, logs, migration evidence and local published branches beneath `.arete-sandbox/run-budget-fixture/`. `inspect` reads the retained evidence. These exercises never use production state or a model.
 
 A laptop sleeps and drops its network. When poll, triage or the heartbeat start offline, most often just after a wake, they wait up to 3 minutes for the network; if it does not come back they skip with an "offline" note and exit 0. A git or gh call that fails on a network error waits up to 30 minutes for the network, then tries once more. An agent step cut off by a dropped connection resumes its own session when the network is back. A run whose process died is put back in the queue with a comment on the ticket, and the next poll starts it again; a second death in a row fails the run as before. Heartbeat ages count only time awake, so a night asleep never reads as a stale log.
 
@@ -724,14 +665,24 @@ Headers, results, timeline `agent` marks and SQLite step rows also carry `auth_m
 When a call leaves the model to the runner's default, arete holds the header until the runner names the model it runs (claude's `init` event or pi's first reply), for at most 10 seconds, so the header names the model the default turned out to be.
 Then come the runner's own lines unchanged: claude's `stream-json` events, pi's `--mode json` events, or codex's `exec --json` events after one `command` line with the argv arete ran.
 A clock line with the seconds since the start goes in before a runner line whenever a second or more has passed since the last one.
+Every call header also has a versioned `context` inventory: fresh or resumed session, prompt and system sizes in Unicode characters and UTF-8 bytes, the serialized schema size, instruction scopes, tool-rule count and MCP-server count.
+These are the explicit inputs the engine supplied, not token estimates or a measurement of resumed history, loaded instruction files or runner-injected tool definitions.
+The result's `first_context_tokens` remains the runner-reported first-turn measurement, or zero when unavailable.
+Inspect both with `arete record RUN_ID STEP`; the inventory adds no prompt text or credentials to the existing record.
 The last line is the result: ok, error, text, structured answer, cost, tokens, first turn's input tokens, turns, model, session and seconds.
 A call that crashes ends with a result whose error starts with `crashed:`, and a call stopped on request (a stop from the CLI or the dashboard, or ctrl-c) ends with the error `stopped by request`.
 Neither has a cost or a turn count, in its result or in its timeline mark, because the runner never reported one.
 
 `steps.jsonl.gz` in the same folder is the run's timeline, one line per mark: `create` (a fresh sandbox), `lease`, `clone`, `boot`, `release`, `worktree`, `setup`, `check`, `diff` (with the staged patch), `agent` (one per call, naming its record file and its `atom`) and `result` (the run's final status).
 Each mark has its start time, and the marks that time something have their seconds.
-Classic `step_end` lines and saved step results include `auth_mode`, joining distinct modes with `, ` when a step retries across modes. Saved results also retain the `auth_modes` list and aggregate `paid_usd`. Seam `step_end` lines join distinct modes like their other call labels; a joined value describes several calls, not one authentication mode. Individual results keep their own mode. A pi schema restatement keeps the original route, provider and configuration; its usage gets a separate step row, and the combined record result lists each call's mode, paid amount and usage in `calls`, alongside aggregate `auth_modes` and `paid_usd`.
-The trusted Pi guard reports completed SDK credential refreshes through a private pipe, so restatement and pinned retries can follow token rotation even when the provider exposes no stable account identity. Refresh continuity stays within the invocation and outside records; unrelated login replacements are refused.
+Classic `step_end` lines and saved step results include `auth_mode`, joining distinct modes with `, ` when a step retries across modes.
+Saved results also retain the `auth_modes` list and aggregate `paid_usd`.
+Seam `step_end` lines join distinct modes like their other call labels; a joined value describes several calls, not one authentication mode.
+Individual results keep their own mode.
+Pi no longer launches a hidden schema-restatement call: a missing structured answer fails the admitted call while retaining its usage.
+Historical multi-call records remain readable with their original `calls`, authentication modes and usage.
+The trusted Pi guard reports completed SDK credential refreshes through a private pipe, so pinned retries can follow token rotation even when the provider exposes no stable account identity.
+Refresh continuity stays within the invocation and outside records; unrelated login replacements are refused.
 
 Subscription limit holds are qualified by subscription family, nonsecret account identity and limit scope. Matching Codex and pi openai-codex ChatGPT account IDs share `codex`. Claude's all-model, opus and sonnet limits remain distinct; Codex's limit covers its family. Different accounts never share a hold. An unknown identity can wait only within its own invocation. Old unqualified holds expire without becoming pi holds.
 Discovery reads login metadata separately from launching an agent. Opaque Claude OAuth credentials can use a read-only profile lookup with a short timeout, a response-size bound and no redirects. Only nonsecret identity snapshots and one-way fingerprints are cached; credentials and profile bodies never enter records. A changed credential, account or login directory invalidates discovery, including on bounded wakeups while waiting. Only a successful subscription call clears older applicable holds for its captured account and scope; API-key success cannot clear them. Reset slack, session continuation and original-prompt retries still apply.
@@ -788,22 +739,6 @@ Hook events rotate monthly from `events.jsonl` into `events-YYYYMM.jsonl`, named
 Each immutable migration lives in `arete/store/migrations/mNNNN_area_name.py`, with `PHASE` and exactly one `SQL` string or `apply(conn)`. Areas come from public store modules declaring literal `TABLES` dictionaries; `foundation` maps to `db`. Each table appears in exactly one owner's `TABLES`, mapped to its retention policy. A future aggregate gains a valid migration area by adding its public module and literal `TABLES` dictionary before adding its migration. Helpers and packages are not owners, and `outbox` is refused until its owner exists. Only the historical `m0004_work_event_routing.py` resolves `work` to `loops`; existing ledger rows stay unchanged. Numbers start at 1 without gaps or repeats. `latest.txt` names the highest file, so branches adding the same next number conflict there. The loader refuses a changed SHA-256 for any applied file. Add a new migration to repair an earlier one.
 
 Import connections with `from arete.store import db` and persistence functions through their owner modules. `store.runs` owns recording SQL, history, billing helpers (`paid_by_run`, `loop_spent_since`), reports, feed, pins and folder-purge scheduling; `record.py` keeps IDs, timelines and filesystem cleanup. Loops owns queue recovery, events, loop state, findings and loop locking. Sources owns seen keys, cursors, source ownership and passed-over tickets. Incidents owns incidents, notes, aliases, repairs and alerts. Approvals owns approvals, proposals and mined results; chats owns chats, messages and linked sessions; tasks owns tasks and comments; triage owns current rows and triage approvals; devices owns VMs, probes and holds; insights owns usage, research, evals, feedback, verdicts and captures with their checks and evidence; asks owns owner asks and run messages; push owns subscriptions. The private `_rows` encoding helper is excluded from migration owners. Approval settlement updates verdicts through insights on the approval transaction's connection. `oncall.commit_scan` coordinates incident and cursor writes on one connection. `store.prune` calls runs, loops and incidents in order on one connection, after the server's checked backup. The relocated numbered migrations and `latest.txt` retain their original bytes.
-
-The isolated persistence probes print exact inventories and rollback evidence as `BEHAVIOR_RESULT` JSON:
-
-```sh
-python -I tests/scripts/store_contract.py ownership
-python -I tests/scripts/store_contract.py unknown-area
-python -I tests/scripts/store_contract.py base-upgrade
-python -I tests/scripts/store_contract.py prune
-python -I tests/scripts/store_contract.py rollback
-python -I tests/scripts/store_contract.py record-and-readers
-python -I tests/scripts/store_contract.py boundary
-```
-
-In the build sandbox, prefix each command with the supplied `verification-runtime/harness/sandbox` executable.
-
-Every mode generates configuration with `replay.sample` and confines all six environment paths to a disposable directory. `boundary` inspects every Python file outside `store`, requires `state.py` to be absent and reports SQL or SQLite connection violations with filenames and lines. `base-upgrade` compares every numbered migration with its historical adding commit and proves an `origin/main` database gains no ledger rows; this extraction adds no migration. Additional modes `record-failures`, `aggregate-joins`, `scan-atomicity` and `server-prune` cover rollback, reader joins, atomic scans and backup ordering. Nearby backup and coherent-read exercises live in `docs/db-fixture.py`.
 
 The phases are `expand` (compatible additions), `backfill` (data conversion) and `contract` (removals or incompatible changes). `arete migrate --no-contracts` stops before the first contract. A contract waits for live runs and serve processes that name an older schema, including runs without a schema stamp. A stale heartbeat does not release a still-running older serve's contract gate. Serve retries a waiting contract on each tick. Each migration and its ledger row commit together, with `user_version`, duration and the snapshot filename. A failure rolls back that migration and preserves earlier successful versions. Retention also keeps the snapshot named by the newest migration.
 
@@ -881,7 +816,12 @@ The run log, the `<step>.json` files, the tables and the records stay as they we
 
 ## The seam
 
-`arete/factory.py` is one seam that a run's steps can go through. The steps in `arete/flows.py` run on it, in the order the [scripts in `adws/`](#the-adw-scripts) give, when a repo's layer sets `[factory] path = "adw"`, on any repo; every other run takes the classic pipeline and behaves as before.
+New delivery runs default to the [delegation-only orchestrator](docs/orchestration.md), which chooses bounded worker actions while Arete owns safety, evidence and publication.
+Explicit `[factory] path = "classic"` and `path = "adw"` retain their fixed pipelines, and explicitly invoked scripts retain their own strategy.
+Existing private layer pins are not rewritten.
+
+`arete/factory.py` is the shared lifecycle seam.
+The fixed [scripts in `adws/`](#the-adw-scripts) call ordered steps from `arete/flows.py`; the adaptive script uses those atomic helpers with a separate durable SQLite action ledger, not positional step replay.
 
 - `factory.Outcome(result, next="", feedback="", data={}, session=NO_SESSION)` is what a step returns. `result` is `pass`, `fail`, `ask` or `stop`, and any other value raises. `next` names the step to run next, or is empty for the flow's own order. `data` is a JSON object. `outcome.passed` is true for `pass` alone.
 - `@factory.step("name")` registers `fn(flow, *args, **kw) -> Outcome` in `factory.STEPS`. A name registers once.
@@ -897,7 +837,10 @@ Every agent step of an adw run has the `ask_owner` tool (claude and codex throug
 
 ### The adw flow
 
-`[factory] path` in a layer is `classic` (the default) or `adw`; any other value fails the layer's load. The switch works on every repo. A repo with a `github` name gets its PRs, CI watch, ticket comment and merge as a classic run does. A repo with no `github` name needs a git remote `origin`, or `arete run` refuses it as before, and gets a pushed branch.
+`[factory] path` in a layer is `orchestrated` (the default), `classic` or `adw`; any other value fails the layer's load.
+The following section describes explicitly selected fixed ADW runs.
+A repo with a `github` name gets its PRs, CI watch, ticket comment and merge as a classic run does.
+A repo with no `github` name still needs a git remote `origin` and gets a pushed branch.
 
 A run with open review feedback takes the revise flow (`adws/revise.py`); any other run takes the feature flow (`adws/feature.py`). The flows run these seam steps, each with the pipeline's own helpers and the agent call names of the classic run (`plan`, `build`, `revise`, `fix2`, `review_fix`, `ci_fix`, `verify`, `verify2`, `review`, `review2`, `learn`, `learn2`):
 
@@ -928,6 +871,8 @@ The order of an adw run's steps lives in short scripts in `adws/` at the top of 
 
 | script | holds |
 |---|---|
+| `adws/orchestrate.py` | Delegation-only adaptive delivery, the implicit default for new runs. |
+| `adws/single_worker.py` | One implementation worker without planning, retaining the adaptive engine gates; used for whole-workflow comparisons. |
 | `adws/feature.py` | The feature flow: `prepare`, `plan`, `implement`, the `checks` and fix loop, `verify`, `review` and the review fix, `learn`, `document` when on, then `pr`, `ci` and `publish`. |
 | `adws/patch.py` | The small-patch flow: `prepare`, direct implementation, targeted checks, independent review, final full checks and focused verification, then the usual publication steps; escalates to the feature flow when needed. |
 | `adws/revise.py` | The revise flow: the same order with `revise` in place of `plan` and `implement`. |
@@ -951,7 +896,8 @@ Run them with the Python that has arete installed (`uv run python adws/feature.p
 - `--set step.key=value` overrides one setting of one step for this run, with the keys and values of `[steps]` (see [Steps](#steps)); repeat it for more. The step names are the seam's (`plan`, `implement`, `revise`, `verify`, `review`, `learn`, `document`); `implement`, `revise` and `repair` set the build step, and `check_repair`, `review_repair` and `ci_repair` set the repair steps. A value `[steps]` would not take is refused before any run starts.
 - `step.py <run id> <step> [key=value ...]` reads the script the earlier run used from the `path` on its `task` line and runs it with `--continue <run id> --only <step>`, each `key=value` as `--set <step>.key=value`. It refuses a run that did not come from a script, a step the run never started, and settings for a step that calls no agent. The step runs in the earlier run's work folder. A run that ended `done` or with a PR has removed it, so the step makes it again from the run's branch on origin and runs the setup commands; when the branch is not on origin, it refuses and names the folder.
 
-`arete run` on a repo whose layer sets `[factory] path = "adw"` replaces itself with `adws/revise.py` when the ticket has review feedback due and `adws/feature.py` otherwise, run by the same Python. The poller, and a skipped ticket run from the dashboard, start runs the same way; `pipeline.run_command(repo, ticket)` returns the command they use. Every other repo starts `arete run` as before.
+`arete run` on a repo whose layer sets `[factory] path = "adw"` replaces itself with `adws/revise.py` when the ticket has review feedback due and `adws/feature.py` otherwise, run by the same Python. The poller, and a skipped ticket run from the dashboard, start runs the same way; `pipeline.run_command(repo, ticket)` returns the command they use. An unpinned repo starts `adws/orchestrate.py`; an explicitly classic repo retains the classic pipeline.
+Resumes, owner answers and feedback retain their source execution mode.
 
 To change a flow, copy `adws/` to a folder of your own, edit the scripts there and set `[factory] adws = "<folder>"` in `~/.config/arete/config.toml` (a relative folder counts from the config's folder). A script defines a function named after its file (`feature` in `feature.py`), which takes the run's `factory.Flow`. When the folder or the script is missing, the run fails before it starts with `adws folder <folder> does not exist` or `no adw script <file>`.
 
@@ -997,12 +943,20 @@ Builder and repair prompts leave the full-suite gate to Arete instead of asking 
 [check_policy]
 quick = ["lint", "compile", "imports", "web"]
 
+[targeted_commands]
+tracker-smoke = ".venv/bin/python -m unittest tests.test_sessions_and_tokens.PushedPrDraftTests"
+poll-smoke = ".venv/bin/python -m unittest tests.test_process_limits.QueueTests"
+
 [check_policy.targeted]
 "arete/tracker.py" = ["tracker-smoke"]
 "arete/poll.py" = ["poll-smoke"]
 ```
 
-Every explicitly named check must exist in `[checks]`.
+`[checks]` contains the required commands for every final full run.
+`[targeted_commands]` contains owner-configured commands used only when selected for an intermediate check; they are excluded from final full runs.
+Targeted patterns may name commands from either table, while explicit quick names must exist in `[checks]`.
+Commands must be nonempty strings, selected names must exist, and the two command tables cannot share names.
+Changing a targeted command invalidates stored check evidence on resume.
 Targeted passes are marked as partial evidence, not as a successful full suite.
 
 For disposable-fixture commands that the agent's irreversible-action classifier cannot authorize, an owner can configure named product probes separately from prerequisite preflight checks:
@@ -1051,7 +1005,27 @@ Approval, dependency, running-ticket and capacity checks still decide whether a 
 
 ## Develop
 
-`uv run arete status` runs from the checkout without the installed tool. `uv tool install --editable . --python 3.13 --force` refreshes the `arete` on PATH that launchd uses.
+`uv run arete status` runs from the checkout without the installed tool.
+`uv tool install --editable . --python 3.13 --force` refreshes the `arete` on PATH that launchd uses.
+
+To inspect a fresh local database without using your regular Arete config or state, run this from the checkout:
+
+```sh
+(
+  set -eu
+  sandbox=$(mktemp -d "${TMPDIR:-/tmp}/arete-status.XXXXXX")
+  trap 'rm -rf -- "$sandbox"' EXIT
+  export ARETE_CONFIG_DIR="$sandbox/config"
+  export ARETE_STATE_DIR="$sandbox/state"
+  export ARETE_LOG_DIR="$sandbox/logs"
+  export ARETE_WORKTREES_DIR="$sandbox/worktrees"
+  uv run arete migrate
+  uv run arete status
+)
+```
+
+`migrate` initializes the disposable database without starting a service.
+If you add a pipeline repository to that config, the delivery rows show the configured strategy and controller route, not whether the provider is currently available.
 
 No runtime dependencies: stdlib only, so the tool install needs nothing from PyPI. Add one with `uv add`, never pip. The verifier's browser is `@playwright/mcp`, pinned in `arete/verify.py` and started with `npx`, so it needs node and Chrome on the machine. Under trusted scratch on the Codex runner the engine instead resolves that pinned version once, from the npm registry, into a private folder under its state (`browser-server/<version>`), checks it against the published integrity at every launch, and starts it with the engine's own `node` and no `npx`. On the Claude runner the engine starts that same pinned server itself, under the browser profile and outside the Claude process tree, as an HTTP MCP server on a loopback port it picks before the app starts; the app's profile denies outbound TCP to that port, and Claude gets one `http` entry named `playwright`. Before it starts the server, a preflight dumps `about:blank` with headless Chrome under the same profile within 30 seconds. When the preflight or the server start fails, the verify runs without browser tools and its prompt carries Chrome's first error line, so the browser checks are recorded as blocked with that line. The output of the server and of Chrome goes to `<step>-browser.log` in the run folder.
 
@@ -1081,6 +1055,7 @@ private_key = "~/.config/arete/github-app.pem"
 | `[[job]]` | launchd jobs the heartbeat watches, by `label`. A `keepalive` job must have a pid; others must have last exited 0. `log` with `max_age_hours` flags a stale log. |
 | `[[probe]]` | Real calls the heartbeat makes every `every_hours`: a `command` whose output must contain `expect`. A real call, because an auth check can say ready while real calls fail on an expired token. |
 | `[research]` | `planner` (default false) turns on the planning stage of a research run. `search` (default false, needs `planner = true`) runs the plan's tasks as bounded search workers; `search_workers` (default 3, from 1 to 8) is how many run at once and `search_share` (default 0.6, above 0 and under 1) the share of the run's remaining money and time they may use. `synthesis` (default false, needs `search = true`) has a collator with no web tools write the report from the workers' evidence. `audit` (default false, needs `synthesis = true`) has a fresh auditor check the collator's claims against their sources before the report is written. See [Triage](#triage). |
+| `[orchestration]` | Finite adaptive limits: `max_decisions = 64`, `max_actions = 128`, `max_workers = 3`, `progress_seconds = 30`; each is an integer from 1 to 10000. See [Orchestration](docs/orchestration.md). |
 | `[ask]` | `max_per_run` (default 3) is how many asks an adw run may send; the next one ends the run `needs-info` and names the limit. `settle` (default true) lets JEV take the recommended options of an ask made only of `choice` questions, at 0.9 or more, without the owner. `expire_days` (default 7, a number above 0 and at most 3650) is how long a parked ask waits for an answer. `remind_hours` (default 24, a number above 0) is when one reminder push goes for an ask still open. `push_contact` (default empty, `mailto:` or `https://`) is the contact a push token carries. See [The seam](#the-seam). |
 | `[oncall]` | `enabled` (default false) turns on the log watcher; `vision`, `scope`, `confidence` and `injection` steer JEV's decision on each incident; `max_repairs`, `wakes_per_hour`, `max_attempts`, `incident_budget_usd`, `daily_budget_usd` and `cooldown_minutes` bound the repairs it wakes, and `keep_days` how long a closed incident keeps its notes and evidence; `[[oncall.source]]` adds other logs, each with its own `vision` and `scope`. See [On-call](#on-call). |
 | `[jira]` | See [Jira tickets](#jira-tickets). |
@@ -1112,9 +1087,24 @@ private_key = "~/.config/arete/github-app.pem"
 
 An open issue labeled `agent` that the repo owner opened. Issues labeled `bug` or `fix` are fixes; the rest are features. Arete tracks progress with `agent:running`, `agent:pr`, `agent:failed` and `agent:needs-info`, and the PR closes the issue, unless it leaves a change for a person. Remove `agent:failed` or `agent:needs-info` to send it back to the queue. When the plan finds nothing left to build and the builder changes nothing, arete pushes nothing: with an open PR it keeps the PR in `agent:pr` and says so on the ticket, and with none it asks in `agent:needs-info` whether the ticket is done. A ticket in `agent:needs-info` also goes back when you reply to arete's question in a comment: poll removes the label, and the next run reads the question and your answer. A parked ask with a secret question stays waiting: answer it on the dashboard or with `arete answer`. `arete install` creates all of these labels in each GitHub pipeline repo, so `agent` is there to pick from any GitHub client, the phone app included.
 
-A body line that starts with `Waits on`, such as `Waits on #7.` or `Waits on #7 and #9`, holds the issue until every issue or PR of the same repo it names is closed or merged, and a number arete cannot read holds it too.
+A dependency declaration is a body line starting with `Waits on` or `Blocked by`, case insensitive, with an optional colon.
+Leading spaces or tabs, one Markdown bullet (`-`, `*`, `+`) or heading (`#` through `######`), and `**` bold markers around the label are accepted, as in `- **Blocked by:** #7 and #9` or `### Waits on: #7`.
+The shared parser scans lines directly, including matching lines inside code fences or HTML comments; put examples in inline code to avoid declaring dependencies.
+GitHub issues use the bare `#N` references on these lines, such as `Waits on #7.` or `Blocked by #7 and #9`, and wait until every named issue or PR in the same repository is closed or merged.
+A number arete cannot read holds the issue too.
 Poll skips an issue that waits on such a number, with the reason in the serve log and the dashboard's queue; `arete run` skips it too, and `--force` or Run on the queue runs it anyway.
-A `#N` anywhere but a `Waits on` line holds nothing, and Jira tickets order work with their own links, not `Waits on` lines.
+References outside matching declaration lines hold nothing.
+Each tracker reads only its own reference type on those lines: GitHub issue numbers, local task ids or Jira keys.
+
+A maintainer can consolidate a bounded group into one execution issue labelled `agent:batch`.
+Its first nonblank body line must be the plain, unindented header `Batch issues: #12, #13`, with comma-separated positive `#numbers` from this repository, including its own issue and at most 20 entries.
+Only blank lines may precede it; prose, Markdown formatting, fences and HTML comments before the header refuse the batch.
+Any further exact `Batch issues:` directive line, including indented lines and lines in fenced or commented examples, refuses the batch conservatively.
+Missing or malformed headers also refuse the batch before execution or any branch push, even for partial work.
+Keep every requirement in the execution issue and remove `agent` from the tracking children; `no-agent` prevents automatic readmission.
+Dependent execution issues should wait on the execution issue rather than a separately queued child.
+A complete PR closes every listed issue, with its own issue first and the other numbers in numeric order; a PR with work left for a person closes none of them.
+The batch retains the repository's diff limit, review, full checks, verification and publication policy.
 
 ## Jira tickets
 
@@ -1153,6 +1143,11 @@ Touching the labels is the approval: whatever the ticket says then, you have rea
 
 Progress shows as `agent-running`, `agent-pr`, `agent-failed` and `agent-needs-info`. A reply from you after arete's question takes `agent-needs-info` off, as on GitHub. An ask that holds a secret question is not answered by a reply; answer it on the dashboard or with `arete answer`. Bug, Fire, Incident and Problem issue types are fixes, as are tickets labeled `bug` or `fix`. PR titles end with the key, like `Fix login (ABC-12)`, PR bodies link the ticket, and these PRs get no arete labels. Tickets the approval rules hold back, and tickets with a missing or doubled route label, show in `arete status` with the reason. `arete run REPO KEY --force` runs one anyway.
 
+Jira descriptions use the same `Waits on` and `Blocked by` declarations and Markdown forms described under GitHub tickets, with Jira keys such as `Blocked by: ABC-7 and ABC-9`.
+Keys are case insensitive; every named ticket must have a status in Jira's done category before the wait clears.
+A ticket in another category, an unreadable ticket or a status without a readable category holds the dependent ticket.
+GitHub numbers and local task ids on these lines do not declare Jira dependencies.
+
 `[jira] auto = true` lets [triage](#triage) add `agent` and the route label to the tickets it finds ready, at most `auto_per_refresh` (default 3) each refresh. Default `false`.
 
 `[jira] sprint_only` (default `true`) limits that auto approval, and the research loop, to tickets in the open sprint or left over in a closed sprint and not moved to a future one. Triage still sorts every open ticket. Set it to `false` for a board without sprints.
@@ -1175,7 +1170,10 @@ arete task close t-1a2b
 
 `add` prints the new id. `--kind fix` makes a fix, and the title defaults to the body's first line. `list` prints one JSON line per task, oldest first, and both its filters are optional. `show` prints one JSON line: the task and its comments, with its `runs` and `children` as `GET /api/tasks/ID` gives them, from the server when it is up. `task start --repo NAME "PROMPT"` adds a task and starts it, and `task run REPO TICKET` starts one that exists; both go through the server (see [From the CLI](#from-the-cli)). `reply` stores your answer to arete's question, and `close` closes the task. Every task counts as yours. A task in `needs-info` whose newest comment is yours counts as replied, as an issue you answered does.
 
-A body line such as `Waits on t-1a2b.` holds the task until `t-1a2b` is `done` or `closed`. A named task in any other state holds it, `failed` and `needs-info` included, so a task that failed holds the tasks that wait on it. A name that matches no task holds it too, and the reason says so.
+Local task bodies use the same `Waits on` and `Blocked by` declarations and Markdown forms described under GitHub tickets, with case-insensitive task ids such as `Waits on t-1a2b.` or `- **Blocked by:** t-1a2b`.
+Every named task must be `done` or `closed`; any other state holds the dependent task, including `failed` and `needs-info`.
+A name that matches no task holds it too, and the reason says so.
+GitHub numbers and Jira keys on these lines do not declare local dependencies.
 
 A `t-` id gets the local tracker on any repo, wherever arete makes a tracker for a ticket, as in `arete run web t-1a2b`. An issue number or a Jira key gets the repo's own tracker. `tracker = "local"` makes local tasks a repo's only tracker. Such a repo may have no `github`: it loads, shows in `arete status` and on the dashboard, and gets no triage, but `arete run` refuses it with `has no github remote configured` unless its layer sets `[factory] path = "adw"` and the repo has a git remote `origin`. Then the run pushes a branch to `origin` and moves the task to `done`; see [The adw flow](#the-adw-flow). A PR for a task closes nothing and ends with the id, like `Paint the door (t-1a2b)`.
 
@@ -1236,7 +1234,7 @@ path = "classic"
 | `checks` | Every check must exit 0 before review. The agent may run them while it builds. |
 | `limits` | Diff size, paths the change may not touch, fix attempts (which also cap the CI fix rounds), the timeout of each step and of the checks, and cumulative `max_repair_cycles`, `max_run_minutes` and `max_verify_minutes` process budgets. These budgets must be positive integers. `max_run_minutes` leaves out `limit` and `slot` waits. Checks remain serialized by default; `parallel_checks = true` explicitly allows a repo whose checks use isolated resources to overlap them across worktrees, up to the machine's `max_parallel_checks`. `max_attempts` and `timeout_minutes` are the defaults for each step's `tries` and `timeout_minutes`, which [Steps](#steps) can set apart. Code enforces the diff size and the paths after the agent finishes. Every repo also denies `.agents/config.toml`, `.github/workflows/` and `.env` files. It denies `.claude/` too, since Claude Code refuses agent writes there. The planner names a change in a denied path for a human to make. The PR shows it under "Left for a person", and a rerun on an open PR writes, rewrites or removes that section to match its plan. The verifier and the reviewer are told that a person makes it, so its absence never fails the run. The CI fix step counts a red check that only that change fixes as not caused by the PR. |
 | `agent.allow_bash` | Bash patterns the agent may run, on top of read only git and file commands. |
-| `trust.level` | `pr`, or `automerge` once earned. |
+| `trust.level` | `pr`, or `automerge` once earned. See [Pipeline auto-merge](#pipeline-auto-merge). |
 | `trust.automerge_after` | Merged PRs in a row before arete opens a PR proposing automerge. |
 | `git.base` | Branch PRs target. Defaults to the GitHub default branch. |
 | `git.subject` | Commit subject and PR title. Fields: `{kind}` (`feat` or `fix`) and `{title}`. The ticket ref is appended to the commit subject, like `(#35)` or `(ABC-12)`, and to a Jira PR title; a GitHub PR links its issue with `Closes #35` instead, or with `Part of #35` when the plan leaves a change for a person. |
@@ -1257,9 +1255,24 @@ path = "classic"
 
 A template with an unknown field falls back to the default. A layer may also hold `[steps]`, `[kinds]`, `[tiers]` and `[routing]`, which set its steps apart from the engine's; see [Steps](#steps). A layer in `.agents/` that is not committed yet still works: runs read it from the main checkout and lessons land there, but arete never proposes automerge until it is committed. A layer outside the repo is read in place, lessons land in its `expertise.md`, and the miner leaves the repo's `.agents/` alone. Arete never proposes automerge for it: raise `trust.level` by hand.
 
-After a run that had something to learn from (a failed check, a fix, a failed check in use, or PR feedback), the learn step rewrites `expertise.md` whole, in at most 80 lines. It checks each lesson against the code in the worktree and drops a lesson the code now contradicts, with the reason in the run's report. A rewrite over the cap is not applied. A layer outside the repo is made a git repo, and arete commits each rewrite there, so its log shows what was learned and from which run. A clean run learns nothing.
+After a run that had something to learn from (a failed check, a fix, a failed check in use, or PR feedback), the learn step proposes a whole `expertise.md` file, in at most 80 lines, starting with `# Expertise`.
+The learner is read only, takes no configured MCP servers, and checks each lesson against the code in the worktree.
+Its report must identify every added or corrected lesson in `added`, at most three, and every dropped or corrected lesson in `removed`, with a nonempty reason.
+Arete compares those declarations with the old and proposed lesson lines before applying anything; malformed reports, unaccounted changes and rewrites over the cap keep the old file.
+A heading or formatting change without a lesson change is a no-op, preserving the current file without a commit.
+A layer outside the repo is made a git repo, and arete commits each accepted rewrite there, so its log shows what was learned and from which run.
+A clean run learns nothing.
 
 Lessons merge when runs overlap. The learn step reads `expertise.md` when it starts, not the copy the run planned with. Before it writes, it takes a lock for the layer and reads the file again. When another run changed the file meanwhile, it runs once more as `learn2` on the current file, under the lock, and writes that; a rewrite whose base moved is never written. When the second pass gives no usable file, the first rewrite is saved in the run folder and not applied. The commit holds `expertise.md` alone, and an eval mine commit holds its eval file alone; other changed files in the layer stay uncommitted. The commit sha is saved as `expertise-commit.txt` in the run folder. The lock is a file lock on this host, so runs on separate hosts are not covered.
+
+### Pipeline auto-merge
+
+Pipeline auto-merge requires full local checks, approving review, and native verification of the published tree.
+GitHub must report at least one CI result, and every reported check and current status must be successful on that head.
+JEV must complete its risk screen on the diff and not hold it.
+Arete attempts only a head-matched squash merge on an open, ready PR whose head contains the target base.
+It never arms a later merge and leaves changes spanning repositories for a person.
+Set required checks and require an up-to-date branch in GitHub so the server enforces those rules even if the base or CI changes during the merge request.
 
 ## Steps
 
@@ -1321,7 +1334,25 @@ effort = "high"
 | `mcp` | Names of `[mcp.<name>]` servers from `~/.config/arete/config.toml`; claude and codex load those and no others. Default `[]`. verify also gets its own browser server when the layer serves an app, and that server wins over one of the same name. pi takes no servers. codex refuses servers with `env` values. |
 | `instructions` | Which standing instruction files load: `user` and `repo`. Default both on claude (`~/.claude/CLAUDE.md`, the repo's `CLAUDE.md` and `CLAUDE.local.md`), `[]` on pi, and `["repo"]` on codex (repo `AGENTS.md` or `AGENTS.override.md`, supplied as developer instructions with automatic project document loading disabled). codex refuses `user`; if the login has global instruction files that the CLI cannot exclude, the call is withheld automatically. On claude, a value short of both becomes `--setting-sources`, which also leaves out that source's `settings.json`. pi runs with `--no-context-files` and takes only `[]`. |
 | `modalities`, `min_context`, `structured_output`, `data_handling`, `floor`, `directory_cleanup` | Requirements a route must meet: input modalities (list), minimum usable context in tokens (whole number, at least 1), structured output (true or false), the data handling labels the step allows (list), a `[routing.floors]` name, and directory cleanup on codex (true or false; default true for verify, inherited by eval_grade). Default none otherwise; capture_evidence builds in `image` (`video` for a video item) and structured output. See [Chains and routes](#chains-and-routes). |
-| `session` | `resume` or `fresh`. With `resume`, a later round of the step (for build, a fix, review fix, verify fix or CI fix) continues the session of its earlier rounds; with `fresh`, each round is a new session whose prompt carries the failing output. Default `resume` for build, `fresh` for the rest. The repair steps share the builder's session; a repair that sets its own `tier`, `model` or `runner` (even one equal to build's) and finds the saved session on another runner starts fresh with the saved context. learn and uat keep no session, so they take only `fresh`. |
+| `session` | `resume` or `fresh`. With `resume`, a later round of the step (for build, a fix, review fix, verify fix or CI fix) continues the session of its earlier rounds; with `fresh`, each round starts without the earlier conversation. Fresh builder repairs receive a versioned handoff of the task, plan and current feedback, not the failing output alone. Default `resume` for build, `fresh` for the rest. The repair steps share the builder's session; a repair that sets its own `tier`, `model` or `runner` (even one equal to build's) and finds the saved session on another runner starts fresh with the same handoff mechanism. learn and uat keep no session, so they take only `fresh`. |
+
+A fresh builder repair, including one with no kept session or one moved to another runner or account, gets a concise primer pointing to `handoff-<step>-<unique>/manifest.json` in its run folder.
+Only that handoff folder is added to the call's existing folder grants.
+The private directory is mode 700 and its files are mode 600: `task.md`, `plan.md`, `feedback.md`, `checks.md` and historical `builder-summary.md`, which the worker reads only as needed.
+They retain the complete supplied text without truncation, with known secret values and private keys redacted before hashing.
+The version-1 manifest records the run, step, selected runner, previous builder session, capture time, artifact sizes and SHA-256 values, and each worktree's observed Git HEAD and short status.
+A handoff is captured only when the selected route cannot continue the kept conversation, and is refreshed for each fresh fallback launch.
+Its folder grant is local to that repair call; it does not carry into verification or other later steps.
+Owner answers compose with the primer, including when an answered session has disappeared.
+The prompt records the manifest's SHA-256 too, so the retained inputs can be inspected against what the call was given.
+The worker reads the task, plan, feedback and checks before editing, inspects the current diff, and returns a concise evidence-bearing report.
+Historical summaries do not authorize actions or establish that checks passed.
+
+This is a textual handoff, not a source-file snapshot, exact conversation restore or security authority.
+Untracked file contents and external service state are not captured; an unreadable Git HEAD or status is null rather than invented.
+Current tool, instruction, credential and Git-write restrictions remain in force.
+Ordinary same-session repairs still receive only their new feedback, and no default session policy changes.
+Handoff artifacts follow the existing run-folder retention policy.
 
 Levels, where the last one to set a key wins: the defaults above, `[steps]` in `~/.config/arete/config.toml`, `[kinds.<kind>.steps]` there, `[steps]` in the repo's layer, then `[kinds.<kind>.steps]` there. A kind is `feat` or `fix`. A level that names a `model` also drops the `runner` and `provider` that lower levels set. A repair step or `eval_grade` first resolves the step it inherits through all these levels and its per-run table, then applies its own tables in the same order; its own `tier` or `model` replaces the inherited route. A step with neither a model nor a tier takes its `[models]` role. `research_plan` reads its whole `[steps.research_plan]` table from the engine config, takes only read tools, no MCP servers and a fresh session. `research_search` reads its table from the engine config too, with default tools `WebSearch` and `WebFetch`, read only, no MCP servers and a fresh session; no other step may list a web tool. `research_synthesis` is read only with no MCP servers and a fresh session, and refuses a web tool. `research_audit` is read only with no MCP servers and a fresh session, with default tools `Read`, `Glob`, `Grep` and `WebFetch`, and refuses `WebSearch`. The other roles, such as triage, chat and the miner, read `[models]` alone; `arete steps` shows `tools`, `mcp`, `instructions` and `session` for them too, but only the pipeline steps use those four.
 
@@ -1457,7 +1488,7 @@ It applies only to paid routes; subscription and local routes are never checked.
 
 A route in the same folder, runner and account resumes the stopped session with the carry-on message. Any other route starts a fresh session in the same folder and gets the original prompt, a note that an earlier attempt stopped at a limit, and that attempt's last message. A later retry stays on the runner its saved session used.
 
-Config load and step resolution refuse, in one line that names the table: a `[routing]` key other than `fallback`, `payment_modes`, `paid`, `capabilities` and `floors`, a `[routing.paid]` key other than `providers`, `max_input` and `max_output`, a `providers` that is not a list of names, a negative or non numeric cap, a `fallback` that is not true or false, a `payment_modes` that is not a nonempty list of distinct `subscription`, `api_key` and `local`, a capability table with an unknown key, a wrong type or `context` under 1, a floor that is not a nonempty list of model names, a step `floor` the `[routing.floors]` table lacks, a `min_context` under 1, a `structured_output` that is not true or false, a tier with an empty list or an entry that is not a table, an unknown step, kind or key, a tier the map does not have, a runner other than `claude`, `pi`, `codex` or `replay`, an effort the step's runner does not take (including `off` on codex), `tries` or `timeout_minutes` under 1, several tier maps with no engine or repo selection, a `tier_map` with no such map, a tool outside the `tools` list above (`Bash` and `mcp__` names included), a pi or codex step whose `tools` leave out a read tool (research_search excepted), a `[research]` key other than `planner`, `search`, `search_workers` and `search_share`, a `search` that is not true or false or is true with `planner` off, a `search_workers` that is not a whole number from 1 to 8, a `search_share` that is not a number above 0 and under 1, a web tool on any step but research_search, a research_search `tools` outside `WebSearch`, `WebFetch` and the read only tools, an `mcp` name with no `[mcp.<name>]`, any `mcp` or `instructions` on pi, `instructions = ["user"]` on codex, an `instructions` value other than `user` and `repo`, a `session` other than `resume` and `fresh`, `resume` for learn, uat, research_plan or document, a research_plan or document `tools` outside the read only tools, any `mcp` on research_plan or document, a `[document]` key other than `enabled`, `voice`, `style` and `words`, an `enabled` that is not true or false, a `style` that is not a string, a `voice` that is not a list of files inside the folder of the file that names them, a `words` entry that is not two whole numbers, low then high, for `message`, `ticket` or `pr`, and an `[mcp.<name>]` with an unknown key, with both or neither of `command` and `url`, or with `args` beside `url`. A loop or session whose every route is excluded or incompatible on its device, such as codex on an ssh or exe device with no other route in the tier, is refused before starting. A mistake in a layer fails the run at its start, naming the layer file, and `arete steps --repo NAME` shows it first.
+Config load and step resolution refuse, in one line that names the table: a `[routing]` key other than `fallback`, `payment_modes`, `paid`, `capabilities` and `floors`, a `[routing.paid]` key other than `providers`, `max_input` and `max_output`, a `providers` that is not a list of names, a negative or non numeric cap, a `fallback` that is not true or false, a `payment_modes` that is not a nonempty list of distinct `subscription`, `api_key` and `local`, a capability table with an unknown key, a wrong type or `context` under 1, a floor that is not a nonempty list of model names, a step `floor` the `[routing.floors]` table lacks, a `min_context` under 1, a `structured_output` that is not true or false, a tier with an empty list or an entry that is not a table, an unknown step, kind or key, a tier the map does not have, a runner other than `claude`, `pi`, `codex` or `replay`, an effort the step's runner does not take (including `off` on codex), `tries` or `timeout_minutes` under 1, several tier maps with no engine or repo selection, a `tier_map` with no such map, a tool outside the `tools` list above (`Bash` and `mcp__` names included), a pi or codex step whose `tools` leave out a read tool (research_search excepted), a `[research]` key other than `planner`, `search`, `search_workers` and `search_share`, a `search` that is not true or false or is true with `planner` off, a `search_workers` that is not a whole number from 1 to 8, a `search_share` that is not a number above 0 and under 1, a web tool on any step but research_search, a research_search `tools` outside `WebSearch`, `WebFetch` and the read only tools, an `mcp` name with no `[mcp.<name>]`, any `mcp` or `instructions` on pi, `instructions = ["user"]` on codex, an `instructions` value other than `user` and `repo`, a `session` other than `resume` and `fresh`, `resume` for learn, uat, research_plan or document, a learn, research_plan or document `tools` outside the read only tools, any `mcp` on learn, research_plan or document, a `[document]` key other than `enabled`, `voice`, `style` and `words`, an `enabled` that is not true or false, a `style` that is not a string, a `voice` that is not a list of files inside the folder of the file that names them, a `words` entry that is not two whole numbers, low then high, for `message`, `ticket` or `pr`, and an `[mcp.<name>]` with an unknown key, with both or neither of `command` and `url`, or with `args` beside `url`. A loop or session whose every route is excluded or incompatible on its device, such as codex on an ssh or exe device with no other route in the tier, is refused before starting. A mistake in a layer fails the run at its start, naming the layer file, and `arete steps --repo NAME` shows it first.
 
 ### Price snapshots
 
@@ -1569,9 +1600,18 @@ Chat reads a dashboard snapshot with settings and trends at `runs/chat/context/d
 
 ## Verify in use
 
-Run Arete's durable behavioral checks with `uv run python -m unittest discover -s tests -v`. They exercise complete offline workflows against a local tracker and a local bare Git origin, including rejected checks, blocked verification, rejected reviews and a run parked with scratch held. Writer regressions preserve warning and prerequisite bodies, complete commands and code indentation, and keep synthetic private voice text out of captured GitHub publication. Scratch checks cover finalization of created, imported, hard-linked and re-dated entries. Add the same command under `[checks]` in Arete's layer so these cases run before model verification on every candidate branch.
+Run the essential business checks with `uv run python -m tests.parallel`.
+The suite covers budgets, accounting, admission, permissions, approval, idempotency and quality promotion.
+It intentionally trades end-to-end, browser, operating-system, Git and migration-runtime coverage for a small business-rule suite.
+Product behavior, migration compatibility and limits are unchanged by the coverage removal.
+`uv run python -m unittest discover -s tests -v` runs the same business cases serially.
 
-`uv run python -m tests.parallel [-j N] [-v] [--timeout S] [--slowest N]` runs the same tests across worker processes, 4 by default, each test in a process of its own. A class with `serial = True` (today `LiveTests` in `tests/test_scratch_producers.py`) waits for the pool and then runs one test at a time. A class with `slow = True` (today `OptimizeTests` in `tests/test_scratch_and_optimize.py`) starts first, so its longest test does not begin late. `--timeout` (default 300 seconds) kills a hung test and counts it as an error that names it. It prints failures and errors with tracebacks, then one line with the counts, and exits non zero on any failure or error. `--slowest N` prints the N test classes that took longest before that line. Each worker leads its own process group, which the runner kills when the test ends, hangs, or the runner is interrupted (exit 130, naming the tests in flight), and workers end themselves when the runner is killed, so no worker outlives it. It can replace the serial command under `[checks]` in the layer.
+`uv run python -m tests.parallel [-j N] [-v] [--timeout S] [--slowest N]` uses four workers by default and runs each test class's existing cases together in a separate interpreter.
+`--timeout` defaults to 10 seconds per class; a timeout fails the run and cleans up the worker's process group.
+`--slowest N` reports the slowest classes.
+Workers own process groups that the runner cleans up on completion or interruption, and a lifeline ends workers if the runner dies.
+The runner exits nonzero on any failure or error and does not retry; the first failure is authoritative.
+Either command can serve as the business-suite command under `[checks]` in Arete's layer.
 
 Configure cheap environment prerequisites under `[verify.preflight]`:
 
@@ -1586,7 +1626,10 @@ git = "git --version"
 
 These named probes run in the worktree with the layer's command environment before the app or verifier starts. They share one time budget, default 30 seconds and maximum 300. The first failure or timeout records the command, exit and output in `<step>-preflight.json` and `<step>-preflight.md`, then marks verification blocked without a model call or implementation repair. Successful prerequisite evidence stays in the run directory; the verifier still checks the product's behavior. Use `[checks]` for product assertions and `[verify.preflight]` for requirements such as an available runtime or fixture transport. Existing tool permissions, guards and route capability rules remain authoritative.
 
-Checks passing is not the bar. After the checks, a verifier agent uses the change the way its user will: it starts the app with `verify.start`, waits for `verify.ready`, then drives it through a headless browser (Playwright, an isolated profile), `curl`, or the CLI, and reports each check it made with what it saw. Reading the code and running the test suite do not count as checks. The builder does not add tests unless the repo's own rules ask for them.
+Checks passing is not the bar.
+After the checks, a verifier agent uses the change the way its user will: it starts the app with `verify.start`, waits for `verify.ready`, then drives it through a headless browser (Playwright, an isolated profile), `curl`, or the CLI, and reports each check it made with what it saw.
+Reading the code and running the test suite do not count as checks in use.
+Task prompts share the Behavior-first policy in `arete/prompt_loader.py`; individual roles do not define a separate test-writing policy.
 
 Eligible local Codex verification attempts get a fresh mode-700 `.arete-scratch-<16 hex>` folder in their worktree. Arete exclusively creates five empty fixture slots: `config/config.toml`, `state/arete.db`, `fixtures/config.toml`, `fixtures/fixture.db` and `out/output.txt`. Rewrite these in place for fake configuration, SQLite state and output. Files and folders the verifier or the service creates in scratch are verification output and are archived with the scratch root at finalization, without any ownership claim from the guard. An entry that existed before the attempt, a folder holding one at any depth, a file with more than one link, an entry on another device, or one that cannot be classified keeps the attempt pending, and the diagnostic names each such entry and its reason under `unknown_entries` and `reasons`. The test compares the APFS file id with the largest id of the layout the attempt recorded, never a timestamp, and links are never followed.
 
@@ -1803,7 +1846,17 @@ The limits count every `trial` line in the file plus the trial running, across i
 
 Every launched call also gets the tokens and the charged dollars left, and is stopped as soon as its streamed usage reaches either one. The stored usage then passes the limit by no more than the last streamed turn, the trial is `capped` and never paired, and the next trial is refused. A route that cannot stop itself this way is refused before launch: a codex arm, frozen step or grader is refused by the manifest and the dry run with the reason `codex reports usage only when its turn ends, so it cannot stop a call at a token or spend limit`. With `[limits.codex_headroom]` (`tokens` required, `spend_usd` optional, both above 0) codex is allowed in arms, frozen steps, the grader, escalations and the benchmark reviewer, under a per call allowance: each codex launch needs at least that many tokens, and dollars when `spend_usd` is set, left, or it is refused with a reason naming `codex_headroom` and what is left, the trial is `capped` and the run exits 3. A codex call that ends past a limit leaves the trial `capped`, with `overrun` on its trial line. Each `trial` line has `targeted_step`, `launched` or `never launched`; a trial that stopped before its targeted step launched still records the arm's requested runner, model and effort. The design digest hashes the definition of every MCP server a step loads (command and arguments, or URL), never storing them, so changing a server refuses the old file. A repair that cannot continue the builder's session, because `check_repair` runs on another runner, gets the task, the saved plan, the builder's summary and the current diff to inspect, then the check failures; a repair on the same runner resumes the session.
 
-Pi launches a second call to restate an answer that lacks its structured output, and that call cannot be gated against the calls and time limits, so a pi route is refused for any structured call (the `plan` atom, a frozen `plan` step and the grader) with that reason. A routing refusal writes a record header with `refused` set, and `targeted_step` reads `never launched` for it. Usage a call streamed before an interruption (Ctrl-C or a stop) is written to its step row before the interruption propagates; a process killed outright keeps nothing of the call in flight. Usage a call streamed before it failed or timed out is kept in its stored step row, so later trials see the true remaining budget. Limitations: Claude repeats a message's usage as it streams and arete counts each message's growth, but a message's output tokens may still be reported short until it ends, so a Claude call can pass a token cap by that unreported output. A stopped call keeps no session. Replay is never charged, so the spend cap needs a charging route. Local claude routes are plan logins, so their dollar cap applies only when routing bills the route as paid.
+Pi structured calls run under normal launch admission without hidden answer-restatement launches.
+Automatic retry, compaction and cache warming are disabled for those calls; a missing structured answer fails with the original usage retained.
+Local Pi CLI verification can use an engine-mediated, permission-checked shell on macOS without exposing provider credentials or relaxing recursive secret exclusions; see [Pi CLI verification](docs/orchestration.md#pi-cli-verification).
+Browser/MCP tools and production server access remain unsupported on Pi.
+A routing refusal writes a record header with `refused` set, and `targeted_step` reads `never launched` for it.
+Usage a call streamed before an interruption (Ctrl-C or a stop) is written to its step row before the interruption propagates; a process killed outright keeps nothing of the call in flight.
+Usage a call streamed before it failed or timed out is kept in its stored step row, so later trials see the true remaining budget.
+Limitations: Claude repeats a message's usage as it streams and arete counts each message's growth, but a message's output tokens may still be reported short until it ends, so a Claude call can pass a token cap by that unreported output.
+A stopped call keeps no session.
+Replay is never charged, so the spend cap needs a charging route.
+Local claude routes are plan logins, so their dollar cap applies only when routing bills the route as paid.
 
 Running the same command again resumes: a `done` trial is not repeated, and an earlier `start` with no `trial` line (a killed process) is settled as interrupted and run again as the next attempt. A `capped` trial runs again as well. With `[replay] dir` set, a trial reads its answers from the first folder holding a `.json` answer of `<dir>/<arm>/<task>/<repeat>`, `<dir>/<arm>/<task>`, `<dir>/<arm>` and `<dir>`, so two arms can be replayed over several repeats, with a failed trial, without a paid call.
 
@@ -2078,7 +2131,27 @@ Answers are generated with the `retrieval_answer` prompt on `[generate]`'s model
 
 Arete's own step prompts, `arete/prompts/*.md`, are harness too. When the miner sees the same problem in how arete's steps do their job across repos, it proposes a change to the plan, build, fix, verify, review or other step prompts in the `arete_repo`. The grader, the eval writer, the miner and apply prompts stay human edited. Apply refuses a change that adds or drops a `$placeholder`, or adds or deletes a prompt file.
 
-Arete then runs each eval suite twice on the same day, once with main's prompts and once with the PR's, and comments on the PR with the pass rate of each, the tasks that changed, what was paid and run ids, and the changed prompts the evals do not exercise. Private repos show as "private repo N", never by name. These runs do not count toward the nightly baseline. The pipeline reads its prompts from this checkout, so pull it after you merge one of these PRs.
+Inspect the templates and their required inputs without a model call:
+
+```sh
+arete prompts
+arete prompts plan --json
+```
+
+The input list comes directly from each template's `$placeholder` references, not a separate schema.
+The command validates every template, or the named one, and exits nonzero for an unreadable or malformed template.
+Rendering also refuses a missing input or malformed placeholder before starting an agent; optional ticket-brief fields are supplied as empty text.
+A refused on-call repair template leaves the incident waiting without creating a task or consuming a repair attempt.
+Write a literal dollar sign as `$$` in a template; dollar signs inside supplied values remain data and are not expanded again.
+The miner applies the same syntax check before accepting a prompt edit, in addition to its existing placeholder-set check.
+Ticket-flow prompts distinguish the issue and owner answers from reference material such as saved plans, history, attachments, expertise and agent reports.
+Fresh repairs, including provider switches and fallbacks, receive this boundary along with the issue, attachments, saved plan, earlier builder summary and current feedback.
+That instruction does not grant or enforce permissions: the configured tools, guards and diff checks remain authoritative, and an agent's claim is not evidence that a check passed.
+
+For a mined prompt PR, Arete runs each eval suite twice on the same day, once with main's prompts and once with the PR's, and comments on the PR with the pass rate of each, the tasks that changed, what was paid and run ids, and the changed prompts the evals do not exercise.
+Private repos show as "private repo N", never by name.
+These runs do not count toward the nightly baseline.
+The pipeline reads its prompts from this checkout, so pull it after you merge one of these PRs.
 
 ## Triage
 
@@ -2094,21 +2167,26 @@ Uncertain classifications fall back to a read-only haiku step that reads the tic
 - Repos: the one it belongs in. A code ticket that names none, or needs more than one, gets a question to name it or split it.
 - Ready: the pipeline could build it as written.
 - Questions: only real blockers. The ticket does not say what to change and the code does not settle it, an attachment or copy it mentions is missing, a business decision changes the whole build, it needs an account or setup outside the repos, or it says it is parked, blocked or a duplicate.
-- Checks: up to six acceptance checks for a fix or feature, each one thing a person does on the running product and what it must show, so you see what done means before the build. Empty for research and work for a person. After approval, both classic and ADW planning must cover every check without dropping or weakening it; a check disproved by code is explained in the plan's assumptions. The verifier gets the original checks as an independent numbered list after the planner's steps and reports an outcome for each, even one the planner omitted. The PR lists the checks in their original order. The owner's board answers override contradictory checks and assumptions; verification identifies the superseded check and explains the replacement behavior and evidence. Tickets without approval, and older approvals without checks, keep their existing behavior.
-
+- Checks: up to six acceptance checks for a fix or feature, each describing an action on the running product and what it must show.
+  Research and work for a person have no checks.
+  After approval, classic, ADW and orchestrated planners receive the checks and must not drop or weaken them.
+  If the code disproves a check, the plan explains why in its assumptions.
+  The verifier receives the original checks as a separate numbered list even when the planner omitted a check or the run skipped planning.
+  The verifier reports an outcome for each check, and the PR lists the checks in their original order.
+  The owner's board answers override contradictory checks and assumptions; verification identifies the superseded check and gives evidence for the replacement behavior.
+  Tickets without approved checks keep their existing behavior.
 - Assumptions: the small choices the build will make where the ticket leaves them open, such as wording, placement or a default. They are not questions; the pipeline's plan reads them, and the PR lists them for you to check.
 - Size S, M or L. L means split it, so it is never ready.
 - A plan of up to 6 steps.
 
-Exercise the handoff offline with `<sandbox> python docs/triage-checks-fixture.py approved`, then `overrides`,
-`legacy`, `patch` and `inspect` with the same prefix. The `patch` exercise covers an approved fix routed through
-`route_fixes` that completes without escalating to planning. Use the configured verification sandbox executable for `<sandbox>`.
-Each exercise creates fresh disposable state and local bare origins beneath `.arete-sandbox/triage-checks-fixture/`,
-uses replay answers and dry-run publication, and prints the retained evidence paths. Inspect the actual plan, build
-and verify prompts, plan outcome, `verify.md` and `pr_body.md` there. The exercises cover a planner-omitted check,
-a nearby planner-added check, empty planner verification, owner overrides, code-disproved checks and legacy tickets.
-They refuse external transports and credential lookup. Replay proves prompt propagation and report persistence,
-not that a live model obeyed the instructions.
+Exercise the classic and ADW handoff offline with `<sandbox> python docs/triage-checks-fixture.py approved`, then `overrides`, `legacy`, `patch` and `inspect` with the same prefix.
+Use the configured verification sandbox executable for `<sandbox>`.
+The `patch` exercise covers an approved fix routed through `route_fixes` that completes without escalating to planning.
+Each exercise creates fresh disposable state and local bare origins beneath `.arete-sandbox/triage-checks-fixture/`, uses replay answers and dry-run publication, and prints the retained evidence paths.
+Inspect the plan, build and verify prompts, the plan outcome, `verify.md` and `pr_body.md` there.
+The exercises cover a planner-omitted check, a nearby planner-added check, empty planner verification, owner overrides, code-disproved checks and legacy tickets.
+They refuse external transports and credential lookup.
+Replay proves prompt propagation and report persistence, not that a live model obeyed the instructions.
 
 The fallback agent reads only inside its repos, has no MCP servers, and costs at most $0.30 a ticket.
 A ticket is assessed again when its updated time changes or the classifier's policy changes.
@@ -2134,7 +2212,8 @@ It adds `agent`, `fix` or `feature`, and `agent:auto` together; Jira also receiv
 JEV must be enabled for the repo, its required injection screen must pass, the issue must still be open and owned, and its version must match the one triage read.
 `no-agent`, `agent:hold`, `duplicate`, `invalid`, `wontfix` and existing pipeline-state labels prevent automatic admission.
 Issues labelled `loop` stay with their dedicated loop-intake workflow.
-Dependencies can enter the queue but still block execution until resolved.
+Concrete repository work can enter the queue even when it is large or its dependencies have not landed.
+Dependencies still block execution until resolved.
 Research and person work stay on their existing routes rather than acquiring `agent`.
 
 The default admission allowance is 50 tickets per tracker per refresh; zero disables that allowance.
@@ -2147,7 +2226,9 @@ Sent tickets remain on the board for seven days with their pipeline status and P
 Explicit `fix`, `bug` and `feature` labels are respected; otherwise JEV decides and saves a `fix` or `feature` label for subsequent starts.
 Remove that kind label to request a fresh classification after changing the issue's purpose.
 Confident fixes request the ADW patch flow, subject to its scope, sensitive-work, review, verification and final-check gates.
-Features use the full planning flow, and an uncertain or unavailable classifier keeps the existing route.
+Features use the full planning flow.
+Clear, actionable repository work also takes the full flow when JEV is uncertain whether it is a fix or feature; that uncertainty never enables the patch shortcut.
+Otherwise an uncertain or unavailable classifier keeps the existing route.
 Poll dry runs make no classification calls or label writes.
 
 You can also send a ticket yourself from the dashboard's Triage view.
@@ -2173,7 +2254,9 @@ When `alert_repo` is set and private, the board is also one issue there, "[arete
 
 ## Dashboard
 
-`arete serve` serves one page from this machine to its owner over Tailscale, so it opens from a phone or another computer on the tailnet; `arete dashboard` serves it alone.
+`arete serve` serves the dashboard from this machine to its owner over Tailscale, so it opens from a phone or another computer on the tailnet; `arete dashboard` serves it alone.
+Open `/ui.html` for the new dashboard's Floor, Runs, Triage inbox, Outbox, local task Board, and live Health.
+The classic dashboard stays at `/` and still handles the full intake, console, sessions, configuration, incidents, and usage views.
 It listens only on the machine's tailnet addresses.
 A request from any other tailnet login gets 403, and a change also needs the `X-Arete` header that the page sends.
 Admission maps the whois login through `principal_logins` to an active human principal.
@@ -2200,26 +2283,6 @@ and `too_far` means more than 10,000 matching rows wait. Fetch a fresh snapshot 
 `schema` is reserved. Unstored `serve.beat` messages arrive every 15 seconds with the scan cursor as their SSE id.
 Derived events are retained for 90 days, notices for seven, and durable events indefinitely.
 `GET /api/meta` includes `stream.complete`, class trim ids and the head; completeness remains false while older writers may run.
-
-Offline stream exercises use disposable folders, fake Tailscale and the replay runner, and print their evidence directory:
-
-```sh
-python docs/events-fixture.py serve --port 8765
-python docs/events-fixture.py exercise live-replay
-python docs/events-fixture.py exercise reconnect-formats
-python docs/events-fixture.py exercise filters
-python docs/events-fixture.py exercise epoch-reset
-python docs/events-fixture.py exercise retention-reset
-python docs/events-fixture.py exercise backlog-reset
-python docs/events-fixture.py exercise atomicity
-python docs/events-fixture.py exercise admission-seed
-python docs/events-fixture.py exercise principal-gate
-python docs/events-fixture.py exercise row-actors
-python docs/events-fixture.py exercise completeness
-python docs/events-fixture.py exercise beats
-python docs/events-fixture.py exercise nearby
-python docs/events-fixture.py inspect
-```
 
 By default it answers plain HTTP on the machine's tailnet addresses, calls no `tailscale cert` and makes no `tailscale serve` mapping.
 HTTPS is off until the owner turns it on with `https = true` under `[dashboard]` in the config; the key takes `true` or `false` and defaults to `false`.
@@ -2286,7 +2349,8 @@ Ctrl or Cmd K, or `/`, opens Find, which goes to any view, run, loop, session, t
   The page sends view, way and button names with counts and times only, never an id, typed text or page content, and the dashboard drops rows older than 90 days.
 
 The console is a side panel that opens from any view with its button or `c` and stays open from view to view; on a phone it fills the screen.
-It talks to the orchestrator agent on the `chat` model. Reply routes on codex or pi are skipped, since codex has no network and pi has no restricted Bash to run the `arete session` commands.
+It talks to the orchestrator agent on the `chat` model.
+Reply routes on codex or pi are skipped: codex has no network, and Pi's confined shell cannot reach the production server and state needed by the `arete session` commands.
 Every chat is kept in `arete.db`, and the Chat picker in the panel lists them newest first.
 New chat starts one with no project, which works in arete's folder, or on one repo from the config, which works in that repo's folder and gets its layer's checks and expertise from arete's side.
 The agent is arete's orchestrator: it reads arete's code, config, state and logs, and its project's code when it has one, runs `arete status`, `arete events`, `git log` and `git show`, reads arete's GitHub issues, and sends work to task sessions.
@@ -2365,7 +2429,16 @@ A chat's sessions have four routes: `GET /api/chats/N/sessions` lists them with 
 - `{"repo": "web", "prompt": "...", "title": "...", "kind": "feat"}` adds a local task and starts it. `title` defaults to the prompt's first line that is not a `Waits on` line, cut to 80 characters, and `kind` is `feat` or `fix`, `feat` by default.
 - `{"repo": "web", "ticket": "123"}` starts a tracker issue, a Jira key or a `t-` task that exists, past its waits, as `arete run --force` does. With `"force": false`, its `Waits on` line holds it and the run ends `skipped`, as `arete run` without `--force` does.
 
-It answers `{"task", "repo", "run", "state", "why"}`. `state` is `running` with the run's id, or `queued` with an empty `run` when no slot is free (`max_parallel` or `max_parallel_per_repo`) or the prompt's `Waits on` line still holds; `why` says which. In a repo the poller does not pick, `why` names the task and the `ticket` body that starts it. A queued task in a `pipeline = true` repo starts at a later poll. A ticket whose run is going on answers that run's id with `already running` and never starts twice.
+It answers `{"task", "repo", "run", "state", "why"}`.
+`state` is `running` with the run's id, `starting` with an empty `run` while a living child registers, or `queued` with an empty `run` when no slot is free (`max_parallel` or `max_parallel_per_repo`) or the prompt's `Waits on` line still holds; `why` says which.
+If a child finishes during registration or recovery finds an ended run, the answer can carry that run's terminal state, such as `failed`, with its run id.
+In a repo the poller does not pick, `why` names the task and the `ticket` body that starts it.
+A queued task in a `pipeline = true` repo starts at a later poll.
+A ticket whose run is going on answers that run's id with `already running` and never starts twice.
+Once a keyed response is committed, identical resends replay that answer unchanged; use a fresh key with the task's ticket to request a new start.
+
+`GET /api/tasks` returns local task summaries (`id`, `repo`, `title`, `kind`, `state`, `updated`), most recently updated first.
+It does not fetch tracker items or include task bodies or comments.
 
 `GET /api/tasks/ID` returns the task: a local task's row with its `comments`, or a tracker item's `id`, `ref`, `title`, `url` and `state`, with `?repo=NAME` when no run names it yet. Both add `runs` (`id`, `status`, `started`, `finished`, `prs`, `cost_usd`, and `report`, the run's [`report` line](#run-lines), or `{}` while it has none), newest first, and `children`, the local tasks whose parent it is.
 
@@ -2447,129 +2520,51 @@ Run `arete loop try merge-check` to preview held tickets before enabling it
 with `arete loop enable merge-check`. See [the loop guide](arete/loops/README.md#merged-base-use-checks)
 for checkpoints, UTC quotas, blocked-input recovery, the `$finding.repo` ticket selector and queue capacity.
 
-## Offline merge-check fixture
+An unknown repo exits nonzero with one diagnostic.
+Empty-history discovery prints nothing, and a trial with no work finishes skipped with zero model calls.
+The initial source baseline enqueues no old input; later polling enqueues each new merged pipeline PR once, including equal timestamps and late discoveries.
+Discovery keeps one canonical PR URL, even when the same PR is recorded under distinct ids.
+Command-scope catch-up uses `data.at` and retains old seen identities.
+Trial mode holds tickets and metrics and changes no consumer state.
+Its preview names the pinned base, serving configuration, recent PRs, numbered checks and applicable older neighbours, or explicitly says there is no applicable neighbour.
 
-Use a disposable checkout and the verification sandbox. The helper creates only scratch configuration,
-state, two local bare origins, two deliberately stale local main branches, a small local HTTP product
-and replay answers. It never contacts a tracker or provider. Keep the shipped loop disabled. Every
-delivery below uses trial mode, which holds both tickets and metrics. Do not run these commands
-against normal state. Start from an empty fixture directory; retain it for inspection afterward.
+`manifest.json` records the pinned SHA, worktree and steps; `result.json`, `verify.md` and `record/` preserve evidence in the merge-check run folder.
+A passing check emits metric 1, a failed check emits its regression finding followed by metric 0, and a redundant event emits nothing.
+Findings name the failed checks, including overlapping neighbours, and exclude the verifier's private summary, How and Saw text.
+For a continuation, the latest run owns the merge while the earlier run owns its report.
+Merges arriving during a check wait for the next batch.
+Concurrent checks serialize on the consumer lock, and the server's `merge-check = 1` queue limit allows at most one product to serve at once.
 
-```sh
-SB="$HOME/Library/Developer/arete/verification-runtime/harness/sandbox"
-"$SB" python docs/merge-check-fixture.py setup
-"$SB" arete merged --help
-"$SB" arete merge-check --help
-"$SB" arete loop list
-"$SB" arete loop status merge-check
-"$SB" arete merge-check arete-placeholder-missing --dry-run
-"$SB" arete merged --since-cursor
-"$SB" python docs/merge-check-fixture.py check --dry-run
-"$SB" arete loop try merge-check
-"$SB" python docs/merge-check-fixture.py inspect
-```
+Missing reports or diffs, malformed checks, absent verify configuration and failed preflight block without a metric or ticket and leave the batch unchecked.
+Failed preflight starts no service or verifier.
+A product startup crash emits a regression finding and metric 0, naming the checks it prevented; sandbox and confinement failures remain blocked.
+Unavailable, incomplete or unknown verification results remain blocked.
+After restoring prerequisites, retry the event; inspect scheduler dead input with `arete loop status merge-check` and requeue it with `arete loop requeue ID`.
+The hard cutoff interrupts the verifier at 40 actions, keeps usage and evidence, and blocks without repair.
+Interruption and timeout share the cleanup path; unresolved ownership retains and reports the worktree without advancing checked history.
 
-The unknown repo exits nonzero with one diagnostic. Empty-history discovery prints nothing; try
-finishes skipped with zero model calls. `inspect` shows no quota, checked identities or product starts.
-The fixture helper's `check` action sets `ARETE_LOOP_DIR` to its disposable loop folder. For the
-public command, use `"$SB" env ARETE_LOOP_DIR="$PWD/.arete-sandbox/merge-check-fixture/loop"
-arete merge-check fixture` with the same stdin (on one shell line).
+Quota holds exit 75 without starting work or recording a result.
+Scheduler dispatch releases the claimed input and consults the persisted reset before trying again; a concurrent dispatch reports busy.
+Dry-run displays a quota hold without reserving.
 
-Establish the source baseline with an older neighbour, then add two merges. Polling uses the existing
-engine source transaction. `--at` accepts a recorded UTC timestamp, so equal timestamps and late
-discoveries can be reproduced without changing clocks.
+## Versioned writes
 
-```sh
-"$SB" python docs/merge-check-fixture.py add --pr 1 --at 2026-01-01T00:00:00+00:00
-"$SB" python docs/merge-check-fixture.py poll
-"$SB" python docs/merge-check-fixture.py add --pr 2
-"$SB" python docs/merge-check-fixture.py add --pr 3
-"$SB" python docs/merge-check-fixture.py add --pr 90 --kind nonpipeline
-"$SB" python docs/merge-check-fixture.py add --pr 91 --kind open
-"$SB" python docs/merge-check-fixture.py add --pr 92 --kind no-pr
-"$SB" arete merged --since-cursor
-"$SB" python docs/merge-check-fixture.py poll
-"$SB" python docs/merge-check-fixture.py poll
-"$SB" arete loop try merge-check
-"$SB" arete loop try merge-check
-"$SB" python docs/merge-check-fixture.py event --pr 2 > .arete-sandbox/event.json
-"$SB" python docs/merge-check-fixture.py answer
-"$SB" python docs/merge-check-fixture.py check < .arete-sandbox/event.json
-"$SB" python docs/merge-check-fixture.py check < .arete-sandbox/event.json
-"$SB" python docs/merge-check-fixture.py inspect
-```
+Keyed task starts hash the canonical request and replay the exact committed response for the same principal and key.
+A live duplicate is rejected while its request is in flight; keys are separate for each principal.
+Idempotency records expire strictly after 30 days through serve pruning.
+CLI task starts print their `Idempotency-Key` on stderr and use `ARETE_IDEMPOTENCY_KEY` when supplied, otherwise a fresh key.
+Keyed CLI requests share a 30-second deadline across connection, headers, response bodies and waits, with at most two resends after an uncertain result and the same key throughout.
 
-Baseline enqueues no old input. The next poll enqueues the two new PRs once; repeated polling is
-empty. Excluded rows never appear. Try shows origin/main, start and URL templates, the two recent
-PRs, numbered checks and the older neighbour with `version` as the shared file. Try changes no
-consumer state. The first check prints only `{"value":1}`; the redundant event prints nothing.
-Inspect run folders under `.arete-sandbox/state/runs/merge-check-*`: `manifest.json` records the
-pinned SHA, worktree and steps; `result.json`, `verify.md` and `record/` preserve evidence.
-The disposable worktree is released and the server stops. `inspect` extracts START lines from the saved
-server logs to list the actual serving directories.
+Successful run writes retain their legacy response bodies and identify the committed event in `Arete-Seq`.
+Every displayed run action sends its selected `base_version`.
+A stale action shows the conflict once, refreshes and sends no second POST; a deliberate action after refresh uses the new displayed version.
 
-For a failure add PR 4, select `answer --verdict fail`, supply its event and check again. The answer
-contains PRIVATE markers in its summary, How and Saw; none may appear in emitted findings. The
-finding names the manifest's failed steps, including the neighbour, followed by metric 0. Repeat
-with `--repo fixture-two` on add, event, answer and check to inspect routing to the second repo.
-`arete loop try merge-check` previews the sample failure through the held dynamic ticket emit.
-For an ordinary fixed target and explicit numeric metric, run:
-
-```sh
-"$SB" python docs/merge-check-fixture.py emit
-"$SB" python docs/merge-check-fixture.py emit-dynamic --repo fixture-two
-"$SB" python docs/merge-check-fixture.py emit-dynamic --repo unknown
-"$SB" python docs/merge-check-fixture.py emit-dynamic --repo ''
-```
-
-For late delivery add PR 5 using the same `--at` as PR 4, then poll; add PR 6 with an earlier `--at`
-and poll again. Both keys must be observed once despite their timestamps. `poll --scope-change`
-changes command scope without changing its output; catch-up uses `data.at` and retains old seen
-identities. For an ordinary command source, use the same `sources.poll` helper with a different
-source name/command that prints a constant JSON key: run `poll-ordinary` twice (baseline, then empty),
-then `poll-ordinary --id another` (new scope, recent catch-up follows the ordinary command rules).
-
-For arrivals during a check use `answer --seconds 20`, start `check` in one terminal, and add another
-PR in a second terminal while the server runs. Fetch `/version` at the address in `verify-server.log`:
-it must read `origin-new`, even though local main reads `local-old`. After the first result, create a
-new answer and dispatch the new event: only the next batch includes that merge. Two concurrent
-helper `check` processes serialize on the consumer lock. Run `dispatch` to claim the next polled queue
-item through `loop_run.carry`, with every ticket held. A second concurrent dispatch reports busy;
-repeated dispatch after quota is capped reports a hold without a subprocess. This uses the existing
-queue and claim recovery while keeping the shipped loop off. The server uses the same queue with
-`merge-check = 1`, so at most one product serves at once.
-
-For prerequisites and incomplete verification add a new PR, then use `fault --pr N --fault report`,
-`malformed`, `diff`, `verify`, `preflight` or `start`. Each saves a `.bak` alongside the affected
-fixture file; `fault --pr N --fault restore` restores it. Missing reports/diffs, malformed checks,
-absent verify configuration and failed preflight must block with no metric or ticket and leave
-the batch unchecked. Failed preflight starts no service or verifier. A product startup crash emits a
-regression finding and metric 0, naming the checks it prevented; sandbox and confinement failures
-remain blocked. `answer --verdict unavailable`,
-`incomplete` or `unknown` exercises unavailable or unaccounted-for results. Restore prerequisites,
-select a passing answer and retry the same event; for scheduler dead input, inspect `arete loop status
-merge-check` and use `arete loop requeue ID` on the scratch server.
-
-Use `answer --verdict limit` for 45 replay actions: the hard cutoff interrupts the call at 40, keeps
-usage/evidence, and blocks without repair. Use a delayed answer and SIGTERM the check process
-to inspect interruption cleanup; a timeout uses the same cleanup path. Unresolved ownership must
-retain and report the worktree, and never advance checked history.
-
-```sh
-"$SB" python docs/merge-check-fixture.py quota
-"$SB" python docs/merge-check-fixture.py check --dry-run
-"$SB" python docs/merge-check-fixture.py check < .arete-sandbox/event.json
-"$SB" python docs/merge-check-fixture.py quota --yesterday
-```
-
-With a new pending PR, quota exits 75 (held), starting nothing and recording no result. Scheduler
-dispatch releases the claimed input and consults the persisted reset before attempting again.
-Dry-run displays the hold without reserving. Moving the scratch quota to yesterday makes one
-new check eligible. For no overlap use `add --file unrelated.txt` on an otherwise fresh history;
-the preview must explicitly say no applicable neighbour. For a continuation use `add --pr N
---continues fixture-fixture-1`: the latest run owns the merge but the earlier run owns its report.
-To reproduce duplicate publication, record the same PR again with a distinct `--id`; discovery keeps
-one canonical URL. Delete nothing from real state to reset a fixture; use a fresh disposable workspace.
+The missing-version grace deadline starts inactive.
+Migration and startup never activate it.
+The later v1 screen release must explicitly call `arete.store.writes.activate_grace()` once; it persists activation plus 30 days, and repeated activation cannot extend it.
+Before that deadline, legacy commands without versions work.
+At the exact deadline they return 409 `version_conflict` with the current persisted object.
+Explicit versions always compare; internal conditional writes remain versionless.
 
 ## Rules
 

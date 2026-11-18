@@ -270,8 +270,10 @@ def risk(patch: str, about: str, cfg: config.Config, trace: tuple[str, str] = ("
         raise Unjudged(reply.error or "its reply left questions out")
     weights = cfg.jev.risk_weights
     parts = {name: float(reply.answers[name].value) for name in RISK}
+    irreversible = reply.answers["irreversible"].probabilities.get("yes")
+    if irreversible is None or not all(0 <= p <= 1 for p in (*parts.values(), irreversible)):
+        raise Unjudged("its reply included missing or invalid risk probabilities")
     score = sum(weights[n] * parts[n] for n in RISK) / (sum(weights.values()) or 1)
-    irreversible = reply.answers["irreversible"].yes
     shown = ", ".join(f"{n} {v:.2f}" for n, v in parts.items())
     if irreversible >= cfg.jev.irreversible_hold:
         hold = f"JEV reads the change as one a revert will not undo (p {irreversible:.2f})"

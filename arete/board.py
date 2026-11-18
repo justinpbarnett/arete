@@ -11,6 +11,7 @@ from . import (
     config,
     control,
     delivery,
+    flows,
     loops,
     oncall,
     outbound,
@@ -32,6 +33,7 @@ from .store import devices as devices_store
 from .store import incidents as incident_store
 from .store import insights as insights_store
 from .store import loops as loop_store
+from .store import orchestration as orchestration_store
 from .store import runs as run_store
 from .store import triage as triage_store
 
@@ -117,7 +119,7 @@ def live(running: list[dict]) -> dict:
     for r in running:
         lines = log_lines(r)
         rows.append({
-            "id": r["id"], "kind": r["kind"], "ticket": ticket(r), "repo": r["repo"] or "",
+            "id": r["id"], "version": r["version"], "kind": r["kind"], "ticket": ticket(r), "repo": r["repo"] or "",
             "started": r["started"], "seconds": seconds_between(r["started"], None),
             "step": LOG_PREFIX.sub("", lines[-1]) if lines else "",
             "slot": slot_note(r, in_slots, waiting_for_slot),
@@ -380,9 +382,13 @@ def run_board(run_id: str) -> dict:
                        for m in models.values()),
                       key=lambda m: (-m["cost_usd"], m["model"], m["runner"], m["billing"]))
         spec = util.read_json(sessions.spec_file(run_id), {}) if r["kind"] == "session" else {}
+        adaptive = orchestration_store.view(run_id, connect=foundation.reader)
+        if adaptive:
+            adaptive["workspace_retained"] = not flows.action_workspace_refusal(run_id)
         return {"now": util.iso(),
                 "run": {**r, "ticket": ticket(r), "paid": round(sum(m["paid"] for m in rows), 4)},
                 "models": rows,
+                "orchestration": adaptive,
                 "approvals": [a for a in delivery.waiting(connect=foundation.reader) if a["run_id"] == run_id],
                 "lines_from": "feed" if r["kind"] in FEED_KINDS else "log",
                 "session": {"prompt": spec.get("prompt", ""), "tools": spec.get("tools", []),

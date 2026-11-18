@@ -45,7 +45,8 @@ REVIEW_REPAIR = "review_repair"
 CI_REPAIR = "ci_repair"
 ROLE_OF = {"plan": "plan", "patch": BUILD, "implement": BUILD, "revise": BUILD, "repair": BUILD, "verify": "verify", "review": "review", "learn": "learn",
            "document": "document"}
-SETTABLE = {**ROLE_OF, CHECK_REPAIR: CHECK_REPAIR, REVIEW_REPAIR: REVIEW_REPAIR, CI_REPAIR: CI_REPAIR}
+SETTABLE = {**ROLE_OF, "orchestrate": "orchestrate", CHECK_REPAIR: CHECK_REPAIR,
+            REVIEW_REPAIR: REVIEW_REPAIR, CI_REPAIR: CI_REPAIR}
 
 
 def atom_of(name: str, kw: dict) -> str:
@@ -111,6 +112,12 @@ def kept_pending(job: Job, continues: str) -> bool:
 
 
 def guard(job: Job, continues: str) -> str:
+    from .store import orchestration
+
+    if orchestration.publication_pending(continues):
+        return "publication was interrupted; reconcile its branch/PR effects before resuming"
+    if getattr(job.run, "action", "") and (why := action_workspace_refusal(continues)):
+        return why
     data = prepared_data(continues)
     branch, listed = str(data.get("branch") or ""), data.get("checkouts")
     if not continues or not branch or not isinstance(listed, list):
@@ -133,9 +140,24 @@ def guard(job: Job, continues: str) -> str:
     return ""
 
 
+def adaptive_state(run_id: str) -> dict:
+    from .store import orchestration
+
+    return orchestration.find(run_id).get("data", {})
+
+
 def prepared_data(continues: str) -> dict:
+    if prepared := adaptive_state(continues).get("prepared"):
+        return prepared
     prepared = factory.passed_data(factory.history(factory.chain(continues)), "prepare")
     return prepared[-1] if prepared else {}
+
+
+def action_workspace_refusal(run_id: str) -> str:
+    checkouts = prepared_data(run_id).get("checkouts") or []
+    if checkouts and all(c.get("wt") and (Path(c["wt"]) / ".git").exists() for c in checkouts):
+        return ""
+    return "adaptive action reruns need retained worktrees; the saved workspace was removed"
 
 
 def base_moved(continues: str) -> str:
@@ -173,6 +195,8 @@ def authors(run_id: str) -> set[str]:
 
 
 def publication(run_id: str) -> dict:
+    if published := adaptive_state(run_id).get("publication"):
+        return published
     for read in factory.chain(run_id):
         for line in reversed(factory.ends(read)):
             data = line.get("data")
@@ -220,7 +244,7 @@ def remade(line: dict) -> tuple[str, list[workspace.Checkout], str]:
     return branch, made, ""
 
 
-def rebuild(job: Job, line: dict) -> str:
+def rebuild(job: Job, line: dict, *, layer: config.RepoLayer | None = None) -> str:
     branch, made, why = remade(line)
     if why:
         return why
@@ -231,7 +255,8 @@ def rebuild(job: Job, line: dict) -> str:
         if why := job.reclaim(c, *authority(job.continues, c, leases.get(c.github, "")), runs, attached=False):
             return why
     ws = Path(line["tree"])
-    layer = pipeline.checked_layer(job.cfg, Path(line["data"]["layer"]))
+    admitted = layer is not None
+    layer = layer or pipeline.checked_layer(job.cfg, Path(line["data"]["layer"]))
     try:
         workspace.clear_workspace(ws, made, job.run.repo.path, layer.copy)
     except workspace.RunFailed as e:
@@ -247,6 +272,8 @@ def rebuild(job: Job, line: dict) -> str:
     except RuntimeError as e:
         return f"arete could not make it again from origin/{branch}: {util.first_line(str(e), 300)}"
     job.run.log(f"made {ws} again from origin/{branch}")
+    if admitted and layer != pipeline.checked_layer(job.cfg, layer.dir):
+        return "the restored repository layer changed; reconcile before setup"
     return pipeline.furnish(job.cfg, job.run, layer, ws)
 
 
@@ -366,15 +393,16 @@ class Job:
             self.b.restage()
         return self.b
 
-    def restore(self, line: dict) -> str:
-        why = rebuild(self, line)
+    def restore(self, line: dict, *, layer: config.RepoLayer | None = None) -> str:
+        why = rebuild(self, line, layer=layer)
         if why and not self.only and line.get("step") == "prepare":
             raise workspace.RunFailed(why)
         return why
 
     def policy(self, name: str, kw: dict) -> str:
         if name == "checks":
-            value = (self.layer.checks, self.layer.quick_checks, self.layer.targeted_checks, bool(kw.get("quick")))
+            value = (self.layer.checks, self.layer.quick_checks, self.layer.targeted_checks,
+                     self.layer.targeted_commands, bool(kw.get("quick")))
         elif name == "verify":
             value = (asdict(self.layer.verify) if self.layer.verify else None, self.goal, self.left_for_a_person)
         else:
@@ -438,12 +466,16 @@ class Job:
                 self.fix_reply = str(data.get("reply") or "")
             if outcome.session.id:
                 run.sessions[BUILD] = outcome.session
-        elif name == "checks" and "report" in data:
-            self.b.report = data["report"]
-            if outcome.passed and data.get("full"):
+        elif name == "checks":
+            self.b.report = data.get("report", self.b.report)
+            if not outcome.passed:
+                self.b.checked = {}
+            elif "checked" in data:
+                self.b.checked = data["checked"]
+            elif data.get("full"):
                 self.b.checked = {"tree": str(data.get("checked_tree") or ""), "commands": data.get("commands", {}),
                                   "report": data["report"]}
-            if not data.get("after"):
+            if "attempts" in data and not data.get("after"):
                 self.attempts = data["attempts"]
                 if stored:
                     record.note(run.id, attempts=self.attempts)
@@ -841,7 +873,6 @@ def checks(flow: factory.Flow, tree: str, attempt: int = 1, tries: int = 1, afte
     run, b = job.run, job.b
     ok = b.check(quick=True) if quick else b.check()
     if not after:
-        run.save("checks.md", b.report)
         record.note(run.id, attempts=attempt)
     if not ok:
         if not after:
@@ -849,7 +880,7 @@ def checks(flow: factory.Flow, tree: str, attempt: int = 1, tries: int = 1, afte
                              else "Checks still failing after the last attempt.")
         return Outcome("fail", next="implement", feedback=b.report,
                        data={"report": b.report, "attempts": attempt, "after": after, "story": run.story,
-                             "policy": job.policy("checks", {"quick": quick})})
+                             "policy": job.policy("checks", {"quick": quick}), "checked": b.checked})
     planned = f" (the plan estimated {job.estimate})" if job.estimate and not after else ""
     b.require_valid_diff(after or "the build and its fixes", planned)
     checked_tree = factory.fingerprint(job.ws)
@@ -857,14 +888,21 @@ def checks(flow: factory.Flow, tree: str, attempt: int = 1, tries: int = 1, afte
             and b.checked.get("report") == b.report)
     return Outcome("pass", data={"report": b.report, "attempts": attempt, "after": after, "story": run.story,
                                  "full": full, "checked_tree": checked_tree,
-                                 "commands": job.layer.checks, "policy": job.policy("checks", {"quick": quick})})
+                                 "commands": job.layer.checks, "policy": job.policy("checks", {"quick": quick}),
+                                 "checked": b.checked})
 
 
 @factory.step("verify")
-def verify(flow: factory.Flow, tree: str) -> Outcome:
+def verify(flow: factory.Flow, tree: str, single: bool = False) -> Outcome:
     job: Job = flow.ctx
     b = job.staged()
-    verified = pipeline.verify_in_use(b, job.with_left(job.goal), job.build_summary)
+    if single and "refactor" in job.ticket.labels:
+        verified = Verified("unverified", "Check in use skipped because the ticket is labeled `refactor`.")
+    elif single and not job.layer.verify:
+        verified = pipeline.verify.not_configured(job.layer.dir, job.ws)
+    else:
+        check = pipeline.check_in_use if single else pipeline.verify_in_use
+        verified = check(b, job.with_left(job.goal), job.build_summary)
     return Outcome("pass", data={"verified": asdict(verified), "names": dict(b.steps), "story": job.run.story,
                                  "policy": job.policy("verify", {}), "checked": b.checked})
 
@@ -937,16 +975,17 @@ def adopt_open_prs(job: Job) -> list[workspace.Checkout]:
     return found
 
 
-def refuse_closed_repair_prs(job: Job) -> None:
+def refuse_changed_prs(job: Job) -> None:
     run = job.run
-    for c in job.with_prs if run.repairs else []:
+    reason = f"the repair of run {run.repairs}" if run.repairs else "PR feedback"
+    for c in job.with_prs if run.repairs or run.feedback else []:
         view = gh.pr_view(c.pr)
         if view.get("state") != "OPEN":
             raise workspace.RunFailed(f"{c.pr} is {'merged' if view.get('mergedAt') else 'closed'}, so arete pushed "
-                                     f"nothing for the repair of run {run.repairs}")
+                                     f"nothing for {reason}")
         if view.get("headRefName") != job.branch:
             raise workspace.RunFailed(f"{c.pr} is on branch {view.get('headRefName')}, not {job.branch}, so arete "
-                                     f"pushed nothing for the repair of run {run.repairs}")
+                                     f"pushed nothing for {reason}")
 
 
 def settle_unpushed_checkouts(job: Job):
@@ -1041,8 +1080,9 @@ def open_or_refresh_prs(job: Job, found, staged, size, outcome, subject, draft_w
 @factory.step("pr")
 def pr(flow: factory.Flow, tree: str) -> Outcome:
     job: Job = flow.ctx
+    job.run.tracker.pr_link(job.ticket, whole=not job.left_for_a_person)
     found = adopt_open_prs(job)
-    refuse_closed_repair_prs(job)
+    refuse_changed_prs(job)
     fresh, staged, size, outcome, unpushed = settle_unpushed_checkouts(job)
     subject, draft_why, committed = publish_branch(job, fresh, staged, unpushed)
     if not job.run.repo.parts:
@@ -1105,8 +1145,8 @@ def publish(flow: factory.Flow) -> Outcome:
                 + pipeline.published_note(job.draft_why, job.verified, fresh, job.picked(job.drafted)))
     standing = [c for c in job.picked(job.changed) if c not in fresh]
     ready = pipeline.ready_pushed(run, standing, job.picked(job.ci_stopped), job.draft_why)
-    pipeline.automerge(job.cfg, run, job.layer, job.approval, job.draft_why, fresh + ready,
-                       pipeline.automerge_about(job.ticket, job.build_summary), ticket=job.ticket)
+    pipeline.automerge(job.b, job.approval, job.draft_why, job.verified, job.review, fresh + ready,
+                       pipeline.automerge_about(job.ticket, job.build_summary))
     return end_as("pass", "pr", summary=f"{job.summary}, CI: {job.ci_result}")
 
 
@@ -1177,6 +1217,8 @@ def driven(flow: factory.Flow, drive: Callable[[factory.Flow], tuple[str, str, s
         return drive(flow)
     except workspace.RunFailed as e:
         return finish(flow, "failed", why=e.why, detail=e.detail)
+    except tracker.ERRORS as e:
+        return finish(flow, "failed", why=f"tracker refused {flow.ctx.run.ref}: {e}")
     except owner_asks.Asked as e:
         reached = f"ask limit of {e.limit} reached: " if e.limit is not None else ""
         parks = e.limit is None

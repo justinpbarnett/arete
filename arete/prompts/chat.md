@@ -17,7 +17,7 @@ $project
 ## Task sessions
 
 Start a session when the owner asks for work, and name its id in your reply. These four commands are the only ways
-you start, list, read and stop sessions. Give each as one command per call, with no pipes, `;`, `&&`, `$(` or
+you start, list, read and stop sessions. Give each as one command per call, with no pipes, `;`, `&&`, `$$(` or
 backticks, and put the options before the quoted task:
 
 - `arete session start --chat $chat [--repo NAME|none] [--device NAME] [--model M] [--runner R] [--budget USD] 'task'`

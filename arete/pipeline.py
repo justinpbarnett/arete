@@ -16,13 +16,14 @@ from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import NamedTuple, TextIO
+from typing import TextIO
 
 from . import (
     alerts,
     browser,
     ci,
     config,
+    context,
     control,
     devices,
     diffguard,
@@ -32,6 +33,7 @@ from . import (
     gh,
     intake,
     jev,
+    learning,
     outbound,
     owner_asks,
     paths,
@@ -63,6 +65,7 @@ from .store import triage as triage_store
 from .util import git
 
 ADW = "adw"
+ORCHESTRATED = "orchestrated"
 ENDED = workspace.ENDED
 
 
@@ -121,20 +124,8 @@ PLAN_SCHEMA = {
     },
     "required": ["plan", "ambiguous", "risk", "estimated_lines", "verify"],
 }
-LEARN_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "expertise": {"type": "string"},
-        "added": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
-        "removed": {"type": "array", "items": {
-            "type": "object",
-            "properties": {"lesson": {"type": "string"}, "why": {"type": "string"}},
-            "required": ["lesson", "why"],
-        }},
-    },
-    "required": ["expertise", "added", "removed"],
-}
-EXPERTISE_MAX_LINES = 80
+LEARN_SCHEMA = learning.SCHEMA
+EXPERTISE_MAX_LINES = learning.MAX_LINES
 REVISE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -227,6 +218,10 @@ class AgentRun:
     step_calls: dict[str, int] = field(default_factory=dict)
     budget: runlimits.Budget | None = None
     ab_held: dict[str, tuple[str, str, dict]] = field(default_factory=dict)
+    launch_gate: Callable | None = None
+    launch_done: Callable | None = None
+    closed_context: tuple[str, ...] = ()
+    resolved_settings: dict[str, steps.Settings] = field(default_factory=dict)
 
     @property
     def ref(self) -> str:
@@ -275,6 +270,8 @@ class AgentRun:
 
     def settings(self, role: str) -> steps.Settings:
         role = config.STEP_ALIASES.get(role, role)
+        if role in self.resolved_settings:
+            return self.resolved_settings[role]
         return steps.resolve(self.config, self.layer, role, self.kind,
                              {**self.overrides, **self.step_overrides.get(role, {})},
                              self.step_overrides.get(config.INHERITS.get(role, ""), {}), ticket=self.ab_ticket,
@@ -312,11 +309,16 @@ class AgentRun:
         kw.setdefault("waits", self.waiting)
         kw.setdefault("repo", self.repo)
         kw.setdefault("layer", self.layer)
+        if self.closed_context:
+            kw.setdefault("closed_context", self.closed_context)
         seam = factory.inside(self.id)
         if s:
             kw.setdefault("settings", s)
-        if self.writes_lines:
-            def announce(route: dict) -> None:
+        if self.writes_lines or self.launch_gate:
+            def announce(route: dict) -> dict | None:
+                grant = self.launch_gate(step, s.step if s else role, route) if self.launch_gate else None
+                if not self.writes_lines:
+                    return grant
                 fields = {k: route.get(k) for k in ("runner", "model", "provider", "auth_mode", "credential",
                                                     "billing", "effort", "requested_effort", "tier", "position",
                                                     "requested", "env", "skipped", "launch") if k in route}
@@ -327,6 +329,7 @@ class AgentRun:
                 else:
                     self.write_line("step_start", step=seam.step, call=step, **{"try": seam.n}, kind=kw["kind"],
                                     **fields)
+                return grant
 
             kw["on_launch"] = announce
         if s and s.ab_name:
@@ -335,8 +338,13 @@ class AgentRun:
         kw["try_no"] = attempt_no
         self.log(f"{step}: starting")
         kw.setdefault("say", lambda note: self.log(f"{step}: {note}"))
-        res = self.through_drops(step, text, cwd, kw, self.writes_lines and seam is None, s, attempt_no)
-        return self.record_step(step, res, s, kw, seam, attempt_no, started, spent, chosen)
+        res = None
+        try:
+            res = self.through_drops(step, text, cwd, kw, self.writes_lines and seam is None, s, attempt_no)
+            return self.record_step(step, res, s, kw, seam, attempt_no, started, spent, chosen)
+        finally:
+            if self.launch_done:
+                self.launch_done(step, bool(res and (res.ok or res.turns)))
 
     def fit_route(self, step: str, text: str, s: steps.Settings | None, kw: dict) -> dict:
         cfg = kw.get("cfg") or self.config
@@ -359,20 +367,20 @@ class AgentRun:
 
     def through_drops(self, step: str, text: str, cwd: Path, kw: dict, lined: bool, s: steps.Settings | None,
                       attempt_no: int) -> Result:
+        kw.setdefault("add_dirs", self.add_dirs)
         try:
             with run_lines.beating(self.id, step) if lined else nullcontext():
-                res = runner.run(text, cwd, add_dirs=self.add_dirs, trace=(self.id, step), **kw)
+                res = runner.run(text, cwd, trace=(self.id, step), **kw)
                 if res.connection_failed:
                     self.log(f"{step}: lost the connection after {util.count(res.turns, 'turn')}, waiting for the network")
                     if self.wait_for_network():
                         dropped = res
                         self.log(f"{step}: the network is back, the dropped attempt cost {runner.cost_note(res)}")
                         if res.session.id and res.turns > 1 and kw.get("persist", True):
-                            res = runner.run(CONTINUE_AFTER_DROP, cwd, add_dirs=self.add_dirs, trace=(self.id, step),
+                            res = runner.run(CONTINUE_AFTER_DROP, cwd, trace=(self.id, step),
                                              **{**kw, "resume": res.session, **self.retry_kw()})
                         else:
-                            res = runner.run(text, cwd, add_dirs=self.add_dirs, trace=(self.id, step),
-                                             **{**kw, **self.retry_kw()})
+                            res = runner.run(text, cwd, trace=(self.id, step), **{**kw, **self.retry_kw()})
                         res = runner.with_spent(res, [dropped])
             return res
         finally:
@@ -422,6 +430,8 @@ class Run(AgentRun):
     alone: bool = False
     facts: dict = field(default_factory=dict)
     repairs: str = ""
+    action: str = ""
+    action_only: bool = False
     workspace: tuple[Path, list[workspace.Checkout]] | None = None
     asks_made: int = 0
     answers_due: list[dict] = field(default_factory=list)
@@ -447,14 +457,13 @@ class Run(AgentRun):
     def agent(self, step: str, text: str, cwd: Path, role: str = "", **kw) -> Result:
         if not self.asks_owner:
             return super().agent(step, text, cwd, role, **kw)
-        due, plain = self.due_for(step), text
+        due = self.due_for(step)
         if due:
             text, kw = self.with_answers(due, text, kw)
         res = super().agent(step, text, cwd, role, ask_owner=True, **kw)
         if due and kw["resume"].id and not res.ok and owner_asks.session_gone(res.error):
             self.log(f"{step}: the kept session is gone, so the step starts again with the ask and the answers")
-            res = super().agent(step, self.fresh_text(plain, due), cwd, role, ask_owner=True,
-                                **{**kw, "resume": NO_SESSION})
+            res = super().agent(step, text, cwd, role, ask_owner=True, **{**kw, "resume": NO_SESSION})
         if due and res.ok:
             asks_store.asks_taken([a["id"] for a in due], self.id)
             self.answers_due = [a for a in self.answers_due if a not in due]
@@ -476,13 +485,18 @@ class Run(AgentRun):
 
     def with_answers(self, due: list[dict], text: str, kw: dict) -> tuple[str, dict]:
         session = Session(**due[0]["session"]) if due[0]["session"] else NO_SESSION
-        fresh = self.fresh_text(text, due)
+        previous = kw.get("fresh_prompt")
+
+        def fresh_prompt(target: str) -> str:
+            return self.fresh_text(previous(target) if previous else text, due)
+
+        options = {**kw, "fresh_prompt": fresh_prompt}
         if session.id and kw.get("persist", True):
             parts = (owner_asks.answers_message(due), self.kept_note, self.base_note,
                      self.moved_folder_note(due[0]["run"]))
             message = "\n\n".join(part for part in parts if part)
-            return message, {**kw, "resume": session, "fresh_prompt": lambda which: fresh}
-        return fresh, {**kw, "resume": NO_SESSION}
+            return message, {**options, "resume": session}
+        return self.fresh_text(text, due), {**options, "resume": NO_SESSION}
 
     def moved_folder_note(self, asking_run: str) -> str:
         if not asking_run or asking_run == self.id:
@@ -728,14 +742,6 @@ def checkout_patch(c: workspace.Checkout, locks: list[str], *revs: str) -> str:
     return patch + (f"\n(lockfile changes not shown: {', '.join(locks)})\n" if locks else "")
 
 
-def patch_from_base(checkouts: list[workspace.Checkout]) -> str:
-    patch = ""
-    for c in checkouts:
-        since_base = f"{c.origin_base}...HEAD"
-        patch += checkout_patch(c, diffguard.between(c.wt, since_base, prefix=c.prefix).locks, since_base)
-    return patch
-
-
 def lines_by_file(staged: Staged, top: int = 12) -> str:
     rows = sorted(((name, n) for name, n in staged.counts.items() if n), key=lambda r: (-r[1], r[0]))
     out = [f"- `{name}`: {n}" for name, n in rows[:top]]
@@ -801,9 +807,14 @@ def selected_checks(layer: config.RepoLayer, files: list[str]) -> set[str]:
 
 def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: AgentRun,
                timeout: float, *, selected: set[str] | None = None) -> tuple[bool, str]:
-    if not layer.checks:
+    commands = layer.checks
+    if selected is not None:
+        available = layer.checks | layer.targeted_commands
+        if missing := selected - available.keys():
+            raise ValueError(f"unknown selected checks: {', '.join(sorted(missing))}")
+        commands = {name: command for name, command in available.items() if name in selected}
+    if not commands:
         return True, "no checks configured"
-    commands = {name: command for name, command in layer.checks.items() if selected is None or name in selected}
     quick = [(name, commands[name]) for name in layer.quick_checks if name in commands]
     slow = [(name, command) for name, command in commands.items() if name not in layer.quick_checks]
     untracked_before = untracked_by_dir(git_dirs)
@@ -905,41 +916,57 @@ class Build(TicketWork):
     def resume(self, step: str, text: str, role: str = "build", **kw) -> Result:
         saved = self.run.sessions.get("build", NO_SESSION)
         settings = self.run.settings(role)
+        feedback = text
+        base_dirs = tuple(self.run.add_dirs)
+        call_dirs = list(base_dirs)
 
-        def switched(which: str) -> str:
+        def primed(which: str) -> str:
             plan = self.run.dir / "plan.md"
             previous = util.read_json(self.run.dir / "build.json", {})
-            context = (f"The builder changed from {saved.runner} to {which}. Continue the existing work "
-                       f"in {self.ws}; inspect its current diff before editing.\n\n"
-                       f"## Issue {self.ticket.ref}: {self.ticket.title}\n\n{self.ticket.body}\n\n"
-                       f"{self.ticket.comments}\n\n## Saved plan\n\n"
-                       f"{self.plan_text or (plan.read_text() if plan.exists() else '')}\n\n"
-                       f"## Earlier builder summary\n\n{self.build_summary or previous.get('text', '')}\n\n"
-                       "Keep the current task's tool restrictions and never write git metadata or secret files.")
-            return f"{context}\n\n## Current feedback\n\n{text}"
+            task = (f"# Issue {self.ticket.ref}: {self.ticket.title}\n\n{self.ticket.body}\n\n"
+                    f"## Owner comments\n\n{self.ticket.comments or ''}\n\n"
+                    f"## Attachments\n\n{self.attachments}\n\n"
+                    f"## Left for a person\n\n{self.left_for_a_person}\n")
+            prompt, folder = context.builder_handoff(
+                self.run.dir, run_id=self.run.id, step=step, runner=which,
+                previous={"runner": saved.runner, "id": saved.id}, workspace=self.ws, roots=self.git_dirs,
+                task=task, plan=self.plan_text or (plan.read_text() if plan.exists() else ""),
+                summary=self.build_summary or previous.get("text", ""), feedback=feedback, checks=self.check_commands,
+                secret_files=runner.secret_files(self.git_dirs or [self.ws], devices.LOCAL, self.cfg))
+            call_dirs[:] = [*base_dirs, folder]
+            return prompt_loader.task_prompt(prompt)
 
-        if saved.id and saved.runner != settings.runner and settings.explicit_route:
+        text = prompt_loader.task_prompt(text)
+        if settings.session == "fresh" or (saved.id and saved.runner != settings.runner and settings.explicit_route):
             kw["resume"] = NO_SESSION
-            text = switched(settings.runner)
-        elif saved.id and settings.session == "resume":
-            kw["fresh_prompt"] = switched
-        elif saved.id and saved.runner != settings.runner:
-            text = switched(settings.runner)
         return self.run.agent(step, text, self.ws, role=role, allowed_tools=self.tools,
-                              disallowed_tools=routing.NO_GIT_WRITES, **kw)
+                              disallowed_tools=routing.NO_GIT_WRITES, fresh_prompt=primed, add_dirs=call_dirs, **kw)
 
     def check(self, *, quick: bool = False) -> bool:
-        selected = selected_checks(self.layer, self.restage().files) if quick else None
-        full = selected is None or selected == set(self.layer.checks)
-        before = factory.fingerprint(self.ws) if full else ""
-        ok, self.report = run_checks(self.layer, self.ws, self.git_dirs, self.run, self.timeout, selected=selected)
-        if ok and full:
-            after = factory.fingerprint(self.ws)
-            if before and after and before != after:
-                self.report += "\n\nChecks modified the source tree; rerun the full suite on the resulting tree."
-                return False
-            self.checked = {"tree": after, "commands": dict(self.layer.checks), "report": self.report}
-        return ok
+        previous, self.checked = self.checked, {}
+        self.report = "Checks started but did not complete; no passing result from this attempt."
+        try:
+            self.run.save("checks.md", self.report)
+            selected = selected_checks(self.layer, self.restage().files) if quick else None
+            full = selected is None or selected == set(self.layer.checks)
+            before = factory.fingerprint(self.ws)
+            ok, self.report = run_checks(self.layer, self.ws, self.git_dirs, self.run, self.timeout, selected=selected)
+            if ok:
+                after = factory.fingerprint(self.ws)
+                if before and after and before != after:
+                    self.report += "\n\nChecks modified the source tree; rerun the full suite on the resulting tree."
+                    return False
+                if full:
+                    self.checked = {"tree": after, "commands": dict(self.layer.checks), "report": self.report}
+                elif before and before == after == previous.get("tree") and previous.get("commands") == self.layer.checks:
+                    self.checked = previous
+            return ok
+        except BaseException as e:
+            self.checked = {}
+            self.report = f"Checks did not complete: {type(e).__name__}: {util.first_line(str(e), 300)}"
+            raise
+        finally:
+            self.run.save("checks.md", self.report)
 
     def restage(self, *, from_base: bool | None = None) -> Staged:
         self.staged = stage(self.checkouts, self.deny, self.from_base if from_base is None else from_base)
@@ -961,6 +988,7 @@ class Build(TicketWork):
                             f"### Lines changed by file\n\n{lines_by_file(staged)}{pushed}")
 
     def push(self, branch: str, message: str) -> None:
+        self.run.tracker.pr_link(self.ticket, whole=not self.left_for_a_person)
         commit_and_push(self.checkouts, self.staged.changed, branch, message)
         self.committed_lines += self.staged.lines
 
@@ -1004,14 +1032,17 @@ class Script:
     overrides: dict[str, dict] = field(default_factory=dict)
     again: str = ""
     repairs: str = ""
+    action: str = ""
+    action_only: bool = False
 
     @property
     def run_fields(self) -> dict:
-        return {"path": self.path, "alone": bool(self.only), "step_overrides": self.overrides}
+        return {"path": self.path, "alone": bool(self.only or self.action_only), "step_overrides": self.overrides,
+                "action": self.action, "action_only": self.action_only}
 
 
 def script_file(cfg: config.Config, name: str) -> Path:
-    folder = cfg.adws or paths.ADWS_DIR
+    folder = paths.ADWS_DIR if name in ("orchestrate", "single_worker") else cfg.adws or paths.ADWS_DIR
     if not folder.is_dir():
         raise FileNotFoundError(f"adws folder {folder} does not exist")
     if not (found := folder / f"{name}.py").is_file():
@@ -1048,22 +1079,54 @@ def answer_text(asked_id: str) -> str:
         return ""
 
 
+def recorded_path(run_id: str) -> str:
+    from .store import orchestration
+
+    if found := orchestration.find(run_id):
+        return found["data"].get("mode", "orchestrate")
+    for read in factory.chain(run_id):
+        if execution := factory.first(read, "execution"):
+            return str(execution.get("path") or "classic")
+        if path := factory.first(read, "task").get("path"):
+            return str(path)
+    return "classic"
+
+
+def dispatch_path(repo: config.Repo, tid: str) -> str:
+    newest = run_store.newest_whole_run(repo.name, tid)
+    if newest and newest["status"] == "interrupted":
+        return recorded_path(newest["id"])
+    if pending_feedback(repo.name, tid) and (source := next(iter(run_store.open_runs(repo.name, tid)), None)):
+        return recorded_path(source["id"])
+    return wanted(repo)
+
+
 def run_command(repo_name: str, tid: str | int, force: bool = False, dry_run: bool = False) -> list[str]:
     cfg = config.load()
     flags = [*(["--force"] if force else []), *(["--dry-run"] if dry_run else [])]
-    try:
-        adw = wanted(cfg.repo(repo_name)) == ADW
-    except (ValueError, TypeError):
-        adw = False
-    if not adw:
+    mode = dispatch_path(cfg.repo(repo_name), str(tid))
+    if (asked := answered_run(repo_name, str(tid))) and not dry_run:
+        mode = recorded_path(asked["id"])
+        if mode != "classic":
+            return script_command(cfg, mode, repo_name, str(tid), *flags, "--continue", asked["id"])
+    if mode == "classic":
         return control.command(["run", repo_name, str(tid), "--local", *flags])
+    if mode in (ORCHESTRATED, "orchestrate"):
+        from .store import orchestration
+
+        newest = run_store.newest_whole_run(repo_name, str(tid))
+        source = newest if newest and newest["status"] == "interrupted" else (
+            next(iter(run_store.open_runs(repo_name, str(tid))), None)
+            if not force and pending_feedback(repo_name, str(tid)) else None)
+        previous = (orchestration.find(source["id"]) or {}).get("current_run", source["id"]) if source else ""
+        return script_command(cfg, "orchestrate", repo_name, str(tid), *flags,
+                              *(["--continue", previous] if previous else []))
+    if mode != ADW:
+        return script_command(cfg, mode, repo_name, str(tid), *flags)
     newest = run_store.newest_whole_run(repo_name, str(tid))
     if newest and newest["status"] == "interrupted" and repaired_by(newest["id"]):
         return script_command(cfg, "repair", repo_name, str(tid), *flags)
     name = "revise" if pending_feedback(repo_name, str(tid)) else "feature"
-    if (asked := answered_run(repo_name, str(tid))) and not dry_run:
-        path = str(factory.first(run_lines.read(asked["id"]), "task").get("path") or "") or name
-        return script_command(cfg, path, repo_name, str(tid), *flags, "--continue", asked["id"])
     return script_command(cfg, name, repo_name, str(tid), *flags)
 
 
@@ -1078,6 +1141,10 @@ def exec_script(repo_name: str, tid: str, dry_run: bool, force: bool) -> int:
 
 
 def script_refusal(cfg: config.Config, repo: config.Repo, tid: str, script: Script, dry_run: bool = False) -> str:
+    if script.action and (script.path != "orchestrate" or not script.continues or script.only or script.again):
+        return "--action needs an orchestrated --continue without --only or --from"
+    if script.action_only and not script.action:
+        return "--only-action needs --action"
     if script.repairs:
         if script.continues or script.only or script.again or dry_run:
             return "--repair does not go with --continue, --only, --from or --dry-run"
@@ -1112,11 +1179,11 @@ def run_refusal(repo: config.Repo, script: bool = False) -> tuple[bool, str]:
         path, broken = wanted(repo), ""
     except (ValueError, TypeError, OSError) as e:
         path, broken = "classic", f"; {paths.short_path(repo.layer_dir / 'config.toml')}: {e}"
-    adw = path == ADW or script
+    adw = path in (ADW, ORCHESTRATED) or script
     if repo.parts or adw and has_origin(repo):
         return adw, ""
     return adw, f"{repo.name} has no github remote configured" + (
-        " and no git remote origin, which [factory] path = \"adw\" needs" if adw else broken)
+        " and no git remote origin, which a scripted factory needs" if adw else broken)
 
 
 def runnable(repo: config.Repo) -> bool:
@@ -1164,7 +1231,8 @@ def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: boo
 
 
 def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool = False,
-              script: Script | None = None) -> int:
+              script: Script | None = None, admission: Callable | None = None,
+              launch_done: Callable | None = None, closed_context: tuple[str, ...] = ()) -> int:
     try:
         producer_baseline = scratch.process_ids()
     except OSError:
@@ -1184,6 +1252,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
     except ValueError as e:
         print(f"{repo_name}: {e}")
         return 1
+    if not script:
+        adw = dispatch_path(repo, str(tid)) != "classic"
     if adw and not script:
         return exec_script(repo.name, tid, dry_run, force)
     if script and (refusal := script_refusal(cfg, repo, tid, script, dry_run)):
@@ -1199,6 +1269,9 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             layer = config.load_layer(repo.layer_dir)
             budget_history = run_store.ticket_runs(repo.name, tid, limit=1)
             blocked, reset_budget = runlimits.admission(repo, str(tid), tk, runlimits.Policy.of(layer), force)
+        except tracker.ERRORS as e:
+            print(f"could not read {name}: {e}")
+            return 2
         except (ValueError, OSError) as e:
             print(f"could not validate the process budget: {e}")
             return 2
@@ -1210,7 +1283,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             return 1
         with slots.admitting():
             slot = slots.RunSlot(repo.name, str(tid), cfg.max_parallel)
-            only = script.only if script else ""
+            only = (script.only or (script.action if script.action_only else "")) if script else ""
             due = asks_store.asks_due([script.continues]) if script and script.continues and not only else []
             if not dry_run:
                 if slots.slots_free_to_start(cfg.max_parallel) > 0:
@@ -1232,8 +1305,10 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force,
                       feedback=[] if mending else pending_feedback(repo.name, tid), repairs=mending,
                       answering=earlier if earlier and earlier["status"] == "needs-info" else {},
-                      **(script.run_fields if script else {}))
+                      launch_gate=admission, launch_done=launch_done, closed_context=closed_context,
+                **(script.run_fields if script else {}))
             run.dir.mkdir(parents=True, exist_ok=True)
+            run_lines.write(run.id, "execution", path=run.path or "classic", protocol=1 if run.path == "orchestrate" else 0)
             if held_from := earlier["id"] if restarting or run.answering else (
                     script.continues or script.repairs if script else ""):
                 run.ab_held = run_store.ab_held(held_from)
@@ -1276,6 +1351,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 status, summary, pr_url = flows.driven(flow, script.drive) if script else _run(cfg, run, slot)
             if flow and flow.only:
                 status, summary, passed = flows.alone(flow)
+            elif run.action_only:
+                passed = status == "step"
         except runlimits.Parked as e:
             status, summary, pr_url = park_run(run, str(e))
         except factory.OnlyDone:
@@ -1289,6 +1366,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             run.give_up("was stopped by request")
         except workspace.RunFailed as e:
             status, summary, pr_url = _fail(run, e.why, detail=e.detail)
+        except tracker.ERRORS as e:
+            status, summary, pr_url = _fail(run, f"tracker refused {run.ref}: {e}")
         except Exception as e:
             run.log(f"crashed: {type(e).__name__}: {e}")
             status, summary, pr_url = "failed", f"crashed: {e}"[:300], ""
@@ -1399,9 +1478,9 @@ def _ask(run: Run, ws: Path, checkouts: list[workspace.Checkout], comment: str, 
     return "needs-info", summary[:300], ""
 
 
-def checked_layer(cfg: config.Config, layer_dir: Path) -> config.RepoLayer:
+def checked_layer(cfg: config.Config, layer_dir: Path, *, source_file: Path | None = None) -> config.RepoLayer:
     try:
-        layer = config.load_layer(layer_dir)
+        layer = config.load_layer(layer_dir, source_file=source_file)
         steps.check(cfg, layer)
     except (ValueError, TypeError) as e:
         raise workspace.RunFailed(f"{paths.short_path(layer_dir / 'config.toml')}: {e}") from e
@@ -1610,7 +1689,6 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
               plan_text=plan_text, build_summary=build_summary)
 
     ok, attempts = b.check_with_repairs(lambda n: f"fix{n}")
-    run.save("checks.md", b.report)
     record.note(run.id, attempts=attempts)
     if not ok:
         run.story.append("Checks still failing after the last attempt.")
@@ -1693,8 +1771,8 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
     else:
         run.say(f"PRs for this ticket:\n\n{pr_status_lines(with_prs, opened, pushed)}\n\nCI: {ci_result}."
                 + published_note(draft_why, verified, opened, drafted))
-    automerge(cfg, run, layer, approval, draft_why, opened + ready_pushed(run, pushed, ci_stopped, draft_why),
-              automerge_about(t, build_summary), ticket=t)
+    automerge(b, approval, draft_why, verified, review, opened + ready_pushed(run, pushed, ci_stopped, draft_why),
+              automerge_about(t, build_summary))
     urls = record_prs(run, branch, with_prs)
     release_workspace(run, ws, checkouts)
     return "pr", outcome, urls
@@ -1760,42 +1838,71 @@ def report_body(run: Run, *, summary: str, review: Review, verified: verify.Veri
     ))
 
 
-def automerge(cfg: config.Config, run: Run, layer: config.RepoLayer, approval: dict | None, draft_why: str,
-              opened: list[workspace.Checkout], about: str, *, ticket: tracker.Ticket | None = None) -> None:
-    if draft_why or layer.trust_level != "automerge":
+def automerge(b: Build, approval: dict | None, draft_why: str, verified: verify.Verified, review: Review,
+              opened: list[workspace.Checkout], about: str) -> None:
+    run = b.run
+    if not opened or draft_why or b.layer.trust_level != "automerge" or run.feedback or run.repairs:
         return
-    if (approval and approval["sent_by"] == "triage") or (ticket and intake.AUTO_LABEL in ticket.labels):
-        run.log("automerge left off: triage approved the ticket, so a person merges it")
+    if (approval and approval["sent_by"] == "triage") or intake.AUTO_LABEL in b.ticket.labels:
         run.facts["merge_held"] = "triage approved the ticket, so a person merges it"
+        run.log(f"automerge left off: {run.facts['merge_held']}")
         return
-    try:
-        risk = jev.risk(vault.hidden(patch_from_base(opened)), about, cfg,
-                        trace=(run.id, "automerge risk jev")) if opened and jev.ready(cfg, [run.repo]) else None
-        hold = risk.hold if risk else ""
-    except jev.Unjudged as e:
-        run.log(f"automerge risk: JEV could not judge the diff: {e}")
-        hold = "JEV could not judge the diff"
     for c in opened:
         try:
-            if hold:
-                run.facts["merge_held"] = hold
-                run.log(f"automerge left off on {c.pr}: {hold}")
-                gh.pr_comment(c.pr, public_text(run, f"Automerge stays off for this PR: {hold}. A person merges it."))
-                continue
-            try:
-                did, why = gh.pr_merge_auto(c.github, gh.pr_number(c.pr))
-            except gh.GhError as e:
-                did, why = "left", f"a GitHub call failed: {str(e).rstrip('.')}"
-            if did == "merged":
-                run.log(f"automerged {c.pr}")
-            elif did == "auto":
-                run.log(f"automerge enabled on {c.pr}")
-            else:
-                run.facts["merge_held"] = why
-                run.log(f"automerge left {c.pr} for a person: {why}")
-                gh.pr_comment(c.pr, public_text(run, f"Automerge could not merge this PR: {why}. A person merges it."))
+            hold = merge_hold(b, c, verified, review, about)
+        except gh.GhUnsure:
+            run.facts["merge_held"] = "GitHub did not confirm whether it merged the PR"
+            run.log(f"automerge: {run.facts['merge_held']} at {c.lease}; check {c.pr} before retrying")
+            return
+        except (RuntimeError, OSError, KeyError, TypeError, ValueError) as e:
+            run.log(f"automerge could not establish eligibility: {public_text(run, util.first_line(str(e), 300))}")
+            hold = "the merge gate could not be completed"
+        if not hold:
+            run.log(f"automerged {c.pr} at {c.lease}")
+            continue
+        run.facts["merge_held"] = hold
+        run.log(f"automerge left {c.pr} for a person: {hold}")
+        try:
+            gh.pr_comment(c.pr, public_text(run, f"Automerge stays off for this PR: {hold}. A person merges it."))
         except gh.GhError as e:
-            run.log(f"automerge failed on {c.pr}: {e}")
+            run.log(f"automerge could not report the hold on {c.pr}: {e}")
+
+
+def merge_hold(b: Build, c: workspace.Checkout, verified: verify.Verified, review: Review, about: str) -> str:
+    if len(b.checkouts) != 1:
+        return "a change spanning repositories cannot be merged atomically"
+    if verified.verdict != "pass" or not verified.finished or not verified.checks or verified.failed_checks:
+        return "native behavioral verification did not pass"
+    head = c.lease
+    if not head:
+        return "this run has no published head to verify"
+    tree = git(["rev-parse", f"{head}^{{tree}}"], c.wt).strip()
+    trees = {c.prefix: tree}
+    if not tree or verified.native_trees != trees:
+        return "there is no native behavioral pass for the published tree"
+    if not review.approved() or review.trees != trees:
+        return "the published tree lacks a current approving review"
+    if not b.layer.checks or b.checked.get("tree") != tree or b.checked.get("commands") != b.layer.checks:
+        return "the published tree lacks the full local check result"
+    if not jev.ready(b.cfg, [b.run.repo]):
+        return "JEV risk screening is unavailable"
+    base_sha = git(["rev-parse", c.origin_base], c.wt).strip()
+    if not base_sha or git(["merge-base", base_sha, head], c.wt).strip() != base_sha:
+        return "the checked head does not contain the target base"
+    number = gh.pr_number(c.pr)
+    _, hold = gh.merge_readiness(c.github, number, head, c.base, base_sha, wait=gh.MERGE_WAIT_SECONDS)
+    if hold:
+        return hold
+    patch = checkout_patch(c, [], f"{base_sha}..{head}")
+    if not patch:
+        return "there is no diff to risk screen"
+    try:
+        risk = jev.risk(vault.hidden(patch), vault.hidden(about), b.cfg, trace=(b.run.id, "automerge risk jev"))
+    except jev.Unjudged:
+        return "JEV could not judge the diff"
+    if risk.hold:
+        return risk.hold
+    return gh.pr_merge_auto(c.github, number, head, c.base, base_sha)
 
 
 def nothing_to_build(run: Run, t: tracker.Ticket, ws: Path, checkouts: list[workspace.Checkout], branch: str, summary: str,
@@ -1946,7 +2053,7 @@ def watch_ci(b: Build, slot: slots.RunSlot, branch: str, pushed: list[workspace.
         for current in ci_rounds(b, slot, branch, pushed, max_rounds, fix):
             rounds.append(current)
             publish_ci(run, b.ticket, pushed, ci.section(rounds, max_rounds))
-    except owner_asks.Asked:
+    except (owner_asks.Asked, tracker.TaskError):
         raise
     except Exception as e:
         failed = e if isinstance(e, workspace.RunFailed) else workspace.RunFailed(f"the CI watch crashed: {type(e).__name__}: {e}")
@@ -2314,7 +2421,7 @@ def resolve_conflicts(run: AgentRun, c: workspace.Checkout, conflicts: list[str]
                       commands=prompt_loader.code_list(layer.builder_bash), attempt=n, tries=tries, feedback=feedback,
                       owner=run.owner_note)
         try:
-            res = run.agent(round_name("resolve", n), text, c.wt, role="build",
+            res = run.agent(round_name("resolve", n), prompt_loader.task_prompt(text), c.wt, role="build",
                             allowed_tools=prompt_loader.bash_rules(layer.builder_bash), disallowed_tools=routing.NO_GIT_WRITES,
                             json_schema=RESOLVE_SCHEMA, resume=NO_SESSION, extra_env=dict(RESOLVER_SETS))
         finally:
@@ -2600,6 +2707,8 @@ def check_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
 def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "verify",
                 require_released: bool = False, **values) -> verify.Verified:
     run, v = b.run, verify.with_free_ports(b.layer.verify)
+    merge_trees = (verification_trees(b) if prompt_name == role == "verify" and b.layer.trust_level == "automerge"
+                   else {})
     step = b.next_step(step_name)
     if refusal := verify.port_refusal(v):
         run.log(f"{step}: {refusal}")
@@ -2702,11 +2811,19 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
             verified.checks = probes.checks + verified.checks
     if fixture_blocker:
         verified.verdict, verified.blocked_by, verified.finished = "blocked", fixture_blocker, False
+    if (verified.verdict == "pass" and merge_trees and agent_finished and res.runner in {"pi", "codex", "claude"}
+            and merge_trees == verification_trees(b)):
+        verified.native_trees = merge_trees
     verified.saved = os.path.abspath(run.dir / f"{step}.md")
     run.save(f"{step}.md", verified.markdown())
     run.log(f"{step}: {verified.verdict}, {len(verified.checks) - len(verified.failed_checks)} of "
             f"{util.count(len(verified.checks), 'check')} passed")
     return verified
+
+
+def verification_trees(b: TicketWork) -> dict[str, str]:
+    trees = {c.prefix: factory.fingerprint(c.wt) for c in b.checkouts}
+    return trees if len(trees) == len(b.checkouts) and all(trees.values()) else {}
 
 
 def surface_note(v: config.Verify, url: str, evidence: Path) -> str:
@@ -2820,11 +2937,7 @@ def cut_at_end(text: str, limit: int) -> str:
     return head[:at].rstrip() + CUT_MARK
 
 
-class Learned(NamedTuple):
-    rewrite: str
-    report: str
-    added: int
-    removed: int
+Learned = learning.Rewrite
 
 
 def layer_lock(layer_dir: Path) -> str:
@@ -2841,18 +2954,11 @@ def learned(run: AgentRun, wt: Path, title: str, expertise: str, call: str, **kw
                                   max_lines=EXPERTISE_MAX_LINES),
                     wt, role="learn", json_schema=LEARN_SCHEMA, persist=False, **kw)
     found = res.structured if res.ok and isinstance(res.structured, dict) else {}
-    rewrite = found.get("expertise", "").strip()
-    line_count = len(rewrite.splitlines())
-    if not rewrite:
-        run.log("learn: no expertise file came back, kept the old one")
+    try:
+        return learning.parse(found, expertise)
+    except (TypeError, ValueError) as error:
+        run.log(f"learn: {error}; kept the old file")
         return None
-    if line_count > EXPERTISE_MAX_LINES:
-        run.log(f"learn: the rewrite has {line_count} lines, over the {EXPERTISE_MAX_LINES} line cap; kept the old file")
-        return None
-    added = [a.strip() for a in found.get("added", []) if a.strip()]
-    removed = [r for r in found.get("removed", []) if r.get("lesson", "").strip()]
-    report = "\n".join([f"+ {a}" for a in added] + [f"- {r['lesson']} ({r['why']})" for r in removed])
-    return Learned(rewrite, report, len(added), len(removed))
 
 
 def _learn(run: AgentRun, wt: Path, expertise_file: Path, title: str, apply: bool) -> str:
@@ -3049,6 +3155,8 @@ def spawn_run(repo_name: str, tid: str, force: bool = False) -> subprocess.Popen
 
 
 def run_skipped(name: str) -> dict:
+    from . import tasks
+
     entry = skipped_tickets().get(name)
     if not entry:
         raise control.NotFound(f"{name} is not on the skipped list; the last poll either ran it or no longer skips it")
@@ -3056,18 +3164,18 @@ def run_skipped(name: str) -> dict:
         raise control.Refused(f"{name} names no repo to run in; a ticket the pipeline routes to a repo gets one at "
                               "the next poll")
     cfg = config.load()
-    if run_store.issue_running(entry["repo"], entry["id"]):
-        raise control.Busy(name)
-    if slots.slots_free_to_start(cfg.max_parallel) <= 0:
-        raise slots.NoFreeSlot(f"{name} was not started: {slots.no_free_slot(cfg.max_parallel)}; wait for a run to finish or "
-                         "raise max_parallel in Settings")
-    run = spawn_run(entry["repo"], entry["id"], force=True)
-    give_up = time.monotonic() + RUN_START_SECONDS
-    while not run_store.issue_running(entry["repo"], entry["id"]) and time.monotonic() < give_up:
-        if run.poll() is not None:
-            raise control.Refused(f"{name} ended before it showed as running; the end of "
-                                  f"{paths.short_path(paths.LOG_DIR / RUNS_LOG)} says why")
-        time.sleep(0.1)
+    with tasks.PENDING_LOCK, util.lock(tasks.START_LOCK, wait=True):
+        if run_store.issue_running(entry["repo"], entry["id"]):
+            raise control.Busy(name)
+        if not tasks.pending_start(entry["repo"], str(entry["id"])):
+            if slots.slots_free_to_start(cfg.max_parallel) <= 0:
+                raise slots.NoFreeSlot(f"{name} was not started: {slots.no_free_slot(cfg.max_parallel)}; wait for a run "
+                                      "to finish or raise max_parallel in Settings")
+            _, state = tasks.spawned(entry["repo"], str(entry["id"]),
+                                     lambda: spawn_run(entry["repo"], entry["id"], force=True))
+            if state == "exited":
+                raise control.Refused(f"{name} ended before it showed as running; the end of "
+                                      f"{paths.short_path(paths.LOG_DIR / RUNS_LOG)} says why")
     return {"ticket": name, "repo": entry["repo"], "id": entry["id"]}
 
 

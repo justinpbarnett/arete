@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from datetime import timedelta
 from functools import partial
 from pathlib import Path
-from string import Template
 
 from . import (
     config,
@@ -20,6 +19,7 @@ from . import (
     log_follower,
     outbound,
     paths,
+    prompt_loader,
     record,
     run_lines,
     screening,
@@ -970,7 +970,7 @@ def route_refusal(cfg: config.Config, repo: config.Repo) -> tuple[str, bool]:
 def repair_prompt(row: dict, repairs: list[dict], limit: int) -> str:
     earlier = "".join(f"- attempt {n}: task {r['task']}, run {last_run_id(r)}, ended {r['outcome'] or 'unfinished'}\n"
                       for n, r in enumerate(repairs, 1))
-    return Template((paths.PROMPTS_DIR / "oncall_repair.md").read_text()).safe_substitute(
+    return prompt_loader.prompt("oncall_repair", paths.PROMPTS_DIR,
         incident=row["id"], kind=row["class"], source=outbound.plain(row["source"], 200), count=row["count"],
         first_seen=row["first_seen"], last_seen=row["last_seen"], attempt=len(repairs) + 1,
         max_attempts=limit, earlier=f"Earlier attempts:\n{earlier}" if earlier else "", evidence=subject(row))
@@ -1084,9 +1084,14 @@ def wake(cfg: config.Config, row: dict) -> bool:
     limits = cfg.oncall
     mine = attempts(row)
     name = repair_repo(cfg, row)
+    try:
+        text = repair_prompt(row, mine, limits.max_attempts)
+    except (OSError, ValueError) as error:
+        moved(row, "waiting", f"repair prompt refused: {outbound.sanitize(str(error), 160)}")
+        return False
     repair = incident_store.add_repair(row["id"], name)
     try:
-        started = start_task(name, repair_prompt(row, mine, limits.max_attempts), repair_title(row["id"]))
+        started = start_task(name, text, repair_title(row["id"]))
     except (control.Refused, control.NotFound) as e:
         made = next(r for r in incident_store.incident(row["id"])["repairs"] if r["id"] == repair)
         why = outbound.sanitize(str(e), 160)

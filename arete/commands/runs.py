@@ -25,7 +25,7 @@ def cmd_run(args) -> int:
 
     if not (args.local or args.dry_run):
         try:
-            started = client.call("POST", "/api/tasks", {"repo": args.repo, "ticket": args.issue, "force": args.force})
+            started = client.start_task({"repo": args.repo, "ticket": args.issue, "force": args.force}, args.key)
         except client.Down:
             started = None
         except client.Failed as e:
@@ -40,7 +40,7 @@ def run_followed(started: dict) -> int:
 
     client.emit(started)
     if not (run_id := started.get("run")):
-        return 0 if started.get("state") == "queued" else 1
+        return 0 if started.get("state") in ("queued", "starting") else 1
     try:
         for line in client.followed(run_id):
             client.emit(line)
@@ -94,13 +94,13 @@ def cmd_answer(args) -> int:
 def cmd_resume(args) -> int:
     from .. import client
 
-    return client.say("POST", client.run_path(args.run_id, "resume"), {"step": args.step} if args.step else {})
+    return client.run_command(args.run_id, "resume", {"step": args.step} if args.step else {})
 
 
 def cmd_repair(args) -> int:
     from .. import client
 
-    return client.say("POST", client.run_path(args.run_id, "repair"), {})
+    return client.run_command(args.run_id, "repair")
 
 
 def cmd_step(args) -> int:
@@ -115,20 +115,20 @@ def cmd_step(args) -> int:
             client.emit({"error": f"write each setting as key=value, not '{setting}'"})
             return 1
         sets[key.strip()] = value
-    return client.say("POST", client.run_path(args.run_id, f"steps/{quote(args.step, safe='')}"), {"set": sets})
+    return client.run_command(args.run_id, f"steps/{quote(args.step, safe='')}", {"set": sets})
 
 
 def cmd_stop(args) -> int:
     from .. import client
 
-    return client.say("POST", client.run_path(args.run_id, "stop"))
+    return client.run_command(args.run_id, "stop")
 
 
 def cmd_replay(args) -> int:
     from .. import replay
 
     try:
-        lines = replay.sample(paths.expand(args.folder), adw=args.adw)
+        lines = replay.sample(paths.expand(args.folder), adw=args.adw, orchestrated=args.orchestrated)
     except (OSError, RuntimeError) as e:
         print(e, file=sys.stderr)
         return 1
@@ -154,6 +154,7 @@ def register(sub) -> None:
     p.add_argument("--local", action="store_true", help="run in this process even when the server is up; the server "
                                                         "and the poller start runs this way")
     p.set_defaults(fn=cmd_run)
+    p.add_argument("--key", default=None, help="reuse an identical remote task-start request safely")
 
     p = steering(sub.add_parser("resume", help="continue a run that ended interrupted, stopped or failed, through the "
                                                "server"))
@@ -180,7 +181,9 @@ def register(sub) -> None:
                                       "bare origin, a layer and an answer per ticket step")
     p.add_argument("action", choices=("sample",))
     p.add_argument("folder")
-    p.add_argument("--adw", action="store_true", help="turn on [factory] path = \"adw\" in the sample layer")
+    modes = p.add_mutually_exclusive_group()
+    modes.add_argument("--adw", action="store_true", help="pin the sample to the fixed adw flow")
+    modes.add_argument("--orchestrated", action="store_true", help="write adaptive controller/worker replay answers")
     p.set_defaults(fn=cmd_replay)
 
     p = steering(sub.add_parser("wait", help="follow a run through the server, printing its step_end, question, "

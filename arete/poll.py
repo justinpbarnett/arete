@@ -104,8 +104,10 @@ def step_without_route(cfg: config.Config, repo: config.Repo, ticket: tracker.Ti
                   discovery: routing.Discovery, layer: config.RepoLayer) -> str:
     if cfg.replay.all:
         return ""
-    first = ("plan", "build")
-    if (layer.factory_path == pipeline.ADW and len(repo.parts) <= 1
+    mode = pipeline.dispatch_path(repo, str(ticket.id))
+    adaptive = mode in (pipeline.ORCHESTRATED, "orchestrate")
+    first = ("orchestrate", "build") if adaptive else ("plan", "build")
+    if (not adaptive and layer.factory_path == pipeline.ADW and len(repo.parts) <= 1
             and patching.requested(layer, ticket, automatic=cfg.triage.route_fixes)
             and not patching.specification_refusal(ticket)):
         first = ("build",)
@@ -114,7 +116,9 @@ def step_without_route(cfg: config.Config, repo: config.Repo, ticket: tracker.Ti
             and repaired_by(newest["id"])):
         first = ("review_repair",)
     elif pending_feedback(repo.name, ticket.id):
-        first = ("build",)
+        source = next(iter(run_store.open_runs(repo.name, ticket.id)), None)
+        if not source or pipeline.recorded_path(source["id"]) not in (pipeline.ORCHESTRATED, "orchestrate"):
+            first = ("build",)
     for role in (*first, *(("verify",) if layer.verify else ()), "review"):
         setting = steps.resolve(cfg, layer, role, ticket.kind, ticket=(repo.name, str(ticket.id)))
         if setting.runner == REPLAY:
@@ -143,12 +147,18 @@ def tracker_reply(repo: config.Repo, tk: tracker.Tracker, tid: str, dry_run: boo
     return ""
 
 
-def spawn_unparked(repo_name: str, tid: str | int) -> bool:
+def spawn_unparked(repo_name: str, tid: str | int) -> bool | None:
+    """Return True for a spawn, None for existing work, False for an oncall refusal."""
+    from . import tasks
+
     with util.lock("oncall") as got:
         if not got or str(tid) in oncall.parked(repo_name):
             return False
-        spawn_run(repo_name, tid)
-        return True
+        with tasks.PENDING_LOCK, util.lock(tasks.START_LOCK, wait=True):
+            if tasks.pending_start(repo_name, str(tid)) or run_store.issue_running(repo_name, tid):
+                return None
+            tasks.spawn_pending(repo_name, str(tid), lambda: spawn_run(repo_name, tid))
+            return True
 
 
 def failed(errors: list[str], where: str, error: Exception) -> None:
@@ -196,8 +206,13 @@ def repo_queues(cfg: config.Config, pipeline_repos: list[config.Repo], routes: d
 
 def start_pick(cfg: config.Config, queue: RepoQueue, pick: tuple[str, str], skips: pipeline.SkipLog,
                dry_run: bool, going: Counter, slots: int) -> str:
+    from . import tasks
+
     repo, layer = queue.repo, queue.layer
     tid, why = pick
+    with tasks.PENDING_LOCK, util.lock(tasks.START_LOCK, wait=True):
+        if tasks.pending_start(repo.name, str(tid)) or run_store.issue_running(repo.name, tid):
+            return "skipped"
     source = tracker.for_ticket(cfg, repo, tid)
     name = tracker.ticket_name(repo.name, source.ref(tid))
     reply = tracker_reply(repo, source, str(tid), dry_run)
@@ -220,14 +235,18 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: tuple[str, str], skip
     print(f"{util.iso()} {name}: {why}" + (" (dry run, not started)" if dry_run else ""))
     if not dry_run:
         source_store.drop_passed_over(repo.name, keep=str(tid))
-        if not spawn_unparked(repo.name, tid):
+        spawned = spawn_unparked(repo.name, tid)
+        if spawned is None:
+            return "skipped"
+        if not spawned:
             return "refused"
     return "started"
 
 
 def fill_slots(cfg: config.Config, queues: list[RepoQueue], skips: pipeline.SkipLog, dry_run: bool,
-               errors: list[str], going: Counter, slots: int) -> None:
+               errors: list[str], going: Counter, slots: int) -> bool:
     examined, exhausted = 0, set()
+    selected_work = False
     while examined < MAX_STARTS_PER_POLL:
         progressed = False
         for queue in queues:
@@ -248,6 +267,7 @@ def fill_slots(cfg: config.Config, queues: list[RepoQueue], skips: pipeline.Skip
                 if result in ("held", "refused"):
                     exhausted.add(repo.name)
                 elif result == "started":
+                    selected_work = True
                     slots -= 1
                     going[repo.name] += 1
             except Exception as e:
@@ -256,6 +276,7 @@ def fill_slots(cfg: config.Config, queues: list[RepoQueue], skips: pipeline.Skip
                 exhausted.add(repo.name)
         if not progressed:
             break
+    return selected_work
 
 
 def report_unrouted(routes: dict[str, set[str]], reached_clients: dict[str, jira.Client],
@@ -299,11 +320,13 @@ def poll(dry_run: bool = False) -> int:
         skips = pipeline.SkipLog({} if dry_run else util.read_json(pipeline.SKIPPED_FILE, {}))
         routes = jira_routes_by_project(cfg)
         queues, reached_clients = repo_queues(cfg, pipeline_repos, routes, skips, errors)
-        fill_slots(cfg, queues, skips, dry_run, errors, going, slots)
+        selected_work = fill_slots(cfg, queues, skips, dry_run, errors, going, slots)
         report_unrouted(routes, reached_clients, skips, errors)
         if not dry_run:
             guard(errors, "moving tickets", lambda: outcomes.sync_moves(cfg))
             guard(errors, "poll", lambda: save_skips_and_landings(cfg, skips, outcomes.sync_landings))
             guard(errors, "sweeping worktrees", lambda: cleanup_worktrees(cfg=cfg))
             mark_loop("poll", not errors, "; ".join(errors))
+        elif not errors and not selected_work:
+            print(f"{util.iso()} poll dry run: no new run would start")
         return 1 if errors else 0

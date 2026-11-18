@@ -38,7 +38,7 @@ function upNextParts(waiting) {
 
 function stopLiveRun(run, btn) {
   return act(btn, "running", `/api/runs/${encodeURIComponent(run.id)}/stop`, {},
-    (r) => stopWords(run.ticket, r, "It leaves this list once it has."));
+    (r) => stopWords(run.ticket, r, "It leaves this list once it has."), { object: run });
 }
 
 const NEEDS_HEADS = [["Kind", "c-kind"], ["Repo", "c-repo"], ["What"], ["Since", "c-time"], ["", "c-decide"]];

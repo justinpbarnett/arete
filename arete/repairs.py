@@ -45,6 +45,13 @@ def saved_review(run_id: str) -> tuple[Review, int]:
 
 
 def saved_plan(run_id: str) -> tuple[str, str, str]:
+    from . import flows
+
+    if adaptive := flows.adaptive_state(run_id):
+        job, ticket = adaptive.get("job", {}), adaptive.get("prepared", {}).get("ticket", {})
+        task = str(job.get("plan_text") or "\n".join(str(ticket.get(key) or "") for key in ("title", "body")))
+        if task.strip():
+            return task, str(job.get("goal") or ""), str(job.get("left_for_a_person") or "")
     for data in reversed(factory.passed_data(factory.history(factory.chain(run_id)), *PLAN_STEPS)):
         if data.get("plan"):
             return str(data["plan"]), str(data.get("goal") or ""), str(data.get("left_for_a_person") or "")
