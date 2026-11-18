@@ -142,7 +142,7 @@ def print_delivery(cfg: config.Config) -> None:
                 qualified = model if "/" in model else f"{provider}/{model}"
                 detail += (f"; controller runner={setting.runner} model={qualified}"
                            f" effort={setting.effort_on(setting.runner) or 'default'}")
-        except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError) as error:
             detail = (f"configuration problem ({type(error).__name__}); "
                       f"check {paths.short_path(repo.layer_dir / 'config.toml')}")
         print(f"  {repo.name}: {detail}")
