@@ -742,14 +742,6 @@ def checkout_patch(c: workspace.Checkout, locks: list[str], *revs: str) -> str:
     return patch + (f"\n(lockfile changes not shown: {', '.join(locks)})\n" if locks else "")
 
 
-def patch_from_base(checkouts: list[workspace.Checkout]) -> str:
-    patch = ""
-    for c in checkouts:
-        since_base = f"{c.origin_base}...HEAD"
-        patch += checkout_patch(c, diffguard.between(c.wt, since_base, prefix=c.prefix).locks, since_base)
-    return patch
-
-
 def lines_by_file(staged: Staged, top: int = 12) -> str:
     rows = sorted(((name, n) for name, n in staged.counts.items() if n), key=lambda r: (-r[1], r[0]))
     out = [f"- `{name}`: {n}" for name, n in rows[:top]]
@@ -1749,8 +1741,8 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
     else:
         run.say(f"PRs for this ticket:\n\n{pr_status_lines(with_prs, opened, pushed)}\n\nCI: {ci_result}."
                 + published_note(draft_why, verified, opened, drafted))
-    automerge(cfg, run, layer, approval, draft_why, opened + ready_pushed(run, pushed, ci_stopped, draft_why),
-              automerge_about(t, build_summary), ticket=t)
+    automerge(b, approval, draft_why, verified, review, opened + ready_pushed(run, pushed, ci_stopped, draft_why),
+              automerge_about(t, build_summary))
     urls = record_prs(run, branch, with_prs)
     release_workspace(run, ws, checkouts)
     return "pr", outcome, urls
@@ -1816,42 +1808,71 @@ def report_body(run: Run, *, summary: str, review: Review, verified: verify.Veri
     ))
 
 
-def automerge(cfg: config.Config, run: Run, layer: config.RepoLayer, approval: dict | None, draft_why: str,
-              opened: list[workspace.Checkout], about: str, *, ticket: tracker.Ticket | None = None) -> None:
-    if draft_why or layer.trust_level != "automerge":
+def automerge(b: Build, approval: dict | None, draft_why: str, verified: verify.Verified, review: Review,
+              opened: list[workspace.Checkout], about: str) -> None:
+    run = b.run
+    if not opened or draft_why or b.layer.trust_level != "automerge" or run.feedback or run.repairs:
         return
-    if (approval and approval["sent_by"] == "triage") or (ticket and intake.AUTO_LABEL in ticket.labels):
-        run.log("automerge left off: triage approved the ticket, so a person merges it")
+    if (approval and approval["sent_by"] == "triage") or intake.AUTO_LABEL in b.ticket.labels:
         run.facts["merge_held"] = "triage approved the ticket, so a person merges it"
+        run.log(f"automerge left off: {run.facts['merge_held']}")
         return
-    try:
-        risk = jev.risk(vault.hidden(patch_from_base(opened)), about, cfg,
-                        trace=(run.id, "automerge risk jev")) if opened and jev.ready(cfg, [run.repo]) else None
-        hold = risk.hold if risk else ""
-    except jev.Unjudged as e:
-        run.log(f"automerge risk: JEV could not judge the diff: {e}")
-        hold = "JEV could not judge the diff"
     for c in opened:
         try:
-            if hold:
-                run.facts["merge_held"] = hold
-                run.log(f"automerge left off on {c.pr}: {hold}")
-                gh.pr_comment(c.pr, public_text(run, f"Automerge stays off for this PR: {hold}. A person merges it."))
-                continue
-            try:
-                did, why = gh.pr_merge_auto(c.github, gh.pr_number(c.pr))
-            except gh.GhError as e:
-                did, why = "left", f"a GitHub call failed: {str(e).rstrip('.')}"
-            if did == "merged":
-                run.log(f"automerged {c.pr}")
-            elif did == "auto":
-                run.log(f"automerge enabled on {c.pr}")
-            else:
-                run.facts["merge_held"] = why
-                run.log(f"automerge left {c.pr} for a person: {why}")
-                gh.pr_comment(c.pr, public_text(run, f"Automerge could not merge this PR: {why}. A person merges it."))
+            hold = merge_hold(b, c, verified, review, about)
+        except gh.GhUnsure:
+            run.facts["merge_held"] = "GitHub did not confirm whether it merged the PR"
+            run.log(f"automerge: {run.facts['merge_held']} at {c.lease}; check {c.pr} before retrying")
+            return
+        except (RuntimeError, OSError, KeyError, TypeError, ValueError) as e:
+            run.log(f"automerge could not establish eligibility: {public_text(run, util.first_line(str(e), 300))}")
+            hold = "the merge gate could not be completed"
+        if not hold:
+            run.log(f"automerged {c.pr} at {c.lease}")
+            continue
+        run.facts["merge_held"] = hold
+        run.log(f"automerge left {c.pr} for a person: {hold}")
+        try:
+            gh.pr_comment(c.pr, public_text(run, f"Automerge stays off for this PR: {hold}. A person merges it."))
         except gh.GhError as e:
-            run.log(f"automerge failed on {c.pr}: {e}")
+            run.log(f"automerge could not report the hold on {c.pr}: {e}")
+
+
+def merge_hold(b: Build, c: workspace.Checkout, verified: verify.Verified, review: Review, about: str) -> str:
+    if len(b.checkouts) != 1:
+        return "a change spanning repositories cannot be merged atomically"
+    if verified.verdict != "pass" or not verified.finished or not verified.checks or verified.failed_checks:
+        return "native behavioral verification did not pass"
+    head = c.lease
+    if not head:
+        return "this run has no published head to verify"
+    tree = git(["rev-parse", f"{head}^{{tree}}"], c.wt).strip()
+    trees = {c.prefix: tree}
+    if not tree or verified.native_trees != trees:
+        return "there is no native behavioral pass for the published tree"
+    if not review.approved() or review.trees != trees:
+        return "the published tree lacks a current approving review"
+    if not b.layer.checks or b.checked.get("tree") != tree or b.checked.get("commands") != b.layer.checks:
+        return "the published tree lacks the full local check result"
+    if not jev.ready(b.cfg, [b.run.repo]):
+        return "JEV risk screening is unavailable"
+    base_sha = git(["rev-parse", c.origin_base], c.wt).strip()
+    if not base_sha or git(["merge-base", base_sha, head], c.wt).strip() != base_sha:
+        return "the checked head does not contain the target base"
+    number = gh.pr_number(c.pr)
+    _, hold = gh.merge_readiness(c.github, number, head, c.base, base_sha, wait=gh.MERGE_WAIT_SECONDS)
+    if hold:
+        return hold
+    patch = checkout_patch(c, [], f"{base_sha}..{head}")
+    if not patch:
+        return "there is no diff to risk screen"
+    try:
+        risk = jev.risk(vault.hidden(patch), vault.hidden(about), b.cfg, trace=(b.run.id, "automerge risk jev"))
+    except jev.Unjudged:
+        return "JEV could not judge the diff"
+    if risk.hold:
+        return risk.hold
+    return gh.pr_merge_auto(c.github, number, head, c.base, base_sha)
 
 
 def nothing_to_build(run: Run, t: tracker.Ticket, ws: Path, checkouts: list[workspace.Checkout], branch: str, summary: str,
@@ -2656,6 +2677,8 @@ def check_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
 def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "verify",
                 require_released: bool = False, **values) -> verify.Verified:
     run, v = b.run, verify.with_free_ports(b.layer.verify)
+    merge_trees = (verification_trees(b) if prompt_name == role == "verify" and b.layer.trust_level == "automerge"
+                   else {})
     step = b.next_step(step_name)
     if refusal := verify.port_refusal(v):
         run.log(f"{step}: {refusal}")
@@ -2758,11 +2781,19 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
             verified.checks = probes.checks + verified.checks
     if fixture_blocker:
         verified.verdict, verified.blocked_by, verified.finished = "blocked", fixture_blocker, False
+    if (verified.verdict == "pass" and merge_trees and agent_finished and res.runner in {"pi", "codex", "claude"}
+            and merge_trees == verification_trees(b)):
+        verified.native_trees = merge_trees
     verified.saved = os.path.abspath(run.dir / f"{step}.md")
     run.save(f"{step}.md", verified.markdown())
     run.log(f"{step}: {verified.verdict}, {len(verified.checks) - len(verified.failed_checks)} of "
             f"{util.count(len(verified.checks), 'check')} passed")
     return verified
+
+
+def verification_trees(b: TicketWork) -> dict[str, str]:
+    trees = {c.prefix: factory.fingerprint(c.wt) for c in b.checkouts}
+    return trees if len(trees) == len(b.checkouts) and all(trees.values()) else {}
 
 
 def surface_note(v: config.Verify, url: str, evidence: Path) -> str:

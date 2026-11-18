@@ -96,13 +96,19 @@ class PushedPrDraftTests(unittest.TestCase):
         self.draft, self.remote_head, self.score, self.fail = True, self.head, 0.1, False
         self.run = SimpleNamespace(id="x", repo=config.Repo(name="fixture", path=self.root), repairs="", feedback=[],
                                    facts={}, log=self.logs.append)
-        self.layer = SimpleNamespace(trust_level="automerge")
-        self.cfg = config.Config()
+        self.layer = SimpleNamespace(trust_level="automerge", checks={"behavior": "true"})
         self.c = workspace.Checkout("", "fixture/repo", self.root, self.root, "main", pr=self.URL, lease=self.head)
+        self.tree, self.base = "b" * 40, "c" * 40
+        self.build = SimpleNamespace(run=self.run, layer=self.layer, cfg=config.Config(), checkouts=[self.c],
+                                     ticket=SimpleNamespace(labels=[]),
+                                     checked={"tree": self.tree, "commands": self.layer.checks})
+        self.verified = verify.Verified("pass", checks=[{"passed": True}], native_trees={"": self.tree})
+        self.review = Review(verdict="approve", trees={"": self.tree})
         for patch in (mock.patch.object(gh, "gh", self.fake_gh),
                       mock.patch.object(jev, "ready", return_value=True),
                       mock.patch.object(jev, "ask", self.fake_ask),
-                      mock.patch.object(pipeline, "patch_from_base", return_value="+a change"),
+                      mock.patch.object(pipeline, "git", self.fake_git),
+                      mock.patch.object(pipeline, "checkout_patch", return_value="+a change"),
                       mock.patch.object(pipeline.vault, "values", return_value=set()),
                       mock.patch.object(outbound, "keep_configured_private"),
                       mock.patch.object(outbound, "own_hosts", []),
@@ -119,14 +125,25 @@ class PushedPrDraftTests(unittest.TestCase):
                 if self.fail:
                     raise gh.GhError("gh pr view: boom")
                 return json.dumps({"isDraft": self.draft, "headRefOid": self.remote_head})
-            if "title" in args:
-                return json.dumps({"title": "feat: Title"})
-            return json.dumps({"mergeStateStatus": "DRAFT" if self.draft else "CLEAN", "mergeable": "MERGEABLE"})
+            return json.dumps({"title": "feat: Title", "state": "OPEN", "isDraft": self.draft,
+                               "headRefOid": self.remote_head, "baseRefName": self.c.base, "baseRefOid": self.base,
+                               "mergeStateStatus": "DRAFT" if self.draft else "CLEAN", "mergeable": "MERGEABLE"})
         elif args[0] == "api":
-            return json.dumps({"allow_auto_merge": False})
-        elif args[:2] not in (["pr", "merge"], ["pr", "comment"]):
+            if "/check-runs?" in args[1]:
+                return json.dumps([{"check_runs": [{"status": "completed", "conclusion": "success"}]}])
+            if "/statuses?" in args[1]:
+                return "[[]]"
+            if args[:3] == ["api", "-X", "PUT"]:
+                self.assertEqual(json.loads(input)["sha"], self.head)
+                self.assertTrue(kw.get("write"))
+                return '{"merged": true}'
+            raise AssertionError(f"unexpected GitHub request: {args}")
+        elif args[:2] != ["pr", "comment"]:
             raise AssertionError(f"unexpected GitHub request: {args}")
         return ""
+
+    def fake_git(self, args, cwd):
+        return self.tree if args == ["rev-parse", f"{self.head}^{{tree}}"] else self.base
 
     def fake_ask(self, *a, **k):
         answers = {n: jev.Answer(self.score, 1.0) for n in jev.RISK}
@@ -138,10 +155,10 @@ class PushedPrDraftTests(unittest.TestCase):
 
     def test_only_approved_review_can_make_current_work_ready_and_merge(self):
         cases = [
-            ("missing", Review.stored({}), verify.Verified("pass"), False),
-            ("changes requested", Review.stored({"verdict": "request_changes"}), verify.Verified("pass"), False),
-            ("review failed", Review.failed_step([], [], {}), verify.Verified("pass"), False),
-            ("approved", Review.stored({"verdict": "approve"}), verify.Verified("pass"), True),
+            ("missing", Review.stored({}), self.verified, False),
+            ("changes requested", Review.stored({"verdict": "request_changes"}), self.verified, False),
+            ("review failed", Review.failed_step([], [], {}), self.verified, False),
+            ("approved", self.review, self.verified, True),
             ("guard refused", Review.stored({"verdict": "approve"}),
              verify.Verified("blocked", blocked_by="the JEV guard refused it"), False),
         ]
@@ -152,10 +169,10 @@ class PushedPrDraftTests(unittest.TestCase):
                 why = pipeline.draft_reason(review, verified)
                 self.assertEqual(bool(why), not allowed)
                 ready = pipeline.ready_pushed(self.run, [self.c], [], why)
-                pipeline.automerge(self.cfg, self.run, self.layer, None, why, ready, "about")
+                pipeline.automerge(self.build, None, why, verified, review, ready, "about")
                 self.assertEqual(ready, [self.c] if allowed else [])
                 self.assertEqual(self.names("pr", "ready"), [["pr", "ready", self.URL]] if allowed else [])
-                self.assertEqual(len(self.names("pr", "merge")), int(allowed))
+                self.assertEqual(len(self.names("api", "-X", "PUT")), int(allowed))
                 self.assertEqual(self.draft, not allowed)
 
     def test_pushed_ready_pr_is_made_a_draft_when_held(self):
@@ -167,7 +184,7 @@ class PushedPrDraftTests(unittest.TestCase):
         self.calls.clear()
         self.assertEqual(pipeline.ready_pushed(self.run, [self.c], [], why), [])
         # Even callers passing a held checkout directly cannot enable merging.
-        pipeline.automerge(self.cfg, self.run, self.layer, None, why, [self.c], "about")
+        pipeline.automerge(self.build, None, why, self.verified, self.review, [self.c], "about")
         self.assertEqual(self.calls, [])
 
     def test_person_only_work_never_automerges(self):
@@ -180,8 +197,8 @@ class PushedPrDraftTests(unittest.TestCase):
                 approval = {"sent_by": "triage"} if reason == "triage" else None
                 ready = pipeline.ready_pushed(self.run, [self.c], [], "")
                 self.assertEqual(ready, [self.c])
-                pipeline.automerge(self.cfg, self.run, self.layer, approval, "", ready, "about")
-                self.assertEqual(self.names("pr", "merge"), [])
+                pipeline.automerge(self.build, approval, "", self.verified, self.review, ready, "about")
+                self.assertEqual(self.names("api", "-X", "PUT"), [])
                 if reason == "risk":
                     comments = [body for args, body in self.calls if args[:2] == ["pr", "comment"]]
                     self.assertEqual(len(comments), 1)
@@ -200,11 +217,11 @@ class PushedPrDraftTests(unittest.TestCase):
                 self.draft = True
                 ready = pipeline.ready_pushed(self.run, [self.c], stopped, "")
                 self.assertEqual(ready, [])
-                pipeline.automerge(self.cfg, self.run, self.layer, None, "", ready, "about")
+                pipeline.automerge(self.build, None, "", self.verified, self.review, ready, "about")
                 self.draft = False
                 self.assertEqual(pipeline.hold_pushed(self.run, [self.c], stopped, "held"), [])
                 self.assertEqual(self.names("pr", "ready"), [])
-                self.assertEqual(self.names("pr", "merge"), [])
+                self.assertEqual(self.names("api", "-X", "PUT"), [])
 
 
 if __name__ == "__main__":

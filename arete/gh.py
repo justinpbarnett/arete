@@ -426,71 +426,64 @@ def pr_draft_and_head(url: str) -> tuple[bool, str]:
     return bool(row.get("isDraft")), str(row.get("headRefOid") or "")
 
 
-MERGE_NOW = {"CLEAN", "HAS_HOOKS", "UNSTABLE"}
-MERGE_LATER = {"BLOCKED", "BEHIND"}
 MERGE_WAIT_SECONDS = 120
 MERGE_POLL_SECONDS = 5
 
 
-def merge_action(state: str, mergeable: str, auto_allowed: bool) -> str:
-    state, mergeable = (state or "UNKNOWN").upper(), (mergeable or "UNKNOWN").upper()
-    if "UNKNOWN" in (state, mergeable):
-        return "wait"
-    if mergeable == "CONFLICTING":
-        return "leave"
-    if state in MERGE_NOW:
-        return "merge"
-    if state in MERGE_LATER and auto_allowed:
-        return "auto"
-    return "leave"
+def merge_ci_passed(repo: str, head: str) -> bool:
+    path = f"repos/{repo}/commits/{head}"
+    checks = gh_json(["api", f"{path}/check-runs?filter=latest&per_page=100", "--paginate", "--slurp"])
+    statuses = gh_json(["api", f"{path}/statuses?per_page=100", "--paginate", "--slurp"])
+    if (not isinstance(checks, list) or not checks
+            or any(not isinstance(page, dict) or not isinstance(page.get("check_runs"), list) for page in checks)
+            or not isinstance(statuses, list) or not statuses):
+        return False
+    runs = [row for page in checks for row in page["check_runs"]]
+    contexts = {}
+    for page in statuses:
+        if not isinstance(page, list):
+            return False
+        for row in page:
+            contexts.setdefault(row["context"], row["state"])
+    return (bool(runs or contexts) and all(row["status"] == "completed" and row["conclusion"] == "success"
+                                           for row in runs) and all(state == "success" for state in contexts.values()))
 
 
-def leave_reason(state: str, mergeable: str, auto_allowed: bool) -> str:
-    if mergeable == "CONFLICTING" or state == "DIRTY":
-        return "it conflicts with the base branch"
-    if state == "DRAFT":
-        return "it is a draft"
-    if state == "BLOCKED" and not auto_allowed:
-        return "GitHub blocks the merge until a required review or check passes, and the repo has auto merge off"
-    if state == "BEHIND" and not auto_allowed:
-        return "it is behind the base branch, and the repo has auto merge off"
-    return f"GitHub reports merge state {state}, mergeable {mergeable}"
-
-
-def pr_merge_state(repo: str, number: int) -> tuple[str, str]:
-    row = gh_json(["pr", "view", str(number), "--repo", repo, "--json", "mergeStateStatus,mergeable"]) or {}
-    return (row.get("mergeStateStatus") or "UNKNOWN").upper(), (row.get("mergeable") or "UNKNOWN").upper()
-
-
-def squash_subject(repo: str, number: int) -> list[str]:
-    title = ((gh_json(["pr", "view", str(number), "--repo", repo, "--json", "title"]) or {}).get("title") or "").strip()
-    return ["--subject", f"{title} (#{number})"] if title else []
-
-
-def repo_allows_auto_merge(repo: str) -> bool:
-    return bool((gh_json(["api", f"repos/{repo}"]) or {}).get("allow_auto_merge"))
-
-
-def pr_merge_auto(repo: str, number: int, wait: float = MERGE_WAIT_SECONDS,
-                  poll: float = MERGE_POLL_SECONDS) -> tuple[str, str]:
-    auto_allowed = repo_allows_auto_merge(repo)
+def merge_readiness(repo: str, number: int, head: str, base: str, base_sha: str, *, wait: float = 0) -> tuple[str, str]:
+    if not head or not base or not base_sha:
+        return "", "the checked head and base are not known"
     deadline = time.monotonic() + wait
+    fields = "state,isDraft,headRefOid,baseRefName,baseRefOid,mergeStateStatus,mergeable,title"
     while True:
-        state, mergeable = pr_merge_state(repo, number)
-        action = merge_action(state, mergeable, auto_allowed)
-        if action != "wait" or time.monotonic() >= deadline:
+        row = gh_json(["pr", "view", str(number), "--repo", repo, "--json", fields]) or {}
+        if row.get("state") != "OPEN" or row.get("isDraft") is not False:
+            return "", "the PR is not open and ready for review"
+        if row.get("headRefOid") != head:
+            return "", "the PR head changed after verification"
+        if row.get("baseRefName") != base or row.get("baseRefOid") != base_sha:
+            return "", "the PR base changed after verification"
+        state, mergeable = row.get("mergeStateStatus"), row.get("mergeable")
+        remaining = deadline - time.monotonic()
+        if "UNKNOWN" not in (state, mergeable) or remaining <= 0:
             break
-        time.sleep(max(0.0, min(poll, deadline - time.monotonic())))
-    if action == "merge":
-        gh(["pr", "merge", str(number), "--repo", repo, "--squash", "--delete-branch", *squash_subject(repo, number)])
-        return "merged", ""
-    if action == "auto":
-        gh(["pr", "merge", str(number), "--repo", repo, "--squash", "--auto", "--delete-branch",
-            *squash_subject(repo, number)])
-        return "auto", ""
-    if action == "wait":
-        return "left", f"GitHub still reported the merge state as unknown after {wait:g} seconds"
-    return "left", leave_reason(state, mergeable, auto_allowed)
+        time.sleep(min(MERGE_POLL_SECONDS, remaining))
+    if state != "CLEAN" or mergeable != "MERGEABLE":
+        return "", f"GitHub reports merge state {state}, mergeable {mergeable}"
+    if not merge_ci_passed(repo, head):
+        return "", "GitHub has no fully passing CI result for the verified head"
+    return str(row.get("title") or "").strip(), ""
+
+
+def pr_merge_auto(repo: str, number: int, head: str, base: str, base_sha: str) -> str:
+    subject, hold = merge_readiness(repo, number, head, base, base_sha)
+    if hold:
+        return hold
+    payload = {"sha": head, "merge_method": "squash"}
+    if subject:
+        payload["commit_title"] = f"{subject} (#{number})"
+    result = json.loads(gh(["api", "-X", "PUT", f"repos/{repo}/pulls/{number}/merge", "--input", "-"],
+                           input=Outgoing(json.dumps(payload)), write=True) or "{}")
+    return "" if result.get("merged") is True else "GitHub did not confirm the merge"
 
 
 def default_branch(repo: str) -> str:

@@ -1143,8 +1143,8 @@ def publish(flow: factory.Flow) -> Outcome:
                 + pipeline.published_note(job.draft_why, job.verified, fresh, job.picked(job.drafted)))
     standing = [c for c in job.picked(job.changed) if c not in fresh]
     ready = pipeline.ready_pushed(run, standing, job.picked(job.ci_stopped), job.draft_why)
-    pipeline.automerge(job.cfg, run, job.layer, job.approval, job.draft_why, fresh + ready,
-                       pipeline.automerge_about(job.ticket, job.build_summary), ticket=job.ticket)
+    pipeline.automerge(job.b, job.approval, job.draft_why, job.verified, job.review, fresh + ready,
+                       pipeline.automerge_about(job.ticket, job.build_summary))
     return end_as("pass", "pr", summary=f"{job.summary}, CI: {job.ci_result}")
 
 

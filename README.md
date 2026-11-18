@@ -579,7 +579,7 @@ The agent runs as your user, so it can still read a file your user can; the guar
 JEV is a classifier model from TypeSafe, reached through OpenRouter. It reads text and answers a yes or no question, picks one of a few labels, or rates on a scale, each with a confidence, fast and for $0.042 per million input tokens. Arete asks it first where a classifier can settle the question, and leaves the question to the model only when JEV is unsure:
 
 - Loops: a loop fed by outside text drops each event JEV reads as instructions to an agent before the agent sees it, and a ticket emit drawn from outside text waits for approval on the same check. A `[classify]` step asks JEV first and sends only the events it is unsure of to the model. A finding JEV matches to a known one, even worded another way, counts as that finding, not a new one.
-- Risk: the automerge of a pipeline PR, opened, pushed to or checked again by the run, waits for a person when JEV rates the diff risky (how much depends on what it changes, how near it comes to credentials, money or data, and how far it strays from its description), or reads it as a change a revert will not undo.
+- Risk: a pipeline PR waits for a person if JEV is unavailable, cannot judge the diff, rates it risky, or reads it as a change a revert will not undo.
 - Push screen: a `push` emit under `automerge` that no static rule holds lands only when JEV reads its diff as a narrow fix.
   It waits for approval when JEV's chance for one screen question reaches that question's line in `[jev.screen_lines]`: the diff weakens a protection, exposes credentials or personal data, sends data somewhere new or builds a command from outside text, does harm a revert will not undo, adds a capability, removes a behavior instead of fixing it, or renames something other code or config uses, or it reaches past the fix it names.
   The approval names each question that held it, with JEV's chance and the question's line.
@@ -1214,7 +1214,7 @@ path = "classic"
 | `checks` | Every check must exit 0 before review. The agent may run them while it builds. |
 | `limits` | Diff size, paths the change may not touch, fix attempts (which also cap the CI fix rounds), the timeout of each step and of the checks, and cumulative `max_repair_cycles`, `max_run_minutes` and `max_verify_minutes` process budgets. These budgets must be positive integers. `max_run_minutes` leaves out `limit` and `slot` waits. Checks remain serialized by default; `parallel_checks = true` explicitly allows a repo whose checks use isolated resources to overlap them across worktrees, up to the machine's `max_parallel_checks`. `max_attempts` and `timeout_minutes` are the defaults for each step's `tries` and `timeout_minutes`, which [Steps](#steps) can set apart. Code enforces the diff size and the paths after the agent finishes. Every repo also denies `.agents/config.toml`, `.github/workflows/` and `.env` files. It denies `.claude/` too, since Claude Code refuses agent writes there. The planner names a change in a denied path for a human to make. The PR shows it under "Left for a person", and a rerun on an open PR writes, rewrites or removes that section to match its plan. The verifier and the reviewer are told that a person makes it, so its absence never fails the run. The CI fix step counts a red check that only that change fixes as not caused by the PR. |
 | `agent.allow_bash` | Bash patterns the agent may run, on top of read only git and file commands. |
-| `trust.level` | `pr`, or `automerge` once earned. |
+| `trust.level` | `pr`, or `automerge` once earned. See [Pipeline auto-merge](#pipeline-auto-merge). |
 | `trust.automerge_after` | Merged PRs in a row before arete opens a PR proposing automerge. |
 | `git.base` | Branch PRs target. Defaults to the GitHub default branch. |
 | `git.subject` | Commit subject and PR title. Fields: `{kind}` (`feat` or `fix`) and `{title}`. The ticket ref is appended to the commit subject, like `(#35)` or `(ABC-12)`, and to a Jira PR title; a GitHub PR links its issue with `Closes #35` instead, or with `Part of #35` when the plan leaves a change for a person. |
@@ -1244,6 +1244,15 @@ A layer outside the repo is made a git repo, and arete commits each accepted rew
 A clean run learns nothing.
 
 Lessons merge when runs overlap. The learn step reads `expertise.md` when it starts, not the copy the run planned with. Before it writes, it takes a lock for the layer and reads the file again. When another run changed the file meanwhile, it runs once more as `learn2` on the current file, under the lock, and writes that; a rewrite whose base moved is never written. When the second pass gives no usable file, the first rewrite is saved in the run folder and not applied. The commit holds `expertise.md` alone, and an eval mine commit holds its eval file alone; other changed files in the layer stay uncommitted. The commit sha is saved as `expertise-commit.txt` in the run folder. The lock is a file lock on this host, so runs on separate hosts are not covered.
+
+### Pipeline auto-merge
+
+Pipeline auto-merge requires full local checks, approving review, and native verification of the published tree.
+GitHub must report at least one CI result, and every reported check and current status must be successful on that head.
+JEV must complete its risk screen on the diff and not hold it.
+Arete attempts only a head-matched squash merge on an open, ready PR whose head contains the target base.
+It never arms a later merge and leaves changes spanning repositories for a person.
+Set required checks and require an up-to-date branch in GitHub so the server enforces those rules even if the base or CI changes during the merge request.
 
 ## Steps
 
