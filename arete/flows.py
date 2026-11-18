@@ -244,7 +244,7 @@ def remade(line: dict) -> tuple[str, list[workspace.Checkout], str]:
     return branch, made, ""
 
 
-def rebuild(job: Job, line: dict) -> str:
+def rebuild(job: Job, line: dict, *, layer: config.RepoLayer | None = None) -> str:
     branch, made, why = remade(line)
     if why:
         return why
@@ -255,7 +255,8 @@ def rebuild(job: Job, line: dict) -> str:
         if why := job.reclaim(c, *authority(job.continues, c, leases.get(c.github, "")), runs, attached=False):
             return why
     ws = Path(line["tree"])
-    layer = pipeline.checked_layer(job.cfg, Path(line["data"]["layer"]))
+    admitted = layer is not None
+    layer = layer or pipeline.checked_layer(job.cfg, Path(line["data"]["layer"]))
     try:
         workspace.clear_workspace(ws, made, job.run.repo.path, layer.copy)
     except workspace.RunFailed as e:
@@ -271,6 +272,8 @@ def rebuild(job: Job, line: dict) -> str:
     except RuntimeError as e:
         return f"arete could not make it again from origin/{branch}: {util.first_line(str(e), 300)}"
     job.run.log(f"made {ws} again from origin/{branch}")
+    if admitted and layer != pipeline.checked_layer(job.cfg, layer.dir):
+        return "the restored repository layer changed; reconcile before setup"
     return pipeline.furnish(job.cfg, job.run, layer, ws)
 
 
@@ -390,8 +393,8 @@ class Job:
             self.b.restage()
         return self.b
 
-    def restore(self, line: dict) -> str:
-        why = rebuild(self, line)
+    def restore(self, line: dict, *, layer: config.RepoLayer | None = None) -> str:
+        why = rebuild(self, line, layer=layer)
         if why and not self.only and line.get("step") == "prepare":
             raise workspace.RunFailed(why)
         return why
@@ -970,16 +973,17 @@ def adopt_open_prs(job: Job) -> list[workspace.Checkout]:
     return found
 
 
-def refuse_closed_repair_prs(job: Job) -> None:
+def refuse_changed_prs(job: Job) -> None:
     run = job.run
-    for c in job.with_prs if run.repairs else []:
+    reason = f"the repair of run {run.repairs}" if run.repairs else "PR feedback"
+    for c in job.with_prs if run.repairs or run.feedback else []:
         view = gh.pr_view(c.pr)
         if view.get("state") != "OPEN":
             raise workspace.RunFailed(f"{c.pr} is {'merged' if view.get('mergedAt') else 'closed'}, so arete pushed "
-                                     f"nothing for the repair of run {run.repairs}")
+                                     f"nothing for {reason}")
         if view.get("headRefName") != job.branch:
             raise workspace.RunFailed(f"{c.pr} is on branch {view.get('headRefName')}, not {job.branch}, so arete "
-                                     f"pushed nothing for the repair of run {run.repairs}")
+                                     f"pushed nothing for {reason}")
 
 
 def settle_unpushed_checkouts(job: Job):
@@ -1076,7 +1080,7 @@ def pr(flow: factory.Flow, tree: str) -> Outcome:
     job: Job = flow.ctx
     job.run.tracker.pr_link(job.ticket, whole=not job.left_for_a_person)
     found = adopt_open_prs(job)
-    refuse_closed_repair_prs(job)
+    refuse_changed_prs(job)
     fresh, staged, size, outcome, unpushed = settle_unpushed_checkouts(job)
     subject, draft_why, committed = publish_branch(job, fresh, staged, unpushed)
     if not job.run.repo.parts:

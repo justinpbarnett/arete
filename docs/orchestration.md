@@ -23,6 +23,8 @@ progress_seconds = 30
 Changing the default does not rewrite private layers pinned to `adw`.
 Changing only the default path affects new work, not the recorded mode of an interrupted run, owner answer or PR-feedback continuation.
 Changes to admitted permissions, routes or other policy still require reconciliation before continuation.
+Automatic PR-feedback runs continue the existing controller lineage, accepted per-run settings and remaining decision/action allowances instead of starting a fresh controller under current defaults.
+When no owner-answer or interrupted continuation takes precedence, explicit `--force` without `--continue` requests a new owner-directed run; existing cumulative run, verification and repair accounting still applies.
 Built-in orchestration resolves from the installation even when the configured custom ADW folder has no `orchestrate.py`.
 There is no silent fallback to a fixed strategy after orchestration starts.
 
@@ -72,6 +74,8 @@ uv run python adws/orchestrate.py REPO TICKET --continue RUN --action d0003-0 --
 The existing task resume/step APIs and the viewers' “Rerun alone” control accept the same durable IDs.
 Only finished worker, check, verification and review actions with retained workspaces are rerunnable.
 After publication removes the workspace, viewers hide standalone reruns and the API refuses them before starting a run.
+A full controller continuation can reconstruct completely removed, settled published work through the existing guarded branch/worktree recovery path; this does not make a standalone action eligible or grant cleanup authority.
+Incomplete retained workspaces and legacy controllers without recorded invocation settings refuse for reconciliation instead of discarding edits or guessing past authority.
 A standalone action retains its accepted settings, invalidates dependent evidence and cannot publish.
 To select different approved settings, resume the controller instead.
 Existing latest-run, version, purged-workspace and PR-head checks still apply.

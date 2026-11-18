@@ -4,12 +4,14 @@ import json
 import time
 from contextlib import contextmanager
 from dataclasses import asdict
+from pathlib import Path
 
 from . import (
     codebase,
     delegation,
     factory,
     flows,
+    gh,
     owner_asks,
     pipeline,
     prompt_loader,
@@ -42,6 +44,10 @@ class Controller:
             raise factory.Refused("this controller protocol needs compatible code before it can resume")
         self.policy = pipeline.config.Orchestration(**self.data.get("limits", asdict(
             pipeline.config.load_layer(self.run.repo.layer_dir).orchestration)))
+        self.run.overrides = {**self.data.get("overrides", {}), **self.run.overrides}
+        inherited = self.data.get("step_overrides", {})
+        self.run.step_overrides = {role: {**inherited.get(role, {}), **self.run.step_overrides.get(role, {})}
+                                  for role in inherited.keys() | self.run.step_overrides.keys()}
         self.catalog = None
         self.last_progress, self.ending = time.monotonic(), None
 
@@ -62,12 +68,45 @@ class Controller:
         self.job.take(name, outcome, stored=False)
         return outcome
 
+    def quiescent(self):
+        for turn in ledger.pending(self.lease):
+            launch = turn["response"] or {}
+            if delegation.live(launch.get("pid"), launch.get("identity")):
+                raise factory.Refused("the prior controller inference is still live; no replacement was launched")
+        for action in ledger.actions(self.lease):
+            result = action["result"]
+            if action["state"] == "running" and delegation.live(result.get("pid"), result.get("identity")):
+                raise factory.Refused(f"worker {action['id']} is still live; no replacement was launched")
+
     def prepare(self):
         if self.flow.refusal:
             raise factory.Refused(self.flow.refusal)
+        self.quiescent()
+        if self.run.feedback and (closed := [url for url in self.run.feedback_prs if gh.pr_view(url).get("state") != "OPEN"]):
+            return "noop", f"the PR closed before arete could revise it: {', '.join(closed)}", ""
         self.flow.matching = False
         run_lines.write(self.run.id, "route", continues=self.flow.continues, mode="orchestrated", protocol=PROTOCOL)
         if self.data.get("prepared"):
+            if not {"run_settings", "overrides", "step_overrides"} <= self.data.keys():
+                raise factory.Refused("the saved controller lacks accepted invocation settings; reconcile before resuming")
+            prepared = self.data["prepared"]
+            layer_dir, source_file = Path(prepared["layer"]), None
+            if not layer_dir.exists():
+                for checkout in map(workspace.Checkout.from_row, prepared["checkouts"]):
+                    if layer_dir.is_relative_to(checkout.wt):
+                        source_file = checkout.src / layer_dir.relative_to(checkout.wt) / "config.toml"
+                        break
+            self.job.layer = pipeline.checked_layer(self.job.cfg, layer_dir, source_file=source_file)
+            self.run.cfg, self.run.layer, self.run.kind = self.job.cfg, self.job.layer, prepared["ticket"]["kind"]
+            self.lineage()
+            if any(not (Path(c["wt"]) / ".git").exists() for c in prepared["checkouts"]):
+                if any(Path(c["wt"]).exists() for c in prepared["checkouts"]):
+                    raise factory.Refused("the retained workspace is incomplete; reconcile without discarding its edits")
+                if ledger.publication_pending(self.run.id) or not any(
+                        a["op"] == "publication.request" and a["state"] == "succeeded" for a in ledger.actions(self.lease)):
+                    raise factory.Refused("the missing workspace has no settled publication; reconcile before resuming")
+                if why := self.job.restore({"step": "prepare", "tree": str(self.job.ws), "data": prepared}, layer=self.job.layer):
+                    raise factory.Refused(why)
             self.job.take("prepare", factory.Outcome("pass", data=self.data["prepared"]), stored=True)
             for name, value in self.data.get("job", {}).items():
                 if name in STATE_FIELDS:
@@ -103,26 +142,23 @@ class Controller:
                 self.job.reviews = 1
                 self.job.goal += f"\n\nCheck the saved review findings are fixed:\n{found.review.findings()}"
                 self.job.left_for_a_person = found.left_for_a_person
-        if self.run.feedback and not self.data.get("feedback"):
-            self.data["feedback"] = self.run.feedback
-            feedback = pipeline.feedback_markdown(self.run.feedback)
+        self.data.setdefault("goal_base", self.job.goal)
+        known = {(f.get("pr_url"), f.get("kind"), f.get("gh_id")) for f in self.data.get("feedback", [])}
+        fresh = [f for f in self.run.feedback if (f.get("pr_url"), f.get("kind"), f.get("gh_id")) not in known]
+        if fresh:
+            self.data.setdefault("feedback", []).extend(fresh)
+            feedback = pipeline.feedback_markdown(fresh)
             self.run.story.append(feedback)
-            self.job.goal += f"\n\nCheck each change the owner's PR feedback asks for:\n{feedback}"
+            self.data["goal_base"] += f"\n\nCheck each change the owner's PR feedback asks for:\n{feedback}"
             self.job.left_for_a_person = pipeline.left_on_prs(self.run.feedback_prs)
         if self.run.answers_due:
             answer = owner_asks.fresh_note(self.run.answers_due)
             self.run.story.append(answer)
             self.data.setdefault("owner_answers", []).append(answer)
-        self.data.setdefault("goal_base", self.job.goal)
         self.job.goal = self.data["goal_base"] + "\n" + "\n".join(self.data.get("owner_answers", []))
         self.job.b.plan_text, self.job.b.left_for_a_person = self.job.plan_text, self.job.left_for_a_person
-        self.catalog = Catalog(self.job)
-        lineage = {"catalog_sha": self.catalog.fingerprint, "policy_sha": self.policy_sha(),
-                   "controller_prompt": ledger.digest(prompt_loader.template("orchestrate").template),
-                   "controller_settings": ledger.digest(asdict(self.run.settings("orchestrate")))}
-        if any(key in self.data and self.data[key] != value for key, value in lineage.items()):
-            raise factory.Refused("the admitted catalog, controller or policy changed; reconcile before resuming")
-        self.data.update(lineage)
+        self.data.update(self.lineage())
+        self.data["overrides"], self.data["step_overrides"] = self.run.overrides, self.run.step_overrides
         self.data.setdefault("code", codebase.STAMP)
         self.data["recovery_code"] = codebase.STAMP
         self.data["limits"] = asdict(self.policy)
@@ -134,6 +170,16 @@ class Controller:
             self.job.merge_moved_base("orchestrate")
         self.persist()
         return None
+
+    def lineage(self):
+        self.catalog = Catalog(self.job)
+        found = {"catalog_sha": self.catalog.fingerprint, "policy_sha": self.policy_sha(),
+                 "controller_prompt": ledger.digest(prompt_loader.template("orchestrate").template),
+                 "controller_settings": ledger.digest(asdict(self.run.settings("orchestrate"))),
+                 "run_settings": ledger.digest([self.run.overrides, self.run.step_overrides])}
+        if any(key in self.data and self.data[key] != value for key, value in found.items()):
+            raise factory.Refused("the admitted catalog, controller or policy changed; reconcile before resuming")
+        return found
 
     def policy_sha(self):
         layer = asdict(self.job.layer)
@@ -159,11 +205,8 @@ class Controller:
                     and found.get("acceptance") == self.data["acceptance"])
 
     def recover(self):
+        self.quiescent()
         for turn in ledger.pending(self.lease):
-            launch = turn["response"] or {}
-            pid, identity = launch.get("pid"), launch.get("identity")
-            if delegation.live(pid, identity):
-                raise factory.Refused("the prior controller inference is still live; no replacement was launched")
             ledger.reject(self.lease, turn["id"], "interrupted controller turn; admitted usage may be unknown")
         for action in ledger.actions(self.lease):
             result = action["result"]
@@ -172,9 +215,6 @@ class Controller:
                 if not answers or any(not answer or answer["status"] not in ("answered", "taken") for answer in answers):
                     raise factory.Refused("owner answers or interrupted question settlement need reconciliation before resuming")
             if action["state"] == "running":
-                pid, identity = result.get("pid"), result.get("identity")
-                if delegation.live(pid, identity):
-                    raise factory.Refused(f"worker {action['id']} is still live; no replacement was launched")
                 state = "reconciliation-required" if action["op"] == "publication.request" else "interrupted"
                 ledger.transition(self.lease, action["id"], state,
                                   {**result, "error": "execution interrupted; usage may be unknown", "usage_unknown": True})
