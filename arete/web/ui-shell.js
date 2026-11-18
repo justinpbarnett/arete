@@ -3,9 +3,10 @@ import htm from "./vendor-htm.js";
 import * as data from "./ui-data.js";
 import { screenKeys, activatePane } from "./ui-keys.js";
 import { KeyBar, KeySheet } from "./ui-keybar.js";
-import { List, createList, demoQueue, demoFocus } from "./ui-list.js";
-import { Empty, Fault, Gate } from "./ui-states.js";
-import { readFault } from "./ui-live.js";
+import { List } from "./ui-list.js";
+import { Fault, Gate } from "./ui-states.js";
+import { InboxFocus, InboxQueue, RunQuestions, selectedInbox } from "./ui-inbox.js";
+import { FloorFocus, FloorQueue, HealthFocus, TaskFocus, TaskQueue } from "./ui-work.js";
 import { Palette, openPalette } from "./ui-palette.js";
 import { ReasonBox, fixture, fixtureRevision, replayLast } from "./ui-actions.js";
 import { RunFocus, RunQueue, RunSubtitle } from "./ui-run.js";
@@ -21,30 +22,27 @@ function duration(seconds) {
     : value >= 60 ? `${Math.floor(value / 60)}m ${value % 60}s` : `${value}s`;
 }
 
-const floorRuns = createList({ rows: [], empty: "No running work" });
-const runRow = (run) => ({ id: run.id, title: [run.ticket, run.step].filter(Boolean).join(" · "), state: "Running",
-  repo: run.repo, priority: "", number: `${run.seconds}s` });
+const classic = {
+  intake: ["/#triage", "Open ticket intake in classic"],
+  insights: ["/#outcomes", "Open outcomes in classic"],
+};
 
-export function applyRuns(runs) {
-  const rows = (runs ?? []).map(runRow);
-  if (JSON.stringify(rows) !== JSON.stringify(floorRuns.state.rows)) floorRuns.setRows(rows);
+function NotPorted({ screen }) {
+  const link = classic[screen];
+  return html`<div class="ops-detail"><h3>Not yet in the new dashboard</h3>
+    ${link ? html`<a href=${link[0]}>${link[1]}</a>` : html`<p>${screen === "prompts"
+    ? "Prompt files and overrides are still managed outside the dashboard." : "Edit ADWs in your checkout. Loop operations are available in classic."}</p>`}
+    ${screen === "adws" ? html`<a href="/#loops">Open loops in classic</a>` : null}
+    ${screen === "insights" ? html`<a href="/#usage">Open usage in classic</a>` : null}</div>`;
 }
 
-const askParts = [["approvals", "Approvals"], ["skipped", "Skipped"], ["proposals", "Proposals"], ["ready", "Ready"]];
-const askSize = (part) => Array.isArray(part?.rows) ? part.rows.length : Object.values(part?.rows ?? {}).reduce((sum, rows) => sum + rows.length, 0);
-
-function queueBody({ route, snapshot, retry, page, demo }) {
-  const asks = route.screen === "triage" ? snapshot.asks : null;
-  const fault = readFault(route.screen, snapshot);
-  const cached = route.screen === "floor" ? snapshot.runs != null : snapshot.live != null;
-  const missing = route.screen === "floor" ? "No running work" : route.screen === "triage" ? "Nothing needs you" : `No ${page.queue.toLowerCase()} to show`;
-  const empty = demo ? false : route.screen === "floor" ? false : route.screen === "triage" ? asks != null && snapshot.needsYou === 0 : true;
-  const body = demo ? demo : route.screen === "floor" ? html`<${List} id="floor-runs" controller=${floorRuns} queue=${true} />`
-    : asks ? html`<p class="ui-summary">${askParts.map(([name, label]) => `${label} ${askSize(asks[name])}`).join(" · ")}</p>` : null;
-  const beside = fault && cached;
-  return html`${beside ? html`<${Fault} what=${page.queue} fault=${fault} retry=${retry} />` : null}
-    <${Gate} pending=${snapshot.pending && !cached} fault=${beside ? null : fault} empty=${empty || (!body && cached)} what=${page.queue}
-    missing=${missing} retry=${retry}>${body}<//>`;
+function SettingsQueue() {
+  return html`<nav class="ops-section settings-links" aria-label="Settings sections">
+    <a href="#settings/health" aria-current="page">Health</a>
+    <a href="/#settings">Configuration in classic</a>
+    <a href="/#health">Health controls in classic</a>
+    <a href="/#incidents">Incidents in classic</a>
+  </nav>`;
 }
 
 export function Sidebar({ route, snapshot, now }) {
@@ -53,23 +51,24 @@ export function Sidebar({ route, snapshot, now }) {
   const uptime = Number.isFinite(started) ? duration((now - started) / 1000) : "";
   const age = Number.isFinite(serve?.age_seconds)
     ? duration(serve.age_seconds + Math.max(0, now - snapshot.received) / 1000) : "";
+  const questions = snapshot.questions;
+  const needs = snapshot.needsYou != null && questions?.data && !questions.error ? snapshot.needsYou + questions.data.asks.length : null;
   return html`<aside class="sidebar frame" data-pane="sidebar" aria-label="Sidebar">
     <div class="side-top"><span class="mark">A</span><span class="wordmark">arete</span><span class="version" aria-label="Server version"></span></div>
     <button type="button" class="search" data-act="palette" aria-label="Search (Cmd K)" title="Search (Cmd K)" onClick=${() => openPalette()}><kbd>:</kbd><span>Search</span><kbd>Cmd K</kbd></button>
     <nav class="side-nav" aria-label="Screens" data-list="screens">${navigation.map(([id, label, key, glyph, href]) => {
-      const count = id === "triage" ? snapshot.needsYou : id === "runs" ? snapshot.running : null;
+      const count = id === "triage" ? needs : id === "runs" ? snapshot.running : null;
       return html`<a key=${id} data-row data-item=${id} data-act=${`go-${id}`} class=${`nav-row${route.active === id ? " selected" : ""}`} href=${href}
         aria-label=${label} title=${`${label} (${key})`} aria-current=${route.active === id ? "page" : undefined}>
         <kbd class="key-slot">${key}</kbd><span class="glyph" aria-hidden="true">${glyph}</span>
-        <span class="nav-label">${label}</span><span class=${`count${id === "triage" && count > 0 ? " accent" : ""}`}>${count}</span>
+        <span class="nav-label">${label}</span><span class=${`count${id === "triage" && count > 0 ? " accent" : ""}`}>${count || null}</span>
       </a>`;
     })}</nav>
     <footer class="side-foot">
-      <p><span class=${serve?.alive ? "serve-up" : "muted"}>serve ${serve?.alive ? "up" : "down"}</span> <span>${uptime}</span></p>
+      <p><span class=${serve?.alive ? "serve-up" : "muted"}>serve ${!serve ? "unknown" : serve.alive ? "up" : "down"}</span> <span>${uptime}</span></p>
       ${serve?.alive && Object.keys(serve.failing || {}).length ? html`<p class="serve-fails">tick fails at ${Object.entries(serve.failing).map(([key, f]) => `${key}: ${f.error}`).join("; ")}</p>` : null}
-      <p>heartbeat <span>${age}</span></p>
+      ${age ? html`<p>serve beat <span>${age}</span></p>` : null}
       <p class="host">${location.host}</p>
-      <p aria-label="Checks passed over total">checks <span></span> / <span></span></p>
       <p class="health">${snapshot.health}</p>
     </footer>
   </aside>`;
@@ -90,38 +89,51 @@ function runQueueBody({ view, route, retry }) {
 
 const runPage = () => ({ title: "Runs", subtitle: html`<${RunSubtitle} />`, queue: "Runs", focus: "Run" });
 
-export function Shell({ route, snapshot, now, retry, runs }) {
+function panels({ route, snapshot, resources, now, retry, runs }) {
+  switch (route.screen) {
+    case "floor": return [html`${snapshot.slots == null ? null : html`<p class="slots mono">Slots ${snapshot.slots} / ${snapshot.capacity}</p>`}
+      <${FloorQueue} snapshot=${snapshot} retry=${retry} />`, html`<${FloorFocus} snapshot=${snapshot} retry=${retry} />`];
+    case "triage":
+    case "outbox": return [html`<${InboxQueue} snapshot=${snapshot} route=${route} retry=${retry} />`,
+      html`<${InboxFocus} snapshot=${snapshot} route=${route} retry=${retry} />`];
+    case "task":
+    case "board": return [html`<${TaskQueue} resource=${resources.tasks} route=${route} retry=${retry} />`,
+      html`<${TaskFocus} resource=${resources.task} route=${route} retry=${retry} />`];
+    case "run": return [runQueueBody({ view: runs, route, retry }), html`
+      ${runs.detail?.run?.status === "needs-info" ? html`<${RunQuestions} resource=${snapshot.questions} run=${runs.id} retry=${retry} />` : null}
+      <${RunFocus} key=${runs.id} view=${runs} now=${now} retry=${retry} />`];
+    case "settings": return [html`<${SettingsQueue} />`, html`<${HealthFocus} resource=${resources.health} retry=${retry} />`];
+    default: return [html`<${NotPorted} screen=${route.screen} />`, null];
+  }
+}
+
+export function Shell({ route, snapshot, resources, now, retry, runs }) {
   fixtureRevision.value;
   const actionList = fixture.value;
   const counts = actionList?.counts();
-  if (counts) snapshot = { ...snapshot, needsYou: counts.needsYou };
   const page = route.screen === "run" ? runPage() : data[route.screen](route);
-  const health = route.screen === "settings" && route.path[0] === "health";
-  const slots = route.screen === "floor" ? html`<p class="slots mono">Slots <span>${snapshot.slots}</span> / <span>${snapshot.capacity}</span></p>` : null;
-  const healthFocus = (body, what) => {
-    const fault = readFault(route.screen, snapshot);
-    const cached = snapshot.live != null;
-    return html`${fault && cached ? html`<${Fault} what=${what} fault=${fault} retry=${retry} />` : null}
-      <${Gate} pending=${snapshot.pending && !cached} fault=${cached ? null : fault} what=${what} retry=${retry}>${body}<//>`;
-  };
-  const nothing = (label) => html`<${Empty} what=${`No ${label.toLowerCase()} selected`} />`;
-  const extra = page.extra ? html`<${Pane} name="auxiliary" label=${page.extra}>${nothing(page.extra)}<//>` : null;
-  const queue = actionList ? html`<${List} id="action-fixture" controller=${actionList} queue=${true} />`
-    : route.screen === "run" ? runQueueBody({ view: runs, route, retry }) : queueBody({ route, snapshot, retry, page, demo: health ? html`<${List} id="health-queue" controller=${demoQueue} queue=${true} />` : null });
-  return html`<div class="ui-app" data-screen=${route.screen} data-health-demo=${health ? "" : undefined}>
+  const [queue, focus] = panels({ route, snapshot, resources, now, retry, runs });
+  const parent = selectedInbox(route) && ["triage", "outbox"].includes(route.screen)
+    ? [`#${route.screen}`, `Back to ${route.screen === "triage" ? "inbox" : "Outbox"}`]
+    : route.screen === "task" && route.path[0] ? ["#board", "Back to Board"] : null;
+  return html`<div class="ui-app" data-screen=${route.screen} data-detail=${parent ? "" : undefined}>
     <${Sidebar} route=${route} snapshot=${snapshot} now=${now} />
     <main class="main">
-      <div class="top-bar" aria-label="Top bar"></div>
+      <div class="top-bar ops-links" aria-label="Dashboard shortcuts">
+        ${route.screen === "run" ? html`<a href="/#sessions">Sessions in classic</a>` : null}
+        <a href=${route.screen === "run" && runs.id ? `/#run/${encodeURIComponent(runs.id)}` : "/"}>${route.screen === "run" && runs.id ? "Run in classic" : "Classic dashboard"}</a>
+      </div>
       <header class="page-head">
-        <div class="head-row"><h1>${page.title}</h1><div class="head-tools">${route.screen === "run" ? html`<button type="button" class="run-back" aria-controls="pane-queue" onClick=${() => activatePane("queue")}>← Back to runs</button>` : null}</div></div>
+        <div class="head-row"><h1>${page.title}</h1><div class="head-tools">
+          ${parent ? html`<a class="ops-back" href=${parent[0]}>← ${parent[1]}</a>` : null}
+          ${route.screen === "run" ? html`<button type="button" class="run-back" aria-controls="pane-queue" onClick=${() => activatePane("queue")}>← Back to runs</button>` : null}
+        </div></div>
         <p class="subtitle">${page.subtitle}</p>
         ${counts ? html`<p class="subtitle">${counts.total} open · ${counts.needsYou} need you · ${counts.high} high · ${counts.med} med</p>` : null}
-        ${page.tabs ? html`<div class="tabs-slot" aria-label="Tabs"></div>` : null}
       </header>
-      <div class="pane-grid">
-        <${Pane} name="queue" label=${page.queue}>${slots}${queue}<//>
-        ${route.screen === "run" ? html`<${Pane} name="focus" label=${page.focus}><${RunFocus} view=${runs} now=${now} retry=${retry} /><//>`
-          : html`<${Pane} name="focus" label=${page.focus}>${health ? healthFocus(html`<${List} id="health-focus" controller=${demoFocus} />`, page.focus) : nothing(page.focus)}<//>${extra}`}
+      <div class=${`pane-grid${focus ? "" : " single"}`}>
+        <${Pane} name="queue" label=${page.queue}>${actionList ? html`<${List} id="action-fixture" controller=${actionList} queue=${true} />` : queue}<//>
+        ${focus ? html`<${Pane} name="focus" label=${page.focus}>${focus}<//>` : null}
       </div>
       <${KeyBar} />
       ${actionList ? html`<button class="fixture-replay" type="button" onClick=${replayLast}>Replay last request</button>` : null}

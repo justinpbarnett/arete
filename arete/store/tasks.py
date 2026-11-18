@@ -49,6 +49,12 @@ def tasks(repo: str = "", in_state: str = "", connect=reader) -> list[dict]:
         return [dict(r) for r in c.execute(q + " ORDER BY created, rowid", args)]
 
 
+def task_summaries(connect=reader) -> list[dict]:
+    with connect() as c:
+        rows = c.execute("SELECT id, repo, title, kind, state, updated FROM tasks ORDER BY updated DESC, id")
+        return [dict(row) for row in rows]
+
+
 def task_children(parent: str, connect=reader) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT * FROM tasks WHERE parent = ? ORDER BY created, rowid", (parent,))]

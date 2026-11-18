@@ -668,6 +668,10 @@ def get_run(handler, rest, query):
     return board.run_board(unquote(rest))
 
 
+def get_tasks(handler, rest, query):
+    return {"tasks": tasks.task_summaries()}
+
+
 def get_task(handler, rest, query):
     return tasks.view(unquote(rest), query.get("repo", ""))
 
@@ -943,6 +947,7 @@ ROUTES = (
     ("GET", "/api/live", get_live),
     ("GET", "/api/runs", get_runs),
     ("GET", "/api/runs/*", get_run),
+    ("GET", "/api/tasks", get_tasks),
     ("GET", "/api/tasks/*", get_task),
     ("GET", "/api/asks", get_asks),
     ("GET", "/api/health", get_health),

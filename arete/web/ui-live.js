@@ -1,14 +1,19 @@
 import { signal } from "./vendor-signals.js";
 import * as data from "./ui-data.js";
 
-const endpoints = { sidebar: "/api/sidebar", live: "/api/live" };
+const endpoints = { sidebar: "/api/sidebar", live: "/api/live", questions: "/api/asks", health: "/api/health", tasks: "/api/tasks" };
+const resources = {
+  settings: [["health", endpoints.health, (x) => x.serve && x.checks]],
+  board: [["tasks", endpoints.tasks, (x) => Array.isArray(x.tasks)]],
+};
+export const screenReads = signal({});
 const FAST_MS = 5000;
 const RUN_MS = 2500;
 const SLOW_MS = 30000;
 const TIMEOUT_MS = 3000;
 const OFFLINE_ROUNDS = 2;
 const STALE_SECONDS = 60;
-const fastScreens = new Set(["floor", "triage", "board", "task", "run"]);
+const fastScreens = new Set(["floor", "triage", "outbox", "board", "task", "run"]);
 
 const cache = { sidebar: null, sidebarAt: 0, live: null, liveAt: 0, liveTried: 0, errors: { sidebar: null, live: null }, failures: 0, settled: false };
 const controllers = new Set();
@@ -30,6 +35,7 @@ function snapshotOf() {
   const rows = payload?.live?.rows;
   return {
     needsYou: sidebar?.needs_you ?? asksCount(payload?.needs_you),
+    questions: cache.questions ?? null,
     running: sidebar?.running ?? null,
     health: sidebar?.health ?? null,
     serve: sidebar?.serve ?? null,
@@ -60,7 +66,9 @@ export function connectivity(current, now) {
 export function readFault(screen, current) {
   const panel = screen === "floor" ? current.live?.live : screen === "triage"
     ? Object.values(current.asks ?? {}).find((part) => part?.error) : null;
-  return panel?.error ? { status: null, message: panel.error } : current.fault;
+  const resourceError = Object.values(screenReads.value).find((part) => part.error)?.error
+    ?? (["triage", "run"].includes(screen) ? current.questions?.error : null);
+  return resourceError ?? (panel?.error ? { status: null, message: panel.error } : current.fault);
 }
 
 async function refusal(response) {
@@ -251,6 +259,22 @@ async function readRun(run, token) {
   publishRuns();
 }
 
+async function readScreen(run, token) {
+  const boardReads = resources.board;
+  const detail = run.id ? [["task", data.taskDetail(run.id, run.repo), (x) => typeof x.id === "string"]] : [];
+  const wanted = run.screen === "task" ? [...boardReads, ...detail] : resources[run.screen] ?? [];
+  await Promise.all(wanted.map(async ([key, url, valid]) => {
+    const previous = screenReads.value[key];
+    if (key === "task" && !/^t-[a-f0-9]+$/i.test(run.id) && previous?.data && !previous.error && !run.refreshDetail) return;
+    const result = await read(url, { say: true });
+    if (token !== generation || active !== run) return;
+    const usable = result.data && valid(result.data);
+    screenReads.value = { ...screenReads.value, [key]: usable ? { data: result.data }
+      : { data: previous?.data, error: result.error ?? { message: "Malformed response" } } };
+  }));
+  if (token === generation && active === run) run.refreshDetail = false;
+}
+
 async function round(run) {
   pause();
   if (document.hidden || active !== run) { dropStream(); return; }
@@ -258,12 +282,14 @@ async function round(run) {
   const began = Date.now();
   const delay = fastScreens.has(run.screen) ? FAST_MS : SLOW_MS;
   const wantLive = liveDue || delay <= FAST_MS || began - cache.liveTried >= delay - 500;
-  const [sidebar, live] = await Promise.all([read(endpoints.sidebar), wantLive ? read(endpoints.live) : null,
-    run.screen === "run" ? readRun(run, token) : null]);
+  const [sidebar, live, questions] = await Promise.all([read(endpoints.sidebar), wantLive ? read(endpoints.live) : null,
+    read(endpoints.questions), run.screen === "run" ? readRun(run, token) : null, readScreen(run, token)]);
   if (token !== generation || active !== run) return;
   const finished = Date.now();
   if (sidebar.data) { cache.sidebar = sidebar.data; cache.sidebarAt = finished; }
   cache.errors.sidebar = sidebar.error ?? null;
+  cache.questions = Array.isArray(questions.data?.asks) ? { data: questions.data }
+    : { data: cache.questions?.data, error: questions.error ?? { message: "Malformed response" } };
   if (live) {
     cache.liveTried = began;
     if (live.data) { cache.live = live.data; cache.liveAt = finished; }
@@ -286,11 +312,14 @@ export function stop() {
   run?.release();
 }
 
-export function live(screen, id = "") {
+export function live(screen, id = "", repo = "") {
   stop();
   selectRun(screen === "run" ? id : "");
+  const sharedTasks = ["board", "task"].includes(screen) ? screenReads.value.tasks : null;
+  const sharedHealth = screen === "settings" ? screenReads.value.health : null;
+  screenReads.value = { ...(sharedTasks ? { tasks: sharedTasks } : {}), ...(sharedHealth ? { health: sharedHealth } : {}) };
   liveDue = true;
-  const run = { screen, id };
+  const run = { screen, id, repo, refreshDetail: false };
   const visibility = () => { liveDue = true; round(run); };
   document.addEventListener("visibilitychange", visibility);
   run.release = () => document.removeEventListener("visibilitychange", visibility);
@@ -303,6 +332,7 @@ export function live(screen, id = "") {
       if (active !== run) return Promise.resolve();
       liveDue = true;
       rs.force = true;
+      run.refreshDetail = true;
       return round(run);
     },
   };

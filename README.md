@@ -2218,7 +2218,9 @@ When `alert_repo` is set and private, the board is also one issue there, "[arete
 
 ## Dashboard
 
-`arete serve` serves one page from this machine to its owner over Tailscale, so it opens from a phone or another computer on the tailnet; `arete dashboard` serves it alone.
+`arete serve` serves the dashboard from this machine to its owner over Tailscale, so it opens from a phone or another computer on the tailnet; `arete dashboard` serves it alone.
+Open `/ui.html` for the new dashboard's Floor, Runs, Triage inbox, Outbox, local task Board, and live Health.
+The classic dashboard stays at `/` and still handles the full intake, console, sessions, configuration, incidents, and usage views.
 It listens only on the machine's tailnet addresses.
 A request from any other tailnet login gets 403, and a change also needs the `X-Arete` header that the page sends.
 Admission maps the whois login through `principal_logins` to an active human principal.
@@ -2398,6 +2400,9 @@ In a repo the poller does not pick, `why` names the task and the `ticket` body t
 A queued task in a `pipeline = true` repo starts at a later poll.
 A ticket whose run is going on answers that run's id with `already running` and never starts twice.
 Once a keyed response is committed, identical resends replay that answer unchanged; use a fresh key with the task's ticket to request a new start.
+
+`GET /api/tasks` returns local task summaries (`id`, `repo`, `title`, `kind`, `state`, `updated`), most recently updated first.
+It does not fetch tracker items or include task bodies or comments.
 
 `GET /api/tasks/ID` returns the task: a local task's row with its `comments`, or a tracker item's `id`, `ref`, `title`, `url` and `state`, with `?repo=NAME` when no run names it yet. Both add `runs` (`id`, `status`, `started`, `finished`, `prs`, `cost_usd`, and `report`, the run's [`report` line](#run-lines), or `{}` while it has none), newest first, and `children`, the local tasks whose parent it is.
 

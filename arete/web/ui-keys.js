@@ -10,7 +10,7 @@ export { notice };
 export const screenKeys = [
   ["f", "floor", "Floor", "#floor"],
   ["t", "triage", "Triage", "#triage"],
-  ["w", "my-work", "My work", "#board/open-work"],
+  ["w", "my-work", "Open work", "#board/open-work"],
   ["b", "board", "Board", "#board"],
   ["r", "runs", "Runs", "#run"],
   ["n", "intake", "Intake", "#intake"],
@@ -203,7 +203,7 @@ function up() {
   const scope = (list && cursorRow(list)) ?? paneElements(pane.value)[0];
   const marked = scope?.closest("[data-up]") ?? document.querySelector("[data-up]");
   const route = parse(location.hash);
-  const parent = marked?.dataset.up ?? (route.screen === "task" ? "#board" : route.screen === "run" ? "#floor" : "");
+  const parent = marked?.dataset.up ?? document.querySelector(".ops-back")?.hash ?? (route.screen === "run" ? "#floor" : "");
   if (parent.startsWith("#")) go(parent);
 }
 
@@ -239,7 +239,9 @@ function search() {
 function insert() {
   const list = focusedList();
   const scope = list && cursorRow(list);
-  const box = scope && [...scope.querySelectorAll("textarea, input, [contenteditable]")].find((el) => writable(el) && usable(el));
+  const fields = [...(scope?.querySelectorAll("textarea, input, [contenteditable]") ?? []),
+    ...paneElements(pane.value).flatMap((el) => [...el.querySelectorAll(".ops-form textarea, .ops-form input")])];
+  const box = fields.find((el) => writable(el) && usable(el));
   box?.focus();
 }
 
@@ -349,8 +351,13 @@ function onKey(event) {
     return;
   }
   if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
-    const context = actionContext();
-    if (context?.primary) perform(context.primary, context);
+    const form = event.target.closest?.(".ops-form");
+    const submit = form?.querySelector('button[type="submit"]');
+    if (submit && !submit.disabled) form.requestSubmit(submit);
+    else if (!form) {
+      const context = actionContext();
+      if (context?.primary) perform(context.primary, context);
+    }
     event.preventDefault(); return;
   }
   if (event.metaKey || event.ctrlKey || event.altKey) return;
