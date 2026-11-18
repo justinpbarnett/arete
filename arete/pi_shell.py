@@ -51,7 +51,7 @@ def simple_command(command: str) -> bool:
 
 SYSTEM_READ_ROOTS = tuple(Path(name) for name in (
     "/System", "/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/lib", "/usr/share",
-    "/private/etc", "/Library/Apple", "/Library/Developer/CommandLineTools", "/dev/fd",
+    "/private/etc", "/var/select", "/Library/Apple", "/Library/Developer/CommandLineTools", "/dev/fd",
     *sandbox.WRITABLE_DEVICES,
 ))
 
@@ -67,11 +67,15 @@ def runtime_roots() -> tuple[Path, ...]:
 
 def command_env(passing, extra, hidden=()) -> dict[str, str]:
     source = environment.build(passing or [], extra)
-    return {name: value for name, value in source.items()
-            if not CREDENTIAL.search(name) and name not in environment.SHELL_HOOKS
-            and not name.upper().startswith(environment.LOADER_HOOKS)
-            and not name.startswith(("ARETE_PI_", "PI_", "CLAUDE", "CODEX"))
-            and not any(secret in value for secret in hidden)}
+    clean = {name: value for name, value in source.items()
+             if not CREDENTIAL.search(name) and name not in environment.SHELL_HOOKS
+             and not name.upper().startswith(environment.LOADER_HOOKS)
+             and not name.startswith(("ARETE_PI_", "PI_", "CLAUDE", "CODEX"))
+             and not any(secret in value for secret in hidden)}
+    clean.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_COUNT="2",
+                 GIT_CONFIG_KEY_0="core.hooksPath", GIT_CONFIG_VALUE_0="/dev/null",
+                 GIT_CONFIG_KEY_1="core.fsmonitor", GIT_CONFIG_VALUE_1="false", xcrun_nocache="1")
+    return clean
 
 
 @dataclass(frozen=True)
