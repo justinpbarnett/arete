@@ -17,6 +17,7 @@ from . import (
     owner_asks,
     patching,
     paths,
+    pilot,
     pipeline,
     prompt_loader,
     record,
@@ -959,6 +960,9 @@ def publishing(run: pipeline.Run, branch: str, push: Callable[[], None]) -> None
     try:
         push()
     except workspace.RunFailed as e:
+        if pilot.is_pilot_task(str(run.tid)):
+            raise workspace.RunFailed(e.why, f"{e.detail}\n\nInspect the pilot receipt and this run's branch. "
+                                            "This authorization cannot be resumed.") from e
         raise workspace.RunFailed(
             e.why, f"{e.detail}\n\nThis run's commit stays on `{branch}` in its worktree and nothing on origin was "
                    f"overwritten. `arete resume {run.id}` publishes it from the pr step when origin still holds only "
@@ -988,7 +992,7 @@ def refuse_changed_prs(job: Job) -> None:
                                      f"pushed nothing for {reason}")
 
 
-def settle_unpushed_checkouts(job: Job):
+def settle_unpushed_checkouts(job: Job, before_push=None):
     b, run = job.b, job.run
     fresh = b.restage(from_base=False)
     staged = b.restage(from_base=True) if fresh.empty or b.from_base else fresh
@@ -1005,11 +1009,12 @@ def settle_unpushed_checkouts(job: Job):
             raise workspace.RunFailed(f"nothing was left to push in {c.github}, and its checkout of "
                                      f"{job.branch} does not match origin")
     if unpushed:
-        publishing(run, job.branch, lambda: pipeline.commit_and_push(job.checkouts, unpushed, job.branch, ""))
+        publishing(run, job.branch, lambda: pipeline.commit_and_push(job.checkouts, unpushed, job.branch, "",
+                                                                     before_push=before_push))
     return fresh, staged, size, outcome, unpushed
 
 
-def publish_branch(job: Job, fresh, staged, unpushed):
+def publish_branch(job: Job, fresh, staged, unpushed, before_push=None):
     b, run, t = job.b, job.run, job.ticket
     if fresh.empty:
         b.committed_lines = max(b.committed_lines, staged.lines)
@@ -1020,8 +1025,8 @@ def publish_branch(job: Job, fresh, staged, unpushed):
                f"Repairs the review findings of run {run.repairs}.\n\n" if run.repairs else "")
     if not fresh.empty:
         b.staged = fresh
-        publishing(run, job.branch,
-                   lambda: b.push(job.branch, f"{tracker.with_ref(subject, t.ref)}\n\n{revised}Arete-Run: {run.id}"))
+        publishing(run, job.branch, lambda: b.push(
+            job.branch, f"{tracker.with_ref(subject, t.ref)}\n\n{revised}Arete-Run: {run.id}", before_push=before_push))
         b.staged = staged
     return subject, draft_why, committed
 
@@ -1046,7 +1051,8 @@ def report(job: Job, size: str, images: dict, held: str) -> str:
                                 held=held, written=job.document)
 
 
-def open_or_refresh_prs(job: Job, found, staged, size, outcome, subject, draft_why, committed) -> Outcome:
+def open_or_refresh_prs(job: Job, found, staged, size, outcome, subject, draft_why, committed,
+                        before_push=None) -> Outcome:
     run, t, tk = job.run, job.ticket, job.run.tracker
     images = pipeline.evidence_images(run, staged.changed[0], job.verified)
     report_body = report(job, size, images, draft_why)
@@ -1058,10 +1064,16 @@ def open_or_refresh_prs(job: Job, found, staged, size, outcome, subject, draft_w
         if c in opened:
             gh.pr_edit_body(c.pr, with_stop(report_body, stops.get(c.github, "")), link=link)
         elif not c.pr:
+            if before_push:
+                remote_head = workspace.remote_head(c.src, job.branch)
+                if not remote_head or remote_head != c.lease or c.lease != before_push(c):
+                    raise workspace.RunFailed("the authorized pilot branch changed before PR creation")
             c.pr = gh.pr_create(c.github, job.branch, c.base, tk.pr_title(subject, t), report_body,
                                 labels=tk.pr_labels, draft=bool(draft_why), cwd=c.wt, link=link)
             opened.append(c)
             pipeline.note_prs(run, job.branch, job.with_prs)
+            if before_push and gh.pr_draft_and_head(c.pr)[1] != c.lease:
+                raise workspace.RunFailed("GitHub created a PR with a different head; inspect it before any merge")
             run.log(f"opened {c.pr}{' as draft' if draft_why else ''}")
         else:
             run.log(f"pushed to {c.pr}" if committed else f"checked {c.pr} again, nothing new to push")
@@ -1080,18 +1092,32 @@ def open_or_refresh_prs(job: Job, found, staged, size, outcome, subject, draft_w
 @factory.step("pr")
 def pr(flow: factory.Flow, tree: str) -> Outcome:
     job: Job = flow.ctx
-    job.run.tracker.pr_link(job.ticket, whole=not job.left_for_a_person)
+    run = job.run
+    run.tracker.pr_link(job.ticket, whole=not job.left_for_a_person)
     found = adopt_open_prs(job)
     refuse_changed_prs(job)
-    fresh, staged, size, outcome, unpushed = settle_unpushed_checkouts(job)
-    subject, draft_why, committed = publish_branch(job, fresh, staged, unpushed)
+    before_push = None
+    if pilot.is_pilot_task(str(run.tid)):
+        if (len(job.checkouts) != 1 or run.feedback or run.repairs or found
+                or any(c.resumes or c.lease or c.pr for c in job.checkouts)
+                or not job.branch.startswith(f"arete/{run.tid}-")):
+            raise workspace.RunFailed("the pilot can only publish a fresh branch for this local task")
+
+        def before_push(checkout):
+            try:
+                return pilot.publication_head(run.repo, str(run.tid), run.id, checkout)
+            except pilot.Held as error:
+                raise workspace.RunFailed(str(error)) from error
+
+    fresh, staged, size, outcome, unpushed = settle_unpushed_checkouts(job, before_push)
+    subject, draft_why, committed = publish_branch(job, fresh, staged, unpushed, before_push)
     if not job.run.repo.parts:
         record.note(job.run.id, branch=job.branch)
         if draft_why:
             return end_as("fail", "failed",
                           why=f"pushed {job.branch}, but {draft_why}, and this repo has no GitHub name for a draft PR")
         return publication_outcome(job, staged, outcome, committed)
-    return open_or_refresh_prs(job, found, staged, size, outcome, subject, draft_why, committed)
+    return open_or_refresh_prs(job, found, staged, size, outcome, subject, draft_why, committed, before_push)
 
 
 def with_stop(text: str, stop: str) -> str:

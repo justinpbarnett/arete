@@ -430,7 +430,7 @@ MERGE_WAIT_SECONDS = 120
 MERGE_POLL_SECONDS = 5
 
 
-def merge_ci_passed(repo: str, head: str) -> bool:
+def merge_ci_passed(repo: str, head: str, *, required: dict | None = None) -> bool:
     path = f"repos/{repo}/commits/{head}"
     checks = gh_json(["api", f"{path}/check-runs?filter=latest&per_page=100", "--paginate", "--slurp"])
     statuses = gh_json(["api", f"{path}/statuses?per_page=100", "--paginate", "--slurp"])
@@ -439,6 +439,9 @@ def merge_ci_passed(repo: str, head: str) -> bool:
             or not isinstance(statuses, list) or not statuses):
         return False
     runs = [row for page in checks for row in page["check_runs"]]
+    if required and not any(row.get("head_sha") == head and row.get("name") == required["context"]
+                            and row.get("app", {}).get("id") == required["app_id"] for row in runs):
+        return False
     contexts = {}
     for page in statuses:
         if not isinstance(page, list):
@@ -449,7 +452,8 @@ def merge_ci_passed(repo: str, head: str) -> bool:
                                            for row in runs) and all(state == "success" for state in contexts.values()))
 
 
-def merge_readiness(repo: str, number: int, head: str, base: str, base_sha: str, *, wait: float = 0) -> tuple[str, str]:
+def merge_readiness(repo: str, number: int, head: str, base: str, base_sha: str, *, wait: float = 0,
+                    required: dict | None = None) -> tuple[str, str]:
     if not head or not base or not base_sha:
         return "", "the checked head and base are not known"
     deadline = time.monotonic() + wait
@@ -469,7 +473,7 @@ def merge_readiness(repo: str, number: int, head: str, base: str, base_sha: str,
         time.sleep(min(MERGE_POLL_SECONDS, remaining))
     if state != "CLEAN" or mergeable != "MERGEABLE":
         return "", f"GitHub reports merge state {state}, mergeable {mergeable}"
-    if not merge_ci_passed(repo, head):
+    if not merge_ci_passed(repo, head, required=required):
         return "", "GitHub has no fully passing CI result for the verified head"
     return str(row.get("title") or "").strip(), ""
 

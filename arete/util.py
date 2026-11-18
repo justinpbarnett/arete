@@ -182,9 +182,10 @@ def sh_with_network(cmd: list[str] | str, rerun: re.Pattern = NETWORK_ERROR, **k
 
 
 def git(args: list[str], cwd: Path, timeout: float = 300, check: bool = True, input: str | None = None,
-        env: dict | None = None) -> str:
+        env: dict | None = None, *, retry: bool = True) -> str:
     keeps = ("ssh-agent",) if git_command(args).partition(" ")[0] in NETWORK_GIT else ()
-    res = sh_with_network(["git", *args], cwd=cwd, timeout=timeout, input=input, env=env, keeps=keeps)
+    call = sh_with_network if retry else sh
+    res = call(["git", *args], cwd=cwd, timeout=timeout, input=input, env=env, keeps=keeps)
     if check and res.returncode != 0:
         raise RuntimeError(f"git {git_command(args)}: {git_error(res.stderr or res.stdout)}")
     return res.stdout

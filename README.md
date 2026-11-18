@@ -1274,6 +1274,22 @@ Arete attempts only a head-matched squash merge on an open, ready PR whose head 
 It never arms a later merge and leaves changes spanning repositories for a person.
 Set required checks and require an up-to-date branch in GitHub so the server enforces those rules even if the base or CI changes during the merge request.
 
+#### One-shot delivery pilot with owner merge
+
+The local owner can authorize one exact README line replacement from a pinned `main` commit without changing PR trust.
+Run `arete pilot-doc-fix --base FULL_SHA --old-line 'exact old line' --new-line 'exact new line'` to check the signal without starting work.
+Add `--execute` to spend that authorization and leave the watcher running.
+The command creates one local task for the scheduled poller, not a GitHub issue.
+Before pushing a feature branch, Arete requires a single commit on the pinned base containing only the authorized edit, with matching native verification, full local checks, and independent review.
+After exact-head GitHub Actions and JEV screening pass, the watcher prints the PR URL, expected head, and base for the GitHub repository owner to squash-merge.
+Arete does not request a merge because GitHub's squash API cannot pin the target branch and commit at the write.
+The watcher only accepts a merge attributed by GitHub to the repository owner after the handoff, with the approved head and target branch, exact squash parent and tree, and passing CI on that release.
+It then fast-forwards a clean, idle local checkout and waits for a fresh healthy service heartbeat and API response.
+The README-only deployment does not need a service restart.
+The write-admission window is at most 40 minutes, and an operation already started can take longer to finish.
+The poller skips spent or expired tasks, including when the watcher process is no longer running.
+On a hold or interruption, inspect the printed receipt and any branch, PR, or merge already present; the same authorization is never automatically retried.
+
 ## Steps
 
 Each pipeline step reads its own model, runner, effort, timeout, tries, tools, MCP servers, instructions and session: plan, build (also revise, the fixes and the CI fixes), verify, review, learn, uat and document. `arete steps` prints what each step resolves to, one JSON line per step. `--repo NAME` reads that repo's layer too, and `--kind feat` or `--kind fix` resolves for that kind of ticket.
