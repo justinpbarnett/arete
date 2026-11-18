@@ -99,7 +99,8 @@ class Catalog:
         for role in ("plan", "build", "check_repair", "review_repair", "ci_repair", "verify", "review"):
             setting = job.run.settings(role)
             for n, link in enumerate(setting.chain):
-                overrides = {"runner": link.runner, "provider": link.provider, "model": link.model,
+                overrides = {**job.run.overrides, **job.run.step_overrides.get(role, {}),
+                             "runner": link.runner, "provider": link.provider, "model": link.model,
                              "effort": link.effort}
                 try:
                     selected = steps.resolve(job.cfg, job.layer, role, job.run.kind, overrides,
@@ -184,7 +185,8 @@ class Catalog:
         if effort not in traits_of(setting.runner).efforts:
             raise ValueError("unsupported reasoning effort")
         resolved = steps.resolve(self.job.cfg, self.job.layer, setting.step, self.job.run.kind,
-                                 {"runner": setting.runner, "provider": setting.provider, "model": setting.model,
+                                 {**self.job.run.overrides, **self.job.run.step_overrides.get(setting.step, {}),
+                                  "runner": setting.runner, "provider": setting.provider, "model": setting.model,
                                   "effort": effort},
                                  self.job.run.step_overrides.get(config.INHERITS.get(setting.step, ""), {}))
         return replace(resolved, requires=replace(resolved.requires, gated_launches=setting.requires.gated_launches))
