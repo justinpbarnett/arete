@@ -14,6 +14,7 @@ from . import (
     owner_asks,
     patching,
     paths,
+    pilot,
     pipeline,
     queueing,
     routing,
@@ -56,7 +57,8 @@ def next_ticket(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
                 other_routes: set[str] = frozenset(), excluded: set[str] = frozenset()) -> tracker.Ticket | None:
     for source in ticket_queues(repo, tk):
         for t in queueing.prioritized(source.todo()):
-            if str(t.id) in excluded or other_routes & set(t.labels) or run_store.issue_running(repo.name, t.id):
+            if (str(t.id) in excluded or other_routes & set(t.labels) or run_store.issue_running(repo.name, t.id)
+                    or not pilot.pickable(str(t.id), repo.name)):
                 continue
             if owed := run_store.pending_label(repo.name, t.id):
                 skips.note(tracker.ticket_name(repo.name, t.ref), t, f"its {owed} label is not written yet", repo.name)
@@ -80,15 +82,18 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
               other_routes: set[str], excluded: set[str] = frozenset()) -> tuple[str, str] | None:
     excluded = excluded | oncall.parked(repo.name)
     fresh = next_ticket(repo, tk, skips, other_routes, excluded)
+    def eligible_again(tid):
+        return str(tid) not in excluded and not pilot.is_pilot_task(str(tid)) and not run_store.issue_running(repo.name, tid)
+
     for tid in run_store.interrupted_tickets(repo.name):
-        if str(tid) not in excluded and not run_store.issue_running(repo.name, tid):
+        if eligible_again(tid):
             return tid, "restarting after an interruption"
     for tid in insights_store.feedback_due(repo.name, util.iso(util.now() - timedelta(minutes=pipeline.FEEDBACK_QUIET_MINUTES))):
-        if str(tid) not in excluded and not run_store.issue_running(repo.name, tid):
+        if eligible_again(tid):
             return tid, "revising the PR for your review comments"
     for source in ticket_queues(repo, tk):
         for t in source.replied():
-            if str(t.id) in excluded or run_store.issue_running(repo.name, t.id):
+            if not eligible_again(t.id):
                 continue
             if other_routes & set(t.labels):
                 skips.note(t.ref, t, tracker.route_blocker(other_routes | {tracker.route_label(repo)}, t.labels))
@@ -210,6 +215,8 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: tuple[str, str], skip
 
     repo, layer = queue.repo, queue.layer
     tid, why = pick
+    if not pilot.pickable(str(tid), repo.name):
+        return "skipped"
     with tasks.PENDING_LOCK, util.lock(tasks.START_LOCK, wait=True):
         if tasks.pending_start(repo.name, str(tid)) or run_store.issue_running(repo.name, tid):
             return "skipped"

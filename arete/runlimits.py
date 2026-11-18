@@ -183,8 +183,9 @@ idle_waits = budget_legacy.idle_waits
 
 
 class Budget:
-    def __init__(self, run, policy: Policy, previous: str, ticket=None, forced: bool = False) -> None:
-        self.run, self.policy = run, policy
+    def __init__(self, run, policy: Policy, previous: str, ticket=None, forced: bool = False,
+                 *, wall_deadline: float = math.inf) -> None:
+        self.run, self.policy, self.wall_deadline = run, policy, wall_deadline
         chain = family(previous)
         rows = {rid: run_store.run_get(rid) for rid in chain}
         if any(row is None or (row["repo"], str(row["issue"])) != (run.repo.name, str(run.tid))
@@ -283,7 +284,7 @@ class Budget:
                                                   for cause in IDLE_WAITS}}
 
     def run_deadline(self) -> float:
-        return math.inf if self.idle_since is not None else self.deadline
+        return min(self.wall_deadline, math.inf if self.idle_since is not None else self.deadline)
 
     def capture(self, ticket) -> None:
         self.specification = specification(ticket)
@@ -292,6 +293,8 @@ class Budget:
     def reason(self) -> str:
         if self.verify_deadline is not None and self.verify_deadline <= self.run_deadline():
             return f"verification reached its cumulative {self.policy.max_verify_minutes:g} minute budget"
+        if self.run_deadline() == self.wall_deadline and not math.isinf(self.wall_deadline):
+            return "the one-shot pilot authorization expired"
         return f"the run chain reached its cumulative {self.policy.max_run_minutes:g} minute budget"
 
     def arm(self) -> None:
@@ -308,7 +311,7 @@ class Budget:
         def expire(*_):
             raise Parked(self.reason())
 
-        if self.deadline <= time.monotonic():
+        if self.run_deadline() <= time.monotonic():
             raise Parked(self.reason())
         previous = signal.signal(signal.SIGALRM, expire)
         previous_timer = signal.getitimer(signal.ITIMER_REAL)

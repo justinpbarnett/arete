@@ -14,6 +14,7 @@ from . import (
     flows,
     gh,
     owner_asks,
+    pilot,
     pipeline,
     prompt_loader,
     repairs,
@@ -31,6 +32,13 @@ from .verify import Verified
 STATE_FIELDS = ("plan_text", "goal", "estimate", "left_for_a_person", "build_summary", "reviews", "fix_reply",
                 "document", "report_body", "draft_why", "summary", "opened", "found", "pushed", "drafted",
                 "ci_stopped", "changed", "ci_result", "committed")
+
+
+def policy_fingerprint(cfg, layer, closed_context):
+    effective = asdict(layer)
+    effective.pop("factory_path")
+    return ledger.digest(json.loads(json.dumps({"layer": effective, "config": asdict(cfg),
+                                                "closed_context": closed_context}, default=str)))
 
 
 class Controller:
@@ -185,10 +193,7 @@ class Controller:
         return found
 
     def policy_sha(self):
-        layer = asdict(self.job.layer)
-        layer.pop("factory_path")
-        return ledger.digest(json.loads(json.dumps({"layer": layer, "config": asdict(self.job.cfg),
-                                                    "closed_context": self.run.closed_context}, default=str)))
+        return policy_fingerprint(self.job.cfg, self.job.layer, self.run.closed_context)
 
     def fingerprint(self):
         prints = {c.github: factory.fingerprint(c.wt) for c in self.job.checkouts}
@@ -464,6 +469,7 @@ class Controller:
         if self.run.dry_run:
             self.ending = flows.end_dry_run(self.flow)
             return {"status": "dry-run"}
+        self.check_pilot_publication()
         self.data["publication_intent"] = {"tree": self.fingerprint()}
         self.persist()
         outcome = self.atomic("pr", tree=str(self.job.ws))
@@ -483,13 +489,16 @@ class Controller:
             finally:
                 self.job.slot.take(self.run.log, self.run.waiting)
             self.job.ci_result = current.summary()
+            self.check_pilot_publication()
             pipeline.publish_ci(self.run, self.job.ticket, self.job.with_prs, pipeline.ci.section([current], 1))
             if current.reds or not current.all_read:
                 self.data["ci_failed"] = True
                 for checkout in self.job.with_prs:
+                    self.check_pilot_publication()
                     pipeline.set_draft(self.run, checkout, True)
                 return {"ci": self.job.ci_result, "error": "CI needs an explicit worker diagnosis or repair"}
             self.data.pop("ci_failed", None)
+        self.check_pilot_publication()
         self.data["publication_intent"] = {"tree": self.fingerprint(), "phase": "publish"}
         self.persist()
         outcome = self.atomic("publish")
@@ -502,6 +511,20 @@ class Controller:
         self.persist()
         self.ending = flows.ended(self.flow, outcome)
         return outcome.data
+
+    def check_pilot_publication(self):
+        if pilot.is_pilot_task(str(self.run.tid)):
+            try:
+                repo, tid = self.run.repo, str(self.run.tid)
+                receipt = pilot.live_receipt(tid, repo.name)
+                layer = pipeline.config.load_layer(repo.layer_dir)
+                run = pilot.scheduled_run(repo.name, tid)
+                pilot.require(run and run["id"] == self.run.id, "the approved one-shot run changed")
+                pilot.require(layer.factory_path == "orchestrated"
+                              and self.policy_sha() == receipt["policy"] == policy_fingerprint(
+                                  pipeline.config.load(), layer, ()), "the one-shot run changed its admitted policy")
+            except pilot.Held as error:
+                raise runlimits.Parked(str(error)) from error
 
     def perform(self, action):
         args, op = action["request"], action["op"]

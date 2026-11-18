@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
 import shlex
@@ -987,9 +988,9 @@ class Build(TicketWork):
             raise workspace.RunFailed(f"after {after} {why}{planned}; split the work",
                             f"### Lines changed by file\n\n{lines_by_file(staged)}{pushed}")
 
-    def push(self, branch: str, message: str) -> None:
+    def push(self, branch: str, message: str, *, before_push: Callable[[workspace.Checkout], str] | None = None) -> None:
         self.run.tracker.pr_link(self.ticket, whole=not self.left_for_a_person)
-        commit_and_push(self.checkouts, self.staged.changed, branch, message)
+        commit_and_push(self.checkouts, self.staged.changed, branch, message, before_push=before_push)
         self.committed_lines += self.staged.lines
 
     def check_with_repairs(self, step_name: Callable[[int], str] | None = None) -> tuple[bool, int]:
@@ -1241,7 +1242,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
     paths.ensure_dirs()
     cfg = config.load()
     repo = cfg.repo(repo_name)
-    from . import flows
+    from . import flows, pilot
     adw, refusal = run_refusal(repo, script is not None)
     if refusal:
         print(refusal)
@@ -1267,10 +1268,25 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             return 0
         try:
             layer = config.load_layer(repo.layer_dir)
+            wall_deadline = math.inf
+            if pilot.is_pilot_task(str(tid)):
+                from .orchestration import policy_fingerprint
+
+                permit = pilot.task_admission(str(tid), repo.name)
+                pilot.require(principals.current() == "rule:poll" and script and script.path == "orchestrate"
+                              and not any((dry_run, force, script.continues, script.only, script.again, script.repairs,
+                                           script.action, script.overrides, closed_context))
+                              and permit["policy"] == policy_fingerprint(cfg, layer, ())
+                              and layer.factory_path == ORCHESTRATED,
+                              "the one-shot task requires the approved first scheduled orchestration")
+                wall_deadline = permit["deadline"]
             budget_history = run_store.ticket_runs(repo.name, tid, limit=1)
             blocked, reset_budget = runlimits.admission(repo, str(tid), tk, runlimits.Policy.of(layer), force)
         except tracker.ERRORS as e:
             print(f"could not read {name}: {e}")
+            return 2
+        except pilot.Held as e:
+            print(f"could not admit the one-shot task: {e}")
             return 2
         except (ValueError, OSError) as e:
             print(f"could not validate the process budget: {e}")
@@ -1298,6 +1314,14 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             restarting = bool(earlier) and earlier["status"] == "interrupted"
             mending = (script.repairs or repaired_by(script.continues or (earlier["id"] if restarting else ""))
                        ) if script else ""
+            if pilot.is_pilot_task(str(tid)):
+                try:
+                    pilot.require(pilot.task_admission(str(tid), repo.name) == permit,
+                                  "the authorization changed before the run was started")
+                except pilot.Held as e:
+                    print(f"could not admit the one-shot task: {e}")
+                    slot.free()
+                    return 2
             run_id = record.start("pipeline", tag=f"{repo.name}-{tid}", lock=lock, repo=repo.name, issue=tid,
                                   only_step=only)
             scratch.RUN_BASELINES[run_id] = producer_baseline
@@ -1344,7 +1368,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             fresh = bool(previous) and force and not restarting and not run.repairs and not run.alone and not (
                 flow and flow.continues)
             current = tk.get(tid) if fresh else None
-            run.budget = runlimits.Budget(run, runlimits.Policy.of(layer), previous, current, fresh)
+            run.budget = runlimits.Budget(run, runlimits.Policy.of(layer), previous, current, fresh,
+                                          wall_deadline=wall_deadline)
             with run.budget.watching():
                 if not (flow and flow.refusal):
                     run.budget.capture(current or tk.get(tid))
@@ -2014,7 +2039,8 @@ def note_prs(run: Run, branch: str, with_prs: list[workspace.Checkout]) -> None:
     record.note(run.id, branch=branch, pr_url=" ".join(c.pr for c in with_prs))
 
 
-def commit_and_push(checkouts: list[workspace.Checkout], changed: list[workspace.Checkout], branch: str, message: str) -> None:
+def commit_and_push(checkouts: list[workspace.Checkout], changed: list[workspace.Checkout], branch: str, message: str,
+                    *, before_push: Callable[[workspace.Checkout], str] | None = None) -> None:
     for c in changed:
         if not git(["diff", "--cached", "--name-only"], c.wt).strip():
             continue
@@ -2030,13 +2056,23 @@ def commit_and_push(checkouts: list[workspace.Checkout], changed: list[workspace
                         "Someone pushed to that branch after this run started. A retry builds on top of their work.")
     pushed: list[workspace.Checkout] = []
     for c in changed:
+        if before_push:
+            head = before_push(c)
+            ref = f"refs/heads/{branch}"
+            argv = ["push", "-q", "--no-follow-tags", "--recurse-submodules=no", f"--force-with-lease={ref}:{c.lease}",
+                    "origin", f"{head}:{ref}"]
+        else:
+            head = ""
+            argv = ["push", "-q", f"--force-with-lease={branch}:{c.lease}", "-u", "origin", branch]
         try:
-            git(["push", "-q", f"--force-with-lease={branch}:{c.lease}", "-u", "origin", branch], c.wt, timeout=600)
+            git(argv, c.wt, timeout=600, retry=not before_push)
         except RuntimeError as e:
             done = ", ".join(p.github for p in pushed) or "nothing"
+            aftermath = ("The pilot will not retry the push." if before_push
+                         else "A retry builds on whatever reached the branch.")
             raise workspace.RunFailed(f"the push to {c.github} failed after arete pushed {done}",
-                            f"{e}\n\nA retry builds on whatever reached the branch.") from e
-        c.lease = git(["rev-parse", "HEAD"], c.wt).strip()
+                                      f"{e}\n\n{aftermath}") from e
+        c.lease = head or git(["rev-parse", "HEAD"], c.wt).strip()
         c.onto = ""
         pushed.append(c)
 
@@ -2706,9 +2742,11 @@ def check_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
 
 def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "verify",
                 require_released: bool = False, **values) -> verify.Verified:
+    from . import pilot
+
     run, v = b.run, verify.with_free_ports(b.layer.verify)
-    merge_trees = (verification_trees(b) if prompt_name == role == "verify" and b.layer.trust_level == "automerge"
-                   else {})
+    merge_candidate = b.layer.trust_level == "automerge" or pilot.is_pilot_task(str(run.tid))
+    checked_trees = verification_trees(b) if prompt_name == role == "verify" and merge_candidate else {}
     step = b.next_step(step_name)
     if refusal := verify.port_refusal(v):
         run.log(f"{step}: {refusal}")
@@ -2811,9 +2849,9 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
             verified.checks = probes.checks + verified.checks
     if fixture_blocker:
         verified.verdict, verified.blocked_by, verified.finished = "blocked", fixture_blocker, False
-    if (verified.verdict == "pass" and merge_trees and agent_finished and res.runner in {"pi", "codex", "claude"}
-            and merge_trees == verification_trees(b)):
-        verified.native_trees = merge_trees
+    if (verified.verdict == "pass" and checked_trees and agent_finished and res.runner in {"pi", "codex", "claude"}
+            and checked_trees == verification_trees(b)):
+        verified.native_trees = checked_trees
     verified.saved = os.path.abspath(run.dir / f"{step}.md")
     run.save(f"{step}.md", verified.markdown())
     run.log(f"{step}: {verified.verdict}, {len(verified.checks) - len(verified.failed_checks)} of "
