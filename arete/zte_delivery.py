@@ -261,11 +261,16 @@ def database_busy(error: sqlite3.OperationalError) -> bool:
     return (getattr(error, "sqlite_errorcode", 0) & 0xff) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
 
 
+class HostedDeadlineExpired(pilot.Held):
+    pass
+
+
 def send_authorized(delivery, policy, client, isolated, proof, risk, ci_scope) -> None:
     deadline = zte.wall_deadline(delivery)
 
     def check_deadline():
-        pilot.require(time.monotonic() < deadline, "ZTE grant expired at the hosted write boundary")
+        if time.monotonic() >= deadline:
+            raise HostedDeadlineExpired("ZTE grant expired at the hosted write boundary")
 
     data = delivery.data
     branch, head, tree = data["branch"], data["head"], data["tree"]
@@ -285,6 +290,7 @@ def send_authorized(delivery, policy, client, isolated, proof, risk, ci_scope) -
         pilot.require(delivery.phase == "pr_ready" and proof and risk, "no authorized ZTE squash")
         if not ready_to_squash(delivery, client):
             return
+    pr_body = policy.signal(delivery.base).task() if delivery.phase == "pushed" else ""
     response = {}
     with util.lock(zte.INTERLOCK) as got:
         if not got:
@@ -309,7 +315,7 @@ def send_authorized(delivery, policy, client, isolated, proof, risk, ci_scope) -
         if intent.phase == "push_intent":
             client.push(isolated, branch, head, token)
         elif intent.phase == "pr_intent":
-            created = client.create(branch, pilot.TASK_TITLE, policy.signal(delivery.base).task(), token)
+            created = client.create(branch, pilot.TASK_TITLE, pr_body, token)
             if isinstance(created.get("node_id"), str):
                 response["created_pr"] = created["node_id"]
         else:
@@ -322,6 +328,8 @@ def send_authorized(delivery, policy, client, isolated, proof, risk, ci_scope) -
         try:
             with db.tx(timeout=0, before_commit=check_deadline):
                 store.annotate(intent, **response)
+        except HostedDeadlineExpired:
+            return
         except sqlite3.OperationalError as error:
             if not database_busy(error):
                 raise
