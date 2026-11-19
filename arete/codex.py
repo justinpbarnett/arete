@@ -320,8 +320,8 @@ def profile(cwd: Path, add_dirs: list[Path], writing: bool, hidden: list[Path | 
     if result.returncode == 0:
         metadata |= {path: "read" for p in result.stdout.splitlines() for path in both(p)}
     table = {"extends": PROFILE_BASE[name], "filesystem": {**granted, **metadata,
-             **kept_out([cwd, *add_dirs], [*hidden, sandbox.AUTHORITY], floor),
-             **executables(allowed_tools, [*hidden, sandbox.AUTHORITY])},
+             **kept_out([cwd, *add_dirs], [*hidden, *sandbox.authority_roots()], floor),
+             **executables(allowed_tools, [*hidden, *sandbox.authority_roots()])},
              "network": {"enabled": False}}
     return [*setting("default_permissions", name), "-c", f"permissions.{name}={toml_value(table)}"]
 

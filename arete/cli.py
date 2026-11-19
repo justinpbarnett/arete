@@ -3,14 +3,14 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import __version__, codebase, paths, pilot, principals
+from . import __version__, codebase, paths, pilot, principals, zte
 from .commands import costs, hooks, lab, loops, records, research, runs, sessions, setup, tasks
 from .commands.common import Parser, serve_line
 
 __all__ = ["main", "serve_line"]
 
 REGISTRATIONS = (runs.register, tasks.register, loops.register, sessions.register, hooks.register, costs.register,
-                 records.register, research.register, lab.register, setup.register, pilot.register)
+                 records.register, research.register, lab.register, setup.register, pilot.register, zte.register)
 
 PER_CALL_HOOKS = paths.PER_CALL_HOOKS
 

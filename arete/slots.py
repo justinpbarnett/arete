@@ -9,6 +9,7 @@ from typing import TextIO
 from . import config, paths, record, refusals, util
 from .store import chats as chats_store
 from .store import runs as run_store
+from .store import zte as zte_store
 
 SLOTS_LOCK = "run-slots"
 SLOT_KINDS = ("pipeline", "experiment")
@@ -38,7 +39,7 @@ def runs_waiting_for_a_slot() -> list[dict]:
 
 
 def slots_free_to_start(max_parallel: int) -> int:
-    if runs_waiting_for_a_slot():
+    if zte_store.activation_pending() or runs_waiting_for_a_slot():
         return 0
     return max_parallel - len(runs_in_slots())
 
@@ -74,7 +75,7 @@ class RunSlot:
             while True:
                 with admitting():
                     self.max_parallel = live_max_parallel(self.max_parallel)
-                    if len(runs_in_slots()) < self.max_parallel:
+                    if not zte_store.activation_pending() and len(runs_in_slots()) < self.max_parallel:
                         self.hold()
                         log(f"{what}: took a run slot back" + (" after waiting for one" if waiting else ""))
                         return
@@ -92,6 +93,8 @@ class RunSlot:
 
 
 def no_free_slot(max_parallel: int) -> str:
+    if zte_store.activation_pending():
+        return "a managed release is being verified or restored"
     if waiting := len(runs_waiting_for_a_slot()):
         return (f"{util.count(waiting, 'run')} {'waits' if waiting == 1 else 'wait'} to take a run slot back first "
                 f"(max_parallel {max_parallel})")

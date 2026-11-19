@@ -278,6 +278,10 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
                 return with_spent(res, limited)
             return with_spent(done, limited)
         chosen_route = picked.candidate
+        if kw.get("native_observation") and (target.remote or chosen_route.runner != "pi"
+                                             or picked.auth.mode != "subscription"):
+            return Result(ok=False, runner=chosen_route.runner, model=name,
+                          error="native observation requires local Pi subscription")
         text, session = session_for(trip, picked, prompt, fresh_prompt, previous, kw, record_id)
         launch_kw = launch_kwargs(kw, picked, trip, trace, ask_jev, say, cwd=cwd)
         final_size = routing.routing_size(text, settings, launch_kw)

@@ -22,6 +22,7 @@ from . import (
     steps,
     tracker,
     util,
+    zte,
 )
 from .agent import REPLAY
 from .heartbeat import mark_loop, network_up_or_skip
@@ -57,8 +58,10 @@ def next_ticket(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
                 other_routes: set[str] = frozenset(), excluded: set[str] = frozenset()) -> tracker.Ticket | None:
     for source in ticket_queues(repo, tk):
         for t in queueing.prioritized(source.todo()):
-            if (str(t.id) in excluded or other_routes & set(t.labels) or run_store.issue_running(repo.name, t.id)
-                    or not pilot.pickable(str(t.id), repo.name)):
+            tid = str(t.id)
+            if (tid in excluded or other_routes & set(t.labels) or run_store.issue_running(repo.name, t.id)
+                    or not pilot.pickable(tid, repo.name)
+                    or (zte.reserved(tid) and not (zte.scheduled_poll() and zte.pickable(tid, repo.name)))):
                 continue
             if owed := run_store.pending_label(repo.name, t.id):
                 skips.note(tracker.ticket_name(repo.name, t.ref), t, f"its {owed} label is not written yet", repo.name)
@@ -83,7 +86,8 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
     excluded = excluded | oncall.parked(repo.name)
     fresh = next_ticket(repo, tk, skips, other_routes, excluded)
     def eligible_again(tid):
-        return str(tid) not in excluded and not pilot.is_pilot_task(str(tid)) and not run_store.issue_running(repo.name, tid)
+        return (str(tid) not in excluded and not pilot.is_pilot_task(str(tid)) and not zte.reserved(str(tid))
+                and not run_store.issue_running(repo.name, tid))
 
     for tid in run_store.interrupted_tickets(repo.name):
         if eligible_again(tid):
@@ -162,7 +166,14 @@ def spawn_unparked(repo_name: str, tid: str | int) -> bool | None:
         with tasks.PENDING_LOCK, util.lock(tasks.START_LOCK, wait=True):
             if tasks.pending_start(repo_name, str(tid)) or run_store.issue_running(repo_name, tid):
                 return None
-            tasks.spawn_pending(repo_name, str(tid), lambda: spawn_run(repo_name, tid))
+            def spawn():
+                if zte.reserved(str(tid)):
+                    from . import launch_lease
+
+                    zte.bind_launch(repo_name, str(tid), launch_lease.CURRENT.get())
+                return spawn_run(repo_name, tid)
+
+            tasks.spawn_pending(repo_name, str(tid), spawn)
             return True
 
 
@@ -215,7 +226,8 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: tuple[str, str], skip
 
     repo, layer = queue.repo, queue.layer
     tid, why = pick
-    if not pilot.pickable(str(tid), repo.name):
+    if not pilot.pickable(str(tid), repo.name) or (
+            zte.reserved(str(tid)) and not (zte.scheduled_poll() and zte.pickable(str(tid), repo.name))):
         return "skipped"
     with tasks.PENDING_LOCK, util.lock(tasks.START_LOCK, wait=True):
         if tasks.pending_start(repo.name, str(tid)) or run_store.issue_running(repo.name, tid):
@@ -233,7 +245,8 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: tuple[str, str], skip
     ticket = source.get(tid)
     blocked = blocked or source.blocker(tid) or reply
     if not blocked:
-        ticket = intake.route_ticket(cfg, repo, source, ticket, dry_run=dry_run)
+        if not zte.reserved(str(tid)):
+            ticket = intake.route_ticket(cfg, repo, source, ticket, dry_run=dry_run)
         blocked = step_without_route(cfg, repo, ticket, queue.discovery, layer)
     if blocked:
         skips.note(name, ticket, blocked, repo.name)

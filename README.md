@@ -1290,6 +1290,31 @@ The write-admission window is at most 40 minutes, and an operation already start
 The poller skips spent or expired tasks, including when the watcher process is no longer running.
 On a hold or interruption, inspect the printed receipt and any branch, PR, or merge already present; the same authorization is never automatically retried.
 
+#### Standing README delivery lane
+
+The standing lane is off unless the local owner installs and approves its repository policy and managed runtime.
+It watches one exact README heading on protected `main` and accepts no other edit, target, or source of tasks.
+It does not change the regular PR trust level or use the one-shot pilot's receipts.
+`arete zte status --dry-run` reads the signal without creating a task, and `arete zte status` shows the recorded delivery phase and evidence.
+`arete zte pause` stops new effects at the local interlock; a GitHub write already sent may still land.
+The worker reconciles that result by reading, not by retrying a write or reverting Git history.
+GitHub pins the squash head but not the target or target tip, so a landing with the wrong target, parent, or tree is never deployed.
+
+Install the launchd supervisor outside the selectable releases and migrate to the current schema during bootstrap, before enabling the policy.
+From that private, pinned checkout, `python -m arete.zte_release write-launch-agents` writes the service and release-agent plists without loading them.
+The installation must already have a private release profile, a verified selector, and a healthy known-good runtime matching protected `main`.
+Before squashing, the lane checks that the last-good runtime is healthy and the release worker is loaded.
+The worker keeps the previous runtime until it sees two fresh authenticated HTTPS health beats on the replacement.
+On an unhealthy activation it restores the last-good runtime, checks that runtime's health and pauses the lane without changing Git or rolling back the database.
+
+A later violation can open a new task only after a healthy delivery, an intervening conforming observation, and the daily quota reset.
+The protected `main` tip must already be running in the managed installation; ZTE never deploys unrelated changes to make a finding eligible.
+Advance that baseline through the normal reviewed release process, not by editing the selector to bypass health checks.
+A held, uncertain, or rolled-back delivery does not rearm automatically.
+If recovery cannot verify the database, the worker stops the managed service and leaves run admission closed.
+Keep its evidence and the Stop latch in place; inspect the remote state and recover the installation separately.
+There is no command to clear the ledger or retry that shipment under the old authorization.
+
 ## Steps
 
 Each pipeline step reads its own model, runner, effort, timeout, tries, tools, MCP servers, instructions and session: plan, build (also revise, the fixes and the CI fixes), verify, review, learn, uat and document. `arete steps` prints what each step resolves to, one JSON line per step. `--repo NAME` reads that repo's layer too, and `--kind feat` or `--kind fix` resolves for that kind of ticket.

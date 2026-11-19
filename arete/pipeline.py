@@ -459,6 +459,10 @@ class Run(AgentRun):
         if not self.asks_owner:
             return super().agent(step, text, cwd, role, **kw)
         due = self.due_for(step)
+        if kw.get("native_observation"):
+            if due:
+                raise RuntimeError("a pending owner decision precludes unattended native verification")
+            return super().agent(step, text, cwd, role, **kw)
         if due:
             text, kw = self.with_answers(due, text, kw)
         res = super().agent(step, text, cwd, role, ask_owner=True, **kw)
@@ -1242,7 +1246,9 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
     paths.ensure_dirs()
     cfg = config.load()
     repo = cfg.repo(repo_name)
-    from . import flows, pilot
+    from . import flows, pilot, zte
+    from .store import zte as zte_store
+
     adw, refusal = run_refusal(repo, script is not None)
     if refusal:
         print(refusal)
@@ -1269,6 +1275,13 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         try:
             layer = config.load_layer(repo.layer_dir)
             wall_deadline = math.inf
+            zte_grant = None
+            if zte.reserved(str(tid)):
+                pilot.require(script and script.path == "orchestrate" and not any(
+                    (dry_run, force, script.continues, script.only, script.again, script.repairs, script.action,
+                     script.overrides, closed_context)), "ZTE requires its original scheduled orchestration")
+                zte_grant = zte.admit_run(cfg, repo, str(tid))
+                wall_deadline = zte.wall_deadline(zte_grant)
             if pilot.is_pilot_task(str(tid)):
                 from .orchestration import policy_fingerprint
 
@@ -1286,7 +1299,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             print(f"could not read {name}: {e}")
             return 2
         except pilot.Held as e:
-            print(f"could not admit the one-shot task: {e}")
+            print(f"could not admit the reserved README task: {e}")
             return 2
         except (ValueError, OSError) as e:
             print(f"could not validate the process budget: {e}")
@@ -1297,6 +1310,12 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         if script and script.repairs and (later := run_store.later_run(repo.name, tid, script.repairs)):
             print(f"run {later['id']} of {name} came after run {script.repairs}, so it is not repaired twice")
             return 1
+        if zte_grant:
+            try:
+                zte.require_launch_base(zte_grant)
+            except (OSError, RuntimeError, ValueError) as error:
+                print(f"could not start the reserved README task: {error}")
+                return 2
         with slots.admitting():
             slot = slots.RunSlot(repo.name, str(tid), cfg.max_parallel)
             only = (script.only or (script.action if script.action_only else "")) if script else ""
@@ -1304,7 +1323,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             if not dry_run:
                 if slots.slots_free_to_start(cfg.max_parallel) > 0:
                     slot.hold()
-                elif not due:
+                elif not due or zte_store.activation_pending():
                     print(f"{name} was not started: {slots.no_free_slot(cfg.max_parallel)}. Wait for a run to "
                           f"finish or raise max_parallel in {paths.short_path(paths.CONFIG_FILE)}.")
                     return 1
@@ -1322,8 +1341,32 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     print(f"could not admit the one-shot task: {e}")
                     slot.free()
                     return 2
-            run_id = record.start("pipeline", tag=f"{repo.name}-{tid}", lock=lock, repo=repo.name, issue=tid,
-                                  only_step=only)
+            def start():
+                return record.start("pipeline", tag=f"{repo.name}-{tid}", lock=lock, repo=repo.name, issue=tid,
+                                    only_step=only)
+
+            if zte_grant:
+                from . import launch_lease
+                from .store import db
+
+                try:
+                    with util.lock(zte.INTERLOCK, wait=True):
+                        fresh_grant = zte.admit_run(config.load(), repo, str(tid))
+                        pilot.require(fresh_grant == zte_grant, "ZTE authorization changed before run start")
+                        with db.tx():
+                            run_id = start()
+                            zte_store.transition(fresh_grant, "running", run=run_id)
+                        try:
+                            launch_lease.registered(repo.name, str(tid))
+                        except PermissionError:
+                            record.settle(run_id, "failed", summary="could not release the scheduled launch lease")
+                            raise
+                except (OSError, RuntimeError, ValueError) as error:
+                    print(f"could not start the reserved README task: {error}")
+                    slot.free()
+                    return 2
+            else:
+                run_id = start()
             scratch.RUN_BASELINES[run_id] = producer_baseline
             scratch.RUN_LABELS[run_id] = service_labels
             run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force,
@@ -2742,11 +2785,13 @@ def check_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
 
 def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "verify",
                 require_released: bool = False, **values) -> verify.Verified:
-    from . import pilot, readme_verify
+    from . import pilot, readme_verify, zte
 
     run, v = b.run, verify.with_free_ports(b.layer.verify)
-    pilot_task = pilot.is_pilot_task(str(run.tid)) and prompt_name == role == "verify"
-    merge_candidate = b.layer.trust_level == "automerge" or pilot_task
+    tid = str(run.tid)
+    zte_verify = zte.reserved(tid) and prompt_name == role == "verify"
+    readme_task = (pilot.is_pilot_task(tid) and prompt_name == role == "verify") or zte_verify
+    merge_candidate = b.layer.trust_level == "automerge" or readme_task
     checked_trees = verification_trees(b) if prompt_name == role == "verify" and merge_candidate else {}
     step = b.next_step(step_name)
     if refusal := verify.port_refusal(v):
@@ -2760,11 +2805,15 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
             ready.saved = os.path.abspath(run.dir / f"{step}-preflight.md")
             run.save(f"{step}-preflight.md", ready.markdown())
             return ready
-    if pilot_task and not (v.start or v.probes):
+    if readme_task and not (v.start or v.probes):
         try:
-            receipt = pilot.live_receipt(str(run.tid), run.repo.name)
+            if zte_verify:
+                grant, policy = zte.for_run(run.repo, tid, run.id, "running")
+                signal = policy.signal(grant.base)
+            else:
+                signal = pilot.Signal(**pilot.live_receipt(tid, run.repo.name)["signal"])
             pilot.require(checked_trees.keys() == {""}, "the README verifier requires one exact candidate tree")
-            verified = readme_verify.check(run, b.ws, step, pilot.Signal(**receipt["signal"]), checked_trees[""])
+            verified = readme_verify.check(run, b.ws, step, signal, checked_trees[""])
             if verified.verdict == "pass":
                 pilot.require(checked_trees == verification_trees(b), "the candidate tree changed during verification")
                 verified.native_trees = checked_trees

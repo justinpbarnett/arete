@@ -99,10 +99,12 @@ export default function (pi) {
         metadata.roots.push(agent);
         metadata.files.push(auth, auth + ".lock", canonical(auth), canonical(auth) + ".lock");
     }
-    if (metadata.shell) {
+    if (metadata.shell_tool) {
         pi.on("before_agent_start", () => {
-            const shell = pi.getAllTools().find(tool => tool.name === "bash");
-            if (!shell?.sourceInfo?.path || resolve(shell.sourceInfo.path) !== resolve(metadata.shell_file)) {
+            const shell = pi.getAllTools().find(tool => tool.name === metadata.shell_tool);
+            const active = pi.getActiveTools();
+            if (!active.includes(metadata.shell_tool) || active.includes("bash") || active.includes("powershell")
+                || !shell?.sourceInfo?.path || resolve(shell.sourceInfo.path) !== resolve(metadata.shell_file)) {
                 writeSync(2, "Arete refused an unguarded shell implementation.\n");
                 process.exit(78);
             }
@@ -167,7 +169,9 @@ export default function (pi) {
         });
     }
     pi.on("tool_call", (event, ctx) => {
-        if (event.toolName === "ask_owner" || (event.toolName === "bash" && metadata.shell)) return undefined;
+        if (event.toolName === "ask_owner" || (metadata.shell_tool && event.toolName === metadata.shell_tool)) {
+            return undefined;
+        }
         try {
             if (!tools.has(event.toolName)) return { block: true, reason };
             const writing = event.toolName === "edit" || event.toolName === "write";

@@ -207,6 +207,8 @@ class Server:
         self.polls: dict[str, Future] = {}
         self.sweep: Future | None = None
         self.oncall: Future | None = None
+        self.zte_work: Future | None = None
+        self.zte_at = 0.0
         self.oncall_error = ""
         self.tried: dict[str, float] = {}
         self.errors: dict[str, str] = {}
@@ -322,6 +324,7 @@ class Server:
             self.loaded = True
         self.guard("stage:forget", self.forget_unpolled_errors, self.live)
         self.guard("stage:oncall", self.watch_oncall)
+        self.guard("stage:zte", self.zte_when_due)
         self.guard("stage:dispatch", self.dispatch, {x.name: x for x in reversed(self.every_loop)})
         self.guard("stage:approvals", self.approvals)
         self.guard("stage:rotate", self.rotate_when_due)
@@ -340,6 +343,18 @@ class Server:
     def step_loop(self, loop: Loop, st: dict, now: datetime) -> None:
         self.schedule(loop, st, now)
         self.poll(loop)
+
+    def zte_when_due(self) -> None:
+        from . import zte, zte_delivery
+
+        if self.zte_work is not None:
+            if not self.zte_work.done():
+                return
+            finished, self.zte_work = self.zte_work, None
+            finished.result()
+        if time.monotonic() - self.zte_at >= zte.INTERVAL:
+            self.zte_at = time.monotonic()
+            self.zte_work = self.pool.submit(zte_delivery.tick, self.cfg)
 
     def approvals(self) -> None:
         for released in delivery.release_lapsed():
