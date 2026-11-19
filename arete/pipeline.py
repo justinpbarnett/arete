@@ -459,6 +459,10 @@ class Run(AgentRun):
         if not self.asks_owner:
             return super().agent(step, text, cwd, role, **kw)
         due = self.due_for(step)
+        if kw.get("native_observation"):
+            if due:
+                raise RuntimeError("a pending owner decision precludes unattended native verification")
+            return super().agent(step, text, cwd, role, **kw)
         if due:
             text, kw = self.with_answers(due, text, kw)
         res = super().agent(step, text, cwd, role, ask_owner=True, **kw)

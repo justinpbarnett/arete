@@ -323,7 +323,7 @@ def child_env(provider: str, available: dict, passing: list[str], providers: dic
     env = environment.build(names, {"ARETE_AGENT": "1"}, never=(*PARENT_SESSION_VARS, *never), source=available)
     for n in ("PI_CODING_AGENT_DIR", "ARETE_PI_GUARD_PATHS", "ARETE_PI_REFRESH_FD", "ARETE_PI_REFRESH_ACK_FD",
               "ARETE_PI_REFRESH_PROVIDER",
-              "ARETE_PI_SHELL_FD", "NODE_OPTIONS", "NODE_PATH"):
+              "ARETE_PI_SHELL_FD", "ARETE_PI_OBSERVE", "NODE_OPTIONS", "NODE_PATH"):
         env.pop(n, None)
     if not chosen_login and managed:
         env.update(managed.env)
@@ -589,12 +589,13 @@ def confinement(cwd: Path, add_dirs: list[Path], floor: guard.Floor, selected: R
 
 
 def command(names: list[str], *, model: str = "", effort: str = "", resume: Session = NO_SESSION, system: str = "",
-            persist: bool = True, add_dirs: list[Path] | None = None, ask_owner: bool = False) -> list[str]:
+            persist: bool = True, add_dirs: list[Path] | None = None, ask_owner: bool = False,
+            observe: bool = False) -> list[str]:
     cmd = [binary(), "-p", "--mode", "json", "--no-context-files", "--no-skills", "--no-extensions",
            "--no-prompt-templates", "--no-themes", "--no-approve", "--no-mcp", "--extension", str(GUARD_FILE)]
     if ask_owner:
         cmd += ["--extension", str(ASK_FILE)]
-    if pi_shell.TOOL in names:
+    if observe or pi_shell.TOOL in names:
         cmd += ["--extension", str(SHELL_FILE)]
     names = [*names, owner_asks.TOOL] if ask_owner else names
     cmd += ["--tools", ",".join(names)] if names else ["--no-tools"]
@@ -814,6 +815,7 @@ def _run(
     delegation_only: bool = False,
     judge: bool = False,
     read_roots: tuple[Path, ...] = (),
+    native_observation: str = "",
 ) -> Result:
     auth = auth if auth is not None else accounts.Auth("api_key")
     if mcp_servers(mcp_config):
@@ -829,21 +831,27 @@ def _run(
 
         floor = guard.floor(os.environ.get("ARETE_RUN_ID", ""), cwd, add_dirs)
     names = [name for name in tool_names(tools, allowed_tools, disallowed_tools) if name in GUARDED_TOOLS]
+    observing = bool(native_observation)
+    if observing and (names or ask_owner or persist or resume.id or add_dirs or delegation_only
+                      or auth.mode != "subscription" or not json_schema or not pi_shell.simple_command(native_observation)
+                      or f"Bash({native_observation})" not in (allowed_tools or [])):
+        raise ValueError("native observation requires a fresh tool-free subscription with one exact command")
     if delegation_only and (names or ask_owner or resume.id or json_schema is not None or system or add_dirs or read_roots or persist):
         raise ValueError("controller requires a fresh tool-free, non-restating invocation")
     if persist or resume.id:
         sandbox.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     launch_model = selected.model.partition("/")[2] if selected else model
     cmd = command(names, model=launch_model, effort=effort, resume=resume, system=system, persist=persist, add_dirs=add_dirs,
-                  ask_owner=ask_owner)
+                  ask_owner=ask_owner, observe=observing)
     if selected and selected.provider:
         cmd += ["--provider", selected.provider]
     if json_schema is not None:
         prompt = f"{prompt}\n\n{SCHEMA_RULE.format(schema=json.dumps(json_schema))}"
     confined = False
-    if writing := sorted(WRITING & set(names)):
+    writing = sorted(WRITING & set(names))
+    if writing or observing:
         if not sandbox.can_confine(False):
-            return Result(ok=False, error=f"{sandbox.NO_CONFINEMENT_REASON}, so pi cannot {', '.join(writing)} here",
+            return Result(ok=False, error=f"{sandbox.NO_CONFINEMENT_REASON}, so pi cannot run confined commands here",
                           session=resume, runner="pi", model=model)
         cmd = confinement(cwd, add_dirs, floor, selected) + cmd
         confined = True
@@ -857,11 +865,15 @@ def _run(
                        delegation_only=delegation_only, shell=pi_shell.TOOL in names),
            **({"ARETE_ASK_TOOL": json.dumps(owner_asks.pi_tool())} if ask_owner else {})}
     protection = json.loads(env["ARETE_PI_GUARD_PATHS"])
-    shell = (pi_shell.Shell(cwd, tuple(add_dirs), floor, tuple(allowed_tools or ()), tuple(disallowed_tools or ()),
+    env.pop("ARETE_PI_OBSERVE", None)
+    if observing:
+        env["ARETE_PI_OBSERVE"] = native_observation
+    allowed = (f"Bash({native_observation})",) if observing else tuple(allowed_tools or ())
+    shell = (pi_shell.Shell(cwd, tuple(add_dirs), floor, allowed, tuple(disallowed_tools or ()),
                             pi_shell.command_env(passing, extra_env, selected.hidden),
                             (selected.owner, folder, *selected.sensitive_files, *map(Path, protection["files"])),
                             judge, time.monotonic() + timeout, tuple(read_roots))
-             if pi_shell.TOOL in names else None)
+             if observing or pi_shell.TOOL in names else None)
     try:
         with refresh_channel(selected, env) as refresh, pi_shell.channel(shell, env) as terminal:
             descriptors = (*refresh, *terminal)
