@@ -176,6 +176,10 @@ TLS_CERT_FILE = STATE_DIR / "dashboard.crt"
 TLS_KEY_FILE = STATE_DIR / "dashboard.key"
 PUSH_KEY_FILE = STATE_DIR / "webpush.key"
 LOCKS_DIR = STATE_DIR / "locks"
+ZTE_AUTHORITY = CONFIG_DIR / "zte-authority"
+ZTE_STOP = STATE_DIR / "zte-paused.json"
+ZTE_REHEARSAL_INSTALL = STATE_DIR / "zte-managed"
+ZTE_LIVE_INSTALL = HOME / "Library/Developer/arete/zte-managed"
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 PROMPTS_DIR = PACKAGE_DIR / "prompts"

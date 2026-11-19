@@ -22,6 +22,7 @@ from . import (
     runlimits,
     util,
     workspace,
+    zte,
 )
 from .agent import NO_SESSION, Session, json_from_text
 from .orchestration_api import BUNDLES, PROTOCOL, Catalog, help_text
@@ -151,6 +152,11 @@ class Controller:
                 self.job.reviews = 1
                 self.job.goal += f"\n\nCheck the saved review findings are fixed:\n{found.review.findings()}"
                 self.job.left_for_a_person = found.left_for_a_person
+        if zte.reserved(str(self.run.tid)):
+            grant, policy = zte.for_run(self.run.repo, str(self.run.tid), self.run.id, "running")
+            zte.check_checkout(grant, policy, self.run.repo, self.job.checkouts)
+            if self.job.left_for_a_person or self.run.feedback or self.run.repairs or self.flow.continues:
+                raise factory.Refused("ZTE does not inherit owner work or previous attempts")
         self.data.setdefault("goal_base", self.job.goal)
         known = {(f.get("pr_url"), f.get("kind"), f.get("gh_id")) for f in self.data.get("feedback", [])}
         fresh = [f for f in self.run.feedback if (f.get("pr_url"), f.get("kind"), f.get("gh_id")) not in known]
@@ -469,6 +475,10 @@ class Controller:
         if self.run.dry_run:
             self.ending = flows.end_dry_run(self.flow)
             return {"status": "dry-run"}
+        if zte.reserved(str(self.run.tid)):
+            grant = zte.prepare_candidate(self.run, self.job, self.data)
+            self.ending = ("pr", "Prepared an exact README candidate for engine-owned delivery", "")
+            return {"prepared_head": grant.data["head"], "tree": grant.data["tree"]}
         self.check_pilot_publication()
         self.data["publication_intent"] = {"tree": self.fingerprint()}
         self.persist()
@@ -600,6 +610,8 @@ class Controller:
             self.stamp(role, result)
             return {"operation_passed": outcome.passed, **result}
         if op == "owner.ask":
+            if zte.reserved(str(self.run.tid)):
+                raise ValueError("the standing README lane cannot request owner intervention; stop without delivery")
             ask, errors = owner_asks.validate(args["request"])
             if errors:
                 raise ValueError("; ".join(errors))

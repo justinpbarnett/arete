@@ -140,14 +140,11 @@ def passed() -> None:
         lease.passed = True
 
 
-def registered(repo: str, tid: str) -> None:
-    message = os.environ.get(ENV)
-    if not message:
-        return
+def verify(repo: str, tid: str, *, release: bool = False) -> None:
     try:
-        owner, ticket, fd, device, inode, nonce = json.loads(message)
+        owner, ticket, fd, device, inode, nonce = json.loads(os.environ.get(ENV, ""))
         if (owner, ticket) != (repo, str(tid)):
-            return
+            raise ValueError("incorrect task lease")
         if any(type(n) is not int for n in (fd, device, inode)) or fd < 3 or not isinstance(nonce, str):
             raise ValueError("invalid descriptor identity")
         st = os.fstat(fd)
@@ -162,8 +159,22 @@ def registered(repo: str, tid: str) -> None:
             # must already own the lock. An arbitrary open FD cannot release it.
             if take(probe) or not take(fd):
                 raise ValueError("descriptor does not hold this launch lease")
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
-        os.environ.pop(ENV, None)
+            if release:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        if release:
+            os.close(fd)
+            os.environ.pop(ENV, None)
     except (OSError, ValueError, TypeError) as e:
         raise PermissionError("invalid inherited task launch lease") from e
+
+
+def registered(repo: str, tid: str) -> None:
+    message = os.environ.get(ENV)
+    if not message:
+        return
+    try:
+        owner, ticket, _fd, _device, _inode, _nonce = json.loads(message)
+    except (ValueError, TypeError) as e:
+        raise PermissionError("invalid inherited task launch lease") from e
+    if (owner, ticket) == (repo, str(tid)):
+        verify(repo, tid, release=True)

@@ -1,0 +1,232 @@
+from __future__ import annotations
+
+from contextlib import nullcontext
+from dataclasses import asdict
+from datetime import timedelta
+from pathlib import Path
+
+from . import config, delegation, jev, launch_lease, pilot, record, scratch, util, workspace, zte
+from .store import db, orchestration
+from .store import zte as store
+from .zte_github import GitHub, Identity
+
+INTENTS = {"push_intent", "pr_intent", "merge_intent"}
+
+
+def settled(delivery, policy, repo, layer) -> bool:
+    data = delivery.data
+    run = pilot.scheduled_run(delivery.repo, delivery.task)
+    if run and not run.get("finished"):
+        return False
+    pilot.require(run and (run["id"], run["status"]) == (data["run"], "pr"),
+                  "the original run did not settle an exact candidate")
+    row = orchestration.find(run["id"])
+    pilot.require(row and row["root"] == row["current_run"] == run["id"] and row["generation"] == 1,
+                  "the original run generation changed")
+    if util.pid_alive(row["owner"]):
+        return False
+    lease = orchestration.Lease(run["id"], run["id"], 1)
+    actions = orchestration.actions(lease)
+    completed = [a for a in actions if a["op"] == "publication.request" and a["state"] == "succeeded"]
+    pilot.require(not orchestration.pending(lease) and len(completed) == 1
+                  and completed[0]["result"].get("prepared_head") == data["head"]
+                  and all(a["state"] in ("succeeded", "failed", "cancelled") and a["op"] != "owner.ask"
+                          and not delegation.live(a["result"].get("pid"), a["result"].get("identity")) for a in actions),
+                  "the candidate has an unresolved or live producer")
+    checkout = zte.check_checkout(delivery, policy, repo, [workspace.Checkout.from_row(c)
+        for c in row["data"].get("prepared", {}).get("checkouts", [])])
+    where = Path(data["worktree"])
+    pilot.require(checkout.wt == where and not scratch.pending(where), "the workspace or producer state changed")
+    signal = policy.signal(delivery.base)
+    pilot.require(zte.task_version(delivery, signal, "pr") == data["pr_task_version"],
+                  "the ZTE task changed after candidate preparation")
+    pilot.require(pilot.git(where, "rev-parse", "HEAD").strip() == data["head"]
+                  and pilot.exact_edit(where, signal, data["head"], signal.expected(pilot.readme(where, signal.base)))
+                  == data["tree"] and not pilot.git(where, "status", "--porcelain", "--untracked-files=all"),
+                  "the exact ZTE candidate changed after preparation")
+    pilot.require_evidence(row["data"], policy.identity.name, data["tree"], layer.checks)
+    return True
+
+
+def check_stop(delivery, policy, *, engine: str = "") -> None:
+    pilot.require(store.find(delivery.task) == delivery and zte.active(delivery, engine=engine) == policy,
+                  "ZTE authority changed")
+    pilot.require(not record.stop_asked(delivery.data["run"]), "the original run was stopped")
+    pilot.require(zte.task_version(delivery, policy.signal(delivery.base), "pr") == delivery.data["pr_task_version"],
+                  "the reserved task changed before an external effect")
+
+
+def require_landing(delivery, client, expected: str = "", observed: dict | None = None) -> dict:
+    data = delivery.data
+    pull = client.pull(data["pr"])
+    if observed is not None:
+        observed.update({"pr": data["pr"], "merged": pull.get("merged"), "sha": pull.get("merge_commit_sha"),
+                         "target": (pull.get("base") or {}).get("ref"), "head": (pull.get("head") or {}).get("sha"),
+                         "actor": (pull.get("merged_by") or {}).get("id")})
+    client.require_pull(pull, node=data["pr_node"], head=data["head"], branch=data["branch"])
+    landed = pull.get("merge_commit_sha") or ""
+    pilot.require(pull.get("state") == "closed" and pull.get("merged") is True and pilot.SHA.fullmatch(landed)
+                  and (pull.get("merged_by") or {}).get("id") == client.identity.bot
+                  and (not expected or expected == landed) and pull.get("merged_at")
+                  and util.parse_iso(pull["merged_at"]) >= util.parse_iso(data["merge_sent_after"]),
+                  "GitHub has not confirmed the exact squash and delivery identity")
+    commit = client.commit(landed)
+    pilot.require(commit.get("tree", {}).get("sha") == data["tree"]
+                  and [p["sha"] for p in commit["parents"]] == [delivery.base] and client.tip() == landed,
+                  "the observed landing has a different parent, tree or current main")
+    return {"release": landed, "merge_actor": pull["merged_by"]["id"], "merged_at": pull["merged_at"]}
+
+
+def settle_pr(delivery, client) -> None:
+    data = delivery.data
+    found = client.branch_prs(data["branch"])
+    pilot.require(len(found) == 1, "GitHub did not confirm a unique PR; no creation retry")
+    pull = found[0]
+    client.require_pull(pull, node=pull["node_id"], head=data["head"], branch=data["branch"])
+    pilot.require(pull.get("state") == "open" and pull.get("draft") is False
+                  and pull.get("base", {}).get("sha") == delivery.base and pull.get("created_at")
+                  and util.parse_iso(pull["created_at"]) >= util.parse_iso(data["pr_sent_after"]),
+                  "GitHub did not confirm the authorized fresh PR")
+    returned = data.get("created_pr")
+    pilot.require(not returned or returned == pull["node_id"], "GitHub returned another PR after creation")
+    with db.tx():
+        store.transition(delivery, "pr_ready", pr=pull["number"], pr_node=pull["node_id"], pr_url=pull["html_url"])
+        record.note(data["run"], branch=data["branch"], pr_url=pull["html_url"])
+
+
+def ready_to_squash(delivery, client) -> bool:
+    data = delivery.data
+    pull = client.pull(data["pr"])
+    client.require_pull(pull, node=data["pr_node"], head=data["head"], branch=data["branch"])
+    return client.readiness(pull, delivery.base)
+
+
+def send_next(delivery, policy, client, cfg, repo) -> None:
+    data = delivery.data
+    branch, head, tree = data["branch"], data["head"], data["tree"]
+    where = Path(data["worktree"])
+    proof = risk = None
+    ci_scope = {"base": delivery.base, "pr": data.get("pr", 0), "branch": branch}
+    if delivery.phase == "pr_ready":
+        from . import zte_release
+
+        proof = client.ci(head, tree, "pull_request", **ci_scope)
+        if not proof or not ready_to_squash(delivery, client):
+            return
+        pilot.require(jev.ready(cfg, [repo]), "JEV is unavailable for this exact patch")
+        patch = pilot.git(where, "diff", "--no-ext-diff", "--no-textconv", delivery.base, head)
+        pilot.require(patch, "the exact patch is not available to JEV")
+        result = jev.risk(patch, policy.signal(delivery.base).task(), cfg, trace=(data["run"], "ZTE exact patch"))
+        pilot.require(not result.hold, result.hold)
+        risk = {**asdict(result), "patch": orchestration.digest(patch), "tree": tree, "head": head,
+                "model": cfg.jev.model, "risk_hold": cfg.jev.risk_hold,
+                "irreversible_hold": cfg.jev.irreversible_hold, "at": util.iso()}
+        zte_release.preflight(delivery, policy)
+    source = client.push_source(where, head, tree, delivery.base) if delivery.phase == "prepared" else nullcontext()
+    with source as isolated:
+        send_authorized(delivery, policy, client, isolated, proof, risk, ci_scope)
+
+
+def send_authorized(delivery, policy, client, isolated, proof, risk, ci_scope) -> None:
+    data = delivery.data
+    branch, head, tree = data["branch"], data["head"], data["tree"]
+    token = client.token()
+    policy.audit(client)
+    if proof:
+        pilot.require(client.ci(head, tree, "pull_request", **ci_scope) == proof,
+                      "CI provenance changed during risk screening")
+    if delivery.phase == "prepared":
+        pilot.require(not client.branch_head(branch) and client.tip() == delivery.base,
+                      "the reserved branch exists or protected main moved before push")
+    elif delivery.phase == "pushed":
+        pilot.require(client.branch_head(branch) == head and not client.branch_prs(branch)
+                      and client.tip() == delivery.base, "the reserved branch, PR or base changed after push")
+    else:
+        pilot.require(delivery.phase == "pr_ready" and proof and risk, "no authorized ZTE squash")
+        if not ready_to_squash(delivery, client):
+            return
+    with util.lock(zte.INTERLOCK) as got:
+        if not got:
+            return
+        pilot.require(zte.settings(config.load(), policy)[2] == data["config"], "ZTE configuration changed")
+        check_stop(delivery, policy)
+        if delivery.phase == "prepared":
+            store.transition(delivery, "push_intent", push_sent_after=util.iso())
+            client.push(isolated, branch, head, token)
+        elif delivery.phase == "pushed":
+            intent = store.transition(delivery, "pr_intent", pr_sent_after=util.iso())
+            created = client.create(branch, pilot.TASK_TITLE, policy.signal(delivery.base).task(), token)
+            if isinstance(created.get("node_id"), str):
+                store.annotate(intent, created_pr=created["node_id"])
+        else:
+            intent = store.transition(delivery, "merge_intent", pr_ci=proof, risk=risk, merge_sent_after=util.iso())
+            reply = client.squash(data["pr"], head, token)
+            if reply.get("merged") is True and pilot.SHA.fullmatch(reply.get("sha") or ""):
+                store.annotate(intent, returned_merge=reply["sha"])
+
+
+def reconcile(delivery, client, observed: dict) -> None:
+    if delivery.phase == "push_intent":
+        pilot.require(client.branch_head(delivery.data["branch"]) == delivery.data["head"],
+                      "the exact push effect is not observable; no retry")
+        store.transition(delivery, "pushed")
+    elif delivery.phase == "pr_intent":
+        settle_pr(delivery, client)
+    else:
+        store.transition(delivery, "merged", **require_landing(delivery, client,
+                         expected=delivery.data.get("returned_merge", ""), observed=observed))
+
+
+def advance(cfg) -> None:
+    delivery = store.latest()
+    if not delivery or delivery.phase in store.TERMINAL | {"release_ready", "deploy_intent", "rollback_intent"}:
+        return
+    observed: dict = {}
+    if delivery.phase in INTENTS:
+        timestamp = delivery.data[f"{delivery.phase.removesuffix('_intent')}_sent_after"]
+        until = util.parse_iso(timestamp) + timedelta(minutes=3)
+        try:
+            identity = Identity(**delivery.data["github"])
+            client = GitHub(identity, util.iso(max(until, util.now() + timedelta(seconds=25))), Path("/dev/null"))
+            reconcile(delivery, client, observed)
+        except (OSError, RuntimeError, ValueError, TypeError, KeyError) as error:
+            if util.now() >= until or (observed.get("merged") and observed.get("target") != "main"):
+                zte.hold(delivery, error, uncertain=True, **({"observed_landing": observed} if observed else {}))
+        return
+    try:
+        policy = zte.active(delivery)
+        repo, layer, digest = zte.settings(cfg, policy)
+        pilot.require(repo.name == delivery.repo and digest == delivery.data["config"], "ZTE configuration changed")
+        client = policy.client(delivery.deadline)
+        if delivery.phase == "queued":
+            return
+        if delivery.phase == "dispatching":
+            if not launch_lease.held(delivery.repo, delivery.task):
+                pilot.require(store.find(delivery.task) != delivery, "the scheduled child exited before registration")
+            return
+        if delivery.phase == "running":
+            run = pilot.scheduled_run(delivery.repo, delivery.task)
+            pilot.require(run and not run.get("finished"), "the run stopped before preparing an exact candidate")
+            return
+        if not settled(delivery, policy, repo, layer):
+            return
+        if delivery.phase == "merged":
+            policy.audit(client)
+            release = delivery.data["release"]
+            require_landing(delivery, client, release)
+            proof = client.ci(release, delivery.data["tree"], "push")
+            if proof:
+                store.transition(delivery, "release_ready", release_ci=proof)
+        else:
+            send_next(delivery, policy, client, cfg, repo)
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError) as error:
+        current = store.find(delivery.task)
+        if current == delivery:
+            zte.hold(current, error)
+
+
+def tick(cfg) -> None:
+    with util.lock(zte.DELIVERY_LOCK) as got:
+        if got:
+            advance(cfg)
+    zte.finder(cfg)
