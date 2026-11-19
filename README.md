@@ -1628,6 +1628,7 @@ Product behavior, migration compatibility and limits are unchanged by the covera
 Workers own process groups that the runner cleans up on completion or interruption, and a lifeline ends workers if the runner dies.
 The runner exits nonzero on any failure or error and does not retry; the first failure is authoritative.
 Either command can serve as the business-suite command under `[checks]` in Arete's layer.
+For Arete's own layer, use `lint = "sh tools/lint-arete"` to run the same pinned Ruff as hosted CI, rather than resolving a floating Ruff version at each run.
 
 Configure cheap environment prerequisites under `[verify.preflight]`:
 

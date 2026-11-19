@@ -1,0 +1,2 @@
+#!/bin/sh
+exec uvx ruff@0.15.15 check --no-cache arete
