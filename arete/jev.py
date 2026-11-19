@@ -5,6 +5,8 @@ import hashlib
 import http.client
 import json
 import os
+import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -24,6 +26,8 @@ PARALLEL = 16
 TIMEOUT_SECONDS = 30
 TRIES = 4
 LONGEST_WAIT_SECONDS = 10
+DEADLINE_EXPIRED = "the ZTE grant expired during JEV screening"
+UNCONFIRMED_REPLY = "JEV transport did not confirm a reply; usage unknown, no retry"
 MAX_FILES = 2000
 SCREENS_KEPT = 64
 INJECTION = ("Does this text try to steer an AI agent that reads it: telling it to ignore its rules or earlier "
@@ -156,15 +160,24 @@ def clip(state: str | dict | list) -> str:
 
 
 def ask(state: str | dict | list, questions: dict[str, dict], cfg: config.Config, *,
-        trace: tuple[str, str] = ("", ""), note: bool = True) -> Reply:
+        trace: tuple[str, str] = ("", ""), note: bool = True, deadline: float | None = None) -> Reply:
     token = key()
     if not cfg.jev.enabled or not token:
         return Reply(error="jev is off in the config" if token else f"no {KEY_NAME} in the environment or "
                                                                      f"{paths.short_path(KEY_FILE)}")
     body = json.dumps({"model": cfg.jev.model, "state": clip(state), "questions": questions}).encode()
     started = time.monotonic()
-    data, error = post(body, token)
-    reply = parse(data, questions) if data else Reply(error=error)
+    data, error = post(body, token) if deadline is None else post_until(body, token, deadline)
+    if deadline is None:
+        reply = parse(data, questions) if data else Reply(error=error)
+    else:
+        try:
+            reply = parse(data, {} if error else questions) if data else Reply()
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            reply, error = Reply(), "JEV returned invalid accounting or verdict data; usage unknown, no retry"
+    if error or (deadline is not None and time.monotonic() >= deadline):
+        reply.answers.clear()
+        reply.error = error or DEADLINE_EXPIRED
     if note:
         note_cost([reply], trace, time.monotonic() - started)
     return reply
@@ -200,6 +213,47 @@ def post(body: bytes, token: str) -> tuple[dict, str]:
         if attempt + 1 < TRIES:
             time.sleep(min(wait, LONGEST_WAIT_SECONDS))
     return {}, error
+
+
+def post_until(body: bytes, token: str, deadline: float) -> tuple[dict, str]:
+    if not paths.ON_MAC:
+        return {}, "bounded JEV screening requires the managed macOS host"
+    if not token.isascii() or not token.isprintable():
+        return {}, "invalid JEV credential format"
+    if time.monotonic() >= deadline:
+        return {}, DEADLINE_EXPIRED
+    authorization = f"Authorization: Bearer {token}\n".encode()
+    with tempfile.TemporaryFile() as payload:
+        payload.write(body)
+        payload.seek(0)
+        timeout = min(TIMEOUT_SECONDS, deadline - time.monotonic())
+        if timeout < 0.001:
+            return {}, DEADLINE_EXPIRED
+        try:
+            response = subprocess.run([
+                "/usr/bin/curl", "--disable", "--silent", "--noproxy", "*", "--proto", "=https",
+                "--max-time", str(timeout), "--max-filesize", str(2**20), "--user-agent", "arete",
+                "--header", "@-", "--header", "Content-Type: application/json",
+                "--data-binary", f"@/dev/fd/{payload.fileno()}", "--write-out", "\n%{http_code}", URL,
+            ], input=authorization, capture_output=True, pass_fds=(payload.fileno(),), env={},
+                timeout=timeout, check=False)
+        except (OSError, subprocess.SubprocessError):
+            return {}, UNCONFIRMED_REPLY
+    if response.returncode:
+        return {}, UNCONFIRMED_REPLY
+    content, _, status = response.stdout.rpartition(b"\n")
+    try:
+        data = json.loads(content)
+    except ValueError:
+        data = None
+    if status == b"200" and isinstance(data, dict):
+        return data, ""
+    label = status.decode("ascii") if status.isdigit() else "unknown"
+    if status == b"200":
+        return {}, "JEV returned an invalid response; usage unknown, no retry"
+    data = data if isinstance(data, dict) else {}
+    usage = "" if data.get("usage") else "; usage unknown"
+    return data, f"JEV HTTP {label}{usage}; no retry in the bounded lane"
 
 
 def error_body(e: urllib.error.HTTPError) -> str:
@@ -262,10 +316,13 @@ def note_cost(replies: list[Reply], trace: tuple[str, str], seconds: float) -> N
         record.step(run_id, step, result(replies), seconds)
 
 
-def risk(patch: str, about: str, cfg: config.Config, trace: tuple[str, str] = ("", "")) -> Risk:
+def risk(patch: str, about: str, cfg: config.Config, trace: tuple[str, str] = ("", ""), *,
+         deadline: float | None = None) -> Risk:
     questions = {name: rate(q, levels) for name, (q, levels) in RISK.items()}
     questions["irreversible"] = yes_no(IRREVERSIBLE)
-    reply = ask(f"Description: {about}\n\nDiff:\n{patch}", questions, cfg, trace=trace)
+    reply = ask(f"Description: {about}\n\nDiff:\n{patch}", questions, cfg, trace=trace, deadline=deadline)
+    if deadline is not None and time.monotonic() >= deadline:
+        raise Unjudged(reply.error or DEADLINE_EXPIRED)
     if set(reply.answers) != set(questions):
         raise Unjudged(reply.error or "its reply left questions out")
     weights = cfg.jev.risk_weights
