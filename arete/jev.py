@@ -4,6 +4,7 @@ import glob
 import hashlib
 import http.client
 import json
+import math
 import os
 import subprocess
 import tempfile
@@ -173,12 +174,14 @@ def ask(state: str | dict | list, questions: dict[str, dict], cfg: config.Config
     else:
         try:
             reply = parse(data, {} if error else questions) if data else Reply()
+            if reply.tokens_in < 0 or reply.tokens_in >= 2**63 or not math.isfinite(reply.cost_usd) or reply.cost_usd < 0:
+                raise ValueError("invalid JEV usage")
         except (AttributeError, TypeError, ValueError, OverflowError):
             reply, error = Reply(), "JEV returned invalid accounting or verdict data; usage unknown, no retry"
     if error or (deadline is not None and time.monotonic() >= deadline):
         reply.answers.clear()
         reply.error = error or DEADLINE_EXPIRED
-    if note:
+    if note and deadline is None:
         note_cost([reply], trace, time.monotonic() - started)
     return reply
 
@@ -317,10 +320,16 @@ def note_cost(replies: list[Reply], trace: tuple[str, str], seconds: float) -> N
 
 
 def risk(patch: str, about: str, cfg: config.Config, trace: tuple[str, str] = ("", ""), *,
-         deadline: float | None = None) -> Risk:
+         deadline: float | None = None, account=None) -> Risk:
+    if deadline is not None and account is None:
+        raise ValueError("bounded JEV risk requires deferred accounting")
     questions = {name: rate(q, levels) for name, (q, levels) in RISK.items()}
     questions["irreversible"] = yes_no(IRREVERSIBLE)
-    reply = ask(f"Description: {about}\n\nDiff:\n{patch}", questions, cfg, trace=trace, deadline=deadline)
+    started = time.monotonic()
+    reply = ask(f"Description: {about}\n\nDiff:\n{patch}", questions, cfg, trace=trace,
+                deadline=deadline, note=account is None)
+    if account is not None:
+        account(result([reply]), time.monotonic() - started)
     if deadline is not None and time.monotonic() >= deadline:
         raise Unjudged(reply.error or DEADLINE_EXPIRED)
     if set(reply.answers) != set(questions):
