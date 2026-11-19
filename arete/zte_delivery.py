@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import time
 from contextlib import nullcontext
 from dataclasses import asdict
@@ -121,20 +122,44 @@ def send_next(delivery, policy, client, cfg, repo) -> None:
         patch = util.git(["diff", "--no-ext-diff", "--no-textconv", delivery.base, head], where,
                          timeout=min(remaining, 30), retry=False)
         pilot.require(patch, "the exact patch is not available to JEV")
+        delivery, risk = screen_patch(delivery, policy, cfg, patch, deadline)
+        zte_release.preflight(delivery, policy)
+    source = client.push_source(where, head, tree, delivery.base) if delivery.phase == "prepared" else nullcontext()
+    with source as isolated:
+        send_authorized(delivery, policy, client, isolated, proof, risk, ci_scope)
+
+
+def screen_patch(delivery, policy, cfg, patch: str, deadline: float):
+    data = delivery.data
+    subject = {"patch": orchestration.digest(patch), "tree": data["tree"], "head": data["head"],
+               "model": cfg.jev.model, "risk_hold": cfg.jev.risk_hold, "irreversible_hold": cfg.jev.irreversible_hold}
+    if (receipt := data.get("jev_receipt")) is not None:
+        pilot.require(data.get("jev_attempt", {}).get("subject") == subject and not receipt["hold"]
+                      and all(receipt.get(key) == value for key, value in subject.items()),
+                      "the exact JEV receipt no longer matches the candidate")
+        return delivery, receipt
+    pilot.require("jev_attempt" not in data, "JEV attempt has no confirmed verdict; no retry")
+
+    def check_deadline():
+        pilot.require(time.monotonic() < deadline, jev.DEADLINE_EXPIRED)
+
+    with util.lock(zte.INTERLOCK) as got:
+        pilot.require(got, "the Stop interlock is busy before JEV screening")
+        with db.tx(timeout=0, before_commit=check_deadline):
+            check_stop(delivery, policy)
+            check_deadline()
+            delivery = store.annotate(delivery, jev_attempt={"subject": subject, "at": util.iso()})
         try:
             result = jev.risk(patch, policy.signal(delivery.base).task(), cfg, trace=(data["run"], "ZTE exact patch"),
                               deadline=deadline)
         except jev.Unjudged as error:
             raise pilot.Held(f"JEV could not judge the exact patch: {error}") from error
-        pilot.require(time.monotonic() < deadline, jev.DEADLINE_EXPIRED)
+        check_deadline()
         pilot.require(not result.hold, result.hold)
-        risk = {**asdict(result), "patch": orchestration.digest(patch), "tree": tree, "head": head,
-                "model": cfg.jev.model, "risk_hold": cfg.jev.risk_hold,
-                "irreversible_hold": cfg.jev.irreversible_hold, "at": util.iso()}
-        zte_release.preflight(delivery, policy)
-    source = client.push_source(where, head, tree, delivery.base) if delivery.phase == "prepared" else nullcontext()
-    with source as isolated:
-        send_authorized(delivery, policy, client, isolated, proof, risk, ci_scope)
+        receipt = {**asdict(result), **subject, "at": util.iso()}
+        with db.tx(timeout=0, before_commit=check_deadline):
+            delivery = store.annotate(delivery, jev_receipt=receipt)
+    return delivery, receipt
 
 
 def send_authorized(delivery, policy, client, isolated, proof, risk, ci_scope) -> None:
@@ -230,9 +255,10 @@ def advance(cfg) -> None:
                 store.transition(delivery, "release_ready", release_ci=proof)
         else:
             send_next(delivery, policy, client, cfg, repo)
-    except (OSError, RuntimeError, ValueError, TypeError, KeyError) as error:
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError, sqlite3.Error) as error:
         current = store.find(delivery.task)
-        if current == delivery:
+        if current == delivery or (current and delivery.phase == current.phase == "pr_ready"
+                                   and "jev_attempt" in current.data and current.data.get("run") == delivery.data["run"]):
             zte.hold(current, error)
 
 

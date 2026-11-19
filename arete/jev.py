@@ -168,7 +168,13 @@ def ask(state: str | dict | list, questions: dict[str, dict], cfg: config.Config
     body = json.dumps({"model": cfg.jev.model, "state": clip(state), "questions": questions}).encode()
     started = time.monotonic()
     data, error = post(body, token) if deadline is None else post_until(body, token, deadline)
-    reply = parse(data, {} if error else questions) if data else Reply()
+    if deadline is None:
+        reply = parse(data, questions) if data else Reply(error=error)
+    else:
+        try:
+            reply = parse(data, {} if error else questions) if data else Reply()
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            reply, error = Reply(), "JEV returned invalid accounting or verdict data; usage unknown, no retry"
     if error or (deadline is not None and time.monotonic() >= deadline):
         reply.answers.clear()
         reply.error = error or DEADLINE_EXPIRED
@@ -245,7 +251,9 @@ def post_until(body: bytes, token: str, deadline: float) -> tuple[dict, str]:
     label = status.decode("ascii") if status.isdigit() else "unknown"
     if status == b"200":
         return {}, "JEV returned an invalid response; usage unknown, no retry"
-    return data if isinstance(data, dict) else {}, f"JEV HTTP {label}; no retry in the bounded lane"
+    data = data if isinstance(data, dict) else {}
+    usage = "" if data.get("usage") else "; usage unknown"
+    return data, f"JEV HTTP {label}{usage}; no retry in the bounded lane"
 
 
 def error_body(e: urllib.error.HTTPError) -> str:
