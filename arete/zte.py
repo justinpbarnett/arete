@@ -209,13 +209,14 @@ def for_run(repo: config.Repo, tid: str, run_id: str, *phases: str) -> tuple[sto
     return delivery, policy
 
 
-def check_checkout(delivery: store.Delivery, policy: Policy, repo: config.Repo, checkouts) -> workspace.Checkout:
+def check_checkout(delivery: store.Delivery, policy: Policy, repo: config.Repo, checkouts, *,
+                   until: float | None = None) -> workspace.Checkout:
     pilot.require(len(checkouts) == 1, "ZTE requires exactly one checkout")
     checkout = checkouts[0]
     pilot.require(checkout.github == policy.identity.name and checkout.base == "main" and not checkout.dir
                   and not any((checkout.pr, checkout.lease, checkout.resumes, checkout.merged_base))
                   and checkout.src.resolve() == repo.path.resolve(), "ZTE checkout does not match the approved origin")
-    pilot.check_origin(checkout.wt, policy.identity.name)
+    pilot.check_origin(checkout.wt, policy.identity.name, until=until)
     return checkout
 
 

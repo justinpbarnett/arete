@@ -21,6 +21,23 @@ JEV_USAGE_PENDING = paths.ZTE_AUTHORITY / "jev-response.pending"
 
 
 def settled(delivery, policy, repo, layer) -> bool:
+    until = zte.wall_deadline(delivery)
+    pilot.candidate_time_left(until, 1)
+    with db.one_read(timeout=0) as conn:
+        conn.set_progress_handler(lambda: int(time.monotonic() >= until), 1000)
+        try:
+            ready = validate_candidate(delivery, policy, repo, layer, until)
+        except sqlite3.OperationalError as error:
+            if error.sqlite_errorcode == sqlite3.SQLITE_INTERRUPT:
+                pilot.candidate_time_left(until, 1)
+            raise
+        finally:
+            conn.set_progress_handler(None, 0)
+    pilot.candidate_time_left(until, 1)
+    return ready
+
+
+def validate_candidate(delivery, policy, repo, layer, until: float) -> bool:
     data = delivery.data
     run = pilot.scheduled_run(delivery.repo, delivery.task)
     if run and not run.get("finished"):
@@ -41,16 +58,21 @@ def settled(delivery, policy, repo, layer) -> bool:
                           and not delegation.live(a["result"].get("pid"), a["result"].get("identity")) for a in actions),
                   "the candidate has an unresolved or live producer")
     checkout = zte.check_checkout(delivery, policy, repo, [workspace.Checkout.from_row(c)
-        for c in row["data"].get("prepared", {}).get("checkouts", [])])
+        for c in row["data"].get("prepared", {}).get("checkouts", [])], until=until)
     where = Path(data["worktree"])
+    pilot.candidate_time_left(until, 1)
     pilot.require(checkout.wt == where and not scratch.pending(where), "the workspace or producer state changed")
     signal = policy.signal(delivery.base)
+    pilot.candidate_time_left(until, 1)
     pilot.require(zte.task_version(delivery, signal, "pr") == data["pr_task_version"],
                   "the ZTE task changed after candidate preparation")
-    pilot.require(pilot.git(where, "rev-parse", "HEAD").strip() == data["head"]
-                  and pilot.exact_edit(where, signal, data["head"], signal.expected(pilot.readme(where, signal.base)))
-                  == data["tree"] and not pilot.git(where, "status", "--porcelain", "--untracked-files=all"),
+    pilot.require(pilot.git(where, "rev-parse", "HEAD", until=until).strip() == data["head"],
+                  "the exact ZTE candidate head changed after preparation")
+    expected = signal.expected(pilot.readme(where, signal.base, until=until))
+    pilot.require(pilot.exact_edit(where, signal, data["head"], expected, until=until) == data["tree"]
+                  and not pilot.git(where, "status", "--porcelain", "--untracked-files=all", until=until),
                   "the exact ZTE candidate changed after preparation")
+    pilot.candidate_time_left(until, 1)
     pilot.require_evidence(row["data"], policy.identity.name, data["tree"], layer.checks)
     return True
 
