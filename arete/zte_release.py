@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import http.client
 import json
 import os
 import plistlib
@@ -207,21 +206,24 @@ def health(install: Installation, sha: str, *, after: str = "", old_pid: int = 0
                                               str(paths.CONFIG_FILE)), "managed service address differs from the profile")
     pilot.require(service_pid(install, until=until) == pid and executable_matches(root, pid, until=until),
                   "heartbeat PID is not the selected managed launchd executable")
-    connection = http.client.HTTPSConnection(target.hostname, target.port, timeout=activation_timeout(until, 8))
-    try:
-        connection.request("GET", "/api/meta", headers={"Accept": "application/json"})
-        connection.sock.settimeout(activation_timeout(until, 8))
-        response = connection.getresponse()
-        if until is not None:
-            activation_time_left(until)
-        pilot.require(response.status == 200 and response.getheader("X-Arete-Engine") == sha[:12]
-                      and json.loads(response.read(2**18))["schema"]["version"] == install.schema,
-                      "authenticated HTTPS did not confirm the selected engine and schema")
-        if until is not None:
-            activation_time_left(until)
-    finally:
-        connection.close()
+    probe_https(install, sha, until=until)
     return {"at": beat["at"], "pid": pid, "engine": sha, "schema": install.schema, "https_status": 200}
+
+
+def probe_https(install: Installation, sha: str, *, until: datetime | None = None) -> None:
+    reason = "authenticated HTTPS did not confirm the selected engine and schema"
+    timeout = activation_timeout(until, 8)
+    result = subprocess.run([
+        "/usr/bin/curl", "--disable", "--noproxy", "*", "--proto", "=https", "--silent",
+        "--max-time", str(timeout), "--max-filesize", str(2**18), "--header", "Accept: application/json",
+        "--write-out", "\n%{response_code}\n%header{x-arete-engine}", f"{install.endpoint}/api/meta",
+    ], capture_output=True, timeout=timeout, check=False)
+    if until is not None:
+        activation_time_left(until)
+    pilot.require(result.returncode == 0, reason)
+    body, status, engine = result.stdout.rsplit(b"\n", 2)
+    pilot.require(status == b"200" and engine == sha[:12].encode()
+                  and json.loads(body)["schema"]["version"] == install.schema, reason)
 
 
 def failure_reason(error: Exception) -> str:
@@ -237,7 +239,7 @@ def fresh_health(install: Installation, sha: str, after: str, old_pid: int, chec
         check()
         try:
             beat = health(install, sha, after=after, old_pid=old_pid, until=until)
-        except (OSError, RuntimeError, ValueError, KeyError, http.client.HTTPException, subprocess.SubprocessError) as error:
+        except (OSError, RuntimeError, ValueError, KeyError, subprocess.SubprocessError) as error:
             reason = failure_reason(error)
             evidence.clear()
         else:
@@ -325,8 +327,7 @@ def preflight(delivery, policy) -> None:
                   "the admitted managed release profile changed")
     try:
         known_good(install, delivery.base)
-    except (OSError, RuntimeError, ValueError, KeyError, TypeError, http.client.HTTPException,
-            subprocess.SubprocessError) as error:
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         raise pilot.Held("the admitted last-good runtime or release worker is not healthy") from error
 
 
@@ -362,7 +363,7 @@ def reconcile_recovery(install: Installation, delivery, previous: str, known: Pa
             final = health(install, previous, after=after)
         except DatabaseUnhealthy:
             raise
-        except (OSError, RuntimeError, ValueError, KeyError, http.client.HTTPException, subprocess.SubprocessError):
+        except (OSError, RuntimeError, ValueError, KeyError, subprocess.SubprocessError):
             pass
         else:
             with db.tx():
@@ -444,7 +445,7 @@ def finish(install: Installation, delivery) -> None:
     with util.lock(zte.INTERLOCK) as got:
         if not got:
             return
-        with db.tx(timeout=activation_timeout(until, 2)):
+        with db.tx(timeout=0, before_commit=lambda: activation_time_left(until)):
             check()
             database(install, until=until)
             pilot.require(selected(install) == sha, "the selected runtime changed during validation")
@@ -452,7 +453,6 @@ def finish(install: Installation, delivery) -> None:
                           "the validated runtime exited or restarted before completion")
             activation_time_left(until)
             store.complete(delivery, data["pr_task_version"], release_health=beats, completion_health=final)
-            activation_time_left(until)
 
 
 def tick() -> int:
@@ -470,13 +470,12 @@ def tick() -> int:
                 finish(install, delivery)
             else:
                 restore(install, delivery)
-        except (OSError, RuntimeError, ValueError, TypeError, KeyError, sqlite3.Error, http.client.HTTPException,
-                subprocess.SubprocessError) as error:
+        except (OSError, RuntimeError, ValueError, TypeError, KeyError, sqlite3.Error, subprocess.SubprocessError) as error:
             current = store.find(delivery.task)
             if current and current.phase == "deploy_intent":
                 try:
                     restore(installation(current.data.get("installation")), current, reason=failure_reason(error))
-                except (OSError, RuntimeError, ValueError, TypeError, KeyError, http.client.HTTPException,
+                except (OSError, RuntimeError, ValueError, TypeError, KeyError, sqlite3.Error,
                         subprocess.SubprocessError) as rollback_error:
                     zte.hold(store.find(delivery.task), rollback_error, uncertain=True)
                     return 1

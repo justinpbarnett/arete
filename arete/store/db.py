@@ -27,12 +27,12 @@ class FixtureConnection(sqlite3.Connection):
 
 
 def connect_db(p: Path, readonly: bool = False, create: bool = False, *, streaming: bool = False,
-               timeout: float = 30) -> sqlite3.Connection:
+               timeout: float | None = None) -> sqlite3.Connection:
     if streaming and not readonly:
         raise ValueError("a streaming database connection must be read-only")
     if not paths.ISOLATED:
         mode = "ro" if readonly else "rwc" if create else "rw"
-        conn = sqlite3.connect(f"{p.absolute().as_uri()}?mode={mode}", uri=True, timeout=timeout)
+        conn = sqlite3.connect(f"{p.absolute().as_uri()}?mode={mode}", uri=True, timeout=30 if timeout is None else timeout)
         try:
             conn.execute("PRAGMA synchronous=NORMAL")
             return conn
@@ -41,8 +41,8 @@ def connect_db(p: Path, readonly: bool = False, create: bool = False, *, streami
             raise
     if not paths.ON_MAC or paths.confined(p) is None:
         raise PermissionError("isolated state requires a supported confined database path")
-    deadline = time.monotonic() + timeout
-    if getattr(DB_THREAD, "active", False) or not DB_LOCK.acquire(timeout=timeout):
+    deadline = None if timeout is None else time.monotonic() + timeout
+    if getattr(DB_THREAD, "active", False) or not DB_LOCK.acquire(timeout=30 if timeout is None else timeout):
         raise PermissionError("nested or busy isolated state access refused")
     DB_THREAD.active = True
     handles, retained, conn = ExitStack(), ExitStack(), None
@@ -50,14 +50,16 @@ def connect_db(p: Path, readonly: bool = False, create: bool = False, *, streami
     handles.callback(setattr, DB_THREAD, "active", False)
     try:
         parent = handles.enter_context(paths.directory_fd(p.absolute().parent))
+        lock_until = time.monotonic() + 30 if deadline is None else deadline
         while True:
             try:
                 fcntl.flock(parent, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
             except BlockingIOError:
-                if time.monotonic() >= deadline:
+                remaining = lock_until - time.monotonic()
+                if remaining <= 0:
                     raise PermissionError("busy isolated state directory refused") from None
-                time.sleep(0.05)
+                time.sleep(min(0.05, remaining))
         for suffix in ("-wal", "-shm", "-journal"):
             try:
                 os.stat(p.name + suffix, dir_fd=parent, follow_symlinks=False)
@@ -72,7 +74,8 @@ def connect_db(p: Path, readonly: bool = False, create: bool = False, *, streami
                 or os.pread(fd, 20, 0)[18:20] == b"\x02\x02"):
             raise PermissionError("linked, non-plain or WAL isolated state database refused")
         conn = sqlite3.connect(f"file:/dev/fd/{fd}?mode={'ro' if readonly else 'rw'}", uri=True,
-                               timeout=max(0, deadline - time.monotonic()), factory=FixtureConnection)
+                               timeout=30 if deadline is None else max(0, deadline - time.monotonic()),
+                               factory=FixtureConnection)
         conn.handles = retained if streaming else handles
         if not readonly and conn.execute("PRAGMA journal_mode=MEMORY").fetchone()[0] != "memory":
             raise PermissionError("isolated state requires disposable memory journaling")
@@ -221,14 +224,14 @@ def checked_connection(*, timeout: float | None = None):
     try:
         identity = paths.DB_FILE.stat()
     except FileNotFoundError:
-        if not paths.ISOLATED:
+        if not paths.ISOLATED or timeout is not None:
             raise missing_database() from None
         migrate()
         identity = paths.DB_FILE.stat()
     if identity.st_size == 0:
         refuse_empty_file()
     try:
-        conn = connect_db(paths.DB_FILE, timeout=30 if timeout is None else timeout)
+        conn = connect_db(paths.DB_FILE, timeout=timeout)
     except (sqlite3.OperationalError, FileNotFoundError):
         if not paths.DB_FILE.exists():
             raise missing_database() from None
@@ -238,10 +241,10 @@ def checked_connection(*, timeout: float | None = None):
                getattr(identity, "st_birthtime", None), LATEST, NEEDED)
         if key not in _CHECKED:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if paths.ISOLATED and version == 0:
+            if paths.ISOLATED and version == 0 and timeout is None:
                 conn.close()
                 migrate()
-                return checked_connection(timeout=timeout)
+                return checked_connection()
             deadline = time.monotonic() + (MIGRATE_WAIT_SECONDS if timeout is None else 0)
             if version < NEEDED:
                 print(f"schema {version} waits for schema {NEEDED}; run arete serve or arete migrate", flush=True)
@@ -262,7 +265,7 @@ def checked_connection(*, timeout: float | None = None):
 
 
 @contextmanager
-def owning_transaction(connect, begin="BEGIN IMMEDIATE", timing=None, *, commit=True):
+def owning_transaction(connect, begin="BEGIN IMMEDIATE", timing=None, *, commit=True, before_commit=None):
     conn = None
     failed = False
     try:
@@ -276,6 +279,8 @@ def owning_transaction(connect, begin="BEGIN IMMEDIATE", timing=None, *, commit=
             if timing:
                 timing.committing()
             try:
+                if before_commit is not None:
+                    before_commit()
                 conn.execute("COMMIT")
             finally:
                 if timing:
@@ -304,7 +309,7 @@ def owning_transaction(connect, begin="BEGIN IMMEDIATE", timing=None, *, commit=
 
 def read_connection(*, timeout: float | None = None):
     try:
-        return connect_db(paths.DB_FILE, readonly=True, timeout=30 if timeout is None else timeout)
+        return connect_db(paths.DB_FILE, readonly=True, timeout=timeout)
     except (sqlite3.OperationalError, FileNotFoundError):
         if not paths.DB_FILE.exists():
             raise missing_database() from None
@@ -312,9 +317,11 @@ def read_connection(*, timeout: float | None = None):
 
 
 @contextmanager
-def owned(mode, timeout):
+def owned(mode, timeout, before_commit=None):
     active = getattr(_OWNER, "active", None)
     if active and active[0] == os.getpid():
+        if before_commit is not None:
+            raise RuntimeError("a commit guard requires an outer transaction")
         _, held_mode, conn = active
         if held_mode == "read" and mode == "write":
             raise RuntimeError("cannot promote a read snapshot to a writer")
@@ -324,7 +331,7 @@ def owned(mode, timeout):
     connect = checked_connection if mode == "write" else read_connection
     try:
         with owning_transaction(lambda: connect(timeout=timeout), "BEGIN IMMEDIATE" if mode == "write" else "BEGIN", timing,
-                                commit=mode == "write") as conn:
+                                commit=mode == "write", before_commit=before_commit) as conn:
             _OWNER.active = (os.getpid(), mode, conn)
             yield conn
     finally:
@@ -332,8 +339,8 @@ def owned(mode, timeout):
 
 
 @contextmanager
-def tx(*, timeout: float | None = None):
-    with owned("write", timeout) as conn:
+def tx(*, timeout: float | None = None, before_commit=None):
+    with owned("write", timeout, before_commit) as conn:
         yield conn
 
 
