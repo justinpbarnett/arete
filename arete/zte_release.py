@@ -26,6 +26,7 @@ RECOVERY_SECONDS = 180
 RESTART_GRACE_SECONDS = 30
 RECOVERY_HEALTH_SECONDS = 45
 RELEASE_LOCK = "zte-host-release"
+RECOVERY_BLOCK = paths.ZTE_AUTHORITY / "zte-recovery-blocked.json"
 
 
 class DatabaseUnhealthy(pilot.Held):
@@ -497,11 +498,25 @@ def finish(install: Installation, delivery) -> None:
             store.complete(delivery, data["pr_task_version"], release_health=beats, completion_health=final)
 
 
+def recovery_blocked(task: str) -> str:
+    try:
+        block = json.loads(zte.private_bytes(RECOVERY_BLOCK, 2048))
+    except FileNotFoundError:
+        return ""
+    pilot.require(isinstance(block, dict) and isinstance(block.get("task"), str)
+                  and isinstance(block.get("reason"), str) and block["reason"], "invalid managed recovery stop receipt")
+    return block["reason"] if block["task"] == task else ""
+
+
 def hold_recovery(task: str, error: Exception) -> None:
     with util.lock(zte.INTERLOCK, wait=True):
+        reason = recovery_blocked(task)
+        if not reason:
+            reason = util.first_line(str(error), 260) or type(error).__name__
+            util.write_durably(RECOVERY_BLOCK, json.dumps({"task": task, "reason": reason}).encode(), mode=0o600)
         current = store.find(task)
         if current and current.phase in ("deploy_intent", "rollback_intent"):
-            zte.hold(current, error, uncertain=True)
+            zte.hold(current, pilot.Held(reason), uncertain=True)
 
 
 def tick() -> int:
@@ -511,6 +526,9 @@ def tick() -> int:
         delivery = store.latest()
         if not delivery or delivery.phase not in ("release_ready", "deploy_intent", "rollback_intent"):
             return 0
+        if delivery.phase in ("deploy_intent", "rollback_intent") and (reason := recovery_blocked(delivery.task)):
+            hold_recovery(delivery.task, pilot.Held(reason))
+            return 1
         try:
             install = installation(delivery.data.get("installation"))
             if delivery.phase == "release_ready":
@@ -555,7 +573,8 @@ def launch_selected(install: Installation) -> None:
     until = None
     candidate = False
     if delivery is not None:
-        pilot.require(delivery.phase != "uncertain", "managed startup is blocked by an uncertain recovery")
+        pilot.require(delivery.phase != "uncertain" and not recovery_blocked(delivery.task),
+                      "managed startup is blocked by an uncertain recovery")
         pilot.require(install.to_receipt() == delivery.data.get("installation"),
                       "the managed service does not match the activation journal")
         if delivery.phase == "rollback_intent":
@@ -575,6 +594,7 @@ def launch_selected(install: Installation) -> None:
     if candidate:
         activation_authority(delivery, install, until)
     elif until is not None:
+        database(install, until=until)
         activation_time_left(until)
     os.execv(python, [str(python), "-m", "arete.cli", "serve"])
 
