@@ -227,13 +227,15 @@ def post_until(body: bytes, token: str, questions: dict[str, dict], deadline: fl
     with tempfile.TemporaryFile() as payload:
         payload.write(body)
         payload.seek(0)
-        if time.monotonic() >= deadline:
+        if deadline - time.monotonic() < 0.001:
             return Reply(error=DEADLINE_EXPIRED)
+        marker_at = receipt.tell()
         receipt.write(REQUEST_ADMITTED)
         receipt.flush()
         offset = receipt.tell()
         timeout = min(TIMEOUT_SECONDS, deadline - time.monotonic())
         if timeout < 0.001:
+            receipt.truncate(marker_at)
             return Reply(error=DEADLINE_EXPIRED)
         try:
             process = subprocess.run([
