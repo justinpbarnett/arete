@@ -109,7 +109,8 @@ def mark_runtime(root: Path, sha: str, tree: str, *, until: datetime | None = No
     pilot.require(observed == expected, "the locked runtime does not resolve inside its release directory")
     if until is not None:
         activation_time_left(until)
-    util.write_durably(ready_path(root), json.dumps({"sha": sha, "tree": tree}).encode(), mode=0o600)
+    util.write_durably(ready_path(root), json.dumps({"sha": sha, "tree": tree}).encode(), mode=0o600,
+                       before_replace=None if until is None else lambda: activation_time_left(until))
 
 
 def verify_runtime(install: Installation, sha: str, tree: str = "", *, until: datetime | None = None) -> Path:
@@ -118,6 +119,8 @@ def verify_runtime(install: Installation, sha: str, tree: str = "", *, until: da
     pilot.require((root / ".venv/bin/python").is_file()
                   and json.loads(zte.private_bytes(ready_path(root), 512)) == {"sha": sha, "tree": actual},
                   "the managed runtime has no completed locked-install receipt")
+    if until is not None:
+        activation_time_left(until)
     return root
 
 
@@ -495,8 +498,9 @@ def finish(install: Installation, delivery) -> None:
 
 
 def hold_recovery(task: str, error: Exception) -> None:
-    with util.lock(zte.INTERLOCK) as got:
-        if got and (current := store.find(task)) and current.phase in ("deploy_intent", "rollback_intent"):
+    with util.lock(zte.INTERLOCK, wait=True):
+        current = store.find(task)
+        if current and current.phase in ("deploy_intent", "rollback_intent"):
             zte.hold(current, error, uncertain=True)
 
 
@@ -562,8 +566,8 @@ def launch_selected(install: Installation) -> None:
             pilot.require(sha in (delivery.data.get("last_good"), delivery.data.get("release")),
                           "the runtime selector does not match the activation journal")
             candidate = sha == delivery.data["release"]
-            until = activation_deadline(delivery)
             if candidate:
+                until = activation_deadline(delivery)
                 activation_authority(delivery, install, until)
     runtime = verify_runtime(install, sha, until=until)
     os.chdir(runtime)
