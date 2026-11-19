@@ -22,13 +22,14 @@ END = "report"
 FIXED = ("ts", "run", "seq", "event")
 WAIT_CAUSES = ("limit", "ci", "slot", "person")
 TAIL_BYTES = 4096
+GUARDED_TAIL_BYTES = 64 * 1024
 
 _writing = threading.Lock()
 _named: set[tuple[int, str]] = set()
 _append_guard: ContextVar[Callable[[], None] | None] = ContextVar("run_line_append_guard", default=None)
 
 
-class LogBusy(RuntimeError):
+class AppendRefused(RuntimeError):
     pass
 
 
@@ -48,7 +49,7 @@ def locked_log(target: Path, check: Callable[[], None] | None):
     if check:
         check()
     if not _writing.acquire(blocking=check is None):
-        raise LogBusy("another thread is appending run events")
+        raise AppendRefused("another thread is appending run events")
     try:
         if check:
             check()
@@ -59,7 +60,7 @@ def locked_log(target: Path, check: Callable[[], None] | None):
                 fcntl.flock(stream, fcntl.LOCK_EX | (fcntl.LOCK_NB if check else 0))
             except BlockingIOError as error:
                 if check:
-                    raise LogBusy("the run event log is locked") from error
+                    raise AppendRefused("the run event log is locked") from error
                 raise
             if check:
                 check()
@@ -100,6 +101,8 @@ def tail(f, check: Callable[[], None] | None = None) -> tuple[int, bool]:
     while True:
         if check:
             check()
+            if min(end, size) > GUARDED_TAIL_BYTES:
+                raise AppendRefused("cannot recover the run event sequence within the tail limit")
         start = max(0, end - size)
         f.seek(start)
         data = f.read(end - start)
@@ -148,8 +151,9 @@ def write(run_id: str, event: str, **fields) -> dict:
                         data={**fields, "run": run_id, "step": step, "try": attempt})
     if check:
         check()
-    sys.stdout.write(text + "\n")
-    sys.stdout.flush()
+    else:
+        sys.stdout.write(text + "\n")
+        sys.stdout.flush()
     return line
 
 

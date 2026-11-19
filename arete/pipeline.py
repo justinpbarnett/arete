@@ -1240,7 +1240,6 @@ def refuse_zte_start(repo: str, tid: str, slot: slots.RunSlot, run_id: str, erro
     from . import launch_lease
     from .store import db
 
-    print(f"could not start the reserved README task: {error}")
     slot.free()
     if run_id:
         try:
@@ -1254,8 +1253,8 @@ def refuse_zte_start(repo: str, tid: str, slot: slots.RunSlot, run_id: str, erro
                     failed = {"status": "failed", "finished": util.iso(), "summary": str(error)}
                     with db.tx(timeout=0):
                         run_store.settle(run_id, failed)
-        except (OSError, RuntimeError, sqlite3.Error) as cleanup:
-            print(f"could not reconcile reserved run {run_id}: {cleanup}")
+        except (OSError, RuntimeError, sqlite3.Error):
+            pass  # The scheduled reaper settles abandoned registered runs.
     return 2
 
 
@@ -3309,7 +3308,7 @@ def tell_ticket_run_died(cfg: config.Config, row: dict) -> None:
         try:
             with run_lines.nonblocking_appends(lambda: None):
                 run_lines.write(row["id"], "error", message="Reserved README run ended without an active child; it will not be retried.")
-        except (OSError, run_lines.LogBusy):
+        except (OSError, run_lines.AppendRefused):
             pass
         return
     repo = cfg.repo(row["repo"])
