@@ -364,15 +364,18 @@ def deploy(install: Installation, delivery) -> None:
     pilot.require(client.ci(sha, tree, "push") == delivery.data["release_ci"], "release CI evidence changed")
     before = known_good(install, prior)
     zte_delivery.require_landing(delivery, client, sha)
-    with slots.admitting(), util.lock(zte.INTERLOCK) as got:
-        if not got or runs.runs_marked_running():
+    with slots.admitting(wait=False) as slot:
+        if not slot:
             return
-        active(delivery, install)
-        pilot.require(selected(install) == prior and util.pid_alive(before["pid"]),
-                      "the last-good runtime changed before activation")
-        intent = store.transition(delivery, "deploy_intent", last_good=prior, activation_after=util.iso(),
-                                  old_pid=before["pid"], installation=install.to_receipt())
-        switch(install, prior, sha)
+        with util.lock(zte.INTERLOCK) as got:
+            if not got or runs.runs_marked_running():
+                return
+            active(delivery, install)
+            pilot.require(selected(install) == prior and util.pid_alive(before["pid"]),
+                          "the last-good runtime changed before activation")
+            intent = store.transition(delivery, "deploy_intent", last_good=prior, activation_after=util.iso(),
+                                      old_pid=before["pid"], installation=install.to_receipt())
+            switch(install, prior, sha)
     restart(install)
     finish(install, intent)
 
