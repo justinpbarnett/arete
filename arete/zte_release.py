@@ -163,8 +163,11 @@ def database(install: Installation, *, until: datetime | None = None) -> None:
             if until is not None:
                 connection.set_progress_handler(lambda: util.now() >= until, 1000)
             try:
-                if (connection.execute("PRAGMA user_version").fetchone()[0] != install.schema
-                        or connection.execute("PRAGMA quick_check").fetchone()[0] != "ok"):
+                if connection.execute("PRAGMA user_version").fetchone()[0] != install.schema:
+                    raise DatabaseUnhealthy(reason)
+                if until is not None:
+                    activation_time_left(until)
+                if connection.execute("PRAGMA quick_check").fetchone()[0] != "ok":
                     raise DatabaseUnhealthy(reason)
             finally:
                 if until is not None:
@@ -349,6 +352,7 @@ def restore(install: Installation, delivery, *, reason: str = "") -> None:
             # Restoring the last-good selector is a safety action, even if recovery authority has expired.
             verify_runtime(install, previous, until=util.now() + timedelta(seconds=15))
             switch(install, release, previous)
+    # Stop blocks delivery, not corrective recovery of an already-activated release.
     until = util.parse_iso(delivery.data["restore_after"]) + timedelta(seconds=RECOVERY_SECONDS)
     try:
         database(install, until=until)
