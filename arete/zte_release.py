@@ -125,9 +125,15 @@ def verify_runtime(install: Installation, sha: str, tree: str = "", *, until: da
     return root
 
 
-def switch(install: Installation, previous: str, sha: str) -> None:
-    pilot.require(selected(install) == previous, "the runtime selector moved outside the release worker")
-    util.write_durably(install.selector, json.dumps({"sha": sha}).encode(), mode=0o600)
+def switch(install: Installation, previous: str, sha: str, *, until: datetime | None = None) -> None:
+    def authorize_replace() -> None:
+        pilot.require(selected(install) == previous, "the runtime selector moved outside the release worker")
+        if until is not None:
+            activation_time_left(until)
+
+    authorize_replace()
+    util.write_durably(install.selector, json.dumps({"sha": sha}).encode(), mode=0o600,
+                       before_replace=authorize_replace)
 
 
 def activation_deadline(delivery) -> datetime:
@@ -462,7 +468,7 @@ def deploy(install: Installation, delivery) -> None:
                                           old_pid=before["pid"], installation=install.to_receipt())
             until = activation_deadline(intent)
             activation_authority(intent, install, until)
-            switch(install, prior, sha)
+            switch(install, prior, sha, until=until)
     with util.lock(zte.INTERLOCK) as got:
         pilot.require(got, "the Stop interlock is busy before the managed restart")
         activation_authority(intent, install, until)
