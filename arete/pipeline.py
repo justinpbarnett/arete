@@ -9,6 +9,7 @@ import re
 import shlex
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -1316,7 +1317,10 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             except (OSError, RuntimeError, ValueError) as error:
                 print(f"could not start the reserved README task: {error}")
                 return 2
-        with slots.admitting():
+        with slots.admitting(wait=zte_grant is None) as admitting:
+            if not admitting:
+                print("could not start the reserved README task: slot admission is busy")
+                return 2
             slot = slots.RunSlot(repo.name, str(tid), cfg.max_parallel)
             only = (script.only or (script.action if script.action_only else "")) if script else ""
             due = asks_store.asks_due([script.continues]) if script and script.continues and not only else []
@@ -1349,11 +1353,18 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 from . import launch_lease
                 from .store import db
 
+                def check_start_cutoff():
+                    pilot.require(time.monotonic() < wall_deadline, "ZTE deadline expired before run registration")
+
                 try:
-                    with util.lock(zte.INTERLOCK, wait=True):
-                        fresh_grant = zte.admit_run(config.load(), repo, str(tid))
-                        pilot.require(fresh_grant == zte_grant, "ZTE authorization changed before run start")
-                        with db.tx():
+                    with util.lock(zte.INTERLOCK) as got_interlock:
+                        pilot.require(got_interlock, "ZTE run registration is interlocked")
+                        check_start_cutoff()
+                        with db.tx(timeout=0, before_commit=check_start_cutoff):
+                            check_start_cutoff()
+                            fresh_grant = zte.admit_run(config.load(), repo, str(tid))
+                            pilot.require(fresh_grant == zte_grant, "ZTE authorization changed before run start")
+                            check_start_cutoff()
                             run_id = start()
                             zte_store.transition(fresh_grant, "running", run=run_id)
                         try:
@@ -1361,7 +1372,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                         except PermissionError:
                             record.settle(run_id, "failed", summary="could not release the scheduled launch lease")
                             raise
-                except (OSError, RuntimeError, ValueError) as error:
+                except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
                     print(f"could not start the reserved README task: {error}")
                     slot.free()
                     return 2
