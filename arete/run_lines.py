@@ -4,7 +4,6 @@ import fcntl
 import json
 import os
 import sys
-import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -24,7 +23,6 @@ WAIT_CAUSES = ("limit", "ci", "slot", "person")
 TAIL_BYTES = 4096
 GUARDED_TAIL_BYTES = 64 * 1024
 
-_writing = threading.Lock()
 _named: set[tuple[int, str]] = set()
 _append_guard: ContextVar[Callable[[], None] | None] = ContextVar("run_line_append_guard", default=None)
 
@@ -48,25 +46,19 @@ def nonblocking_appends(check: Callable[[], None]):
 def locked_log(target: Path, check: Callable[[], None] | None):
     if check:
         check()
-    if not _writing.acquire(blocking=check is None):
-        raise AppendRefused("another thread is appending run events")
-    try:
+    with open(target, "a+b", buffering=0 if check else -1) as stream:
         if check:
             check()
-        with open(target, "a+b", buffering=0 if check else -1) as stream:
+        # Each open has its own flock identity, even for threads in one process.
+        try:
+            fcntl.flock(stream, fcntl.LOCK_EX | (fcntl.LOCK_NB if check else 0))
+        except BlockingIOError as error:
             if check:
-                check()
-            try:
-                fcntl.flock(stream, fcntl.LOCK_EX | (fcntl.LOCK_NB if check else 0))
-            except BlockingIOError as error:
-                if check:
-                    raise AppendRefused("the run event log is locked") from error
-                raise
-            if check:
-                check()
-            yield stream
-    finally:
-        _writing.release()
+                raise AppendRefused("the run event log is locked") from error
+            raise
+        if check:
+            check()
+        yield stream
 
 
 def path(run_id: str) -> Path:
