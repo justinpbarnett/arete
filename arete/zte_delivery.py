@@ -439,9 +439,10 @@ def advance(cfg) -> bool:
                     if not database_busy(busy):
                         raise
         return False
-    until = zte.wall_deadline(delivery)
+    until = None
     startup = delivery.phase in ("dispatching", "running")
     try:
+        until = zte.wall_deadline(delivery)
         policy = zte.active(delivery)
         repo, layer, digest = zte.settings(cfg, policy)
         pilot.require(repo.name == delivery.repo and digest == delivery.data["config"], "ZTE configuration changed")
@@ -466,7 +467,7 @@ def advance(cfg) -> bool:
         else:
             send_next(delivery, policy, client, cfg, repo)
     except (OSError, RuntimeError, ValueError, TypeError, KeyError, sqlite3.Error) as error:
-        if startup and isinstance(error, sqlite3.OperationalError) and database_busy(error):
+        if startup and until is not None and isinstance(error, sqlite3.OperationalError) and database_busy(error):
             if time.monotonic() < until:
                 return False
             error = pilot.Held("ZTE deadline expired while observing the scheduled startup")
@@ -490,4 +491,8 @@ def tick(cfg) -> None:
         if not reconcile_jev_usage():
             return
     if can_find:
-        zte.finder(cfg)
+        try:
+            zte.finder(cfg)
+        except sqlite3.OperationalError as error:
+            if not database_busy(error):
+                raise
