@@ -1217,7 +1217,8 @@ def park_run(run: Run, reason: str) -> tuple[str, str, str]:
     return status, summary, pr_url
 
 
-def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: bool, flow: factory.Flow | None) -> None:
+def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: bool, flow: factory.Flow | None,
+               *, echo_end: bool = True) -> None:
     if restarting and status in ("skipped", "noop") and not run.feedback:
         run.enter("failed")
         run.say(f"I did not restart this after the interruption: {summary}. Remove "
@@ -1231,7 +1232,8 @@ def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: boo
             run_lines.write(run.id, "error", step=run_lines.last_step(run.id), message=summary)
     pr_url = pr_url or str((run_store.run_get(run.id) or {}).get("pr_url") or "")
     end_line = f"done: {status} {pr_url or summary}"
-    run.log(end_line)
+    if echo_end:
+        run.log(end_line)
     record.settle(run.id, status, end_line=end_line, summary=summary, pr_url=pr_url)
     write_report(run_store.run_get(run.id) or {"id": run.id, "status": status, "pr_url": pr_url}, flow, run)
 
@@ -1250,9 +1252,9 @@ def settle_zte_refusal(repo: str, tid: str, slot: slots.RunSlot, run_id: str, er
                 try:
                     launch_lease.registered(repo, tid)
                 finally:
-                    failed = {"status": "failed", "finished": util.iso(), "summary": str(error)}
+                    outcome = "stopped" if isinstance(error, Stopped) else "failed"
                     with db.tx(timeout=0):
-                        run_store.settle(run_id, failed)
+                        run_store.settle(run_id, {"status": outcome, "finished": util.iso(), "summary": str(error)})
         except (OSError, RuntimeError, sqlite3.Error):
             pass  # The scheduled reaper settles abandoned registered runs.
     return 2
@@ -1474,7 +1476,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             if not dry_run and not run.alone:
                 insights_store.take_feedback(run.feedback, run_id)
         signal.signal(signal.SIGTERM, stop_on_term(run_id))
-        pr_url, passed, work_started, retain_in_place = "", None, False, False
+        pr_url, passed, work_started = "", None, False
 
         def check_work_log():
             if time.monotonic() >= wall_deadline:
@@ -1515,40 +1517,51 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 passed = status == "step"
         except runlimits.Parked as e:
             if zte_grant:
-                retain_in_place = True
                 return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
             status, summary, pr_url = park_run(run, str(e))
-        except factory.OnlyDone:
+        except factory.OnlyDone as e:
+            if zte_grant:
+                return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
             status, summary, passed = flows.alone(flow)
         except factory.Refused as e:
+            if zte_grant:
+                return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
             status, summary = "failed", str(e)
-        except Stopped:
+        except Stopped as e:
+            if zte_grant:
+                return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
             status, summary, pr_url = "stopped", record.STOPPED, ""
             run.log(record.STOPPED)
             run.give_up("was stopped by request")
         except workspace.RunFailed as e:
+            if zte_grant:
+                return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
             status, summary, pr_url = _fail(run, e.why, detail=e.detail)
         except tracker.ERRORS as e:
-            if zte_grant and not work_started:
-                retain_in_place = True
+            if zte_grant:
                 return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
             status, summary, pr_url = _fail(run, f"tracker refused {run.ref}: {e}")
         except Exception as e:
-            if zte_grant and (not work_started or isinstance(e, (run_lines.AppendRefused, pilot.Held))):
-                retain_in_place = True
+            if zte_grant:
                 return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
             run.log(f"crashed: {type(e).__name__}: {e}")
             status, summary, pr_url = "failed", f"crashed: {e}"[:300], ""
             run.give_up("crashed before finishing")
         finally:
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
-            if run.workspace and not retain_in_place:
+            if run.workspace and not zte_grant:
                 keep_edits(run)
                 workspace.note_made(*run.workspace, workspace_owner(run, *run.workspace))
             slot.free()
-        settle_run(run, status, summary, pr_url, restarting, flow)
-        if status == "skipped":
+        try:
+            with handoff_io():
+                settle_run(run, status, summary, pr_url, restarting, flow, echo_end=not zte_grant)
+        except (OSError, RuntimeError, ValueError, sqlite3.Error) as e:
+            if not zte_grant:
+                raise
+            return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
+        if status == "skipped" and not zte_grant:
             print(f"{name} was not run: {summary}. Pass --force to run it anyway.")
         return 0 if (status in SUCCEEDED if passed is None else passed) else 1
 
