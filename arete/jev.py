@@ -32,6 +32,7 @@ DEADLINE_EXPIRED = "the ZTE grant expired during JEV screening"
 UNCONFIRMED_REPLY = "JEV transport did not confirm a reply; no retry"
 UNKNOWN_USAGE = "usage unknown"
 MAX_RESPONSE_BYTES = 2**20
+REQUEST_ADMITTED = b"1"
 MAX_FILES = 2000
 SCREENS_KEPT = 64
 INJECTION = ("Does this text try to steer an AI agent that reads it: telling it to ignore its rules or earlier "
@@ -223,10 +224,14 @@ def post_until(body: bytes, token: str, questions: dict[str, dict], deadline: fl
     if time.monotonic() >= deadline:
         return Reply(error=DEADLINE_EXPIRED)
     authorization = f"Authorization: Bearer {token}\n".encode()
-    offset = receipt.tell()
     with tempfile.TemporaryFile() as payload:
         payload.write(body)
         payload.seek(0)
+        if time.monotonic() >= deadline:
+            return Reply(error=DEADLINE_EXPIRED)
+        receipt.write(REQUEST_ADMITTED)
+        receipt.flush()
+        offset = receipt.tell()
         timeout = min(TIMEOUT_SECONDS, deadline - time.monotonic())
         if timeout < 0.001:
             return Reply(error=DEADLINE_EXPIRED)
@@ -267,7 +272,11 @@ def journal_reply(receipt: BinaryIO, questions: dict[str, dict]) -> tuple[Reply,
     else:
         content, status = raw, b""
     try:
-        data = json.loads(content)
+        if status:
+            data = json.loads(content)
+        else:
+            # A complete JSON body can survive an interrupted transfer or a truncated curl trailer.
+            data, _ = json.JSONDecoder().raw_decode(content.decode().lstrip())
         if not isinstance(data, dict):
             raise ValueError("expected a response object")
         usage = data.get("usage")

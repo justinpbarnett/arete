@@ -214,9 +214,15 @@ def reconcile_jev_usage(*, deadline: float | None = None) -> bool:
             return False
         pilot.require(launch_lease.plain(os.fstat(fd)), "unsafe JEV response journal")
         run = json.loads(journal.readline(512))["run"]
+        marker = journal.read(1)
+        pilot.require(marker in (b"", jev.REQUEST_ADMITTED), "invalid JEV response journal marker")
+        if not marker:
+            path.unlink()
+            util.flush_folder(path.parent)
+            return True
         reply, seconds = jev.journal_reply(journal, jev.risk_questions())
         usage = jev.result([reply])
-        usage.model = usage.model[:128]
+        usage.model = usage.model[:128].encode(errors="replace").decode()
 
         def check_deadline():
             if deadline is not None:
@@ -227,6 +233,12 @@ def reconcile_jev_usage(*, deadline: float | None = None) -> bool:
         check_deadline()
         try:
             with db.tx(timeout=0, before_commit=check_deadline) as conn:
+                delivery = store.latest()
+                pilot.require(delivery and delivery.data.get("run") == run and "jev_attempt" in delivery.data,
+                              "JEV response journal has no matching delivery attempt")
+                if "jev_receipt" not in delivery.data and usage.ok:
+                    usage.ok = False
+                    usage.error = "provider usage recovered without an accepted JEV verdict"
                 prior = conn.execute("SELECT ok, model, cost_usd, tokens_in, error, seconds FROM steps "
                                      "WHERE run_id=? AND step=? AND try=1", (run, JEV_STEP)).fetchone()
                 if prior is None:
