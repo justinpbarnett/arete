@@ -584,7 +584,7 @@ def confinement(cwd: Path, add_dirs: list[Path], floor: guard.Floor, selected: R
     return sandbox.write_confinement(
         cwd, add_dirs, selected.owner if selected and selected.using_login else None,
         state=(paths.STATE_DIR, (*floor.open, sandbox.SESSIONS_DIR, sandbox.AGENT_DIR, sandbox.LOGIN_DIR,
-                                 sandbox.KEY_DIR)),
+                                 sandbox.KEY_DIR, paths.PACKAGE_DIR)),
         hidden=(paths.CONFIG_DIR, paths.LOG_DIR, paths.CLIENT_DIR), peers=paths.WORKTREES_DIR)
 
 
