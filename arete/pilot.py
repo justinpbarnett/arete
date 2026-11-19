@@ -77,6 +77,7 @@ def candidate_time_left(until: float, cap: float) -> float:
 def candidate_git(repo: Path, args: tuple[str, ...], until: float, cap: float) -> subprocess.CompletedProcess:
     from . import sandbox
 
+    candidate_time_left(until, cap)
     command = sandbox.protected_command(["git", *args], repo, ())
     env = {key: os.environ[key] for key in ("PATH", "HOME", "LANG", "LC_ALL", "GIT_CONFIG_GLOBAL",
                                             "GIT_CONFIG_NOSYSTEM") if key in os.environ}
@@ -221,13 +222,19 @@ def pickable(tid: str, repo: str) -> bool:
         return False
 
 
-def scheduled_run(repo: str, tid: str) -> dict | None:
-    with db.one_read() as connection:
+def scheduled_run(repo: str, tid: str, *, until: float | None = None) -> dict | None:
+    if until is not None:
+        candidate_time_left(until, 1)
+    with db.one_read(timeout=0 if until is not None else None) as connection:
+        if until is not None:
+            candidate_time_left(until, 1)
         rows = runs.ticket_runs(repo, tid, limit=2, whole=True)
         require(len(rows) <= 1, "the local task had more than one delivery attempt")
         if not rows:
             return None
         run = rows[0]
+        if until is not None:
+            candidate_time_left(until, 1)
         start = connection.execute("SELECT actor FROM events_log WHERE kind = 'run.started' AND subject = ?",
                                    (f"run:{run['id']}",)).fetchone()
         require(start and start[0] == "rule:poll", "the run was not started by scheduled poll")

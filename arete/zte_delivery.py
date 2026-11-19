@@ -38,33 +38,43 @@ def settled(delivery, policy, repo, layer) -> bool:
 
 
 def validate_candidate(delivery, policy, repo, layer, until: float) -> bool:
+    def check():
+        pilot.candidate_time_left(until, 1)
+
+    def inactive(action):
+        check()
+        result = action["result"]
+        return not delegation.live(result.get("pid"), result.get("identity"))
+
     data = delivery.data
-    run = pilot.scheduled_run(delivery.repo, delivery.task)
+    run = pilot.scheduled_run(delivery.repo, delivery.task, until=until)
     if run and not run.get("finished"):
         return False
     pilot.require(run and (run["id"], run["status"]) == (data["run"], "pr"),
                   "the original run did not settle an exact candidate")
+    check()
     row = orchestration.find(run["id"])
     pilot.require(row and row["root"] == row["current_run"] == run["id"] and row["generation"] == 1,
                   "the original run generation changed")
+    check()
     if util.pid_alive(row["owner"]):
         return False
     lease = orchestration.Lease(run["id"], run["id"], 1)
+    check()
     actions = orchestration.actions(lease)
     completed = [a for a in actions if a["op"] == "publication.request" and a["state"] == "succeeded"]
+    check()
     pilot.require(not orchestration.pending(lease) and len(completed) == 1
                   and completed[0]["result"].get("prepared_head") == data["head"]
                   and all(a["state"] in ("succeeded", "failed", "cancelled") and a["op"] != "owner.ask"
-                          and not delegation.live(a["result"].get("pid"), a["result"].get("identity")) for a in actions),
-                  "the candidate has an unresolved or live producer")
+                          and inactive(a) for a in actions), "the candidate has an unresolved or live producer")
     checkout = zte.check_checkout(delivery, policy, repo, [workspace.Checkout.from_row(c)
         for c in row["data"].get("prepared", {}).get("checkouts", [])], until=until)
     where = Path(data["worktree"])
-    pilot.candidate_time_left(until, 1)
-    pilot.require(checkout.wt == where and not scratch.pending(where), "the workspace or producer state changed")
+    pilot.require(checkout.wt == where and not scratch.pending(where, check=check),
+                  "the workspace or producer state changed")
     signal = policy.signal(delivery.base)
-    pilot.candidate_time_left(until, 1)
-    pilot.require(zte.task_version(delivery, signal, "pr") == data["pr_task_version"],
+    pilot.require(zte.task_version(delivery, signal, "pr", until=until) == data["pr_task_version"],
                   "the ZTE task changed after candidate preparation")
     pilot.require(pilot.git(where, "rev-parse", "HEAD", until=until).strip() == data["head"],
                   "the exact ZTE candidate head changed after preparation")
@@ -72,7 +82,7 @@ def validate_candidate(delivery, policy, repo, layer, until: float) -> bool:
     pilot.require(pilot.exact_edit(where, signal, data["head"], expected, until=until) == data["tree"]
                   and not pilot.git(where, "status", "--porcelain", "--untracked-files=all", until=until),
                   "the exact ZTE candidate changed after preparation")
-    pilot.candidate_time_left(until, 1)
+    check()
     pilot.require_evidence(row["data"], policy.identity.name, data["tree"], layer.checks)
     return True
 
