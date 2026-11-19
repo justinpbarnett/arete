@@ -14,9 +14,13 @@ from . import config, gh, pilot, util
 
 WORKFLOW = ".github/workflows/ci.yml"
 PERMISSIONS = {"contents": "write", "pull_requests": "write"}
-CHECKOUT_STEP = r"arete-checks\tRun actions/checkout@[a-f0-9]{40}\t[0-9.T:-]+Z "
-CHECKOUT = re.compile(rf"(?m)^{CHECKOUT_STEP}\[command\][^\r\n]+/git log -1 --format=%H\r?\n"
-                      rf"{CHECKOUT_STEP}([a-f0-9]{{40}})\r?$")
+LOG_TIME = r"[0-9.T:-]+Z "
+RUN_STEP = re.compile(rf"(?m)^{LOG_TIME}##\[group\]Run ([^\r\n]+)\r?$")
+CHECKOUT = re.compile(rf"(?m)^{LOG_TIME}\[command\][^\r\n]+/git log -1 --format=%H\r?\n"
+                      rf"{LOG_TIME}([a-f0-9]{{40}})\r?$")
+MERGE_SETTINGS = """query($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) { id nameWithOwner squashMergeAllowed autoMergeAllowed }
+}"""
 MAX_RESPONSE = 1024 * 1024
 
 
@@ -92,14 +96,29 @@ class GitHub:
             args.extend(["--paginate", "--slurp"])
         return json.loads(self.gh_read(*args))
 
+    def require_merge_settings(self, repo: dict) -> None:
+        squash, auto = repo.get("allow_squash_merge"), repo.get("allow_auto_merge")
+        if squash is None or auto is None:
+            owner, name = self.identity.name.split("/")
+            reply = json.loads(self.gh_read("api", "graphql", "--hostname", "github.com", "-f", f"query={MERGE_SETTINGS}",
+                                            "-f", f"owner={owner}", "-f", f"name={name}"))
+            settings = reply["data"]["repository"]
+            pilot.require((settings["id"], settings["nameWithOwner"]) == (self.identity.node, self.identity.name),
+                          "GitHub returned merge settings for a different repository")
+            reported = settings["squashMergeAllowed"], settings["autoMergeAllowed"]
+            pilot.require(all(value is None or value is checked for value, checked in zip((squash, auto), reported)),
+                          "GitHub reported conflicting merge settings")
+            squash, auto = reported
+        pilot.require(squash is True and auto is False, "GitHub must allow squash and disable deferred auto-merge")
+
     def snapshot(self) -> dict:
         repo = self.read()
         identity = self.identity
         pilot.require((repo.get("node_id"), repo.get("id"), repo.get("full_name"), (repo.get("owner") or {}).get("id"))
                       == (identity.node, identity.number, identity.name, identity.owner)
                       and repo.get("default_branch") == "main" and repo.get("private") is False
-                      and repo.get("allow_squash_merge") is True and repo.get("allow_auto_merge") is False
                       and not repo.get("archived"), "GitHub does not report the approved personal repository and main")
+        self.require_merge_settings(repo)
         protection = self.read("/branches/main/protection")
         status = protection.get("required_status_checks") or {}
         pilot.require(status.get("strict") is True and status.get("checks") == [pilot.CHECK]
@@ -222,14 +241,17 @@ class GitHub:
             return None
         pilot.require(len(expected) == 1 and all(row.get("conclusion") == "success" for row in checks),
                       "hosted checks are not completely green")
-        log = self.gh_read("run", "view", str(run["id"]), "--repo", f"github.com/{ident.name}", "--job", str(jobs[0]["id"]),
-                           "--log", cap=25)
-        tested = CHECKOUT.findall(log)
+        log = self.gh_read("api", "--hostname", "github.com", f"{self.route}/actions/jobs/{jobs[0]['id']}/logs", cap=25)
+        steps = list(RUN_STEP.finditer(log))
+        checkout = [i for i, step in enumerate(steps) if re.fullmatch(r"actions/checkout@[a-f0-9]{40}", step[1])]
+        pilot.require(len(steps) > 1 and checkout == [0], "the approved CI job did not start with one pinned checkout")
+        checkout_log = log[steps[0].end():steps[1].start()]
+        tested = CHECKOUT.findall(checkout_log)
         pilot.require(len(tested) == 1, "the pinned checkout step did not report a unique tested commit")
         if pr:
             checkout_ref = re.escape(f"+{tested[0]}:refs/remotes/pull/{pr}/merge")
-            pilot.require(re.search(rf"(?m)^{CHECKOUT_STEP}\[command\][^\r\n]+ fetch [^\r\n]+ {checkout_ref}\r?$", log),
-                          "the tested checkout is not the admitted PR merge ref")
+            fetched = rf"(?m)^{LOG_TIME}\[command\][^\r\n]+ fetch [^\r\n]+ {checkout_ref}\r?$"
+            pilot.require(re.search(fetched, checkout_log), "the tested checkout is not the admitted PR merge ref")
         commit = self.commit(tested[0])
         pilot.require(commit.get("tree", {}).get("sha") == tree and (
             [parent["sha"] for parent in commit["parents"]] == [base, head] if event == "pull_request"
