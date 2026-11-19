@@ -295,7 +295,8 @@ def finder(cfg: config.Config) -> None:
     with util.lock(DELIVERY_LOCK) as got:
         if not got:
             return
-        previous = store.latest()
+        with db.one_read(timeout=0):
+            previous = store.latest()
         if previous and previous.phase != "healthy":
             return
         repo, _, digest = settings(cfg, policy)
@@ -304,11 +305,14 @@ def finder(cfg: config.Config) -> None:
         status, base = observation(policy, repo, client)
         if status == "no match" or client.tip() != base:
             return
+        client.time_left()
         with util.lock(INTERLOCK) as got:
             if not got or PAUSE_FILE.exists() or load_policy() != policy or settings(config.load(), policy)[2] != digest:
                 return
+            client.time_left()
             if status == "conforming" and previous and previous.policy == policy.fingerprint:
-                store.note_conforming(previous, base)
+                with db.tx(timeout=0, before_commit=client.time_left):
+                    store.note_conforming(previous, base)
             elif status == "eligible":
                 from . import zte_release
 
@@ -317,7 +321,8 @@ def finder(cfg: config.Config) -> None:
                 if policy.rehearsal != profile["rehearsal"] or zte_release.selected(install) != base:
                     return
                 signal = policy.signal(base)
-                with principals.acting("rule:zte-finder"):
+                client.time_left()
+                with principals.acting("rule:zte-finder"), db.tx(timeout=0, before_commit=client.time_left):
                     store.reserve(policy.fingerprint, repo.name, base, deadline, pilot.TASK_TITLE, pilot.TASK_KIND,
                                   signal.task(), {"engine": codebase.STAMP, "config": digest, "task_version": 1,
                                                   "github": asdict(policy.identity), "approved_installation": profile})
