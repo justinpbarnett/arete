@@ -35,7 +35,7 @@ jobs:
         run: uv run --locked python -m tests.parallel
       - name: Python lint, compilation and imports
         run: |
-          uvx ruff@0.15.15 check --no-cache arete
+          sh tools/lint-arete
           uv run --locked python -m compileall -q arete
           uv run --locked python -c "import importlib, pathlib; [importlib.import_module('arete.' + p.stem) for p in sorted(pathlib.Path('arete').glob('*.py'))]"
       - name: JavaScript syntax

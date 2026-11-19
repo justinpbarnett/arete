@@ -71,7 +71,8 @@ def git(repo: Path, *args: str) -> str:
 
 
 def readme(repo: Path, ref: str) -> str:
-    result = subprocess.run(["git", "show", f"{ref}:{DOC}"], cwd=repo, capture_output=True, timeout=10)
+    result = subprocess.run(["git", "show", f"{ref}:{DOC}"], cwd=repo, capture_output=True, timeout=10,
+                            check=False)
     require(result.returncode == 0, "the approved README blob is unavailable")
     return result.stdout.decode("utf-8")
 
@@ -104,15 +105,24 @@ def have_checkout(repo: Path, base: str) -> None:
             and not git(repo, "status", "--porcelain"), "the deployment checkout changed or is dirty")
 
 
+def require_exact_tree(repo: Path, signal: Signal, tree: str, expected: str) -> None:
+    require(SHA.fullmatch(tree), "the candidate tree is not known")
+    base_entry = git(repo, "ls-tree", signal.base, DOC).split()
+    candidate_entry = git(repo, "ls-tree", tree, DOC).split()
+    require(base_entry[:2] in (["100644", "blob"], ["100755", "blob"])
+            and candidate_entry[:2] == base_entry[:2]
+            and git(repo, "diff", "--name-status", "--no-renames", "--ignore-submodules=none", "--no-ext-diff",
+                    signal.base, tree).strip() == f"M\t{DOC}"
+            and readme(repo, tree) == expected, "the candidate is not the approved regular-file README edit")
+
+
 def exact_edit(repo: Path, signal: Signal, head: str, expected: str) -> str:
     require(SHA.fullmatch(head), "the published head is not known")
     require(git(repo, "rev-list", "--parents", "-n", "1", head).split() == [head, signal.base],
             "the published head is not a single commit directly on the approved base")
-    require(git(repo, "diff", "--name-status", "--no-renames", "--ignore-submodules=none", "--no-ext-diff",
-                signal.base, head).strip() == f"M\t{DOC}"
-            and git(repo, "ls-tree", head, DOC).split()[0] == git(repo, "ls-tree", signal.base, DOC).split()[0]
-            and readme(repo, head) == expected, "the published patch is not the approved README edit")
-    return git(repo, "rev-parse", f"{head}^{{tree}}").strip()
+    tree = git(repo, "rev-parse", f"{head}^{{tree}}").strip()
+    require_exact_tree(repo, signal, tree, expected)
+    return tree
 
 
 def receipt_for(tid: str) -> Path:

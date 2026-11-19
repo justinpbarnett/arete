@@ -2742,10 +2742,11 @@ def check_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
 
 def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "verify",
                 require_released: bool = False, **values) -> verify.Verified:
-    from . import pilot
+    from . import pilot, readme_verify
 
     run, v = b.run, verify.with_free_ports(b.layer.verify)
-    merge_candidate = b.layer.trust_level == "automerge" or pilot.is_pilot_task(str(run.tid))
+    pilot_task = pilot.is_pilot_task(str(run.tid)) and prompt_name == role == "verify"
+    merge_candidate = b.layer.trust_level == "automerge" or pilot_task
     checked_trees = verification_trees(b) if prompt_name == role == "verify" and merge_candidate else {}
     step = b.next_step(step_name)
     if refusal := verify.port_refusal(v):
@@ -2759,6 +2760,18 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
             ready.saved = os.path.abspath(run.dir / f"{step}-preflight.md")
             run.save(f"{step}-preflight.md", ready.markdown())
             return ready
+    if pilot_task and not (v.start or v.probes):
+        try:
+            receipt = pilot.live_receipt(str(run.tid), run.repo.name)
+            pilot.require(checked_trees.keys() == {""}, "the README verifier requires one exact candidate tree")
+            verified = readme_verify.check(run, b.ws, step, pilot.Signal(**receipt["signal"]), checked_trees[""])
+            if verified.verdict == "pass":
+                pilot.require(checked_trees == verification_trees(b), "the candidate tree changed during verification")
+                verified.native_trees = checked_trees
+        except pilot.Held as error:
+            verified = verify.Verified("blocked", "The exact README could not be verified.", finished=False,
+                                       blocked_by=str(error))
+        return save_verification(run, step, verified)
     evidence = run_folder(run, "evidence")
     untracked_before = untracked_by_dir(b.git_dirs)
     attempt = None
@@ -2852,6 +2865,10 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
     if (verified.verdict == "pass" and checked_trees and agent_finished and res.runner in {"pi", "codex", "claude"}
             and checked_trees == verification_trees(b)):
         verified.native_trees = checked_trees
+    return save_verification(run, step, verified)
+
+
+def save_verification(run: Run, step: str, verified: verify.Verified) -> verify.Verified:
     verified.saved = os.path.abspath(run.dir / f"{step}.md")
     run.save(f"{step}.md", verified.markdown())
     run.log(f"{step}: {verified.verdict}, {len(verified.checks) - len(verified.failed_checks)} of "
