@@ -319,11 +319,11 @@ class GitHub:
             def git(*args):
                 done = util.sh(["/usr/bin/git", "-c", "core.hooksPath=/dev/null", *args], cwd=root,
                                env=self.git_env(), inherit=False, timeout=self.time_left(25))
-                pilot.require(done.returncode == 0, "could not isolate the candidate Git object before push")
+                pilot.require(done.returncode == 0, f"could not isolate the candidate Git object before push ({args[0]})")
                 return done.stdout.strip()
 
             git("init", "--bare", "--quiet", "--template=")
-            git("fetch", "--no-tags", "--no-recurse-submodules", "--", str(where.resolve()), head)
+            git("fetch", "--depth=2", "--no-tags", "--no-recurse-submodules", "--", str(where.resolve()), head)
             pilot.require(git("rev-parse", "FETCH_HEAD", "FETCH_HEAD^{tree}").split() == [head, tree]
                           and git("rev-list", "--parents", "-n", "1", head).split() == [head, base],
                           "the isolated candidate does not match the admitted head, tree and parent")
