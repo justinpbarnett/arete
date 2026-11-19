@@ -74,8 +74,9 @@ class Identity:
 
 
 class GitHub:
-    def __init__(self, identity: Identity, deadline: str, key: Path):
+    def __init__(self, identity: Identity, deadline: str, key: Path, *, observer: Path | None = None):
         self.identity, self.deadline, self.key = identity, deadline, key
+        self.observer = observer
         self.route = f"repos/{identity.name}"
 
     def time_left(self, cap: int = 15) -> float:
@@ -83,25 +84,36 @@ class GitHub:
         pilot.require(left > 0, "ZTE GitHub deadline expired")
         return min(left, cap)
 
-    def gh_read(self, *args: str, cap: int = 15) -> str:
-        result = util.sh(["gh", *args], timeout=self.time_left(cap),
-                         env={"GH_HOST": "github.com", "GH_PROMPT_DISABLED": "1"})
+    def _gh_read(self, args: list[str], *, cap: int = 15) -> str:
+        env = {"GH_HOST": "github.com", "GH_PROMPT_DISABLED": "1"}
+        if self.observer is not None:
+            from .zte import private_bytes
+
+            token = private_bytes(self.observer, 512).decode().strip()
+            pilot.require(re.fullmatch(r"github_pat_[A-Za-z0-9_]{30,500}", token),
+                          "the dedicated read-only GitHub observer is unavailable")
+            env["GH_TOKEN"] = token
+        result = util.sh(["gh", "api", "--hostname", "github.com", *args], timeout=self.time_left(cap), env=env)
         if result.returncode != 0:
-            raise gh.GhError(f"GitHub {args[0]} could not confirm exact ZTE evidence")
+            raise gh.GhError("GitHub API could not confirm exact ZTE evidence")
         return result.stdout
 
+    def _get(self, endpoint: str, *, pages=False, cap: int = 15) -> str:
+        args = ["--method", "GET", "--paginate", "--slurp"] if pages else ["--method", "GET"]
+        return self._gh_read([*args, "--", endpoint], cap=cap)
+
     def read(self, suffix: str = "", *, pages=False):
-        args = ["api", "--hostname", "github.com", self.route + suffix]
-        if pages:
-            args.extend(["--paginate", "--slurp"])
-        return json.loads(self.gh_read(*args))
+        return json.loads(self._get(self.route + suffix, pages=pages))
+
+    def bot_info(self, login: str) -> dict:
+        return json.loads(self._get(f"users/{quote(login, safe='')}"))
 
     def require_merge_settings(self, repo: dict) -> None:
         squash, auto = repo.get("allow_squash_merge"), repo.get("allow_auto_merge")
         if squash is None or auto is None:
             owner, name = self.identity.name.split("/")
-            reply = json.loads(self.gh_read("api", "graphql", "--hostname", "github.com", "-f", f"query={MERGE_SETTINGS}",
-                                            "-f", f"owner={owner}", "-f", f"name={name}"))
+            reply = json.loads(self._gh_read(["graphql", "-f", f"query={MERGE_SETTINGS}",
+                                              "-f", f"owner={owner}", "-f", f"name={name}"]))
             settings = reply["data"]["repository"]
             pilot.require((settings["id"], settings["nameWithOwner"]) == (self.identity.node, self.identity.name),
                           "GitHub returned merge settings for a different repository")
@@ -241,7 +253,7 @@ class GitHub:
             return None
         pilot.require(len(expected) == 1 and all(row.get("conclusion") == "success" for row in checks),
                       "hosted checks are not completely green")
-        log = self.gh_read("api", "--hostname", "github.com", f"{self.route}/actions/jobs/{jobs[0]['id']}/logs", cap=25)
+        log = self._get(f"{self.route}/actions/jobs/{jobs[0]['id']}/logs", cap=25)
         steps = list(RUN_STEP.finditer(log))
         checkout = [i for i, step in enumerate(steps) if re.fullmatch(r"actions/checkout@[a-f0-9]{40}", step[1])]
         pilot.require(len(steps) > 1 and checkout == [0], "the approved CI job did not start with one pinned checkout")
@@ -279,7 +291,7 @@ class GitHub:
         pilot.require(isinstance(slug, str) and re.fullmatch(r"[a-z0-9-]{1,100}", slug),
                       "the delivery App installation did not identify its bot")
         login = slug + "[bot]"
-        bot = json.loads(self.gh_read("api", "--hostname", "github.com", f"users/{quote(login, safe='')}"))
+        bot = self.bot_info(login)
         pilot.require((bot.get("login"), bot.get("type"), bot.get("id")) == (login, "Bot", identity.bot),
                       "the delivery App bot does not match the approved actor")
         reply = api("POST", f"{path}/access_tokens", jwt, self.time_left(),

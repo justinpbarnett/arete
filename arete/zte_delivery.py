@@ -187,7 +187,8 @@ def advance(cfg) -> None:
         until = util.parse_iso(timestamp) + timedelta(minutes=3)
         try:
             identity = Identity(**delivery.data["github"])
-            client = GitHub(identity, util.iso(max(until, util.now() + timedelta(seconds=25))), Path("/dev/null"))
+            client = GitHub(identity, util.iso(max(until, util.now() + timedelta(seconds=25))), Path("/dev/null"),
+                            observer=zte.OBSERVER_FILE)
             reconcile(delivery, client, observed)
         except (OSError, RuntimeError, ValueError, TypeError, KeyError) as error:
             if util.now() >= until or (observed.get("merged") and observed.get("target") != "main"):

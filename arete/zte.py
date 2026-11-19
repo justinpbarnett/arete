@@ -18,6 +18,7 @@ TASK = re.compile(r"t-[0-9a-f]{40}\Z")
 CANONICAL = ("justinpbarnett/arete", 1446501487, "R_kgDOVjfcbw", 42453910)
 REHEARSAL = ("justinpbarnett/arete-zte-rehearsal-20261118-2f303b9", 1463520326, "R_kgDOVzuMRg", 42453910)
 POLICY_FILE = paths.ZTE_AUTHORITY / "zte.toml"
+OBSERVER_FILE = paths.ZTE_AUTHORITY / "observer.token"
 PAUSE_FILE = paths.ZTE_STOP
 INTERLOCK = "zte-interlock"
 DELIVERY_LOCK = "zte-delivery"
@@ -56,7 +57,7 @@ class Policy:
         return orchestration.digest(asdict(self))
 
     def client(self, deadline: str) -> GitHub:
-        return GitHub(self.identity, deadline, paths.ZTE_AUTHORITY / "delivery.pem")
+        return GitHub(self.identity, deadline, paths.ZTE_AUTHORITY / "delivery.pem", observer=OBSERVER_FILE)
 
     def signal(self, base: str) -> pilot.Signal:
         return pilot.Signal(self.identity.name, base, self.before, self.after)
