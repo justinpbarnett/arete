@@ -632,7 +632,7 @@ def write_bytes_atomic(path: Path, data: bytes) -> None:
 
 
 @contextmanager
-def repeating(seconds: float, action, name: str):
+def repeating(seconds: float, action, name: str, *, wait_on_exit: bool = True):
     stop = threading.Event()
 
     def beat() -> None:
@@ -645,4 +645,5 @@ def repeating(seconds: float, action, name: str):
         yield
     finally:
         stop.set()
-        beater.join()
+        if wait_on_exit:
+            beater.join()
