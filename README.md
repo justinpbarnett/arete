@@ -1003,7 +1003,7 @@ Approval, dependency, running-ticket and capacity checks still decide whether a 
 - Logs: `~/Library/Logs/arete/`. A log over 5 MB rotates by rename into five numbered copies (`runs.log.1` newest to `runs.log.5`), hourly by `arete serve`; `serve.log` rotates the same way when serve starts, including each restart for new code.
 - Per repo: `config.toml`, `expertise.md` and `evals/` in the layer, `.agents/` in the repo or the folder that `layer` names
 
-## Develop
+## Develop locally
 
 `uv run arete status` runs from the checkout without the installed tool.
 `uv tool install --editable . --python 3.13 --force` refreshes the `arete` on PATH that launchd uses.
