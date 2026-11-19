@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from contextlib import nullcontext
 from dataclasses import asdict
 from datetime import timedelta
@@ -113,10 +114,19 @@ def send_next(delivery, policy, client, cfg, repo) -> None:
         proof = client.ci(head, tree, "pull_request", **ci_scope)
         if not proof or not ready_to_squash(delivery, client):
             return
+        deadline = zte.wall_deadline(delivery)
         pilot.require(jev.ready(cfg, [repo]), "JEV is unavailable for this exact patch")
-        patch = pilot.git(where, "diff", "--no-ext-diff", "--no-textconv", delivery.base, head)
+        remaining = deadline - time.monotonic()
+        pilot.require(remaining > 0, jev.DEADLINE_EXPIRED)
+        patch = util.git(["diff", "--no-ext-diff", "--no-textconv", delivery.base, head], where,
+                         timeout=min(remaining, 30), retry=False)
         pilot.require(patch, "the exact patch is not available to JEV")
-        result = jev.risk(patch, policy.signal(delivery.base).task(), cfg, trace=(data["run"], "ZTE exact patch"))
+        try:
+            result = jev.risk(patch, policy.signal(delivery.base).task(), cfg, trace=(data["run"], "ZTE exact patch"),
+                              deadline=deadline)
+        except jev.Unjudged as error:
+            raise pilot.Held(f"JEV could not judge the exact patch: {error}") from error
+        pilot.require(time.monotonic() < deadline, jev.DEADLINE_EXPIRED)
         pilot.require(not result.hold, result.hold)
         risk = {**asdict(result), "patch": orchestration.digest(patch), "tree": tree, "head": head,
                 "model": cfg.jev.model, "risk_hold": cfg.jev.risk_hold,
