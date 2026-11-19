@@ -1446,6 +1446,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 else:
                     passed_over = "" if dry_run or run.alone else source_store.take_passed_over(repo.name, str(tid))
                 opening_waits(run_id, run.answering, passed_over)
+                if zte_grant:
+                    check_handoff()
                 if restarting:
                     run.log(f"restarting after run {earlier['id']} was interrupted")
                 if zte_grant:
@@ -1473,7 +1475,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             with handoff_io():
                 run.budget = runlimits.Budget(run, runlimits.Policy.of(layer), previous, current, fresh,
                                               wall_deadline=wall_deadline, checkpoint_timeout=0 if zte_grant else None)
-            with run.budget.watching():
+            with run.budget.watching(admit=check_handoff if zte_grant else None,
+                                     work_admitted=(lambda: work_started) if zte_grant else None):
                 with handoff_io():
                     if not (flow and flow.refusal):
                         run.budget.capture(current or tk.get(tid))
@@ -1499,6 +1502,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         except workspace.RunFailed as e:
             status, summary, pr_url = _fail(run, e.why, detail=e.detail)
         except tracker.ERRORS as e:
+            if zte_grant and not work_started:
+                return refuse_zte_start(repo.name, str(tid), slot, run_id, e, committed=True)
             status, summary, pr_url = _fail(run, f"tracker refused {run.ref}: {e}")
         except Exception as e:
             if zte_grant and not work_started:

@@ -308,10 +308,12 @@ class Budget:
         signal.setitimer(signal.ITIMER_REAL, max(0.001, deadline - time.monotonic()))
 
     @contextmanager
-    def watching(self):
+    def watching(self, *, admit=None, work_admitted=None):
         def expire(*_):
             raise Parked(self.reason())
 
+        if admit:
+            admit()
         if self.run_deadline() <= time.monotonic():
             raise Parked(self.reason())
         previous = signal.signal(signal.SIGALRM, expire)
@@ -321,10 +323,13 @@ class Budget:
 
         def checkpointing():
             while not stopped.wait(CHECKPOINT_SECONDS):
-                self.checkpoint()
+                if work_admitted is None or work_admitted():
+                    self.checkpoint()
 
         worker = threading.Thread(target=checkpointing, name=f"budget-{self.run.id}", daemon=True)
         try:
+            if admit:
+                admit()
             worker.start()
             self.arm()
             yield
@@ -335,7 +340,8 @@ class Budget:
             stopped.set()
             if worker.ident is not None:
                 worker.join()
-            self.checkpoint()
+            if work_admitted is None or work_admitted():
+                self.checkpoint()
 
     @contextmanager
     def idling(self, cause: str):
