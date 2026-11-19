@@ -457,6 +457,7 @@ def survey(*, check=lambda: None) -> View:
                                               key, name))
             return View(good, unreadable, False)
     except FileNotFoundError:
+        check()
         if os.path.lexists(sandbox.AUTHORITY):
             raise
         return View([], [], True)
@@ -482,8 +483,13 @@ def holds(view: View, workspace: Path, *, check=lambda: None) -> list:
             found.append(document)
     for unreadable in view.unreadable:
         check()
-        if not unreadable.workspace or (overlap(Path(unreadable.workspace), ws) and alive(unreadable)):
-            found.append(unreadable)
+        if unreadable.workspace:
+            if not overlap(Path(unreadable.workspace), ws):
+                continue
+            check()
+            if not alive(unreadable):
+                continue
+        found.append(unreadable)
     return found
 
 
@@ -491,6 +497,7 @@ def pending(workspace: Path, *, check=lambda: None) -> bool:
     try:
         return bool(holds(survey(check=check), workspace, check=check))
     except (OSError, ValueError, KeyError, TypeError):
+        check()
         return os.path.lexists(sandbox.AUTHORITY)
 
 

@@ -83,7 +83,8 @@ def candidate_git(repo: Path, args: tuple[str, ...], until: float, cap: float) -
                                             "GIT_CONFIG_NOSYSTEM") if key in os.environ}
     env.update(GIT_NO_LAZY_FETCH="1", GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", GIT_CONFIG_COUNT="1",
                GIT_CONFIG_KEY_0="core.fsmonitor", GIT_CONFIG_VALUE_0="false")
-    until = time.monotonic() + candidate_time_left(until, cap)
+    until = min(until, time.monotonic() + cap)
+    candidate_time_left(until, cap)
     with subprocess.Popen(command, cwd=repo, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                           stderr=subprocess.DEVNULL, start_new_session=True) as process:
         try:
