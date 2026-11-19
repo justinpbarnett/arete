@@ -1357,6 +1357,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     pilot.require(time.monotonic() < wall_deadline, "ZTE deadline expired before run registration")
 
                 run_id = ""
+                committed = False
                 try:
                     with util.lock(zte.INTERLOCK) as got_interlock:
                         pilot.require(got_interlock, "ZTE run registration is interlocked")
@@ -1373,6 +1374,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                             check_start_cutoff()
                             run_id = start()
                             zte_store.transition(fresh_grant, "running", run=run_id)
+                        committed = True
                         launch_lease.registered(repo.name, str(tid))
                         check_start_cutoff()
                 except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
@@ -1380,9 +1382,10 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     slot.free()
                     if run_id:
                         try:
-                            with db.one_read(timeout=0):
-                                registered = run_store.run_get(run_id)
-                            if registered:
+                            if not committed:
+                                with db.one_read(timeout=0):
+                                    committed = bool(run_store.run_get(run_id))
+                            if committed:
                                 try:
                                     launch_lease.registered(repo.name, str(tid))
                                 finally:
@@ -3247,6 +3250,11 @@ def retry_scratch(days: float = 30) -> None:
 
 
 def tell_ticket_run_died(cfg: config.Config, row: dict) -> None:
+    from . import zte
+
+    if zte.reserved(str(row["issue"])):
+        run_lines.write(row["id"], "error", message="Reserved README run ended without an active child; it will not be retried.")
+        return
     repo = cfg.repo(row["repo"])
     run = Run(row["id"], repo, paths.RUNS_DIR / row["id"], tracker=tracker.for_ticket(cfg, repo, str(row["issue"])),
               tid=str(row["issue"]), feedback=pending_feedback(repo.name, str(row["issue"])),
