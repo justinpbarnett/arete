@@ -192,16 +192,23 @@ def health(install: Installation, sha: str, *, after: str = "", old_pid: int = 0
     return {"at": beat["at"], "pid": pid, "engine": sha, "schema": install.schema, "https_status": 200}
 
 
+def failure_reason(error: Exception) -> str:
+    return util.first_line(str(error), 200) if isinstance(error, pilot.Held) else type(error).__name__
+
+
 def fresh_health(install: Installation, sha: str, after: str, old_pid: int, check, *, seconds=None) -> list[dict]:
     until = time.monotonic() + (HEALTH_SECONDS if seconds is None else seconds)
     evidence = []
+    reason = "no second heartbeat from the same process"
     while time.monotonic() < until:
         check()
         try:
             beat = health(install, sha, after=after, old_pid=old_pid)
-        except (OSError, RuntimeError, ValueError, KeyError, http.client.HTTPException, subprocess.SubprocessError):
+        except (OSError, RuntimeError, ValueError, KeyError, http.client.HTTPException, subprocess.SubprocessError) as error:
+            reason = failure_reason(error)
             evidence.clear()
         else:
+            reason = "no second heartbeat from the same process"
             if not evidence or beat["pid"] != evidence[-1]["pid"]:
                 evidence = [beat]
             elif beat["at"] != evidence[-1]["at"]:
@@ -209,7 +216,7 @@ def fresh_health(install: Installation, sha: str, after: str, old_pid: int, chec
                 check()
                 return [evidence[-1], beat]
         time.sleep(2)
-    raise pilot.Held("no two fresh authenticated HTTPS health beats for the managed release")
+    raise pilot.Held(f"no two fresh authenticated HTTPS health beats for the managed release: {reason}")
 
 
 def stage(install: Installation, delivery, client) -> Path:
@@ -243,7 +250,11 @@ def stage(install: Installation, delivery, client) -> Path:
             source.rename(root)
             util.flush_folder(root.parent)
     verify_source(root, sha, tree)
-    command(["uv", "sync", "--locked", "--no-dev"], where=root, timeout=client.time_left(120), env=env)
+    interpreter = Path(sys.executable).resolve(strict=True)
+    command(["uv", "sync", "--locked", "--no-dev", "--python", str(interpreter)], where=root,
+            timeout=client.time_left(120), env=env)
+    pilot.require((root / ".venv/bin/python").resolve() == interpreter,
+                  "the locked release did not retain the supervisor's Python interpreter")
     mark_runtime(root, sha, tree)
     return verify_runtime(install, sha, tree)
 
@@ -277,12 +288,12 @@ def preflight(delivery, policy) -> None:
         raise pilot.Held("the admitted last-good runtime or release worker is not healthy") from error
 
 
-def restore(install: Installation, delivery) -> None:
+def restore(install: Installation, delivery, *, reason: str = "") -> None:
     previous, release = delivery.data["last_good"], delivery.data["release"]
     with util.lock(zte.INTERLOCK, wait=True):
         if delivery.phase == "deploy_intent":
             util.write_durably(zte.PAUSE_FILE, json.dumps({"at": util.iso(), "task": delivery.task}).encode(), mode=0o600)
-            delivery = store.transition(delivery, "rollback_intent", restore_after=util.iso())
+            delivery = store.transition(delivery, "rollback_intent", restore_after=util.iso(), reason=reason)
         current = selected(install)
         pilot.require(current in (previous, release), "selector and recovery journal disagree; no runtime overwritten")
         known = verify_runtime(install, previous)
@@ -404,7 +415,7 @@ def tick() -> int:
             current = store.find(delivery.task)
             if current and current.phase == "deploy_intent":
                 try:
-                    restore(installation(current.data.get("installation")), current)
+                    restore(installation(current.data.get("installation")), current, reason=failure_reason(error))
                 except (OSError, RuntimeError, ValueError, TypeError, KeyError, http.client.HTTPException,
                         subprocess.SubprocessError) as rollback_error:
                     zte.hold(store.find(delivery.task), rollback_error, uncertain=True)
