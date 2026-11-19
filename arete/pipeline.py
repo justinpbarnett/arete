@@ -1356,6 +1356,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 def check_start_cutoff():
                     pilot.require(time.monotonic() < wall_deadline, "ZTE deadline expired before run registration")
 
+                committed = False
                 try:
                     with util.lock(zte.INTERLOCK) as got_interlock:
                         pilot.require(got_interlock, "ZTE run registration is interlocked")
@@ -1367,14 +1368,14 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                             check_start_cutoff()
                             run_id = start()
                             zte_store.transition(fresh_grant, "running", run=run_id)
-                        try:
-                            launch_lease.registered(repo.name, str(tid))
-                        except PermissionError:
-                            record.settle(run_id, "failed", summary="could not release the scheduled launch lease")
-                            raise
+                        committed = True
+                        launch_lease.registered(repo.name, str(tid))
+                        check_start_cutoff()
                 except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
                     print(f"could not start the reserved README task: {error}")
                     slot.free()
+                    if committed:
+                        record.settle(run_id, "failed", summary=str(error))
                     return 2
             else:
                 run_id = start()
