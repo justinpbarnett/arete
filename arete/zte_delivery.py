@@ -5,7 +5,7 @@ import json
 import os
 import sqlite3
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict
 from datetime import timedelta
 from pathlib import Path
@@ -20,21 +20,46 @@ JEV_STEP = "ZTE exact patch"
 JEV_USAGE_PENDING = paths.ZTE_AUTHORITY / "jev-response.pending"
 
 
-def settled(delivery, policy, repo, layer) -> bool:
-    until = zte.wall_deadline(delivery)
-    pilot.candidate_time_left(until, 1)
+@contextmanager
+def deadline_snapshot(until: float, check):
+    check()
     with db.one_read(timeout=0) as conn:
+        check()
         conn.set_progress_handler(lambda: int(time.monotonic() >= until), 1000)
         try:
-            ready = validate_candidate(delivery, policy, repo, layer, until)
+            yield
         except sqlite3.OperationalError as error:
             if error.sqlite_errorcode == sqlite3.SQLITE_INTERRUPT:
-                pilot.candidate_time_left(until, 1)
+                check()
             raise
         finally:
             conn.set_progress_handler(None, 0)
-    pilot.candidate_time_left(until, 1)
-    return ready
+    check()
+
+
+def settled(delivery, policy, repo, layer, *, until: float) -> bool:
+    with deadline_snapshot(until, lambda: pilot.candidate_time_left(until, 1)):
+        return validate_candidate(delivery, policy, repo, layer, until)
+
+
+def observe_startup(delivery, until: float) -> None:
+    def check():
+        pilot.require(time.monotonic() < until, "ZTE deadline expired while observing the scheduled startup")
+
+    check()
+    if delivery.phase == "dispatching":
+        leased = launch_lease.held(delivery.repo, delivery.task)
+        check()
+        if not leased:
+            with deadline_snapshot(until, check):
+                current = store.find(delivery.task)
+                check()
+                pilot.require(current != delivery, "the scheduled child exited before registration")
+    else:
+        with deadline_snapshot(until, check):
+            run = pilot.scheduled_run(delivery.repo, delivery.task, until=until)
+            check()
+            pilot.require(run and not run.get("finished"), "the run stopped before preparing an exact candidate")
 
 
 def validate_candidate(delivery, policy, repo, layer, until: float) -> bool:
@@ -381,16 +406,18 @@ def reconcile(delivery, client, observed: dict) -> None:
             store.transition(delivery, "merged", **receipt)
 
 
-def advance(cfg) -> None:
+def advance(cfg) -> bool:
     try:
         with db.one_read(timeout=0):
             delivery = store.latest()
     except sqlite3.OperationalError as error:
         if not database_busy(error):
             raise
-        return
-    if not delivery or delivery.phase in store.TERMINAL | {"release_ready", "deploy_intent", "rollback_intent"}:
-        return
+        return False
+    if not delivery or delivery.phase == "healthy":
+        return True
+    if delivery.phase in store.TERMINAL | {"release_ready", "deploy_intent", "rollback_intent"}:
+        return False
     observed: dict = {}
     if delivery.phase in INTENTS:
         timestamp = delivery.data[f"{delivery.phase.removesuffix('_intent')}_sent_after"]
@@ -411,24 +438,22 @@ def advance(cfg) -> None:
                 except sqlite3.OperationalError as busy:
                     if not database_busy(busy):
                         raise
-        return
+        return False
+    until = zte.wall_deadline(delivery)
+    startup = delivery.phase in ("dispatching", "running")
     try:
         policy = zte.active(delivery)
         repo, layer, digest = zte.settings(cfg, policy)
         pilot.require(repo.name == delivery.repo and digest == delivery.data["config"], "ZTE configuration changed")
-        client = policy.client(delivery.deadline)
         if delivery.phase == "queued":
-            return
-        if delivery.phase == "dispatching":
-            if not launch_lease.held(delivery.repo, delivery.task):
-                pilot.require(store.find(delivery.task) != delivery, "the scheduled child exited before registration")
-            return
-        if delivery.phase == "running":
-            run = pilot.scheduled_run(delivery.repo, delivery.task)
-            pilot.require(run and not run.get("finished"), "the run stopped before preparing an exact candidate")
-            return
-        if not settled(delivery, policy, repo, layer):
-            return
+            pilot.require(time.monotonic() < until, "ZTE deadline expired while queued")
+            return False
+        if startup:
+            observe_startup(delivery, until)
+            return False
+        if not settled(delivery, policy, repo, layer, until=until):
+            return False
+        client = policy.client(delivery.deadline)
         if delivery.phase == "merged":
             policy.audit(client)
             release = delivery.data["release"]
@@ -441,6 +466,10 @@ def advance(cfg) -> None:
         else:
             send_next(delivery, policy, client, cfg, repo)
     except (OSError, RuntimeError, ValueError, TypeError, KeyError, sqlite3.Error) as error:
+        if startup and isinstance(error, sqlite3.OperationalError) and database_busy(error):
+            if time.monotonic() < until:
+                return False
+            error = pilot.Held("ZTE deadline expired while observing the scheduled startup")
         try:
             with db.one_read(timeout=0):
                 current = store.find(delivery.task)
@@ -450,13 +479,15 @@ def advance(cfg) -> None:
         except sqlite3.OperationalError as busy:
             if not database_busy(busy):
                 raise
+    return False
 
 
 def tick(cfg) -> None:
     with util.lock(zte.DELIVERY_LOCK) as got:
         if not got or not reconcile_jev_usage():
             return
-        advance(cfg)
+        can_find = advance(cfg)
         if not reconcile_jev_usage():
             return
-    zte.finder(cfg)
+    if can_find:
+        zte.finder(cfg)
