@@ -6,7 +6,9 @@ import sqlite3
 import stat
 import threading
 import time
+from collections.abc import Callable
 from contextlib import ExitStack, contextmanager, suppress
+from contextvars import ContextVar
 from pathlib import Path
 
 from .. import dbstats, paths, util
@@ -16,6 +18,21 @@ from .migrations import m0002_foundation_time_shape as time_shape
 TABLES = {"schema_meta": "kept", "schema_migrations": "kept"}
 DB_LOCK = threading.Lock()
 DB_THREAD = threading.local()
+_TRANSACTION_DEADLINE: ContextVar[tuple[float, Callable[[], None]] | None] = ContextVar(
+    "sqlite_transaction_deadline", default=None)
+
+
+@contextmanager
+def nonblocking_transactions(until: float, check: Callable[[], None]):
+    if _TRANSACTION_DEADLINE.get() is not None or in_write():
+        raise RuntimeError("bounded transactions require an outer startup scope")
+    token = _TRANSACTION_DEADLINE.set((until, check))
+    try:
+        check()
+        yield
+        check()
+    finally:
+        _TRANSACTION_DEADLINE.reset(token)
 
 
 class FixtureConnection(sqlite3.Connection):
@@ -318,6 +335,11 @@ def read_connection(*, timeout: float | None = None):
 
 @contextmanager
 def owned(mode, timeout, before_commit=None):
+    bounded = _TRANSACTION_DEADLINE.get()
+    if bounded:
+        until, check = bounded
+        check()
+        timeout = 0
     active = getattr(_OWNER, "active", None)
     if active and active[0] == os.getpid():
         if before_commit is not None:
@@ -329,11 +351,29 @@ def owned(mode, timeout, before_commit=None):
         return
     timing = dbstats.Timing(paths.DB_FILE, mode)
     connect = checked_connection if mode == "write" else read_connection
+    def guarded_commit():
+        if before_commit is not None:
+            before_commit()
+        check()
+
     try:
         with owning_transaction(lambda: connect(timeout=timeout), "BEGIN IMMEDIATE" if mode == "write" else "BEGIN", timing,
-                                commit=mode == "write", before_commit=before_commit) as conn:
+                                commit=mode == "write", before_commit=guarded_commit if bounded else before_commit) as conn:
             _OWNER.active = (os.getpid(), mode, conn)
-            yield conn
+            if bounded:
+                check()
+                conn.set_progress_handler(lambda: int(time.monotonic() >= until), 1000)
+            try:
+                yield conn
+                if bounded and mode == "read":
+                    check()
+            except sqlite3.OperationalError as error:
+                if bounded and error.sqlite_errorcode == sqlite3.SQLITE_INTERRUPT:
+                    check()
+                raise
+            finally:
+                if bounded:
+                    conn.set_progress_handler(None, 0)
     finally:
         _OWNER.active = None
 
