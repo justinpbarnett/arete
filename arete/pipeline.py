@@ -9,6 +9,7 @@ import re
 import shlex
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -1316,7 +1317,10 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             except (OSError, RuntimeError, ValueError) as error:
                 print(f"could not start the reserved README task: {error}")
                 return 2
-        with slots.admitting():
+        with slots.admitting(wait=zte_grant is None) as admitting:
+            if not admitting:
+                print("could not start the reserved README task: slot admission is busy")
+                return 2
             slot = slots.RunSlot(repo.name, str(tid), cfg.max_parallel)
             only = (script.only or (script.action if script.action_only else "")) if script else ""
             due = asks_store.asks_due([script.continues]) if script and script.continues and not only else []
@@ -1349,21 +1353,47 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 from . import launch_lease
                 from .store import db
 
+                def check_start_cutoff():
+                    pilot.require(time.monotonic() < wall_deadline, "ZTE deadline expired before run registration")
+
+                run_id = ""
+                committed = False
                 try:
-                    with util.lock(zte.INTERLOCK, wait=True):
-                        fresh_grant = zte.admit_run(config.load(), repo, str(tid))
+                    with util.lock(zte.INTERLOCK) as got_interlock:
+                        pilot.require(got_interlock, "ZTE run registration is interlocked")
+                        check_start_cutoff()
+                        with db.one_read(timeout=0):
+                            fresh_grant = zte.admit_run(config.load(), repo, str(tid))
                         pilot.require(fresh_grant == zte_grant, "ZTE authorization changed before run start")
-                        with db.tx():
+                        readme_rule = zte.active(fresh_grant).signal(fresh_grant.base)
+                        check_start_cutoff()
+                        with db.tx(timeout=0, before_commit=check_start_cutoff):
+                            check_start_cutoff()
+                            pilot.require(zte.task_version(fresh_grant, readme_rule, "todo") == fresh_grant.data["task_version"],
+                                          "the reserved task was edited before ZTE launch")
+                            check_start_cutoff()
                             run_id = start()
                             zte_store.transition(fresh_grant, "running", run=run_id)
-                        try:
-                            launch_lease.registered(repo.name, str(tid))
-                        except PermissionError:
-                            record.settle(run_id, "failed", summary="could not release the scheduled launch lease")
-                            raise
-                except (OSError, RuntimeError, ValueError) as error:
+                        committed = True
+                        launch_lease.registered(repo.name, str(tid))
+                        check_start_cutoff()
+                except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
                     print(f"could not start the reserved README task: {error}")
                     slot.free()
+                    if run_id:
+                        try:
+                            if not committed:
+                                with db.one_read(timeout=0):
+                                    committed = bool(run_store.run_get(run_id))
+                            if committed:
+                                try:
+                                    launch_lease.registered(repo.name, str(tid))
+                                finally:
+                                    failed = {"status": "failed", "finished": util.iso(), "summary": str(error)}
+                                    with db.tx(timeout=0):
+                                        run_store.settle(run_id, failed)
+                        except (OSError, RuntimeError, sqlite3.Error) as cleanup:
+                            print(f"could not reconcile reserved run {run_id}: {cleanup}")
                     return 2
             else:
                 run_id = start()
@@ -3220,6 +3250,11 @@ def retry_scratch(days: float = 30) -> None:
 
 
 def tell_ticket_run_died(cfg: config.Config, row: dict) -> None:
+    from . import zte
+
+    if zte.reserved(str(row["issue"])):
+        run_lines.write(row["id"], "error", message="Reserved README run ended without an active child; it will not be retried.")
+        return
     repo = cfg.repo(row["repo"])
     run = Run(row["id"], repo, paths.RUNS_DIR / row["id"], tracker=tracker.for_ticket(cfg, repo, str(row["issue"])),
               tid=str(row["issue"]), feedback=pending_feedback(repo.name, str(row["issue"])),
