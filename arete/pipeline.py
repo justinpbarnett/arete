@@ -1240,7 +1240,6 @@ def refuse_zte_start(repo: str, tid: str, slot: slots.RunSlot, run_id: str, erro
     from . import launch_lease
     from .store import db
 
-    print(f"could not start the reserved README task: {error}")
     slot.free()
     if run_id:
         try:
@@ -1254,8 +1253,8 @@ def refuse_zte_start(repo: str, tid: str, slot: slots.RunSlot, run_id: str, erro
                     failed = {"status": "failed", "finished": util.iso(), "summary": str(error)}
                     with db.tx(timeout=0):
                         run_store.settle(run_id, failed)
-        except (OSError, RuntimeError, sqlite3.Error) as cleanup:
-            print(f"could not reconcile reserved run {run_id}: {cleanup}")
+        except (OSError, RuntimeError, sqlite3.Error):
+            pass  # The scheduled reaper settles abandoned registered runs.
     return 2
 
 
@@ -1381,6 +1380,14 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 pilot.require(not zte.PAUSE_FILE.exists(), "ZTE was stopped before the flow started")
                 check_start_cutoff()
 
+            @contextmanager
+            def handoff_io():
+                with ExitStack() as stack:
+                    if zte_grant:
+                        stack.enter_context(db.nonblocking_transactions(wall_deadline, check_handoff))
+                        stack.enter_context(run_lines.nonblocking_appends(check_handoff))
+                    yield
+
             if zte_grant:
                 run_id = ""
                 committed = False
@@ -1414,8 +1421,15 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                       answering=earlier if earlier and earlier["status"] == "needs-info" else {},
                       launch_gate=admission, launch_done=launch_done, closed_context=closed_context,
                 **(script.run_fields if script else {}))
-            run.dir.mkdir(parents=True, exist_ok=True)
-            run_lines.write(run.id, "execution", path=run.path or "classic", protocol=1 if run.path == "orchestrate" else 0)
+            try:
+                with handoff_io():
+                    run.dir.mkdir(parents=True, exist_ok=True)
+                    run_lines.write(run.id, "execution", path=run.path or "classic",
+                                    protocol=1 if run.path == "orchestrate" else 0)
+            except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
+                if not zte_grant:
+                    raise
+                return refuse_zte_start(repo.name, str(tid), slot, run_id, error, committed=True)
             if held_from := earlier["id"] if restarting or run.answering else (
                     script.continues or script.repairs if script else ""):
                 run.ab_held = run_store.ab_held(held_from)
@@ -1431,9 +1445,6 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             if done["status"] != "stopped":
                 run_lines.write(done["id"], "error", step=run_lines.last_step(done["id"]), message=done.get("summary") or "")
             write_report(done)
-        def handoff_io():
-            return db.nonblocking_transactions(wall_deadline, check_handoff) if zte_grant else nullcontext()
-
         try:
             with handoff_io():
                 if zte_grant:
@@ -3294,7 +3305,11 @@ def tell_ticket_run_died(cfg: config.Config, row: dict) -> None:
     from . import zte
 
     if zte.reserved(str(row["issue"])):
-        run_lines.write(row["id"], "error", message="Reserved README run ended without an active child; it will not be retried.")
+        try:
+            with run_lines.nonblocking_appends(lambda: None):
+                run_lines.write(row["id"], "error", message="Reserved README run ended without an active child; it will not be retried.")
+        except (OSError, run_lines.AppendRefused):
+            pass
         return
     repo = cfg.repo(row["repo"])
     run = Run(row["id"], repo, paths.RUNS_DIR / row["id"], tracker=tracker.for_ticket(cfg, repo, str(row["issue"])),
