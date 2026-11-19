@@ -8,6 +8,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 
 from . import codebase, events, paths, principals, util
@@ -24,6 +25,47 @@ TAIL_BYTES = 4096
 
 _writing = threading.Lock()
 _named: set[tuple[int, str]] = set()
+_append_guard: ContextVar[Callable[[], None] | None] = ContextVar("run_line_append_guard", default=None)
+
+
+class LogBusy(RuntimeError):
+    pass
+
+
+@contextmanager
+def nonblocking_appends(check: Callable[[], None]):
+    token = _append_guard.set(check)
+    try:
+        check()
+        yield
+        check()
+    finally:
+        _append_guard.reset(token)
+
+
+@contextmanager
+def locked_log(target: Path, check: Callable[[], None] | None):
+    if check:
+        check()
+    if not _writing.acquire(blocking=check is None):
+        raise LogBusy("another thread is appending run events")
+    try:
+        if check:
+            check()
+        with open(target, "a+b", buffering=0 if check else -1) as stream:
+            if check:
+                check()
+            try:
+                fcntl.flock(stream, fcntl.LOCK_EX | (fcntl.LOCK_NB if check else 0))
+            except BlockingIOError as error:
+                if check:
+                    raise LogBusy("the run event log is locked") from error
+                raise
+            if check:
+                check()
+            yield stream
+    finally:
+        _writing.release()
 
 
 def path(run_id: str) -> Path:
@@ -51,11 +93,13 @@ def seq_of(line: dict) -> int:
     return seq if type(seq) is int else 0
 
 
-def tail(f) -> tuple[int, bool]:
+def tail(f, check: Callable[[], None] | None = None) -> tuple[int, bool]:
     end = f.seek(0, 2)
     f.seek(max(0, end - 1))
     torn, size = bool(end) and f.read(1) != b"\n", TAIL_BYTES
     while True:
+        if check:
+            check()
         start = max(0, end - size)
         f.seek(start)
         data = f.read(end - start)
@@ -70,21 +114,29 @@ def write(run_id: str, event: str, **fields) -> dict:
     line = {"ts": util.iso(), "run": run_id, "seq": 0, "event": event,
             **{k: v for k, v in fields.items() if k not in FIXED + ("engine",)}}
     target = path(run_id)
+    check = _append_guard.get()
     try:
+        if check:
+            check()
         target.parent.mkdir(parents=True, exist_ok=True)
-        with _writing, open(target, "a+b") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            seq, torn = tail(f)
+        with locked_log(target, check) as f:
+            seq, torn = tail(f, check)
             line["ts"], line["seq"] = util.iso(), seq + 1
             first = (os.getpid(), run_id) not in _named
             if first:
                 line["engine"] = codebase.STAMP
             text = json.dumps(line, ensure_ascii=False, default=str)
-            f.write((b"\n" if torn else b"") + text.encode() + b"\n")
+            payload = (b"\n" if torn else b"") + text.encode() + b"\n"
+            if check:
+                check()
+            if f.write(payload) != len(payload):
+                raise OSError("incomplete run event append")
             f.flush()
             if first:
                 _named.add((os.getpid(), run_id))
     except OSError as e:
+        if check:
+            raise
         text = json.dumps(line, ensure_ascii=False, default=str)
         print(f"{util.iso()} could not write {event} to {target}: {e}", file=sys.stderr, flush=True)
     if event in ("step_start", "step_end"):
@@ -94,6 +146,8 @@ def write(run_id: str, event: str, **fields) -> dict:
             events.emit("step.started" if event == "step_start" else "step.ended",
                         f"step:{run_id}/{step}/{attempt}", cls="derived", task=row["issue"] if row else None,
                         data={**fields, "run": run_id, "step": step, "try": attempt})
+    if check:
+        check()
     sys.stdout.write(text + "\n")
     sys.stdout.flush()
     return line
