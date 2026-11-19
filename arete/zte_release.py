@@ -13,7 +13,7 @@ import tempfile
 import time
 import tomllib
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -121,9 +121,21 @@ def switch(install: Installation, previous: str, sha: str) -> None:
     util.write_durably(install.selector, json.dumps({"sha": sha}).encode(), mode=0o600)
 
 
-def restart(install: Installation) -> None:
-    boot = subprocess.run(["/bin/launchctl", "kickstart", "-k", install.service],
-                          timeout=20, capture_output=True, check=False)
+def activation_deadline(delivery) -> datetime:
+    window = util.parse_iso(delivery.data["activation_after"]) + timedelta(seconds=HEALTH_SECONDS)
+    return min(window, util.parse_iso(delivery.deadline))
+
+
+def activation_time_left(until: datetime) -> float:
+    remaining = (until - util.now()).total_seconds()
+    pilot.require(remaining > 0, "the initial managed release health window expired")
+    return remaining
+
+
+def restart(install: Installation, *, until: datetime | None = None) -> None:
+    command = ["/bin/launchctl", "kickstart", "-k", install.service]
+    timeout = min(20, activation_time_left(until)) if until is not None else 20
+    boot = subprocess.run(command, timeout=timeout, capture_output=True, check=False)
     pilot.require(boot.returncode == 0, "launchd could not restart the managed service")
 
 
@@ -375,26 +387,43 @@ def deploy(install: Installation, delivery) -> None:
                           "the last-good runtime changed before activation")
             intent = store.transition(delivery, "deploy_intent", last_good=prior, activation_after=util.iso(),
                                       old_pid=before["pid"], installation=install.to_receipt())
+            active(intent, install)
+            until = activation_deadline(intent)
+            activation_time_left(until)
             switch(install, prior, sha)
-    restart(install)
+    with util.lock(zte.INTERLOCK) as got:
+        pilot.require(got, "the Stop interlock is busy before the managed restart")
+        active(intent, install)
+        pilot.require(selected(install) == sha, "the selected runtime changed before the managed restart")
+        restart(install, until=until)
     finish(install, intent)
 
 
 def finish(install: Installation, delivery) -> None:
     data = delivery.data
     sha = data["release"]
+    until = activation_deadline(delivery)
+
+    def check():
+        policy = active(delivery, install)
+        activation_time_left(until)
+        return policy
+
     pilot.require(selected(install) == sha, "the deployment intent has no active candidate selector")
-    beats = fresh_health(install, sha, data["activation_after"], data["old_pid"], lambda: active(delivery, install))
-    policy = active(delivery, install)
-    zte_delivery.require_landing(delivery, policy.client(delivery.deadline), sha)
+    check()
+    beats = fresh_health(install, sha, data["activation_after"], data["old_pid"], check,
+                         seconds=activation_time_left(until))
+    policy = check()
+    zte_delivery.require_landing(delivery, policy.client(util.iso(until)), sha)
     database(install)
     final = health(install, sha, after=data["activation_after"], old_pid=data["old_pid"])
     with util.lock(zte.INTERLOCK, wait=True), db.tx():
-        active(delivery, install)
+        check()
         database(install)
         pilot.require(selected(install) == sha, "the selected runtime changed during validation")
         pilot.require(final["pid"] == beats[-1]["pid"] and util.pid_alive(final["pid"]),
                       "the validated runtime exited or restarted before completion")
+        activation_time_left(until)
         store.complete(delivery, data["pr_task_version"], release_health=beats, completion_health=final)
 
 
