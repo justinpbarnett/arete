@@ -184,8 +184,9 @@ idle_waits = budget_legacy.idle_waits
 
 class Budget:
     def __init__(self, run, policy: Policy, previous: str, ticket=None, forced: bool = False,
-                 *, wall_deadline: float = math.inf) -> None:
+                 *, wall_deadline: float = math.inf, checkpoint_timeout: float | None = None) -> None:
         self.run, self.policy, self.wall_deadline = run, policy, wall_deadline
+        self.checkpoint_timeout = checkpoint_timeout
         chain = family(previous)
         rows = {rid: run_store.run_get(rid) for rid in chain}
         if any(row is None or (row["repo"], str(row["issue"])) != (run.repo.name, str(run.tid))
@@ -261,7 +262,7 @@ class Budget:
                 "specification": self.specification, **self.left_out_waits(now)}
             compatibility = getattr(self, "compatibility", True)
             try:
-                with foundation.tx() as conn:
+                with foundation.tx(timeout=self.checkpoint_timeout) as conn:
                     compatibility = not contracted(conn)
                     self.compatibility = compatibility
                     run_store.checkpoint(self.run.id, active, self.current_verification_seconds,
