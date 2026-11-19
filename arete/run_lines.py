@@ -4,6 +4,7 @@ import fcntl
 import json
 import os
 import sys
+import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -228,9 +229,26 @@ def wait_minutes(run_id: str) -> dict:
 @contextmanager
 def beating(run_id: str, step: str):
     started = time.monotonic()
+    append_guard = _append_guard.get()
+    closed = threading.Event()
+
+    def check():
+        append_guard()
+        if closed.is_set():
+            raise AppendRefused("the step heartbeat ended")
 
     def beat() -> None:
-        write(run_id, "heartbeat", step=step, seconds=round(time.monotonic() - started, 1))
+        if append_guard is None:
+            write(run_id, "heartbeat", step=step, seconds=round(time.monotonic() - started, 1))
+            return
+        try:
+            with nonblocking_appends(check):
+                write(run_id, "heartbeat", step=step, seconds=round(time.monotonic() - started, 1))
+        except (OSError, RuntimeError):
+            return  # A diagnostic heartbeat must not delay the step or its unwind.
 
-    with util.repeating(HEARTBEAT_SECONDS, beat, f"heartbeat {run_id}"):
-        yield
+    with util.repeating(HEARTBEAT_SECONDS, beat, f"heartbeat {run_id}", wait_on_exit=append_guard is None):
+        try:
+            yield
+        finally:
+            closed.set()

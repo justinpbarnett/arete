@@ -1479,11 +1479,9 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         pr_url, passed, work_started = "", None, False
 
         def check_work_log():
-            if time.monotonic() >= wall_deadline:
-                raise runlimits.Parked("the ZTE authorization expired")
+            pilot.require(time.monotonic() < wall_deadline, "the ZTE authorization expired")
             pilot.require(not zte.PAUSE_FILE.exists(), "ZTE was stopped")
-            if time.monotonic() >= wall_deadline:
-                raise runlimits.Parked("the ZTE authorization expired")
+            pilot.require(time.monotonic() < wall_deadline, "the ZTE authorization expired")
 
         def checkpoint_allowed():
             return time.monotonic() < wall_deadline and not zte.PAUSE_FILE.exists()
