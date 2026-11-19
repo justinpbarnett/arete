@@ -184,9 +184,10 @@ idle_waits = budget_legacy.idle_waits
 
 class Budget:
     def __init__(self, run, policy: Policy, previous: str, ticket=None, forced: bool = False,
-                 *, wall_deadline: float = math.inf, checkpoint_timeout: float | None = None) -> None:
+                 *, wall_deadline: float = math.inf, checkpoint_timeout: float | None = None,
+                 checkpoint_gate=None) -> None:
         self.run, self.policy, self.wall_deadline = run, policy, wall_deadline
-        self.checkpoint_timeout = checkpoint_timeout
+        self.checkpoint_timeout, self.checkpoint_gate = checkpoint_timeout, checkpoint_gate
         chain = family(previous)
         rows = {rid: run_store.run_get(rid) for rid in chain}
         if any(row is None or (row["repo"], str(row["issue"])) != (run.repo.name, str(run.tid))
@@ -253,6 +254,8 @@ class Budget:
 
     def checkpoint(self) -> None:
         with self.lock:
+            if self.checkpoint_gate is not None and not self.checkpoint_gate():
+                return
             now, at = time.monotonic(), util.iso()
             opened = now - self.idle_since if self.idle_since is not None else 0
             active = max(0, now - self.started - self.idled - opened)
@@ -308,7 +311,7 @@ class Budget:
         signal.setitimer(signal.ITIMER_REAL, max(0.001, deadline - time.monotonic()))
 
     @contextmanager
-    def watching(self, *, admit=None, work_admitted=None):
+    def watching(self, *, admit=None, work_admitted=None, periodic: bool = True):
         def expire(*_):
             raise Parked(self.reason())
 
@@ -326,11 +329,12 @@ class Budget:
                 if work_admitted is None or work_admitted():
                     self.checkpoint()
 
-        worker = threading.Thread(target=checkpointing, name=f"budget-{self.run.id}", daemon=True)
+        worker = threading.Thread(target=checkpointing, name=f"budget-{self.run.id}", daemon=True) if periodic else None
         try:
             if admit:
                 admit()
-            worker.start()
+            if worker is not None:
+                worker.start()
             self.arm()
             yield
         finally:
@@ -338,7 +342,7 @@ class Budget:
             signal.setitimer(signal.ITIMER_REAL, *previous_timer)
             signal.signal(signal.SIGALRM, previous)
             stopped.set()
-            if worker.ident is not None:
+            if worker is not None and worker.ident is not None:
                 worker.join()
             if work_admitted is None or work_admitted():
                 self.checkpoint()
