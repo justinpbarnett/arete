@@ -6,7 +6,7 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from . import paths, pilot, record, routing, verify
+from . import paths, pi_shell, pilot, record, routing, verify
 
 if TYPE_CHECKING:
     from .pipeline import Run
@@ -15,13 +15,15 @@ if TYPE_CHECKING:
 def observed(run_id: str, filename: str, command: str, excerpt: str) -> bool:
     if not filename or Path(filename).name != filename:
         return False
-    calls = list(record.lines(paths.record_dir(run_id) / filename))
-    asked = [event for event in calls if event.get("type") == "tool_execution_start"]
-    if len(asked) != 1 or asked[0].get("toolName") != "bash" or asked[0].get("args", {}).get("command") != command:
+    calls = [event for event in record.lines(paths.record_dir(run_id) / filename)
+             if event.get("type") in {"tool_execution_start", "tool_execution_end"}]
+    if [event["type"] for event in calls] != ["tool_execution_start", "tool_execution_end"]:
         return False
-    return any(event.get("type") == "tool_execution_end" and event.get("toolCallId") == asked[0].get("toolCallId")
-               and event.get("isError") is False and event.get("result", {}).get("content") ==
-               [{"type": "text", "text": f"{excerpt}\nExit code: 0"}] for event in calls)
+    start, end = calls
+    return (start.get("toolName") == end.get("toolName") == pi_shell.TOOL
+            and bool(start.get("toolCallId")) and start["toolCallId"] == end.get("toolCallId")
+            and start.get("args", {}).get("command") == command and end.get("isError") is False
+            and end.get("result", {}).get("content") == [{"type": "text", "text": f"{excerpt}\nExit code: 0"}])
 
 
 def check(run: Run, source: Path, step: str, signal: pilot.Signal, tree: str) -> verify.Verified:
@@ -41,8 +43,9 @@ def check(run: Run, source: Path, step: str, signal: pilot.Signal, tree: str) ->
             document.write_bytes(stored)
             document.chmod(0o400)
             identity = document.stat()
-            result = run.agent(step, f"Verify the exact candidate README as a reader. Run this one read-only "
-                               f"command verbatim: `{command}`. Check that the heading is `{signal.after}` and "
+            result = run.agent(step, f"Verify the exact candidate README as a reader. Call `{pi_shell.TOOL}` once "
+                               f"with exactly this command and no prefixes or suffixes: `{command}`. "
+                               f"Check that the heading is `{signal.after}` and "
                                "the nearby instructions are readable. No service or Git commands are needed. "
                                "Report what you actually observed; if the read fails, return blocked.",
                                view, role="verify", tools=["Bash"], allowed_tools=[f"Bash({command})"],

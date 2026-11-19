@@ -50,14 +50,14 @@ if TYPE_CHECKING:
     from . import guard
 
 TOOLS_OF = {"Read": ("read",), "Glob": ("find", "ls"), "Grep": ("grep",), "LS": ("ls",), "Edit": ("edit",),
-            "MultiEdit": ("edit",), "Write": ("write",), "Bash": ("bash",)}
-WRITING = {"edit", "write", "bash"}
+            "MultiEdit": ("edit",), "Write": ("write",), "Bash": (pi_shell.TOOL,)}
+WRITING = {"edit", "write", pi_shell.TOOL}
 PI_HOME = paths.HOME / ".pi"
 KEYS_FILE = paths.PI_KEYS_FILE
 GUARD_FILE = paths.PACKAGE_DIR / "pi_guard.mjs"
 ASK_FILE = paths.PACKAGE_DIR / "pi_ask.mjs"
 SHELL_FILE = paths.PACKAGE_DIR / "pi_shell.mjs"
-GUARDED_TOOLS = frozenset({"read", "edit", "write", "grep", "find", "ls", "bash"})
+GUARDED_TOOLS = frozenset({"read", "edit", "write", "grep", "find", "ls", pi_shell.TOOL})
 SCHEMA_RULE = ("No tool takes this answer, so write it as the text of your last reply. Reply with only one JSON value "
                "that matches this JSON schema, in a ```json fence, and nothing after it:\n\n{schema}")
 PARENT_SESSION_VARS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")
@@ -523,8 +523,8 @@ def tool_names(tools: list[str] | None, allowed_tools: list[str] | None, disallo
             continue
         names += [n for n in TOOLS_OF.get(tool, ()) if n not in names]
     if "Bash" not in denied and (tools is None or "Bash" in tools) and any(
-            t.startswith("Bash(") for t in allowed_tools or []) and "bash" not in names:
-        names.append("bash")
+            t.startswith("Bash(") for t in allowed_tools or []) and pi_shell.TOOL not in names:
+        names.append(pi_shell.TOOL)
     return names
 
 
@@ -569,8 +569,9 @@ def guard_env(floor: guard.Floor, auth_paths: list[Path] | None = None,
                 inodes.append(f"{stat.st_dev}:{stat.st_ino}")
             except OSError:
                 pass
-    return {"ARETE_PI_GUARD_PATHS": json.dumps({"delegation_only": delegation_only, "shell": shell,
-                                              "inodes": inodes, "shell_file": str(SHELL_FILE),
+    return {"ARETE_PI_GUARD_PATHS": json.dumps({"delegation_only": delegation_only,
+                                              "shell_tool": pi_shell.TOOL if shell else "", "shell_file": str(SHELL_FILE),
+                                              "inodes": inodes,
                                               "secret_names": sandbox.SECRET_NAMES, "safe_names": sandbox.SAFE_NAMES,
                                               "secret_dirs": sorted(sandbox.SECRET_DIRS),
                                               "roots": list(map(str, roots)), "files": list(map(str, files)),
@@ -593,7 +594,7 @@ def command(names: list[str], *, model: str = "", effort: str = "", resume: Sess
            "--no-prompt-templates", "--no-themes", "--no-approve", "--no-mcp", "--extension", str(GUARD_FILE)]
     if ask_owner:
         cmd += ["--extension", str(ASK_FILE)]
-    if "bash" in names:
+    if pi_shell.TOOL in names:
         cmd += ["--extension", str(SHELL_FILE)]
     names = [*names, owner_asks.TOOL] if ask_owner else names
     cmd += ["--tools", ",".join(names)] if names else ["--no-tools"]
@@ -853,14 +854,14 @@ def _run(
     folder = selected.view
     env = {**selected.env, **(extra_env or {}), "PI_CODING_AGENT_DIR": str(folder),
            **guard_env(floor, [selected.owner, folder / "auth.json"], selected.sensitive_files,
-                       delegation_only=delegation_only, shell="bash" in names),
+                       delegation_only=delegation_only, shell=pi_shell.TOOL in names),
            **({"ARETE_ASK_TOOL": json.dumps(owner_asks.pi_tool())} if ask_owner else {})}
     protection = json.loads(env["ARETE_PI_GUARD_PATHS"])
     shell = (pi_shell.Shell(cwd, tuple(add_dirs), floor, tuple(allowed_tools or ()), tuple(disallowed_tools or ()),
                             pi_shell.command_env(passing, extra_env, selected.hidden),
                             (selected.owner, folder, *selected.sensitive_files, *map(Path, protection["files"])),
                             judge, time.monotonic() + timeout, tuple(read_roots))
-             if "bash" in names else None)
+             if pi_shell.TOOL in names else None)
     try:
         with refresh_channel(selected, env) as refresh, pi_shell.channel(shell, env) as terminal:
             descriptors = (*refresh, *terminal)

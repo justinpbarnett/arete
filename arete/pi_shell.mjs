@@ -8,8 +8,8 @@ export default function (pi) {
         throw new Error("Arete's shell needs a private engine descriptor");
     }
     pi.registerTool({
-        name: "bash",
-        label: "bash",
+        name: "arete_shell",
+        label: "Arete shell",
         executionMode: "sequential",
         description: "Run a shell command under this step's permissions, guard and filesystem confinement. "
             + "The working directory and environment are fixed by Arete. Commands stop at 120 seconds or 32768 output bytes.",
