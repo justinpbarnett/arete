@@ -1356,26 +1356,41 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 def check_start_cutoff():
                     pilot.require(time.monotonic() < wall_deadline, "ZTE deadline expired before run registration")
 
-                committed = False
+                run_id = ""
                 try:
                     with util.lock(zte.INTERLOCK) as got_interlock:
                         pilot.require(got_interlock, "ZTE run registration is interlocked")
                         check_start_cutoff()
+                        with db.one_read(timeout=0):
+                            fresh_grant = zte.admit_run(config.load(), repo, str(tid))
+                        pilot.require(fresh_grant == zte_grant, "ZTE authorization changed before run start")
+                        readme_rule = zte.active(fresh_grant).signal(fresh_grant.base)
+                        check_start_cutoff()
                         with db.tx(timeout=0, before_commit=check_start_cutoff):
                             check_start_cutoff()
-                            fresh_grant = zte.admit_run(config.load(), repo, str(tid))
-                            pilot.require(fresh_grant == zte_grant, "ZTE authorization changed before run start")
+                            pilot.require(zte.task_version(fresh_grant, readme_rule, "todo") == fresh_grant.data["task_version"],
+                                          "the reserved task was edited before ZTE launch")
                             check_start_cutoff()
                             run_id = start()
                             zte_store.transition(fresh_grant, "running", run=run_id)
-                        committed = True
                         launch_lease.registered(repo.name, str(tid))
                         check_start_cutoff()
                 except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
                     print(f"could not start the reserved README task: {error}")
                     slot.free()
-                    if committed:
-                        record.settle(run_id, "failed", summary=str(error))
+                    if run_id:
+                        try:
+                            with db.one_read(timeout=0):
+                                registered = run_store.run_get(run_id)
+                            if registered:
+                                try:
+                                    launch_lease.registered(repo.name, str(tid))
+                                finally:
+                                    failed = {"status": "failed", "finished": util.iso(), "summary": str(error)}
+                                    with db.tx(timeout=0):
+                                        run_store.settle(run_id, failed)
+                        except (OSError, RuntimeError, sqlite3.Error) as cleanup:
+                            print(f"could not reconcile reserved run {run_id}: {cleanup}")
                     return 2
             else:
                 run_id = start()
