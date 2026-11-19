@@ -337,26 +337,30 @@ def preflight(delivery, policy) -> None:
 
 def restore(install: Installation, delivery, *, reason: str = "") -> None:
     previous, release = delivery.data["last_good"], delivery.data["release"]
-    with util.lock(zte.INTERLOCK, wait=True):
+    with util.lock(zte.INTERLOCK) as got:
+        if not got:
+            return
         if delivery.phase == "deploy_intent":
             util.write_durably(zte.PAUSE_FILE, json.dumps({"at": util.iso(), "task": delivery.task}).encode(), mode=0o600)
             delivery = store.transition(delivery, "rollback_intent", restore_after=util.iso(), reason=reason)
         current = selected(install)
         pilot.require(current in (previous, release), "selector and recovery journal disagree; no runtime overwritten")
-        known = verify_runtime(install, previous)
         if current == release:
+            # Restoring the last-good selector is a safety action, even if recovery authority has expired.
+            verify_runtime(install, previous, until=util.now() + timedelta(seconds=15))
             switch(install, release, previous)
+    until = util.parse_iso(delivery.data["restore_after"]) + timedelta(seconds=RECOVERY_SECONDS)
     try:
-        database(install)
-        reconcile_recovery(install, delivery, previous, known)
+        database(install, until=until)
+        reconcile_recovery(install, delivery, previous, until)
     except DatabaseUnhealthy as error:
         stop_unhealthy_service(install)
         raise DatabaseUnhealthy("managed service stopped: database failed recovery integrity or schema checks") from error
 
 
-def reconcile_recovery(install: Installation, delivery, previous: str, known: Path) -> None:
+def reconcile_recovery(install: Installation, delivery, previous: str, until: datetime) -> None:
     after = delivery.data["restore_after"]
-    until = util.parse_iso(after) + timedelta(seconds=RECOVERY_SECONDS)
+    known = install.runtime(previous)
     pilot.require(util.now() < until, "bounded recovery window expired")
     pid = service_pid(install, until=until)
     if pid and executable_matches(known, pid, until=until):
@@ -393,7 +397,9 @@ def reconcile_recovery(install: Installation, delivery, previous: str, known: Pa
     try:
         restart(install, until=until)
     except (OSError, RuntimeError, subprocess.SubprocessError) as error:
-        store.annotate(delivery, **{f"{key}_error": util.first_line(str(error), 160)})
+        with db.tx(timeout=0, before_commit=lambda: activation_time_left(until)):
+            activation_time_left(until)
+            store.annotate(delivery, **{f"{key}_error": util.first_line(str(error), 160)})
 
 
 def deploy(install: Installation, delivery) -> None:
