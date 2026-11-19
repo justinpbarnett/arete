@@ -105,8 +105,8 @@ class NoFreeSlot(refusals.Conflict, RuntimeError):
     pass
 
 
-def admitting():
-    return util.lock(SLOTS_LOCK, wait=True)
+def admitting(*, wait: bool = True):
+    return util.lock(SLOTS_LOCK, wait=wait)
 
 
 def hold(repo: str, tid: str | None):
