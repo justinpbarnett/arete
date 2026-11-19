@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import http.client
 import json
 import os
 import plistlib
@@ -13,7 +12,7 @@ import tempfile
 import time
 import tomllib
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -85,12 +84,15 @@ def selected(install: Installation) -> str:
     return sha
 
 
-def verify_source(root: Path, sha: str, tree: str = "") -> str:
+def verify_source(root: Path, sha: str, tree: str = "", *, until: datetime | None = None) -> str:
+    def git(*args: str) -> str:
+        return util.git(list(args), root, timeout=activation_timeout(until, 30), retry=False)
+
     pilot.require(pilot.private(root, stat.S_ISDIR) and (root / ".git").is_dir()
-                  and not (root / ".git").is_symlink() and pilot.git(root, "rev-parse", "HEAD").strip() == sha
-                  and not pilot.git(root, "status", "--porcelain", "--untracked-files=all"),
+                  and not (root / ".git").is_symlink() and git("rev-parse", "HEAD").strip() == sha
+                  and not git("status", "--porcelain", "--untracked-files=all"),
                   "the managed source is missing, dirty or differs from the verified release")
-    actual = pilot.git(root, "rev-parse", "HEAD^{tree}").strip()
+    actual = git("rev-parse", "HEAD^{tree}").strip()
     pilot.require(not tree or actual == tree, "the managed source does not have the authorized tree")
     return actual
 
@@ -107,9 +109,9 @@ def mark_runtime(root: Path, sha: str, tree: str) -> None:
     util.write_durably(ready_path(root), json.dumps({"sha": sha, "tree": tree}).encode(), mode=0o600)
 
 
-def verify_runtime(install: Installation, sha: str, tree: str = "") -> Path:
+def verify_runtime(install: Installation, sha: str, tree: str = "", *, until: datetime | None = None) -> Path:
     root = install.runtime(sha)
-    actual = verify_source(root, sha, tree)
+    actual = verify_source(root, sha, tree, until=until)
     pilot.require((root / ".venv/bin/python").is_file()
                   and json.loads(zte.private_bytes(ready_path(root), 512)) == {"sha": sha, "tree": actual},
                   "the managed runtime has no completed locked-install receipt")
@@ -121,32 +123,58 @@ def switch(install: Installation, previous: str, sha: str) -> None:
     util.write_durably(install.selector, json.dumps({"sha": sha}).encode(), mode=0o600)
 
 
-def restart(install: Installation) -> None:
-    boot = subprocess.run(["/bin/launchctl", "kickstart", "-k", install.service],
-                          timeout=20, capture_output=True, check=False)
+def activation_deadline(delivery) -> datetime:
+    window = util.parse_iso(delivery.data["activation_after"]) + timedelta(seconds=HEALTH_SECONDS)
+    return min(window, util.parse_iso(delivery.deadline))
+
+
+def activation_time_left(until: datetime) -> float:
+    remaining = (until - util.now()).total_seconds()
+    pilot.require(remaining > 0, "the initial managed release health window expired")
+    return remaining
+
+
+def activation_timeout(until: datetime | None, cap: float) -> float:
+    return cap if until is None else min(cap, activation_time_left(until))
+
+
+def restart(install: Installation, *, until: datetime | None = None) -> None:
+    command = ["/bin/launchctl", "kickstart", "-k", install.service]
+    boot = subprocess.run(command, timeout=activation_timeout(until, 20), capture_output=True, check=False)
     pilot.require(boot.returncode == 0, "launchd could not restart the managed service")
 
 
-def launch_job(service: str) -> str:
-    job = subprocess.run(["/bin/launchctl", "print", service], timeout=4,
+def launch_job(service: str, *, until: datetime | None = None) -> str:
+    job = subprocess.run(["/bin/launchctl", "print", service], timeout=activation_timeout(until, 4),
                          capture_output=True, text=True, check=False)
     pilot.require(job.returncode == 0, "the managed launchd job is not loaded")
     return job.stdout
 
 
-def service_pid(install: Installation) -> int:
-    match = re.search(r"^\s*pid = (\d+)$", launch_job(install.service), re.MULTILINE)
+def service_pid(install: Installation, *, until: datetime | None = None) -> int:
+    match = re.search(r"^\s*pid = (\d+)$", launch_job(install.service, until=until), re.MULTILINE)
     return int(match[1]) if match else 0
 
 
-def database(install: Installation) -> None:
+def database(install: Installation, *, until: datetime | None = None) -> None:
     reason = "the unchanged managed database did not pass its schema and integrity check"
     try:
-        with db.one_read() as connection:
-            if (connection.execute("PRAGMA user_version").fetchone()[0] != install.schema
-                    or connection.execute("PRAGMA quick_check").fetchone()[0] != "ok"):
-                raise DatabaseUnhealthy(reason)
+        with db.one_read(timeout=None if until is None else activation_timeout(until, 2)) as connection:
+            if until is not None:
+                connection.set_progress_handler(lambda: util.now() >= until, 1000)
+            try:
+                if connection.execute("PRAGMA user_version").fetchone()[0] != install.schema:
+                    raise DatabaseUnhealthy(reason)
+                if until is not None:
+                    activation_time_left(until)
+                if connection.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                    raise DatabaseUnhealthy(reason)
+            finally:
+                if until is not None:
+                    connection.set_progress_handler(None, 0)
     except (OSError, sqlite3.Error) as error:
+        if until is not None:
+            activation_time_left(until)
         raise DatabaseUnhealthy(reason) from error
 
 
@@ -156,14 +184,15 @@ def stop_unhealthy_service(install: Installation) -> None:
     pilot.require(service.returncode == 0, "database unhealthy and launchd did not confirm service shutdown")
 
 
-def executable_matches(root: Path, pid: int) -> bool:
-    process = subprocess.run(["/bin/ps", "-p", str(pid), "-o", "command="], timeout=4,
+def executable_matches(root: Path, pid: int, *, until: datetime | None = None) -> bool:
+    process = subprocess.run(["/bin/ps", "-p", str(pid), "-o", "command="], timeout=activation_timeout(until, 4),
                              capture_output=True, text=True, check=False)
     return process.returncode == 0 and process.stdout.strip() == f"{root / '.venv/bin/python'} -m arete.cli serve"
 
 
-def health(install: Installation, sha: str, *, after: str = "", old_pid: int = 0) -> dict:
-    root = verify_runtime(install, sha)
+def health(install: Installation, sha: str, *, after: str = "", old_pid: int = 0,
+           until: datetime | None = None) -> dict:
+    root = verify_runtime(install, sha, until=until)
     beat = util.read_json(paths.STATE_DIR / "serve.json", {})
     server = util.read_json(paths.STATE_DIR / "server.json", {})
     pid = beat.get("pid")
@@ -178,33 +207,46 @@ def health(install: Installation, sha: str, *, after: str = "", old_pid: int = 0
     pilot.require((server.get("scheme"), server.get("host"), server.get("port"), server.get("state"),
                    server.get("config")) == ("https", target.hostname, target.port, str(paths.STATE_DIR),
                                               str(paths.CONFIG_FILE)), "managed service address differs from the profile")
-    pilot.require(service_pid(install) == pid and executable_matches(root, pid),
+    pilot.require(service_pid(install, until=until) == pid and executable_matches(root, pid, until=until),
                   "heartbeat PID is not the selected managed launchd executable")
-    connection = http.client.HTTPSConnection(target.hostname, target.port, timeout=8)
-    try:
-        connection.request("GET", "/api/meta", headers={"Accept": "application/json"})
-        response = connection.getresponse()
-        pilot.require(response.status == 200 and response.getheader("X-Arete-Engine") == sha[:12]
-                      and json.loads(response.read(2**18))["schema"]["version"] == install.schema,
-                      "authenticated HTTPS did not confirm the selected engine and schema")
-    finally:
-        connection.close()
+    probe_https(install, sha, until=until)
     return {"at": beat["at"], "pid": pid, "engine": sha, "schema": install.schema, "https_status": 200}
+
+
+def probe_https(install: Installation, sha: str, *, until: datetime | None = None) -> None:
+    reason = "authenticated HTTPS did not confirm the selected engine and schema"
+    with tempfile.TemporaryFile() as headers:
+        timeout = activation_timeout(until, 8)
+        result = subprocess.run([
+            "/usr/bin/curl", "--disable", "--noproxy", "*", "--proto", "=https", "--silent",
+            "--max-time", str(timeout), "--max-filesize", str(2**18), "--header", "Accept: application/json",
+            "--dump-header", f"/dev/fd/{headers.fileno()}", "--write-out", "\n%{http_code}", f"{install.endpoint}/api/meta",
+        ], pass_fds=(headers.fileno(),), capture_output=True, timeout=timeout, check=False)
+        if until is not None:
+            activation_time_left(until)
+        pilot.require(result.returncode == 0, reason)
+        headers.seek(0)
+        engines = [line.partition(b":")[2].strip() for line in headers.read(2**18).splitlines()
+                   if line.partition(b":")[0].lower() == b"x-arete-engine"]
+    body, status = result.stdout.rsplit(b"\n", 1)
+    pilot.require(status == b"200" and engines == [sha[:12].encode()]
+                  and json.loads(body)["schema"]["version"] == install.schema, reason)
 
 
 def failure_reason(error: Exception) -> str:
     return util.first_line(str(error), 200) if isinstance(error, pilot.Held) else type(error).__name__
 
 
-def fresh_health(install: Installation, sha: str, after: str, old_pid: int, check, *, seconds=None) -> list[dict]:
-    until = time.monotonic() + (HEALTH_SECONDS if seconds is None else seconds)
+def fresh_health(install: Installation, sha: str, after: str, old_pid: int, check, *, seconds=None,
+                 until: datetime | None = None) -> list[dict]:
+    limit = time.monotonic() + activation_timeout(until, HEALTH_SECONDS if seconds is None else seconds)
     evidence = []
     reason = "no second heartbeat from the same process"
-    while time.monotonic() < until:
+    while time.monotonic() < limit:
         check()
         try:
-            beat = health(install, sha, after=after, old_pid=old_pid)
-        except (OSError, RuntimeError, ValueError, KeyError, http.client.HTTPException, subprocess.SubprocessError) as error:
+            beat = health(install, sha, after=after, old_pid=old_pid, until=until)
+        except (OSError, RuntimeError, ValueError, KeyError, subprocess.SubprocessError) as error:
             reason = failure_reason(error)
             evidence.clear()
         else:
@@ -212,10 +254,12 @@ def fresh_health(install: Installation, sha: str, after: str, old_pid: int, chec
             if not evidence or beat["pid"] != evidence[-1]["pid"]:
                 evidence = [beat]
             elif beat["at"] != evidence[-1]["at"]:
-                database(install)
+                database(install, until=until)
                 check()
                 return [evidence[-1], beat]
-        time.sleep(2)
+        time.sleep(activation_timeout(until, min(2, max(0, limit - time.monotonic()))))
+    if until is not None:
+        activation_time_left(until)
     raise pilot.Held(f"no two fresh authenticated HTTPS health beats for the managed release: {reason}")
 
 
@@ -269,6 +313,13 @@ def active(delivery, install: Installation):
     return policy
 
 
+def activation_authority(delivery, install: Installation, until: datetime):
+    with db.one_read(timeout=activation_timeout(until, 2)):
+        policy = active(delivery, install)
+    activation_time_left(until)
+    return policy
+
+
 def known_good(install: Installation, base: str) -> dict:
     pilot.require(selected(install) == base, "the selected known-good runtime is not the approved squash parent")
     launch_job(install.service + ".zte-release")
@@ -283,48 +334,52 @@ def preflight(delivery, policy) -> None:
                   "the admitted managed release profile changed")
     try:
         known_good(install, delivery.base)
-    except (OSError, RuntimeError, ValueError, KeyError, TypeError, http.client.HTTPException,
-            subprocess.SubprocessError) as error:
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         raise pilot.Held("the admitted last-good runtime or release worker is not healthy") from error
 
 
 def restore(install: Installation, delivery, *, reason: str = "") -> None:
     previous, release = delivery.data["last_good"], delivery.data["release"]
-    with util.lock(zte.INTERLOCK, wait=True):
+    with util.lock(zte.INTERLOCK) as got:
+        if not got:
+            return
         if delivery.phase == "deploy_intent":
             util.write_durably(zte.PAUSE_FILE, json.dumps({"at": util.iso(), "task": delivery.task}).encode(), mode=0o600)
             delivery = store.transition(delivery, "rollback_intent", restore_after=util.iso(), reason=reason)
         current = selected(install)
         pilot.require(current in (previous, release), "selector and recovery journal disagree; no runtime overwritten")
-        known = verify_runtime(install, previous)
         if current == release:
+            # Restoring the last-good selector is a safety action, even if recovery authority has expired.
+            verify_runtime(install, previous, until=util.now() + timedelta(seconds=15))
             switch(install, release, previous)
+    # Stop blocks delivery, not corrective recovery of an already-activated release.
+    until = util.parse_iso(delivery.data["restore_after"]) + timedelta(seconds=RECOVERY_SECONDS)
     try:
-        database(install)
-        reconcile_recovery(install, delivery, previous, known)
+        database(install, until=until)
+        reconcile_recovery(install, delivery, previous, until)
     except DatabaseUnhealthy as error:
         stop_unhealthy_service(install)
         raise DatabaseUnhealthy("managed service stopped: database failed recovery integrity or schema checks") from error
 
 
-def reconcile_recovery(install: Installation, delivery, previous: str, known: Path) -> None:
+def reconcile_recovery(install: Installation, delivery, previous: str, until: datetime) -> None:
     after = delivery.data["restore_after"]
-    until = util.parse_iso(after) + timedelta(seconds=RECOVERY_SECONDS)
+    known = install.runtime(previous)
     pilot.require(util.now() < until, "bounded recovery window expired")
-    pid = service_pid(install)
-    if pid and executable_matches(known, pid):
+    pid = service_pid(install, until=until)
+    if pid and executable_matches(known, pid, until=until):
         try:
             beats = fresh_health(install, previous, after, 0, lambda: None,
-                                 seconds=min(RECOVERY_HEALTH_SECONDS, (until - util.now()).total_seconds()))
-            database(install)
-            final = health(install, previous, after=after)
+                                 seconds=RECOVERY_HEALTH_SECONDS, until=until)
+            final = health(install, previous, after=after, until=until)
         except DatabaseUnhealthy:
             raise
-        except (OSError, RuntimeError, ValueError, KeyError, http.client.HTTPException, subprocess.SubprocessError):
+        except (OSError, RuntimeError, ValueError, KeyError, subprocess.SubprocessError):
             pass
         else:
-            with db.tx():
-                database(install)
+            with db.tx(timeout=0, before_commit=lambda: activation_time_left(until)):
+                activation_time_left(until)
+                database(install, until=until)
                 pilot.require(selected(install) == previous, "the selected runtime changed during recovery")
                 confirmed = final["pid"] == beats[-1]["pid"] and util.pid_alive(final["pid"])
                 if confirmed:
@@ -338,14 +393,17 @@ def reconcile_recovery(install: Installation, delivery, previous: str, known: Pa
     pilot.require(util.now() < until and not delivery.data.get("restart_recovery"),
                   "last-good runtime did not recover within the bounded restart budget")
     pilot.require(selected(install) == previous, "the selected runtime changed before the recovery restart")
-    database(install)
+    database(install, until=until)
     key = "restart_recovery" if attempt else "restart_restore"
-    delivery = store.annotate(delivery, **{key: util.iso()})
-    database(install)
+    with db.tx(timeout=0, before_commit=lambda: activation_time_left(until)):
+        delivery = store.annotate(delivery, **{key: util.iso()})
+    database(install, until=until)
     try:
-        restart(install)
+        restart(install, until=until)
     except (OSError, RuntimeError, subprocess.SubprocessError) as error:
-        store.annotate(delivery, **{f"{key}_error": util.first_line(str(error), 160)})
+        with db.tx(timeout=0, before_commit=lambda: activation_time_left(until)):
+            activation_time_left(until)
+            store.annotate(delivery, **{f"{key}_error": util.first_line(str(error), 160)})
 
 
 def deploy(install: Installation, delivery) -> None:
@@ -375,27 +433,42 @@ def deploy(install: Installation, delivery) -> None:
                           "the last-good runtime changed before activation")
             intent = store.transition(delivery, "deploy_intent", last_good=prior, activation_after=util.iso(),
                                       old_pid=before["pid"], installation=install.to_receipt())
+            until = activation_deadline(intent)
+            activation_authority(intent, install, until)
             switch(install, prior, sha)
-    restart(install)
+    with util.lock(zte.INTERLOCK) as got:
+        pilot.require(got, "the Stop interlock is busy before the managed restart")
+        activation_authority(intent, install, until)
+        pilot.require(selected(install) == sha, "the selected runtime changed before the managed restart")
+        restart(install, until=until)
     finish(install, intent)
 
 
 def finish(install: Installation, delivery) -> None:
     data = delivery.data
     sha = data["release"]
+    until = activation_deadline(delivery)
+
+    def check():
+        return activation_authority(delivery, install, until)
+
     pilot.require(selected(install) == sha, "the deployment intent has no active candidate selector")
-    beats = fresh_health(install, sha, data["activation_after"], data["old_pid"], lambda: active(delivery, install))
-    policy = active(delivery, install)
-    zte_delivery.require_landing(delivery, policy.client(delivery.deadline), sha)
-    database(install)
-    final = health(install, sha, after=data["activation_after"], old_pid=data["old_pid"])
-    with util.lock(zte.INTERLOCK, wait=True), db.tx():
-        active(delivery, install)
-        database(install)
-        pilot.require(selected(install) == sha, "the selected runtime changed during validation")
-        pilot.require(final["pid"] == beats[-1]["pid"] and util.pid_alive(final["pid"]),
-                      "the validated runtime exited or restarted before completion")
-        store.complete(delivery, data["pr_task_version"], release_health=beats, completion_health=final)
+    beats = fresh_health(install, sha, data["activation_after"], data["old_pid"], check, until=until)
+    policy = check()
+    zte_delivery.require_landing(delivery, policy.client(util.iso(until)), sha)
+    final = health(install, sha, after=data["activation_after"], old_pid=data["old_pid"], until=until)
+    with util.lock(zte.INTERLOCK) as got:
+        if not got:
+            return
+        # Fence the start of COMMIT without a SQLite busy wait; the OS controls when durability returns.
+        with db.tx(timeout=0, before_commit=lambda: activation_time_left(until)):
+            check()
+            database(install, until=until)
+            pilot.require(selected(install) == sha, "the selected runtime changed during validation")
+            pilot.require(final["pid"] == beats[-1]["pid"] and util.pid_alive(final["pid"]),
+                          "the validated runtime exited or restarted before completion")
+            activation_time_left(until)
+            store.complete(delivery, data["pr_task_version"], release_health=beats, completion_health=final)
 
 
 def tick() -> int:
@@ -413,13 +486,12 @@ def tick() -> int:
                 finish(install, delivery)
             else:
                 restore(install, delivery)
-        except (OSError, RuntimeError, ValueError, TypeError, KeyError, http.client.HTTPException,
-                subprocess.SubprocessError) as error:
+        except (OSError, RuntimeError, ValueError, TypeError, KeyError, sqlite3.Error, subprocess.SubprocessError) as error:
             current = store.find(delivery.task)
             if current and current.phase == "deploy_intent":
                 try:
                     restore(installation(current.data.get("installation")), current, reason=failure_reason(error))
-                except (OSError, RuntimeError, ValueError, TypeError, KeyError, http.client.HTTPException,
+                except (OSError, RuntimeError, ValueError, TypeError, KeyError, sqlite3.Error,
                         subprocess.SubprocessError) as rollback_error:
                     zte.hold(store.find(delivery.task), rollback_error, uncertain=True)
                     return 1
@@ -431,10 +503,33 @@ def tick() -> int:
 
 def launch(receipt: dict | None = None) -> None:
     install = installation(receipt)
+    limit = time.monotonic() + 25
+    while time.monotonic() < limit:
+        with util.lock(zte.INTERLOCK) as got:
+            if got:
+                launch_selected(install)
+        time.sleep(min(0.05, max(0, limit - time.monotonic())))
+    raise pilot.Held("the Stop interlock is busy before managed service startup")
+
+
+def launch_selected(install: Installation) -> None:
     sha = selected(install)
-    runtime = verify_runtime(install, sha)
+    with db.one_read(timeout=2):
+        delivery = store.latest() if store.activation_pending() else None
+    if delivery is not None:
+        pilot.require(sha in (delivery.data.get("last_good"), delivery.data.get("release")),
+                      "the runtime selector does not match the activation journal")
+    candidate = delivery is not None and sha == delivery.data.get("release")
+    until = None
+    if candidate:
+        pilot.require(delivery.phase == "deploy_intent", "candidate startup is no longer authorized")
+        until = activation_deadline(delivery)
+        activation_authority(delivery, install, until)
+    runtime = verify_runtime(install, sha, until=until)
     os.chdir(runtime)
     python = runtime / ".venv/bin/python"
+    if candidate:
+        activation_authority(delivery, install, until)
     os.execv(python, [str(python), "-m", "arete.cli", "serve"])
 
 

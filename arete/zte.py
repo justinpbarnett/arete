@@ -264,9 +264,10 @@ def observation(policy: Policy, repo: config.Repo, client: GitHub) -> tuple[str,
 
 def hold(delivery: store.Delivery, error: Exception, *, uncertain: bool = False, **evidence) -> None:
     reason = util.first_line(str(error), 260) or type(error).__name__
+    reason_key = "hold_reason" if "reason" in delivery.data else "reason"
     try:
-        row = store.transition(delivery, "uncertain" if uncertain else "held", reason=reason, stopped_at=delivery.phase,
-                               **evidence)
+        row = store.transition(delivery, "uncertain" if uncertain else "held", stopped_at=delivery.phase,
+                               **{reason_key: reason, **evidence})
     except store.Conflict:
         return
     alerts.notify("Arete ZTE held", f"{row.task}: {reason}")
