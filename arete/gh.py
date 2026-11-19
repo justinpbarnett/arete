@@ -501,13 +501,13 @@ def base64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 
 
-def key_signature(app: config.GithubApp, signing_input: bytes) -> bytes:
+def key_signature(app: config.GithubApp, signing_input: bytes, *, timeout: float = 30) -> bytes:
     failed = f"openssl could not sign with [github_app] private_key {paths.short_path(app.private_key)}"
     if paths.ISOLATED and paths.confined(app.private_key) is None:
         raise GhError("isolated arete uses no key of this machine; put the [github_app] private_key in the scratch folder")
     try:
         res = subprocess.run(["openssl", "dgst", "-sha256", "-sign", str(app.private_key)], input=signing_input,
-                             capture_output=True, timeout=30, check=False)
+                             capture_output=True, timeout=timeout, check=False)
     except (OSError, subprocess.SubprocessError) as e:
         raise GhError(f"{failed}: {e}") from None
     if res.returncode != 0:
@@ -515,11 +515,11 @@ def key_signature(app: config.GithubApp, signing_input: bytes) -> bytes:
     return res.stdout
 
 
-def app_jwt(app: config.GithubApp) -> str:
+def app_jwt(app: config.GithubApp, *, timeout: float = 30) -> str:
     now = int(time.time())
     signed = ".".join(base64url(json.dumps(part, separators=(",", ":")).encode()) for part in (
         {"alg": "RS256", "typ": "JWT"}, {"iat": now - 60, "exp": now + 540, "iss": app.app_id}))
-    return f"{signed}.{base64url(key_signature(app, signed.encode()))}"
+    return f"{signed}.{base64url(key_signature(app, signed.encode(), timeout=timeout))}"
 
 
 def clone_token(app: config.GithubApp, repo: str) -> str:
