@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import fcntl
 import json
+import os
 import sqlite3
 import time
 from contextlib import nullcontext
@@ -9,14 +11,13 @@ from datetime import timedelta
 from pathlib import Path
 
 from . import config, delegation, jev, launch_lease, paths, pilot, record, scratch, util, workspace, zte
-from .agent import Result
 from .store import db, orchestration
 from .store import zte as store
 from .zte_github import GitHub, Identity
 
 INTENTS = {"push_intent", "pr_intent", "merge_intent"}
 JEV_STEP = "ZTE exact patch"
-JEV_USAGE_PENDING = paths.ZTE_AUTHORITY / "jev-usage-pending.json"
+JEV_USAGE_PENDING = paths.ZTE_AUTHORITY / "jev-response.pending"
 
 
 def settled(delivery, policy, repo, layer) -> bool:
@@ -127,9 +128,9 @@ def send_next(delivery, policy, client, cfg, repo) -> None:
                          timeout=min(remaining, 30), retry=False)
         pilot.require(patch, "the exact patch is not available to JEV")
         delivery, risk = screen_patch(delivery, policy, cfg, patch, deadline)
-        if not reconcile_jev_usage():
+        if not reconcile_jev_usage(deadline=deadline):
             return
-        pilot.require(time.monotonic() < deadline, jev.DEADLINE_EXPIRED)
+        check_jev_deadline(deadline)
         zte_release.preflight(delivery, policy)
     source = client.push_source(where, head, tree, delivery.base) if delivery.phase == "prepared" else nullcontext()
     with source as isolated:
@@ -145,18 +146,10 @@ def screen_patch(delivery, policy, cfg, patch: str, deadline: float):
                       and all(receipt.get(key) == value for key, value in subject.items()),
                       "the exact JEV receipt no longer matches the candidate")
         return delivery, receipt
-    pilot.require("jev_attempt" not in data, "JEV attempt has no confirmed verdict; no retry")
+    pilot.require("jev_attempt" not in data, "JEV attempt has no confirmed verdict; usage may be unknown, no retry")
 
     def check_deadline():
-        pilot.require(time.monotonic() < deadline, jev.DEADLINE_EXPIRED)
-
-    usage = None
-
-    def capture(result: Result, seconds: float):
-        nonlocal usage
-        usage = {"run": data["run"], "seconds": round(seconds, 2), "ok": result.ok,
-                 "model": result.model[:128], "cost_usd": result.cost_usd, "tokens_in": result.tokens_in,
-                 "error": result.error}
+        check_jev_deadline(deadline)
 
     try:
         with util.lock(zte.INTERLOCK) as got:
@@ -165,44 +158,90 @@ def screen_patch(delivery, policy, cfg, patch: str, deadline: float):
                 check_stop(delivery, policy)
                 check_deadline()
                 delivery = store.annotate(delivery, jev_attempt={"subject": subject, "at": util.iso()})
-            result = jev.risk(patch, policy.signal(delivery.base).task(), cfg, deadline=deadline, account=capture)
+        with new_jev_journal(data["run"], deadline) as response, util.lock(zte.INTERLOCK) as got:
+            pilot.require(got, "the Stop interlock is busy before the JEV request")
+            with db.one_read(timeout=0):
+                check_stop(delivery, policy)
+            result = jev.risk(patch, policy.signal(delivery.base).task(), cfg, deadline=deadline, receipt=response)
     except jev.Unjudged as error:
         raise pilot.Held(f"JEV could not judge the exact patch: {error}") from error
-    finally:
-        if usage is not None:
-            util.write_durably(JEV_USAGE_PENDING, json.dumps(usage).encode(), mode=0o600)
     check_deadline()
     pilot.require(not result.hold, result.hold)
     receipt = {**asdict(result), **subject, "at": util.iso()}
-    with db.tx(timeout=0, before_commit=check_deadline):
-        check_stop(delivery, policy)
-        delivery = store.annotate(delivery, jev_receipt=receipt)
+    with util.lock(zte.INTERLOCK) as got:
+        pilot.require(got, "the Stop interlock is busy after the JEV request")
+        with db.tx(timeout=0, before_commit=check_deadline):
+            check_stop(delivery, policy)
+            delivery = store.annotate(delivery, jev_receipt=receipt)
     return delivery, receipt
 
 
-def reconcile_jev_usage() -> bool:
+def check_jev_deadline(deadline: float) -> None:
+    pilot.require(time.monotonic() < deadline, jev.DEADLINE_EXPIRED)
+
+
+def new_jev_journal(run: str, deadline: float):
+    path = JEV_USAGE_PENDING
+    with paths.directory_fd(path.parent) as parent:
+        launch_lease.private_directory(parent)
+        util.write_durably(path, json.dumps({"run": run}).encode() + b"\n", mode=0o600,
+                           before_replace=lambda: check_jev_deadline(deadline))
+        fd = os.open(path.name, os.O_RDWR | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=parent)
+    journal = os.fdopen(fd, "r+b")
     try:
-        usage = json.loads(zte.private_bytes(JEV_USAGE_PENDING, 4096))
+        pilot.require(launch_lease.plain(os.fstat(fd)), "unsafe JEV response journal")
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        journal.seek(0, os.SEEK_END)
+        return journal
+    except BaseException:
+        journal.close()
+        raise
+
+
+def reconcile_jev_usage(*, deadline: float | None = None) -> bool:
+    path = JEV_USAGE_PENDING
+    try:
+        with paths.directory_fd(path.parent) as parent:
+            launch_lease.private_directory(parent)
+            fd = os.open(path.name, os.O_RDWR | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=parent)
     except FileNotFoundError:
         return True
-    run = usage.pop("run")
-    seconds = usage.pop("seconds")
-    try:
-        with db.tx(timeout=0) as conn:
-            prior = conn.execute("SELECT ok, model, cost_usd, tokens_in, error, seconds FROM steps "
-                                 "WHERE run_id=? AND step=? AND try=1", (run, JEV_STEP)).fetchone()
-            if prior is None:
-                pilot.require(conn.execute("SELECT 1 FROM runs WHERE id=?", (run,)).fetchone(), "JEV usage has no run")
-                record.step(run, JEV_STEP, Result(**usage, turns=1, runner="jev", provider="openrouter"), seconds,
-                            try_no=1)
-            else:
-                pilot.require(dict(prior) == {**usage, "seconds": seconds}, "JEV usage conflicts with a recorded step")
-    except sqlite3.OperationalError as error:
-        if not database_busy(error):
-            raise
-        return False
-    JEV_USAGE_PENDING.unlink()
-    util.flush_folder(JEV_USAGE_PENDING.parent)
+    with os.fdopen(fd, "rb") as journal:
+        try:
+            # The transport inherits this file description. An orphaned curl may still be writing it.
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        pilot.require(launch_lease.plain(os.fstat(fd)), "unsafe JEV response journal")
+        run = json.loads(journal.readline(512))["run"]
+        reply, seconds = jev.journal_reply(journal, jev.risk_questions())
+        usage = jev.result([reply])
+        usage.model = usage.model[:128]
+
+        def check_deadline():
+            if deadline is not None:
+                check_jev_deadline(deadline)
+
+        check_deadline()
+        util.flush_fd(fd)
+        check_deadline()
+        try:
+            with db.tx(timeout=0, before_commit=check_deadline) as conn:
+                prior = conn.execute("SELECT ok, model, cost_usd, tokens_in, error, seconds FROM steps "
+                                     "WHERE run_id=? AND step=? AND try=1", (run, JEV_STEP)).fetchone()
+                if prior is None:
+                    pilot.require(conn.execute("SELECT 1 FROM runs WHERE id=?", (run,)).fetchone(), "JEV usage has no run")
+                    record.step(run, JEV_STEP, usage, seconds, try_no=1)
+                else:
+                    pilot.require(tuple(prior) == (usage.ok, usage.model, usage.cost_usd, usage.tokens_in,
+                                                  usage.error, seconds), "JEV usage conflicts with a recorded step")
+        except sqlite3.OperationalError as error:
+            if not database_busy(error):
+                raise
+            return False
+        check_deadline()
+        path.unlink()
+        util.flush_folder(path.parent)
     return True
 
 
@@ -261,8 +300,13 @@ def reconcile(delivery, client, observed: dict) -> None:
 
 
 def advance(cfg) -> None:
-    with db.one_read(timeout=0):
-        delivery = store.latest()
+    try:
+        with db.one_read(timeout=0):
+            delivery = store.latest()
+    except sqlite3.OperationalError as error:
+        if not database_busy(error):
+            raise
+        return
     if not delivery or delivery.phase in store.TERMINAL | {"release_ready", "deploy_intent", "rollback_intent"}:
         return
     observed: dict = {}
