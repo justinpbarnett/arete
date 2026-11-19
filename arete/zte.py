@@ -125,12 +125,16 @@ def active(delivery: store.Delivery, *, engine: str = "") -> Policy:
     return policy
 
 
-def task_version(delivery: store.Delivery, signal: pilot.Signal, *states: str) -> int:
+def task_version(delivery: store.Delivery, signal: pilot.Signal, *states: str, until: float | None = None) -> int:
+    if until is not None:
+        pilot.candidate_time_left(until, 1)
     task = tasks.task_get(delivery.task)
     pilot.require(task and task["repo"] == delivery.repo and task["title"] == pilot.TASK_TITLE
                   and task["kind"] == pilot.TASK_KIND and task["body"] == signal.task() and not task["parent"]
-                  and task["state"] in states
-                  and all(note["author"] == "arete" for note in tasks.task_comments(delivery.task)),
+                  and task["state"] in states, "the reserved ZTE task changed")
+    if until is not None:
+        pilot.candidate_time_left(until, 1)
+    pilot.require(all(note["author"] == "arete" for note in tasks.task_comments(delivery.task)),
                   "the reserved ZTE task changed")
     return task["version"]
 
@@ -209,13 +213,20 @@ def for_run(repo: config.Repo, tid: str, run_id: str, *phases: str) -> tuple[sto
     return delivery, policy
 
 
-def check_checkout(delivery: store.Delivery, policy: Policy, repo: config.Repo, checkouts) -> workspace.Checkout:
+def check_checkout(delivery: store.Delivery, policy: Policy, repo: config.Repo, checkouts, *,
+                   until: float | None = None) -> workspace.Checkout:
     pilot.require(len(checkouts) == 1, "ZTE requires exactly one checkout")
     checkout = checkouts[0]
+    reason = "ZTE checkout does not match the approved origin"
     pilot.require(checkout.github == policy.identity.name and checkout.base == "main" and not checkout.dir
-                  and not any((checkout.pr, checkout.lease, checkout.resumes, checkout.merged_base))
-                  and checkout.src.resolve() == repo.path.resolve(), "ZTE checkout does not match the approved origin")
-    pilot.check_origin(checkout.wt, policy.identity.name)
+                  and not any((checkout.pr, checkout.lease, checkout.resumes, checkout.merged_base)), reason)
+    if until is not None:
+        pilot.candidate_time_left(until, 1)
+    source = checkout.src.resolve()
+    if until is not None:
+        pilot.candidate_time_left(until, 1)
+    pilot.require(source == repo.path.resolve(), reason)
+    pilot.check_origin(checkout.wt, policy.identity.name, until=until)
     return checkout
 
 

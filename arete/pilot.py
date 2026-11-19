@@ -5,11 +5,13 @@ import json
 import math
 import os
 import re
+import signal
 import sqlite3
 import stat
 import subprocess
 import sys
 import time
+from contextlib import suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from urllib.request import urlopen
@@ -66,13 +68,51 @@ class Signal:
                 "appears once by reading the actual README. Do not start or mutate a service.")
 
 
-def git(repo: Path, *args: str) -> str:
-    return util.git(list(args), repo, timeout=30)
+def candidate_time_left(until: float, cap: float) -> float:
+    remaining = until - time.monotonic()
+    require(remaining > 0, "ZTE deadline expired during candidate revalidation")
+    return min(remaining, cap)
 
 
-def readme(repo: Path, ref: str) -> str:
-    result = subprocess.run(["git", "show", f"{ref}:{DOC}"], cwd=repo, capture_output=True, timeout=10,
-                            check=False)
+def candidate_git(repo: Path, args: tuple[str, ...], until: float, cap: float) -> subprocess.CompletedProcess:
+    from . import sandbox
+
+    candidate_time_left(until, cap)
+    command = sandbox.protected_command(["git", *args], repo, ())
+    env = {key: os.environ[key] for key in ("PATH", "HOME", "LANG", "LC_ALL", "GIT_CONFIG_GLOBAL",
+                                            "GIT_CONFIG_NOSYSTEM") if key in os.environ}
+    env.update(GIT_NO_LAZY_FETCH="1", GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", GIT_CONFIG_COUNT="1",
+               GIT_CONFIG_KEY_0="core.fsmonitor", GIT_CONFIG_VALUE_0="false")
+    until = min(until, time.monotonic() + cap)
+    candidate_time_left(until, cap)
+    with subprocess.Popen(command, cwd=repo, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL, start_new_session=True) as process:
+        try:
+            output, _ = process.communicate(timeout=candidate_time_left(until, cap))
+        except BaseException as error:
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            if isinstance(error, subprocess.TimeoutExpired):
+                raise Held(f"ZTE candidate revalidation timed out in git {args[0]}") from None
+            raise
+    candidate_time_left(until, cap)
+    return subprocess.CompletedProcess(command, process.returncode, output)
+
+
+def git(repo: Path, *args: str, until: float | None = None) -> str:
+    if until is None:
+        return util.git(list(args), repo, timeout=30)
+    result = candidate_git(repo, args, until, 30)
+    require(result.returncode == 0, f"ZTE candidate revalidation failed in git {args[0]}")
+    return result.stdout.decode("utf-8")
+
+
+def readme(repo: Path, ref: str, *, until: float | None = None) -> str:
+    args = ("show", f"{ref}:{DOC}")
+    if until is None:
+        result = subprocess.run(["git", *args], cwd=repo, capture_output=True, timeout=10, check=False)
+    else:
+        result = candidate_git(repo, args, until, 10)
     require(result.returncode == 0, "the approved README blob is unavailable")
     return result.stdout.decode("utf-8")
 
@@ -92,10 +132,10 @@ def protected(github: str) -> None:
             "GitHub is not enforcing the expected strict Actions check for all actors")
 
 
-def check_origin(repo: Path, github: str) -> None:
+def check_origin(repo: Path, github: str, *, until: float | None = None) -> None:
     approved = ([f"git@github.com:{github}.git"], [f"https://github.com/{github}.git"])
     for flags in ((), ("--push",)):
-        require(git(repo, "remote", "get-url", *flags, "--all", "origin").splitlines() in approved,
+        require(git(repo, "remote", "get-url", *flags, "--all", "origin", until=until).splitlines() in approved,
                 "the checkout origin must have exactly one approved GitHub fetch and push URL")
 
 
@@ -105,23 +145,23 @@ def have_checkout(repo: Path, base: str) -> None:
             and not git(repo, "status", "--porcelain"), "the deployment checkout changed or is dirty")
 
 
-def require_exact_tree(repo: Path, signal: Signal, tree: str, expected: str) -> None:
+def require_exact_tree(repo: Path, signal: Signal, tree: str, expected: str, *, until: float | None = None) -> None:
     require(SHA.fullmatch(tree), "the candidate tree is not known")
-    base_entry = git(repo, "ls-tree", signal.base, DOC).split()
-    candidate_entry = git(repo, "ls-tree", tree, DOC).split()
+    base_entry = git(repo, "ls-tree", signal.base, DOC, until=until).split()
+    candidate_entry = git(repo, "ls-tree", tree, DOC, until=until).split()
     require(base_entry[:2] in (["100644", "blob"], ["100755", "blob"])
             and candidate_entry[:2] == base_entry[:2]
             and git(repo, "diff", "--name-status", "--no-renames", "--ignore-submodules=none", "--no-ext-diff",
-                    signal.base, tree).strip() == f"M\t{DOC}"
-            and readme(repo, tree) == expected, "the candidate is not the approved regular-file README edit")
+                    signal.base, tree, until=until).strip() == f"M\t{DOC}"
+            and readme(repo, tree, until=until) == expected, "the candidate is not the approved regular-file README edit")
 
 
-def exact_edit(repo: Path, signal: Signal, head: str, expected: str) -> str:
+def exact_edit(repo: Path, signal: Signal, head: str, expected: str, *, until: float | None = None) -> str:
     require(SHA.fullmatch(head), "the published head is not known")
-    require(git(repo, "rev-list", "--parents", "-n", "1", head).split() == [head, signal.base],
+    require(git(repo, "rev-list", "--parents", "-n", "1", head, until=until).split() == [head, signal.base],
             "the published head is not a single commit directly on the approved base")
-    tree = git(repo, "rev-parse", f"{head}^{{tree}}").strip()
-    require_exact_tree(repo, signal, tree, expected)
+    tree = git(repo, "rev-parse", f"{head}^{{tree}}", until=until).strip()
+    require_exact_tree(repo, signal, tree, expected, until=until)
     return tree
 
 
@@ -183,13 +223,19 @@ def pickable(tid: str, repo: str) -> bool:
         return False
 
 
-def scheduled_run(repo: str, tid: str) -> dict | None:
-    with db.one_read() as connection:
+def scheduled_run(repo: str, tid: str, *, until: float | None = None) -> dict | None:
+    if until is not None:
+        candidate_time_left(until, 1)
+    with db.one_read(timeout=0 if until is not None else None) as connection:
+        if until is not None:
+            candidate_time_left(until, 1)
         rows = runs.ticket_runs(repo, tid, limit=2, whole=True)
         require(len(rows) <= 1, "the local task had more than one delivery attempt")
         if not rows:
             return None
         run = rows[0]
+        if until is not None:
+            candidate_time_left(until, 1)
         start = connection.execute("SELECT actor FROM events_log WHERE kind = 'run.started' AND subject = ?",
                                    (f"run:{run['id']}",)).fetchone()
         require(start and start[0] == "rule:poll", "the run was not started by scheduled poll")
