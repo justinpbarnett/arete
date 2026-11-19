@@ -101,11 +101,14 @@ def ready_path(root: Path) -> Path:
     return root / ".git" / "arete-runtime.json"
 
 
-def mark_runtime(root: Path, sha: str, tree: str) -> None:
+def mark_runtime(root: Path, sha: str, tree: str, *, until: datetime | None = None) -> None:
     python = root / ".venv/bin/python"
     expected = str(root / ".venv")
-    observed = command([str(python), "-I", "-c", "import sys, arete; print(sys.prefix)"], where=root)
+    observed = command([str(python), "-I", "-c", "import sys, arete; print(sys.prefix)"], where=root,
+                       timeout=activation_timeout(until, 20))
     pilot.require(observed == expected, "the locked runtime does not resolve inside its release directory")
+    if until is not None:
+        activation_time_left(until)
     util.write_durably(ready_path(root), json.dumps({"sha": sha, "tree": tree}).encode(), mode=0o600)
 
 
@@ -128,9 +131,13 @@ def activation_deadline(delivery) -> datetime:
     return min(window, util.parse_iso(delivery.deadline))
 
 
+def recovery_deadline(delivery) -> datetime:
+    return util.parse_iso(delivery.data["restore_after"]) + timedelta(seconds=RECOVERY_SECONDS)
+
+
 def activation_time_left(until: datetime) -> float:
     remaining = (until - util.now()).total_seconds()
-    pilot.require(remaining > 0, "the initial managed release health window expired")
+    pilot.require(remaining > 0, "the managed release deadline or health window expired")
     return remaining
 
 
@@ -264,22 +271,25 @@ def fresh_health(install: Installation, sha: str, after: str, old_pid: int, chec
 
 
 def stage(install: Installation, delivery, client) -> Path:
+    until = util.parse_iso(delivery.deadline)
+    activation_time_left(until)
     data = delivery.data
     sha, tree = data["release"], data["tree"]
     root = install.runtime(sha)
     if ready_path(root).exists():
-        return verify_runtime(install, sha, tree)
+        return verify_runtime(install, sha, tree, until=until)
     env = {"PATH": os.environ["PATH"], "HOME": str(Path.home()), "GIT_CONFIG_NOSYSTEM": "1",
            "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0", "UV_NO_PROGRESS": "1",
            "UV_NO_CONFIG": "1", "UV_PYTHON_DOWNLOADS": "never"}
 
     if not root.exists():
+        activation_time_left(until)
         with tempfile.TemporaryDirectory(prefix=".prepare-", dir=root.parent) as temporary:
             source = Path(temporary) / "source"
             source.mkdir(mode=0o700)
 
             def git(*args):
-                return command(["/usr/bin/git", *args], where=source, timeout=client.time_left(90), env=env)
+                return command(["/usr/bin/git", *args], where=source, timeout=activation_timeout(until, 90), env=env)
 
             git("init", "-q", "--template=", "--initial-branch=main")
             git("-c", "http.followRedirects=false", "fetch", "--no-tags", "--no-recurse-submodules",
@@ -290,17 +300,19 @@ def stage(install: Installation, delivery, client) -> Path:
             changed = git("diff", "--name-status", "--no-renames", delivery.base, sha)
             pilot.require(changed == "M\tREADME.md", "the managed release may only replace the authorized README")
             git("-c", "core.hooksPath=/dev/null", "checkout", "--detach", sha)
-            verify_source(source, sha, tree)
+            verify_source(source, sha, tree, until=until)
+            activation_time_left(until)
             source.rename(root)
             util.flush_folder(root.parent)
-    verify_source(root, sha, tree)
+    verify_source(root, sha, tree, until=until)
     interpreter = Path(sys.executable).resolve(strict=True)
     command(["uv", "sync", "--locked", "--no-dev", "--python", str(interpreter)], where=root,
-            timeout=client.time_left(120), env=env)
+            timeout=activation_timeout(until, 120), env=env)
     pilot.require((root / ".venv/bin/python").resolve() == interpreter,
                   "the locked release did not retain the supervisor's Python interpreter")
-    mark_runtime(root, sha, tree)
-    return verify_runtime(install, sha, tree)
+    activation_time_left(until)
+    mark_runtime(root, sha, tree, until=until)
+    return verify_runtime(install, sha, tree, until=until)
 
 
 def active(delivery, install: Installation):
@@ -320,11 +332,15 @@ def activation_authority(delivery, install: Installation, until: datetime):
     return policy
 
 
-def known_good(install: Installation, base: str) -> dict:
+def known_good(install: Installation, base: str, *, until: datetime) -> dict:
+    activation_time_left(until)
     pilot.require(selected(install) == base, "the selected known-good runtime is not the approved squash parent")
-    launch_job(install.service + ".zte-release")
-    database(install)
-    return health(install, base)
+    launch_job(install.service + ".zte-release", until=until)
+    database(install, until=until)
+    activation_time_left(until)
+    beat = health(install, base, until=until)
+    activation_time_left(until)
+    return beat
 
 
 def preflight(delivery, policy) -> None:
@@ -333,7 +349,7 @@ def preflight(delivery, policy) -> None:
                   and policy.rehearsal == install.to_receipt()["rehearsal"],
                   "the admitted managed release profile changed")
     try:
-        known_good(install, delivery.base)
+        known_good(install, delivery.base, until=util.parse_iso(delivery.deadline))
     except (OSError, RuntimeError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         raise pilot.Held("the admitted last-good runtime or release worker is not healthy") from error
 
@@ -353,7 +369,7 @@ def restore(install: Installation, delivery, *, reason: str = "") -> None:
             verify_runtime(install, previous, until=util.now() + timedelta(seconds=15))
             switch(install, release, previous)
     # Stop blocks delivery, not corrective recovery of an already-activated release.
-    until = util.parse_iso(delivery.data["restore_after"]) + timedelta(seconds=RECOVERY_SECONDS)
+    until = recovery_deadline(delivery)
     try:
         database(install, until=until)
         reconcile_recovery(install, delivery, previous, until)
@@ -407,7 +423,8 @@ def reconcile_recovery(install: Installation, delivery, previous: str, until: da
 
 
 def deploy(install: Installation, delivery) -> None:
-    policy = active(delivery, install)
+    outer = util.parse_iso(delivery.deadline)
+    policy = activation_authority(delivery, install, outer)
     client = policy.client(delivery.deadline)
     prior = delivery.base
     sha, tree = delivery.data["release"], delivery.data["tree"]
@@ -415,24 +432,30 @@ def deploy(install: Installation, delivery) -> None:
                   "the admitted managed release profile changed")
     zte_delivery.require_landing(delivery, client, sha)
     stage(install, delivery, client)
-    if runs.runs_marked_running():
-        return
-    verify_runtime(install, sha, tree)
+    with db.one_read(timeout=activation_timeout(outer, 2)):
+        if runs.runs_marked_running():
+            return
+    verify_runtime(install, sha, tree, until=outer)
     policy.audit(client)
     pilot.require(client.ci(sha, tree, "push") == delivery.data["release_ci"], "release CI evidence changed")
-    before = known_good(install, prior)
+    before = known_good(install, prior, until=outer)
+    activation_time_left(outer)
     zte_delivery.require_landing(delivery, client, sha)
     with slots.admitting(wait=False) as slot:
         if not slot:
             return
         with util.lock(zte.INTERLOCK) as got:
-            if not got or runs.runs_marked_running():
+            if not got:
                 return
-            active(delivery, install)
-            pilot.require(selected(install) == prior and util.pid_alive(before["pid"]),
-                          "the last-good runtime changed before activation")
-            intent = store.transition(delivery, "deploy_intent", last_good=prior, activation_after=util.iso(),
-                                      old_pid=before["pid"], installation=install.to_receipt())
+            with db.tx(timeout=0, before_commit=lambda: activation_time_left(outer)):
+                if runs.runs_marked_running():
+                    return
+                activation_authority(delivery, install, outer)
+                pilot.require(selected(install) == prior and util.pid_alive(before["pid"]),
+                              "the last-good runtime changed before activation")
+                activation_time_left(outer)
+                intent = store.transition(delivery, "deploy_intent", last_good=prior, activation_after=util.iso(),
+                                          old_pid=before["pid"], installation=install.to_receipt())
             until = activation_deadline(intent)
             activation_authority(intent, install, until)
             switch(install, prior, sha)
@@ -471,6 +494,12 @@ def finish(install: Installation, delivery) -> None:
             store.complete(delivery, data["pr_task_version"], release_health=beats, completion_health=final)
 
 
+def hold_recovery(task: str, error: Exception) -> None:
+    with util.lock(zte.INTERLOCK) as got:
+        if got and (current := store.find(task)) and current.phase in ("deploy_intent", "rollback_intent"):
+            zte.hold(current, error, uncertain=True)
+
+
 def tick() -> int:
     with util.lock(RELEASE_LOCK) as got:
         if not got:
@@ -493,10 +522,13 @@ def tick() -> int:
                     restore(installation(current.data.get("installation")), current, reason=failure_reason(error))
                 except (OSError, RuntimeError, ValueError, TypeError, KeyError, sqlite3.Error,
                         subprocess.SubprocessError) as rollback_error:
-                    zte.hold(store.find(delivery.task), rollback_error, uncertain=True)
+                    hold_recovery(delivery.task, rollback_error)
                     return 1
+            elif current and current.phase == "rollback_intent":
+                hold_recovery(delivery.task, error)
+                return 1
             elif current and current.phase not in store.TERMINAL:
-                zte.hold(current, error, uncertain=current.phase == "rollback_intent")
+                zte.hold(current, error)
                 return 1
     return 0
 
@@ -516,20 +548,30 @@ def launch_selected(install: Installation) -> None:
     sha = selected(install)
     with db.one_read(timeout=2):
         delivery = store.latest() if store.activation_pending() else None
-    if delivery is not None:
-        pilot.require(sha in (delivery.data.get("last_good"), delivery.data.get("release")),
-                      "the runtime selector does not match the activation journal")
-    candidate = delivery is not None and sha == delivery.data.get("release")
     until = None
-    if candidate:
-        pilot.require(delivery.phase == "deploy_intent", "candidate startup is no longer authorized")
-        until = activation_deadline(delivery)
-        activation_authority(delivery, install, until)
+    candidate = False
+    if delivery is not None:
+        pilot.require(delivery.phase != "uncertain", "managed startup is blocked by an uncertain recovery")
+        pilot.require(install.to_receipt() == delivery.data.get("installation"),
+                      "the managed service does not match the activation journal")
+        if delivery.phase == "rollback_intent":
+            pilot.require(sha == delivery.data["last_good"], "the last-good runtime is not selected for recovery")
+            until = recovery_deadline(delivery)
+            pilot.require(util.now() < until, "bounded recovery window expired before managed startup")
+        else:
+            pilot.require(sha in (delivery.data.get("last_good"), delivery.data.get("release")),
+                          "the runtime selector does not match the activation journal")
+            candidate = sha == delivery.data["release"]
+            until = activation_deadline(delivery)
+            if candidate:
+                activation_authority(delivery, install, until)
     runtime = verify_runtime(install, sha, until=until)
     os.chdir(runtime)
     python = runtime / ".venv/bin/python"
     if candidate:
         activation_authority(delivery, install, until)
+    elif until is not None:
+        activation_time_left(until)
     os.execv(python, [str(python), "-m", "arete.cli", "serve"])
 
 
