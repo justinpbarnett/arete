@@ -85,12 +85,15 @@ def selected(install: Installation) -> str:
     return sha
 
 
-def verify_source(root: Path, sha: str, tree: str = "") -> str:
+def verify_source(root: Path, sha: str, tree: str = "", *, until: datetime | None = None) -> str:
+    def git(*args: str) -> str:
+        return util.git(list(args), root, timeout=activation_timeout(until, 30), retry=False)
+
     pilot.require(pilot.private(root, stat.S_ISDIR) and (root / ".git").is_dir()
-                  and not (root / ".git").is_symlink() and pilot.git(root, "rev-parse", "HEAD").strip() == sha
-                  and not pilot.git(root, "status", "--porcelain", "--untracked-files=all"),
+                  and not (root / ".git").is_symlink() and git("rev-parse", "HEAD").strip() == sha
+                  and not git("status", "--porcelain", "--untracked-files=all"),
                   "the managed source is missing, dirty or differs from the verified release")
-    actual = pilot.git(root, "rev-parse", "HEAD^{tree}").strip()
+    actual = git("rev-parse", "HEAD^{tree}").strip()
     pilot.require(not tree or actual == tree, "the managed source does not have the authorized tree")
     return actual
 
@@ -107,9 +110,9 @@ def mark_runtime(root: Path, sha: str, tree: str) -> None:
     util.write_durably(ready_path(root), json.dumps({"sha": sha, "tree": tree}).encode(), mode=0o600)
 
 
-def verify_runtime(install: Installation, sha: str, tree: str = "") -> Path:
+def verify_runtime(install: Installation, sha: str, tree: str = "", *, until: datetime | None = None) -> Path:
     root = install.runtime(sha)
-    actual = verify_source(root, sha, tree)
+    actual = verify_source(root, sha, tree, until=until)
     pilot.require((root / ".venv/bin/python").is_file()
                   and json.loads(zte.private_bytes(ready_path(root), 512)) == {"sha": sha, "tree": actual},
                   "the managed runtime has no completed locked-install receipt")
@@ -132,33 +135,44 @@ def activation_time_left(until: datetime) -> float:
     return remaining
 
 
+def activation_timeout(until: datetime | None, cap: float) -> float:
+    return cap if until is None else min(cap, activation_time_left(until))
+
+
 def restart(install: Installation, *, until: datetime | None = None) -> None:
     command = ["/bin/launchctl", "kickstart", "-k", install.service]
-    timeout = min(20, activation_time_left(until)) if until is not None else 20
-    boot = subprocess.run(command, timeout=timeout, capture_output=True, check=False)
+    boot = subprocess.run(command, timeout=activation_timeout(until, 20), capture_output=True, check=False)
     pilot.require(boot.returncode == 0, "launchd could not restart the managed service")
 
 
-def launch_job(service: str) -> str:
-    job = subprocess.run(["/bin/launchctl", "print", service], timeout=4,
+def launch_job(service: str, *, until: datetime | None = None) -> str:
+    job = subprocess.run(["/bin/launchctl", "print", service], timeout=activation_timeout(until, 4),
                          capture_output=True, text=True, check=False)
     pilot.require(job.returncode == 0, "the managed launchd job is not loaded")
     return job.stdout
 
 
-def service_pid(install: Installation) -> int:
-    match = re.search(r"^\s*pid = (\d+)$", launch_job(install.service), re.MULTILINE)
+def service_pid(install: Installation, *, until: datetime | None = None) -> int:
+    match = re.search(r"^\s*pid = (\d+)$", launch_job(install.service, until=until), re.MULTILINE)
     return int(match[1]) if match else 0
 
 
-def database(install: Installation) -> None:
+def database(install: Installation, *, until: datetime | None = None) -> None:
     reason = "the unchanged managed database did not pass its schema and integrity check"
     try:
-        with db.one_read() as connection:
-            if (connection.execute("PRAGMA user_version").fetchone()[0] != install.schema
-                    or connection.execute("PRAGMA quick_check").fetchone()[0] != "ok"):
-                raise DatabaseUnhealthy(reason)
+        with db.one_read(timeout=None if until is None else activation_timeout(until, 2)) as connection:
+            if until is not None:
+                connection.set_progress_handler(lambda: util.now() >= until, 1000)
+            try:
+                if (connection.execute("PRAGMA user_version").fetchone()[0] != install.schema
+                        or connection.execute("PRAGMA quick_check").fetchone()[0] != "ok"):
+                    raise DatabaseUnhealthy(reason)
+            finally:
+                if until is not None:
+                    connection.set_progress_handler(None, 0)
     except (OSError, sqlite3.Error) as error:
+        if until is not None:
+            activation_time_left(until)
         raise DatabaseUnhealthy(reason) from error
 
 
@@ -168,14 +182,15 @@ def stop_unhealthy_service(install: Installation) -> None:
     pilot.require(service.returncode == 0, "database unhealthy and launchd did not confirm service shutdown")
 
 
-def executable_matches(root: Path, pid: int) -> bool:
-    process = subprocess.run(["/bin/ps", "-p", str(pid), "-o", "command="], timeout=4,
+def executable_matches(root: Path, pid: int, *, until: datetime | None = None) -> bool:
+    process = subprocess.run(["/bin/ps", "-p", str(pid), "-o", "command="], timeout=activation_timeout(until, 4),
                              capture_output=True, text=True, check=False)
     return process.returncode == 0 and process.stdout.strip() == f"{root / '.venv/bin/python'} -m arete.cli serve"
 
 
-def health(install: Installation, sha: str, *, after: str = "", old_pid: int = 0) -> dict:
-    root = verify_runtime(install, sha)
+def health(install: Installation, sha: str, *, after: str = "", old_pid: int = 0,
+           until: datetime | None = None) -> dict:
+    root = verify_runtime(install, sha, until=until)
     beat = util.read_json(paths.STATE_DIR / "serve.json", {})
     server = util.read_json(paths.STATE_DIR / "server.json", {})
     pid = beat.get("pid")
@@ -190,15 +205,20 @@ def health(install: Installation, sha: str, *, after: str = "", old_pid: int = 0
     pilot.require((server.get("scheme"), server.get("host"), server.get("port"), server.get("state"),
                    server.get("config")) == ("https", target.hostname, target.port, str(paths.STATE_DIR),
                                               str(paths.CONFIG_FILE)), "managed service address differs from the profile")
-    pilot.require(service_pid(install) == pid and executable_matches(root, pid),
+    pilot.require(service_pid(install, until=until) == pid and executable_matches(root, pid, until=until),
                   "heartbeat PID is not the selected managed launchd executable")
-    connection = http.client.HTTPSConnection(target.hostname, target.port, timeout=8)
+    connection = http.client.HTTPSConnection(target.hostname, target.port, timeout=activation_timeout(until, 8))
     try:
         connection.request("GET", "/api/meta", headers={"Accept": "application/json"})
+        connection.sock.settimeout(activation_timeout(until, 8))
         response = connection.getresponse()
+        if until is not None:
+            activation_time_left(until)
         pilot.require(response.status == 200 and response.getheader("X-Arete-Engine") == sha[:12]
                       and json.loads(response.read(2**18))["schema"]["version"] == install.schema,
                       "authenticated HTTPS did not confirm the selected engine and schema")
+        if until is not None:
+            activation_time_left(until)
     finally:
         connection.close()
     return {"at": beat["at"], "pid": pid, "engine": sha, "schema": install.schema, "https_status": 200}
@@ -208,14 +228,15 @@ def failure_reason(error: Exception) -> str:
     return util.first_line(str(error), 200) if isinstance(error, pilot.Held) else type(error).__name__
 
 
-def fresh_health(install: Installation, sha: str, after: str, old_pid: int, check, *, seconds=None) -> list[dict]:
-    until = time.monotonic() + (HEALTH_SECONDS if seconds is None else seconds)
+def fresh_health(install: Installation, sha: str, after: str, old_pid: int, check, *, seconds=None,
+                 until: datetime | None = None) -> list[dict]:
+    limit = time.monotonic() + activation_timeout(until, HEALTH_SECONDS if seconds is None else seconds)
     evidence = []
     reason = "no second heartbeat from the same process"
-    while time.monotonic() < until:
+    while time.monotonic() < limit:
         check()
         try:
-            beat = health(install, sha, after=after, old_pid=old_pid)
+            beat = health(install, sha, after=after, old_pid=old_pid, until=until)
         except (OSError, RuntimeError, ValueError, KeyError, http.client.HTTPException, subprocess.SubprocessError) as error:
             reason = failure_reason(error)
             evidence.clear()
@@ -224,10 +245,12 @@ def fresh_health(install: Installation, sha: str, after: str, old_pid: int, chec
             if not evidence or beat["pid"] != evidence[-1]["pid"]:
                 evidence = [beat]
             elif beat["at"] != evidence[-1]["at"]:
-                database(install)
+                database(install, until=until)
                 check()
                 return [evidence[-1], beat]
-        time.sleep(2)
+        time.sleep(activation_timeout(until, min(2, max(0, limit - time.monotonic()))))
+    if until is not None:
+        activation_time_left(until)
     raise pilot.Held(f"no two fresh authenticated HTTPS health beats for the managed release: {reason}")
 
 
@@ -278,6 +301,13 @@ def active(delivery, install: Installation):
                   and zte.settings(config.load(), policy)[2] == delivery.data["config"],
                   "the release profile or admitted configuration changed")
     zte_delivery.check_stop(delivery, policy, engine=previous[:12])
+    return policy
+
+
+def activation_authority(delivery, install: Installation, until: datetime):
+    with db.one_read(timeout=activation_timeout(until, 2)):
+        policy = active(delivery, install)
+    activation_time_left(until)
     return policy
 
 
@@ -387,13 +417,12 @@ def deploy(install: Installation, delivery) -> None:
                           "the last-good runtime changed before activation")
             intent = store.transition(delivery, "deploy_intent", last_good=prior, activation_after=util.iso(),
                                       old_pid=before["pid"], installation=install.to_receipt())
-            active(intent, install)
             until = activation_deadline(intent)
-            activation_time_left(until)
+            activation_authority(intent, install, until)
             switch(install, prior, sha)
     with util.lock(zte.INTERLOCK) as got:
         pilot.require(got, "the Stop interlock is busy before the managed restart")
-        active(intent, install)
+        activation_authority(intent, install, until)
         pilot.require(selected(install) == sha, "the selected runtime changed before the managed restart")
         restart(install, until=until)
     finish(install, intent)
@@ -405,26 +434,25 @@ def finish(install: Installation, delivery) -> None:
     until = activation_deadline(delivery)
 
     def check():
-        policy = active(delivery, install)
-        activation_time_left(until)
-        return policy
+        return activation_authority(delivery, install, until)
 
     pilot.require(selected(install) == sha, "the deployment intent has no active candidate selector")
-    check()
-    beats = fresh_health(install, sha, data["activation_after"], data["old_pid"], check,
-                         seconds=activation_time_left(until))
+    beats = fresh_health(install, sha, data["activation_after"], data["old_pid"], check, until=until)
     policy = check()
     zte_delivery.require_landing(delivery, policy.client(util.iso(until)), sha)
-    database(install)
-    final = health(install, sha, after=data["activation_after"], old_pid=data["old_pid"])
-    with util.lock(zte.INTERLOCK, wait=True), db.tx():
-        check()
-        database(install)
-        pilot.require(selected(install) == sha, "the selected runtime changed during validation")
-        pilot.require(final["pid"] == beats[-1]["pid"] and util.pid_alive(final["pid"]),
-                      "the validated runtime exited or restarted before completion")
-        activation_time_left(until)
-        store.complete(delivery, data["pr_task_version"], release_health=beats, completion_health=final)
+    final = health(install, sha, after=data["activation_after"], old_pid=data["old_pid"], until=until)
+    with util.lock(zte.INTERLOCK) as got:
+        if not got:
+            return
+        with db.tx(timeout=activation_timeout(until, 2)):
+            check()
+            database(install, until=until)
+            pilot.require(selected(install) == sha, "the selected runtime changed during validation")
+            pilot.require(final["pid"] == beats[-1]["pid"] and util.pid_alive(final["pid"]),
+                          "the validated runtime exited or restarted before completion")
+            activation_time_left(until)
+            store.complete(delivery, data["pr_task_version"], release_health=beats, completion_health=final)
+            activation_time_left(until)
 
 
 def tick() -> int:
@@ -442,7 +470,7 @@ def tick() -> int:
                 finish(install, delivery)
             else:
                 restore(install, delivery)
-        except (OSError, RuntimeError, ValueError, TypeError, KeyError, http.client.HTTPException,
+        except (OSError, RuntimeError, ValueError, TypeError, KeyError, sqlite3.Error, http.client.HTTPException,
                 subprocess.SubprocessError) as error:
             current = store.find(delivery.task)
             if current and current.phase == "deploy_intent":
