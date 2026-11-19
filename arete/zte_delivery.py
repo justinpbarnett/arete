@@ -96,7 +96,7 @@ def settle_pr(delivery, client) -> None:
                   "GitHub did not confirm the authorized fresh PR")
     returned = data.get("created_pr")
     pilot.require(not returned or returned == pull["node_id"], "GitHub returned another PR after creation")
-    with db.tx():
+    with db.tx(timeout=0):
         store.transition(delivery, "pr_ready", pr=pull["number"], pr_node=pull["node_id"], pr_url=pull["html_url"])
         record.note(data["run"], branch=data["branch"], pr_url=pull["html_url"])
 
@@ -261,9 +261,20 @@ def database_busy(error: sqlite3.OperationalError) -> bool:
     return (getattr(error, "sqlite_errorcode", 0) & 0xff) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
 
 
+class HostedDeadlineExpired(pilot.Held):
+    pass
+
+
 def send_authorized(delivery, policy, client, isolated, proof, risk, ci_scope) -> None:
+    deadline = zte.wall_deadline(delivery)
+
+    def check_deadline():
+        if time.monotonic() >= deadline:
+            raise HostedDeadlineExpired("ZTE grant expired at the hosted write boundary")
+
     data = delivery.data
     branch, head, tree = data["branch"], data["head"], data["tree"]
+    check_deadline()
     token = client.token()
     policy.audit(client)
     if proof:
@@ -279,36 +290,63 @@ def send_authorized(delivery, policy, client, isolated, proof, risk, ci_scope) -
         pilot.require(delivery.phase == "pr_ready" and proof and risk, "no authorized ZTE squash")
         if not ready_to_squash(delivery, client):
             return
+    pr_body = policy.signal(delivery.base).task() if delivery.phase == "pushed" else ""
+    response = {}
     with util.lock(zte.INTERLOCK) as got:
         if not got:
             return
         pilot.require(zte.settings(config.load(), policy)[2] == data["config"], "ZTE configuration changed")
-        check_stop(delivery, policy)
-        if delivery.phase == "prepared":
-            store.transition(delivery, "push_intent", push_sent_after=util.iso())
+        check_deadline()
+        try:
+            with db.tx(timeout=0, before_commit=check_deadline):
+                check_stop(delivery, policy)
+                sent = util.iso()
+                if delivery.phase == "prepared":
+                    intent = store.transition(delivery, "push_intent", push_sent_after=sent)
+                elif delivery.phase == "pushed":
+                    intent = store.transition(delivery, "pr_intent", pr_sent_after=sent)
+                else:
+                    intent = store.transition(delivery, "merge_intent", pr_ci=proof, risk=risk, merge_sent_after=sent)
+        except sqlite3.OperationalError as error:
+            if not database_busy(error):
+                raise
+            return
+        check_deadline()
+        if intent.phase == "push_intent":
             client.push(isolated, branch, head, token)
-        elif delivery.phase == "pushed":
-            intent = store.transition(delivery, "pr_intent", pr_sent_after=util.iso())
-            created = client.create(branch, pilot.TASK_TITLE, policy.signal(delivery.base).task(), token)
+        elif intent.phase == "pr_intent":
+            created = client.create(branch, pilot.TASK_TITLE, pr_body, token)
             if isinstance(created.get("node_id"), str):
-                store.annotate(intent, created_pr=created["node_id"])
+                response["created_pr"] = created["node_id"]
         else:
-            intent = store.transition(delivery, "merge_intent", pr_ci=proof, risk=risk, merge_sent_after=util.iso())
             reply = client.squash(data["pr"], head, token)
             if reply.get("merged") is True and pilot.SHA.fullmatch(reply.get("sha") or ""):
-                store.annotate(intent, returned_merge=reply["sha"])
+                response["returned_merge"] = reply["sha"]
+
+    # A missing response hint leaves the committed intent for read-only reconciliation, not a resend.
+    if response and time.monotonic() < deadline:
+        try:
+            with db.tx(timeout=0, before_commit=check_deadline):
+                store.annotate(intent, **response)
+        except HostedDeadlineExpired:
+            return
+        except sqlite3.OperationalError as error:
+            if not database_busy(error):
+                raise
 
 
 def reconcile(delivery, client, observed: dict) -> None:
     if delivery.phase == "push_intent":
         pilot.require(client.branch_head(delivery.data["branch"]) == delivery.data["head"],
                       "the exact push effect is not observable; no retry")
-        store.transition(delivery, "pushed")
+        with db.tx(timeout=0):
+            store.transition(delivery, "pushed")
     elif delivery.phase == "pr_intent":
         settle_pr(delivery, client)
     else:
-        store.transition(delivery, "merged", **require_landing(delivery, client,
-                         expected=delivery.data.get("returned_merge", ""), observed=observed))
+        receipt = require_landing(delivery, client, expected=delivery.data.get("returned_merge", ""), observed=observed)
+        with db.tx(timeout=0):
+            store.transition(delivery, "merged", **receipt)
 
 
 def advance(cfg) -> None:
@@ -330,9 +368,17 @@ def advance(cfg) -> None:
             client = GitHub(identity, util.iso(max(until, util.now() + timedelta(seconds=25))), Path("/dev/null"),
                             observer=zte.OBSERVER_FILE)
             reconcile(delivery, client, observed)
+        except sqlite3.OperationalError as error:
+            if not database_busy(error):
+                raise
         except (OSError, RuntimeError, ValueError, TypeError, KeyError) as error:
             if util.now() >= until or (observed.get("merged") and observed.get("target") != "main"):
-                zte.hold(delivery, error, uncertain=True, **({"observed_landing": observed} if observed else {}))
+                try:
+                    zte.hold(delivery, error, uncertain=True, timeout=0,
+                             **({"observed_landing": observed} if observed else {}))
+                except sqlite3.OperationalError as busy:
+                    if not database_busy(busy):
+                        raise
         return
     try:
         policy = zte.active(delivery)
@@ -357,7 +403,9 @@ def advance(cfg) -> None:
             require_landing(delivery, client, release)
             proof = client.ci(release, delivery.data["tree"], "push")
             if proof:
-                store.transition(delivery, "release_ready", release_ci=proof)
+                with db.tx(timeout=0, before_commit=lambda: client.time_left()):
+                    check_stop(delivery, policy)
+                    store.transition(delivery, "release_ready", release_ci=proof)
         else:
             send_next(delivery, policy, client, cfg, repo)
     except (OSError, RuntimeError, ValueError, TypeError, KeyError, sqlite3.Error) as error:

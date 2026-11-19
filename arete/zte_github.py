@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import base64
-import http.client
 import json
 import re
+import selectors
+import subprocess
 import tempfile
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,23 +27,63 @@ MAX_RESPONSE = 1024 * 1024
 
 
 def api(method: str, path: str, token: str, timeout: float, data: dict | None = None) -> dict:
-    connection = http.client.HTTPSConnection("api.github.com", timeout=timeout)
+    deadline = time.monotonic() + timeout
+    pilot.require(path.startswith("/") and token.isascii() and token.isprintable(), "invalid ZTE API request")
+    headers = (f"Authorization: Bearer {token}\nAccept: application/vnd.github+json\n"
+               "Content-Type: application/json\nX-GitHub-Api-Version: 2022-11-28\n").encode()
+    with tempfile.TemporaryFile() as auth, tempfile.TemporaryFile() as payload:
+        auth.write(headers)
+        auth.seek(0)
+        body = []
+        if data is not None:
+            payload.write(json.dumps(data).encode())
+            payload.seek(0)
+            body = ["--data-binary", f"@/dev/fd/{payload.fileno()}"]
+        remaining = deadline - time.monotonic()
+        pilot.require(remaining >= 0.001, "ZTE GitHub deadline expired before request")
+        command = [
+            "/usr/bin/curl", "--disable", "--silent", "--http1.1", "--globoff", "--noproxy", "*", "--proto", "=https",
+            "--max-time", str(remaining), "--max-filesize", str(MAX_RESPONSE), "--user-agent", "Arete-ZTE",
+            "--header", "@-", "--request", method, "--write-out", "\n%{http_code}", *body, f"https://api.github.com{path}",
+        ]
+        raw, _, status = api_response(command, auth, payload.fileno(), deadline).rpartition(b"\n")
+    if status not in (b"200", b"201"):
+        label = status.decode("ascii") if len(status) == 3 and status.isdigit() else "unknown"
+        if method == "GET":
+            raise gh.GhError(f"GitHub HTTP {label}; could not confirm ZTE App scope")
+        raise gh.GhUnsure(f"GitHub HTTP {label}; reconcile the ZTE effect by reading")
+    pilot.require(len(raw) <= MAX_RESPONSE, "GitHub response exceeded the ZTE receipt bound")
+    result = json.loads(raw)
+    pilot.require(isinstance(result, dict), "GitHub returned no ZTE receipt object")
+    return result
+
+
+def api_response(command, auth, payload_fd: int, deadline: float) -> bytes:
+    unconfirmed = "GitHub transport did not confirm the ZTE response in time; reconcile by reading"
     try:
-        connection.request(method, path, json.dumps(data) if data is not None else None,
-                           {"Authorization": f"Bearer {token}",
-                           "Accept": "application/vnd.github+json", "Content-Type": "application/json",
-                           "User-Agent": "Arete-ZTE", "X-GitHub-Api-Version": "2022-11-28"})
-        response = connection.getresponse()
-        if response.status not in (200, 201):
-            if method == "GET":
-                raise gh.GhError(f"GitHub HTTP {response.status}; could not confirm ZTE App scope")
-            raise gh.GhUnsure(f"GitHub HTTP {response.status}; reconcile the ZTE effect by reading")
-        raw = response.read(MAX_RESPONSE + 1)
-        if len(raw) > MAX_RESPONSE:
-            raise gh.GhUnsure("GitHub response exceeded the ZTE receipt bound")
-        return json.loads(raw)
-    finally:
-        connection.close()
+        with subprocess.Popen(command, stdin=auth, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              env={}, pass_fds=(payload_fd,)) as curl:
+            try:
+                stream = curl.stdout
+                data = bytearray()
+                limit = MAX_RESPONSE + len(b"\n200")
+                with selectors.DefaultSelector() as readable:
+                    readable.register(stream, selectors.EVENT_READ)
+                    while (left := deadline - time.monotonic()) > 0 and readable.select(left):
+                        chunk = stream.read1(min(64 * 1024, limit + 1 - len(data)))
+                        if not chunk:
+                            if curl.wait(timeout=max(0, deadline - time.monotonic())) == 0 and time.monotonic() < deadline:
+                                return bytes(data)
+                            break
+                        data.extend(chunk)
+                        if len(data) > limit:
+                            raise gh.GhUnsure("GitHub response exceeded the ZTE receipt bound")
+                raise gh.GhUnsure(unconfirmed)
+            finally:
+                if curl.poll() is None:
+                    curl.kill()
+    except (OSError, subprocess.SubprocessError):
+        raise gh.GhUnsure(unconfirmed) from None
 
 
 def rows(pages, field: str = "") -> list:
@@ -278,7 +320,7 @@ class GitHub:
                       and self.key.lstat().st_nlink == 1, "the delivery signing key must be private")
         identity = self.identity
         app = config.GithubApp(app_id=str(identity.app), installation_id=str(identity.installation), private_key=self.key)
-        jwt = gh.app_jwt(app)
+        jwt = gh.app_jwt(app, timeout=self.time_left(30))
         path = f"/app/installations/{identity.installation}"
         install = api("GET", path, jwt, self.time_left())
         allowed = {**PERMISSIONS, "metadata": "read"}
