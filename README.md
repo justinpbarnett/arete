@@ -1754,7 +1754,7 @@ Missing requirements, invented facts and damaged commands are counted separately
 
 The result is `unreviewed` until every text has all five values from at least `raters` raters; an unreviewed report proposes nothing. Once reviewed, the proposal is the eligible candidate with the highest preference, with its lead over the next one and whether the interval is clear of zero. Proposals only.
 
-## CI
+## Continuous integration
 
 After the push, the run waits for the checks on the PR. It waits up to 30 minutes, or 3 minutes when no check reports at all. The run frees its `max_parallel` slot for the wait, so another ticket can start, and takes a slot back before a CI fix step. Arete compares each failed check with the same check on the head of the base branch.
 
