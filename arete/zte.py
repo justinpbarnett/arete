@@ -60,6 +60,7 @@ class Policy:
     production_issue_base: str = ""
     accept_issue_races: bool = False
     reconciled_hold: str = ""
+    allow_same_day_recovery: bool = False
 
     @property
     def fingerprint(self) -> str:
@@ -76,6 +77,8 @@ class Policy:
             del fields["accept_issue_races"]
         if not self.reconciled_hold:
             del fields["reconciled_hold"]
+        if not self.allow_same_day_recovery:
+            del fields["allow_same_day_recovery"]
         return orchestration.digest(fields)
 
     def client(self, deadline: str) -> GitHub:
@@ -131,6 +134,9 @@ def load_policy() -> Policy | None:
     pilot.require(type(policy.reconciled_hold) is str and (not policy.reconciled_hold
                   or (base and policy.accept_issue_races and TASK.fullmatch(policy.reconciled_hold))),
                   "a pre-PR hold may only be reconciled for an explicitly pinned production issue")
+    pilot.require(type(policy.allow_same_day_recovery) is bool
+                  and (not policy.allow_same_day_recovery or bool(policy.reconciled_hold)),
+                  "same-day recovery requires an explicitly pinned pre-PR hold")
     if issue is not None:
         zte_issue.require_number(issue.number)
         pilot.require(type(issue.node) is str and 0 < len(issue.node) <= 128
@@ -369,7 +375,7 @@ def finder(cfg: config.Config) -> None:
         recovery = None
         if previous and previous.phase != "healthy":
             if (previous.task != policy.reconciled_hold or not (recovery := store.pre_pr_hold(previous))
-                    or not store.recovery_ready(previous, util.now())):
+                    or not store.recovery_ready(previous, util.now(), allow_same_day=policy.allow_same_day_recovery)):
                 return
         repo, _, digest = settings(cfg, policy)
         deadline = util.iso(util.now() + timedelta(seconds=MAX_SECONDS))
@@ -414,6 +420,8 @@ def finder(cfg: config.Config) -> None:
                     data["production_issue_base"] = policy.production_issue_base
                 if recovery:
                     data["reconciled_hold"] = recovery
+                    if policy.allow_same_day_recovery:
+                        data["allow_same_day_recovery"] = True
                 client.time_left()
                 with principals.acting("rule:zte-finder"), db.tx(timeout=0, before_commit=client.time_left):
                     store.reserve(policy.fingerprint, repo.name, base, deadline, pilot.TASK_TITLE, pilot.TASK_KIND,

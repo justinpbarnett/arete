@@ -115,14 +115,25 @@ def pre_pr_hold(delivery: Delivery | None) -> dict | None:
     return {"task": delivery.task, "version": delivery.version, "branch": branch, "head": head}
 
 
-def recovery_ready(delivery: Delivery, now: datetime) -> bool:
+def recovery_ready(delivery: Delivery, now: datetime, *, allow_same_day: bool = False) -> bool:
     created, deadline = map(ledger_time, (delivery.created, delivery.deadline))
-    return bool(created and deadline and now >= deadline and now.date() > created.date())
+    return bool(created and deadline and deadline <= now
+                and (now.date() > created.date() or (allow_same_day is True and now.date() == created.date())))
 
 
-def same_installation(delivery: Delivery, repo: str, data: dict) -> bool:
-    return delivery.repo == repo and all(data.get(key) and data[key] == delivery.data.get(key)
-                                         for key in ("github", "approved_installation"))
+def same_installation(delivery: Delivery, repo: str, data: dict, *, migrating_recovery: bool = False) -> bool:
+    if delivery.repo != repo or not data.get("github") or data["github"] != delivery.data.get("github"):
+        return False
+    prior = delivery.data.get("approved_installation")
+    current = data.get("approved_installation")
+    if prior and prior == current:
+        return True
+    # Migration 13 changes only the delivery indexes, not the managed installation.
+    if not isinstance(prior, dict) or not isinstance(current, dict):
+        return False
+    return (migrating_recovery and prior.get("schema") == 12 and current.get("schema") == 13
+            and current.keys() == {"schema", "endpoint", "rehearsal"}
+            and current == {**prior, "schema": 13})
 
 
 def reserve(policy: str, repo: str, base: str, deadline: str, title: str, kind: str, body: str,
@@ -133,17 +144,29 @@ def reserve(policy: str, repo: str, base: str, deadline: str, title: str, kind: 
         issue = data.get("issue")
         pinned = bool(issue and data.get("production_issue_base") == base and data.get("close_after_health") is True)
         predecessor = previous
-        if recovery := data.get("reconciled_hold"):
-            if not (pinned and recovery == pre_pr_hold(previous) and same_installation(previous, repo, data)
-                    and recovery_ready(previous, now) and base != previous.base
+        recovery = data.get("reconciled_hold")
+        allow_same_day = data.get("allow_same_day_recovery", False)
+        if (type(allow_same_day) is not bool or (allow_same_day and not recovery)
+                or "same_day_recovery" in data):
+            return None
+        if recovery:
+            if not (pinned and recovery == pre_pr_hold(previous)
+                    and same_installation(previous, repo, data, migrating_recovery=allow_same_day)
+                    and recovery_ready(previous, now, allow_same_day=allow_same_day) and base != previous.base
                     and all(issue.get(key) and issue[key] != previous.data["issue"][key] for key in ("number", "node"))):
                 return None
             predecessor = decode(c.execute("SELECT * FROM zte_deliveries WHERE phase = 'healthy' "
                                           "ORDER BY rowid DESC LIMIT 1").fetchone())
-            if predecessor is None or not same_installation(predecessor, repo, data):
+            if predecessor is None or not same_installation(predecessor, repo, data, migrating_recovery=allow_same_day):
                 return None
-        if previous and (previous.created[:10] == now.date().isoformat() or predecessor.phase != "healthy"
-                         or not (predecessor.policy == policy or (pinned and same_installation(predecessor, repo, data)))
+        day = now.date().isoformat()
+        if previous and previous.created[:10] == day:
+            if not allow_same_day or previous.data.get("same_day_recovery") is True:
+                return None
+            data = {**data, "same_day_recovery": True}
+        if previous and (predecessor.phase != "healthy"
+                         or not (predecessor.policy == policy or (pinned and same_installation(
+                             predecessor, repo, data, migrating_recovery=bool(recovery) and allow_same_day)))
                          or not predecessor.conformed or base in (predecessor.base, predecessor.conformed)):
             return None
         if issue:
@@ -174,7 +197,7 @@ def annotate(delivery: Delivery, **data) -> Delivery:
 
 
 def amend(delivery: Delivery, phase: str, **data) -> Delivery:
-    if data.keys() & delivery.data.keys():
+    if data.keys() & delivery.data.keys() or "same_day_recovery" in data:
         raise Conflict("ZTE evidence is append-only")
     with db.tx() as c:
         changed = c.execute("UPDATE zte_deliveries SET phase = ?, version = version + 1, data = ? "
