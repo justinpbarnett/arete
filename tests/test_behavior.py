@@ -72,9 +72,12 @@ class VersionedApiTests(unittest.TestCase):
                 self.fail("invalid key admitted")
 
     def test_versioned_read_surface(self):
-        node = SimpleNamespace(names={"127.0.0.1"})
+        address = "127.0.0.1"
+        node = SimpleNamespace(names={address})
         logins = SimpleNamespace(of=lambda _: "fixture@example.test")
-        with tailnet.Server("127.0.0.1", 0, node, logins, False, dashboard.Handler, dashboard.Redirect) as server:
+        with mock.patch("socket.getfqdn", return_value=address):
+            server = tailnet.Server(address, 0, node, logins, False, dashboard.Handler, dashboard.Redirect)
+        with server:
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": .01})
             thread.start()
             try:
