@@ -31,6 +31,7 @@ def setUpModule():
 
 class ApiCheckTests(unittest.TestCase):
     serial = True
+    class_timeout = 20  # Hosted macOS reached streaming but exhausted the unit-test budget.
 
     def test_api_check(self):
         with tempfile.TemporaryDirectory(prefix="arete-api-cli-") as temp:
