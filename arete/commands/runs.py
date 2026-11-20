@@ -4,6 +4,7 @@ import sys
 from collections.abc import Iterable
 
 from .. import paths
+from ..store import db as foundation
 from ..store import runs as run_store
 from .common import print_lines, steering
 
@@ -23,16 +24,10 @@ def cmd_merge_check(args) -> int:
 def cmd_run(args) -> int:
     from .. import client, pipeline
 
-    if not (args.local or args.dry_run):
-        try:
-            started = client.start_task({"repo": args.repo, "ticket": args.issue, "force": args.force}, args.key)
-        except client.Down:
-            started = None
-        except client.Failed as e:
-            return client.failed(e)
-        if started is not None:
-            return client.steered(lambda: run_followed(started))
-    return pipeline.run_issue(args.repo, args.issue, dry_run=args.dry_run, force=args.force)
+    if args.local or args.dry_run:
+        return pipeline.run_issue(args.repo, args.issue, dry_run=args.dry_run, force=args.force)
+    return client.steered(lambda: run_followed(client.start_task(
+        {"repo": args.repo, "ticket": args.issue, "force": args.force}, args.key)))
 
 
 def run_followed(started: dict) -> int:
@@ -55,9 +50,15 @@ def run_followed(started: dict) -> int:
 def local_lines(run_id: str, start: int, follow: bool) -> Iterable[dict] | None:
     from .. import run_lines
 
-    if not run_lines.path(run_id).exists() and not run_store.run_get(run_id):
+    def ended():
+        row = run_store.run_get(run_id, connect=foundation.reader) if paths.DB_FILE.exists() else None
+        return not row or row["status"] != "running"
+
+    if not run_lines.path(run_id).exists() and not paths.DB_FILE.exists():
         return None
-    return (run_lines.follow(run_id, start) if follow
+    if not run_lines.path(run_id).exists() and not run_store.run_get(run_id, connect=foundation.reader):
+        return None
+    return (run_lines.follow(run_id, start, ended=ended) if follow
             else (line for line in run_lines.read(run_id) if run_lines.seq_of(line) > start))
 
 
@@ -65,15 +66,15 @@ def cmd_lines(args) -> int:
     from .. import client
 
     def printed() -> int:
-        try:
-            found = (client.followed if args.follow else client.events)(args.run_id, args.start)
-        except client.Down:
+        if args.offline:
             if (found := local_lines(args.run_id, args.start, args.follow)) is None:
-                client.emit({"error": f"no run {args.run_id}"})
+                client.emit({"error": f"no run {args.run_id}", "source": "local"})
                 return 1
+        else:
+            found = (client.followed if args.follow else client.events)(args.run_id, args.start)
         for line in found:
             if not args.step or line.get("step") == args.step:
-                client.emit(line)
+                client.emit({**line, "source": "local"} if args.offline else line)
         return 0
 
     return client.steered(printed)
@@ -151,8 +152,7 @@ def register(sub) -> None:
     p.add_argument("issue", help="an issue number (35), a Jira key (ABC-1234) or a task id (t-1a2b)")
     p.add_argument("--dry-run", action="store_true", help="plan and build locally, no push, PR or tracker writes")
     p.add_argument("--force", action="store_true", help="run a ticket the approval rules would skip")
-    p.add_argument("--local", action="store_true", help="run in this process even when the server is up; the server "
-                                                        "and the poller start runs this way")
+    p.add_argument("--local", action="store_true", help="run in this process for a server spawn or development")
     p.set_defaults(fn=cmd_run)
     p.add_argument("--key", default=None, help="reuse an identical remote task-start request safely")
 
@@ -209,4 +209,5 @@ def register(sub) -> None:
     p.add_argument("--from", dest="start", type=int, default=0, metavar="SEQ",
                    help="start after the line with this seq")
     p.add_argument("--step", default="", help="print only this step's lines")
+    p.add_argument("--offline", action="store_true", help="read local run lines")
     p.set_defaults(fn=cmd_lines)

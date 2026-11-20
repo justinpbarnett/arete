@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import getpass
 import http.client
+import ipaddress
 import json
 import os
 import secrets
@@ -12,14 +15,15 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from urllib.parse import quote, urlencode, urlsplit
 
 from . import config, paths, run_lines, util
 
 ENV = "ARETE_SERVER"
+MINOR = 2
 CONNECT_SECONDS = 5
-PROBE_SECONDS = 1
 CALL_SECONDS = 120
 RETRY_SECONDS = 2
 RESTART_WAIT_SECONDS = 30
@@ -31,7 +35,9 @@ _acquisition_thread: threading.Thread | None = None
 
 
 class Down(Exception):
-    pass
+    def __init__(self, url, cause):
+        super().__init__(f"server unreachable at {url} ({cause})")
+        self.answer = {"error": str(self), "reason": "server_down"}
 
 
 class Failed(Exception):
@@ -62,42 +68,110 @@ class Server:
     name: str
 
 
-def named_server(wanted: str) -> Server:
-    parts = urlsplit(wanted if "://" in wanted else f"http://{wanted}")
+class Invocation:
+    def __init__(self):
+        self.prefix = os.environ.get("ARETE_IDEMPOTENCY_KEY") or secrets.token_hex(16)
+        self.writes = 0
+        self.server = None
+
+    def key(self):
+        self.writes += 1
+        return f"{self.prefix}:{self.writes}"
+
+
+_invocation = ContextVar("client_invocation", default=None)
+
+
+@contextmanager
+def invocation():
+    token = _invocation.set(Invocation())
     try:
+        yield
+    finally:
+        _invocation.reset(token)
+
+
+def write_key():
+    return (_invocation.get() or Invocation()).key()
+
+
+def named_server(wanted: str, setting=ENV) -> Server:
+    try:
+        parts = urlsplit(wanted if setting != ENV or "://" in wanted else f"http://{wanted}")
         host, port = parts.hostname, parts.port
+        if (parts.scheme not in ("http", "https") or not host or parts.username is not None
+                or parts.path not in ("", "/") or parts.query or parts.fragment or port == 0):
+            raise ValueError
     except ValueError:
-        host, port = "", None
-    if parts.scheme not in ("http", "https") or not host:
-        raise Failed({"error": f"{ENV}={wanted} is not http://HOST:PORT or https://HOST:PORT"})
-    return Server(parts.scheme, host, port or config.load().dashboard_port, host)
+        raise Failed({"error": f"{setting} must be http://HOST:PORT or https://HOST:PORT"}) from None
+    return Server(parts.scheme, host, port or config.load_or_problem()[0].dashboard_port, host)
+
+
+def discover() -> Server:
+    if wanted := os.environ.get(ENV, "").strip():
+        return named_server(wanted)
+    cfg = config.load()
+    if cfg.server_url:
+        return named_server(cfg.server_url, "[server] url")
+    found, mine = util.read_json(paths.SERVER_FILE, None), paths.state_and_config()
+    if not isinstance(found, dict) or not (found.get("addresses") and found.get("port")):
+        raise Down(f"http://127.0.0.1:{cfg.dashboard_port}", f"no server address in {paths.SERVER_FILE}")
+    addresses = [str(a) for a in found["addresses"]]
+    host, port = next((a for a in addresses if ":" not in a), addresses[0]), int(found["port"])
+    where = Server(found.get("scheme") or "http", host, port, found.get("host") or host)
+    if not util.pid_alive(found.get("pid")):
+        raise Down(address(where), "the server process has ended")
+    if {k: found.get(k) for k in mine} != mine:
+        raise Down(address(where), "server.json names a different state or config")
+    return where
+
+
+def check_instance(where, instance):
+    url = address(where)
+    if not isinstance(instance, str) or not instance:
+        raise Failed({"error": "the server answer has an invalid instance.id"})
+    folder = paths.CONFIG_DIR / "server-instances"
+    folder.mkdir(parents=True, exist_ok=True)
+    identity = folder / hashlib.sha256(url.encode()).hexdigest()
+    with identity.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        saved = util.read_json(identity, None)
+        if saved is None and not identity.exists():
+            util.write_json(identity, instance)
+        elif saved != instance:
+            raise Failed({"error": f"server instance at {url} changed (expected {saved}, got {instance})",
+                          "reason": "server_identity_changed"})
 
 
 def server() -> Server:
-    if wanted := os.environ.get(ENV, "").strip():
-        return named_server(wanted)
-    found, mine = util.read_json(paths.SERVER_FILE, None), paths.state_and_config()
-    where = paths.short_path(paths.STATE_DIR)
-    if not isinstance(found, dict) or not (found.get("addresses") and found.get("port")) \
-            or not util.pid_alive(found.get("pid")):
-        raise Down(f"no arete server is up on the state in {where}; start it with `arete serve`, or set {ENV}")
-    if {k: found.get(k) for k in mine} != mine:
-        raise Down(f"the arete server named in {where} works on {found.get('state')} with {found.get('config')}, "
-                   f"not on {mine['state']} with {mine['config']}; set {ENV} to call it anyway")
-    addresses = [str(a) for a in found["addresses"]]
-    scheme = found.get("scheme") or "http"
-    host, port = next((a for a in addresses if ":" not in a), addresses[0]), int(found["port"])
-    here = Server(scheme, host, port, found.get("host") or host)
+    current = _invocation.get()
+    if current is not None and current.server is not None:
+        return current.server
+    where = discover()
+    resp = request("GET", "/api/meta", read_seconds=CONNECT_SECONDS, where=where)
+    answer = decoded(resp, "GET", "/api/meta")
+    check_instance(where, field(field(answer, "instance"), "id", "instance.id"))
+    where = getattr(resp, "arete_server", where)
+    if current is not None:
+        current.server = where
+        if remote(where):
+            from . import tool_events
+
+            tool_events.send_pending(address(where), lambda body, key: call("POST", "/api/v1/hook-events", body, key))
+    return where
+
+
+def remote(where):
     try:
-        socket.create_connection((host, port), timeout=PROBE_SECONDS).close()
-    except OSError as e:
-        raise Down(f"the arete server named in {where} does not answer on {address(here)} ({e}); start it "
-                   f"with `arete serve`, or set {ENV}") from None
-    return here
+        if ipaddress.ip_address(where.host).is_loopback:
+            return False
+    except ValueError:
+        pass
+    return where.host not in {"localhost", socket.gethostname().lower(), socket.getfqdn().lower()}
 
 
 def headers_for(where: Server) -> dict[str, str]:
-    headers = {"X-Arete": "1"}
+    headers = {"X-Arete": "1", "X-Arete-Client": f"cli/1.{MINOR}"}
     if where.scheme == "http" and where.name != where.host:
         headers["Host"] = f"{where.name}:{where.port}"
     return headers
@@ -114,12 +188,10 @@ def connect(where: Server, seconds: float = CONNECT_SECONDS) -> http.client.HTTP
         conn.connect()
     except ssl.SSLError as e:
         conn.close()
-        raise Down(f"the certificate of the arete server at {address(where)} was not accepted "
-                   f"({getattr(e, 'verify_message', None) or e.reason or e})") from None
+        raise Down(address(where), getattr(e, "verify_message", None) or e.reason or e) from None
     except OSError as e:
         conn.close()
-        raise Down(f"the arete server is not up at {address(where)} ({e.strerror or e}); start it with "
-                   f"`arete serve`, or set {ENV}") from None
+        raise Down(address(where), e.strerror or e) from None
     except BaseException:
         conn.close()
         raise
@@ -149,7 +221,7 @@ def acquired_connection(where, deadline):
             with lock:
                 if abandoned or time.monotonic() >= deadline:
                     return
-            found = server() if where is None else where
+            found = where
             with lock:
                 if abandoned or time.monotonic() >= deadline:
                     return
@@ -171,7 +243,7 @@ def acquired_connection(where, deadline):
             budget_left(deadline)
             # One live acquisition thread, no queue, even if a resolver never returns.
             if _acquisition_thread is not None and _acquisition_thread.is_alive():
-                raise Down("a previous arete server connection is still being acquired; try again later")
+                raise Down(address(where), "a previous server connection is still being acquired")
             worker = threading.Thread(target=acquire, name="arete-http-acquire", daemon=True)
             _acquisition_thread = worker
             worker.start()
@@ -194,7 +266,9 @@ def acquired_connection(where, deadline):
 
 
 def request(method: str, path: str, body: dict | None = None,
-            read_seconds: float | None = CALL_SECONDS, key: str | None = None) -> http.client.HTTPResponse:
+            read_seconds: float | None = CALL_SECONDS, key: str | None = None,
+            *, where: Server | None = None) -> http.client.HTTPResponse:
+    where = where or server()
     deadline = None
     restart = None
     while True:
@@ -203,11 +277,14 @@ def request(method: str, path: str, body: dict | None = None,
             raise Failed(restart.answer, 503)
         try:
             return request_once(method, path, body, read_seconds, within,
-                                **({"key": key} if key is not None else {}),
-                                **({"deadline": deadline} if deadline is not None else {}))
+                                key=key, deadline=deadline, where=where)
         except Restarting as e:
             restart, pause = e, e.seconds
         except Down:
+            if restart is None:
+                raise
+            pause = RETRY_SECONDS
+        except Broken:
             if restart is None:
                 raise
             pause = RETRY_SECONDS
@@ -221,11 +298,12 @@ def request(method: str, path: str, body: dict | None = None,
 
 def request_once(method: str, path: str, body: dict | None = None,
                  read_seconds: float | None = CALL_SECONDS, within: float | None = None,
-                 key: str | None = None, *, deadline: float | None = None) -> http.client.HTTPResponse:
+                 key: str | None = None, *, deadline: float | None = None,
+                 where: Server | None = None) -> http.client.HTTPResponse:
     if deadline is None and within is not None:
         deadline = time.monotonic() + within
-    where = server() if deadline is None else None
-    payload = json.dumps(body or {}).encode() if method == "POST" else None
+    where = where or server()
+    payload = json.dumps(body or {}).encode() if method != "GET" else None
     followed = False
     if within is not None:
         read_seconds = within if read_seconds is None else min(read_seconds, within)
@@ -251,6 +329,7 @@ def request_once(method: str, path: str, body: dict | None = None,
                         transport.settimeout(budget_left(deadline))
                     resp = conn.getresponse()
                     resp.arete_transport = transport
+                    resp.arete_server = where
                 if not followed and (moved := util.https_upgrade(resp, where.port)):
                     read_response(resp, deadline)
                     where, followed = Server("https", where.host, where.port, moved.hostname), True
@@ -273,8 +352,9 @@ def request_once(method: str, path: str, body: dict | None = None,
         answer = json.loads(text)
     except ValueError:
         answer = None
-    failure = (answer if isinstance(answer, dict) and "error" in answer
-               else {"error": f"the server at {address(where)} answered {resp.status}"})
+    failure = {"error": f"the server at {address(where)} answered {resp.status}"}
+    if isinstance(answer, dict):
+        failure.update(answer)
     wait = (resp.getheader("Retry-After") or "").strip()
     if key is not None and resp.status == 409 and failure.get("code") == "idempotency_in_flight":
         failure = InFlight(failure, resp.status)
@@ -351,20 +431,33 @@ def read_response(resp, deadline):
         close_response(resp)
 
 
-def call(method: str, path: str, body: dict | None = None, key: str | None = None) -> dict:
+def call(method: str, path: str, body: dict | None = None, key: str | None = None,
+         *, legacy: str = "", legacy_body: dict | None = None) -> dict:
+    if method != "GET" and key is None:
+        key = write_key()
     if key is not None and method == "POST" and path == "/api/tasks":
         return keyed_call(body, key)
-    resp = request(method, path, body)
     try:
-        answer = json.loads(resp.read())
+        return decoded(request(method, path, body, key=key), method, path)
+    except Failed as e:
+        if not legacy or e.code != 404 or not unknown_route(e.answer):
+            raise
+    return decoded(request(method, legacy, body if legacy_body is None else legacy_body, key=key), method, legacy)
+
+
+def decoded(resp, method, path):
+    try:
+        return json.loads(resp.read())
     except BROKE as e:
         raise Failed({"error": f"the server broke off: {e}"}) from None
     except ValueError:
         raise Failed({"error": f"the server answered {method} {path} with no JSON"}) from None
-    return answer
+    finally:
+        close_response(resp)
 
 
 def keyed_call(body, key):
+    where = server()
     deadline = time.monotonic() + 30
     retries, restart, failure = 0, None, None
     uncertain = False
@@ -378,7 +471,7 @@ def keyed_call(body, key):
             retries += 1
         resp = None
         try:
-            resp = request_once("POST", "/api/tasks", body, within=left, key=key, deadline=deadline)
+            resp = request_once("POST", "/api/tasks", body, within=left, key=key, deadline=deadline, where=where)
             answer = json.loads(read_response(resp, deadline))
             budget_left(deadline)
             return answer
@@ -386,16 +479,19 @@ def keyed_call(body, key):
             failure = Broken({"error": f"the server broke off: {e}"})
             uncertain, pause = True, 0
         except (Broken, InFlight) as e:
+            if restart is not None and time.monotonic() >= deadline:
+                raise restart
             failure, pause = e, getattr(e, "seconds", 0)
             uncertain = True
         except Restarting as e:
-            restart, failure, pause = e, Failed(e.answer, 503), e.seconds
+            restart = failure = Failed(e.answer, 503)
+            pause = e.seconds
             time.sleep(min(pause, max(0, deadline - time.monotonic())))
             continue
         except Down as e:
             if not uncertain and restart is None:
                 raise
-            failure, pause = Broken({"error": str(e)}), RETRY_SECONDS
+            failure, pause = restart or Broken(e.answer), RETRY_SECONDS
         except ValueError:
             raise Failed({"error": "the server answered POST /api/tasks with no JSON"}) from None
         finally:
@@ -405,8 +501,7 @@ def keyed_call(body, key):
 
 
 def start_task(body, key=None):
-    chosen = key if key is not None else os.environ.get("ARETE_IDEMPOTENCY_KEY")
-    chosen = chosen if chosen is not None else secrets.token_hex(16)
+    chosen = key if key is not None else write_key()
     print(f"Idempotency-Key: {chosen}", file=sys.stderr, flush=True)
     return call("POST", "/api/tasks", body, key=chosen)
 
@@ -425,22 +520,39 @@ def parsed(resp: http.client.HTTPResponse) -> Iterator[dict]:
             if isinstance(line, dict):
                 yield line
     except BROKE as e:
-        raise Failed({"error": f"the server broke off the lines: {e}"}) from None
+        raise Broken({"error": f"the server broke off the lines: {e}"}) from None
     finally:
         resp.close()
 
 
-def run_path(run_id: str, action: str) -> str:
-    return f"/api/runs/{quote(run_id, safe='')}/{action}"
+def run_path(run_id: str, action: str, *, prefix="/api") -> str:
+    return f"{prefix}/runs/{quote(run_id, safe='')}/{action}"
 
 
-def run_command(run_id: str, action: str, body: dict | None = None) -> int:
+def run_command(run_id: str, action: str, body: dict | None = None, *, legacy: str = "") -> int:
     def selected():
-        run = call("GET", f"/api/runs/{quote(run_id, safe='')}")["run"]
-        emit(call("POST", run_path(run_id, action), {**(body or {}), "base_version": run["version"]}))
+        run = run_info(run_id)
+        data = {**(body or {}), "base_version": field(run, "version", "run.version")}
+        path = run_path(run_id, action)
+        if action == "stop":
+            answer = call("POST", run_path(run_id, "stop", prefix="/api/v1"), data,
+                          legacy=legacy or path, legacy_body={} if legacy else None)
+            emit({k: v for k, v in answer.items() if k != "seq"})
+        else:
+            emit(call("POST", path, data))
         return 0
 
     return steered(selected)
+
+
+def run_info(run_id):
+    return field(call("GET", f"/api/runs/{quote(run_id, safe='')}"), "run")
+
+
+def steer(run_id, text):
+    answer = call("POST", run_path(run_id, "steer", prefix="/api/v1"), {"text": text},
+                  legacy=f"/api/sessions/{quote(run_id, safe='')}/send")
+    return {k: v for k, v in answer.items() if k != "seq"}
 
 
 def events(run_id: str, start: int = 0, follow: bool = False) -> Iterator[dict]:
@@ -450,7 +562,7 @@ def events(run_id: str, start: int = 0, follow: bool = False) -> Iterator[dict]:
 def run_status(run_id: str) -> str:
     try:
         return str((call("GET", f"/api/runs/{quote(run_id, safe='')}").get("run") or {}).get("status") or "")
-    except (Down, Failed):
+    except (Down, Broken):
         return ""
 
 
@@ -468,7 +580,7 @@ def kept(run_id: str, seen: int, read: Iterator[dict] | None) -> Iterator[dict]:
                 yield line
                 if line.get("event") == run_lines.END:
                     return
-        except Failed:
+        except Broken:
             whole = False
         lost = lost or time.monotonic()
         status = run_status(run_id)
@@ -480,7 +592,7 @@ def kept(run_id: str, seen: int, read: Iterator[dict] | None) -> Iterator[dict]:
         time.sleep(RETRY_SECONDS)
         try:
             read = events(run_id, seen, follow=True)
-        except (Down, Failed):
+        except (Down, Broken):
             read = None
 
 
@@ -489,17 +601,43 @@ def emit(line: dict) -> None:
 
 
 def failed(e: Failed) -> int:
-    emit({**e.answer, **({"code": e.code} if e.code and "code" not in e.answer else {})})
+    answer = e.answer
+    if e.code == 400 and reason(answer) == "client_too_old" and (needed := answer.get("required_version")):
+        answer = {**answer, "error": f"server requires Arete CLI version {needed}"}
+    emit({**answer, **({"code": e.code} if e.code and "code" not in answer else {})})
     return 1
+
+
+def reason(answer):
+    return answer.get("reason") or answer.get("code")
+
+
+def unknown_route(answer):
+    code = reason(answer)
+    return code == "unknown_route" or (code == "not_found" and answer.get("detail") == "No such route.")
+
+
+def field(answer, name, label=None):
+    try:
+        return answer[name]
+    except (KeyError, TypeError) as e:
+        raise Failed({"error": f"server answer is missing or has an invalid field {label or name}"}) from e
+
+
+def answer_error(e):
+    detail = e.args[0] if e.args else "unknown"
+    return failed(Failed({"error": f"server answer is missing or has an invalid field ({detail})"}))
 
 
 def steered(act: Callable[[], int]) -> int:
     try:
         return act()
     except Down as e:
-        emit({"error": str(e)})
+        emit(e.answer)
     except Failed as e:
         return failed(e)
+    except (KeyError, TypeError) as e:
+        return answer_error(e)
     except KeyboardInterrupt:
         return 130
     except BrokenPipeError:
@@ -540,7 +678,10 @@ def prompted(i: int, q: dict) -> dict:
 
 
 def answered_ask(run_id: str, ask_id: str, raw: str) -> dict:
-    open_asks = [a for a in call("GET", "/api/asks")["asks"]
+    asks = field(call("GET", "/api/asks"), "asks")
+    if not isinstance(asks, list):
+        raise Failed({"error": "server answer has an invalid field asks"})
+    open_asks = [a for a in asks
                  if a["run"] == run_id and (not ask_id or a["id"] == ask_id)]
     if not open_asks:
         raise Failed({"error": f"run {run_id} has no open ask"})

@@ -5,6 +5,7 @@ import os
 import sys
 
 from .. import config, paths
+from ..store import db as foundation
 
 
 def piped_events() -> list[dict]:
@@ -90,13 +91,13 @@ def cmd_triage(args) -> int:
     else:
         code = 0
     if args.ref:
-        shown = triage.ticket(args.ref)
+        shown = triage.ticket(args.ref, connect=foundation.reader)
         if shown is None:
             print(f"no triage row for {args.ref}; `arete triage` lists them", file=sys.stderr)
             return 1
         print(shown)
     else:
-        print(triage.board())
+        print(triage.board(connect=foundation.reader))
     return code
 
 

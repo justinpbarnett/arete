@@ -46,17 +46,13 @@ def cmd_document(args) -> int:
 
 
 def cmd_record(args) -> int:
-    from .. import record
+    from .. import client, record
 
     if args.run_id in ("pin", "unpin"):
         if not args.step:
             print("usage: arete record pin|unpin RUN_ID", file=sys.stderr)
             return 2
-        try:
-            (record.pin if args.run_id == "pin" else record.unpin)(args.step)
-        except LookupError as e:
-            print(e, file=sys.stderr)
-            return 1
+        client.call("POST", client.run_path(args.step, args.run_id, prefix="/api/v1"))
         print(f"pinned {args.step}: its record stays until `arete record unpin {args.step}`" if args.run_id == "pin"
               else f"unpinned {args.step}: its record ages out like any other")
         return 0

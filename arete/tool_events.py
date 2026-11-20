@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import re
+import socket
 import sys
 from datetime import UTC, datetime
 
-from . import paths
+from . import paths, refusals, util
+
+INGEST_MARK = "_arete_ingest"
+BATCH_BYTES = 65536
 
 BASH_CLASSES = [
     ("missing_tool", r"command not found"),
@@ -115,15 +120,92 @@ def main() -> int:
         payload = json.loads(raw) if raw.strip() else {}
         ev = build_event(payload)
         if ev:
-            paths.STATE_DIR.mkdir(parents=True, exist_ok=True)
-            with open(paths.EVENTS_FILE, "a") as f:
-                f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+            with util.lock("hook-events", wait=True):
+                append_events([ev])
     except Exception as e:
         with contextlib.suppress(OSError):
             paths.LOG_DIR.mkdir(parents=True, exist_ok=True)
             with open(paths.LOG_DIR / "hook-errors.log", "a") as f:
                 f.write(f"{datetime.now().isoformat()} {type(e).__name__}: {e}\n")
     return 0
+
+
+def append_events(events, durable=False):
+    with paths.EVENTS_FILE.open("a+b") as out:
+        out.seek(0, os.SEEK_END)
+        if out.tell():
+            out.seek(-1, os.SEEK_END)
+            if out.read(1) != b"\n":
+                out.write(b"\n")
+        for event in events:
+            out.write(json.dumps(event, ensure_ascii=False).encode() + b"\n")
+        if durable:
+            out.flush()
+            util.flush_fd(out.fileno())
+            util.flush_folder(paths.EVENTS_FILE.parent)
+
+
+def ingest(origin, offset, events):
+    if not re.fullmatch(r"[0-9a-f]{32}", origin) or offset < 0:
+        raise refusals.Invalid("Hook ingest needs a source identifier and a nonnegative offset")
+    tag = f"{origin}:{offset}:"
+    with util.lock("hook-events", wait=True):
+        seen = {item[INGEST_MARK] for path in event_files() for item in read_event_file(path, None, internal=True)
+                if isinstance(item.get(INGEST_MARK), str) and item[INGEST_MARK].startswith(tag)}
+        append_events([{**event, INGEST_MARK: f"{tag}{index}"} for index, event in enumerate(events)
+                       if f"{tag}{index}" not in seen], durable=True)
+    return len(events)
+
+
+def send_pending(url, send):
+    if not paths.EVENTS_FILE.exists() and not dated_events():
+        return
+    checkpoint = paths.STATE_DIR / ("hook-offsets-" + hashlib.sha256(url.encode()).hexdigest()[:32] + ".json")
+    with util.lock(checkpoint.stem, wait=True):
+        offsets = util.read_json(checkpoint, {})
+        sources = set()
+        for path in event_files():
+            try:
+                stream = path.open("rb")
+            except FileNotFoundError:
+                continue
+            with stream:
+                info = os.fstat(stream.fileno())
+                if not (first := stream.readline()).endswith(b"\n"):
+                    continue
+                machine = f"{socket.gethostname()}:{paths.STATE_DIR}:{info.st_dev}:{info.st_ino}:".encode()
+                origin = hashlib.sha256(machine + first).hexdigest()[:32]
+                sources.add(origin)
+                offset, pending = offsets.get(origin, (0, None))
+                stream.seek(offset)
+                end, events = read_batch(stream, pending)
+                if end == offset:
+                    continue
+                if events:
+                    offsets[origin] = (offset, end)
+                    util.write_json(checkpoint, offsets)
+                    send({"origin": origin, "offset": offset, "events": events}, f"hook:{origin}:{offset}")
+                offsets[origin] = (end, None)
+        util.write_json(checkpoint, {source: offsets[source] for source in sources if source in offsets})
+
+
+def read_batch(stream, pending):
+    offset = end = stream.tell()
+    events = []
+    while pending is None or end < pending:
+        raw = stream.readline()
+        if not raw.endswith(b"\n") or (end > offset and pending is None and stream.tell() - offset > BATCH_BYTES):
+            break
+        end = stream.tell()
+        try:
+            item = json.loads(raw)
+        except (ValueError, UnicodeError):
+            continue
+        if isinstance(item, dict) and INGEST_MARK not in item:
+            events.append(item)
+    if pending is not None and end != pending:
+        raise refusals.Invalid("The pending hook batch is no longer in the local event file")
+    return end, events
 
 
 def dated_events():
@@ -150,6 +232,11 @@ def event_stats():
 
 
 def rotate_events(keep_days: float) -> None:
+    with util.lock("hook-events", wait=True):
+        rotate_locked(keep_days)
+
+
+def rotate_locked(keep_days: float) -> None:
     try:
         with paths.EVENTS_FILE.open() as f:
             first = f.readline()
@@ -194,7 +281,7 @@ def read_events(since_hours: float | None = None, since_ts: float | None = None,
     return out
 
 
-def read_event_file(path, cutoff, until=None) -> list[dict]:
+def read_event_file(path, cutoff, until=None, *, internal=False) -> list[dict]:
     out = []
     with path.open() as f:
         for line in f:
@@ -211,5 +298,7 @@ def read_event_file(path, cutoff, until=None) -> list[dict]:
                     continue
                 if (cutoff is not None and t < cutoff) or (until is not None and t >= until):
                     continue
+            if not internal:
+                ev.pop(INGEST_MARK, None)
             out.append(ev)
     return out

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -250,7 +251,7 @@ class Check:
         problems = list(registry_problems(self.published))
         require(not problems, ", ".join(problems))
         for op in self.published["operations"]:
-            route = op["path"].replace("{id}", "route-check")
+            route = re.sub(r"\{\w+\}", "route-check", op["path"])
             headers, _ = self.request("PUT", route, status=405)
             require(op["method"] in headers.get("Allow", "").split(", "),
                     f"{op['name']} {route}: registered method missing from Allow")
@@ -307,7 +308,7 @@ class Check:
             self.request("GET", "/api/v1/meta", headers={"X-Arete-Client": f"{client}/{minimum}"})
         self.request("POST", "/api/v1/batch", {"requests": []}, headers={"X-Arete": ""}, status=403)
         for method, path, body, custom, code in (
-            ("GET", "/api/v1/no-such-operation", None, {}, "not_found"),
+            ("GET", "/api/v1/no-such-operation", None, {}, "unknown_route"),
             ("PUT", "/api/v1/meta", None, {}, "method_not_allowed"),
             ("GET", "/api/v1/meta", None, {"X-Arete-Client": "cli/0.9"}, "client_too_old"),
             ("POST", "/api/v1/batch", b'{"requests":[],"requests":[]}', {}, "invalid_json"),
@@ -391,7 +392,7 @@ class Check:
                 require(not response.read(1), f"{path} kept streaming after reset")
 
     def shapes(self):
-        from . import agent, contract, record, replay, triage
+        from . import agent, contract, dashboard, paths, record, replay, triage
         from .sighting import Sighting
         from .store import chats, incidents, insights, runs
         from .store import triage as triage_store
@@ -403,21 +404,37 @@ class Check:
         ticket = triage.Candidate("demo#7", "7", "Fixture ticket", "https://example.invalid/7", "old")
         triage_store.triage_put(triage.row(triage.GitHubSource("demo/repo", []), ticket, updated="old"))
         insights.research_set(ticket.ref, status="done", title="Fixture research")
+        stopped = record.start("loop", pid=0)
+        session = record.start("session")
+        paths.record_dir(session).mkdir(parents=True, exist_ok=True)
         identities = {"task": self.task, "run": self.run, "step": str(runs.steps(self.run)[0]["id"]),
                       "chat": str(chat), "incident": str(incident), "triage": ticket.ref, "research": ticket.ref,
                       "project": replay.SAMPLE_REPO, "line": replay.SAMPLE_REPO, "view": "live", "loop": "poll"}
         for op in self.published["operations"]:
             name, method, path = (op[key] for key in ("name", "method", "path"))
             values = op["example"]["input"].copy()
-            if "{id}" in path:
-                path = path.replace("{id}", quote(identities[name.partition(".")[0]], safe=""))
-                values.pop("id")
+            resource = name.partition(".")[0]
+            target = {**identities, "id": identities.get(resource, ""),
+                      "run": stopped if name == "run.stop" else session if contract.keyed_write(op) else self.run}
+            for field in re.findall(r"\{(\w+)\}", path):
+                path = path.replace("{" + field + "}", quote(target[field], safe=""))
+                values.pop(field)
             if "run" in values:
                 values["run"] = self.run
+            if name in ("task.update", "run.stop"):
+                row = self.read(f"/api/v1/{resource}s/{self.task if resource == 'task' else stopped}")[resource]
+                values["base_version"] = row["version"]
+            if name == "task.create":
+                values["repo"] = replay.SAMPLE_REPO
             if method == "GET":
                 data = self.read(path + ("?" + urlencode(values) if values else ""))
             else:
-                headers, raw = self.request(method, path, values)
+                key = {"Idempotency-Key": f"check-{name}"} if contract.keyed_write(op) else None
+                if name == "serve.install":
+                    with patch.object(dashboard, "install_serve", return_value={"restarting": True}):
+                        headers, raw = self.request(method, path, values, headers=key)
+                else:
+                    headers, raw = self.request(method, path, values, headers=key)
                 data = json.loads(raw)
                 if name == "batch.run":
                     require(data["seq"] == headers.get("Arete-Seq") and all(row["seq"] == data["seq"] for row in data["results"]),
@@ -444,11 +461,12 @@ class Check:
 
         for path in sorted(RESERVED_PATHS - {"/api/v1/events"}):
             self.read(path.replace("{id}", "me"))
+        before = self.read("/api/v1/tasks")["tasks"]
         fields = dict.fromkeys(RESERVED_FIELDS, "reserved")
         for path, body in (("/api/v1/usage", {**fields, "kind": "visit"}), ("/api/tasks", {**self.task_body, **fields})):
             _, raw = self.request("POST", path, body, status=422)
             require(sorted(json.loads(raw)["fields"]) == sorted(fields), f"{path} did not reject reserve fields")
-        require(len(self.read("/api/v1/tasks")["tasks"]) == 1, "reserved input created a task")
+        require(self.read("/api/v1/tasks")["tasks"] == before, "reserved input created a task")
 
 
 def worker(lifeline):

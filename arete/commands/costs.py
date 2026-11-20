@@ -124,7 +124,7 @@ def cmd_ab(args) -> int:
     from .. import control
 
     try:
-        report = control.ab_report(args.name or "", args.days)
+        report = control.ab_report(args.name or "", args.days, connect=foundation.reader)
     except (ValueError, TypeError) as e:
         print(e, file=sys.stderr)
         return 1

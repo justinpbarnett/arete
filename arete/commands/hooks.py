@@ -3,16 +3,18 @@ from __future__ import annotations
 import json
 import sys
 from collections import Counter
+from datetime import timedelta
+from urllib.parse import urlencode
 
-from .. import config, paths
+from .. import client, config, paths, util
+from ..store import db as foundation
 from ..store import incidents as incident_store
 from .common import when
 
 
 def cmd_events(args) -> int:
-    from .. import tool_events
-
-    evs = tool_events.read_events(args.hours)
+    query = urlencode({"since": util.iso(util.now() - timedelta(hours=args.hours))})
+    evs = client.field(client.call("GET", f"/api/v1/hook-events?{query}"), "events")
     if args.raw:
         for e in evs[max(len(evs) - args.limit, 0):]:
             print(json.dumps(e))
@@ -44,21 +46,17 @@ def oncall_scan(args, cfg) -> int:
 
 
 def oncall_toggle(args, cfg) -> int:
-    from .. import oncall
-
-    oncall.switch(args.action == "on")
+    client.call("POST", "/api/incidents/switch", {"on": args.action == "on"})
     print(f"on-call wakes and rechecks are {args.action}")
     return 0
 
 
 def oncall_incident_action(args, cfg) -> int:
-    from .. import oncall
-
     if not args.id.isdigit():
         print(f"no incident {args.id}" if args.id else f"{args.action} needs an incident number", file=sys.stderr)
         return 1
     number = int(args.id)
-    done = getattr(oncall, args.action)(number)
+    done = client.call("POST", f"/api/incidents/{number}/{args.action}")
     if args.action == "cancel":
         stopped = f"stopped run {done['stopped']}" if done["stopped"] else "no run was live"
         print(f"cancelled incident {number}: {stopped}; cooling down until {done['cooldown_until'] or '-'}")
@@ -72,7 +70,8 @@ def oncall_incident_action(args, cfg) -> int:
 def oncall_show(args, cfg) -> int:
     from .. import oncall
 
-    found = incident_store.incident(int(args.id)) if args.id.isdigit() else None
+    found = (incident_store.incident(int(args.id), connect=foundation.reader)
+             if args.id.isdigit() and paths.DB_FILE.exists() else None)
     if not found:
         print(f"no incident {args.id}", file=sys.stderr)
         return 1
@@ -98,7 +97,7 @@ def oncall_show(args, cfg) -> int:
 def oncall_list(args, cfg) -> int:
     from .. import oncall
 
-    rows = incident_store.incidents()
+    rows = incident_store.incidents(connect=foundation.reader) if paths.DB_FILE.exists() else []
     if args.json:
         for row in rows:
             print(json.dumps(row))
@@ -109,7 +108,8 @@ def oncall_list(args, cfg) -> int:
         print(f"      {oncall.decision_line(r)}")
         if line := oncall.repair_line(r):
             print(f"      repair: {line}")
-    now = oncall.status(cfg)
+    now = (oncall.status(cfg, connect=foundation.reader) if paths.DB_FILE.exists()
+           else {"enabled": cfg.oncall.enabled, "last_scan": "", "expected": 0, "wakes": "on"})
     if not now["enabled"]:
         print(f"on-call is off; `[oncall] enabled = true` in {paths.CONFIG_FILE} turns it on")
     else:

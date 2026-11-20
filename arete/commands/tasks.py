@@ -2,124 +2,95 @@ from __future__ import annotations
 
 import json
 import shutil
-import signal
 import sys
 import textwrap
-from typing import NoReturn
+from urllib.parse import quote
 
-from .. import config, principals
+from .. import client, config
+from ..store import db as foundation
 from .common import Parser, print_lines, steering, when
 
 
-def task_shown(task_id: str, repo: str, one_line: bool) -> int:
-    from urllib.parse import quote
-
-    from .. import client
-
+def task_shown(task_id: str, repo: str, one_line: bool, offline=False) -> int:
     def show(found: dict) -> None:
         if one_line:
             client.emit(found)
         else:
             print(json.dumps(found, ensure_ascii=False, default=str, indent=2), flush=True)
 
-    try:
-        show(client.call("GET", f"/api/tasks/{quote(task_id, safe='')}"
-                         + (f"?repo={quote(repo, safe='')}" if repo else "")))
-        return 0
-    except client.Down:
-        from .. import control, gh, jira, tasks
+    if offline:
+        from .. import control, paths, tasks, tracker
 
         try:
-            show(tasks.view(task_id, repo))
-        except (control.NotFound, control.Refused, gh.GhError, jira.JiraError) as e:
-            client.emit({"error": str(e)})
+            if not tracker.is_task_id(task_id.strip()) or not paths.DB_FILE.exists():
+                raise control.NotFound(f"no local task {task_id}")
+            show({**tasks.view(task_id, repo), "source": "local"})
+        except (control.NotFound, foundation.NoDatabase) as e:
+            client.emit({"error": str(e), "source": "local"})
             return 1
+    else:
+        show(client.call("GET", f"/api/tasks/{quote(task_id, safe='')}"
+                         + (f"?repo={quote(repo, safe='')}" if repo else "")))
     return 0
 
 
 def task_add(args) -> int:
-    from .. import chat
-    from ..store import tasks as tasks_store
-
     body = " ".join(args.body).strip()
     if not body:
         print('arete task add --repo NAME "what to do"', file=sys.stderr)
         return 2
-    config.load().repo(args.repo)
-    print(tasks_store.task_add(args.repo, body, title=args.title.strip() or chat.title_of(body), kind=args.kind))
+    answer = client.call("POST", "/api/v1/tasks", {"repo": args.repo, "body": body, "title": args.title,
+                                                   "kind": args.kind})
+    print(client.field(client.field(answer, "task"), "id", "task.id"))
     return 0
 
 
 def task_list(args) -> int:
-    from ..store import tasks as tasks_store
-
-    print_lines(json.dumps(row, ensure_ascii=False) for row in tasks_store.tasks(args.repo, args.state))
+    rows = client.field(client.call("GET", "/api/v1/tasks", legacy="/api/tasks"), "tasks")
+    print_lines(json.dumps(row, ensure_ascii=False) for row in rows
+                if (not args.repo or row["repo"] == args.repo) and (not args.state or row["state"] == args.state))
     return 0
 
 
 def task_show(args) -> int:
-    from .. import client
-
-    return client.steered(lambda: task_shown(args.id, args.repo, args.json))
-
-
-def existing_task(args) -> str | None:
-    from ..store import tasks as tasks_store
-
-    tid = args.id.strip().lower()
-    if tasks_store.task_get(tid) is None:
-        print(f"no task {tid}", file=sys.stderr)
-        return None
-    return tid
+    return client.steered(lambda: task_shown(args.id, args.repo, args.json, args.offline))
 
 
 def task_reply(args) -> int:
-    from ..store import tasks as tasks_store
-
-    if (tid := existing_task(args)) is None:
-        return 1
+    tid = args.id.strip().lower()
     text = " ".join(args.text).strip()
     if not text:
         print('arete task reply ID "your reply"', file=sys.stderr)
         return 2
-    tasks_store.task_comment(tid, principals.current(), text)
+    client.call("POST", f"/api/v1/tasks/{quote(tid, safe='')}/comments", {"body": text})
     print(f"{tid}: reply saved")
     return 0
 
 
 def task_close(args) -> int:
-    from ..store import tasks as tasks_store
-
-    if (tid := existing_task(args)) is None:
-        return 1
-    tasks_store.task_set_state(tid, "closed")
+    tid = args.id.strip().lower()
+    client.call("POST", f"/api/v1/tasks/{quote(tid, safe='')}/close")
     print(f"{tid}: closed")
     return 0
 
 
 def task_start(args) -> int:
-    from .. import client
-
     return client.steered(lambda: client.emit(client.start_task(
         {"repo": args.repo, "prompt": " ".join(args.prompt), "title": args.title, "kind": args.kind}, args.key)) or 0)
 
 
 def task_run(args) -> int:
-    from .. import client
-
     return client.steered(lambda: client.emit(client.start_task({"repo": args.repo, "ticket": args.ticket}, args.key)) or 0)
 
 
 def cmd_forget(args) -> int:
-    from ..store import approvals as approvals_store
-
-    if not approvals_store.forget_proposal(args.id):
-        print(f"no open proposal #{args.id}")
-        return 1
+    client.call("POST", f"/api/proposals/{args.id}/done")
     return 0
 
 
 def cmd_file_rule(args) -> int:
+    if not args.local:
+        return client.say("POST", f"/api/proposals/{args.id}/approve")
     from .. import miner
 
     try:
@@ -131,11 +102,7 @@ def cmd_file_rule(args) -> int:
 
 
 def cmd_reject_rule(args) -> int:
-    from ..store import approvals as approvals_store
-
-    if not approvals_store.move_proposal(args.id, ("approve",), "rejected"):
-        print(f"#{args.id} is not a rule waiting for approval")
-        return 1
+    client.call("POST", f"/api/proposals/{args.id}/reject")
     return 0
 
 
@@ -147,15 +114,11 @@ def approval_notes(a: dict) -> list[str]:
                                 f"review by {review['by']}: {review['said']}" if review else "") if note)]
 
 
-def stop_on_sigterm(signum, frame) -> NoReturn:
-    raise SystemExit(128 + signal.SIGTERM)
-
-
 def cmd_approve(args) -> int:
-    from .. import control, delivery
+    from .. import delivery, paths
 
     if args.id is None:
-        pending = delivery.waiting()
+        pending = delivery.waiting(connect=foundation.reader) if paths.DB_FILE.exists() else []
         for a in pending:
             print(textwrap.fill(f"#{a['id']:<4} {a['loop']:<20} {a['repo'] or 'none':<12} {when(a['created'])}  "
                                 f"{a['plain_summary'] or a['what']}", shutil.get_terminal_size().columns,
@@ -166,12 +129,7 @@ def cmd_approve(args) -> int:
         if not pending:
             print("nothing waiting for approval")
         return 0
-    before = signal.signal(signal.SIGTERM, stop_on_sigterm)
-    try:
-        print(json.dumps(control.decide(args.id, not args.reject)))
-    finally:
-        signal.signal(signal.SIGTERM, before)
-    return 0
+    return client.say("POST", f"/api/approvals/{args.id}", {"approve": not args.reject})
 
 
 def register(sub) -> None:
@@ -198,6 +156,7 @@ def register(sub) -> None:
     t.add_argument("id")
     t.add_argument("--repo", default="", help="the repo of a tracker item no run names yet")
     t.add_argument("--json", action="store_true", help="print it as one JSON line")
+    t.add_argument("--offline", action="store_true", help="read a task from the local store")
     t.set_defaults(fn=task_show)
     t = tsub.add_parser("reply", help="answer a task's question as its owner")
     t.add_argument("id")
@@ -227,6 +186,7 @@ def register(sub) -> None:
 
     p = sub.add_parser("file-rule", help="write an approved global rule from the miner into the global CLAUDE.md and push it")
     p.add_argument("id", type=int)
+    p.add_argument("--local", action="store_true", help="carry out the server's detached rule filing")
     p.set_defaults(fn=cmd_file_rule)
 
     p = sub.add_parser("reject-rule", help="drop a global rule from the miner, so it is not proposed again")

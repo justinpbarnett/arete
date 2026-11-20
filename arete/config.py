@@ -288,6 +288,7 @@ class Config:
     max_parallel_per_repo: int = 1
     max_parallel_checks: int = 2
     dashboard_port: int = paths.DASHBOARD_PORT
+    server_url: str = ""
     dashboard_owner: str = ""
     dashboard_https: bool = False
     loop_dirs: list[Path] = field(default_factory=lambda: [paths.CONFIG_DIR / "loops"])
@@ -898,7 +899,8 @@ def load_or_problem(path: Path | None = None) -> tuple[Config, str]:
         problem = f"{type(e).__name__}: {e}"
     fallback = Config()
     try:
-        dashboard = tomllib.loads(paths.read_confined(path or paths.CONFIG_FILE).decode()).get("dashboard", {})
+        data = tomllib.loads(paths.read_confined(path or paths.CONFIG_FILE).decode())
+        dashboard = data.get("dashboard", {})
         dashboard = dashboard if isinstance(dashboard, dict) else {}
     except Exception:
         return fallback, problem
@@ -908,7 +910,16 @@ def load_or_problem(path: Path | None = None) -> tuple[Config, str]:
         fallback.dashboard_https = dashboard_https(dashboard.get("https", False))
     if isinstance(dashboard.get("owner", ""), str):
         fallback.dashboard_owner = dashboard.get("owner", "")
+    with contextlib.suppress(TypeError):
+        fallback.server_url = server_url(data)
     return fallback, problem
+
+
+def server_url(data: dict) -> str:
+    server = data.get("server", {})
+    if not isinstance(server, dict) or not isinstance(server.get("url", ""), str):
+        raise TypeError("[server] url must be a URL string")
+    return server.get("url", "").strip()
 
 
 def load(path: Path | None = None, strict: bool = False) -> Config:
@@ -929,6 +940,7 @@ def load(path: Path | None = None, strict: bool = False) -> Config:
         max_parallel_per_repo=max(1, int(data.get("max_parallel_per_repo", 1))),
         max_parallel_checks=max(1, int(data.get("max_parallel_checks", 2))),
         dashboard_port=int(data.get("dashboard", {}).get("port", paths.DASHBOARD_PORT)),
+        server_url=server_url(data),
         dashboard_owner=data.get("dashboard", {}).get("owner", ""),
         dashboard_https=dashboard_https(data.get("dashboard", {}).get("https", False)),
     )

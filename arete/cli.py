@@ -3,11 +3,11 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import __version__, codebase, paths, pilot, principals, zte
+from . import __version__, client, codebase, config, paths, pilot, principals, zte
 from .commands import api, costs, hooks, lab, loops, records, research, runs, sessions, setup, tasks
 from .commands.common import Parser, serve_line
 
-__all__ = ["main", "serve_line"]
+__all__ = ["main", "parser", "serve_line"]
 
 REGISTRATIONS = (api.register, runs.register, tasks.register, loops.register, sessions.register, hooks.register, costs.register,
                  records.register, research.register, lab.register, setup.register, pilot.register, zte.register)
@@ -24,26 +24,37 @@ class ShowVersion(argparse.Action):
         parser.exit()
 
 
-def main(argv: list[str] | None = None) -> int:
-    from . import refusals
-
+def parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="arete", description="arete: agents that keep running and keep getting better", formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--version", action=ShowVersion)
     sub = ap.add_subparsers(dest="cmd", required=True, parser_class=Parser)
     for register in REGISTRATIONS:
         register(sub)
-    args = ap.parse_args(argv)
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    from . import refusals
+
+    args = parser().parse_args(argv)
     if args.cmd == "api":
         return args.fn(args) or 0
     if args.cmd not in PER_CALL_HOOKS:
         codebase.load()
     try:
         recovery = args.cmd in ("init", "migrate") or (args.cmd == "backup" and args.restore)
-        with principals.acting("hand" if recovery else principals.cli_actor()):
+        with client.invocation(), principals.acting("hand" if recovery else principals.cli_actor()):
             return args.fn(args) or 0
-    except refusals.Refusal as e:
+    except client.Down as e:
+        client.emit(e.answer)
+        return 1
+    except client.Failed as e:
+        return client.failed(e)
+    except (config.UnknownRepo, refusals.Refusal) as e:
         print(e, file=sys.stderr)
         return 1
+    except (KeyError, TypeError) as e:
+        return client.answer_error(e)
 
 
 if __name__ == "__main__":

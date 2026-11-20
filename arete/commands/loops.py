@@ -4,8 +4,10 @@ import argparse
 import functools
 import json
 import sys
+from urllib.parse import quote
 
-from .. import config, paths
+from .. import client, config, paths
+from ..store import db as foundation
 from ..store import loops as loop_store
 from ..store import runs as run_store
 from .common import Parser, follow, loop_line, print_feed_line, print_table, serve_line, when
@@ -38,10 +40,10 @@ def events_from_file(file: str) -> list[dict] | None:
 def latest_run(name_or_run: str) -> str:
     from .. import control
 
-    if run_store.run_get(name_or_run):
+    if run_store.run_get(name_or_run, connect=foundation.reader):
         return name_or_run
     loop = control.find_loop(name_or_run)
-    last = next(iter(run_store.runs(kind="loop", loop=loop.name, limit=1, firings=True)), None)
+    last = next(iter(run_store.runs(kind="loop", loop=loop.name, limit=1, firings=True, connect=foundation.reader)), None)
     if not last:
         raise control.NotFound(f"{loop.name} has not run yet")
     return last["id"]
@@ -108,9 +110,7 @@ def loop_try(args) -> int:
 
 
 def loop_switched(args, enabled: bool) -> int:
-    from .. import control
-
-    done = control.switch(args.name, enabled)
+    done = client.call("POST", f"/api/loops/{quote(args.name, safe='')}/{'enable' if enabled else 'disable'}")
     print(f"{done['name']}: {'on' if done['enabled'] else 'off'}"
           + ("; serve is down, so it fires once serve runs again" if done["enabled"] and not done["serve_up"] else ""))
     return 0
@@ -130,26 +130,26 @@ def loop_disable(args) -> int:
 def loop_start(args) -> int:
     from .. import loop_run
 
-    r = loop_run.launch(args.name, events=events_from_file(args.events))
+    r = (loop_run.launch(args.name, events=events_from_file(args.events)) if args.events
+         else client.call("POST", f"/api/loops/{quote(args.name, safe='')}/start"))
     print(f"started {r['id']}")
     if args.follow:
-        follow(r["id"])
+        follow(r["id"], remote=not args.events)
     return 0
 
 
 @loop_errors
 def loop_stop(args) -> int:
-    from .. import control
-
     target = args.name
-    if not run_store.run_get(target):
-        loop = control.find_loop(target)
-        running = [r for r in run_store.runs_marked_running() if r["kind"] == "loop" and r["loop"] == loop.name]
-        if not running:
-            raise control.Refused(f"{target} has no run going")
-        target = running[0]["id"]
-    print(json.dumps(control.stop_run(target)))
-    return 0
+    try:
+        loop = client.call("GET", f"/api/loops/{quote(target, safe='')}")
+    except client.Failed as e:
+        if e.code != 404:
+            raise
+    else:
+        if not (target := client.field(loop, "running")):
+            raise client.Failed({"error": f"{args.name} has no run going"})
+    return client.run_command(target, "stop")
 
 
 @loop_errors
@@ -190,12 +190,12 @@ def loop_status(args) -> int:
 @loop_errors
 def loop_feed(args) -> int:
     run_id = latest_run(args.name)
-    r = run_store.run_get(run_id)
+    r = run_store.run_get(run_id, connect=foundation.reader)
     print(f"{run_id} {r['status']} {r.get('loop') or r['kind']}")
     if args.follow:
         follow(run_id)
     else:
-        for line in run_store.feed(run_id):
+        for line in run_store.feed(run_id, connect=foundation.reader):
             print_feed_line(line)
     return 0
 

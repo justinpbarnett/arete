@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from urllib.parse import unquote
 
-from . import board, codebase, config, contract, control, events, record, refusals, settings, tasks, triage
+from . import board, codebase, config, contract, control, events, record, refusals, settings, tasks, tool_events, triage, util
 from .store import chats, insights, runs
 from .store import db as foundation
 from .store import tasks as task_store
+from .store import writes
 
 VIEWS = {"live": "Live", "runs": "Runs", "sessions": "Sessions", "loops": "Loops", "triage": "Triage",
          "outcomes": "Outcomes", "health": "Health", "incidents": "Incidents", "settings": "Settings", "usage": "Usage"}
@@ -132,6 +133,18 @@ def read(name, values, handler):
         return {"settings": settings.current()}
     if name == "health.get":
         return {"health": board.health_board()}
+    if name == "status.get":
+        limit = values.get("limit", str(board.RECENT_RUNS))
+        if not limit.isascii() or not limit.isdecimal() or len(limit) > 6:
+            raise contract.Problem("invalid_input", "limit must be a nonnegative integer")
+        return {"snapshot": board.snapshot(int(limit)), "loops": control.loop_views(), "records": board.panel(record.store)}
+    if name == "hook_event.list":
+        since = values.get("since")
+        try:
+            cutoff = None if since is None else util.parse_iso(since).timestamp()
+        except (ValueError, OverflowError):
+            raise contract.Problem("invalid_input", "since must be a timestamp") from None
+        return {"events": tool_events.read_events(since_ts=cutoff)}
     if name == "line_stream.read":
         after = values.get("after", "0")
         if not after.isdecimal():
@@ -169,12 +182,83 @@ def read(name, values, handler):
 
 
 def dispatch(handler, op, path_values, query):
-    values = {**query, **{k: unquote(v) for k, v in path_values.items()}}
-    if op["method"] == "POST":
-        values = handler.body()
+    name, method = op["name"], op["method"]
+    identity = {k: unquote(v) for k, v in path_values.items()}
+    values = {**query, **identity}
+    write = contract.keyed_write(op)
+    if method != "GET":
+        body = handler.body()
+        if write and (query or identity.keys() & body.keys()):
+            raise contract.Problem("invalid_input", "Send writable fields in the JSON body and the target in the URL")
+        values = {**body, **identity}
     try:
-        return execute(op["name"], values, handler)
+        if write:
+            prepare(name, values)
+            return handler.keyed_action(method, op["path"], path_values, lambda: mutation(name, values, handler),
+                                        atomic=name not in ("run.stop", "serve.install", "hook.ingest"))
+        return execute(name, values, handler)
     except refusals.Refusal as error:
         if not getattr(error, "code", None) and error.status in (400, 404):
             raise contract.Problem("not_found" if error.status == 404 else "invalid_input", str(error)) from error
         raise
+
+
+def mutation(name, values, handler):
+    from . import dashboard
+
+    if name.startswith("task.") or name == "comment.create":
+        result = {"task": change_task(name, values)}
+    elif name == "run.stop":
+        result = dashboard.stop_run(handler, values["run"], values["base_version"], public=True)
+    elif name == "run.steer":
+        result = dashboard.steer_run(values["run"], values["text"])
+    elif name in ("run.pin", "run.unpin"):
+        identity = values["run"]
+        try:
+            (record.pin if name == "run.pin" else record.unpin)(identity)
+        except LookupError as error:
+            raise control.NotFound(str(error)) from error
+        result = {"id": identity}
+    elif name == "chat.drop":
+        result = {"chat": dashboard.drop_chat(values["chat"])}
+    elif name == "serve.install":
+        result = dashboard.install_serve(handler.server.inside_serve)
+    elif name == "hook.ingest":
+        result = {"received": tool_events.ingest(values["origin"], values["offset"], values["events"])}
+    else:
+        raise contract.Problem("unknown_route", f"Unknown operation {name}")
+    with foundation.reader() as conn:
+        return {"seq": events.metadata(conn)["head"], **result}
+
+
+def change_task(name, values):
+    from . import chat
+
+    body = values.get("body", "").strip()
+    kind = values.get("kind", "feat")
+    if ("kind" in values and kind not in config.KINDS) or ("body" in values and not body):
+        raise contract.Problem("invalid_input", "A task needs a body and a supported kind")
+    if name == "task.create":
+        repo = tasks.repo_named(config.load(), values["repo"])
+        identity = task_store.task_add(repo.name, body, title=values.get("title", "").strip() or chat.title_of(body),
+                                       kind=kind)
+    else:
+        identity = values.get("task", values.get("id", "")).strip().lower()
+        if name == "task.close":
+            open_states = tuple(state for state in config.TASK_STATES if state not in config.TASK_FINISHED)
+            if not task_store.task_set_state(identity, "closed", from_states=open_states):
+                raise contract.Problem("invalid_state", f"Task {identity} cannot be closed")
+        elif name == "comment.create":
+            if not task_store.task_comment(identity, "owner", body):
+                raise control.NotFound(f"no task {identity}")
+        else:
+            fields = {key: value for key, value in values.items() if key not in ("id", "base_version")}
+            if not fields or ("state" in fields and fields["state"] not in config.TASK_STATES):
+                raise contract.Problem("invalid_input", "Send at least one editable field and a supported state")
+            try:
+                changed = task_store.task_update(identity, values["base_version"], fields)
+            except writes.VersionConflict as error:
+                raise contract.Problem("task_version_conflict", str(error),
+                                       current=serialize(error.current, contract.TASK)) from error
+            return serialize(needed(changed, identity), contract.TASK)
+    return serialize(task_store.task_get(identity), contract.TASK)

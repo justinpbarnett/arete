@@ -185,17 +185,19 @@ def print_feed_line(line: dict) -> None:
     print(f"{when(line['ts'])[6:]} [{line['kind']}] {text}", flush=True)
 
 
-def follow(run_id: str, alive=None, after: int = 0, send=None) -> int:
+def follow(run_id: str, alive=None, after: int = 0, send=None, *, remote=False) -> int:
     import time
+    from urllib.parse import quote
 
-    from .. import control
+    from .. import client, control
 
     epoch = None
 
     def drain():
         nonlocal after, epoch
         while True:
-            found = control.feed(run_id, after)
+            found = (client.call("GET", f"/api/feed/{quote(run_id, safe='')}?after={after}") if remote
+                     else control.feed(run_id, after))
             current = found["restore_epoch"]
             if epoch != current:
                 changed = epoch is not None
@@ -206,7 +208,7 @@ def follow(run_id: str, alive=None, after: int = 0, send=None) -> int:
             for line in found["lines"]:
                 print_feed_line(line)
                 after = line["id"]
-            return found["run"]
+            return client.run_info(run_id) if remote else found["run"]
 
     while True:
         r = drain()

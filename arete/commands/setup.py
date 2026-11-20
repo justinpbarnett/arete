@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sys
 
-from .. import __version__, config, paths, routing, steps
+from .. import __version__, client, config, paths, routing, steps
 from ..store import db as foundation
 from ..store import runs as run_store
 from .common import (
@@ -89,18 +89,24 @@ def cmd_status(args) -> int:
     from .. import board, control, record
 
     if args.json:
-        return status_lines(args.run_id)
+        return status_lines(args.run_id, args.offline)
     if args.run_id:
         print("arete status --json RUN_ID prints one run's steps", file=sys.stderr)
         return 2
     cfg, problem = config.load_or_problem()
-    try:
-        views = control.loop_views(cfg)
-        snap = board.snapshot(recent_runs=args.limit)
-    except foundation.NoDatabase as e:
-        print(e, file=sys.stderr)
-        return 1
-    print(f"arete {__version__}  config {paths.CONFIG_FILE}")
+    if args.offline:
+        try:
+            with foundation.one_read():
+                views = control.loop_views(cfg, connect=foundation.reader)
+                snap = board.snapshot(recent_runs=args.limit)
+                records = board.panel(record.store)
+        except foundation.NoDatabase as e:
+            client.emit({"error": str(e), "source": "local"})
+            return 1
+    else:
+        answer = client.call("GET", f"/api/v1/status?limit={args.limit}")
+        views, snap, records = (client.field(answer, key) for key in ("loops", "snapshot", "records"))
+    print(f"arete {__version__}  config {paths.CONFIG_FILE}" + ("  source: local" if args.offline else ""))
     if problem:
         print(f"config does not load: {problem}")
     if cfg.ignored:
@@ -118,7 +124,7 @@ def cmd_status(args) -> int:
     show(snap["alerts"], "the alerts", print_alerts)
     show(snap["recent"], "the recent runs", print_recent)
     show(snap["proposals"], "the miner proposals", print_proposals)
-    show(board.panel(record.store), "the record store", lambda s: print_records(s, cfg.retention))
+    show(records, "the record store", lambda s: print_records(s, cfg.retention))
     show(snap["skipped"], "the skipped tickets", print_skipped)
     show(snap["waiting"], "the review feedback", print_waiting)
     show(snap["triage"], "triage", print_triage)
@@ -152,34 +158,37 @@ def print_delivery(cfg: config.Config) -> None:
         print(f"  {repo.name}: {detail}")
 
 
-def status_lines(run_id: str) -> int:
-    from .. import client
+def status_lines(run_id: str, offline: bool) -> int:
     from .runs import local_lines
 
+    def emit(row):
+        client.emit({**row, "source": "local"} if offline else row)
+
     def live() -> int:
-        try:
-            panel = client.call("GET", "/api/live")["live"]
-        except client.Down:
+        if offline:
             from .. import board
 
-            panel = board.panel(lambda: board.live(run_store.runs_marked_running(connect=foundation.reader)))
+            panel = (board.panel(lambda: board.live(run_store.runs_marked_running(connect=foundation.reader)))
+                     if paths.DB_FILE.exists() else {"rows": {"runs": []}})
+        else:
+            panel = client.field(client.call("GET", "/api/live"), "live")
         if "error" in panel:
-            client.emit({"error": panel["error"]})
+            emit({"error": panel["error"]})
             return 1
-        for row in panel["rows"]["runs"]:
-            client.emit(row)
+        for row in client.field(client.field(panel, "rows"), "runs", "live.rows.runs"):
+            emit(row)
         return 0
 
     def steps() -> int:
-        try:
-            read = list(client.events(run_id))
-        except client.Down:
+        if offline:
             if (found := local_lines(run_id, 0, False)) is None:
-                client.emit({"error": f"no run {run_id}"})
+                emit({"error": f"no run {run_id}"})
                 return 1
             read = list(found)
+        else:
+            read = list(client.events(run_id))
         for line in client.steps_of(run_id, read):
-            client.emit(line)
+            emit(line)
         return 0
 
     return client.steered(steps if run_id else live)
@@ -254,6 +263,7 @@ def register(sub) -> None:
     p.add_argument("run_id", nargs="?", default="", help="with --json: this run's steps, then its report")
     p.add_argument("--limit", type=int, default=10)
     p.add_argument("--json", action="store_true", help="one JSON line per live run, or per step of RUN_ID")
+    p.add_argument("--offline", action="store_true", help="read local status and run lines")
     p.set_defaults(fn=cmd_status)
 
     p = sub.add_parser("install", help="run arete serve at login: one launchd agent on a Mac, one systemd user unit on "

@@ -3,11 +3,11 @@ from __future__ import annotations
 import argparse
 import functools
 import json
-import os
 import sys
+from urllib.parse import quote
 
-from .. import paths
-from ..store import runs as run_store
+from .. import client, paths
+from ..store import db as foundation
 from .common import Parser, follow
 
 CHAT_SESSION_ACTIONS = ("start", "list", "report", "stop")
@@ -65,11 +65,9 @@ def attached(session_id: str) -> int:
     import select
     import threading
 
-    from .. import control, sessions
-
-    r = run_store.run_get(session_id)
-    if not r or r["kind"] != "session":
-        raise control.NotFound(f"no session {session_id}")
+    r = client.run_info(session_id)
+    if client.field(r, "kind", "run.kind") != "session":
+        raise client.Failed({"error": f"no session {session_id}"})
     stop = threading.Event()
     print("following; type a line and press enter to send it, ctrl-c to detach", flush=True)
 
@@ -82,9 +80,9 @@ def attached(session_id: str) -> int:
             if not line:
                 stop.set()
             elif line.strip():
-                sessions.send(session_id, line)
+                client.steer(session_id, line)
     try:
-        follow(session_id, send=send_typed)
+        follow(session_id, send=send_typed, remote=True)
     except KeyboardInterrupt:
         print(f"\ndetached; the session keeps running. `arete session stop {session_id}` ends it")
     return 0
@@ -95,9 +93,15 @@ def session_start(args) -> int:
     from .. import sessions
 
     tools = [t.strip() for t in args.tools.split(",") if t.strip()] if args.tools is not None else None
-    s = sessions.launch(" ".join(args.prompt), device=args.device, model=args.model, run_with=args.runner,
-                        tools=tools, repo=args.repo or "", budget_usd=args.budget, task=args.task,
-                        draft_pr=args.draft_pr)
+    prompt = " ".join(args.prompt)
+    if args.task or args.draft_pr:
+        s = sessions.launch(prompt, device=args.device, model=args.model, run_with=args.runner,
+                            tools=tools, repo=args.repo or "", budget_usd=args.budget, task=args.task,
+                            draft_pr=args.draft_pr)
+    else:
+        s = client.call("POST", "/api/sessions", {"prompt": prompt, "device": args.device, "model": args.model,
+                                                "runner": args.runner, "tools": tools, "repo": args.repo or "",
+                                                "budget_usd": args.budget})
     print(f"session {s['id']}: {s['runner']} {s['model']} on {s['device']} in {paths.short_path(s['cwd'])}"
           + (f" on {s['branch']}" if s["branch"] else "") + f"; tools {', '.join(s['tools']) or 'none'}")
     if s["task"] and not args.attach:
@@ -106,7 +110,7 @@ def session_start(args) -> int:
     if not args.attach:
         print(f"`arete session attach {s['id']}` follows it and sends what you type")
         return 0
-    return attached(s["id"])
+    return attached(s["id"]) if not (args.task or args.draft_pr) else follow(s["id"])
 
 
 @local_only
@@ -118,24 +122,19 @@ def session_attach(args) -> int:
 def session_report(args) -> int:
     from .. import control
 
-    print(json.dumps(control.session_report(args.id)))
+    print(json.dumps(control.session_report(args.id, connect=foundation.reader)))
     return 0
 
 
 @local_only
 def session_send(args) -> int:
-    from .. import sessions
-
-    print(json.dumps(sessions.send(args.id, " ".join(args.text))))
+    print(json.dumps(client.steer(args.id, " ".join(args.text))))
     return 0
 
 
 @chat_routed
 def session_stop(args) -> int:
-    from .. import control
-
-    print(json.dumps(control.stop_run(args.id)))
-    return 0
+    return client.run_command(args.id, "stop", legacy=f"/api/sessions/{quote(args.id, safe='')}/stop")
 
 
 @local_only
@@ -149,20 +148,16 @@ def session_exec(args) -> int:
 def session_list(args) -> int:
     from .. import sessions, util
 
-    for s in sessions.views():
+    rows = sessions.views(connect=foundation.reader) if paths.DB_FILE.exists() else []
+    for s in rows:
         print(f"{s['id']:<28} {s['status']:<11} {s['runner'] or '':<6} {s['model'] or '':<24} "
               f"{s['device'] or '':<10} {util.paid_note(s['paid']):<12}  {s['prompt'][:70]}")
-    if not run_store.runs(kind="session", limit=1):
+    if not rows:
         print("no sessions yet; `arete session start \"what to do\"`")
     return 0
 
 
 def chat_session(args, chat: int) -> int:
-    from urllib.parse import quote
-
-    from .. import chat as chats
-    from .. import client
-
     base = f"/api/chats/{chat}/sessions"
     if args.action == "start":
         if args.tools is not None or args.draft_pr or args.attach:
@@ -177,23 +172,7 @@ def chat_session(args, chat: int) -> int:
         request = ("GET", f"{base}/{quote(args.id, safe='')}/report", None)
     else:
         request = ("POST", f"{base}/{quote(args.id, safe='')}/stop", None)
-    try:
-        try:
-            answer = client.call(*request)
-        except client.Down as e:
-            if args.action in ("start", "stop") and os.environ.get("ARETE_AGENT") == "1":
-                print(f"{e}; an agent starts and stops sessions only through the server", file=sys.stderr)
-                return 1
-            answer = {"start": lambda: chats.start_session(
-                          chat, " ".join(args.prompt), repo=args.repo, device=args.device, model=args.model,
-                          runner=args.runner, budget_usd=args.budget),
-                      "list": lambda: chats.sessions_of(chat),
-                      "report": lambda: chats.session_report(chat, args.id),
-                      "stop": lambda: chats.stop_session(chat, args.id)}[args.action]()
-    except client.Failed as e:
-        print(e, file=sys.stderr)
-        return 1
-    print(json.dumps(answer))
+    print(json.dumps(client.call(*request)))
     return 0
 
 
