@@ -719,6 +719,12 @@ A run's records go into the prompt as quoted data, one prefixed line each, to a 
 Evidence cites `run <id> <record>:<lines>`, the raw line numbers `arete record RUN STEP --raw` prints.
 A proposal for arete or a public repo that names another repository, ticket, run, host or the login name is skipped.
 
+When two owner review comments in the same repository point to a deterministic correction, the miner can save a proposal in `check-proposals/` under that repository's configured layer. At least one comment must be in the current mining window. The preceding 30 days of comments can corroborate it. The proposal recommends an API or architecture change when it can remove the invalid choice, or an executable check that Arete verifies in isolation. It lists existing examples to clean up when found.
+
+Executable proposals include the observed rejection, corrective diagnostic, and acceptance. The supported evaluator compiles Python examples with syntax warnings treated as errors and verifies literal identity diagnostics. Unsupported or inconclusive checks are skipped.
+
+Review proposals under **Needs you → By hand** or in `arete status`. Bring any approved change through the repository's usual review process and run its existing checks. Mark done clears the inbox item and leaves the proposal file for reference. A materially revised proposal can return for review.
+
 ### Retention
 
 The hourly prune in `arete serve` removes zero-cost command-loop firing rows, feed entries and run folders after 14 days. Folder deletions are queued in the database and retried after a filesystem failure. Old rowless folders are removed only when their contents match the legacy firing shape: `run.log`, optionally `events.json`, an empty `scratch/`, and `record/` containing only `steps.jsonl.gz`.

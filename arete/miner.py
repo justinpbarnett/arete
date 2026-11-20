@@ -10,6 +10,7 @@ from string import Template
 
 from . import (
     auditor,
+    check_proposals,
     config,
     devices,
     diffguard,
@@ -35,6 +36,7 @@ from .util import git
 
 MAX_PROPOSALS = 8
 MAX_CATCHUP = timedelta(days=7)
+REVIEW_LOOKBACK = timedelta(days=30)
 SETTLE_LAG = timedelta(minutes=2)
 WINDOW_TRIGGER = "mine-window"
 HOURS_TRIGGER = "mine-hours"
@@ -89,6 +91,7 @@ PROPOSAL_SCHEMA = {
                     "why": {"type": "string"},
                     "evidence": {"type": "array", "items": {"type": "string"}},
                     "confidence": {"type": "number"},
+                    "enforcement": check_proposals.SCHEMA,
                 },
                 "required": ["layer", "repo", "file", "change", "why", "evidence", "confidence"],
             },
@@ -408,17 +411,19 @@ FEEDBACK_STATUS = {"new": "waiting for a revision", "taken": "being revised", "d
                    "skipped": "not revised, JEV read it as asking nothing"}
 
 
-def render_feedback(rows: list[dict], limit: int = 8000) -> str:
+def render_feedback(rows: list[dict], limit: int = 8000) -> tuple[str, dict[str, str]]:
     if not rows:
-        return "(no comments from the owner on arete PRs in this window)"
+        return "(no comments from the owner on arete PRs in this period)", {}
     final_state = {r["pr_url"]: (r["pr_state"] or "").lower() for r in rows}
+    shown = {}
     out, used, url = [], 0, None
     for n, r in enumerate(rows):
         lines = []
         if r["pr_url"] != url:
             url = r["pr_url"]
             lines += ["", f"### {r['repo']} {r['issue']}: {url} (PR {final_state[url]})"]
-        lines.append(f"- {r['kind']}" + (f" on `{r['path']}`" if r.get("path") else "")
+        citation = f"feedback {url} {r['kind']} {r['gh_id']}"
+        lines.append(f"- [{citation}]" + (f" on `{r['path']}`" if r.get("path") else "")
                      + f", {FEEDBACK_STATUS.get(r['status'], r['status'])}: {_short(r['body'] or '', 400)}")
         size = sum(len(line) + 1 for line in lines)
         if used + size > limit:
@@ -426,7 +431,8 @@ def render_feedback(rows: list[dict], limit: int = 8000) -> str:
             break
         out += lines
         used += size
-    return "\n".join(out).strip()
+        shown[citation] = r["repo"]
+    return "\n".join(out).strip(), shown
 
 
 def sync_feedback() -> None:
@@ -745,6 +751,49 @@ def proposal_status(cfg, p, flagged) -> tuple[str, str]:
     return "pending", ""
 
 
+def record_check_proposal(cfg: config.Config, run_id: str, p: dict, recent: dict[str, str],
+                          earlier: dict[str, str], flagged: list[dict], dry_run: bool) -> None:
+    if p.get("layer") != "repo" or p.get("repo") == cfg.global_repo:
+        print("  [skip: enforcement proposals must target the affected repository]")
+        return
+    try:
+        repo = cfg.repo(p.get("repo", ""))
+    except KeyError as error:
+        print(f"  [skip: {error}]")
+        return
+    confidence = p.get("confidence")
+    if not repo.mine or not repo.path.is_dir():
+        print(f"  [skip: mining disabled or checkout missing for {repo.name}]")
+        return
+    if type(confidence) not in (int, float) or not MIN_CONFIDENCE <= confidence <= 1:
+        print("  [skip: invalid or low confidence]")
+        return
+    refusal = check_proposals.refusal(p, repo, recent, earlier)
+    if not refusal:
+        rule = p["enforcement"]
+        fields = [p["file"], p["change"], rule["behavior"], *rule["cleanup"]]
+        if rule["kind"] == "check":
+            fields.extend(rule[k] for k in ("known_bad", "allowed", "diagnostic"))
+        wording = dict(p, change="\n".join(fields))
+        refusal = public_wording_refusal(cfg, repo, wording, flagged)
+    if not refusal:
+        refusal, diagnostic = check_proposals.verify(p["enforcement"])
+    if refusal:
+        print(f"  [skip: {refusal}]")
+        return
+    print(f"  [repo] {repo.name} {_short(p['enforcement']['behavior'], 140)} [manual review]")
+    if dry_run:
+        return
+    family = check_proposals.filename(p)
+    report = check_proposals.review_text(p, diagnostic).encode()
+    relative = check_proposals.revision_name(family, report)
+    path = check_proposals.save(repo, relative, report)
+    change = f"Review {relative} in the repo layer. {p['enforcement']['behavior']}"
+    approvals_store.record_check_proposal(run_id, dict(p, file=str(relative), change=change),
+                                          str(family), str(family.with_stem(f"{family.stem}-*")))
+    print(f"  {paths.short_path(path)}")
+
+
 def _run(cfg: config.Config, run_id: str, since: datetime, until: datetime, checkpointed: bool, lost: str,
          dry_run: bool, apply: bool) -> int:
     if lost:
@@ -766,6 +815,12 @@ def _run(cfg: config.Config, run_id: str, since: datetime, until: datetime, chec
     records = records or f"(no recorded run since {since_iso} failed, needed a retry, hit a budget or ran long)"
     audit_wants_fixes = not auditor.latest_findings().startswith("(")
     pr_feedback = insights_store.feedback_between(since_iso, until_iso)
+    feedback, recent = render_feedback(pr_feedback)
+    earlier_text, earlier = "(no earlier review evidence included)", {}
+    if pr_feedback:
+        prior_rows = insights_store.feedback_between(util.iso(since - REVIEW_LOOKBACK), since_iso)
+        prior_rows.sort(key=lambda r: r["recorded"] or r["created"] or "", reverse=True)
+        earlier_text, earlier = render_feedback(prior_rows)
     mine_repos = [r for r in cfg.repos if r.mine and r.path.is_dir()]
     repos ="\n".join(f"- {r.name}: {r.path} {'(public)' if r.public else ''}" for r in mine_repos)
     text = prompt_loader.prompt(
@@ -775,7 +830,7 @@ def _run(cfg: config.Config, run_id: str, since: datetime, until: datetime, chec
         done=_fmt(approvals_store.proposals(status=["memory", "filed", "merged"])),
         rejected=_fmt(approvals_store.proposals(status=["rejected", "skipped"])),
         events=render_events(cfg, since, until), digest=digest, audit=auditor.latest_findings(),
-        feedback=render_feedback(pr_feedback), records=records, since=since_iso,
+        feedback=feedback, earlier_feedback=earlier_text, records=records, since=since_iso,
     )
     run_dir = paths.RUNS_DIR / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -798,7 +853,15 @@ def _run(cfg: config.Config, run_id: str, since: datetime, until: datetime, chec
         return 1
     props = res.structured.get("proposals", [])[:MAX_PROPOSALS]
     by_repo: dict[str, list[dict]] = defaultdict(list)
+    opened, failures = [], []
     for p in props:
+        if "enforcement" in p:
+            try:
+                record_check_proposal(cfg, run_id, p, recent, earlier, flagged, dry_run)
+            except OSError as error:
+                failures.append(f"{p['repo']}: could not save the review proposal: {util.first_line(str(error), 200)}")
+                print(failures[-1])
+            continue
         status, note = proposal_status(cfg, p, flagged)
         print(f"{'->' if status == 'pending' else '  '} [{p['layer']}] {p['repo']}/{p['file']} ({p.get('confidence', 0):.2f}) {_short(p['change'], 140)}{note}")
         if dry_run:
@@ -810,7 +873,6 @@ def _run(cfg: config.Config, run_id: str, since: datetime, until: datetime, chec
     if dry_run:
         print(f"miner: dry run, {len(props)} proposals, {util.paid_note(res.paid_usd)}")
         return 0
-    opened, failures = [], []
     branch = miner_branch()
     for name, ps in by_repo.items():
         url, landed = "", []

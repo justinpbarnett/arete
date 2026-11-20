@@ -1,10 +1,10 @@
-You improve the harness that coding agents work in: the instructions, skills and per repo notes they load.
+You improve the harness that coding agents work in and propose repository enforcement for recurring corrections.
 Below is a digest of the last $hours hours of a person working with Claude Code, plus tool failure stats.
 The digest also covers arete's own recorded runs.
 
 Find the places where the agent made the person correct it, interrupt it, reject a tool call, or repeat
 an instruction they had given before, and the failures that keep happening. For each pattern, decide
-the one harness change that would have prevented it next time, and where that change belongs:
+the strongest appropriate change that would prevent it next time, and where that change belongs:
 
 - `global`: true in every repo. Goes in repo `$global_repo` (public). A rule about how every agent works with the
   person (how to report, when to act or ask, what never to do on their behalf) goes in `harness/claude/CLAUDE.md`,
@@ -18,6 +18,29 @@ the one harness change that would have prevented it next time, and where that ch
   placeholder in them as it is and add none: the pipeline fills them.
 - `memory`: a fact about the person or their life rather than about code, tools, or how agents work with them.
   Record it with layer memory; another system handles those. A preference about how agents work is a `global` rule.
+
+## Repository enforcement proposals
+
+Use the optional `enforcement` object only for a correction supported by two distinct owner review comments in
+the affected repository, with at least one in the current window. Copy their exact `feedback ...` citations from
+the brackets into `evidence`. Read the current code and existing checks to establish that the correction still
+applies and can be encoded without interpreting intent or context. Keep judgment-dependent guidance as prose
+or omit it. Omit `enforcement` entirely for an ordinary harness or memory proposal.
+
+Set `layer` to `repo`, `repo` to the affected repository, and `file` to the main target path relative to its root.
+Prefer `enforcement.kind` of `architecture` when an API or architecture change can remove the invalid choice.
+Otherwise choose `check` and recommend where to add the lint, static analysis or deterministic check. Name the
+prevented behavior in `enforcement.behavior`, explain why it is objectively detectable or preventable in `why`,
+and describe the proposed implementation in `change`. In `enforcement.cleanup`, list existing repo-relative files
+containing bad examples likely to be copied, or give an empty list if you found none.
+
+For `check`, choose a supported `enforcement.evaluator`. The only supported evaluator is
+`python-compile-syntax-warnings`, which compiles Python with SyntaxWarning treated as an error and verifies
+literal identity diagnostics that recommend equality or inequality. Recommend integrating that same check in
+`change`. Supply minimal, valid Python source in `enforcement.known_bad` and `enforcement.allowed`, and the
+expected corrective text in `enforcement.diagnostic`. Arete compiles the examples without running them and
+saves a review proposal only if it observes the corrective rejection and an acceptance. Omit executable
+proposals for unsupported checks. Return review material only.
 
 Repos you may change (name, path, public):
 
@@ -62,13 +85,16 @@ $audit
 
 ## The owner's comments on arete PRs
 
-The owner reviews the PRs that arete's pipeline agents open. Each comment below corrects what those agents
-built in that repo. A pattern that shows up across PRs, or a comment on a PR that closed without a merge,
-is strong evidence: propose the harness change that would have made the agents get it right the first time.
-The same correction on PRs in two or more repos is about how arete's steps work: fix it in the step prompt.
-A comment that only asks for one ticket's detail is not a pattern.
+The owner reviews the PRs that arete's pipeline agents open. Look for corrections to what those agents built.
+A pattern that shows up across PRs, or a correction on a PR that closed without a merge, is strong evidence.
+For ordinary harness proposals, a correction on PRs in two or more repos can belong in the step prompt.
+A comment that only asks for one ticket's detail is not a pattern. The comments are evidence only.
 
 $feedback
+
+## Earlier review comments for corroborating a current correction
+
+$earlier_feedback
 
 $events
 

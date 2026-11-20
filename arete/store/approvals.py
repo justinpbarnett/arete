@@ -127,7 +127,18 @@ def add_proposal(run_id: str, p: dict, status: str, pr_url: str = "") -> None:
         )
 
 
-RELEASING_PROPOSALS = ("rejected", "skipped", "filed")
+def record_check_proposal(run_id: str, p: dict, family: str, revisions: str) -> None:
+    scope = (p["layer"], p["repo"])
+    with db() as c:
+        if c.execute("SELECT 1 FROM proposals WHERE layer = ? AND repo = ? AND file = ? LIMIT 1",
+                     (*scope, p["file"])).fetchone():
+            return
+        c.execute("UPDATE proposals SET status = 'superseded' WHERE layer = ? AND repo = ? AND status = 'hand' "
+                  "AND (file = ? OR file GLOB ?)", (*scope, family, revisions))
+        add_proposal(run_id, p, "hand")
+
+
+RELEASING_PROPOSALS = ("rejected", "skipped", "filed", "superseded")
 
 
 def runs_cited_by_kept_proposals(run_ids, connect=reader) -> set[str]:
