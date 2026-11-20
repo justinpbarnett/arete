@@ -133,9 +133,9 @@ def loopback_only(event, args):
             forbidden()
     if event in ("socket.getnameinfo", "socket.gethostbyaddr"):
         forbidden()
-    if event == "socket.getaddrinfo" and (args[0] != ADDRESS or type(args[1]) is not int):
+    if event == "socket.getaddrinfo" and (type(args[0]) is not str or args[0] != ADDRESS or type(args[1]) is not int):
         forbidden()
-    if event == "socket.gethostbyname" and args[0] != ADDRESS:
+    if event == "socket.gethostbyname" and (type(args[0]) is not str or args[0] != ADDRESS):
         forbidden()
 
 
@@ -145,7 +145,8 @@ def address_call(method):
             address = args[-1]
         else:
             address = kwargs.get("address")
-        if not isinstance(address, tuple) or len(address) != 2 or address[0] != ADDRESS or type(address[1]) is not int:
+        if (type(address) is not tuple or len(address) != 2 or type(address[0]) is not str
+                or address[0] != ADDRESS or type(address[1]) is not int):
             forbidden()
         return method(sock, *args, **kwargs)
 
