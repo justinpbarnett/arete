@@ -59,6 +59,7 @@ class Policy:
     issue_app: IssueApp | None = None
     production_issue_base: str = ""
     accept_issue_races: bool = False
+    reconciled_hold: str = ""
 
     @property
     def fingerprint(self) -> str:
@@ -73,6 +74,8 @@ class Policy:
             del fields["production_issue_base"]
         if not self.accept_issue_races:
             del fields["accept_issue_races"]
+        if not self.reconciled_hold:
+            del fields["reconciled_hold"]
         return orchestration.digest(fields)
 
     def client(self, deadline: str) -> GitHub:
@@ -125,6 +128,9 @@ def load_policy() -> Policy | None:
                       "production issue delivery requires the exact approved README edit, base and a distinct App")
         pilot.require(not policy.enabled or policy.accept_issue_races,
                       "production issue delivery requires separate approval of GitHub issue and PR metadata races")
+    pilot.require(type(policy.reconciled_hold) is str and (not policy.reconciled_hold
+                  or (base and policy.accept_issue_races and TASK.fullmatch(policy.reconciled_hold))),
+                  "a pre-PR hold may only be reconciled for an explicitly pinned production issue")
     if issue is not None:
         zte_issue.require_number(issue.number)
         pilot.require(type(issue.node) is str and 0 < len(issue.node) <= 128
@@ -337,6 +343,18 @@ def hold(delivery: store.Delivery, error: Exception, *, uncertain: bool = False,
     alerts.notify("Arete ZTE held", f"{row.task}: {reason}")
 
 
+def reconcile_pre_pr_hold(previous: store.Delivery, recovery: dict, client: GitHub, base: str) -> None:
+    pilot.require(client.branch_head(recovery["branch"]) == recovery["head"] and client.branch_prs(recovery["branch"]) == [],
+                  "the held branch no longer has its original head and no pull requests")
+    claim = zte_issue.Claim(**previous.data["issue"])
+    old = zte_issue.require_issue(client.identity, claim, client.issue_snapshot(claim.number))
+    zte_issue.require_closable(old)
+    comparison = client.read(f"/compare/{previous.base}...{base}")
+    pilot.require(comparison.get("status") == "ahead" and comparison.get("behind_by") == 0
+                  and comparison.get("merge_base_commit", {}).get("sha") == previous.base,
+                  "current protected main does not descend from the held attempt base")
+
+
 def finder(cfg: config.Config) -> None:
     if not POLICY_FILE.exists() or PAUSE_FILE.exists():
         return
@@ -348,8 +366,11 @@ def finder(cfg: config.Config) -> None:
             return
         with db.one_read(timeout=0):
             previous = store.latest()
+        recovery = None
         if previous and previous.phase != "healthy":
-            return
+            if (previous.task != policy.reconciled_hold or not (recovery := store.pre_pr_hold(previous))
+                    or not store.recovery_ready(previous, util.now())):
+                return
         repo, _, digest = settings(cfg, policy)
         deadline = util.iso(util.now() + timedelta(seconds=MAX_SECONDS))
         client = policy.client(deadline)
@@ -360,6 +381,11 @@ def finder(cfg: config.Config) -> None:
             zte_issue.current(client, policy.issue, require_fresh=bool(policy.production_issue_base))
             if policy.issue_app is not None:
                 client.require_issue_app(policy.issue_app, ISSUE_KEY)
+            if policy.reconciled_hold:
+                if not recovery or any(getattr(policy.issue, key) == previous.data["issue"][key]
+                                       for key in ("number", "node")):
+                    return
+                reconcile_pre_pr_hold(previous, recovery, client, base)
         if status == "no match" or client.tip() != base:
             return
         client.time_left()
@@ -386,6 +412,8 @@ def finder(cfg: config.Config) -> None:
                     data.update(close_after_health=True, issue_app=asdict(policy.issue_app))
                 if policy.production_issue_base:
                     data["production_issue_base"] = policy.production_issue_base
+                if recovery:
+                    data["reconciled_hold"] = recovery
                 client.time_left()
                 with principals.acting("rule:zte-finder"), db.tx(timeout=0, before_commit=client.time_left):
                     store.reserve(policy.fingerprint, repo.name, base, deadline, pilot.TASK_TITLE, pilot.TASK_KIND,

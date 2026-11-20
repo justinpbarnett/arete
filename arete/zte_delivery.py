@@ -479,7 +479,7 @@ def advance(cfg) -> bool:
         if not database_busy(error):
             raise
         return False
-    if not delivery or delivery.phase == "healthy":
+    if not delivery or delivery.phase == "healthy" or store.pre_pr_hold(delivery):
         return True
     if delivery.phase in store.TERMINAL | {"release_ready", "deploy_intent", "rollback_intent"}:
         return False
