@@ -194,6 +194,7 @@ class VersionedApiTests(unittest.TestCase):
               mock.patch("urllib.request.urlopen", side_effect=forbidden),
               mock.patch.object(gh, "gh", side_effect=forbidden),
               mock.patch.object(gh, "gh_json", side_effect=lookup),
+              mock.patch.object(gh, "issue", return_value={"labels": []}),
               mock.patch.object(gh, "issue_comment", side_effect=comment),
               mock.patch.object(gh, "issue_create", side_effect=issue),
               mock.patch.object(gh, "pr_create", side_effect=pull),

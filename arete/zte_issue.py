@@ -10,7 +10,7 @@ from . import gh, pilot, tracker, util
 if TYPE_CHECKING:
     from .zte_github import GitHub, Identity
 
-LABEL = "agent:zte"
+LABEL = tracker.ZTE_LABEL
 LABELS = frozenset({LABEL, "documentation"})
 MAX_BODY_BYTES = 16 * 1024
 ISSUE_PROOF = """
