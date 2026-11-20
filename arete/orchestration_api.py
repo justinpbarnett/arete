@@ -222,6 +222,7 @@ class Catalog:
             op = call["op"]
             args = OPERATIONS[op].arguments(call["args"])
             if op == "worker.start":
+                args["tool_bundle"] = args["tool_bundle"].removeprefix("tools:")
                 self.worker(args)
                 if (len(args["depends_on"]) > 20 or any(type(dep) is not str or dep not in known
                                                         for dep in args["depends_on"])):
