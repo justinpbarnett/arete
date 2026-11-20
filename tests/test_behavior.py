@@ -29,6 +29,8 @@ def setUpModule():
 
 
 class ApiCheckTests(unittest.TestCase):
+    serial = True
+
     def test_api_check(self):
         with tempfile.TemporaryDirectory(prefix="arete-api-cli-") as temp:
             root = Path(temp).resolve()
@@ -42,6 +44,8 @@ class ApiCheckTests(unittest.TestCase):
 
 
 class ApiCompatibilityTests(unittest.TestCase):
+    serial = True
+
     def test_api_diff(self):
         versioned_api_fixture.evolution_temp()
 

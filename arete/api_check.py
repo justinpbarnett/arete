@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -138,19 +139,39 @@ def loopback_only(event, args):
         forbidden()
 
 
+def address_call(method):
+    def checked(sock, *args, **kwargs):
+        if args:
+            address = args[-1]
+        else:
+            address = kwargs.get("address")
+        if not isinstance(address, tuple) or len(address) != 2 or address[0] != ADDRESS or type(address[1]) is not int:
+            forbidden()
+        return method(sock, *args, **kwargs)
+
+    return checked
+
+
 @contextmanager
 def offline():
     sys.addaudithook(loopback_only)
-    from . import accounts, gh, jira, paths, tailnet, util
+    with ExitStack() as guards:
+        for name in ("bind", "connect", "connect_ex", "sendto"):
+            guards.enter_context(patch.object(socket.socket, name, address_call(getattr(socket.socket, name))))
+        if hasattr(socket.socket, "sendmsg"):
+            guards.enter_context(patch.object(socket.socket, "sendmsg", forbidden))
+        from . import accounts, gh, jira, paths, tailnet, util
 
-    root = Path.cwd()
-    require(all(path == root / name and not path.is_symlink() for path, name in (
-        (paths.CONFIG_DIR, "config"), (paths.STATE_DIR, "state"), (paths.LOG_DIR, "logs"),
-        (paths.WORKTREES_DIR, "worktrees"), (paths.HOME, "home"), (Path(os.environ["TMPDIR"]), "tmp"))),
-        "expected an isolated scratch root")
-    with (patch("urllib.request.urlopen", forbidden), patch.object(accounts, "read", forbidden),
-          patch.object(gh, "gh", forbidden), patch.object(jira.Client, "from_env", forbidden),
-          patch.object(tailnet, "tailscale_run", forbidden), patch.object(util, "github_token", return_value="")):
+        root = Path.cwd()
+        require(all(path == root / name and not path.is_symlink() for path, name in (
+            (paths.CONFIG_DIR, "config"), (paths.STATE_DIR, "state"), (paths.LOG_DIR, "logs"),
+            (paths.WORKTREES_DIR, "worktrees"), (paths.HOME, "home"), (Path(os.environ["TMPDIR"]), "tmp"))),
+            "expected an isolated scratch root")
+        for primitive in (patch("urllib.request.urlopen", forbidden), patch.object(accounts, "read", forbidden),
+                          patch.object(gh, "gh", forbidden), patch.object(jira.Client, "from_env", forbidden),
+                          patch.object(tailnet, "tailscale_run", forbidden),
+                          patch.object(util, "github_token", return_value="")):
+            guards.enter_context(primitive)
         yield
 
 
@@ -190,6 +211,8 @@ class Check:
         if body is not None:
             merged.setdefault("Content-Type", "application/json")
         try:
+            conn.connect()
+            conn.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             conn.request(method, path, json.dumps(body) if isinstance(body, dict) else body, merged)
             with conn.getresponse() as response:
                 yield response
@@ -329,7 +352,7 @@ class Check:
 
     def streams(self):
         from . import contract, run_lines
-        from .store import runs
+        from .store import db, events, runs
 
         runs.add_feed(self.run, "plan", "Add kumquat")
         run_lines.write(self.run, "step_end", step="plan", result="pass")
@@ -341,16 +364,30 @@ class Check:
         require(any(json.loads(line).get("event") == "step_end" for line in lines.splitlines()),
                 "run event stream did not contain the recorded step")
         for path in ("/api/v1/events", "/api/events"):
-            query = urlencode({"since": "0", "timeout": 0, "subject": f"run:{self.run}"})
+            with db.one_read() as connection:
+                epoch, _ = events.cursor(events.metadata(connection)["head"])
+            query = urlencode({"since": f"{epoch}.0", "subject": f"run:{self.run}"})
             with self.response("GET", f"{path}?{query}", headers={"Accept": "application/x-ndjson"}) as response:
-                require(response.status == 200 and response.headers.get("Content-Type") == "application/x-ndjson"
-                        and response.headers.get("Arete-API") == contract.VERSION, f"{path} did not open an NDJSON stream")
+                try:
+                    require(response.status == 200 and response.headers.get("Content-Type") == "application/x-ndjson"
+                            and response.headers.get("Arete-API") == contract.VERSION, f"{path} did not open an NDJSON stream")
+                    for _ in range(16):
+                        row = json.loads(response.readline(65536))
+                        if row.get("kind") == "run.started" and row.get("id"):
+                            break
+                    else:
+                        raise RuntimeError(f"{path} did not send the committed run event with a cursor")
+                finally:
+                    with db.tx() as connection:
+                        connection.execute("UPDATE schema_meta SET value = ? WHERE key = 'restore_epoch'",
+                                           (str(int(epoch) + 1),))
                 for _ in range(16):
-                    row = json.loads(response.readline())
-                    if row.get("kind") == "run.started" and row.get("id"):
+                    row = json.loads(response.readline(65536))
+                    if row == {"kind": "reset", "reason": "epoch"}:
                         break
                 else:
-                    raise RuntimeError(f"{path} did not send the committed run event with a cursor")
+                    raise RuntimeError(f"{path} did not reset after the fixture epoch changed")
+                require(not response.read(1), f"{path} kept streaming after reset")
 
     def shapes(self):
         from . import agent, contract, record, replay, triage
@@ -443,8 +480,9 @@ def worker(lifeline):
             node = SimpleNamespace(names={ADDRESS})
             logins = SimpleNamespace(of=lambda _: LOGIN)
             stage = f"listen on {ADDRESS}:0"
+            handler = type("FixtureHandler", (dashboard.Handler,), {"disable_nagle_algorithm": True})
             with patch("socket.getfqdn", return_value=ADDRESS):
-                server = tailnet.Server(ADDRESS, 0, node, logins, False, dashboard.Handler, dashboard.Redirect)
+                server = tailnet.Server(ADDRESS, 0, node, logins, False, handler, dashboard.Redirect)
             server.daemon_threads = False
             with server:
                 thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": .02})
