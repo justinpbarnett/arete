@@ -81,6 +81,12 @@ def task_comments(tid: str, connect=reader) -> list[dict]:
                                            (tid,))]
 
 
+def versioned_comments(tid: str) -> list[dict]:
+    with reader() as c:
+        return [dict(r) for r in c.execute("SELECT version, author, body, ts FROM task_comments "
+                                           "WHERE task = ? ORDER BY rowid", (tid,))]
+
+
 def tasks_replied(repo: str) -> list[dict]:
     with reader() as c:
         return [dict(r) for r in c.execute(

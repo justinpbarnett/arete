@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import json
 import os
 import re
@@ -149,7 +151,7 @@ def filters(query):
 
 def scan(c, epoch, seq, selected):
     where, args, classes = selected
-    with foundation.read_snapshot(c):
+    with (nullcontext() if c.in_transaction else foundation.read_snapshot(c)):
         meta = metadata(c)
         now_epoch, top = cursor(meta["head"])
         seq = top if seq is None else seq

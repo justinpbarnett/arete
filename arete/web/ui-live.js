@@ -1,5 +1,6 @@
-import { signal } from "./vendor-signals.js";
+import { batch, signal } from "./vendor-signals.js";
 import * as data from "./ui-data.js";
+import { coherent } from "./ui-snapshot.js";
 
 const endpoints = { sidebar: "/api/sidebar", live: "/api/live", questions: "/api/asks", health: "/api/health", tasks: "/api/tasks" };
 const resources = {
@@ -82,7 +83,8 @@ async function read(url, { text = false, say = false } = {}) {
   controllers.add(controller);
   try {
     const response = await fetch(url, { cache: "no-store", signal: controller.signal });
-    if (!response.ok) return { error: { status: response.status, message: say ? await refusal(response) : `HTTP ${response.status}` } };
+    if (!response.ok) return { seq: response.headers.get("Arete-Seq"),
+      error: { status: response.status, message: say ? await refusal(response) : `HTTP ${response.status}` } };
     if (text) return { data: await response.text() };
     const data = await response.json().catch(() => null);
     if (data && typeof data === "object" && !Array.isArray(data)) return { data };
@@ -224,11 +226,9 @@ async function readTurns(selection, token, run) {
   return true;
 }
 
-async function readRun(run, token) {
+async function readRun(run, token, queue, detail) {
   const selection = rs.selection;
   const id = run.id;
-  const wantDetail = id && (rs.force || !rs.detail || rs.detail.run?.status === "running");
-  const [queue, detail] = await Promise.all([read(data.runs(), { say: true }), wantDetail ? read(data.run(id).detail, { say: true }) : null]);
   const stale = () => token !== generation || active !== run || selection !== rs.selection;
   if (stale()) return;
   if (Array.isArray(queue.data?.runs)) { rs.queue = queue.data.runs; rs.more = Boolean(queue.data.more); rs.queueError = null; }
@@ -259,20 +259,21 @@ async function readRun(run, token) {
   publishRuns();
 }
 
-async function readScreen(run, token) {
-  const boardReads = resources.board;
-  const detail = run.id ? [["task", data.taskDetail(run.id, run.repo), (x) => typeof x.id === "string"]] : [];
-  const wanted = run.screen === "task" ? [...boardReads, ...detail] : resources[run.screen] ?? [];
-  await Promise.all(wanted.map(async ([key, url, valid]) => {
-    const previous = screenReads.value[key];
-    if (key === "task" && !/^t-[a-f0-9]+$/i.test(run.id) && previous?.data && !previous.error && !run.refreshDetail) return;
-    const result = await read(url, { say: true });
-    if (token !== generation || active !== run) return;
-    const usable = result.data && valid(result.data);
-    screenReads.value = { ...screenReads.value, [key]: usable ? { data: result.data }
-      : { data: previous?.data, error: result.error ?? { message: "Malformed response" } } };
-  }));
-  if (token === generation && active === run) run.refreshDetail = false;
+function screenResources(run) {
+  if (run.screen !== "task") return resources[run.screen] ?? [];
+  if (!run.id) return resources.board;
+  return [...resources.board, ["task", data.taskDetail(run.id, run.repo), (x) => typeof x.id === "string"]];
+}
+
+function validRead(result, valid) {
+  if (result.error || valid(result.data)) return result;
+  return { error: { status: null, message: "Malformed response" } };
+}
+
+async function readExternalTask(run, task) {
+  const previous = screenReads.value.task;
+  if (previous?.data && !previous.error && !run.refreshDetail) return null;
+  return validRead(await read(task[1], { say: true }), task[2]);
 }
 
 async function round(run) {
@@ -282,24 +283,80 @@ async function round(run) {
   const began = Date.now();
   const delay = fastScreens.has(run.screen) ? FAST_MS : SLOW_MS;
   const wantLive = liveDue || delay <= FAST_MS || began - cache.liveTried >= delay - 500;
-  const [sidebar, live, questions] = await Promise.all([read(endpoints.sidebar), wantLive ? read(endpoints.live) : null,
-    read(endpoints.questions), run.screen === "run" ? readRun(run, token) : null, readScreen(run, token)]);
-  if (token !== generation || active !== run) return;
+  const screens = screenResources(run);
+  const externalTask = !/^t-[a-f0-9]+$/i.test(run.id) && screens.find(([key]) => key === "task");
+  const localScreens = screens.filter((entry) => entry !== externalTask);
+  const entries = [
+    ["sidebar", endpoints.sidebar, (x) => Number.isInteger(x.running)],
+    ["live", endpoints.live, (x) => !!x.live],
+    ["questions", endpoints.questions, (x) => Array.isArray(x.asks)],
+    ...localScreens,
+  ];
+  const readingRuns = run.screen === "run";
+  if (readingRuns) entries.push(["queue", data.runs(), (x) => Array.isArray(x.runs)]);
+  if (readingRuns && run.id) entries.push(["detail", data.run(run.id).detail, (x) => x.run && typeof x.run === "object"]);
+  const latest = {};
+  let fetchedLive = false;
+  const current = () => token === generation && active === run;
+  const readers = entries.map(([key, url, valid]) => async () => {
+    if (!current()) return { error: { message: "Superseded" } };
+    if (key === "live") {
+      if (!latest.live && !wantLive && cache.live) {
+        latest.live = { data: cache.live };
+        return { seq: cache.live.seq };
+      }
+      fetchedLive = true;
+    }
+    const result = latest[key] = validRead(await read(url, { say: true }), valid);
+    if ((key === "detail" || key === "task") && result.error?.status === 404 && result.seq) return { seq: result.seq };
+    return result.error ? result : { seq: result.data.seq };
+  });
+  const [group, external] = await Promise.all([
+    coherent(readers),
+    externalTask ? readExternalTask(run, externalTask) : null,
+  ]);
+  if (!current()) return;
   const finished = Date.now();
-  if (sidebar.data) { cache.sidebar = sidebar.data; cache.sidebarAt = finished; }
-  cache.errors.sidebar = sidebar.error ?? null;
-  cache.questions = Array.isArray(questions.data?.asks) ? { data: questions.data }
-    : { data: cache.questions?.data, error: questions.error ?? { message: "Malformed response" } };
-  if (live) {
-    cache.liveTried = began;
-    if (live.data) { cache.live = live.data; cache.liveAt = finished; }
-    cache.errors.live = live.error ?? null;
+  const { sidebar, live, questions, queue, detail } = latest;
+  const editing = document.activeElement?.matches?.("form.ops-form :is(input, textarea, select, [contenteditable=true])");
+  const publish = group && !editing;
+  if (publish) {
+    cache.sidebar = sidebar.data;
+    cache.sidebarAt = finished;
+    cache.questions = { data: questions.data };
+    cache.live = live.data;
+    if (fetchedLive) cache.liveAt = finished;
+  } else if (questions.error) {
+    cache.questions = { data: cache.questions?.data, error: questions.error };
   }
-  const failed = Boolean(sidebar.error || live?.error);
+  if (fetchedLive) cache.liveTried = began;
+  cache.errors.sidebar = sidebar.error ?? null;
+  cache.errors.live = live.error ?? null;
+  const failed = Boolean(sidebar.error || live.error);
   cache.failures = failed ? cache.failures + 1 : 0;
   cache.settled = true;
-  liveDue = failed;
-  snapshot.value = snapshotOf();
+  liveDue = !group;
+  const screen = { ...screenReads.value };
+  for (const [key] of localScreens) {
+    if (latest[key].error) screen[key] = { data: screen[key]?.data, error: latest[key].error };
+    else if (publish) screen[key] = { data: latest[key].data };
+  }
+  if (external) screen.task = external.error ? { data: screen.task?.data, error: external.error } : external;
+  run.refreshDetail = false;
+  let pending;
+  batch(() => {
+    snapshot.value = snapshotOf();
+    if (screens.length) screenReads.value = screen;
+    if (readingRuns && publish) pending = readRun(run, token, queue, detail);
+    else if (readingRuns && (queue.error || detail?.error)) {
+      rs.queueError = queue.error ?? null;
+      rs.detailError = detail?.error ?? null;
+      rs.settled = true;
+      publishRuns();
+    }
+  });
+  await pending;
+  if (!current()) return;
   const every = run.screen === "run" ? RUN_MS : FAST_MS;
   timer = setTimeout(() => round(run), Math.max(0, every - (Date.now() - began)));
 }
