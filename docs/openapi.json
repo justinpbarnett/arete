@@ -695,7 +695,7 @@
   },
   "x-arete-contract-sources-sha256": {
     "arete/contract.py": "4189e4e4ecc35bf2945a63e7ce233149adadf43b13e214587dfd8f5392cb2a8b",
-    "arete/contract_evolution.py": "db0d82bb9734c0dc28a7367e929d7e3d52392ed00f8be4c1528475edc2f78d58",
+    "arete/contract_evolution.py": "750bdbd172677317ab7ee60838566817607c6a77c7143938119eddc858f93ab1",
     "arete/refusals.py": "1ecf93a2ed4d349a8b93cf4b5682f1711d7050c652c012ba6d25ba748227d714"
   },
   "x-arete-errors": {

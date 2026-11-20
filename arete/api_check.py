@@ -66,8 +66,18 @@ def follow_launcher(lifeline):
     threading.Thread(target=watch, daemon=True).start()
 
 
+def wait_for_worker_exit(process):
+    deadline = time.monotonic() + CHECK_TIMEOUT
+    while not os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG):
+        if time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired(process.args, CHECK_TIMEOUT)
+        time.sleep(.025)
+
+
 def drain_group(process):
-    kill_group(process.pid)
+    # Darwin reports EPERM if the only group member is the unreaped worker.
+    with suppress(PermissionError):
+        kill_group(process.pid)
     process.wait(timeout=2)
     deadline = time.monotonic() + 2
     while True:
@@ -93,10 +103,11 @@ def launch():
             command = child_command(SOURCE, entry, str(read))
             process = subprocess.Popen(command, cwd=root, env=isolated_env(root), start_new_session=True, pass_fds=(read,))
             try:
-                return process.wait(timeout=CHECK_TIMEOUT)
+                wait_for_worker_exit(process)
             finally:
                 drain_group(process)
                 drained = True
+            return process.returncode
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
         print(f"api check: could not finish the isolated check: {error}", file=sys.stderr)
         return 1
@@ -119,9 +130,11 @@ def loopback_only(event, args):
             return
         if not isinstance(address, tuple) or not address or address[0] != ADDRESS:
             forbidden()
-    if event == "socket.getnameinfo" and (not isinstance(args[0], tuple) or not args[0] or args[0][0] != ADDRESS):
+    if event in ("socket.getnameinfo", "socket.gethostbyaddr"):
         forbidden()
-    if event in ("socket.getaddrinfo", "socket.gethostbyname", "socket.gethostbyaddr") and args[0] != ADDRESS:
+    if event == "socket.getaddrinfo" and (args[0] != ADDRESS or type(args[1]) is not int):
+        forbidden()
+    if event == "socket.gethostbyname" and args[0] != ADDRESS:
         forbidden()
 
 

@@ -176,10 +176,12 @@ def git(root, *args):
 
 def baseline(root, revision):
     commit = git(root, "rev-parse", "--verify", "--end-of-options", revision + "^{commit}").decode().strip()
+
     def read(path):
         return git(root, "cat-file", "blob", f"{commit}:{path}")
 
-    if sources(read, REGISTRY_INPUTS) == BOOTSTRAP_SOURCES:
+    has_artifact = bool(git(root, "ls-tree", "-z", commit, "--", OPENAPI))
+    if not has_artifact and sources(read, REGISTRY_INPUTS) == BOOTSTRAP_SOURCES:
         frozen = (root / BOOTSTRAP).read_bytes()
         if sha(frozen) != BOOTSTRAP_DATA_SHA:
             raise ValueError(f"pre-OpenAPI baseline {BOOTSTRAP} was modified")
