@@ -1,0 +1,4 @@
+[verifier-prompt-inputs]
+steps = ["Run `python3.13 -B -m arete.cli prompts verify --json` from the Arete checkout.", "Read the verification prompt's JSON record."]
+outcome = "The command exits 0 and returns a valid `verify` template listing `goal`, `surface`, `commands` and `journeys` among its inputs."
+driver = "prompt-inputs"

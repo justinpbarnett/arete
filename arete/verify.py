@@ -77,18 +77,20 @@ def port_refusal(v: config.Verify) -> str:
 def with_free_ports(v: config.Verify) -> config.Verify:
     avoid = paths.dashboard_ports()
     ports = {name: browser.free_port(avoid) for name in dict.fromkeys(PORT_FIELD.findall(
-        v.start + v.url + v.notes + " ".join(v.probes.values())))}
+        v.start + v.url + v.notes + " ".join((*v.probes.values(), *v.drivers.values()))))}
 
     def filled(text: str) -> str:
         return PORT_FIELD.sub(lambda m: str(ports[m.group(1)]), text)
 
     return replace(v, start=filled(v.start), url=filled(v.url), notes=filled(v.notes),
-                   probes={name: filled(command) for name, command in v.probes.items()})
+                   probes={name: filled(command) for name, command in v.probes.items()},
+                   drivers={name: filled(command) for name, command in v.drivers.items()})
 
 
 def with_scratch(v: config.Verify, root: str) -> config.Verify:
     return replace(v, start=v.start.replace(SCRATCH_FIELD, root), notes=v.notes.replace(SCRATCH_FIELD, root),
-                   probes={name: command.replace(SCRATCH_FIELD, root) for name, command in v.probes.items()})
+                   probes={name: command.replace(SCRATCH_FIELD, root) for name, command in v.probes.items()},
+                   drivers={name: command.replace(SCRATCH_FIELD, root) for name, command in v.drivers.items()})
 
 
 def preflight(v: config.Verify, cwd: Path, cfg: config.Config, repo: config.Repo | None = None) -> Verified | None:
@@ -115,12 +117,16 @@ def preflight(v: config.Verify, cwd: Path, cfg: config.Config, repo: config.Repo
                     blocked_by=f"{failed['what']}: {failed['saw']}" if failed else "", finished=not bool(failed))
 
 
-def run_probes(v: config.Verify, cwd: Path, attempt: scratch.Attempt | None) -> Verified | None:
-    if not v.probes:
+def run_probes(v: config.Verify, cwd: Path, attempt: scratch.Attempt | None,
+               *, journey_drivers: dict[str, str] | None = None) -> Verified | None:
+    named = [(f"journey:{name}", v.drivers[driver]) for name, driver in sorted((journey_drivers or {}).items())]
+    if not v.probes and not named:
         return None
+    label = "verification commands" if named else "verification probes"
     if attempt is None:
-        return Verified("blocked", "Configured verification probes require trusted scratch confinement.",
-                        blocked_by="verification probes could not obtain scratch authority", finished=False)
+        requested = " for " + ", ".join(name for name, _ in named) if named else ""
+        return Verified("blocked", f"Configured {label} require trusted scratch confinement.",
+                        blocked_by=f"{label} could not obtain scratch authority{requested}", finished=False)
     deadline, checks = time.monotonic() + v.probe_seconds, []
     env = environment.build((), scratch.attempt_env(attempt))
     env = {name: value for name, value in env.items() if not paths.CREDENTIAL_NAME.search(name)}
@@ -129,12 +135,13 @@ def run_probes(v: config.Verify, cwd: Path, attempt: scratch.Attempt | None) -> 
         text = vault.hidden(text).replace(str(paths.HOME), "~")
         return text.replace(v.url, "<app>") if v.url else text
 
-    for name, command in v.probes.items():
+    for index, (name, command) in enumerate((*v.probes.items(), *named)):
+        is_driver = index >= len(v.probes)
         remaining = deadline - time.monotonic()
         cause = "change"
         try:
             if remaining <= 0:
-                raise TimeoutError("verification probe budget exhausted")
+                raise TimeoutError(f"{'verification command' if named else 'verification probe'} budget exhausted")
             confined = scratch.service_command(attempt, command)
             with scratch.producing(attempt):
                 proc = scratch.spawn(confined, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
@@ -143,8 +150,10 @@ def run_probes(v: config.Verify, cwd: Path, attempt: scratch.Attempt | None) -> 
             try:
                 out, err = proc.communicate(timeout=remaining)
                 passed = proc.returncode == 0
-                saw = f"exit {proc.returncode}: " + util.tail(out + err, MAX_SAW_CHARS)
-                if not passed and (proc.returncode in (126, 127, util.TIMED_OUT) or ENVIRONMENT_FAULT.search(saw)):
+                output = "\n".join(filter(None, (out, err))) if is_driver else out + err
+                saw = f"exit {proc.returncode}: " + util.tail(output, MAX_SAW_CHARS)
+                if not passed and (proc.returncode in (126, 127, util.TIMED_OUT)
+                                   or ENVIRONMENT_FAULT.search(err if is_driver else saw)):
                     cause = "environment"
             finally:
                 util.stop_group(proc)
@@ -155,9 +164,15 @@ def run_probes(v: config.Verify, cwd: Path, attempt: scratch.Attempt | None) -> 
             check["cause"] = cause
         checks.append(check)
         if not passed:
-            return Verified("blocked" if cause == "environment" else "fail", "Configured verification probes failed.",
-                            checks, blocked_by=f"probes: {name}: {public(saw)}" if cause == "environment" else "")
-    return Verified("pass", "Owner-configured verification probes passed under scratch confinement.", checks)
+            blocker = f"{name}: {public(saw)}"
+            blocked = cause == "environment"
+            summary = f"Configured {label} failed."
+            if named:
+                summary = f"Could not run {name}." if blocked else f"{name} failed."
+            return Verified("blocked" if blocked else "fail", summary, checks,
+                            blocked_by=(blocker if named else f"probes: {blocker}") if blocked else "",
+                            finished=not (named and blocked))
+    return Verified("pass", f"Owner-configured {label} passed under scratch confinement.", checks)
 
 
 def relay_server(url: str) -> ThreadingHTTPServer:

@@ -14,6 +14,7 @@ from . import (
     factory,
     gh,
     intake,
+    journeys,
     owner_asks,
     patching,
     paths,
@@ -405,7 +406,7 @@ class Job:
             value = (self.layer.checks, self.layer.quick_checks, self.layer.targeted_checks,
                      self.layer.targeted_commands, bool(kw.get("quick")))
         elif name == "verify":
-            value = (asdict(self.layer.verify) if self.layer.verify else None, self.goal, self.left_for_a_person)
+            value = (self.layer.verify.policy() if self.layer.verify else None, self.goal, self.left_for_a_person)
         else:
             return ""
         return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
@@ -710,7 +711,8 @@ def plan(flow: factory.Flow) -> Outcome:
     reads = pipeline.git_reads(job.checkouts)
     res = run.agent("plan", job.brief.prompt(
         "plan", triage=job.triage, denied=prompt_loader.code_list(diffguard.denied_paths(layer)),
-        checks=pipeline.check_list(layer)),
+        checks=pipeline.check_list(layer), journeys=journeys.guidance(layer.verify.feature_map, planning=True)
+        if layer.verify else ""),
                     job.ws, role="plan", allowed_tools=prompt_loader.bash_rules(config.DEFAULT_ALLOW_BASH + reads),
                     json_schema=pipeline.PLAN_SCHEMA)
     if not res.ok or not isinstance(res.structured, dict):
