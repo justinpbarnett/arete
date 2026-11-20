@@ -1,6 +1,8 @@
 import base64
 import json
 import sqlite3
+import subprocess
+import tempfile
 import threading
 import unittest
 from contextlib import ExitStack, redirect_stderr
@@ -12,7 +14,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from arete import (
-    accounts, api_http, chat, config, contract, control, dashboard, events, gh, idempotency, jira, pipeline, principals,
+    accounts, api_check, api_http, chat, config, contract, control, dashboard, events, gh, idempotency, jira, pipeline, principals,
     screening, serve, tailnet, tasks, triage, util,
 )
 from arete.store import approvals as approvals_store
@@ -20,11 +22,32 @@ from arete.store import chats as chats_store
 from arete.store import db
 from arete.store import idempotency as claims
 from arete.store import triage as triage_store
-from tests import support
+from tests import support, versioned_api_fixture
 
 
 def setUpModule():
     support.isolate_live_state()
+
+
+class ApiCheckTests(unittest.TestCase):
+    serial = True
+    class_timeout = 20  # Hosted macOS reached streaming but exhausted the unit-test budget.
+
+    def test_api_check(self):
+        with tempfile.TemporaryDirectory(prefix="arete-api-cli-") as temp:
+            root = Path(temp).resolve()
+            command = api_check.child_command(versioned_api_fixture.SOURCE, "from arete.cli import main; sys.exit(main())",
+                                              "api", "check")
+            result = subprocess.run(command, cwd=root, env=api_check.isolated_env(root),
+                                    timeout=api_check.CHECK_TIMEOUT + 5, check=False)
+            self.assertEqual(result.returncode, 0, "the API smoke command failed; see its scenario output above")
+
+
+class ApiCompatibilityTests(unittest.TestCase):
+    serial = True
+
+    def test_api_diff(self):
+        versioned_api_fixture.evolution_temp()
 
 
 class VersionedApiTests(unittest.TestCase):

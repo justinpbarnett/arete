@@ -16,6 +16,13 @@ A task has many runs. An answer, a resume and a step each start a **new** run wi
 
 Run the recipes from this checkout, so `uv run arete` runs this checkout's code. The server is `arete serve`, or `arete dashboard` alone. The recipes call only the server that works on their own state and config: once it listens, the server writes where it listens, its state folder and its config file to `server.json` in the state folder. `ARETE_SERVER=https://NAME:PORT` or `http://HOST:PORT` names a server and skips that check.
 
+## Versioned API
+
+For direct integrations use `/api/v1/meta` to check the server's API version and contract hash, and `/api/v1/contract` to discover operations.
+The recipes still use the existing routes; their response and replay behavior does not change with the addition of versioned routes.
+If a keyed task start loses its reply, resend the same key with the same arguments; a different body with that key is refused.
+Before changing the registry or how an operation behaves, follow the [API verification and compatibility workflow](../README.md#checking-api-changes).
+
 ## Output
 
 Every recipe prints JSON lines on stdout and nothing else, so read stdout one line at a time and parse each line. `just` itself echoes the command it runs on stderr.
