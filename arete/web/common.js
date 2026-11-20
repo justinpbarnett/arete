@@ -280,6 +280,7 @@ async function call(path, body, signal) {
     const response = await fetch(path, options).catch(() => { throw new NoAnswer("The connection to arete failed."); });
     noteServedCode(response);
     const data = await response.json().catch(() => ({ error: `The server answered ${response.status} with no JSON.` }));
+    if (!changes && data && typeof data === "object" && !data.seq) data.seq = response.headers?.get?.("Arete-Seq");
     if (!response.ok) throw new ErrorAnswer(data.error || `The server answered ${response.status}.`, data, response.status);
     return data;
   } finally {

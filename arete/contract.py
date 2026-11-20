@@ -1,0 +1,416 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import threading
+from collections import Counter
+from functools import cache
+
+from . import refusals
+
+MINOR = 0
+VERSION = f"1.{MINOR}"
+OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
+STRING = {"type": "string"}
+INTEGER = {"type": "integer"}
+NUMBER = {"type": "number"}
+BOOLEAN = {"type": "boolean"}
+JSON = {"type": ["object", "array", "string", "number", "boolean", "null"]}
+
+
+def obj(properties, required=None, additional=False):
+    return {"type": "object", "properties": properties,
+            "required": list(properties) if required is None else required, "additionalProperties": additional}
+
+
+def array(items):
+    return {"type": "array", "items": items}
+
+
+def mapping(values):
+    return obj({}, [], values)
+
+
+TASK = obj({**dict.fromkeys(("id", "repo", "title", "body", "kind", "state", "parent", "created", "updated"), STRING),
+            "version": INTEGER})
+RUN_TEXT = ("id", "kind", "repo", "issue", "loop", "loop_kind", "started", "finished", "status", "summary", "pr_url",
+            "branch", "only_step", "files_purged", "mined_until", "stop_asked", "ab_held", "measured_at", "landed",
+            "device", "model", "runner", "log", "trigger", "queue", "grp", "lock", "moved", "engine_sha",
+            "label_pending", "wait_minutes")
+RUN_NUMBERS = ("pid", "cost_usd", "tokens_in", "tokens_out", "active_seconds", "verify_seconds", "verify_open_seconds",
+               "repair_calls", "schema_version", "attempts", "version")
+RUN = obj({**{k: {"type": ["string", "null"]} for k in RUN_TEXT},
+           **{k: {"type": ["number", "null"]} for k in RUN_NUMBERS}}, ["id", "status", "version"])
+RUN["properties"]["issue"] = {"type": ["integer", "string", "null"]}
+RUN["properties"]["version"] = INTEGER
+NULL_TEXT = {"type": ["string", "null"]}
+LOOP = obj({"name": STRING, "enabled": BOOLEAN, "kind": STRING, "running": STRING, "pending": INTEGER,
+            "dead": {"type": ["integer", "array"], "items": mapping(JSON)},
+            "prompt": STRING, "model": STRING, "state": mapping(JSON), "runs": array(RUN)},
+           ["name", "enabled"])
+INCIDENT = obj({**dict.fromkeys(("state", "phase", "waiting", "class", "source", "repo", "signature", "first_seen",
+                               "last_seen", "decision", "reason", "decided", "retry_at", "recovery", "closed",
+                               "decision_line", "repair_line"), STRING),
+                "id": INTEGER, "count": INTEGER, "confidence": NUMBER, "injection": INTEGER, "alerted": INTEGER,
+                "evidence": STRING, "answers": mapping(JSON), "notes_total": INTEGER,
+                "notes": array(obj({"ts": STRING, "note": STRING}))},
+               ["id", "state"])
+TRIAGE = obj({**dict.fromkeys(("ref", "source", "tracker", "repo", "route", "title", "url", "updated", "size", "why",
+                             "ts", "kind", "parent"), NULL_TEXT), "ready": JSON, "code": JSON, "closed": JSON,
+              "in_sprint": JSON, "cost": NUMBER,
+              **{k: array(STRING) for k in ("questions", "plan", "repos", "assumptions", "checks")}}, ["ref", "title"])
+RESEARCH = obj({**dict.fromkeys(("ref", "source", "title", "url", "updated", "status", "summary", "report", "error",
+                               "run_id", "ts", "ticket", "basis", "answered_by", "filed_path", "filed_url", "moved",
+                               "delivered"), NULL_TEXT), "cost": NUMBER}, ["ref", "status"])
+CHAT = obj({"id": INTEGER, **dict.fromkeys(("title", "project", "created", "updated", "summary", "folder",
+                                          "runner", "draft_title", "draft_body"), STRING),
+            "busy": {"type": ["boolean", "integer"]}, "paid_usd": {"type": ["number", "null"]},
+            "spent": {"type": ["number", "null"]}, "messages": array(obj({"id": INTEGER, "sender": STRING, "text": NULL_TEXT,
+              "cost": NUMBER, "paid_usd": {"type": ["number", "null"]}, "ts": STRING}))}, ["id", "title"])
+RESOURCE = {
+    "task": TASK, "run": RUN,
+    "project": obj(dict.fromkeys(("id", "name", "github", "path"), STRING)),
+    "line": obj({"id": STRING, "kind": STRING, "repo": STRING, "enabled": BOOLEAN}),
+    "view": obj({"id": STRING, "label": STRING, "data": mapping(JSON)}, ["id", "label"]),
+    "step": obj({"id": INTEGER, "run_id": STRING, "name": STRING, "model": STRING, "runner": STRING,
+                 "cost_usd": NUMBER, "seconds": NUMBER}),
+    "loop": obj({"id": STRING, "enabled": BOOLEAN, "detail": LOOP}),
+    "incident": obj({"id": STRING, "detail": INCIDENT}),
+    "triage": obj({"id": STRING, "detail": TRIAGE}),
+    "research": obj({"id": STRING, "detail": RESEARCH}),
+    "chat": obj({"id": STRING, "detail": CHAT}),
+}
+ERRORS = [{"code": code, "status": status, "description": description} for code, status, description in (
+    ("not_found", 404, "The selected resource does not exist."),
+    ("unavailable", 404, "No saved diff is available."),
+    ("unknown_field", 422, "Undeclared request fields; fields lists rejected paths."),
+    ("invalid_input", 400, "The input does not match the operation schema."),
+    ("client_too_old", 400, "Upgrade the client to required_version."),
+    ("version_conflict", 409, "Refresh current before trying again."),
+)]
+
+
+def envelope(properties):
+    return obj({"seq": {"type": "string", "pattern": r"^\d+\.\d+$"}, **properties})
+
+
+def operation(name, path, result, inputs=None, example=None, method="GET"):
+    shown = sample(result)
+    if "seq" in result.get("properties", {}):
+        shown["seq"] = "0.1"
+    return {"name": name, "method": method, "path": "/api/v1/" + path,
+            "input": inputs or obj({}), "result": result, "errors": [r["code"] for r in ERRORS],
+            "example": {"input": example or {}, "result": shown}}
+
+
+def sample(schema):
+    if "anyOf" in schema:
+        return sample(schema["anyOf"][0])
+    if "enum" in schema:
+        return schema["enum"][0]
+    kind = schema["type"]
+    if isinstance(kind, list):
+        return None if "null" in kind else sample({"type": kind[0]})
+    if kind == "object":
+        return {k: sample(v) for k, v in schema.get("properties", {}).items() if k in schema.get("required", [])}
+    return {"string": "example", "integer": 1, "number": 1, "boolean": True, "array": []}[kind]
+
+
+for _error in ERRORS:
+    _details = ({"fields": array(STRING)} if _error["code"] == "unknown_field" else
+                {"required_version": STRING} if _error["code"] == "client_too_old" else
+                {"current": RUN} if _error["code"] == "version_conflict" else {})
+    _error["schema"] = obj({"error": STRING, "code": {"type": "string", "enum": [_error["code"]]}, **_details})
+    _error["example"] = {**sample(_error["schema"]), "error": _error["description"]}
+
+
+META = envelope({"api": obj({"version": STRING, "minor": INTEGER, "contract_sha": STRING}),
+                 "server": obj({"engine_sha": STRING}), "oldest_client": obj(dict.fromkeys(OLDEST_CLIENT, STRING)),
+                 "instance": obj(dict.fromkeys(("id", "tag", "name", "created"), STRING)),
+                 "schema": obj({"version": INTEGER, "oldest_writer": {"type": ["integer", "null"]}}),
+                 "stream": obj({"complete": BOOLEAN, "head": STRING, "trim": mapping(STRING)})})
+SETTINGS = obj({"max_parallel": INTEGER, "max_parallel_per_repo": INTEGER, "parallel_max": INTEGER,
+                "aliases": array(STRING), "models": mapping(STRING), "defaults": mapping(STRING)})
+PANEL = obj({"rows": JSON, "error": STRING}, [])
+HEALTH = obj({"checks": PANEL, "alerts": PANEL, "incidents": PANEL, "now": STRING, "serve": mapping(JSON), "state": STRING,
+              "devices": PANEL, "workspaces": PANEL})
+SIDEBAR = obj({"now": STRING, "needs_you": INTEGER, "running": INTEGER, "questions": INTEGER, "health": STRING,
+               "serve": mapping(JSON), "chat": obj({"busy": BOOLEAN, "draft": BOOLEAN})})
+ASK = obj({**dict.fromkeys(("id", "repo", "ticket", "run", "step", "asked", "why", "tried", "reminded"), STRING),
+           "questions": array(mapping(JSON))})
+FEED_LINE = obj({"id": INTEGER, "run_id": STRING, "ts": STRING, "kind": STRING, "text": STRING})
+ERROR = obj({"code": STRING, "status": INTEGER, "description": STRING, "schema": mapping(JSON), "example": mapping(JSON)})
+OPERATION = obj({"name": STRING, "method": STRING, "path": STRING, "input": mapping(JSON),
+                 "result": mapping(JSON), "errors": array(STRING),
+                 "example": obj({"input": mapping(JSON), "result": mapping(JSON)})})
+ALIAS = obj({"method": STRING, "path": STRING, "provider": STRING, "adapter": STRING, "input": mapping(JSON),
+             "actions": mapping(mapping(JSON)), "transport": BOOLEAN}, ["method", "path", "provider", "adapter", "input"])
+OPERATIONS = [operation("meta.get", "meta", META),
+              operation("contract.get", "contract", envelope({"operations": array(OPERATION),
+                        "errors": array(ERROR), "aliases": array(ALIAS), "contract_sha": STRING})),
+              operation("error.list", "errors", envelope({"errors": array(ERROR)})),
+              operation("screen.get", "screen", envelope({"sidebar": SIDEBAR, "asks": obj({"asks": array(ASK)}),
+                        "view": mapping(JSON)}), obj({"view": STRING, "id": STRING}, []))]
+PLURALS = {name: name + "s" for name in RESOURCE}
+PLURALS.update(research="research", triage="triage")
+for _name, _shape in RESOURCE.items():
+    _plural = PLURALS[_name]
+    _selectors = {"run": STRING} if _name == "step" else {}
+    OPERATIONS += [operation(f"{_name}.list", _plural, envelope({_plural: array(_shape)}),
+                             obj(_selectors, list(_selectors)), {k: "example" for k in _selectors}),
+                   operation(f"{_name}.get", _plural + "/{id}", envelope({_name: _shape}),
+                             obj({"id": STRING, **_selectors}), {"id": "example", **{k: "example" for k in _selectors}})]
+OPERATIONS += [
+    operation("run.diff", "runs/{id}/diff", envelope({"diff": STRING}), obj({"id": STRING}), {"id": "example"}),
+    operation("task.history", "tasks/{id}/history", envelope({"comments": array(obj({"version": INTEGER,
+              "author": STRING, "body": STRING, "ts": STRING})), "runs": array(RUN)}),
+              obj({"id": STRING}), {"id": "example"}),
+    operation("line_stream.read", "line-stream", envelope({"lines": array(FEED_LINE), "after": INTEGER}),
+              obj({"run": STRING, "after": STRING}, ["run"]), {"run": "example"}),
+    operation("settings.get", "settings", envelope({"settings": SETTINGS})),
+    operation("health.get", "health", envelope({"health": HEALTH})),
+    operation("batch.run", "batch", envelope({"results": array(mapping(JSON))}),
+              obj({"requests": array(obj({"operation": STRING, "input": mapping(JSON)}, ["operation"]))}),
+              {"requests": [{"operation": "meta.get"}]}, "POST"),
+    operation("usage.record", "usage", obj({}), obj({"kind": STRING, "device": STRING, "tab": STRING,
+              "view": STRING, "via": STRING, "name": STRING, "ms": INTEGER}, ["kind", "device", "tab", "view"]),
+              {"kind": "visit", "device": "desktop", "tab": "0123456789abcdef", "view": "live", "via": "open"}, "POST"),
+]
+BY_NAME = {op["name"]: op for op in OPERATIONS}
+BY_NAME["batch.run"]["result"]["properties"]["results"]["items"] = {
+    "anyOf": [op["result"] for op in OPERATIONS if op["method"] == "GET"]}
+BY_NAME["batch.run"]["input"]["properties"]["requests"].update(minItems=1, maxItems=50)
+BY_NAME["batch.run"]["input"]["properties"]["requests"]["items"]["properties"]["operation"] = {
+    "type": "string", "enum": [op["name"] for op in OPERATIONS if op["method"] == "GET"]}
+BY_NAME["usage.record"]["input"]["properties"].update(
+    kind={"type": "string", "enum": ["visit", "action"]},
+    device={"type": "string", "enum": ["desktop", "phone"]},
+    tab={"type": "string", "pattern": "^[0-9a-f]{16}$"},
+    ms={"type": "integer", "minimum": 0, "maximum": 86400000})
+BY_NAME["meta.get"]["example"]["result"].update(
+    api={"version": VERSION, "minor": MINOR, "contract_sha": "0" * 64},
+    server={"engine_sha": "example-engine"}, oldest_client=OLDEST_CLIENT)
+ALIASES = []
+USES = Counter()
+USE_LOCK = threading.Lock()
+
+
+def publish():
+    return {"operations": OPERATIONS, "errors": ERRORS, "aliases": ALIASES}
+
+
+@cache
+def digest():
+    return hashlib.sha256(json.dumps(publish(), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+class Problem(refusals.Stated):
+    def __init__(self, code, message, **details):
+        super().__init__(next(r["status"] for r in ERRORS if r["code"] == code), message)
+        self.code, self.details = code, details
+
+
+def unknown(value, schema, path=""):
+    found = []
+    if isinstance(value, dict):
+        properties = schema.get("properties", {})
+        extra = schema.get("additionalProperties", True)
+        for key, item in value.items():
+            at = f"{path}.{key}" if path else key
+            if key in properties:
+                found.extend(unknown(item, properties[key], at))
+            elif extra is False:
+                found.append(at)
+            elif isinstance(extra, dict):
+                found.extend(unknown(item, extra, at))
+    elif isinstance(value, list) and "items" in schema:
+        for i, item in enumerate(value):
+            found.extend(unknown(item, schema["items"], f"{path}[{i}]"))
+    return sorted(found)
+
+
+def reject_unknown(value, schema, path=""):
+    if fields := unknown(value, schema, path):
+        raise Problem("unknown_field", "Undeclared fields: " + ", ".join(fields), fields=fields)
+
+
+def validate(value, schema, path="input"):
+    if "anyOf" in schema:
+        for candidate in schema["anyOf"]:
+            try:
+                validate(value, candidate, path)
+                return
+            except Problem:
+                pass
+        raise Problem("invalid_input", f"{path} matches no declared result shape")
+    reject_unknown(value, schema)
+    kinds = schema.get("type", [])
+    kinds = [kinds] if isinstance(kinds, str) else kinds
+    kind = ("null" if value is None else "boolean" if isinstance(value, bool) else "integer" if isinstance(value, int)
+            else "number" if isinstance(value, float) else "string" if isinstance(value, str)
+            else "array" if isinstance(value, (list, tuple)) else "object" if isinstance(value, dict) else "unknown")
+    if kinds and kind not in kinds and not (kind == "integer" and "number" in kinds):
+        raise Problem("invalid_input", f"{path} must be {' or '.join(kinds)}")
+    if "enum" in schema and value not in schema["enum"]:
+        raise Problem("invalid_input", f"{path} is not a declared value")
+    if isinstance(value, str) and "pattern" in schema and not re.fullmatch(schema["pattern"], value):
+        raise Problem("invalid_input", f"{path} has an invalid format")
+    if kind in ("integer", "number") and (value < schema.get("minimum", value) or value > schema.get("maximum", value)):
+        raise Problem("invalid_input", f"{path} is outside its allowed range")
+    if isinstance(value, (list, tuple)) and not schema.get("minItems", 0) <= len(value) <= schema.get("maxItems", len(value)):
+        raise Problem("invalid_input", f"{path} has an invalid number of items")
+    if isinstance(value, dict):
+        if missing := set(schema.get("required", [])) - value.keys():
+            raise Problem("invalid_input", f"{path} needs {', '.join(sorted(missing))}")
+        for key, item in value.items():
+            child = schema.get("properties", {}).get(key, schema.get("additionalProperties"))
+            if isinstance(child, dict):
+                validate(item, child, f"{path}.{key}")
+    if isinstance(value, (list, tuple)) and "items" in schema:
+        for i, item in enumerate(value):
+            validate(item, schema["items"], f"{path}[{i}]")
+
+
+def match(method, path):
+    for op in OPERATIONS:
+        if method == op["method"] and (found := re.fullmatch(op["path"].replace("{id}", "([^/]+)"), path)):
+            return op, ({"id": found[1]} if found.groups() else {})
+    return None
+
+
+def fields(names):
+    return obj(dict.fromkeys(names.split(), JSON), [])
+
+
+SESSION_INPUT = fields("prompt device model runner tools repo budget_usd")
+ALIAS_INPUTS = {
+    "post_task": fields("repo prompt title kind ticket force"),
+    "post_usage": BY_NAME["usage.record"]["input"],
+    "post_settings": obj({"max_parallel": JSON, "max_parallel_per_repo": JSON,
+                          "models": {**mapping(STRING), "type": ["object", "null"]}}, []),
+    "post_capture": fields("kind text expected actual steps"),
+    "post_capture_context": obj({"view": JSON, "screen": JSON,
+                                 "detail": {**fields("kind id"), "type": ["object", "null"]}}, []),
+    "post_capture_submit": fields("id revision"),
+    "post_chat_new": fields("project"),
+    "post_loop_new": fields("sentence name repo model"),
+    "post_incident_switch": fields("on"),
+    "post_push_subscribe": obj({"endpoint": JSON, "expirationTime": JSON, "label": JSON,
+                                "keys": fields("auth p256dh")}, []),
+    "post_push_remove": fields("id"),
+    "post_sessions": SESSION_INPUT,
+    "post_approval": fields("approve"),
+}
+
+
+def alias_input(provider, rest):
+    if provider == "post_run":
+        action = rest.partition("/")[2]
+        if action.startswith("steps/"):
+            return obj({"base_version": JSON, "set": mapping(JSON)}, [])
+        return fields("text" if action == "answer" else "base_version step" if action == "resume" else "base_version")
+    if provider == "post_chat":
+        if rest.endswith("/sessions"):
+            return SESSION_INPUT
+        return fields("text") if rest.endswith("/send") else obj({})
+    if provider == "post_session":
+        return fields("text") if rest.endswith("/send") else obj({})
+    if provider == "post_triage":
+        return fields("questions answers repo") if rest.endswith("/send") else fields("force")
+    if provider == "post_ask":
+        answer = {"type": ["object", "null"], "properties": {
+                  "text": STRING, "secret": STRING, "choice": {"type": ["string", "integer", "array"],
+                  "items": {"type": ["string", "integer"]}}, "done": BOOLEAN, "declined": BOOLEAN},
+                  "additionalProperties": False}
+        return obj({"answers": {**array(answer), "type": ["array", "null"]}, "recommended": BOOLEAN, "stop": BOOLEAN}, [])
+    return ALIAS_INPUTS.get(provider, obj({}))
+
+
+ALIAS_ROUTES = (
+    ("GET", "/api/meta", "get_meta"),
+    ("GET", "/api/push", "get_push"),
+    ("GET", "/api/sidebar", "get_sidebar"),
+    ("GET", "/api/live", "get_live"),
+    ("GET", "/api/runs", "get_runs"),
+    ("GET", "/api/runs/*", "get_run"),
+    ("GET", "/api/tasks", "get_tasks"),
+    ("GET", "/api/tasks/*", "get_task"),
+    ("GET", "/api/asks", "get_asks"),
+    ("GET", "/api/health", "get_health"),
+    ("GET", "/api/triage", "get_triage"),
+    ("GET", "/api/outcomes", "get_outcomes"),
+    ("GET", "/api/find", "get_find"),
+    ("GET", "/api/usage", "get_usage"),
+    ("GET", "/api/settings", "get_settings"),
+    ("GET", "/api/capture", "get_capture"),
+    ("GET", "/api/chats", "get_chats"),
+    ("GET", "/api/chats/*", "get_chat"),
+    ("GET", "/api/log/*", "get_log"),
+    ("GET", "/api/loops", "get_loops"),
+    ("GET", "/api/loops/*", "get_loop"),
+    ("GET", "/api/incidents", "get_incidents"),
+    ("GET", "/api/incidents/*", "get_incident"),
+    ("GET", "/api/feed/*", "get_feed"),
+    ("GET", "/api/sessions", "get_sessions"),
+    ("POST", "/api/usage", "post_usage"),
+    ("POST", "/api/capture", "post_capture"),
+    ("POST", "/api/capture/context", "post_capture_context"),
+    ("POST", "/api/capture/submit", "post_capture_submit"),
+    ("POST", "/api/capture/context/drop", "post_capture_context_drop"),
+    ("POST", "/api/capture/discard", "post_capture_discard"),
+    ("POST", "/api/capture/evidence/*", "post_capture_evidence"),
+    ("POST", "/api/settings", "post_settings"),
+    ("POST", "/api/chats/new", "post_chat_new"),
+    ("POST", "/api/chats/*", "post_chat"),
+    ("POST", "/api/incidents/switch", "post_incident_switch"),
+    ("POST", "/api/incidents/*", "post_incident"),
+    ("POST", "/api/loops/new", "post_loop_new"),
+    ("POST", "/api/loops/*", "post_loop"),
+    ("POST", "/api/runs/*", "post_run"),
+    ("POST", "/api/push/subscribe", "post_push_subscribe"),
+    ("POST", "/api/push/remove", "post_push_remove"),
+    ("POST", "/api/push/test", "post_push_test"),
+    ("POST", "/api/asks/*", "post_ask"),
+    ("POST", "/api/approvals/*", "post_approval"),
+    ("POST", "/api/tasks", "post_task"),
+    ("POST", "/api/sessions", "post_sessions"),
+    ("POST", "/api/sessions/*", "post_session"),
+    ("POST", "/api/devices/*", "post_device"),
+    ("POST", "/api/triage/refresh", "post_triage_refresh"),
+    ("POST", "/api/triage/*", "post_triage"),
+    ("POST", "/api/checks/run", "post_checks_run"),
+    ("POST", "/api/skipped/*", "post_skipped"),
+    ("POST", "/api/proposals/*", "post_proposal"),
+    ("POST", "/api/serve/install", "post_serve_install"),
+)
+ALIAS_VARIANTS = {"post_run": ("stop", "answer", "resume", "repair", "steps/{step}"),
+                  "post_chat": ("send", "file", "drop", "sessions", "sessions/{session}/stop"),
+                  "post_session": ("send", "stop"), "post_triage": ("send", "research"),
+                  "post_incident": ("dismiss", "retry", "cancel"),
+                  "post_loop": ("enable", "disable", "start", "try"), "post_device": ("probe",),
+                  "post_proposal": ("done", "approve", "reject"), "post_skipped": ("run",),
+                  "post_ask": ("answer",), "post_capture_evidence": ("drop",),
+                  "get_chat": ("sessions", "sessions/{session}/report")}
+ALIASES.extend({"method": method, "path": path, "provider": provider, "adapter": "frozen-v0",
+                "input": alias_input(provider, "") if method == "POST" else obj({}),
+                "actions": {action: alias_input(provider, "id/" + action) for action in ALIAS_VARIANTS.get(provider, ())}}
+               for method, path, provider in ALIAS_ROUTES)
+ALIASES[:0] = [{"method": method, "path": path, "provider": provider, "adapter": "identity", "transport": True,
+               "input": mapping(STRING) if method == "POST" else obj({})} for method, path, provider in (
+    ("POST", "/api/capture/evidence", "stage_evidence"),
+    ("GET", "/api/capture/evidence/*", "send_evidence"),
+    ("GET", "/api/runs/*/events", "send_events"),
+    ("GET", "/api/events", "event_stream.serve"),
+)]
+
+
+def alias_match(method, path):
+    for entry in ALIASES:
+        if entry["method"] != method:
+            continue
+        template = entry["path"]
+        if (template == path or template.endswith("/*") and path.startswith(template[:-1])
+                or "*" in template and re.fullmatch(re.escape(template).replace(r"\*", "[^/]+"), path)):
+            return entry
+    return None

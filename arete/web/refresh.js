@@ -21,22 +21,32 @@ async function refresh() {
   const at = route;
   const label = VIEWS[at.view].label;
   try {
-    const [draw, sidebar, asks] = await Promise.all([LOADERS[at.view](at), call("/api/sidebar").catch(() => null), call("/api/asks").catch(() => null)]);
+    const { coherent } = await import("./ui-snapshot.js");
+    const auxiliary = (path) => () => call(path).catch(() => null);
+    const group = await coherent([() => LOADERS[at.view](at), auxiliary("/api/sidebar"), auxiliary("/api/asks")]);
     if (mine !== refreshCount) return;
     if (reloadIfNewCode()) return;
-    if (sidebar) drawSidebar(sidebar);
-    if (asks) drawWaiting(asks.asks);
+    if (!group) { schedule(LIVE_MS); return; }
+    const [draw, sidebar, asks] = group;
     const drawn = draw();
     const held = drawn === HELD;
-    const delay = held ? SLOW_MS : drawn || SLOW_MS;
+    if (!held) {
+      if (sidebar) drawSidebar(sidebar);
+      else clearSidebar();
+      if (asks) drawWaiting(asks.asks);
+      else hideWaiting();
+    }
+    const partial = !sidebar || !asks;
+    const delay = held ? SLOW_MS : partial ? LIVE_MS : drawn || SLOW_MS;
     refreshDelay = delay;
     if (held) tickLiveAgos(currentSection().querySelectorAll("time.ago"));
     else lastGood.set(at.view, new Date());
     const shown = held ? "held while you edit" : `updated ${new Date().toLocaleTimeString([], { hour12: false })}`;
-    status("", [label, shown, `refreshes every ${delay / 1000} s`].join(" · "), newCodeNote());
+    status(partial ? "fault" : "", [label, shown, ...(partial ? ["sidebar or questions unavailable"] : []),
+      `refreshes every ${delay / 1000} s`].join(" · "), newCodeNote());
     document.querySelectorAll(".readout").forEach((r) => r.classList.remove("stale"));
     afterDraw();
-    if (asks) showAskedCard();
+    if (!held && asks) showAskedCard();
     schedule(delay);
   } catch (e) {
     if (mine !== refreshCount) return;
@@ -54,6 +64,18 @@ function setCount(view, n, words) {
   box.textContent = n ? String(n) : "";
   if (n) a.setAttribute("aria-label", `${VIEWS[view].label}, ${words(n)}`);
   else a.removeAttribute("aria-label");
+}
+
+function clearSidebar() {
+  for (const view of ["live", "runs", "triage"]) setCount(view, 0);
+  for (const id of ["count-health", "count-console", "serve-line"]) {
+    document.getElementById(id).textContent = "";
+  }
+}
+
+function hideWaiting() {
+  document.getElementById("waiting").hidden = true;
+  setWaitingCount(0);
 }
 
 function drawSidebar(f) {

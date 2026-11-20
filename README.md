@@ -2601,12 +2601,20 @@ Successful run writes retain their legacy response bodies and identify the commi
 Every displayed run action sends its selected `base_version`.
 A stale action shows the conflict once, refreshes and sends no second POST; a deliberate action after refresh uses the new displayed version.
 
-The missing-version grace deadline starts inactive.
-Migration and startup never activate it.
-The later v1 screen release must explicitly call `arete.store.writes.activate_grace()` once; it persists activation plus 30 days, and repeated activation cannot extend it.
+Migration leaves the missing-version grace deadline inactive.
+Serving `/ui.html` for the first time activates the 30-day grace period.
+The deadline is persisted and does not move on later views or restarts.
 Before that deadline, legacy commands without versions work.
 At the exact deadline they return 409 `version_conflict` with the current persisted object.
 Explicit versions always compare; internal conditional writes remain versionless.
+
+`GET /api/v1/contract` lists the versioned operations with their inputs, result shapes, examples, and errors.
+`GET /api/v1/meta` reports the API version, engine and client versions, and contract hash.
+Legacy paths retain their existing fields and report `Deprecation: true`.
+Read results include a `seq` cursor and carry it in `Arete-Seq`; legacy writes keep their receipt in the header only.
+`POST /api/v1/batch` accepts up to 50 declared reads and evaluates them against one database snapshot.
+If dashboard fragments disagree, both dashboards refetch at most twice, keep the last coherent display if they still disagree, and try again on the next refresh.
+If a classic dashboard sidebar or questions request fails, the view can still refresh without showing the unavailable fragment as current.
 
 ## Rules
 

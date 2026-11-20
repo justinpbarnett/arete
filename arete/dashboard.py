@@ -14,11 +14,13 @@ from typing import NoReturn
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import (
+    api,
     board,
     capture,
     chat,
     codebase,
     config,
+    contract,
     control,
     devices,
     event_stream,
@@ -178,7 +180,8 @@ def refusal_answer(e: Exception) -> dict:
     if getattr(e, "code", None):
         answer["code"] = e.code
     if hasattr(e, "current"):
-        answer["current"] = e.current
+        answer["current"] = api.run_object(e.current) if e.current and "status" in e.current else e.current
+    answer.update(getattr(e, "details", {}))
     if isinstance(e, control.KeptFailure):
         answer["kept"] = True
     return answer
@@ -226,17 +229,34 @@ class Handler(BaseHTTPRequestHandler):
             self.write_receipt = None
             self.keyed_delivery = False
             self.idempotent_replayed = False
+            self.read_seq = None
+            self.parsed_body = None
+            self.alias = None
             return self.answer_as_person(method)
 
     def answer_as_person(self, method: str) -> None:
         try:
             parts = urlsplit(self.path)
             path = parts.path
+            self.alias = contract.alias_match(method, path)
             self.admit(method, path)
+            if self.alias:
+                with contract.USE_LOCK:
+                    contract.USES[(method, self.alias["path"])] += 1
+            if not path.startswith(webhooks.HOOK_PATH):
+                client = self.headers.get("X-Arete-Client", "")
+                if found := re.fullmatch(r"(cli|mcp|web)/0+\.[0-9]+(?:\..*)?", client):
+                    required = contract.OLDEST_CLIENT[found[1]]
+                    raise contract.Problem("client_too_old", f"This client needs version {required}", required_version=required)
             if self.restarting:
                 self.drop_body()
                 raise Restarting(503, RESTARTING)
+            if method == "POST" and self.alias and path != EVIDENCE_PATH:
+                rest = path[len(self.alias["path"]) - 1:] if self.alias["path"].endswith("/*") else ""
+                contract.reject_unknown(self.body(), contract.alias_input(self.alias["provider"], unquote(rest)))
             if method == "GET" and path in WEB_BY_PATH:
+                if path == "/ui.html":
+                    writes.activate_grace()
                 return self.send(200, *WEB_BY_PATH[path], "no-cache")
             if method == "POST" and path.startswith(webhooks.HOOK_PATH):
                 got = webhooks.receive(unquote(path[len(webhooks.HOOK_PATH):]), self.headers, self.raw_body())
@@ -250,9 +270,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, self.stage_evidence(query))
             if method == "GET" and (item := EVIDENCE_ITEM.fullmatch(path)):
                 return self.send_evidence(int(item[1]))
-            if method == "GET" and (events := EVENTS_PATH.fullmatch(path)):
-                return self.send_events(unquote(events[1]), query)
-            result = self.api(method, path, query)
+            if method == "GET" and (run_events := EVENTS_PATH.fullmatch(path)):
+                return self.send_events(unquote(run_events[1]), query)
+            if method == "GET" or path == "/api/v1/batch":
+                with foundation.one_read() as conn:
+                    self.read_seq = events.metadata(conn)["head"]
+                    result = self.api(method, path, query)
+                    if isinstance(result, dict) and not path.startswith("/api/v1/principals"):
+                        result = {**result, "seq": self.read_seq}
+            else:
+                result = self.api(method, path, query)
             if method == "POST" and self.write_receipt is None:
                 self.write_receipt = event_store.committed_receipt()
                 if isinstance(result, dict) and isinstance(result.get("run"), str) and result["run"]:
@@ -327,6 +354,8 @@ class Handler(BaseHTTPRequestHandler):
             raise Refusal(403, "A change needs the X-Arete header, which the dashboard page sends.")
 
     def api(self, method: str, path: str, query: dict):
+        if selected := contract.match(method, path):
+            return api.dispatch(self, *selected, query)
         if method == "GET" and path == "/api/v1/principals":
             return principals.listing(**{k: query[k] for k in ("kind", "role", "status") if k in query})
         if method == "GET" and path.startswith("/api/v1/principals/"):
@@ -339,9 +368,6 @@ class Handler(BaseHTTPRequestHandler):
             rest = route_rest(template, path) if verb == method else None
             if rest is not None:
                 try:
-                    if method == "GET":
-                        with foundation.one_read():
-                            return route(self, rest, query)
                     return route(self, rest, query)
                 except NoRoute:
                     break
@@ -440,7 +466,9 @@ class Handler(BaseHTTPRequestHandler):
                              query.get("seconds", ""))
 
     def send_evidence(self, evidence_id: int) -> None:
-        path, row = capture.staged_file(evidence_id)
+        with foundation.one_read() as conn:
+            self.read_seq = events.metadata(conn)["head"]
+            path, row = capture.staged_file(evidence_id)
         total = path.stat().st_size
         first, last, status = 0, total - 1, 200
         wanted = EVIDENCE_RANGE.fullmatch((self.headers.get("Range") or "").strip())
@@ -474,12 +502,15 @@ class Handler(BaseHTTPRequestHandler):
         return self.rfile.read(size)
 
     def body(self) -> dict:
+        if self.parsed_body is not None:
+            return self.parsed_body
         try:
             data = json.loads(self.raw_body(MAX_BODY) or b"{}")
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
             raise Refusal(400, "The request body is not JSON.") from e
         if not isinstance(data, dict):
             raise Refusal(400, "The request body is not a JSON object.")
+        self.parsed_body = data
         return data
 
     def send_json(self, status: int, data, retry_after: int = 0) -> None:
@@ -488,8 +519,10 @@ class Handler(BaseHTTPRequestHandler):
     def send_events(self, run_id: str, query: dict) -> None:
         if not RUN_ID.fullmatch(run_id):
             raise board.NotARunId(f"'{run_id}' is not a run id.")
-        if not run_lines.path(run_id).exists() and not run_store.run_get(run_id, connect=foundation.reader):
-            raise control.NotFound(f"nothing has the id {run_id}")
+        with foundation.one_read() as conn:
+            self.read_seq = events.metadata(conn)["head"]
+            if not run_lines.path(run_id).exists() and not run_store.run_get(run_id, connect=foundation.reader):
+                raise control.NotFound(f"nothing has the id {run_id}")
         start = whole_number(query.get("from", "0"))
         if query.get("follow") != "1":
             found = (line for line in run_lines.read(run_id) if run_lines.seq_of(line) > start)
@@ -506,6 +539,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def end_headers(self) -> None:
         self.send_header("X-Arete-Engine", codebase.STAMP)
+        if not urlsplit(getattr(self, "path", "")).path.startswith(webhooks.HOOK_PATH):
+            self.send_header("Arete-API", contract.VERSION)
+        if getattr(self, "alias", None):
+            self.send_header("Deprecation", "true")
+        if getattr(self, "read_seq", None):
+            self.send_header("Arete-Seq", self.read_seq)
         super().end_headers()
 
     def head(self, status: int, kind: str, cache: str, length: int | None = None) -> None:
@@ -639,13 +678,7 @@ def chat_session_parts(rest: str) -> list[str] | None:
 
 
 def get_meta(handler, rest, query):
-    with foundation.reader() as conn:
-        meta = foundation.metadata(conn)
-        stream = events.metadata(conn)
-    return {"instance": {key: meta[f"instance_{key}"] for key in ("id", "tag", "name", "created")},
-            "schema": {"version": int(meta["schema_version"]),
-                       "oldest_writer": int(meta["oldest_writer"]) if meta["oldest_writer"] is not None else None},
-            "stream": stream}
+    return api.meta()
 
 
 def get_push(handler, rest, query):
@@ -940,63 +973,8 @@ def post_serve_install(handler, rest, query):
     return install_serve(handler.server.inside_serve)
 
 
-ROUTES = (
-    ("GET", "/api/meta", get_meta),
-    ("GET", PUSH_PATH, get_push),
-    ("GET", "/api/sidebar", get_sidebar),
-    ("GET", "/api/live", get_live),
-    ("GET", "/api/runs", get_runs),
-    ("GET", "/api/runs/*", get_run),
-    ("GET", "/api/tasks", get_tasks),
-    ("GET", "/api/tasks/*", get_task),
-    ("GET", "/api/asks", get_asks),
-    ("GET", "/api/health", get_health),
-    ("GET", "/api/triage", get_triage),
-    ("GET", "/api/outcomes", get_outcomes),
-    ("GET", "/api/find", get_find),
-    ("GET", "/api/usage", get_usage),
-    ("GET", "/api/settings", get_settings),
-    ("GET", "/api/capture", get_capture),
-    ("GET", "/api/chats", get_chats),
-    ("GET", "/api/chats/*", get_chat),
-    ("GET", "/api/log/*", get_log),
-    ("GET", "/api/loops", get_loops),
-    ("GET", "/api/loops/*", get_loop),
-    ("GET", "/api/incidents", get_incidents),
-    ("GET", "/api/incidents/*", get_incident),
-    ("GET", "/api/feed/*", get_feed),
-    ("GET", "/api/sessions", get_sessions),
-    ("POST", "/api/usage", post_usage),
-    ("POST", "/api/capture", post_capture),
-    ("POST", "/api/capture/context", post_capture_context),
-    ("POST", "/api/capture/submit", post_capture_submit),
-    ("POST", "/api/capture/context/drop", post_capture_context_drop),
-    ("POST", "/api/capture/discard", post_capture_discard),
-    ("POST", "/api/capture/evidence/*", post_capture_evidence),
-    ("POST", "/api/settings", post_settings),
-    ("POST", "/api/chats/new", post_chat_new),
-    ("POST", "/api/chats/*", post_chat),
-    ("POST", "/api/incidents/switch", post_incident_switch),
-    ("POST", "/api/incidents/*", post_incident),
-    ("POST", "/api/loops/new", post_loop_new),
-    ("POST", "/api/loops/*", post_loop),
-    ("POST", "/api/runs/*", post_run),
-    ("POST", f"{PUSH_PATH}/subscribe", post_push_subscribe),
-    ("POST", f"{PUSH_PATH}/remove", post_push_remove),
-    ("POST", f"{PUSH_PATH}/test", post_push_test),
-    ("POST", "/api/asks/*", post_ask),
-    ("POST", "/api/approvals/*", post_approval),
-    ("POST", "/api/tasks", post_task),
-    ("POST", "/api/sessions", post_sessions),
-    ("POST", "/api/sessions/*", post_session),
-    ("POST", "/api/devices/*", post_device),
-    ("POST", "/api/triage/refresh", post_triage_refresh),
-    ("POST", "/api/triage/*", post_triage),
-    ("POST", "/api/checks/run", post_checks_run),
-    ("POST", "/api/skipped/*", post_skipped),
-    ("POST", "/api/proposals/*", post_proposal),
-    ("POST", "/api/serve/install", post_serve_install),
-)
+ROUTES = tuple((entry["method"], entry["path"], globals()[entry["provider"]]) for entry in contract.ALIASES
+               if not entry.get("transport"))
 
 
 def serve(port: int | None = None, inside_serve: bool = False, host: tailnet.Tailscale | None = None) -> NoReturn:
