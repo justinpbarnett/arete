@@ -117,8 +117,8 @@ def pre_pr_hold(delivery: Delivery | None) -> dict | None:
 
 def recovery_ready(delivery: Delivery, now: datetime, *, allow_same_day: bool = False) -> bool:
     created, deadline = map(ledger_time, (delivery.created, delivery.deadline))
-    return bool(created and deadline and created < deadline <= now
-                and (now.date() > created.date() or allow_same_day is True))
+    return bool(created and deadline and deadline <= now
+                and (now.date() > created.date() or (allow_same_day is True and now.date() == created.date())))
 
 
 def same_installation(delivery: Delivery, repo: str, data: dict, *, migrating_recovery: bool = False) -> bool:
@@ -160,10 +160,8 @@ def reserve(policy: str, repo: str, base: str, deadline: str, title: str, kind: 
             if predecessor is None or not same_installation(predecessor, repo, data, migrating_recovery=allow_same_day):
                 return None
         day = now.date().isoformat()
-        if previous and previous.created[:10] >= day:
-            if not allow_same_day or previous.created[:10] != day:
-                return None
-            if previous.data.get("same_day_recovery") is True:
+        if previous and previous.created[:10] == day:
+            if not allow_same_day or previous.data.get("same_day_recovery") is True:
                 return None
             data = {**data, "same_day_recovery": True}
         if previous and (predecessor.phase != "healthy"
