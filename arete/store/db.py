@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import fcntl
 import os
+import secrets
 import sqlite3
 import stat
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -18,6 +20,7 @@ from .migrations import m0002_foundation_time_shape as time_shape
 TABLES = {"schema_meta": "kept", "schema_migrations": "kept"}
 DB_LOCK = threading.Lock()
 DB_THREAD = threading.local()
+LINUX = sys.platform == "linux"
 _TRANSACTION_DEADLINE: ContextVar[tuple[float, Callable[[], None]] | None] = ContextVar(
     "sqlite_transaction_deadline", default=None)
 
@@ -36,11 +39,41 @@ def nonblocking_transactions(until: float, check: Callable[[], None]):
 
 
 class FixtureConnection(sqlite3.Connection):
+    persist = None
+
     def close(self):
         try:
-            super().close()
+            if persist := self.persist:
+                self.persist = None
+                persist()
         finally:
-            self.handles.close()
+            try:
+                super().close()
+            finally:
+                self.handles.close()
+
+
+def save_fixture(conn: FixtureConnection, original: bytes, parent: int, name: str, opened: os.stat_result):
+    if conn.in_transaction:
+        conn.rollback()
+    data = conn.serialize() if conn.execute("PRAGMA page_count").fetchone()[0] else b""
+    if data == original:
+        return
+    pending = ".arete-db-" + secrets.token_hex(16)
+    fd = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if (current.st_dev, current.st_ino, current.st_nlink) != (opened.st_dev, opened.st_ino, 1):
+            raise PermissionError("isolated database replaced before saving")
+        os.replace(pending, name, src_dir_fd=parent, dst_dir_fd=parent)
+        os.fsync(parent)
+    finally:
+        with suppress(FileNotFoundError):
+            os.unlink(pending, dir_fd=parent)
 
 
 def connect_db(p: Path, readonly: bool = False, create: bool = False, *, streaming: bool = False,
@@ -56,7 +89,7 @@ def connect_db(p: Path, readonly: bool = False, create: bool = False, *, streami
         except BaseException:
             conn.close()
             raise
-    if not paths.ON_MAC or paths.confined(p) is None:
+    if not (paths.ON_MAC or (LINUX and not streaming)) or paths.confined(p) is None:
         raise PermissionError("isolated state requires a supported confined database path")
     deadline = None if timeout is None else time.monotonic() + timeout
     if getattr(DB_THREAD, "active", False) or not DB_LOCK.acquire(timeout=30 if timeout is None else timeout):
@@ -90,13 +123,23 @@ def connect_db(p: Path, readonly: bool = False, create: bool = False, *, streami
         if (not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid != os.getuid()
                 or os.pread(fd, 20, 0)[18:20] == b"\x02\x02"):
             raise PermissionError("linked, non-plain or WAL isolated state database refused")
-        conn = sqlite3.connect(f"file:/dev/fd/{fd}?mode={'ro' if readonly else 'rw'}", uri=True,
+        target = ":memory:" if LINUX else f"file:/dev/fd/{fd}?mode={'ro' if readonly else 'rw'}"
+        conn = sqlite3.connect(target, uri=True,
                                timeout=30 if deadline is None else max(0, deadline - time.monotonic()),
                                factory=FixtureConnection)
         conn.handles = retained if streaming else handles
+        if LINUX:
+            with os.fdopen(os.dup(fd), "rb") as stream:
+                original = stream.read()
+            if original:
+                conn.deserialize(original)
+            if readonly:
+                conn.execute("PRAGMA query_only=ON")
         if not readonly and conn.execute("PRAGMA journal_mode=MEMORY").fetchone()[0] != "memory":
             raise PermissionError("isolated state requires disposable memory journaling")
         conn.execute("PRAGMA synchronous=NORMAL")
+        if LINUX and not readonly:
+            conn.persist = lambda: save_fixture(conn, original, parent, p.name, st)
         if streaming:
             handles.close()
         return conn

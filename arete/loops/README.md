@@ -234,3 +234,77 @@ merge-check = 1
 
 See the [offline fixture recipe](../../README.md#offline-merge-check-fixture) for disposable origins,
 replay answers, blocked recovery and quota checks.
+
+## Release journeys
+
+`release-journeys` ships disabled. Run it after the merged release has been built and installed.
+Put the selection in `release-journeys.toml` in the Arete config directory and run
+`arete loop try release-journeys` to exercise the build and preview findings. Enable the loop for
+manual starts with `arete loop enable release-journeys`, then start it after each release with
+`arete loop start release-journeys`. A release job can run `arete release-journeys --config FILE` directly.
+
+```toml
+python = "/absolute/path/to/release/bin/python"
+build = "0.1.0 code.0123456789ab"
+journeys = ["first-run", "config-protection"]
+```
+
+Set `build` to the output of that interpreter's `-I -m arete.cli --version` after removing the
+`arete ` prefix. Use an immutable wheel installation or a clean, locked release checkout with its
+own virtual environment. The identity check runs before each attempt, including confirmation replays.
+
+| Journey | Actions and invariants |
+|---|---|
+| `first-run` | Run `init`, validate the generated settings, then run `migrate` and `status --json`. Check that migration creates state and status shows zero live runs. |
+| `config-protection` | Seed `max_parallel = 2`, run `init`, then `init --force`. Check that the first call refuses and preserves the exact settings and that the forced call replaces them. Validate the replacement settings. |
+
+Each attempt starts with fresh scratch config and state. The whole run allows at most two journeys,
+16 actions including version and fixture actions, and 60 seconds of execution. Each command has at
+most 10 seconds and 64 KiB of captured stdout. The report keeps command arguments, exit codes,
+checked invariants and the build identity. Product output and fixture contents are discarded.
+The `validate-settings` action runs the selected build's settings loader in the release interpreter
+and requires the generated file. Use a build that includes this validation contract. On Linux,
+SQLite loads disposable state from a checked file into memory and saves committed changes back
+inside the same scratch directory. A repeated existing-file refusal from `init --force` produces
+a finding for the replacement invariant.
+A startup probe failure, build mismatch or scratch error, and an unexpected action exit or timeout
+are recorded as startup, environment, and infrastructure outcomes respectively.
+
+An invariant has to fail twice on the same pinned build before it becomes a finding. Inconsistent
+replays are inconclusive. Findings are coalesced by journey and invariant across builds. Reports
+remain under `release-journeys/runs/` in the Arete state directory. The first report for each
+fingerprint is linked from `release-journeys/findings/`. A trial writes a run report and previews
+findings without reserving their fingerprints. The shipped loop keeps findings local for human review.
+A completed run exits 0, including a confirmed product failure. A blocked run exits 1 unless it also
+has a confirmed finding to report. Read the per-journey outcomes when a run reports `partial`.
+
+### Independent release verification
+
+In a checkout of the revision to release, record the source commit and build a wheel. Use a fresh
+directory outside the checkout for both the artifact and its environment.
+
+```sh
+git log -1 --format=%H
+journey_dir=$(mktemp -d)
+uv build --wheel --offline --out-dir "$journey_dir/wheels"
+shasum -a 256 "$journey_dir"/wheels/arete-*.whl
+uv venv --python 3.13 "$journey_dir/release"
+uv pip install --offline --no-index --no-deps --python "$journey_dir/release/bin/python" "$journey_dir"/wheels/arete-*.whl
+"$journey_dir/release/bin/python" -I -m arete.cli --version
+```
+
+Write the selection above to `$journey_dir/release-journeys.toml` using that interpreter's
+absolute path and observed build. Run the installed command with disposable outer state.
+
+```sh
+ARETE_CONFIG_DIR="$journey_dir/config" ARETE_STATE_DIR="$journey_dir/state" \
+  "$journey_dir/release/bin/python" -I -m arete.cli release-journeys --config "$journey_dir/release-journeys.toml"
+```
+
+Open the reported path under `$journey_dir/state/release-journeys/` and verify that both journeys
+passed, the observed identities match the version probe, all ten actions are accounted for, and
+the report has no findings. Keep the source commit, wheel digest, version and report together.
+For a regression check, build a second wheel from a disposable copy with the existing-file guard
+in `cmd_init` refusing even when `--force` is passed. Update the selection with the second
+interpreter and identity and run the same command twice using the same outer state. Expect two failed
+replacement assertions in each report and one canonical finding across the two runs.

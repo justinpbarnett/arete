@@ -565,9 +565,9 @@ def finding_text(f: dict) -> str:
 
 
 def known_twins(run: LoopRun, unseen: list[dict]) -> dict[int, dict]:
-    from . import mergecheck
+    from . import mergecheck, releasejourneys
 
-    if mergecheck.builtin(run.loop):
+    if mergecheck.builtin(run.loop) or releasejourneys.builtin(run.loop):
         return {}
     if not unseen or not jev.ready(run.cfg, [loop_repo(run)]):
         return {}

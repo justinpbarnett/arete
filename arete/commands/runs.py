@@ -20,6 +20,12 @@ def cmd_merge_check(args) -> int:
     return mergecheck.command(args)
 
 
+def cmd_release_journeys(args) -> int:
+    from .. import releasejourneys
+
+    return releasejourneys.command(args)
+
+
 def cmd_run(args) -> int:
     from .. import client, pipeline
 
@@ -145,6 +151,10 @@ def register(sub) -> None:
     p.add_argument("repo", nargs="?", default="", help="configured repository; otherwise read events on stdin")
     p.add_argument("--dry-run", action="store_true", help="preview saved checks without starting anything")
     p.set_defaults(fn=cmd_merge_check)
+
+    p = sub.add_parser("release-journeys", help="exercise configured journeys against a pinned release build")
+    p.add_argument("--config", help="journey TOML file, defaults to release-journeys.toml in the Arete config directory")
+    p.set_defaults(fn=cmd_release_journeys)
 
     p = sub.add_parser("run", help="loop 3: run the pipeline on one ticket")
     p.add_argument("repo")

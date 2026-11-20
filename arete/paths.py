@@ -104,6 +104,10 @@ def read_confined(p: Path, limit: int | None = None) -> bytes:
     if not ISOLATED:
         with open(p, "rb") as f:
             return f.read(-1 if limit is None else limit)
+    return read_scratch_file(p, limit)
+
+
+def read_scratch_file(p: Path, limit: int | None = None) -> bytes:
     root = scratch_root(p)
     parts = Path(os.path.abspath(p)).parts
     if root is None or len(parts) <= len(root.parts) or ".." in Path(p).parts:

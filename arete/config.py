@@ -911,12 +911,18 @@ def load_or_problem(path: Path | None = None) -> tuple[Config, str]:
     return fallback, problem
 
 
-def load(path: Path | None = None, strict: bool = False) -> Config:
+def load_required() -> Config:
+    return load(required=True)
+
+
+def load(path: Path | None = None, strict: bool = False, *, required: bool = False) -> Config:
     path = path or paths.CONFIG_FILE
     ignored: list[str] | None = None if strict else []
     try:
         data = tomllib.loads(paths.read_confined(path).decode())
     except FileNotFoundError:
+        if required:
+            raise
         return Config()
     cfg = Config(
         alert_repo=data.get("alert_repo", ""),
