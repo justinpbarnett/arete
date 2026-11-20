@@ -10,6 +10,47 @@ export function prepareWrite(url, data = {}, object = null, options = {}) {
     key: idempotencyKey(), keepalive: Boolean(options.keepalive) });
 }
 
+const publications = new Map();
+const PUBLICATION_PREFIX = "arete:pending-publication:";
+
+function savedPublication(id) {
+  try {
+    const key = sessionStorage.getItem(id);
+    return /^[0-9a-f]{32}$/.test(key ?? "") ? key : null;
+  } catch {
+    return null;
+  }
+}
+
+function rememberPublication(id, key) {
+  try {
+    if (key) sessionStorage.setItem(id, key);
+    else sessionStorage.removeItem(id);
+  } catch {
+    // The in-memory entry still covers retries until this page is closed.
+  }
+}
+
+export function isPublication(path, body) {
+  return /^\/api\/(?:triage\/[^/]+\/send|chats\/\d+\/file)$/.test(path)
+    || (/^\/api\/approvals\/\d+$/.test(path) && body?.approve === true);
+}
+
+export async function sendPublication(path, body, onResponse) {
+  const fresh = prepareWrite(path, body);
+  const fingerprint = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify([path, fresh.body])));
+  const id = PUBLICATION_PREFIX + Array.from(new Uint8Array(fingerprint), byte => byte.toString(16).padStart(2, "0")).join("");
+  const request = publications.get(id) ?? Object.freeze({ ...fresh, key: savedPublication(id) ?? fresh.key });
+  publications.set(id, request);
+  rememberPublication(id, request.key);
+  const result = await sendWrite(request, onResponse);
+  if (publications.get(id) === request) {
+    if (savedPublication(id) === request.key) rememberPublication(id, null);
+    publications.delete(id);
+  }
+  return result;
+}
+
 function headers(request) {
   return { "X-Arete": "1", "Idempotency-Key": request.key, "Content-Type": request.type ?? "application/json" };
 }

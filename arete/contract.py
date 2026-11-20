@@ -88,6 +88,26 @@ ERRORS = [{"code": code, "status": status, "description": description} for code,
     ("invalid_input", 400, "The input does not match the operation schema."),
     ("client_too_old", 400, "Upgrade the client to required_version."),
     ("version_conflict", 409, "Refresh current before trying again."),
+    ("invalid_framing", 400, "Use a single decimal Content-Length for a body and omit Transfer-Encoding."),
+    ("invalid_json", 400, "Send a UTF-8 JSON object with unique names, at most 32 levels, finite numbers, and "
+                          "integers between -9007199254740991 and 9007199254740991."),
+    ("forbidden", 403, "The request was not authorized."),
+    ("method_not_allowed", 405, "The route does not accept this method."),
+    ("conflict", 409, "The request conflicts with current state."),
+    ("idempotency_in_flight", 409, "Try again with the same key after Retry-After."),
+    ("body_too_large", 413, "The request body exceeds the route's size limit."),
+    ("uri_too_long", 414, "The request target is too long."),
+    ("unsupported_media_type", 415, "The route does not accept this Content-Type."),
+    ("misdirected_request", 421, "Use the server's tailnet name or address."),
+    ("invalid_fields", 422, "The request fields could not be processed."),
+    ("idempotency_key_reused", 422, "Use a new key for different content."),
+    ("rate_limited", 429, "Wait Retry-After seconds before sending more requests."),
+    ("headers_too_large", 431, "A request takes at most 100 headers."),
+    ("internal_error", 500, "The server could not complete the request."),
+    ("not_implemented", 501, "The server does not implement this method."),
+    ("upstream_failed", 502, "The target could not complete the request."),
+    ("draining", 503, "Serve is loading new code. Try again after Retry-After."),
+    ("unsupported_http_version", 505, "Use HTTP/1.0 or HTTP/1.1."),
 )]
 
 
@@ -118,11 +138,14 @@ def sample(schema):
 
 
 for _error in ERRORS:
-    _details = ({"fields": array(STRING)} if _error["code"] == "unknown_field" else
-                {"required_version": STRING} if _error["code"] == "client_too_old" else
-                {"current": RUN} if _error["code"] == "version_conflict" else {})
-    _error["schema"] = obj({"error": STRING, "code": {"type": "string", "enum": [_error["code"]]}, **_details})
-    _error["example"] = {**sample(_error["schema"]), "error": _error["description"]}
+    _code, _status, _description = (_error[k] for k in ("code", "status", "description"))
+    _details = {"unknown_field": {"fields": array(STRING)}, "client_too_old": {"required_version": STRING},
+                "version_conflict": {"current": RUN}, "rate_limited": {"retry_after": INTEGER}}.get(_code, {})
+    _error["schema"] = obj({"type": {"type": "string", "enum": [f"urn:arete:problem:{_code}"]}, "title": STRING,
+                            "status": {"type": "integer", "enum": [_status]}, "detail": STRING, "error": STRING,
+                            "code": {"type": "string", "enum": [_code]}, **_details})
+    _error["example"] = {**sample(_error["schema"]), "type": f"urn:arete:problem:{_code}", "status": _status,
+                         "detail": _description, "error": _description}
 
 
 META = envelope({"api": obj({"version": STRING, "minor": INTEGER, "contract_sha": STRING}),
@@ -313,6 +336,8 @@ def alias_input(provider, rest):
     if provider == "post_chat":
         if rest.endswith("/sessions"):
             return SESSION_INPUT
+        if rest.endswith("/file"):
+            return obj({"draft": STRING}, [])
         return fields("text") if rest.endswith("/send") else obj({})
     if provider == "post_session":
         return fields("text") if rest.endswith("/send") else obj({})

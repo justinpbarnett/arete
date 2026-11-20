@@ -71,7 +71,8 @@ function detailFor({ kind, item: x }) {
         `Start ${x.ticket} despite the blocker above?`, (r) => r.why || `Started ${x.ticket}`)] : [] };
     case "draft":
       return { body: x.body, why: `This issue is a draft for ${x.repo}. It has not reached GitHub.`, options: [
-        option("File issue", `/api/chats/${x.chat}/file`, "File this draft as a GitHub issue?", (r) => r.messages?.at(-1)?.text || "Filed the issue"),
+        option("File issue", `/api/chats/${x.chat}/file`, "File this draft as a GitHub issue?",
+          (r) => r.messages?.at(-1)?.text || "Filed the issue", { draft: x.fingerprint }),
         option("Drop draft", `/api/chats/${x.chat}/drop`, "Discard this draft without sending it?", stated("Dropped the draft"))] };
     case "approve":
       return { body: x.change, options: [

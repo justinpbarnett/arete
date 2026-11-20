@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import tempfile
@@ -24,6 +25,7 @@ from . import (
 )
 from .agent import READ_TOOLS, Result
 from .store import chats as chats_store
+from .store import db as foundation
 from .store import runs as run_store
 
 CONTEXT_FILE = paths.RUNS_DIR / "chat" / "context" / "dashboard.json"
@@ -110,7 +112,12 @@ def view(chat_id: int) -> dict:
 def draft_of(row: dict, cfg: config.Config) -> dict | None:
     if not row["draft_title"]:
         return None
-    return {"chat": row["id"], "title": row["draft_title"], "body": row["draft_body"], "repo": cfg.arete_repo}
+    return {"chat": row["id"], "title": row["draft_title"], "body": row["draft_body"], "repo": cfg.arete_repo,
+            "fingerprint": draft_fingerprint(row)}
+
+
+def draft_fingerprint(row: dict) -> str:
+    return hashlib.sha256(json.dumps([row["draft_title"], row["draft_body"]]).encode()).hexdigest()
 
 
 def pulse() -> dict:
@@ -368,17 +375,45 @@ def reply_and_draft(result: Result) -> tuple[str, dict | None]:
     return drafted.get("reply") or result.text, {"title": title, "body": body} if title else None
 
 
-def file_draft(chat_id: int) -> dict:
+def file_draft(chat_id: int, publication=None, *, draft=None) -> dict:
     with filing:
-        row = chat_row(chat_id)
-        if not row["draft_title"]:
-            raise NoDraft("There is no drafted issue to file.")
-        github = arete_repo(config.load()).github
-        if not github:
-            raise NoDraft("The config names no GitHub repo for arete, so the draft stays unfiled.")
-        number = gh.issue_create(github, row["draft_title"], row["draft_body"])
-        chats_store.chat_drop_draft(chat_id, row["draft_title"], row["draft_body"])
-        chats_store.chat_say(chat_id, "arete", f"Filed {gh.issue_url(github, number)}")
+        if publication and publication.pending and "result" in publication.pending:
+            return view(chat_id)
+        if publication and publication.pending:
+            target = publication.pending
+        else:
+            row = chat_row(chat_id)
+            if not row["draft_title"]:
+                raise NoDraft("There is no drafted issue to file.")
+            if publication and draft is None:
+                raise NoDraft("A keyed filing needs the current draft fingerprint. Read the draft and try again.")
+            if draft is not None and draft != draft_fingerprint(row):
+                raise NoDraft("The draft changed. Read the current draft and try again.")
+            github = arete_repo(config.load()).github
+            if not github:
+                raise NoDraft("The config names no GitHub repo for arete, so the draft stays unfiled.")
+            target = {"repo": github, "title": row["draft_title"], "body": row["draft_body"]}
+            if publication:
+                publication.remember(target)
+        github, title, body = (target[k] for k in ("repo", "title", "body"))
+        url = gh.find_issue_marker(github, publication.marker) if publication else ""
+        if not url:
+            if publication:
+                with foundation.tx():
+                    if not publication.pending.get("send_started"):
+                        current = chat_row(chat_id)
+                        if (current["draft_title"], current["draft_body"]) != (title, body):
+                            raise NoDraft("The draft changed. Read the current draft and try again.")
+                    publication.begin_send()
+                number = gh.issue_create(github, title, publication.text(body), single_attempt=True)
+            else:
+                number = gh.issue_create(github, title, body)
+            url = gh.issue_url(github, number)
+        with foundation.tx():
+            chats_store.chat_drop_draft(chat_id, title, body)
+            chats_store.chat_say(chat_id, "arete", f"Filed {url}")
+            if publication:
+                publication.record(f"chat:{chat_id}", url, url)
     return view(chat_id)
 
 

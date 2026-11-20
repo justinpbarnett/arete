@@ -67,6 +67,10 @@ class KeptFailure(Refused):
     pass
 
 
+class KeptUpstreamFailure(KeptFailure):
+    status = 502
+
+
 def session_report(run_id: str, connect=foundation.reader) -> dict:
     row = run_store.run_get(run_id, connect)
     if not row or row["kind"] != "session":
@@ -225,13 +229,15 @@ def feed(run_id: str, after: int = 0) -> dict:
     return {"run": run_read_after_its_lines, "lines": lines, "restore_epoch": epoch}
 
 
-def decide(approval_id: int, yes: bool) -> dict:
+def decide(approval_id: int, yes: bool, *, publication=None) -> dict:
     try:
-        return {"id": approval_id, "approved": yes, "result": delivery.decide(approval_id, yes)}
+        result = delivery.decide(approval_id, yes, publication=publication)
+        return {"id": approval_id, "approved": yes, "result": result}
     except LookupError as e:
         raise NotFound(str(e)) from e
     except delivery.KeptFailure as e:
-        raise KeptFailure(str(e)) from e
+        failure = KeptUpstreamFailure if e.upstream else KeptFailure
+        raise failure(str(e)) from e
     except (ValueError, delivery.Failed) as e:
         raise Refused(str(e)) from e
 
