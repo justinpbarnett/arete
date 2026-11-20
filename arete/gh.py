@@ -133,24 +133,28 @@ def recovery_lookup(lookup):
         raise GhUnsure(f"GitHub reply was lost; could not reconcile the write: {e}") from e
 
 
-def comment_key(path: str, key: str, start) -> bool:
+def comment_key(path: str, key: str, start):
     query = urlencode({"since": util.iso(start - timedelta(seconds=60)), "per_page": 100})
     pages = gh_json(["api", f"{path}?{query}", "--paginate", "--slurp"])
     if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
         raise GhUnsure("GitHub comment lookup returned no list")
-    return any(key_mark(key) in (row.get("body") or "") for page in pages for row in page)
+    return next((row for page in pages for row in page if key_mark(key) in (row.get("body") or "")), None)
 
 
-def keyed_comment(args: list[str], body: str, path: str, mark: bool = False, envelope: bool = False) -> None:
+def keyed_comment(args: list[str], body: str, path: str, mark: bool = False, envelope: bool = False,
+                  *, single_attempt: bool = False) -> str:
     key, start = uuid.uuid4().hex, util.now()
     payload = outgoing(body, mark=mark, key=key)
     if envelope:
         payload = Outgoing(json.dumps({"body": payload}))
     try:
-        gh(args, input=payload, write=True)
+        return gh(args, input=payload, write=True).strip()
     except GhUnsure:
-        if not recovery_lookup(lambda: comment_key(path, key, start)):
-            gh(args, input=payload, write=True)
+        if single_attempt:
+            raise
+        if found := recovery_lookup(lambda: comment_key(path, key, start)):
+            return found.get("html_url", "")
+        return gh(args, input=payload, write=True).strip()
 
 
 def split_link(body: str, links) -> tuple[str, str]:
@@ -168,7 +172,7 @@ def split_link(body: str, links) -> tuple[str, str]:
     return "", body
 
 
-def issue_create(repo: str, title: str, body: str, labels: Sequence[str] = ()) -> int:
+def issue_create(repo: str, title: str, body: str, labels: Sequence[str] = (), *, single_attempt: bool = False) -> int:
     key = uuid.uuid4().hex
     args = ["issue", "create", "--repo", repo, "--title", outbound.screen(title), "--body-file", "-"]
     for lb in labels:
@@ -177,6 +181,9 @@ def issue_create(repo: str, title: str, body: str, labels: Sequence[str] = ()) -
     try:
         reply = gh(args, input=payload, write=True)
     except GhUnsure:
+        if single_attempt:
+            raise
+
         def find():
             rows = gh_json(["issue", "list", "--repo", repo, "--state", "all", "--limit", "20", "--json", "number,body"])
             if not isinstance(rows, list):
@@ -198,9 +205,37 @@ def issue_url(repo: str, number: int | str) -> str:
     return f"https://github.com/{repo}/issues/{number}"
 
 
-def issue_comment(repo: str, number: int, body: str) -> None:
-    keyed_comment(["issue", "comment", str(number), "--repo", repo, "--body-file", "-"], body,
-                  f"repos/{repo}/issues/{number}/comments")
+def publication_url(path: str, marker: str, **query) -> str:
+    query = urlencode({"per_page": 100, **query})
+    pages = gh_json(["api", f"{path}?{query}", "--paginate", "--slurp"])
+    if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+        raise GhError("GitHub publication lookup returned no list")
+    for page in pages:
+        for row in page:
+            if "pull_request" not in row and marker in (row.get("body") or "").splitlines():
+                if not row.get("html_url"):
+                    raise GhError("GitHub publication lookup returned no URL")
+                return row["html_url"]
+    return ""
+
+
+def find_issue_marker(repo: str, marker: str) -> str:
+    return publication_url(f"repos/{repo}/issues", marker, state="all")
+
+
+def find_issue_comment_marker(repo: str, number: int, marker: str) -> str:
+    return publication_url(f"repos/{repo}/issues/{number}/comments", marker)
+
+
+def find_pr_marker(repo: str, branch: str, marker: str) -> str:
+    return publication_url(f"repos/{repo}/pulls", marker, state="all", head=f"{repo.split('/')[0]}:{branch}")
+
+
+def issue_comment(repo: str, number: int, body: str, *, return_url: bool = False,
+                  single_attempt: bool = False) -> str | None:
+    url = keyed_comment(["issue", "comment", str(number), "--repo", repo, "--body-file", "-"], body,
+                        f"repos/{repo}/issues/{number}/comments", single_attempt=single_attempt)
+    return url if return_url else None
 
 
 def issue_close(repo: str, number: int, comment: str = "") -> None:
@@ -252,7 +287,7 @@ def issue_reopen(repo: str, number: int) -> None:
 
 
 def pr_create(repo: str, head: str, base: str, title: str, body: str, labels: Sequence[str] = (),
-              draft: bool = False, cwd=None, link: str = "") -> str:
+              draft: bool = False, cwd=None, link: str = "", *, single_attempt: bool = False) -> str:
     args = ["pr", "create", "--repo", repo, "--head", head, "--base", base, "--title", outbound.screen(title),
             "--body-file", "-"]
     for lb in labels:
@@ -262,7 +297,7 @@ def pr_create(repo: str, head: str, base: str, title: str, body: str, labels: Se
     try:
         return gh(args, cwd=cwd, input=outgoing(body, link), write=True).strip().splitlines()[-1]
     except GhError as e:
-        if not isinstance(e, GhUnsure) and "already exists" not in str(e).lower():
+        if single_attempt or (not isinstance(e, GhUnsure) and "already exists" not in str(e).lower()):
             raise
         url = recovery_lookup(lambda: open_pr_url(repo, head)) if isinstance(e, GhUnsure) else open_pr_url(repo, head)
         if url:

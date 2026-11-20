@@ -2462,7 +2462,11 @@ Explicit subscription calls contribute no paid spend and retain all their tokens
 
 ### API
 
-These routes pass the same caller check as the page, and the POST needs the `X-Arete` header. A bad request gets 400, an unknown task or run 404, a ticket whose run is going on or no free slot 409, and a tracker that fails 502.
+These routes pass the same caller check as the page, and a POST needs the `X-Arete: 1` header.
+A bad request gets 400, an unknown task or run 404, a ticket whose run is going on or no free slot 409, and a tracker that fails 502.
+Send JSON bodies with `Content-Type: application/json` and a single `Content-Length`.
+Unkeyed legacy routes still accept an omitted media type, or no length for an empty body, but a supplied unsupported media type now returns 415.
+Evidence uploads still accept the supported image and video types or `application/octet-stream`.
 
 A chat's sessions have four routes: `GET /api/chats/N/sessions` lists them with the chat's limits (`max_sessions`, `running`, `budget_usd`, `spent`, `left`), `GET /api/chats/N/sessions/ID/report` returns a session's report, `POST /api/chats/N/sessions` starts one (body `prompt`, and optionally `repo`, `device`, `model`, `runner`, `budget_usd`; a missing `repo` means the chat's project), and `POST /api/chats/N/sessions/ID/stop` stops one. A session another chat started answers 404.
 

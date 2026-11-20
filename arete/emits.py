@@ -145,11 +145,24 @@ class Ticket(Emit):
                     f"({screened.answer.note()})")
         return ""
 
-    def execute(self, item: dict, batch: list[dict], loop_name: str, run_id: str, cfg: config.Config) -> str:
-        repo = sources.github_name(cfg, item["repo"])
+    def execute(self, item: dict, batch: list[dict], loop_name: str, run_id: str, cfg: config.Config,
+                *, publication=None) -> str:
+        repo = publication.pending.get("repo") if publication else ""
+        if not repo:
+            repo = sources.github_name(cfg, item["repo"])
+            if publication:
+                publication.remember({**publication.pending, "repo": repo})
+        if publication:
+            if url := gh.find_issue_marker(repo, publication.marker):
+                return url
+            publication.require_unsent()
         for label in item["labels"]:
             gh.ensure_label(repo, label, restyle=False)
-        return gh.issue_url(repo, gh.issue_create(repo, item["title"], item["body"], item["labels"]))
+        body = publication.text(item["body"]) if publication else item["body"]
+        if publication:
+            publication.begin_send()
+        return gh.issue_url(repo, gh.issue_create(repo, item["title"], body, item["labels"],
+                                                  single_attempt=publication is not None))
 
     def landed(self, batch: list[dict], loop_name: str, url: str) -> None:
         for f in batch:
@@ -188,12 +201,20 @@ class PullRequest(Emit):
                 "body": gh.marked(f"Made by the `{loop.name}` loop, run `{run_id}`.\n\n{outbound.plain(told, 6000)}"),
                 "draft": bool(spec.get("draft", True)), "labels": as_list(spec.get("labels"))}
 
-    def execute(self, item: dict, batch: list[dict], loop_name: str, run_id: str, cfg: config.Config) -> str:
+    def execute(self, item: dict, batch: list[dict], loop_name: str, run_id: str, cfg: config.Config,
+                *, publication=None) -> str:
+        if publication:
+            if url := gh.find_pr_marker(item["repo"], item["branch"], publication.marker):
+                return url
+            publication.require_unsent()
         for label in item["labels"]:
             gh.ensure_label(item["repo"], label, restyle=False)
         util.git(["push", "-u", "origin", item["branch"]], Path(item["workdir"]), timeout=300)
-        return gh.pr_create(item["repo"], item["branch"], item["base"], item["title"], item["body"], item["labels"],
-                            draft=item["draft"])
+        body = publication.text(item["body"]) if publication else item["body"]
+        if publication:
+            publication.begin_send()
+        return gh.pr_create(item["repo"], item["branch"], item["base"], item["title"], body, item["labels"],
+                            draft=item["draft"], single_attempt=publication is not None)
 
     def describe(self, item: dict) -> str:
         return f"open a {'draft ' if item['draft'] else ''}PR on {item['repo']} from {item['branch']}: {item['title']}"
