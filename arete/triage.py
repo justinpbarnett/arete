@@ -37,7 +37,7 @@ from .store import triage as triage_store
 
 ISSUE_TITLE = "[arete] triage"
 ISSUE_LABEL = "arete-triage"
-SKIP_LABELS = {tracker.LABEL, alerts.LABEL, ISSUE_LABEL, "loop"}
+SKIP_LABELS = {tracker.LABEL, tracker.ZTE_LABEL, alerts.LABEL, ISSUE_LABEL, "loop"}
 AUTO_SKIP_LABELS = {"no-agent", "agent:hold", "duplicate", "invalid", "wontfix",
                     *(f"agent:{state}" for state in config.RUN_LABELS), *tracker.JIRA_STATE_LABELS}
 MAX_CALLS = 20
@@ -275,6 +275,8 @@ class GitHubSource(Source):
         if issue.get("state") != "OPEN":
             raise gh.GhError(f"{c.ref} is no longer open")
         labels = tuple(lb["name"] for lb in issue.get("labels", []))
+        if tracker.ZTE_LABEL in labels:
+            raise tracker.TaskError(tracker.ZTE_QUEUE)
         comments = [(tk.owner, cm.get("createdAt", ""), cm.get("body", ""))
                     for cm in issue.get("comments", []) if tk.by_owner(cm)]
         return TicketText(f"Labels: {', '.join(labels) or 'none'}", (issue.get("body") or "").strip(),
@@ -297,7 +299,9 @@ class GitHubSource(Source):
         return ""
 
     def comment(self, ref: str, text: str, *, return_url=False) -> str | None:
-        number = int(self.tid(ref))
+        tid = self.tid(ref)
+        self.issues.require_ordinary(tid)
+        number = int(tid)
         if return_url:
             return gh.issue_comment(self.key, number, text, return_url=True, single_attempt=True)
         return gh.issue_comment(self.key, number, text)

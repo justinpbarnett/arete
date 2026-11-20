@@ -92,6 +92,7 @@ def add_labels(source: tracker.Tracker, tid: str, labels: list[str]) -> None:
             color, description = LABEL_STYLES[label]
             if error := gh.ensure_label(source.repo.github, label, color, description, restyle=False):
                 raise gh.GhError(error)
+        source.require_ordinary(tid)
         gh.issue_labels(source.repo.github, int(tid), add=labels)
     elif isinstance(source, tracker.JiraTracker):
         source.client.edit_labels(tid, labels)

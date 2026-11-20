@@ -11,6 +11,8 @@ from . import config, gh, jira, principals, util
 from .store import tasks as tasks_store
 
 LABEL = "agent"
+ZTE_LABEL = "agent:zte"
+ZTE_QUEUE = f"its `{ZTE_LABEL}` label reserves it for zero-touch delivery"
 BATCH_LABEL = "agent:batch"
 BATCH_LINE = re.compile(r"Batch issues:[ \t]*(.*)")
 BATCH_REFS = re.compile(r"#[1-9][0-9]*(?:[ \t]*,[ \t]*#[1-9][0-9]*)*")
@@ -172,7 +174,7 @@ class GitHubTracker:
         return f"#{tid}"
 
     def todo(self) -> list[Ticket]:
-        skip = {self.label_name(s) for s in config.RUN_LABELS}
+        skip = {ZTE_LABEL, *(self.label_name(s) for s in config.RUN_LABELS)}
         out = []
         self._bodies, self._labels, self._open = {}, {}, {}
         for i in gh.issues(self.repo.github, LABEL, limit=MAX_AGENT_ISSUES):
@@ -197,7 +199,8 @@ class GitHubTracker:
             body = issue.get("body") or ""
             self._labels[tid] = [lb["name"] for lb in issue.get("labels", [])]
         ticket = Ticket(tid, self.ref(tid), "", body=body, labels=self._labels.get(tid, []))
-        return error_of(lambda: batch_ids(ticket)) or wait_blocker(waits_on(body), self.is_open)
+        return (ZTE_QUEUE if ZTE_LABEL in ticket.labels else "") or error_of(lambda: batch_ids(ticket)) or wait_blocker(
+            waits_on(body), self.is_open)
 
     def is_open(self, number: int) -> bool | None:
         if number not in self._open:
@@ -211,11 +214,14 @@ class GitHubTracker:
     def replied(self) -> list[Ticket]:
         out = []
         for i in gh.issues(self.repo.github, self.label_name("needs-info")):
-            if LABEL not in {lb["name"] for lb in i.get("labels", [])} or not self.by_owner(i):
+            labels = {lb["name"] for lb in i.get("labels", [])}
+            if LABEL not in labels or ZTE_LABEL in labels or not self.by_owner(i):
                 continue
             full = gh.issue(self.repo.github, int(i["number"]))
             self._bodies[str(i["number"])] = full.get("body") or ""
             self._labels[str(i["number"])] = [lb["name"] for lb in full.get("labels", [])]
+            if ZTE_LABEL in self._labels[str(i["number"])]:
+                continue
             mine = [(datetime.fromisoformat(c["createdAt"]), c.get("body") or "") for c in full.get("comments", [])
                     if self.by_owner(c) and c.get("createdAt")]
             if answered(mine):
@@ -225,6 +231,8 @@ class GitHubTracker:
 
     def reply_since(self, tid: str, since: str) -> str:
         full = gh.issue(self.repo.github, int(tid))
+        if any(label["name"] == ZTE_LABEL for label in full.get("labels", [])):
+            return ""
         return reply_text([(datetime.fromisoformat(c["createdAt"]), c.get("body") or "")
                            for c in full.get("comments", []) if self.by_owner(c) and c.get("createdAt")], since)
 
@@ -234,17 +242,21 @@ class GitHubTracker:
     def get(self, tid: str) -> Ticket:
         i = gh.issue(self.repo.github, int(tid))
         labels = [lb["name"] for lb in i.get("labels", [])]
+        self._bodies[str(tid)] = i.get("body") or ""
+        self._labels[str(tid)] = labels
         author = (i.get("author") or {}).get("login", "")
         comments = [(self.owner, c.get("createdAt", ""), c.get("body", "")) for c in i.get("comments", [])
                     if self.by_owner(c)]
-        blocker = ("" if self.by_owner(i) else f"it was opened by {author or 'someone else'}, not {self.owner}") or (
+        blocker = (ZTE_QUEUE if ZTE_LABEL in labels else "") or (
+            "" if self.by_owner(i) else f"it was opened by {author or 'someone else'}, not {self.owner}") or (
             "" if LABEL in labels else f"it has no `{LABEL}` label") or wait_blocker(
             waits_on(i.get("body") or ""), self.is_open)
         ticket = Ticket(str(i["number"]), f"#{i['number']}", i["title"], body=i.get("body") or "(no description)",
                       comments=comments_text(comments), open=i.get("state") == "OPEN",
                       kind="fix" if FIX_LABELS & set(labels) else "feat", url=i.get("url", ""),
                       updated=i.get("updatedAt") or "", labels=labels, blocker=blocker)
-        batch_ids(ticket)
+        if ZTE_LABEL not in labels:
+            batch_ids(ticket)
         return ticket
 
     def prepare(self) -> list[str]:
@@ -254,17 +266,26 @@ class GitHubTracker:
                  for s in config.STATES]
         return [err for err in made if err]
 
+    def in_zte_queue(self, tid: str) -> bool:
+        issue = gh.issue(self.repo.github, int(tid))
+        return any(label["name"] == ZTE_LABEL for label in issue.get("labels", []))
+
+    def require_ordinary(self, tid: str) -> None:
+        if self.in_zte_queue(tid):
+            raise TaskError(ZTE_QUEUE)
+
     def approve(self, tid: str) -> None:
+        self.require_ordinary(tid)
         if failed := gh.ensure_label(self.repo.github, LABEL, *APPROVAL_LABEL_STYLE, restyle=False):
             raise gh.GhError(failed)
         gh.issue_labels(self.repo.github, int(tid), add=[LABEL])
 
     def label(self, tid: str, add=(), remove=()) -> str:
-        return error_of(lambda: gh.issue_labels(self.repo.github, int(tid), add=[self.label_name(s) for s in add],
-                                                remove=[self.label_name(s) for s in remove]))
+        return error_of(lambda: self.require_ordinary(tid) or gh.issue_labels(
+            self.repo.github, int(tid), add=[self.label_name(s) for s in add], remove=[self.label_name(s) for s in remove]))
 
     def comment(self, tid: str, body: str) -> str:
-        return error_of(lambda: gh.issue_comment(self.repo.github, int(tid), body))
+        return error_of(lambda: self.require_ordinary(tid) or gh.issue_comment(self.repo.github, int(tid), body))
 
     def move(self, tid: str, state: str) -> str:
         return ""
@@ -273,9 +294,13 @@ class GitHubTracker:
         return subject
 
     def pr_link(self, t: Ticket, whole: bool) -> str:
+        if ZTE_LABEL in t.labels:
+            raise TaskError(ZTE_QUEUE)
         ids = batch_ids(t)
         if not whole:
             return f"Part of #{t.id}"
+        for tid in ids[1:]:
+            self.require_ordinary(tid)
         return "\n".join(f"Closes #{tid}" for tid in ids)
 
 
