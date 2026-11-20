@@ -1,0 +1,65 @@
+#!/bin/sh
+set -eu
+
+exec uv run --no-sync python -IB -c '
+import argparse
+import os
+import subprocess
+import sys
+import tempfile
+from io import BytesIO
+from pathlib import Path
+
+
+def git(*args, **kwargs):
+    env = {**os.environ, "GIT_NO_LAZY_FETCH": "1", "GIT_ALLOW_PROTOCOL": ""}
+    return subprocess.check_output(["git", "--no-replace-objects", *args], env=env, **kwargs)
+
+
+def check(root):
+    artifact = Path("docs/openapi.json")
+    entries = {}
+    for row in git("ls-files", "--full-name", "--stage", "-z", "--", "arete/", str(artifact)).split(b"\0"):
+        if not row:
+            continue
+        metadata, name = row.split(b"\t", 1)
+        mode, oid, stage = metadata.split()
+        path = Path(os.fsdecode(name))
+        if stage != b"0" or mode not in (b"100644", b"100755"):
+            sys.exit(f"Cannot check nonregular or unresolved staged path: {path}")
+        if path.is_absolute() or ".." in path.parts:
+            sys.exit(f"Cannot check unsafe staged path: {path}")
+        entries[path] = oid
+    if artifact not in entries:
+        sys.exit(f"Stage {artifact} so the index contains the generated API contract.")
+    objects = BytesIO(git("cat-file", "--batch", input=b"\n".join(entries.values()) + b"\n"))
+    for path, oid in entries.items():
+        header = objects.readline().split()
+        if header[:2] != [oid, b"blob"] or len(header) != 3:
+            sys.exit(f"Cannot read staged blob for {path}")
+        file = root / path
+        file.parent.mkdir(parents=True, exist_ok=True)
+        size = int(header[2])
+        data = objects.read(size)
+        if len(data) != size or objects.read(1) != b"\n":
+            sys.exit(f"Incomplete staged blob for {path}")
+        file.write_bytes(data)
+    args = ["api", "diff", "--check-artifact"]
+    for variable, flag in (("ARETE_API_USAGE", "--usage"), ("ARETE_API_OWNER_APPROVAL", "--owner-approval")):
+        if value := os.environ.get(variable):
+            args.extend([flag, str(Path(value).absolute())])
+    os.environ.update(GIT_DIR=os.fsdecode(git("rev-parse", "--absolute-git-dir").rstrip(b"\n")), GIT_WORK_TREE=str(root))
+    os.chdir(root)
+    sys.path.insert(0, str(root))
+    from arete.commands import api
+
+    parser = argparse.ArgumentParser(prog="arete")
+    api.register(parser.add_subparsers(required=True))
+    parsed = parser.parse_args(args)
+    return parsed.fn(parsed)
+
+
+with tempfile.TemporaryDirectory(prefix="arete-api-hook-") as folder:
+    status = check(Path(folder).resolve())
+sys.exit(status)
+'

@@ -1,5 +1,28 @@
 set positional-arguments
 
+# Use this repository's opt-in Git hooks
+hooks:
+    #!/bin/sh
+    set -eu
+    if current=$(git config --get core.hooksPath); then
+        if [ "$current" != .githooks ]; then
+            printf '%s\n' 'Another core.hooksPath is configured; keep it and run the API check separately.' >&2
+            exit 1
+        fi
+    else
+        [ "$?" -eq 1 ] || exit 1
+        default=$(git rev-parse --git-path hooks)
+        for hook in "$default"/*; do
+            if [ -f "$hook" ] && [ -x "$hook" ]; then
+                case "$hook" in
+                    *.sample) ;;
+                    *) printf 'Keep existing Git hook: %s\n' "$hook" >&2; exit 1 ;;
+                esac
+            fi
+        done
+    fi
+    git config --local core.hooksPath .githooks
+
 # Start a task from a prompt: prints the task, its run and why
 adw prompt repo kind="feat":
     uv run arete task start --repo {{quote(repo)}} --kind {{quote(kind)}} -- "$1"

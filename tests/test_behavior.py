@@ -1,6 +1,7 @@
 import base64
 import json
 import sqlite3
+import tempfile
 import threading
 import unittest
 from contextlib import ExitStack, redirect_stderr
@@ -12,7 +13,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from arete import (
-    accounts, api_http, chat, config, contract, control, dashboard, events, gh, idempotency, jira, pipeline, principals,
+    accounts, api_check, api_http, chat, config, contract, control, dashboard, events, gh, idempotency, jira, pipeline, principals,
     screening, serve, tailnet, tasks, triage, util,
 )
 from arete.store import approvals as approvals_store
@@ -20,7 +21,7 @@ from arete.store import chats as chats_store
 from arete.store import db
 from arete.store import idempotency as claims
 from arete.store import triage as triage_store
-from tests import support
+from tests import support, versioned_api_fixture
 
 
 def setUpModule():
@@ -83,6 +84,20 @@ class VersionedApiTests(unittest.TestCase):
 
     def test_versioned_read_surface(self):
         self.with_server(self.check_read_surface)
+
+    def test_api_check(self):
+        with tempfile.TemporaryDirectory(prefix="arete-api-cli-") as temp:
+            root = Path(temp).resolve()
+            command = api_check.child_command(versioned_api_fixture.SOURCE, "from arete.cli import main; sys.exit(main())",
+                                              "api", "check")
+            result = versioned_api_fixture.run(root, command, api_check.isolated_env(root),
+                                               timeout=api_check.CHECK_TIMEOUT + 5)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual([line for line in result.stdout.splitlines() if line.endswith(" passed")],
+                             [f"{n}. {name} passed" for n, name in enumerate(api_check.SCENARIOS, 1)])
+
+    def test_api_diff(self):
+        versioned_api_fixture.evolution_temp()
 
     def test_transport_and_publication_compatibility(self):
         self.with_server(self.check_transport)
