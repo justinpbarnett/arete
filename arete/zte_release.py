@@ -11,17 +11,18 @@ import sys
 import tempfile
 import time
 import tomllib
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from . import alerts, codebase, config, install as service_install, paths, pilot, principals, slots, util, zte, zte_delivery
+from . import alerts, codebase, config, gh, install as service_install, paths, pilot, principals, slots, util, zte, zte_delivery
 from .store import db, runs
 from .store import zte as store
 
 PROFILE = paths.ZTE_AUTHORITY / "zte-release.toml"
 HEALTH_SECONDS = 120
+HEARTBEAT_MAX_AGE_SECONDS = 65
 RECOVERY_SECONDS = 180
 RESTART_GRACE_SECONDS = 30
 RECOVERY_HEALTH_SECONDS = 45
@@ -192,6 +193,8 @@ def database(install: Installation, *, until: datetime | None = None) -> None:
     except (OSError, sqlite3.Error) as error:
         if until is not None:
             activation_time_left(until)
+        if isinstance(error, sqlite3.OperationalError) and zte_delivery.database_busy(error):
+            raise
         raise DatabaseUnhealthy(reason) from error
 
 
@@ -207,6 +210,10 @@ def executable_matches(root: Path, pid: int, *, until: datetime | None = None) -
     return process.returncode == 0 and process.stdout.strip() == f"{root / '.venv/bin/python'} -m arete.cli serve"
 
 
+def heartbeat_fresh(at: str) -> bool:
+    return 0 <= (util.now() - util.parse_iso(at)).total_seconds() < HEARTBEAT_MAX_AGE_SECONDS
+
+
 def health(install: Installation, sha: str, *, after: str = "", old_pid: int = 0,
            until: datetime | None = None) -> dict:
     root = verify_runtime(install, sha, until=until)
@@ -216,7 +223,7 @@ def health(install: Installation, sha: str, *, after: str = "", old_pid: int = 0
     pilot.require(beat.get("engine") == server.get("engine") == sha[:12] and pid == server.get("pid")
                   and pid != old_pid and util.pid_alive(pid) and beat.get("schema") == install.schema
                   and beat.get("tick_ok") is True and beat.get("at", "") > after
-                  and 0 <= (util.now() - util.parse_iso(beat["at"])).total_seconds() < 65
+                  and heartbeat_fresh(beat["at"])
                   and not any(beat.get(k) for k in ("broken", "failing", "poll_errors", "config_ignored",
                                                    "config_problem", "code_problem", "migration_error")),
                   "managed service has no matching healthy heartbeat")
@@ -228,6 +235,12 @@ def health(install: Installation, sha: str, *, after: str = "", old_pid: int = 0
                   "heartbeat PID is not the selected managed launchd executable")
     probe_https(install, sha, until=until)
     return {"at": beat["at"], "pid": pid, "engine": sha, "schema": install.schema, "https_status": 200}
+
+
+def require_fresh_runtime(install: Installation, sha: str, observation: dict, until: datetime) -> None:
+    activation_time_left(until)
+    pilot.require(selected(install) == sha and util.pid_alive(observation["pid"]) and heartbeat_fresh(observation["at"]),
+                  "the validated runtime changed or became stale")
 
 
 def probe_https(install: Installation, sha: str, *, until: datetime | None = None) -> None:
@@ -441,6 +454,7 @@ def deploy(install: Installation, delivery) -> None:
     pilot.require(install.to_receipt() == delivery.data["approved_installation"],
                   "the admitted managed release profile changed")
     zte_delivery.require_landing(delivery, client, sha)
+    release_issue_gate(delivery, policy, client)
     stage(install, delivery, client)
     with db.one_read(timeout=activation_timeout(outer, 2)):
         if runs.runs_marked_running():
@@ -457,6 +471,9 @@ def deploy(install: Installation, delivery) -> None:
         with util.lock(zte.INTERLOCK) as got:
             if not got:
                 return
+            activation_authority(delivery, install, outer)
+            if policy.production_issue_base:
+                release_issue_gate(delivery, policy, client)
             with db.tx(timeout=0, before_commit=lambda: activation_time_left(outer)):
                 if runs.runs_marked_running():
                     return
@@ -477,6 +494,15 @@ def deploy(install: Installation, delivery) -> None:
     finish(install, intent)
 
 
+def release_issue_gate(delivery, policy, client) -> None:
+    if policy.close_after_health:
+        pilot.require(zte_delivery.closable_issue(delivery, client) == delivery.data["issue_content"],
+                      "the approved issue changed before release")
+    else:
+        pilot.require(zte_delivery.issue_closure(delivery, client) == delivery.data.get("issue_closure"),
+                      "GitHub issue closure changed before release")
+
+
 def finish(install: Installation, delivery) -> None:
     data = delivery.data
     sha = data["release"]
@@ -488,30 +514,117 @@ def finish(install: Installation, delivery) -> None:
     pilot.require(selected(install) == sha, "the deployment intent has no active candidate selector")
     beats = fresh_health(install, sha, data["activation_after"], data["old_pid"], check, until=until)
     policy = check()
-    zte_delivery.require_landing(delivery, policy.client(util.iso(until)), sha)
+    client = policy.client(util.iso(until))
+    zte_delivery.require_landing(delivery, client, sha)
+    release_issue_gate(delivery, policy, client)
     final = health(install, sha, after=data["activation_after"], old_pid=data["old_pid"], until=until)
     with util.lock(zte.INTERLOCK) as got:
         if not got:
             return
         # Fence the start of COMMIT without a SQLite busy wait; the OS controls when durability returns.
-        with db.tx(timeout=0, before_commit=lambda: activation_time_left(until)):
+        with db.tx(timeout=0, before_commit=lambda: require_fresh_runtime(install, sha, final, until)):
             check()
             database(install, until=until)
-            pilot.require(selected(install) == sha, "the selected runtime changed during validation")
-            pilot.require(final["pid"] == beats[-1]["pid"] and util.pid_alive(final["pid"]),
-                          "the validated runtime exited or restarted before completion")
+            pilot.require(final["pid"] == beats[-1]["pid"], "the validated runtime restarted before completion")
             activation_time_left(until)
-            store.complete(delivery, data["pr_task_version"], release_health=beats, completion_health=final)
+            if policy.close_after_health:
+                store.annotate(delivery, release_health=beats, completion_health=final)
+            else:
+                store.complete(delivery, data["pr_task_version"], release_health=beats, completion_health=final)
 
 
-def recovery_blocked(task: str) -> str:
+def close_after_health(install: Installation, delivery) -> None:
+    data = delivery.data
+    until = util.parse_iso(delivery.deadline)
+    policy = activation_authority(delivery, install, until)
+    pilot.require(policy.close_after_health and policy.issue and policy.issue_app
+                  and (policy.rehearsal or policy.production_issue_base == delivery.base)
+                  and data.get("close_after_health") is True and data["issue"] == asdict(policy.issue)
+                  and data.get("issue_app") == asdict(policy.issue_app),
+                  "closing requires the original pinned issue and separate App authority")
+    client = policy.client(delivery.deadline)
+    token = client.issue_token(policy.issue_app, zte.ISSUE_KEY)
+    policy.audit(client)
+    zte_delivery.require_landing(delivery, client, data["release"])
+    pilot.require(client.ci(data["release"], data["tree"], "push") == data["release_ci"], "release CI evidence changed")
+    with util.lock(zte.INTERLOCK) as got:
+        if not got:
+            return
+        activation_authority(delivery, install, until)
+        release_issue_gate(delivery, policy, client)
+        final = close_health(install, delivery, until)
+
+        def check_runtime():
+            require_fresh_runtime(install, data["release"], final, until)
+
+        with db.tx(timeout=0, before_commit=check_runtime):
+            activation_authority(delivery, install, until)
+            database(install, until=until)
+            intent = store.annotate(delivery, issue_close_sent_after=util.iso(), issue_close_health=final)
+        activation_authority(intent, install, until)
+        check_runtime()
+        try:
+            client.close_issue(policy.issue.number, token)
+        except gh.GhUnsure as error:
+            activation_time_left(until)
+            with db.tx(timeout=0, before_commit=lambda: activation_time_left(until)):
+                store.annotate(intent, issue_close_transport=util.first_line(str(error), 160))
+
+
+def close_health(install: Installation, delivery, until: datetime) -> dict:
+    data = delivery.data
+    pilot.require(selected(install) == data["release"], "the validated release is no longer selected")
+    observation = health(install, data["release"], after=data["activation_after"], old_pid=data["old_pid"], until=until)
+    pilot.require(observation["pid"] == data["completion_health"]["pid"], "the validated runtime restarted")
+    return observation
+
+
+def reconcile_close(install: Installation, delivery) -> None:
+    from .zte_github import GitHub, Identity
+
+    data = delivery.data
+    cutoff = util.parse_iso(delivery.deadline)
+    observed_until = util.parse_iso(data["issue_close_sent_after"]) + timedelta(minutes=2)
+    client = GitHub(Identity(**data["github"]), util.iso(util.now() + timedelta(seconds=25)), Path("/dev/null"),
+                    observer=zte.OBSERVER_FILE)
+    try:
+        zte_delivery.require_landing(delivery, client, data["release"])
+        closure = zte_delivery.issue_closure(delivery, client)
+        pilot.require(util.parse_iso(closure["closed_at"]) <= observed_until,
+                      "the issue closed outside the admitted reconciliation window")
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError) as error:
+        if util.now() >= observed_until:
+            if transport := data.get("issue_close_transport"):
+                error = pilot.Held(f"{transport}; {error}")
+            zte.hold(delivery, error, uncertain=True, timeout=0)
+        return
+    try:
+        activation_authority(delivery, install, cutoff)
+        final = close_health(install, delivery, cutoff)
+        with util.lock(zte.INTERLOCK) as got:
+            if not got:
+                return
+            with db.tx(timeout=0, before_commit=lambda: require_fresh_runtime(install, data["release"], final, cutoff)):
+                activation_authority(delivery, install, cutoff)
+                database(install, until=cutoff)
+                store.complete(delivery, data["pr_task_version"], issue_closure=closure, issue_completion_health=final)
+    except sqlite3.OperationalError as error:
+        if not zte_delivery.database_busy(error):
+            raise
+    except DatabaseUnhealthy:
+        raise
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError) as error:
+        zte.hold(delivery, error, uncertain=True, timeout=0, observed_issue_closure=closure)
+
+
+def recovery_blocked(task: str | None) -> str:
     try:
         block = json.loads(zte.private_bytes(RECOVERY_BLOCK, 2048))
     except FileNotFoundError:
         return ""
     pilot.require(isinstance(block, dict) and isinstance(block.get("task"), str)
                   and isinstance(block.get("reason"), str) and block["reason"], "invalid managed recovery stop receipt")
-    return block["reason"] if block["task"] == task else ""
+    return block["reason"] if task is None or block["task"] == task else ""
 
 
 def hold_recovery(task: str, error: Exception) -> None:
@@ -540,11 +653,26 @@ def tick() -> int:
             if delivery.phase == "release_ready":
                 deploy(install, delivery)
             elif delivery.phase == "deploy_intent":
-                finish(install, delivery)
+                if delivery.data.get("issue_close_sent_after"):
+                    database(install, until=util.now() + timedelta(seconds=2))
+                    reconcile_close(install, delivery)
+                elif delivery.data.get("completion_health"):
+                    close_after_health(install, delivery)
+                else:
+                    finish(install, delivery)
             else:
                 restore(install, delivery)
         except (OSError, RuntimeError, ValueError, TypeError, KeyError, sqlite3.Error, subprocess.SubprocessError) as error:
             current = store.find(delivery.task)
+            if (current and current.phase == "deploy_intent" and current.data.get("completion_health")
+                    and not isinstance(error, DatabaseUnhealthy)):
+                close_intent = current.data.get("issue_close_sent_after")
+                if close_intent and not delivery.data.get("issue_close_sent_after"):
+                    return 0
+                if isinstance(error, sqlite3.OperationalError) and zte_delivery.database_busy(error):
+                    return 0
+                zte.hold(current, error, uncertain=bool(close_intent), timeout=0)
+                return 1
             if current and current.phase == "deploy_intent":
                 try:
                     restore(installation(current.data.get("installation")), current, reason=failure_reason(error))
@@ -574,13 +702,16 @@ def launch(receipt: dict | None = None) -> None:
 
 def launch_selected(install: Installation) -> None:
     sha = selected(install)
-    with db.one_read(timeout=2):
-        delivery = store.latest() if store.activation_pending() else None
+    with db.one_read(timeout=2) as connection:
+        has_ledger = connection.execute("PRAGMA user_version").fetchone()[0] >= 12
+        latest = store.latest() if has_ledger else None
+        delivery = latest if latest is not None and store.activation_pending() else None
+    pilot.require(not recovery_blocked(latest.task if latest is not None else None),
+                  "managed startup is blocked by an uncertain recovery")
     until = None
     candidate = False
     if delivery is not None:
-        pilot.require(delivery.phase != "uncertain" and not recovery_blocked(delivery.task),
-                      "managed startup is blocked by an uncertain recovery")
+        pilot.require(delivery.phase != "uncertain", "managed startup is blocked by an uncertain recovery")
         pilot.require(install.to_receipt() == delivery.data.get("installation"),
                       "the managed service does not match the activation journal")
         if delivery.phase == "rollback_intent":

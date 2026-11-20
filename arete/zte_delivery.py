@@ -10,7 +10,7 @@ from dataclasses import asdict
 from datetime import timedelta
 from pathlib import Path
 
-from . import config, delegation, jev, launch_lease, paths, pilot, record, scratch, util, workspace, zte
+from . import config, delegation, jev, launch_lease, paths, pilot, record, scratch, util, workspace, zte, zte_issue
 from .store import db, orchestration
 from .store import zte as store
 from .zte_github import GitHub, Identity
@@ -138,7 +138,57 @@ def require_landing(delivery, client, expected: str = "", observed: dict | None 
     pilot.require(commit.get("tree", {}).get("sha") == data["tree"]
                   and [p["sha"] for p in commit["parents"]] == [delivery.base] and client.tip() == landed,
                   "the observed landing has a different parent, tree or current main")
+    if "issue" in data:
+        issue = zte_issue.Claim(**data["issue"])
+        reference = zte_issue.reference(issue, explicit=bool(data.get("close_after_health")))
+        message = f"{zte_issue.squash_title(data['pr'])}\n\n{reference}"
+        pilot.require(commit.get("message") == message, "the observed squash does not carry the exact bound issue reference")
     return {"release": landed, "merge_actor": pull["merged_by"]["id"], "merged_at": pull["merged_at"]}
+
+
+def require_issue_link(delivery, client, issue) -> None:
+    data = delivery.data
+    zte_issue.require_link(client.identity, issue, data["pr"], data["pr_node"], data["head"],
+                           client.issue_binding(issue.number, data["pr"]), explicit=bool(data.get("close_after_health")))
+
+
+def closable_issue(delivery, client) -> str:
+    data = delivery.data
+    issue = zte_issue.Claim(**data["issue"])
+    github_issue, _ = zte_issue.require_merged(client.identity, issue, data["pr"], data["pr_node"], data["head"],
+                                                data["release"], client.issue_binding(issue.number, data["pr"]),
+                                                explicit=True)
+    zte_issue.require_closable(github_issue)
+    return zte_issue.current(client, issue)
+
+
+def issue_closure(delivery, client):
+    data = delivery.data
+    if "issue" not in data:
+        return None
+    issue = zte_issue.Claim(**data["issue"])
+    sent_after = data.get("issue_close_sent_after", "")
+    actor = None
+    if sent_after:
+        from .zte_github import IssueApp
+
+        identity = data.get("issue_app")
+        pilot.require(isinstance(identity, dict) and identity.keys() == {"app", "installation", "bot"},
+                      "the close intent does not bind the separate issue App; no send or adoption")
+        closer = IssueApp(**identity)
+        pilot.require(closer.separate_from(client.identity), "the issue close actor differs from the approved App")
+        actor = closer.bot
+    proof = zte_issue.require_completed(client.identity, issue, data["pr"], data["pr_node"], data["head"],
+                                       data["release"], client.issue_binding(issue.number, data["pr"]),
+                                       sent_after=sent_after, close_actor=actor)
+    if sent_after:
+        row = client.read(f"/issues/{issue.number}")
+        pilot.require((row.get("state"), row.get("state_reason"), row.get("closed_at")) ==
+                      ("closed", "completed", proof["closed_at"])
+                      and (row.get("closed_by") or {}).get("id") == actor
+                      and zte_issue.digest(zte_issue.issue_content(client.identity, issue.number, row)) == data["issue_content"],
+                      "the closed issue no longer matches the admitted issue and close actor")
+    return proof
 
 
 def settle_pr(delivery, client) -> None:
@@ -178,6 +228,8 @@ def send_next(delivery, policy, client, cfg, repo) -> None:
         if not proof or not ready_to_squash(delivery, client):
             return
         deadline = zte.wall_deadline(delivery)
+        if policy.issue_app is not None:
+            client.require_issue_app(policy.issue_app, zte.ISSUE_KEY)
         pilot.require(jev.ready(cfg, [repo]), "JEV is unavailable for this exact patch")
         remaining = deadline - time.monotonic()
         pilot.require(remaining > 0, jev.DEADLINE_EXPIRED)
@@ -348,12 +400,25 @@ def send_authorized(delivery, policy, client, isolated, proof, risk, ci_scope) -
         if not ready_to_squash(delivery, client):
             return
     pr_body = policy.signal(delivery.base).task() if delivery.phase == "pushed" else ""
+    issue = policy.issue
+    if issue is not None:
+        pilot.require(data.get("issue") == asdict(issue), "the original GitHub issue claim changed")
+    issue_options = {"issue": issue} if issue is not None else {}
+    if policy.close_after_health:
+        issue_options["explicit"] = True
     response = {}
     with util.lock(zte.INTERLOCK) as got:
         if not got:
             return
         pilot.require(zte.settings(config.load(), policy)[2] == data["config"], "ZTE configuration changed")
         check_deadline()
+        if issue is not None:
+            with db.one_read(timeout=0):
+                check_stop(delivery, policy)
+            if delivery.phase == "pr_ready":
+                require_issue_link(delivery, client, issue)
+            zte_issue.current(client, issue,
+                              require_fresh=bool(policy.production_issue_base and delivery.phase != "pr_ready"))
         try:
             with db.tx(timeout=0, before_commit=check_deadline):
                 check_stop(delivery, policy)
@@ -372,11 +437,11 @@ def send_authorized(delivery, policy, client, isolated, proof, risk, ci_scope) -
         if intent.phase == "push_intent":
             client.push(isolated, branch, head, token)
         elif intent.phase == "pr_intent":
-            created = client.create(branch, pilot.TASK_TITLE, pr_body, token)
+            created = client.create(branch, pilot.TASK_TITLE, pr_body, token, **issue_options)
             if isinstance(created.get("node_id"), str):
                 response["created_pr"] = created["node_id"]
         else:
-            reply = client.squash(data["pr"], head, token)
+            reply = client.squash(data["pr"], head, token, **issue_options)
             if reply.get("merged") is True and pilot.SHA.fullmatch(reply.get("sha") or ""):
                 response["returned_merge"] = reply["sha"]
 
@@ -461,9 +526,14 @@ def advance(cfg) -> bool:
             require_landing(delivery, client, release)
             proof = client.ci(release, delivery.data["tree"], "push")
             if proof:
+                if policy.close_after_health:
+                    closure_data = {"issue_content": closable_issue(delivery, client)}
+                else:
+                    closure = issue_closure(delivery, client)
+                    closure_data = {"issue_closure": closure} if closure is not None else {}
                 with db.tx(timeout=0, before_commit=lambda: client.time_left()):
                     check_stop(delivery, policy)
-                    store.transition(delivery, "release_ready", release_ci=proof)
+                    store.transition(delivery, "release_ready", release_ci=proof, **closure_data)
         else:
             send_next(delivery, policy, client, cfg, repo)
     except (OSError, RuntimeError, ValueError, TypeError, KeyError, sqlite3.Error) as error:
