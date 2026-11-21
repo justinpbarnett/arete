@@ -377,6 +377,50 @@ def publication(run_id: str) -> dict:
     return classic_hold(run_id).get("publication", {})
 
 
+def legacy_publication_diffs(source: dict) -> set[tuple[bool, str]]:
+    if not source:
+        return set()
+    try:
+        run_id, end, total = source["run"], source["ts"], source["data"]["committed_lines"]
+        steps = [line for line in run_lines.read(run_id) if line.get("event") in ("step_start", "step_end")]
+        starts = [line for line in steps if line["event"] == "step_start" and line.get("step") == "pr"
+                  and line.get("try") == source.get("try") and line["seq"] < source["seq"]]
+        if len(starts) != 1 or source not in steps:
+            return set()
+        start, first_seq, last_seq = starts[0]["ts"], starts[0]["seq"], source["seq"]
+        if any(first_seq < line["seq"] < last_seq for line in steps):
+            return set()
+        before = [line for line in steps if line["seq"] < first_seq and line["ts"] >= start]
+        after = [line for line in steps if line["seq"] > last_seq and line["ts"] <= end]
+        if any(line["ts"] != start for line in before) or any(line["ts"] != end for line in after):
+            return set()
+        if before and max(before, key=lambda line: line["seq"])["event"] != "step_end":
+            return set()
+        if after and min(after, key=lambda line: line["seq"])["event"] != "step_start":
+            return set()
+        marks = [mark for mark in record.lines(paths.record_dir(run_id) / record.TIMELINE)
+                 if mark.get("kind") == "diff" and start <= mark.get("at", "") <= end]
+    except (OSError, KeyError, TypeError):
+        return set()
+    times = [mark["at"] for mark in marks]
+    if times != sorted(times):
+        return set()
+    max_start = times.count(start) if before else 0
+    min_end = len(marks) - (times.count(end) if after else 0)
+    committed = source["data"].get("committed") is not False
+    candidates = set()
+    for first in range(min(max_start + 1, len(marks))):
+        fresh = marks[first]
+        fresh_empty = fresh.get("files") == [] and fresh.get("lines") == 0 and fresh.get("patch") == ""
+        for last in range(max(first + 1, min_end), min(first + 2, len(marks)) + 1):
+            from_base = not committed or (last == first + 2 and fresh_empty)
+            counted = marks[last - 1] if from_base else fresh
+            patch = counted.get("patch")
+            if counted.get("lines") == total and isinstance(patch, str):
+                candidates.add((from_base, patch))
+    return candidates
+
+
 def authority(run_id: str, c: workspace.Checkout, lease: str) -> tuple[str, bool]:
     pub = publication(run_id)
     heads = pub.get("heads") if isinstance(pub.get("heads"), dict) else {}
@@ -491,6 +535,7 @@ class Job:
     check_commands: list[str] = field(default_factory=list)
     check_rules: list[str] = field(default_factory=list)
     restored: dict[str, str] = field(default_factory=dict)
+    prepared_starts: dict[str, str] = field(default_factory=dict)
     continues: str = ""
     carried: bool = False
     committed: bool = True
@@ -611,7 +656,7 @@ class Job:
             return text
         return f"{text}\n\n{pipeline.NOT_CHECKED_LEFT_FOR_A_PERSON}{self.left_for_a_person}"
 
-    def take(self, name: str, outcome: Outcome, stored: bool) -> None:
+    def take(self, name: str, outcome: Outcome, stored: bool, *, source: dict | None = None) -> None:
         data, run = outcome.data, self.run
         if name == "prepare" and not stored:
             for ask in run.answers_due:
@@ -668,11 +713,11 @@ class Job:
         elif name == "document" and outcome.passed:
             self.document = data.get("text", "")
         elif name == "pr" and outcome.passed:
-            self.published(data, stored)
+            self.published(data, stored, source or {})
         elif name == "ci" and outcome.passed:
             self.ci_result = data["summary"]
 
-    def published(self, data: dict, stored: bool) -> None:
+    def published(self, data: dict, stored: bool, source: dict) -> None:
         for c in self.checkouts:
             c.pr = data["prs"].get(c.github, c.pr)
         self.opened, self.pushed, self.changed = data["opened"], data["pushed"], data["changed"]
@@ -680,10 +725,17 @@ class Job:
         self.found = data.get("found", [])
         self.draft_why, self.report_body, self.summary = data["draft_why"], data["report_body"], data["summary"]
         self.b.committed_lines = data["committed_lines"]
+        self.b.committed_by_repo = dict(data.get("committed_by_repo", {}))
+        self.b.committed_lines_bounded = data.get("committed_lines_bounded", False)
         self.committed = bool(data.get("committed", True))
         if stored:
-            for c in self.picked(self.changed):
-                c.lease = c.onto or util.git(["rev-parse", "HEAD"], c.wt).strip()
+            changed = self.picked(self.changed)
+            if len(self.checkouts) > 1 and self.b.committed_lines and "committed_by_repo" not in data:
+                self.b.committed_by_repo = pipeline.legacy_published_lines(
+                    changed, data.get("heads") or {}, self.prepared_starts, self.b.committed_lines, self.committed,
+                    legacy_publication_diffs(source))
+            for c in changed:
+                c.lease = c.lease or (data.get("heads") or {}).get(c.github) or c.onto
             if self.with_prs:
                 pipeline.note_prs(self.run, self.branch, self.with_prs)
 
@@ -753,6 +805,7 @@ class Job:
         self.expertise, self.approval = data["expertise"], data.get("approval")
         self.checkouts = [workspace.Checkout.from_row(c)
                           for c in data["checkouts"]]
+        self.prepared_starts = {c.github: c.onto or c.revision for c in self.checkouts}
         leases = {c.github: c.lease for c in self.checkouts}
         for c in self.checkouts:
             if str(c.wt) in self.restored:
@@ -1228,8 +1281,10 @@ def settle_unpushed_checkouts(job: Job, before_push=None):
 
 def publish_branch(job: Job, fresh, staged, unpushed, before_push=None):
     b, run, t = job.b, job.run, job.ticket
-    if fresh.empty:
-        b.committed_lines = max(b.committed_lines, staged.lines)
+    if fresh.empty and staged.lines > b.committed_lines:
+        b.committed_lines = staged.lines
+        b.committed_by_repo = {repo: diff.lines for repo, (_, diff) in staged.comparisons.items()}
+        b.committed_lines_bounded = False
     committed = not fresh.empty or bool(unpushed)
     subject = prompt_loader.fill_template(job.layer.subject, config.RepoLayer.subject, kind=t.kind, id=t.id, title=t.title)
     draft_why = job.held_reason
@@ -1248,8 +1303,11 @@ def publication_outcome(job: Job, staged, summary, committed, draft_why="", repo
     data = {"summary": summary, "prs": {c.github: c.pr for c in job.with_prs} if job.run.repo.parts else {},
             "opened": [c.github for c in opened], "pushed": [c.github for c in pushed], "draft_why": draft_why,
             "changed": [c.github for c in staged.changed], "report_body": report_body,
-            "committed_lines": job.b.committed_lines, "heads": {c.github: c.lease for c in staged.changed},
+            "committed_lines": job.b.committed_lines, "committed_by_repo": dict(job.b.committed_by_repo),
+            "heads": {c.github: c.lease for c in staged.changed},
             "committed": committed, "verified": asdict(job.verified)}
+    if job.b.committed_lines_bounded:
+        data["committed_lines_bounded"] = True
     if job.run.repo.parts:
         data.update(found=[c.github for c in found], drafted=[c.github for c in drafted],
                     ci_stopped=[c.github for c in ci_stopped])
@@ -1461,7 +1519,9 @@ def done_comment(job: Job, summary: str) -> str:
 def step(flow: factory.Flow, name: str, **kw) -> Outcome:
     before = flow.skipped
     outcome = flow.step(name, **kw)
-    flow.ctx.take(name, outcome, stored=flow.skipped > before)
+    stored = flow.skipped > before
+    source = flow.earlier[flow.at - 1] if stored and name == "pr" else None
+    flow.ctx.take(name, outcome, stored=stored, source=source)
     return outcome
 
 
