@@ -12,7 +12,7 @@ import urllib.request
 import uuid
 from collections.abc import Sequence
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from urllib.parse import urlencode
 
@@ -826,6 +826,7 @@ class Check:
     check_run_id: int = 0
     source: str = "status"
     workflow_run_id: int = 0
+    details_url: str = ""
 
     @property
     def key(self) -> CheckKey:
@@ -849,10 +850,11 @@ def check_state(row: dict) -> str:
 def check_from_run(row: dict) -> Check:
     app = row.get("app") or {}
     actions = app.get("slug") == "github-actions"
+    details_url = row.get("details_url") or ""
     return Check(row["name"], check_state(row), row.get("completed_at") or row.get("started_at") or "",
-                 row.get("html_url") or row.get("details_url") or "", row["id"] if actions else 0,
+                 row.get("html_url") or details_url, row["id"] if actions else 0,
                  ((row.get("output") or {}).get("title") or "").strip(), row["id"],
-                 f"app:{app.get('id') or app.get('slug') or ''}")
+                 f"app:{app.get('id') or app.get('slug') or ''}", details_url=details_url)
 
 
 def check_from_status(row: dict) -> Check:
@@ -934,13 +936,18 @@ class WorkflowRerun:
     run: int
     attempt: int
     jobs: dict[str, int]
+    unrelated: dict[str, str] = field(default_factory=dict)
 
     @property
     def check_keys(self) -> set[CheckKey]:
         return {(f"app:{GITHUB_ACTIONS_APP_ID}", name) for name in self.jobs}
 
 
-def workflow_run(repo: str, head: str, run: int, *, attempt: int = 0,
+def workflow_belongs_to_pr(row: dict, number: int) -> bool:
+    return row.get("event") == "pull_request" and [pull.get("number") for pull in row.get("pull_requests") or []] == [number]
+
+
+def workflow_run(repo: str, head: str, run: int, *, pr: str = "", attempt: int = 0,
                  timeout: float = 120, retry: bool = True) -> dict:
     path = f"repos/{repo}/actions/runs/{run}" + (f"/attempts/{attempt}" if attempt else "")
     row = gh_json(["api", path], timeout=timeout, retry=retry) or {}
@@ -948,6 +955,8 @@ def workflow_run(repo: str, head: str, run: int, *, attempt: int = 0,
     if (row.get("id") != run or row.get("head_sha") != head or type(actual) is not int or actual <= 0
             or (attempt and actual != attempt)):
         raise GhError(f"GitHub did not identify the workflow attempt for run {run} on {head}")
+    if pr and (pr_repo(pr).casefold() != repo.casefold() or not workflow_belongs_to_pr(row, pr_number(pr))):
+        raise GhError(f"GitHub did not identify workflow run {run} as belonging to {pr}")
     return row
 
 
@@ -973,8 +982,7 @@ def latest_pr_workflows(repo: str, pr: str, head: str, **options) -> dict[int, d
     query = urlencode({"event": "pull_request", "head_sha": head, "per_page": 100})
     number = pr_number(pr)
     candidates = [row for row in actions_rows(f"repos/{repo}/actions/runs?{query}", "workflow_runs", **options)
-                  if (row.get("head_sha"), row.get("event")) == (head, "pull_request")
-                  and [pull.get("number") for pull in row.get("pull_requests") or []] == [number]]
+                  if row.get("head_sha") == head and workflow_belongs_to_pr(row, number)]
     return {row["workflow_id"]: row for row in sorted(candidates, key=lambda row: row["run_number"])}
 
 
@@ -1019,14 +1027,14 @@ def workflow_check(run: dict) -> Check:
                  description=description, source=f"workflow:{run['id']}")
 
 
-def rerun_checks(repo: str, head: str, rerun: WorkflowRerun, run: dict, **options) -> dict[CheckKey, Check]:
+def rerun_checks(repo: str, pr: str, head: str, rerun: WorkflowRerun, run: dict, **options) -> dict[CheckKey, Check]:
     if run["run_attempt"] > rerun.attempt:
-        run = workflow_run(repo, head, rerun.run, attempt=rerun.attempt, **options)
+        run = workflow_run(repo, head, rerun.run, pr=pr, attempt=rerun.attempt, **options)
     if run["run_attempt"] != rerun.attempt or (workflow := workflow_check(run)).state == "pending":
         return {}
     try:
         rows = workflow_attempt_jobs(repo, head, rerun.run, rerun.attempt, **options)
-    except GhError:
+    except (GhError, OSError, KeyError, TypeError, ValueError, AttributeError):
         if workflow.state == "fail":
             return {workflow.key: workflow}
         raise
@@ -1049,3 +1057,9 @@ def rerun_checks(repo: str, head: str, rerun: WorkflowRerun, run: dict, **option
 
 def rerun_failed_jobs(repo: str, run: int) -> None:
     gh(["run", "rerun", str(run), "--failed", "--repo", repo], write=True)
+
+
+def actions_run_id(repo: str, link: str) -> int:
+    match = re.fullmatch(rf"https://github\.com/{re.escape(repo)}/actions/runs/([1-9][0-9]{{0,19}})(?:[/?#].*)?",
+                         link, re.IGNORECASE)
+    return int(match[1]) if match else 0

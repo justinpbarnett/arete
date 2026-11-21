@@ -65,7 +65,7 @@ class Red:
 
     @property
     def key(self) -> tuple[str, str, gh.CheckKey]:
-        return self.target.github, self.target.sha, self.check.key
+        return self.target.github, self.target.sha, self.check.context_key
 
     @property
     def kind(self) -> str:
@@ -95,6 +95,7 @@ class Watched:
     reds: list[Red] = field(default_factory=list)
     conflicting: bool = False
     rerun_reds: set[gh.CheckKey] = field(default_factory=set)
+    rerun_reasons: dict[gh.CheckKey, str] = field(default_factory=dict)
 
     def in_state(self, state: str) -> list[gh.Check]:
         return [c for c in self.checks.values() if c.state == state]
@@ -179,6 +180,7 @@ def conflicting(target: Target, log: Callable[[str], None]) -> bool:
 def watch(target: Target, log: Callable[[str], None], *, reruns: Sequence[gh.WorkflowRerun] = ()) -> Watched:
     completed: dict[int, set[gh.CheckKey]] = {}
     exact: dict[gh.CheckKey, gh.Check] = {}
+    rerun_reasons: dict[gh.CheckKey, str] = {}
 
     def superseded_jobs(checks, newer_attempts, pr_runs, options):
         replaced = {r.run: r.check_keys | completed.get(r.run, set()) for r in reruns}
@@ -216,16 +218,21 @@ def watch(target: Target, log: Callable[[str], None], *, reruns: Sequence[gh.Wor
         checks = gh.commit_checks(target.github, target.sha, **options)
         runs = []
         for rerun in reruns:
-            run = gh.workflow_run(target.github, target.sha, rerun.run, **options)
+            run = gh.workflow_run(target.github, target.sha, rerun.run, pr=target.pr, **options)
             runs.append((rerun, run))
             if rerun.run not in completed:
-                attempt = gh.rerun_checks(target.github, target.sha, rerun, run, **options)
+                attempt = gh.rerun_checks(target.github, target.pr, target.sha, rerun, run, **options)
                 if attempt:
                     completed[rerun.run] = set(attempt)
                     for check in attempt.values():
                         if check.job:
                             check = replace(check, workflow_run_id=rerun.run)
                         exact[check.key] = check
+                        if check.state == "fail" and rerun.unrelated:
+                            if check.source == f"workflow:{rerun.run}":
+                                rerun_reasons[check.key] = " ".join(dict.fromkeys(rerun.unrelated.values()))
+                            elif check.name in rerun.unrelated:
+                                rerun_reasons[check.key] = rerun.unrelated[check.name]
         awaiting_rerun = len(completed) < len(reruns)
         newer_attempts, pr_runs = {}, set()
         if reruns and not awaiting_rerun and not any(check.state == "fail" for check in exact.values()):
@@ -246,7 +253,8 @@ def watch(target: Target, log: Callable[[str], None], *, reruns: Sequence[gh.Wor
 
     def watched(checks: dict[gh.CheckKey, gh.Check], *, read=True, conflict=False) -> Watched:
         return Watched(target, checks | exact, read=read, conflicting=conflict,
-                       rerun_reds={key for key, check in exact.items() if check.state == "fail"})
+                       rerun_reds={key for key, check in exact.items() if check.state == "fail"},
+                       rerun_reasons=rerun_reasons)
 
     log(f"ci: waiting on the checks of {target.pr_name} at {target.sha[:7]}")
     checks: dict[gh.CheckKey, gh.Check] = {}
@@ -302,16 +310,22 @@ def compare_with_base(w: Watched, log: Callable[[str], None]) -> Watched:
         base_sha, on_base = "", {}
     w.reds = [Red(t, c, on_base.get(c.context_key), base_sha) for c in failed]
     for r in w.reds:
+        if r.check.key in w.rerun_reasons:
+            r.caused, r.reason = False, w.rerun_reasons[r.check.key]
         log(f"ci: {r.label} failed; it {r.base_result.replace('`', '')}")
     return w
 
 
 def failure_note(r: Red, log_file: Path) -> str:
     lines = [f"### {r.label}", "", f"- Link: {r.check.link or 'none'}", f"- This check {r.base_result}."]
+    if r.kind == "not caused":
+        lines.append(f"- Arete judged this failure unrelated to the PR. {r.reason}")
     if r.check.description:
         lines.append(f"- GitHub says: {r.check.description}")
     if not r.check.job:
-        return "\n".join([*lines, "- This check has no Actions log. Judge it from its name, what GitHub says, and the diff."])
+        if r.kind == "unjudged":
+            lines.append("- This check has no Actions log. Judge it from its name, what GitHub says, and the diff.")
+        return "\n".join(lines)
     try:
         text = gh.job_log(r.target.github, r.check.job)
     except gh.GhError as e:
@@ -443,6 +457,8 @@ def section(rounds: list[Round], max_rounds: int, ending: str = "") -> str:
         for w in last.seen:
             lines += [f"[{w.target.pr_name}]({w.target.pr}) at `{w.target.sha[:7]}`, round {last.n} of {max_rounds}:",
                       "", *w.markdown(), ""]
+        if last.story:
+            lines += [last.story, ""]
     if ending:
         lines += [ending, ""]
     if len(rounds) > 1:

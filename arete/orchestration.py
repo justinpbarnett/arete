@@ -761,27 +761,43 @@ class Controller:
         pipeline.ready_pushed(self.run, fresh, job.picked(job.ci_stopped), job.draft_why)
         return self.finish_publication()
 
-    def second_ci_failure(self, targets, retried):
+    def second_ci_failure(self, targets, retried, *, finish=True):
         for repo, target in targets.items():
             head = target["head"]
             if target["red"] and head in retried.get(repo, []):
                 reason = f"CI failed twice on the unchanged head {head}"
-                self.ending = flows.finish(self.flow, "failed", why=reason, prs=True)
+                if finish:
+                    self.ending = flows.finish(self.flow, "failed", why=reason, prs=True)
                 return {"error": reason}
         return None
 
     def publication_ci(self, pushed, *, caught_up=False, reruns=None):
         tree = self.fingerprint()
-        current = pipeline.watch_publication_ci(self.run, self.job.slot, pushed, reruns=reruns)
+        saved = self.data.get("ci_retry", {}) if reruns is not None else {}
+        max_rounds = saved.get("max_rounds", 2) if reruns is not None else self.run.settings("ci_repair").tries
+        earlier = [pipeline.ci.Round(n, [], story) for n, story in enumerate(saved.get("round_stories", []), 1)]
+        automatic = pipeline.AutomaticCIReruns()
+        rounds = pipeline.watch_publication_ci(self.job.b, self.job.slot, pushed, max_rounds,
+                                               automatic=automatic, reruns=reruns)
+        current = rounds[-1]
+        if earlier:
+            current.n = len(earlier) + 1
+            rounds = earlier + rounds
         self.job.ci_result = current.summary()
         self.check_pilot_publication()
-        section = pipeline.ci.section([current], current.n)
+        section = pipeline.ci.section(rounds, max_rounds)
         if caught_up:
             for checkout in pushed:
                 pipeline.comment_catch_up_ci(self.run, checkout, section, self.job.verified, self.job.review)
         else:
             pipeline.publish_ci(self.run, self.job.ticket, self.job.with_prs, section)
         self.data.pop("ci_retry", None)
+        automatic_reruns = {c.github: attempts for c in pushed if (attempts := automatic.for_checkout(c))}
+        for checkout in pushed:
+            if checkout.github in automatic_reruns:
+                retried = self.data.setdefault("ci_retried_heads", {}).setdefault(checkout.github, [])
+                if checkout.lease not in retried:
+                    retried.append(checkout.lease)
         if current.passed:
             self.data.pop("ci_failed", None)
             self.data.pop("ci_failures", None)
@@ -793,13 +809,16 @@ class Controller:
             reds = [r for r in w.reds if w.read or r.check.key in w.rerun_reds]
             targets[w.target.github] = {"head": w.target.sha, "pr": w.target.pr, "red": bool(reds),
                                         "jobs": [r.check.job for r in reds if r.check.job]}
-        interrupted_watch = reruns is not None and not current.all_read
+        requested = automatic_reruns if reruns is None else reruns
+        interrupted_watch = bool(requested) and not current.all_read
         if interrupted_watch or any(t["red"] for t in targets.values()):
             self.data["published_tree"] = tree
             self.data["ci_retry"] = {"caught_up": caught_up, "targets": targets}
             if interrupted_watch:
-                self.data["ci_retry"]["reruns"] = {repo: [asdict(rerun) for rerun in requested]
-                                                   for repo, requested in reruns.items()}
+                retry = self.data["ci_retry"]
+                retry["reruns"] = {repo: [asdict(rerun) for rerun in attempts] for repo, attempts in requested.items()}
+                if earlier or automatic_reruns:
+                    retry.update(max_rounds=max_rounds, round_stories=[r.story for r in rounds[:-1]])
         self.data["ci_failures"] = self.ci_failures(current)
         self.catalog.add_context(CI_FAILURES, self.data["ci_failures"])
         check_head = caught_up or self.data.get("catch_up_hold")
@@ -810,6 +829,9 @@ class Controller:
                                or pipeline.own_draft_state(self.run, checkout) is None):
                 continue
             pipeline.set_draft(self.run, checkout, True)
+        if any(w.rerun_reasons for w in current.seen) and all(r.kind in ("base", "not caused") for r in current.reds):
+            if failure := self.second_ci_failure(targets, self.data.get("ci_retried_heads", {}), finish=False):
+                return {**failure, "ci": self.job.ci_result, "second_red": True}
         return {"ci": self.job.ci_result, "failures": CI_FAILURES,
                 "error": f"CI needs an explicit worker diagnosis or repair; its failure logs are context {CI_FAILURES}"}
 
@@ -932,7 +954,9 @@ class Controller:
         return pipeline.park_run(self.run, f"{held}. {reason}")
 
     def settle_publication_failure(self, failure):
-        if self.data.get("catch_up_hold"):
+        if failure.pop("second_red", False):
+            self.ending = flows.finish(self.flow, "failed", why=failure["error"], prs=True)
+        elif self.data.get("catch_up_hold"):
             if failure.get("park"):
                 self.ending = self.park_catch_up(failure["error"])
             elif self.run.budget and (limit := self.run.budget.repair_limit_reason()):
