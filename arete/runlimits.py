@@ -609,11 +609,11 @@ class Budget:
             return f"the repair chain used its {self.policy.max_repair_cycles} repair cycles"
         return ""
 
-    def charge(self, step: str, role: str, *, read_only: bool = False) -> None:
+    def charge(self, step: str, role: str) -> None:
         if time.monotonic() >= self.run_deadline() or (self.verify_deadline is not None
                                                and time.monotonic() >= self.verify_deadline):
             raise Parked(self.reason())
-        if read_only or (role not in REPAIRS and not step.startswith(REPAIR_NAMES)):
+        if role not in REPAIRS and not step.startswith(REPAIR_NAMES):
             self.checkpoint()
             return
         self.check_repairs()

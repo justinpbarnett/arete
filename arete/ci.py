@@ -58,6 +58,7 @@ class Red:
     base_sha: str
     caused: bool | None = None
     reason: str = ""
+    rerun_reason: str = ""
 
     @property
     def label(self) -> str:
@@ -65,7 +66,7 @@ class Red:
 
     @property
     def key(self) -> tuple[str, str, gh.CheckKey]:
-        return self.target.github, self.target.sha, self.check.context_key
+        return self.target.github, self.target.sha, self.check.key
 
     @property
     def kind(self) -> str:
@@ -96,6 +97,8 @@ class Watched:
     conflicting: bool = False
     rerun_reds: set[gh.CheckKey] = field(default_factory=set)
     rerun_reasons: dict[gh.CheckKey, str] = field(default_factory=dict)
+    previous_failure: bool = False
+    red_workflows: set[int] = field(default_factory=set)
 
     def in_state(self, state: str) -> list[gh.Check]:
         return [c for c in self.checks.values() if c.state == state]
@@ -181,6 +184,7 @@ def watch(target: Target, log: Callable[[str], None], *, reruns: Sequence[gh.Wor
     completed: dict[int, set[gh.CheckKey]] = {}
     exact: dict[gh.CheckKey, gh.Check] = {}
     rerun_reasons: dict[gh.CheckKey, str] = {}
+    red_workflows: set[int] = set()
 
     def superseded_jobs(checks, newer_attempts, pr_runs, options):
         replaced = {r.run: r.check_keys | completed.get(r.run, set()) for r in reruns}
@@ -215,10 +219,11 @@ def watch(target: Target, log: Callable[[str], None], *, reruns: Sequence[gh.Wor
 
     def snapshot(*, timeout: float = 120, retry: bool = True):
         options = {"timeout": timeout, "retry": retry}
-        checks = gh.commit_checks(target.github, target.sha, **options)
+        checks = gh.commit_checks(target.github, target.sha, red_workflows=red_workflows, **options)
         runs = []
         for rerun in reruns:
-            run = gh.workflow_run(target.github, target.sha, rerun.run, pr=target.pr, **options)
+            run = gh.workflow_run(target.github, target.sha, rerun.run, pr=target.pr,
+                                  allow_head_branch=bool(rerun.unrelated), **options)
             runs.append((rerun, run))
             if rerun.run not in completed:
                 attempt = gh.rerun_checks(target.github, target.pr, target.sha, rerun, run, **options)
@@ -254,7 +259,7 @@ def watch(target: Target, log: Callable[[str], None], *, reruns: Sequence[gh.Wor
     def watched(checks: dict[gh.CheckKey, gh.Check], *, read=True, conflict=False) -> Watched:
         return Watched(target, checks | exact, read=read, conflicting=conflict,
                        rerun_reds={key for key, check in exact.items() if check.state == "fail"},
-                       rerun_reasons=rerun_reasons)
+                       rerun_reasons=rerun_reasons, red_workflows=red_workflows)
 
     log(f"ci: waiting on the checks of {target.pr_name} at {target.sha[:7]}")
     checks: dict[gh.CheckKey, gh.Check] = {}

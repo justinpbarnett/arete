@@ -838,6 +838,13 @@ class Check:
     def context_key(self) -> CheckKey:
         return self.source, self.name
 
+    def actions_workflow(self, repo: str) -> int:
+        from_link = actions_run_id(repo, self.link)
+        from_details = actions_run_id(repo, self.details_url)
+        if from_link and from_details and from_link != from_details:
+            return 0
+        return from_link or from_details
+
 
 def check_state(row: dict) -> str:
     if row.get("status") != "completed":
@@ -862,7 +869,8 @@ def check_from_status(row: dict) -> Check:
                  row.get("target_url") or "", 0, (row.get("description") or "").strip())
 
 
-def commit_checks(repo: str, ref: str, *, timeout: float = 120, retry: bool = True) -> dict[CheckKey, Check]:
+def commit_checks(repo: str, ref: str, *, timeout: float = 120, retry: bool = True,
+                  red_workflows: set[int] | None = None) -> dict[CheckKey, Check]:
     path = f"repos/{repo}/commits/{ref}"
     pages = gh_json(["api", f"{path}/check-runs?filter=all&per_page=100", "--paginate", "--slurp"],
                     timeout=timeout, retry=retry)
@@ -874,6 +882,9 @@ def commit_checks(repo: str, ref: str, *, timeout: float = 120, retry: bool = Tr
     if not isinstance(statuses, list) or not statuses or any(
             not isinstance(page, list) for page in statuses):
         raise GhError("GitHub did not return commit statuses")
+    if red_workflows is not None:
+        red_workflows.clear()
+        red_workflows.update(c.actions_workflow(repo) for c in runs if c.state == "fail")
     newest = {c.key: c for c in runs}
     # GitHub returns commit statuses in reverse chronological order.
     for c in (check_from_status(row) for page in statuses for row in page):
@@ -944,19 +955,39 @@ class WorkflowRerun:
 
 
 def workflow_belongs_to_pr(row: dict, number: int) -> bool:
-    return row.get("event") == "pull_request" and [pull.get("number") for pull in row.get("pull_requests") or []] == [number]
+    pulls = row.get("pull_requests")
+    return (row.get("event") == "pull_request" and isinstance(pulls, list) and len(pulls) == 1 and isinstance(pulls[0], dict)
+            and type(pulls[0].get("number")) is int and pulls[0]["number"] == number)
 
 
-def workflow_run(repo: str, head: str, run: int, *, pr: str = "", attempt: int = 0,
+def workflow_belongs_to_head_branch(row: dict, repo: str, number: int, head: str, **options) -> bool:
+    if row.get("pull_requests") != [] or not row.get("head_branch"):
+        return False
+    pull = gh_json(["api", f"repos/{repo}/pulls/{number}"], **options) or {}
+    ref = pull.get("head") or {}
+    branch_repo = (ref.get("repo") or {}).get("full_name")
+    run_repo = (row.get("head_repository") or {}).get("full_name")
+    return (type(pull.get("number")) is int and pull["number"] == number and pull.get("state") == "open"
+            and ref.get("sha") == head and ref.get("ref") == row["head_branch"]
+            and isinstance(branch_repo, str) and isinstance(run_repo, str)
+            and bool(branch_repo) and branch_repo.casefold() == run_repo.casefold())
+
+
+def workflow_run(repo: str, head: str, run: int, *, pr: str = "", allow_head_branch: bool = False, attempt: int = 0,
                  timeout: float = 120, retry: bool = True) -> dict:
     path = f"repos/{repo}/actions/runs/{run}" + (f"/attempts/{attempt}" if attempt else "")
     row = gh_json(["api", path], timeout=timeout, retry=retry) or {}
     actual = row.get("run_attempt")
-    if (row.get("id") != run or row.get("head_sha") != head or type(actual) is not int or actual <= 0
+    if (type(row.get("id")) is not int or row["id"] != run or row.get("head_sha") != head
+            or type(actual) is not int or actual <= 0
             or (attempt and actual != attempt)):
         raise GhError(f"GitHub did not identify the workflow attempt for run {run} on {head}")
-    if pr and (pr_repo(pr).casefold() != repo.casefold() or not workflow_belongs_to_pr(row, pr_number(pr))):
-        raise GhError(f"GitHub did not identify workflow run {run} as belonging to {pr}")
+    if pr:
+        number = pr_number(pr)
+        if pr_repo(pr).casefold() != repo.casefold() or not (
+                workflow_belongs_to_pr(row, number) or allow_head_branch and workflow_belongs_to_head_branch(
+                    row, repo, number, head, timeout=timeout, retry=retry)):
+            raise GhError(f"GitHub did not identify workflow run {run} as belonging to {pr}")
     return row
 
 
@@ -976,6 +1007,41 @@ def workflow_attempt_jobs(repo: str, head: str, run: int, attempt: int, *,
             and row.get("run_attempt", attempt) == attempt
             and type(row.get("id")) is int and row["id"] > 0
             and isinstance(row.get("name"), str) and row["name"]]
+
+
+def failed_workflow_jobs(repo: str, head: str, run: int, attempt: int) -> dict[int, str]:
+    path = f"repos/{repo}/actions/runs/{run}/jobs?filter=all&per_page=100"
+    pages = gh_json(["api", path, "--paginate", "--slurp"])
+    incomplete = f"GitHub did not return complete job results for workflow run {run} on {head}"
+    if not isinstance(pages, list) or not pages or any(
+            not isinstance(page, dict) or not isinstance(page.get("jobs"), list) for page in pages):
+        raise GhError(incomplete)
+    rows = [row for page in pages for row in page["jobs"]]
+    if not rows or any(type(page.get("total_count")) is not int or page["total_count"] != len(rows) for page in pages):
+        raise GhError(incomplete)
+    seen, attempts = set(), set()
+    jobs_by_name: dict[str, dict[int, list[dict]]] = {}
+    for row in rows:
+        if (not isinstance(row, dict) or type(row.get("run_id")) is not int or row["run_id"] != run
+                or row.get("head_sha") != head or type(row.get("run_attempt")) is not int
+                or not 0 < row["run_attempt"] <= attempt or row.get("status") != "completed"
+                or not isinstance(row.get("conclusion"), str) or not row["conclusion"]
+                or not isinstance(row.get("name"), str) or not row["name"]
+                or type(row.get("id")) is not int or row["id"] <= 0 or row["id"] in seen):
+            raise GhError(incomplete)
+        job_attempt = row["run_attempt"]
+        seen.add(row["id"])
+        attempts.add(job_attempt)
+        jobs_by_name.setdefault(row["name"], {}).setdefault(job_attempt, []).append(row)
+    if attempt not in attempts:
+        raise GhError(incomplete)
+    failed = {}
+    for name, attempts_for_job in jobs_by_name.items():
+        if len(attempts_for_job) > 1 and any(len(jobs) > 1 for jobs in attempts_for_job.values()):
+            raise GhError(f"GitHub returned ambiguous attempts for jobs named {name} in workflow run {run}")
+        current = attempts_for_job[max(attempts_for_job)]
+        failed.update((job["id"], name) for job in current if check_state(job) == "fail")
+    return failed
 
 
 def latest_pr_workflows(repo: str, pr: str, head: str, **options) -> dict[int, dict]:
@@ -1029,12 +1095,13 @@ def workflow_check(run: dict) -> Check:
 
 def rerun_checks(repo: str, pr: str, head: str, rerun: WorkflowRerun, run: dict, **options) -> dict[CheckKey, Check]:
     if run["run_attempt"] > rerun.attempt:
-        run = workflow_run(repo, head, rerun.run, pr=pr, attempt=rerun.attempt, **options)
+        run = workflow_run(repo, head, rerun.run, pr=pr, allow_head_branch=bool(rerun.unrelated),
+                           attempt=rerun.attempt, **options)
     if run["run_attempt"] != rerun.attempt or (workflow := workflow_check(run)).state == "pending":
         return {}
     try:
         rows = workflow_attempt_jobs(repo, head, rerun.run, rerun.attempt, **options)
-    except (GhError, OSError, KeyError, TypeError, ValueError, AttributeError):
+    except GhError:
         if workflow.state == "fail":
             return {workflow.key: workflow}
         raise
@@ -1060,6 +1127,8 @@ def rerun_failed_jobs(repo: str, run: int) -> None:
 
 
 def actions_run_id(repo: str, link: str) -> int:
+    if not isinstance(link, str):
+        return 0
     match = re.fullmatch(rf"https://github\.com/{re.escape(repo)}/actions/runs/([1-9][0-9]{{0,19}})(?:[/?#].*)?",
                          link, re.IGNORECASE)
     return int(match[1]) if match else 0

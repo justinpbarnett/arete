@@ -262,6 +262,8 @@ class AutomaticCIRerunTests(unittest.TestCase):
         self.failed = [self.job("checks", 101, "failure")]
         self.base_jobs = []
         self.rerun_jobs = [self.job("checks", 201, "success")]
+        self.workflow_job_pages = None
+        self.workflow_attempt = 1
         self.launched = False
         self.attempt_read = False
         self.attempt_error = None
@@ -269,6 +271,9 @@ class AutomaticCIRerunTests(unittest.TestCase):
         self.rerun_error = None
         self.workflow_pr = 7
         self.attempt_pr = 7
+        self.workflow_head = ""
+        self.workflow_branch = "fixture-branch"
+        self.workflow_head_repo = self.checkout.github
         self.verdicts = {"checks": False}
         self.fix = mock.Mock(side_effect=self.judge)
         self.run.agent.side_effect = lambda *_args, **_options: self.judge()
@@ -285,6 +290,7 @@ class AutomaticCIRerunTests(unittest.TestCase):
         self.sleep = mock.Mock(side_effect=self.wait_for_attempt)
         self.enterContext(mock.patch.object(ci, "time", SimpleNamespace(monotonic=time.monotonic, sleep=self.sleep)))
         self.enterContext(mock.patch.object(ci, "failure_note", return_value="Fixture failure"))
+        self.run_history = self.enterContext(mock.patch.object(factory, "chain", return_value=[]))
         self.enterContext(mock.patch.object(pipeline, "run_folder", return_value=root))
         self.enterContext(mock.patch.object(pipeline, "checkout_patch", return_value="fixture diff"))
         self.enterContext(mock.patch.object(pipeline, "merge_moved_bases_for_ci_fix", return_value=""))
@@ -338,15 +344,28 @@ class AutomaticCIRerunTests(unittest.TestCase):
             return [{"check_runs": self.rerun_jobs if latest and "filter=latest" in endpoint else self.failed}]
         if endpoint.startswith(prefix + "commits/") and "/statuses?" in endpoint:
             return [[]]
+        if endpoint == prefix + "pulls/7":
+            return {"number": 7, "state": "open", "head": {"sha": self.checkout.lease, "ref": "fixture-branch",
+                                                          "repo": {"full_name": self.checkout.github}}}
         if endpoint == prefix + "actions/runs/456":
-            attempt = 2 if self.sleep.called or (self.launched and self.attempt_ready) else 1
-            passed = attempt == 2 and all(j["conclusion"] == "success" for j in self.rerun_jobs)
+            rerunning = self.sleep.called or (self.launched and self.attempt_ready)
+            attempt = self.workflow_attempt + int(rerunning)
+            passed = rerunning and all(j["conclusion"] == "success" for j in self.rerun_jobs)
             number = self.attempt_pr if self.launched else self.workflow_pr
-            return {"id": 456, "head_sha": self.checkout.lease, "run_attempt": attempt, "run_number": 1,
+            return {"id": 456, "head_sha": self.workflow_head or self.checkout.lease, "run_attempt": attempt, "run_number": 1,
                     "workflow_id": 1, "status": "completed", "conclusion": "success" if passed else "failure",
-                    "event": "pull_request", "pull_requests": [{"number": number}], "name": "Fixture CI",
+                    "event": "pull_request" if number else "push", "pull_requests": [{"number": number}] if number else [],
+                    "head_branch": self.workflow_branch, "head_repository": {"full_name": self.workflow_head_repo},
+                    "name": "Fixture CI",
                     "html_url": "https://github.com/fixture/repo/actions/runs/456"}
-        if endpoint == prefix + "actions/runs/456/attempts/2/jobs?per_page=100":
+        if endpoint == prefix + "actions/runs/456/jobs?filter=all&per_page=100":
+            self.assertEqual(args[2:], ["--paginate", "--slurp"])
+            if self.workflow_job_pages is not None:
+                return self.workflow_job_pages
+            jobs = [{**job, "head_sha": self.checkout.lease, "run_attempt": 1}
+                    for job in self.failed if job["run_id"] == 456]
+            return [{"total_count": len(jobs), "jobs": jobs}]
+        if endpoint == prefix + f"actions/runs/456/attempts/{self.workflow_attempt + 1}/jobs?per_page=100":
             if self.attempt_error:
                 raise self.attempt_error
             self.attempt_read = True
@@ -407,6 +426,81 @@ class AutomaticCIRerunTests(unittest.TestCase):
         self.push_fix.assert_called_once()
         self.discard.assert_not_called()
 
+    def test_case_colliding_jobs_cannot_share_an_unrelated_verdict(self):
+        self.failed.insert(0, self.job("Checks", 100, "failure"))
+        self.rerun_jobs.append(self.job("Checks", 200, "success"))
+        self.verdicts = {"Checks": True, "checks": False}
+
+        self.watch()
+        gh.gh.assert_not_called()
+        self.fix.assert_called_once()
+        self.push_fix.assert_not_called()
+        self.assertEqual(self.automerge_hold(), self.hold_reason)
+
+        controller = self.controller()
+        with mock.patch.object(pipeline, "set_draft"):
+            self.assertEqual(controller.publish()["failures"], orchestration.CI_FAILURES)
+        self.run.agent.assert_called_once()
+        gh.gh.assert_not_called()
+
+    def test_conflicting_verdicts_for_one_job_cannot_authorize_a_rerun(self):
+        self.verdicts = {"repo#7 checks": False, "checks": True}
+
+        self.assertIn("red but not caused by the PR", self.watch())
+        gh.gh.assert_not_called()
+        self.fix.assert_called_once()
+        self.push_fix.assert_not_called()
+        self.assertEqual(self.automerge_hold(), self.hold_reason)
+
+    def test_human_rerun_supersedes_old_failure_and_preserves_carried_failure(self):
+        self.workflow_attempt = 2
+        superseded = self.job("checks", 100, "failure")
+        carried = self.job("carried", 102, "failure")
+        self.workflow_job_pages = [{"total_count": 3, "jobs": [
+            {**self.failed[0], "run_attempt": 2}, {**superseded, "run_attempt": 1}, {**carried, "run_attempt": 1},
+        ]}]
+        self.failed += [superseded, carried]
+        self.verdicts["carried"] = False
+        self.rerun_jobs.append(self.job("carried", 202, "success"))
+
+        self.assertEqual(self.watch(), "2 of 2 passed")
+        gh.gh.assert_called_once()
+        self.fix.assert_called_once()
+        self.push_fix.assert_not_called()
+        self.assertEqual(self.automerge_hold(), "")
+
+    def test_human_rerun_cannot_hide_an_ambiguous_carried_failure(self):
+        self.workflow_attempt = 2
+        self.failed += [self.job("checks", 100, "failure"), self.job("checks", 99, "failure")]
+        self.workflow_job_pages = [{"total_count": 3, "jobs": [
+            {**job, "run_attempt": 2 if job["id"] == 101 else 1} for job in self.failed
+        ]}]
+
+        self.assertIn("red but not caused by the PR", self.watch())
+        gh.gh.assert_not_called()
+        self.push_fix.assert_not_called()
+        self.assertEqual(self.automerge_hold(), self.hold_reason)
+
+    def test_new_failure_after_rerun_uses_the_remaining_ci_repair_round(self):
+        self.rerun_jobs = [self.job("checks", 201, "success"), self.job("dependent", 202, "failure")]
+        self.verdicts["dependent"] = True
+        ci.failure_note.side_effect = lambda red, _: red.check.name
+
+        def push_fix(*args):
+            self.fixed(*args)
+            self.rerun_jobs[1] = self.job("dependent", 302, "success")
+
+        self.push_fix.side_effect = push_fix
+
+        self.assertEqual(self.watch(), "2 of 2 passed")
+        self.assertEqual([call.args[2] for call in self.fix.call_args_list], ["checks", "dependent"])
+        self.push_fix.assert_called_once()
+        self.assertEqual(self.push_fix.call_args.args[-1], 2)
+        self.assertEqual(self.checkout.lease, "fixed-head")
+        gh.gh.assert_called_once()
+        self.assertIn("Arete reran failed jobs for repo#7 checks.", self.body.call_args.args[1])
+        self.assertEqual(self.automerge_hold(), "")
+
     def test_failed_rerun_request_logs_error_and_keeps_the_existing_hold(self):
         self.rerun_error = gh.GhError("permission denied")
 
@@ -439,6 +533,86 @@ class AutomaticCIRerunTests(unittest.TestCase):
         for name in ("checks", "other check"):
             self.assertTrue(any(f"reran failed jobs for repo#7 {name}: failed on main" in call.args[0]
                                 for call in self.run.log.call_args_list))
+
+    def test_two_unrelated_red_workflows_keep_the_existing_holds(self):
+        self.failed.append(self.job("other check", 102, "failure", run=789))
+        self.verdicts["other check"] = False
+
+        self.assertIn("2 red but not caused by the PR", self.watch())
+        self.fix.assert_called_once()
+        self.push_fix.assert_not_called()
+        self.assertEqual(self.automerge_hold(), self.hold_reason)
+
+        controller = self.controller()
+        with mock.patch.object(pipeline, "set_draft") as draft:
+            result = controller.publish()
+        self.assertEqual(result["failures"], orchestration.CI_FAILURES)
+        self.assertIn("2 red and not judged", result["ci"])
+        draft.assert_called_once_with(self.run, self.checkout, True)
+        self.run.agent.assert_not_called()
+        gh.gh.assert_not_called()
+
+    def test_distinct_workflows_with_the_same_red_job_name_do_not_rerun(self):
+        self.failed.append(self.job("checks", 102, "failure", run=789))
+
+        self.assertIn("red but not caused by the PR", self.watch())
+        self.assertEqual(self.automerge_hold(), self.hold_reason)
+        gh.gh.assert_not_called()
+
+    def test_same_workflow_duplicate_job_name_cannot_borrow_the_judged_verdict(self):
+        self.failed.insert(0, self.job("checks", 100, "failure"))
+        self.workflow_job_pages = [{"total_count": 2, "jobs": [{**job, "run_attempt": 1}]}
+                                   for job in reversed(self.failed)]
+        ci.failure_note.side_effect = lambda red, _: {
+            100: "The PR changed the expected result.", 101: "The runner timed out."
+        }[red.check.job]
+
+        self.assertIn("red but not caused by the PR", self.watch())
+        self.fix.assert_called_once()
+        self.assertEqual(self.fix.call_args.args[2], "The runner timed out.")
+        self.push_fix.assert_not_called()
+        gh.gh.assert_not_called()
+        self.assertEqual(self.automerge_hold(), self.hold_reason)
+
+        controller = self.controller()
+        with mock.patch.object(pipeline, "set_draft"):
+            self.assertEqual(controller.publish()["failures"], orchestration.CI_FAILURES)
+        self.assertIsNone(controller.ending)
+        gh.gh.assert_not_called()
+
+    def test_passing_same_name_job_does_not_hide_a_second_red_workflow(self):
+        self.failed += [self.job("other check", 102, "failure", run=789),
+                        self.job("other check", 103, "success", run=789)]
+
+        self.assertIn("red but not caused by the PR", self.watch())
+        self.fix.assert_called_once()
+        gh.gh.assert_not_called()
+        self.assertEqual(self.automerge_hold(), self.hold_reason)
+
+    def test_incomplete_workflow_job_pages_keep_the_existing_hold(self):
+        self.workflow_job_pages = [{"total_count": 2, "jobs": [{**self.failed[0], "run_attempt": 1}]}]
+
+        self.assertIn("red but not caused by the PR", self.watch())
+        self.fix.assert_called_once()
+        self.push_fix.assert_not_called()
+        gh.gh.assert_not_called()
+        self.assertEqual(self.automerge_hold(), self.hold_reason)
+
+    def test_older_same_name_red_without_workflow_id_blocks_rerun(self):
+        self.failed.insert(0, {**self.job("checks", 100, "failure", run=789),
+                               "html_url": "https://github.com/fixture/repo/runs/100"})
+
+        self.assertIn("red but not caused by the PR", self.watch())
+        self.assertEqual(self.automerge_hold(), self.hold_reason)
+
+        controller = self.controller()
+        with mock.patch.object(pipeline, "set_draft") as draft:
+            result = controller.publish()
+        self.assertEqual(result["failures"], orchestration.CI_FAILURES)
+        self.assertIn("red and not judged", result["ci"])
+        draft.assert_called_once_with(self.run, self.checkout, True)
+        self.run.agent.assert_not_called()
+        gh.gh.assert_not_called()
 
     def test_final_round_does_not_launch_an_unwatched_rerun(self):
         self.run.settings.return_value.tries = 1
@@ -481,6 +655,28 @@ class AutomaticCIRerunTests(unittest.TestCase):
         self.assertTrue(self.run.agent.call_args.kwargs["read_only"])
         self.push_fix.assert_not_called()
         self.assertIn("round 2 of 3", self.body.call_args.args[1])
+        self.assertIn("Arete reran failed jobs for repo#7 checks.", self.body.call_args.args[1])
+
+    def test_default_publication_leaves_a_confirmed_repeat_red_for_worker_diagnosis(self):
+        self.rerun_jobs = [self.job("checks", 201, "failure")]
+        controller = self.controller()
+        with (mock.patch.object(pipeline, "set_draft") as draft,
+              mock.patch.object(flows, "finish") as finish):
+            result = controller.publish()
+            self.assertEqual(controller.publish(), result)
+
+        self.assertEqual(result["failures"], orchestration.CI_FAILURES)
+        self.assertEqual(result["error"],
+                         "CI needs an explicit worker diagnosis or repair; its failure logs are context ci:failures")
+        self.assertIsNone(controller.ending)
+        self.assertTrue(self.attempt_read)
+        self.assertEqual(controller.data["ci_retry"]["targets"][self.checkout.github]["jobs"], [201])
+        controller.catalog.add_context.assert_called_once_with(orchestration.CI_FAILURES, controller.data["ci_failures"])
+        controller.atomic.assert_called_once()
+        controller.finish_publication.assert_not_called()
+        draft.assert_called_once_with(self.run, self.checkout, True)
+        finish.assert_not_called()
+        gh.gh.assert_called_once()
         self.assertIn("Arete reran failed jobs for repo#7 checks.", self.body.call_args.args[1])
 
     def test_classic_automerge_watches_a_rerun_after_the_catch_up_push(self):
@@ -539,6 +735,43 @@ class AutomaticCIRerunTests(unittest.TestCase):
         self.assertIn("red but not caused by the PR", self.watch())
         gh.gh.assert_not_called()
         self.push_fix.assert_not_called()
+
+    def test_check_permalink_without_a_workflow_id_keeps_the_existing_hold(self):
+        self.check_permalink()
+        self.failed[0].pop("details_url")
+
+        self.assertIn("red but not caused by the PR", self.watch())
+        self.assertEqual(self.automerge_hold(), self.hold_reason)
+        gh.gh.assert_not_called()
+
+    def test_workflow_run_at_a_different_head_never_receives_a_rerun(self):
+        self.workflow_head = "different-head"
+
+        self.assertIn("red but not caused by the PR", self.watch())
+        self.assertEqual(self.automerge_hold(), self.hold_reason)
+        gh.gh.assert_not_called()
+
+    def test_rerun_is_skipped_if_the_pr_head_moved(self):
+        with mock.patch.object(gh, "pr_merge_details", return_value={**self.pr_details(), "headRefOid": "new-head"}):
+            self.assertIn("red but not caused by the PR", self.watch())
+
+        gh.gh.assert_not_called()
+
+    def test_head_branch_workflow_can_rerun_and_clear_ci(self):
+        self.workflow_pr = self.attempt_pr = None
+        self.check_permalink()
+
+        self.assertEqual(self.watch(), "1 of 1 passed")
+        self.assertEqual(self.automerge_hold(), "")
+        gh.gh.assert_called_once()
+
+    def test_head_branch_name_alone_does_not_establish_ownership(self):
+        self.workflow_pr = None
+        self.workflow_head_repo = "other/fork"
+
+        self.assertIn("red but not caused by the PR", self.watch())
+        self.assertEqual(self.automerge_hold(), self.hold_reason)
+        gh.gh.assert_not_called()
 
     def test_foreign_pr_result_cannot_clear_publication_ci(self):
         self.attempt_pr = 8
@@ -656,10 +889,9 @@ class AutomaticCIRerunTests(unittest.TestCase):
         resumed = self.controller()
         resumed.data = json.loads(json.dumps(controller.data))
         self.attempt_ready = True
-        reason = f"CI failed twice on the unchanged head {self.checkout.lease}"
         with (mock.patch.object(pipeline, "set_draft") as draft,
-              mock.patch.object(flows, "finish", return_value=("failed", reason, self.checkout.pr)) as finish):
-            self.assertEqual(resumed.publish()["error"], reason)
+              mock.patch.object(flows, "finish") as finish):
+            self.assertEqual(resumed.publish()["failures"], orchestration.CI_FAILURES)
 
         self.assertTrue(self.attempt_read)
         gh.gh.assert_called_once()
@@ -667,7 +899,8 @@ class AutomaticCIRerunTests(unittest.TestCase):
         resumed.atomic.assert_not_called()
         resumed.finish_publication.assert_not_called()
         draft.assert_called_once_with(self.run, self.checkout, True)
-        finish.assert_called_once_with(resumed.flow, "failed", why=reason, prs=True)
+        self.assertIsNone(resumed.ending)
+        finish.assert_not_called()
         self.assertIn("round 2 of 2", self.body.call_args.args[1])
 
     def test_definite_rerun_failure_keeps_the_existing_publication_hold(self):
@@ -683,6 +916,58 @@ class AutomaticCIRerunTests(unittest.TestCase):
         self.assertIn("round 1 of 3", self.body.call_args.args[1])
         draft.assert_called_once_with(self.run, self.checkout, True)
 
+    def test_definite_rerun_failure_is_reported_and_cannot_send_again(self):
+        self.rerun_error = gh.GhError("permission denied")
+        controller = self.controller()
+
+        def rejected(args, **options):
+            self.assertEqual(controller.data["ci_rerun_requested_heads"],
+                             {self.checkout.github: [self.checkout.lease]})
+            return self.command(args, **options)
+
+        gh.gh.side_effect = rejected
+        with mock.patch.object(pipeline, "set_draft"):
+            result = controller.publish()
+        self.assertIn("Arete requested a rerun for repo#7 checks.", self.body.call_args.args[1])
+        self.assertEqual(result["failures"], orchestration.CI_FAILURES)
+
+        resumed = self.controller()
+        resumed.data = json.loads(json.dumps(controller.data))
+        resumed.job.ci_result = controller.job.ci_result
+        with mock.patch.object(gh, "failed_job_reruns") as find_reruns:
+            self.assertEqual(resumed.publish(), result)
+        find_reruns.assert_not_called()
+        gh.gh.assert_called_once()
+
+    def test_unreadable_green_attempt_keeps_the_original_publication_hold(self):
+        self.attempt_error = gh.GhError("attempt jobs temporarily unavailable")
+        self.attempt_ready = True
+        controller = self.controller()
+        with (mock.patch.object(ci, "WAIT_SECONDS", 0), mock.patch.object(pipeline, "set_draft") as draft):
+            result = controller.publish()
+
+        self.assertEqual(result["failures"], orchestration.CI_FAILURES)
+        self.assertIn("red but not caused by the PR", controller.data["ci_failures"])
+        self.assertIn("GitHub accepted the rerun request.", self.body.call_args.args[1])
+        controller.finish_publication.assert_not_called()
+        draft.assert_called_once_with(self.run, self.checkout, True)
+        gh.gh.assert_called_once()
+
+    def test_lost_reply_blocks_a_different_workflow_at_the_same_head(self):
+        self.rerun_error = gh.GhUnsure("GitHub reply was lost")
+        with mock.patch.object(ci, "WAIT_SECONDS", 0):
+            self.assertIn("red but not caused by the PR", self.watch())
+
+        self.assertIn("Arete requested a rerun for repo#7 checks", self.body.call_args.args[1])
+        [saved] = self.run.write_line.call_args_list
+        self.assertEqual(saved.args, ("ci_rerun_request",))
+        self.run_history.return_value = [[{"event": saved.args[0], **saved.kwargs}]]
+        self.build.ci_rerun_requested_heads.clear()
+        self.failed = [self.job("checks", 102, "failure", run=789)]
+        self.assertIn("red but not caused by the PR", self.watch())
+        self.assertEqual(self.automerge_hold(), self.hold_reason)
+        gh.gh.assert_called_once()
+
     def test_red_rerun_with_unavailable_attempt_jobs_keeps_the_unrelated_verdict(self):
         self.rerun_jobs = [self.job("checks", 201, "failure")]
         self.attempt_error = gh.GhError("attempt jobs temporarily unavailable")
@@ -695,17 +980,21 @@ class AutomaticCIRerunTests(unittest.TestCase):
         self.assertIn("The runner timed out.", self.body.call_args.args[1])
         self.assertEqual(self.automerge_hold(), self.hold_reason)
 
-    def test_default_publication_holds_the_red_workflow_fallback_without_repair(self):
+    def test_default_publication_keeps_the_worker_hold_when_red_attempt_jobs_are_unavailable(self):
         self.rerun_jobs = [self.job("checks", 201, "failure")]
         self.attempt_error = gh.GhError("attempt jobs temporarily unavailable")
         controller = self.controller()
-        reason = f"CI failed twice on the unchanged head {self.checkout.lease}"
 
         with (mock.patch.object(pipeline, "set_draft") as draft,
-              mock.patch.object(flows, "finish", return_value=("failed", reason, self.checkout.pr)) as finish):
-            self.assertEqual(controller.publish()["error"], reason)
+              mock.patch.object(flows, "finish") as finish):
+            result = controller.publish()
 
-        finish.assert_called_once_with(controller.flow, "failed", why=reason, prs=True)
+        self.assertEqual(result["failures"], orchestration.CI_FAILURES)
+        self.assertIn("CI needs an explicit worker diagnosis or repair", result["error"])
+        self.assertTrue(controller.data["ci_failed"])
+        controller.catalog.add_context.assert_called_once_with(orchestration.CI_FAILURES, controller.data["ci_failures"])
+        self.assertIsNone(controller.ending)
+        finish.assert_not_called()
         draft.assert_called_once_with(self.run, self.checkout, True)
         self.run.agent.assert_called_once()
         gh.gh.assert_called_once()
