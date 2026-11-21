@@ -124,7 +124,7 @@ def cmd_ab(args) -> int:
     from .. import control
 
     try:
-        report = control.ab_report(args.name or "", args.days)
+        report = control.ab_report(args.name or "", args.days, connect=foundation.reader)
     except (ValueError, TypeError) as e:
         print(e, file=sys.stderr)
         return 1
@@ -284,27 +284,27 @@ def register(sub) -> None:
     p.add_argument("--why", help="reason for --correct")
     p.add_argument("--auth-mode", choices=("subscription", "api_key", "local"), help="correction billing (default subscription)")
     p.add_argument("--before", metavar="FILE", help="JSON run-ID to pre-edit dollar amount map for --backfill")
-    p.set_defaults(fn=cmd_costs)
+    p.set_defaults(fn=cmd_costs, local_read=lambda args: not (args.correct or args.backfill))
 
     p = steering(sub.add_parser("hold", help="move steps off a subscription before it hits its limit, or bring it back; "
                                              "with no arguments, list the holds in force"))
     p.add_argument("subscription", nargs="?", choices=("claude", "codex"))
     p.add_argument("until", nargs="?", help="how long: 90m, 6h, 2d, or an ISO time")
     p.add_argument("--release", action="store_true", help="clear the hold now, including one a real limit set")
-    p.set_defaults(fn=cmd_hold)
+    p.set_defaults(fn=cmd_hold, local_read=lambda args: not args.subscription)
 
     p = steering(sub.add_parser("ab", help="compare the arm and baseline of each per-step A/B route on live tickets: "
                                            "merged PRs, repairs, review rounds and cost per merged PR"))
     p.add_argument("name", nargs="?", default="")
     p.add_argument("--days", type=float, default=None)
     p.add_argument("--json", action="store_true", help="one JSON line per A/B")
-    p.set_defaults(fn=cmd_ab)
+    p.set_defaults(fn=cmd_ab, local_read=True)
 
     p = steering(sub.add_parser("steps", help="the model, runner, effort, timeout, tries, tools, mcp servers, "
                                               "instructions and session each step resolves to, one JSON line per step"))
     p.add_argument("--repo", default="", help="read this repo's layer too")
     p.add_argument("--kind", default="", choices=config.KINDS, help="resolve for this kind of ticket")
-    p.set_defaults(fn=cmd_steps)
+    p.set_defaults(fn=cmd_steps, local_read=True)
 
     p = sub.add_parser("prices", help="import, diff or recompute from an owner-supplied price and lifecycle "
                                       "snapshot")
@@ -314,8 +314,8 @@ def register(sub) -> None:
     a.set_defaults(fn=prices_import)
     a = psub.add_parser("diff", help="diff a snapshot file, or the stored snapshot, against the stored one")
     a.add_argument("file", metavar="FILE", nargs="?", default=None, help="the snapshot file")
-    a.set_defaults(fn=prices_diff)
+    a.set_defaults(fn=prices_diff, local_read=True)
     a = psub.add_parser("recompute", help="reprice one step of a run from the stored snapshot")
     a.add_argument("run_id", metavar="RUN_ID")
     a.add_argument("step", metavar="STEP")
-    a.set_defaults(fn=prices_recompute)
+    a.set_defaults(fn=prices_recompute, local_read=True)

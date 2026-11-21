@@ -1638,7 +1638,7 @@ When `<dir>/<step>.patch` exists, arete applies it to the call's folder with `gi
 
 A replayed call is recorded like any other: its step row, its record header and its timeline `agent` mark say `replay`, the raw record holds one `replay` line naming the answer and patch files, and it costs what the file says, which `[pricing]` never changes. The directory launch floor runs before replay and refuses unsafe cwd or additional folders without reading an answer. Usage limit holds, the login check, provider tool hooks, JEV rules and devices do not apply to it. JEV calls are not agent calls and still go to JEV. `all = true` also sends chat, triage, loops and sessions to replay, so turn it on in a scratch `ARETE_CONFIG_DIR` and `ARETE_STATE_DIR`.
 
-`arete replay sample FOLDER` writes a fixture into a new or empty folder: `repo` (a git repo with one commit of `notes.txt`), `origin.git` (a bare repo set as its `origin`), `layer` (a layer whose one check greps `notes.txt` for `kumquat`) and `replay` (an answer for plan, build, verify, review, learn and document, and a `build.patch` that adds the word). It prints, as TOML, the `[replay]` and `[[repo]]` lines to add to the config; the repo has `tracker = "local"`, no `github` and no `pipeline`, so poll never picks it up; add `pipeline = true` with `--adw` and `arete poll` starts its `todo` tasks. `--adw` adds `[factory] path = "adw"` to the layer, so `arete run replay-sample t-...` on a task from `arete task add --repo replay-sample` runs the [adw flow](#the-adw-flow) and pushes the branch to `origin.git`. On scratch state `arete run` calls only a server started on that state (see [From the CLI](#from-the-cli)), so with none it runs in its own process, as before. The answers serve both paths. A `github` name added to the sample's `[[repo]]` makes the adw flow go on to the PR, CI and publish steps, which call GitHub.
+`arete replay sample FOLDER` writes a fixture into a new or empty folder: `repo` (a git repo with one commit of `notes.txt`), `origin.git` (a bare repo set as its `origin`), `layer` (a layer whose one check greps `notes.txt` for `kumquat`) and `replay` (an answer for plan, build, verify, review, learn and document, and a `build.patch` that adds the word). It prints, as TOML, the `[replay]` and `[[repo]]` lines to add to the config; the repo has `tracker = "local"`, no `github` and no `pipeline`, so poll never picks it up; add `pipeline = true` with `--adw` and `arete poll` starts its `todo` tasks. `--adw` adds `[factory] path = "adw"` to the layer, so `arete run replay-sample t-...` on a task from `arete task add --repo replay-sample` runs the [adw flow](#the-adw-flow) and pushes the branch to `origin.git`. Start serve with the replay fixture's config and state before running these commands. See [From the CLI](#from-the-cli) for how the CLI finds it. A `github` name added to the sample's `[[repo]]` makes the adw flow go on to the PR, CI and publish steps, which call GitHub.
 
 Chat reads a dashboard snapshot with settings and trends at `runs/chat/context/dashboard.json` beneath state. Its only state grant is that context folder; run history comes through `arete status`, `arete events`, `arete record` and `arete lines`. Summaries use empty temporary working directories with no tools. Research and triage without a repository also use temporary working directories; Arete still saves their reports and records in the usual locations.
 
@@ -1651,10 +1651,13 @@ Product behavior, migration compatibility and limits are unchanged by the covera
 `uv run python -m unittest discover -s tests -v` runs the same business cases serially.
 
 `uv run python -m tests.parallel [-j N] [-v] [--timeout S] [--slowest N]` uses four workers by default and runs each test class's existing cases together in a separate interpreter.
-`--timeout` defaults to 10 seconds per class; a timeout fails the run and cleans up the worker's process group.
+The default deadline is 10 seconds per class unless the class declares its own. `--timeout` overrides all class deadlines.
+At the deadline, the runner collects thread stacks from the class, its ordinary Python children and repository launchers that explicitly enable stack dumps before cleaning up the worker's process group. It prints the stacks with the timeout report.
+An unmodified child launched with `python -I` may produce no stack because isolated mode ignores the startup hook.
+A class that times out in the parallel phase reruns once by itself with twice its deadline. The first timeout and its stacks stay in the output even if the retry passes.
 `--slowest N` reports the slowest classes.
 Workers own process groups that the runner cleans up on completion or interruption, and a lifeline ends workers if the runner dies.
-The runner exits nonzero on any failure or error and does not retry; the first failure is authoritative.
+The runner uses the solo retry's result when a class reruns and exits nonzero if any final result is a failure, error or timeout.
 Either command can serve as the business-suite command under `[checks]` in Arete's layer.
 For Arete's own layer, use `lint = "sh tools/lint-arete"` to run the same pinned Ruff as hosted CI, rather than resolving a floating Ruff version at each run.
 
@@ -2588,7 +2591,7 @@ curl -H 'X-Arete: 1' --data-binary @shot.png 'http://HOST:PORT/api/capture/evide
 
 ### From the CLI
 
-Each of these commands makes one call to the server and prints JSON and nothing else. All but `task show` print one JSON object per line; `task show` prints the task as indented JSON, and as one line with `--json`:
+These commands contact serve and print JSON. All but `task show` print one JSON object per line. `task show` prints indented JSON by default and one line with `--json`.
 
 | command | route |
 |---|---|
@@ -2605,14 +2608,16 @@ Each of these commands makes one call to the server and prints JSON and nothing 
 | `arete resume RUN_ID [--step STEP]` | `POST /api/runs/RUN_ID/resume` |
 | `arete repair RUN_ID` | `POST /api/runs/RUN_ID/repair` |
 | `arete step RUN_ID STEP [key=value ...]` | `POST /api/runs/RUN_ID/steps/STEP` |
-| `arete stop RUN_ID` | `POST /api/runs/RUN_ID/stop` |
+| `arete stop RUN_ID` | `POST /api/v1/runs/RUN_ID/stop` |
 | `arete status --json [RUN_ID]` | `GET /api/live` for one line per live run; with a run id, `GET /api/runs/RUN_ID/events` for one line per step with `"event": "step"` (`state` is the step's result, or `running`), then the report |
 
-They call only a server that works on their own state. Once it listens, `arete serve` or `arete dashboard` writes its addresses, port, scheme, tailnet name, process id, state folder and config file to `server.json` in the state folder; over HTTPS the commands verify the certificate against that name. The commands call that server while its process is alive, it works on the same state folder and config file as they do, and its address answers within a second; when it does not answer, a command says so and names `arete serve` and `ARETE_SERVER`. `ARETE_SERVER=https://NAME:PORT` or `http://HOST:PORT` names a server and skips that check; a plain HTTP address follows the dashboard's redirect to HTTPS. So with a scratch `ARETE_STATE_DIR` or `ARETE_CONFIG_DIR` they never reach the real server: they call a server started on the scratch state, or none.
+The CLI looks for `ARETE_SERVER` first, then `url` in the `[server]` section of `config.toml`. Set either to `https://NAME:PORT` or `http://HOST:PORT`. With neither set, the CLI reads `server.json` in its state folder and checks that the named process is live and uses the same state folder and config file. HTTPS verifies the server certificate, and HTTP follows the dashboard's HTTPS upgrade. On first connection the CLI saves the server's instance ID for that URL under the config directory. Each invocation checks the instance and sends the verified ID in `X-Arete-Instance` on every write attempt. Serve rejects a mismatched ID before acting on the write or looking up its idempotency key.
 
-A failed command prints one line with `error` and no `event`, with `code` when the server answered with an HTTP status, and exits 1. A command line these commands cannot parse, such as a missing argument or an unknown flag, prints one line with `error` and `usage` and exits 1. A `step_end` line or a step row with an `error` field is a step's error, not the command's. When no server works on the state, the readers (`task show`, `lines` and `status --json`) read the local state instead, and the others print one `error` line and exit 1. When a stream of lines drops, as it does when serve restarts on new code, `wait`, `lines --follow` and `arete run` connect again and go on from the last line they read. They give up with an `error` line when the run ended with no `report` line, or when no line came for 2 minutes. A request that got a 503 with `Retry-After` because serve is loading new code is sent again after that wait, for up to 30 seconds, and a refused connection in that time is retried too; after that the command fails with the 503 answer.
+Failed server commands print one JSON error line and exit 1. An unreachable server reports `reason: "server_down"` and names the URL. Server-backed commands require serve. To read the local store, use `task show --offline`, `lines --offline` or `status --offline`. Each JSON line from those reads includes `"source": "local"`. When a stream drops, `wait`, `lines --follow` and `arete run` reconnect from the last line they read. They report an error when the run ended without a report or when two minutes pass without a line. During code reload the CLI retries a 503 with `Retry-After` and any ensuing refused connections for up to 30 seconds, keeping the write's idempotency key. If the deadline expires the command reports the 503.
 
-`arete run REPO TICKET` asks the server to start the run, as `POST /api/tasks` with `"force"` set by `--force`, prints the answer, then prints the run's lines until its `report` line. It exits 0 when the report's status counts as success, as before, and when the server queued the ticket instead of starting a run. Ctrl-c detaches and leaves the run going. With `--local` or `--dry-run`, or when no server works on its state, it runs in its own process as before. The server and the poller start a classic run with `--local`.
+`arete hook` appends to the local event log. `arete events` reads that log from the local state folder.
+
+`arete run REPO TICKET` sends `POST /api/tasks` with `"force"` set by `--force`, prints the answer, then follows the run to its report. It exits 0 for a successful report or a queued ticket. Ctrl-c detaches and leaves the run going. Arete marks the classic run and rule-filing workers it launches with `--local`. For a development invocation, set `ARETE_DEVELOPMENT=1` with `--local`. `run --dry-run` still runs locally and records the run.
 
 The `justfile` at the top of this checkout wraps these commands in `adw` recipes, one `uv run arete` call each; `just --list` lists them. [adws/README.md](adws/README.md) is the guide for an agent that steers runs with them.
 
@@ -2658,8 +2663,8 @@ Dry-run displays a quota hold without reserving.
 Keyed task starts hash the canonical request and replay the exact committed response for the same principal and key.
 A live duplicate is rejected while its request is in flight; keys are separate for each principal.
 Idempotency records expire strictly after 30 days through serve pruning.
-CLI task starts print their `Idempotency-Key` on stderr and use `ARETE_IDEMPOTENCY_KEY` when supplied, otherwise a fresh key.
-Keyed CLI requests share a 30-second deadline across connection, headers, response bodies and waits, with at most two resends after an uncertain result and the same key throughout.
+The CLI generates one idempotency key per invocation. Set `ARETE_IDEMPOTENCY_KEY` to reuse it when retrying the same invocation. The first write uses the key verbatim, and subsequent writes append `:2`, `:3` and so on. `loop stop NAME` looks up the current run and adds its ID to the key. If a suffix makes the key longer than 128 characters, the CLI sends its SHA-256 hex digest. Task starts print the key on stderr and accept an exact key via `--key`.
+Task starts share a 30-second deadline across connection, headers, response bodies and waits, with at most two resends after an uncertain result and the same key throughout.
 
 Successful run writes retain their legacy response bodies and identify the committed event in `Arete-Seq`.
 Every displayed run action sends its selected `base_version`.

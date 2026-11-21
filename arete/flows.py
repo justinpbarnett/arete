@@ -35,6 +35,7 @@ from .agent import NO_SESSION, Result
 from .factory import Outcome
 from .review import Review
 from .store import asks as asks_store
+from .store import insights as insights_store
 from .store import runs as run_store
 from .store import triage as triage_store
 from .verify import Verified
@@ -499,6 +500,7 @@ class Job:
     noted: bool = False
     moved_base: str = ""
     patch_mode: bool = False
+    prepared_feedback_prs: list[str] = field(default_factory=list)
 
     @property
     def held_reason(self) -> str:
@@ -589,10 +591,29 @@ class Job:
         return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
     def accepts(self, name: str, outcome: Outcome, kw: dict) -> bool:
+        if name == "revise" and not self.only and not self.includes_feedback(outcome.data):
+            self.run.log(f"{name}: pending PR feedback was absent from the saved outcome; rerunning is required")
+            return False
         if (expected := self.policy(name, kw)) and outcome.data.get("policy") != expected:
             self.run.log(f"{name}: stored evidence used a different policy; rerunning is required")
             return False
         return True
+
+    def includes_feedback(self, data: dict) -> bool:
+        feedback = self.run.feedback
+        if not feedback:
+            return True
+        keys = data.get("feedback_keys", data.get("feedback_ids"))
+        if keys is not None:
+            known = {tuple(key) for key in keys}
+            return all(pipeline.feedback_key(row) in known for row in feedback)
+        return (not insights_store.has_fresh_feedback(feedback)
+                and data.get("plan") == revision_plan(pipeline.feedback_markdown(feedback)))
+
+    def claim_revision_feedback(self) -> None:
+        if self.run.claim_feedback_on_revise:
+            self.run.claim_feedback_on_revise = False
+            self.run.claim_feedback()
 
     def keeps(self, name: str, kw: dict) -> bool:
         return any(c.onto for c in self.checkouts) and (
@@ -683,7 +704,8 @@ class Job:
         self.committed = bool(data.get("committed", True))
         if stored:
             for c in self.picked(self.changed):
-                c.note_pushed_head(c.onto or util.git(["rev-parse", "HEAD"], c.wt).strip())
+                head = c.publication_baseline or c.onto or util.git(["rev-parse", "HEAD"], c.wt).strip()
+                c.note_pushed_head(head)
             if self.with_prs:
                 pipeline.note_prs(self.run, self.branch, self.with_prs)
 
@@ -748,6 +770,7 @@ class Job:
 
     def prepared(self, data: dict, stored: bool, *, reconciling_catch_up: bool = False) -> None:
         run = self.run
+        self.prepared_feedback_prs = data.get("feedback_prs", [])
         self.ticket = tracker.Ticket(**data["ticket"])
         self.branch, self.attachments, self.triage = data["branch"], data["attachments"], data["triage"]
         self.expertise, self.approval = data["expertise"], data.get("approval")
@@ -830,12 +853,17 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
         return end_as("stop", "quiet", status="failed", summary=f"could not read {run.ref}: {e}")
     opened(run, t)
     mended = run_store.run_get(run.repairs) or {} if run.repairs else {}
-    if run.feedback or run.repairs:
-        urls = run.feedback_prs or str(mended.get("pr_url") or "").split()
+    feedback_prs = run.feedback_prs
+    if not (feedback_prs or run.repairs or run.alone) and run.path in ("feature", "patch"):
+        feedback_prs = list(dict.fromkeys(row["pr_url"] for row in pipeline.pending_feedback(repo.name, run.tid)))
+    if feedback_prs:
+        if closed := run.feedback_closure(feedback_prs):
+            return end_as("stop", "quiet", status="noop", summary=closed)
+    elif run.repairs:
+        urls = str(mended.get("pr_url") or "").split()
         if closed := [url for url in urls if gh.pr_view(url).get("state") != "OPEN"]:
             return end_as("stop", "quiet", status="noop",
-                          summary=f"the PR closed before arete could {'revise' if run.feedback else 'repair'} it: "
-                                  f"{', '.join(closed)}")
+                          summary=f"the PR closed before arete could repair it: {', '.join(closed)}")
     elif not t.open:
         return end_as("stop", "quiet", status="noop", summary="ticket is not open")
     elif t.blocker and not run.force:
@@ -876,8 +904,11 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
         return end_as("fail", "failed", why=why)
     workspace.note_made(job.ws, checkouts, pipeline.workspace_owner(run, job.ws, checkouts))
     approval = triage_store.triage_approval(run.triage_key)
-    return Outcome("pass", data=prepared_fields(t, branch, checkouts, layer, [run.dir / "images"] if images.paths else [],
-                                                pipeline.images_note(images), approval))
+    data = prepared_fields(t, branch, checkouts, layer, [run.dir / "images"] if images.paths else [],
+                           pipeline.images_note(images), approval)
+    if feedback_prs:
+        data["feedback_prs"] = feedback_prs
+    return Outcome("pass", data=data)
 
 
 def prepared_fields(ticket: tracker.Ticket, branch: str, checkouts: list[workspace.Checkout], layer: config.RepoLayer,
@@ -953,6 +984,10 @@ def patch(flow: factory.Flow, tree: str) -> Outcome:
     }, session=job.run.sessions.get(BUILD, NO_SESSION))
 
 
+def revision_plan(feedback: str) -> str:
+    return f"Revise the open PR for the owner's feedback:\n\n{feedback}"
+
+
 @factory.step("revise")
 def revision(flow: factory.Flow, tree: str) -> Outcome:
     job: Job = flow.ctx
@@ -970,9 +1005,10 @@ def revision(flow: factory.Flow, tree: str) -> Outcome:
     if pipeline.stage(job.checkouts, diffguard.denied_paths(layer)).empty:
         return end_as("stop", "unchanged", summary=summary, replies=replies)
     return Outcome("pass", data={
-        "plan": f"Revise the open PR for the owner's feedback:\n\n{feedback}", "left_for_a_person": left,
+        "plan": revision_plan(feedback), "left_for_a_person": left,
         "goal": ("Check each change the owner's feedback asks for, and that what the issue asks for still works.\n\n"
                  + feedback),
+        "feedback_keys": [pipeline.feedback_key(row) for row in run.feedback],
         "summary": summary, "replies": replies, "story": run.story}, session=run.sessions.get(BUILD, NO_SESSION))
 
 
@@ -1194,13 +1230,16 @@ def adopt_open_prs(job: Job) -> list[workspace.Checkout]:
 def refuse_changed_prs(job: Job) -> None:
     run = job.run
     reason = f"the repair of run {run.repairs}" if run.repairs else "PR feedback"
-    for c in job.with_prs if run.repairs or run.feedback else []:
-        view = gh.pr_view(c.pr)
+    prs = job.prepared_feedback_prs + run.feedback_prs
+    if run.repairs or prs:
+        prs += [c.pr for c in job.with_prs]
+    for url in dict.fromkeys(prs):
+        view = gh.pr_view(url)
         if view.get("state") != "OPEN":
-            raise workspace.RunFailed(f"{c.pr} is {'merged' if view.get('mergedAt') else 'closed'}, so arete pushed "
+            raise workspace.RunFailed(f"{url} is {'merged' if view.get('mergedAt') else 'closed'}, so arete pushed "
                                      f"nothing for {reason}")
         if view.get("headRefName") != job.branch:
-            raise workspace.RunFailed(f"{c.pr} is on branch {view.get('headRefName')}, not {job.branch}, so arete "
+            raise workspace.RunFailed(f"{url} is on branch {view.get('headRefName')}, not {job.branch}, so arete "
                                      f"pushed nothing for {reason}")
 
 

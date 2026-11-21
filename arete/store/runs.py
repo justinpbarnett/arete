@@ -21,7 +21,7 @@ TABLES = {
     "environment_holds": "with run",
     "environment_hold_prs": "with run",
     "environment_gap_creations": "kept",
-    "failed_finishes": "with run",
+    "environment_budget_resets": "kept",
 }
 
 
@@ -29,7 +29,6 @@ OPEN_PR_RUN = "(runs.status = 'pr' OR (runs.status IN ('failed', 'stopped') AND 
 
 WHOLE_RUN = "COALESCE(only_step, '') = ''"
 LIVE_RUN = "dry_run = 0 AND status != 'dry-run'"
-FAILED_FINISH_PENDING = "(ticket_pending = 1 OR comment != '' OR prs != '{}')"
 
 FIRINGS = ("(runs.kind = 'loop' AND runs.loop_kind = 'command' AND runs.status IN ('done', 'skipped') "
            "AND COALESCE(runs.cost_usd, 0) = 0)")
@@ -230,6 +229,16 @@ def unclaim_environment_gap(repo: str, signature: str, day: str) -> None:
                   (repo, signature, day))
 
 
+def claim_environment_budget_resets(repo: str, issue: str, run_id: str,
+                                    gaps: tuple[tuple[str, int], ...]) -> list[int]:
+    with tx() as c:
+        return [number for project, number in gaps if c.execute(
+            "INSERT INTO environment_budget_resets (repo, issue, gap_repo, gap_issue, run_id) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT (repo, issue, gap_repo, gap_issue) DO UPDATE SET run_id = excluded.run_id "
+            "WHERE environment_budget_resets.run_id = excluded.run_id",
+            (repo, issue, project, number, run_id)).rowcount]
+
+
 def run_lock(kind: str, repo: str | None = None, issue: int | str | None = None) -> str:
     return {"pipeline": f"run-{repo}-{issue}", "slot": f"slot-{repo}-{issue}", "slot-wait": f"slot-wait-{repo}-{issue}",
             "eval": f"eval-{repo}", "experiment": f"experiment-{repo}", "eval-mine": "eval-mine", "miner": "mine"}[kind]
@@ -323,46 +332,6 @@ def newest_whole_run(repo: str, issue: int | str) -> dict | None:
 
 def newest_live_whole_run(repo: str, issue: int | str) -> dict | None:
     return next(iter(ticket_runs(repo, issue, limit=1, whole=True, live=True)), None)
-
-
-def save_failed_finish(run_id: str, comment: str, prs: dict[str, str], **fields) -> None:
-    with writes.atomic() as c:
-        c.execute("INSERT INTO failed_finishes (run_id, comment, prs) VALUES (?, ?, ?)",
-                  (run_id, comment, json.dumps(prs)))
-        note(run_id, label_pending="failed", **fields)
-
-
-def failed_finish(run_id: str) -> dict | None:
-    with reader() as c:
-        row = c.execute("SELECT r.label_pending, f.ticket_pending, f.comment, f.prs "
-                        "FROM failed_finishes f JOIN runs r ON r.id = f.run_id WHERE f.run_id = ?", (run_id,)).fetchone()
-    return {**row, "prs": json.loads(row["prs"])} if row else None
-
-
-def note_failed_finish(run_id: str, *, ticket_pending: bool, comment: str, prs: dict[str, str]) -> None:
-    with db() as c:
-        c.execute("UPDATE failed_finishes SET ticket_pending = ?, comment = ?, prs = ? WHERE run_id = ?",
-                  (ticket_pending, comment, json.dumps(prs), run_id))
-
-
-def discard_failed_finish(run_id: str) -> None:
-    with writes.atomic():
-        note_failed_finish(run_id, ticket_pending=False, comment="", prs={})
-        note(run_id, label_pending="")
-
-
-def unfinished_failed_finishes() -> list[dict]:
-    with reader() as c:
-        return [dict(row) for row in c.execute(
-            "SELECT r.id, r.repo, r.issue FROM failed_finishes f JOIN runs r ON r.id = f.run_id "
-            f"WHERE {FAILED_FINISH_PENDING} AND r.status != 'running' ORDER BY r.started, r.rowid")]
-
-
-def failed_finish_pending(repo: str, issue: int | str) -> bool:
-    with reader() as c:
-        return c.execute("SELECT 1 FROM failed_finishes f JOIN runs r ON r.id = f.run_id "
-                         f"WHERE r.repo = ? AND r.issue = ? AND {FAILED_FINISH_PENDING} LIMIT 1",
-                         (repo, issue)).fetchone() is not None
 
 
 def environment_requeue(run: dict, since: str) -> tuple[dict, int]:
@@ -615,6 +584,10 @@ def settle(run_id: str, fields: dict, end_line: str = "", base_version=None) -> 
         settled = writes.update("runs", run_id, fields, expect=("running",), kind="run.ended", base_version=base_version)
         if not settled:
             return None
+        if settled["kind"] == "pipeline" and settled["status"] in ("interrupted", "stopped"):
+            from . import insights
+
+            insights.release_interrupted_feedback(run_id)
         if end_line:
             insert_feed(run_id, "end", end_line)
         return settled

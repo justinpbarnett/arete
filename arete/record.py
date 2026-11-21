@@ -24,6 +24,7 @@ from typing import Self
 from . import agent, codebase, launch_lease, paths, run_lines, scrub, util
 from .store import approvals as approvals_store
 from .store import db as foundation
+from .store import insights as insights_store
 from .store import loops as loop_store
 from .store import runs as run_store
 
@@ -177,12 +178,13 @@ def dead(row: dict):
 
 
 def interrupt(row: dict, notes: Sequence[str] = (), *, base_version=None) -> dict | None:
-    if row["kind"] == "pipeline" and run_store.failed_finish(row["id"]):
-        status, summary = "failed", run_store.run_get(row["id"])["summary"]
-    else:
-        status = dead_status(row)
-        summary = "; ".join([STOPPED if status == "stopped" else INTERRUPTED, *notes])
-    settled = settle(row["id"], status, end_line=f"{status}: {summary}", summary=summary, base_version=base_version)
+    status = dead_status(row)
+    summary = "; ".join([STOPPED if status == "stopped" else INTERRUPTED, *notes])
+    run_id = row["id"]
+    with foundation.tx():
+        settled = settle(run_id, status, end_line=f"{status}: {summary}", summary=summary, base_version=base_version)
+        if settled and row["kind"] in TICKET_KINDS and (row["kind"] != "pipeline" or status == "failed"):
+            insights_store.release_interrupted_feedback(run_id)
     if settled and not util.pid_alive(row.get("pid")):
         util.end_session(row.get("pid"))
     if settled and row["kind"] == "draft":

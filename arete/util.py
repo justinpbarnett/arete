@@ -248,6 +248,12 @@ def git(args: list[str], cwd: Path, timeout: float = 300, check: bool = True, in
     return res.stdout
 
 
+def git_bytes(args: list[str], cwd: Path, timeout: float = 300) -> bytes:
+    res = _sh(["git", *args], cwd=cwd, timeout=timeout, binary=True)
+    _check_git(args, res)
+    return res.stdout
+
+
 def _check_git(args: list[str], res: subprocess.CompletedProcess) -> None:
     if res.returncode != 0:
         raise RuntimeError(f"git {git_command(args)}: {git_error(_s(res.stderr or res.stdout))}")

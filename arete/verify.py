@@ -17,7 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import SplitResult, urlsplit
 
-from . import browser, config, environment, paths, sandbox, scratch, util, vault
+from . import _test_stacks, browser, config, environment, paths, sandbox, scratch, util, vault
 from .util import git
 
 PLAYWRIGHT_TOOLS = tuple("browser_" + n for n in (
@@ -134,7 +134,7 @@ def run_probes(v: config.Verify, cwd: Path, attempt: scratch.Attempt | None,
                         blocked_by=f"{label} could not obtain scratch authority{requested}", finished=False)
     deadline, checks = time.monotonic() + v.probe_seconds, []
     failure, blocked_by = "", ""
-    env = environment.build((), scratch.attempt_env(attempt))
+    env = environment.build((_test_stacks.PREFIX_ENV,), scratch.attempt_env(attempt))
     env = {name: value for name, value in env.items() if not paths.CREDENTIAL_NAME.search(name)}
 
     def public(text):

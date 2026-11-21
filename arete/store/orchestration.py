@@ -186,14 +186,6 @@ def actions(lease: Lease, connect=reader) -> list[dict]:
                                              (lease.root,))]
 
 
-def turn_rationale(lease: Lease, turn: str) -> str:
-    with reader() as c:
-        fenced(c, lease)
-        row = c.execute("SELECT response FROM orchestration_turns WHERE root = ? AND id = ? AND state = 'accepted'",
-                        (lease.root, turn)).fetchone()
-        return decoded(row).get("response", {}).get("rationale", "")
-
-
 def transition(lease: Lease, action: str, state: str, result: dict, expected=("accepted", "running")) -> dict:
     with tx() as c:
         current = fenced(c, lease)
