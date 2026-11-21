@@ -173,8 +173,9 @@ class GitHubTracker:
     def ref(self, tid: str) -> str:
         return f"#{tid}"
 
-    def todo(self) -> list[Ticket]:
-        skip = {ZTE_LABEL, *(self.label_name(s) for s in config.RUN_LABELS)}
+    def todo(self, *, parked: Callable[[str], bool] | None = None) -> list[Ticket]:
+        failed = self.label_name("failed")
+        skip = {ZTE_LABEL, *(self.label_name(s) for s in config.RUN_LABELS if s != "failed")}
         out = []
         self._bodies, self._labels, self._open = {}, {}, {}
         for i in gh.issues(self.repo.github, LABEL, limit=MAX_AGENT_ISSUES):
@@ -182,7 +183,8 @@ class GitHubTracker:
             self._open[int(i["number"])] = True
             names = {lb["name"] for lb in i.get("labels", [])}
             self._labels[str(i["number"])] = sorted(names)
-            if names & skip or not self.by_owner(i):
+            if (names & skip or not self.by_owner(i)
+                    or failed in names and not (parked and parked(str(i["number"])))):
                 continue
             out.append(Ticket(str(i["number"]), f"#{i['number']}", i["title"], body=self._bodies[str(i["number"])],
                               url=i.get("url", ""), created=i.get("createdAt", ""), labels=sorted(names)))
@@ -338,11 +340,17 @@ class JiraTracker:
     def ref(self, tid: str) -> str:
         return tid
 
-    def todo(self) -> list[Ticket]:
+    def todo(self, *, parked: Callable[[str], bool] | None = None) -> list[Ticket]:
         if not self.project:
             raise jira.JiraError(f"{self.repo.name}: no Jira project; set [jira] project or jira_project on the repo")
-        jql = candidates_jql(self.project, f'labels = "{self.route}"')
-        return [search_ticket(self.client, i) for i in self.client.search(jql, [*SEARCH_FIELDS, "description"], limit=20)]
+        route = f'labels = "{self.route}"'
+        fields = [*SEARCH_FIELDS, "description"]
+        issues = self.client.search(candidates_jql(self.project, route), fields, limit=20)
+        if parked:
+            failed = self.label_name("failed")
+            jql = candidates_jql(self.project, f'{route} AND labels = "{failed}"', include_state=failed)
+            issues.extend(self.client.search(jql, fields, limit=20, include=lambda i: parked(i["key"])))
+        return [search_ticket(self.client, i) for i in issues]
 
     def blocker(self, tid: str) -> str:
         issue = self.client.issue(tid, JIRA_FIELDS)
@@ -475,8 +483,11 @@ class LocalTracker:
     def ref(self, tid: str) -> str:
         return tid
 
-    def todo(self) -> list[Ticket]:
-        return [task_ticket(row) for row in tasks_store.tasks(self.repo.name, "todo")]
+    def todo(self, *, parked: Callable[[str], bool] | None = None) -> list[Ticket]:
+        rows = tasks_store.tasks(self.repo.name, "todo")
+        if parked:
+            rows.extend(row for row in tasks_store.tasks(self.repo.name, "failed") if parked(row["id"]))
+        return [task_ticket(row) for row in rows]
 
     def by_owner(self, item: dict) -> bool:
         return True
@@ -560,8 +571,8 @@ def route_label(repo: config.Repo) -> str:
     return "repo-" + (repo.github.split("/")[-1] if repo.github else repo.name)
 
 
-def candidates_jql(project: str, extra: str = "", skip_states: bool = True) -> str:
-    skip = ", ".join(f'"{s}"' for s in sorted(JIRA_STATE_LABELS))
+def candidates_jql(project: str, extra: str = "", skip_states: bool = True, *, include_state: str = "") -> str:
+    skip = ", ".join(f'"{s}"' for s in sorted(JIRA_STATE_LABELS - {include_state}))
     parts = [f'project = "{project}"', f'labels = "{LABEL}"', "assignee = currentUser()", "statusCategory != Done"]
     if skip_states:
         parts.append(f"labels not in ({skip})")

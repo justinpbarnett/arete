@@ -50,6 +50,8 @@ If this list is empty, nothing is pinned.
   It names the commands and files a person needs, and nothing the engineer can read in the code.
 - A pull request description says what changed and why it matters to the reviewer, then what was checked.
   Plans, machine notes and your own reasoning stay out.
+  Name any check that stayed blocked or could not run as blocked, with its reason.
+  Do not describe a supplied-source, replay or partial result as acceptance evidence.
 - A doc edit keeps every command, API name, prerequisite, warning and expected output of the draft and the facts.
   Make it as short as completeness allows, and never drop content to hit a length.
 - The word target is soft: $target.

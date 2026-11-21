@@ -91,12 +91,13 @@ def detach(args: list[str], log_name: str = DETACHED_LOG, keep: tuple[int, ...] 
     return launch(command(args), log_name, keep)
 
 
-def launch(command: list[str], log_name: str = DETACHED_LOG, keep: tuple[int, ...] = ()) -> subprocess.Popen:
+def launch(command: list[str], log_name: str = DETACHED_LOG, keep: tuple[int, ...] = (), *,
+           start_new_session: bool = True) -> subprocess.Popen:
     paths.ensure_dirs()
     keep, env = launch_lease.child_environment(keep)
     with open(paths.LOG_DIR / log_name, "a") as log:
         proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log,
-                                stderr=subprocess.STDOUT, start_new_session=True, pass_fds=keep,
+                                stderr=subprocess.STDOUT, start_new_session=start_new_session, pass_fds=keep,
                                 env={**env, "ARETE_ACTOR": principals.current(),
                                      "ARETE_VIA": events.provenance() or ""})
     launch_lease.passed()
