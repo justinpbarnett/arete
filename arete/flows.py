@@ -829,13 +829,15 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
     except tracker.ERRORS as e:
         return end_as("stop", "quiet", status="failed", summary=f"could not read {run.ref}: {e}")
     opened(run, t)
-    mended = run_store.run_get(run.repairs) or {} if run.repairs else {}
-    if run.feedback or run.repairs:
-        urls = run.feedback_prs or str(mended.get("pr_url") or "").split()
+    if run.feedback:
+        if closed := run.feedback_closure():
+            return end_as("stop", "quiet", status="noop", summary=closed)
+    elif run.repairs:
+        mended = run_store.run_get(run.repairs) or {}
+        urls = str(mended.get("pr_url") or "").split()
         if closed := [url for url in urls if gh.pr_view(url).get("state") != "OPEN"]:
             return end_as("stop", "quiet", status="noop",
-                          summary=f"the PR closed before arete could {'revise' if run.feedback else 'repair'} it: "
-                                  f"{', '.join(closed)}")
+                          summary=f"the PR closed before arete could repair it: {', '.join(closed)}")
     elif not t.open:
         return end_as("stop", "quiet", status="noop", summary="ticket is not open")
     elif t.blocker and not run.force:

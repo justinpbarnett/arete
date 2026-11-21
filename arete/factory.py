@@ -409,7 +409,7 @@ class Flow:
         try:
             labels = self.ctx.labels(name, kw)
         except Exception as e:
-            run_lines.write(self.run_id, "step_start", step=name, **{"try": n})
+            run_lines.write(self.run_id, "step_start", step=name, **{"try": n}, preflight=True)
             self.failed(name, n, e, calls, started, kw)
             raise
         began = ({"tree": os.path.abspath(kw["tree"]), "fingerprint": fingerprint(kw["tree"])}

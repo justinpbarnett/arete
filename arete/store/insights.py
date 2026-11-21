@@ -160,22 +160,27 @@ def has_fresh_feedback(rows: list[dict]) -> bool:
 def take_feedback(rows: list[dict], run_id: str) -> list[dict]:
     with tx() as c:
         return [r for r in rows if c.execute(
-            "UPDATE feedback SET status = 'taken', run_id = ? WHERE pr_url = ? AND kind = ? AND gh_id = ? "
+            "UPDATE feedback SET status = 'taken', previous_run_id = run_id, run_id = ? "
+            "WHERE pr_url = ? AND kind = ? AND gh_id = ? "
             "AND status = ? AND run_id IS ? AND (status IN ('new', 'failed') OR (status = 'taken' "
             "AND NOT EXISTS (SELECT 1 FROM runs WHERE id = feedback.run_id AND status = 'running')))",
             (run_id, r["pr_url"], r["kind"], r["gh_id"], r["status"], r.get("run_id"))).rowcount]
 
 
-def release_feedback(rows: list[dict], run_id: str) -> None:
+def release_feedback(run_id: str, *, closed_prs: tuple[str, ...] = ()) -> None:
     with tx() as c:
-        c.executemany("UPDATE feedback SET status = 'new', run_id = ? WHERE pr_url = ? AND kind = ? AND gh_id = ? "
-                      "AND run_id = ? AND status = 'taken'",
-                      [(row["run_id"], row["pr_url"], row["kind"], row["gh_id"], run_id) for row in rows])
+        if closed_prs:
+            c.execute(f"UPDATE feedback SET status = 'recorded', previous_run_id = NULL "
+                      f"WHERE run_id = ? AND status = 'taken' AND pr_url IN ({','.join('?' * len(closed_prs))})",
+                      (run_id, *closed_prs))
+        c.execute("UPDATE feedback SET status = 'new', run_id = previous_run_id, previous_run_id = NULL "
+                  "WHERE run_id = ? AND status = 'taken'", (run_id,))
 
 
 def settle_feedback(run_id: str, status: str) -> None:
     with db() as c:
-        c.execute("UPDATE feedback SET status = ? WHERE run_id = ? AND status = 'taken'", (status, run_id))
+        c.execute("UPDATE feedback SET status = ?, previous_run_id = NULL WHERE run_id = ? AND status = 'taken'",
+                  (status, run_id))
 
 
 def feedback_between(since: str, until: str) -> list[dict]:

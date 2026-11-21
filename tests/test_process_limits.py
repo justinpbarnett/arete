@@ -1034,13 +1034,46 @@ class QueueTests(Isolated):
                     newest = run_store.newest_whole_run(self.repo.name, self.ticket)["id"]
                     self.assertEqual((row["status"], row["run_id"]), (expected, newest if launched else None))
 
-    def test_interrupted_revision_keeps_spent_budget_until_the_owner_adds_feedback(self):
+    def test_reaping_revision_before_first_step_returns_comment_for_fresh_poll(self):
+        parent = self.feedback_ticket()
+        url = self.feedback_row["pr_url"]
+        self.local.label(self.ticket, add=["pr"])
+        interrupted = self.made_run(parent.id)
+        record.note(interrupted.id, pid=None)
+        insights_store.take_feedback(insights_store.open_feedback([url]), interrupted.id)
+        with patch.object(record, "SETTLE_GRACE_SECONDS", 0):
+            reaped, = record.reap(tickets=True)
+        self.assertEqual((reaped["id"], reaped["status"]), (interrupted.id, "interrupted"))
+        row, = insights_store.open_feedback([url])
+        self.assertEqual((row["status"], row["run_id"]), ("new", None))
+        self.assertEqual(insights_store.feedback_due(self.repo.name, "2025-12-31T23:59:59Z"), [])
+        self.assertEqual(insights_store.feedback_due(self.repo.name, "2026-01-01T00:10:00Z"), [self.ticket])
+        reached = []
+
+        def work(cfg, run, slot):
+            reached.append(run.id)
+            self.assertEqual(run.budget.parents, [])
+            self.assertEqual((run.budget.prior_repairs, run.budget.prior_seconds, run.budget.verify_seconds), (0, 0, 0))
+            self.assertEqual([row["gh_id"] for row in run.feedback], [1])
+            return "noop", "answered", ""
+
+        with patch.object(util, "now", return_value=datetime(2026, 1, 1, tzinfo=UTC)):
+            self.assertEqual(self.poll_with(self.cfg, lambda *args: self.fail("feedback is still in its quiet period")),
+                             0)
+        self.assertEqual(self.poll_with(self.cfg, lambda repo, tid: self.run_polled_ticket(repo, tid, work)), 0)
+        self.assertEqual(len(reached), 1)
+        self.assertIn(interrupted.id, runlimits.metadata(reached[0], "budget.json")["left_out"])
+
+    def test_interrupted_revision_after_first_step_keeps_spent_budget_until_new_feedback(self):
         self.feedback_ticket()
         url = self.feedback_row["pr_url"]
         interrupted = self.made_run()
         record.note(interrupted.id, active_seconds=1200, verify_seconds=300, repair_calls=3)
         insights_store.take_feedback(insights_store.open_feedback([url]), interrupted.id)
-        record.settle(interrupted.id, "interrupted")
+        run_lines.write(interrupted.id, "step_start", step="revise")
+        self.assertEqual(record.interrupt(run_store.run_get(interrupted.id))["status"], "interrupted")
+        row, = insights_store.open_feedback([url])
+        self.assertEqual((row["status"], row["run_id"]), ("taken", interrupted.id))
         reached = []
 
         def work(cfg, run, slot):
@@ -1076,6 +1109,7 @@ class QueueTests(Isolated):
         url = self.feedback_row["pr_url"]
         sibling = "https://github.com/owner/fixture/pull/2"
         record.note(parent.id, pr_url=f"{url} {sibling}")
+        insights_store.add_feedback([{**self.feedback_row, "pr_url": sibling, "gh_id": 2}])
         self.local.label(self.ticket, add=["pr"])
 
         def spawn(repo, tid):
@@ -1090,13 +1124,65 @@ class QueueTests(Isolated):
             noop = run_store.newest_whole_run(self.repo.name, self.ticket)
             self.assertEqual(noop["status"], "noop")
             self.assertIn(url, noop["summary"])
-            feedback, = insights_store.feedback_between("2025-01-01", "9999-01-01")
-            self.assertEqual((feedback["status"], feedback["run_id"]), ("recorded", noop["id"]))
+            feedback = {row["pr_url"]: (row["status"], row["run_id"])
+                        for row in insights_store.feedback_between("2025-01-01", "9999-01-01")}
+            self.assertEqual(feedback, {url: ("recorded", noop["id"]), sibling: ("new", None)})
             self.assertEqual(run_store.open_runs(self.repo.name, self.ticket)[0]["id"], parent.id)
-            self.assertEqual(insights_store.feedback_due(self.repo.name, "2026-01-01T00:10:00Z"), [])
-            self.assertEqual(self.poll_with(self.cfg, spawn), 0)
-            self.assertEqual(run_store.newest_whole_run(self.repo.name, self.ticket)["id"], noop["id"])
+            self.assertEqual(insights_store.feedback_due(self.repo.name, "2026-01-01T00:10:00Z"), [self.ticket])
             model.assert_not_called()
+
+        revised = []
+
+        def work(cfg, run, slot):
+            revised.extend(run.feedback_prs)
+            return "noop", "answered", ""
+
+        self.assertEqual(self.poll_with(self.cfg, lambda repo, tid: self.run_polled_ticket(repo, tid, work)), 0)
+        self.assertEqual(revised, [sibling])
+
+    def test_force_readmission_after_published_head_moves_resets_failed_feedback_budget(self):
+        self.feedback_ticket()
+        url = self.feedback_row["pr_url"]
+        branch = "arete/fixture"
+        head = "a" * 40
+        reached = []
+
+        def work(cfg, run, slot):
+            reached.append(run.id)
+            run.agent("revise", "Apply the feedback", self.repo.path)
+            self.assertEqual((run.budget.prior_repairs, run.budget.prior_seconds, run.budget.verify_seconds), (0, 0, 0))
+            if run.force:
+                self.assertEqual([(row["gh_id"], row["status"]) for row in run.feedback], [(1, "failed")])
+                return "pr", "revised", url
+            record.note(run.id, branch=branch, pr_url=url)
+            for i in range(3):
+                run.budget.charge(f"review_fix{i + 1}", "review_repair")
+            run.budget.check_repairs()
+            self.fail("the first revision should have parked")
+
+        def launch(*args, on_launch, **kwargs):
+            on_launch({"runner": "replay"})
+            return Result(ok=True, runner="replay")
+
+        with (patch.object(config, "load", return_value=self.cfg),
+              patch.object(runlimits, "branch_head", side_effect=lambda src, name: head) as published,
+              patch.object(pipeline.runner, "run", side_effect=launch)):
+            self.assertEqual(self.run_polled_ticket(self.repo.name, self.ticket, work), 1)
+            parked = run_store.run_get(reached[0])
+            self.assertIn("used its 3 repair cycles", parked["summary"])
+            self.assertEqual(parked["repair_calls"], 3)
+            row, = insights_store.open_feedback([url])
+            self.assertEqual((row["status"], row["run_id"]), ("failed", parked["id"]))
+            self.assertEqual(self.run_polled_ticket(self.repo.name, self.ticket, work, force=True), 2)
+            self.assertEqual(reached, [parked["id"]])
+
+            head = "b" * 40
+            self.assertEqual(self.run_polled_ticket(self.repo.name, self.ticket, work, force=True), 0)
+            published.assert_called_with(self.repo.path, branch)
+
+        self.assertEqual(len(reached), 2)
+        self.assertEqual(run_lines.last_step(reached[1]), "revise")
+        self.assertEqual(insights_store.open_feedback([url]), [])
 
     def park_ticket(self, branch=""):
         self.repo.layer_dir.mkdir()
@@ -1110,12 +1196,12 @@ class QueueTests(Isolated):
         self.cfg.replay = config.ReplayConfig(all=True)
         return run
 
-    def run_polled_ticket(self, repo, tid, work):
+    def run_polled_ticket(self, repo, tid, work, *, force=False):
         _, env = launch_lease.child_environment(())
         with patch.dict(os.environ, env), patch.object(launch_lease, "registered"), \
                 patch.object(pipeline, "run_refusal", return_value=(False, "")), \
                 patch.object(pipeline, "_run", side_effect=work):
-            return pipeline.run_issue(repo, tid)
+            return pipeline.run_issue(repo, tid, force=force)
 
     def test_interrupted_ticket_rechecks_dependencies_before_starting(self):
         interrupted = self.made_run()
