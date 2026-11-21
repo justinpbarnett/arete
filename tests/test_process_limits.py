@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from string import Template
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from adws import feature
 from arete import (
@@ -19,6 +19,7 @@ from arete import (
     config,
     dbstats,
     delegation,
+    diffguard,
     environment_gaps,
     factory,
     flows,
@@ -31,6 +32,7 @@ from arete import (
     pipeline,
     poll,
     principals,
+    prompt_loader,
     record,
     repairs,
     run_lines,
@@ -41,10 +43,11 @@ from arete import (
     tasks,
     tracker,
     util,
+    vault,
     workspace,
 )
 from arete.agent import Result, Session
-from arete.orchestration_api import MAX_BYTES, OPERATIONS, PROTOCOL, Catalog, describe_operations
+from arete.orchestration_api import MAX_BYTES, OPERATIONS, PROMPTS, PROTOCOL, Catalog, describe_operations
 from arete.store import asks as ask_store
 from arete.store import db as foundation
 from arete.store import insights as insights_store
@@ -2356,6 +2359,182 @@ class ParkedRetryBudgetTests(Isolated):
         self.assert_fresh_retry()
 
 
+class DeniedWorkerEditsTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.base = Path(tempfile.mkdtemp(prefix="arete-denied-base-")).resolve()
+        cls.addClassCleanup(shutil.rmtree, cls.base, ignore_errors=True)
+        (cls.base / "guarded.txt").write_text("base\n")
+        (cls.base / "removed.txt").write_text("base\n")
+        util.git(["init", "-q", "-b", "main", "--template="], cls.base)
+        util.git(["add", "."], cls.base)
+        util.git([*util.ARETE_IDENTITY, "commit", "-qm", "Base"], cls.base)
+
+    def prepare_controller(self):
+        root = Path(tempfile.mkdtemp(prefix="arete-denied-")).resolve()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        self.wt = root / "repo"
+        shutil.copytree(self.base, self.wt)
+        repo = config.Repo("fixture/repo", self.wt, tracker="local")
+        self.layer = config.RepoLayer(repo.layer_dir, max_repair_cycles=1,
+                                      deny=["guarded.txt", "removed.txt", "blocked[[]1].txt"],
+                                      checks={"goal": 'test "$(cat goal.txt)" = reached'})
+        cfg = config.Config(replay=config.ReplayConfig(all=True))
+        run_dir = root / "runs" / "fixture"
+        run_dir.mkdir(parents=True)
+        self.run_fixture = pipeline.Run(id="fixture", repo=repo, dir=run_dir, tracker=tracker.LocalTracker(repo),
+                                        tid="1", path="orchestrate")
+        job = flows.Job(cfg, self.run_fixture, self.wt, ticket=tracker.Ticket("1", "#1", "Fixture goal"),
+                        checkouts=[workspace.Checkout("", repo.name, repo.path, self.wt, "main")])
+        self.run_fixture.workspace = self.wt, job.checkouts
+        self.enterContext(patch.object(paths, "RUNS_DIR", run_dir.parent))
+        self.enterContext(patch.object(config, "load_layer", return_value=self.layer))
+        self.enterContext(patch.multiple(record, mark=Mock(), note=Mock()))
+        self.enterContext(patch.object(run_lines, "write"))
+        self.enterContext(patch.object(run_store, "run_get", return_value={
+            "measured_at": "fixture", "active_seconds": 0, "repair_calls": 0,
+            "verify_seconds": 0, "verify_open_seconds": 0}))
+        self.enterContext(patch.object(runlimits.Budget, "checkpoint"))
+        self.enterContext(patch.object(self.run_fixture, "enter"))
+        self.enterContext(patch.object(util, "flush_fd"))
+        self.enterContext(patch.multiple(workspace, note_made=Mock(), kept_work=Mock(return_value=""),
+                                         scratch_left=Mock(return_value=[]), drop_untracked_bytecode=Mock()))
+        self.stored = self.enterContext(patch.object(vault, "every", return_value=[]))
+        self.enterContext(patch.multiple(ledger, acquire=Mock(return_value="fixture"), actions=Mock(return_value=[]),
+                                         save=Mock(), transition=Mock(), snapshot=Mock(return_value={"data": {
+                                             "protocol": PROTOCOL, "mode": "orchestrate", "acceptance": "fixture"}})))
+        job.use_layer(self.layer)
+        self.run_fixture.budget = runlimits.Budget(self.run_fixture, runlimits.Policy.of(self.layer), "")
+        flow = SimpleNamespace(ctx=job, continues="", run=lambda _name, _args, kw: flows.checks(flow, **kw))
+        self.controller = orchestration.Controller(flow)
+        self.controller.catalog = Catalog(job)
+
+    def test_each_pipeline_writing_prompt_renders_denied_paths(self):
+        writing = {name for name, (_, writes) in PROMPTS.items() if writes}
+        writing |= {"patch", "repair", "fix", "ci_fix", "review_fix", "verify_fix", "revise", "resolve",
+                    "apply", "oncall_repair"}
+        denied = "`guarded.txt`, `restricted/**`"
+        for name in sorted(writing):
+            with self.subTest(prompt=name):
+                identifiers = prompt_loader.template(name).get_identifiers()
+                inputs = dict.fromkeys(identifiers, "fixture") | {"denied": denied}
+                rendered = prompt_loader.prompt(name, **inputs)
+                self.assertIn(f"Denied paths: {denied}.", rendered.splitlines())
+    def git(self, *args):
+        return util.git(list(args), self.wt).strip()
+
+    def write(self, name, text):
+        target = self.wt / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+
+    def perform(self, op, **args):
+        self.controller.executing = op
+        return self.controller.perform({"id": op, "op": op, "request": OPERATIONS[op].arguments(args)})
+
+    def worker(self, edit, prompt_id="delegate"):
+        controller = self.controller
+
+        def launch(run, action, request):
+            expected = prompt_loader.code_list(diffguard.denied_paths(self.layer))
+            self.assertIn(f"Denied paths: {expected}.", request["prompt"].splitlines())
+            if prompt_id == "delegate":
+                self.assertIn("Reach the fixture goal", request["prompt"])
+            if feedback := controller.data.get("denied_feedback"):
+                self.assertIn(feedback, request["prompt"])
+
+            def messages():
+                yield {"event": "launch", "step": request["step"], "role": request["role"], "route": {}}
+                edit()
+                yield {"event": "result", "ok": True, "text": "Edited the fixture"}
+
+            return SimpleNamespace(pid=123, identity=456, receive=messages, allow=lambda _: None, close=lambda: None)
+
+        with patch.object(delegation, "Worker", side_effect=launch) as worker:
+            model = controller.catalog.settings["model:build:0"]
+            self.perform("worker.start", goal="Reach the fixture goal", prompt_id=prompt_id,
+                         route_id="model:build:0", effort=model.effort or "low")
+            self.assertTrue(controller.collect())
+            return worker.call_args.args[2]["role"]
+
+    def test_second_worker_passes_checks_without_the_denied_paths(self):
+        self.prepare_controller()
+
+        def first_edits():
+            self.write("guarded.txt", "worker edit\n")
+            (self.wt / "removed.txt").unlink()
+            self.write("blocked[1].txt", "worker addition\n")
+            self.write("blocked1.txt", "allowed addition\n")
+
+        self.assertEqual(self.worker(first_edits, prompt_id="build"), "build")
+        failed = self.perform("checks.run", scope="quick")
+        self.assertFalse(failed["passed"])
+        self.assertIn("Reach the goal without them", failed["report"])
+        for name in ("guarded.txt", "removed.txt", "blocked[1].txt"):
+            self.assertIn(name, failed["report"])
+        self.assertFalse(self.controller.current("checks"))
+        self.assertEqual(self.git("diff", "--cached", "--name-only"), "blocked1.txt")
+        for name in ("guarded.txt", "removed.txt"):
+            self.assertEqual((self.wt / name).read_text(), "base\n")
+        self.assertFalse((self.wt / "blocked[1].txt").exists())
+        repeated = self.perform("checks.run")
+        self.assertFalse(repeated["passed"])
+        self.assertEqual(repeated["report"], failed["report"])
+        self.assertEqual(self.run_fixture.budget.repair_calls, 0)
+        self.assertEqual(self.worker(lambda: self.write("goal.txt", "reached\n")), "check_repair")
+        self.assertEqual(self.run_fixture.budget.repair_calls, 1)
+        passed = self.perform("checks.run")
+        self.assertTrue(passed["passed"], passed["report"])
+        self.assertTrue(passed["full"])
+        self.assertIn("goal passed", passed["report"])
+        self.assertEqual(self.git("diff", "--cached", "--name-only"), "blocked1.txt\ngoal.txt")
+
+    def test_denied_edit_on_last_repair_parks_with_the_path(self):
+        self.prepare_controller()
+        self.controller.data["writes"] = 1
+        self.assertEqual(self.worker(lambda: self.write("guarded.txt", "last attempt\n")), "check_repair")
+        with self.assertRaises(runlimits.Parked) as parked:
+            self.perform("checks.run")
+        status, _, _ = pipeline.park_run(self.run_fixture, str(parked.exception))
+        self.assertEqual(status, "failed")
+        reason = runlimits.metadata(self.run_fixture.id, "parked.json")["reason"]
+        self.assertIn("the repair chain used its 1 repair cycles", reason)
+        self.assertIn("guarded.txt", reason)
+        self.assertEqual((self.wt / "guarded.txt").read_text(), "base\n")
+        self.assertEqual(self.run_fixture.budget.repair_calls, 1)
+
+    def test_staged_secret_fails_with_the_existing_message(self):
+        self.prepare_controller()
+        sample = "fixture-vault-value-728"
+        self.stored.return_value = [("FIXTURE_TOKEN", sample)]
+        self.assert_fatal_worker_edit(lambda: self.write("payload.txt", sample + "\n"),
+                                      "payload.txt (holds the stored value of FIXTURE_TOKEN)")
+        self.assertFalse((self.wt / "payload.txt").exists())
+        pipeline.keep_edits(self.run_fixture)
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        self.assertEqual(self.git("diff", "HEAD^", "HEAD", "--name-only"), "goal.txt")
+
+    def test_workflow_edit_mixed_with_a_layer_denied_edit_is_fatal(self):
+        self.prepare_controller()
+
+        def edit():
+            self.write("guarded.txt", "worker edit\n")
+            self.write(".github/workflows/fixture.yml", "name: fixture\n")
+
+        self.assert_fatal_worker_edit(edit, ".github/workflows/fixture.yml, guarded.txt")
+        self.assertFalse((self.wt / ".github/workflows/fixture.yml").exists())
+        self.assertEqual((self.wt / "guarded.txt").read_text(), "base\n")
+
+    def assert_fatal_worker_edit(self, edit, paths_in_message):
+        edit()
+        self.write("goal.txt", "reached\n")
+        with self.assertRaises(workspace.RunFailed) as failed:
+            self.perform("checks.run")
+        self.assertEqual(failed.exception.why, f"the build and its fixes touched denied paths: {paths_in_message}")
+        self.assertEqual(self.run_fixture.budget.repair_calls, 0)
+        self.assertEqual(self.git("diff", "--cached", "--name-only"), "goal.txt")
+
+
 class OrchestratedFinishBudgetTests(PollFixture):
     def setUp(self):
         super().setUp()
@@ -2446,6 +2625,136 @@ class OrchestratedFinishBudgetTests(PollFixture):
         self.assertEqual(summary, "the orchestrator stopped without delivery")
         self.assertEqual(tasks_store.task_get(tid)["state"], "failed")
         self.assertFalse((directory / "parked.json").exists())
+
+
+class OrchestrationFinishTests(Isolated):
+    PR = "https://github.com/owner/project/pull/685"
+
+    def setUp(self):
+        super().setUp()
+        self.repo = replace(self.repo, github="owner/project", tracker="github",
+                            parts=[config.Part("", "owner/project")])
+        self.cfg = config.Config(repos=[self.repo], replay=config.ReplayConfig(all=True))
+        self.issue = "658"
+        self.labels = {"agent"}
+        self.comments = []
+        self.prs = {self.PR: {"state": "OPEN", "isDraft": False}}
+        self.checkout = workspace.Checkout("", self.repo.github, self.repo.path,
+                                           paths.WORKTREES_DIR / f"{self.repo.name}-{self.issue}",
+                                           "main", pr=self.PR)
+        for module, name, func in (
+            (config, "load", lambda: self.cfg),
+            (gh, "issue", self.issue_view),
+            (gh, "issue_labels", self.edit_labels),
+            (gh, "issue_comment", self.post_comment),
+            (gh, "ensure_label", lambda *args: ""),
+            (gh, "default_branch", lambda repo: "main"),
+            (gh, "pr_merge_details", self.prs.__getitem__),
+            (gh, "pr_set_draft", self.set_draft),
+            (scratch, "process_ids", dict),
+            (scratch, "service_labels", dict),
+            (sandbox, "AUTHORITY", self.root / "authority"),
+        ):
+            self.patches.enter_context(patch.object(module, name, func))
+
+    def issue_view(self, repo, number):
+        return {"number": number, "title": "Fixture issue", "body": "Fixture description", "state": "OPEN",
+                "author": {"login": "owner"}, "labels": [{"name": label} for label in sorted(self.labels)]}
+
+    def edit_labels(self, repo, number, add=(), remove=(), **kwargs):
+        self.labels.difference_update(remove)
+        self.labels.update(add)
+
+    def post_comment(self, repo, number, body):
+        drafted = {url for url, pr in self.prs.items() if pr["isDraft"]}
+        self.comments.append((body, drafted, self.labels.copy()))
+
+    def set_draft(self, url, draft):
+        self.prs[url]["isDraft"] = draft
+
+    def run_controller(self, decide, code):
+        def prepare(flow, tree):
+            flow.ctx.run.enter("running")
+            return factory.Outcome("pass", data={
+                "layer": str(self.repo.layer_dir),
+                "checkouts": [replace(self.checkout, pr=url).to_row() for url in self.prs],
+                "ticket": asdict(flow.ctx.run.tracker.get(self.issue)), "branch": "arete/fixture",
+                "add_dirs": [], "attachments": "", "expertise": "", "triage": "",
+            })
+
+        def drive(flow):
+            controller = orchestration.Controller(flow)
+            with patch.object(controller, "decide", side_effect=lambda: decide(controller)):
+                return controller.drive()
+
+        with (patch.dict(factory.STEPS, {"prepare": prepare}),
+              patch.object(factory, "fingerprint", return_value="fixture-tree")):
+            self.assertEqual(pipeline.run_issue(self.repo.name, self.issue, script=pipeline.Script("orchestrate", drive)),
+                             code)
+        return run_store.newest_whole_run(self.repo.name, self.issue)
+
+    def controller_action(self, controller, op, args, rationale):
+        version = ledger.snapshot(controller.lease)["version"]
+        turn = ledger.begin(controller.lease, {}, controller.policy.max_decisions)
+        response = {"version": PROTOCOL, "decision_id": turn, "state_version": version,
+                    "rationale": rationale, "calls": [{"op": op, "args": args}]}
+        validated = controller.catalog.validate(response, turn, version, {})
+        return ledger.accept(controller.lease, turn, version, validated, controller.policy.max_actions)
+
+    def test_failed_finish_comments_with_its_rationale_and_drafts_open_prs(self):
+        other = "https://github.com/owner/other/pull/686"
+        closed = "https://github.com/owner/closed/pull/687"
+        self.prs[other] = {**self.prs[self.PR]}
+        self.prs[closed] = {**self.prs[self.PR], "state": "CLOSED"}
+        decisions = iter([
+            ("catalog.list", {"kind": "context"}, "The earlier decision only listed context."),
+            ("run.finish", {"reason": "failed"}, "The merge conflicts remain. See http://127.0.0.1:8000/logs."),
+        ])
+        row = self.run_controller(lambda controller: self.controller_action(controller, *next(decisions)), code=1)
+        self.assertEqual((row["status"], row["summary"]), ("failed", "the orchestrator stopped without delivery"))
+        self.assertEqual(self.labels, {"agent", "agent:failed"})
+        (comment, drafted, labels), = self.comments
+        self.assertIn("The merge conflicts remain. See [private address]/logs.", comment)
+        self.assertIn(row["id"], comment)
+        self.assertNotIn("The earlier decision", comment)
+        self.assertNotIn("127.0.0.1", comment)
+        self.assertEqual(drafted, {self.PR, other})
+        self.assertEqual(labels, {"agent", "agent:running"})
+        directory = paths.RUNS_DIR / row["id"]
+        self.assertFalse((directory / "parked.json").exists())
+        for text in (str(row), str(run_lines.read(row["id"])), (directory / "run.log").read_text(),
+                     str(ledger.view(row["id"]))):
+            self.assertNotIn("The merge conflicts remain", text)
+
+    def test_failed_finish_with_unpaired_surrogate_settles_a_local_task(self):
+        self.repo = replace(self.repo, tracker="local")
+        self.cfg = replace(self.cfg, repos=[self.repo])
+        self.issue = self.ticket
+        decisions = iter([("run.finish", {"reason": "failed"}, "Échec \ud800 de la fusion.")])
+
+        row = self.run_controller(lambda controller: self.controller_action(controller, *next(decisions)), code=1)
+
+        self.assertEqual((row["status"], row["summary"]), ("failed", "the orchestrator stopped without delivery"))
+        self.assertEqual(tasks_store.task_get(self.ticket)["state"], "failed")
+        comment, = tasks_store.task_comments(self.ticket)
+        self.assertIn(row["id"], comment["body"])
+        self.assertIn("Échec \\ud800 de la fusion.", comment["body"])
+
+    def test_delivered_finish_keeps_the_ready_pr_and_ticket_state(self):
+        def decide(controller):
+            controller.run.enter("pr")
+            controller.data["published"] = {"ending": "pr", "summary": "Delivered fixture"}
+            controller.data["published_tree"] = controller.fingerprint()
+            controller.executing = "fixture-publication"
+            for gate in ("checks", "verify", "review"):
+                controller.stamp(gate, {})
+            return self.controller_action(controller, "run.finish", {"reason": "delivered"}, "Published the change.")
+
+        row = self.run_controller(decide, code=0)
+        self.assertEqual((row["status"], row["summary"], row["pr_url"]), ("pr", "Delivered fixture", self.PR))
+        self.assertEqual(self.labels, {"agent", "agent:pr"})
+        self.assertEqual(self.comments, [])
+        self.assertFalse(self.prs[self.PR]["isDraft"])
 
 
 class BudgetReadmissionTests(ReadmissionFixture):
