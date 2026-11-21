@@ -1536,7 +1536,7 @@ class CatchUpReviewTests(CatchUpRepairFixture):
 
         self.prepare_publication("review", implementation="exec './helper tool'\n", edit_base=remove_executable_bit)
         self.assertEqual(invoke_caller().stdout, "worked\n")
-        mode = {"file": helper.name, "old_mode": "100755", "new_mode": "100644"}
+        mode = {"file": helper.name}
         finding = {"file": "file.txt", "problem": "The helper gets permission denied.",
                    "severity": "blocker", "category": "regression"}
 
@@ -1551,7 +1551,7 @@ class CatchUpReviewTests(CatchUpRepairFixture):
         self.review_agent.side_effect = review
         action = self.action_result("publication.request")
         self.assertEqual(action["result"]["failures"], orchestration.CATCH_UP_FAILURE)
-        change = "base change at helper tool (mode 100755 to 100644)"
+        change = "base change at helper tool"
         self.assertIn(f"permission denied. ({change})", self.body)
         self.assertIn(f"approved change at file.txt:1 (after) depends on {change}", self.body)
         self.assertEqual(len(self.pushes), 1)
@@ -1646,52 +1646,42 @@ class CatchUpReviewSafetyTests(CatchUpRepairFixture):
             resolve(*args)
 
         self.enterContext(mock.patch.object(pipeline, "resolve_conflicts", side_effect=resolve_with_rename))
-        return {part: {"old_file": old, "file": new} for part, (old, new) in renames.items()}
+        return renames
 
     def test_rename_only_changes_hold_for_direct_and_dependent_citations(self):
         renames = self.prepare_renamed_helpers()
         caller = {"part": "approved", "file": "file.txt", "line": 1,
                   "dependency": "The approved caller still loads the old path."}
 
-        def review(_step, prompt, _cwd, *, json_schema, **_):
+        def review(_step, prompt, _cwd, **_):
             self.assertIn("similarity index 100%\nrename from base helper.txt\nrename to moved helper.txt", prompt)
             self.assertIn('similarity index 100%\nrename from resolution helper.txt\nrename to "resolved\\thelper.txt"',
                           prompt)
-            fields = json_schema["properties"]["problems"]["items"]["properties"]["attribution"]["properties"]
-            self.assertIn("old_file", fields)
-            self.assertIn("old_file", fields["base_change"]["properties"])
-            self.assertIn("old_file", fields["resolution_change"]["properties"])
-            problems = []
-            for part, rename in renames.items():
-                for source, attribution in (("Direct", {"part": part, **rename}),
-                                            ("Dependent", {**caller, f"{part}_change": rename})):
-                    problems.append({"file": "file.txt", "severity": "blocker", "category": "regression",
-                                     "problem": f"{source} {part} rename finding.", "attribution": attribution})
+            finding = {"file": "file.txt", "severity": "blocker", "category": "regression"}
+            problems = [{**finding, "problem": f"Direct {part} rename finding.",
+                         "attribution": {"part": part, "file": new}} for part, (_, new) in renames.items()]
+            problems.append({**finding, "problem": "Dependent base rename finding.",
+                             "attribution": {**caller, "base_change": {"file": renames["base"][0]}}})
             return Result(ok=True, structured={"summary": "The old paths no longer resolve.", "problems": problems})
 
         self.review_agent.side_effect = review
         action = self.action_result("publication.request")
         self.assertEqual(action["result"].get("failures"), orchestration.CATCH_UP_FAILURE)
-        for part, rename in renames.items():
-            cause = f"{part} change at {rename['file']} (renamed from {rename['old_file']})"
-            self.assertIn(f"Direct {part} rename finding. ({cause})", self.body)
-            self.assertIn(f"Dependent {part} rename finding. (approved change at file.txt:1 (after) depends on {cause}",
-                          self.body)
+        for part, (_, new) in renames.items():
+            self.assertIn(f"Direct {part} rename finding. ({part} change at {new})", self.body)
+        self.assertIn("Dependent base rename finding. (approved change at file.txt:1 (after) "
+                      "depends on base change at base helper.txt", self.body)
         self.assertEqual(len(self.pushes), 1)
         self.assertFalse(self.merged)
 
     def test_incorrect_rename_citations_become_pr_notes(self):
         renames = self.prepare_renamed_helpers()
-        base, resolution = renames["base"], renames["resolution"]
+        base, resolution = renames["base"][1], renames["resolution"][1]
         caller = {"part": "approved", "file": "file.txt", "line": 1, "dependency": "The caller uses the helper."}
         citations = [
-            {"part": "base", **base, "old_file": resolution["old_file"]},
-            {"part": "base", **base, "file": resolution["file"]},
-            {"part": "base", "old_file": base["file"], "file": base["old_file"]},
-            {"part": "resolution", **base},
-            {"part": "base", **base, "line": 1},
-            {**caller, "resolution_change": base},
-            {**caller, "base_change": {**base, "old_file": resolution["old_file"]}},
+            {"part": "base", "file": resolution},
+            {"part": "resolution", "file": base},
+            {**caller, "base_change": {"file": resolution}},
         ]
         self.review_agent.side_effect = None
         self.review_agent.return_value = Result(ok=True, structured={
@@ -1766,7 +1756,7 @@ class CatchUpReviewSafetyTests(CatchUpRepairFixture):
                     self.assertNotIn(hidden, exposed)
         self.assertTrue(all(not artifact.exists() for artifact in artifacts))
 
-    def test_binary_changes_hold_in_both_deltas_for_direct_and_dependent_citations(self):
+    def test_binary_changes_hold_in_both_deltas_by_path(self):
         base_asset = self.root / "base.bin"
         resolution_asset = self.root / "resolution schema.bin"
         unchanged_asset = self.root / "unchanged.bin"
@@ -1799,20 +1789,20 @@ class CatchUpReviewSafetyTests(CatchUpRepairFixture):
             finding = {"file": "file.txt", "severity": "blocker", "category": "regression"}
             caller = {"part": "approved", "file": "file.txt", "line": 1,
                       "dependency": "The caller requires schema v1."}
-            unchanged = {"file": unchanged_asset.name, "binary": True}
+            unchanged = {"file": unchanged_asset.name}
             problems = []
             for part, asset in (("base", base_asset), ("resolution", resolution_asset)):
-                citation = {"file": asset.name, "binary": True}
                 problems.extend((
                     {**finding, "problem": f"Direct {part} binary finding.",
-                     "attribution": {"part": part, **citation}},
-                    {**finding, "problem": f"Dependent {part} binary finding.",
-                     "attribution": {**caller, f"{part}_change": citation}},
+                     "attribution": {"part": part, "file": asset.name}},
                     {**finding, "problem": f"Unchanged binary in {part}.",
                      "attribution": {"part": part, **unchanged}},
-                    {**finding, "problem": f"Unchanged dependency in {part}.",
-                     "attribution": {**caller, f"{part}_change": unchanged}},
                 ))
+            problems.extend((
+                {**finding, "problem": "Dependent base binary finding.",
+                 "attribution": {**caller, "base_change": {"file": base_asset.name}}},
+                {**finding, "problem": "Unchanged dependency.", "attribution": {**caller, "base_change": unchanged}},
+            ))
             return Result(ok=True, structured={"summary": "Two schemas changed.", "problems": problems})
 
         self.review_agent.side_effect = review
@@ -1820,14 +1810,56 @@ class CatchUpReviewSafetyTests(CatchUpRepairFixture):
             action = self.action_result("publication.request")
         self.assertEqual(action["result"]["failures"], orchestration.CATCH_UP_FAILURE)
         for part, asset in (("base", base_asset), ("resolution", resolution_asset)):
-            change = f"{part} change at {asset.name} (binary content)"
+            change = f"{part} change at {asset.name}"
             self.assertIn(f"Direct {part} binary finding. ({change})", self.body)
-            self.assertIn(f"Dependent {part} binary finding. (approved change at file.txt:1 (after) depends on {change}",
-                          self.body)
             self.assertIn(f"Unchanged binary in {part}. (found on catch-up)", self.body)
-            self.assertIn(f"Unchanged dependency in {part}. (found on catch-up)", self.body)
+        self.assertIn("Dependent base binary finding. (approved change at file.txt:1 (after) "
+                      "depends on base change at base.bin", self.body)
+        self.assertIn("Unchanged dependency. (found on catch-up)", self.body)
         self.assertEqual(len(self.pushes), 1)
         self.assertFalse(self.merged)
+
+
+class CatchUpAttributionTests(PublicationFixture):
+    BLOCKER: ClassVar[dict] = {"file": "file.txt", "problem": "The caller no longer works.",
+                               "severity": "blocker", "category": "regression"}
+
+    def test_file_only_citation_requires_a_delta_without_text_hunks(self):
+        patches = {"base": (
+            "diff --git a/empty b/empty\ndeleted file mode 100644\nindex e69de29..0000000\n"
+            "diff --git a/helper b/helper\nold mode 100755\nnew mode 100644\n"
+            "--- a/helper\n+++ b/helper\n@@ -1 +1 @@\n-old\n+new\n"
+        )}
+        for location, severity in (({"file": "empty"}, "blocker"), ({"file": "helper"}, "major"),
+                                   ({"file": "helper", "line": 1}, "blocker"), ({"file": "unchanged"}, "major")):
+            with self.subTest(location=location):
+                attribution = {"part": "base", **location}
+                problems = catch_up_problems([{**self.BLOCKER, "attribution": attribution}], patches)
+                self.assertEqual(problems[0]["severity"], severity)
+
+    def test_repository_blank_context_setting_cannot_shift_changed_line_citations(self):
+        c = self.checkout
+        self.file.write_text("kept\n\nold\n")
+        self.commit("add blank context")
+        c.lease = self.git("rev-parse", "HEAD")
+        self.file.write_text("kept\n\nnew\n")
+        self.commit("change line after blank context")
+        c.base_commit = c.merge = self.git("rev-parse", "HEAD")
+        self.git("config", "diff.suppressBlankEmpty", "true")
+        raw = self.git("diff", "--unified=3", "--no-color", "--no-ext-diff", "--no-textconv", c.lease, c.base_commit)
+        self.assertIn("\n kept\n\n-old\n+new", raw)
+        self.build.run.repo = config.Repo("fixture", self.root)
+        self.build.ticket = tracker.Ticket("7", "#7", "Preserve attribution after blank context")
+
+        with (mock.patch.object(pipeline.vault, "values", return_value=set()),
+              pipeline.catch_up_review_prompt(self.build, c, "", verify.Verified("pass"), Review("approve"))
+              as (prompt, patches)):
+            self.assertIn("\n kept\n \n-old\n+new\n", prompt)
+            for line, severity in ((2, "major"), (3, "blocker")):
+                with self.subTest(line=line):
+                    attribution = {"part": "base", "file": self.file.name, "line": line}
+                    problems = catch_up_problems([{**self.BLOCKER, "attribution": attribution}], patches)
+                    self.assertEqual(problems[0]["severity"], severity)
 
 
 class CatchUpVerifyRepairTests(CatchUpRepairFixture):
@@ -3922,32 +3954,6 @@ class ReviewTests(unittest.TestCase):
             with self.subTest(side=side):
                 cause = {**attribution, "base_change": {"file": "api.txt", "line": 1, "side": side}}
                 problems = catch_up_problems([{**self.BLOCKER, "attribution": cause}], patches)
-                review = Review.judged({"problems": problems}, [], [], {})
-                self.assertEqual(review.verdict, verdict)
-
-    def test_file_mode_attribution_matches_only_a_real_transition_in_the_cited_delta(self):
-        text_change = ("diff --git a/helper b/helper\nindex 1234567..89abcde 100755\n"
-                       "--- a/helper\n+++ b/helper\n@@ -1 +1 @@\n-old\n+new\n")
-        patches = {
-            "approved": text_change,
-            "base": text_change,
-            "resolution": ('diff --git "a/helper\\ttool" "b/helper\\ttool"\n'
-                           "old mode 100755\nnew mode 100644\n"),
-        }
-        mode = {"file": "helper\ttool", "old_mode": "100755", "new_mode": "100644"}
-        approved = {"part": "approved", "file": "helper", "line": 1, "dependency": "The caller executes the tool."}
-        for citation, verdict in (
-            ({"part": "resolution", **mode}, "request_changes"),
-            ({**approved, "resolution_change": mode}, "request_changes"),
-            ({"part": "base", **mode}, "approve"),
-            ({"part": "base", **mode, "file": "helper", "new_mode": "100755"}, "approve"),
-            ({"part": "resolution", **mode, "old_mode": "100644"}, "approve"),
-            ({"part": "resolution", **mode, "new_mode": None}, "approve"),
-            ({"part": "resolution", **mode, "line": 1}, "approve"),
-            ({**approved, "base_change": mode}, "approve"),
-        ):
-            with self.subTest(citation=citation):
-                problems = catch_up_problems([{**self.BLOCKER, "attribution": citation}], patches)
                 review = Review.judged({"problems": problems}, [], [], {})
                 self.assertEqual(review.verdict, verdict)
 

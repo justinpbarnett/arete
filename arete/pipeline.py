@@ -3489,6 +3489,7 @@ def _review(b: Build, plan: str, verified: verify.Verified, step: str = "review"
 def catch_up_review_prompt(b: Build, c: workspace.Checkout, plan: str, verified: verify.Verified,
                            before: Review) -> Iterator[tuple[str, dict[str, str]]]:
     fork = git(["merge-base", c.lease, c.base_commit], c.wt).strip()
+    diff_config = ["-c", "diff.suppressBlankEmpty=false"]
     flags = ("--no-color", "--no-ext-diff", "--no-textconv", "--submodule=short", "--unified=3", "--no-relative",
              "--src-prefix=a/", "--dst-prefix=b/", "--find-renames", "-l0")
     comparisons = {
@@ -3496,7 +3497,7 @@ def catch_up_review_prompt(b: Build, c: workspace.Checkout, plan: str, verified:
         "base": ["diff", *flags, fork, c.base_commit, "--"],
         "resolution": ["show", "--remerge-diff", "--format=", *flags, c.merge, "--"] if c.resolved else [],
     }
-    raw = {part: util.git_bytes(args, c.wt).decode(errors="replace") if args else ""
+    raw = {part: util.git_bytes(diff_config + args, c.wt).decode(errors="replace") if args else ""
            for part, args in comparisons.items()}
     patches = permitted_review_patches(raw, diffguard.denied_paths(b.layer), c.prefix)
     with ExitStack() as files:

@@ -49,13 +49,9 @@ REVIEW_SCHEMA = {
 _LOCATION_SCHEMA = {
     "type": "object",
     "properties": {
-        "file": {"type": "string", "description": "Repository-relative path. For a rename, use the new path."},
-        "old_file": {"type": "string", "description": "Exact old repository-relative path for a rename."},
-        "line": {"type": "integer", "minimum": 1},
+        "file": {"type": "string", "description": "Repository-relative path."},
+        "line": {"type": "integer", "minimum": 1, "description": "Changed line. Required for files with text hunks."},
         "side": {"type": "string", "enum": ["before", "after"]},
-        "old_mode": {"type": "string", "description": "Git mode before the change. Use 000000 for an added file."},
-        "new_mode": {"type": "string", "description": "Git mode after the change. Use 000000 for a deleted file."},
-        "binary": {"type": "boolean", "description": "True for a file marked as changed binary content."},
     },
     "required": ["file"],
 }
@@ -74,12 +70,11 @@ CATCH_UP_REVIEW_SCHEMA = {
                     **_PROBLEM_SCHEMA["properties"],
                     "attribution": {
                         **_LOCATION_SCHEMA,
-                        "description": "Cite a changed line, a Git mode transition, a binary change, or an exact rename.",
+                        "description": "Cite a changed line, or a changed file in the base or resolution part with no text hunk.",
                         "properties": {
                             **_LOCATION_SCHEMA["properties"],
                             "part": {"type": "string", "enum": ["base", "resolution", "approved"]},
                             "base_change": _LOCATION_SCHEMA,
-                            "resolution_change": _LOCATION_SCHEMA,
                             "dependency": {"type": "string"},
                         },
                         "required": [*_LOCATION_SCHEMA["required"], "part"],
@@ -89,21 +84,17 @@ CATCH_UP_REVIEW_SCHEMA = {
         },
     },
 }
-_HUNK_START = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+_HUNK_START = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", re.MULTILINE)
 _PATCH_SECTION = re.compile(r"^diff --git ", re.MULTILINE)
 _SAME_PATH = re.compile(r'("?)a/(.+)\1 \1b/\2\1')
-_MODE_LINE = re.compile(r"^(old mode|new mode|deleted file mode|new file mode) ([0-7]{6})$", re.MULTILINE)
 _RENAME_PATHS = re.compile(r"^rename from (.+)\nrename to (.+)$", re.MULTILINE)
-_BINARY_LINE = re.compile(r"^Binary files(?: .+)? differ$", re.MULTILINE)
 _PATCH_BODY = re.compile(r"^(?:@@ |GIT binary patch$)", re.MULTILINE)
 
 
 @dataclass
 class ChangedLocations:
     lines: set[tuple[str, str, int]]
-    modes: dict[str, tuple[str, str]]
-    binaries: set[str]
-    renames: set[tuple[str, str]]
+    files_without_hunks: set[str]
 
 
 @dataclass(frozen=True)
@@ -311,28 +302,15 @@ def changed_lines(patch: str) -> set[tuple[str, str, int]]:
 
 
 def changed_locations(patch: str, *, text_only: bool) -> ChangedLocations:
-    before, after = {}, {}
-    binaries, renames = set(), set()
-    if not text_only:
-        for section in review_patch_sections(patch):
-            if not section.paths:
-                continue
-            if len(section.paths) == 2:
-                old, new = section.paths
-                renames.add((old, new))
-            if _BINARY_LINE.search(section.metadata):
-                binaries.update(section.paths)
-            for kind, mode in _MODE_LINE.findall(section.metadata):
-                file = section.paths[-1]
-                modes = before if kind in ("old mode", "deleted file mode") else after
-                modes[file] = mode
-                if kind == "new file mode":
-                    before.setdefault(file, "000000")
-                elif kind == "deleted file mode":
-                    after.setdefault(file, "000000")
-    changed_modes = {file: (before[file], after[file]) for file in before.keys() & after.keys()
-                     if before[file] != after[file]}
-    return ChangedLocations(changed_lines(patch), changed_modes, binaries, renames)
+    lines = changed_lines(patch)
+    if text_only:
+        return ChangedLocations(lines, set())
+    touched, with_hunks = set(), set()
+    for section in review_patch_sections(patch):
+        touched.update(section.paths)
+        if _HUNK_START.search(section.text):
+            with_hunks.update(section.paths)
+    return ChangedLocations(lines, touched - with_hunks)
 
 
 def changed_location(given, changes: ChangedLocations) -> str:
@@ -341,22 +319,8 @@ def changed_location(given, changes: ChangedLocations) -> str:
     file = given.get("file")
     if not isinstance(file, str):
         return ""
-    if "old_file" in given:
-        old = given["old_file"]
-        if (isinstance(old, str) and (old, file) in changes.renames
-                and given.keys().isdisjoint(("line", "side", "old_mode", "new_mode", "binary"))):
-            return f"{file} (renamed from {old})"
-        return ""
-    if "binary" in given:
-        if (given["binary"] is True and file in changes.binaries
-                and given.keys().isdisjoint(("line", "side", "old_mode", "new_mode"))):
-            return f"{file} (binary content)"
-        return ""
-    if "old_mode" in given or "new_mode" in given:
-        modes = given.get("old_mode"), given.get("new_mode")
-        if "line" not in given and "side" not in given and modes == changes.modes.get(file):
-            return f"{file} (mode {modes[0]} to {modes[1]})"
-        return ""
+    if file in changes.files_without_hunks:
+        return file
     side, line = given.get("side", "after"), given.get("line")
     if isinstance(side, str) and type(line) is int and (file, side, line) in changes.lines:
         return f"{file}:{line} ({side})"
@@ -373,16 +337,12 @@ def catch_up_cause(attribution, changes: dict[str, ChangedLocations]) -> str:
         return ""
     if part in ("base", "resolution"):
         return f"{part} change at {location}"
-    sources = [source for source in ("base", "resolution") if f"{source}_change" in attribution]
-    if len(sources) != 1:
+    if "base" not in changes:
         return ""
-    source, = sources
-    if source not in changes:
-        return ""
-    cause = changed_location(attribution[f"{source}_change"], changes[source])
+    cause = changed_location(attribution.get("base_change"), changes["base"])
     dependency = attribution.get("dependency")
     if cause and isinstance(dependency, str) and dependency.strip():
-        return f"approved change at {location} depends on {source} change at {cause}. {dependency.strip()}"
+        return f"approved change at {location} depends on base change at {cause}. {dependency.strip()}"
     return ""
 
 
