@@ -13,13 +13,14 @@ WAIT_SECONDS = 30 * 60
 FIRST_CHECK_SECONDS = 3 * 60
 SETTLE_SECONDS = 60
 POLL_SECONDS = 30
+CONFLICT_SNAPSHOT_TIMEOUT = 5
 LOG_EXCERPT_CHARS = 8000
 LOG_TIMESTAMP = re.compile(r"^\d{4}-\d\d-\d\dT[\d:.]+Z ", re.MULTILINE)
 SECTION_START, SECTION_END = "<!-- arete:ci -->", "<!-- /arete:ci -->"
-SECTION = re.compile(rf"\n*^{re.escape(SECTION_START)}\r?$.*?^{re.escape(SECTION_END)}\r?$", re.DOTALL | re.MULTILINE)
+SECTION = re.compile(rf"^{re.escape(SECTION_START)}\r?$.*?^{re.escape(SECTION_END)}\r?$", re.DOTALL | re.MULTILINE)
 STOPPED = "Arete stopped:"
 PAST_TENSE = {"pass": "passed", "fail": "failed", "pending": "was still running", "skipped": "was skipped"}
-READ_ERRORS = (gh.GhError, KeyError, TypeError, ValueError)
+READ_ERRORS = (gh.GhError, OSError, KeyError, TypeError, ValueError, AttributeError)
 RED_LINE = {
     "base": "- Failed on the base too: {check}. It {base_result}, so this PR did not cause it.",
     "not caused": "- Failed, not caused by this PR: {check}. It {base_result}. {reason}",
@@ -170,18 +171,20 @@ def watch(target: Target, log: Callable[[str], None]) -> Watched:
     checks: dict[str, gh.Check] = {}
     waiting_on: list[str] | None = None
     while True:
-        conflict = conflicting(target, log)
-        if conflict:
+        if conflicting(target, log):
             log(f"ci: stopped waiting on {target.pr_name} because GitHub reports a merge conflict with the base")
+            try:
+                latest = gh.commit_checks(target.github, target.sha, timeout=CONFLICT_SNAPSHOT_TIMEOUT, retry=False)
+            except READ_ERRORS as e:
+                log(f"ci: reading the checks of {target.pr_name} failed: {util.first_line(str(e), 200)}")
+                return Watched(target, {}, read=False, conflicting=True)
+            return Watched(target, latest, conflicting=True)
         try:
             checks = gh.commit_checks(target.github, target.sha)
             just_read = True
         except READ_ERRORS as e:
             just_read = False
-            retry = "" if conflict else ", trying again"
-            log(f"ci: reading the checks of {target.pr_name} failed{retry}: {util.first_line(str(e), 200)}")
-        if conflict:
-            return Watched(target, checks if just_read else {}, read=just_read, conflicting=True)
+            log(f"ci: reading the checks of {target.pr_name} failed, trying again: {util.first_line(str(e), 200)}")
         waited = time.monotonic() - target.pushed_at
         pending = sorted(c.name for c in checks.values() if c.state == "pending")
         if checks and pending != waiting_on:

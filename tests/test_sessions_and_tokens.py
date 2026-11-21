@@ -142,7 +142,7 @@ class PushedPrDraftTests(unittest.TestCase):
             raise AssertionError(f"unexpected GitHub request: {args}")
         return ""
 
-    def fake_git(self, args, cwd, **kw):
+    def fake_git(self, args, cwd):
         return self.tree if args == ["rev-parse", f"{self.head}^{{tree}}"] else self.base
 
     def fake_ask(self, *a, **k):

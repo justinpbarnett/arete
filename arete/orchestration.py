@@ -552,24 +552,27 @@ class Controller:
         self.data.pop("publication_intent", None)
         self.data["publication"] = outcome.data
         self.persist()
-        if self.run.repo.parts:
-            self.job.slot.free()
-            try:
-                with self.run.waiting("ci"):
-                    current = pipeline.ci.Round(1, [pipeline.ci.compare_with_base(
-                        pipeline.ci.watch(pipeline.ci_target(c), self.run.log), self.run.log)
-                        for c in self.job.picked(self.job.changed)])
-            finally:
-                self.job.slot.take(self.run.log, self.run.waiting)
-            self.job.ci_result = current.summary()
-            self.check_pilot_publication()
-            pipeline.publish_ci(self.run, self.job.ticket, self.job.with_prs, pipeline.ci.section([current], 1))
-            if failure := self.publication_ci_error(current):
-                return failure
+        if self.run.repo.parts and (failure := self.publication_ci(self.job.picked(self.job.changed))):
+            return failure
         return self.finish_publication()
 
-    def publication_ci_error(self, current):
-        if not current.reds and current.all_read:
+    def publication_ci(self, pushed, *, caught_up=False):
+        self.job.slot.free()
+        try:
+            with self.run.waiting("ci"):
+                current = pipeline.ci.Round(1, [pipeline.ci.compare_with_base(
+                    pipeline.ci.watch(pipeline.ci_target(c), self.run.log), self.run.log) for c in pushed])
+        finally:
+            self.job.slot.take(self.run.log, self.run.waiting)
+        self.job.ci_result = current.summary()
+        self.check_pilot_publication()
+        section = pipeline.ci.section([current], 1)
+        if caught_up:
+            for checkout in pushed:
+                pipeline.comment_catch_up_ci(self.run, checkout, section, self.job.verified, self.job.review)
+        else:
+            pipeline.publish_ci(self.run, self.job.ticket, self.job.with_prs, section)
+        if not current.reds and all(w.read or w.conflicting for w in current.seen):
             self.data.pop("ci_failed", None)
             self.data.pop("ci_failures", None)
             self.catalog.context.pop(CI_FAILURES, None)
@@ -583,13 +586,64 @@ class Controller:
         return {"ci": self.job.ci_result, "failures": CI_FAILURES,
                 "error": f"CI needs an explicit worker diagnosis or repair; its failure logs are context {CI_FAILURES}"}
 
+    def automerge(self, candidates):
+        job = self.job
+        if not candidates or not pipeline.automerge_allowed(job.b, job.approval, job.draft_why):
+            return None
+        about = pipeline.automerge_about(job.ticket, job.build_summary)
+        track_base = not pilot.is_pilot_task(str(self.run.tid))
+        for checkout in candidates:
+            while True:
+                hold = pipeline.try_automerge(job.b, checkout, job.verified, job.review, about,
+                                              track_moved_base=track_base)
+                if hold is None:
+                    return None
+                if isinstance(hold, gh.MovedBaseHold):
+                    hold = self.catch_up(checkout)
+                    if not hold:
+                        if failure := self.publication_ci([checkout], caught_up=True):
+                            return failure
+                        continue
+                pipeline.report_automerge(self.run, checkout, hold)
+                break
+        return None
+
+    def catch_up(self, checkout):
+        job, b = self.job, self.job.b
+        base_sha = ""
+        try:
+            row = gh.pr_merge_details(checkout.pr)
+            if hold := gh.merge_ref_hold(row, checkout.lease, checkout.base):
+                return hold
+            base_sha = row.get("baseRefOid")
+            base_sha = pipeline.fetch_merge_base(checkout) or base_sha
+            if not base_sha:
+                return "GitHub did not report the current base commit"
+            if b.catch_ups >= pipeline.AUTOMERGE_CATCH_UPS:
+                return f"the base `{checkout.base}` moved to `{base_sha}` after {b.catch_ups} catch-ups"
+            b.catch_ups += 1
+            job.verified, job.review = pipeline.catch_up_base(
+                b, checkout, job.branch, base_sha, job.with_left(job.goal), job.with_left(job.plan_text))
+        except pipeline.CatchUpPushUnconfirmed:
+            raise
+        except (workspace.RunFailed, RuntimeError, OSError) as e:
+            reason = e.why if isinstance(e, workspace.RunFailed) else util.first_line(str(e), 300)
+            base = f"`{checkout.base}` at `{base_sha}`" if base_sha else f"`{checkout.base}`"
+            return f"could not catch up to {base}: {pipeline.public_text(self.run, reason)}"
+        self.data["publication"]["heads"][checkout.github] = checkout.lease
+        pipeline.note_review(self.run, job.review, job.verified)
+        self.run.log(f"automerge: pushed catch-up {b.catch_ups} to {checkout.pr} at {checkout.lease}")
+        self.stamp("checks", {"full": True, "checked": b.checked, "report": b.report})
+        self.stamp("verify", asdict(job.verified))
+        self.stamp("review", job.review.asdict())
+        self.persist()
+        return ""
+
     def finish_publication(self):
         self.check_pilot_publication()
         self.data["publication_intent"] = {"tree": self.fingerprint(), "phase": "publish"}
         self.persist()
-        outcome = self.atomic("publish", ci_guard=self.publication_ci_error)
-        for checkout in self.job.picked(self.job.changed):
-            self.data["publication"]["heads"][checkout.github] = checkout.lease
+        outcome = self.atomic("publish", merge=self.automerge)
         self.data.pop("publication_intent", None)
         if outcome.passed:
             self.data["published"], self.data["published_tree"] = outcome.data, self.fingerprint()

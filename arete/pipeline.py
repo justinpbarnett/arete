@@ -438,6 +438,18 @@ class AgentRun:
         return res
 
 
+class CatchUpNeedsInput(workspace.RunFailed):
+    pass
+
+
+class PushFailed(workspace.RunFailed):
+    pass
+
+
+class CatchUpPushUnconfirmed(workspace.RunFailed):
+    pass
+
+
 @dataclass(kw_only=True)
 class Run(AgentRun):
     tracker: tracker.Tracker
@@ -481,7 +493,7 @@ class Run(AgentRun):
             if self.owner_questions_blocked and res.record and any(
                     event.get("kind") == "tool_call" and owner_asks.is_ask(event.get("name"))
                     for event in record.events(paths.record_dir(self.id) / res.record)):
-                raise workspace.RunFailed(f"{step} needs owner input")
+                raise CatchUpNeedsInput(f"{step} needs owner input")
             return res
         due = self.due_for(step)
         if kw.get("native_observation"):
@@ -539,7 +551,7 @@ class Run(AgentRun):
 
     def owner_ask(self, step: str, sent: list[dict], session: Session) -> None:
         if self.owner_questions_blocked:
-            raise workspace.RunFailed(f"{step} needs owner input")
+            raise CatchUpNeedsInput(f"{step} needs owner input")
         ask_ids = [f"{self.id}-a{self.asks_made + n}" for n in range(1, len(sent) + 1)]
         self.asks_made += len(sent)
         limit, seam = self.config.ask.max_per_run, factory.inside(self.id).step
@@ -2072,90 +2084,57 @@ def report_body(run: Run, *, summary: str, review: Review, verified: verify.Veri
 
 
 def automerge(b: Build, approval: dict | None, draft_why: str, verified: verify.Verified, review: Review,
-              opened: list[workspace.Checkout], about: str, *,
-              catch_up: Callable[[workspace.Checkout], tuple[str, ci.Round | None]] | None = None) -> ci.Round | None:
+              opened: list[workspace.Checkout], about: str) -> None:
+    if not opened or not automerge_allowed(b, approval, draft_why):
+        return
+    for c in opened:
+        hold = try_automerge(b, c, verified, review, about)
+        if hold is None:
+            return
+        report_automerge(b.run, c, hold)
+
+
+def automerge_allowed(b: Build, approval: dict | None, draft_why: str) -> bool:
     run = b.run
-    if not opened or draft_why or b.layer.trust_level != "automerge" or run.feedback or run.repairs:
-        return None
+    if draft_why or b.layer.trust_level != "automerge" or run.feedback or run.repairs:
+        return False
     if (approval and approval["sent_by"] == "triage") or intake.AUTO_LABEL in b.ticket.labels:
         run.facts["merge_held"] = "triage approved the ticket, so a person merges it"
         run.log(f"automerge left off: {run.facts['merge_held']}")
-        return None
-    current = None
-    for c in opened:
-        try:
-            if catch_up:
-                hold, current = catch_up(c)
-            else:
-                hold = merge_hold(b, c, verified, review, about)
-        except gh.GhUnsure:
-            run.facts["merge_held"] = "GitHub did not confirm whether it merged the PR"
-            run.log(f"automerge: {run.facts['merge_held']} at {c.lease}; check {c.pr} before retrying")
-            return current
-        except (RuntimeError, OSError, KeyError, TypeError, ValueError) as e:
-            run.log(f"automerge could not establish eligibility: {public_text(run, util.first_line(str(e), 300))}")
-            hold = "the merge gate could not be completed"
-        if not hold:
-            run.log(f"automerged {c.pr} at {c.lease}")
-            continue
-        if current and (current.reds or not current.all_read):
-            return current
-        run.facts["merge_held"] = hold
-        run.log(f"automerge left {c.pr} for a person: {hold}")
-        try:
-            gh.pr_comment(c.pr, public_text(run, f"Automerge stays off for this PR: {hold}. A person merges it."))
-        except gh.GhError as e:
-            run.log(f"automerge could not report the hold on {c.pr}: {e}")
-    return current
+        return False
+    return True
 
 
-def merge_with_catch_ups(b: Build, c: workspace.Checkout, verified: verify.Verified, review: Review, about: str,
-                         branch: str, slot: slots.RunSlot, goal: str, plan: str) -> tuple[str, ci.Round | None]:
-    from . import pilot
-
-    run, current = b.run, None
-    track_base = not pilot.is_pilot_task(str(run.tid))
-    while True:
-        hold = merge_hold(b, c, verified, review, about, track_moved_base=track_base)
-        if not isinstance(hold, gh.MovedBaseHold):
-            return hold, current
-        row = gh.pr_merge_details(c.pr)
-        if ref_hold := gh.merge_ref_hold(row, c.lease, c.base):
-            return ref_hold, current
-        base_sha = row.get("baseRefOid")
-        if not base_sha:
-            return "GitHub did not report the current base commit", current
-        try:
-            base_sha = fetch_merge_base(c)
-            if b.catch_ups >= AUTOMERGE_CATCH_UPS:
-                return f"the base `{c.base}` moved to `{base_sha}` after {b.catch_ups} catch-ups", current
-            b.catch_ups += 1
-            verified, review = catch_up_base(b, c, branch, goal, plan)
-        except (workspace.RunFailed, RuntimeError, OSError) as e:
-            reason = e.why if isinstance(e, workspace.RunFailed) else util.first_line(str(e), 300)
-            return f"could not catch up to `{c.base}` at `{base_sha}`: {public_text(run, reason)}", current
-        slot.free()
-        try:
-            with run.waiting("ci"):
-                current = ci.Round(1, [ci.compare_with_base(ci.watch(ci_target(c), run.log), run.log)])
-        finally:
-            slot.take(run.log, run.waiting)
-        try:
-            ref_hold = gh.merge_ref_hold(gh.pr_merge_details(c.pr), c.lease, c.base)
-            if not ref_hold:
-                publish_ci(run, b.ticket, [c], ci.section([current], 1), (verified, review))
-        except gh.GhError as e:
-            run.log(f"automerge: could not refresh {c.pr}: {public_text(run, util.first_line(str(e), 300))}")
-            ref_hold = "the PR could not be refreshed for the caught-up head"
-        if current.reds or not current.all_read:
-            return "CI needs diagnosis or repair", current
-        if ref_hold:
-            return ref_hold, current
-
-
-def catch_up_base(b: Build, c: workspace.Checkout, branch: str, goal: str, plan: str) -> tuple[verify.Verified, Review]:
+def try_automerge(b: Build, c: workspace.Checkout, verified: verify.Verified, review: Review, about: str, *,
+                  track_moved_base: bool = False) -> str | None:
     run = b.run
-    if git(["rev-parse", "HEAD"], c.wt).strip() != c.lease or workspace.uncommitted(c.wt):
+    try:
+        return merge_hold(b, c, verified, review, about, track_moved_base=track_moved_base)
+    except gh.GhUnsure:
+        run.facts["merge_held"] = "GitHub did not confirm whether it merged the PR"
+        run.log(f"automerge: {run.facts['merge_held']} at {c.lease}; check {c.pr} before retrying")
+        return None
+    except (RuntimeError, OSError, KeyError, TypeError, ValueError) as e:
+        run.log(f"automerge could not establish eligibility: {public_text(run, util.first_line(str(e), 300))}")
+        return "the merge gate could not be completed"
+
+
+def report_automerge(run: Run, c: workspace.Checkout, hold: str) -> None:
+    if not hold:
+        run.log(f"automerged {c.pr} at {c.lease}")
+        return
+    run.facts["merge_held"] = hold
+    run.log(f"automerge left {c.pr} for a person: {hold}")
+    try:
+        gh.pr_comment(c.pr, public_text(run, f"Automerge stays off for this PR: {hold}. A person merges it."))
+    except gh.GhError as e:
+        run.log(f"automerge could not report the hold on {c.pr}: {e}")
+
+
+def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
+                  goal: str, plan: str) -> tuple[verify.Verified, Review]:
+    run = b.run
+    if git(["rev-parse", "HEAD"], c.wt).strip() != c.lease or workspace.uncommitted(c.wt, tracked_only=True):
         raise workspace.RunFailed("the worktree differs from the published head")
     before = replace(c)
     checked, report, staged = b.checked, b.report, b.staged
@@ -2163,9 +2142,12 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, goal: str, plan:
     blocked = run.owner_questions_blocked
     run.owner_questions_blocked = True
     try:
-        if not merge_moved_bases(run, [c], b.layer, b.ticket, "automerge: "):
+        if not merge_moved_bases(run, [c], b.layer, b.ticket, "automerge: ",
+                                bases={c.github: base_sha}, allow_untracked=True):
             raise workspace.RunFailed("the published head already contains the fetched base")
         head = c.merge
+        if workspace.uncommitted(c.wt):
+            raise workspace.RunFailed("the worktree has uncommitted files after merging the moved base")
         b.require_valid_diff("catching up the moved base", from_base=True)
         if not b.check():
             raise workspace.RunFailed("the layer's local checks failed")
@@ -2181,21 +2163,37 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, goal: str, plan:
             raise workspace.RunFailed(hold)
     except BaseException as error:
         abort_merge(c.wt)
+        if (git(["rev-parse", "HEAD"], c.wt).strip() != before.lease
+                or workspace.uncommitted(c.wt, tracked_only=True)):
+            git(["reset", "--hard", before.lease], c.wt)
         for name in workspace.untracked_files(c.wt) - untracked:
             workspace.remove_untracked(c.wt, name)
-        if git(["rev-parse", "HEAD"], c.wt).strip() != before.lease or workspace.uncommitted(c.wt):
-            git(["reset", "--hard", before.lease], c.wt)
         c.__dict__.update(vars(before))
         b.checked, b.report, b.staged = checked, report, staged
         if isinstance(error, owner_asks.Asked):
-            raise workspace.RunFailed("a catch-up worker needs owner input") from error
+            raise CatchUpNeedsInput("a catch-up worker needs owner input") from error
         raise
     finally:
         run.owner_questions_blocked = blocked
-    commit_and_push(b.checkouts, [c], branch, "", before_push=lambda _: head)
-    note_review(run, review, verified)
-    run.log(f"automerge: pushed catch-up {b.catch_ups} to {c.pr} at {c.lease}")
+    push_caught_up_head(b, c, branch, head)
     return verified, review
+
+
+def push_caught_up_head(b: Build, c: workspace.Checkout, branch: str, head: str) -> None:
+    b.run.log(f"automerge: pushing catch-up {b.catch_ups} to {c.pr} at {head}, after {c.lease}")
+    try:
+        commit_and_push(b.checkouts, [c], branch, "", before_push=lambda _: head)
+    except PushFailed as failed:
+        try:
+            remote = runlimits.branch_head(c.src, branch)
+        except (ValueError, RuntimeError, OSError):
+            remote = None
+        if remote != head:
+            raise CatchUpPushUnconfirmed(
+                f"the catch-up push to `{branch}` could not be confirmed; reconcile its remote head before resuming",
+                f"Previous head `{c.lease}`, attempted head `{head}`, PR {c.pr}.",
+            ) from failed
+        c.lease, c.onto = head, ""
 
 
 def merge_evidence_hold(b: Build, c: workspace.Checkout, verified: verify.Verified, review: Review, head: str) -> str:
@@ -2243,7 +2241,7 @@ def fetch_merge_base(c: workspace.Checkout) -> str:
 
 
 def has_merge_base(c: workspace.Checkout, head: str, base_sha: str) -> bool:
-    return bool(base_sha) and git(["merge-base", base_sha, head], c.wt, check=False).strip() == base_sha
+    return bool(base_sha) and git(["merge-base", base_sha, head], c.wt).strip() == base_sha
 
 
 def screen_and_merge(b: Build, c: workspace.Checkout, number: int, head: str, base_sha: str, about: str, *,
@@ -2396,12 +2394,11 @@ def commit_and_push(checkouts: list[workspace.Checkout], changed: list[workspace
             argv = ["push", "-q", f"--force-with-lease={branch}:{c.lease}", "-u", "origin", branch]
         try:
             git(argv, c.wt, timeout=600, retry=not before_push)
-        except RuntimeError as e:
+        except (RuntimeError, OSError) as e:
             done = ", ".join(p.github for p in pushed) or "nothing"
             aftermath = ("Arete will not retry the push." if before_push
                          else "A retry builds on whatever reached the branch.")
-            raise workspace.RunFailed(f"the push to {c.github} failed after arete pushed {done}",
-                                      f"{e}\n\n{aftermath}") from e
+            raise PushFailed(f"the push to {c.github} failed after arete pushed {done}", f"{e}\n\n{aftermath}") from e
         c.lease = head or git(["rev-parse", "HEAD"], c.wt).strip()
         c.onto = ""
         pushed.append(c)
@@ -2719,13 +2716,14 @@ def merge_as_run(run_id: str, c: workspace.Checkout, commit: str, named: str) ->
 
 
 def merge_moved_bases(run: AgentRun, checkouts: list[workspace.Checkout], layer: config.RepoLayer, ticket: tracker.Ticket,
-                      log_prefix: str = "", reason: str = "since the base moved after the last push") -> list[workspace.Checkout]:
+                      log_prefix: str = "", reason: str = "since the base moved after the last push", *,
+                      bases: dict[str, str] | None = None, allow_untracked: bool = False) -> list[workspace.Checkout]:
     merged = []
     for c in checkouts:
-        c.base_commit = git(["rev-parse", c.origin_base], c.wt).strip()
+        c.base_commit = (bases or {}).get(c.github) or git(["rev-parse", c.origin_base], c.wt).strip()
         if git(["rev-list", "--count", f"HEAD..{c.base_commit}"], c.wt).strip() == "0":
             continue
-        if edits := workspace.uncommitted(c.wt):
+        if edits := workspace.uncommitted(c.wt, tracked_only=allow_untracked):
             raise workspace.RunFailed(f"{c.github} has uncommitted edits ({', '.join(edits[:5])}), so arete merged nothing into "
                             "them and left them as they are")
         head = git(["rev-parse", "HEAD"], c.wt).strip()
@@ -2903,29 +2901,24 @@ def ci_fix_message(b: Build, caused: list[ci.Red]) -> str:
     return f"{tracker.with_ref(subject, b.ticket.ref)}\n\nArete-Run: {b.run.id}"
 
 
-def replace_pr_section(body: str, heading: str, section: str) -> str:
-    pattern = re.compile(rf"^{re.escape(heading)}\n.*?(?=^## |\Z)", re.MULTILINE | re.DOTALL)
-    body, replaced = pattern.subn(lambda _: f"{section.rstrip()}\n\n", body, count=1)
-    return body if replaced else f"{body.rstrip()}\n\n{section.rstrip()}\n"
-
-
-def publish_ci(run: AgentRun, t: tracker.Ticket, pushed: list[workspace.Checkout], ci_section: str,
-               evidence: tuple[verify.Verified, Review] | None = None) -> None:
+def publish_ci(run: AgentRun, t: tracker.Ticket, pushed: list[workspace.Checkout], ci_section: str) -> None:
     links = (run.tracker.pr_link(t, whole=True), run.tracker.pr_link(t, whole=False))
     for c in pushed:
         try:
             kept, text = gh.split_link(gh.pr_body(c.pr), links)
-            if evidence:
-                text = ci.SECTION.sub("", text)
-                verified, review = evidence
-                text = replace_pr_section(text, CHECKED_IN_USE_HEADING,
-                                          f"{CHECKED_IN_USE_HEADING}\n\nHead `{c.lease[:7]}`\n\n{verified.markdown()}")
-                text = replace_pr_section(text, REVIEW_HEADING, review.markdown())
             gh.pr_edit_body(c.pr, public_text(run, ci.with_section(text, ci_section)), link=kept)
         except gh.GhError as e:
-            if evidence:
-                raise
             run.log(f"ci: could not write the CI section on {c.pr}: {util.first_line(str(e), 300)}")
+
+
+def comment_catch_up_ci(run: AgentRun, c: workspace.Checkout, ci_section: str,
+                        verified: verify.Verified, review: Review) -> None:
+    text = (f"## Catch-up evidence for head `{c.lease}`\n\n"
+            f"{CHECKED_IN_USE_HEADING}\n\n{verified.markdown()}\n\n{review.markdown()}\n\n{ci_section}")
+    try:
+        gh.pr_comment(c.pr, public_text(run, text))
+    except gh.GhError as e:
+        run.log(f"ci: could not comment on {c.pr} for head {c.lease}: {util.first_line(str(e), 300)}")
 
 
 def images_note(images: tracker.SavedImages) -> str:
@@ -3193,7 +3186,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                                 mcp_config=browser.mcp_config(evidence) if url else "",
                                 scratch=attempt)
                 agent_finished = True
-    except owner_asks.Asked:
+    except (owner_asks.Asked, CatchUpNeedsInput):
         agent_finished = True
         raise
     except sandbox.ConfinementUnavailable as e:

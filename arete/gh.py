@@ -81,8 +81,8 @@ def gh(args: list[str], cwd=None, timeout: float = 120, input: str | None = None
     return res.stdout
 
 
-def gh_json(args: list[str], cwd=None, timeout: float = 120):
-    out = gh(args, cwd=cwd, timeout=timeout)
+def gh_json(args: list[str], cwd=None, timeout: float = 120, *, retry: bool = True):
+    out = gh(args, cwd=cwd, timeout=timeout, retry=retry)
     return json.loads(out) if out.strip() else None
 
 
@@ -717,12 +717,20 @@ def check_from_status(row: dict) -> Check:
                  row.get("target_url") or "", 0, (row.get("description") or "").strip())
 
 
-def commit_checks(repo: str, ref: str) -> dict[str, Check]:
-    pages = gh_json(["api", f"repos/{repo}/commits/{ref}/check-runs?per_page=100", "--paginate", "--slurp"]) or []
-    runs = sorted((check_from_run(r) for page in pages for r in page.get("check_runs", [])), key=lambda c: c.check_run_id)
-    statuses = (gh_json(["api", f"repos/{repo}/commits/{ref}/status?per_page=100"]) or {}).get("statuses", [])
+def commit_checks(repo: str, ref: str, *, timeout: float = 120, retry: bool = True) -> dict[str, Check]:
+    path = f"repos/{repo}/commits/{ref}"
+    pages = gh_json(["api", f"{path}/check-runs?filter=latest&per_page=100", "--paginate", "--slurp"],
+                    timeout=timeout, retry=retry)
+    if not isinstance(pages, list) or not pages or any(
+            not isinstance(page, dict) or not isinstance(page.get("check_runs"), list) for page in pages):
+        raise GhError("GitHub did not return check runs")
+    runs = sorted((check_from_run(r) for page in pages for r in page["check_runs"]), key=lambda c: c.check_run_id)
+    statuses = gh_json(["api", f"{path}/status?per_page=100", "--paginate", "--slurp"], timeout=timeout, retry=retry)
+    if not isinstance(statuses, list) or not statuses or any(
+            not isinstance(page, dict) or not isinstance(page.get("statuses"), list) for page in statuses):
+        raise GhError("GitHub did not return commit statuses")
     newest: dict[str, Check] = {c.name: c for c in runs}
-    for c in map(check_from_status, statuses):
+    for c in (check_from_status(row) for page in statuses for row in page["statuses"]):
         if c.name not in newest or c.updated > newest[c.name].updated:
             newest[c.name] = c
     return newest

@@ -678,8 +678,9 @@ class RunFailed(Exception):
         self.recovery = recovery
 
 
-def uncommitted(wt: Path) -> list[str]:
-    return [r[3:] for r in util.git_records(["status", "--porcelain", "--no-renames", "--untracked-files=all"], wt)]
+def uncommitted(wt: Path, *, tracked_only: bool = False) -> list[str]:
+    untracked = "no" if tracked_only else "all"
+    return [r[3:] for r in util.git_records(["status", "--porcelain", "--no-renames", f"--untracked-files={untracked}"], wt)]
 
 
 def untracked_files(wt: Path) -> set[str]:
