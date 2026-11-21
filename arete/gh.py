@@ -825,9 +825,16 @@ class Check:
     description: str = ""
     check_run_id: int = 0
     source: str = "status"
+    workflow_run_id: int = 0
 
     @property
     def key(self) -> CheckKey:
+        if self.workflow_run_id:
+            return f"workflow-job:{self.workflow_run_id}", self.name
+        return self.context_key
+
+    @property
+    def context_key(self) -> CheckKey:
         return self.source, self.name
 
 
@@ -962,31 +969,35 @@ def workflow_attempt_jobs(repo: str, head: str, run: int, attempt: int, *,
             and isinstance(row.get("name"), str) and row["name"]]
 
 
+def latest_pr_workflows(repo: str, pr: str, head: str, **options) -> dict[int, dict]:
+    query = urlencode({"event": "pull_request", "head_sha": head, "per_page": 100})
+    number = pr_number(pr)
+    candidates = [row for row in actions_rows(f"repos/{repo}/actions/runs?{query}", "workflow_runs", **options)
+                  if (row.get("head_sha"), row.get("event")) == (head, "pull_request")
+                  and [pull.get("number") for pull in row.get("pull_requests") or []] == [number]]
+    return {row["workflow_id"]: row for row in sorted(candidates, key=lambda row: row["run_number"])}
+
+
+def actions_job(repo: str, head: str, job: int, **options) -> dict:
+    row = gh_json(["api", f"repos/{repo}/actions/jobs/{job}"], **options) or {}
+    name = row.get("name")
+    if row.get("id") != job or row.get("head_sha") != head or not isinstance(name, str) or not name:
+        raise GhError(f"GitHub did not identify the Actions job {job} on {head}")
+    return row
+
+
 def failed_job_reruns(repo: str, pr: str, head: str, jobs: list[int]) -> list[WorkflowRerun]:
     if not jobs or pr_repo(pr).casefold() != repo.casefold():
         return []
-    names = set()
-    for job in jobs:
-        row = gh_json(["api", f"repos/{repo}/actions/jobs/{job}"]) or {}
-        name = row.get("name")
-        if (row.get("id") != job or row.get("head_sha") != head
-                or not isinstance(name, str) or not name):
-            raise GhError(f"GitHub did not identify the Actions job {job} on {head}")
-        names.add(name)
+    names = {actions_job(repo, head, job)["name"] for job in jobs}
 
-    query = urlencode({"event": "pull_request", "head_sha": head, "per_page": 100})
-    number = pr_number(pr)
-    candidates = [row for row in actions_rows(f"repos/{repo}/actions/runs?{query}", "workflow_runs")
-                  if (row.get("head_sha"), row.get("event")) == (head, "pull_request")
-                  and [pull.get("number") for pull in row.get("pull_requests") or []] == [number]]
-    latest = {row["workflow_id"]: row for row in sorted(candidates, key=lambda row: row["run_number"])}
     reruns = []
-    for current in latest.values():
+    for current in latest_pr_workflows(repo, pr, head).values():
         if not current.get("conclusion") or check_state(current) != "fail":
             continue
         run, attempt = current.get("id"), current.get("run_attempt")
         if type(run) is not int or run <= 0 or type(attempt) is not int or attempt <= 0:
-            raise GhError(f"GitHub did not identify the workflow attempt for PR {number} on {head}")
+            raise GhError(f"GitHub did not identify the workflow attempt for PR {pr_number(pr)} on {head}")
         failed = {}
         for row in workflow_attempt_jobs(repo, head, run, attempt):
             if row.get("conclusion") and check_state(row) == "fail":
@@ -998,31 +1009,41 @@ def failed_job_reruns(repo: str, pr: str, head: str, jobs: list[int]) -> list[Wo
     return reruns
 
 
-def rerun_checks(repo: str, head: str, rerun: WorkflowRerun, *, timeout: float, retry: bool) -> dict[CheckKey, Check]:
-    options = {"timeout": timeout, "retry": retry}
-    run = workflow_run(repo, head, rerun.run, **options)
+def workflow_check(run: dict) -> Check:
+    attempt, conclusion = run["run_attempt"], run.get("conclusion")
+    state, description = "pending", f"Workflow attempt {attempt} has no terminal result yet"
+    if run.get("status") == "completed" and conclusion:
+        state = "pass" if conclusion == "success" else "fail"
+        description = f"Workflow attempt {attempt} concluded {conclusion}"
+    return Check(run.get("name") or "GitHub Actions", state, run.get("updated_at") or "", run.get("html_url") or "",
+                 description=description, source=f"workflow:{run['id']}")
+
+
+def rerun_checks(repo: str, head: str, rerun: WorkflowRerun, run: dict, **options) -> dict[CheckKey, Check]:
     if run["run_attempt"] > rerun.attempt:
         run = workflow_run(repo, head, rerun.run, attempt=rerun.attempt, **options)
-    conclusion = run.get("conclusion")
-    if (run["run_attempt"], run.get("status")) != (rerun.attempt, "completed") or not conclusion:
+    if run["run_attempt"] != rerun.attempt or (workflow := workflow_check(run)).state == "pending":
         return {}
+    try:
+        rows = workflow_attempt_jobs(repo, head, rerun.run, rerun.attempt, **options)
+    except GhError:
+        if workflow.state == "fail":
+            return {workflow.key: workflow}
+        raise
     found: dict[CheckKey, Check] = {}
-    for row in workflow_attempt_jobs(repo, head, rerun.run, rerun.attempt, **options):
+    for row in rows:
         name, job = row["name"], row["id"]
         if job == rerun.jobs.get(name):
             continue
         check = Check(name, check_state(row), row.get("completed_at") or "", row.get("html_url") or "",
                       job=job, check_run_id=job, source=f"app:{GITHUB_ACTIONS_APP_ID}")
         if check.key in found or check.state == "pending" or not row.get("conclusion"):
-            return {}
+            return {workflow.key: workflow} if workflow.state == "fail" else {}
         found[check.key] = check
-    if not rerun.check_keys <= found.keys():
-        return {}
-    if conclusion != "success" and not any(check.state == "fail" for check in found.values()):
-        check = Check(run.get("name") or "GitHub Actions", "fail", run.get("updated_at") or "",
-                      run.get("html_url") or "", description=f"Workflow attempt {rerun.attempt} concluded {conclusion}",
-                      source=f"workflow:{rerun.run}")
-        found[check.key] = check
+    if workflow.state == "pass":
+        return found if rerun.check_keys <= found.keys() else {}
+    if not any(check.state == "fail" for check in found.values()):
+        found[workflow.key] = workflow
     return found
 
 

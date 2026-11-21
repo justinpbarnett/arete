@@ -672,47 +672,64 @@ class Controller:
         checkouts = {c.github: c for c in job.with_prs}
         heads = self.data["publication"]["heads"]
         retried = self.data.setdefault("ci_retried_heads", {})
-        pushed, reruns = [], {}
+        pushed = []
         targets = retry["targets"]
         for repo, target in targets.items():
             checkout = checkouts.get(repo)
             head = target["head"]
             if not checkout or checkout.pr != target["pr"] or checkout.lease != head or heads.get(repo) != head:
                 raise ValueError("the failed CI no longer matches this run's published head")
-            if target["red"] and head in retried.get(repo, []):
-                reason = f"CI failed twice on the unchanged head {head}"
-                self.ending = flows.finish(self.flow, "failed", why=reason, prs=True)
-                return {"error": reason}
             pushed.append(checkout)
+        if failure := self.second_ci_failure(targets, retried):
+            return failure
         for checkout in pushed:
             row = gh.pr_merge_details(checkout.pr)
             if (row.get("state") != "OPEN" or row.get("headRefOid") != checkout.lease
                     or row.get("baseRefName") != checkout.base):
                 raise ValueError("the PR no longer matches this run's published head and base")
-            reruns[checkout.github] = gh.failed_job_reruns(checkout.github, checkout.pr, checkout.lease,
-                                                         targets[checkout.github]["jobs"])
-        if not any(reruns.values()):
-            raise ValueError("the failed CI has no GitHub Actions jobs to rerun")
+        saved = retry.get("reruns")
+        launches = {}
+        if saved is not None:
+            reruns = {repo: [gh.WorkflowRerun(**row) for row in requested] for repo, requested in saved.items()}
+        else:
+            reruns = {c.github: gh.failed_job_reruns(c.github, c.pr, c.lease, targets[c.github]["jobs"])
+                      for c in pushed if c.lease not in retried.get(c.github, [])}
+            if not any(reruns.values()):
+                raise ValueError("the failed CI has no GitHub Actions jobs to rerun")
+            for checkout in pushed:
+                if reruns.get(checkout.github):
+                    retried.setdefault(checkout.github, []).append(checkout.lease)
+            launches = reruns
         self.data["publication_intent"] = {"tree": tree, "phase": "ci-rerun"}
-        for checkout in pushed:
-            if reruns[checkout.github]:
-                retried.setdefault(checkout.github, []).append(checkout.lease)
         self.persist()
-        for repo, requested in reruns.items():
+        for repo, requested in launches.items():
             for rerun in requested:
                 gh.rerun_failed_jobs(repo, rerun.run)
         failure = self.publication_ci(pushed, caught_up=retry["caught_up"], reruns=reruns)
         if failure:
             self.data.pop("publication_intent", None)
+            if saved is not None:
+                targets = self.data["ci_retry"]["targets"]
+                if second_failure := self.second_ci_failure(targets, retried):
+                    return second_failure
             return self.settle_publication_failure(failure)
         flows.require_environment_owner_clear(job)
         fresh = [c for c in job.picked(job.opened) if c.github not in job.found]
         pipeline.ready_pushed(self.run, fresh, job.picked(job.ci_stopped), job.draft_why)
         return self.finish_publication()
 
+    def second_ci_failure(self, targets, retried):
+        for repo, target in targets.items():
+            head = target["head"]
+            if target["red"] and head in retried.get(repo, []):
+                reason = f"CI failed twice on the unchanged head {head}"
+                self.ending = flows.finish(self.flow, "failed", why=reason, prs=True)
+                return {"error": reason}
+        return None
+
     def publication_ci(self, pushed, *, caught_up=False, reruns=None):
         def watch(checkout):
-            options = {} if reruns is None else {"reruns": reruns[checkout.github]}
+            options = {} if reruns is None else {"reruns": reruns.get(checkout.github, ())}
             watched = pipeline.ci.watch(pipeline.ci_target(checkout), self.run.log, **options)
             return pipeline.ci.compare_with_base(watched, self.run.log)
 
@@ -743,9 +760,13 @@ class Controller:
             reds = [r for r in w.reds if w.read or r.check.key in w.rerun_reds]
             targets[w.target.github] = {"head": w.target.sha, "pr": w.target.pr, "red": bool(reds),
                                         "jobs": [r.check.job for r in reds if r.check.job]}
-        if any(t["red"] for t in targets.values()):
+        interrupted_watch = reruns is not None and not current.all_read
+        if interrupted_watch or any(t["red"] for t in targets.values()):
             self.data["published_tree"] = tree
             self.data["ci_retry"] = {"caught_up": caught_up, "targets": targets}
+            if interrupted_watch:
+                self.data["ci_retry"]["reruns"] = {repo: [asdict(rerun) for rerun in requested]
+                                                   for repo, requested in reruns.items()}
         self.data["ci_failures"] = self.ci_failures(current)
         self.catalog.add_context(CI_FAILURES, self.data["ci_failures"])
         for checkout in self.job.with_prs:

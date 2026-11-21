@@ -4,7 +4,7 @@ import re
 import time
 from collections import Counter
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import _test_stacks, gh, util
@@ -173,20 +173,72 @@ def conflicting(target: Target, log: Callable[[str], None]) -> bool:
 
 
 def watch(target: Target, log: Callable[[str], None], *, reruns: Sequence[gh.WorkflowRerun] = ()) -> Watched:
-    completed: set[int] = set()
+    completed: dict[int, set[gh.CheckKey]] = {}
     exact: dict[gh.CheckKey, gh.Check] = {}
 
-    def snapshot(*, timeout: float = 120, retry: bool = True):
-        checks = gh.commit_checks(target.github, target.sha, timeout=timeout, retry=retry)
-        for rerun in reruns:
-            for key in rerun.check_keys:
-                checks.pop(key, None)
-            if rerun.run in completed:
+    def superseded_jobs(checks, newer_attempts, pr_runs, options):
+        replaced = {r.run: r.check_keys | completed.get(r.run, set()) for r in reruns}
+        keys = set().union(*replaced.values())
+        job_ids = {job for r in reruns for job in r.jobs.values()} | {c.job for c in exact.values() if c.job}
+        attempts = {r.run: r.attempt for r in reruns}
+        for key in keys & checks.keys():
+            check = checks[key]
+            if check.job in job_ids:
+                yield key
                 continue
-            if attempt := gh.rerun_checks(target.github, target.sha, rerun, timeout=timeout, retry=retry):
-                completed.add(rerun.run)
-                exact.update({key: check for key, check in attempt.items() if key not in exact or check.state == "fail"})
-        return checks | exact, len(completed) < len(reruns)
+            if not check.job:
+                continue
+            try:
+                job = gh.actions_job(target.github, target.sha, check.job, **options)
+                owner = job.get("run_id")
+                if job["name"] != check.name or type(owner) is not int or owner <= 0:
+                    continue
+                if owner in replaced:
+                    attempt = job.get("run_attempt")
+                    if key in replaced[owner] and type(attempt) is int and (
+                            attempt < attempts[owner] or attempt <= newer_attempts.get(owner, 0)):
+                        yield key
+                elif owner not in pr_runs:
+                    run = gh.workflow_run(target.github, target.sha, owner, **options)
+                    pulls = run.get("pull_requests") or []
+                    if run.get("event") == "pull_request" and pulls and all(
+                            type(pull.get("number")) is int and pull["number"] != gh.pr_number(target.pr) for pull in pulls):
+                        yield key
+            except READ_ERRORS:
+                continue
+
+    def snapshot(*, timeout: float = 120, retry: bool = True):
+        options = {"timeout": timeout, "retry": retry}
+        checks = gh.commit_checks(target.github, target.sha, **options)
+        runs = []
+        for rerun in reruns:
+            run = gh.workflow_run(target.github, target.sha, rerun.run, **options)
+            runs.append((rerun, run))
+            if rerun.run not in completed:
+                attempt = gh.rerun_checks(target.github, target.sha, rerun, run, **options)
+                if attempt:
+                    completed[rerun.run] = set(attempt)
+                    for check in attempt.values():
+                        if check.job:
+                            check = replace(check, workflow_run_id=rerun.run)
+                        exact[check.key] = check
+        awaiting_rerun = len(completed) < len(reruns)
+        newer_attempts, pr_runs = {}, set()
+        if reruns and not awaiting_rerun and not any(check.state == "fail" for check in exact.values()):
+            latest = gh.latest_pr_workflows(target.github, target.pr, target.sha, **options)
+            pr_runs = {run["id"] for run in latest.values()}
+            for rerun, run in runs:
+                listed = latest.get(run["workflow_id"], run)
+                newest = max((run, listed), key=lambda row: (row["run_number"], row["run_attempt"]))
+                if (newest["run_number"], newest["run_attempt"]) > (run["run_number"], rerun.attempt):
+                    check = gh.workflow_check(newest)
+                    if check.state != "pass":
+                        checks[check.key] = check
+                        newer_attempts[newest["id"]] = newest["run_attempt"]
+        if reruns:
+            for key in superseded_jobs(checks, newer_attempts, pr_runs, options):
+                del checks[key]
+        return checks | exact, awaiting_rerun
 
     def watched(checks: dict[gh.CheckKey, gh.Check], *, read=True, conflict=False) -> Watched:
         return Watched(target, checks | exact, read=read, conflicting=conflict,
@@ -244,7 +296,7 @@ def compare_with_base(w: Watched, log: Callable[[str], None]) -> Watched:
     except READ_ERRORS as e:
         log(f"ci: could not read the checks on {t.base} of {t.github}: {util.first_line(str(e), 200)}")
         base_sha, on_base = "", {}
-    w.reds = [Red(t, c, on_base.get(c.key), base_sha) for c in failed]
+    w.reds = [Red(t, c, on_base.get(c.context_key), base_sha) for c in failed]
     for r in w.reds:
         log(f"ci: {r.label} failed; it {r.base_result.replace('`', '')}")
     return w
