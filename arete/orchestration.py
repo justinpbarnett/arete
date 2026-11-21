@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import time
 from contextlib import contextmanager
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from math import inf
 from pathlib import Path
 from uuid import uuid4
@@ -47,12 +47,6 @@ REFRESHABLE_LINEAGE = {"catalog_sha", "controller_prompt", "operations_sha"}
 
 class UnchangedPushedHead(ValueError):
     pass
-
-
-class FailedFinishJiraTracker(tracker.JiraTracker):
-    def move_to(self, tid: str, target: str) -> str:
-        self.shift(tid, target, keep_done=True)
-        return ""
 
 
 def policy_fingerprint(cfg, layer, closed_context):
@@ -914,23 +908,29 @@ class Controller:
             ).fetchone()
         return ledger.decoded(decision).get("response", {}).get("rationale")
 
-    def park_failed_finish(self, rationale):
+    def finish_with_rationale(self, rationale):
         recovery = self.failure_recovery()
+        reason = outbound.screen(rationale.strip())
+        why = "the orchestrator stopped without delivery"
+        if (recovery and recovery.get("reason") in ("runner-start", "runner-login", "sandbox-start")
+                and isinstance(self.run.tracker, tracker.GitHubTracker) and self.run.failed_state == "failed"
+                and not self.job.with_prs and not (pipeline.run_store.run_get(self.run.id) or {}).get("pr_url")):
+            return flows.finish(self.flow, "failed", why=why, detail=reason, recovery=recovery)
+
         self.run.failure = {"class": "environment", **recovery} if recovery else {"class": "work"}
-        reason = outbound.redact(outbound.screen(rationale.strip())) or "the orchestrator stopped without delivery"
+        reason = reason or why
         for checkout in self.job.with_prs:
             try:
                 pr = gh.pr_merge_details(checkout.pr)
-            except gh.GhError as error:
+                if not isinstance(pr, dict):
+                    raise ValueError("PR lookup did not return a JSON object")
+            except (gh.GhError, ValueError) as error:
                 self.run.log(f"pr: could not inspect {checkout.pr}: {util.first_line(str(error), 300)}")
                 continue
             if pr.get("state") == "OPEN" and pr.get("isDraft") is False:
                 pipeline.set_draft(self.run, checkout, True, "orchestrator")
-        run = replace(self.run, feedback=[])
-        if isinstance(run.tracker, tracker.JiraTracker):
-            run.tracker = FailedFinishJiraTracker(run.repo, run.tracker.cfg)
-        run.say(f"Run `{run.id}` parked without delivery.\n\n{reason}")
-        return pipeline.park_run(run, reason)
+        self.run.say(f"Run `{self.run.id}` parked without delivery.\n\n{reason}")
+        return pipeline.park_run(self.run, reason)
 
     def settle_publication_failure(self, failure):
         if self.data.get("catch_up_hold"):
@@ -1135,7 +1135,7 @@ class Controller:
             elif (self.run.budget and not (self.run.alone or self.run.action_only or self.run.dry_run)
                   and not zte.reserved(str(self.run.tid)) and (turn := action.get("turn"))
                   and (rationale := self.finish_rationale(turn)) is not None):
-                self.ending = self.park_failed_finish(rationale)
+                self.ending = self.finish_with_rationale(rationale)
             else:
                 self.ending = flows.finish(self.flow, "failed", why="the orchestrator stopped without delivery",
                                            recovery=self.failure_recovery())

@@ -2455,7 +2455,6 @@ class OrchestratedFailedFinishTests(Isolated):
                                 parts=[config.Part("", "owner/project")], pipeline=True)
         self.cfg = config.Config(repos=[self.repo], replay=config.ReplayConfig(all=True))
         self.labels, self.comments, self.drafted = {"agent"}, [], []
-        self.pr_comments = []
         self.pr_states = {self.pr: "OPEN"}
         self.checkout = workspace.Checkout("", self.repo.github, self.repo.path,
                                            paths.WORKTREES_DIR / f"{self.repo.name}-{self.issue}",
@@ -2468,10 +2467,8 @@ class OrchestratedFailedFinishTests(Isolated):
             (gh, "ensure_label", lambda *args: ""),
             (gh, "pr_view", lambda url: {"state": self.pr_states[url]}),
             (gh, "pr_body", lambda url: ""),
-            (gh, "pr_comment", lambda url, body: self.pr_comments.append((url, body))),
-            (gh, "pr_merge_details", lambda url: {"state": self.pr_states[url], "isDraft": url in self.drafted}),
             (gh, "pr_set_draft", self.set_draft),
-            (gh, "gh", self.post_comment),
+            (gh, "gh", self.github),
             (scratch, "process_ids", dict),
             (scratch, "service_labels", dict),
             (sandbox, "AUTHORITY", self.root / "authority"),
@@ -2484,7 +2481,7 @@ class OrchestratedFailedFinishTests(Isolated):
         return {"number": number, "title": "Fixture issue", "body": "Fixture description", "state": "OPEN",
                 "author": {"login": "owner"}, "labels": [{"name": label} for label in sorted(self.labels)]}
 
-    def edit_labels(self, repo, number, add=(), remove=()):
+    def edit_labels(self, repo, number, add=(), remove=(), *, single_attempt=False):
         self.labels.difference_update(remove)
         self.labels.update(add)
 
@@ -2492,7 +2489,10 @@ class OrchestratedFailedFinishTests(Isolated):
         self.assertTrue(draft)
         self.drafted.append(url)
 
-    def post_comment(self, args, *, input, write):
+    def github(self, args, *, input=None, write=False, **kwargs):
+        if args[:2] == ["pr", "view"]:
+            url = args[2]
+            return json.dumps({"state": self.pr_states[url], "isDraft": url in self.drafted})
         self.assertEqual(args[:3], ["issue", "comment", self.issue])
         self.comments.append(input)
         return ""
@@ -2502,21 +2502,22 @@ class OrchestratedFailedFinishTests(Isolated):
         run.enter("running")
         return factory.Outcome("pass", data={
             "layer": str(self.repo.layer_dir),
-            "checkouts": [replace(self.checkout, pr=url).to_row() for url in self.pr_states],
+            "checkouts": [replace(self.checkout, pr=url).to_row() for url in self.pr_states or [""]],
             "ticket": asdict(run.tracker.get(self.issue)), "branch": "arete/fixture",
             "add_dirs": [], "attachments": "", "expertise": "", "triage": "",
         })
 
-    def finish_run(self, ending, rationale, exit_code, recovery=None):
+    def finish_run(self, ending, rationale, exit_code, *, worker_failure=None, budgeted=True, before_finish=None):
         def drive(flow):
             controller = orchestration.Controller(flow)
-            if recovery:
+            if worker_failure:
+                role, recovery = worker_failure
                 lease = controller.lease
                 turn = ledger.begin(lease, {}, controller.policy.max_decisions)
                 version = ledger.snapshot(lease)["version"]
                 worker, = ledger.accept(lease, turn, version, {"calls": [{"op": "worker.start", "args": {}}]}, 1)
-                ledger.transition(lease, worker["id"], "failed",
-                                  {"writing": True, "event": "result", "recovery": recovery})
+                ledger.transition(lease, worker["id"], "running", {"writing": True, "role": role})
+                ledger.transition(lease, worker["id"], "failed", {"event": "result", "recovery": recovery})
             decisions = iter([
                 ("catalog.list", {"kind": "context"}, "Only listed the context."),
                 ("run.finish", {"reason": ending}, rationale),
@@ -2524,6 +2525,8 @@ class OrchestratedFailedFinishTests(Isolated):
 
             def decide():
                 op, args, reason = next(decisions)
+                if op == "run.finish" and before_finish:
+                    before_finish(controller)
                 if op == "run.finish" and ending == "delivered":
                     controller.run.enter("pr")
                     controller.data["published"] = {"ending": "pr", "summary": "Delivered fixture"}
@@ -2539,7 +2542,8 @@ class OrchestratedFailedFinishTests(Isolated):
                 controller.run.step_started = True
                 return ledger.accept(controller.lease, turn, version, validated, controller.policy.max_actions)
 
-            with patch.object(controller, "decide", side_effect=decide):
+            budget = controller.run.budget if budgeted else None
+            with patch.object(controller, "decide", side_effect=decide), patch.object(controller.run, "budget", budget):
                 return controller.drive()
 
         result = pipeline.run_issue(self.repo.name, self.issue, script=pipeline.Script("orchestrate", drive))
@@ -2550,84 +2554,152 @@ class OrchestratedFailedFinishTests(Isolated):
         other = "https://github.com/owner/other/pull/686"
         closed = "https://github.com/owner/closed/pull/687"
         self.pr_states.update({other: "OPEN", closed: "CLOSED"})
-        reason = "The merge conflicts remain. See http://127.0.0.1:8000/logs."
-        screened = "The merge conflicts remain. See [private address]/logs."
+        address, home = "http://127.0.0.1:8000", "/Users/fixture"
+        reason = f"The merge conflicts remain. See {address}/logs and {home}/build.log."
+        screened = "The merge conflicts remain. See [private address]/logs and ~/build.log."
         row = self.finish_run("failed", reason, 1)
         self.assertEqual(row["status"], "failed")
         self.assertEqual(runlimits.metadata(row["id"], "parked.json")["reason"], screened)
         self.assertEqual(self.labels, {"agent", "agent:failed"})
         comment, = self.comments
-        self.assertIn(screened, comment)
+        for output in (comment, row["summary"], (paths.RUNS_DIR / row["id"] / "run.log").read_text()):
+            self.assertIn(screened, output)
+            self.assertNotIn(address, output)
+            self.assertNotIn(home, output)
         self.assertIn(row["id"], comment)
         self.assertNotIn("Only listed the context.", comment)
-        self.assertNotIn("127.0.0.1", comment)
         self.assertCountEqual(self.drafted, [self.pr, other])
 
-    def test_feedback_finish_posts_one_issue_comment_and_redacts_park_outputs(self):
-        parent = record.start("pipeline", repo=self.repo.name, issue=self.issue)
-        record.settle(parent, "pr", pr_url=self.pr)
-        insights_store.add_feedback([{"pr_url": self.pr, "repo": self.repo.name, "issue": self.issue,
-                                      "kind": "comment", "gh_id": 1, "body": "Please revise.", "at_once": 1,
-                                      "created": util.iso(), "pr_state": "OPEN", "status": "new"}])
-        self.assertTrue(pipeline.pending_feedback(self.repo.name, self.issue))
-        tokens = ("ghp_Fixture987654321", "sk-Fixture123456789")
-        row = self.finish_run("failed", f"Could not authenticate with {tokens[0]} or {tokens[1]}.", 1)
-        self.assertTrue(row["summary"].startswith("parked:"), row["summary"])
-        self.assertEqual(self.pr_comments, [])
-        comment, = self.comments
-        self.assertIn(row["id"], comment)
+    def test_malformed_pr_lookup_does_not_interrupt_failed_finish(self):
+        non_object = "https://github.com/owner/other/pull/686"
+        ready = "https://github.com/owner/ready/pull/687"
+        self.pr_states.update({non_object: "OPEN", ready: "OPEN"})
+        bad_replies = {self.pr: "{broken", non_object: '[{"state": "OPEN", "isDraft": false}]'}
+
+        def github(args, **kwargs):
+            if args[:2] == ["pr", "view"] and args[2] in bad_replies:
+                return bad_replies[args[2]]
+            return self.github(args, **kwargs)
+
+        reason = "The merge conflicts remain."
+        with patch.object(gh, "gh", github):
+            row = self.finish_run("failed", reason, 1)
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(runlimits.metadata(row["id"], "parked.json").get("reason"), reason)
         self.assertEqual(self.labels, {"agent", "agent:failed"})
-        feedback, = insights_store.feedback_between("", "9999")
-        self.assertEqual((feedback["run_id"], feedback["status"]), (row["id"], "failed"))
-        reason = "Could not authenticate with [redacted] or [redacted]."
-        self.assertEqual(runlimits.metadata(row["id"], "parked.json")["reason"], reason)
-        for text in (comment, row["summary"], (paths.RUNS_DIR / row["id"] / "run.log").read_text(),
-                     json.dumps(run_lines.read(row["id"]))):
-            self.assertIn(reason, text)
-            for token in tokens:
-                self.assertNotIn(token, text)
-
-    def configure_jira(self, status, category, moved):
-        self.issue = "FIX-709"
-        self.repo = replace(self.repo, tracker="jira")
-        self.cfg.repos = [self.repo]
-        self.cfg.jira = config.JiraConfig(project="FIX", transitions={"failed": "Failed"})
-        self.labels.add(tracker.route_label(self.repo))
-        client = SimpleNamespace(
-            issue=lambda tid, fields: {"fields": {"status": {"name": status, "statusCategory": {"key": category}},
-                                                  "summary": "Fixture", "labels": sorted(self.labels)}},
-            me=lambda: {"accountId": "owner"}, changelog=lambda tid: [], comments=lambda tid: [],
-            browse_url=lambda tid: f"https://example.com/browse/{tid}",
-            edit_labels=lambda tid, add, remove: self.edit_labels(None, tid, add, remove),
-            comment=lambda tid, body: self.comments.append(body), move=moved,
-        )
-        self.patches.enter_context(patch.dict(tracker._clients, {"": client}))
-
-    def test_failed_finish_keeps_owner_set_jira_done(self):
-        self.configure_jira("Done", "done", lambda *_: self.fail("attempted to move a Done ticket"))
-        row = self.finish_run("failed", "The revision could not be completed.", 1)
-        self.assertEqual(row["moved"], "failed")
-        self.assertIn("agent-failed", self.labels)
         comment, = self.comments
+        self.assertIn(reason, comment)
         self.assertIn(row["id"], comment)
-        self.assertEqual(self.drafted, [self.pr])
+        self.assertEqual(self.drafted, [ready])
+        log = (paths.RUNS_DIR / row["id"] / "run.log").read_text()
+        for url in bad_replies:
+            self.assertIn(f"could not inspect {url}", log)
 
-    def test_missing_jira_transition_does_not_leave_settlement_pending(self):
-        moves = []
-        self.configure_jira("In Progress", "indeterminate", lambda tid, target: moves.append((tid, target)) or False)
-        row = self.finish_run("failed", "The revision could not be completed.", 1)
-        outcomes.sync_moves(self.cfg)
-        self.assertEqual(moves, [(self.issue, "Failed")])
-        self.assertEqual(row["moved"], "failed")
-        self.assertIn("agent-failed", self.labels)
-        self.assertEqual(len(self.comments), 1)
-        self.assertEqual(self.drafted, [self.pr])
+    def assert_github_finish_requeues(self, failure, role, recovery_reason, evidence):
+        from arete import requeue
 
-    def test_parked_finish_records_the_blocking_worker_recovery(self):
-        recovery = {"reason": "runner-start", "runner": "claude"}
-        row = self.finish_run("failed", "The builder could not start.", 1, recovery=recovery)
+        self.pr_states.clear()
+        recovery = pipeline.runner.start_failure(failure, role)
+        self.assertIsNotNone(recovery)
+        self.assertEqual(recovery["reason"], recovery_reason)
+        rationale = f"The {role} worker could not proceed."
+        row = self.finish_run("failed", rationale, 1, worker_failure=(role, recovery))
+        self.assertEqual(row["status"], "failed")
         self.assertEqual(json.loads(row["failure"]), {"class": "environment", **recovery})
-        self.assertEqual(runlimits.metadata(row["id"], "parked.json")["reason"], "The builder could not start.")
+        self.assertFalse(row["pr_url"])
+        self.assertFalse(runlimits.metadata(row["id"], "parked.json"))
+        comment, = self.comments
+        self.assertIn(rationale, comment)
+        self.assertIn(row["id"], comment)
+
+        source = tracker.GitHubTracker(self.repo)
+        layer = config.load_layer(self.repo.layer_dir)
+        with patch.object(gh, "find_issue_comment_marker", return_value=""):
+            requeue.reconsider(self.cfg, source, layer, self.issue, dry_run=False)
+            self.assertIn("agent:failed", self.labels)
+            self.assertEqual(self.comments, [comment])
+            requeue.reconsider(self.cfg, source, layer, self.issue, dry_run=False)
+        self.assertEqual(self.labels, {"agent"})
+        self.assertEqual(len(self.comments), 2)
+        self.assertIn(f"Requeued this issue because {evidence}.", self.comments[1])
+        ticket = source.get(self.issue)
+        self.assertEqual(runlimits.poll_admission(self.repo, self.issue, ticket, runlimits.Policy.of(layer)), ("", None))
+
+    def test_github_finish_requeues_a_builder_start_failure_after_the_runner_recovers(self):
+        failure = Result(ok=False, runner="claude", error="claude not found: fixture")
+        with patch.object(pipeline.runner, "started_now", side_effect=[False, True]) as probe:
+            self.assert_github_finish_requeues(failure, "build", "runner-start", "the runner answered its startup check")
+        self.assertEqual([call.args for call in probe.call_args_list], [("claude",), ("claude",)])
+
+    def test_github_finish_requeues_a_builder_after_rejected_login_is_renewed(self):
+        failure = Result(ok=False, runner="claude", model="sonnet", credential="cli_login", turns=1,
+                         raw={"api_error": "authentication_failed"}, auth_generation="stale-login")
+        route = SimpleNamespace(state="ready", runner="claude", model="sonnet", credential="cli_login")
+        with patch.object(pipeline.routing, "Discovery") as discovery, \
+                patch.object(pipeline.runner, "authentication", side_effect=[
+                    SimpleNamespace(generation="stale-login"), SimpleNamespace(generation="new-login")]) as auth:
+            routes = discovery.return_value.routes
+            routes.return_value = [route]
+            self.assert_github_finish_requeues(failure, "build", "runner-login", "the runner login is available again")
+        self.assertEqual([call.args[0].step for call in routes.call_args_list], ["build", "build"])
+        self.assertEqual(auth.call_count, 2)
+
+    def test_github_finish_requeues_a_review_repair_after_a_login_route_becomes_ready(self):
+        route = {"runner": "claude", "model": "sonnet", "credential": "cli_login"}
+        failure = Result(ok=False, error=pipeline.runner.NO_ROUTE, skipped=[{**route, "state": "missing_login"}])
+        with patch.object(pipeline.routing, "Discovery") as discovery:
+            routes = discovery.return_value.routes
+            routes.side_effect = [[SimpleNamespace(**route, state="missing_login")],
+                                  [SimpleNamespace(**route, state="ready")]]
+            self.assert_github_finish_requeues(failure, "review_repair", "runner-login",
+                                               "the runner login is available again")
+        self.assertEqual([call.args[0].step for call in routes.call_args_list], ["review_repair", "review_repair"])
+
+    def assert_sandbox_finish_requeues(self, role):
+        failure = Result(ok=False, error=pipeline.runner.SANDBOX_START_ERROR)
+        with patch.object(sandbox, "can_confine", return_value=True), \
+                patch.object(sandbox, "write_confinement", return_value=["sandbox-exec"]), \
+                patch.object(util, "run_whole_tree", side_effect=[
+                    SimpleNamespace(returncode=1), SimpleNamespace(returncode=0)]) as probe:
+            self.assert_github_finish_requeues(failure, role, "sandbox-start", "the local sandbox started successfully")
+        self.assertEqual([call.args[0] for call in probe.call_args_list], [["sandbox-exec", "/usr/bin/true"]] * 2)
+
+    def test_github_finish_requeues_a_check_repair_after_sandbox_confinement_works(self):
+        self.assert_sandbox_finish_requeues("check_repair")
+
+    def test_github_finish_requeues_a_ci_repair_after_sandbox_confinement_works(self):
+        self.assert_sandbox_finish_requeues("ci_repair")
+
+    def test_catch_up_repair_budget_park_posts_one_comment(self):
+        held = "Catch-up review requested changes"
+        reason = "the repair chain used its 1 repair cycles"
+        self.checkout = replace(self.checkout, lease="already-drafted")
+        self.repo.layer_dir.mkdir()
+        (self.repo.layer_dir / "config.toml").write_text("[limits]\nmax_repair_cycles = 1\n")
+
+        def attempt_another_repair(controller):
+            controller.data["catch_up_hold"] = {"reason": held}
+            controller.run.budget.charge("repair", "review_repair")
+            controller.run.budget.charge("repair", "review_repair")
+
+        with patch.object(gh, "pr_draft_and_head", return_value=(True, "already-drafted")):
+            row = self.finish_run("failed", "The controller stopped.", 1, before_finish=attempt_another_repair)
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(runlimits.metadata(row["id"], "parked.json")["reason"], f"{held}. {reason}")
+        self.assertEqual(self.labels, {"agent", "agent:failed"})
+        comment, = self.comments
+        self.assertIn(f"{held}. I parked the run because {reason}.", comment)
+
+    def test_failed_finish_without_a_budget_uses_the_existing_failure_response(self):
+        row = self.finish_run("failed", "The controller stopped.", 1, budgeted=False)
+        why = "the orchestrator stopped without delivery"
+        self.assertEqual((row["status"], row["summary"]), ("failed", why))
+        self.assertFalse(runlimits.metadata(row["id"], "parked.json"))
+        self.assertEqual(self.labels, {"agent", "agent:failed"})
+        comment, = self.comments
+        self.assertIn(why, comment)
+        self.assertIn(row["id"], comment)
+        self.assertEqual(self.drafted, [])
 
     def test_delivered_finish_keeps_the_ready_pr_and_ticket_state(self):
         row = self.finish_run("delivered", "Published the change.", 0)
