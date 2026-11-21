@@ -264,7 +264,8 @@ class Controller:
 
     def ci_failures(self, current):
         logs = pipeline.run_folder(self.run, "ci")
-        notes = [pipeline.ci.failure_note(r, logs / f"publish-{i}-{prompt_loader.slug(r.label)}.log")
+        prefix = "publish" if current.n == 1 else "publish-rerun"
+        notes = [pipeline.ci.failure_note(r, logs / f"{prefix}-{i}-{prompt_loader.slug(r.label)}.log")
                  for i, r in enumerate(current.reds, 1)]
         return "\n\n".join(["## CI failures", "", current.summary(), *notes])
 
@@ -619,6 +620,10 @@ class Controller:
             raise ValueError("publication requires the full owner check policy")
         if self.job.verified.verdict == "fail":
             raise ValueError("behavioral verification failed; repair or finish failed")
+        if (not self.run.dry_run and not zte.reserved(str(self.run.tid)) and self.data.get("ci_failed")
+                and (retry := self.data.get("ci_retry")) and (tree := self.fingerprint())
+                and tree == self.data.get("published_tree")):
+            return self.retry_publication_ci(retry, tree)
         self.validate_publication_diff()
         if self.run.dry_run:
             self.ending = flows.end_dry_run(self.flow)
@@ -641,28 +646,88 @@ class Controller:
             return failure
         return self.finish_publication()
 
-    def publication_ci(self, pushed, *, caught_up=False):
+    def retry_publication_ci(self, retry, tree):
+        job = self.job
+        self.check_pilot_publication()
+        flows.require_environment_owner_clear(job)
+        flows.refuse_changed_prs(job)
+        checkouts = {c.github: c for c in job.with_prs}
+        heads = self.data["publication"]["heads"]
+        retried = self.data.setdefault("ci_retried_heads", {})
+        pushed, reruns = [], {}
+        targets = retry["targets"]
+        for repo, target in targets.items():
+            checkout = checkouts.get(repo)
+            head = target["head"]
+            if not checkout or checkout.pr != target["pr"] or checkout.lease != head or heads.get(repo) != head:
+                raise ValueError("the failed CI no longer matches this run's published head")
+            if target["red"] and head in retried.get(repo, []):
+                reason = f"CI failed twice on the unchanged head {head}"
+                self.ending = flows.finish(self.flow, "failed", why=reason, prs=True)
+                return {"error": reason}
+            pushed.append(checkout)
+        for checkout in pushed:
+            row = gh.pr_merge_details(checkout.pr)
+            if (row.get("state") != "OPEN" or row.get("headRefOid") != checkout.lease
+                    or row.get("baseRefName") != checkout.base):
+                raise ValueError("the PR no longer matches this run's published head and base")
+            reruns[checkout.github] = gh.failed_job_reruns(checkout.github, checkout.pr, checkout.lease,
+                                                         targets[checkout.github]["jobs"])
+        if not any(reruns.values()):
+            raise ValueError("the failed CI has no GitHub Actions jobs to rerun")
+        self.data["publication_intent"] = {"tree": tree, "phase": "ci-rerun"}
+        for checkout in pushed:
+            if reruns[checkout.github]:
+                retried.setdefault(checkout.github, []).append(checkout.lease)
+        self.persist()
+        for repo, requested in reruns.items():
+            for rerun in requested:
+                gh.rerun_failed_jobs(repo, rerun.run)
+        failure = self.publication_ci(pushed, caught_up=retry["caught_up"], reruns=reruns)
+        if failure:
+            self.data.pop("publication_intent", None)
+            return failure
+        flows.require_environment_owner_clear(job)
+        fresh = [c for c in job.picked(job.opened) if c.github not in job.found]
+        pipeline.ready_pushed(self.run, fresh, job.picked(job.ci_stopped), job.draft_why)
+        return self.finish_publication()
+
+    def publication_ci(self, pushed, *, caught_up=False, reruns=None):
+        def watch(checkout):
+            options = {} if reruns is None else {"reruns": reruns[checkout.github]}
+            watched = pipeline.ci.watch(pipeline.ci_target(checkout), self.run.log, **options)
+            return pipeline.ci.compare_with_base(watched, self.run.log)
+
+        tree = self.fingerprint()
         self.job.slot.free()
         try:
             with self.run.waiting("ci"):
-                current = pipeline.ci.Round(1, [pipeline.ci.compare_with_base(
-                    pipeline.ci.watch(pipeline.ci_target(c), self.run.log), self.run.log) for c in pushed])
+                current = pipeline.ci.Round(1 if reruns is None else 2, [watch(c) for c in pushed])
         finally:
             self.job.slot.take(self.run.log, self.run.waiting)
         self.job.ci_result = current.summary()
         self.check_pilot_publication()
-        section = pipeline.ci.section([current], 1)
+        section = pipeline.ci.section([current], current.n)
         if caught_up:
             for checkout in pushed:
                 pipeline.comment_catch_up_ci(self.run, checkout, section, self.job.verified, self.job.review)
         else:
             pipeline.publish_ci(self.run, self.job.ticket, self.job.with_prs, section)
+        self.data.pop("ci_retry", None)
         if not current.reds and current.all_read:
             self.data.pop("ci_failed", None)
             self.data.pop("ci_failures", None)
             self.catalog.context.pop(CI_FAILURES, None)
             return None
         self.data["ci_failed"] = True
+        targets = {}
+        for w in current.seen:
+            reds = [r for r in w.reds if w.read or r.check.key in w.rerun_reds]
+            targets[w.target.github] = {"head": w.target.sha, "pr": w.target.pr, "red": bool(reds),
+                                        "jobs": [r.check.job for r in reds if r.check.job]}
+        if any(t["red"] for t in targets.values()):
+            self.data["published_tree"] = tree
+            self.data["ci_retry"] = {"caught_up": caught_up, "targets": targets}
         self.data["ci_failures"] = self.ci_failures(current)
         self.catalog.add_context(CI_FAILURES, self.data["ci_failures"])
         for checkout in self.job.with_prs:
@@ -793,7 +858,8 @@ class Controller:
             self.data["published"], self.data["published_tree"] = outcome.data, self.fingerprint()
         else:
             self.data.pop("published", None)
-            self.data.pop("published_tree", None)
+            if not self.data.get("ci_retry"):
+                self.data.pop("published_tree", None)
         self.persist()
         if self.data.get("ci_failed"):
             return outcome.data

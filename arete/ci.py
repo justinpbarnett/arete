@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import time
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -94,6 +94,7 @@ class Watched:
     read: bool = True
     reds: list[Red] = field(default_factory=list)
     conflicting: bool = False
+    rerun_reds: set[gh.CheckKey] = field(default_factory=set)
 
     def in_state(self, state: str) -> list[gh.Check]:
         return [c for c in self.checks.values() if c.state == state]
@@ -171,21 +172,42 @@ def conflicting(target: Target, log: Callable[[str], None]) -> bool:
         return False
 
 
-def watch(target: Target, log: Callable[[str], None]) -> Watched:
+def watch(target: Target, log: Callable[[str], None], *, reruns: Sequence[gh.WorkflowRerun] = ()) -> Watched:
+    completed: set[int] = set()
+    exact: dict[gh.CheckKey, gh.Check] = {}
+
+    def snapshot(*, timeout: float = 120, retry: bool = True):
+        checks = gh.commit_checks(target.github, target.sha, timeout=timeout, retry=retry)
+        for rerun in reruns:
+            for key in rerun.check_keys:
+                checks.pop(key, None)
+            if rerun.run in completed:
+                continue
+            if attempt := gh.rerun_checks(target.github, target.sha, rerun, timeout=timeout, retry=retry):
+                completed.add(rerun.run)
+                exact.update({key: check for key, check in attempt.items() if key not in exact or check.state == "fail"})
+        return checks | exact, len(completed) < len(reruns)
+
+    def watched(checks: dict[gh.CheckKey, gh.Check], *, read=True, conflict=False) -> Watched:
+        return Watched(target, checks | exact, read=read, conflicting=conflict,
+                       rerun_reds={key for key, check in exact.items() if check.state == "fail"})
+
     log(f"ci: waiting on the checks of {target.pr_name} at {target.sha[:7]}")
     checks: dict[gh.CheckKey, gh.Check] = {}
+    awaiting_rerun = bool(reruns)
     waiting_on: list[str] | None = None
     while True:
         if conflicting(target, log):
             log(f"ci: stopped waiting on {target.pr_name} because GitHub reports a merge conflict with the base")
             try:
-                latest = gh.commit_checks(target.github, target.sha, timeout=CONFLICT_SNAPSHOT_TIMEOUT, retry=False)
+                latest, awaiting_rerun = snapshot(timeout=CONFLICT_SNAPSHOT_TIMEOUT, retry=False)
             except READ_ERRORS as e:
                 log(f"ci: reading the checks of {target.pr_name} failed: {util.first_line(str(e), 200)}")
-                return Watched(target, {}, read=False, conflicting=True)
-            return Watched(target, latest, conflicting=True)
+                return watched({}, read=False, conflict=True)
+            pending = bool(reruns) and any(c.state == "pending" for c in latest.values())
+            return watched(latest, read=not awaiting_rerun and not pending, conflict=True)
         try:
-            checks = gh.commit_checks(target.github, target.sha)
+            checks, awaiting_rerun = snapshot()
             just_read = True
         except READ_ERRORS as e:
             just_read = False
@@ -196,15 +218,18 @@ def watch(target: Target, log: Callable[[str], None]) -> Watched:
             log(f"ci: {target.pr_name} {len(checks) - len(pending)} of {util.count(len(checks), 'check')} done"
                 + (f", waiting on {', '.join(pending)}" if pending else ""))
             waiting_on = pending
-        if just_read and checks and not pending and waited >= SETTLE_SECONDS:
-            return Watched(target, checks)
-        if just_read and not checks and waited >= FIRST_CHECK_SECONDS:
+        if just_read and checks and not pending and not awaiting_rerun and waited >= SETTLE_SECONDS:
+            return watched(checks)
+        if just_read and not reruns and not checks and waited >= FIRST_CHECK_SECONDS:
             log(f"ci: no checks on {target.pr_name} within {minutes(FIRST_CHECK_SECONDS)} of the push")
             return Watched(target, checks)
         if waited >= WAIT_SECONDS:
+            if just_read and awaiting_rerun:
+                log(f"ci: {target.pr_name} did not report completed rerun checks after {minutes(WAIT_SECONDS)}")
+                return watched(checks, read=False)
             log(f"ci: {target.pr_name} still waiting on {', '.join(pending)} after {minutes(WAIT_SECONDS)}" if just_read
                 else f"ci: could not read the checks of {target.pr_name} within {minutes(WAIT_SECONDS)}")
-            return Watched(target, checks, read=just_read)
+            return watched(checks, read=just_read and not (reruns and pending))
         time.sleep(POLL_SECONDS)
 
 
