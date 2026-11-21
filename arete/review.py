@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import re
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass, field
+
+from . import sandbox, util
+from .vault import git_unquoted
 
 BLOCKER_CATEGORIES = ("issue", "regression", "security", "data_loss")
 UNWAIVABLE = ("security", "data_loss")
@@ -40,6 +45,78 @@ REVIEW_SCHEMA = {
     },
     "required": ["summary", "problems"],
 }
+
+_LOCATION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "file": {"type": "string", "description": "Repository-relative path. For a rename, use the new path."},
+        "old_file": {"type": "string", "description": "Exact old repository-relative path for a rename."},
+        "line": {"type": "integer", "minimum": 1},
+        "side": {"type": "string", "enum": ["before", "after"]},
+        "old_mode": {"type": "string", "description": "Git mode before the change. Use 000000 for an added file."},
+        "new_mode": {"type": "string", "description": "Git mode after the change. Use 000000 for a deleted file."},
+        "binary": {"type": "boolean", "description": "True for a file marked as changed binary content."},
+    },
+    "required": ["file"],
+}
+_PROBLEMS_SCHEMA = REVIEW_SCHEMA["properties"]["problems"]
+_PROBLEM_SCHEMA = _PROBLEMS_SCHEMA["items"]
+CATCH_UP_REVIEW_SCHEMA = {
+    **REVIEW_SCHEMA,
+    "properties": {
+        "summary": REVIEW_SCHEMA["properties"]["summary"],
+        "changes": REVIEW_SCHEMA["properties"]["changes"],
+        "problems": {
+            **_PROBLEMS_SCHEMA,
+            "items": {
+                **_PROBLEM_SCHEMA,
+                "properties": {
+                    **_PROBLEM_SCHEMA["properties"],
+                    "attribution": {
+                        **_LOCATION_SCHEMA,
+                        "description": "Cite a changed line, a Git mode transition, a binary change, or an exact rename.",
+                        "properties": {
+                            **_LOCATION_SCHEMA["properties"],
+                            "part": {"type": "string", "enum": ["base", "resolution", "approved"]},
+                            "base_change": _LOCATION_SCHEMA,
+                            "resolution_change": _LOCATION_SCHEMA,
+                            "dependency": {"type": "string"},
+                        },
+                        "required": [*_LOCATION_SCHEMA["required"], "part"],
+                    },
+                },
+            },
+        },
+    },
+}
+_HUNK_START = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+_PATCH_SECTION = re.compile(r"^diff --git ", re.MULTILINE)
+_SAME_PATH = re.compile(r'("?)a/(.+)\1 \1b/\2\1')
+_MODE_LINE = re.compile(r"^(old mode|new mode|deleted file mode|new file mode) ([0-7]{6})$", re.MULTILINE)
+_RENAME_PATHS = re.compile(r"^rename from (.+)\nrename to (.+)$", re.MULTILINE)
+_BINARY_LINE = re.compile(r"^Binary files(?: .+)? differ$", re.MULTILINE)
+_PATCH_BODY = re.compile(r"^(?:@@ |GIT binary patch$)", re.MULTILINE)
+
+
+@dataclass
+class ChangedLocations:
+    lines: set[tuple[str, str, int]]
+    modes: dict[str, tuple[str, str]]
+    binaries: set[str]
+    renames: set[tuple[str, str]]
+
+
+@dataclass(frozen=True)
+class ReviewPatchSection:
+    paths: tuple[str, ...]
+    header: str
+    metadata: str
+    text: str
+
+    def without_binary_payload(self) -> str:
+        if "\0" in self.text or "\nGIT binary patch\n" in self.text:
+            return f"diff --git {self.header}\n{self.metadata}Binary files differ\n"
+        return f"diff --git {self.text}"
 
 
 @dataclass
@@ -112,10 +189,10 @@ class Review:
         return self.verdict if "verdict" in self._keys else "none"
 
     def lists(self) -> str:
-        notes = ([f"[{p['severity']}] {p['file']}: {p['problem']}" for p in self.notes()]
+        notes = ([f"[{p['severity']}] {p['file']}: {problem_text(p)}" for p in self.notes()]
                  + [f"[waived {p.get('category') or 'blocker'}] {p.get('file', '')}: {p['problem']} ({p['why']})"
                     for p in self.waived or []])
-        return ("".join(f"\n- [blocker, {p.get('category') or 'unstated'}] {p.get('file', '')}: {p['problem']}"
+        return ("".join(f"\n- [blocker, {p.get('category') or 'unstated'}] {p.get('file', '')}: {problem_text(p)}"
                         for p in self.blocking())
                 + ("\n\n### Review notes (not blocking)\n" + "".join(f"\n- {n}" for n in notes) if notes else ""))
 
@@ -151,7 +228,7 @@ def blocker_id(n: int) -> str:
 
 
 def numbered(listed: list[dict]) -> str:
-    return "\n".join(f"- {blocker_id(n)} [{p.get('category') or 'unstated'}] {p.get('file', '')}: {p['problem']}"
+    return "\n".join(f"- {blocker_id(n)} [{p.get('category') or 'unstated'}] {p.get('file', '')}: {problem_text(p)}"
                      for n, p in enumerate(listed, 1))
 
 
@@ -161,10 +238,170 @@ def review_problems(listed) -> list[dict]:
     return [{"file": p.get("file") or "", "problem": p.get("problem") or "",
              "severity": str(p.get("severity") or "unrated").strip().lower(),
              "category": str(p.get("category") or "").strip().lower()
-             if str(p.get("category") or "").strip().lower() in BLOCKER_CATEGORIES else ""}
+             if str(p.get("category") or "").strip().lower() in BLOCKER_CATEGORIES else "",
+             **{key: p[key] for key in ("cause", "catch_up_note") if p.get(key)}}
             for p in listed if isinstance(p, dict)]
 
 
+def problem_text(problem: dict) -> str:
+    text = problem["problem"]
+    if problem.get("cause"):
+        return f"{text} ({problem['cause']})"
+    return f"{text} (found on catch-up)" if problem.get("catch_up_note") else text
+
+
+def section_paths(header: str, metadata: str) -> tuple[str, ...]:
+    if rename := _RENAME_PATHS.search(metadata):
+        old, new = rename.groups()
+        return git_unquoted(old), git_unquoted(new)
+    if match := _SAME_PATH.fullmatch(header):
+        quote, path = match.groups()
+        return (git_unquoted(f"{quote}{path}{quote}"),)
+    return ()
+
+
+def review_patch_sections(patch: str) -> Iterator[ReviewPatchSection]:
+    for section in _PATCH_SECTION.split(patch)[1:]:
+        header, _, body = section.partition("\n")
+        metadata = _PATCH_BODY.split(body, maxsplit=1)[0]
+        yield ReviewPatchSection(section_paths(header, metadata), header, metadata, section)
+
+
+def permitted_review_patches(patches: dict[str, str], deny: list[str], prefix: str) -> dict[str, str]:
+    sections = {part: list(review_patch_sections(patch)) for part, patch in patches.items()}
+    paths = [section.paths for group in sections.values() for section in group]
+    protected = {path for names in paths for path in names
+                 if sandbox.secret_path(prefix + path) or util.matches_any(path, deny)
+                 or util.matches_any(prefix + path, deny)}
+    renames = [set(names) for names in paths if len(names) == 2]
+    while aliases := {path for names in renames if names & protected for path in names} - protected:
+        protected.update(aliases)
+    return {part: "".join(section.without_binary_payload() for section in group
+                          if section.paths and protected.isdisjoint(section.paths))
+            for part, group in sections.items()}
+
+
+def changed_lines(patch: str) -> set[tuple[str, str, int]]:
+    locations = set()
+    in_hunk = False
+    old_file = new_file = ""
+    old_line = new_line = 0
+    for line in patch.split("\n"):
+        if line.startswith("diff --git "):
+            in_hunk = False
+            old_file = new_file = ""
+        elif match := _HUNK_START.match(line):
+            in_hunk = True
+            old_line, new_line = map(int, match.groups())
+        elif not in_hunk:
+            if line.startswith("--- "):
+                old_file = git_unquoted(line[4:].rstrip("\t")).removeprefix("a/")
+            elif line.startswith("+++ "):
+                new_file = git_unquoted(line[4:].rstrip("\t")).removeprefix("b/")
+        elif line.startswith("-"):
+            locations.add((old_file, "before", old_line))
+            old_line += 1
+        elif line.startswith("+"):
+            locations.add((new_file, "after", new_line))
+            new_line += 1
+        elif line.startswith(" "):
+            old_line += 1
+            new_line += 1
+    return locations
+
+
+def changed_locations(patch: str, *, text_only: bool) -> ChangedLocations:
+    before, after = {}, {}
+    binaries, renames = set(), set()
+    if not text_only:
+        for section in review_patch_sections(patch):
+            if not section.paths:
+                continue
+            if len(section.paths) == 2:
+                old, new = section.paths
+                renames.add((old, new))
+            if _BINARY_LINE.search(section.metadata):
+                binaries.update(section.paths)
+            for kind, mode in _MODE_LINE.findall(section.metadata):
+                file = section.paths[-1]
+                modes = before if kind in ("old mode", "deleted file mode") else after
+                modes[file] = mode
+                if kind == "new file mode":
+                    before.setdefault(file, "000000")
+                elif kind == "deleted file mode":
+                    after.setdefault(file, "000000")
+    changed_modes = {file: (before[file], after[file]) for file in before.keys() & after.keys()
+                     if before[file] != after[file]}
+    return ChangedLocations(changed_lines(patch), changed_modes, binaries, renames)
+
+
+def changed_location(given, changes: ChangedLocations) -> str:
+    if not isinstance(given, dict):
+        return ""
+    file = given.get("file")
+    if not isinstance(file, str):
+        return ""
+    if "old_file" in given:
+        old = given["old_file"]
+        if (isinstance(old, str) and (old, file) in changes.renames
+                and given.keys().isdisjoint(("line", "side", "old_mode", "new_mode", "binary"))):
+            return f"{file} (renamed from {old})"
+        return ""
+    if "binary" in given:
+        if (given["binary"] is True and file in changes.binaries
+                and given.keys().isdisjoint(("line", "side", "old_mode", "new_mode"))):
+            return f"{file} (binary content)"
+        return ""
+    if "old_mode" in given or "new_mode" in given:
+        modes = given.get("old_mode"), given.get("new_mode")
+        if "line" not in given and "side" not in given and modes == changes.modes.get(file):
+            return f"{file} (mode {modes[0]} to {modes[1]})"
+        return ""
+    side, line = given.get("side", "after"), given.get("line")
+    if isinstance(side, str) and type(line) is int and (file, side, line) in changes.lines:
+        return f"{file}:{line} ({side})"
+    return ""
+
+
+def catch_up_cause(attribution, changes: dict[str, ChangedLocations]) -> str:
+    if not isinstance(attribution, dict):
+        return ""
+    part = attribution.get("part")
+    if part not in ("base", "resolution", "approved") or part not in changes:
+        return ""
+    if not (location := changed_location(attribution, changes[part])):
+        return ""
+    if part in ("base", "resolution"):
+        return f"{part} change at {location}"
+    sources = [source for source in ("base", "resolution") if f"{source}_change" in attribution]
+    if len(sources) != 1:
+        return ""
+    source, = sources
+    if source not in changes:
+        return ""
+    cause = changed_location(attribution[f"{source}_change"], changes[source])
+    dependency = attribution.get("dependency")
+    if cause and isinstance(dependency, str) and dependency.strip():
+        return f"approved change at {location} depends on {source} change at {cause}. {dependency.strip()}"
+    return ""
+
+
+def catch_up_problems(problems: list, patches: dict[str, str]) -> list[dict]:
+    changes = {part: changed_locations(patch, text_only=part == "approved") for part, patch in patches.items()}
+    findings = []
+    for raw in problems:
+        if not isinstance(raw, dict):
+            continue
+        problem = {key: raw[key] for key in ("file", "problem", "severity", "category") if key in raw}
+        if str(problem.get("severity") or "").strip().lower() not in NOTE_SEVERITIES:
+            if cause := catch_up_cause(raw.get("attribution"), changes):
+                problem["cause"] = cause
+            else:
+                problem.update(severity="major", category="", catch_up_note=True)
+        findings.append(problem)
+    return findings
+
+
 def reported(listed: list[dict]) -> list[dict]:
-    return [{"file": p["file"], "text": p["problem"], "severity": p["severity"], "category": p.get("category") or ""}
+    return [{"file": p["file"], "text": problem_text(p), "severity": p["severity"], "category": p.get("category") or ""}
             for p in listed]

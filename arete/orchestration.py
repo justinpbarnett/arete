@@ -748,7 +748,7 @@ class Controller:
             b.catch_ups += 1
             job.verified, job.review = pipeline.catch_up_base(
                 b, checkout, job.branch, base_sha, job.with_left(job.goal), job.with_left(job.plan_text),
-                before_push=remember_push)
+                job.review, before_push=remember_push)
         except pipeline.CatchUpGateHold as error:
             return self.hold_catch_up(checkout, base_sha, error)
         except pipeline.CatchUpPushUnconfirmed:

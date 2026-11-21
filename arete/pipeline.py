@@ -18,6 +18,7 @@ from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import TextIO
 
 from . import (
@@ -59,7 +60,7 @@ from . import (
     workspace,
 )
 from .agent import NO_SESSION, Result, Session
-from .review import REVIEW_SCHEMA, Review, numbered
+from .review import CATCH_UP_REVIEW_SCHEMA, REVIEW_SCHEMA, Review, catch_up_problems, numbered, permitted_review_patches
 from .store import asks as asks_store
 from .store import insights as insights_store
 from .store import runs as run_store
@@ -2310,11 +2311,14 @@ def report_automerge(run: Run, c: workspace.Checkout, hold: str) -> None:
 
 
 def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
-                  goal: str, plan: str, *,
+                  goal: str, plan: str, prior_review: Review, *,
                   before_push: Callable[[str, verify.Verified, Review], None]) -> tuple[verify.Verified, Review]:
     run = b.run
     if git(["rev-parse", "HEAD"], c.wt).strip() != c.lease or workspace.uncommitted(c.wt, tracked_only=True):
         raise workspace.RunFailed("the worktree differs from the published head")
+    tree = git(["rev-parse", f"{c.lease}^{{tree}}"], c.wt).strip()
+    if not tree or not prior_review.approved() or prior_review.trees != {c.prefix: tree}:
+        raise workspace.RunFailed("the published tree lacks a current approving review")
     before = replace(c)
     checked, report, staged = b.checked, b.report, b.staged
     worktree_files = workspace.untracked_files(c.wt) | workspace.ignored_file_paths(c.wt)
@@ -2333,7 +2337,7 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
         if not b.layer.verify:
             raise CatchUpGateHold("verify", "the layer has no behavioral verification configured", head, b.report)
         verified = check_in_use(b, goal, b.build_summary)
-        review = _review(b, plan, verified, step=b.next_step("review"))
+        review = _review(b, plan, verified, step=b.next_step("review"), before=prior_review, catch_up=c)
         if problem := merge_evidence_problem(b, c, verified, review, head):
             gate, why = problem
             raise CatchUpGateHold(gate, why, head, b.report, verified, review)
@@ -3277,19 +3281,65 @@ def answer_without_changes(run: Run, ws: Path, checkouts: list[workspace.Checkou
 
 
 def _review(b: Build, plan: str, verified: verify.Verified, step: str = "review", before: Review | None = None,
-            reply: str = "") -> Review:
+            reply: str = "", *, catch_up: workspace.Checkout | None = None) -> Review:
     before = before or Review.stored({})
-    earlier = before.blocking()
-    text = b.brief.prompt(
-        "review", plan=plan, checks=b.report, evidence=verified.markdown(), compare=compare_with_fork(b.checkouts),
-        diff=util.tail(diffguard.fold_moved(b.staged.patch), MAX_DIFF_IN_PROMPT),
-        earlier=earlier_review(earlier, reply, fixed_since(b, before.trees or {})))
+    if catch_up is None:
+        earlier = before.blocking()
+        schema = REVIEW_SCHEMA
+        text = b.brief.prompt(
+            "review", plan=plan, checks=b.report, evidence=verified.markdown(), compare=compare_with_fork(b.checkouts),
+            diff=util.tail(diffguard.fold_moved(b.staged.patch), MAX_DIFF_IN_PROMPT),
+            earlier=earlier_review(earlier, reply, fixed_since(b, before.trees or {})))
+        context = nullcontext((text, {}))
+    else:
+        earlier = []
+        schema = CATCH_UP_REVIEW_SCHEMA
+        context = catch_up_review_prompt(b, catch_up, plan, verified, before)
     allowed_tools = prompt_loader.bash_rules(b.read_bash)
-    for _ in range(2):
-        res = b.run.agent(step, text, b.ws, role="review", allowed_tools=allowed_tools, json_schema=REVIEW_SCHEMA)
-        if res.ok and isinstance(res.structured, dict) and isinstance(res.structured.get("problems"), list):
-            return Review.judged(res.structured, earlier, before.waived or [], index_trees(b.checkouts))
+    with context as (text, patches):
+        for _ in range(2):
+            res = b.run.agent(step, text, b.ws, role="review", allowed_tools=allowed_tools, json_schema=schema)
+            if res.ok and isinstance(res.structured, dict) and isinstance(res.structured.get("problems"), list):
+                said = res.structured
+                if catch_up is not None:
+                    said = {**said, "problems": catch_up_problems(said["problems"], patches)}
+                return Review.judged(said, earlier, before.waived or [], index_trees(b.checkouts))
     return Review.failed_step(earlier, before.waived or [], before.trees or {})
+
+
+@contextmanager
+def catch_up_review_prompt(b: Build, c: workspace.Checkout, plan: str, verified: verify.Verified,
+                           before: Review) -> Iterator[tuple[str, dict[str, str]]]:
+    fork = git(["merge-base", c.lease, c.base_commit], c.wt).strip()
+    flags = ("--no-color", "--no-ext-diff", "--no-textconv", "--submodule=short", "--unified=3", "--no-relative",
+             "--src-prefix=a/", "--dst-prefix=b/", "--find-renames", "-l0")
+    comparisons = {
+        "approved": ["diff", *flags, fork, c.lease, "--"],
+        "base": ["diff", *flags, fork, c.base_commit, "--"],
+        "resolution": ["show", "--remerge-diff", "--format=", *flags, c.merge, "--"] if c.resolved else [],
+    }
+    raw = {part: util.git_bytes(args, c.wt).decode(errors="replace") if args else ""
+           for part, args in comparisons.items()}
+    patches = permitted_review_patches(raw, diffguard.denied_paths(b.layer), c.prefix)
+    with ExitStack() as files:
+        excerpts, sources = {}, []
+        for part, patch in patches.items():
+            redacted = vault.hidden(patch)
+            excerpts[part] = util.both_ends(redacted, MAX_FIX_DIFF_IN_PROMPT) or "None."
+            if len(redacted) <= MAX_FIX_DIFF_IN_PROMPT:
+                continue
+            patch_file = files.enter_context(NamedTemporaryFile(mode="w", encoding="utf-8", dir=b.ws,
+                                                                prefix=f".arete-{part}-", suffix=".diff"))
+            patch_file.write(redacted)
+            patch_file.flush()
+            sources.append(f"The {part} excerpt is truncated. Read the full patch at "
+                           f"`{Path(patch_file.name).name}` using the read-only tools.")
+        text = b.brief.prompt("review_catch_up", plan=plan, checks=b.report, evidence=verified.markdown(),
+                              checkout=c.dir or ".", approved_head=c.lease, fork=fork, base_head=c.base_commit,
+                              merged_head=c.merge,
+                              earlier=vault.hidden(json.dumps(before.asdict(), indent=2)), sources="\n".join(sources),
+                              **excerpts)
+        yield text, patches
 
 
 def earlier_review(earlier: list[dict], reply: str, fixed: str) -> str:
