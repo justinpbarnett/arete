@@ -30,6 +30,7 @@ from arete import (
 from arete.agent import NO_SESSION, Result
 from arete.review import Review
 from arete.store import db, orchestration as ledger
+from tests.parallel import stack_env
 
 
 class PublicationFixture(unittest.TestCase):
@@ -1343,7 +1344,7 @@ class ServeStatusTests(unittest.TestCase):
         }))
         installed = Path(sysconfig.get_path("scripts")) / "arete"
         result = subprocess.run([str(installed), "status", *args], cwd=self.root,
-                                env={**env, "PYTHONPATH": str(self.root), "PYTHONDONTWRITEBYTECODE": "1"},
+                                env=stack_env({**env, "PYTHONPATH": str(self.root), "PYTHONDONTWRITEBYTECODE": "1"}),
                                 capture_output=True, text=True, timeout=8)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("broken deployment fixture", result.stderr)
