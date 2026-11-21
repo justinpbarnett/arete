@@ -3,6 +3,7 @@ import ast
 import base64
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -36,6 +37,7 @@ def setUpModule():
 
 class _CliThroughServeCase(unittest.TestCase):
     class_timeout = 30
+    fixture_root = None
     OWNER = "cli-owner@example.test"
     ONLINE = (
         "run replay-sample 7", "task add --repo replay-sample change", "task list", "task show t-1234",
@@ -92,18 +94,48 @@ class _CliThroughServeCase(unittest.TestCase):
         "secrets rm replay-sample secret": "vault",
     }
 
+    @classmethod
+    def setUpClass(cls):
+        directory = tempfile.TemporaryDirectory(prefix="arete-cli-fixture-")
+        cls.addClassCleanup(directory.cleanup)
+        cls.addClassCleanup(setattr, cls, "fixture_root", None)
+        root = Path(directory.name).resolve()
+        entry = "from tests.test_behavior import _CliThroughServeCase; _CliThroughServeCase.prepare_fixture()"
+        result = cls.run_child(root, entry)
+        if result.returncode:
+            raise RuntimeError(result.stdout + result.stderr)
+        cls.fixture_root = root
+
+    @staticmethod
+    def prepare_fixture():
+        from arete import paths
+
+        root = Path.cwd()
+        lines, _ = api_check.prepare_replay(root)
+        paths.CONFIG_FILE.write_text("\n".join(lines) + "\n")
+        # The copied checkout should use the copy of its bare origin.
+        subprocess.run(["git", "remote", "set-url", "origin", "../origin.git"],
+                       cwd=root / "sample/repo", check=True, timeout=10)
+        db.migrate()
+
+    @staticmethod
+    def run_child(root, entry, *args):
+        command = api_check.child_command(Path(__file__).resolve().parents[1], entry, *args)
+        return subprocess.run(command, cwd=root, env=api_check.isolated_env(root), capture_output=True,
+                              text=True, timeout=18, check=False)
+
     def in_subprocess(self, case):
         with tempfile.TemporaryDirectory(prefix="arete-cli-") as temp:
             root = Path(temp).resolve()
             entry = ("import faulthandler; faulthandler.dump_traceback_later(15); "
+                     "from pathlib import Path; "
                      "from tests import test_behavior; "
                      "from unittest import TextTestRunner; "
                      "test = getattr(test_behavior, sys.argv[1])(sys.argv[2]); "
+                     "test.fixture_root = Path(sys.argv[3]) if sys.argv[3] else None; "
                      "sys.exit(not TextTestRunner().run(test).wasSuccessful())")
-            command = api_check.child_command(Path(__file__).resolve().parents[1], entry, type(self).__name__, case)
             try:
-                result = subprocess.run(command, cwd=root, env=api_check.isolated_env(root), capture_output=True,
-                                        text=True, timeout=18, check=False)
+                result = self.run_child(root, entry, type(self).__name__, case, str(self.fixture_root or ""))
             except subprocess.TimeoutExpired as error:
                 output = (error.stderr or b"").decode(errors="replace")
                 self.fail(f"{case} timed out after {error.timeout:g}s\n{output}")
@@ -118,9 +150,26 @@ class _CliThroughServeCase(unittest.TestCase):
         self.addCleanup(self.stack.close)
         for name in ("urllib.request.urlopen", "arete.gh.gh"):
             self.stack.enter_context(mock.patch(name, side_effect=AssertionError(name)))
-        lines, _ = api_check.prepare_replay(Path.cwd())
-        self.fixture_config = "\n".join(lines) + "\n"
+        root = Path.cwd()
+        if self.fixture_root is None:
+            # The pin check invokes a single case directly, outside this class fixture.
+            lines, _ = api_check.prepare_replay(root)
+            self.fixture_config = "\n".join(lines) + "\n"
+        else:
+            shutil.copytree(self.fixture_root / "sample", root / "sample")
+            config_text = (self.fixture_root / "config/config.toml").read_text()
+            original = json.dumps(str(self.fixture_root / "sample"))[1:-1]
+            copied = json.dumps(str(root / "sample"))[1:-1]
+            self.fixture_config = config_text.replace(original, copied)
         paths.CONFIG_FILE.write_text(self.fixture_config)
+
+    def prepare_state(self):
+        from arete import paths
+
+        if self.fixture_root is None:
+            db.migrate()
+        elif not paths.DB_FILE.exists():
+            shutil.copytree(self.fixture_root / "state", paths.STATE_DIR, dirs_exist_ok=True)
 
     def cli(self, command, stdin=""):
         from arete import cli
@@ -152,7 +201,7 @@ class _CliThroughServeCase(unittest.TestCase):
 
     @contextmanager
     def serve_at(self, requests, *, write_instances=None):
-        db.migrate()
+        self.prepare_state()
         principals.seed_owner(self.OWNER)
 
         class Handler(dashboard.Handler):
@@ -305,7 +354,7 @@ class CliThroughServeAccessTests(_CliThroughServeCase):
     def check_events_read_the_local_log(self):
         from arete import client, paths
 
-        db.migrate()
+        self.prepare_state()
         event = {"ts": util.iso(), "kind": "tool", "cls": "fixture"}
         paths.EVENTS_FILE.write_text(json.dumps(event) + "\n")
         with mock.patch.object(client, "server", side_effect=AssertionError("events contacted serve")):
@@ -316,7 +365,7 @@ class CliThroughServeAccessTests(_CliThroughServeCase):
         from arete import record, run_lines
         from arete.store import tasks as task_store
 
-        db.migrate()
+        self.prepare_state()
         task = task_store.task_add("replay-sample", "work")
         run = record.start("session", run_id="r1", pid=None)
         record.settle(run, "done", end_line="done")
