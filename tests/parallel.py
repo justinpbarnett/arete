@@ -285,8 +285,9 @@ class Runner:
                     self.child(item)
             for index, batch in items:
                 identifier = batch.identifier
-                if not batch.serial and not self.stopping and self.results[identifier].get("timeout"):
-                    self.first_timeouts[identifier] = self.results[identifier]
+                first = self.results.get(identifier, {})
+                if not batch.serial and not self.stopping and first.get("timeout"):
+                    self.first_timeouts[identifier] = first
                     self.child((f"{index}.alone", batch), stretch=2)
                     if not failed(self.results[identifier]):
                         self.crowded.append(identifier)
@@ -325,10 +326,10 @@ class Runner:
         for identifier, report in self.results.items():
             ran += report["ran"]
             skipped += len(report["skipped"])
-            if first := self.first_timeouts.get(identifier):
-                self.show_failures(identifier, first)
             if failed(report):
                 suite_failed = True
+                if first := self.first_timeouts.get(identifier):
+                    self.show_failures(identifier, first)
                 self.show_failures(identifier, report)
         try:
             temporary = f"{HISTORY}.{os.getpid()}.tmp"
@@ -341,6 +342,7 @@ class Runner:
             report = self.results[identifier]
             print(f"{identifier}: ran past its deadline beside other classes, "
                   f"then passed alone within twice that deadline in {report['seconds']:.2f}s", flush=True)
+            self.show_failures(identifier, self.first_timeouts[identifier])
         if self.args.slowest:
             print("Slowest classes:")
             for name, report in sorted(self.results.items(), key=lambda item: -item[1]["seconds"])[:self.args.slowest]:

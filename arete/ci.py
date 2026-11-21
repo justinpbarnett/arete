@@ -18,7 +18,7 @@ LOG_EXCERPT_CHARS = 8000
 TIMEOUT_EXCERPT_CHARS = 6000
 MIN_TIMEOUT_REPORT_CHARS = 160
 LOG_TIMESTAMP = re.compile(r"^\d{4}-\d\d-\d\dT[\d:.]+Z ", re.MULTILINE)
-TEST_TIMEOUT = re.compile(rf"^{re.escape(_test_stacks.REPORT_START)}\r?\n(.*?)\r?\n"
+TEST_TIMEOUT = re.compile(rf"^{re.escape(_test_stacks.REPORT_START)}\r?\n.*?\r?\n"
                           rf"^{re.escape(_test_stacks.REPORT_END)}\r?$", re.DOTALL | re.MULTILINE)
 PYTHON_STACK = re.compile(r"^(Python (?:class|child) stack \(PID \d+\))\r?\n", re.MULTILINE)
 SECTION_START, SECTION_END = "<!-- arete:ci -->", "<!-- /arete:ci -->"
@@ -257,7 +257,10 @@ def clip(text: str, max_chars: int) -> str:
 
 
 def timeout_excerpt(report: str, limit: int) -> str:
-    identity, *stacks = PYTHON_STACK.split(report)
+    if len(report) <= limit:
+        return report
+    body = report[report.index("\n") + 1:report.rindex("\n")]
+    identity, *stacks = PYTHON_STACK.split(body)
     sections = [util.both_ends(identity.rstrip(), limit)]
     remaining = limit - len(sections[0])
     traces = []
@@ -312,11 +315,16 @@ def excerpt(log_text: str) -> str:
     if len(text) <= LOG_EXCERPT_CHARS:
         return text
     if reports := TEST_TIMEOUT.findall(text):
-        summary = timeout_summary(reports)
+        summary = "\n\n".join(reports)
+        if len(summary) > LOG_EXCERPT_CHARS:
+            summary = timeout_summary(reports)
         remaining = LOG_EXCERPT_CHARS - len(summary) - 2
+        if remaining < 8:
+            return summary
         tail = TEST_TIMEOUT.sub("", text).strip()
-        if last_error >= 0 and len(text) - last_error > remaining:
-            tail = util.both_ends(text[last_error:], remaining)
+        last_error = tail.rfind("##[error]")
+        if last_error >= 0 and len(tail) - last_error > remaining:
+            tail = util.both_ends(tail[last_error:], remaining)
         elif len(tail) > remaining:
             tail = util.tail(tail, remaining - len("...\n"))
         return "\n\n".join(filter(None, (summary, tail)))
