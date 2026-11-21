@@ -5,7 +5,7 @@ import json
 import os
 import shutil
 import stat
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -372,13 +372,18 @@ def outside_scratch(ws: Path, names: list[str], held: list[Path]) -> list[str]:
             and not any(h.is_relative_to(ws / n) for h in held)]
 
 
-def note_made(ws: Path, checkouts: list[Checkout], owner: dict | None = None) -> None:
+def note_made(ws: Path, checkouts: list[Checkout], owner: dict | None = None,
+              *, preserve: Collection[str] = ()) -> None:
     try:
         owner = owner or owner_in(made_before(ws))
         names, held = [], []
         if ws.is_dir():
             names, held = leftovers(ws, checkouts), scratch_left(ws, checkouts)
             names = outside_scratch(ws, names, held)
+            if preserve:
+                protected = {Path(n) for n in preserve}
+                protected |= {parent for path in protected for parent in path.parents}
+                names = [n for n in names if Path(n) not in protected]
         heads = {head_key(c): git(["rev-parse", "HEAD"], c.wt).strip() for c in checkouts if (c.wt / ".git").exists()}
         heads |= {onto_key(c): c.onto for c in checkouts if c.onto and (c.wt / ".git").exists()}
         if names or heads:

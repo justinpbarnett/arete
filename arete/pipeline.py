@@ -96,7 +96,6 @@ NOT_CAUSED_LEFT_FOR_A_PERSON = (f"{LEFT_HEADING}\n\n{LEFT_BY_A_PERSON} A red che
                                 "is not caused by the PR: set `caused_by_pr` to false, say in its reason that it waits "
                                 "on the change left for a person, and do not make it pass another way.\n\n")
 CHECKED_IN_USE_HEADING = "## Checked in use"
-REVIEW_HEADING = "## Review"
 RUNS_LOG = "runs.log"
 RUN_START_SECONDS = 10
 SUCCEEDED = ("pr", "noop", "needs-info", "dry-run", "done")
@@ -442,12 +441,16 @@ class CatchUpNeedsInput(workspace.RunFailed):
     pass
 
 
-class PushFailed(workspace.RunFailed):
-    pass
-
-
 class CatchUpPushUnconfirmed(workspace.RunFailed):
-    pass
+    def __init__(self, why: str, detail: str, *, retryable: bool):
+        super().__init__(why, detail)
+        self.retryable = retryable
+
+
+class CatchUpPathCollision(workspace.RunFailed):
+    def __init__(self, name: str, kind: str):
+        super().__init__(f"the merge would overwrite {kind} file `{name}`")
+        self.name = name
 
 
 @dataclass(kw_only=True)
@@ -460,6 +463,7 @@ class Run(AgentRun):
     path: str = ""
     alone: bool = False
     facts: dict = field(default_factory=dict)
+    catch_up_preserved: set[str] = field(default_factory=set)
     repairs: str = ""
     action: str = ""
     action_only: bool = False
@@ -666,7 +670,10 @@ def workspace_owner(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> 
 
 
 def release_workspace(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> bool:
-    workspace.note_made(ws, checkouts, workspace_owner(run, ws, checkouts))
+    workspace.note_made(ws, checkouts, workspace_owner(run, ws, checkouts), preserve=run.catch_up_preserved)
+    if run.catch_up_preserved:
+        run.log(f"workspace kept at {ws}: it contains files that existed before catch-up")
+        return False
     if workspace.remove_workspace(ws, checkouts):
         return True
     names = workspace.blocked_by(ws, checkouts)
@@ -805,8 +812,7 @@ def lines_by_file(staged: Staged, top: int = 12) -> str:
 
 
 def ignored_state(wt: Path) -> dict[str, str]:
-    names = util.git_records(["ls-files", "--others", "--ignored", "--exclude-standard"], wt)
-    return {n: workspace.fingerprint(wt / n, "") for n in names
+    return {n: workspace.fingerprint(wt / n, "") for n in workspace.ignored_file_paths(wt)
             if not (Path(n).parent.name == "__pycache__" and Path(n).suffix == ".pyc")}
 
 
@@ -1473,6 +1479,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                        if (done := record.interrupt(dead_row))]
             earlier = None if only or preview_of else run_store.newest_live_whole_run(repo.name, tid)
             restarting = bool(earlier) and earlier["status"] == "interrupted"
+            reconciling_catch_up = (script and script.path == "orchestrate" and script.continues
+                                    and bool(flows.pending_catch_up(script.continues)))
             mending = (script.repairs or repaired_by(script.continues or (earlier["id"] if restarting else ""))
                        ) if script else ""
             if pilot.is_pilot_task(str(tid)):
@@ -1532,7 +1540,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             scratch.RUN_BASELINES[run_id] = producer_baseline
             scratch.RUN_LABELS[run_id] = service_labels
             run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force,
-                      feedback=[] if mending or zte_grant else pending_feedback(repo.name, tid), repairs=mending,
+                      feedback=[] if mending or zte_grant or reconciling_catch_up else pending_feedback(repo.name, tid),
+                      repairs=mending,
                       answering=earlier if earlier and earlier["status"] == "needs-info" else {},
                       launch_gate=admission, launch_done=launch_done, closed_context=closed_context, preview_of=preview_of,
                 **(script.run_fields if script else {}))
@@ -1591,7 +1600,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             if not dry_run and not run.alone:
                 insights_store.take_feedback(run.feedback, run_id)
         signal.signal(signal.SIGTERM, stop_on_term(run_id))
-        pr_url, passed, work_started = "", None, False
+        pr_url, passed, work_started, retaining_catch_up = "", None, False, False
 
         def check_work_log():
             pilot.require(time.monotonic() < wall_deadline, "the ZTE authorization expired")
@@ -1637,6 +1646,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
             status, summary, passed = flows.alone(flow)
         except factory.Refused as e:
+            retaining_catch_up = reconciling_catch_up
             if zte_grant:
                 return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
             if run.environment_release:
@@ -1650,6 +1660,13 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             status, summary, pr_url = "stopped", record.STOPPED, ""
             run.log(record.STOPPED)
             run.give_up("was stopped by request")
+        except CatchUpPushUnconfirmed as e:
+            retaining_catch_up = True
+            status = "interrupted" if e.retryable and run.path == "orchestrate" else "failed"
+            summary = f"{e.why}. {e.detail}"
+            if status == "interrupted":
+                summary += " The next poll can reconcile the recorded push."
+            run.log(summary)
         except workspace.RunFailed as e:
             if zte_grant:
                 return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
@@ -1678,9 +1695,10 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         finally:
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
             if run.workspace and not zte_grant:
-                if not run.environment_release or ("requirements" in run.facts and flows.retry_passed(flow.ctx.verified)):
+                if not (retaining_catch_up or run.catch_up_preserved) and (
+                        not run.environment_release or ("requirements" in run.facts and flows.retry_passed(flow.ctx.verified))):
                     keep_edits(run)
-                workspace.note_made(*run.workspace, workspace_owner(run, *run.workspace))
+                workspace.note_made(*run.workspace, workspace_owner(run, *run.workspace), preserve=run.catch_up_preserved)
             slot.free()
         try:
             with handoff_io():
@@ -2227,14 +2245,14 @@ def report_automerge(run: Run, c: workspace.Checkout, hold: str) -> None:
 
 
 def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
-                  goal: str, plan: str, *, before_push: Callable[[str], None]) -> tuple[verify.Verified, Review]:
+                  goal: str, plan: str, *,
+                  before_push: Callable[[str, verify.Verified, Review], None]) -> tuple[verify.Verified, Review]:
     run = b.run
     if git(["rev-parse", "HEAD"], c.wt).strip() != c.lease or workspace.uncommitted(c.wt, tracked_only=True):
         raise workspace.RunFailed("the worktree differs from the published head")
     before = replace(c)
     checked, report, staged = b.checked, b.report, b.staged
-    untracked = workspace.untracked_files(c.wt)
-    worktree_files = untracked | workspace.ignored_file_paths(c.wt)
+    worktree_files = workspace.untracked_files(c.wt) | workspace.ignored_file_paths(c.wt)
     blocked = run.owner_questions_blocked
     run.owner_questions_blocked = True
     try:
@@ -2257,7 +2275,11 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
             raise workspace.RunFailed("the worktree changed while checking the merge")
         if hold := gh.merge_ref_hold(gh.pr_merge_details(c.pr), c.lease, c.base):
             raise workspace.RunFailed(hold)
+        before_push(head, verified, review)
     except BaseException as error:
+        if isinstance(error, CatchUpPathCollision):
+            worktree_files.add(error.name)
+        run.catch_up_preserved.update(c.prefix + name for name in worktree_files)
         abort_merge(c.wt)
         if (git(["rev-parse", "HEAD"], c.wt).strip() != before.lease
                 or workspace.uncommitted(c.wt, tracked_only=True)):
@@ -2272,7 +2294,6 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
         raise
     finally:
         run.owner_questions_blocked = blocked
-    before_push(head)
     push_caught_up_head(b, c, branch, head)
     return verified, review
 
@@ -2281,28 +2302,30 @@ def push_caught_up_head(b: Build, c: workspace.Checkout, branch: str, head: str)
     b.run.log(f"automerge: pushing catch-up {b.catch_ups} to {c.pr} at {head}, after {c.lease}")
     candidate = replace(c)
     pending_push = True
-    for attempt in range(3):
-        if pending_push:
+    why = f"the catch-up push to `{branch}` could not be confirmed"
+    detail = f"Previous head `{c.lease}`, attempted head `{head}`, PR {c.pr}."
+    for attempt in range(4):
+        try:
+            row = gh.pr_merge_details(c.pr)
+        except ci.READ_ERRORS:
+            row = {}
+        remote = row.get("headRefOid")
+        if remote == head:
+            c.lease, c.onto = head, ""
+            return
+        if remote and (hold := gh.merge_ref_hold(row, c.lease, c.base)):
+            raise CatchUpPushUnconfirmed(f"{why}: {hold}", f"{detail} GitHub reports `{remote}`.", retryable=False)
+        if attempt == 3:
+            break
+        if pending_push and remote == c.lease:
             try:
                 commit_and_push([candidate], [candidate], branch, "", before_push=lambda _: head)
                 pending_push = False
             except (workspace.RunFailed, RuntimeError, OSError) as failed:
                 b.run.log(f"automerge: catch-up push failed: {public_text(b.run, util.first_line(str(failed), 300))}")
-        try:
-            remote = gh.pr_merge_details(c.pr).get("headRefOid")
-        except ci.READ_ERRORS:
-            remote = ""
-        if remote == head:
-            c.lease, c.onto = head, ""
-            return
-        if remote and remote != c.lease:
-            break
-        if attempt < 2:
+        if attempt or not remote:
             time.sleep(gh.MERGE_POLL_SECONDS)
-    raise CatchUpPushUnconfirmed(
-        f"the catch-up push to `{branch}` could not be confirmed; reconcile its remote head before resuming",
-        f"Previous head `{c.lease}`, attempted head `{head}`, PR {c.pr}.",
-    )
+    raise CatchUpPushUnconfirmed(why, detail, retryable=True)
 
 
 def merge_evidence_hold(b: Build, c: workspace.Checkout, verified: verify.Verified, review: Review, head: str) -> str:
@@ -2503,11 +2526,11 @@ def commit_and_push(checkouts: list[workspace.Checkout], changed: list[workspace
             argv = ["push", "-q", f"--force-with-lease={branch}:{c.lease}", "-u", "origin", branch]
         try:
             git(argv, c.wt, timeout=600, retry=not before_push)
-        except (RuntimeError, OSError) as e:
+        except RuntimeError as e:
             done = ", ".join(p.github for p in pushed) or "nothing"
-            aftermath = ("Arete will not retry the push." if before_push
+            aftermath = ("The pilot will not retry the push." if before_push
                          else "A retry builds on whatever reached the branch.")
-            raise PushFailed(f"the push to {c.github} failed after arete pushed {done}", f"{e}\n\n{aftermath}") from e
+            raise workspace.RunFailed(f"the push to {c.github} failed after arete pushed {done}", f"{e}\n\n{aftermath}") from e
         c.lease = head or git(["rev-parse", "HEAD"], c.wt).strip()
         c.onto = ""
         pushed.append(c)
@@ -2835,7 +2858,7 @@ def check_merge_paths(wt: Path, commit: str) -> None:
         path = Path(name.casefold() if ignore_case else name)
         if path in targets or path in directories or not targets.isdisjoint(path.parents):
             kind = "ignored" if name in ignored else "untracked"
-            raise workspace.RunFailed(f"the merge would overwrite {kind} file `{name}`")
+            raise CatchUpPathCollision(name, kind)
 
 
 def merge_as_run(run_id: str, c: workspace.Checkout, commit: str, named: str, *, overwrite_ignore: bool = True) -> None:

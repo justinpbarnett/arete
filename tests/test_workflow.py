@@ -30,19 +30,22 @@ class MovedBasePublicationTests(unittest.TestCase):
         checkout = workspace.Checkout("", "fixture/repo", root, root, "main",
                                       pr="https://github.com/fixture/repo/pull/7", lease="head")
         controller = orchestration.Controller.__new__(orchestration.Controller)
-        run = mock.Mock(dry_run=False, tid="7", repo=SimpleNamespace(parts=[checkout], public=False),
+        run = mock.Mock(id="fixture-run", path="orchestrate", dry_run=False, alone=False, tid="7",
+                        repo=SimpleNamespace(name="repo", parts=[checkout], public=False), catch_up_preserved=set(),
                         waiting=mock.Mock(return_value=nullcontext()), feedback=[], repairs="", facts={},
-                        environment_release="", owner_questions_blocked=False)
-        job = mock.Mock(run=run, with_prs=[checkout], picked=mock.Mock(side_effect=lambda names: [checkout] if names else []),
+                        action="", environment_release="", owner_questions_blocked=False)
+        job = mock.Mock(run=run, only="", checkouts=[checkout], with_prs=[checkout],
+                        picked=mock.Mock(side_effect=lambda names: [checkout] if names else []),
                         verified=verify.Verified("pass"), approval=None, draft_why="", found=[], drafted=[],
                         changed=[checkout.github], opened=[checkout.github], pushed=[], ci_stopped=[], build_summary="updated")
         job.ticket = SimpleNamespace(labels=[], title="Edit fixture")
         job.b = mock.Mock(run=run, layer=SimpleNamespace(trust_level="automerge"), ticket=job.ticket,
                           checked={}, report="", staged=None, catch_ups=0)
         controller.run, controller.job = run, job
-        controller.flow = SimpleNamespace(ctx=job)
-        controller.data = {"evidence": {"checks": {"result": {"full": True}}}}
+        controller.flow = SimpleNamespace(ctx=job, refusal="", continues="")
+        controller.data = {"mode": "orchestrate", "evidence": {"checks": {"result": {"full": True}}}}
         controller.workers = {}
+        controller.executing, controller.lease, controller.ending = "d0001-0", "fixture-lease", None
         controller.current = mock.Mock(return_value=True)
         controller.fingerprint = mock.Mock(return_value="tree")
         controller.persist = mock.Mock()
@@ -56,7 +59,7 @@ class MovedBasePublicationTests(unittest.TestCase):
         controller, checkout = self.controller()
         clean = {"state": "OPEN", "headRefOid": checkout.lease, "mergeable": "MERGEABLE"}
         conflict = {**clean, "mergeable": "CONFLICTING"}
-        failed = {"id": 1, "name": "checks", "status": "completed", "conclusion": "failure"}
+        failed = {"id": 1, "app": {"id": 1}, "name": "checks", "status": "completed", "conclusion": "failure"}
         passed = {**failed, "id": 2, "conclusion": "success"}
         with (mock.patch.object(gh, "pr_merge_details", side_effect=[clean, conflict]),
               mock.patch.object(gh, "gh_json", side_effect=[[{"check_runs": [failed]}], [[]],
@@ -85,9 +88,10 @@ class MovedBasePublicationTests(unittest.TestCase):
                 "baseRefOid": "moved-base"}
 
         def catch_up(*args, before_push):
-            before_push("new-head")
+            evidence = verify.Verified("pass"), Review.stored({"verdict": "approve"})
+            before_push("new-head", *evidence)
             checkout.lease = "new-head"
-            return verify.Verified("pass"), Review.stored({"verdict": "approve"})
+            return evidence
 
         def transport(args, **kwargs):
             if "/statuses?" in args[1]:
@@ -96,7 +100,7 @@ class MovedBasePublicationTests(unittest.TestCase):
                       for n, conclusion in enumerate(("failure", "success"), 1)] if "/new-head/" in args[1] else []
             return [{"check_runs": checks}]
 
-        def details(pr):
+        def details(pr, **kwargs):
             return {**refs, "headRefOid": checkout.lease, "mergeable": "CONFLICTING"}
 
         with (mock.patch.object(pipeline, "merge_hold", return_value=gh.MovedBaseHold("base moved")) as gate,
@@ -126,37 +130,235 @@ class MovedBasePublicationTests(unittest.TestCase):
         self.assertIn("head `new-head`", comment.call_args.args[1])
         self.assertIn("Failed", comment.call_args.args[1])
 
+    def test_next_poll_reconciles_only_the_recorded_catch_up_push(self):
+        first, checkout = self.controller()
+        root = checkout.wt
+        refs = {"state": "OPEN", "isDraft": False, "baseRefName": "main", "baseRefOid": "moved-base"}
+        verified = verify.Verified("pass", checks=[{"passed": True}], native_trees={"": "new-tree"})
+        review = Review.stored({"verdict": "approve", "trees": {"": "new-tree"}})
+        first.job.b.checked = {"tree": "new-tree", "commands": {"local": "check"}}
+        first.job.b.catch_ups = 1
+
+        def catch_up(b, c, branch, *args, before_push):
+            c.merge, c.base_commit = "new-head", "moved-base"
+            before_push(c.merge, verified, review)
+            pipeline.push_caught_up_head(b, c, branch, c.merge)
+
+        with (mock.patch.object(gh, "pr_merge_details", return_value={**refs, "headRefOid": "head"}),
+              mock.patch.object(pipeline, "fetch_merge_base", return_value="moved-base"),
+              mock.patch.object(pipeline, "merge_hold", return_value=gh.MovedBaseHold("base moved")),
+              mock.patch.object(pipeline, "catch_up_base", side_effect=catch_up),
+              mock.patch.object(first, "publication_ci", return_value=None),
+              mock.patch.object(pipeline, "commit_and_push", side_effect=OSError("lost push reply")) as push,
+              mock.patch.object(pipeline.time, "sleep")):
+            with self.assertRaises(pipeline.CatchUpPushUnconfirmed) as unconfirmed:
+                first.publish()
+        self.assertTrue(unconfirmed.exception.retryable)
+        self.assertEqual(push.call_count, 3)
+        ticket = tracker.Ticket("7", "#7", "Restore context", "Issue body", "Owner clarification", kind="fix")
+        prepared = {"layer": str(root), "ticket": vars(ticket), "checkouts": [checkout.to_row()],
+                    "branch": "fix", "attachments": "Saved attachment", "expertise": "Saved expertise",
+                    "triage": "", "add_dirs": []}
+        saved = json.dumps({**first.data, "prepared": prepared, "catch_ups": first.job.b.catch_ups,
+                            "verified": {"verdict": "pass"}, "checked": first.job.b.checked,
+                            "run_settings": "settings", "overrides": {}, "step_overrides": {}})
+        action = {"id": first.executing, "op": "publication.request", "state": "reconciliation-required"}
+        question = {"id": "d0001-1", "op": "owner.ask", "state": "accepted"}
+
+        for initial, tree in (("new-head", "new-tree"), ("head", "new-tree"), ("unrelated-head", "new-tree"),
+                              ("head", "different-tree")):
+            with self.subTest(pr_head=initial, tree=tree):
+                resumed, _ = self.controller()
+                resumed.flow.continues = first.run.id
+                resumed.data = json.loads(saved)
+                resumed.job = resumed.flow.ctx = flows.Job(config.Config(), resumed.run, root, built=resumed.job.b)
+                resumed.run.add_dirs, resumed.run.story, resumed.run.workspace = [], [], None
+                resumed.run.settings.return_value = SimpleNamespace(chain=[])
+                remote = initial
+
+                def retry(all_checkouts, changed, branch, message, *, before_push):
+                    nonlocal remote
+                    self.assertEqual(remote, "head")
+                    self.assertEqual(changed[0].lease, "head")
+                    self.assertIn("catch_up", resumed.data["publication_intent"])
+                    remote = before_push(changed[0])
+
+                def ci_gate(pushed, *, caught_up):
+                    self.assertTrue(caught_up)
+                    candidate = resumed.job.checkouts[0]
+                    self.assertEqual(pushed, [candidate])
+                    self.assertEqual(candidate.lease, remote)
+                    self.assertNotIn("catch_up", resumed.data["publication_intent"])
+                    self.assertEqual(resumed.job.verified, verified)
+                    self.assertEqual(resumed.job.review, review)
+                    self.assertEqual(resumed.catalog.read("task", 0, 8000)["text"],
+                                     "Restore context\n\nIssue body\n\nOwner clarification")
+                    self.assertEqual(resumed.catalog.read("expertise", 0, 8000)["text"], "Saved expertise")
+                    self.assertEqual(resumed.catalog.read("attachments", 0, 8000)["text"], "Saved attachment")
+                    return {"error": "CI failed"}
+
+                def lineage():
+                    resumed.catalog = orchestration.Catalog(resumed.job)
+
+                with (mock.patch.object(orchestration.ledger, "find", return_value={"data": resumed.data}),
+                      mock.patch.object(orchestration.ledger, "actions", return_value=[action, question]),
+                      mock.patch.object(orchestration.ledger, "transition") as transition,
+                      mock.patch.multiple(resumed, lineage=mock.Mock(side_effect=lineage),
+                                          write_lineage_event=mock.DEFAULT, quiescent=mock.DEFAULT, stamp=mock.DEFAULT),
+                      mock.patch.object(orchestration.run_lines, "write"),
+                      mock.patch.multiple(pipeline, checked_layer=mock.Mock(return_value=SimpleNamespace(
+                          checks={"local": "check"})), check_script=mock.Mock(return_value=([], [])), note_prs=mock.DEFAULT),
+                      mock.patch.object(resumed, "publication_ci", side_effect=ci_gate) as watched,
+                      mock.patch.object(pipeline, "catch_up_base") as merge,
+                      mock.patch.multiple(workspace, uncommitted=mock.Mock(return_value=[]),
+                                          scratch_left=mock.Mock(return_value=[])),
+                      mock.patch.object(util, "git", return_value="new-head"),
+                      mock.patch.object(pipeline, "git", return_value=tree),
+                      mock.patch.object(gh, "pr_merge_details", side_effect=lambda *_: {**refs, "headRefOid": remote}),
+                      mock.patch.object(pipeline, "commit_and_push", side_effect=retry) as retried):
+                    resumed.job.b.layer = pipeline.checked_layer(None, root)
+                    self.assertEqual(flows.guard(resumed.job, first.run.id), "")
+                    if tree != "new-tree":
+                        with self.assertRaisesRegex(factory.Refused, "native behavioral pass"):
+                            resumed.prepare()
+                    elif initial == "unrelated-head":
+                        with self.assertRaises(pipeline.CatchUpPushUnconfirmed) as refused:
+                            resumed.prepare()
+                        self.assertFalse(refused.exception.retryable)
+                    else:
+                        self.assertIsNone(resumed.prepare())
+                        watched.assert_called_once()
+                        self.assertNotIn("publication_intent", resumed.data)
+                        self.assertEqual([call.args[1:3] for call in transition.call_args_list],
+                                         [(question["id"], "cancelled"), (first.executing, "failed")])
+                        self.assertEqual(transition.call_args.kwargs["expected"], ("reconciliation-required",))
+                    if initial == "unrelated-head" or tree != "new-tree":
+                        self.assertIn("catch_up", resumed.data["publication_intent"])
+                        watched.assert_not_called()
+                        transition.assert_not_called()
+                    self.assertEqual(resumed.job.b.catch_ups, 2)
+                    self.assertEqual(retried.call_count, int(initial == "head" and tree == "new-tree"))
+                    merge.assert_not_called()
+
+    def test_collision_file_survives_the_final_pr_hold(self):
+        for kind in ("ignored", "untracked"):
+            with self.subTest(kind=kind):
+                self.check_collision_hold(kind)
+
+    def check_collision_hold(self, kind):
+        controller, checkout = self.controller()
+        root = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        checkout.wt = controller.job.ws = root / "checkout"
+        path = checkout.wt / "ignored" / "data.txt"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"owner's file")
+        (checkout.wt / ".git").touch()
+        for file in (path, checkout.wt / ".git", root / "workspaces" / "checkout.json"):
+            self.addCleanup(file.unlink, missing_ok=True)
+        refs = {"state": "OPEN", "isDraft": False, "headRefOid": "head", "baseRefName": "main",
+                "baseRefOid": "moved-base"}
+
+        def git(args, *_, **kw):
+            return {"rev-parse": "head", "rev-list": "1", "merge-tree": "merged-tree"}.get(args[0], "")
+
+        def git_records(args, wt):
+            if args[0] == "diff" or (args[0] == "ls-files" and ("--ignored" in args) == (kind == "ignored")):
+                return ["ignored/data.txt"]
+            if args[0] == "status":
+                if kind == "ignored" and "--ignored=matching" in args:
+                    return ["!! ignored/"]
+                if kind == "untracked" and "--untracked-files=all" in args:
+                    return ["?? ignored/data.txt"]
+            return []
+
+        def remove_checkout(*_):
+            path.unlink()
+            return True
+
+        with (mock.patch.object(gh, "pr_merge_details", return_value=refs), mock.patch.object(gh, "pr_comment"),
+              mock.patch.object(pipeline, "fetch_merge_base", return_value="moved-base"),
+              mock.patch.object(pipeline, "merge_hold", return_value=gh.MovedBaseHold("base moved")),
+              mock.patch.object(controller, "publication_ci", return_value=None),
+              mock.patch.object(pipeline, "git", side_effect=git), mock.patch.object(workspace, "git", side_effect=git),
+              mock.patch.object(util, "git_records", side_effect=git_records),
+              mock.patch.object(util, "repo_lock", return_value=nullcontext()),
+              mock.patch.object(pipeline.record, "timed", return_value=nullcontext({})),
+              mock.patch.object(pipeline, "abort_merge"), mock.patch.object(util, "git_as_owner") as merge,
+              mock.patch.object(workspace, "scratch_left", return_value=[]), mock.patch.object(paths, "STATE_DIR", root),
+              mock.patch.object(workspace, "remove_workspace", side_effect=remove_checkout) as remove,
+              mock.patch.object(pipeline, "record_prs", return_value=checkout.pr),
+              mock.patch.object(flows, "ended", side_effect=lambda flow, outcome: flows.respond(flow, **outcome.data))):
+            self.assertEqual(controller.publish()["ending"], "pr")
+            self.assertEqual(path.read_bytes(), b"owner's file")
+            self.assertEqual(workspace.blocked_by(checkout.wt, [checkout]),
+                             ["ignored/" if kind == "ignored" else "ignored/data.txt"])
+        self.assertIn("`main` at `moved-base`", controller.run.facts["merge_held"])
+        self.assertIn(f"{kind} file `ignored/data.txt`", controller.run.facts["merge_held"])
+        merge.assert_not_called()
+        remove.assert_not_called()
+
     def test_resolver_question_cleans_its_ignored_file_and_names_moved_base(self):
         controller, checkout = self.controller()
-        checkout.wt = Path(self.enterContext(TemporaryDirectory()))
+        root = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        checkout.wt = controller.job.ws = root / "checkout"
         ignored = checkout.wt / "ignored"
-        ignored.mkdir()
+        ignored.mkdir(parents=True)
+        (checkout.wt / ".git").touch()
         existing, created = ignored / "kept", ignored / "resolver"
+        existing_untracked, untracked = checkout.wt / "kept", checkout.wt / "resolver"
+        for path in (existing, created, existing_untracked, untracked, checkout.wt / ".git",
+                     root / "workspaces" / "checkout.json"):
+            self.addCleanup(path.unlink, missing_ok=True)
         existing.write_bytes(b"keep me")
+        existing_untracked.write_bytes(b"keep me too")
         refs = {"state": "OPEN", "isDraft": False, "headRefOid": "head", "baseRefName": "main",
                 "baseRefOid": "moved-base"}
 
         def resolve(*args, **kwargs):
             self.assertTrue(controller.run.owner_questions_blocked)
             created.write_text("remove me")
+            untracked.write_text("remove me too")
             raise owner_asks.Asked([], [], "publish", "resolve", NO_SESSION)
 
-        with (mock.patch.object(gh, "pr_merge_details", return_value=refs),
+        def git_records(args, wt):
+            files = (existing, created) if "--ignored" in args else (existing_untracked, untracked)
+            names = [str(path.relative_to(wt)) for path in files if path.exists()]
+            if args[0] == "ls-files":
+                return names
+            if "--ignored=matching" in args:
+                return ["!! ignored/"]
+            return [f"?? {name}" for name in names] if "--untracked-files=all" in args else []
+
+        with (mock.patch.object(gh, "pr_merge_details", return_value=refs), mock.patch.object(gh, "pr_comment"),
               mock.patch.object(pipeline, "fetch_merge_base", return_value="moved-base"),
+              mock.patch.object(pipeline, "merge_hold", return_value=gh.MovedBaseHold("base moved")),
+              mock.patch.object(controller, "publication_ci", return_value=None),
               mock.patch.object(pipeline, "git", return_value="head"),
-              mock.patch.object(workspace, "uncommitted", return_value=[]),
-              mock.patch.object(workspace, "untracked_files", return_value=set()),
-              mock.patch.object(workspace, "ignored_file_paths",
-                                side_effect=lambda wt: {str(p.relative_to(wt)) for p in (existing, created) if p.exists()}),
+              mock.patch.object(workspace, "git", return_value="head") as workspace_git,
+              mock.patch.object(util, "git_records", side_effect=git_records),
+              mock.patch.object(util, "repo_lock", return_value=nullcontext()),
               mock.patch.object(pipeline, "merge_moved_bases", side_effect=resolve),
               mock.patch.object(pipeline, "abort_merge") as abort,
-              mock.patch.object(pipeline, "commit_and_push") as push):
-            hold = controller.catch_up(checkout)
+              mock.patch.object(pipeline, "commit_and_push") as push,
+              mock.patch.object(workspace, "scratch_left", return_value=[]), mock.patch.object(paths, "STATE_DIR", root),
+              mock.patch.object(pipeline, "record_prs", return_value=checkout.pr),
+              mock.patch.object(flows, "ended", side_effect=lambda flow, outcome: flows.respond(flow, **outcome.data))):
+            self.assertEqual(controller.publish()["ending"], "pr")
+            self.assertEqual(existing.read_bytes(), b"keep me")
+            self.assertEqual(existing_untracked.read_bytes(), b"keep me too")
+            self.assertCountEqual(workspace.blocked_by(checkout.wt, [checkout]), ["ignored/", "kept"])
+            with self.assertRaisesRegex(workspace.RunFailed, "has no record of leaving there"):
+                workspace.clear_workspace(checkout.wt, [checkout], checkout.src, [])
+        hold = controller.run.facts["merge_held"]
         self.assertIn("`main` at `moved-base`", hold)
         self.assertIn("needs owner input", hold)
+        self.assertNotIn("publication_intent", controller.data)
         self.assertFalse(created.exists())
+        self.assertFalse(untracked.exists())
         self.assertEqual(existing.read_bytes(), b"keep me")
+        self.assertEqual(existing_untracked.read_bytes(), b"keep me too")
         self.assertFalse(controller.run.owner_questions_blocked)
+        self.assertFalse(any(call.args[0][0] == "worktree" for call in workspace_git.call_args_list))
         abort.assert_called_once_with(checkout.wt)
         push.assert_not_called()
 

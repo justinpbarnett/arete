@@ -120,6 +120,7 @@ class Controller:
         self.write_lineage_event()
         if self.flow.refusal:
             raise factory.Refused(self.flow.refusal)
+        pending_push = ledger.catch_up_push(self.data)
         if self.run.feedback and (closed := [url for url in self.run.feedback_prs if gh.pr_view(url).get("state") != "OPEN"]):
             self.quiescent()
             return "noop", f"the PR closed before arete could revise it: {', '.join(closed)}", ""
@@ -145,7 +146,9 @@ class Controller:
                 if ledger.publication_pending(self.run.id) or not any(
                         a["op"] == "publication.request" and a["state"] == "succeeded" for a in ledger.actions(self.lease)):
                     raise factory.Refused("the missing workspace has no settled publication; reconcile before resuming")
-            if self.run.environment_release:
+            if pending_push:
+                self.job.prepared(prepared, stored=True, reconciling_catch_up=True)
+            elif self.run.environment_release:
                 flows.restore_environment_draft(self.job, prepared)
             else:
                 if missing:
@@ -162,6 +165,11 @@ class Controller:
             self.job.b.catch_ups = self.data.get("catch_ups", 0)
             self.job.b.from_base = True
             self.job.b.plan_text, self.job.b.build_summary = self.job.plan_text, self.job.build_summary
+            if pending_push:
+                self.catalog.refresh_context()
+                self.quiescent()
+                self.publish()
+                return self.ending
         else:
             self.quiescent()
             if self.run.environment_release:
@@ -569,6 +577,8 @@ class Controller:
 
     def publish(self):
         self.barrier()
+        if pending := ledger.catch_up_push(self.data):
+            return self.reconcile_catch_up(pending)
         if self.data.get("publication_intent"):
             raise factory.Refused("publication was interrupted; reconcile its branch/PR effects before resuming")
         needed = [gate for gate in ("checks", "review", "verify") if not self.current(gate)]
@@ -616,7 +626,7 @@ class Controller:
                 pipeline.comment_catch_up_ci(self.run, checkout, section, self.job.verified, self.job.review)
         else:
             pipeline.publish_ci(self.run, self.job.ticket, self.job.with_prs, section)
-        if not current.reds and all(w.read or w.conflicting for w in current.seen):
+        if not current.reds and current.all_read:
             self.data.pop("ci_failed", None)
             self.data.pop("ci_failures", None)
             self.catalog.context.pop(CI_FAILURES, None)
@@ -656,11 +666,17 @@ class Controller:
         job, b = self.job, self.job.b
         base_sha = ""
 
-        def remember_push(head):
+        def remember_push(head, verified, review):
             self.data["publication_intent"]["catch_up"] = {
+                "action": self.executing,
                 "pr": checkout.pr, "previous": checkout.lease, "head": head, "base": base_sha,
+                "verified": asdict(verified), "review": review.asdict(),
             }
-            self.persist()
+            try:
+                self.persist()
+            except BaseException:
+                self.data["publication_intent"].pop("catch_up", None)
+                raise
 
         try:
             row = gh.pr_merge_details(checkout.pr)
@@ -682,15 +698,59 @@ class Controller:
             reason = e.why if isinstance(e, workspace.RunFailed) else util.first_line(str(e), 300)
             base = f"`{checkout.base}` at `{base_sha}`" if base_sha else f"`{checkout.base}`"
             return f"could not catch up to {base}: {pipeline.public_text(self.run, reason)}"
+        self.note_caught_up(checkout)
+        return ""
+
+    def reconcile_catch_up(self, pending):
+        job = self.job
+        self.executing = pending["action"]
+        actions = ledger.actions(self.lease)
+        action = next((a for a in actions if a["id"] == self.executing), None)
+        if (not action or action["op"] != "publication.request"
+                or action["state"] not in ("running", "reconciliation-required")):
+            raise factory.Refused("the catch-up push has no interrupted publication action")
+        if len(job.checkouts) != 1:
+            raise factory.Refused("the catch-up push does not match the retained checkout")
+        checkout = job.checkouts[0]
+        head = pending["head"]
+        if (checkout.pr != pending["pr"] or checkout.lease != pending["previous"] or checkout.merge != head
+                or checkout.base_commit != pending["base"]
+                or self.data["publication"]["heads"].get(checkout.github) != checkout.lease
+                or util.git(["rev-parse", "HEAD"], checkout.wt).strip() != head or workspace.uncommitted(checkout.wt)):
+            raise factory.Refused("the catch-up push does not match the retained checkout")
+        verified, review = Verified.stored(pending["verified"]), pipeline.Review.stored(pending["review"])
+        if hold := pipeline.merge_evidence_hold(job.b, checkout, verified, review, head):
+            raise factory.Refused(f"cannot reconcile the catch-up push: {hold}")
+        self.check_pilot_publication()
+        pipeline.note_prs(self.run, job.branch, job.with_prs)
+        pipeline.push_caught_up_head(job.b, checkout, job.branch, head)
+        job.verified, job.review = verified, review
+        self.note_caught_up(checkout)
+        if failure := self.publication_ci([checkout], caught_up=True):
+            for prior in actions:
+                if prior["state"] == "accepted" and prior["op"] == "owner.ask":
+                    ledger.transition(self.lease, prior["id"], "cancelled",
+                                      {"reason": "the run resumed an interrupted catch-up push"}, expected=("accepted",))
+            self.data.pop("publication_intent", None)
+            self.persist()
+            result = failure
+        else:
+            result = self.finish_publication()
+        ledger.transition(self.lease, self.executing, "failed" if "error" in result else "succeeded", result,
+                          expected=(action["state"],))
+        return result
+
+    def note_caught_up(self, checkout):
+        job, b = self.job, self.job.b
         self.data["publication"]["heads"][checkout.github] = checkout.lease
         pipeline.note_review(self.run, job.review, job.verified)
         self.run.log(f"automerge: pushed catch-up {b.catch_ups} to {checkout.pr} at {checkout.lease}")
         self.stamp("checks", {"full": True, "checked": b.checked, "report": b.report})
         self.stamp("verify", asdict(job.verified))
         self.stamp("review", job.review.asdict())
+
         self.data["publication_intent"].pop("catch_up", None)
         self.persist()
-        return ""
 
     def finish_publication(self):
         self.check_pilot_publication()

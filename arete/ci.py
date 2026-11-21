@@ -17,7 +17,7 @@ CONFLICT_SNAPSHOT_TIMEOUT = 5
 LOG_EXCERPT_CHARS = 8000
 LOG_TIMESTAMP = re.compile(r"^\d{4}-\d\d-\d\dT[\d:.]+Z ", re.MULTILINE)
 SECTION_START, SECTION_END = "<!-- arete:ci -->", "<!-- /arete:ci -->"
-SECTION = re.compile(rf"^{re.escape(SECTION_START)}\r?$.*?^{re.escape(SECTION_END)}\r?$", re.DOTALL | re.MULTILINE)
+SECTION = re.compile(rf"\n*^{re.escape(SECTION_START)}\r?$.*?^{re.escape(SECTION_END)}\r?$", re.DOTALL | re.MULTILINE)
 STOPPED = "Arete stopped:"
 PAST_TENSE = {"pass": "passed", "fail": "failed", "pending": "was still running", "skipped": "was skipped"}
 READ_ERRORS = (gh.GhError, OSError, KeyError, TypeError, ValueError, AttributeError)
@@ -158,7 +158,7 @@ def linked(c: gh.Check) -> str:
 
 def conflicting(target: Target, log: Callable[[str], None]) -> bool:
     try:
-        row = gh.pr_merge_details(target.pr)
+        row = gh.pr_merge_details(target.pr, timeout=CONFLICT_SNAPSHOT_TIMEOUT, retry=False)
         return (row.get("state") == "OPEN" and row.get("headRefOid") == target.sha
                 and (row.get("mergeable") == "CONFLICTING" or row.get("mergeStateStatus") == "DIRTY"))
     except READ_ERRORS as e:
@@ -191,15 +191,15 @@ def watch(target: Target, log: Callable[[str], None]) -> Watched:
             log(f"ci: {target.pr_name} {len(checks) - len(pending)} of {util.count(len(checks), 'check')} done"
                 + (f", waiting on {', '.join(pending)}" if pending else ""))
             waiting_on = pending
-        if checks and not pending and waited >= SETTLE_SECONDS:
+        if just_read and checks and not pending and waited >= SETTLE_SECONDS:
             return Watched(target, checks)
         if just_read and not checks and waited >= FIRST_CHECK_SECONDS:
             log(f"ci: no checks on {target.pr_name} within {minutes(FIRST_CHECK_SECONDS)} of the push")
             return Watched(target, checks)
         if waited >= WAIT_SECONDS:
-            log(f"ci: {target.pr_name} still waiting on {', '.join(pending)} after {minutes(WAIT_SECONDS)}" if checks
+            log(f"ci: {target.pr_name} still waiting on {', '.join(pending)} after {minutes(WAIT_SECONDS)}" if just_read
                 else f"ci: could not read the checks of {target.pr_name} within {minutes(WAIT_SECONDS)}")
-            return Watched(target, checks, bool(checks))
+            return Watched(target, checks, read=just_read)
         time.sleep(POLL_SECONDS)
 
 

@@ -582,12 +582,12 @@ class BaseTipChanged(str):
     pass
 
 
-def pr_merge_details(pr: str, repo: str = "") -> dict:
+def pr_merge_details(pr: str, repo: str = "", *, timeout: float = 120, retry: bool = True) -> dict:
     fields = "state,isDraft,headRefOid,baseRefName,baseRefOid,mergeStateStatus,mergeable,title"
     args = ["pr", "view", pr, "--json", fields]
     if repo:
         args += ["--repo", repo]
-    return gh_json(args) or {}
+    return gh_json(args, timeout=timeout, retry=retry) or {}
 
 
 def merge_ref_hold(row: dict, head: str, base: str) -> str:
