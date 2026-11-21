@@ -1,4 +1,7 @@
+import json
+import shutil
 import subprocess
+import sysconfig
 import tempfile
 import tomllib
 import unittest
@@ -9,8 +12,58 @@ from types import SimpleNamespace
 from typing import ClassVar
 from unittest import mock
 
-from arete import config, factory, flows, mergecheck, orchestration, pipeline, sandbox, tracker, util, verify, workspace
+from arete import (
+    api_check, config, factory, flows, mergecheck, orchestration, pipeline, sandbox, serve, tracker, util, verify,
+    workspace,
+)
 from arete.review import Review
+
+
+class ServeStatusTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.env = api_check.isolated_env(self.root)
+
+    def break_candidate_import(self, module):
+        candidate = self.root / "arete"
+        shutil.copytree(Path(serve.__file__).parent, candidate, ignore=shutil.ignore_patterns("__pycache__"))
+        (candidate / module).write_text('raise RuntimeError("broken deployment fixture")\n')
+
+    def check_revisions(self, env, state_dir, *args):
+        running, checkout = "a" * 12, "b" * 12
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / "serve.json").write_text(json.dumps({
+            "at": "2026-11-21T00:00:00Z", "engine": running, "checkout_head": checkout,
+        }))
+        installed = Path(sysconfig.get_path("scripts")) / "arete"
+        result = subprocess.run([str(installed), "status", *args], cwd=self.root,
+                                env={**env, "PYTHONPATH": str(self.root), "PYTHONDONTWRITEBYTECODE": "1"},
+                                capture_output=True, text=True, timeout=8)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("broken deployment fixture", result.stderr)
+        self.assertIn(f"last recorded serve heartbeat at 2026-11-21T00:00:00Z, "
+                      f"running code {running}, checkout HEAD {checkout}", result.stderr)
+
+    def test_installed_status_reads_revisions_when_candidate_common_raises(self):
+        self.break_candidate_import("commands/common.py")
+        self.check_revisions(self.env, Path(self.env["ARETE_STATE_DIR"]), "--limit", "1")
+
+    def test_installed_status_reads_revisions_when_candidate_paths_raises(self):
+        self.break_candidate_import("paths.py")
+        self.check_revisions(self.env, Path(self.env["ARETE_STATE_DIR"]))
+
+    def test_installed_status_finds_default_state_when_candidate_paths_raises(self):
+        self.break_candidate_import("paths.py")
+        del self.env["ARETE_CONFIG_DIR"], self.env["ARETE_STATE_DIR"]
+        self.check_revisions(self.env, Path(self.env["HOME"]) / ".local/share/arete")
+
+    def test_installed_status_finds_scratch_state_when_candidate_paths_raises(self):
+        self.break_candidate_import("paths.py")
+        scratch = self.root / ".arete-scratch-0123456789abcdef"
+        scratch.mkdir(mode=0o700)
+        del self.env["ARETE_CONFIG_DIR"], self.env["ARETE_STATE_DIR"]
+        self.check_revisions({**self.env, "ARETE_VERIFY_SCRATCH": str(scratch)}, scratch / "state")
 
 
 class AskConfigTests(unittest.TestCase):

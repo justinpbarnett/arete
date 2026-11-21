@@ -814,7 +814,8 @@ class Server:
         util.write_json(control.BEAT_FILE, {
             "schema": foundation.LATEST,
             "db": db,
-            "pid": os.getpid(), "engine": codebase.STAMP, "at": at, "started": util.iso(self.started), "ticks": self.ticks,
+            "pid": os.getpid(), "engine": codebase.STAMP, "checkout_head": codebase.checkout_head(),
+            "at": at, "started": util.iso(self.started), "ticks": self.ticks,
             "tick_seconds": TICK_SECONDS, "loops": len(live), "off": len(every_loop) - len(live),
             "broken": {x.name: x.error for x in every_loop if x.error}, "pending": pending,
             "running": running, "poll_errors": dict(self.errors),

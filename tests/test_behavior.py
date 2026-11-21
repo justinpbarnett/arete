@@ -380,6 +380,7 @@ class CliThroughServeAccessTests(_CliThroughServeCase):
 
         from arete import paths
 
+        paths.SERVE_BEAT_FILE.write_text(json.dumps({"at": "2000-01-01T00:00:00Z", "engine": "old-engine"}))
         for name in ("pipeline.run_issue", "delivery.send", "miner.file_rule", "loop_run.launch", "sessions.launch",
                      "control.stop_run", "record.pin", "oncall.dismiss", "chat.start_session", "chat.stop_session"):
             self.stack.enter_context(mock.patch("arete." + name, side_effect=AssertionError(name)))
@@ -405,6 +406,25 @@ class CliThroughServeAccessTests(_CliThroughServeCase):
         with mock.patch.dict(os.environ, {"ARETE_SERVER": url}):
             self.problem("run replay-sample 7", "server_down")
             self.problem("loop start example", "server_down")
+        self.assertFalse(paths.DB_FILE.exists())
+
+    def test_status_reports_failed_import_with_stale_heartbeat(self):
+        self.in_subprocess("check_status_reports_failed_import_with_stale_heartbeat")
+
+    def check_status_reports_failed_import_with_stale_heartbeat(self):
+        from arete import codebase, paths
+
+        paths.SERVE_BEAT_FILE.write_text(json.dumps({
+            "at": "2000-01-01T00:00:00Z", "engine": "old-engine", "checkout_head": "broken-head",
+        }))
+        problem = "arete: cannot import arete.commands.setup: RuntimeError: broken candidate"
+        with mock.patch.object(codebase, "load", side_effect=SystemExit(problem)):
+            code, lines, err = self.cli("status --limit 1")
+        self.assertEqual((code, lines), (1, []))
+        self.assertEqual(err.splitlines(), [
+            problem,
+            "last recorded serve heartbeat at 2000-01-01T00:00:00Z, running code old-engine, checkout HEAD broken-head",
+        ])
         self.assertFalse(paths.DB_FILE.exists())
 
     def test_readers_and_worker_guards(self):

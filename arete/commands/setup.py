@@ -21,7 +21,7 @@ from .common import (
     print_waiting,
     serve_line,
     show,
-    steering,
+    status_arguments,
 )
 
 DEFAULT_CONFIG = """\
@@ -270,13 +270,9 @@ def register(sub) -> None:
     p.add_argument("--force", action="store_true")
     p.set_defaults(fn=cmd_init)
 
-    p = steering(sub.add_parser("status", help="settings, heartbeat, alerts, recent runs; with --json, the live runs "
-                                               "or one run's steps as JSON lines"))
-    p.add_argument("run_id", nargs="?", default="", help="with --json: this run's steps, then its report")
-    p.add_argument("--limit", type=int, default=10)
-    p.add_argument("--json", action="store_true", help="one JSON line per live run, or per step of RUN_ID")
-    p.add_argument("--offline", action="store_true", help="read local status and run lines")
-    p.set_defaults(fn=cmd_status, local_read=lambda args: args.offline)
+    p = status_arguments(sub.add_parser("status", help="settings, heartbeat, alerts, recent runs; with --json, "
+                                                       "the live runs or one run's steps as JSON lines"))
+    p.set_defaults(fn=cmd_status)
 
     p = sub.add_parser("install", help="run arete serve at login: one launchd agent on a Mac, one systemd user unit on "
                                        "Linux; retires the old per loop agents")
