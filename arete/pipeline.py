@@ -2450,16 +2450,17 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
         status, why, _ = _fail(run, e.why, detail=f"{e.detail}\n\n### PRs\n\n{prs}\n\nReview comments on a PR "
                                                   "start a revision, as on any arete PR.")
         return status, why, record_prs(run, branch, with_prs)
-    outcome += f", CI: {ci_result}"
     run.enter("pr")
+    ready = opened + ready_pushed(run, pushed, ci_stopped, draft_why)
+    ci_result = automerge(b, approval, draft_why, verified, review, ready, automerge_about(t, build_summary),
+                          slot=slot, branch=branch, goal=goal, plan=plan_to_review) or ci_result
+    outcome += f", CI: {ci_result}"
     if run.feedback:
         answer_feedback(run, replies, "Done in the latest push.")
         run.say(f"Revised for your review.\n\n{pr_report}\n\nCI: {ci_result}.")
     else:
         run.say(f"PRs for this ticket:\n\n{pr_status_lines(with_prs, opened, pushed)}\n\nCI: {ci_result}."
                 + published_note(draft_why, verified, opened, drafted))
-    automerge(b, approval, draft_why, verified, review, opened + ready_pushed(run, pushed, ci_stopped, draft_why),
-              automerge_about(t, build_summary))
     if (not run.feedback and draft_why and review.approved()
             and not ci_stopped and environment_gaps.gaps(asdict(verified))):
         run_lines.write(run.id, "classic_hold",
@@ -2535,14 +2536,44 @@ def report_body(run: Run, *, summary: str, review: Review, verified: verify.Veri
 
 
 def automerge(b: Build, approval: dict | None, draft_why: str, verified: verify.Verified, review: Review,
-              opened: list[workspace.Checkout], about: str) -> None:
+              opened: list[workspace.Checkout], about: str, *, slot: slots.RunSlot, branch: str,
+              goal: str, plan: str) -> str:
     if not opened or not automerge_allowed(b, approval, draft_why):
-        return
+        return ""
+    run = b.run
+    ci_result = ""
     for c in opened:
-        hold = try_automerge(b, c, verified, review, about)
-        if hold is None:
-            return
-        report_automerge(b.run, c, hold)
+        with slots.take_merge_lease(run, c.github, slot=slot) if len(b.checkouts) == 1 else nullcontext():
+            while True:
+                hold = try_automerge(b, c, verified, review, about, track_moved_base=True)
+                if hold is None:
+                    return ci_result
+                if not isinstance(hold, gh.MovedBaseHold):
+                    break
+                try:
+                    base_sha, hold = catch_up_target(b, c, slot)
+                    if hold:
+                        break
+                    b.catch_ups += 1
+                    verified, review = catch_up_base(b, c, branch, base_sha, goal, plan, review)
+                    note_review(run, review, verified)
+                    publish_gate_evidence(run, b.ticket, c, verified, review)
+                    current = watch_publication_ci(run, slot, [c])
+                    ci_result = current.summary()
+                    comment_catch_up_ci(run, c, ci.section([current], current.n), verified, review)
+                except CatchUpPushUnconfirmed:
+                    raise
+                except (workspace.RunFailed, RuntimeError, OSError) as e:
+                    reason = e.why if isinstance(e, workspace.RunFailed) else util.first_line(str(e), 300)
+                    hold = f"catch-up to `{c.base}` did not complete: {public_text(run, reason)}"
+                    break
+                if not current.passed:
+                    if c.lease == current.seen[0].target.sha and own_draft_state(run, c) is False:
+                        set_draft(run, c, True)
+                    hold = f"catch-up CI held: {ci_result}"
+                    break
+            report_automerge(run, c, hold)
+    return ci_result
 
 
 def automerge_allowed(b: Build, approval: dict | None, draft_why: str) -> bool:
@@ -2582,9 +2613,23 @@ def report_automerge(run: Run, c: workspace.Checkout, hold: str) -> None:
         run.log(f"automerge could not report the hold on {c.pr}: {e}")
 
 
+def catch_up_target(b: Build, c: workspace.Checkout, slot: slots.RunSlot) -> tuple[str, str]:
+    if b.catch_ups < AUTOMERGE_CATCH_UPS:
+        slot.take(b.run.log, b.run.waiting, "automerge")
+    row = gh.pr_merge_details(c.pr)
+    if hold := gh.merge_ref_hold(row, c.lease, c.base):
+        return "", hold
+    base_sha = fetch_merge_base(c) or row.get("baseRefOid")
+    if not base_sha:
+        return "", "GitHub did not report the current base commit"
+    if b.catch_ups >= AUTOMERGE_CATCH_UPS:
+        return base_sha, f"the base `{c.base}` moved to `{base_sha}` after {b.catch_ups} catch-ups"
+    return base_sha, ""
+
+
 def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
                   goal: str, plan: str, prior_review: Review, *,
-                  before_push: Callable[[str, verify.Verified, Review], None]) -> tuple[verify.Verified, Review]:
+                  before_push: Callable[[str, verify.Verified, Review], None] | None = None) -> tuple[verify.Verified, Review]:
     run = b.run
     if git(["rev-parse", "HEAD"], c.wt).strip() != c.lease or workspace.uncommitted(c.wt, tracked_only=True):
         raise workspace.RunFailed("the worktree differs from the published head")
@@ -2617,7 +2662,8 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
             raise workspace.RunFailed("the worktree changed while checking the merge")
         if hold := gh.merge_ref_hold(gh.pr_merge_details(c.pr), c.lease, c.base):
             raise workspace.RunFailed(hold)
-        before_push(head, verified, review)
+        if before_push is not None:
+            before_push(head, verified, review)
     except BaseException as error:
         retained = isinstance(error, CatchUpGateHold)
         if isinstance(error, CatchUpPathCollision):
@@ -2705,7 +2751,7 @@ def merge_hold(b: Build, c: workspace.Checkout, verified: verify.Verified, revie
         return hold
     if not jev.ready(b.cfg, [b.run.repo]):
         return "JEV risk screening is unavailable"
-    base_sha = fetch_merge_base(c) if track_moved_base else git(["rev-parse", c.origin_base], c.wt).strip()
+    base_sha = fetch_merge_base(c)
     if not has_merge_base(c, head, base_sha):
         hold = "the checked head does not contain the target base"
         return gh.MovedBaseHold(hold) if track_moved_base else hold
@@ -2949,7 +2995,7 @@ def set_draft(run: AgentRun, c: workspace.Checkout, draft: bool, by: str = "ci")
 def own_draft_state(run: AgentRun, c: workspace.Checkout) -> bool | None:
     try:
         draft, head = gh.pr_draft_and_head(c.pr)
-    except gh.GhError as e:
+    except ci.READ_ERRORS as e:
         run.log(f"pr: left {c.pr} as it is: arete could not read its state: {util.first_line(str(e), 300)}")
         return None
     if not head or not c.lease:
@@ -3057,6 +3103,20 @@ def push_ci_fix(b: Build, branch: str, caused: list[ci.Red], names: str, n: int)
 
 def ci_target(c: workspace.Checkout) -> ci.Target:
     return ci.Target(c.github, c.pr, c.pr_name, c.lease, c.base)
+
+
+def watch_publication_ci(run: Run, slot: slots.RunSlot, pushed: list[workspace.Checkout], *,
+                         reruns: dict[str, list[gh.WorkflowRerun]] | None = None) -> ci.Round:
+    def watch(checkout):
+        options = {} if reruns is None else {"reruns": reruns.get(checkout.github, ())}
+        return ci.compare_with_base(ci.watch(ci_target(checkout), run.log, **options), run.log)
+
+    slot.free()
+    try:
+        with run.waiting("ci"):
+            return ci.Round(1 if reruns is None else 2, [watch(c) for c in pushed])
+    finally:
+        slot.take(run.log, run.waiting)
 
 
 def unmerged_paths(wt: Path) -> list[str]:

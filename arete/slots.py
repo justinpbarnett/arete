@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager, ExitStack, nullcontext
 from dataclasses import dataclass
 from typing import TextIO
+from urllib.parse import quote
 
 from . import config, paths, record, refusals, util
 from .store import chats as chats_store
@@ -38,8 +40,12 @@ def runs_waiting_for_a_slot() -> list[dict]:
     return holding(run_store.runs_marked_running(), "slot-wait")
 
 
+def runs_waiting_for_merge_lease() -> list[dict]:
+    return holding(run_store.runs_marked_running(), "merge-wait")
+
+
 def slots_free_to_start(max_parallel: int) -> int:
-    if zte_store.activation_pending() or runs_waiting_for_a_slot():
+    if zte_store.activation_pending() or runs_waiting_for_a_slot() or runs_waiting_for_merge_lease():
         return 0
     return max_parallel - len(runs_in_slots())
 
@@ -98,6 +104,8 @@ def no_free_slot(max_parallel: int) -> str:
     if waiting := len(runs_waiting_for_a_slot()):
         return (f"{util.count(waiting, 'run')} {'waits' if waiting == 1 else 'wait'} to take a run slot back first "
                 f"(max_parallel {max_parallel})")
+    if waiting := len(runs_waiting_for_merge_lease()):
+        return f"{util.count(waiting, 'run')} {'waits' if waiting == 1 else 'wait'} for an automerge lease first"
     return f"no run slot is free (max_parallel {max_parallel})"
 
 
@@ -111,3 +119,26 @@ def admitting(*, wait: bool = True):
 
 def hold(repo: str, tid: str | None):
     return util.hold_lock(run_store.run_lock("slot", repo, tid))
+
+
+def take_merge_lease(run, github: str, *, slot: RunSlot | None = None) -> TextIO:
+    lease = util.lock_file(f"automerge-{quote(github.casefold(), safe='')}")
+    try:
+        with ExitStack() as stack:
+            with admitting():
+                if util.flock_now(lease):
+                    util.mark_holder(lease, os.getpid())
+                    return lease
+                stack.enter_context(util.hold_lock(run_store.run_lock("merge-wait", run.repo.name, run.tid)))
+                resume = slot if slot is not None and slot.held else None
+                if resume is not None:
+                    resume.free()
+            with run.waiting("slot"):
+                run.log(f"automerge: waiting for the merge lease for {github}, ahead of new runs")
+                util.take_lock(lease, wait=True)
+            if resume is not None:
+                resume.take(run.log, run.waiting, "automerge")
+        return lease
+    except BaseException:
+        lease.close()
+        raise
