@@ -441,6 +441,14 @@ class CatchUpNeedsInput(workspace.RunFailed):
     pass
 
 
+class CatchUpGateHold(workspace.RunFailed):
+    def __init__(self, gate: str, why: str, head: str, report: str,
+                 verified: verify.Verified | None = None, review: Review | None = None):
+        super().__init__(why)
+        self.gate, self.head, self.report = gate, head, report
+        self.verified, self.review = verified, review
+
+
 class CatchUpPushUnconfirmed(workspace.RunFailed):
     def __init__(self, why: str, detail: str, *, retryable: bool):
         super().__init__(why, detail)
@@ -2266,13 +2274,14 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
             raise workspace.RunFailed("the worktree has uncommitted files after merging the moved base")
         b.require_valid_diff("catching up the moved base", from_base=True)
         if not b.check():
-            raise workspace.RunFailed("the layer's local checks failed")
+            raise CatchUpGateHold("checks", "the layer's local checks failed", head, b.report)
         if not b.layer.verify:
-            raise workspace.RunFailed("the layer has no behavioral verification configured")
+            raise CatchUpGateHold("verify", "the layer has no behavioral verification configured", head, b.report)
         verified = check_in_use(b, goal, b.build_summary)
         review = _review(b, plan, verified, step=b.next_step("review"))
-        if hold := merge_evidence_hold(b, c, verified, review, head):
-            raise workspace.RunFailed(hold)
+        if problem := merge_evidence_problem(b, c, verified, review, head):
+            gate, why = problem
+            raise CatchUpGateHold(gate, why, head, b.report, verified, review)
         if git(["rev-parse", "HEAD"], c.wt).strip() != head or workspace.uncommitted(c.wt):
             raise workspace.RunFailed("the worktree changed while checking the merge")
         if hold := gh.merge_ref_hold(gh.pr_merge_details(c.pr), c.lease, c.base):
@@ -2332,19 +2341,25 @@ def push_caught_up_head(b: Build, c: workspace.Checkout, branch: str, head: str)
 
 
 def merge_evidence_hold(b: Build, c: workspace.Checkout, verified: verify.Verified, review: Review, head: str) -> str:
+    problem = merge_evidence_problem(b, c, verified, review, head)
+    return problem[1] if problem else ""
+
+
+def merge_evidence_problem(b: Build, c: workspace.Checkout, verified: verify.Verified,
+                           review: Review, head: str) -> tuple[str, str] | None:
     if verified.verdict != "pass" or not verified.finished or not verified.checks or verified.failed_checks:
-        return "native behavioral verification did not pass"
+        return "verify", "native behavioral verification did not pass"
     if not head:
-        return "this run has no published head to verify"
+        return "verify", "this run has no published head to verify"
     tree = git(["rev-parse", f"{head}^{{tree}}"], c.wt).strip()
     trees = {c.prefix: tree}
     if not tree or verified.native_trees != trees:
-        return "there is no native behavioral pass for the published tree"
+        return "verify", "there is no native behavioral pass for the published tree"
     if not review.approved() or review.trees != trees:
-        return "the published tree lacks a current approving review"
+        return "review", "the published tree lacks a current approving review"
     if not b.layer.checks or b.checked.get("tree") != tree or b.checked.get("commands") != b.layer.checks:
-        return "the published tree lacks the full local check result"
-    return ""
+        return "checks", "the published tree lacks the full local check result"
+    return None
 
 
 def merge_hold(b: Build, c: workspace.Checkout, verified: verify.Verified, review: Review, about: str, *,
@@ -3077,6 +3092,27 @@ def publish_ci(run: AgentRun, t: tracker.Ticket, pushed: list[workspace.Checkout
             gh.pr_edit_body(c.pr, public_text(run, ci.with_section(text, ci_section)), link=kept)
         except gh.GhError as e:
             run.log(f"ci: could not write the CI section on {c.pr}: {util.first_line(str(e), 300)}")
+
+
+def publish_gate_evidence(run: Run, t: tracker.Ticket, c: workspace.Checkout,
+                          verified: verify.Verified | None, review: Review | None, *, held: str = "") -> None:
+    checked = verified.markdown() if verified is not None else "Verification did not run."
+    if held:
+        checked = f"{held}\n\n{checked}"
+    sections = ((CHECKED_IN_USE_HEADING, f"{CHECKED_IN_USE_HEADING}\n\n{checked}"),
+                ("## Review", review.markdown() if review is not None else "## Review\n\nReview did not run."))
+    links = (run.tracker.pr_link(t, whole=True), run.tracker.pr_link(t, whole=False))
+    try:
+        kept, body = gh.split_link(gh.pr_body(c.pr), links)
+        for heading, section in sections:
+            pattern = re.compile(rf"^{re.escape(heading)}\n.*?(?=^## |\Z)", re.M | re.S)
+            if pattern.search(body):
+                body = pattern.sub(lambda _: f"{section.rstrip()}\n\n", body, count=1)
+            else:
+                body = f"{body.rstrip()}\n\n{section}"
+        gh.pr_edit_body(c.pr, public_text(run, body.rstrip()), link=kept)
+    except gh.GhError as e:
+        run.log(f"automerge: could not update gate evidence in {c.pr}: {util.first_line(str(e), 300)}")
 
 
 def comment_catch_up_ci(run: AgentRun, c: workspace.Checkout, ci_section: str,

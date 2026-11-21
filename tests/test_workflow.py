@@ -25,9 +25,10 @@ from unittest import mock
 from adws import single_worker
 from arete import (
     api_check, ci, config, diffguard, evals, factory, flows, gh, jev, journeys, loop_run, mergecheck, miner,
-    orchestration, owner_asks, paths, pipeline, sandbox, serve, tracker, util, verify, workspace,
+    orchestration, outcomes, owner_asks, paths, pipeline, runlimits, sandbox, serve, tracker, util, verify, workspace,
 )
 from arete.agent import NO_SESSION, Result
+from arete.orchestration_api import OPERATIONS
 from arete.review import Review
 from arete.store import db, orchestration as ledger
 from tests.parallel import stack_env
@@ -366,6 +367,245 @@ class PendingBaseMergePublicationTests(PublicationFixture):
         self.assertEqual(self.git("show", "HEAD:file.txt"), "implementation")
 
 
+class CatchUpRepairTests(PublicationFixture):
+    def prepare_publication(self, gate, *, spent=False):
+        c, b, controller = self.checkout, self.build, self.controller
+        branch = "arete/7-edit-fixture"
+        self.git("branch", branch)
+        incoming = self.root / "incoming.txt"
+        incoming.write_text("new base\n")
+        self.git("add", "incoming.txt")
+        self.commit("base moved")
+        self.base = self.git("rev-parse", "HEAD")
+        self.git("switch", "-q", branch)
+        self.file.write_text("implementation\n")
+        repo = config.Repo("fixture", self.root, github=c.github, parts=[config.Part("", c.github)])
+        b.layer.trust_level, b.layer.verify, b.layer.checks = "automerge", config.Verify(), {"local": "check"}
+        job = self.publication_job(repo, branch, verified=verify.Verified("pass"))
+        state = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        self.enterContext(mock.patch.multiple(paths, STATE_DIR=state, DB_FILE=state / "arete.db",
+                                             RUNS_DIR=state / "runs", LOCKS_DIR=state / "locks",
+                                             WORKTREES_DIR=state / "worktrees", LOG_DIR=state / "logs"))
+        db.migrate()
+        rid = pipeline.record.start("pipeline", repo=repo.name, issue="7")
+        folder = paths.RUNS_DIR / rid
+        folder.mkdir(parents=True)
+        run = pipeline.Run(rid, repo, folder, tracker=tracker.GitHubTracker(repo), tid="7",
+                           path="orchestrate", layer=b.layer, workspace=(self.root, [c]))
+        controller.run = job.run = b.run = run
+        self.enterContext(mock.patch.object(run, "log"))
+        run.budget = runlimits.Budget(run, runlimits.Policy(max_repair_cycles=1), "")
+        if spent:
+            run.budget.charge("earlier_worker", "review_repair")
+        self.transition.return_value = mock.DEFAULT
+        del controller.persist
+        controller.policy = config.Orchestration()
+        controller.lease = ledger.acquire(run.id, "", controller.data)
+        controller.catalog.route.side_effect = lambda key, *_: SimpleNamespace(step=key, runner="codex")
+        controller.catalog.add_context.side_effect = controller.catalog.context.__setitem__
+        controller.selected = mock.Mock(return_value=nullcontext())
+        self.head, self.body, self.draft, self.merged, self.ticket_open = "", "", False, False, True
+        self.pushes, self.ci_heads, self.labels, self.comments = [], [], set(), []
+        self.message = {"checks": "local check output from the merged base",
+                        "verify": "verification reproduced the bug on the merged base",
+                        "review": "review found a blocker specific to the merged base"}[gate]
+
+        def holds():
+            return incoming.exists() and self.file.read_text() == "implementation\n"
+
+        def check(*_, **__):
+            return (False, self.message) if gate == "checks" and holds() else (True, "local checks passed")
+
+        def verification(*_):
+            failed = gate == "verify" and holds()
+            summary = self.message if failed else "verified with the new base" if incoming.exists() else "pre-catch-up verification"
+            return verify.Verified("fail" if failed else "pass", summary, checks=[
+                {"what": "fixture behavior", "how": "read fixture", "saw": summary, "passed": not failed}],
+                native_trees=pipeline.verification_trees(b))
+
+        def review(*_, **__):
+            if gate == "review" and holds():
+                result = {"verdict": "request_changes", "summary": "catch-up review holds", "problems": [
+                    {"file": "file.txt", "severity": "blocker", "category": "issue", "problem": self.message}]}
+            else:
+                result = {"verdict": "approve", "summary": "approved on the new base" if incoming.exists()
+                          else "pre-catch-up review"}
+            return Review.stored({**result, "trees": pipeline.verification_trees(b)})
+
+        def git(args, cwd, **kw):
+            if args[0] != "push":
+                return util.git(args, cwd, **kw)
+            self.head = self.git("rev-parse", "HEAD")
+            self.pushes.append(self.head)
+            return ""
+
+        def ci_watch(target, _log):
+            if not self.ci_heads:
+                self.git("update-ref", c.origin_base, self.base)
+            self.ci_heads.append(target.sha)
+            return ci.Watched(target, {})
+
+        def edit_body(_url, body, *, link):
+            self.body = gh.outgoing(body, link)
+
+        def create_pr(*args, link, **_):
+            url = "https://github.com/fixture/repo/pull/7"
+            edit_body(url, args[4] + "\n\n## Owner note\n\nKeep this.", link=link)
+            return url
+
+        def merge(_repo, _number, head, _base, base_sha, **_):
+            self.assertEqual(head, self.head)
+            self.assertEqual(base_sha, self.git("merge-base", self.base, head))
+            self.assertTrue(self.body.startswith("Closes #7\n"))
+            self.merged = True
+            self.ticket_open = False
+            return ""
+
+        def label(_repo, _number, add, remove):
+            self.labels.difference_update(remove)
+            self.labels.update(add)
+
+        patches = {
+            pipeline: dict(git=mock.Mock(side_effect=git), run_checks=mock.Mock(side_effect=check),
+                           check_in_use=mock.Mock(side_effect=verification), _review=mock.Mock(side_effect=review),
+                           release_workspace=mock.DEFAULT),
+            workspace: dict(fetch=mock.DEFAULT, remote_head=mock.Mock(side_effect=lambda *_: self.head)),
+            runlimits: dict(branch_head=mock.Mock(side_effect=lambda *_: self.head)),
+            ci: dict(watch=mock.Mock(side_effect=ci_watch)),
+            jev: dict(ready=mock.Mock(return_value=True), risk=mock.Mock(return_value=SimpleNamespace(hold=""))),
+            gh: dict(open_pr_url=mock.Mock(return_value=""), pr_create=mock.Mock(side_effect=create_pr),
+                     pr_merge_details=mock.Mock(side_effect=lambda _: {"state": "OPEN", "isDraft": self.draft,
+                         "headRefOid": self.head, "baseRefName": "main", "baseRefOid": self.base}),
+                     pr_body=mock.Mock(side_effect=lambda _: self.body), pr_edit_body=mock.Mock(side_effect=edit_body),
+                     pr_comment=mock.DEFAULT, find_own_pr_comment=mock.Mock(return_value=None),
+                     pr_set_draft=mock.Mock(side_effect=lambda _, draft: setattr(self, "draft", draft)),
+                     pr_draft_and_head=mock.Mock(side_effect=lambda _: (self.draft, self.head)),
+                     merge_readiness=mock.Mock(return_value=("", "")), pr_merge_auto=mock.Mock(side_effect=merge),
+                     issue_labels=mock.Mock(side_effect=label), issue_comment=mock.Mock(
+                         side_effect=lambda _repo, _number, body: self.comments.append(body)),
+                     issue=mock.Mock(return_value={"labels": []})),
+        }
+        for module, replacements in patches.items():
+            self.enterContext(mock.patch.multiple(module, **replacements))
+        self.gates()
+
+    def action_result(self, op, **args):
+        controller = self.controller
+        turn = ledger.begin(controller.lease, {}, 100)
+        version = ledger.snapshot(controller.lease)["version"]
+        action = ledger.accept(controller.lease, turn, version,
+                               {"calls": [{"op": op, "args": OPERATIONS[op].arguments(args)}]}, 100)[0]
+        controller.dispatch(action)
+        return ledger.actions(controller.lease)[-1]
+
+    def gates(self):
+        self.action_result("checks.run")
+        self.action_result("verification.run", route_id="verify", effort="low")
+        self.action_result("review.run", route_id="review", effort="low")
+
+    def publish_held(self, gate):
+        controller = self.controller
+        action = self.action_result("publication.request")
+        self.assertEqual(action["state"], "failed")
+        self.assertEqual(action["result"]["failures"], orchestration.CATCH_UP_FAILURE)
+        self.assertIn(self.message, controller.data["catch_up_hold"]["feedback"])
+        self.assertEqual(controller.data["evidence"], {})
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.head)
+        self.assertFalse((self.root / "incoming.txt").exists())
+        self.assertIn(f"held on {gate}", self.body)
+        self.assertIn("Closes #7", self.body)
+        self.assertIn("Keep this.", self.body)
+        self.assertNotIn("pre-catch-up review", self.body)
+        self.assertNotIn("pre-catch-up verification", self.body)
+        self.assertEqual(self.build.report, "local checks passed")
+
+    def repair_and_publish(self, gate, role, *, last_catch_up=False):
+        self.prepare_publication(gate)
+        if last_catch_up:
+            self.build.catch_ups = pipeline.AUTOMERGE_CATCH_UPS - 1
+        self.publish_held(gate)
+        self.assertIn("**request_changes**" if gate == "review" else "**fail**", self.body)
+        controller = self.controller
+        self.assertIsNone(controller.ending)
+        controller.recover()
+        self.assertEqual(controller.data["evidence"], {})
+        setting = SimpleNamespace(step="build", runner="codex", model="test", provider="", effort="low", tools=("Edit",))
+        controller.catalog.worker.return_value = setting, "delegate", True
+        worker = mock.Mock(pid=123, identity=456, step="worker")
+        worker.proc.poll.return_value = None
+        worker.receive.return_value = [{"event": "launch", "step": "worker", "role": role, "route": ""},
+                                       {"event": "result", "ok": True, "text": "Repaired"}]
+        worker.allow.side_effect = lambda _: self.file.write_text("repaired implementation\n")
+        request = mock.Mock()
+        repair_setting = SimpleNamespace(**{**vars(setting), "step": role})
+        with (mock.patch.object(pipeline.steps, "resolve", return_value=repair_setting),
+              mock.patch.object(orchestration.delegation, "Worker", return_value=worker),
+              mock.patch.object(orchestration.delegation, "request", request),
+              mock.patch.object(workspace, "note_made"), mock.patch.object(workspace, "kept_work", return_value="")):
+            launched = self.action_result("worker.start", goal="Repair the catch-up", route_id="build", effort="low")
+            self.assertEqual(launched["result"]["role"], role)
+            self.assertIs(request.call_args.args[3], repair_setting)
+            self.assertIn(self.message, request.call_args.args[2])
+            controller.collect()
+        self.assertEqual(controller.run.budget.repair_calls, 1)
+        self.gates()
+        delivered = self.action_result("publication.request")
+        if last_catch_up:
+            self.assertEqual(delivered["state"], "failed")
+            self.assertEqual(controller.ending[0], "failed")
+            self.assertEqual(self.labels, {"agent:failed"})
+            self.assertTrue(self.draft)
+            self.assertFalse(self.merged)
+            self.assertEqual(len(self.pushes), 2)
+            self.assertEqual(self.build.catch_ups, pipeline.AUTOMERGE_CATCH_UPS)
+            self.assertIn(f"after {pipeline.AUTOMERGE_CATCH_UPS} catch-ups", self.comments[-1])
+            self.assertIn("held on review", self.comments[-1])
+            return
+        self.assertEqual(delivered["state"], "succeeded")
+        self.assertEqual(controller.ending[0], "pr")
+        self.assertTrue(self.merged)
+        self.assertFalse(self.ticket_open)
+        self.assertEqual(self.build.catch_ups, 2)
+        self.assertEqual(len(self.pushes), 3)
+        self.assertEqual(self.ci_heads, self.pushes)
+        self.assertEqual(self.git("show", "HEAD:file.txt"), "repaired implementation")
+        self.assertIn("**approve**: approved on the new base", self.body)
+        self.assertIn("**pass**: verified with the new base", self.body)
+        self.assertNotIn(self.message, self.body)
+        self.assertNotIn("merge_held", controller.run.facts)
+        status, summary, url = controller.ending
+        pipeline.record.settle(controller.run.id, status, summary=summary, pr_url=url)
+        with (mock.patch.object(outcomes, "PR_SEEN_FILE", paths.STATE_DIR / "pr_seen.json"),
+              mock.patch.object(outcomes, "record_feedback"),
+              mock.patch.object(gh, "pr_view", return_value={"state": "MERGED", "mergedAt": util.iso()})):
+            outcomes.sync_outcomes(config.Config())
+        self.assertEqual(pipeline.run_store.run_get(controller.run.id)["status"], "merged")
+
+    def test_review_hold_repairs_and_automerge_closes_ticket(self):
+        self.repair_and_publish("review", "review_repair")
+
+    def test_verify_hold_repairs_and_automerge_closes_ticket(self):
+        self.repair_and_publish("verify", "check_repair")
+
+    def test_repair_keeps_the_per_run_catch_up_limit(self):
+        self.repair_and_publish("review", "review_repair", last_catch_up=True)
+
+    def test_checks_hold_with_no_repair_cycles_parks_and_drafts(self):
+        self.prepare_publication("checks", spent=True)
+        self.publish_held("checks")
+        self.assertEqual(self.controller.ending[0], "failed")
+        self.assertEqual(self.labels, {"agent:failed"})
+        self.assertTrue(self.draft)
+        self.assertFalse(self.merged)
+        self.assertEqual(len(self.pushes), 1)
+        self.assertEqual(self.controller.run.budget.repair_calls, 1)
+        self.assertIn("held on checks", self.comments[-1])
+        self.assertIn("local checks failed", self.comments[-1])
+        self.assertIn("repair cycles", self.comments[-1])
+        self.assertIn("Verification did not run.", self.body)
+        self.assertIn("Review did not run.", self.body)
+
+
 class MovedBasePublicationTests(unittest.TestCase):
     def controller(self):
         root = Path(".")
@@ -455,6 +695,7 @@ class MovedBasePublicationTests(unittest.TestCase):
               mock.patch.object(gh, "branch_sha", return_value="moved-base"),
               mock.patch.object(gh, "gh_json", side_effect=transport),
               mock.patch.object(pipeline, "publish_ci") as report,
+              mock.patch.object(pipeline, "publish_gate_evidence"),
               mock.patch.object(controller, "ci_failures", return_value="failed check logs"),
               mock.patch.object(pipeline, "set_draft") as draft,
               mock.patch.object(gh, "find_own_pr_comment", return_value=None),
@@ -550,7 +791,8 @@ class MovedBasePublicationTests(unittest.TestCase):
                                           write_lineage_event=mock.DEFAULT, quiescent=mock.DEFAULT, stamp=mock.DEFAULT),
                       mock.patch.object(orchestration.run_lines, "write"),
                       mock.patch.multiple(pipeline, checked_layer=mock.Mock(return_value=SimpleNamespace(
-                          checks={"local": "check"})), check_script=mock.Mock(return_value=([], [])), note_prs=mock.DEFAULT),
+                          checks={"local": "check"})), check_script=mock.Mock(return_value=([], [])), note_prs=mock.DEFAULT,
+                                          publish_gate_evidence=mock.DEFAULT),
                       mock.patch.object(resumed, "publication_ci", side_effect=ci_gate) as watched,
                       mock.patch.object(pipeline, "catch_up_base") as merge,
                       mock.patch.multiple(workspace, uncommitted=mock.Mock(return_value=[]),
