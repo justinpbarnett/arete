@@ -851,8 +851,11 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
         return end_as("stop", "quiet", status="failed", summary=f"could not read {run.ref}: {e}")
     opened(run, t)
     mended = run_store.run_get(run.repairs) or {} if run.repairs else {}
-    if run.feedback:
-        if closed := run.feedback_closure():
+    feedback_prs = run.feedback_prs
+    if not (feedback_prs or run.repairs or run.alone) and run.path in ("feature", "patch"):
+        feedback_prs = list(dict.fromkeys(row["pr_url"] for row in pipeline.pending_feedback(repo.name, run.tid)))
+    if feedback_prs:
+        if closed := run.feedback_closure(feedback_prs):
             return end_as("stop", "quiet", status="noop", summary=closed)
     elif run.repairs:
         urls = str(mended.get("pr_url") or "").split()

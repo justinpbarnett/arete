@@ -612,8 +612,9 @@ class Run(AgentRun):
     def feedback_prs(self) -> list[str]:
         return list(dict.fromkeys(f["pr_url"] for f in self.feedback))
 
-    def feedback_closure(self) -> str:
-        self.closed_feedback_prs = tuple(url for url in self.feedback_prs if gh.pr_view(url).get("state") != "OPEN")
+    def feedback_closure(self, prs: list[str] | None = None) -> str:
+        prs = self.feedback_prs if prs is None else prs
+        self.closed_feedback_prs = tuple(url for url in prs if gh.pr_view(url).get("state") != "OPEN")
         if self.closed_feedback_prs:
             return f"the PR closed before arete could revise it: {', '.join(self.closed_feedback_prs)}"
         return ""
@@ -1363,11 +1364,11 @@ def park_run(run: Run, reason: str) -> tuple[str, str, str]:
 
 def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: bool, flow: factory.Flow | None,
                *, echo_end: bool = True) -> None:
-    if restarting and status in ("skipped", "noop") and not run.feedback:
+    if restarting and status in ("skipped", "noop") and not (run.feedback or run.closed_feedback_prs):
         run.enter("failed")
         run.say(f"I did not restart this after the interruption: {summary}. Remove "
                 f"`{run.tracker.label_name('failed')}` to retry.")
-    if run.feedback and not run.dry_run and not run.alone:
+    if run.feedback and not (run.dry_run or run.alone or run.claim_feedback_on_revise):
         if status == "noop" and run.closed_feedback_prs:
             insights_store.release_feedback(run.id, closed_prs=run.closed_feedback_prs)
         elif run.step_started or (flow and flow.work_started):
