@@ -758,22 +758,42 @@ class Staged(diffguard.Diff):
     patch: str = ""
     changed: list[workspace.Checkout] = field(default_factory=list)
     merged: list[workspace.Checkout] = field(default_factory=list)
+    bases: dict[str, str] = field(default_factory=dict)
 
     @property
     def empty(self) -> bool:
         return not self.files and not self.merged
 
 
+def base_of_head(c: workspace.Checkout, head: str = "HEAD", *, check: bool = True) -> str:
+    return git(["merge-base", c.origin_base, head], c.wt, check=check).strip()
+
+
+def has_unpublished_base(c: workspace.Checkout) -> bool:
+    published = c.publication_baseline or c.onto
+    if not published:
+        return False
+    base = base_of_head(c, check=False)
+    return bool(base) and git(["merge-base", base, published], c.wt, check=False).strip() not in ("", base)
+
+
+def comparison_label(c: workspace.Checkout, against: str, from_base: bool) -> str:
+    sha = git(["rev-parse", "--short=7", against], c.wt).strip()
+    name = c.base if from_base else ("HEAD" if against == "HEAD" else "the starting commit")
+    return f"{name} at {sha}"
+
+
 def stage(checkouts: list[workspace.Checkout], deny: list[str], from_base: bool = False) -> Staged:
     out = Staged()
     for c in checkouts:
         workspace.drop_untracked_bytecode(c.wt)
-        against = git(["merge-base", c.origin_base, "HEAD"], c.wt).strip() if from_base else (c.onto or "HEAD")
+        against = base_of_head(c) if from_base else (c.onto or "HEAD")
         diff = diffguard.stage(c.wt, deny, against=against, prefix=c.prefix)
         merged = pending_merge(c)
         if merged and not from_base:
             brought = diffguard.between(c.wt, c.lease, c.merge, prefix=c.prefix).counts
             diff.counts = {name: 0 for name in brought} | diff.counts
+        out.bases[c.github] = against
         if merged:
             out.merged.append(c)
         elif not diff.counts:
@@ -806,7 +826,7 @@ def checkout_patch(c: workspace.Checkout, locks: list[str], *revs: str) -> str:
     return patch + (f"\n(lockfile changes not shown: {', '.join(locks)})\n" if locks else "")
 
 
-def lines_by_file(staged: Staged, top: int = 12) -> str:
+def lines_by_file(staged: diffguard.Diff, top: int = 12) -> str:
     rows = sorted(((name, n) for name, n in staged.counts.items() if n), key=lambda r: (-r[1], r[0]))
     out = [f"- `{name}`: {n}" for name, n in rows[:top]]
     if len(rows) > top:
@@ -1044,15 +1064,34 @@ class Build(TicketWork):
     def validate_diff(self, staged: Staged, after: str, planned: str = "", *, from_base: bool | None = None) -> None:
         if staged.empty:
             raise workspace.RunFailed(f"{after} undid every change")
-        whole_diff = self.from_base if from_base is None else from_base
-        earlier = 0 if whole_diff else self.committed_lines + sum(c.resolved_lines for c in self.checkouts)
-        why = staged.refusal(self.layer.max_diff_lines, earlier=earlier)
         if staged.denied:
-            raise workspace.RunFailed(f"{after} {why}")
-        if why:
+            raise workspace.RunFailed(f"{after} {staged.refusal(self.layer.max_diff_lines)}")
+        whole_diff = self.from_base if from_base is None else from_base
+        counts, bases = staged, staged.bases
+        earlier = 0
+        if any(has_unpublished_base(c) for c in self.checkouts):
+            whole_diff = True
+            counts, bases, total = diffguard.Diff(), {}, 0
+            for c in self.checkouts:
+                against = bases[c.github] = base_of_head(c)
+                diff = diffguard.between(c.wt, "--cached", against, prefix=c.prefix, moves=True)
+                counts += diff
+                total += diff.lines
+        else:
+            if not whole_diff:
+                earlier = self.committed_lines + sum(c.resolved_lines for c in self.checkouts)
+            total = staged.lines + earlier
+        limit = self.layer.max_diff_lines
+        if total > limit:
+            comparisons = []
+            for c in self.checkouts:
+                label = comparison_label(c, bases[c.github], whole_diff)
+                comparisons.append(f"{c.github} {label}" if len(bases) > 1 else label)
+            against = ", ".join(comparisons)
+            why = f"the diff is {total} lines against {against}, over the {limit} line limit"
             pushed = f"\n- pushed earlier in this run: {earlier}" if earlier else ""
             raise workspace.RunFailed(f"after {after} {why}{planned}; split the work",
-                            f"### Lines changed by file\n\n{lines_by_file(staged)}{pushed}")
+                            f"### Lines changed by file\n\n{lines_by_file(counts)}{pushed}")
 
     def push(self, branch: str, message: str, *, before_push: Callable[[workspace.Checkout], str] | None = None) -> None:
         self.run.tracker.pr_link(self.ticket, whole=not self.left_for_a_person)
