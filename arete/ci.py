@@ -7,7 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import gh, util
+from . import _test_stacks, gh, util
 
 WAIT_SECONDS = 30 * 60
 FIRST_CHECK_SECONDS = 3 * 60
@@ -15,7 +15,11 @@ SETTLE_SECONDS = 60
 POLL_SECONDS = 30
 CONFLICT_SNAPSHOT_TIMEOUT = 5
 LOG_EXCERPT_CHARS = 8000
+TIMEOUT_EXCERPT_CHARS = 6000
 LOG_TIMESTAMP = re.compile(r"^\d{4}-\d\d-\d\dT[\d:.]+Z ", re.MULTILINE)
+TEST_TIMEOUT = re.compile(rf"^{re.escape(_test_stacks.REPORT_START)}\r?\n(.*?)\r?\n"
+                          rf"^{re.escape(_test_stacks.REPORT_END)}\r?$", re.DOTALL | re.MULTILINE)
+PYTHON_STACK = re.compile(r"^(Python (?:class|child) stack \(PID \d+\))\r?\n", re.MULTILINE)
 SECTION_START, SECTION_END = "<!-- arete:ci -->", "<!-- /arete:ci -->"
 SECTION = re.compile(rf"\n*^{re.escape(SECTION_START)}\r?$.*?^{re.escape(SECTION_END)}\r?$", re.DOTALL | re.MULTILINE)
 STOPPED = "Arete stopped:"
@@ -231,7 +235,7 @@ def failure_note(r: Red, log_file: Path) -> str:
     except gh.GhError as e:
         return "\n".join([*lines, f"- Arete could not read its log: {util.first_line(str(e), 300)}"])
     log_file.write_text(text)
-    return "\n".join([*lines, f"- Full log: `{log_file}`", "", "The log up to its last error:", "", "````",
+    return "\n".join([*lines, f"- Full log: `{log_file}`", "", "Log excerpt:", "", "````",
                       excerpt(text), "````"])
 
 
@@ -251,12 +255,31 @@ def clip(text: str, max_chars: int) -> str:
     return cut.rsplit(" ", 1)[0] + " (cut)"
 
 
+def timeout_excerpt(report: str) -> str:
+    identity, *stacks = PYTHON_STACK.split(report)
+    lines = [identity.rstrip()]
+    for heading, stack in zip(stacks[::2], stacks[1::2], strict=True):
+        thread = stack.replace("\r\n", "\n").partition("\n\n")[0]
+        lines.extend([heading, *(util.both_ends(line, 220) for line in thread.splitlines()[:7])])
+    return "\n".join(lines)
+
+
 def excerpt(log_text: str) -> str:
+    if len(log_text) <= LOG_EXCERPT_CHARS:
+        return log_text
     text = LOG_TIMESTAMP.sub("", log_text)
     last_error = text.rfind("##[error]")
     if last_error >= 0:
         line_end = text.find("\n", last_error)
         text = text[:line_end] if line_end >= 0 else text
+    if len(text) <= LOG_EXCERPT_CHARS:
+        return text
+    if reports := TEST_TIMEOUT.findall(text):
+        summary = "\n\n".join(map(timeout_excerpt, reports))
+        if len(summary) > TIMEOUT_EXCERPT_CHARS:
+            summary = summary[:TIMEOUT_EXCERPT_CHARS - 4].rsplit("\n", 1)[0] + "\n..."
+        remaining = LOG_EXCERPT_CHARS - len(summary) - 6
+        return summary + "\n\n" + util.tail(TEST_TIMEOUT.sub("", text).strip(), remaining)
     return util.tail(text, LOG_EXCERPT_CHARS)
 
 

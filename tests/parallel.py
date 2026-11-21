@@ -1,7 +1,9 @@
 import argparse
+import fcntl
 import json
 import math
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -12,11 +14,40 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from importlib import import_module
 from unittest.loader import _FailedTest
 
 TAIL = 4000
 DEFAULT_CLASS_TIMEOUT = 10
+STACK_GRACE = 1
 HISTORY = os.path.join(tempfile.gettempdir(), "arete-parallel-durations.json")
+TESTS = os.path.dirname(os.path.abspath(__file__))
+STACK_SITE = os.path.join(TESTS, "_parallel_site")
+
+if __spec__ is None:
+    sys.path.insert(0, os.path.dirname(TESTS))
+_test_stacks = import_module("arete._test_stacks")
+THREAD = re.compile(r"(?:Current thread|Thread) (0x[0-9a-f]+) \(most recent call first\):")
+
+
+def stack_env(env):
+    if not env.get(_test_stacks.PREFIX_ENV):
+        return env
+    pythonpath = env.get("PYTHONPATH")
+    paths = pythonpath.split(os.pathsep) if pythonpath else []
+    if STACK_SITE in paths:
+        return env
+    return {**env, "PYTHONPATH": os.pathsep.join([STACK_SITE, *paths])}
+
+
+def main_thread_first(stack, ident):
+    threads = stack.split("\n\n")
+    for index, thread in enumerate(threads):
+        heading = THREAD.fullmatch(thread.partition("\n")[0])
+        if heading and int(heading[1], 16) == ident:
+            threads.insert(0, threads.pop(index))
+            break
+    return "\n\n".join(threads)
 
 
 def flatten(suite):
@@ -98,23 +129,78 @@ class Runner:
             handle.seek(-TAIL, os.SEEK_END)
             return head + f"\n... full output: {path} ...\n" + handle.read().decode(errors="replace")
 
+    def request_stacks(self, prefix):
+        deadline = time.monotonic() + STACK_GRACE
+        requested = []
+        try:
+            entries = os.scandir(self.folder)
+        except OSError:
+            return requested
+        with entries:
+            for entry in entries:
+                if self.stopping or time.monotonic() >= deadline:
+                    break
+                if not entry.name.startswith(prefix):
+                    continue
+                suffix = entry.name[len(prefix):]
+                if not suffix.isascii() or not suffix.isdecimal():
+                    continue
+                pid = int(suffix)
+                if pid <= 1:
+                    continue
+                try:
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    with open(entry.path, "rb") as handle:
+                        fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    # An exec can reset the handler after this check. Unhandled SIGURG is ignored.
+                    try:
+                        os.kill(pid, _test_stacks.DUMP_SIGNAL)
+                    except OSError:
+                        continue
+                    requested.append((pid, entry.path))
+                except OSError:
+                    continue
+        if requested:
+            time.sleep(max(0, deadline - time.monotonic()))
+        return requested
+
+    def stack_output(self, requested, worker):
+        dumps = []
+        for pid, path in sorted(requested, key=lambda item: (item[0] != worker, item[0])):
+            try:
+                with open(path, "rb") as handle:
+                    size = os.fstat(handle.fileno()).st_size
+                    ident, _, stack = handle.read(size).decode(errors="replace").partition("\n")
+                    stack = main_thread_first(stack.rstrip(), int(ident, 16))
+            except (OSError, ValueError):
+                continue
+            if stack:
+                role = "class" if pid == worker else "child"
+                dumps.append(f"Python {role} stack (PID {pid})\n{stack}")
+        return "\n\n".join(dumps)
+
     def child(self, item):
         index, batch = item
         result_file = os.path.join(self.folder, f"{index}.json")
         output_file = os.path.join(self.folder, f"{index}.out")
+        stack_prefix = f"{index}.stack."
+        env = stack_env({**os.environ, _test_stacks.PREFIX_ENV: os.path.join(self.folder, stack_prefix)})
         tail = ["--one", batch.identifier, "--start", self.args.start, "--result", result_file,
                 "--lifeline", str(self.lifeline)]
         command = ([sys.executable, "-m", "tests.parallel"] if __spec__ is not None else
                    [sys.executable, os.path.abspath(__file__)]) + tail
         began = time.monotonic()
         problem = None
+        timeout_report = ""
         with open(output_file, "w") as output, self.lock:
             if self.stopping:
                 return
             try:
                 process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=output,
                                            stderr=subprocess.STDOUT, start_new_session=True,
-                                           pass_fds=(self.lifeline,))
+                                           pass_fds=(self.lifeline,), env=env)
             except OSError as error:
                 process = None
                 problem = f"could not start {batch.identifier}: {error}"
@@ -122,17 +208,24 @@ class Runner:
                 self.live[process] = batch.identifier
         if process is not None:
             timeout = self.args.timeout if self.args.timeout is not None else batch.timeout
+            requested = []
             try:
                 process.wait(timeout)
                 if process.returncode:
                     problem = f"worker exited with status {process.returncode}"
             except subprocess.TimeoutExpired:
                 problem = f"class exceeded {timeout:g}s"
+                requested = self.request_stacks(stack_prefix)
             finally:
                 self.kill(process)
                 process.wait()
                 with self.lock:
                     self.live.pop(process, None)
+            if problem and problem.startswith("class exceeded "):
+                stacks = self.stack_output(requested, process.pid)
+                timeout_report = "\n".join(filter(None, (
+                    _test_stacks.REPORT_START, batch.identifier, problem, stacks, _test_stacks.REPORT_END,
+                )))
         try:
             with open(result_file) as handle:
                 report = json.load(handle)
@@ -145,13 +238,13 @@ class Runner:
         except (OSError, ValueError, KeyError, TypeError):
             report = {"ran": 0, "errors": [], "failures": [], "skipped": [], "unexpected": []}
             problem = problem or "worker exited without a complete report"
-        if problem:
+        if problem and not timeout_report:
             report["errors"].append((batch.identifier, problem))
-        report.update(seconds=time.monotonic() - began, output=self.output(output_file))
+        report.update(seconds=time.monotonic() - began, output=self.output(output_file), timeout=timeout_report)
         with self.lock:
             self.results[batch.identifier] = report
             if self.args.verbose:
-                outcome = "FAIL" if report["errors"] or report["failures"] or report["unexpected"] else "ok"
+                outcome = "FAIL" if timeout_report or report["errors"] or report["failures"] or report["unexpected"] else "ok"
                 print(f"{batch.identifier}: {report['ran']} tests, {outcome} ({report['seconds']:.2f}s)", flush=True)
 
     def run(self, tests):
@@ -204,6 +297,11 @@ class Runner:
         for identifier, report in self.results.items():
             ran += report["ran"]
             skipped += len(report["skipped"])
+            if timeout_report := report.get("timeout"):
+                failed = True
+                print(f"\n{timeout_report}")
+                if report["output"]:
+                    print(report["output"])
             for kind in ("errors", "failures", "unexpected"):
                 if not report[kind]:
                     continue
@@ -211,7 +309,7 @@ class Runner:
                 print(f"\n{identifier}: {kind}")
                 for entry in report[kind]:
                     print(entry if isinstance(entry, str) else "\n".join(entry))
-                if report["output"]:
+                if report["output"] and not timeout_report:
                     print(report["output"])
         try:
             temporary = f"{HISTORY}.{os.getpid()}.tmp"
@@ -235,7 +333,7 @@ class Runner:
 
 def main():
     parser = argparse.ArgumentParser(prog="tests.parallel")
-    parser.add_argument("-s", "--start", default=os.path.dirname(os.path.abspath(__file__)))
+    parser.add_argument("-s", "--start", default=TESTS)
     parser.add_argument("-j", "--jobs", type=int, default=4)
     parser.add_argument("--timeout", type=float, help="override the per-class deadline (default: 10 seconds unless declared)")
     parser.add_argument("-v", "--verbose", action="store_true")
