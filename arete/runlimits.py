@@ -15,6 +15,7 @@ from pathlib import Path
 
 from . import budget_legacy, gh, paths, run_lines, util
 from .store import db as foundation
+from .store import insights as insights_store
 from .store import runs as run_store
 
 IDLE_WAITS = ("limit", "slot")
@@ -339,7 +340,8 @@ idle_waits = budget_legacy.idle_waits
 class Budget:
     def __init__(self, run, policy: Policy, previous: str, ticket=None, forced: bool = False,
                  *, repair_previous: str | None = None, answered_runs: tuple[str, ...] = (),
-                 wall_deadline: float = math.inf, checkpoint_timeout: float | None = None, checkpoint_gate=None) -> None:
+                 wall_deadline: float = math.inf, checkpoint_timeout: float | None = None,
+                 checkpoint_gate=None, fixed_gaps: tuple[tuple[str, int], ...] = ()) -> None:
         self.run, self.policy, self.wall_deadline = run, policy, wall_deadline
         self.checkpoint_timeout, self.checkpoint_gate = checkpoint_timeout, checkpoint_gate
         chain = family(previous)
@@ -349,17 +351,20 @@ class Budget:
                for row in rows.values()):
             raise ValueError("the repair budget chain names a different or missing ticket run")
         current = specification(ticket) if ticket else None
-        if run.environment_release or run.preview_of:
+        if not run.dry_run and (run.environment_release or run.preview_of):
             live = {rid for rid, row in rows.items() if not row["dry_run"] and row["status"] != "dry-run"}
             chain = [rid for rid in chain if rid in live]
             repair_chain = [rid for rid in repair_chain if rid in live]
-        changed = {rid for rid in rows
-                   if forced and current and (found := recorded_specification(rid)) and found != current}
-        left = [rid for rid in chain if rid in changed]
-        answer_omitted = repair_chain if set(answered_runs).intersection(repair_chain) else []
-        self.repair_left_out = answer_omitted or [rid for rid in repair_chain if rid in changed]
+        fresh_feedback = (not run.dry_run and not run.alone and run.path == "orchestrate"
+                          and insights_store.has_fresh_feedback(run.feedback))
+        excluded = set(rows) if fresh_feedback else set()
+        if not (run.dry_run or fresh_feedback) and forced and current:
+            excluded = {rid for rid in rows if (found := recorded_specification(rid)) and found != current}
+        left = [rid for rid in chain if rid in excluded]
+        answer_omitted = repair_chain if not run.dry_run and set(answered_runs).intersection(repair_chain) else []
+        self.repair_left_out = answer_omitted or [rid for rid in repair_chain if rid in excluded]
         self.repair_parents = [rid for rid in repair_chain if rid not in self.repair_left_out]
-        left_repairs = sum(repair_count(rid) for rid in self.repair_left_out if rid in changed)
+        left_repairs = sum(repair_count(rid) for rid in self.repair_left_out if rid in excluded)
         left_seconds = sum(active_seconds(rid, rows[rid]) for rid in left)
         left_verify = sum(verification_seconds(rid, rows[rid]) for rid in left)
         self.left_out = left
@@ -396,6 +401,16 @@ class Budget:
             "repair_calls": repair_count(rid) if rid in self.repair_parents else 0,
             "estimate": row.get("measured_at") == ""
         } for rid, row in rows.items() if rid in self.parents or rid in self.repair_parents}
+        if self.repair_parents and run.environment_release and fixed_gaps and not run.dry_run:
+            reset = run_store.claim_environment_budget_resets(run.repo.name, str(run.tid), run.id, fixed_gaps)
+            if reset:
+                gaps = ', '.join(f'#{number}' for number in reset)
+                fixed = f"gap {gaps} was" if len(reset) == 1 else f"gaps {gaps} were"
+                run.log(f"budget: left out {util.count(self.prior_repairs, 'earlier repair cycle')} of "
+                        f"{util.count(len(self.repair_parents), 'earlier run')} because the environment {fixed} fixed since they ran")
+                self.prior_repairs = 0
+                for usage in self.charged.values():
+                    usage["repair_calls"] = 0
         self.persist()
         omitted = ({"repair_left_out": answer_omitted, "reason": "owner answer"} if answer_omitted else {})
         run_lines.write(run.id, "budget_chain", charged=self.charged, **omitted)
@@ -405,10 +420,12 @@ class Budget:
             for rid, v in self.charged.items()) or "no parents") +
             (f"; left out of repair accounting because of an owner answer: {', '.join(answer_omitted)}"
              if answer_omitted else ""))
-        if left:
+        if left or (fresh_feedback and self.repair_left_out):
+            reason = "the owner commented on the PR" if fresh_feedback else "the ticket specification changed"
+            omitted_runs = len(set(left) | set(self.repair_left_out)) if fresh_feedback else len(left)
             run.log(f"budget: left out {util.count(left_repairs, 'earlier repair cycle')}, "
                     f"{left_seconds / 60:.1f} run minutes and {left_verify / 60:.1f} verification minutes of "
-                    f"{util.count(len(left), 'earlier run')} because the ticket specification changed since they ran")
+                    f"{util.count(omitted_runs, 'earlier run')} because {reason} since they ran")
 
     def persist(self) -> None:
         self.checkpoint()
@@ -428,9 +445,11 @@ class Budget:
             active = max(0, now - self.started - self.idled - opened)
             verify_open = max(0, now - self.verify_started) if self.verify_started is not None else 0
             saved = {
-                "version": 1, "parents": self.parents, "left_out": self.left_out, "policy": asdict(self.policy),
-                "repair_parents": self.repair_parents, "repair_left_out": self.repair_left_out,
+                "version": 1, "parents": self.parents, "repair_parents": self.repair_parents,
+                "policy": asdict(self.policy),
                 "specification": self.specification, **self.left_out_waits(now)}
+            if not self.run.dry_run:
+                saved.update(left_out=self.left_out, repair_left_out=self.repair_left_out)
             compatibility = getattr(self, "compatibility", True)
             try:
                 with foundation.tx(timeout=self.checkpoint_timeout) as conn:
@@ -485,6 +504,8 @@ class Budget:
 
         if admit:
             admit()
+        if self.run.path == "orchestrate" and self.run.feedback and not self.run.dry_run:
+            self.check_repairs()
         if self.run_deadline() <= time.monotonic():
             raise Parked(self.reason())
         previous = signal.signal(signal.SIGALRM, expire)
@@ -583,11 +604,15 @@ class Budget:
         if role not in REPAIRS and not step.startswith(REPAIR_NAMES):
             self.checkpoint()
             return
-        if reason := self.repair_limit_reason():
-            raise Parked(reason)
+        self.check_repairs()
         self.repair_calls += 1
         self.persist()
         run_lines.write(self.run.id, "budget_repair", call=step, atom=role, used=self.prior_repairs + self.repair_calls)
+
+    def check_repairs(self) -> int:
+        if reason := self.repair_limit_reason():
+            raise Parked(reason)
+        return self.prior_repairs + self.repair_calls
 
     def park(self, reason: str, kept: dict | None = None) -> dict:
         row = run_store.run_get(self.run.id) or {}

@@ -21,6 +21,7 @@ TABLES = {
     "environment_holds": "with run",
     "environment_hold_prs": "with run",
     "environment_gap_creations": "kept",
+    "environment_budget_resets": "kept",
 }
 
 
@@ -226,6 +227,16 @@ def unclaim_environment_gap(repo: str, signature: str, day: str) -> None:
     with db() as c:
         c.execute("DELETE FROM environment_gap_creations WHERE repo = ? AND signature = ? AND day = ?",
                   (repo, signature, day))
+
+
+def claim_environment_budget_resets(repo: str, issue: str, run_id: str,
+                                    gaps: tuple[tuple[str, int], ...]) -> list[int]:
+    with tx() as c:
+        return [number for project, number in gaps if c.execute(
+            "INSERT INTO environment_budget_resets (repo, issue, gap_repo, gap_issue, run_id) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT (repo, issue, gap_repo, gap_issue) DO UPDATE SET run_id = excluded.run_id "
+            "WHERE environment_budget_resets.run_id = excluded.run_id",
+            (repo, issue, project, number, run_id)).rowcount]
 
 
 def run_lock(kind: str, repo: str | None = None, issue: int | str | None = None) -> str:
@@ -573,6 +584,10 @@ def settle(run_id: str, fields: dict, end_line: str = "", base_version=None) -> 
         settled = writes.update("runs", run_id, fields, expect=("running",), kind="run.ended", base_version=base_version)
         if not settled:
             return None
+        if settled["kind"] == "pipeline" and settled["status"] in ("interrupted", "stopped"):
+            from . import insights
+
+            insights.release_interrupted_feedback(run_id)
         if end_line:
             insert_feed(run_id, "end", end_line)
         return settled

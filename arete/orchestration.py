@@ -129,9 +129,9 @@ class Controller:
         if self.flow.refusal:
             raise factory.Refused(self.flow.refusal)
         pending_push = ledger.catch_up_push(self.data)
-        if self.run.feedback and (closed := [url for url in self.run.feedback_prs if gh.pr_view(url).get("state") != "OPEN"]):
+        if self.run.feedback and (closed := self.run.feedback_closure()):
             self.quiescent()
-            return "noop", f"the PR closed before arete could revise it: {', '.join(closed)}", ""
+            return "noop", closed, ""
         self.flow.matching = False
         run_lines.write(self.run.id, "route", continues=self.flow.continues, mode="orchestrated", protocol=PROTOCOL)
         if self.data.get("prepared"):
@@ -396,7 +396,10 @@ class Controller:
                         grant = self.run.launch_gate(message["step"], message["role"], message["route"]) \
                             if self.run.launch_gate else None
                         ledger.launched(self.lease, self.policy.max_decisions)
+                        if self.run.feedback and not self.run.step_started:
+                            run_lines.write(self.run.id, "work_start")
                         controller.allow(grant)
+                        self.run.step_started = True
                     else:
                         result, complete = message, True
                 if controller.proc.poll() is not None:
@@ -417,6 +420,7 @@ class Controller:
             self.data["error"] = error
             self.persist()
             raise workspace.RunFailed(error, recovery=result.get("recovery"))
+        self.run.step_started = True
         try:
             response = result.get("structured")
             if response is None:
@@ -511,7 +515,10 @@ class Controller:
                     seconds = grant.get("timeout") if isinstance(grant, dict) else None
                     if type(seconds) in (int, float) and seconds > 0:
                         worker.deadline = min(worker.deadline, time.monotonic() + seconds)
+                    if self.run.feedback and not self.run.step_started:
+                        run_lines.write(self.run.id, "work_start")
                     worker.allow(grant)
+                    self.run.step_started = True
                 elif message.get("event") in ("result", "error"):
                     worker.close()
                     del self.workers[key]
