@@ -164,7 +164,8 @@ def step_without_route(cfg: config.Config, repo: config.Repo, ticket: tracker.Ti
     return ""
 
 
-def tracker_reply(repo: config.Repo, tk: tracker.Tracker, tid: str, dry_run: bool, *, from_queue: bool) -> str:
+def tracker_reply(repo: config.Repo, tk: tracker.Tracker, tid: str, dry_run: bool, *,
+                  from_queue: bool, from_feedback: bool) -> str:
     newest = run_store.newest_live_whole_run(repo.name, tid)
     if not newest or newest["status"] != "needs-info":
         return ""
@@ -198,6 +199,10 @@ def tracker_reply(repo: config.Repo, tk: tracker.Tracker, tid: str, dry_run: boo
             if any(owner_asks.has_secret(a["questions"]) for a in open_asks):
                 return SECRET_ASK_REPLY
             waiting_ids = {a["id"] for a in waiting}
+            if not text and from_feedback and open_asks and (latest_ask := open_asks[-1]["asked"]):
+                text = "\n\n".join(body for row in pending_feedback(repo.name, tid)
+                                   if row["status"] == "new" and (row["created"] or "") > latest_ask
+                                   and (body := (row["body"] or "").strip()))
             if text:
                 for a in open_asks:
                     if a["id"] in waiting_ids:
@@ -320,7 +325,7 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline
     name = tracker.ticket_name(repo.name, source.ref(tid))
     if isinstance(source, tracker.GitHubTracker) and source.in_zte_queue(str(tid)):
         return "skipped"
-    reply = "" if pick.from_feedback else tracker_reply(repo, source, str(tid), dry_run, from_queue=pick.from_queue)
+    reply = tracker_reply(repo, source, str(tid), dry_run, from_queue=pick.from_queue, from_feedback=pick.from_feedback)
     answering = not reply and pipeline.answered_run(repo.name, str(tid)) is not None
     if not answering and not reply and (waiting := held_back(cfg, repo.name, going, slots)):
         if not dry_run:

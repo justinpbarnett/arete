@@ -589,10 +589,23 @@ class Job:
         return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
     def accepts(self, name: str, outcome: Outcome, kw: dict) -> bool:
+        if not self.only and name in ("revise", "repair") and not self.includes_feedback(name, outcome.data):
+            self.run.log(f"{name}: pending PR feedback was absent from the saved outcome; rerunning is required")
+            return False
         if (expected := self.policy(name, kw)) and outcome.data.get("policy") != expected:
             self.run.log(f"{name}: stored evidence used a different policy; rerunning is required")
             return False
         return True
+
+    def includes_feedback(self, name: str, data: dict) -> bool:
+        feedback = self.run.feedback
+        if not feedback:
+            return True
+        if "feedback_keys" in data:
+            known = {tuple(key) for key in data["feedback_keys"]}
+            return all(pipeline.feedback_key(row) in known for row in feedback)
+        return (name == "revise" and all(row.get("status") != "new" for row in feedback)
+                and data.get("plan") == revision_plan(pipeline.feedback_markdown(feedback)))
 
     def keeps(self, name: str, kw: dict) -> bool:
         return any(c.onto for c in self.checkouts) and (
@@ -953,6 +966,10 @@ def patch(flow: factory.Flow, tree: str) -> Outcome:
     }, session=job.run.sessions.get(BUILD, NO_SESSION))
 
 
+def revision_plan(feedback: str) -> str:
+    return f"Revise the open PR for the owner's feedback:\n\n{feedback}"
+
+
 @factory.step("revise")
 def revision(flow: factory.Flow, tree: str) -> Outcome:
     job: Job = flow.ctx
@@ -970,9 +987,10 @@ def revision(flow: factory.Flow, tree: str) -> Outcome:
     if pipeline.stage(job.checkouts, diffguard.denied_paths(layer)).empty:
         return end_as("stop", "unchanged", summary=summary, replies=replies)
     return Outcome("pass", data={
-        "plan": f"Revise the open PR for the owner's feedback:\n\n{feedback}", "left_for_a_person": left,
+        "plan": revision_plan(feedback), "left_for_a_person": left,
         "goal": ("Check each change the owner's feedback asks for, and that what the issue asks for still works.\n\n"
                  + feedback),
+        "feedback_keys": [pipeline.feedback_key(row) for row in run.feedback],
         "summary": summary, "replies": replies, "story": run.story}, session=run.sessions.get(BUILD, NO_SESSION))
 
 
@@ -998,8 +1016,14 @@ def repair(flow: factory.Flow, tree: str) -> Outcome:
         run.log(f"repair: the PR head of {github} moved since run {found.run_id}; checks, verify and review run "
                 "again on it")
     run.story.append(f"Review findings of run {found.run_id} to repair:\n{findings}")
+    feedback = pipeline.feedback_markdown(run.feedback)
+    feedback_section = f"\n\n## Owner PR feedback\n\n{feedback}" if feedback else ""
+    goal = f"{found.goal}\n\nAlso check that each of these review findings is fixed:\n\n{findings}"
+    if feedback:
+        run.story.append(feedback_section.strip())
+        goal += f"\n\nCheck that the owner's PR feedback is addressed:\n\n{feedback}"
     res = run.agent("repair", job.brief.prompt(
-        "repair", plan=found.plan, source=found.run_id, findings=findings, checks=job.checks),
+        "repair", plan=found.plan, source=found.run_id, findings=findings, feedback=feedback_section, checks=job.checks),
                     job.ws, role=REVIEW_REPAIR, allowed_tools=prompt_loader.bash_rules(job.builder_bash),
                     disallowed_tools=routing.NO_GIT_WRITES)
     if not res.ok:
@@ -1010,7 +1034,8 @@ def repair(flow: factory.Flow, tree: str) -> Outcome:
                           "unresolved")
     return Outcome("pass", data={
         "plan": found.plan, "left_for_a_person": found.left_for_a_person, "summary": res.text,
-        "goal": f"{found.goal}\n\nAlso check that each of these review findings is fixed:\n\n{findings}",
+        "goal": goal,
+        "feedback_keys": [pipeline.feedback_key(row) for row in run.feedback],
         "source": found.run_id, "evidence": found.evidence, "findings": count, "heads": heads, "moved": moved,
         "story": run.story}, session=run.sessions.get(BUILD, NO_SESSION))
 

@@ -204,8 +204,8 @@ class Controller:
             if self.job.left_for_a_person or self.run.feedback or self.run.repairs or self.flow.continues:
                 raise factory.Refused("ZTE does not inherit owner work or previous attempts")
         self.data.setdefault("goal_base", self.job.goal)
-        known = {(f.get("pr_url"), f.get("kind"), f.get("gh_id")) for f in self.data.get("feedback", [])}
-        fresh = [f for f in self.run.feedback if (f.get("pr_url"), f.get("kind"), f.get("gh_id")) not in known]
+        known = {pipeline.feedback_key(f) for f in self.data.get("feedback", [])}
+        fresh = [f for f in self.run.feedback if pipeline.feedback_key(f) not in known]
         if fresh:
             self.data.setdefault("feedback", []).extend(fresh)
             feedback = pipeline.feedback_markdown(fresh)

@@ -31,6 +31,7 @@ from arete import (
     poll,
     principals,
     record,
+    repairs,
     run_lines,
     runlimits,
     sandbox,
@@ -41,7 +42,7 @@ from arete import (
     util,
     workspace,
 )
-from arete.agent import Result
+from arete.agent import Result, Session
 from arete.orchestration_api import MAX_BYTES, OPERATIONS, PROTOCOL, Catalog, describe_operations
 from arete.store import asks as ask_store
 from arete.store import db as foundation
@@ -999,34 +1000,357 @@ class QueueTests(Isolated):
     def test_tracker_reply_to_a_structured_question_gives_a_fresh_budget_after_a_dry_run(self):
         self.check_tracker_reply_budget(structured=True, dry_run=True)
 
-    def test_poll_starts_pr_revision_with_feedback_while_text_ask_is_open(self):
-        self.cfg.replay = config.ReplayConfig(all=True)
-        pr = "https://github.com/owner/project/pull/1"
-        published = self.made_run()
-        record.settle(published.id, "pr", pr_url=pr)
-        asked = self.made_run(published.id)
-        ask_store.ask_add("ask-fixture", asked.id, self.repo.name, self.ticket, "revise", "revise", "", "",
-                          [{"kind": "text", "header": "CI log", "question": "Where is the CI log?"}], {})
+    def prepare_pr_fixture(self, checkouts=()):
+        return factory.Outcome("pass", data={
+            "layer": str(self.repo.layer_dir), "checkouts": [c.to_row() for c in checkouts],
+            "ticket": asdict(self.local.get(self.ticket)), "branch": "fixture", "add_dirs": [],
+            "attachments": "", "expertise": "", "triage": "",
+        })
+
+    def open_pr_ask(self, asked, kind="text", *, step="orchestrate", session=None):
+        asked_at = (util.now() - timedelta(minutes=pipeline.FEEDBACK_QUIET_MINUTES + 2)).replace(microsecond=0)
+        question = {"kind": kind, "header": "CI log", "question": "Where is the CI log?"}
+        if kind == "secret":
+            question["name"] = "CI_LOG_TOKEN"
+        with patch.object(util, "now", return_value=asked_at):
+            ask_store.ask_add("ask-fixture", asked.id, self.repo.name, self.ticket, step, step, "", "",
+                              [question], asdict(session) if session else {})
         record.settle(asked.id, "needs-info")
         self.local.label(self.ticket, add=["needs-info"])
-        comment = "The lint job has the log. Please fix the failing check."
-        created = util.iso(util.now() - timedelta(minutes=pipeline.FEEDBACK_QUIET_MINUTES + 1))
-        insights_store.add_feedback([{"pr_url": pr, "kind": "comment", "gh_id": 1, "repo": self.repo.name,
-                                      "issue": self.ticket, "body": comment, "created": created, "at_once": 0,
+        return asked_at
+
+    def waiting_pr_ask(self, kind="text", *, repair=False):
+        self.cfg.replay = config.ReplayConfig(all=True)
+        self.repo.layer_dir.mkdir()
+        pr = "https://github.com/owner/project/pull/1"
+        published = self.made_run()
+        starting = published
+        checkouts = []
+        if repair:
+            run_lines.write(published.id, run_lines.END, review={"verdict": "request_changes", "problems": [
+                {"file": "notes.txt", "text": "Fix the saved finding.", "category": "issue"}]})
+            (published.dir / "plan.md").write_text("Implement the issue.")
+            record.settle(published.id, "pr", pr_url=pr, branch="fixture")
+            starting = self.made_run(published.id)
+            starting.repairs = published.id
+            run_lines.write(starting.id, "repair", source=published.id)
+            wt = paths.WORKTREES_DIR / f"{self.repo.name}-{self.ticket}"
+            (wt / ".git").mkdir(parents=True)
+            checkouts.append(workspace.Checkout("", "owner/project", self.repo.path, wt, "main", pr, "fixture-head"))
+        starting.path = "orchestrate"
+        controller = orchestration.Controller(flows.start(self.cfg, starting, {}))
+        prepared = self.prepare_pr_fixture(checkouts)
+
+        def prepare_workspace(*args, **kwargs):
+            controller.job.take("prepare", prepared, stored=False)
+            return prepared
+
+        with (patch.object(controller, "atomic", side_effect=prepare_workspace),
+              patch.object(pipeline, "workspace_note", return_value="Fixture workspace"),
+              patch.object(repairs, "matched_head", return_value="fixture-head")):
+            self.assertIsNone(controller.prepare())
+        if repair:
+            asked, lease = starting, controller.lease
+        else:
+            record.settle(published.id, "pr", pr_url=pr)
+            asked = self.made_run(published.id)
+            lease = ledger.acquire(asked.id, published.id, {})
+        turn = ledger.begin(lease, {}, 10)
+        action, = ledger.accept(lease, turn, ledger.snapshot(lease)["version"],
+                                {"calls": [{"op": "owner.ask", "args": {}}]}, 10)
+        ledger.transition(lease, action["id"], "succeeded", {"ask_ids": ["ask-fixture"], "awaiting_owner": True})
+        return asked, pr, self.open_pr_ask(asked, kind)
+
+    def add_pr_comment(self, pr, comment, created, gh_id=1):
+        insights_store.add_feedback([{"pr_url": pr, "kind": "comment", "gh_id": gh_id, "repo": self.repo.name,
+                                      "issue": self.ticket, "body": comment, "created": util.iso(created), "at_once": 0,
                                       "pr_state": "OPEN", "status": "new"}])
 
-        revisions = []
+    def add_issue_reply(self, text):
+        with principals.acting(principals.seed_owner("fixture@example.test")):
+            tasks_store.task_comment(self.ticket, principals.current(), text)
 
-        def work(cfg, run, slot):
-            revisions.append([(row["pr_url"], row["body"]) for row in run.feedback])
-            return "noop", "fixture finished", ""
+    def poll_continuation(self, asked, path):
+        exit_codes = []
 
         def spawn(repo, tid):
-            self.assertEqual(self.run_polled_ticket(repo, tid, work), 0)
+            self.assertEqual(pipeline.run_command(repo, tid),
+                             pipeline.script_command(self.cfg, path, repo, str(tid), "--continue", asked.id))
+            script = pipeline.Script(path, pipeline.flow_function(self.cfg, path), continues=asked.id)
+            exit_codes.append(self.run_polled_ticket(repo, tid, lambda *_: self.fail("started an ordinary run"), script))
 
         self.assertEqual(self.poll_with(self.cfg, spawn), 0)
-        self.assertEqual(revisions, [[(pr, comment)]])
-        self.assertEqual(ask_store.ask_get("ask-fixture")["status"], "open")
+        revision = run_store.newest_whole_run(self.repo.name, self.ticket)
+        self.assertEqual(exit_codes, [0], revision["summary"])
+        return revision
+
+    def check_polled_pr_answer(self, issue_reply="", *, stale_feedback=False, repair=False):
+        asked, pr, asked_at = self.waiting_pr_ask(repair=repair)
+        comments = []
+        if stale_feedback:
+            for gh_id, offset in enumerate((-1, 0), start=2):
+                stale = f"Please rename button {gh_id}."
+                self.add_pr_comment(pr, stale, asked_at + timedelta(seconds=offset), gh_id=gh_id)
+                comments.append(stale)
+        comment = "The lint job has the log. Please fix the failing check."
+        self.add_pr_comment(pr, comment, asked_at + timedelta(seconds=1))
+        comments.append(comment)
+        if issue_reply:
+            self.add_issue_reply(issue_reply)
+        expected = issue_reply or comment
+
+        def decide(run, turn, request):
+            self.assertIn(f"Answer: {expected}", request["prompt"])
+            for body in comments:
+                self.assertIn(body, request["prompt"])
+            if repair:
+                self.assertTrue(run.repairs)
+                self.assertEqual(run.repairs, pipeline.repaired_by(asked.id))
+            found = ledger.find(run.id)
+            response = {"version": PROTOCOL, "decision_id": turn,
+                        "state_version": found["version"], "rationale": "Fixture reviewed owner input.",
+                        "calls": [{"op": "run.finish", "args": {"reason": "noop"}}]}
+            return SimpleNamespace(pid=0, identity=None, proc=SimpleNamespace(poll=lambda: 0),
+                                   receive=lambda: [{"ok": True, "structured": response}], close=lambda: None)
+
+        with (patch.object(delegation, "Worker", side_effect=decide) as worker,
+              patch.object(pipeline, "workspace_note", return_value="Fixture workspace"),
+              patch.object(flows.Job, "reclaim", return_value=""),
+              patch.object(workspace, "kept_work", return_value=""),
+              patch.object(repairs, "matched_head", return_value="fixture-head"),
+              patch.object(pipeline, "stage", return_value=pipeline.Staged()),
+              patch.object(pipeline, "nothing_to_build", return_value=("pr", "fixture finished", pr)),
+              patch.object(gh, "pr_view", return_value={"state": "OPEN"}),
+              patch.object(gh, "pr_body", return_value="")):
+            revision = self.poll_continuation(asked, "orchestrate")
+        worker.assert_called_once()
+        ask = ask_store.ask_get("ask-fixture")
+        self.assertEqual((ask["taken_by"], ask["answers"][0]["text"]), (revision["id"], expected))
+        data = ledger.find(revision["id"])["data"]
+        self.assertEqual([(row["pr_url"], row["body"]) for row in data["feedback"]], [(pr, body) for body in comments])
+        self.assertIn(f"Answer: {expected}", data["job"]["goal"])
+        for body in comments:
+            self.assertIn(body, data["goal_base"])
+        self.assertTrue(any(line.get("op") == "owner.ask" and line.get("recovered") and line.get("source") == asked.id
+                            for line in run_lines.read(revision["id"])))
+        self.assert_feedback_done(pr, comments)
+
+    def assert_feedback_done(self, pr, comments):
+        rows = insights_store.feedback_between("", "9999")
+        self.assertCountEqual([(row["body"], row["status"]) for row in rows if row["pr_url"] == pr],
+                              [(body, "done") for body in comments])
+
+    def test_poll_uses_pr_feedback_as_answer_and_recovers_orchestrated_revision(self):
+        self.check_polled_pr_answer()
+
+    def test_poll_leaves_an_ask_open_when_only_earlier_or_equal_second_feedback_is_due(self):
+        asked, pr, asked_at = self.waiting_pr_ask()
+        earlier, equal = "Please rename the button.", "Please move the icon."
+        self.add_pr_comment(pr, earlier, asked_at - timedelta(seconds=1))
+        self.add_pr_comment(pr, equal, asked_at, gh_id=2)
+        started = []
+        self.assertEqual(self.poll_with(self.cfg, lambda repo, tid: started.append(tid)), 0)
+        self.assertEqual(started, [])
+        self.assertEqual(ask_store.asks_of(asked.id)[0]["status"], "open")
+        pending = pipeline.pending_feedback(self.repo.name, self.ticket)
+        self.assertEqual([(row["body"], row["status"]) for row in pending], [(earlier, "new"), (equal, "new")])
+        name = tracker.ticket_name(self.repo.name, self.local.ref(self.ticket))
+        self.assertEqual(util.read_json(self.root / "skipped.json", {})[name]["why"],
+                         "its asks are still waiting for an owner answer")
+
+    def test_poll_keeps_earlier_and_equal_second_comments_as_revision_feedback(self):
+        self.check_polled_pr_answer(stale_feedback=True)
+
+    def test_poll_prefers_issue_reply_to_due_pr_feedback_as_answer(self):
+        self.check_polled_pr_answer("The integration job has the log.")
+
+    def test_poll_delivers_pr_feedback_when_an_orchestrated_repair_recovers_an_issue_answer(self):
+        self.check_polled_pr_answer("The integration job has the log.", repair=True)
+
+    def configure_adw(self):
+        self.cfg.replay = config.ReplayConfig(all=True)
+        self.repo.layer_dir.mkdir()
+        (self.repo.layer_dir / "config.toml").write_text('[factory]\npath = "adw"\n')
+
+    def adw_pr_steps(self, prepared):
+        return {
+            "prepare": lambda *a, **kw: prepared,
+            "checks": lambda flow, **kw: factory.Outcome("pass", data={"policy": flow.ctx.policy("checks", kw)}),
+            "verify": lambda flow, **kw: factory.Outcome("pass", data={
+                "verified": {"verdict": "pass"}, "names": [], "policy": flow.ctx.policy("verify", kw)}),
+            "learn": lambda *a, **kw: factory.Outcome("pass"),
+            "pr": lambda *a, **kw: factory.Outcome("pass", data={
+                "prs": {}, "opened": [], "changed": [], "pushed": [], "committed_lines": 1,
+                "draft_why": "", "report_body": "", "summary": ""}),
+            "publish": lambda *a, **kw: factory.Outcome("pass", data={"ending": "pr"}),
+        }
+
+    def check_adw_pr_answer(self, *, new_feedback, asking_step="review", legacy=False, only_review=False):
+        self.configure_adw()
+        pr = "https://github.com/owner/project/pull/1"
+        published = self.made_run()
+        run_lines.write(published.id, "execution", path="feature")
+        record.settle(published.id, "pr", pr_url=pr)
+        asked = self.made_run(published.id)
+        asked.path = "revise"
+        run_lines.write(asked.id, "execution", path="revise")
+        original, fresh = "Please rename the button.", "Please also move the icon."
+        self.add_pr_comment(pr, original, util.now() - timedelta(minutes=pipeline.FEEDBACK_QUIET_MINUTES + 3))
+        asked.feedback = pipeline.pending_feedback(self.repo.name, self.ticket)
+        insights_store.take_feedback(asked.feedback, asked.id)
+        insights_store.settle_feedback(asked.id, "failed")
+        prepared = self.prepare_pr_fixture()
+        session = Session(id="kept-ask-session")
+        expected = "The integration job has the log."
+
+        def revise_step(flow, **kwargs):
+            outcome = flows.revision(flow, **kwargs)
+            if legacy and flow.run_id == asked.id:
+                outcome.data.pop("feedback_keys", None)
+            return outcome
+
+        with (patch.object(factory, "fingerprint", return_value="fixture-tree"),
+              patch.object(pipeline, "workspace_note", return_value="Fixture workspace"),
+              patch.object(pipeline, "stage", return_value=pipeline.Staged(counts={"notes.txt": 1})),
+              patch.object(gh, "pr_body", return_value=""),
+              patch.object(pipeline, "record_prs", return_value=pr),
+              patch.object(pipeline, "release_workspace"), patch.object(flows, "documents", return_value=False),
+              patch.object(pipeline.AgentRun, "agent",
+                           return_value=Result(ok=True, structured={"summary": "Fixture", "problems": []})) as agent,
+              patch.dict(factory.STEPS, {**self.adw_pr_steps(prepared), "revise": revise_step})):
+            prior = flows.start(self.cfg, asked, {})
+            tree = str(prior.ctx.ws)
+            prior.ctx.ws.mkdir()
+            flows.step(prior, "prepare", tree=tree)
+            if asking_step == "review":
+                flows.step(prior, "revise", tree=tree)
+                flows.step(prior, "checks", tree=tree, attempt=1, tries=asked.settings("check_repair").tries)
+                flows.step(prior, "verify", tree=tree)
+            run_lines.write(asked.id, "step_end", step=asking_step, result="ask")
+            asked_at = self.open_pr_ask(asked, step=asking_step, session=session)
+            if new_feedback:
+                self.add_pr_comment(pr, fresh, asked_at + timedelta(seconds=1), gh_id=2)
+            agent.reset_mock()
+            if only_review:
+                script = pipeline.Script("revise", pipeline.flow_function(self.cfg, "revise"),
+                                         continues=asked.id, only="review")
+                with (patch.object(config, "load", return_value=self.cfg),
+                      patch.object(pipeline, "has_origin", return_value=True)):
+                    exit_code = pipeline.run_issue(self.repo.name, self.ticket, script=script)
+                rerun = next(row for row in run_store.ticket_runs(self.repo.name, self.ticket) if row["only_step"])
+                self.assertEqual(exit_code, 0, rerun["summary"])
+            else:
+                self.add_issue_reply(expected)
+                revision = self.poll_continuation(asked, "revise")
+
+        if only_review:
+            self.assertEqual(rerun["summary"], "review pass")
+            self.assertEqual([call.args[0] for call in agent.call_args_list], ["review"])
+            self.assertNotIn(fresh, agent.call_args.args[1])
+            pending = pipeline.pending_feedback(self.repo.name, self.ticket)
+            self.assertEqual([(row["body"], row["status"], row["run_id"]) for row in pending],
+                             [(original, "failed", asked.id), (fresh, "new", None)])
+            return
+
+        calls = {call.args[0]: call for call in agent.call_args_list}
+        self.assertEqual([call.args[0] for call in agent.call_args_list],
+                         ["revise", "review"] if new_feedback else ["review"])
+        if new_feedback:
+            self.assertIn(fresh, calls["revise"].args[1])
+        self.assertEqual(calls[asking_step].kwargs["resume"], session)
+        self.assertIn(expected, calls[asking_step].args[1])
+        self.assertEqual(ask_store.ask_get("ask-fixture")["taken_by"], revision["id"])
+        self.assert_feedback_done(pr, [original, fresh] if new_feedback else [original])
+
+    def test_poll_reruns_saved_adw_revision_for_new_pr_feedback_before_resuming_review(self):
+        self.check_adw_pr_answer(new_feedback=True)
+
+    def test_poll_reuses_saved_adw_revision_when_only_the_issue_answer_is_new(self):
+        self.check_adw_pr_answer(new_feedback=False, legacy=True)
+
+    def test_poll_delivers_new_pr_feedback_when_resuming_the_adw_revision_agent(self):
+        self.check_adw_pr_answer(new_feedback=True, asking_step="revise")
+
+    def test_isolated_adw_review_reuses_saved_revision_and_leaves_new_feedback_pending(self):
+        self.check_adw_pr_answer(new_feedback=True, only_review=True)
+
+    def check_polled_adw_repair(self, session, asking_step="repair"):
+        self.configure_adw()
+        pr = "https://github.com/owner/project/pull/1"
+        published = self.made_run()
+        run_lines.write(published.id, run_lines.END, review={"verdict": "request_changes", "problems": [
+            {"file": "notes.txt", "text": "Fix the saved finding.", "category": "issue"}]})
+        (published.dir / "plan.md").write_text("Implement the issue.")
+        record.settle(published.id, "pr", pr_url=pr, branch="fixture")
+        asked = self.made_run(published.id)
+        asked.path, asked.repairs = "repair", published.id
+        run_lines.write(asked.id, "execution", path="repair")
+        run_lines.write(asked.id, "repair", source=published.id)
+        prior = flows.start(self.cfg, asked, {})
+        checkout = workspace.Checkout("", "owner/project", self.repo.path, prior.ctx.ws, "main", pr, "fixture-head")
+        (prior.ctx.ws / ".git").mkdir(parents=True)
+        comment, reply = "Please move the icon.", "The integration job has the log."
+        repairs_called = []
+
+        def worker(prompt, cwd, *, trace, **kw):
+            if trace[0] != asked.id:
+                if trace[1] == asking_step:
+                    self.assertIn(f"Answer: {reply}", prompt)
+                    self.assertEqual(kw["resume"], session)
+                if trace[1] == "repair":
+                    self.assertIn(comment, prompt)
+                    if asking_step == "repair":
+                        fresh_prompt = kw["fresh_prompt"]("codex")
+                        self.assertIn(f"Answer: {reply}", fresh_prompt)
+                        self.assertIn(comment, fresh_prompt)
+                    pending = pipeline.pending_feedback(self.repo.name, self.ticket)
+                    self.assertEqual([(row["body"], row["status"], row["run_id"]) for row in pending],
+                                     [(comment, "taken", trace[0])])
+                    repairs_called.append(trace[0])
+            return Result(ok=True, text="Fixture repaired.", structured={"summary": "Fixture", "problems": []})
+
+        with (patch.object(factory, "fingerprint", return_value="fixture-tree"),
+              patch.object(pipeline, "workspace_note", return_value="Fixture workspace"),
+              patch.object(pipeline, "stage", return_value=pipeline.Staged(counts={"notes.txt": 1})),
+              patch.object(pipeline, "index_trees", return_value={}),
+              patch.object(pipeline, "record_prs", return_value=pr),
+              patch.object(pipeline, "release_workspace"), patch.object(flows, "documents", return_value=False),
+              patch.object(workspace, "kept_work", return_value=""), patch.object(flows.Job, "reclaim", return_value=""),
+              patch.object(repairs, "matched_head", return_value="fixture-head"),
+              patch.object(pipeline.runner, "run", side_effect=worker),
+              patch.dict(factory.STEPS, self.adw_pr_steps(self.prepare_pr_fixture([checkout])))):
+            tree = str(prior.ctx.ws)
+            flows.step(prior, "prepare", tree=tree)
+            if asking_step == "review":
+                self.assertTrue(flows.step(prior, "repair", tree=tree).passed)
+                flows.step(prior, "checks", tree=tree, attempt=1, tries=asked.settings("check_repair").tries)
+                flows.step(prior, "verify", tree=tree)
+            run_lines.write(asked.id, "step_end", step=asking_step, result="ask")
+            asked_at = self.open_pr_ask(asked, step=asking_step, session=session)
+            self.add_pr_comment(pr, comment, asked_at + timedelta(seconds=1))
+            self.add_issue_reply(reply)
+            repair = self.poll_continuation(asked, "repair")
+
+        self.assertEqual(repairs_called, [repair["id"]])
+        self.assertEqual(ask_store.ask_get("ask-fixture")["taken_by"], repair["id"])
+        self.assert_feedback_done(pr, [comment])
+
+    def test_poll_delivers_issue_answer_and_pr_feedback_to_resumed_adw_repair_agent(self):
+        self.check_polled_adw_repair(Session(id="kept-repair-session", runner="codex"))
+
+    def test_poll_delivers_issue_answer_and_pr_feedback_to_fresh_adw_repair_agent(self):
+        self.check_polled_adw_repair(Session())
+
+    def test_poll_reruns_saved_adw_repair_for_new_pr_feedback_before_resuming_review(self):
+        self.check_polled_adw_repair(Session(id="kept-review-session", runner="codex"), asking_step="review")
+
+    def test_poll_blocks_pr_feedback_when_an_open_ask_holds_a_secret(self):
+        asked, pr, asked_at = self.waiting_pr_ask("secret")
+        self.add_pr_comment(pr, "The lint job has the log.", asked_at + timedelta(minutes=1))
+        self.assertEqual(self.poll_with(self.cfg, lambda *_: self.fail("launched with an open secret ask")), 0)
+        self.assertEqual(ask_store.asks_of(asked.id)[0]["status"], "open")
+        name = tracker.ticket_name(self.repo.name, self.local.ref(self.ticket))
+        self.assertEqual(util.read_json(self.root / "skipped.json", {})[name]["why"], poll.SECRET_ASK_REPLY)
 
     def test_github_label_removal_without_a_reply_admits_a_run_with_spent_repairs(self):
         self.repo = replace(self.repo, name="github-fixture", github="owner/project", tracker="github",
