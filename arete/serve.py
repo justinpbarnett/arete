@@ -511,15 +511,16 @@ class Server:
             if reason:
                 self.deploy_refused(src, tip, reason)
                 return
+            if util.git(["rev-parse", "--verify", ref], src, timeout=10, retry=False).strip() != tip:
+                return
+            if not self.deploy_ready(src, base, tip):
+                return
             try:
                 recovery = util.deploy_recovery(src, base, tip)
             except (OSError, RuntimeError) as error:
                 self.deploy_refused(src, tip, str(error))
                 return
-            if util.git(["rev-parse", "--verify", ref], src, timeout=10, retry=False).strip() != tip:
-                return
-            if not self.deploy_ready(src, base, tip):
-                return
+            self.say(f"deploy: {paths.short_path(src)} Git hooks disabled for fast forward to {tip}")
             try:
                 util.deploy_fast_forward(src, tip)
             except (OSError, RuntimeError) as error:
@@ -531,17 +532,16 @@ class Server:
     def restore_deploy(self, src: Path, base: str, tip: str, recovery: util.DeployRecovery, error: Exception) -> None:
         checkout = paths.short_path(src)
         try:
-            tracked, untracked, preserved = util.restore_deploy_paths(src, base, recovery)
+            problems = util.restore_deploy_paths(src, base, recovery)
         except (OSError, RuntimeError) as restore_error:
-            self.say(f"deploy: {checkout} could not restore tracked changes for {tip} ({error}; {restore_error})")
-        else:
-            if preserved:
-                self.say(f"deploy: {checkout} could not fully restore changes for {tip} "
-                         f"({error}; preserved {util.count(preserved, 'path')} with uncertain changes)")
-            elif tracked:
-                self.say(f"deploy: {checkout} restored tracked changes for {tip} ({error})")
-            elif untracked:
-                self.say(f"deploy: {checkout} restored checkout for {tip} by removing untracked tip additions ({error})")
+            problems = [str(restore_error)]
+        try:
+            if remaining := util.deploy_porcelain(src):
+                problems.append(f"remaining paths: {remaining}")
+        except (OSError, RuntimeError) as status_error:
+            problems.append(f"could not read remaining paths: {status_error}")
+        details = " | ".join([str(error), *problems])
+        self.say(f"deploy: {checkout} recovery for {tip} ({details})")
 
     def deploy_ready(self, src: Path, base: str, tip: str) -> bool:
         reason = deploy_refusal(src, base, tip)
