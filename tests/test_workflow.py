@@ -24,7 +24,7 @@ from unittest import mock
 
 from adws import single_worker
 from arete import (
-    api_check, ci, config, diffguard, evals, factory, flows, gh, jev, journeys, loop_run, mergecheck, miner,
+    api_check, ci, config, diffguard, evals, factory, flows, gh, guard, jev, journeys, loop_run, mergecheck, miner,
     orchestration, outcomes, owner_asks, paths, pipeline, poll, queueing, runlimits, sandbox, serve, tracker, util,
     verify, workspace,
 )
@@ -2189,6 +2189,18 @@ signal.pause()
 
 
 class CommandConfinementTests(unittest.TestCase):
+    def test_guard_denies_reads_from_eval_skill_folder(self):
+        root = paths.PACKAGE_DIR.parent / "fixture"
+        state = root / "state"
+        cwd = root / "eval-checkout"
+        skill = state / "eval-skills" / "other-arm" / "skills" / "example" / "helper.md"
+        payload = {"cwd": str(cwd), "tool_name": "Read", "tool_input": {"file_path": str(skill)}}
+        output = StringIO()
+        with (mock.patch.object(paths, "STATE_DIR", state),
+              mock.patch.object(sys, "stdin", StringIO(json.dumps(payload))), redirect_stdout(output)):
+            self.assertEqual(guard.main(), 0)
+        self.assertEqual(json.loads(output.getvalue())["hookSpecificOutput"]["permissionDecision"], "deny")
+
     def test_only_deploy_merge_drops_the_engine_write_deny(self):
         src = paths.PACKAGE_DIR.parent
         tip = "a" * 40
@@ -3625,7 +3637,9 @@ class MinerLifecycleTests(unittest.TestCase):
             self.assertIs(repo, self.repo)
             task, = tasks
             self.assertEqual((task.name, task.base), ("global-task", self.BASE))
-            run = evals.EvalRun(id=tag, repo=repo, dir=self.root / tag, task=task.name, trial=tag, writes_lines=False)
+            trial = f"{tag}-{len(graded)}"
+            run = evals.EvalRun(id=trial, repo=repo, dir=self.root / trial, task=task.name, trial=trial,
+                                writes_lines=False)
             run.call_kw = mock.Mock(return_value={})
             run.gate = mock.Mock(return_value=(True, "checks passed"))
             run.agent = mock.Mock(return_value=Result(ok=True, structured={}))
@@ -4309,6 +4323,7 @@ class MinerLifecycleTests(unittest.TestCase):
 
     def test_pr_requires_jev_yes_for_prompts_no_candidate_graded(self):
         task = evals.Task("fixture", "Fixture", "fixture")
+        blocked_task = evals.Task("blocked", "Fixture", "fixture", verify="Exercise the repaired behavior")
         ran = []
 
         def suite(cfg, repo, source, tasks, tag, prompts):
@@ -4320,14 +4335,25 @@ class MinerLifecycleTests(unittest.TestCase):
                                       repairs=int(on_base), prompts_used={"build.md", "fix.md"} if on_base else
                                       {"build.md"})
             results = [result]
-            if suite_state == "grading blocked":
-                results.append(replace(result, task="blocked", passed=on_base, graded=on_base,
-                                       prompts_used={"build.md", "fix.md"}))
+            if blocked_task in tasks:
+                blocked = replace(result, task=blocked_task.name, passed=False, graded=False,
+                                  prompts_used={"build.md", "fix.md"})
+                run = evals.EvalRun(id=tag, repo=repo, dir=self.root, task=blocked_task.name)
+                grade = (verify.Verified("pass") if on_base else
+                         verify.Verified("blocked", blocked_by="Verifier unavailable", finished=False))
+                with (mock.patch.object(evals, "grade", return_value=grade),
+                      mock.patch.object(evals, "git", return_value="")):
+                    results.append(evals.acceptance(cfg, run, self.layer, self.root, blocked_task, None, blocked,
+                                                    "", "", True, 60))
+                self.assertEqual(blocked.graded, on_base)
             return evals.Arm(tag, results)
 
         def compare(*args, **kwargs):
             report = self.compare_prompts(*args, **kwargs)
             self.assertEqual(report.unmeasured, [prompt])
+            if suite_state == "grading blocked":
+                self.assertFalse(report.complete)
+                self.assertEqual(report.incomplete, ["`blocked` in arete"])
             return report
 
         self.eval.side_effect = compare
@@ -4343,6 +4369,9 @@ class MinerLifecycleTests(unittest.TestCase):
                 if mixed:
                     files["CLAUDE.md"] = 2
                 self.diff.return_value = diffguard.Diff(files)
+                tasks = [task, blocked_task] if suite_state == "grading blocked" else [task]
+                if suite_state == "empty":
+                    tasks = []
                 for verdict in (None, False, True):
                     with self.subTest(prompt=prompt, suite_state=suite_state, mixed=mixed, verdict=verdict):
                         self.calls.clear()
@@ -4354,7 +4383,7 @@ class MinerLifecycleTests(unittest.TestCase):
                                  jev.Reply({"fix": jev.Answer(verdict, 1.0, {"yes": float(verdict)})}))
                         with (
                             mock.patch.object(evals, "export_prompts", side_effect=lambda r, ref, d: {prompt: ref.encode()}),
-                            mock.patch.object(evals, "paired_tasks", return_value=[] if suite_state == "empty" else [task]),
+                            mock.patch.object(evals, "paired_tasks", return_value=tasks),
                             mock.patch.object(util, "lock", return_value=nullcontext(suite_state != "busy")),
                             mock.patch.object(jev, "ask", return_value=reply) as ask,
                         ):
