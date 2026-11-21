@@ -725,8 +725,10 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
         kw["remote"] = target
     else:
         kw["passing"] = environment.passed(cfg, repo)
-        if snapshot := config.snapshot_env(cfg):
-            kw["extra_env"] = {**(kw.get("extra_env") or {}), **snapshot}
+        if cfg.settings_snapshot is not None:
+            kw["extra_env"] = {**(kw.get("extra_env") or {}), **config.snapshot_env(cfg)}
+            floor = replace(floor, closed=(*floor.closed, paths.settings_store()),
+                            files=(*floor.files, cfg.settings_snapshot[0]))
         if which == "pi":
             roots = trip.layer.read_roots if trip.layer and not (request and request.requires.delegation_only) else ()
             kw["read_roots"] = tuple(Path(root) for root in roots)
@@ -991,6 +993,10 @@ def local_claude(kw: dict, cfg: config.Config, run_id: str, ask_jev: bool, say: 
     kw = {**kw, "extra_env": {**(kw.get("extra_env") or {}), **run_env(run_id)}}
     if guard.wanted(kw.get("tools")):
         kw["settings"] = guard.settings(cfg.jev.guard, floor.open)
+        if cfg.settings_snapshot is not None:
+            snapshot = cfg.settings_snapshot[0]
+            claude.protect_settings(kw["settings"], snapshot, floor.open)
+            closed_context = (*closed_context, paths.settings_store(), snapshot)
         if closed_context:
             for group in kw["settings"]["hooks"]["PreToolUse"]:
                 for hook in group["hooks"]:
@@ -1004,6 +1010,9 @@ def local_claude(kw: dict, cfg: config.Config, run_id: str, ask_jev: bool, say: 
     if ask_jev and runs_bash(kw) and jev.ready(cfg, [repo], env=claude.agent_env(kw["passing"])):
         kw["allowed_tools"] = [*(kw.get("allowed_tools") or []), jev_ask.rule()]
         browser.with_note(kw, jev_ask.note())
+        if cfg.settings_snapshot is not None:
+            directory = next((path for path in floor.open if path.is_dir()), floor.open[0])
+            kw["ask_policy"] = cfg.settings_snapshot, directory
     if uploads.granted(kw.get("allowed_tools")):
         kw["settings"] = uploads.with_hook(kw.get("settings"))
     return kw

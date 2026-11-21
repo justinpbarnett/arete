@@ -136,7 +136,8 @@ def guard(job: Job, continues: str) -> str:
     job.branch = branch
     try:
         checkouts = [workspace.Checkout.from_row(e) for e in listed]
-        layer = pipeline.checked_layer(job.cfg, Path(data["layer"]), pinned=saved_layer(data))
+        layer = pipeline.checked_layer(job.cfg, Path(data["layer"]),
+                                       pinned=job.cfg.prepared_layer or saved_layer(data))
         if held := workspace.scratch_held(job.ws, checkouts):
             error = workspace.scratch_failure(
                 f"verification scratch at {held[0]} is still held; poll finalizes it once its holders end, "
@@ -172,7 +173,11 @@ def prepared_data(continues: str) -> dict:
     if prepared := adaptive_state(continues).get("prepared"):
         return prepared
     prepared = factory.passed_data(factory.history(factory.chain(continues)), "prepare")
-    return prepared[-1] if prepared else classic_hold(continues).get("prepared", {})
+    if prepared:
+        return prepared[-1]
+    if held := classic_hold(continues).get("prepared"):
+        return held
+    return factory.first(run_lines.read(continues), "settings_snapshot")
 
 
 def saved_layer(prepared: dict) -> config.RepoLayer | None:
@@ -541,11 +546,14 @@ class Job:
     prepared_feedback_prs: list[str] = field(default_factory=list)
 
     def load_snapshot(self, data: dict) -> config.RepoLayer | None:
+        if self.cfg.settings_snapshot is not None:
+            path, sha = self.cfg.settings_snapshot
+            if data.get("settings_snapshot") == {"path": str(path), "sha": sha}:
+                return self.cfg.prepared_layer
         if settings := saved_settings(data):
-            self.cfg, layer, source_layer = settings
+            self.cfg, layer, _ = settings
             self.run.cfg = self.cfg
             self.run.repo = self.cfg.repo(self.run.repo.name)
-            self.run.repo.pinned_layer = source_layer
             return layer
         return saved_layer(data)
 
@@ -952,14 +960,15 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
     for c in checkouts:
         c.revision = util.git(["rev-parse", "HEAD"], c.wt).strip()
     layer = pipeline.resolve_layer(cfg, run, job.ws)
-    run.layer = layer
     if why := pipeline.furnish(cfg, run, layer, job.ws):
         return end_as("fail", "failed", why=why)
     workspace.note_made(job.ws, checkouts, pipeline.workspace_owner(run, job.ws, checkouts))
     approval = triage_store.triage_approval(run.triage_key)
     data = prepared_fields(t, branch, checkouts, layer, [run.dir / "images"] if images.paths else [],
                            pipeline.images_note(images), approval)
-    data["settings_snapshot"] = delegation.freeze_settings(cfg, run, layer)
+    if cfg.settings_snapshot is None:
+        layer = pipeline.checked_layer(cfg, layer.dir)
+    data["settings_snapshot"] = delegation.freeze_settings(cfg, run, layer, source_layer=main_layer)
     if feedback_prs:
         data["feedback_prs"] = feedback_prs
     return Outcome("pass", data=data)

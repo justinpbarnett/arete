@@ -158,11 +158,13 @@ def run_guard(call, *argv) -> int:
     from ..delegation import PolicyChanged
 
     try:
-        return call(*argv)
+        cfg = config.snapshot_config()
     except PolicyChanged:
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                                  "permissionDecisionReason": "Arete could not read the guard settings"}}))
         return 0
+    with config.using_settings(cfg):
+        return call(*argv)
 
 
 def cmd_upload_guard(args) -> int:
@@ -179,12 +181,6 @@ def scratch_hook(p) -> None:
     p.add_argument("--scratch", default="", help="the verification attempt's scratch folder, set by arete")
     p.add_argument("--scratch-id", default="", help="selector for protected harness authority; never proves ownership")
     p.add_argument("--scratch-saves", default="", help="must match the authenticated evidence destination")
-
-
-def guard_options(p) -> None:
-    p.add_argument("--judge", action="store_true")
-    p.add_argument("--open", action="append", default=[])
-    scratch_hook(p)
 
 
 def cmd_codex_guard(args) -> int:
@@ -232,8 +228,10 @@ def register(sub) -> None:
     p = sub.add_parser("guard", help="PreToolUse hook for arete's agents: enforces the directory floor and secret rules; "
                                      "with --judge, "
                                      "stops shell commands git cannot undo (reads a payload on stdin)")
-    guard_options(p)
+    p.add_argument("--judge", action="store_true")
+    p.add_argument("--open", action="append", default=[])
     p.add_argument("--closed", action="append", default=[], help="add a protected grading-context folder")
+    scratch_hook(p)
     p.set_defaults(fn=cmd_guard)
 
     p = sub.add_parser("upload-guard", help="PreToolUse hook for the verifier's browser_file_upload: allows only files "
@@ -242,7 +240,9 @@ def register(sub) -> None:
 
     p = sub.add_parser("codex-guard", help="PreToolUse hook for arete's codex agents: enforces the directory floor, "
                                            "git write and secret rules; with --judge, asks JEV (reads a payload on stdin)")
-    guard_options(p)
+    p.add_argument("--judge", action="store_true")
+    p.add_argument("--open", action="append", default=[])
+    scratch_hook(p)
     p.set_defaults(fn=cmd_codex_guard)
 
     p = sub.add_parser("mcp-ask", help="stdio MCP server that gives arete's agents the ask_owner tool; with --check, "

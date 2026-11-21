@@ -146,6 +146,8 @@ def named_server(wanted: str, setting=ENV) -> Server:
 def configured_server() -> Server | None:
     if wanted := os.environ.get(ENV, "").strip():
         return named_server(wanted)
+    if (cfg := config.snapshot_config()) is not None:
+        return named_server(cfg.server_url, "[server] url") if cfg.server_url else None
     try:
         data = config.read_data()
     except FileNotFoundError:

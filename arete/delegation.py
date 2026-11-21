@@ -15,7 +15,7 @@ from hashlib import sha256
 from math import inf
 from pathlib import Path
 
-from . import child, codebase, config, journeys, paths, pipeline, record, routing, scratch, util
+from . import child, codebase, config, journeys, outbound, paths, pipeline, record, routing, scratch, util
 from .agent import NO_SESSION, Session
 from .store.orchestration import digest
 
@@ -212,35 +212,58 @@ def unpack_settings(data):
     return SETTINGS_TYPES[kind](**value)
 
 
-def freeze_settings(cfg: config.Config, run: pipeline.AgentRun, layer: config.RepoLayer) -> dict[str, str]:
+def freeze_settings(cfg: config.Config, run: pipeline.AgentRun, layer: config.RepoLayer, *,
+                    source_layer: config.RepoLayer | None = None) -> dict[str, str]:
     if cfg.settings_snapshot is None:
-        path = (run.dir / "settings-snapshot.json").absolute()
-        # Routing uses the source layer, while step settings can come from the fetched checkout.
+        store = paths.settings_store()
+        directory = store / run.dir.name
+        if store.is_symlink() or directory.is_symlink():
+            raise PolicyChanged("the private run settings directory is a symlink")
+        store.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = (directory / paths.SETTINGS_SNAPSHOT_FILE).absolute()
         repo = run.repo
-        source_layer = layer if layer.dir == repo.layer_dir else repo.configured_layer()
-        raw = json.dumps(pack_settings((cfg, layer, source_layer))).encode()
+        if layer.dir == repo.layer_dir:
+            source_layer = layer
+        elif source_layer is None:
+            source_layer = repo.configured_layer()
+        for configured in cfg.repos:
+            if configured.layer_dir != repo.layer_dir:
+                outbound.keep_layer_private(configured.layer_dir)
+        private_hosts = tuple(sorted(outbound.extra_hosts))
+        raw = json.dumps(pack_settings((cfg, layer, source_layer, private_hosts))).encode()
         sha = sha256(raw).hexdigest()
         util.write_bytes_atomic(path, raw)
         cfg.settings_snapshot = path, sha
+        cfg.prepared_layer = layer
+        cfg.snapshot_private_hosts = private_hosts
         repo.pinned_layer = source_layer
     path, sha = cfg.settings_snapshot
     return {"path": str(path), "sha": sha}
 
 
-def read_snapshot(path: Path, sha: str) -> tuple[config.Config, config.RepoLayer, config.RepoLayer]:
+def snapshot_bytes(path: Path, sha: str) -> bytes:
     try:
         raw = path.read_bytes()
-        if sha256(raw).hexdigest() != sha:
-            raise PolicyChanged("worker policy changed after action acceptance")
-        cfg, layer, source_layer = json.loads(raw, object_hook=unpack_settings)
-    except PolicyChanged:
-        raise
-    except (OSError, ValueError, TypeError, KeyError, RecursionError) as error:
+    except (OSError, ValueError) as error:
+        raise PolicyChanged("worker policy changed after action acceptance") from error
+    if sha256(raw).hexdigest() != sha:
+        raise PolicyChanged("worker policy changed after action acceptance")
+    return raw
+
+
+def read_snapshot(path: Path, sha: str) -> tuple[config.Config, config.RepoLayer, config.RepoLayer]:
+    raw = snapshot_bytes(path, sha)
+    try:
+        cfg, layer, source_layer, *redactions = json.loads(raw, object_hook=unpack_settings)
+    except (ValueError, TypeError, KeyError, RecursionError) as error:
         raise PolicyChanged("worker policy changed after action acceptance") from error
     if not (isinstance(cfg, config.Config) and isinstance(layer, config.RepoLayer)
             and isinstance(source_layer, config.RepoLayer)):
         raise PolicyChanged("worker policy changed after action acceptance")
     cfg.settings_snapshot = path, sha
+    cfg.prepared_layer = layer
+    if redactions:
+        cfg.snapshot_private_hosts = redactions[0]
     for repo in cfg.repos:
         if repo.layer_dir == source_layer.dir:
             repo.pinned_layer = source_layer
@@ -259,6 +282,34 @@ def request(job, action: str, prompt: str, setting, tools: tuple, rules: list[st
             "closed_context": job.run.closed_context,
             "config_sha": settings_sha(job.cfg), "layer_sha": settings_sha(job.layer),
             "snapshot_path": str(snapshot), "snapshot_sha": sha}
+
+
+def accepted_settings(launch: dict) -> tuple[config.Config, config.RepoLayer]:
+    cfg, layer, source_layer = read_snapshot(Path(launch["snapshot_path"]), launch["snapshot_sha"])
+    if launch["config_sha"] not in settings_shas(cfg) or launch["layer_sha"] not in settings_shas(layer):
+        raise PolicyChanged("worker policy changed after action acceptance")
+    cfg.repo(launch["repo"]).pinned_layer = source_layer
+    return cfg, layer
+
+
+def run_request(launch: dict, admission) -> dict:
+    cfg, layer = accepted_settings(launch)
+    repo = cfg.repo(launch["repo"])
+    run = pipeline.AgentRun(launch["run"], repo, paths.RUNS_DIR / launch["run"], cfg=cfg, layer=layer,
+                            kind=launch["kind"], step_overrides={launch["role"]: launch["overrides"]},
+                            closed_context=tuple(launch["closed_context"]), launch_gate=admission)
+    kept = Session(**launch["session"])
+    if kept.id:
+        run.sessions[config.INHERITS.get(launch["role"], launch["role"])] = kept
+    with config.using_settings(cfg):
+        result = run.agent(launch["step"], launch["prompt"], Path(launch["cwd"]), role=launch["role"],
+                           allowed_tools=launch["rules"], disallowed_tools=routing.NO_GIT_WRITES,
+                           wait_out_limits=False, fresh_prompt=lambda which: launch["prompt"])
+    return {"event": "result", "ok": result.ok, "text": result.text[:65536],
+            "structured": result.structured, "error": result.error[:2000], "session": asdict(result.session),
+            "cost_usd": run.cost, "paid_usd": run.paid,
+            "runner": result.runner, "model": result.model, "effort": result.effort,
+            "record": result.record, "recovery": pipeline.runner.start_failure(result, launch["role"])}
 
 
 def main() -> None:
@@ -285,22 +336,10 @@ def main() -> None:
 
     threading.Thread(target=listening, daemon=True).start()
     try:
-        raw = sys.stdin.buffer.readline(MAX_MESSAGE + 1)
-        if len(raw.rstrip(b"\n")) > MAX_MESSAGE:
+        raw = sys.stdin.buffer.read(MAX_MESSAGE + 1)
+        if len(raw) > MAX_MESSAGE:
             raise ValueError("oversized worker launch request")
         launch = json.loads(raw)
-        directory = paths.RUNS_DIR / launch["run"]
-        cfg, layer, source_layer = read_snapshot(Path(launch["snapshot_path"]), launch["snapshot_sha"])
-        if launch["config_sha"] not in settings_shas(cfg) or launch["layer_sha"] not in settings_shas(layer):
-            raise PolicyChanged("worker policy changed after action acceptance")
-        repo = cfg.repo(launch["repo"])
-        repo.pinned_layer = source_layer
-        run = pipeline.AgentRun(launch["run"], repo, directory, cfg=cfg, layer=layer,
-                                kind=launch["kind"], step_overrides={launch["role"]: launch["overrides"]},
-                                closed_context=tuple(launch["closed_context"]))
-        kept = Session(**launch["session"])
-        if kept.id:
-            run.sessions[config.INHERITS.get(launch["role"], launch["role"])] = kept
 
         def admission(step, role, route):
             send(channel, {"event": "launch", "step": step, "role": role, "route": route})
@@ -309,16 +348,7 @@ def main() -> None:
                 raise ValueError("worker launch was not admitted")
             return grant.get("limits")
 
-        run.launch_gate = admission
-        with config.using_settings(cfg):
-            result = run.agent(launch["step"], launch["prompt"], Path(launch["cwd"]), role=launch["role"],
-                               allowed_tools=launch["rules"], disallowed_tools=routing.NO_GIT_WRITES,
-                               wait_out_limits=False, fresh_prompt=lambda which: launch["prompt"])
-        send(channel, {"event": "result", "ok": result.ok, "text": result.text[:65536],
-                       "structured": result.structured, "error": result.error[:2000], "session": asdict(result.session),
-                       "cost_usd": run.cost, "paid_usd": run.paid,
-                       "runner": result.runner, "model": result.model, "effort": result.effort,
-                       "record": result.record, "recovery": pipeline.runner.start_failure(result, launch["role"])})
+        send(channel, run_request(launch, admission))
     except pipeline.Stopped:
         pass
     except PolicyChanged as error:

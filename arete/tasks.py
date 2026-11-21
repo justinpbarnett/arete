@@ -157,7 +157,11 @@ def queued(repo: config.Repo, tid: str, why: str, poller_picks: bool) -> dict:
     return answer(tid, repo.name, "", "queued", f"{why}; {later}")
 
 
-def begin(cfg: config.Config, repo: config.Repo, tid: str, force: bool, poller_picks: bool) -> dict:
+def begin(cfg: config.Config, repo: config.Repo, tid: str, force: bool, poller_picks: bool, *,
+          command: list[str] | None = None) -> dict:
+    def spawn():
+        return control.launch(command, pipeline.RUNS_LOG) if command else pipeline.spawn_run(repo.name, tid, force)
+
     with PENDING_LOCK, util.lock(START_LOCK, wait=True):
         if pending := pending_start(repo.name, tid):
             return pending
@@ -166,9 +170,9 @@ def begin(cfg: config.Config, repo: config.Repo, tid: str, force: bool, poller_p
         if why := held(cfg, repo):
             return queued(repo, tid, why, poller_picks)
         if why := runlimits.admission(repo, tid, tracker.for_ticket(cfg, repo, tid),
-                                      runlimits.Policy.of(config.load_layer(repo.layer_dir)), force).reason:
+                                      runlimits.Policy.of(repo.configured_layer()), force).reason:
             raise control.Refused(why)
-        new, state = spawned(repo.name, tid, lambda: pipeline.spawn_run(repo.name, tid, force))
+        new, state = spawned(repo.name, tid, spawn)
         if state != "exited":
             return answer(tid, repo.name, new, state, "started" if new else "child is starting")
         if why := held(cfg, repo):
@@ -259,7 +263,7 @@ def free_to_start(cfg: config.Config, repo: config.Repo, tid: str, after: str = 
     if not ahead and (why := held(cfg, repo)):
         raise slots.NoFreeSlot(why + after)
     if why := runlimits.admission(repo, tid, tracker.for_ticket(cfg, repo, tid),
-                                  runlimits.Policy.of(config.load_layer(repo.layer_dir)), True).reason:
+                                  runlimits.Policy.of(repo.configured_layer()), True).reason:
         raise control.Refused(why)
 
 
@@ -280,12 +284,20 @@ def launch(cfg: config.Config, repo: config.Repo, tid: str, command: list[str], 
     raise did_not_show(repo, tid)
 
 
-def run_of(run_id: str) -> tuple[config.Config, config.Repo, dict]:
+def run_of(run_id: str, *, resume: bool = False) -> tuple[config.Config, config.Repo, dict]:
     if not (row := run_store.run_get(run_id)):
         raise control.NotFound(f"no run {run_id}")
     if row["kind"] != "pipeline":
         raise control.Refused(f"run {run_id} is a {row['kind']} run, not the run of a ticket")
-    cfg = config.load()
+    saved = None
+    if resume and not row.get("files_purged"):
+        from . import delegation
+
+        try:
+            saved = flows.saved_settings(flows.prepared_data(run_id))
+        except delegation.PolicyChanged as error:
+            raise control.Refused(record.failure(error)) from error
+    cfg = saved[0] if saved else config.load()
     try:
         return cfg, cfg.repo(row["repo"]), row
     except config.UnknownRepo:
@@ -293,9 +305,9 @@ def run_of(run_id: str) -> tuple[config.Config, config.Repo, dict]:
                               f"{paths.short_path(paths.CONFIG_FILE)}") from None
 
 
-def command_run(run_id, base_version):
+def command_run(run_id, base_version, *, resume=False):
     writes.check_run(run_id, base_version, public=True)
-    cfg, repo, row = run_of(run_id)
+    cfg, repo, row = run_of(run_id, resume=resume)
     if base_version is not None and row["version"] != base_version:
         raise writes.VersionConflict(row)
     return cfg, repo, row
@@ -331,7 +343,7 @@ def reply(run_id: str, text: str) -> dict:
     if len(text) > MAX_ANSWER_CHARS:
         raise control.Refused(f"the answer is {len(text)} characters; the most is {MAX_ANSWER_CHARS}")
     with util.lock(STEER_LOCK, wait=True):
-        cfg, repo, row = run_of(run_id)
+        cfg, repo, row = run_of(run_id, resume=True)
         waiting = ask_store.asks_of(run_id, "open")
         if not waiting and ask_store.asks_of(run_id):
             raise AlreadyResolved(f"run {run_id}'s asks were already resolved, so this answer was not stored")
@@ -342,9 +354,10 @@ def reply(run_id: str, text: str) -> dict:
         if waiting:
             return reply_to_asks(cfg, repo, row, waiting, text)
         free_to_start(cfg, repo, tid, "; the answer was not stored")
+        command = continuing(cfg, repo, row) if cfg.settings_snapshot is not None else None
         kept = store_answer(cfg, repo, tid, text)
         util.write_bytes_atomic(paths.RUNS_DIR / run_id / pipeline.ANSWER_FILE, text.encode())
-        started = begin(cfg, repo, tid, force=True, poller_picks=repo.pipeline)
+        started = begin(cfg, repo, tid, force=True, poller_picks=repo.pipeline, command=command)
         return {**started, "why": f"{started['why']}; {kept}"} if kept else started
 
 
@@ -397,14 +410,15 @@ def answer_ask(ask_id: str, body) -> dict:
             raise control.NotFound(f"no ask {ask_id}")
         if ask["status"] != "open":
             raise AlreadyResolved(f"ask {ask_id} is {ask['status']}, so it takes no answer{answers_held(ask)}")
-        cfg, repo, row = run_of(ask["run"])
+        stop = isinstance(body, dict) and "stop" in body
+        cfg, repo, row = run_of(ask["run"], resume=not stop)
         if row["status"] != "needs-info":
             raise control.Refused(f"run {row['id']} is {row['status']}, so ask {ask_id} takes no answer")
         no_later_run(row)
         tid = str(row["issue"])
         if run := live_run(repo.name, tid):
             raise control.Busy(f"run {run['id']} of {tracker.issue_name(repo.name, tid)}")
-        if isinstance(body, dict) and "stop" in body:
+        if stop:
             if body != {"stop": True}:
                 raise control.Refused('To stop the run, send {"stop": true} alone')
             return let_go(cfg, repo, row, "stopped")
@@ -466,7 +480,10 @@ def parked_with_answers(row: dict) -> bool:
 
 def continuing(cfg: config.Config, repo: config.Repo, row: dict) -> list[str]:
     tid = str(row["issue"])
-    path = script_path(row) or ("revise" if pipeline.pending_feedback(repo.name, tid) else "feature")
+    path = script_path(row)
+    if not path and cfg.settings_snapshot is not None and not flows.ran_on_seam(row["id"]):
+        return control.command(["run", repo.name, tid, "--local", "--force", "--continue", row["id"]])
+    path = path or ("revise" if pipeline.pending_feedback(repo.name, tid) else "feature")
     return command_of(cfg, path, repo.name, tid, "--force", "--continue", row["id"])
 
 
@@ -564,7 +581,7 @@ def release_closed(cfg: config.Config) -> list[str]:
 
 def resume(run_id: str, step: str = "", base_version=None, *, environment_release: str = "") -> dict:
     with util.lock(STEER_LOCK, wait=True):
-        cfg, repo, row = command_run(run_id, base_version)
+        cfg, repo, row = command_run(run_id, base_version, resume=True)
         if row.get("files_purged"):
             raise control.Refused(f"run {run_id} files were removed on {row['files_purged']}; "
                                   "start the ticket again with POST /api/tasks")
@@ -666,7 +683,7 @@ def adaptive_action(row: dict, action: str) -> dict:
 
 def run_step(run_id: str, step: str, sets, base_version=None) -> dict:
     with util.lock(STEER_LOCK, wait=True):
-        cfg, repo, row = command_run(run_id, base_version)
+        cfg, repo, row = command_run(run_id, base_version, resume=True)
         if row["status"] == "running":
             raise control.Refused(f"run {run_id} is running; a step runs alone only on a run that ended")
         if not (path := script_path(row)):

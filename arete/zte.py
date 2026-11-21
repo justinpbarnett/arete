@@ -268,7 +268,8 @@ def for_run(repo: config.Repo, tid: str, run_id: str, *phases: str) -> tuple[sto
     pilot.require(delivery and (delivery.repo, delivery.data.get("run")) == (repo.name, run_id)
                   and delivery.phase in phases, "the ZTE run lost its delivery grant")
     policy = active(delivery)
-    current, _, digest = settings(config.load(), policy)
+    with config.using_settings(live=True):
+        current, _, digest = settings(config.load(), policy)
     pilot.require(current == repo and delivery.data["config"] == digest, "the admitted ZTE config changed")
     run = pilot.scheduled_run(repo.name, tid)
     pilot.require(run and run["id"] == run_id, "the ZTE run is not the original scheduled attempt")

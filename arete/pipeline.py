@@ -314,10 +314,11 @@ class AgentRun:
             kw = {**s.call, **reach,
                   "resume": self.sessions.get(config.INHERITS.get(s.step, s.step), NO_SESSION)
                   if s.session == "resume" else NO_SESSION, **kw}
-        kw["cfg"] = kw.get("cfg") or self.config
+        if not kw.get("cfg") and self.config.settings_snapshot is not None:
+            kw["cfg"] = self.config
         kw = self.fit_route(step, text, s, kw)
         run_with = kw.get("runner", "") or kw.get("resume", NO_SESSION).runner
-        which, model = routing.chosen(kw.get("model", ""), run_with, kw["cfg"])
+        which, model = routing.chosen(kw.get("model", ""), run_with, kw.get("cfg") or self.config)
         chosen = (which, model, kw.get("effort", ""))
         started, spent = time.monotonic(), self.cost
         kw.setdefault("tier", s.tier if s else "")
@@ -1446,19 +1447,38 @@ def dispatch_path(repo: config.Repo, tid: str) -> str:
 
 
 def run_command(repo_name: str, tid: str | int, force: bool = False, dry_run: bool = False) -> list[str]:
-    cfg = config.load()
+    from . import flows
+
+    tid = str(tid)
     flags = [*(["--force"] if force else []), *(["--dry-run"] if dry_run else [])]
-    mode = dispatch_path(cfg.repo(repo_name), str(tid))
-    if (asked := answered_run(repo_name, str(tid))) and not dry_run:
-        mode = recorded_path(asked["id"])
-        if mode != "classic":
-            return script_command(cfg, mode, repo_name, str(tid), *flags, "--continue", asked["id"])
+    newest_live = run_store.newest_live_whole_run(repo_name, tid) if not dry_run else None
+    cfg, interrupted_mode = None, ""
+    if newest_live and newest_live["status"] == "interrupted" and not force:
+        run_id = newest_live["id"]
+        mode = recorded_path(run_id)
+        if mode == "classic":
+            return control.command(["run", repo_name, tid, "--local", "--restart", run_id])
+        if saved := flows.saved_settings(flows.prepared_data(run_id)):
+            cfg, interrupted_mode = saved[0], mode
+    elif newest_live and newest_live["status"] == "needs-info":
+        run_id = newest_live["id"]
+        structured = answered_run(repo_name, tid)
+        if structured or answer_text(run_id):
+            saved = flows.saved_settings(flows.prepared_data(run_id))
+            mode = recorded_path(run_id)
+            if mode == "classic":
+                return control.command(["run", repo_name, tid, "--local", *flags, "--continue", run_id])
+            if structured:
+                return script_command(saved[0] if saved else config.load(), mode, repo_name, tid,
+                                      *flags, "--continue", run_id)
+    cfg = cfg or config.load()
+    mode = interrupted_mode or dispatch_path(cfg.repo(repo_name), tid)
     if mode == "classic":
         return control.command(["run", repo_name, str(tid), "--local", *flags])
     if mode in (ORCHESTRATED, "orchestrate"):
         from .store import orchestration
 
-        newest = run_store.newest_whole_run(repo_name, str(tid))
+        newest = newest_live if interrupted_mode else run_store.newest_whole_run(repo_name, tid)
         source = newest if newest and newest["status"] == "interrupted" else (
             next(iter(run_store.open_runs(repo_name, str(tid))), None)
             if not force and pending_feedback(repo_name, str(tid)) else None)
@@ -1645,28 +1665,40 @@ def crash_failure(error: Exception) -> dict:
 
 def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool = False,
               script: Script | None = None, admission: Callable | None = None,
-              launch_done: Callable | None = None, closed_context: tuple[str, ...] = ()) -> int:
+              launch_done: Callable | None = None, closed_context: tuple[str, ...] = (), answering: str = "",
+              restart: str = "") -> int:
     try:
         producer_baseline = scratch.process_ids()
     except OSError:
         producer_baseline = None
     service_labels = scratch.service_labels()
     paths.ensure_dirs()
-    from . import flows, launch_lease, pilot, zte
+    from . import delegation, flows, launch_lease, pilot, zte
     from .store import db
     from .store import zte as zte_store
 
-    continued = run_store.run_get(script.continues) if script and script.continues else None
+    continued_id = script.continues if script else answering or restart
+    continued = run_store.run_get(continued_id) if continued_id else None
+    if answering and (not continued or continued["repo"] != repo_name or recorded_path(answering) != "classic"):
+        print(f"Run {answering} is not a classic run of {repo_name}.")
+        return 2
+    if restart and (not continued or continued["repo"] != repo_name or continued["status"] != "interrupted"
+                    or recorded_path(restart) != "classic"):
+        print(f"Run {restart} is not an interrupted classic run of {repo_name}.")
+        return 2
+    if script and not (script.continues or script.only or dry_run):
+        latest = run_store.newest_live_whole_run(repo_name, tid)
+        if latest and latest["status"] == "interrupted":
+            continued = latest
     try:
-        saved = (flows.saved_settings(flows.prepared_data(script.continues))
+        saved = (flows.saved_settings(flows.prepared_data(continued["id"]))
                  if continued and continued["repo"] == repo_name else None)
-    except ValueError as error:
+    except delegation.PolicyChanged as error:
         print(record.failure(error))
         return 2
     if saved:
-        cfg, _, source_layer = saved
+        cfg = saved[0]
         repo = cfg.repo(repo_name)
-        repo.pinned_layer = source_layer
     else:
         cfg = config.load()
         configured_repo = cfg.repo(repo_name)
@@ -1683,10 +1715,10 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
     except ValueError as e:
         print(f"{repo_name}: {e}")
         return 1
-    if not script:
+    if not (script or answering or restart):
         adw = dispatch_path(repo, str(tid)) != "classic"
-    if adw and not script:
-        return exec_script(repo.name, tid, dry_run, force)
+        if adw:
+            return exec_script(repo.name, tid, dry_run, force)
     if script and (refusal := script_refusal(cfg, repo, tid, script, dry_run)):
         print(refusal)
         return 2
@@ -1696,6 +1728,11 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         if not got:
             print(f"{name} is already running")
             return 0
+        if restart:
+            latest = run_store.newest_live_whole_run(repo_name, tid)
+            if not latest or latest["id"] != restart or latest["status"] != "interrupted":
+                print(f"Run {restart} is no longer the latest interrupted run of {name}.")
+                return 2
         retry_of = {}
         fixed_gaps = ()
         preview_of = run_store.held_environment_branch(repo.name, str(tid)) if dry_run else ""
@@ -1735,17 +1772,24 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 from .orchestration import policy_fingerprint
 
                 permit = pilot.task_admission(str(tid), repo.name)
+                live_cfg, live_layer = pilot.live_policy(repo)
                 pilot.require(principals.current() == "rule:poll" and script and script.path == "orchestrate"
                               and not any((dry_run, force, script.continues, script.only, script.again, script.repairs,
                                            script.action, script.overrides, closed_context))
                               and permit["policy"] == policy_fingerprint(cfg, layer, ())
-                              and layer.factory_path == ORCHESTRATED,
+                              == policy_fingerprint(live_cfg, live_layer, ())
+                              and layer.factory_path == live_layer.factory_path == ORCHESTRATED,
                               "the one-shot task requires the approved first scheduled orchestration")
                 wall_deadline = permit["deadline"]
             if isinstance(tk, tracker.GitHubTracker):
                 tk.require_ordinary(tid)
             budget_history = run_store.ticket_runs(repo.name, tid, limit=1, live=bool(retry_of or preview_of))
             latest = budget_history[0] if budget_history else None
+            if answering:
+                parked = run_store.newest_live_whole_run(repo.name, tid)
+                if not parked or parked["id"] != answering or parked["status"] != "needs-info":
+                    print(f"{answering} is no longer the waiting run of {name}.")
+                    return 2
             custom_feature = bool(script and script.path == "feature" and custom_revision_feature(cfg))
             may_revise = not (zte_grant or retry_of or reconciling_catch_up or only) and (
                 script is None or not script.repairs and (script.path in ("orchestrate", "revise") or custom_feature))
@@ -1842,7 +1886,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     with util.lock(zte.INTERLOCK) as got_interlock:
                         pilot.require(got_interlock, "ZTE run registration is interlocked")
                         check_start_cutoff()
-                        with db.one_read(timeout=0):
+                        with db.one_read(timeout=0), config.using_settings(live=True):
                             fresh_grant = zte.admit_run(config.load(), repo, str(tid))
                         pilot.require(fresh_grant == zte_grant, "ZTE authorization changed before run start")
                         readme_rule = zte.active(fresh_grant).signal(fresh_grant.base)
@@ -2186,10 +2230,8 @@ def checked_layer(cfg: config.Config, layer_dir: Path, *, source_file: Path | No
 
 
 def resolve_layer(cfg: config.Config, run: Run, ws: Path) -> config.RepoLayer:
-    if cfg.settings_snapshot:
-        from . import delegation
-
-        return delegation.read_snapshot(*cfg.settings_snapshot)[1]
+    if cfg.prepared_layer is not None:
+        return cfg.prepared_layer
     repo = run.repo
     if repo.layer:
         return checked_layer(cfg, repo.layer)
@@ -2311,7 +2353,8 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
     if why := furnish(cfg, run, layer, ws):
         return _fail(run, why)
     workspace.note_made(ws, checkouts, workspace_owner(run, ws, checkouts))
-    snapshot = delegation.freeze_settings(cfg, run, layer)
+    snapshot = delegation.freeze_settings(cfg, run, layer, source_layer=main_layer)
+    run_lines.write(run.id, "settings_snapshot", settings_snapshot=snapshot)
 
     expertise = layer.expertise_file.read_text() if layer.expertise_file.exists() else "(none yet)"
     checks = check_list(layer)

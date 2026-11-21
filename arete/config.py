@@ -277,6 +277,8 @@ class PaidRoutes:
 @dataclass
 class Config:
     settings_snapshot: ClassVar[tuple[Path, str] | None] = None
+    prepared_layer: ClassVar[RepoLayer | None] = None
+    snapshot_private_hosts: ClassVar[tuple[str, ...]] = ()
     alert_repo: str = ""
     global_repo: str = "ai"
     arete_repo: str = "arete"
@@ -905,6 +907,8 @@ def read_data(path: Path | None = None) -> dict:
 
 
 def discovery_port(data: dict | None = None) -> int:
+    if data is None and (cfg := snapshot_config()) is not None:
+        return cfg.dashboard_port
     try:
         data = read_data() if data is None else data
         dashboard = data.get("dashboard", {})
@@ -914,6 +918,8 @@ def discovery_port(data: dict | None = None) -> int:
 
 
 def load_or_problem(path: Path | None = None) -> tuple[Config, str]:
+    if (path is None or path == paths.CONFIG_FILE) and (cfg := snapshot_config()) is not None:
+        return cfg, ""
     try:
         return load(path), ""
     except Exception as e:
@@ -942,7 +948,7 @@ def server_url(data: dict) -> str:
     return server.get("url", "").strip()
 
 
-_LOAD_SETTINGS: ContextVar[Config | None] = ContextVar("load_settings", default=None)
+_LOAD_SETTINGS: ContextVar[Config | Literal[False] | None] = ContextVar("load_settings", default=None)
 SNAPSHOT_PATH = "ARETE_SETTINGS_SNAPSHOT"
 SNAPSHOT_SHA = "ARETE_SETTINGS_SNAPSHOT_SHA"
 
@@ -955,22 +961,30 @@ def snapshot_env(cfg: Config) -> dict[str, str]:
 
 
 @contextlib.contextmanager
-def using_settings(cfg: Config | None):
-    token = _LOAD_SETTINGS.set(cfg)
+def using_settings(cfg: Config | None = None, *, live: bool = False):
+    token = _LOAD_SETTINGS.set(False if live else cfg)
     try:
         yield
     finally:
         _LOAD_SETTINGS.reset(token)
 
 
-def load(path: Path | None = None, strict: bool = False) -> Config:
-    if path is None:
-        if not strict and (cfg := _LOAD_SETTINGS.get()) is not None:
-            return cfg
-        if snapshot := os.environ.get(SNAPSHOT_PATH):
-            from . import delegation
+def snapshot_config() -> Config | None:
+    cfg = _LOAD_SETTINGS.get()
+    if cfg is False:
+        return None
+    if cfg is not None and cfg.settings_snapshot is not None:
+        return cfg
+    if SNAPSHOT_PATH in os.environ or SNAPSHOT_SHA in os.environ:
+        from . import delegation
 
-            return delegation.read_snapshot(Path(snapshot), os.environ.get(SNAPSHOT_SHA, ""))[0]
+        return delegation.read_snapshot(Path(os.environ.get(SNAPSHOT_PATH, "")), os.environ.get(SNAPSHOT_SHA, ""))[0]
+    return None
+
+
+def load(path: Path | None = None, strict: bool = False) -> Config:
+    if (path is None or path == paths.CONFIG_FILE) and (cfg := snapshot_config()) is not None:
+        return cfg
     path = path or paths.CONFIG_FILE
     ignored: list[str] | None = None if strict else []
     try:
@@ -1308,11 +1322,12 @@ def section(data: dict, name: str) -> dict:
 
 
 def load_layer(layer_dir: Path, strict: bool = False, *, source_file: Path | None = None) -> RepoLayer:
-    cfg = _LOAD_SETTINGS.get()
-    if cfg and cfg.settings_snapshot and source_file is None and not strict:
+    if (cfg := snapshot_config()) is not None:
         for repo in cfg.repos:
             if repo.pinned_layer is not None and repo.layer_dir == layer_dir:
                 return repo.pinned_layer
+        if cfg.prepared_layer is not None and cfg.prepared_layer.dir == layer_dir:
+            return cfg.prepared_layer
     ignored: list[str] | None = None if strict else []
     layer = RepoLayer(dir=layer_dir)
     config_file = source_file or layer.config_file

@@ -213,6 +213,15 @@ def task_admission(tid: str, repo: str) -> dict:
     return receipt
 
 
+def live_policy(repo: config.Repo) -> tuple[config.Config, config.RepoLayer]:
+    try:
+        with config.using_settings(live=True):
+            cfg = config.load()
+            return cfg, config.load_layer(cfg.repo(repo.name).layer_dir)
+    except (OSError, ValueError, TypeError, config.UnknownRepo) as error:
+        raise Held("the one-shot task's live policy could not be read") from error
+
+
 def pickable(tid: str, repo: str) -> bool:
     if not is_pilot_task(tid):
         return True
@@ -294,8 +303,7 @@ def publication_head(repo: config.Repo, tid: str, run_id: str, checkout: workspa
     signal = Signal(**receipt["signal"])
     require(checkout.github == signal.github and checkout.base == BRANCH and not checkout.dir and not checkout.resumes
             and checkout.src.resolve() == repo.path.resolve(), "the publication checkout is not the authorized checkout")
-    cfg = config.load()
-    layer = config.load_layer(repo.layer_dir)
+    cfg, layer = live_policy(repo)
     head = git(checkout.wt, "rev-parse", "HEAD").strip()
     tree = exact_edit(checkout.wt, signal, head, signal.expected(readme(checkout.wt, signal.base)))
     data = (orchestration.find(run_id) or {}).get("data", {})

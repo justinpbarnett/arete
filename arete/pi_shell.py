@@ -151,7 +151,7 @@ class Shell:
         return profile
 
     def execute(self, request: dict, stopped: threading.Event) -> dict:
-        from . import codex, guard
+        from . import codex, delegation, guard
 
         if type(request) is not dict or request.keys() - {"command", "timeout"}:
             raise ValueError("shell accepts only command and timeout")
@@ -165,7 +165,10 @@ class Shell:
             raise ValueError("command is outside this step's Bash permissions; patterned grants need one simple command")
         if why := codex.git_write(command, list(self.denied)):
             raise ValueError(f"Arete owns publication and git mutation: {why}")
-        with config.using_settings(self.guard_config):
+        cfg = self.guard_config
+        if cfg is not None and cfg.settings_snapshot is not None:
+            delegation.snapshot_bytes(*cfg.settings_snapshot)
+        with config.using_settings(cfg):
             if why := guard.decide({"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(self.cwd)},
                                    self.judge, self.floor):
                 raise ValueError(why)

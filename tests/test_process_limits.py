@@ -10,7 +10,6 @@ import sqlite3
 import subprocess
 import tempfile
 import time
-import tomllib
 import unittest
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
@@ -24,7 +23,6 @@ from arete import (
     accounts,
     claude,
     codebase,
-    codex,
     config,
     dbstats,
     delegation,
@@ -676,12 +674,28 @@ class OrchestrationLineageTests(Isolated):
                                      [] if launched else [self.ticket])
 
 
-class RunSettingsFixture(Isolated):
+class RunSettingsSnapshotTests(Isolated):
+    @classmethod
+    def setUpClass(cls):
+        connect = foundation.connect_db
+
+        def connect_fixture(*args, **kwargs):
+            connection = connect(*args, **kwargs)
+            connection.execute("PRAGMA synchronous=OFF")
+            return connection
+
+        cls.enterClassContext(patch.object(foundation, "connect_db", connect_fixture))
+        cls.enterClassContext(patch.object(util, "flush_fd"))
+        cls.enterClassContext(patch.object(os, "fsync"))
+        super().setUpClass()
+
     def setUp(self):
         super().setUp()
+        self.enterContext(patch.object(jev, "KEY_FILE", self.root / "missing-jev-key"))
         self.layer_dir = self.root / "layer"
         self.layer_dir.mkdir()
         self.enterContext(patch.object(paths, "RUNS_DIR", paths.STATE_DIR / "runs"))
+        paths.RUNS_DIR.mkdir(exist_ok=True)
         self.enterContext(patch.object(paths, "ISOLATED", False))
         self.enterContext(patch.dict(os.environ, {
             "ARETE_CONFIG_DIR": str(paths.CONFIG_DIR), "ARETE_STATE_DIR": str(paths.STATE_DIR),
@@ -715,7 +729,7 @@ tracker = 'local'
             "[document]\nvoice = ['voice.md']\n")
 
     def controller(self, previous=""):
-        cfg = config.load()
+        cfg = config.Config(repos=[self.repo]) if previous else config.load()
         repo = cfg.repo(self.repo.name)
         run_id = record.start("pipeline", repo=repo.name, issue=self.ticket, dry_run=1)
         directory = paths.RUNS_DIR / run_id
@@ -742,15 +756,20 @@ tracker = 'local'
         return action
 
     def launch_worker(self, controller, action):
-        self.assertIsNone(controller.dispatch(action))
-        deadline = time.monotonic() + 4
-        while controller.workers and time.monotonic() < deadline:
-            controller.collect()
-            if controller.workers:
-                time.sleep(0.01)
-        self.assertFalse(controller.workers, "worker did not settle")
-        result, = ledger.actions(controller.lease)
-        return result
+        worker = Mock(pid=123, identity=1)
+        with patch.object(delegation, "Worker", return_value=worker) as process:
+            self.assertIsNone(controller.dispatch(action))
+        launch = process.call_args.args[2]
+        messages = []
+
+        def admit(step, role, route):
+            messages.append({"event": "launch", "step": step, "role": role, "route": route})
+
+        messages.append(delegation.run_request(launch, admit))
+        worker.receive.return_value = messages
+        controller.collect()
+        self.assertFalse(controller.workers)
+        return next(result for result in ledger.actions(controller.lease) if result["id"] == action["id"])
 
     def mock_worktree(self, fetched_layer=None):
         def make(run, base, branch, ws, copies):
@@ -761,8 +780,6 @@ tracker = 'local'
 
         return self.enterContext(patch.object(flows, "local_workspace", side_effect=make))
 
-
-class RunSettingsSnapshotTests(RunSettingsFixture):
     def test_live_run_keeps_its_settings_and_next_run_reads_edits(self):
         self.mock_worktree()
         self.write_settings("original", 0.5)
@@ -786,16 +803,16 @@ class RunSettingsSnapshotTests(RunSettingsFixture):
         self.assertEqual(newer.run.config.replay.dir, self.root / "edited")
         self.assertIn("`echo edited layer`", flows.report(newer.job, "", {}, ""))
 
-
-class WorkerSnapshotRefusalTests(RunSettingsFixture):
-    def test_dispatch_refuses_changed_snapshot_bytes(self):
+    def test_dispatch_and_worker_each_refuse_changed_snapshot_bytes(self):
         self.mock_worktree()
         self.write_settings("original", 0.5)
         controller = self.controller()
         self.assertIsNone(controller.prepare())
         action = self.accept_worker(controller)
         path, _ = controller.job.cfg.settings_snapshot
-        path.write_bytes(path.read_bytes() + b"\n")
+        original = path.read_bytes()
+        changed = original + b"\n"
+        path.write_bytes(changed)
 
         self.assertIsInstance(controller.dispatch(action), delegation.PolicyChanged)
         result, = ledger.actions(controller.lease)
@@ -803,27 +820,15 @@ class WorkerSnapshotRefusalTests(RunSettingsFixture):
         self.assertEqual(result["result"]["error"], "PolicyChanged: worker policy changed after action acceptance")
         self.assertFalse(controller.run.step_started)
 
-    def test_worker_checks_snapshot_again_after_dispatch(self):
-        self.mock_worktree()
-        self.write_settings("original", 0.5)
-        controller = self.controller()
-        self.assertIsNone(controller.prepare())
-        worker = delegation.Worker
-        path, _ = controller.job.cfg.settings_snapshot
+        path.write_bytes(original)
+        controller.check_snapshot()
+        launch = delegation.request(controller.job, action["id"], "Read the fixture",
+                                    controller.run.settings("plan"), (), [])
+        path.write_bytes(changed)
+        with self.assertRaises(delegation.PolicyChanged):
+            delegation.accepted_settings(launch)
 
-        def launch(*args):
-            path.write_bytes(path.read_bytes() + b"\n")
-            return worker(*args)
-
-        with patch.object(delegation, "Worker", side_effect=launch):
-            result = self.launch_worker(controller, self.accept_worker(controller))
-        self.assertEqual(result["state"], "failed")
-        self.assertEqual(result["result"]["error"], "PolicyChanged: worker policy changed after action acceptance")
-        self.assertFalse(controller.run.step_started)
-
-
-class UpstreamLayerSettingsTests(RunSettingsFixture):
-    def test_snapshot_preserves_source_and_checked_in_layer_resolution(self):
+    def test_resume_keeps_lineage_and_resolved_layers_without_rereading_settings(self):
         self.write_settings("original", 0.5, checked_in=True)
         source_config = self.repo.layer_dir / "config.toml"
         source_config.write_text(source_config.read_text() + "\n[git]\nbase = 'main'\n[factory]\npath = 'classic'\n")
@@ -845,101 +850,406 @@ class UpstreamLayerSettingsTests(RunSettingsFixture):
         self.assertEqual((configured.base_branch, configured.passes, configured.factory_path),
                          ("main", ("SNAPSHOT_ORIGINAL",), "classic"))
         self.assertEqual(cfg.repo(self.repo.name).configured_layer(), configured)
-
-
-class PreparedLayerResumeTests(RunSettingsFixture):
-    def test_resume_without_file_changes_keeps_lineage_and_snapshot(self):
-        self.write_settings("original", 0.5, checked_in=True)
-        controller = self.controller()
-        edited = self.root / "fetched-layer"
-        self.write_layer(edited, "edited")
-        self.mock_worktree(edited)
-        self.assertIsNone(controller.prepare())
-        worktree_layer = controller.job.ws / ".agents"
-        self.assertIn("echo edited layer", (worktree_layer / "config.toml").read_text())
-        self.assertEqual(controller.job.layer.checks["behavior"], "echo edited layer")
         record.move(controller.run.id, "interrupted", ("running",))
 
-        resumed = self.controller(controller.run.id)
-        self.assertIsNone(resumed.prepare())
+        with patch.object(config, "read_data", side_effect=AssertionError("read live config")), patch.object(
+                config, "load_layer", side_effect=AssertionError("read live layer")):
+            resumed_cfg, _, _ = tasks.run_of(controller.run.id, resume=True)
+            self.assertEqual(resumed_cfg.settings_snapshot, controller.job.cfg.settings_snapshot)
+            resumed = self.controller(controller.run.id)
+            self.assertIsNone(resumed.prepare())
         self.assertEqual(resumed.job.layer, controller.job.layer)
         self.assertEqual(resumed.data["policy_sha"], controller.data["policy_sha"])
         self.assertEqual(resumed.job.cfg.settings_snapshot, controller.job.cfg.settings_snapshot)
         self.assertIn("`echo edited layer`", flows.report(resumed.job, "", {}, ""))
 
+    def test_bash_hook_uses_accepted_jev_settings(self):
+        from arete import cli
 
-class NativeGuardSettingsFixture:
-    def check_hook(self, module, blocked, refusal):
-        with tempfile.TemporaryDirectory(prefix="arete-guard-settings-") as directory:
-            root = Path(directory).resolve()
-            cwd = root / "repo"
-            cwd.mkdir()
-            settings = root / "config" / "config.toml"
-            settings.parent.mkdir()
-            self.enterContext(patch.object(paths, "CONFIG_FILE", settings))
-            self.enterContext(patch.object(paths, "ISOLATED", False))
-            self.enterContext(patch.dict(os.environ, {"ARETE_CONFIG_DIR": str(settings.parent),
-                                                      "ARETE_STATE_DIR": str(root / "state")}))
-            settings.write_text("[jev]\nguard = true\nirreversible_hold = 0.5\n")
-            cfg = config.load()
-            layer = config.RepoLayer(root)
-            run = SimpleNamespace(dir=root, repo=config.Repo("fixture", root, layer=root))
-            delegation.freeze_settings(cfg, run, layer)
-            settings.write_text("[jev]\nguard = true\nirreversible_hold = 0.7\n")
-            trip = runner.Trip(cfg, None, devices.LOCAL, None, Session(), None, None, layer=layer)
+        paths.CONFIG_FILE.write_text("[jev]\nguard = true\nirreversible_hold = 0.5\n")
+        cfg = config.load()
+        layer = config.RepoLayer(self.repo.layer_dir)
+        delegation.freeze_settings(cfg, SimpleNamespace(dir=self.root, repo=self.repo), layer)
+        paths.CONFIG_FILE.write_text("[jev]\nguard = true\nirreversible_hold = 0.7\n")
 
-            candidate = SimpleNamespace(runner=module.__name__.split(".")[-1], effort="", instructions=())
-            auth = accounts.Auth("api_key")
-            picked = runner.Picked(candidate, auth, None, "fixture", "", set(), None)
-            kw = runner.launch_kwargs({"tools": ["Bash"], "allowed_tools": ["Bash"], "persist": False},
-                                      picked, trip, ("", ""), False, Mock(), cwd=cwd)
-            command, env = self.hook_command(module, cwd, kw, auth)
-            shell_tool = "Bash" if module is claude else "shell"
-            self.assertIn("git cannot undo (p 0.60)", self.hook_decision(command, env, cwd, shell_tool, "echo fixture"))
-            self.assertIn(refusal, self.hook_decision(command, env, cwd, shell_tool, blocked))
-            self.assertEqual(config.load().jev.irreversible_hold, 0.7)
-
-    def hook_command(self, module, root, kw, auth):
+        cwd = self.repo.path
+        trip = runner.Trip(cfg, None, devices.LOCAL, None, Session(), None, None, layer=layer)
+        candidate = SimpleNamespace(runner="claude", effort="", instructions=())
+        auth = accounts.Auth("api_key")
+        picked = runner.Picked(candidate, auth, None, "fixture", "", set(), None)
+        kw = runner.launch_kwargs({"tools": ["Bash"], "allowed_tools": ["Bash"], "persist": False},
+                                  picked, trip, ("", ""), False, Mock(), cwd=cwd)
         completed = subprocess.CompletedProcess([], 0, "", "")
-        if module is claude:
-            with patch.object(claude.child, "stream", return_value=completed) as launch:
-                claude.run("Fixture", root, model="fixture", auth=auth, **kw)
-            argv = launch.call_args.args[0]
-            command = json.loads(argv[argv.index("--settings") + 1])["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
-            return command, launch.call_args.args[3]
-        with (patch.object(codex, "launch", return_value=completed) as launch,
-              patch.object(codex, "isolation_problem", return_value=""), patch.object(codex, "home", return_value=root)):
-            codex.run("Fixture", root, model="fixture", auth=auth, **kw)
-        setting = next(arg for arg in launch.call_args.args[0] if arg.startswith("hooks.PreToolUse="))
-        return tomllib.loads(setting)["hooks"]["PreToolUse"][0]["hooks"][0]["command"], launch.call_args.args[3]
-
-    def hook_decision(self, command, env, cwd, tool, bash):
+        with patch.object(claude.child, "stream", return_value=completed) as launch:
+            claude.run("Fixture", cwd, model="fixture", auth=auth, **kw)
+        command_line, _, _, env = launch.call_args.args[:4]
+        hooks = json.loads(command_line[command_line.index("--settings") + 1])["hooks"]
+        command = hooks["PreToolUse"][0]["hooks"][0]["command"]
         argv = shlex.split(command)
-        entrypoint = argv.index("-c") + 1
-        setup = ("from arete import jev; jev.key = lambda *a: 'fixture'; "
-                 "jev.ask = lambda *a, **kw: jev.Reply({'effect': jev.Answer('irreversible', 0.6, "
-                 "{'irreversible': 0.6})}); ")
-        at = argv[entrypoint].index("from arete.cli")
-        argv[entrypoint] = argv[entrypoint][:at] + setup + argv[entrypoint][at:]
-        payload = {"tool_name": tool, "tool_input": {"command": bash}, "cwd": str(cwd)}
-        proc = subprocess.run(argv, input=json.dumps(payload), capture_output=True, text=True, timeout=2, cwd=cwd, env=env)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        result = json.loads(proc.stdout)["hookSpecificOutput"]
+        hook_args = argv[argv.index("-c") + 2:]
+        payload = {"tool_name": "Bash", "tool_input": {"command": "echo fixture"}, "cwd": str(cwd)}
+        response = io.StringIO()
+        answer = jev.Answer("irreversible", 0.6, {"irreversible": 0.6})
+        with (patch.dict(os.environ, env, clear=True), patch.object(scratch, "HOOK", {}),
+              patch.object(guard, "LOGIN_FOLDERS", guard.LOGIN_FOLDERS),
+              patch("sys.stdin", io.StringIO(json.dumps(payload))), contextlib.redirect_stdout(response),
+              patch.object(jev, "key", return_value="fixture"),
+              patch.object(jev, "ask", return_value=jev.Reply({"effect": answer}))):
+            self.assertEqual(cli.main(hook_args), 0)
+        result = json.loads(response.getvalue())["hookSpecificOutput"]
         self.assertEqual(result["permissionDecision"], "deny")
-        return result["permissionDecisionReason"]
+        self.assertIn("git cannot undo (p 0.60)", result["permissionDecisionReason"])
+        self.assertEqual(config.load().jev.irreversible_hold, 0.7)
 
+    def test_claude_tools_keep_the_snapshot_out_of_the_open_run_folder(self):
+        from arete import cli
 
-class ClaudeGuardSettingsTests(NativeGuardSettingsFixture, unittest.TestCase):
-    def test_hook_uses_accepted_jev_settings_and_enforces_the_floor(self):
-        self.check_hook(claude, "cat ../state/other-run.txt", "outside the agent's reach")
+        self.mock_worktree()
+        self.write_settings("original", 0.5)
+        controller = self.controller()
+        self.assertIsNone(controller.prepare())
+        cfg, repo, run = controller.job.cfg, controller.run.repo, controller.run
+        path, _ = cfg.settings_snapshot
+        report = run.dir / "report.md"
+        report.write_text("Public run evidence")
+        trip = runner.Trip(cfg, repo, devices.LOCAL, None, Session(), None, None, layer=controller.job.layer)
+        candidate = SimpleNamespace(runner="claude", effort="", instructions=())
+        picked = runner.Picked(candidate, accounts.Auth("api_key"), None, "fixture", "", set(), None)
+        kw = runner.launch_kwargs({"tools": ["Read", "Bash"], "add_dirs": [run.dir]}, picked, trip, (run.id, ""),
+                                  False, Mock(), cwd=controller.job.ws)
+        settings = kw["settings"]
+        self.assertIn(f"Read(/{path})", settings["permissions"]["deny"])
+        self.assertFalse(path.is_relative_to(run.dir))
+        self.assertTrue(path.is_relative_to(paths.settings_store()))
+        confinement = settings["sandbox"]
+        self.assertTrue(confinement["enabled"])
+        self.assertTrue(confinement["failIfUnavailable"])
+        self.assertFalse(confinement["allowUnsandboxedCommands"])
+        self.assertFalse(confinement["autoAllowBashIfSandboxed"])
+        self.assertEqual(confinement["excludedCommands"], [])
+        self.assertIn(str(paths.settings_store()), confinement["filesystem"]["denyRead"])
+        self.assertIn(str(paths.settings_store()), confinement["filesystem"]["denyWrite"])
+        self.assertIn(str(run.dir), confinement["filesystem"]["allowWrite"])
+        command = shlex.split(settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"])
+        env = {**os.environ, **kw["extra_env"]}
+        self.assertIn(str(path), command)
+        hook_args = command[command.index("-c") + 2:]
+        with (patch.dict(os.environ, env, clear=True), patch.object(guard, "LOGIN_FOLDERS", guard.LOGIN_FOLDERS),
+              patch.object(scratch, "HOOK", {})):
+            for tool, tool_input, denied in (
+                    ("Read", {"file_path": str(path)}, True),
+                    ("Read", {"file_path": str(paths.CONFIG_FILE)}, True),
+                    ("Read", {"file_path": str(report)}, False),
+                    ("Bash", {"command": f'cat "${config.SNAPSHOT_PATH}"'}, True)):
+                payload = {"cwd": str(controller.job.ws), "tool_name": tool, "tool_input": tool_input}
+                with (patch("sys.stdin", io.StringIO(json.dumps(payload))),
+                      contextlib.redirect_stdout(io.StringIO()) as out):
+                    self.assertEqual(cli.main(hook_args), 0)
+                    self.assertEqual(bool(out.getvalue()), denied, out.getvalue())
+                    if denied:
+                        output = json.loads(out.getvalue())["hookSpecificOutput"]
+                        self.assertEqual(output["permissionDecision"], "deny")
 
+    def test_claude_ask_uses_the_verified_jev_policy_without_reading_the_snapshot(self):
+        from arete import cli, jev_ask
 
-class CodexGuardSettingsTests(NativeGuardSettingsFixture, unittest.TestCase):
-    def test_hook_uses_accepted_jev_settings_and_refuses_git_writes(self):
-        self.check_hook(codex, "git add fixture.txt", "git add")
+        self.write_settings("original", 0.5)
+        cwd = self.repo.path
+        blocked = cwd / "other"
+        blocked.mkdir()
+        file = blocked / "notes.txt"
+        file.write_text("fixture")
+        paths.CONFIG_FILE.write_text(paths.CONFIG_FILE.read_text().replace("[jev]\n", "[jev]\nmodel = 'frozen'\n")
+                                     + f"\n[[repo]]\nname = 'other'\npath = '{blocked}'\njev = false\n")
+        cfg = config.load()
+        run = self.made_run()
+        repo = run.repo = cfg.repo(self.repo.name)
+        layer = repo.configured_layer()
+        delegation.freeze_settings(cfg, run, layer)
+        path, _ = cfg.settings_snapshot
+        paths.CONFIG_FILE.write_text("[jev]\nenabled = false\nmodel = 'edited'\n")
 
+        trip = runner.Trip(cfg, repo, devices.LOCAL, None, Session(), None, None, layer=layer)
+        candidate = SimpleNamespace(runner="claude", effort="", instructions=())
+        auth = accounts.Auth("api_key")
+        picked = runner.Picked(candidate, auth, None, "fixture", "", set(), None)
 
-class PiShellSettingsTests(unittest.TestCase):
+        def ask(*args):
+            with (patch("sys.stdin", io.StringIO("fixture")), contextlib.redirect_stdout(io.StringIO()) as out,
+                  contextlib.redirect_stderr(io.StringIO()) as err):
+                code = cli.main(["ask", "Is this the fixture?", *args, "--json"])
+                return code, out.getvalue(), err.getvalue()
+
+        def launch(cmd, _, prompt, env, timeout, on_line):
+            mailbox = Path(env[jev_ask.POLICY_DIR])
+            self.assertTrue(mailbox.is_relative_to(run.dir))
+            self.assertIn(jev_ask.rule(), cmd)
+            settings = json.loads(cmd[cmd.index("--settings") + 1])
+            self.assertIn(str(path), settings["sandbox"]["filesystem"]["denyRead"])
+            answer = jev.Answer("yes", 0.9, {"yes": 0.9})
+            with (patch.dict(os.environ, env, clear=True), patch.object(Path, "cwd", return_value=cwd),
+                  patch.object(config, "load", side_effect=PermissionError("sandbox denied the snapshot read")),
+                  patch.object(jev, "ask", return_value=jev.Reply({"q": answer})) as judge):
+                code, out, err = ask()
+                self.assertEqual(code, 0, err)
+                self.assertEqual(json.loads(out)["answer"], "yes")
+                self.assertEqual(judge.call_args.args[2].jev.model, "frozen")
+                code, _, err = ask(str(file))
+                self.assertEqual(code, 2)
+                self.assertIn("JEV is off for this repo", err)
+                path.write_bytes(path.read_bytes() + b"\n")
+                for missing in (False, True):
+                    if missing:
+                        path.unlink()
+                    code, _, err = ask()
+                    self.assertEqual(code, 2)
+                    self.assertIn("could not verify the accepted JEV settings", err)
+                judge.assert_called_once()
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with patch.object(jev, "key", return_value="fixture"), patch.object(claude.child, "stream", side_effect=launch):
+            kw = runner.launch_kwargs({"tools": ["Bash"]}, picked, trip, (run.id, ""), True, Mock(), cwd=cwd)
+            claude.run("Fixture", cwd, model="fixture", auth=auth, **kw)
+
+    def test_bash_hooks_deny_when_the_accepted_snapshot_is_missing_or_changed(self):
+        from arete import cli
+
+        self.write_settings("original", 0.5)
+        cfg = config.load()
+        delegation.freeze_settings(cfg, SimpleNamespace(dir=self.root, repo=cfg.repo(self.repo.name)),
+                                   config.RepoLayer(self.layer_dir))
+        path, _ = cfg.settings_snapshot
+        path.write_bytes(path.read_bytes() + b"\n")
+        payload = {"tool_name": "Bash", "tool_input": {"command": "echo fixture"}, "cwd": str(self.repo.path)}
+        with patch.dict(os.environ, config.snapshot_env(cfg)), patch.object(scratch, "HOOK", {}):
+            for missing in (False, True):
+                if missing:
+                    path.unlink()
+                for command in ("guard", "codex-guard"):
+                    with (self.subTest(missing=missing, command=command),
+                          patch.object(guard, "LOGIN_FOLDERS", guard.LOGIN_FOLDERS),
+                          patch("sys.stdin", io.StringIO(json.dumps(payload))), contextlib.redirect_stdout(io.StringIO()) as out):
+                        self.assertEqual(cli.main([command, "--judge"]), 0)
+                        result = json.loads(out.getvalue())["hookSpecificOutput"]
+                        self.assertEqual(result["permissionDecision"], "deny")
+                        self.assertEqual(result["permissionDecisionReason"], "Arete could not read the guard settings")
+
+    def test_answer_continuations_admit_using_the_snapshot_after_repo_removal(self):
+        self.write_settings("original", 0.5)
+        original_global = paths.CONFIG_FILE.read_text()
+        original_layer = (self.layer_dir / "config.toml").read_text() + "\n[limits]\nmax_repair_cycles = 7\n"
+        for method in ("answer", "structured reply", "text reply"):
+            with self.subTest(method=method):
+                self.ticket = tasks_store.task_add(self.repo.name, "Fixture specification", "Fixture", "feat")
+                paths.CONFIG_FILE.write_text(original_global)
+                layer = self.layer_dir / "config.toml"
+                layer.write_text(original_layer)
+                cfg = config.load()
+                repo = cfg.repo(self.repo.name)
+                run_id = record.start("pipeline", repo=repo.name, issue=self.ticket)
+                run = SimpleNamespace(id=run_id, dir=paths.RUNS_DIR / run_id, repo=repo)
+                snapshot = delegation.freeze_settings(cfg, run, repo.configured_layer())
+                self.assertTrue(record.move(run.id, "needs-info", ("running",)))
+                if method != "text reply":
+                    run_lines.write(run.id, "execution", path="orchestrate")
+                    run_lines.write(run.id, "step_end", step="prepare", result="pass",
+                                    data={"settings_snapshot": snapshot})
+                    ask_store.ask_add(run.id, run.id, self.repo.name, self.ticket, "review", "review", "", "", [
+                        {"kind": "text", "header": "Expected behavior", "question": "What should it do?"}], {})
+                else:
+                    run_lines.write(run.id, "settings_snapshot", settings_snapshot=snapshot)
+                paths.CONFIG_FILE.write_text("[jev]\nrisk_hold = 0.7\n")
+                layer.unlink()
+                with (patch.object(config, "read_data", side_effect=AssertionError("read live config")),
+                      patch.object(config, "load_layer", side_effect=AssertionError("read live layer")),
+                      patch.object(runlimits, "admission", wraps=runlimits.admission) as admission,
+                      patch.object(tasks, "spawned", side_effect=lambda repo, tid, spawn: (spawn(), "running")),
+                      patch.object(tasks.control, "launch", return_value="continued") as launch):
+                    if method == "answer":
+                        result = tasks.answer_ask(run.id, {"answers": [{"text": "Use the fixture"}]})
+                    else:
+                        result = tasks.reply(run.id, "Use the fixture")
+                self.assertEqual(result["run"], "continued")
+                self.assertEqual(launch.call_args.args[0][-2:], ["--continue", run.id])
+                self.assertTrue(all(call.args[3].max_repair_cycles == 7 for call in admission.call_args_list))
+                if method == "text reply":
+                    self.assertEqual(launch.call_args.args[0][-4:], ["--local", "--force", "--continue", run.id])
+                    self.assertEqual(pipeline.answer_text(run.id), "Use the fixture")
+                else:
+                    self.assertEqual(ask_store.ask_get(run.id)["status"], "answered")
+
+    def test_healthy_prepare_ignores_malformed_verification_in_other_layers(self):
+        from arete import outbound
+
+        self.mock_worktree()
+        self.write_settings("original", 0.5)
+        with paths.CONFIG_FILE.open("a") as global_settings:
+            for name, verify in (("malformed", "verify = false"), ("bad-url", "[verify]\nurl = false"),
+                                 ("valid", "[verify]\nurl = 'http://fixture.internal:8080'")):
+                directory = self.root / name
+                self.write_layer(directory, name)
+                (directory / "config.toml").write_text(verify)
+                global_settings.write(f"\n[[repo]]\nname = '{name}'\npath = '{directory}'\nlayer = '{directory}'\n")
+        with patch.object(outbound, "extra_hosts", set()):
+            controller = self.controller()
+            self.assertIsNone(controller.prepare())
+            self.assertEqual(controller.job.cfg.snapshot_private_hosts, ("fixture.internal",))
+
+    def test_classic_poller_restart_carries_the_original_snapshot(self):
+        self.write_settings("original", 0.5)
+        cfg = config.load()
+        repo = cfg.repo(self.repo.name)
+        run = self.made_run()
+        run.repo = repo
+        run_lines.write(run.id, "execution", path="classic")
+        snapshot = delegation.freeze_settings(cfg, run, repo.configured_layer())
+        run_lines.write(run.id, "settings_snapshot", settings_snapshot=snapshot)
+        record.move(run.id, "interrupted", ("running",))
+        self.write_settings("edited", 0.7)
+
+        with patch.object(config, "read_data", side_effect=AssertionError("read live config")):
+            command = pipeline.run_command(repo.name, self.ticket)
+            self.assertEqual(command[-6:], ["run", repo.name, self.ticket, "--local", "--restart", run.id])
+            with (patch.object(pipeline, "run_refusal", return_value=(False, "")),
+                  patch.object(pipeline, "_run", return_value=("noop", "restarted", "")) as execute):
+                self.assertEqual(pipeline.run_issue(repo.name, self.ticket, restart=run.id), 0)
+        resumed, restarted, _ = execute.call_args.args
+        self.assertEqual(resumed.settings_snapshot, cfg.settings_snapshot)
+        self.assertEqual(resumed.jev.risk_hold, 0.5)
+        self.assertEqual(restarted.repo.configured_layer().passes, ("SNAPSHOT_ORIGINAL",))
+
+    def test_classic_tracker_reply_continues_with_the_waiting_snapshot(self):
+        from arete import cli
+
+        self.write_settings("original", 0.5)
+        cfg = config.load()
+        repo = cfg.repo(self.repo.name)
+        run = self.made_run()
+        run.repo = repo
+        run_lines.write(run.id, "execution", path="classic")
+        snapshot = delegation.freeze_settings(cfg, run, repo.configured_layer())
+        run_lines.write(run.id, "settings_snapshot", settings_snapshot=snapshot)
+        record.settle(run.id, "needs-info")
+        self.write_settings("edited", 0.7)
+        source = Mock(reply_since=lambda *_: "Use the fixture")
+        self.assertEqual(poll.tracker_reply(repo, source, self.ticket, False, from_queue=False, from_feedback=False), "")
+        self.assertEqual(pipeline.answer_text(run.id), "Use the fixture")
+
+        with (patch.object(config, "read_data", side_effect=AssertionError("read live config")),
+              patch.object(pipeline, "run_refusal", return_value=(False, "")),
+              patch.object(pipeline.control, "require_worker"),
+              patch.object(pipeline, "_run", return_value=("noop", "continued", "")) as execute):
+            command = pipeline.run_command(repo.name, self.ticket)
+            self.assertEqual(command[-6:], ["run", repo.name, self.ticket, "--local", "--continue", run.id])
+            self.assertEqual(cli.main(command[-6:]), 0)
+        resumed, continuing, _ = execute.call_args.args
+        self.assertEqual(resumed.settings_snapshot, cfg.settings_snapshot)
+        self.assertEqual(resumed.jev.risk_hold, 0.5)
+        self.assertEqual(continuing.answering["id"], run.id)
+        self.assertFalse(continuing.force)
+
+    def test_factory_rerun_resolves_the_script_with_saved_settings(self):
+        old = self.root / "original-adws"
+        old.mkdir()
+        (old / "custom.py").write_text("def custom(flow):\n    return 'original script'\n")
+        self.write_settings("original", 0.5)
+        paths.CONFIG_FILE.write_text(f"[factory]\nadws = '{old}'\n" + paths.CONFIG_FILE.read_text())
+        cfg = config.load()
+        repo = cfg.repo(self.repo.name)
+        run = self.made_run()
+        run.repo = repo
+        run_lines.write(run.id, "task", path="custom")
+        run_lines.write(run.id, "step_start", step="plan")
+        snapshot = delegation.freeze_settings(cfg, run, repo.configured_layer())
+        run_lines.write(run.id, "settings_snapshot", settings_snapshot=snapshot)
+        paths.CONFIG_FILE.write_text(f"[factory]\nadws = '{self.root / 'missing'}'\n")
+        fn, argv = factory.earlier([run.id, "plan"])
+        self.assertEqual(fn(None), "original script")
+        self.assertEqual(argv, [repo.name, self.ticket, "--continue", run.id, "--only", "plan"])
+        record.move(run.id, "interrupted", ("running",))
+        with patch.object(config, "read_data", side_effect=AssertionError("read live config")):
+            command = pipeline.run_command(repo.name, self.ticket)
+        self.assertEqual(command[-3:], [str(old / "custom.py"), repo.name, self.ticket])
+        path, _ = cfg.settings_snapshot
+        original = path.read_bytes()
+        path.write_bytes(original + b"\n")
+        with self.assertRaisesRegex(SystemExit, "PolicyChanged"):
+            factory.earlier([run.id, "plan"])
+        with self.assertRaises(delegation.PolicyChanged):
+            pipeline.run_command(repo.name, self.ticket)
+        path.write_bytes(original)
+        execute = Mock(return_value=("noop", "restarted", ""))
+        with (patch.object(config, "read_data", side_effect=AssertionError("read live config")),
+              patch.object(pipeline, "run_refusal", return_value=(True, ""))):
+            self.assertEqual(pipeline.run_issue(repo.name, self.ticket, script=pipeline.Script("custom", execute)), 0)
+        self.assertEqual(execute.call_args.args[0].ctx.cfg.settings_snapshot, cfg.settings_snapshot)
+
+    def test_pilot_gates_use_live_policy_with_the_run_snapshot_in_context(self):
+        from arete import pilot
+
+        self.write_settings("original", 0.5)
+        layer_file = self.layer_dir / "config.toml"
+        layer_file.write_text(layer_file.read_text() + "\n[factory]\npath = 'orchestrated'\n")
+        cfg = config.load()
+        repo = cfg.repo(self.repo.name)
+        layer = repo.configured_layer()
+        run = self.made_run()
+        run.repo = repo
+        delegation.freeze_settings(cfg, run, layer)
+        signal = pilot.Signal("owner/sample", "1" * 40, "old", "new")
+        run.tid = signal.task_id
+        receipt = {"policy": orchestration.policy_fingerprint(cfg, layer, ()), "signal": asdict(signal),
+                   "deadline": time.monotonic() + 30}
+        checkout = workspace.Checkout("", signal.github, repo.path, self.root, "main")
+        controller = object.__new__(orchestration.Controller)
+        controller.run, controller.job = run, SimpleNamespace(cfg=cfg, layer=layer)
+        with (config.using_settings(cfg), patch.dict(os.environ, config.snapshot_env(cfg)),
+              patch.object(pilot, "live_receipt", return_value=receipt),
+              patch.object(pilot, "scheduled_run", return_value={"id": run.id})):
+            controller.check_pilot_publication()
+            layer_file.write_text(layer_file.read_text().replace("orchestrated", "classic"))
+            self.assertEqual(config.load_layer(repo.layer_dir).factory_path, "orchestrated")
+            with self.assertRaisesRegex(runlimits.Parked, "changed its admitted policy"):
+                controller.check_pilot_publication()
+            with (patch.object(pilot, "git", return_value="head"), patch.object(pilot, "readme", return_value="old\n"),
+                  patch.object(pilot, "exact_edit", return_value="tree"),
+                  self.assertRaisesRegex(pilot.Held, "does not match the agreed policy")):
+                pilot.publication_head(repo, run.tid, run.id, checkout)
+            with (patch.object(pilot, "task_admission", return_value=receipt),
+                  patch.object(pipeline, "run_refusal", return_value=(True, "")), principals.acting("rule:poll")):
+                script = pipeline.Script("orchestrate", Mock(side_effect=AssertionError("started after revocation")))
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(pipeline.run_issue(repo.name, run.tid, script=script), 2)
+                self.assertIn("requires the approved first scheduled orchestration", output.getvalue())
+            self.assertIs(config.load(), cfg)
+
+    def test_zte_candidate_authority_uses_live_config_despite_a_snapshot(self):
+        from arete import pilot, zte
+
+        self.write_settings("original", 0.5)
+        cfg = config.load()
+        repo = cfg.repo(self.repo.name)
+        layer = repo.configured_layer()
+        run = self.made_run()
+        run.repo = repo
+        delegation.freeze_settings(cfg, run, layer)
+        self.write_settings("edited", 0.7)
+        grant = SimpleNamespace(repo=repo.name, phase="running", data={
+            "run": run.id, "config": orchestration.policy_fingerprint(cfg, layer, ())})
+
+        def read_policy(current, _):
+            configured = current.repo(repo.name)
+            effective = config.load_layer(configured.layer_dir)
+            self.assertEqual(effective.passes, ("SNAPSHOT_EDITED",))
+            return configured, effective, orchestration.policy_fingerprint(current, effective, ())
+
+        with (config.using_settings(cfg), patch.dict(os.environ, config.snapshot_env(cfg)),
+              patch.object(zte.store, "find", return_value=grant), patch.object(zte, "active"),
+              patch.object(zte, "settings", side_effect=read_policy),
+              self.assertRaisesRegex(pilot.Held, "admitted ZTE config changed")):
+            zte.for_run(repo, run.tid, run.id, "running")
+
     def test_pi_shell_judges_with_accepted_settings_and_enforces_the_floor(self):
         with tempfile.TemporaryDirectory(prefix="arete-pi-settings-") as directory:
             root = Path(directory).resolve()

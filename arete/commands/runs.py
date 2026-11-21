@@ -25,23 +25,30 @@ def cmd_merge_check(args) -> int:
 def cmd_run(args) -> int:
     from .. import client, pipeline
 
-    environment_retry = bool(args.continues or args.environment_release)
-    if environment_retry and (not (args.local and args.force and args.continues and args.environment_release)
-                              or args.dry_run):
-        print("The held verification retry needs a local run, its source run and its live release.")
+    if args.environment_release and not (args.local and args.force and args.continues and not args.dry_run):
+        print("A continuation needs a forced local run and its source run.")
+        return 2
+    if args.continues and (not args.local or args.dry_run):
+        print("A continuation needs a local run and its source run.")
+        return 2
+    if args.restart and (not args.local or args.continues or args.dry_run or args.force):
+        print("An interrupted restart needs a local run and its source run.")
         return 2
     if args.local:
         from .. import control
 
         control.require_worker("run", development=True)
-    if environment_retry:
+    if args.environment_release:
         from .. import flows
 
         script = pipeline.Script("classic", flows.retry_environment, continues=args.continues, again="verify",
                                  environment_release=args.environment_release)
         return pipeline.run_issue(args.repo, args.issue, force=args.force, script=script)
+    if args.continues:
+        return pipeline.run_issue(args.repo, args.issue, force=args.force, answering=args.continues)
     if args.local or args.dry_run:
-        return pipeline.run_issue(args.repo, args.issue, dry_run=args.dry_run, force=args.force)
+        restart = {"restart": args.restart} if args.restart else {}
+        return pipeline.run_issue(args.repo, args.issue, dry_run=args.dry_run, force=args.force, **restart)
     return client.steered(lambda: run_followed(client.start_task(
         {"repo": args.repo, "ticket": args.issue, "force": args.force}, args.key)))
 
@@ -173,6 +180,7 @@ def register(sub) -> None:
     p.set_defaults(fn=cmd_run)
     p.add_argument("--key", default=None, help="reuse an identical remote task-start request safely")
     p.add_argument("--continue", dest="continues", default="", help=argparse.SUPPRESS)
+    p.add_argument("--restart", default="", help=argparse.SUPPRESS)
     p.add_argument("--environment-release", default="", help=argparse.SUPPRESS)
 
     p = steering(sub.add_parser("resume", help="continue a run that ended interrupted, stopped or failed, through the "

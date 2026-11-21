@@ -1010,12 +1010,12 @@ class Controller:
             try:
                 repo, tid = self.run.repo, str(self.run.tid)
                 receipt = pilot.live_receipt(tid, repo.name)
-                layer = repo.configured_layer()
+                cfg, layer = pilot.live_policy(repo)
                 run = pilot.scheduled_run(repo.name, tid)
                 pilot.require(run and run["id"] == self.run.id, "the approved one-shot run changed")
                 pilot.require(layer.factory_path == "orchestrated"
                               and self.policy_sha() == receipt["policy"] == policy_fingerprint(
-                                  self.job.cfg, layer, ()), "the one-shot run changed its admitted policy")
+                                  cfg, layer, ()), "the one-shot run changed its admitted policy")
             except pilot.Held as error:
                 raise runlimits.Parked(str(error)) from error
 
