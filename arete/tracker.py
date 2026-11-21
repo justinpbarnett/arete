@@ -41,6 +41,12 @@ class TaskError(LookupError):
 ERRORS = (gh.GhError, jira.JiraError, TaskError)
 
 
+def github_fix_label(repo: str) -> str | None:
+    pages = gh.gh_json(["api", f"repos/{repo}/labels?per_page=100", "--paginate", "--slurp"]) or []
+    names = {label["name"] for page in pages for label in page}
+    return min(FIX_LABELS & names, default=None)
+
+
 @dataclass
 class Image:
     id: str

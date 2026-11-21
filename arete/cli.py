@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -56,20 +55,15 @@ def status_from_heartbeat(problem: SystemExit) -> int:
     return 1
 
 
-def check_serve_start() -> None:
-    from . import local_paths, serve_guard
-
-    home = Path.home()
-    _, state, isolated = local_paths.local_dirs(home)
-    logs = Path(os.environ.get("ARETE_LOG_DIR", home / "Library" / "Logs" / "arete"
-                               if sys.platform == "darwin" and not isolated else state / "logs"))
-    serve_guard.startup(state, Path(__file__).resolve().parent.parent, logs)
-
-
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    if argv in (["serve"], ["serve", "--no-dashboard"]) and not _serve_start_checked:
-        check_serve_start()
+    if argv[:1] == ["serve"] and not _serve_start_checked:
+        from . import local_paths, serve_guard
+
+        if serve_guard.is_serve_start(argv):
+            home = Path.home()
+            _, state, isolated = local_paths.local_dirs(home)
+            serve_guard.startup(state, Path(__file__).resolve().parent.parent, local_paths.log_dir(home, state, isolated))
     from . import codebase
 
     if argv[:1] == ["status"]:

@@ -8,7 +8,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from . import config, launchd, paths, serve_guard, tracker, util
+from . import config, paths, serve_guard, tracker, util
 
 AGENTS_DIR = paths.HOME / "Library" / "LaunchAgents"
 UNITS_DIR = paths.HOME / ".config" / "systemd" / "user"
@@ -16,7 +16,6 @@ SERVE = "serve"
 SERVE_UNIT = "arete-serve.service"
 RETIRED = ("heartbeat", "poll", "mine", "audit", "eval", "triage", "dashboard")
 PLATFORMS = ("mac", "linux")
-RUNNING_GUARD = Path(serve_guard.__file__).read_bytes()
 
 
 def label(name: str) -> str:
@@ -53,7 +52,7 @@ def serve_guard_file() -> Path:
 
 
 def write_serve_guard() -> None:
-    util.write_durably(serve_guard_file(), RUNNING_GUARD, mode=0o600)
+    util.write_durably(serve_guard_file(), Path(serve_guard.__file__).read_bytes(), mode=0o600)
 
 
 def serve_command() -> list[str]:
@@ -142,42 +141,6 @@ def serve_file(platform: str) -> Path:
 
 def serve_installed() -> bool:
     return serve_file(this_platform()).exists()
-
-
-def managed_restart() -> bool:
-    command = serve_command()
-    if paths.ON_MAC:
-        file = serve_file("mac")
-        pl = plistlib.loads(file.read_bytes())
-        if (pl.get("ProgramArguments") != command or pl.get("Program", command[0]) != command[0]
-                or not pl.get("KeepAlive") or any(pl.get("EnvironmentVariables", {}).get(k) != v
-                                                for k, v in serve_environment().items())):
-            return False
-        job = launchd.fields(launchd.printed(f"{_domain()}/{label(SERVE)}") or "")
-        return job.get("pid") == str(os.getpid()) and job.get("path") == str(file)
-    file = serve_file("linux")
-    if file.read_text() != serve_unit():
-        return False
-    unit = util.sh(["systemctl", "--user", "show", "--all", "-p", "MainPID,FragmentPath,DropInPaths,NeedDaemonReload",
-                    SERVE_UNIT], timeout=10)
-    return unit.returncode == 0 and set(unit.stdout.splitlines()) == {
-        f"MainPID={os.getpid()}", f"FragmentPath={file}", "DropInPaths=", "NeedDaemonReload=no",
-    }
-
-
-def deploy_restart_refusal(checkout: Path) -> str:
-    reinstall = "restart guard is not active; run `arete install` from the self-deploy checkout to reload serve"
-    try:
-        command = serve_command()
-        guard = serve_guard_file()
-        if (sys.orig_argv != command or guard.absolute().is_relative_to(checkout)
-                or guard.resolve().is_relative_to(checkout) or Path(command[0]).is_relative_to(checkout)
-                or not managed_restart()):
-            return reinstall
-        write_serve_guard()
-    except (OSError, ValueError, AttributeError, TypeError, RuntimeError, plistlib.InvalidFileException):
-        return f"could not verify or refresh the restart guard; {reinstall}"
-    return ""
 
 
 def retired_labels() -> set[str]:

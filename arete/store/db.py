@@ -11,7 +11,7 @@ from contextlib import ExitStack, contextmanager, suppress
 from contextvars import ContextVar
 from pathlib import Path
 
-from .. import codebase, dbstats, paths, serve_guard, util
+from .. import dbstats, paths, util
 from . import migrations
 from .migrations import m0002_foundation_time_shape as time_shape
 
@@ -171,60 +171,18 @@ def execute_statements(conn, sql):
         conn.execute(pending)
 
 
-def rollback_catalogs():
-    if not codebase.RELEASE:
-        return
-    for file in (paths.STATE_DIR / serve_guard.HOLDS).glob("*.json"):
-        try:
-            hold = serve_guard.read(file)
-        except (OSError, ValueError):
-            continue
-        if (isinstance(hold, dict) and hold.get("previous") == codebase.RELEASE
-                and hold.get("checkout") == str(codebase.CHECKOUT)
-                and isinstance(hold.get("migrations"), dict)):
-            yield hold["migrations"]
-
-
-def pending_receipt():
-    receipt = serve_guard.pending(paths.STATE_DIR, codebase.CHECKOUT)
-    if receipt is not None and (receipt.tip == codebase.RELEASE
-                                or serve_guard.at_tip(codebase.CHECKOUT, receipt)):
-        return receipt
-    return None
-
-
-def contract_connection(receipt, previous):
-    conn = connect_db(paths.DB_FILE)
-    try:
-        serve_guard.lock_database(conn)
-        snapshot = serve_guard.contract_snapshot(paths.STATE_DIR, receipt)
-        if not serve_guard.applied_contract(conn, previous):
-            serve_guard.snapshot_database(conn, snapshot)
-        elif not snapshot.is_file():
-            raise IncompatibleSchema(f"pending deploy is missing its pre-contract database at {snapshot}")
-    except BaseException:
-        conn.close()
-        raise
-    return conn
-
-
 def migrate(contracts=True):
     from .. import backup
 
     chain = migrations.load()
-    needed = max(m.n for m in chain if m.phase != "contract")
     paths.ensure_dirs()
     with util.lock("migrate", wait=True):
         refuse_empty_file()
-        deploying = pending_receipt()
-        if deploying is not None and serve_guard.hold_path(paths.STATE_DIR, deploying.tip).exists():
-            raise IncompatibleSchema("pending deploy is held for startup rollback")
-        previous = serve_guard.previous_schema(codebase.CHECKOUT, deploying) if deploying is not None else 0
         conn = connect_db(paths.DB_FILE, create=True)
         conn.row_factory = sqlite3.Row
         try:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            migrations.validate(conn, chain, version, rollback_catalogs())
+            migrations.validate(conn, chain, version)
             conn.close()
             conn = None
             snapshot = None
@@ -232,10 +190,8 @@ def migrate(contracts=True):
             for migration in chain:
                 if migration.n <= version:
                     continue
-                deploy_contract = False
                 if migration.phase == "contract":
-                    deploy_contract = deploying is not None and migration.n > previous
-                    if not contracts or deploy_contract and migration.n > needed:
+                    if not contracts:
                         return True
                     conn = connect_db(paths.DB_FILE)
                     conn.row_factory = sqlite3.Row
@@ -254,9 +210,7 @@ def migrate(contracts=True):
                 started = time.monotonic()
                 try:
                     timing = dbstats.Timing(paths.DB_FILE, "write")
-                    connect = (lambda: contract_connection(deploying, previous)) if deploy_contract else (
-                        lambda: connect_db(paths.DB_FILE))
-                    with owning_transaction(connect, "BEGIN EXCLUSIVE", timing) as writer:
+                    with owning_transaction(lambda: connect_db(paths.DB_FILE), "BEGIN EXCLUSIVE", timing) as writer:
                         if migration.sql is not None:
                             execute_statements(writer, migration.sql)
                         else:
@@ -405,10 +359,6 @@ def owned(mode, timeout, before_commit=None):
     try:
         with owning_transaction(lambda: connect(timeout=timeout), "BEGIN IMMEDIATE" if mode == "write" else "BEGIN", timing,
                                 commit=mode == "write", before_commit=guarded_commit if bounded else before_commit) as conn:
-            if mode == "write":
-                version = conn.execute("PRAGMA user_version").fetchone()[0]
-                if version < NEEDED:
-                    raise IncompatibleSchema(f"schema {version} needs {NEEDED}; run arete serve or arete migrate")
             _OWNER.active = (os.getpid(), mode, conn)
             if bounded:
                 check()

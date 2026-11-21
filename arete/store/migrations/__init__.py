@@ -82,30 +82,18 @@ def load(folder=None):
     return list(found.values())
 
 
-def validate(conn, chain, version, rollback_catalogs=()):
+def validate(conn, chain, version):
     if not version:
         return
     try:
-        rows = list(conn.execute("SELECT n, name, sha256, phase FROM schema_migrations ORDER BY n"))
+        rows = list(conn.execute("SELECT n, name, sha256 FROM schema_migrations ORDER BY n"))
     except Exception as e:
         raise Refused(f"user_version {version} has no schema_migrations ledger") from e
     by_n = {m.n: m for m in chain}
     if [r[0] for r in rows] != list(range(1, version + 1)):
         raise Refused(f"schema_migrations disagrees with user_version {version}")
-    latest = chain[-1].n
-    for n, name, digest, _ in rows[:latest]:
+    for n, name, digest in rows:
         migration = by_n.get(n)
         if migration is None or migration.name != name or migration.sha256 != digest:
             expected = migration.name if migration else "missing migration file"
             raise Refused(f"{name}, {expected}: applied migration sha256 differs")
-    if version <= latest:
-        return
-    newer = rows[latest:]
-    meta = dict(conn.execute("SELECT key, value FROM schema_meta WHERE key IN ('schema_version', 'oldest_writer')"))
-    if (meta.get("schema_version") == str(version) and "oldest_writer" in meta
-            and int(meta["oldest_writer"] or 0) <= latest
-            and all(phase in ("expand", "backfill") for _, _, _, phase in newer)
-            and any(all(catalog.get(name) == digest for _, name, digest, _ in newer)
-                    for catalog in rollback_catalogs)):
-        return
-    raise Refused(f"{newer[0][1]}, missing migration file: applied migration sha256 differs")

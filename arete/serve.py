@@ -244,11 +244,16 @@ def report_rollbacks(src: Path, say: Callable[[str], None]) -> None:
             if issue is None:
                 tracked = serve_guard.git(src, "ls-tree", "-r", "--name-only", tip).splitlines()
                 excerpt = startup_excerpt.redacted(held["log_tail"], str(src), frozenset(tracked), (tip, previous))
-                body = (f"Arete rolled back self-deploy `{tip[:12]}` to `{previous[:12]}` because "
+                body = (f"Arete rolled back self-deploy code from `{tip[:12]}` to `{previous[:12]}` because "
                         f"{serve_guard.report_reason(held)}. Deploys of `{tip[:12]}` are held.\n\n"
                         f"Redacted serve.log tail\n\n```text\n{excerpt}\n```")
+                labels = [tracker.LABEL]
+                if label := tracker.github_fix_label(repo):
+                    labels.append(label)
+                elif not gh.ensure_label(repo, "bug", "d73a4a", "Something isn't working", restyle=False):
+                    labels.append("bug")
                 issue = gh.issue_create(repo, f"{tracker.ARETE_TAG} Serve self-deploy {tip[:12]} rolled back",
-                                        body, [tracker.LABEL, "bug"], key=key)
+                                        body, labels, key=key)
             serve_guard.write(path, {**held, "issue": issue})
             say(f"deploy: reported rollback of {tip} in {gh.issue_url(repo, issue)}")
         except (OSError, RuntimeError, KeyError, TypeError, ValueError, subprocess.SubprocessError) as error:
@@ -509,7 +514,6 @@ class Server:
             finally:
                 self.checkout_update.release()
         completed = self.guard("tick", self.tick)
-        self.guard("stage:deploy-health", self.acknowledge_deploy, completed)
         self.guard("stage:deploy", self.deploy_when_due)
         self.guard("stage:inherited", self.reap_inherited)
         self.ticks += 1
@@ -518,6 +522,7 @@ class Server:
             self.beat()
         except Exception as e:
             self.say(f"beat failed: {type(e).__name__}: {e}")
+        self.guard("stage:deploy-health", self.acknowledge_deploy, completed)
 
     def deploy_when_due(self) -> None:
         if self.deployment is not None:
@@ -530,15 +535,15 @@ class Server:
             self.deploy_at = now
             self.deployment = self.pool.submit(self.deploy_if_ready, self.cfg)
 
-    def acknowledge_deploy(self, completed: bool) -> None:
-        receipt = serve_guard.pending(paths.STATE_DIR, paths.PACKAGE_DIR.parent)
-        if (receipt is None or receipt.tip != codebase.RELEASE
-                or serve_guard.hold_path(paths.STATE_DIR, receipt.tip).exists()):
+    def acknowledge_deploy(self, completed: bool | None) -> None:
+        checkout = paths.PACKAGE_DIR.parent
+        receipt = serve_guard.pending(paths.STATE_DIR, checkout)
+        if (receipt is None or not receipt.starts or serve_guard.hold_path(paths.STATE_DIR, receipt.tip).exists()
+                or not serve_guard.at_tip(checkout, receipt)):
             return
         if completed and (not self.with_dashboard or dashboard_answers()):
             serve_guard.write(paths.STATE_DIR / serve_guard.RECEIPT, asdict(replace(receipt, healthy=True)))
             self.say(f"deploy: {receipt.tip} is healthy")
-            serve_guard.contract_snapshot(paths.STATE_DIR, receipt).unlink(missing_ok=True)
         elif receipt.expired():
             self.restart_for_new_code()
 
@@ -546,7 +551,7 @@ class Server:
         src = paths.PACKAGE_DIR.parent
         report_rollbacks(src, self.say)
         receipt = serve_guard.pending(paths.STATE_DIR, src)
-        if receipt is None or receipt.tip[:12] != codebase.checkout_head():
+        if receipt is None or not serve_guard.at_tip(src, receipt):
             self.deploy(cfg)
 
     def deploy(self, cfg: config.Config) -> None:
@@ -598,9 +603,6 @@ class Server:
             if util.git(["rev-parse", "--verify", ref], src, timeout=10, retry=False).strip() != tip:
                 return
             if not self.deploy_ready(src, base, tip):
-                return
-            if reason := install.deploy_restart_refusal(src):
-                self.deploy_refused(src, tip, reason)
                 return
             try:
                 recovery = util.deploy_recovery(src, base, tip)
@@ -1000,14 +1002,10 @@ class Server:
         if stamp == self.code or not steady:
             return
         receipt = serve_guard.pending(paths.STATE_DIR, paths.PACKAGE_DIR.parent)
-        deploying = receipt is not None and ("HEAD", receipt.tip[:12]) in stamp
-        if deploying and receipt.tip == codebase.RELEASE:
-            return
-        if deploying and receipt.expired():
-            self.rollback_deploy(receipt, serve_guard.AGE_FAILURE)
-            return
+        deploying = receipt is not None and not receipt.starts and ("HEAD", receipt.tip[:12]) in stamp
         entrypoint = f"import sys; sys.path.insert(0, {str(paths.PACKAGE_DIR.parent)!r}); "
-        check = util.sh([sys.executable, "-I", "-c", entrypoint + IMPORT_CHECK], timeout=120)
+        check = util.sh([sys.executable, "-I", "-c", entrypoint + f"sys.argv[:] = {sys.argv!r}; " + IMPORT_CHECK],
+                        timeout=120)
         if check.returncode != 0:
             problem = util.last_line(check.stderr or check.stdout, 300)
             if deploying:
@@ -1148,6 +1146,7 @@ def run(with_dashboard: bool = True) -> NoReturn:
                 cleanup_legacy()
             except Exception as e:
                 print(str(e), file=sys.stderr)
+                report_rollbacks(paths.PACKAGE_DIR.parent, lambda line: print(line, file=sys.stderr))
                 raise SystemExit(1) from e
             server = Server()
             server.contracts_waiting = contracts_waiting

@@ -7,18 +7,19 @@ requires-python = ">=3.13"
 dependencies = []
 
 [project.scripts]
-arete = "arete.cli:main"
+arete = "arete_launcher:main"
 
 [build-system]
-requires = ["uv_build>=0.10.2,<0.11"]
-build-backend = "uv_build"
+requires = []
+build-backend = "arete_build"
+backend-path = ["tools"]
 
 [tool.uv]
 required-version = ">=0.10.2"
 
 [tool.uv.build-backend]
-module-name = "arete"
 module-root = ""
+source-include = ["tools/arete_build.py", "tools/launcher/arete_launcher/__init__.py"]
 
 [tool.ruff]
 line-length = 120
