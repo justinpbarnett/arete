@@ -1,21 +1,22 @@
 import base64
 import json
+import os
 import sqlite3
 import subprocess
 import tempfile
 import threading
 import unittest
-from contextlib import ExitStack, redirect_stderr
+from contextlib import ExitStack, closing, contextmanager, redirect_stderr, redirect_stdout
 from http.client import HTTPConnection, HTTPResponse
 from io import BytesIO, StringIO
 from pathlib import Path
-from socket import SHUT_WR, create_connection
+from socket import SHUT_WR, create_connection, socketpair
 from types import SimpleNamespace
 from unittest import mock
 
 from arete import (
-    accounts, api_check, api_http, chat, config, contract, control, dashboard, events, gh, idempotency, jira, pipeline, principals,
-    paths, screening, serve, tailnet, tasks, triage, util,
+    accounts, api_check, api_http, chat, cli, config, contract, control, dashboard, event_stream, events, gh,
+    idempotency, jira, paths, pipeline, principals, screening, serve, tailnet, tasks, triage, util, verify_faults,
 )
 from arete.store import approvals as approvals_store
 from arete.store import chats as chats_store
@@ -47,6 +48,351 @@ class DashboardSnapshotTests(unittest.TestCase):
             capture_output=True, text=True, timeout=8, check=False,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class VerifyFaultTests(unittest.TestCase):
+    board_route = "/api/v1/screen?view=board"
+
+    def setUp(self):
+        self.login = "fixture@example.test"
+        self.actor = principals.seed_owner(self.login)
+        self.marker = paths.STATE_DIR.parent / ".arete-owned"
+        self.spec = paths.STATE_DIR / verify_faults.SPEC
+        self.addCleanup(self.marker.unlink, missing_ok=True)
+        self.addCleanup(self.spec.unlink, missing_ok=True)
+        self.enterContext(mock.patch.dict(os.environ, {"ARETE_STATE_DIR": str(paths.STATE_DIR)}))
+
+    def mark_scratch(self):
+        self.marker.write_bytes(verify_faults.MARKER + b"\n")
+
+    def command(self, *args):
+        with redirect_stderr(StringIO()) as err, redirect_stdout(StringIO()):
+            status = cli.main(["verify-fault", *args])
+        return status, err.getvalue()
+
+    def fault(self, *args):
+        self.assertEqual(self.command(*args), (0, ""))
+
+    def endpoint(self):
+        handlers = dashboard.handlers()
+        address = "127.0.0.1"
+        node = SimpleNamespace(names={address})
+        logins = SimpleNamespace(of=lambda _: self.login)
+        server = SimpleNamespace(node=node, logins=logins)
+        return handlers.open, server
+
+    @contextmanager
+    def client(self, endpoint):
+        handler, server = endpoint
+        browser, app = socketpair()
+        browser.settimeout(3)
+
+        def handle():
+            with app:
+                handler(app, ("127.0.0.1", 0), server)
+
+        thread = threading.Thread(target=handle, daemon=True)
+        thread.start()
+        with closing(HTTPConnection("127.0.0.1")) as client:
+            client.sock = browser
+            yield client
+        thread.join(timeout=1)
+
+    def request(self, endpoint, method, path, *, body=None, headers=(), raw=False):
+        headers = dict(headers)
+        if body is not None:
+            body = json.dumps(body)
+            headers["Content-Type"] = "application/json"
+        if method == "POST":
+            headers["X-Arete"] = "1"
+        with self.client(endpoint) as client:
+            client.request(method, path, body, headers)
+            with client.getresponse() as result:
+                return result.status, result.read() if raw else json.load(result)
+
+    def arm_board(self):
+        self.fault("arm", "--route", self.board_route, "--status", "404", "--count", "2")
+
+    def initial_cursor(self, endpoint):
+        status, data = self.request(endpoint, "GET", "/api/v1/events?timeout=0", headers={"Accept": "application/json"})
+        self.assertEqual(status, 200)
+        return data["next"]
+
+    @contextmanager
+    def stream(self, endpoint, cursor=None):
+        headers = {"Accept": "text/event-stream"}
+        if cursor is not None:
+            headers["Last-Event-ID"] = cursor
+        with self.client(endpoint) as client:
+            client.request("GET", "/api/v1/events", headers=headers)
+            with client.getresponse() as result:
+                self.assertEqual(result.status, 200)
+                self.assertEqual(result.readline(), b"retry: 2000\n")
+                self.assertEqual(result.readline(), b"\n")
+                yield result
+
+    def read_event(self, stream):
+        position = stream.readline().removeprefix(b"id: ").strip().decode()
+        data = json.loads(stream.readline().removeprefix(b"data: "))
+        self.assertEqual(stream.readline(), b"\n")
+        self.assertEqual(position, data["id"])
+        return data
+
+    def test_cli_refuses_and_dashboard_ignores_planted_spec_without_wrapper_marker(self):
+        status, reason = self.command("clear")
+        self.assertEqual(status, 1)
+        self.assertIn("ARETE_STATE_DIR", reason)
+        self.assertIn("verification sandbox wrapper", reason)
+        self.assertFalse(self.spec.exists())
+
+        self.mark_scratch()
+        self.arm_board()
+        saved = self.spec.read_bytes()
+        self.marker.unlink()
+        self.assertEqual(self.command("clear"), (status, reason))
+
+        endpoint = self.endpoint()
+        status, body = self.request(endpoint, "GET", self.board_route)
+        self.assertEqual(status, 200)
+        self.assertIn("view", body)
+        self.assertEqual(self.spec.read_bytes(), saved)
+
+        self.mark_scratch()
+        with tempfile.TemporaryDirectory(dir=paths.STATE_DIR.parent) as folder:
+            link = Path(folder) / "scratch"
+            link.symlink_to(paths.STATE_DIR.parent, target_is_directory=True)
+            with mock.patch.dict(os.environ, {"ARETE_STATE_DIR": str(link / "state")}):
+                self.assertEqual(self.command("clear")[0], 1)
+        self.assertEqual(self.spec.read_bytes(), saved)
+
+    def test_board_fault_is_consumed_twice_across_unrelated_updates(self):
+        self.mark_scratch()
+        self.enterContext(mock.patch.object(util, "now", return_value=util.now()))
+        route = self.board_route
+        other = "/api/v1/screen?view=runs"
+        endpoint = self.endpoint()
+        before = self.request(endpoint, "GET", route)
+        self.assertEqual(before[0], 200)
+        self.arm_board()
+        self.assertEqual(self.request(endpoint, "GET", other)[0], 200)
+        first = self.request(endpoint, "GET", route)
+        self.assertEqual((first[0], first[1]["code"]), (404, "not_found"))
+        explicit = '{ "fault": "armed" }\n'
+        self.fault("arm", "--route", other, "--status", "503", "--body", explicit)
+        self.assertEqual(self.request(endpoint, "GET", route), first)
+        self.assertEqual(self.request(endpoint, "GET", route), before)
+        self.assertEqual(self.request(endpoint, "GET", other, raw=True), (503, explicit.encode()))
+        self.assertEqual(self.request(endpoint, "GET", other)[0], 200)
+        self.arm_board()
+        self.fault("clear")
+        self.assertEqual(self.request(endpoint, "GET", route), before)
+
+    def start_run(self, run):
+        with principals.acting(self.actor):
+            run_store.insert_run(run, {"kind": "pipeline", "started": util.iso(), "status": "running"})
+
+    def test_default_conflict_matches_contract_and_sets_dashboard_stale_notice(self):
+        self.mark_scratch()
+        run = "fault-conflict-run"
+        route = f"/api/runs/{run}/stop"
+        self.fault("arm", "--route", route, "--status", "409", "--count", "1")
+        self.start_run(run)
+        current = run_store.run_get(run)
+        status, raw = self.request(self.endpoint(), "POST", route, body={"base_version": current["version"]}, raw=True)
+        self.assertEqual(status, 409)
+        schema = next(error["schema"] for error in contract.ERRORS if error["code"] == "version_conflict")
+        problem = json.loads(raw)
+        contract.validate(problem, schema)
+        self.assertEqual(problem["current"], {k: v for k, v in current.items() if k in contract.RUN["properties"]})
+        self.assertEqual(run_store.run_get(run), current)
+
+        result = subprocess.run(["node", "--input-type=module", "-e", """
+            import assert from "node:assert/strict";
+            import { readFileSync } from "node:fs";
+            import { prepareWrite, sendWrite } from "./arete/web/ui-write.js";
+            import { staleWrite } from "./arete/web/ui-notice.js";
+
+            const [route, status] = process.argv.slice(1);
+            const body = readFileSync(0);
+            const { current } = JSON.parse(body);
+            globalThis.fetch = async () => new Response(body, { status: Number(status) });
+            await assert.rejects(sendWrite(prepareWrite(route, {}, current)), { status: 409, conflict: true, current });
+            assert.equal(staleWrite.value, "This item changed. Review the latest version before trying again.");
+        """, route, str(status)], input=raw, capture_output=True, timeout=8, check=False,
+                                cwd=Path(__file__).resolve().parents[1])
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+
+    def test_default_conflict_on_run_addressed_routes_returns_persisted_current(self):
+        self.mark_scratch()
+        run = "fault-read-run"
+        with principals.acting(self.actor):
+            run_store.insert_run(run, {"kind": "session", "started": util.iso(), "status": "running"})
+            chat_id = chats_store.chat_add("fixture")
+            chats_store.chat_link_session(chat_id, run, None)
+        endpoint = self.endpoint()
+        schema = next(error["schema"] for error in contract.ERRORS if error["code"] == "version_conflict")
+        routes = (
+            ("GET", "/api/log/fault%2Dread-run"),
+            ("GET", f"/api/feed/{run}?after=0"),
+            ("GET", f"/api/v1/screen?view=run&id={run}"),
+            ("GET", f"/api/v1/line-stream?run={run}&after=0"),
+            ("GET", f"/api/v1/steps?run={run}"),
+            ("GET", f"/api/v1/steps/1?run={run}"),
+            ("POST", f"/api/sessions/{run}/send"),
+            ("POST", f"/api/sessions/{run}/stop"),
+            ("GET", f"/api/chats/{chat_id}/sessions/{run}/report"),
+            ("POST", f"/api/chats/{chat_id}/sessions/{run}/stop"),
+        )
+        for method, route in routes:
+            with self.subTest(route=route):
+                self.fault("arm", "--route", route, "--status", "409")
+                with principals.acting(self.actor):
+                    run_store.note(run, summary=f"Updated after arming {route}")
+                current = run_store.run_get(run)
+                body = {} if method == "POST" else None
+                status, problem = self.request(endpoint, method, route, body=body)
+                self.assertEqual(status, 409)
+                contract.validate(problem, schema)
+                self.assertEqual(problem["current"], {k: v for k, v in current.items() if k in contract.RUN["properties"]})
+
+        route = f"/api/feed/{run}"
+        explicit = '{ "fault": "armed" }\n'
+        self.fault("arm", "--route", route, "--status", "409", "--body", explicit)
+        self.assertEqual(self.request(endpoint, "GET", route, raw=True), (409, explicit.encode()))
+
+    def test_default_event_conflict_returns_persisted_current_for_one_run(self):
+        self.mark_scratch()
+        run = "fault-stream-run"
+        other = "fault-stream-other"
+        self.start_run(run)
+        self.start_run(other)
+        endpoint = self.endpoint()
+        conflict = next(error for error in contract.ERRORS if error["code"] == "version_conflict")
+        selectors = (
+            (f"run={run}", True),
+            (f"subject=run%3A{run}", True),
+            (f"run={other}&run={run}", True),
+            (f"run={run}&subject=run:{run}", True),
+            (f"subject=run:{run},run:{other}", False),
+            (f"run={run}&subject=run:{other}", False),
+        )
+        for path in ("/api/v1/events", "/api/events"):
+            for selector, selects_run in selectors:
+                route = f"{path}?{selector}"
+                with self.subTest(route=route):
+                    self.fault("arm", "--route", route, "--status", "409")
+                    with principals.acting(self.actor):
+                        run_store.note(run, summary=f"Updated after arming {route}")
+                    status, problem = self.request(endpoint, "GET", route)
+                    self.assertEqual(status, 409)
+                    contract.validate(problem, conflict["schema"])
+                    current = conflict["example"]["current"]
+                    if selects_run:
+                        current = {k: v for k, v in run_store.run_get(run).items() if k in contract.RUN["properties"]}
+                    self.assertEqual(problem["current"], current)
+
+    def test_drop_closes_open_streams_and_reconnect_resumes_after_last_event(self):
+        self.mark_scratch()
+        endpoint = self.endpoint()
+        cursor = self.initial_cursor(endpoint)
+        with self.stream(endpoint, cursor) as first, self.stream(endpoint, cursor) as second:
+            self.start_run("fault-drop-first")
+            last = self.read_event(first)["id"]
+            self.assertEqual(self.read_event(second)["id"], last)
+            self.fault("drop-streams")
+            self.assertEqual(first.read(), b"")
+            self.assertEqual(second.read(), b"")
+        status, polled = self.request(endpoint, "GET", "/api/v1/events?timeout=0",
+                                      headers={"Accept": "application/json", "Last-Event-ID": last})
+        self.assertEqual((status, polled), (200, {"events": [], "next": last, "reset": None}))
+        with self.stream(endpoint, last) as reconnected:
+            self.fault("clear")
+            self.start_run("fault-drop-second")
+            self.assertEqual(self.read_event(reconnected)["subject"], "run:fault-drop-second")
+            self.fault("drop-streams")
+            self.assertEqual(reconnected.read(), b"")
+
+    def test_drop_after_heartbeat_reconnects_from_the_last_received_id(self):
+        self.mark_scratch()
+        clock = mock.Mock(wraps=event_stream.time)
+        clock.monotonic.return_value = 0
+        envelope = events.envelope
+
+        def make_beat_due(conn, row, epoch):
+            data = envelope(conn, row, epoch)
+            if data["subject"] == "run:fault-before-beat":
+                clock.monotonic.return_value = 15
+            return data
+
+        with (mock.patch.object(event_stream, "time", clock),
+              mock.patch.object(events, "envelope", side_effect=make_beat_due)):
+            endpoint = self.endpoint()
+            with self.stream(endpoint, self.initial_cursor(endpoint)) as stream:
+                self.start_run("fault-before-beat")
+                before_beat = self.read_event(stream)
+                last = stream.readline().removeprefix(b"id: ").strip().decode()
+                self.assertEqual(stream.readline(), b"event: serve.beat\n")
+                self.assertEqual(json.loads(stream.readline().removeprefix(b"data: "))["kind"], "serve.beat")
+                self.assertEqual(stream.readline(), b"\n")
+                self.fault("drop-streams")
+                self.assertEqual(stream.read(), b"")
+            with self.stream(endpoint, last) as reconnected:
+                self.start_run("fault-after-beat")
+                self.assertEqual(self.read_event(reconnected)["subject"], "run:fault-after-beat")
+                self.fault("drop-streams")
+                self.assertEqual(reconnected.read(), b"")
+            self.assertEqual(last, before_beat["id"])
+
+    def test_cursorless_stream_delivers_event_queued_after_opening_frame_once(self):
+        self.mark_scratch()
+        run = "fault-before-first-scan"
+        self.start_run(run)
+        endpoint = self.endpoint()
+        controls = endpoint[0].verify_controls
+        poll = controls.poll
+        queued = threading.Event()
+
+        def wait_for_queued_event(route="", query=""):
+            if not route and not queued.wait(timeout=3):
+                raise TimeoutError("event was not queued before the first stream tick")
+            return poll(route, query)
+
+        with mock.patch.object(controls, "poll", wait_for_queued_event), self.stream(endpoint) as stream:
+            try:
+                self.fault("event", "--kind", "run.ended", "--run", run)
+                queued.set()
+                ended = self.read_event(stream)
+                self.assertEqual((ended["kind"], ended["subject"]), ("run.ended", f"run:{run}"))
+
+                following = "fault-after-first-scan"
+                self.start_run(following)
+                self.assertEqual(self.read_event(stream)["subject"], f"run:{following}")
+            finally:
+                self.fault("drop-streams")
+                queued.set()
+            self.assertEqual(stream.read(), b"")
+
+    def test_run_ended_is_delivered_through_the_real_event_log(self):
+        self.mark_scratch()
+        run = "fault-event-run"
+        self.start_run(run)
+        endpoint = self.endpoint()
+        with self.stream(endpoint, self.initial_cursor(endpoint)) as stream:
+            with principals.acting(self.actor):
+                settled = run_store.settle(run, {"status": "failed", "finished": util.iso()})
+            real = self.read_event(stream)
+            self.assertEqual(real["kind"], "run.ended")
+            self.fault("event", "--kind", "run.ended", "--run", run)
+            with mock.patch.object(verify_faults, "write_spec", side_effect=OSError("acknowledgment failed")):
+                synthetic = self.read_event(stream)
+            self.assertGreater(synthetic["seq"], real["seq"])
+            for field in real.keys() - {"seq", "at", "id", "via"}:
+                self.assertEqual(synthetic[field], real[field], field)
+            self.assertEqual(run_store.run_get(run), settled)
+            self.assertEqual(self.initial_cursor(endpoint), synthetic["id"])
+            self.assertEqual(json.loads(self.spec.read_bytes())["events"], [])
+            self.fault("drop-streams")
+            self.assertEqual(stream.read(), b"")
 
 
 class ApiCheckTests(unittest.TestCase):
