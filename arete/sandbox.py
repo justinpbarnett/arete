@@ -92,10 +92,11 @@ def authority_roots() -> tuple[Path, ...]:
 
 def already_protects_authority() -> bool:
     lib = ctypes.CDLL(None)
-    lib.sandbox_check.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p)
+    lib.sandbox_check.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int)
 
     def denied(path: Path, *operations: bytes) -> bool:
-        return all(lib.sandbox_check(os.getpid(), op, 1, os.fsencode(path)) == 1 for op in operations)
+        return all(lib.sandbox_check(os.getpid(), op, 1, ctypes.c_char_p(os.fsencode(path))) == 1
+                   for op in operations)
 
     def absent(path: Path) -> bool:
         try:

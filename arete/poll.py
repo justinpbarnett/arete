@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import json
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import timedelta
 
 from . import (
     config,
     intake,
     jira,
+    launch_lease,
     oncall,
     outcomes,
     owner_asks,
@@ -59,7 +61,10 @@ def next_ticket(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
                 other_routes: set[str] = frozenset(), excluded: set[str] = frozenset(),
                 recovered: tuple[tracker.Ticket, ...] = ()) -> tracker.Ticket | None:
     for source in ticket_queues(repo, tk):
-        for t in queueing.prioritized([*source.todo(), *(recovered if source is tk else ())]):
+        listed = source.todo(parked=lambda tid: bool(runlimits.latest_park(repo.name, tid)[1]))
+        known = {str(t.id) for t in listed}
+        extra = [t for t in recovered if str(t.id) not in known] if source is tk else []
+        for t in queueing.prioritized([*listed, *extra]):
             tid = str(t.id)
             if (tid in excluded or other_routes & set(t.labels) or run_store.issue_running(repo.name, t.id)
                     or not pilot.pickable(tid, repo.name)
@@ -163,7 +168,7 @@ def tracker_reply(repo: config.Repo, tk: tracker.Tracker, tid: str, dry_run: boo
     return ""
 
 
-def spawn_unparked(repo_name: str, tid: str | int) -> bool | None:
+def spawn_unparked(repo_name: str, tid: str | int, readmission: runlimits.Readmission | None = None) -> bool | None:
     """Return True for a spawn, None for existing work, False for an oncall refusal."""
     from . import tasks
 
@@ -174,10 +179,12 @@ def spawn_unparked(repo_name: str, tid: str | int) -> bool | None:
             if tasks.pending_start(repo_name, str(tid)) or run_store.issue_running(repo_name, tid):
                 return None
             def spawn():
+                lease = launch_lease.CURRENT.get()
                 if zte.reserved(str(tid)):
-                    from . import launch_lease
-
-                    zte.bind_launch(repo_name, str(tid), launch_lease.CURRENT.get())
+                    zte.bind_launch(repo_name, str(tid), lease)
+                if readmission:
+                    lease.readmission = json.dumps(asdict(readmission))
+                    readmission.attempted(record=True)
                 return spawn_run(repo_name, tid)
 
             tasks.spawn_pending(repo_name, str(tid), spawn)
@@ -273,8 +280,8 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: tuple[str, str], skip
             source_store.pass_over(repo.name, str(tid))
         print(f"{util.iso()} {name}: waiting, {waiting}")
         return "held"
-    blocked, _ = runlimits.admission(repo, str(tid), source, runlimits.Policy.of(layer), False)
     ticket = source.get(tid)
+    blocked, readmission = runlimits.poll_admission(repo, str(tid), ticket, runlimits.Policy.of(layer))
     blocked = blocked or source.blocker(tid) or reply
     if not blocked:
         if not zte.reserved(str(tid)):
@@ -287,7 +294,7 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: tuple[str, str], skip
     print(f"{util.iso()} {name}: {why}" + (" (dry run, not started)" if dry_run else ""))
     if not dry_run:
         source_store.drop_passed_over(repo.name, keep=str(tid))
-        spawned = spawn_unparked(repo.name, tid)
+        spawned = spawn_unparked(repo.name, tid, readmission)
         if spawned is None:
             return "skipped"
         if not spawned:
