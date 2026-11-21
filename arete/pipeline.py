@@ -847,6 +847,11 @@ def stageable_untracked(wt: Path, *, ignored: bool = False) -> set[str]:
                                  *diffguard.NEVER_STAGED], wt))
 
 
+def changed_tree_paths(wt: Path, before: str, after: str) -> set[str]:
+    return set(util.git_records(["diff", "--no-renames", "--ignore-submodules=none", "--name-only",
+                                 before, after], wt))
+
+
 def stage(checkouts: list[workspace.Checkout], deny: list[str], from_base: bool = False, *,
           worker_trees: dict[str, str] | None = None, ignored_denied_paths: dict[str, list[str]] | None = None) -> Staged:
     out = Staged()
@@ -1485,7 +1490,7 @@ def run_command(repo_name: str, tid: str | int, force: bool = False, dry_run: bo
         source = newest if newest and newest["status"] == "interrupted" else (
             next(iter(run_store.open_runs(repo_name, str(tid))), None)
             if not force and pending_feedback(repo_name, str(tid)) else None)
-        if ((newest and not newest.get("dry_run") and requeue.policy_retry(newest))
+        if (requeue.policy_retry(run_store.newest_live_whole_run(repo_name, str(tid)))
                 or dry_run and run_store.held_environment_branch(repo_name, str(tid))):
             source = None
         previous = (orchestration.find(source["id"]) or {}).get("current_run", source["id"]) if source else ""
@@ -3327,16 +3332,32 @@ def merge_as_run(run_id: str, c: workspace.Checkout, commit: str, named: str, *,
         options = []
         if not overwrite_ignore:
             check_merge_paths(c.wt, commit)
-            options = ["--no-overwrite-ignore", "-s", "ort"]
+            options = ["--no-autostash", "--no-overwrite-ignore", "-s", "ort"]
         util.git_as_owner(["merge", "-q", "--no-edit", *options, "-m", f"Merge {named} at {commit[:12]}",
                            "-m", f"Arete-Run: {run_id}", commit], c.wt)
+
+
+def parked_tracked_edits(ws: Path, c: workspace.Checkout, head: str, edits: list[str],
+                         layer: config.RepoLayer) -> dict:
+    made = workspace.made_before(ws)
+    if workspace.head_recorded(made, c) != head:
+        return {}
+    deny = diffguard.denied_paths(layer)
+    if not all((util.matches_any(name, deny) or util.matches_any(c.prefix + name, deny))
+               and workspace.recorded(made, c.wt, name, c.prefix) for name in edits):
+        return {}
+    status = util.git_records(["status", "--porcelain", "--no-renames", "--untracked-files=no",
+                               "--ignore-submodules=all", "--", ".", *diffguard.NEVER_STAGED], c.wt)
+    if all(entry[:3] in (" M ", " D ", " T ") for entry in status) and {entry[3:] for entry in status} == set(edits):
+        return made
+    return {}
 
 
 def merge_moved_bases(run: AgentRun, checkouts: list[workspace.Checkout], layer: config.RepoLayer, ticket: tracker.Ticket,
                       log_prefix: str = "", reason: str = "since the base moved after the last push", *,
                       bases: dict[str, str] | None = None, allow_untracked: bool = False,
-                      environment_retry: bool = False,
-                      before_merge: Callable[[workspace.Checkout], None] | None = None,
+                      environment_retry: bool = False, retained_workspace: Path | None = None,
+                      before_merge: Callable[[workspace.Checkout, str, list[str]], None] | None = None,
                       before_resolve: Callable[[], None] | None = None) -> list[workspace.Checkout]:
     merged = []
     for c in checkouts:
@@ -3349,12 +3370,14 @@ def merge_moved_bases(run: AgentRun, checkouts: list[workspace.Checkout], layer:
                 c.base_commit = base
             continue
         c.base_commit = base
-        if edits := workspace.uncommitted(c.wt, tracked_only=allow_untracked):
+        head = git(["rev-parse", "HEAD"], c.wt).strip()
+        edits = workspace.uncommitted(c.wt, tracked_only=allow_untracked)
+        parked = parked_tracked_edits(retained_workspace, c, head, edits, layer) if edits and retained_workspace else {}
+        if edits and not parked:
             raise workspace.RunFailed(f"{c.github} has uncommitted edits ({', '.join(edits[:5])}), so arete merged nothing into "
                             "them and left them as they are")
-        head = git(["rev-parse", "HEAD"], c.wt).strip()
         if before_merge:
-            before_merge(c)
+            before_merge(c, head, edits)
         with record.timed(run.id, "base_merge", repo=c.github, base=c.base, base_commit=c.base_commit,
                           head=head) as rec:
             try:
@@ -3370,7 +3393,8 @@ def merge_moved_bases(run: AgentRun, checkouts: list[workspace.Checkout], layer:
                     if before_resolve:
                         before_resolve()
                     try:
-                        resolve_conflicts(run, c, conflicts, layer, ticket)
+                        retained = {"parked": (parked, edits)} if parked else {}
+                        resolve_conflicts(run, c, conflicts, layer, ticket, **retained)
                     except workspace.RunFailed as e:
                         raise ConflictUnresolved(e, conflicts) from e
                 else:
@@ -3390,7 +3414,8 @@ def merge_moved_bases(run: AgentRun, checkouts: list[workspace.Checkout], layer:
 
 
 def resolve_conflicts(run: AgentRun, c: workspace.Checkout, conflicts: list[str], layer: config.RepoLayer,
-                      ticket: tracker.Ticket, incoming: tuple[str, str] | None = None) -> None:
+                      ticket: tracker.Ticket, incoming: tuple[str, str] | None = None, *,
+                      parked: tuple[dict, list[str]] | None = None) -> None:
     deny = diffguard.denied_paths(layer)
     named, commit = incoming or (c.origin_base, c.base_commit)
 
@@ -3470,6 +3495,10 @@ def resolve_conflicts(run: AgentRun, c: workspace.Checkout, conflicts: list[str]
         invalidated_edits.update(name for name in invalidated_before & invalidated_after
                                  if scratch_metadata[name] != resolver_scratch_metadata(c.wt, name))
         tracked_edits = set(util.git_records(["diff", "--name-only"], c.wt))
+        if parked:
+            made, names = parked
+            tracked_edits.difference_update(names)
+            tracked_edits.update(n for n in names if not workspace.recorded(made, c.wt, n, c.prefix))
         touched = tracked_edits | new_untracked | changed_watched | restorations
         if outside := sorted((touched - conflict_paths - supplemental) | invalidated_edits):
             raise workspace.RunFailed(f"the resolver edited files outside the conflict in {c.github}: {', '.join(outside)}")

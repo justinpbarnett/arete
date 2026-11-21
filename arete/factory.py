@@ -125,12 +125,15 @@ def fingerprint(folder: Path | str) -> str:
         index.with_name(index.name + ".lock").unlink(missing_ok=True)
 
 
-def tree_with_paths(folder: Path, base: str, source: str, names: list[str]) -> str:
-    entries = util.git_records(["ls-tree", "-r", source, "--", *names], folder,
-                               env={"GIT_LITERAL_PATHSPECS": "1"})
+def tree_with_paths(folder: Path, base: str, source: str, names: list[str], *,
+                    remove_missing: set[str]) -> str:
+    listed = util.git_records(["ls-tree", "-r", source, "--", *names], folder,
+                              env={"GIT_LITERAL_PATHSPECS": "1"})
     wanted = set(names)
-    entries = [entry for entry in entries if entry.partition("\t")[2] in wanted]
-    if not entries:
+    entries = {name: entry for entry in listed if (name := entry.partition("\t")[2]) in wanted}
+    updates = [f"0 {'0' * len(base)}\t{name}" for name in sorted(remove_missing - entries.keys())]
+    updates.extend(entries.values())
+    if not updates:
         return base
     handle, name = tempfile.mkstemp(prefix="arete-index-")
     os.close(handle)
@@ -139,7 +142,7 @@ def tree_with_paths(folder: Path, base: str, source: str, names: list[str]) -> s
         index.unlink()
         env = {"GIT_INDEX_FILE": str(index)}
         util.git(["read-tree", base], folder, env=env)
-        util.git(["update-index", "-z", "--index-info"], folder, input="\0".join(entries) + "\0", env=env)
+        util.git(["update-index", "-z", "--index-info"], folder, input="\0".join(updates) + "\0", env=env)
         return util.git(["write-tree"], folder, env=env).strip()
     finally:
         index.unlink(missing_ok=True)

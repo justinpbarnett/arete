@@ -270,7 +270,13 @@ class Controller:
             self.data.pop("published", None)
             self.data.pop("published_tree", None)
         elif restore_prs:
-            self.merge_restored_bases()
+            try:
+                self.merge_restored_bases()
+            except delegation.PolicyChanged as error:
+                recovery = {"reason": "policy-changed"}
+                if self.run.closed_checkouts:
+                    recovery.update(branch=self.job.branch, closed_checkouts=[c.to_row() for c in self.run.closed_checkouts])
+                raise workspace.RunFailed(pipeline.record.failure(error), recovery=recovery) from error
         elif not prepared and self.flow.continues and (moved := flows.base_moved(self.flow.continues)):
             self.job.moved_base = moved
             self.job.merge_moved_base("orchestrate")
@@ -355,35 +361,59 @@ class Controller:
                     self.check_merged_policy()
             return
         deny = diffguard.denied_paths(job.layer)
+        b = job.b
 
-        def visible_denied(checkout):
-            return {path for path in pipeline.stageable_untracked(checkout.wt)
+        def denied_paths(checkout, paths):
+            return {path for path in paths
                     if util.matches_any(path, deny) or util.matches_any(checkout.prefix + path, deny)}
 
-        denied_before = {}
+        def visible_denied(checkout):
+            return denied_paths(checkout, pipeline.stageable_untracked(checkout.wt))
 
-        def remember_denied(checkout):
-            denied_before[checkout.github] = visible_denied(checkout)
+        denied_before = {}
+        saved_baseline = {}
+        saved_tracked = {}
+
+        def remember_denied(checkout, head, tracked):
+            repo = checkout.github
+            denied_before[repo] = visible_denied(checkout)
+            if tracked:
+                saved_tracked[repo] = set(tracked)
+            if previous := b.worker_trees.get(repo):
+                paths = pipeline.changed_tree_paths(checkout.wt, head, previous)
+                saved_baseline[repo] = head, denied_paths(checkout, paths)
 
         for checkout in prs:
             checkout.resumes = True
             workspace.fetch(checkout.src, checkout.base)
-        merged = pipeline.merge_moved_bases(self.run, prs, job.layer, job.ticket, allow_untracked=True,
+        policy_dir = self.run.repo.layer or job.ws / ".agents"
+        merge_order = sorted(prs, key=lambda c: -len(c.wt.parts) if policy_dir.is_relative_to(c.wt) else 0)
+        merged = pipeline.merge_moved_bases(self.run, merge_order, job.layer, job.ticket, allow_untracked=True,
+                                           retained_workspace=job.ws,
                                            before_merge=remember_denied,
                                            before_resolve=self.check_merged_policy)
         if merged:
             self.check_merged_policy()
-            b = job.b
             for checkout in merged:
                 repo = checkout.github
                 visible = visible_denied(checkout)
                 if hidden := denied_before[repo] - visible:
                     b.ignored_denied_paths[repo] = sorted(hidden.union(b.ignored_denied_paths.get(repo, ())))
-                denied = sorted(visible.union(b.ignored_denied_paths.get(repo, ())))
+                denied = visible.union(b.ignored_denied_paths.get(repo, ()))
+                preserved = saved_tracked.get(repo, set())
+                if repo in saved_baseline:
+                    head, prior_paths = saved_baseline[repo]
+                    if prior_paths:
+                        changed = {Path(path) for path in pipeline.changed_tree_paths(checkout.wt, head, checkout.merge)}
+                        parents = {parent for path in changed for parent in path.parents}
+                        targets = changed | parents
+                        preserved.update(path for path in prior_paths if Path(path) not in targets
+                                         and changed.isdisjoint(Path(path).parents))
                 previous = b.worker_trees.pop(repo, "")
-                if denied:
+                if denied or preserved:
                     b.worker_trees[repo] = (
-                        factory.tree_with_paths(checkout.wt, checkout.merge, previous, denied)
+                        factory.tree_with_paths(checkout.wt, checkout.merge, previous, sorted(denied | preserved),
+                                                remove_missing=preserved)
                         if previous else checkout.merge)
             self.data["worker_trees"] = b.worker_trees
             if b.ignored_denied_paths:
@@ -398,13 +428,7 @@ class Controller:
         job = self.job
         layer = pipeline.resolve_layer(job.cfg, self.run, job.ws)
         launch = {"config_sha": delegation.settings_sha(job.cfg), "layer_sha": delegation.settings_sha(job.layer)}
-        try:
-            delegation.check_policy(launch, job.cfg, layer)
-        except delegation.PolicyChanged as error:
-            recovery = {"reason": "policy-changed"}
-            if self.run.closed_checkouts:
-                recovery.update(branch=job.branch, closed_checkouts=[c.to_row() for c in self.run.closed_checkouts])
-            raise workspace.RunFailed(pipeline.record.failure(error), recovery=recovery) from error
+        delegation.check_policy(launch, job.cfg, layer)
 
     def lineage(self):
         self.catalog = Catalog(self.job)

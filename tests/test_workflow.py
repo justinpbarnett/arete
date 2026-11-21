@@ -207,11 +207,13 @@ class RestoredPRRevisionTests(unittest.TestCase):
         self.enterContext(mock.patch.object(flows, "authority", return_value=(self.head, True)))
         self.enterContext(mock.patch.object(orchestration.zte, "reserved", return_value=False))
         self.enterContext(mock.patch.object(orchestration.run_lines, "write"))
+        self.enterContext(mock.patch.object(util, "github_token", return_value=""))
         self.kept_work = workspace.kept_work
         self.workspace_git = {name: getattr(workspace, name) for name in
                               ("fetch", "ignored_files", "kept_onto", "kept_work", "note_made", "uncommitted")}
         self.pipeline_git = {name: getattr(pipeline, name) for name in
-                             ("git", "merge_as_run", "stageable_untracked", "unmerged_paths")}
+                             ("abort_merge", "changed_tree_paths", "git", "merge_as_run", "stageable_untracked",
+                              "unmerged_paths")}
         self.enterContext(mock.patch.multiple(workspace, kept_work=mock.Mock(return_value=""),
                                               kept_onto=mock.Mock(return_value={}), scratch_held=mock.Mock(return_value=[]),
                                               uncommitted=mock.Mock(return_value=[]), note_made=mock.DEFAULT,
@@ -222,6 +224,7 @@ class RestoredPRRevisionTests(unittest.TestCase):
         self.push = self.enterContext(mock.patch.object(pipeline, "commit_and_push", wraps=pipeline.commit_and_push))
         self.enterContext(mock.patch.object(pipeline, "git", side_effect=self.git))
         self.enterContext(mock.patch.object(pipeline, "stageable_untracked", return_value=set()))
+        self.enterContext(mock.patch.object(pipeline, "changed_tree_paths", return_value=set()))
         self.enterContext(mock.patch.object(pipeline.record, "timed", side_effect=lambda *_a, **_kw: nullcontext({})))
         self.enterContext(mock.patch.object(pipeline, "resolution_diff", return_value=SimpleNamespace(lines=1)))
         self.enterContext(mock.patch.object(pipeline, "unmerged_paths",
@@ -247,6 +250,14 @@ class RestoredPRRevisionTests(unittest.TestCase):
         checkout = self.add_checkout("sibling", pr_number, **kw)
         self.controller.data["prepared"]["checkouts"].append(checkout.to_row())
         return checkout
+
+    def answer_owner(self):
+        answer = {**owner_asks.text_ask("Keep the edit?"), "answers": [{"text": "Keep it"}], "status": "answered",
+                  "run": "prior-run", "id": "question", "step": "orchestrate"}
+        self.run.answers_due = [answer]
+        self.actions.return_value.insert(0, {**self.worker, "id": "ask", "op": "owner.ask", "state": "succeeded",
+                                            "result": {"awaiting_owner": True, "ask_ids": [answer["id"]]}})
+        self.enterContext(mock.patch.object(orchestration.ask_store, "ask_get", return_value=answer))
 
     def advance(self, checkout, *, conflict=False):
         self.tips[checkout.src] = "moved-base"
@@ -322,28 +333,46 @@ class RestoredPRRevisionTests(unittest.TestCase):
 
         self.first_dispatch(check)
 
-    def real_checkout(self, *, ignore=""):
-        c = self.checkout
-        origin = self.ws.parent / "origin.git"
-        origin.mkdir()
-        self.enterContext(mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}))
-        (c.wt / ".git").unlink()
-        self.fixture_git(origin, "init", "-q", "--bare", "--template=", "-b", "main")
+    def seed_checkout(self):
+        cls = type(self)
+        if hasattr(cls, "git_seed"):
+            return cls.git_seed
+        origin = Path(tempfile.mkdtemp(prefix="arete-pr-seed-"))
+        self.addClassCleanup(shutil.rmtree, origin, ignore_errors=True)
+        self.fixture_git(origin, "init", "-q", "--template=", "-b", "revision")
         commits = []
-        for mark, (branch, name, content) in enumerate(
-                (("main", "file.txt", "base"), ("revision", "file.txt", "kept edit"),
-                 ("advance", "upstream.txt", "base advance")), start=1):
+        branches = {
+            "base": {"file.txt": "base", "tracked-denied.txt": "committed content", ".agents/config.toml": self.deny,
+                     "tracked-absent.txt": "committed content"},
+            "revision": {"file.txt": "kept edit"},
+            "main": {"upstream.txt": "base advance"},
+            "ignore": {"upstream.txt": "base advance", ".gitignore": "ignored-*.txt\n*.cache\n"},
+            "conflict": {"file.txt": "base advance", ".agents/config.toml": ""},
+        }
+        for mark, (branch, files) in enumerate(branches.items(), start=1):
             parent = "from :1\n" if mark != 1 else ""
             commits.append(f"commit refs/heads/{branch}\nmark :{mark}\n"
                            "committer Fixture <fixture@example.com> 1 +0000\n"
-                           f"data {len(branch)}\n{branch}\n{parent}"
-                           f"M 100644 inline {name}\ndata {len(content)}\n{content}\n")
-            if branch == "advance" and ignore:
-                commits.append(f"M 100644 inline .gitignore\ndata {len(ignore)}\n{ignore}\n")
-        self.fixture_git(origin, "fast-import", "--quiet", input="".join(commits) + "done\n")
-        self.fixture_git(self.ws, "clone", "-q", "--template=", "-b", "revision", str(origin), str(c.wt))
+                           f"data {len(branch)}\n{branch}\n{parent}")
+            commits.extend(f"M 100644 inline {name}\ndata {len(content)}\n{content}\n" for name, content in files.items())
+        marks_file = origin / ".git" / "marks"
+        self.fixture_git(origin, "fast-import", "--quiet", f"--export-marks={marks_file}",
+                         input="".join(commits) + "done\n")
+        self.fixture_git(origin, "reset", "-q", "--hard")
+        shas = dict(zip(branches, (line.split()[1] for line in marks_file.read_text().splitlines()), strict=True))
+        cls.git_seed = origin, shas
+        self.addClassCleanup(delattr, cls, "git_seed")
+        return cls.git_seed
+
+    def real_checkout(self, advance):
+        c = self.checkout
+        self.enterContext(mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}))
+        origin, shas = self.seed_checkout()
+        (c.wt / ".git").unlink()
+        shutil.copytree(origin, c.wt, dirs_exist_ok=True)
+        self.fixture_git(c.wt, "update-ref", "refs/remotes/origin/main", shas[advance])
         c.src = c.wt
-        c.lease, c.base_commit = self.fixture_git(c.wt, "rev-parse", "HEAD", "origin/main").split()
+        c.lease, c.base_commit = shas["revision"], shas["base"]
         c.revision = c.lease
         self.controller.data["prepared"]["checkouts"] = [c.to_row()]
         self.enterContext(mock.patch.multiple(workspace, fetch=self.workspace_git["fetch"],
@@ -353,7 +382,8 @@ class RestoredPRRevisionTests(unittest.TestCase):
         lock_dir.mkdir()
         self.enterContext(mock.patch.object(paths, "LOCKS_DIR", lock_dir))
         self.enterContext(mock.patch.object(paths, "ensure_dirs"))
-        return c, origin
+        self.enterContext(mock.patch.object(workspace, "drop_untracked_bytecode"))
+        return c, shas[advance]
 
     def fixture_git(self, cwd, *args, input=None):
         result = subprocess.run(["git", *args], cwd=cwd, input=input, capture_output=True, text=True, timeout=5)
@@ -361,27 +391,46 @@ class RestoredPRRevisionTests(unittest.TestCase):
         return result.stdout
 
     def test_restored_merge_preserves_the_denied_worktree_baseline_at_the_next_checks(self):
-        c, _ = self.real_checkout(ignore="ignored-*.txt\n*.cache\n")
+        c, moved = self.real_checkout("ignore")
         ctl = self.controller
-        self.config.write_text('[limits]\ndeny = ["owner-only.txt", "prior-only.txt", "upstream.txt", "ignored-*.txt"]\n'
+        self.config.write_text('[limits]\ndeny = ["owner-only.txt", "prior-only.txt", "upstream.txt", '
+                               '"ignored-*.txt", "tracked-denied.txt", "tracked-absent.txt", "deleted-local.txt"]\n'
                                '[checks]\nfixture = "check workspace"\n')
+        self.enterContext(mock.patch.object(paths, "STATE_DIR", self.ws.parent / "state"))
+        tracked = c.wt / "tracked-denied.txt"
+        tracked.write_text("pre-worker content")
+        absent = c.wt / "tracked-absent.txt"
+        absent.unlink()
         prior = c.wt / "prior-only.txt"
         prior.write_text("original local content")
+        deleted = c.wt / "deleted-local.txt"
+        deleted.write_text("pre-existing local content")
         ignored_prior = c.wt / "ignored-prior.txt"
         ignored_prior.write_text("original content before the ignore rule")
         ctl.data["worker_trees"][c.github] = factory.fingerprint(c.wt)
+        deleted.unlink()
         denied = c.wt / "owner-only.txt"
-        denied.write_text("retained denied edit")
+        denied.write_text("left by the previous worker")
         prior.write_text("retained edit to the local file")
         ignored_denied = c.wt / "ignored-denied.txt"
         ignored_denied.write_text("retained denied edit under the new ignore rule")
         ignored_prior.write_text("retained edit under the new ignore rule")
         allowed = c.wt / "allowed.cache"
         allowed.write_text("local cache")
-        self.fixture_git(c.wt, "update-ref", "refs/remotes/origin/main", "refs/remotes/origin/advance")
+        tracked.write_text("parked tracked edit")
+        absent.write_text("parked edit on a path absent from the saved baseline")
+        with (mock.patch.object(workspace, "leftovers", return_value=[c.prefix + p.name for p in (tracked, absent)]),
+              mock.patch.object(workspace, "git", return_value=c.lease)):
+            self.workspace_git["note_made"](self.ws, [c])
+        self.answer_owner()
 
         def start_worker(row):
             self.assertTrue(row["merged_base"])
+            self.assertEqual(row["base_commit"], moved)
+            self.assertIn("Keep it", self.job.goal)
+            self.assertFalse(deleted.exists())
+            self.assertEqual(denied.read_text(), "left by the previous worker")
+            self.assertEqual(tracked.read_text(), "parked tracked edit")
             setting = self.run.settings("build")
             args = {"tool_bundle": "write", "depends_on": [], "context_refs": [], "goal": "Revise", "inputs": {}}
             with (mock.patch.object(ctl.catalog, "worker", return_value=(setting, "build", True)),
@@ -389,6 +438,8 @@ class RestoredPRRevisionTests(unittest.TestCase):
                 ctl.worker_start(self.worker, args)
             launched.assert_called_once()
             ctl.workers.clear()
+            self.assertNotIn(denied.name, self.fixture_git(c.wt, "ls-tree", "--name-only",
+                                                           self.job.b.worker_trees[c.github]).splitlines())
 
         with (mock.patch.object(workspace, "fetch"), mock.patch.object(pipeline, "check_merge_paths")):
             self.first_dispatch(start_worker)
@@ -396,6 +447,7 @@ class RestoredPRRevisionTests(unittest.TestCase):
         self.assertEqual(self.saved.call_args.args[1]["ignored_denied_paths"][c.github],
                          [ignored_denied.name, ignored_prior.name])
         with (mock.patch.object(pipeline.record, "mark"),
+              mock.patch.object(pipeline, "checkout_patch", return_value=""),
               mock.patch.object(pipeline, "run_checks", return_value=(True, "")) as commands):
             self.assertFalse(self.job.b.check())
         commands.assert_not_called()
@@ -409,6 +461,83 @@ class RestoredPRRevisionTests(unittest.TestCase):
         self.assertFalse(ignored_denied.exists())
         self.assertEqual(ignored_prior.read_text(), "original content before the ignore rule")
         self.assertEqual(allowed.read_text(), "local cache")
+        self.assertIn(tracked.name, self.job.b.report)
+        self.assertEqual(tracked.read_text(), "pre-worker content")
+        self.assertFalse(absent.exists())
+        self.assertIn(deleted.name, self.job.b.report)
+        self.assertEqual(deleted.read_text(), "pre-existing local content")
+
+        def check(command, cfg, repo, *, cwd, timeout):
+            self.assertEqual((command, cwd), ("check workspace", self.ws))
+            self.assertFalse(denied.exists())
+            self.assertEqual(deleted.read_text(), "pre-existing local content")
+            self.assertEqual(tracked.read_text(), "pre-worker content")
+            self.assertFalse(absent.exists())
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        with (mock.patch.object(factory, "fingerprint", return_value="checked-tree"),
+              mock.patch.object(pipeline, "check_lane", return_value=nullcontext()),
+              mock.patch.object(pipeline.environment, "sh", side_effect=check) as command):
+            self.assertTrue(self.job.b.check(staged=self.job.b.staged))
+        command.assert_called_once()
+
+    def test_restored_merge_keeps_the_baseline_for_git_clean_denied_edits(self):
+        c, moved = self.real_checkout("main")
+        self.config.write_text('[limits]\ndeny = ["tracked-denied.txt", "tracked-absent.txt"]\n'
+                               '[checks]\nfixture = "check workspace"\n')
+        self.enterContext(mock.patch.object(paths, "STATE_DIR", self.ws.parent / "state"))
+        tracked = c.wt / "tracked-denied.txt"
+        absent = c.wt / "tracked-absent.txt"
+        tracked.write_text("pre-worker content")
+        absent.unlink()
+        self.controller.data["worker_trees"][c.github] = factory.fingerprint(c.wt)
+        tracked.write_text("committed content")
+        absent.write_text("committed content")
+        self.assertEqual(self.fixture_git(c.wt, "status", "--porcelain"), "")
+        self.answer_owner()
+
+        def at_dispatch(row):
+            self.assertEqual(row["base_commit"], moved)
+            self.assertEqual(tracked.read_text(), "committed content")
+            self.assertTrue(absent.exists())
+
+        with mock.patch.object(workspace, "fetch"):
+            self.first_dispatch(at_dispatch)
+
+        def check(command, cfg, repo, *, cwd, timeout):
+            self.assertEqual((command, cwd), ("check workspace", self.ws))
+            self.assertEqual(tracked.read_text(), "pre-worker content")
+            self.assertFalse(absent.exists())
+            self.assertEqual((c.wt / "upstream.txt").read_text(), "base advance")
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        b = self.job.b
+        with (mock.patch.object(pipeline.record, "mark"),
+              mock.patch.object(pipeline, "check_lane", return_value=nullcontext()),
+              mock.patch.object(pipeline.environment, "sh", side_effect=check) as command):
+            self.assertFalse(b.check())
+            command.assert_not_called()
+            self.assertIn(tracked.name, b.report)
+            self.assertIn(absent.name, b.report)
+            self.assertTrue(b.check(staged=b.staged))
+        command.assert_called_once()
+
+    def test_moved_base_refuses_a_changed_recorded_tracked_edit(self):
+        c = self.checkout
+        self.advance(c)
+        path = c.wt / "owner-only.txt"
+        path.write_text("parked denied edit")
+        salt = "fixture-salt"
+        made = {workspace.SALT_KEY: salt, workspace.head_key(c): self.head,
+                c.prefix + path.name: workspace.fingerprint(path, salt)}
+        path.write_text("edit since parking")
+        with (mock.patch.object(workspace, "made_before", return_value=made),
+              mock.patch.object(workspace, "uncommitted", return_value=[path.name]),
+              self.assertRaisesRegex(workspace.RunFailed, r"has uncommitted edits \(owner-only\.txt\)")):
+            self.controller.drive()
+        self.merge.assert_not_called()
+        self.dispatch.assert_not_called()
+        self.assertEqual(path.read_text(), "edit since parking")
 
     def test_closed_sibling_ignored_files_must_match_the_workspace_record(self):
         c = self.checkout
@@ -501,18 +630,13 @@ class RestoredPRRevisionTests(unittest.TestCase):
         self.assertEqual(owner.read_text(), "retained local file")
 
     def test_parked_owner_answer_merges_the_new_base_with_kept_edits_and_no_pr(self):
-        c, origin = self.real_checkout()
-        kept, moved = c.lease, self.fixture_git(origin, "rev-parse", "advance").strip()
-        self.fixture_git(origin, "update-ref", "refs/heads/main", moved)
+        c, moved = self.real_checkout("main")
+        kept = c.lease
         c.pr = c.lease = ""
         c.revision = c.base_commit
         prepared = self.controller.data["prepared"]
         prepared["checkouts"] = [c.to_row()]
-        answer = {**owner_asks.text_ask("Keep the edit?"), "answers": [{"text": "Keep it"}], "status": "answered",
-                  "run": "prior-run", "id": "question", "step": "orchestrate"}
-        self.run.answers_due = [answer]
-        self.actions.return_value.insert(0, {**self.worker, "id": "ask", "op": "owner.ask", "state": "succeeded",
-                                            "result": {"awaiting_owner": True, "ask_ids": ["question"]}})
+        self.answer_owner()
 
         def check(row):
             head, *parents = self.fixture_git(c.wt, "rev-list", "--parents", "-1", "HEAD").split()
@@ -522,10 +646,12 @@ class RestoredPRRevisionTests(unittest.TestCase):
             self.assertEqual((c.wt / "upstream.txt").read_text(), "base advance")
             self.assertIn("Keep it", self.job.goal)
 
-        with (mock.patch.object(workspace, "kept_onto", return_value={str(c.wt): c.base_commit}),
-              mock.patch.object(flows, "prepared_data", return_value=prepared),
-              mock.patch.object(orchestration.ask_store, "ask_get", return_value=answer)):
+        with (mock.patch.object(workspace, "remote_head", return_value=moved),
+              mock.patch.object(workspace, "fetch") as fetch,
+              mock.patch.object(workspace, "kept_onto", return_value={str(c.wt): c.base_commit}),
+              mock.patch.object(flows, "prepared_data", return_value=prepared)):
             self.first_dispatch(check)
+        fetch.assert_called_once_with(c.src, c.base)
         self.pr_details.assert_not_called()
         self.resolver.assert_not_called()
 
@@ -885,6 +1011,48 @@ class RestoredPRRevisionTests(unittest.TestCase):
         self.dispatch.assert_not_called()
         self.saved.assert_not_called()
 
+    def test_real_conflict_aborts_when_the_base_merge_removes_a_deny_rule(self):
+        c, _ = self.real_checkout("conflict")
+        layer = c.wt / ".agents"
+        self.run.repo = replace(self.run.repo, layer=layer)
+        self.controller.data["prepared"]["layer"] = str(layer)
+        self.controller.data["worker_trees"].clear()
+
+        with (mock.patch.object(workspace, "fetch"),
+              mock.patch.object(pipeline, "check_merge_paths"),
+              self.assertRaisesRegex(workspace.RunFailed, "PolicyChanged: worker policy changed after action acceptance")):
+            self.controller.drive()
+
+        self.assertEqual(self.fixture_git(c.wt, "rev-parse", "HEAD").strip(), c.lease)
+        self.assertFalse((c.wt / ".git" / "MERGE_HEAD").exists())
+        self.assertEqual((layer / "config.toml").read_text(), self.deny)
+        self.resolver.assert_not_called()
+        self.dispatch.assert_not_called()
+
+    def test_policy_change_in_a_sibling_stops_before_resolving_the_first_checkout(self):
+        sibling = self.add_sibling(8)
+        layer = sibling.wt / ".agents"
+        layer.mkdir()
+        policy = layer / "config.toml"
+        policy.write_text(self.deny)
+        self.run.repo = replace(self.run.repo, layer=layer,
+                                parts=[*self.run.repo.parts, config.Part(sibling.dir, sibling.github)])
+        self.controller.data["prepared"]["layer"] = str(layer)
+        self.advance(self.checkout, conflict=True)
+        self.advance(sibling)
+
+        def merge(run_id, checkout, commit, ref, *, overwrite_ignore):
+            self.start_merge(run_id, checkout, commit, ref, overwrite_ignore=overwrite_ignore)
+            if checkout.github == sibling.github:
+                policy.write_text("")
+
+        self.merge.side_effect = merge
+        with self.assertRaisesRegex(workspace.RunFailed, "PolicyChanged: worker policy changed after action acceptance"):
+            self.controller.drive()
+
+        self.resolver.assert_not_called()
+        self.dispatch.assert_not_called()
+
     def test_policy_change_on_answered_pr_repair_without_feedback_starts_fresh_at_next_poll(self):
         ctl = self.controller
         state = self.ws.parent / "poll-state"
@@ -948,7 +1116,8 @@ class RestoredPRRevisionTests(unittest.TestCase):
         paths.DB_FILE.touch()
         self.enterContext(mock.patch.object(dbstats.Timing, "finished"))
         self.enterContext(mock.patch.object(db, "connect_db", side_effect=lambda *_a, **_kw: sqlite3.connect(uri, uri=True)))
-        with redirect_stdout(StringIO()):
+        with (redirect_stdout(StringIO()),
+              mock.patch.object(db.migrations, "owners", return_value=db.migrations.owners())):
             db.migrate()
         record.start("pipeline", run_id="prior-run", repo=repo.name, issue=self.run.tid)
         self.run.repairs = "repair-source"
@@ -984,6 +1153,10 @@ class RestoredPRRevisionTests(unittest.TestCase):
         self.assertEqual([row["pr_url"] for row in pipeline.run_store.open_runs(repo.name, self.run.tid)], [c.pr])
         self.assertEqual(pipeline.pending_feedback(repo.name, self.run.tid), [])
         self.assertIn(self.run.tracker.label_name("failed"), labels)
+        preview = record.start("pipeline", run_id="newer-preview", repo=repo.name, issue=self.run.tid, dry_run=True)
+        record.settle(preview, "dry-run")
+        self.assertEqual(pipeline.run_store.newest_whole_run(repo.name, self.run.tid)["id"], preview)
+        self.assertEqual(pipeline.run_store.newest_live_whole_run(repo.name, self.run.tid)["id"], failed["id"])
 
         def add_worktree(checkout, branch, start):
             self.assertEqual((checkout.wt, branch, start), (c.wt, "revision", "origin/revision"))
