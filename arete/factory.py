@@ -340,8 +340,11 @@ class Flow:
         line = self.earlier[self.carry] if self.carry < len(self.earlier) else {}
         if (line.get("step") == name and line.get("result") == "pass" and self.ctx.keeps(name, kw)
                 and (not self.again or self.carry < self.again_at)):
-            n = self.tries[name] = self.tries.get(name, 0) + 1
             outcome = outcome_of(line)
+            if not self.accepts(name, outcome, kw):
+                self.carrying = False
+                return None
+            n = self.tries[name] = self.tries.get(name, 0) + 1
             self.end(name, n, outcome, "", Calls(self.run_id, name, n=n), time.monotonic(), kw,
                      carried=self.continues)
             self.carry += 1
@@ -356,8 +359,8 @@ class Flow:
         line = self.earlier[self.at] if self.at < len(self.earlier) else {}
         if line.get("step") != name or not self.takable(line):
             return None
-        accepts = getattr(self.ctx, "accepts", None)
-        if accepts is not None and not accepts(name, outcome_of(line), kw):
+        outcome = outcome_of(line)
+        if not self.accepts(name, outcome, kw):
             return None
         if (self.only or self.again) and line.get("tree") and not os.path.isdir(line["tree"]):
             why = self.ctx.restore(line)
@@ -371,7 +374,11 @@ class Flow:
             now = self.print_of(kw.get("tree") or line["tree"])
             if not now or now != self.expected(self.at, str(line["tree"])):
                 return None
-        return outcome_of(line)
+        return outcome
+
+    def accepts(self, name: str, outcome: Outcome, kw: dict) -> bool:
+        accepts = getattr(self.ctx, "accepts", None)
+        return accepts is None or accepts(name, outcome, kw)
 
     def takable(self, line: dict) -> bool:
         if line.get("result") == "pass":

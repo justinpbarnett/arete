@@ -118,12 +118,12 @@ def already_protects_authority() -> bool:
                for root in (paths.ZTE_REHEARSAL_INSTALL, paths.ZTE_LIVE_INSTALL))
 
 
-def protected_command(command, cwd=None, keeps=()):
+def protected_command(command, cwd=None, keeps=(), *, _deploy=False, _restore_paths=()):
     if not can_confine(False) or (sandboxed() and already_protects_authority()):
         return command
     words = ["/bin/sh", "-c", command] if isinstance(command, str) else list(command)
     return write_confinement(Path(cwd or Path.cwd()), [], restrict_writes=False,
-                             keeps=tuple(keeps)) + words
+                             keeps=tuple(keeps), _deploy=_deploy, _restore_paths=_restore_paths) + words
 
 
 def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = None,
@@ -133,7 +133,8 @@ def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = 
                       state: tuple[Path, tuple[Path, ...]] | None = None,
                       mach: tuple[tuple[str, ...], str] | None = None, tcp_port: int | None = None,
                       denied_ports: tuple[int, ...] = (), listen_port: int | None = None,
-                      private_temporary: bool = False, read_roots: tuple[Path, ...] | None = None) -> list[str]:
+                      private_temporary: bool = False, read_roots: tuple[Path, ...] | None = None,
+                      _deploy: bool = False, _restore_paths: tuple[Path, ...] = ()) -> list[str]:
     hidden = tuple(dict.fromkeys((*hidden, *authority_roots())))
     roots = [cwd, *add_dirs, *([AGENT_DIR, LOGIN_DIR, KEY_DIR, SESSIONS_DIR] if agent_roots else [])]
     allow = " ".join(f'(subpath (param "W{i}"))' for i in range(len(roots)))
@@ -181,12 +182,23 @@ def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = 
                    "-D", "DIRS=" + pattern(SECRET_DIRS, True)]
         profile += ('(deny file-read* file-write* (require-all (regex (param "NAMES")) '
                     '(require-not (regex (param "SAFE")))))(deny file-read* file-write* (regex (param "DIRS")))')
-    params += ["-D", f"ENGINE={real_path(paths.PACKAGE_DIR)}", "-D", f"RUNTIME={real_path(sys.prefix)}"]
-    profile += '(deny file-write* (subpath (param "ENGINE")) (subpath (param "RUNTIME")))'
+    engine = real_path(paths.PACKAGE_DIR)
+    if not _deploy:
+        params += ["-D", f"ENGINE={engine}"]
+        engine_filter = '(subpath (param "ENGINE"))'
+        if _restore_paths:
+            exceptions = ""
+            for i, path in enumerate(_restore_paths):
+                params += ["-D", f"RESTORE{i}={path}"]
+                exceptions += f'(require-not (literal (param "RESTORE{i}")))'
+            engine_filter = f"(require-all {engine_filter} {exceptions})"
+        profile += f"(deny file-write* {engine_filter})"
+    params += ["-D", f"RUNTIME={real_path(sys.prefix)}"]
+    profile += '(deny file-write* (subpath (param "RUNTIME")))'
     for i, root in enumerate((paths.ZTE_REHEARSAL_INSTALL, paths.ZTE_LIVE_INSTALL)):
         params += ["-D", f"INSTALL{i}={real_path(root)}"]
         profile += f'(deny file-write* file-link (subpath (param "INSTALL{i}")))'
-    ancestors = {p for root in (*hidden, paths.PACKAGE_DIR, Path(sys.prefix)) for p in real_path(root).parents}
+    ancestors = {*engine.parents, *(p for root in (*hidden, Path(sys.prefix)) for p in real_path(root).parents)}
     for i, path in enumerate(sorted(ancestors)):
         params += ["-D", f"A{i}={path}"]
         profile += f'(deny file-write* (literal (param "A{i}")))'
