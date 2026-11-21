@@ -575,6 +575,29 @@ class Controller:
         finally:
             self.run.resolved_settings = previous
 
+    def validate_publication_diff(self):
+        b = self.job.b
+        staged = b.restage()
+        checkouts = self.job.checkouts
+        after = "the final orchestrated tree"
+        if any(c.lease for c in checkouts):
+            bases = {c.github: util.git(["merge-base", c.origin_base, "HEAD"], c.wt).strip() for c in checkouts}
+            if not any(util.git(["diff", "--cached", "--name-only", bases[c.github]], c.wt) for c in checkouts):
+                raise workspace.RunFailed(f"{after} undid every change")
+            heads = {c.github: head for c in checkouts if (head := c.publication_baseline)}
+            if not staged.merged and heads and not any(
+                util.git(["diff", "--cached", "--name-only", heads.get(c.github, bases[c.github])], c.wt)
+                for c in checkouts
+            ):
+                if (self.run.environment_release and not self.data.get("ci_failed")
+                        and flows.retry_passed(self.job.verified) and any(c.pr and c.github in heads for c in checkouts)):
+                    whole = staged if b.from_base else b.restage(from_base=True)
+                    return b.validate_diff(whole, after, from_base=True)
+                label = "head" if len(heads) == 1 else "heads"
+                shas = ", ".join(f"`{head}`" for head in heads.values())
+                raise ValueError(f"nothing changed since the pushed {label} {shas}")
+        b.validate_diff(staged, after)
+
     def publish(self):
         self.barrier()
         if pending := ledger.catch_up_push(self.data):
@@ -588,7 +611,7 @@ class Controller:
             raise ValueError("publication requires the full owner check policy")
         if self.job.verified.verdict == "fail":
             raise ValueError("behavioral verification failed; repair or finish failed")
-        self.job.b.require_valid_diff("the final orchestrated tree")
+        self.validate_publication_diff()
         if self.run.dry_run:
             self.ending = flows.end_dry_run(self.flow)
             return {"status": "dry-run"}

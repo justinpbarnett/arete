@@ -29,6 +29,219 @@ from arete.agent import NO_SESSION, Result
 from arete.review import Review
 
 
+class PublicationDiffTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        self.git("init", "-q", "-b", "main")
+        self.file = self.root / "file.txt"
+        self.file.write_text("base\n")
+        self.commit("base")
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        self.checkout = workspace.Checkout("", "fixture/repo", self.root, self.root, "main")
+        self.controller = orchestration.Controller.__new__(orchestration.Controller)
+        run = mock.Mock(id="fixture-run", environment_release="", dry_run=False)
+        self.build = pipeline.Build(cfg=config.Config(), run=run, ticket=mock.Mock(), ws=self.root,
+                                    checkouts=[self.checkout], layer=config.RepoLayer(dir=self.root), timeout=0,
+                                    workspace="fixture", tools=[], deny=[])
+        self.controller.run = run
+        self.controller.job = SimpleNamespace(b=self.build, checkouts=[self.checkout], verified=verify.Verified("pass"))
+        self.controller.lease, self.controller.ending, self.controller.workers = "fixture-lease", None, {}
+        self.controller.data = {"acceptance": "task", "evidence": {"checks": {"result": {"full": True}}}}
+        self.controller.current = mock.Mock(return_value=True)
+        self.controller.policy_sha = mock.Mock(return_value="policy")
+        self.controller.persist = mock.Mock()
+        self.controller.atomic = mock.Mock()
+        self.action = {"id": "d0001-0", "op": "publication.request", "state": "accepted", "request": {}}
+        self.transition = self.enterContext(mock.patch.object(orchestration.ledger, "transition"))
+        self.enterContext(mock.patch.object(pipeline.record, "mark"))
+        self.enterContext(mock.patch.object(orchestration.run_lines, "write"))
+
+    def git(self, *args):
+        return util.git(list(args), self.root).strip()
+
+    def commit(self, subject):
+        self.git("add", "--", "file.txt")
+        self.git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.com",
+                 "-c", "commit.gpgSign=false", "commit", "-qm", subject)
+
+    def record_pushed_head(self):
+        self.file.write_text("implementation\n")
+        self.commit("implementation")
+        self.checkout.note_pushed_head(self.git("rev-parse", "HEAD"))
+        self.checkout.pr = "https://github.com/fixture/repo/pull/7"
+        self.controller.data["publication"] = {"heads": {self.checkout.github: self.checkout.lease}}
+
+    def publication_job(self, repo, branch, *, verified, carried=False, continues=""):
+        c, controller, b = self.checkout, self.controller, self.build
+        run = controller.run
+        run.configure_mock(dir=self.root, tid="7", repairs="", feedback=[], feedback_prs=[], facts={}, story=[],
+                           resolved_settings={}, repo=repo, waiting=mock.Mock(return_value=nullcontext()))
+        run.tracker.pr_link.return_value = "Closes #7"
+        run.tracker.pr_title.return_value = "Edit fixture"
+        b.ticket = tracker.Ticket("7", "#7", "Edit fixture")
+        run.layer = b.layer
+        job = flows.Job(b.cfg, run, c.wt, ticket=b.ticket, branch=branch, checkouts=[c], layer=b.layer, built=b,
+                        slot=mock.Mock(), carried=carried, continues=continues, verified=verified,
+                        review=Review.stored({"verdict": "approve"}))
+        flow = SimpleNamespace(ctx=job, skipped=0)
+        flow.run = lambda name, args, kw: getattr(flows, name)(flow, *args, **kw)
+        flow.step = lambda name, **kw: flow.run(name, (), kw)
+        controller.job, controller.flow = job, flow
+        controller.catalog = mock.Mock(context={})
+        del controller.atomic, controller.current
+        controller.executing = "prior-action"
+        controller.stamp("checks", {"full": True})
+        controller.stamp("review", job.review.asdict())
+        return job
+
+    def test_unchanged_pushed_tree_refuses_publication_and_keeps_the_run_open(self):
+        self.record_pushed_head()
+        self.controller.data["ci_failed"] = True
+        self.controller.job.verified.checks = [{"passed": True}]
+        for from_base, release in ((False, ""), (True, ""), (True, "live-release")):
+            with self.subTest(from_base=from_base, release=release):
+                self.build.from_base = from_base
+                self.controller.run.environment_release = release
+                self.controller.dispatch(self.action)
+                self.transition.assert_called_with(
+                    self.controller.lease, self.action["id"], "failed",
+                    {"error": f"nothing changed since the pushed head `{self.checkout.lease}`"})
+                self.assertIsNone(self.controller.ending)
+                self.assertTrue(self.controller.data["ci_failed"])
+                self.assertNotIn("publication_intent", self.controller.data)
+        self.controller.atomic.assert_not_called()
+
+    def test_closed_pr_rerun_publishes_with_the_remote_only_lease(self):
+        other = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        self.git("clone", "-q", "--shared", str(self.root), str(other))
+        (other / "file.txt").write_text("old closed PR\n")
+        util.git(["-c", "user.name=Fixture", "-c", "user.email=fixture@example.com",
+                  "-c", "commit.gpgSign=false", "commit", "-qam", "closed PR"], other)
+        lease = util.git(["rev-parse", "HEAD"], other).strip()
+        self.assertNotEqual(util.sh(["git", "cat-file", "-e", f"{lease}^{{commit}}"], cwd=self.root).returncode, 0)
+        self.git("config", "commit.gpgSign", "false")
+        repo = config.Repo("fixture", self.root, parts=[config.Part("", self.checkout.github)])
+        branch, controller, b = "arete/7-edit-fixture", self.controller, self.build
+        remote = lease
+        pushes = []
+
+        def git(args, cwd, **kw):
+            nonlocal remote
+            if args[0] != "push":
+                return util.git(args, cwd, **kw)
+            pushes.append(args)
+            self.assertEqual(remote, lease)
+            self.assertEqual(args, ["push", "-q", f"--force-with-lease={branch}:{lease}", "-u", "origin", branch])
+            remote = util.git(["rev-parse", "HEAD"], cwd).strip()
+            return ""
+
+        pr = "https://github.com/fixture/repo/pull/8"
+        with (mock.patch.object(paths, "WORKTREES_DIR", other / "worktrees"),
+              mock.patch.object(workspace, "fetch") as fetch,
+              mock.patch.object(workspace, "remote_head", side_effect=lambda src, branch: remote),
+              mock.patch.object(gh, "open_pr_url", return_value=""),
+              mock.patch.object(gh, "closed_pr_heads", return_value={lease}),
+              mock.patch.object(workspace.record, "timed", return_value=nullcontext({})),
+              mock.patch.object(pipeline, "git", side_effect=git),
+              mock.patch.object(pipeline, "release_workspace"),
+              mock.patch.object(pipeline, "supersede_older_runs"),
+              mock.patch.object(pipeline.record, "note"),
+              mock.patch.object(pipeline.record, "metered_spent", return_value=0),
+              mock.patch.object(ci, "watch", side_effect=lambda target, log: ci.Watched(target, {})) as watch,
+              mock.patch.object(gh, "pr_create", return_value=pr) as create,
+              mock.patch.object(gh, "pr_body", return_value="Fixture PR"),
+              mock.patch.object(gh, "pr_edit_body")):
+            ws, checkouts = workspace.make_workspace(controller.run.id, repo, "main", branch, "7", [])
+            self.checkout = c = checkouts[0]
+            b.checkouts, b.ws = checkouts, ws
+            self.assertEqual(c.lease, lease)
+            self.assertFalse(c.resumes)
+            self.assertEqual(util.git(["rev-parse", "HEAD"], ws).strip(), self.git("rev-parse", "origin/main"))
+            (ws / "file.txt").write_text("new implementation\n")
+            job = self.publication_job(repo, branch, verified=verify.Verified("pass"))
+            controller.stamp("verify", {"verdict": "pass"})
+            controller.dispatch(self.action)
+
+        state = self.transition.call_args.args
+        self.assertEqual(state[:3], (controller.lease, self.action["id"], "succeeded"), state[-1])
+        self.assertEqual(controller.ending[0], "pr")
+        self.assertEqual(controller.ending[2], pr)
+        self.assertEqual(util.git(["show", f"{remote}:file.txt"], ws), "new implementation\n")
+        self.assertEqual(controller.data["publication"]["heads"], {c.github: remote})
+        self.assertEqual(c.lease, remote)
+        self.assertEqual(c.publication_baseline, remote)
+        self.assertTrue(job.committed)
+        self.assertEqual(len(pushes), 1)
+        watch.assert_called_once()
+        self.assertEqual(watch.call_args.args[0].sha, remote)
+        create.assert_called_once()
+        fetch.assert_called_once_with(self.root, "main")
+
+    def test_verified_environment_resume_readies_the_existing_draft_without_a_push(self):
+        self.record_pushed_head()
+        c, controller, b = self.checkout, self.controller, self.build
+        c.resumes, b.from_base = True, True
+        controller.run.environment_release = "live-release"
+        b.layer.verify = config.Verify(publish_evidence=False)
+        repo = config.Repo("fixture", self.root, parts=[config.Part("", c.github)])
+        self.publication_job(repo, "arete/7-edit-fixture", verified=verify.Verified("blocked"),
+                             carried=True, continues="held-run")
+        controller.catalog.route.return_value = SimpleNamespace(step="verify")
+        controller.dispatch(self.action)
+        self.transition.assert_called_with(controller.lease, self.action["id"], "failed",
+                                           {"error": "publication needs current evidence: verify"})
+
+        verified = verify.Verified("pass", "Implementation works", checks=[
+            {"what": "Use the fixture", "how": "Open the fixture", "saw": "The fixture opened", "passed": True}])
+        rerun = {"id": "d0002-0", "op": "verification.run", "state": "accepted",
+                 "request": {"route_id": "fixture", "effort": "", "goal_refs": []}}
+        publish = {**self.action, "id": "d0003-0"}
+        head = c.lease
+        with (mock.patch.object(pipeline, "check_in_use", return_value=verified),
+              mock.patch.object(flows.run_store, "run_get", return_value={"started": "2026-01-01"}),
+              mock.patch.object(pipeline, "pending_feedback", return_value=[]),
+              mock.patch.object(workspace, "remote_head", return_value=head),
+              mock.patch.object(pipeline, "commit_and_push") as push,
+              mock.patch.object(pipeline, "release_workspace"),
+              mock.patch.object(pipeline, "supersede_older_runs"),
+              mock.patch.object(pipeline.record, "note"),
+              mock.patch.object(pipeline.record, "metered_spent", return_value=0),
+              mock.patch.object(ci, "watch", side_effect=lambda target, log: ci.Watched(target, {})) as watch,
+              mock.patch.object(gh, "me", return_value="fixture"),
+              mock.patch.object(gh, "pr_discussion", return_value=gh.Discussion([], [], [])),
+              mock.patch.object(gh, "pr_body", return_value="Saved draft"),
+              mock.patch.object(gh, "pr_edit_body"),
+              mock.patch.object(gh, "pr_comment") as comment,
+              mock.patch.object(gh, "pr_draft_and_head", return_value=(True, head)),
+              mock.patch.object(gh, "pr_set_draft") as draft):
+            controller.dispatch(rerun)
+            controller.dispatch(publish)
+        action_state = self.transition.call_args.args
+        self.assertEqual(action_state[:3], (controller.lease, publish["id"], "succeeded"), action_state[-1])
+        self.assertEqual(controller.ending[0], "pr")
+        self.assertEqual(controller.ending[2], c.pr)
+        self.assertEqual(controller.data["publication"]["heads"], {c.github: head})
+        self.assertEqual(watch.call_args.args[0].sha, head)
+        draft.assert_called_once_with(c.pr, False)
+        comment.assert_called_once()
+        self.assertIn("Verified and reviewed #7 again; nothing new was pushed.", comment.call_args.args[1])
+        push.assert_not_called()
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+
+    def test_edits_that_undo_the_implementation_still_fail_the_run(self):
+        for pushed in (False, True):
+            with self.subTest(pushed=pushed):
+                if pushed:
+                    self.record_pushed_head()
+                else:
+                    self.file.write_text("implementation\n")
+                    self.git("add", "--", "file.txt")
+                self.file.write_text("base\n")
+                with self.assertRaisesRegex(workspace.RunFailed, "the final orchestrated tree undid every change"):
+                    self.controller.dispatch(self.action)
+        self.controller.atomic.assert_not_called()
+
+
 class MovedBasePublicationTests(unittest.TestCase):
     def controller(self):
         root = Path(".")
@@ -54,6 +267,7 @@ class MovedBasePublicationTests(unittest.TestCase):
         controller.current = mock.Mock(return_value=True)
         controller.fingerprint = mock.Mock(return_value="tree")
         controller.persist = mock.Mock()
+        controller.validate_publication_diff = mock.Mock()
         controller.atomic = mock.Mock(side_effect=lambda name, **kw: (
             flows.publish(controller.flow, **kw) if name == "publish"
             else factory.Outcome("pass", data={"heads": {checkout.github: checkout.lease}})))
