@@ -619,27 +619,36 @@ class Run(AgentRun):
         return f"Remove `{self.tracker.label_name('failed')}` to retry"
 
     def enter(self, status: str) -> None:
-        if self.dry_run:
-            return
+        if not self.dry_run:
+            self.enter_label(status)
+            self.enter_workflow(status)
+
+    def enter_label(self, status: str) -> bool:
         others = [s for s in self.tracker.states if s != status]
-        labeled = self.tracker.label(self.tid, add=[status], remove=others)
-        record.note(self.id, label_pending=status if labeled else "")
-        moved = self.tracker.move(self.tid, status)
-        for err in (labeled, moved):
-            if err:
-                self.log(f"tracker: {util.first_line(err, 300)}")
-        if not moved and isinstance(self.tracker, tracker.JiraTracker) and self.tracker.cfg.transitions.get(status):
+        error = self.tracker.label(self.tid, add=[status], remove=others)
+        record.note(self.id, label_pending=status if error else "")
+        if error:
+            self.log(f"tracker: {util.first_line(error, 300)}")
+        return not error
+
+    def enter_workflow(self, status: str) -> bool:
+        if error := self.tracker.move(self.tid, status):
+            self.log(f"tracker: {util.first_line(error, 300)}")
+            return False
+        if isinstance(self.tracker, tracker.JiraTracker) and self.tracker.cfg.transitions.get(status):
             record.note(self.id, moved=status)
+        return True
 
     def leave(self, status: str) -> None:
         if not self.dry_run and (err := self.tracker.label(self.tid, remove=[status])):
             self.log(f"tracker: {util.first_line(err, 300)}")
 
-    def say(self, body: str) -> str:
+    def say(self, body: str, *, on_ticket: bool = False) -> str:
         if self.dry_run:
             return ""
         body = public_text(self, body)
-        err = self.say_on_prs(body) if self.feedback else self.tracker.comment(self.tid, f"{tracker.ARETE_TAG} {body}")
+        err = (self.say_on_prs(body) if self.feedback and not on_ticket
+               else self.tracker.comment(self.tid, f"{tracker.ARETE_TAG} {body}"))
         if err:
             self.log(f"tracker: {util.first_line(err, 300)}")
         return err
@@ -1289,8 +1298,63 @@ def park_run(run: Run, reason: str) -> tuple[str, str, str]:
     record.note(run.id, **kept)
     pr_url = kept["pr_url"]
     run.log(summary)
-    run.enter("failed")
+    if not run.dry_run:
+        record.note(run.id, label_pending="failed")
+        run.enter("failed")
+        try:
+            with run.budget.watching(periodic=False):
+                run.say(f"Run `{run.id}` {outbound.screen(summary)}", on_ticket=True)
+        except runlimits.Parked as e:
+            run.log(f"parked: ticket updates cut short: {e}")
     return status, summary, pr_url
+
+
+def save_failed_finish(run: Run, summary: str, rationale: str, recovery: dict | None,
+                       branch: str, checkouts: list[workspace.Checkout]) -> dict:
+    failure = failure_classification(recovery)
+    prs = {c.pr: c.lease for c in checkouts}
+    body = failure_comment(run, summary, detail=outbound.screen(rationale))
+    run_store.save_failed_finish(run.id, f"{tracker.ARETE_TAG} {public_text(run, body)}", prs,
+                                 summary=summary, failure=json.dumps(failure), **({"branch": branch} if prs else {}))
+    return failure
+
+
+def draft_failed_pr(run: Run, url: str, head: str) -> None:
+    state = gh.pr_view(url).get("state")
+    if state in ("CLOSED", "MERGED"):
+        return
+    if state != "OPEN":
+        raise gh.GhError("GitHub did not confirm the PR state")
+    row = run_store.run_get(run.id)
+    urls = (row.get("pr_url") or "").split()
+    if url not in urls:
+        record.note(run.id, pr_url=" ".join([*urls, url]))
+    if draft_state_for_head(run, url, head) is False:
+        gh.pr_set_draft(url, True, single_attempt=True)
+        run.log(f"failed: marked {url} a draft")
+
+
+def apply_failed_finish(run: Run, pending: dict) -> None:
+    if pending.pop("label_pending") and not run.enter_label("failed"):
+        return
+    if pending["comment"]:
+        marker = f"<!-- arete:failed-finish={run.id} -->"
+        if error := tracker.error_of(lambda: run.tracker.comment_once(run.tid, pending["comment"], marker)):
+            run.log(f"tracker: {util.first_line(error, 300)}")
+        else:
+            pending["comment"] = ""
+            run_store.note_failed_finish(run.id, **pending)
+    for url, head in list(pending["prs"].items()):
+        try:
+            draft_failed_pr(run, url, head)
+        except gh.GhError as e:
+            run.log(f"failed: could not settle {url}: {util.first_line(str(e), 300)}")
+            continue
+        del pending["prs"][url]
+        run_store.note_failed_finish(run.id, **pending)
+    if pending["ticket_pending"] and run.enter_workflow("failed"):
+        pending["ticket_pending"] = False
+        run_store.note_failed_finish(run.id, **pending)
 
 
 def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: bool, flow: factory.Flow | None,
@@ -1624,15 +1688,28 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 run.budget = runlimits.Budget(run, runlimits.Policy.of(layer), previous, current, fresh,
                                               wall_deadline=wall_deadline, checkpoint_timeout=0 if zte_grant else None,
                                               checkpoint_gate=checkpoint_allowed if zte_grant else None)
-            with run.budget.watching(admit=check_handoff if zte_grant else None,
-                                     work_admitted=(lambda: work_started and checkpoint_allowed()) if zte_grant else None,
-                                     periodic=not zte_grant):
-                with handoff_io():
-                    if not (flow and flow.refusal):
-                        run.budget.capture(current or tk.get(tid))
-                with run_lines.nonblocking_appends(check_work_log) if zte_grant else nullcontext():
-                    work_started = True
-                    status, summary, pr_url = flows.driven(flow, script.drive) if script else _run(cfg, run, slot)
+            try:
+                with run.budget.watching(admit=check_handoff if zte_grant else None,
+                                         work_admitted=(lambda: work_started and checkpoint_allowed()) if zte_grant else None,
+                                         periodic=not zte_grant):
+                    with handoff_io():
+                        if not (flow and flow.refusal):
+                            run.budget.capture(current or tk.get(tid))
+                    with run_lines.nonblocking_appends(check_work_log) if zte_grant else nullcontext():
+                        work_started = True
+                        status, summary, pr_url = flows.driven(flow, script.drive) if script else _run(cfg, run, slot)
+                        if flow and status == "failed" and (pending := run_store.failed_finish(run.id)):
+                            run.log(f"failed: {summary}")
+                            apply_failed_finish(run, pending)
+            except (runlimits.Parked, Stopped, Exception) as e:
+                if zte_grant or not flow or not run_store.failed_finish(run.id):
+                    raise
+                if isinstance(e, Stopped):
+                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                row = run_store.run_get(run.id)
+                status, summary, pr_url = "failed", row["summary"], row["pr_url"] or ""
+                run.failure = json.loads(row["failure"])
+                run.log(f"failed: finishing cut short: {type(e).__name__}: {e}")
             if zte_grant:
                 check_work_log()
             if flow and flow.only:
@@ -1725,18 +1802,26 @@ def environment_retry_held(run: Run, continues: str, why: str) -> tuple[str, str
     return "pr", why, pr_url
 
 
-def _fail(run: Run, why: str, builder_said: str = "", detail: str = "",
-          *, recovery: dict | None = None) -> tuple[str, str, str]:
-    run.failure = {"class": "environment", **recovery} if recovery else {"class": "work"}
-    run.log(f"failed: {why}")
-    run.enter(run.failed_state)
+def failure_classification(recovery: dict | None) -> dict:
+    return {"class": "environment", **recovery} if recovery else {"class": "work"}
+
+
+def failure_comment(run: Run, why: str, builder_said: str = "", detail: str = "") -> str:
     extra = f"\n\n{detail.strip()}" if detail.strip() else ""
     if builder_said.strip():
         extra += f"\n\n### What the builder said\n\n{builder_said.strip()[:4000]}"
     task = ("apply your feedback" if run.feedback else "repair the review findings" if run.repairs
             else "finish this one")
-    run.say(f"Could not {task}: {why}{extra}\n\nRun `{run.id}`; details in `arete status` on the "
+    return (f"Could not {task}: {why}{extra}\n\nRun `{run.id}`; details in `arete status` on the "
             f"Mac. {run.retry_hint}.")
+
+
+def _fail(run: Run, why: str, builder_said: str = "", detail: str = "",
+          *, recovery: dict | None = None) -> tuple[str, str, str]:
+    run.failure = failure_classification(recovery)
+    run.log(f"failed: {why}")
+    run.enter(run.failed_state)
+    run.say(failure_comment(run, why, builder_said, detail))
     return "failed", why, ""
 
 
@@ -2599,15 +2684,19 @@ def set_draft(run: AgentRun, c: workspace.Checkout, draft: bool, by: str = "ci")
 
 def own_draft_state(run: AgentRun, c: workspace.Checkout) -> bool | None:
     try:
-        draft, head = gh.pr_draft_and_head(c.pr)
+        return draft_state_for_head(run, c.pr, c.lease)
     except gh.GhError as e:
         run.log(f"pr: left {c.pr} as it is: arete could not read its state: {util.first_line(str(e), 300)}")
         return None
-    if not head or not c.lease:
-        run.log(f"pr: left {c.pr} as it is: arete could not compare its head with this run's push")
+
+
+def draft_state_for_head(run: AgentRun, url: str, expected_head: str) -> bool | None:
+    draft, head = gh.pr_draft_and_head(url)
+    if not head or not expected_head:
+        run.log(f"pr: left {url} as it is: arete could not compare its head with this run's push")
         return None
-    if head != c.lease:
-        run.log(f"pr: left {c.pr} as it is: its head is {head[:12]}, not the {c.lease[:12]} this run pushed or "
+    if head != expected_head:
+        run.log(f"pr: left {url} as it is: its head is {head[:12]}, not the {expected_head[:12]} this run pushed or "
                 "checked again, so someone changed it after the run started")
         return None
     return draft
@@ -3650,6 +3739,36 @@ def commit_layer(layer_dir: Path, message: str, written: list[Path]) -> str:
         return commit_written(layer_dir, message, written)
 
 
+def sync_failed_finishes(cfg: config.Config) -> None:
+    from . import zte
+
+    for row in run_store.unfinished_failed_finishes():
+        issue = str(row["issue"])
+        try:
+            repo = cfg.repo(row["repo"])
+        except KeyError:
+            continue
+        with util.lock(run_store.run_lock("pipeline", repo.name, issue)) as free:
+            if not free or zte.reserved(issue):
+                continue
+            pending = run_store.failed_finish(row["id"])
+            if pending is None:
+                continue
+            newest = run_store.newest_live_whole_run(repo.name, issue)
+            if newest and newest["id"] != row["id"]:
+                run_store.discard_failed_finish(row["id"])
+                continue
+            run = Run(row["id"], repo, paths.RUNS_DIR / row["id"], tracker=tracker.for_ticket(cfg, repo, issue), tid=issue)
+            run.dir.mkdir(parents=True, exist_ok=True)
+            try:
+                if pending["label_pending"] or run.tracker.has_state(issue, "failed"):
+                    apply_failed_finish(run, pending)
+                else:
+                    run_store.discard_failed_finish(run.id)
+            except tracker.ERRORS as e:
+                run.log(f"tracker: {util.first_line(str(e), 300)}")
+
+
 def sync_labels(cfg: config.Config) -> None:
     seen: set[tuple[str, str]] = set()
     for r in run_store.runs(kind="pipeline", limit=200):
@@ -3661,6 +3780,8 @@ def sync_labels(cfg: config.Config) -> None:
         seen.add(key)
         want = r["label_pending"]
         if not want or r["status"] == "running" or util.lock_is_held(run_store.run_lock("pipeline", *key)):
+            continue
+        if want == "failed" and run_store.failed_finish(r["id"]):
             continue
         if r["status"] == "interrupted":
             record.note(r["id"], label_pending="")
@@ -3753,6 +3874,8 @@ def tell_ticket_run_died(cfg: config.Config, row: dict) -> None:
     if row["status"] != "stopped":
         run_lines.write(row["id"], "error", step=run_lines.last_step(row["id"]), message=row.get("summary") or "")
     write_report(row)
+    if run_store.failed_finish(row["id"]):
+        return
     if run.alone:
         run.log(f"{record.STOPPED if row['status'] == 'stopped' else record.INTERRUPTED}, a run of "
                 f"{row['only_step']} alone, so the ticket stays as it was")

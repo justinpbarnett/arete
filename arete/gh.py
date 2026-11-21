@@ -529,8 +529,8 @@ def merged_pr_names(repo: str, branch: str, text: str) -> bool:
     return bool(found)
 
 
-def pr_set_draft(url: str, draft: bool) -> None:
-    gh(["pr", "ready", url, *(["--undo"] if draft else [])])
+def pr_set_draft(url: str, draft: bool, *, single_attempt: bool = False) -> None:
+    gh(["pr", "ready", url, *(["--undo"] if draft else [])], write=single_attempt, retry=not single_attempt)
 
 
 def pr_close(url: str) -> None:

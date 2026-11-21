@@ -165,6 +165,10 @@ class GitHubTracker:
     def label_name(self, state: str) -> str:
         return f"agent:{state}"
 
+    def has_state(self, tid: str, state: str) -> bool:
+        labels = {label["name"] for label in gh.issue(self.repo.github, int(tid)).get("labels", [])}
+        return ZTE_LABEL not in labels and self.label_name(state) in labels
+
     def normalize(self, tid: str | int) -> str:
         s = str(tid).strip().lstrip("#")
         if not s.isdigit():
@@ -316,6 +320,11 @@ class GitHubTracker:
     def comment(self, tid: str, body: str) -> str:
         return error_of(lambda: self.require_ordinary(tid) or gh.issue_comment(self.repo.github, int(tid), body))
 
+    def comment_once(self, tid: str, body: str, marker: str) -> None:
+        if not gh.find_issue_comment_marker(self.repo.github, int(tid), marker):
+            self.require_ordinary(tid)
+            gh.issue_comment(self.repo.github, int(tid), f"{body}\n\n{marker}", single_attempt=True)
+
     def move(self, tid: str, state: str) -> str:
         return ""
 
@@ -357,6 +366,10 @@ class JiraTracker:
 
     def label_name(self, state: str) -> str:
         return f"agent-{state}"
+
+    def has_state(self, tid: str, state: str) -> bool:
+        fields = self.client.issue(tid, ["labels"]).get("fields") or {}
+        return self.label_name(state) in (fields.get("labels") or [])
 
     def normalize(self, tid: str | int) -> str:
         key = str(tid).strip().upper()
@@ -458,6 +471,10 @@ class JiraTracker:
     def comment(self, tid: str, body: str) -> str:
         return error_of(lambda: self.client.comment(tid, body))
 
+    def comment_once(self, tid: str, body: str, marker: str) -> None:
+        if not self.client.find_comment_marker(tid, marker):
+            self.client.comment(tid, f"{body}\n\n{marker}", single_attempt=True)
+
     def move(self, tid: str, state: str) -> str:
         try:
             return self.move_to(tid, self.cfg.transitions.get(state, ""))
@@ -503,6 +520,9 @@ class LocalTracker:
 
     def label_name(self, state: str) -> str:
         return state
+
+    def has_state(self, tid: str, state: str) -> bool:
+        return task_state(tid) == state
 
     def normalize(self, tid: str | int) -> str:
         s = str(tid).strip().lower()
@@ -568,6 +588,12 @@ class LocalTracker:
 
     def comment(self, tid: str, body: str) -> str:
         return "" if tasks_store.task_comment(tid, "arete", body) else f"no task {tid}"
+
+    def comment_once(self, tid: str, body: str, marker: str) -> None:
+        if any(c["author"] == "arete" and marker in c["body"].splitlines() for c in tasks_store.task_comments(tid)):
+            return
+        if error := self.comment(tid, f"{body}\n\n{marker}"):
+            raise TaskError(error)
 
     def move(self, tid: str, state: str) -> str:
         return ""

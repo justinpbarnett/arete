@@ -177,8 +177,11 @@ def dead(row: dict):
 
 
 def interrupt(row: dict, notes: Sequence[str] = (), *, base_version=None) -> dict | None:
-    status = dead_status(row)
-    summary = "; ".join([STOPPED if status == "stopped" else INTERRUPTED, *notes])
+    if row["kind"] == "pipeline" and run_store.failed_finish(row["id"]):
+        status, summary = "failed", run_store.run_get(row["id"])["summary"]
+    else:
+        status = dead_status(row)
+        summary = "; ".join([STOPPED if status == "stopped" else INTERRUPTED, *notes])
     settled = settle(row["id"], status, end_line=f"{status}: {summary}", summary=summary, base_version=base_version)
     if settled and not util.pid_alive(row.get("pid")):
         util.end_session(row.get("pid"))

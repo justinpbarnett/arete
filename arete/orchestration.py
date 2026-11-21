@@ -30,6 +30,7 @@ from . import (
 from .agent import NO_SESSION, Session, json_from_text
 from .orchestration_api import BUNDLES, PROTOCOL, Catalog, describe_operations, help_text
 from .store import asks as ask_store
+from .store import db
 from .store import orchestration as ledger
 from .verify import Verified
 
@@ -917,8 +918,8 @@ class Controller:
                     raise ValueError("noop cannot discard an implementation diff")
                 self.ending = flows.finish(self.flow, "nothing", summary=self.job.build_summary or "No change needed.")
             else:
-                self.ending = flows.finish(self.flow, "failed", why="the orchestrator stopped without delivery",
-                                           recovery=self.failure_recovery())
+                self.ending = flows.finish(self.flow, "quiet", status="failed",
+                                           summary="the orchestrator stopped without delivery")
             return {"reason": args["reason"]}
         raise ValueError("unknown orchestration operation")
 
@@ -957,7 +958,17 @@ class Controller:
                 gate = {"checks.run": "checks", "verification.run": "verify", "review.run": "review"}.get(action["op"])
                 if gate and self.data.get("evidence", {}).get(gate, {}).get("producer") == action["id"]:
                     result["evidence"] = self.data["evidence"][gate]
-                ledger.transition(self.lease, action["id"], "failed" if "error" in result else "succeeded", result)
+                if (action["op"] == "run.finish" and result.get("reason") == "failed"
+                        and not (self.flow.only or self.run.action_only or self.run.dry_run)):
+                    rationale = ledger.turn_rationale(self.lease, action["turn"])
+                    recovery = self.failure_recovery()
+                    with db.tx():
+                        failure = pipeline.save_failed_finish(self.run, self.ending[1], rationale, recovery,
+                                                              self.job.branch, self.job.with_prs)
+                        ledger.transition(self.lease, action["id"], "succeeded", result)
+                    self.run.failure = failure
+                else:
+                    ledger.transition(self.lease, action["id"], "failed" if "error" in result else "succeeded", result)
         self.persist()
         run_lines.write(self.run.id, "action", action=action["id"], op=action["op"],
                         state="running" if result is None else "failed" if "error" in result else "succeeded")

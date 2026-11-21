@@ -87,10 +87,7 @@ def cleared(cfg: config.Config, repo: config.Repo, layer: config.RepoLayer, tick
 
 def comment(source: tracker.GitHubTracker, issue: str, run_id: str, event: str, body: str) -> None:
     marker = f"<!-- arete:environment-{event}={run_id} -->"
-    repo, number = source.repo.github, int(issue)
-    if not gh.find_issue_comment_marker(repo, number, marker):
-        source.require_ordinary(issue)
-        gh.issue_comment(repo, number, f"{tracker.ARETE_TAG} {body}\n\n{marker}", single_attempt=True)
+    source.comment_once(issue, f"{tracker.ARETE_TAG} {body}", marker)
 
 
 def announce(source: tracker.GitHubTracker, run: dict, evidence: str) -> None:
@@ -141,7 +138,7 @@ def reconsider(cfg: config.Config, source: tracker.GitHubTracker, layer: config.
     lock = run_store.run_lock("pipeline", repo.name, issue)
     with (nullcontext(not util.lock_is_held(lock)) if dry_run else util.lock(lock)) as free:
         if (not free or tasks.pending_start(repo.name, issue) or run_store.issue_running(repo.name, issue)
-                or run_store.pending_label(repo.name, issue)):
+                or run_store.pending_label(repo.name, issue) or run_store.failed_finish_pending(repo.name, issue)):
             return None
         run = run_store.newest_live_whole_run(repo.name, issue)
         if (not run or run["status"] != "failed" or run.get("pr_url") or not (failure := recorded_failure(run))

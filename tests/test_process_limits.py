@@ -5,7 +5,9 @@ import os
 import shutil
 import sqlite3
 import tempfile
+import time
 import unittest
+from collections import Counter
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -30,6 +32,7 @@ from arete import (
     pipeline,
     poll,
     record,
+    routing,
     run_lines,
     runlimits,
     sandbox,
@@ -1144,9 +1147,7 @@ class QueueTests(Isolated):
         self.assertEqual(len(started), 1)
 
 
-class EnvironmentRequeueTests(Isolated):
-    class_timeout = 20
-
+class GitHubTicketFixture(Isolated):
     def setUp(self):
         super().setUp()
         tasks_store.task_set_state(self.ticket, "closed")
@@ -1156,30 +1157,431 @@ class EnvironmentRequeueTests(Isolated):
         self.issue = "658"
         self.labels = {"agent"}
         self.comments = []
-        self.started = []
-        self.time = datetime(2026, 11, 21, 8, tzinfo=UTC)
         self.ws = paths.WORKTREES_DIR / f"{self.repo.name}-{self.issue}"
-        self.authority = self.root / "authority"
         for module, name, func in (
             (config, "load", lambda: self.cfg),
-            (codebase, "STAMP", "old-engine"),
-            (util, "now", lambda: self.time),
             (gh, "issue", self.issue_view),
-            (gh, "issues", self.issue_list),
             (gh, "issue_labels", self.edit_labels),
             (gh, "issue_comment", self.post_comment),
-            (gh, "find_issue_comment_marker", self.find_comment),
             (gh, "ensure_label", lambda *args: ""),
             (gh, "default_branch", lambda repo: "main"),
+            (scratch, "process_ids", dict),
+            (scratch, "service_labels", dict),
+            (sandbox, "AUTHORITY", self.root / "authority"),
+        ):
+            self.patches.enter_context(patch.object(module, name, func))
+
+    def issue_view(self, repo, number):
+        return {"number": number, "title": "Fixture issue", "body": "Fixture description", "state": "OPEN",
+                "author": {"login": "owner"}, "labels": [{"name": label} for label in sorted(self.labels)]}
+
+    def edit_labels(self, repo, number, add=(), remove=(), **kwargs):
+        self.labels.difference_update(remove)
+        self.labels.update(add)
+
+    def post_comment(self, repo, number, body, **kwargs):
+        self.comments.append(body)
+
+    def run_failure(self, failure=None, script=None):
+        with patch.object(pipeline, "_run", side_effect=failure, wraps=pipeline._run):
+            self.assertEqual(pipeline.run_issue(self.repo.name, self.issue, script=script), 1)
+        self.assertIn("agent:failed", self.labels)
+        return run_store.newest_whole_run(self.repo.name, self.issue)
+
+
+class OrchestrationFinishTests(GitHubTicketFixture):
+    PR = "https://github.com/owner/project/pull/685"
+    HEAD = "a" * 40
+
+    def setUp(self):
+        super().setUp()
+        self.pr = {"state": "OPEN", "isDraft": False, "draft_calls": 0}
+        self.remote_head = self.HEAD
+        for name, func in (
+            ("find_issue_comment_marker", self.find_comment),
+            ("pr_view", lambda url: self.pr),
+            ("pr_draft_and_head", lambda url: (self.pr["isDraft"], self.remote_head)),
+            ("pr_set_draft", self.set_draft),
+        ):
+            self.patches.enter_context(patch.object(gh, name, func))
+
+    def find_comment(self, repo, number, marker):
+        return any(marker in body.splitlines() for body in self.comments)
+
+    def set_draft(self, url, draft, *, single_attempt):
+        self.assertEqual(url, self.PR)
+        self.assertTrue(single_attempt)
+        self.pr["isDraft"] = draft
+        self.pr["draft_calls"] += 1
+
+    def run_controller(self, decide, code, *, remote_head=HEAD):
+        checkout = workspace.Checkout("", self.repo.github, self.repo.path, self.ws, "main", pr=self.PR, lease=self.HEAD)
+        self.remote_head = remote_head
+
+        def prepare(flow, tree):
+            flow.ctx.run.enter("running")
+            return factory.Outcome("pass", data={
+                "layer": str(self.repo.layer_dir), "checkouts": [checkout.to_row()],
+                "ticket": asdict(flow.ctx.run.tracker.get(self.issue)), "branch": "arete/fixture",
+                "add_dirs": [], "attachments": "", "expertise": "", "triage": "",
+            })
+
+        def drive(flow):
+            controller = orchestration.Controller(flow)
+            with patch.object(controller, "decide", side_effect=lambda: decide(controller)):
+                return controller.drive()
+
+        with (patch.dict(factory.STEPS, {"prepare": prepare}),
+              patch.object(factory, "fingerprint", return_value="fixture-tree")):
+            self.assertEqual(pipeline.run_issue(self.repo.name, self.issue, script=pipeline.Script("orchestrate", drive)),
+                             code)
+        return run_store.newest_whole_run(self.repo.name, self.issue), self.pr
+
+    def controller_action(self, controller, op, args, rationale):
+        version = ledger.snapshot(controller.lease)["version"]
+        turn = ledger.begin(controller.lease, {}, controller.policy.max_decisions)
+        response = {"version": PROTOCOL, "decision_id": turn, "state_version": version,
+                    "rationale": rationale, "calls": [{"op": op, "args": args}]}
+        validated = controller.catalog.validate(response, turn, version, {})
+        return ledger.accept(controller.lease, turn, version, validated, controller.policy.max_actions)
+
+    def test_failed_finish_labels_and_comments_on_the_ticket_and_drafts_the_pr(self):
+        decisions = iter([
+            ("catalog.list", {"kind": "context"}, "The earlier decision only listed context."),
+            ("run.finish", {"reason": "failed"}, "The merge conflicts remain. See http://127.0.0.1:8000/logs."),
+        ])
+        row, pr = self.run_controller(lambda controller: self.controller_action(controller, *next(decisions)), code=1)
+        self.assertEqual((row["status"], row["pr_url"]), ("failed", self.PR))
+        self.assertEqual(self.labels, {"agent", "agent:failed"})
+        comment, = self.comments
+        self.assertIn("The merge conflicts remain. See [private address]/logs.", comment)
+        self.assertIn(row["id"], comment)
+        self.assertNotIn("The earlier decision", comment)
+        self.assertNotIn("127.0.0.1", comment)
+        self.assertTrue(pr["isDraft"])
+
+    def test_failed_finish_leaves_an_owner_updated_pr_ready(self):
+        def decide(controller):
+            return self.controller_action(controller, "run.finish", {"reason": "failed"}, "Could not finish the repair.")
+
+        row, pr = self.run_controller(decide, code=1, remote_head="b" * 40)
+        self.assertEqual((row["status"], row["pr_url"]), ("failed", self.PR))
+        self.assertEqual(self.labels, {"agent", "agent:failed"})
+        comment, = self.comments
+        self.assertIn("Could not finish the repair.", comment)
+        self.assertIn(row["id"], comment)
+        self.assertFalse(pr["isDraft"])
+        self.assertEqual(pr["draft_calls"], 0)
+
+    def test_failed_finish_deadline_interrupts_tracker_and_pr_calls_and_releases_slot(self):
+        slot = run_store.run_lock("slot", self.repo.name, self.issue)
+        recovery = pipeline.runner.start_failure(Result(ok=False, runner="claude", error="claude not found: fixture"),
+                                                 "build")
+        calls = ("issue", "issue_labels", "find_issue_comment_marker", "issue_comment", "pr_view", "pr_draft_and_head",
+                 "pr_set_draft")
+        cases = [(call, False) for call in calls]
+        cases.append(("pr_set_draft", True))
+        for call, owner_pushed in cases:
+            with self.subTest(call=call, owner_pushed=owner_pushed):
+                self.labels = {"agent"}
+                self.comments.clear()
+                self.pr.update(isDraft=False, draft_calls=0)
+                held, returned = [], []
+
+                def decide(controller):
+                    def stall(*args, **kwargs):
+                        held.append(util.lock_is_held(slot))
+                        budget = controller.run.budget
+                        budget.deadline = time.monotonic() + 0.02
+                        budget.arm()
+                        time.sleep(1)
+                        returned.append(True)
+
+                    patches.enter_context(patch.object(gh, call, side_effect=stall))
+                    patches.enter_context(patch.object(controller, "failure_recovery", return_value=recovery))
+                    return self.controller_action(controller, "run.finish", {"reason": "failed"}, "The build could not start.")
+
+                with contextlib.ExitStack() as patches:
+                    row, _ = self.run_controller(decide, code=1)
+                self.assertEqual(held, [True])
+                self.assertEqual(returned, [])
+                self.assertFalse(util.lock_is_held(slot))
+                self.assertEqual((row["status"], row["summary"]), ("failed", "the orchestrator stopped without delivery"))
+                self.assertEqual(json.loads(row["failure"]), {"class": "environment", **recovery})
+                self.assertEqual(runlimits.metadata(row["id"], "parked.json"), {})
+                self.assertTrue(run_store.failed_finish_pending(self.repo.name, self.issue))
+                if call in ("issue", "issue_labels"):
+                    self.assertEqual(row["label_pending"], "failed")
+                if call.startswith("pr_"):
+                    self.assertEqual(len(self.comments), 1)
+                else:
+                    self.assertEqual(self.comments, [])
+
+                if owner_pushed:
+                    self.remote_head = "b" * 40
+                pipeline.sync_failed_finishes(self.cfg)
+                pipeline.sync_failed_finishes(self.cfg)
+                self.assertFalse(run_store.failed_finish_pending(self.repo.name, self.issue))
+                self.assertEqual(run_store.newest_whole_run(self.repo.name, self.issue)["id"], row["id"])
+                self.assertEqual(self.labels, {"agent", "agent:failed"})
+                comment, = self.comments
+                self.assertIn("The build could not start.", comment)
+                self.assertIn(row["id"], comment)
+                self.assertEqual(self.pr["draft_calls"], 0 if owner_pushed else 1)
+                self.assertEqual(self.pr["isDraft"], not owner_pushed)
+
+    def fail_finish(self, controller):
+        return self.controller_action(controller, "run.finish", {"reason": "failed"}, "Could not resolve the conflicts.")
+
+    def test_failed_finish_survives_a_deadline_during_controller_save(self):
+        at_save = []
+
+        def decide(controller):
+            def interrupted_save(lease, data):
+                action, = ledger.actions(lease)
+                at_save.append((action["state"], run_store.failed_finish(lease.run)))
+                raise runlimits.Parked("fixture deadline during controller save")
+
+            patches.enter_context(patch.object(ledger, "save", side_effect=interrupted_save))
+            return self.controller_action(controller, "run.finish", {"reason": "failed"},
+                                          "Conflicts remain. See http://127.0.0.1:8000/logs.")
+
+        with contextlib.ExitStack() as patches:
+            row, pr = self.run_controller(decide, code=1)
+        (action_state, pending), = at_save
+        self.assertEqual(action_state, "succeeded")
+        self.assertEqual(pending["prs"], {self.PR: self.HEAD})
+        self.assertIn("Conflicts remain. See [private address]/logs.", pending["comment"])
+        self.assertEqual((row["status"], row["summary"]), ("failed", "the orchestrator stopped without delivery"))
+        self.assertEqual(runlimits.metadata(row["id"], "parked.json"), {})
+        self.assertFalse(util.lock_is_held(run_store.run_lock("slot", self.repo.name, self.issue)))
+        self.assertEqual(self.comments, [])
+        self.assertEqual(pr["draft_calls"], 0)
+
+        pipeline.sync_failed_finishes(self.cfg)
+        pipeline.sync_failed_finishes(self.cfg)
+        self.assertEqual(self.labels, {"agent", "agent:failed"})
+        comment, = self.comments
+        self.assertIn("Conflicts remain. See [private address]/logs.", comment)
+        self.assertIn(row["id"], comment)
+        self.assertEqual(pr["draft_calls"], 1)
+        self.assertFalse(run_store.failed_finish_pending(self.repo.name, self.issue))
+
+    def test_failed_finish_posts_and_drafts_when_jira_rejects_the_transition(self):
+        self.repo.tracker = "jira"
+        self.issue = "FIXTURE-658"
+        self.cfg.jira.transitions["failed"] = "Failed"
+        client = jira.Client("https://example.invalid", "unused", "unused")
+
+        def issue(key, fields):
+            return {"fields": {"labels": sorted(self.labels), "status": {"name": "In Progress"}}}
+
+        def get(source, tid):
+            return tracker.Ticket(tid, tid, "Fixture Jira issue", labels=sorted(self.labels))
+
+        with (patch.dict(tracker._clients, {"": client}),
+              patch.object(tracker.JiraTracker, "get", get),
+              patch.object(client, "issue", issue),
+              patch.object(client, "edit_labels", side_effect=lambda key, add, remove:
+                           self.edit_labels("", key, add, remove)) as labels,
+              patch.object(client, "move", return_value=False) as move,
+              patch.object(client, "find_comment_marker", side_effect=lambda key, marker:
+                           self.find_comment("", key, marker)),
+              patch.object(client, "comment", side_effect=lambda key, body, **kw:
+                           self.post_comment("", key, body, **kw))):
+            row, pr = self.run_controller(self.fail_finish, code=1)
+            self.assertEqual(self.labels, {"agent", "agent-failed"})
+            comment, = self.comments
+            self.assertIn("Could not resolve the conflicts.", comment)
+            self.assertIn(row["id"], comment)
+            self.assertEqual(pr["draft_calls"], 1)
+            self.assertTrue(run_store.failed_finish_pending(self.repo.name, self.issue))
+            move.assert_called_once_with(self.issue, "Failed")
+            outcomes.sync_moves(self.cfg)
+            self.assertEqual(move.call_count, 1)
+
+            move.return_value = True
+            pipeline.sync_failed_finishes(self.cfg)
+            self.assertEqual(move.call_count, 2)
+            self.assertEqual(labels.call_count, 2)
+            self.assertEqual(self.comments, [comment])
+            self.assertEqual(pr["draft_calls"], 1)
+            self.assertEqual(run_store.run_get(row["id"])["moved"], "failed")
+            self.assertFalse(run_store.failed_finish_pending(self.repo.name, self.issue))
+
+    def test_failed_finish_owner_retry_retires_the_pending_draft(self):
+        for synced_before_pick in (True, False):
+            with self.subTest(synced_before_pick=synced_before_pick):
+                self.labels = {"agent"}
+                self.comments.clear()
+                self.pr.update(isDraft=False, draft_calls=0)
+                with patch.object(gh, "pr_set_draft", side_effect=gh.GhError("conversion rejected")) as rejected:
+                    row, pr = self.run_controller(self.fail_finish, code=1)
+                    pipeline.sync_failed_finishes(self.cfg)
+                    self.assertEqual(rejected.call_count, 2)
+                self.assertEqual(self.labels, {"agent", "agent:failed"})
+                self.assertEqual(len(self.comments), 1)
+                self.assertTrue(run_store.failed_finish_pending(self.repo.name, self.issue))
+
+                self.labels.remove("agent:failed")
+                if synced_before_pick:
+                    pipeline.sync_failed_finishes(self.cfg)
+                    self.assertFalse(run_store.failed_finish_pending(self.repo.name, self.issue))
+                source = tracker.for_repo(self.cfg, self.repo)
+                queue = poll.RepoQueue(self.repo, source, set(), config.load_layer(self.repo.layer_dir),
+                                       routing.Discovery(self.cfg, self.repo, priced=False))
+                skips = pipeline.SkipLog({})
+                with patch.object(gh, "issues", return_value=[self.issue_view(self.repo.github, int(self.issue))]):
+                    pick = poll.next_pick(self.repo, source, skips, set())
+                self.assertEqual(pick, (self.issue, "Fixture issue"))
+                with patch.object(poll, "spawn_unparked", return_value=True) as spawn:
+                    self.assertEqual(poll.start_pick(self.cfg, queue, pick, skips, False, Counter(), 1), "started")
+                spawn.assert_called_once()
+
+                newer = record.start("pipeline", repo=self.repo.name, issue=self.issue)
+                record.settle(newer, "failed")
+                self.labels.add("agent:failed")
+                pipeline.sync_failed_finishes(self.cfg)
+                self.assertEqual(pr["draft_calls"], 0)
+                self.assertEqual(len(self.comments), 1)
+                self.assertEqual(self.labels, {"agent", "agent:failed"})
+                self.assertFalse(run_store.failed_finish_pending(self.repo.name, self.issue))
+                self.assertEqual(run_store.failed_finish(row["id"])["prs"], {})
+
+    def test_failed_finish_recovers_a_comment_written_before_process_interruption(self):
+        def post_then_interrupt(repo, number, body, *, single_attempt):
+            self.assertTrue(single_attempt)
+            self.post_comment(repo, number, body)
+            raise KeyboardInterrupt
+
+        with patch.object(gh, "issue_comment", side_effect=post_then_interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_controller(self.fail_finish, code=1)
+        row = run_store.newest_whole_run(self.repo.name, self.issue)
+        self.assertEqual(row["status"], "running")
+        self.assertFalse(util.lock_is_held(run_store.run_lock("slot", self.repo.name, self.issue)))
+        with patch.object(record, "SETTLE_GRACE_SECONDS", 0):
+            pipeline.settle_abandoned_runs(self.cfg)
+        self.assertEqual(run_store.run_get(row["id"])["status"], "failed")
+        self.assertEqual(run_store.interrupted_tickets(self.repo.name), [])
+        self.assertTrue(run_store.failed_finish_pending(self.repo.name, self.issue))
+        with patch.object(gh, "find_issue_comment_marker", side_effect=gh.GhError("lookup unavailable")):
+            pipeline.sync_failed_finishes(self.cfg)
+        self.assertTrue(run_store.failed_finish_pending(self.repo.name, self.issue))
+        source = tracker.for_repo(self.cfg, self.repo)
+        queue = poll.RepoQueue(self.repo, source, set(), config.load_layer(self.repo.layer_dir),
+                               routing.Discovery(self.cfg, self.repo, priced=False))
+        with patch.object(poll, "spawn_unparked") as spawn:
+            self.assertEqual(poll.start_pick(self.cfg, queue, (self.issue, "queued"), pipeline.SkipLog({}),
+                                             False, Counter(), 1), "blocked")
+        spawn.assert_not_called()
+        pipeline.sync_failed_finishes(self.cfg)
+        pipeline.sync_failed_finishes(self.cfg)
+        self.assertFalse(run_store.failed_finish_pending(self.repo.name, self.issue))
+        self.assertEqual(self.labels, {"agent", "agent:failed"})
+        comment, = self.comments
+        self.assertIn(row["id"], comment)
+        self.assertIn("Could not resolve the conflicts.", comment)
+        self.assertTrue(self.pr["isDraft"])
+
+    def test_delivered_finish_keeps_the_ready_pr_and_ticket_state(self):
+        def decide(controller):
+            controller.run.enter("pr")
+            controller.data["published"] = {"ending": "pr", "summary": "Delivered fixture"}
+            controller.data["published_tree"] = controller.fingerprint()
+            controller.executing = "fixture-publication"
+            for gate in ("checks", "verify", "review"):
+                controller.stamp(gate, {})
+            return self.controller_action(controller, "run.finish", {"reason": "delivered"}, "Published the change.")
+
+        row, pr = self.run_controller(decide, code=0)
+        self.assertEqual((row["status"], row["summary"], row["pr_url"]), ("pr", "Delivered fixture", self.PR))
+        self.assertEqual(self.labels, {"agent", "agent:pr"})
+        self.assertEqual(self.comments, [])
+        self.assertFalse(pr["isDraft"])
+
+    def test_repair_budget_park_posts_one_ticket_comment(self):
+        def decide(controller):
+            budget = controller.run.budget
+            for _ in range(budget.policy.max_repair_cycles + 1):
+                budget.charge("repair", "review_repair")
+
+        row, pr = self.run_controller(decide, code=1)
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(self.labels, {"agent", "agent:failed"})
+        saved = runlimits.metadata(row["id"], "parked.json")
+        comment, = self.comments
+        self.assertIn("the repair chain used its 2 repair cycles", saved["reason"])
+        self.assertIn(saved["reason"], comment)
+        self.assertIn(row["id"], comment)
+        self.assertIn(runlimits.RETRY, comment)
+        self.assertFalse(pr["isDraft"])
+
+    def test_expired_active_time_park_sets_the_failed_label_without_polling(self):
+        def decide(controller):
+            budget = controller.run.budget
+            budget.deadline = time.monotonic() - 1
+            budget.charge("build", "build")
+
+        row, pr = self.run_controller(decide, code=1)
+        self.assertEqual(row["status"], "failed")
+        self.assertIn("cumulative", runlimits.metadata(row["id"], "parked.json")["reason"])
+        self.assertEqual(self.labels, {"agent", "agent:failed"})
+        self.assertEqual(row["label_pending"], "")
+        self.assertFalse(pr["isDraft"])
+
+    def test_adaptive_finish_uses_the_blocking_build_result(self):
+        startup = Result(ok=False, runner="claude", error="claude not found: fixture")
+        recovery = pipeline.runner.start_failure(startup, "build")
+        build_start = ("worker.start", "failed", {"writing": True, "event": "result", "recovery": recovery})
+        unrelated = ("worker.start", "failed", {"writing": False, "event": "result", "recovery": recovery})
+        for actions, expected in (
+            ([build_start], {"class": "environment", **recovery}),
+            ([build_start, unrelated], {"class": "environment", **recovery}),
+            ([unrelated], {"class": "work"}),
+            ([build_start, ("worker.continue", "failed", {"writing": True, "event": "result"})], {"class": "work"}),
+            ([build_start, ("checks.run", "succeeded", {"passed": False})], {"class": "work"}),
+            ([build_start, ("verification.run", "succeeded", {"operation_passed": True, "verdict": "fail"})],
+             {"class": "work"}),
+        ):
+            with self.subTest(actions=actions):
+                def drive(flow):
+                    controller = orchestration.Controller(flow)
+                    lease = controller.lease
+                    turn = ledger.begin(lease, {}, 1)
+                    version = ledger.snapshot(lease)["version"]
+                    calls = [{"op": op, "args": {}} for op, _, _ in actions]
+                    calls.append({"op": "run.finish", "args": {"reason": "failed"}})
+                    *accepted, finish = ledger.accept(lease, turn, version, {"calls": calls}, 10)
+                    for action, (_, state, result) in zip(accepted, actions, strict=True):
+                        ledger.transition(lease, action["id"], state, result)
+                    controller.data["acceptance"] = "fixture"
+                    controller.dispatch(finish)
+                    return controller.ending
+
+                row = self.run_failure(script=pipeline.Script("adw", drive))
+                self.assertEqual(json.loads(row["failure"]), expected)
+
+
+class EnvironmentRequeueTests(GitHubTicketFixture):
+    class_timeout = 20
+
+    def setUp(self):
+        super().setUp()
+        self.started = []
+        self.time = datetime(2026, 11, 21, 8, tzinfo=UTC)
+        self.authority = sandbox.AUTHORITY
+        for module, name, func in (
+            (codebase, "STAMP", "old-engine"),
+            (util, "now", lambda: self.time),
+            (gh, "issues", self.issue_list),
+            (gh, "find_issue_comment_marker", self.find_comment),
             (poll, "network_up_or_skip", lambda *args: True),
             (poll, "mark_loop", lambda *args: None),
             (poll, "cleanup_worktrees", lambda **kwargs: None),
             (outcomes, "sync_outcomes", lambda cfg: None),
             (outcomes, "sync_moves", lambda cfg: None),
             (outcomes, "sync_landings", lambda cfg: None),
-            (scratch, "process_ids", dict),
-            (scratch, "service_labels", dict),
-            (sandbox, "AUTHORITY", self.authority),
             (pipeline, "SKIPPED_FILE", self.root / "skipped.json"),
             (pipeline, "wanted", lambda repo: "classic"),
             (tasks, "spawn_pending", lambda repo, tid, launch: self.started.append(tid)),
@@ -1189,28 +1591,11 @@ class EnvironmentRequeueTests(Isolated):
             scratch.create_secret(fd, scratch.SECRET)
             self.key = scratch.read_secret(fd)
 
-    def issue_view(self, repo, number):
-        return {"number": number, "title": "Fixture issue", "body": "Fixture description", "state": "OPEN",
-                "author": {"login": "owner"}, "labels": [{"name": label} for label in sorted(self.labels)]}
-
     def issue_list(self, repo, label, **kwargs):
         return [self.issue_view(repo, int(self.issue))] if label in self.labels else []
 
-    def edit_labels(self, repo, number, add=(), remove=(), **kwargs):
-        self.labels.difference_update(remove)
-        self.labels.update(add)
-
-    def post_comment(self, repo, number, body, **kwargs):
-        self.comments.append(body)
-
     def find_comment(self, repo, number, marker):
         return next(("fixture" for body in self.comments if marker in body.splitlines()), "")
-
-    def run_failure(self, failure=None, script=None):
-        with patch.object(pipeline, "_run", side_effect=failure, wraps=pipeline._run):
-            self.assertEqual(pipeline.run_issue(self.repo.name, self.issue, script=script), 1)
-        self.assertIn("agent:failed", self.labels)
-        return run_store.newest_whole_run(self.repo.name, self.issue)
 
     def test_authenticated_scratch_settlement_requeues_before_picking(self):
         selector = "a" * 64
@@ -1439,36 +1824,6 @@ class EnvironmentRequeueTests(Isolated):
         self.assertEqual(run_store.environment_requeue(next_run, since), ({}, 1))
         self.assertEqual(sum("environment-requeue" in body for body in self.comments), 1)
         self.assertIn(self.issue, self.started)
-
-    def test_adaptive_finish_uses_the_blocking_build_result(self):
-        startup = Result(ok=False, runner="claude", error="claude not found: fixture")
-        recovery = pipeline.runner.start_failure(startup, "build")
-        build_start = ("worker.start", "failed", {"writing": True, "event": "result", "recovery": recovery})
-        unrelated = ("worker.start", "failed", {"writing": False, "event": "result", "recovery": recovery})
-        for actions, expected in (
-            ([build_start], {"class": "environment", **recovery}),
-            ([build_start, unrelated], {"class": "environment", **recovery}),
-            ([unrelated], {"class": "work"}),
-            ([build_start, ("worker.continue", "failed", {"writing": True, "event": "result"})], {"class": "work"}),
-            ([build_start, ("checks.run", "succeeded", {"passed": False})], {"class": "work"}),
-            ([build_start, ("verification.run", "succeeded", {"operation_passed": True, "verdict": "fail"})],
-             {"class": "work"}),
-        ):
-            with self.subTest(actions=actions):
-                def drive(flow):
-                    controller = orchestration.Controller(flow)
-                    lease = controller.lease
-                    turn = ledger.begin(lease, {}, 1)
-                    version = ledger.snapshot(lease)["version"]
-                    accepted = ledger.accept(lease, turn, version,
-                                             {"calls": [{"op": op, "args": {}} for op, _, _ in actions]}, 10)
-                    for action, (_, state, result) in zip(accepted, actions):
-                        ledger.transition(lease, action["id"], state, result)
-                    controller.perform({"op": "run.finish", "request": {"reason": "failed"}})
-                    return controller.ending
-
-                row = self.run_failure(script=pipeline.Script("adw", drive))
-                self.assertEqual(json.loads(row["failure"]), expected)
 
     def test_runner_start_failure_requires_a_successful_probe(self):
         failure = Result(ok=False, runner="claude", error="claude not found: fixture")

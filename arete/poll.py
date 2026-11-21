@@ -277,6 +277,11 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: tuple[str, str], skip
     name = tracker.ticket_name(repo.name, source.ref(tid))
     if isinstance(source, tracker.GitHubTracker) and source.in_zte_queue(str(tid)):
         return "skipped"
+    if run_store.failed_finish_pending(repo.name, tid) and (
+            run_store.pending_label(repo.name, tid) or source.has_state(tid, "failed")):
+        ticket = source.get(tid)
+        skips.note(name, ticket, "its failed run's tracker updates are pending", repo.name)
+        return "blocked"
     reply = tracker_reply(repo, source, str(tid), dry_run)
     answering = not reply and pipeline.answered_run(repo.name, str(tid)) is not None
     if not answering and not reply and (waiting := held_back(cfg, repo.name, going, slots)):
@@ -396,6 +401,7 @@ def poll(dry_run: bool = False) -> int:
         if not dry_run:
             guard(errors, "settling abandoned runs", lambda: settle_abandoned_runs(cfg))
             guard(errors, "syncing PR outcomes", lambda: outcomes.sync_outcomes(cfg))
+            guard(errors, "settling failed runs", lambda: pipeline.sync_failed_finishes(cfg))
             guard(errors, "labeling tickets", lambda: sync_labels(cfg))
         going = Counter(r["repo"] for r in live_pipeline_runs())
         slots = slots_free_to_start(cfg.max_parallel)
