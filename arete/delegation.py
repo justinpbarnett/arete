@@ -207,7 +207,7 @@ def check_policy(launch: dict, cfg: config.Config, layer: config.RepoLayer) -> N
     config_sha = launch["config_sha"]
     if ((config_sha not in settings_shas(cfg) and config_sha not in legacy_settings_shas(cfg))
             or launch["layer_sha"] not in settings_shas(layer)):
-        raise PolicyChanged()
+        raise PolicyChanged("worker policy changed after action acceptance")
 
 
 def main() -> None:
