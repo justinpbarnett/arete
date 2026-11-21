@@ -101,7 +101,9 @@ def main(argv: list[str] | None = None) -> int:
         if (local_read(args) if callable(local_read) else local_read) and not paths.DB_FILE.is_file():
             raise foundation.NoDatabase
         recovery = args.cmd in ("init", "migrate") or (args.cmd == "backup" and args.restore)
-        with client.invocation(), principals.acting("hand" if recovery else principals.cli_actor):
+        upload_on_write = args.cmd not in ("doctor", "install") and not getattr(args, "dry_run", False)
+        with client.invocation(upload_on_write=upload_on_write), principals.acting(
+                "hand" if recovery else principals.cli_actor):
             return args.fn(args) or 0
     except client.Down as e:
         client.emit(e.answer)
