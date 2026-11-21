@@ -242,7 +242,7 @@ class PublicationFixture(unittest.TestCase):
         return job
 
 
-class AutomaticCIRerunTests(unittest.TestCase):
+class AutomaticCIRerunFixture:
     hold_reason = "GitHub has no fully passing CI result for the verified head"
 
     def setUp(self):
@@ -347,6 +347,8 @@ class AutomaticCIRerunTests(unittest.TestCase):
         if endpoint == prefix + "pulls/7":
             return {"number": 7, "state": "open", "head": {"sha": self.checkout.lease, "ref": "fixture-branch",
                                                           "repo": {"full_name": self.checkout.github}}}
+        if endpoint == prefix + "actions/runs/789":
+            return {"id": 789, "head_sha": self.checkout.lease, "run_attempt": 1}
         if endpoint == prefix + "actions/runs/456":
             rerunning = self.sleep.called or (self.launched and self.attempt_ready)
             attempt = self.workflow_attempt + int(rerunning)
@@ -393,6 +395,31 @@ class AutomaticCIRerunTests(unittest.TestCase):
         pipeline.report_automerge(self.run, self.checkout, hold)
         return hold
 
+    def controller(self):
+        controller = orchestration.Controller.__new__(orchestration.Controller)
+        controller.run = self.run
+        controller.job = SimpleNamespace(b=self.build, ws=self.build.ws, slot=self.slot, ticket=self.build.ticket,
+                                         with_prs=[self.checkout], checkouts=[self.checkout], changed=[self.checkout],
+                                         picked=list, verified=verify.Verified("pass"), review=Review("approve"),
+                                         approval=None, draft_why="", build_summary="Fixture", run=self.run,
+                                         prepared_feedback_prs=[])
+        controller.data = {"evidence": {"checks": {"result": {"full": True}}}}
+        controller.workers = {}
+        controller.ending = None
+        controller.flow = mock.Mock()
+        controller.catalog = mock.Mock(context={})
+        controller.current = mock.Mock(return_value=True)
+        controller.fingerprint = mock.Mock(return_value="published-tree")
+        controller.validate_publication_diff = mock.Mock()
+        controller.persist = mock.Mock()
+        controller.atomic = mock.Mock(return_value=factory.Outcome("pass", data={"heads": {
+            self.checkout.github: self.checkout.lease}}))
+        controller.finish_publication = mock.Mock(return_value={"ending": "done"})
+        controller.take_merge_lease = mock.Mock()
+        return controller
+
+
+class AutomaticCIRerunTests(AutomaticCIRerunFixture, unittest.TestCase):
     def test_unrelated_red_reruns_once_then_green_reaches_automerge(self):
         self.assertEqual(self.watch(), "1 of 1 passed")
         gh.gh.assert_called_once()
@@ -620,29 +647,6 @@ class AutomaticCIRerunTests(unittest.TestCase):
         self.assertIn("red but not caused by the PR", self.watch())
         gh.gh.assert_not_called()
         self.assertEqual(self.automerge_hold(), self.hold_reason)
-
-    def controller(self):
-        controller = orchestration.Controller.__new__(orchestration.Controller)
-        controller.run = self.run
-        controller.job = SimpleNamespace(b=self.build, ws=self.build.ws, slot=self.slot, ticket=self.build.ticket,
-                                         with_prs=[self.checkout], checkouts=[self.checkout], changed=[self.checkout],
-                                         picked=list, verified=verify.Verified("pass"), review=Review("approve"),
-                                         approval=None, draft_why="", build_summary="Fixture", run=self.run,
-                                         prepared_feedback_prs=[])
-        controller.data = {"evidence": {"checks": {"result": {"full": True}}}}
-        controller.workers = {}
-        controller.ending = None
-        controller.flow = mock.Mock()
-        controller.catalog = mock.Mock(context={})
-        controller.current = mock.Mock(return_value=True)
-        controller.fingerprint = mock.Mock(return_value="published-tree")
-        controller.validate_publication_diff = mock.Mock()
-        controller.persist = mock.Mock()
-        controller.atomic = mock.Mock(return_value=factory.Outcome("pass", data={"heads": {
-            self.checkout.github: self.checkout.lease}}))
-        controller.finish_publication = mock.Mock(return_value={"ending": "done"})
-        controller.take_merge_lease = mock.Mock()
-        return controller
 
     def test_default_publication_reruns_an_unrelated_check_and_finishes_on_green(self):
         self.check_permalink()
@@ -999,6 +1003,303 @@ class AutomaticCIRerunTests(unittest.TestCase):
         self.run.agent.assert_called_once()
         gh.gh.assert_called_once()
         controller.finish_publication.assert_not_called()
+
+
+class ExactCIRerunTests(AutomaticCIRerunFixture, unittest.TestCase):
+    def test_human_rerun_passes_on_unchanged_head_after_automatic_rerun_failed(self):
+        self.rerun_jobs = [self.job("checks", 201, "failure")]
+        self.assertIn("red but not caused by the PR", self.watch())
+        self.assertEqual(self.automerge_hold(), self.hold_reason)
+        self.merge.assert_not_called()
+
+        self.workflow_attempt += 1
+        self.rerun_jobs = [self.job("checks", 301, "success")]
+        self.assertEqual(self.checkout.lease, "original-head")
+        self.assertEqual(self.automerge_hold(), "")
+        self.merge.assert_called_once()
+        gh.gh.assert_called_once()
+
+    def test_jobs_in_two_attempts_match_only_the_current_failure(self):
+        self.workflow_attempt = 2
+        self.failed += [self.job("checks", 100, "failure")]
+        self.workflow_job_pages = [{"total_count": 2, "jobs": [
+            {**self.failed[0], "run_attempt": 2}, {**self.failed[1], "run_attempt": 1},
+        ]}]
+
+        self.assertEqual(self.watch(), "1 of 1 passed")
+        gh.gh.assert_called_once()
+        self.assertEqual(self.automerge_hold(), "")
+
+    def test_differently_cased_verdict_does_not_authorize_a_rerun(self):
+        self.failed = [self.job("Checks", 101, "failure")]
+        self.assertIn("red but not caused by the PR", self.watch())
+        self.assertEqual(self.automerge_hold(), self.hold_reason)
+        controller = self.controller()
+        with mock.patch.object(pipeline, "set_draft"):
+            self.assertEqual(controller.publish()["failures"], orchestration.CI_FAILURES)
+        gh.gh.assert_not_called()
+
+    def test_timed_out_job_cannot_cover_another_failed_job_with_the_same_name(self):
+        self.failed = [self.job("checks", 100, "failure"), self.job("checks", 101, "timed_out")]
+        controller = self.controller()
+        with mock.patch.object(pipeline, "set_draft") as draft:
+            result = controller.publish()
+        self.assertEqual(result["failures"], orchestration.CI_FAILURES)
+        self.assertIsNone(controller.ending)
+        draft.assert_called_once_with(self.run, self.checkout, True)
+        gh.gh.assert_not_called()
+
+
+class CurrentHeadCIRerunTests(AutomaticCIRerunFixture, unittest.TestCase):
+    def test_other_workflow_failure_superseded_by_a_passing_attempt_allows_rerun(self):
+        stale = self.job("other check", 102, "failure", run=789)
+        passing = self.job("other check", 103, "success", run=789)
+        self.failed.append(stale)
+        self.verdicts["other check"] = False
+
+        def api(args, **options):
+            run_path = f"repos/{self.checkout.github}/actions/runs/789"
+            if args[1] == run_path:
+                return {"id": 789, "head_sha": self.checkout.lease, "run_attempt": 2,
+                        "status": "completed", "conclusion": "success"}
+            if args[1] == run_path + "/jobs?filter=all&per_page=100":
+                return [{"total_count": 2, "jobs": [
+                    {**stale, "run_attempt": 1}, {**passing, "run_attempt": 2}]}]
+            return self.api(args, **options)
+
+        gh.gh_json.side_effect = api
+        self.assertEqual(self.watch(), "1 of 1 passed")
+        gh.gh.assert_called_once()
+        self.fix.assert_called_once()
+        self.push_fix.assert_not_called()
+
+    def test_latest_green_reaches_classic_merge_screening_during_workflow_lookup_outage(self):
+        def api(args, **options):
+            if self.launched and args[1].endswith("/actions/runs/456"):
+                raise gh.GhError("workflow lookup unavailable")
+            return self.api(args, **options)
+
+        gh.gh_json.side_effect = api
+        with mock.patch.object(ci, "WAIT_SECONDS", 0):
+            self.assertIn("could not read the checks", self.watch())
+        self.assertEqual(self.automerge_hold(), self.hold_reason)
+        self.merge.assert_not_called()
+
+        self.attempt_ready = True
+        gh.gh_json.reset_mock()
+        self.assertEqual(self.automerge_hold(), "")
+        self.assertTrue(any("filter=latest" in c.args[0][1] for c in gh.gh_json.call_args_list))
+        self.merge.assert_called_once()
+        gh.gh.assert_called_once()
+
+    def test_default_publication_refreshes_a_repeat_red_on_the_same_head(self):
+        self.rerun_jobs = [self.job("checks", 201, "failure")]
+        controller = self.controller()
+        controller.job.opened = controller.job.found = controller.job.ci_stopped = []
+        with mock.patch.object(pipeline, "set_draft") as draft:
+            hold = controller.publish()
+
+            def unavailable(args, **options):
+                if "filter=latest" in args[1]:
+                    raise gh.GhError("commit checks unavailable")
+                return self.api(args, **options)
+
+            gh.gh_json.side_effect = unavailable
+            self.assertEqual(controller.publish(), hold)
+            controller.finish_publication.assert_not_called()
+
+            gh.gh_json.side_effect = self.api
+            self.rerun_jobs = [self.job("checks", 301, "success")]
+            self.assertEqual(controller.publish(), {"ending": "done"})
+
+        self.assertEqual(hold["failures"], orchestration.CI_FAILURES)
+        self.assertEqual(self.checkout.lease, "original-head")
+        self.assertNotIn("ci_failed", controller.data)
+        self.assertNotIn("ci_retry", controller.data)
+        self.assertIn("Arete reran failed jobs for repo#7 checks.", self.body.call_args.args[1])
+        self.assertIn("GitHub now reports passing checks", self.body.call_args.args[1])
+        self.run.agent.assert_called_once()
+        controller.atomic.assert_called_once()
+        controller.finish_publication.assert_called_once()
+        draft.assert_called_once()
+        gh.gh.assert_called_once()
+
+
+class PublicationCIRerunReviewTests(AutomaticCIRerunFixture, unittest.TestCase):
+    def test_actions_failure_missing_from_commit_checks_holds_publication(self):
+        self.workflow_attempt = 2
+        original = self.failed[0]
+        passing = self.job("checks", 201, "success")
+        dependent = self.job("dependent", 202, "failure")
+        self.failed.append(passing)
+        self.workflow_job_pages = [{"total_count": 3, "jobs": [
+            {**original, "run_attempt": 1}, {**passing, "run_attempt": 2}, {**dependent, "run_attempt": 2},
+        ]}]
+        self.verdicts = {"dependent": True}
+        ci.failure_note.side_effect = lambda red, _: red.check.name
+        latest = [passing]
+
+        def api(args, **options):
+            if "filter=latest" in args[1]:
+                return [{"check_runs": latest}]
+            return self.api(args, **options)
+
+        gh.gh_json.side_effect = api
+        controller = self.controller()
+        controller.job.opened = controller.job.found = controller.job.ci_stopped = []
+        with mock.patch.object(pipeline, "set_draft") as draft:
+            result = controller.publish()
+            self.assertEqual(result.get("failures"), orchestration.CI_FAILURES)
+            self.assertIn("red from the PR", result["ci"])
+            self.assertEqual(controller.data["ci_retry"]["targets"][self.checkout.github]["jobs"], [202])
+            self.assertEqual(controller.publish(), result)
+            controller.finish_publication.assert_not_called()
+            latest.append(self.job("dependent", 302, "success"))
+            self.assertEqual(controller.publish(), {"ending": "done"})
+
+        controller.finish_publication.assert_called_once()
+        draft.assert_called_once_with(self.run, self.checkout, True)
+        gh.gh.assert_not_called()
+
+    def test_same_head_retry_refreshes_checks_without_rerunning_a_caused_job(self):
+        self.verdicts = {"checks": True}
+        controller = self.controller()
+        controller.job.opened = controller.job.found = controller.job.ci_stopped = []
+        with (mock.patch.object(pipeline, "set_draft"),
+              mock.patch.object(gh, "failed_job_reruns",
+                                return_value=[gh.WorkflowRerun(456, 2, {"checks": 101})]) as find_jobs):
+            hold = controller.publish()
+            gh.gh_json.reset_mock()
+            self.assertEqual(controller.publish(), hold)
+            self.assertTrue(any("filter=latest" in c.args[0][1] for c in gh.gh_json.call_args_list))
+            controller.finish_publication.assert_not_called()
+            self.failed = [self.job("checks", 201, "success")]
+            self.assertEqual(controller.publish(), {"ending": "done"})
+
+        self.assertEqual(hold["failures"], orchestration.CI_FAILURES)
+        self.assertIn("red from the PR", hold["ci"])
+        self.assertNotIn("ci_failed", controller.data)
+        self.assertNotIn("rerun", self.body.call_args.args[1])
+        self.run.agent.assert_called_once()
+        controller.finish_publication.assert_called_once()
+        find_jobs.assert_not_called()
+        gh.gh.assert_not_called()
+
+    def test_push_workflow_with_matching_pr_and_head_can_rerun(self):
+        def api(args, **options):
+            row = self.api(args, **options)
+            if args[1].endswith("/actions/runs/456"):
+                row["event"] = "push"
+            return row
+
+        gh.gh_json.side_effect = api
+        with mock.patch.object(pipeline, "set_draft"):
+            self.workflow_pr = 8
+            self.assertEqual(self.controller().publish()["failures"], orchestration.CI_FAILURES)
+            gh.gh.assert_not_called()
+            self.workflow_pr = 7
+            self.assertEqual(self.controller().publish(), {"ending": "done"})
+        gh.gh.assert_called_once()
+
+    def test_green_head_clears_hold_when_red_rerun_watch_timed_out(self):
+        self.attempt_ready = True
+        self.rerun_jobs = [self.job("checks", 201, "failure")]
+        other = self.job("independent", 300, "success", run=789)
+        pending = {**other, "status": "in_progress", "conclusion": None}
+        green = []
+
+        def api(args, **options):
+            endpoint = args[1]
+            if endpoint.endswith("/actions/jobs/301"):
+                return {**green[0], "run_attempt": 3}
+            if f"/commits/{self.checkout.lease}/check-runs?" in endpoint and self.launched:
+                if green:
+                    return [{"check_runs": green}]
+                page, = self.api(args, **options)
+                return [{"check_runs": [*page["check_runs"], pending]}]
+            return self.api(args, **options)
+
+        gh.gh_json.side_effect = api
+        controller = self.controller()
+        controller.job.opened = controller.job.found = controller.job.ci_stopped = []
+        with (mock.patch.object(ci, "WAIT_SECONDS", 0), mock.patch.object(pipeline, "set_draft") as draft):
+            hold = controller.publish()
+            self.assertEqual(hold["failures"], orchestration.CI_FAILURES)
+            self.assertIn("independent", self.body.call_args.args[1])
+            self.assertIn("reruns", controller.data["ci_retry"])
+            self.assertTrue(self.attempt_read)
+            controller.finish_publication.assert_not_called()
+            controller.data = json.loads(json.dumps(controller.data))
+            green[:] = [self.job("checks", 301, "success"), other]
+            gh.gh_json.reset_mock()
+            self.assertEqual(controller.publish(), {"ending": "done"})
+
+        self.assertTrue(any("filter=latest" in c.args[0][1] for c in gh.gh_json.call_args_list))
+        self.assertNotIn("ci_retry", controller.data)
+        self.assertIn("Arete reran failed jobs for repo#7 checks.", self.body.call_args.args[1])
+        controller.finish_publication.assert_called_once()
+        draft.assert_called_once()
+        gh.gh.assert_called_once()
+
+
+class PublicationCIRefreshTests(AutomaticCIRerunFixture, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.attempt_ready = True
+        self.publication = self.controller()
+        self.publication.job.opened = self.publication.job.found = self.publication.job.ci_stopped = []
+        self.enterContext(mock.patch.object(pipeline, "set_draft"))
+
+    def test_retry_holds_when_a_failed_dependent_job_disappears_from_commit_checks(self):
+        original = self.failed[0]
+        passing = self.job("checks", 201, "success")
+        dependent = self.job("dependent", 202, "failure")
+        self.rerun_jobs = [passing, dependent]
+        lists_dependent = True
+        manual_attempt = None
+
+        def api(args, **options):
+            if self.launched and f"/commits/{self.checkout.lease}/check-runs?" in args[1]:
+                jobs = [passing, dependent] if lists_dependent else [passing]
+                return [{"check_runs": jobs}]
+            row = self.api(args, **options)
+            if manual_attempt and args[1].endswith("/actions/runs/456"):
+                row.update(run_attempt=manual_attempt, conclusion="success")
+            return row
+
+        gh.gh_json.side_effect = api
+        held = self.publication.publish()
+        self.assertEqual(held.get("failures"), orchestration.CI_FAILURES)
+        saved = self.publication.data["ci_retry"]["targets"][self.checkout.github]
+        self.assertEqual(saved["jobs"], [dependent["id"]])
+
+        lists_dependent = False
+        self.workflow_job_pages = [{"total_count": 3, "jobs": [
+            {**original, "run_attempt": 1}, {**passing, "run_attempt": 2}, {**dependent, "run_attempt": 2},
+        ]}]
+        self.publication.data = json.loads(json.dumps(self.publication.data))
+        self.assertEqual(self.publication.publish(), held)
+        self.assertIn("ci_retry", self.publication.data)
+        self.publication.finish_publication.assert_not_called()
+
+        manual_attempt = 3
+        page, = self.workflow_job_pages
+        page["jobs"].append({**self.job("dependent", 303, "success"), "run_attempt": manual_attempt})
+        page["total_count"] = len(page["jobs"])
+        self.assertEqual(self.publication.publish(), {"ending": "done"})
+        self.publication.finish_publication.assert_called_once()
+        gh.gh.assert_called_once()
+
+    def test_retry_finishes_with_a_pass_and_a_skipped_check(self):
+        self.rerun_jobs = [self.job("checks", 201, "failure")]
+        self.assertEqual(self.publication.publish().get("failures"), orchestration.CI_FAILURES)
+
+        self.rerun_jobs = [self.job("checks", 301, "success"), self.job("optional", 302, "skipped")]
+        self.assertEqual(self.publication.publish(), {"ending": "done"})
+
+        self.assertNotIn("ci_retry", self.publication.data)
+        self.publication.finish_publication.assert_called_once()
+        gh.gh.assert_called_once()
 
 
 class LiveOutsideEventPublicationTests(PublicationFixture):
@@ -2929,7 +3230,7 @@ class MovedBasePublicationFixture:
                         changed=[checkout.github], opened=[checkout.github], pushed=[], ci_stopped=[], build_summary="updated")
         job.ticket = SimpleNamespace(labels=[], title="Edit fixture")
         job.b = mock.Mock(run=run, layer=SimpleNamespace(trust_level="automerge"), ticket=job.ticket,
-                          checked={}, report="", staged=None, catch_ups=0, ci_rerun_holds=set())
+                          checked={}, report="", staged=None, catch_ups=0, unread_ci_reruns={})
         controller.run, controller.job = run, job
         controller.flow = SimpleNamespace(ctx=job, refusal="", continues="")
         controller.data = {"mode": "orchestrate", "evidence": {"checks": {"result": {"full": True}}}}

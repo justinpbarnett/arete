@@ -254,6 +254,8 @@ def watch(target: Target, log: Callable[[str], None], *, reruns: Sequence[gh.Wor
         if reruns:
             for key in superseded_jobs(checks, newer_attempts, pr_runs, options):
                 del checks[key]
+            exact_jobs = {c.job for c in exact.values()}
+            checks = {key: c for key, c in checks.items() if not c.actions_only or c.job not in exact_jobs}
         return checks | exact, awaiting_rerun
 
     def watched(checks: dict[gh.CheckKey, gh.Check], *, read=True, conflict=False) -> Watched:

@@ -1174,7 +1174,7 @@ class Build(TicketWork):
     build_summary: str = ""
     catch_ups: int = 0
     ci_rerun_requested_heads: set[tuple[str, str]] = field(default_factory=set)
-    ci_rerun_holds: set[tuple[str, str, str]] = field(default_factory=set)
+    unread_ci_reruns: dict[tuple[str, str, str], int] = field(default_factory=dict)
     worker_trees: dict[str, str] = field(default_factory=dict)
     denied_feedback: str = ""
     on_denied_edit: Callable[[str], None] | None = None
@@ -2766,8 +2766,14 @@ def merge_hold(b: Build, c: workspace.Checkout, verified: verify.Verified, revie
     number = gh.pr_number(c.pr)
     _, hold = gh.merge_readiness(c.github, number, head, c.base, base_sha, wait=gh.MERGE_WAIT_SECONDS,
                                  track_moved_base=track_moved_base)
-    if not hold and (c.github, head, c.pr) in b.ci_rerun_holds:
-        hold = "GitHub has no fully passing CI result for the verified head"
+    if not hold and (workflow := b.unread_ci_reruns.get((c.github, head, c.pr))):
+        try:
+            gh.workflow_run(c.github, head, workflow, pr=c.pr, allow_head_branch=True,
+                            timeout=ci.CONFLICT_SNAPSHOT_TIMEOUT, retry=False)
+        except gh.WorkflowNotForPR:
+            return "GitHub has no fully passing CI result for the verified head"
+        except ci.READ_ERRORS:
+            pass
     if not hold:
         hold = screen_and_merge(b, c, number, head, base_sha, about, track_moved_base=track_moved_base)
     if isinstance(hold, gh.BaseTipChanged) and not has_merge_base(c, head, fetch_merge_base(c)):
@@ -3068,13 +3074,8 @@ def ci_rounds(b: Build, slot: slots.RunSlot, branch: str, pushed: list[workspace
         run.log(slots.FREED_SLOT_FOR_CI)
         with run.waiting("ci"):
             current = ci.Round(n, [watch_checkout_ci(run, c, reruns.for_checkout(c)) for c in watched])
-        if reruns.reruns:
-            reruns.keep_failure_evidence(current)
-            for seen in current.seen:
-                target = seen.target
-                key = target.github, target.sha, target.pr
-                if key in reruns.reruns and (not seen.read or seen.reds):
-                    b.ci_rerun_holds.add(key)
+        reruns.keep_failure_evidence(current)
+        reruns.remember_unread(b, current)
         reds = current.reds
         judged = [r for r in reds if r.kind != "base"]
         for r in judged:
@@ -3140,6 +3141,15 @@ class AutomaticCIReruns:
             before = self.before.get((target.github, target.sha, target.pr))
             if before and not seen.read and not seen.rerun_reds:
                 current.seen[i] = replace(before, read=False, conflicting=seen.conflicting, previous_failure=True)
+
+    def remember_unread(self, b: Build, current: ci.Round) -> None:
+        for seen in current.seen:
+            target = seen.target
+            key = target.github, target.sha, target.pr
+            if seen.read:
+                b.unread_ci_reruns.pop(key, None)
+            elif attempts := self.reruns.get(key):
+                b.unread_ci_reruns[key] = attempts[0].run
 
     def candidate(self, current: ci.Round) -> tuple[str, str, str, int] | None:
         if not current.reds or any(0 in w.red_workflows for w in current.seen):
@@ -3665,11 +3675,16 @@ def apply_ci_verdicts(run: Run, reds: list[ci.Red], res: Result, *, assume_cause
     if not isinstance(checks, list):
         checks = []
     named = [v for v in checks if isinstance(v, dict) and isinstance(v.get("name"), str)]
-    rerun_reasons = ci_rerun_reasons(reds, named) if len(named) == len(checks) else {}
-    verdicts = {name_key(v["name"]): v for v in named}
+    exact = exact_ci_verdicts(reds, named) if len(named) == len(checks) else {}
+    repair = {name_key(v["name"]): v for v in named} if assume_caused else {}
     for i, r in enumerate(reds):
-        r.rerun_reason = rerun_reasons.get(i, "")
-        v = verdicts.get(name_key(r.label)) or verdicts.get(name_key(r.check.name)) or {}
+        rerun_verdict = exact.get(i, {})
+        reason = rerun_verdict.get("reason")
+        if rerun_verdict.get("caused_by_pr") is False and isinstance(reason, str) and reason.strip():
+            r.rerun_reason = ci.clip(reason, MAX_CI_REASON_CHARS)
+        v = rerun_verdict
+        if assume_caused:
+            v = repair.get(name_key(r.label)) or repair.get(name_key(r.check.name)) or {}
         verdict, reason = v.get("caused_by_pr"), v.get("reason")
         if not assume_caused and (type(verdict) is not bool or not isinstance(reason, str) or not reason.strip()):
             continue
@@ -3678,17 +3693,14 @@ def apply_ci_verdicts(run: Run, reds: list[ci.Red], res: Result, *, assume_cause
         run.log(f"ci: {r.label} {'caused' if r.caused else 'not caused'} by the PR: {util.first_line(r.reason, 200)}")
 
 
-def ci_rerun_reasons(reds: list[ci.Red], verdicts: list[dict]) -> dict[int, str]:
+def exact_ci_verdicts(reds: list[ci.Red], verdicts: list[dict]) -> dict[int, dict]:
     exact: dict[str, set[int]] = {}
-    normalized: dict[str, set[int]] = {}
     for i, red in enumerate(reds):
         for name in (red.label, red.check.name):
             exact.setdefault(name, set()).add(i)
-            normalized.setdefault(name_key(name), set()).add(i)
     matched = {}
     for verdict in verdicts:
-        name = verdict["name"]
-        matches = exact.get(name) or normalized.get(name_key(name))
+        matches = exact.get(verdict["name"])
         if not matches:
             continue
         if len(matches) != 1:
@@ -3697,8 +3709,7 @@ def ci_rerun_reasons(reds: list[ci.Red], verdicts: list[dict]) -> dict[int, str]
         if index in matched:
             return {}
         matched[index] = verdict
-    return {index: ci.clip(reason, MAX_CI_REASON_CHARS) for index, verdict in matched.items()
-            if verdict.get("caused_by_pr") is False and isinstance(reason := verdict.get("reason"), str) and reason.strip()}
+    return matched
 
 
 def name_key(name: str) -> str:
