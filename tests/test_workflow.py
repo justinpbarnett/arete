@@ -1,3 +1,5 @@
+import ast
+import http.client
 import json
 import os
 import shlex
@@ -13,11 +15,12 @@ import time
 import tomllib
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
+from contextlib import closing, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import asdict, replace
 from datetime import timedelta
 from io import StringIO
 from pathlib import Path
+from socket import socketpair
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from typing import ClassVar
@@ -25,9 +28,9 @@ from unittest import mock
 
 from adws import single_worker
 from arete import (
-    api_check, ci, codex, config, diffguard, evals, factory, flows, gh, guard, jev, journeys, loop_run, mergecheck,
-    miner, orchestration, outcomes, owner_asks, paths, pipeline, poll, queueing, runlimits, sandbox, serve, slots, tracker,
-    util, verify, workspace,
+    api_check, ci, codex, config, dashboard, diffguard, evals, factory, flows, gh, guard, install, jev, journeys,
+    loop_run, mergecheck, miner, orchestration, outcomes, owner_asks, paths, pipeline, poll, principals, queueing,
+    runlimits, sandbox, serve, serve_guard, slots, tailnet, tracker, util, verify, workspace,
 )
 from arete.agent import NO_SESSION, Result
 from arete.orchestration_api import OPERATIONS
@@ -3066,6 +3069,404 @@ class ServeDeploymentRefusalTests(ServeDeploymentFixture):
         self.ci_state = ("completed", "success")
         self.assertEqual(self.deploy(), other)
         self.assertIn(f"fast forwarded to {other} (second merge)", self.server.say.call_args.args[0])
+
+
+class SelfDeployRollbackTests(unittest.TestCase):
+    class_timeout = 5
+
+    def git(self, *args):
+        return subprocess.check_output(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+                                        "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", *args],
+                                       cwd=self.checkout,
+                                       text=True, timeout=2).strip()
+
+    def prepare_state(self):
+        root = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        self.checkout = root / "checkout"
+        self.state = root / "state"
+        self.github = "fixture/arete"
+        self.ref = "refs/remotes/origin/main"
+        self.previous, self.tip = "1" * 40, "2" * 40
+        self.enterContext(mock.patch.multiple(paths, HOME=root, PACKAGE_DIR=self.checkout / "arete",
+                                             STATE_DIR=self.state, CONFIG_DIR=root / "config",
+                                             CONFIG_FILE=root / "config" / "config.toml",
+                                             LOCKS_DIR=self.state / "locks", DB_FILE=self.state / "arete.db",
+                                             RUNS_DIR=self.state / "runs", LOG_DIR=root / "logs",
+                                             WORKTREES_DIR=root / "worktrees", SERVER_FILE=self.state / "server.json",
+                                             ISOLATED=False))
+        self.server = object.__new__(serve.Server)
+        self.server.deploy_refusals = set()
+        self.server.say = mock.Mock()
+
+    def prepare_checkout(self, candidate):
+        self.prepare_state()
+        self.checkout.mkdir()
+        self.git("init", "-q", "-b", "main")
+        package = self.checkout / "arete"
+        package.mkdir()
+        (package / "__init__.py").write_text("")
+        (package / "cli.py").write_text("def main():\n    print('last good started')\n    return 0\n")
+        self.git("add", "arete")
+        self.git("commit", "-qm", "working entry point")
+        for name, body in candidate.items():
+            file = self.checkout / name
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_text(body)
+        self.git("add", ".")
+        self.git("commit", "-qm", "new code", "--allow-empty")
+        self.tip, self.previous = self.git("log", "-2", "--format=%H").splitlines()
+
+    def receipt(self):
+        return serve_guard.read(self.state / serve_guard.RECEIPT)
+
+    def write_receipt(self, **updates):
+        created_at = updates.pop("created_at", time.time())
+        receipt = serve_guard.Receipt(str(self.checkout), "main", self.previous, self.tip, self.github, created_at,
+                                      **updates)
+        serve_guard.write(self.state / serve_guard.RECEIPT, asdict(receipt))
+
+    def start(self):
+        plist = install.serve_plist()
+        return subprocess.run(plist["ProgramArguments"], cwd=plist["WorkingDirectory"],
+                              env=plist["EnvironmentVariables"], capture_output=True, text=True, timeout=2)
+
+    def test_import_rejection_counts_as_a_failed_start(self):
+        self.prepare_state()
+        self.write_receipt()
+        self.server.code = frozenset({("HEAD", self.previous[:12])})
+        stamp = frozenset({("HEAD", self.tip[:12])})
+        self.server.code_seen = stamp
+        self.server.code_note = ""
+        failure = subprocess.CompletedProcess([], 1, "", "ImportError: broken candidate initializer")
+        attempted_at = time.time()
+
+        def failed_probe(*args, **kwargs):
+            clock.return_value = attempted_at + 60
+            return failure
+
+        with (mock.patch.object(serve, "code_stamp", return_value=stamp),
+              mock.patch.object(serve_guard.time, "time", return_value=attempted_at) as clock,
+              mock.patch.object(util, "sh", side_effect=failed_probe),
+              mock.patch.object(serve_guard, "at_tip", return_value=True),
+              mock.patch.object(self.server, "busy_with", return_value=""),
+              mock.patch.object(self.server, "restart_for_new_code") as restart):
+            self.server.load_new_code()
+        restart.assert_not_called()
+        self.assertIn("broken candidate initializer", self.server.code_note)
+        self.assertEqual((self.receipt()["starts"], self.receipt()["started_at"]), (1, attempted_at))
+        self.assertFalse(serve_guard.hold_path(self.state, self.tip).exists())
+
+    def test_launchd_rolls_back_after_three_failed_starts_and_holds_the_tip(self):
+        token = "ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ"
+        password = "synthetic-password-that-must-stay-local"
+        self.prepare_checkout({"arete/__init__.py": f"raise ImportError('cannot import module token={token} "
+                                                  f"password={password}')\n"})
+        untracked = self.checkout / "arete" / "local.py"
+        untracked.write_text("local = True\n")
+        install.write_serve_guard()
+        self.write_receipt(starts=2)
+        observed = self.receipt()
+        self.assertEqual((observed["previous"], observed["tip"], observed["starts"]),
+                         (self.previous, self.tip, 2))
+
+        self.write_receipt(healthy=True, starts=3, created_at=0)
+        serve_guard.startup(self.state, self.checkout, paths.LOG_DIR)
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.tip)
+        self.assertEqual(self.receipt()["starts"], 3)
+        self.assertFalse(serve_guard.hold_path(self.state, self.tip).exists())
+        serve_guard.write(self.state / serve_guard.RECEIPT, observed)
+
+        log = Path(install.serve_plist()["StandardErrorPath"])
+        log.parent.mkdir(parents=True, exist_ok=True)
+        failed = self.start()
+        self.assertNotEqual(failed.returncode, 0, failed.stdout)
+        self.assertIn("ImportError: cannot import module", failed.stderr)
+        log.write_text(failed.stderr)
+        self.assertEqual(self.receipt()["starts"], 3)
+        restored = self.start()
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        self.assertIn(f"deploy: rolled back to {self.previous} because 3 unhealthy starts", restored.stdout)
+        self.assertIn("last good started", restored.stdout)
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.previous)
+        self.assertEqual(untracked.read_text(), "local = True\n")
+        self.assertEqual(self.receipt()["starts"], 3)
+        self.assertEqual(self.receipt()["rollback"], "code_only")
+        self.assertIsNone(serve_guard.pending(self.state, self.checkout))
+        self.assertEqual(serve.deploy_refusal(self.checkout, "main", self.tip), "held after startup rollback")
+
+        held = serve_guard.read(serve_guard.hold_path(self.state, self.tip))
+        self.assertIn(token, held["log_tail"])
+        with (mock.patch.object(serve.codebase, "checkout_head", return_value=self.previous[:12]),
+              mock.patch.object(gh, "gh", return_value=f"https://github.com/{self.github}/issues/52") as github):
+            serve.report_rollbacks(self.checkout, self.server.say)
+            serve.report_rollbacks(self.checkout, self.server.say)
+        self.assertEqual(serve_guard.read(serve_guard.hold_path(self.state, self.tip))["issue"], 52)
+        github.assert_called_once()
+        self.assertEqual(github.call_args.args[0][:4], ["issue", "create", "--repo", self.github])
+        self.assertEqual(github.call_args.args[0][8:], ["--label", "agent"])
+        body = github.call_args.kwargs["input"]
+        self.assertIn("Redacted serve.log tail", body)
+        self.assertIn("ImportError: cannot import module", body)
+        for private in (token, password, str(self.checkout)):
+            self.assertNotIn(private, body)
+
+    def test_terminal_wrapper_checks_receipt_before_loading_cli_commands(self):
+        source = Path(serve_guard.__file__).parent
+        self.prepare_checkout({f"arete/{name}": (source / name).read_text()
+                               for name in ("cli.py", "local_paths.py", "serve_guard.py")})
+        wrapper = paths.HOME / "arete-cli"
+        wrapper.write_text(f"import sys\nsys.path.insert(0, {str(self.checkout)!r})\n"
+                           "from arete.cli import main\nraise SystemExit(main())\n")
+        self.write_receipt(starts=3, started_at=time.time())
+        restored = subprocess.run([sys.executable, "-I", "-S", str(wrapper), "serve"],
+                                  cwd=self.checkout, env=install.serve_plist()["EnvironmentVariables"],
+                                  capture_output=True, text=True, timeout=2)
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        self.assertIn("last good started", restored.stdout)
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.previous)
+        with (mock.patch.object(serve.codebase, "checkout_head", return_value=self.previous[:12]),
+              mock.patch.object(gh, "issue_create", return_value=52) as ticket):
+            serve.report_rollbacks(self.checkout, self.server.say)
+        self.assertIn(serve_guard.MISSING_TAIL, ticket.call_args.args[2])
+
+    def test_unstarted_deploy_waits_for_chat_before_opening_health_window(self):
+        self.prepare_state()
+        self.write_receipt(created_at=time.time() - 6 * 60)
+        self.server.code = frozenset({("HEAD", self.previous[:12])})
+        stamp = frozenset({("HEAD", self.tip[:12])})
+        self.server.code_seen = stamp
+        self.server.code_note = ""
+        self.server.migration_stamp = None
+        self.server.polls, self.server.jobs = {}, {}
+        self.server.oncall = self.server.sweep = None
+        self.server.lock = self.enterContext(tempfile.TemporaryFile())
+        with (mock.patch.object(serve, "code_stamp", return_value=stamp),
+              mock.patch.object(util, "sh", return_value=subprocess.CompletedProcess([], 0, "", "")) as run,
+              mock.patch.object(serve.chat, "any_busy", return_value=True) as busy,
+              mock.patch.object(serve.capture, "checking", return_value=False),
+              mock.patch.object(serve, "reap_children"),
+              mock.patch.object(serve.os, "environ", serve.os.environ.copy()),
+              mock.patch.object(serve.os, "execv", side_effect=OSError("restart candidate")) as restart):
+            self.server.load_new_code()
+            run.assert_not_called()
+            restart.assert_not_called()
+            self.server.say.assert_called_once_with("new code waits to load: a chat message is still running")
+            self.assertEqual(self.receipt()["starts"], 0)
+            busy.return_value = False
+            with self.assertRaisesRegex(OSError, "restart candidate"):
+                self.server.load_new_code()
+            restart.assert_called_once()
+
+        with mock.patch.object(serve_guard, "at_tip", return_value=True):
+            self.assertFalse(serve_guard.count_start(self.state, self.checkout, paths.LOG_DIR))
+        receipt = serve_guard.pending(self.state, self.checkout)
+        self.assertEqual(receipt.starts, 1)
+        self.assertGreater(receipt.started_at, receipt.created_at + serve_guard.AGE_LIMIT)
+        self.assertFalse(receipt.expired())
+        self.assertFalse(serve_guard.hold_path(self.state, self.tip).exists())
+        with (mock.patch.object(serve_guard.time, "time", return_value=receipt.started_at + serve_guard.AGE_LIMIT),
+              mock.patch.object(serve_guard, "at_tip", return_value=True),
+              mock.patch.object(serve_guard, "rollback", return_value=True) as rollback):
+            self.assertTrue(serve_guard.count_start(self.state, self.checkout, paths.LOG_DIR))
+        rollback.assert_called_once_with(self.state, self.checkout, paths.LOG_DIR, receipt, serve_guard.AGE_FAILURE)
+
+    def test_new_green_commit_deploys_after_config_rejection(self):
+        self.prepare_state()
+        self.write_receipt()
+        self.server.checkout_update = threading.Lock()
+        self.server.code = frozenset({("HEAD", self.previous[:12])})
+        stamp = frozenset({("HEAD", self.tip[:12])})
+        self.server.code_seen = stamp
+        self.server.code_note = ""
+        self.server.started_head = self.previous[:12]
+        good = subprocess.CompletedProcess([], 0, "", "")
+        bad_config = subprocess.CompletedProcess([], 1, "", "invalid candidate config")
+        with (mock.patch.object(serve, "code_stamp", return_value=stamp),
+              mock.patch.object(util, "sh", side_effect=[good, bad_config]),
+              mock.patch.object(self.server, "busy_with", return_value=""),
+              mock.patch.object(serve_guard, "at_tip", return_value=True),
+              mock.patch.object(config, "load_or_problem", return_value=(config.Config(), ""))):
+            self.server.load_new_code()
+        self.assertIn("invalid candidate config", self.server.code_problem)
+        self.server.acknowledge_deploy(True)
+        self.assertEqual(self.receipt()["starts"], 1)
+        self.assertFalse(self.receipt()["healthy"])
+
+        newer = "3" * 40
+        repo = config.Repo("arete", self.checkout, github=self.github)
+        cfg = config.Config(arete_repo=repo.name, repos=[repo])
+        self.checkout.mkdir()
+
+        def git(args, *_args, **_kwargs):
+            return {("rev-parse", "--show-toplevel"): str(self.checkout),
+                    ("rev-parse", "--verify", self.ref): newer,
+                    ("rev-parse", "--verify", "HEAD"): self.tip,
+                    ("branch", "--show-current"): "main",
+                    ("--no-replace-objects", "merge-base", self.tip, newer): self.tip,
+                    ("--no-replace-objects", "show", "-s", "--format=%s", newer): "new candidate"}.get(tuple(args), "")
+
+        with (mock.patch.object(util, "git", side_effect=git),
+              mock.patch.object(serve, "pilot_deploy_refusal", return_value=""),
+              mock.patch.object(util, "deploy_recovery", return_value=SimpleNamespace(head=self.tip)),
+              mock.patch.object(util, "deploy_fast_forward") as fast_forward,
+              mock.patch.object(gh, "default_branch", return_value="main"),
+              mock.patch.object(gh, "deployment_ci_refusal", return_value="") as ci_gate):
+            self.server.deploy_if_ready(cfg)
+        self.assertEqual(ci_gate.call_args.args[1], newer)
+        fast_forward.assert_called_once_with(self.checkout, newer)
+        self.assertEqual((self.receipt()["previous"], self.receipt()["tip"], self.receipt()["starts"]),
+                         (self.previous, newer, 0))
+
+    def test_deploy_requires_a_full_tick_and_dashboard_readiness(self):
+        self.prepare_state()
+        self.server.with_dashboard = False
+        cfg = config.Config()
+        with mock.patch.object(self.server, "deploy") as deploy:
+            self.server.deploy_if_ready(cfg)
+        deploy.assert_called_once_with(cfg)
+        self.write_receipt(starts=1)
+        stamp = frozenset({("HEAD", self.tip[:12])})
+        with (mock.patch.object(serve, "code_stamp", return_value=stamp),
+              mock.patch.object(serve.codebase, "RELEASE", self.previous)):
+            self.server = serve.Server()
+        self.addCleanup(self.server.pool.shutdown)
+        self.assertEqual(self.server.code, stamp)
+        self.write_receipt()
+        self.server.with_dashboard = True
+
+        self.server.contracts_waiting = False
+        self.server.code_problem = ""
+        self.server.every_loop = self.server.live = []
+        self.server.failing, self.server.logged = {}, {}
+        actions = ("reap", "forget_unpolled_errors", "watch_oncall", "zte_when_due", "dispatch", "approvals",
+                   "rotate_when_due", "prune_when_due", "sweep_when_due", "expire_asks", "release_closed_when_due",
+                   "remind")
+        with (mock.patch.multiple(self.server, load=mock.Mock(return_value=True),
+                                  **{action: mock.DEFAULT for action in actions}) as stages,
+              mock.patch.object(db, "ensure_schema"),
+              mock.patch.object(serve.loop_store, "loop_states", return_value={}),
+              mock.patch.object(serve.codebase, "RELEASE", ""),
+              mock.patch.object(serve_guard, "at_tip", return_value=True),
+              mock.patch.object(serve, "dashboard_answers", side_effect=[False, True]) as probe):
+            self.server.acknowledge_deploy(self.server.tick())
+            probe.assert_not_called()
+            self.write_receipt(starts=1)
+            stages["dispatch"].side_effect = RuntimeError("queue failure")
+            self.server.acknowledge_deploy(self.server.tick())
+            self.assertIn("stage:dispatch", self.server.failing)
+            self.assertFalse(self.receipt()["healthy"])
+            probe.assert_not_called()
+            stages["dispatch"].side_effect = None
+            self.server.acknowledge_deploy(self.server.tick())
+            self.assertFalse(self.receipt()["healthy"])
+            healthy_at_deploy = mock.Mock()
+            with mock.patch.multiple(self.server, load_new_code=mock.DEFAULT, reap_inherited=mock.DEFAULT,
+                                     watch_alerts=mock.DEFAULT, beat=mock.DEFAULT,
+                                     deploy_when_due=lambda: healthy_at_deploy(self.receipt()["healthy"])):
+                self.server.run_pass()
+            healthy_at_deploy.assert_called_once_with(True)
+        self.assertTrue(self.receipt()["healthy"])
+
+    def test_pending_deploy_delivers_tick_alert_at_normal_threshold(self):
+        self.prepare_state()
+        self.write_receipt(starts=1, created_at=time.time() - serve_guard.AGE_LIMIT)
+        self.server = serve.Server()
+        self.addCleanup(self.server.pool.shutdown)
+        self.server.cfg = config.Config()
+        self.server.say = mock.Mock()
+        dispatch = mock.Mock(return_value=True, side_effect=RuntimeError("queue failure"))
+        self.server.tick = lambda: self.server.guard("stage:dispatch", dispatch) is True
+        with (mock.patch.object(serve_guard, "at_tip", return_value=True),
+              mock.patch.multiple(self.server, load_new_code=mock.DEFAULT, deploy_when_due=mock.DEFAULT,
+                                  reap_inherited=mock.DEFAULT, beat=mock.DEFAULT,
+                                  busy_with=mock.Mock(return_value="a chat message is still running")),
+              mock.patch.multiple(serve.incident_store, alert_get=mock.DEFAULT, alert_set=mock.DEFAULT,
+                                  alert_clear=mock.DEFAULT) as incidents,
+              mock.patch.object(serve.alerts, "notify") as notify):
+            incidents["alert_get"].return_value = None
+            for _ in range(serve.ALERT_TICKS - 1):
+                self.server.run_pass()
+            self.assertIsNone(self.server.alert_last)
+            self.server.run_pass()
+            self.server.alert_last.result(timeout=1)
+            incidents["alert_set"].assert_called_once_with(serve.ALERT_KEY, None)
+            self.assertIn("stage:dispatch: RuntimeError: queue failure", notify.call_args.args[1])
+            self.server.run_pass()
+            self.server.alert_last.result(timeout=1)
+            notify.assert_called_once()
+            self.assertFalse(self.receipt()["healthy"])
+            incidents["alert_get"].return_value = {"issue": None}
+            dispatch.side_effect = None
+            self.server.run_pass()
+            self.server.alert_last.result(timeout=1)
+            incidents["alert_clear"].assert_called_once_with(serve.ALERT_KEY)
+
+    def test_rollback_leaves_contract_and_expansion_in_the_database(self):
+        self.prepare_checkout({})
+        self.write_receipt(starts=3)
+        with redirect_stdout(StringIO()):
+            with mock.patch.object(db.migrations, "load", return_value=db._CHAIN[:9]):
+                self.assertFalse(db.migrate())
+            with mock.patch.object(db.migrations, "load", return_value=db._CHAIN[:11]):
+                self.assertFalse(db.migrate())
+            with closing(db.connect_db(paths.DB_FILE)) as conn:
+                applied = conn.execute("SELECT phase FROM schema_migrations WHERE n >= 10 ORDER BY n").fetchall()
+                self.assertEqual(applied, [("contract",), ("expand",)])
+            contents = paths.DB_FILE.read_bytes()
+            self.assertTrue(serve_guard.count_start(self.state, self.checkout, paths.LOG_DIR))
+        self.assertEqual(paths.DB_FILE.read_bytes(), contents)
+        self.assertEqual(self.receipt()["rollback"], "code_only")
+        self.assertEqual(list((self.state / serve_guard.HOLDS).iterdir()),
+                         [serve_guard.hold_path(self.state, self.tip)])
+
+    def test_dashboard_readiness_preserves_normal_access_checks(self):
+        self.prepare_state()
+        address = "127.0.0.1"
+        node = tailnet.Node((address,), frozenset({address}), address)
+        logins = tailnet.Logins(SimpleNamespace(whois=lambda _: "visitor@example.test"))
+        server = SimpleNamespace(node=node, logins=logins, inside_serve=True)
+
+        def connect(conn):
+            browser, app = socketpair()
+            browser.settimeout(conn.timeout)
+
+            def handle():
+                with app:
+                    dashboard.Handler(app, (address, 0), server)
+
+            worker = threading.Thread(target=handle, daemon=True)
+            worker.start()
+            conn.sock = browser
+            self.addCleanup(worker.join, 1)
+
+        def get(path, headers):
+            with closing(http.client.HTTPConnection(address, 1234, timeout=1)) as conn:
+                conn.request("GET", path, headers=headers)
+                with conn.getresponse() as response:
+                    response.read()
+                    return response.status
+
+        tailnet.record_server(node, 1234, tailnet.Front("http", []))
+        with (mock.patch.object(http.client.HTTPConnection, "connect", connect),
+              mock.patch.object(principals, "for_login", return_value=None) as for_login,
+              mock.patch.object(dashboard.api, "meta", return_value={"schema": {"version": db.LATEST}}) as meta):
+            self.assertTrue(serve.dashboard_answers())
+            for_login.assert_not_called()
+            self.assertEqual(get(dashboard.READY_PATH, {}), 403)
+            self.assertEqual(get("/api/meta", {dashboard.READY_HEADER: dashboard.READY_TOKEN}), 403)
+            meta.assert_called_once()
+            meta.return_value = {"schema": {"version": db.NEEDED - 1}}
+            self.assertFalse(serve.dashboard_answers())
+
+    def test_guard_imports_only_standard_library(self):
+        tree = ast.parse(Path(serve_guard.__file__).read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                self.assertTrue(all(alias.name.split(".")[0] in sys.stdlib_module_names for alias in node.names))
+            elif isinstance(node, ast.ImportFrom):
+                self.assertEqual(node.level, 0)
+                self.assertIn(node.module.split(".")[0], sys.stdlib_module_names)
 
 
 class ServeDeploymentMergeTests(ServeDeploymentFixture):
