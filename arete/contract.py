@@ -9,7 +9,7 @@ from functools import cache
 
 from . import refusals
 
-MINOR = 0
+MINOR = 1
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -166,9 +166,12 @@ FEED_LINE = obj({"id": INTEGER, "run_id": STRING, "ts": STRING, "kind": STRING, 
 ERROR = obj({"code": STRING, "status": INTEGER, "description": STRING, "schema": mapping(JSON), "example": mapping(JSON)})
 OPERATION = obj({"name": STRING, "method": STRING, "path": STRING, "input": mapping(JSON),
                  "result": mapping(JSON), "errors": array(STRING),
-                 "example": obj({"input": mapping(JSON), "result": mapping(JSON)})})
+                 "example": obj({"input": mapping(JSON), "result": mapping(JSON)}),
+                 "deprecated": BOOLEAN, "sunset": STRING},
+                ["name", "method", "path", "input", "result", "errors", "example"])
 ALIAS = obj({"method": STRING, "path": STRING, "provider": STRING, "adapter": STRING, "input": mapping(JSON),
-             "actions": mapping(mapping(JSON)), "transport": BOOLEAN}, ["method", "path", "provider", "adapter", "input"])
+             "actions": mapping(mapping(JSON)), "transport": BOOLEAN, "deprecated": BOOLEAN, "sunset": STRING},
+            ["method", "path", "provider", "adapter", "input"])
 OPERATIONS = [operation("meta.get", "meta", META),
               operation("contract.get", "contract", envelope({"operations": array(OPERATION),
                         "errors": array(ERROR), "aliases": array(ALIAS), "contract_sha": STRING})),
@@ -213,7 +216,9 @@ BY_NAME["usage.record"]["input"]["properties"].update(
     ms={"type": "integer", "minimum": 0, "maximum": 86400000})
 BY_NAME["meta.get"]["example"]["result"].update(
     api={"version": VERSION, "minor": MINOR, "contract_sha": "0" * 64},
-    server={"engine_sha": "example-engine"}, oldest_client=OLDEST_CLIENT)
+    server={"engine_sha": "code.7b1170924da4"}, oldest_client=OLDEST_CLIENT,
+    instance={"id": "a1b2c3d4", "tag": "demo", "name": "Demo", "created": "2026-01-01T00:00:00Z"},
+    stream={"complete": True, "head": "0.1", "trim": {}})
 ALIASES = []
 USES = Counter()
 USE_LOCK = threading.Lock()
@@ -428,6 +433,33 @@ ALIASES[:0] = [{"method": method, "path": path, "provider": provider, "adapter":
     ("GET", "/api/runs/*/events", "send_events"),
     ("GET", "/api/events", "event_stream.serve"),
 )]
+
+
+def complete_examples():
+    instances = {"task": "t-a1b2", "project": "replay-sample", "line": "replay-sample", "view": "live",
+                 "run": "pip-demo-1", "step": "1", "loop": "poll", "incident": "1",
+                 "triage": "demo#7", "research": "demo#7", "chat": "1"}
+    for name, identity in instances.items():
+        get = BY_NAME[f"{name}.get"]["example"]
+        get["input"]["id"] = identity
+        row = get["result"][name]
+        row["id"] = int(identity) if name == "step" else identity
+        BY_NAME[f"{name}.list"]["example"]["result"][PLURALS[name]] = [row.copy()]
+    for name in ("step.get", "step.list", "line_stream.read"):
+        BY_NAME[name]["example"]["input"]["run"] = instances["run"]
+    BY_NAME["step.get"]["example"]["result"]["step"].update(run_id=instances["run"], name="plan")
+    BY_NAME["run.diff"]["example"]["input"]["id"] = instances["run"]
+    BY_NAME["run.diff"]["example"]["result"]["diff"] = "--- a/notes.txt\n+++ b/notes.txt\n@@ -1 +1,2 @@\n Notes\n+kumquat\n"
+    BY_NAME["task.history"]["example"]["input"]["id"] = instances["task"]
+    BY_NAME["line_stream.read"]["example"]["result"].update(after=1, lines=[{
+        "id": 1, "run_id": instances["run"], "ts": "2026-01-01T00:00:00Z", "kind": "plan", "text": "Add kumquat"}])
+    BY_NAME["batch.run"]["example"]["result"]["results"] = [BY_NAME["meta.get"]["example"]["result"]]
+    BY_NAME["error.list"]["example"]["result"]["errors"] = ERRORS[:1]
+    BY_NAME["contract.get"]["example"]["result"].update(
+        operations=[BY_NAME["meta.get"]], errors=ERRORS[:1], aliases=ALIASES[:1], contract_sha="0" * 64)
+
+
+complete_examples()
 
 
 def alias_match(method, path):

@@ -10,6 +10,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from http.client import RemoteDisconnected
 from pathlib import Path
@@ -139,18 +140,24 @@ class Client:
             self._me = self.get("/rest/api/3/myself") or {}
         return self._me
 
-    def search(self, jql: str, fields: list[str], limit: int = 50) -> list[dict]:
+    def search(self, jql: str, fields: list[str], limit: int = 50, *,
+               include: Callable[[dict], bool] | None = None) -> list[dict]:
         out: list[dict] = []
         token = ""
+        seen = set()
         while len(out) < limit:
-            params = {"jql": jql, "fields": ",".join(fields), "maxResults": min(100, limit - len(out))}
+            page_size = min(100, limit - len(out)) if include is None else 100
+            params = {"jql": jql, "fields": ",".join(fields), "maxResults": page_size}
             if token:
                 params["nextPageToken"] = token
             res = self.get("/rest/api/3/search/jql", **params) or {}
-            out += [_read_description(issue) for issue in res.get("issues", [])]
+            out.extend(_read_description(issue) for issue in res.get("issues", []) if include is None or include(issue))
             token = res.get("nextPageToken", "")
-            if not token or res.get("isLast", True):
+            if not token or res.get("isLast"):
                 break
+            if token in seen:
+                raise JiraError("Jira search repeated a page token")
+            seen.add(token)
         return out[:limit]
 
     def issue(self, key: str, fields: list[str]) -> dict:

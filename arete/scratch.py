@@ -1004,7 +1004,7 @@ def holders(data: dict) -> list[dict]:
     why = {p.identity: IN_GROUP for p in current.values() if p.group in groups}
     held = [{"pid": g, "name": "unknown", "reason": IN_GROUP} for g in groups
             if not any(p.group == g for p in current.values())]
-    unrelated, table = {-1, *data["before"]}, launchd.Table(os.getuid())
+    unrelated, table = {-1, *data["before"]}, launchd.Table(os.getuid(), by_pid)
     while True:
         while descendants := {i for i, p in current.items() if p.parent in unrelated} - unrelated:
             unrelated.update(descendants)

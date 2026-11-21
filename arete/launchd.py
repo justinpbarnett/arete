@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import ctypes
 import os
 import plistlib
 import re
 import subprocess
+from collections.abc import Iterable
 from dataclasses import dataclass
+from functools import cached_property
 
 LAUNCHCTL = "/bin/launchctl"
 MAX_PID_DOMAINS = 256
+MISSING_DOMAIN = 112
+MISSING_SERVICE = 113
 
 
 class Unreadable(Exception):
@@ -22,13 +27,19 @@ class Job:
     pid: int
 
 
-def printed(target: str) -> str | None:
+def printed(target: str, *, strict: bool = False) -> str | None:
     try:
         done = subprocess.run([LAUNCHCTL, "print", target], check=False, capture_output=True, text=True, errors="replace",
                               timeout=10)
     except (OSError, subprocess.SubprocessError):
+        if strict:
+            raise
         return None
-    return done.stdout if done.returncode == 0 else None
+    if done.returncode == 0:
+        return done.stdout
+    if strict and done.returncode not in (MISSING_DOMAIN, MISSING_SERVICE):
+        done.check_returncode()
+    return None
 
 
 def block(text: str, name: str) -> list[str] | None:
@@ -128,14 +139,37 @@ def bundled(executable: str) -> bool:
 
 
 class Table:
-    def __init__(self, uid: int):
+    def __init__(self, uid: int, pids: Iterable[int] = ()):
         self.uid = uid
+        self.pids = tuple(pids)
         self.prints: dict[str, str | None] = {}
+        self.failed_prints: set[str] = set()
 
     def text(self, target: str) -> str | None:
         if target not in self.prints:
-            self.prints[target] = printed(target)
+            if len(self.prints) >= MAX_PID_DOMAINS:
+                raise Unreadable("too many launchctl prints")
+            try:
+                self.prints[target] = printed(target, strict=True)
+            except (OSError, subprocess.SubprocessError):
+                self.prints[target] = None
+                self.failed_prints.add(target)
         return self.prints[target]
+
+    @cached_property
+    def responsible_pids(self) -> dict[int, int]:
+        try:
+            responsible = ctypes.CDLL(None).responsibility_get_pid_responsible_for_pid
+        except (AttributeError, OSError):
+            return {}
+        responsible.argtypes = (ctypes.c_int,)
+        responsible.restype = ctypes.c_int
+        owners = {}
+        for pid in self.pids:
+            owner = responsible(pid)
+            if owner is not None and owner > 0:
+                owners[pid] = owner
+        return owners
 
     def job(self, pid: int, bundled: bool = False) -> Job | None:
         domains, unreadable, texts = [], False, []
@@ -146,17 +180,40 @@ class Table:
             else:
                 texts.append(text)
                 domains.append(domain)
+        extra = {}
         if bundled:
-            extra = list(dict.fromkeys(name for text in texts for name in pid_domains(text)))
-            if len(extra) > MAX_PID_DOMAINS:
-                raise Unreadable("too many pid domains")
+            extra = dict.fromkeys(name for text in texts for name in pid_domains(text))
             for name in extra:
                 text = self.text(name)
                 if text is not None and running(text) is not None:
                     texts.append(text)
                     domains.append(name)
+                elif text is not None or name in self.failed_prints:
+                    unreadable = True
         found = [(domain, label) for domain, text in zip(domains, texts)
                  for label in (running(text) or {}).get(pid, [])]
+        if bundled and not found and pid in self.pids:
+            owners = self.responsible_pids
+            responsible = owners.get(pid)
+            if responsible is None:
+                raise Unreadable("responsible pid unavailable")
+            for other in self.pids:
+                domain = f"pid/{other}"
+                if domain in extra:
+                    continue
+                owner = owners.get(other)
+                if owner is None:
+                    unreadable = True
+                elif owner == responsible:
+                    text = self.text(domain)
+                    if text is not None:
+                        services = running(text)
+                        if services is None:
+                            unreadable = True
+                        else:
+                            found.extend((domain, label) for label in services.get(pid, []))
+                    elif domain in self.failed_prints:
+                        unreadable = True
         if len(found) > 1:
             raise Unreadable("pid listed under more than one service")
         if not found:
