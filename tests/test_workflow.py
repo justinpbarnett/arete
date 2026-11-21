@@ -65,8 +65,8 @@ class PublicationFixture(unittest.TestCase):
     def git(self, *args):
         return util.git(list(args), self.root).strip()
 
-    def commit(self, subject):
-        self.git("add", "--", "file.txt")
+    def commit(self, subject, *files):
+        self.git("add", "--", *(files or ("file.txt",)))
         self.git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.com",
                  "-c", "commit.gpgSign=false", "commit", "-qm", subject)
 
@@ -77,7 +77,7 @@ class PublicationFixture(unittest.TestCase):
         self.checkout.pr = "https://github.com/fixture/repo/pull/7"
         self.controller.data["publication"] = {"heads": {self.checkout.github: self.checkout.lease}}
 
-    def publication_job(self, repo, branch, *, verified, carried=False, continues=""):
+    def publication_job(self, repo, branch, *, verified, carried=False, continues="", stamp=True):
         c, controller, b = self.checkout, self.controller, self.build
         run = controller.run
         run.configure_mock(dir=self.root, tid="7", repairs="", feedback=[], feedback_prs=[], facts={}, story=[],
@@ -96,8 +96,9 @@ class PublicationFixture(unittest.TestCase):
         controller.catalog = mock.Mock(context={})
         del controller.atomic, controller.current
         controller.executing = "prior-action"
-        controller.stamp("checks", {"full": True})
-        controller.stamp("review", job.review.asdict())
+        if stamp:
+            controller.stamp("checks", {"full": True})
+            controller.stamp("review", job.review.asdict())
         return job
 
 
@@ -367,21 +368,20 @@ class PendingBaseMergePublicationTests(PublicationFixture):
         self.assertEqual(self.git("show", "HEAD:file.txt"), "implementation")
 
 
-class CatchUpRepairTests(PublicationFixture):
+class CatchUpRepairFixture(PublicationFixture):
     def prepare_publication(self, gate, *, spent=False):
         c, b, controller = self.checkout, self.build, self.controller
         branch = "arete/7-edit-fixture"
         self.git("branch", branch)
         incoming = self.root / "incoming.txt"
         incoming.write_text("new base\n")
-        self.git("add", "incoming.txt")
-        self.commit("base moved")
+        self.commit("base moved", "incoming.txt")
         self.base = self.git("rev-parse", "HEAD")
         self.git("switch", "-q", branch)
         self.file.write_text("implementation\n")
         repo = config.Repo("fixture", self.root, github=c.github, parts=[config.Part("", c.github)])
         b.layer.trust_level, b.layer.verify, b.layer.checks = "automerge", config.Verify(), {"local": "check"}
-        job = self.publication_job(repo, branch, verified=verify.Verified("pass"))
+        job = self.publication_job(repo, branch, verified=verify.Verified("pass"), stamp=False)
         state = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
         self.enterContext(mock.patch.multiple(paths, STATE_DIR=state, DB_FILE=state / "arete.db",
                                              RUNS_DIR=state / "runs", LOCKS_DIR=state / "locks",
@@ -416,21 +416,21 @@ class CatchUpRepairTests(PublicationFixture):
         def check(*_, **__):
             return (False, self.message) if gate == "checks" and holds() else (True, "local checks passed")
 
-        def verification(*_):
+        def verification(*_, trees=None):
             failed = gate == "verify" and holds()
             summary = self.message if failed else "verified with the new base" if incoming.exists() else "pre-catch-up verification"
             return verify.Verified("fail" if failed else "pass", summary, checks=[
                 {"what": "fixture behavior", "how": "read fixture", "saw": summary, "passed": not failed}],
-                native_trees=pipeline.verification_trees(b))
+                native_trees=pipeline.verification_trees(b) if trees is None else trees)
 
-        def review(*_, **__):
+        def review(*_, trees=None, **__):
             if gate == "review" and holds():
                 result = {"verdict": "request_changes", "summary": "catch-up review holds", "problems": [
                     {"file": "file.txt", "severity": "blocker", "category": "issue", "problem": self.message}]}
             else:
                 result = {"verdict": "approve", "summary": "approved on the new base" if incoming.exists()
                           else "pre-catch-up review"}
-            return Review.stored({**result, "trees": pipeline.verification_trees(b)})
+            return Review.stored({**result, "trees": pipeline.verification_trees(b) if trees is None else trees})
 
         def git(args, cwd, **kw):
             if args[0] != "push":
@@ -451,6 +451,8 @@ class CatchUpRepairTests(PublicationFixture):
         def create_pr(*args, link, **_):
             url = "https://github.com/fixture/repo/pull/7"
             edit_body(url, args[4] + "\n\n## Owner note\n\nKeep this.", link=link)
+            self.assertIn("**approve**: pre-catch-up review", self.body)
+            self.assertIn("**pass**: pre-catch-up verification", self.body)
             return url
 
         def merge(_repo, _number, head, _base, base_sha, **_):
@@ -487,7 +489,16 @@ class CatchUpRepairTests(PublicationFixture):
         }
         for module, replacements in patches.items():
             self.enterContext(mock.patch.multiple(module, **replacements))
-        self.gates()
+        trees = pipeline.verification_trees(b)
+        job.verified = verification(trees=trees)
+        job.review = review(trees=trees)
+        b.report = "local checks passed"
+        b.checked = {"tree": trees[c.prefix], "commands": b.layer.checks, "report": b.report}
+        with mock.patch.object(controller, "fingerprint", return_value=ledger.digest({c.github: trees[c.prefix]})):
+            controller.stamp("checks", {"full": True, "checked": b.checked, "report": b.report})
+            controller.stamp("verify", asdict(job.verified))
+            controller.stamp("review", job.review.asdict())
+        controller.persist()
 
     def action_result(self, op, **args):
         controller = self.controller
@@ -581,15 +592,23 @@ class CatchUpRepairTests(PublicationFixture):
             outcomes.sync_outcomes(config.Config())
         self.assertEqual(pipeline.run_store.run_get(controller.run.id)["status"], "merged")
 
+
+class CatchUpReviewRepairTests(CatchUpRepairFixture):
     def test_review_hold_repairs_and_automerge_closes_ticket(self):
         self.repair_and_publish("review", "review_repair")
 
+
+class CatchUpVerifyRepairTests(CatchUpRepairFixture):
     def test_verify_hold_repairs_and_automerge_closes_ticket(self):
         self.repair_and_publish("verify", "check_repair")
 
+
+class CatchUpLimitTests(CatchUpRepairFixture):
     def test_repair_keeps_the_per_run_catch_up_limit(self):
         self.repair_and_publish("review", "review_repair", last_catch_up=True)
 
+
+class CatchUpParkingTests(CatchUpRepairFixture):
     def test_checks_hold_with_no_repair_cycles_parks_and_drafts(self):
         self.prepare_publication("checks", spent=True)
         self.publish_held("checks")
