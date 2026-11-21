@@ -241,6 +241,7 @@ def claim_environment_budget_resets(repo: str, issue: str, run_id: str,
 
 def run_lock(kind: str, repo: str | None = None, issue: int | str | None = None) -> str:
     return {"pipeline": f"run-{repo}-{issue}", "slot": f"slot-{repo}-{issue}", "slot-wait": f"slot-wait-{repo}-{issue}",
+            "merge-wait": f"merge-wait-{repo}-{issue}",
             "eval": f"eval-{repo}", "experiment": f"experiment-{repo}", "eval-mine": "eval-mine", "miner": "mine"}[kind]
 
 
