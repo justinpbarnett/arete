@@ -4,7 +4,7 @@ import os
 import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager, ExitStack, nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TextIO
 from urllib.parse import quote
 
@@ -68,29 +68,23 @@ class RunSlot:
     tid: str
     max_parallel: int
     held: TextIO | None = None
-    _merge_only: bool = field(default=False, init=False)
 
     def hold(self) -> None:
         self.held = hold(self.repo, self.tid)
 
     def take(self, log: Callable[[str], None],
-             waits: Callable[[str], AbstractContextManager] = lambda cause: nullcontext(), what: str = "ci",
-             *, merge_priority: bool = False) -> None:
-        if self.held and (merge_priority or not self._merge_only):
+             waits: Callable[[str], AbstractContextManager] = lambda cause: nullcontext(), what: str = "ci") -> None:
+        if self.held:
             return
         waiting = False
         with ExitStack() as stack:
             while True:
                 with admitting():
-                    self.free()
                     self.max_parallel = live_max_parallel(self.max_parallel)
-                    if not zte_store.activation_pending():
-                        at_capacity = len(runs_in_slots()) >= self.max_parallel
-                        if merge_priority or not at_capacity:
-                            self.hold()
-                            self._merge_only = at_capacity
-                            log(f"{what}: took a run slot back" + (" after waiting for one" if waiting else ""))
-                            return
+                    if not zte_store.activation_pending() and len(runs_in_slots()) < self.max_parallel:
+                        self.hold()
+                        log(f"{what}: took a run slot back" + (" after waiting for one" if waiting else ""))
+                        return
                     if not waiting:
                         waiting = True
                         stack.enter_context(util.hold_lock(run_store.run_lock("slot-wait", self.repo, self.tid)))
@@ -102,7 +96,6 @@ class RunSlot:
         if self.held:
             self.held.close()
             self.held = None
-        self._merge_only = False
 
 
 def no_free_slot(max_parallel: int) -> str:
@@ -128,7 +121,7 @@ def hold(repo: str, tid: str | None):
     return util.hold_lock(run_store.run_lock("slot", repo, tid))
 
 
-def take_merge_lease(run, github: str, *, slot: RunSlot | None = None, merge_priority: bool = False) -> TextIO:
+def take_merge_lease(run, github: str, *, slot: RunSlot | None = None) -> TextIO:
     lease = util.lock_file(f"automerge-{quote(github.casefold(), safe='')}")
     try:
         with ExitStack() as stack:
@@ -144,7 +137,7 @@ def take_merge_lease(run, github: str, *, slot: RunSlot | None = None, merge_pri
                 run.log(f"automerge: waiting for the merge lease for {github}, ahead of new runs")
                 util.take_lock(lease, wait=True)
             if resume is not None:
-                resume.take(run.log, run.waiting, "automerge", merge_priority=merge_priority)
+                resume.take(run.log, run.waiting, "automerge")
         return lease
     except BaseException:
         lease.close()

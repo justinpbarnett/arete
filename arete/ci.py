@@ -141,11 +141,6 @@ class Round:
     def passed(self) -> bool:
         return self.all_read and not self.reds
 
-    @property
-    def green(self) -> bool:
-        return self.all_read and bool(self.seen) and all(
-            w.checks and all(check.state == "pass" for check in w.checks.values()) for w in self.seen)
-
     def summary(self) -> str:
         checks = [c for w in self.seen for c in w.checks.values()]
         ran = [c for c in checks if c.state != "skipped"]

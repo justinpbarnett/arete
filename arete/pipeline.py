@@ -2558,7 +2558,7 @@ def automerge(b: Build, approval: dict | None, draft_why: str, verified: verify.
                     verified, review = catch_up_base(b, c, branch, base_sha, goal, plan, review)
                     note_review(run, review, verified)
                     publish_gate_evidence(run, b.ticket, c, verified, review)
-                    current = watch_publication_ci(run, slot, [c], merge_priority=True)
+                    current = watch_publication_ci(run, slot, [c])
                     ci_result = current.summary()
                     comment_catch_up_ci(run, c, ci.section([current], current.n), verified, review)
                 except CatchUpPushUnconfirmed:
@@ -2751,7 +2751,7 @@ def merge_hold(b: Build, c: workspace.Checkout, verified: verify.Verified, revie
         return hold
     if not jev.ready(b.cfg, [b.run.repo]):
         return "JEV risk screening is unavailable"
-    base_sha = fetch_merge_base(c) if track_moved_base else git(["rev-parse", c.origin_base], c.wt).strip()
+    base_sha = fetch_merge_base(c)
     if not has_merge_base(c, head, base_sha):
         hold = "the checked head does not contain the target base"
         return gh.MovedBaseHold(hold) if track_moved_base else hold
@@ -3106,20 +3106,17 @@ def ci_target(c: workspace.Checkout) -> ci.Target:
 
 
 def watch_publication_ci(run: Run, slot: slots.RunSlot, pushed: list[workspace.Checkout], *,
-                         reruns: dict[str, list[gh.WorkflowRerun]] | None = None, merge_priority: bool = False) -> ci.Round:
+                         reruns: dict[str, list[gh.WorkflowRerun]] | None = None) -> ci.Round:
     def watch(checkout):
         options = {} if reruns is None else {"reruns": reruns.get(checkout.github, ())}
         return ci.compare_with_base(ci.watch(ci_target(checkout), run.log, **options), run.log)
 
     slot.free()
-    resume_for_merge = False
     try:
         with run.waiting("ci"):
-            current = ci.Round(1 if reruns is None else 2, [watch(c) for c in pushed])
-        resume_for_merge = merge_priority and current.green
-        return current
+            return ci.Round(1 if reruns is None else 2, [watch(c) for c in pushed])
     finally:
-        slot.take(run.log, run.waiting, merge_priority=resume_for_merge)
+        slot.take(run.log, run.waiting)
 
 
 def unmerged_paths(wt: Path) -> list[str]:

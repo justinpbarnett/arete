@@ -2019,31 +2019,22 @@ class MovedBasePublicationFixture:
 
 
 class AutomergeLeaseTests(MovedBasePublicationFixture, unittest.TestCase):
-    @staticmethod
-    def state_paths(state):
-        return mock.patch.multiple(paths, STATE_DIR=state, DB_FILE=state / "arete.db",
-                                   RUNS_DIR=state / "runs", LOCKS_DIR=state / "locks",
-                                   WORKTREES_DIR=state / "worktrees", LOG_DIR=state / "logs")
-
-    @classmethod
-    def setUpClass(cls):
-        with TemporaryDirectory(ignore_cleanup_errors=True) as tmp, cls.state_paths(Path(tmp)):
-            db.migrate()
-            cls.database = paths.DB_FILE.read_bytes()
-
     def setUp(self):
         self.state = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
-        self.enterContext(self.state_paths(self.state))
-        paths.ensure_dirs()
-        paths.DB_FILE.write_bytes(self.database)
-        self.enterContext(mock.patch.object(paths, "ensure_dirs"))
+        locks = self.state / "locks"
+        locks.mkdir()
+        self.enterContext(mock.patch.multiple(paths, LOCKS_DIR=locks, ensure_dirs=mock.DEFAULT))
+        self.running = []
+        self.enterContext(mock.patch.object(slots.run_store, "runs_marked_running", return_value=self.running))
+        self.enterContext(mock.patch.object(slots.chats_store, "chat_sessions", return_value=[]))
         self.enterContext(mock.patch.object(slots.zte_store, "activation_pending", return_value=False))
         self.enterContext(mock.patch.object(slots, "live_max_parallel", return_value=2))
-        self.sleep = mock.Mock(side_effect=AssertionError("a lease holder waited for a run slot"))
+        self.sleep = mock.Mock(side_effect=AssertionError("unexpected wait for a run slot"))
         self.enterContext(mock.patch.object(slots, "time", SimpleNamespace(sleep=self.sleep)))
 
     def running_slot(self, tid):
-        run_id = pipeline.record.start("pipeline", repo="repo", issue=tid)
+        run_id = f"run-{tid}"
+        self.running.append({"id": run_id, "kind": "pipeline", "repo": "repo", "issue": tid})
         slot = slots.RunSlot("repo", tid, 2)
         slot.hold()
         self.addCleanup(slot.free)
@@ -2068,21 +2059,31 @@ class AutomergeLeaseTests(MovedBasePublicationFixture, unittest.TestCase):
     def test_fixed_waiter_catches_up_after_refreshing_a_stale_base(self):
         self.waiter_catches_up(fixed=True)
 
-    def test_pending_ci_waits_for_capacity_before_reading_the_moved_base(self):
+    def test_timed_out_ci_waits_for_capacity_before_reading_the_moved_base(self):
         self.waiter_catches_up(fixed=False, ci_after_base_move="pending")
 
-    def test_green_ci_reads_the_moved_base_then_waits_for_capacity_to_catch_up(self):
+    def test_green_ci_waits_for_capacity_before_reading_the_moved_base(self):
         self.waiter_catches_up(fixed=False, ci_after_base_move="pass")
 
-    def test_green_waiter_merges_an_unchanged_base_at_capacity(self):
+    def test_green_waiter_refreshes_an_unchanged_base_after_a_slot_frees(self):
         first, a = self.ready_run("1")
         second, b = self.ready_run("2")
         _, other_slot = self.running_slot("3")
         other_slot.free()
         first.take_merge_lease(a)
         waiting = threading.Event()
+        capacity_wait = threading.Event()
+        allow_resume = threading.Event()
         second.run.log.side_effect = lambda line: waiting.set() if "waiting for the merge lease" in line else None
         local_base = "stale-base"
+
+        def wait_for_capacity(_seconds):
+            self.assertTrue(util.lock_is_held("automerge-fixture%2Frepo"))
+            self.assertIsNone(second.job.slot.held)
+            capacity_wait.set()
+            self.assertTrue(allow_resume.wait(1.5))
+
+        self.sleep.side_effect = wait_for_capacity
 
         def fetch(src, branch):
             nonlocal local_base
@@ -2092,7 +2093,7 @@ class AutomergeLeaseTests(MovedBasePublicationFixture, unittest.TestCase):
         def merge(_build, checkout, _number, head, base, _about, **_):
             self.assertEqual((checkout, head, base), (b, b.lease, "current-base"))
             self.assertTrue(util.lock_is_held("automerge-fixture%2Frepo"))
-            self.assertTrue(first.job.slot.held and other_slot.held)
+            self.assertTrue(first.job.slot.held and second.job.slot.held)
             return ""
 
         def watch(target, _log):
@@ -2100,6 +2101,8 @@ class AutomergeLeaseTests(MovedBasePublicationFixture, unittest.TestCase):
             return ci.Watched(target, {check.key: check})
 
         with (mock.patch.object(ci, "watch", side_effect=watch),
+              mock.patch.object(orchestration.pilot, "is_pilot_task", return_value=True),
+              mock.patch.object(second, "check_pilot_publication"),
               mock.patch.object(pipeline, "publish_ci"),
               mock.patch.object(pipeline, "merge_evidence_hold", return_value=""),
               mock.patch.object(pipeline, "git", side_effect=lambda *_: local_base),
@@ -2118,16 +2121,22 @@ class AutomergeLeaseTests(MovedBasePublicationFixture, unittest.TestCase):
                 other_slot.take(mock.Mock())
                 self.assertEqual(len(slots.runs_in_slots()), 2)
                 fetch_base.assert_not_called()
+                first.release_merge_lease()
+                self.assertTrue(capacity_wait.wait(1.5))
+                fetch_base.assert_not_called()
+                merge_head.assert_not_called()
+                other_slot.free()
             finally:
                 first.release_merge_lease()
+                allow_resume.set()
             self.assertEqual(result.result(timeout=1.5)["ending"], "pr")
             fetch_base.assert_called_once()
             merge_head.assert_called_once()
             catch_up.assert_not_called()
         self.assertIsNone(second.merge_lease)
-        self.sleep.assert_not_called()
+        self.sleep.assert_called_once()
 
-    def test_fixed_and_classic_draft_failed_catch_up_only_for_the_watched_head(self):
+    def test_classic_drafts_failed_catch_up_only_for_the_watched_head(self):
         controller, checkout = self.controller()
         job, run = controller.job, controller.run
         job.b.checkouts = [checkout]
@@ -2180,6 +2189,53 @@ class AutomergeLeaseTests(MovedBasePublicationFixture, unittest.TestCase):
                     draft.assert_called_once_with(checkout.pr, True)
                 else:
                     draft.assert_not_called()
+
+    def test_orchestrated_catch_up_ci_leaves_a_replacement_head_ready(self):
+        for result in ("fail", "unread"):
+            with self.subTest(ci=result):
+                controller, checkout = self.ready_run("7")
+                self.addCleanup(controller.close)
+                pr = {"head": checkout.lease, "draft": False}
+
+                def catch_up(*_, before_push):
+                    evidence = verify.Verified("pass"), Review("approve")
+                    before_push("caught-up", *evidence)
+                    checkout.note_pushed_head("caught-up")
+                    pr["head"] = checkout.lease
+                    return evidence
+
+                def watch(target, _log):
+                    self.assertEqual(target.sha, pr["head"])
+                    self.assertEqual(target.sha, "caught-up")
+                    pr["head"] = "maintainer-head"
+                    check = gh.Check("checks", "fail")
+                    return ci.Watched(target, {check.key: check} if result == "fail" else {}, read=result == "fail")
+
+                def draft_pr(_, draft):
+                    pr["draft"] = draft
+
+                refs = {"state": "OPEN", "isDraft": False, "headRefOid": checkout.lease, "baseRefName": "main"}
+                controller.ci_failures = mock.Mock(return_value="CI needs diagnosis")
+                with (mock.patch.object(pipeline, "merge_hold", return_value=gh.MovedBaseHold("base moved")) as merge,
+                      mock.patch.object(gh, "pr_merge_details", return_value=refs),
+                      mock.patch.object(pipeline, "fetch_merge_base", return_value="new-base"),
+                      mock.patch.object(pipeline, "catch_up_base", side_effect=catch_up),
+                      mock.patch.object(pipeline, "note_review"),
+                      mock.patch.object(pipeline, "publish_gate_evidence"),
+                      mock.patch.object(pipeline, "comment_catch_up_ci"),
+                      mock.patch.object(ci, "watch", side_effect=watch),
+                      mock.patch.object(gh, "branch_sha", return_value="new-base"),
+                      mock.patch.object(gh, "commit_checks", return_value={}),
+                      mock.patch.object(gh, "pr_draft_and_head", side_effect=lambda _: (pr["draft"], pr["head"])) as state,
+                      mock.patch.object(gh, "pr_set_draft", side_effect=draft_pr) as draft):
+                    failure = controller.finish_publication()
+                self.assertEqual(failure["failures"], orchestration.CI_FAILURES)
+                self.assertEqual(pr, {"head": "maintainer-head", "draft": False})
+                state.assert_called_once_with(checkout.pr)
+                draft.assert_not_called()
+                merge.assert_called_once()
+                controller.close()
+                controller.job.slot.free()
 
     def waiter_catches_up(self, *, fixed, ci_after_base_move=""):
         first, a = self.ready_run("1")
@@ -2310,10 +2366,9 @@ class AutomergeLeaseTests(MovedBasePublicationFixture, unittest.TestCase):
                 self.assertIsNone(second.job.slot.held)
                 self.assertEqual([r["id"] for r in slots.runs_waiting_for_merge_lease()], [second.run.id])
                 self.assertEqual(slots.slots_free_to_start(3), 0)
-                expected = [(a.pr, "main-0"), (a.pr, "main-0")]
-                if ci_after_base_move == "pass":
-                    expected.append((a.pr, "main-external"))
-                self.assertEqual(reads, expected)
+                self.assertEqual(reads, [(a.pr, "main-0"), (a.pr, "main-0")])
+                pipeline.comment_catch_up_ci.assert_not_called()
+                self.assertEqual(merged, [])
                 self.assertEqual((first.job.b.catch_ups, second.job.b.catch_ups), (1, 0))
             finally:
                 finish_watch.set()
@@ -2326,7 +2381,7 @@ class AutomergeLeaseTests(MovedBasePublicationFixture, unittest.TestCase):
         self.assertEqual(slots.runs_waiting_for_merge_lease(), [])
         gh.pr_comment.assert_not_called()
 
-    def test_only_passing_catch_up_ci_takes_a_slot_above_capacity(self):
+    def test_each_catch_up_ci_result_waits_for_a_free_slot(self):
         for n, result in enumerate(("pass", "fail", "unread"), 1):
             with self.subTest(ci=result):
                 controller, checkout = self.ready_run(f"{n}1")
@@ -2358,17 +2413,17 @@ class AutomergeLeaseTests(MovedBasePublicationFixture, unittest.TestCase):
                     with (mock.patch.object(ci, "watch", side_effect=watch),
                           mock.patch.object(gh, "branch_sha", return_value="main"),
                           mock.patch.object(gh, "commit_checks", return_value={}),
+                          mock.patch.object(gh, "pr_draft_and_head", return_value=(False, checkout.lease)),
                           mock.patch.object(pipeline, "comment_catch_up_ci"),
                           mock.patch.object(pipeline, "set_draft")):
                         failure = controller.publication_ci([checkout], caught_up=True)
+                    self.assertEqual(len(slots.runs_in_slots()), 2)
+                    self.sleep.assert_called_once()
                     if result == "pass":
                         self.assertIsNone(failure)
-                        self.assertEqual(len(slots.runs_in_slots()), 3)
-                        self.sleep.assert_not_called()
                         controller.ci_failures.assert_not_called()
                     else:
                         self.assertEqual(failure["failures"], orchestration.CI_FAILURES)
-                        self.sleep.assert_called_once()
                         controller.ci_failures.assert_called_once()
                 finally:
                     controller.close()
@@ -2387,8 +2442,8 @@ lease = slots.take_merge_lease(run, 'fixture/repo')
 print(util.lock_is_held('automerge-fixture%2Frepo'), flush=True)
 os.kill(os.getpid(), signal.SIGKILL)
 """
-        env = {**os.environ, "ARETE_STATE_DIR": str(self.state), "ARETE_LOG_DIR": str(paths.LOG_DIR),
-               "ARETE_WORKTREES_DIR": str(paths.WORKTREES_DIR)}
+        env = {**os.environ, "ARETE_STATE_DIR": str(self.state), "ARETE_LOG_DIR": str(self.state / "logs"),
+               "ARETE_WORKTREES_DIR": str(self.state / "worktrees")}
         done = subprocess.run([sys.executable, "-c", child], capture_output=True, text=True, timeout=2, env=env)
         self.assertEqual((done.returncode, done.stdout.strip()), (-signal.SIGKILL, "True"), done.stderr)
         self.assertFalse(util.lock_is_held("automerge-fixture%2Frepo"))
@@ -2521,6 +2576,7 @@ class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
               mock.patch.object(pipeline, "publish_ci") as report,
               mock.patch.object(pipeline, "publish_gate_evidence"),
               mock.patch.object(controller, "ci_failures", return_value="failed check logs"),
+              mock.patch.object(gh, "pr_draft_and_head", side_effect=lambda _: (False, checkout.lease)),
               mock.patch.object(pipeline, "set_draft") as draft,
               mock.patch.object(gh, "find_own_pr_comment", return_value=None),
               mock.patch.object(gh, "pr_comment") as comment):

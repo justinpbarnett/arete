@@ -66,7 +66,6 @@ def policy_fingerprint(cfg, layer, closed_context):
 
 class Controller:
     merge_lease: TextIO | None = None
-    green_ci_head: tuple[str, str] | None = None
 
     def __init__(self, flow):
         self.flow, self.job = flow, flow.ctx
@@ -773,12 +772,7 @@ class Controller:
 
     def publication_ci(self, pushed, *, caught_up=False, reruns=None):
         tree = self.fingerprint()
-        self.green_ci_head = None
-        current = pipeline.watch_publication_ci(self.run, self.job.slot, pushed, reruns=reruns,
-                                                merge_priority=self.merge_lease is not None)
-        if len(current.seen) == 1 and current.green:
-            target = current.seen[0].target
-            self.green_ci_head = (target.pr, target.sha)
+        current = pipeline.watch_publication_ci(self.run, self.job.slot, pushed, reruns=reruns)
         self.job.ci_result = current.summary()
         self.check_pilot_publication()
         section = pipeline.ci.section([current], current.n)
@@ -808,16 +802,20 @@ class Controller:
                                                    for repo, requested in reruns.items()}
         self.data["ci_failures"] = self.ci_failures(current)
         self.catalog.add_context(CI_FAILURES, self.data["ci_failures"])
+        check_head = caught_up or self.data.get("catch_up_hold")
+        watched_heads = {w.target.pr: w.target.sha for w in current.seen}
         for checkout in self.job.with_prs:
             self.check_pilot_publication()
+            if check_head and (watched_heads.get(checkout.pr) != checkout.lease
+                               or pipeline.own_draft_state(self.run, checkout) is None):
+                continue
             pipeline.set_draft(self.run, checkout, True)
         return {"ci": self.job.ci_result, "failures": CI_FAILURES,
                 "error": f"CI needs an explicit worker diagnosis or repair; its failure logs are context {CI_FAILURES}"}
 
-    def take_merge_lease(self, checkout, *, merge_priority=False):
+    def take_merge_lease(self, checkout):
         if self.merge_lease is None:
-            self.merge_lease = slots.take_merge_lease(self.run, checkout.github, slot=self.job.slot,
-                                                      merge_priority=merge_priority)
+            self.merge_lease = slots.take_merge_lease(self.run, checkout.github, slot=self.job.slot)
 
     def release_merge_lease(self):
         if self.merge_lease is not None:
@@ -834,7 +832,7 @@ class Controller:
         track_base = not pilot.is_pilot_task(str(self.run.tid))
         for checkout in candidates:
             if len(job.checkouts) == 1:
-                self.take_merge_lease(checkout, merge_priority=self.green_ci_head == (checkout.pr, checkout.lease))
+                self.take_merge_lease(checkout)
             while True:
                 hold = pipeline.try_automerge(job.b, checkout, job.verified, job.review, about,
                                               track_moved_base=track_base)

@@ -2,6 +2,7 @@ import io
 import json
 import unittest
 import urllib.error
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -95,7 +96,7 @@ class PushedPrDraftTests(unittest.TestCase):
         self.calls, self.logs = [], []
         self.draft, self.remote_head, self.score, self.fail = True, self.head, 0.1, False
         self.run = SimpleNamespace(id="x", repo=config.Repo(name="fixture", path=self.root), repairs="", feedback=[],
-                                   tid="7", facts={}, log=self.logs.append)
+                                   tid="7", facts={}, log=self.logs.append, waiting=lambda _: nullcontext())
         self.slot = slots.RunSlot("fixture", "7", 1)
         self.layer = SimpleNamespace(trust_level="automerge", checks={"behavior": "true"})
         self.c = workspace.Checkout("", "fixture/repo", self.root, self.root, "main", pr=self.URL, lease=self.head)
