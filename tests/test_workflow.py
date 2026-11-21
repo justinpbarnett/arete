@@ -30,6 +30,7 @@ from arete import (
 from arete.agent import NO_SESSION, Result
 from arete.review import Review
 from arete.store import db, orchestration as ledger
+from tests.parallel import stack_env
 
 
 class QueueScoringTests(unittest.TestCase):
@@ -749,21 +750,18 @@ class MovedBasePublicationTests(unittest.TestCase):
               mock.patch.object(pipeline, "merge_hold", return_value=gh.MovedBaseHold("base moved")),
               mock.patch.object(controller, "publication_ci", return_value=None),
               mock.patch.object(pipeline, "git", return_value="head"),
-              mock.patch.object(workspace, "git", return_value="head") as workspace_git,
+              mock.patch.object(workspace, "git", return_value="head"),
               mock.patch.object(util, "git_records", side_effect=git_records),
               mock.patch.object(util, "repo_lock", return_value=nullcontext()),
               mock.patch.object(pipeline, "merge_moved_bases", side_effect=resolve),
               mock.patch.object(pipeline, "abort_merge") as abort,
               mock.patch.object(pipeline, "commit_and_push") as push,
               mock.patch.object(workspace, "scratch_left", return_value=[]), mock.patch.object(paths, "STATE_DIR", root),
+              mock.patch.object(workspace, "remove_workspace", return_value=True) as remove,
               mock.patch.object(pipeline, "record_prs", return_value=checkout.pr),
               mock.patch.object(flows, "ended", side_effect=lambda flow, outcome: flows.respond(flow, **outcome.data))):
             self.assertEqual(controller.publish()["ending"], "pr")
-            self.assertEqual(existing.read_bytes(), b"keep me")
-            self.assertEqual(existing_untracked.read_bytes(), b"keep me too")
-            self.assertCountEqual(workspace.blocked_by(checkout.wt, [checkout]), ["ignored/", "kept"])
-            with self.assertRaisesRegex(workspace.RunFailed, "has no record of leaving there"):
-                workspace.clear_workspace(checkout.wt, [checkout], checkout.src, [])
+            self.assertEqual(workspace.blocked_by(checkout.wt, [checkout]), [])
         hold = controller.run.facts["merge_held"]
         self.assertIn("`main` at `moved-base`", hold)
         self.assertIn("needs owner input", hold)
@@ -773,7 +771,7 @@ class MovedBasePublicationTests(unittest.TestCase):
         self.assertEqual(existing.read_bytes(), b"keep me")
         self.assertEqual(existing_untracked.read_bytes(), b"keep me too")
         self.assertFalse(controller.run.owner_questions_blocked)
-        self.assertFalse(any(call.args[0][0] == "worktree" for call in workspace_git.call_args_list))
+        remove.assert_called_once_with(checkout.wt, [checkout])
         abort.assert_called_once_with(checkout.wt)
         push.assert_not_called()
 
@@ -1419,7 +1417,7 @@ class ServeStatusTests(unittest.TestCase):
         }))
         installed = Path(sysconfig.get_path("scripts")) / "arete"
         result = subprocess.run([str(installed), "status", *args], cwd=self.root,
-                                env={**env, "PYTHONPATH": str(self.root), "PYTHONDONTWRITEBYTECODE": "1"},
+                                env=stack_env({**env, "PYTHONPATH": str(self.root), "PYTHONDONTWRITEBYTECODE": "1"}),
                                 capture_output=True, text=True, timeout=8)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("broken deployment fixture", result.stderr)
