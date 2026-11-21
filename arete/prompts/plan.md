@@ -16,7 +16,7 @@ $triage
 
 $expertise
 
-## Your job
+$journeys## Your job
 
 Read the code you need (Read, Glob, Grep, read only git and shell commands). Do not edit anything.
 Then return a plan a separate builder agent will follow without you:

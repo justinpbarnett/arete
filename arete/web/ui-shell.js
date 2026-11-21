@@ -10,6 +10,7 @@ import { FloorFocus, FloorQueue, HealthFocus, TaskFocus, TaskQueue } from "./ui-
 import { Palette, openPalette } from "./ui-palette.js";
 import { ReasonBox, fixture, fixtureRevision, replayLast } from "./ui-actions.js";
 import { RunFocus, RunQueue, RunSubtitle } from "./ui-run.js";
+import { clientNotice, staleWrite } from "./ui-notice.js";
 
 const html = htm.bind(h);
 const glyphs = { floor: "▦", triage: "!", "my-work": "○", board: "▤", runs: "▷", intake: "↓", outbox: "↑", prompts: "≡", adws: "◇", insights: "▥", settings: "⚙" };
@@ -131,6 +132,8 @@ export function Shell({ route, snapshot, resources, now, retry, runs }) {
         <p class="subtitle">${page.subtitle}</p>
         ${counts ? html`<p class="subtitle">${counts.total} open · ${counts.needsYou} need you · ${counts.high} high · ${counts.med} med</p>` : null}
       </header>
+      ${clientNotice.value ? html`<p class="ui-state" role="status">${clientNotice.value}</p>` : null}
+      ${staleWrite.value ? html`<p class="ui-state" data-state="stale" role="status">${staleWrite.value}</p>` : null}
       <div class=${`pane-grid${focus ? "" : " single"}`}>
         <${Pane} name="queue" label=${page.queue}>${actionList ? html`<${List} id="action-fixture" controller=${actionList} queue=${true} />` : queue}<//>
         ${focus ? html`<${Pane} name="focus" label=${page.focus}>${focus}<//>` : null}

@@ -14,6 +14,7 @@ from . import (
     factory,
     flows,
     gh,
+    journeys,
     owner_asks,
     pilot,
     pipeline,
@@ -39,6 +40,8 @@ STATE_FIELDS = ("plan_text", "goal", "estimate", "left_for_a_person", "build_sum
 def policy_fingerprint(cfg, layer, closed_context):
     effective = asdict(layer)
     effective.pop("factory_path")
+    if layer.verify:
+        effective["verify"] = layer.verify.policy()
     return ledger.digest(json.loads(json.dumps({"layer": effective, "config": asdict(cfg),
                                                 "closed_context": closed_context}, default=str)))
 
@@ -388,6 +391,8 @@ class Controller:
         inputs = {"goal": goal, "context": contexts, "plan": self.job.plan_text, "checks": self.job.checks,
                   "denied": prompt_loader.code_list(diffguard.denied_paths(self.job.layer)),
                   "estimate": self.job.estimate, "verify": self.job.goal, "triage": self.job.triage, **args["inputs"]}
+        if name == "plan" and self.job.layer.verify:
+            inputs["journeys"] = journeys.guidance(self.job.layer.verify.feature_map, planning=True)
         if "verify" in args["inputs"] and pipeline.triage_checks(self.job.approval):
             inputs["verify"] = pipeline.triage_goal(str(inputs["verify"]), self.job.approval)
         prompt = self.job.brief.prompt("delegate" if name in ("delegate", "investigate") else name, **inputs)

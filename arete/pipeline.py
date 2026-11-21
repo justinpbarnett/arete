@@ -35,6 +35,7 @@ from . import (
     gh,
     intake,
     jev,
+    journeys,
     learning,
     outbound,
     owner_asks,
@@ -1863,7 +1864,8 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
             return answer_without_changes(run, ws, checkouts, branch, build_summary, replies)
     else:
         res = run.agent("plan", brief.prompt(
-            "plan", triage=triage_notes(approval), denied=prompt_loader.code_list(deny), checks=checks),
+            "plan", triage=triage_notes(approval), denied=prompt_loader.code_list(deny), checks=checks,
+            journeys=journeys.guidance(layer.verify.feature_map, planning=True) if layer.verify else ""),
                         ws, role="plan", allowed_tools=read_rules, json_schema=PLAN_SCHEMA)
         if not res.ok or not isinstance(res.structured, dict):
             return _fail(run, "planning step failed", recovery=runner.start_failure(res, "plan"))
@@ -2939,13 +2941,22 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                 require_released: bool = False, **values) -> verify.Verified:
     from . import pilot, readme_verify, zte
 
-    run, v = b.run, verify.with_free_ports(b.layer.verify)
+    run, configured = b.run, b.layer.verify
     tid = str(run.tid)
     zte_verify = zte.reserved(tid) and prompt_name == role == "verify"
     readme_task = (pilot.is_pilot_task(tid) and prompt_name == role == "verify") or zte_verify
+    feature_map = configured.feature_map if prompt_name == role == "verify" and not readme_task else {}
+    requested = journeys.requested(feature_map, b.ticket.title, b.ticket.body)
+    step = b.next_step(step_name)
+    if unknown := [name for name in requested if name not in feature_map]:
+        return save_verification(run, step, verify.Verified(
+            "blocked", "An issue references a journey absent from the configured feature map.", finished=False,
+            blocked_by=", ".join(f"journey:{name}" for name in unknown)))
+    selected = {name: feature_map[name] for name in requested}
+    drivers = {name: journey.driver for name, journey in selected.items() if journey.driver}
+    v = verify.with_free_ports(replace(configured, drivers={name: configured.drivers[name] for name in drivers.values()}))
     merge_candidate = b.layer.trust_level == "automerge" or readme_task
     checked_trees = verification_trees(b) if prompt_name == role == "verify" and merge_candidate else {}
-    step = b.next_step(step_name)
     if refusal := verify.port_refusal(v):
         run.log(f"{step}: {refusal}")
         return verify.Verified("blocked", "Verification cannot use a port the live dashboard serves.",
@@ -2979,7 +2990,13 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
     try:
         attempt = scratch.make(run.id, step, b.ws, run.dir)
     except (OSError, ValueError) as e:
-        run.log(f"{step}: trusted scratch unavailable: {util.first_line(str(e), 300)}")
+        reason = util.first_line(str(e), 300)
+        run.log(f"{step}: trusted scratch unavailable: {reason}")
+        if drivers:
+            names = ", ".join(f"journey:{name}" for name in drivers)
+            return save_verification(run, step, verify.Verified(
+                "blocked", f"Configured drivers require trusted scratch confinement for {names}.",
+                blocked_by=reason, finished=False))
     agent_started, agent_finished = False, False
     lifetime = {"stopped": True}
     fixture_blocker = ""
@@ -2999,21 +3016,28 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                 attempt=attempt) as url:
             if url:
                 run.log(f"{step}: the app answers at {url}")
-            probes = (verify.run_probes(replace(v, probe_seconds=run.time_for(v.probe_seconds)), b.ws, attempt)
-                      if v.probes else None)
+            if v.probes or drivers:
+                probes = verify.run_probes(replace(v, probe_seconds=run.time_for(v.probe_seconds)), b.ws, attempt,
+                                           journey_drivers=drivers)
             if probes:
                 run.save(f"{step}-probes.json", json.dumps(asdict(probes), indent=2))
-                run.log(f"{step}: configured probes {probes.verdict}")
+                label = "configured verification commands" if drivers else "configured probes"
+                run.log(f"{step}: {label} {probes.verdict}")
                 if probes.verdict == "pass":
-                    v = replace(v, notes=v.notes + "\n\nArete already executed these owner-configured probes in a "
+                    name = "verification commands" if drivers else "probes"
+                    instructions = ("Check any remaining acceptance criteria. Arete adds the configured results to the "
+                                    "report. Return only the checks you performed.\n\n"
+                                    if drivers else "Check only acceptance criteria not covered by them.\n\n")
+                    v = replace(v, notes=v.notes + f"\n\nArete already executed these owner-configured {name} in a "
                                 "confined disposable workspace. Use their observed results as evidence; do not repeat "
-                                "these commands. Check only acceptance criteria not covered by them.\n\n" + probes.markdown())
+                                "these commands. " + instructions + probes.markdown())
             if not probes or probes.verdict == "pass":
                 agent_started = True
                 res = run.agent(step, b.brief.prompt(
                     prompt_name, surface=surface_note(v, url, evidence), notes=v.notes, scratch=scratch.note(attempt),
                     commands=prompt_loader.code_list(bash), checks=check_list(b.layer),
-                    compare=compare_with_fork(b.checkouts), owner=run.owner_note, **values),
+                    compare=compare_with_fork(b.checkouts), owner=run.owner_note,
+                    journeys=journeys.guidance(selected or feature_map), **values),
                                 b.ws, role=role,
                                 allowed_tools=prompt_loader.bash_rules(bash) + ([f"mcp__playwright__{t}" for t in verify.PLAYWRIGHT_TOOLS] if url else []),
                                 disallowed_tools=routing.NO_GIT_WRITES, json_schema=verify.SCHEMA,
@@ -3055,12 +3079,14 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
     if probes and probes.verdict != "pass":
         verified = probes
     elif not res.ok or not isinstance(res.structured, dict):
-        return verify.Verified("blocked", "The check in use did not finish.", finished=False,
-                               blocked_by=util.first_line(res.error or "the verifier returned no verdict", 300))
+        verified = verify.Verified("blocked", "The check in use did not finish.", finished=False,
+                                   blocked_by=util.first_line(res.error or "the verifier returned no verdict", 300))
+        if not drivers:
+            return verified
     else:
         verified = verify.Verified.from_agent(res.structured)
-        if probes:
-            verified.checks = probes.checks + verified.checks
+    if probes and probes.verdict == "pass":
+        verified.checks = probes.checks + verified.checks
     if fixture_blocker:
         verified.verdict, verified.blocked_by, verified.finished = "blocked", fixture_blocker, False
     if (verified.verdict == "pass" and checked_trees and agent_finished and res.runner in {"pi", "codex", "claude"}

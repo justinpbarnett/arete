@@ -1245,6 +1245,9 @@ path = "classic"
 | `verify.allow_bash` | Bash patterns the verifier may run, on top of `curl` and `echo`. |
 | `verify.publish_evidence` | Boolean, default `true`. Set `false` to keep screenshots in the local run folder without uploading them or linking images in PRs. Verification and ordinary PR delivery still run. |
 | `verify.notes` | What the verifier must know: how to sign in, what not to touch, what is shared. `{scratch}` is the attempt's scratch folder. |
+| `verify.feature_map` | Optional table of named user journeys or a TOML filename relative to the layer config. See [Feature maps and journey drivers](#feature-maps-and-journey-drivers). |
+| `verify.drivers` | Optional table of named, owner-configured journey commands. |
+| `verify.journey_drivers` | Optional table binding feature map journey IDs to names in `verify.drivers`. |
 | `research.dir` | Folder, from the repo root, where arete files the reports of this repo's research tickets as pull requests. Leave it out and the reports stay in arete. See [Triage](#triage). |
 | `factory.path` | `classic` (default) or `adw`, which runs a ticket through the [adw flow](#the-adw-flow) on any repo. |
 | `environment.pass` | More server variables this repo's local agents and commands get, on top of the engine's `[environment] pass`. Read from the layer folder, never from a worktree. A layer takes no `[environment.providers]`. See [An agent's environment](#an-agents-environment). |
@@ -1688,6 +1691,27 @@ Arete run with `ARETE_VERIFY_SCRATCH` set, or with `ARETE_CONFIG_DIR` or `ARETE_
 - Blocked: the verifier could not check something (a service it may not reach, a sign in it cannot finish). A check that fails because the verifier's own tools could not run it (the verifier marks it `cause: environment`, such as a closed browser), and an app start whose command exited with a sandbox denial in its log (Operation not permitted, EPERM, `[Errno 1]`, sandbox-exec), are blocked too, never a failure that sends the builder to repair code that is not at fault; a failed check with `cause: change` or no cause stays a fail. The PR body says what it would take. It opens as a draft when the review did not approve, or when the blocker or summary names a guard, JEV or credential refusal; an approved review with any other blocked check leaves it ready. A run that pushes to an open PR of its branch, or continues an earlier run and verifies and reviews it again with nothing new to push, applies the same rule to it: held (review not approving, or a check in use blocked by a refusal) turns a ready PR into a draft with the same note; not held marks a draft PR ready for review and judges it for automerge as a PR the run opened (trust level, triage approval, the JEV risk hold, conflicts, GitHub's merge state). So does a run whose `pr` step finds the PR open on the branch because the prepare outcome named none, as when a continuation of a run that opened its own PR runs `pr` again. A PR whose head someone changed after the run pushed or checked it is left as it is and the run log says so; a PR that an earlier CI watch stopped follows the CI section; an approved repair still leaves its draft for a person; a revise run applies the rule to none of the PRs it pushed to, checked again or found, and automerges none of them.
 
 Arete stops the server's whole process group after each verifier run, so no dev server outlives its step.
+
+### Feature maps and journey drivers
+
+Use a feature map for a few important product journeys. Each entry names the steps a user takes and the outcome a verifier can observe. Define entries inline or set `feature_map = "feature-map.toml"` under `[verify]` and use top-level tables such as `[browse-catalog]` in that file. Use a regular TOML file under the layer directory. Keep journey and driver names lowercase and hyphen-separated.
+
+```toml
+[verify.feature_map.browse-catalog]
+steps = ["Open the shop home page.", "Choose Catalog in the navigation."]
+outcome = "The Catalog page displays the available products."
+```
+
+The planner can refer to a map entry by its stable name in the verification steps. Put `journey:browse-catalog` in the issue title or body to select it explicitly. The verifier gets the selected entries or, when the issue names none, the map as guidance. An explicit name missing from a configured map blocks product verification and appears in the report. Browser journeys can attach screenshots through the existing evidence folder and `publish_evidence` setting.
+
+Bind a journey ID to a named command in `[verify.journey_drivers]` and define the command in `[verify.drivers]`. Both tables belong in the layer's `config.toml`, including when the map is a linked file. Arete runs explicitly selected drivers in journey ID order after product readiness and ordinary configured probes. Drivers share the existing `probe_seconds` budget and trusted scratch confinement. They run from the worktree with the same `{port}` and `{scratch}` substitutions as probes. A driver should assert its outcome, print what it observed and exit `1` when the assertion fails. Arete reports timeouts (including exit `124`), command startup errors (exits `126` and `127`) and unavailable confinement as blocked. A failed assertion fails verification. The report includes the journey ID, command and bounded observations. The verifier uses those observations and exercises any remaining acceptance criteria with its existing tools.
+
+#### Verify the Arete CLI journey
+
+1. Configure an isolated repo layer for the Arete candidate. Copy the example's `[verify]`, `[verify.journey_drivers]` and `[verify.drivers]` settings into its layer config and place `feature-map.toml` beside that config. Keep the repo's ordinary check commands. Use an Arete-managed candidate worktree with a configured verifier route, macOS trusted scratch support and `python3.13` on the service `PATH`. [Example layer](docs/examples/product-verification/config.toml) · [Feature map](docs/examples/product-verification/feature-map.toml)
+2. Use an isolated ticket that calls for a small candidate change and includes `journey:verifier-prompt-inputs` in its title or body. Run `arete run <repo> <ticket> --dry-run` with that repo configured to check out the candidate. The planner should see the stable ID and the verification step should run `python3.13 -B docs/examples/product-verification/prompt_inputs.py` from the candidate worktree. [Driver](docs/examples/product-verification/prompt_inputs.py)
+3. In the run folder, inspect `verify-probes.json` and `verify.md` for the attempt, using the numbered filenames on retries. The driver row should name `journey:verifier-prompt-inputs`, show exit `0` and include the observation from `arete prompts verify --json`. The JSON record should have `name` equal to `verify`, `valid` equal to `true` and include `goal`, `surface`, `commands` and `journeys` in `inputs`. Confirm the verifier used the evidence, the ordinary checks ran, and this attempt released its verification scratch resources.
+4. Repeat with a separate isolated layer using the ordinary `[verify]` settings and omitting the feature map and driver tables. Confirm the checks and verifier still run on a ticket without a journey reference.
 
 ## Document
 

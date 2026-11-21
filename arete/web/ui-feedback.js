@@ -1,5 +1,6 @@
 import { notice, mode } from "./ui-keys.js";
 import { postBody } from "./ui-write.js";
+import { webFetch } from "./ui-request.js";
 
 const KEPT = "arete.feedback";
 const SAVE_MS = 600;
@@ -107,7 +108,7 @@ function sayIn(target, state, sentence) {
 
 async function call(path, body, signal) {
   const raw = body instanceof Blob;
-  const sent = body === undefined ? fetch(path, { cache: "no-store", signal })
+  const sent = body === undefined ? webFetch(path, { cache: "no-store", signal })
     : postBody(path, raw ? body : JSON.stringify(body), raw ? "application/octet-stream" : "application/json");
   const response = await sent.catch(() => { throw new NoAnswer("The connection to arete failed."); });
   const data = await response.json().catch(() => ({ error: `The server answered ${response.status} with no JSON.` }));
