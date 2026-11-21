@@ -275,16 +275,8 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: tuple[str, str], skip
             return "skipped"
     source = tracker.for_ticket(cfg, repo, tid)
     name = tracker.ticket_name(repo.name, source.ref(tid))
-    ticket = source.get(tid) if isinstance(source, tracker.GitHubTracker) else None
-    if ticket:
-        if tracker.ZTE_LABEL in ticket.labels:
-            return "skipped"
-        blocker = tracker.github_hold(ticket.labels)
-        if not blocker and not ticket.open and not pending_feedback(repo.name, tid):
-            blocker = "it is closed"
-        if blocker:
-            skips.note(name, ticket, blocker, repo.name)
-            return "blocked"
+    if isinstance(source, tracker.GitHubTracker) and source.in_zte_queue(str(tid)):
+        return "skipped"
     reply = tracker_reply(repo, source, str(tid), dry_run)
     answering = not reply and pipeline.answered_run(repo.name, str(tid)) is not None
     if not answering and not reply and (waiting := held_back(cfg, repo.name, going, slots)):
@@ -292,7 +284,7 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: tuple[str, str], skip
             source_store.pass_over(repo.name, str(tid))
         print(f"{util.iso()} {name}: waiting, {waiting}")
         return "held"
-    ticket = ticket or source.get(tid)
+    ticket = source.get(tid)
     blocked, readmission = runlimits.poll_admission(repo, str(tid), ticket, runlimits.Policy.of(layer))
     blocked = blocked or source.blocker(tid) or reply
     if not blocked:

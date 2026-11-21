@@ -13,10 +13,9 @@ from dataclasses import asdict, dataclass, field, replace
 from functools import wraps
 from pathlib import Path
 
-from . import budget_legacy, gh, paths, run_lines, util
+from . import budget_legacy, config, gh, paths, run_lines, tracker, util
 from .store import db as foundation
 from .store import runs as run_store
-from .tracker import BATCH_LABEL, github_hold, github_park_hold, is_task_id
 
 IDLE_WAITS = ("limit", "slot")
 CHECKPOINT_SECONDS = 30
@@ -26,6 +25,8 @@ RETRY = ("Change the ticket specification, published branch head, or budget sett
          "arete run REPO TICKET --force.")
 HEAD_ERROR = "could not confirm the parked branch head; work remains parked"
 OID = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+RETRY_HOLD_LABELS = {"no-agent", "agent:hold", "duplicate", "invalid", "wontfix", tracker.ZTE_LABEL,
+                     *(f"agent:{state}" for state in config.RUN_LABELS if state != "failed")}
 
 
 class Parked(BaseException):
@@ -176,25 +177,22 @@ def feedback_key(comment) -> str:
 
 
 def park_retry(row: dict, saved: dict, ticket):
-    if row.get("only_step") or BATCH_LABEL in ticket.labels:
+    if row.get("only_step") or tracker.BATCH_LABEL in ticket.labels:
         return None
     retry = ticket.retries[-1] if ticket.retries else None
     return retry if retry and retry.run_id == row["id"] and newer(retry.when, parked_at(row, saved)) else None
 
 
-def park_feedback(repo, row: dict, saved: dict, ticket) -> str:
-    if not ticket.open or ticket.blocker or park_label_hold(repo, ticket) or ticket.state == "needs-info":
-        return ""
-    retry = park_retry(row, saved, ticket)
-    return feedback_key(retry) if retry else ""
-
-
-def automatic_hold(repo, ticket) -> str:
-    return github_hold(ticket.labels) if repo.tracker == "github" and not is_task_id(ticket.id) else ""
-
-
-def park_label_hold(repo, ticket) -> str:
-    return github_park_hold(ticket.labels) if repo.tracker == "github" and not is_task_id(ticket.id) else ""
+def retry_hold(ticket: tracker.Ticket) -> str:
+    if not ticket.open:
+        return "it is closed"
+    if ticket.blocker:
+        return ticket.blocker
+    if holds := RETRY_HOLD_LABELS.intersection(ticket.labels):
+        return f"its `{min(holds)}` label prevents automatic admission"
+    if ticket.state and ticket.state not in ("todo", "failed"):
+        return f"its `{ticket.state}` state prevents automatic admission"
+    return ""
 
 
 def readmission_key(value) -> str:
@@ -244,17 +242,16 @@ class Readmission:
         except TypeError as error:
             raise ValueError("invalid poll readmission") from error
 
-    def matches(self, repo, row: dict, saved: dict, ticket, policy: Policy, *, closed_pr_revision: bool = False) -> bool:
+    def matches(self, repo, row: dict, saved: dict, ticket, policy: Policy) -> bool:
         spec, limits = specification(ticket), asdict(policy)
-        if (not (ticket.open or closed_pr_revision and not self.feedback)
-                or automatic_hold(repo, ticket)
-                or (park_retry(row, saved, ticket) and park_label_hold(repo, ticket))
-                or self.baseline != readmission_key(saved)
-                or self.inputs != readmission_key([spec, limits])):
+        if self.baseline != readmission_key(saved) or self.inputs != readmission_key([spec, limits]):
+            return False
+        retry = park_retry(row, saved, ticket)
+        if retry and retry_hold(ticket):
             return False
         if not self.branch:
             if self.feedback:
-                return self.feedback == park_feedback(repo, row, saved, ticket) and not self.attempted()
+                return bool(retry and self.feedback == feedback_key(retry) and not self.attempted())
             return inputs_changed(saved, spec, limits)
         names = {name for name, _ in checkouts(repo)}
         return (self.branch == park_branch(row, saved) and complete_heads(saved.get("heads"), names)
@@ -275,7 +272,7 @@ class Readmission:
 
 
 def admission(repo, tid: str, tracker, policy: Policy, explicit: bool, *,
-              readmission: Readmission | None = None, ticket=None, closed_pr_revision: bool = False) -> tuple[str, bool]:
+              readmission: Readmission | None = None, ticket=None) -> tuple[str, bool]:
     row, saved = latest_park(repo.name, tid)
     if not saved:
         return ("the parked run changed before launch", False) if readmission else ("", False)
@@ -286,19 +283,17 @@ def admission(repo, tid: str, tracker, policy: Policy, explicit: bool, *,
         if isinstance(saved.get("heads"), dict) and saved["heads"] != heads(repo, park_branch(row, saved)):
             return "", True
     if (readmission and readmission.run_id == row["id"]
-            and readmission.matches(repo, row, saved, ticket or tracker.get(tid), policy,
-                                    closed_pr_revision=closed_pr_revision)):
+            and readmission.matches(repo, row, saved, ticket or tracker.get(tid), policy)):
         return "", True
     return park_reason(row, saved), False
 
 
 def poll_admission(repo, tid: str, ticket, policy: Policy) -> tuple[str, Readmission | None]:
-    if hold := automatic_hold(repo, ticket):
-        return hold, None
     row, saved = latest_park(repo.name, tid)
     if not saved:
         return "", None
-    if park_retry(row, saved, ticket) and (hold := park_label_hold(repo, ticket)):
+    retry = park_retry(row, saved, ticket)
+    if retry and (hold := retry_hold(ticket)):
         return hold, None
     reason = park_reason(row, saved)
     tried = f"{reason} Poll already tried these inputs."
@@ -309,8 +304,8 @@ def poll_admission(repo, tid: str, ticket, policy: Policy) -> tuple[str, Readmis
             if not proof.attempted():
                 return "", proof
             reason = tried
-        if feedback := park_feedback(repo, row, saved, ticket):
-            feedback_proof = replace(proof, feedback=feedback)
+        if retry:
+            feedback_proof = replace(proof, feedback=feedback_key(retry))
             if not feedback_proof.attempted():
                 return "", feedback_proof
             reason = tried

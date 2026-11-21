@@ -29,7 +29,8 @@ from .store import tasks as tasks_store
 
 MAX_REWRITES = 2
 RUN_ID = re.compile(tracker.PARK_RUN_ID)
-CONTROLLER_ALLOWANCE = re.compile(r"(?:controller used its \d+ decision|run used its \d+ action) allowance")
+CONTROLLER_ALLOWANCE = re.compile(
+    r"(?:controller used its \d+ (?:decision|inference-launch)|run used its \d+ action) allowance")
 BUDGET_PARKS = (
     (CONTROLLER_ALLOWANCE, "The controller reached its allowance. Focus the next attempt on the required behavior."),
     (re.compile(r"the repair chain used its \d+ repair cycles"), "The run used all of its repair cycles."),
@@ -109,17 +110,27 @@ def verify_event(run_id: str, step: str, line: dict, number: int) -> tuple[dict,
     if isinstance(saved, dict):
         return saved, run_lines.FILE, number
     detail = {key: line[key] for key in ("error", "summary", "blocked_by", "feedback") if line.get(key)}
-    return {**NO_CHECK_RESULT, **with_worker_error(run_id, step, detail)}, run_lines.FILE, number
+    if "result" not in line or line.get("call"):
+        detail = with_worker_error(run_id, step, detail)
+    return {**NO_CHECK_RESULT, **detail}, run_lines.FILE, number
 
 
 def with_worker_error(run_id: str, step: str, detail: dict) -> dict:
     if reported := detail.get("error") or detail.get("blocked_by"):
         worker = artifact(run_id, f"{step}.json")
         full_error = worker.get("error")
-        if worker.get("ok") is False and isinstance(full_error, str) and isinstance(reported, str) and (
-                full_error.startswith(reported) or util.first_line(full_error, 300) == reported):
+        if worker.get("ok") is False and matches_worker_error(full_error, reported):
             return {**detail, "error": full_error}
     return detail
+
+
+def matches_worker_error(full_error, reported) -> bool:
+    return (isinstance(full_error, str) and isinstance(reported, str) and bool(reported)
+            and (full_error.startswith(reported) or util.first_line(full_error, 300) == reported))
+
+
+def verify_name(attempt: int) -> str:
+    return f"verify{attempt}" if attempt > 1 else "verify"
 
 
 def verification(run_id: str, lines: list[tuple[int, dict]]) -> tuple[dict, str, int]:
@@ -130,8 +141,11 @@ def verification(run_id: str, lines: list[tuple[int, dict]]) -> tuple[dict, str,
             continue
         if not (match := VERIFY_STEP.fullmatch(str(line.get("call") or line.get("step") or ""))):
             continue
+        is_outer = "result" in line and not line.get("call")
         attempt = int(match[1] or "1")
-        if outer_attempt and attempt != outer_attempt:
+        if event == "step_end" and not (match[1] or line.get("call") or is_outer) and type(line.get("try")) is int:
+            attempt = max(attempt, line["try"])
+        if attempt < minimum or (outer_attempt and attempt != outer_attempt):
             break
         if event == "verification_end":
             verdict = line.get("verdict")
@@ -147,32 +161,47 @@ def verification(run_id: str, lines: list[tuple[int, dict]]) -> tuple[dict, str,
         if event == "verification_start":
             return verification_files(run_id, attempt, only_attempt=True) or verify_event(run_id, match[0], line, number)
         if event == "step_start":
-            if outer and not line.get("call"):
+            if line.get("call"):
+                minimum = max(minimum, attempt)
+            elif outer:
                 break
             continue
         data = line.get("data")
-        found = verify_event(run_id, match[0], line, number)
+        found = verify_event(run_id, verify_name(attempt), line, number)
         has_result = isinstance(data, dict) and isinstance(data.get("verified"), dict)
-        if "result" in line and not line.get("call"):
+        if is_outer:
             if outer:
                 break
             if has_result:
                 if isinstance(names := data.get("names"), dict):
-                    outer_attempt = names.get("verify")
+                    named = names.get("verify")
+                    if type(named) is int and named > 0:
+                        outer_attempt = named
                 if not outer_attempt and found[0].get("verdict") != "blocked":
                     return found
                 outer_result = found
             elif line["result"] not in ("fail", "stop"):
                 return {}, run_lines.FILE, number
             outer = found
-            if line["result"] == "fail" and isinstance(line.get("try"), int):
-                minimum = line["try"]
+            if type(line.get("try")) is int and not outer_attempt:
+                minimum = max(attempt, line["try"])
             continue
         if has_result or line.get("ok") is False:
             return found
         minimum = max(attempt, minimum)
         break
-    return outer_result or verification_files(run_id, minimum) or outer or ({}, run_lines.FILE, 1)
+    if outer_result and outer_attempt:
+        step = verify_name(outer_attempt)
+        full = with_worker_error(run_id, step, outer_result[0])
+        return (full, f"{step}.json", 1) if full is not outer_result[0] else outer_result
+    saved = verification_files(run_id, minimum)
+    if outer_result:
+        detail = outer_result[0]
+        if saved and VERIFY_STEP.fullmatch(saved[1].removesuffix(".json")) and matches_worker_error(
+                saved[0].get("error"), detail.get("error") or detail.get("blocked_by")):
+            return {**detail, "error": saved[0]["error"]}, saved[1], saved[2]
+        return outer_result
+    return saved or outer or ({}, run_lines.FILE, 1)
 
 
 def verification_files(run_id: str, minimum: int, *, only_attempt: bool = False,
@@ -193,9 +222,11 @@ def verification_files(run_id: str, minimum: int, *, only_attempt: bool = False,
         if number != latest:
             break
         if priority == -1:
-            return NO_CHECK_RESULT, name, 1
+            return {**NO_CHECK_RESULT, "error": (folder / name).read_text(errors="replace")}, name, 1
         saved = artifact(run_id, name)
         if priority == 0:
+            if saved.get("ok") is False and isinstance(saved.get("error"), str) and saved["error"]:
+                return {**NO_CHECK_RESULT, "error": saved["error"]}, name, 1
             saved = saved.get("structured") if saved.get("ok") is True else None
         if isinstance(saved, dict) and saved.get("verdict") in ("pass", "fail", "blocked", "unverified"):
             if priority not in (1, 2) or saved["verdict"] != "pass":
@@ -348,15 +379,35 @@ def retryable(repo: config.Repo, issue: str, run: dict, saved: dict) -> bool:
         ws, checkouts, repo.path, config.load_layer(repo.layer_dir).copy)
 
 
+def restart_parked_revision(cfg, repo, layer, closed_context, row, park, ticket):
+    from . import pipeline
+    from .orchestration import lease_continuation_blocker, policy_fingerprint
+
+    if row["status"] != "failed" or not row.get("pr_url"):
+        return False
+    prior = orchestration.find(row["id"])
+    if not prior or prior["current_run"] != row["id"]:
+        return False
+    data = prior["data"]
+    saved_policy = data.get("policy_sha")
+    shared_policy_changed = (data.get("prepared", {}).get("layer") == str(layer.dir) and saved_policy
+                             and saved_policy != policy_fingerprint(cfg, layer, closed_context))
+    if not (shared_policy_changed or CONTROLLER_ALLOWANCE.fullmatch(str(park.get("reason") or ""))):
+        return False
+    lease = orchestration.Lease(prior["root"], prior["current_run"], prior["generation"])
+    return (retryable(repo, ticket.id, row, park) and not lease_continuation_blocker(lease)
+            and bool(pipeline.pending_feedback(repo.name, ticket.id)))
+
+
 def eligible(source: ParkTracker, ticket: tracker.Ticket, issue: str, saved: dict) -> bool:
-    if (ticket.id != issue or not ticket.open or ticket.blocker
+    if (ticket.id != issue or runlimits.retry_hold(ticket)
             or tracker.BATCH_LABEL in ticket.labels
             or runlimits.specification(ticket) != saved["specification"]):
         return False
     if isinstance(source, tracker.LocalTracker):
         row = tasks_store.task_get(ticket.id)
         return bool(row and row["version"] == ticket.version and row["state"] in ("todo", "failed"))
-    return not tracker.github_park_hold(ticket.labels)
+    return True
 
 
 def append(source: ParkTracker, ticket: tracker.Ticket, body: str) -> bool:
@@ -449,11 +500,9 @@ def retry_ticket(source: ParkTracker, issue: str, secrets: tuple[str, ...]) -> s
             except gh.GhError as error:
                 if gh.NO_ISSUE not in str(error):
                     raise
-            if ticket is None:
+            if ticket is None or ticket.id != issue:
                 state["rewrites"] = {rid: status for rid, status in state["rewrites"].items() if status != "pending"}
                 util.write_json(journal, state)
-                return
-            if ticket.id != issue:
                 return
             reconcile(journal, state, ticket)
         if (tasks.pending_start(repo.name, issue) or run_store.issue_running(repo.name, issue)

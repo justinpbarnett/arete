@@ -20,9 +20,28 @@ HEARTBEAT_SECONDS = 30
 FOLLOW_POLL_SECONDS = 0.2
 END = "report"
 FIXED = ("ts", "run", "seq", "event")
+LOG_ENVELOPE = frozenset((*FIXED, "engine", "event_id"))
 WAIT_CAUSES = ("limit", "ci", "slot", "person")
 TAIL_BYTES = 4096
 GUARDED_TAIL_BYTES = 64 * 1024
+STEP_FIELDS = frozenset("""
+    step call try result ok next carried seconds runner model provider credential auth_mode
+    billing effort requested_effort tier kind atom ab ab_side cost_usd tokens_in tokens_out
+    turns cache_read cache_write api_seconds position
+""".split())
+FINDING_FIELDS = frozenset(("parked_run", "finding_count", "finding_classes"))
+LOG_FIELDS = {
+    "step_start": STEP_FIELDS,
+    "step_end": STEP_FIELDS,
+    "prepare": FINDING_FIELDS,
+    "verification_end": FINDING_FIELDS | {"step", "verdict", "startup_failed"},
+    END: frozenset(("task", "status", "prs", "steps", "minutes", "cost_usd", "wait_minutes")),
+    "classic_hold": frozenset(),
+    "error": frozenset(("step",)),
+    "question": frozenset(("ask_id", "step", "call")),
+    "answer": frozenset(("asked_in", "ask_id", "step", "call")),
+    "ask_settled": frozenset(("ask_id", "step", "call", "p")),
+}
 
 _named: set[tuple[int, str]] = set()
 _append_guard: ContextVar[Callable[[], None] | None] = ContextVar("run_line_append_guard", default=None)
@@ -68,6 +87,17 @@ def path(run_id: str) -> Path:
 
 def run_of_path(where: Path) -> str:
     return where.parent.name if where.name == FILE and where.parent.parent == paths.RUNS_DIR else ""
+
+
+def finding_step(step: str) -> bool:
+    return step.rstrip("0123456789") in ("review", "verify")
+
+
+def log_fields(line: dict) -> dict:
+    allowed = LOG_FIELDS.get(line["event"])
+    if allowed is None:
+        return line
+    return {key: value for key, value in line.items() if key in allowed or key in LOG_ENVELOPE}
 
 
 def whole(data: bytes) -> list[dict]:
@@ -150,19 +180,20 @@ def write(run_id: str, event: str, *, event_id: str = "", **fields) -> dict:
     except OSError as e:
         if check or event_id:
             raise
-        text = json.dumps(line, ensure_ascii=False, default=str)
         print(f"{util.iso()} could not write {event} to {target}: {e}", file=sys.stderr, flush=True)
+    shared = log_fields(line)
     if event in ("step_start", "step_end"):
         step, attempt = str(fields.get("step", "")), fields.get("try", 1)
+        payload = {key: value for key, value in shared.items() if key not in LOG_ENVELOPE}
         with principals.acting(f"run:{run_id}/{step}"), foundation.tx():
             row = run_store.run_get(run_id)
             events.emit("step.started" if event == "step_start" else "step.ended",
                         f"step:{run_id}/{step}/{attempt}", cls="derived", task=row["issue"] if row else None,
-                        data={**fields, "run": run_id, "step": step, "try": attempt})
+                        data={**payload, "run": run_id, "step": step, "try": attempt})
     if check:
         check()
     else:
-        sys.stdout.write(text + "\n")
+        sys.stdout.write(json.dumps(shared, ensure_ascii=False, default=str) + "\n")
         sys.stdout.flush()
     return line
 

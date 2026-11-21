@@ -12,10 +12,6 @@ from .store import runs as run_store
 from .store import tasks as tasks_store
 
 LABEL = "agent"
-NO_AGENT = "no-agent"
-NO_AGENT_HOLD = f"its `{NO_AGENT}` label prevents automatic admission"
-HOLD_LABELS = {NO_AGENT, "agent:hold", "duplicate", "invalid", "wontfix"}
-PARK_CONFLICTS = {f"agent:{state}" for state in config.RUN_LABELS if state != "failed"}
 ZTE_LABEL = "agent:zte"
 ZTE_QUEUE = f"its `{ZTE_LABEL}` label reserves it for zero-touch delivery"
 BATCH_LABEL = "agent:batch"
@@ -36,7 +32,7 @@ MAX_IMAGES = 6
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 ARETE_TAG = "[arete]"
 TASK_ID = re.compile(r"t-[0-9a-f]{4,}", re.IGNORECASE)
-PARK_RUN_ID = r"pip-\d{8}-\d{6}-[a-f0-9]{4}(?:-[a-zA-Z0-9][a-zA-Z0-9_.-]{0,100})?"
+PARK_RUN_ID = r"pip-\d{8}-\d{6}-[a-f0-9]{4}(?:-[a-zA-Z0-9][a-zA-Z0-9_. -]{0,100})?"
 RETRY_MARKER = re.compile(rf"<!-- arete:retry run=({PARK_RUN_ID}) n=([12]) -->")
 
 
@@ -228,7 +224,7 @@ class GitHubTracker:
             body = issue.get("body") or ""
             self._labels[tid] = [lb["name"] for lb in issue.get("labels", [])]
         ticket = Ticket(tid, self.ref(tid), "", body=body, labels=self._labels.get(tid, []))
-        return github_hold(ticket.labels) or error_of(lambda: batch_ids(ticket)) or self.wait_blocker(
+        return (ZTE_QUEUE if ZTE_LABEL in ticket.labels else "") or error_of(lambda: batch_ids(ticket)) or self.wait_blocker(
             self.ticket_waits(tid, body))
 
     @staticmethod
@@ -300,19 +296,22 @@ class GitHubTracker:
         self._bodies[str(tid)] = i.get("body") or ""
         self._labels[str(tid)] = labels
         author = (i.get("author") or {}).get("login", "")
-        rows = i.get("comments", [])
-        retries = retry_comments((c.get("createdAt") or "", c.get("body") or "") for c in rows
-                                 if self.authored_retry(c))
-        comments = [(self.owner, c.get("createdAt", ""), c.get("body") or "") for c in rows
-                    if self.by_owner(c) and not self.authored_retry(c)]
-        blocker = github_hold(labels) or (
+        comments, retry_messages = [], []
+        for comment in i.get("comments", []):
+            when, body = comment.get("createdAt") or "", comment.get("body") or ""
+            if self.authored_retry(comment):
+                retry_messages.append((when, body))
+            elif self.by_owner(comment):
+                comments.append((self.owner, when, body))
+        blocker = (ZTE_QUEUE if ZTE_LABEL in labels else "") or (
             "" if self.by_owner(i) else f"it was opened by {author or 'someone else'}, not {self.owner}") or (
             "" if LABEL in labels else f"it has no `{LABEL}` label") or self.wait_blocker(
             self.ticket_waits(str(i["number"]), i.get("body") or ""))
         ticket = Ticket(str(i["number"]), f"#{i['number']}", i["title"], body=i.get("body") or "(no description)",
                       comments=comments_text(comments), open=i.get("state") == "OPEN",
                       kind="fix" if FIX_LABELS & set(labels) else "feat", url=i.get("url", ""),
-                      updated=i.get("updatedAt") or "", labels=labels, blocker=blocker, retries=retries)
+                      updated=i.get("updatedAt") or "", labels=labels, blocker=blocker,
+                      retries=retry_comments(retry_messages))
         if ZTE_LABEL not in labels:
             batch_ids(ticket)
         return ticket
@@ -579,6 +578,7 @@ class LocalTracker:
             blocker = environment_blocker(self.repo.name, tid)
         ticket = task_ticket(row, comments_text(comments), blocker)
         ticket.retries = retries
+        ticket.version, ticket.state = row.get("version"), row["state"]
         return ticket
 
     def prepare(self) -> list[str]:
@@ -627,7 +627,7 @@ def task_ticket(row: dict, comments: str = "", blocker: str = "") -> Ticket:
     return Ticket(row["id"], row["id"], row["title"] or "", body=row["body"] or "(no description)",
                   comments=comments, open=row["state"] not in config.TASK_FINISHED,
                   kind=row["kind"] if row["kind"] in config.KINDS else "feat", created=row["created"] or "",
-                  updated=row["updated"] or "", blocker=blocker, version=row.get("version"), state=row["state"])
+                  updated=row["updated"] or "", blocker=blocker)
 
 
 def route_label(repo: config.Repo) -> str:
@@ -720,23 +720,6 @@ def safe_filename(name: str) -> str:
 
 def from_arete(body: str) -> bool:
     return body.lstrip().startswith(ARETE_TAG)
-
-
-def github_hold(labels: Iterable[str]) -> str:
-    names = set(labels)
-    if ZTE_LABEL in names:
-        return ZTE_QUEUE
-    if NO_AGENT in names:
-        return NO_AGENT_HOLD
-    return label_hold(names & HOLD_LABELS)
-
-
-def github_park_hold(labels: Iterable[str]) -> str:
-    return label_hold(PARK_CONFLICTS.intersection(labels))
-
-
-def label_hold(labels: set[str]) -> str:
-    return f"its `{min(labels)}` label prevents automatic admission" if labels else ""
 
 
 def retry_marker(body: str) -> re.Match | None:

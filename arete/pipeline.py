@@ -388,7 +388,8 @@ class AgentRun:
                 for n, wait in enumerate(BUSY_WAITS, 2):
                     if not provider_busy(res) or self.time_for(wait) < wait:
                         break
-                    self.log(f"{step}: {res.error.strip().splitlines()[0][:200]}; "
+                    reason = "provider busy" if run_lines.finding_step(step) else util.first_line(res.error, 200)
+                    self.log(f"{step}: {reason}; "
                              f"try {n} of {len(BUSY_WAITS) + 1} in {wait}s")
                     time.sleep(wait)
                     res = self.again(step, text, cwd, kw, res, CONTINUE_AFTER_BUSY)
@@ -432,7 +433,10 @@ class AgentRun:
                                    "turns": res.turns, "text": res.text, "structured": res.structured,
                                    "error": res.error, "runner": usage["runner"], "model": usage["model"],
                                    "skipped": res.skipped})
-        self.log(f"{step}: {'ok' if res.ok else 'FAILED ' + util.first_line(res.error)} {runner.cost_note(res)}")
+        status = "ok" if res.ok else "FAILED"
+        if not res.ok and not run_lines.finding_step(step):
+            status += f" {util.first_line(res.error)}"
+        self.log(f"{step}: {status} {runner.cost_note(res)}")
         return res
 
 
@@ -457,7 +461,7 @@ class Run(AgentRun):
     base_note: str = ""
     kept_note: str = ""
     parked_branch: str = ""
-    readmitted_park: str = ""
+    readmitted_retry: bool = False
     retry_run: str = ""
     environment_release: str = ""
     preview_of: str = ""
@@ -1443,24 +1447,20 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             budget_history = run_store.ticket_runs(repo.name, tid, limit=1, live=bool(retry_of or preview_of))
             readmission = None if force else runlimits.Readmission.decode(launch_lease.readmission(repo.name, str(tid)))
             readmitted_ticket = tk.get(tid) if readmission else None
-            closed_pr_revision = bool(readmission and not readmission.feedback
-                                      and isinstance(tk, (tracker.GitHubTracker, tracker.JiraTracker))
-                                      and not readmitted_ticket.open and pending_feedback(repo.name, tid))
             blocked, reset_budget = runlimits.admission(repo, str(tid), tk, runlimits.Policy.of(layer), force,
-                                                       readmission=readmission, ticket=readmitted_ticket,
-                                                       closed_pr_revision=closed_pr_revision)
-            parked_branch, readmitted_park = "", ""
-            park = {}
-            if reset_budget:
+                                                       readmission=readmission, ticket=readmitted_ticket)
+            parked_branch, readmitted_retry = "", False
+            if reset_budget and readmission:
                 parked_run, park = runlimits.latest_park(repo.name, str(tid))
-                parked_branch = runlimits.park_branch(parked_run, park)
-                readmitted_park = parked_run["id"]
-                if (park and readmission and not dry_run and script and script.path == "orchestrate"
-                        and script.continues == readmitted_park and not (script.only or script.again or script.action)):
-                    from .orchestration import restart_parked_revision
+                readmitted_retry = bool(park and runlimits.park_retry(parked_run, park, readmitted_ticket))
+                if readmitted_retry:
+                    parked_branch = runlimits.park_branch(parked_run, park)
+                    if (not dry_run and script and script.path == "orchestrate"
+                            and script.continues == parked_run["id"] and not (script.only or script.again or script.action)):
+                        from .park_retries import restart_parked_revision
 
-                    if restart_parked_revision(cfg, repo, layer, closed_context, parked_run, park, readmitted_ticket):
-                        script = replace(script, continues="")
+                        if restart_parked_revision(cfg, repo, layer, closed_context, parked_run, park, readmitted_ticket):
+                            script = replace(script, continues="")
         except tracker.ERRORS as e:
             print(f"could not read {name}: {e}")
             return 2
@@ -1556,7 +1556,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     return settle_zte_refusal(repo.name, str(tid), slot, run_id, error, committed=committed)
             else:
                 run_id = start()
-            if park and readmission and readmission.feedback and not dry_run:
+            if readmitted_retry and readmission.feedback and not dry_run:
                 readmission.attempted(record=True)
             scratch.RUN_BASELINES[run_id] = producer_baseline
             scratch.RUN_LABELS[run_id] = service_labels
@@ -1564,7 +1564,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                       feedback=[] if mending or zte_grant else pending_feedback(repo.name, tid), repairs=mending,
                       answering=earlier if earlier and earlier["status"] == "needs-info" else {},
                       launch_gate=admission, launch_done=launch_done, closed_context=closed_context, preview_of=preview_of,
-                      parked_branch=parked_branch, readmitted_park=readmitted_park,
+                      parked_branch=parked_branch, readmitted_retry=readmitted_retry,
                 **(script.run_fields if script else {}))
             try:
                 with handoff_io():
@@ -3101,13 +3101,13 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
     record_attempt = step_name == prompt_name == role == "verify"
     if record_attempt:
         b.run.write_line("verification_start", step=step)
-    startup_failed = False
+    startup_error = None
     try:
         verified = _use_product(b, step, prompt_name, role, require_released, **values)
     except verify.ServerError as error:
-        startup_failed = True
+        startup_error = str(error)
         b.run.log(f"{step}: the app did not start")
-        fault = verify.environment_fault(str(error))
+        fault = verify.environment_fault(startup_error)
         verified = (verify.Verified("blocked", "The app could not start in the verifier's sandbox.",
                                     blocked_by=f"the app could not start in the verifier's sandbox ({fault}); "
                                                "the start log stays in the run folder", finished=False,
@@ -3116,9 +3116,13 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
     if record_attempt:
         from . import park_retries
 
+        startup_failed = startup_error is not None
         if not verified.saved and verified.verdict != "pass":
-            b.run.save(f"{step}-attempt.json", {"verdict": verified.verdict, "summary": verified.summary,
-                                               "blocked_by": verified.blocked_by, "checks": verified.checks})
+            attempt = {"verdict": verified.verdict, "summary": verified.summary,
+                       "blocked_by": verified.blocked_by, "checks": verified.checks}
+            if startup_failed and verified.verdict == "blocked":
+                attempt["error"] = startup_error
+            b.run.save(f"{step}-attempt.json", attempt)
         classes = park_retries.verification_classes(verified.verdict, len(verified.failed_checks), startup_failed)
         b.run.write_line("verification_end", step=step, verdict=verified.verdict, startup_failed=startup_failed,
                          parked_run=b.run.retry_run, finding_count=len(classes), finding_classes=classes)

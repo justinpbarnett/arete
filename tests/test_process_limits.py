@@ -100,8 +100,8 @@ class Isolated(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             return super().run(result)
 
-    def made_run(self, previous="", forced=False):
-        rid = record.start("pipeline", repo=self.repo.name, issue=self.ticket)
+    def made_run(self, previous="", forced=False, *, tag=""):
+        rid = record.start("pipeline", tag=tag, repo=self.repo.name, issue=self.ticket)
         directory = paths.RUNS_DIR / rid
         directory.mkdir()
         run = pipeline.Run(rid, self.repo, directory, tracker=self.local, tid=self.ticket, cfg=self.cfg)
@@ -849,6 +849,77 @@ class ParkRetryFixture(PollFixture):
 
 
 class LocalParkRetryTests(ParkRetryFixture):
+    def test_adw_retry_planner_keeps_its_echo_in_local_records(self):
+        unrelated = self.ticket
+        self.local.label(unrelated, add=["closed"])
+        self.repo.name = "Client Tools"
+        self.ticket = tasks_store.task_add(self.repo.name, "Keep my draft", "Save changes")
+        self.repo.layer_dir.mkdir()
+        (self.repo.layer_dir / "config.toml").write_text('[factory]\npath = "adw"\n')
+        self.cfg.replay = config.ReplayConfig(all=True)
+        parked = self.made_run(tag=f"{self.repo.name}-{self.ticket}")
+        private = "Synthetic private finding: Mara Doe's saved draft vanished."
+        self.parked_findings(parked, private)
+        self.park_for_triage(parked)
+        self.local.label(self.ticket, add=["failed"])
+
+        self.assertEqual(self.triage_parks(), 0)
+        ticket = self.local.get(self.ticket)
+        retry, = ticket.retries
+        self.assertEqual(retry.run_id, parked.id)
+        self.assertNotIn(private, retry.body)
+        self.assertEqual(park_retries.ticket_evidence(self.repo.name, replace(ticket, id=unrelated), parked.id), [])
+        for bad in ("../other", r"Client\Tools", "Client\nTools", "Client\tTools", "Client-->Tools"):
+            self.assertIsNone(tracker.retry_marker(retry.body.replace(self.repo.name, bad)))
+
+        ws = paths.WORKTREES_DIR / f"{self.repo.name}-{self.ticket}"
+        ws.mkdir()
+        checkout = workspace.Checkout("", "", self.repo.path, ws, "main")
+        git = util.git
+
+        def fixture_git(args, cwd, **kw):
+            return "a" * 40 if args == ["rev-parse", "HEAD"] and cwd == ws else git(args, cwd, **kw)
+
+        def drive(flow):
+            self.assertTrue(flows.step(flow, "prepare", tree=str(flow.ctx.ws)).passed)
+            self.assertTrue(flows.step(flow, "plan").passed)
+            return "noop", "Plan recorded", ""
+
+        script = pipeline.Script("feature", drive)
+        result = Result(ok=True, structured={"plan": private, "verify": private, "left_for_a_person": private,
+                                             "assumptions": [private]})
+        log = paths.LOG_DIR / pipeline.RUNS_LOG
+        with (patch.object(flows, "local_workspace", return_value=[checkout]),
+              patch.object(util, "git", side_effect=fixture_git),
+              patch.object(pipeline, "settle_starts"), patch.object(pipeline, "furnish", return_value=""),
+              patch.object(pipeline.runner, "run", return_value=result) as call,
+              log.open("w") as output, contextlib.redirect_stdout(output)):
+            def spawn(repo, tid):
+                self.assertEqual(self.run_polled_ticket(repo, tid, pipeline._run, script=script), 0)
+
+            rc = self.poll_with(self.cfg, spawn)
+        service_log = log.read_text()
+        self.assertEqual(rc, 0, service_log)
+        call.assert_called_once()
+        rid, step = call.call_args.kwargs["trace"]
+        self.assertEqual(step, "plan")
+        self.assertIn(retry.body, call.call_args.args[0])
+        self.assertIn(private, call.call_args.args[0])
+        self.assertEqual((paths.RUNS_DIR / rid / "plan.md").read_text(), private)
+        lines = run_lines.read(rid)
+        planned, = [line for line in lines if line["event"] == "step_end" and line["step"] == "plan"]
+        self.assertEqual(planned["data"]["plan"], private)
+        self.assertIn(private, lines[-1]["assumptions"])
+        self.assertIn(private, lines[-1]["left_for_a_person"])
+        self.assertNotIn(private, service_log)
+        self.assertIn(parked.id, service_log)
+        self.assertIn("Review blocker", service_log)
+        with foundation.reader() as conn:
+            derived = [json.loads(row[0]) for row in conn.execute(
+                "SELECT data FROM events_log WHERE class = 'derived' AND json_extract(data, '$.run') = ?", (rid,))]
+        self.assertTrue(any(event.get("step") == "plan" and event.get("result") == "pass" for event in derived))
+        self.assertNotIn(private, json.dumps(derived))
+
     def test_triage_rewrites_readmit_with_findings_and_third_park_stays_failed(self):
         self.repo.layer_dir.mkdir()
         (self.repo.layer_dir / "config.toml").write_text('[factory]\npath = "classic"\n')
@@ -909,10 +980,12 @@ class LocalParkRetryTests(ParkRetryFixture):
             self.assertEqual(self.local.get(self.ticket).retries, ticket.retries)
             with patch.object(workspace, "make_workspace", return_value=(workspace_dir, [checkout])), \
                     patch.object(runlimits, "heads", return_value={}), \
+                    patch.object(pipeline, "git", return_value="a" * 40), \
                     patch.object(pipeline, "settle_starts"), patch.object(pipeline, "furnish", return_value=""), \
-                    patch.object(pipeline.Run, "agent", autospec=True, side_effect=planner):
+                    patch.object(pipeline.Run, "agent", autospec=True, side_effect=planner), \
+                    contextlib.redirect_stdout(io.StringIO()) as service_log:
                 self.assertEqual(self.poll_with(self.cfg, lambda repo, tid: self.run_polled_ticket(repo, tid, classic)), 0)
-            self.assertEqual(len(prompts), attempt + 1)
+            self.assertEqual(len(prompts), attempt + 1, service_log.getvalue())
             self.age_park(prompts[-1][0])
             self.assertIn("Current acceptance criteria that add to the ticket body", prompts[-1][1])
             self.assertIn(ticket.retries[-1].body, prompts[-1][1])
@@ -931,6 +1004,10 @@ class LocalParkRetryTests(ParkRetryFixture):
             self.assertIn("Review blocker", log)
             self.assertNotIn(reasons[attempt], json.dumps(event))
             self.assertNotIn(reasons[attempt], log)
+            self.assertIn(ticket.retries[-1].run_id, service_log.getvalue())
+            self.assertIn("Review blocker", service_log.getvalue())
+            self.assertNotIn(reasons[attempt], service_log.getvalue())
+            self.assertNotIn("Private raw page text", service_log.getvalue())
         self.assertEqual(self.triage_parks(), 0)
         self.assertEqual(self.triage_parks(), 0)
         self.assertEqual(self.local.get(self.ticket).body, original)
@@ -939,14 +1016,14 @@ class LocalParkRetryTests(ParkRetryFixture):
         self.assertEqual(self.poll_with(self.cfg, lambda *_: self.fail("third park restarted")), 0)
 
     def test_triage_skips_missing_route_environment_and_held_or_kept_work(self):
+        self.local.label(self.ticket, add=["closed"])
         budget = "the repair chain used its 2 repair cycles"
         cases = [("missing route", {}, False, False), ("held scratch", {}, False, False),
                  (budget, {".": {"head": "kept"}}, False, False), (budget, {}, True, False),
                  (budget, {}, False, True),
                  ("controller used its 4 decision allowance", {".": {"head": "kept"}}, False, False),
                  ("run used its 3 action allowance", {}, True, False),
-                 ("run used its 3 action allowance", {}, False, True),
-                 ("controller used its 4 inference-launch allowance", {}, False, False)]
+                 ("run used its 3 action allowance", {}, False, True)]
         for reason, kept, held, environment in cases:
             with self.subTest(reason=reason, kept=kept, held=held, environment=environment):
                 self.ticket = tasks_store.task_add(self.repo.name, "Do the work", "Work")
@@ -963,6 +1040,9 @@ class LocalParkRetryTests(ParkRetryFixture):
                     self.assertEqual(self.triage_parks(), 0)
                 self.assertEqual(self.local.get(self.ticket).body, "Do the work")
                 self.assertEqual(tasks_store.task_comments(self.ticket), [])
+                started = []
+                self.assertEqual(self.poll_with(self.cfg, lambda _, tid: started.append(tid)), 0)
+                self.assertNotIn(self.ticket, started)
 
     def test_triage_retries_clean_controller_allowance_parks(self):
         self.local.label(self.ticket, add=["closed"])
@@ -971,7 +1051,7 @@ class LocalParkRetryTests(ParkRetryFixture):
             '[factory]\npath = "orchestrated"\n[orchestration]\nmax_decisions = 1\nmax_actions = 1\n')
         self.cfg.replay = config.ReplayConfig(all=True)
 
-        for allowance in ("decision", "action"):
+        for allowance in ("decision", "action", "inference-launch"):
             with self.subTest(allowance=allowance):
                 self.ticket = tasks_store.task_add(self.repo.name, "Fixture body", f"{allowance} limit")
                 started = []
@@ -989,6 +1069,10 @@ class LocalParkRetryTests(ParkRetryFixture):
 
                     def exhaust():
                         lease = controller.lease
+                        if allowance == "inference-launch":
+                            ledger.launched(lease, 1)
+                            ledger.launched(lease, 1)
+                            self.fail("the controller allowed another inference launch")
                         turn = ledger.begin(lease, {}, controller.policy.max_decisions)
                         if allowance == "decision":
                             ledger.reject(lease, turn, "Fixture decision consumed")
@@ -1036,7 +1120,7 @@ class LocalParkRetryTests(ParkRetryFixture):
         branch = f"first/{self.ticket}-fixture"
         branches, runs = [], []
 
-        def make(_run, _repo, _base, name, _ticket, _copy):
+        def make(_run, _repo, _base, name, _ticket, _copy, *, preview_of=""):
             branches.append(name)
             return ws, [checkout]
 
@@ -1052,6 +1136,7 @@ class LocalParkRetryTests(ParkRetryFixture):
             return self.run_polled_ticket(repo, tid, classic)
 
         with patch.object(workspace, "make_workspace", side_effect=make), \
+                patch.object(pipeline, "git", return_value="a" * 40), \
                 patch.object(pipeline, "settle_starts"), \
                 patch.object(pipeline, "furnish", return_value=""), \
                 patch.object(runlimits, "heads", return_value={"": ""}), \
@@ -1181,6 +1266,7 @@ outcome = "No approved tracker text"
 
         def work(cfg, run, slot):
             self.assertEqual(run.budget.parents, [])
+            run.enter("running")
             ticket = run.task_ticket()
             self.assertEqual(ticket.body, original)
             started.append(run.id)
@@ -1210,10 +1296,14 @@ outcome = "No approved tracker text"
                     {k: v for k, v in check.items() if k not in ("how", "saw")} for check in report["checks"]]})
             raise runlimits.Parked("the repair chain used its 2 repair cycles")
 
+        def edit_labels(_repo, _number, *, add, remove):
+            labels[:] = [label for label in labels if label["name"] not in remove]
+            labels.extend({"name": name} for name in add if {"name": name} not in labels)
+
         with patch.object(gh, "issue", return_value=issue), patch.object(gh, "gh", side_effect=command) as writes, \
                 patch.object(gh, "issues", side_effect=lambda repo, label, **kw: [
                     issue] if {"name": label} in labels else []), \
-                patch.object(pipeline.Run, "enter"), \
+                patch.object(gh, "issue_labels", side_effect=edit_labels) as label_writes, \
                 patch.object(triage, "sources", return_value=[]):
             run = self.park_remote_issue(source, "17")
             self.parked_findings(run, blocker)
@@ -1235,8 +1325,15 @@ outcome = "No approved tracker text"
             self.assertEqual(self.triage_parks(), 0)
             self.assertEqual(self.triage_parks(), 0)
             self.assertEqual(writes.call_count, 2)
+            self.assertEqual([call.kwargs["add"] for call in label_writes.call_args_list],
+                             [["agent:running"], ["agent:failed"], ["agent:running"], ["agent:failed"]])
             self.assertIn({"name": "agent:failed"}, labels)
             self.assertEqual(self.poll_with(self.cfg, lambda *_: self.fail("third park restarted")), 0)
+            comments.append({"body": "Owner reply alone", "author": issue["author"], "createdAt": util.iso()})
+            self.assertEqual(self.poll_with(self.cfg, lambda *_: self.fail("owner reply restarted the park")), 0)
+            labels.remove({"name": "agent:failed"})
+            self.assertEqual(self.poll_with(self.cfg, lambda *_: self.fail("label removal restarted the park")), 0)
+            self.assertEqual(writes.call_count, 2)
             self.assertEqual(issue["body"], original)
 
     def github_batch(self):
@@ -1265,7 +1362,7 @@ outcome = "No approved tracker text"
         def comment(_repo, _number, body, **_kw):
             comments.append({"body": body, "createdAt": util.iso(), "viewerDidAuthor": True})
 
-        hold_labels = tracker.HOLD_LABELS | tracker.PARK_CONFLICTS
+        hold_labels = runlimits.RETRY_HOLD_LABELS
         def listed(_repo, label, **_kw):
             return [{**issue, "labels": [lb for lb in labels if lb["name"] not in hold_labels]}] if {
                 "name": label} in labels else []
@@ -1445,8 +1542,9 @@ outcome = "No approved tracker text"
             self.assertEqual(controller.run.budget.policy.max_repair_cycles, repair_limit)
             self.assertNotEqual(controller.data["acceptance"], original_acceptance)
             snapshot = ledger.snapshot(controller.lease)
-            saved = snapshot["data"]["prepared"]["ticket"]["comments"]
-            self.assertIn(blocker, saved)
+            prepared = snapshot["data"]["prepared"]
+            self.assertEqual(prepared["retry_run"], prior.id)
+            self.assertNotIn(blocker, prepared["ticket"]["comments"])
             if fresh:
                 self.assertEqual(controller.lease.root, controller.run.id)
                 self.assertEqual(snapshot["turns"], 0)
@@ -1470,7 +1568,7 @@ outcome = "No approved tracker text"
             script = pipeline.Script("orchestrate", drive, continues=command[-1])
             self.assertEqual(self.run_polled_ticket(repo, tid, None, script=script), 1 if fresh else 0)
 
-        def make(_run, _repo, _base, branch, _tid, _copies):
+        def make(_run, _repo, _base, branch, _tid, _copies, *, preview_of=""):
             self.assertEqual(branch, "fixture/revision")
             return paths.WORKTREES_DIR / f"{self.repo.name}-17", []
 
@@ -1545,6 +1643,7 @@ outcome = "No approved tracker text"
             due, = flow.ctx.run.answers_due
             self.assertEqual(due["answers"], [{"header": "Save", "kind": "text", "text": answer}])
             started.append(flow.run_id)
+            issue["labels"][-1] = {"name": "agent:pr"}
             return "noop", "fixture", ""
 
         def spawn(repo, tid):
@@ -1568,7 +1667,12 @@ outcome = "No approved tracker text"
             ask_store.ask_add("revision-question", revision.id, self.repo.name, "17", "orchestrate_ask", "orchestrate",
                               "", "", [{"header": "Save", "question": "What should remain selected?", "kind": "text"}], {})
             record.settle(revision.id, "needs-info", pr_url=pr)
-            issue["comments"].append({"body": answer, "author": issue["author"], "createdAt": util.iso()})
+            asked = ask_store.ask_get("revision-question")["asked"]
+            issue["comments"].extend([
+                {"body": "[arete] What should remain selected?", "author": issue["author"], "createdAt": asked},
+                {"body": answer, "author": issue["author"],
+                 "createdAt": util.iso(util.parse_iso(asked) + timedelta(seconds=1))},
+            ])
             selected = []
             self.assertEqual(self.poll_with(self.cfg, lambda repo, tid: selected.append(tid)), 0)
             self.assertEqual(ask_store.ask_get("revision-question")["status"], "answered")
@@ -1865,7 +1969,8 @@ class ParkRecoveryTests(ParkRetryFixture):
                             patch.object(scratch, "make", return_value=None), \
                             patch.object(verify, "serving", side_effect=serving), \
                             patch.object(build, "resume", side_effect=lambda step, _, role: run.budget.charge(step, role)), \
-                            patch.object(build, "recheck"), self.assertRaises(runlimits.Parked) as parked:
+                            patch.object(build, "recheck"), contextlib.redirect_stdout(io.StringIO()) as service_log, \
+                            self.assertRaises(runlimits.Parked) as parked:
                         if mode == "classic":
                             pipeline.verify_in_use(build, job.goal, job.build_summary)
                         else:
@@ -1888,6 +1993,7 @@ class ParkRecoveryTests(ParkRetryFixture):
                     for private in ("Fixture verify summary", "Synthetic command", "Synthetic page contents",
                                     "Synthetic startup output", "/var/tmp/private.log"):
                         self.assertNotIn(private, body)
+                        self.assertNotIn(private, service_log.getvalue())
 
     def test_retry_uses_latest_verify_step_end_even_without_saved_outcome(self):
         for newest in ({"step": "verify2", "ok": False},
@@ -1900,6 +2006,7 @@ class ParkRecoveryTests(ParkRetryFixture):
                 if newest is None:
                     (run.dir / "verify2-server.log").write_text("Raw failure from /tmp/private.log")
                 else:
+                    run_lines.write(run.id, "verification_end", step="verify", verdict="fail")
                     run_lines.write(run.id, "step_end", **newest, error="Raw failure from /tmp/private.log")
                 last_line = len(run_lines.path(run.id).read_text().splitlines())
                 self.park_for_triage(run)
@@ -1911,9 +2018,41 @@ class ParkRecoveryTests(ParkRetryFixture):
                 self.assertIn("Preserve the draft when saving fails", context)
                 self.assertNotIn("Private raw page text", context)
                 self.assertNotIn("/tmp/private.log", body)
+                self.assertIn("Raw failure from /tmp/private.log", context)
                 if newest:
-                    self.assertIn("Raw failure from /tmp/private.log", context)
                     self.assertIn(f"`run.jsonl:{last_line}`", body)
+
+    def test_legacy_adw_verify_event_recovers_only_the_selected_worker_diagnostic(self):
+        short = "The verifier stopped while saving the draft."
+        older = short + "\nOlder worker diagnostic."
+        newest = short + "\nNewest worker diagnostic."
+        for numbered_names, saved_newest in ((True, True), (False, True), (True, False), (False, False)):
+            with self.subTest(numbered_names=numbered_names, saved_newest=saved_newest):
+                self.ticket = tasks_store.task_add(self.repo.name, "Keep the draft", "Save changes")
+                run = self.made_run()
+                self.parked_findings(run, "Restore the draft on failure")
+                run.save("verify.json", {"ok": False, "error": older})
+                if saved_newest:
+                    run.save("verify2.json", {"ok": False, "error": newest})
+                data = {"verified": asdict(verify.Verified("blocked", "Verifier stopped", blocked_by=short))}
+                if numbered_names:
+                    data["names"] = {"verify": 2}
+                else:
+                    run_lines.write(run.id, "step_start", step="verify", call="verify2", **{"try": 1})
+                run_lines.write(run.id, "step_end", step="verify", result="pass", data=data, **{"try": 1})
+                self.park_for_triage(run)
+                self.local.label(self.ticket, add=["failed"])
+                self.assertEqual(self.triage_parks(), 0)
+
+                ticket = run.task_ticket()
+                comment, = ticket.retries
+                self.assertIn("Verification blocked", comment.body)
+                self.assertNotIn(short, comment.body)
+                self.assertIn(short, ticket.comments)
+                self.assertNotIn("Older worker diagnostic", ticket.comments)
+                self.assertNotIn("Private raw page text", ticket.comments)
+                self.assertEqual(newest in ticket.comments, saved_newest)
+                self.assertEqual("`verify2.json:1`" in comment.body, saved_newest)
 
     def test_verifier_worker_failure_keeps_its_evidence_when_the_app_log_is_empty(self):
         for mode in ("classic", "adw"):
@@ -1945,7 +2084,8 @@ class ParkRecoveryTests(ParkRetryFixture):
         with patch.object(verify, "serving", side_effect=serving), \
                 patch.object(scratch, "make", return_value=None), \
                 patch.object(pipeline.browser, "mcp_config", return_value=""), \
-                patch.object(pipeline.runner, "run", return_value=Result(ok=False, error=full_error)):
+                patch.object(pipeline.runner, "run", return_value=Result(ok=False, error=full_error)), \
+                contextlib.redirect_stdout(io.StringIO()) as service_log:
             if mode == "adw":
                 outcome = factory.Flow(run.id, job).run("verify", (str(self.repo.path),), {})
                 result = verify.Verified.stored(outcome.data["verified"])
@@ -1958,6 +2098,8 @@ class ParkRecoveryTests(ParkRetryFixture):
                              if line["event"] == "verification_end" and line["step"] == "verify2"]
         self.assertEqual(verification_end["finding_classes"], ["Verification blocked"])
         self.assertNotIn(short_error, json.dumps(verification_end))
+        self.assertNotIn(short_error, service_log.getvalue())
+        self.assertNotIn(short_error, (run.dir / "run.log").read_text())
         self.park_for_triage(run)
         self.local.label(self.ticket, add=["failed"])
         self.assertEqual(self.triage_parks(), 0)

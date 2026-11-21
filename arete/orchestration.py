@@ -17,7 +17,6 @@ from . import (
     gh,
     journeys,
     owner_asks,
-    park_retries,
     pilot,
     pipeline,
     prompt_loader,
@@ -53,11 +52,11 @@ def policy_fingerprint(cfg, layer, closed_context):
                                                 "closed_context": closed_context}, default=str)))
 
 
-def task_goal(title, body):
+def _task_goal(title, body):
     return f"Check the issue and owner's answers in use:\n{title}\n{body}"
 
 
-def continuation_blocker(lease, *, decision_boundary=False):
+def lease_continuation_blocker(lease, *, decision_boundary=False):
     for turn in ledger.pending(lease):
         launch = turn["response"] or {}
         if delegation.live(launch.get("pid"), launch.get("identity")):
@@ -72,24 +71,6 @@ def continuation_blocker(lease, *, decision_boundary=False):
             if action["state"] not in ledger.TERMINAL:
                 return f"accepted action {action['id']} is unfinished ({action['state']})"
     return ""
-
-
-def restart_parked_revision(cfg, repo, layer, closed_context, row, park, ticket):
-    if (row["status"] != "failed" or row.get("only_step") or not row.get("pr_url")
-            or not runlimits.park_retry(row, park, ticket)):
-        return False
-    prior = ledger.find(row["id"])
-    if not prior or prior["current_run"] != row["id"]:
-        return False
-    data = prior["data"]
-    saved_policy = data.get("policy_sha")
-    shared_policy_changed = (data.get("prepared", {}).get("layer") == str(layer.dir) and saved_policy
-                             and saved_policy != policy_fingerprint(cfg, layer, closed_context))
-    if not (shared_policy_changed or park_retries.CONTROLLER_ALLOWANCE.fullmatch(str(park.get("reason") or ""))):
-        return False
-    lease = ledger.Lease(prior["root"], prior["current_run"], prior["generation"])
-    return (park_retries.retryable(repo, ticket.id, row, park) and not continuation_blocker(lease)
-            and bool(pipeline.pending_feedback(repo.name, ticket.id)))
 
 
 class Controller:
@@ -128,8 +109,11 @@ class Controller:
         self.job.take(name, outcome, stored=False)
         return outcome
 
+    def continuation_blocker(self, *, decision_boundary=False):
+        return lease_continuation_blocker(self.lease, decision_boundary=decision_boundary)
+
     def quiescent(self):
-        if why := continuation_blocker(self.lease):
+        if why := self.continuation_blocker():
             raise factory.Refused(why)
 
     def write_lineage_event(self):
@@ -139,13 +123,13 @@ class Controller:
             del self.data["lineage_event"]
             ledger.save(self.lease, self.data)
 
-    def refresh_task(self, prepared):
+    def _refresh_retry_task(self, prepared):
         current = self.run.tracker.get(self.run.tid)
         ticket = prepared["ticket"]
-        previous_goal = task_goal(ticket["title"], ticket["body"])
+        previous_goal = _task_goal(ticket["title"], ticket["body"])
         goal_base = self.data.get("goal_base", "")
         if goal_base.startswith(previous_goal):
-            self.data["goal_base"] = task_goal(current.title, current.body) + goal_base[len(previous_goal):]
+            self.data["goal_base"] = _task_goal(current.title, current.body) + goal_base[len(previous_goal):]
         ticket.update(title=current.title, body=current.body, comments=current.comments, labels=current.labels)
         prepared.pop("retry_run", None)
         prepared.update(flows.prepared_retry(current))
@@ -185,8 +169,8 @@ class Controller:
                 if missing:
                     if why := self.job.restore({"step": "prepare", "tree": str(self.job.ws), "data": prepared}, layer=self.job.layer):
                         raise factory.Refused(why)
-                if self.run.readmitted_park:
-                    self.refresh_task(prepared)
+                if self.run.readmitted_retry:
+                    self._refresh_retry_task(prepared)
                 self.job.take("prepare", factory.Outcome("pass", data=prepared), stored=True)
             for name, value in self.data.get("job", {}).items():
                 if name in STATE_FIELDS:
@@ -209,7 +193,7 @@ class Controller:
             if not outcome.passed:
                 return flows.ended(self.flow, outcome)
             self.data["prepared"] = outcome.data
-            self.job.goal = task_goal(self.job.ticket.title, self.job.ticket.body)
+            self.job.goal = _task_goal(self.job.ticket.title, self.job.ticket.body)
             self.job.plan_text = ""
         if self.run.repairs:
             found = repairs.source(pipeline.run_store.run_get(self.run.repairs) or {})
@@ -281,7 +265,7 @@ class Controller:
         changes = ", ".join(f"{key} changed ({str(value)[:8]} → {found[key][:8]})" for key, value in old.items())
         if old.keys() - REFRESHABLE_LINEAGE:
             raise factory.Refused(f"{changes}; reconcile before resuming")
-        if why := continuation_blocker(self.lease, decision_boundary=bool(old)):
+        if why := self.continuation_blocker(decision_boundary=bool(old)):
             raise factory.Refused(f"{changes}; {why}; reconcile before resuming" if old else why)
         return found, old
 
