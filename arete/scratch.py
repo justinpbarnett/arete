@@ -54,6 +54,7 @@ SECRET = "signing.secret"
 NEXT_SECRET = "signing.secret.next"
 ROTATION_MARKER = "rotation.marker"
 SETTLED = "settled"
+RECEIPTS = "settlement-receipts"
 SETTLE_AFTER_SECONDS = 3600
 MAX_INSPECTED_BYTES = 16 * 1024 * 1024
 SELECTOR_FILE = re.compile(r"^[0-9a-f]{64}\.json$")
@@ -134,14 +135,26 @@ def authority_fd(create: bool = False):
         yield fd
 
 
+@contextmanager
+def private_directory(fd: int, folder: str, *, create: bool = False):
+    with paths.directory_fd(Path(folder), fd, create=create) as directory:
+        st = os.fstat(directory)
+        if st.st_uid != os.getuid() or st.st_mode & 0o077:
+            raise PermissionError(f"{folder} is not private")
+        yield directory
+
+
+def stored_in(fd: int, folder: str) -> list[str]:
+    try:
+        with private_directory(fd, folder) as directory:
+            return sorted(f"{folder}/{name}" for name in os.listdir(directory))
+    except FileNotFoundError:
+        return []
+
+
 def stored_files(fd: int) -> list[str]:
     names = [n for n in os.listdir(fd) if n.endswith(".json") or n == "browser-server.pin"]
-    try:
-        with paths.directory_fd(Path(SETTLED), fd) as settled:
-            names += [f"{SETTLED}/{n}" for n in os.listdir(settled)]
-    except FileNotFoundError:
-        pass
-    return sorted(names)
+    return sorted(names + stored_in(fd, SETTLED) + stored_in(fd, RECEIPTS))
 
 
 def mint_secret(fd: int) -> None:
@@ -273,6 +286,10 @@ def verifies(fd: int, key: bytes, name: str) -> bool:
     try:
         if name == browser.PIN:
             browser.load_pin(fd, key)
+        elif "/" in name:
+            folder, leaf = name.split("/", 1)
+            with private_directory(fd, folder) as directory:
+                load(directory, key, leaf[:-5])
         else:
             load(fd, key, name[:-5])
     except (OSError, ValueError, KeyError, TypeError):
@@ -285,6 +302,11 @@ def resign(fd: int, old: bytes, new: bytes, name: str) -> None:
 
     if name == browser.PIN:
         browser.store_pin(fd, new, browser.load_pin(fd, old))
+    elif "/" in name:
+        folder, leaf = name.split("/", 1)
+        with private_directory(fd, folder) as directory:
+            store(directory, new, load(directory, old, leaf[:-5]))
+            os.fsync(directory)
     else:
         store(fd, new, load(fd, old, name[:-5]))
 
@@ -321,6 +343,9 @@ def rotate() -> tuple[int, int]:
         files = sorted(n for n in listing if n.endswith(".json")) + [n for n in listing if n == browser.PIN]
         marker = resigned_names(fd)
         has_next = NEXT_SECRET in listing
+        files += [name for name in stored_in(fd, RECEIPTS) if SELECTOR_FILE.fullmatch(Path(name).name)]
+        settled = stored_in(fd, SETTLED)
+        files += [name for name in settled if name in (marker or ()) or verifies(fd, old, name)]
         if not has_next:
             bad = [n for n in files if not verifies(fd, old, n)]
             if bad:
@@ -330,6 +355,7 @@ def rotate() -> tuple[int, int]:
                 os.unlink(ROTATION_MARKER, dir_fd=fd)
                 return rotation_counts(marker, files)
         new = rotation_secret(fd, marker is not None)
+        files += [name for name in settled if name not in files and verifies(fd, new, name)]
         bad = [n for n in files if not verifies(fd, new, n) and not verifies(fd, old, n)]
         if bad:
             raise unverified(bad)
@@ -467,6 +493,37 @@ def path_of(hold) -> str:
     return hold.path if isinstance(hold, Unreadable) else str(sandbox.AUTHORITY / (hold["attempt"]["selector"] + ".json"))
 
 
+def root_absent(root: str) -> bool:
+    if not absolute_text(root):
+        return False
+    try:
+        os.lstat(root)
+    except FileNotFoundError:
+        return True
+    return False
+
+
+def settled_record(selector: str, workspace: Path) -> bool:
+    try:
+        with authority_fd() as fd:
+            key = read_secret(fd)
+            try:
+                data = load(fd, key, selector)
+            except FileNotFoundError:
+                try:
+                    with private_directory(fd, SETTLED) as directory:
+                        data = load(directory, key, selector)
+                except FileNotFoundError:
+                    with private_directory(fd, RECEIPTS) as directory:
+                        data = load(directory, key, selector)
+        attempt = data["attempt"]
+        recorded = absolute_text(attempt["workspace"])
+        return bool(recorded and data["state"] == "done" and overlap(Path(recorded), workspace.resolve())
+                    and root_absent(attempt["root"]))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return False
+
+
 def alive(u: Unreadable) -> bool:
     if u.version == 2 and u.shaped and u.state == "done":
         return os.path.lexists(u.root)
@@ -521,12 +578,7 @@ def admitted(fd: int, key: bytes, name: str, now: float) -> bool:
 
 
 def move_settled(fd: int, name: str) -> None:
-    with suppress(FileExistsError):
-        os.mkdir(SETTLED, 0o700, dir_fd=fd)
-    with paths.directory_fd(Path(SETTLED), fd) as settled:
-        st = os.fstat(settled)
-        if st.st_uid != os.getuid() or st.st_mode & 0o077:
-            raise PermissionError("settled records folder is not private")
+    with private_directory(fd, SETTLED, create=True) as settled:
         os.rename(name, name, src_dir_fd=fd, dst_dir_fd=settled)
 
 
@@ -582,26 +634,27 @@ def prune_evidence(fd: int, selector: str) -> None:
     shutil.rmtree(selector, dir_fd=fd)
 
 
-def prune_settled(fd: int, settled: int, name: str) -> None:
-    st = os.stat(name, dir_fd=settled, follow_symlinks=False)
-    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
-        raise OSError(errno.ESTALE, "settled record is not a plain file of this user")
-    source = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=settled)
-    with os.fdopen(source, "rb") as inp:
-        record = claimed(str(sandbox.AUTHORITY / SETTLED / name), "", inp.read(MAX_RECORD_BYTES + 1), None, name)
-    if not record.shaped or record.state != "done":
-        raise ValueError("settled record is malformed or not done, left as it is")
-    prune_evidence(fd, name[:-5])
+def prune_settled(fd: int, settled: int, name: str, key: bytes) -> None:
+    selector = name[:-5]
+    data = load(settled, key, selector)
+    attempt = data["attempt"]
+    workspace = absolute_text(attempt.get("workspace"))
+    if data["state"] != "done" or not workspace or not root_absent(attempt.get("root", "")):
+        raise ValueError("settled record does not prove the scratch root is gone")
+    with private_directory(fd, RECEIPTS, create=True) as receipts:
+        store(receipts, key, {"version": 2, "state": "done", "source_mutations": False,
+                              "attempt": {"selector": selector, "workspace": workspace, "root": attempt["root"]}})
+        os.fsync(receipts)
+    os.fsync(fd)
+    prune_evidence(fd, selector)
     with suppress(FileNotFoundError):
-        os.unlink(name[:-5] + ".lease", dir_fd=fd)
+        os.unlink(selector + ".lease", dir_fd=fd)
     os.unlink(name, dir_fd=settled)
 
 
-def prune_old(fd: int, days: float, failures: list[str]) -> None:
+def prune_old(fd: int, key: bytes, days: float, failures: list[str]) -> None:
     try:
-        with paths.directory_fd(Path(SETTLED), fd) as settled:
-            if os.fstat(settled).st_uid != os.getuid():
-                raise PermissionError("settled records folder is not owned by this user")
+        with private_directory(fd, SETTLED) as settled:
             cutoff = time.time() - days * 86400
             for name in sorted(os.listdir(settled)):
                 path = sandbox.AUTHORITY / SETTLED / name
@@ -609,7 +662,7 @@ def prune_old(fd: int, days: float, failures: list[str]) -> None:
                     if not SELECTOR_FILE.match(name):
                         failures.append(f"{path}: not a settled record, left as it is")
                     elif os.stat(name, dir_fd=settled, follow_symlinks=False).st_mtime < cutoff:
-                        prune_settled(fd, settled, name)
+                        prune_settled(fd, settled, name, key)
                 except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
                     failures.append(f"{path}: {type(e).__name__}: {e}")
     except FileNotFoundError:
@@ -621,7 +674,8 @@ def settle(days: float) -> list[str]:
     with registry() as (fd, key):
         fcntl.flock(fd, fcntl.LOCK_EX)
         settle_hot(fd, key, failures)
-        prune_old(fd, days, failures)
+        if NEXT_SECRET not in os.listdir(fd):
+            prune_old(fd, key, days, failures)
     return failures
 
 

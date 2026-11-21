@@ -188,6 +188,15 @@ class GitHubTracker:
                               url=i.get("url", ""), created=i.get("createdAt", ""), labels=sorted(names)))
         return sorted(out, key=lambda t: t.created)
 
+    def queued_failure(self, labels: list[str]) -> bool:
+        names = set(labels)
+        return (LABEL in names and ZTE_LABEL not in names
+                and names & {self.label_name(s) for s in config.RUN_LABELS} == {self.label_name("failed")})
+
+    def failed_queue(self) -> list[str]:
+        return [str(i["number"]) for i in gh.issues(self.repo.github, self.label_name("failed"), limit=MAX_AGENT_ISSUES)
+                if self.by_owner(i) and self.queued_failure([label["name"] for label in i.get("labels", [])])]
+
     def by_owner(self, item: dict) -> bool:
         login = (item.get("author") or {}).get("login") or ""
         return bool(login) and login.lower() == self.owner.lower()
