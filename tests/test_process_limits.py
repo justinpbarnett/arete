@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import os
 import shutil
 import sqlite3
 import tempfile
@@ -14,6 +15,8 @@ from arete import (
     config,
     dbstats,
     delegation,
+    jira,
+    launch_lease,
     orchestration,
     outcomes,
     paths,
@@ -411,6 +414,25 @@ class BudgetTests(Isolated):
 
 
 class QueueTests(Isolated):
+    def park_ticket(self, branch=""):
+        self.repo.layer_dir.mkdir()
+        (self.repo.layer_dir / "config.toml").write_text('[factory]\npath = "classic"\n')
+        run = self.made_run()
+        run.budget.charge("review_fix1", "review_repair")
+        record.note(run.id, branch=branch)
+        run.budget.park("repair limit")
+        record.settle(run.id, "failed")
+        self.local.label(self.ticket, add=["failed"])
+        self.cfg.replay = config.ReplayConfig(all=True)
+        return run
+
+    def run_polled_ticket(self, repo, tid, work):
+        _, env = launch_lease.child_environment(())
+        with patch.dict(os.environ, env), patch.object(launch_lease, "registered"), \
+                patch.object(pipeline, "run_refusal", return_value=(False, "")), \
+                patch.object(pipeline, "_run", side_effect=work):
+            return pipeline.run_issue(repo, tid)
+
     def test_interrupted_ticket_rechecks_dependencies_before_starting(self):
         interrupted = self.made_run()
         record.settle(interrupted.id, "interrupted")
@@ -424,14 +446,252 @@ class QueueTests(Isolated):
         self.assertIn(prerequisite, started)
 
     def poll_with(self, cfg, spawn):
+        def launch_pending(repo, tid, launch):
+            with launch_lease.acquiring(repo, tid):
+                return launch()
+
         with patch.object(config, "load", return_value=cfg), patch.object(poll, "runnable", return_value=True), \
-                patch.object(tasks, "spawn_pending", side_effect=lambda repo, tid, launch: spawn(repo, tid)), \
+                patch.object(tasks, "spawn_pending", side_effect=launch_pending), \
+                patch.object(poll, "spawn_run", side_effect=spawn), \
+                patch.object(poll, "network_up_or_skip", return_value=True), \
                 patch.object(poll, "settle_abandoned_runs"), patch.object(outcomes, "sync_outcomes"), \
                 patch.object(outcomes, "sync_moves"), patch.object(outcomes, "sync_landings"), \
                 patch.object(poll, "retry_scratch"), \
                 patch.object(poll, "cleanup_worktrees"), patch.object(poll, "mark_loop"), \
                 patch.object(pipeline, "SKIPPED_FILE", self.root / "skipped.json"):
             return poll.poll()
+
+    def test_specification_edit_readmits_once_and_reparks_on_current_inputs(self):
+        parked = self.park_ticket()
+        with foundation.db() as connection:
+            set_task_body(self.ticket, "A narrower specification", connection=connection)
+        started = []
+
+        def work(cfg, run, slot):
+            started.append(run.id)
+            self.assertFalse(run.force)
+            self.assertEqual(run.budget.parents, [])
+            raise runlimits.Parked("repair limit again")
+
+        def spawn(repo, tid):
+            self.assertEqual(self.run_polled_ticket(repo, tid, work), 1)
+
+        self.assertEqual(self.poll_with(self.cfg, spawn), 0)
+        self.assertEqual(len(started), 1)
+        self.assertNotEqual(started[0], parked.id)
+        self.assertEqual(runlimits.latest_park(self.repo.name, self.ticket)[0]["id"], started[0])
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(self.poll_with(self.cfg, spawn), 0)
+        self.assertEqual(len(started), 1)
+        self.assertIn(f"parked after run {started[0]}: repair limit again", output.getvalue())
+        self.assertIn(runlimits.RETRY, output.getvalue())
+
+    def test_raised_layer_budget_readmits_a_failed_ticket(self):
+        self.park_ticket()
+        (self.repo.layer_dir / "config.toml").write_text('[factory]\npath = "classic"\n[limits]\nmax_repair_cycles = 3\n')
+        started = []
+
+        def work(cfg, run, slot):
+            started.append(run.budget.policy.max_repair_cycles)
+            self.assertFalse(run.force)
+            self.assertEqual(run.budget.parents, [])
+            return "noop", "fixture finished", ""
+
+        self.assertEqual(self.poll_with(self.cfg, lambda repo, tid: self.run_polled_ticket(repo, tid, work)), 0)
+        self.assertEqual(started, [3])
+
+    def test_branch_readmission_checks_origin_once_per_poll_and_fails_closed(self):
+        branch = "arete/fixture"
+        command = ["git", "ls-remote", "origin", f"refs/heads/{branch}"]
+        old, new = "a" * 40, "b" * 40
+        remote = SimpleNamespace(returncode=0, stdout=f"{old}\trefs/heads/{branch}\n")
+        calls, started = [], []
+        sh = util.sh
+
+        def read(cmd, *args, **kwargs):
+            if cmd == ["git", "remote", "get-url", "origin"]:
+                return SimpleNamespace(returncode=0, stdout="/tmp/fixture.git\n")
+            if cmd == command:
+                calls.append(cmd)
+                return remote
+            return sh(cmd, *args, **kwargs)
+
+        def work(cfg, run, slot):
+            started.append(run.id)
+            self.assertFalse(run.force)
+            self.assertEqual(run.budget.parents, [])
+            return "noop", "fixture finished", ""
+
+        def spawn(repo, tid):
+            self.assertEqual(self.run_polled_ticket(repo, tid, work), 0)
+
+        with patch.object(util, "sh", side_effect=read):
+            parked = self.park_ticket(branch)
+            unchanged = f"{old}\trefs/heads/{branch}\n{new}\trefs/heads/nested/refs/heads/{branch}\n"
+            moved = f"{new}\trefs/heads/{branch}\n"
+            cases = ((unchanged, 0, False), (moved, 1, False), ("truncated\n", 0, False), (moved, 0, True))
+            for stdout, returncode, should_start in cases:
+                with self.subTest(returncode=returncode, stdout=stdout):
+                    calls.clear()
+                    remote.returncode = returncode
+                    remote.stdout = stdout
+                    with contextlib.redirect_stdout(io.StringIO()) as output:
+                        self.assertEqual(self.poll_with(self.cfg, spawn), 0)
+                    self.assertEqual(calls, [command])
+                    self.assertEqual(len(started), int(should_start))
+                    if not should_start:
+                        self.assertIn(f"parked after run {parked.id}: repair limit", output.getvalue())
+                        self.assertIn(runlimits.RETRY, output.getvalue())
+                    if returncode:
+                        self.assertIn("could not confirm the parked branch head", output.getvalue())
+
+    def test_child_refuses_a_specification_or_policy_reverted_after_poll(self):
+        parked = self.park_ticket()
+        original = self.local.get(self.ticket).body
+        layer = self.repo.layer_dir / "config.toml"
+        original_layer = layer.read_text()
+
+        def set_body(body):
+            with foundation.db() as connection:
+                set_task_body(self.ticket, body, connection=connection)
+
+        for change, revert in (
+                (lambda: set_body("Changed specification"), lambda: set_body(original)),
+                (lambda: layer.write_text(original_layer + "[limits]\nmax_repair_cycles = 3\n"),
+                 lambda: layer.write_text(original_layer))):
+            change()
+
+            def spawn(repo, tid):
+                revert()
+                self.assertEqual(self.run_polled_ticket(repo, tid, lambda *_: self.fail("stale launch")), 2)
+
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(self.poll_with(self.cfg, spawn), 0)
+            self.assertIn(f"parked after run {parked.id}", output.getvalue())
+            self.assertEqual([row["id"] for row in run_store.ticket_runs(self.repo.name, self.ticket)], [parked.id])
+
+    def test_poll_does_not_repeat_a_launch_that_exits_before_registration(self):
+        self.park_ticket()
+        starts = []
+
+        def spawn(repo, tid):
+            starts.append(tid)
+
+        for body in ("First edit", "Second edit"):
+            with foundation.db() as connection:
+                set_task_body(self.ticket, body, connection=connection)
+            self.assertEqual(self.poll_with(self.cfg, spawn), 0)
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(self.poll_with(self.cfg, spawn), 0)
+            self.assertIn("Poll already tried these inputs.", output.getvalue())
+            self.assertEqual(runlimits.admission(self.repo, self.ticket, self.local, runlimits.Policy(), True),
+                             ("", True))
+        self.assertEqual(starts, [self.ticket, self.ticket])
+
+    def test_multi_origin_readmission_checks_complete_exact_refs_and_revalidates_origins(self):
+        branch = "arete/fixture"
+        ref = f"refs/heads/{branch}"
+        client, server = "a" * 40, "b" * 40
+        self.repo.tracker = "jira"
+        self.repo.parts = [config.Part("server", "Acme/server"), config.Part("client", "Acme/client")]
+        urls = {"client": "https://github.com/acme/client.git", "server": "git@github.com:acme/server.git"}
+        for name in urls:
+            (self.repo.path / name).mkdir()
+        lookups, calls, started = [], [], []
+        sh = util.sh
+
+        def repository(project, oid, name=branch):
+            ref_row = {"prefix": "refs/heads/", "name": name, "target": {"oid": oid}} if oid else None
+            return {"nameWithOwner": project, "ref": ref_row}
+
+        old_client = repository("Acme/client", client)
+        old_server = repository("Acme/server", server)
+        deleted = repository("Acme/client", "")
+        complete = {"part0": deleted, "part1": old_server}
+        reply = {}
+
+        def read(cmd, *args, **kwargs):
+            if cmd[:2] == ["git", "ls-remote"]:
+                name = kwargs["cwd"].name
+                lookups.append(name)
+                oid = client if name == "client" else server
+                return SimpleNamespace(returncode=0, stdout=f"{oid}\t{ref}\n")
+            if cmd == ["git", "remote", "get-url", "origin"]:
+                return SimpleNamespace(returncode=0, stdout=urls[kwargs["cwd"].name] + "\n")
+            if cmd[:3] == ["gh", "api", "graphql"]:
+                self.assertEqual(cmd[3:], ["--hostname", "github.com", "--input", "-"])
+                calls.append(json.loads(kwargs["input"]))
+                return SimpleNamespace(returncode=0, stdout=json.dumps(reply), stderr="")
+            return sh(cmd, *args, **kwargs)
+
+        def work(cfg, run, slot):
+            started.append(run.id)
+            self.assertEqual(run.budget.parents, [])
+            return "noop", "fixture finished", ""
+
+        with patch.object(util, "sh", side_effect=read), patch.object(tracker, "for_repo", return_value=self.local):
+            parked = self.park_ticket(branch)
+            self.assertCountEqual(lookups, ["client", "server"])
+            lookups.clear()
+            for response in ({"data": {"part0": old_client, "part1": old_server}},
+                             {"data": {"part0": deleted}},
+                             {"data": {"part0": deleted, "part1": {"nameWithOwner": "Acme/server"}}},
+                             {"data": complete, "errors": [{"message": "partial failure"}]},
+                             {"data": {**complete, "part1": repository("Acme/another", server)}},
+                             {"data": {**complete, "part1": repository("Acme/server", server, branch + "-other")}}):
+                with self.subTest(response=response):
+                    reply = response
+                    calls.clear()
+                    with contextlib.redirect_stdout(io.StringIO()) as output:
+                        self.assertEqual(self.poll_with(self.cfg, lambda *_: self.fail("unexpected launch")), 0)
+                    self.assertIn(f"parked after run {parked.id}", output.getvalue())
+                    self.assertEqual(len(calls), 1)
+                    self.assertEqual(calls[0]["variables"], {"ref": ref})
+                    self.assertIn('name: "client"', calls[0]["query"])
+                    self.assertIn('name: "server"', calls[0]["query"])
+
+            reply = {"data": complete}
+            urls["server"] = "https://github.com.example/acme/server.git"
+            calls.clear()
+            self.assertEqual(self.poll_with(self.cfg, lambda *_: self.fail("unverified origin")), 0)
+            self.assertEqual(calls, [])
+
+            urls["server"] = "git@github.com:acme/server.git"
+
+            def stale_origin(repo, tid):
+                urls["server"] = "https://github.com/acme/wrong.git"
+                self.assertEqual(self.run_polled_ticket(repo, tid, work), 2)
+
+            self.assertEqual(self.poll_with(self.cfg, stale_origin), 0)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(started, [])
+
+            urls["server"] = "git@github.com:acme/server.git"
+            reply = {"data": {**complete, "part1": repository("Acme/server", "c" * 40)}}
+            calls.clear()
+
+            def spawn(repo, tid):
+                self.assertEqual(self.run_polled_ticket(repo, tid, work), 0)
+
+            self.assertEqual(self.poll_with(self.cfg, spawn), 0)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(lookups, [])
+            self.assertEqual(len(started), 1)
+
+    def test_jira_parked_candidate_can_follow_a_page_of_ordinary_failures(self):
+        self.repo.jira_project = "FIXTURE"
+        source = tracker.JiraTracker(self.repo, self.cfg.jira)
+        client = jira.Client("https://example.invalid", "unused", "unused")
+        ordinary = [{"key": f"FIXTURE-{i}"} for i in range(1, 21)]
+        parked = {"key": "FIXTURE-21", "fields": {"summary": "Parked ticket"}}
+        with patch.dict(tracker._clients, {"": client}), patch.object(client, "get", side_effect=[
+            {"issues": [], "isLast": True},
+            {"issues": ordinary, "isLast": False, "nextPageToken": "next"},
+            {"issues": [parked], "isLast": True},
+        ]) as read:
+            self.assertEqual([ticket.id for ticket in source.todo(parked=lambda key: key == parked["key"])],
+                             [parked["key"]])
+        self.assertEqual(read.call_args.kwargs["nextPageToken"], "next")
 
     def test_one_poll_fills_capacity_round_robin_without_relying_on_child_rows(self):
         second = config.Repo(name="other", path=self.root / "other", tracker="local", pipeline=True)
@@ -454,6 +714,8 @@ class QueueTests(Isolated):
         parked = self.made_run()
         parked.budget.park("repair limit")
         record.settle(parked.id, "failed")
+        failed = tasks_store.task_add(self.repo.name, "Ordinary failure", "Ordinary failure", "feat")
+        self.local.label(failed, add=["failed"])
         extra = tasks_store.task_add(self.repo.name, "Ready", "Ready", "feat")
         cfg = config.Config(repos=[self.repo], max_parallel=8, max_parallel_per_repo=8,
                             replay=config.ReplayConfig(all=True))
@@ -462,6 +724,7 @@ class QueueTests(Isolated):
         self.assertIn(prerequisite, started)
         self.assertIn(extra, started)
         self.assertNotIn(blocked, started)
+        self.assertNotIn(failed, started)
         self.assertNotIn(self.ticket, started)
 
     def test_route_readiness_is_rechecked_after_every_start(self):
