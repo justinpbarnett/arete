@@ -29,6 +29,173 @@ from arete.agent import NO_SESSION, Result
 from arete.review import Review
 
 
+class ResolverScratchTests(unittest.TestCase):
+    MARKER = "arete-verification-scratch-v1\n"
+    LOG = ".arete-sandbox/logs/db.log"
+
+    def setUp(self):
+        self.enterContext(mock.patch.object(util, "repo_lock", return_value=nullcontext()))
+
+    def merge(self, log_changed_by=""):
+        self.root = Path(self.enterContext(TemporaryDirectory()))
+        self.git("init", "-q", "-b", "main")
+        self.git("config", "user.name", "Fixture")
+        self.git("config", "user.email", "fixture@example.test")
+        self.git("config", "commit.gpgsign", "false")
+        scratch_ignore = ".arete-sandbox/.arete-owned" if log_changed_by else ".arete-sandbox/"
+        (self.root / ".gitignore").write_text(f"{scratch_ignore}\nignored.local\nproject/.arete-owned\nproject/private.local\n")
+        (self.root / "project").mkdir()
+        (self.root / "project/tracked.txt").write_text("untouched\n")
+        (self.root / "conflict.txt").write_text("original\n")
+        self.git("add", ".")
+        log = self.root / self.LOG
+        if log_changed_by:
+            self.write_log()
+            (log.parent.parent / ".arete-owned").write_text(self.MARKER)
+            self.git("add", self.LOG)
+        self.git("commit", "-qm", "original")
+        self.git("checkout", "-qb", "branch")
+        (self.root / "conflict.txt").write_text("branch\n")
+        (self.root / "supplemental.txt").write_text("branch addition\n")
+        if log_changed_by in ("branch", "both"):
+            log.write_text("branch log\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "branch change")
+        self.git("checkout", "-q", "main")
+        (self.root / "conflict.txt").write_text("base\n")
+        if log_changed_by in ("base", "both"):
+            log.write_text("base log\n")
+        self.git("commit", "-qam", "base change")
+        self.git("checkout", "-q", "branch")
+        self.git("merge", "--no-commit", "main", check=False)
+        self.conflicts = [self.LOG, "conflict.txt"] if log_changed_by == "both" else ["conflict.txt"]
+        self.assertEqual(pipeline.unmerged_paths(self.root), self.conflicts)
+        self.checkout = workspace.Checkout("", "fixture/repo", self.root, self.root, "main",
+                                           base_commit=self.git("rev-parse", "main"))
+        self.run = mock.Mock(repo=SimpleNamespace(name="repo"), sessions={}, owner_note="",
+                             settings=mock.Mock(return_value=SimpleNamespace(tries=1)))
+
+    def git(self, *args, check=True):
+        return util.git(list(args), self.root, check=check).strip()
+
+    def resolve(self, edit):
+        def agent(*args, **kwargs):
+            (self.root / "conflict.txt").write_text("branch and base\n")
+            edit()
+            return Result(ok=True, structured={"resolved": True})
+
+        self.run.agent.side_effect = agent
+        pipeline.resolve_conflicts(self.run, self.checkout, self.conflicts, config.RepoLayer(self.root),
+                                   tracker.Ticket("719", "#719", "Scratch exemption", "", ""))
+
+    def write_log(self):
+        log = self.root / self.LOG
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a") as out:
+            out.write("verification ran\n")
+
+    def assert_outside_conflict(self, edit, paths):
+        with self.assertRaises(workspace.RunFailed) as failed:
+            self.resolve(edit)
+        self.assertEqual(str(failed.exception), f"the resolver edited files outside the conflict in fixture/repo: {paths}")
+
+    def test_wrapper_scratch_stays_out_of_merge(self):
+        self.merge()
+        scratch = self.root / ".arete-sandbox"
+        scratch.mkdir()
+        (scratch / ".gitignore").write_text("*\n")
+        (scratch / ".arete-owned").write_text(self.MARKER)
+
+        def edit():
+            self.write_log()
+            (self.root / "supplemental.txt").write_text("updated branch addition\n")
+
+        with mock.patch.object(pipeline, "git", wraps=pipeline.git) as git:
+            self.resolve(edit)
+        staged = [call.args[0] for call in git.call_args_list if call.args[0][0] == "add"]
+        self.assertEqual(staged, [["add", "-A", "--", "conflict.txt", "supplemental.txt"]])
+        self.assertEqual(len(self.git("rev-list", "--parents", "-n", "1", "HEAD").split()), 3)
+        self.assertEqual(self.git("show", "HEAD:conflict.txt"), "branch and base")
+        self.assertEqual(self.git("show", "HEAD:supplemental.txt"), "updated branch addition")
+        self.assertEqual(self.git("ls-tree", "-r", "--name-only", "HEAD", "--", ".arete-sandbox"), "")
+        self.assertEqual((self.root / self.LOG).read_text(), "verification ran\n")
+
+    def test_invalid_scratch_markers_do_not_exempt_ignored_log_changes(self):
+        self.merge()
+        scratch = self.root / ".arete-sandbox"
+        marker = scratch / ".arete-owned"
+        (self.root / ".arete-owned").write_text(self.MARKER)
+        for kind in ("missing", "symlink", "wrong text"):
+            with self.subTest(marker=kind):
+                marker.unlink(missing_ok=True)
+                self.write_log()
+                if kind == "symlink":
+                    marker.symlink_to("../.arete-owned")
+                elif kind == "wrong text":
+                    marker.write_text("someone else's scratch\n")
+                self.assert_outside_conflict(self.write_log, self.LOG)
+
+    def test_scratch_exemption_preserves_other_path_checks(self):
+        self.merge()
+        folder = self.root / "project"
+        (folder / ".arete-owned").write_text(self.MARKER)
+        self.write_log()
+        (self.root / ".arete-sandbox/.arete-owned").write_text(self.MARKER)
+
+        def edit():
+            self.write_log()
+            (self.root / "ignored.local").write_text("ignored edit\n")
+            (folder / "private.local").write_text("scratch edit\n")
+            (folder / "tracked.txt").write_text("tracked edit\n")
+            (folder / "untracked.txt").write_text("untracked addition\n")
+
+        self.assert_outside_conflict(edit, "ignored.local, project/tracked.txt, project/untracked.txt")
+
+    def test_first_use_initializes_scratch_before_resolver(self):
+        self.merge()
+        scratch = self.root / ".arete-sandbox"
+        self.assertFalse(scratch.exists())
+
+        def edit():
+            self.assertEqual((scratch / ".arete-owned").read_text(), self.MARKER)
+            self.assertEqual((scratch / ".gitignore").read_text(), "*\n")
+            self.write_log()
+
+        self.resolve(edit)
+        self.assertEqual(self.git("ls-tree", "-r", "--name-only", "HEAD", "--", ".arete-sandbox"), "")
+
+    def test_resolver_cannot_make_an_ignored_path_scratch(self):
+        for initial in (None, "wrong text\n"):
+            with self.subTest(initial=initial):
+                self.merge()
+                marker = self.root / "project/.arete-owned"
+                ignored = self.root / "project/private.local"
+                if initial is not None:
+                    marker.write_text(initial)
+                ignored.write_text("original\n")
+
+                def edit():
+                    marker.write_text(self.MARKER)
+                    ignored.write_text("ignored edit\n")
+
+                self.assert_outside_conflict(edit, "project/.arete-owned, project/private.local")
+
+    def test_tracked_supplemental_scratch_edits_stay_out_of_merge(self):
+        for parent in ("branch", "base"):
+            with self.subTest(parent=parent):
+                self.merge(log_changed_by=parent)
+                self.resolve(self.write_log)
+                self.assertEqual(self.git("show", f"HEAD:{self.LOG}"), f"{parent} log")
+                self.assertEqual((self.root / self.LOG).read_text(), f"{parent} log\nverification ran\n")
+
+    def test_scratch_conflict_requires_a_person(self):
+        self.merge(log_changed_by="both")
+        with self.assertRaisesRegex(workspace.RunFailed, r"conflicts in protected paths.*db\.log.*a person must merge"):
+            self.resolve(self.write_log)
+        self.run.agent.assert_not_called()
+        self.assertEqual(pipeline.unmerged_paths(self.root), self.conflicts)
+
+
 class MovedBasePublicationTests(unittest.TestCase):
     def controller(self):
         root = Path(".")
