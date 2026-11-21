@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from arete import config, gh, jev, outbound, pipeline, verify, workspace
+from arete import config, flows, gh, jev, outbound, pipeline, verify, workspace
 from arete.review import Review
 
 READ_ONLY_GRANT = {"repositories": ["widgets"], "permissions": {"contents": "read"}}
@@ -186,6 +186,28 @@ class PushedPrDraftTests(unittest.TestCase):
         # Even callers passing a held checkout directly cannot enable merging.
         pipeline.automerge(self.build, None, why, self.verified, self.review, [self.c], "about")
         self.assertEqual(self.calls, [])
+
+    def test_passing_verify_retry_uses_the_normal_publication_and_automerge_gates(self):
+        self.run.environment_release = "d" * 40
+        self.run.story = []
+        self.run.repo.parts = [config.Part("", self.c.github)]
+        self.run.enter = self.run.say = self.logs.append
+        self.build.steps = {}
+        self.layer.verify = config.Verify()
+        ticket = SimpleNamespace(title="Fixture", labels=[])
+        job = SimpleNamespace(run=self.run, staged=lambda: self.build, b=self.build, approval=None, ticket=ticket,
+                              layer=self.layer, with_left=lambda text: text, goal="goal", build_summary="summary", draft_why="",
+                              review=self.review, picked=lambda names: [self.c] if names else [], with_prs=[self.c],
+                              opened=[], found=[], pushed=[], drafted=[], ci_stopped=[], changed=[self.c.github],
+                              summary="summary", ci_result="passed", policy=lambda *_: "policy")
+        flow = SimpleNamespace(ctx=job)
+        with mock.patch.object(pipeline, "check_in_use", return_value=self.verified):
+            result = flows.verify(flow, "fixture")
+        self.assertTrue(result.passed)
+        job.verified = verify.Verified.stored(result.data["verified"])
+        self.assertTrue(flows.publish(flow).passed)
+        self.assertFalse(self.draft)
+        self.assertEqual(len(self.names("api", "-X", "PUT")), 1)
 
     def test_person_only_work_never_automerges(self):
         for reason in ("risk", "pr trust", "triage"):

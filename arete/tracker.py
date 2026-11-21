@@ -199,17 +199,31 @@ class GitHubTracker:
             body = issue.get("body") or ""
             self._labels[tid] = [lb["name"] for lb in issue.get("labels", [])]
         ticket = Ticket(tid, self.ref(tid), "", body=body, labels=self._labels.get(tid, []))
-        return (ZTE_QUEUE if ZTE_LABEL in ticket.labels else "") or error_of(lambda: batch_ids(ticket)) or wait_blocker(
-            waits_on(body), self.is_open)
+        return (ZTE_QUEUE if ZTE_LABEL in ticket.labels else "") or error_of(lambda: batch_ids(ticket)) or self.wait_blocker(
+            github_waits(body, self.repo.github))
+
+    def wait_blocker(self, waits: list[tuple[str, int]]) -> str:
+        own = self.repo.github.casefold()
+        return wait_blocker([n if repo == own else f"{repo}#{n}" for repo, n in waits], self.wait_is_open)
+
+    def wait_is_open(self, ref: int | str) -> bool | None:
+        if isinstance(ref, int):
+            return self.is_open(ref)
+        repo, number = ref.rsplit("#", 1)
+        return self.issue_open(repo, int(number))
 
     def is_open(self, number: int) -> bool | None:
         if number not in self._open:
-            try:
-                state = (gh.issue(self.repo.github, number) or {}).get("state")
-            except gh.GhError:
-                state = None
-            self._open[number] = True if state == "OPEN" else False if state in ("CLOSED", "MERGED") else None
+            self._open[number] = self.issue_open(self.repo.github, number)
         return self._open[number]
+
+    @staticmethod
+    def issue_open(repo: str, number: int) -> bool | None:
+        try:
+            state = (gh.issue(repo, number) or {}).get("state")
+        except gh.GhError:
+            state = None
+        return True if state == "OPEN" else False if state in ("CLOSED", "MERGED") else None
 
     def replied(self) -> list[Ticket]:
         out = []
@@ -249,8 +263,8 @@ class GitHubTracker:
                     if self.by_owner(c)]
         blocker = (ZTE_QUEUE if ZTE_LABEL in labels else "") or (
             "" if self.by_owner(i) else f"it was opened by {author or 'someone else'}, not {self.owner}") or (
-            "" if LABEL in labels else f"it has no `{LABEL}` label") or wait_blocker(
-            waits_on(i.get("body") or ""), self.is_open)
+            "" if LABEL in labels else f"it has no `{LABEL}` label") or self.wait_blocker(
+            github_waits(i.get("body") or "", self.repo.github))
         ticket = Ticket(str(i["number"]), f"#{i['number']}", i["title"], body=i.get("body") or "(no description)",
                       comments=comments_text(comments), open=i.get("state") == "OPEN",
                       kind="fix" if FIX_LABELS & set(labels) else "feat", url=i.get("url", ""),
@@ -691,12 +705,21 @@ WAIT_LINE = re.compile(r"^[ \t]*(?:[-*+][ \t]+|#{1,6}[ \t]+)?(?:\*\*|__)?"
                        r"(?:waits[ \t]+on|blocked[ \t]+by)\b(?:\*\*|__)?[ \t]*:?[ \t]*(?:\*\*|__)?(.*)$",
                        re.IGNORECASE | re.MULTILINE)
 WAIT_REF = re.compile(r"(?<![\w/])#(\d+)")
+WAIT_GITHUB = re.compile(r"(?<![\w/])(?:([\w.-]+/[\w.-]+)#([0-9]+)\b|"
+                         r"https://github\.com/([\w.-]+/[\w.-]+)/issues/([0-9]+)\b|#([0-9]+)\b)", re.IGNORECASE)
 WAIT_TASK = re.compile(r"(?<![\w-])t-[0-9a-f]{4,}(?![\w-])", re.IGNORECASE)
 WAIT_JIRA = re.compile(r"(?<![\w-])[A-Z][A-Z0-9_]+-\d+(?![\w-])", re.IGNORECASE)
 
 
 def waits_on(body: str) -> list[int]:
     found = [int(n) for rest in WAIT_LINE.findall(body or "") for n in WAIT_REF.findall(rest)]
+    return list(dict.fromkeys(found))
+
+
+def github_waits(body: str, repo: str) -> list[tuple[str, int]]:
+    found = [((qualified or url_repo or repo).casefold(), int(number or url_number or local))
+             for line in WAIT_LINE.findall(body or "")
+             for qualified, number, url_repo, url_number, local in WAIT_GITHUB.findall(line)]
     return list(dict.fromkeys(found))
 
 
@@ -715,7 +738,7 @@ def joined(names: list[str]) -> str:
 
 
 def _refs(references: Iterable[int | str]) -> str:
-    return joined([ref_for(ref) for ref in references])
+    return joined([ref if isinstance(ref, str) and "#" in ref else ref_for(ref) for ref in references])
 
 
 def task_wait_blocker(waits: list[str], state_of: Callable[[str], str | None]) -> str:

@@ -79,7 +79,8 @@ def start(cfg: config.Config, run: pipeline.Run, earlier: dict, slot: slots.RunS
     renew = ""
     if refusal:
         job.note_task()
-    elif continues and not only and kept_pending(job, continues) and (moved := base_moved(continues)):
+    elif (continues and not only and not run.environment_release and kept_pending(job, continues)
+          and (moved := base_moved(continues))):
         if run.answers_due:
             job.moved_base = moved
         else:
@@ -117,7 +118,8 @@ def guard(job: Job, continues: str) -> str:
 
     if orchestration.publication_pending(continues):
         return "publication was interrupted; reconcile its branch/PR effects before resuming"
-    if getattr(job.run, "action", "") and (why := action_workspace_refusal(continues)):
+    if (getattr(job.run, "action", "") and not job.run.environment_release
+            and (why := action_workspace_refusal(continues))):
         return why
     data = prepared_data(continues)
     branch, listed = str(data.get("branch") or ""), data.get("checkouts")
@@ -151,7 +153,110 @@ def prepared_data(continues: str) -> dict:
     if prepared := adaptive_state(continues).get("prepared"):
         return prepared
     prepared = factory.passed_data(factory.history(factory.chain(continues)), "prepare")
-    return prepared[-1] if prepared else {}
+    return prepared[-1] if prepared else classic_hold(continues).get("prepared", {})
+
+
+def classic_hold(run_id: str) -> dict:
+    return next((held for read in factory.chain(run_id) if (held := factory.first(read, "classic_hold"))), {})
+
+
+def environment_build(job: Job, history: list[dict]) -> None:
+    if classic := classic_hold(job.continues):
+        plan, build = classic.get("plan"), classic.get("build")
+        name = "plan"
+    else:
+        prior = [(line["step"], factory.outcome_of(line).data) for line in history if line.get("result") == "pass"]
+        planned = next((i for i in range(len(prior) - 1, -1, -1)
+                        if prior[i][0] in ("plan", "patch") and not prior[i][1].get("escalate")), -1)
+        name, plan = prior[planned] if planned >= 0 else ("", None)
+        build = plan
+        if name == "plan":
+            build = next((data for step, data in reversed(prior[planned + 1:])
+                          if step == "implement" and data.get("round") == BUILD), None)
+    if (not isinstance(plan, dict) or not isinstance(build, dict)
+            or not all(isinstance(plan.get(key), str) for key in ("plan", "goal", "left_for_a_person"))
+            or not plan["goal"].strip() or type(plan.get("estimate")) is not int
+            or not isinstance(build.get("summary"), str)):
+        raise workspace.RunFailed("the held run has no complete saved plan and build for verification")
+    job.take(name, Outcome("pass", data=plan), stored=True)
+    if name != "patch":
+        job.take("implement", Outcome("pass", data=build), stored=True)
+
+
+def restore_environment_workspace(job: Job, data: dict, heads: dict[str, str]) -> None:
+    if not data.get("branch") or not data.get("checkouts"):
+        raise workspace.RunFailed("the held run has no saved workspace for verification")
+    job.branch = data["branch"]
+    checkouts = [workspace.Checkout.from_row(c) for c in data["checkouts"]]
+    repo = job.run.repo
+    configured = {(p.github, repo.path / p.dir, job.ws / p.dir) for p in repo.parts}
+    if {(c.github, c.src, c.wt) for c in checkouts} != configured or len(configured) != len(checkouts):
+        raise workspace.RunFailed("the saved worktrees no longer match the configured repository")
+    if set(heads) != {c.github.casefold() for c in checkouts}:
+        raise workspace.RunFailed("the saved workspace does not match the published draft")
+    for c in checkouts:
+        head = heads[c.github.casefold()]
+        local = util.git(["rev-parse", "--verify", "-q", f"refs/heads/{job.branch}"], c.src, check=False).strip()
+        if (workspace.remote_head(c.src, job.branch) != head or local and local != head
+                or (c.wt / ".git").exists() and workspace.uncommitted(c.wt)):
+            raise workspace.RunFailed(f"the held branch of {c.github} no longer matches the saved draft")
+    if not all((c.wt / ".git").exists() for c in checkouts):
+        if why := rebuild(job, {"step": "prepare", "data": data, "tree": str(job.ws)}, setup=False):
+            raise workspace.RunFailed(why)
+    job.take("prepare", Outcome("pass", data=data), stored=True)
+    for c in job.checkouts:
+        if c.lease != heads[c.github.casefold()] or util.git(["rev-parse", "HEAD"], c.wt).strip() != c.lease:
+            raise workspace.RunFailed(f"the held branch of {c.github} moved while restoring it")
+        c.onto, c.merge, c.resumes = "", "", True
+        workspace.fetch(c.src, c.base)
+    pipeline.merge_moved_bases(job.run, job.checkouts, job.layer, job.ticket, environment_retry=True)
+    job.use_layer(pipeline.resolve_layer(job.cfg, job.run, job.ws))
+    if why := pipeline.furnish(job.cfg, job.run, job.layer, job.ws):
+        raise workspace.RunFailed(why)
+    job.carried = True
+
+
+def retry_environment(flow: factory.Flow) -> tuple[str, str, str]:
+    from . import environment_gaps
+
+    job: Job = flow.ctx
+    if flow.refusal:
+        raise factory.Refused(flow.refusal)
+    source = run_store.run_get(job.continues) or {}
+    if not (hold := environment_gaps.hold_of(job.continues)):
+        raise factory.Refused("the run has no saved verification hold")
+    flow.skipped = len(flow.earlier)
+    flow.route()
+    prepared = prepared_data(job.continues)
+    prs = {gh.pr_repo(url).casefold(): (url, head) for url, head in hold.heads.items()}
+    if prepared.get("branch") != source.get("branch") or len(prs) != len(hold.heads):
+        raise factory.Refused("the held PRs do not match the saved branch")
+    environment_build(job, flow.earlier)
+    restore_environment_workspace(job, prepared, {repo: head for repo, (_, head) in prs.items()})
+    for c in job.checkouts:
+        c.pr = prs[c.github.casefold()][0]
+    ws = str(job.ws)
+    trees = pipeline.verification_trees(job.b)
+    if not trees:
+        raise factory.Refused("the restored tree could not be identified for verification")
+    if not (verified := step(flow, "verify", tree=ws)).passed:
+        for c in job.checkouts:
+            if c.merge:
+                with util.repo_lock(c.src):
+                    if util.git(["rev-parse", "HEAD"], c.wt).strip() == c.merge and not workspace.uncommitted(c.wt):
+                        util.git(["reset", "--keep", c.lease], c.wt)
+        return ended(flow, verified)
+    if not step(flow, "checks", tree=ws).passed:
+        raise factory.Refused("the full checks did not pass after verification")
+    if job.patch_mode and (why := patching.change_refusal(job.layer.patch, job.b.staged.files, job.b.staged.lines)):
+        raise factory.Refused(why)
+    if not step(flow, "review", attempt=1, tries=1).passed or not job.review.approved():
+        raise factory.Refused("the restored draft did not pass review")
+    if trees != pipeline.verification_trees(job.b):
+        raise factory.Refused("the restored tree changed while checking or reviewing it")
+    if not environment_gaps.owned_drafts(source, hold):
+        raise factory.Refused("the held pull request changed before publication")
+    return deliver(flow)
 
 
 def action_workspace_refusal(run_id: str) -> str:
@@ -203,7 +308,7 @@ def publication(run_id: str) -> dict:
             data = line.get("data")
             if line.get("step") == "pr" and line.get("result") == "pass" and isinstance(data, dict):
                 return data
-    return {}
+    return classic_hold(run_id).get("publication", {})
 
 
 def authority(run_id: str, c: workspace.Checkout, lease: str) -> tuple[str, bool]:
@@ -245,7 +350,7 @@ def remade(line: dict) -> tuple[str, list[workspace.Checkout], str]:
     return branch, made, ""
 
 
-def rebuild(job: Job, line: dict, *, layer: config.RepoLayer | None = None) -> str:
+def rebuild(job: Job, line: dict, *, layer: config.RepoLayer | None = None, setup: bool = True) -> str:
     branch, made, why = remade(line)
     if why:
         return why
@@ -257,7 +362,7 @@ def rebuild(job: Job, line: dict, *, layer: config.RepoLayer | None = None) -> s
             return why
     ws = Path(line["tree"])
     admitted = layer is not None
-    layer = layer or pipeline.checked_layer(job.cfg, Path(line["data"]["layer"]))
+    layer = layer or pipeline.checked_layer(job.cfg, Path(line["data"]["layer"]) if setup else job.run.repo.layer_dir)
     try:
         workspace.clear_workspace(ws, made, job.run.repo.path, layer.copy)
     except workspace.RunFailed as e:
@@ -273,6 +378,8 @@ def rebuild(job: Job, line: dict, *, layer: config.RepoLayer | None = None) -> s
     except RuntimeError as e:
         return f"arete could not make it again from origin/{branch}: {util.first_line(str(e), 300)}"
     job.run.log(f"made {ws} again from origin/{branch}")
+    if not setup:
+        return ""
     if admitted and layer != pipeline.checked_layer(job.cfg, layer.dir):
         return "the restored repository layer changed; reconcile before setup"
     return pipeline.furnish(job.cfg, job.run, layer, ws)
@@ -329,6 +436,8 @@ class Job:
 
     @property
     def held_reason(self) -> str:
+        if self.run.environment_release and not retry_passed(self.verified):
+            return "verification did not pass on the live release"
         if self.verified.verdict == "blocked" and (self.patch_mode or patching.specification_refusal(self.ticket)
                 or patching.sensitive_files(self.layer.patch, self.b.staged.files)):
             return "the check in use was blocked; this change requires behavioral evidence"
@@ -579,9 +688,7 @@ class Job:
         for c in self.checkouts:
             if str(c.wt) in self.restored:
                 c.lease = self.restored[str(c.wt)]
-        self.layer = pipeline.checked_layer(self.cfg, Path(data["layer"]))
-        self.check_commands, self.check_rules = pipeline.check_script(run.dir, self.layer, self.ws)
-        run.cfg, run.layer, run.kind = self.cfg, self.layer, self.ticket.kind
+        self.use_layer(pipeline.checked_layer(self.cfg, Path(data["layer"])))
         run.add_dirs += [d for d in map(Path, data["add_dirs"]) if d not in run.add_dirs]
         if stored and not run.workspace:
             if held := workspace.scratch_held(self.ws, self.checkouts):
@@ -604,6 +711,11 @@ class Job:
             opened(run, self.ticket)
             if not run.alone:
                 run.enter("running")
+
+    def use_layer(self, layer: config.RepoLayer) -> None:
+        self.layer = layer
+        self.check_commands, self.check_rules = pipeline.check_script(self.run.dir, layer, self.ws)
+        self.run.cfg, self.run.layer, self.run.kind = self.cfg, layer, self.ticket.kind
 
 
 def opened(run: pipeline.Run, t: tracker.Ticket) -> None:
@@ -694,12 +806,16 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
         return end_as("fail", "failed", why=why)
     workspace.note_made(job.ws, checkouts, pipeline.workspace_owner(run, job.ws, checkouts))
     approval = triage_store.triage_approval(run.triage_key)
-    return Outcome("pass", data={
-        "ticket": {k: getattr(t, k) for k in TICKET_FIELDS}, "branch": branch,
-        "checkouts": [c.to_row() for c in checkouts],
-        "layer": str(layer.dir), "add_dirs": [str(run.dir / "images")] if images.paths else [],
-        "attachments": pipeline.images_note(images), "triage": pipeline.triage_notes(approval), "approval": approval,
-        "expertise": layer.expertise_file.read_text() if layer.expertise_file.exists() else "(none yet)"})
+    return Outcome("pass", data=prepared_fields(t, branch, checkouts, layer, [run.dir / "images"] if images.paths else [],
+                                                pipeline.images_note(images), approval))
+
+
+def prepared_fields(ticket: tracker.Ticket, branch: str, checkouts: list[workspace.Checkout], layer: config.RepoLayer,
+                    add_dirs: list[Path], attachments: str, approval: dict | None) -> dict:
+    return {"ticket": {k: getattr(ticket, k) for k in TICKET_FIELDS}, "branch": branch,
+            "checkouts": [c.to_row() for c in checkouts], "layer": str(layer.dir), "add_dirs": list(map(str, add_dirs)),
+            "attachments": attachments, "triage": pipeline.triage_notes(approval), "approval": approval,
+            "expertise": layer.expertise_file.read_text() if layer.expertise_file.exists() else "(none yet)"}
 
 
 @factory.step("plan")
@@ -893,17 +1009,25 @@ def checks(flow: factory.Flow, tree: str, attempt: int = 1, tries: int = 1, afte
                                  "checked": b.checked})
 
 
+def retry_passed(verified: Verified) -> bool:
+    return verified.verdict == "pass" and verified.finished and bool(verified.checks) and not verified.failed_checks
+
+
 @factory.step("verify")
 def verify(flow: factory.Flow, tree: str, single: bool = False) -> Outcome:
     job: Job = flow.ctx
     b = job.staged()
+    check_only = single or bool(job.run.environment_release)
     if single and "refactor" in job.ticket.labels:
         verified = Verified("unverified", "Check in use skipped because the ticket is labeled `refactor`.")
-    elif single and not job.layer.verify:
+    elif check_only and not job.layer.verify:
         verified = pipeline.verify.not_configured(job.layer.dir, job.ws)
     else:
-        check = pipeline.check_in_use if single else pipeline.verify_in_use
+        check = pipeline.check_in_use if check_only else pipeline.verify_in_use
         verified = check(b, job.with_left(job.goal), job.build_summary)
+    if job.run.environment_release and not retry_passed(verified):
+        return end_as("stop", "environment-held", verified=asdict(verified),
+                      summary="Verification did not pass on the live release. The PR stays a draft.")
     return Outcome("pass", data={"verified": asdict(verified), "names": dict(b.steps), "story": job.run.story,
                                  "policy": job.policy("verify", {}), "checked": b.checked})
 
@@ -935,6 +1059,20 @@ def learn(flow: factory.Flow, tree: str, apply: bool) -> Outcome:
 
 def documents(job: Job) -> bool:
     return config.document_for(job.cfg, job.run.repo, job.layer).enabled
+
+
+def deliver(flow: factory.Flow) -> tuple[str, str, str]:
+    job: Job = flow.ctx
+    ws = str(job.ws)
+    step(flow, "learn", tree=ws, apply=True)
+    if documents(job):
+        step(flow, "document", tree=ws)
+    if job.run.dry_run:
+        return end_dry_run(flow)
+    for name, kw in [("pr", {"tree": ws}), *([("ci", {"tree": ws})] if job.run.repo.parts else []), ("publish", {})]:
+        if not (outcome := step(flow, name, **kw)).passed:
+            break
+    return ended(flow, outcome)
 
 
 @factory.step("document")
@@ -1037,7 +1175,7 @@ def publication_outcome(job: Job, staged, summary, committed, draft_why="", repo
             "opened": [c.github for c in opened], "pushed": [c.github for c in pushed], "draft_why": draft_why,
             "changed": [c.github for c in staged.changed], "report_body": report_body,
             "committed_lines": job.b.committed_lines, "heads": {c.github: c.lease for c in staged.changed},
-            "committed": committed}
+            "committed": committed, "verified": asdict(job.verified)}
     if job.run.repo.parts:
         data.update(found=[c.github for c in found], drafted=[c.github for c in drafted],
                     ci_stopped=[c.github for c in ci_stopped])
@@ -1179,7 +1317,7 @@ def publish(flow: factory.Flow) -> Outcome:
 @factory.step("respond")
 def respond(flow: factory.Flow, ending: str, why: str = "", said: str = "", detail: str = "", comment: str = "",
             summary: str = "", status: str = "", replies: list[dict] | None = None, prs: bool = False,
-            asked: list[dict] | None = None, session: dict | None = None) -> Outcome:
+            asked: list[dict] | None = None, session: dict | None = None, verified: dict | None = None) -> Outcome:
     job: Job = flow.ctx
     run, pr_url = job.run, ""
     if ending == "failed":
@@ -1196,6 +1334,16 @@ def respond(flow: factory.Flow, ending: str, why: str = "", said: str = "", deta
     elif ending == "pr":
         pr_url = pipeline.record_prs(run, job.branch, job.with_prs)
         pipeline.release_workspace(run, job.ws, job.checkouts)
+    elif ending == "environment-held":
+        source = run_store.run_get(job.continues) or {}
+        pr_url = source.get("pr_url") or ""
+        job.verified = Verified.stored(verified or {})
+        run.facts["requirements"] = job.verified.requirements()
+        run.facts["held"] = summary
+        run.enter("pr")
+        record.note(run.id, branch=job.branch, pr_url=pr_url)
+        pipeline.supersede_older_runs(run, pr_url.split())
+        status = "pr"
     elif ending == "done":
         run.say(done_comment(job, summary))
         pipeline.release_workspace(run, job.ws, job.checkouts)
@@ -1242,10 +1390,16 @@ def driven(flow: factory.Flow, drive: Callable[[factory.Flow], tuple[str, str, s
     try:
         return drive(flow)
     except workspace.RunFailed as e:
+        if flow.ctx.run.environment_release:
+            raise
         return finish(flow, "failed", why=e.why, detail=e.detail)
     except tracker.ERRORS as e:
+        if flow.ctx.run.environment_release:
+            raise
         return finish(flow, "failed", why=f"tracker refused {flow.ctx.run.ref}: {e}")
     except owner_asks.Asked as e:
+        if flow.ctx.run.environment_release:
+            raise factory.Refused("verification retry requires owner input") from e
         reached = f"ask limit of {e.limit} reached: " if e.limit is not None else ""
         parks = e.limit is None
         return finish(flow, "ask", summary=reached + owner_asks.summary(e.sent),

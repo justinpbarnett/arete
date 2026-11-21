@@ -151,6 +151,15 @@ def open_runs(repo: str, issue: int | str) -> list[dict]:
                                            "ORDER BY started DESC", (repo, issue))]
 
 
+def latest_pr_runs(repo: str) -> list[dict]:
+    with reader() as c:
+        return [dict(r) for r in c.execute(
+            f"SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND {WHOLE_RUN} AND status = 'pr' "
+            "AND pr_url != '' AND files_purged IS NULL AND NOT EXISTS (SELECT 1 FROM runs newer "
+            "WHERE newer.kind = 'pipeline' AND newer.repo = runs.repo AND newer.issue = runs.issue "
+            "AND COALESCE(newer.only_step, '') = '' AND newer.rowid > runs.rowid) ORDER BY started, id", (repo,))]
+
+
 def run_lock(kind: str, repo: str | None = None, issue: int | str | None = None) -> str:
     return {"pipeline": f"run-{repo}-{issue}", "slot": f"slot-{repo}-{issue}", "slot-wait": f"slot-wait-{repo}-{issue}",
             "eval": f"eval-{repo}", "experiment": f"experiment-{repo}", "eval-mine": "eval-mine", "miner": "mine"}[kind]

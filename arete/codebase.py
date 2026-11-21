@@ -4,6 +4,7 @@ import hashlib
 import importlib
 import os
 import pkgutil
+import re
 import subprocess
 import sys
 import time
@@ -16,6 +17,7 @@ RELOADS = "ARETE_CODE_RELOADS"
 MAX_RELOADS = 5
 GIT_SECONDS = 30
 STAMP = ""
+RELEASE = ""
 
 
 def code_files() -> list[Path]:
@@ -61,10 +63,9 @@ def git(*args: str) -> str | None:
     return done.stdout if done.returncode == 0 else None
 
 
-def head_and_dirt() -> tuple[str, bool]:
-    head = (git("rev-parse", "--short=12", "HEAD") or "").strip()
-    status = git("status", "--porcelain", "--", "arete", "adws") if head else None
-    return head, any("__pycache__" not in line for line in (status or "").splitlines())
+def head_and_dirt() -> tuple[str, str | None]:
+    head = (git("rev-parse", "HEAD") or "").strip()
+    return head, git("status", "--porcelain", "--untracked-files=all") if head else None
 
 
 def reload(count: int) -> None:
@@ -76,17 +77,22 @@ def reload(count: int) -> None:
 
 
 def load() -> str:
-    global STAMP
+    global RELEASE, STAMP
     if STAMP:
         return STAMP
     before, _ = inventory()
     import_everything()
-    head, dirty = head_and_dirt()
+    head, status = head_and_dirt()
+    changed = git("status", "--porcelain", "--", "arete", "adws") if status else ""
+    dirty = any("__pycache__" not in line for line in (changed or "").splitlines())
     after, newest = inventory()
     moved = before != after or newest > arete.IMPORTED_NS
     reloads = int(os.environ.get(RELOADS) or 0)
     if moved and reloads < MAX_RELOADS:
         reload(reloads + 1)
-    stamp = (head + (f"+dirty.{after[:8]}" if dirty else "")) if head else f"code.{after[:12]}"
+    if (re.fullmatch(r"[0-9a-f]{40}", head) and status == "" and not moved
+            and (git("rev-parse", "HEAD") or "").strip() == head):
+        RELEASE = head
+    stamp = (head[:12] + (f"+dirty.{after[:8]}" if dirty else "")) if head else f"code.{after[:12]}"
     STAMP = stamp + ("+moving" if moved else "")
     return STAMP

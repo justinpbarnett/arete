@@ -183,7 +183,13 @@ class Controller:
         self.data["acceptance"] = ledger.digest([self.catalog.context["task"], self.job.goal,
                                                  self.job.left_for_a_person])
         self.recover()
-        if self.flow.continues and (moved := flows.base_moved(self.flow.continues)):
+        if self.run.environment_release:
+            for checkout in self.job.checkouts:
+                workspace.fetch(checkout.src, checkout.base)
+            pipeline.merge_moved_bases(self.run, self.job.checkouts, self.job.layer, self.job.ticket)
+            self.data.pop("published", None)
+            self.data.pop("published_tree", None)
+        elif self.flow.continues and (moved := flows.base_moved(self.flow.continues)):
             self.job.moved_base = moved
             self.job.merge_moved_base("orchestrate")
         self.persist()
@@ -641,6 +647,9 @@ class Controller:
                 self.job.goal, self.job.fix_reply = goal, reply
             result = outcome.data.get("verified" if role == "verify" else "review", {})
             self.stamp(role, result)
+            if outcome.data.get("ending") == "environment-held":
+                self.ending = flows.ended(self.flow, outcome)
+                return {"operation_passed": False, **result}
             return {"operation_passed": outcome.passed, **result}
         if op == "owner.ask":
             if zte.reserved(str(self.run.tid)):
@@ -718,8 +727,9 @@ class Controller:
                     raise factory.Refused("rerun requires a finished worker/check/review/verification action ID")
                 snapshot = ledger.snapshot(self.lease)
                 turn = ledger.begin(self.lease, {"rerun": prior["id"]}, self.policy.max_decisions)
+                requester = "Live release retry" if self.run.environment_release else "Owner requested rerun"
                 response = {"version": PROTOCOL, "decision_id": turn, "state_version": snapshot["version"],
-                            "rationale": f"Owner requested rerun of {prior['id']}",
+                            "rationale": f"{requester} of {prior['id']}",
                             "calls": [{"op": prior["op"], "args": prior["request"]}]}
                 rerun = ledger.accept(self.lease, turn, snapshot["version"], response, self.policy.max_actions)[0]
                 self.dispatch(rerun)
