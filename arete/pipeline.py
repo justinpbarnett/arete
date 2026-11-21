@@ -1045,7 +1045,9 @@ class Build(TicketWork):
         return self.staged
 
     def require_valid_diff(self, after: str, planned: str = "", *, from_base: bool | None = None) -> None:
-        staged = self.restage(from_base=from_base)
+        self.validate_diff(self.restage(from_base=from_base), after, planned, from_base=from_base)
+
+    def validate_diff(self, staged: Staged, after: str, planned: str = "", *, from_base: bool | None = None) -> None:
         if staged.empty:
             raise workspace.RunFailed(f"{after} undid every change")
         whole_diff = self.from_base if from_base is None else from_base
@@ -2334,7 +2336,8 @@ def push_caught_up_head(b: Build, c: workspace.Checkout, branch: str, head: str)
             row = {}
         remote = row.get("headRefOid")
         if remote == head:
-            c.lease, c.onto = head, ""
+            c.note_pushed_head(head)
+            c.onto = ""
             return
         if remote and (hold := gh.merge_ref_hold(row, c.lease, c.base)):
             raise CatchUpPushUnconfirmed(f"{why}: {hold}", f"{detail} GitHub reports `{remote}`.", retryable=False)
@@ -2554,7 +2557,7 @@ def commit_and_push(checkouts: list[workspace.Checkout], changed: list[workspace
             aftermath = ("The pilot will not retry the push." if before_push
                          else "A retry builds on whatever reached the branch.")
             raise workspace.RunFailed(f"the push to {c.github} failed after arete pushed {done}", f"{e}\n\n{aftermath}") from e
-        c.lease = head or git(["rev-parse", "HEAD"], c.wt).strip()
+        c.note_pushed_head(head or git(["rev-parse", "HEAD"], c.wt).strip())
         c.onto = ""
         pushed.append(c)
 
@@ -2904,9 +2907,11 @@ def merge_moved_bases(run: AgentRun, checkouts: list[workspace.Checkout], layer:
         if environment_retry and (not c.base_commit or
                                   git(["merge-base", c.base_commit, base], c.wt).strip() != c.base_commit):
             raise workspace.RunFailed(f"the base for {c.github} no longer contains the saved base")
-        c.base_commit = base
-        if git(["rev-list", "--count", f"HEAD..{c.base_commit}"], c.wt).strip() == "0":
+        if git(["rev-list", "--count", f"HEAD..{base}"], c.wt).strip() == "0":
+            if not pending_merge(c):
+                c.base_commit = base
             continue
+        c.base_commit = base
         if edits := workspace.uncommitted(c.wt, tracked_only=allow_untracked):
             raise workspace.RunFailed(f"{c.github} has uncommitted edits ({', '.join(edits[:5])}), so arete merged nothing into "
                             "them and left them as they are")
@@ -3273,10 +3278,11 @@ def check_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
 
 
 def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "verify",
-                require_released: bool = False, **values) -> verify.Verified:
+                require_released: bool = False, *, replay_drivers: set[str] | None = None, **values) -> verify.Verified:
     from . import pilot, readme_verify, zte
 
     run, configured = b.run, b.layer.verify
+    replay_only = replay_drivers is not None
     delivery_verification = prompt_name == role == "verify"
     tid = str(run.tid) if delivery_verification else ""
     zte_verify = delivery_verification and zte.reserved(tid)
@@ -3290,7 +3296,10 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
             blocked_by=", ".join(f"journey:{name}" for name in unknown)))
     selected = {name: feature_map[name] for name in requested}
     drivers = {name: journey.driver for name, journey in selected.items() if journey.driver}
-    v = verify.with_free_ports(replace(configured, drivers={name: configured.drivers[name] for name in drivers.values()}))
+    replay = {name: journey.driver for name in replay_drivers or ()
+              if (journey := configured.feature_map.get(name)) and journey.driver in configured.drivers}
+    commands = {name: configured.drivers[name] for name in (*drivers.values(), *replay.values())}
+    v = verify.with_free_ports(replace(configured, drivers=commands))
     merge_candidate = b.layer.trust_level == "automerge" or readme_task
     checked_trees = verification_trees(b) if delivery_verification and merge_candidate else {}
     if refusal := verify.port_refusal(v):
@@ -3320,7 +3329,11 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
             verified = verify.Verified("blocked", "The exact README could not be verified.", finished=False,
                                        blocked_by=str(error))
         return save_verification(run, step, verified)
-    evidence = run_folder(run, "evidence")
+    if replay_only:
+        evidence = run.dir / f"{step}-evidence"
+        evidence.mkdir(exist_ok=True)
+    else:
+        evidence = run_folder(run, "evidence")
     untracked_before = untracked_by_dir(b.git_dirs)
     attempt = None
     try:
@@ -3353,8 +3366,8 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
             if url:
                 run.log(f"{step}: the app answers at {url}")
             if v.probes or drivers:
-                probes = verify.run_probes(replace(v, probe_seconds=run.time_for(v.probe_seconds)), b.ws, attempt,
-                                           journey_drivers=drivers)
+                probe_config = replace(v, probe_seconds=run.time_for(v.probe_seconds))
+                probes = verify.run_probes(probe_config, b.ws, attempt, journey_drivers=drivers)
             if probes:
                 run.save(f"{step}-probes.json", json.dumps(asdict(probes), indent=2))
                 label = "configured verification commands" if drivers else "configured probes"
@@ -3367,10 +3380,18 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                     v = replace(v, notes=v.notes + f"\n\nArete already executed these owner-configured {name} in a "
                                 "confined disposable workspace. Use their observed results as evidence; do not repeat "
                                 "these commands. " + instructions + probes.markdown())
-            if not probes or probes.verdict == "pass":
+            probes_passed = not probes or probes.verdict == "pass"
+            if replay and probes_passed:
+                driver_config = replace(v, probes={}, probe_seconds=run.time_for(v.probe_seconds))
+                observed = verify.run_probes(driver_config, b.ws, attempt, journey_drivers=replay,
+                                             stop_on_driver_failure=False)
+                run.save(f"{step}-replay-drivers.json", asdict(observed))
+            if not replay_only and probes_passed:
                 agent_started = True
+                fault_controls = verify.fault_note(v) if url and delivery_verification else ""
                 res = run.agent(step, b.brief.prompt(
-                    prompt_name, surface=surface_note(v, url, evidence), notes=v.notes, scratch=scratch.note(attempt),
+                    prompt_name, surface=surface_note(v, url, evidence) + fault_controls, notes=v.notes,
+                    scratch=scratch.note(attempt),
                     commands=prompt_loader.code_list(bash), checks=check_list(b.layer),
                     compare=compare_with_fork(b.checkouts), owner=run.owner_note,
                     journeys=journeys.guidance(selected or feature_map), **values),
@@ -3415,6 +3436,8 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
             restore_worktrees(untracked_before, evidence)
     if probes and probes.verdict != "pass":
         verified = probes
+    elif replay_only:
+        verified = verify.Verified("pass", "No ordinary steps to replay.")
     elif not res.ok or not isinstance(res.structured, dict):
         verified = verify.Verified("blocked", "The check in use did not finish.", finished=False,
                                    blocked_by=util.first_line(res.error or "the verifier returned no verdict", 300))
@@ -3422,7 +3445,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
             return verified
     else:
         verified = verify.Verified.from_agent(res.structured)
-    if probes and probes.verdict == "pass":
+    if probes and probes.verdict == "pass" and not replay_only:
         verified.checks = probes.checks + verified.checks
     if fixture_blocker:
         verified.verdict, verified.blocked_by, verified.finished = "blocked", fixture_blocker, False
@@ -3466,7 +3489,8 @@ def surface_note(v: config.Verify, url: str, evidence: Path) -> str:
             "saved there also serves as a fixture.\n"
             "- Read `browser_console_messages` after each state. Name each console error and each dev error overlay "
             "or badge in `saw`, and say whether the change causes it.\n"
-            "- Send API requests with curl, shaped the way the app's clients send them, and read the status and body.")
+            "- For ordinary API checks, send requests with curl, shaped the way the app's clients send them, "
+            "and read the status and body.")
 
 
 def restore_worktrees(untracked_before: dict[Path, set[str]], evidence: Path) -> None:
