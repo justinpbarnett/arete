@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import timedelta
 
-from .. import util
+from .. import run_lines, util
 from ._rows import insert_sql
 from .db import db, reader, tx
 from .runs import OPEN_PR_RUN
@@ -177,8 +177,23 @@ def release_feedback(run_id: str, *, closed_prs: tuple[str, ...] = ()) -> None:
             c.execute(f"UPDATE feedback SET status = 'recorded', previous_run_id = NULL "
                       f"WHERE run_id = ? AND status = 'taken' AND pr_url IN ({','.join('?' * len(closed_prs))})",
                       (run_id, *closed_prs))
+        # Runs launched before the migration saved the previous claim in the run log.
+        previous = next((line["previous"] for line in run_lines.read(run_id)
+                         if line.get("event") == "feedback_claim"), [])
+        c.executemany("UPDATE feedback SET status = 'new', run_id = ? WHERE pr_url = ? AND kind = ? AND gh_id = ? "
+                      "AND run_id = ? AND status = 'taken' AND previous_run_id IS NULL",
+                      [(prior, url, kind, gh_id, run_id) for url, kind, gh_id, prior in previous])
         c.execute("UPDATE feedback SET status = 'new', run_id = previous_run_id, previous_run_id = NULL "
                   "WHERE run_id = ? AND status = 'taken'", (run_id,))
+
+
+def release_interrupted_feedback(run_id: str) -> None:
+    with tx() as c:
+        if c.execute("SELECT 1 FROM feedback WHERE run_id = ? AND status = 'taken' LIMIT 1", (run_id,)).fetchone():
+            if not any(line.get("event") == "work_start" or (line.get("event") == "step_start"
+                       and line.get("step") != "respond" and not line.get("preflight"))
+                       for line in run_lines.read(run_id)):
+                release_feedback(run_id)
 
 
 def settle_feedback(run_id: str, status: str) -> None:

@@ -461,6 +461,7 @@ class Run(AgentRun):
     tid: str
     force: bool = False
     feedback: list[dict] = field(default_factory=list)
+    claim_feedback_on_revise: bool = False
     closed_feedback_prs: tuple[str, ...] = field(default=(), init=False)
     answering: dict = field(default_factory=dict)
     path: str = ""
@@ -551,7 +552,10 @@ class Run(AgentRun):
 
         options = {**kw, "fresh_prompt": fresh_prompt}
         if session.id and kw.get("persist", True):
-            parts = (owner_asks.answers_message(due), self.kept_note, self.base_note,
+            feedback = feedback_markdown(self.feedback) if due[0]["step"] == "revise" else ""
+            parts = (owner_asks.answers_message(due),
+                     f"Address the owner's PR feedback as well:\n\n{feedback}" if feedback else "",
+                     self.kept_note, self.base_note,
                      self.moved_folder_note(due[0]["run"]))
             message = "\n\n".join(part for part in parts if part)
             return message, {**options, "resume": session}
@@ -613,6 +617,10 @@ class Run(AgentRun):
         if self.closed_feedback_prs:
             return f"the PR closed before arete could revise it: {', '.join(self.closed_feedback_prs)}"
         return ""
+
+    def claim_feedback(self) -> None:
+        if self.feedback and not self.dry_run and not self.alone:
+            self.feedback = insights_store.take_feedback(self.feedback, self.id)
 
     @property
     def failed_state(self) -> str:
@@ -1166,40 +1174,29 @@ def recorded_path(run_id: str) -> str:
     return "classic"
 
 
-def feedback_script(cfg: config.Config, path: str) -> str:
-    if cfg.adws and cfg.adws.resolve() != paths.ADWS_DIR.resolve():
-        if path not in (ADW, "repair"):
-            return path
-        if not (cfg.adws / "revise.py").is_file():
-            return "feature"
-    return "revise" if path in (ADW, "feature", "patch", "repair") else path
+def custom_revision_feature(cfg: config.Config) -> bool:
+    return bool(cfg.adws and cfg.adws.resolve() != paths.ADWS_DIR.resolve()
+                and (cfg.adws / "feature.py").is_file() and not (cfg.adws / "revise.py").is_file())
 
 
-def dispatch(cfg: config.Config, repo: config.Repo, tid: str) -> tuple[str, dict | None]:
+def custom_feedback_fallback(cfg: config.Config, mode: str, feedback: list[dict]) -> bool:
+    return (custom_revision_feature(cfg) and insights_store.has_new_feedback(feedback)
+            and (mode == ADW or mode == "repair" and not (cfg.adws / "repair.py").is_file()))
+
+
+def dispatch_path(repo: config.Repo, tid: str) -> str:
     newest = run_store.newest_whole_run(repo.name, tid)
-    feedback = pending_feedback(repo.name, tid)
     if newest and newest["status"] == "interrupted":
-        rid = newest["id"]
-        path = recorded_path(rid)
-        if path in (ORCHESTRATED, "orchestrate"):
-            return path, newest
-        repair = path == "repair" or bool(repaired_by(rid))
-        if not (repair and insights_store.has_new_feedback(feedback)):
-            if path == ADW:
-                path = "repair" if repair else feedback_script(cfg, path) if feedback else "feature"
-            return path, newest
-    if feedback and (source := next(iter(run_store.open_runs(repo.name, tid)), None)):
-        while (parent := repaired_by(source["id"])) and (original := run_store.run_get(parent)):
-            source = original
-        return feedback_script(cfg, recorded_path(source["id"])), source
-    path = wanted(repo)
-    return ("feature" if path == ADW else path), None
+        return recorded_path(newest["id"])
+    if pending_feedback(repo.name, tid) and (source := next(iter(run_store.open_runs(repo.name, tid)), None)):
+        return recorded_path(source["id"])
+    return wanted(repo)
 
 
 def run_command(repo_name: str, tid: str | int, force: bool = False, dry_run: bool = False) -> list[str]:
     cfg = config.load()
     flags = [*(["--force"] if force else []), *(["--dry-run"] if dry_run else [])]
-    mode, source = dispatch(cfg, cfg.repo(repo_name), str(tid))
+    mode = dispatch_path(cfg.repo(repo_name), str(tid))
     if (asked := answered_run(repo_name, str(tid))) and not dry_run:
         mode = recorded_path(asked["id"])
         if mode != "classic":
@@ -1209,13 +1206,24 @@ def run_command(repo_name: str, tid: str | int, force: bool = False, dry_run: bo
     if mode in (ORCHESTRATED, "orchestrate"):
         from .store import orchestration
 
-        if (force and source and source["status"] != "interrupted"
-                or dry_run and run_store.held_environment_branch(repo_name, str(tid))):
+        newest = run_store.newest_whole_run(repo_name, str(tid))
+        source = newest if newest and newest["status"] == "interrupted" else (
+            next(iter(run_store.open_runs(repo_name, str(tid))), None)
+            if not force and pending_feedback(repo_name, str(tid)) else None)
+        if dry_run and run_store.held_environment_branch(repo_name, str(tid)):
             source = None
         previous = (orchestration.find(source["id"]) or {}).get("current_run", source["id"]) if source else ""
         return script_command(cfg, "orchestrate", repo_name, str(tid), *flags,
                               *(["--continue", previous] if previous else []))
-    return script_command(cfg, mode, repo_name, str(tid), *flags)
+    if mode in (ADW, "repair") and custom_feedback_fallback(cfg, mode, pending_feedback(repo_name, str(tid))):
+        return script_command(cfg, "feature", repo_name, str(tid), *flags)
+    if mode != ADW:
+        return script_command(cfg, mode, repo_name, str(tid), *flags)
+    newest = run_store.newest_whole_run(repo_name, str(tid))
+    if newest and newest["status"] == "interrupted" and repaired_by(newest["id"]):
+        return script_command(cfg, "repair", repo_name, str(tid), *flags)
+    name = "revise" if pending_feedback(repo_name, str(tid)) else "feature"
+    return script_command(cfg, name, repo_name, str(tid), *flags)
 
 
 def exec_script(repo_name: str, tid: str, dry_run: bool, force: bool) -> int:
@@ -1323,7 +1331,7 @@ def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: boo
     if run.feedback and not run.dry_run and not run.alone:
         if status == "noop" and run.closed_feedback_prs:
             insights_store.release_feedback(run.id, closed_prs=run.closed_feedback_prs)
-        elif status == "noop" or run.step_started or (flow and flow.work_started):
+        elif run.step_started or (flow and flow.work_started):
             insights_store.settle_feedback(run.id, {"pr": "done", "noop": "recorded"}.get(status, "failed"))
         else:
             insights_store.release_feedback(run.id)
@@ -1409,7 +1417,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         print(f"{repo_name}: {e}")
         return 1
     if not script:
-        adw = dispatch(cfg, repo, str(tid))[0] != "classic"
+        adw = dispatch_path(repo, str(tid)) != "classic"
     if adw and not script:
         return exec_script(repo.name, tid, dry_run, force)
     if script and (refusal := script_refusal(cfg, repo, tid, script, dry_run)):
@@ -1470,14 +1478,18 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             if isinstance(tk, tracker.GitHubTracker):
                 tk.require_ordinary(tid)
             budget_history = run_store.ticket_runs(repo.name, tid, limit=1, live=bool(retry_of or preview_of))
-            feedback = [] if (zte_grant or retry_of or reconciling_catch_up or script and script.repairs) else (
-                pending_feedback(repo.name, tid))
-            if not only and insights_store.has_fresh_feedback(feedback):
-                blocked, reset_budget = "", False
+            custom_feature = bool(script and script.path == "feature" and custom_revision_feature(cfg))
+            may_revise = not (zte_grant or retry_of or reconciling_catch_up or only) and (
+                script is None or not script.repairs and (script.path in ("orchestrate", "revise") or custom_feature))
+            feedback = pending_feedback(repo.name, tid) if may_revise else []
+            feedback_readmits = (not dry_run and script and script.path == "orchestrate"
+                                 and insights_store.has_fresh_feedback(feedback))
+            readmission = None if force else runlimits.Readmission.decode(launch_lease.readmission(repo.name, str(tid)))
+            if feedback_readmits and not (force or readmission):
+                budget_admission = runlimits.Admission()
             else:
-                readmission = None if force else runlimits.Readmission.decode(launch_lease.readmission(repo.name, str(tid)))
-                blocked, reset_budget = runlimits.admission(repo, str(tid), tk, runlimits.Policy.of(layer), force,
-                                                           readmission=readmission)
+                budget_admission = runlimits.admission(repo, str(tid), tk, runlimits.Policy.of(layer), force,
+                                                       readmission=readmission)
         except tracker.ERRORS as e:
             print(f"could not read {name}: {e}")
             return 2
@@ -1487,8 +1499,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         except (ValueError, OSError) as e:
             print(f"could not validate the process budget: {e}")
             return 2
-        if blocked and not dry_run:
-            print(blocked)
+        if budget_admission.reason and not dry_run and not (force and feedback_readmits):
+            print(budget_admission.reason)
             return 2
         if script and script.repairs and (later := run_store.later_run(repo.name, tid, script.repairs)):
             print(f"run {later['id']} of {name} came after run {script.repairs}, so it is not repaired twice")
@@ -1514,13 +1526,13 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     return 1
             settled = [done for dead_row in run_store.ticket_runs_marked_running(repo.name, tid)
                        if (done := record.interrupt(dead_row))]
-            if settled and feedback:
+            if settled and may_revise:
                 feedback = pending_feedback(repo.name, tid)
             earlier = None if only or preview_of else run_store.newest_live_whole_run(repo.name, tid)
             restarting = bool(earlier) and earlier["status"] == "interrupted"
             mending = (script.repairs or repaired_by(script.continues or (earlier["id"] if restarting else ""))
                        ) if script else ""
-            revising_over_repair = (mending and script.path != "repair" and not (only or script.action)
+            revising_over_repair = (mending and custom_feature and not (only or script.continues)
                                     and insights_store.has_new_feedback(feedback))
             if revising_over_repair:
                 mending = ""
@@ -1580,8 +1592,10 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 run_id = start()
             scratch.RUN_BASELINES[run_id] = producer_baseline
             scratch.RUN_LABELS[run_id] = service_labels
+            repair_with_feedback = script and script.path == "orchestrate" and script.continues and not script.action
             run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force,
-                      feedback=[] if mending else feedback,
+                      feedback=[] if mending and not repair_with_feedback else feedback,
+                      claim_feedback_on_revise=custom_feature,
                       repairs=mending,
                       answering=earlier if earlier and earlier["status"] == "needs-info" else {},
                       launch_gate=admission, launch_done=launch_done, closed_context=closed_context, preview_of=preview_of,
@@ -1648,19 +1662,27 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
 
         try:
             signal.signal(signal.SIGTERM, stop_on_term(run_id))
-            if run.feedback and not dry_run and not run.alone:
-                run.feedback = insights_store.take_feedback(run.feedback, run_id)
+            if not run.claim_feedback_on_revise:
+                run.claim_feedback()
             if run.feedback:
                 run.log(f"revising {', '.join(run.feedback_prs)} for {util.count(len(run.feedback), 'comment')}")
             if due and not slot.held and not dry_run and not flow.refusal:
                 slot.take(run.log, run.waiting, "answer")
             parent = parent_run(script, earlier, budget_history)
-            previous = "" if reset_budget and not retry_of else parent
-            fresh = bool(previous) and force and not retry_of and not restarting and not run.repairs and not run.alone and not (
-                flow and flow.continues)
+            allow_reset = not (dry_run or retry_of)
+            previous = "" if allow_reset and budget_admission.reset_time else parent
+            repair_parent = "" if allow_reset and budget_admission.reset_repairs else parent
+            fresh = (bool(previous) and allow_reset and force and not restarting and not run.repairs
+                     and not run.alone and not (flow and flow.continues))
             current = tk.get(tid) if fresh else None
+            answered_runs = ()
+            if not dry_run and not only and not (flow and flow.refusal):
+                answered_runs = tuple(a["run"] for a in run.answers_due)
+                if run.answering and answer_text(run.answering["id"]).strip():
+                    answered_runs += (run.answering["id"],)
             with handoff_io():
                 run.budget = runlimits.Budget(run, runlimits.Policy.of(layer), previous, current, fresh,
+                                              repair_previous=repair_parent, answered_runs=answered_runs,
                                               wall_deadline=wall_deadline, checkpoint_timeout=0 if zte_grant else None,
                                               checkpoint_gate=checkpoint_allowed if zte_grant else None,
                                               fixed_gaps=fixed_gaps)
@@ -1821,11 +1843,15 @@ def assumptions_of(plan: dict) -> list[str]:
     return [a.strip() for a in listed if isinstance(a, str) and a.strip()] if isinstance(listed, list) else []
 
 
+def question_time(run: dict) -> str:
+    return next((line["ts"] for line in reversed(run_lines.read(run["id"]))
+                 if line.get("event") == "question" and line.get("ts")), None) or run.get("finished") or ""
+
+
 def opening_waits(run_id: str, answering: dict, passed_over: str) -> None:
     now = util.iso()
     if answering:
-        asked = next((line.get("ts") for line in reversed(run_lines.read(answering["id"]))
-                      if line.get("event") == "question"), None) or answering.get("finished")
+        asked = question_time(answering)
         if asked:
             run_lines.waited(run_id, "person", asked, passed_over or now)
     if passed_over:
@@ -2320,7 +2346,7 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
     except BaseException as error:
         if isinstance(error, CatchUpPathCollision):
             worktree_files.add(error.name)
-        run.catch_up_preserved.update(c.prefix + name for name in worktree_files)
+            run.catch_up_preserved.add(c.prefix + error.name)
         abort_merge(c.wt)
         if (git(["rev-parse", "HEAD"], c.wt).strip() != before.lease
                 or workspace.uncommitted(c.wt, tracked_only=True)):
@@ -3171,6 +3197,10 @@ def pending_feedback(repo_name: str, tid: str) -> list[dict]:
     return insights_store.open_feedback([url for r in run_store.open_runs(repo_name, tid) for url in (r.get("pr_url") or "").split()])
 
 
+def feedback_key(row: dict) -> tuple[str, str, int]:
+    return row["pr_url"], row["kind"], row["gh_id"]
+
+
 def feedback_markdown(rows: list[dict]) -> str:
     out = []
     for url in dict.fromkeys(f["pr_url"] for f in rows):
@@ -3851,7 +3881,7 @@ def run_skipped(name: str) -> dict:
 
 
 def answered_run(repo_name: str, tid: str) -> dict | None:
-    newest = run_store.newest_whole_run(repo_name, tid)
+    newest = run_store.newest_live_whole_run(repo_name, tid)
     if (newest and newest["status"] == "needs-info" and asks_store.asks_due([newest["id"]])
             and not asks_store.asks_of(newest["id"], "open")):
         return newest

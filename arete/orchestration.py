@@ -125,7 +125,7 @@ class Controller:
         if self.flow.refusal:
             raise factory.Refused(self.flow.refusal)
         pending_push = ledger.catch_up_push(self.data)
-        if self.run.feedback and (closed := self.run.feedback_closure()):
+        if closed := self.run.feedback_closure():
             self.quiescent()
             return "noop", closed, ""
         self.flow.matching = False
@@ -208,8 +208,8 @@ class Controller:
             if self.job.left_for_a_person or self.run.feedback or self.run.repairs or self.flow.continues:
                 raise factory.Refused("ZTE does not inherit owner work or previous attempts")
         self.data.setdefault("goal_base", self.job.goal)
-        known = {(f.get("pr_url"), f.get("kind"), f.get("gh_id")) for f in self.data.get("feedback", [])}
-        fresh = [f for f in self.run.feedback if (f.get("pr_url"), f.get("kind"), f.get("gh_id")) not in known]
+        known = {pipeline.feedback_key(f) for f in self.data.get("feedback", [])}
+        fresh = [f for f in self.run.feedback if pipeline.feedback_key(f) not in known]
         if fresh:
             self.data.setdefault("feedback", []).extend(fresh)
             feedback = pipeline.feedback_markdown(fresh)
@@ -410,6 +410,7 @@ class Controller:
             self.data["error"] = error
             self.persist()
             raise workspace.RunFailed(error, recovery=result.get("recovery"))
+        self.run.step_started = True
         try:
             response = result.get("structured")
             if response is None:
@@ -499,6 +500,8 @@ class Controller:
                     seconds = grant.get("timeout") if isinstance(grant, dict) else None
                     if type(seconds) in (int, float) and seconds > 0:
                         worker.deadline = min(worker.deadline, time.monotonic() + seconds)
+                    if self.run.feedback and not self.run.step_started:
+                        run_lines.write(self.run.id, "work_start")
                     worker.allow(grant)
                     self.run.step_started = True
                 elif message.get("event") in ("result", "error"):

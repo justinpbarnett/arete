@@ -7,7 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import gh, util
+from . import _test_stacks, gh, util
 
 WAIT_SECONDS = 30 * 60
 FIRST_CHECK_SECONDS = 3 * 60
@@ -15,7 +15,12 @@ SETTLE_SECONDS = 60
 POLL_SECONDS = 30
 CONFLICT_SNAPSHOT_TIMEOUT = 5
 LOG_EXCERPT_CHARS = 8000
+MIN_TIMEOUT_REPORT_CHARS = 160
 LOG_TIMESTAMP = re.compile(r"^\d{4}-\d\d-\d\dT[\d:.]+Z ", re.MULTILINE)
+TEST_TIMEOUT = re.compile(rf"^{re.escape(_test_stacks.REPORT_START)}\r?\n.*?\r?\n"
+                          rf"^{re.escape(_test_stacks.REPORT_END)}\r?$", re.DOTALL | re.MULTILINE)
+PYTHON_STACK = re.compile(r"^(Python (?:class|child) stack \(PID \d+\))\r?\n", re.MULTILINE)
+TIMEOUT_OMISSION = re.compile(r"\.\.\. \d+ timeout reports omitted")
 SECTION_START, SECTION_END = "<!-- arete:ci -->", "<!-- /arete:ci -->"
 SECTION = re.compile(rf"\n*^{re.escape(SECTION_START)}\r?$.*?^{re.escape(SECTION_END)}\r?$", re.DOTALL | re.MULTILINE)
 STOPPED = "Arete stopped:"
@@ -231,8 +236,9 @@ def failure_note(r: Red, log_file: Path) -> str:
     except gh.GhError as e:
         return "\n".join([*lines, f"- Arete could not read its log: {util.first_line(str(e), 300)}"])
     log_file.write_text(text)
-    return "\n".join([*lines, f"- Full log: `{log_file}`", "", "The log up to its last error:", "", "````",
-                      excerpt(text), "````"])
+    snippet, has_timeout_report = _log_excerpt(text)
+    heading = "Log excerpt:" if has_timeout_report else "The log up to its last error:"
+    return "\n".join([*lines, f"- Full log: `{log_file}`", "", heading, "", "````", snippet, "````"])
 
 
 def red_list(reds: list[Red]) -> str:
@@ -251,13 +257,103 @@ def clip(text: str, max_chars: int) -> str:
     return cut.rsplit(" ", 1)[0] + " (cut)"
 
 
+def timeout_excerpt(report: str, limit: int) -> str:
+    if len(report) <= limit:
+        return report
+    body = report[report.index("\n") + 1:report.rindex("\n")]
+    identity, *stacks = PYTHON_STACK.split(body)
+    sections = [util.both_ends(identity.rstrip(), limit)]
+    remaining = limit - len(sections[0])
+    traces = []
+    for heading, stack in zip(stacks[::2], stacks[1::2], strict=True):
+        thread = stack.replace("\r\n", "\n").partition("\n\n")[0]
+        frames = [line for line in thread.splitlines() if line.startswith("  File ")][:6]
+        if frames:
+            traces.append((heading, frames))
+    traces = traces[:max(1, remaining // 140)]
+    for index, (heading, frames) in enumerate(traces):
+        room = remaining // (len(traces) - index) - len(heading) - 2
+        if room < 8:
+            break
+        preview = [util.both_ends(frames[0], min(room, 220))]
+        room -= len(preview[0])
+        for frame in frames[1:]:
+            frame = util.both_ends(frame, 220)
+            if len(frame) + 1 > room:
+                break
+            preview.append(frame)
+            room -= len(frame) + 1
+        sections.append("\n".join([heading, *preview]))
+        remaining -= len(sections[-1]) + 1
+    return "\n".join(sections)
+
+
+def timeout_summary(reports: list[str]) -> str:
+    summary = "\n\n".join(reports)
+    if len(summary) <= LOG_EXCERPT_CHARS:
+        return summary
+    remaining = LOG_EXCERPT_CHARS + 2
+    summaries = [""] * len(reports)
+    for index in sorted(range(len(reports)), key=lambda index: len(reports[index])):
+        size = len(reports[index]) + 2
+        if size > remaining:
+            break
+        summaries[index] = reports[index]
+        remaining -= size
+
+    overflow = [index for index, report in enumerate(summaries) if not report]
+    notice = ""
+    minimum = MIN_TIMEOUT_REPORT_CHARS + 2
+    if remaining < len(overflow) * minimum:
+        notice_budget = len(f"... {len(overflow)} timeout reports omitted") + 2
+        if remaining < notice_budget:
+            index = max(range(len(summaries)), key=lambda index: len(summaries[index]))
+            report = summaries[index]
+            summaries[index] = util.both_ends(report, len(report) - (notice_budget - remaining))
+            remaining += len(report) - len(summaries[index])
+        remaining -= notice_budget
+        count = remaining // minimum
+        notice = f"... {len(overflow) - count} timeout reports omitted"
+        overflow = overflow[len(overflow) - count:]
+
+    for offset, index in enumerate(overflow):
+        limit = remaining // (len(overflow) - offset) - 2
+        summaries[index] = timeout_excerpt(reports[index], limit)
+        remaining -= len(summaries[index]) + 2
+    return "\n\n".join(filter(None, (*summaries, notice)))
+
+
 def excerpt(log_text: str) -> str:
+    return _log_excerpt(log_text)[0]
+
+
+def _log_excerpt(log_text: str) -> tuple[str, bool]:
     text = LOG_TIMESTAMP.sub("", log_text)
-    last_error = text.rfind("##[error]")
+    reports = TEST_TIMEOUT.findall(text)
+    if reports and len(text) <= LOG_EXCERPT_CHARS:
+        return text, True
+    surrounding = TEST_TIMEOUT.sub("", text).strip() if reports else text
+    last_error = surrounding.rfind("##[error]")
     if last_error >= 0:
-        line_end = text.find("\n", last_error)
-        text = text[:line_end] if line_end >= 0 else text
-    return util.tail(text, LOG_EXCERPT_CHARS)
+        line_end = surrounding.find("\n", last_error)
+        if line_end >= 0:
+            surrounding = surrounding[:line_end]
+    if not reports:
+        if len(surrounding) > LOG_EXCERPT_CHARS:
+            surrounding = util.tail(surrounding, LOG_EXCERPT_CHARS - len("...\n"))
+        return surrounding, False
+    summary = timeout_summary(reports)
+    remaining = LOG_EXCERPT_CHARS - len(summary) - 2
+    if remaining < 8:
+        return summary, True
+    if last_error >= 0 and len(surrounding) - last_error > remaining:
+        surrounding = util.both_ends(surrounding[last_error:], remaining)
+    elif len(surrounding) > remaining:
+        surrounding = util.tail(surrounding, remaining - len("...\n"))
+    kept_reports, _, notice = summary.rpartition("\n\n")
+    if TIMEOUT_OMISSION.fullmatch(notice):
+        return "\n\n".join(filter(None, (kept_reports, surrounding, notice))), True
+    return "\n\n".join(filter(None, (summary, surrounding))), True
 
 
 def section(rounds: list[Round], max_rounds: int, ending: str = "") -> str:

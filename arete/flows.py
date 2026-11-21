@@ -590,19 +590,29 @@ class Job:
         return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
     def accepts(self, name: str, outcome: Outcome, kw: dict) -> bool:
-        if name == "revise" and self.run.feedback and not self.run.alone:
-            if "feedback_ids" in outcome.data:
-                matches = outcome.data["feedback_ids"] == feedback_ids(self.run.feedback)
-            else:
-                matches = (not insights_store.has_fresh_feedback(self.run.feedback)
-                           and outcome.data.get("plan") == revision_plan(pipeline.feedback_markdown(self.run.feedback)))
-            if not matches:
-                self.run.log("revise: owner feedback changed since the saved revision")
-                return False
+        if name == "revise" and not self.only and not self.includes_feedback(outcome.data):
+            self.run.log(f"{name}: pending PR feedback was absent from the saved outcome; rerunning is required")
+            return False
         if (expected := self.policy(name, kw)) and outcome.data.get("policy") != expected:
             self.run.log(f"{name}: stored evidence used a different policy; rerunning is required")
             return False
         return True
+
+    def includes_feedback(self, data: dict) -> bool:
+        feedback = self.run.feedback
+        if not feedback:
+            return True
+        keys = data.get("feedback_keys", data.get("feedback_ids"))
+        if keys is not None:
+            known = {tuple(key) for key in keys}
+            return all(pipeline.feedback_key(row) in known for row in feedback)
+        return (not insights_store.has_fresh_feedback(feedback)
+                and data.get("plan") == revision_plan(pipeline.feedback_markdown(feedback)))
+
+    def claim_revision_feedback(self) -> None:
+        if self.run.claim_feedback_on_revise:
+            self.run.claim_feedback_on_revise = False
+            self.run.claim_feedback()
 
     def keeps(self, name: str, kw: dict) -> bool:
         return any(c.onto for c in self.checkouts) and (
@@ -965,10 +975,6 @@ def patch(flow: factory.Flow, tree: str) -> Outcome:
     }, session=job.run.sessions.get(BUILD, NO_SESSION))
 
 
-def feedback_ids(rows: list[dict]) -> list[list[str | int]]:
-    return sorted([f["pr_url"], f["kind"], f["gh_id"]] for f in rows)
-
-
 def revision_plan(feedback: str) -> str:
     return f"Revise the open PR for the owner's feedback:\n\n{feedback}"
 
@@ -992,9 +998,10 @@ def revision(flow: factory.Flow, tree: str) -> Outcome:
     if pipeline.stage(job.checkouts, diffguard.denied_paths(layer)).empty:
         return end_as("stop", "unchanged", summary=summary, replies=replies)
     return Outcome("pass", data={
-        "plan": revision_plan(feedback), "left_for_a_person": left, "feedback_ids": feedback_ids(run.feedback),
+        "plan": revision_plan(feedback), "left_for_a_person": left,
         "goal": ("Check each change the owner's feedback asks for, and that what the issue asks for still works.\n\n"
                  + feedback),
+        "feedback_keys": [pipeline.feedback_key(row) for row in run.feedback],
         "summary": summary, "replies": replies, "story": run.story}, session=run.sessions.get(BUILD, NO_SESSION))
 
 

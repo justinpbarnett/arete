@@ -584,6 +584,10 @@ def settle(run_id: str, fields: dict, end_line: str = "", base_version=None) -> 
         settled = writes.update("runs", run_id, fields, expect=("running",), kind="run.ended", base_version=base_version)
         if not settled:
             return None
+        if settled["kind"] == "pipeline" and settled["status"] in ("interrupted", "stopped"):
+            from . import insights
+
+            insights.release_interrupted_feedback(run_id)
         if end_line:
             insert_feed(run_id, "end", end_line)
         return settled

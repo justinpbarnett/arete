@@ -260,6 +260,8 @@ class Flow:
         if self.refusal:
             self.matching = False
             raise Refused(self.refusal)
+        if name == "revise" and (claim := getattr(self.ctx, "claim_revision_feedback", None)):
+            claim()
         if self.matching and name == self.renew:
             return self.renewed(name, args, kw)
         if not self.matching and self.carrying and (found := self.carried(name, kw)) is not None:
@@ -340,7 +342,11 @@ class Flow:
     def carried(self, name: str, kw: dict) -> Outcome | None:
         line = self.earlier[self.carry] if self.carry < len(self.earlier) else {}
         if (line.get("step") == name and line.get("result") == "pass" and self.ctx.keeps(name, kw)
-                and (not self.again or self.carry < self.again_at) and (outcome := self.accepted(name, line, kw))):
+                and (not self.again or self.carry < self.again_at)):
+            outcome = outcome_of(line)
+            if not self.accepts(name, outcome, kw):
+                self.carrying = False
+                return None
             n = self.tries[name] = self.tries.get(name, 0) + 1
             self.end(name, n, outcome, "", Calls(self.run_id, name, n=n), time.monotonic(), kw,
                      carried=self.continues)
@@ -352,16 +358,12 @@ class Flow:
     def takes(self, name: str) -> bool:
         return name != self.only and (name != self.again or self.at < self.again_at)
 
-    def accepted(self, name: str, line: dict, kw: dict) -> Outcome | None:
-        outcome = outcome_of(line)
-        accepts = getattr(self.ctx, "accepts", None)
-        return outcome if accepts is None or accepts(name, outcome, kw) else None
-
     def stored(self, name: str, kw: dict) -> Outcome | None:
         line = self.earlier[self.at] if self.at < len(self.earlier) else {}
         if line.get("step") != name or not self.takable(line):
             return None
-        if not (outcome := self.accepted(name, line, kw)):
+        outcome = outcome_of(line)
+        if not self.accepts(name, outcome, kw):
             return None
         if (self.only or self.again) and line.get("tree") and not os.path.isdir(line["tree"]):
             why = self.ctx.restore(line)
@@ -376,6 +378,10 @@ class Flow:
             if not now or now != self.expected(self.at, str(line["tree"])):
                 return None
         return outcome
+
+    def accepts(self, name: str, outcome: Outcome, kw: dict) -> bool:
+        accepts = getattr(self.ctx, "accepts", None)
+        return accepts is None or accepts(name, outcome, kw)
 
     def takable(self, line: dict) -> bool:
         if line.get("result") == "pass":

@@ -183,10 +183,8 @@ def interrupt(row: dict, notes: Sequence[str] = (), *, base_version=None) -> dic
     run_id = row["id"]
     with foundation.tx():
         settled = settle(run_id, status, end_line=f"{status}: {summary}", summary=summary, base_version=base_version)
-        if settled and row["kind"] in TICKET_KINDS and not any(
-                line.get("event") == "work_start" or (line.get("event") == "step_start"
-                and line.get("step") != "respond" and not line.get("preflight")) for line in run_lines.read(run_id)):
-            insights_store.release_feedback(run_id)
+        if settled and row["kind"] in TICKET_KINDS and (row["kind"] != "pipeline" or status == "failed"):
+            insights_store.release_interrupted_feedback(run_id)
     if settled and not util.pid_alive(row.get("pid")):
         util.end_session(row.get("pid"))
     if settled and row["kind"] == "draft":
