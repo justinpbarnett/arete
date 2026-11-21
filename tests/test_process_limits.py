@@ -22,6 +22,7 @@ from arete import (
     launch_lease,
     orchestration,
     outcomes,
+    park_retries,
     paths,
     pipeline,
     poll,
@@ -33,7 +34,9 @@ from arete import (
     steps,
     tasks,
     tracker,
+    triage,
     util,
+    verify,
     workspace,
 )
 from arete.agent import Result
@@ -42,6 +45,7 @@ from arete.store import db as foundation
 from arete.store import orchestration as ledger
 from arete.store import runs as run_store
 from arete.store import tasks as tasks_store
+from arete.store import writes
 from tests.harness import set_task_body
 
 
@@ -467,6 +471,272 @@ class QueueTests(Isolated):
                 patch.object(poll, "cleanup_worktrees"), patch.object(poll, "mark_loop"), \
                 patch.object(pipeline, "SKIPPED_FILE", self.root / "skipped.json"):
             return poll.poll()
+
+    def parked_findings(self, run, *blockers):
+        run_lines.write(run.id, "step_end", step="review", ok=True)
+        run.save("review.json", {"ok": True, "text": "Private reviewer transcript",
+                                 "structured": {"problems": [{"severity": "blocker", **(
+                                     {"problem": finding} if isinstance(finding, str) else finding)}
+                                     for finding in blockers] + [
+                                     {"problem": "Optional review note", "severity": "minor"}]}})
+        pipeline.save_verification(run, "verify", verify.Verified("fail", "Private verify summary", [
+            {"what": "The page displays Mara Doe owes 240 dollars", "retry_action": "preserve_draft_on_retry",
+             "passed": False, "how": "Private command", "saw": "Private raw page text"},
+            {"what": "Environment startup failed", "passed": False, "cause": "environment", "how": "", "saw": ""},
+            {"what": "Ordinary save succeeds", "passed": True, "how": "", "saw": ""}]))
+
+    def triage_parks(self, dry_run=False):
+        with patch.object(triage, "META_FILE", self.root / "triage.json"), \
+                patch.object(triage, "prune_records"), patch.object(triage, "mark_loop"), \
+                patch.object(sandbox, "AUTHORITY", self.root / "verification-authority"), \
+                patch.object(util, "github_token", return_value=""), patch.object(paths, "PI_KEYS_FILE", self.root / "keys"), \
+                patch.object(park_retries.scrub.vault, "FOLDER", self.root / "vault"):
+            return triage.refresh(self.cfg, dry_run)
+
+    def test_triage_rewrites_readmit_with_findings_in_the_next_plan_and_third_park_asks_once(self):
+        self.repo.layer_dir.mkdir()
+        (self.repo.layer_dir / "config.toml").write_text('[factory]\npath = "classic"\n')
+        self.cfg.replay = config.ReplayConfig(all=True)
+        workspace_dir = paths.WORKTREES_DIR / f"{self.repo.name}-{self.ticket}"
+        workspace_dir.mkdir()
+        checkout = workspace.Checkout("", "fixture/repo", self.repo.path, workspace_dir, "main")
+        reasons = ("Saving the draft fails: preserve the draft after a declined save", "Restore the selected tab",
+                   "Explain the retry policy")
+        actions = ("Preserve the draft after a declined save.", "Restore the previously selected tab or item.",
+                   "Explain when a retry is possible and how to start it.")
+        original = "Keep this body. cc @someone\n"
+        writes.update("tasks", self.ticket, {"body": original})
+        park_reason = "the repair chain used its 2 repair cycles"
+        first = self.made_run()
+        self.parked_findings(first, reasons[0], "Show the failure beside the field")
+        first.budget.park(park_reason)
+        record.settle(first.id, "failed")
+        self.local.label(self.ticket, add=["failed"])
+        self.assertEqual(self.triage_parks(dry_run=True), 0)
+        self.assertEqual(self.local.get(self.ticket).body, original)
+        prompts = []
+        classic = pipeline._run
+
+        def planner(run, step, prompt, *args, **kw):
+            self.assertEqual(step, "plan")
+            self.assertFalse(run.force)
+            self.assertEqual(run.budget.parents, [])
+            prompts.append((run.id, prompt))
+            self.parked_findings(run, reasons[len(prompts)])
+            raise runlimits.Parked(park_reason)
+
+        append = park_retries.append
+
+        def lost_append_reply(*args):
+            self.assertTrue(append(*args))
+            current = self.local.get(self.ticket).body
+            writes.update("tasks", self.ticket, {"body": current + "Owner clarification after the append.\n"})
+            raise OSError("lost tracker reply")
+
+        with patch.object(park_retries, "append", side_effect=lost_append_reply):
+            self.assertEqual(self.triage_parks(), 1)
+        for attempt in range(2):
+            self.assertEqual(self.triage_parks(), 0)
+            body = self.local.get(self.ticket).body
+            self.assertEqual(body.count("## From parked run"), attempt + 1)
+            self.assertTrue(body.startswith(original))
+            self.assertIn("Owner clarification after the append.", body)
+            self.assertEqual(self.triage_parks(), 0)
+            self.assertEqual(self.local.get(self.ticket).body, body)
+            with patch.object(workspace, "make_workspace", return_value=(workspace_dir, [checkout])), \
+                    patch.object(pipeline, "settle_starts"), patch.object(pipeline, "furnish", return_value=""), \
+                    patch.object(pipeline.Run, "agent", autospec=True, side_effect=planner):
+                self.assertEqual(self.poll_with(self.cfg, lambda repo, tid: self.run_polled_ticket(repo, tid, classic)), 0)
+            self.assertEqual(len(prompts), attempt + 1)
+            self.assertIn(actions[attempt], prompts[-1][1])
+            self.assertIn("Show the failure beside the field that needs correction.", prompts[-1][1])
+            self.assertIn("Preserve the draft when retrying.", prompts[-1][1])
+        with patch.object(tracker.LocalTracker, "label", return_value="temporary label error"):
+            self.assertEqual(self.triage_parks(), 1)
+        self.assertEqual(len(tasks_store.task_comments(self.ticket)), 1)
+        self.assertEqual(self.triage_parks(), 0)
+        self.assertEqual(self.triage_parks(), 0)
+        self.assertEqual(self.local.get(self.ticket).body, body)
+        self.assertEqual(tasks_store.task_get(self.ticket)["state"], "needs-info")
+        comments = tasks_store.task_comments(self.ticket)
+        self.assertEqual(len(comments), 1)
+        self.assertIn(actions[2], comments[0]["body"])
+        self.assertIn("What behavior should the next attempt implement", comments[0]["body"])
+        self.assertNotIn("Optional review note", body + comments[0]["body"])
+        self.assertEqual(self.poll_with(self.cfg, lambda *_: self.fail("escalated ticket restarted")), 0)
+
+    def test_triage_skips_missing_route_environment_and_held_or_kept_work(self):
+        budget = "the repair chain used its 2 repair cycles"
+        cases = [("missing route", {}, False, False), ("held scratch", {}, False, False),
+                 (budget, {".": {"head": "kept"}}, False, False), (budget, {}, True, False),
+                 (budget, {}, False, True)]
+        for reason, kept, held, environment in cases:
+            with self.subTest(reason=reason, kept=kept, held=held, environment=environment):
+                self.ticket = tasks_store.task_add(self.repo.name, "Do the work", "Work")
+                run = self.made_run()
+                self.parked_findings(run, "Keep the draft on failed save")
+                if environment:
+                    record.note(run.id, failure=json.dumps({"class": "environment"}))
+                ws = paths.WORKTREES_DIR / f"{self.repo.name}-{self.ticket}"
+                if held:
+                    run.workspace = (ws, [])
+                run.budget.park(reason, kept)
+                record.settle(run.id, "failed")
+                self.local.label(self.ticket, add=["failed"])
+                with patch.object(workspace, "scratch_left", return_value=[ws / "scratch"] if held else []):
+                    self.assertEqual(self.triage_parks(), 0)
+                self.assertEqual(self.local.get(self.ticket).body, "Do the work")
+                self.assertEqual(tasks_store.task_comments(self.ticket), [])
+
+    def test_triage_readmits_a_clean_planning_budget_park_without_findings(self):
+        run = self.made_run()
+        ws = paths.WORKTREES_DIR / f"{self.repo.name}-{self.ticket}"
+        ws.mkdir()
+        run.workspace = (ws, [])
+        run.budget.deadline = 0
+        with self.assertRaises(runlimits.Parked) as parked:
+            run.budget.charge("plan", "plan")
+        run.budget.park(str(parked.exception))
+        record.settle(run.id, "failed")
+        self.local.label(self.ticket, add=["failed"])
+        self.assertEqual(park_retries.findings(run.id), [])
+        before = self.local.get(self.ticket)
+        reason, admission = runlimits.poll_admission(self.repo, self.ticket, before, run.budget.policy)
+        self.assertIn("parked after run", reason)
+        self.assertIsNone(admission)
+        self.assertEqual(self.triage_parks(), 0)
+        after = self.local.get(self.ticket)
+        self.assertTrue(after.body.startswith(before.body))
+        self.assertIn(f"## From parked run {run.id}", after.body)
+        self.assertIn("The run reached its time budget. Replan the work", after.body)
+        reason, admission = runlimits.poll_admission(self.repo, self.ticket, after, run.budget.policy)
+        self.assertEqual(reason, "")
+        self.assertEqual(admission.run_id, run.id)
+        self.assertEqual(tasks_store.task_comments(self.ticket), [])
+
+    def test_triage_filters_the_same_evidence_for_rewrites_and_escalation(self):
+        unsafe = ("Paste password hidden-literal", "Report ghp_synthetic12345678", "Read files from /tmp/private.txt",
+                  r"Read C:\outside\private.txt", "Read ../private.txt", "<p>Private page contents</p>",
+                  "First line\nPrivate log text", "Replace SensitiveFixtureValue", "Bearer hidden-literal",
+                  "The page displays Mara Doe owes 240 dollars", "Mara Doe owes 240 dollars",
+                  "Preserve the draft after a declined save for Mara Doe")
+        action = {"problem": "The page displays a private transaction", "category": "data_loss",
+                  "retry_action": "avoid_partial_write"}
+        arbitrary = {"problem": "The reviewer supplied a private thought", "retry_action": "Private action text"}
+        bodies = []
+        with patch.dict(os.environ, {"TEST_SECRET": "SensitiveFixtureValue"}):
+            for count in (1, 2, 2):
+                run = self.made_run()
+                self.parked_findings(run, action, arbitrary, *unsafe)
+                run.budget.park("the repair chain used its 2 repair cycles")
+                record.settle(run.id, "failed")
+                self.local.label(self.ticket, add=["failed"])
+                self.assertEqual(self.triage_parks(), 0)
+                self.assertEqual(self.triage_parks(), 0)
+                body = self.local.get(self.ticket).body
+                self.assertEqual(body.count("## From parked run"), count)
+                bodies.append(body)
+        comments = tasks_store.task_comments(self.ticket)
+        self.assertEqual(len(comments), 1)
+        self.assertEqual(tasks_store.task_get(self.ticket)["state"], "needs-info")
+        for output in (*bodies, comments[0]["body"]):
+            self.assertIn("Review blocker 1 (data_loss). Keep existing data intact if any part of the write fails.",
+                          output)
+            self.assertIn("Review blocker 2. See this blocker in the run’s review.", output)
+            self.assertIn("Preserve the draft when retrying.", output)
+            for private in (*unsafe, "hidden-literal", "ghp_synthetic12345678", "private.txt", "SensitiveFixtureValue",
+                            "Private page contents", "Private log text", "Private raw page text", "Private command",
+                            "Private verify summary", "Private reviewer transcript", "Environment startup failed",
+                            "Ordinary save succeeds", "Mara Doe", action["problem"], *arbitrary.values()):
+                self.assertNotIn(private, output)
+
+    def park_remote_issue(self, source, issue):
+        rid = record.start("pipeline", repo=self.repo.name, issue=issue)
+        directory = paths.RUNS_DIR / rid
+        directory.mkdir()
+        run = pipeline.Run(rid, self.repo, directory, tracker=source, tid=issue, cfg=self.cfg)
+        run.budget = runlimits.Budget(run, runlimits.Policy(), "", source.get(issue), False)
+        run.budget.park("the repair chain used its 2 repair cycles")
+        record.settle(run.id, "failed")
+
+    def test_triage_holds_github_without_editing_or_counting_unsupported_rewrites(self):
+        self.repo.tracker, self.repo.github = "github", "fixture/project"
+        source = tracker.GitHubTracker(self.repo)
+        labels = [{"name": "agent"}, {"name": "agent:failed"}]
+        issue = {"number": 17, "title": "Fixture", "state": "OPEN", "labels": labels,
+                 "author": {"login": "fixture"}}
+        with patch.object(gh, "issue", return_value=issue), patch.object(gh, "gh") as command, \
+                patch.object(triage, "sources", return_value=[]):
+            for attempt in range(3):
+                body = issue["body"] = f"Owner specification {attempt}. cc @someone\n"
+                self.park_remote_issue(source, "17")
+                self.assertEqual(self.triage_parks(), 0)
+                self.assertEqual(issue["body"], body)
+                self.assertEqual(issue["labels"], labels)
+                self.assertIn("GitHub has no supported atomic description append", self.park_holds()["fixture#17"])
+        command.assert_not_called()
+        self.assertEqual(list((paths.STATE_DIR / "park-retries").glob("*.json")), [])
+
+    def test_triage_holds_jira_without_any_description_put(self):
+        self.repo.tracker, self.repo.jira_project = "jira", "JRA"
+        source = tracker.JiraTracker(self.repo, self.cfg.jira)
+        client = jira.Client("https://example.invalid", "fixture", "fixture")
+        body = "Owner specification. cc @someone\n"
+        account = {"accountId": "owner"}
+        fields = {"summary": "Fixture", "description": body, "creator": account, "assignee": account,
+                  "labels": ["agent", source.route, "agent-failed"]}
+        replies = {"myself": account, "changelog": {"values": []}, "comment": {"comments": []},
+                   "JRA-17": {"fields": fields}}
+
+        def request(method, path, params=None, body=None):
+            self.assertEqual(method, "GET")
+            self.assertIsNone(body)
+            return replies[path.rsplit("/", 1)[-1]]
+
+        with patch.object(tracker.JiraTracker, "client", client), patch.object(client, "request", side_effect=request), \
+                patch.object(triage, "sources", return_value=[]):
+            self.park_remote_issue(source, "JRA-17")
+            self.assertEqual(self.triage_parks(), 0)
+            self.assertEqual(fields["description"], body)
+            self.assertIn("Jira has no supported atomic description append", self.park_holds()["fixture JRA-17"])
+
+    def park_holds(self):
+        return json.loads((self.root / "triage.json").read_text())["held"]
+
+    def test_triage_conditional_append_preserves_concurrent_edit(self):
+        run = self.made_run()
+        run.budget.park(run.budget.reason())
+        record.settle(run.id, "failed")
+        self.local.label(self.ticket, add=["failed"])
+        append = tasks_store.task_append_body
+        edited = "Owner changed the specification. cc @someone\n"
+
+        def concurrent_edit(*args, **kw):
+            set_task_body(self.ticket, edited)
+            return append(*args, **kw)
+
+        with patch.object(tasks_store, "task_append_body", side_effect=concurrent_edit) as attempted:
+            self.assertEqual(self.triage_parks(), 0)
+            self.assertIn("The ticket changed", self.park_holds()[f"fixture {self.ticket}"])
+            self.assertEqual(self.triage_parks(), 0)
+        attempted.assert_called_once()
+        self.assertEqual(self.local.get(self.ticket).body, edited)
+        self.assertEqual(tasks_store.task_comments(self.ticket), [])
+
+    def test_triage_holds_ambiguous_append_without_a_marker_and_does_not_replay(self):
+        run = self.made_run()
+        run.budget.park(run.budget.reason())
+        record.settle(run.id, "failed")
+        self.local.label(self.ticket, add=["failed"])
+        original = self.local.get(self.ticket).body
+        with patch.object(tasks_store, "task_append_body", side_effect=OSError("lost reply")) as append:
+            self.assertEqual(self.triage_parks(), 1)
+            self.assertEqual(self.triage_parks(), 0)
+            self.assertIn("Could not confirm", self.park_holds()[f"fixture {self.ticket}"])
+        append.assert_called_once()
+        self.assertEqual(self.local.get(self.ticket).body, original)
+        self.assertEqual(tasks_store.task_get(self.ticket)["state"], "failed")
+        self.assertEqual(tasks_store.task_comments(self.ticket), [])
 
     def test_specification_edit_readmits_once_and_reparks_on_current_inputs(self):
         parked = self.park_ticket()

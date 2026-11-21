@@ -18,6 +18,7 @@ from . import (
     intake,
     jev,
     jira,
+    park_retries,
     paths,
     principals,
     prompt_loader,
@@ -563,9 +564,12 @@ def refresh(cfg: config.Config, dry_run: bool) -> int:
     if dry_run:
         preview_refresh(cfg, srcs, read, old, todo)
         return 1 if errors else 0
+    parked_held, park_errors = park_retries.refresh(cfg)
+    errors.extend(park_errors)
     triaged = triage_due(cfg, todo)
     write_board(srcs, read, triaged)
     approved, held = approve_ready(cfg, srcs, excluded=set(triaged.failed) | set(triaged.waiting))
+    held.update(parked_held)
     prune_records()
     triaged.waiting += [r["ref"] for r in old.values() if r["source"] not in read
                         and (changed_policy or r["ref"] in retry)]
@@ -1012,7 +1016,7 @@ def board() -> str:
     lines += [f"Not read this time: {e}" for e in meta.get("errors", [])]
     if meta.get("waiting"):
         lines.append(f"Waiting for the next refresh: {', '.join(meta['waiting'])}")
-    lines += [f"Not approved this time: {ref}: {why}" for ref, why in (meta.get("held") or {}).items()]
+    lines += [f"Held {ref}: {why}" for ref, why in (meta.get("held") or {}).items()]
     g = groups(v)
     width = max((len(r["ref"]) for r in rows + v["sent"]), default=0)
     repo_width = max((len(r["repo"] or "") for r in rows + v["sent"]), default=0)

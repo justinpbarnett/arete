@@ -3098,6 +3098,9 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
 def save_verification(run: Run, step: str, verified: verify.Verified) -> verify.Verified:
     verified.saved = os.path.abspath(run.dir / f"{step}.md")
     run.save(f"{step}.md", verified.markdown())
+    run.save(f"{step}-outcome.json", {"verdict": verified.verdict, "checks": [
+        {name: check[name] for name in ("what", "passed", "cause", "retry_action") if name in check}
+        for check in verified.checks]})
     run.log(f"{step}: {verified.verdict}, {len(verified.checks) - len(verified.failed_checks)} of "
             f"{util.count(len(verified.checks), 'check')} passed")
     return verified

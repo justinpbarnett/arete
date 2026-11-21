@@ -248,6 +248,15 @@ def newest_live_whole_run(repo: str, issue: int | str) -> dict | None:
     return next(iter(ticket_runs(repo, issue, limit=1, whole=True, live=True)), None)
 
 
+def latest_failed_tickets(repo: str) -> list[str]:
+    with reader() as c:
+        rows = c.execute(f"SELECT issue FROM (SELECT issue, status, ROW_NUMBER() OVER ("
+                         f"PARTITION BY issue ORDER BY started DESC, rowid DESC) AS position FROM runs "
+                         f"WHERE kind = 'pipeline' AND repo = ? AND {WHOLE_RUN} AND {LIVE_RUN}) "
+                         "WHERE position = 1 AND status = 'failed' AND issue IS NOT NULL", (repo,))
+        return [str(row['issue']) for row in rows]
+
+
 def environment_requeue(run: dict, since: str) -> tuple[dict, int]:
     with reader() as c:
         entry = c.execute("SELECT * FROM environment_requeues WHERE run_id = ?", (run["id"],)).fetchone()
