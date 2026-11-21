@@ -286,6 +286,27 @@ class ReviewTests(unittest.TestCase):
         self.assertTrue(result.failed)
 
 
+class MinerGitHubTransportTests(unittest.TestCase):
+    def test_miner_and_pipeline_merges_use_the_arete_gh_login(self):
+        repo, head, base = "example/arete", "b" * 40, "a" * 40
+        commands = [
+            ["gh", "api", "user"],
+            ["gh", "pr", "merge", "8", "--repo", repo, "--squash", "--match-head-commit", head],
+            ["gh", "api", "-X", "PUT", f"repos/{repo}/pulls/9/merge", "--input", "-"],
+        ]
+        replies = [subprocess.CompletedProcess(cmd, 0, body, "") for cmd, body in
+                   zip(commands, ['{"login":"operator"}', "", '{"merged":true}'])]
+        with mock.patch.object(util, "sh_with_network", side_effect=replies) as transport, \
+                mock.patch.object(gh, "merge_readiness", return_value=("", "")):
+            self.assertEqual(gh.me.__wrapped__(), "operator")
+            gh.pr_squash(repo, 8, head)
+            self.assertEqual(gh.pr_merge_auto(repo, 9, head, "main", base), "")
+        self.assertEqual([call.args[0] for call in transport.call_args_list], commands)
+        for call in transport.call_args_list:
+            self.assertNotIn("env", call.kwargs)
+            self.assertIsNone(call.kwargs["cwd"])
+
+
 class MinerLifecycleTests(unittest.TestCase):
     BASE = "a" * 40
     HEAD = "b" * 40
@@ -487,12 +508,18 @@ class MinerLifecycleTests(unittest.TestCase):
     def test_deferred_pr_is_retried_on_a_later_run(self):
         self.prs = [{"html_url": self.URL, "pull_request": {}}]
         self.status = "pending"
+        self.eval.return_value = evals.Comparison("| pending eval table |", complete=True)
         self.assertEqual(self.run_miner(), 0)
         self.assertFalse(self.merged)
         self.status = "success"
+        self.eval.return_value = evals.Comparison("| latest eval table |", complete=True)
         self.assertEqual(self.run_miner(), 0)
         self.assertTrue(self.merged)
         self.assertEqual(self.ci_reads, [self.HEAD, self.HEAD])
+        self.assertEqual([call[0] for call in self.calls], ["comment", "edit-comment", "merge"])
+        self.assertEqual(list(self.comments), [1])
+        self.assertIn("| latest eval table |", self.comments[1]["body"])
+        self.assertNotIn("pending eval table", self.comments[1]["body"])
 
     def test_dry_run_leaves_stale_pr_untouched(self):
         self.prs = [{"createdAt": util.iso(util.now() - timedelta(days=3)), "url": self.URL}]
@@ -640,8 +667,13 @@ class MinerLifecycleTests(unittest.TestCase):
         self.proposals.assert_not_called()
 
     def test_lowered_trust_after_comment_prevents_the_next_pr_write(self):
+        self.repo.layer = self.root
+        trust_file = self.root / "config.toml"
+        post = gh.pr_comment
+
         def comment(*args):
-            self.layer.trust_level = "pr"
+            post(*args)
+            trust_file.write_text('[trust]\nlevel = "pr"\n')
 
         for report, verdict in (
             (evals.Comparison("eval table", complete=True), None),
@@ -649,12 +681,15 @@ class MinerLifecycleTests(unittest.TestCase):
             (evals.Comparison("Not measured.", unmeasured=["build.md"], complete=True), False),
         ):
             with self.subTest(report=report), mock.patch.object(gh, "pr_comment", side_effect=comment) as posted, \
-                    mock.patch.object(miner, "judge_prompts", return_value=(verdict, "JEV verdict")):
-                self.layer.trust_level = "automerge"
+                    mock.patch.object(miner, "judge_prompts", return_value=(verdict, "JEV verdict")), \
+                    mock.patch.object(config, "load_layer", wraps=self.load_layer):
+                self.comments.clear()
+                self.calls.clear()
+                trust_file.write_text('[trust]\nlevel = "automerge"\n')
                 self.eval.return_value = report
                 self.assertIn("trust", self.decide())
                 posted.assert_called_once()
-                self.assertEqual(self.calls, [])
+                self.assertEqual([call[0] for call in self.calls], ["comment"])
         self.proposals.assert_not_called()
 
     def test_lowered_trust_during_label_creation_prevents_labeling_the_pr(self):
@@ -689,7 +724,8 @@ class MinerLifecycleTests(unittest.TestCase):
             on_base = prompts.commit == self.BASE
             self.assertEqual(source.ref, "")
             return evals.Arm(tag, [evals.TaskResult(task, passed, base_commit=self.BASE, context_sha="harness",
-                                                  graded=True, prompts_used={"build.md"})
+                                                  graded=True, prompts_used={"build.md"},
+                                                  required_behavior_failed=not passed)
                                    for task, passed in (("regressed-task", on_base), ("improved-task", not on_base))]
                              + [evals.TaskResult("unavailable-task", passed=on_base, graded=on_base,
                                                  base_commit=self.BASE, context_sha="harness")])
@@ -989,7 +1025,7 @@ class MinerLifecycleTests(unittest.TestCase):
                 self.assertIn("complete table", body)
                 self.assertIn(f"Base `{base}`, head `{self.HEAD}`.", body)
                 self.assertNotIn("first-task", body)
-                self.assertNotIn("Incomplete eval tasks", body)
+                self.assertIn("Incomplete eval tasks: none.", body)
                 self.assertEqual(self.calls[1], ("edit-comment", 1, body))
                 if status == "success":
                     self.assertEqual(decision, "merged")
@@ -1023,6 +1059,7 @@ class MinerLifecycleTests(unittest.TestCase):
         self.assertIn(f"Base `{self.base}`, head `{self.UPDATED}`.", body)
         self.assertIn("complete table", body)
         self.assertNotIn("first-task", body)
+        self.assertIn("Incomplete eval tasks: none.", body)
         self.assertEqual(self.calls[2:], [("edit-comment", 1, body), ("merge", self.UPDATED)])
 
     def test_lowered_trust_during_comment_lookup_prevents_editing_eval_feedback(self):
@@ -1262,6 +1299,63 @@ class MinerLifecycleTests(unittest.TestCase):
                 self.assertEqual(result.graded, complete)
                 self.assertEqual(result.failures, [f"check exit {exit_code}"])
 
+    def test_required_check_outcome_requires_a_product_failure_and_a_command_exit(self):
+        for verdict, cause, code, expected in (
+            ("fail", None, 1, "fail"),
+            ("fail", "product", 0, "fail"),
+            ("fail", None, 124, ""),
+            ("fail", None, 126, ""),
+            ("fail", None, 127, ""),
+            ("fail", None, -15, ""),
+            ("fail", None, 143, ""),
+            ("fail", None, None, ""),
+            ("fail", "environment", 1, ""),
+            ("fail", "prerequisite", 1, ""),
+            ("blocked", None, 1, ""),
+            ("pass", None, 0, "pass"),
+        ):
+            with self.subTest(verdict=verdict, cause=cause, code=code):
+                self.assertEqual(evals.required_check_outcome(verdict, cause, code), expected)
+
+    def test_optional_repo_check_and_failed_repair_do_not_hide_a_regression(self):
+        task = evals.Task("required-behavior", "Fixture", "fixture", base=self.BASE, check="held-out")
+        layer = config.RepoLayer(self.root, max_attempts=2, checks={"optional": "optional-check"})
+        results = {}
+
+        def suite(cfg, repo, source, tasks, tag, prompts):
+            on_base = prompts.commit == self.BASE
+            run = evals.EvalRun(id=tag, repo=repo, dir=self.root / tag, task=task.name)
+            run.call_kw = mock.Mock(return_value={})
+            run.agent = mock.Mock(side_effect=[Result(ok=True, structured={}), Result(ok=True),
+                                               Result(ok=False, turns=0 if on_base else 1)])
+            run.gate = mock.Mock(return_value=(False, "optional check failed"))
+            check = subprocess.CompletedProcess(task.check, 0 if on_base else 1, "", "")
+            with mock.patch.object(evals, "hidden_check", return_value=check):
+                result = evals.run_task(cfg, source, task, evals.Prompts(commit=prompts.commit), run)
+            self.assertEqual(run.agent.call_args.args[0], "fix2")
+            self.assertEqual(result.checks, "fail")
+            results[prompts.commit] = result
+            return evals.Arm(tag, [result])
+
+        self.eval.side_effect = self.compare_prompts
+        with (
+            mock.patch.multiple(evals, export_prompts=lambda repo, ref, dest: {"build.md": ref.encode()},
+                                paired_tasks=lambda *args: [task], suites=lambda cfg: [self.repo], run_suite=suite,
+                                git=mock.Mock(return_value=""), fetch_origin=mock.DEFAULT,
+                                checkout_without_origin_refs=mock.Mock(return_value=self.BASE),
+                                prepare=mock.Mock(return_value=layer), check_script=mock.Mock(return_value=([], []))),
+            mock.patch.object(evals.paths, "WORKTREES_DIR", self.root / "eval-worktrees"),
+            mock.patch.object(util, "lock", return_value=nullcontext(True)),
+            mock.patch.object(evals.vault, "hidden", side_effect=str),
+        ):
+            self.assertEqual(self.decide(), "closed for an eval regression")
+        self.assertTrue(results[self.BASE].passed)
+        self.assertTrue(results[self.BASE].graded)
+        self.assertNotIn("fix.md", results[self.BASE].prompts_used)
+        self.assertIn("fix.md", results[self.HEAD].prompts_used)
+        self.assertIn("Closing because `required-behavior`", self.comments[1]["body"])
+        self.assertEqual(self.calls[-1], ("pr", "close", self.URL))
+
     def test_confirmed_verifier_failure_closes_even_when_other_commands_are_incomplete(self):
         task = evals.Task("required-behavior", "Fixture", "fixture", check="held-out", verify="Try the behavior")
         layer = config.RepoLayer(self.root, verify=config.Verify())
@@ -1271,7 +1365,7 @@ class MinerLifecycleTests(unittest.TestCase):
             on_base = prompts.commit == self.BASE
             run = evals.EvalRun(id=tag, repo=repo, dir=self.root, task=task.name)
             result = evals.TaskResult(task.name, base_commit=self.BASE, context_sha="harness", prompts_used={"build.md"})
-            grading = verify.Verified("pass") if on_base else candidate_grade
+            grading = baseline_grade if on_base else candidate_grade
             command = subprocess.CompletedProcess(task.check, 0, "", "") if on_base else candidate_command
             with mock.patch.object(evals, "grade", return_value=grading), mock.patch.object(
                 util, "run_whole_tree", side_effect=[command],
@@ -1281,9 +1375,9 @@ class MinerLifecycleTests(unittest.TestCase):
 
         self.eval.side_effect = self.compare_prompts
         export = mock.Mock(side_effect=lambda repo, ref, dest: {"build.md": ref.encode()})
-        failed = verify.Verified("fail", summary="Required behavior failed.")
-        observed_failure = {"what": "Required behavior", "how": "Run the feature", "saw": "Assertion failed",
+        observed_failure = {"what": "Required behavior", "how": "Run the feature", "saw": "exit 1: Assertion failed",
                             "passed": False}
+        failed = verify.Verified("fail", checks=[observed_failure])
         blocked_check = {"what": "Another step", "how": "Run the command", "saw": "Service unavailable",
                          "passed": False, "cause": "environment"}
         blocked_with_failure = verify.Verified("blocked", finished=False, blocked_by="Another command could not run",
@@ -1296,25 +1390,41 @@ class MinerLifecycleTests(unittest.TestCase):
             mock.patch.object(evals.vault, "hidden", side_effect=lambda text, *args: text),
             mock.patch.object(miner, "judge_prompts") as judge,
         ):
-            for candidate_grade, candidate_command, exit_code in (
-                (failed, subprocess.TimeoutExpired(task.check, 60), 124),
-                (failed, subprocess.CompletedProcess(task.check, 127, "", "command not found"), 127),
-                (blocked_with_failure, subprocess.TimeoutExpired(task.check, 60), 124),
-                (blocked_with_untagged_failure, subprocess.TimeoutExpired(task.check, 60), 124),
+            passed = verify.Verified("pass")
+            timeout_grade = verify.Verified("fail", checks=[{**observed_failure, "saw": "exit 124: timeout"}])
+            unobserved_grade = verify.Verified("fail", checks=[{**observed_failure, "saw": "Service unavailable"}])
+            unavailable_grade = verify.Verified("fail", checks=[{**observed_failure, "saw": "exit 126: unavailable"}])
+            timeout_command = subprocess.TimeoutExpired(task.check, 60)
+            for baseline_grade, candidate_grade, candidate_command, exit_code, closes in (
+                (passed, failed, timeout_command, 124, True),
+                (passed, failed, subprocess.CompletedProcess(task.check, 127, "", "command not found"), 127, True),
+                (passed, blocked_with_failure, timeout_command, 124, True),
+                (passed, blocked_with_untagged_failure, timeout_command, 124, True),
+                (passed, timeout_grade, timeout_command, 124, False),
+                (passed, unobserved_grade, timeout_command, 124, False),
+                (passed, unavailable_grade, timeout_command, 124, False),
+                (timeout_grade, failed, timeout_command, 124, False),
             ):
-                with self.subTest(grade=candidate_grade, exit_code=exit_code):
+                with self.subTest(main=baseline_grade, candidate=candidate_grade, exit_code=exit_code):
                     self.calls.clear()
+                    self.comments.clear()
                     results.clear()
-                    self.assertEqual(self.decide(), "closed for an eval regression")
+                    expected = "closed for an eval regression" if closes else "the eval comparison is incomplete"
+                    self.assertEqual(self.decide(), expected)
                     baseline, candidate = results
-                    self.assertTrue(baseline.passed and baseline.graded)
+                    self.assertEqual(baseline.graded, baseline_grade == passed)
+                    self.assertFalse(baseline.required_behavior_failed)
                     self.assertFalse(candidate.passed)
                     self.assertFalse(candidate.graded)
                     self.assertEqual(candidate.failures[-1], f"check exit {exit_code}")
-                    self.assertIn("Closing because `required-behavior`", self.calls[0][2])
-                    self.assertNotIn("Incomplete eval tasks", self.calls[0][2])
-                    self.assertIn("| all | 1/1 | 0/1 |", self.calls[0][2])
-                    self.assertEqual(self.calls[1], ("pr", "close", self.URL))
+                    baseline_score = "1/1" if baseline_grade == passed else "0/1"
+                    self.assertIn(f"| all | {baseline_score} | 0/1 |", self.calls[0][2])
+                    if closes:
+                        self.assertIn("Closing because `required-behavior`", self.calls[0][2])
+                        self.assertEqual(self.calls[1:], [("pr", "close", self.URL)])
+                    else:
+                        self.assertIn("Incomplete eval tasks were `required-behavior`", self.calls[0][2])
+                        self.assertEqual([call[0] for call in self.calls], ["comment"])
             judge.assert_not_called()
 
     def test_confirmed_held_out_failure_closes_even_when_the_verifier_is_blocked(self):
@@ -1416,23 +1526,32 @@ class MinerLifecycleTests(unittest.TestCase):
         self.assertEqual(self.calls[1], ("merge", self.HEAD))
         self.proposals.assert_called_once_with(self.URL, "merged")
 
-    def test_jev_retry_only_refreshes_stale_incomplete_feedback(self):
+    def test_jev_errors_preserve_existing_incomplete_feedback_until_a_verdict(self):
         self.eval.return_value = evals.Comparison("partial table", incomplete=["`first-task`"])
         self.assertIn("incomplete", self.decide())
+        original = self.comments[1]["body"]
         self.eval.return_value = evals.Comparison("Not measured.", unmeasured=["build.md"], complete=True)
+        replies = [jev.Reply(error="HTTP 503"), jev.Reply(error="JEV request timed out"), jev.Reply(),
+                   jev.Reply({"fix": jev.Answer(True, 1.0, {"yes": 1})})]
         with mock.patch.object(jev, "ready", return_value=True), \
-                mock.patch.object(jev, "ask", return_value=jev.Reply(error="HTTP 503")) as ask, \
+                mock.patch.object(jev, "ask", side_effect=replies) as ask, \
                 mock.patch.object(miner.vault, "hidden", side_effect=str):
-            self.assertEqual(self.decide(), "JEV returned no decision.")
-            self.assertEqual(self.decide(), "JEV returned no decision.")
-        self.assertEqual(ask.call_count, 2)
-        self.assertEqual([call[0] for call in self.calls], ["comment", "edit-comment"])
+            for _ in range(3):
+                self.assertEqual(self.decide(), "JEV returned no decision.")
+                self.assertEqual([call[0] for call in self.calls], ["comment"])
+                self.assertEqual(self.comments[1]["body"], original)
+                self.assertEqual(self.labels, {miner.MINER_LABEL})
+                self.proposals.assert_not_called()
+            self.assertEqual(self.decide(), "merged")
+        self.assertEqual(ask.call_count, 4)
+        self.assertEqual([call[0] for call in self.calls], ["comment", "edit-comment", "merge"])
         self.assertEqual(list(self.comments), [1])
         self.assertIn("Not measured.", self.comments[1]["body"])
+        self.assertIn("Incomplete eval tasks: none.", self.comments[1]["body"])
         self.assertNotIn("first-task", self.comments[1]["body"])
-        self.assertNotIn("JEV", self.comments[1]["body"])
+        self.assertIn("JEV answered yes", self.comments[1]["body"])
         self.assertEqual(self.labels, {miner.MINER_LABEL})
-        self.proposals.assert_not_called()
+        self.proposals.assert_called_once_with(self.URL, "merged")
 
     def test_unavailable_invalid_or_uncertain_jev_verdicts_do_not_request_human_review(self):
         self.eval.return_value = evals.Comparison("Not measured.", unmeasured=["build.md"], complete=True)

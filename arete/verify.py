@@ -116,7 +116,8 @@ def preflight(v: config.Verify, cwd: Path, cfg: config.Config, repo: config.Repo
         failed["cause"] = "environment"
     return Verified("blocked" if failed else "pass", "Verification prerequisites are unavailable." if failed else
                     "Configured verification prerequisites passed.", checks,
-                    blocked_by=f"{failed['what']}: {failed['saw']}" if failed else "", finished=not bool(failed))
+                    blocked_by=f"{failed['what']}: {failed['saw']}" if failed else "", finished=not bool(failed),
+                    behavior_reached=False)
 
 
 def run_probes(v: config.Verify, cwd: Path, attempt: scratch.Attempt | None,

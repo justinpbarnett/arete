@@ -352,11 +352,14 @@ def pr_comment(url: str, body: str) -> None:
                   f"repos/{pr_repo(url)}/issues/{pr_number(url)}/comments", mark=True)
 
 
-def find_own_pr_comment(repo: str, number: int, marker: str) -> dict | None:
+def find_own_pr_comment(repo: str, number: int, *markers: str) -> dict | None:
     author = me()
-    return next((row for row in api_list(f"repos/{repo}/issues/{number}/comments")
-                 if author and (row.get("user") or {}).get("login") == author
-                 and marker in (row.get("body") or "").splitlines()), None)
+    if not author:
+        return None
+    own = [(row, (row.get("body") or "").splitlines())
+           for row in api_list(f"repos/{repo}/issues/{number}/comments")
+           if (row.get("user") or {}).get("login") == author]
+    return next((row for marker in markers for row, lines in own if marker in lines), None)
 
 
 def pr_edit_comment(repo: str, comment_id: int, body: str) -> None:

@@ -490,6 +490,15 @@ def review(run: EvalRun, wt: Path, brief: prompt_loader.Brief, plan: str, report
     return sum(p["severity"] == "blocker" for p in review_problems(res.structured.get("problems")))
 
 
+def required_check_outcome(verdict: str, cause: str | None = None, exit_code: int | None = None) -> str:
+    if verdict == "pass":
+        return "pass"
+    if (verdict == "fail" and cause in (None, "product") and exit_code is not None
+            and exit_code >= 0 and exit_code not in (124, 126, 127) and not 129 <= exit_code <= 192):
+        return "fail"
+    return ""
+
+
 def acceptance(cfg, run, layer, wt, task, brief, result, plan, report, ok, timeout):
     git(["add", "-A"], wt)
     diff = vault.hidden(git(["diff", "--cached", "HEAD"], wt))
@@ -501,11 +510,18 @@ def acceptance(cfg, run, layer, wt, task, brief, result, plan, report, ok, timeo
         graded = grade(cfg, run, layer, wt, task.title, task.prompt, task.verify, run.time_for(timeout))
         result.verify = graded.verdict
         evidence = graded.markdown()
-        complete = graded.behavior_reached and graded.finished and graded.verdict in ("pass", "fail")
-        result.required_behavior_failed = (complete and graded.verdict == "fail") or any(
-            check.get("passed") is False and str(check.get("cause") or "").strip().lower() != "environment"
-            for check in graded.failed_checks
-        )
+        failed = []
+        if graded.behavior_reached:
+            for check in graded.failed_checks:
+                exit_status = re.match(r"\s*exit(?: code| status)?\s+(-?\d+)\b", check.get("saw", ""), re.I)
+                cause = check.get("cause")
+                failed.append(required_check_outcome("fail" if check.get("passed") is False else "",
+                                                     "product" if cause == "change" else cause,
+                                                     int(exit_status[1]) if exit_status else None))
+        complete = graded.behavior_reached and graded.finished and (
+            (graded.verdict == "pass" and not graded.failed_checks)
+            or (graded.verdict == "fail" and bool(failed) and all(failed)))
+        result.required_behavior_failed = "fail" in failed
         if graded.verdict != "pass":
             failures.append(grade_failure(graded))
     if run.reviews:
@@ -515,15 +531,14 @@ def acceptance(cfg, run, layer, wt, task, brief, result, plan, report, ok, timeo
             failures.append(util.count(blocking, "blocking review finding"))
     if task.check:
         res = hidden_check(cfg, run.repo, task, wt, run.time_for(timeout))
-        check_complete = not isinstance(res, util.CommandIncomplete) and res.returncode not in (124, 126, 127) and not (
-            res.returncode and re.search(r"^sandbox-exec:", res.stderr, re.M)
-        )
-        complete = complete and check_complete
         result.hidden = "pass" if res.returncode == 0 else "fail"
+        cause = "environment" if re.search(r"^sandbox-exec:", res.stderr, re.M) else None
+        outcome = required_check_outcome(result.hidden, cause, res.returncode)
+        complete = complete and bool(outcome)
+        result.required_behavior_failed |= outcome == "fail"
         (run.dir / "check.log").write_text(res.stdout + res.stderr)
         run.log(f"held out check: {'PASS' if res.returncode == 0 else 'FAIL'}")
         if res.returncode != 0:
-            result.required_behavior_failed |= check_complete
             failures.append(f"check exit {res.returncode}")
     result.graded = complete
     result.passed = not failures
@@ -611,7 +626,7 @@ def run_task(cfg: config.Config, src: Source, task: Task, prompts: Prompts, run:
                                 disallowed_tools=routing.NO_GIT_WRITES, resume=session, timeout=timeout,
                                 fresh_prompt=lambda which, fix=fix, summary=summary: switched_prompt(
                                     which, wt, task, plan, summary, fix))
-                if res.ok:
+                if res.ok or res.turns:
                     result.prompts_used.add("fix.md")
                 session, summary = res.session, res.text
                 ok, report = run.gate(layer, wt, task, timeout)
@@ -620,9 +635,7 @@ def run_task(cfg: config.Config, src: Source, task: Task, prompts: Prompts, run:
             raise
         result.repairs = attempts - 1
         result.checks = "pass" if ok else "fail"
-        result = acceptance(cfg, run, layer, wt, task, brief, result, plan, report, ok, timeout)
-        result.graded = result.graded and (ok or res.ok)
-        return result
+        return acceptance(cfg, run, layer, wt, task, brief, result, plan, report, ok, timeout)
     except workspace.RunFailed as e:
         result.why = e.why
         run.log(f"stopped: {e.why}")
@@ -829,12 +842,12 @@ def compare_prompts(cfg: config.Config, arete: config.Repo, base: str, head: str
                       ran, changed, skipped)
 
 
-def show_flips(flips: list[TaskResult], private: bool) -> str:
+def show_flips(flips: list[tuple[str, bool]], private: bool) -> str:
     if not flips:
         return "none"
     if not private:
-        return ", ".join(f"`{r.task}` now {'passes' if r.passed else 'fails'}" for r in flips)
-    up = sum(r.passed for r in flips)
+        return ", ".join(f"`{task}` now {'passes' if passed else 'fails'}" for task, passed in flips)
+    up = sum(passed for _, passed in flips)
     down = len(flips) - up
     return ", ".join(filter(None, [f"{util.count(up, 'task')} now {'passes' if up == 1 else 'pass'}" if up else "",
                                    f"{util.count(down, 'task')} now {'fails' if down == 1 else 'fail'}" if down else ""]))
@@ -873,9 +886,10 @@ def comparison(target: config.Repo, base: str, lead: str, ran: list[tuple[config
             paired = [(prior, r) for r in pr.results if confirmed(r) and (prior := before.get(r.task))
                       and r.base_commit and r.context_sha and inputs(prior) == inputs(r)]
             exercised.update(name for r in pr.results for name in r.prompts_used)
-            flips = [r for prior, r in paired if prior.passed != r.passed]
+            flips = [(r.task, not r.required_behavior_failed) for prior, r in paired
+                     if prior.required_behavior_failed != r.required_behavior_failed]
             lines.append(f"| {shown(repo)} | {main.score} | {pr.score} | {show_flips(flips, hidden(repo))} |")
-            failed = [r.task for r in flips if not r.passed]
+            failed = [task for task, passed in flips if not passed]
             if failed:
                 regressions.append(shown_tasks(repo, failed))
             paired_names = {r.task for _, r in paired}

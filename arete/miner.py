@@ -649,25 +649,27 @@ def pr_action_refusal(cfg: config.Config, repo: config.Repo, url: str, pr: Miner
     return ""
 
 
-def post_eval_feedback(cfg: config.Config, repo: config.Repo, url: str, pr: MinerPR, evidence: str, *,
-                       incomplete_reason: str = "", deferred: bool = False, edit_only: bool = False) -> str:
-    marker = gh.key_mark(util.digest("miner-incomplete"))
-    comment = gh.find_own_pr_comment(repo.github, pr.number, marker)
+def post_eval_feedback(cfg: config.Config, repo: config.Repo, url: str, pr: MinerPR, report: evals.Comparison, *,
+                       closing: str = "", answer: str = "") -> str:
+    marker = gh.key_mark(util.digest("miner-evals", pr.head))
+    incomplete_marker = gh.key_mark(util.digest("miner-incomplete"))
+    legacy = gh.key_mark(util.digest("miner-evals", pr.base_sha, pr.head))
+    comment = gh.find_own_pr_comment(repo.github, pr.number, marker, legacy, incomplete_marker)
     previous = comment["body"] if comment else ""
-    was_incomplete = previous.startswith(("Incomplete eval tasks were ", "The eval comparison did not complete."))
-    if incomplete_reason:
-        evidence = f"{incomplete_reason}\n\n{evidence}"
-        if previous.startswith(gh.outgoing(f"{incomplete_reason}\n\n{pr.commits()}")):
-            return ""
-    elif edit_only and not was_incomplete:
-        return ""
-    elif not was_incomplete and not re.search(rf"^Base `[0-9a-f]{{40}}`, head `{pr.head}`\.$", previous, re.M):
-        comment = None
-        marker = gh.key_mark(util.digest("miner-evals", pr.base_sha, pr.head)) if deferred else ""
-        if marker and gh.find_own_pr_comment(repo.github, pr.number, marker):
-            return ""
-    body = f"{evidence}\n\n{marker}" if marker else evidence
-    if comment and previous.startswith(gh.outgoing(body, mark=True)):
+    if (comment and not previous.startswith(("Incomplete eval tasks were ", "The eval comparison did not complete."))
+            and not any(key in previous.splitlines() for key in (marker, legacy))
+            and not re.search(rf"^Base `[0-9a-f]{{40}}`, head `{pr.head}`\.$", previous, re.M)):
+        comment, previous = None, ""
+    incomplete = bool(report.incomplete) or not (report.complete or report.regressions)
+    status = ""
+    if incomplete and not report.regressions:
+        tasks = ", ".join(report.incomplete)
+        status = f"Incomplete eval tasks were {tasks}." if tasks else "The eval comparison did not complete."
+    if not incomplete and (incomplete_marker in previous.splitlines() or "Incomplete eval tasks: none." in previous):
+        status = "Incomplete eval tasks: none."
+    body = "\n\n".join(filter(None, [closing, status, pr.commits(), report.markdown.strip(), answer, marker,
+                                     incomplete_marker if incomplete else ""]))
+    if previous.startswith(gh.outgoing(body, mark=True)):
         return ""
     if refusal := pr_action_refusal(cfg, repo, url, pr, "the PR changed before eval feedback could be posted"):
         return refusal
@@ -676,16 +678,6 @@ def post_eval_feedback(cfg: config.Config, repo: config.Repo, url: str, pr: Mine
     else:
         gh.pr_edit_comment(repo.github, int(comment["id"]), body)
     return ""
-
-
-def post_deferred_evals(cfg: config.Config, repo: config.Repo, url: str, pr: MinerPR,
-                        report: evals.Comparison, evidence: str) -> str:
-    reason = ""
-    if not report.complete and not report.regressions:
-        tasks = ", ".join(report.incomplete)
-        reason = f"Incomplete eval tasks were {tasks}." if tasks else "The eval comparison did not complete."
-    return post_eval_feedback(cfg, repo, url, pr, evidence, incomplete_reason=reason, deferred=True,
-                              edit_only=not (reason or report.markdown.strip()))
 
 
 def decide_pr(cfg: config.Config, run_id: str, repo: config.Repo, url: str, *, published_head: str = "") -> str:
@@ -727,15 +719,12 @@ def decide_pr(cfg: config.Config, run_id: str, repo: config.Repo, url: str, *, p
     ci_passed = gh.actions_check_passed(repo.github, pr.head, MINER_CHECK)
     if refusal := pr_action_refusal(cfg, repo, url, pr, "the PR changed during the CI check"):
         return refusal
-    evidence = "\n\n".join(filter(None, [pr.commits(), report.markdown.strip()]))
     if not ci_passed:
-        if report.markdown.strip() or report.incomplete or report.complete:
-            if refusal := post_deferred_evals(cfg, repo, url, pr, report, evidence):
-                return refusal
-        return "the PR head does not have a passing arete-checks result"
+        return (post_eval_feedback(cfg, repo, url, pr, report)
+                or "the PR head does not have a passing arete-checks result")
     if report.regressions:
-        feedback = f"Closing because {', '.join(report.regressions)} passed on the base and now fail.\n\n{evidence}"
-        if refusal := post_eval_feedback(cfg, repo, url, pr, feedback):
+        closing = f"Closing because {', '.join(report.regressions)} passed on the base and now fail."
+        if refusal := post_eval_feedback(cfg, repo, url, pr, report, closing=closing):
             return refusal
         if refusal := pr_action_refusal(cfg, repo, url, pr, "the PR changed before it could be closed"):
             return refusal
@@ -743,14 +732,14 @@ def decide_pr(cfg: config.Config, run_id: str, repo: config.Repo, url: str, *, p
         approvals_store.set_proposal_status_by_pr(url, "rejected")
         return "closed for an eval regression"
     if not report.complete:
-        return post_deferred_evals(cfg, repo, url, pr, report, evidence) or "the eval comparison is incomplete"
+        return post_eval_feedback(cfg, repo, url, pr, report) or "the eval comparison is incomplete"
     if report.unmeasured:
         approved, answer = judge_prompts(cfg, run_id, repo, pr, report.unmeasured)
         if approved is None:
-            return post_eval_feedback(cfg, repo, url, pr, evidence, edit_only=True) or answer
+            return answer
         if refusal := pr_action_refusal(cfg, repo, url, pr, "the PR changed during JEV review"):
             return refusal
-        if refusal := post_eval_feedback(cfg, repo, url, pr, f"{evidence}\n\n{answer}"):
+        if refusal := post_eval_feedback(cfg, repo, url, pr, report, answer=answer):
             return refusal
         if approved is False:
             changed = "the PR changed before it could be labeled"
@@ -762,7 +751,7 @@ def decide_pr(cfg: config.Config, run_id: str, repo: config.Repo, url: str, *, p
                 return refusal
             gh.pr_add_label(url, REVIEW_LABEL)
             return answer
-    elif refusal := post_eval_feedback(cfg, repo, url, pr, evidence):
+    elif refusal := post_eval_feedback(cfg, repo, url, pr, report):
         return refusal
     if refusal := pr_action_refusal(cfg, repo, url, pr, "the PR changed before it could be merged"):
         return refusal
