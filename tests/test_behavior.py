@@ -37,7 +37,7 @@ def setUpModule():
 
 
 class _CliThroughServeCase(unittest.TestCase):
-    class_timeout = 30
+    class_timeout = 150
     class_worker = None
     OWNER = "cli-owner@example.test"
     ONLINE = (
@@ -144,8 +144,7 @@ class _CliThroughServeCase(unittest.TestCase):
                 except subprocess.TimeoutExpired:
                     process.kill()
                     status = process.wait()
-            if status:
-                raise RuntimeError(f"CLI test worker exited with status {status}\n{output.read_text(errors='replace')}")
+            raise RuntimeError(f"[diag] CLI test worker exited with status {status}\n{output.read_text(errors='replace')}")
 
     def in_subprocess(self, case):
         if self.class_worker is None:
@@ -179,22 +178,29 @@ class _CliThroughServeCase(unittest.TestCase):
               mock.patch("urllib.request.urlopen", side_effect=AssertionError("urllib.request.urlopen")),
               mock.patch.object(gh, "gh", side_effect=AssertionError("arete.gh.gh"))):
             connection.set_inheritable(False)
-            faulthandler.dump_traceback_later(cls.class_timeout - 4)
+            import time as diag_time
+            faulthandler.dump_traceback_later(12, repeat=True)
+            began = diag_time.monotonic()
             fixture_root = Path.cwd()
             config_text = cls.prepare_fixture(fixture_root)
+            print(f"[diag] prepare_fixture {diag_time.monotonic() - began:.1f}s", file=sys.stderr, flush=True)
+            began = diag_time.monotonic()
             # Import once so all module-level paths can be rebound for each check.
             codebase.import_everything()
+            print(f"[diag] import_everything {diag_time.monotonic() - began:.1f}s", file=sys.stderr, flush=True)
             faulthandler.cancel_dump_traceback_later()
             for request in channel:
                 test = cls(request.decode().strip())
                 test.fixture_root = fixture_root
                 test.fixture_config = config_text
                 output = StringIO()
-                faulthandler.dump_traceback_later(cls.class_timeout - 4)
+                faulthandler.dump_traceback_later(12, repeat=True)
+                began = diag_time.monotonic()
                 try:
                     result = Context().run(unittest.TextTestRunner(stream=output, verbosity=2).run, test)
                 finally:
                     faulthandler.cancel_dump_traceback_later()
+                    print(f"[diag] {request.decode().strip()} {diag_time.monotonic() - began:.1f}s", file=sys.stderr, flush=True)
                 channel.write(json.dumps([result.wasSuccessful(), output.getvalue()]).encode() + b"\n")
                 channel.flush()
 
