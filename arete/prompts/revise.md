@@ -21,6 +21,8 @@ $expertise
 
 ## Rules
 
+Denied paths: $denied.
+
 - The branch already holds the PR's work. Read what it changes with `git log` and `git diff` against the PR base
   before you edit.
 - Change the code so it does what the feedback asks. Where the feedback and the issue disagree, the feedback wins.

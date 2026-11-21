@@ -20,6 +20,8 @@ $expertise
 
 ## Rules
 
+Denied paths: $denied.
+
 - Make the change the plan describes.
 - Write self-documenting code: no docstrings, and a comment only for what the code cannot show, such as a line that looks wrong and is right. Follow the repo's own docs where they ask for more.
 - Arete owns the full check gate and runs it after you finish: $checks.

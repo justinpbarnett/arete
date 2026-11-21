@@ -27,6 +27,8 @@ $base_log
 
 ## Rules
 
+Denied paths: $denied.
+
 - Edit only the conflicting files, the branch's own files listed above, and incoming-side files for the reason
   permitted above. Remove every conflict marker (`<<<<<<<`, `|||||||`, `=======`, `>>>>>>>`).
 - Keep both the branch's requested work and the base's already-landed behaviour. Never drop either side to make the
