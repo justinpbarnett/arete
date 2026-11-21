@@ -60,6 +60,7 @@ class Pick:
     tid: str
     why: str
     from_queue: bool = False
+    from_feedback: bool = False
 
 
 def ticket_queues(repo: config.Repo, tk: tracker.Tracker) -> list[tracker.Tracker]:
@@ -118,7 +119,7 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
             return Pick(tid, "restarting after an interruption")
     for tid in insights_store.feedback_due(repo.name, util.iso(util.now() - timedelta(minutes=pipeline.FEEDBACK_QUIET_MINUTES))):
         if ordinary_history(tid):
-            return Pick(tid, "revising the PR for your review comments")
+            return Pick(tid, "revising the PR for your review comments", from_feedback=True)
     for source in ticket_queues(repo, tk):
         for t in source.replied():
             if not eligible_again(t.id):
@@ -319,7 +320,7 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline
     name = tracker.ticket_name(repo.name, source.ref(tid))
     if isinstance(source, tracker.GitHubTracker) and source.in_zte_queue(str(tid)):
         return "skipped"
-    reply = tracker_reply(repo, source, str(tid), dry_run, from_queue=pick.from_queue)
+    reply = "" if pick.from_feedback else tracker_reply(repo, source, str(tid), dry_run, from_queue=pick.from_queue)
     answering = not reply and pipeline.answered_run(repo.name, str(tid)) is not None
     if not answering and not reply and (waiting := held_back(cfg, repo.name, going, slots)):
         if not dry_run:

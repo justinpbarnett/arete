@@ -45,6 +45,7 @@ from arete.agent import Result
 from arete.orchestration_api import MAX_BYTES, OPERATIONS, PROTOCOL, Catalog, describe_operations
 from arete.store import asks as ask_store
 from arete.store import db as foundation
+from arete.store import insights as insights_store
 from arete.store import orchestration as ledger
 from arete.store import runs as run_store
 from arete.store import tasks as tasks_store
@@ -997,6 +998,35 @@ class QueueTests(Isolated):
 
     def test_tracker_reply_to_a_structured_question_gives_a_fresh_budget_after_a_dry_run(self):
         self.check_tracker_reply_budget(structured=True, dry_run=True)
+
+    def test_poll_starts_pr_revision_with_feedback_while_text_ask_is_open(self):
+        self.cfg.replay = config.ReplayConfig(all=True)
+        pr = "https://github.com/owner/project/pull/1"
+        published = self.made_run()
+        record.settle(published.id, "pr", pr_url=pr)
+        asked = self.made_run(published.id)
+        ask_store.ask_add("ask-fixture", asked.id, self.repo.name, self.ticket, "revise", "revise", "", "",
+                          [{"kind": "text", "header": "CI log", "question": "Where is the CI log?"}], {})
+        record.settle(asked.id, "needs-info")
+        self.local.label(self.ticket, add=["needs-info"])
+        comment = "The lint job has the log. Please fix the failing check."
+        created = util.iso(util.now() - timedelta(minutes=pipeline.FEEDBACK_QUIET_MINUTES + 1))
+        insights_store.add_feedback([{"pr_url": pr, "kind": "comment", "gh_id": 1, "repo": self.repo.name,
+                                      "issue": self.ticket, "body": comment, "created": created, "at_once": 0,
+                                      "pr_state": "OPEN", "status": "new"}])
+
+        revisions = []
+
+        def work(cfg, run, slot):
+            revisions.append([(row["pr_url"], row["body"]) for row in run.feedback])
+            return "noop", "fixture finished", ""
+
+        def spawn(repo, tid):
+            self.assertEqual(self.run_polled_ticket(repo, tid, work), 0)
+
+        self.assertEqual(self.poll_with(self.cfg, spawn), 0)
+        self.assertEqual(revisions, [[(pr, comment)]])
+        self.assertEqual(ask_store.ask_get("ask-fixture")["status"], "open")
 
     def test_github_label_removal_without_a_reply_admits_a_run_with_spent_repairs(self):
         self.repo = replace(self.repo, name="github-fixture", github="owner/project", tracker="github",
