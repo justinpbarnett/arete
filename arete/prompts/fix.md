@@ -2,6 +2,8 @@ The checks failed after your change. Attempt $attempt of $max_attempts.
 
 $failures
 
+Denied paths: $denied.
+
 Wait for every check you started to finish and read its result before you finish. Do not wait with chained sleeps, and
 do not end your turn while a check is still running.
 
