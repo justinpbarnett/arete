@@ -790,7 +790,7 @@ class Controller:
         self.data["ci_failed"] = True
         targets = {}
         for w in current.seen:
-            reds = [r for r in w.reds if w.read or r.check.key in w.rerun_reds]
+            reds = [r for r in w.reds if reruns is None or w.read or r.check.key in w.rerun_reds]
             targets[w.target.github] = {"head": w.target.sha, "pr": w.target.pr, "red": bool(reds),
                                         "jobs": [r.check.job for r in reds if r.check.job]}
         interrupted_watch = reruns is not None and not current.all_read
@@ -1161,6 +1161,8 @@ class Controller:
         if op == "publication.request":
             return self.publish()
         if op == "run.finish":
+            if args["reason"] == "noop" and self.data.get("ci_failed"):
+                raise ValueError("CI is still failed; retry CI through publication.request, repair, or finish failed")
             if args["reason"] == "delivered":
                 published = self.data.get("published", {})
                 if (published.get("ending") not in ("done", "pr") or self.data.get("ci_failed")
