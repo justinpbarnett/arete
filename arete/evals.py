@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import tomllib
+import unicodedata
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -433,6 +434,20 @@ def fetch_origin(repo: config.Repo) -> None:
         git(["fetch", "-q", "origin"], repo.path, check=False, timeout=300)
 
 
+def overlay_owns_copy(root: Path, dest: Path, overlay_paths: frozenset[str]) -> bool:
+    if not overlay_paths or not dest.is_relative_to(root):
+        return False
+    name = dest.relative_to(root).as_posix()
+    if name in overlay_paths:
+        return True
+    folded = unicodedata.normalize("NFD", name).casefold()
+    if not any(unicodedata.normalize("NFD", path).casefold() == folded for path in overlay_paths):
+        return False
+    with tempfile.NamedTemporaryFile(prefix="eval-copy-", dir=root) as scratch:
+        probe = Path(scratch.name)
+        return probe.with_name(probe.name.upper()).exists()
+
+
 def prepare(repo: config.Repo, src: Source, wt: Path, run: EvalRun) -> config.RepoLayer:
     copied = overlay_harness(src, wt)
     run.harness_paths = copied
@@ -444,11 +459,23 @@ def prepare(repo: config.Repo, src: Source, wt: Path, run: EvalRun) -> config.Re
     layer = config.load_layer(repo.layer or wt / ".agents")
     overlay_paths = src.changed.union(copied) if isinstance(src, HarnessOverlay) else frozenset()
     for c in layer.copy:
-        if os.path.normpath(c) in overlay_paths:
-            continue
         s = repo.path / c
         if s.exists():
-            dest = fixture_path(wt.resolve(), c)
+            root = wt.resolve()
+            rel = Path(c)
+            path = root / rel
+            if (overlay_paths and not rel.is_absolute() and path.is_symlink()
+                    and overlay_owns_copy(root, path.parent.resolve() / path.name, overlay_paths)):
+                continue
+            dest = fixture_path(root, c)
+            if overlay_owns_copy(root, dest, overlay_paths):
+                continue
+            if overlay_paths and dest.is_dir():
+                target = dest / s.name
+                if overlay_owns_copy(root, target, overlay_paths) or (
+                    target.is_symlink() and overlay_owns_copy(root, target.resolve(), overlay_paths)
+                ):
+                    continue
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(s, dest)
     for cmd in layer.setup:
