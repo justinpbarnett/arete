@@ -2302,9 +2302,14 @@ class ServeStatusTests(unittest.TestCase):
         result = subprocess.run([str(installed), "status", *args], cwd=self.root,
                                 env=stack_env({**env, "PYTHONPATH": str(self.root), "PYTHONDONTWRITEBYTECODE": "1"}),
                                 capture_output=True, text=True, timeout=8)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
         self.assertIn("broken deployment fixture", result.stderr)
-        self.assertIn(f"running code {running}, checkout HEAD {checkout}", result.stdout)
+        self.assertIn(
+            f"last recorded serve heartbeat at 2026-11-21T00:00:00Z, running code {running}, checkout HEAD {checkout}",
+            result.stderr.splitlines(),
+        )
+        self.assertFalse((state_dir / "arete.db").exists())
 
     def test_installed_status_reads_revisions_when_candidate_common_raises(self):
         self.break_candidate_import("commands/common.py")

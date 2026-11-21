@@ -1,23 +1,15 @@
 from __future__ import annotations
 
 import argparse
-import functools
 import json
 import sys
+from urllib.parse import quote
 
-from .. import config, paths
+from .. import client, config, paths
+from ..store import db as foundation
 from ..store import loops as loop_store
 from ..store import runs as run_store
 from .common import Parser, follow, loop_line, print_feed_line, print_table, serve_line, when
-
-
-def loop_errors(handler):
-    @functools.wraps(handler)
-    def guarded(args) -> int:
-
-        return handler(args)
-
-    return guarded
 
 
 def events_from_file(file: str) -> list[dict] | None:
@@ -38,10 +30,10 @@ def events_from_file(file: str) -> list[dict] | None:
 def latest_run(name_or_run: str) -> str:
     from .. import control
 
-    if run_store.run_get(name_or_run):
+    if run_store.run_get(name_or_run, connect=foundation.reader):
         return name_or_run
     loop = control.find_loop(name_or_run)
-    last = next(iter(run_store.runs(kind="loop", loop=loop.name, limit=1, firings=True)), None)
+    last = next(iter(run_store.runs(kind="loop", loop=loop.name, limit=1, firings=True, connect=foundation.reader)), None)
     if not last:
         raise control.NotFound(f"{loop.name} has not run yet")
     return last["id"]
@@ -53,7 +45,6 @@ def cmd_serve(args) -> int:
     serve.run(with_dashboard=not args.no_dashboard)
 
 
-@loop_errors
 def loop_requeue(args) -> int:
     from .. import control
 
@@ -66,7 +57,6 @@ def loop_requeue(args) -> int:
     return 0
 
 
-@loop_errors
 def loop_list(args) -> int:
     from .. import control
 
@@ -76,10 +66,11 @@ def loop_list(args) -> int:
     return 0
 
 
-@loop_errors
 def loop_new(args) -> int:
-    from .. import scaffold, util
+    from .. import control, scaffold, util
 
+    if args.run_id:
+        control.require_worker("loop new")
     made = scaffold.draft(scaffold.DraftRequest(" ".join(args.words), args.name, args.repo, args.model),
                           run_id=args.run_id)
     print(f"drafted {made['name']} in {paths.short_path(made['dir'])} (off, {util.paid_note(made['paid'])})\n")
@@ -90,14 +81,13 @@ def loop_new(args) -> int:
     return 0
 
 
-@loop_errors
 def loop_exec(args) -> int:
-    from .. import loop_run
+    from .. import control, loop_run
 
+    control.require_worker("loop exec")
     return 0 if loop_run.carry_opened(args.run_id) in ("done", "skipped") else 1
 
 
-@loop_errors
 def loop_try(args) -> int:
     from .. import scaffold, util
 
@@ -108,51 +98,46 @@ def loop_try(args) -> int:
 
 
 def loop_switched(args, enabled: bool) -> int:
-    from .. import control
-
-    done = control.switch(args.name, enabled)
+    done = client.call("POST", f"/api/loops/{quote(args.name, safe='')}/{'enable' if enabled else 'disable'}")
     print(f"{done['name']}: {'on' if done['enabled'] else 'off'}"
           + ("; serve is down, so it fires once serve runs again" if done["enabled"] and not done["serve_up"] else ""))
     return 0
 
 
-@loop_errors
 def loop_enable(args) -> int:
     return loop_switched(args, True)
 
 
-@loop_errors
 def loop_disable(args) -> int:
     return loop_switched(args, False)
 
 
-@loop_errors
 def loop_start(args) -> int:
     from .. import loop_run
 
-    r = loop_run.launch(args.name, events=events_from_file(args.events))
-    print(f"started {r['id']}")
+    r = (loop_run.launch(args.name, events=events_from_file(args.events)) if args.events
+         else client.call("POST", f"/api/loops/{quote(args.name, safe='')}/start"))
+    run_id = r["id"]
     if args.follow:
-        follow(r["id"])
+        follow(run_id, remote=not args.events, on_start=lambda: print(f"started {run_id}", flush=True))
+    else:
+        print(f"started {run_id}")
     return 0
 
 
-@loop_errors
 def loop_stop(args) -> int:
-    from .. import control
+    try:
+        loop = client.call("GET", f"/api/loops/{quote(args.name, safe='')}")
+    except client.Failed as e:
+        if e.code != 404:
+            raise
+        return client.run_command(args.name, "stop")
+    if not (target := client.field(loop, "running")):
+        print("not running")
+        return 0
+    return client.run_command(target, "stop", key_scope=target)
 
-    target = args.name
-    if not run_store.run_get(target):
-        loop = control.find_loop(target)
-        running = [r for r in run_store.runs_marked_running() if r["kind"] == "loop" and r["loop"] == loop.name]
-        if not running:
-            raise control.Refused(f"{target} has no run going")
-        target = running[0]["id"]
-    print(json.dumps(control.stop_run(target)))
-    return 0
 
-
-@loop_errors
 def loop_status(args) -> int:
     from .. import control, util
 
@@ -187,15 +172,14 @@ def loop_status(args) -> int:
     return 0
 
 
-@loop_errors
 def loop_feed(args) -> int:
     run_id = latest_run(args.name)
-    r = run_store.run_get(run_id)
+    r = run_store.run_get(run_id, connect=foundation.reader)
     print(f"{run_id} {r['status']} {r.get('loop') or r['kind']}")
     if args.follow:
         follow(run_id)
     else:
-        for line in run_store.feed(run_id):
+        for line in run_store.feed(run_id, connect=foundation.reader):
             print_feed_line(line)
     return 0
 
@@ -248,7 +232,7 @@ def register(sub) -> None:
     p = sub.add_parser("loop", help="list, draft, try, switch, start, stop and follow loops")
     lsub = p.add_subparsers(dest="action", required=True, parser_class=Parser)
     a = lsub.add_parser("list", help="the serve beat and every loop")
-    a.set_defaults(fn=loop_list)
+    a.set_defaults(fn=loop_list, local_read=True)
     a = lsub.add_parser("new", help="draft a loop from one sentence")
     a.add_argument("words", nargs="+", metavar="WORDS", help="one sentence on what the loop does")
     a.add_argument("--name", default="", help="the loop name")
@@ -276,11 +260,11 @@ def register(sub) -> None:
     a.set_defaults(fn=loop_stop)
     a = lsub.add_parser("status", help="one loop in detail")
     a.add_argument("name", metavar="NAME", help="a loop name")
-    a.set_defaults(fn=loop_status)
+    a.set_defaults(fn=loop_status, local_read=True)
     a = lsub.add_parser("feed", help="the feed of a loop's latest run, or of a run id")
     a.add_argument("name", metavar="NAME", help="a loop name, or a run id")
     a.add_argument("-f", "--follow", action="store_true", help="keep printing until the run ends")
-    a.set_defaults(fn=loop_feed)
+    a.set_defaults(fn=loop_feed, local_read=True)
     a = lsub.add_parser("exec", help="run a started loop run; serve and `arete loop start` call it")
     a.add_argument("--run-id", required=True, help="the run to carry out")
     a.set_defaults(fn=loop_exec)
@@ -294,10 +278,10 @@ def register(sub) -> None:
 
     p = sub.add_parser("devices", help="the devices loops and sessions run on, with their last probe")
     dsub = p.add_subparsers(dest="action", required=False, parser_class=Parser)
-    p.set_defaults(fn=devices_list)
+    p.set_defaults(fn=devices_list, local_read=True)
     a = dsub.add_parser("probe", help="probe one device and print what it found")
     a.add_argument("name", metavar="NAME", help="a device name")
-    a.set_defaults(fn=devices_probe)
+    a.set_defaults(fn=devices_probe, local_read=False)
 
     p = sub.add_parser("webhook", help="print the URL and token for a loop's webhook")
     p.add_argument("action", choices=("secret",))
