@@ -117,4 +117,4 @@ def emit(data: dict) -> None:
         row = writes.current(conn, "runs", run)
         if row is None:
             raise Stated(404, "No such run.")
-        writes.emit("runs", run, row, kind)
+        writes.emit(conn, "runs", run, row, kind)
