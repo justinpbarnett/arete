@@ -73,12 +73,29 @@ def end_with_runner(lifeline):
     os.kill(os.getpid(), signal.SIGKILL)
 
 
+class TimedResult(unittest.TestResult):
+    def __init__(self, progress):
+        super().__init__()
+        self.progress = progress
+
+    def startTest(self, test):
+        super().startTest(test)
+        self.started = time.monotonic()
+        self.progress.write(json.dumps([self.started, test.id(), None]) + "\n")
+
+    def stopTest(self, test):
+        super().stopTest(test)
+        finished = time.monotonic()
+        self.progress.write(json.dumps([finished, test.id(), finished - self.started]) + "\n")
+
+
 def run_one(identifier, start, result_file, lifeline):
     os.set_inheritable(lifeline, False)
     threading.Thread(target=end_with_runner, args=(lifeline,), daemon=True).start()
     sys.path.insert(0, start)
-    result = unittest.TestResult()
-    unittest.defaultTestLoader.loadTestsFromName(identifier).run(result)
+    with open(result_file + ".progress", "w", buffering=1) as progress:
+        result = TimedResult(progress)
+        unittest.defaultTestLoader.loadTestsFromName(identifier).run(result)
     report = {"ran": result.testsRun, "errors": [[str(t), text] for t, text in result.errors],
               "failures": [[str(t), text] for t, text in result.failures],
               "skipped": [[str(t), why] for t, why in result.skipped],
@@ -95,6 +112,35 @@ class Batch:
     count: int
     serial: bool = False
     timeout: float = DEFAULT_CLASS_TIMEOUT
+
+
+def class_timeout_report(batch, timeout, deadline, progress_file, stacks):
+    started = 0
+    completed = []
+    try:
+        with open(progress_file) as progress:
+            for line in progress:
+                if not line.endswith("\n"):
+                    break
+                timestamp, name, duration = json.loads(line)
+                if timestamp > deadline:
+                    break
+                if duration is None:
+                    started += 1
+                else:
+                    completed.append((duration, name))
+    except FileNotFoundError:
+        pass
+    slowest = sorted(completed, key=lambda entry: -entry[0])[:5]
+    timings = [f"  {duration:.3f}s {name}" for duration, name in slowest]
+    return "\n".join(filter(None, (
+        _test_stacks.REPORT_START,
+        f"{batch.identifier} ({batch.count} tests)",
+        f"class exceeded {timeout:g}s",
+        f"{len(completed)} completed, {batch.count - started} never started",
+        "Slowest completed tests:" if timings else "",
+        *timings, stacks, _test_stacks.TIMEOUT_REMEDIATION, _test_stacks.REPORT_END,
+    )))
 
 
 class Runner:
@@ -216,11 +262,11 @@ class Runner:
             timeout = stretch * (self.args.timeout if self.args.timeout is not None else batch.timeout)
             requested = None
             try:
+                deadline = time.monotonic() + timeout
                 process.wait(timeout)
                 if process.returncode:
                     problem = f"worker exited with status {process.returncode}"
             except subprocess.TimeoutExpired:
-                problem = f"class exceeded {timeout:g}s"
                 requested = self.request_stacks(stack_prefix)
             finally:
                 self.kill(process)
@@ -229,9 +275,7 @@ class Runner:
                     self.live.pop(process, None)
             if requested is not None:
                 stacks = self.stack_output(requested, process.pid)
-                timeout_report = "\n".join(filter(None, (
-                    _test_stacks.REPORT_START, batch.identifier, problem, stacks, _test_stacks.REPORT_END,
-                )))
+                timeout_report = class_timeout_report(batch, timeout, deadline, result_file + ".progress", stacks)
         try:
             with open(result_file) as handle:
                 report = json.load(handle)

@@ -8,6 +8,11 @@ PREFIX_ENV = "ARETE_TEST_STACK_PREFIX"
 DUMP_SIGNAL = signal.SIGURG
 REPORT_START = "=== Test class timeout ==="
 REPORT_END = "=== End test class timeout ==="
+TIMEOUT_REMEDIATION = (
+    "Move the tests this change adds into their own TestCase class, or split the class, "
+    "so each class finishes alone well within its deadline. Raise class_timeout only for a class "
+    "whose tests are slow on purpose."
+)
 _stack_fd = None
 
 

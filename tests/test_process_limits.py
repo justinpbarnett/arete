@@ -15,6 +15,7 @@ from unittest.mock import Mock, patch
 
 from adws import feature
 from arete import (
+    ci,
     codebase,
     config,
     dbstats,
@@ -55,7 +56,164 @@ from arete.store import orchestration as ledger
 from arete.store import runs as run_store
 from arete.store import tasks as tasks_store
 from arete.store import zte as zte_store
+from tests import parallel
 from tests.harness import set_task_body
+
+
+class ParallelTimeoutTests(unittest.TestCase):
+    guidance = (
+        "Move the tests this change adds into their own TestCase class, or split the class, "
+        "so each class finishes alone well within its deadline. Raise class_timeout only for a class "
+        "whose tests are slow on purpose."
+    )
+
+    def test_timeout_reports_the_five_slowest_tests_completed_by_the_deadline(self):
+        batch = parallel.Batch("fixture.Sample", 8)
+        durations = (2, 5, 1, 7, 4, 3, 20, 1)
+        events = [timestamp for index, seconds in enumerate(durations)
+                  for timestamp in (10 * index, 10 * index + seconds)]
+        # Simulate tests finishing and starting during the grace period for stack collection.
+        events[-2:] = [81, 82]
+        with tempfile.NamedTemporaryFile(mode="w", buffering=1) as progress:
+            result = parallel.TimedResult(progress)
+            clock = Mock()
+            clock.monotonic.side_effect = events
+            with patch.object(parallel, "time", clock):
+                for index in range(batch.count):
+                    test = Mock()
+                    test.id.return_value = f"fixture.Sample.test_{index}"
+                    result.startTest(test)
+                    result.stopTest(test)
+            report = parallel.class_timeout_report(
+                batch, 70, 70, progress.name, "Python class stack (PID 42)\n  File fixture.py"
+            )
+
+        self.assertEqual(report.splitlines()[1:-1], [
+            "fixture.Sample (8 tests)",
+            "class exceeded 70s",
+            "6 completed, 1 never started",
+            "Slowest completed tests:",
+            "  7.000s fixture.Sample.test_3",
+            "  5.000s fixture.Sample.test_1",
+            "  4.000s fixture.Sample.test_4",
+            "  3.000s fixture.Sample.test_5",
+            "  2.000s fixture.Sample.test_0",
+            "Python class stack (PID 42)",
+            "  File fixture.py",
+            self.guidance,
+        ])
+
+    def oversized_timeout_output(self):
+        stack = ("Python class stack (PID 42)\nCurrent thread (most recent call first):\n" +
+                 '  File "fixture.py", line 42 in test_hang\n' * 300)
+        with tempfile.NamedTemporaryFile(mode="w", buffering=1) as progress:
+            for event in ((0, "fixture.Sample.test_fast", None), (1, "fixture.Sample.test_fast", 1),
+                          (2, "fixture.Sample.test_slower", None), (4, "fixture.Sample.test_slower", 2),
+                          (5, "fixture.Sample.test_hang", None)):
+                progress.write(json.dumps(event) + "\n")
+            batch = parallel.Batch("fixture.Sample", 3)
+            return "\n\n".join(parallel.class_timeout_report(batch, deadline, deadline, progress.name, stack)
+                               for deadline in (10, 20))
+
+    def nearly_full_timeout_report(self, size):
+        stack = 'Python class stack (PID 42)\n  File "fixture.py", line 42 in test_hang'
+        with tempfile.NamedTemporaryFile(mode="w", buffering=1) as progress:
+            for event in ((0, "fixture.Sample.test_fast", None), (1, "fixture.Sample.test_fast", 1),
+                          (2, "fixture.Sample.test_hang", None)):
+                progress.write(json.dumps(event) + "\n")
+            batch = parallel.Batch("fixture.Sample", 2)
+            report = parallel.class_timeout_report(batch, 10, 10, progress.name, stack)
+            stack += "\n  " + "x" * (size - len(report) - 3)
+            return parallel.class_timeout_report(batch, 10, 10, progress.name, stack)
+
+    def assert_timeout_excerpt(self, excerpt, limit):
+        self.assertEqual(excerpt.splitlines().count(self.guidance), 2)
+        first, solo, _ = excerpt.split(self.guidance)
+        for deadline, summary in ((10, first), (20, solo)):
+            self.assertIn(
+                f"fixture.Sample (3 tests)\nclass exceeded {deadline}s\n2 completed, 0 never started\n"
+                "Slowest completed tests:\n  2.000s fixture.Sample.test_slower\n  1.000s fixture.Sample.test_fast",
+                summary,
+            )
+            self.assertIn('  File "fixture.py", line 42 in test_hang', summary)
+        self.assertLessEqual(len(excerpt), limit)
+
+    def test_local_repair_excerpt_keeps_both_timeout_summaries(self):
+        layer = config.RepoLayer(Path.cwd(), checks={"suite": "run suite"},
+                                 quick_checks=["suite"], parallel_checks=True)
+        result = SimpleNamespace(returncode=1, stdout=self.oversized_timeout_output(),
+                                 stderr="check stderr\n" * 1000)
+        with (patch.object(pipeline.environment, "sh", return_value=result),
+              patch.object(record, "timed", return_value=contextlib.nullcontext({}))):
+            ok, note = pipeline.run_checks(layer, Path.cwd(), [], Mock(), 30)
+
+        self.assertFalse(ok)
+        excerpt = note.split("\n```\n")[1].removesuffix("\n```")
+        self.assert_timeout_excerpt(excerpt, 6000)
+        self.assertIn("check stderr", excerpt)
+
+    def test_local_repair_excerpt_keeps_assertion_after_nearly_full_timeout_report(self):
+        report = self.nearly_full_timeout_report(5995)
+        self.assertEqual(len(report), 5995)
+        failure = "FAIL: fixture.Other.test_value\nAssertionError: 7 != 8"
+        excerpt = pipeline.check_output_excerpt(report + "\n\n" + failure, "", 6000)
+
+        self.assertIn(failure, excerpt)
+        self.assertIn(
+            "fixture.Sample (2 tests)\nclass exceeded 10s\n1 completed, 0 never started\n"
+            "Slowest completed tests:\n  1.000s fixture.Sample.test_fast",
+            excerpt,
+        )
+        self.assertIn(self.guidance, excerpt.splitlines())
+        self.assertLessEqual(len(excerpt), 6000)
+
+    def test_local_repair_excerpt_keeps_six_timeout_reports_after_verbose_output(self):
+        sample = self.oversized_timeout_output()
+        names = [f"fixture.test_workflow.test_pipeline_review_for_changed_dependencies.{name}Tests"
+                 for name in ("PublicationDiff", "CatchUpWorkspace", "ProcessQueue")]
+        reports = "\n\n".join(sample.replace("fixture.Sample", name) for name in names)
+        excerpt = pipeline.check_output_excerpt("verbose setup\n" * 1000 + "\n" + reports, "", 6000)
+
+        self.assertLessEqual(len(excerpt), 6000)
+        self.assertEqual(excerpt.splitlines().count(self.guidance), 6)
+        for name in names:
+            for deadline in (10, 20):
+                self.assertIn(f"{name} (3 tests)\nclass exceeded {deadline}s\n2 completed, 0 never started\n"
+                              f"Slowest completed tests:\n  2.000s {name}.test_slower\n  1.000s {name}.test_fast",
+                              excerpt)
+
+    def test_ci_repair_excerpt_keeps_both_timeout_summaries_and_saves_full_log(self):
+        target = ci.Target("owner/repo", "pr", "PR #1", "abcdef", "main")
+        red = ci.Red(target, gh.Check("suite", "fail", job=42), None, "")
+        output = self.oversized_timeout_output() + "\n##[error]Process completed with exit code 1.\n"
+        log = "\n".join(f"2026-11-21T12:00:00Z {line}" for line in output.splitlines())
+        with tempfile.NamedTemporaryFile() as saved, patch.object(gh, "job_log", return_value=log):
+            log_file = Path(saved.name)
+            note = ci.failure_note(red, log_file)
+            self.assertEqual(log_file.read_text(), log)
+
+        excerpt = note.split("\n````\n")[1].removesuffix("\n````")
+        self.assert_timeout_excerpt(excerpt, 8000)
+        self.assertIn("##[error]Process completed with exit code 1.", excerpt)
+
+    def test_ci_repair_excerpt_keeps_both_failures_after_nearly_full_timeout_report(self):
+        report = self.nearly_full_timeout_report(7995)
+        self.assertEqual(len(report), 7995)
+        failure = "FAIL: fixture.Other.test_value\nAssertionError: 7 != 8"
+        error = "##[error]Process completed with exit code 1."
+        for verbose in (False, True):
+            with self.subTest(verbose=verbose):
+                output = "verbose setup\n" * (1000 if verbose else 0)
+                output += f"{report}\n\n{failure}\n{error}\nPost-job cleanup"
+                log = "\n".join(f"2026-11-21T12:00:00Z {line}" for line in output.splitlines())
+                excerpt = ci.excerpt(log)
+
+                self.assertLessEqual(len(excerpt), 8000)
+                self.assertIn(f"{failure}\n{error}", excerpt)
+                self.assertIn("fixture.Sample (2 tests)\nclass exceeded 10s\n1 completed, 0 never started\n"
+                              "Slowest completed tests:\n  1.000s fixture.Sample.test_fast", excerpt)
+                self.assertIn(self.guidance, excerpt.splitlines())
+                self.assertNotIn("Post-job cleanup", excerpt)
 
 
 class PinCommandTests(unittest.TestCase):

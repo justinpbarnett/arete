@@ -1052,6 +1052,16 @@ def tail_of_both_streams(stdout: str, stderr: str, n: int) -> str:
     return util.tail(stdout, stdout_room) + util.tail(stderr, stderr_room)
 
 
+def check_output_excerpt(stdout: str, stderr: str, limit: int) -> str:
+    if len(stdout) + len(stderr) <= limit:
+        return stdout + stderr
+    reports = ci.TEST_TIMEOUT.findall(stdout) + ci.TEST_TIMEOUT.findall(stderr)
+    if not reports:
+        return tail_of_both_streams(stdout, stderr, limit)
+    output = "\n".join(filter(None, (ci.TEST_TIMEOUT.sub("", stream).strip() for stream in (stdout, stderr))))
+    return ci.timeout_log_excerpt(reports, limit, output)
+
+
 def selected_checks(layer: config.RepoLayer, files: list[str]) -> set[str]:
     selected = set(layer.quick_checks) & layer.checks.keys()
     for pattern, names in layer.targeted_checks.items():
@@ -1085,7 +1095,8 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
             ok = ok and passed
             run.log(f"check {name}: {'pass' if passed else f'FAIL (exit {res.returncode})'}")
             if not passed:
-                report.append(f"### {name} failed: `{cmd}` exit {res.returncode}\n```\n{tail_of_both_streams(res.stdout, res.stderr, 6000)}\n```")
+                excerpt = check_output_excerpt(res.stdout, res.stderr, 6000)
+                report.append(f"### {name} failed: `{cmd}` exit {res.returncode}\n```\n{excerpt}\n```")
             else:
                 report.append(f"### {name} passed: `{cmd}`")
 
