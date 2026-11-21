@@ -343,17 +343,13 @@ def fill_slots(cfg: config.Config, queues: list[RepoQueue], skips: pipeline.Skip
 
 def resume_environment_holds(cfg: config.Config, queues: list[RepoQueue], dry_run: bool,
                              errors: list[str], going: Counter, slots: int) -> int:
-    github_queues = [q for q in queues if isinstance(q.tracker, tracker.GitHubTracker)]
-    if not github_queues:
-        return 0
-    journal = environment_gaps.Journal(paths.STATE_DIR / "environment-gaps.json")
     started = 0
-    for queue in github_queues:
+    for queue in queues:
         repo = queue.repo
-        for row in run_store.latest_held_drafts(repo.name):
+        for row in run_store.environment_holds(repo.name):
             try:
                 can_start = started < MAX_STARTS_PER_POLL and not held_back(cfg, repo.name, going, slots - started)
-                if environment_gaps.handle(cfg, repo, row, journal, dry_run, can_start=can_start):
+                if environment_gaps.handle(cfg, repo, row, dry_run, can_start=can_start):
                     queue.selected.add(str(row["issue"]))
                     going[repo.name] += 1
                     started += 1

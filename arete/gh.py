@@ -239,9 +239,9 @@ def find_pr_marker(repo: str, branch: str, marker: str) -> str:
 
 
 def issue_comment(repo: str, number: int, body: str, *, return_url: bool = False,
-                  key: str = "", single_attempt: bool = False) -> str | None:
+                  single_attempt: bool = False) -> str | None:
     url = keyed_comment(["issue", "comment", str(number), "--repo", repo, "--body-file", "-"], body,
-                        f"repos/{repo}/issues/{number}/comments", key=key, single_attempt=single_attempt)
+                        f"repos/{repo}/issues/{number}/comments", single_attempt=single_attempt)
     return url if return_url else None
 
 
@@ -667,15 +667,6 @@ def repo_private(repo: str) -> bool | None:
         return bool((gh_json(["repo", "view", repo, "--json", "isPrivate"]) or {}).get("isPrivate"))
     except GhError:
         return None
-
-
-def repo_public(repo: str) -> bool:
-    try:
-        result = gh_json(["repo", "view", repo, "--json", "visibility,nameWithOwner"])
-    except (GhError, ValueError):
-        return False
-    return (isinstance(result, dict) and result.get("visibility") == "PUBLIC"
-            and str(result.get("nameWithOwner") or "").casefold() == repo.casefold())
 
 
 PASSING_CONCLUSIONS = {"success", "neutral"}

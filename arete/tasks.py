@@ -303,8 +303,8 @@ def command_run(run_id, base_version):
     return cfg, repo, row
 
 
-def no_later_run(row: dict) -> None:
-    if later := run_store.later_run(row["repo"], row["issue"], row["id"]):
+def no_later_run(row: dict, *, live: bool = False) -> None:
+    if later := run_store.later_run(row["repo"], row["issue"], row["id"], live=live):
         raise control.Refused(f"run {row['id']} is not the ticket's latest run: run {later['id']} "
                               f"({later['status']}) came after it")
 
@@ -590,7 +590,7 @@ def resume(run_id: str, step: str = "", base_version=None, *, environment_releas
         if row["status"] not in RESUMABLE and not environment_retry:
             raise control.Refused(f"run {run_id} ended {row['status']}; a run resumes only when it ended "
                                   f"{', '.join(RESUMABLE[:-1])} or {RESUMABLE[-1]}")
-        no_later_run(row)
+        no_later_run(row, live=environment_retry)
         path = pipeline.recorded_path(run_id)
         if environment_retry:
             from . import environment_gaps

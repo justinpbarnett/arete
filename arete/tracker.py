@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Literal
 
 from . import config, gh, jira, principals, util
+from .store import runs as run_store
 from .store import tasks as tasks_store
 
 LABEL = "agent"
@@ -211,7 +212,10 @@ class GitHubTracker:
             self._labels[tid] = [lb["name"] for lb in issue.get("labels", [])]
         ticket = Ticket(tid, self.ref(tid), "", body=body, labels=self._labels.get(tid, []))
         return (ZTE_QUEUE if ZTE_LABEL in ticket.labels else "") or error_of(lambda: batch_ids(ticket)) or self.wait_blocker(
-            github_waits(body, self.repo.github))
+            self.ticket_waits(tid, body))
+
+    def ticket_waits(self, tid: str, body: str) -> list[tuple[str, int]]:
+        return list(dict.fromkeys(github_waits(body, self.repo.github) + run_store.environment_waits(self.repo.name, tid)))
 
     def wait_blocker(self, waits: list[tuple[str, int]]) -> str:
         own = self.repo.github.casefold()
@@ -275,7 +279,7 @@ class GitHubTracker:
         blocker = (ZTE_QUEUE if ZTE_LABEL in labels else "") or (
             "" if self.by_owner(i) else f"it was opened by {author or 'someone else'}, not {self.owner}") or (
             "" if LABEL in labels else f"it has no `{LABEL}` label") or self.wait_blocker(
-            github_waits(i.get("body") or "", self.repo.github))
+            self.ticket_waits(str(i["number"]), i.get("body") or ""))
         ticket = Ticket(str(i["number"]), f"#{i['number']}", i["title"], body=i.get("body") or "(no description)",
                       comments=comments_text(comments), open=i.get("state") == "OPEN",
                       kind="fix" if FIX_LABELS & set(labels) else "feat", url=i.get("url", ""),
@@ -378,7 +382,8 @@ class JiraTracker:
     def blocker(self, tid: str) -> str:
         issue = self.client.issue(tid, JIRA_FIELDS)
         return (check_approval(self.client.me().get("accountId", ""), issue, self.client.changelog(tid), self.route)[0]
-                or wait_blocker(waits_on_jira((issue.get("fields") or {}).get("description") or ""), self.is_open))
+                or wait_blocker(waits_on_jira((issue.get("fields") or {}).get("description") or ""), self.is_open)
+                or environment_blocker(self.repo.name, tid))
 
     def is_open(self, key: str) -> bool | None:
         try:
@@ -405,7 +410,7 @@ class JiraTracker:
         return reply_text([(jira.parse_time(c["created"]), c.get("body") or "") for c in self.client.comments(tid)
                            if _authored_by(c, me) and c.get("created")], since)
 
-    def get(self, tid: str) -> Ticket:
+    def get(self, tid: str, *, include_environment: bool = True) -> Ticket:
         issue = self.client.issue(tid, JIRA_FIELDS)
         me = self.client.me().get("accountId", "")
         blocker, approved_at = check_approval(me, issue, self.client.changelog(tid), self.route)
@@ -413,6 +418,8 @@ class JiraTracker:
         labels = list(f.get("labels") or [])
         body = f.get("description") or "(no description)"
         blocker = blocker or wait_blocker(waits_on_jira(body), self.is_open)
+        if include_environment and not blocker:
+            blocker = environment_blocker(self.repo.name, tid)
         parent = f.get("parent") or {}
         if parent.get("key"):
             body = f"Part of {parent['key']}: {(parent.get('fields') or {}).get('summary', '')}\n\n{body}"
@@ -518,7 +525,7 @@ class LocalTracker:
     def blocker(self, tid: str) -> str:
         if (row := tasks_store.task_get(tid)) is None:
             return f"there is no task {tid}"
-        return task_wait_blocker(waits_on_tasks(row["body"]), task_state)
+        return task_wait_blocker(waits_on_tasks(row["body"]), task_state) or environment_blocker(self.repo.name, tid)
 
     def replied(self) -> list[Ticket]:
         return [task_ticket(row) for row in tasks_store.tasks_replied(self.repo.name)]
@@ -530,13 +537,15 @@ class LocalTracker:
     def save_images(self, t: Ticket, dest: Path) -> SavedImages:
         return SavedImages()
 
-    def get(self, tid: str) -> Ticket:
+    def get(self, tid: str, *, include_environment: bool = True) -> Ticket:
         if (row := tasks_store.task_get(tid)) is None:
             raise TaskError(f"no task {tid}")
         comments = [("Arete" if c["author"] == "arete" else "Owner", c["ts"] or "", c["body"] or "")
                     for c in tasks_store.task_comments(tid)]
         blocker = (f"it is a task of {row['repo']}, not {self.repo.name}" if row["repo"] != self.repo.name
                    else task_wait_blocker(waits_on_tasks(row["body"]), task_state))
+        if include_environment and not blocker:
+            blocker = environment_blocker(self.repo.name, tid)
         return task_ticket(row, comments_text(comments), blocker)
 
     def prepare(self) -> list[str]:
@@ -783,6 +792,11 @@ def wait_blocker[T: (int, str)](waits: list[T], is_open: Callable[[T], bool | No
     if unread:
         parts.append(f"it waits on {_refs(unread)}, which arete could not read")
     return "; ".join(parts)
+
+
+def environment_blocker(repo: str, tid: str) -> str:
+    refs = {f"{remote}#{number}": (remote, number) for remote, number in run_store.environment_waits(repo, tid)}
+    return wait_blocker(list(refs), lambda ref: GitHubTracker.issue_open(*refs[ref]))
 
 
 def jira_unrouted(project: str, routes: set[str], client: jira.Client) -> list[Ticket]:

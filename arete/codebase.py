@@ -63,9 +63,32 @@ def git(*args: str) -> str | None:
     return done.stdout if done.returncode == 0 else None
 
 
-def head_and_dirt() -> tuple[str, str | None]:
-    head = (git("rev-parse", "HEAD") or "").strip()
-    return head, git("status", "--porcelain", "--untracked-files=all") if head else None
+def checkout_head() -> str:
+    return (git("rev-parse", "--verify", "--short=12", "HEAD") or "").strip()
+
+
+def serve_revisions(beat: dict) -> str:
+    revisions = []
+    if beat.get("engine"):
+        revisions.append(f"running code {beat['engine']}")
+    if "checkout_head" in beat:
+        revisions.append(f"checkout HEAD {beat['checkout_head'] or 'unavailable'}")
+    return ", ".join(revisions)
+
+
+def head_and_dirt() -> tuple[str, bool]:
+    head = checkout_head()
+    status = git("status", "--porcelain", "--", "arete", "adws") if head else None
+    return head, any("__pycache__" not in line for line in (status or "").splitlines())
+
+
+def clean_release(short_head: str) -> str:
+    head = (git("rev-parse", "--verify", "HEAD") or "").strip()
+    if (re.fullmatch(r"[0-9a-f]{40}", head) and head.startswith(short_head)
+            and git("status", "--porcelain", "--untracked-files=no") == ""
+            and (git("rev-parse", "--verify", "HEAD") or "").strip() == head):
+        return head
+    return ""
 
 
 def reload(count: int) -> None:
@@ -82,17 +105,14 @@ def load() -> str:
         return STAMP
     before, _ = inventory()
     import_everything()
-    head, status = head_and_dirt()
-    changed = git("status", "--porcelain", "--", "arete", "adws") if status else ""
-    dirty = any("__pycache__" not in line for line in (changed or "").splitlines())
+    head, dirty = head_and_dirt()
+    release = clean_release(head) if head and not dirty else ""
     after, newest = inventory()
     moved = before != after or newest > arete.IMPORTED_NS
     reloads = int(os.environ.get(RELOADS) or 0)
     if moved and reloads < MAX_RELOADS:
         reload(reloads + 1)
-    if (re.fullmatch(r"[0-9a-f]{40}", head) and status == "" and not moved
-            and (git("rev-parse", "HEAD") or "").strip() == head):
-        RELEASE = head
-    stamp = (head[:12] + (f"+dirty.{after[:8]}" if dirty else "")) if head else f"code.{after[:12]}"
+    RELEASE = release if not moved else ""
+    stamp = (head + (f"+dirty.{after[:8]}" if dirty else "")) if head else f"code.{after[:12]}"
     STAMP = stamp + ("+moving" if moved else "")
     return STAMP

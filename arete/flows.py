@@ -70,7 +70,7 @@ def ran_on_seam(run_id: str) -> bool:
 
 def start(cfg: config.Config, run: pipeline.Run, earlier: dict, slot: slots.RunSlot | None = None,
           continues: str = "", only: str = "", again: str = "") -> factory.Flow:
-    ws = paths.WORKTREES_DIR / f"{run.repo.name}-{run.tid}"
+    ws = paths.WORKTREES_DIR / f"{run.repo.name}-{run.workspace_key}"
     continues = continues or (earlier["id"] if earlier.get("status") == "interrupted" and ran_on_seam(earlier["id"])
                               else "")
     if continues and not only:
@@ -189,31 +189,55 @@ def environment_build(job: Job, history: list[dict]) -> None:
         job.take("implement", Outcome("pass", data=build), stored=True)
 
 
-def restore_environment_workspace(job: Job, data: dict, heads: dict[str, str]) -> None:
+def environment_checkouts(repo: config.Repo, ws: Path, data: dict, heads: dict[str, str]) -> list[workspace.Checkout]:
     if not data.get("branch") or not data.get("checkouts"):
         raise workspace.RunFailed("the held run has no saved workspace for verification")
-    job.branch = data["branch"]
     checkouts = [workspace.Checkout.from_row(c) for c in data["checkouts"]]
-    repo = job.run.repo
-    configured = {(p.github, repo.path / p.dir, job.ws / p.dir) for p in repo.parts}
+    configured = {(p.github, repo.path / p.dir, ws / p.dir) for p in repo.parts}
     if {(c.github, c.src, c.wt) for c in checkouts} != configured or len(configured) != len(checkouts):
         raise workspace.RunFailed("the saved worktrees no longer match the configured repository")
-    if set(heads) != {c.github.casefold() for c in checkouts}:
+    if not set(heads) <= {c.github.casefold() for c in checkouts}:
         raise workspace.RunFailed("the saved workspace does not match the published draft")
+    if left := workspace.scratch_held(ws, checkouts):
+        raise workspace.scratch_failure(f"verification scratch at {left[0]} is still held", ws, left)
+    if why := workspace.kept_work(ws, checkouts, repo.path, config.load_layer(repo.layer_dir).copy, commits=False):
+        raise workspace.RunFailed(why)
+    branch = data["branch"]
     for c in checkouts:
-        head = heads[c.github.casefold()]
-        local = util.git(["rev-parse", "--verify", "-q", f"refs/heads/{job.branch}"], c.src, check=False).strip()
-        if (workspace.remote_head(c.src, job.branch) != head or local and local != head
-                or (c.wt / ".git").exists() and workspace.uncommitted(c.wt)):
+        remote = heads.get(c.github.casefold(), "")
+        head = remote or c.revision
+        ref = f"refs/heads/{branch}"
+        local = util.git(["rev-parse", "--verify", "-q", ref], c.src, check=False).strip()
+        if (not head or workspace.remote_head(c.src, branch) != remote or local and local != head
+                or (not remote and not local)):
             raise workspace.RunFailed(f"the held branch of {c.github} no longer matches the saved draft")
+        if (c.wt / ".git").exists() and (
+                util.git(["symbolic-ref", "-q", "HEAD"], c.wt, check=False).strip() != ref
+                or util.git(["rev-parse", "HEAD"], c.wt).strip() != head or workspace.uncommitted(c.wt)):
+            raise workspace.RunFailed(f"the held worktree of {c.github} no longer matches the saved draft")
+    return checkouts
+
+
+def check_environment_workspace(repo: config.Repo, row: dict, heads: dict[str, str]) -> None:
+    data = prepared_data(row["id"])
+    if data.get("branch") != row["branch"]:
+        raise workspace.RunFailed("the held PRs do not match the saved branch")
+    ws = paths.WORKTREES_DIR / f"{repo.name}-{row['issue']}"
+    environment_checkouts(repo, ws, data, {gh.pr_repo(url).casefold(): head for url, head in heads.items()})
+
+
+def restore_environment_workspace(job: Job, data: dict, heads: dict[str, str]) -> None:
+    checkouts = environment_checkouts(job.run.repo, job.ws, data, heads)
+    job.branch = data["branch"]
     if not all((c.wt / ".git").exists() for c in checkouts):
         if why := rebuild(job, {"step": "prepare", "data": data, "tree": str(job.ws)}, setup=False):
             raise workspace.RunFailed(why)
     job.take("prepare", Outcome("pass", data=data), stored=True)
     for c in job.checkouts:
-        if c.lease != heads[c.github.casefold()] or util.git(["rev-parse", "HEAD"], c.wt).strip() != c.lease:
+        remote = heads.get(c.github.casefold(), "")
+        if c.lease != remote or util.git(["rev-parse", "HEAD"], c.wt).strip() != (remote or c.revision):
             raise workspace.RunFailed(f"the held branch of {c.github} moved while restoring it")
-        c.onto, c.merge, c.resumes = "", "", True
+        c.onto, c.merge, c.resumes = "", "", bool(remote)
         workspace.fetch(c.src, c.base)
     try:
         pipeline.merge_moved_bases(job.run, job.checkouts, job.layer, job.ticket, environment_retry=True)
@@ -221,7 +245,7 @@ def restore_environment_workspace(job: Job, data: dict, heads: dict[str, str]) -
         if why := pipeline.furnish(job.cfg, job.run, job.layer, job.ws):
             raise workspace.RunFailed(why)
         for c in job.checkouts:
-            if (util.git(["rev-parse", "HEAD"], c.wt).strip() != (c.merge or c.lease)
+            if (util.git(["rev-parse", "HEAD"], c.wt).strip() != (c.merge or c.lease or c.revision)
                     or workspace.uncommitted(c.wt)):
                 raise workspace.RunFailed(f"setup changed the tree of {c.github} before verification")
     except BaseException:
@@ -236,8 +260,9 @@ def reset_environment_base(checkouts: list[workspace.Checkout]) -> bool:
         if c.merge:
             with util.repo_lock(c.src):
                 if util.git(["rev-parse", "HEAD"], c.wt).strip() == c.merge and not workspace.uncommitted(c.wt):
-                    util.git(["reset", "--keep", c.lease], c.wt)
-                    c.base_commit = util.git(["merge-base", c.lease, c.origin_base], c.wt).strip()
+                    head = c.lease or c.revision
+                    util.git(["reset", "--keep", head], c.wt)
+                    c.base_commit = util.git(["merge-base", head, c.origin_base], c.wt).strip()
                     c.merge, c.merged_base = "", False
                     reset = True
     return reset
@@ -255,7 +280,7 @@ def restore_environment_draft(job: Job, prepared: dict) -> None:
         raise factory.Refused("the held PRs do not match the saved branch")
     restore_environment_workspace(job, prepared, {repo: head for repo, (_, head) in prs.items()})
     for c in job.checkouts:
-        c.pr = prs[c.github.casefold()][0]
+        c.pr = prs.get(c.github.casefold(), ("", ""))[0]
 
 
 def retry_environment(flow: factory.Flow) -> tuple[str, str, str]:
@@ -813,7 +838,7 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
     if images.left_out:
         run.log(f"images: left out {', '.join(images.left_out)}")
     main_layer = pipeline.checked_layer(cfg, repo.layer_dir)
-    branch = (mended.get("branch") or pipeline.open_branch(run)
+    branch = (run.preview_branch or mended.get("branch") or pipeline.open_branch(run)
               or prompt_loader.fill_template(main_layer.branch, config.RepoLayer.branch, kind=t.kind, id=t.id,
                                         slug=prompt_loader.slug(t.title)))
     if not run.dry_run:
@@ -821,9 +846,9 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
     if not run.alone:
         run.enter("running")
     try:
-        if repo.parts and not run.dry_run:
-            checkouts = workspace.make_workspace(run.id, repo, main_layer.base_branch, branch, run.tid,
-                                                main_layer.copy)[1]
+        if repo.parts and (not run.dry_run or run.preview_of):
+            checkouts = workspace.make_workspace(run.id, repo, main_layer.base_branch, branch, run.workspace_key,
+                                                main_layer.copy, preview_of=run.preview_of)[1]
         else:
             checkouts = local_workspace(run, main_layer.base_branch, branch, job.ws, main_layer.copy)
         run.workspace = job.ws, checkouts
@@ -1265,10 +1290,24 @@ def open_or_refresh_prs(job: Job, found, staged, size, outcome, subject, draft_w
                                found, drafted, ci_stopped)
 
 
+def require_environment_owner_clear(job: Job) -> None:
+    run = job.run
+    if not run.environment_release:
+        return
+    from . import environment_gaps
+
+    source = run_store.run_get(job.continues) or {}
+    talks = {c.pr: gh.pr_discussion(c.pr) for c in job.with_prs}
+    if (not source or pipeline.pending_feedback(run.repo.name, str(run.tid))
+            or environment_gaps.owner_intervened(source, run.tracker, talks)):
+        raise factory.Refused("owner feedback took over the held PR before publication")
+
+
 @factory.step("pr")
 def pr(flow: factory.Flow, tree: str) -> Outcome:
     job: Job = flow.ctx
     run = job.run
+    require_environment_owner_clear(job)
     run.tracker.pr_link(job.ticket, whole=not job.left_for_a_person)
     found = adopt_open_prs(job)
     refuse_changed_prs(job)
@@ -1327,6 +1366,7 @@ def watch(flow: factory.Flow, tree: str) -> Outcome:
 def publish(flow: factory.Flow) -> Outcome:
     job: Job = flow.ctx
     run = job.run
+    require_environment_owner_clear(job)
     if not run.repo.parts:
         run.enter("done")
         what = (f"pushed {job.branch} to origin" if job.committed

@@ -144,13 +144,15 @@ def next_due(loop: Loop, after: datetime) -> str:
 
 
 def code_stamp() -> frozenset:
-    stamp = {("HEAD", (codebase.git("rev-parse", "HEAD") or "").strip())}
+    stamp = set()
     for p in [*paths.PACKAGE_DIR.rglob("*.py"), *paths.ADWS_DIR.glob("*.py"), *dashboard.web_files()]:
         try:
             st = p.stat()
         except FileNotFoundError:
             continue
         stamp.add((str(p), st.st_mtime_ns, st.st_size))
+    if head := codebase.checkout_head():
+        stamp.add(("HEAD", head))
     return frozenset(stamp)
 
 
@@ -235,7 +237,11 @@ class Server:
         self.alert_open = False
         self.alert_checked = False
         self.alert_last: Future | None = None
-        self.code = self.code_seen = code_stamp()
+        self.code_seen = code_stamp()
+        self.code = self.code_seen
+        if codebase.RELEASE:
+            self.code = frozenset(entry for entry in self.code if entry[0] != "HEAD") | {
+                ("HEAD", codebase.RELEASE[:12])}
         self.code_note = ""
         self.migration_stamp = None
         self.migration_error = ""
@@ -812,10 +818,11 @@ class Server:
         except Exception:
             running = None
         util.write_json(control.BEAT_FILE, {
+            "release": codebase.RELEASE,
             "schema": foundation.LATEST,
             "db": db,
-            "pid": os.getpid(), "engine": codebase.STAMP, "release": codebase.RELEASE, "at": at,
-            "started": util.iso(self.started), "ticks": self.ticks,
+            "pid": os.getpid(), "engine": codebase.STAMP, "checkout_head": codebase.checkout_head(),
+            "at": at, "started": util.iso(self.started), "ticks": self.ticks,
             "tick_seconds": TICK_SECONDS, "loops": len(live), "off": len(every_loop) - len(live),
             "broken": {x.name: x.error for x in every_loop if x.error}, "pending": pending,
             "running": running, "poll_errors": dict(self.errors),

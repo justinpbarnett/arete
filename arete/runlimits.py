@@ -136,11 +136,13 @@ def heads(repo, branch: str) -> dict[str, str]:
 
 
 def latest_park(repo: str, tid: str) -> tuple[dict, dict]:
-    rows = run_store.ticket_runs(repo, tid, limit=1)
+    rows = run_store.ticket_runs(repo, tid, limit=1, live=True)
     row = rows[0] if rows else {}
     for rid in family(row["id"]) if row else ():
         if saved := metadata(rid, "parked.json"):
-            return run_store.run_get(rid) or row, saved
+            prior = run_store.run_get(rid) or row
+            if not prior["dry_run"] and prior["status"] != "dry-run":
+                return prior, saved
     return row, {}
 
 
@@ -329,6 +331,8 @@ class Budget:
                for row in rows.values()):
             raise ValueError("the repair budget chain names a different or missing ticket run")
         current = specification(ticket) if ticket else None
+        if run.environment_release or run.preview_of:
+            chain = [rid for rid in chain if not rows[rid]["dry_run"] and rows[rid]["status"] != "dry-run"]
         left = [rid for rid in chain
                 if forced and current and (found := recorded_specification(rid)) and found != current]
         left_repairs = sum(repair_count(rid) for rid in left)
