@@ -174,7 +174,6 @@ function takeHeartbeat(serve, received = Date.now()) {
     return;
   }
   const previous = cache.serve?.at;
-  if (previous && serve.at < previous && serve.kind !== "serve.beat") return;
   if (serve.at === previous) {
     cache.serve = { ...serve, age_seconds: cache.serve.age_seconds };
     return;
@@ -396,7 +395,10 @@ async function flush(run) {
         if (grouped.includes(key) && result.data && (mismatch || key === "detail" && latest.get("shell")?.error)) continue;
         if (run.readingBoard && key === "tasks" && result.data && result.seq && behind(key, result.seq)) continue;
         if (usageOnly && result.data && behind(key, result.seq)) continue;
-        if (result.data && !usageOnly) run.positions.set(key, result.seq);
+        if (result.data && !usageOnly) {
+          run.positions.set(key, result.seq);
+          if (key === "tasks") run.tasksSource = result.source;
+        }
         if (key === "detail" && result.data?.run?.id === rs.id) run.positions.set("usage", result.seq ?? run.usageNeeded);
         if (key === "shell" && result.data) run.states.clear();
         publish(key, result, usageOnly);
@@ -584,18 +586,17 @@ export function stop() {
 
 export function live(screen, id = "", repo = "") {
   const existingShell = screen === "board" && transport && active?.positions.has("shell") && !cache.errors.sidebar ? active : null;
+  const existingBoard = screen === "board" && active?.screen === "board" && active.positions.has("tasks") ? active : null;
   const positions = new Map();
   if (existingShell) positions.set("shell", existingShell.positions.get("shell"));
-  if (screen === "board" && active?.screen === "board" && active.positions.has("tasks")) {
-    positions.set("tasks", active.positions.get("tasks"));
-  }
+  if (existingBoard) positions.set("tasks", existingBoard.positions.get("tasks"));
   stopReaders();
   selectRun(screen === "run" ? id : "");
   const previous = screenReads.peek();
   const reads = readers(screen, id, repo);
   screenReads.value = Object.fromEntries(["tasks", "health"].filter((key) => reads[key] && previous[key]).map((key) => [key, previous[key]]));
   const run = active = { screen, id, reads, externalTask: reads.task && !/^t-[a-f0-9]+$/i.test(id),
-    positions, dirty: new Map(), states: existingShell?.states ?? new Map(), reportUntil: 0,
+    positions, tasksSource: existingBoard?.tasksSource, dirty: new Map(), states: existingShell?.states ?? new Map(), reportUntil: 0,
     controller: new AbortController(), busy: false, timer: null };
   connect(run);
   const retry = () => {
@@ -611,7 +612,8 @@ export function live(screen, id = "", repo = "") {
     if (needsDetail) keys.push("detail");
     if (transcript && rs.detail?.run.status === "running") keys.push("transcript");
     const refreshKeys = transport && !run.incoherent ? keys : all(run);
-    const boardCurrent = run.screen === "board" && transport && run.positions.get("tasks") && !screenReads.peek().tasks?.error;
+    const boardCurrent = run.screen === "board" && transport && run.tasksSource === "board"
+      && run.positions.get("tasks") && !screenReads.peek().tasks?.error;
     invalidate(run, boardCurrent ? refreshKeys.filter((key) => key !== "tasks") : refreshKeys, true);
   };
   run.visibility = () => refresh(true);

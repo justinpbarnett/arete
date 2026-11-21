@@ -36,16 +36,14 @@ export const lineStream = (run, after) => `/api/v1/line-stream?${new URLSearchPa
 export const sortTasks = (tasks) => [...tasks].sort((a, b) => b.updated.localeCompare(a.updated) || a.id.localeCompare(b.id));
 
 export async function boardTasks(read, readTasks) {
-  let result = await read(screen("board"));
-  const { error } = result;
-  if (error?.status === 404 || error?.status === 400) {
-    result = { ...await readTasks(), seq: undefined };
-  }
+  const board = await read(screen("board"));
+  const fallback = board.error?.status === 404 || board.error?.status === 400;
+  const result = fallback ? await readTasks() : board;
   const { view, tasks = view?.tasks } = result.data ?? {};
   if (!Array.isArray(tasks) || tasks.some((task) => typeof task?.updated !== "string" || typeof task.id !== "string")) {
     return { error: result.error ?? { status: null, message: "Malformed response" } };
   }
-  return { ...result, data: { tasks: sortTasks(tasks) } };
+  return { ...result, source: fallback ? "fallback" : "board", data: { tasks: sortTasks(tasks) } };
 }
 
 export function visit(row) {

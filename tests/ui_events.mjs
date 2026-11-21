@@ -445,6 +445,15 @@ async function snapshots() {
     assert.equal(ui.connectivity(feed.snapshot.value, clock), "STALE");
     assert.equal(reads("/api/sidebar").length, 0);
 
+    serve = { at: "2026-11-21T05:01:00Z", age_seconds: 0 };
+    needsYou = 6;
+    refresh();
+    await until(() => feed.snapshot.value.needsYou === 6, "the long-poll shell publishes a new answer");
+    assert.equal(latestPoll(), idlePoll);
+    assert.deepEqual(feed.snapshot.value.serve, serve);
+    assert.equal(feed.snapshot.value.received, clock);
+    assert.equal(ui.connectivity(feed.snapshot.value, clock), "", "an earlier heartbeat from the long-poll shell clears STALE");
+
     clock += 20000;
     seq = "6.2";
     Object.assign(runs[2], { status: "pr", version: 4 });
@@ -584,8 +593,10 @@ async function boardSnapshots() {
     assert.equal(ui.snapshot.value.running, 1, "the Board 304 preserves the event-driven badge");
     last().send({ kind: "serve.beat", at: "2026-11-21T05:04:00Z", age_seconds: 0 }, "serve.beat", "9.14");
     assert.equal(ui.connectivity(ui.snapshot.value, clock), "STALE");
+    assert.equal(ui.snapshot.value.received, staleReceipt, "an identical beat keeps the original receipt time");
     last().send({ kind: "serve.beat", at: "2026-11-21T05:03:00Z", age_seconds: 0 }, "serve.beat", "9.14");
     assert.equal(ui.connectivity(ui.snapshot.value, clock), "", "a fresh beat after a backward clock correction clears STALE");
+    assert.equal(ui.snapshot.value.received, clock);
     assert.deepEqual(columns("#board"), { Running: 1, Closed: 1 });
     assert.deepEqual(columns("#board/open-work"), { Running: 1 });
     const review = { ...task, state: "pr", updated: "3", version: 3 };
@@ -690,21 +701,29 @@ async function boardSnapshots() {
     assert.deepEqual(taskListCalls().slice(start).map(({ key, status }) => [key, status]), [["/api/v1/tasks", 503]]);
 
     taskListSequenced = true;
-    for (const [status, position] of [[404, "9.22"], [200, "9.23"]]) {
+    for (const [status, startSeq, endSeq] of [[404, "9.22", "9.23"], [200, "9.24", "9.25"]]) {
       taskListStatus = status;
       open("#floor");
       assert.equal(tasks(), undefined);
       rows = [running, closed];
+      seq = startSeq;
+      const firstRead = calls.length;
       open("#board");
       await until(() => tasks()?.data, "Board renders the fallback list on its first read");
       assert.deepEqual(columns("#board"), { Running: 1, Closed: 1 });
 
       assert.equal(last().readyState, 1);
-      rows = [review, closed];
-      sendRun(position, "run.ended", "pr");
-      refresh();
       const path = status === 404 ? "/api/tasks" : "/api/v1/tasks";
+      const fallbackCalls = () => calls.slice(firstRead).filter(({ key }) => key === path);
+      assert.equal(fallbackCalls().length, 1);
+      rows = [review, closed];
+      seq = endSeq;
+      sendRun(seq, "run.ended", "pr");
+      assert.equal(state(), "running", "an end event without a task patch leaves the card in Running");
+      refresh();
       await until(() => state() === "pr", `a connected Board refreshes ${path} after an end event without a task update`);
+      assert.equal(fallbackCalls().length, 2);
+      assert.deepEqual(columns("#board"), { "In review": 1, Closed: 1 });
       assert.deepEqual(columns("#board/open-work"), { "In review": 1 });
     }
   } finally {
