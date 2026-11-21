@@ -13,6 +13,7 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass
 from importlib import import_module
 from unittest.loader import _FailedTest
@@ -81,7 +82,7 @@ class TimedResult(unittest.TestResult):
     def startTest(self, test):
         super().startTest(test)
         self.started = time.monotonic()
-        self.progress.write(json.dumps([self.started, test.id(), None]) + "\n")
+        self.progress.write(json.dumps([self.started, None, None]) + "\n")
 
     def stopTest(self, test):
         super().stopTest(test)
@@ -89,12 +90,14 @@ class TimedResult(unittest.TestResult):
         self.progress.write(json.dumps([finished, test.id(), finished - self.started]) + "\n")
 
 
-def run_one(identifier, start, result_file, lifeline):
+def run_one(identifier, start, result_file, lifeline, progress_fd=None):
     os.set_inheritable(lifeline, False)
+    if progress_fd is not None:
+        os.set_inheritable(progress_fd, False)
     threading.Thread(target=end_with_runner, args=(lifeline,), daemon=True).start()
     sys.path.insert(0, start)
-    with open(result_file + ".progress", "w", buffering=1) as progress:
-        result = TimedResult(progress)
+    with (os.fdopen(progress_fd, "w", buffering=1) if progress_fd is not None else nullcontext()) as progress:
+        result = TimedResult(progress) if progress is not None else unittest.TestResult()
         unittest.defaultTestLoader.loadTestsFromName(identifier).run(result)
     report = {"ran": result.testsRun, "errors": [[str(t), text] for t, text in result.errors],
               "failures": [[str(t), text] for t, text in result.failures],
@@ -114,56 +117,32 @@ class Batch:
     timeout: float = DEFAULT_CLASS_TIMEOUT
 
 
-def class_timeout_details(batch, timeout, deadline, progress_file):
+def class_timeout_details(batch, timeout, deadline, progress):
     started = 0
     completed = []
     try:
-        with open(progress_file) as progress:
-            for line in progress:
-                if not line.endswith("\n"):
-                    break
-                timestamp, name, duration = json.loads(line)
-                if timestamp > deadline:
-                    break
-                if duration is None:
-                    started += 1
-                else:
-                    completed.append((duration, name))
+        progress.seek(0)
+        for line in progress:
+            if not line.endswith(b"\n"):
+                break
+            timestamp, name, duration = json.loads(line)
+            if timestamp > deadline:
+                break
+            if duration is None:
+                started += 1
+            else:
+                completed.append((duration, name))
     except (OSError, ValueError):
         pass
-    slowest = sorted(completed, key=lambda entry: -entry[0])[:5]
-    timings = [f"  {duration:.3f}s {name}" for duration, name in slowest]
-    return "\n".join(filter(None, (
-        f"{batch.identifier} ({batch.count} tests)",
-        f"class exceeded {timeout:g}s",
-        f"{len(completed)} completed, {max(0, batch.count - started)} never started",
-        "Slowest completed tests:" if timings else "",
-        *timings,
-    )))
-
-
-def timeout_summary(identifier, details):
-    guidance = _test_stacks.TIMEOUT_REMEDIATION
-    limit = _test_stacks.MAX_TIMEOUT_SUMMARY_CHARS
-    if len(details) + 1 + len(guidance) <= limit:
-        return f"{details}\n{guidance}"
-    lines = details.split("\n")
-    lines[4:] = [line.replace(f" {identifier}.", " ", 1) for line in lines[4:]]
-    remaining = limit - len(guidance) - len(lines)
-    for offset, index in enumerate(sorted(range(len(lines)), key=lambda i: len(lines[i]))):
-        room = remaining // (len(lines) - offset)
-        line = lines[index]
-        if len(line) > room:
-            head = (room - 3) // 2
-            tail = room - 3 - head
-            lines[index] = f"{line[:head]}...{line[-tail:]}"
-        remaining -= len(lines[index])
-    return "\n".join((*lines, guidance))
+    return {"class_name": batch.identifier, "count": batch.count, "deadline": timeout,
+            "completed": len(completed), "never_started": max(0, batch.count - started),
+            "timings": sorted(completed, key=lambda entry: -entry[0])[:5]}
 
 
 class Runner:
     def __init__(self, args):
         self.args = args
+        self.summary_path = os.environ.get(_test_stacks.SUMMARY_FILE_ENV)
         self.lock = threading.RLock()
         self.live = {}
         self.stopping = False
@@ -257,47 +236,55 @@ class Runner:
         output_file = os.path.join(self.folder, f"{index}.out")
         stack_prefix = f"{index}.stack."
         env = stack_env({**os.environ, _test_stacks.PREFIX_ENV: os.path.join(self.folder, stack_prefix)})
+        env.pop(_test_stacks.SUMMARY_FILE_ENV, None)
         tail = ["--one", batch.identifier, "--start", self.args.start, "--result", result_file,
                 "--lifeline", str(self.lifeline)]
         command = ([sys.executable, "-m", "tests.parallel"] if __spec__ is not None else
                    [sys.executable, os.path.abspath(__file__)]) + tail
         began = time.monotonic()
         problem = None
-        timeout_report = timeout_details = ""
-        with open(output_file, "w") as output, self.lock:
-            if self.stopping:
-                return
-            try:
-                process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=output,
-                                           stderr=subprocess.STDOUT, start_new_session=True,
-                                           pass_fds=(self.lifeline,), env=env)
-            except OSError as error:
-                process = None
-                problem = f"could not start {batch.identifier}: {error}"
-            else:
-                self.live[process] = batch.identifier
-        if process is not None:
-            timeout = stretch * (self.args.timeout if self.args.timeout is not None else batch.timeout)
-            requested = None
-            try:
-                deadline = time.monotonic() + timeout
-                process.wait(timeout)
-                if process.returncode:
-                    problem = f"worker exited with status {process.returncode}"
-            except subprocess.TimeoutExpired:
-                problem = f"class exceeded {timeout:g}s"
-                requested = self.request_stacks(stack_prefix)
-            finally:
-                self.kill(process)
-                process.wait()
-                with self.lock:
-                    self.live.pop(process, None)
-            if requested is not None:
-                stacks = self.stack_output(requested, process.pid)
-                timeout_report = "\n".join(filter(None, (
-                    _test_stacks.REPORT_START, batch.identifier, problem, stacks, _test_stacks.REPORT_END,
-                )))
-                timeout_details = class_timeout_details(batch, timeout, deadline, result_file + ".progress")
+        timeout_report = ""
+        timeout_details = None
+        with (tempfile.TemporaryFile() if self.summary_path else nullcontext()) as progress:
+            pass_fds = (self.lifeline,)
+            if progress is not None:
+                command += ["--progress-fd", str(progress.fileno())]
+                pass_fds += (progress.fileno(),)
+            with open(output_file, "w") as output, self.lock:
+                if self.stopping:
+                    return
+                try:
+                    process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=output,
+                                               stderr=subprocess.STDOUT, start_new_session=True,
+                                               pass_fds=pass_fds, env=env)
+                except OSError as error:
+                    process = None
+                    problem = f"could not start {batch.identifier}: {error}"
+                else:
+                    self.live[process] = batch.identifier
+            if process is not None:
+                timeout = stretch * (self.args.timeout if self.args.timeout is not None else batch.timeout)
+                requested = None
+                deadline = time.monotonic() + timeout if progress is not None else None
+                try:
+                    process.wait(timeout)
+                    if process.returncode:
+                        problem = f"worker exited with status {process.returncode}"
+                except subprocess.TimeoutExpired:
+                    problem = f"class exceeded {timeout:g}s"
+                    requested = self.request_stacks(stack_prefix)
+                finally:
+                    self.kill(process)
+                    process.wait()
+                    with self.lock:
+                        self.live.pop(process, None)
+                if requested is not None:
+                    stacks = self.stack_output(requested, process.pid)
+                    timeout_report = "\n".join(filter(None, (
+                        _test_stacks.REPORT_START, batch.identifier, problem, stacks, _test_stacks.REPORT_END,
+                    )))
+                    if deadline is not None:
+                        timeout_details = class_timeout_details(batch, timeout, deadline, progress)
         try:
             with open(result_file) as handle:
                 report = json.load(handle)
@@ -396,13 +383,13 @@ class Runner:
             skipped += len(report["skipped"])
             if failed(report):
                 suite_failed = True
-                first = self.first_failures.get(identifier, {})
-                if first.get("timeout"):
+                if (first := self.first_failures.get(identifier)) and first["timeout"]:
                     self.show_failures(identifier, first)
                 self.show_failures(identifier, report)
-                details = report.get("timeout_details") or first.get("timeout_details")
-                if details and len(summaries) < _test_stacks.MAX_TIMEOUT_SUMMARY_CLASSES:
-                    summaries.append(timeout_summary(identifier, details))
+                if self.summary_path and first and len(summaries) < _test_stacks.MAX_TIMEOUT_SUMMARY_CLASSES:
+                    details = report.get("timeout_details") or first.get("timeout_details")
+                    if details:
+                        summaries.append(details)
         try:
             temporary = f"{HISTORY}.{os.getpid()}.tmp"
             with open(temporary, "w") as handle:
@@ -424,8 +411,13 @@ class Runner:
               (f" (skipped={skipped})" if skipped else ""), flush=True)
         if suite_failed:
             print(f"Worker reports and output retained in: {self.folder}", flush=True)
-            for summary in summaries:
-                print(f"{_test_stacks.SUMMARY_START}\n{summary}", flush=True)
+            if summaries:
+                try:
+                    with open(self.summary_path, "ab", buffering=0) as sidecar:
+                        for summary in summaries:
+                            sidecar.write((json.dumps(summary) + "\n").encode())
+                except OSError:
+                    pass
             return 1
         shutil.rmtree(self.folder)
         return 0 if ran else 5
@@ -441,10 +433,11 @@ def main():
     parser.add_argument("--lifeline", type=int)
     parser.add_argument("--one")
     parser.add_argument("--result")
+    parser.add_argument("--progress-fd", type=int, help=argparse.SUPPRESS)
     args = parser.parse_args()
     args.start = os.path.abspath(args.start)
     if args.one:
-        return run_one(args.one, args.start, args.result, args.lifeline)
+        return run_one(args.one, args.start, args.result, args.lifeline, args.progress_fd)
     if (args.jobs < 1 or args.slowest < 0
             or (args.timeout is not None and (not math.isfinite(args.timeout) or args.timeout <= 0))):
         parser.error("jobs and timeout must be positive; slowest must be nonnegative")

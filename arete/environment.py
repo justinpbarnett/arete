@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
+from subprocess import CompletedProcess
 
 from . import config, util, vault
 
@@ -59,12 +60,22 @@ def commands(cfg: config.Config, repo: config.Repo | None = None, sets: Mapping[
 
 def sh(cmd: list[str] | str, cfg: config.Config, repo: config.Repo | None = None,
        sets: Mapping[str, str] | None = None, **kw):
+    res, _ = sh_with_redactor(cmd, cfg, repo, sets, **kw)
+    return res
+
+
+def sh_with_redactor(cmd: list[str] | str, cfg: config.Config, repo: config.Repo | None = None,
+                     sets: Mapping[str, str] | None = None, **kw) -> tuple[CompletedProcess[str], Callable[[str], str]]:
     env, kept = started(cfg, repo, sets)
     given = set(kept.values())
+
+    def redact(text: str) -> str:
+        return vault.hidden(text, given)
+
     res = util.sh(cmd, env=env, inherit=False, **kw)
-    res.stdout = vault.hidden(res.stdout or "", given)
-    res.stderr = vault.hidden(res.stderr or "", given)
-    return res
+    res.stdout = redact(res.stdout or "")
+    res.stderr = redact(res.stderr or "")
+    return res, redact
 
 
 def dropped(cfg: config.Config, source: Mapping[str, str] | None = None) -> list[str]:

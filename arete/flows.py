@@ -1109,8 +1109,8 @@ def checks(flow: factory.Flow, tree: str, attempt: int = 1, tries: int = 1, afte
         record.note(run.id, attempts=attempt)
     if not ok:
         if not after:
-            run.story.append(f"Checks failed on attempt {attempt}:\n{util.tail(b.report, 2500)}" if attempt < tries
-                             else "Checks still failing after the last attempt.")
+            run.story.append(f"Checks failed on attempt {attempt}:\n{pipeline.check_report_tail(b.report, 2500)}"
+                             if attempt < tries else "Checks still failing after the last attempt.")
         return Outcome("fail", next="implement", feedback=b.report,
                        data={"report": b.report, "attempts": attempt, "after": after, "story": run.story,
                              "policy": job.policy("checks", {"quick": quick}), "checked": b.checked})

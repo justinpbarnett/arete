@@ -901,7 +901,7 @@ class Controller:
         attempted = f"{reason}. Checked candidate `{hold.head}` and kept it in the worktree for repair."
         evidence = [attempted]
         if hold.gate == "checks":
-            evidence.append(util.tail(hold.report, MAX_CATCH_UP_FEEDBACK_CHARS))
+            evidence.append(pipeline.check_report_tail(hold.report, MAX_CATCH_UP_FEEDBACK_CHARS))
         if hold.verified is not None:
             evidence.append(hold.verified.markdown())
         if hold.review is not None:
