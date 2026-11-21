@@ -21,8 +21,8 @@ from types import SimpleNamespace
 from unittest import mock
 
 from arete import (
-    accounts, api_check, api_http, chat, cli, config, contract, control, dashboard, event_stream, events, gh,
-    idempotency, jira, paths, pipeline, principals, screening, serve, tailnet, tasks, triage, util, verify_faults,
+    accounts, api_check, api_http, chat, cli, client, config, contract, control, dashboard, event_stream, events, gh,
+    idempotency, jira, paths, pipeline, principals, screening, serve, tailnet, tasks, tool_events, triage, util, verify_faults,
 )
 from arete.store import approvals as approvals_store
 from arete.store import chats as chats_store
@@ -1022,6 +1022,282 @@ class CliThroughServeRunTests(_CliThroughServeCase):
         ])
 
 
+class HookUploadTests(unittest.TestCase):
+    aliases = ("first.example.test", "second.example.test")
+    route = "/api/v1/hook-events"
+
+    def setUp(self):
+        from arete import codebase
+
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.servers = {}
+        self.enterContext(mock.patch.dict(os.environ, {client.ENV: ""}))
+        self.enterContext(mock.patch.object(codebase, "load"))
+        self.enterContext(mock.patch.object(paths, "ISOLATED", False))
+        self.enterContext(mock.patch.object(client, "connect", side_effect=self.connect))
+        self.enterContext(mock.patch.object(api_http, "log_request"))
+
+    def connect(self, where, seconds=client.CONNECT_SECONDS):
+        self.assertIn(where.host, self.aliases)
+        root, server = self.servers[where.port]
+        connection = HTTPConnection(where.host, where.port, timeout=seconds)
+        request, response = BytesIO(), BytesIO()
+        connection.sock = mock.Mock(sendall=request.write, makefile=lambda *_: response)
+        getresponse = connection.getresponse
+
+        def reply():
+            request.seek(0)
+            wire = mock.Mock(makefile=lambda *_: request, sendall=response.write)
+            with self.state_at(root):
+                dashboard.Handler(wire, (api_check.ADDRESS, 0), server)
+            response.seek(0)
+            return getresponse()
+
+        connection.getresponse = reply
+        return connection
+
+    def serve_at(self, name):
+        root = self.root / name
+        template = paths.DB_FILE
+        with self.state_at(root):
+            paths.STATE_DIR.mkdir()
+            instance = util.digest(name)[:32]
+            with closing(sqlite3.connect(template)) as src, closing(sqlite3.connect(paths.DB_FILE)) as dest:
+                src.backup(dest)
+                with dest:
+                    dest.executemany("UPDATE schema_meta SET value = ? WHERE key = ?",
+                                     [(instance, "instance_id"), (instance[:8], "instance_tag")])
+                identity = {key: value for key, value in db.metadata(dest).items() if key.startswith("instance_")}
+            util.write_json(paths.backups_dir() / "instance.json", identity)
+            principals.seed_owner(api_check.LOGIN)
+        port = 8000 + len(self.servers)
+        self.servers[port] = (root, SimpleNamespace(node=SimpleNamespace(names=set(self.aliases)),
+                                                    logins=SimpleNamespace(of=lambda _: api_check.LOGIN)))
+        return root, port
+
+    def state_at(self, root):
+        cfg, state = root / "config", root / "state"
+        cfg.mkdir(parents=True, exist_ok=True)
+        return mock.patch.multiple(paths, CONFIG_DIR=cfg, CONFIG_FILE=cfg / "config.toml", STATE_DIR=state,
+                                   DB_FILE=state / "arete.db", EVENTS_FILE=state / "events.jsonl",
+                                   LOCKS_DIR=state / "locks", RUNS_DIR=state / "runs",
+                                   LOG_DIR=root / "logs", WORKTREES_DIR=root / "worktrees")
+
+    @contextmanager
+    def cli_at(self, root, host, port):
+        with self.state_at(root):
+            paths.CONFIG_FILE.write_text(f'[server]\nurl = "http://{host}:{port}"\n')
+            yield
+
+    def invoke(self, *argv, stdin="", code=0):
+        out, err = StringIO(), StringIO()
+        with redirect_stdout(out), redirect_stderr(err), mock.patch("sys.stdin", StringIO(stdin)):
+            self.assertEqual(cli.main(list(argv)), code, (out.getvalue(), err.getvalue()))
+        return out.getvalue(), err.getvalue()
+
+    def command(self, *argv, stdin=""):
+        out, err = self.invoke(*argv, stdin=stdin)
+        self.assertEqual(err, "")
+        return [json.loads(line) for line in out.splitlines()]
+
+    def hook(self, detail, *, session_id=""):
+        self.command("hook", stdin=json.dumps({"hook_event_name": "PostToolUse", "tool_name": "Skill",
+                                               "tool_input": {"skill": detail}, "session_id": session_id}))
+
+    def recorded(self, root):
+        path = root / "state" / "events.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def test_hostname_aliases_share_the_upload_checkpoint(self):
+        source = self.root / "client"
+        target, port = self.serve_at("target")
+        with mock.patch.object(client, "send_hook_batch", wraps=client.send_hook_batch) as send:
+            with self.cli_at(source, self.aliases[0], port):
+                self.hook("first")
+                self.assertEqual(self.recorded(target), [])
+                self.assertEqual([row["detail"] for row in self.command("events", "--raw")], ["first"])
+            with self.cli_at(source, self.aliases[1], port):
+                self.hook("second")
+                self.assertEqual([row["detail"] for row in self.command("events", "--raw")], ["first", "second"])
+        first, second = [call.args[0] for call in send.call_args_list]
+        self.assertEqual([[row["detail"] for row in batch["events"]] for batch in (first, second)],
+                         [["first"], ["second"]])
+        self.assertGreater(second["offset"], first["offset"])
+        self.assertEqual([row["detail"] for row in self.recorded(target)], ["first", "second"])
+
+    def test_reciprocal_serves_do_not_upload_ingested_events(self):
+        a, a_port = self.serve_at("a")
+        b, b_port = self.serve_at("b")
+        with self.cli_at(a, self.aliases[1], b_port):
+            self.hook("from-a")
+            source_id = tool_events.local_instance()
+            self.assertIsNotNone(source_id)
+        for _ in range(3):
+            with self.cli_at(a, self.aliases[1], b_port):
+                self.command("events", "--raw")
+            with self.cli_at(b, self.aliases[0], a_port):
+                self.command("events", "--raw")
+        original, = self.recorded(a)
+        self.assertEqual(self.recorded(b), [{**original, tool_events.INGEST_MARK: source_id}])
+        self.assertNotIn(tool_events.INGEST_MARK, original)
+
+    def test_resent_key_leaves_the_ingested_log_unchanged(self):
+        target, port = self.serve_at("target")
+        with self.cli_at(self.root / "client", self.aliases[0], port):
+            event = {"ts": util.iso(), "kind": "skill", "cls": "invoked"}
+            body = {"origin": "a" * 32, "offset": 0, "events": [event]}
+            with client.invocation():
+                first = client.call("POST", self.route, body, "hook-replay")
+                before = self.recorded(target)
+                response = client.request("POST", self.route, body, key="hook-replay")
+                self.assertEqual(response.getheader("Idempotent-Replayed"), "true")
+                self.assertEqual(client.decoded(response, "POST", self.route), first)
+            self.assertEqual(first["received"], 1)
+            self.assertEqual(before, [{**event, tool_events.INGEST_MARK: body["origin"]}])
+            self.assertEqual(self.recorded(target), before)
+
+    def test_ingest_remembers_each_offset_when_batches_arrive_out_of_order(self):
+        target, port = self.serve_at("target")
+        with self.cli_at(self.root / "client", self.aliases[0], port), client.invocation():
+            later = {"ts": util.iso(), "kind": "skill", "cls": "invoked", "detail": "later"}
+            earlier = {**later, "detail": "earlier"}
+            body = {"origin": "a" * 32, "stream": "b" * 64, "offset": 200, "events": [later]}
+            first = {**body, "offset": 0, "events": [earlier]}
+            for batch, key in ((body, "batch-later"), (first, "batch-earlier"),
+                               (first, "earlier-again"), (body, "later-again")):
+                self.assertEqual(client.call("POST", self.route, batch, key)["received"], 1)
+            for key, code in (("batch-earlier", 422), ("changed-earlier", 409)):
+                with self.assertRaises(client.Failed) as error:
+                    client.call("POST", self.route, {**first, "events": [later]}, key)
+                self.assertEqual(error.exception.code, code)
+        self.assertEqual([row["detail"] for row in self.recorded(target)], ["later", "earlier"])
+
+    def test_ingest_validates_every_row_before_appending(self):
+        target, port = self.serve_at("target")
+        with self.cli_at(self.root / "client", self.aliases[0], port), client.invocation():
+            valid = {"ts": util.iso(), "kind": "skill", "cls": "invoked", "detail": "valid"}
+            invalid_rows = ({**valid, "detail": ["array"]}, {**valid, "ts": "tomorrow"}, {"kind": "skill"}, [])
+            for i, invalid in enumerate(invalid_rows):
+                body = {"origin": "a" * 32, "offset": 0, "events": [valid, invalid]}
+                with self.assertRaises(client.Failed) as error:
+                    client.call("POST", self.route, body, f"invalid-{i}")
+                self.assertEqual(error.exception.code, 400)
+                self.assertEqual(error.exception.answer["code"], "invalid_input")
+                self.assertIn("input.events[1]", error.exception.answer["error"])
+                self.assertEqual(self.recorded(target), [])
+                self.assertFalse((target / "state" / "hook-ingest.json").exists())
+
+    def test_null_session_hooks_upload_and_retry_with_the_same_body_and_key(self):
+        source = self.root / "client"
+        target, port = self.serve_at("target")
+        send_batch = client.send_hook_batch
+
+        def lost_reply(body, key, deadline):
+            send_batch(body, key, deadline)
+            raise client.Broken({"error": "lost reply"})
+
+        with self.cli_at(source, self.aliases[0], port):
+            self.hook("pending", session_id=None)
+            with mock.patch.object(client, "send_hook_batch", side_effect=lost_reply) as dropped:
+                out, _ = self.invoke("events", "--raw", code=1)
+            self.assertEqual(json.loads(out)["error"], "lost reply")
+            self.assertEqual([row["detail"] for row in self.recorded(target)], ["pending"])
+            self.command("hook", stdin=json.dumps({"hook_event_name": "StopFailure", "tool_name": None,
+                                                   "session_id": None, "error_details": "retained"}))
+            self.hook("later", session_id="session-2")
+            with mock.patch.object(client, "send_hook_batch", wraps=send_batch) as send:
+                listed = self.command("events", "--raw")
+            self.assertEqual(listed, self.recorded(source))
+            self.assertEqual(self.command("events", "--raw"), listed)
+        retry, later = [call.args[:2] for call in send.call_args_list]
+        self.assertEqual(dropped.call_args.args[:2], retry)
+        self.assertNotEqual(retry[1], later[1])
+        self.assertEqual([(row["detail"], row["session"]) for row in self.recorded(target)],
+                         [("pending", None), ("retained", None), ("later", "session-2")])
+
+    def test_infinite_hours_includes_rotated_and_current_history_locally_and_remotely(self):
+        source, _ = self.serve_at("source")
+        target, port = self.serve_at("target")
+        with self.state_at(source):
+            self.hook("old")
+            old = {**self.recorded(source)[0], "ts": "2000-01-01T00:00:00Z"}
+            paths.EVENTS_FILE.write_text(json.dumps(old) + "\n")
+            tool_events.rotate_events(30)
+            self.hook("recent")
+            recent, = self.recorded(source)
+            self.assertEqual(self.command("events", "--raw", "--hours", "inf"), [old, recent])
+            self.assertEqual(self.command("events", "--raw"), [recent])
+        with self.cli_at(source, self.aliases[0], port):
+            self.assertEqual(self.command("events", "--raw", "--hours", "inf"), [old, recent])
+            self.assertEqual(self.command("events", "--raw"), [recent])
+        self.assertEqual([row["detail"] for row in self.recorded(target)], ["old", "recent"])
+
+    def test_doctor_is_offline_and_preserves_state_with_a_pending_upload(self):
+        source, _ = self.serve_at("source")
+        target, port = self.serve_at("target")
+
+        def files():
+            return {p.relative_to(source): p.read_bytes() for p in source.rglob("*") if p.is_file()}
+
+        with self.cli_at(source, self.aliases[0], port):
+            self.hook("pending")
+            before = files()
+            out = StringIO()
+            with mock.patch.object(client, "connect", side_effect=AssertionError("doctor contacted serve")) as connect:
+                with redirect_stdout(out):
+                    cli.main(["doctor"])
+            connect.assert_not_called()
+            self.assertIn("quick_check ok", out.getvalue())
+            self.assertEqual(files(), before)
+        self.assertEqual(self.recorded(target), [])
+
+    def test_install_and_dry_runs_leave_pending_events_and_the_checkpoint_alone(self):
+        from arete import install
+
+        source = self.root / "client"
+        target, port = self.serve_at("target")
+        with self.cli_at(source, self.aliases[0], port):
+            self.hook("uploaded")
+            self.command("events", "--raw")
+            self.hook("pending")
+            checkpoint, = (paths.STATE_DIR / "hook-uploads").glob("*.json")
+            before = checkpoint.read_bytes()
+            client.connect.reset_mock()
+            with mock.patch.object(install, "install", return_value=0) as install_serve:
+                self.invoke("install")
+            install_serve.assert_called_once_with(dry_run=False, platform="")
+            out, _ = self.invoke("install", "--dry-run", "--platform", "linux")
+            self.assertIn("[Unit]\nDescription=arete serve", out)
+            with mock.patch.object(pipeline, "run_issue", return_value=0) as run_issue:
+                self.invoke("run", "sample", "7", "--dry-run")
+            run_issue.assert_called_once_with("sample", "7", dry_run=True, force=False)
+            client.connect.assert_not_called()
+            self.assertEqual(checkpoint.read_bytes(), before)
+        self.assertEqual([row["detail"] for row in self.recorded(target)], ["uploaded"])
+
+    def test_only_serve_writes_upload_pending_events_during_other_commands(self):
+        source = self.root / "client"
+        target, port = self.serve_at("target")
+        with self.cli_at(source, self.aliases[0], port):
+            self.hook("first")
+            self.assertEqual(self.command("task", "list"), [])
+            self.assertEqual(self.recorded(target), [])
+            self.assertEqual(list(paths.STATE_DIR.glob("hook-*.json")), [])
+            self.assertFalse((paths.STATE_DIR / "hook-uploads").exists())
+            out, err = self.invoke("oncall", "off")
+            self.assertIn("wakes and rechecks are off", out)
+            self.assertEqual(err, "")
+            self.assertEqual([row["detail"] for row in self.recorded(target)], ["first"])
+
+            self.hook("second")
+            with mock.patch.object(tasks, "start", return_value={"queued": True}) as start:
+                out, err = self.invoke("task", "run", "sample", "7", "--key", "run-seven")
+            start.assert_called_once()
+            self.assertEqual(json.loads(out), {"queued": True})
+            self.assertEqual(err, "Idempotency-Key: run-seven\n")
+        self.assertEqual([row["detail"] for row in self.recorded(target)], ["first", "second"])
+
+
 class WaitReconnectTests(unittest.TestCase):
     def test_wait_resumes_after_stream_drop_and_status_502(self):
         from arete import client, codebase
@@ -1919,8 +2195,8 @@ class VersionedApiTests(unittest.TestCase):
 
         registry, _ = request("/api/v1/contract")
         operations = registry["operations"]
-        self.assertEqual(len(operations), 44)
-        self.assertEqual(len({op["name"] for op in operations}), 44)
+        self.assertEqual(len(operations), 46)
+        self.assertEqual(len({op["name"] for op in operations}), 46)
         for op in operations:
             with self.subTest(op=op["name"]):
                 contract.validate(op["example"]["input"], op["input"])

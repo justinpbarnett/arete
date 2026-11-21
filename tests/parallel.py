@@ -152,7 +152,7 @@ class Runner:
         self.in_flight = []
         self.results = {}
         self.crowded = []
-        self.first_timeouts = {}
+        self.first_failures = {}
         try:
             with open(HISTORY) as handle:
                 self.history = json.load(handle)
@@ -330,8 +330,8 @@ class Runner:
             for index, batch in items:
                 identifier = batch.identifier
                 first = self.results.get(identifier, {})
-                if not batch.serial and not self.stopping and first.get("timeout"):
-                    self.first_timeouts[identifier] = first
+                if not self.stopping and failed(first):
+                    self.first_failures[identifier] = first
                     self.child((f"{index}.alone", batch), stretch=2)
                     if not failed(self.results[identifier]):
                         self.crowded.append(identifier)
@@ -372,7 +372,7 @@ class Runner:
             skipped += len(report["skipped"])
             if failed(report):
                 suite_failed = True
-                if first := self.first_timeouts.get(identifier):
+                if (first := self.first_failures.get(identifier)) and first["timeout"]:
                     self.show_failures(identifier, first)
                 self.show_failures(identifier, report)
         try:
@@ -384,10 +384,10 @@ class Runner:
             pass
         for identifier in self.crowded:
             report = self.results[identifier]
-            first = self.first_timeouts[identifier]
-            print(f"{identifier}: ran past its deadline beside other classes, "
-                  f"then passed alone within twice that deadline in {report['seconds']:.2f}s\n\n"
-                  f"{first['timeout']}", flush=True)
+            first = self.first_failures[identifier]
+            where = "ran past its deadline" if first["timeout"] else "failed"
+            print(f"{identifier}: {where} on its first run, "
+                  f"then passed alone within twice its deadline in {report['seconds']:.2f}s", flush=True)
         if self.args.slowest:
             print("Slowest classes:")
             for name, report in sorted(self.results.items(), key=lambda item: -item[1]["seconds"])[:self.args.slowest]:

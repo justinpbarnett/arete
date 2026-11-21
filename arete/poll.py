@@ -246,6 +246,7 @@ def spawn_unparked(repo_name: str, tid: str | int, readmission: runlimits.Readmi
                 return None
             def spawn():
                 lease = launch_lease.CURRENT.get()
+                lease.poll = True
                 if zte.reserved(str(tid)):
                     zte.bind_launch(repo_name, str(tid), lease)
                 if readmission:
