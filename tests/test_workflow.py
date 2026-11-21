@@ -4115,6 +4115,132 @@ class SavedRunPolicyTests(unittest.TestCase):
         self.assertEqual(controller.data["policy_sha"], saved_policy)
 
 
+class ResumePolicyTests(unittest.TestCase):
+    def setUp(self):
+        repo = config.Repo("fixture", Path("/fixture/repo"), github="fixture/repo")
+        self.cfg = config.Config(repos=[repo], loop_dirs=[], max_parallel=4,
+                                 steps={"build": {"model": "gpt-5.4"}})
+        self.layer = config.RepoLayer(repo.layer_dir)
+        run = pipeline.AgentRun("saved-run", repo, Path("/fixture/run"), cfg=self.cfg, layer=self.layer, kind="fix")
+        self.controller = object.__new__(orchestration.Controller)
+        self.controller.run = run
+        self.controller.job = SimpleNamespace(cfg=self.cfg, layer=self.layer, run=run,
+                                              ticket=tracker.Ticket("1", "#1", "Fixture"), expertise="", attachments="")
+        self.controller.continuation_blocker = lambda **_: ""
+        self.controller.data = {}
+        self.controller.data = self.controller.lineage()[0]
+
+    def legacy_policy(self):
+        return orchestration.policy_fingerprint(self.cfg, self.layer, self.controller.run.closed_context)
+
+    def test_resume_after_max_parallel_changes(self):
+        self.cfg.max_parallel = 3
+        lineage, changed = self.controller.lineage()
+        self.assertEqual(lineage["policy_sha"], self.controller.data["policy_sha"])
+        self.assertEqual(changed, {})
+
+    def test_resume_with_unchanged_legacy_policy(self):
+        legacy = self.legacy_policy()
+        self.assertNotEqual(legacy, self.controller.data["policy_sha"])
+        self.controller.data["policy_sha"] = legacy
+        lineage, changed = self.controller.lineage()
+        self.assertEqual(lineage["policy_sha"], legacy)
+        self.assertEqual(changed, {})
+
+    def test_resume_refuses_changed_step_model(self):
+        original = self.controller.data["policy_sha"]
+        legacy = self.legacy_policy()
+        self.cfg.steps["build"]["model"] = "gpt-5.4-mini"
+        for saved in (original, legacy):
+            with self.subTest(saved=saved), self.assertRaisesRegex(factory.Refused, "policy_sha changed"):
+                self.controller.data["policy_sha"] = saved
+                self.controller.lineage()
+
+    def test_legacy_policy_requires_an_exact_config_match(self):
+        legacy = self.legacy_policy()
+        self.controller.fingerprint = lambda: "tree"
+        self.controller.data.update(policy_sha=legacy, acceptance="accepted", evidence={
+            "checks": {"tree": "tree", "policy": legacy, "acceptance": "accepted"},
+        })
+        self.assertTrue(self.controller.current("checks"))
+
+        self.cfg.max_parallel = 3
+        self.assertFalse(self.controller.current("checks"))
+        with self.assertRaisesRegex(factory.Refused, "policy_sha changed"):
+            self.controller.lineage()
+
+
+class AuthorizationPolicyTests(unittest.TestCase):
+    PILOT_TASK = "t-" + "a" * 32
+    ZTE_TASK = "t-" + "b" * 40
+
+    def setUp(self):
+        from arete import pilot, zte, zte_delivery
+
+        self.pilot, self.zte, self.zte_delivery = pilot, zte, zte_delivery
+        self.repo = config.Repo("fixture", Path("/fixture/repo"), github="fixture/repo")
+        self.cfg = config.Config(repos=[self.repo], loop_dirs=[])
+        self.layer = config.RepoLayer(self.repo.layer_dir, factory_path="orchestrated")
+
+    def controller(self, tid):
+        run = pipeline.AgentRun("saved-run", self.repo, Path("/fixture/run"), cfg=self.cfg, layer=self.layer, kind="fix")
+        run.tid = tid
+        controller = object.__new__(orchestration.Controller)
+        controller.run = run
+        controller.job = SimpleNamespace(cfg=self.cfg, layer=self.layer, run=run)
+        return controller
+
+    def test_authorized_runs_keep_the_full_config_hash(self):
+        full = orchestration.policy_fingerprint(self.cfg, self.layer, ())
+        resume = orchestration.policy_fingerprint(self.cfg, self.layer, (), resume=True)
+        self.assertNotEqual(full, resume)
+        with mock.patch.object(self.zte, "reserved", side_effect=lambda tid: tid == self.ZTE_TASK):
+            self.assertEqual(self.controller(self.PILOT_TASK).policy_sha(), full)
+            self.assertEqual(self.controller(self.ZTE_TASK).policy_sha(), full)
+            self.assertEqual(self.controller("12").policy_sha(), resume)
+            self.cfg.jev.risk_hold = 0.2
+            self.assertNotEqual(self.controller(self.PILOT_TASK).policy_sha(), full)
+            self.assertEqual(self.controller("12").policy_sha(), resume)
+
+    def test_lowering_risk_hold_blocks_one_shot_pilot_publication(self):
+        controller = self.controller(self.PILOT_TASK)
+        receipt = {"policy": orchestration.policy_fingerprint(self.cfg, self.layer, ())}
+        with mock.patch.object(self.pilot, "live_receipt", return_value=receipt), \
+                mock.patch.object(self.pilot, "scheduled_run", return_value={"id": "saved-run"}), \
+                mock.patch.object(config, "load", side_effect=lambda: self.cfg), \
+                mock.patch.object(config, "load_layer", return_value=self.layer):
+            controller.check_pilot_publication()
+            self.cfg.jev.risk_hold = 0.2
+            with self.assertRaises(runlimits.Parked):
+                controller.check_pilot_publication()
+
+    def test_lowering_risk_hold_blocks_the_standing_delivery_squash(self):
+        admitted = orchestration.policy_fingerprint(self.cfg, self.layer, ())
+        delivery = SimpleNamespace(phase="pr_ready", base="base", data={
+            "branch": "arete/task", "head": "head", "tree": "tree", "config": admitted})
+        policy = mock.MagicMock(issue=None, close_after_health=False)
+        client = mock.MagicMock()
+        client.ci.return_value = "proof"
+
+        @contextmanager
+        def lock(_name):
+            yield True
+
+        def send():
+            self.zte_delivery.send_authorized(delivery, policy, client, None, "proof", "risk", {})
+
+        with mock.patch.object(self.zte, "wall_deadline", return_value=float("inf")), \
+                mock.patch.object(self.zte_delivery, "ready_to_squash", return_value=True), \
+                mock.patch.object(util, "lock", lock), \
+                mock.patch.object(config, "load", side_effect=lambda: self.cfg), \
+                mock.patch.object(self.zte, "settings", side_effect=lambda cfg, _: (
+                    self.repo, self.layer, orchestration.policy_fingerprint(cfg, self.layer, ()))):
+            self.cfg.jev.risk_hold = 0.2
+            with self.assertRaisesRegex(self.pilot.Held, "ZTE configuration changed"):
+                send()
+        client.squash.assert_not_called()
+
+
 class AskConfigTests(unittest.TestCase):
     def test_expire_days_is_a_finite_number_of_at_most_ten_years(self):
         for entry in ("expire_days = inf", "expire_days = nan", "expire_days = 999999", "expire_days = 0",

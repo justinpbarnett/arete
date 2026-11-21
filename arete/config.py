@@ -361,6 +361,16 @@ class Config:
         return sorted(set(self.models) - set(MODEL_ROLES))
 
 
+def remove_controller_only_settings(data: dict) -> None:
+    for name in ("max_parallel", "max_parallel_per_repo"):
+        data.pop(name, None)
+    if "jev" in data:
+        for name in ("risk_hold", "irreversible_hold", "secrets_hold"):
+            data["jev"].pop(name, None)
+        if not data["jev"]:
+            del data["jev"]
+
+
 def moves_table(jira: dict, table: str, states: tuple[str, ...], hints: dict[str, str] | None = None) -> dict[str, str]:
     moves = {str(k): str(v) for k, v in (jira.get(table) or {}).items() if v}
     if bad := sorted(set(moves) - set(states)):
