@@ -1446,6 +1446,12 @@ def publish(flow: factory.Flow, merge: Callable[[list[workspace.Checkout]], dict
     run.enter("pr")
     if merge and (failure := merge(publication_candidates(job, fresh))):
         return Outcome("fail", feedback=failure["error"], data=failure)
+    if not merge:
+        candidates = publication_candidates(job, fresh)
+        job.ci_result = pipeline.automerge(
+            job.b, job.approval, job.draft_why, job.verified, job.review, candidates,
+            pipeline.automerge_about(job.ticket, job.build_summary), slot=job.slot, branch=job.branch,
+            goal=job.with_left(job.goal), plan=job.with_left(job.plan_text)) or job.ci_result
     if run.feedback:
         pipeline.answer_feedback(run, job.replies, "Done in the latest push.")
         run.say(f"Revised for your review.\n\n{job.report_body}\n\nCI: {job.ci_result}.")
@@ -1456,9 +1462,6 @@ def publish(flow: factory.Flow, merge: Callable[[list[workspace.Checkout]], dict
     else:
         run.say(f"PRs for this ticket:\n\n{pipeline.pr_status_lines(with_prs, opened, pushed)}\n\nCI: {job.ci_result}."
                 + pipeline.published_note(job.draft_why, job.verified, fresh, job.picked(job.drafted)))
-    if not merge:
-        pipeline.automerge(job.b, job.approval, job.draft_why, job.verified, job.review,
-                           publication_candidates(job, fresh), pipeline.automerge_about(job.ticket, job.build_summary))
     return end_as("pass", "pr", summary=f"{job.summary}, CI: {job.ci_result}")
 
 
