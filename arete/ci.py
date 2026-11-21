@@ -59,8 +59,8 @@ class Red:
         return f"{self.target.pr_name} {self.check.name}"
 
     @property
-    def key(self) -> tuple[str, str, str]:
-        return self.target.github, self.target.sha, self.check.name
+    def key(self) -> tuple[str, str, gh.CheckKey]:
+        return self.target.github, self.target.sha, self.check.key
 
     @property
     def kind(self) -> str:
@@ -85,7 +85,7 @@ class Red:
 @dataclass
 class Watched:
     target: Target
-    checks: dict[str, gh.Check]
+    checks: dict[gh.CheckKey, gh.Check]
     read: bool = True
     reds: list[Red] = field(default_factory=list)
     conflicting: bool = False
@@ -168,7 +168,7 @@ def conflicting(target: Target, log: Callable[[str], None]) -> bool:
 
 def watch(target: Target, log: Callable[[str], None]) -> Watched:
     log(f"ci: waiting on the checks of {target.pr_name} at {target.sha[:7]}")
-    checks: dict[str, gh.Check] = {}
+    checks: dict[gh.CheckKey, gh.Check] = {}
     waiting_on: list[str] | None = None
     while True:
         if conflicting(target, log):
@@ -214,7 +214,7 @@ def compare_with_base(w: Watched, log: Callable[[str], None]) -> Watched:
     except READ_ERRORS as e:
         log(f"ci: could not read the checks on {t.base} of {t.github}: {util.first_line(str(e), 200)}")
         base_sha, on_base = "", {}
-    w.reds = [Red(t, c, on_base.get(c.name), base_sha) for c in failed]
+    w.reds = [Red(t, c, on_base.get(c.key), base_sha) for c in failed]
     for r in w.reds:
         log(f"ci: {r.label} failed; it {r.base_result.replace('`', '')}")
     return w

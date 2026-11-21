@@ -11,6 +11,7 @@ import urllib.error
 import urllib.request
 import uuid
 from collections.abc import Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import timedelta
 from urllib.parse import urlencode
@@ -19,8 +20,10 @@ from . import config, outbound, paths, util
 
 ARETE_MARK = "<!-- arete -->"
 GITHUB_API = "https://api.github.com"
+GITHUB_ACTIONS_APP_ID = 15368
 CLONE_TOKEN_PERMISSIONS = {"contents": "read"}
 NO_ISSUE = "Could not resolve to an issue"
+_deployment_ci_deadline: ContextVar[float | None] = ContextVar("deployment_ci_deadline", default=None)
 
 
 class GhError(RuntimeError):
@@ -82,6 +85,11 @@ def gh(args: list[str], cwd=None, timeout: float = 120, input: str | None = None
 
 
 def gh_json(args: list[str], cwd=None, timeout: float = 120, *, retry: bool = True):
+    if (deadline := _deployment_ci_deadline.get()) is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise GhError("deployment CI lookup timed out")
+        timeout, retry = min(timeout, remaining), False
     out = gh(args, cwd=cwd, timeout=timeout, retry=retry)
     return json.loads(out) if out.strip() else None
 
@@ -146,8 +154,8 @@ def comment_key(path: str, key: str, start):
 
 
 def keyed_comment(args: list[str], body: str, path: str, mark: bool = False, envelope: bool = False,
-                  *, single_attempt: bool = False) -> str:
-    key, start = uuid.uuid4().hex, util.now()
+                  *, key: str = "", single_attempt: bool = False) -> str:
+    key, start = key or uuid.uuid4().hex, util.now()
     payload = outgoing(body, mark=mark, key=key)
     if envelope:
         payload = Outgoing(json.dumps({"body": payload}))
@@ -176,8 +184,9 @@ def split_link(body: str, links) -> tuple[str, str]:
     return "", body
 
 
-def issue_create(repo: str, title: str, body: str, labels: Sequence[str] = (), *, single_attempt: bool = False) -> int:
-    key = uuid.uuid4().hex
+def issue_create(repo: str, title: str, body: str, labels: Sequence[str] = (), *, key: str = "",
+                 single_attempt: bool = False) -> int:
+    key = key or uuid.uuid4().hex
     args = ["issue", "create", "--repo", repo, "--title", outbound.screen(title), "--body-file", "-"]
     for lb in labels:
         args += ["--label", lb]
@@ -196,8 +205,10 @@ def issue_create(repo: str, title: str, body: str, labels: Sequence[str] = (), *
         if number := recovery_lookup(find):
             return int(number)
         reply = gh(args, input=payload, write=True)
-    url = reply.strip().splitlines()[-1]
-    return int(url.rstrip("/").rsplit("/", 1)[-1])
+    parts = reply.strip().splitlines()
+    if not parts or not (number := re.fullmatch(r"https://[^/]+/[^/]+/[^/]+/issues/([1-9][0-9]*)/?", parts[-1])):
+        raise GhUnsure("GitHub did not confirm the created issue number")
+    return int(number[1])
 
 
 def recent_issues(repo: str, limit: int = 100) -> list[dict]:
@@ -286,6 +297,45 @@ def issue_edit_body(repo: str, number: int, body: str) -> None:
     gh(["issue", "edit", str(number), "--repo", repo, "--body-file", "-"], input=outgoing(body))
 
 
+def issue_merge_commit(repo: str, number: int, base: str) -> str:
+    owner, name = repo.split("/", 1)
+    query = """
+    query($owner:String!, $name:String!, $number:Int!) {
+      repository(owner:$owner, name:$name) {
+        issue(number:$number) {
+          state stateReason
+          timelineItems(last:1, itemTypes:[CLOSED_EVENT, REOPENED_EVENT]) {
+            nodes { ... on ClosedEvent { closer {
+              __typename
+              ... on PullRequest { ...Fix }
+              ... on Commit { oid associatedPullRequests(first:10) { nodes { ...Fix } } }
+            } } }
+          }
+        }
+      }
+    }
+    fragment Fix on PullRequest {
+      merged baseRefName repository { nameWithOwner } mergeCommit { oid }
+    }
+    """
+    result = gh_json(["api", "graphql", "-f", outgoing(f"query={query}"), "-f", outgoing(f"owner={owner}"),
+                      "-f", outgoing(f"name={name}"), "-F", outgoing(f"number={number}")]) or {}
+    issue = ((result.get("data") or {}).get("repository") or {}).get("issue") or {}
+    if (issue.get("state"), issue.get("stateReason")) != ("CLOSED", "COMPLETED"):
+        return ""
+    events = (issue.get("timelineItems") or {}).get("nodes") or []
+    closer = ((events[-1] or {}).get("closer") or {}) if events else {}
+    pulls = ([closer] if closer.get("__typename") == "PullRequest" else
+             (closer.get("associatedPullRequests") or {}).get("nodes") or [])
+    for pr in filter(None, pulls):
+        sha = (pr.get("mergeCommit") or {}).get("oid") or ""
+        actual_repo = (pr.get("repository") or {}).get("nameWithOwner") or ""
+        if (pr.get("merged") is True and pr.get("baseRefName") == base and actual_repo.casefold() == repo.casefold()
+                and re.fullmatch(r"[0-9a-f]{40}", sha) and (pr is closer or closer.get("oid") == sha)):
+            return sha
+    return ""
+
+
 def issue_reopen(repo: str, number: int) -> None:
     gh(["issue", "reopen", str(number), "--repo", repo])
 
@@ -317,6 +367,12 @@ def prs(repo: str, label: str = "", state: str = "open", limit: int = 50) -> lis
     return gh_json(args) or []
 
 
+def open_labeled_pr_urls(repo: str, label: str) -> list[str]:
+    query = urlencode({"state": "open", "labels": label, "per_page": 100})
+    pages = gh_json(["api", f"repos/{repo}/issues?{query}", "--paginate", "--slurp"]) or []
+    return [row["html_url"] for page in pages for row in page if "pull_request" in row]
+
+
 def open_pr_url(repo: str, head: str) -> str:
     rows = gh_json(["pr", "list", "--repo", repo, "--head", head, "--state", "open", "--limit", "1", "--json", "url"])
     return rows[0]["url"] if rows else ""
@@ -340,9 +396,26 @@ def pr_edit_body(url: str, body: str, link: str = "") -> None:
     gh(["pr", "edit", url, "--body-file", "-"], input=outgoing(body, link))
 
 
-def pr_comment(url: str, body: str) -> None:
+def pr_comment(url: str, body: str, *, key: str = "", single_attempt: bool = False) -> None:
     keyed_comment(["pr", "comment", url, "--body-file", "-"], body,
-                  f"repos/{pr_repo(url)}/issues/{pr_number(url)}/comments", mark=True)
+                  f"repos/{pr_repo(url)}/issues/{pr_number(url)}/comments", mark=True,
+                  key=key, single_attempt=single_attempt)
+
+
+def find_own_pr_comment(repo: str, number: int, *markers: str) -> dict | None:
+    author = me()
+    if not author:
+        return None
+    own = [(row, (row.get("body") or "").splitlines())
+           for row in api_list(f"repos/{repo}/issues/{number}/comments")
+           if (row.get("user") or {}).get("login") == author]
+    return next((row for marker in markers for row, lines in own if marker in lines), None)
+
+
+def pr_edit_comment(repo: str, comment_id: int, body: str, *, key: str = "") -> None:
+    payload = Outgoing(json.dumps({"body": outgoing(body, mark=True, key=key)}))
+    gh(["api", "-X", "PATCH", f"repos/{repo}/issues/comments/{comment_id}", "--input", "-"],
+       input=payload, write=True)
 
 
 def pr_reply(url: str, comment_id: int, body: str) -> None:
@@ -460,6 +533,35 @@ def pr_set_draft(url: str, draft: bool) -> None:
     gh(["pr", "ready", url, *(["--undo"] if draft else [])])
 
 
+def pr_close(url: str) -> None:
+    gh(["pr", "close", url], write=True)
+
+
+def pr_add_label(url: str, name: str) -> None:
+    gh(["pr", "edit", url, "--add-label", name], write=True)
+
+
+def pr_update_branch(repo: str, number: int, head: str) -> None:
+    gh(["api", "-X", "PUT", f"repos/{repo}/pulls/{number}/update-branch", "--input", "-"],
+       input=Outgoing(json.dumps({"expected_head_sha": head})), write=True)
+
+
+def pr_squash(repo: str, number: int, head: str) -> None:
+    gh(["pr", "merge", str(number), "--repo", repo, "--squash", "--match-head-commit", head], write=True)
+
+
+def actions_check_passed(repo: str, head: str, name: str) -> bool:
+    query = urlencode({"check_name": name, "filter": "latest", "per_page": 100})
+    path = f"repos/{repo}/commits/{head}/check-runs?{query}"
+    reply = json.loads(gh(["api", path], retry=False) or "{}")
+    rows = reply.get("check_runs", [])
+    if reply.get("total_count", len(rows)) > len(rows):
+        return False
+    runs = [row for row in rows if row.get("name") == name
+            and row.get("head_sha") == head and (row.get("app") or {}).get("id") == GITHUB_ACTIONS_APP_ID]
+    return bool(runs) and all(row.get("status") == "completed" and row.get("conclusion") == "success" for row in runs)
+
+
 def pr_draft_and_head(url: str) -> tuple[bool, str]:
     row = gh_json(["pr", "view", url, "--json", "isDraft,headRefOid"]) or {}
     return bool(row.get("isDraft")), str(row.get("headRefOid") or "")
@@ -518,6 +620,29 @@ def merge_ci_passed(repo: str, head: str, *, required: dict | None = None) -> bo
             contexts.setdefault(row["context"], row["state"])
     return (bool(runs or contexts) and all(row["status"] == "completed" and row["conclusion"] == "success"
                                            for row in runs) and all(state == "success" for state in contexts.values()))
+
+
+def deployment_ci_refusal(repo: str, head: str, required: dict, *, timeout: float) -> str:
+    token = _deployment_ci_deadline.set(time.monotonic() + timeout)
+    try:
+        return "" if merge_ci_passed(repo, head, required=required) else _required_ci_refusal(repo, head, required)
+    except (GhError, OSError, ValueError, KeyError, TypeError, AttributeError):
+        return "CI unavailable"
+    finally:
+        _deployment_ci_deadline.reset(token)
+
+
+def _required_ci_refusal(repo: str, head: str, required: dict) -> str:
+    query = urlencode({"filter": "latest", "per_page": 100, "check_name": required["context"]})
+    pages = gh_json(["api", f"repos/{repo}/commits/{head}/check-runs?{query}", "--paginate", "--slurp"])
+    runs = [row for page in pages for row in page["check_runs"]
+            if row.get("head_sha") == head and row.get("name") == required["context"]
+            and (row.get("app") or {}).get("id") == required["app_id"]]
+    if any(row["status"] == "completed" and row["conclusion"] != "success" for row in runs):
+        return "CI failed"
+    if not runs or any(row["status"] != "completed" for row in runs):
+        return "CI pending"
+    return "CI not passing"
 
 
 def merge_readiness(repo: str, number: int, head: str, base: str, base_sha: str, *, wait: float = 0,
@@ -587,11 +712,12 @@ def pr_merge_auto(repo: str, number: int, head: str, base: str, base_sha: str, *
     return "GitHub rejected the merge"
 
 
-def default_branch(repo: str) -> str:
+def default_branch(repo: str, *, fallback: str = "main", timeout: float = 120, retry: bool = True) -> str:
     try:
-        return (gh_json(["repo", "view", repo, "--json", "defaultBranchRef"]) or {})["defaultBranchRef"]["name"]
+        row = gh_json(["repo", "view", repo, "--json", "defaultBranchRef"], timeout=timeout, retry=retry) or {}
+        return row["defaultBranchRef"]["name"] or fallback
     except (GhError, KeyError, TypeError):
-        return "main"
+        return fallback
 
 
 def base64url(data: bytes) -> str:
@@ -686,6 +812,7 @@ def repo_private(repo: str) -> bool | None:
 
 PASSING_CONCLUSIONS = {"success", "neutral"}
 STATUS_STATES = {"success": "pass", "pending": "pending", "failure": "fail", "error": "fail"}
+CheckKey = tuple[str, str]
 
 
 @dataclass
@@ -697,6 +824,11 @@ class Check:
     job: int = 0
     description: str = ""
     check_run_id: int = 0
+    source: str = "status"
+
+    @property
+    def key(self) -> CheckKey:
+        return self.source, self.name
 
 
 def check_from_run(row: dict) -> Check:
@@ -706,10 +838,12 @@ def check_from_run(row: dict) -> Check:
         state = "skipped"
     else:
         state = "pass" if row.get("conclusion") in PASSING_CONCLUSIONS else "fail"
-    actions = (row.get("app") or {}).get("slug") == "github-actions"
+    app = row.get("app") or {}
+    actions = app.get("slug") == "github-actions"
     return Check(row["name"], state, row.get("completed_at") or row.get("started_at") or "",
                  row.get("html_url") or row.get("details_url") or "", row["id"] if actions else 0,
-                 ((row.get("output") or {}).get("title") or "").strip(), row["id"])
+                 ((row.get("output") or {}).get("title") or "").strip(), row["id"],
+                 f"app:{app.get('id') or app.get('slug') or ''}")
 
 
 def check_from_status(row: dict) -> Check:
@@ -717,22 +851,22 @@ def check_from_status(row: dict) -> Check:
                  row.get("target_url") or "", 0, (row.get("description") or "").strip())
 
 
-def commit_checks(repo: str, ref: str, *, timeout: float = 120, retry: bool = True) -> dict[str, Check]:
+def commit_checks(repo: str, ref: str, *, timeout: float = 120, retry: bool = True) -> dict[CheckKey, Check]:
     path = f"repos/{repo}/commits/{ref}"
-    pages = gh_json(["api", f"{path}/check-runs?filter=latest&per_page=100", "--paginate", "--slurp"],
+    pages = gh_json(["api", f"{path}/check-runs?filter=all&per_page=100", "--paginate", "--slurp"],
                     timeout=timeout, retry=retry)
     if not isinstance(pages, list) or not pages or any(
             not isinstance(page, dict) or not isinstance(page.get("check_runs"), list) for page in pages):
         raise GhError("GitHub did not return check runs")
     runs = sorted((check_from_run(r) for page in pages for r in page["check_runs"]), key=lambda c: c.check_run_id)
-    statuses = gh_json(["api", f"{path}/status?per_page=100", "--paginate", "--slurp"], timeout=timeout, retry=retry)
+    statuses = gh_json(["api", f"{path}/statuses?per_page=100", "--paginate", "--slurp"], timeout=timeout, retry=retry)
     if not isinstance(statuses, list) or not statuses or any(
-            not isinstance(page, dict) or not isinstance(page.get("statuses"), list) for page in statuses):
+            not isinstance(page, list) for page in statuses):
         raise GhError("GitHub did not return commit statuses")
-    newest: dict[str, Check] = {c.name: c for c in runs}
-    for c in (check_from_status(row) for page in statuses for row in page["statuses"]):
-        if c.name not in newest or c.updated > newest[c.name].updated:
-            newest[c.name] = c
+    newest = {c.key: c for c in runs}
+    # GitHub returns commit statuses in reverse chronological order.
+    for c in (check_from_status(row) for page in statuses for row in page):
+        newest.setdefault(c.key, c)
     return newest
 
 

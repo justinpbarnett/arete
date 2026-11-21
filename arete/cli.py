@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+from pathlib import Path
 
-from . import __version__, codebase, paths, pilot, principals, zte
-from .commands import api, costs, hooks, lab, loops, records, research, runs, sessions, setup, tasks
-from .commands.common import Parser, serve_line
+from . import __version__, codebase, local_paths
+from .commands.arguments import Parser, status_arguments
 
 __all__ = ["main", "serve_line"]
 
-REGISTRATIONS = (api.register, runs.register, tasks.register, loops.register, sessions.register, hooks.register, costs.register,
-                 records.register, research.register, lab.register, setup.register, pilot.register, zte.register)
 
-PER_CALL_HOOKS = paths.PER_CALL_HOOKS
+def serve_line(beat: dict) -> str:
+    from .commands.common import serve_line as format_serve_line
+
+    return format_serve_line(beat)
 
 
 class ShowVersion(argparse.Action):
@@ -24,19 +26,55 @@ class ShowVersion(argparse.Action):
         parser.exit()
 
 
-def main(argv: list[str] | None = None) -> int:
-    from . import refusals
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    from . import pilot, zte
+    from .commands import api, costs, hooks, lab, loops, records, research, runs, sessions, setup, tasks
 
     ap = argparse.ArgumentParser(prog="arete", description="arete: agents that keep running and keep getting better", formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--version", action=ShowVersion)
     sub = ap.add_subparsers(dest="cmd", required=True, parser_class=Parser)
-    for register in REGISTRATIONS:
-        register(sub)
-    args = ap.parse_args(argv)
-    if args.cmd == "api":
-        return args.fn(args) or 0
-    if args.cmd not in PER_CALL_HOOKS:
-        codebase.load()
+    for group in (api, runs, tasks, loops, sessions, hooks, costs, records, research, lab, setup, pilot, zte):
+        group.register(sub)
+    return ap.parse_args(argv)
+
+
+def status_from_heartbeat(problem: SystemExit) -> int:
+    _, state, isolated = local_paths.local_dirs(Path.home())
+    print(problem, file=sys.stderr)
+    try:
+        beat = json.loads(local_paths.read_confined(state / local_paths.SERVE_BEAT_NAME, isolated=isolated))
+    except (OSError, ValueError):
+        beat = None
+    if isinstance(beat, dict) and (revisions := codebase.serve_revisions(beat)):
+        print(f"serve heartbeat at {beat.get('at', 'unknown time')}, {revisions}")
+        return 0
+    print("serve heartbeat has no recorded revisions", file=sys.stderr)
+    return 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["status"]:
+        args = status_arguments(Parser(prog="arete status")).parse_args(argv[1:])
+        try:
+            codebase.load()
+        except SystemExit as problem:
+            if args.json or args.run_id:
+                raise
+            return status_from_heartbeat(problem)
+        from .commands.setup import cmd_status
+
+        args.cmd, args.fn = "status", cmd_status
+    else:
+        args = parse_args(argv)
+        if args.cmd == "api":
+            return args.fn(args) or 0
+        from .paths import PER_CALL_HOOKS
+
+        if args.cmd not in PER_CALL_HOOKS:
+            codebase.load()
+    from . import principals, refusals
+
     try:
         recovery = args.cmd in ("init", "migrate") or (args.cmd == "backup" and args.restore)
         with principals.acting("hand" if recovery else principals.cli_actor()):

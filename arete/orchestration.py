@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from dataclasses import asdict
 from math import inf
 from pathlib import Path
+from uuid import uuid4
 
 from . import (
     codebase,
@@ -27,7 +28,7 @@ from . import (
     zte,
 )
 from .agent import NO_SESSION, Session, json_from_text
-from .orchestration_api import BUNDLES, PROTOCOL, Catalog, help_text
+from .orchestration_api import BUNDLES, PROTOCOL, Catalog, describe_operations, help_text
 from .store import asks as ask_store
 from .store import orchestration as ledger
 from .verify import Verified
@@ -37,11 +38,14 @@ MAX_CI_FAILURE_CHARS = 24000
 STATE_FIELDS = ("plan_text", "goal", "estimate", "left_for_a_person", "build_summary", "reviews", "fix_reply",
                 "document", "report_body", "draft_why", "summary", "opened", "found", "pushed", "drafted",
                 "ci_stopped", "changed", "ci_result", "committed")
+REFRESHABLE_LINEAGE = {"catalog_sha", "controller_prompt", "operations_sha"}
 
 
 def policy_fingerprint(cfg, layer, closed_context):
     effective = asdict(layer)
     effective.pop("factory_path")
+    if layer.required_check is None:
+        effective.pop("required_check")
     if layer.verify:
         effective["verify"] = layer.verify.policy()
     return ledger.digest(json.loads(json.dumps({"layer": effective, "config": asdict(cfg),
@@ -85,21 +89,39 @@ class Controller:
         self.job.take(name, outcome, stored=False)
         return outcome
 
-    def quiescent(self):
+    def continuation_blocker(self, *, decision_boundary=False):
         for turn in ledger.pending(self.lease):
             launch = turn["response"] or {}
             if delegation.live(launch.get("pid"), launch.get("identity")):
-                raise factory.Refused("the prior controller inference is still live; no replacement was launched")
-        for action in ledger.actions(self.lease):
+                return "the prior controller inference is still live; no replacement was launched"
+        actions = ledger.actions(self.lease)
+        for action in actions:
             result = action["result"]
             if action["state"] == "running" and delegation.live(result.get("pid"), result.get("identity")):
-                raise factory.Refused(f"worker {action['id']} is still live; no replacement was launched")
+                return f"worker {action['id']} is still live; no replacement was launched"
+        if decision_boundary:
+            for action in actions:
+                if action["state"] not in ledger.TERMINAL:
+                    return f"accepted action {action['id']} is unfinished ({action['state']})"
+        return ""
+
+    def quiescent(self):
+        if why := self.continuation_blocker():
+            raise factory.Refused(why)
+
+    def write_lineage_event(self):
+        if event := self.data.get("lineage_event"):
+            run_lines.write(event["run"], "lineage", event_id=event["event_id"], old=event["old"], new=event["new"],
+                            engine_commit=event["engine_commit"])
+            del self.data["lineage_event"]
+            ledger.save(self.lease, self.data)
 
     def prepare(self):
+        self.write_lineage_event()
         if self.flow.refusal:
             raise factory.Refused(self.flow.refusal)
-        self.quiescent()
         if self.run.feedback and (closed := [url for url in self.run.feedback_prs if gh.pr_view(url).get("state") != "OPEN"]):
+            self.quiescent()
             return "noop", f"the PR closed before arete could revise it: {', '.join(closed)}", ""
         self.flow.matching = False
         run_lines.write(self.run.id, "route", continues=self.flow.continues, mode="orchestrated", protocol=PROTOCOL)
@@ -116,15 +138,20 @@ class Controller:
             self.job.layer = pipeline.checked_layer(self.job.cfg, layer_dir, source_file=source_file)
             self.run.cfg, self.run.layer, self.run.kind = self.job.cfg, self.job.layer, prepared["ticket"]["kind"]
             self.lineage()
-            if any(not (Path(c["wt"]) / ".git").exists() for c in prepared["checkouts"]):
+            missing = any(not (Path(c["wt"]) / ".git").exists() for c in prepared["checkouts"])
+            if missing:
                 if any(Path(c["wt"]).exists() for c in prepared["checkouts"]):
                     raise factory.Refused("the retained workspace is incomplete; reconcile without discarding its edits")
                 if ledger.publication_pending(self.run.id) or not any(
                         a["op"] == "publication.request" and a["state"] == "succeeded" for a in ledger.actions(self.lease)):
                     raise factory.Refused("the missing workspace has no settled publication; reconcile before resuming")
-                if why := self.job.restore({"step": "prepare", "tree": str(self.job.ws), "data": prepared}, layer=self.job.layer):
-                    raise factory.Refused(why)
-            self.job.take("prepare", factory.Outcome("pass", data=self.data["prepared"]), stored=True)
+            if self.run.environment_release:
+                flows.restore_environment_draft(self.job, prepared)
+            else:
+                if missing:
+                    if why := self.job.restore({"step": "prepare", "tree": str(self.job.ws), "data": prepared}, layer=self.job.layer):
+                        raise factory.Refused(why)
+                self.job.take("prepare", factory.Outcome("pass", data=prepared), stored=True)
             for name, value in self.data.get("job", {}).items():
                 if name in STATE_FIELDS:
                     setattr(self.job, name, value)
@@ -136,6 +163,9 @@ class Controller:
             self.job.b.from_base = True
             self.job.b.plan_text, self.job.b.build_summary = self.job.plan_text, self.job.build_summary
         else:
+            self.quiescent()
+            if self.run.environment_release:
+                raise factory.Refused("the held controller has no saved workspace for verification")
             if self.data.get("preparing"):
                 raise factory.Refused("preparation was interrupted before durable workspace authority; reconcile before restarting")
             self.data["preparing"] = True
@@ -182,7 +212,8 @@ class Controller:
         self.job.goal = pipeline.triage_goal(goal, self.job.approval)
         self.job.triage = pipeline.triage_notes(self.job.approval)
         self.job.b.plan_text, self.job.b.left_for_a_person = self.job.plan_text, self.job.left_for_a_person
-        self.data.update(self.lineage())
+        lineage, old_lineage = self.lineage()
+        self.data.update(lineage)
         self.data["overrides"], self.data["step_overrides"] = self.run.overrides, self.run.step_overrides
         self.data.setdefault("code", codebase.STAMP)
         self.data["recovery_code"] = codebase.STAMP
@@ -190,21 +221,34 @@ class Controller:
         self.data["acceptance"] = ledger.digest([self.catalog.context["task"], self.job.goal,
                                                  self.job.left_for_a_person])
         self.recover()
-        if self.flow.continues and (moved := flows.base_moved(self.flow.continues)):
+        if self.run.environment_release:
+            self.data.pop("published", None)
+            self.data.pop("published_tree", None)
+        elif self.flow.continues and (moved := flows.base_moved(self.flow.continues)):
             self.job.moved_base = moved
             self.job.merge_moved_base("orchestrate")
+        if old_lineage:
+            self.data["lineage_event"] = {"run": self.run.id, "event_id": uuid4().hex, "old": old_lineage,
+                                          "new": {key: lineage[key] for key in old_lineage},
+                                          "engine_commit": util.engine_commit()}
         self.persist()
+        self.write_lineage_event()
         return None
 
     def lineage(self):
         self.catalog = Catalog(self.job)
-        found = {"catalog_sha": self.catalog.fingerprint, "policy_sha": self.policy_sha(),
+        found = {"catalog_sha": self.catalog.fingerprint, "operations_sha": ledger.digest(describe_operations()),
+                 "policy_sha": self.policy_sha(),
                  "controller_prompt": ledger.digest(prompt_loader.template("orchestrate").template),
                  "controller_settings": ledger.digest(asdict(self.run.settings("orchestrate"))),
                  "run_settings": ledger.digest([self.run.overrides, self.run.step_overrides])}
-        if any(key in self.data and self.data[key] != value for key, value in found.items()):
-            raise factory.Refused("the admitted catalog, controller or policy changed; reconcile before resuming")
-        return found
+        old = {key: self.data[key] for key, value in found.items() if key in self.data and self.data[key] != value}
+        changes = ", ".join(f"{key} changed ({str(value)[:8]} → {found[key][:8]})" for key, value in old.items())
+        if old.keys() - REFRESHABLE_LINEAGE:
+            raise factory.Refused(f"{changes}; reconcile before resuming")
+        if why := self.continuation_blocker(decision_boundary=bool(old)):
+            raise factory.Refused(f"{changes}; {why}; reconcile before resuming" if old else why)
+        return found, old
 
     def ci_failures(self, current):
         logs = pipeline.run_folder(self.run, "ci")
@@ -611,6 +655,13 @@ class Controller:
     def catch_up(self, checkout):
         job, b = self.job, self.job.b
         base_sha = ""
+
+        def remember_push(head):
+            self.data["publication_intent"]["catch_up"] = {
+                "pr": checkout.pr, "previous": checkout.lease, "head": head, "base": base_sha,
+            }
+            self.persist()
+
         try:
             row = gh.pr_merge_details(checkout.pr)
             if hold := gh.merge_ref_hold(row, checkout.lease, checkout.base):
@@ -623,7 +674,8 @@ class Controller:
                 return f"the base `{checkout.base}` moved to `{base_sha}` after {b.catch_ups} catch-ups"
             b.catch_ups += 1
             job.verified, job.review = pipeline.catch_up_base(
-                b, checkout, job.branch, base_sha, job.with_left(job.goal), job.with_left(job.plan_text))
+                b, checkout, job.branch, base_sha, job.with_left(job.goal), job.with_left(job.plan_text),
+                before_push=remember_push)
         except pipeline.CatchUpPushUnconfirmed:
             raise
         except (workspace.RunFailed, RuntimeError, OSError) as e:
@@ -636,6 +688,7 @@ class Controller:
         self.stamp("checks", {"full": True, "checked": b.checked, "report": b.report})
         self.stamp("verify", asdict(job.verified))
         self.stamp("review", job.review.asdict())
+        self.data["publication_intent"].pop("catch_up", None)
         self.persist()
         return ""
 
@@ -746,6 +799,9 @@ class Controller:
                 self.job.goal, self.job.fix_reply = goal, reply
             result = outcome.data.get("verified" if role == "verify" else "review", {})
             self.stamp(role, result)
+            if outcome.data.get("ending") == "environment-held":
+                self.ending = flows.ended(self.flow, outcome)
+                return {"operation_passed": False, **result}
             return {"operation_passed": outcome.passed, **result}
         if op == "owner.ask":
             if zte.reserved(str(self.run.tid)):
@@ -814,21 +870,38 @@ class Controller:
                         state="running" if result is None else "failed" if "error" in result else "succeeded")
 
     def drive(self):
+        verification_passed = False
         try:
             if ended := self.prepare():
                 return ended
             if self.run.action:
-                prior = next((a for a in ledger.actions(self.lease) if a["id"] == self.run.action), None)
-                allowed = ("worker.start", "worker.continue", "checks.run", "verification.run", "review.run")
+                known = {action["id"]: action for action in ledger.actions(self.lease)}
+                prior = known.get(self.run.action)
+                allowed = (("verification.run",) if self.run.environment_release else
+                           ("worker.start", "worker.continue", "checks.run", "verification.run", "review.run"))
                 if prior is None or prior["op"] not in allowed or prior["state"] not in ledger.TERMINAL:
                     raise factory.Refused("rerun requires a finished worker/check/review/verification action ID")
                 snapshot = ledger.snapshot(self.lease)
                 turn = ledger.begin(self.lease, {"rerun": prior["id"]}, self.policy.max_decisions)
+                requester = "Live release retry" if self.run.environment_release else "Owner requested rerun"
                 response = {"version": PROTOCOL, "decision_id": turn, "state_version": snapshot["version"],
-                            "rationale": f"Owner requested rerun of {prior['id']}",
+                            "rationale": f"{requester} of {prior['id']}",
                             "calls": [{"op": prior["op"], "args": prior["request"]}]}
+                try:
+                    response = self.catalog.validate(response, turn, snapshot["version"], known,
+                                                     enforce_size_limit=False)
+                except (ValueError, TypeError) as error:
+                    ledger.reject(self.lease, turn, str(error)[:2000])
+                    raise factory.Refused(f"cannot rerun {prior['id']} under the current catalog: {error}") from error
                 rerun = ledger.accept(self.lease, turn, snapshot["version"], response, self.policy.max_actions)[0]
                 self.dispatch(rerun)
+                if self.run.environment_release:
+                    if self.ending:
+                        return self.ending
+                    if (not flows.retry_passed(self.job.verified)
+                            or self.data.get("evidence", {}).get("verify", {}).get("producer") != rerun["id"]):
+                        raise factory.Refused("the saved verification action did not complete successfully")
+                    verification_passed = True
                 if self.run.action_only:
                     while self.workers:
                         self.collect()
@@ -848,6 +921,8 @@ class Controller:
             raise runlimits.Parked(str(error)) from error
         finally:
             self.close()
+            if self.run.environment_release and not verification_passed and flows.reset_environment_base(self.job.checkouts):
+                self.persist()
 
     def close(self):
         errors = []

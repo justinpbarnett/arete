@@ -36,7 +36,7 @@ from .store import writes
 AB_DAYS = 30
 AB_MIN_TICKETS = 20
 REPAIRS = tuple(r for r, b in config.INHERITS.items() if b == "build")
-BEAT_FILE = paths.STATE_DIR / "serve.json"
+BEAT_FILE = paths.SERVE_BEAT_FILE
 BEAT_STALE_SECONDS = 120
 STUCK_TICKS = 3
 

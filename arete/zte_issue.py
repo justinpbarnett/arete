@@ -94,7 +94,7 @@ def issue_content(identity: Identity, number: int, row: dict) -> tuple:
     pilot.require(type(title) is str and 0 < len(title.encode()) <= 512
                   and type(body) is str and 0 < len(body.encode()) <= MAX_BODY_BYTES,
                   "the issue text is missing or exceeds the delivery bound")
-    pilot.require(not tracker.waits_on(body), "this lane does not admit issues with dependencies")
+    pilot.require(not tracker.github_waits(body, identity.name), "this lane does not admit issues with dependencies")
     return identity.number, identity.node, identity.owner, number, row["node_id"], title, body, labels
 
 

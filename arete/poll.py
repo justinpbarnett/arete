@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 from collections import Counter
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from datetime import timedelta
 
 from . import (
     config,
+    environment_gaps,
     intake,
     jira,
     launch_lease,
@@ -102,7 +104,8 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
                                         or not tk.in_zte_queue(str(tid)))
 
     for tid in run_store.interrupted_tickets(repo.name):
-        if ordinary_history(tid):
+        if (ordinary_history(tid) and (row := run_store.newest_live_whole_run(repo.name, tid))
+                and not environment_gaps.was_retry(row)):
             return tid, "restarting after an interruption"
     for tid in insights_store.feedback_due(repo.name, util.iso(util.now() - timedelta(minutes=pipeline.FEEDBACK_QUIET_MINUTES))):
         if ordinary_history(tid):
@@ -266,7 +269,7 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: tuple[str, str], skip
     if not pilot.pickable(str(tid), repo.name) or (
             zte.reserved(str(tid)) and not (zte.scheduled_poll() and zte.pickable(str(tid), repo.name))):
         return "skipped"
-    with tasks.PENDING_LOCK, util.lock(tasks.START_LOCK, wait=True):
+    with tasks.PENDING_LOCK, (nullcontext() if dry_run else util.lock(tasks.START_LOCK, wait=True)):
         if tasks.pending_start(repo.name, str(tid)) or run_store.issue_running(repo.name, tid):
             return "skipped"
     source = tracker.for_ticket(cfg, repo, tid)
@@ -338,6 +341,23 @@ def fill_slots(cfg: config.Config, queues: list[RepoQueue], skips: pipeline.Skip
     return selected_work
 
 
+def resume_environment_holds(cfg: config.Config, queues: list[RepoQueue], dry_run: bool,
+                             errors: list[str], going: Counter, slots: int) -> int:
+    started = 0
+    for queue in queues:
+        repo = queue.repo
+        for row in run_store.environment_holds(repo.name):
+            try:
+                can_start = started < MAX_STARTS_PER_POLL and not held_back(cfg, repo.name, going, slots - started)
+                if environment_gaps.handle(cfg, repo, row, dry_run, can_start=can_start):
+                    queue.selected.add(str(row["issue"]))
+                    going[repo.name] += 1
+                    started += 1
+            except Exception as error:
+                failed(errors, row["id"], error)
+    return started
+
+
 def report_unrouted(routes: dict[str, set[str]], reached_clients: dict[str, jira.Client],
                     skips: pipeline.SkipLog, errors: list[str]) -> None:
     for project, client in reached_clients.items():
@@ -358,9 +378,10 @@ def save_skips_and_landings(cfg: config.Config, skips: pipeline.SkipLog,
 
 
 def poll(dry_run: bool = False) -> int:
-    paths.ensure_dirs()
+    if not dry_run:
+        paths.ensure_dirs()
     cfg = config.load()
-    with util.lock("poll") as got:
+    with (nullcontext(True) if dry_run else util.lock("poll")) as got:
         if not got:
             print(f"{util.iso()} poll already running")
             return 0
@@ -381,7 +402,12 @@ def poll(dry_run: bool = False) -> int:
         queues, reached_clients = repo_queues(cfg, pipeline_repos, routes, skips, errors)
         for queue in queues:
             guard(errors, f"{queue.repo.name} environment requeues", lambda: requeue_failures(cfg, queue, dry_run, errors))
-        selected_work = fill_slots(cfg, queues, skips, dry_run, errors, going, slots)
+        resumed = 0
+        try:
+            resumed = resume_environment_holds(cfg, queues, dry_run, errors, going, slots)
+        except Exception as error:
+            failed(errors, "environment holds", error)
+        selected_work = fill_slots(cfg, queues, skips, dry_run, errors, going, slots - resumed) or resumed > 0
         report_unrouted(routes, reached_clients, skips, errors)
         if not dry_run:
             guard(errors, "moving tickets", lambda: outcomes.sync_moves(cfg))
