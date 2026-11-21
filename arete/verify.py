@@ -150,21 +150,33 @@ def run_probes(v: config.Verify, cwd: Path, attempt: scratch.Attempt | None,
             try:
                 out, err = proc.communicate(timeout=remaining)
                 passed = proc.returncode == 0
-                output = "\n".join(filter(None, (out, err))) if is_driver else out + err
-                saw = f"exit {proc.returncode}: " + util.tail(output, MAX_SAW_CHARS)
-                if not passed and (proc.returncode in (126, 127, util.TIMED_OUT)
-                                   or ENVIRONMENT_FAULT.search(err if is_driver else saw)):
+                status = f"exit {proc.returncode}: "
+                if is_driver:
+                    output = public("\n".join(filter(None, (out, err))))
+                    saw = status + util.tail(output, MAX_SAW_CHARS - len(status) - len("...\n"))
+                    confinement_fault = err.startswith("sandbox-exec:")
+                else:
+                    saw = status + util.tail(out + err, MAX_SAW_CHARS)
+                    confinement_fault = ENVIRONMENT_FAULT.search(saw)
+                if not passed and (proc.returncode in (126, 127, util.TIMED_OUT) or confinement_fault):
                     cause = "environment"
             finally:
                 util.stop_group(proc)
         except (OSError, TimeoutError, subprocess.TimeoutExpired) as error:
             passed, saw, cause = False, f"{type(error).__name__}: {error}", "environment"
-        check = {"what": name, "how": public(command), "saw": public(saw), "passed": passed}
+            if is_driver and isinstance(error, subprocess.TimeoutExpired):
+                saw = "Timed out waiting for the driver to finish."
+        saw = public(saw)
+        if is_driver:
+            saw = saw[:MAX_SAW_CHARS]
+        check = {"what": name, "how": public(command), "saw": saw, "passed": passed}
+        if is_driver:
+            check["driver"] = True
         if not passed:
             check["cause"] = cause
         checks.append(check)
         if not passed:
-            blocker = f"{name}: {public(saw)}"
+            blocker = f"{name}: {saw}"
             blocked = cause == "environment"
             summary = f"Configured {label} failed."
             if named:
@@ -348,8 +360,9 @@ class Verified:
     @classmethod
     def from_agent(cls, found: dict) -> Verified:
         said = found.get("verdict")
+        checks = [{k: v for k, v in c.items() if k != "driver"} for c in found.get("checks", []) if isinstance(c, dict)]
         v = cls(said.strip().lower() if isinstance(said, str) else "", found.get("summary", "").strip(),
-                [c for c in found.get("checks", []) if isinstance(c, dict)], found.get("blocked_by", "").strip())
+                checks, found.get("blocked_by", "").strip())
         if v.verdict not in VERDICTS:
             v.verdict = "blocked"
             v.blocked_by = v.blocked_by or f"the verifier's verdict {json.dumps(said)} is not pass, fail or blocked"
@@ -393,7 +406,12 @@ class Verified:
             lines.append(f"\nBlocked by: {self.blocked_by}")
         embedded: set[str] = set()
         for c in self.checks:
-            lines += ["", f"- **{'Passed' if c.get('passed') else 'Failed (environment)' if str(c.get('cause') or '').strip().lower() == 'environment' else 'Failed'}**: {c['what'].strip()}",
+            status = "Passed" if c.get("passed") else "Failed"
+            if status == "Failed" and str(c.get("cause") or "").strip().lower() == "environment":
+                status += " (environment)"
+            if c.get("driver") is True:
+                status = f"Driver {status}"
+            lines += ["", f"- **{status}**: {c['what'].strip()}",
                       f"  - How: {one_line(c['how'])}", f"  - Saw: {one_line(c['saw'])[:MAX_SAW_CHARS]}"]
             shot = Path(c.get("screenshot") or "").name
             if shot in embedded:

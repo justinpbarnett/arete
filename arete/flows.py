@@ -406,7 +406,10 @@ class Job:
             value = (self.layer.checks, self.layer.quick_checks, self.layer.targeted_checks,
                      self.layer.targeted_commands, bool(kw.get("quick")))
         elif name == "verify":
-            value = (self.layer.verify.policy() if self.layer.verify else None, self.goal, self.left_for_a_person)
+            verify = self.layer.verify
+            value = (verify.policy() if verify else None, self.goal, self.left_for_a_person)
+            if verify and verify.feature_map:
+                value += (journeys.requested(verify.feature_map, self.ticket.title, self.ticket.body),)
         else:
             return ""
         return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()

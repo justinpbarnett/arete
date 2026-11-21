@@ -42,7 +42,7 @@ def linked_map(value: str, source_dir: Path) -> dict:
         raise ValueError(f"[verify] cannot read feature_map {value!r}: {error}") from error
 
 
-def load(value, source_dir: Path, drivers: dict[str, str]) -> dict[str, Journey]:
+def load(value, source_dir: Path, bindings: dict[str, str]) -> dict[str, Journey]:
     entries = linked_map(value, source_dir) if isinstance(value, str) else value
     if not isinstance(entries, dict):
         raise ValueError("[verify] feature_map must be a table or a relative TOML filename")
@@ -51,22 +51,21 @@ def load(value, source_dir: Path, drivers: dict[str, str]) -> dict[str, Journey]
         where = f"[verify.feature_map.{name}]"
         if not NAME.fullmatch(name):
             raise ValueError(f"{where} use a lowercase, hyphen-separated journey name")
-        if not isinstance(entry, dict) or entry.keys() - {"steps", "outcome", "driver"}:
-            raise ValueError(f"{where} expected steps, outcome and an optional driver reference")
+        if not isinstance(entry, dict) or entry.keys() - {"steps", "outcome"}:
+            raise ValueError(f"{where} expected steps and outcome; bind drivers in [verify.journey_drivers]")
         steps, outcome = entry.get("steps"), entry.get("outcome")
         if not isinstance(steps, list) or not steps or any(not isinstance(s, str) or not s.strip() for s in steps):
             raise ValueError(f"{where} steps must be a nonempty list of nonempty strings")
         if not isinstance(outcome, str) or not outcome.strip():
             raise ValueError(f"{where} outcome must be a nonempty string")
-        driver = entry.get("driver", "")
-        if "driver" in entry and (not isinstance(driver, str) or driver not in drivers):
-            raise ValueError(f"{where} driver must refer to a name in [verify.drivers]")
-        journeys[name] = Journey(tuple(step.strip() for step in steps), outcome.strip(), driver)
+        journeys[name] = Journey(tuple(step.strip() for step in steps), outcome.strip(), bindings.get(name, ""))
+    if unknown := bindings.keys() - journeys.keys():
+        raise ValueError(f"[verify.journey_drivers] unknown journeys: {', '.join(sorted(unknown))}")
     return journeys
 
 
-def references(title: str, body: str) -> set[str]:
-    return set(REFERENCE.findall(title + "\n" + body))
+def requested(entries: dict[str, Journey], title: str, body: str) -> list[str]:
+    return sorted(set(REFERENCE.findall(title + "\n" + body))) if entries else []
 
 
 def guidance(entries: dict[str, Journey], *, planning: bool = False) -> str:

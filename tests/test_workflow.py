@@ -1,3 +1,5 @@
+import subprocess
+import tempfile
 import tomllib
 import unittest
 from dataclasses import replace
@@ -7,7 +9,7 @@ from types import SimpleNamespace
 from typing import ClassVar
 from unittest import mock
 
-from arete import config, pipeline, sandbox, tracker, util, verify
+from arete import config, factory, flows, mergecheck, orchestration, pipeline, sandbox, tracker, util, verify, workspace
 from arete.review import Review
 
 
@@ -45,8 +47,105 @@ class JourneyVerificationTests(unittest.TestCase):
         return pipeline.use_product(self.work, "verify", "verify", goal="Check the CLI output.", summary="",
                                     diff="")
 
+    def passing_driver(self):
+        process = mock.Mock(returncode=0, communicate=mock.Mock(return_value=("Driver observed valid prompt", "")))
+        self.enterContext(mock.patch.object(verify.scratch, "service_command", return_value=["driver"]))
+        self.enterContext(mock.patch.object(verify.scratch, "spawn", return_value=process))
+        self.enterContext(mock.patch.object(util, "stop_group"))
+
+    def test_passing_driver_cannot_supply_missing_verifier_checks(self):
+        self.ticket.body = "Also inspect the catalog."
+        self.work.layer.trust_level = "automerge"
+        self.run.agent.return_value.runner = "codex"
+        self.enterContext(mock.patch.object(pipeline, "verification_trees", return_value={"": "candidate"}))
+        self.passing_driver()
+
+        result = self.verify()
+
+        self.assertEqual(result.verdict, "blocked")
+        self.assertEqual(result.blocked_by, "the verifier said pass but listed no checks")
+        self.assertEqual(result.native_trees, {})
+        self.assertIn("Driver observed valid prompt", self.run.save.call_args.args[1])
+
+    def test_merge_check_replays_numbered_verifier_step_without_the_driver(self):
+        self.passing_driver()
+        self.run.agent.return_value.structured["checks"] = [
+            {"what": "1. Inspect the catalog", "how": "echo catalog", "saw": "catalog", "passed": True},
+            {"what": "journey:verifier-prompt-inputs", "how": "echo prompt", "saw": "prompt", "passed": True},
+        ]
+
+        result = self.verify()
+        self.assertEqual(result.verdict, "pass")
+        report = self.run.save.call_args.args[1]
+        self.assertIn(self.work.layer.verify.drivers["prompt-inputs"], report)
+        self.assertIn("Driver observed valid prompt", report)
+        with tempfile.NamedTemporaryFile(suffix=".md") as saved:
+            path = Path(saved.name)
+            path.write_text(report)
+            with mock.patch.object(mergecheck, "reports", return_value=("build", path)):
+                steps = mergecheck.report_steps({"run_id": "build", "pr": 646})
+
+        self.assertEqual([step.goal(n) for n, step in enumerate(steps, 1)], [
+            "1. [build step 1] Inspect the catalog: echo catalog",
+            "2. [build step 2] journey:verifier-prompt-inputs: echo prompt",
+        ])
+
+    def test_linked_map_cannot_redirect_an_owner_configured_binding(self):
+        with (tempfile.NamedTemporaryFile(suffix=".toml") as source,
+              tempfile.NamedTemporaryFile(suffix=".toml") as linked):
+            config_file, map_file = Path(source.name), Path(linked.name)
+            configured = (self.example / "config.toml").read_text().replace("feature-map.toml", map_file.name)
+            config_file.write_text(configured + '\nother = "echo other"\n')
+            map_file.write_text((self.example / "feature-map.toml").read_text())
+            journey = config.load_layer(self.example, source_file=config_file).verify.feature_map["verifier-prompt-inputs"]
+            self.assertEqual(journey.driver, "prompt-inputs")
+
+            with map_file.open("a") as stream:
+                stream.write('driver = "other"\n')
+            with self.assertRaisesRegex(ValueError, r"bind drivers in \[verify\.journey_drivers\]"):
+                config.load_layer(self.example, source_file=config_file)
+
+    def test_orchestrated_plan_worker_sees_the_configured_journey(self):
+        checkout = workspace.Checkout("", "arete", self.example, self.example, "main")
+        job = flows.Job(self.work.cfg, self.run, self.example, ticket=self.ticket, layer=self.work.layer,
+                        checkouts=[checkout])
+        controller = orchestration.Controller.__new__(orchestration.Controller)
+        controller.job, controller.run, controller.lease = job, self.run, "fixture"
+        controller.workers, controller.data, controller.policy = {}, {}, config.Orchestration()
+        controller.catalog = mock.Mock()
+        setting = SimpleNamespace(step="plan", tools=("Read",), runner="codex", model="fixture")
+        controller.catalog.worker.return_value = setting, "plan", False
+        args = {"depends_on": [], "tool_bundle": "read", "context_refs": [], "goal": "Plan", "inputs": {}}
+        with (mock.patch.object(orchestration.ledger, "actions", return_value=[]),
+              mock.patch.object(orchestration.ledger, "transition"),
+              mock.patch.object(orchestration.delegation, "Worker"),
+              mock.patch.object(orchestration.delegation, "request") as request):
+            controller.worker_start({"id": "plan-1"}, args)
+
+        prompt = request.call_args.args[2]
+        self.assertIn("## Product feature map\n", prompt)
+        self.assertIn("`journey:verifier-prompt-inputs` (configured driver available)", prompt)
+        self.assertIn("Read the verification prompt's JSON record.", prompt)
+
+    def test_stored_evidence_requires_the_same_ticket_selection_with_a_map(self):
+        job = flows.Job(self.work.cfg, self.run, self.example, ticket=self.ticket, layer=self.work.layer,
+                        goal="Check the CLI output.")
+        passing = factory.Outcome("pass", data={"policy": job.policy("verify", {})})
+        self.ticket.body = "Repeat journey:verifier-prompt-inputs."
+        self.assertTrue(job.accepts("verify", passing, {}))
+        self.ticket.title, self.ticket.body = "Check prompt inputs", ""
+        self.assertFalse(job.accepts("verify", passing, {}))
+
+        job.layer.verify = config.Verify(url="")
+        passing.data["policy"] = job.policy("verify", {})
+        self.ticket.body = "Check journey:verifier-prompt-inputs."
+        self.assertTrue(job.accepts("verify", passing, {}))
+
     def test_requested_driver_runs_after_probes_in_journey_order_and_reports_observations(self):
         self.ticket.body = "Also check journey:another-journey and journey:verifier-prompt-inputs."
+        self.run.agent.return_value.structured["checks"] = [
+            {"what": "Inspect the catalog", "how": "echo catalog", "saw": "catalog", "passed": True},
+        ]
         configured = self.work.layer.verify
         configured.feature_map["another-journey"] = replace(configured.feature_map["verifier-prompt-inputs"],
                                                            driver="another-driver")
@@ -63,9 +162,9 @@ class JourneyVerificationTests(unittest.TestCase):
 
         self.assertEqual(result.verdict, "pass")
         self.assertEqual([c["what"] for c in result.checks], [
-            "ready", "journey:another-journey", "journey:verifier-prompt-inputs",
+            "ready", "journey:another-journey", "journey:verifier-prompt-inputs", "Inspect the catalog",
         ])
-        self.assertEqual(result.checks[-1]["saw"], "exit 0: second output")
+        self.assertEqual(result.checks[2]["saw"], "exit 0: second output")
         self.assertEqual([call.args[1] for call in confined.call_args_list],
                          ["echo ready", f"echo 4242 {self.scratch.return_value.root}",
                           configured.drivers["prompt-inputs"]])
@@ -78,9 +177,10 @@ class JourneyVerificationTests(unittest.TestCase):
         self.enterContext(mock.patch.object(verify.scratch, "service_command", return_value=["driver"]))
         spawn = self.enterContext(mock.patch.object(verify.scratch, "spawn"))
         self.enterContext(mock.patch.object(util, "stop_group"))
-        for code, stdout, stderr, verdict in ((1, "unexpected product response: EPERM", "", "fail"),
+        for code, stdout, stderr, verdict in ((1, "", "unexpected product response: EPERM", "fail"),
+                                               (1, "", "sandbox-exec: confinement unavailable", "blocked"),
                                                (127, "", "driver: command not found", "blocked")):
-            with self.subTest(code=code):
+            with self.subTest(code=code, stderr=stderr):
                 spawn.return_value = mock.Mock(returncode=code, communicate=mock.Mock(return_value=(stdout, stderr)))
 
                 result = self.verify()
@@ -89,6 +189,21 @@ class JourneyVerificationTests(unittest.TestCase):
                 self.assertEqual(result.finished, verdict == "fail")
                 self.assertIn("journey:verifier-prompt-inputs", result.summary)
                 self.assertEqual(result.checks[0]["saw"], f"exit {code}: {stdout or stderr}")
+        self.run.agent.assert_not_called()
+
+    def test_driver_timeout_reports_the_journey_and_stops_the_process_group(self):
+        self.enterContext(mock.patch.object(verify.scratch, "service_command", return_value=["driver"]))
+        process = mock.Mock()
+        process.communicate.side_effect = subprocess.TimeoutExpired("driver", 1)
+        self.enterContext(mock.patch.object(verify.scratch, "spawn", return_value=process))
+        stop = self.enterContext(mock.patch.object(util, "stop_group"))
+
+        result = self.verify()
+
+        self.assertEqual(result.verdict, "blocked")
+        self.assertIn("journey:verifier-prompt-inputs", result.blocked_by)
+        self.assertIn("Timed out waiting for the driver", result.checks[0]["saw"])
+        stop.assert_called_once_with(process)
         self.run.agent.assert_not_called()
 
     def test_driver_requires_trusted_scratch(self):

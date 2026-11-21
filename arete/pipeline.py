@@ -2910,13 +2910,13 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
     zte_verify = zte.reserved(tid) and prompt_name == role == "verify"
     readme_task = (pilot.is_pilot_task(tid) and prompt_name == role == "verify") or zte_verify
     feature_map = configured.feature_map if prompt_name == role == "verify" and not readme_task else {}
-    requested = journeys.references(b.ticket.title, b.ticket.body) if feature_map else set()
+    requested = journeys.requested(feature_map, b.ticket.title, b.ticket.body)
     step = b.next_step(step_name)
-    if unknown := sorted(requested - feature_map.keys()):
+    if unknown := [name for name in requested if name not in feature_map]:
         return save_verification(run, step, verify.Verified(
             "blocked", "An issue references a journey absent from the configured feature map.", finished=False,
             blocked_by=", ".join(f"journey:{name}" for name in unknown)))
-    selected = {name: feature_map[name] for name in sorted(requested)}
+    selected = {name: feature_map[name] for name in requested}
     drivers = {name: journey.driver for name, journey in selected.items() if journey.driver}
     v = verify.with_free_ports(replace(configured, drivers={name: configured.drivers[name] for name in drivers.values()}))
     merge_candidate = b.layer.trust_level == "automerge" or readme_task
@@ -3047,14 +3047,10 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                                    blocked_by=util.first_line(res.error or "the verifier returned no verdict", 300))
         if not drivers:
             return verified
-        verified.checks = probes.checks
     else:
-        said = res.structured
-        if drivers and isinstance(said.get("checks"), list):
-            said = {**said, "checks": probes.checks + said["checks"]}
-        verified = verify.Verified.from_agent(said)
-        if probes and not drivers:
-            verified.checks = probes.checks + verified.checks
+        verified = verify.Verified.from_agent(res.structured)
+    if probes and probes.verdict == "pass":
+        verified.checks = probes.checks + verified.checks
     if fixture_blocker:
         verified.verdict, verified.blocked_by, verified.finished = "blocked", fixture_blocker, False
     if (verified.verdict == "pass" and checked_trees and agent_finished and res.runner in {"pi", "codex", "claude"}

@@ -1336,7 +1336,11 @@ def load_layer(layer_dir: Path, strict: bool = False, *, source_file: Path | Non
         if any(not journeys.NAME.fullmatch(name) or not isinstance(cmd, str) or not cmd.strip()
                for name, cmd in drivers.items()):
             raise ValueError("[verify.drivers] must map lowercase, hyphen-separated names to nonempty commands")
-        feature_map = journeys.load(v.get("feature_map", {}), source_dir, drivers)
+        bindings = table_of(v.get("journey_drivers", {}), "verify.journey_drivers")
+        for name, driver in bindings.items():
+            if not isinstance(driver, str) or driver not in drivers:
+                raise ValueError(f"[verify.journey_drivers] {name!r} must name a command in [verify.drivers]")
+        feature_map = journeys.load(v.get("feature_map", {}), source_dir, bindings)
         layer.verify = Verify(publish_evidence=publish_evidence, start=v.get("start", ""), url=v.get("url", Verify.url), ready=v.get("ready", "/"),
                               ready_seconds=int(v.get("ready_seconds", Verify.ready_seconds)),
                               allow_bash=list(v.get("allow_bash", [])), notes=v.get("notes", "").strip(),
