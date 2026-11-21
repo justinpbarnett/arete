@@ -18,6 +18,10 @@ class Conflict(ValueError):
     pass
 
 
+class Limit(Conflict):
+    pass
+
+
 def encoded(value) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
@@ -113,7 +117,7 @@ def begin(lease: Lease, observation: dict, maximum: int) -> str:
     with tx() as c:
         row = fenced(c, lease)
         if row["turns"] - unchanged_waits(c, lease.root) >= maximum:
-            raise Conflict(f"controller used its {maximum} decision allowance")
+            raise Limit(f"controller used its {maximum} decision allowance")
         turn = f"d{row['turns'] + 1:04d}"
         c.execute("INSERT INTO orchestration_turns VALUES (?,?,?,?,?,?,?)",
                   (lease.root, turn, lease.run, digest(observation), "null", "pending", util.iso()))
@@ -139,7 +143,7 @@ def launched(lease: Lease, maximum: int) -> None:
     with tx() as c:
         row = fenced(c, lease)
         if row["launches"] - unchanged_waits(c, lease.root) >= maximum:
-            raise Conflict(f"controller used its {maximum} inference-launch allowance")
+            raise Limit(f"controller used its {maximum} inference-launch allowance")
         c.execute("UPDATE orchestrations SET launches = launches + 1 WHERE root = ?", (lease.root,))
 
 
@@ -166,8 +170,12 @@ def accept(lease: Lease, turn: str, version: int, response: dict, maximum: int) 
         if earlier["state"] != "pending" or current["version"] != version:
             raise Conflict("stale decision state")
         count = c.execute("SELECT count(*) FROM orchestration_actions WHERE root = ?", (lease.root,)).fetchone()[0]
-        if count + len(response["calls"]) > maximum:
-            raise Conflict(f"run used its {maximum} action allowance")
+        remaining = maximum - count
+        requested = len(response["calls"])
+        if requested > remaining:
+            if remaining <= 0:
+                raise Limit(f"run used its {maximum} action allowance")
+            raise Conflict(f"decision requested {requested} actions with {remaining} remaining in the action allowance")
         for n, call in enumerate(response["calls"]):
             c.execute("INSERT INTO orchestration_actions VALUES (?,?,?,?,?,'accepted',?,?,?)",
                       (lease.root, f"{turn}-{n}", turn, lease.run, call["op"], encoded(call["args"]),

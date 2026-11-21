@@ -2539,6 +2539,333 @@ class CatchUpPublicationFailureTests(MovedBasePublicationFixture, unittest.TestC
                     park.assert_not_called()
 
 
+class CatchUpRecoveryTests(MovedBasePublicationFixture, unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.state = Path(cls.enterClassContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        cls.enterClassContext(mock.patch.multiple(paths, STATE_DIR=cls.state, DB_FILE=cls.state / "arete.db",
+                                                  RUNS_DIR=cls.state / "runs", LOCKS_DIR=cls.state / "locks",
+                                                  LOG_DIR=cls.state / "logs", WORKTREES_DIR=cls.state / "worktrees"))
+        cls.enterClassContext(mock.patch.object(db.dbstats.Timing, "finished"))
+        db.migrate()
+
+    def setUp(self):
+        self.ctrl, self.checkout = self.controller()
+        job, c = self.ctrl.job, self.checkout
+        self.repo = config.Repo(self._testMethodName, self.state, github=c.github, parts=[config.Part("", c.github)])
+        self.run = self.new_run()
+        self.ctrl.run = job.run = job.b.run = self.run
+        job.ticket = job.b.ticket = tracker.Ticket("7", "#7", "Edit fixture")
+        self.ctrl.data.update(publication_intent={}, publication={"heads": {c.github: c.lease}})
+        self.ctrl.lease = ledger.acquire(self.run.id, "", self.ctrl.data)
+        self.ctrl.prepare = mock.Mock(return_value=None)
+        self.ctrl.observe = mock.Mock(side_effect=lambda: {"state_version": ledger.snapshot(self.ctrl.lease)["version"]})
+        self.ctrl.take_merge_lease = mock.Mock()
+        self.ctrl.publication_ci = mock.Mock(return_value=None)
+        self.ctrl.stamp = mock.Mock()
+        self.body = ("Closes #7\n\n## Checked in use\n\nEarlier verification.\n\n## Review\n\nEarlier review.\n\n"
+                     "## Owner note\n\nKeep this.")
+        self.head, self.draft = c.lease, False
+        self.enterContext(mock.patch.object(gh, "gh", side_effect=AssertionError("unexpected GitHub call")))
+        self.enterContext(mock.patch.object(gh, "pr_body", side_effect=lambda _: self.body))
+        self.enterContext(mock.patch.object(gh, "pr_draft_and_head", side_effect=lambda _: (self.draft, self.head)))
+        self.enterContext(mock.patch.object(gh, "pr_set_draft", side_effect=lambda _, draft: setattr(self, "draft", draft)))
+        self.edit = self.enterContext(mock.patch.object(gh, "pr_edit_body", side_effect=self.edit_body))
+        issue = {"number": 7, "title": job.ticket.title, "author": {"login": "fixture"},
+                 "labels": [{"name": tracker.LABEL}], "state": "OPEN"}
+        self.enterContext(mock.patch.object(gh, "issue", return_value=issue))
+        self.enterContext(mock.patch.object(gh, "issue_labels", return_value=""))
+        self.comment = self.enterContext(mock.patch.object(gh, "issue_comment", return_value=""))
+        self.push = self.enterContext(mock.patch.object(pipeline, "commit_and_push"))
+        self.enterContext(mock.patch.object(pipeline, "git", side_effect=AssertionError("unexpected git call")))
+        self.enterContext(mock.patch.object(pipeline, "catch_up_target", return_value=("new-base", "")))
+
+    def new_run(self):
+        rid = pipeline.record.start("pipeline", repo=self.repo.name, issue="7")
+        folder = paths.RUNS_DIR / rid
+        folder.mkdir(parents=True)
+        run = pipeline.Run(rid, self.repo, folder, tracker=tracker.GitHubTracker(self.repo), tid="7")
+        self.enterContext(mock.patch.object(run, "log"))
+        self.enterContext(mock.patch.object(run, "enter"))
+        return run
+
+    def edit_body(self, url, text, *, link):
+        self.assertEqual(url, self.checkout.pr)
+        self.body = gh.outgoing(text, link)
+
+    def catch_up_hold(self):
+        verified = verify.Verified("fail", "Verification failed on the new base.")
+        error = pipeline.CatchUpGateHold("verify", "verification found a blocker", "candidate", "", verified=verified)
+        with mock.patch.object(pipeline, "catch_up_base", side_effect=error):
+            result = self.ctrl.catch_up(self.checkout)
+        self.assertEqual(result["failures"], orchestration.CATCH_UP_FAILURE)
+
+    def use_last_repair(self):
+        self.catch_up_hold()
+        self.run.budget = runlimits.Budget(self.run, runlimits.Policy(max_repair_cycles=1), "")
+        self.run.budget.charge("repair", "review_repair")
+        self.assertTrue(self.run.budget.repair_limit_reason())
+
+    def assert_parked_for(self, limit):
+        status, summary, _ = self.ctrl.drive()
+        self.assertEqual(status, "failed")
+        self.assertIn(limit, summary)
+        self.assertTrue(self.draft)
+        self.comment.assert_called_once()
+        ticket_comment = self.comment.call_args.args[2]
+        self.assertIn("Catch-up to `main` at `new-base` held on verify", ticket_comment)
+        self.assertIn(limit, ticket_comment)
+
+    def test_last_repair_parks_at_decision_limit(self):
+        self.use_last_repair()
+        self.ctrl.policy = config.Orchestration(max_decisions=1)
+        ledger.begin(self.ctrl.lease, {}, self.ctrl.policy.max_decisions)
+        self.assert_parked_for("1 decision allowance")
+
+    def test_decision_limit_stops_repair_before_retaining_workspace(self):
+        self.use_last_repair()
+        self.ctrl.policy = config.Orchestration(max_decisions=1)
+        worker = self.start_writing_worker()
+
+        def keep_edits(run):
+            self.assertIs(run, self.run)
+            worker.close.assert_called_once_with()
+            self.assertFalse(self.ctrl.workers)
+            self.assertEqual(ledger.actions(self.ctrl.lease)[0]["state"], "interrupted")
+
+        held = {".": {"head": "retained-head", "onto": "candidate"}}
+        with (mock.patch.object(pipeline, "keep_edits", side_effect=keep_edits) as keep,
+              mock.patch.object(pipeline, "kept_heads", return_value=held)):
+            self.assert_parked_for("1 decision allowance")
+        keep.assert_called_once_with(self.run)
+        parked = runlimits.metadata(self.run.id, "parked.json")
+        self.assertEqual(parked["kept"], held)
+        self.assertIn("held on verify", parked["reason"])
+        self.assertIn("1 decision allowance", parked["reason"])
+
+    def start_writing_worker(self):
+        lease = self.ctrl.lease
+        turn = ledger.begin(lease, {}, self.ctrl.policy.max_decisions)
+        action, = ledger.accept(lease, turn, ledger.snapshot(lease)["version"],
+                                {"calls": [{"op": "worker.start", "args": {}}]}, self.ctrl.policy.max_actions)
+        ledger.transition(lease, action["id"], "running", {"writing": True, "role": "check_repair"})
+        worker = mock.Mock(writing=True, effective={})
+        worker.receive.return_value = []
+        worker.proc.poll.return_value = None
+        self.ctrl.workers[action["id"]] = worker
+        return worker
+
+    def test_time_limit_reports_hold_when_writer_shutdown_fails(self):
+        self.catch_up_hold()
+        error = RuntimeError("worker producer group did not become quiescent")
+
+        def drive(flow):
+            run = flow.ctx.run
+            self.ctrl.run = self.ctrl.job.run = self.ctrl.job.b.run = run
+            run.workspace = self.state, [self.checkout]
+            self.ctrl.lease = ledger.acquire(run.id, "", self.ctrl.data)
+            self.ctrl.policy = config.Orchestration()
+            self.ctrl.last_progress = 0
+            worker = self.start_writing_worker()
+            worker.close.side_effect = error
+            self.ctrl.decide = mock.Mock(side_effect=lambda: self.ctrl.wait_workers(0))
+            with mock.patch.object(run.budget, "run_deadline", return_value=0):
+                try:
+                    return self.ctrl.drive()
+                finally:
+                    worker.close.assert_called_once_with()
+
+        with (mock.patch.object(pipeline, "keep_edits") as keep,
+              mock.patch.object(pipeline, "kept_heads") as kept,
+              mock.patch.object(workspace, "note_made") as note_made):
+            self.assertEqual(self.run_ticket_again(drive), 1)
+        run = self.ctrl.run
+        self.assertTrue(self.draft)
+        hold_comments = [call.args[2] for call in self.comment.call_args_list if "held on verify" in call.args[2]]
+        self.assertEqual(len(hold_comments), 1)
+        self.assertIn("Catch-up to `main` at `new-base` held on verify", hold_comments[0])
+        self.assertIn("minute budget", hold_comments[0])
+        self.assertIn(f"crashed: RuntimeError: {error}", (run.dir / "run.log").read_text())
+        keep.assert_not_called()
+        kept.assert_not_called()
+        note_made.assert_not_called()
+
+    def test_last_repair_parks_at_action_limit(self):
+        self.use_last_repair()
+        self.ctrl.policy = config.Orchestration(max_actions=1)
+        lease = self.ctrl.lease
+        turn = ledger.begin(lease, {}, self.ctrl.policy.max_decisions)
+        calls = [{"op": "checks.run", "args": {}}]
+        version = ledger.snapshot(lease)["version"]
+        action, = ledger.accept(lease, turn, version, {"calls": calls}, self.ctrl.policy.max_actions)
+        ledger.transition(lease, action["id"], "succeeded", {})
+        self.controller_batches(calls)
+        self.assert_parked_for("1 action allowance")
+
+    def controller_batches(self, *batches):
+        self.ctrl.catalog.validate.side_effect = lambda response, *_: response
+        replies = [[{"ok": True, "structured": {"calls": calls}}] for calls in batches]
+        worker = mock.Mock(pid=1, identity=None, receive=mock.Mock(side_effect=replies))
+        self.enterContext(mock.patch.object(orchestration.delegation, "Worker", return_value=worker))
+        self.enterContext(mock.patch.object(orchestration.delegation, "request", return_value={}))
+        self.enterContext(mock.patch.object(self.run, "settings"))
+
+    def test_oversized_gate_batch_can_retry_with_four_actions(self):
+        self.use_last_repair()
+        self.ctrl.policy = config.Orchestration(max_actions=4, max_decisions=2)
+        self.ctrl.policy_sha = mock.Mock(return_value="policy")
+        self.ctrl.data["acceptance"] = "current"
+        calls = [{"op": "checks.run", "args": {}},
+                 {"op": "verification.run", "args": {"route_id": "model:verify:0", "effort": "low"}},
+                 {"op": "review.run", "args": {"route_id": "model:review:0", "effort": "low"}},
+                 {"op": "publication.request", "args": {}}]
+        observation = {"op": "run.observe", "args": {"after": 0, "limit": 20}}
+        self.controller_batches([observation, *calls], calls)
+
+        def perform(action):
+            if action["op"] == "publication.request":
+                self.ctrl.ending = ("pr", "gates passed", self.checkout.pr)
+            return {}
+
+        with mock.patch.object(self.ctrl, "perform", side_effect=perform):
+            self.assertEqual(self.ctrl.drive(), ("pr", "gates passed", self.checkout.pr))
+        actions = ledger.actions(self.ctrl.lease)
+        self.assertEqual([(a["turn"], a["op"], a["state"]) for a in actions],
+                         [("d0002", call["op"], "succeeded") for call in calls])
+        self.assertFalse(self.draft)
+        self.comment.assert_not_called()
+
+    def fail_body_edit(self):
+        self.edit.side_effect = gh.GhError("edit rejected")
+        self.catch_up_hold()
+        pending, = pipeline.run_store.pr_gate_refreshes(self.repo.name, "7")
+        self.assertEqual((pending["run_id"], pending["head"]), (self.run.id, self.head))
+        self.assertIn("Earlier verification.", self.body)
+        failures = [call.args[0] for call in self.run.log.call_args_list if "could not update" in call.args[0]]
+        self.assertEqual(len(failures), 1)
+        self.assertIn("edit rejected", failures[0])
+        self.edit.side_effect = self.edit_body
+
+    def assert_body_refreshed(self, log_lines):
+        self.assertEqual(pipeline.run_store.pr_gate_refreshes(self.repo.name, "7"), [])
+        self.assertIn("Verification failed on the new base.", self.body)
+        self.assertIn("Review did not run.", self.body)
+        self.assertIn("Catch-up to `main` at `new-base` held on verify", self.body)
+        self.assertIn("## Owner note\n\nKeep this.", self.body)
+        self.assertTrue(self.body.startswith("Closes #7\n"))
+        self.assertNotIn("Earlier review.", self.body)
+        retries = [line for line in log_lines if "retrying gate evidence" in line]
+        self.assertEqual(len(retries), 1)
+        self.push.assert_not_called()
+
+    def test_later_publish_retries_body_without_pushing(self):
+        self.fail_body_edit()
+        job = self.ctrl.job
+        job.changed = job.opened = job.pushed = []
+        self.assertTrue(flows.publish(self.ctrl.flow).passed)
+        self.assert_body_refreshed(call.args[0] for call in self.run.log.call_args_list)
+
+    def test_controller_retries_new_evidence_before_merge(self):
+        self.publish_repaired_catch_up(retry_fails=False)
+
+    def test_controller_keeps_new_evidence_pending_when_retry_fails(self):
+        self.publish_repaired_catch_up(retry_fails=True)
+
+    def publish_repaired_catch_up(self, *, retry_fails):
+        self.catch_up_hold()
+        job = self.ctrl.job
+        self.ctrl.data["evidence"]["checks"] = {"result": {"full": True}}
+        job.verified = verify.Verified("pass", "Repaired head verified.", checks=[
+            {"passed": True, "what": "repair", "how": "run the check", "saw": "passed"}])
+        job.review = Review("approve", "Repaired head approved.")
+        self.edit.reset_mock()
+
+        def edit_body(*args, **kwargs):
+            if self.edit.call_count == 1 or retry_fails:
+                raise gh.GhError("edit rejected")
+            self.edit_body(*args, **kwargs)
+
+        def merge(*_args, **_kwargs):
+            self.assertEqual(self.edit.call_count, 2)
+            pending = pipeline.run_store.pr_gate_refreshes(self.repo.name, "7")
+            if retry_fails:
+                row, = pending
+                self.assertEqual(row["head"], self.head)
+                self.assertIn("Repaired head verified.", row["evidence"]["checked"])
+                self.assertIn("Verification failed on the new base.", self.body)
+            else:
+                self.assertEqual(pending, [])
+                self.assertIn("Repaired head verified.", self.body)
+                self.assertIn("Repaired head approved.", self.body)
+
+        self.edit.side_effect = edit_body
+        with (mock.patch.object(pipeline, "try_automerge", side_effect=merge) as merge_attempt,
+              mock.patch.object(flows, "ended", return_value=("pr", "published", self.checkout.pr))):
+            self.assertEqual(self.ctrl.publish()["ending"], "pr")
+        merge_attempt.assert_called_once()
+        self.assertEqual(bool(pipeline.run_store.pr_gate_refreshes(self.repo.name, "7")), retry_fails)
+        self.assertEqual([call.args[0] for call in self.ctrl.atomic.call_args_list], ["pr", "publish"])
+        self.push.assert_not_called()
+        log_lines = [call.args[0] for call in self.run.log.call_args_list]
+        self.assertEqual(sum("retrying gate evidence" in line for line in log_lines), 1)
+        self.assertEqual(sum("could not update gate evidence" in line for line in log_lines), 2 if retry_fails else 1)
+
+    def test_new_run_of_ticket_retries_saved_body_refresh(self):
+        self.fail_body_edit()
+        drive = mock.Mock(return_value=("noop", "fixture done", ""))
+        self.assertEqual(self.run_ticket_again(drive), 0)
+        drive.assert_called_once()
+        run = drive.call_args.args[0].ctx.run
+        self.assertNotEqual(run.id, self.run.id)
+        self.assert_body_refreshed((run.dir / "run.log").read_text().splitlines())
+
+    def run_ticket_again(self, drive):
+        pipeline.record.settle(self.run.id, "failed")
+        script = pipeline.Script("orchestrate", drive)
+        self.addCleanup(signal.signal, signal.SIGTERM, signal.getsignal(signal.SIGTERM))
+        with (mock.patch.object(config, "load", return_value=config.Config(repos=[self.repo])),
+              mock.patch.multiple(pipeline.scratch, process_ids=dict, service_labels=dict, RUN_BASELINES={}, RUN_LABELS={}),
+              redirect_stdout(StringIO())):
+            return pipeline.run_issue(self.repo.name, "7", script=script)
+
+    def test_newer_gate_results_replace_the_pending_hold(self):
+        self.fail_body_edit()
+        c = self.checkout
+        self.head = "repaired-head"
+        c.note_pushed_head(self.head)
+        self.body = self.body.replace("Keep this.", "Updated while refresh was pending.")
+        pipeline.publish_gate_evidence(self.run, self.ctrl.job.ticket, c,
+                                       verify.Verified("pass", "Repaired head verified."),
+                                       Review("approve", "Repaired head approved."))
+        self.assertIn("Repaired head verified.", self.body)
+        self.assertIn("Repaired head approved.", self.body)
+        self.assertIn("Updated while refresh was pending.", self.body)
+        self.assertNotIn("Verification failed on the new base.", self.body)
+        self.assertEqual(pipeline.run_store.pr_gate_refreshes(self.repo.name, "7"), [])
+
+    def test_passing_catch_up_refreshes_evidence_and_retries_merge_as_before(self):
+        c = self.checkout
+        current = verify.Verified("pass", "Verified on the new base."), Review("approve", "Reviewed on the new base.")
+
+        def catch_up(*_, before_push):
+            before_push("caught-up", *current)
+            self.head = "caught-up"
+            c.note_pushed_head(self.head)
+            return current
+
+        with (mock.patch.object(pipeline, "try_automerge", side_effect=[gh.MovedBaseHold("base moved"), None]) as merge,
+              mock.patch.object(pipeline, "catch_up_base", side_effect=catch_up)):
+            self.assertIsNone(self.ctrl.automerge([c]))
+        self.assertEqual(merge.call_count, 2)
+        self.assertEqual(merge.call_args.args[2:4], current)
+        self.ctrl.publication_ci.assert_called_once_with([c], caught_up=True)
+        self.assertFalse(self.draft)
+        self.assertEqual(self.ctrl.data["publication"]["heads"][c.github], "caught-up")
+        self.assertIn("Verified on the new base.", self.body)
+        self.assertIn("Reviewed on the new base.", self.body)
+        self.assertEqual(pipeline.run_store.pr_gate_refreshes(self.repo.name, "7"), [])
+
+
 class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
     def test_conflict_after_a_rerun_passes_reaches_catch_up(self):
         controller, checkout = self.controller()

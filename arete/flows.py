@@ -1431,6 +1431,7 @@ def publish(flow: factory.Flow, merge: Callable[[list[workspace.Checkout]], dict
     opened, pushed, with_prs = job.picked(job.opened), job.picked(job.pushed), job.with_prs
     fresh = [c for c in opened if c.github not in job.found]
     run.enter("pr")
+    run.retry_gate_evidence()
     if merge and (failure := merge(publication_candidates(job, fresh))):
         return Outcome("fail", feedback=failure["error"], data=failure)
     if not merge:

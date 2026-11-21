@@ -22,6 +22,7 @@ TABLES = {
     "environment_hold_prs": "with run",
     "environment_gap_creations": "kept",
     "environment_budget_resets": "kept",
+    "pr_gate_refreshes": "until refreshed or the PR head changes",
 }
 
 
@@ -333,6 +334,30 @@ def newest_whole_run(repo: str, issue: int | str) -> dict | None:
 
 def newest_live_whole_run(repo: str, issue: int | str) -> dict | None:
     return next(iter(ticket_runs(repo, issue, limit=1, whole=True, live=True)), None)
+
+
+def pr_gate_refreshes(repo: str, issue: str) -> list[dict]:
+    with reader() as c:
+        rows = c.execute("SELECT pr_url, run_id, head, evidence FROM pr_gate_refreshes WHERE repo = ? AND issue = ?",
+                         (repo, issue))
+        return [{**row, "evidence": json.loads(row["evidence"])} for row in rows]
+
+
+def save_pr_gate_refresh(repo: str, issue: str, pr_url: str, run_id: str, head: str, evidence: dict) -> bool:
+    with tx() as c:
+        target = repo, issue, pr_url
+        pending = c.execute("SELECT 1 FROM pr_gate_refreshes WHERE repo = ? AND issue = ? AND pr_url = ?", target)
+        retry = pending.fetchone() is not None
+        c.execute("INSERT INTO pr_gate_refreshes VALUES (?, ?, ?, ?, ?, ?) "
+                  "ON CONFLICT (repo, issue, pr_url) DO UPDATE SET "
+                  "run_id = excluded.run_id, head = excluded.head, evidence = excluded.evidence",
+                  (*target, run_id, head, json.dumps(evidence)))
+        return retry
+
+
+def clear_pr_gate_refresh(repo: str, issue: str, pr_url: str) -> None:
+    with tx() as c:
+        c.execute("DELETE FROM pr_gate_refreshes WHERE repo = ? AND issue = ? AND pr_url = ?", (repo, issue, pr_url))
 
 
 def environment_requeue(run: dict, since: str) -> tuple[dict, int]:
