@@ -17,7 +17,7 @@ $plan
 
 ## Review findings from run $source
 
-$findings$feedback
+$findings
 
 ## What this repo's agents have learned so far
 
@@ -28,8 +28,7 @@ $expertise
 - The branch already holds the PR's work. Read what it changes with `git log` and `git diff` against the PR base
   before you edit.
 - Fix every finding listed: each is a blocker from the last review. Where a finding and the plan disagree, the finding wins.
-- Address any owner PR feedback listed above. Keep the change to the findings and that feedback. No scope growth,
-  no drive by refactors, no formatting churn.
+- Keep the change to what the findings ask. No scope growth, no drive by refactors, no formatting churn.
 - Arete runs the full check gate after you finish: $checks.
   Do not duplicate the full suite here.
   Use focused reproductions when helpful and report what you ran; never work around a sandbox refusal.

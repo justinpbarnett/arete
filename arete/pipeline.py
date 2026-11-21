@@ -548,7 +548,7 @@ class Run(AgentRun):
 
         options = {**kw, "fresh_prompt": fresh_prompt}
         if session.id and kw.get("persist", True):
-            feedback = feedback_markdown(self.feedback) if due[0]["step"] in ("revise", "repair") else ""
+            feedback = feedback_markdown(self.feedback) if due[0]["step"] == "revise" else ""
             parts = (owner_asks.answers_message(due),
                      f"Address the owner's PR feedback as well:\n\n{feedback}" if feedback else "",
                      self.kept_note, self.base_note,
@@ -1544,8 +1544,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 run_id = start()
             scratch.RUN_BASELINES[run_id] = producer_baseline
             scratch.RUN_LABELS[run_id] = service_labels
-            repair_with_feedback = script and script.continues and (
-                script.path == "orchestrate" and not script.action or script.path == "repair" and due)
+            repair_with_feedback = script and script.path == "orchestrate" and script.continues and not script.action
             run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force,
                       feedback=[] if zte_grant or reconciling_catch_up or (mending and not repair_with_feedback)
                       else pending_feedback(repo.name, tid),

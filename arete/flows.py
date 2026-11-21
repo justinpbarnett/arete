@@ -589,7 +589,7 @@ class Job:
         return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
     def accepts(self, name: str, outcome: Outcome, kw: dict) -> bool:
-        if not self.only and name in ("revise", "repair") and not self.includes_feedback(name, outcome.data):
+        if name == "revise" and not self.only and not self.includes_feedback(outcome.data):
             self.run.log(f"{name}: pending PR feedback was absent from the saved outcome; rerunning is required")
             return False
         if (expected := self.policy(name, kw)) and outcome.data.get("policy") != expected:
@@ -597,14 +597,14 @@ class Job:
             return False
         return True
 
-    def includes_feedback(self, name: str, data: dict) -> bool:
+    def includes_feedback(self, data: dict) -> bool:
         feedback = self.run.feedback
         if not feedback:
             return True
         if "feedback_keys" in data:
             known = {tuple(key) for key in data["feedback_keys"]}
             return all(pipeline.feedback_key(row) in known for row in feedback)
-        return (name == "revise" and all(row.get("status") != "new" for row in feedback)
+        return (all(row.get("status") != "new" for row in feedback)
                 and data.get("plan") == revision_plan(pipeline.feedback_markdown(feedback)))
 
     def keeps(self, name: str, kw: dict) -> bool:
@@ -1016,14 +1016,8 @@ def repair(flow: factory.Flow, tree: str) -> Outcome:
         run.log(f"repair: the PR head of {github} moved since run {found.run_id}; checks, verify and review run "
                 "again on it")
     run.story.append(f"Review findings of run {found.run_id} to repair:\n{findings}")
-    feedback = pipeline.feedback_markdown(run.feedback)
-    feedback_section = f"\n\n## Owner PR feedback\n\n{feedback}" if feedback else ""
-    goal = f"{found.goal}\n\nAlso check that each of these review findings is fixed:\n\n{findings}"
-    if feedback:
-        run.story.append(feedback_section.strip())
-        goal += f"\n\nCheck that the owner's PR feedback is addressed:\n\n{feedback}"
     res = run.agent("repair", job.brief.prompt(
-        "repair", plan=found.plan, source=found.run_id, findings=findings, feedback=feedback_section, checks=job.checks),
+        "repair", plan=found.plan, source=found.run_id, findings=findings, checks=job.checks),
                     job.ws, role=REVIEW_REPAIR, allowed_tools=prompt_loader.bash_rules(job.builder_bash),
                     disallowed_tools=routing.NO_GIT_WRITES)
     if not res.ok:
@@ -1034,8 +1028,7 @@ def repair(flow: factory.Flow, tree: str) -> Outcome:
                           "unresolved")
     return Outcome("pass", data={
         "plan": found.plan, "left_for_a_person": found.left_for_a_person, "summary": res.text,
-        "goal": goal,
-        "feedback_keys": [pipeline.feedback_key(row) for row in run.feedback],
+        "goal": f"{found.goal}\n\nAlso check that each of these review findings is fixed:\n\n{findings}",
         "source": found.run_id, "evidence": found.evidence, "findings": count, "heads": heads, "moved": moved,
         "story": run.story}, session=run.sessions.get(BUILD, NO_SESSION))
 
