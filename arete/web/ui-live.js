@@ -1,7 +1,7 @@
 import { batch, signal } from "./vendor-signals.js";
 import * as data from "./ui-data.js";
 import { coherent, newer } from "./ui-snapshot.js";
-import { openEvents } from "./ui-events.js";
+import { boardTask, openEvents } from "./ui-events.js";
 import { webFetch } from "./ui-request.js";
 
 const TIMEOUT_MS = 3000;
@@ -99,6 +99,8 @@ async function versioned(url, signal, fallback, select = (body) => body) {
 }
 
 const legacy = (url, signal, text = false) => read(url, { text }, signal);
+const taskList = (signal, select) => versioned("/api/v1/tasks", signal, () => legacy("/api/tasks", signal), select);
+
 const malformed = () => ({ status: null, message: "Malformed response" });
 
 async function shell(signal, allowLegacy = () => true) {
@@ -145,11 +147,14 @@ function readers(screen, id, repo) {
     requests.queue = runQueue;
     if (id) requests.detail = projection("run", data.run(id).detail, id);
   }
-  if (screen === "board" || screen === "task") {
-    requests.tasks = (signal) => versioned("/api/v1/tasks", signal, () => legacy("/api/tasks", signal), (body) => ({
-      tasks: Array.isArray(body.tasks) ? [...body.tasks].sort((a, b) => b.updated.localeCompare(a.updated) || a.id.localeCompare(b.id)) : null,
+  if (screen === "board") {
+    requests.tasks = (signal) => data.boardTasks((url) => read(url, { versioned: true }, signal), () => taskList(signal));
+  }
+  if (screen === "task") {
+    requests.tasks = (signal) => taskList(signal, (body) => ({
+      tasks: Array.isArray(body.tasks) ? data.sortTasks(body.tasks) : null,
     }));
-    if (screen === "task" && id) {
+    if (id) {
       requests.task = projection("task", data.taskDetail(id, repo), /^t-[a-f0-9]+$/i.test(id) ? id.toLowerCase() : id);
     }
   }
@@ -160,10 +165,12 @@ function readers(screen, id, repo) {
 
 function publishShell(result) {
   if (result.data) {
-    cache.sidebar = result.data.sidebar;
+    const received = result.received ?? Date.now();
+    const keepBeat = result.unchanged && cache.sidebarAt >= received;
+    cache.sidebar = keepBeat ? { ...result.data.sidebar, serve: cache.sidebar.serve } : result.data.sidebar;
     cache.live = result.data.view;
     cache.questions = { data: result.data.asks };
-    cache.sidebarAt = Date.now();
+    if (!keepBeat) cache.sidebarAt = received;
   } else cache.questions = { data: cache.questions?.data, error: result.error };
   cache.errors = { sidebar: result.error ?? null, live: result.error ?? null };
   cache.failures = result.error ? cache.failures + 1 : 0;
@@ -336,9 +343,15 @@ async function flush(run) {
   const refreshDetailOnly = run.dirty.get("detail") && connectedAtStart && !run.incoherent && !missingDetail;
   run.dirty.clear();
   const latest = new Map();
-  const readShell = () => shell(signal, () => !periodicShell || !(connectedAtStart || transport));
+  run.readingBoard = run.screen === "board" && keys.includes("tasks");
+  const boardRead = run.readingBoard ? run.reads.tasks(signal) : null;
+  const readShell = async () => {
+    const board = !refreshShellOnly && await boardRead;
+    if (board?.shell) return { ...board, data: board.shell };
+    return shell(signal, () => !periodicShell || !(connectedAtStart || transport));
+  };
   const read = async (key) => {
-    const result = key === "shell" ? await readShell() : await run.reads[key](signal);
+    const result = await (key === "shell" ? readShell() : (key === "tasks" && boardRead) || run.reads[key](signal));
     if (!result) return null;
     latest.set(key, result);
     return result.data && result.seq ? result : null;
@@ -348,7 +361,7 @@ async function flush(run) {
   const fullDetail = grouped.includes("detail");
   const behind = (key, seq) => newer(run.positions.get(key), seq) || key === "detail"
     && (newer(run.positions.get("usage"), seq) || seq && newer(run.usageNeeded, seq));
-  run.duringRead = grouped.length ? [] : null;
+  run.duringRead = grouped.length || run.readingBoard ? [] : null;
   try {
     const [group, shellRefresh] = await Promise.all([
       grouped.length && coherent(grouped.map((key) => () => read(key)), (result) => result ? [result.seq] : []),
@@ -368,17 +381,24 @@ async function flush(run) {
       for (const [key, result] of latest) {
         const usageOnly = key === "detail" && refreshDetailOnly;
         if (grouped.includes(key) && result.data && (mismatch || key === "detail" && latest.get("shell")?.error)) continue;
+        if (run.readingBoard && key === "tasks" && result.data && behind(key, result.seq)) continue;
         if (usageOnly && result.data && behind(key, result.seq)) continue;
         if (result.data && !usageOnly) run.positions.set(key, result.seq);
         if (key === "detail" && result.data?.run?.id === rs.id) run.positions.set("usage", result.seq ?? run.usageNeeded);
-        if (key === "shell" && result.data) run.states.clear();
+        if (key === "shell" && result.data) {
+          run.states.clear();
+          run.runningIds = Array.isArray(result.data.runningIds) ? new Set(result.data.runningIds) : null;
+        }
         publish(key, result, usageOnly);
       }
       for (const event of run.duringRead ?? []) applyEvent(run, event);
       if (grouped.length || refreshDetailOnly) publishRuns();
     });
     run.duringRead = null;
-    feed?.baseline(latest.get("shell")?.seq ?? (fullDetail ? latest.get("detail")?.seq : null) ?? latest.get("queue")?.seq);
+    const shellSeq = latest.get("shell")?.seq;
+    const boardSeq = run.screen === "board" ? run.positions.get("tasks") : null;
+    feed?.baseline(boardSeq && newer(shellSeq, boardSeq) ? boardSeq
+      : shellSeq ?? boardSeq ?? (fullDetail ? latest.get("detail")?.seq : null) ?? latest.get("queue")?.seq);
     const detail = rs.detail?.run;
     if (fullDetail && detail?.kind === "pipeline" && detail.status !== "running") {
       run.reportUntil = Math.max(run.reportUntil, Date.parse(detail.finished) + REPORT_GRACE_MS || 0);
@@ -386,6 +406,7 @@ async function flush(run) {
     if (keys.includes("transcript") || fullDetail && detail && !mismatch) await readTranscript(run, signal);
   } finally {
     run.duringRead = null;
+    run.readingBoard = false;
     run.busy = false;
     schedule(run);
   }
@@ -414,11 +435,14 @@ function applyRun(run, event) {
   const running = row.status === "running";
   if (fresh("shell")) {
     const rows = cache.live?.live?.rows;
-    const was = run.states.get(id) ?? (rows?.runs ? Boolean(before(rows.runs)) :
+    const was = run.runningIds?.has(id) ?? run.states.get(id) ?? (rows?.runs ? Boolean(before(rows.runs)) :
       before(rs.queue)?.status === "running" || rs.detail?.run.id === id && rs.detail.run.status === "running"
         || event.kind === "run.ended");
     cache.sidebar = { ...cache.sidebar, running: Math.max(0, cache.sidebar.running + Number(running) - Number(was)) };
-    if (!rows?.runs) run.states.set(id, running);
+    if (run.runningIds) {
+      if (running) run.runningIds.add(id);
+      else run.runningIds.delete(id);
+    } else if (!rows?.runs) run.states.set(id, running);
     if (rows?.runs) floorRuns(running ? replace(rows.runs, { ...row, ticket: ticket(row), stopping: Boolean(row.stop_asked) })
       : rows.runs.filter((item) => item.id !== id));
     run.positions.set("shell", event.id);
@@ -461,9 +485,29 @@ function applyStep(run, event) {
   if (event.kind === "step.ended") refreshUsage(run, event.id);
 }
 
-function applyEvent(run, event) {
+function applyBoard(run, event) {
+  if (!newer(event.id, run.positions.get("tasks"))) return;
+  if (event.kind === "principal.changed" && event.data?.id && event.subject === `principal:${event.data.id}`) {
+    invalidate(run, ["tasks"]);
+    return;
+  }
+  const patch = boardTask(event);
+  const reads = screenReads.peek();
+  const rows = reads.tasks?.data?.tasks;
+  if (typeof patch?.updated !== "string" || !rows || !run.positions.has("tasks")) return;
+  const previous = rows.find((task) => task.id === patch.id);
+  const fromRun = event.kind.startsWith("run.");
+  if (fromRun && (!previous || previous.repo !== event.data.repo)) return;
+  run.positions.set("tasks", event.id);
+  if (previous?.version >= patch.version) return;
+  const tasks = data.sortTasks(previous ? rows.map((task) => task.id === patch.id ? { ...task, ...patch } : task) : [...rows, patch]);
+  screenReads.value = { ...reads, tasks: { ...reads.tasks, data: { tasks } } };
+}
+
+function applyEvent(run, event, includeBoard = true) {
   if (event.kind.startsWith("run.")) applyRun(run, event);
-  else applyStep(run, event);
+  else if (event.kind.startsWith("step.")) applyStep(run, event);
+  if (includeBoard && run.screen === "board") applyBoard(run, event);
 }
 
 function update(event) {
@@ -489,9 +533,10 @@ function update(event) {
       snapshot.value = snapshotOf();
     }
     if (rs.detail?.run.status === "running") invalidate(run, ["transcript"]);
-  } else if (event.kind.startsWith("run.") || event.kind.startsWith("step.")) {
+  } else if (event.kind.startsWith("run.") || event.kind.startsWith("step.")
+      || run.screen === "board" && (event.kind.startsWith("task.") || event.kind === "principal.changed")) {
     run.duringRead?.push(event);
-    batch(() => { applyEvent(run, event); publishRuns(); });
+    batch(() => { applyEvent(run, event, !run.readingBoard); publishRuns(); });
   } else if (event.kind === "turn.appended" && event.data?.run === run.id) invalidate(run, ["transcript"]);
 }
 
@@ -553,7 +598,9 @@ export function live(screen, id = "", repo = "") {
     if (run.queueError || needsDetail && !rs.detail) keys.push("queue");
     if (needsDetail) keys.push("detail");
     if (transcript && rs.detail?.run.status === "running") keys.push("transcript");
-    invalidate(run, transport && !run.incoherent ? keys : all(run), true);
+    const refreshKeys = transport && !run.incoherent ? keys : all(run);
+    const boardCurrent = run.screen === "board" && transport && run.positions.has("tasks") && !screenReads.peek().tasks?.error;
+    invalidate(run, boardCurrent ? refreshKeys.filter((key) => key !== "tasks") : refreshKeys, true);
   };
   run.visibility = () => refresh(true);
   document.addEventListener("visibilitychange", run.visibility);

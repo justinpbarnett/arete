@@ -11,10 +11,10 @@ export async function snapshotRead(url, signal) {
   const headers = saved?.etag ? { "If-None-Match": saved.etag } : {};
   const response = await webFetch(url, { headers, signal, cache: "no-store" });
   const seq = response.headers.get("Arete-Seq");
-  if (response.status === 304 && saved) return { data: saved.data, unchanged: true };
+  if (response.status === 304 && saved) return { data: saved.data, received: saved.received, unchanged: true };
   if (!response.ok) {
     const body = await response.json().catch(() => null);
-    return { seq, error: { status: response.status, message: body?.detail ?? body?.error ?? `HTTP ${response.status}` } };
+    return { seq, error: { status: response.status, code: body?.code, message: body?.detail ?? body?.error ?? `HTTP ${response.status}` } };
   }
   const body = await response.json().catch(() => null);
   const position = seq ?? body?.seq;
@@ -22,16 +22,34 @@ export async function snapshotRead(url, signal) {
     return { error: { status: response.status, message: "Malformed snapshot" } };
   }
   const data = { ...body, seq: position };
+  const received = Date.now();
   if (!signal.aborted) {
     snapshots.delete(url);
-    snapshots.set(url, { etag: response.headers.get("ETag"), data });
+    snapshots.set(url, { etag: response.headers.get("ETag"), data, received });
     if (snapshots.size > 32) snapshots.delete(snapshots.keys().next().value);
   }
-  return { data };
+  return { data, received };
 }
 
 export const screen = (view, id = "") => `/api/v1/screen?${new URLSearchParams(id ? { view, id } : { view })}`;
 export const lineStream = (run, after) => `/api/v1/line-stream?${new URLSearchParams({ run, after })}`;
+export const sortTasks = (tasks) => [...tasks].sort((a, b) => b.updated.localeCompare(a.updated) || a.id.localeCompare(b.id));
+
+export async function boardTasks(read, readTasks) {
+  let result = await read(screen("board"));
+  const { error } = result;
+  const unknownView = error?.status === 400 && error.code === "invalid_input" && error.message === "Unknown view board";
+  if (error?.status === 404 || unknownView) {
+    result = await readTasks();
+  }
+  const { view, tasks = view?.tasks, sidebar, asks } = result.data ?? {};
+  if (!Array.isArray(tasks) || tasks.some((task) => typeof task?.updated !== "string" || typeof task.id !== "string")) {
+    return { error: result.error ?? { status: null, message: "Malformed response" } };
+  }
+  const shell = Number.isInteger(sidebar?.running) && Array.isArray(asks?.asks)
+    ? { sidebar, asks, view: { live: {} }, runningIds: view?.running_ids } : null;
+  return { ...result, data: { tasks: sortTasks(tasks) }, shell };
+}
 
 export function visit(row) {
   return sendWrite(prepareWrite("/api/usage",{ kind: "visit", ...row }, null, { keepalive: true })).catch(() => null);

@@ -3,6 +3,8 @@ import { setTimeout as delay } from "node:timers/promises";
 import { openEvents } from "../arete/web/ui-events.js";
 import { prepareWrite, sendWrite } from "../arete/web/ui-write.js";
 import { clientNotice, staleWrite } from "../arete/web/ui-notice.js";
+import { parse } from "../arete/web/ui-router.js";
+import { TaskQueue } from "../arete/web/ui-work.js";
 import { effect } from "../arete/web/vendor-signals.js";
 
 const locks = {
@@ -489,6 +491,159 @@ async function snapshots() {
   }
 }
 
+async function boardSnapshots() {
+  const calls = [];
+  const task = { id: "t-1234", repo: "sample", title: "Board card", state: "todo", updated: "1", version: 1 };
+  const closed = { ...task, id: "t-9999", state: "closed" };
+  let rows = [task, closed];
+  let seq = "9.10";
+  let boardStatus = 200;
+  let boardProblem;
+  let taskListStatus = 200;
+  let holdBoard = false;
+  let releaseBoard;
+  const { setInterval: interval, Date: { now } } = globalThis;
+  let clock = now();
+  Date.now = () => clock;
+  let refresh;
+  globalThis.setInterval = (fn, ms, ...args) => ms === 5000 ? (refresh = fn, null) : interval(fn, ms, ...args);
+  globalThis.fetch = async (path, options) => {
+    const key = new URL(path, "http://dashboard.test").searchParams.get("view") ?? path;
+    const tag = `"${key}-${seq}"`;
+    const validator = options.headers.get("If-None-Match");
+    const configured = key === "board" ? boardStatus : key === "/api/v1/tasks" ? taskListStatus : 200;
+    const status = configured !== 200 ? configured : validator === tag ? 304 : 200;
+    calls.push({ key, status, validator });
+    if (status >= 400) return json(key === "board" ? boardProblem ?? { error: "Board unavailable" }
+      : { detail: "Task list unavailable" }, status);
+    const headers = { ETag: tag, "Arete-Seq": seq };
+    if (key === "board" && holdBoard) await new Promise((resolve) => { releaseBoard = resolve; });
+    if (status === 304) return new Response(null, { status, headers });
+    const running = seq === "9.10" ? 1 : 0;
+    const shell = { sidebar: { running, needs_you: running ? 0 : 1, serve: { age_seconds: 0 } }, asks: { asks: [] } };
+    if (key === "board") return json({ ...shell, view: { tasks: rows, running_ids: running ? ["already-running"] : [] } }, 200, headers);
+    if (key === "/api/v1/tasks") return json({ tasks: rows }, 200, headers);
+    if (key === "/api/tasks") return json({ tasks: rows });
+    assert.equal(key, "live");
+    return json({ ...shell, view: { live: { rows: { runs: [] } } } }, 200, headers);
+  };
+  const open = (hash) => { const route = parse(hash); return ui.live(route.screen, ...route.path); };
+  const last = () => streams.at(-1);
+  const boardCalls = () => calls.filter(({ key }) => key === "board");
+  const taskListCalls = () => calls.filter(({ key }) => key === "/api/v1/tasks" || key === "/api/tasks");
+  const tasks = () => ui.screenReads.value.tasks;
+  const state = () => tasks().data.tasks.find((row) => row.id === task.id).state;
+  const columns = (hash) => {
+    const queue = new TaskQueue().render({ route: parse(hash), resource: tasks() }, { query: "" });
+    const groups = queue.props.children(tasks().data).props.children[1];
+    return Object.fromEntries(groups.filter(Boolean).map((group) => {
+      const [label, , count] = group.props.children[0].props.children;
+      return [label, count.props.children];
+    }));
+  };
+  const sendRun = (id, kind, status, row, subject = "run:board-run") => last().send({ id, kind, subject,
+    data: { id: "board-run", issue: task.id, repo: task.repo, status, board_task: row } });
+  try {
+    open("#board");
+    await until(() => last().url.searchParams.get("since") === "9.10", "Board keeps its own snapshot cursor");
+    last().open();
+    assert.equal(state(), "todo");
+    assert.deepEqual(calls.map(({ key }) => key), ["board"]);
+    assert.equal(ui.snapshot.value.running, 1);
+    last().send(event("9.11", "run.changed", { id: "already-running", status: "running" }));
+    assert.equal(ui.snapshot.value.running, 1, "a change to a run already in the snapshot leaves the badge unchanged");
+    clock += 61000;
+    assert.equal(ui.connectivity(ui.snapshot.value, clock), "STALE");
+    holdBoard = true;
+    open("#board/open-work");
+    await until(() => releaseBoard, "Open work reads the Board projection once");
+    assert.deepEqual(calls.map(({ key }) => key), ["board", "board"]);
+    assert.deepEqual(boardCalls().at(-1), { key: "board", status: 304, validator: '"board-9.10"' });
+
+    const running = { ...task, state: "running", updated: "2", version: 2 };
+    sendRun("9.12", "run.started", "running", task);
+    assert.equal(state(), "todo", "a registered run can precede the stored task transition");
+    last().send({ id: "9.13", kind: "task.changed", subject: `task:${task.id}`, data: running });
+    holdBoard = false;
+    releaseBoard();
+    await until(() => state() === "running", "an event during the conditional read moves the cached card");
+    assert.equal(ui.connectivity(ui.snapshot.value, clock), "STALE", "the Board 304 preserves heartbeat age");
+    last().send({ kind: "serve.beat", at: "new heartbeat", age_seconds: 0 }, "serve.beat", "9.13");
+    assert.equal(ui.connectivity(ui.snapshot.value, clock), "");
+    assert.deepEqual(columns("#board"), { Running: 1, Closed: 1 });
+    assert.deepEqual(columns("#board/open-work"), { Running: 1 });
+    const review = { ...task, state: "pr", updated: "3", version: 3 };
+    sendRun("9.14", "run.changed", "pr", review, "run:other-run");
+    assert.equal(state(), "running");
+    sendRun("9.15", "run.changed", "running", review);
+    assert.equal(state(), "pr", "run events apply the task snapshot even if run status differs");
+    const done = { ...task, state: "done", updated: "4", version: 4 };
+    sendRun("9.16", "run.ended", "pr", done);
+    assert.equal(state(), "done");
+    seq = "9.17";
+    last().send(event(seq, "run.ended", { id: "already-running", status: "done" }));
+    assert.equal(ui.snapshot.value.running, 0, "ending the pre-existing run clears the badge");
+    assert.equal(tasks().data.tasks.find((row) => row.id === closed.id).state, "closed");
+    refresh();
+    await until(() => ui.snapshot.value.needsYou === 1, "shell refresh is independent");
+    assert.equal(ui.snapshot.value.running, 0, "refresh leaves the finished run off the badge");
+    assert.equal(calls.filter(({ key }) => key === "live").length, 1);
+    assert.equal(boardCalls().length, 2);
+    assert.equal(taskListCalls().length, 0);
+
+    seq = "9.18";
+    rows = [done, closed];
+    last().send({ id: seq, kind: "principal.changed", subject: "principal:u:1234", data: { id: "u:1234" } });
+    await until(() => boardCalls().length === 3, "principal changes revalidate Board access");
+    assert.equal(boardCalls().at(-1).validator, '"board-9.10"');
+    boardStatus = 503;
+    open("#board");
+    await until(() => tasks().error?.status === 503, "service errors surface without falling back");
+    assert.equal(taskListCalls().length, 0);
+    boardStatus = 404;
+    open("#board");
+    await until(() => taskListCalls().length === 1 && !tasks().error, "missing Board uses the v1 task list");
+    assert.equal(state(), "done");
+    assert.deepEqual(columns("#board"), { Done: 1, Closed: 1 });
+
+    boardStatus = 400;
+    for (const problem of [{ code: "invalid_input", detail: "Invalid id" }, { code: "invalid_fields", detail: "Unknown view board" }]) {
+      boardProblem = problem;
+      open("#board");
+      await until(() => tasks().error?.message === problem.detail, "unrelated 400 surfaces without falling back");
+      assert.equal(taskListCalls().length, 1);
+    }
+    boardProblem = { code: "invalid_input", detail: "Unknown view board" };
+    open("#board/open-work");
+    await until(() => taskListCalls().length === 2 && !tasks().error, "the pinned server's unknown Board 400 uses the v1 task list");
+    assert.equal(state(), "done");
+
+    boardStatus = 404;
+    boardProblem = undefined;
+    taskListStatus = 404;
+    for (const [hash, counts] of [["#board", { Running: 1, Closed: 1 }], ["#board/open-work", { Running: 1 }]]) {
+      const start = calls.length;
+      rows = [{ ...running, title: `Recovered ${hash}` }, closed];
+      open(hash);
+      await until(() => tasks().data?.tasks[0]?.title === rows[0].title && !tasks().error, `${hash} renders the legacy task list`);
+      assert.deepEqual(calls.slice(start).filter(({ key }) => key !== "live").map(({ key, status }) => [key, status]),
+        [["board", 404], ["/api/v1/tasks", 404], ["/api/tasks", 200]]);
+      assert.deepEqual(columns(hash), counts);
+    }
+
+    taskListStatus = 503;
+    const start = taskListCalls().length;
+    open("#board");
+    await until(() => tasks().error?.message === "Task list unavailable", "a v1 task list service failure surfaces");
+    assert.deepEqual(taskListCalls().slice(start).map(({ key, status }) => [key, status]), [["/api/v1/tasks", 503]]);
+  } finally {
+    ui.stop();
+    Date.now = now;
+    globalThis.setInterval = interval;
+  }
+}
+
 await transport(false);
 await transport(true);
 await snapshots();
+await boardSnapshots();
