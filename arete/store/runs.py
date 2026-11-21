@@ -153,10 +153,11 @@ def open_runs(repo: str, issue: int | str) -> list[dict]:
                                            "ORDER BY started DESC", (repo, issue))]
 
 
-def latest_pr_runs(repo: str) -> list[dict]:
+def latest_held_drafts(repo: str) -> list[dict]:
     with reader() as c:
         return [dict(r) for r in c.execute(
-            f"SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND {WHOLE_RUN} AND status = 'pr' "
+            f"SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND {WHOLE_RUN} "
+            "AND (status = 'pr' OR (status = 'interrupted' AND environment_retry_of IS NOT NULL)) "
             "AND pr_url != '' AND files_purged IS NULL AND NOT EXISTS (SELECT 1 FROM runs newer "
             "WHERE newer.kind = 'pipeline' AND newer.repo = runs.repo AND newer.issue = runs.issue "
             "AND COALESCE(newer.only_step, '') = '' AND newer.rowid > runs.rowid) ORDER BY started, id", (repo,))]

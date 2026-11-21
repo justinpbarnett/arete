@@ -8,13 +8,21 @@ from errno import errorcode
 from pathlib import Path
 
 from . import ci, codebase, config, control, factory, gh, outbound, paths, pipeline, run_lines, tracker, util, vault
+from .store import runs as run_store
 from .verify import Verified
 
 STEP_PATHS = ("feature", "patch")
 RESUME_PATHS = (*STEP_PATHS, "classic", "orchestrate")
 SANDBOX_DENIAL = re.compile(r"\bsandbox_apply:\s*Operation not permitted\b", re.IGNORECASE)
-ERROR_CODES = re.compile(r"\b(?:" + "|".join(sorted(set(errorcode.values()) |
-                         {"EAI_AGAIN", "EAI_FAIL", "EAI_NONAME", "ENOTFOUND"})) + r")\b", re.IGNORECASE)
+OPERATIONS = r"access|bind|chmod|chown|connect|execve|fork|getaddrinfo|listen|mkdir|open|read|rename|spawn|stat|unlink|write"
+ERROR_CODES = "|".join(sorted(set(errorcode.values()) | {"EAI_AGAIN", "EAI_FAIL", "EAI_NONAME", "ENOTFOUND"}))
+OPERATION_ERRORS = re.compile(rf"\b({OPERATIONS})(?:\s*:\s*|\s+)({ERROR_CODES})\b", re.IGNORECASE)
+ERROR_INTRO = re.compile(
+    r"^(?:(?:the\s+)?(?:command|driver|probe|process|check|verifier)\s+)?"
+    r"(?:exit(?:ed)?(?:\s+with)?\s+(?:(?:exit\s+)?(?:status|code)\s+)?-?\d+"
+    r"(?:\s+(?:with|and\s+(?:printed|reported)))?\s*[:,-]?\s+"
+    r"|failed\s+with\s+(?:(?:the\s+following\s+)?(?:error|output)\b\s*,?\s*:?\s*)?"
+    r"|(?:stderr|error output)\s*:\s*)", re.IGNORECASE)
 
 
 def normalized(text: str) -> str:
@@ -30,10 +38,21 @@ def safe_text(text: str) -> str:
 
 
 def signatures(text: str) -> tuple[str, ...]:
-    codes = {code.upper() for code in ERROR_CODES.findall(text)}
+    errors = {f"{op.lower()} {code.upper()}" for op, code in OPERATION_ERRORS.findall(text)}
     if SANDBOX_DENIAL.search(text):
-        return ("sandbox_apply: Operation not permitted", *sorted(codes - {"EPERM"}))
-    return tuple(sorted(codes))
+        errors.add("sandbox_apply: Operation not permitted")
+    return tuple(sorted(errors))
+
+
+def error_text(text: str) -> str:
+    text = text.strip()
+    while match := ERROR_INTRO.match(text):
+        text = text[match.end():].strip()
+    if quoted := re.fullmatch(r"([`\"'])(.+)\1[.!]?", text, re.DOTALL):
+        text = quoted[2].strip()
+    if fenced := re.fullmatch(r"```[^\n]*\n(.+)\n```[.!]?", text, re.DOTALL):
+        text = fenced[1].strip()
+    return text.removesuffix(".").rstrip()
 
 
 @dataclass(frozen=True)
@@ -44,11 +63,15 @@ class Gap:
 
     @property
     def error(self) -> str:
-        return ", ".join(signatures(self.saw)) or self.saw
+        return ", ".join(signatures(self.saw)) or error_text(self.saw) or self.saw
 
     @property
     def key(self) -> str:
         return digest(normalized(self.error))
+
+    @property
+    def legacy_key(self) -> str:
+        return digest(normalized(", ".join(signatures(self.saw)) or self.saw))
 
     def matches(self, title: str, body: str) -> bool:
         if known := signatures(self.saw):
@@ -60,22 +83,25 @@ class Gap:
 
 
 def gaps(data: dict) -> list[Gap]:
+    if data.get("verdict") != "blocked":
+        return []
     verified = Verified.stored(data)
     failed = verified.failed_checks
-    if verified.verdict != "blocked" or not verified.finished or not failed:
+    if not failed:
         return []
-    if any(c.get("cause") != "environment" or not c.get("saw") or not c.get("what") for c in failed):
+    if any(c.get("passed") is not False or normalized(str(c.get("cause") or "")) != "environment" for c in failed):
         return []
     found = [Gap(*(safe_text(str(c.get(field) or "")).strip() for field in ("what", "how", "saw"))) for c in failed]
-    return list({gap.key: gap for gap in found if gap.saw and gap.what}.values())
+    return list({gap.key: gap for gap in found}.values()) if all(gap.saw and gap.what for gap in found) else []
 
 
 def last_data(lines: list[dict], step: str) -> dict:
     return next((factory.outcome_of(line).data for line in reversed(lines) if line.get("step") == step), {})
 
 
-def was_retry(run_id: str) -> bool:
-    return bool(factory.first(run_lines.read(run_id), "execution").get("environment_release"))
+def was_retry(row: dict) -> bool:
+    return bool(row.get("environment_retry_of")
+                or factory.first(run_lines.read(row["id"]), "execution").get("environment_release"))
 
 
 def verification_action(run_id: str) -> str:
@@ -91,22 +117,22 @@ def verification_action(run_id: str) -> str:
 class Hold:
     gaps: list[Gap]
     heads: dict[str, str]
+    retried: bool = False
     repeated: bool = False
-    earlier_gaps: tuple[Gap, ...] = ()
 
 
 def hold_of(run_id: str) -> Hold | None:
     chain = factory.chain(run_id)
-    previous = factory.first(chain[0], "route").get("continues") or ""
-    own_verify = last_data(factory.ends(chain[0]), "verify")
-    if factory.first(chain[0], "execution").get("environment_release"):
-        if not previous or len(chain) <= 1 or own_verify.get("ending") != "environment-held":
+    row = run_store.run_get(run_id) or {"id": run_id}
+    if was_retry(row):
+        previous = row.get("environment_retry_of") or factory.first(chain[0], "route").get("continues")
+        own_verify = last_data(factory.ends(chain[0]), "verify")
+        if not previous or previous == run_id or own_verify.get("ending") != "environment-held":
             return None
         prior = hold_of(previous)
         found = gaps(own_verify.get("verified") or {})
         if prior and found:
-            earlier = (*prior.earlier_gaps, *prior.gaps)
-            return Hold(found, prior.heads, any(g.repeats(old) for g in found for old in earlier), earlier)
+            return Hold(found, prior.heads, retried=True, repeated=any(g.repeats(old) for g in found for old in prior.gaps))
         return None
     history = factory.history(chain)
     classic = factory.first(chain[0], "classic_hold")
@@ -145,8 +171,22 @@ def release_repo(cfg: config.Config) -> config.Repo | None:
     return next((repo for repo in cfg.repos if repo.name == cfg.arete_repo and repo.github), None)
 
 
+def shared_audience(repo: config.Repo, release: config.Repo, hold: Hold) -> bool:
+    pulls = [re.fullmatch(r"https://github\.com/([\w.-]+/[\w.-]+)/pull/[1-9][0-9]*/?", url) for url in hold.heads]
+    if not all(pulls):
+        return False
+    repos = {name.casefold() for name in (repo.github, release.github, *(part.github for part in repo.parts),
+                                        *(pull[1] for pull in pulls))}
+    return all(re.fullmatch(r"[\w.-]+/[\w.-]+", name) for name in repos) and (
+        len(repos) == 1 or all(gh.repo_public(name) for name in sorted(repos)))
+
+
+def release_base(repo: config.Repo) -> str:
+    return config.load_layer(repo.layer_dir).base_branch or gh.default_branch(repo.github)
+
+
 def release_contains_fixes(repo: config.Repo, numbers: list[int], sha: str) -> bool:
-    base = config.load_layer(repo.layer_dir).base_branch or gh.default_branch(repo.github)
+    base = release_base(repo)
     fixes = [gh.issue_merge_commit(repo.github, n, base) for n in numbers]
     return bool(fixes and all(fixes) and gh.branch_contains(repo.github, base, sha)
                 and all(gh.branch_contains(repo.github, sha, fix) for fix in fixes))
@@ -166,37 +206,71 @@ class Journal:
     def save(self) -> None:
         util.write_json(self.path, self.data)
 
-    def issue_for(self, repo: str, own: tuple[str, int], run_id: str, gap: Gap,
+    def linked_issue(self, repo: str, run_id: str, gap: Gap) -> int | None:
+        links = self.holds.get(run_id, {})
+        return links.get(f"{repo.casefold()}:{gap.key}") or links.get(f"{repo.casefold()}:{gap.legacy_key}")
+
+    def issue_for(self, repo: str, base: str, own: tuple[str, int], run_id: str, gap: Gap,
                   waits: list[tuple[str, int]], dry_run: bool) -> int | None:
-        issue_key = f"{repo.casefold()}:{gap.key}"
-        if number := self.holds.get(run_id, {}).get(issue_key):
-            return number
+        scope = repo.casefold()
+        issue_key = f"{scope}:{gap.key}"
+
+        def linkable(number: int | None) -> bool:
+            return type(number) is int and number > 0 and (scope, number) != own
+
         today = util.now().date().isoformat()
         key = f"environment-gap-{gap.key}-{today}"
-        creation = self.creations.get(issue_key) or {}
-        scope = repo.casefold()
+        legacy_key = f"environment-gap-{gap.legacy_key}-{today}"
+        creation = self.creations.get(issue_key) or self.creations.get(f"{scope}:{gap.legacy_key}") or {}
+        markers = {gh.key_mark(key), gh.key_mark(legacy_key)}
+
+        def eligible(issue: dict) -> bool:
+            return (linkable(issue.get("number")) and own not in tracker.github_waits(issue.get("body") or "", repo)
+                    and any(label.get("name") == tracker.LABEL for label in issue.get("labels", [])))
 
         def matches(issue: dict) -> bool:
-            body = issue.get("body") or ""
-            return ((scope, issue.get("number")) != own and own not in tracker.github_waits(body, repo)
-                    and gap.matches(issue.get("title") or "", body))
+            return eligible(issue) and gap.matches(issue.get("title") or "", issue.get("body") or "")
 
-        linked = (gh.issue(repo, n) or {} for ref, n in waits if ref == scope and (ref, n) != own)
-        number = next((i["number"] for i in linked if matches(i)
-                       and any(label.get("name") == tracker.LABEL for label in i.get("labels", []))), None)
+        previous = self.linked_issue(repo, run_id, gap)
+        current = {}
+        if linkable(previous):
+            current = gh.issue(repo, previous) or {}
+            if eligible(current):
+                if current.get("state") == "OPEN" or (current.get("state") == "CLOSED"
+                        and gh.issue_merge_commit(repo, previous, base)):
+                    return previous
+            if current.get("state") != "CLOSED":
+                return None
+        else:
+            previous = None
+        linked = [gh.issue(repo, n) or {} for ref, n in waits if ref == scope and (ref, n) != own and n != previous]
+        if previous:
+            closed = gh.issues(repo, tracker.LABEL, state="closed", limit=tracker.MAX_AGENT_ISSUES)
+            replacements = [i for i in linked if i.get("state") == "CLOSED" and matches(i)]
+            replacements.extend(i for i in closed if matches(i) and i["number"] > previous)
+            for number in sorted({i["number"] for i in replacements}, reverse=True):
+                if gh.issue_merge_commit(repo, number, base):
+                    return number
+        number = next((i["number"] for i in linked if i.get("state") == "OPEN" and matches(i)), None)
         if not number:
             opened = gh.issues(repo, tracker.LABEL, limit=tracker.MAX_AGENT_ISSUES)
             number = min((i["number"] for i in opened if matches(i)), default=None)
-        if not number and creation.get("day") == today:
+        if number or previous:
+            return number or (previous if eligible(current) else None)
+        if creation.get("day") == today:
             number = creation.get("number")
-            if not number and (url := gh.find_issue_marker(repo, gh.key_mark(key))):
-                number = int(url.rsplit("/", 1)[-1])
             if not number:
+                for marker in sorted(markers):
+                    if url := gh.find_issue_marker(repo, marker):
+                        number = int(url.rsplit("/", 1)[-1])
+                        break
+            if not linkable(number) or not eligible(gh.issue(repo, number) or {}):
                 return None
         if not number and not dry_run:
             recent = gh.issues(repo, state="all", limit=tracker.MAX_AGENT_ISSUES, search=f"created:{today}")
-            number = next((i["number"] for i in recent if gh.key_mark(key) in (i.get("body") or "").splitlines()), None)
-            if not number:
+            if marked := [i for i in recent if markers.intersection((i.get("body") or "").splitlines())]:
+                number = next((i["number"] for i in marked if eligible(i)), None)
+            else:
                 self.creations[issue_key] = {"day": today}
                 self.save()
                 checks = "\n\n".join(f"{name}\n\n{indented(value)}" for name, value in (
@@ -212,25 +286,30 @@ class Journal:
                     self.save()
                     raise
                 self.creations[issue_key]["number"] = number
-        if number and not dry_run:
-            self.holds.setdefault(run_id, {})[issue_key] = number
-            self.save()
-        return number
+                self.save()
+        return number if linkable(number) else None
 
-    def notice(self, url: str, key: str, message: str, dry_run: bool = False) -> bool:
-        key = "environment-gap-" + digest(f"{url}\n{key}")
+    def notice(self, url: str, event: str, message: str, dry_run: bool = False,
+               *, ticket: tuple[str, int] | None = None) -> bool:
+        key = notice_key(url, event)
         state = self.notices.get(key)
         if state == "sent":
             return True
-        if state == "pending":
-            if not gh.find_issue_comment_marker(gh.pr_repo(url), gh.pr_number(url), gh.key_mark(key)):
-                return False
-        elif not dry_run:
+        repo, number = ticket or (gh.pr_repo(url), gh.pr_number(url))
+        found = state in ("pending", "uncertain") and gh.find_issue_comment_marker(repo, number, gh.key_mark(key))
+        if state == "uncertain" and not found:
+            return False
+        if not found and not dry_run:
             self.notices[key] = "pending"
             self.save()
             try:
-                gh.pr_comment(url, message, key=key, single_attempt=True)
+                if ticket:
+                    gh.issue_comment(repo, number, message, key=key, single_attempt=True)
+                else:
+                    gh.pr_comment(url, message, key=key, single_attempt=True)
             except gh.GhUnsure:
+                self.notices[key] = "uncertain"
+                self.save()
                 raise
             except gh.GhError:
                 del self.notices[key]
@@ -240,6 +319,10 @@ class Journal:
             self.notices[key] = "sent"
             self.save()
         return True
+
+
+def notice_key(url: str, event: str) -> str:
+    return "environment-gap-" + digest(f"{url}\n{event}")
 
 
 def indented(text: str) -> str:
@@ -255,23 +338,38 @@ def open_ticket(source: tracker.GitHubTracker, number: int) -> dict:
     return {}
 
 
+def ticket_wait_event(run_id: str, release: str, numbers: list[int]) -> str:
+    return f"{run_id}-ticket-wait-{release.casefold()}-{','.join(map(str, sorted(numbers)))}"
+
+
+def ticket_wait_published(journal: Journal, repo: str, number: int, key: str) -> bool:
+    return journal.notices.get(key) == "sent" and bool(gh.find_issue_comment_marker(repo, number, gh.key_mark(key)))
+
+
 def confirm_retry(cfg: config.Config, repo: config.Repo, row: dict, sha: str) -> bool:
     tid = str(row.get("issue") or "")
     if (repo.tracker != "github" or not re.fullmatch(r"[1-9][0-9]*", tid)
-            or row.get("status") != "pr" or not row.get("pr_url") or live_release() != sha
+            or row.get("status") != "pr" or not row.get("pr_url") or was_retry(row) or live_release() != sha
             or pipeline.pending_feedback(repo.name, tid)):
         return False
-    if not (release := release_repo(cfg)) or not (hold := hold_of(row["id"])) or hold.repeated or not owned_drafts(row, hold):
+    if (not (release := release_repo(cfg)) or not (hold := hold_of(row["id"]))
+            or not shared_audience(repo, release, hold) or not owned_drafts(row, hold)):
         return False
     source = tracker.GitHubTracker(repo)
-    ticket = open_ticket(source, int(tid))
+    if not (ticket := open_ticket(source, int(tid))):
+        return False
+    run_id = row["id"]
     waits = tracker.github_waits(ticket.get("body") or "", repo.github)
     journal = Journal(paths.STATE_DIR / "environment-gaps.json")
-    links = journal.holds.get(row["id"], {})
+    linked = [journal.linked_issue(release.github, run_id, gap) for gap in hold.gaps]
+    if not linked or any(type(n) is not int or n <= 0 for n in linked):
+        return False
+    numbers = list(dict.fromkeys(linked))
     scope = release.github.casefold()
-    numbers = list(dict.fromkeys(links.get(f"{scope}:{gap.key}") for gap in hold.gaps))
     required = [(scope, n) for n in numbers]
-    return (all(ref in waits for ref in required)
+    key = notice_key(gh.issue_url(repo.github, tid), ticket_wait_event(run_id, release.github, numbers))
+    return ((repo.github.casefold(), int(tid)) not in required
+            and (all(ref in waits for ref in required) or ticket_wait_published(journal, repo.github, int(tid), key))
             and not source.wait_blocker([ref for ref in waits if ref not in required])
             and release_contains_fixes(release, numbers, sha))
 
@@ -287,37 +385,53 @@ def handle(cfg: config.Config, repo: config.Repo, row: dict, journal: Journal, d
     run_id, tid = row["id"], str(row["issue"])
     if (not re.fullmatch(r"[1-9][0-9]*", tid) or tid in oncall.parked(repo.name)
             or pilot.is_pilot_task(tid) or zte.reserved(tid) or tasks.pending_start(repo.name, tid)
-            or (path := pipeline.recorded_path(run_id)) not in RESUME_PATHS
+            or ((path := pipeline.recorded_path(run_id)) not in RESUME_PATHS and not row.get("environment_retry_of"))
             or (path in STEP_PATHS and cfg.adws and cfg.adws.resolve() != paths.ADWS_DIR.resolve())):
         return False
-    if not (release := release_repo(cfg)) or not (hold := hold_of(run_id)) or not owned_drafts(row, hold):
+    if (not (release := release_repo(cfg)) or not (hold := hold_of(run_id))
+            or not shared_audience(repo, release, hold) or not owned_drafts(row, hold)):
         return False
     source = tracker.GitHubTracker(repo)
     if not (ticket := open_ticket(source, int(tid))):
         return False
-    if hold.repeated:
+    if hold.retried:
         if not dry_run:
+            gap = "the same environment gap again" if hold.repeated else "another environment gap"
             for url in hold.heads:
-                journal.notice(url, f"{run_id}-retry", f"Verification in run `{run_id}` hit the same environment "
-                               "gap again after the automatic retry. The PR stays a draft for a person to check.")
+                journal.notice(url, f"{run_id}-retry", f"Verification in run `{run_id}` hit {gap} "
+                               "after the automatic retry. The PR stays a draft for a person to check.")
         return False
     waits = tracker.github_waits(ticket.get("body") or "", repo.github)
     own = repo.github.casefold(), int(tid)
-    needed = [journal.issue_for(release.github, own, run_id, gap, waits, dry_run) for gap in hold.gaps]
-    numbers = list(dict.fromkeys(n for n in needed if n))
-    required = [(release.github.casefold(), n) for n in numbers]
+    scope = release.github.casefold()
+    base = release_base(release)
+    needed = [journal.issue_for(release.github, base, own, run_id, gap, waits, dry_run) for gap in hold.gaps]
+    if not all(needed):
+        return False
+    numbers = list(dict.fromkeys(needed))
+    required = [(scope, n) for n in numbers]
     if not dry_run:
         if not (ticket := open_ticket(source, int(tid))):
             return False
-        body = ticket.get("body") or ""
-        waits = tracker.github_waits(body, repo.github)
-        missing = [n for ref, n in required if (ref, n) not in waits]
-        if missing:
-            if not gh.issue_add_waits(repo.github, int(tid), body, displayed_refs(repo.github, release.github, missing)):
-                return False
-            waits.extend((release.github.casefold(), n) for n in missing)
-    if not all(needed) or any(ref not in waits for ref in required):
-        return False
+        waits = tracker.github_waits(ticket.get("body") or "", repo.github)
+    previous = {journal.linked_issue(release.github, run_id, gap) for gap in hold.gaps}
+    superseded = sorted(previous - set(numbers) - {None})
+    ticket_url = gh.issue_url(repo.github, tid)
+    event = ticket_wait_event(run_id, release.github, numbers)
+    missing = any(ref not in waits for ref in required)
+    if superseded or missing:
+        message = "Waits on " + ", ".join(displayed_refs(repo.github, release.github, numbers))
+        if superseded:
+            old_refs = tracker.joined(displayed_refs(repo.github, release.github, superseded))
+            message += f"\n\nSupersedes the environment gap dependency on {old_refs}."
+        if not journal.notice(ticket_url, event, message, dry_run, ticket=(repo.github, int(tid))):
+            return False
+    if not dry_run:
+        links = journal.holds.setdefault(run_id, {})
+        updated = {f"{scope}:{gap.key}": n for gap, n in zip(hold.gaps, needed, strict=True)}
+        if any(links.get(key) != n for key, n in updated.items()):
+            links.update(updated)
+            journal.save()
     refs = tracker.joined(displayed_refs(repo.github, release.github, numbers))
     for url in hold.heads:
         links = tracker.joined(displayed_refs(gh.pr_repo(url), release.github, numbers))
@@ -333,6 +447,10 @@ def handle(cfg: config.Config, repo: config.Repo, row: dict, journal: Journal, d
     layer = config.load_layer(repo.layer_dir)
     if not release_contains_fixes(release, numbers, sha):
         return False
+    key = notice_key(ticket_url, event)
+    if missing and (not dry_run or journal.notices.get(key) == "sent"):
+        if not ticket_wait_published(journal, repo.github, int(tid), key):
+            return False
     if runlimits.admission(repo, tid, source, runlimits.Policy.of(layer), False)[0]:
         return False
     if not dry_run:

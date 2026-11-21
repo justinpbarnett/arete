@@ -1346,6 +1346,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         if not got:
             print(f"{name} is already running")
             return 0
+        retry_of = {}
         if script and script.environment_release:
             from . import environment_gaps
 
@@ -1354,6 +1355,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     or not environment_gaps.confirm_retry(cfg, repo, source, script.environment_release)):
                 print(f"{name}: the held draft or its release evidence changed before verification could restart")
                 return 2
+            retry_of = {"environment_retry_of": source["id"], "pr_url": source["pr_url"], "branch": source["branch"]}
         try:
             layer = config.load_layer(repo.layer_dir)
             wall_deadline = math.inf
@@ -1432,7 +1434,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     return 2
             def start():
                 return record.start("pipeline", tag=f"{repo.name}-{tid}", lock=lock, repo=repo.name, issue=tid,
-                                    only_step=only, dry_run=int(dry_run))
+                                    only_step=only, dry_run=int(dry_run), **retry_of)
 
             def check_start_cutoff():
                 pilot.require(time.monotonic() < wall_deadline, "ZTE deadline expired during run startup")
@@ -1491,6 +1493,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                                     **({"environment_release": run.environment_release} if run.environment_release else {}))
             except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
                 if not zte_grant:
+                    slot.free()
                     raise
                 return settle_zte_refusal(repo.name, str(tid), slot, run_id, error, committed=True)
             if held_from := earlier["id"] if restarting or run.answering else (
@@ -1624,7 +1627,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         finally:
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
             if run.workspace and not zte_grant:
-                keep_edits(run)
+                if not run.environment_release or ("requirements" in run.facts and flows.retry_passed(flow.ctx.verified)):
+                    keep_edits(run)
                 workspace.note_made(*run.workspace, workspace_owner(run, *run.workspace))
             slot.free()
         try:
@@ -3495,7 +3499,7 @@ def tell_ticket_run_died(cfg: config.Config, row: dict) -> None:
     elif row["status"] == "failed":
         run.log(f"{record.INTERRUPTED}, the second interruption in a row")
         run.give_up(f"{record.INTERRUPTED}, the second interruption in a row")
-    elif environment_gaps.was_retry(run.id):
+    elif environment_gaps.was_retry(row):
         run.enter("pr")
         run.say(f"Run `{run.id}` was interrupted during the automatic verification retry. Check the PR before resuming it.")
     else:

@@ -215,11 +215,47 @@ def restore_environment_workspace(job: Job, data: dict, heads: dict[str, str]) -
             raise workspace.RunFailed(f"the held branch of {c.github} moved while restoring it")
         c.onto, c.merge, c.resumes = "", "", True
         workspace.fetch(c.src, c.base)
-    pipeline.merge_moved_bases(job.run, job.checkouts, job.layer, job.ticket, environment_retry=True)
-    job.use_layer(pipeline.resolve_layer(job.cfg, job.run, job.ws))
-    if why := pipeline.furnish(job.cfg, job.run, job.layer, job.ws):
-        raise workspace.RunFailed(why)
+    try:
+        pipeline.merge_moved_bases(job.run, job.checkouts, job.layer, job.ticket, environment_retry=True)
+        job.use_layer(pipeline.resolve_layer(job.cfg, job.run, job.ws))
+        if why := pipeline.furnish(job.cfg, job.run, job.layer, job.ws):
+            raise workspace.RunFailed(why)
+        for c in job.checkouts:
+            if (util.git(["rev-parse", "HEAD"], c.wt).strip() != (c.merge or c.lease)
+                    or workspace.uncommitted(c.wt)):
+                raise workspace.RunFailed(f"setup changed the tree of {c.github} before verification")
+    except BaseException:
+        reset_environment_base(job.checkouts)
+        raise
     job.carried = True
+
+
+def reset_environment_base(checkouts: list[workspace.Checkout]) -> bool:
+    reset = False
+    for c in checkouts:
+        if c.merge:
+            with util.repo_lock(c.src):
+                if util.git(["rev-parse", "HEAD"], c.wt).strip() == c.merge and not workspace.uncommitted(c.wt):
+                    util.git(["reset", "--keep", c.lease], c.wt)
+                    c.base_commit = util.git(["merge-base", c.lease, c.origin_base], c.wt).strip()
+                    c.merge, c.merged_base = "", False
+                    reset = True
+    return reset
+
+
+def restore_environment_draft(job: Job, prepared: dict) -> None:
+    from . import environment_gaps
+
+    source = run_store.run_get(job.continues) or {}
+    hold = environment_gaps.hold_of(job.continues)
+    if not hold or not environment_gaps.owned_drafts(source, hold):
+        raise factory.Refused("the run no longer has its saved verification hold")
+    prs = {gh.pr_repo(url).casefold(): (url, head) for url, head in hold.heads.items()}
+    if prepared.get("branch") != source.get("branch") or len(prs) != len(hold.heads):
+        raise factory.Refused("the held PRs do not match the saved branch")
+    restore_environment_workspace(job, prepared, {repo: head for repo, (_, head) in prs.items()})
+    for c in job.checkouts:
+        c.pr = prs[c.github.casefold()][0]
 
 
 def retry_environment(flow: factory.Flow) -> tuple[str, str, str]:
@@ -228,29 +264,16 @@ def retry_environment(flow: factory.Flow) -> tuple[str, str, str]:
     job: Job = flow.ctx
     if flow.refusal:
         raise factory.Refused(flow.refusal)
-    source = run_store.run_get(job.continues) or {}
-    if not (hold := environment_gaps.hold_of(job.continues)):
-        raise factory.Refused("the run has no saved verification hold")
     flow.skipped = len(flow.earlier)
     flow.route()
-    prepared = prepared_data(job.continues)
-    prs = {gh.pr_repo(url).casefold(): (url, head) for url, head in hold.heads.items()}
-    if prepared.get("branch") != source.get("branch") or len(prs) != len(hold.heads):
-        raise factory.Refused("the held PRs do not match the saved branch")
     environment_build(job, flow.earlier)
-    restore_environment_workspace(job, prepared, {repo: head for repo, (_, head) in prs.items()})
-    for c in job.checkouts:
-        c.pr = prs[c.github.casefold()][0]
+    restore_environment_draft(job, prepared_data(job.continues))
     ws = str(job.ws)
     trees = pipeline.verification_trees(job.b)
     if not trees:
         raise factory.Refused("the restored tree could not be identified for verification")
     if not (verified := step(flow, "verify", tree=ws)).passed:
-        for c in job.checkouts:
-            if c.merge:
-                with util.repo_lock(c.src):
-                    if util.git(["rev-parse", "HEAD"], c.wt).strip() == c.merge and not workspace.uncommitted(c.wt):
-                        util.git(["reset", "--keep", c.lease], c.wt)
+        reset_environment_base(job.checkouts)
         return ended(flow, verified)
     if not step(flow, "checks", tree=ws).passed:
         raise factory.Refused("the full checks did not pass after verification")
@@ -260,7 +283,9 @@ def retry_environment(flow: factory.Flow) -> tuple[str, str, str]:
         raise factory.Refused("the restored draft did not pass review")
     if trees != pipeline.verification_trees(job.b):
         raise factory.Refused("the restored tree changed while checking or reviewing it")
-    if not environment_gaps.owned_drafts(source, hold):
+    source = run_store.run_get(job.continues) or {}
+    hold = environment_gaps.hold_of(job.continues)
+    if not hold or not environment_gaps.owned_drafts(source, hold):
         raise factory.Refused("the held pull request changed before publication")
     return deliver(flow)
 

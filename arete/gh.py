@@ -239,9 +239,9 @@ def find_pr_marker(repo: str, branch: str, marker: str) -> str:
 
 
 def issue_comment(repo: str, number: int, body: str, *, return_url: bool = False,
-                  single_attempt: bool = False) -> str | None:
+                  key: str = "", single_attempt: bool = False) -> str | None:
     url = keyed_comment(["issue", "comment", str(number), "--repo", repo, "--body-file", "-"], body,
-                        f"repos/{repo}/issues/{number}/comments", single_attempt=single_attempt)
+                        f"repos/{repo}/issues/{number}/comments", key=key, single_attempt=single_attempt)
     return url if return_url else None
 
 
@@ -287,31 +287,6 @@ def issue_state(repo: str, number: int) -> str:
 
 def issue_edit_body(repo: str, number: int, body: str) -> None:
     gh(["issue", "edit", str(number), "--repo", repo, "--body-file", "-"], input=outgoing(body))
-
-
-def issue_add_waits(repo: str, number: int, body: str, waits: list[str]) -> bool:
-    endpoint = f"repos/{repo}/issues/{number}"
-    headers, _, data = gh(["api", "--include", endpoint]).replace("\r\n", "\n").partition("\n\n")
-    current = json.loads(data)
-    if current.get("state") != "open" or (current.get("body") or "") != body:
-        return False
-    condition = []
-    for header, request in (("etag", "If-Match"), ("last-modified", "If-Unmodified-Since")):
-        value = next((line.partition(":")[2].strip() for line in headers.splitlines()
-                      if line.partition(":")[0].casefold() == header), "")
-        if value and not (header == "etag" and value.startswith("W/")):
-            condition = ["-H", f"{request}: {value}"]
-            break
-    directive = "Waits on " + ", ".join(waits)
-    updated = f"{body}{'\n\n' if body else ''}{directive}"
-    try:
-        gh(["api", "--method", "PATCH", endpoint, *condition, "--input", "-"],
-           input=Outgoing(json.dumps({"body": updated})), write=True)
-    except GhError as e:
-        if re.search(r"\bHTTP (?:409|412)\b", str(e)):
-            return False
-        raise
-    return True
 
 
 def issue_merge_commit(repo: str, number: int, base: str) -> str:
@@ -692,6 +667,15 @@ def repo_private(repo: str) -> bool | None:
         return bool((gh_json(["repo", "view", repo, "--json", "isPrivate"]) or {}).get("isPrivate"))
     except GhError:
         return None
+
+
+def repo_public(repo: str) -> bool:
+    try:
+        result = gh_json(["repo", "view", repo, "--json", "visibility,nameWithOwner"])
+    except (GhError, ValueError):
+        return False
+    return (isinstance(result, dict) and result.get("visibility") == "PUBLIC"
+            and str(result.get("nameWithOwner") or "").casefold() == repo.casefold())
 
 
 PASSING_CONCLUSIONS = {"success", "neutral"}

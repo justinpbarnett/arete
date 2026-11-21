@@ -144,8 +144,8 @@ def next_due(loop: Loop, after: datetime) -> str:
 
 
 def code_stamp() -> frozenset:
-    stamp = set()
-    for p in [*paths.PACKAGE_DIR.rglob("*.py"), *dashboard.web_files()]:
+    stamp = {("HEAD", (codebase.git("rev-parse", "HEAD") or "").strip())}
+    for p in [*paths.PACKAGE_DIR.rglob("*.py"), *paths.ADWS_DIR.glob("*.py"), *dashboard.web_files()]:
         try:
             st = p.stat()
         except FileNotFoundError:

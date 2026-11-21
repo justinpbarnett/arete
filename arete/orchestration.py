@@ -115,15 +115,20 @@ class Controller:
             self.job.layer = pipeline.checked_layer(self.job.cfg, layer_dir, source_file=source_file)
             self.run.cfg, self.run.layer, self.run.kind = self.job.cfg, self.job.layer, prepared["ticket"]["kind"]
             self.lineage()
-            if any(not (Path(c["wt"]) / ".git").exists() for c in prepared["checkouts"]):
+            missing = any(not (Path(c["wt"]) / ".git").exists() for c in prepared["checkouts"])
+            if missing:
                 if any(Path(c["wt"]).exists() for c in prepared["checkouts"]):
                     raise factory.Refused("the retained workspace is incomplete; reconcile without discarding its edits")
                 if ledger.publication_pending(self.run.id) or not any(
                         a["op"] == "publication.request" and a["state"] == "succeeded" for a in ledger.actions(self.lease)):
                     raise factory.Refused("the missing workspace has no settled publication; reconcile before resuming")
-                if why := self.job.restore({"step": "prepare", "tree": str(self.job.ws), "data": prepared}, layer=self.job.layer):
-                    raise factory.Refused(why)
-            self.job.take("prepare", factory.Outcome("pass", data=self.data["prepared"]), stored=True)
+            if self.run.environment_release:
+                flows.restore_environment_draft(self.job, prepared)
+            else:
+                if missing:
+                    if why := self.job.restore({"step": "prepare", "tree": str(self.job.ws), "data": prepared}, layer=self.job.layer):
+                        raise factory.Refused(why)
+                self.job.take("prepare", factory.Outcome("pass", data=prepared), stored=True)
             for name, value in self.data.get("job", {}).items():
                 if name in STATE_FIELDS:
                     setattr(self.job, name, value)
@@ -134,6 +139,8 @@ class Controller:
             self.job.b.from_base = True
             self.job.b.plan_text, self.job.b.build_summary = self.job.plan_text, self.job.build_summary
         else:
+            if self.run.environment_release:
+                raise factory.Refused("the held controller has no saved workspace for verification")
             if self.data.get("preparing"):
                 raise factory.Refused("preparation was interrupted before durable workspace authority; reconcile before restarting")
             self.data["preparing"] = True
@@ -189,9 +196,6 @@ class Controller:
                                                  self.job.left_for_a_person])
         self.recover()
         if self.run.environment_release:
-            for checkout in self.job.checkouts:
-                workspace.fetch(checkout.src, checkout.base)
-            pipeline.merge_moved_bases(self.run, self.job.checkouts, self.job.layer, self.job.ticket)
             self.data.pop("published", None)
             self.data.pop("published_tree", None)
         elif self.flow.continues and (moved := flows.base_moved(self.flow.continues)):
@@ -752,12 +756,14 @@ class Controller:
                         state="running" if result is None else "failed" if "error" in result else "succeeded")
 
     def drive(self):
+        verification_passed = False
         try:
             if ended := self.prepare():
                 return ended
             if self.run.action:
                 prior = next((a for a in ledger.actions(self.lease) if a["id"] == self.run.action), None)
-                allowed = ("worker.start", "worker.continue", "checks.run", "verification.run", "review.run")
+                allowed = (("verification.run",) if self.run.environment_release else
+                           ("worker.start", "worker.continue", "checks.run", "verification.run", "review.run"))
                 if prior is None or prior["op"] not in allowed or prior["state"] not in ledger.TERMINAL:
                     raise factory.Refused("rerun requires a finished worker/check/review/verification action ID")
                 snapshot = ledger.snapshot(self.lease)
@@ -768,6 +774,13 @@ class Controller:
                             "calls": [{"op": prior["op"], "args": prior["request"]}]}
                 rerun = ledger.accept(self.lease, turn, snapshot["version"], response, self.policy.max_actions)[0]
                 self.dispatch(rerun)
+                if self.run.environment_release:
+                    if self.ending:
+                        return self.ending
+                    if (not flows.retry_passed(self.job.verified)
+                            or self.data.get("evidence", {}).get("verify", {}).get("producer") != rerun["id"]):
+                        raise factory.Refused("the saved verification action did not complete successfully")
+                    verification_passed = True
                 if self.run.action_only:
                     while self.workers:
                         self.collect()
@@ -787,6 +800,8 @@ class Controller:
             raise runlimits.Parked(str(error)) from error
         finally:
             self.close()
+            if self.run.environment_release and not verification_passed and flows.reset_environment_base(self.job.checkouts):
+                self.persist()
 
     def close(self):
         errors = []

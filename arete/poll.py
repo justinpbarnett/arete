@@ -104,8 +104,8 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
                                         or not tk.in_zte_queue(str(tid)))
 
     for tid in run_store.interrupted_tickets(repo.name):
-        if (ordinary_history(tid) and (row := run_store.newest_whole_run(repo.name, tid))
-                and not environment_gaps.was_retry(row["id"])):
+        if (ordinary_history(tid) and (row := run_store.newest_live_whole_run(repo.name, tid))
+                and not environment_gaps.was_retry(row)):
             return tid, "restarting after an interruption"
     for tid in insights_store.feedback_due(repo.name, util.iso(util.now() - timedelta(minutes=pipeline.FEEDBACK_QUIET_MINUTES))):
         if ordinary_history(tid):
@@ -350,7 +350,7 @@ def resume_environment_holds(cfg: config.Config, queues: list[RepoQueue], dry_ru
     started = 0
     for queue in github_queues:
         repo = queue.repo
-        for row in run_store.latest_pr_runs(repo.name):
+        for row in run_store.latest_held_drafts(repo.name):
             try:
                 can_start = started < MAX_STARTS_PER_POLL and not held_back(cfg, repo.name, going, slots - started)
                 if environment_gaps.handle(cfg, repo, row, journal, dry_run, can_start=can_start):
