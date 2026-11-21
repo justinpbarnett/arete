@@ -87,7 +87,15 @@ def seq_of(line: dict) -> int:
     return seq if type(seq) is int else 0
 
 
-def tail(f, check: Callable[[], None] | None = None) -> tuple[int, bool]:
+def append_bytes(f, payload: bytes, check: Callable[[], None] | None) -> None:
+    if check:
+        check()
+    if f.write(payload) != len(payload):
+        raise OSError("incomplete run event append")
+    f.flush()
+
+
+def recover_tail(f, check: Callable[[], None] | None) -> int:
     end = f.seek(0, 2)
     f.seek(max(0, end - 1))
     torn, size = bool(end) and f.read(1) != b"\n", TAIL_BYTES
@@ -100,15 +108,21 @@ def tail(f, check: Callable[[], None] | None = None) -> tuple[int, bool]:
         f.seek(start)
         data = f.read(end - start)
         if start:
-            data = data[data.find(b"\n") + 1:]
+            data = data.partition(b"\n")[2]
+        if torn:
+            data += b"\n"
         if (seq := next((seq_of(line) for line in reversed(whole(data)) if seq_of(line)), 0)) or not start:
-            return seq, torn
+            if torn:
+                append_bytes(f, b"\n", check)
+            return seq
         size *= 2
 
 
-def write(run_id: str, event: str, **fields) -> dict:
+def write(run_id: str, event: str, *, event_id: str = "", **fields) -> dict:
     line = {"ts": util.iso(), "run": run_id, "seq": 0, "event": event,
             **{k: v for k, v in fields.items() if k not in FIXED + ("engine",)}}
+    if event_id:
+        line["event_id"] = event_id
     target = path(run_id)
     check = _append_guard.get()
     try:
@@ -116,22 +130,25 @@ def write(run_id: str, event: str, **fields) -> dict:
             check()
         target.parent.mkdir(parents=True, exist_ok=True)
         with locked_log(target, check) as f:
-            seq, torn = tail(f, check)
+            seq = recover_tail(f, check)
+            if event_id:
+                f.seek(0)
+                if prior := next((row for row in whole(f.read())
+                                  if row.get("event") == event and row.get("event_id") == event_id), None):
+                    os.fsync(f.fileno())
+                    return prior
             line["ts"], line["seq"] = util.iso(), seq + 1
             first = (os.getpid(), run_id) not in _named
             if first:
                 line["engine"] = codebase.STAMP
             text = json.dumps(line, ensure_ascii=False, default=str)
-            payload = (b"\n" if torn else b"") + text.encode() + b"\n"
-            if check:
-                check()
-            if f.write(payload) != len(payload):
-                raise OSError("incomplete run event append")
-            f.flush()
+            append_bytes(f, text.encode() + b"\n", check)
+            if event_id:
+                os.fsync(f.fileno())
             if first:
                 _named.add((os.getpid(), run_id))
     except OSError as e:
-        if check:
+        if check or event_id:
             raise
         text = json.dumps(line, ensure_ascii=False, default=str)
         print(f"{util.iso()} could not write {event} to {target}: {e}", file=sys.stderr, flush=True)
