@@ -50,6 +50,7 @@ class QueueScoringTests(unittest.TestCase):
                                              environment_waits=mock.Mock(return_value=[])))
         self.enterContext(mock.patch.object(poll.pilot, "pickable", return_value=True))
         self.enterContext(mock.patch.object(poll.zte, "reserved", return_value=False))
+        self.enterContext(mock.patch.object(tracker.LocalTracker, "todo", return_value=[]))
         return poll.next_ticket(self.repo, self.source, pipeline.SkipLog({}))
 
     def test_waits_on_ignores_oversized_reference(self):
@@ -89,6 +90,113 @@ class QueueScoringTests(unittest.TestCase):
         self.assertEqual([ticket.id for ticket in todo], ["4", "1"])
         self.assertEqual(self.next_ticket().id, "1")
         self.assertEqual(queueing.scores(todo, open_tickets=self.source.open_agent_tickets)["1"], (3, 2))
+
+    def test_poll_counts_local_waits_on_inside_underscores(self):
+        older = [self.issue(number, created="2026-11-20T00:00:00Z") for number in (692, 693, 697, 698)]
+        issues = [*older, self.issue(708), self.issue(283, "agent:pr", body="__Waits on #708__")]
+        self.enterContext(mock.patch.object(gh, "issues", return_value=issues))
+
+        todo = self.source.todo()
+        ranked = queueing.prioritized(todo, open_tickets=self.source.open_agent_tickets, github_repo=self.repo.github)
+        self.assertEqual([ticket.id for ticket in ranked], ["708", "692", "693", "697", "698"])
+        self.assertEqual(self.next_ticket().id, "708")
+
+    def test_poll_finds_only_candidate_when_earlier_issue_closes_between_pages(self):
+        open_issues = [self.issue(number, "agent:running") for number in range(101, 1, -1)]
+        open_issues.append(self.issue(1))
+
+        def github(args):
+            self.assertEqual(args, ["issue", "list", "--repo", "fixture/repo", "--state", "open", "--limit", "1000",
+                                    "--json", "number,title,body,labels,url,createdAt,updatedAt,author", "--label", "agent"])
+            first_page = open_issues[:100]
+            open_issues.pop(0)
+            cursor = first_page[-1]["number"]
+            return first_page + [issue for issue in open_issues if issue["number"] < cursor]
+
+        self.enterContext(mock.patch.object(gh, "gh_json", side_effect=github))
+        ticket = self.next_ticket()
+        self.assertIsNotNone(ticket)
+        self.assertEqual(ticket.id, "1")
+
+    def test_poll_counts_in_flight_dependent_beyond_1000_open_issues(self):
+        issues = [self.issue(1002), *[self.issue(number, "agent:running") for number in range(1001, 3, -1)],
+                  self.issue(3, created="2026-11-20T00:00:00Z"),
+                  self.issue(1, created="2026-11-19T00:00:00Z"),
+                  self.issue(2, "agent:pr", body="Waits on #1002.", created="2026-11-18T00:00:00Z")]
+        scoring_rows = [{**i, "labels": {"nodes": i["labels"]}} for i in issues[1:]]
+        pages = [{"data": {"repository": {"issues": {"nodes": scoring_rows[start:start + 100]}}}}
+                 for start in range(0, len(scoring_rows), 100)]
+
+        def github(args):
+            if args[:2] == ["issue", "list"]:
+                return issues[:int(args[args.index("--limit") + 1])]
+            self.assertEqual(args[:4], ["api", "graphql", "--paginate", "--slurp"])
+            self.assertIn("after: $endCursor", args[5])
+            self.assertIn("pageInfo { hasNextPage endCursor }", args[5])
+            self.assertEqual(args[6:], ["-f", "owner=fixture", "-f", "name=repo", "-f", "label=agent"])
+            return pages
+
+        self.enterContext(mock.patch.object(gh, "gh_json", side_effect=github))
+        self.assertEqual(self.next_ticket().id, "1002")
+        self.assertEqual(len(self.source.open_agent_tickets), 1002)
+        self.assertEqual([ticket.id for ticket in self.source.todo()], ["3", "1002"])
+
+    def test_poll_uses_candidate_window_for_scoring_after_graphql_504(self):
+        issues = [*[self.issue(number, "agent:running") for number in range(1000, 2, -1)],
+                  self.issue(2, "agent:pr", body="Waits on #1."), self.issue(1)]
+
+        def github(args):
+            if args[:2] == ["issue", "list"]:
+                return issues
+            self.assertEqual(args[:2], ["api", "graphql"])
+            raise gh.GhError("gh api graphql: HTTP 504 Gateway Timeout")
+
+        self.enterContext(mock.patch.object(gh, "gh_json", side_effect=github))
+        with redirect_stdout(StringIO()) as stdout:
+            ticket = self.next_ticket()
+
+        self.assertEqual(ticket.id, "1")
+        self.assertEqual(queueing.scores([ticket], open_tickets=self.source.open_agent_tickets)["1"], (2, 1))
+        self.assertIn("fixture/repo", stdout.getvalue())
+        self.assertIn("queue scoring is using the candidate listing", stdout.getvalue())
+        self.assertIn("HTTP 504", stdout.getvalue())
+
+    def test_poll_looks_up_prerequisite_closed_after_supplemental_scoring_fetch(self):
+        candidate = self.issue(1001, body="Waits on #1.")
+        window = [candidate, *[self.issue(number, "agent:running") for number in range(1000, 1, -1)]]
+        prerequisite = self.issue(1)
+        closed = False
+
+        def scoring_rows(repo, label):
+            nonlocal closed
+            closed = True
+            return [*window, prerequisite]
+
+        def issue(repo, number):
+            self.assertEqual((repo, number), (self.repo.github, 1))
+            return {**self.issue(1, "agent:zte"), "state": "CLOSED" if closed else "OPEN"}
+
+        self.enterContext(mock.patch.object(gh, "issues", return_value=window))
+        self.enterContext(mock.patch.object(gh, "all_open_issues", side_effect=scoring_rows))
+        lookup = self.enterContext(mock.patch.object(gh, "issue", side_effect=issue))
+
+        ticket = self.next_ticket()
+        self.assertIsNotNone(ticket)
+        self.assertEqual(ticket.id, "1001")
+        lookup.assert_called_once_with(self.repo.github, 1)
+        self.assertIn("1", {row.id for row in self.source.open_agent_tickets})
+        lookup.reset_mock()
+        self.assertEqual(self.source.blocker("1"), tracker.ZTE_QUEUE)
+        lookup.assert_called_once_with(self.repo.github, 1)
+
+    def test_poll_preserves_candidate_cycle_ranking_with_unrelated_in_flight_issue(self):
+        issues = [self.issue(1), self.issue(2, body="Waits on #1 and #3."), self.issue(3, body="Waits on #2."),
+                  self.issue(5), self.issue(6, body="Waits on #5.")]
+        with mock.patch.object(gh, "issues", return_value=issues):
+            self.assertEqual(self.next_ticket().id, "5")
+
+        with mock.patch.object(gh, "issues", return_value=[*issues, self.issue(7, "agent:pr")]):
+            self.assertEqual(self.next_ticket().id, "5")
 
     def test_poll_prioritizes_prerequisite_of_in_flight_cycle(self):
         issues = [self.issue(1), self.issue(2, body="Waits on #1."),

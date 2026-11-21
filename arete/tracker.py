@@ -179,25 +179,39 @@ class GitHubTracker:
     def open_agent_tickets(self) -> tuple[Ticket, ...]:
         return tuple(self._open_agent_tickets)
 
+    def _listed_ticket(self, issue: dict) -> Ticket:
+        tid = str(issue["number"])
+        labels = sorted({label["name"] for label in issue.get("labels", [])})
+        return Ticket(tid, self.ref(tid), issue["title"], body=issue.get("body") or "",
+                      url=issue.get("url", ""), created=issue.get("createdAt", ""), labels=labels)
+
     def todo(self, *, parked: Callable[[str], bool] | None = None) -> list[Ticket]:
         failed = self.label_name("failed")
         skip = {ZTE_LABEL, *(self.label_name(s) for s in config.RUN_LABELS if s != "failed")}
         out = []
         self._bodies, self._labels, self._open = {}, {}, {}
         self._open_agent_tickets = []
-        for i in gh.issues(self.repo.github, LABEL, limit=MAX_AGENT_ISSUES):
-            tid = str(i["number"])
-            names = {lb["name"] for lb in i.get("labels", [])}
-            ticket = Ticket(tid, self.ref(tid), i["title"], body=i.get("body") or "",
-                            url=i.get("url", ""), created=i.get("createdAt", ""), labels=sorted(names))
+        window = gh.issues(self.repo.github, LABEL, limit=MAX_AGENT_ISSUES)
+        for i in window:
+            ticket = self._listed_ticket(i)
+            tid = ticket.id
             self._bodies[tid] = ticket.body
             self._open[int(tid)] = True
             self._labels[tid] = ticket.labels.copy()
             self._open_agent_tickets.append(ticket)
-            if (names & skip or not self.by_owner(i)
-                    or failed in names and not (parked and parked(tid))):
+            if (skip.intersection(ticket.labels) or not self.by_owner(i)
+                    or failed in ticket.labels and not (parked and parked(tid))):
                 continue
             out.append(ticket)
+        if len(window) == MAX_AGENT_ISSUES:
+            try:
+                supplemental = gh.all_open_issues(self.repo.github, LABEL)
+            except gh.GhError as error:
+                print(f"{util.iso()} {self.repo.github}: queue scoring is using the candidate listing "
+                      f"because the supplemental GitHub fetch failed ({error})")
+            else:
+                listed = {i["number"] for i in window}
+                self._open_agent_tickets.extend(self._listed_ticket(i) for i in supplemental if i["number"] not in listed)
         return sorted(out, key=lambda t: t.created)
 
     def queued_failure(self, labels: list[str]) -> bool:

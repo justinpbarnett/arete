@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Iterable, Iterator
 
 from . import tracker
@@ -9,10 +10,11 @@ def dependencies(ticket: tracker.Ticket, *, github_repo: str | None = None) -> s
     if tracker.is_task_id(ticket.id):
         return set(tracker.waits_on_tasks(ticket.body))
     if ticket.id.isdigit():
+        numbers = set(tracker.waits_on(ticket.body))
         if github_repo is not None:
             own = github_repo.casefold()
-            return {str(number) for repo, number in tracker.github_waits(ticket.body, own) if repo == own}
-        return {str(number) for number in tracker.waits_on(ticket.body)}
+            numbers.update(number for repo, number in tracker.github_waits(ticket.body, github_repo) if repo == own)
+        return {str(number) for number in numbers}
     return set(tracker.waits_on_jira(ticket.body))
 
 
@@ -48,22 +50,44 @@ def _topological_components(parents: dict[str, set[str]], dependents: dict[str, 
         yield component
 
 
-def scores(tickets: list[tracker.Ticket], *, open_tickets: Iterable[tracker.Ticket] = (),
-           github_repo: str | None = None) -> dict[str, tuple[int, int]]:
-    graph = {str(ticket.id): ticket for ticket in tickets}
-    graph.update((str(ticket.id), ticket) for ticket in open_tickets)
-    parents = {tid: dependencies(ticket, github_repo=github_repo) & graph.keys() for tid, ticket in graph.items()}
-    dependents = {tid: set() for tid in graph}
-    for child, prerequisites in parents.items():
-        for parent in prerequisites:
-            dependents[parent].add(child)
-    depth = dict.fromkeys(graph, 1)
+def _depths_from_leaves(parents: dict[str, set[str]], dependents: dict[str, set[str]]) -> dict[str, int]:
+    remaining = {tid: len(children) for tid, children in dependents.items()}
+    depth = dict.fromkeys(parents, 1)
+    ready = deque(tid for tid, count in remaining.items() if not count)
+    while ready:
+        child = ready.popleft()
+        for parent in parents[child]:
+            depth[parent] = max(depth[parent], depth[child] + 1)
+            remaining[parent] -= 1
+            if not remaining[parent]:
+                ready.append(parent)
+    return depth
+
+
+def _expanded_depths(parents: dict[str, set[str]], dependents: dict[str, set[str]]) -> dict[str, int]:
+    depth = dict.fromkeys(parents, 1)
     for component in _topological_components(parents, dependents):
         level = max(depth[tid] for tid in component)
         for tid in component:
             depth[tid] = level
             for parent in parents[tid] - component:
                 depth[parent] = max(depth[parent], level + 1)
+    return depth
+
+
+def scores(tickets: list[tracker.Ticket], *, open_tickets: Iterable[tracker.Ticket] = (),
+           github_repo: str | None = None) -> dict[str, tuple[int, int]]:
+    graph = {str(ticket.id): ticket for ticket in tickets}
+    candidates = set(graph)
+    graph.update((str(ticket.id), ticket) for ticket in open_tickets)
+    unlisted = graph.keys() - candidates
+    parents = {tid: dependencies(ticket, github_repo=github_repo) & graph.keys() for tid, ticket in graph.items()}
+    dependents = {tid: set() for tid in graph}
+    for child, prerequisites in parents.items():
+        for parent in prerequisites:
+            dependents[parent].add(child)
+    depth = _depths_from_leaves(parents, dependents)
+    expanded_depth = _expanded_depths(parents, dependents) if unlisted else depth
     result = {}
     for key, children in dependents.items():
         seen, pending = {key}, list(children)
@@ -72,7 +96,8 @@ def scores(tickets: list[tracker.Ticket], *, open_tickets: Iterable[tracker.Tick
             if child not in seen:
                 seen.add(child)
                 pending.extend(dependents[child] - seen)
-        result[key] = (depth[key], len(seen) - 1)
+        levels = depth if unlisted.isdisjoint(seen) else expanded_depth
+        result[key] = (levels[key], len(seen) - 1)
     return result
 
 
