@@ -73,14 +73,15 @@ def start(cfg: config.Config, run: pipeline.Run, earlier: dict, slot: slots.RunS
     ws = paths.WORKTREES_DIR / f"{run.repo.name}-{run.workspace_key}"
     continues = continues or (earlier["id"] if earlier.get("status") == "interrupted" and ran_on_seam(earlier["id"])
                               else "")
-    if continues and not only:
-        run.answers_due = asks_store.asks_due(sorted(factory.chain_runs(continues)))
     job = Job(cfg, run, ws, slot=slot, continues=continues, only=only)
+    catch_up = not only and run.path == "orchestrate" and pending_catch_up(continues)
+    if continues and not only and not catch_up:
+        run.answers_due = asks_store.asks_due(sorted(factory.chain_runs(continues)))
     refusal = guard(job, continues) if continues else ""
     renew = ""
     if refusal:
         job.note_task()
-    elif (continues and not only and not run.environment_release and kept_pending(job, continues)
+    elif (continues and not only and not catch_up and not run.environment_release and kept_pending(job, continues)
           and (moved := base_moved(continues))):
         if run.answers_due:
             job.moved_base = moved
@@ -118,6 +119,9 @@ def guard(job: Job, continues: str) -> str:
     from .store import orchestration
 
     if orchestration.publication_pending(continues):
+        if (job.run.path == "orchestrate" and not any((job.only, job.run.dry_run, job.run.action,
+                                                      job.run.environment_release)) and pending_catch_up(continues)):
+            return ""
         return "publication was interrupted; reconcile its branch/PR effects before resuming"
     if (getattr(job.run, "action", "") and not job.run.environment_release
             and (why := action_workspace_refusal(continues))):
@@ -153,6 +157,12 @@ def adaptive_state(run_id: str) -> dict:
     from .store import orchestration
 
     return orchestration.find(run_id).get("data", {})
+
+
+def pending_catch_up(run_id: str) -> dict:
+    from .store import orchestration
+
+    return orchestration.catch_up_push(adaptive_state(run_id))
 
 
 def prepared_data(continues: str) -> dict:
@@ -736,7 +746,7 @@ class Job:
             self.pending.append(c.github)
         return ""
 
-    def prepared(self, data: dict, stored: bool) -> None:
+    def prepared(self, data: dict, stored: bool, *, reconciling_catch_up: bool = False) -> None:
         run = self.run
         self.ticket = tracker.Ticket(**data["ticket"])
         if retry_run := data.get("retry_run"):
@@ -755,16 +765,17 @@ class Job:
             if held := workspace.scratch_held(self.ws, self.checkouts):
                 raise workspace.scratch_failure(f"verification scratch at {held[0]} is still held; poll finalizes it "
                                                 "once its holders end, then run again", self.ws, held)
-            kept = workspace.kept_onto(self.ws, self.checkouts, self.branch)
-            if why := workspace.kept_work(self.ws, self.checkouts, run.repo.path, self.layer.copy):
-                raise workspace.worktree_failure(why, self.ws, self.branch)
-            for c in self.checkouts:
-                c.onto = kept.get(str(c.wt), "")
+            if not reconciling_catch_up:
+                kept = workspace.kept_onto(self.ws, self.checkouts, self.branch)
+                if why := workspace.kept_work(self.ws, self.checkouts, run.repo.path, self.layer.copy):
+                    raise workspace.worktree_failure(why, self.ws, self.branch)
+                for c in self.checkouts:
+                    c.onto = kept.get(str(c.wt), "")
         elif stored:
             for c in self.checkouts:
                 c.onto = ""
         run.set_workspace(self.ws, self.checkouts, self.branch)
-        if stored:
+        if stored and not reconciling_catch_up:
             runs = authors(self.continues)
             for c in self.checkouts:
                 if why := self.reclaim(c, *authority(self.continues, c, leases[c.github]), runs):
@@ -1371,7 +1382,7 @@ def watch(flow: factory.Flow, tree: str) -> Outcome:
 
 
 @factory.step("publish")
-def publish(flow: factory.Flow) -> Outcome:
+def publish(flow: factory.Flow, merge: Callable[[list[workspace.Checkout]], dict | None] | None = None) -> Outcome:
     job: Job = flow.ctx
     run = job.run
     require_environment_owner_clear(job)
@@ -1383,6 +1394,8 @@ def publish(flow: factory.Flow) -> Outcome:
     opened, pushed, with_prs = job.picked(job.opened), job.picked(job.pushed), job.with_prs
     fresh = [c for c in opened if c.github not in job.found]
     run.enter("pr")
+    if merge and (failure := merge(publication_candidates(job, fresh))):
+        return Outcome("fail", feedback=failure["error"], data=failure)
     if run.feedback:
         pipeline.answer_feedback(run, job.replies, "Done in the latest push.")
         run.say(f"Revised for your review.\n\n{job.report_body}\n\nCI: {job.ci_result}.")
@@ -1393,11 +1406,16 @@ def publish(flow: factory.Flow) -> Outcome:
     else:
         run.say(f"PRs for this ticket:\n\n{pipeline.pr_status_lines(with_prs, opened, pushed)}\n\nCI: {job.ci_result}."
                 + pipeline.published_note(job.draft_why, job.verified, fresh, job.picked(job.drafted)))
-    standing = [c for c in job.picked(job.changed) if c not in fresh]
-    ready = pipeline.ready_pushed(run, standing, job.picked(job.ci_stopped), job.draft_why)
-    pipeline.automerge(job.b, job.approval, job.draft_why, job.verified, job.review, fresh + ready,
-                       pipeline.automerge_about(job.ticket, job.build_summary))
+    if not merge:
+        pipeline.automerge(job.b, job.approval, job.draft_why, job.verified, job.review,
+                           publication_candidates(job, fresh), pipeline.automerge_about(job.ticket, job.build_summary))
     return end_as("pass", "pr", summary=f"{job.summary}, CI: {job.ci_result}")
+
+
+def publication_candidates(job: Job, fresh: list[workspace.Checkout]) -> list[workspace.Checkout]:
+    standing = [c for c in job.picked(job.changed) if c not in fresh]
+    ready = pipeline.ready_pushed(job.run, standing, job.picked(job.ci_stopped), job.draft_why)
+    return fresh + ready
 
 
 @factory.step("respond")
@@ -1476,6 +1494,8 @@ def end_dry_run(flow: factory.Flow) -> tuple[str, str, str]:
 def driven(flow: factory.Flow, drive: Callable[[factory.Flow], tuple[str, str, str]]) -> tuple[str, str, str]:
     try:
         return drive(flow)
+    except pipeline.CatchUpPushUnconfirmed:
+        raise
     except workspace.RunFailed as e:
         if flow.ctx.run.environment_release:
             raise

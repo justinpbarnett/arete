@@ -10,6 +10,7 @@ from datetime import timedelta
 from . import (
     config,
     environment_gaps,
+    flows,
     intake,
     jira,
     launch_lease,
@@ -288,9 +289,11 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: tuple[str, str], skip
     blocked, readmission = runlimits.poll_admission(repo, str(tid), ticket, runlimits.Policy.of(layer))
     blocked = blocked or source.blocker(tid) or reply
     if not blocked:
-        if not zte.reserved(str(tid)):
-            ticket = intake.route_ticket(cfg, repo, source, ticket, dry_run=dry_run)
-        blocked = step_without_route(cfg, repo, ticket, queue.discovery, layer)
+        newest = run_store.newest_whole_run(repo.name, tid)
+        if not (newest and newest["status"] == "interrupted" and flows.pending_catch_up(newest["id"])):
+            if not zte.reserved(str(tid)):
+                ticket = intake.route_ticket(cfg, repo, source, ticket, dry_run=dry_run)
+            blocked = step_without_route(cfg, repo, ticket, queue.discovery, layer)
     if blocked:
         skips.note(name, ticket, blocked, repo.name)
         print(f"{util.iso()} {name}: {blocked}")

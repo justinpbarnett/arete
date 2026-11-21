@@ -103,6 +103,18 @@ def model_scope(model: str) -> str:
     return "model:" + (family[1] if family else name)
 
 
+OVERLOAD_SECONDS = 600
+OVERLOAD_TEXT = re.compile(r"at capacity|\boverloaded\b|(?:status|code|http)\W{0,4}529\b|\b529\b\W{0,3}overloaded",
+                           re.IGNORECASE)
+
+
+def overload_limit(text, model: str) -> UsageLimit | None:
+    raw = text if isinstance(text, str) else json.dumps(text, default=str)
+    if not OVERLOAD_TEXT.search(raw):
+        return None
+    return UsageLimit(util.iso(util.now() + timedelta(seconds=OVERLOAD_SECONDS)), model_scope(model), "overloaded")
+
+
 def reset_at(value) -> datetime | None:
     if isinstance(value, bool) or value is None:
         return None

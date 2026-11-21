@@ -32,8 +32,7 @@ MAX_IMAGES = 6
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 ARETE_TAG = "[arete]"
 TASK_ID = re.compile(r"t-[0-9a-f]{4,}", re.IGNORECASE)
-PARK_RUN_ID = r"pip-\d{8}-\d{6}-[a-f0-9]{4}(?:-[a-zA-Z0-9][a-zA-Z0-9_. -]{0,100})?"
-RETRY_MARKER = re.compile(rf"<!-- arete:retry run=({PARK_RUN_ID}) n=([12]) -->")
+RETRY_MARKER = re.compile(r"<!-- arete:retry run=(.+) n=([12]) -->")
 
 
 class TaskError(LookupError):
@@ -311,7 +310,7 @@ class GitHubTracker:
                       comments=comments_text(comments), open=i.get("state") == "OPEN",
                       kind="fix" if FIX_LABELS & set(labels) else "feat", url=i.get("url", ""),
                       updated=i.get("updatedAt") or "", labels=labels, blocker=blocker,
-                      retries=retry_comments(retry_messages))
+                      retries=retry_comments(retry_messages, self.repo.name, str(tid)))
         if ZTE_LABEL not in labels:
             batch_ids(ticket)
         return ticket
@@ -569,7 +568,8 @@ class LocalTracker:
         if (row := tasks_store.task_get(tid)) is None:
             raise TaskError(f"no task {tid}")
         rows = tasks_store.task_comments(tid)
-        retries = retry_comments((c["ts"] or "", c["body"] or "") for c in rows if c["author"] == "arete")
+        retry_messages = ((c["ts"] or "", c["body"] or "") for c in rows if c["author"] == "arete")
+        retries = retry_comments(retry_messages, self.repo.name, tid)
         comments = [("Arete" if c["author"] == "arete" else "Owner", c["ts"] or "", c["body"] or "")
                     for c in rows if c["author"] != "arete" or not retry_marker(c["body"] or "")]
         blocker = (f"it is a task of {row['repo']}, not {self.repo.name}" if row["repo"] != self.repo.name
@@ -726,9 +726,13 @@ def retry_marker(body: str) -> re.Match | None:
     return RETRY_MARKER.fullmatch(body.partition("\n")[0])
 
 
-def retry_comments(messages: Iterable[tuple[str, str]]) -> list[ParkComment]:
-    return [ParkComment(match[1], when, body, int(match[2]))
-            for when, body in sorted(messages, key=lambda row: row[0]) if when and (match := retry_marker(body))]
+def retry_comments(messages: Iterable[tuple[str, str]], repo: str, issue: str) -> list[ParkComment]:
+    retries = []
+    for when, body in sorted(messages, key=lambda row: row[0]):
+        if when and (match := retry_marker(body)) and (run := run_store.run_get(match[1])):
+            if run["kind"] == "pipeline" and (run["repo"], str(run["issue"])) == (repo, issue):
+                retries.append(ParkComment(match[1], when, body, int(match[2])))
+    return retries
 
 
 def reply_text(comments: list[tuple[datetime, str]], since: str) -> str:

@@ -246,12 +246,11 @@ class Readmission:
         spec, limits = specification(ticket), asdict(policy)
         if self.baseline != readmission_key(saved) or self.inputs != readmission_key([spec, limits]):
             return False
-        retry = park_retry(row, saved, ticket)
-        if retry and retry_hold(ticket):
-            return False
         if not self.branch:
             if self.feedback:
-                return bool(retry and self.feedback == feedback_key(retry) and not self.attempted())
+                retry = park_retry(row, saved, ticket)
+                return bool(retry and not retry_hold(ticket) and self.feedback == feedback_key(retry)
+                            and not self.attempted())
             return inputs_changed(saved, spec, limits)
         names = {name for name, _ in checkouts(repo)}
         return (self.branch == park_branch(row, saved) and complete_heads(saved.get("heads"), names)
@@ -293,10 +292,12 @@ def poll_admission(repo, tid: str, ticket, policy: Policy) -> tuple[str, Readmis
     if not saved:
         return "", None
     retry = park_retry(row, saved, ticket)
-    if retry and (hold := retry_hold(ticket)):
-        return hold, None
-    reason = park_reason(row, saved)
-    tried = f"{reason} Poll already tried these inputs."
+    hold = retry_hold(ticket) if retry else ""
+    if hold:
+        retry = None
+    parked = park_reason(row, saved)
+    reason = hold or parked
+    tried = f"{parked} Poll already tried these inputs."
     spec, limits = specification(ticket), asdict(policy)
     proof = Readmission(row["id"], readmission_key(saved), readmission_key([spec, limits]))
     try:

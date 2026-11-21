@@ -28,7 +28,7 @@ from .store import runs as run_store
 from .store import tasks as tasks_store
 
 MAX_REWRITES = 2
-RUN_ID = re.compile(tracker.PARK_RUN_ID)
+RUN_ID = re.compile(r"pip-\d{8}-\d{6}-[a-f0-9]{4}(?:-[^/\r\n]+)?")
 CONTROLLER_ALLOWANCE = re.compile(
     r"(?:controller used its \d+ (?:decision|inference-launch)|run used its \d+ action) allowance")
 BUDGET_PARKS = (

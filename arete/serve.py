@@ -511,13 +511,43 @@ class Server:
             if reason:
                 self.deploy_refused(src, tip, reason)
                 return
+            if util.git(["rev-parse", "--verify", ref], src, timeout=10, retry=False).strip() != tip:
+                return
+            if not self.deploy_ready(src, base, tip):
+                return
             try:
-                util.git(["--no-replace-objects", "merge", "-q", "--ff-only", "--no-autostash",
-                          "--no-overwrite-ignore", tip], src, timeout=30, retry=False)
-            except RuntimeError as error:
+                recovery = util.deploy_recovery(src, base, tip)
+            except (OSError, RuntimeError) as error:
+                self.deploy_refused(src, tip, str(error))
+                return
+            hooks_path = util.git(["config", "--null", "--get", "core.hooksPath"], src, timeout=10,
+                                  check=False, retry=False)
+            if hooks_path.removesuffix("\0"):
+                self.say(f"deploy: {paths.short_path(src)} Git hooks disabled for fast forward to {tip}")
+            try:
+                util.deploy_fast_forward(src, tip)
+            except util.DeployStillRunning as error:
+                self.deploy_refused(src, tip, str(error))
+                return
+            except (OSError, RuntimeError) as error:
+                self.restore_deploy(src, base, tip, recovery, error)
                 self.deploy_refused(src, tip, str(error))
                 return
         self.say(f"deploy: {paths.short_path(src)} fast forwarded to {tip} ({subject})")
+
+    def restore_deploy(self, src: Path, base: str, tip: str, recovery: util.DeployRecovery, error: Exception) -> None:
+        checkout = paths.short_path(src)
+        try:
+            problems = util.restore_deploy_paths(src, base, recovery)
+        except (OSError, RuntimeError) as restore_error:
+            problems = [str(restore_error)]
+        try:
+            if remaining := util.deploy_porcelain(src):
+                problems.append(f"remaining paths: {remaining}")
+        except (OSError, RuntimeError) as status_error:
+            problems.append(f"could not read remaining paths: {status_error}")
+        details = " | ".join([str(error), *problems])
+        self.say(f"deploy: {checkout} recovery for {tip} ({details})")
 
     def deploy_ready(self, src: Path, base: str, tip: str) -> bool:
         reason = deploy_refusal(src, base, tip)

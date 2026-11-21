@@ -507,7 +507,7 @@ def browser_start(argv: list[str]) -> None:
                 recorded, browser_digest(rest)):
             raise SystemExit("browser server refused: the command is not the one the engine built")
         data["browser"]["groups"] = [*data["browser"].get("groups", []), os.getpid()]
-        data["producers"][f"browser-{os.getpid()}"] = os.getpid()
+        data["producers"][f"browser-{os.getpid()}"] = scratch.producer_entry(os.getpid())
         scratch.store(fd, key, data)
     os.chdir(scratch.browser_path(data["attempt"]["run_dir"]))
     os.execv(rest[0], rest)
