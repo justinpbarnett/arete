@@ -34,7 +34,7 @@ def setUpModule():
     support.isolate_live_state()
 
 
-class CliThroughServeTests(unittest.TestCase):
+class _CliThroughServeCase(unittest.TestCase):
     class_timeout = 30
     OWNER = "cli-owner@example.test"
     ONLINE = (
@@ -96,10 +96,11 @@ class CliThroughServeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="arete-cli-") as temp:
             root = Path(temp).resolve()
             entry = ("import faulthandler; faulthandler.dump_traceback_later(15); "
-                     "from tests.test_behavior import CliThroughServeTests; "
+                     "from tests import test_behavior; "
                      "from unittest import TextTestRunner; "
-                     "sys.exit(not TextTestRunner().run(CliThroughServeTests(sys.argv[1])).wasSuccessful())")
-            command = api_check.child_command(Path(__file__).resolve().parents[1], entry, case)
+                     "test = getattr(test_behavior, sys.argv[1])(sys.argv[2]); "
+                     "sys.exit(not TextTestRunner().run(test).wasSuccessful())")
+            command = api_check.child_command(Path(__file__).resolve().parents[1], entry, type(self).__name__, case)
             try:
                 result = subprocess.run(command, cwd=root, env=api_check.isolated_env(root), capture_output=True,
                                         text=True, timeout=18, check=False)
@@ -193,6 +194,8 @@ class CliThroughServeTests(unittest.TestCase):
         with self.listening(ThreadingHTTPServer(("127.0.0.1", 0), Handler)):
             yield
 
+
+class CliThroughServeAccessTests(_CliThroughServeCase):
     def test_parser_groups_and_cli_calls(self):
         self.in_subprocess("check_parser_groups_and_cli_calls")
 
@@ -427,6 +430,8 @@ class CliThroughServeTests(unittest.TestCase):
             paths.CONFIG_FILE.write_text(invalid + "\n[server]\nurl = false\n")
             report()
 
+
+class CliThroughServeCommandTests(_CliThroughServeCase):
     def test_approval_waits_out_drain(self):
         self.in_subprocess("check_approval_waits_out_drain")
 
@@ -607,6 +612,8 @@ class CliThroughServeTests(unittest.TestCase):
         self.assertEqual([key for method, _, _, key in seen if method == "POST"], ["loop-stop:r1", "loop-stop:r2"])
         self.assertEqual([path for method, path, _, _ in seen if method == "GET"].count("/api/loops/poll"), 3)
 
+
+class CliThroughServeRunTests(_CliThroughServeCase):
     def test_run_retries_keep_the_original_version(self):
         self.in_subprocess("check_run_retries_keep_the_original_version")
 

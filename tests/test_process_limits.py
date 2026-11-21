@@ -47,9 +47,9 @@ from tests.harness import set_task_body
 
 class PinCommandTests(unittest.TestCase):
     def test_pin_commands(self):
-        from tests.test_behavior import CliThroughServeTests
+        from tests.test_behavior import CliThroughServeRunTests
 
-        CliThroughServeTests().in_subprocess("check_pin_commands")
+        CliThroughServeRunTests().in_subprocess("check_pin_commands")
 
 
 class Isolated(unittest.TestCase):
