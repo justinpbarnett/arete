@@ -63,8 +63,10 @@ class EnforcementProposalTests(unittest.TestCase):
 
     def test_check_proposal_is_reviewable_and_never_enters_apply(self):
         rule = self.proposal["enforcement"]
+        rule["behavior"] = "Use identity comparisons anywhere in Python."
+        self.proposal["why"] = "The compiler rejects all identity comparisons."
         for example in ("known_bad", "allowed"):
-            rule[example] += '\nraise RuntimeError("fixture must never run")'
+            rule[example] += '\nunset = status is None\nraise RuntimeError("fixture must never run")'
         (self.repo.path / "example.py").write_text(rule["known_bad"])
         prose = {"layer": "repo", "repo": self.repo.name, "file": "CLAUDE.md", "change": "Mention the owner review flow.",
                  "why": "Review depends on the ticket.", "evidence": [], "confidence": 0.9}
@@ -76,10 +78,15 @@ class EnforcementProposalTests(unittest.TestCase):
 
         report, = (self.repo.layer_dir / check_proposals.DIRECTORY).glob("*.md")
         text = report.read_text()
-        for value in (rule["behavior"], self.proposal["why"], self.proposal["change"], "example.py",
+        for value in (self.proposal["change"], "example.py",
                       self.recent, self.earlier, "### Known-bad example rejected", "### Allowed example accepted",
                       "python -I -S -B -Werror::SyntaxWarning -c", "path/to/source.py < path/to/source.py"):
             self.assertIn(value, text)
+        behavior = "Identity comparisons with literals that Python diagnoses with an equality or inequality suggestion."
+        self.assertIn(f"## Prevented behavior\n\n{behavior}\n\n", text)
+        self.assertIn("## Why it is deterministic\n\nThe Python compiler detects this comparison", text)
+        self.assertIn(f"## Repository context from mining\n\n> {self.proposal['why']}\n\n", text)
+        self.assertNotIn(rule["behavior"], text)
         self.assertRegex(text, r"""### Observed diagnostic\n\n    "is" with (?:a|'str') literal\. Did you mean "=="\?""")
         for example in ("known_bad", "allowed"):
             for line in rule[example].splitlines():
@@ -91,14 +98,17 @@ class EnforcementProposalTests(unittest.TestCase):
         args = [sys.executable, *shlex.split(command)[1:]]
         rejected = subprocess.run(args, input=rule["known_bad"], capture_output=True, text=True, timeout=5)
         accepted = subprocess.run(args, input=rule["allowed"], capture_output=True, text=True, timeout=5)
-        self.assertNotEqual(rejected.returncode, 0)
+        self.assertEqual(rejected.returncode, 1)
         self.assertIn(rule["diagnostic"], rejected.stderr)
         self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertEqual(accepted.stderr, "")
 
         with mock.patch.object(miner, "push_rule") as push:
             self.mine([self.proposal])
             rows = [row for row in board.proposals()["hand"] if row["repo"] == self.repo.name]
             self.assertEqual(len(rows), 1)
+            self.assertIn(behavior, rows[0]["change"])
+            self.assertNotIn(rule["behavior"], rows[0]["change"])
             self.assertEqual(self.repo.layer_dir / rows[0]["file"], report)
             with self.assertRaises(LookupError):
                 miner.file_rule(rows[0]["id"])

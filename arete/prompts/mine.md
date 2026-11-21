@@ -40,7 +40,8 @@ Give an empty list if you found none.
 For `check`, choose a supported `enforcement.evaluator`. The only supported evaluator is
 `python-compile-syntax-warnings`, which compiles Python with SyntaxWarning treated as an error and verifies
 literal identity diagnostics that recommend equality or inequality. Set `change` to the exact sentence below.
-Arete supplies the command itself in the review proposal.
+Arete supplies the command and describes the compiler-verified behavior in the review proposal. Use `why`
+to explain how the recurring correction applies in the target repository.
 
 $check_adoption
 

@@ -204,20 +204,30 @@ def evidence_matches_github(evidence: str, github: str) -> bool:
     return True
 
 
+def prevented_behavior(p: dict) -> str:
+    rule = p["enforcement"]
+    if rule["kind"] == "check":
+        return "Identity comparisons with literals that Python diagnoses with an equality or inequality suggestion."
+    return rule["behavior"]
+
+
 def review_text(p: dict, diagnostic: str) -> str:
     rule = p["enforcement"]
-    layer = "API or architecture" if rule["kind"] == "architecture" else "Executable check"
     sections = ["# Proposed repository enforcement", "Review and implement through the repository's usual change process.",
-                "## Prevented behavior", rule["behavior"], "## Why it is deterministic", p["why"],
-                f"## Recommended layer\n\n{layer}"]
+                "## Prevented behavior", prevented_behavior(p), "## Why it is deterministic"]
     if rule["kind"] == "check":
         command = shlex.join(["python", *COMPILE_ARGS, "path/to/source.py"])
-        sections += [f"Integration target `{p['file']}`\n\n{ADOPTION_CHANGE}",
+        sections += ["The Python compiler detects this comparison from source without running the code. "
+                     "Treating SyntaxWarning as an error makes the diagnostic fail the check.",
+                     "## Repository context from mining", indent(p["why"], "> ", lambda _: True),
+                     "## Recommended layer\n\nExecutable check",
+                     f"Integration target `{p['file']}`\n\n{ADOPTION_CHANGE}",
                      f"```sh\n{command} < path/to/source.py\n```",
                      "Use the repository's Python interpreter and substitute each source path in both positions. "
                      "The command compiles source without running it and rejects syntax warnings and syntax errors."]
     else:
-        sections += [f"Target file `{p['file']}`\n\n{p['change']}"]
+        sections += [p["why"], "## Recommended layer\n\nAPI or architecture",
+                     f"Target file `{p['file']}`\n\n{p['change']}"]
     sections += ["## Existing examples to clean up", "\n".join(f"- `{f}`" for f in sorted(set(rule["cleanup"])))
                  or "No examples identified."]
     if rule["kind"] == "check":

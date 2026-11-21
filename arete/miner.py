@@ -782,7 +782,8 @@ def record_check_proposal(cfg: config.Config, run_id: str, p: dict, recent: dict
     if refusal:
         print(f"  [skip: {refusal}]")
         return
-    print(f"  [repo] {repo.name} {_short(p['enforcement']['behavior'], 140)} [manual review]")
+    behavior = check_proposals.prevented_behavior(p)
+    print(f"  [repo] {repo.name} {_short(behavior, 140)} [manual review]")
     if dry_run:
         return
     family = check_proposals.family_name(p, github)
@@ -795,7 +796,7 @@ def record_check_proposal(cfg: config.Config, run_id: str, p: dict, recent: dict
     if any(row["file"] == str(legacy_relative) for row in legacy):
         relative = legacy_relative
     path = check_proposals.save(repo, relative, report)
-    change = f"Review {relative} in the repo layer. {p['enforcement']['behavior']}"
+    change = f"Review {relative} in the repo layer. {behavior}"
     legacy_ids = [row["id"] for row in legacy if row["status"] == "hand"
                   and check_proposals.evidence_matches_github(row["evidence"], github)]
     approvals_store.record_check_proposal(run_id, dict(p, file=str(relative), change=change),
