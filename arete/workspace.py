@@ -399,11 +399,14 @@ def note_made(ws: Path, checkouts: list[Checkout], owner: dict | None = None) ->
     made_record(ws).unlink(missing_ok=True)
 
 
-def kept_work(ws: Path, checkouts: list[Checkout], source: Path, copies: list[str], commits: bool = True) -> str:
+def kept_work(ws: Path, checkouts: list[Checkout], source: Path, copies: list[str], commits: bool = True,
+              held: list[Path] | None = None) -> str:
     made = made_before(ws)
     salt = salt_of(made)
 
     def unknown(names: list[str]) -> list[str]:
+        if held:
+            names = outside_scratch(ws, names, held)
         return [n for n in names if not made_copy(ws, source, copies, n)
                 and not (salt and made.get(n) == fingerprint(ws / n, salt))]
 
