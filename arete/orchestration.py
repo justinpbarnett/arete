@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import time
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from math import inf
 from pathlib import Path
 from uuid import uuid4
@@ -16,6 +16,7 @@ from . import (
     flows,
     gh,
     journeys,
+    outbound,
     owner_asks,
     pilot,
     pipeline,
@@ -23,6 +24,7 @@ from . import (
     repairs,
     run_lines,
     runlimits,
+    tracker,
     util,
     workspace,
     zte,
@@ -45,6 +47,12 @@ REFRESHABLE_LINEAGE = {"catalog_sha", "controller_prompt", "operations_sha"}
 
 class UnchangedPushedHead(ValueError):
     pass
+
+
+class FailedFinishJiraTracker(tracker.JiraTracker):
+    def move_to(self, tid: str, target: str) -> str:
+        self.shift(tid, target, keep_done=True)
+        return ""
 
 
 def policy_fingerprint(cfg, layer, closed_context):
@@ -129,9 +137,9 @@ class Controller:
         if self.flow.refusal:
             raise factory.Refused(self.flow.refusal)
         pending_push = ledger.catch_up_push(self.data)
-        if self.run.feedback and (closed := [url for url in self.run.feedback_prs if gh.pr_view(url).get("state") != "OPEN"]):
+        if self.run.feedback and (closed := self.run.feedback_closure()):
             self.quiescent()
-            return "noop", f"the PR closed before arete could revise it: {', '.join(closed)}", ""
+            return "noop", closed, ""
         self.flow.matching = False
         run_lines.write(self.run.id, "route", continues=self.flow.continues, mode="orchestrated", protocol=PROTOCOL)
         if self.data.get("prepared"):
@@ -396,7 +404,10 @@ class Controller:
                         grant = self.run.launch_gate(message["step"], message["role"], message["route"]) \
                             if self.run.launch_gate else None
                         ledger.launched(self.lease, self.policy.max_decisions)
+                        if self.run.feedback and not self.run.step_started:
+                            run_lines.write(self.run.id, "work_start")
                         controller.allow(grant)
+                        self.run.step_started = True
                     else:
                         result, complete = message, True
                 if controller.proc.poll() is not None:
@@ -417,6 +428,7 @@ class Controller:
             self.data["error"] = error
             self.persist()
             raise workspace.RunFailed(error, recovery=result.get("recovery"))
+        self.run.step_started = True
         try:
             response = result.get("structured")
             if response is None:
@@ -511,7 +523,10 @@ class Controller:
                     seconds = grant.get("timeout") if isinstance(grant, dict) else None
                     if type(seconds) in (int, float) and seconds > 0:
                         worker.deadline = min(worker.deadline, time.monotonic() + seconds)
+                    if self.run.feedback and not self.run.step_started:
+                        run_lines.write(self.run.id, "work_start")
                     worker.allow(grant)
+                    self.run.step_started = True
                 elif message.get("event") in ("result", "error"):
                     worker.close()
                     del self.workers[key]
@@ -890,25 +905,32 @@ class Controller:
         self.run.say(f"{held}. I parked the run because {reason}.")
         return pipeline.park_run(self.run, f"{held}. {reason}")
 
-    def park_failed_finish(self, turn):
+    def finish_rationale(self, turn):
         with ledger.reader() as connection:
             ledger.fenced(connection, self.lease)
             decision = connection.execute(
                 "SELECT response FROM orchestration_turns WHERE root = ? AND id = ? AND state = 'accepted'",
                 (self.lease.root, turn),
             ).fetchone()
-        rationale = ledger.decoded(decision).get("response", {}).get("rationale", "")
-        reason = rationale.strip() or "the orchestrator stopped without delivery"
+        return ledger.decoded(decision).get("response", {}).get("rationale")
+
+    def park_failed_finish(self, rationale):
+        recovery = self.failure_recovery()
+        self.run.failure = {"class": "environment", **recovery} if recovery else {"class": "work"}
+        reason = outbound.redact(outbound.screen(rationale.strip())) or "the orchestrator stopped without delivery"
         for checkout in self.job.with_prs:
             try:
-                open_pr = gh.pr_view(checkout.pr).get("state") == "OPEN"
+                pr = gh.pr_merge_details(checkout.pr)
             except gh.GhError as error:
                 self.run.log(f"pr: could not inspect {checkout.pr}: {util.first_line(str(error), 300)}")
                 continue
-            if open_pr and pipeline.own_draft_state(self.run, checkout) is False:
+            if pr.get("state") == "OPEN" and pr.get("isDraft") is False:
                 pipeline.set_draft(self.run, checkout, True, "orchestrator")
-        self.run.say(f"Run `{self.run.id}` parked without delivery.\n\n{reason}")
-        return pipeline.park_run(self.run, reason)
+        run = replace(self.run, feedback=[])
+        if isinstance(run.tracker, tracker.JiraTracker):
+            run.tracker = FailedFinishJiraTracker(run.repo, run.tracker.cfg)
+        run.say(f"Run `{run.id}` parked without delivery.\n\n{reason}")
+        return pipeline.park_run(run, reason)
 
     def settle_publication_failure(self, failure):
         if self.data.get("catch_up_hold"):
@@ -1111,8 +1133,9 @@ class Controller:
                   and not zte.reserved(str(self.run.tid))):
                 self.ending = pipeline.park_run(self.run, reason)
             elif (self.run.budget and not (self.run.alone or self.run.action_only or self.run.dry_run)
-                  and not zte.reserved(str(self.run.tid))):
-                self.ending = self.park_failed_finish(action["turn"])
+                  and not zte.reserved(str(self.run.tid)) and (turn := action.get("turn"))
+                  and (rationale := self.finish_rationale(turn)) is not None):
+                self.ending = self.park_failed_finish(rationale)
             else:
                 self.ending = flows.finish(self.flow, "failed", why="the orchestrator stopped without delivery",
                                            recovery=self.failure_recovery())
