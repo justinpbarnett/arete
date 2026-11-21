@@ -101,7 +101,7 @@ def print_proposals(p: dict) -> None:
     for m in p["memory"]:
         print(f"  {m['id']:<4} {m['change']}"[:200])
     if p["hand"]:
-        print("harness fixes to make by hand, since Claude Code denies agent writes under .claude/ (then `arete forget ID`):")
+        print("miner proposals to review by hand (use `arete forget ID` when finished):")
     for h in p["hand"]:
         print(f"  {h['id']:<4} {h['repo']}/{h['file']}: {h['change']}"[:400])
     if p["approve"]:

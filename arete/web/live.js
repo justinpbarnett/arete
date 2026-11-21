@@ -63,9 +63,9 @@ function needsParts(n) {
   take(n.skipped, "The skipped tickets", (skipped) => skipped.map(skippedRow));
   if (n.draft) rows.push(draftRow(n.draft));
   let notes = [];
-  take(n.proposals, "The fixes to make by hand", (p) => {
+  take(n.proposals, "The miner proposals", (p) => {
     notes = [
-      p.hand.length ? quiet("By hand: Claude Code will not let an agent write under .claude/, so the miner leaves these harness fixes to you. Make each one, then mark it done.") : null,
+      p.hand.length ? quiet("By hand: review each proposal and mark it done when finished.") : null,
       p.memory.length ? quiet("Memory: facts the miner noticed for an agent's memory. File each one by hand, then mark it done.") : null,
       p.approve.length ? quiet("Rules: global rules the miner drafted for every agent on every machine. Approve writes one into the global CLAUDE.md and pushes it; reject teaches the miner not to propose it again.") : null,
     ];
