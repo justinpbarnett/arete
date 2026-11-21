@@ -49,15 +49,17 @@ def cmd_run(args) -> int:
 def run_followed(started: dict) -> int:
     from .. import client, pipeline, run_lines
 
-    run_id, status = started["run"], started["state"]
+    run_id, state = started["run"], started["state"]
     client.emit(started)
     if not run_id:
-        return 0 if status in ("queued", "starting") else 1
+        return 0 if state in ("queued", "starting") else 1
     try:
         for line in client.followed(run_id):
-            client.emit(line)
             if line.get("event") == run_lines.END:
-                return 0 if line.get("status") in pipeline.SUCCEEDED else 1
+                status = client.field(line, "status", kind=str)
+                client.emit(line)
+                return 0 if status in pipeline.SUCCEEDED else 1
+            client.emit(line)
     except KeyboardInterrupt:
         print(f"detached; run {run_id} keeps going; `arete stop {run_id}` stops it", file=sys.stderr)
         return 130

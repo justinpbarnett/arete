@@ -545,7 +545,7 @@ def keyed_call(body, key, *, deadline=None):
         left = deadline - time.monotonic()
         if left <= 0:
             raise restart or failure or Failed({"error": "task start retry budget expired"})
-        if uncertain:
+        if uncertain and restart is None:
             if retries >= 2:
                 raise failure
             retries += 1
@@ -561,11 +561,11 @@ def keyed_call(body, key, *, deadline=None):
             return answer
         except BROKE as e:
             failure = Broken({"error": f"the server broke off: {e}"})
-            uncertain, pause = True, 0
+            uncertain, pause = True, RETRY_SECONDS if restart is not None else 0
         except (Broken, InFlight) as e:
             if restart is not None and time.monotonic() >= deadline:
                 raise restart
-            failure, pause = e, getattr(e, "seconds", 0)
+            failure, pause = e, getattr(e, "seconds", RETRY_SECONDS if restart is not None else 0)
             uncertain = True
         except Restarting as e:
             restart = failure = Failed(e.answer, 503)

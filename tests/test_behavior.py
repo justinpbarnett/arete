@@ -306,8 +306,13 @@ class _CliThroughServeCase(unittest.TestCase):
     def stub(self, response):
         class Handler(BaseHTTPRequestHandler):
             def reply(handler):
-                status, answer, headers = response(handler)
-                raw = json.dumps(answer).encode()
+                result = response(handler)
+                if result is None:
+                    handler.rfile.read(int(handler.headers.get("Content-Length", "0")))
+                    handler.close_connection = True
+                    return
+                status, answer, headers = result
+                raw = answer if isinstance(answer, bytes) else json.dumps(answer).encode()
                 handler.send_response(status)
                 for name, value in headers.items():
                     handler.send_header(name, value)
@@ -424,11 +429,11 @@ class CliThroughServeAccessTests(_CliThroughServeCase):
         problem = "arete: cannot import arete.commands.setup: RuntimeError: broken candidate"
         with mock.patch.object(codebase, "load", side_effect=SystemExit(problem)):
             code, lines, err = self.cli("status --limit 1")
-        self.assertEqual(code, 0)
-        self.assertEqual(lines, [
-            "serve heartbeat at 2000-01-01T00:00:00Z, running code old-engine, checkout HEAD broken-head",
+        self.assertEqual((code, lines), (1, []))
+        self.assertEqual(err.splitlines(), [
+            problem,
+            "last recorded serve heartbeat at 2000-01-01T00:00:00Z, running code old-engine, checkout HEAD broken-head",
         ])
-        self.assertEqual(err.splitlines(), [problem])
         self.assertFalse(paths.DB_FILE.exists())
 
     def test_readers_and_worker_guards(self):
@@ -766,6 +771,76 @@ class CliThroughServeCommandTests(_CliThroughServeCase):
 
 
 class CliThroughServeRunTests(_CliThroughServeCase):
+    def test_task_start_recovers_from_a_dropped_response_and_reload(self):
+        self.in_subprocess("check_task_start_recovers_from_a_dropped_response_and_reload")
+
+    def check_task_start_recovers_from_a_dropped_response_and_reload(self):
+        from errno import ECONNREFUSED
+        from socket import create_connection
+
+        from arete import client
+
+        started = {"task": "t-1234", "state": "queued", "run": ""}
+        sent, refused = [], []
+
+        def response(request):
+            if request.path == "/api/meta":
+                return 200, {"instance": {"id": "reloading"}}, {}
+            sent.append((request.path, request.headers.get("Idempotency-Key")))
+            if len(sent) == 1:
+                return None
+            if len(sent) == 2:
+                return 503, {"error": "server is draining", "code": "draining"}, {"Retry-After": "0"}
+            return 200, started, {}
+
+        def connect(address, *args, **kwargs):
+            if len(sent) == 2 and not refused:
+                refused.append(address)
+                raise ConnectionRefusedError(ECONNREFUSED, os.strerror(ECONNREFUSED))
+            return create_connection(address, *args, **kwargs)
+
+        key = "restart-key"
+        with (self.stub(response), mock.patch("socket.create_connection", side_effect=connect),
+              mock.patch.object(client, "RETRY_SECONDS", 0), mock.patch.dict(os.environ, {"ARETE_IDEMPOTENCY_KEY": key})):
+            code, lines, err = self.cli("run replay-sample 7")
+        self.assertEqual((code, list(map(json.loads, lines)), err), (0, [started], f"Idempotency-Key: {key}\n"))
+        self.assertEqual(len(refused), 1)
+        self.assertEqual(sent, [("/api/tasks", key)] * 3)
+
+    def test_run_validates_terminal_status_before_printing(self):
+        self.in_subprocess("check_run_validates_terminal_status_before_printing")
+
+    def check_run_validates_terminal_status_before_printing(self):
+        from arete import client
+
+        started = {"task": "t-1234", "state": "running", "run": "r1"}
+        step = {"event": "step_end", "seq": 1, "step": "plan"}
+        report = {"event": "report", "seq": 2}
+        events = client.events
+
+        def response(request):
+            if request.path == "/api/meta":
+                return 200, {"instance": {"id": "reports"}}, {}
+            if request.path == "/api/runs/r1/events?from=0&follow=1":
+                return 200, b"".join(json.dumps(line).encode() + b"\n" for line in (step, report)), {}
+            return 200, started, {}
+
+        def observed_events(*args, **kwargs):
+            self.assertEqual(list(map(json.loads, sys.stdout.getvalue().splitlines())), [started])
+            with closing(events(*args, **kwargs)) as stream:
+                yield next(stream)
+                self.assertEqual(list(map(json.loads, sys.stdout.getvalue().splitlines())), [started, step])
+                yield from stream
+
+        with self.stub(response), mock.patch.object(client, "events", side_effect=observed_events):
+            code, lines, err = self.cli("run replay-sample 7")
+            error = {"error": "server answer is missing or has an invalid field status"}
+            self.assertEqual((code, list(map(json.loads, lines))), (1, [started, step, error]), err)
+            self.assertNotIn("Traceback", err)
+            report["status"] = "done"
+            code, lines, err = self.cli("run replay-sample 7")
+        self.assertEqual((code, list(map(json.loads, lines))), (0, [started, step, report]), err)
+
     def test_run_retries_keep_the_original_version(self):
         self.in_subprocess("check_run_retries_keep_the_original_version")
 

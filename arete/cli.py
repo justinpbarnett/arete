@@ -46,9 +46,9 @@ def status_from_heartbeat(problem: SystemExit) -> int:
     except (OSError, ValueError):
         beat = None
     if isinstance(beat, dict) and (revisions := codebase.serve_revisions(beat)):
-        print(f"serve heartbeat at {beat.get('at', 'unknown time')}, {revisions}")
-        return 0
-    print("serve heartbeat has no recorded revisions", file=sys.stderr)
+        print(f"last recorded serve heartbeat at {beat.get('at', 'unknown time')}, {revisions}", file=sys.stderr)
+    else:
+        print("serve heartbeat has no recorded revisions", file=sys.stderr)
     return 1
 
 
