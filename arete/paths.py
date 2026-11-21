@@ -1,140 +1,27 @@
-import errno
 import json
 import os
 import re
-import stat
 import sys
 import tomllib
-from contextlib import contextmanager
 from pathlib import Path
+
+from . import local_paths
+from .local_paths import SCRATCH_ENV as SCRATCH_ENV
+from .local_paths import SCRATCH_PREFIX as SCRATCH_PREFIX
+from .local_paths import SCRATCH_SUFFIX as SCRATCH_SUFFIX
+from .local_paths import confined as confined
+from .local_paths import directory_fd as directory_fd
+from .local_paths import scratch_root as scratch_root
 
 HOME = Path.home()
 ON_MAC = sys.platform == "darwin"
-SCRATCH_PREFIX = ".arete-scratch-"
-SCRATCH_SUFFIX = ".noindex"
-SCRATCH_ENV = "ARETE_VERIFY_SCRATCH"
-SCRATCH_TOKEN = re.compile(r"[0-9a-f]{16}(?:" + re.escape(SCRATCH_SUFFIX) + ")?")
-SEARCH_ONLY = getattr(os, "O_SEARCH", 0)
 NOWHERE = Path("/var/empty/arete-isolated")
 CREDENTIAL_NAME = re.compile(r"TOKEN|SECRET|PASSW|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CREDENTIAL|^access$|^refresh$", re.IGNORECASE)
 ISOLATED_LOGINS = "scratch config and state never use this machine's logins, keys or price lookups"
-ISOLATED_REFUSAL = (f"arete: refusing to start: with {SCRATCH_ENV}, or ARETE_CONFIG_DIR or ARETE_STATE_DIR in a scratch "
-                    f"folder, the config and state folders must both sit, without links, in the one scratch folder "
-                    f"selected for isolation (unset ones go to its config and state folders)")
-
-
-def inside_scratch(d: Path) -> bool:
-    return any(part.startswith(SCRATCH_PREFIX) for part in (*d.absolute().parts, *Path(os.path.realpath(d)).parts))
-
-
-def valid_scratch(root: str) -> os.stat_result | None:
-    try:
-        name = os.path.basename(root)
-        if (not os.path.isabs(root) or os.path.abspath(root) != root or not name.startswith(SCRATCH_PREFIX)
-                or not SCRATCH_TOKEN.fullmatch(name.removeprefix(SCRATCH_PREFIX))):
-            return None
-        st = os.lstat(root)
-    except (OSError, TypeError, ValueError):
-        return None
-    if (not stat.S_ISDIR(st.st_mode) or os.path.realpath(root) != root or st.st_uid != os.getuid()
-            or st.st_mode & 0o077):
-        return None
-    return st
-
-
-def scratch_root(p: Path) -> Path | None:
-    full = Path(os.path.abspath(p))
-    for d in (full, *full.parents):
-        if d.name.startswith(SCRATCH_PREFIX):
-            return d if valid_scratch(str(d)) else None
-    return None
-
-
-def confined(p: Path) -> Path | None:
-    root = scratch_root(p)
-    if root is None:
-        return None
-    here = root
-    for part in Path(os.path.abspath(p)).relative_to(root).parts:
-        here = here / part
-        try:
-            if stat.S_ISLNK(os.lstat(here).st_mode):
-                return None
-        except FileNotFoundError:
-            break
-        except OSError:
-            return None
-    real = Path(os.path.realpath(p))
-    return real if real == root or root in real.parents else None
-
-
-def open_directory(part: str, parent: int, above_target: bool) -> int:
-    flags = os.O_DIRECTORY | os.O_NOFOLLOW
-    if above_target and SEARCH_ONLY:
-        try:
-            return os.open(part, SEARCH_ONLY | flags, dir_fd=parent)
-        except PermissionError:
-            pass
-    return os.open(part, os.O_RDONLY | flags, dir_fd=parent)
-
-
-@contextmanager
-def directory_fd(p: Path, parent: int | None = None, create: bool = False):
-    parts = p.parts
-    if ".." in parts or (parent is not None and p.is_absolute()):
-        raise PermissionError("directory traversal refused")
-    fd = os.dup(parent) if parent is not None else os.open("/", os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        walked = parts if parent is not None else p.absolute().parts[1:]
-        for index, part in enumerate(walked):
-            if create:
-                try:
-                    os.mkdir(part, 0o700, dir_fd=fd)
-                except FileExistsError:
-                    pass
-            next_fd = open_directory(part, fd, index < len(walked) - 1)
-            os.close(fd)
-            fd = next_fd
-        yield fd
-    finally:
-        os.close(fd)
 
 
 def read_confined(p: Path, limit: int | None = None) -> bytes:
-    if not ISOLATED:
-        with open(p, "rb") as f:
-            return f.read(-1 if limit is None else limit)
-    root = scratch_root(p)
-    parts = Path(os.path.abspath(p)).parts
-    if root is None or len(parts) <= len(root.parts) or ".." in Path(p).parts:
-        raise FileNotFoundError(errno.ENOENT, "not a file inside a scratch folder", str(p))
-    try:
-        expected = os.lstat(root)
-        with directory_fd(root) as root_fd:
-            current = os.fstat(root_fd)
-            if (expected.st_dev, expected.st_ino) != (current.st_dev, current.st_ino):
-                raise PermissionError("scratch credential root replaced")
-            with directory_fd(p.absolute().parent.relative_to(root), root_fd) as parent:
-                source = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
-                with os.fdopen(source, "rb") as f:
-                    st = os.fstat(source)
-                    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid != os.getuid():
-                        raise FileNotFoundError(errno.ENOENT, "not a plain file of this user", str(p))
-                    return f.read(-1 if limit is None else limit)
-    except OSError as e:
-        raise FileNotFoundError(errno.ENOENT, "not a file inside a scratch folder", str(p)) from e
-
-
-def isolated_dirs() -> tuple[Path, Path]:
-    given = {name: os.environ.get(f"ARETE_{name.upper()}_DIR", "") for name in ("config", "state")}
-    roots = {str(r) if (r := scratch_root(Path(v))) else "" for v in given.values() if v}
-    if asked := os.environ.get(SCRATCH_ENV, ""):
-        roots.add(asked)
-    root = roots.pop() if len(roots) == 1 else ""
-    config, state = (Path(given[name] or os.path.join(root, name)) for name in ("config", "state"))
-    if not root or valid_scratch(root) is None or confined(config) is None or confined(state) is None:
-        raise SystemExit(ISOLATED_REFUSAL)
-    return config, state
+    return local_paths.read_confined(p, limit, isolated=ISOLATED)
 
 
 def drop_credentials() -> None:
@@ -142,14 +29,10 @@ def drop_credentials() -> None:
         del os.environ[name]
 
 
-CONFIG_DIR = Path(os.environ.get("ARETE_CONFIG_DIR", HOME / ".config" / "arete"))
-STATE_DIR = Path(os.environ.get("ARETE_STATE_DIR", HOME / ".local" / "share" / "arete"))
 CLIENT_DIR = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local/state") / "arete-client"
 GUARD_HOOK = sys.argv[1:2] in (["guard"], ["codex-guard"])
-ISOLATED = not GUARD_HOOK and (bool(os.environ.get(SCRATCH_ENV)) or inside_scratch(CONFIG_DIR)
-                               or inside_scratch(STATE_DIR))
+CONFIG_DIR, STATE_DIR, ISOLATED = local_paths.local_dirs(HOME, guard_hook=GUARD_HOOK)
 if ISOLATED:
-    CONFIG_DIR, STATE_DIR = isolated_dirs()
     drop_credentials()
 SCRATCH_CONFIG = confined(CONFIG_DIR) is not None
 SCRATCH_STATE = confined(STATE_DIR) is not None
@@ -170,6 +53,7 @@ RUNS_DIR = STATE_DIR / "runs"
 WORKTREES_DIR = Path(os.environ.get("ARETE_WORKTREES_DIR", HOME / "Library" / "Developer" / "arete" / "worktrees"
                                     if ON_MAC and not ISOLATED else STATE_DIR / "worktrees"))
 HEARTBEAT_FILE = STATE_DIR / "heartbeat.json"
+SERVE_BEAT_FILE = STATE_DIR / local_paths.SERVE_BEAT_NAME
 SERVER_FILE = STATE_DIR / "server.json"
 DASHBOARD_PORT = 8796
 TLS_CERT_FILE = STATE_DIR / "dashboard.crt"
@@ -192,7 +76,7 @@ PER_CALL_HOOKS = ("hook", "guard", "codex-guard", "background")
 
 
 def cli_command(*args: str, flags: tuple[str, ...] = ()) -> list[str]:
-    pinned = "" if args[:1] and args[0] in PER_CALL_HOOKS else "from arete import codebase; codebase.load(); "
+    pinned = "" if args and args[0] in (*PER_CALL_HOOKS, "status") else "from arete import codebase; codebase.load(); "
     entrypoint = (f"import sys; sys.path.insert(0, {str(PACKAGE_DIR.parent)!r}); {pinned}"
                   "from arete.cli import main; raise SystemExit(main())")
     return [sys.executable, "-I", *flags, "-c", entrypoint, *args]

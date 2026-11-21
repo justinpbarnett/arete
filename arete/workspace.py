@@ -509,18 +509,20 @@ def kept_or_cleared(ws: Path, checkouts: list[Checkout], source: Path, copies: l
 
 
 def make_workspace(run_id: str, repo: config.Repo, base: str, branch: str, key: str,
-                   copies: list[str]) -> tuple[Path, list[Checkout]]:
+                   copies: list[str], *, preview_of: str = "") -> tuple[Path, list[Checkout]]:
     ws = paths.WORKTREES_DIR / f"{repo.name}-{key}"
     checkouts = [Checkout(p.dir, p.github, repo.path / p.dir, ws / p.dir, base or gh.default_branch(p.github))
                  for p in repo.parts]
     kept = kept_or_cleared(ws, checkouts, repo.path, copies, branch)
 
     def resumes_for(c: Checkout) -> bool:
+        if preview_of:
+            return bool(remote_head(c.src, preview_of))
         c.pr = gh.open_pr_url(c.github, branch)
         c.lease = remote_head(c.src, branch)
         return bool(c.pr) or (bool(c.lease) and c.lease not in gh.closed_pr_heads(c.github, branch))
 
-    place_checkouts(run_id, checkouts, kept, branch, resumes_for)
+    place_checkouts(run_id, checkouts, kept, branch, resumes_for, starting_branch=preview_of or branch)
     return ws, checkouts
 
 
@@ -702,13 +704,14 @@ def drop_untracked_bytecode(wt: Path) -> None:
 
 
 def place_checkouts(run_id: str, checkouts: list[Checkout], kept: dict[str, str], branch: str,
-                    resumes_for: Callable[[Checkout], bool]) -> None:
+                    resumes_for: Callable[[Checkout], bool], *, starting_branch: str = "") -> None:
+    starting_branch = starting_branch or branch
     for c in checkouts:
         with record.timed(run_id, "clone", repo=c.github, base=c.base, branch=branch, path=str(c.wt)) as clone:
             fetch(c.src, c.base)
             c.resumes = resumes_for(c)
             if c.resumes:
-                fetch(c.src, branch)
+                fetch(c.src, starting_branch)
             if str(c.wt) in kept:
                 continue_from(c, branch, kept[str(c.wt)])
                 clone["continued"] = True
@@ -716,5 +719,5 @@ def place_checkouts(run_id: str, checkouts: list[Checkout], kept: dict[str, str]
                 if kept and (c.wt / ".git").exists():
                     with util.repo_lock(c.src):
                         git(["worktree", "remove", "--force", str(c.wt)], c.src)
-                add_worktree(c, branch, start_of(c, branch))
+                add_worktree(c, branch, start_of(c, starting_branch))
             clone["resumed"] = c.resumes
