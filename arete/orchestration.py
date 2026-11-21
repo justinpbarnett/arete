@@ -453,7 +453,8 @@ class Controller:
             self.data["job"] = {**self.data["job"], "reviews": 0, "ci_result": ""}
 
     def lineage(self):
-        pinned = pilot.is_pilot_task(str(self.run.tid)) or zte.reserved(str(self.run.tid))
+        tid = str(getattr(self.run, "tid", ""))
+        pinned = pilot.is_pilot_task(tid) or zte.reserved(tid)
         restarts = not pinned and any(c.get("pr") for c in self.data.get("prepared", {}).get("checkouts", ()))
         self.catalog = Catalog(self.job)
         policy = self.policy_sha()
