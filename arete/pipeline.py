@@ -3334,6 +3334,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                 run.log(f"{step}: the app answers at {url}")
             if v.probes or drivers or replay:
                 probe_config = replace(v, probe_seconds=run.time_for(v.probe_seconds))
+            if replay:
                 probe_deadline = time.monotonic() + probe_config.probe_seconds
             if v.probes or drivers:
                 probes = verify.run_probes(probe_config, b.ws, attempt, journey_drivers=drivers)
@@ -3349,11 +3350,9 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                     v = replace(v, notes=v.notes + f"\n\nArete already executed these owner-configured {name} in a "
                                 "confined disposable workspace. Use their observed results as evidence; do not repeat "
                                 "these commands. " + instructions + probes.markdown())
-            if (not probes or probes.verdict == "pass") and replay:
+            driver_config = None
+            if replay and (not probes or probes.verdict == "pass"):
                 driver_config = replace(v, probes={}, probe_seconds=probe_deadline - time.monotonic())
-                observed = verify.run_probes(driver_config, b.ws, attempt, journey_drivers=replay,
-                                             stop_on_driver_failure=False)
-                run.save(f"{step}-replay-drivers.json", asdict(observed))
             if not replay_only and (not probes or probes.verdict == "pass"):
                 agent_started = True
                 res = run.agent(step, b.brief.prompt(
@@ -3367,6 +3366,10 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                                 mcp_config=browser.mcp_config(evidence) if url else "",
                                 scratch=attempt)
                 agent_finished = True
+            if driver_config:
+                observed = verify.run_probes(driver_config, b.ws, attempt, journey_drivers=replay,
+                                             stop_on_driver_failure=False)
+                run.save(f"{step}-replay-drivers.json", asdict(observed))
     except (owner_asks.Asked, CatchUpNeedsInput):
         agent_finished = True
         raise

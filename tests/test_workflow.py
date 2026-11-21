@@ -1449,14 +1449,20 @@ class MergeCheckJourneyTests(unittest.TestCase):
         self.agent.assert_called_once()
 
     def test_driver_only_failure_names_the_journey_and_its_observation(self):
-        replay, result = self.replay_driver(1)
+        self.prepare_replay(1)
 
-        self.assertEqual(result.failed, [1])
-        self.assertEqual(result.blocked_by, "")
-        self.assertIn("journey:checkout", mergecheck.finding(replay, result.failed)["summary"])
+        code, stdout, _ = self.consume(self.items)
+
+        self.assertEqual(code, 0)
+        finding, metric = map(json.loads, stdout.splitlines())
+        self.assertIn("journey:checkout", finding["summary"])
+        self.assertIn("local merge-check record for replay-fixture", finding["summary"])
+        self.assertEqual(metric, {"value": 0})
+        self.assertEqual(self.checked(), [self.item["key"]])
         self.assertEqual(json.loads((self.run_dir / "driver-failures.json").read_text()), {
             "1": {"what": "journey:checkout", "saw": "exit 1: merged checkout output\n"},
         })
+        self.spawn.assert_called_once()
         self.agent.assert_not_called()
 
     def test_failure_block_and_pending_driver_preserve_the_regression_and_retry_the_batch(self):
@@ -1519,6 +1525,18 @@ class MergeCheckJourneyTests(unittest.TestCase):
         self.assertFalse((self.run_dir / "driver-failures.json").exists())
         self.agent.assert_not_called()
 
+    def test_replay_driver_without_trusted_scratch_holds_without_spawning(self):
+        self.prepare_replay(0)
+        with mock.patch.object(verify.scratch, "make", side_effect=sandbox.ConfinementUnavailable("unavailable")):
+            code, stdout, stderr = self.consume(self.items)
+
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("journey:checkout", stderr)
+        self.assertEqual(self.checked(), [])
+        self.spawn.assert_not_called()
+        self.agent.assert_not_called()
+
     def test_later_driver_failure_wins_over_the_first_driver_exit_127(self):
         replay, result = self.replay_driver(127, later_drivers={"inventory": 1})
 
@@ -1542,10 +1560,13 @@ class MergeCheckJourneyTests(unittest.TestCase):
         self.assertNotIn(marker, json.dumps(finding))
 
     def test_driver_only_success_executes_the_configured_driver_once(self):
-        _, result = self.replay_driver(0)
+        self.prepare_replay(0)
 
-        self.assertEqual(result.failed, [])
-        self.assertEqual(result.blocked_by, "")
+        code, stdout, _ = self.consume(self.items)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(stdout), {"value": 1})
+        self.assertEqual(self.checked(), [self.item["key"]])
         self.spawn.assert_called_once()
         self.agent.assert_not_called()
 
@@ -1674,6 +1695,9 @@ class MergeCheckJourneyTests(unittest.TestCase):
             "verdict": "fail", "summary": "Catalog regressed.",
             "checks": [{"what": "Step 1: Inspect the catalog", "how": "echo catalog", "saw": "empty", "passed": False}],
         })
+        replay = mock.Mock()
+        replay.attach_mock(self.agent, "grade")
+        replay.attach_mock(self.spawn, "driver")
 
         code, stdout, stderr = self.consume(self.items)
 
@@ -1684,7 +1708,20 @@ class MergeCheckJourneyTests(unittest.TestCase):
         self.assertIn("journey:checkout", stderr)
         self.assertEqual(metric, {"value": 0})
         self.assertEqual(self.checked(), [])
-        self.agent.assert_called_once()
+        self.assertEqual([call[0] for call in replay.mock_calls], ["grade", "driver"])
+
+    def test_malformed_manifest_row_prevents_publication_even_when_both_kinds_of_check_fail(self):
+        check = {"what": "Step 1: Inspect the catalog", "how": "echo catalog", "saw": "empty", "passed": False}
+        self.prepare_replay(1, grade={"verdict": "fail", "summary": "Catalog regressed.",
+                                      "checks": [check, {**check, "what": "Malformed"}]})
+
+        code, stdout, stderr = self.consume(self.items)
+
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("unknown or invalid step", stderr)
+        self.assertEqual(self.checked(), [])
+        self.spawn.assert_called_once()
 
     def test_driver_failure_with_an_unaccounted_ordinary_step_holds_without_a_finding(self):
         check = {"what": "Inspect the catalog", "how": "echo catalog", "saw": "catalog", "passed": True}
