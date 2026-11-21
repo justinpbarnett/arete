@@ -369,7 +369,7 @@ class PendingBaseMergePublicationTests(PublicationFixture):
 class ResolverScratchFixture(unittest.TestCase):
     MARKER = "arete-verification-scratch-v1\n"
     LOG = ".arete-sandbox/logs/db.log"
-    TRACKED = ".arete-sandbox/tracked.txt"
+    TRACKED = ".arete-sandbox/logs/tracked.txt"
     merge_fixture = None
 
     def setUp(self):
@@ -390,8 +390,8 @@ class ResolverScratchFixture(unittest.TestCase):
         (root / "conflict.txt").write_text("original\n")
         tracked = root / cls.TRACKED
         if tracked_changed_by or tracked_added_by_base:
-            tracked.parent.mkdir()
-            (tracked.parent / ".arete-owned").write_text(cls.MARKER)
+            tracked.parent.mkdir(parents=True)
+            (root / ".arete-sandbox/.arete-owned").write_text(cls.MARKER)
         if tracked_changed_by:
             tracked.write_text("original tracked content\n")
             git("add", "-f", "--", cls.TRACKED)
@@ -408,6 +408,8 @@ class ResolverScratchFixture(unittest.TestCase):
         (root / "conflict.txt").write_text("base\n")
         if tracked_changed_by in ("base", "both") or tracked_added_by_base:
             tracked.write_text("base content\n")
+        if tracked_changed_by == "removed by base":
+            tracked.unlink()
         if tracked_added_by_base:
             (root / "incoming.txt").write_text("incoming addition\n")
             git("add", "-f", "--", cls.TRACKED)
@@ -417,7 +419,8 @@ class ResolverScratchFixture(unittest.TestCase):
         git("merge", "--no-commit", "main", check=False)
 
     def merge(self, tracked_changed_by="", tracked_added_by_base=False):
-        self.root = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         if self.merge_fixture is not None:
             shutil.copytree(self.merge_fixture, self.root, dirs_exist_ok=True)
         else:
@@ -458,7 +461,8 @@ class ResolverScratchFixture(unittest.TestCase):
 class SharedResolverScratchFixture(ResolverScratchFixture):
     @classmethod
     def setUpClass(cls):
-        cls.merge_fixture = Path(cls.enterClassContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        cls.merge_fixture = Path(tempfile.mkdtemp())
+        cls.addClassCleanup(shutil.rmtree, cls.merge_fixture, ignore_errors=True)
         cls.create_merge(cls.merge_fixture)
 
 
@@ -510,6 +514,7 @@ class ResolverScratchTests(SharedResolverScratchFixture):
         (folder / ".arete-owned").write_text(self.MARKER.removesuffix("\n"))
         self.write_log()
         (self.root / ".arete-sandbox/.arete-owned").write_text(self.MARKER)
+        (self.root / "ignored.local").write_text("ignored original\n")
 
         def edit():
             self.write_log()
@@ -665,6 +670,19 @@ class TrackedResolverScratchTests(ResolverScratchFixture):
                 self.assertEqual(self.git("ls-tree", "-r", "--name-only", "HEAD", "--", self.LOG), "")
                 self.assertEqual((self.root / self.LOG).read_text(), "verification ran\n")
                 self.assertEqual(workspace.uncommitted(self.root), [])
+
+    def test_parent_tracked_path_under_logs_can_be_restored(self):
+        self.merge(tracked_changed_by="removed by base")
+        tracked = self.root / self.TRACKED
+        self.assertFalse(tracked.exists())
+
+        def edit():
+            self.write_log()
+            tracked.write_text("restored parent content\n")
+
+        self.resolve(edit)
+        self.assertEqual(self.git("show", f"HEAD:{self.TRACKED}"), "restored parent content")
+        self.assertEqual(self.git("ls-tree", "-r", "--name-only", "HEAD", "--", self.LOG), "")
 
     def test_tracked_scratch_conflict_is_resolved(self):
         self.merge(tracked_changed_by="both")

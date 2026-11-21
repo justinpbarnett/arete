@@ -38,7 +38,8 @@ $base_log
 - Shell commands you may run: $commands. Others are refused.
 - Never edit `.agents/`, CI workflows, or env files.
 - You may run a check through the layer's verification wrapper when the shell rules allow it. The wrapper's
-  untracked and ignored scratch files are exempt while its ownership marker remains valid and unchanged.
+  untracked and ignored scratch files are exempt when the same valid ownership marker is present before and
+  after resolution. Tracked files in that folder follow the same editing rules as other tracked files.
 - Keep other optional validation cache-free and read-only. Skip checks that write outside the permitted files.
   Run Ruff as `uvx ruff check --no-cache ...` (arete also sets `RUFF_NO_CACHE`). Arete stops the merge if it
   detects edits outside the permitted files and exempt scratch files, including other ignored files and caches.

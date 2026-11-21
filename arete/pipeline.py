@@ -839,10 +839,6 @@ def lines_by_file(staged: diffguard.Diff, top: int = 12) -> str:
 VERIFY_SCRATCH_ROOT = Path(".arete-sandbox")
 VERIFY_SCRATCH_MARKER = ".arete-owned"
 VERIFY_SCRATCH_CONTENT = b"arete-verification-scratch-v1"
-WRAPPER_OUTPUT_DIRS = {"state", "logs", "worktrees", "tmp", "uv-cache"}
-WRAPPER_OUTPUT_FILES = {Path(name) for name in (
-    ".gitignore", VERIFY_SCRATCH_MARKER, "config/config.toml", ".replay-bootstrap.lock", ".replay-bootstrap.json",
-)}
 
 
 def names_verification_wrapper(rule: str) -> bool:
@@ -872,22 +868,12 @@ def resolver_scratch_paths(names: set[str], roots: set[Path]) -> set[str]:
     return {n for n in names if roots and not roots.isdisjoint(Path(n).parents)}
 
 
-def wrapper_scratch_output(path: Path, wrapper_roots: set[Path]) -> bool:
-    for root in wrapper_roots.intersection(path.parents):
-        relative = path.relative_to(root)
-        if relative in WRAPPER_OUTPUT_FILES or relative.parts[0] in WRAPPER_OUTPUT_DIRS:
-            return True
-    return False
-
-
 def restorable_scratch_paths(wt: Path, incoming: str, roots: set[Path]) -> set[str]:
     if not roots:
         return set()
     deletions = ["diff", "--cached", "--no-renames", "--ignore-submodules=none", "--name-only", "--diff-filter=D"]
     deleted = {path for parent in ("HEAD", incoming) for path in util.git_records([*deletions, parent], wt)}
-    wrapper_roots = {root for root in roots if root.name == VERIFY_SCRATCH_ROOT.name}
-    return {path for path in resolver_scratch_paths(deleted, roots)
-            if not wrapper_scratch_output(Path(path), wrapper_roots)}
+    return resolver_scratch_paths(deleted, roots)
 
 
 def resolver_file_metadata(path: Path) -> tuple[int, ...] | None:
