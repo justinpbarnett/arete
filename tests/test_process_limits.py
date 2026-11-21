@@ -749,6 +749,8 @@ class QueueTests(Isolated):
 
 
 class EnvironmentRequeueTests(Isolated):
+    class_timeout = 20
+
     def setUp(self):
         super().setUp()
         tasks_store.task_set_state(self.ticket, "closed")
