@@ -439,8 +439,9 @@ class Controller:
                         workspace.note_made(self.job.ws, self.job.checkouts,
                                             pipeline.workspace_owner(self.run, self.job.ws, self.job.checkouts))
                         if why := workspace.kept_work(self.job.ws, self.job.checkouts, self.run.repo.path,
-                                                       self.job.layer.copy, commits=False):
-                            raise factory.Refused(why)
+                                                       self.job.layer.copy, commits=False,
+                                                       held=workspace.scratch_left(self.job.ws, self.job.checkouts)):
+                            raise workspace.worktree_failure(why, self.job.ws, self.job.branch)
                     ledger.transition(self.lease, key, "succeeded" if message.get("ok") else "failed", result)
                     self.catalog.add_context(key, message.get("text", message.get("error", "")))
                     if worker.writing:
