@@ -42,20 +42,54 @@ class _CliThroughServeCase(unittest.TestCase):
     class_timeout = 30
     class_worker = None
     OWNER = "cli-owner@example.test"
-    ONLINE = (
-        "run replay-sample 7", "task add --repo replay-sample change", "task list", "task show t-1234",
-        "task reply t-1234 answer", "task close t-1234", "task start --repo replay-sample change",
-        "task run replay-sample 7", "answer r1", "resume r1", "repair r1", "step r1 build", "wait r1",
-        "lines r1", "status", "stop r1", "approve 1", "forget 1", "file-rule 1", "reject-rule 1",
-        "loop start example", "loop enable example", "loop disable example", "loop stop example",
-        "session start work", "session attach r1", "session send r1 hello", "session stop r1",
-        "oncall off", "oncall on", "oncall cancel 1", "oncall dismiss 1", "oncall retry 1",
-    )
-    ONLINE_VARIANTS = (
-        "status --json r1", "status --json", "record pin r1", "record unpin r1", "approve 1 --reject",
-        "loop start example -f", "session --chat 1 start work", "session --chat 1 list",
-        "session --chat 1 report r1", "session --chat 1 stop r1",
-    )
+    ONLINE = {
+        "run replay-sample 7": "POST /api/tasks",
+        "task add --repo replay-sample change": None,
+        "task list": "GET /api/tasks",
+        "task show t-1234": "GET /api/tasks/{task}",
+        "task reply t-1234 answer": None,
+        "task close t-1234": None,
+        "task start --repo replay-sample change": "POST /api/tasks",
+        "task run replay-sample 7": "POST /api/tasks",
+        "answer r1": "POST /api/asks/{id}/answer",
+        "resume r1": "POST /api/runs/{run}/resume",
+        "repair r1": "POST /api/runs/{run}/repair",
+        "step r1 build": "POST /api/runs/{run}/steps/{step}",
+        "wait r1": "GET /api/runs/{run}/events",
+        "lines r1": "GET /api/runs/{run}/events",
+        "status": None,
+        "stop r1": "POST /api/runs/{run}/stop",
+        "approve 1": "POST /api/approvals/{id}",
+        "forget 1": "POST /api/proposals/{id}/done",
+        "file-rule 1": "POST /api/proposals/{id}/approve",
+        "reject-rule 1": "POST /api/proposals/{id}/reject",
+        "loop start example": "POST /api/loops/{name}/start",
+        "loop enable example": "POST /api/loops/{name}/enable",
+        "loop disable example": "POST /api/loops/{name}/disable",
+        "loop stop example": "POST /api/runs/{run}/stop",
+        "session start work": "POST /api/sessions",
+        "session attach r1": None,
+        "session send r1 hello": None,
+        "session stop r1": "POST /api/runs/{run}/stop",
+        "oncall off": "POST /api/incidents/switch",
+        "oncall on": "POST /api/incidents/switch",
+        "oncall cancel 1": "POST /api/incidents/{id}/cancel",
+        "oncall dismiss 1": "POST /api/incidents/{id}/dismiss",
+        "oncall retry 1": "POST /api/incidents/{id}/retry",
+    }
+    ONLINE_VARIANTS = {
+        "status --json r1": "GET /api/runs/{run}/events",
+        "status --json": "GET /api/live",
+        "record pin r1": None,
+        "record unpin r1": None,
+        "approve 1 --reject": "POST /api/approvals/{id}",
+        "loop start example -f": "POST /api/loops/{name}/start",
+        "session start --attach work": "POST /api/sessions",
+        "session --chat 1 start work": "POST /api/chats/{chat}/sessions",
+        "session --chat 1 list": "GET /api/chats/{chat}/sessions",
+        "session --chat 1 report r1": "GET /api/chats/{chat}/sessions/{session}/report",
+        "session --chat 1 stop r1": "POST /api/chats/{chat}/sessions/{session}/stop",
+    }
     READS = (
         "ab", "backup --check", "benchmark report missing", "costs", "devices", "doctor", "events",
         "experiment summary missing", "jev report", "jira-check", "loop feed r1", "loop list", "loop status poll",
@@ -702,6 +736,8 @@ class CliThroughServeCommandTests(_CliThroughServeCase):
         def response(request):
             if request.path == "/api/meta":
                 return 200, {"instance": {"id": "follower"}}, {}
+            if request.path.endswith("/steer"):
+                return 405, {"code": "method_not_allowed"}, {"Allow": "POST"}
             if request.command == "POST":
                 return 200, {"id": "r1", "task": "", "runner": "pi", "model": "sample", "device": "local",
                              "cwd": "/fixture", "branch": "", "tools": []}, {}
@@ -968,22 +1004,6 @@ class CliThroughServeRunTests(_CliThroughServeCase):
             paths.record_dir("r1").mkdir(parents=True)
             for command, code in (("pin r1", 0), ("unpin r1", 0), ("unpin r1", 1), ("pin missing", 1), ("pin", 2)):
                 self.assertEqual(self.cli(f"record {command}")[0], code, command)
-
-    def test_routes_do_not_fall_back(self):
-        self.in_subprocess("check_routes_do_not_fall_back")
-
-    def check_routes_do_not_fall_back(self):
-        writes = []
-
-        def response(request):
-            if request.path == "/api/meta":
-                return 200, {"instance": {"id": "v1-only"}}, {}
-            writes.append((request.path, request.headers.get("Idempotency-Key")))
-            return 404, {"error": "No such route", "code": "not_found"}, {}
-
-        with self.stub(response), mock.patch.dict(os.environ, {"ARETE_IDEMPOTENCY_KEY": "v1-only-key"}):
-            self.problem("session send r1 message", "not_found")
-        self.assertEqual(writes, [("/api/v1/runs/r1/steer", "v1-only-key")])
 
     def test_invocation_write_keys(self):
         self.in_subprocess("check_invocation_write_keys")

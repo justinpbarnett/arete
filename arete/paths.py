@@ -36,8 +36,7 @@ if ISOLATED:
     drop_credentials()
 SCRATCH_CONFIG = confined(CONFIG_DIR) is not None
 SCRATCH_STATE = confined(STATE_DIR) is not None
-LOG_DIR = Path(os.environ.get("ARETE_LOG_DIR", HOME / "Library" / "Logs" / "arete" if ON_MAC and not ISOLATED
-                              else STATE_DIR / "logs"))
+LOG_DIR = local_paths.log_dir(HOME, STATE_DIR, ISOLATED)
 
 CONFIG_FILE = CONFIG_DIR / "config.toml"
 PI_KEYS_FILE = (CONFIG_DIR if SCRATCH_CONFIG or not ISOLATED else NOWHERE) / "pi.env"
@@ -76,7 +75,7 @@ PER_CALL_HOOKS = ("hook", "guard", "codex-guard", "background")
 
 
 def cli_command(*args: str, flags: tuple[str, ...] = ()) -> list[str]:
-    pinned = "" if args and args[0] in (*PER_CALL_HOOKS, "status") else "from arete import codebase; codebase.load(); "
+    pinned = "" if args and args[0] in (*PER_CALL_HOOKS, "status", "serve") else "from arete import codebase; codebase.load(); "
     entrypoint = (f"import sys; sys.path.insert(0, {str(PACKAGE_DIR.parent)!r}); {pinned}"
                   "from arete.cli import main; raise SystemExit(main())")
     return [sys.executable, "-I", *flags, "-c", entrypoint, *args]

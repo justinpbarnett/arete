@@ -2,6 +2,7 @@ import errno
 import os
 import re
 import stat
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -137,3 +138,8 @@ def local_dirs(home: Path, *, guard_hook: bool = False) -> tuple[Path, Path, boo
     if isolated:
         config, state = isolated_dirs()
     return config, state, isolated
+
+
+def log_dir(home: Path, state: Path, isolated: bool) -> Path:
+    default = home / "Library" / "Logs" / "arete" if sys.platform == "darwin" and not isolated else state / "logs"
+    return Path(os.environ.get("ARETE_LOG_DIR", default))

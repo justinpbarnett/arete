@@ -112,6 +112,7 @@ def session_start(args) -> int:
 
 @local_only
 def session_attach(args) -> int:
+    client.require_steering(args.id)
     return attached(args.id)
 
 
@@ -125,6 +126,7 @@ def session_report(args) -> int:
 
 @local_only
 def session_send(args) -> int:
+    client.require_steering(args.id)
     print(json.dumps(client.steer(args.id, " ".join(args.text))))
     return 0
 
