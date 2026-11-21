@@ -165,11 +165,8 @@ class QueueScoringTests(unittest.TestCase):
 class PublicationFixture(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
-        self.git("init", "-q", "--template=", "-b", "main")
         self.file = self.root / "file.txt"
-        self.file.write_text("base\n")
-        self.commit("base")
-        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        self.set_up_repository()
         self.checkout = workspace.Checkout("", "fixture/repo", self.root, self.root, "main")
         self.controller = orchestration.Controller.__new__(orchestration.Controller)
         run = mock.Mock(id="fixture-run", environment_release="", dry_run=False)
@@ -189,6 +186,21 @@ class PublicationFixture(unittest.TestCase):
                                                               return_value=None))
         self.enterContext(mock.patch.object(pipeline.record, "mark"))
         self.enterContext(mock.patch.object(orchestration.run_lines, "write"))
+
+    def set_up_repository(self):
+        self.create_repository(self.root)
+
+    @staticmethod
+    def create_repository(root):
+        def git(*args):
+            util.git(list(args), root)
+
+        git("init", "-q", "--template=", "-b", "main")
+        (root / "file.txt").write_text("base\n")
+        git("add", "--", "file.txt")
+        git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.com",
+            "-c", "commit.gpgSign=false", "commit", "-qm", "base")
+        git("update-ref", "refs/remotes/origin/main", "HEAD")
 
     def git(self, *args):
         return util.git(list(args), self.root).strip()
@@ -1481,6 +1493,14 @@ class CatchUpReviewRepairTests(CatchUpRepairFixture):
 
 
 class CatchUpReviewTests(CatchUpRepairFixture):
+    @classmethod
+    def setUpClass(cls):
+        cls.repository_fixture = Path(cls.enterClassContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        cls.create_repository(cls.repository_fixture)
+
+    def set_up_repository(self):
+        shutil.copytree(self.repository_fixture, self.root, dirs_exist_ok=True)
+
     def test_catch_up_requires_approval_for_the_pushed_tree(self):
         self.record_pushed_head()
         c = self.checkout
