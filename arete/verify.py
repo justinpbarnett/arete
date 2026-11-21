@@ -16,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import SplitResult, urlsplit
 
-from . import browser, config, contract, environment, paths, sandbox, scratch, util, vault
+from . import browser, config, environment, paths, sandbox, scratch, util, vault
 from .util import git
 
 PLAYWRIGHT_TOOLS = tuple("browser_" + n for n in (
@@ -132,7 +132,7 @@ def run_probes(v: config.Verify, cwd: Path, attempt: scratch.Attempt | None,
         return Verified("blocked", f"Configured {label} require trusted scratch confinement.",
                         blocked_by=f"{label} could not obtain scratch authority{requested}", finished=False)
     deadline, checks = time.monotonic() + v.probe_seconds, []
-    failure = ""
+    failure, blocked_by = "", ""
     env = environment.build((), scratch.attempt_env(attempt))
     env = {name: value for name, value in env.items() if not paths.CREDENTIAL_NAME.search(name)}
 
@@ -186,13 +186,19 @@ def run_probes(v: config.Verify, cwd: Path, attempt: scratch.Attempt | None,
             summary = f"Configured {label} failed."
             if named:
                 summary = f"Could not run {name}." if blocked else f"{name} failed."
-            if blocked or not is_driver or stop_on_driver_failure:
+            if not is_driver or stop_on_driver_failure:
                 return Verified("blocked" if blocked else "fail", summary, checks,
                                 blocked_by=(blocker if named else f"probes: {blocker}") if blocked else "",
                                 finished=not (named and blocked))
-            failure = failure or summary
+            if blocked:
+                blocked_by = blocked_by or blocker
+            else:
+                failure = failure or summary
     if failure:
         return Verified("fail", failure, checks)
+    if blocked_by:
+        return Verified("blocked", "A configured journey driver could not run.", checks,
+                        blocked_by=blocked_by, finished=False)
     return Verified("pass", f"Owner-configured {label} passed under scratch confinement.", checks)
 
 
@@ -368,12 +374,7 @@ class Verified:
     behavior_reached: bool = True
 
     @classmethod
-    def from_agent(cls, found: dict, *, strict: bool = False) -> Verified:
-        if strict:
-            try:
-                contract.validate(found, SCHEMA, "verifier result")
-            except contract.Problem as error:
-                return cls("blocked", "The verifier returned an invalid result.", blocked_by=str(error), finished=False)
+    def from_agent(cls, found: dict) -> Verified:
         said = found.get("verdict")
         checks = [{k: v for k, v in c.items() if k != "driver"} for c in found.get("checks", []) if isinstance(c, dict)]
         v = cls(said.strip().lower() if isinstance(said, str) else "", found.get("summary", "").strip(),

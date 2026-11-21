@@ -10,7 +10,7 @@ import signal
 import sys
 import time
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -143,7 +143,12 @@ def reports(item: dict) -> tuple[str, Path, list[dict] | None]:
         owners = {run_id, *(str(line.get("run") or "") for read in chain for line in read)}
         if saved_owner in owners:
             owner = saved_owner
-        return owner, paths.RUNS_DIR / owner / name, verified.get("checks") or []
+        path = paths.RUNS_DIR / owner / name
+        try:
+            probes = read_json(path.with_name(f"{path.stem}-probes.json"), {"checks": []})
+        except (OSError, ValueError):
+            raise Blocked(f"{run_id}: unreadable driver evidence for {path.name}") from None
+        return owner, path, driver_checks(run_id, probes.get("checks") if isinstance(probes, dict) else None)
     for read in chain:
         owner = str(next((line.get("run") for line in read if line.get("run")), run_id))
         folder = paths.RUNS_DIR / owner
@@ -168,43 +173,14 @@ def driver_names(run_id: str, names) -> list[str]:
     return list(dict.fromkeys(names))
 
 
-def driver_rows(lines: list[str]) -> list[list[str]]:
-    return [lines[i:i + 3] for i, line in enumerate(lines) if (match := CHECK.match(line)) and match[1]]
-
-
-def classic_drivers(run_id: str, path: Path, report: bytes, lines: list[str]) -> list[str]:
-    missing = object()
-    try:
-        evidence = read_json(path.with_name(f"{path.stem}-drivers.json"), missing)
-        probes = read_json(path.with_name(f"{path.stem}-probes.json"), {"checks": []}) if evidence is missing else None
-    except (OSError, ValueError):
-        raise Blocked(f"{run_id}: unreadable driver evidence for {path.name}") from None
-    if evidence is not missing:
-        if not isinstance(evidence, dict) or evidence.get("report_sha256") != hashlib.sha256(report).hexdigest():
-            raise Blocked(f"{run_id}: recorded driver evidence does not match {path.name}")
-        return driver_names(run_id, evidence.get("drivers"))
-
-    checks = driver_checks(run_id, probes.get("checks") if isinstance(probes, dict) else None)
-    names = driver_names(run_id, [check.get("what") for check in checks])
-    if any(type(check.get("passed")) is not bool or not isinstance(check.get("how"), str)
-           or not isinstance(check.get("saw"), str) for check in checks):
-        raise Blocked(f"{run_id}: invalid recorded driver check")
-    recorded = verify.Verified("pass", checks=[{**check, "screenshot": ""} for check in checks])
-    if driver_rows(lines) != driver_rows(recorded.markdown().splitlines()):
-        raise Blocked(f"{run_id}: {path.name} has driver rows without matching engine evidence")
-    return names
-
-
 def report_steps(item: dict, neighbour: bool = False) -> list[Step]:
     run_id = item["run_id"]
     owner, path, checks = reports(item)
     try:
-        report = path.read_bytes()
-        lines = report.decode().splitlines()
-    except (OSError, UnicodeError):
+        lines = path.read_text().splitlines()
+    except OSError:
         raise Blocked(f"{run_id}: unreadable verification report {path}") from None
-    drivers = (classic_drivers(run_id, path, report, lines) if checks is None else
-               driver_names(run_id, [check.get("what") for check in driver_checks(run_id, checks)]))
+    drivers = driver_names(run_id, [check.get("what") for check in checks or []])
     found, name, how = [], "", ""
     for line in [*lines, "- **Passed**: __end__"]:
         if match := CHECK.match(line):
@@ -288,20 +264,27 @@ def plan(cfg: config.Config, repo: config.Repo, rows: list[dict], batch: list[di
             replay = report_steps(item, neighbour=True)
             selected.extend(s for n, s in enumerate(replay) if n == 0 or s.driver)
             break
+    selected.sort(key=lambda step: step.driver)
     return Plan(repo, layer, batch, selected, base, paths.WORKTREES_DIR / f"{run_id}-{repo.name}", neighbour, matches)
 
 
-def finding(p: Plan, failed: list[int]) -> dict:
+def finding(p: Plan, failed: list[int], run_id: str = "") -> dict:
     prs = ", ".join(f"#{n}" for n in sorted({r["pr"] for r in p.batch}))
     runs = ", ".join(dict.fromkeys(r["run_id"] for r in p.batch))
-    names = "; ".join(f"{p.steps[n - 1].run} step {p.steps[n - 1].number}: {p.steps[n - 1].name}"
-                      + (f" (neighbour PR #{p.steps[n - 1].pr})" if p.steps[n - 1].neighbour else "") for n in failed)
+    steps = [p.steps[n - 1] for n in failed]
+    names = "; ".join(f"{s.name} ({s.run})" if s.driver else
+                      f"{s.run} step {s.number}: {s.name}" +
+                      (f" (neighbour PR #{s.pr})" if s.neighbour else "") for s in steps)
+    details = ""
+    if any(s.driver for s in steps):
+        local_run = f" for {run_id}" if run_id else ""
+        details = f" Journey details are in the local merge-check record{local_run}."
     key = hashlib.sha256(json.dumps([sorted(r["key"] for r in p.batch), failed]).encode()).hexdigest()[:20]
     return {"title": f"Merged base fails use check: {p.repo.name} after PRs {prs}",
             "fingerprint": f"merge-check/{p.repo.name}/{key}", "repo": p.repo.name,
             "summary": f"Merged PRs {prs}. Runs: {runs}. "
                        + ("Product startup failed before the required checks could run. " if p.startup_failed else "")
-                       + f"Failed checks: {names}."}
+                       + f"Failed checks: {names}.{details}"}
 
 
 def preview(p: Plan, folder: Path) -> None:
@@ -377,80 +360,60 @@ def execute(cfg: config.Config, p: Plan, run_id: str) -> ReplayResult:
     except BaseException:
         record.settle(run_id, "failed", summary="merge-check blocked; evidence retained locally")
         raise
-    summary = result.blocked_by or ("merged base failed in use" if result.failed else "merged base passed in use")
-    if result.driver_reason:
-        summary = f"{result.driver_reason}. {summary}"
-    record.settle(run_id, "failed" if result.blocked_by else "done", summary=summary)
+    outcome = "merged base failed in use" if result.failed else "merged base passed in use"
+    if result.blocked_by:
+        outcome = f"{outcome}. {result.blocked_by}" if result.failed else result.blocked_by
+    summary = "\n".join(filter(None, (outcome, result.driver_reason)))
+    record.settle(run_id, "failed" if result.blocked_by and not result.failed else "done", summary=summary)
     return result
 
 
-def ordinary_failures(verified: verify.Verified, ordinary: list[int]) -> set[int]:
-    accounted, failed = set(), set()
-    environment_step = None
+def ordinary_failures(verified: verify.Verified, ordinary: list[int]) -> list[int]:
+    accounted: dict[int, bool] = {}
     for check in verified.checks:
-        if check.get("driver") is True:
-            continue
-        what = check.get("what")
-        match = NUMBER.match(what) if isinstance(what, str) else None
-        try:
-            n = int(match[1]) if match else 0
-        except ValueError:
-            n = 0
-        if not 0 < n <= len(ordinary) or type(check.get("passed")) is not bool:
+        match = NUMBER.match(str(check.get("what") or ""))
+        if not match or int(match[1]) not in range(1, len(ordinary) + 1) or type(check.get("passed")) is not bool:
             raise Blocked("verifier returned an unknown or invalid step")
-        accounted.add(n)
-        if not check["passed"]:
-            if str(check.get("cause") or "").strip().lower() == "environment":
-                environment_step = environment_step or n
-            else:
-                failed.add(ordinary[n - 1])
+        n = int(match[1])
+        accounted[n] = accounted.get(n, True) and check["passed"]
     if len(accounted) != len(ordinary):
         raise Blocked("verifier did not account for every manifest step")
-    if environment_step:
-        raise Blocked(f"ordinary check {environment_step} was blocked by the environment")
+    failed = [ordinary[n - 1] for n, passed in sorted(accounted.items()) if not passed]
+    if verified.verdict == "fail" and not failed:
+        raise Blocked("verifier reported failure without a failed manifest step")
     return failed
 
 
 def replay_result(p: Plan, run: CheckRun, verified: verify.Verified,
-                  ordinary: list[int], drivers: dict[int, str]) -> ReplayResult:
+                  ordinary: list[int], drivers: dict[int, str], observed: verify.Verified | None) -> ReplayResult:
+    if verified.verdict == "fail" and not run.invoked:
+        p.startup_failed = True
+        prevented = ordinary or list(drivers)
+        run.save("startup-failure.json", {"prevented_steps": prevented})
+        return ReplayResult(failed=prevented)
+    if verified.verdict not in ("pass", "fail") or (ordinary and not run.invoked):
+        raise Blocked(verified.blocked_by or "the product or verifier did not start")
+
     result = ReplayResult()
-    driver_checks = {check["what"]: check for check in verified.checks if check.get("driver") is True}
-    failures = {n: {"what": name, "saw": check["saw"]} for n, name in drivers.items()
-                if (check := driver_checks.get(name)) and check.get("cause") == "change"}
+    if ordinary:
+        result.failed = ordinary_failures(verified, ordinary)
+    checks = {check["what"]: check for check in observed.checks} if observed else {}
+    failures, reasons, blocked = {}, [], []
+    for n, name in drivers.items():
+        check = checks.get(name)
+        if check is None or check.get("cause") == "environment":
+            blocked.append(name)
+            saw = check["saw"] if check else (observed.blocked_by if observed else "") or "No configured driver result."
+            reasons.append(f"{name}: {saw}")
+        elif not check["passed"]:
+            failures[n] = {"what": name, "saw": check["saw"]}
+            reasons.append(f"{name}: {check['saw']}")
     if failures:
         run.save("driver-failures.json", failures)
-        result.driver_reason = f"See {run.dir / 'driver-failures.json'} for the failing journeys and their observations"
-        result.failed.extend(failures)
-
-    blocked_driver = next((name for name, check in driver_checks.items() if check.get("cause") == "environment"), "")
-    if blocked_driver:
-        result.blocked_by = f"{blocked_driver}: driver was blocked. See the local result.json."
-    elif verified.verdict not in ("pass", "fail") or not verified.finished:
-        result.blocked_by = (verified.blocked_by if not (drivers and run.invoked) else
-                             "the grader did not finish; see the local result.json")
-        result.blocked_by = result.blocked_by or "the product or verifier did not start"
-    elif verified.verdict == "fail" and not run.invoked and (not drivers or not verified.behavior_reached):
-        prevented = list(range(1, len(p.steps) + 1))
-        run.save("startup-failure.json", {"prevented_steps": prevented})
-        if drivers:
-            result.blocked_by = "product startup prevented replay; see the local result.json"
-        else:
-            p.startup_failed = True
-            result.failed = prevented
-        return result
-
-    if set(drivers.values()) != driver_checks.keys():
-        result.blocked_by = result.blocked_by or "verification did not account for every manifest driver"
-    if ordinary and not run.invoked:
-        result.blocked_by = result.blocked_by or "the verifier did not start"
-    elif ordinary and verified.finished and verified.verdict in ("pass", "fail"):
-        try:
-            result.failed.extend(ordinary_failures(verified, ordinary))
-        except Blocked as error:
-            result.blocked_by = result.blocked_by or str(error)
-    if verified.verdict == "fail" and not result.failed:
-        result.blocked_by = result.blocked_by or "verifier reported failure without a failed manifest step"
-    result.failed = sorted(set(result.failed))
+    result.driver_reason = "\n".join(reasons)
+    if blocked:
+        result.blocked_by = f"{', '.join(blocked)}: driver replay blocked. Details are in local run {run.id}."
+    result.failed = sorted([*result.failed, *failures])
     return result
 
 
@@ -460,7 +423,6 @@ def execute_attempt(cfg: config.Config, p: Plan, run_id: str) -> ReplayResult:
     run = CheckRun(id=run_id, repo=p.repo, dir=folder, cfg=cfg, layer=p.layer,
                    deadline=time.monotonic() + 1800, writes_lines=False)
     made = False
-    replay = None
     with deadline():
         try:
             util.git(["fetch", "origin"], p.repo.path)
@@ -486,29 +448,26 @@ def execute_attempt(cfg: config.Config, p: Plan, run_id: str) -> ReplayResult:
             ordinary = [n for n, s in enumerate(p.steps, 1) if not s.driver]
             goal = "\n".join(p.steps[n - 1].goal(i) for i, n in enumerate(ordinary, 1))
             drivers = {n: s.name for n, s in enumerate(p.steps, 1) if s.driver}
-            try:
-                verified = use_product(work, "verify", "grade", goal=goal, require_released=True,
-                                       replay_drivers={name.removeprefix("journey:") for name in drivers.values()})
-            except (Blocked, OSError, RuntimeError) as error:
-                saved_probes = read_json(folder / "verify-probes.json", {}) if drivers else {}
-                if not saved_probes:
-                    raise
-                driver_checks = [check for check in saved_probes.get("checks", []) if check.get("driver") is True]
-                verified = verify.Verified("blocked", "Replay was interrupted.", driver_checks,
-                                           blocked_by=str(error), finished=False)
-            run.save("result.json", asdict(verified))
-            replay = replay_result(p, run, verified, ordinary, drivers)
-            return replay
+            replay = {"replay_drivers": {name.removeprefix("journey:") for name in drivers.values()}} if drivers else {}
+            verified = use_product(work, "verify", "grade", goal=goal, require_released=True, **replay)
+            saved = read_json(folder / "verify-replay-drivers.json", None) if drivers else None
+            observed = verify.Verified.stored(saved) if saved is not None else None
+            result = verified
+            if observed:
+                verdict = verified.verdict
+                if observed.verdict == "fail" or verdict == "pass":
+                    verdict = observed.verdict
+                result = replace(verified, verdict=verdict, checks=observed.checks + verified.checks,
+                                 blocked_by=verified.blocked_by or observed.blocked_by,
+                                 finished=verified.finished and observed.finished)
+            run.save("result.json", asdict(result))
+            return replay_result(p, run, verified, ordinary, drivers, observed)
         finally:
             if made:
-                try:
-                    if (folder / "verify-retained.json").exists() or verifier_suites.held(folder, p.worktree, "verify"):
-                        raise Blocked(f"verification scratch ownership is unresolved; retained workspace {p.worktree}")
-                    util.git(["worktree", "remove", "--force", str(p.worktree)], p.repo.path)
-                except (Blocked, OSError, RuntimeError) as error:
-                    if replay is None:
-                        raise
-                    replay.blocked_by = ". ".join(filter(None, (replay.blocked_by, util.first_line(str(error), 300))))
+                if (folder / "verify-retained.json").exists() or verifier_suites.held(folder, p.worktree, "verify"):
+                    print(f"merge-check: retained {p.worktree}; scratch ownership is unresolved", file=sys.stderr)
+                    raise Blocked("verification scratch ownership is unresolved; workspace retained")
+                util.git(["worktree", "remove", "--force", str(p.worktree)], p.repo.path)
 
 
 def consume(cfg: config.Config, repo_name: str, supplied: list[dict], dry_run: bool = False) -> int:
@@ -576,15 +535,15 @@ def consume_batch(cfg: config.Config, repo_name: str, supplied: list[dict], dry_
             save_json(folder / "quota.json", data)
         outputs, holds = [], []
         for p in plans:
-            try:
-                result = execute(cfg, p, run_id + "-" + p.repo.name)
-            except (Blocked, OSError, RuntimeError) as error:
-                holds.append(str(error))
-                continue
+            attempt_id = run_id + "-" + p.repo.name
+            result = execute(cfg, p, attempt_id)
             if result.failed:
-                outputs.append(finding(p, result.failed))
+                outputs.append(finding(p, result.failed, attempt_id))
             if result.blocked_by:
-                holds.append(". ".join(filter(None, (result.driver_reason, result.blocked_by))))
+                holds.append(result.blocked_by)
+                if any(not step.driver for step in p.steps):
+                    ordinary_failed = any(not p.steps[n - 1].driver for n in result.failed)
+                    outputs.append({"value": 0 if ordinary_failed else 1})
             else:
                 outputs.append({"value": 0 if result.failed else 1})
                 checked[p.repo.name] += [r["key"] for r in p.batch]
