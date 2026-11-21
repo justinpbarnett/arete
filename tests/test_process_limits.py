@@ -143,7 +143,7 @@ class CatchUpWorkspaceRecordTests(Isolated):
         status = pipeline.run_issue(self.repo.name, self.ticket, force=True, script=pipeline.Script("adw", drive))
         return status, run_store.newest_whole_run(self.repo.name, self.ticket)
 
-    def fail_catch_up(self, incoming, why):
+    def fail_catch_up(self, incoming, why, *, retained=False):
         src = self.repo.path
         (src / incoming).write_text("Base change\n")
         util.git(["add", "-f", incoming], src)
@@ -160,8 +160,14 @@ class CatchUpWorkspaceRecordTests(Isolated):
 
         status, row = self.run_ticket(drive)
         self.assertEqual((status, row["summary"]), (1, why))
-        self.assertEqual(util.git(["rev-parse", "HEAD"], self.ws).strip(), self.head)
+        head = util.git(["rev-parse", "HEAD"], self.ws).strip()
+        if retained:
+            self.assertEqual(head, self.checkout.merge)
+            self.assertEqual(util.git(["rev-parse", "HEAD^1", "HEAD^2"], self.ws).splitlines(), [self.head, base])
+        else:
+            self.assertEqual(head, self.head)
         made = workspace.made_before(self.ws)
+        self.assertEqual(workspace.head_recorded(made, self.checkout), head)
         for name in self.build_files:
             self.assertIn(f"{Path(name).parent}/", made)
             self.assertEqual((self.ws / name).read_text(), "Build output\n")
@@ -188,7 +194,7 @@ class CatchUpWorkspaceRecordTests(Isolated):
         with (patch.object(pipeline.Build, "check", return_value=True),
               patch.object(pipeline, "check_in_use", side_effect=verified),
               patch.object(pipeline, "_review", return_value=pipeline.Review("request_changes"))):
-            self.fail_catch_up("incoming.txt", "the published tree lacks a current approving review")
+            self.fail_catch_up("incoming.txt", "the published tree lacks a current approving review", retained=True)
 
         self.assertEqual(self.retry(), ("planning step failed", ["plan"]))
 
@@ -1596,6 +1602,38 @@ class FeedbackRevisionRegressionTests(FeedbackRevisionBudgetFixture):
         self.assertNotIn("left_out", saved)
         self.assertNotIn("repair_left_out", saved)
         row, = insights_store.open_feedback([self.feedback_row["pr_url"]])
+        self.assertEqual((row["status"], row["run_id"]), ("new", None))
+
+
+class BuiltInFeedbackPublicationTests(FeedbackRevisionBudgetFixture):
+    def test_feature_does_not_push_if_a_feedback_pr_closes_after_prepare(self):
+        parent = self.feedback_ticket(path="feature")
+        record.note(parent.id, active_seconds=0, verify_seconds=0)
+        url = self.feedback_row["pr_url"]
+
+        def publish(flow, *args, **kwargs):
+            self.assertEqual(flow.ctx.run.feedback, [])
+            return flows.step(flow, "pr", tree=str(flow.ctx.ws))
+
+        script = pipeline.Script("feature", feature.feature)
+        with (patch.object(config, "load", return_value=self.cfg),
+              patch.object(pipeline, "run_refusal", return_value=(True, "")),
+              patch.object(flows, "local_workspace", return_value=[]),
+              patch.object(pipeline, "settle_starts"),
+              patch.object(pipeline, "furnish", return_value=""),
+              patch.object(workspace, "note_made"),
+              patch.object(feature, "built", side_effect=publish),
+              patch.object(gh, "pr_view", side_effect=[{"state": "OPEN"}, {"state": "CLOSED"}]) as pr_view,
+              patch.object(flows, "settle_unpushed_checkouts") as settle,
+              patch.object(pipeline, "commit_and_push") as push):
+            self.assertEqual(pipeline.run_issue(self.repo.name, self.ticket, script=script), 1)
+
+        self.assertEqual([call.args for call in pr_view.call_args_list], [(url,), (url,)])
+        settle.assert_not_called()
+        push.assert_not_called()
+        revision = run_store.newest_whole_run(self.repo.name, self.ticket)
+        self.assertIn("is closed, so arete pushed nothing for PR feedback", revision["summary"])
+        row, = insights_store.open_feedback([url])
         self.assertEqual((row["status"], row["run_id"]), ("new", None))
 
 
