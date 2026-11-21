@@ -25,12 +25,135 @@ from unittest import mock
 from adws import single_worker
 from arete import (
     api_check, ci, config, diffguard, evals, factory, flows, gh, jev, journeys, loop_run, mergecheck, miner,
-    orchestration, owner_asks, paths, pipeline, sandbox, serve, tracker, util, verify, workspace,
+    orchestration, owner_asks, paths, pipeline, poll, queueing, sandbox, serve, tracker, util, verify, workspace,
 )
 from arete.agent import NO_SESSION, Result
 from arete.review import Review
 from arete.store import db, orchestration as ledger
 from tests.parallel import stack_env
+
+
+class QueueScoringTests(unittest.TestCase):
+    def setUp(self):
+        remote = "fixture/repo"
+        self.repo = config.Repo("fixture", Path("."), github=remote, parts=[config.Part("", remote)])
+        self.source = tracker.for_repo(config.Config(), self.repo)
+
+    def issue(self, number, *labels, body="", created="2026-11-21T00:00:00Z", author="fixture"):
+        return {"number": number, "title": f"Issue {number}", "body": body, "createdAt": created,
+                "author": {"login": author}, "labels": [{"name": name} for name in ("agent", *labels)]}
+
+    def next_ticket(self):
+        self.enterContext(mock.patch.object(poll.runlimits, "latest_park", return_value=(None, None)))
+        self.enterContext(mock.patch.multiple(poll.run_store, issue_running=mock.Mock(return_value=False),
+                                             pending_label=mock.Mock(return_value=""),
+                                             environment_waits=mock.Mock(return_value=[])))
+        self.enterContext(mock.patch.object(poll.pilot, "pickable", return_value=True))
+        self.enterContext(mock.patch.object(poll.zte, "reserved", return_value=False))
+        self.enterContext(mock.patch.object(tracker.LocalTracker, "todo", return_value=[]))
+        return poll.next_ticket(self.repo, self.source, pipeline.SkipLog({}))
+
+    def test_waits_on_ignores_oversized_reference(self):
+        oversized = "9" * 4500
+        self.assertEqual(tracker.waits_on(f"Waits on #12, #{oversized}, #34 and #12."), [12, 34])
+
+    def test_poll_uses_valid_reference_alongside_oversized_reference(self):
+        oversized = "9" * 4500
+        body = (f"Waits on #{oversized}, fixture/repo#{oversized}, "
+                f"https://github.com/fixture/repo/issues/{oversized} and #1.")
+        issues = [self.issue(1), self.issue(2, "agent:pr", body=body), self.issue(3, created="2026-11-20T00:00:00Z")]
+        self.enterContext(mock.patch.object(gh, "issues", return_value=issues))
+
+        self.assertEqual(self.next_ticket().id, "1")
+
+    def test_poll_ranks_only_same_repository_references(self):
+        cases = [
+            ("Fixture/Repo#708", "708"),
+            ("https://github.com/Fixture/Repo/issues/708", "708"),
+            ("fixture/other#708", "692"),
+            ("https://github.com/fixture/other/issues/708", "692"),
+        ]
+        for reference, expected in cases:
+            with self.subTest(reference=reference):
+                issues = [self.issue(708), self.issue(283, "agent:pr", body=f"Waits on {reference}."),
+                          self.issue(692, created="2026-11-20T00:00:00Z")]
+                with mock.patch.object(gh, "issues", return_value=issues):
+                    self.assertEqual(self.next_ticket().id, expected)
+
+    def test_poll_prioritizes_prerequisite_of_in_flight_chain(self):
+        issues = [self.issue(1), self.issue(2, "agent:pr", body="Waits on #1."),
+                  self.issue(3, "agent:running", body="Waits on #2."),
+                  self.issue(4, created="2026-11-20T00:00:00Z")]
+        self.enterContext(mock.patch.object(gh, "issues", return_value=issues))
+
+        todo = self.source.todo()
+        self.assertEqual([ticket.id for ticket in todo], ["4", "1"])
+        self.assertEqual(self.next_ticket().id, "1")
+        self.assertEqual(queueing.scores(list(self.source.open_agent_tickets))["1"], (3, 2))
+
+    def test_poll_counts_local_waits_on_inside_underscores(self):
+        older = [self.issue(number, created="2026-11-20T00:00:00Z") for number in (692, 693, 697, 698)]
+        issues = [*older, self.issue(708), self.issue(283, "agent:pr", body="__Waits on #708__")]
+        self.enterContext(mock.patch.object(gh, "issues", return_value=issues))
+
+        todo = self.source.todo()
+        ranked = queueing.prioritized(todo, open_tickets=self.source.open_agent_tickets)
+        self.assertEqual([ticket.id for ticket in ranked], ["708", "692", "693", "697", "698"])
+        self.assertEqual(self.next_ticket().id, "708")
+
+    def test_poll_uses_one_limited_listing_and_main_prerequisite_cache(self):
+        candidate = self.issue(1, body="Waits on #1001.")
+        issues = [candidate, *(self.issue(n, "agent:pr") for n in range(2, 1001))]
+        github = self.enterContext(mock.patch.object(gh, "gh_json", side_effect=[issues, {"state": "CLOSED"}]))
+
+        self.assertEqual(self.next_ticket().id, "1")
+        self.assertEqual(len(self.source.open_agent_tickets), 1000)
+        self.assertIs(self.source.is_open(2), True)
+        self.assertIs(self.source.is_open(1001), False)
+        self.assertEqual(github.call_args_list, [
+            mock.call(["issue", "list", "--repo", "fixture/repo", "--state", "open", "--limit", "1000", "--json",
+                       "number,title,body,labels,url,createdAt,updatedAt,author", "--label", "agent"]),
+            mock.call(["issue", "view", "1001", "--repo", "fixture/repo", "--json",
+                       "number,title,body,labels,url,comments,state,author,updatedAt"]),
+        ])
+
+    def test_poll_preserves_candidate_cycle_ranking_with_unrelated_in_flight_issue(self):
+        issues = [self.issue(1), self.issue(2, body="Waits on #1 and #3."), self.issue(3, body="Waits on #2."),
+                  self.issue(5), self.issue(6, body="Waits on #5.")]
+        with mock.patch.object(gh, "issues", return_value=issues):
+            self.assertEqual(self.next_ticket().id, "5")
+
+        with mock.patch.object(gh, "issues", return_value=[*issues, self.issue(7, "agent:pr")]):
+            self.assertEqual(self.next_ticket().id, "5")
+
+    def test_rank_counts_failed_and_other_ineligible_open_agent_tickets(self):
+        issues = [self.issue(1), self.issue(2, created="2026-11-19T00:00:00Z"),
+                  self.issue(3, "agent:failed", body="Waits on #1, #1, #2 and #6."),
+                  self.issue(4, "agent:zte", body="Waits on #1."), self.issue(5, body="Waits on #1.", author="other"),
+                  self.issue(6, created="2026-11-20T00:00:00Z")]
+        self.enterContext(mock.patch.object(gh, "issues", return_value=issues))
+
+        todo = self.source.todo()
+        self.assertEqual([ticket.id for ticket in todo], ["2", "6", "1"])
+        open_tickets = self.source.open_agent_tickets
+        scores = queueing.scores(list(open_tickets))
+        self.assertEqual((scores["1"], scores["2"], scores["6"]), ((2, 3), (2, 1), (2, 1)))
+        ranked = queueing.prioritized(todo[::-1], open_tickets=open_tickets)
+        self.assertEqual([ticket.id for ticket in ranked], ["1", "2", "6"])
+
+        parked = self.source.todo(parked=lambda tid: tid == "3")
+        self.assertEqual({ticket.id for ticket in parked}, {"1", "2", "3", "6"})
+        self.assertEqual(queueing.scores(list(self.source.open_agent_tickets)), scores)
+
+    def test_todo_refresh_drops_dependents_no_longer_in_open_agent_list(self):
+        first = [self.issue(1), self.issue(2, "agent:pr", body="Waits on #1 and #99.")]
+        self.enterContext(mock.patch.object(gh, "issues", side_effect=[first, first[:1]]))
+
+        self.source.todo()
+        self.assertEqual(queueing.scores(list(self.source.open_agent_tickets)), {"1": (2, 1), "2": (1, 0)})
+
+        self.source.todo()
+        self.assertEqual(queueing.scores(list(self.source.open_agent_tickets)), {"1": (1, 0)})
 
 
 class PublicationFixture(unittest.TestCase):
@@ -364,6 +487,93 @@ class PendingBaseMergePublicationTests(PublicationFixture):
         push.assert_called_once_with(["push", "-q", f"--force-with-lease={branch}:{c.lease}", "-u", "origin", branch],
                                      self.root)
         self.assertEqual(self.git("show", "HEAD:file.txt"), "implementation")
+
+
+class BaseMergeDiffLimitTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.enterContext(mock.patch.object(pipeline.record, "mark"))
+
+    def git(self, c, *args):
+        return util.git(["-c", "user.name=Fixture", "-c", "user.email=fixture@example.com",
+                         "-c", "commit.gpgSign=false", "-c", "core.hooksPath=/dev/null", *args], c.wt).strip()
+
+    def write_lines(self, c, name, count):
+        (c.wt / name).write_text(f"{name}\n" * count)
+
+    def commit(self, c, subject):
+        self.git(c, "add", ".")
+        self.git(c, "commit", "-qm", subject)
+
+    def checkout(self, name, lines):
+        root = self.root / name
+        root.mkdir()
+        c = workspace.Checkout(name, f"fixture/{name}", root, root, "main", resumes=True)
+        self.git(c, "init", "-q", "--template=", "-b", c.base)
+        self.git(c, "commit", "-qm", "base", "--allow-empty")
+        self.git(c, "switch", "-qc", "work")
+        self.write_lines(c, "work.txt", lines)
+        self.commit(c, "published work")
+        c.onto = self.git(c, "rev-parse", "HEAD")
+        c.note_pushed_head(c.onto)
+        return c
+
+    def advance_origin(self, c, lines):
+        self.git(c, "switch", "-q", "--detach", c.base)
+        self.write_lines(c, "incoming.txt", lines)
+        self.commit(c, "advance origin base")
+        self.git(c, "update-ref", f"refs/remotes/{c.origin_base}", "HEAD")
+        self.git(c, "switch", "-q", "work")
+
+    def build(self, limit, *checkouts, committed_lines=0):
+        return pipeline.Build(cfg=config.Config(), run=mock.Mock(id="diff-limit"), ticket=mock.Mock(),
+                              ws=self.root, checkouts=list(checkouts),
+                              layer=config.RepoLayer(dir=self.root, max_diff_lines=limit), timeout=0,
+                              workspace="diff-limit", tools=[], deny=[], committed_lines=committed_lines)
+
+    def test_committed_base_merge_passes_with_100_lines(self):
+        c = self.checkout("first", 100)
+        self.advance_origin(c, 500)
+        self.git(c, "merge", "-q", "--no-edit", c.origin_base)
+        self.build(300, c).require_valid_diff("the build")
+
+    def test_committed_base_merge_refusal_names_origin_base(self):
+        c = self.checkout("first", 400)
+        self.advance_origin(c, 500)
+        self.git(c, "merge", "-q", "--no-edit", c.origin_base)
+        base = self.git(c, "rev-parse", "--short=7", c.origin_base)
+        with self.assertRaisesRegex(workspace.RunFailed, f"the diff is 400 lines against main at {base}"):
+            self.build(300, c).require_valid_diff("the build")
+
+    def test_no_base_merge_counts_staged_pushed_and_resolved_lines(self):
+        c = self.checkout("first", 80)
+        self.advance_origin(c, 500)
+        self.write_lines(c, "work.txt", 110)
+        c.resolved_lines = 20
+        b = self.build(130, c, committed_lines=80)
+        b.require_valid_diff("the build")
+        b.layer.max_diff_lines = 129
+        with self.assertRaisesRegex(workspace.RunFailed, "the diff is 130 lines") as refused:
+            b.validate_diff(b.staged, "the build")
+        self.assertIn("pushed earlier in this run: 100", refused.exception.detail)
+
+    def test_one_base_merge_counts_both_repositories_against_their_bases(self):
+        first = self.checkout("first", 155)
+        self.advance_origin(first, 500)
+        self.git(first, "merge", "-q", "--no-edit", first.origin_base)
+        first.onto = self.git(first, "rev-parse", "HEAD")
+        second = self.checkout("second", 100)
+        self.advance_origin(second, 500)
+        self.write_lines(second, "work.txt", 120)
+        b = self.build(400, first, second, committed_lines=255)
+        b.require_valid_diff("the build")
+        b.layer.max_diff_lines = 274
+        with self.assertRaisesRegex(workspace.RunFailed, "the diff is 275 lines") as refused:
+            b.validate_diff(b.staged, "the build")
+        self.assertIn("`first/work.txt`: 155", refused.exception.detail)
+        self.assertIn("`second/work.txt`: 120", refused.exception.detail)
+        self.assertNotIn("pushed earlier", refused.exception.detail)
 
 
 class MovedBasePublicationTests(unittest.TestCase):

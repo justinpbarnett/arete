@@ -923,6 +923,9 @@ class Controller:
                 if not self.job.b.restage().empty:
                     raise ValueError("noop cannot discard an implementation diff")
                 self.ending = flows.finish(self.flow, "nothing", summary=self.job.build_summary or "No change needed.")
+            elif (self.run.budget and (reason := self.run.budget.repair_limit_reason())
+                  and not zte.reserved(str(self.run.tid))):
+                self.ending = pipeline.park_run(self.run, reason)
             else:
                 self.ending = flows.finish(self.flow, "failed", why="the orchestrator stopped without delivery",
                                            recovery=self.failure_recovery())
