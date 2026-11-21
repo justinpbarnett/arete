@@ -30,6 +30,8 @@ from arete.review import Review
 
 
 class ServeDeploymentFixture(unittest.TestCase):
+    class_timeout = 30
+
     def setUp(self):
         root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         origin = root / "origin.git"
