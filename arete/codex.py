@@ -342,10 +342,9 @@ def owner_hooks_off() -> dict[str, dict]:
     return off
 
 
-def guard_hook(judge: bool, scratch: tuple[str, ...] = (), opened=(), judge_args: tuple[str, ...] = ()) -> list[str]:
+def guard_hook(judge: bool, scratch: tuple[str, ...] = (), opened=()) -> list[str]:
     hook = shlex.join(paths.cli_command("codex-guard", *(["--judge"] if judge else []),
-                                        *(arg for path in opened for arg in ("--open", str(path))),
-                                        *scratch, *judge_args))
+                                        *(arg for path in opened for arg in ("--open", str(path))), *scratch))
     entry = [{"matcher": "*", "hooks": [{"type": "command", "command": hook, "timeout": guard.HOOK_TIMEOUT_SECONDS}]}]
     off = owner_hooks_off()
     return [*setting("hooks.PreToolUse", entry), *(setting("hooks.state", off) if off else [])]
@@ -428,7 +427,6 @@ def command(
     hidden: list[Path | str] = (),
     scratch: tuple[str, ...] = (),
     floor: guard.Floor | None = None,
-    judge_args: tuple[str, ...] = (),
 ) -> list[str]:
     try:
         if any((home() / name).exists() for name in ("AGENTS.override.md", "AGENTS.md")):
@@ -461,7 +459,7 @@ def command(
         system = "\n\n".join(filter(None, [system, repo_instructions(cwd)]))
     if system:
         cmd += setting("developer_instructions", system)
-    cmd += guard_hook(judge, scratch, floor.open, judge_args)
+    cmd += guard_hook(judge, scratch, floor.open)
     cmd += mcp_settings(mcp_config, allowed_tools)
     return [*cmd, "-"]
 
@@ -526,7 +524,6 @@ def _run(
     auth: accounts.Auth | None = None,
     scratch: tuple[str, ...] = (),
     floor: guard.Floor | None = None,
-    judge_args: tuple[str, ...] = (),
     api_key: str = "",
 ) -> Result:
     auth = auth if auth is not None else accounts.Auth()
@@ -554,8 +551,7 @@ def _run(
     try:
         cmd = command(cwd, model=model, effort=effort, tools=tools, allowed_tools=allowed_tools, resume=resume,
                       system=system, persist=persist, add_dirs=add_dirs, mcp_config=mcp_config, instructions=instructions,
-                      judge=judge, passing=passing, extra_env=extra_env, hidden=hidden, scratch=scratch, floor=floor,
-                      judge_args=judge_args)
+                      judge=judge, passing=passing, extra_env=extra_env, hidden=hidden, scratch=scratch, floor=floor)
     except (ValueError, OSError) as e:
         return Result(ok=False, session=resume, error=str(e), runner="codex", model=model)
     if json_schema:

@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import contextlib
 import math
+import os
 import re
 import tomllib
-from collections.abc import Callable
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import ClassVar, Literal
 
@@ -89,8 +89,8 @@ class Part:
 
 @dataclass
 class Repo:
+    # Run-specific state stays outside the settings and policy fingerprints.
     pinned_layer: ClassVar[RepoLayer | None] = None
-    pinned_layer_committed: ClassVar[bool | None] = None
     name: str
     path: Path
     github: str = ""
@@ -276,6 +276,7 @@ class PaidRoutes:
 
 @dataclass
 class Config:
+    settings_snapshot: ClassVar[tuple[Path, str] | None] = None
     alert_repo: str = ""
     global_repo: str = "ai"
     arete_repo: str = "arete"
@@ -793,14 +794,13 @@ def environment_table(data, layer: bool = False) -> Environment:
     return Environment(variable_names(table.get("pass", []), "[environment] pass"), providers)
 
 
-def voice_file(entry, folder: Path, read_file: Callable[[str], bytes | None] | None = None) -> str:
+def voice_file(entry, folder: Path) -> str:
     if not isinstance(entry, str):
         raise TypeError(f"[document] voice: must be a list of file names, not {entry!r}")
     named = Path(entry)
-    root = folder.resolve()
-    found = root / named if read_file else (root / named).resolve()
-    if (named.is_absolute() or ".." in named.parts or not found.is_relative_to(root)
-            or (read_file(named.as_posix()) is None if read_file else not found.is_file())):
+    found = (folder / named).resolve()
+    if (named.is_absolute() or ".." in named.parts or not found.is_relative_to(folder.resolve())
+            or not found.is_file()):
         raise ValueError(f"[document] voice: {entry!r} is not a file in {paths.short_path(folder)}")
     return str(found)
 
@@ -856,8 +856,7 @@ def jev_names(jv: dict, name: str, noun: str, ignored: list[str] | None) -> dict
     return known(jv.get(name) or {}, JevConfig().__dict__[name], f"jev.{name}", ignored, noun)
 
 
-def document_table(data, folder: Path, ignored: list[str] | None = None,
-                   read_file: Callable[[str], bytes | None] | None = None) -> dict:
+def document_table(data, folder: Path, ignored: list[str] | None = None) -> dict:
     table = known(table_of(data, "document"), DOCUMENT_KEYS, "document", ignored)
     found = {}
     if "enabled" in table:
@@ -871,19 +870,11 @@ def document_table(data, folder: Path, ignored: list[str] | None = None,
     if "voice" in table:
         if not isinstance(table["voice"], list):
             raise ValueError(f"[document] voice must be a list of file names, not {table['voice']!r}")
-        found["voice"] = tuple(dict.fromkeys(voice_file(entry, folder, read_file) for entry in table["voice"]))
+        found["voice"] = tuple(dict.fromkeys(voice_file(entry, folder) for entry in table["voice"]))
     if "words" in table:
         words = table_of(table["words"], "document.words")
         found["words"] = {kind: word_range(kind, value) for kind, value in words.items()}
     return found
-
-
-def layer_document_at(document: dict, source: Path, directory: Path) -> dict:
-    if "voice" not in document:
-        return document
-    source = source.resolve()
-    return {**document, "voice": tuple(str((directory / Path(name).relative_to(source)).resolve())
-                                       for name in document["voice"])}
 
 
 @dataclass(frozen=True)
@@ -952,6 +943,15 @@ def server_url(data: dict) -> str:
 
 
 _LOAD_SETTINGS: ContextVar[Config | None] = ContextVar("load_settings", default=None)
+SNAPSHOT_PATH = "ARETE_SETTINGS_SNAPSHOT"
+SNAPSHOT_SHA = "ARETE_SETTINGS_SNAPSHOT_SHA"
+
+
+def snapshot_env(cfg: Config) -> dict[str, str]:
+    if cfg.settings_snapshot is None:
+        return {}
+    path, sha = cfg.settings_snapshot
+    return {SNAPSHOT_PATH: str(path), SNAPSHOT_SHA: sha}
 
 
 @contextlib.contextmanager
@@ -964,8 +964,13 @@ def using_settings(cfg: Config | None):
 
 
 def load(path: Path | None = None, strict: bool = False) -> Config:
-    if path is None and not strict and (cfg := _LOAD_SETTINGS.get()) is not None:
-        return cfg
+    if path is None:
+        if not strict and (cfg := _LOAD_SETTINGS.get()) is not None:
+            return cfg
+        if snapshot := os.environ.get(SNAPSHOT_PATH):
+            from . import delegation
+
+            return delegation.read_snapshot(Path(snapshot), os.environ.get(SNAPSHOT_SHA, ""))[0]
     path = path or paths.CONFIG_FILE
     ignored: list[str] | None = None if strict else []
     try:
@@ -1238,9 +1243,6 @@ class RepoLayer:
     ignored: tuple[str, ...] = ()
     read_roots: tuple[str, ...] = ()
 
-    def at(self, directory: Path) -> RepoLayer:
-        return replace(self, dir=directory, document=layer_document_at(self.document, self.dir, directory))
-
     @property
     def builder_bash(self) -> list[str]:
         return self.allow_bash + (self.verify.bash if self.verify else [])
@@ -1306,17 +1308,17 @@ def section(data: dict, name: str) -> dict:
 
 
 def load_layer(layer_dir: Path, strict: bool = False, *, source_file: Path | None = None) -> RepoLayer:
-    config_file = source_file or layer_dir / "config.toml"
-    if not config_file.exists():
-        return RepoLayer(dir=layer_dir)
-    return parse_layer(layer_dir, config_file.read_text(), strict, source_dir=config_file.parent)
-
-
-def parse_layer(layer_dir: Path, text: str, strict: bool = False, *, source_dir: Path | None = None,
-                read_file: Callable[[str], bytes | None] | None = None) -> RepoLayer:
+    cfg = _LOAD_SETTINGS.get()
+    if cfg and cfg.settings_snapshot and source_file is None and not strict:
+        for repo in cfg.repos:
+            if repo.pinned_layer is not None and repo.layer_dir == layer_dir:
+                return repo.pinned_layer
     ignored: list[str] | None = None if strict else []
     layer = RepoLayer(dir=layer_dir)
-    data = tomllib.loads(text)
+    config_file = source_file or layer.config_file
+    if not config_file.exists():
+        return layer
+    data = tomllib.loads(config_file.read_text())
     setup = section(data, "setup")
     layer.setup = list(setup.get("commands", []))
     layer.copy = list(setup.get("copy", []))
@@ -1375,10 +1377,11 @@ def parse_layer(layer_dir: Path, text: str, strict: bool = False, *, source_dir:
     if layer.factory_path not in FACTORY_PATHS:
         raise ValueError(f"[factory] path '{layer.factory_path}' is not one of {', '.join(FACTORY_PATHS)}")
     layer.passes = environment_table(section(data, "environment"), layer=True).passes
-    source_dir = source_dir or layer_dir
-    layer.document = document_table(section(data, "document"), source_dir, ignored, read_file)
-    if source_dir != layer_dir:
-        layer.document = layer_document_at(layer.document, source_dir, layer_dir)
+    source_dir = source_file.parent if source_file else layer_dir
+    layer.document = document_table(section(data, "document"), source_dir, ignored)
+    if source_file and "voice" in layer.document:
+        layer.document["voice"] = tuple(str((layer_dir / Path(name).relative_to(source_dir.resolve())).resolve())
+                                        for name in layer.document["voice"])
     if "verify" in data:
         v = section(data, "verify")
         publish_evidence = v.get("publish_evidence", True)
@@ -1409,7 +1412,7 @@ def parse_layer(layer_dir: Path, text: str, strict: bool = False, *, source_dir:
         for name, driver in bindings.items():
             if not isinstance(driver, str) or driver not in drivers:
                 raise ValueError(f"[verify.journey_drivers] {name!r} must name a command in [verify.drivers]")
-        feature_map = journeys.load(v.get("feature_map", {}), source_dir, bindings, read_file=read_file)
+        feature_map = journeys.load(v.get("feature_map", {}), source_dir, bindings)
         layer.verify = Verify(publish_evidence=publish_evidence, start=v.get("start", ""), url=v.get("url", Verify.url), ready=v.get("ready", "/"),
                               ready_seconds=int(v.get("ready_seconds", Verify.ready_seconds)),
                               allow_bash=list(v.get("allow_bash", [])), notes=v.get("notes", "").strip(),

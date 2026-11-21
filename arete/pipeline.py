@@ -18,6 +18,7 @@ from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, replace
+from functools import partial
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import TextIO
@@ -176,7 +177,7 @@ FEEDBACK_QUIET_MINUTES = 10
 
 
 def wanted(repo: config.Repo) -> str:
-    return config.load_layer(repo.layer_dir).factory_path
+    return repo.configured_layer().factory_path
 
 
 def has_origin(repo: config.Repo) -> bool:
@@ -1520,7 +1521,7 @@ def script_refusal(cfg: config.Config, repo: config.Repo, tid: str, script: Scri
         if (row.get("repo"), str(row.get("issue"))) != (repo.name, str(tid)):
             return f"--continue {script.continues}: no run of {repo.name} {tid} has that id"
     try:
-        layer = config.load_layer(repo.layer_dir)
+        layer = repo.configured_layer()
     except (ValueError, TypeError, OSError):
         layer = None
     for role in config.STEP_ROLES:
@@ -1651,13 +1652,26 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         producer_baseline = None
     service_labels = scratch.service_labels()
     paths.ensure_dirs()
-    cfg = config.load()
-    configured_repo = cfg.repo(repo_name)
-    repo = replace(configured_repo)
-    cfg = replace(cfg, repos=[repo if item is configured_repo else item for item in cfg.repos])
     from . import flows, launch_lease, pilot, zte
     from .store import db
     from .store import zte as zte_store
+
+    continued = run_store.run_get(script.continues) if script and script.continues else None
+    try:
+        saved = (flows.saved_settings(flows.prepared_data(script.continues))
+                 if continued and continued["repo"] == repo_name else None)
+    except ValueError as error:
+        print(record.failure(error))
+        return 2
+    if saved:
+        cfg, _, source_layer = saved
+        repo = cfg.repo(repo_name)
+        repo.pinned_layer = source_layer
+    else:
+        cfg = config.load()
+        configured_repo = cfg.repo(repo_name)
+        repo = replace(configured_repo)
+        cfg = replace(cfg, repos=[repo if item is configured_repo else item for item in cfg.repos])
 
     adw, refusal = run_refusal(repo, script is not None)
     if refusal:
@@ -1708,10 +1722,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         reconciling_catch_up = (script and script.path == "orchestrate" and script.continues
                                 and bool(flows.pending_catch_up(script.continues)))
         try:
-            prepared = flows.prepared_data(script.continues) if script and script.continues else {}
-            layer = flows.saved_layer(prepared)
-            if layer is None:
-                layer = config.load_layer(repo.layer_dir) if prepared else pin_layer(repo)
+            layer = repo.configured_layer()
             wall_deadline = math.inf
             zte_grant = None
             if zte.reserved(str(tid)):
@@ -1734,6 +1745,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             if isinstance(tk, tracker.GitHubTracker):
                 tk.require_ordinary(tid)
             budget_history = run_store.ticket_runs(repo.name, tid, limit=1, live=bool(retry_of or preview_of))
+            latest = budget_history[0] if budget_history else None
             custom_feature = bool(script and script.path == "feature" and custom_revision_feature(cfg))
             may_revise = not (zte_grant or retry_of or reconciling_catch_up or only) and (
                 script is None or not script.repairs and (script.path in ("orchestrate", "revise") or custom_feature))
@@ -1746,13 +1758,16 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             else:
                 budget_admission = runlimits.admission(repo, str(tid), tk, runlimits.Policy.of(layer), force,
                                                        readmission=readmission)
+            poll_failure = (latest["id"] if not (dry_run or force or retry_of or readmission) and latest
+                            and latest["status"] == "failed" and not latest["dry_run"]
+                            and launch_lease.from_poll(repo.name, str(tid)) else "")
         except tracker.ERRORS as e:
             print(f"could not read {name}: {e}")
             return 2
         except pilot.Held as e:
             print(f"could not admit the reserved README task: {e}")
             return 2
-        except (ValueError, OSError, RuntimeError, workspace.RunFailed) as e:
+        except (ValueError, OSError) as e:
             print(f"could not validate the process budget: {e}")
             return 2
         if budget_admission.reason and not dry_run and not (force and feedback_readmits):
@@ -1849,7 +1864,6 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             scratch.RUN_BASELINES[run_id] = producer_baseline
             scratch.RUN_LABELS[run_id] = service_labels
             repair_with_feedback = script and script.path == "orchestrate" and script.continues and not script.action
-            repo.pinned_layer = layer
             run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, cfg=cfg, tracker=tk, tid=tid, force=force,
                       feedback=[] if mending and not repair_with_feedback else feedback,
                       claim_feedback_on_revise=custom_feature or bool(script and script.path == "revise"),
@@ -1929,27 +1943,43 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             allow_reset = not (dry_run or retry_of)
             previous = "" if allow_reset and budget_admission.reset_time else parent
             repair_parent = "" if allow_reset and budget_admission.reset_repairs else parent
-            fresh = (bool(previous) and allow_reset and force and not restarting and not run.repairs
-                     and not run.alone and not (flow and flow.continues))
-            current = tk.get(tid) if fresh else None
+            can_reset_specs = bool(previous) and allow_reset and not restarting and not run.repairs and not run.alone
+            poll_retry = can_reset_specs and previous == poll_failure and not (flow and flow.refusal)
+            reset_changed_specs = can_reset_specs and force and not (flow and flow.continues)
+            current = tk.get(tid) if reset_changed_specs else None
             answered_runs = ()
             if not dry_run and not only and not (flow and flow.refusal):
                 answered_runs = tuple(a["run"] for a in run.answers_due)
                 if run.answering and answer_text(run.answering["id"]).strip():
                     answered_runs += (run.answering["id"],)
+            new_budget = partial(runlimits.Budget, run, runlimits.Policy.of(layer), previous,
+                                 repair_previous=repair_parent, answered_runs=answered_runs,
+                                 wall_deadline=wall_deadline, checkpoint_timeout=0 if zte_grant else None,
+                                 checkpoint_gate=checkpoint_allowed if zte_grant else None, fixed_gaps=fixed_gaps)
+            budget_started = None
+            if poll_retry:
+                with handoff_io():
+                    run.budget = new_budget(pending_specification=True)
+                try:
+                    with run.budget.watching(admit=check_handoff if zte_grant else None, periodic=not zte_grant):
+                        current = tk.get(tid)
+                except (Exception, runlimits.Parked, Stopped):
+                    with handoff_io():
+                        run.budget.log_chain()
+                    raise
+                budget_started = run.budget.started
+                reset_changed_specs = runlimits.specification_changed(
+                    runlimits.metadata(poll_failure, "budget.json"), runlimits.specification(current))
             with handoff_io():
-                run.budget = runlimits.Budget(run, runlimits.Policy.of(layer), previous, current, fresh,
-                                              repair_previous=repair_parent, answered_runs=answered_runs,
-                                              wall_deadline=wall_deadline, checkpoint_timeout=0 if zte_grant else None,
-                                              checkpoint_gate=checkpoint_allowed if zte_grant else None,
-                                              fixed_gaps=fixed_gaps)
+                run.budget = new_budget(current, reset_changed_specs, started=budget_started)
             with run.budget.watching(admit=check_handoff if zte_grant else None,
                                      work_admitted=(lambda: drive_entered and checkpoint_allowed()) if zte_grant else None,
                                      periodic=not zte_grant):
                 with handoff_io():
                     if not (flow and flow.refusal):
                         run.budget.capture(current or tk.get(tid))
-                with run_lines.nonblocking_appends(check_work_log) if zte_grant else nullcontext():
+                with (run_lines.nonblocking_appends(check_work_log) if zte_grant else nullcontext(),
+                      config.using_settings(flow.ctx.cfg if flow else cfg)):
                     drive_entered = True
                     status, summary, pr_url = flows.driven(flow, script.drive) if script else _run(cfg, run, slot)
             if zte_grant:
@@ -2155,55 +2185,19 @@ def checked_layer(cfg: config.Config, layer_dir: Path, *, source_file: Path | No
     return layer
 
 
-def pin_layer(repo: config.Repo) -> config.RepoLayer:
-    if repo.pinned_layer is not None:
-        return repo.pinned_layer
-    repo.pinned_layer = startup_layer(repo)
-    return repo.pinned_layer
-
-
-def startup_layer(repo: config.Repo) -> config.RepoLayer:
-    directory = repo.layer_dir
-    if repo.layer or not has_origin(repo):
-        return config.load_layer(directory)
-    root = util.git(["rev-parse", "--show-toplevel"], repo.path, check=False).strip()
-    if not root or Path(root).resolve() != repo.path.resolve():
-        return config.load_layer(directory)
-    local = None
-    try:
-        local = config.load_layer(directory)
-    except (ValueError, TypeError, OSError):
-        pass
-    base = (local.base_branch if local else "") or util.origin_default_branch(repo.path)
-    with util.repo_lock(repo.path):
-        util.git(["fetch", "origin", f"refs/heads/{base}"], repo.path)
-        revision = util.git(["rev-parse", "--verify", "FETCH_HEAD"], repo.path).strip()
-
-    def read_file(name: str) -> bytes | None:
-        entry = util.git(["--literal-pathspecs", "ls-tree", "--full-tree", revision, "--", f".agents/{name}"], repo.path)
-        if not entry or not entry.startswith(("100644 blob ", "100755 blob ")):
-            return None
-        oid = entry.split(None, 3)[2]
-        return util.git_bytes(["cat-file", "blob", oid], repo.path)
-
-    committed = read_file("config.toml")
-    repo.pinned_layer_committed = committed is not None
-    if committed is None:
-        return local if local is not None else config.load_layer(directory)
-    return config.parse_layer(directory, committed.decode(), read_file=read_file)
-
-
 def resolve_layer(cfg: config.Config, run: Run, ws: Path) -> config.RepoLayer:
+    if cfg.settings_snapshot:
+        from . import delegation
+
+        return delegation.read_snapshot(*cfg.settings_snapshot)[1]
     repo = run.repo
     if repo.layer:
-        return checked_layer(cfg, repo.layer, pinned=repo.pinned_layer)
+        return checked_layer(cfg, repo.layer)
     layer_dir = ws / ".agents"
-    committed = repo.pinned_layer_committed
-    if committed is True or (committed is None and (layer_dir / "config.toml").exists()):
-        pinned = repo.pinned_layer.at(layer_dir) if repo.pinned_layer is not None else None
-        return checked_layer(cfg, layer_dir, pinned=pinned)
+    if (layer_dir / "config.toml").exists():
+        return checked_layer(cfg, layer_dir)
     run.log(f"layer: {paths.short_path(repo.path / '.agents')} is not committed; lessons stay in the main checkout")
-    return checked_layer(cfg, repo.layer_dir, pinned=repo.pinned_layer)
+    return checked_layer(cfg, repo.layer_dir)
 
 
 def triage_checks(approval: dict | None) -> str:
@@ -2263,7 +2257,7 @@ def triage_block(approval: dict | None) -> str:
 
 
 def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, str]:
-    from . import environment_gaps, flows
+    from . import delegation, environment_gaps, flows
 
     repo, tk = run.repo, run.tracker
     try:
@@ -2317,6 +2311,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
     if why := furnish(cfg, run, layer, ws):
         return _fail(run, why)
     workspace.note_made(ws, checkouts, workspace_owner(run, ws, checkouts))
+    snapshot = delegation.freeze_settings(cfg, run, layer)
 
     expertise = layer.expertise_file.read_text() if layer.expertise_file.exists() else "(none yet)"
     checks = check_list(layer)
@@ -2493,7 +2488,8 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
     if (not run.feedback and draft_why and review.approved()
             and not ci_stopped and environment_gaps.gaps(asdict(verified))):
         run_lines.write(run.id, "classic_hold",
-                        prepared=flows.prepared_fields(t, branch, checkouts, layer, run.add_dirs, attachments, approval),
+                        prepared={**flows.prepared_fields(t, branch, checkouts, layer, run.add_dirs, attachments, approval),
+                                  "settings_snapshot": snapshot},
                         plan={"plan": plan_text, "goal": verify_goal, "estimate": estimate,
                               "left_for_a_person": left_for_a_person},
                         build={"summary": build_summary}, review=review.asdict(),

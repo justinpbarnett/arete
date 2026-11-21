@@ -4,6 +4,7 @@ import json
 import os
 import shlex
 import shutil
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -13,7 +14,6 @@ import tomllib
 import unittest
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
-from hashlib import sha256
 from pathlib import Path
 from string import Template
 from types import SimpleNamespace
@@ -759,7 +759,7 @@ tracker = 'local'
                 shutil.copytree(fetched_layer, ws / ".agents")
             return []
 
-        self.enterContext(patch.object(flows, "local_workspace", side_effect=make))
+        return self.enterContext(patch.object(flows, "local_workspace", side_effect=make))
 
 
 class RunSettingsSnapshotTests(RunSettingsFixture):
@@ -768,8 +768,8 @@ class RunSettingsSnapshotTests(RunSettingsFixture):
         self.write_settings("original", 0.5)
         controller = self.controller()
 
-        self.write_settings("edited", 0.7)
         self.assertIsNone(controller.prepare())
+        self.write_settings("edited", 0.7)
         controller.run.launch_gate = Mock(return_value=None)
         result = self.launch_worker(controller, self.accept_worker(controller))
         self.assertEqual(result["state"], "succeeded", result["result"])
@@ -788,78 +788,67 @@ class RunSettingsSnapshotTests(RunSettingsFixture):
 
 
 class WorkerSnapshotRefusalTests(RunSettingsFixture):
-    def test_worker_refuses_a_snapshot_with_a_different_accepted_layer(self):
+    def test_dispatch_refuses_changed_snapshot_bytes(self):
         self.mock_worktree()
         self.write_settings("original", 0.5)
         controller = self.controller()
         self.assertIsNone(controller.prepare())
         action = self.accept_worker(controller)
-        changed_layer = replace(controller.job.layer, checks={"behavior": "echo changed layer"})
-        controller.job.worker_settings = delegation.snapshot_settings(replace(controller.job, layer=changed_layer))
+        path, _ = controller.job.cfg.settings_snapshot
+        path.write_bytes(path.read_bytes() + b"\n")
 
-        result = self.launch_worker(controller, action)
+        self.assertIsInstance(controller.dispatch(action), delegation.PolicyChanged)
+        result, = ledger.actions(controller.lease)
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["result"]["error"], "PolicyChanged: worker policy changed after action acceptance")
+        self.assertFalse(controller.run.step_started)
+
+    def test_worker_checks_snapshot_again_after_dispatch(self):
+        self.mock_worktree()
+        self.write_settings("original", 0.5)
+        controller = self.controller()
+        self.assertIsNone(controller.prepare())
+        worker = delegation.Worker
+        path, _ = controller.job.cfg.settings_snapshot
+
+        def launch(*args):
+            path.write_bytes(path.read_bytes() + b"\n")
+            return worker(*args)
+
+        with patch.object(delegation, "Worker", side_effect=launch):
+            result = self.launch_worker(controller, self.accept_worker(controller))
         self.assertEqual(result["state"], "failed")
         self.assertEqual(result["result"]["error"], "PolicyChanged: worker policy changed after action acceptance")
         self.assertFalse(controller.run.step_started)
 
 
-class CheckedInLayerSnapshotTests(RunSettingsFixture):
-    def test_prepare_keeps_checked_in_layer_when_origin_changes(self):
-        self.write_settings("original", 0.5, checked_in=True)
-        controller = self.controller()
-
-        fetched_layer = self.root / "fetched-layer"
-        self.write_layer(fetched_layer, "edited")
-        self.mock_worktree(fetched_layer)
-        self.assertIsNone(controller.prepare())
-        worktree_layer = controller.job.ws / ".agents"
-        self.assertIn("echo edited layer", (worktree_layer / "config.toml").read_text())
-        self.assertEqual(controller.job.layer.dir, worktree_layer)
-        self.assertEqual(controller.job.layer.document["voice"], (str(worktree_layer / "voice.md"),))
-        controller.run.launch_gate = Mock(return_value=None)
-        result = self.launch_worker(controller, self.accept_worker(controller))
-        self.assertEqual(result["state"], "succeeded", result["result"])
-        env = controller.run.launch_gate.call_args.args[2]["env"]
-        self.assertIn("SNAPSHOT_ORIGINAL", env)
-        self.assertNotIn("SNAPSHOT_EDITED", env)
-        self.assertIn("`echo original layer`", flows.report(controller.job, "", {}, ""))
-
-
 class UpstreamLayerSettingsTests(RunSettingsFixture):
-    def test_uses_upstream_at_startup_and_keeps_it_through_prepare(self):
+    def test_snapshot_preserves_source_and_checked_in_layer_resolution(self):
         self.write_settings("original", 0.5, checked_in=True)
-        source = self.repo.path
-        origin = self.root / "origin"
-        util.git(["init", "-q", "-b", "main", "--template="], source)
-        self.commit_layer(source, "Source")
-        util.git(["clone", "-q", str(source), str(origin)], self.root)
-        util.git(["remote", "add", "origin", str(origin)], source)
-
-        upstream = origin / ".agents"
+        source_config = self.repo.layer_dir / "config.toml"
+        source_config.write_text(source_config.read_text() + "\n[git]\nbase = 'main'\n[factory]\npath = 'classic'\n")
+        upstream = self.root / "fetched-layer"
         self.write_layer(upstream, "edited")
-        (upstream / "config.toml").write_text((upstream / "config.toml").read_text().replace("voice.md", "new-voice.md"))
-        (upstream / "new-voice.md").write_text("Upstream voice\n")
-        self.commit_layer(origin, "Before startup")
+        upstream_config = upstream / "config.toml"
+        upstream_config.write_text(upstream_config.read_text() + "\n[git]\nbase = 'other'\n[factory]\npath = 'adw'\n")
+        checkout = self.mock_worktree(upstream)
+
         controller = self.controller()
-        self.assertEqual(controller.run.repo.configured_layer().checks["behavior"], "echo edited layer")
-        self.assertIn("echo original layer", (source / ".agents" / "config.toml").read_text())
-
-        self.write_layer(upstream, "later")
-        self.commit_layer(origin, "After startup")
-        self.mock_worktree(upstream)
         self.assertIsNone(controller.prepare())
-        worktree_layer = controller.job.ws / ".agents"
-        self.assertIn("echo later layer", (worktree_layer / "config.toml").read_text())
-        self.assertEqual(controller.job.layer.document["voice"], (str(worktree_layer / "new-voice.md"),))
-        self.assertIn("`echo edited layer`", flows.report(controller.job, "", {}, ""))
-
-    def commit_layer(self, checkout, message):
-        util.git(["add", "-f", ".agents"], checkout)
-        util.git([*util.ARETE_IDENTITY, "commit", "-qm", message], checkout)
+        self.assertEqual(checkout.call_args.args[1], "main")
+        cfg, layer, configured = delegation.read_snapshot(*controller.job.cfg.settings_snapshot)
+        source_layer = config.load_layer(self.repo.layer_dir)
+        checked_in = config.load_layer(controller.job.ws / ".agents")
+        self.assertEqual(configured, source_layer)
+        self.assertEqual(layer, checked_in)
+        self.assertEqual((layer.base_branch, layer.passes, layer.factory_path), ("other", ("SNAPSHOT_EDITED",), "adw"))
+        self.assertEqual((configured.base_branch, configured.passes, configured.factory_path),
+                         ("main", ("SNAPSHOT_ORIGINAL",), "classic"))
+        self.assertEqual(cfg.repo(self.repo.name).configured_layer(), configured)
 
 
 class PreparedLayerResumeTests(RunSettingsFixture):
-    def test_resume_reuses_the_accepted_layer_when_the_worktree_differs(self):
+    def test_resume_without_file_changes_keeps_lineage_and_snapshot(self):
         self.write_settings("original", 0.5, checked_in=True)
         controller = self.controller()
         edited = self.root / "fetched-layer"
@@ -868,14 +857,15 @@ class PreparedLayerResumeTests(RunSettingsFixture):
         self.assertIsNone(controller.prepare())
         worktree_layer = controller.job.ws / ".agents"
         self.assertIn("echo edited layer", (worktree_layer / "config.toml").read_text())
-        self.assertEqual(controller.job.layer.checks["behavior"], "echo original layer")
+        self.assertEqual(controller.job.layer.checks["behavior"], "echo edited layer")
         record.move(controller.run.id, "interrupted", ("running",))
 
         resumed = self.controller(controller.run.id)
         self.assertIsNone(resumed.prepare())
         self.assertEqual(resumed.job.layer, controller.job.layer)
         self.assertEqual(resumed.data["policy_sha"], controller.data["policy_sha"])
-        self.assertIn("`echo original layer`", flows.report(resumed.job, "", {}, ""))
+        self.assertEqual(resumed.job.cfg.settings_snapshot, controller.job.cfg.settings_snapshot)
+        self.assertIn("`echo edited layer`", flows.report(resumed.job, "", {}, ""))
 
 
 class NativeGuardSettingsFixture:
@@ -892,22 +882,21 @@ class NativeGuardSettingsFixture:
                                                       "ARETE_STATE_DIR": str(root / "state")}))
             settings.write_text("[jev]\nguard = true\nirreversible_hold = 0.5\n")
             cfg = config.load()
-            job = SimpleNamespace(cfg=cfg, layer=config.RepoLayer(root),
-                                  run=SimpleNamespace(repo=config.Repo("fixture", root)))
-            raw = delegation.snapshot_settings(job)
+            layer = config.RepoLayer(root)
+            run = SimpleNamespace(dir=root, repo=config.Repo("fixture", root, layer=root))
+            delegation.freeze_settings(cfg, run, layer)
             settings.write_text("[jev]\nguard = true\nirreversible_hold = 0.7\n")
-            accepted, layer, _ = delegation.load_settings(raw, sha256(raw).hexdigest())
-            trip = runner.Trip(accepted, None, devices.LOCAL, None, Session(), None, None, layer=layer)
+            trip = runner.Trip(cfg, None, devices.LOCAL, None, Session(), None, None, layer=layer)
 
             candidate = SimpleNamespace(runner=module.__name__.split(".")[-1], effort="", instructions=())
             auth = accounts.Auth("api_key")
             picked = runner.Picked(candidate, auth, None, "fixture", "", set(), None)
             kw = runner.launch_kwargs({"tools": ["Bash"], "allowed_tools": ["Bash"], "persist": False},
                                       picked, trip, ("", ""), False, Mock(), cwd=cwd)
-            command = self.hook_command(module, cwd, kw, auth)
+            command, env = self.hook_command(module, cwd, kw, auth)
             shell_tool = "Bash" if module is claude else "shell"
-            self.assertIn("git cannot undo (p 0.60)", self.hook_decision(command, cwd, shell_tool, "echo fixture"))
-            self.assertIn(refusal, self.hook_decision(command, cwd, shell_tool, blocked))
+            self.assertIn("git cannot undo (p 0.60)", self.hook_decision(command, env, cwd, shell_tool, "echo fixture"))
+            self.assertIn(refusal, self.hook_decision(command, env, cwd, shell_tool, blocked))
             self.assertEqual(config.load().jev.irreversible_hold, 0.7)
 
     def hook_command(self, module, root, kw, auth):
@@ -916,14 +905,15 @@ class NativeGuardSettingsFixture:
             with patch.object(claude.child, "stream", return_value=completed) as launch:
                 claude.run("Fixture", root, model="fixture", auth=auth, **kw)
             argv = launch.call_args.args[0]
-            return json.loads(argv[argv.index("--settings") + 1])["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            command = json.loads(argv[argv.index("--settings") + 1])["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            return command, launch.call_args.args[3]
         with (patch.object(codex, "launch", return_value=completed) as launch,
               patch.object(codex, "isolation_problem", return_value=""), patch.object(codex, "home", return_value=root)):
             codex.run("Fixture", root, model="fixture", auth=auth, **kw)
         setting = next(arg for arg in launch.call_args.args[0] if arg.startswith("hooks.PreToolUse="))
-        return tomllib.loads(setting)["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        return tomllib.loads(setting)["hooks"]["PreToolUse"][0]["hooks"][0]["command"], launch.call_args.args[3]
 
-    def hook_decision(self, command, cwd, tool, bash):
+    def hook_decision(self, command, env, cwd, tool, bash):
         argv = shlex.split(command)
         entrypoint = argv.index("-c") + 1
         setup = ("from arete import jev; jev.key = lambda *a: 'fixture'; "
@@ -932,7 +922,7 @@ class NativeGuardSettingsFixture:
         at = argv[entrypoint].index("from arete.cli")
         argv[entrypoint] = argv[entrypoint][:at] + setup + argv[entrypoint][at:]
         payload = {"tool_name": tool, "tool_input": {"command": bash}, "cwd": str(cwd)}
-        proc = subprocess.run(argv, input=json.dumps(payload), capture_output=True, text=True, timeout=2, cwd=cwd)
+        proc = subprocess.run(argv, input=json.dumps(payload), capture_output=True, text=True, timeout=2, cwd=cwd, env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         result = json.loads(proc.stdout)["hookSpecificOutput"]
         self.assertEqual(result["permissionDecision"], "deny")
@@ -958,11 +948,11 @@ class PiShellSettingsTests(unittest.TestCase):
             self.enterContext(patch.object(paths, "ISOLATED", False))
             settings.write_text("[jev]\nguard = true\nirreversible_hold = 0.5\n")
             cfg = config.load()
-            job = SimpleNamespace(cfg=cfg, layer=config.RepoLayer(root),
-                                  run=SimpleNamespace(repo=config.Repo("fixture", root)))
-            raw = delegation.snapshot_settings(job)
+            layer = config.RepoLayer(root)
+            run = SimpleNamespace(dir=root, repo=config.Repo("fixture", root, layer=root))
+            delegation.freeze_settings(cfg, run, layer)
             settings.write_text("[jev]\nguard = true\nirreversible_hold = 0.7\n")
-            accepted, layer, _ = delegation.load_settings(raw, sha256(raw).hexdigest())
+            accepted, layer, _ = delegation.read_snapshot(*cfg.settings_snapshot)
 
             auth = accounts.Auth("api_key")
             selected = pi.Route("fixture", "fixture/model", auth, owner=root / "owner", view=root)
@@ -2379,7 +2369,7 @@ class OrchestratedFeedbackAnswerTests(PrAnswerFixture):
             self.add_issue_reply(issue_reply)
         expected = issue_reply or comment
 
-        def decide(run, turn, request, _snapshot):
+        def decide(run, turn, request):
             self.assertIn(f"Answer: {expected}", request["prompt"])
             for body in comments:
                 self.assertIn(body, request["prompt"])
@@ -2771,7 +2761,7 @@ class DeniedWorkerEditsTests(unittest.TestCase):
     def worker(self, edit, prompt_id="delegate"):
         controller = self.controller
 
-        def launch(run, action, request, _snapshot):
+        def launch(run, action, request):
             expected = prompt_loader.code_list(diffguard.denied_paths(self.layer))
             self.assertIn(f"Denied paths: {expected}.", request["prompt"].splitlines())
             if prompt_id == "delegate":
@@ -2961,6 +2951,278 @@ class OrchestratedFinishBudgetTests(PollFixture):
         self.assertEqual(summary, "the orchestrator stopped without delivery")
         self.assertEqual(tasks_store.task_get(tid)["state"], "failed")
         self.assertFalse((directory / "parked.json").exists())
+
+
+class FailedPollBudgetTests(ReadmissionFixture):
+    def failed_with_spent_repairs(self, previous="", *, pr_url=""):
+        self.repo.layer_dir.mkdir()
+        (self.repo.layer_dir / "config.toml").write_text('[factory]\npath = "classic"\n[limits]\nmax_repair_cycles = 3\n')
+        self.cfg.replay = config.ReplayConfig(all=True)
+        failed = self.made_run(previous)
+        record.note(failed.id, repair_calls=3)
+        record.settle(failed.id, "failed", pr_url=pr_url)
+        self.local.label(self.ticket, add=["failed"])
+        return failed
+
+    def test_poll_keeps_budget_after_failed_run_with_unchanged_specification(self):
+        older = self.made_run()
+        record.settle(older.id, "failed")
+        with foundation.db() as connection:
+            set_task_body(self.ticket, "The latest failed run used this specification", connection=connection)
+        failed = self.failed_with_spent_repairs(older.id)
+        self.local.label(self.ticket, remove=["failed"])
+
+        def work(cfg, run, slot):
+            self.assertFalse(run.force)
+            self.assertEqual(run.budget.prior_repairs, 3)
+            run.budget.charge("repair", "review_repair")
+            return "noop", "fixture finished", ""
+
+        self.assertEqual(self.poll_with(self.cfg, lambda repo, tid: self.run_polled_ticket(repo, tid, work)), 0)
+        retry = run_store.newest_live_whole_run(self.repo.name, self.ticket)
+        self.assertNotEqual(retry["id"], failed.id)
+        saved = runlimits.metadata(retry["id"], "budget.json")
+        log = (paths.RUNS_DIR / retry["id"] / "run.log").read_text()
+        self.assertEqual(saved["repair_parents"], [failed.id, older.id])
+        self.assertEqual(saved["repair_left_out"], [])
+        self.assertIn("the repair chain used its 3 repair cycles", log)
+
+    def assert_failed_run_charged(self, retry, failed, minutes):
+        [chain] = [line for line in run_lines.read(retry["id"]) if line["event"] == "budget_chain"]
+        self.assertEqual(chain["charged"][failed.id]["repair_calls"], 3)
+        self.assertEqual(chain["charged"][failed.id]["run_minutes"], minutes)
+        log = (paths.RUNS_DIR / retry["id"] / "run.log").read_text()
+        self.assertIn(f"budget chain: {failed.id}: {minutes:.1f} run minutes, 0.0 verification minutes, "
+                      "3 repair calls", log)
+
+    def test_poll_retry_keeps_budget_when_lookup_times_out(self):
+        failed = self.failed_with_spent_repairs()
+        record.note(failed.id, active_seconds=3599.75)
+        self.local.label(self.ticket, remove=["failed"])
+        clock = [100.0]
+        work = Mock()
+
+        def launch_with_stalled_lookup(repo, tid):
+            with patch.object(runlimits, "time", SimpleNamespace(monotonic=lambda: clock[0])), \
+                    patch.object(signal, "setitimer") as timer:
+                def stalled_lookup(*_):
+                    timer.assert_called_once_with(signal.ITIMER_REAL, 3600)
+                    self.assertTrue(callable(signal.getsignal(signal.SIGALRM)))
+                    clock[0] += 3600
+                    signal.raise_signal(signal.SIGALRM)
+                    self.fail("the watchdog did not interrupt the lookup")
+
+                with patch.object(tracker.LocalTracker, "get", side_effect=stalled_lookup) as lookup:
+                    self.assertEqual(self.run_polled_ticket(repo, tid, work), 1)
+                lookup.assert_called_once()
+
+        self.assertEqual(self.poll_with(self.cfg, launch_with_stalled_lookup), 0)
+        work.assert_not_called()
+        retry = run_store.newest_live_whole_run(self.repo.name, self.ticket)
+        parked = runlimits.metadata(retry["id"], "parked.json")
+        self.assertEqual(parked.get("reason"), "the run chain reached its cumulative 60 minute budget")
+        self.assertEqual(parked["specification"], runlimits.recorded_specification(failed.id))
+        saved = runlimits.metadata(retry["id"], "budget.json")
+        self.assertEqual(saved["parents"], [failed.id])
+        self.assertEqual(saved["repair_parents"], [failed.id])
+        self.assertEqual(retry["active_seconds"], 3600)
+        self.assert_failed_run_charged(retry, failed, 60.0)
+
+    def test_poll_retry_compares_an_edit_after_the_inherited_deadline_would_expire(self):
+        failed = self.failed_with_spent_repairs()
+        record.note(failed.id, active_seconds=3599.75)
+        with foundation.db() as connection:
+            set_task_body(self.ticket, "A narrower specification", connection=connection)
+        self.local.label(self.ticket, remove=["failed"])
+        ticket = self.local.get(self.ticket)
+        clock = [100.0]
+        budgets = []
+
+        def slow_lookup(*_):
+            clock[0] += 12
+            return ticket
+
+        def work(cfg, run, slot):
+            self.assertFalse(run.force)
+            budgets.append(run.budget)
+            run.budget.charge("repair", "review_repair")
+            return "noop", "fixture finished", ""
+
+        def launch_with_slow_lookup(repo, tid):
+            with patch.object(runlimits, "time", SimpleNamespace(monotonic=lambda: clock[0])), \
+                    patch.object(signal, "setitimer"), \
+                    patch.object(tracker.LocalTracker, "get", side_effect=slow_lookup) as lookup:
+                self.assertEqual(self.run_polled_ticket(repo, tid, work), 0)
+                lookup.assert_called_once()
+
+        self.assertEqual(self.poll_with(self.cfg, launch_with_slow_lookup), 0)
+        retry = run_store.newest_live_whole_run(self.repo.name, self.ticket)
+        self.assertNotEqual(retry["id"], failed.id)
+        self.assertEqual(retry["status"], "noop")
+        self.assertEqual(retry["active_seconds"], 12)
+        [budget] = budgets
+        self.assertEqual(budget.parents, [])
+        self.assertEqual(budget.run_deadline() - clock[0], 60 * 60 - 12)
+        saved = runlimits.metadata(retry["id"], "budget.json")
+        self.assertEqual(saved["parents"], [])
+        self.assertEqual(saved["repair_left_out"], [failed.id])
+        self.assertEqual(runlimits.repair_count(retry["id"]), 1)
+        [chain] = [line for line in run_lines.read(retry["id"]) if line["event"] == "budget_chain"]
+        self.assertEqual(chain["charged"], {})
+        log = (paths.RUNS_DIR / retry["id"] / "run.log").read_text()
+        self.assertIn("budget: left out 3 earlier repair cycles, 60.0 run minutes and 0.0 verification minutes "
+                      "of 1 earlier run because the ticket specification changed since they ran", log)
+
+    def test_poll_keeps_budget_across_a_failed_ticket_fetch(self):
+        failed = self.failed_with_spent_repairs()
+        self.local.label(self.ticket, remove=["failed"])
+        work = Mock()
+
+        def launch_with_fetch_error(repo, tid):
+            with patch.object(tracker.LocalTracker, "get", side_effect=tracker.TaskError("ticket fetch failed")):
+                self.assertEqual(self.run_polled_ticket(repo, tid, work), 1)
+
+        self.assertEqual(self.poll_with(self.cfg, launch_with_fetch_error), 0)
+        retry = run_store.newest_live_whole_run(self.repo.name, self.ticket)
+        self.assertNotEqual(retry["id"], failed.id)
+        self.assertEqual(retry["status"], "failed")
+        self.assertIn("ticket fetch failed", retry["summary"])
+        work.assert_not_called()
+        self.assert_failed_run_charged(retry, failed, 0.0)
+
+        self.local.label(self.ticket, remove=["failed"])
+
+        def charge_repair(cfg, run, slot):
+            run.budget.charge("repair", "review_repair")
+            return "noop", "fixture finished", ""
+
+        self.assertEqual(self.poll_with(self.cfg, lambda repo, tid: self.run_polled_ticket(repo, tid, charge_repair)), 0)
+        next_retry = run_store.newest_live_whole_run(self.repo.name, self.ticket)
+        self.assertNotEqual(next_retry["id"], retry["id"])
+        self.assertIn("the repair chain used its 3 repair cycles", next_retry["summary"])
+        self.assertEqual(runlimits.repair_count(next_retry["id"]), 0)
+        for key in ("parents", "repair_parents"):
+            self.assertEqual(runlimits.metadata(retry["id"], "budget.json")[key], [failed.id])
+            self.assertEqual(runlimits.metadata(next_retry["id"], "budget.json")[key], [retry["id"], failed.id])
+
+    def assert_fresh_feedback_logged_on_lookup_failure(self, *, timeout):
+        url = "https://github.com/owner/fixture/pull/1"
+        failed = self.failed_with_spent_repairs(pr_url=url)
+        run_lines.write(failed.id, "execution", path="orchestrate")
+        record.note(failed.id, active_seconds=180, verify_seconds=60)
+        insights_store.add_feedback([{"pr_url": url, "repo": self.repo.name, "issue": self.ticket,
+                                      "kind": "comment", "gh_id": 1, "body": "Please revise", "pr_state": "OPEN",
+                                      "status": "new", "at_once": 0, "created": "2026-01-01T00:00:00Z"}])
+        with foundation.db() as connection:
+            set_task_body(self.ticket, "A narrower specification", connection=connection)
+        self.local.label(self.ticket, remove=["failed"])
+        clock = [100.0]
+
+        def fail_lookup(*_):
+            if timeout:
+                clock[0] += 3600
+                signal.raise_signal(signal.SIGALRM)
+                self.fail("the watchdog did not interrupt the lookup")
+            raise tracker.TaskError("ticket fetch failed")
+
+        def spawn(repo, tid):
+            command = pipeline.run_command(repo, tid)
+            self.assertEqual(command[-4:], [repo, tid, "--continue", failed.id])
+            script = pipeline.Script("orchestrate", lambda _: self.fail("started work after lookup failure"),
+                                     continues=failed.id)
+            with patch.object(runlimits, "time", SimpleNamespace(monotonic=lambda: clock[0])), \
+                    patch.object(signal, "setitimer"), \
+                    patch.object(tracker.LocalTracker, "get", side_effect=fail_lookup) as lookup:
+                self.assertEqual(self.run_polled_ticket(repo, tid, Mock(), script), 1)
+                lookup.assert_called_once()
+
+        self.assertEqual(self.poll_with(self.cfg, spawn), 0)
+        retry = run_store.newest_live_whole_run(self.repo.name, self.ticket)
+        self.assertNotEqual(retry["id"], failed.id)
+        self.assertEqual(retry["status"], "failed")
+        self.assertIn("the run chain reached its cumulative 60 minute budget" if timeout else "ticket fetch failed",
+                      retry["summary"])
+        saved = runlimits.metadata(retry["id"], "budget.json")
+        self.assertEqual(saved["parents"], [])
+        self.assertEqual(saved["repair_parents"], [])
+        self.assertEqual(saved["left_out"], [failed.id])
+        self.assertEqual(saved["repair_left_out"], [failed.id])
+        self.assertIsNone(saved["specification"])
+        [chain] = [line for line in run_lines.read(retry["id"]) if line["event"] == "budget_chain"]
+        self.assertEqual(chain["charged"], {})
+        log = (paths.RUNS_DIR / retry["id"] / "run.log").read_text()
+        self.assertEqual(log.count("budget chain: no parents\n"), 1)
+        self.assertEqual([line.split("] ", 1)[-1] for line in log.splitlines() if "budget: left out" in line], [
+            "budget: left out 3 earlier repair cycles, 3.0 run minutes and 1.0 verification minutes "
+            "of 1 earlier run because the owner commented on the PR since they ran",
+        ])
+
+    def test_poll_logs_fresh_feedback_reset_when_lookup_errors(self):
+        self.assert_fresh_feedback_logged_on_lookup_failure(timeout=False)
+
+    def test_poll_logs_fresh_feedback_reset_when_lookup_times_out(self):
+        self.assert_fresh_feedback_logged_on_lookup_failure(timeout=True)
+
+    def test_poll_continuation_drops_spent_repairs_after_specification_edit(self):
+        url = "https://github.com/owner/fixture/pull/1"
+        failed = self.failed_with_spent_repairs(pr_url=url)
+        run_lines.write(failed.id, "execution", path="orchestrate")
+        insights_store.add_feedback([{"pr_url": url, "repo": self.repo.name, "issue": self.ticket,
+                                      "kind": "comment", "gh_id": 1, "body": "Please revise", "pr_state": "OPEN",
+                                      "status": "new", "at_once": 0, "created": "2026-01-01T00:00:00Z"}])
+        insights_store.take_feedback(insights_store.open_feedback([url]), failed.id)
+        insights_store.settle_feedback(failed.id, "failed")
+        record.note(failed.id, active_seconds=3599.75)
+        with foundation.db() as connection:
+            set_task_body(self.ticket, "A narrower specification", connection=connection)
+        self.local.label(self.ticket, remove=["failed"])
+        ticket = self.local.get(self.ticket)
+        clock = [100.0]
+
+        def drive(flow):
+            run = flow.ctx.run
+            self.assertEqual(flow.continues, failed.id)
+            self.assertEqual([row["run_id"] for row in run.feedback], [failed.id])
+            run.budget.charge("repair", "review_repair")
+            return "noop", "fixture finished", ""
+
+        def spawn(repo, tid):
+            command = pipeline.run_command(repo, tid)
+            self.assertEqual(command[-4:], [repo, tid, "--continue", failed.id])
+            script = pipeline.Script("orchestrate", drive, continues=command[-1])
+            timer = Mock()
+
+            def slow_lookup(*_):
+                timer.assert_called_once_with(signal.ITIMER_REAL, 3600)
+                clock[0] += 12
+                return ticket
+
+            with patch.object(runlimits, "time", SimpleNamespace(monotonic=lambda: clock[0])), \
+                    patch.object(signal, "setitimer", timer), \
+                    patch.object(tracker.LocalTracker, "get", side_effect=slow_lookup) as lookup:
+                self.assertEqual(self.run_polled_ticket(repo, tid, Mock(), script), 0)
+                lookup.assert_called_once()
+
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(self.poll_with(self.cfg, spawn), 0, output.getvalue())
+        retry = run_store.newest_live_whole_run(self.repo.name, self.ticket)
+        self.assertEqual(retry["status"], "noop")
+        self.assertEqual(retry["active_seconds"], 12)
+        saved = runlimits.metadata(retry["id"], "budget.json")
+        self.assertEqual(saved["parents"], [])
+        self.assertEqual(saved["repair_left_out"], [failed.id])
+        self.assertEqual(runlimits.repair_count(retry["id"]), 1)
+        log = (paths.RUNS_DIR / retry["id"] / "run.log").read_text()
+        self.assertIn("budget: left out 3 earlier repair cycles, 60.0 run minutes and 0.0 verification minutes "
+                      "of 1 earlier run because the ticket specification changed since they ran", log)
+
+    def test_poll_leaves_unchanged_park_in_place_after_failed_label_removed(self):
+        parked = self.park_ticket()
+        self.local.label(self.ticket, remove=["failed"])
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(self.poll_with(self.cfg, lambda *_: self.fail("started without an edit")), 0)
+        self.assertIn(f"parked after run {parked.id}: repair limit", output.getvalue())
+        self.assertEqual(run_store.newest_live_whole_run(self.repo.name, self.ticket)["id"], parked.id)
 
 
 class OrchestrationFinishTests(Isolated):

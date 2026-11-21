@@ -22,7 +22,6 @@ from . import (
     devices,
     environment,
     guard,
-    guard_settings,
     jev,
     jev_ask,
     owner_asks,
@@ -726,6 +725,8 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
         kw["remote"] = target
     else:
         kw["passing"] = environment.passed(cfg, repo)
+        if snapshot := config.snapshot_env(cfg):
+            kw["extra_env"] = {**(kw.get("extra_env") or {}), **snapshot}
         if which == "pi":
             roots = trip.layer.read_roots if trip.layer and not (request and request.requires.delegation_only) else ()
             kw["read_roots"] = tuple(Path(root) for root in roots)
@@ -774,7 +775,7 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
             kw["providers"] = cfg.environment.providers
             kw["floor"] = floor
             kw["judge"] = cfg.jev.guard
-            kw["guard_config"] = cfg
+            kw["guard_config"] = cfg if cfg.settings_snapshot else None
     if uploads.granted(kw.get("allowed_tools")) and (not TRAITS[which].uploads_supported or target.remote):
         kw["allowed_tools"] = uploads.without(kw["allowed_tools"])
         browser.with_note(kw, uploads.WITHHELD)
@@ -990,12 +991,10 @@ def local_claude(kw: dict, cfg: config.Config, run_id: str, ask_jev: bool, say: 
     kw = {**kw, "extra_env": {**(kw.get("extra_env") or {}), **run_env(run_id)}}
     if guard.wanted(kw.get("tools")):
         kw["settings"] = guard.settings(cfg.jev.guard, floor.open)
-        guard_args = [*guard_settings.arguments(cfg),
-                      *(arg for path in closed_context for arg in ("--closed", str(path)))]
-        if guard_args:
+        if closed_context:
             for group in kw["settings"]["hooks"]["PreToolUse"]:
                 for hook in group["hooks"]:
-                    hook["command"] += " " + shlex.join(guard_args)
+                    hook["command"] += " " + shlex.join([arg for path in closed_context for arg in ("--closed", str(path))])
         if scratch:
             for group in kw["settings"]["hooks"]["PreToolUse"]:
                 for hook in group["hooks"]:
@@ -1015,8 +1014,6 @@ def local_codex(kw: dict, cfg: config.Config, run_id: str, say: Callable[[str], 
     kw = {**kw, "extra_env": {**(kw.get("extra_env") or {}), **run_env(run_id)}}
     kw["floor"] = floor
     kw["judge"] = cfg.jev.guard
-    if cfg.jev.guard and guard.wanted(kw.get("tools")):
-        kw["judge_args"] = guard_settings.arguments(cfg)
     if scratch:
         kw["scratch"] = tuple(scratch)
     if cfg.jev.guard and guard.wanted(kw.get("tools")) and (note := judge_note(cfg, kw["passing"], repo)):
