@@ -920,6 +920,7 @@ def publication_ci_passed(repo: str, head: str, *,
         if type(run) is not int or run <= 0:
             return False
         unresolved.add(run)
+    unresolved.update(row["id"] for row in head_workflow_runs(repo, head, retry=False))
     for run in sorted(unresolved):
         row = workflow_run(repo, head, run, retry=False)
         if row.get("status") != "completed":
@@ -928,6 +929,22 @@ def publication_ci_passed(repo: str, head: str, *,
         if failures or check_state(row) == "fail":
             return False
     return bool(checks or unresolved)
+
+
+def run_number(row: dict) -> int:
+    return row["run_number"] if type(row.get("run_number")) is int else 0
+
+
+def head_workflow_runs(repo: str, head: str, **options) -> list[dict]:
+    query = urlencode({"head_sha": head, "per_page": 100})
+    latest: dict[object, dict] = {}
+    for row in actions_rows(f"repos/{repo}/actions/runs?{query}", "workflow_runs", **options):
+        if not isinstance(row, dict) or row.get("head_sha") != head or type(row.get("id")) is not int:
+            continue
+        key = row.get("workflow_id") or ("run", row["id"])
+        if key not in latest or run_number(row) >= run_number(latest[key]):
+            latest[key] = row
+    return list(latest.values())
 
 
 def current_workflow_checks(repo: str, head: str, runs: list[Check], red_workflows: set[int], *,
@@ -1025,8 +1042,7 @@ def workflow_belongs_to_pr(row: dict, number: int) -> bool:
 
 def workflow_belongs_to_head_branch(row: dict, repo: str, number: int, head: str, **options) -> bool:
     pulls = row.get("pull_requests")
-    if not row.get("head_branch") or (pulls != [] and not (
-            row.get("event") == "push" and workflow_lists_pr(pulls, number))):
+    if not row.get("head_branch") or not (pulls == [] or row.get("event") == "push" and isinstance(pulls, list)):
         return False
     pull = gh_json(["api", f"repos/{repo}/pulls/{number}"], **options) or {}
     ref = pull.get("head") or {}

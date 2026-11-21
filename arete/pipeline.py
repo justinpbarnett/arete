@@ -1199,7 +1199,6 @@ class Build(TicketWork):
     build_summary: str = ""
     catch_ups: int = 0
     ci_rerun_requested_heads: set[tuple[str, str]] = field(default_factory=set)
-    unread_ci_reruns: dict[tuple[str, str, str], int] = field(default_factory=dict)
     worker_trees: dict[str, str] = field(default_factory=dict)
     ignored_denied_paths: dict[str, list[str]] = field(default_factory=dict)
     denied_feedback: str = ""
@@ -2816,19 +2815,22 @@ def merge_hold(b: Build, c: workspace.Checkout, verified: verify.Verified, revie
     number = gh.pr_number(c.pr)
     _, hold = gh.merge_readiness(c.github, number, head, c.base, base_sha, wait=gh.MERGE_WAIT_SECONDS,
                                  track_moved_base=track_moved_base)
-    if not hold and (workflow := b.unread_ci_reruns.get((c.github, head, c.pr))):
-        try:
-            gh.workflow_run(c.github, head, workflow, pr=c.pr, allow_head_branch=True,
-                            timeout=ci.CONFLICT_SNAPSHOT_TIMEOUT, retry=False)
-        except gh.WorkflowNotForPR:
-            return "GitHub has no fully passing CI result for the verified head"
-        except ci.READ_ERRORS:
-            pass
+    if not hold and (c.github, head) in b.ci_rerun_requested_heads:
+        hold = rerun_head_hold(b, c, head)
     if not hold:
         hold = screen_and_merge(b, c, number, head, base_sha, about, track_moved_base=track_moved_base)
     if isinstance(hold, gh.BaseTipChanged) and not has_merge_base(c, head, fetch_merge_base(c)):
         return gh.MovedBaseHold("the checked head does not contain the target base")
     return hold
+
+
+def rerun_head_hold(b: Build, c: workspace.Checkout, head: str) -> str:
+    try:
+        if gh.publication_ci_passed(c.github, head):
+            return ""
+    except ci.READ_ERRORS as e:
+        b.run.log(f"ci: could not refresh the checks of {c.pr_name}: {util.first_line(str(e), 300)}")
+    return "GitHub has no fully passing CI result for the verified head"
 
 
 def fetch_merge_base(c: workspace.Checkout) -> str:
@@ -3127,7 +3129,6 @@ def ci_rounds(b: Build, slot: slots.RunSlot, branch: str, pushed: list[workspace
         with run.waiting("ci"):
             current = ci.Round(n, [watch_checkout_ci(run, c, reruns.for_checkout(c)) for c in watched])
         reruns.keep_failure_evidence(current)
-        reruns.remember_unread(b, current)
         reds = current.reds
         judged = [r for r in reds if r.kind != "base"]
         for r in judged:
@@ -3193,15 +3194,6 @@ class AutomaticCIReruns:
             before = self.before.get((target.github, target.sha, target.pr))
             if before and not seen.read and not seen.rerun_reds:
                 current.seen[i] = replace(before, read=False, conflicting=seen.conflicting, previous_failure=True)
-
-    def remember_unread(self, b: Build, current: ci.Round) -> None:
-        for seen in current.seen:
-            target = seen.target
-            key = target.github, target.sha, target.pr
-            if seen.read:
-                b.unread_ci_reruns.pop(key, None)
-            elif attempts := self.reruns.get(key):
-                b.unread_ci_reruns[key] = attempts[0].run
 
     def candidate(self, current: ci.Round) -> tuple[str, str, str, int] | None:
         if not current.reds or any(0 in w.red_workflows for w in current.seen):
