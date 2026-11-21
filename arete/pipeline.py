@@ -2297,7 +2297,7 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
     except BaseException as error:
         if isinstance(error, CatchUpPathCollision):
             worktree_files.add(error.name)
-        run.catch_up_preserved.update(c.prefix + name for name in worktree_files)
+            run.catch_up_preserved.add(c.prefix + error.name)
         abort_merge(c.wt)
         if (git(["rev-parse", "HEAD"], c.wt).strip() != before.lease
                 or workspace.uncommitted(c.wt, tracked_only=True)):
