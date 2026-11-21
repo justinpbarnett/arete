@@ -39,7 +39,7 @@ from .store import triage as triage_store
 ISSUE_TITLE = "[arete] triage"
 ISSUE_LABEL = "arete-triage"
 SKIP_LABELS = {tracker.LABEL, tracker.ZTE_LABEL, alerts.LABEL, ISSUE_LABEL, "loop"}
-AUTO_SKIP_LABELS = {"no-agent", "agent:hold", "duplicate", "invalid", "wontfix",
+AUTO_SKIP_LABELS = {*tracker.HOLD_LABELS,
                     *(f"agent:{state}" for state in config.RUN_LABELS), *tracker.JIRA_STATE_LABELS}
 MAX_CALLS = 20
 PER_SOURCE = 50

@@ -254,20 +254,19 @@ def did_not_show(repo: config.Repo, tid: str) -> control.Refused:
                            f"of {paths.short_path(paths.LOG_DIR / pipeline.RUNS_LOG)} says why")
 
 
-def free_to_start(cfg: config.Config, repo: config.Repo, tid: str, after: str = "", ahead: bool = False, *,
-                  standalone: bool = False) -> None:
+def free_to_start(cfg: config.Config, repo: config.Repo, tid: str, after: str = "", ahead: bool = False) -> None:
     if run := live_run(repo.name, tid):
         raise control.Busy(f"run {run['id']} of {tracker.issue_name(repo.name, tid)}")
     if not ahead and (why := held(cfg, repo)):
         raise slots.NoFreeSlot(why + after)
     why, _ = runlimits.admission(repo, tid, tracker.for_ticket(cfg, repo, tid),
-                                 runlimits.Policy.of(config.load_layer(repo.layer_dir)), True, standalone=standalone)
+                                 runlimits.Policy.of(config.load_layer(repo.layer_dir)), True)
     if why:
         raise control.Refused(why)
 
 
 def launch(cfg: config.Config, repo: config.Repo, tid: str, command: list[str], ahead: bool = False,
-           admission=None, *, standalone: bool = False) -> dict:
+           admission=None) -> dict:
     def admitted_spawn():
         if admission and not writes.check_run(*admission, public=True):
             raise control.NotFound(f"no run {admission[0]}")
@@ -276,7 +275,7 @@ def launch(cfg: config.Config, repo: config.Repo, tid: str, command: list[str], 
     with PENDING_LOCK, util.lock(START_LOCK, wait=True):
         if pending := pending_start(repo.name, tid):
             return pending
-        free_to_start(cfg, repo, tid, ahead=ahead, standalone=standalone)
+        free_to_start(cfg, repo, tid, ahead=ahead)
         new, state = spawned(repo.name, tid, admitted_spawn)
         if state != "exited":
             return answer(tid, repo.name, new, state, "started" if new else "child is starting")
@@ -664,7 +663,7 @@ def run_step(run_id: str, step: str, sets, base_version=None) -> dict:
                 raise control.Refused("adaptive action reruns keep their accepted settings; select new settings through a resumed controller")
             return launch(cfg, repo, str(row["issue"]), command_of(
                 cfg, "orchestrate", repo.name, str(row["issue"]), "--force", "--continue", run_id,
-                "--action", step, "--only-action"), admission=(run_id, base_version), standalone=True)
+                "--action", step, "--only-action"), admission=(run_id, base_version))
         step_named(step)
         if not factory.started(run_id, step):
             raise control.Refused(f"run {run_id} never started {step}, so it cannot run it alone")
@@ -684,8 +683,7 @@ def run_step(run_id: str, step: str, sets, base_version=None) -> dict:
         if gone := removed_tree(run_id, step):
             raise control.Refused(f"run {run_id} ended {row['status']} and removed its work folder {gone}, so a step "
                                   "cannot run alone on it")
-        return launch(cfg, repo, tid, command_of(cfg, "step", run_id, step, *settings), admission=(run_id, base_version),
-                      standalone=True)
+        return launch(cfg, repo, tid, command_of(cfg, "step", run_id, step, *settings), admission=(run_id, base_version))
 
 
 def removed_tree(run_id: str, step: str) -> str:

@@ -268,7 +268,7 @@ def rebuild(job: Job, line: dict, *, layer: config.RepoLayer | None = None) -> s
         workspace.clear_workspace(ws, made, job.run.repo.path, layer.copy)
     except workspace.RunFailed as e:
         return e.why
-    job.run.workspace = ws, made
+    job.run.set_workspace(ws, made, branch)
     try:
         for c in made:
             if c.lease:
@@ -604,7 +604,7 @@ class Job:
         elif stored:
             for c in self.checkouts:
                 c.onto = ""
-        run.workspace = self.ws, self.checkouts
+        run.set_workspace(self.ws, self.checkouts, self.branch)
         if stored:
             runs = authors(self.continues)
             for c in self.checkouts:
@@ -652,7 +652,8 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
     cfg, run = job.cfg, job.run
     repo, tk = run.repo, run.tracker
     try:
-        t = intake.route_ticket(cfg, repo, tk, run.task_ticket(), dry_run=run.dry_run, log=run.log)
+        t = intake.route_ticket(cfg, repo, tk, tk.get(run.tid), dry_run=run.dry_run, log=run.log)
+        t = run.task_ticket(t)
     except tracker.ERRORS as e:
         return end_as("stop", "quiet", status="failed", summary=f"could not read {run.ref}: {e}")
     opened(run, t)
@@ -689,7 +690,7 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
                                                 main_layer.copy)[1]
         else:
             checkouts = local_workspace(run, main_layer.base_branch, branch, job.ws, main_layer.copy)
-        run.workspace = job.ws, checkouts
+        run.set_workspace(job.ws, checkouts, branch)
         for c in checkouts:
             run.log(f"worktree {c.wt} on {branch}, {c.starting_point}")
         run.cfg, run.layer, run.kind = cfg, main_layer, t.kind

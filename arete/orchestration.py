@@ -17,6 +17,7 @@ from . import (
     gh,
     journeys,
     owner_asks,
+    park_retries,
     pilot,
     pipeline,
     prompt_loader,
@@ -48,6 +49,45 @@ def policy_fingerprint(cfg, layer, closed_context):
         effective["verify"] = layer.verify.policy()
     return ledger.digest(json.loads(json.dumps({"layer": effective, "config": asdict(cfg),
                                                 "closed_context": closed_context}, default=str)))
+
+
+def task_goal(title, body):
+    return f"Check the issue and owner's answers in use:\n{title}\n{body}"
+
+
+def continuation_blocker(lease, *, decision_boundary=False):
+    for turn in ledger.pending(lease):
+        launch = turn["response"] or {}
+        if delegation.live(launch.get("pid"), launch.get("identity")):
+            return "the prior controller inference is still live; no replacement was launched"
+    actions = ledger.actions(lease)
+    for action in actions:
+        result = action["result"]
+        if action["state"] == "running" and delegation.live(result.get("pid"), result.get("identity")):
+            return f"worker {action['id']} is still live; no replacement was launched"
+    if decision_boundary:
+        for action in actions:
+            if action["state"] not in ledger.TERMINAL:
+                return f"accepted action {action['id']} is unfinished ({action['state']})"
+    return ""
+
+
+def restart_parked_revision(cfg, repo, layer, closed_context, row, park, ticket):
+    if (row["status"] != "failed" or row.get("only_step") or not row.get("pr_url")
+            or not runlimits.park_retry(row, park, ticket)):
+        return False
+    prior = ledger.find(row["id"])
+    if not prior or prior["current_run"] != row["id"]:
+        return False
+    data = prior["data"]
+    saved_policy = data.get("policy_sha")
+    shared_policy_changed = (data.get("prepared", {}).get("layer") == str(layer.dir) and saved_policy
+                             and saved_policy != policy_fingerprint(cfg, layer, closed_context))
+    if not (shared_policy_changed or park_retries.CONTROLLER_ALLOWANCE.fullmatch(str(park.get("reason") or ""))):
+        return False
+    lease = ledger.Lease(prior["root"], prior["current_run"], prior["generation"])
+    return (park_retries.retryable(repo, ticket.id, row, park) and not continuation_blocker(lease)
+            and bool(pipeline.pending_feedback(repo.name, ticket.id)))
 
 
 class Controller:
@@ -86,24 +126,8 @@ class Controller:
         self.job.take(name, outcome, stored=False)
         return outcome
 
-    def continuation_blocker(self, *, decision_boundary=False):
-        for turn in ledger.pending(self.lease):
-            launch = turn["response"] or {}
-            if delegation.live(launch.get("pid"), launch.get("identity")):
-                return "the prior controller inference is still live; no replacement was launched"
-        actions = ledger.actions(self.lease)
-        for action in actions:
-            result = action["result"]
-            if action["state"] == "running" and delegation.live(result.get("pid"), result.get("identity")):
-                return f"worker {action['id']} is still live; no replacement was launched"
-        if decision_boundary:
-            for action in actions:
-                if action["state"] not in ledger.TERMINAL:
-                    return f"accepted action {action['id']} is unfinished ({action['state']})"
-        return ""
-
     def quiescent(self):
-        if why := self.continuation_blocker():
+        if why := continuation_blocker(self.lease):
             raise factory.Refused(why)
 
     def write_lineage_event(self):
@@ -112,6 +136,15 @@ class Controller:
                             engine_commit=event["engine_commit"])
             del self.data["lineage_event"]
             ledger.save(self.lease, self.data)
+
+    def refresh_task(self, prepared):
+        current = self.run.task_ticket()
+        ticket = prepared["ticket"]
+        previous_goal = task_goal(ticket["title"], ticket["body"])
+        goal_base = self.data.get("goal_base", "")
+        if goal_base.startswith(previous_goal):
+            self.data["goal_base"] = task_goal(current.title, current.body) + goal_base[len(previous_goal):]
+        ticket.update(title=current.title, body=current.body, comments=current.comments)
 
     def prepare(self):
         self.write_lineage_event()
@@ -143,7 +176,9 @@ class Controller:
                     raise factory.Refused("the missing workspace has no settled publication; reconcile before resuming")
                 if why := self.job.restore({"step": "prepare", "tree": str(self.job.ws), "data": prepared}, layer=self.job.layer):
                     raise factory.Refused(why)
-            self.job.take("prepare", factory.Outcome("pass", data=self.data["prepared"]), stored=True)
+            if self.run.readmitted_park:
+                self.refresh_task(prepared)
+            self.job.take("prepare", factory.Outcome("pass", data=prepared), stored=True)
             for name, value in self.data.get("job", {}).items():
                 if name in STATE_FIELDS:
                     setattr(self.job, name, value)
@@ -163,7 +198,7 @@ class Controller:
             if not outcome.passed:
                 return flows.ended(self.flow, outcome)
             self.data["prepared"] = outcome.data
-            self.job.goal = f"Check the issue and owner's answers in use:\n{self.job.ticket.title}\n{self.job.ticket.body}"
+            self.job.goal = task_goal(self.job.ticket.title, self.job.ticket.body)
             self.job.plan_text = ""
         if self.run.repairs:
             found = repairs.source(pipeline.run_store.run_get(self.run.repairs) or {})
@@ -232,7 +267,7 @@ class Controller:
         changes = ", ".join(f"{key} changed ({str(value)[:8]} → {found[key][:8]})" for key, value in old.items())
         if old.keys() - REFRESHABLE_LINEAGE:
             raise factory.Refused(f"{changes}; reconcile before resuming")
-        if why := self.continuation_blocker(decision_boundary=bool(old)):
+        if why := continuation_blocker(self.lease, decision_boundary=bool(old)):
             raise factory.Refused(f"{changes}; {why}; reconcile before resuming" if old else why)
         return found, old
 

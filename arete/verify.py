@@ -46,7 +46,6 @@ SCHEMA = {
                 "saw": {"type": "string"},
                 "passed": {"type": "boolean"},
                 "cause": {"type": "string", "enum": ["change", "environment"]},
-                "retry_action": retry_findings.ACTION_SCHEMA,
                 "criterion_ref": retry_findings.REFERENCE_SCHEMA,
                 "screenshot": {"type": "string"},
             },

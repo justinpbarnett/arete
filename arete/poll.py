@@ -88,9 +88,16 @@ def jira_routes_by_project(cfg: config.Config) -> dict[str, set[str]]:
     return out
 
 
+@dataclass(frozen=True)
+class Pick:
+    tid: str
+    why: str
+    reply: bool = False
+
+
 def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
               other_routes: set[str], excluded: set[str] = frozenset(),
-              recovered: tuple[tracker.Ticket, ...] = ()) -> tuple[str, str] | None:
+              recovered: tuple[tracker.Ticket, ...] = ()) -> Pick | None:
     excluded = excluded | oncall.parked(repo.name)
     fresh = next_ticket(repo, tk, skips, other_routes, excluded, recovered)
     def eligible_again(tid):
@@ -103,15 +110,12 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
 
     for tid in run_store.interrupted_tickets(repo.name):
         if ordinary_history(tid):
-            return tid, "restarting after an interruption"
+            return Pick(tid, "restarting after an interruption")
     for tid in insights_store.feedback_due(repo.name, util.iso(util.now() - timedelta(minutes=pipeline.FEEDBACK_QUIET_MINUTES))):
         if ordinary_history(tid):
-            return tid, "revising the PR for your review comments"
+            return Pick(tid, "revising the PR for your review comments")
     for source in ticket_queues(repo, tk):
-        github = isinstance(source, tracker.GitHubTracker)
-        replies = (source.replied(park_spec_edited=lambda t: runlimits.parked_question_spec_edited(repo.name, t))
-                   if github else source.replied())
-        for t in replies:
+        for t in source.replied():
             if not eligible_again(t.id):
                 continue
             if other_routes & set(t.labels):
@@ -120,8 +124,8 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
             if blocker := source.blocker(t.id):
                 skips.note(tracker.ticket_name(repo.name, t.ref), t, blocker, repo.name)
                 continue
-            return t.id, t.title if github else f"{t.title} (you replied to the question)"
-    return (fresh.id, fresh.title) if fresh else None
+            return Pick(t.id, f"{t.title} (you replied to the question)", reply=True)
+    return Pick(fresh.id, fresh.title) if fresh else None
 
 
 def step_without_route(cfg: config.Config, repo: config.Repo, ticket: tracker.Ticket,
@@ -187,7 +191,8 @@ def spawn_unparked(repo_name: str, tid: str | int, readmission: runlimits.Readmi
                     zte.bind_launch(repo_name, str(tid), lease)
                 if readmission:
                     lease.readmission = json.dumps(asdict(readmission))
-                    readmission.attempted(record=True)
+                    if not readmission.feedback:
+                        readmission.attempted(record=True)
                 return spawn_run(repo_name, tid)
 
             tasks.spawn_pending(repo_name, str(tid), spawn)
@@ -260,12 +265,12 @@ def repo_queues(cfg: config.Config, pipeline_repos: list[config.Repo], routes: d
     return queues, reached_clients
 
 
-def start_pick(cfg: config.Config, queue: RepoQueue, pick: tuple[str, str], skips: pipeline.SkipLog,
+def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline.SkipLog,
                dry_run: bool, going: Counter, slots: int) -> str:
     from . import tasks
 
     repo, layer = queue.repo, queue.layer
-    tid, why = pick
+    tid, why = pick.tid, pick.why
     if not pilot.pickable(str(tid), repo.name) or (
             zte.reserved(str(tid)) and not (zte.scheduled_poll() and zte.pickable(str(tid), repo.name))):
         return "skipped"
@@ -278,8 +283,11 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: tuple[str, str], skip
     if ticket:
         if tracker.ZTE_LABEL in ticket.labels:
             return "skipped"
-        if tracker.NO_AGENT in ticket.labels:
-            skips.note(name, ticket, tracker.NO_AGENT_HOLD, repo.name)
+        blocker = tracker.github_hold(ticket.labels)
+        if not blocker and not ticket.open and not pending_feedback(repo.name, tid):
+            blocker = "it is closed"
+        if blocker:
+            skips.note(name, ticket, blocker, repo.name)
             return "blocked"
     reply = tracker_reply(repo, source, str(tid), dry_run)
     answering = not reply and pipeline.answered_run(repo.name, str(tid)) is not None
@@ -290,6 +298,8 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: tuple[str, str], skip
         return "held"
     ticket = ticket or source.get(tid)
     blocked, readmission = runlimits.poll_admission(repo, str(tid), ticket, runlimits.Policy.of(layer))
+    if pick.reply and ticket.park_question and not (answering or blocked or readmission):
+        return "skipped"
     blocked = blocked or source.blocker(tid) or reply
     if not blocked:
         if not zte.reserved(str(tid)):
@@ -327,7 +337,7 @@ def fill_slots(cfg: config.Config, queues: list[RepoQueue], skips: pipeline.Skip
                     if not dry_run:
                         source_store.drop_passed_over(repo.name)
                     continue
-                queue.selected.add(str(pick[0]))
+                queue.selected.add(str(pick.tid))
                 examined += 1
                 progressed = True
                 result = start_pick(cfg, queue, pick, skips, dry_run, going, slots)

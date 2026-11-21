@@ -450,25 +450,38 @@ class Run(AgentRun):
     action: str = ""
     action_only: bool = False
     workspace: tuple[Path, list[workspace.Checkout]] | None = None
+    workspace_branch: str = ""
     failure: dict | None = None
     asks_made: int = 0
     answers_due: list[dict] = field(default_factory=list)
     base_note: str = ""
     kept_note: str = ""
     parked_branch: str = ""
-    parked_context: tuple[str, str] | None = None
+    readmitted_park: str = ""
+
+    def set_workspace(self, ws: Path, checkouts: list[workspace.Checkout], branch: str) -> None:
+        self.workspace, self.workspace_branch = (ws, checkouts), branch
 
     @property
     def ref(self) -> str:
         return self.tracker.ref(self.tid)
 
-    def task_ticket(self) -> tracker.Ticket:
-        ticket = self.tracker.get(self.tid)
-        if self.parked_context:
-            spec, context = self.parked_context
-            if runlimits.specification(ticket) == spec:
-                return replace(ticket, comments="\n\n".join(part for part in (ticket.comments, context) if part))
-        return ticket
+    def task_ticket(self, ticket: tracker.Ticket | None = None) -> tracker.Ticket:
+        from . import park_retries
+
+        ticket = ticket or self.tracker.get(self.tid)
+        sections, evidence_runs = [ticket.comments], []
+        if ticket.retries and tracker.BATCH_LABEL not in ticket.labels:
+            retry = ticket.retries[-1]
+            sections.append("## Current acceptance criteria that add to the ticket body\n\n"
+                            f"Follow the owner's current specification if it conflicts with this retry.\n\n{retry.body}")
+            evidence_runs.append(retry.run_id)
+        if ticket.park_question and ticket.park_question.run_id == self.readmitted_park:
+            if answer := ticket.park_answer:
+                sections.append(f"## Owner's answer to the parked retry question\n\n{answer.body}")
+            evidence_runs.append(self.readmitted_park)
+        sections.extend(park_retries.task_evidence(self.repo.name, ticket, rid) for rid in dict.fromkeys(evidence_runs))
+        return replace(ticket, comments="\n\n".join(filter(None, sections)))
 
     @property
     def ab_ticket(self) -> tuple[str, str] | None:
@@ -1367,19 +1380,24 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             budget_history = run_store.ticket_runs(repo.name, tid, limit=1)
             readmission = None if force else runlimits.Readmission.decode(launch_lease.readmission(repo.name, str(tid)))
             readmitted_ticket = tk.get(tid) if readmission else None
-            standalone = bool(script and (script.only or script.action_only))
+            closed_pr_revision = bool(readmission and not readmission.feedback
+                                      and isinstance(tk, (tracker.GitHubTracker, tracker.JiraTracker))
+                                      and not readmitted_ticket.open and pending_feedback(repo.name, tid))
             blocked, reset_budget = runlimits.admission(repo, str(tid), tk, runlimits.Policy.of(layer), force,
                                                        readmission=readmission, ticket=readmitted_ticket,
-                                                       standalone=standalone)
-            parked_branch, parked_context = "", None
+                                                       closed_pr_revision=closed_pr_revision)
+            parked_branch, readmitted_park = "", ""
+            park = {}
             if reset_budget:
-                parked_run, park = runlimits.latest_park(repo.name, str(tid), whole=not standalone)
+                parked_run, park = runlimits.latest_park(repo.name, str(tid))
                 parked_branch = runlimits.park_branch(parked_run, park)
-                if readmission and readmission.feedback:
-                    comment = runlimits.park_feedback(parked_run, park, readmitted_ticket)
-                    heading = ("Current acceptance criteria that add to the ticket body" if comment.number
-                               else "Owner's answer to the parked retry question")
-                    parked_context = runlimits.specification(readmitted_ticket), f"## {heading}\n\n{comment.body}"
+                readmitted_park = parked_run["id"]
+                if (park and readmission and not dry_run and script and script.path == "orchestrate"
+                        and script.continues == readmitted_park and not (script.only or script.again or script.action)):
+                    from .orchestration import restart_parked_revision
+
+                    if restart_parked_revision(cfg, repo, layer, closed_context, parked_run, park, readmitted_ticket):
+                        script = replace(script, continues="")
         except tracker.ERRORS as e:
             print(f"could not read {name}: {e}")
             return 2
@@ -1475,13 +1493,15 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     return settle_zte_refusal(repo.name, str(tid), slot, run_id, error, committed=committed)
             else:
                 run_id = start()
+            if park and readmission and readmission.feedback and not dry_run:
+                readmission.attempted(record=True)
             scratch.RUN_BASELINES[run_id] = producer_baseline
             scratch.RUN_LABELS[run_id] = service_labels
             run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force,
                       feedback=[] if mending or zte_grant else pending_feedback(repo.name, tid), repairs=mending,
                       answering=earlier if earlier and earlier["status"] == "needs-info" else {},
                       launch_gate=admission, launch_done=launch_done, closed_context=closed_context,
-                      parked_branch=parked_branch, parked_context=parked_context,
+                      parked_branch=parked_branch, readmitted_park=readmitted_park,
                 **(script.run_fields if script else {}))
             try:
                 with handoff_io():
@@ -1799,7 +1819,8 @@ def triage_block(approval: dict | None) -> str:
 def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, str]:
     repo, tk = run.repo, run.tracker
     try:
-        t = intake.route_ticket(cfg, repo, tk, run.task_ticket(), dry_run=run.dry_run, log=run.log)
+        t = intake.route_ticket(cfg, repo, tk, tk.get(run.tid), dry_run=run.dry_run, log=run.log)
+        t = run.task_ticket(t)
     except tracker.ERRORS as e:
         return "failed", f"could not read {run.ref}: {e}", ""
     run_lines.write(run.id, "task", ticket=t.ref, kind=t.kind, repo=repo.name, title=t.title)
@@ -1835,7 +1856,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
 
     try:
         ws, checkouts = workspace.make_workspace(run.id, repo, main_layer.base_branch, branch, t.id, main_layer.copy)
-        run.workspace = ws, checkouts
+        run.set_workspace(ws, checkouts, branch)
         for c in checkouts:
             run.log(f"worktree {c.wt} on {branch}, {c.starting_point}")
         run.cfg, run.layer, run.kind = cfg, main_layer, t.kind
@@ -2979,7 +3000,8 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                                                "the start log stays in the run folder", finished=False)
                     if fault else verify.Verified("fail", f"The app did not start: {error}"))
     if record_attempt:
-        b.run.write_line("verification_end", step=step, verdict=verified.verdict, startup_failed=startup_failed)
+        details = {"summary": verified.summary, "blocked_by": verified.blocked_by} if not verified.saved else {}
+        b.run.write_line("verification_end", step=step, verdict=verified.verdict, startup_failed=startup_failed, **details)
     return verified
 
 
@@ -3136,9 +3158,8 @@ def _use_product(b: TicketWork, step: str, prompt_name: str, role: str,
 def save_verification(run: Run, step: str, verified: verify.Verified) -> verify.Verified:
     verified.saved = os.path.abspath(run.dir / f"{step}.md")
     run.save(f"{step}.md", verified.markdown())
-    run.save(f"{step}-outcome.json", {"verdict": verified.verdict, "checks": [
-        {name: check[name] for name in ("what", "passed", "cause", "retry_action", "criterion_ref") if name in check}
-        for check in verified.checks]})
+    run.save(f"{step}-outcome.json", {"verdict": verified.verdict, "summary": verified.summary,
+                                    "blocked_by": verified.blocked_by, "checks": verified.checks})
     run.log(f"{step}: {verified.verdict}, {len(verified.checks) - len(verified.failed_checks)} of "
             f"{util.count(len(verified.checks), 'check')} passed")
     return verified

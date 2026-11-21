@@ -1077,7 +1077,6 @@ private_key = "~/.config/arete/github-app.pem"
 | `mine` | `true` | The miner may open harness PRs here. |
 | `public` | `false` | PR bodies cite run ids, never transcript text. Arete's own repo (`arete_repo`) is treated the same way. |
 | `tracker` | `"github"` | `github` for issues in the repo, `jira` for tickets in Jira, `local` for [local tasks](#local-tasks) only; such a repo may have no `github`. PRs are on GitHub either way. |
-| `github_automation_logins` | `[]` | Additional trusted GitHub logins that can post Arete's parked questions, for example `["my-arete[bot]"]`. Replies come from the repository owner. |
 | `jira_project` | `[jira] project` | Jira project for this repo. |
 | `jira_label` | `repo-<github repo name>` | Route label that sends a Jira ticket to this repo. |
 | `jev` | `true` | JEV may read this repo's events, tickets, diffs, transcripts and files. `false` keeps them off OpenRouter and TypeSafe. See [JEV](#jev). |

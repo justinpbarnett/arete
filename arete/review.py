@@ -23,7 +23,6 @@ REVIEW_SCHEMA = {
                     "problem": {"type": "string"},
                     "severity": {"type": "string", "enum": ["blocker", "major", "minor"]},
                     "category": {"type": "string", "enum": list(BLOCKER_CATEGORIES)},
-                    "retry_action": retry_findings.ACTION_SCHEMA,
                     "criterion_ref": retry_findings.REFERENCE_SCHEMA,
                 },
                 "required": ["problem", "severity"],
@@ -171,13 +170,8 @@ def review_problems(listed) -> list[dict]:
 
 
 def retry_fields(problem: dict) -> dict:
-    fields = {}
-    key = retry_findings.action_key(problem)
-    if key:
-        fields["retry_action"] = key
-    if ref := retry_findings.reference(problem.get("criterion_ref")):
-        fields["criterion_ref"] = ref
-    return fields
+    ref = retry_findings.reference(problem.get("criterion_ref"))
+    return {"criterion_ref": ref} if ref else {}
 
 
 def reported(listed: list[dict]) -> list[dict]:
