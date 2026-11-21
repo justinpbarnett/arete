@@ -170,12 +170,8 @@ def accept(lease: Lease, turn: str, version: int, response: dict, maximum: int) 
         if earlier["state"] != "pending" or current["version"] != version:
             raise Conflict("stale decision state")
         count = c.execute("SELECT count(*) FROM orchestration_actions WHERE root = ?", (lease.root,)).fetchone()[0]
-        remaining = maximum - count
-        requested = len(response["calls"])
-        if requested > remaining:
-            if remaining <= 0:
-                raise Limit(f"run used its {maximum} action allowance")
-            raise Conflict(f"decision requested {requested} actions with {remaining} remaining in the action allowance")
+        if count + len(response["calls"]) > maximum:
+            raise Limit(f"run used its {maximum} action allowance")
         for n, call in enumerate(response["calls"]):
             c.execute("INSERT INTO orchestration_actions VALUES (?,?,?,?,?,'accepted',?,?,?)",
                       (lease.root, f"{turn}-{n}", turn, lease.run, call["op"], encoded(call["args"]),

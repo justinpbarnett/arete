@@ -446,8 +446,6 @@ class Controller:
             ledger.reject(self.lease, turn, str(error)[:2000])
             self.data["error"] = str(error)[:2000]
             self.persist()
-            if isinstance(error, ledger.Limit) and self.data.get("catch_up_hold"):
-                raise
             return []
 
     def barrier(self):
@@ -658,7 +656,6 @@ class Controller:
 
     def publish(self):
         self.barrier()
-        self.run.retry_gate_evidence()
         if pending := ledger.catch_up_push(self.data):
             return self.reconcile_catch_up(pending)
         if self.data.get("publication_intent"):
@@ -926,16 +923,13 @@ class Controller:
         self.data.pop("catch_up_hold", None)
         self.catalog.context.pop(CATCH_UP_FAILURE, None)
 
-    def report_catch_up_hold(self, reason):
+    def park_catch_up(self, reason, *, on_ticket=False):
         held = self.data["catch_up_hold"]["reason"]
         for checkout in self.job.with_prs:
             if pipeline.own_draft_state(self.run, checkout) is False:
                 pipeline.set_draft(self.run, checkout, True, "automerge")
-        self.run.say(f"{held}. I parked the run because {reason}.", on_ticket=True)
-        return f"{held}. {reason}"
-
-    def park_catch_up(self, reason):
-        return pipeline.park_run(self.run, self.report_catch_up_hold(reason))
+        self.run.say(f"{held}. I parked the run because {reason}.", on_ticket=on_ticket)
+        return pipeline.park_run(self.run, f"{held}. {reason}")
 
     def settle_publication_failure(self, failure):
         if self.data.get("catch_up_hold"):
@@ -1290,22 +1284,30 @@ class Controller:
                         break
             return self.ending
         except runlimits.Parked as error:
-            if not self.data.get("catch_up_hold"):
-                raise
-            park_reason = str(error)
+            if self.data.get("catch_up_hold"):
+                return self.park_catch_up(str(error))
+            raise
         except ledger.Conflict as error:
             if not (isinstance(error, ledger.Limit) and self.data.get("catch_up_hold")):
                 raise runlimits.Parked(str(error)) from error
             park_reason = str(error)
         finally:
             try:
-                if park_reason is not None:
-                    park_reason = self.report_catch_up_hold(park_reason)
-            finally:
                 self.close()
-                if self.run.environment_release and not verification_passed and flows.reset_environment_base(self.job.checkouts):
-                    self.persist()
-        return pipeline.park_run(self.run, park_reason)
+            except BaseException as cleanup_error:
+                if park_reason is not None:
+                    try:
+                        self.run.workspace_retention_blocked = any(
+                            worker.writing and util.group_alive(worker.proc) for worker in self.workers.values())
+                        parked = self.park_catch_up(park_reason, on_ticket=True)
+                        if isinstance(cleanup_error, runlimits.Parked):
+                            self.run.catch_up_cleanup_park = parked
+                    except BaseException as park_error:
+                        cleanup_error.add_note(f"Could not park the catch-up: {park_error}")
+                raise
+            if self.run.environment_release and not verification_passed and flows.reset_environment_base(self.job.checkouts):
+                self.persist()
+        return self.park_catch_up(park_reason, on_ticket=True)
 
     def close(self):
         errors = []
@@ -1319,8 +1321,6 @@ class Controller:
                 del self.workers[key]
             except BaseException as error:
                 errors.append(error)
-        if errors and any(worker.writing for worker in self.workers.values()):
-            self.run.workspace_retention_blocked = True
         self.release_merge_lease()
         if errors:
             raise errors[0]

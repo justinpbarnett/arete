@@ -480,6 +480,7 @@ class Run(AgentRun):
     alone: bool = False
     facts: dict = field(default_factory=dict)
     catch_up_preserved: set[str] = field(default_factory=set)
+    catch_up_cleanup_park: tuple[str, str, str] | None = field(default=None, init=False)
     repairs: str = ""
     action: str = ""
     action_only: bool = False
@@ -1991,7 +1992,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         except runlimits.Parked as e:
             if zte_grant:
                 return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
-            status, summary, pr_url = park_run(run, str(e))
+            status, summary, pr_url = run.catch_up_cleanup_park or park_run(run, str(e))
         except factory.OnlyDone as e:
             if zte_grant:
                 return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
@@ -2045,7 +2046,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 run.give_up("crashed before finishing")
         finally:
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
-            if run.workspace and not (zte_grant or run.workspace_retention_blocked):
+            if run.workspace and not zte_grant:
                 if not (retaining_catch_up or run.catch_up_preserved) and (
                         not run.environment_release or ("requirements" in run.facts and flows.retry_passed(flow.ctx.verified))):
                     keep_edits(run)
@@ -2467,7 +2468,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
         status, why, _ = _fail(run, e.why, detail=f"{e.detail}\n\n### PRs\n\n{prs}\n\nReview comments on a PR "
                                                   "start a revision, as on any arete PR.")
         return status, why, record_prs(run, branch, with_prs)
-    run.enter("pr")
+    flows.enter_publication(run)
     ready = opened + ready_pushed(run, pushed, ci_stopped, draft_why)
     ci_result = automerge(b, approval, draft_why, verified, review, ready, automerge_about(t, build_summary),
                           slot=slot, branch=branch, goal=goal, plan=plan_to_review) or ci_result
@@ -3547,10 +3548,11 @@ def publish_gate_evidence(run: Run, t: tracker.Ticket, c: workspace.Checkout,
     checked = verified.markdown() if verified is not None else "Verification did not run."
     if held:
         checked = f"{held}\n\n{checked}"
+    reviewed = review.markdown() if review is not None else "## Review\n\nReview did not run."
     evidence = {
-        "links": (run.tracker.pr_link(t, whole=True), run.tracker.pr_link(t, whole=False)),
-        "checked": checked,
-        "review": review.markdown() if review is not None else "## Review\n\nReview did not run.",
+        "links": tuple(outbound.screen(run.tracker.pr_link(t, whole=whole)) for whole in (True, False)),
+        "checked": public_text(run, outbound.screen(checked)),
+        "review": public_text(run, outbound.screen(reviewed)),
     }
     target = run.repo.name, str(run.tid), c.pr
     if run_store.save_pr_gate_refresh(*target, run.id, c.lease, evidence):

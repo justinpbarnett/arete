@@ -1418,6 +1418,11 @@ def watch(flow: factory.Flow, tree: str) -> Outcome:
     return Outcome("pass", data={"summary": result})
 
 
+def enter_publication(run: pipeline.Run) -> None:
+    run.enter("pr")
+    run.retry_gate_evidence()
+
+
 @factory.step("publish")
 def publish(flow: factory.Flow, merge: Callable[[list[workspace.Checkout]], dict | None] | None = None) -> Outcome:
     job: Job = flow.ctx
@@ -1430,8 +1435,7 @@ def publish(flow: factory.Flow, merge: Callable[[list[workspace.Checkout]], dict
         return end_as("pass", "done", summary=f"{what}: {job.summary}")
     opened, pushed, with_prs = job.picked(job.opened), job.picked(job.pushed), job.with_prs
     fresh = [c for c in opened if c.github not in job.found]
-    run.enter("pr")
-    run.retry_gate_evidence()
+    enter_publication(run)
     if merge and (failure := merge(publication_candidates(job, fresh))):
         return Outcome("fail", feedback=failure["error"], data=failure)
     if not merge:
