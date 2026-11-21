@@ -683,7 +683,7 @@ class Job:
         self.committed = bool(data.get("committed", True))
         if stored:
             for c in self.picked(self.changed):
-                c.lease = c.onto or util.git(["rev-parse", "HEAD"], c.wt).strip()
+                c.note_pushed_head(c.onto or util.git(["rev-parse", "HEAD"], c.wt).strip())
             if self.with_prs:
                 pipeline.note_prs(self.run, self.branch, self.with_prs)
 
@@ -739,7 +739,7 @@ class Job:
                         "published nothing")
         except RuntimeError as e:
             return f"arete could not check {branch} of {c.github} against origin: {util.first_line(str(e), 300)}"
-        c.lease = remote
+        c.note_pushed_head(remote)
         if head != c.revision:
             self.carried = True
         if head not in (remote, c.revision) and c.github not in self.pending:
@@ -1214,7 +1214,7 @@ def settle_unpushed_checkouts(job: Job, before_push=None):
         head = util.git(["rev-parse", "HEAD"], c.wt).strip()
         remote = workspace.remote_head(c.src, job.branch)
         if remote == head:
-            c.lease = head
+            c.note_pushed_head(head)
         elif remote == c.lease and (not remote or ancestor(c.wt, remote, head)):
             unpushed.append(c)
         else:
