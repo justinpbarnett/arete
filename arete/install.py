@@ -57,19 +57,15 @@ def write_serve_guard() -> None:
 
 def serve_command() -> list[str]:
     checkout = paths.PACKAGE_DIR.parent
-    launcher = "\n".join((
-        "import runpy, sys",
-        "from pathlib import Path",
-        f"guard = runpy.run_path({str(serve_guard_file())!r})",
-        f"guard['startup'](Path({str(paths.STATE_DIR)!r}), Path({str(checkout)!r}), Path({str(paths.LOG_DIR)!r}))",
-        "sys.pycache_prefix = '/dev/null'",
-        "sys.dont_write_bytecode = True",
-        f"sys.path.insert(0, {str(checkout)!r})",
-        "from arete import cli",
-        "cli._serve_start_checked = True",
-        "raise SystemExit(cli.main())",
-    ))
-    return [str(Path(sys.executable).resolve()), "-I", "-S", "-c", launcher, SERVE]
+    entrypoint = (
+        "import sys; "
+        "sys.orig_argv = [sys.executable, '-I', '-S', *sys.argv[1:]]; "
+        "sys.pycache_prefix = '/dev/null'; sys.dont_write_bytecode = True; "
+        "sys.path.insert(0, sys.argv[3]); sys.argv[:] = ['arete', 'serve']; "
+        "from arete import cli; cli._serve_start_checked = True; raise SystemExit(cli.main())"
+    )
+    return [sys.executable, "-I", "-S", str(serve_guard_file()), str(paths.STATE_DIR), str(checkout),
+            str(paths.LOG_DIR), entrypoint]
 
 
 def serve_environment() -> dict[str, str]:

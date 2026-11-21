@@ -1006,7 +1006,7 @@ Approval, dependency, running-ticket and capacity checks still decide whether a 
 ## Develop locally
 
 `uv run arete status` runs from the checkout without the installed tool.
-From a working checkout with this release, run `uv tool install --editable . --python 3.13 --force` before relying on `arete serve` to recover from a failed self-deploy. Older editable wrappers import the checkout's `arete/__init__.py` before reaching the startup guard, so a broken initializer can stop every terminal retry. The refresh installs a launcher and guard in the tool environment that check the receipt before loading the checkout. Restart terminal serve using the refreshed `arete` on PATH. `arete install` records the current Python interpreter in the service configuration.
+`arete install` configures the service to check the self-deploy receipt before importing the checkout. A terminal `arete serve` reaches the same check through the CLI after the package initializer loads.
 
 To inspect a fresh local database without using your regular Arete config or state, run this from the checkout:
 

@@ -247,13 +247,8 @@ def report_rollbacks(src: Path, say: Callable[[str], None]) -> None:
                 body = (f"Arete rolled back self-deploy code from `{tip[:12]}` to `{previous[:12]}` because "
                         f"{serve_guard.report_reason(held)}. Deploys of `{tip[:12]}` are held.\n\n"
                         f"Redacted serve.log tail\n\n```text\n{excerpt}\n```")
-                labels = [tracker.LABEL]
-                if label := tracker.github_fix_label(repo):
-                    labels.append(label)
-                elif not gh.ensure_label(repo, "bug", "d73a4a", "Something isn't working", restyle=False):
-                    labels.append("bug")
                 issue = gh.issue_create(repo, f"{tracker.ARETE_TAG} Serve self-deploy {tip[:12]} rolled back",
-                                        body, labels, key=key)
+                                        body, [tracker.LABEL], key=key)
             serve_guard.write(path, {**held, "issue": issue})
             say(f"deploy: reported rollback of {tip} in {gh.issue_url(repo, issue)}")
         except (OSError, RuntimeError, KeyError, TypeError, ValueError, subprocess.SubprocessError) as error:
@@ -347,10 +342,13 @@ class Server:
         self.alert_checked = False
         self.alert_last: Future | None = None
         self.code_seen = code_stamp()
+        self.started_head = next((entry[1] for entry in self.code_seen if entry[0] == "HEAD"), "")
         self.code = self.code_seen
-        if codebase.RELEASE:
-            self.code = frozenset(entry for entry in self.code if entry[0] != "HEAD") | {
-                ("HEAD", codebase.RELEASE[:12])}
+        if codebase.RELEASE and codebase.RELEASE[:12] != self.started_head:
+            receipt = serve_guard.pending(paths.STATE_DIR, paths.PACKAGE_DIR.parent)
+            if receipt is None or not receipt.starts or receipt.tip[:12] != self.started_head:
+                self.code = frozenset(entry for entry in self.code if entry[0] != "HEAD") | {
+                    ("HEAD", codebase.RELEASE[:12])}
         self.code_note = ""
         self.migration_stamp = None
         self.migration_error = ""
@@ -522,7 +520,11 @@ class Server:
             self.beat()
         except Exception as e:
             self.say(f"beat failed: {type(e).__name__}: {e}")
-        self.guard("stage:deploy-health", self.acknowledge_deploy, completed)
+        if self.checkout_update.acquire(blocking=False):
+            try:
+                self.guard("stage:deploy-health", self.acknowledge_deploy, completed)
+            finally:
+                self.checkout_update.release()
 
     def deploy_when_due(self) -> None:
         if self.deployment is not None:
@@ -538,7 +540,8 @@ class Server:
     def acknowledge_deploy(self, completed: bool | None) -> None:
         checkout = paths.PACKAGE_DIR.parent
         receipt = serve_guard.pending(paths.STATE_DIR, checkout)
-        if (receipt is None or not receipt.starts or serve_guard.hold_path(paths.STATE_DIR, receipt.tip).exists()
+        if (receipt is None or not receipt.starts or self.started_head != receipt.tip[:12]
+                or serve_guard.hold_path(paths.STATE_DIR, receipt.tip).exists()
                 or not serve_guard.at_tip(checkout, receipt)):
             return
         if completed and (not self.with_dashboard or dashboard_answers()):
@@ -550,9 +553,7 @@ class Server:
     def deploy_if_ready(self, cfg: config.Config) -> None:
         src = paths.PACKAGE_DIR.parent
         report_rollbacks(src, self.say)
-        receipt = serve_guard.pending(paths.STATE_DIR, src)
-        if receipt is None or not serve_guard.at_tip(src, receipt):
-            self.deploy(cfg)
+        self.deploy(cfg)
 
     def deploy(self, cfg: config.Config) -> None:
         if not (repo := cfg.repo_for_path(paths.PACKAGE_DIR)):
@@ -613,7 +614,9 @@ class Server:
                                   check=False, retry=False)
             if hooks_path.removesuffix("\0"):
                 self.say(f"deploy: {paths.short_path(src)} Git hooks disabled for fast forward to {tip}")
-            receipt = serve_guard.Receipt(str(src), base, recovery.head, tip, github, time.time())
+            prior = serve_guard.pending(paths.STATE_DIR, src)
+            previous = prior.previous if prior and prior.branch == base and prior.tip == recovery.head else recovery.head
+            receipt = serve_guard.Receipt(str(src), base, previous, tip, github, time.time())
             serve_guard.write(paths.STATE_DIR / serve_guard.RECEIPT, asdict(receipt))
             try:
                 util.deploy_fast_forward(src, tip)
@@ -622,6 +625,8 @@ class Server:
                 return
             except (OSError, RuntimeError) as error:
                 self.restore_deploy(src, base, tip, recovery, error)
+                if prior and serve_guard.at_tip(src, prior):
+                    serve_guard.write(paths.STATE_DIR / serve_guard.RECEIPT, asdict(prior))
                 self.deploy_refused(src, tip, str(error))
                 return
         self.say(f"deploy: {paths.short_path(src)} fast forwarded to {tip} ({subject})")
@@ -988,8 +993,8 @@ class Server:
             return "a feedback request is still being checked or filed"
         return ""
 
-    def rollback_deploy(self, receipt: serve_guard.Receipt, reason: str) -> None:
-        if serve_guard.rollback(paths.STATE_DIR, paths.PACKAGE_DIR.parent, paths.LOG_DIR, receipt, reason):
+    def record_failed_start(self, receipt: serve_guard.Receipt) -> None:
+        if serve_guard.count_start(paths.STATE_DIR, paths.PACKAGE_DIR.parent, paths.LOG_DIR):
             self.code_problem = ""
             if codebase.RELEASE == receipt.previous and codebase.head_and_dirt() == (receipt.previous[:12], False):
                 self.code = self.code_seen = code_stamp()
@@ -1002,15 +1007,19 @@ class Server:
         if stamp == self.code or not steady:
             return
         receipt = serve_guard.pending(paths.STATE_DIR, paths.PACKAGE_DIR.parent)
-        deploying = receipt is not None and not receipt.starts and ("HEAD", receipt.tip[:12]) in stamp
+        if receipt is not None and ("HEAD", receipt.tip[:12]) not in stamp:
+            receipt = None
+        if receipt is not None and (busy := self.busy_with()):
+            self.note_once(f"new code waits to load: {busy}")
+            return
         entrypoint = f"import sys; sys.path.insert(0, {str(paths.PACKAGE_DIR.parent)!r}); "
         check = util.sh([sys.executable, "-I", "-c", entrypoint + f"sys.argv[:] = {sys.argv!r}; " + IMPORT_CHECK],
                         timeout=120)
         if check.returncode != 0:
             problem = util.last_line(check.stderr or check.stdout, 300)
-            if deploying:
+            if receipt is not None:
                 self.note_once("deploy: new code does not import: " + problem)
-                self.rollback_deploy(receipt, serve_guard.IMPORT_FAILURE)
+                self.record_failed_start(receipt)
             else:
                 self.note_once("new code does not import, so serve keeps the code it started with: " + problem)
             return
@@ -1019,18 +1028,18 @@ class Server:
             self.code_problem = ("new code cannot read config.toml, so serve keeps the code it started with: "
                                  + util.last_line(candidate.stderr or candidate.stdout, 300))
             self.note_once(self.code_problem)
+            if receipt is not None:
+                self.record_failed_start(receipt)
             return
         if stamp != self.migration_stamp:
             migrated = util.sh(control.command(["migrate", "--no-contracts"]), timeout=120)
             self.migration_stamp = stamp
             self.migration_error = ((util.last_line(migrated.stderr or migrated.stdout, 300)
                                      or f"migrate exited {migrated.returncode}") if migrated.returncode else "")
+            if self.migration_error and receipt is not None:
+                self.record_failed_start(receipt)
         if self.migration_error:
-            if deploying:
-                self.note_once("deploy: new code migration failed: " + self.migration_error)
-                self.rollback_deploy(receipt, serve_guard.MIGRATION_FAILURE)
-            else:
-                self.note_once("new code migration failed, so serve keeps its code: " + self.migration_error)
+            self.note_once("new code migration failed, so serve keeps its code: " + self.migration_error)
             return
         self.restart_for_new_code()
 

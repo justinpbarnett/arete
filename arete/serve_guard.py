@@ -16,8 +16,6 @@ LOCK_FD = "ARETE_SERVE_LOCK_FD"
 START_LIMIT = 3
 AGE_LIMIT = 5 * 60
 SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
-IMPORT_FAILURE = "the candidate failed the import check"
-MIGRATION_FAILURE = "the candidate failed the migration check"
 AGE_FAILURE = "the deploy receipt is older than 5 minutes"
 
 
@@ -37,9 +35,11 @@ class Receipt:
     healthy: bool = False
     settled: str = ""
     rollback: str = ""
+    started_at: float | None = None
 
     def expired(self) -> bool:
-        return time.time() - self.created_at >= AGE_LIMIT
+        return bool(self.starts and time.time() - (
+            self.created_at if self.started_at is None else self.started_at) >= AGE_LIMIT)
 
 
 def read(file: Path) -> dict | None:
@@ -112,7 +112,7 @@ def log_tail(logs: Path) -> str:
 def report_reason(held: dict) -> str:
     reason = held.get("reason", "")
     if isinstance(reason, str) and (
-            reason in (IMPORT_FAILURE, MIGRATION_FAILURE, AGE_FAILURE)
+            reason in ("the candidate failed the import check", "the candidate failed the migration check", AGE_FAILURE)
             or re.fullmatch(r"[0-9]{1,6} unhealthy starts", reason)):
         return reason
     return "startup health was not confirmed"
@@ -149,7 +149,10 @@ def count_start(state: Path, checkout: Path, logs: Path) -> bool:
     held = read(hold_path(state, receipt.tip))
     reason = (report_reason(held) if held else AGE_FAILURE if receipt.expired()
               else f"{receipt.starts} unhealthy starts" if receipt.starts >= START_LIMIT else "")
-    receipt = replace(receipt, starts=receipt.starts + 1)
+    started_at = receipt.started_at
+    if started_at is None:
+        started_at = receipt.created_at if receipt.starts else time.time()
+    receipt = replace(receipt, starts=receipt.starts + 1, started_at=started_at)
     write(state / RECEIPT, asdict(receipt))
     return bool(reason) and rollback(state, checkout, logs, receipt, reason)
 
@@ -187,3 +190,13 @@ def startup(state: Path, checkout: Path, logs: Path) -> None:
             os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])
     except (OSError, RuntimeError, TypeError, ValueError, subprocess.SubprocessError) as error:
         raise SystemExit(f"deploy: startup guard: {error}") from error
+
+
+def main() -> None:
+    state, checkout, logs = map(Path, sys.argv[1:4])
+    startup(state, checkout, logs)
+    os.execv(sys.executable, [sys.executable, "-I", "-S", "-c", sys.argv[4], *sys.argv])
+
+
+if __name__ == "__main__":
+    main()
