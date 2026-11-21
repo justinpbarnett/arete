@@ -411,7 +411,7 @@ FEEDBACK_STATUS = {"new": "waiting for a revision", "taken": "being revised", "d
                    "skipped": "not revised, JEV read it as asking nothing"}
 
 
-def render_feedback(rows: list[dict], limit: int = 8000) -> tuple[str, dict[str, str]]:
+def render_feedback(rows: list[dict], limit: int = 8000) -> tuple[str, dict[str, check_proposals.ReviewComment]]:
     if not rows:
         return "(no comments from the owner on arete PRs in this period)", {}
     final_state = {r["pr_url"]: (r["pr_state"] or "").lower() for r in rows}
@@ -431,7 +431,8 @@ def render_feedback(rows: list[dict], limit: int = 8000) -> tuple[str, dict[str,
             break
         out += lines
         used += size
-        shown[citation] = r["repo"]
+        if comment := check_proposals.review_comment(url, r["kind"], r["gh_id"]):
+            shown[citation] = comment
     return "\n".join(out).strip(), shown
 
 
@@ -751,8 +752,8 @@ def proposal_status(cfg, p, flagged) -> tuple[str, str]:
     return "pending", ""
 
 
-def record_check_proposal(cfg: config.Config, run_id: str, p: dict, recent: dict[str, str],
-                          earlier: dict[str, str], flagged: list[dict], dry_run: bool) -> None:
+def record_check_proposal(cfg: config.Config, run_id: str, p: dict, recent: dict[str, check_proposals.ReviewComment],
+                          earlier: dict[str, check_proposals.ReviewComment], flagged: list[dict], dry_run: bool) -> None:
     if p.get("layer") != "repo" or p.get("repo") == cfg.global_repo:
         print("  [skip: enforcement proposals must target the affected repository]")
         return
@@ -768,7 +769,7 @@ def record_check_proposal(cfg: config.Config, run_id: str, p: dict, recent: dict
     if type(confidence) not in (int, float) or not MIN_CONFIDENCE <= confidence <= 1:
         print("  [skip: invalid or low confidence]")
         return
-    refusal = check_proposals.refusal(p, repo, recent, earlier)
+    github, refusal = check_proposals.validate(p, repo, recent, earlier)
     if not refusal:
         rule = p["enforcement"]
         fields = [p["file"], p["change"], rule["behavior"], *rule["cleanup"]]
@@ -777,20 +778,28 @@ def record_check_proposal(cfg: config.Config, run_id: str, p: dict, recent: dict
         wording = dict(p, change="\n".join(fields))
         refusal = public_wording_refusal(cfg, repo, wording, flagged)
     if not refusal:
-        refusal, diagnostic = check_proposals.verify(p["enforcement"])
+        refusal, diagnostic = check_proposals.verify(p)
     if refusal:
         print(f"  [skip: {refusal}]")
         return
     print(f"  [repo] {repo.name} {_short(p['enforcement']['behavior'], 140)} [manual review]")
     if dry_run:
         return
-    family = check_proposals.filename(p)
+    family = check_proposals.family_name(p, github)
+    legacy_family = check_proposals.family_name(p, None)
     report = check_proposals.review_text(p, diagnostic).encode()
     relative = check_proposals.revision_name(family, report)
+    legacy_relative = check_proposals.revision_name(legacy_family, report)
+    legacy = approvals_store.check_proposal_revisions(p["layer"], p["repo"], str(legacy_family),
+                                                       check_proposals.revision_glob(legacy_family))
+    if any(row["file"] == str(legacy_relative) for row in legacy):
+        relative = legacy_relative
     path = check_proposals.save(repo, relative, report)
     change = f"Review {relative} in the repo layer. {p['enforcement']['behavior']}"
+    legacy_ids = [row["id"] for row in legacy if row["status"] == "hand"
+                  and check_proposals.evidence_matches_github(row["evidence"], github)]
     approvals_store.record_check_proposal(run_id, dict(p, file=str(relative), change=change),
-                                          str(family), str(family.with_stem(f"{family.stem}-*")))
+                                          str(family), check_proposals.revision_glob(family), legacy_ids)
     print(f"  {paths.short_path(path)}")
 
 
@@ -825,7 +834,7 @@ def _run(cfg: config.Config, run_id: str, since: datetime, until: datetime, chec
     repos ="\n".join(f"- {r.name}: {r.path} {'(public)' if r.public else ''}" for r in mine_repos)
     text = prompt_loader.prompt(
         "mine", hours=f"{hours:g}", global_repo=cfg.global_repo, arete_repo=cfg.arete_repo,
-        arete_prompts=minable_prompts(), repos=repos, max=MAX_PROPOSALS,
+        arete_prompts=minable_prompts(), repos=repos, max=MAX_PROPOSALS, check_adoption=check_proposals.ADOPTION_CHANGE,
         pending=_fmt(approvals_store.proposals(status=["applied", "pending", "hand", "approve", "filing"])),
         done=_fmt(approvals_store.proposals(status=["memory", "filed", "merged"])),
         rejected=_fmt(approvals_store.proposals(status=["rejected", "skipped"])),

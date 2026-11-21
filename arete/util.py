@@ -531,7 +531,8 @@ def flush_folder(folder: Path) -> None:
         os.close(fd)
 
 
-def write_durably(p: Path, data: bytes, mode: int | None = None, check=None, *, before_replace=None) -> None:
+def write_durably(p: Path, data: bytes, mode: int | None = None, check=None, *,
+                  before_replace=None, replace: bool = True) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=f".{p.name}.", suffix=".tmp")
     draft = Path(tmp)
@@ -545,7 +546,11 @@ def write_durably(p: Path, data: bytes, mode: int | None = None, check=None, *, 
             flush_fd(f.fileno())
         if before_replace is not None:
             before_replace()
-        os.replace(draft, p)
+        if replace:
+            os.replace(draft, p)
+        else:
+            os.link(draft, p)
+            draft.unlink()
     except BaseException:
         draft.unlink(missing_ok=True)
         raise

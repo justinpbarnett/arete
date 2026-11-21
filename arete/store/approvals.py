@@ -127,7 +127,13 @@ def add_proposal(run_id: str, p: dict, status: str, pr_url: str = "") -> None:
         )
 
 
-def record_check_proposal(run_id: str, p: dict, family: str, revisions: str) -> None:
+def check_proposal_revisions(layer: str, repo: str, family: str, revisions: str) -> list[dict]:
+    with reader() as c:
+        return [dict(r) for r in c.execute("SELECT id, file, evidence, status FROM proposals WHERE layer = ? AND repo = ? "
+                                          "AND (file = ? OR file GLOB ?)", (layer, repo, family, revisions))]
+
+
+def record_check_proposal(run_id: str, p: dict, family: str, revisions: str, legacy_ids: list[int]) -> None:
     scope = (p["layer"], p["repo"])
     with db() as c:
         if c.execute("SELECT 1 FROM proposals WHERE layer = ? AND repo = ? AND file = ? LIMIT 1",
@@ -135,6 +141,8 @@ def record_check_proposal(run_id: str, p: dict, family: str, revisions: str) -> 
             return
         c.execute("UPDATE proposals SET status = 'superseded' WHERE layer = ? AND repo = ? AND status = 'hand' "
                   "AND (file = ? OR file GLOB ?)", (*scope, family, revisions))
+        c.executemany("UPDATE proposals SET status = 'superseded' WHERE id = ? AND status = 'hand'",
+                      ((proposal_id,) for proposal_id in legacy_ids))
         add_proposal(run_id, p, "hand")
 
 

@@ -22,25 +22,34 @@ the strongest appropriate change that would prevent it next time, and where that
 ## Repository enforcement proposals
 
 Use the optional `enforcement` object only for a correction supported by two distinct owner review comments in
-the affected repository, with at least one in the current window. Copy their exact `feedback ...` citations from
-the brackets into `evidence`. Read the current code and existing checks to establish that the correction still
-applies and can be encoded without interpreting intent or context. Keep judgment-dependent guidance as prose
-or omit it. Omit `enforcement` entirely for an ordinary harness or memory proposal.
+the GitHub repository that owns the target file, with at least one in the current window. In a project with
+multiple repositories, identify the part from the target path and use only PRs in that part's repository.
+Copy their exact `feedback ...` citations from the brackets into `evidence`. Read the current code and existing
+checks to establish that the correction still applies and can be encoded without interpreting intent or context.
+Keep judgment-dependent guidance as prose or omit it. Omit `enforcement` entirely for an ordinary harness or
+memory proposal.
 
-Set `layer` to `repo`, `repo` to the affected repository, and `file` to the main target path relative to its root.
+Set `layer` to `repo`, `repo` to the configured project name, and `file` to the target path relative to its root.
 Prefer `enforcement.kind` of `architecture` when an API or architecture change can remove the invalid choice.
-Otherwise choose `check` and recommend where to add the lint, static analysis or deterministic check. Name the
-prevented behavior in `enforcement.behavior`, explain why it is objectively detectable or preventable in `why`,
-and describe the proposed implementation in `change`. In `enforcement.cleanup`, list existing repo-relative files
-containing bad examples likely to be copied, or give an empty list if you found none.
+Otherwise choose `check` and use `file` to identify where to integrate the check. Name the prevented behavior in
+`enforcement.behavior` and explain why it is objectively detectable or preventable in `why`. For architecture,
+describe the proposed implementation in `change`. In `enforcement.cleanup`, list existing files containing bad
+examples likely to be copied, using paths in the same GitHub repository relative to the configured project root.
+Give an empty list if you found none.
 
 For `check`, choose a supported `enforcement.evaluator`. The only supported evaluator is
 `python-compile-syntax-warnings`, which compiles Python with SyntaxWarning treated as an error and verifies
-literal identity diagnostics that recommend equality or inequality. Recommend integrating that same check in
-`change`. Supply minimal, valid Python source in `enforcement.known_bad` and `enforcement.allowed`, and the
-expected corrective text in `enforcement.diagnostic`. Arete compiles the examples without running them and
-saves a review proposal only if it observes the corrective rejection and an acceptance. Omit executable
-proposals for unsupported checks. Return review material only.
+literal identity diagnostics that recommend equality or inequality. Set `change` to the exact sentence below.
+Arete supplies the command itself in the review proposal.
+
+$check_adoption
+
+Supply minimal, valid Python source in `enforcement.known_bad` and `enforcement.allowed`. The allowed example
+must change exactly one comparison operator to the suggested replacement and preserve its operands and
+surrounding code. Give the expected corrective sentence, such as `Did you mean "=="?`, in
+`enforcement.diagnostic`. Arete compiles the examples without running them and saves a review proposal only
+if it observes the corrective rejection and an acceptance. Omit executable proposals for unsupported checks.
+Return review material only.
 
 Repos you may change (name, path, public):
 
