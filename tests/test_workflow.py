@@ -1,6 +1,7 @@
 import json
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -277,6 +278,22 @@ class ServeDeploymentMergeTests(ServeDeploymentFixture):
             f"deploy: {checkout} fast forwarded to {tip} (engine update)",
         ])
 
+    def test_approved_deploy_skips_default_hooks_without_logging(self):
+        (self.writer / "arete" / "fixture.py").write_text("version = 2\n")
+        tip = self.publish("engine update")
+        hooks = self.checkout / ".git" / "hooks"
+        hooks.mkdir(exist_ok=True)
+        hook = hooks / "post-merge"
+        hook.write_text("#!/bin/sh\necho called > hook-ran\n")
+        hook.chmod(0o755)
+
+        with mock.patch.dict("os.environ", {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}):
+            self.assertEqual(self.deploy(), tip)
+
+        self.assertFalse((self.checkout / "hook-ran").exists())
+        self.server.say.assert_called_once_with(
+            f"deploy: {paths.short_path(self.checkout)} fast forwarded to {tip} (engine update)")
+
     def test_failed_fast_forward_restores_tracked_paths_and_retries(self):
         package = self.writer / "arete"
         (package / "fixture.py").write_text("version = 2\n")
@@ -382,14 +399,122 @@ class ServeDeploymentRecoveryTests(ServeDeploymentFixture):
         self.assertEqual((package / "shared.py").read_text(), "shared = 1\n")
         self.assertEqual((package / "other.py").read_text(), "other = 'also edited by owner'\n")
         self.assertEqual(self.git(self.checkout, "show", ":arete/other.py"), "other = 'staged by owner'")
-        self.assertIn("remaining paths: MM arete/other.py", self.server.say.call_args_list[1].args[0])
+        [recovery] = [call.args[0] for call in self.server.say.call_args_list if " recovery for " in call.args[0]]
+        self.assertIn("remaining paths: MM arete/other.py", recovery)
         with mock.patch.object(util, "deploy_fast_forward") as merge:
             self.assertEqual(self.deploy(), self.start)
             merge.assert_not_called()
         self.assertIn(f"left alone for {tip} (dirty)", self.server.say.call_args.args[0])
 
 
+class DeployProcessTimeoutTests(unittest.TestCase):
+    def test_deploy_escalates_and_bounds_reaping_when_child_stays_running(self):
+        process = mock.MagicMock(pid=123, stdin=None)
+        shutdown = mock.Mock()
+        expired = subprocess.TimeoutExpired(["git"], 30)
+        process.communicate.side_effect = expired
+        process.wait = shutdown.wait
+        shutdown.wait.side_effect = subprocess.TimeoutExpired(["git"], 1)
+
+        with (mock.patch.object(subprocess, "Popen", return_value=process),
+              mock.patch.object(util.os, "killpg", shutdown.killpg),
+              self.assertRaisesRegex(util.DeployStillRunning, "could not confirm Git stopped")):
+            util.run_whole_tree(["git"], 30, None, graceful_timeout=True)
+
+        self.assertEqual(shutdown.mock_calls, [
+            mock.call.killpg(123, signal.SIGTERM),
+            mock.call.wait(timeout=util.DEPLOY_TERMINATION_GRACE),
+            mock.call.killpg(123, signal.SIGKILL),
+            mock.call.wait(timeout=util.DEPLOY_TERMINATION_GRACE),
+        ])
+        process.__exit__.assert_not_called()
+        process.stdout.close.assert_called_once_with()
+        process.stderr.close.assert_called_once_with()
+
+
 class ServeDeploymentTimeoutTests(ServeDeploymentFixture):
+    def test_killed_merge_recovers_partial_writes_and_its_leftover_lock(self):
+        self.check_killed_merge_lock(held=True)
+
+    def test_killed_merge_leaves_an_unproven_lock_in_place(self):
+        self.check_killed_merge_lock(held=False)
+
+    def check_killed_merge_lock(self, *, held):
+        (self.writer / "arete" / "fixture.py").write_text("version = 2\n")
+        (self.writer / "arete" / "fresh.py").write_text("added = True\n")
+        tip = self.publish("interrupted checkout")
+        script = self.state.parent / "interrupted-merge.py"
+        ready = self.state.parent / "merge-started"
+        script.write_text("""\
+import os
+import signal
+import sys
+from pathlib import Path
+
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+fd = os.open('.git/index.lock', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+os.write(fd, b'partial index')
+if sys.argv[1] == 'False':
+    os.close(fd)
+Path('arete/fixture.py').write_text('version = ')
+Path('arete/fresh.py').write_text('added = True\\n')
+Path(sys.argv[2]).touch()
+signal.pause()
+""")
+        package = self.checkout / "arete"
+        lock = self.checkout / ".git" / "index.lock"
+        protected_command = sandbox.protected_command
+        communicate = subprocess.Popen.communicate
+        merges = []
+
+        def substitute_merge(cmd, *args, **kwargs):
+            if "--ff-only" in cmd:
+                cmd = [sys.executable, str(script), str(held), str(ready)]
+            return protected_command(cmd, *args, **kwargs)
+
+        def expire_after_writes(proc, input=None, timeout=None):
+            if str(script) in proc.args:
+                merges.append(proc)
+                deadline = time.monotonic() + 5
+                while not ready.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists())
+                self.assertEqual(lock.read_bytes(), b"partial index")
+                self.assertEqual((package / "fixture.py").read_text(), "version = ")
+                timeout = 0
+            return communicate(proc, input=input, timeout=timeout)
+
+        with (mock.patch.object(sandbox, "protected_command", substitute_merge),
+              mock.patch.object(subprocess.Popen, "communicate", expire_after_writes)):
+            self.assertEqual(self.deploy(), self.start)
+
+        [merge] = merges
+        self.assertEqual(merge.returncode, -signal.SIGKILL)
+        [recovery] = [call.args[0] for call in self.server.say.call_args_list if " recovery for " in call.args[0]]
+        self.assertIn(f"recovery for {tip}", recovery)
+        self.assertIn("timed out", recovery)
+        if held:
+            self.assertFalse(lock.exists())
+            self.assertEqual((package / "fixture.py").read_text(), "version = 1\n")
+            self.assertFalse((package / "fresh.py").exists())
+            self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+            self.assertNotIn("remaining paths", recovery)
+        else:
+            self.assertEqual(lock.read_bytes(), b"partial index")
+            self.assertEqual((package / "fixture.py").read_text(), "version = ")
+            self.assertIn("Git index is locked", recovery)
+
+    def test_unconfirmed_merge_shutdown_skips_recovery(self):
+        (self.writer / "arete" / "fixture.py").write_text("version = 2\n")
+        tip = self.publish("engine update")
+        error = util.DeployStillRunning("could not confirm Git stopped after deploy timeout")
+        with (mock.patch.object(util, "deploy_fast_forward", side_effect=error),
+              mock.patch.object(self.server, "restore_deploy") as restore):
+            self.assertEqual(self.deploy(), self.start)
+
+        restore.assert_not_called()
+        self.assertIn(f"left alone for {tip} ({error})", self.server.say.call_args.args[0])
+
     def test_timed_out_merge_releases_its_lock_and_retries(self):
         (self.writer / "arete" / "fixture.py").write_text("version = 2\n")
         (self.writer / "arete" / "fresh.py").write_text("added = True\n")
@@ -428,11 +553,11 @@ class ServeDeploymentTimeoutTests(ServeDeploymentFixture):
         with (mock.patch.object(subprocess.Popen, "communicate", expire_while_git_holds_lock),
               mock.patch.object(subprocess.Popen, "wait", observe_cleanup)):
             self.assertEqual(self.deploy(), self.start)
-        self.assertTrue(cleanup_waits)
-        self.assertIsNone(cleanup_waits[0])
+        self.assertEqual(cleanup_waits, [util.DEPLOY_TERMINATION_GRACE] * 2)
         self.assertFalse(lock.exists())
         self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
-        self.assertIn("timed out", self.server.say.call_args_list[1].args[0])
+        [recovery] = [call.args[0] for call in self.server.say.call_args_list if " recovery for " in call.args[0]]
+        self.assertIn("timed out", recovery)
 
         lock.write_text("another Git process")
         self.assertEqual(self.deploy(), self.start)
@@ -450,6 +575,7 @@ class CommandConfinementTests(unittest.TestCase):
         recovery = util.DeployRecovery("b" * 40, (b"arete/util.py",), (b"arete/added.py",), (b"arete/added.py",))
         with (mock.patch.object(sandbox, "can_confine", return_value=True),
               mock.patch.object(sandbox, "sandboxed", return_value=False),
+              mock.patch.object(util, "_deploy_index_lock", return_value=src / "index.lock"),
               mock.patch.object(util, "_deploy_path_mode", return_value=stat.S_IFREG),
               mock.patch.object(util, "run_whole_tree", return_value=subprocess.CompletedProcess([], 0, "", ""))
               as run):

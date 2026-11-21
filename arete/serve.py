@@ -520,9 +520,15 @@ class Server:
             except (OSError, RuntimeError) as error:
                 self.deploy_refused(src, tip, str(error))
                 return
-            self.say(f"deploy: {paths.short_path(src)} Git hooks disabled for fast forward to {tip}")
+            hooks_path = util.git(["config", "--null", "--get", "core.hooksPath"], src, timeout=10,
+                                  check=False, retry=False)
+            if hooks_path.removesuffix("\0"):
+                self.say(f"deploy: {paths.short_path(src)} Git hooks disabled for fast forward to {tip}")
             try:
                 util.deploy_fast_forward(src, tip)
+            except util.DeployStillRunning as error:
+                self.deploy_refused(src, tip, str(error))
+                return
             except (OSError, RuntimeError) as error:
                 self.restore_deploy(src, base, tip, recovery, error)
                 self.deploy_refused(src, tip, str(error))

@@ -20,7 +20,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Iterable
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, closing, contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -30,6 +30,7 @@ from urllib.parse import SplitResult, urlsplit
 from . import paths, sandbox
 
 PROBE_GRACE_SECONDS = 0.2
+DEPLOY_TERMINATION_GRACE = 1
 TIMED_OUT = 124
 
 
@@ -92,7 +93,8 @@ def sh(
 
 
 def _sh(cmd, cwd=None, timeout=600, check=False, env=None, input=None, inherit=True, keeps=(), *,
-        deploy=False, restore_paths=(), binary=False, graceful_timeout=False) -> subprocess.CompletedProcess:
+        deploy=False, restore_paths=(), binary=False, graceful_timeout=False,
+        index_lock: _DeployIndexLock | None = None) -> subprocess.CompletedProcess:
     full_env = foreground_maintenance({**(os.environ if inherit else {}), **(env or {})})
     command = sandbox.protected_command(cmd, cwd, keeps, _deploy=deploy, _restore_paths=restore_paths)
     try:
@@ -106,6 +108,7 @@ def _sh(cmd, cwd=None, timeout=600, check=False, env=None, input=None, inherit=T
             errors=None if binary else "replace",
             env=full_env,
             graceful_timeout=graceful_timeout,
+            index_lock=index_lock,
         )
     except subprocess.TimeoutExpired as e:
         res = subprocess.CompletedProcess(
@@ -119,26 +122,51 @@ def _sh(cmd, cwd=None, timeout=600, check=False, env=None, input=None, inherit=T
 
 
 def run_whole_tree(command, timeout: float | None, input: str | bytes | None, *,
-                   graceful_timeout: bool = False, **kw) -> subprocess.CompletedProcess:
+                   graceful_timeout: bool = False, index_lock: _DeployIndexLock | None = None,
+                   **kw) -> subprocess.CompletedProcess:
     stdin = subprocess.PIPE if input is not None else None
     if graceful_timeout:
         kw.update(own_group_args())
-    with subprocess.Popen(command, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kw) as proc:
+    with ExitStack() as cleanup:
+        proc = subprocess.Popen(command, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kw)
+        if graceful_timeout:
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                if stream is not None:
+                    cleanup.enter_context(closing(stream))
+        else:
+            cleanup.enter_context(proc)
         try:
             out, err = proc.communicate(input, timeout=timeout)
         except BaseException:
             if graceful_timeout:
-                with suppress(ProcessLookupError):
-                    os.killpg(proc.pid, signal.SIGTERM)
-                proc.wait()
-                with suppress(ProcessLookupError, PermissionError):
-                    os.killpg(proc.pid, signal.SIGKILL)
+                _stop_deploy_process(proc, index_lock)
             else:
                 with suppress(Exception):
                     kill_tree(proc.pid)
                 proc.kill()
             raise
     return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
+
+
+class DeployStillRunning(RuntimeError):
+    pass
+
+
+def _stop_deploy_process(proc: subprocess.Popen, index_lock: _DeployIndexLock | None) -> None:
+    with suppress(ProcessLookupError, PermissionError):
+        os.killpg(proc.pid, signal.SIGTERM)
+    try:
+        proc.wait(timeout=DEPLOY_TERMINATION_GRACE)
+    except subprocess.TimeoutExpired:
+        if index_lock is not None:
+            with suppress(OSError, RuntimeError):
+                index_lock.observe(proc.pid)
+    try:
+        with suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=DEPLOY_TERMINATION_GRACE)
+    except (PermissionError, subprocess.TimeoutExpired) as error:
+        raise DeployStillRunning("could not confirm Git stopped after deploy timeout") from error
 
 
 NETWORK_ERROR = re.compile(
@@ -227,7 +255,58 @@ def _check_git(args: list[str], res: subprocess.CompletedProcess) -> None:
 
 def deploy_fast_forward(src: Path, tip: str) -> None:
     args = ["--no-replace-objects", "merge", "-q", "--ff-only", "--no-autostash", "--no-overwrite-ignore", tip]
-    _check_git(args, _deploy_git(src, args, deploy=True))
+    path = _deploy_index_lock(src)
+    with ExitStack() as cleanup:
+        index_lock = None if path.exists(follow_symlinks=False) else _DeployIndexLock(path, cleanup)
+        result = _deploy_git(src, args, deploy=True, index_lock=index_lock)
+        if result.returncode == TIMED_OUT and index_lock is not None:
+            index_lock.clear(src)
+    _check_git(args, result)
+
+
+@dataclass
+class _DeployIndexLock:
+    path: Path
+    cleanup: ExitStack
+    observed: os.stat_result | None = None
+
+    def observe(self, pid: int) -> None:
+        fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        self.cleanup.callback(os.close, fd)
+        candidate = os.fstat(fd)
+        if stat.S_ISREG(candidate.st_mode) and _process_holds_lock(pid, self.path, candidate):
+            self.observed = candidate
+
+    def clear(self, src: Path) -> None:
+        if self.observed is None:
+            return
+        with suppress(FileNotFoundError):
+            if os.path.samestat(self.path.lstat(), self.observed):
+                _sh(["/bin/rm", "-f", str(self.path)], cwd=src, timeout=10, graceful_timeout=True)
+
+
+def _process_holds_lock(pid: int, path: Path, candidate: os.stat_result) -> bool:
+    if sys.platform == "darwin":
+        result = _sh(["/usr/sbin/lsof", "-nP", "-a", "-p", str(pid), "-FaDi", "--", str(path)],
+                     cwd=path.parent, timeout=1, graceful_timeout=True)
+        if result.returncode != 0:
+            return False
+        identity = {f"D{candidate.st_dev:#x}", f"i{candidate.st_ino}"}
+        for descriptor in result.stdout.split("\nf")[1:]:
+            fields = set(descriptor.splitlines()[1:])
+            if identity <= fields and fields.intersection({"aw", "au"}):
+                return True
+    elif sys.platform == "linux":
+        proc = Path(f"/proc/{pid}")
+        for fd in (proc / "fd").iterdir():
+            with suppress(FileNotFoundError):
+                if not os.path.samestat(fd.stat(), candidate):
+                    continue
+                flags = (proc / "fdinfo" / fd.name).read_text()
+                match = re.search(r"^flags:\s*([0-7]+)$", flags, re.MULTILINE)
+                if match and int(match[1], 8) & os.O_ACCMODE:
+                    return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -262,6 +341,12 @@ def _deploy_head(src: Path) -> tuple[str, str]:
     return head.decode("ascii"), os.fsdecode(refs[0]) if refs else ""
 
 
+def _deploy_index_lock(src: Path) -> Path:
+    raw = _deploy_read(src, "rev-parse", "--path-format=absolute", "--git-path", "index")
+    index = Path(os.fsdecode(raw.removesuffix(b"\n"))).resolve()
+    return Path(f"{index}.lock")
+
+
 def deploy_recovery(src: Path, base: str, tip: str) -> DeployRecovery:
     head, ref = _deploy_head(src)
     if ref != f"refs/heads/{base}":
@@ -279,8 +364,7 @@ def deploy_recovery(src: Path, base: str, tip: str) -> DeployRecovery:
 def restore_deploy_paths(src: Path, base: str, recovery: DeployRecovery) -> list[str]:
     if _deploy_head(src) != (recovery.head, f"refs/heads/{base}"):
         raise RuntimeError("HEAD or branch changed during deploy")
-    index = _deploy_read(src, "rev-parse", "--path-format=absolute", "--git-path", "index")
-    if Path(os.fsdecode(index.removesuffix(b"\n")) + ".lock").exists(follow_symlinks=False):
+    if _deploy_index_lock(src).exists(follow_symlinks=False):
         raise RuntimeError("Git index is locked")
 
     errors = []
