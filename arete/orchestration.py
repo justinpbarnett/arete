@@ -210,8 +210,8 @@ class Controller:
             if self.job.left_for_a_person or self.run.feedback or self.run.repairs or self.flow.continues:
                 raise factory.Refused("ZTE does not inherit owner work or previous attempts")
         self.data.setdefault("goal_base", self.job.goal)
-        known = {(f.get("pr_url"), f.get("kind"), f.get("gh_id")) for f in self.data.get("feedback", [])}
-        fresh = [f for f in self.run.feedback if (f.get("pr_url"), f.get("kind"), f.get("gh_id")) not in known]
+        known = {pipeline.feedback_key(f) for f in self.data.get("feedback", [])}
+        fresh = [f for f in self.run.feedback if pipeline.feedback_key(f) not in known]
         if fresh:
             self.data.setdefault("feedback", []).extend(fresh)
             feedback = pipeline.feedback_markdown(fresh)
@@ -712,6 +712,8 @@ class Controller:
                         if failure := self.publication_ci([checkout], caught_up=True):
                             return failure
                         continue
+                elif hold and self.data.get("catch_up_hold"):
+                    return {"park": True, "error": hold}
                 pipeline.report_automerge(self.run, checkout, hold)
                 self.clear_catch_up_hold()
                 break
@@ -762,7 +764,7 @@ class Controller:
     def hold_catch_up(self, checkout, base_sha, hold):
         reason = pipeline.public_text(
             self.run, f"Catch-up to `{checkout.base}` at `{base_sha}` held on {hold.gate}: {hold.why}")
-        attempted = f"{reason}. Checked candidate `{hold.head}` and restored published head `{checkout.lease}`."
+        attempted = f"{reason}. Checked candidate `{hold.head}` and kept it in the worktree for repair."
         evidence = [attempted]
         if hold.gate == "checks":
             evidence.append(util.tail(hold.report, MAX_CATCH_UP_FEEDBACK_CHARS))
