@@ -2,6 +2,8 @@ A verifier used the product with your change, and it does not work yet. Attempt 
 
 $failures
 
+Denied paths: $denied.
+
 Fix the cause in the code so the user gets what the issue asks for. Do not change what the verifier checks, and
 do not add tests to stand in for the product working.
 Arete runs the full check gate after your repair: $checks.
