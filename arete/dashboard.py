@@ -235,7 +235,7 @@ def canonical_path(path: str) -> bool:
 def canonical_methods(path: str) -> tuple[str, ...]:
     if path in ("/api/v1/events", "/api/v1/principals") or re.fullmatch(r"/api/v1/principals/[^/]+", path):
         return ("GET",)
-    return tuple(method for method in ("GET", "POST") if contract.match(method, path))
+    return tuple(method for method in ("GET", "POST", "PATCH", "DELETE") if contract.match(method, path))
 
 
 def fault_run_id(path: str, query: dict[str, str]) -> str | None:
@@ -300,7 +300,7 @@ class Handler(BaseHTTPRequestHandler):
         except contract.Problem as error:
             self.send_error(error.status, str(error), problem_code=error.code)
             return False
-        if self.command not in ("GET", "POST") and canonical_methods(self.api_path):
+        if self.command not in ("GET", "POST", "PATCH", "DELETE") and canonical_methods(self.api_path):
             self.answer(self.command)
             return False
         return True
@@ -324,10 +324,19 @@ class Handler(BaseHTTPRequestHandler):
         self.answer("GET")
 
     def do_POST(self) -> None:
+        self.write("POST")
+
+    def do_PATCH(self) -> None:
+        self.write("PATCH")
+
+    def do_DELETE(self) -> None:
+        self.write("DELETE")
+
+    def write(self, method) -> None:
         entered = POSTS_IN_FLIGHT.enter()
         self.restarting = not entered
         try:
-            self.answer("POST")
+            self.answer(method)
         finally:
             if entered:
                 POSTS_IN_FLIGHT.add(-1)
@@ -352,6 +361,8 @@ class Handler(BaseHTTPRequestHandler):
             parts = urlsplit(self.path)
             path = parts.path
             self.admit(method, path)
+            if method in ("POST", "PATCH", "DELETE"):
+                self.check_write_instance()
             if canonical_path(path) and not self.operation and method not in (allowed := canonical_methods(path)) and allowed:
                 self.allowed_methods = allowed
                 raise contract.Problem("method_not_allowed", "The route does not accept this method.")
@@ -388,7 +399,7 @@ class Handler(BaseHTTPRequestHandler):
                         result = {**result, "seq": self.read_seq}
             else:
                 result = self.api(method, path, query)
-            if method == "POST" and self.write_receipt is None:
+            if method != "GET" and self.write_receipt is None:
                 self.write_receipt = event_store.committed_receipt()
                 if isinstance(result, dict) and isinstance(result.get("run"), str) and result["run"]:
                     self.write_receipt = writes.receipt(f"run:{result['run']}", kind="run.started") or self.write_receipt
@@ -404,19 +415,31 @@ class Handler(BaseHTTPRequestHandler):
                      1 if isinstance(e, idempotency.InFlight) else getattr(e, "retry_after", 0))
             self.send_json(refusal_status(e) or 500, refusal_answer(e), retry_after=retry)
 
+    def check_write_instance(self):
+        expected = self.headers.get_all("X-Arete-Instance", [])
+        if not expected:
+            return
+        if len(expected) != 1:
+            raise contract.Problem("invalid_framing", "Send at most one X-Arete-Instance.")
+        with foundation.reader() as conn:
+            instance = foundation.metadata(conn).get("instance_id")
+        if expected[0] != instance:
+            raise contract.Problem("conflict", "The server instance changed before this write.")
+
     def event_connection(self):
         return self.verify_controls.stream(self.connection) if self.verify_controls else nullcontext()
 
     def validate_transport(self, method, path):
-        if self.api_path and (self.restarting or method == "GET" and POSTS_IN_FLIGHT.draining()):
+        if self.api_path and (self.restarting or
+                              method == "GET" and path != "/api/meta" and POSTS_IN_FLIGHT.draining()):
             raise contract.Problem("draining", RESTARTING)
         client = self.headers.get("X-Arete-Client", "")
         if found := re.fullmatch(r"(cli|mcp|web)/0+\.[0-9]+(?:\..*)?", client):
             required = contract.OLDEST_CLIENT[found[1]]
             raise contract.Problem("client_too_old", f"This client needs version {required}", required_version=required)
-        post = method == "POST"
+        post = method in ("POST", "PATCH", "DELETE")
         legacy = bool(self.alias) and "Idempotency-Key" not in self.headers
-        self.content_size = api_http.content_length(self.headers, required=post and not legacy)
+        self.content_size = api_http.content_length(self.headers, required=post and not legacy and method != "DELETE")
         if not post and self.content_size:
             raise contract.Problem("invalid_framing", "This method does not take a body.")
         if not self.api_path:
@@ -431,6 +454,8 @@ class Handler(BaseHTTPRequestHandler):
                 api_http.check_media(self.headers, {"application/json"}, self.content_size)
             if len(self.headers.get_all("Idempotency-Key", [])) > 1:
                 raise contract.Problem("invalid_framing", "Send at most one Idempotency-Key.")
+            if self.operation and contract.keyed_write(self.operation[0]) and "Idempotency-Key" not in self.headers:
+                raise contract.Problem("invalid_input", "Send an Idempotency-Key for a write.")
             if batch:
                 requests = self.body().get("requests")
                 if isinstance(requests, list) and 2 <= len(requests) <= 50:
@@ -490,6 +515,39 @@ class Handler(BaseHTTPRequestHandler):
             self.write_receipt = claims.receipt(row["last_seq"])
             return json.loads(row["response"])
 
+    def keyed_action(self, method, route, parameters, action, *, atomic=False):
+        key = self.headers.get("Idempotency-Key")
+        if key is None:
+            return action()
+        sha = idempotency.fingerprint(method, route, parameters, self.body())
+        with idempotency.owning(principals.current(), key, sha, route) as context:
+            row = idempotency.matching_claim(context)
+            if row and row["status"]:
+                self.idempotent_replayed = True
+            elif row:
+                raise idempotency.Unconfirmed("The earlier request did not record a result. Check its effect before trying again.")
+            else:
+                row = self.complete_action(context, action, atomic)
+            self.write_receipt = claims.receipt(row["last_seq"])
+            return json.loads(row["response"])
+
+    def complete_action(self, context, action, atomic):
+        if not atomic:
+            claims.claim(context, None)
+        with (foundation.tx() if atomic else nullcontext()), event_store.collect_receipts() as collected:
+            try:
+                result = action()
+            except Exception as e:
+                status = refusal_status(e)
+                if not atomic and (isinstance(e, NoRoute) or status is not None and 400 <= status < 500):
+                    claims.abandon(context)
+                raise
+            receipt = self.write_receipt or event_store.committed_receipt()
+            seq = int(receipt["event_seq"].rsplit(".", 1)[1]) if receipt else None
+            if atomic and collected:
+                seq = collected[-1][0]
+            return claims.complete(context, 200, api_http.json_bytes(result), seq)
+
     def admit(self, method: str, path: str) -> None:
         node: tailnet.Node = self.server.node
         if tailnet.host_name(self.headers.get("Host", "")) not in node.names:
@@ -503,7 +561,7 @@ class Handler(BaseHTTPRequestHandler):
             raise Refusal(403, "The dashboard opens only for its owner's tailnet login.")
         principals.admit(person)
         self.actor = principals.current()
-        if method == "POST" and self.headers.get("X-Arete") != "1":
+        if method in ("POST", "PATCH", "DELETE") and self.headers.get("X-Arete") != "1":
             raise Refusal(403, "A change needs the X-Arete header, which the dashboard page sends.")
 
     def api(self, method: str, path: str, query: dict):
@@ -521,6 +579,9 @@ class Handler(BaseHTTPRequestHandler):
             rest = route_rest(template, path) if verb == method else None
             if rest is not None:
                 try:
+                    if method == "POST" and route in CLI_ALIASES and not (route is post_chat and rest.endswith("/file")):
+                        return self.keyed_action(method, template, {"path": rest}, lambda: route(self, rest, query),
+                                                 atomic=atomic_alias(route, unquote(rest)))
                     return route(self, rest, query)
                 except NoRoute:
                     break
@@ -792,7 +853,7 @@ def forget_proposal(proposal_id: int) -> dict:
 def approve_rule(proposal_id: int) -> dict:
     if (approvals_store.proposal(proposal_id, connect=foundation.reader) or {}).get("status") not in ("approve", "filing"):
         raise control.NotFound(f"#{proposal_id} is not a rule waiting for approval")
-    control.detach(["file-rule", str(proposal_id)])
+    control.detach(["file-rule", str(proposal_id), "--local"])
     return {"id": proposal_id}
 
 
@@ -994,7 +1055,7 @@ def post_chat(handler, rest, query):
         return handler.publish("/api/chats/{n}/file", {"n": str(number)},
                                lambda publication=None: chat.file_draft(number, publication, draft=draft))
     if action == "drop":
-        return chat.drop_draft(whole_number(chat_id))
+        return drop_chat(chat_id)
     raise NoRoute
 
 
@@ -1027,7 +1088,7 @@ def post_run(handler, rest, query):
     base_version = body.get("base_version")
     result = None
     if action == "stop":
-        result = control.stop_run(run_id, base_version, public=True)
+        return stop_run(handler, run_id, base_version, public=True)
     elif action == "answer":
         result = tasks.reply(run_id, str(body.get("text") or ""))
     elif action == "resume":
@@ -1038,10 +1099,24 @@ def post_run(handler, rest, query):
         result = tasks.run_step(run_id, action[len("steps/"):], body.get("set") or {}, base_version)
     else:
         raise NoRoute
-    handler.write_receipt = event_store.committed_receipt(f"run:{run_id}", first=action == "stop")
+    handler.write_receipt = event_store.committed_receipt(f"run:{run_id}")
     if result.get("run") and result["run"] != run_id:
         handler.write_receipt = writes.receipt(f"run:{result['run']}", kind="run.started")
     return result
+
+
+def stop_run(handler, run_id, base_version=None, *, public=False):
+    result = control.stop_run(run_id, base_version, public=public)
+    handler.write_receipt = event_store.committed_receipt(f"run:{run_id}", first=True)
+    return result
+
+
+def steer_run(run_id, text):
+    return sessions.send(run_id, text)
+
+
+def drop_chat(chat_id):
+    return chat.drop_draft(whole_number(chat_id))
 
 
 def post_push_subscribe(handler, rest, query):
@@ -1083,9 +1158,9 @@ def post_sessions(handler, rest, query):
 def post_session(handler, rest, query):
     session_id, _, action = unquote(rest).rpartition("/")
     if action == "send":
-        return sessions.send(session_id, str(handler.body().get("text", "")))
+        return steer_run(session_id, str(handler.body().get("text", "")))
     if action == "stop":
-        return control.stop_run(session_id)
+        return stop_run(handler, session_id)
     raise NoRoute
 
 
@@ -1139,6 +1214,14 @@ def post_serve_install(handler, rest, query):
 
 ROUTES = tuple((entry["method"], entry["path"], globals()[entry["provider"]]) for entry in contract.ALIASES
                if not entry.get("transport"))
+CLI_ALIASES = (post_ask, post_chat, post_incident_switch, post_incident, post_loop, post_proposal, post_run,
+               post_serve_install, post_session, post_sessions)
+
+
+def atomic_alias(route, rest):
+    return ((route is post_chat and rest.endswith("/drop"))
+            or (route is post_session and rest.endswith("/send"))
+            or (route is post_proposal and rest.endswith(("/done", "/reject"))))
 
 
 def handlers() -> tailnet.Handlers:

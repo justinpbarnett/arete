@@ -226,6 +226,332 @@ class PublicationFixture(unittest.TestCase):
         return job
 
 
+class UnchangedHeadCIRetryTests(PublicationFixture):
+    def setUp(self):
+        super().setUp()
+        self.record_pushed_head()
+        c, controller = self.checkout, self.controller
+        pushed_tree = factory.fingerprint(c.wt)
+        self.assertTrue(pushed_tree)
+        self.enterContext(mock.patch.object(factory, "fingerprint", return_value=pushed_tree))
+        repo = config.Repo("fixture", self.root, parts=[config.Part("", c.github)])
+        job = self.publication_job(repo, "arete/7-edit-fixture", verified=verify.Verified("pass"))
+        job.changed = job.opened = [c.github]
+        job.b.layer.trust_level = "automerge"
+        controller.stamp("verify", {"verdict": "pass"})
+
+        api = f"repos/{c.github}"
+        self.run_path = f"{api}/actions/runs/456"
+        self.workflow_runs_path = f"{api}/actions/runs?event=pull_request&head_sha={c.lease}&per_page=100"
+        self.jobs_path = f"{self.run_path}/attempts/3/jobs?per_page=100"
+        self.failed_job_path = f"{api}/actions/jobs/123"
+        self.failed = self.actions_job(123, 456, 2, "failure")
+        self.head_checks = [self.failed]
+        self.other_pr_check = self.actions_job(200, 789, 1, "success")
+        self.original_run = self.actions_run(456, 7, 2, "completed", "failure")
+        self.other_pr_run = self.actions_run(789, 8, 1, "completed", "failure")
+        self.workflow_runs = [self.original_run]
+
+        def transport(args, **options):
+            endpoint = args[1]
+            if endpoint == self.failed_job_path:
+                return self.failed
+            if endpoint == f"{api}/actions/jobs/200":
+                return self.other_pr_check
+            if endpoint == f"{api}/actions/runs/789":
+                return self.other_pr_run
+            if endpoint.startswith(f"{api}/actions/jobs/"):
+                return next(row for row in self.head_checks if row["id"] == int(endpoint.rsplit("/", 1)[1]))
+            if endpoint == self.workflow_runs_path:
+                return [{"workflow_runs": self.workflow_runs}]
+            if endpoint == self.run_path:
+                return self.actions_run(456, 7, *next(self.run_snapshots))
+            if endpoint == f"{self.run_path}/attempts/3":
+                return self.exact_attempt
+            if endpoint == f"{self.run_path}/attempts/2/jobs?per_page=100":
+                return [{"jobs": [self.failed]}]
+            if endpoint == self.jobs_path:
+                return [{"jobs": next(self.job_snapshots)}]
+            if endpoint.startswith(f"{api}/commits/{c.lease}/check-runs?"):
+                return [{"check_runs": self.head_checks}]
+            if endpoint.startswith(f"{api}/commits/base/check-runs?"):
+                return [{"check_runs": []}]
+            if "/statuses?" in endpoint:
+                return [[]]
+            self.fail(f"unexpected GitHub endpoint {endpoint}")
+
+        self.enterContext(mock.patch.object(gh, "branch_sha", return_value="base"))
+        self.enterContext(mock.patch.object(gh, "pr_merge_details", return_value={
+            "state": "OPEN", "headRefOid": c.lease, "baseRefName": c.base, "mergeable": "MERGEABLE",
+        }))
+        self.enterContext(mock.patch.object(ci, "SETTLE_SECONDS", 0))
+        self.sleep = self.enterContext(mock.patch.object(ci.time, "sleep"))
+        self.enterContext(mock.patch.object(controller, "ci_failures", return_value="checks failed"))
+        self.enterContext(mock.patch.object(pipeline, "publish_ci"))
+        self.enterContext(mock.patch.object(pipeline, "release_workspace"))
+        self.enterContext(mock.patch.object(pipeline, "record_prs", return_value=c.pr))
+        self.github = self.enterContext(mock.patch.object(gh, "gh_json", side_effect=transport))
+        self.command = self.enterContext(mock.patch.object(gh, "gh"))
+        self.draft = True
+
+        def set_draft(pr, draft):
+            self.assertEqual(pr, c.pr)
+            self.draft = draft
+
+        self.set_draft = self.enterContext(mock.patch.object(gh, "pr_set_draft", side_effect=set_draft))
+        self.enterContext(mock.patch.object(gh, "pr_draft_and_head", side_effect=lambda _: (self.draft, c.lease)))
+        self.merge = self.enterContext(mock.patch.object(pipeline, "try_automerge", return_value=None))
+        self.record_ci_failure()
+
+        for obj, name in ((job.b, "restage"), (job.b, "require_valid_diff"),
+                          (controller, "validate_publication_diff"), (pipeline, "commit_and_push")):
+            call = self.enterContext(mock.patch.object(obj, name, side_effect=AssertionError(f"unexpected {name}")))
+            self.addCleanup(call.assert_not_called)
+
+    def record_ci_failure(self):
+        controller, c = self.controller, self.checkout
+        self.assertIn("error", controller.publication_ci([c]))
+        self.assertEqual(controller.data["published_tree"], controller.fingerprint())
+        self.assertTrue(controller.data["ci_failed"])
+
+    def actions_run(self, run, pr, attempt, status, conclusion, *, workflow_id=99):
+        return {"id": run, "head_sha": self.checkout.lease, "workflow_id": workflow_id, "run_number": run,
+                "event": "pull_request", "pull_requests": [{"number": pr}],
+                "run_attempt": attempt, "status": status, "conclusion": conclusion}
+
+    def actions_job(self, job, run, attempt, conclusion, name="arete-checks"):
+        return {"id": job, "run_id": run, "run_attempt": attempt, "head_sha": self.checkout.lease,
+                "name": name, "status": "completed", "conclusion": conclusion,
+                "app": {"id": gh.GITHUB_ACTIONS_APP_ID, "slug": "github-actions"}}
+
+    def request_retry(self, action=None):
+        waits = self.controller.run.waiting.call_args_list[:]
+        self.assertIsNone(self.controller.dispatch(action or self.action))
+        self.command.assert_called_once_with(["run", "rerun", "456", "--failed", "--repo", self.checkout.github],
+                                             write=True)
+        self.assertEqual(self.controller.run.waiting.call_args_list, [*waits, mock.call("ci")])
+
+    def complete_retry(self, conclusion):
+        self.head_checks.append(self.other_pr_check)
+        previous, finished = (2, "completed", "failure"), (3, "completed", conclusion)
+        self.run_snapshots = iter([previous, (3, "in_progress", None), finished, finished, finished])
+        lagging_jobs = [[], [self.actions_job(124, 456, 2, "success")]] if conclusion == "success" else []
+        self.job_snapshots = iter([*lagging_jobs, [self.actions_job(125, 456, 3, conclusion)]])
+
+        def still_waiting(_):
+            self.assertTrue(self.draft)
+            self.merge.assert_not_called()
+
+        self.sleep.side_effect = still_waiting
+        self.request_retry()
+        self.assertEqual(self.sleep.call_count, 2 + len(lagging_jobs))
+
+    def test_publication_request_reruns_failed_jobs_and_resumes_publication_after_green_ci(self):
+        def merge(*args, **kwargs):
+            self.assertFalse(self.draft)
+
+        self.merge.side_effect = merge
+        self.complete_retry("success")
+        self.merge.assert_called_once()
+        self.assertEqual(self.controller.ending[0], "pr")
+        self.assertNotIn("ci_failed", self.controller.data)
+        self.assertEqual(self.transition.call_args.args[2], "succeeded")
+
+    def test_second_red_on_the_same_head_fails_publication_with_the_exact_reason(self):
+        self.complete_retry("failure")
+        self.assertEqual(self.controller.data["ci_retry"]["targets"][self.checkout.github]["jobs"], [125])
+        self.assert_second_red()
+
+    def test_unchanged_request_resumes_timed_out_rerun_and_reports_its_failure(self):
+        self.run_snapshots = iter([(3, "in_progress", None), (3, "completed", "failure")])
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "failure")]])
+        with mock.patch.object(ci, "WAIT_SECONDS", 0):
+            self.request_retry()
+        self.assert_retry_held()
+
+        self.controller.data = json.loads(json.dumps(self.controller.data))
+        verify_evidence = self.controller.data["evidence"]["verify"]
+        with mock.patch.dict(verify_evidence, tree="stale"):
+            stale_action = {**self.action, "id": "d0002-1"}
+            self.assertEqual(str(self.controller.dispatch(stale_action)), "publication needs current evidence: verify")
+        self.assert_second_red()
+        self.assertEqual(self.controller.run.waiting.call_args_list, [mock.call("ci")] * 3)
+
+    def test_unchanged_request_resumes_timed_out_rerun_and_publishes_on_green(self):
+        self.run_snapshots = iter([(3, "in_progress", None), (3, "completed", "success")])
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "success")]])
+        with mock.patch.object(ci, "WAIT_SECONDS", 0):
+            self.request_retry()
+        self.assert_retry_held()
+
+        self.assertIsNone(self.controller.dispatch({**self.action, "id": "d0002-0"}))
+        self.command.assert_called_once()
+        self.merge.assert_called_once()
+        self.assertFalse(self.draft)
+        self.assertNotIn("ci_retry", self.controller.data)
+
+    def assert_second_red(self):
+        self.assertIsNone(self.controller.ending)
+        self.assertTrue(self.draft)
+        next_action = {**self.action, "id": "d0002-0"}
+        self.assertIsNone(self.controller.dispatch(next_action))
+        reason = f"CI failed twice on the unchanged head {self.checkout.lease}"
+        self.assertEqual(self.controller.ending, ("failed", reason, self.checkout.pr))
+        self.transition.assert_called_with(self.controller.lease, next_action["id"], "failed", {"error": reason})
+        self.command.assert_called_once()
+        self.merge.assert_not_called()
+
+    def test_completed_attempt_without_the_replacement_job_keeps_publication_blocked(self):
+        self.head_checks.append(self.other_pr_check)
+        self.run_snapshots = iter([(3, "completed", "success")])
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "success", name="other-job")]])
+        with mock.patch.object(ci, "WAIT_SECONDS", 0):
+            self.request_retry()
+        self.assertTrue(self.controller.data["ci_failed"])
+        self.assertIsNone(self.controller.ending)
+        self.assertTrue(self.draft)
+        self.merge.assert_not_called()
+
+    def test_failed_attempt_without_the_replacement_job_counts_as_second_red(self):
+        self.run_snapshots = iter([(3, "completed", "failure")])
+        self.job_snapshots = iter([[]])
+        with mock.patch.object(ci, "WAIT_SECONDS", 0):
+            self.request_retry()
+        reds = self.controller.ci_failures.call_args.args[0].reds
+        self.assertEqual([r.check.description for r in reds], ["Workflow attempt 3 concluded failure"])
+        self.assert_second_red()
+
+    def test_newer_pending_attempt_keeps_publication_draft_after_the_requested_attempt_passes(self):
+        self.run_snapshots = iter([(4, "in_progress", None)])
+        self.exact_attempt = self.actions_run(456, 7, 3, "completed", "success")
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "success")]])
+        pending = self.actions_job(126, 456, 4, None)
+        self.head_checks.append({**pending, "status": "in_progress"})
+        with mock.patch.object(ci, "WAIT_SECONDS", 0):
+            self.request_retry()
+        self.assert_retry_held()
+        watched, = self.controller.ci_failures.call_args.args[0].seen
+        self.assertFalse(watched.read)
+        self.assertEqual([check.source for check in watched.in_state("pending")], ["workflow:456"])
+
+    def test_newer_failed_attempt_keeps_publication_draft_after_another_check_finishes(self):
+        independent = self.actions_job(300, 789, 1, None, name="independent")
+        self.head_checks.append({**independent, "status": "in_progress"})
+        self.run_snapshots = iter([(3, "completed", "success"), (4, "completed", "failure")])
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "success")]])
+
+        def finish_checks(_):
+            self.head_checks = [self.actions_job(126, 456, 4, "failure"),
+                                {**independent, "conclusion": "success"}]
+
+        self.sleep.side_effect = finish_checks
+        self.request_retry()
+        self.sleep.assert_called_once()
+        self.assert_retry_held()
+        reds = self.controller.ci_failures.call_args.args[0].reds
+        self.assertEqual([r.check.description for r in reds], ["Workflow attempt 4 concluded failure"])
+
+    def test_newer_run_of_the_same_workflow_keeps_publication_draft(self):
+        self.run_snapshots = iter([(3, "completed", "success")])
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "success")]])
+
+        def start_newer_run(*args, **kwargs):
+            self.workflow_runs.append(self.actions_run(457, 7, 1, "completed", "failure"))
+
+        self.command.side_effect = start_newer_run
+        self.request_retry()
+        self.assert_retry_held()
+        reds = self.controller.ci_failures.call_args.args[0].reds
+        self.assertEqual([r.check.source for r in reds], ["workflow:457"])
+
+    def assert_newer_check_from_separate_workflow_holds_publication(self, status, conclusion, state):
+        separate = self.actions_run(458, 7, 2, status, conclusion, workflow_id=100)
+        self.run_snapshots = iter([(3, "completed", "success")])
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "success")]])
+
+        def rerun_requested(*args, **kwargs):
+            self.workflow_runs.append(separate)
+            self.head_checks.append({**self.actions_job(127, 458, 2, conclusion), "status": status})
+
+        self.command.side_effect = rerun_requested
+        with mock.patch.object(ci, "WAIT_SECONDS", 0):
+            self.request_retry()
+        self.assert_retry_held()
+        watched, = self.controller.ci_failures.call_args.args[0].seen
+        self.assertEqual([check.job for check in watched.in_state(state)], [127])
+        self.assertEqual([check.job for check in watched.in_state("pass")], [125])
+
+    def test_newer_red_check_from_separate_same_name_workflow_keeps_publication_draft(self):
+        self.assert_newer_check_from_separate_workflow_holds_publication("completed", "failure", "fail")
+
+    def test_newer_pending_check_from_separate_same_name_workflow_keeps_publication_draft(self):
+        self.assert_newer_check_from_separate_workflow_holds_publication("in_progress", None, "pending")
+
+    def assert_retry_held(self):
+        self.assertTrue(self.draft)
+        self.assertNotIn(mock.call(self.checkout.pr, False), self.set_draft.call_args_list)
+        self.merge.assert_not_called()
+        self.assertIsNone(self.controller.ending)
+        self.assertTrue(self.controller.data.get("ci_failed"))
+
+    def test_newer_same_name_failure_on_another_pr_never_spends_this_prs_retry(self):
+        self.other_pr_check["conclusion"] = "failure"
+        self.head_checks.append(self.other_pr_check)
+        self.record_ci_failure()
+        self.assertEqual(self.controller.data["ci_retry"]["targets"][self.checkout.github]["jobs"], [200])
+        self.workflow_runs = [self.other_pr_run]
+        refusal = self.controller.dispatch(self.action)
+        self.assertEqual(str(refusal), "the failed CI has no GitHub Actions jobs to rerun")
+        self.command.assert_not_called()
+        self.assertFalse(self.controller.data["ci_retried_heads"])
+
+        self.workflow_runs.append(self.original_run)
+        self.run_snapshots = iter([(3, "completed", "success")])
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "success")]])
+        self.merge.side_effect = lambda *args, **kwargs: setattr(self, "draft", False)
+        self.request_retry({**self.action, "id": "d0002-0"})
+        self.github.assert_any_call(["api", f"repos/{self.checkout.github}/actions/jobs/200"])
+        self.merge.assert_called_once()
+
+    def test_failed_rerun_replaces_a_stale_skipped_dependent_check(self):
+        self.head_checks.append(self.actions_job(124, 456, 2, "skipped", name="dependent"))
+        self.run_snapshots = iter([(3, "completed", "failure")])
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "success"),
+                                    self.actions_job(126, 456, 3, "failure", name="dependent")]])
+        self.request_retry()
+        reds = self.controller.ci_failures.call_args.args[0].reds
+        self.assertEqual([(r.check.name, r.check.job) for r in reds], [("dependent", 126)])
+        self.assert_second_red()
+
+    def test_failed_workflow_conclusion_blocks_publication_when_the_rerun_job_passed(self):
+        self.run_snapshots = iter([(4, "completed", "success")])
+        self.exact_attempt = self.actions_run(456, 7, 3, "completed", "failure")
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "success")]])
+        self.request_retry()
+        reds = self.controller.ci_failures.call_args.args[0].reds
+        self.assertEqual([r.check.description for r in reds], ["Workflow attempt 3 concluded failure"])
+        self.assert_second_red()
+
+    def test_confirmed_second_red_is_kept_when_an_independent_check_times_out(self):
+        pending = self.actions_job(200, 789, 1, None, name="independent")
+        self.head_checks.append({**pending, "status": "in_progress"})
+        self.run_snapshots = iter([(3, "completed", "failure")])
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "failure")]])
+        with mock.patch.object(ci, "WAIT_SECONDS", 0):
+            self.request_retry()
+        watched, = self.controller.ci_failures.call_args.args[0].seen
+        self.assertFalse(watched.read)
+        self.assertEqual([check.name for check in watched.in_state("pending")], ["independent"])
+        self.assertEqual(self.controller.data["ci_retry"]["targets"][self.checkout.github]["jobs"], [125])
+        self.assert_second_red()
+
+    def test_publication_retry_requires_current_verification(self):
+        self.controller.data["evidence"]["verify"]["tree"] = "stale"
+        refusal = self.controller.dispatch(self.action)
+        self.assertEqual(str(refusal), "publication needs current evidence: verify")
+        self.command.assert_not_called()
+
+
 class SingleWorkerPublicationTests(PublicationFixture):
     def test_single_worker_repair_fails_required_gates_when_publication_is_refused(self):
         branch = "arete/7-edit-fixture"
@@ -490,6 +816,374 @@ class PendingBaseMergePublicationTests(PublicationFixture):
         push.assert_called_once_with(["push", "-q", f"--force-with-lease={branch}:{c.lease}", "-u", "origin", branch],
                                      self.root)
         self.assertEqual(self.git("show", "HEAD:file.txt"), "implementation")
+
+
+class ResolverScratchFixture(unittest.TestCase):
+    MARKER = "arete-verification-scratch-v1\n"
+    LOG = ".arete-sandbox/logs/db.log"
+    TRACKED = ".arete-sandbox/logs/tracked.txt"
+    merge_fixture = None
+
+    def setUp(self):
+        self.enterContext(mock.patch.object(util, "repo_lock", return_value=nullcontext()))
+
+    @classmethod
+    def create_merge(cls, root, tracked_changed_by="", tracked_added_by_base=False):
+        def git(*args, check=True):
+            subprocess.run(["git", *args], cwd=root, check=check, capture_output=True, text=True)
+
+        git("init", "-q", "-b", "main", "--template=")
+        git("config", "user.name", "Fixture")
+        git("config", "user.email", "fixture@example.test")
+        git("config", "commit.gpgsign", "false")
+        (root / ".gitignore").write_text(".arete-sandbox/\nignored.local\nproject/.arete-owned\nproject/private.local\n")
+        (root / "project").mkdir()
+        (root / "project/tracked.txt").write_text("untouched\n")
+        (root / "conflict.txt").write_text("original\n")
+        tracked = root / cls.TRACKED
+        if tracked_changed_by or tracked_added_by_base:
+            tracked.parent.mkdir(parents=True)
+            (root / ".arete-sandbox/.arete-owned").write_text(cls.MARKER)
+        if tracked_changed_by:
+            tracked.write_text("original tracked content\n")
+            git("add", "-f", "--", cls.TRACKED)
+        git("add", ".")
+        git("commit", "-qm", "original")
+        git("checkout", "-qb", "branch")
+        (root / "conflict.txt").write_text("branch\n")
+        (root / "supplemental.txt").write_text("branch addition\n")
+        if tracked_changed_by in ("branch", "both"):
+            tracked.write_text("branch content\n")
+        git("add", ".")
+        git("commit", "-qm", "branch change")
+        git("checkout", "-q", "main")
+        (root / "conflict.txt").write_text("base\n")
+        if tracked_changed_by in ("base", "both") or tracked_added_by_base:
+            tracked.write_text("base content\n")
+        if tracked_changed_by == "removed by base":
+            tracked.unlink()
+        if tracked_added_by_base:
+            (root / "incoming.txt").write_text("incoming addition\n")
+            git("add", "-f", "--", cls.TRACKED)
+            git("add", "--", "incoming.txt")
+        git("commit", "-qam", "base change")
+        git("checkout", "-q", "branch")
+        git("merge", "--no-commit", "main", check=False)
+
+    def merge(self, tracked_changed_by="", tracked_added_by_base=False):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        if self.merge_fixture is not None:
+            shutil.copytree(self.merge_fixture, self.root, dirs_exist_ok=True)
+        else:
+            self.create_merge(self.root, tracked_changed_by, tracked_added_by_base)
+        self.conflicts = [self.TRACKED, "conflict.txt"] if tracked_changed_by == "both" else ["conflict.txt"]
+        self.assertEqual(pipeline.unmerged_paths(self.root), self.conflicts)
+        self.checkout = workspace.Checkout("", "fixture/repo", self.root, self.root, "main",
+                                           base_commit=self.git("rev-parse", "main"))
+        self.layer = config.RepoLayer(self.root)
+        self.run = mock.Mock(repo=SimpleNamespace(name="repo"), sessions={}, owner_note="",
+                             settings=mock.Mock(return_value=SimpleNamespace(tries=1)))
+
+    def git(self, *args, check=True):
+        return util.git(list(args), self.root, check=check).strip()
+
+    def resolve(self, edit):
+        def agent(*args, **kwargs):
+            (self.root / "conflict.txt").write_text("branch and base\n")
+            edit()
+            return Result(ok=True, structured={"resolved": True})
+
+        self.run.agent.side_effect = agent
+        pipeline.resolve_conflicts(self.run, self.checkout, self.conflicts, self.layer,
+                                   tracker.Ticket("719", "#719", "Scratch exemption", "", ""))
+
+    def write_log(self):
+        log = self.root / self.LOG
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a") as out:
+            out.write("verification ran\n")
+
+    def assert_outside_conflict(self, edit, paths):
+        with self.assertRaises(workspace.RunFailed) as failed:
+            self.resolve(edit)
+        self.assertEqual(str(failed.exception), f"the resolver edited files outside the conflict in fixture/repo: {paths}")
+
+
+class SharedResolverScratchFixture(ResolverScratchFixture):
+    @classmethod
+    def setUpClass(cls):
+        cls.merge_fixture = Path(tempfile.mkdtemp())
+        cls.addClassCleanup(shutil.rmtree, cls.merge_fixture, ignore_errors=True)
+        cls.create_merge(cls.merge_fixture)
+
+
+class ResolverScratchTests(SharedResolverScratchFixture):
+    def test_wrapper_scratch_stays_out_of_merge(self):
+        self.merge()
+        scratch = self.root / ".arete-sandbox"
+        scratch.mkdir()
+        (scratch / ".gitignore").write_text("*\n")
+        (scratch / ".arete-owned").write_text(self.MARKER)
+        (self.root / "project/.arete-owned").write_text(self.MARKER.removesuffix("\n"))
+
+        def edit():
+            self.write_log()
+            (self.root / "project/untracked.txt").write_text("untracked scratch\n")
+            (self.root / "supplemental.txt").write_text("updated branch addition\n")
+
+        with mock.patch.object(pipeline, "git", wraps=pipeline.git) as git:
+            self.resolve(edit)
+        staged = [call.args[0] for call in git.call_args_list if call.args[0][0] == "add"]
+        self.assertEqual(staged, [["add", "-u", "--", "conflict.txt", "supplemental.txt"]])
+        self.assertEqual(len(self.git("rev-list", "--parents", "-n", "1", "HEAD").split()), 3)
+        self.assertEqual(self.git("show", "HEAD:conflict.txt"), "branch and base")
+        self.assertEqual(self.git("show", "HEAD:supplemental.txt"), "updated branch addition")
+        self.assertEqual(self.git("ls-tree", "-r", "--name-only", "HEAD", "--", ".arete-sandbox"), "")
+        self.assertEqual((self.root / self.LOG).read_text(), "verification ran\n")
+        self.assertEqual(workspace.untracked_files(self.root), {"project/untracked.txt"})
+
+    def test_invalid_scratch_markers_do_not_exempt_ignored_log_changes(self):
+        self.merge()
+        scratch = self.root / ".arete-sandbox"
+        marker = scratch / ".arete-owned"
+        (self.root / ".arete-owned").write_text(self.MARKER)
+        for kind in ("missing", "symlink", "wrong text", "blank line"):
+            with self.subTest(marker=kind):
+                marker.unlink(missing_ok=True)
+                self.write_log()
+                if kind == "symlink":
+                    marker.symlink_to("../.arete-owned")
+                elif kind == "wrong text":
+                    marker.write_text("someone else's scratch\n")
+                elif kind == "blank line":
+                    marker.write_text(self.MARKER + "\n")
+                self.assert_outside_conflict(self.write_log, self.LOG)
+
+    def test_scratch_exemption_preserves_other_path_checks(self):
+        self.merge()
+        folder = self.root / "project"
+        (folder / ".arete-owned").write_text(self.MARKER.removesuffix("\n"))
+        self.write_log()
+        (self.root / ".arete-sandbox/.arete-owned").write_text(self.MARKER)
+        (self.root / "ignored.local").write_text("ignored original\n")
+
+        def edit():
+            self.write_log()
+            (self.root / "ignored.local").write_text("ignored edit\n")
+            (folder / "private.local").write_text("scratch edit\n")
+            (folder / "tracked.txt").write_text("tracked edit\n")
+            (folder / "untracked.txt").write_text("untracked addition\n")
+            (self.root / "outside.txt").write_text("outside addition\n")
+
+        self.assert_outside_conflict(edit, "ignored.local, outside.txt, project/tracked.txt")
+
+    def test_resolving_without_the_wrapper_leaves_scratch_absent(self):
+        self.merge()
+        scratch = self.root / ".arete-sandbox"
+        self.assertFalse(scratch.exists())
+        self.resolve(lambda: None)
+        self.assertFalse(scratch.exists())
+
+    def test_first_use_keeps_existing_scratch_entry(self):
+        self.merge()
+        self.layer.allow_bash.append("sandbox *")
+        scratch = self.root / ".arete-sandbox"
+        scratch.symlink_to("missing", target_is_directory=True)
+        self.resolve(lambda: self.assertEqual(scratch.readlink(), Path("missing")))
+        self.assertFalse((self.root / "missing").exists())
+
+    def test_resolver_cannot_exempt_a_new_scratch_directory(self):
+        self.merge()
+        scratch = self.root / ".arete-sandbox"
+        self.assertFalse(scratch.exists())
+        for forged_marker in (False, True):
+            with self.subTest(forged_marker=forged_marker):
+                def edit():
+                    scratch.mkdir(exist_ok=True)
+                    (scratch / "unrelated.txt").write_text(f"outside edit {forged_marker}\n")
+                    if forged_marker:
+                        (scratch / ".arete-owned").write_text(self.MARKER)
+
+                expected = ".arete-sandbox/unrelated.txt"
+                if forged_marker:
+                    expected = ".arete-sandbox/.arete-owned, " + expected
+                self.assert_outside_conflict(edit, expected)
+
+    def test_unreadable_ignored_scratch_requires_a_still_valid_marker(self):
+        self.merge()
+        self.write_log()
+        marker = self.root / ".arete-sandbox/.arete-owned"
+        log = self.root / self.LOG
+        fingerprint = workspace.fingerprint
+
+        def fingerprint_file(path, salt):
+            if path == log:
+                raise PermissionError(path)
+            return fingerprint(path, salt)
+
+        for invalidate in (True, False):
+            with self.subTest(invalidate=invalidate):
+                marker.write_text(self.MARKER)
+
+                def edit():
+                    self.write_log()
+                    if invalidate:
+                        marker.unlink()
+
+                with mock.patch.object(workspace, "fingerprint", side_effect=fingerprint_file):
+                    if invalidate:
+                        self.assert_outside_conflict(edit, f".arete-sandbox/.arete-owned, {self.LOG}")
+                    else:
+                        self.resolve(edit)
+                        self.assertEqual(self.git("ls-tree", "-r", "--name-only", "HEAD", "--", self.LOG), "")
+
+    def test_invalidated_scratch_markers_do_not_exempt_ignored_log_changes(self):
+        self.merge()
+        self.write_log()
+        marker = self.root / ".arete-sandbox/.arete-owned"
+        for kind in ("missing", "symlink", "wrong text", "blank line", "replacement"):
+            with self.subTest(marker=kind):
+                marker.unlink(missing_ok=True)
+                marker.write_text(self.MARKER)
+                (marker.parent / "marker-source").write_text(self.MARKER)
+
+                def edit():
+                    self.write_log()
+                    if kind in ("missing", "symlink"):
+                        marker.unlink()
+                        if kind == "symlink":
+                            marker.symlink_to("marker-source")
+                    elif kind == "replacement":
+                        marker.with_name("marker-source").replace(marker)
+                    else:
+                        marker.write_text("wrong text\n" if kind == "wrong text" else self.MARKER + "\n")
+
+                expected = f".arete-sandbox/.arete-owned, {self.LOG}"
+                if kind == "replacement":
+                    expected += ", .arete-sandbox/marker-source"
+                self.assert_outside_conflict(edit, expected)
+
+    def test_resolver_cannot_make_an_ignored_path_scratch(self):
+        self.merge()
+        marker = self.root / "project/.arete-owned"
+        ignored = self.root / "project/private.local"
+        for initial in (None, "wrong text\n"):
+            with self.subTest(initial=initial):
+                if initial is not None:
+                    marker.write_text(initial)
+                ignored.write_text("original\n")
+
+                def edit():
+                    marker.write_text(self.MARKER)
+                    ignored.write_text("ignored edit\n")
+
+                self.assert_outside_conflict(edit, "project/.arete-owned, project/private.local")
+
+
+class TrackedResolverScratchTests(ResolverScratchFixture):
+    def test_incoming_tracked_addition_is_preserved(self):
+        self.merge(tracked_added_by_base=True)
+        staged = self.git("diff", "--cached", "--name-only", "--diff-filter=A").splitlines()
+        self.assertEqual(staged, [self.TRACKED, "incoming.txt"])
+        self.resolve(self.write_log)
+        self.assertEqual(self.git("show", f"HEAD:{self.TRACKED}"), "base content")
+        self.assertEqual(self.git("ls-tree", "-r", "--name-only", "HEAD", "--", self.LOG), "")
+        self.assertEqual(self.git("show", "HEAD:incoming.txt"), "incoming addition")
+        self.assertEqual(workspace.uncommitted(self.root), [])
+
+    def test_unrelated_tracked_scratch_edit_fails(self):
+        self.merge(tracked_changed_by="neither")
+        head = self.git("rev-parse", "HEAD")
+        tracked = self.root / self.TRACKED
+
+        def edit():
+            self.write_log()
+            tracked.write_text("unrelated edit\n")
+
+        self.assert_outside_conflict(edit, self.TRACKED)
+        self.assertEqual(tracked.read_text(), "unrelated edit\n")
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+
+    def test_tracked_supplemental_scratch_edit_reaches_the_merge_commit(self):
+        for parent in ("branch", "base"):
+            with self.subTest(parent=parent):
+                self.merge(tracked_changed_by=parent)
+
+                def edit():
+                    self.write_log()
+                    (self.root / self.TRACKED).write_text("adapted content\n")
+
+                with mock.patch.object(pipeline, "git", wraps=pipeline.git) as git:
+                    self.resolve(edit)
+                staged = [call.args[0] for call in git.call_args_list if call.args[0][0] == "add"]
+                self.assertEqual(staged, [["add", "-u", "--", "conflict.txt", self.TRACKED]])
+                self.assertEqual(self.git("show", f"HEAD:{self.TRACKED}"), "adapted content")
+                self.assertEqual(self.git("ls-tree", "-r", "--name-only", "HEAD", "--", self.LOG), "")
+                self.assertEqual((self.root / self.LOG).read_text(), "verification ran\n")
+                self.assertEqual(workspace.uncommitted(self.root), [])
+
+    def test_parent_tracked_path_under_logs_can_be_restored(self):
+        self.merge(tracked_changed_by="removed by base")
+        tracked = self.root / self.TRACKED
+        self.assertFalse(tracked.exists())
+
+        def edit():
+            self.write_log()
+            tracked.write_text("restored parent content\n")
+
+        self.resolve(edit)
+        self.assertEqual(self.git("show", f"HEAD:{self.TRACKED}"), "restored parent content")
+        self.assertEqual(self.git("ls-tree", "-r", "--name-only", "HEAD", "--", self.LOG), "")
+
+    def test_tracked_scratch_conflict_is_resolved(self):
+        self.merge(tracked_changed_by="both")
+
+        def edit():
+            self.write_log()
+            (self.root / self.TRACKED).write_text("resolved content\n")
+
+        self.resolve(edit)
+        self.assertEqual(self.git("show", f"HEAD:{self.TRACKED}"), "resolved content")
+        self.assertEqual(self.git("ls-tree", "-r", "--name-only", "HEAD", "--", self.LOG), "")
+        self.assertEqual(pipeline.unmerged_paths(self.root), [])
+
+    def test_tracked_scratch_conflict_respects_repository_deny(self):
+        self.merge(tracked_changed_by="both")
+        self.layer.deny.append(self.TRACKED)
+        with self.assertRaisesRegex(workspace.RunFailed, r"conflicts in protected paths"):
+            self.resolve(self.write_log)
+        self.run.agent.assert_not_called()
+
+
+class FirstUseResolverScratchTests(SharedResolverScratchFixture):
+    def test_first_use_initializes_scratch_for_trusted_wrapper(self):
+        self.merge()
+        scratch = self.root / ".arete-sandbox"
+        self.assertFalse(scratch.exists())
+        self.layer.allow_bash.append("sandbox *")
+
+        def edit():
+            self.assertEqual(stat.S_IMODE(scratch.stat().st_mode), 0o700)
+            self.assertEqual((scratch / ".arete-owned").read_text(), self.MARKER)
+            self.assertEqual((scratch / ".gitignore").read_text(), "*\n")
+            self.write_log()
+
+        self.resolve(edit)
+        self.assertEqual(self.git("show", "HEAD:conflict.txt"), "branch and base")
+        self.assertEqual(self.git("ls-tree", "-r", "--name-only", "HEAD", "--", ".arete-sandbox"), "")
+
+    def test_first_use_without_trusted_wrapper_rejects_scratch_write(self):
+        self.merge()
+        self.layer.allow_bash.extend(["echo sandbox *", "./sandbox *"])
+        scratch = self.root / ".arete-sandbox"
+        self.assertFalse(scratch.exists())
+
+        def edit():
+            self.assertFalse(scratch.exists())
+            self.write_log()
+
+        self.assert_outside_conflict(edit, self.LOG)
 
 
 class CatchUpRepairFixture(PublicationFixture):
@@ -2308,9 +3002,14 @@ class ServeStatusTests(unittest.TestCase):
         result = subprocess.run([str(installed), "status", *args], cwd=self.root,
                                 env=stack_env({**env, "PYTHONPATH": str(self.root), "PYTHONDONTWRITEBYTECODE": "1"}),
                                 capture_output=True, text=True, timeout=8)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
         self.assertIn("broken deployment fixture", result.stderr)
-        self.assertIn(f"running code {running}, checkout HEAD {checkout}", result.stdout)
+        self.assertIn(
+            f"last recorded serve heartbeat at 2026-11-21T00:00:00Z, running code {running}, checkout HEAD {checkout}",
+            result.stderr.splitlines(),
+        )
+        self.assertFalse((state_dir / "arete.db").exists())
 
     def test_installed_status_reads_revisions_when_candidate_common_raises(self):
         self.break_candidate_import("commands/common.py")
