@@ -2652,34 +2652,94 @@ def catch_up_path_spellings(paths: set[Path]) -> dict[Path, set[Path]]:
     return spellings
 
 
-def catch_up_path_matches(root: int, path: Path, spellings: dict[Path, set[Path]]) -> bool:
+def catch_up_path_matches(root: int, path: Path, spellings: dict[Path, set[Path]], *,
+                          include_exact: bool = True) -> bool:
     prior_paths = spellings.get(scratch.folded(path))
     if not prior_paths:
         return False
     if path in prior_paths:
-        return True
+        return include_exact
     with local_paths.directory_fd(path.parent, root) as parent:
         directory = os.fstat(parent)
         current = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
         for prior in prior_paths:
-            with suppress(FileNotFoundError, NotADirectoryError):
+            try:
                 with local_paths.directory_fd(prior.parent, root) as prior_parent:
-                    if not os.path.samestat(directory, os.fstat(prior_parent)):
-                        continue
-                previous = os.stat(prior.name, dir_fd=parent, follow_symlinks=False)
-                if not os.path.samestat(current, previous):
-                    continue
-                if (path.name == prior.name or stat.S_ISDIR(current.st_mode) or current.st_nlink == 1
-                        or not {path.name, prior.name}.issubset(os.listdir(parent))):
-                    return True
+                    previous = os.stat(prior.name, dir_fd=prior_parent, follow_symlinks=False)
+                    same_parent = os.path.samestat(directory, os.fstat(prior_parent))
+            except (FileNotFoundError, NotADirectoryError):
+                return True
+            if not same_parent or not os.path.samestat(current, previous):
+                continue
+            if (path.name == prior.name or stat.S_ISDIR(current.st_mode) or current.st_nlink == 1
+                    or not {path.name, prior.name}.issubset(os.listdir(parent))):
+                return True
     return False
 
 
+def catch_up_directory_spellings(before: set[str]) -> tuple[set[Path], dict[Path, set[Path]]]:
+    outer_dirs = {Path(name) for name in before if name.endswith("/")}
+    parents = {parent for name in before for parent in Path(name).parents if parent.parts}
+    return outer_dirs, catch_up_path_spellings(outer_dirs | parents)
+
+
+def catch_up_protected_parent(root: int, path: Path, outer_dirs: set[Path],
+                              existing_dirs: dict[Path, set[Path]]) -> bool:
+    return any(parent in outer_dirs or catch_up_path_matches(root, parent, existing_dirs, include_exact=False)
+               for parent in reversed(path.parents))
+
+
+def rollback_check_paths(run: AgentRun, wt: Path, before: set[str], after: set[str]) -> bool:
+    added = after - before
+    if not added:
+        return True
+    outer_dirs, existing_dirs = catch_up_directory_spellings(before)
+    existing_files = catch_up_path_spellings({Path(name) for name in before if not name.endswith("/")})
+    directories: dict[Path, str | None] = {}
+    restored = True
+    with local_paths.directory_fd(wt) as root:
+        for name in sorted(added):
+            path = Path(name)
+            try:
+                if catch_up_protected_parent(root, path, outer_dirs, existing_dirs):
+                    raise PermissionError("entry is inside a pre-existing directory")
+                with local_paths.directory_fd(path.parent, root) as parent:
+                    mode = os.stat(path.name, dir_fd=parent, follow_symlinks=False).st_mode
+                    if stat.S_ISDIR(mode):
+                        directories[path] = name
+                    else:
+                        if catch_up_path_matches(root, path, existing_files):
+                            raise PermissionError("file was present before the check under a different spelling")
+                        os.unlink(path.name, dir_fd=parent)
+                for ancestor in path.parents:
+                    if ancestor.parts:
+                        directories.setdefault(ancestor, None)
+            except FileNotFoundError:
+                continue
+            except Exception as failed:
+                restored = False
+                log_catch_up_failure(run, f"cleanup could not remove {name!r}", failed)
+        for path in sorted(directories, reverse=True):
+            record = directories[path]
+            try:
+                if catch_up_path_matches(root, path, existing_dirs):
+                    if record is not None:
+                        raise PermissionError("directory was present before the check")
+                    continue
+                with local_paths.directory_fd(path.parent, root) as parent:
+                    os.rmdir(path.name, dir_fd=parent)
+            except FileNotFoundError:
+                continue
+            except Exception as failed:
+                restored = False
+                name = record if record is not None else path.as_posix() + "/"
+                log_catch_up_failure(run, f"cleanup could not remove {name!r}", failed)
+    return restored
+
+
 def remove_catch_up_paths(run: AgentRun, wt: Path, before: set[str], after: set[str]) -> bool:
-    existing = {Path(name) for name in before}
+    outer_dirs, existing_dirs = catch_up_directory_spellings(before)
     files = catch_up_path_spellings({Path(name) for name in before if not name.endswith("/")})
-    directories = catch_up_path_spellings({Path(name) for name in before if name.endswith("/")})
-    existing_parents = catch_up_path_spellings({parent for path in existing for parent in path.parents if parent.parts})
     removed_all = True
     with local_paths.directory_fd(wt) as root:
         for name in sorted(after - before):
@@ -2688,13 +2748,13 @@ def remove_catch_up_paths(run: AgentRun, wt: Path, before: set[str], after: set[
                 if not path.parts or path.is_absolute() or ".." in path.parts:
                     raise PermissionError("path is not inside the worktree")
                 directory_record = name.endswith("/")
-                if (any(catch_up_path_matches(root, parent, directories) for parent in reversed(path.parents))
-                        or catch_up_path_matches(root, path, directories if directory_record else files)):
+                if (catch_up_protected_parent(root, path, outer_dirs, existing_dirs)
+                        or catch_up_path_matches(root, path, existing_dirs if directory_record else files)):
                     continue
                 with local_paths.directory_fd(path.parent, root) as parent:
                     mode = os.stat(path.name, dir_fd=parent, follow_symlinks=False).st_mode
                     is_directory = stat.S_ISDIR(mode)
-                    if is_directory and catch_up_path_matches(root, path, existing_parents):
+                    if is_directory and catch_up_path_matches(root, path, existing_dirs):
                         continue
                     if is_directory or (directory_record and not stat.S_ISLNK(mode)):
                         shutil.rmtree(path.name, dir_fd=parent)
@@ -2721,6 +2781,7 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
     checked, report, staged = b.checked, b.report, b.staged
     wt = c.wt.resolve()
     worktree_files = catch_up_paths(c.wt)
+    check_files = None
     blocked = run.owner_questions_blocked
     run.owner_questions_blocked = True
     try:
@@ -2731,8 +2792,10 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
         if workspace.uncommitted(c.wt):
             raise workspace.RunFailed("the worktree has uncommitted files after merging the moved base")
         b.require_valid_diff("catching up the moved base", from_base=True)
+        check_files = catch_up_paths(c.wt)
         if not b.check(staged=b.staged, defer_failed_cleanup=True):
             raise CatchUpGateHold("checks", "the layer's local checks failed", head, b.report)
+        check_files = None
         if not b.layer.verify:
             raise CatchUpGateHold("verify", "the layer has no behavioral verification configured", head, b.report)
         verified = check_in_use(b, goal, b.build_summary)
@@ -2764,7 +2827,11 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
                     tracked_restored = True
                 except Exception as failed:
                     log_catch_up_failure(run, "cleanup could not restore the worktree head", failed)
-                paths_restored = remove_catch_up_paths(run, wt, worktree_files, catch_up_paths(c.wt))
+                after = catch_up_paths(c.wt)
+                if check_files is None:
+                    paths_restored = remove_catch_up_paths(run, wt, worktree_files, after)
+                else:
+                    paths_restored = rollback_check_paths(run, wt, check_files, after)
         except Exception as failed:
             log_catch_up_failure(run, f"cleanup could not clean {str(wt)!r}", failed)
         if gate_hold:

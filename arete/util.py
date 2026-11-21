@@ -465,9 +465,6 @@ def git_records(args: list[str], cwd: Path, **kw) -> list[str]:
 
 
 def git_path_records(args: list[str], cwd: Path) -> list[str]:
-    records = git_records(args, cwd)
-    if not any("\ufffd" in record for record in records):
-        return records
     return [os.fsdecode(r) for r in git_bytes([args[0], "-z", *args[1:]], cwd).split(b"\0") if r]
 
 
