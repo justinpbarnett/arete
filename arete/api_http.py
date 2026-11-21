@@ -150,9 +150,16 @@ def etag(payload, kind, seq):
     return f'"{hashlib.sha256(key).hexdigest()}"'
 
 
+def board_etag(result):
+    sidebar = {k: v for k, v in result["sidebar"].items() if k != "now"}
+    sidebar["serve"] = {k: v for k, v in sidebar["serve"].items() if k != "age_seconds"}
+    payload = json_bytes({**result, "sidebar": sidebar})
+    return "W/" + etag(payload, "application/json", result["seq"])
+
+
 def matches_etag(headers, tag):
     value = ",".join(headers.get_all("If-None-Match", [])).strip()
-    return value == "*" or any(found == tag for found in ETAG.findall(value))
+    return value == "*" or tag.removeprefix("W/") in ETAG.findall(value)
 
 
 class RateLimits:

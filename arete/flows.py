@@ -73,14 +73,15 @@ def start(cfg: config.Config, run: pipeline.Run, earlier: dict, slot: slots.RunS
     ws = paths.WORKTREES_DIR / f"{run.repo.name}-{run.workspace_key}"
     continues = continues or (earlier["id"] if earlier.get("status") == "interrupted" and ran_on_seam(earlier["id"])
                               else "")
-    if continues and not only:
-        run.answers_due = asks_store.asks_due(sorted(factory.chain_runs(continues)))
     job = Job(cfg, run, ws, slot=slot, continues=continues, only=only)
+    catch_up = not only and run.path == "orchestrate" and pending_catch_up(continues)
+    if continues and not only and not catch_up:
+        run.answers_due = asks_store.asks_due(sorted(factory.chain_runs(continues)))
     refusal = guard(job, continues) if continues else ""
     renew = ""
     if refusal:
         job.note_task()
-    elif (continues and not only and not run.environment_release and kept_pending(job, continues)
+    elif (continues and not only and not catch_up and not run.environment_release and kept_pending(job, continues)
           and (moved := base_moved(continues))):
         if run.answers_due:
             job.moved_base = moved
@@ -118,6 +119,9 @@ def guard(job: Job, continues: str) -> str:
     from .store import orchestration
 
     if orchestration.publication_pending(continues):
+        if (job.run.path == "orchestrate" and not any((job.only, job.run.dry_run, job.run.action,
+                                                      job.run.environment_release)) and pending_catch_up(continues)):
+            return ""
         return "publication was interrupted; reconcile its branch/PR effects before resuming"
     if (getattr(job.run, "action", "") and not job.run.environment_release
             and (why := action_workspace_refusal(continues))):
@@ -153,6 +157,12 @@ def adaptive_state(run_id: str) -> dict:
     from .store import orchestration
 
     return orchestration.find(run_id).get("data", {})
+
+
+def pending_catch_up(run_id: str) -> dict:
+    from .store import orchestration
+
+    return orchestration.catch_up_push(adaptive_state(run_id))
 
 
 def prepared_data(continues: str) -> dict:
@@ -579,10 +589,23 @@ class Job:
         return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
     def accepts(self, name: str, outcome: Outcome, kw: dict) -> bool:
+        if name == "revise" and not self.only and not self.includes_feedback(outcome.data):
+            self.run.log(f"{name}: pending PR feedback was absent from the saved outcome; rerunning is required")
+            return False
         if (expected := self.policy(name, kw)) and outcome.data.get("policy") != expected:
             self.run.log(f"{name}: stored evidence used a different policy; rerunning is required")
             return False
         return True
+
+    def includes_feedback(self, data: dict) -> bool:
+        feedback = self.run.feedback
+        if not feedback:
+            return True
+        if "feedback_keys" in data:
+            known = {tuple(key) for key in data["feedback_keys"]}
+            return all(pipeline.feedback_key(row) in known for row in feedback)
+        return (all(row.get("status") != "new" for row in feedback)
+                and data.get("plan") == revision_plan(pipeline.feedback_markdown(feedback)))
 
     def keeps(self, name: str, kw: dict) -> bool:
         return any(c.onto for c in self.checkouts) and (
@@ -673,7 +696,8 @@ class Job:
         self.committed = bool(data.get("committed", True))
         if stored:
             for c in self.picked(self.changed):
-                c.lease = c.onto or util.git(["rev-parse", "HEAD"], c.wt).strip()
+                head = c.publication_baseline or c.onto or util.git(["rev-parse", "HEAD"], c.wt).strip()
+                c.note_pushed_head(head)
             if self.with_prs:
                 pipeline.note_prs(self.run, self.branch, self.with_prs)
 
@@ -729,14 +753,14 @@ class Job:
                         "published nothing")
         except RuntimeError as e:
             return f"arete could not check {branch} of {c.github} against origin: {util.first_line(str(e), 300)}"
-        c.lease = remote
+        c.note_pushed_head(remote)
         if head != c.revision:
             self.carried = True
         if head not in (remote, c.revision) and c.github not in self.pending:
             self.pending.append(c.github)
         return ""
 
-    def prepared(self, data: dict, stored: bool) -> None:
+    def prepared(self, data: dict, stored: bool, *, reconciling_catch_up: bool = False) -> None:
         run = self.run
         self.ticket = tracker.Ticket(**data["ticket"])
         self.branch, self.attachments, self.triage = data["branch"], data["attachments"], data["triage"]
@@ -753,16 +777,17 @@ class Job:
             if held := workspace.scratch_held(self.ws, self.checkouts):
                 raise workspace.scratch_failure(f"verification scratch at {held[0]} is still held; poll finalizes it "
                                                 "once its holders end, then run again", self.ws, held)
-            kept = workspace.kept_onto(self.ws, self.checkouts, self.branch)
-            if why := workspace.kept_work(self.ws, self.checkouts, run.repo.path, self.layer.copy):
-                raise workspace.worktree_failure(why, self.ws, self.branch)
-            for c in self.checkouts:
-                c.onto = kept.get(str(c.wt), "")
+            if not reconciling_catch_up:
+                kept = workspace.kept_onto(self.ws, self.checkouts, self.branch)
+                if why := workspace.kept_work(self.ws, self.checkouts, run.repo.path, self.layer.copy):
+                    raise workspace.worktree_failure(why, self.ws, self.branch)
+                for c in self.checkouts:
+                    c.onto = kept.get(str(c.wt), "")
         elif stored:
             for c in self.checkouts:
                 c.onto = ""
         run.workspace = self.ws, self.checkouts
-        if stored:
+        if stored and not reconciling_catch_up:
             runs = authors(self.continues)
             for c in self.checkouts:
                 if why := self.reclaim(c, *authority(self.continues, c, leases[c.github]), runs):
@@ -942,6 +967,10 @@ def patch(flow: factory.Flow, tree: str) -> Outcome:
     }, session=job.run.sessions.get(BUILD, NO_SESSION))
 
 
+def revision_plan(feedback: str) -> str:
+    return f"Revise the open PR for the owner's feedback:\n\n{feedback}"
+
+
 @factory.step("revise")
 def revision(flow: factory.Flow, tree: str) -> Outcome:
     job: Job = flow.ctx
@@ -959,9 +988,10 @@ def revision(flow: factory.Flow, tree: str) -> Outcome:
     if pipeline.stage(job.checkouts, diffguard.denied_paths(layer)).empty:
         return end_as("stop", "unchanged", summary=summary, replies=replies)
     return Outcome("pass", data={
-        "plan": f"Revise the open PR for the owner's feedback:\n\n{feedback}", "left_for_a_person": left,
+        "plan": revision_plan(feedback), "left_for_a_person": left,
         "goal": ("Check each change the owner's feedback asks for, and that what the issue asks for still works.\n\n"
                  + feedback),
+        "feedback_keys": [pipeline.feedback_key(row) for row in run.feedback],
         "summary": summary, "replies": replies, "story": run.story}, session=run.sessions.get(BUILD, NO_SESSION))
 
 
@@ -1203,7 +1233,7 @@ def settle_unpushed_checkouts(job: Job, before_push=None):
         head = util.git(["rev-parse", "HEAD"], c.wt).strip()
         remote = workspace.remote_head(c.src, job.branch)
         if remote == head:
-            c.lease = head
+            c.note_pushed_head(head)
         elif remote == c.lease and (not remote or ancestor(c.wt, remote, head)):
             unpushed.append(c)
         else:
@@ -1363,7 +1393,7 @@ def watch(flow: factory.Flow, tree: str) -> Outcome:
 
 
 @factory.step("publish")
-def publish(flow: factory.Flow) -> Outcome:
+def publish(flow: factory.Flow, merge: Callable[[list[workspace.Checkout]], dict | None] | None = None) -> Outcome:
     job: Job = flow.ctx
     run = job.run
     require_environment_owner_clear(job)
@@ -1375,6 +1405,8 @@ def publish(flow: factory.Flow) -> Outcome:
     opened, pushed, with_prs = job.picked(job.opened), job.picked(job.pushed), job.with_prs
     fresh = [c for c in opened if c.github not in job.found]
     run.enter("pr")
+    if merge and (failure := merge(publication_candidates(job, fresh))):
+        return Outcome("fail", feedback=failure["error"], data=failure)
     if run.feedback:
         pipeline.answer_feedback(run, job.replies, "Done in the latest push.")
         run.say(f"Revised for your review.\n\n{job.report_body}\n\nCI: {job.ci_result}.")
@@ -1385,11 +1417,16 @@ def publish(flow: factory.Flow) -> Outcome:
     else:
         run.say(f"PRs for this ticket:\n\n{pipeline.pr_status_lines(with_prs, opened, pushed)}\n\nCI: {job.ci_result}."
                 + pipeline.published_note(job.draft_why, job.verified, fresh, job.picked(job.drafted)))
-    standing = [c for c in job.picked(job.changed) if c not in fresh]
-    ready = pipeline.ready_pushed(run, standing, job.picked(job.ci_stopped), job.draft_why)
-    pipeline.automerge(job.b, job.approval, job.draft_why, job.verified, job.review, fresh + ready,
-                       pipeline.automerge_about(job.ticket, job.build_summary))
+    if not merge:
+        pipeline.automerge(job.b, job.approval, job.draft_why, job.verified, job.review,
+                           publication_candidates(job, fresh), pipeline.automerge_about(job.ticket, job.build_summary))
     return end_as("pass", "pr", summary=f"{job.summary}, CI: {job.ci_result}")
+
+
+def publication_candidates(job: Job, fresh: list[workspace.Checkout]) -> list[workspace.Checkout]:
+    standing = [c for c in job.picked(job.changed) if c not in fresh]
+    ready = pipeline.ready_pushed(job.run, standing, job.picked(job.ci_stopped), job.draft_why)
+    return fresh + ready
 
 
 @factory.step("respond")
@@ -1468,6 +1505,8 @@ def end_dry_run(flow: factory.Flow) -> tuple[str, str, str]:
 def driven(flow: factory.Flow, drive: Callable[[factory.Flow], tuple[str, str, str]]) -> tuple[str, str, str]:
     try:
         return drive(flow)
+    except pipeline.CatchUpPushUnconfirmed:
+        raise
     except workspace.RunFailed as e:
         if flow.ctx.run.environment_release:
             raise

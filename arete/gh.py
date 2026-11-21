@@ -412,8 +412,8 @@ def find_own_pr_comment(repo: str, number: int, *markers: str) -> dict | None:
     return next((row for marker in markers for row, lines in own if marker in lines), None)
 
 
-def pr_edit_comment(repo: str, comment_id: int, body: str) -> None:
-    payload = Outgoing(json.dumps({"body": outgoing(body, mark=True)}))
+def pr_edit_comment(repo: str, comment_id: int, body: str, *, key: str = "") -> None:
+    payload = Outgoing(json.dumps({"body": outgoing(body, mark=True, key=key)}))
     gh(["api", "-X", "PATCH", f"repos/{repo}/issues/comments/{comment_id}", "--input", "-"],
        input=payload, write=True)
 
@@ -569,6 +569,35 @@ def pr_draft_and_head(url: str) -> tuple[bool, str]:
 
 MERGE_WAIT_SECONDS = 120
 MERGE_POLL_SECONDS = 5
+MOVED_BASE_STATES = {"BEHIND", "DIRTY"}
+BASE_MERGE_REJECTION = r"(?:Pull Request is not mergeable|Base branch was modified\. Review and try the merge again)\.?"
+BASE_MERGE_HTTP_REJECTION = re.compile(rf"(?:^|: ){BASE_MERGE_REJECTION}\s*\(HTTP (?:405|409)\)$", re.IGNORECASE)
+
+
+class MovedBaseHold(str):
+    pass
+
+
+class BaseTipChanged(str):
+    pass
+
+
+def pr_merge_details(pr: str, repo: str = "", *, timeout: float = 120, retry: bool = True) -> dict:
+    fields = "state,isDraft,headRefOid,baseRefName,baseRefOid,mergeStateStatus,mergeable,title"
+    args = ["pr", "view", pr, "--json", fields]
+    if repo:
+        args += ["--repo", repo]
+    return gh_json(args, timeout=timeout, retry=retry) or {}
+
+
+def merge_ref_hold(row: dict, head: str, base: str) -> str:
+    if row.get("state") != "OPEN" or row.get("isDraft") is not False:
+        return "the PR is not open and ready for review"
+    if row.get("headRefOid") != head:
+        return "the PR head changed after verification"
+    if row.get("baseRefName") != base:
+        return "the PR base changed after verification"
+    return ""
 
 
 def merge_ci_passed(repo: str, head: str, *, required: dict | None = None) -> bool:
@@ -617,20 +646,20 @@ def _required_ci_refusal(repo: str, head: str, required: dict) -> str:
 
 
 def merge_readiness(repo: str, number: int, head: str, base: str, base_sha: str, *, wait: float = 0,
-                    required: dict | None = None) -> tuple[str, str]:
+                    required: dict | None = None, track_moved_base: bool = False) -> tuple[str, str]:
     if not head or not base or not base_sha:
         return "", "the checked head and base are not known"
     deadline = time.monotonic() + wait
-    fields = "state,isDraft,headRefOid,baseRefName,baseRefOid,mergeStateStatus,mergeable,title"
     while True:
-        row = gh_json(["pr", "view", str(number), "--repo", repo, "--json", fields]) or {}
-        if row.get("state") != "OPEN" or row.get("isDraft") is not False:
-            return "", "the PR is not open and ready for review"
-        if row.get("headRefOid") != head:
-            return "", "the PR head changed after verification"
-        if row.get("baseRefName") != base or row.get("baseRefOid") != base_sha:
-            return "", "the PR base changed after verification"
+        row = pr_merge_details(str(number), repo)
+        if hold := merge_ref_hold(row, head, base):
+            return "", hold
         state, mergeable = row.get("mergeStateStatus"), row.get("mergeable")
+        if track_moved_base and state in MOVED_BASE_STATES:
+            return "", MovedBaseHold(f"GitHub reports merge state {state}, mergeable {mergeable}")
+        if row.get("baseRefOid") != base_sha:
+            hold = "the PR base changed after verification"
+            return "", BaseTipChanged(hold) if track_moved_base else hold
         remaining = deadline - time.monotonic()
         if "UNKNOWN" not in (state, mergeable) or remaining <= 0:
             break
@@ -642,16 +671,45 @@ def merge_readiness(repo: str, number: int, head: str, base: str, base_sha: str,
     return str(row.get("title") or "").strip(), ""
 
 
-def pr_merge_auto(repo: str, number: int, head: str, base: str, base_sha: str) -> str:
-    subject, hold = merge_readiness(repo, number, head, base, base_sha)
+def merge_rejection_hold(repo: str, number: int, head: str, base: str, base_sha: str) -> str:
+    row = pr_merge_details(str(number), repo)
+    if hold := merge_ref_hold(row, head, base):
+        return hold
+    if row.get("baseRefOid") and row["baseRefOid"] != base_sha:
+        return BaseTipChanged("GitHub rejected the merge after the PR base changed")
+    return ""
+
+
+def pr_merge_auto(repo: str, number: int, head: str, base: str, base_sha: str, *, track_moved_base: bool = False) -> str:
+    subject, hold = merge_readiness(repo, number, head, base, base_sha, track_moved_base=track_moved_base)
     if hold:
         return hold
     payload = {"sha": head, "merge_method": "squash"}
     if subject:
         payload["commit_title"] = f"{subject} (#{number})"
-    result = json.loads(gh(["api", "-X", "PUT", f"repos/{repo}/pulls/{number}/merge", "--input", "-"],
-                           input=Outgoing(json.dumps(payload)), write=True) or "{}")
-    return "" if result.get("merged") is True else "GitHub did not confirm the merge"
+    try:
+        reply = gh(["api", "-X", "PUT", f"repos/{repo}/pulls/{number}/merge", "--input", "-"],
+                   input=Outgoing(json.dumps(payload)), write=True)
+    except GhError as error:
+        if track_moved_base and not isinstance(error, GhUnsure) and BASE_MERGE_HTTP_REJECTION.search(str(error)):
+            if hold := merge_rejection_hold(repo, number, head, base, base_sha):
+                return hold
+        raise
+    if not track_moved_base:
+        result = json.loads(reply or "{}")
+        return "" if result.get("merged") is True else "GitHub did not confirm the merge"
+    try:
+        result = json.loads(reply)
+    except ValueError:
+        raise GhUnsure("GitHub did not return a definite merge outcome") from None
+    if not isinstance(result, dict) or type(result.get("merged")) is not bool:
+        raise GhUnsure("GitHub did not return a definite merge outcome")
+    if result["merged"]:
+        return ""
+    if re.fullmatch(BASE_MERGE_REJECTION, str(result.get("message", "")).strip(), re.IGNORECASE):
+        if hold := merge_rejection_hold(repo, number, head, base, base_sha):
+            return hold
+    return "GitHub rejected the merge"
 
 
 def default_branch(repo: str, *, fallback: str = "main", timeout: float = 120, retry: bool = True) -> str:
@@ -754,6 +812,7 @@ def repo_private(repo: str) -> bool | None:
 
 PASSING_CONCLUSIONS = {"success", "neutral"}
 STATUS_STATES = {"success": "pass", "pending": "pending", "failure": "fail", "error": "fail"}
+CheckKey = tuple[str, str]
 
 
 @dataclass
@@ -765,6 +824,11 @@ class Check:
     job: int = 0
     description: str = ""
     check_run_id: int = 0
+    source: str = "status"
+
+    @property
+    def key(self) -> CheckKey:
+        return self.source, self.name
 
 
 def check_from_run(row: dict) -> Check:
@@ -774,10 +838,12 @@ def check_from_run(row: dict) -> Check:
         state = "skipped"
     else:
         state = "pass" if row.get("conclusion") in PASSING_CONCLUSIONS else "fail"
-    actions = (row.get("app") or {}).get("slug") == "github-actions"
+    app = row.get("app") or {}
+    actions = app.get("slug") == "github-actions"
     return Check(row["name"], state, row.get("completed_at") or row.get("started_at") or "",
                  row.get("html_url") or row.get("details_url") or "", row["id"] if actions else 0,
-                 ((row.get("output") or {}).get("title") or "").strip(), row["id"])
+                 ((row.get("output") or {}).get("title") or "").strip(), row["id"],
+                 f"app:{app.get('id') or app.get('slug') or ''}")
 
 
 def check_from_status(row: dict) -> Check:
@@ -785,14 +851,22 @@ def check_from_status(row: dict) -> Check:
                  row.get("target_url") or "", 0, (row.get("description") or "").strip())
 
 
-def commit_checks(repo: str, ref: str) -> dict[str, Check]:
-    pages = gh_json(["api", f"repos/{repo}/commits/{ref}/check-runs?per_page=100", "--paginate", "--slurp"]) or []
-    runs = sorted((check_from_run(r) for page in pages for r in page.get("check_runs", [])), key=lambda c: c.check_run_id)
-    statuses = (gh_json(["api", f"repos/{repo}/commits/{ref}/status?per_page=100"]) or {}).get("statuses", [])
-    newest: dict[str, Check] = {c.name: c for c in runs}
-    for c in map(check_from_status, statuses):
-        if c.name not in newest or c.updated > newest[c.name].updated:
-            newest[c.name] = c
+def commit_checks(repo: str, ref: str, *, timeout: float = 120, retry: bool = True) -> dict[CheckKey, Check]:
+    path = f"repos/{repo}/commits/{ref}"
+    pages = gh_json(["api", f"{path}/check-runs?filter=all&per_page=100", "--paginate", "--slurp"],
+                    timeout=timeout, retry=retry)
+    if not isinstance(pages, list) or not pages or any(
+            not isinstance(page, dict) or not isinstance(page.get("check_runs"), list) for page in pages):
+        raise GhError("GitHub did not return check runs")
+    runs = sorted((check_from_run(r) for page in pages for r in page["check_runs"]), key=lambda c: c.check_run_id)
+    statuses = gh_json(["api", f"{path}/statuses?per_page=100", "--paginate", "--slurp"], timeout=timeout, retry=retry)
+    if not isinstance(statuses, list) or not statuses or any(
+            not isinstance(page, list) for page in statuses):
+        raise GhError("GitHub did not return commit statuses")
+    newest = {c.key: c for c in runs}
+    # GitHub returns commit statuses in reverse chronological order.
+    for c in (check_from_status(row) for page in statuses for row in page):
+        newest.setdefault(c.key, c)
     return newest
 
 

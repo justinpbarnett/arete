@@ -20,6 +20,7 @@ from .agent import (
     credit_limit,
     json_from_text,
     model_scope,
+    overload_limit,
     provider_reset,
     rate_limit_type,
     streamed_turn,
@@ -307,7 +308,7 @@ def usage_limit(data: dict | list | str, text: str, model: str = "") -> UsageLim
     model_only = bool(re.search(r"\bmodel[_ ]requires[_ ]usage[_ ]credits\b|"
                                 r"(?:^|\n)You've reached your Fable limit\. Switch to another model", text, re.IGNORECASE))
     if not model_only and "usage_limit_reached" not in text and not USAGE_LIMIT_TEXT.search(text):
-        return None
+        return overload_limit(text, model)
     legacy = LEGACY_LIMIT_RESET.search(text)
     resets = provider_reset(data) or provider_reset(text)
     if resets is None and legacy:
