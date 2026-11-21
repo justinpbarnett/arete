@@ -738,6 +738,14 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
             kw["stored_values"] = [*(kw.get("stored_values") or ()), api_key]
     hook = ()
     kw.pop("verification_attempt", None)
+    skill_plugin = kw.pop("skill_plugin", None)
+    allowed = kw.get("allowed_tools") or []
+    if (skill_plugin and which == "claude" and not target.remote and "user" in kw["instructions"]
+            and kw.get("tools") is None and "Read" in allowed):
+        kw["skill_plugin"] = skill_plugin
+        kw["allowed_tools"] = list(dict.fromkeys([*allowed, "Skill", f"Read(/{skill_plugin}/skills/**)"]))
+        browser.with_note(kw, f"For a repository skill requested by this eval, call the Skill tool with "
+                             f"`{claude.EVAL_SKILL_PLUGIN}:<skill-name>` to use this eval's version.")
     if trip.scratch:
         kw, hook = browser.confine(kw, trip.scratch, which, bool(target.remote), say)
     if asking and hook:
@@ -985,7 +993,7 @@ def local_claude(kw: dict, cfg: config.Config, run_id: str, ask_jev: bool, say: 
                  closed_context: tuple[Path, ...] = ()) -> dict:
     kw = {**kw, "extra_env": {**(kw.get("extra_env") or {}), **run_env(run_id)}}
     if guard.wanted(kw.get("tools")):
-        kw["settings"] = guard.settings(cfg.jev.guard, floor.open)
+        kw["settings"] = guard.settings(cfg.jev.guard, floor.open, skill_plugin=kw.get("skill_plugin"))
         if closed_context:
             for group in kw["settings"]["hooks"]["PreToolUse"]:
                 for hook in group["hooks"]:

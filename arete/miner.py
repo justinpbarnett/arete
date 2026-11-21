@@ -637,15 +637,29 @@ def judge_prompts(cfg: config.Config, run_id: str, repo: config.Repo, pr: MinerP
 
 
 def decides_repo(cfg: config.Config, repo: config.Repo) -> bool:
-    return (repo.name == cfg.arete_repo and repo.name != cfg.global_repo and bool(repo.github)
+    return (repo.name in (cfg.arete_repo, cfg.global_repo) and bool(repo.github)
             and config.load_layer(repo.layer_dir).trust_level == "automerge")
 
 
-def pr_action_refusal(cfg: config.Config, repo: config.Repo, url: str, pr: MinerPR, changed: str) -> str:
+def pr_action_refusal(cfg: config.Config, repo: config.Repo, url: str, pr: MinerPR, changed: str, *,
+                      require_automerge: bool = True) -> str:
     if miner_pr(repo, url, pr.base) != pr:
         return changed
-    if not decides_repo(cfg, repo):
+    if require_automerge and not decides_repo(cfg, repo):
         return "repository trust no longer permits automatic miner PR actions"
+    return ""
+
+
+def label_for_review(cfg: config.Config, repo: config.Repo, url: str, pr: MinerPR, *,
+                     require_automerge: bool = True) -> str:
+    changed = "the PR changed before it could be labeled"
+    if refusal := pr_action_refusal(cfg, repo, url, pr, changed, require_automerge=require_automerge):
+        return refusal
+    if problem := gh.ensure_label(repo.github, REVIEW_LABEL, description="Miner PR needs human review", restyle=False):
+        raise gh.GhError(problem)
+    if refusal := pr_action_refusal(cfg, repo, url, pr, changed, require_automerge=require_automerge):
+        return refusal
+    gh.pr_add_label(url, REVIEW_LABEL)
     return ""
 
 
@@ -681,9 +695,10 @@ def post_eval_feedback(cfg: config.Config, repo: config.Repo, url: str, pr: Mine
 
 
 def decide_pr(cfg: config.Config, run_id: str, repo: config.Repo, url: str, *, published_head: str = "") -> str:
-    eligible = decides_repo(cfg, repo)
+    global_repo = repo.name == cfg.global_repo
+    eligible = not global_repo and decides_repo(cfg, repo)
     outside = "the repository is outside the miner's automatic decision scope"
-    if not eligible and (not published_head or repo.name == cfg.global_repo or not repo.github):
+    if not repo.github or not (eligible or published_head or global_repo):
         return outside
     base = gh.default_branch(repo.github)
     pr = miner_pr(repo, url, base)
@@ -693,17 +708,32 @@ def decide_pr(cfg: config.Config, run_id: str, repo: config.Repo, url: str, *, p
         return "the PR does not show the head just pushed"
     if pr.needs_review and not published_head:
         return "the PR is awaiting human review"
-    if not eligible:
+    if not eligible and not global_repo:
         eval_pr(cfg, repo, url, pr)
         return outside
     fork = pr_fork(repo, pr)
     if not fork:
         return "the PR head and current base could not be confirmed"
     diff = diffguard.between(repo.path, fork, pr.head, deny=diffguard.ALWAYS_DENY, moves=True)
-    if len(diff.files) != 1 or Path(diff.files[0]).parent.as_posix() != evals.ARETE_PROMPTS:
-        if published_head:
+    if global_repo and GLOBAL_RULES in diff.files:
+        if pr.needs_review:
+            return "the PR is awaiting human review"
+        return (label_for_review(cfg, repo, url, pr, require_automerge=False)
+                or f"{GLOBAL_RULES} requires owner approval")
+    if global_repo:
+        if not decides_repo(cfg, repo):
+            return outside
+        harness = diff.files
+        in_scope = bool(harness) and all(f.startswith("skills/") for f in harness)
+    else:
+        prompts = [f for f in diff.files if Path(f).parent.as_posix() == evals.ARETE_PROMPTS and f.endswith(".md")]
+        harness = [f for f in diff.files if f not in prompts]
+        in_scope = (len(prompts) == 1 and not harness) or (bool(prompts and harness) and all(
+            util.matches_any(f, evals.harness_globs()) and is_harness_file(cfg, repo, f) for f in harness))
+    if not in_scope:
+        if published_head and not global_repo:
             eval_pr(cfg, repo, url, pr, fork, require_automerge=True)
-        return "the PR is outside the miner's single-prompt scope"
+        return "the PR changes files outside the miner's automatic decision scope"
     if pr.needs_review:
         return "the PR is awaiting human review"
     if refusal := harness_diff_refusal(cfg, repo, diff) or prompt_refusal(cfg, repo, repo.path, fork, pr.head):
@@ -713,15 +743,26 @@ def decide_pr(cfg: config.Config, run_id: str, repo: config.Repo, url: str, *, p
             return refusal
         gh.pr_update_branch(repo.github, pr.number, pr.head)
         return "branch update requested"
-    report = evals.compare_prompts(cfg, repo, pr.base_sha, pr.head)
+    if global_repo:
+        report = evals.compare_harness(cfg, repo, pr.base_sha, pr.head, harness)
+    elif harness:
+        report = evals.compare_prompts(cfg, repo, pr.base_sha, pr.head, harness=harness)
+    else:
+        report = evals.compare_prompts(cfg, repo, pr.base_sha, pr.head)
     if refusal := pr_action_refusal(cfg, repo, url, pr, "the PR changed during evals"):
         return refusal
-    ci_passed = gh.actions_check_passed(repo.github, pr.head, MINER_CHECK)
+    if global_repo:
+        required = config.load_layer(repo.layer_dir).required_check
+        ci_passed = gh.merge_ci_passed(repo.github, pr.head, required=required)
+        check = required["context"] if required else "repository CI"
+    else:
+        ci_passed = gh.actions_check_passed(repo.github, pr.head, MINER_CHECK)
+        check = MINER_CHECK
     if refusal := pr_action_refusal(cfg, repo, url, pr, "the PR changed during the CI check"):
         return refusal
     if not ci_passed:
         return (post_eval_feedback(cfg, repo, url, pr, report)
-                or "the PR head does not have a passing arete-checks result")
+                or f"the PR head does not have a passing {check} result")
     if report.regressions:
         closing = f"Closing because {', '.join(report.regressions)} passed on the base and now fail."
         if refusal := post_eval_feedback(cfg, repo, url, pr, report, closing=closing):
@@ -731,8 +772,6 @@ def decide_pr(cfg: config.Config, run_id: str, repo: config.Repo, url: str, *, p
         gh.pr_close(url)
         approvals_store.set_proposal_status_by_pr(url, "rejected")
         return "closed for an eval regression"
-    if not report.complete:
-        return post_eval_feedback(cfg, repo, url, pr, report) or "the eval comparison is incomplete"
     if report.unmeasured:
         approved, answer = judge_prompts(cfg, run_id, repo, pr, report.unmeasured)
         if approved is None:
@@ -742,17 +781,13 @@ def decide_pr(cfg: config.Config, run_id: str, repo: config.Repo, url: str, *, p
         if refusal := post_eval_feedback(cfg, repo, url, pr, report, answer=answer):
             return refusal
         if approved is False:
-            changed = "the PR changed before it could be labeled"
-            if refusal := pr_action_refusal(cfg, repo, url, pr, changed):
-                return refusal
-            if problem := gh.ensure_label(repo.github, REVIEW_LABEL, description="Miner PR needs human review", restyle=False):
-                raise gh.GhError(problem)
-            if refusal := pr_action_refusal(cfg, repo, url, pr, changed):
-                return refusal
-            gh.pr_add_label(url, REVIEW_LABEL)
-            return answer
+            return label_for_review(cfg, repo, url, pr) or answer
     elif refusal := post_eval_feedback(cfg, repo, url, pr, report):
         return refusal
+    if not report.complete:
+        return "the eval comparison is incomplete"
+    if report.unconfirmed_skills:
+        return label_for_review(cfg, repo, url, pr) or "candidate skill invocation is unconfirmed"
     if refusal := pr_action_refusal(cfg, repo, url, pr, "the PR changed before it could be merged"):
         return refusal
     gh.pr_squash(repo.github, pr.number, pr.head)
@@ -773,7 +808,7 @@ def settle_pr(cfg: config.Config, run_id: str, repo: config.Repo, url: str, fail
 def settle_open_prs(cfg: config.Config, run_id: str, repos: list[config.Repo], failures: list[str],
                    attempted: set[str]) -> None:
     for repo in repos:
-        if not decides_repo(cfg, repo):
+        if not repo.github or (repo.name != cfg.global_repo and not decides_repo(cfg, repo)):
             continue
         try:
             urls = gh.open_labeled_pr_urls(repo.github, MINER_LABEL)
@@ -924,8 +959,8 @@ def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[d
             ev = ", ".join(p.get("evidence", [])[:4])
             body.append(f"{i}. `{p['file']}`: {p['why']}" + (f" (evidence {ev})" if keep_evidence else ""))
         body += ["", f"Run `{run_id}`. {res.text.strip()[:1500]}", "",
-                 "The miner can decide a single Arete prompt change using CI and evals. "
-                 "Merge other changes that help and close those that do not.",
+                 "The miner uses CI and evals to decide eligible Arete prompt changes and global skill changes. "
+                 "Other changes go to human review.",
                  "Closed PRs teach the miner what to avoid proposing again."]
         gh.ensure_label(repo.github, MINER_LABEL, "1d76db", "Harness fixes mined by arete")
         existing = gh.prs(repo.github, label=MINER_LABEL, state="open")

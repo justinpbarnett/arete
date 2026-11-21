@@ -50,6 +50,7 @@ def backups_dir() -> Path:
 
 
 RUNS_DIR = STATE_DIR / "runs"
+EVAL_SKILLS_DIR = STATE_DIR / "eval-skills"
 WORKTREES_DIR = Path(os.environ.get("ARETE_WORKTREES_DIR", HOME / "Library" / "Developer" / "arete" / "worktrees"
                                     if ON_MAC and not ISOLATED else STATE_DIR / "worktrees"))
 HEARTBEAT_FILE = STATE_DIR / "heartbeat.json"

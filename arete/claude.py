@@ -39,6 +39,7 @@ EVERY_MODEL = "claude"
 LIMIT_SLACK_SECONDS = 60
 LIMIT_RECHECK_SECONDS = 1800
 SETTING_SOURCES = {"user": ("user",), "repo": ("project", "local")}
+EVAL_SKILL_PLUGIN = "arete-eval"
 
 
 def binary() -> str:
@@ -77,6 +78,7 @@ def command(
     remote: devices.Device | None = None,
     settings: dict | None = None,
     instructions: list[str] | None = None,
+    skill_plugin: Path | None = None,
 ) -> list[str]:
     add_dirs = [Path(d).absolute() for d in add_dirs or []]
     cmd = ["claude" if remote else binary(), "-p", "--output-format", "stream-json", "--verbose",
@@ -107,6 +109,8 @@ def command(
         cmd += ["--max-budget-usd", str(max_budget_usd)]
     if not persist:
         cmd += ["--no-session-persistence"]
+    if skill_plugin:
+        cmd += ["--plugin-dir", str(skill_plugin)]
     if add_dirs:
         cmd += ["--add-dir", *map(str, add_dirs)]
     cmd += ["--strict-mcp-config", "--mcp-config", mcp_config or NO_MCP_SERVERS]
@@ -181,13 +185,14 @@ def _run(
     auth: accounts.Auth | None = None,
     api_key: str = "",
     leaf: str = "",
+    skill_plugin: Path | None = None,
 ) -> Result:
     fresh_session = "" if resume.id or not persist else str(uuid.uuid4())
     cmd = command(cwd, model=model, effort=effort, tools=tools, allowed_tools=allowed_tools,
                   disallowed_tools=disallowed_tools, permission_mode=permission_mode, json_schema=json_schema,
                   resume=resume, fresh_session=fresh_session, system=system, max_budget_usd=max_budget_usd,
                   persist=persist, add_dirs=add_dirs, mcp_config=mcp_config, remote=remote, settings=settings,
-                  instructions=instructions)
+                  instructions=instructions, skill_plugin=skill_plugin)
     if remote:
         extra = {k: v for k, v in (extra_env or {}).items() if k not in PARENT_SESSION_VARS}
         env = {**AGENT_SETS, **extra}
