@@ -16,7 +16,7 @@ from pathlib import Path
 
 from . import accounts, browser, child, claude, config, environment, guard, paths, sandbox, uploads, util
 from . import scratch as verification_scratch
-from .agent import NO_SESSION, Result, Session, UsageLimit, credit_limit, json_from_text
+from .agent import NO_SESSION, Result, Session, UsageLimit, credit_limit, json_from_text, overload_limit
 from .pi import SCHEMA_RULE
 
 LIMIT_SCOPE = "codex"
@@ -650,7 +650,7 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
         error=error,
         connection_failed=not ok and util.is_network_error(error),
         usage_limit=None if ok else (credit_limit([*diagnostics, proc.stderr]) if provider == KEY_PROVIDER else
-                                    usage_limit("\n".join([*failures, proc.stderr]))),
+                                    usage_limit("\n".join([*failures, proc.stderr]), model)),
         raw={"usage": usage, "thread_id": thread},
         tokens_in=usage.get("input_tokens", 0),
         tokens_out=usage.get("output_tokens", 0),
@@ -662,9 +662,9 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
     )
 
 
-def usage_limit(text: str) -> UsageLimit | None:
+def usage_limit(text: str, model: str = "") -> UsageLimit | None:
     if not USAGE_LIMIT_TEXT.search(text):
-        return None
+        return overload_limit(text, model)
     soonest = util.now() + timedelta(seconds=claude.LIMIT_SLACK_SECONDS)
     resets = reset_time(text)
     until = (max(soonest, resets + timedelta(seconds=claude.LIMIT_SLACK_SECONDS)) if resets

@@ -3188,15 +3188,16 @@ def _review(b: Build, plan: str, verified: verify.Verified, step: str = "review"
             reply: str = "") -> Review:
     before = before or Review.stored({})
     earlier = before.blocking()
-    res = b.run.agent(step, b.brief.prompt(
+    text = b.brief.prompt(
         "review", plan=plan, checks=b.report, evidence=verified.markdown(), compare=compare_with_fork(b.checkouts),
         diff=util.tail(diffguard.fold_moved(b.staged.patch), MAX_DIFF_IN_PROMPT),
-        earlier=earlier_review(earlier, reply, fixed_since(b, before.trees or {}))),
-                      b.ws, role="review", allowed_tools=prompt_loader.bash_rules(b.read_bash),
-                      json_schema=REVIEW_SCHEMA)
-    if not res.ok or not isinstance(res.structured, dict) or not isinstance(res.structured.get("problems"), list):
-        return Review.failed_step(earlier, before.waived or [], before.trees or {})
-    return Review.judged(res.structured, earlier, before.waived or [], index_trees(b.checkouts))
+        earlier=earlier_review(earlier, reply, fixed_since(b, before.trees or {})))
+    allowed_tools = prompt_loader.bash_rules(b.read_bash)
+    for _ in range(2):
+        res = b.run.agent(step, text, b.ws, role="review", allowed_tools=allowed_tools, json_schema=REVIEW_SCHEMA)
+        if res.ok and isinstance(res.structured, dict) and isinstance(res.structured.get("problems"), list):
+            return Review.judged(res.structured, earlier, before.waived or [], index_trees(b.checkouts))
+    return Review.failed_step(earlier, before.waived or [], before.trees or {})
 
 
 def earlier_review(earlier: list[dict], reply: str, fixed: str) -> str:
