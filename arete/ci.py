@@ -16,6 +16,7 @@ POLL_SECONDS = 30
 CONFLICT_SNAPSHOT_TIMEOUT = 5
 LOG_EXCERPT_CHARS = 8000
 TIMEOUT_EXCERPT_CHARS = 6000
+MIN_TIMEOUT_REPORT_CHARS = 160
 LOG_TIMESTAMP = re.compile(r"^\d{4}-\d\d-\d\dT[\d:.]+Z ", re.MULTILINE)
 TEST_TIMEOUT = re.compile(rf"^{re.escape(_test_stacks.REPORT_START)}\r?\n(.*?)\r?\n"
                           rf"^{re.escape(_test_stacks.REPORT_END)}\r?$", re.DOTALL | re.MULTILINE)
@@ -255,13 +256,49 @@ def clip(text: str, max_chars: int) -> str:
     return cut.rsplit(" ", 1)[0] + " (cut)"
 
 
-def timeout_excerpt(report: str) -> str:
+def timeout_excerpt(report: str, limit: int) -> str:
     identity, *stacks = PYTHON_STACK.split(report)
-    lines = [identity.rstrip()]
+    sections = [util.both_ends(identity.rstrip(), limit)]
+    remaining = limit - len(sections[0])
+    traces = []
     for heading, stack in zip(stacks[::2], stacks[1::2], strict=True):
         thread = stack.replace("\r\n", "\n").partition("\n\n")[0]
-        lines.extend([heading, *(util.both_ends(line, 220) for line in thread.splitlines()[:7])])
-    return "\n".join(lines)
+        frames = [line for line in thread.splitlines() if line.startswith("  File ")][:6]
+        if frames:
+            traces.append((heading, frames))
+    traces = traces[:max(1, remaining // 140)]
+    for index, (heading, frames) in enumerate(traces):
+        room = remaining // (len(traces) - index) - len(heading) - 2
+        if room < 8:
+            break
+        preview = [util.both_ends(frames[0], min(room, 220))]
+        room -= len(preview[0])
+        for frame in frames[1:]:
+            frame = util.both_ends(frame, 220)
+            if len(frame) + 1 > room:
+                break
+            preview.append(frame)
+            room -= len(frame) + 1
+        sections.append("\n".join([heading, *preview]))
+        remaining -= len(sections[-1]) + 1
+    return "\n".join(sections)
+
+
+def timeout_summary(reports: list[str]) -> str:
+    summaries = [timeout_excerpt(report, TIMEOUT_EXCERPT_CHARS) for report in reports]
+    summary = "\n\n".join(summaries)
+    if len(summary) <= TIMEOUT_EXCERPT_CHARS:
+        return summary
+    start = max(0, len(reports) - TIMEOUT_EXCERPT_CHARS // MIN_TIMEOUT_REPORT_CHARS)
+    notice = f"... {start} earlier timeout reports omitted\n\n" if start else ""
+    remaining = TIMEOUT_EXCERPT_CHARS - len(notice) - 2 * (len(reports) - start - 1)
+    by_size = sorted(range(start, len(reports)), key=lambda index: len(summaries[index]))
+    for count, index in enumerate(by_size):
+        limit = remaining // (len(by_size) - count)
+        if len(summaries[index]) > limit:
+            summaries[index] = timeout_excerpt(reports[index], limit)
+        remaining -= len(summaries[index])
+    return notice + "\n\n".join(summaries[start:])
 
 
 def excerpt(log_text: str) -> str:
@@ -275,12 +312,15 @@ def excerpt(log_text: str) -> str:
     if len(text) <= LOG_EXCERPT_CHARS:
         return text
     if reports := TEST_TIMEOUT.findall(text):
-        summary = "\n\n".join(map(timeout_excerpt, reports))
-        if len(summary) > TIMEOUT_EXCERPT_CHARS:
-            summary = summary[:TIMEOUT_EXCERPT_CHARS - 4].rsplit("\n", 1)[0] + "\n..."
-        remaining = LOG_EXCERPT_CHARS - len(summary) - 6
-        return summary + "\n\n" + util.tail(TEST_TIMEOUT.sub("", text).strip(), remaining)
-    return util.tail(text, LOG_EXCERPT_CHARS)
+        summary = timeout_summary(reports)
+        remaining = LOG_EXCERPT_CHARS - len(summary) - 2
+        tail = TEST_TIMEOUT.sub("", text).strip()
+        if last_error >= 0 and len(text) - last_error > remaining:
+            tail = util.both_ends(text[last_error:], remaining)
+        elif len(tail) > remaining:
+            tail = util.tail(tail, remaining - len("...\n"))
+        return "\n\n".join(filter(None, (summary, tail)))
+    return util.tail(text, LOG_EXCERPT_CHARS - len("...\n"))
 
 
 def section(rounds: list[Round], max_rounds: int, ending: str = "") -> str:

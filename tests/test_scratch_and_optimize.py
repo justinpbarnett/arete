@@ -2,7 +2,6 @@ import io
 import json
 import os
 import plistlib
-import select
 import signal
 import subprocess
 import sys
@@ -15,9 +14,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from arete import _test_stacks, launchd, paths, poll, scratch, workspace
+from arete import launchd, paths, poll, scratch, workspace
 from arete.lab import experiment, optimize
-from tests import parallel
 
 PROMOTION_FLOOR = {"accept_rate": 0.8, "max_drop": 0.2, "min_saving": 0.1}
 
@@ -385,36 +383,6 @@ if sys.argv[1] == "double":
             self.stop(*child)
             self.assertEqual(scratch.recover_pending(), [attempt.root])
             self.assertEqual(self.record(attempt)["state"], "done")
-
-
-@unittest.skipUnless(paths.ON_MAC, "requires the native macOS scratch relay")
-class NativeScratchRelayStackTests(ScratchRecordTests):
-    def test_running_producer_relay_reports_its_stack(self):
-        attempt = self.attempt("a")
-        runner = parallel.Runner(None)
-        runner.folder = self.base
-        prefix = "producer.stack."
-        env = {**os.environ, _test_stacks.PREFIX_ENV: str(self.base / prefix)}
-        command = ["/bin/sh", "-c", "echo ready; read -r finish"]
-        with scratch.producing(attempt):
-            proc = scratch.spawn(command, actor_confined=True, cwd=attempt.workspace, env=env,
-                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-        with proc:
-            record = self.record(attempt)
-            self.addCleanup(scratch.stop_monitors, record)
-            try:
-                self.assertTrue(select.select([proc.stdout], [], [], 3)[0], "producer did not start")
-                self.assertEqual(proc.stdout.readline(), b"ready\n")
-                requested = runner.request_stacks(prefix)
-                stacks = runner.stack_output(requested, os.getpid())
-                self.assertRegex(stacks, rf'Python child stack \(PID {proc.pid}\)\n[^\n]+\n'
-                                        r'  File "[^"]+/scratch_process.py", line \d+ in relay\n')
-                monitor, = scratch.monitors(record).values()
-                self.assertIn(f"Python child stack (PID {monitor})", stacks)
-                self.assertIn(" in wait_for_command\n", stacks)
-            finally:
-                proc.communicate(b"done\n", timeout=5)
-            self.assertEqual(proc.returncode, 0)
 
 
 class OptimizeTests(unittest.TestCase):

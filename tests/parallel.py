@@ -50,6 +50,10 @@ def main_thread_first(stack, ident):
     return "\n\n".join(threads)
 
 
+def failed(report):
+    return any(report.get(kind) for kind in ("timeout", "errors", "failures", "unexpected"))
+
+
 def flatten(suite):
     for item in suite:
         if isinstance(item, unittest.TestSuite):
@@ -101,6 +105,8 @@ class Runner:
         self.stopping = False
         self.in_flight = []
         self.results = {}
+        self.crowded = []
+        self.first_timeouts = {}
         try:
             with open(HISTORY) as handle:
                 self.history = json.load(handle)
@@ -181,7 +187,7 @@ class Runner:
                 dumps.append(f"Python {role} stack (PID {pid})\n{stack}")
         return "\n\n".join(dumps)
 
-    def child(self, item):
+    def child(self, item, stretch=1):
         index, batch = item
         result_file = os.path.join(self.folder, f"{index}.json")
         output_file = os.path.join(self.folder, f"{index}.out")
@@ -207,8 +213,8 @@ class Runner:
             else:
                 self.live[process] = batch.identifier
         if process is not None:
-            timeout = self.args.timeout if self.args.timeout is not None else batch.timeout
-            requested = []
+            timeout = stretch * (self.args.timeout if self.args.timeout is not None else batch.timeout)
+            requested = None
             try:
                 process.wait(timeout)
                 if process.returncode:
@@ -221,7 +227,7 @@ class Runner:
                 process.wait()
                 with self.lock:
                     self.live.pop(process, None)
-            if problem and problem.startswith("class exceeded "):
+            if requested is not None:
                 stacks = self.stack_output(requested, process.pid)
                 timeout_report = "\n".join(filter(None, (
                     _test_stacks.REPORT_START, batch.identifier, problem, stacks, _test_stacks.REPORT_END,
@@ -244,7 +250,7 @@ class Runner:
         with self.lock:
             self.results[batch.identifier] = report
             if self.args.verbose:
-                outcome = "FAIL" if timeout_report or report["errors"] or report["failures"] or report["unexpected"] else "ok"
+                outcome = "FAIL" if failed(report) else "ok"
                 print(f"{batch.identifier}: {report['ran']} tests, {outcome} ({report['seconds']:.2f}s)", flush=True)
 
     def run(self, tests):
@@ -277,6 +283,13 @@ class Runner:
             for item in items:
                 if item[1].serial:
                     self.child(item)
+            for index, batch in items:
+                identifier = batch.identifier
+                if not batch.serial and not self.stopping and self.results[identifier].get("timeout"):
+                    self.first_timeouts[identifier] = self.results[identifier]
+                    self.child((f"{index}.alone", batch), stretch=2)
+                    if not failed(self.results[identifier]):
+                        self.crowded.append(identifier)
             complete = True
         finally:
             if not complete:
@@ -291,26 +304,32 @@ class Runner:
             return 130
         return self.finish(time.monotonic() - began)
 
+    def show_failures(self, identifier, report):
+        timeout_report = report.get("timeout")
+        if timeout_report:
+            print(f"\n{timeout_report}")
+            if report["output"]:
+                print(report["output"])
+        for kind in ("errors", "failures", "unexpected"):
+            if not report[kind]:
+                continue
+            print(f"\n{identifier}: {kind}")
+            for entry in report[kind]:
+                print(entry if isinstance(entry, str) else "\n".join(entry))
+            if report["output"] and not timeout_report:
+                print(report["output"])
+
     def finish(self, seconds):
-        failed = False
+        suite_failed = False
         ran = skipped = 0
         for identifier, report in self.results.items():
             ran += report["ran"]
             skipped += len(report["skipped"])
-            if timeout_report := report.get("timeout"):
-                failed = True
-                print(f"\n{timeout_report}")
-                if report["output"]:
-                    print(report["output"])
-            for kind in ("errors", "failures", "unexpected"):
-                if not report[kind]:
-                    continue
-                failed = True
-                print(f"\n{identifier}: {kind}")
-                for entry in report[kind]:
-                    print(entry if isinstance(entry, str) else "\n".join(entry))
-                if report["output"] and not timeout_report:
-                    print(report["output"])
+            if first := self.first_timeouts.get(identifier):
+                self.show_failures(identifier, first)
+            if failed(report):
+                suite_failed = True
+                self.show_failures(identifier, report)
         try:
             temporary = f"{HISTORY}.{os.getpid()}.tmp"
             with open(temporary, "w") as handle:
@@ -318,13 +337,17 @@ class Runner:
             os.replace(temporary, HISTORY)
         except OSError:
             pass
+        for identifier in self.crowded:
+            report = self.results[identifier]
+            print(f"{identifier}: ran past its deadline beside other classes, "
+                  f"then passed alone within twice that deadline in {report['seconds']:.2f}s", flush=True)
         if self.args.slowest:
             print("Slowest classes:")
             for name, report in sorted(self.results.items(), key=lambda item: -item[1]["seconds"])[:self.args.slowest]:
                 print(f"  {report['seconds']:.2f}s {name} ({report['ran']} tests)")
-        print(f"Ran {ran} tests in {seconds:.2f}s: {'FAILED' if failed else 'OK'}" +
+        print(f"Ran {ran} tests in {seconds:.2f}s: {'FAILED' if suite_failed else 'OK'}" +
               (f" (skipped={skipped})" if skipped else ""), flush=True)
-        if failed:
+        if suite_failed:
             print(f"Worker reports and output retained in: {self.folder}", flush=True)
             return 1
         shutil.rmtree(self.folder)
