@@ -296,22 +296,24 @@ def linked_numbers(hold: Hold, waits: dict, repo: str) -> list[int]:
     return sorted({waits[gap.signature.key][1] for gap in hold.gaps})
 
 
-def confirm_retry(cfg: config.Config, repo: config.Repo, row: dict, sha: str) -> bool:
+def confirmed_retry_gaps(cfg: config.Config, repo: config.Repo, row: dict, sha: str) -> tuple[tuple[str, int], ...]:
     tid = str(row.get("issue") or "")
     if (not tid or row.get("repo") != repo.name or row.get("status") != "pr"
             or row.get("dry_run") or was_retry(row) or live_release() != sha):
-        return False
+        return ()
     run_id = row["id"]
     saved = run_store.environment_hold(run_id)
     release, hold = release_repo(cfg), hold_of(run_id)
     if (not release or not hold or saved.get("released") != 0 or saved["heads"] != hold.heads
             or run_store.environment_retry(run_id)):
-        return False
+        return ()
     source = tracker.for_ticket(cfg, repo, tid)
     if ticket_blocker(source, tid) != "" or not discussions(row, hold, source):
-        return False
+        return ()
     numbers = linked_numbers(hold, saved["waits"], release.github)
-    return release_contains_fixes(release, numbers, sha)
+    if not release_contains_fixes(release, numbers, sha):
+        return ()
+    return tuple((release.github.casefold(), number) for number in numbers)
 
 
 def displayed_refs(repo: str, gaps_repo: str, numbers: list[int]) -> str:

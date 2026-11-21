@@ -15,6 +15,7 @@ from pathlib import Path
 
 from . import budget_legacy, gh, paths, run_lines, util
 from .store import db as foundation
+from .store import insights as insights_store
 from .store import runs as run_store
 
 IDLE_WAITS = ("limit", "slot")
@@ -322,7 +323,7 @@ idle_waits = budget_legacy.idle_waits
 class Budget:
     def __init__(self, run, policy: Policy, previous: str, ticket=None, forced: bool = False,
                  *, wall_deadline: float = math.inf, checkpoint_timeout: float | None = None,
-                 checkpoint_gate=None) -> None:
+                 checkpoint_gate=None, fixed_gaps: tuple[tuple[str, int], ...] = ()) -> None:
         self.run, self.policy, self.wall_deadline = run, policy, wall_deadline
         self.checkpoint_timeout, self.checkpoint_gate = checkpoint_timeout, checkpoint_gate
         chain = family(previous)
@@ -333,8 +334,12 @@ class Budget:
         current = specification(ticket) if ticket else None
         if run.environment_release or run.preview_of:
             chain = [rid for rid in chain if not rows[rid]["dry_run"] and rows[rid]["status"] != "dry-run"]
-        left = [rid for rid in chain
-                if forced and current and (found := recorded_specification(rid)) and found != current]
+        if insights_store.has_fresh_feedback(run.feedback):
+            left, reason = chain, "the owner commented on the PR"
+        else:
+            left = [rid for rid in chain
+                    if forced and current and (found := recorded_specification(rid)) and found != current]
+            reason = "the ticket specification changed"
         left_repairs = sum(repair_count(rid) for rid in left)
         left_seconds = sum(active_seconds(rid, rows[rid]) for rid in left)
         left_verify = sum(verification_seconds(rid, rows[rid]) for rid in left)
@@ -355,7 +360,6 @@ class Budget:
         self.lock = threading.RLock()
         self.watched = False
         self.verify_seconds = sum(verification_seconds(row["id"], row) for row in kept)
-        self.prior_repairs = sum(repair_count(rid) for rid in self.parents)
         self.repair_calls = repair_count(run.id)
         self.current_verification_seconds = verification_seconds(run.id, own_row)
         self.verify_seconds += self.current_verification_seconds
@@ -371,6 +375,17 @@ class Budget:
             "verification_minutes": round(verification_seconds(row["id"], row) / 60, 1),
             "repair_calls": repair_count(row["id"]), "estimate": row.get("measured_at") == ""
         } for row in kept}
+        self.prior_repairs = sum(usage["repair_calls"] for usage in self.charged.values())
+        if self.parents and run.environment_release and fixed_gaps:
+            reset = run_store.claim_environment_budget_resets(run.repo.name, str(run.tid), run.id, fixed_gaps)
+            if reset:
+                gaps = ', '.join(f'#{number}' for number in reset)
+                fixed = f"gap {gaps} was" if len(reset) == 1 else f"gaps {gaps} were"
+                run.log(f"budget: left out {util.count(self.prior_repairs, 'earlier repair cycle')} of "
+                        f"{util.count(len(self.parents), 'earlier run')} because the environment {fixed} fixed since they ran")
+                self.prior_repairs = 0
+                for usage in self.charged.values():
+                    usage["repair_calls"] = 0
         run_lines.write(run.id, "budget_chain", charged=self.charged)
         run.log("budget chain: " + ("; ".join(
             f"{rid}: {v['run_minutes']:.1f} run minutes, {v['verification_minutes']:.1f} verification minutes, "
@@ -380,7 +395,7 @@ class Budget:
         if left:
             run.log(f"budget: left out {util.count(left_repairs, 'earlier repair cycle')}, "
                     f"{left_seconds / 60:.1f} run minutes and {left_verify / 60:.1f} verification minutes of "
-                    f"{util.count(len(left), 'earlier run')} because the ticket specification changed since they ran")
+                    f"{util.count(len(left), 'earlier run')} because {reason} since they ran")
 
     def persist(self) -> None:
         self.checkpoint()
@@ -456,6 +471,8 @@ class Budget:
 
         if admit:
             admit()
+        if self.run.feedback:
+            self.check_repairs()
         if self.run_deadline() <= time.monotonic():
             raise Parked(self.reason())
         previous = signal.signal(signal.SIGALRM, expire)
@@ -549,12 +566,16 @@ class Budget:
         if role not in REPAIRS and not step.startswith(REPAIR_NAMES):
             self.checkpoint()
             return
-        count = self.prior_repairs + self.repair_calls
-        if count >= self.policy.max_repair_cycles:
-            raise Parked(f"the repair chain used its {self.policy.max_repair_cycles} repair cycles")
+        count = self.check_repairs()
         self.repair_calls += 1
         self.persist()
         run_lines.write(self.run.id, "budget_repair", call=step, atom=role, used=count + 1)
+
+    def check_repairs(self) -> int:
+        count = self.prior_repairs + self.repair_calls
+        if count >= self.policy.max_repair_cycles:
+            raise Parked(f"the repair chain used its {self.policy.max_repair_cycles} repair cycles")
+        return count
 
     def park(self, reason: str, kept: dict | None = None) -> dict:
         row = run_store.run_get(self.run.id) or {}

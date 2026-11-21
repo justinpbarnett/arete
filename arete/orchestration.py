@@ -383,6 +383,7 @@ class Controller:
                             if self.run.launch_gate else None
                         ledger.launched(self.lease, self.policy.max_decisions)
                         controller.allow(grant)
+                        self.run.step_started = True
                     else:
                         result, complete = message, True
                 if controller.proc.poll() is not None:
@@ -493,6 +494,7 @@ class Controller:
                     if type(seconds) in (int, float) and seconds > 0:
                         worker.deadline = min(worker.deadline, time.monotonic() + seconds)
                     worker.allow(grant)
+                    self.run.step_started = True
                 elif message.get("event") in ("result", "error"):
                     worker.close()
                     del self.workers[key]

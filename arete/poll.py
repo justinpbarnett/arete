@@ -52,6 +52,7 @@ from .store import sources as source_store
 from .workspace import cleanup_worktrees
 
 MAX_STARTS_PER_POLL = 64
+FEEDBACK_PICK = "revising the PR for your review comments"
 
 
 def ticket_queues(repo: config.Repo, tk: tracker.Tracker) -> list[tracker.Tracker]:
@@ -104,13 +105,15 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
         return eligible_again(tid) and (not isinstance(tk, tracker.GitHubTracker) or tracker.is_task_id(tid)
                                         or not tk.in_zte_queue(str(tid)))
 
+    quiet_since = util.iso(util.now() - timedelta(minutes=pipeline.FEEDBACK_QUIET_MINUTES))
+    feedback_due = insights_store.feedback_due(repo.name, quiet_since)
     for tid in run_store.interrupted_tickets(repo.name):
         if (ordinary_history(tid) and (row := run_store.newest_live_whole_run(repo.name, tid))
                 and not environment_gaps.was_retry(row)):
-            return tid, "restarting after an interruption"
-    for tid in insights_store.feedback_due(repo.name, util.iso(util.now() - timedelta(minutes=pipeline.FEEDBACK_QUIET_MINUTES))):
+            return tid, FEEDBACK_PICK if tid in feedback_due else "restarting after an interruption"
+    for tid in feedback_due:
         if ordinary_history(tid):
-            return tid, "revising the PR for your review comments"
+            return tid, FEEDBACK_PICK
     for source in ticket_queues(repo, tk):
         for t in source.replied():
             if not eligible_again(t.id):
@@ -285,7 +288,9 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: tuple[str, str], skip
         print(f"{util.iso()} {name}: waiting, {waiting}")
         return "held"
     ticket = source.get(tid)
-    blocked, readmission = runlimits.poll_admission(repo, str(tid), ticket, runlimits.Policy.of(layer))
+    fresh_feedback = why == FEEDBACK_PICK and insights_store.has_fresh_feedback(pending_feedback(repo.name, tid))
+    blocked, readmission = ("", None) if fresh_feedback else runlimits.poll_admission(
+        repo, str(tid), ticket, runlimits.Policy.of(layer))
     blocked = blocked or source.blocker(tid) or reply
     if not blocked:
         newest = run_store.newest_whole_run(repo.name, tid)

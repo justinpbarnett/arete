@@ -245,6 +245,7 @@ class Flow:
         self.carrying, self.carry = False, 0
         self.skipped, self.matching, self.done = 0, bool(continues or only), False
         self.redone, self.stepped = 0, False
+        self.work_started = False
         self.reopens = (bool(continues) and not only and again != OPENING and reopening(chained)
                         and bool(self.earlier) and self.earlier[0].get("step") == OPENING)
         if self.matching:
@@ -415,6 +416,8 @@ class Flow:
                  if name == self.only and kw.get("tree") else {})
         run_lines.write(self.run_id, "step_start", step=name, **{"try": n}, **labels, **began)
         try:
+            if name != "respond":
+                self.work_started = True
             outcome = self.call(name, calls, args, kw)
         except owner_asks.Asked as e:
             outcome = Outcome("ask", feedback=owner_asks.summary(e.sent), data={"ask_ids": e.ask_ids, "call": e.call},
