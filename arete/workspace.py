@@ -224,17 +224,19 @@ def retained(ws: Path, checkouts: list[Checkout], names: list[str], held: list[P
             "names": [n for n in names if n in loose]}
 
 
-def remove_workspace(ws: Path, checkouts: list[Checkout]) -> bool:
+def remove_workspace(ws: Path, checkouts: list[Checkout], *, excluded: Collection[Path] = ()) -> bool:
     if scratch_left(ws, checkouts):
         return False
     made = made_before(ws)
 
     def unknown_outside(examined: set[Path]) -> bool:
         try:
-            return any(not recorded(made, ws, n) for n in unexamined(ws, examined))
+            return any(not recorded(made, ws, n) for n in unexamined(ws, examined.union(excluded)))
         except OSError:
             return True
 
+    if any(wt.resolve().is_relative_to(c.wt.resolve()) for c in checkouts for wt in excluded):
+        return False
     if unknown_outside({c.wt for c in checkouts if (c.wt / ".git").exists()}):
         return False
     for c in checkouts:
@@ -251,6 +253,8 @@ def remove_workspace(ws: Path, checkouts: list[Checkout]) -> bool:
             git(["worktree", "remove", "--force", str(c.wt)], c.src, check=False)
     if scratch_left(ws, checkouts) or unknown_outside(set()):
         return False
+    if excluded:
+        return True
     shutil.rmtree(ws, ignore_errors=True)
     if os.path.lexists(ws):
         return False
@@ -359,10 +363,10 @@ def unexamined(ws: Path, examined: set[Path]) -> list[str]:
     return sorted(found)
 
 
-def leftovers(ws: Path, checkouts: list[Checkout]) -> list[str]:
+def leftovers(ws: Path, checkouts: list[Checkout], *, excluded: Collection[Path] = ()) -> list[str]:
     examined = {c.wt for c in checkouts if (c.wt / ".git").exists()}
     found = [c.prefix + n for c in checkouts if c.wt in examined for n in uncommitted(c.wt) + ignored_files(c.wt)]
-    return found + unexamined(ws, examined)
+    return found + unexamined(ws, examined.union(excluded))
 
 
 def head_key(c: Checkout) -> str:
@@ -381,12 +385,12 @@ def outside_scratch(ws: Path, names: list[str], held: list[Path]) -> list[str]:
 
 
 def note_made(ws: Path, checkouts: list[Checkout], owner: dict | None = None,
-              *, preserve: Collection[str] = ()) -> None:
+              *, preserve: Collection[str] = (), excluded: Collection[Path] = ()) -> None:
     try:
         owner = owner or owner_in(made_before(ws))
         names, held = [], []
         if ws.is_dir():
-            names, held = leftovers(ws, checkouts), scratch_left(ws, checkouts)
+            names, held = leftovers(ws, checkouts, excluded=excluded), scratch_left(ws, checkouts)
             names = outside_scratch(ws, names, held)
             if preserve:
                 protected = {Path(n) for n in preserve}
@@ -413,7 +417,7 @@ def note_made(ws: Path, checkouts: list[Checkout], owner: dict | None = None,
 
 
 def kept_work(ws: Path, checkouts: list[Checkout], source: Path, copies: list[str], commits: bool = True,
-              held: list[Path] | None = None) -> str:
+              held: list[Path] | None = None, *, excluded: Collection[Path] = ()) -> str:
     made = made_before(ws)
     salt = salt_of(made)
 
@@ -442,7 +446,7 @@ def kept_work(ws: Path, checkouts: list[Checkout], source: Path, copies: list[st
             return (f"the existing worktree {c.wt} of {c.github} holds {what}, so arete did not make it again and "
                     "left them as they are; move or remove them, then run again")
     try:
-        others = unknown(unexamined(ws, examined))
+        others = unknown(unexamined(ws, examined.union(excluded)))
     except OSError as e:
         return f"arete could not read the existing workspace {ws}, so it left it as it is: {e}"
     if others:
@@ -464,14 +468,15 @@ def worktree_failure(why: str, ws: Path, branch: str) -> RunFailed:
 
 
 def clear_workspace(ws: Path, checkouts: list[Checkout], source: Path, copies: list[str],
-                    branch: str = "") -> None:
+                    branch: str = "", *, excluded: Collection[Path] = ()) -> None:
     if left := scratch_held(ws, checkouts):
         raise scratch_failure(
             f"unresolved or unknown scratch resources keep the existing workspace retained ({held_words(left)})",
             ws, left)
-    if why := kept_work(ws, checkouts, source, copies):
+    if why := kept_work(ws, checkouts, source, copies, excluded=excluded):
         raise worktree_failure(why, ws, branch)
-    if not remove_workspace(ws, checkouts):
+    removal = {"excluded": excluded} if excluded else {}
+    if not remove_workspace(ws, checkouts, **removal):
         why = "workspace removal withheld to preserve scratch resources"
         if left := scratch_left(ws, checkouts):
             raise scratch_failure(why, ws, left)
@@ -507,26 +512,30 @@ def kept_onto(ws: Path, checkouts: list[Checkout], branch: str) -> dict[str, str
 
 
 def kept_or_cleared(ws: Path, checkouts: list[Checkout], source: Path, copies: list[str],
-                    branch: str) -> dict[str, str]:
+                    branch: str, *, excluded: Collection[Path] = ()) -> dict[str, str]:
     if left := scratch_held(ws, checkouts):
         raise scratch_failure(
             f"unresolved or unknown scratch resources keep the existing workspace retained ({held_words(left)})",
             ws, left)
     kept = kept_onto(ws, checkouts, branch)
     if not kept:
-        clear_workspace(ws, checkouts, source, copies, branch)
+        clear_workspace(ws, checkouts, source, copies, branch, excluded=excluded)
         return {}
-    if why := kept_work(ws, checkouts, source, copies):
+    if why := kept_work(ws, checkouts, source, copies, excluded=excluded):
         raise worktree_failure(why, ws, branch)
     return kept
 
 
 def make_workspace(run_id: str, repo: config.Repo, base: str, branch: str, key: str,
-                   copies: list[str], *, preview_of: str = "") -> tuple[Path, list[Checkout]]:
+                   copies: list[str], *, preview_of: str = "",
+                   excluded: Collection[Path] = ()) -> tuple[Path, list[Checkout]]:
     ws = paths.WORKTREES_DIR / f"{repo.name}-{key}"
     checkouts = [Checkout(p.dir, p.github, repo.path / p.dir, ws / p.dir, base or gh.default_branch(p.github))
-                 for p in repo.parts]
-    kept = kept_or_cleared(ws, checkouts, repo.path, copies, branch)
+                 for p in repo.parts if ws / p.dir not in excluded]
+    if any(wt.resolve().is_relative_to(c.wt.resolve()) or c.wt.resolve().is_relative_to(wt.resolve())
+           for c in checkouts for wt in excluded):
+        raise worktree_failure("an active worktree overlaps a closed PR worktree", ws, branch)
+    kept = kept_or_cleared(ws, checkouts, repo.path, copies, branch, excluded=excluded)
 
     def resumes_for(c: Checkout) -> bool:
         if preview_of:

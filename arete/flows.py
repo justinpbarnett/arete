@@ -71,18 +71,25 @@ def ran_on_seam(run_id: str) -> bool:
 
 def start(cfg: config.Config, run: pipeline.Run, earlier: dict, slot: slots.RunSlot | None = None,
           continues: str = "", only: str = "", again: str = "") -> factory.Flow:
+    from . import requeue
+
     ws = paths.WORKTREES_DIR / f"{run.repo.name}-{run.workspace_key}"
     continues = continues or (earlier["id"] if earlier.get("status") == "interrupted" and ran_on_seam(earlier["id"])
                               else "")
     job = Job(cfg, run, ws, slot=slot, continues=continues, only=only)
+    if run.path == "orchestrate" and not (continues or only or run.dry_run or run.repairs) and requeue.policy_retry(earlier):
+        job.policy_retry = requeue.recorded_failure(earlier)
     catch_up = not only and run.path == "orchestrate" and pending_catch_up(continues)
     if continues and not only and not catch_up:
         run.answers_due = asks_store.asks_due(sorted(factory.chain_runs(continues)))
-    refusal = guard(job, continues) if continues else ""
+    saved_controller = continues and run.path == "orchestrate" and bool(adaptive_state(continues).get("prepared"))
+    restore_prs = saved_controller and not (catch_up or run.environment_release or run.action_only)
+    refusal = guard(job, continues, controller_restore=restore_prs) if continues else ""
     renew = ""
     if refusal:
         job.note_task()
-    elif (continues and not only and not catch_up and not run.environment_release and kept_pending(job, continues)
+    elif (continues and not saved_controller and not only and not catch_up and not run.environment_release
+          and kept_pending(job, continues)
           and (moved := base_moved(continues))):
         if run.answers_due:
             job.moved_base = moved
@@ -116,7 +123,7 @@ def kept_pending(job: Job, continues: str) -> bool:
     return all(str(c.wt) in kept for c in checkouts if c.github in job.pending)
 
 
-def guard(job: Job, continues: str) -> str:
+def guard(job: Job, continues: str, *, controller_restore: bool = False) -> str:
     from .store import orchestration
 
     if orchestration.publication_pending(continues):
@@ -127,13 +134,17 @@ def guard(job: Job, continues: str) -> str:
     if (getattr(job.run, "action", "") and not job.run.environment_release
             and (why := action_workspace_refusal(continues))):
         return why
+    if controller_restore:
+        return ""
     data = prepared_data(continues)
     branch, listed = str(data.get("branch") or ""), data.get("checkouts")
     if not continues or not branch or not isinstance(listed, list):
         return ""
     job.branch = branch
     try:
-        checkouts = [workspace.Checkout.from_row(e) for e in listed]
+        closed = data.get("closed_prs", ())
+        checkouts = [workspace.Checkout.from_row(e) for e in listed if e.get("pr") not in closed]
+        excluded = {Path(e["wt"]) for e in listed if e.get("pr") in closed}
         layer = pipeline.checked_layer(job.cfg, Path(data["layer"]))
         if held := workspace.scratch_held(job.ws, checkouts):
             error = workspace.scratch_failure(
@@ -141,7 +152,7 @@ def guard(job: Job, continues: str) -> str:
                 "then run again", job.ws, held)
             job.run.failure = {"class": "environment", **error.recovery}
             return f"arete started no step and made no tracker call: {error.why}"
-        if why := workspace.kept_work(job.ws, checkouts, job.run.repo.path, layer.copy, commits=False):
+        if why := workspace.kept_work(job.ws, checkouts, job.run.repo.path, layer.copy, commits=False, excluded=excluded):
             error = workspace.worktree_failure(why, job.ws, branch)
             job.run.failure = {"class": "environment", **error.recovery}
             return f"arete started no step and made no tracker call: {why}"
@@ -327,27 +338,23 @@ def retry_environment(flow: factory.Flow) -> tuple[str, str, str]:
 
 
 def action_workspace_refusal(run_id: str) -> str:
-    checkouts = prepared_data(run_id).get("checkouts") or []
+    data = prepared_data(run_id)
+    checkouts = [c for c in data.get("checkouts") or [] if c.get("pr") not in data.get("closed_prs", ())]
     if checkouts and all(c.get("wt") and (Path(c["wt"]) / ".git").exists() for c in checkouts):
         return ""
     return "adaptive action reruns need retained worktrees; the saved workspace was removed"
 
 
-def base_moved(continues: str, *, targets: dict[str, str] | None = None) -> str:
+def base_moved(continues: str) -> str:
     for c in prepared_data(continues).get("checkouts") or []:
         if not isinstance(c, dict) or not c.get("base_commit"):
             continue
-        base = c["base"] if targets is None else targets.get(c.get("github"))
-        if not base:
-            continue
         try:
-            now = workspace.remote_head(Path(c["src"]), base)
+            now = workspace.remote_head(Path(c["src"]), c["base"])
         except RuntimeError:
             continue
         if now and now != c["base_commit"]:
-            if base != c["base"]:
-                return f"the PR in {c['github']} changed its base from `{c['base']}` to `{base}`"
-            return f"`origin/{base}` moved from {c['base_commit'][:12]} to {now[:12]} in {c['github']}"
+            return f"`origin/{c['base']}` moved from {c['base_commit'][:12]} to {now[:12]} in {c['github']}"
     return ""
 
 
@@ -435,10 +442,17 @@ def rebuild(job: Job, line: dict, *, layer: config.RepoLayer | None = None, setu
     ws = Path(line["tree"])
     admitted = layer is not None
     layer = layer or pipeline.checked_layer(job.cfg, Path(line["data"]["layer"]) if setup else job.run.repo.layer_dir)
-    try:
-        workspace.clear_workspace(ws, made, job.run.repo.path, layer.copy)
-    except workspace.RunFailed as e:
-        return e.why
+    excluded = job.run.excluded_worktrees
+    if excluded:
+        if held := workspace.scratch_held(ws, made):
+            return f"verification scratch at {held[0]} is still held; poll finalizes it once its holders end"
+        if why := workspace.kept_work(ws, made, job.run.repo.path, layer.copy, excluded=excluded):
+            return why
+    else:
+        try:
+            workspace.clear_workspace(ws, made, job.run.repo.path, layer.copy)
+        except workspace.RunFailed as e:
+            return e.why
     job.run.workspace = ws, made
     try:
         for c in made:
@@ -506,6 +520,10 @@ class Job:
     moved_base: str = ""
     patch_mode: bool = False
     prepared_feedback_prs: list[str] = field(default_factory=list)
+    closed_prs: set[str] = field(default_factory=set)
+    closed_checkouts: list[workspace.Checkout] = field(default_factory=list)
+    policy_retry: dict = field(default_factory=dict)
+    check_publication_targets: Callable[[], None] | None = None
 
     @property
     def held_reason(self) -> str:
@@ -516,14 +534,13 @@ class Job:
             return "the check in use was blocked; this change requires behavioral evidence"
         return pipeline.draft_reason(self.review, self.verified, self.reviews)
 
-    def merge_moved_base(self, name: str, *, repos: set[str] | None = None) -> list[workspace.Checkout]:
+    def merge_moved_base(self, name: str) -> None:
         moved, self.moved_base = self.moved_base, ""
         held = [c for c in self.checkouts if c.onto]
-        merged = []
-        if moved and (eligible := [c for c in held if repos is None or c.github in repos]):
+        if moved and held:
             self.run.log(f"{moved} since run {self.continues} prepared, so arete merges the new base into the edits "
                          f"that run kept before {name} runs with the answers")
-            merged = pipeline.merge_base_into_kept(self.run, eligible, self.layer, self.ticket)
+            merged = pipeline.merge_base_into_kept(self.run, held, self.layer, self.ticket)
             if merged:
                 self.run.base_note = pipeline.base_merge_note(merged)
                 if self.built is not None:
@@ -532,7 +549,10 @@ class Job:
                         self.built.worker_trees.pop(checkout.github, None)
                 workspace.note_made(self.ws, self.checkouts)
         self.run.kept_note = pipeline.kept_edits_note(held) if self.run.answers_due else ""
-        return merged
+
+    @property
+    def workspace_checkouts(self) -> list[workspace.Checkout]:
+        return self.checkouts + self.closed_checkouts
 
     @property
     def with_prs(self) -> list[workspace.Checkout]:
@@ -780,12 +800,13 @@ class Job:
 
     def prepared(self, data: dict, stored: bool, *, reconciling_catch_up: bool = False) -> None:
         run = self.run
-        self.prepared_feedback_prs = data.get("feedback_prs", [])
+        self.prepared_feedback_prs = [url for url in data.get("feedback_prs", []) if url not in self.closed_prs]
         self.ticket = tracker.Ticket(**data["ticket"])
         self.branch, self.attachments, self.triage = data["branch"], data["attachments"], data["triage"]
         self.expertise, self.approval = data["expertise"], data.get("approval")
-        self.checkouts = [workspace.Checkout.from_row(c)
-                          for c in data["checkouts"]]
+        checkouts = [workspace.Checkout.from_row(c) for c in data["checkouts"]]
+        self.checkouts = [c for c in checkouts if c.pr not in self.closed_prs]
+        self.closed_checkouts = [c for c in checkouts if c.pr in self.closed_prs]
         leases = {c.github: c.lease for c in self.checkouts}
         for c in self.checkouts:
             if str(c.wt) in self.restored:
@@ -798,19 +819,21 @@ class Job:
                                                 "once its holders end, then run again", self.ws, held)
             if not reconciling_catch_up:
                 kept = workspace.kept_onto(self.ws, self.checkouts, self.branch)
-                if why := workspace.kept_work(self.ws, self.checkouts, run.repo.path, self.layer.copy):
+                if why := workspace.kept_work(self.ws, self.checkouts, run.repo.path, self.layer.copy,
+                                              excluded=run.excluded_worktrees):
                     raise workspace.worktree_failure(why, self.ws, self.branch)
                 for c in self.checkouts:
                     c.onto = kept.get(str(c.wt), "")
         elif stored:
             for c in self.checkouts:
                 c.onto = ""
-        run.workspace = self.ws, self.checkouts
         if stored and not reconciling_catch_up:
             runs = authors(self.continues)
             for c in self.checkouts:
                 if why := self.reclaim(c, *authority(self.continues, c, leases[c.github]), runs):
                     raise workspace.RunFailed(why)
+        run.workspace = self.ws, self.checkouts
+        if stored and not reconciling_catch_up:
             opened(run, self.ticket)
             if not run.alone:
                 run.enter("running")
@@ -819,12 +842,6 @@ class Job:
         self.layer = layer
         self.check_commands, self.check_rules = pipeline.check_script(self.run.dir, layer, self.ws)
         self.run.cfg, self.run.layer, self.run.kind = self.cfg, layer, self.ticket.kind
-        if self.built is not None:
-            self.built.layer = layer
-            self.built.timeout = layer.timeout_minutes * 60
-            self.built.tools = prompt_loader.bash_rules(self.builder_bash)
-            self.built.deny = diffguard.denied_paths(layer)
-            self.built.check_commands = self.checks
 
 
 def opened(run: pipeline.Run, t: tracker.Ticket) -> None:
@@ -896,14 +913,21 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
     branch = (run.preview_branch or mended.get("branch") or pipeline.open_branch(run)
               or prompt_loader.fill_template(main_layer.branch, config.RepoLayer.branch, kind=t.kind, id=t.id,
                                         slug=prompt_loader.slug(t.title)))
+    if job.policy_retry.get("branch") == branch:
+        parts = {(p.dir, p.github, job.ws / p.dir) for p in repo.parts}
+        closed = [workspace.Checkout.from_row(row) for row in job.policy_retry.get("closed_checkouts", ())]
+        job.closed_checkouts = [c for c in closed if (c.dir, c.github, c.wt) in parts]
+        job.closed_prs = {c.pr for c in job.closed_checkouts}
+        run.excluded_worktrees = {c.wt for c in job.closed_checkouts}
     if not run.dry_run:
         tk.prepare()
     if not run.alone:
         run.enter("running")
     try:
         if repo.parts and (not run.dry_run or run.preview_of):
+            exclusion = {"excluded": run.excluded_worktrees} if run.excluded_worktrees else {}
             checkouts = workspace.make_workspace(run.id, repo, main_layer.base_branch, branch, run.workspace_key,
-                                                main_layer.copy, preview_of=run.preview_of)[1]
+                                                main_layer.copy, preview_of=run.preview_of, **exclusion)[1]
         else:
             checkouts = local_workspace(run, main_layer.base_branch, branch, job.ws, main_layer.copy)
         run.workspace = job.ws, checkouts
@@ -918,10 +942,14 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
     layer = pipeline.resolve_layer(cfg, run, job.ws)
     if why := pipeline.furnish(cfg, run, layer, job.ws):
         return end_as("fail", "failed", why=why)
-    workspace.note_made(job.ws, checkouts, pipeline.workspace_owner(run, job.ws, checkouts))
+    workspace.note_made(job.ws, checkouts, pipeline.workspace_owner(run, job.ws, checkouts),
+                        excluded=run.excluded_worktrees)
     approval = triage_store.triage_approval(run.triage_key)
-    data = prepared_fields(t, branch, checkouts, layer, [run.dir / "images"] if images.paths else [],
+    data = prepared_fields(t, branch, [*checkouts, *job.closed_checkouts], layer,
+                           [run.dir / "images"] if images.paths else [],
                            pipeline.images_note(images), approval)
+    if job.closed_prs:
+        data["closed_prs"] = sorted(job.closed_prs)
     if feedback_prs:
         data["feedback_prs"] = feedback_prs
     return Outcome("pass", data=data)
@@ -1280,7 +1308,8 @@ def settle_unpushed_checkouts(job: Job, before_push=None):
                                      f"{job.branch} does not match origin")
     if unpushed:
         publishing(run, job.branch, lambda: pipeline.commit_and_push(job.checkouts, unpushed, job.branch, "",
-                                                                     before_push=before_push))
+                                                                     before_push=before_push,
+                                                                     check_targets=job.check_publication_targets))
     return fresh, staged, size, outcome, unpushed
 
 
@@ -1296,7 +1325,8 @@ def publish_branch(job: Job, fresh, staged, unpushed, before_push=None):
     if not fresh.empty:
         b.staged = fresh
         publishing(run, job.branch, lambda: b.push(
-            job.branch, f"{tracker.with_ref(subject, t.ref)}\n\n{revised}Arete-Run: {run.id}", before_push=before_push))
+            job.branch, f"{tracker.with_ref(subject, t.ref)}\n\n{revised}Arete-Run: {run.id}",
+            before_push=before_push, check_targets=job.check_publication_targets))
         b.staged = staged
     return subject, draft_why, committed
 
@@ -1401,6 +1431,8 @@ def pr(flow: factory.Flow, tree: str) -> Outcome:
             return end_as("fail", "failed",
                           why=f"pushed {job.branch}, but {draft_why}, and this repo has no GitHub name for a draft PR")
         return publication_outcome(job, staged, outcome, committed)
+    if job.check_publication_targets:
+        job.check_publication_targets()
     return open_or_refresh_prs(job, found, staged, size, outcome, subject, draft_why, committed, before_push)
 
 

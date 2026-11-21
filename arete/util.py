@@ -19,7 +19,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from contextlib import ExitStack, closing, contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -88,15 +88,18 @@ def sh(
     input: str | None = None,
     inherit: bool = True,
     keeps: tuple[str, ...] = (),
+    *,
+    write_denied: tuple[Path, ...] = (),
 ) -> subprocess.CompletedProcess:
-    return _sh(cmd, cwd, timeout, check, env, input, inherit, keeps)
+    return _sh(cmd, cwd, timeout, check, env, input, inherit, keeps, write_denied=write_denied)
 
 
 def _sh(cmd, cwd=None, timeout=600, check=False, env=None, input=None, inherit=True, keeps=(), *,
         deploy=False, restore_paths=(), binary=False, graceful_timeout=False,
-        index_lock: _DeployIndexLock | None = None) -> subprocess.CompletedProcess:
+        index_lock: _DeployIndexLock | None = None, write_denied=()) -> subprocess.CompletedProcess:
     full_env = foreground_maintenance({**(os.environ if inherit else {}), **(env or {})})
-    command = sandbox.protected_command(cmd, cwd, keeps, _deploy=deploy, _restore_paths=restore_paths)
+    confinement = {"write_denied": write_denied} if write_denied else {}
+    command = sandbox.protected_command(cmd, cwd, keeps, _deploy=deploy, _restore_paths=restore_paths, **confinement)
     try:
         res = run_whole_tree(
             command,
@@ -230,19 +233,28 @@ def hours_awake_since(timestamp: float) -> float:
     return (now().timestamp() - max(timestamp, last_wake())) / 3600
 
 
-def sh_with_network(cmd: list[str] | str, rerun: re.Pattern = NETWORK_ERROR, **kw) -> subprocess.CompletedProcess:
-    res = sh(cmd, **kw)
+def sh_with_network(cmd: list[str] | str, rerun: re.Pattern = NETWORK_ERROR, *,
+                    before_attempt: Callable[[], None] | None = None, **kw) -> subprocess.CompletedProcess:
+    def attempt():
+        if before_attempt:
+            before_attempt()
+        return sh(cmd, **kw)
+
+    res = attempt()
     if res.returncode == 0 or not rerun.search(res.stdout + res.stderr):
         return res
     print(f"{iso()} network error, waiting for the network: {first_line(res.stderr or res.stdout)}", flush=True)
-    return sh(cmd, **kw) if wait_for_network() else res
+    return attempt() if wait_for_network() else res
 
 
 def git(args: list[str], cwd: Path, timeout: float = 300, check: bool = True, input: str | None = None,
-        env: dict | None = None, *, retry: bool = True) -> str:
+        env: dict | None = None, *, retry: bool = True, before_attempt: Callable[[], None] | None = None) -> str:
     keeps = ("ssh-agent",) if git_command(args).partition(" ")[0] in NETWORK_GIT else ()
     call = sh_with_network if retry else sh
-    res = call(["git", *args], cwd=cwd, timeout=timeout, input=input, env=env, keeps=keeps)
+    if before_attempt and not retry:
+        before_attempt()
+    attempt = {"before_attempt": before_attempt} if retry and before_attempt else {}
+    res = call(["git", *args], cwd=cwd, timeout=timeout, input=input, env=env, keeps=keeps, **attempt)
     if check:
         _check_git(args, res)
     return res.stdout

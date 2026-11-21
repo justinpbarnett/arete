@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 
-from . import config, owner_asks, paths, record, util
+from . import config, owner_asks, paths, record, sandbox, util
 from .agent import NO_SESSION, REPLAY, Result, Session, usage_totals
 from .store import runs as run_store
 
@@ -57,7 +57,8 @@ def failed(error: str) -> Result:
 
 
 def run(cwd: Path | str, trace: tuple[str, str], cfg: config.Config, on_line: Callable[[str], None],
-        resume: Session = NO_SESSION, timeout: float | None = None, *, prompt: str = "") -> Result:
+        resume: Session = NO_SESSION, timeout: float | None = None, *, prompt: str = "",
+        excluded_worktrees: tuple[Path, ...] = ()) -> Result:
     if not (where := folder(cfg)):
         return failed(f"replay: no answer folder; set [replay] dir in {paths.short_path(paths.CONFIG_FILE)} or {ENV}")
     name = answer_name(*trace)
@@ -124,8 +125,14 @@ def run(cwd: Path | str, trace: tuple[str, str], cfg: config.Config, on_line: Ca
             on_line(json.dumps({"type": "tool_result", "id": at, "name": call["name"], "text": call["result"],
                                 "error": bool(call.get("error"))}))
     time.sleep(seconds)
-    if patched and (applied := util.sh(["git", "apply", str(patch_file)], cwd=cwd)).returncode != 0:
-        return failed(f"replay: {patch_file} does not apply: {util.first_line(applied.stderr or applied.stdout)}")
+    if patched:
+        confinement = {"write_denied": excluded_worktrees} if excluded_worktrees else {}
+        try:
+            applied = util.sh(["git", "apply", str(patch_file)], cwd=cwd, **confinement)
+        except sandbox.ConfinementUnavailable as error:
+            return failed(str(error))
+        if applied.returncode != 0:
+            return failed(f"replay: {patch_file} does not apply: {util.first_line(applied.stderr or applied.stdout)}")
     return res
 
 

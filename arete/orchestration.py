@@ -4,6 +4,7 @@ import json
 import time
 from contextlib import contextmanager
 from dataclasses import asdict
+from functools import partial
 from math import inf
 from pathlib import Path
 from typing import TextIO
@@ -34,6 +35,7 @@ from . import (
 from .agent import NO_SESSION, Session, json_from_text
 from .orchestration_api import BUNDLES, PROTOCOL, Catalog, describe_operations, help_text
 from .store import asks as ask_store
+from .store import insights as insights_store
 from .store import orchestration as ledger
 from .verify import Verified
 
@@ -90,7 +92,8 @@ class Controller:
         self.data["review"] = self.job.review.asdict()
         self.data["verified"] = asdict(self.job.verified)
         if self.job.checkouts and self.data.get("prepared"):
-            self.data["prepared"]["checkouts"] = [checkout.to_row() for checkout in self.job.checkouts]
+            self.data["prepared"]["checkouts"] = [checkout.to_row() for checkout in self.job.workspace_checkouts]
+            self.data["prepared"]["closed_prs"] = sorted(self.job.closed_prs)
         if self.job.built:
             self.data["checked"] = self.job.b.checked
             self.data["report"] = self.job.b.report
@@ -135,12 +138,13 @@ class Controller:
         if self.flow.refusal:
             raise factory.Refused(self.flow.refusal)
         pending_push = ledger.catch_up_push(self.data)
-        if self.run.feedback and (closed := self.run.feedback_closure()):
+        prepared = self.data.get("prepared")
+        restore_prs = bool(prepared) and not (pending_push or self.run.environment_release or self.run.action_only)
+        if not restore_prs and self.run.feedback and (closed := self.run.feedback_closure()):
             self.quiescent()
             return "noop", closed, ""
         self.flow.matching = False
         run_lines.write(self.run.id, "route", continues=self.flow.continues, mode="orchestrated", protocol=PROTOCOL)
-        prepared = self.data.get("prepared")
         if prepared:
             if not {"run_settings", "overrides", "step_overrides"} <= self.data.keys():
                 raise factory.Refused("the saved controller lacks accepted invocation settings; reconcile before resuming")
@@ -153,9 +157,20 @@ class Controller:
             self.job.layer = pipeline.checked_layer(self.job.cfg, layer_dir, source_file=source_file)
             self.run.cfg, self.run.layer, self.run.kind = self.job.cfg, self.job.layer, prepared["ticket"]["kind"]
             self.lineage()
-            missing = any(not (Path(c["wt"]) / ".git").exists() for c in prepared["checkouts"])
+            if restore_prs:
+                try:
+                    if closed := self.restore_pr_targets(prepared):
+                        return "noop", closed, ""
+                except gh.RetargetedPR as error:
+                    return self.hold_retargeted_pr(error)
+            else:
+                self.job.closed_prs = set(prepared.get("closed_prs", ()))
+            active = [c for c in prepared["checkouts"] if c.get("pr") not in self.job.closed_prs]
+            self.run.excluded_worktrees = {Path(c["wt"]) for c in prepared["checkouts"]
+                                           if c.get("pr") in self.job.closed_prs}
+            missing = any(not (Path(c["wt"]) / ".git").exists() for c in active)
             if missing:
-                if any(Path(c["wt"]).exists() for c in prepared["checkouts"]):
+                if any(Path(c["wt"]).exists() for c in active):
                     raise factory.Refused("the retained workspace is incomplete; reconcile without discarding its edits")
                 if ledger.publication_pending(self.run.id) or not any(
                         a["op"] == "publication.request" and a["state"] == "succeeded" for a in ledger.actions(self.lease)):
@@ -166,7 +181,8 @@ class Controller:
                 flows.restore_environment_draft(self.job, prepared)
             else:
                 if missing:
-                    if why := self.job.restore({"step": "prepare", "tree": str(self.job.ws), "data": prepared}, layer=self.job.layer):
+                    line = {"step": "prepare", "tree": str(self.job.ws), "data": {**prepared, "checkouts": active}}
+                    if why := self.job.restore(line, layer=self.job.layer):
                         raise factory.Refused(why)
                 self.job.take("prepare", factory.Outcome("pass", data=prepared), stored=True)
             for name, value in self.data.get("job", {}).items():
@@ -236,6 +252,7 @@ class Controller:
         self.job.triage = pipeline.triage_notes(self.job.approval)
         self.job.b.plan_text, self.job.b.left_for_a_person = self.job.plan_text, self.job.left_for_a_person
         lineage, old_lineage = self.lineage()
+        self.data.update(lineage)
         self.data["overrides"], self.data["step_overrides"] = self.run.overrides, self.run.step_overrides
         self.data.setdefault("code", codebase.STAMP)
         self.data["recovery_code"] = codebase.STAMP
@@ -246,19 +263,11 @@ class Controller:
         if self.run.environment_release:
             self.data.pop("published", None)
             self.data.pop("published_tree", None)
-        elif prepared:
-            if not self.run.action_only and self.merge_restored_bases():
-                layer = pipeline.resolve_layer(self.job.cfg, self.run, self.job.ws)
-                if layer != self.job.layer:
-                    context = self.catalog.context
-                    self.job.use_layer(layer)
-                    lineage, old_lineage = self.lineage()
-                    self.catalog.context.update(context)
-                    prepared["layer"] = str(layer.dir)
-        elif self.flow.continues and (moved := flows.base_moved(self.flow.continues)):
+        elif restore_prs:
+            self.merge_restored_bases()
+        elif not prepared and self.flow.continues and (moved := flows.base_moved(self.flow.continues)):
             self.job.moved_base = moved
             self.job.merge_moved_base("orchestrate")
-        self.data.update(lineage)
         if old_lineage:
             self.data["lineage_event"] = {"run": self.run.id, "event_id": uuid4().hex, "old": old_lineage,
                                           "new": {key: lineage[key] for key in old_lineage},
@@ -267,43 +276,75 @@ class Controller:
         self.write_lineage_event()
         return None
 
-    def merge_restored_bases(self) -> bool:
-        prs = []
-        retargeted = set()
-        for checkout in self.job.with_prs:
-            pr = gh.pr_merge_details(checkout.pr)
-            if pr.get("state") != "OPEN":
-                continue
-            if not (base := pr.get("baseRefName")):
-                raise workspace.RunFailed(f"GitHub did not identify the target branch for {checkout.pr}")
-            if checkout.base != base:
-                checkout.base = base
-                retargeted.add(checkout.github)
-            checkout.resumes = True
-            prs.append(checkout)
-        if not prs:
+    def restore_pr_targets(self, prepared):
+        targets = {c["pr"]: c["base"] for c in prepared["checkouts"] if c.get("pr")}
+        open_targets = {pr: base for pr, base in targets.items() if self.pr_target_open(pr, base)}
+        self.job.closed_prs = targets.keys() - open_targets.keys()
+        unlisted = [pr for pr in self.run.feedback_prs if pr not in targets]
+        self.run.feedback_closure(unlisted)
+        self.run.closed_feedback_prs += tuple(pr for pr in self.run.feedback_prs if pr in self.job.closed_prs)
+        closed = self.run.closed_feedback_prs
+        if closed and not open_targets and len(closed) == len(self.run.feedback_prs):
+            return f"the PR closed before arete could revise it: {', '.join(closed)}"
+        if targets and not open_targets and all(c.get("pr") in self.job.closed_prs for c in prepared["checkouts"]):
+            return "the saved PRs closed before arete could revise them"
+        if closed:
+            if not (self.run.dry_run or self.run.alone):
+                insights_store.settle_feedback(self.run.id, "recorded", prs=closed)
+            self.run.feedback = [f for f in self.run.feedback if f["pr_url"] not in closed]
+
+        def check_targets():
+            for checkout in self.job.with_prs:
+                if not self.pr_target_open(checkout.pr, checkout.base):
+                    raise workspace.RunFailed(f"{checkout.pr} closed before publication")
+
+        self.job.check_publication_targets = check_targets
+        return ""
+
+    def pr_target_open(self, pr, base, details=None):
+        if details is None:
+            details = gh.pr_merge_details(pr)
+        if details.get("state") in ("CLOSED", "MERGED"):
             return False
-        targets = {c.github: c.base for c in prs}
-        merged_kept = []
-        if self.flow.continues and (moved := flows.base_moved(self.flow.continues, targets=targets)):
-            self.job.moved_base = moved
-            merged_kept = self.job.merge_moved_base("orchestrate", repos=set(targets))
-        bases = {}
+        if details.get("state") != "OPEN" or not (current := details.get("baseRefName")):
+            raise workspace.RunFailed(f"GitHub did not identify the open PR and its target branch for {pr}")
+        if base != current:
+            raise gh.RetargetedPR(pr, base, current)
+        return True
+
+    def hold_retargeted_pr(self, error):
+        reason = str(error)
+        self.run.log(f"{error.pr}: {reason}")
+        if not self.run.dry_run:
+            key = ledger.digest(["retargeted", error.pr, error.previous, error.current])
+            gh.pr_comment(error.pr, pipeline.public_text(self.run, reason), key=key)
+            if not self.run.alone:
+                self.run.enter("pr")
+                if self.run.feedback:
+                    insights_store.settle_feedback(self.run.id, "failed")
+        return "failed", reason, error.pr
+
+    def merge_restored_bases(self):
+        job = self.job
+        prs = job.with_prs
         for checkout in prs:
+            checkout.resumes = True
             workspace.fetch(checkout.src, checkout.base)
-            if checkout.github in retargeted:
-                base = bases[checkout.github] = util.git(["rev-parse", checkout.origin_base], checkout.wt).strip()
-                if checkout.base_commit != base:
-                    checkout.merge, checkout.merged_base = "", False
-                    checkout.resolved, checkout.resolved_lines = [], 0
-        merged = pipeline.merge_moved_bases(self.run, prs, self.job.layer, self.job.ticket, bases=bases,
-                                            allow_untracked=True)
+        merged = pipeline.merge_moved_bases(self.run, prs, job.layer, job.ticket, allow_untracked=True)
         if merged:
+            layer = pipeline.resolve_layer(job.cfg, self.run, job.ws)
+            if delegation.settings_sha(layer) != delegation.settings_sha(job.layer):
+                recovery = {"reason": "policy-changed"}
+                if job.closed_checkouts:
+                    recovery.update(branch=job.branch, closed_checkouts=[c.to_row() for c in job.closed_checkouts])
+                raise workspace.RunFailed(pipeline.worker_policy_changed(), recovery=recovery)
             for checkout in merged:
-                self.job.b.worker_trees.pop(checkout.github, None)
-            workspace.note_made(self.job.ws, self.job.checkouts)
-        self.job.b.workspace = self.job.workspace
-        return bool(merged_kept or merged)
+                job.b.worker_trees.pop(checkout.github, None)
+            workspace.note_made(job.ws, job.checkouts, excluded=self.run.excluded_worktrees)
+        if self.run.answers_due:
+            self.run.kept_note = pipeline.kept_edits_note([c for c in job.checkouts if c.onto])
+            self.run.base_note = pipeline.base_merge_note([c for c in merged if c.onto])
+        job.b.workspace = job.workspace
 
     def lineage(self):
         self.catalog = Catalog(self.job)
@@ -601,11 +642,14 @@ class Controller:
                     self.run.paid += message.get("paid_usd", 0)
                     result = {**message, "effective": worker.effective, "writing": worker.writing}
                     if worker.writing:
-                        workspace.note_made(self.job.ws, self.job.checkouts,
-                                            pipeline.workspace_owner(self.run, self.job.ws, self.job.checkouts))
-                        if why := workspace.kept_work(self.job.ws, self.job.checkouts, self.run.repo.path,
+                        checkouts = self.job.checkouts
+                        excluded = self.run.excluded_worktrees
+                        workspace.note_made(self.job.ws, checkouts,
+                                            pipeline.workspace_owner(self.run, self.job.ws, checkouts), excluded=excluded)
+                        if why := workspace.kept_work(self.job.ws, checkouts, self.run.repo.path,
                                                        self.job.layer.copy, commits=False,
-                                                       held=workspace.scratch_left(self.job.ws, self.job.checkouts)):
+                                                       held=workspace.scratch_left(self.job.ws, checkouts),
+                                                       excluded=excluded):
                             raise workspace.worktree_failure(why, self.job.ws, self.job.branch)
                     ledger.transition(self.lease, key, "succeeded" if message.get("ok") else "failed", result)
                     self.catalog.add_context(key, message.get("text", message.get("error", "")))
@@ -707,6 +751,8 @@ class Controller:
             return self.reconcile_catch_up(pending)
         if self.data.get("publication_intent"):
             raise factory.Refused("publication was interrupted; reconcile its branch/PR effects before resuming")
+        if self.job.check_publication_targets:
+            self.job.check_publication_targets()
         needed = [gate for gate in ("checks", "review", "verify") if not self.current(gate)]
         if needed:
             raise ValueError("publication needs current evidence: " + ", ".join(needed))
@@ -729,7 +775,7 @@ class Controller:
             grant = zte.prepare_candidate(self.run, self.job, self.data)
             self.ending = ("pr", "Prepared an exact README candidate for engine-owned delivery", "")
             return {"prepared_head": grant.data["head"], "tree": grant.data["tree"]}
-        self.check_pilot_publication()
+        self.check_publication()
         if catch_up:
             checkout, = self.job.checkouts
             self.take_merge_lease(checkout)
@@ -753,7 +799,7 @@ class Controller:
 
     def retry_publication_ci(self, retry, tree):
         job = self.job
-        self.check_pilot_publication()
+        self.check_publication()
         flows.require_environment_owner_clear(job)
         flows.refuse_changed_prs(job)
         checkouts = {c.github: c for c in job.with_prs}
@@ -774,6 +820,8 @@ class Controller:
             self.take_merge_lease(checkout)
         for checkout in pushed:
             row = gh.pr_merge_details(checkout.pr)
+            if job.check_publication_targets:
+                self.pr_target_open(checkout.pr, checkout.base, row)
             if (row.get("state") != "OPEN" or row.get("headRefOid") != checkout.lease
                     or row.get("baseRefName") != checkout.base):
                 raise ValueError("the PR no longer matches this run's published head and base")
@@ -794,6 +842,8 @@ class Controller:
         self.persist()
         for repo, requested in launches.items():
             for rerun in requested:
+                if job.check_publication_targets:
+                    job.check_publication_targets()
                 gh.rerun_failed_jobs(repo, rerun.run)
         failure = self.publication_ci(pushed, caught_up=retry["caught_up"], reruns=reruns)
         if failure:
@@ -821,7 +871,7 @@ class Controller:
         tree = self.fingerprint()
         current = pipeline.watch_publication_ci(self.run, self.job.slot, pushed, reruns=reruns)
         self.job.ci_result = current.summary()
-        self.check_pilot_publication()
+        self.check_publication()
         section = pipeline.ci.section([current], current.n)
         if caught_up:
             for checkout in pushed:
@@ -852,7 +902,7 @@ class Controller:
         check_head = caught_up or self.data.get("catch_up_hold")
         watched_heads = {w.target.pr: w.target.sha for w in current.seen}
         for checkout in self.job.with_prs:
-            self.check_pilot_publication()
+            self.check_publication()
             if check_head and (watched_heads.get(checkout.pr) != checkout.lease
                                or pipeline.own_draft_state(self.run, checkout) is None):
                 continue
@@ -880,9 +930,14 @@ class Controller:
         for checkout in candidates:
             if len(job.checkouts) == 1:
                 self.take_merge_lease(checkout)
+            target_check = {}
+            if job.check_publication_targets:
+                target_check["check_target"] = partial(self.pr_target_open, checkout.pr, checkout.base)
             while True:
+                if job.check_publication_targets:
+                    job.check_publication_targets()
                 hold = pipeline.try_automerge(job.b, checkout, job.verified, job.review, about,
-                                              track_moved_base=track_base)
+                                              track_moved_base=track_base, **target_check)
                 if hold is None:
                     self.clear_catch_up_hold()
                     return None
@@ -918,13 +973,15 @@ class Controller:
                 raise
 
         try:
-            base_sha, hold = pipeline.catch_up_target(b, checkout, job.slot)
+            check_target = partial(self.pr_target_open, checkout.pr, checkout.base) if job.check_publication_targets else None
+            base_sha, hold = pipeline.catch_up_target(b, checkout, job.slot, check_target=check_target)
             if hold:
                 return self.catch_up_failure(hold)
             b.catch_ups += 1
+            target_check = {"check_targets": job.check_publication_targets} if job.check_publication_targets else {}
             job.verified, job.review = pipeline.catch_up_base(
                 b, checkout, job.branch, base_sha, job.with_left(job.goal), job.with_left(job.plan_text),
-                job.review, before_push=remember_push)
+                job.review, before_push=remember_push, **target_check)
         except pipeline.CatchUpGateHold as error:
             return self.hold_catch_up(checkout, base_sha, error)
         except pipeline.CatchUpPushUnconfirmed:
@@ -1043,7 +1100,7 @@ class Controller:
         pipeline.publish_gate_evidence(self.run, job.ticket, checkout, job.verified, job.review)
 
     def finish_publication(self):
-        self.check_pilot_publication()
+        self.check_publication()
         self.data["publication_intent"] = {"tree": self.fingerprint(), "phase": "publish"}
         self.persist()
         outcome = self.atomic("publish", merge=self.automerge)
@@ -1060,6 +1117,11 @@ class Controller:
         self.ending = flows.ended(self.flow, outcome)
         self.release_merge_lease()
         return outcome.data
+
+    def check_publication(self):
+        self.check_pilot_publication()
+        if self.job.check_publication_targets:
+            self.job.check_publication_targets()
 
     def check_pilot_publication(self):
         if pilot.is_pilot_task(str(self.run.tid)):
@@ -1256,6 +1318,12 @@ class Controller:
             self.persist()
             run_lines.write(self.run.id, "action", action=action["id"], op=action["op"], state="succeeded")
             raise
+        except gh.RetargetedPR as error:
+            refusal = error
+            self.ending = self.hold_retargeted_pr(error)
+            self.data.pop("publication_intent", None)
+            result = {"error": str(error)}
+            ledger.transition(self.lease, action["id"], "failed", result)
         except ValueError as error:
             refusal = error
             result = {"error": str(error)[:2000]}
@@ -1389,7 +1457,8 @@ def single_worker(flow):
                 "calls": batch}, turn, snapshot["version"], {a["id"]: a for a in ledger.actions(controller.lease)})
             actions = ledger.accept(controller.lease, turn, snapshot["version"], response, controller.policy.max_actions)
             for action in actions:
-                controller.dispatch(action)
+                if isinstance(controller.dispatch(action), gh.RetargetedPR):
+                    return controller.ending
                 while controller.workers:
                     controller.collect()
                     time.sleep(0.05)

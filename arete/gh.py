@@ -10,7 +10,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import timedelta
@@ -32,6 +32,12 @@ class GhError(RuntimeError):
 
 class GhUnsure(GhError):
     pass
+
+
+class RetargetedPR(ValueError):
+    def __init__(self, pr: str, previous: str, current: str):
+        self.pr, self.previous, self.current = pr, previous, current
+        super().__init__(f"The PR base changed from `{previous}` to `{current}`. A person needs to revise it.")
 
 
 def marked(body: str) -> str:
@@ -646,12 +652,15 @@ def _required_ci_refusal(repo: str, head: str, required: dict) -> str:
 
 
 def merge_readiness(repo: str, number: int, head: str, base: str, base_sha: str, *, wait: float = 0,
-                    required: dict | None = None, track_moved_base: bool = False) -> tuple[str, str]:
+                    required: dict | None = None, track_moved_base: bool = False,
+                    check_target: Callable[[dict], bool] | None = None) -> tuple[str, str]:
     if not head or not base or not base_sha:
         return "", "the checked head and base are not known"
     deadline = time.monotonic() + wait
     while True:
         row = pr_merge_details(str(number), repo)
+        if check_target:
+            check_target(row)
         if hold := merge_ref_hold(row, head, base):
             return "", hold
         state, mergeable = row.get("mergeStateStatus"), row.get("mergeable")
@@ -671,8 +680,11 @@ def merge_readiness(repo: str, number: int, head: str, base: str, base_sha: str,
     return str(row.get("title") or "").strip(), ""
 
 
-def merge_rejection_hold(repo: str, number: int, head: str, base: str, base_sha: str) -> str:
+def merge_rejection_hold(repo: str, number: int, head: str, base: str, base_sha: str,
+                         check_target: Callable[[dict], bool] | None = None) -> str:
     row = pr_merge_details(str(number), repo)
+    if check_target:
+        check_target(row)
     if hold := merge_ref_hold(row, head, base):
         return hold
     if row.get("baseRefOid") and row["baseRefOid"] != base_sha:
@@ -680,8 +692,10 @@ def merge_rejection_hold(repo: str, number: int, head: str, base: str, base_sha:
     return ""
 
 
-def pr_merge_auto(repo: str, number: int, head: str, base: str, base_sha: str, *, track_moved_base: bool = False) -> str:
-    subject, hold = merge_readiness(repo, number, head, base, base_sha, track_moved_base=track_moved_base)
+def pr_merge_auto(repo: str, number: int, head: str, base: str, base_sha: str, *, track_moved_base: bool = False,
+                  check_target: Callable[[dict], bool] | None = None) -> str:
+    target_check = {"check_target": check_target} if check_target else {}
+    subject, hold = merge_readiness(repo, number, head, base, base_sha, track_moved_base=track_moved_base, **target_check)
     if hold:
         return hold
     payload = {"sha": head, "merge_method": "squash"}
@@ -692,7 +706,7 @@ def pr_merge_auto(repo: str, number: int, head: str, base: str, base_sha: str, *
                    input=Outgoing(json.dumps(payload)), write=True)
     except GhError as error:
         if track_moved_base and not isinstance(error, GhUnsure) and BASE_MERGE_HTTP_REJECTION.search(str(error)):
-            if hold := merge_rejection_hold(repo, number, head, base, base_sha):
+            if hold := merge_rejection_hold(repo, number, head, base, base_sha, **target_check):
                 return hold
         raise
     if not track_moved_base:
@@ -707,7 +721,7 @@ def pr_merge_auto(repo: str, number: int, head: str, base: str, base_sha: str, *
     if result["merged"]:
         return ""
     if re.fullmatch(BASE_MERGE_REJECTION, str(result.get("message", "")).strip(), re.IGNORECASE):
-        if hold := merge_rejection_hold(repo, number, head, base, base_sha):
+        if hold := merge_rejection_hold(repo, number, head, base, base_sha, **target_check):
             return hold
     return "GitHub rejected the merge"
 

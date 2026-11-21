@@ -581,12 +581,14 @@ def guard_env(floor: guard.Floor, auth_paths: list[Path] | None = None,
                                               "write_files": [str(GUARD_FILE), str(ASK_FILE), str(SHELL_FILE)]})}
 
 
-def confinement(cwd: Path, add_dirs: list[Path], floor: guard.Floor, selected: Route | None) -> list[str]:
+def confinement(cwd: Path, add_dirs: list[Path], floor: guard.Floor, selected: Route | None, *,
+                excluded_worktrees: tuple[Path, ...] = ()) -> list[str]:
     return sandbox.write_confinement(
         cwd, add_dirs, selected.owner if selected and selected.using_login else None,
         state=(paths.STATE_DIR, (*floor.open, sandbox.SESSIONS_DIR, sandbox.AGENT_DIR, sandbox.LOGIN_DIR,
                                  sandbox.KEY_DIR, paths.PACKAGE_DIR)),
-        hidden=(paths.CONFIG_DIR, paths.LOG_DIR, paths.CLIENT_DIR), peers=paths.WORKTREES_DIR)
+        hidden=(paths.CONFIG_DIR, paths.LOG_DIR, paths.CLIENT_DIR), peers=paths.WORKTREES_DIR,
+        write_denied=excluded_worktrees)
 
 
 def command(names: list[str], *, model: str = "", effort: str = "", resume: Session = NO_SESSION, system: str = "",
@@ -819,6 +821,7 @@ def _run(
     judge: bool = False,
     read_roots: tuple[Path, ...] = (),
     native_observation: str = "",
+    excluded_worktrees: tuple[Path, ...] = (),
 ) -> Result:
     auth = auth if auth is not None else accounts.Auth("api_key")
     if mcp_servers(mcp_config):
@@ -852,11 +855,12 @@ def _run(
         prompt = f"{prompt}\n\n{SCHEMA_RULE.format(schema=json.dumps(json_schema))}"
     confined = False
     writing = sorted(WRITING & set(names))
-    if writing or observing:
+    if writing or observing or excluded_worktrees:
         if not sandbox.can_confine(False):
             return Result(ok=False, error=f"{sandbox.NO_CONFINEMENT_REASON}, so pi cannot run confined commands here",
                           session=resume, runner="pi", model=model)
-        cmd = confinement(cwd, add_dirs, floor, selected) + cmd
+        excluded = {"excluded_worktrees": excluded_worktrees} if excluded_worktrees else {}
+        cmd = confinement(cwd, add_dirs, floor, selected, **excluded) + cmd
         confined = True
     if selected and selected.using_login and not confined and sandbox.can_confine(False):
         cmd = confinement(cwd, add_dirs, floor, selected) + cmd

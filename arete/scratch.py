@@ -1057,21 +1057,24 @@ def exposure(path: Path, grants) -> Path | None:
     return None
 
 
-def spawn(*args, actor_confined: bool = False, **kwargs) -> subprocess.Popen:
+def spawn(*args, actor_confined: bool = False, write_denied: tuple[Path, ...] = (), **kwargs) -> subprocess.Popen:
     a = PRODUCING.get()
+    if actor_confined and write_denied:
+        raise ValueError("write exclusions must be applied by the process launcher")
+    confinement = {"write_denied": write_denied} if write_denied else {}
     if a is None and actor_confined:
         return subprocess.Popen(*args, **kwargs)
     command, *rest = args
     if kwargs.pop("shell", False):
         command = [kwargs.pop("executable", None) or "/bin/sh", "-c", command]
     if a is None:
-        return subprocess.Popen(sandbox.protected_command(command, kwargs.get("cwd")), *rest, **kwargs)
+        return subprocess.Popen(sandbox.protected_command(command, kwargs.get("cwd"), **confinement), *rest, **kwargs)
     kwargs.pop("process_group", None)
     if not actor_confined:
         with registry() as (fd, key):
             if load(fd, key, a.selector)["state"] == "active":
                 raise sandbox.ConfinementUnavailable("active authority requires verified actor confinement")
-        command = sandbox.protected_command(command, kwargs.get("cwd"))
+        command = sandbox.protected_command(command, kwargs.get("cwd"), **confinement)
     producer = secrets.token_hex(16)
     producer_group(a, producer, None)
     passed = tuple(kwargs.get("pass_fds", ()))
