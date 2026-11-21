@@ -451,12 +451,14 @@ def kill_tree(root: int) -> None:
 
 
 def lock_is_held(name: str) -> bool:
-    with lock_file(name) as f:
-        try:
+    try:
+        with (paths.LOCKS_DIR / f"{name}.lock").open() as f:
             fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return True
-        return False
+    except BlockingIOError:
+        return True
+    except FileNotFoundError:
+        pass
+    return False
 
 
 def read_env_file(path: Path) -> dict[str, str]:

@@ -1698,7 +1698,7 @@ Arete stops the server's whole process group after each verifier run, so no dev 
 
 Use a feature map for a few important product journeys. Each entry names the steps a user takes and the outcome a verifier can observe. Define entries inline or set `feature_map = "feature-map.toml"` under `[verify]` and use top-level tables such as `[browse-catalog]` in that file. Use a regular TOML file under the layer directory. Keep journey and driver names lowercase and hyphen-separated.
 
-Set an optional `tracker_criterion` on a journey to approve a single plain-text line for parked retry and escalation comments. The issue must name the journey, for example `journey:browse-catalog`, and the finding must refer to that journey. The journey steps, outcome, commands and observed evidence stay in the run.
+Set an optional `tracker_criterion` on a journey to approve a single plain-text line for parked retry comments. The issue must name the journey, for example `journey:browse-catalog`, and the finding must refer to that journey. The journey steps, outcome, commands and observed evidence stay in the run.
 
 ```toml
 [verify.feature_map.browse-catalog]

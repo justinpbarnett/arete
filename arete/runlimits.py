@@ -16,7 +16,7 @@ from pathlib import Path
 from . import budget_legacy, gh, paths, run_lines, util
 from .store import db as foundation
 from .store import runs as run_store
-from .tracker import BATCH_LABEL, ParkComment, github_hold, github_park_hold, is_task_id
+from .tracker import BATCH_LABEL, github_hold, github_park_hold, is_task_id
 
 IDLE_WAITS = ("limit", "slot")
 CHECKPOINT_SECONDS = 30
@@ -137,11 +137,13 @@ def heads(repo, branch: str) -> dict[str, str]:
 
 
 def latest_park(repo: str, tid: str) -> tuple[dict, dict]:
-    rows = run_store.ticket_runs(repo, tid, limit=1)
+    rows = run_store.ticket_runs(repo, tid, limit=1, live=True)
     row = rows[0] if rows else {}
     for rid in family(row["id"]) if row else ():
         if saved := metadata(rid, "parked.json"):
-            return run_store.run_get(rid) or row, saved
+            prior = run_store.run_get(rid) or row
+            if not prior["dry_run"] and prior["status"] != "dry-run":
+                return prior, saved
     return row, {}
 
 
@@ -173,39 +175,18 @@ def feedback_key(comment) -> str:
     return readmission_key([comment.when, comment.body])
 
 
-def needs_info(ticket) -> bool:
-    return ticket.state == "needs-info" or "agent:needs-info" in ticket.labels
-
-
 def park_retry(row: dict, saved: dict, ticket):
+    if row.get("only_step") or BATCH_LABEL in ticket.labels:
+        return None
     retry = ticket.retries[-1] if ticket.retries else None
     return retry if retry and retry.run_id == row["id"] and newer(retry.when, parked_at(row, saved)) else None
 
 
-def park_feedback(row: dict, saved: dict, ticket) -> str:
-    if row.get("only_step") or BATCH_LABEL in ticket.labels:
-        return ""
-    cutoff = parked_at(row, saved)
-    question, answer = ticket.park_question, ticket.park_answer
-    if question and question.run_id == row["id"]:
-        if answer and newer(answer.when, cutoff):
-            return feedback_key(answer)
-        if not needs_info(ticket) and "agent:failed" not in ticket.labels and ticket.state != "failed":
-            return readmission_key(["question released", feedback_key(question)])
-        return ""
-    if question and newer(question.when, cutoff):
+def park_feedback(repo, row: dict, saved: dict, ticket) -> str:
+    if not ticket.open or ticket.blocker or park_label_hold(repo, ticket) or ticket.state == "needs-info":
         return ""
     retry = park_retry(row, saved, ticket)
     return feedback_key(retry) if retry else ""
-
-
-def waiting_for_park_answer(row: dict, saved: dict, ticket) -> bool:
-    if not needs_info(ticket):
-        return False
-    question = ticket.park_question
-    if question and question.run_id == row["id"]:
-        return not ticket.park_answer or not newer(ticket.park_answer.when, parked_at(row, saved))
-    return bool(park_retry(row, saved, ticket))
 
 
 def automatic_hold(repo, ticket) -> str:
@@ -266,16 +247,14 @@ class Readmission:
     def matches(self, repo, row: dict, saved: dict, ticket, policy: Policy, *, closed_pr_revision: bool = False) -> bool:
         spec, limits = specification(ticket), asdict(policy)
         if (not (ticket.open or closed_pr_revision and not self.feedback)
-                or automatic_hold(repo, ticket) or park_label_hold(repo, ticket)
+                or automatic_hold(repo, ticket)
+                or (park_retry(row, saved, ticket) and park_label_hold(repo, ticket))
                 or self.baseline != readmission_key(saved)
                 or self.inputs != readmission_key([spec, limits])):
             return False
-        feedback = park_feedback(row, saved, ticket)
-        if waiting_for_park_answer(row, saved, ticket):
-            return False
         if not self.branch:
             if self.feedback:
-                return self.feedback == feedback and not self.attempted()
+                return self.feedback == park_feedback(repo, row, saved, ticket) and not self.attempted()
             return inputs_changed(saved, spec, limits)
         names = {name for name, _ in checkouts(repo)}
         return (self.branch == park_branch(row, saved) and complete_heads(saved.get("heads"), names)
@@ -295,32 +274,11 @@ class Readmission:
         return False
 
 
-def purged_park_question(row: dict, ticket) -> ParkComment | None:
-    question = ticket.park_question
-    if (row.get("files_purged") and row["status"] == "failed" and not row.get("only_step")
-            and BATCH_LABEL not in ticket.labels and question and question.run_id == row["id"]):
-        return question
-    return None
-
-
-def purged_park_reply(repo, row: dict, ticket, policy: Policy) -> Readmission | None:
-    question, answer = purged_park_question(row, ticket), ticket.park_answer
-    if (not question or not answer or answer.run_id != question.run_id or not ticket.open or ticket.blocker
-            or automatic_hold(repo, ticket) or park_label_hold(repo, ticket)):
-        return None
-    return Readmission(row["id"], readmission_key([row["files_purged"], feedback_key(question)]),
-                       readmission_key([specification(ticket), asdict(policy)]), feedback=feedback_key(answer))
-
-
 def admission(repo, tid: str, tracker, policy: Policy, explicit: bool, *,
               readmission: Readmission | None = None, ticket=None, closed_pr_revision: bool = False) -> tuple[str, bool]:
     row, saved = latest_park(repo.name, tid)
     if not saved:
-        if not readmission:
-            return "", False
-        if readmission == purged_park_reply(repo, row, ticket or tracker.get(tid), policy):
-            return "", True
-        return "the parked run changed before launch", False
+        return ("the parked run changed before launch", False) if readmission else ("", False)
     if explicit:
         spec = specification(tracker.get(tid)) if saved.get("specification") else ""
         if inputs_changed(saved, spec, asdict(policy)):
@@ -339,25 +297,19 @@ def poll_admission(repo, tid: str, ticket, policy: Policy) -> tuple[str, Readmis
         return hold, None
     row, saved = latest_park(repo.name, tid)
     if not saved:
-        if proof := purged_park_reply(repo, row, ticket, policy):
-            return "", proof
-        if needs_info(ticket) and purged_park_question(row, ticket):
-            return f"waiting for the owner's reply to parked run {row['id']}", None
         return "", None
-    if hold := park_label_hold(repo, ticket):
+    if park_retry(row, saved, ticket) and (hold := park_label_hold(repo, ticket)):
         return hold, None
     reason = park_reason(row, saved)
     tried = f"{reason} Poll already tried these inputs."
     spec, limits = specification(ticket), asdict(policy)
     proof = Readmission(row["id"], readmission_key(saved), readmission_key([spec, limits]))
     try:
-        if waiting_for_park_answer(row, saved, ticket):
-            return reason, None
         if inputs_changed(saved, spec, limits):
             if not proof.attempted():
                 return "", proof
             reason = tried
-        if ticket.open and (feedback := park_feedback(row, saved, ticket)):
+        if feedback := park_feedback(repo, row, saved, ticket):
             feedback_proof = replace(proof, feedback=feedback)
             if not feedback_proof.attempted():
                 return "", feedback_proof
@@ -438,6 +390,8 @@ class Budget:
                for row in rows.values()):
             raise ValueError("the repair budget chain names a different or missing ticket run")
         current = specification(ticket) if ticket else None
+        if run.environment_release or run.preview_of:
+            chain = [rid for rid in chain if not rows[rid]["dry_run"] and rows[rid]["status"] != "dry-run"]
         left = [rid for rid in chain
                 if forced and current and (found := recorded_specification(rid)) and found != current]
         left_repairs = sum(repair_count(rid) for rid in left)

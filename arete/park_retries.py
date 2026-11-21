@@ -136,7 +136,10 @@ def verification(run_id: str, lines: list[tuple[int, dict]]) -> tuple[dict, str,
         if event == "verification_end":
             verdict = line.get("verdict")
             found, file, at = verify_event(run_id, match[0], line, number)
-            if not isinstance(line.get("data"), dict) and not line.get("startup_failed"):
+            attempt_file = f"{match[0]}-attempt.json"
+            if attempt_result := artifact(run_id, attempt_file):
+                found, file, at = with_worker_error(run_id, match[0], attempt_result), attempt_file, 1
+            elif not isinstance(line.get("data"), dict) and not line.get("startup_failed"):
                 if saved := verification_files(run_id, attempt, only_attempt=True, server_fallback=False):
                     found, file, at = saved
                     found = with_worker_error(run_id, match[0], found)
@@ -154,11 +157,11 @@ def verification(run_id: str, lines: list[tuple[int, dict]]) -> tuple[dict, str,
             if outer:
                 break
             if has_result:
-                if found[0].get("verdict") != "blocked":
-                    return found
-                outer_result = found
                 if isinstance(names := data.get("names"), dict):
                     outer_attempt = names.get("verify")
+                if not outer_attempt and found[0].get("verdict") != "blocked":
+                    return found
+                outer_result = found
             elif line["result"] not in ("fail", "stop"):
                 return {}, run_lines.FILE, number
             outer = found
@@ -255,6 +258,21 @@ def record_lines(run_id: str, file: str, line: int, rows: list[dict], field: str
     return [matches.popleft() if matches else line for matches in numbers]
 
 
+def verification_failure_class(verdict: str, failed: int, startup_failed: bool) -> str:
+    if startup_failed:
+        return "Verification startup failure"
+    if verdict == "blocked":
+        return "Verification blocked"
+    return "Verification failure" if verdict == "fail" and not failed else ""
+
+
+def verification_classes(verdict: str, failed: int, startup_failed: bool) -> list[str]:
+    classes = ["Failed verification check"] * failed
+    if kind := verification_failure_class(verdict, failed, startup_failed):
+        classes.append(kind)
+    return classes
+
+
 def evidence(run_id: str) -> list[Finding]:
     lines = numbered_log(run_id)
     listed = []
@@ -269,10 +287,7 @@ def evidence(run_id: str) -> list[Finding]:
               for check, at in zip(checks, record_lines(run_id, file, number, checks, "what"))
               if check.get("passed") is False]
     listed.extend(failed)
-    if checked.get("startup_failed") or checked.get("verdict") == "blocked" or (
-            not failed and checked.get("verdict") == "fail"):
-        kind = ("Verification startup failure" if checked.get("startup_failed") else
-                "Verification blocked" if checked.get("verdict") == "blocked" else "Verification failure")
+    if kind := verification_failure_class(checked.get("verdict"), len(failed), checked.get("startup_failed")):
         listed.append(Finding(kind, file, number, {k: checked[k] for k in ("error", "summary", "blocked_by", "feedback")
                                                    if checked.get(k)}))
     return listed
@@ -286,14 +301,18 @@ def findings(run_id: str, criteria: dict[str, str]) -> list[str]:
     return listed
 
 
-def task_evidence(repo: str, ticket: tracker.Ticket, run_id: str) -> str:
+def ticket_evidence(repo: str, ticket: tracker.Ticket, run_id: str) -> list[Finding]:
     row = run_store.run_get(run_id) if RUN_ID.fullmatch(run_id) else None
     if (not row or row["kind"] != "pipeline" or row.get("only_step")
             or (row["repo"], str(row["issue"])) != (repo, ticket.id) or not artifact(run_id, "parked.json")):
-        return ""
+        return []
+    return evidence(run_id)
+
+
+def task_evidence(run_id: str, findings: list[Finding]) -> str:
     entries = [f"### {finding.pointer(run_id)}\n\n"
                + "\n".join(f"{name}: {value}" for name, value in finding.evidence.items() if value not in (None, ""))
-               for finding in evidence(run_id)]
+               for finding in findings]
     return f"## Local evidence from parked run {run_id}\n\n" + "\n\n".join(entries) if entries else ""
 
 
@@ -337,39 +356,14 @@ def eligible(source: ParkTracker, ticket: tracker.Ticket, issue: str, saved: dic
     if isinstance(source, tracker.LocalTracker):
         row = tasks_store.task_get(ticket.id)
         return bool(row and row["version"] == ticket.version and row["state"] in ("todo", "failed"))
-    return not (tracker.github_park_hold(ticket.labels) or runlimits.needs_info(ticket))
+    return not tracker.github_park_hold(ticket.labels)
 
 
-def append(source: ParkTracker, ticket: tracker.Ticket, body: str, *, needs_info: bool = False) -> bool:
+def append(source: ParkTracker, ticket: tracker.Ticket, body: str) -> bool:
     if isinstance(source, tracker.LocalTracker):
         return tasks_store.task_append_comment(ticket.id, body, base_version=ticket.version, title=ticket.title,
-                                               description=ticket.body, needs_info=needs_info)
+                                               description=ticket.body)
     gh.issue_comment(source.repo.github, int(ticket.id), body, single_attempt=True)
-    return True
-
-
-def asked(ticket: tracker.Ticket, run_id: str) -> bool:
-    return bool(ticket.park_question and ticket.park_question.run_id == run_id)
-
-
-def ask_owner(source: ParkTracker, issue: str, run_id: str, saved: dict, question: str) -> bool:
-    ticket = source.get(issue)
-    if not eligible(source, ticket, issue, saved):
-        return False
-    if isinstance(source, tracker.LocalTracker):
-        if asked(ticket, run_id):
-            return tasks_store.task_set_state(issue, "needs-info", ("todo", "failed"), base_version=ticket.version)
-        return append(source, ticket, question, needs_info=True)
-    if asked(ticket, run_id):
-        if ticket.park_answer or source.label_name("failed") not in ticket.labels:
-            return True
-    else:
-        append(source, ticket, question)
-        ticket = source.get(issue)
-        if not eligible(source, ticket, issue, saved):
-            return False
-    gh.issue_labels(source.repo.github, int(issue), add=[source.label_name("needs-info")],
-                    remove=[source.label_name("failed")], single_attempt=True)
     return True
 
 
@@ -409,19 +403,9 @@ def settle_retry(source: ParkTracker, issue: str, run: dict, saved: dict, summar
         return
     count = max(len(posted | {prior for prior, status in rewrites.items() if status == "done"}),
                 max((comment.number for comment in ticket.retries), default=0))
-    listed = "\n".join(findings(rid, tracker_criteria(source.repo, ticket, secrets)) or [f"- {summary}"])
     if count >= MAX_REWRITES:
-        reply = (f'Reply with `arete task reply {issue} "your reply"`.'
-                 if isinstance(source, tracker.LocalTracker) else
-                 "Reply in a comment on this GitHub issue or remove the `agent:needs-info` label to retry.")
-        question = (f"{tracker.ARETE_TAG} Parked retry question for run {rid}.\n\n{listed}\n\n"
-                    f"What behavior should the next attempt implement? {reply}")
-        if not screened(question, secrets):
-            return "Outbound screening held the parked retry question."
-        if ask_owner(source, issue, rid, saved, question):
-            state["escalated"] = rid
-            util.write_json(journal, state)
         return
+    listed = "\n".join(findings(rid, tracker_criteria(source.repo, ticket, secrets)) or [f"- {summary}"])
     marker = f"<!-- arete:retry run={rid} n={count + 1} -->"
     body = (f"{marker}\n\n## From parked run {rid}\n\n"
             "Keep the ticket's requirements and address these findings in the next attempt. "
@@ -454,7 +438,7 @@ def retry_ticket(source: ParkTracker, issue: str, secrets: tuple[str, ...]) -> s
         try:
             state = json.loads(journal.read_text())
         except FileNotFoundError:
-            state = {"rewrites": {}, "escalated": False}
+            state = {"rewrites": {}}
         ticket = None
         if "pending" in state["rewrites"].values():
             try:
@@ -481,7 +465,7 @@ def retry_ticket(source: ParkTracker, issue: str, secrets: tuple[str, ...]) -> s
         parked, _ = runlimits.latest_park(repo.name, issue)
         if parked.get("id") != run["id"]:
             return
-        if state["rewrites"].get(run["id"]) == "done" or state["escalated"] == run["id"]:
+        if state["rewrites"].get(run["id"]) == "done":
             return
         saved = artifact(run["id"], "parked.json")
         summary = budget_summary(saved)

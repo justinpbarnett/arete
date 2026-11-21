@@ -82,8 +82,7 @@ def task_reply(args) -> int:
     if not text:
         print('arete task reply ID "your reply"', file=sys.stderr)
         return 2
-    actor = principals.current()
-    tasks_store.task_comment(tid, "owner" if actor == "hand" else actor, text)
+    tasks_store.task_comment(tid, principals.current(), text)
     print(f"{tid}: reply saved")
     return 0
 

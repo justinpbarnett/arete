@@ -44,7 +44,6 @@ from arete import (
     workspace,
 )
 from arete.agent import Result
-from arete.commands.tasks import task_reply
 from arete.orchestration_api import MAX_BYTES, OPERATIONS, PROTOCOL, Catalog, describe_operations
 from arete.store import asks as ask_store
 from arete.store import db as foundation
@@ -850,31 +849,7 @@ class ParkRetryFixture(PollFixture):
 
 
 class LocalParkRetryTests(ParkRetryFixture):
-    def test_local_reply_readmits_after_run_retention(self):
-        parked = self.park_ticket("fixture/parked")
-        self.local.comment(self.ticket, f"[arete] Parked retry question for run {parked.id}.")
-        self.local.label(self.ticket, add=["needs-info"])
-        self.purge_park(parked.id)
-        answer = "Keep drafts until save succeeds."
-        self.assertEqual(task_reply(SimpleNamespace(id=self.ticket, text=[answer])), 0)
-        started = []
-
-        def work(cfg, run, slot):
-            self.assertEqual(run.budget.parents, [])
-            self.assertEqual(pipeline.open_branch(run), "fixture/parked")
-            self.assertIn(f"## Owner's answer to the parked retry question\n\n{answer}", run.task_ticket().comments)
-            started.append(run.id)
-            return "noop", "fixture", ""
-
-        def spawn(repo, tid):
-            self.assertEqual(self.run_polled_ticket(repo, tid, work), 0)
-
-        self.assertEqual(self.poll_with(self.cfg, spawn), 0)
-        self.assertEqual(self.poll_with(self.cfg, spawn), 0)
-        self.assertEqual(len(started), 1)
-        self.assertFalse(runlimits.artifact(parked.id, "poll-readmissions.json").exists())
-
-    def test_triage_rewrites_readmit_with_findings_in_the_next_plan_and_third_park_asks_once(self):
+    def test_triage_rewrites_readmit_with_findings_and_third_park_stays_failed(self):
         self.repo.layer_dir.mkdir()
         (self.repo.layer_dir / "config.toml").write_text('[factory]\npath = "classic"\n')
         self.cfg.replay = config.ReplayConfig(all=True)
@@ -948,30 +923,20 @@ class LocalParkRetryTests(ParkRetryFixture):
                 self.assertIn("Editing a task title drops its attachments.", prompts[-1][1])
             self.assertIn("Private raw page text", prompts[-1][1])
             self.assertIn("Environment startup failed", prompts[-1][1])
+            event, = [line for line in run_lines.read(prompts[-1][0]) if line["event"] == "prepare"]
+            self.assertEqual(event["parked_run"], ticket.retries[-1].run_id)
+            self.assertIn("Review blocker", event["finding_classes"])
+            log = runlimits.artifact(prompts[-1][0], "run.log").read_text()
+            self.assertIn(ticket.retries[-1].run_id, log)
+            self.assertIn("Review blocker", log)
+            self.assertNotIn(reasons[attempt], json.dumps(event))
+            self.assertNotIn(reasons[attempt], log)
         self.assertEqual(self.triage_parks(), 0)
         self.assertEqual(self.triage_parks(), 0)
         self.assertEqual(self.local.get(self.ticket).body, original)
-        self.assertEqual(tasks_store.task_get(self.ticket)["state"], "needs-info")
-        comments = tasks_store.task_comments(self.ticket)
-        self.assertEqual(len(comments), 3)
-        question = comments[-1]["body"]
-        self.assertIn(reasons[2], question)
-        self.assertIn(f'arete task reply {self.ticket} "your reply"', question)
-        self.assertNotIn("Optional review note", question)
-        self.assertEqual(self.poll_with(self.cfg, lambda *_: self.fail("escalated ticket restarted")), 0)
-        self.assertEqual(task_reply(SimpleNamespace(id=self.ticket, text=["Keep drafts until save succeeds."])), 0)
-        started = []
-
-        def answered(cfg, run, slot):
-            self.assertEqual(run.budget.parents, [])
-            self.assertEqual(pipeline.open_branch(run), branch)
-            self.assertIn("Keep drafts until save succeeds.", run.task_ticket().comments)
-            self.assertIn("The form can send a second request mid-save.", run.task_ticket().comments)
-            started.append(run.id)
-            return "noop", "fixture", ""
-
-        self.assertEqual(self.poll_with(self.cfg, lambda repo, tid: self.run_polled_ticket(repo, tid, answered)), 0)
-        self.assertEqual(len(started), 1)
+        self.assertEqual(tasks_store.task_get(self.ticket)["state"], "failed")
+        self.assertEqual(len(tasks_store.task_comments(self.ticket)), 2)
+        self.assertEqual(self.poll_with(self.cfg, lambda *_: self.fail("third park restarted")), 0)
 
     def test_triage_skips_missing_route_environment_and_held_or_kept_work(self):
         budget = "the repair chain used its 2 repair cycles"
@@ -1111,7 +1076,7 @@ class LocalParkRetryTests(ParkRetryFixture):
         self.assertEqual(len(tasks_store.task_comments(self.ticket)), 1)
 
 class GitHubParkRetryTests(ParkRetryFixture):
-    def test_github_retries_and_escalation_use_approved_criteria_and_record_pointers(self):
+    def test_github_retries_use_approved_criteria_and_record_pointers(self):
         unsafe = ("Paste password hidden-literal", "Report ghp_synthetic12345678", "Read files from /tmp/private.txt",
                   r"Read C:\outside\private.txt", "Read ../private.txt", "<p>Private page contents</p>",
                   "First line\nPrivate log text", "Replace SensitiveFixtureValue", "Bearer hidden-literal",
@@ -1162,9 +1127,9 @@ outcome = "No approved tracker text"
                 runs.append(run.id)
                 self.parked_findings(run, action, arbitrary, with_evidence, canceled, *unsafe, extra_checks=checks)
                 self.assertIsNone(park_retries.retry_ticket(source, "17", ("SensitiveFixtureValue",)))
-            labels.assert_called_once()
+            labels.assert_not_called()
         comments = issue["comments"]
-        self.assertEqual(len(comments), 3)
+        self.assertEqual(len(comments), 2)
         for run_id, comment in zip(runs, comments):
             output = comment["body"]
             review = runlimits.artifact(run_id, "review.json").read_text().splitlines()
@@ -1187,7 +1152,7 @@ outcome = "No approved tracker text"
                 self.assertNotIn(private, output)
 
 
-    def test_github_retries_readmit_then_owner_reply_readmits_after_escalation(self):
+    def test_github_retries_readmit_twice_then_leave_the_ticket_failed(self):
         self.repo.tracker, self.repo.github = "github", "fixture/project"
         self.repo.parts = [config.Part("", self.repo.github)]
         self.repo.layer_dir.mkdir()
@@ -1201,7 +1166,6 @@ outcome = "No approved tracker text"
         issue = {"number": 17, "title": "Fixture", "state": "OPEN", "labels": labels,
                  "author": {"login": "fixture"}, "body": original, "comments": comments}
         started = []
-        label_attempts = []
         blocker = "Renaming a task drops the unread attachment labelled Private Fixture."
         error = "Synthetic verifier failed while navigating back to the editor."
 
@@ -1212,12 +1176,7 @@ outcome = "No approved tracker text"
                 comments.append({"body": input, "author": {"login": "fixture-bot"}, "viewerDidAuthor": True,
                                  "createdAt": util.iso()})
             else:
-                self.assertEqual(args, ["issue", "edit", "17", "--repo", self.repo.github,
-                                        "--add-label", "agent:needs-info", "--remove-label", "agent:failed"])
-                label_attempts.append(args)
-                if len(label_attempts) == 1:
-                    raise gh.GhError("temporary label failure")
-                labels[:] = [{"name": "agent"}, {"name": "agent:needs-info"}]
+                self.fail(f"unexpected GitHub command: {args}")
             return "https://example.invalid/issue-comment\n"
 
         def work(cfg, run, slot):
@@ -1225,9 +1184,6 @@ outcome = "No approved tracker text"
             ticket = run.task_ticket()
             self.assertEqual(ticket.body, original)
             started.append(run.id)
-            if len(started) == 3:
-                self.assertIn("Retain the draft until the write commits.", ticket.comments)
-                return "noop", "fixture", ""
             job = SimpleNamespace(run=run, cfg=cfg, layer=config.load_layer(self.repo.layer_dir),
                                   ticket=ticket, expertise="", attachments="")
             context = Catalog(job).context["task"]
@@ -1276,66 +1232,12 @@ outcome = "No approved tracker text"
                 self.assertEqual(len(started), attempt)
                 run = SimpleNamespace(id=started[-1])
                 self.age_park(run.id)
-            self.assertEqual(self.triage_parks(), 1)
             self.assertEqual(self.triage_parks(), 0)
             self.assertEqual(self.triage_parks(), 0)
-            self.assertEqual(writes.call_count, 5)
-            self.assertEqual(sum("Parked retry question" in c["body"] for c in comments), 1)
-            self.assertIn({"name": "agent:needs-info"}, labels)
-            self.assertIn("Reply in a comment on this GitHub issue or remove the `agent:needs-info` label",
-                          comments[-1]["body"])
-            self.assertEqual(self.poll_with(self.cfg, lambda *_: self.fail("started without a reply")), 0)
-            comments.append({"body": "Retain the draft until the write commits.", "author": issue["author"],
-                             "createdAt": util.iso(util.parse_iso(comments[-1]["createdAt"]) + timedelta(seconds=1))})
-            self.assertEqual(self.poll_with(self.cfg, lambda repo, tid: self.run_polled_ticket(repo, tid, work)), 0)
-            self.assertEqual(len(started), 3)
+            self.assertEqual(writes.call_count, 2)
+            self.assertIn({"name": "agent:failed"}, labels)
+            self.assertEqual(self.poll_with(self.cfg, lambda *_: self.fail("third park restarted")), 0)
             self.assertEqual(issue["body"], original)
-
-    def test_github_escalation_requires_a_reply_or_label_removal(self):
-        self.repo.tracker, self.repo.github = "github", "fixture/project"
-        self.repo.parts = [config.Part("", self.repo.github)]
-        self.repo.layer_dir.mkdir()
-        (self.repo.layer_dir / "config.toml").write_text('[factory]\npath = "classic"\n')
-        self.cfg.replay = config.ReplayConfig(all=True)
-        self.local.label(self.ticket, add=["closed"])
-        source = tracker.GitHubTracker(self.repo)
-        for number, field in enumerate(("title", "body", None), 17):
-            with self.subTest(field=field):
-                labels = [{"name": "agent"}, {"name": "agent:needs-info"}]
-                issue = {"number": number, "title": "Original title", "body": "Original body", "state": "OPEN",
-                         "labels": labels, "author": {"login": "fixture"}, "comments": []}
-                started = []
-
-                def work(cfg, run, slot):
-                    current = run.task_ticket()
-                    if field:
-                        self.assertEqual(getattr(current, field), "Owner clarification")
-                    self.assertEqual(run.budget.parents, [])
-                    self.assertNotIn("agent:needs-info", current.labels)
-                    started.append(run.id)
-                    return "noop", "fixture", ""
-
-                def spawn(repo, tid):
-                    return self.run_polled_ticket(repo, tid, work)
-
-                with patch.object(gh, "issue", return_value=issue), \
-                        patch.object(gh, "issues", side_effect=lambda repo, label, **kw: [
-                            issue] if {"name": label} in labels else []), \
-                        patch.object(gh, "gh", side_effect=AssertionError("unexpected GitHub command")), \
-                        patch.object(pipeline.Run, "enter"):
-                    run = self.park_remote_issue(source, str(number))
-                    issue["comments"].append({"body": f"[arete] Parked retry question for run {run.id}.",
-                                              "viewerDidAuthor": True, "createdAt": util.iso()})
-                    self.assertEqual(self.poll_with(self.cfg, spawn), 0)
-                    self.assertEqual(started, [])
-                    if field:
-                        issue[field] = "Owner clarification"
-                    self.assertEqual(self.poll_with(self.cfg, spawn), 0)
-                    self.assertEqual(started, [])
-                    labels.remove({"name": "agent:needs-info"})
-                    self.assertEqual(self.poll_with(self.cfg, spawn), 0)
-                    self.assertEqual(len(started), 1)
-                    self.assertEqual(len(issue["comments"]), 1)
 
     def github_batch(self):
         self.repo.tracker, self.repo.github = "github", "fixture/project"
@@ -1354,11 +1256,11 @@ outcome = "No approved tracker text"
             self.assertIsNone(park_retries.retry_ticket(source, "17", ()))
         post.assert_not_called()
 
-    def test_holds_block_retry_and_reply_paths_even_after_selection(self):
+    def test_holds_block_retry_even_after_selection(self):
         issue = self.github_batch()
         issue["labels"].remove({"name": "agent:batch"})
         source = tracker.GitHubTracker(self.repo)
-        labels, comments, owner = (issue[key] for key in ("labels", "comments", "author"))
+        labels, comments = (issue[key] for key in ("labels", "comments"))
 
         def comment(_repo, _number, body, **_kw):
             comments.append({"body": body, "createdAt": util.iso(), "viewerDidAuthor": True})
@@ -1385,34 +1287,16 @@ outcome = "No approved tracker text"
                     self.assertFalse(runlimits.admission(self.repo, "17", source, run.budget.policy, False,
                                                          readmission=proof)[1])
                     labels.pop()
-            labels.append({"name": "agent:needs-info"})
-            self.assertFalse(runlimits.admission(self.repo, "17", source, run.budget.policy, False,
-                                                 readmission=proof)[1])
-            labels.pop()
-
-            labels.remove({"name": "agent:failed"})
-            labels.append({"name": "agent:needs-info"})
-            when = util.parse_iso(comments[-1]["createdAt"])
-            comments.extend([{"body": f"[arete] Parked retry question for run {run.id}.", "viewerDidAuthor": True,
-                              "createdAt": util.iso(when + timedelta(seconds=1))},
-                             {"body": "Keep its dependencies closed.", "author": owner,
-                              "createdAt": util.iso(when + timedelta(seconds=2))}])
-            for hold in sorted(hold_labels):
-                with self.subTest(reply_hold=hold):
-                    labels.append({"name": hold})
-                    self.assertEqual(self.poll_with(self.cfg, lambda *_: self.fail("held reply launched")), 0)
-                    self.assertEqual(source.reply_since("17", util.iso(when)), "")
-                    labels.pop()
             started = []
             self.assertEqual(self.poll_with(self.cfg, lambda _repo, tid: started.append(tid)), 0)
             self.assertEqual(started, ["17"])
 
-    def test_hold_at_child_admission_leaves_retry_and_reply_available_until_registration(self):
+    def test_hold_at_child_admission_leaves_retry_available_until_registration(self):
         self.repo.layer_dir.mkdir()
         layer = self.repo.layer_dir / "config.toml"
         classic = '[factory]\npath = "classic"\n'
 
-        for number, trigger in enumerate(("retry", "reply", "policy and retry"), 17):
+        for number, trigger in enumerate(("retry", "policy and retry"), 17):
             with self.subTest(trigger=trigger):
                 issue = self.github_batch()
                 issue["number"] = number
@@ -1445,15 +1329,8 @@ outcome = "No approved tracker text"
 
                 with patch.object(gh, "issue", return_value=issue), patch.object(gh, "issues", side_effect=listed):
                     parked = self.park_remote_issue(source, tid)
-                    if trigger == "reply":
-                        labels[1] = {"name": "agent:needs-info"}
-                        comments.extend([{"body": f"[arete] Parked retry question for run {parked.id}.",
-                                          "viewerDidAuthor": True, "createdAt": util.iso()},
-                                         {"body": "Keep the draft.", "author": issue["author"],
-                                          "createdAt": util.iso(util.now() + timedelta(seconds=1))}])
-                    else:
-                        comments.append({"body": f"<!-- arete:retry run={parked.id} n=1 -->\n\nKeep the draft.",
-                                         "viewerDidAuthor": True, "createdAt": util.iso()})
+                    comments.append({"body": f"<!-- arete:retry run={parked.id} n=1 -->\n\nKeep the draft.",
+                                     "viewerDidAuthor": True, "createdAt": util.iso()})
                     if trigger == "policy and retry":
                         layer.write_text(classic + "[limits]\nmax_repair_cycles = 3\n")
                     self.assertEqual(self.poll_with(self.cfg, refuse), 0)
@@ -1655,7 +1532,7 @@ outcome = "No approved tracker text"
             pending, = pipeline.pending_feedback(self.repo.name, "17")
             self.assertEqual((pending["body"], pending["status"]), (feedback, "failed"))
 
-    def test_older_park_question_does_not_block_an_answered_pr_question(self):
+    def test_older_retry_does_not_block_an_answered_pr_question(self):
         issue = self.github_batch()
         issue["labels"] = [{"name": "agent"}, {"name": "agent:needs-info"}]
         source = tracker.GitHubTracker(self.repo)
@@ -1681,7 +1558,7 @@ outcome = "No approved tracker text"
             parked = self.park_remote_issue(source, "17")
             past = util.now() - timedelta(minutes=1)
             issue["comments"].extend([
-                {"body": f"[arete] Parked retry question for run {parked.id}.", "viewerDidAuthor": True,
+                {"body": f"<!-- arete:retry run={parked.id} n=1 -->", "viewerDidAuthor": True,
                  "createdAt": util.iso(past)},
                 {"body": "Keep failed drafts.", "author": issue["author"],
                  "createdAt": util.iso(past + timedelta(seconds=1))},
@@ -1697,91 +1574,23 @@ outcome = "No approved tracker text"
             self.assertEqual(ask_store.ask_get("revision-question")["status"], "answered")
             self.assertEqual(selected, ["17"])
             self.assertEqual(self.poll_with(self.cfg, spawn), 0)
-            self.assertEqual(self.poll_with(self.cfg, lambda *_: self.fail("stale park reply started a run")), 0)
+            self.assertEqual(self.poll_with(self.cfg, lambda *_: self.fail("stale retry started a run")), 0)
         self.assertEqual(len(started), 1)
 
-    def test_authenticated_github_reply_survives_retention_and_can_only_start_once(self):
-        issue = self.github_batch()
-        self.repo.layer_dir.mkdir()
-        (self.repo.layer_dir / "config.toml").write_text('[factory]\npath = "classic"\n')
-        owner, stranger = issue["author"], {"login": "someone-else"}
-        issue.update(body="Original body", labels=[{"name": "agent"}, {"name": "agent:needs-info"}])
-        source = tracker.GitHubTracker(self.repo)
-        answer = "Keep the draft on failed save."
-        started = []
-
-        def work(cfg, run, slot):
-            self.assertEqual(run.budget.parents, [])
-            self.assertIn(f"## Owner's answer to the parked retry question\n\n{answer}", run.task_ticket().comments)
-            started.append(run.id)
-            return "noop", "fixture", ""
-
-        def spawn(repo, tid):
-            self.assertEqual(self.run_polled_ticket(repo, tid, work), 0)
-
-        with patch.object(gh, "issue", return_value=issue), \
-                patch.object(gh, "issues", side_effect=lambda _repo, label, **kw: [
-                    issue] if {"name": label} in issue["labels"] else []), patch.object(pipeline.Run, "enter"), \
-                patch.object(gh, "gh", side_effect=AssertionError("unexpected GitHub write")):
-            parked = self.park_remote_issue(source, "17")
-            issue["comments"].append({"body": f"[arete] Parked retry question for run {parked.id}.",
-                                      "viewerDidAuthor": True, "createdAt": util.iso()})
-            self.purge_park(parked.id)
-            issue["body"] = "Edited specification"
-            issue["comments"].append({"body": "Try again", "author": stranger, "createdAt": util.iso()})
-            self.assertEqual(self.poll_with(self.cfg, lambda *_: self.fail("started without an owner reply")), 0)
-            issue["comments"].append({"body": answer, "author": owner, "createdAt": util.iso()})
-            hold = {"name": "no-agent"}
-
-            def add_hold(repo, tid):
-                issue["labels"].append(hold)
-                self.assertEqual(self.run_polled_ticket(repo, tid, work), 2)
-
-            self.assertEqual(self.poll_with(self.cfg, add_hold), 0)
-            self.assertEqual(self.poll_with(self.cfg, lambda *_: self.fail("started while held")), 0)
-            self.assertEqual(run_store.newest_whole_run(self.repo.name, "17")["id"], parked.id)
-            issue["labels"].remove(hold)
-            self.assertEqual(self.poll_with(self.cfg, spawn), 0)
-            self.assertEqual(self.poll_with(self.cfg, lambda *_: self.fail("replayed the reply")), 0)
-        self.assertEqual(len(started), 1)
-        self.assertFalse(runlimits.artifact(parked.id, "poll-readmissions.json").exists())
-
-    def test_only_authenticated_arete_questions_invalidate_an_old_owner_reply(self):
+    def test_only_authenticated_arete_retries_are_readmitted(self):
         issue = self.github_batch()
         issue["labels"].remove({"name": "agent:batch"})
-        issue["labels"].remove({"name": "agent:failed"})
-        issue["labels"].append({"name": "agent:needs-info"})
         source = tracker.GitHubTracker(self.repo)
-
-        def comment(body, login, offset, **fields):
-            issue["comments"].append({"body": body, "author": {"login": login},
-                                      "createdAt": util.iso(when + timedelta(seconds=offset)), **fields})
-
-        with patch.object(gh, "issue", return_value=issue), patch.object(gh, "issues", side_effect=lambda _repo, label,
-                          **_kw: [issue] if {"name": label} in issue["labels"] else []), \
-                patch.object(gh, "me", return_value="fixture-app[bot]"):
-            first = self.park_remote_issue(source, "17")
-            second = self.park_remote_issue(source, "17")
-            cutoff = runlimits.metadata(second.id, "parked.json")["parked_at"]
-            when = util.parse_iso(cutoff)
-            older = f"[arete] Parked retry question for run {first.id}."
-            newest = f"[arete] Parked retry question for run {second.id}."
-            comment(older, "fixture-app[bot]", 1, viewerDidAuthor=True)
-            comment("Old answer.", "fixture", 2)
-            comment(newest, "stranger[bot]", 3)
-            comment(newest, "fixture", 4)
-            self.assertEqual(source.get("17").park_question.run_id, first.id)
-            self.assertEqual([t.id for t in source.replied()], ["17"])
-            comment(newest, "Fixture-App[bot]", 5)
-            self.assertEqual(source.get("17").park_question.run_id, second.id)
-            self.assertEqual(source.replied(), [])
-            self.assertEqual(source.reply_since("17", cutoff), "")
-            self.assertEqual(self.poll_with(self.cfg, lambda *_: self.fail("old answer launched")), 0)
-            comment("New answer.", "fixture", 6)
-            started = []
-            self.assertEqual(source.reply_since("17", cutoff), "New answer.")
-            self.assertEqual(self.poll_with(self.cfg, lambda _repo, tid: started.append(tid)), 0)
-            self.assertEqual(started, ["17"])
+        with patch.object(gh, "issue", return_value=issue), patch.object(gh, "me", return_value="fixture-app[bot]"):
+            parked = self.park_remote_issue(source, "17")
+            marker = f"<!-- arete:retry run={parked.id} n=1 -->"
+            comment = {"body": marker, "author": {"login": "stranger[bot]"}, "createdAt": util.iso()}
+            issue["comments"].append(comment)
+            self.assertEqual(source.get("17").retries, [])
+            self.assertIsNone(runlimits.poll_admission(self.repo, "17", source.get("17"), parked.budget.policy)[1])
+            comment["author"]["login"] = "fixture-app[bot]"
+            self.assertEqual(source.get("17").retries[-1].run_id, parked.id)
+            self.assertTrue(runlimits.poll_admission(self.repo, "17", source.get("17"), parked.budget.policy)[1].feedback)
 
     def test_parked_retry_ignores_jira(self):
         self.repo.tracker, self.repo.jira_project = "jira", "JRA"
@@ -2145,12 +1954,14 @@ class ParkRecoveryTests(ParkRetryFixture):
         self.assertEqual((result.verdict, result.blocked_by), ("blocked", short_error))
         self.assertTrue((run.dir / "verify2-server.log").is_file())
         self.assertFalse((run.dir / "verify2-outcome.json").exists())
-        verification_end, = [number for number, line in park_retries.numbered_log(run.id)
+        verification_end, = [line for _, line in park_retries.numbered_log(run.id)
                              if line["event"] == "verification_end" and line["step"] == "verify2"]
+        self.assertEqual(verification_end["finding_classes"], ["Verification blocked"])
+        self.assertNotIn(short_error, json.dumps(verification_end))
         self.park_for_triage(run)
         self.local.label(self.ticket, add=["failed"])
         self.assertEqual(self.triage_parks(), 0)
-        pointer = f"Verification blocked — run `{run.id}`, `run.jsonl:{verification_end}`."
+        pointer = f"Verification blocked — run `{run.id}`, `verify2-attempt.json:1`."
         comment = self.local.get(self.ticket).retries[-1].body
         context = run.task_ticket().comments
         self.assertIn(pointer, comment)

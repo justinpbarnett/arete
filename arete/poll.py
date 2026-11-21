@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 from collections import Counter
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from datetime import timedelta
 
 from . import (
     config,
+    environment_gaps,
     intake,
     jira,
     launch_lease,
@@ -88,16 +90,9 @@ def jira_routes_by_project(cfg: config.Config) -> dict[str, set[str]]:
     return out
 
 
-@dataclass(frozen=True)
-class Pick:
-    tid: str
-    why: str
-    reply: bool = False
-
-
 def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
               other_routes: set[str], excluded: set[str] = frozenset(),
-              recovered: tuple[tracker.Ticket, ...] = ()) -> Pick | None:
+              recovered: tuple[tracker.Ticket, ...] = ()) -> tuple[str, str] | None:
     excluded = excluded | oncall.parked(repo.name)
     fresh = next_ticket(repo, tk, skips, other_routes, excluded, recovered)
     def eligible_again(tid):
@@ -109,11 +104,12 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
                                         or not tk.in_zte_queue(str(tid)))
 
     for tid in run_store.interrupted_tickets(repo.name):
-        if ordinary_history(tid):
-            return Pick(tid, "restarting after an interruption")
+        if (ordinary_history(tid) and (row := run_store.newest_live_whole_run(repo.name, tid))
+                and not environment_gaps.was_retry(row)):
+            return tid, "restarting after an interruption"
     for tid in insights_store.feedback_due(repo.name, util.iso(util.now() - timedelta(minutes=pipeline.FEEDBACK_QUIET_MINUTES))):
         if ordinary_history(tid):
-            return Pick(tid, "revising the PR for your review comments")
+            return tid, "revising the PR for your review comments"
     for source in ticket_queues(repo, tk):
         for t in source.replied():
             if not eligible_again(t.id):
@@ -124,8 +120,8 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
             if blocker := source.blocker(t.id):
                 skips.note(tracker.ticket_name(repo.name, t.ref), t, blocker, repo.name)
                 continue
-            return Pick(t.id, f"{t.title} (you replied to the question)", reply=True)
-    return Pick(fresh.id, fresh.title) if fresh else None
+            return t.id, f"{t.title} (you replied to the question)"
+    return (fresh.id, fresh.title) if fresh else None
 
 
 def step_without_route(cfg: config.Config, repo: config.Repo, ticket: tracker.Ticket,
@@ -265,16 +261,16 @@ def repo_queues(cfg: config.Config, pipeline_repos: list[config.Repo], routes: d
     return queues, reached_clients
 
 
-def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline.SkipLog,
+def start_pick(cfg: config.Config, queue: RepoQueue, pick: tuple[str, str], skips: pipeline.SkipLog,
                dry_run: bool, going: Counter, slots: int) -> str:
     from . import tasks
 
     repo, layer = queue.repo, queue.layer
-    tid, why = pick.tid, pick.why
+    tid, why = pick
     if not pilot.pickable(str(tid), repo.name) or (
             zte.reserved(str(tid)) and not (zte.scheduled_poll() and zte.pickable(str(tid), repo.name))):
         return "skipped"
-    with tasks.PENDING_LOCK, util.lock(tasks.START_LOCK, wait=True):
+    with tasks.PENDING_LOCK, (nullcontext() if dry_run else util.lock(tasks.START_LOCK, wait=True)):
         if tasks.pending_start(repo.name, str(tid)) or run_store.issue_running(repo.name, tid):
             return "skipped"
     source = tracker.for_ticket(cfg, repo, tid)
@@ -298,8 +294,6 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline
         return "held"
     ticket = ticket or source.get(tid)
     blocked, readmission = runlimits.poll_admission(repo, str(tid), ticket, runlimits.Policy.of(layer))
-    if pick.reply and ticket.park_question and not (answering or blocked or readmission):
-        return "skipped"
     blocked = blocked or source.blocker(tid) or reply
     if not blocked:
         if not zte.reserved(str(tid)):
@@ -337,7 +331,7 @@ def fill_slots(cfg: config.Config, queues: list[RepoQueue], skips: pipeline.Skip
                     if not dry_run:
                         source_store.drop_passed_over(repo.name)
                     continue
-                queue.selected.add(str(pick.tid))
+                queue.selected.add(str(pick[0]))
                 examined += 1
                 progressed = True
                 result = start_pick(cfg, queue, pick, skips, dry_run, going, slots)
@@ -354,6 +348,23 @@ def fill_slots(cfg: config.Config, queues: list[RepoQueue], skips: pipeline.Skip
         if not progressed:
             break
     return selected_work
+
+
+def resume_environment_holds(cfg: config.Config, queues: list[RepoQueue], dry_run: bool,
+                             errors: list[str], going: Counter, slots: int) -> int:
+    started = 0
+    for queue in queues:
+        repo = queue.repo
+        for row in run_store.environment_holds(repo.name):
+            try:
+                can_start = started < MAX_STARTS_PER_POLL and not held_back(cfg, repo.name, going, slots - started)
+                if environment_gaps.handle(cfg, repo, row, dry_run, can_start=can_start):
+                    queue.selected.add(str(row["issue"]))
+                    going[repo.name] += 1
+                    started += 1
+            except Exception as error:
+                failed(errors, row["id"], error)
+    return started
 
 
 def report_unrouted(routes: dict[str, set[str]], reached_clients: dict[str, jira.Client],
@@ -376,9 +387,10 @@ def save_skips_and_landings(cfg: config.Config, skips: pipeline.SkipLog,
 
 
 def poll(dry_run: bool = False) -> int:
-    paths.ensure_dirs()
+    if not dry_run:
+        paths.ensure_dirs()
     cfg = config.load()
-    with util.lock("poll") as got:
+    with (nullcontext(True) if dry_run else util.lock("poll")) as got:
         if not got:
             print(f"{util.iso()} poll already running")
             return 0
@@ -399,7 +411,12 @@ def poll(dry_run: bool = False) -> int:
         queues, reached_clients = repo_queues(cfg, pipeline_repos, routes, skips, errors)
         for queue in queues:
             guard(errors, f"{queue.repo.name} environment requeues", lambda: requeue_failures(cfg, queue, dry_run, errors))
-        selected_work = fill_slots(cfg, queues, skips, dry_run, errors, going, slots)
+        resumed = 0
+        try:
+            resumed = resume_environment_holds(cfg, queues, dry_run, errors, going, slots)
+        except Exception as error:
+            failed(errors, "environment holds", error)
+        selected_work = fill_slots(cfg, queues, skips, dry_run, errors, going, slots - resumed) or resumed > 0
         report_unrouted(routes, reached_clients, skips, errors)
         if not dry_run:
             guard(errors, "moving tickets", lambda: outcomes.sync_moves(cfg))
