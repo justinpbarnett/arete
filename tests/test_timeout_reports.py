@@ -193,8 +193,8 @@ class ParallelTimeoutReportTests(unittest.TestCase):
         events[-2:] = [81, 82]
         rows = []
         result = parallel.TimedResult(lambda *row: rows.append(row))
-        clock = Mock(monotonic=Mock(side_effect=events))
-        with patch.object(parallel, "time", clock):
+        clock = Mock(side_effect=events)
+        with patch.object(parallel, "_timing_clock", clock):
             for index in range(batch.count):
                 test = unittest.TestCase()
                 test._testMethodName = f"test_{index}"
@@ -226,7 +226,7 @@ class ParallelTimeoutReportTests(unittest.TestCase):
             with self.subTest(clock=clock):
                 events = []
                 result = parallel.TimedResult(lambda *row: events.append(row))
-                with patch.object(parallel, "time", Mock(monotonic=clock)):
+                with patch.object(parallel, "_timing_clock", clock):
                     Sample().run(result)
                 self.assertEqual(result.testsRun, 1)
                 self.assertEqual(len(result.failures), 1)
@@ -556,9 +556,9 @@ class TimeoutProgressRegressionTests(unittest.TestCase):
 
     def test_missing_start_timestamp_still_counts_the_test_as_started(self):
         batch = parallel.Batch("fixture.Sample", 3)
-        clock = Mock(monotonic=Mock(side_effect=[OSError("start time unavailable"), 2, 2.5]))
+        clock = Mock(side_effect=[OSError("start time unavailable"), 2, 2.5])
         events = []
-        with tempfile.TemporaryFile() as counter, patch.object(parallel, "time", clock):
+        with tempfile.TemporaryFile() as counter, patch.object(parallel, "_timing_clock", clock):
             result = parallel.TimedResult(lambda *row: events.append(row), counter.fileno())
             for name in ("test_missing", "test_timed"):
                 test = unittest.TestCase()
@@ -757,3 +757,82 @@ class TimeoutTimingIsolationTests(unittest.TestCase):
             with self.subTest(hook=hook), patch.object(unittest.TestResult, hook, side_effect=KeyboardInterrupt(hook)):
                 with self.assertRaisesRegex(KeyboardInterrupt, hook):
                     getattr(result, hook)(Interrupted())
+
+
+class TimeoutClockIsolationTests(unittest.TestCase):
+    def test_worker_report_matches_baseline_when_setup_class_patches_monotonic(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            root = Path(directory)
+            (root / "test_patched_clock.py").write_text(
+                "import time\nimport unittest\nfrom unittest.mock import patch\n\n"
+                "class PatchedClockTests(unittest.TestCase):\n"
+                "    @classmethod\n"
+                "    def setUpClass(cls):\n"
+                "        cls.enterClassContext(patch('time.monotonic', side_effect=[10, 11]))\n"
+                "    def test_clock(self):\n"
+                "        self.assertEqual([time.monotonic(), time.monotonic()], [10, 11])\n"
+            )
+            identifier = "test_patched_clock.PatchedClockTests"
+            lifeline, held = os.pipe()
+            reports = []
+            try:
+                with parallel.timing_channel() as (reader, writer):
+                    command = [sys.executable, "-B", "-m", "tests.parallel", "--one", identifier,
+                               "--start", directory, "--lifeline", str(lifeline)]
+                    for timing, fds in (([], (lifeline,)), worker_timing(reader, writer, lifeline)):
+                        path = root / f"result-{len(reports)}.json"
+                        child = subprocess.run([*command, "--result", str(path), *timing], pass_fds=fds,
+                                               capture_output=True, text=True, timeout=2)
+                        self.assertEqual(child.returncode, 0, child.stdout + child.stderr)
+                        reports.append(path.read_bytes())
+                    rows = parallel.timing_rows(reader)
+            finally:
+                os.close(lifeline)
+                os.close(held)
+
+        self.assertEqual(json.loads(reports[0]),
+                         {"ran": 1, "errors": [], "failures": [], "skipped": [], "unexpected": []})
+        self.assertEqual(reports[1], reports[0])
+        self.assertEqual([name for _, name, _ in rows], [f"{identifier}.test_clock"])
+
+
+class TimeoutStartCounterIsolationTests(unittest.TestCase):
+    def test_worker_report_matches_baseline_when_setup_class_patches_lseek(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            root = Path(directory)
+            (root / "test_patched_seek.py").write_text(
+                "import os\nimport unittest\nfrom unittest.mock import patch\n\n"
+                "class PatchedSeekTests(unittest.TestCase):\n"
+                "    @classmethod\n"
+                "    def setUpClass(cls):\n"
+                "        cls.enterClassContext(patch('os.lseek', side_effect=[42]))\n"
+                "    def test_seek(self):\n"
+                "        self.assertEqual(os.lseek(0, 0, os.SEEK_CUR), 42)\n"
+            )
+            identifier = "test_patched_seek.PatchedSeekTests"
+            lifeline, held = os.pipe()
+            reports = []
+            try:
+                with tempfile.TemporaryFile() as counter, parallel.timing_channel() as (reader, writer):
+                    timing, fds = worker_timing(reader, writer, lifeline)
+                    command = [sys.executable, "-B", "-m", "tests.parallel", "--one", identifier,
+                               "--start", directory, "--lifeline", str(lifeline)]
+                    for options, inherited in (([], (lifeline,)),
+                                               ([*timing, "--started-fd", str(counter.fileno())],
+                                                (*fds, counter.fileno()))):
+                        path = root / f"result-{len(reports)}.json"
+                        child = subprocess.run([*command, "--result", str(path), *options], pass_fds=inherited,
+                                               capture_output=True, text=True, timeout=2)
+                        self.assertEqual(child.returncode, 0, child.stdout + child.stderr)
+                        reports.append(path.read_bytes())
+                    started = os.lseek(counter.fileno(), 0, os.SEEK_CUR)
+                    rows = parallel.timing_rows(reader)
+            finally:
+                os.close(lifeline)
+                os.close(held)
+
+        self.assertEqual(json.loads(reports[0]),
+                         {"ran": 1, "errors": [], "failures": [], "skipped": [], "unexpected": []})
+        self.assertEqual(reports[1], reports[0])
+        self.assertEqual(started, 1)
+        self.assertEqual([name for _, name, _ in rows], [f"{identifier}.test_seek"])

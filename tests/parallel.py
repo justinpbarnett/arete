@@ -29,6 +29,8 @@ TIMING_LIMIT = 5
 TIMING_NAME_BYTES = 8192
 TIMING_PACKET_BYTES = 48 * 1024
 LONG_TIMING_NAME = "[test name too long]"
+_timing_clock = time.monotonic
+_timing_seek = os.lseek
 
 if __spec__ is None:
     sys.path.insert(0, os.path.dirname(TESTS))
@@ -105,10 +107,10 @@ class TimedResult(unittest.TestResult):
         self.started = self.name = None
         with suppress(OSError):
             if self.started_fd is not None:
-                os.lseek(self.started_fd, self.testsRun, os.SEEK_SET)
+                _timing_seek(self.started_fd, self.testsRun, os.SEEK_SET)
         with suppress(Exception):
             if self.record is not None:
-                started = time.monotonic()
+                started = _timing_clock()
                 if math.isfinite(started):
                     self.started = started
                     self.name = timing_name(test)
@@ -117,7 +119,7 @@ class TimedResult(unittest.TestResult):
         super().stopTest(test)
         with suppress(Exception):
             if self.started is not None and self.name is not None:
-                finished = time.monotonic()
+                finished = _timing_clock()
                 duration = finished - self.started
                 if 0 <= duration < math.inf:
                     self.record(finished, self.name, duration)
@@ -379,7 +381,7 @@ class Runner:
                 requested = None
                 if progress is not None:
                     with suppress(Exception):
-                        deadline = time.monotonic() + timeout
+                        deadline = _timing_clock() + timeout
                         # The worker excludes stack-dump grace time before ranking its five rows.
                         reader.send(str(deadline).encode())
                 try:
@@ -389,7 +391,7 @@ class Runner:
                 except subprocess.TimeoutExpired:
                     if started_fd is not None:
                         with suppress(OSError):
-                            started = os.lseek(started_fd, 0, os.SEEK_CUR)
+                            started = _timing_seek(started_fd, 0, os.SEEK_CUR)
                     problem = f"class exceeded {timeout:g}s"
                     requested = self.request_stacks(stack_prefix)
                 finally:
