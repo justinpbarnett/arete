@@ -149,7 +149,7 @@ class Controller:
             raise factory.Refused(self.flow.refusal)
         pending_push = ledger.catch_up_push(self.data)
         prepared = self.data.get("prepared")
-        restore_prs =bool(prepared) and not (pending_push or self.run.environment_release or self.run.action_only)
+        restore_prs = bool(prepared) and not (pending_push or self.run.environment_release or self.run.action_only)
         if not restore_prs and self.run.feedback and (closed := self.run.feedback_closure()):
             self.quiescent()
             return "noop", closed, ""
@@ -450,7 +450,8 @@ class Controller:
             self.data["job"] = {**self.data["job"], "reviews": 0, "ci_result": ""}
 
     def lineage(self):
-        restarts = any(c.get("pr") for c in self.data.get("prepared", {}).get("checkouts", ()))
+        pinned = pilot.is_pilot_task(str(self.run.tid)) or zte.reserved(str(self.run.tid))
+        restarts = not pinned and any(c.get("pr") for c in self.data.get("prepared", {}).get("checkouts", ()))
         self.catalog = Catalog(self.job)
         found = {"catalog_sha": self.catalog.fingerprint, "operations_sha": ledger.digest(describe_operations()),
                  "policy_sha": self.policy_sha(),
