@@ -65,6 +65,15 @@ def checkout_head() -> str:
     return (git("rev-parse", "--verify", "--short=12", "HEAD") or "").strip()
 
 
+def serve_revisions(beat: dict) -> str:
+    revisions = []
+    if beat.get("engine"):
+        revisions.append(f"running code {beat['engine']}")
+    if "checkout_head" in beat:
+        revisions.append(f"checkout HEAD {beat['checkout_head'] or 'unavailable'}")
+    return ", ".join(revisions)
+
+
 def head_and_dirt() -> tuple[str, bool]:
     head = checkout_head()
     status = git("status", "--porcelain", "--", "arete", "adws") if head else None

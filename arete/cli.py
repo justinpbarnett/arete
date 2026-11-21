@@ -3,11 +3,18 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 
-from . import __version__, codebase
-from .commands.common import Parser, serve_line, serve_revisions, status_arguments
+from . import __version__, codebase, local_paths
+from .commands.arguments import Parser, status_arguments
 
 __all__ = ["main", "serve_line"]
+
+
+def serve_line(beat: dict) -> str:
+    from .commands.common import serve_line as format_serve_line
+
+    return format_serve_line(beat)
 
 
 class ShowVersion(argparse.Action):
@@ -32,14 +39,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def status_from_heartbeat(problem: SystemExit) -> int:
-    from . import paths
-
+    _, state, isolated = local_paths.local_dirs(Path.home())
     print(problem, file=sys.stderr)
     try:
-        beat = json.loads(paths.read_confined(paths.SERVE_BEAT_FILE))
+        beat = json.loads(local_paths.read_confined(state / local_paths.SERVE_BEAT_NAME, isolated=isolated))
     except (OSError, ValueError):
         beat = None
-    if isinstance(beat, dict) and (revisions := serve_revisions(beat)):
+    if isinstance(beat, dict) and (revisions := codebase.serve_revisions(beat)):
         print(f"serve heartbeat at {beat.get('at', 'unknown time')}, {revisions}")
         return 0
     print("serve heartbeat has no recorded revisions", file=sys.stderr)

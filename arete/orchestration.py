@@ -42,6 +42,8 @@ STATE_FIELDS = ("plan_text", "goal", "estimate", "left_for_a_person", "build_sum
 def policy_fingerprint(cfg, layer, closed_context):
     effective = asdict(layer)
     effective.pop("factory_path")
+    if layer.required_check is None:
+        effective.pop("required_check")
     if layer.verify:
         effective["verify"] = layer.verify.policy()
     return ledger.digest(json.loads(json.dumps({"layer": effective, "config": asdict(cfg),

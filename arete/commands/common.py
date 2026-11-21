@@ -1,40 +1,13 @@
 from __future__ import annotations
 
-import argparse
-import json
 import os
 import sys
 from collections.abc import Iterable
-from typing import NoReturn
 
-
-class Parser(argparse.ArgumentParser):
-    json_errors = False
-
-    def parse_known_args(self, args=None, namespace=None):
-        found, extra = super().parse_known_args(args, namespace)
-        if self.json_errors and extra:
-            self.error(f"unrecognized arguments: {' '.join(extra)}")
-        return found, extra
-
-    def error(self, message: str) -> NoReturn:
-        if not self.json_errors:
-            super().error(message)
-        print(json.dumps({"error": message, "usage": self.format_usage().strip()}), flush=True)
-        sys.exit(1)
-
-
-def steering(p: Parser) -> Parser:
-    p.json_errors = True
-    return p
-
-
-def status_arguments(p: Parser) -> Parser:
-    steering(p)
-    p.add_argument("run_id", nargs="?", default="", help="with --json: this run's steps, then its report")
-    p.add_argument("--limit", type=int, default=10)
-    p.add_argument("--json", action="store_true", help="one JSON line per live run, or per step of RUN_ID")
-    return p
+from ..codebase import serve_revisions as serve_revisions
+from .arguments import Parser as Parser
+from .arguments import status_arguments as status_arguments
+from .arguments import steering as steering
 
 
 def when(stamp: str | None) -> str:
@@ -155,15 +128,6 @@ def print_live(live: dict) -> None:
     if live["runs"]:
         print_table([(r["id"], r["kind"], r["ticket"], f"since {when(r['started'])}", util.paid_note(r["paid"]),
                       r["slot"] or r["step"]) for r in live["runs"]], 200)
-
-
-def serve_revisions(beat: dict) -> str:
-    revisions = []
-    if beat.get("engine"):
-        revisions.append(f"running code {beat['engine']}")
-    if "checkout_head" in beat:
-        revisions.append(f"checkout HEAD {beat['checkout_head'] or 'unavailable'}")
-    return ", ".join(revisions)
 
 
 def serve_line(beat: dict) -> str:

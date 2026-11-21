@@ -751,7 +751,6 @@ class VersionedApiTests(unittest.TestCase):
         coordinator.code, coordinator.code_seen = old, replacement
         coordinator.migration_stamp, coordinator.migration_error = replacement, ""
         coordinator.polls, coordinator.oncall = {}, None
-        coordinator.deployment = None
         coordinator.job_running = mock.Mock(return_value=False)
         coordinator.sweeping = mock.Mock(return_value=False)
         coordinator.note_once = mock.Mock()

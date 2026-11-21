@@ -59,6 +59,7 @@ from .store import sources as source_store
 TICK_SECONDS = 20
 DEPLOY_SECONDS = 120
 DEPLOY_API_TIMEOUT = 20
+PILOT_LOCK = "pilot-doc-fix"
 PRUNE_SECONDS = 3600
 ROTATE_SECONDS = 3600
 APPROVAL_RETRY_SECONDS = 900
@@ -161,16 +162,36 @@ def code_stamp() -> frozenset:
 
 
 def deploy_refusal(src: Path, base: str, tip: str) -> str | None:
-    head = util.git(["rev-parse", "--verify", "HEAD"], src, timeout=10).strip()
+    head = util.git(["rev-parse", "--verify", "HEAD"], src, timeout=10, retry=False).strip()
     if head == tip:
         return None
-    if util.git(["branch", "--show-current"], src, timeout=10).strip() != base:
+    if util.git(["branch", "--show-current"], src, timeout=10, retry=False).strip() != base:
         return "on another branch"
     if util.git(["--no-replace-objects", "status", "--porcelain", "--untracked-files=no",
-                 "--ignore-submodules=untracked"], src, timeout=10):
+                 "--ignore-submodules=untracked"], src, timeout=10, retry=False):
         return "dirty"
-    ancestor = util.git(["--no-replace-objects", "merge-base", head, tip], src, check=False, timeout=10).strip()
+    ancestor = util.git(["--no-replace-objects", "merge-base", head, tip], src,
+                        check=False, timeout=10, retry=False).strip()
     return "" if ancestor == head else "diverged"
+
+
+def pilot_deploy_refusal() -> str:
+    try:
+        tasks = list((paths.STATE_DIR / PILOT_LOCK).iterdir())
+    except FileNotFoundError:
+        return ""
+    except OSError:
+        return "pilot receipt unavailable"
+    for task in tasks:
+        try:
+            receipt = json.loads(paths.read_confined(task / "receipt.json"))
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except (OSError, ValueError):
+            return "pilot receipt unavailable"
+        if not isinstance(receipt, dict) or receipt.get("phase") not in ("held", "healthy", "spent"):
+            return "live pilot receipt"
+    return ""
 
 
 def reap_children() -> None:
@@ -447,11 +468,13 @@ class Server:
         root = util.git(["rev-parse", "--show-toplevel"], paths.PACKAGE_DIR, check=False, timeout=10).strip()
         if not root or Path(root).resolve() != src:
             return
-        with util.lock(pilot.PILOT_LOCK) as free:
-            if free:
-                self.deploy_checkout(repo, src)
+        required = config.load_layer(repo.layer_dir).required_check
+        if required is None and repo.name == cfg.arete_repo:
+            required = pilot.CHECK
+        if required is not None:
+            self.deploy_checkout(repo, src, required)
 
-    def deploy_checkout(self, repo: config.Repo, src: Path) -> None:
+    def deploy_checkout(self, repo: config.Repo, src: Path, required: dict) -> None:
         with util.repo_lock(src):
             if not (github := loops.github_remote(src) or repo.github):
                 return
@@ -461,36 +484,36 @@ class Server:
             util.git(["fetch", "-q", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules",
                       "origin", f"+refs/heads/{base}:{ref}"], src,
                      timeout=45, env={"GIT_TERMINAL_PROMPT": "0"}, retry=False)
-            tip = util.git(["rev-parse", "--verify", ref], src, timeout=10).strip()
-            if not self.deploy_ready(src, base, tip):
-                return
-            try:
-                pilot_merges = pilot.pending_checkout_merges(github, timeout=DEPLOY_API_TIMEOUT)
-            except (RuntimeError, OSError, ValueError, KeyError, TypeError, AttributeError):
-                self.deploy_refused(src, tip, "pilot deployment state unavailable")
-                return
-            ci = gh.push_ci_state(github, tip, base, timeout=DEPLOY_API_TIMEOUT)
-            if ci != "pass":
-                self.deploy_refused(src, tip, {"fail": "CI failed", "pending": "CI pending"}.get(ci, "CI unavailable"))
-                return
             with self.checkout_update:
-                if util.git(["rev-parse", "--verify", ref], src, timeout=10).strip() != tip:
-                    return
+                tip = util.git(["rev-parse", "--verify", ref], src, timeout=10, retry=False).strip()
                 if not self.deploy_ready(src, base, tip):
                     return
-                if pilot_merges:
-                    incoming = util.git(["--no-replace-objects", "rev-list", f"HEAD..{tip}"], src, timeout=10)
-                    if pilot_merges.intersection(incoming.splitlines()):
-                        self.deploy_refused(src, tip, "one-shot pilot deployment held")
-                        return
-                subject = util.git(["--no-replace-objects", "show", "-s", "--format=%s", tip], src, timeout=10).strip()
-                try:
-                    util.git(["--no-replace-objects", "merge", "-q", "--ff-only", "--no-autostash",
-                              "--no-overwrite-ignore", tip], src, timeout=30)
-                except RuntimeError as error:
-                    self.deploy_refused(src, tip, str(error))
+                if reason := pilot_deploy_refusal() or gh.deployment_ci_refusal(
+                    github, tip, required, timeout=DEPLOY_API_TIMEOUT,
+                ):
+                    self.deploy_refused(src, tip, reason)
                     return
-                self.say(f"deploy: {paths.short_path(src)} fast forwarded to {tip} ({subject})")
+                self.deploy_tip(src, base, ref, tip)
+
+    def deploy_tip(self, src: Path, base: str, ref: str, tip: str) -> None:
+        if util.git(["rev-parse", "--verify", ref], src, timeout=10, retry=False).strip() != tip:
+            return
+        if not self.deploy_ready(src, base, tip):
+            return
+        subject = util.git(["--no-replace-objects", "show", "-s", "--format=%s", tip], src,
+                           timeout=10, retry=False).strip()
+        with util.lock(PILOT_LOCK) as free:
+            reason = pilot_deploy_refusal() if free else "pilot is active"
+            if reason:
+                self.deploy_refused(src, tip, reason)
+                return
+            try:
+                util.git(["--no-replace-objects", "merge", "-q", "--ff-only", "--no-autostash",
+                          "--no-overwrite-ignore", tip], src, timeout=30, retry=False)
+            except RuntimeError as error:
+                self.deploy_refused(src, tip, str(error))
+                return
+        self.say(f"deploy: {paths.short_path(src)} fast forwarded to {tip} ({subject})")
 
     def deploy_ready(self, src: Path, base: str, tip: str) -> bool:
         reason = deploy_refusal(src, base, tip)
@@ -824,8 +847,6 @@ class Server:
                 self.inherited.discard(pid)
 
     def busy_with(self) -> str:
-        if self.deployment and not self.deployment.done():
-            return "a checkout update is still running"
         if sum(not f.done() for f in self.polls.values()):
             return "a source poll is still running"
         if running := [job.while_running for job in APPROVAL_JOBS if self.job_running(job)]:

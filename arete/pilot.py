@@ -24,10 +24,9 @@ BRANCH = "main"
 DOC = "README.md"
 TASK_TITLE = "Correct one README line"
 TASK_KIND = "fix"
-CHECK = gh.ARETE_CHECK
+CHECK = {"context": "arete-checks", "app_id": 15368}
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 PILOT_TASK = re.compile(r"t-[0-9a-f]{32}\Z")
-PILOT_LOCK = "pilot-doc-fix"
 
 
 class Held(RuntimeError):
@@ -140,10 +139,9 @@ def check_origin(repo: Path, github: str, *, until: float | None = None) -> None
                 "the checkout origin must have exactly one approved GitHub fetch and push URL")
 
 
-def have_checkout(repo: Path, expected: str) -> None:
-    head = git(repo, "rev-parse", "HEAD").strip()
+def have_checkout(repo: Path, base: str) -> None:
     require(git(repo, "symbolic-ref", "--short", "HEAD").strip() == BRANCH
-            and head == expected
+            and git(repo, "rev-parse", "HEAD").strip() == base
             and not git(repo, "status", "--porcelain"), "the deployment checkout changed or is dirty")
 
 
@@ -168,42 +166,11 @@ def exact_edit(repo: Path, signal: Signal, head: str, expected: str, *, until: f
 
 
 def receipt_for(tid: str) -> Path:
-    return paths.STATE_DIR / PILOT_LOCK / tid / "receipt.json"
+    return paths.STATE_DIR / "pilot-doc-fix" / tid / "receipt.json"
 
 
 def is_pilot_task(tid: str) -> bool:
     return bool(PILOT_TASK.fullmatch(tid))
-
-
-def pending_checkout_merges(github: str, *, timeout: float) -> set[str]:
-    try:
-        folders = list((paths.STATE_DIR / PILOT_LOCK).iterdir())
-    except FileNotFoundError:
-        return set()
-    merges = set()
-    for folder in folders:
-        if not is_pilot_task(folder.name):
-            continue
-        try:
-            row = json.loads(paths.read_confined(receipt_for(folder.name)))
-        except FileNotFoundError:
-            continue
-        if (row["signal"]["github"].casefold() != github.casefold() or row["phase"] == "healthy"
-                or not (url := row.get("pr"))):
-            continue
-        merged = row.get("merged")
-        if not merged:
-            pr = re.fullmatch(rf"https://github\.com/{re.escape(github)}/pull/([1-9][0-9]*)", url, re.IGNORECASE)
-            require(pr, "the pilot receipt has an invalid PR")
-            view = gh.gh_json(["api", f"repos/{github}/pulls/{pr[1]}"], timeout=timeout, retry=False)
-            require(isinstance(view, dict) and type(view.get("merged")) is bool,
-                    "GitHub did not establish whether the pilot PR merged")
-            if not view["merged"]:
-                continue
-            merged = view.get("merge_commit_sha")
-        require(isinstance(merged, str) and SHA.fullmatch(merged), "the pilot merge commit is unknown")
-        merges.add(merged)
-    return merges
 
 
 def private(path: Path, expected_type) -> bool:
@@ -361,8 +328,8 @@ def owner_merge(github: str, number: int, head: str, ready_at: str = "") -> str:
     return commit
 
 
-def healthy(*, head: str = "") -> str:
-    beat = util.read_json(paths.SERVE_BEAT_FILE, {})
+def healthy() -> str:
+    beat = util.read_json(paths.STATE_DIR / "serve.json", {})
     server = util.read_json(paths.STATE_DIR / "server.json", {})
     require(beat.get("tick_ok") is True and beat.get("schema") and beat.get("at")
             and util.now().timestamp() - util.parse_iso(beat["at"]).timestamp() < 65
@@ -370,10 +337,6 @@ def healthy(*, head: str = "") -> str:
             and server.get("scheme") == "https" and server.get("state") == str(paths.STATE_DIR)
             and server.get("config") == str(paths.CONFIG_FILE) and server.get("pid") == beat.get("pid")
             and util.pid_alive(server.get("pid")), "the local service is not healthy")
-    if head:
-        engine = beat.get("engine") or ""
-        require(len(engine) >= 12 and head.startswith(engine) and engine == beat.get("checkout_head"),
-                "serve has not loaded the deployed commit")
     with urlopen(f"https://{server['host']}:{server['port']}/api/meta", timeout=10) as response:
         require(response.status == 200 and json.load(response)["schema"]["version"] == beat["schema"],
                 "the dashboard API did not confirm the healthy schema")
@@ -388,13 +351,13 @@ def wait_for(deadline: float, check, why: str, *, interval: float = 2):
     raise Held(why)
 
 
-def wait_healthy(deadline: float, deployed_at: str, head: str) -> None:
+def wait_healthy(deadline: float, deployed_at: str) -> None:
     last_failure = ""
 
     def fresh():
         nonlocal last_failure
         try:
-            return healthy(head=head) > deployed_at
+            return healthy() > deployed_at
         except (Held, OSError, ValueError, KeyError) as error:
             last_failure = str(error)
             return False
@@ -504,7 +467,7 @@ def execute(cfg: config.Config, repo: config.Repo, layer: config.RepoLayer, sign
 
         def ci_on_main():
             require(origin(signal.github) == merged, "main moved before deployment")
-            return gh.push_ci_state(signal.github, merged, BRANCH, required=CHECK) == "pass"
+            return gh.merge_ci_passed(signal.github, merged, required=CHECK)
 
         wait_for(deadline, ci_on_main, "the merged commit has no passing CI before the deadline", interval=5)
         with util.repo_lock(repo.path):
@@ -522,18 +485,15 @@ def execute(cfg: config.Config, repo: config.Repo, layer: config.RepoLayer, sign
             healthy()
             require(origin(signal.github) == merged, "main moved before the checkout could be updated")
             protected(signal.github)
-            require(gh.push_ci_state(signal.github, merged, BRANCH, required=CHECK) == "pass",
-                    "release CI changed before deployment")
+            require(gh.merge_ci_passed(signal.github, merged, required=CHECK), "release CI changed before deployment")
             check_run()
-            in_time()
             record("deployment_requested")
-            have_checkout(repo.path, signal.base)
             in_time()
-            git(repo.path, "merge", "--ff-only", "--no-autostash", "--no-overwrite-ignore", merged)
+            git(repo.path, "merge", "--ff-only", merged)
             have_checkout(repo.path, merged)
             deployed_at = util.iso()
             record("deployed_waiting_for_health", deployed_at=deployed_at)
-        wait_healthy(deadline, deployed_at, merged)
+        wait_healthy(deadline, deployed_at)
         record("healthy")
     except BaseException as error:
         record("held", stopped_at=row["phase"], why=str(error) or type(error).__name__)
@@ -580,8 +540,8 @@ def cmd_pilot(args) -> int:
                 and limits.max_workers == 1 and limits.max_decisions <= 16 and limits.max_actions <= 64
                 and layer.max_run_minutes <= 40 and layer.max_verify_minutes <= 15 and layer.max_repair_cycles <= 1,
                 "the one-shot pilot needs the bounded subscription-only layer")
-        with util.lock(PILOT_LOCK) as locked:
-            require(locked, "a pilot or checkout update is already active")
+        with util.lock("pilot-doc-fix") as locked:
+            require(locked, "another pilot is already active")
             receipt = claim(signal)
             print(f"One-shot record: {receipt}", flush=True)
             execute(cfg, repo, layer, signal, expected, receipt, args.minutes)
