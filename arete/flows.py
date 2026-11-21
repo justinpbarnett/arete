@@ -520,6 +520,8 @@ class Job:
                 self.run.base_note = pipeline.base_merge_note(merged)
                 if self.built is not None:
                     self.built.workspace = self.workspace
+                    for checkout in merged:
+                        self.built.worker_trees.pop(checkout.github, None)
                 workspace.note_made(self.ws, self.checkouts)
         self.run.kept_note = pipeline.kept_edits_note(held) if self.run.answers_due else ""
 
@@ -551,7 +553,8 @@ class Job:
         t = self.ticket
         return prompt_loader.Brief(self.run.repo.name, self.workspace, t.ref, t.title, t.body,
                                    owner=self.run.owner_note, comments=t.comments, attachments=self.attachments,
-                                   expertise=self.expertise, commands=self.commands, max_lines=self.layer.max_diff_lines)
+                                   expertise=self.expertise, commands=self.commands, max_lines=self.layer.max_diff_lines,
+                                   denied=prompt_loader.code_list(diffguard.denied_paths(self.layer)))
 
     @property
     def b(self) -> pipeline.Build:
@@ -909,7 +912,7 @@ def plan(flow: factory.Flow) -> Outcome:
     limit, info = layer.max_diff_lines, run.tracker.label_name("needs-info")
     reads = pipeline.git_reads(job.checkouts)
     res = run.agent("plan", job.brief.prompt(
-        "plan", triage=job.triage, denied=prompt_loader.code_list(diffguard.denied_paths(layer)),
+        "plan", triage=job.triage,
         checks=pipeline.check_list(layer), journeys=journeys.guidance(layer.verify.feature_map, planning=True)
         if layer.verify else ""),
                     job.ws, role="plan", allowed_tools=prompt_loader.bash_rules(config.DEFAULT_ALLOW_BASH + reads),
@@ -943,8 +946,8 @@ def patch(flow: factory.Flow, tree: str) -> Outcome:
     job: Job = flow.ctx
     policy = job.layer.patch
     res = job.run.agent(BUILD, job.brief.prompt(
-        "patch", triage=job.triage, patch_files=policy.max_files, patch_lines=min(policy.max_lines, job.layer.max_diff_lines),
-        denied=prompt_loader.code_list(diffguard.denied_paths(job.layer))), job.ws, role=BUILD,
+        "patch", triage=job.triage, patch_files=policy.max_files,
+        patch_lines=min(policy.max_lines, job.layer.max_diff_lines)), job.ws, role=BUILD,
         allowed_tools=prompt_loader.bash_rules(job.builder_bash), disallowed_tools=routing.NO_GIT_WRITES,
         json_schema=patching.SCHEMA)
     if not res.ok or not isinstance(res.structured, dict):
@@ -1045,14 +1048,16 @@ def implement(flow: factory.Flow, tree: str, round: str, feedback: str = "", att
         return Outcome("pass" if res.ok and isinstance(res.structured, dict) else "fail",
                        data={"round": round, "failures": feedback, "verdicts": res.structured, "said": res.text},
                        session=run.sessions.get(BUILD, NO_SESSION))
-    if round.startswith(REVIEW_FIX):
-        res = job.b.resume(round, prompt_loader.prompt(REVIEW_FIX, problems=feedback, notes=job.review.fix_notes()),
-                           role=atom)
-    elif round != BUILD:
-        res = job.b.resume(round, prompt_loader.prompt("fix", attempt=attempt, max_attempts=tries, failures=feedback,
-                                                  checks=job.b.check_commands), role=atom)
-    else:
+    if round == BUILD:
         return build(job)
+    b = job.b
+    denied = prompt_loader.code_list(b.deny)
+    if round.startswith(REVIEW_FIX):
+        prompt = prompt_loader.prompt(REVIEW_FIX, problems=feedback, notes=job.review.fix_notes(), denied=denied)
+    else:
+        prompt = prompt_loader.prompt("fix", attempt=attempt, max_attempts=tries, failures=feedback,
+                                      checks=b.check_commands, denied=denied)
+    res = b.resume(round, prompt, role=atom)
     return Outcome("pass" if res.ok else "fail", data={"round": round, "reply": res.text},
                    session=run.sessions.get(BUILD, NO_SESSION))
 
@@ -1081,7 +1086,8 @@ def checks(flow: factory.Flow, tree: str, attempt: int = 1, tries: int = 1, afte
            quick: bool = False) -> Outcome:
     job: Job = flow.ctx
     run, b = job.run, job.b
-    ok = b.check(quick=True) if quick else b.check()
+    phase = after or "the build and its fixes"
+    ok = b.check(quick=quick, after=phase)
     if not after:
         record.note(run.id, attempts=attempt)
     if not ok:
@@ -1092,7 +1098,7 @@ def checks(flow: factory.Flow, tree: str, attempt: int = 1, tries: int = 1, afte
                        data={"report": b.report, "attempts": attempt, "after": after, "story": run.story,
                              "policy": job.policy("checks", {"quick": quick}), "checked": b.checked})
     planned = f" (the plan estimated {job.estimate})" if job.estimate and not after else ""
-    b.require_valid_diff(after or "the build and its fixes", planned)
+    b.require_valid_diff(phase, planned)
     checked_tree = factory.fingerprint(job.ws)
     full = (b.checked.get("tree") == checked_tree and b.checked.get("commands") == job.layer.checks
             and b.checked.get("report") == b.report)

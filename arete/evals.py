@@ -582,7 +582,7 @@ def run_task(cfg: config.Config, src: Source, task: Task, prompts: Prompts, run:
         brief = prompt_loader.Brief(repo.name, workspace_text, task.name, task.title, task.prompt,
                                     comments="",
                                     attachments="", expertise=expertise, commands=commands,
-                                    max_lines=layer.max_diff_lines)
+                                    max_lines=layer.max_diff_lines, denied=prompt_loader.code_list(denied_paths(layer)))
         if run.executor:
             from .lab import workflows
 
@@ -594,7 +594,7 @@ def run_task(cfg: config.Config, src: Source, task: Task, prompts: Prompts, run:
             return acceptance(cfg, run, layer, wt, task, brief, result, "", "Engine workflow gates completed.",
                               True, timeout)
         res = run.agent("plan", brief.prompt(
-            "plan", prompts.dir, triage="", denied=prompt_loader.code_list(denied_paths(layer)), checks=checks),
+            "plan", prompts.dir, triage="", checks=checks),
                         wt, **run.call_kw(cfg, "plan", READ_TOOLS, prompt_loader.bash_rules(config.DEFAULT_ALLOW_BASH)),
                         json_schema=PLAN_SCHEMA, timeout=timeout)
         if not res.ok or not isinstance(res.structured, dict):
@@ -620,7 +620,7 @@ def run_task(cfg: config.Config, src: Source, task: Task, prompts: Prompts, run:
             while not ok and run.may_repair(attempts, max_attempts):
                 attempts += 1
                 fix = prompt_loader.prompt("fix", prompts.dir, attempt=attempts, max_attempts=max_attempts, failures=report,
-                             checks=runs_checks)
+                                           checks=runs_checks, denied=brief.denied)
                 res = run.agent(f"fix{attempts}", prompt_loader.task_prompt(fix), wt,
                                 **run.call_kw(cfg, "check_repair", BUILD_TOOLS, rules),
                                 disallowed_tools=routing.NO_GIT_WRITES, resume=session, timeout=timeout,

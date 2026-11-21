@@ -169,6 +169,7 @@ class Controller:
             self.job.b.checked = self.data.get("checked", {})
             self.job.b.report = self.data.get("report", "")
             self.job.b.catch_ups = self.data.get("catch_ups", 0)
+            self.job.b.worker_trees = self.data.get("worker_trees", {})
             self.job.b.from_base = True
             self.job.b.plan_text, self.job.b.build_summary = self.job.plan_text, self.job.build_summary
             if pending_push:
@@ -286,6 +287,8 @@ class Controller:
         self.catalog.add_context(f"evidence:{gate}", ledger.encoded(self.data["evidence"][gate]))
 
     def current(self, gate):
+        if gate == "checks" and self.data.get("denied_feedback"):
+            return False
         found = self.data.get("evidence", {}).get(gate, {})
         return bool(found and found["tree"] == self.fingerprint() and found["policy"] == self.policy_sha()
                     and found.get("acceptance") == self.data["acceptance"])
@@ -447,7 +450,8 @@ class Controller:
             raise ValueError("worker or workspace mutation lease is busy; wait before starting this delegation")
         role = setting.step
         catch_up = self.data.get("catch_up_hold", {})
-        if writing and (self.data.get("writes", 0) or self.run.repairs or catch_up):
+        denied_feedback = self.data.get("denied_feedback", "")
+        if writing and (self.data.get("writes", 0) or self.run.repairs or catch_up or denied_feedback):
             role = ("ci_repair" if self.data.get("ci_failed") else "review_repair"
                     if catch_up.get("gate") == "review" or self.job.review.verdict == "request_changes"
                     else "check_repair")
@@ -478,12 +482,23 @@ class Controller:
         if "verify" in args["inputs"] and pipeline.triage_checks(self.job.approval):
             inputs["verify"] = pipeline.triage_goal(str(inputs["verify"]), self.job.approval)
         prompt = self.job.brief.prompt("delegate" if name in ("delegate", "investigate") else name, **inputs)
+        if writing and denied_feedback:
+            prompt += f"\n\n## Check failure to repair\n\n{denied_feedback}"
         session = NO_SESSION
         previous = (prior or {}).get("result", {})
         if previous.get("runner") == setting.runner and previous.get("model") == setting.model:
             session = Session(**previous.get("session", {}))
         request = delegation.request(self.job, action["id"], prompt, setting, tools,
                                      prompt_loader.bash_rules(self.job.builder_bash) if writing else [], session)
+        if writing:
+            b = self.job.b
+            if not b.worker_trees and not denied_feedback:
+                b.worker_trees = {c.github: factory.fingerprint(c.wt) for c in b.checkouts}
+                if not all(b.worker_trees.values()):
+                    b.worker_trees.clear()
+                    raise ValueError("the workspace could not be recorded before the writing worker")
+                self.data["worker_trees"] = b.worker_trees
+                self.persist()
         worker = delegation.Worker(self.run, action["id"], request)
         worker.writing, worker.effective = writing, args
         try:
@@ -509,6 +524,11 @@ class Controller:
                     if type(seconds) in (int, float) and seconds > 0:
                         worker.deadline = min(worker.deadline, time.monotonic() + seconds)
                     worker.allow(grant)
+                    if (self.run.budget and worker.writing and message["role"] in runlimits.REPAIRS
+                            and self.data.get("denied_feedback")):
+                        self.data.pop("denied_feedback")
+                        self.job.b.denied_feedback = ""
+                        self.persist()
                 elif message.get("event") in ("result", "error"):
                     worker.close()
                     del self.workers[key]
@@ -516,7 +536,7 @@ class Controller:
                         self.run.launch_done(worker.step, bool(message.get("ok")))
                     self.run.cost += message.get("cost_usd", 0)
                     self.run.paid += message.get("paid_usd", 0)
-                    result = {**message, "effective": worker.effective}
+                    result = {**message, "effective": worker.effective, "writing": worker.writing}
                     if worker.writing:
                         workspace.note_made(self.job.ws, self.job.checkouts,
                                             pipeline.workspace_owner(self.run, self.job.ws, self.job.checkouts))
@@ -650,6 +670,8 @@ class Controller:
             self.ending = flows.ended(self.flow, outcome)
             return outcome.data
         self.data.pop("publication_intent", None)
+        self.data.pop("worker_trees", None)
+        self.job.b.worker_trees = {}
         self.data["publication"] = outcome.data
         self.persist()
         if catch_up:
@@ -948,7 +970,15 @@ class Controller:
         if op == "checks.run":
             self.data.setdefault("evidence", {}).pop("checks", None)
             self.persist()
-            outcome = self.atomic("checks", tree=str(self.job.ws), quick=args["scope"] == "quick")
+            b = self.job.b
+            b.denied_feedback = self.data.get("denied_feedback", "")
+            b.on_denied_edit = self.hold_for_denied_edit
+            try:
+                outcome = self.atomic("checks", tree=str(self.job.ws), quick=args["scope"] == "quick")
+            finally:
+                b.on_denied_edit = None
+            if self.data.get("denied_feedback"):
+                self.data["denied_feedback"] = b.report
             if outcome.passed:
                 self.stamp("checks", outcome.data)
             return {"passed": outcome.passed, **outcome.data}
@@ -995,17 +1025,25 @@ class Controller:
             elif self.data.get("catch_up_hold"):
                 self.ending = self.park_catch_up("the orchestrator stopped without delivery")
             elif args["reason"] == "noop":
+                if feedback := self.data.get("denied_feedback"):
+                    raise ValueError(feedback)
                 if not self.job.b.restage().empty:
                     raise ValueError("noop cannot discard an implementation diff")
                 self.ending = flows.finish(self.flow, "nothing", summary=self.job.build_summary or "No change needed.")
             elif (self.run.budget and (reason := self.run.budget.repair_limit_reason())
                   and not zte.reserved(str(self.run.tid))):
+                if feedback := self.data.get("denied_feedback"):
+                    reason = f"{reason}. {feedback}"
                 self.ending = pipeline.park_run(self.run, reason)
             else:
                 self.ending = flows.finish(self.flow, "failed", why="the orchestrator stopped without delivery",
                                            recovery=self.failure_recovery())
             return {"reason": args["reason"]}
         raise ValueError("unknown orchestration operation")
+
+    def hold_for_denied_edit(self, feedback):
+        self.data["denied_feedback"] = feedback
+        self.persist()
 
     def dispatch(self, action) -> ValueError | None:
         if action["state"] != "accepted":

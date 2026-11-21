@@ -3,6 +3,8 @@ This is round $round of $max_rounds. $merged_base
 
 $failures
 
+Denied paths: $denied.
+
 For each check, first decide whether this PR caused the failure. CI also fails for reasons outside the PR: a shared
 test database or service that drifted, a flaky test, an expired secret, an outage. The base result helps, and its
 date matters: a check that passed on the base weeks ago may fail there now. Compare what failed with what the PR

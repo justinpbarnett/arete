@@ -835,7 +835,9 @@ def proposals_text(props: list[dict]) -> str:
 
 
 def apply_in(cfg: config.Config, run_id: str, wt: Path, props: list[dict]) -> runner.Result:
-    return runner.run(prompt_loader.prompt("apply", proposals=proposals_text(props)), wt, model=cfg.model("apply"),
+    denied = list(dict.fromkeys(diffguard.ALWAYS_DENY + NEVER))
+    text = prompt_loader.prompt("apply", proposals=proposals_text(props), denied=prompt_loader.code_list(denied))
+    return runner.run(text, wt, model=cfg.model("apply"),
                       allowed_tools=EDIT_TOOLS, timeout=1200, persist=False, trace=(run_id, "apply"))
 
 
