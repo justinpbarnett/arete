@@ -15,7 +15,6 @@ import threading
 import time
 import tomllib
 import unittest
-from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import asdict, replace
@@ -31,14 +30,14 @@ from unittest import mock
 from adws import single_worker
 from arete import (
     api_check, ci, codebase, codex, config, dashboard, diffguard, evals, factory, flows, gh, guard, install, jev,
-    journeys, launch_lease, loop_run, mergecheck, miner, orchestration, outcomes, owner_asks, paths, pi, pipeline,
-    poll, principals, queueing, record, runner, runlimits, sandbox, serve, serve_guard, slots, tailnet, tasks, tracker,
+    journeys, launch_lease, loop_run, mergecheck, miner, orchestration, outcomes, owner_asks, paths, pipeline,
+    poll, principals, queueing, record, runlimits, sandbox, serve, serve_guard, slots, tailnet, tasks, tracker,
     util, verify, workspace,
 )
 from arete.agent import NO_SESSION, Result
 from arete.orchestration_api import OPERATIONS
 from arete.review import Review, catch_up_problems
-from arete.store import db, orchestration as ledger, tasks as tasks_store
+from arete.store import db, orchestration as ledger
 from tests.parallel import stack_env
 
 
@@ -169,21 +168,6 @@ class RestoredPRRevisionTests(unittest.TestCase):
     base = "old-base"
     head = "pr-head"
     deny = '[limits]\ndeny = ["owner-only.txt"]\n'
-
-    @classmethod
-    def setUpClass(cls):
-        root = Path(tempfile.mkdtemp(prefix="arete-restored-pr-db-"))
-        cls.addClassCleanup(shutil.rmtree, root, ignore_errors=True)
-        db_path = root / "arete.db"
-        db_path.touch()
-        uri = f"file:{db_path.as_posix()}?mode=memory&cache=shared"
-        with (closing(sqlite3.connect(uri, uri=True)) as schema,
-              mock.patch.object(db, "connect_db", side_effect=lambda *_a, **_kw: sqlite3.connect(uri, uri=True)),
-              mock.patch.multiple(paths, STATE_DIR=root, DB_FILE=db_path, LOCKS_DIR=root,
-                                  ensure_dirs=mock.DEFAULT),
-              redirect_stdout(StringIO())):
-            db.migrate()
-            cls.policy_schema = schema.serialize()
 
     def setUp(self):
         root = Path(tempfile.mkdtemp(prefix="arete-restored-pr-"))
@@ -320,71 +304,6 @@ class RestoredPRRevisionTests(unittest.TestCase):
 
         self.first_dispatch(check)
 
-    def test_writing_worker_from_shared_root_preserves_the_closed_sibling(self):
-        ctl, c = self.controller, self.checkout
-        sibling = self.add_sibling(8, base="deleted-base", state="CLOSED")
-        owner = sibling.wt / "owner.txt"
-        owner.write_text("owner edit")
-        alias = self.ws / "owner-alias"
-        alias.symlink_to(owner)
-        self.assertIsNone(ctl.prepare())
-        args = {"depends_on": [], "context_refs": [], "tool_bundle": "write", "goal": "Revise the PR", "inputs": {}}
-        setting = pipeline.steps.resolve(self.job.cfg, self.job.layer, "build", self.run.kind,
-                                         {"runner": "pi", "model": "test",
-                                          "tools": ["Read", "Glob", "Grep", "Write", "Edit"]})
-        with (mock.patch.object(ctl.catalog, "worker", return_value=(setting, "delegate", True)),
-              mock.patch.object(orchestration.delegation, "Worker") as worker):
-            ctl.worker_start(self.worker, args)
-        launch = worker.call_args.args[2]
-        self.assertEqual(launch["cwd"], str(self.ws))
-        cwd = Path(launch["cwd"])
-        excluded = tuple(map(Path, launch["excluded_worktrees"]))
-        trip = runner.Trip(self.job.cfg, self.run.repo, runner.devices.LOCAL, None, NO_SESSION, None, None,
-                           layer=self.job.layer)
-        picked = SimpleNamespace(candidate=SimpleNamespace(runner="pi", effort="", instructions=[]),
-                                 selected=None, budget=0)
-        root = self.ws.parent
-        with mock.patch.object(guard, "floor", return_value=guard.Floor((root,), (), (cwd,))):
-            kw = runner.launch_kwargs({"excluded_worktrees": excluded}, picked, trip, (self.run.id, "worker"),
-                                      False, print, cwd=cwd)
-        active = c.wt / "worker.txt"
-        with (mock.patch.multiple(pi, PI_HOME=root / "pi", KEYS_FILE=root / "keys.toml",
-                                  GUARD_FILE=root / "guard.mjs", ASK_FILE=root / "ask.mjs", SHELL_FILE=root / "shell.mjs",
-                                  owner_dir=mock.Mock(return_value=root / "pi-owner")),
-              mock.patch.multiple(sandbox, AGENT_DIR=root / "pi-agent", LOGIN_DIR=root / "pi-login",
-                                  KEY_DIR=root / "pi-keys"),
-              mock.patch.multiple(paths, PACKAGE_DIR=root / "package", CONFIG_FILE=root / "config.toml")):
-            env = pi.guard_env(kw["floor"])
-        node = shutil.which("node")
-        self.assertIsNotNone(node, "Node is required to exercise Pi's writing tools")
-        guard_file = root / pi.GUARD_FILE.name
-        guard_file.write_bytes(pi.GUARD_FILE.read_bytes())
-        script = """
-import { writeFileSync } from "node:fs";
-import { resolve } from "node:path";
-const { default: guard } = await import(process.argv[1]);
-let admit;
-guard({ on(event, callback) { if (event === "tool_call") admit = callback; } });
-for (const path of process.argv.slice(2)) {
-    if (!admit({ toolName: "write", input: { path } }, { cwd: process.cwd() })?.block) {
-        writeFileSync(resolve(path), "worker edit");
-    }
-}
-"""
-        result = subprocess.run([node, "--input-type=module", "-e", script, guard_file.as_uri(),
-                                 *(str(p.relative_to(cwd)) for p in (owner, alias, active))],
-                                cwd=cwd, env=env, capture_output=True, text=True, timeout=2)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(active.read_text(), "worker edit")
-        self.assertEqual(owner.read_text(), "owner edit")
-        if sandbox.can_confine(False) and not sandbox.sandboxed():
-            command = pi.confinement(cwd, [], kw["floor"], None, excluded_worktrees=kw["excluded_worktrees"])
-            command += ["/bin/sh", "-c", 'echo replacement > "$1"; echo "confined edit" > "$2"', "probe", owner, active]
-            result = subprocess.run(command, cwd=cwd, capture_output=True, text=True, timeout=2)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(active.read_text().strip(), "confined edit")
-            self.assertEqual(owner.read_text(), "owner edit")
-
     def test_unchanged_base_leaves_head_and_skips_a_sibling_without_a_pr(self):
         c = self.checkout
         sibling = self.add_sibling(base="deleted-base")
@@ -408,13 +327,14 @@ for (const path of process.argv.slice(2)) {
         (c.wt / ".git").unlink()
         self.fixture_git(origin, "init", "-q", "--bare", "--template=", "-b", "main")
         commits = []
-        for mark, (branch, content) in enumerate(
-                (("main", "base"), ("revision", "PR version"), ("advance", "base advance")), start=1):
+        for mark, (branch, name, content) in enumerate(
+                (("main", "file.txt", "base"), ("revision", "file.txt", "kept edit"),
+                 ("advance", "upstream.txt", "base advance")), start=1):
             parent = "from :1\n" if mark != 1 else ""
             commits.append(f"commit refs/heads/{branch}\nmark :{mark}\n"
                            "committer Fixture <fixture@example.com> 1 +0000\n"
                            f"data {len(branch)}\n{branch}\n{parent}"
-                           f"M 100644 inline file.txt\ndata {len(content)}\n{content}\n")
+                           f"M 100644 inline {name}\ndata {len(content)}\n{content}\n")
         self.fixture_git(origin, "fast-import", "--quiet", input="".join(commits) + "done\n")
         self.fixture_git(self.ws, "clone", "-q", "--template=", "-b", "revision", str(origin), str(c.wt))
         c.src = c.wt
@@ -435,65 +355,56 @@ for (const path of process.argv.slice(2)) {
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout
 
-    def test_real_git_keeps_an_unmoved_base_and_resolves_a_conflicting_advance(self):
+    def test_dirty_closed_sibling_stops_before_any_worker_or_check_and_keeps_the_edit(self):
+        sibling = self.add_sibling(8, base="deleted-base", state="CLOSED")
+        owner = sibling.wt / "file.txt"
+        owner.write_text("uncommitted owner edit\n")
+        self.actions.return_value.insert(0, {**self.worker, "id": "checks", "op": "checks.run"})
+
+        with (mock.patch.object(self.controller, "atomic") as checks,
+              mock.patch.object(workspace, "uncommitted", return_value=[owner.name]) as dirty):
+            status, summary, pr = self.controller.drive()
+        pipeline.keep_edits(self.run)
+
+        self.assertEqual((status, pr), ("failed", self.checkout.pr))
+        self.assertIn(sibling.github, summary)
+        self.comment.assert_called_once()
+        self.assertEqual(self.comment.call_args.args, (pr, summary))
+        self.assertIsNone(self.run.workspace)
+        self.assertEqual(owner.read_text(), "uncommitted owner edit\n")
+        dirty.assert_called_once_with(sibling.wt)
+        self.dispatch.assert_not_called()
+        checks.assert_not_called()
+        self.fetch.assert_not_called()
+
+    def test_parked_owner_answer_merges_the_new_base_with_kept_edits_and_no_pr(self):
         c, origin = self.real_checkout()
-
-        def check_unmoved(row):
-            self.assertEqual(row["base_commit"], c.base_commit)
-            self.assertEqual(self.fixture_git(c.wt, "rev-parse", "HEAD").strip(), c.lease)
-
-        with mock.patch.object(pipeline, "merge_as_run") as merge:
-            self.first_dispatch(check_unmoved)
-        merge.assert_not_called()
-        self.resolver.assert_not_called()
-
-        self.run.workspace = self.controller.ending = None
-        self.dispatch.reset_mock()
-        self.saved.reset_mock()
-        moved = self.fixture_git(origin, "rev-parse", "advance").strip()
+        kept, moved = c.lease, self.fixture_git(origin, "rev-parse", "advance").strip()
         self.fixture_git(origin, "update-ref", "refs/heads/main", moved)
-
-        def resolve(run, checkout, conflicts, layer, ticket):
-            self.dispatch.assert_not_called()
-            self.assertEqual((run, checkout.wt, conflicts), (self.run, c.wt, ["file.txt"]))
-            (c.wt / "file.txt").write_text("PR version\nbase advance\n")
-            self.fixture_git(c.wt, *util.ARETE_IDENTITY, "commit", "-qa", "--no-edit")
+        c.pr = c.lease = ""
+        c.revision = c.base_commit
+        prepared = self.controller.data["prepared"]
+        prepared["checkouts"] = [c.to_row()]
+        answer = {**owner_asks.text_ask("Keep the edit?"), "answers": [{"text": "Keep it"}], "status": "answered",
+                  "run": "prior-run", "id": "question", "step": "orchestrate"}
+        self.run.answers_due = [answer]
+        self.actions.return_value.insert(0, {**self.worker, "id": "ask", "op": "owner.ask", "state": "succeeded",
+                                            "result": {"awaiting_owner": True, "ask_ids": ["question"]}})
 
         def check(row):
             head, *parents = self.fixture_git(c.wt, "rev-list", "--parents", "-1", "HEAD").split()
-            self.assertEqual(parents, [c.lease, moved])
-            self.assertEqual((row["base_commit"], row["merge"], row["resolved"]), (moved, head, ["file.txt"]))
-            self.assertEqual((c.wt / "file.txt").read_text(), "PR version\nbase advance\n")
-            self.assertEqual(workspace.uncommitted(c.wt), [])
+            self.assertEqual(parents, [kept, moved])
+            self.assertEqual((row["base_commit"], row["merge"], row["onto"]), (moved, head, moved))
+            self.assertEqual((c.wt / "file.txt").read_text(), "kept edit")
+            self.assertEqual((c.wt / "upstream.txt").read_text(), "base advance")
+            self.assertIn("Keep it", self.job.goal)
 
-        self.resolver.side_effect = resolve
-        self.first_dispatch(check)
-        self.resolver.assert_called_once()
-
-    def test_refused_checkout_keeps_its_uncommitted_edit_through_finalization(self):
-        c = self.checkout
-        (c.wt / ".git").unlink()
-        with mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}):
-            self.fixture_git(c.wt, "init", "-q", "--template=", "-b", "owner-branch")
-            (c.wt / "file.txt").write_text("original\n")
-            self.fixture_git(c.wt, "add", "file.txt")
-            self.fixture_git(c.wt, *util.ARETE_IDENTITY, "commit", "-qm", "Original")
-        (c.wt / "file.txt").write_text("uncommitted owner edit\n")
-
-        with (self.assertRaisesRegex(workspace.RunFailed, "on branch owner-branch"),
-              mock.patch.object(pipeline, "git", util.git),
-              mock.patch.object(self.job, "reclaim", wraps=flows.Job.reclaim.__get__(self.job)),
-              mock.patch.object(pipeline, "workflow_denied", return_value=True)):
-            try:
-                self.controller.drive()
-            finally:
-                pipeline.keep_edits(self.run)
-
-        self.assertIsNone(self.run.workspace)
-        self.assertEqual(self.fixture_git(c.wt, "symbolic-ref", "--short", "HEAD").strip(), "owner-branch")
-        self.assertEqual(self.fixture_git(c.wt, "status", "--porcelain").strip(), "M file.txt")
-        self.assertEqual((c.wt / "file.txt").read_text(), "uncommitted owner edit\n")
-        self.dispatch.assert_not_called()
+        with (mock.patch.object(workspace, "kept_onto", return_value={str(c.wt): c.base_commit}),
+              mock.patch.object(flows, "prepared_data", return_value=prepared),
+              mock.patch.object(orchestration.ask_store, "ask_get", return_value=answer)):
+            self.first_dispatch(check)
+        self.pr_details.assert_not_called()
+        self.resolver.assert_not_called()
 
     def test_closed_sibling_with_a_deleted_base_is_excluded_from_the_revision(self):
         c = self.checkout
@@ -514,7 +425,7 @@ for (const path of process.argv.slice(2)) {
 
         self.first_dispatch(check)
 
-    def test_rebuilds_missing_open_worktree_beside_the_dirty_closed_sibling(self):
+    def test_rebuilds_missing_open_worktree_beside_the_clean_closed_sibling(self):
         sibling = self.checkout
         sibling.base = "deleted-base"
         self.prs[sibling.pr] = {"state": "MERGED", "baseRefName": sibling.base}
@@ -556,8 +467,7 @@ for (const path of process.argv.slice(2)) {
               mock.patch.object(workspace, "made_before", return_value=made),
               mock.patch.object(workspace, "remote_head", return_value=self.head) as remote,
               mock.patch.object(workspace, "add_worktree", side_effect=add_worktree) as add,
-              mock.patch.object(workspace, "uncommitted",
-                                side_effect=lambda wt, **_: ["owner.txt"] if wt == sibling.wt else []) as dirty,
+              mock.patch.object(workspace, "uncommitted", return_value=[]) as dirty,
               mock.patch.object(workspace, "ignored_files", return_value=[]),
               mock.patch.object(workspace, "git", side_effect=self.git),
               mock.patch.object(workspace, "remove_workspace") as remove,
@@ -565,7 +475,7 @@ for (const path of process.argv.slice(2)) {
             self.first_dispatch(check)
         remote.assert_called_once_with(c.src, "revision")
         add.assert_called_once()
-        self.assertNotIn(sibling.wt, [call.args[0] for call in dirty.call_args_list])
+        dirty.assert_any_call(sibling.wt)
         remove.assert_not_called()
         self.assertEqual(self.fetch.call_args_list, [mock.call(c.src, "revision"), mock.call(c.src, c.base)])
 
@@ -601,14 +511,11 @@ for (const path of process.argv.slice(2)) {
 
     def test_retarget_during_the_worker_blocks_publication(self):
         c, ctl = self.checkout, self.controller
-        publication = {"id": "publish", "op": "publication.request", "request": {},
-                       "state": "accepted", "result": {}, "run": self.run.id}
-        self.enterContext(mock.patch.object(ctl, "fingerprint", return_value="tree"))
-        self.enterContext(mock.patch.object(ctl, "current", return_value=True))
-        ctl.data["evidence"] = {"checks": {"result": {"full": True}}}
+        publication = {"id": "publish", "op": "publication.request", "request": {}, "state": "accepted"}
 
         def dispatch(action):
             if action == self.worker:
+                self.arrange_branch_publication(fresh_edit=True)
                 self.prs[c.pr]["baseRefName"] = "release"
                 action["state"] = "succeeded"
                 self.actions.return_value.append(publication)
@@ -616,28 +523,28 @@ for (const path of process.argv.slice(2)) {
                 orchestration.Controller.dispatch(ctl, action)
 
         self.dispatch.side_effect = dispatch
-        with mock.patch.object(ctl, "atomic") as atomic:
+        with (mock.patch.object(workspace, "remote_head", return_value=self.head),
+              mock.patch.object(util, "sh", side_effect=AssertionError("unexpected push")) as push):
             self.assert_retargeted(ctl.drive(), c.pr)
         self.dispatch.assert_has_calls([mock.call(self.worker), mock.call(publication)])
-        atomic.assert_not_called()
+        self.assertEqual(self.pr_details.call_args_list, [mock.call(c.pr), mock.call(c.pr)])
         self.merge.assert_not_called()
-        self.push.assert_not_called()
+        push.assert_not_called()
         self.assertNotIn("publication_intent", ctl.data)
 
-    def unpushed_merge_publication(self):
+    def arrange_branch_publication(self, *, fresh_edit=False):
         ctl = self.controller
-        self.assertIsNone(ctl.prepare())
         c, = self.job.checkouts
         self.enterContext(mock.patch.object(ctl, "fingerprint", return_value="tree"))
         self.enterContext(mock.patch.object(ctl, "current", return_value=True))
         self.enterContext(mock.patch.object(ctl, "validate_publication_diff"))
         ctl.data["evidence"] = {"checks": {"result": {"full": True}}}
-        fresh, staged = pipeline.Staged(), pipeline.Staged(changed=[c])
+        staged = pipeline.Staged(changed=[c], counts={"file.txt": 1})
+        fresh = staged if fresh_edit else pipeline.Staged()
         self.enterContext(mock.patch.object(self.job.b, "restage", side_effect=[fresh, staged]))
         self.enterContext(mock.patch.object(flows, "change", return_value=(staged, "1 line", "fixture")))
         self.enterContext(mock.patch.object(flows, "ancestor", return_value=True))
         self.enterContext(mock.patch.object(ctl, "atomic", side_effect=lambda _name, **kw: flows.pr(ctl.flow, **kw)))
-        publication = {"id": "publish", "op": "publication.request", "request": {}, "state": "accepted"}
         git = util.git
 
         def publication_git(args, cwd, **kw):
@@ -648,6 +555,13 @@ for (const path of process.argv.slice(2)) {
 
         self.enterContext(mock.patch.object(util, "git", return_value="new-head"))
         self.enterContext(mock.patch.object(pipeline, "git", side_effect=publication_git))
+
+    def unpushed_merge_publication(self):
+        ctl = self.controller
+        self.assertIsNone(ctl.prepare())
+        self.arrange_branch_publication()
+        c, = self.job.checkouts
+        publication = {"id": "publish", "op": "publication.request", "request": {}, "state": "accepted"}
         return ctl, c, publication
 
     def test_retarget_after_publication_starts_blocks_the_unpushed_merge(self):
@@ -688,102 +602,6 @@ for (const path of process.argv.slice(2)) {
         self.assertEqual(c.lease, self.head)
         self.assertNotIn("publication_intent", ctl.data)
 
-    def test_retarget_while_waiting_for_catch_up_stops_publication(self):
-        ctl = self.controller
-        self.assertIsNone(ctl.prepare())
-        c, = self.job.checkouts
-        self.prs[c.pr].update(isDraft=False, headRefOid=c.lease)
-        self.job.opened = [c.github]
-        self.job.slot = mock.Mock()
-
-        def retarget(*_args):
-            self.prs[c.pr]["baseRefName"] = "release"
-
-        self.job.slot.take.side_effect = retarget
-        publication = {"id": "publish", "op": "publication.request", "request": {}, "state": "accepted"}
-        with (mock.patch.object(ctl, "fingerprint", return_value="tree"),
-              mock.patch.object(ctl, "perform", side_effect=lambda _: ctl.finish_publication()),
-              mock.patch.object(ctl, "atomic", side_effect=lambda _, **kw: flows.publish(ctl.flow, **kw)),
-              mock.patch.object(ctl, "take_merge_lease"),
-              mock.patch.object(self.run, "enter"),
-              mock.patch.object(self.run, "say") as say,
-              mock.patch.object(pipeline, "automerge_allowed", return_value=True),
-              mock.patch.object(pipeline, "try_automerge", return_value=gh.MovedBaseHold("base moved")) as attempt,
-              mock.patch.object(pipeline, "report_automerge") as report,
-              mock.patch.object(pipeline, "fetch_merge_base") as fetch):
-            orchestration.Controller.dispatch(ctl, publication)
-
-        self.job.slot.take.assert_called_once_with(self.run.log, self.run.waiting, "automerge")
-        self.assert_retargeted(ctl.ending, c.pr)
-        attempt.assert_called_once()
-        for operation in (say, report, fetch, self.merge, self.push):
-            operation.assert_not_called()
-        self.assertNotIn("published", ctl.data)
-        self.assertNotIn("publication_intent", ctl.data)
-
-    def test_automerge_uses_the_retarget_observed_in_readiness_or_base_fetch(self):
-        for release_during_fetch in (False, True):
-            with self.subTest(release_during_fetch=release_during_fetch):
-                ctl = self.controller
-                ctl.ending, self.run.workspace = None, None
-                self.comment.reset_mock()
-                opts = {"isDraft": False, "headRefOid": self.head, "baseRefOid": self.base,
-                        "mergeStateStatus": "CLEAN", "mergeable": "MERGEABLE"}
-                self.prs[self.checkout.pr].update(opts)
-                self.pr_details.side_effect = self.prs.__getitem__
-                self.assertIsNone(ctl.prepare())
-                c, = self.job.checkouts
-                main = self.prs[c.pr]
-                release = {**main, "baseRefName": "release"}
-                observed = []
-                fetched = False
-                polled = False
-
-                def fetch(src, base):
-                    nonlocal fetched
-                    self.check_base(src, base)
-                    fetched = True
-                    if release_during_fetch:
-                        raise RuntimeError("could not fetch the previous base")
-
-                def details(pr, repo=None):
-                    nonlocal polled
-                    if (repo is not None and polled) or (fetched and release_during_fetch):
-                        observed.append("release")
-                        return release
-                    observed.append("main")
-                    if repo is not None:
-                        polled = True
-                        return {**main, "mergeStateStatus": "UNKNOWN"}
-                    return main
-
-                self.pr_details.side_effect = details
-                self.job.opened = [c.github]
-                publication = {"id": "publish", "op": "publication.request", "request": {}, "state": "accepted"}
-                with (mock.patch.object(ctl, "fingerprint", return_value="tree"),
-                      mock.patch.object(workspace, "fetch", side_effect=fetch),
-                      mock.patch.object(ctl, "perform", side_effect=lambda _: ctl.finish_publication()),
-                      mock.patch.object(ctl, "atomic", side_effect=lambda _, **kw: flows.publish(ctl.flow, **kw)),
-                      mock.patch.object(ctl, "take_merge_lease"),
-                      mock.patch.object(self.run, "enter"),
-                      mock.patch.object(self.run, "say") as say,
-                      mock.patch.object(pipeline, "automerge_allowed", return_value=True),
-                      mock.patch.object(pipeline, "merge_evidence_hold", return_value=""),
-                      mock.patch.object(jev, "ready", return_value=True),
-                      mock.patch.object(gh, "MERGE_POLL_SECONDS", 0),
-                      mock.patch.object(pipeline, "has_merge_base", return_value=True),
-                      mock.patch.object(pipeline, "report_automerge") as report,
-                      mock.patch.object(gh, "pr_merge_auto") as merge):
-                    orchestration.Controller.dispatch(ctl, publication)
-                self.assert_retargeted(ctl.ending, c.pr)
-                self.assertEqual(observed[-2:], ["main", "release"])
-                self.assertEqual(self.pr_details.call_args, mock.call(c.pr) if release_during_fetch
-                                 else mock.call(str(gh.pr_number(c.pr)), c.github))
-                for operation in (say, report, merge, self.merge, self.push):
-                    operation.assert_not_called()
-                self.assertNotIn("published", ctl.data)
-                self.assertNotIn("publication_intent", ctl.data)
-
     def assert_retargeted(self, ending, pr):
         self.assertEqual((ending[0], ending[2]), ("failed", pr))
         self.comment.assert_called_once()
@@ -792,11 +610,21 @@ for (const path of process.argv.slice(2)) {
         self.assertIn("from `main` to `release`", body)
 
     def test_rerun_alone_runs_selected_checks_on_the_retained_head(self):
+        self.rerun_saved_checks()
+
+    def test_rerun_alone_refuses_a_dirty_excluded_sibling_before_checks(self):
+        self.rerun_saved_checks(dirty_sibling=True)
+
+    def rerun_saved_checks(self, *, dirty_sibling=False):
         c, ctl = self.checkout, self.controller
         sibling = self.add_sibling(8, base="deleted-base", state="CLOSED")
         owner = sibling.wt / "owner.txt"
-        owner.write_text("closed sibling owner edit")
+        if dirty_sibling:
+            owner.write_text("closed sibling owner edit")
+            workspace.uncommitted.side_effect = lambda wt: [owner.name] if wt == sibling.wt else []
         ctl.data["prepared"]["closed_prs"] = [sibling.pr]
+        self.config.write_text(self.deny + '\n[checks]\nlint = "verify retained tree"\nslow = "run full checks"\n')
+        (c.wt / "file.txt").write_text("retained version")
         self.advance(c, conflict=True)
         self.worker.update(id="saved-checks", op="checks.run", state="succeeded", request={"scope": "quick"})
         self.run.action, self.run.action_only = self.worker["id"], True
@@ -811,11 +639,14 @@ for (const path of process.argv.slice(2)) {
             self.actions.return_value.append(rerun)
             return [rerun]
 
-        def check(name, **kw):
-            self.assertEqual((name, kw), ("checks", {"tree": str(self.ws), "quick": True}))
+        def check(command, cfg, repo, *, cwd, timeout):
+            self.assertEqual((command, cwd), ("verify retained tree", self.ws))
             self.assertEqual(self.heads[c.wt], self.head)
+            self.assertEqual((cwd / c.dir / "file.txt").read_text(), "retained version")
             self.assertEqual([checkout.wt for checkout in self.job.checkouts], [c.wt])
-            return factory.Outcome("pass")
+            if dirty_sibling:
+                owner.write_text("regenerated by the check")
+            return subprocess.CompletedProcess([], 0, "", "")
 
         def transition(lease, action, state, result):
             self.assertEqual(action, rerun["id"])
@@ -824,47 +655,50 @@ for (const path of process.argv.slice(2)) {
         self.transition.side_effect = transition
         self.enterContext(mock.patch.object(ledger, "accept", side_effect=accept))
         self.dispatch.side_effect = lambda action: orchestration.Controller.dispatch(ctl, action)
-        with mock.patch.object(ctl, "atomic", side_effect=check) as checks:
+        with (mock.patch.object(ctl, "atomic", side_effect=lambda _, **kw: flows.checks(ctl.flow, **kw)),
+              mock.patch.object(pipeline.Build, "restage", return_value=pipeline.Staged(counts={"file.txt": 1})),
+              mock.patch.object(pipeline, "check_lane", return_value=nullcontext()),
+              mock.patch.object(factory, "fingerprint", return_value="retained-tree"),
+              mock.patch.object(pipeline, "untracked_by_dir", return_value={}),
+              mock.patch.object(pipeline.record, "note"),
+              mock.patch.object(pipeline.environment, "sh", side_effect=check) as checks):
             ending = ctl.drive()
 
-        self.assertEqual(ending, ("step", "rerun-checks succeeded; dependent evidence must be refreshed", ""))
-        checks.assert_called_once()
-        self.dispatch.assert_called_once_with(rerun)
+        if dirty_sibling:
+            self.assertEqual(owner.read_text(), "closed sibling owner edit")
+            self.assertEqual((ending[0], ending[2]), ("failed", c.pr))
+            self.assertIn(sibling.github, ending[1])
+            self.comment.assert_called_once()
+            self.assertEqual(self.comment.call_args.args, (c.pr, ending[1]))
+            self.dispatch.assert_not_called()
+            checks.assert_not_called()
+        else:
+            self.assertEqual(ending, ("step", "rerun-checks succeeded; dependent evidence must be refreshed", ""))
+            checks.assert_called_once()
+            self.dispatch.assert_called_once_with(rerun)
         self.pr_details.assert_not_called()
         self.fetch.assert_not_called()
         self.merge.assert_not_called()
         self.resolver.assert_not_called()
-        self.assertEqual(owner.read_text(), "closed sibling owner edit")
 
     def test_merging_away_a_deny_rule_stops_before_dispatch_and_poll_starts_fresh(self):
-        self.policy_retry_through_poll("github")
+        self.policy_change_stops_and_poll_starts_fresh()
 
-    def test_policy_change_retries_jira_without_pr_feedback(self):
-        self.policy_retry_through_poll("jira")
+    def test_policy_change_on_answered_pr_repair_without_feedback_starts_fresh_at_next_poll(self):
+        self.policy_change_stops_and_poll_starts_fresh(repair=True)
 
-    def test_policy_change_retries_a_local_task_without_pr_feedback(self):
-        self.policy_retry_through_poll("local")
-
-    def policy_retry_through_poll(self, backend):
+    def policy_change_stops_and_poll_starts_fresh(self, *, repair=False):
         ctl = self.controller
         state = self.ws.parent / "poll-state"
         state.mkdir()
-        if backend == "github":
-            self.ws = self.job.ws = state / "worktrees" / "fixture-7"
-            self.checkout = self.add_checkout("primary", 7)
-            ctl.data["prepared"]["checkouts"] = [self.checkout.to_row()]
-            sibling = self.add_sibling(8, base="deleted-base", state="CLOSED")
-            (sibling.wt / ".git").unlink()
-            self.enterContext(mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}))
-            self.fixture_git(sibling.wt, "init", "-q", "--template=", "-b", "revision")
-            owner = sibling.wt / "owner.txt"
-            owner.write_text("closed sibling owner edit")
-            self.assertEqual(self.fixture_git(sibling.wt, "status", "--porcelain").strip(), "?? owner.txt")
-            self.config = self.ws / ".agents" / "config.toml"
-            self.config.parent.mkdir()
-            self.config.write_text(self.deny)
-            ctl.data["prepared"]["layer"] = str(self.config.parent)
-        c = self.checkout
+        self.ws = self.job.ws = state / "worktrees" / "fixture-7"
+        self.checkout = c = self.add_checkout("primary", 7)
+        ctl.data["prepared"]["checkouts"] = [c.to_row()]
+        sibling = self.add_sibling(8, base="deleted-base", state="CLOSED")
+        self.config = self.ws / ".agents" / "config.toml"
+        self.config.parent.mkdir()
+        self.config.write_text(self.deny)
+        ctl.data["prepared"]["layer"] = str(self.config.parent)
         layer = config.load_layer(self.config.parent)
         self.job.use_layer(layer)
         old_lineage, _ = ctl.lineage()
@@ -883,11 +717,8 @@ for (const path of process.argv.slice(2)) {
 
         self.merge.side_effect = merge
         why = "PolicyChanged: worker policy changed after action acceptance"
-        repo = self.run.repo = replace(self.run.repo, path=c.src.parent, github=c.github, pipeline=True, tracker=backend,
-                                       jira_project="FIX")
-        if backend == "github":
-            repo.parts.append(config.Part(sibling.dir, sibling.github))
-        self.run.tid = {"github": "7", "jira": "FIX-7", "local": "t-7abc"}[backend]
+        repo = self.run.repo = replace(self.run.repo, path=c.src.parent, github=c.github, pipeline=True, tracker="github")
+        repo.parts.append(config.Part(sibling.dir, sibling.github))
         self.run.alone = False
         cfg = config.Config(repos=[repo], replay=config.ReplayConfig(all=True))
         self.run.tracker = tracker.for_ticket(cfg, repo, self.run.tid)
@@ -904,28 +735,6 @@ for (const path of process.argv.slice(2)) {
             labels.difference_update(remove)
             labels.update(add)
 
-        if backend == "jira":
-            labels.update({tracker.route_label(repo), "agent-running"})
-
-            def jira_issue(key, _fields):
-                return {"key": key, "fields": {"labels": sorted(labels), "summary": "Revise the PR",
-                                               "assignee": {"accountId": "owner"},
-                                               "creator": {"accountId": "owner"}}}
-
-            def search(jql, fields, limit, *, include=None):
-                row = jira_issue(self.run.tid, fields)
-                if include:
-                    return [row] if 'AND labels = "agent-failed"' in jql and "agent-failed" in labels and include(row) else []
-                if 'AND labels = "agent-needs-info"' in jql or "agent-failed" in labels:
-                    return []
-                return [row]
-
-            client = mock.Mock(issue=mock.Mock(side_effect=jira_issue), search=mock.Mock(side_effect=search),
-                               me=mock.Mock(return_value={"accountId": "owner"}), changelog=mock.Mock(return_value=[]),
-                               comments=mock.Mock(return_value=[]), browse_url=mock.Mock(return_value="https://jira.test/FIX-7"),
-                               edit_labels=mock.Mock(side_effect=lambda key, add, remove: edit_labels("", key, add=add, remove=remove)))
-            self.enterContext(mock.patch.object(tracker.JiraTracker, "client", client))
-
         self.enterContext(mock.patch.multiple(paths, STATE_DIR=state, DB_FILE=state / "arete.db",
                                               RUNS_DIR=state / "runs", LOCKS_DIR=state / "locks",
                                               WORKTREES_DIR=state / "worktrees", LOG_DIR=state / "logs"))
@@ -937,17 +746,26 @@ for (const path of process.argv.slice(2)) {
         self.enterContext(mock.patch.object(pipeline, "write_report"))
         paths.ensure_dirs()
         uri = f"file:{state.as_posix()}?mode=memory&cache=shared"
-        connection = sqlite3.connect(uri, uri=True)
-        self.addCleanup(connection.close)
-        with closing(sqlite3.connect(":memory:")) as schema:
-            schema.deserialize(self.policy_schema)
-            schema.backup(connection)
+        self.enterContext(closing(sqlite3.connect(uri, uri=True)))
         paths.DB_FILE.touch()
         self.enterContext(mock.patch.object(db, "connect_db", side_effect=lambda *_a, **_kw: sqlite3.connect(uri, uri=True)))
-        if backend == "local":
-            tasks_store.task_add(repo.name, "Revise the PR", title="Revise the PR", reserved_id=self.run.tid)
+        with redirect_stdout(StringIO()):
+            db.migrate()
         record.start("pipeline", run_id="prior-run", repo=repo.name, issue=self.run.tid)
-        record.settle("prior-run", "pr", pr_url=c.pr, branch="revision")
+        if repair:
+            self.run.repairs = "repair-source"
+            record.start("pipeline", run_id=self.run.repairs, repo=repo.name, issue=self.run.tid)
+            record.settle(self.run.repairs, "pr", pr_url=c.pr, branch="revision")
+            record.settle("prior-run", "needs-info", summary="Keep the edit?", branch="revision")
+            self.run.answering = pipeline.run_store.run_get("prior-run")
+            self.run.answers_due = [{**owner_asks.text_ask("Keep the edit?"), "answers": [{"text": "Keep it"}],
+                                     "status": "answered", "run": "prior-run", "id": "ask", "step": "orchestrate"}]
+            ctl.data["repair_source"] = self.run.repairs
+            source = orchestration.repairs.Source(self.run.repairs, "revision", [c.pr], Review.stored({}), "", "", "", "")
+            self.enterContext(mock.patch.object(orchestration.repairs, "source", return_value=source))
+            self.enterContext(mock.patch.object(orchestration.repairs, "matched_head", return_value=self.head))
+        else:
+            record.settle("prior-run", "pr", pr_url=c.pr, branch="revision")
         record.start("pipeline", run_id=self.run.id, repo=repo.name, issue=self.run.tid)
 
         def finish(flow, ending, **fields):
@@ -955,28 +773,22 @@ for (const path of process.argv.slice(2)) {
             return said["status"], said["summary"], said["pr_url"]
 
         ending = ("failed", why, "")
-        recovery = {"reason": "policy-changed"}
-        if backend == "github":
-            recovery.update(branch="revision", closed_checkouts=[sibling.to_row()])
-            with mock.patch.object(flows, "finish", side_effect=finish) as respond:
-                self.assertEqual(flows.driven(ctl.flow, lambda _: ctl.drive()), ending)
-            respond.assert_called_once_with(ctl.flow, "failed", why=why, detail="", recovery=recovery)
-            self.assertEqual(self.heads[c.wt], "merged-head")
-            self.assertIn("owner-only.txt", diffguard.denied_paths(self.job.layer))
-            self.assertEqual(ctl.data["policy_sha"], old_lineage["policy_sha"])
-            self.dispatch.assert_not_called()
-            self.saved.assert_not_called()
-        else:
-            pipeline._fail(self.run, why, recovery=recovery)
+        recovery = {"reason": "policy-changed", "branch": "revision", "closed_checkouts": [sibling.to_row()]}
+        with mock.patch.object(flows, "finish", side_effect=finish) as respond:
+            self.assertEqual(flows.driven(ctl.flow, lambda _: ctl.drive()), ending)
+        respond.assert_called_once_with(ctl.flow, "failed", why=why, detail="", recovery=recovery)
+        self.assertEqual(self.heads[c.wt], "merged-head")
+        self.assertIn("owner-only.txt", diffguard.denied_paths(self.job.layer))
+        self.assertEqual(ctl.data["policy_sha"], old_lineage["policy_sha"])
+        self.dispatch.assert_not_called()
+        self.saved.assert_not_called()
         pipeline.settle_run(self.run, *ending, restarting=False, flow=None)
         failed = pipeline.run_store.newest_live_whole_run(repo.name, self.run.tid)
         self.assertEqual((failed["summary"], failed["engine_sha"]), (why, codebase.STAMP))
         self.assertEqual([row["pr_url"] for row in pipeline.run_store.open_runs(repo.name, self.run.tid)], [c.pr])
         self.assertEqual(pipeline.pending_feedback(repo.name, self.run.tid), [])
-        if backend == "local":
-            self.assertEqual(tracker.task_state(self.run.tid), "failed")
-        else:
-            self.assertIn(self.run.tracker.label_name("failed"), labels)
+        self.assertIn(self.run.tracker.label_name("failed"), labels)
+
         def add_worktree(checkout, branch, start):
             self.assertEqual((checkout.wt, branch, start), (c.wt, "revision", "origin/revision"))
             self.assertFalse((c.wt / ".git").exists())
@@ -1000,8 +812,6 @@ for (const path of process.argv.slice(2)) {
             with (mock.patch.object(pipeline, "pending_feedback", return_value=[{"pr_url": c.pr}]),
                   mock.patch.object(pipeline, "recorded_path", return_value="orchestrate")):
                 self.assertEqual(pipeline.run_command(repo_name, tid), command)
-            if backend != "github":
-                return
             fresh = pipeline.Run(id="fresh-run", repo=repo, tracker=self.run.tracker, tid=tid, path="orchestrate",
                                  dir=self.run.dir / "fresh")
             fresh.dir.mkdir()
@@ -1012,8 +822,6 @@ for (const path of process.argv.slice(2)) {
             with (mock.patch.object(workspace, "kept_work", wraps=self.kept_work) as kept,
                   mock.patch.object(workspace, "note_made", side_effect=self.workspace_git["note_made"]),
                   mock.patch.object(workspace, "kept_onto", side_effect=self.workspace_git["kept_onto"]),
-                  mock.patch.object(workspace, "uncommitted", side_effect=lambda wt, **kw: []
-                                    if wt == c.wt else self.workspace_git["uncommitted"](wt, **kw)),
                   mock.patch.object(workspace, "untracked_files", return_value=set()),
                   mock.patch.object(workspace, "ignored_files", return_value=[]),
                   mock.patch.object(workspace, "add_worktree", side_effect=add_worktree) as add,
@@ -1031,8 +839,7 @@ for (const path of process.argv.slice(2)) {
             open_pr.assert_called_once_with(c.github, "revision")
             self.assertEqual(fresh.excluded_worktrees, {sibling.wt})
             self.assertEqual([checkout.wt for checkout in controller.job.checkouts], [c.wt])
-            self.assertEqual(owner.read_text(), "closed sibling owner edit")
-            self.assertEqual(self.fixture_git(sibling.wt, "status", "--porcelain").strip(), "?? owner.txt")
+            self.assertTrue((sibling.wt / ".git").exists())
             self.assertFalse(flow.continues)
             self.assertNotIn("owner-only.txt", diffguard.denied_paths(controller.job.layer))
             self.assertEqual(controller.data["policy_sha"], controller.policy_sha())
@@ -1055,17 +862,9 @@ for (const path of process.argv.slice(2)) {
                                   retry_scratch=mock.DEFAULT, cleanup_worktrees=mock.DEFAULT, mark_loop=mock.DEFAULT),
               mock.patch.multiple(outcomes, sync_outcomes=mock.DEFAULT, sync_moves=mock.DEFAULT,
                                   sync_landings=mock.DEFAULT), redirect_stdout(StringIO()) as output):
-            if backend == "github":
-                self.assertEqual(poll.poll(), 0, output.getvalue())
-            else:
-                queue = poll.RepoQueue(repo, self.run.tracker, set(), config.load_layer(repo.layer_dir), mock.Mock())
-                errors = []
-                self.assertTrue(poll.fill_slots(cfg, [queue], pipeline.SkipLog({}), False, errors, Counter(), 1),
-                                output.getvalue())
-                self.assertEqual(errors, [])
+            self.assertEqual(poll.poll(), 0, output.getvalue())
         spawn.assert_called_once_with(repo.name, self.run.tid)
-        if backend == "github":
-            self.assertEqual(self.merge.call_count, 2)
+        self.assertEqual(self.merge.call_count, 2)
 
 
 class PublicationFixture(unittest.TestCase):

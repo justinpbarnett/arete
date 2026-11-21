@@ -345,9 +345,11 @@ def action_workspace_refusal(run_id: str) -> str:
     return "adaptive action reruns need retained worktrees; the saved workspace was removed"
 
 
-def base_moved(continues: str) -> str:
+def base_moved(continues: str, *, repos: set[str] | None = None) -> str:
     for c in prepared_data(continues).get("checkouts") or []:
         if not isinstance(c, dict) or not c.get("base_commit"):
+            continue
+        if repos is not None and c["github"] not in repos:
             continue
         try:
             now = workspace.remote_head(Path(c["src"]), c["base"])
@@ -534,9 +536,10 @@ class Job:
             return "the check in use was blocked; this change requires behavioral evidence"
         return pipeline.draft_reason(self.review, self.verified, self.reviews)
 
-    def merge_moved_base(self, name: str) -> None:
+    def merge_moved_base(self, name: str) -> list[workspace.Checkout]:
         moved, self.moved_base = self.moved_base, ""
         held = [c for c in self.checkouts if c.onto]
+        merged = []
         if moved and held:
             self.run.log(f"{moved} since run {self.continues} prepared, so arete merges the new base into the edits "
                          f"that run kept before {name} runs with the answers")
@@ -547,8 +550,9 @@ class Job:
                     self.built.workspace = self.workspace
                     for checkout in merged:
                         self.built.worker_trees.pop(checkout.github, None)
-                workspace.note_made(self.ws, self.checkouts)
+                workspace.note_made(self.ws, self.checkouts, excluded=self.run.excluded_worktrees)
         self.run.kept_note = pipeline.kept_edits_note(held) if self.run.answers_due else ""
+        return merged
 
     @property
     def workspace_checkouts(self) -> list[workspace.Checkout]:
@@ -916,9 +920,11 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
     if job.policy_retry.get("branch") == branch:
         parts = {(p.dir, p.github, job.ws / p.dir) for p in repo.parts}
         closed = [workspace.Checkout.from_row(row) for row in job.policy_retry.get("closed_checkouts", ())]
-        job.closed_checkouts = [c for c in closed if (c.dir, c.github, c.wt) in parts]
-        job.closed_prs = {c.pr for c in job.closed_checkouts}
-        run.excluded_worktrees = {c.wt for c in job.closed_checkouts}
+        closed = [c for c in closed if (c.dir, c.github, c.wt) in parts]
+        if not any((c.wt / ".git").exists() and workspace.uncommitted(c.wt) for c in closed):
+            job.closed_checkouts = closed
+            job.closed_prs = {c.pr for c in closed}
+            run.excluded_worktrees = {c.wt for c in closed}
     if not run.dry_run:
         tk.prepare()
     if not run.alone:
@@ -1431,8 +1437,6 @@ def pr(flow: factory.Flow, tree: str) -> Outcome:
             return end_as("fail", "failed",
                           why=f"pushed {job.branch}, but {draft_why}, and this repo has no GitHub name for a draft PR")
         return publication_outcome(job, staged, outcome, committed)
-    if job.check_publication_targets:
-        job.check_publication_targets()
     return open_or_refresh_prs(job, found, staged, size, outcome, subject, draft_why, committed, before_push)
 
 

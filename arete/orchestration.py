@@ -4,7 +4,6 @@ import json
 import time
 from contextlib import contextmanager
 from dataclasses import asdict
-from functools import partial
 from math import inf
 from pathlib import Path
 from typing import TextIO
@@ -51,6 +50,12 @@ REFRESHABLE_LINEAGE = {"catalog_sha", "controller_prompt", "operations_sha"}
 
 class UnchangedPushedHead(ValueError):
     pass
+
+
+class RetargetedPR(ValueError):
+    def __init__(self, pr: str, previous: str, current: str):
+        self.pr = pr
+        super().__init__(f"The PR base changed from `{previous}` to `{current}`. A person needs to revise it.")
 
 
 def policy_fingerprint(cfg, layer, closed_context):
@@ -158,13 +163,12 @@ class Controller:
             self.run.cfg, self.run.layer, self.run.kind = self.job.cfg, self.job.layer, prepared["ticket"]["kind"]
             self.lineage()
             if restore_prs:
-                try:
-                    if closed := self.restore_pr_targets(prepared):
-                        return "noop", closed, ""
-                except gh.RetargetedPR as error:
-                    return self.hold_retargeted_pr(error)
+                if ending := self.restore_pr_targets(prepared):
+                    return ending
             else:
                 self.job.closed_prs = set(prepared.get("closed_prs", ()))
+                if self.run.action_only and (ending := self.hold_dirty_closed_checkout(prepared["checkouts"])):
+                    return ending
             active = [c for c in prepared["checkouts"] if c.get("pr") not in self.job.closed_prs]
             self.run.excluded_worktrees = {Path(c["wt"]) for c in prepared["checkouts"]
                                            if c.get("pr") in self.job.closed_prs}
@@ -277,67 +281,84 @@ class Controller:
         return None
 
     def restore_pr_targets(self, prepared):
-        targets = {c["pr"]: c["base"] for c in prepared["checkouts"] if c.get("pr")}
-        open_targets = {pr: base for pr, base in targets.items() if self.pr_target_open(pr, base)}
-        self.job.closed_prs = targets.keys() - open_targets.keys()
+        targets = {c["pr"]: c for c in prepared["checkouts"] if c.get("pr")}
+        try:
+            open_targets = {pr for pr, c in targets.items() if self.pr_target_open(pr, c["base"])}
+        except RetargetedPR as error:
+            return self.hold_revision(error.pr, str(error))
+        self.job.closed_prs = targets.keys() - open_targets
+        if ending := self.hold_dirty_closed_checkout(prepared["checkouts"]):
+            return ending
         unlisted = [pr for pr in self.run.feedback_prs if pr not in targets]
         self.run.feedback_closure(unlisted)
         self.run.closed_feedback_prs += tuple(pr for pr in self.run.feedback_prs if pr in self.job.closed_prs)
         closed = self.run.closed_feedback_prs
         if closed and not open_targets and len(closed) == len(self.run.feedback_prs):
-            return f"the PR closed before arete could revise it: {', '.join(closed)}"
+            return "noop", f"the PR closed before arete could revise it: {', '.join(closed)}", ""
         if targets and not open_targets and all(c.get("pr") in self.job.closed_prs for c in prepared["checkouts"]):
-            return "the saved PRs closed before arete could revise them"
+            return "noop", "the saved PRs closed before arete could revise them", ""
         if closed:
             if not (self.run.dry_run or self.run.alone):
                 insights_store.settle_feedback(self.run.id, "recorded", prs=closed)
             self.run.feedback = [f for f in self.run.feedback if f["pr_url"] not in closed]
 
-        def check_targets():
-            for checkout in self.job.with_prs:
-                if not self.pr_target_open(checkout.pr, checkout.base):
-                    raise workspace.RunFailed(f"{checkout.pr} closed before publication")
+        if open_targets:
+            self.job.check_publication_targets = self.check_push_targets
 
-        self.job.check_publication_targets = check_targets
-        return ""
+    def hold_dirty_closed_checkout(self, checkouts):
+        closed = self.job.closed_prs
+        for c in checkouts:
+            if c.get("pr") not in closed:
+                continue
+            wt = Path(c["wt"])
+            if (wt / ".git").exists() and workspace.uncommitted(wt):
+                revision_pr = next((row["pr"] for row in checkouts if row.get("pr") and row["pr"] not in closed),
+                                   c["pr"])
+                return self.hold_revision(revision_pr, f"The closed PR checkout `{c['github']}` at `{wt}` has "
+                                                       "uncommitted edits. Arete left them in place.")
 
-    def pr_target_open(self, pr, base, details=None):
-        if details is None:
-            details = gh.pr_merge_details(pr)
+    def check_push_targets(self):
+        for checkout in self.job.with_prs:
+            if not self.pr_target_open(checkout.pr, checkout.base):
+                raise workspace.RunFailed(f"{checkout.pr} closed before publication")
+
+    def pr_target_open(self, pr, base):
+        details = gh.pr_merge_details(pr)
         if details.get("state") in ("CLOSED", "MERGED"):
             return False
         if details.get("state") != "OPEN" or not (current := details.get("baseRefName")):
             raise workspace.RunFailed(f"GitHub did not identify the open PR and its target branch for {pr}")
         if base != current:
-            raise gh.RetargetedPR(pr, base, current)
+            raise RetargetedPR(pr, base, current)
         return True
 
-    def hold_retargeted_pr(self, error):
-        reason = str(error)
-        self.run.log(f"{error.pr}: {reason}")
+    def hold_revision(self, pr, reason):
+        self.run.log(f"{pr}: {reason}")
         if not self.run.dry_run:
-            key = ledger.digest(["retargeted", error.pr, error.previous, error.current])
-            gh.pr_comment(error.pr, pipeline.public_text(self.run, reason), key=key)
+            key = ledger.digest([self.run.id, pr, reason])
+            gh.pr_comment(pr, pipeline.public_text(self.run, reason), key=key)
             if not self.run.alone:
                 self.run.enter("pr")
                 if self.run.feedback:
                     insights_store.settle_feedback(self.run.id, "failed")
-        return "failed", reason, error.pr
+        return "failed", reason, pr
 
     def merge_restored_bases(self):
         job = self.job
         prs = job.with_prs
+        if not prs:
+            if self.run.answers_due:
+                kept = {c.github for c in job.checkouts if c.onto}
+                job.moved_base = flows.base_moved(self.flow.continues, repos=kept) if kept else ""
+                if job.merge_moved_base("orchestrate"):
+                    self.check_merged_policy()
+            return
         for checkout in prs:
             checkout.resumes = True
             workspace.fetch(checkout.src, checkout.base)
         merged = pipeline.merge_moved_bases(self.run, prs, job.layer, job.ticket, allow_untracked=True)
         if merged:
-            layer = pipeline.resolve_layer(job.cfg, self.run, job.ws)
-            if delegation.settings_sha(layer) != delegation.settings_sha(job.layer):
-                recovery = {"reason": "policy-changed"}
-                if job.closed_checkouts:
-                    recovery.update(branch=job.branch, closed_checkouts=[c.to_row() for c in job.closed_checkouts])
-                raise workspace.RunFailed(pipeline.worker_policy_changed(), recovery=recovery)
+            self.check_merged_policy()
             for checkout in merged:
                 job.b.worker_trees.pop(checkout.github, None)
             workspace.note_made(job.ws, job.checkouts, excluded=self.run.excluded_worktrees)
@@ -345,6 +366,15 @@ class Controller:
             self.run.kept_note = pipeline.kept_edits_note([c for c in job.checkouts if c.onto])
             self.run.base_note = pipeline.base_merge_note([c for c in merged if c.onto])
         job.b.workspace = job.workspace
+
+    def check_merged_policy(self):
+        job = self.job
+        layer = pipeline.resolve_layer(job.cfg, self.run, job.ws)
+        if delegation.settings_sha(layer) != delegation.settings_sha(job.layer):
+            recovery = {"reason": "policy-changed"}
+            if job.closed_checkouts:
+                recovery.update(branch=job.branch, closed_checkouts=[c.to_row() for c in job.closed_checkouts])
+            raise workspace.RunFailed(pipeline.worker_policy_changed(), recovery=recovery)
 
     def lineage(self):
         self.catalog = Catalog(self.job)
@@ -751,8 +781,6 @@ class Controller:
             return self.reconcile_catch_up(pending)
         if self.data.get("publication_intent"):
             raise factory.Refused("publication was interrupted; reconcile its branch/PR effects before resuming")
-        if self.job.check_publication_targets:
-            self.job.check_publication_targets()
         needed = [gate for gate in ("checks", "review", "verify") if not self.current(gate)]
         if needed:
             raise ValueError("publication needs current evidence: " + ", ".join(needed))
@@ -775,7 +803,7 @@ class Controller:
             grant = zte.prepare_candidate(self.run, self.job, self.data)
             self.ending = ("pr", "Prepared an exact README candidate for engine-owned delivery", "")
             return {"prepared_head": grant.data["head"], "tree": grant.data["tree"]}
-        self.check_publication()
+        self.check_pilot_publication()
         if catch_up:
             checkout, = self.job.checkouts
             self.take_merge_lease(checkout)
@@ -799,7 +827,7 @@ class Controller:
 
     def retry_publication_ci(self, retry, tree):
         job = self.job
-        self.check_publication()
+        self.check_pilot_publication()
         flows.require_environment_owner_clear(job)
         flows.refuse_changed_prs(job)
         checkouts = {c.github: c for c in job.with_prs}
@@ -820,8 +848,6 @@ class Controller:
             self.take_merge_lease(checkout)
         for checkout in pushed:
             row = gh.pr_merge_details(checkout.pr)
-            if job.check_publication_targets:
-                self.pr_target_open(checkout.pr, checkout.base, row)
             if (row.get("state") != "OPEN" or row.get("headRefOid") != checkout.lease
                     or row.get("baseRefName") != checkout.base):
                 raise ValueError("the PR no longer matches this run's published head and base")
@@ -842,8 +868,6 @@ class Controller:
         self.persist()
         for repo, requested in launches.items():
             for rerun in requested:
-                if job.check_publication_targets:
-                    job.check_publication_targets()
                 gh.rerun_failed_jobs(repo, rerun.run)
         failure = self.publication_ci(pushed, caught_up=retry["caught_up"], reruns=reruns)
         if failure:
@@ -871,7 +895,7 @@ class Controller:
         tree = self.fingerprint()
         current = pipeline.watch_publication_ci(self.run, self.job.slot, pushed, reruns=reruns)
         self.job.ci_result = current.summary()
-        self.check_publication()
+        self.check_pilot_publication()
         section = pipeline.ci.section([current], current.n)
         if caught_up:
             for checkout in pushed:
@@ -902,7 +926,7 @@ class Controller:
         check_head = caught_up or self.data.get("catch_up_hold")
         watched_heads = {w.target.pr: w.target.sha for w in current.seen}
         for checkout in self.job.with_prs:
-            self.check_publication()
+            self.check_pilot_publication()
             if check_head and (watched_heads.get(checkout.pr) != checkout.lease
                                or pipeline.own_draft_state(self.run, checkout) is None):
                 continue
@@ -930,14 +954,9 @@ class Controller:
         for checkout in candidates:
             if len(job.checkouts) == 1:
                 self.take_merge_lease(checkout)
-            target_check = {}
-            if job.check_publication_targets:
-                target_check["check_target"] = partial(self.pr_target_open, checkout.pr, checkout.base)
             while True:
-                if job.check_publication_targets:
-                    job.check_publication_targets()
                 hold = pipeline.try_automerge(job.b, checkout, job.verified, job.review, about,
-                                              track_moved_base=track_base, **target_check)
+                                              track_moved_base=track_base)
                 if hold is None:
                     self.clear_catch_up_hold()
                     return None
@@ -973,8 +992,7 @@ class Controller:
                 raise
 
         try:
-            check_target = partial(self.pr_target_open, checkout.pr, checkout.base) if job.check_publication_targets else None
-            base_sha, hold = pipeline.catch_up_target(b, checkout, job.slot, check_target=check_target)
+            base_sha, hold = pipeline.catch_up_target(b, checkout, job.slot)
             if hold:
                 return self.catch_up_failure(hold)
             b.catch_ups += 1
@@ -1100,7 +1118,7 @@ class Controller:
         pipeline.publish_gate_evidence(self.run, job.ticket, checkout, job.verified, job.review)
 
     def finish_publication(self):
-        self.check_publication()
+        self.check_pilot_publication()
         self.data["publication_intent"] = {"tree": self.fingerprint(), "phase": "publish"}
         self.persist()
         outcome = self.atomic("publish", merge=self.automerge)
@@ -1117,11 +1135,6 @@ class Controller:
         self.ending = flows.ended(self.flow, outcome)
         self.release_merge_lease()
         return outcome.data
-
-    def check_publication(self):
-        self.check_pilot_publication()
-        if self.job.check_publication_targets:
-            self.job.check_publication_targets()
 
     def check_pilot_publication(self):
         if pilot.is_pilot_task(str(self.run.tid)):
@@ -1318,9 +1331,9 @@ class Controller:
             self.persist()
             run_lines.write(self.run.id, "action", action=action["id"], op=action["op"], state="succeeded")
             raise
-        except gh.RetargetedPR as error:
+        except RetargetedPR as error:
             refusal = error
-            self.ending = self.hold_retargeted_pr(error)
+            self.ending = self.hold_revision(error.pr, str(error))
             self.data.pop("publication_intent", None)
             result = {"error": str(error)}
             ledger.transition(self.lease, action["id"], "failed", result)
@@ -1457,7 +1470,7 @@ def single_worker(flow):
                 "calls": batch}, turn, snapshot["version"], {a["id"]: a for a in ledger.actions(controller.lease)})
             actions = ledger.accept(controller.lease, turn, snapshot["version"], response, controller.policy.max_actions)
             for action in actions:
-                if isinstance(controller.dispatch(action), gh.RetargetedPR):
+                if isinstance(controller.dispatch(action), RetargetedPR):
                     return controller.ending
                 while controller.workers:
                     controller.collect()

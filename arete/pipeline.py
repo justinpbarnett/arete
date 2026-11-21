@@ -640,14 +640,15 @@ class Run(AgentRun):
 
     @property
     def failed_state(self) -> str:
-        return "pr" if self.feedback or self.repairs else "failed"
+        repair_waits_on_pr = self.repairs and (self.failure or {}).get("reason") != "policy-changed"
+        return "pr" if self.feedback or repair_waits_on_pr else "failed"
 
     @property
     def retry_hint(self) -> str:
         if self.feedback:
             return (f"Comment on the PR again to retry: a submitted review starts at once, a comment after "
                     f"{FEEDBACK_QUIET_MINUTES} quiet minutes")
-        if self.repairs:
+        if self.repairs and self.failed_state == "pr":
             return f"Continue it with `arete resume {self.id}`"
         return f"Remove `{self.tracker.label_name('failed')}` to retry"
 
@@ -1464,14 +1465,14 @@ def run_command(repo_name: str, tid: str | int, force: bool = False, dry_run: bo
     if mode == "classic":
         return control.command(["run", repo_name, str(tid), "--local", *flags])
     if mode in (ORCHESTRATED, "orchestrate"):
+        from . import requeue
         from .store import orchestration
 
         newest = run_store.newest_whole_run(repo_name, str(tid))
         source = newest if newest and newest["status"] == "interrupted" else (
             next(iter(run_store.open_runs(repo_name, str(tid))), None)
             if not force and pending_feedback(repo_name, str(tid)) else None)
-        if ((newest and not newest.get("dry_run") and newest["status"] == "failed"
-             and newest.get("summary") == worker_policy_changed())
+        if ((newest and not newest.get("dry_run") and requeue.policy_retry(newest))
                 or dry_run and run_store.held_environment_branch(repo_name, str(tid))):
             source = None
         previous = (orchestration.find(source["id"]) or {}).get("current_run", source["id"]) if source else ""
@@ -1586,12 +1587,14 @@ def park_run(run: Run, reason: str) -> tuple[str, str, str]:
 
 def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: bool, flow: factory.Flow | None,
                *, echo_end: bool = True) -> None:
+    failure = run.failure if run.failure is not None else {"class": "work"}
     if restarting and status in ("skipped", "noop") and not (run.feedback or run.closed_feedback_prs):
         run.enter("failed")
         run.say(f"I did not restart this after the interruption: {summary}. Remove "
                 f"`{run.tracker.label_name('failed')}` to retry.")
     if run.feedback and not (run.dry_run or run.alone or run.claim_feedback_on_revise):
-        if (status == "noop" and run.closed_feedback_prs) or (status == "failed" and summary == worker_policy_changed()):
+        if (status == "noop" and run.closed_feedback_prs) or (
+                status == "failed" and failure.get("reason") == "policy-changed"):
             insights_store.release_feedback(run.id, closed_prs=run.closed_feedback_prs)
         elif run.step_started or (flow and flow.work_started):
             insights_store.settle_feedback(run.id, {"pr": "done", "noop": "recorded"}.get(status, "failed"))
@@ -1606,7 +1609,6 @@ def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: boo
     end_line = f"done: {status} {pr_url or summary}"
     if echo_end:
         run.log(end_line)
-    failure = run.failure if run.failure is not None else {"class": "work"}
     classified = {"failure": json.dumps(failure)} if status == "failed" and failure and not run.dry_run else {}
     if status == "pr" and pr_url and not (run.environment_release or run.dry_run or run.alone or run.feedback or run.repairs):
         from . import environment_gaps
@@ -2613,14 +2615,10 @@ def automerge_allowed(b: Build, approval: dict | None, draft_why: str) -> bool:
 
 
 def try_automerge(b: Build, c: workspace.Checkout, verified: verify.Verified, review: Review, about: str, *,
-                  track_moved_base: bool = False,
-                  check_target: Callable[[dict], bool] | None = None) -> str | None:
+                  track_moved_base: bool = False) -> str | None:
     run = b.run
-    target_check = {"check_target": check_target} if check_target else {}
     try:
-        return merge_hold(b, c, verified, review, about, track_moved_base=track_moved_base, **target_check)
-    except gh.RetargetedPR:
-        raise
+        return merge_hold(b, c, verified, review, about, track_moved_base=track_moved_base)
     except gh.GhUnsure:
         run.facts["merge_held"] = "GitHub did not confirm whether it merged the PR"
         run.log(f"automerge: {run.facts['merge_held']} at {c.lease}; check {c.pr} before retrying")
@@ -2642,17 +2640,13 @@ def report_automerge(run: Run, c: workspace.Checkout, hold: str) -> None:
         run.log(f"automerge could not report the hold on {c.pr}: {e}")
 
 
-def catch_up_target(b: Build, c: workspace.Checkout, slot: slots.RunSlot, *,
-                    check_target: Callable[[dict], bool] | None = None) -> tuple[str, str]:
+def catch_up_target(b: Build, c: workspace.Checkout, slot: slots.RunSlot) -> tuple[str, str]:
     if b.catch_ups < AUTOMERGE_CATCH_UPS:
         slot.take(b.run.log, b.run.waiting, "automerge")
     row = gh.pr_merge_details(c.pr)
-    if check_target:
-        check_target(row)
     if hold := gh.merge_ref_hold(row, c.lease, c.base):
         return "", hold
-    target_check = {"check_target": check_target} if check_target else {}
-    base_sha = fetch_merge_base(c, **target_check) or row.get("baseRefOid")
+    base_sha = fetch_merge_base(c) or row.get("baseRefOid")
     if not base_sha:
         return "", "GitHub did not report the current base commit"
     if b.catch_ups >= AUTOMERGE_CATCH_UPS:
@@ -2694,10 +2688,7 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
             raise CatchUpGateHold(gate, why, head, b.report, verified, review)
         if git(["rev-parse", "HEAD"], c.wt).strip() != head or workspace.uncommitted(c.wt):
             raise workspace.RunFailed("the worktree changed while checking the merge")
-        refs = gh.pr_merge_details(c.pr)
-        if check_targets:
-            check_targets()
-        if hold := gh.merge_ref_hold(refs, c.lease, c.base):
+        if hold := gh.merge_ref_hold(gh.pr_merge_details(c.pr), c.lease, c.base):
             raise workspace.RunFailed(hold)
         if before_push is not None:
             before_push(head, verified, review)
@@ -2722,7 +2713,8 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
         raise
     finally:
         run.owner_questions_blocked = blocked
-    push_caught_up_head(b, c, branch, head, check_targets=check_targets)
+    target_check = {"check_targets": check_targets} if check_targets else {}
+    push_caught_up_head(b, c, branch, head, **target_check)
     return verified, review
 
 
@@ -2745,8 +2737,6 @@ def push_caught_up_head(b: Build, c: workspace.Checkout, branch: str, head: str,
             c.onto = ""
             return
         if remote and (hold := gh.merge_ref_hold(row, c.lease, c.base)):
-            if check_targets and row.get("baseRefName") != c.base:
-                check_targets()
             raise CatchUpPushUnconfirmed(f"{why}: {hold}", f"{detail} GitHub reports `{remote}`.", retryable=False)
         if attempt == 3:
             break
@@ -2784,7 +2774,7 @@ def merge_evidence_problem(b: Build, c: workspace.Checkout, verified: verify.Ver
 
 
 def merge_hold(b: Build, c: workspace.Checkout, verified: verify.Verified, review: Review, about: str, *,
-               track_moved_base: bool = False, check_target: Callable[[dict], bool] | None = None) -> str:
+               track_moved_base: bool = False) -> str:
     if len(b.checkouts) != 1:
         return "a change spanning repositories cannot be merged atomically"
     head = c.lease
@@ -2792,28 +2782,23 @@ def merge_hold(b: Build, c: workspace.Checkout, verified: verify.Verified, revie
         return hold
     if not jev.ready(b.cfg, [b.run.repo]):
         return "JEV risk screening is unavailable"
-    target_check = {"check_target": check_target} if check_target else {}
-    base_sha = fetch_merge_base(c, **target_check)
+    base_sha = fetch_merge_base(c)
     if not has_merge_base(c, head, base_sha):
         hold = "the checked head does not contain the target base"
         return gh.MovedBaseHold(hold) if track_moved_base else hold
     number = gh.pr_number(c.pr)
     _, hold = gh.merge_readiness(c.github, number, head, c.base, base_sha, wait=gh.MERGE_WAIT_SECONDS,
-                                 track_moved_base=track_moved_base, **target_check)
+                                 track_moved_base=track_moved_base)
     if not hold:
-        hold = screen_and_merge(b, c, number, head, base_sha, about, track_moved_base=track_moved_base, **target_check)
-    if isinstance(hold, gh.BaseTipChanged) and not has_merge_base(c, head, fetch_merge_base(c, **target_check)):
+        hold = screen_and_merge(b, c, number, head, base_sha, about, track_moved_base=track_moved_base)
+    if isinstance(hold, gh.BaseTipChanged) and not has_merge_base(c, head, fetch_merge_base(c)):
         return gh.MovedBaseHold("the checked head does not contain the target base")
     return hold
 
 
-def fetch_merge_base(c: workspace.Checkout, *, check_target: Callable[[dict], bool] | None = None) -> str:
-    try:
-        workspace.fetch(c.src, c.base)
-        return git(["rev-parse", c.origin_base], c.wt).strip()
-    finally:
-        if check_target:
-            check_target(gh.pr_merge_details(c.pr))
+def fetch_merge_base(c: workspace.Checkout) -> str:
+    workspace.fetch(c.src, c.base)
+    return git(["rev-parse", c.origin_base], c.wt).strip()
 
 
 def has_merge_base(c: workspace.Checkout, head: str, base_sha: str) -> bool:
@@ -2821,7 +2806,7 @@ def has_merge_base(c: workspace.Checkout, head: str, base_sha: str) -> bool:
 
 
 def screen_and_merge(b: Build, c: workspace.Checkout, number: int, head: str, base_sha: str, about: str, *,
-                     track_moved_base: bool, check_target: Callable[[dict], bool] | None = None) -> str:
+                     track_moved_base: bool) -> str:
     patch = checkout_patch(c, [], f"{base_sha}..{head}")
     if not patch:
         return "there is no diff to risk screen"
@@ -2831,8 +2816,7 @@ def screen_and_merge(b: Build, c: workspace.Checkout, number: int, head: str, ba
         return "JEV could not judge the diff"
     if risk.hold:
         return risk.hold
-    target_check = {"check_target": check_target} if check_target else {}
-    return gh.pr_merge_auto(c.github, number, head, c.base, base_sha, track_moved_base=track_moved_base, **target_check)
+    return gh.pr_merge_auto(c.github, number, head, c.base, base_sha, track_moved_base=track_moved_base)
 
 
 def nothing_to_build(run: Run, t: tracker.Ticket, ws: Path, checkouts: list[workspace.Checkout], branch: str, summary: str,

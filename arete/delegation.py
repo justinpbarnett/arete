@@ -140,8 +140,8 @@ def reports_progress(event: dict) -> bool:
 
 
 class PolicyChanged(ValueError):
-    def __init__(self):
-        super().__init__("worker policy changed after action acceptance")
+    def __init__(self, message: str = "worker policy changed after action acceptance"):
+        super().__init__(message)
 
 
 def at_default(f, value) -> bool:
@@ -161,12 +161,33 @@ def explicit(value):
     return value
 
 
+def settings_digest(data) -> str:
+    return digest(json.loads(json.dumps(data, default=str)))
+
+
+def worker_settings_digest(value, serialize) -> str:
+    data = serialize(value)
+    if isinstance(value, config.Config):
+        for name in ("max_parallel", "max_parallel_per_repo"):
+            data.pop(name, None)
+        if "jev" in data:
+            for name in ("risk_hold", "irreversible_hold", "secrets_hold"):
+                data["jev"].pop(name, None)
+            if not data["jev"]:
+                del data["jev"]
+    return settings_digest(data)
+
+
 def settings_sha(value) -> str:
-    return digest(json.loads(json.dumps(explicit(value), default=str)))
+    return worker_settings_digest(value, explicit)
 
 
 def settings_shas(value) -> set[str]:
-    return {settings_sha(value), digest(json.loads(json.dumps(asdict(value), default=str)))}
+    return {settings_sha(value), worker_settings_digest(value, asdict)}
+
+
+def legacy_settings_shas(cfg: config.Config) -> set[str]:
+    return {settings_digest(explicit(cfg)), settings_digest(asdict(cfg))}
 
 
 def request(job, action: str, prompt: str, setting, tools: tuple, rules: list[str], session=NO_SESSION) -> dict:
@@ -178,8 +199,15 @@ def request(job, action: str, prompt: str, setting, tools: tuple, rules: list[st
                           "session": "resume" if session.id else "fresh"},
             "rules": rules, "kind": job.run.kind, "session": asdict(session),
             "closed_context": job.run.closed_context,
-            "excluded_worktrees": [str(wt) for wt in sorted(job.run.excluded_worktrees)],
+            "excluded_worktrees": [str(wt) for wt in sorted(getattr(job.run, "excluded_worktrees", ()))],
             "config_sha": settings_sha(job.cfg), "layer_sha": settings_sha(job.layer)}
+
+
+def check_policy(launch: dict, cfg: config.Config, layer: config.RepoLayer) -> None:
+    config_sha = launch["config_sha"]
+    if ((config_sha not in settings_shas(cfg) and config_sha not in legacy_settings_shas(cfg))
+            or launch["layer_sha"] not in settings_shas(layer)):
+        raise PolicyChanged()
 
 
 def main() -> None:
@@ -213,12 +241,11 @@ def main() -> None:
         cfg = config.load()
         repo = cfg.repo(launch["repo"])
         layer = config.load_layer(Path(launch["layer_dir"]))
-        if launch["config_sha"] not in settings_shas(cfg) or launch["layer_sha"] not in settings_shas(layer):
-            raise PolicyChanged()
+        check_policy(launch, cfg, layer)
         run = pipeline.AgentRun(launch["run"], repo, paths.RUNS_DIR / launch["run"], cfg=cfg, layer=layer,
                                 kind=launch["kind"], step_overrides={launch["role"]: launch["overrides"]},
                                 closed_context=tuple(launch["closed_context"]),
-                                excluded_worktrees={Path(wt) for wt in launch["excluded_worktrees"]})
+                                excluded_worktrees={Path(wt) for wt in launch.get("excluded_worktrees", ())})
         kept = Session(**launch["session"])
         if kept.id:
             run.sessions[config.INHERITS.get(launch["role"], launch["role"])] = kept
