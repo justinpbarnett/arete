@@ -64,6 +64,7 @@ from tests.harness import set_task_body
 
 
 class ParallelTimeoutTests(unittest.TestCase):
+    summary_start = "=== Test class timeout summary ==="
     guidance = (
         "Move the tests this change adds into their own TestCase class, or split the class, "
         "so each class finishes alone well within its deadline. Raise class_timeout only for a class "
@@ -112,99 +113,113 @@ class ParallelTimeoutTests(unittest.TestCase):
                 "    def test_3_hang(self): time.sleep(30)\n"
             )
             result = subprocess.run(
-                [sys.executable, "-m", "tests.parallel", "--start", directory, "--timeout", "0.4"],
+                [sys.executable, "-m", "tests.parallel", "--start", directory, "--timeout", "0.5"],
                 cwd=Path(__file__).resolve().parents[1], env={**os.environ, "TMPDIR": directory},
                 capture_output=True, text=True, timeout=5,
             )
 
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        reports = ci.TEST_TIMEOUT.findall(result.stdout)
+        baseline, summaries = ci.split_timeout_summaries(result.stdout)
+        reports = ci.TEST_TIMEOUT.findall(baseline)
         self.assertEqual(len(reports), 2, result.stdout)
-        for deadline, report in zip(("0.4s", "0.8s"), reports, strict=True):
+        for deadline, report in zip(("0.5s", "1s"), reports, strict=True):
             with self.subTest(deadline=deadline):
                 lines = report.splitlines()
-                self.assertEqual(lines[1:5], [
-                    "test_scratch_timeout.ScratchTimeout (3 tests)",
-                    f"class exceeded {deadline}",
-                    "2 completed, 0 never started",
-                    "Slowest completed tests:",
-                ])
-                self.assertRegex(lines[5], r"^  \d+\.\d{3}s test_scratch_timeout\.ScratchTimeout\.test_2_slower$")
-                self.assertRegex(lines[6], r"^  \d+\.\d{3}s test_scratch_timeout\.ScratchTimeout\.test_1_fast$")
-                self.assertRegex(lines[7], r"^Python class stack \(PID \d+\)$")
+                self.assertEqual(lines[1:3], ["test_scratch_timeout.ScratchTimeout", f"class exceeded {deadline}"])
+                self.assertRegex(lines[3], r"^Python class stack \(PID \d+\)$")
                 self.assertIn("in test_3_hang", report)
-                self.assertEqual(lines[-2], self.guidance)
+        self.assertEqual(len(summaries), 1, result.stdout)
+        lines = summaries[0].splitlines()
+        self.assertEqual(lines[:4], ["test_scratch_timeout.ScratchTimeout (3 tests)", "class exceeded 1s",
+                                     "2 completed, 0 never started", "Slowest completed tests:"])
+        self.assertRegex(lines[4], r"^  \d+\.\d{3}s test_scratch_timeout\.ScratchTimeout\.test_2_slower$")
+        self.assertRegex(lines[5], r"^  \d+\.\d{3}s test_scratch_timeout\.ScratchTimeout\.test_1_fast$")
+        self.assertEqual(lines[6:], [self.guidance])
 
-    def timeout_report(self, name, deadline=10, timings=None, stack=""):
-        if timings is None:
-            timings = (f"  2.000s {name}.test_slower", f"  1.000s {name}.test_fast")
-        details = "\n".join((
-            f"{name} ({len(timings) + 1} tests)", f"class exceeded {deadline}s", f"{len(timings)} completed, 0 never started",
-            "Slowest completed tests:", *timings,
-        ))
-        report = "\n".join(filter(None, (
-            "=== Test class timeout ===", details, stack, self.guidance, "=== End test class timeout ===",
-        )))
-        return report, f"{details}\n{self.guidance}"
+    def report(self, **changes):
+        return dict(dict(ran=3, errors=[], failures=[], skipped=[], unexpected=[],
+                         seconds=0.25, output="", timeout=""), **changes)
 
-    def test_recovered_timeout_keeps_main_assertion_in_ci_and_local_excerpts(self):
-        name = "fixture.Recovered"
-        frame = '  File "fixture.py", line 42 in test_hang'
-        report, summary = self.timeout_report(name)
-        stack = ("Python class stack (PID 42)" + f"\n{frame}" * 200)[:7970 - len(report) - 1]
-        full_report, _ = self.timeout_report(name, stack=stack)
-        self.assertEqual(len(full_report), 7970)
-        passed = dict(ran=3, errors=[], failures=[], skipped=[], unexpected=[], seconds=0.25, output="", timeout="")
-        other = "fixture.Failed"
-        assertion = "AssertionError: 7 != 8"
-        traceback = f'Traceback (most recent call last):\n  File "fixture.py", line 8 in test_failure\n{assertion}'
-        failure = dict(passed, ran=1, failures=[(f"{other}.test_failure", traceback)])
-        later = "fixture.AlsoFailed"
-        error = "ValueError: invalid fixture"
-        later_failure = dict(passed, ran=1, errors=[(f"{later}.test_error", error)])
+    def timeout_report(self, name, deadline=10, stack="", completed=2):
+        timings = [f"  {seconds}.000s {name}.test_fast_{seconds}" for seconds in range(completed, 0, -1)]
+        details = "\n".join((f"{name} ({completed + 1} tests)", f"class exceeded {deadline}s",
+                             f"{completed} completed, 0 never started", "Slowest completed tests:", *timings))
+        report = "\n".join(filter(None, ("=== Test class timeout ===", name, f"class exceeded {deadline}s", stack,
+                                          "=== End test class timeout ===")))
+        return self.report(ran=0, timeout=report, timeout_details=details)
+
+    def finish(self, results, first, crowded=()):
         stdout = io.StringIO()
         with (tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory,
               patch.object(parallel, "HISTORY", str(Path(directory, "durations.json"))),
               contextlib.redirect_stdout(stdout)):
             runner = parallel.Runner(SimpleNamespace(slowest=0))
             runner.folder = directory
-            runner.results = {other: failure, name: passed, later: later_failure}
-            details = summary.removesuffix("\n" + self.guidance)
-            runner.first_failures = {name: dict(passed, ran=0, timeout=details, stacks=stack)}
-            runner.crowded = [name]
-
+            runner.results = results
+            runner.first_failures = first
+            runner.crowded = crowded
             self.assertEqual(runner.finish(1), 1)
+        return stdout.getvalue(), directory
 
-        main_output = (
-            f"\n{other}: failures\n{other}.test_failure\n{traceback}\n"
-            f"\n{later}: errors\n{later}.test_error\n{error}\n"
-            f"{name}: ran past its deadline on its first run, then passed alone within twice its deadline in 0.25s\n"
-            f"Ran 5 tests in 1.00s: FAILED\nWorker reports and output retained in: {directory}\n"
+    def actions_log(self, output):
+        plain = output + "##[error]Process completed with exit code 1.\nPost-job cleanup\n"
+        return "".join(f"2026-11-21T12:00:00Z {line}" for line in plain.splitlines(keepends=True)), plain
+
+    def test_recovered_timeout_prints_only_the_crowded_note_beside_a_failing_class(self):
+        recovered, failed = "fixture.Recovered", "fixture.Failed"
+        first = self.timeout_report(failed)
+        retry = self.timeout_report(failed, deadline=20)
+        output, folder = self.finish({recovered: self.report(), failed: retry},
+                                     {recovered: self.timeout_report(recovered), failed: first}, [recovered])
+        baseline = (
+            f"\n{first['timeout']}\n\n{retry['timeout']}\n"
+            f"{recovered}: ran past its deadline on its first run, then passed alone within twice its deadline in 0.25s\n"
+            f"Ran 3 tests in 1.00s: FAILED\nWorker reports and output retained in: {folder}\n"
         )
+        summary = f"{retry['timeout_details']}\n{self.guidance}"
+        self.assertEqual(output, f"{baseline}{self.summary_start}\n{summary}\n")
+        _, main_excerpt = self.actions_log(baseline)
+        log, _ = self.actions_log(output)
+        self.assertEqual(ci.excerpt(log), f"{main_excerpt}\n\n{summary}")
 
-        def actions_log(output):
-            output += "##[error]Process completed with exit code 1.\nPost-job cleanup\n"
-            return "\n".join(f"2026-11-21T12:00:00Z {line}" for line in output.splitlines())
+    def test_large_timeout_dump_preserves_the_full_retry_traceback_under_excerpt_pressure(self):
+        name = "fixture.Failed"
+        frame = '  File "fixture.py", line 42 in test_hang\n'
+        stack = ("Python class stack (PID 42)\n" + frame * 200)[:7244]
+        self.assertEqual(len(stack), 7244)
+        first = self.timeout_report(name, stack=stack)
+        test = f"{name}.test_assertion"
+        traceback = ('Traceback (most recent call last):\n  File "fixture.py", line 8 in test_assertion\n'
+                     f"    self.assertEqual(actual, expected)\nAssertionError: {'x' * 150} != 'expected'")
+        retry = self.report(ran=1, failures=[(test, traceback)])
+        output, folder = self.finish({name: retry}, {name: first})
+        baseline = (f"\n{first['timeout']}\n\n{name}: failures\n{test}\n{traceback}\n"
+                    f"Ran 1 tests in 1.00s: FAILED\nWorker reports and output retained in: {folder}\n")
+        summary = f"{first['timeout_details']}\n{self.guidance}"
+        self.assertEqual(output, f"{baseline}{self.summary_start}\n{summary}\n")
 
-        self.assertNotIn(assertion, ci._log_excerpt(actions_log(f"\n{full_report}\n{main_output}"))[0])
-        output = stdout.getvalue()
-        self.assertTrue(output.endswith(main_output), output)
-        self.assertEqual(ci.TEST_TIMEOUT.findall(output), [])
-        log = actions_log(output)
-        for excerpt, prefix, main_excerpt in (
-            (ci.excerpt(log), ci._log_excerpt(log)[0], ci._log_excerpt(actions_log(main_output))[0]),
-            (pipeline.check_output_excerpt(output, "", 6000), pipeline.tail_of_both_streams(output, "", 6000),
-             pipeline.tail_of_both_streams(main_output, "", 6000)),
-        ):
-            self.assertIn(traceback, main_excerpt)
-            self.assertTrue(prefix.endswith(main_excerpt), prefix)
-            self.assertEqual(excerpt, prefix + "\n\n" + summary)
+        log, _ = self.actions_log(output)
+        _, main_excerpt = self.actions_log(baseline)
+        self.assertLessEqual(len(main_excerpt), 8000)
+        self.assertGreater(len(main_excerpt) + len(summary) + 2, 8000)
+        target = ci.Target("owner/repo", "pr", "PR #1", "abcdef", "main")
+        red = ci.Red(target, gh.Check("suite", "fail", job=42), None, "")
+        with tempfile.NamedTemporaryFile() as saved, patch.object(gh, "job_log", return_value=log):
+            log_file = Path(saved.name)
+            note = ci.failure_note(red, log_file)
+            self.assertEqual(log_file.read_text(), log)
+        self.assertEqual(note.split("\n````\n")[1].removesuffix("\n````"), main_excerpt)
+        local_excerpt = pipeline.tail_of_both_streams(output, "", 6000)
+        self.assertEqual(local_excerpt, "...\n" + baseline[-6000:])
+        self.assertIn(traceback, local_excerpt)
 
     def test_local_repair_appends_summary_after_exact_main_excerpt(self):
-        report, summary = self.timeout_report("fixture.Sample")
-        stdout = report + "\n" + "stdout\n" * 1000
-        stderr = "stderr\n" * 1000 + "AssertionError: 7 != 8"
-        prefix = "...\n" + stdout[-3000:] + "...\n" + stderr[-3000:]
+        report = self.timeout_report("fixture.Sample")
+        baseline = (f"{report['timeout']}\nWorker output\nRan 1 tests in 1.00s: FAILED\n"
+                    "Worker reports and output retained in: /tmp/reports\n")
+        summary = f"{report['timeout_details']}\n{self.guidance}"
+        stdout = f"{baseline}{self.summary_start}\n{summary}\n"
+        stderr = "stderr\r\nAssertionError: 7 != 8"
         layer = config.RepoLayer(Path.cwd(), checks={"suite": "run suite"},
                                  quick_checks=["suite"], parallel_checks=True)
         result = SimpleNamespace(returncode=1, stdout=stdout, stderr=stderr)
@@ -213,50 +228,187 @@ class ParallelTimeoutTests(unittest.TestCase):
             ok, note = pipeline.run_checks(layer, Path.cwd(), [], Mock(), 30)
 
         self.assertFalse(ok)
-        self.assertEqual(note.split("\n```\n")[1].removesuffix("\n```"), prefix + "\n\n" + summary)
-        self.assertEqual(pipeline.check_output_excerpt("short stdout\r\n", "stderr\n", 6000),
+        self.assertEqual(note, f"### suite failed: `run suite` exit 1\n```\n{baseline}{stderr}\n```\n\n{summary}")
+        self.assertEqual(pipeline.tail_of_both_streams("short stdout\r\n", "stderr\n", 6000),
                          "short stdout\r\nstderr\n")
 
-    def test_ci_repair_appends_summary_after_exact_main_excerpt(self):
+    def test_combined_check_report_and_repair_append_only_three_timeout_summaries(self):
+        baseline, summaries, results = [], [], []
+        commands = {"suite": "run suite", "other": "run other"}
+        for check, command in commands.items():
+            names = [f"fixture.{check}{n}" for n in (1, 2)]
+            first = {name: self.timeout_report(name) for name in names}
+            retry = {name: self.report(ran=1, failures=[(f"{name}.test_retry", f"AssertionError: {name}")])
+                     for name in names}
+            output, folder = self.finish(retry, first)
+            results.append(SimpleNamespace(returncode=1, stdout=output, stderr=""))
+            failures = "".join(f"\n{first[name]['timeout']}\n\n{name}: failures\n{name}.test_retry\nAssertionError: {name}\n"
+                               for name in names)
+            footer = f"Ran 2 tests in 1.00s: FAILED\nWorker reports and output retained in: {folder}\n"
+            baseline.append(f"### {check} failed: `{command}` exit 1\n```\n{failures}{footer}\n```")
+            summaries.extend(f"{first[name]['timeout_details']}\n{self.guidance}" for name in names)
+
+        expected = "\n\n".join((*baseline, *summaries[:3]))
+        layer = config.RepoLayer(Path.cwd(), checks=commands, quick_checks=list(commands), parallel_checks=True)
+        run = Mock(story=[], budget=None)
+        run.settings.return_value.tries = 2
+        build = pipeline.Build(cfg=config.Config(), run=run, ticket=Mock(), ws=Path.cwd(), checkouts=[],
+                               layer=layer, timeout=30, workspace="fixture", tools=[], deny=[])
+        passed = SimpleNamespace(returncode=0, stdout="", stderr="")
+        with (patch.object(pipeline.environment, "sh", side_effect=[*results, passed, passed]),
+              patch.object(record, "timed", side_effect=lambda *_, **__: contextlib.nullcontext({})),
+              patch.object(pipeline.factory, "fingerprint", return_value="tree"),
+              patch.object(build, "restage", return_value=pipeline.Staged()),
+              patch.object(build, "resume") as resume):
+            self.assertEqual(build.check_with_repairs(lambda n: f"fix{n}"), (True, 2))
+
+        run.save.assert_any_call("checks.md", expected)
+        prompt = resume.call_args.args[1]
+        self.assertIn(expected, prompt)
+        self.assertEqual(prompt.count(self.guidance), 3)
+        self.assertEqual(run.story, [f"Checks failed on attempt 1:\n{expected}"])
+
+    def test_combined_suite_excerpts_keep_both_tracebacks_at_their_original_budgets(self):
+        baselines, outputs, summaries = [], [], []
+        tracebacks = [f"Traceback (most recent call last):\nAssertionError: {detail}"
+                      for detail in ("PAYLOAD", "second suite failed")]
+        for n, traceback in enumerate(tracebacks, start=1):
+            name = f"fixture.Suite{n}"
+            first = self.timeout_report(name)
+            retry = self.report(ran=1, failures=[(f"{name}.test_retry", traceback)])
+            output, folder = self.finish({name: retry}, {name: first})
+            baselines.append(f"\n{first['timeout']}\n\n{name}: failures\n{name}.test_retry\n{traceback}\n"
+                             f"Ran 1 tests in 1.00s: FAILED\nWorker reports and output retained in: {folder}\n")
+            outputs.append(output)
+            summaries.append(f"{first['timeout_details']}\n{self.guidance}")
+
+        separator = "Running the second suite\n"
+        baseline = separator.join(baselines)
+        output = separator.join(outputs)
+        appendix = "\n\n" + "\n\n".join(summaries)
+        log, _ = self.actions_log(output)
+        _, main_excerpt = self.actions_log(baseline)
+
+        with self.subTest(excerpt="local", fits=False):
+            local_payload = "é" * (6000 - len(baseline) + len("PAYLOAD"))
+            local = pipeline.tail_of_both_streams(output.replace("PAYLOAD", local_payload), "", 6000)
+            self.assertEqual(local.encode(), baseline.replace("PAYLOAD", local_payload).encode())
+
+        with self.subTest(excerpt="Actions", fits=False):
+            actions_payload = "é" * (8000 - len(main_excerpt) + len("PAYLOAD"))
+            large_log, _ = self.actions_log(output.replace("PAYLOAD", actions_payload))
+            self.assertEqual(ci.excerpt(large_log).encode(), main_excerpt.replace("PAYLOAD", actions_payload).encode())
+
+        with self.subTest(excerpt="local", fits=True):
+            self.assertEqual(pipeline.tail_of_both_streams(output, "", 6000), baseline + appendix)
+        with self.subTest(excerpt="Actions", fits=True):
+            self.assertEqual(ci.excerpt(log), main_excerpt + appendix)
+
+    def test_quoted_timeout_summary_stays_in_both_excerpts(self):
+        quoted = self.timeout_report("fixture.Quoted")
+        real = self.timeout_report("fixture.TimedOut")
+        quote = f"{self.summary_start}\n{quoted['timeout_details']}\n{self.guidance}\n".replace("\n", "\r\n")
+        summary = f"{real['timeout_details']}\n{self.guidance}"
+        final_block = f"{self.summary_start}\n{summary}\n"
+        traceback = f"Traceback (most recent call last):\nAssertionError: capture differs (é)\n{quote}"
+        footer = "Ran 1 tests in 1.00s: FAILED\nWorker reports and output retained in: /tmp/reports\n"
+        for has_diagnostics in (False, True):
+            for has_room in (False, True):
+                with self.subTest(has_diagnostics=has_diagnostics, has_room=has_room):
+                    baseline = (f"{real['timeout']}\n" if has_diagnostics else "") + traceback + footer
+                    block = final_block if has_diagnostics else ""
+                    appendix = f"\n\n{summary}" if has_diagnostics and has_room else ""
+                    _, actions_tail = self.actions_log("")
+                    if not has_diagnostics:
+                        actions_tail = actions_tail.partition("\n")[0]
+                    room = 2 + len(summary) if has_room else 0
+
+                    local_baseline = "x" * (6000 - room - len(baseline) - 1) + "\n" + baseline
+                    local = pipeline.tail_of_both_streams(local_baseline + block, "", 6000)
+                    self.assertEqual(local.encode(), (local_baseline + appendix).encode())
+
+                    actions_baseline = "x" * (8000 - room - len(baseline + actions_tail) - 1) + "\n" + baseline
+                    log, _ = self.actions_log(actions_baseline + block)
+                    self.assertEqual(ci.excerpt(log).encode(), (actions_baseline + actions_tail + appendix).encode())
+
+    def test_repair_history_keeps_main_failure_text_before_timeout_diagnostics(self):
+        name = "fixture.Failed"
+        test = f"{name}.test_assertion"
+        command = "run suite"
+        layer = config.RepoLayer(Path.cwd(), checks={"suite": command},
+                                 quick_checks=["suite"], parallel_checks=True)
+        frame = '  File "fixture.py", line 42 in test_hang\n'
+        cases = ((2, 400, False, True), (4, 1700, False, False), (27, 2120, True, False))
+        for frames, assertion_size, main_clipped, summary_fits in cases:
+            with self.subTest(frames=frames, assertion_size=assertion_size):
+                first = self.timeout_report(name, stack="Python class stack (PID 42)\n" + frame * frames)
+                traceback = ('Traceback (most recent call last):\n  File "fixture.py", line 8 in test_assertion\n'
+                             f"    self.assertEqual(actual, expected)\nAssertionError: {'é' * assertion_size}")
+                retry = self.report(ran=1, failures=[(test, traceback)])
+                output, folder = self.finish({name: retry}, {name: first})
+                baseline = (f"\n{first['timeout']}\n\n{name}: failures\n{test}\n{traceback}\n"
+                            f"Ran 1 tests in 1.00s: FAILED\nWorker reports and output retained in: {folder}\n")
+                summary = f"{first['timeout_details']}\n{self.guidance}"
+                heading = f"### suite failed: `{command}` exit 1\n```\n"
+                main_report = f"{heading}{baseline}\n```"
+                self.assertEqual(len(main_report) > 2500, main_clipped)
+                main_tail = main_report if len(main_report) <= 2500 else "...\n" + main_report[-2500:]
+                self.assertIn(traceback, main_tail)
+                self.assertEqual(len(main_report) + 2 + len(summary) <= 2500, summary_fits)
+
+                run = Mock(story=[], budget=None)
+                run.settings.return_value.tries = 2
+                build = pipeline.Build(cfg=config.Config(), run=run, ticket=Mock(), ws=Path.cwd(), checkouts=[],
+                                       layer=layer, timeout=30, workspace="fixture", tools=[], deny=[])
+                failure = SimpleNamespace(returncode=1, stdout=output, stderr="")
+                passed = SimpleNamespace(returncode=0, stdout="", stderr="")
+                with (patch.object(pipeline.environment, "sh", side_effect=[failure, passed]),
+                      patch.object(record, "timed", side_effect=lambda *_, **__: contextlib.nullcontext({})),
+                      patch.object(pipeline.factory, "fingerprint", return_value="tree"),
+                      patch.object(build, "restage", return_value=pipeline.Staged()),
+                      patch.object(build, "resume")):
+                    self.assertEqual(build.check_with_repairs(lambda n: f"fix{n}"), (True, 2))
+
+                upstream = f"{main_report}\n\n{summary}"
+                run.save.assert_any_call("checks.md", upstream)
+                self.assertLess(len(upstream), 6000)
+                expected = f"Checks failed on attempt 1:\n{main_tail}"
+                if summary_fits:
+                    expected += f"\n\n{summary}"
+                self.assertEqual([entry.encode() for entry in run.story], [expected.encode()])
+
+    def test_ci_repair_appends_summary_after_main_trims_the_stack(self):
         heading = "Python class stack (PID 42)"
         frame = '  File "fixture.py", line 42 in test_hang'
         stack = "\n".join([heading, "Current thread (most recent call first):", *([frame] * 300)])
-        report, summary = self.timeout_report("fixture.Sample", stack=stack)
-        error = "##[error]Process completed with exit code 1."
-        output = f"setup\n{report}\npostlude\n{error}\nPost-job cleanup"
-        log = "\n".join(f"2026-11-21T12:00:00Z {line}" for line in output.splitlines())
-        prefix = "\n".join([summary.removesuffix("\n" + self.guidance), heading, *([frame] * 6),
-                            "", "setup", "", "postlude", error])
-        target = ci.Target("owner/repo", "pr", "PR #1", "abcdef", "main")
-        red = ci.Red(target, gh.Check("suite", "fail", job=42), None, "")
-        with tempfile.NamedTemporaryFile() as saved, patch.object(gh, "job_log", return_value=log):
-            log_file = Path(saved.name)
-            note = ci.failure_note(red, log_file)
-            self.assertEqual(log_file.read_text(), log)
-
-        self.assertEqual(note.split("\n````\n")[1].removesuffix("\n````"), prefix + "\n\n" + summary)
+        report = self.timeout_report("fixture.Sample", stack=stack)
+        summary = f"{report['timeout_details']}\n{self.guidance}"
+        footer = "Ran 1 tests in 1.00s: FAILED\nWorker reports and output retained in: /tmp/reports\n"
+        baseline = f"setup\n{report['timeout']}\npostlude\n{footer}"
+        log, _ = self.actions_log(f"{baseline}{self.summary_start}\n{summary}\n")
+        prefix = "\n".join(["fixture.Sample", "class exceeded 10s", heading, *([frame] * 6), "", "setup", "",
+                            "postlude", footer + "##[error]Process completed with exit code 1."])
+        self.assertEqual(ci.excerpt(log), f"{prefix}\n\n{summary}")
 
     def test_appendix_keeps_at_most_three_classes_and_bounds_each_summary(self):
         long_name = "fixture." + "long_module." * 80 + "LongTests"
-        timings = [f"  {seconds}.000s {long_name}.test_slow_{seconds}" for seconds in range(5, 0, -1)]
-        first, _ = self.timeout_report(long_name, timings=timings)
-        solo, _ = self.timeout_report(long_name, deadline=20, timings=timings)
-        other = [self.timeout_report(f"fixture.{name}")[0] for name in ("Second", "Third", "Fourth")]
-        stdout = "\n\n".join((first, *other, solo)) + "\n" + "x" * 6000
-        prefix = "...\n" + "x" * 6000
+        names = (long_name, "fixture.Second", "fixture.Third", "fixture.Fourth")
+        first = {name: self.timeout_report(name, completed=5) for name in names}
+        retry = {name: self.timeout_report(name, deadline=20, completed=5) for name in names}
+        output, _ = self.finish(retry, first)
+        prefix, summaries = ci.split_timeout_summaries(output)
 
-        excerpt = pipeline.check_output_excerpt(stdout, "", 6000)
-        self.assertTrue(excerpt.startswith(prefix + "\n\n"))
-        summaries = excerpt[len(prefix) + 2:].split("\n\n")
         self.assertEqual(len(summaries), 3)
         for summary in summaries:
             self.assertLessEqual(len(summary), 800)
             self.assertEqual(summary.splitlines()[-1], self.guidance)
         self.assertIn("LongTests (6 tests)\nclass exceeded 20s", summaries[0])
         self.assertEqual(summaries[0].splitlines()[4:9],
-                         [f"  {seconds}.000s test_slow_{seconds}" for seconds in range(5, 0, -1)])
-        self.assertTrue(summaries[1].startswith("fixture.Second (3 tests)\n"))
-        self.assertTrue(summaries[2].startswith("fixture.Third (3 tests)\n"))
+                         [f"  {seconds}.000s test_fast_{seconds}" for seconds in range(5, 0, -1)])
+        self.assertTrue(summaries[1].startswith("fixture.Second (6 tests)\n"))
+        self.assertTrue(summaries[2].startswith("fixture.Third (6 tests)\n"))
+        limit = len(prefix) + 2 + len(summaries[0])
+        self.assertEqual(pipeline.tail_of_both_streams(output, "", limit), f"{prefix}\n\n{summaries[0]}")
 
 
 class PinCommandTests(unittest.TestCase):

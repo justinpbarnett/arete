@@ -24,6 +24,7 @@ from tempfile import NamedTemporaryFile
 from typing import TextIO
 
 from . import (
+    _test_stacks,
     alerts,
     browser,
     ci,
@@ -1048,15 +1049,17 @@ def check_lane(layer: config.RepoLayer, run: AgentRun):
 
 
 def tail_of_both_streams(stdout: str, stderr: str, n: int) -> str:
+    prefix, summaries = check_output_tail(stdout, stderr, n)
+    return ci.append_timeout_summaries(prefix, summaries, n)
+
+
+def check_output_tail(stdout: str, stderr: str, n: int) -> tuple[str, list[str]]:
+    stdout, stdout_summaries = ci.split_timeout_summaries(stdout)
+    stderr, stderr_summaries = ci.split_timeout_summaries(stderr)
     stdout_room = n - min(len(stderr), n // 2)
     stderr_room = n - min(len(stdout), n // 2)
-    return util.tail(stdout, stdout_room) + util.tail(stderr, stderr_room)
-
-
-def check_output_excerpt(stdout: str, stderr: str, limit: int) -> str:
-    prefix = tail_of_both_streams(stdout, stderr, limit)
-    reports = ci.TIMEOUT_SUMMARY_REPORT.findall(stdout) + ci.TIMEOUT_SUMMARY_REPORT.findall(stderr)
-    return ci.append_timeout_summaries(prefix, reports)
+    prefix = util.tail(stdout, stdout_room) + util.tail(stderr, stderr_room)
+    return prefix, stdout_summaries + stderr_summaries
 
 
 def selected_checks(layer: config.RepoLayer, files: list[str]) -> set[str]:
@@ -1067,8 +1070,19 @@ def selected_checks(layer: config.RepoLayer, files: list[str]) -> set[str]:
     return selected or set(layer.checks)
 
 
+@dataclass
+class CheckHistory:
+    baseline: str = ""
+    summaries: list[str] = field(default_factory=list)
+
+    def tail(self, limit: int) -> str:
+        prefix = util.tail(self.baseline, limit)
+        return ci.append_timeout_summaries(prefix, self.summaries, limit)
+
+
 def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: AgentRun,
-               timeout: float, *, selected: set[str] | None = None) -> tuple[bool, str]:
+               timeout: float, *, selected: set[str] | None = None,
+               history: CheckHistory | None = None) -> tuple[bool, str]:
     commands = layer.checks
     if selected is not None:
         available = layer.checks | layer.targeted_commands
@@ -1080,7 +1094,7 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
     quick = [(name, commands[name]) for name in layer.quick_checks if name in commands]
     slow = [(name, command) for name, command in commands.items() if name not in layer.quick_checks]
     untracked_before = untracked_by_dir(git_dirs)
-    report, ok = [], True
+    report, diagnostics, ok = [], [], True
 
     def execute(items):
         nonlocal ok
@@ -1092,8 +1106,9 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
             ok = ok and passed
             run.log(f"check {name}: {'pass' if passed else f'FAIL (exit {res.returncode})'}")
             if not passed:
-                excerpt = check_output_excerpt(res.stdout, res.stderr, 6000)
-                report.append(f"### {name} failed: `{cmd}` exit {res.returncode}\n```\n{excerpt}\n```")
+                prefix, summaries = check_output_tail(res.stdout, res.stderr, 6000)
+                report.append(f"### {name} failed: `{cmd}` exit {res.returncode}\n```\n{prefix}\n```")
+                diagnostics.extend(ci.fitting_timeout_summaries(prefix, summaries, 6000))
             else:
                 report.append(f"### {name} passed: `{cmd}`")
 
@@ -1110,7 +1125,12 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
     finally:
         for d, name in untracked_added_since(untracked_before):
             workspace.remove_untracked(d, name)
-    return ok, "\n\n".join(report)
+    baseline = "\n\n".join(report)
+    diagnostics = diagnostics[:_test_stacks.MAX_TIMEOUT_SUMMARY_CLASSES]
+    if history is not None:
+        history.baseline = baseline
+        history.summaries = diagnostics
+    return ok, "\n\n".join((baseline, *diagnostics))
 
 
 class RetryNextPoll(Exception):
@@ -1167,6 +1187,7 @@ class Build(TicketWork):
     tools: list[str]
     deny: list[str]
     report: str = ""
+    check_history: CheckHistory | None = field(default=None, init=False)
     staged: Staged = field(default_factory=Staged)
     committed_lines: int = 0
     left_for_a_person: str = ""
@@ -1212,6 +1233,7 @@ class Build(TicketWork):
     def check(self, *, quick: bool = False, after: str = "the build and its fixes",
               staged: Staged | None = None) -> bool:
         previous, self.checked = self.checked, {}
+        self.check_history = None
         self.report = "Checks started but did not complete; no passing result from this attempt."
         try:
             self.run.save("checks.md", self.report)
@@ -1236,7 +1258,9 @@ class Build(TicketWork):
         selected = selected_checks(self.layer, staged.files) if quick else None
         full = selected is None or selected == set(self.layer.checks)
         before = factory.fingerprint(self.ws)
-        ok, self.report = run_checks(self.layer, self.ws, self.git_dirs, self.run, self.timeout, selected=selected)
+        self.check_history = CheckHistory()
+        ok, self.report = run_checks(self.layer, self.ws, self.git_dirs, self.run, self.timeout,
+                                     selected=selected, history=self.check_history)
         if ok:
             after = factory.fingerprint(self.ws)
             if before and after and before != after:
@@ -1336,7 +1360,9 @@ class Build(TicketWork):
         attempts, tries = 1, self.run.settings("check_repair").tries
         ok = self.check(after=after)
         while not ok and attempts < tries:
-            self.run.story.append(f"Checks failed on attempt {attempts}:\n{util.tail(self.report, 2500)}")
+            history = self.check_history
+            tail = history.tail(2500) if history and history.summaries else util.tail(self.report, 2500)
+            self.run.story.append(f"Checks failed on attempt {attempts}:\n{tail}")
             attempts += 1
             self.resume(step_name(attempts),
                         prompt_loader.prompt("fix", attempt=attempts, max_attempts=tries, failures=self.report,

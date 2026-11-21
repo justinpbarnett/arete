@@ -16,17 +16,20 @@ POLL_SECONDS = 30
 CONFLICT_SNAPSHOT_TIMEOUT = 5
 LOG_EXCERPT_CHARS = 8000
 MIN_TIMEOUT_REPORT_CHARS = 160
-MAX_TIMEOUT_SUMMARY_CHARS = 800
-MAX_TIMEOUT_SUMMARY_CLASSES = 3
 LOG_TIMESTAMP = re.compile(r"^\d{4}-\d\d-\d\dT[\d:.]+Z ", re.MULTILINE)
 TEST_TIMEOUT = re.compile(rf"^{re.escape(_test_stacks.REPORT_START)}\r?\n.*?\r?\n"
                           rf"^{re.escape(_test_stacks.REPORT_END)}\r?$", re.DOTALL | re.MULTILINE)
-TIMEOUT_SUMMARY_REPORT = re.compile(
-    rf"^(?:{re.escape(_test_stacks.REPORT_START)}|{re.escape(_test_stacks.RECOVERED_REPORT_START)})\r?\n.*?\r?\n"
-    rf"^{re.escape(_test_stacks.REPORT_END)}\r?$", re.DOTALL | re.MULTILINE,
+RUNNER_FAILURE_FOOTER = re.compile(
+    r"^Ran \d+ tests in \d+\.\d{2}s: FAILED(?: \(skipped=\d+\))?\r?\n"
+    r"Worker reports and output retained in: [^\r\n]+\r?\n", re.MULTILINE,
+)
+TIMEOUT_SUMMARY = re.compile(
+    rf"^{re.escape(_test_stacks.SUMMARY_START)}\r?\n"
+    r"([^\r\n]+ \(\d+ tests\)\r?\nclass exceeded [^\r\n]+\r?\n"
+    r"\d+ completed, \d+ never started\r?\n(?:Slowest completed tests:\r?\n(?:  [^\r\n]+\r?\n){1,5})?"
+    rf"{re.escape(_test_stacks.TIMEOUT_REMEDIATION)})\r?(?:\n|$)", re.MULTILINE,
 )
 PYTHON_STACK = re.compile(r"^(Python (?:class|child) stack \(PID \d+\))\r?\n", re.MULTILINE)
-TIMEOUT_CLASS = re.compile(r"(.+) \(\d+ tests\)")
 TIMEOUT_OMISSION = re.compile(r"\.\.\. \d+ timeout reports omitted")
 SECTION_START, SECTION_END = "<!-- arete:ci -->", "<!-- /arete:ci -->"
 SECTION = re.compile(rf"\n*^{re.escape(SECTION_START)}\r?$.*?^{re.escape(SECTION_END)}\r?$", re.DOTALL | re.MULTILINE)
@@ -324,7 +327,7 @@ def failure_note(r: Red, log_file: Path) -> str:
     except gh.GhError as e:
         return "\n".join([*lines, f"- Arete could not read its log: {util.first_line(str(e), 300)}"])
     log_file.write_text(text)
-    snippet, has_timeout_report = _log_excerpt_with_timeout_summaries(text)
+    snippet, has_timeout_report = _log_excerpt(text)
     heading = "Log excerpt:" if has_timeout_report else "The log up to its last error:"
     return "\n".join([*lines, f"- Full log: `{log_file}`", "", heading, "", "````", snippet, "````"])
 
@@ -411,46 +414,53 @@ def timeout_summary(reports: list[str]) -> str:
     return "\n\n".join(filter(None, (*summaries, notice)))
 
 
-def bounded_timeout_summary(details: str, class_name: str) -> str:
-    lines = details.split("\n")[:9]
-    guidance = _test_stacks.TIMEOUT_REMEDIATION
-    if len(details) + 1 + len(guidance) > MAX_TIMEOUT_SUMMARY_CHARS:
-        lines[4:] = [line.replace(f" {class_name}.", " ", 1) for line in lines[4:]]
-    remaining = MAX_TIMEOUT_SUMMARY_CHARS - len(guidance) - len(lines)
-    for offset, index in enumerate(sorted(range(len(lines)), key=lambda index: len(lines[index]))):
-        limit = remaining // (len(lines) - offset)
-        lines[index] = util.both_ends(lines[index], limit).replace("\n...\n", "...")
-        remaining -= len(lines[index])
-    return "\n".join((*lines, guidance))
+def split_timeout_summaries(text: str) -> tuple[str, list[str]]:
+    baseline, summaries = [], []
+    kept_from = 0
+    for footer in RUNNER_FAILURE_FOOTER.finditer(text):
+        start = end = footer.end()
+        while match := TIMEOUT_SUMMARY.match(text, end):
+            summaries.append(match[1].replace("\r\n", "\n"))
+            end = match.end()
+        if end > start:
+            baseline.append(text[kept_from:start])
+            kept_from = end
+
+    baseline.append(text[kept_from:])
+    return "".join(baseline), summaries
 
 
-def append_timeout_summaries(prefix: str, reports: list[str]) -> str:
-    classes = {}
-    for report in reports:
-        body = report.replace("\r\n", "\n").partition("\n")[2].rpartition("\n")[0]
-        details = body.removesuffix("\n" + _test_stacks.TIMEOUT_REMEDIATION)
-        if details == body:
+def fitting_timeout_summaries(prefix: str, summaries: list[str], limit: int) -> list[str]:
+    kept = []
+    remaining = limit - len(prefix)
+    for summary in summaries:
+        if len(summary) > _test_stacks.MAX_TIMEOUT_SUMMARY_CHARS:
             continue
-        details = PYTHON_STACK.split(details, maxsplit=1)[0].rstrip()
-        match = TIMEOUT_CLASS.fullmatch(details.partition("\n")[0])
-        if match and (match[1] in classes or len(classes) < MAX_TIMEOUT_SUMMARY_CLASSES):
-            classes[match[1]] = details
-    summaries = [bounded_timeout_summary(details, name) for name, details in classes.items()]
-    return "\n\n".join(filter(None, (prefix, *summaries)))
+        separator = "\n\n" if prefix or kept else ""
+        size = len(separator) + len(summary)
+        if size > remaining or len(kept) == _test_stacks.MAX_TIMEOUT_SUMMARY_CLASSES:
+            break
+        kept.append(summary)
+        remaining -= size
+    return kept
+
+
+def append_timeout_summaries(prefix: str, summaries: list[str], limit: int) -> str:
+    kept = fitting_timeout_summaries(prefix, summaries, limit)
+    return "\n\n".join(filter(None, (prefix, *kept)))
 
 
 def excerpt(log_text: str) -> str:
-    return _log_excerpt_with_timeout_summaries(log_text)[0]
-
-
-def _log_excerpt_with_timeout_summaries(log_text: str) -> tuple[str, bool]:
-    prefix, has_timeout = _log_excerpt(log_text)
-    reports = TIMEOUT_SUMMARY_REPORT.findall(LOG_TIMESTAMP.sub("", log_text))
-    return append_timeout_summaries(prefix, reports), has_timeout
+    return _log_excerpt(log_text)[0]
 
 
 def _log_excerpt(log_text: str) -> tuple[str, bool]:
-    text = LOG_TIMESTAMP.sub("", log_text)
+    text, summaries = split_timeout_summaries(LOG_TIMESTAMP.sub("", log_text))
+    prefix, has_timeout = _baseline_log_excerpt(text)
+    return append_timeout_summaries(prefix, summaries, LOG_EXCERPT_CHARS), has_timeout
+
+
+def _baseline_log_excerpt(text: str) -> tuple[str, bool]:
     reports = TEST_TIMEOUT.findall(text)
     if reports and len(text) <= LOG_EXCERPT_CHARS:
         return text, True

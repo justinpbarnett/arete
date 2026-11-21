@@ -142,6 +142,25 @@ def class_timeout_details(batch, timeout, deadline, progress_file):
     )))
 
 
+def timeout_summary(identifier, details):
+    guidance = _test_stacks.TIMEOUT_REMEDIATION
+    limit = _test_stacks.MAX_TIMEOUT_SUMMARY_CHARS
+    if len(details) + 1 + len(guidance) <= limit:
+        return f"{details}\n{guidance}"
+    lines = details.split("\n")
+    lines[4:] = [line.replace(f" {identifier}.", " ", 1) for line in lines[4:]]
+    remaining = limit - len(guidance) - len(lines)
+    for offset, index in enumerate(sorted(range(len(lines)), key=lambda i: len(lines[i]))):
+        room = remaining // (len(lines) - offset)
+        line = lines[index]
+        if len(line) > room:
+            head = (room - 3) // 2
+            tail = room - 3 - head
+            lines[index] = f"{line[:head]}...{line[-tail:]}"
+        remaining -= len(lines[index])
+    return "\n".join((*lines, guidance))
+
+
 class Runner:
     def __init__(self, args):
         self.args = args
@@ -244,7 +263,7 @@ class Runner:
                    [sys.executable, os.path.abspath(__file__)]) + tail
         began = time.monotonic()
         problem = None
-        timeout_details = stacks = ""
+        timeout_report = timeout_details = ""
         with open(output_file, "w") as output, self.lock:
             if self.stopping:
                 return
@@ -266,6 +285,7 @@ class Runner:
                 if process.returncode:
                     problem = f"worker exited with status {process.returncode}"
             except subprocess.TimeoutExpired:
+                problem = f"class exceeded {timeout:g}s"
                 requested = self.request_stacks(stack_prefix)
             finally:
                 self.kill(process)
@@ -274,6 +294,9 @@ class Runner:
                     self.live.pop(process, None)
             if requested is not None:
                 stacks = self.stack_output(requested, process.pid)
+                timeout_report = "\n".join(filter(None, (
+                    _test_stacks.REPORT_START, batch.identifier, problem, stacks, _test_stacks.REPORT_END,
+                )))
                 timeout_details = class_timeout_details(batch, timeout, deadline, result_file + ".progress")
         try:
             with open(result_file) as handle:
@@ -287,10 +310,10 @@ class Runner:
         except (OSError, ValueError, KeyError, TypeError):
             report = {"ran": 0, "errors": [], "failures": [], "skipped": [], "unexpected": []}
             problem = problem or "worker exited without a complete report"
-        if problem and not timeout_details:
+        if problem and not timeout_report:
             report["errors"].append((batch.identifier, problem))
-        report.update(seconds=time.monotonic() - began, output=self.output(output_file),
-                      timeout=timeout_details, stacks=stacks)
+        report.update(seconds=time.monotonic() - began, output=self.output(output_file), timeout=timeout_report,
+                      timeout_details=timeout_details)
         with self.lock:
             self.results[batch.identifier] = report
             if self.args.verbose:
@@ -349,17 +372,10 @@ class Runner:
             return 130
         return self.finish(time.monotonic() - began)
 
-    def show_timeout(self, report, *, recovered=False):
-        start = _test_stacks.RECOVERED_REPORT_START if recovered else _test_stacks.REPORT_START
-        stacks = "" if recovered else report["stacks"]
-        print("\n" + "\n".join(filter(None, (
-            start, report["timeout"], stacks, _test_stacks.TIMEOUT_REMEDIATION, _test_stacks.REPORT_END,
-        ))))
-
     def show_failures(self, identifier, report):
-        timeout = report.get("timeout")
-        if timeout:
-            self.show_timeout(report)
+        timeout_report = report.get("timeout")
+        if timeout_report:
+            print(f"\n{timeout_report}")
             if report["output"]:
                 print(report["output"])
         for kind in ("errors", "failures", "unexpected"):
@@ -368,23 +384,25 @@ class Runner:
             print(f"\n{identifier}: {kind}")
             for entry in report[kind]:
                 print(entry if isinstance(entry, str) else "\n".join(entry))
-            if report["output"] and not timeout:
+            if report["output"] and not timeout_report:
                 print(report["output"])
 
     def finish(self, seconds):
         suite_failed = False
+        summaries = []
         ran = skipped = 0
         for identifier, report in self.results.items():
             ran += report["ran"]
             skipped += len(report["skipped"])
-            if (first := self.first_failures.get(identifier)) and first["timeout"] and not failed(report):
-                self.show_timeout(first, recovered=True)
-        for identifier, report in self.results.items():
             if failed(report):
                 suite_failed = True
-                if (first := self.first_failures.get(identifier)) and first["timeout"]:
+                first = self.first_failures.get(identifier, {})
+                if first.get("timeout"):
                     self.show_failures(identifier, first)
                 self.show_failures(identifier, report)
+                details = report.get("timeout_details") or first.get("timeout_details")
+                if details and len(summaries) < _test_stacks.MAX_TIMEOUT_SUMMARY_CLASSES:
+                    summaries.append(timeout_summary(identifier, details))
         try:
             temporary = f"{HISTORY}.{os.getpid()}.tmp"
             with open(temporary, "w") as handle:
@@ -406,6 +424,8 @@ class Runner:
               (f" (skipped={skipped})" if skipped else ""), flush=True)
         if suite_failed:
             print(f"Worker reports and output retained in: {self.folder}", flush=True)
+            for summary in summaries:
+                print(f"{_test_stacks.SUMMARY_START}\n{summary}", flush=True)
             return 1
         shutil.rmtree(self.folder)
         return 0 if ran else 5

@@ -7,8 +7,10 @@ from _thread import get_ident
 PREFIX_ENV = "ARETE_TEST_STACK_PREFIX"
 DUMP_SIGNAL = signal.SIGURG
 REPORT_START = "=== Test class timeout ==="
-RECOVERED_REPORT_START = "=== Recovered test class timeout ==="
 REPORT_END = "=== End test class timeout ==="
+SUMMARY_START = "=== Test class timeout summary ==="
+MAX_TIMEOUT_SUMMARY_CHARS = 800
+MAX_TIMEOUT_SUMMARY_CLASSES = 3
 TIMEOUT_REMEDIATION = (
     "Move the tests this change adds into their own TestCase class, or split the class, "
     "so each class finishes alone well within its deadline. Raise class_timeout only for a class "
