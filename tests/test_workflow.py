@@ -1,9 +1,14 @@
 import json
+import shlex
 import shutil
+import signal
+import stat
 import subprocess
+import sys
 import sysconfig
 import tempfile
 import threading
+import time
 import tomllib
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -363,7 +368,9 @@ class MovedBasePublicationTests(unittest.TestCase):
         push.assert_not_called()
 
 
-class ServeDeploymentTests(unittest.TestCase):
+class ServeDeploymentFixture(unittest.TestCase):
+    class_timeout = 30
+
     def setUp(self):
         root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         origin = root / "origin.git"
@@ -376,6 +383,8 @@ class ServeDeploymentTests(unittest.TestCase):
         package = self.writer / "arete"
         package.mkdir()
         (package / "fixture.py").write_text("version = 1\n")
+        (package / "other.py").write_text("other = 1\n")
+        (package / "shared.py").write_text("shared = 1\n")
         self.start = self.commit(self.writer, "initial code")
         self.git(self.writer, "push", "-q", "origin", "main")
         self.git(root, "clone", "-q", str(origin), str(self.checkout))
@@ -395,7 +404,6 @@ class ServeDeploymentTests(unittest.TestCase):
         self.gh_json = gh.gh_json
         self.ci = self.enterContext(mock.patch.object(gh, "gh_json", side_effect=self.ci_response))
         self.gate = self.enterContext(mock.patch.object(gh, "merge_ci_passed", wraps=gh.merge_ci_passed))
-        self.tip = self.publish("merged code")
 
     def git(self, cwd, *args):
         return subprocess.check_output(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
@@ -428,6 +436,12 @@ class ServeDeploymentTests(unittest.TestCase):
     def deploy(self):
         self.server.deploy(self.cfg)
         return self.git(self.checkout, "rev-parse", "HEAD")
+
+
+class ServeDeploymentTests(ServeDeploymentFixture):
+    def setUp(self):
+        super().setUp()
+        self.tip = self.publish("merged code")
 
     def test_ci_rerun_goes_pending_while_waiting_for_repo_lock(self):
         attempting = threading.Event()
@@ -523,34 +537,6 @@ class ServeDeploymentTests(unittest.TestCase):
         self.assertTrue(heartbeat["tick_ok"], heartbeat["failing"])
         self.assertIn("CI unavailable", server.say.call_args.args[0])
 
-    def test_live_pilot_receipt_blocks_until_held_or_spent(self):
-        receipt = self.state / "pilot-doc-fix" / "task" / "receipt.json"
-        receipt.parent.mkdir(parents=True)
-        receipt.write_text(json.dumps({"phase": "waiting_for_owner_merge"}))
-        self.assertEqual(self.deploy(), self.start)
-        self.assertEqual(self.deploy(), self.start)
-        self.gate.assert_not_called()
-        self.server.say.assert_called_once()
-        self.assertIn("live pilot receipt", self.server.say.call_args.args[0])
-        for terminal in ("held", "spent", "healthy"):
-            with self.subTest(terminal=terminal):
-                tip = self.tip if terminal == "held" else self.publish(f"merge after {terminal}")
-                receipt.write_text(json.dumps({"phase": terminal}))
-                self.assertEqual(self.deploy(), tip)
-
-    def test_refusal_logs_once_per_tip_and_reason(self):
-        for status, conclusion in (("queued", None), ("completed", "failure"), ("queued", None)):
-            self.ci_state = (status, conclusion)
-            self.assertEqual(self.deploy(), self.start)
-        other = self.publish("second merge")
-        self.assertEqual(self.deploy(), self.start)
-        messages = [call.args[0] for call in self.server.say.call_args_list]
-        self.assertEqual([message.split(" left alone for ")[1] for message in messages],
-                         [f"{self.tip} (CI pending)", f"{self.tip} (CI failed)", f"{other} (CI pending)"])
-        self.ci_state = ("completed", "success")
-        self.assertEqual(self.deploy(), other)
-        self.assertIn(f"fast forwarded to {other} (second merge)", self.server.say.call_args.args[0])
-
     def test_origin_ref_moving_during_ci_is_rechecked(self):
         def pass_ci(*args, **kwargs):
             newer = self.publish("another merge")
@@ -562,6 +548,411 @@ class ServeDeploymentTests(unittest.TestCase):
         self.assertEqual(self.deploy(), self.start)
         self.gate.assert_called_once_with(self.repo.github, self.tip,
                                           required={"context": "deployment-check", "app_id": 17})
+
+
+class ServeDeploymentPilotTests(ServeDeploymentFixture):
+    def test_live_pilot_receipt_blocks_until_held_or_spent(self):
+        first_tip = self.publish("merged code")
+        receipt = self.state / "pilot-doc-fix" / "task" / "receipt.json"
+        receipt.parent.mkdir(parents=True)
+        receipt.write_text(json.dumps({"phase": "waiting_for_owner_merge"}))
+        self.assertEqual(self.deploy(), self.start)
+        self.assertEqual(self.deploy(), self.start)
+        self.gate.assert_not_called()
+        self.server.say.assert_called_once()
+        self.assertIn("live pilot receipt", self.server.say.call_args.args[0])
+        for terminal in ("held", "spent", "healthy"):
+            with self.subTest(terminal=terminal):
+                tip = first_tip if terminal == "held" else self.publish(f"merge after {terminal}")
+                receipt.write_text(json.dumps({"phase": terminal}))
+                self.assertEqual(self.deploy(), tip)
+
+
+class ServeDeploymentRefusalTests(ServeDeploymentFixture):
+    def test_refusal_logs_once_per_tip_and_reason(self):
+        tip = self.publish("merged code")
+        for status, conclusion in (("queued", None), ("completed", "failure"), ("queued", None)):
+            self.ci_state = (status, conclusion)
+            self.assertEqual(self.deploy(), self.start)
+        other = self.publish("second merge")
+        self.assertEqual(self.deploy(), self.start)
+        messages = [call.args[0] for call in self.server.say.call_args_list]
+        self.assertEqual([message.split(" left alone for ")[1] for message in messages],
+                         [f"{tip} (CI pending)", f"{tip} (CI failed)", f"{other} (CI pending)"])
+        self.ci_state = ("completed", "success")
+        self.assertEqual(self.deploy(), other)
+        self.assertIn(f"fast forwarded to {other} (second merge)", self.server.say.call_args.args[0])
+
+
+class ServeDeploymentMergeTests(ServeDeploymentFixture):
+    @unittest.skipUnless(sandbox.can_confine(False), "requires macOS sandbox-exec")
+    @unittest.skipIf(sandbox.can_confine(False) and sandbox.sandboxed(),
+                     "sandbox-exec cannot install a profile inside the test runner's sandbox")
+    def test_deploy_fast_forwards_engine_file_in_real_sandbox(self):
+        (self.writer / "arete" / "fixture.py").write_text("version = 2\n")
+        tip = self.publish("engine update")
+        self.git(self.checkout, "fetch", "-q", "origin", "main")
+        with self.assertRaisesRegex(RuntimeError, "Operation not permitted"):
+            util.git(["merge", "--ff-only", tip], self.checkout, retry=False)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.start)
+        self.assertEqual(self.deploy(), tip)
+        self.assertEqual((self.checkout / "arete" / "fixture.py").read_text(), "version = 2\n")
+        self.assertIn(f"fast forwarded to {tip} (engine update)", self.server.say.call_args.args[0])
+
+    def test_approved_deploy_skips_hooks_and_logs_once(self):
+        (self.writer / "arete" / "fixture.py").write_text("version = 2\n")
+        tip = self.publish("engine update")
+        hooks = self.state.parent / "hooks"
+        hooks.mkdir()
+        hook = hooks / "post-merge"
+        hook.write_text("#!/bin/sh\necho called > hook-ran\n")
+        hook.chmod(0o755)
+        self.git(self.checkout, "config", "core.hooksPath", str(hooks))
+
+        self.assertEqual(self.deploy(), tip)
+        self.assertEqual(self.deploy(), tip)
+        self.assertFalse((self.checkout / "hook-ran").exists())
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+        checkout = paths.short_path(self.checkout)
+        self.assertEqual([call.args[0] for call in self.server.say.call_args_list], [
+            f"deploy: {checkout} Git hooks disabled for fast forward to {tip}",
+            f"deploy: {checkout} fast forwarded to {tip} (engine update)",
+        ])
+
+    def test_approved_deploy_skips_default_hooks_without_logging(self):
+        (self.writer / "arete" / "fixture.py").write_text("version = 2\n")
+        tip = self.publish("engine update")
+        hooks = self.checkout / ".git" / "hooks"
+        hooks.mkdir(exist_ok=True)
+        hook = hooks / "post-merge"
+        hook.write_text("#!/bin/sh\necho called > hook-ran\n")
+        hook.chmod(0o755)
+
+        with mock.patch.dict("os.environ", {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}):
+            self.assertEqual(self.deploy(), tip)
+
+        self.assertFalse((self.checkout / "hook-ran").exists())
+        self.server.say.assert_called_once_with(
+            f"deploy: {paths.short_path(self.checkout)} fast forwarded to {tip} (engine update)")
+
+    def test_failed_fast_forward_restores_tracked_paths_and_retries(self):
+        package = self.writer / "arete"
+        (package / "fixture.py").write_text("version = 2\n")
+        (package / "new.py").write_text("added = True\n")
+        (package / "link").symlink_to("new.py")
+        (package / "filtered.txt").write_bytes(b"line one\nline two\n")
+        (self.writer / ".gitattributes").write_text("arete/filtered.txt text eol=crlf\n")
+        tip = self.publish("engine update")
+        untracked = self.checkout / "untracked.txt"
+        untracked.write_text("owner's file\n")
+        lock = self.checkout / ".git" / "refs" / "heads" / "main.lock"
+        lock.touch()
+        restore_paths = util.restore_deploy_paths
+
+        def restore(src, base, recovery):
+            self.assertEqual((src / "arete" / "fixture.py").read_text(), "version = 2\n")
+            self.assertTrue((src / "arete" / "new.py").is_file())
+            self.assertTrue((src / "arete" / "link").is_symlink())
+            self.assertEqual((src / "arete" / "filtered.txt").read_bytes(), b"line one\r\nline two\r\n")
+            return restore_paths(src, base, recovery)
+
+        try:
+            with mock.patch.object(util, "restore_deploy_paths", side_effect=restore) as restored:
+                self.assertEqual(self.deploy(), self.start)
+                restored.assert_called_once()
+        finally:
+            lock.unlink()
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "?? untracked.txt")
+        self.assertEqual((self.checkout / "arete" / "fixture.py").read_text(), "version = 1\n")
+        self.assertEqual(untracked.read_text(), "owner's file\n")
+        self.assertEqual(self.deploy(), tip)
+        messages = [call.args[0] for call in self.server.say.call_args_list]
+        restores = [message for message in messages if " recovery for " in message]
+        self.assertEqual(len(restores), 1, messages)
+        self.assertIn(f"recovery for {tip}", restores[0])
+        self.assertIn("main.lock", restores[0])
+        self.assertIn("remaining paths: ?? untracked.txt", restores[0])
+
+
+class ServeDeploymentRecoveryTests(ServeDeploymentFixture):
+    def test_interrupted_merge_removes_only_tip_additions_absent_before_the_merge(self):
+        additions = ("fresh [1].py", "filtered.txt", "pre-existing.py", "pre-existing-dir.py", "pre-existing-link")
+        content = "added = True\n"
+        for name in additions:
+            (self.writer / "arete" / name).write_text(content)
+        (self.writer / "arete" / "fresh-link").symlink_to("missing-target")
+        tip = self.publish("tip additions")
+        package = self.checkout / "arete"
+        (package / "pre-existing.py").write_text(content)
+        (package / "pre-existing-link").symlink_to("owner-target")
+        occupied = package / "pre-existing-dir.py"
+        occupied.mkdir()
+        (occupied / "keep").write_text("existing directory content")
+        unrelated = package / "unrelated.py"
+        unrelated.write_text(content)
+
+        def interrupt(src, checked_tip):
+            self.assertEqual((src, checked_tip), (self.checkout, tip))
+            (package / additions[0]).write_text(content)
+            (package / additions[1]).write_bytes(b"added = True\r\n")
+            (package / "fresh-link").symlink_to("missing-target")
+            self.assertEqual(self.git(src, "diff", "--cached", "--name-only"), "")
+            raise RuntimeError("interrupted before writing the index")
+
+        with mock.patch.object(util, "deploy_fast_forward", side_effect=interrupt):
+            self.assertEqual(self.deploy(), self.start)
+
+        self.assertFalse((package / additions[0]).exists())
+        self.assertFalse((package / additions[1]).exists())
+        self.assertFalse((package / "fresh-link").is_symlink())
+        self.assertEqual((package / "pre-existing.py").read_text(), content)
+        self.assertEqual((package / "pre-existing-link").readlink(), Path("owner-target"))
+        self.assertEqual((occupied / "keep").read_text(), "existing directory content")
+        self.assertEqual(unrelated.read_text(), content)
+        messages = [call.args[0] for call in self.server.say.call_args_list]
+        restores = [message for message in messages if " recovery for " in message]
+        self.assertEqual(len(restores), 1, messages)
+        self.assertIn(tip, restores[0])
+        self.assertIn("interrupted before writing the index", restores[0])
+        self.assertIn("?? arete/pre-existing-dir.py/keep", restores[0])
+        self.assertIn("?? arete/pre-existing-link", restores[0])
+
+    def test_partial_merge_restores_missing_and_truncated_paths_and_leaves_unrelated_paths(self):
+        (self.writer / "arete" / "fixture.py").write_text("version = 2\n")
+        (self.writer / "arete" / "shared.py").write_text("shared = 2\n")
+        tip = self.publish("engine update")
+
+        def interrupt(src, checked_tip):
+            self.assertEqual(checked_tip, tip)
+            package = src / "arete"
+            (package / "fixture.py").unlink()
+            (package / "shared.py").write_bytes(b"sha")
+            (package / "other.py").write_text("other = 'staged by owner'\n")
+            self.git(src, "add", "arete/other.py")
+            (package / "other.py").write_text("other = 'also edited by owner'\n")
+            raise RuntimeError("write interrupted")
+
+        with mock.patch.object(util, "deploy_fast_forward", side_effect=interrupt):
+            self.assertEqual(self.deploy(), self.start)
+
+        package = self.checkout / "arete"
+        self.assertEqual((package / "fixture.py").read_text(), "version = 1\n")
+        self.assertEqual((package / "shared.py").read_text(), "shared = 1\n")
+        self.assertEqual((package / "other.py").read_text(), "other = 'also edited by owner'\n")
+        self.assertEqual(self.git(self.checkout, "show", ":arete/other.py"), "other = 'staged by owner'")
+        [recovery] = [call.args[0] for call in self.server.say.call_args_list if " recovery for " in call.args[0]]
+        self.assertIn("remaining paths: MM arete/other.py", recovery)
+        with mock.patch.object(util, "deploy_fast_forward") as merge:
+            self.assertEqual(self.deploy(), self.start)
+            merge.assert_not_called()
+        self.assertIn(f"left alone for {tip} (dirty)", self.server.say.call_args.args[0])
+
+
+class DeployProcessTimeoutTests(unittest.TestCase):
+    def test_deploy_escalates_and_bounds_reaping_when_child_stays_running(self):
+        process = mock.MagicMock(pid=123, stdin=None)
+        shutdown = mock.Mock()
+        expired = subprocess.TimeoutExpired(["git"], 30)
+        process.communicate.side_effect = expired
+        process.wait = shutdown.wait
+        shutdown.wait.side_effect = subprocess.TimeoutExpired(["git"], 1)
+
+        with (mock.patch.object(subprocess, "Popen", return_value=process),
+              mock.patch.object(util.os, "killpg", shutdown.killpg),
+              self.assertRaisesRegex(util.DeployStillRunning, "could not confirm Git stopped")):
+            util.run_whole_tree(["git"], 30, None, graceful_timeout=True)
+
+        self.assertEqual(shutdown.mock_calls, [
+            mock.call.killpg(123, signal.SIGTERM),
+            mock.call.wait(timeout=util.DEPLOY_TERMINATION_GRACE),
+            mock.call.killpg(123, signal.SIGKILL),
+            mock.call.wait(timeout=util.DEPLOY_TERMINATION_GRACE),
+        ])
+        process.__exit__.assert_not_called()
+        process.stdout.close.assert_called_once_with()
+        process.stderr.close.assert_called_once_with()
+
+
+class ServeDeploymentTimeoutTests(ServeDeploymentFixture):
+    def test_killed_merge_recovers_partial_writes_and_its_leftover_lock(self):
+        self.check_killed_merge_lock(held=True)
+
+    def test_killed_merge_leaves_an_unproven_lock_in_place(self):
+        self.check_killed_merge_lock(held=False)
+
+    def check_killed_merge_lock(self, *, held):
+        (self.writer / "arete" / "fixture.py").write_text("version = 2\n")
+        (self.writer / "arete" / "fresh.py").write_text("added = True\n")
+        tip = self.publish("interrupted checkout")
+        script = self.state.parent / "interrupted-merge.py"
+        ready = self.state.parent / "merge-started"
+        script.write_text("""\
+import os
+import signal
+import sys
+from pathlib import Path
+
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+fd = os.open('.git/index.lock', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+os.write(fd, b'partial index')
+if sys.argv[1] == 'False':
+    os.close(fd)
+Path('arete/fixture.py').write_text('version = ')
+Path('arete/fresh.py').write_text('added = True\\n')
+Path(sys.argv[2]).touch()
+signal.pause()
+""")
+        package = self.checkout / "arete"
+        lock = self.checkout / ".git" / "index.lock"
+        protected_command = sandbox.protected_command
+        communicate = subprocess.Popen.communicate
+        merges = []
+
+        def substitute_merge(cmd, *args, **kwargs):
+            if "--ff-only" in cmd:
+                cmd = [sys.executable, str(script), str(held), str(ready)]
+            return protected_command(cmd, *args, **kwargs)
+
+        def expire_after_writes(proc, input=None, timeout=None):
+            if str(script) in proc.args:
+                merges.append(proc)
+                deadline = time.monotonic() + 5
+                while not ready.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists())
+                self.assertEqual(lock.read_bytes(), b"partial index")
+                self.assertEqual((package / "fixture.py").read_text(), "version = ")
+                timeout = 0
+            return communicate(proc, input=input, timeout=timeout)
+
+        with (mock.patch.object(sandbox, "protected_command", substitute_merge),
+              mock.patch.object(subprocess.Popen, "communicate", expire_after_writes)):
+            self.assertEqual(self.deploy(), self.start)
+
+        [merge] = merges
+        self.assertEqual(merge.returncode, -signal.SIGKILL)
+        [recovery] = [call.args[0] for call in self.server.say.call_args_list if " recovery for " in call.args[0]]
+        self.assertIn(f"recovery for {tip}", recovery)
+        self.assertIn("timed out", recovery)
+        if held:
+            self.assertFalse(lock.exists())
+            self.assertEqual((package / "fixture.py").read_text(), "version = 1\n")
+            self.assertFalse((package / "fresh.py").exists())
+            self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+            self.assertNotIn("remaining paths", recovery)
+        else:
+            self.assertEqual(lock.read_bytes(), b"partial index")
+            self.assertEqual((package / "fixture.py").read_text(), "version = ")
+            self.assertIn("Git index is locked", recovery)
+
+    def test_unconfirmed_merge_shutdown_skips_recovery(self):
+        (self.writer / "arete" / "fixture.py").write_text("version = 2\n")
+        tip = self.publish("engine update")
+        error = util.DeployStillRunning("could not confirm Git stopped after deploy timeout")
+        with (mock.patch.object(util, "deploy_fast_forward", side_effect=error),
+              mock.patch.object(self.server, "restore_deploy") as restore):
+            self.assertEqual(self.deploy(), self.start)
+
+        restore.assert_not_called()
+        self.assertIn(f"left alone for {tip} ({error})", self.server.say.call_args.args[0])
+
+    def test_timed_out_merge_releases_its_lock_and_retries(self):
+        (self.writer / "arete" / "fixture.py").write_text("version = 2\n")
+        (self.writer / "arete" / "fresh.py").write_text("added = True\n")
+        (self.writer / ".gitattributes").write_text("z-delayed.txt filter=delay\n")
+        (self.writer / "z-delayed.txt").write_text("tip content\n")
+        tip = self.publish("delayed checkout")
+        lock = self.checkout / ".git" / "index.lock"
+        ready = self.state.parent / "filter-started"
+        filter_code = "import pathlib, signal, sys; pathlib.Path(sys.argv[1]).touch(); signal.pause()"
+        self.git(self.checkout, "config", "filter.delay.smudge", shlex.join([sys.executable, "-c", filter_code,
+                                                                             str(ready)]))
+        self.git(self.checkout, "config", "filter.delay.required", "true")
+        self.git(self.checkout, "config", "checkout.workers", "1")
+        communicate, wait = subprocess.Popen.communicate, subprocess.Popen.wait
+        interrupted = False
+        cleanup_waits = []
+
+        def expire_while_git_holds_lock(proc, input=None, timeout=None):
+            nonlocal interrupted
+            if "--ff-only" in proc.args:
+                deadline = time.monotonic() + 5
+                while not ready.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists())
+                self.assertTrue(lock.exists())
+                self.assertTrue((self.checkout / "arete" / "fresh.py").is_file())
+                interrupted = True
+                timeout = 0
+            return communicate(proc, input=input, timeout=timeout)
+
+        def observe_cleanup(proc, timeout=None):
+            if interrupted and "--ff-only" in proc.args:
+                cleanup_waits.append(timeout)
+            return wait(proc, timeout=timeout)
+
+        with (mock.patch.object(subprocess.Popen, "communicate", expire_while_git_holds_lock),
+              mock.patch.object(subprocess.Popen, "wait", observe_cleanup)):
+            self.assertEqual(self.deploy(), self.start)
+        self.assertEqual(cleanup_waits, [util.DEPLOY_TERMINATION_GRACE] * 2)
+        self.assertFalse(lock.exists())
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+        [recovery] = [call.args[0] for call in self.server.say.call_args_list if " recovery for " in call.args[0]]
+        self.assertIn("timed out", recovery)
+
+        lock.write_text("another Git process")
+        self.assertEqual(self.deploy(), self.start)
+        self.assertEqual(lock.read_text(), "another Git process")
+        self.assertIn("Git index is locked", self.server.say.call_args_list[-2].args[0])
+        lock.unlink()
+        self.git(self.checkout, "config", "filter.delay.smudge", "cat")
+        self.assertEqual(self.deploy(), tip)
+
+
+class CommandConfinementTests(unittest.TestCase):
+    def test_only_deploy_merge_drops_the_engine_write_deny(self):
+        src = paths.PACKAGE_DIR.parent
+        tip = "a" * 40
+        recovery = util.DeployRecovery("b" * 40, (b"arete/util.py",), (b"arete/added.py",), (b"arete/added.py",))
+        with (mock.patch.object(sandbox, "can_confine", return_value=True),
+              mock.patch.object(sandbox, "sandboxed", return_value=False),
+              mock.patch.object(util, "_deploy_index_lock", return_value=src / "index.lock"),
+              mock.patch.object(util, "_deploy_path_mode", return_value=stat.S_IFREG),
+              mock.patch.object(util, "run_whole_tree", return_value=subprocess.CompletedProcess([], 0, "", ""))
+              as run):
+            util.sh(["true"], cwd=src)
+            util.git(["status"], src)
+            util.deploy_fast_forward(src, tip)
+            util._restore_deploy_tracked(src, recovery)
+            util._remove_deploy_additions(src, recovery)
+            worker = sandbox.write_confinement(src, [])
+
+        shell, git, deploy, restore, remove = (call.args[0] for call in run.call_args_list)
+        engine = f"ENGINE={sandbox.real_path(paths.PACKAGE_DIR)}"
+        deny_engine = '(deny file-write* (subpath (param "ENGINE")))'
+        for command in (shell, git, worker):
+            self.assertEqual(command[0], "/usr/bin/sandbox-exec")
+            self.assertIn(engine, command)
+            self.assertIn(f"RUNTIME={sandbox.real_path(sys.prefix)}", command)
+            profile = command[command.index("-p") + 1]
+            self.assertIn(deny_engine, profile)
+            self.assertIn('(deny file-write* (subpath (param "RUNTIME")))', profile)
+        profile_index = git.index("-p") + 1
+        engine_index = git.index(engine)
+        self.assertEqual(deploy[:deploy.index("-p") + 2], [
+            *git[:engine_index - 1], *git[engine_index + 1:profile_index], git[profile_index].replace(deny_engine, ""),
+        ])
+        self.assertEqual(deploy[-6:], ["merge", "-q", "--ff-only", "--no-autostash", "--no-overwrite-ignore", tip])
+        self.assertIn("core.hooksPath=/dev/null", deploy)
+        recovery_profile = git[profile_index].replace(
+            deny_engine, '(deny file-write* (require-all (subpath (param "ENGINE")) '
+                         '(require-not (literal (param "RESTORE0")))))',
+        )
+        for command, filename in ((restore, "util.py"), (remove, "added.py")):
+            self.assertIn(engine, command)
+            exception = f"RESTORE0={sandbox.real_path(paths.PACKAGE_DIR) / filename}"
+            self.assertEqual([arg for arg in command if arg.startswith("RESTORE")], [exception])
+            self.assertEqual(command[command.index("-p") + 1], recovery_profile)
 
 
 class DeploymentCiTests(unittest.TestCase):

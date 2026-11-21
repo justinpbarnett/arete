@@ -79,7 +79,7 @@ class Runner:
     def kill(self, process):
         try:
             os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
 
     def stop(self, *args):
