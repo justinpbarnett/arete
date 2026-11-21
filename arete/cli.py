@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
-from . import __version__, codebase, local_paths
-from .commands.arguments import Parser, status_arguments
-
 __all__ = ["main", "parser", "serve_line"]
+_serve_start_checked = False
 
 
 def serve_line(beat: dict) -> str:
@@ -22,6 +21,8 @@ class ShowVersion(argparse.Action):
         super().__init__(option_strings, dest, nargs=0, default=argparse.SUPPRESS, help="show the version and exit")
 
     def __call__(self, parser, namespace, values, option_string=None):
+        from . import __version__, codebase
+
         print(f"arete {__version__} {codebase.load()}")
         parser.exit()
 
@@ -29,6 +30,7 @@ class ShowVersion(argparse.Action):
 def parser() -> argparse.ArgumentParser:
     from . import pilot, zte
     from .commands import api, costs, hooks, lab, loops, records, research, runs, sessions, setup, tasks, verify_fault
+    from .commands.arguments import Parser
 
     ap = argparse.ArgumentParser(prog="arete", description="arete: agents that keep running and keep getting better", formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--version", action=ShowVersion)
@@ -39,6 +41,8 @@ def parser() -> argparse.ArgumentParser:
 
 
 def status_from_heartbeat(problem: SystemExit) -> int:
+    from . import codebase, local_paths
+
     _, state, isolated = local_paths.local_dirs(Path.home())
     print(problem, file=sys.stderr)
     try:
@@ -52,9 +56,25 @@ def status_from_heartbeat(problem: SystemExit) -> int:
     return 1
 
 
+def check_serve_start() -> None:
+    from . import local_paths, serve_guard
+
+    home = Path.home()
+    _, state, isolated = local_paths.local_dirs(home)
+    logs = Path(os.environ.get("ARETE_LOG_DIR", home / "Library" / "Logs" / "arete"
+                               if sys.platform == "darwin" and not isolated else state / "logs"))
+    serve_guard.startup(state, Path(__file__).resolve().parent.parent, logs)
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    if argv in (["serve"], ["serve", "--no-dashboard"]) and not _serve_start_checked:
+        check_serve_start()
+    from . import codebase
+
     if argv[:1] == ["status"]:
+        from .commands.arguments import Parser, status_arguments
+
         args = status_arguments(Parser(prog="arete status")).parse_args(argv[1:])
         try:
             codebase.load()

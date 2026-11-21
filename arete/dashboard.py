@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import secrets
 import sys
 import threading
 import time
@@ -85,6 +86,9 @@ SKIP_CHUNK = 1024 * 1024
 RUN_ID = re.compile(r"\w[\w.-]*")
 END_GRACE_SECONDS = 5
 INSTALL_SECONDS = 120
+READY_PATH = "/_arete/ready"
+READY_HEADER = "X-Arete-Readiness"
+READY_TOKEN = secrets.token_urlsafe(32)
 USAGE_KINDS = ("visit", "action")
 USAGE_DEVICES = ("desktop", "phone")
 USAGE_NEEDS = {"visit": ("view", "via"), "action": ("view", "name")}
@@ -321,6 +325,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(code, answer)
 
     def do_GET(self) -> None:
+        if (self.path == READY_PATH and self.server.inside_serve
+                and tailnet.host_name(self.headers.get("Host", "")) in self.server.node.names
+                and secrets.compare_digest(self.headers.get(READY_HEADER, "").encode(), READY_TOKEN.encode())):
+            try:
+                ready = api.meta()["schema"]["version"] >= foundation.NEEDED
+            except Exception:
+                ready = False
+            self.send(204 if ready else 503, b"", "text/plain", "no-store")
+            return
         self.answer("GET")
 
     def do_POST(self) -> None:

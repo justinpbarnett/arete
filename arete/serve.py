@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import stat
@@ -9,7 +10,8 @@ import time
 from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor, wait
-from dataclasses import dataclass
+from contextlib import closing
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import NoReturn, TextIO
@@ -40,11 +42,13 @@ from . import (
     record,
     routing,
     runner,
+    serve_guard,
     sessions,
     sources,
     store,
     tasks,
     tool_events,
+    tracker,
     util,
     webpush,
 )
@@ -80,7 +84,7 @@ IMPORT_CHECK = "import arete.cli, arete.serve, arete.dashboard, arete.loop_run; 
 CONFIG_CHECK = "from arete import config; config.load()"
 RESTARTED_FOR_NEW_CODE = "ARETE_SERVE_RESTARTED_FOR_NEW_CODE"
 SERVE_LOCK = "serve"
-SERVE_LOCK_FD = "ARETE_SERVE_LOCK_FD"
+SERVE_LOCK_FD = serve_guard.LOCK_FD
 ALERT_TICKS = 9
 ALERT_KEY = "serve:tick"
 ALERT_STAGES = ("tick", "tick:load", "stage:dispatch")
@@ -162,6 +166,8 @@ def code_stamp() -> frozenset:
 
 
 def deploy_refusal(src: Path, base: str, tip: str) -> str | None:
+    if serve_guard.hold_path(paths.STATE_DIR, tip).exists():
+        return "held after startup rollback"
     head = util.git(["rev-parse", "--verify", "HEAD"], src, timeout=10, retry=False).strip()
     if head == tip:
         return None
@@ -192,6 +198,57 @@ def pilot_deploy_refusal() -> str:
         if not isinstance(receipt, dict) or receipt.get("phase") not in ("held", "healthy", "spent"):
             return "live pilot receipt"
     return ""
+
+
+def dashboard_answers() -> bool:
+    server = util.read_json(paths.SERVER_FILE, {})
+    if (not isinstance(server, dict) or server.get("pid") != os.getpid() or server.get("engine") != codebase.STAMP
+            or server.get("scheme") not in ("http", "https") or not server.get("addresses")
+            or {k: server.get(k) for k in ("state", "config")} != paths.state_and_config()):
+        return False
+    try:
+        host, port = server["addresses"][0], server["port"]
+        conn = (util.NamedTlsConnection(host, port, server["host"], 2) if server["scheme"] == "https"
+                else http.client.HTTPConnection(host, port, timeout=2))
+        with closing(conn):
+            conn.request("GET", dashboard.READY_PATH, headers={dashboard.READY_HEADER: dashboard.READY_TOKEN})
+            with conn.getresponse() as response:
+                return response.status == 204 and response.getheader("X-Arete-Engine") == codebase.STAMP
+    except (OSError, http.client.HTTPException, IndexError, KeyError, TypeError, ValueError):
+        return False
+
+
+def report_rollbacks(src: Path, say: Callable[[str], None]) -> None:
+    holds = sorted((paths.STATE_DIR / serve_guard.HOLDS).glob("*.json"))
+    if not holds or not (head := codebase.checkout_head()):
+        return
+    for path in holds:
+        try:
+            held = serve_guard.read(path)
+            if (not held or held["checkout"] != str(src) or held.get("issue")
+                    or held["tip"][:12] == head):
+                continue
+            repo, tip, previous = held["github"], held["tip"], held["previous"]
+            if not all(serve_guard.SHA.fullmatch(sha) for sha in (tip, previous)):
+                continue
+            key = f"serve-rollback-{tip}"
+            body = (f"Arete rolled back self-deploy `{tip[:12]}` to `{previous[:12]}` because "
+                    f"{serve_guard.report_reason(held)}. Deploys of `{tip[:12]}` are held.\n\n"
+                    f"Failure types in the local serve.log tail: {serve_guard.report_log_types(held)}.")
+            issue = None
+            if held.get("report_started"):
+                issue = next((row["number"] for row in gh.recent_issues(repo, limit=20)
+                              if gh.key_mark(key) in (row.get("body") or "")), None)
+            else:
+                held["report_started"] = True
+                serve_guard.write(path, held)
+            if issue is None:
+                issue = gh.issue_create(repo, f"{tracker.ARETE_TAG} Serve self-deploy {tip[:12]} rolled back",
+                                        body, [tracker.LABEL, "bug"], key=key)
+            serve_guard.write(path, {**held, "issue": issue})
+            say(f"deploy: reported rollback of {tip} in {gh.issue_url(repo, issue)}")
+        except (OSError, RuntimeError, KeyError, TypeError, ValueError) as error:
+            say(f"deploy: could not report rollback: {util.first_line(str(error), 300)}")
 
 
 def reap_children() -> None:
@@ -249,6 +306,7 @@ class Server:
         self.oncall: Future | None = None
         self.deployment: Future | None = None
         self.deploy_at = time.monotonic() - DEPLOY_SECONDS
+        self.with_dashboard = True
         self.deploy_refusals: set[tuple[str, str]] = set()
         self.checkout_update = threading.Lock()
         self.zte_work: Future | None = None
@@ -354,14 +412,14 @@ class Server:
         self.config_good = True
         return True
 
-    def tick(self) -> None:
+    def tick(self) -> bool:
         if self.contracts_waiting:
             if not paths.DB_FILE.is_file() or not paths.DB_FILE.stat().st_size:
                 raise foundation.missing_database()
             self.contracts_waiting = foundation.migrate()
         foundation.ensure_schema()
         if not self.guard("tick:load", self.load) or self.code_problem:
-            return
+            return False
         self.guard("stage:reap", self.reap)
         states = self.guard("stage:states", loop_store.loop_states)
         if states is not None:
@@ -370,17 +428,19 @@ class Server:
                 self.guard(f"loop:{loop.name}", self.step_loop, loop, states.get(loop.name) or {}, now)
             self.settle("loop:", {x.name for x in self.live})
             self.loaded = True
-        self.guard("stage:forget", self.forget_unpolled_errors, self.live)
-        self.guard("stage:oncall", self.watch_oncall)
-        self.guard("stage:zte", self.zte_when_due)
-        self.guard("stage:dispatch", self.dispatch, {x.name: x for x in reversed(self.every_loop)})
-        self.guard("stage:approvals", self.approvals)
-        self.guard("stage:rotate", self.rotate_when_due)
-        self.guard("stage:prune", self.prune_when_due)
-        self.guard("stage:sweep", self.sweep_when_due)
-        self.guard("stage:asks", self.expire_asks)
-        self.guard("stage:closed", self.release_closed_when_due)
-        self.guard("stage:remind", self.remind)
+        stages = (
+            ("forget", self.forget_unpolled_errors, (self.live,)),
+            ("oncall", self.watch_oncall, ()), ("zte", self.zte_when_due, ()),
+            ("dispatch", self.dispatch, ({x.name: x for x in reversed(self.every_loop)},)),
+            ("approvals", self.approvals, ()), ("rotate", self.rotate_when_due, ()),
+            ("prune", self.prune_when_due, ()), ("sweep", self.sweep_when_due, ()),
+            ("asks", self.expire_asks, ()), ("closed", self.release_closed_when_due, ()),
+            ("remind", self.remind, ()),
+        )
+        for name, action, args in stages:
+            self.guard(f"stage:{name}", action, *args)
+        tick_stages = {"stage:reap", *(f"stage:{name}" for name, _, _ in stages)}
+        return states is not None and not any(key in tick_stages or key.startswith("loop:") for key in self.failing)
 
     def reap(self) -> None:
         for row in record.reap(tickets=False):
@@ -444,7 +504,8 @@ class Server:
                 self.guard("stage:code", self.load_new_code)
             finally:
                 self.checkout_update.release()
-        self.guard("tick", self.tick)
+        completed = self.guard("tick", self.tick)
+        self.guard("stage:deploy-health", self.acknowledge_deploy, completed)
         self.guard("stage:deploy", self.deploy_when_due)
         self.guard("stage:inherited", self.reap_inherited)
         self.ticks += 1
@@ -463,7 +524,24 @@ class Server:
         now = time.monotonic()
         if now - self.deploy_at >= DEPLOY_SECONDS and not self.config_problem:
             self.deploy_at = now
-            self.deployment = self.pool.submit(self.deploy, self.cfg)
+            self.deployment = self.pool.submit(self.deploy_if_ready, self.cfg)
+
+    def acknowledge_deploy(self, completed: bool) -> None:
+        receipt = serve_guard.pending(paths.STATE_DIR, paths.PACKAGE_DIR.parent)
+        if receipt is None or receipt.tip != codebase.RELEASE:
+            return
+        if completed and (not self.with_dashboard or dashboard_answers()):
+            serve_guard.write(paths.STATE_DIR / serve_guard.RECEIPT, asdict(replace(receipt, healthy=True)))
+            self.say(f"deploy: {receipt.tip} is healthy")
+        elif receipt.expired():
+            self.restart_for_new_code()
+
+    def deploy_if_ready(self, cfg: config.Config) -> None:
+        src = paths.PACKAGE_DIR.parent
+        report_rollbacks(src, self.say)
+        receipt = serve_guard.pending(paths.STATE_DIR, src)
+        if receipt is None or receipt.tip[:12] != codebase.checkout_head():
+            self.deploy(cfg)
 
     def deploy(self, cfg: config.Config) -> None:
         if not (repo := cfg.repo_for_path(paths.PACKAGE_DIR)):
@@ -497,9 +575,9 @@ class Server:
                 ):
                     self.deploy_refused(src, tip, reason)
                     return
-                self.deploy_tip(src, base, ref, tip)
+                self.deploy_tip(src, base, ref, tip, github)
 
-    def deploy_tip(self, src: Path, base: str, ref: str, tip: str) -> None:
+    def deploy_tip(self, src: Path, base: str, ref: str, tip: str, github: str) -> None:
         if util.git(["rev-parse", "--verify", ref], src, timeout=10, retry=False).strip() != tip:
             return
         if not self.deploy_ready(src, base, tip):
@@ -524,6 +602,8 @@ class Server:
                                   check=False, retry=False)
             if hooks_path.removesuffix("\0"):
                 self.say(f"deploy: {paths.short_path(src)} Git hooks disabled for fast forward to {tip}")
+            receipt = serve_guard.Receipt(str(src), base, recovery.head, tip, github, time.time())
+            serve_guard.write(paths.STATE_DIR / serve_guard.RECEIPT, asdict(receipt))
             try:
                 util.deploy_fast_forward(src, tip)
             except util.DeployStillRunning as error:
@@ -562,6 +642,8 @@ class Server:
             self.say(f"deploy: {paths.short_path(src)} left alone for {tip} ({reason})")
 
     def watch_alerts(self) -> None:
+        if foundation.deploy_pending():
+            return
         due = {k: v for k, v in self.failing.items()
                if v["ticks"] >= ALERT_TICKS and (k in ALERT_STAGES or k.startswith("loop:"))}
         self.alerted = {k: e for k, e in self.alerted.items() if k in self.failing}
@@ -897,6 +979,12 @@ class Server:
             return "a feedback request is still being checked or filed"
         return ""
 
+    def rollback_deploy(self, receipt: serve_guard.Receipt, reason: str) -> None:
+        if serve_guard.rollback(paths.STATE_DIR, paths.PACKAGE_DIR.parent, paths.LOG_DIR, receipt, reason):
+            self.code_problem = ""
+            if codebase.RELEASE == receipt.previous and codebase.head_and_dirt() == (receipt.previous[:12], False):
+                self.code = self.code_seen = code_stamp()
+
     def load_new_code(self) -> None:
         stamp = code_stamp()
         steady, self.code_seen = stamp == self.code_seen, stamp
@@ -904,17 +992,31 @@ class Server:
             self.code_problem = ""
         if stamp == self.code or not steady:
             return
+        receipt = serve_guard.pending(paths.STATE_DIR, paths.PACKAGE_DIR.parent)
+        deploying = receipt is not None and ("HEAD", receipt.tip[:12]) in stamp
+        if deploying and receipt.tip == codebase.RELEASE:
+            return
+        if deploying and receipt.expired():
+            self.rollback_deploy(receipt, serve_guard.AGE_FAILURE)
+            return
         entrypoint = f"import sys; sys.path.insert(0, {str(paths.PACKAGE_DIR.parent)!r}); "
         check = util.sh([sys.executable, "-I", "-c", entrypoint + IMPORT_CHECK], timeout=120)
         if check.returncode != 0:
-            self.note_once("new code does not import, so serve keeps the code it started with: "
-                           + util.last_line(check.stderr or check.stdout, 300))
+            problem = util.last_line(check.stderr or check.stdout, 300)
+            if deploying:
+                self.note_once("deploy: new code does not import: " + problem)
+                self.rollback_deploy(receipt, serve_guard.IMPORT_FAILURE)
+            else:
+                self.note_once("new code does not import, so serve keeps the code it started with: " + problem)
             return
         candidate = util.sh([sys.executable, "-I", "-c", entrypoint + CONFIG_CHECK], timeout=120)
         if candidate.returncode != 0 and not config.load_or_problem()[1]:
             self.code_problem = ("new code cannot read config.toml, so serve keeps the code it started with: "
                                  + util.last_line(candidate.stderr or candidate.stdout, 300))
             self.note_once(self.code_problem)
+            return
+        if deploying:
+            self.restart_for_new_code()
             return
         if stamp != self.migration_stamp:
             migrated = util.sh(control.command(["migrate", "--no-contracts"]), timeout=120)
@@ -924,6 +1026,9 @@ class Server:
         if self.migration_error:
             self.note_once("new code migration failed, so serve keeps its code: " + self.migration_error)
             return
+        self.restart_for_new_code()
+
+    def restart_for_new_code(self) -> None:
         if busy := self.busy_with():
             self.note_once(f"new code waits to load: {busy}")
             return
@@ -1039,6 +1144,7 @@ def run(with_dashboard: bool = True) -> NoReturn:
             server = Server()
             server.contracts_waiting = contracts_waiting
             server.lock = held
+            server.with_dashboard = with_dashboard
         except BaseException:
             held.close()
             raise

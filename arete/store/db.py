@@ -11,7 +11,7 @@ from contextlib import ExitStack, contextmanager, suppress
 from contextvars import ContextVar
 from pathlib import Path
 
-from .. import dbstats, paths, util
+from .. import codebase, dbstats, paths, serve_guard, util
 from . import migrations
 from .migrations import m0002_foundation_time_shape as time_shape
 
@@ -171,10 +171,37 @@ def execute_statements(conn, sql):
         conn.execute(pending)
 
 
+def rollback_catalogs():
+    if not codebase.RELEASE:
+        return
+    for file in (paths.STATE_DIR / serve_guard.HOLDS).glob("*.json"):
+        try:
+            hold = serve_guard.read(file)
+        except (OSError, ValueError):
+            continue
+        if (isinstance(hold, dict) and hold.get("previous") == codebase.RELEASE
+                and hold.get("checkout") == str(codebase.CHECKOUT)
+                and isinstance(hold.get("migrations"), dict)):
+            yield hold["migrations"]
+
+
+def pending_receipt():
+    receipt = serve_guard.pending(paths.STATE_DIR, codebase.CHECKOUT)
+    if receipt is not None and (receipt.tip == codebase.RELEASE
+                                or not codebase.RELEASE and receipt.tip[:12] == codebase.checkout_head()):
+        return receipt
+    return None
+
+
+def deploy_pending():
+    return pending_receipt() is not None
+
+
 def migrate(contracts=True):
     from .. import backup
 
     chain = migrations.load()
+    needed = max(m.n for m in chain if m.phase != "contract")
     paths.ensure_dirs()
     with util.lock("migrate", wait=True):
         refuse_empty_file()
@@ -182,7 +209,7 @@ def migrate(contracts=True):
         conn.row_factory = sqlite3.Row
         try:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            migrations.validate(conn, chain, version)
+            migrations.validate(conn, chain, version, rollback_catalogs())
             conn.close()
             conn = None
             snapshot = None
@@ -191,7 +218,8 @@ def migrate(contracts=True):
                 if migration.n <= version:
                     continue
                 if migration.phase == "contract":
-                    if not contracts:
+                    deploying = pending_receipt()
+                    if not contracts or deploying is not None and migration.n > needed:
                         return True
                     conn = connect_db(paths.DB_FILE)
                     conn.row_factory = sqlite3.Row
@@ -203,6 +231,12 @@ def migrate(contracts=True):
                     if blockers:
                         print(f"migration {migration.name} waits for {', '.join(blockers)}", flush=True)
                         return True
+                    if deploying is not None:
+                        serve_guard.settle(paths.STATE_DIR, deploying,
+                                           f"{migration.name} is a contract the candidate needs before its required schema")
+                        print(f"deploy: {deploying.tip[:12]} can no longer be rolled back because "
+                              f"{migration.name} is a contract the candidate needs before its required schema",
+                              flush=True)
                 if not started_chain:
                     if paths.DB_FILE.stat().st_size:
                         snapshot = backup.snapshot(f"m{migration.n}")

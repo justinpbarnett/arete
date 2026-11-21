@@ -1,3 +1,6 @@
+import ast
+import hashlib
+import http.client
 import json
 import shlex
 import shutil
@@ -12,11 +15,12 @@ import time
 import tomllib
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
+from contextlib import closing, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import asdict, replace
 from datetime import timedelta
 from io import StringIO
 from pathlib import Path
+from socket import socketpair
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from typing import ClassVar
@@ -24,9 +28,9 @@ from unittest import mock
 
 from adws import single_worker
 from arete import (
-    api_check, ci, config, diffguard, evals, factory, flows, gh, jev, journeys, loop_run, mergecheck, miner,
-    orchestration, outcomes, owner_asks, paths, pipeline, poll, queueing, runlimits, sandbox, serve, tracker, util,
-    verify, workspace,
+    api_check, ci, config, dashboard, diffguard, evals, factory, flows, gh, install, jev, journeys, loop_run,
+    mergecheck, miner, orchestration, outcomes, owner_asks, paths, pipeline, poll, principals, queueing, runlimits,
+    sandbox, serve, serve_guard, tailnet, tracker, util, verify, workspace,
 )
 from arete.agent import NO_SESSION, Result
 from arete.orchestration_api import OPERATIONS
@@ -2187,6 +2191,244 @@ class ServeDeploymentRefusalTests(ServeDeploymentFixture):
         self.ci_state = ("completed", "success")
         self.assertEqual(self.deploy(), other)
         self.assertIn(f"fast forwarded to {other} (second merge)", self.server.say.call_args.args[0])
+
+
+class SelfDeployRollbackTests(unittest.TestCase):
+    class_timeout = 5
+
+    def git(self, *args):
+        return subprocess.check_output(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+                                        "-c", "commit.gpgsign=false", *args], cwd=self.checkout,
+                                       text=True, timeout=2).strip()
+
+    def prepare_state(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.checkout = root / "checkout"
+        self.state = root / "state"
+        self.github = "fixture/arete"
+        self.ref = "refs/remotes/origin/main"
+        self.enterContext(mock.patch.multiple(paths, HOME=root, PACKAGE_DIR=self.checkout / "arete",
+                                             STATE_DIR=self.state, CONFIG_DIR=root / "config",
+                                             CONFIG_FILE=root / "config" / "config.toml",
+                                             LOCKS_DIR=self.state / "locks", DB_FILE=self.state / "arete.db",
+                                             RUNS_DIR=self.state / "runs", LOG_DIR=root / "logs",
+                                             WORKTREES_DIR=root / "worktrees", SERVER_FILE=self.state / "server.json",
+                                             ISOLATED=False))
+        self.server = object.__new__(serve.Server)
+        self.server.deploy_refusals = set()
+        self.server.say = mock.Mock()
+
+    def prepare_checkout(self, candidate):
+        self.prepare_state()
+        self.checkout.mkdir()
+        self.git("init", "-q", "-b", "main")
+        package = self.checkout / "arete"
+        package.mkdir()
+        (package / "__init__.py").write_text("")
+        (package / "cli.py").write_text("def main():\n    print('last good started')\n    return 0\n")
+        self.git("add", "arete")
+        self.git("commit", "-qm", "working entry point")
+        self.previous = self.git("rev-parse", "HEAD")
+        for name, body in candidate.items():
+            file = self.checkout / name
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_text(body)
+        self.git("add", "arete")
+        self.git("commit", "-qm", "new code", "--allow-empty")
+        self.tip = self.git("rev-parse", "HEAD")
+
+    def receipt(self):
+        return serve_guard.read(self.state / serve_guard.RECEIPT)
+
+    def write_receipt(self, **updates):
+        receipt = serve_guard.Receipt(str(self.checkout), "main", self.previous, self.tip, self.github, time.time(),
+                                      **updates)
+        serve_guard.write(self.state / serve_guard.RECEIPT, asdict(receipt))
+
+    def test_legacy_launcher_keeps_running_when_candidate_fails_import(self):
+        self.prepare_checkout({"arete/cli.py": "raise ImportError('broken deployment')\n"})
+        self.write_receipt()
+        self.server.code = frozenset({("HEAD", self.previous[:12])})
+        self.server.code_note = ""
+        self.assertFalse(install.serve_guard_file().exists())
+        with (mock.patch.multiple(serve.codebase, CHECKOUT=self.checkout, RELEASE=self.previous),
+              mock.patch.object(self.server, "restart_for_new_code") as restart,
+              redirect_stdout(StringIO()) as out):
+            self.server.code_seen = serve.code_stamp()
+            self.server.load_new_code()
+            self.server.load_new_code()
+        restart.assert_not_called()
+        self.assertIn("broken deployment", self.server.code_note)
+        self.assertIn(serve_guard.IMPORT_FAILURE, out.getvalue())
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.previous)
+        self.assertTrue(serve_guard.hold_path(self.state, self.tip).exists())
+
+    def test_launchd_rolls_back_three_import_failures_and_holds_the_tip(self):
+        token = "ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ"
+        password = "synthetic-password-that-must-stay-local"
+        self.prepare_checkout({"arete/__init__.py": f"raise ImportError('token={token} password={password}')\n"})
+        self.git("update-ref", self.ref, self.tip)
+        self.git("reset", "-q", "--hard", self.previous)
+        self.server.deploy_tip(self.checkout, "main", self.ref, self.tip, self.github)
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.tip)
+        install.write_serve_guard()
+        plist = install.serve_plist()
+        observed = self.receipt()
+        self.assertEqual((observed["previous"], observed["tip"], observed["starts"]),
+                         (self.previous, self.tip, 0))
+        serve_guard.write(self.state / serve_guard.RECEIPT, {**observed, "healthy": True, "starts": 3, "created_at": 0})
+        serve_guard.startup(self.state, self.checkout, paths.LOG_DIR)
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.tip)
+        self.assertEqual(self.receipt()["starts"], 3)
+        self.assertFalse(serve_guard.hold_path(self.state, self.tip).exists())
+        serve_guard.write(self.state / serve_guard.RECEIPT, observed)
+
+        def start():
+            return subprocess.run(plist["ProgramArguments"], cwd=self.state.parent,
+                                  env=plist["EnvironmentVariables"], capture_output=True, text=True, timeout=2)
+
+        log = Path(plist["StandardErrorPath"])
+        log.parent.mkdir(parents=True, exist_ok=True)
+        for starts in range(1, 4):
+            failed = start()
+            self.assertNotEqual(failed.returncode, 0, failed.stdout)
+            self.assertIn(f"ImportError: token={token} password={password}", failed.stderr)
+            log.write_text(failed.stderr)
+            self.assertEqual(self.receipt()["starts"], starts)
+        restored = start()
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        self.assertIn(f"deploy: rolled back to {self.previous} because 3 unhealthy starts", restored.stdout)
+        self.assertIn("last good started", restored.stdout)
+        self.server.deploy_tip(self.checkout, "main", self.ref, self.tip, self.github)
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.previous)
+        self.assertIn("held after startup rollback", self.server.say.call_args.args[0])
+
+        held = serve_guard.read(serve_guard.hold_path(self.state, self.tip))
+        self.assertIn(token, held["log_tail"])
+        with (mock.patch.object(serve.codebase, "CHECKOUT", self.checkout),
+              mock.patch.object(gh, "gh", return_value=f"https://github.com/{self.github}/issues/52") as issue):
+            serve.report_rollbacks(self.checkout, self.server.say)
+            serve.report_rollbacks(self.checkout, self.server.say)
+        issue.assert_called_once()
+        self.assertEqual(issue.call_args.args[0][-4:], ["--label", "agent", "--label", "bug"])
+        body = issue.call_args.kwargs["input"]
+        self.assertIn("Failure types in the local serve.log tail: ImportError.", body)
+        for secret in (token, password, str(self.checkout)):
+            self.assertNotIn(secret, body)
+
+    def test_headless_deploy_requires_dispatch_to_succeed(self):
+        self.prepare_state()
+        self.previous, self.tip = "1" * 40, "2" * 40
+        self.server.with_dashboard = False
+        cfg = config.Config()
+        with mock.patch.object(self.server, "deploy") as deploy:
+            self.server.deploy_if_ready(cfg)
+        deploy.assert_called_once_with(cfg)
+        self.write_receipt()
+
+        self.server.contracts_waiting = False
+        self.server.code_problem = ""
+        self.server.every_loop = self.server.live = []
+        self.server.failing, self.server.logged = {}, {}
+        actions = ("reap", "forget_unpolled_errors", "watch_oncall", "zte_when_due", "dispatch", "approvals",
+                   "rotate_when_due", "prune_when_due", "sweep_when_due", "expire_asks", "release_closed_when_due",
+                   "remind")
+        with (mock.patch.multiple(self.server, load=mock.Mock(return_value=True),
+                                  **{action: mock.DEFAULT for action in actions}) as stages,
+              mock.patch.object(db, "ensure_schema"),
+              mock.patch.object(serve.loop_store, "loop_states", return_value={}),
+              mock.patch.object(serve.codebase, "RELEASE", self.tip),
+              mock.patch.object(serve, "dashboard_answers") as probe):
+            stages["dispatch"].side_effect = RuntimeError("queue failure")
+            self.server.acknowledge_deploy(self.server.tick())
+            self.assertIn("stage:dispatch", self.server.failing)
+            self.assertFalse(self.receipt()["healthy"])
+            stages["dispatch"].side_effect = None
+            self.server.acknowledge_deploy(self.server.tick())
+            probe.assert_not_called()
+        self.assertTrue(self.receipt()["healthy"])
+
+    def test_rollback_recovers_migrated_database_and_dashboard_with_distinct_owner(self):
+        expansion = "CREATE TABLE deploy_fixture (value TEXT);"
+        contract = "DROP TABLE deploy_fixture;"
+        files = {f"m{db.LATEST + 1:04d}_foundation_deploy_fixture.py": ("expand", expansion),
+                 f"m{db.LATEST + 2:04d}_foundation_deploy_contract.py": ("contract", contract)}
+        source = {f"arete/store/migrations/{name}": f"PHASE = {phase!r}\nSQL = {sql!r}\n"
+                  for name, (phase, sql) in files.items()}
+        self.prepare_checkout(source)
+        chain = list(db._CHAIN)
+        self.enterContext(mock.patch.object(db.migrations, "load", return_value=db._CHAIN))
+        for name, (phase, sql) in files.items():
+            digest = hashlib.sha256(source[f"arete/store/migrations/{name}"].encode()).hexdigest()
+            chain.append(db.migrations.Migration(int(name[1:5]), name, "foundation", phase, digest, sql, None))
+        self.write_receipt(starts=3)
+        with redirect_stdout(StringIO()):
+            db.migrate()
+            with (mock.patch.object(db.migrations, "load", return_value=chain),
+                  mock.patch.multiple(serve.codebase, RELEASE=self.tip, CHECKOUT=self.checkout)):
+                self.assertTrue(db.migrate())
+        with db.tx() as conn:
+            conn.execute("INSERT INTO deploy_fixture VALUES ('candidate write')")
+        with mock.patch.multiple(serve.codebase, RELEASE=self.previous, CHECKOUT=self.checkout, STAMP=self.previous[:12]):
+            with self.assertRaises(db.migrations.Refused):
+                db.migrate()
+            with redirect_stdout(StringIO()):
+                self.assertTrue(serve_guard.count_start(self.state, self.checkout, paths.LOG_DIR))
+            self.assertFalse(db.migrate())
+            db.ensure_schema()
+            with db.tx() as conn:
+                self.assertEqual(conn.execute("SELECT value FROM deploy_fixture").fetchone()[0], "candidate write")
+                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], db.LATEST + 1)
+                conn.execute("INSERT INTO deploy_fixture VALUES ('restored write')")
+            self.assert_restored_dashboard()
+
+    def assert_restored_dashboard(self):
+        owner, host = "owner@example.test", "host@example.test"
+        principals.seed_owner(owner)
+        whois = mock.Mock(return_value=host)
+        address = "127.0.0.1"
+        node = tailnet.Node((address,), frozenset({address}), address)
+        logins = tailnet.Logins(SimpleNamespace(whois=whois))
+        server = SimpleNamespace(node=node, logins=logins, inside_serve=True)
+
+        def connect(conn):
+            browser, app = socketpair()
+            browser.settimeout(conn.timeout)
+
+            def handle():
+                with app:
+                    dashboard.Handler(app, (address, 0), server)
+
+            worker = threading.Thread(target=handle, daemon=True)
+            worker.start()
+            conn.sock = browser
+            self.addCleanup(worker.join, 1)
+
+        def get(path, headers):
+            with closing(http.client.HTTPConnection(address, 1234, timeout=1)) as conn:
+                conn.request("GET", path, headers=headers)
+                with conn.getresponse() as response:
+                    return response.status, json.load(response)
+
+        tailnet.record_server(node, 1234, tailnet.Front("http", []))
+        with mock.patch.object(http.client.HTTPConnection, "connect", connect):
+            self.assertTrue(serve.dashboard_answers())
+            self.assertEqual(get(dashboard.READY_PATH, {})[0], 403)
+            self.assertEqual(get("/api/meta", {dashboard.READY_HEADER: dashboard.READY_TOKEN})[0], 403)
+            whois.return_value = owner
+            logins.seen.clear()
+            status, body = get("/api/meta", {})
+            self.assertEqual(status, 200)
+            self.assertEqual(body["schema"]["version"], db.LATEST + 1)
+
+    def test_guard_imports_only_standard_library(self):
+        tree = ast.parse(Path(serve_guard.__file__).read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                self.assertTrue(all(alias.name.split(".")[0] in sys.stdlib_module_names for alias in node.names))
+            elif isinstance(node, ast.ImportFrom):
+                self.assertEqual(node.level, 0)
+                self.assertIn(node.module.split(".")[0], sys.stdlib_module_names)
 
 
 class ServeDeploymentMergeTests(ServeDeploymentFixture):
