@@ -29,45 +29,56 @@ from arete.agent import NO_SESSION, Result
 from arete.review import Review
 
 
-class ResolverScratchTests(unittest.TestCase):
+class ResolverScratchFixture(unittest.TestCase):
     MARKER = "arete-verification-scratch-v1\n"
     LOG = ".arete-sandbox/logs/db.log"
+    merge_fixture = None
 
     def setUp(self):
         self.enterContext(mock.patch.object(util, "repo_lock", return_value=nullcontext()))
 
-    def merge(self, log_changed_by=""):
-        self.root = Path(self.enterContext(TemporaryDirectory()))
-        self.git("init", "-q", "-b", "main")
-        self.git("config", "user.name", "Fixture")
-        self.git("config", "user.email", "fixture@example.test")
-        self.git("config", "commit.gpgsign", "false")
+    @classmethod
+    def create_merge(cls, root, log_changed_by=""):
+        def git(*args, check=True):
+            subprocess.run(["git", *args], cwd=root, check=check, capture_output=True, text=True)
+
+        git("init", "-q", "-b", "main")
+        git("config", "user.name", "Fixture")
+        git("config", "user.email", "fixture@example.test")
+        git("config", "commit.gpgsign", "false")
         scratch_ignore = ".arete-sandbox/.arete-owned" if log_changed_by else ".arete-sandbox/"
-        (self.root / ".gitignore").write_text(f"{scratch_ignore}\nignored.local\nproject/.arete-owned\nproject/private.local\n")
-        (self.root / "project").mkdir()
-        (self.root / "project/tracked.txt").write_text("untouched\n")
-        (self.root / "conflict.txt").write_text("original\n")
-        self.git("add", ".")
-        log = self.root / self.LOG
+        (root / ".gitignore").write_text(f"{scratch_ignore}\nignored.local\nproject/.arete-owned\nproject/private.local\n")
+        (root / "project").mkdir()
+        (root / "project/tracked.txt").write_text("untouched\n")
+        (root / "conflict.txt").write_text("original\n")
+        log = root / cls.LOG
         if log_changed_by:
-            self.write_log()
-            (log.parent.parent / ".arete-owned").write_text(self.MARKER)
-            self.git("add", self.LOG)
-        self.git("commit", "-qm", "original")
-        self.git("checkout", "-qb", "branch")
-        (self.root / "conflict.txt").write_text("branch\n")
-        (self.root / "supplemental.txt").write_text("branch addition\n")
+            log.parent.mkdir(parents=True)
+            log.write_text("verification ran\n")
+            (log.parent.parent / ".arete-owned").write_text(cls.MARKER)
+        git("add", ".")
+        git("commit", "-qm", "original")
+        git("checkout", "-qb", "branch")
+        (root / "conflict.txt").write_text("branch\n")
+        (root / "supplemental.txt").write_text("branch addition\n")
         if log_changed_by in ("branch", "both"):
             log.write_text("branch log\n")
-        self.git("add", ".")
-        self.git("commit", "-qm", "branch change")
-        self.git("checkout", "-q", "main")
-        (self.root / "conflict.txt").write_text("base\n")
+        git("add", ".")
+        git("commit", "-qm", "branch change")
+        git("checkout", "-q", "main")
+        (root / "conflict.txt").write_text("base\n")
         if log_changed_by in ("base", "both"):
             log.write_text("base log\n")
-        self.git("commit", "-qam", "base change")
-        self.git("checkout", "-q", "branch")
-        self.git("merge", "--no-commit", "main", check=False)
+        git("commit", "-qam", "base change")
+        git("checkout", "-q", "branch")
+        git("merge", "--no-commit", "main", check=False)
+
+    def merge(self, log_changed_by=""):
+        self.root = Path(self.enterContext(TemporaryDirectory()))
+        if self.merge_fixture is not None:
+            shutil.copytree(self.merge_fixture, self.root, dirs_exist_ok=True)
+        else:
+            self.create_merge(self.root, log_changed_by)
         self.conflicts = [self.LOG, "conflict.txt"] if log_changed_by == "both" else ["conflict.txt"]
         self.assertEqual(pipeline.unmerged_paths(self.root), self.conflicts)
         self.checkout = workspace.Checkout("", "fixture/repo", self.root, self.root, "main",
@@ -98,6 +109,13 @@ class ResolverScratchTests(unittest.TestCase):
         with self.assertRaises(workspace.RunFailed) as failed:
             self.resolve(edit)
         self.assertEqual(str(failed.exception), f"the resolver edited files outside the conflict in fixture/repo: {paths}")
+
+
+class ResolverScratchTests(ResolverScratchFixture):
+    @classmethod
+    def setUpClass(cls):
+        cls.merge_fixture = Path(cls.enterClassContext(TemporaryDirectory()))
+        cls.create_merge(cls.merge_fixture)
 
     def test_wrapper_scratch_stays_out_of_merge(self):
         self.merge()
@@ -180,6 +198,8 @@ class ResolverScratchTests(unittest.TestCase):
 
                 self.assert_outside_conflict(edit, "project/.arete-owned, project/private.local")
 
+
+class TrackedResolverScratchTests(ResolverScratchFixture):
     def test_tracked_supplemental_scratch_edits_stay_out_of_merge(self):
         for parent in ("branch", "base"):
             with self.subTest(parent=parent):
