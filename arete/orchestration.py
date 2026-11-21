@@ -4,6 +4,7 @@ import json
 import time
 from contextlib import contextmanager
 from dataclasses import asdict
+from math import inf
 from pathlib import Path
 
 from . import (
@@ -46,7 +47,7 @@ class Controller:
     def __init__(self, flow):
         self.flow, self.job = flow, flow.ctx
         self.run = self.job.run
-        self.workers, self.progress = {}, {}
+        self.workers, self.progress, self.reported = {}, {}, {}
         self.lease = ledger.acquire(self.run.id, flow.continues,
                                     {"protocol": PROTOCOL, "mode": self.run.path, "evidence": {}})
         self.data = ledger.snapshot(self.lease)["data"]
@@ -59,7 +60,7 @@ class Controller:
         self.run.step_overrides = {role: {**inherited.get(role, {}), **self.run.step_overrides.get(role, {})}
                                   for role in inherited.keys() | self.run.step_overrides.keys()}
         self.catalog = None
-        self.last_progress, self.ending = time.monotonic(), None
+        self.last_progress, self.ending = -inf, None
 
     def persist(self):
         self.data["job"] = {name: getattr(self.job, name) for name in STATE_FIELDS}
@@ -268,6 +269,7 @@ class Controller:
         snapshot = ledger.snapshot(self.lease)
         for worker in self.workers.values():
             self.progress[worker.action] = worker.observations()
+            self.reported[worker.action] = worker.report[0]
         return {"version": PROTOCOL, "state_version": snapshot["version"], "cursor": snapshot["version"],
                 "root": self.lease.root,
                 "task": self.catalog.read("task", 0, 8000), "owner_context": self.run.story[-8:],
@@ -416,6 +418,9 @@ class Controller:
                         self.run.budget.charge(message["step"], message["role"])
                     grant = self.run.launch_gate(message["step"], message["role"], message["route"]) \
                         if self.run.launch_gate else None
+                    seconds = grant.get("timeout") if isinstance(grant, dict) else None
+                    if type(seconds) in (int, float) and seconds > 0:
+                        worker.deadline = min(worker.deadline, time.monotonic() + seconds)
                     worker.allow(grant)
                 elif message.get("event") in ("result", "error"):
                     worker.close()
@@ -452,6 +457,42 @@ class Controller:
                                   "error": "worker ended without a durable result", "usage_unknown": True})
                 changed = True
         return changed
+
+    def wait_workers(self, timeout_seconds):
+        started = time.monotonic()
+        run_deadline = self.run.budget.run_deadline() if self.run.budget else inf
+        progress_at = self.last_progress + self.policy.progress_seconds
+        slept = False
+        while self.workers:
+            if time.monotonic() >= run_deadline:
+                raise runlimits.Parked(self.run.budget.reason())
+            if self.collect():
+                break
+            deadline = min(run_deadline, min(worker.deadline for worker in self.workers.values()))
+            if timeout_seconds and timeout_seconds < deadline - started:
+                deadline = started + timeout_seconds
+            now = time.monotonic()
+            if now >= run_deadline:
+                raise runlimits.Parked(self.run.budget.reason())
+            if now >= progress_at or now >= deadline:
+                reports = {}
+                for key, worker in self.workers.items():
+                    self.progress[key] = worker.observations()
+                    count, report = worker.report
+                    if count > self.reported.get(key, 0):
+                        reports[key] = report
+                        self.reported[key] = count
+                if reports:
+                    self.last_progress = now
+                    return {"active": list(self.workers), "progress": reports}
+                progress_at = now + 1
+            if now >= deadline:
+                return {"active": list(self.workers), "reason": "timeout" if slept else "deadline"}
+            delay = min(0.05, deadline - time.monotonic())
+            if delay > 0:
+                time.sleep(delay)
+                slept = True
+        return {"active": list(self.workers)}
 
     @contextmanager
     def selected(self, setting):
@@ -573,15 +614,7 @@ class Controller:
                 raise ValueError("invalid observation bounds")
             return self.observe(args["limit"], args["after"])
         if op == "run.wait":
-            until = time.monotonic() + args["timeout_seconds"]
-            while self.workers and time.monotonic() < until:
-                if self.collect():
-                    break
-                progress = {key: worker.observations() for key, worker in self.workers.items()}
-                if progress != self.progress and time.monotonic() - self.last_progress >= self.policy.progress_seconds:
-                    self.progress, self.last_progress = progress, time.monotonic()
-                time.sleep(0.05)
-            return {"active": list(self.workers)}
+            return self.wait_workers(args["timeout_seconds"])
         self.barrier()
         if op == "checks.run":
             self.data.setdefault("evidence", {}).pop("checks", None)
