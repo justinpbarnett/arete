@@ -66,17 +66,21 @@ def task_set_state(tid: str, new: str, from_states: tuple[str, ...] = (), base_v
                          expect=from_states, base_version=base_version) is not None
 
 
-def task_append_body(tid: str, body: str, section: str, *, base_version: int) -> bool:
+def task_append_comment(tid: str, body: str, *, base_version: int, title: str, description: str,
+                        needs_info: bool = False) -> bool:
     try:
         with writes.atomic() as c:
             row = writes.current(c, "tasks", tid)
-            if not row or (row["body"] or "") != body:
+            if not row or ((row["title"] or "").strip(), row["body"] or "(no description)") != (title, description):
                 return False
-            updated = writes.update("tasks", tid, {"body": body + section, "updated": util.iso()},
-                                    base_version=base_version, expect=("todo", "failed"))
+            ts = util.iso()
+            fields = {"state": "needs-info", "updated": ts} if needs_info else {"updated": ts}
+            if not writes.update("tasks", tid, fields, base_version=base_version, expect=("todo", "failed")):
+                return False
+            writes.insert("task_comments", {"task": tid, "author": "arete", "body": body, "ts": ts})
     except writes.VersionConflict:
         return False
-    return updated is not None
+    return True
 
 
 def task_comment(tid: str, author: str, body: str) -> bool:

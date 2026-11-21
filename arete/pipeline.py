@@ -455,10 +455,20 @@ class Run(AgentRun):
     answers_due: list[dict] = field(default_factory=list)
     base_note: str = ""
     kept_note: str = ""
+    parked_branch: str = ""
+    parked_context: tuple[str, str] | None = None
 
     @property
     def ref(self) -> str:
         return self.tracker.ref(self.tid)
+
+    def task_ticket(self) -> tracker.Ticket:
+        ticket = self.tracker.get(self.tid)
+        if self.parked_context:
+            spec, context = self.parked_context
+            if runlimits.specification(ticket) == spec:
+                return replace(ticket, comments="\n\n".join(part for part in (ticket.comments, context) if part))
+        return ticket
 
     @property
     def ab_ticket(self) -> tuple[str, str] | None:
@@ -1356,8 +1366,20 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 tk.require_ordinary(tid)
             budget_history = run_store.ticket_runs(repo.name, tid, limit=1)
             readmission = None if force else runlimits.Readmission.decode(launch_lease.readmission(repo.name, str(tid)))
+            readmitted_ticket = tk.get(tid) if readmission else None
+            standalone = bool(script and (script.only or script.action_only))
             blocked, reset_budget = runlimits.admission(repo, str(tid), tk, runlimits.Policy.of(layer), force,
-                                                       readmission=readmission)
+                                                       readmission=readmission, ticket=readmitted_ticket,
+                                                       standalone=standalone)
+            parked_branch, parked_context = "", None
+            if reset_budget:
+                parked_run, park = runlimits.latest_park(repo.name, str(tid), whole=not standalone)
+                parked_branch = runlimits.park_branch(parked_run, park)
+                if readmission and readmission.feedback:
+                    comment = runlimits.park_feedback(parked_run, park, readmitted_ticket)
+                    heading = ("Current acceptance criteria that add to the ticket body" if comment.number
+                               else "Owner's answer to the parked retry question")
+                    parked_context = runlimits.specification(readmitted_ticket), f"## {heading}\n\n{comment.body}"
         except tracker.ERRORS as e:
             print(f"could not read {name}: {e}")
             return 2
@@ -1459,6 +1481,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                       feedback=[] if mending or zte_grant else pending_feedback(repo.name, tid), repairs=mending,
                       answering=earlier if earlier and earlier["status"] == "needs-info" else {},
                       launch_gate=admission, launch_done=launch_done, closed_context=closed_context,
+                      parked_branch=parked_branch, parked_context=parked_context,
                 **(script.run_fields if script else {}))
             try:
                 with handoff_io():
@@ -1776,7 +1799,7 @@ def triage_block(approval: dict | None) -> str:
 def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, str]:
     repo, tk = run.repo, run.tracker
     try:
-        t = intake.route_ticket(cfg, repo, tk, tk.get(run.tid), dry_run=run.dry_run, log=run.log)
+        t = intake.route_ticket(cfg, repo, tk, run.task_ticket(), dry_run=run.dry_run, log=run.log)
     except tracker.ERRORS as e:
         return "failed", f"could not read {run.ref}: {e}", ""
     run_lines.write(run.id, "task", ticket=t.ref, kind=t.kind, repo=repo.name, title=t.title)
@@ -2791,7 +2814,8 @@ def images_note(images: tracker.SavedImages) -> str:
 
 
 def open_branch(run: Run) -> str:
-    return next((r["branch"] for r in run_store.open_runs(run.repo.name, run.tid) if r.get("branch")), "")
+    return run.parked_branch or next((
+        r["branch"] for r in run_store.open_runs(run.repo.name, run.tid) if r.get("branch")), "")
 
 
 def with_siblings(body: str, section: str) -> str:
@@ -2939,6 +2963,28 @@ def check_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
 
 def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "verify",
                 require_released: bool = False, **values) -> verify.Verified:
+    step = b.next_step(step_name)
+    record_attempt = step_name == prompt_name == role == "verify"
+    if record_attempt:
+        b.run.write_line("verification_start", step=step)
+    startup_failed = False
+    try:
+        verified = _use_product(b, step, prompt_name, role, require_released, **values)
+    except verify.ServerError as error:
+        startup_failed = True
+        b.run.log(f"{step}: the app did not start")
+        fault = verify.environment_fault(str(error))
+        verified = (verify.Verified("blocked", "The app could not start in the verifier's sandbox.",
+                                    blocked_by=f"the app could not start in the verifier's sandbox ({fault}); "
+                                               "the start log stays in the run folder", finished=False)
+                    if fault else verify.Verified("fail", f"The app did not start: {error}"))
+    if record_attempt:
+        b.run.write_line("verification_end", step=step, verdict=verified.verdict, startup_failed=startup_failed)
+    return verified
+
+
+def _use_product(b: TicketWork, step: str, prompt_name: str, role: str,
+                 require_released: bool, **values) -> verify.Verified:
     from . import pilot, readme_verify, zte
 
     run, configured = b.run, b.layer.verify
@@ -2947,7 +2993,6 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
     readme_task = (pilot.is_pilot_task(tid) and prompt_name == role == "verify") or zte_verify
     feature_map = configured.feature_map if prompt_name == role == "verify" and not readme_task else {}
     requested = journeys.requested(feature_map, b.ticket.title, b.ticket.body)
-    step = b.next_step(step_name)
     if unknown := [name for name in requested if name not in feature_map]:
         return save_verification(run, step, verify.Verified(
             "blocked", "An issue references a journey absent from the configured feature map.", finished=False,
@@ -3050,13 +3095,6 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
     except sandbox.ConfinementUnavailable as e:
         return verify.Verified("blocked", "Trusted fixture verification could not start.", finished=False,
                                blocked_by=util.first_line(str(e), 300))
-    except verify.ServerError as e:
-        run.log(f"{step}: the app did not start")
-        if fault := verify.environment_fault(str(e)):
-            return verify.Verified("blocked", "The app could not start in the verifier's sandbox.",
-                                   blocked_by=f"the app could not start in the verifier's sandbox ({fault}); "
-                                              "the start log stays in the run folder", finished=False)
-        return verify.Verified("fail", f"The app did not start: {e}")
     finally:
         try:
             if require_released and not lifetime["stopped"]:
@@ -3099,7 +3137,7 @@ def save_verification(run: Run, step: str, verified: verify.Verified) -> verify.
     verified.saved = os.path.abspath(run.dir / f"{step}.md")
     run.save(f"{step}.md", verified.markdown())
     run.save(f"{step}-outcome.json", {"verdict": verified.verdict, "checks": [
-        {name: check[name] for name in ("what", "passed", "cause", "retry_action") if name in check}
+        {name: check[name] for name in ("what", "passed", "cause", "retry_action", "criterion_ref") if name in check}
         for check in verified.checks]})
     run.log(f"{step}: {verified.verdict}, {len(verified.checks) - len(verified.failed_checks)} of "
             f"{util.count(len(verified.checks), 'check')} passed")

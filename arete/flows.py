@@ -652,7 +652,7 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
     cfg, run = job.cfg, job.run
     repo, tk = run.repo, run.tracker
     try:
-        t = intake.route_ticket(cfg, repo, tk, tk.get(run.tid), dry_run=run.dry_run, log=run.log)
+        t = intake.route_ticket(cfg, repo, tk, run.task_ticket(), dry_run=run.dry_run, log=run.log)
     except tracker.ERRORS as e:
         return end_as("stop", "quiet", status="failed", summary=f"could not read {run.ref}: {e}")
     opened(run, t)

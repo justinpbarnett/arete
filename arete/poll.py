@@ -108,7 +108,10 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
         if ordinary_history(tid):
             return tid, "revising the PR for your review comments"
     for source in ticket_queues(repo, tk):
-        for t in source.replied():
+        github = isinstance(source, tracker.GitHubTracker)
+        replies = (source.replied(park_spec_edited=lambda t: runlimits.parked_question_spec_edited(repo.name, t))
+                   if github else source.replied())
+        for t in replies:
             if not eligible_again(t.id):
                 continue
             if other_routes & set(t.labels):
@@ -117,7 +120,7 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
             if blocker := source.blocker(t.id):
                 skips.note(tracker.ticket_name(repo.name, t.ref), t, blocker, repo.name)
                 continue
-            return t.id, f"{t.title} (you replied to the question)"
+            return t.id, t.title if github else f"{t.title} (you replied to the question)"
     return (fresh.id, fresh.title) if fresh else None
 
 
@@ -271,8 +274,13 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: tuple[str, str], skip
             return "skipped"
     source = tracker.for_ticket(cfg, repo, tid)
     name = tracker.ticket_name(repo.name, source.ref(tid))
-    if isinstance(source, tracker.GitHubTracker) and source.in_zte_queue(str(tid)):
-        return "skipped"
+    ticket = source.get(tid) if isinstance(source, tracker.GitHubTracker) else None
+    if ticket:
+        if tracker.ZTE_LABEL in ticket.labels:
+            return "skipped"
+        if tracker.NO_AGENT in ticket.labels:
+            skips.note(name, ticket, tracker.NO_AGENT_HOLD, repo.name)
+            return "blocked"
     reply = tracker_reply(repo, source, str(tid), dry_run)
     answering = not reply and pipeline.answered_run(repo.name, str(tid)) is not None
     if not answering and not reply and (waiting := held_back(cfg, repo.name, going, slots)):
@@ -280,7 +288,7 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: tuple[str, str], skip
             source_store.pass_over(repo.name, str(tid))
         print(f"{util.iso()} {name}: waiting, {waiting}")
         return "held"
-    ticket = source.get(tid)
+    ticket = ticket or source.get(tid)
     blocked, readmission = runlimits.poll_admission(repo, str(tid), ticket, runlimits.Policy.of(layer))
     blocked = blocked or source.blocker(tid) or reply
     if not blocked:

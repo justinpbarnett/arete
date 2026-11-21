@@ -99,6 +99,7 @@ class Repo:
     layer: Path | None = None
     parts: list[Part] = field(default_factory=list)
     jev: bool = True
+    github_automation_logins: tuple[str, ...] = ()
 
     @property
     def layer_dir(self) -> Path:
@@ -1003,6 +1004,11 @@ def load(path: Path | None = None, strict: bool = False) -> Config:
         if tracker not in TRACKERS:
             raise ValueError(f"repo {r['name']}: tracker must be github, jira or local, not '{tracker}'")
         github = r.get("github", "")
+        automation = r.get("github_automation_logins", [])
+        if not isinstance(automation, list) or any(
+                not isinstance(login, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*(?:\[bot\])?", login)
+                for login in automation):
+            raise ValueError(f"repo {r['name']}: github_automation_logins must be a list of GitHub logins")
         parts = [Part(p["dir"].strip("/"), p["github"]) for p in r.get("part", [])]
         if parts and (github or tracker != "jira"):
             raise ValueError(f"repo {r['name']}: a repo with parts takes its github from each part and needs "
@@ -1021,6 +1027,7 @@ def load(path: Path | None = None, strict: bool = False) -> Config:
                 layer=paths.expand(r["layer"]) if r.get("layer") else None,
                 parts=parts or ([Part("", github)] if github else []),
                 jev=bool(r.get("jev", True)),
+                github_automation_logins=tuple(login.casefold() for login in automation),
             )
         )
     for j in data.get("job", []):
@@ -1133,6 +1140,9 @@ class Verify:
 
     def policy(self) -> dict:
         values = asdict(self)
+        for journey in values["feature_map"].values():
+            if not journey["tracker_criterion"]:
+                del journey["tracker_criterion"]
         for name in ("feature_map", "drivers"):
             if not values[name]:
                 del values[name]

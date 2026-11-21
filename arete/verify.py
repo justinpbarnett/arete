@@ -47,6 +47,7 @@ SCHEMA = {
                 "passed": {"type": "boolean"},
                 "cause": {"type": "string", "enum": ["change", "environment"]},
                 "retry_action": retry_findings.ACTION_SCHEMA,
+                "criterion_ref": retry_findings.REFERENCE_SCHEMA,
                 "screenshot": {"type": "string"},
             },
             "required": ["what", "how", "saw", "passed"],

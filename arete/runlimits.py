@@ -16,6 +16,7 @@ from pathlib import Path
 from . import budget_legacy, gh, paths, run_lines, util
 from .store import db as foundation
 from .store import runs as run_store
+from .tracker import NO_AGENT, NO_AGENT_HOLD, is_task_id
 
 IDLE_WAITS = ("limit", "slot")
 CHECKPOINT_SECONDS = 30
@@ -135,12 +136,16 @@ def heads(repo, branch: str) -> dict[str, str]:
     return {name: branch_head(src, branch) for name, src in checkouts(repo)}
 
 
-def latest_park(repo: str, tid: str) -> tuple[dict, dict]:
-    rows = run_store.ticket_runs(repo, tid, limit=1)
-    row = rows[0] if rows else {}
-    for rid in family(row["id"]) if row else ():
-        if saved := metadata(rid, "parked.json"):
-            return run_store.run_get(rid) or row, saved
+def latest_park(repo: str, tid: str, *, whole: bool = True) -> tuple[dict, dict]:
+    row = next(iter(run_store.ticket_runs(repo, tid, limit=1, live=True)), {})
+    while row:
+        for rid in family(row["id"]):
+            if saved := metadata(rid, "parked.json"):
+                return run_store.run_get(rid) or row, saved
+        if not whole or not row.get("only_step"):
+            break
+        whole = False
+        row = next(iter(run_store.ticket_runs(repo, tid, limit=1, whole=True, live=True)), {})
     return row, {}
 
 
@@ -155,6 +160,47 @@ def park_branch(row: dict, saved: dict) -> str:
 def inputs_changed(saved: dict, spec: str, policy: dict) -> bool:
     return (bool(saved.get("specification")) and saved["specification"] != spec
             or saved.get("policy") != policy)
+
+
+def newer(when: str, cutoff: str) -> bool:
+    try:
+        return util.parse_iso(when) > util.parse_iso(cutoff)
+    except (TypeError, ValueError):
+        return False
+
+
+def parked_at(row: dict, saved: dict) -> str:
+    return saved.get("parked_at") or row.get("finished") or ""
+
+
+def parked_question_spec_edited(repo: str, ticket) -> bool:
+    row, saved = latest_park(repo, ticket.id)
+    return bool(ticket.park_question and saved.get("specification")
+                and ticket.park_question.run_id == row["id"]
+                and saved["specification"] != specification(ticket))
+
+
+def park_feedback(row: dict, saved: dict, ticket):
+    if row.get("only_step") or saved.get("specification") != specification(ticket):
+        return None
+    cutoff = parked_at(row, saved)
+    question, answer = ticket.park_question, ticket.park_answer
+    if question and (question.run_id == row["id"] or newer(question.when, cutoff)):
+        return answer if answer and question.run_id == row["id"] and newer(answer.when, cutoff) else None
+    if ticket.retries:
+        retry = ticket.retries[-1]
+        if retry.run_id == row["id"] and newer(retry.when, cutoff):
+            return retry
+    return None
+
+
+def feedback_key(comment) -> str:
+    return readmission_key([comment.when, comment.body]) if comment else ""
+
+
+def automatic_hold(repo, ticket) -> str:
+    return (NO_AGENT_HOLD if repo.tracker == "github" and not is_task_id(ticket.id)
+            and NO_AGENT in ticket.labels else "")
 
 
 def readmission_key(value) -> str:
@@ -193,6 +239,7 @@ class Readmission:
     branch: str = ""
     origins: dict[str, str] = field(default_factory=dict)
     heads: dict[str, str] = field(default_factory=dict)
+    feedback: str = ""
 
     @classmethod
     def decode(cls, data: str) -> Readmission | None:
@@ -205,9 +252,12 @@ class Readmission:
 
     def matches(self, repo, row: dict, saved: dict, ticket, policy: Policy) -> bool:
         spec, limits = specification(ticket), asdict(policy)
-        if self.baseline != readmission_key(saved) or self.inputs != readmission_key([spec, limits]):
+        if (not ticket.open or automatic_hold(repo, ticket) or self.baseline != readmission_key(saved)
+                or self.inputs != readmission_key([spec, limits])):
             return False
         if not self.branch:
+            if self.feedback:
+                return self.feedback == feedback_key(park_feedback(row, saved, ticket))
             return inputs_changed(saved, spec, limits)
         names = {name for name, _ in checkouts(repo)}
         return (self.branch == park_branch(row, saved) and complete_heads(saved.get("heads"), names)
@@ -216,7 +266,10 @@ class Readmission:
 
     def attempted(self, *, record: bool = False) -> bool:
         attempts = metadata(self.run_id, "poll-readmissions.json")
-        key = readmission_key(asdict(self))
+        proof = asdict(self)
+        if not self.feedback:
+            del proof["feedback"]
+        key = readmission_key(proof)
         if key in attempts:
             return True
         if record:
@@ -225,8 +278,8 @@ class Readmission:
 
 
 def admission(repo, tid: str, tracker, policy: Policy, explicit: bool, *,
-              readmission: Readmission | None = None) -> tuple[str, bool]:
-    row, saved = latest_park(repo.name, tid)
+              readmission: Readmission | None = None, ticket=None, standalone: bool = False) -> tuple[str, bool]:
+    row, saved = latest_park(repo.name, tid, whole=not standalone)
     if not saved:
         return ("the parked run changed before launch", False) if readmission else ("", False)
     if explicit:
@@ -235,12 +288,15 @@ def admission(repo, tid: str, tracker, policy: Policy, explicit: bool, *,
             return "", True
         if isinstance(saved.get("heads"), dict) and saved["heads"] != heads(repo, park_branch(row, saved)):
             return "", True
-    if readmission and readmission.run_id == row["id"] and readmission.matches(repo, row, saved, tracker.get(tid), policy):
+    if (readmission and readmission.run_id == row["id"]
+            and readmission.matches(repo, row, saved, ticket or tracker.get(tid), policy)):
         return "", True
     return park_reason(row, saved), False
 
 
 def poll_admission(repo, tid: str, ticket, policy: Policy) -> tuple[str, Readmission | None]:
+    if hold := automatic_hold(repo, ticket):
+        return hold, None
     row, saved = latest_park(repo.name, tid)
     if not saved:
         return "", None
@@ -249,7 +305,9 @@ def poll_admission(repo, tid: str, ticket, policy: Policy) -> tuple[str, Readmis
     spec, limits = specification(ticket), asdict(policy)
     proof = Readmission(row["id"], readmission_key(saved), readmission_key([spec, limits]))
     try:
-        if inputs_changed(saved, spec, limits):
+        feedback = park_feedback(row, saved, ticket) if ticket.open else None
+        if feedback or inputs_changed(saved, spec, limits):
+            proof = replace(proof, feedback=feedback_key(feedback))
             if not proof.attempted():
                 return "", proof
             reason = tried
@@ -264,7 +322,7 @@ def poll_admission(repo, tid: str, ticket, policy: Policy) -> tuple[str, Readmis
             current = heads(repo, branch)
         if current == saved["heads"]:
             return reason, None
-        proof = replace(proof, branch=branch, origins=origins, heads=current)
+        proof = replace(proof, branch=branch, origins=origins, heads=current, feedback="")
         if proof.attempted():
             return tried, None
         return "", proof
@@ -554,7 +612,7 @@ class Budget:
 
     def park(self, reason: str, kept: dict | None = None) -> dict:
         row = run_store.run_get(self.run.id) or {}
-        branch = str(row.get("branch") or next((r.get("branch") for rid in self.parents
+        branch = str(row.get("branch") or getattr(self.run, "parked_branch", "") or next((r.get("branch") for rid in self.parents
                      if (r := run_store.run_get(rid)) and r.get("branch")), ""))
         try:
             published = heads(self.run.repo, branch)
@@ -564,6 +622,7 @@ class Budget:
                      if (r := run_store.run_get(rid)) and r.get("pr_url")), ""))
         util.write_json(artifact(self.run.id, "parked.json"), {
             "reason": reason, "charged": self.charged, "policy": asdict(self.policy), "specification": self.specification,
+            "parked_at": util.iso(),
             "heads": published, "branch": branch, "pr_url": pr_url, "kept": kept or {},
             "workspace": str(self.run.workspace[0]) if self.run.workspace else "", "retry": RETRY,
             **self.left_out_waits()})

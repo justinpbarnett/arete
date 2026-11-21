@@ -24,6 +24,7 @@ REVIEW_SCHEMA = {
                     "severity": {"type": "string", "enum": ["blocker", "major", "minor"]},
                     "category": {"type": "string", "enum": list(BLOCKER_CATEGORIES)},
                     "retry_action": retry_findings.ACTION_SCHEMA,
+                    "criterion_ref": retry_findings.REFERENCE_SCHEMA,
                 },
                 "required": ["problem", "severity"],
             },
@@ -165,15 +166,20 @@ def review_problems(listed) -> list[dict]:
              "severity": str(p.get("severity") or "unrated").strip().lower(),
              "category": str(p.get("category") or "").strip().lower()
              if str(p.get("category") or "").strip().lower() in BLOCKER_CATEGORIES else "",
-             **action_field(p)}
+             **retry_fields(p)}
             for p in listed if isinstance(p, dict)]
 
 
-def action_field(problem: dict) -> dict:
+def retry_fields(problem: dict) -> dict:
+    fields = {}
     key = retry_findings.action_key(problem)
-    return {"retry_action": key} if key else {}
+    if key:
+        fields["retry_action"] = key
+    if ref := retry_findings.reference(problem.get("criterion_ref")):
+        fields["criterion_ref"] = ref
+    return fields
 
 
 def reported(listed: list[dict]) -> list[dict]:
     return [{"file": p["file"], "text": p["problem"], "severity": p["severity"], "category": p.get("category") or "",
-             **action_field(p)} for p in listed]
+             **retry_fields(p)} for p in listed]
