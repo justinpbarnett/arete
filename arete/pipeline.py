@@ -16,14 +16,15 @@ import sys
 import time
 from collections import Counter
 from collections.abc import Callable, Iterator
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import TextIO
+from typing import BinaryIO, TextIO
 
 from . import (
+    _test_stacks,
     alerts,
     browser,
     ci,
@@ -1086,6 +1087,98 @@ def selected_checks(layer: config.RepoLayer, files: list[str]) -> set[str]:
     return selected or set(layer.checks)
 
 
+def shorten_timeout_name(name: str, room: int) -> str:
+    if len(name) <= room:
+        return name
+    head = (room - 3) // 2
+    tail = room - 3 - head
+    return f"{name[:head]}...{name[len(name) - tail:]}"
+
+
+def format_timeout_summary(details: object, redact: Callable[[str], str]) -> str:
+    match details:
+        case {"class_name": str(class_name), "count": int(count), "deadline": int() | float() as deadline,
+              "timings": list(timings)}:
+            pass
+        case _:
+            return ""
+
+    def redact_name(name: str) -> str:
+        return redact(name).encode(errors="replace").decode().replace("\r", "\\r").replace("\n", "\\n")
+
+    timed_names = []
+    for timing in timings[:5]:
+        match timing:
+            case [int() | float() as duration, str(name)]:
+                timed_names.append((redact(f"  {duration:.3f}s "), redact_name(name)))
+
+    identifier = redact_name(class_name)
+    metadata = f" ({count} tests)\nclass exceeded {deadline:g}s\n{len(timed_names)} timing rows"
+    if isinstance(never_started := details.get("never_started"), int):
+        metadata += f", {never_started} never started"
+    metadata = redact(metadata)
+    guidance = _test_stacks.TIMEOUT_REMEDIATION
+    room = _test_stacks.MAX_TIMEOUT_SUMMARY_CHARS - len(metadata) - len(guidance) - 1
+    if room < 3:
+        return ""
+    class_label = shorten_timeout_name(identifier, room)
+    timing_heading = "Slowest recorded tests:"
+    remaining = room - len(class_label) - len(timing_heading) - 1
+    if sum(len(prefix) + len(name) + 1 for prefix, name in timed_names) > remaining:
+        timed_names = [(prefix, name.removeprefix(f"{identifier}.")) for prefix, name in timed_names]
+
+    rows = []
+    for prefix, name in timed_names:
+        room = remaining - len(prefix) - 1
+        if room < 4:
+            break
+        rows.append(prefix + shorten_timeout_name(name, room))
+        remaining -= len(rows[-1]) + 1
+    timing_lines = (timing_heading, *rows) if rows else ()
+    summary = redact("\n".join((class_label + metadata, *timing_lines, guidance)))
+    return summary if len(summary) <= _test_stacks.MAX_TIMEOUT_SUMMARY_CHARS else ""
+
+
+def read_timeout_summaries(sidecar: BinaryIO, limit: int, redact: Callable[[str], str]) -> list[str]:
+    summaries = []
+    with suppress(OSError):
+        for line in sidecar:
+            if len(summaries) >= limit or not line.endswith(b"\n"):
+                break
+            try:
+                summary = format_timeout_summary(json.loads(line), redact)
+            except (ValueError, OverflowError, RecursionError):
+                continue
+            if summary:
+                summaries.append(summary)
+    return summaries
+
+
+class CheckReport(str):
+    baseline: str
+    summaries: tuple[str, ...]
+
+    def __new__(cls, baseline: str, summaries: tuple[str, ...] = ()) -> CheckReport:
+        report = super().__new__(cls, "\n\n".join((baseline, *summaries)))
+        report.baseline = baseline
+        report.summaries = summaries
+        return report
+
+
+def check_report_tail(report: str, limit: int) -> str:
+    if not isinstance(report, CheckReport):
+        return util.tail(report, limit)
+    parts = [util.tail(report.baseline, limit)]
+    remaining = limit - len(parts[0])
+    for summary in report.summaries:
+        size = len(summary) + 2
+        if size > remaining:
+            break
+        parts.append(summary)
+        remaining -= size
+    return "\n\n".join(parts)
+
+
 def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: AgentRun,
                timeout: float, *, selected: set[str] | None = None) -> tuple[bool, str]:
     commands = layer.checks
@@ -1099,21 +1192,33 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
     quick = [(name, commands[name]) for name in layer.quick_checks if name in commands]
     slow = [(name, command) for name, command in commands.items() if name not in layer.quick_checks]
     untracked_before = untracked_by_dir(git_dirs)
-    report, ok = [], True
+    report, diagnostics, ok = [], [], True
 
     def execute(items):
         nonlocal ok
         for name, cmd in items:
-            with record.timed(run.id, "check", name=name, command=cmd) as check:
-                res = environment.sh(cmd, run.config, run.repo, cwd=cwd, timeout=run.time_for(timeout))
-                check["exit"] = res.returncode
-            passed = res.returncode == 0
-            ok = ok and passed
-            run.log(f"check {name}: {'pass' if passed else f'FAIL (exit {res.returncode})'}")
-            if not passed:
-                report.append(f"### {name} failed: `{cmd}` exit {res.returncode}\n```\n{tail_of_both_streams(res.stdout, res.stderr, 6000)}\n```")
-            else:
-                report.append(f"### {name} passed: `{cmd}`")
+            with ExitStack() as cleanup:
+                sidecar = None
+                with suppress(OSError):
+                    sidecar = NamedTemporaryFile(dir=run.dir, prefix="check-timeouts-", delete=False)
+                    cleanup.callback(Path(sidecar.name).unlink, missing_ok=True)
+                    cleanup.enter_context(sidecar)
+                sets = {_test_stacks.SUMMARY_FILE_ENV: sidecar.name if sidecar else ""}
+                with record.timed(run.id, "check", name=name, command=cmd) as check:
+                    res, redact = environment.sh_with_redactor(
+                        cmd, run.config, run.repo, cwd=cwd, timeout=run.time_for(timeout),
+                        sets=sets,
+                    )
+                    check["exit"] = res.returncode
+                passed = res.returncode == 0
+                ok = ok and passed
+                run.log(f"check {name}: {'pass' if passed else f'FAIL (exit {res.returncode})'}")
+                if not passed:
+                    report.append(f"### {name} failed: `{cmd}` exit {res.returncode}\n```\n{tail_of_both_streams(res.stdout, res.stderr, 6000)}\n```")
+                    if sidecar and (remaining := _test_stacks.MAX_TIMEOUT_SUMMARY_CLASSES - len(diagnostics)):
+                        diagnostics.extend(read_timeout_summaries(sidecar, remaining, redact))
+                else:
+                    report.append(f"### {name} passed: `{cmd}`")
 
     try:
         with nullcontext() if layer.parallel_checks else check_lane(layer, run):
@@ -1128,7 +1233,8 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
     finally:
         for d, name in untracked_added_since(untracked_before):
             workspace.remove_untracked(d, name)
-    return ok, "\n\n".join(report)
+    baseline = "\n\n".join(report)
+    return ok, CheckReport(baseline, tuple(diagnostics)) if diagnostics else baseline
 
 
 class RetryNextPoll(Exception):
@@ -1357,7 +1463,7 @@ class Build(TicketWork):
         attempts, tries = 1, self.run.settings("check_repair").tries
         ok = self.check(after=after)
         while not ok and attempts < tries:
-            self.run.story.append(f"Checks failed on attempt {attempts}:\n{util.tail(self.report, 2500)}")
+            self.run.story.append(f"Checks failed on attempt {attempts}:\n{check_report_tail(self.report, 2500)}")
             attempts += 1
             self.resume(step_name(attempts),
                         prompt_loader.prompt("fix", attempt=attempts, max_attempts=tries, failures=self.report,
