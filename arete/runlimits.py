@@ -56,7 +56,13 @@ def metadata(run_id: str, name: str) -> dict:
     raise ValueError(f"run {run_id} has invalid {name}")
 
 
-def family(run_id: str) -> list[str]:
+def lineage_ids(run_id: str, ids) -> list[str]:
+    if not isinstance(ids, list) or any(not isinstance(rid, str) or not rid for rid in ids):
+        raise ValueError(f"run {run_id} has invalid budget lineage")
+    return ids
+
+
+def family(run_id: str, *, repairs: bool = False) -> list[str]:
     found, todo, dropped = [], [run_id] if run_id else [], set()
     while todo:
         rid = todo.pop()
@@ -67,15 +73,15 @@ def family(run_id: str) -> list[str]:
         found.append(rid)
         saved = metadata(rid, "budget.json")
         if saved:
-            if saved.get("version") != 1 or not isinstance(saved.get("parents"), list) or any(
-                    not isinstance(parent, str) or not parent for parent in saved["parents"]):
+            if saved.get("version") != 1:
                 raise ValueError(f"run {rid} has invalid budget lineage")
-            if "left_out" in saved:
-                if not isinstance(saved["left_out"], list) or any(
-                        not isinstance(left, str) or not left for left in saved["left_out"]):
-                    raise ValueError(f"run {rid} has invalid budget lineage")
-                dropped.update(saved["left_out"])
-            todo.extend(saved.get("parents", []))
+            parents = lineage_ids(rid, saved.get("parents"))
+            left = lineage_ids(rid, saved.get("left_out", []))
+            if repairs:
+                parents = lineage_ids(rid, saved.get("repair_parents", parents))
+                left = lineage_ids(rid, saved.get("repair_left_out", left))
+            dropped.update(left)
+            todo.extend(parents)
             continue
         for item in run_lines.read(rid):
             if item.get("event") == "repair" and item.get("source"):
@@ -154,9 +160,12 @@ def park_branch(row: dict, saved: dict) -> str:
     return str(saved.get("branch") or row.get("branch") or "")
 
 
+def specification_changed(saved: dict, spec: str) -> bool:
+    return bool(saved.get("specification")) and saved["specification"] != spec
+
+
 def inputs_changed(saved: dict, spec: str, policy: dict) -> bool:
-    return (bool(saved.get("specification")) and saved["specification"] != spec
-            or saved.get("policy") != policy)
+    return specification_changed(saved, spec) or saved.get("policy") != policy
 
 
 def readmission_key(value) -> str:
@@ -226,20 +235,28 @@ class Readmission:
         return False
 
 
+@dataclass(frozen=True)
+class Admission:
+    reason: str = ""
+    reset_time: bool = False
+    reset_repairs: bool = False
+
+
 def admission(repo, tid: str, tracker, policy: Policy, explicit: bool, *,
-              readmission: Readmission | None = None) -> tuple[str, bool]:
+              readmission: Readmission | None = None) -> Admission:
     row, saved = latest_park(repo.name, tid)
     if not saved:
-        return ("the parked run changed before launch", False) if readmission else ("", False)
+        return Admission("the parked run changed before launch" if readmission else "")
     if explicit:
         spec = specification(tracker.get(tid)) if saved.get("specification") else ""
         if inputs_changed(saved, spec, asdict(policy)):
-            return "", True
+            return Admission(reset_time=True, reset_repairs=True)
         if isinstance(saved.get("heads"), dict) and saved["heads"] != heads(repo, park_branch(row, saved)):
-            return "", True
-    if readmission and readmission.run_id == row["id"] and readmission.matches(repo, row, saved, tracker.get(tid), policy):
-        return "", True
-    return park_reason(row, saved), False
+            return Admission(reset_time=True, reset_repairs=True)
+    if (readmission and readmission.run_id == row["id"]
+            and readmission.matches(repo, row, saved, tracker.get(tid), policy)):
+        return Admission(reset_time=True, reset_repairs=True)
+    return Admission(park_reason(row, saved))
 
 
 def poll_admission(repo, tid: str, ticket, policy: Policy) -> tuple[str, Readmission | None]:
@@ -321,21 +338,28 @@ idle_waits = budget_legacy.idle_waits
 
 class Budget:
     def __init__(self, run, policy: Policy, previous: str, ticket=None, forced: bool = False,
-                 *, wall_deadline: float = math.inf, checkpoint_timeout: float | None = None,
-                 checkpoint_gate=None) -> None:
+                 *, repair_previous: str | None = None, answered_runs: tuple[str, ...] = (),
+                 wall_deadline: float = math.inf, checkpoint_timeout: float | None = None, checkpoint_gate=None) -> None:
         self.run, self.policy, self.wall_deadline = run, policy, wall_deadline
         self.checkpoint_timeout, self.checkpoint_gate = checkpoint_timeout, checkpoint_gate
         chain = family(previous)
-        rows = {rid: run_store.run_get(rid) for rid in chain}
+        repair_chain = family(previous if repair_previous is None else repair_previous, repairs=True)
+        rows = {rid: run_store.run_get(rid) for rid in dict.fromkeys(chain + repair_chain)}
         if any(row is None or (row["repo"], str(row["issue"])) != (run.repo.name, str(run.tid))
                for row in rows.values()):
             raise ValueError("the repair budget chain names a different or missing ticket run")
         current = specification(ticket) if ticket else None
         if run.environment_release or run.preview_of:
-            chain = [rid for rid in chain if not rows[rid]["dry_run"] and rows[rid]["status"] != "dry-run"]
-        left = [rid for rid in chain
-                if forced and current and (found := recorded_specification(rid)) and found != current]
-        left_repairs = sum(repair_count(rid) for rid in left)
+            live = {rid for rid, row in rows.items() if not row["dry_run"] and row["status"] != "dry-run"}
+            chain = [rid for rid in chain if rid in live]
+            repair_chain = [rid for rid in repair_chain if rid in live]
+        changed = {rid for rid in rows
+                   if forced and current and (found := recorded_specification(rid)) and found != current}
+        left = [rid for rid in chain if rid in changed]
+        answer_omitted = repair_chain if set(answered_runs).intersection(repair_chain) else []
+        self.repair_left_out = answer_omitted or [rid for rid in repair_chain if rid in changed]
+        self.repair_parents = [rid for rid in repair_chain if rid not in self.repair_left_out]
+        left_repairs = sum(repair_count(rid) for rid in self.repair_left_out if rid in changed)
         left_seconds = sum(active_seconds(rid, rows[rid]) for rid in left)
         left_verify = sum(verification_seconds(rid, rows[rid]) for rid in left)
         self.left_out = left
@@ -355,7 +379,7 @@ class Budget:
         self.lock = threading.RLock()
         self.watched = False
         self.verify_seconds = sum(verification_seconds(row["id"], row) for row in kept)
-        self.prior_repairs = sum(repair_count(rid) for rid in self.parents)
+        self.prior_repairs = sum(repair_count(rid) for rid in self.repair_parents)
         self.repair_calls = repair_count(run.id)
         self.current_verification_seconds = verification_seconds(run.id, own_row)
         self.verify_seconds += self.current_verification_seconds
@@ -367,16 +391,20 @@ class Budget:
         self.specification = current or next(
             (found for rid in self.parents if (found := recorded_specification(rid))), None)
         self.charged = {row["id"]: {
-            "run_minutes": round(active_seconds(row["id"], row) / 60, 1),
-            "verification_minutes": round(verification_seconds(row["id"], row) / 60, 1),
-            "repair_calls": repair_count(row["id"]), "estimate": row.get("measured_at") == ""
-        } for row in kept}
-        run_lines.write(run.id, "budget_chain", charged=self.charged)
+            "run_minutes": round(active_seconds(rid, row) / 60, 1) if rid in self.parents else 0,
+            "verification_minutes": round(verification_seconds(rid, row) / 60, 1) if rid in self.parents else 0,
+            "repair_calls": repair_count(rid) if rid in self.repair_parents else 0,
+            "estimate": row.get("measured_at") == ""
+        } for rid, row in rows.items() if rid in self.parents or rid in self.repair_parents}
+        self.persist()
+        omitted = ({"repair_left_out": answer_omitted, "reason": "owner answer"} if answer_omitted else {})
+        run_lines.write(run.id, "budget_chain", charged=self.charged, **omitted)
         run.log("budget chain: " + ("; ".join(
             f"{rid}: {v['run_minutes']:.1f} run minutes, {v['verification_minutes']:.1f} verification minutes, "
             f"{v['repair_calls']} repair calls" + (" (estimate)" if v["estimate"] else "")
-            for rid, v in self.charged.items()) or "no parents"))
-        self.persist()
+            for rid, v in self.charged.items()) or "no parents") +
+            (f"; left out of repair accounting because of an owner answer: {', '.join(answer_omitted)}"
+             if answer_omitted else ""))
         if left:
             run.log(f"budget: left out {util.count(left_repairs, 'earlier repair cycle')}, "
                     f"{left_seconds / 60:.1f} run minutes and {left_verify / 60:.1f} verification minutes of "
@@ -401,6 +429,7 @@ class Budget:
             verify_open = max(0, now - self.verify_started) if self.verify_started is not None else 0
             saved = {
                 "version": 1, "parents": self.parents, "left_out": self.left_out, "policy": asdict(self.policy),
+                "repair_parents": self.repair_parents, "repair_left_out": self.repair_left_out,
                 "specification": self.specification, **self.left_out_waits(now)}
             compatibility = getattr(self, "compatibility", True)
             try:
@@ -542,6 +571,11 @@ class Budget:
             if self.run_deadline() > time.monotonic():
                 self.arm()
 
+    def repair_limit_reason(self) -> str:
+        if self.prior_repairs + self.repair_calls >= self.policy.max_repair_cycles:
+            return f"the repair chain used its {self.policy.max_repair_cycles} repair cycles"
+        return ""
+
     def charge(self, step: str, role: str) -> None:
         if time.monotonic() >= self.run_deadline() or (self.verify_deadline is not None
                                                and time.monotonic() >= self.verify_deadline):
@@ -549,12 +583,11 @@ class Budget:
         if role not in REPAIRS and not step.startswith(REPAIR_NAMES):
             self.checkpoint()
             return
-        count = self.prior_repairs + self.repair_calls
-        if count >= self.policy.max_repair_cycles:
-            raise Parked(f"the repair chain used its {self.policy.max_repair_cycles} repair cycles")
+        if reason := self.repair_limit_reason():
+            raise Parked(reason)
         self.repair_calls += 1
         self.persist()
-        run_lines.write(self.run.id, "budget_repair", call=step, atom=role, used=count + 1)
+        run_lines.write(self.run.id, "budget_repair", call=step, atom=role, used=self.prior_repairs + self.repair_calls)
 
     def park(self, reason: str, kept: dict | None = None) -> dict:
         row = run_store.run_get(self.run.id) or {}

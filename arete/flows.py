@@ -589,10 +589,23 @@ class Job:
         return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
     def accepts(self, name: str, outcome: Outcome, kw: dict) -> bool:
+        if name == "revise" and not self.only and not self.includes_feedback(outcome.data):
+            self.run.log(f"{name}: pending PR feedback was absent from the saved outcome; rerunning is required")
+            return False
         if (expected := self.policy(name, kw)) and outcome.data.get("policy") != expected:
             self.run.log(f"{name}: stored evidence used a different policy; rerunning is required")
             return False
         return True
+
+    def includes_feedback(self, data: dict) -> bool:
+        feedback = self.run.feedback
+        if not feedback:
+            return True
+        if "feedback_keys" in data:
+            known = {tuple(key) for key in data["feedback_keys"]}
+            return all(pipeline.feedback_key(row) in known for row in feedback)
+        return (all(row.get("status") != "new" for row in feedback)
+                and data.get("plan") == revision_plan(pipeline.feedback_markdown(feedback)))
 
     def keeps(self, name: str, kw: dict) -> bool:
         return any(c.onto for c in self.checkouts) and (
@@ -683,7 +696,8 @@ class Job:
         self.committed = bool(data.get("committed", True))
         if stored:
             for c in self.picked(self.changed):
-                c.note_pushed_head(c.onto or util.git(["rev-parse", "HEAD"], c.wt).strip())
+                head = c.publication_baseline or c.onto or util.git(["rev-parse", "HEAD"], c.wt).strip()
+                c.note_pushed_head(head)
             if self.with_prs:
                 pipeline.note_prs(self.run, self.branch, self.with_prs)
 
@@ -953,6 +967,10 @@ def patch(flow: factory.Flow, tree: str) -> Outcome:
     }, session=job.run.sessions.get(BUILD, NO_SESSION))
 
 
+def revision_plan(feedback: str) -> str:
+    return f"Revise the open PR for the owner's feedback:\n\n{feedback}"
+
+
 @factory.step("revise")
 def revision(flow: factory.Flow, tree: str) -> Outcome:
     job: Job = flow.ctx
@@ -970,9 +988,10 @@ def revision(flow: factory.Flow, tree: str) -> Outcome:
     if pipeline.stage(job.checkouts, diffguard.denied_paths(layer)).empty:
         return end_as("stop", "unchanged", summary=summary, replies=replies)
     return Outcome("pass", data={
-        "plan": f"Revise the open PR for the owner's feedback:\n\n{feedback}", "left_for_a_person": left,
+        "plan": revision_plan(feedback), "left_for_a_person": left,
         "goal": ("Check each change the owner's feedback asks for, and that what the issue asks for still works.\n\n"
                  + feedback),
+        "feedback_keys": [pipeline.feedback_key(row) for row in run.feedback],
         "summary": summary, "replies": replies, "story": run.story}, session=run.sessions.get(BUILD, NO_SESSION))
 
 
