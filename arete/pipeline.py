@@ -766,18 +766,12 @@ def base_of_head(c: workspace.Checkout, head: str = "HEAD", *, check: bool = Tru
     return git(["merge-base", c.origin_base, head], c.wt, check=check).strip()
 
 
-def unpublished_base(c: workspace.Checkout) -> str:
+def has_unpublished_base(c: workspace.Checkout) -> bool:
     published = c.publication_baseline or c.onto
     if not published:
-        return ""
+        return False
     base = base_of_head(c, check=False)
-    if base and git(["merge-base", base, published], c.wt, check=False).strip() not in ("", base):
-        return base
-    return ""
-
-
-def limit_diff_from(c: workspace.Checkout, against: str) -> diffguard.Diff:
-    return diffguard.between(c.wt, "--cached", against, prefix=c.prefix, moves=True)
+    return bool(base) and git(["merge-base", base, published], c.wt, check=False).strip() not in ("", base)
 
 
 def comparison_label(c: workspace.Checkout, against: str, from_base: bool) -> str:
@@ -1071,19 +1065,19 @@ class Build(TicketWork):
             raise workspace.RunFailed(f"{after} {staged.refusal(self.layer.max_diff_lines)}")
         whole_diff = self.from_base if from_base is None else from_base
         counts, bases = staged, staged.bases
-        total = staged.lines
         earlier = 0
-        if any(unpublished_base(c) for c in self.checkouts):
+        if any(has_unpublished_base(c) for c in self.checkouts):
             whole_diff = True
             counts, bases, total = diffguard.Diff(), {}, 0
             for c in self.checkouts:
                 against = bases[c.github] = base_of_head(c)
-                diff = limit_diff_from(c, against)
+                diff = diffguard.between(c.wt, "--cached", against, prefix=c.prefix, moves=True)
                 counts += diff
                 total += diff.lines
-        elif not whole_diff:
-            earlier = self.committed_lines + sum(c.resolved_lines for c in self.checkouts)
-            total += earlier
+        else:
+            if not whole_diff:
+                earlier = self.committed_lines + sum(c.resolved_lines for c in self.checkouts)
+            total = staged.lines + earlier
         limit = self.layer.max_diff_lines
         if total > limit:
             comparisons = []
