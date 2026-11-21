@@ -14,6 +14,7 @@ from . import (
     factory,
     flows,
     gh,
+    journeys,
     owner_asks,
     pilot,
     pipeline,
@@ -31,6 +32,8 @@ from .store import asks as ask_store
 from .store import orchestration as ledger
 from .verify import Verified
 
+CI_FAILURES = "ci:failures"
+MAX_CI_FAILURE_CHARS = 24000
 STATE_FIELDS = ("plan_text", "goal", "estimate", "left_for_a_person", "build_summary", "reviews", "fix_reply",
                 "document", "report_body", "draft_why", "summary", "opened", "found", "pushed", "drafted",
                 "ci_stopped", "changed", "ci_result", "committed")
@@ -39,6 +42,8 @@ STATE_FIELDS = ("plan_text", "goal", "estimate", "left_for_a_person", "build_sum
 def policy_fingerprint(cfg, layer, closed_context):
     effective = asdict(layer)
     effective.pop("factory_path")
+    if layer.verify:
+        effective["verify"] = layer.verify.policy()
     return ledger.digest(json.loads(json.dumps({"layer": effective, "config": asdict(cfg),
                                                 "closed_context": closed_context}, default=str)))
 
@@ -205,6 +210,12 @@ class Controller:
             raise factory.Refused("the admitted catalog, controller or policy changed; reconcile before resuming")
         return found
 
+    def ci_failures(self, current):
+        logs = pipeline.run_folder(self.run, "ci")
+        notes = [pipeline.ci.failure_note(r, logs / f"publish-{i}-{prompt_loader.slug(r.label)}.log")
+                 for i, r in enumerate(current.reds, 1)]
+        return "\n\n".join(["## CI failures", "", current.summary(), *notes])
+
     def policy_sha(self):
         return policy_fingerprint(self.job.cfg, self.job.layer, self.run.closed_context)
 
@@ -265,6 +276,8 @@ class Controller:
             raise factory.Refused("publication was interrupted; reconcile its branch/PR effects before resuming")
         for gate, value in self.data.get("evidence", {}).items():
             self.catalog.add_context(f"evidence:{gate}", ledger.encoded(value))
+        if self.data.get("ci_failures"):
+            self.catalog.add_context(CI_FAILURES, self.data["ci_failures"])
         for action in ledger.actions(self.lease):
             run_lines.write(self.run.id, "action", action=action["id"], op=action["op"], state=action["state"],
                             recovered=True, source=action["run"])
@@ -341,7 +354,7 @@ class Controller:
             ledger.reject(self.lease, turn, error)
             self.data["error"] = error
             self.persist()
-            raise workspace.RunFailed(error)
+            raise workspace.RunFailed(error, recovery=result.get("recovery"))
         try:
             response = result.get("structured")
             if response is None:
@@ -383,7 +396,9 @@ class Controller:
         tools = tuple(tool for tool in BUNDLES[args["tool_bundle"]] if tool in setting.tools)
         if writing and not {"Write", "Edit"} & set(tools):
             raise ValueError("this role grants no implementation writing tools")
-        contexts = "\n\n".join(self.catalog.read(ref, 0, 8000)["text"] for ref in args["context_refs"])
+        contexts = "\n\n".join(self.catalog.read(ref, 0, 8000)["text"] for ref in args["context_refs"] if ref != CI_FAILURES)
+        if self.data.get("ci_failures") and (self.data.get("ci_failed") or CI_FAILURES in args["context_refs"]):
+            contexts = "\n\n".join(filter(None, (contexts, self.data["ci_failures"][:MAX_CI_FAILURE_CHARS])))
         if prior:
             contexts += "\n\nPrevious worker result:\n" + prior["result"].get("text", "")[:8000]
         goal = args["goal"]
@@ -394,6 +409,8 @@ class Controller:
         inputs = {"goal": goal, "context": contexts, "plan": self.job.plan_text, "checks": self.job.checks,
                   "denied": prompt_loader.code_list(diffguard.denied_paths(self.job.layer)),
                   "estimate": self.job.estimate, "verify": self.job.goal, "triage": self.job.triage, **args["inputs"]}
+        if name == "plan" and self.job.layer.verify:
+            inputs["journeys"] = journeys.guidance(self.job.layer.verify.feature_map, planning=True)
         if "verify" in args["inputs"] and pipeline.triage_checks(self.job.approval):
             inputs["verify"] = pipeline.triage_goal(str(inputs["verify"]), self.job.approval)
         prompt = self.job.brief.prompt("delegate" if name in ("delegate", "investigate") else name, **inputs)
@@ -440,8 +457,9 @@ class Controller:
                         workspace.note_made(self.job.ws, self.job.checkouts,
                                             pipeline.workspace_owner(self.run, self.job.ws, self.job.checkouts))
                         if why := workspace.kept_work(self.job.ws, self.job.checkouts, self.run.repo.path,
-                                                       self.job.layer.copy, commits=False):
-                            raise factory.Refused(why)
+                                                       self.job.layer.copy, commits=False,
+                                                       held=workspace.scratch_left(self.job.ws, self.job.checkouts)):
+                            raise workspace.worktree_failure(why, self.job.ws, self.job.branch)
                     ledger.transition(self.lease, key, "succeeded" if message.get("ok") else "failed", result)
                     self.catalog.add_context(key, message.get("text", message.get("error", "")))
                     if worker.writing:
@@ -550,11 +568,15 @@ class Controller:
             pipeline.publish_ci(self.run, self.job.ticket, self.job.with_prs, pipeline.ci.section([current], 1))
             if current.reds or not current.all_read:
                 self.data["ci_failed"] = True
+                self.data["ci_failures"] = self.ci_failures(current)
+                self.catalog.add_context(CI_FAILURES, self.data["ci_failures"])
                 for checkout in self.job.with_prs:
                     self.check_pilot_publication()
                     pipeline.set_draft(self.run, checkout, True)
-                return {"ci": self.job.ci_result, "error": "CI needs an explicit worker diagnosis or repair"}
+                return {"ci": self.job.ci_result, "failures": CI_FAILURES,
+                        "error": f"CI needs an explicit worker diagnosis or repair; its failure logs are context {CI_FAILURES}"}
             self.data.pop("ci_failed", None)
+            self.data.pop("ci_failures", None)
         self.check_pilot_publication()
         self.data["publication_intent"] = {"tree": self.fingerprint(), "phase": "publish"}
         self.persist()
@@ -582,6 +604,18 @@ class Controller:
                                   pipeline.config.load(), layer, ()), "the one-shot run changed its admitted policy")
             except pilot.Held as error:
                 raise runlimits.Parked(str(error)) from error
+
+    def failure_recovery(self):
+        actions = (action for action in ledger.actions(self.lease) if action["run"] == self.run.id)
+        for action in sorted(actions, key=lambda action: action["result"]["revision"], reverse=True):
+            op, result = action["op"], action["result"]
+            if op in ("worker.start", "worker.continue") and result.get("writing") is True:
+                return result.get("recovery") if action["state"] == "failed" and result.get("event") == "result" else None
+            if (op == "checks.run" and result.get("passed") is False
+                    or op == "verification.run" and result.get("verdict") == "fail"
+                    or op == "review.run" and result.get("verdict") == "request_changes"):
+                return None
+        return None
 
     def perform(self, action):
         args, op = action["request"], action["op"]
@@ -674,7 +708,8 @@ class Controller:
                     raise ValueError("noop cannot discard an implementation diff")
                 self.ending = flows.finish(self.flow, "nothing", summary=self.job.build_summary or "No change needed.")
             else:
-                self.ending = flows.finish(self.flow, "failed", why="the orchestrator stopped without delivery")
+                self.ending = flows.finish(self.flow, "failed", why="the orchestrator stopped without delivery",
+                                           recovery=self.failure_recovery())
             return {"reason": args["reason"]}
         raise ValueError("unknown orchestration operation")
 
@@ -806,7 +841,8 @@ def single_worker(flow):
                     controller.collect()
                     time.sleep(0.05)
                 if any(a["state"] in ("failed", "interrupted") for a in ledger.actions(controller.lease)):
-                    return flows.finish(flow, "failed", why="single-worker execution did not pass its required gates")
+                    return flows.finish(flow, "failed", why="single-worker execution did not pass its required gates",
+                                        recovery=controller.failure_recovery())
                 if controller.ending:
                     return controller.ending
         return flows.finish(flow, "failed", why="single-worker execution did not deliver")

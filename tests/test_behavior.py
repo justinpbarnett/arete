@@ -29,6 +29,24 @@ def setUpModule():
     support.isolate_live_state()
 
 
+class DashboardSnapshotTests(unittest.TestCase):
+    def test_event_client_surface(self):
+        web = Path(__file__).resolve().parents[1] / "arete" / "web"
+        source = (web / "ui-events.js").read_text() + (web / "ui-live.js").read_text()
+        for name in ("EventSource", "navigator.locks", "BroadcastChannel", "Last-Event-ID", "reset",
+                     "/api/v1/events", "timeout"):
+            self.assertIn(name, source)
+        for name in ("innerHTML", "insertAdjacentHTML", "eval"):
+            self.assertNotIn(name, source)
+
+    def test_snapshot_and_event_behavior(self):
+        result = subprocess.run(
+            ["node", str(Path(__file__).with_name("ui_events.mjs").resolve())],
+            capture_output=True, text=True, timeout=8, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
 class ApiCheckTests(unittest.TestCase):
     serial = True
     class_timeout = 20  # Hosted macOS reached streaming but exhausted the unit-test budget.

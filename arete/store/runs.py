@@ -17,12 +17,14 @@ TABLES = {
     "record_pins": "kept",
     "reports": "kept",
     "run_purges": "until file cleanup",
+    "environment_requeues": "kept",
 }
 
 
 OPEN_PR_RUN = "(runs.status = 'pr' OR (runs.status IN ('failed', 'stopped') AND runs.pr_url != ''))"
 
 WHOLE_RUN = "COALESCE(only_step, '') = ''"
+LIVE_RUN = "dry_run = 0 AND status != 'dry-run'"
 
 FIRINGS = ("(runs.kind = 'loop' AND runs.loop_kind = 'command' AND runs.status IN ('done', 'skipped') "
            "AND COALESCE(runs.cost_usd, 0) = 0)")
@@ -238,15 +240,60 @@ def runs_marked_running(connect=reader) -> list[dict]:
         return [dict(r) for r in c.execute("SELECT * FROM runs WHERE status = 'running' ORDER BY started")]
 
 
-def ticket_runs(repo: str, issue: int | str, limit: int = 10, connect=reader, whole: bool = False) -> list[dict]:
+def ticket_runs(repo: str, issue: int | str, limit: int = 10, connect=reader, whole: bool = False,
+                live: bool = False) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "
                                            + (f"AND {WHOLE_RUN} " if whole else "")
+                                           + (f"AND {LIVE_RUN} " if live else "")
                                            + "ORDER BY started DESC, rowid DESC LIMIT ?", (repo, issue, limit))]
 
 
 def newest_whole_run(repo: str, issue: int | str) -> dict | None:
     return next(iter(ticket_runs(repo, issue, limit=1, whole=True)), None)
+
+
+def newest_live_whole_run(repo: str, issue: int | str) -> dict | None:
+    return next(iter(ticket_runs(repo, issue, limit=1, whole=True, live=True)), None)
+
+
+def environment_requeue(run: dict, since: str) -> tuple[dict, int]:
+    with reader() as c:
+        entry = c.execute("SELECT * FROM environment_requeues WHERE run_id = ?", (run["id"],)).fetchone()
+        count = c.execute("SELECT COUNT(*) FROM environment_requeues WHERE repo = ? AND issue = ? "
+                          "AND attempted > ? AND requeued = 1 AND run_id != ?",
+                          (run["repo"], run["issue"], since, run["id"])).fetchone()
+        return dict(entry) if entry else {}, count[0]
+
+
+def unfinished_environment_requeues(repo: str) -> list[dict]:
+    with reader() as c:
+        return [dict(row) for row in c.execute(
+            "SELECT * FROM environment_requeues WHERE repo = ? "
+            "AND (edit_pending IS NOT NULL OR (requeued = 1 AND requeue_notified = 0)) ORDER BY issue, run_id", (repo,))]
+
+
+def start_requeue_edit(run: dict, at: str) -> None:
+    with db() as c:
+        c.execute("INSERT INTO environment_requeues (run_id, repo, issue, edit_pending) VALUES (?, ?, ?, ?) "
+                  "ON CONFLICT(run_id) DO UPDATE SET edit_pending = excluded.edit_pending WHERE requeued = 0",
+                  (run["id"], run["repo"], run["issue"], at))
+
+
+def settle_requeue_edit(run_id: str, confirmed_at: str | None = None) -> None:
+    with db() as c:
+        c.execute("UPDATE environment_requeues SET edit_pending = NULL, attempted = ?, requeued = ? "
+                  "WHERE run_id = ? AND edit_pending IS NOT NULL", (confirmed_at, int(confirmed_at is not None), run_id))
+
+
+def note_requeue_comment(run: dict, *, capped: bool = False) -> None:
+    with db() as c:
+        if capped:
+            c.execute("INSERT INTO environment_requeues (run_id, repo, issue, cap_notified) VALUES (?, ?, ?, 1) "
+                      "ON CONFLICT(run_id) DO UPDATE SET cap_notified = 1", (run["id"], run["repo"], run["issue"]))
+        else:
+            c.execute("UPDATE environment_requeues SET requeue_notified = 1 WHERE run_id = ? AND requeued = 1",
+                      (run["id"],))
 
 
 def ticket_runs_marked_running(repo: str, issue: int | str, connect=reader) -> list[dict]:
@@ -292,7 +339,7 @@ def interrupted_tickets(repo: str) -> list[str]:
     with reader() as c:
         rows = c.execute(f"SELECT issue, status FROM runs WHERE kind = 'pipeline' AND repo = ? AND {WHOLE_RUN} "
                          "AND rowid = (SELECT r2.rowid FROM runs r2 WHERE r2.kind = 'pipeline' "
-                         "AND r2.repo = runs.repo AND r2.issue = runs.issue AND COALESCE(r2.only_step, '') = '' "
+                         f"AND r2.repo = runs.repo AND r2.issue = runs.issue AND {WHOLE_RUN} AND {LIVE_RUN} "
                          "ORDER BY r2.started DESC, r2.rowid DESC LIMIT 1) "
                          "ORDER BY started, rowid", (repo,))
         return [str(r["issue"]) for r in rows if r["status"] == "interrupted"]
