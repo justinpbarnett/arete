@@ -24,13 +24,13 @@ from unittest import mock
 
 from adws import single_worker
 from arete import (
-    api_check, ci, config, diffguard, evals, factory, flows, gh, jev, journeys, loop_run, mergecheck, miner,
+    api_check, ci, codex, config, diffguard, evals, factory, flows, gh, jev, journeys, loop_run, mergecheck, miner,
     orchestration, outcomes, owner_asks, paths, pipeline, poll, queueing, runlimits, sandbox, serve, tracker, util,
     verify, workspace,
 )
 from arete.agent import NO_SESSION, Result
 from arete.orchestration_api import OPERATIONS
-from arete.review import Review
+from arete.review import Review, catch_up_problems
 from arete.store import db, orchestration as ledger
 from tests.parallel import stack_env
 
@@ -1187,13 +1187,17 @@ class FirstUseResolverScratchTests(SharedResolverScratchFixture):
 
 
 class CatchUpRepairFixture(PublicationFixture):
-    def prepare_publication(self, gate, *, spent=False, move_base_again=False):
+    def prepare_publication(self, gate, *, spent=False, move_base_again=False, conflict=False,
+                            implementation="implementation\n", resolution="resolved implementation\n", edit_base=None):
         c, b, controller = self.checkout, self.build, self.controller
         branch = "arete/7-edit-fixture"
         self.git("branch", branch)
         incoming = self.root / "incoming.txt"
         incoming.write_text("new base\n" * 100)
-        self.commit("base moved", "incoming.txt")
+        if conflict:
+            self.file.write_text(self.file.read_text().replace("base\n", "base implementation\n", 1))
+        extra = edit_base() if edit_base else ()
+        self.commit("base moved", "incoming.txt", "file.txt", *extra)
         self.base = self.git("rev-parse", "HEAD")
         next_base = ""
         if move_base_again:
@@ -1201,7 +1205,7 @@ class CatchUpRepairFixture(PublicationFixture):
             self.commit("base moved again", "incoming.txt")
             next_base = self.git("rev-parse", "HEAD")
         self.git("switch", "-q", branch)
-        self.file.write_text("implementation\n")
+        self.file.write_text(implementation)
         repo = config.Repo("fixture", self.root, github=c.github, parts=[config.Part("", c.github)])
         b.layer.trust_level, b.layer.verify, b.layer.checks = "automerge", config.Verify(), {"local": "check"}
         b.layer.max_diff_lines = 20
@@ -1232,7 +1236,8 @@ class CatchUpRepairFixture(PublicationFixture):
         self.pushes, self.ci_heads, self.labels, self.comments = [], [], set(), []
         self.message = {"checks": "local check output from the merged base",
                         "verify": "verification reproduced the bug on the merged base",
-                        "review": "review found a blocker specific to the merged base"}[gate]
+                        "review": "review found a blocker specific to the merged base",
+                        "unrelated": "the approved implementation has an unrelated problem"}[gate]
         fingerprints = {}
         git_fingerprint = factory.fingerprint
 
@@ -1245,7 +1250,7 @@ class CatchUpRepairFixture(PublicationFixture):
         self.enterContext(mock.patch.object(factory, "fingerprint", side_effect=fingerprint))
 
         def holds():
-            return incoming.exists() and self.file.read_text() == "implementation\n"
+            return incoming.exists() and self.file.read_text() == implementation
 
         def check(*_, **__):
             return (False, self.message) if gate == "checks" and holds() else (True, "local checks passed")
@@ -1257,14 +1262,31 @@ class CatchUpRepairFixture(PublicationFixture):
                 {"what": "fixture behavior", "how": "read fixture", "saw": summary, "passed": not failed}],
                 native_trees=pipeline.verification_trees(b) if trees is None else trees)
 
-        def review(*_, trees=None, **__):
-            if gate == "review" and holds():
-                result = {"verdict": "request_changes", "summary": "catch-up review holds", "problems": [
-                    {"file": "file.txt", "severity": "blocker", "category": "issue", "problem": self.message}]}
-            else:
-                result = {"verdict": "approve", "summary": "approved on the new base" if incoming.exists()
-                          else "pre-catch-up review"}
-            return Review.stored({**result, "trees": pipeline.verification_trees(b) if trees is None else trees})
+        real_review = pipeline._review
+
+        def review(*args, catch_up=None, **kwargs):
+            if catch_up is not None:
+                return real_review(*args, catch_up=catch_up, **kwargs)
+            return Review.judged({"summary": "approved on the new base", "problems": []}, [], [],
+                                 pipeline.verification_trees(b))
+
+        def review_answer(*_, **__):
+            problems = []
+            if gate in ("review", "unrelated") and holds():
+                finding = {"file": "file.txt", "severity": "blocker", "category": "issue", "problem": self.message}
+                if gate == "review":
+                    finding["attribution"] = {"part": "base", "file": "incoming.txt", "line": 1}
+                problems.append(finding)
+            return Result(ok=True, structured={"summary": "Reviewed the moved base.", "problems": problems})
+
+        self.review_agent = self.enterContext(mock.patch.object(run, "agent", side_effect=review_answer))
+
+        if conflict:
+            def resolve(*_):
+                self.file.write_text(resolution)
+                self.commit("Resolve fixture conflict")
+
+            self.enterContext(mock.patch.object(pipeline, "resolve_conflicts", side_effect=resolve))
 
         def git(args, cwd, **kw):
             if args[0] != "push":
@@ -1328,7 +1350,8 @@ class CatchUpRepairFixture(PublicationFixture):
             self.enterContext(mock.patch.multiple(module, **replacements))
         trees = pipeline.verification_trees(b)
         job.verified = verification(trees=trees)
-        job.review = review(trees=trees)
+        job.review = Review.judged({"summary": "pre-catch-up review", "problems": [
+            {"file": "file.txt", "severity": "minor", "problem": "Earlier approved note"}]}, [], [], trees)
         b.report = "local checks passed"
         b.checked = {"tree": trees[c.prefix], "commands": b.layer.checks, "report": b.report}
         with mock.patch.object(controller, "fingerprint", return_value=ledger.digest({c.github: trees[c.prefix]})):
@@ -1364,6 +1387,8 @@ class CatchUpRepairFixture(PublicationFixture):
         self.assertEqual(self.git("merge-base", candidate, self.base), self.base)
         self.assertEqual(self.git("merge-base", candidate, self.head), self.head)
         self.assertIn(f"held on {gate}", self.body)
+        if gate == "review":
+            self.assertIn("base change at incoming.txt:1 (after)", self.body)
         self.assertIn("Closes #7", self.body)
         self.assertIn("Keep this.", self.body)
         self.assertNotIn("pre-catch-up review", self.body)
@@ -1448,6 +1473,393 @@ class CatchUpRepairFixture(PublicationFixture):
 class CatchUpReviewRepairTests(CatchUpRepairFixture):
     def test_review_hold_repairs_and_automerge_closes_ticket(self):
         self.repair_and_publish("review", "review_repair")
+
+
+class CatchUpReviewTests(CatchUpRepairFixture):
+    def test_catch_up_requires_approval_for_the_pushed_tree(self):
+        self.record_pushed_head()
+        c = self.checkout
+        prior = Review("approve", trees={"": self.git("rev-parse", "origin/main^{tree}")})
+        push = mock.Mock()
+        with (mock.patch.object(pipeline, "merge_moved_bases") as merge,
+              self.assertRaisesRegex(workspace.RunFailed, "lacks a current approving review")):
+            pipeline.catch_up_base(self.build, c, "fixture", self.git("rev-parse", "origin/main"), "", "", prior,
+                                   before_push=push)
+        merge.assert_not_called()
+        push.assert_not_called()
+        self.assertEqual(self.git("rev-parse", "HEAD"), c.lease)
+
+    def test_prompt_includes_approval_and_separates_base_from_resolution(self):
+        self.prepare_publication("review", conflict=True)
+        prior_trees = self.controller.job.review.trees
+        self.review_agent.side_effect = None
+        self.review_agent.return_value = Result(ok=True, structured={
+            "summary": "The resolution lost behavior.",
+            "problems": [{"severity": "blocker", "category": "regression", "file": "file.txt",
+                          "problem": "The conflict resolution changed the output.",
+                          "attribution": {"part": "resolution", "file": "file.txt", "line": 1}}],
+        })
+        action = self.action_result("publication.request")
+        self.assertEqual(action["result"]["failures"], orchestration.CATCH_UP_FAILURE)
+        self.assertIn("resolution change at file.txt:1 (after)", self.body)
+        self.review_agent.assert_called_once()
+        prompt = self.review_agent.call_args.args[1]
+        approval, _, deltas = prompt.partition("## Approved diff")
+        self.assertIn(self.head, approval)
+        self.assertIn('"verdict": "approve"', approval)
+        self.assertIn("pre-catch-up review", approval)
+        self.assertIn("Earlier approved note", approval)
+        self.assertIn(prior_trees[""], approval)
+        approved, _, deltas = deltas.partition("## Base changes")
+        base, _, resolution = deltas.partition("## Conflict-resolution changes")
+        self.assertIn("\n+implementation\n", approved)
+        self.assertIn("\n+base implementation\n", base)
+        self.assertIn("\n+new base\n", base)
+        self.assertNotIn("resolved implementation", base)
+        self.assertIn("\n+resolved implementation\n", resolution)
+        self.assertNotIn("\n+new base\n", resolution)
+
+    def test_base_executable_bit_regression_holds_for_direct_and_dependent_citations(self):
+        self.git("config", "core.fileMode", "true")
+        helper = self.root / "helper tool"
+        helper.write_text("#!/bin/sh\nprintf 'worked\\n'\n")
+        helper.chmod(0o755)
+        self.commit("add executable helper", helper.name)
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+
+        def remove_executable_bit():
+            helper.chmod(0o644)
+            return (helper.name,)
+
+        def invoke_caller():
+            return subprocess.run(["/bin/sh", self.file.name], cwd=self.root, capture_output=True, text=True)
+
+        self.prepare_publication("review", implementation="exec './helper tool'\n", edit_base=remove_executable_bit)
+        self.assertEqual(invoke_caller().stdout, "worked\n")
+        mode = {"file": helper.name}
+        finding = {"file": "file.txt", "problem": "The helper gets permission denied.",
+                   "severity": "blocker", "category": "regression"}
+
+        def review(*_args, **_kwargs):
+            self.assertEqual(invoke_caller().returncode, 126)
+            return Result(ok=True, structured={"summary": "The caller stopped working.", "problems": [
+                {**finding, "attribution": {"part": "base", **mode}},
+                {**finding, "attribution": {"part": "approved", "file": "file.txt", "line": 1,
+                                            "base_change": mode, "dependency": "The caller executes the helper directly."}},
+            ]})
+
+        self.review_agent.side_effect = review
+        action = self.action_result("publication.request")
+        self.assertEqual(action["result"]["failures"], orchestration.CATCH_UP_FAILURE)
+        change = "base change at helper tool"
+        self.assertIn(f"permission denied. ({change})", self.body)
+        self.assertIn(f"approved change at file.txt:1 (after) depends on {change}", self.body)
+        self.assertEqual(len(self.pushes), 1)
+        self.assertFalse(self.merged)
+
+    def test_read_only_reviewer_can_cite_resolution_hunk_omitted_from_prompt(self):
+        context = "unchanged\n" * 8
+        remainder = f"{context}old middle\n{context}old last\n"
+        self.file.write_text("base\n" + remainder)
+        self.commit("add context")
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        padding = "x" * (pipeline.MAX_FIX_DIFF_IN_PROMPT // 2 + 100)
+        omitted = "resolver broke the middle output"
+        resolution = f"head {padding}\n{context}{omitted}\n{context}tail {padding}\n"
+        self.prepare_publication("review", conflict=True, implementation="implementation\n" + remainder,
+                                 resolution=resolution)
+        patch_path = None
+
+        def review(_step, prompt, cwd, *, allowed_tools, **_):
+            nonlocal patch_path
+            self.assertNotIn(omitted, prompt)
+            self.assertNotIn("--remerge-diff", prompt)
+            self.assertFalse(codex.writes(None, allowed_tools))
+            notice = "The resolution excerpt is truncated. Read the full patch at `"
+            self.assertIn(notice, prompt)
+            name = prompt.split(notice, 1)[1].split("`", 1)[0]
+            patch_path = cwd / name
+            command = ["cat", name]
+            self.assertEqual(codex.guard_reason({"tool_name": "Bash", "tool_input": {"command": command},
+                                                 "cwd": str(cwd)}, False, []), "")
+            patch = subprocess.run(command, cwd=cwd, check=True, capture_output=True, text=True).stdout
+            self.assertGreater(len(patch), pipeline.MAX_FIX_DIFF_IN_PROMPT)
+            self.assertEqual(patch.count("\n@@ "), 3)
+            self.assertIn(f"\n+{omitted}\n", patch)
+            return Result(ok=True, structured={"summary": "The resolution changed the middle output.", "problems": [
+                {"severity": "blocker", "category": "regression", "file": "file.txt", "problem": omitted,
+                 "attribution": {"part": "resolution", "file": "file.txt", "line": 10}},
+            ]})
+
+        self.review_agent.side_effect = review
+        action = self.action_result("publication.request")
+        self.assertEqual(action["result"].get("failures"), orchestration.CATCH_UP_FAILURE,
+                         self.build.run.log.call_args_list)
+        self.assertIn(f"{omitted} (resolution change at file.txt:10 (after))", self.body)
+        self.review_agent.assert_called_once()
+        self.assertFalse(patch_path.exists())
+        self.assertEqual(len(self.pushes), 1)
+        self.assertFalse(self.merged)
+
+    def test_unrelated_blocker_becomes_pr_note_and_merged_tree_is_approved(self):
+        self.prepare_publication("unrelated")
+        self.build.steps["review"] = 1
+        action = self.action_result("publication.request")
+        self.assertEqual(action["state"], "succeeded")
+        self.assertTrue(self.merged)
+        self.assertEqual(self.ci_heads, self.pushes)
+        self.assertEqual(len(self.pushes), 2)
+        self.assertNotEqual(self.git("rev-parse", f"{self.pushes[0]}^{{tree}}"), self.git("rev-parse", "HEAD^{tree}"))
+        review = self.controller.job.review
+        self.assertTrue(review.approved())
+        self.assertEqual(review.trees, {"": self.git("rev-parse", "HEAD^{tree}")})
+        self.assertIn(f"{self.message} (found on catch-up)", self.body)
+        self.assertIn("### Review notes", self.body)
+        self.assertIn("Keep this.", self.body)
+        self.review_agent.assert_called_once()
+        self.assertEqual(self.review_agent.call_args.args[0], "review2")
+        self.assertEqual(self.review_agent.call_args.kwargs["role"], "review")
+        self.assertEqual(self.build.steps["review"], 2)
+
+
+class CatchUpReviewSafetyTests(CatchUpRepairFixture):
+    def prepare_renamed_helpers(self):
+        renames = {"base": ("base helper.txt", "moved helper.txt"),
+                   "resolution": ("resolution helper.txt", "resolved\thelper.txt")}
+        for part, (old, _) in renames.items():
+            (self.root / old).write_text(f"{part} helper behavior\n")
+        self.commit("add helpers", *(old for old, _ in renames.values()))
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+
+        def rename(part):
+            old, new = renames[part]
+            (self.root / old).rename(self.root / new)
+            return old, new
+
+        implementation = 'load("base helper.txt", "resolution helper.txt")\n'
+        self.prepare_publication("review", conflict=True, implementation=implementation, resolution=implementation,
+                                 edit_base=lambda: rename("base"))
+        resolve = pipeline.resolve_conflicts
+
+        def resolve_with_rename(*args):
+            self.git("add", "--", *rename("resolution"))
+            resolve(*args)
+
+        self.enterContext(mock.patch.object(pipeline, "resolve_conflicts", side_effect=resolve_with_rename))
+        return renames
+
+    def test_rename_only_changes_hold_for_direct_and_dependent_citations(self):
+        renames = self.prepare_renamed_helpers()
+        caller = {"part": "approved", "file": "file.txt", "line": 1,
+                  "dependency": "The approved caller still loads the old path."}
+
+        def review(_step, prompt, _cwd, **_):
+            self.assertIn("similarity index 100%\nrename from base helper.txt\nrename to moved helper.txt", prompt)
+            self.assertIn('similarity index 100%\nrename from resolution helper.txt\nrename to "resolved\\thelper.txt"',
+                          prompt)
+            finding = {"file": "file.txt", "severity": "blocker", "category": "regression"}
+            problems = [{**finding, "problem": f"Direct {part} rename finding.",
+                         "attribution": {"part": part, "file": new}} for part, (_, new) in renames.items()]
+            problems.append({**finding, "problem": "Dependent base rename finding.",
+                             "attribution": {**caller, "base_change": {"file": renames["base"][0]}}})
+            return Result(ok=True, structured={"summary": "The old paths no longer resolve.", "problems": problems})
+
+        self.review_agent.side_effect = review
+        action = self.action_result("publication.request")
+        self.assertEqual(action["result"].get("failures"), orchestration.CATCH_UP_FAILURE)
+        for part, (_, new) in renames.items():
+            self.assertIn(f"Direct {part} rename finding. ({part} change at {new})", self.body)
+        self.assertIn("Dependent base rename finding. (approved change at file.txt:1 (after) "
+                      "depends on base change at base helper.txt", self.body)
+        self.assertEqual(len(self.pushes), 1)
+        self.assertFalse(self.merged)
+
+    def test_incorrect_rename_citations_become_pr_notes(self):
+        renames = self.prepare_renamed_helpers()
+        base, resolution = renames["base"][1], renames["resolution"][1]
+        caller = {"part": "approved", "file": "file.txt", "line": 1, "dependency": "The caller uses the helper."}
+        citations = [
+            {"part": "base", "file": resolution},
+            {"part": "resolution", "file": base},
+            {**caller, "base_change": {"file": resolution}},
+        ]
+        self.review_agent.side_effect = None
+        self.review_agent.return_value = Result(ok=True, structured={
+            "summary": "Checked the rename citations.",
+            "problems": [{"file": "file.txt", "severity": "blocker", "category": "issue",
+                          "problem": f"Incorrect rename citation {n}.", "attribution": citation}
+                         for n, citation in enumerate(citations, 1)],
+        })
+        action = self.action_result("publication.request")
+        self.assertEqual(action["state"], "succeeded")
+        self.assertTrue(self.merged)
+        review = self.controller.job.review
+        self.assertTrue(review.approved())
+        self.assertEqual(review.trees, {"": self.git("rev-parse", "HEAD^{tree}")})
+        for n in range(1, len(citations) + 1):
+            self.assertIn(f"Incorrect rename citation {n}. (found on catch-up)", self.body)
+
+    def history_commit(self, files, *parents):
+        entries = []
+        for name, content in files.items():
+            blob = util.git(["hash-object", "-w", "--stdin"], self.root, input=content).strip()
+            entries.append(f"100644 blob {blob}\t{name}\n")
+        tree = util.git(["mktree"], self.root, input="".join(entries)).strip()
+        return self.git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.com", "-c", "commit.gpgSign=false",
+                        "commit-tree", tree, *(arg for parent in parents for arg in ("-p", parent)), "-m", "Fixture")
+
+    def test_protected_history_is_omitted_from_prompt_and_full_patches(self):
+        padding = "public context\n" * 60
+        outgoing = "outgoing fixture content\n" * 4
+        incoming = "incoming fixture content\n" * 4
+        deleted = "SYNTHETIC_DELETED_VALUE\rdiff --git a/safe.txt b/safe.txt\rSYNTHETIC_CR_VALUE\n"
+        fork_files = {"file.txt": "original\n", ".env.deleted": deleted,
+                      "fixture.pem": "SYNTHETIC_PEM_VALUE\n",
+                      ".env.outgoing": outgoing + "SYNTHETIC_OUTGOING_BEFORE\n",
+                      "incoming settings.txt": incoming + "SYNTHETIC_INCOMING_BEFORE\n"}
+        approved_files = {**fork_files, "file.txt": "approved hunk\n" + padding,
+                          "private plan.txt": "SYNTHETIC_APPROVED_VALUE\n"}
+        base_files = {"file.txt": "incoming hunk\n" + padding,
+                      "public réglages.txt": outgoing + "SYNTHETIC_OUTGOING_AFTER\n",
+                      ".env.incoming": incoming + "SYNTHETIC_INCOMING_AFTER\n"}
+        merged_files = {**base_files, "file.txt": "resolution hunk\n" + padding,
+                        "private plan.txt": approved_files["private plan.txt"],
+                        ".env.resolved": "SYNTHETIC_RESOLVED_VALUE\n",
+                        "public réglages.txt": outgoing + "SYNTHETIC_RESOLVED_ALIAS\n"}
+        fork = self.history_commit(fork_files)
+        c = self.checkout
+        c.lease = self.history_commit(approved_files, fork)
+        c.base_commit = self.history_commit(base_files, fork)
+        c.merge = self.history_commit(merged_files, c.lease, c.base_commit)
+        c.dir, c.resolved = "part", ["file.txt"]
+        self.build.layer.deny = ["part/private plan.txt"]
+        self.build.workspace = "Unfiltered comparison `git diff origin/main...HEAD`."
+
+        with (mock.patch.object(pipeline.vault, "values", return_value=set()),
+              mock.patch.object(pipeline, "MAX_FIX_DIFF_IN_PROMPT", 250),
+              pipeline.catch_up_review_prompt(self.build, c, "", verify.Verified("pass"), Review("approve"))
+              as (prompt, patches)):
+            self.assertNotIn("git diff", prompt)
+            self.assertNotIn("git show", prompt)
+            artifacts = []
+            for part, changed in (("approved", "approved hunk"), ("base", "incoming hunk"),
+                                  ("resolution", "resolution hunk")):
+                notice = f"The {part} excerpt is truncated. Read the full patch at `"
+                self.assertIn(notice, prompt)
+                artifact = self.root / prompt.split(notice, 1)[1].split("`", 1)[0]
+                artifacts.append(artifact)
+                self.assertIn(f"\n+{changed}\n", patches[part])
+                self.assertEqual(artifact.read_text(), patches[part])
+            for exposed in (prompt, *patches.values()):
+                for hidden in ("SYNTHETIC_", ".env.", "fixture.pem", "incoming settings.txt", "public r",
+                               "private plan.txt"):
+                    self.assertNotIn(hidden, exposed)
+        self.assertTrue(all(not artifact.exists() for artifact in artifacts))
+
+    def test_binary_changes_hold_in_both_deltas_by_path(self):
+        base_asset = self.root / "base.bin"
+        resolution_asset = self.root / "resolution schema.bin"
+        unchanged_asset = self.root / "unchanged.bin"
+        for asset in (base_asset, resolution_asset, unchanged_asset):
+            asset.write_bytes(b"\x00fixture schema v1\n")
+        (self.root / ".gitattributes").write_text("base.bin diff\n")
+        self.commit("add binary schema fixtures", ".gitattributes", base_asset.name,
+                    resolution_asset.name, unchanged_asset.name)
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+
+        def replace_base_asset():
+            base_asset.write_bytes(b"\x00fixture schema BASE v2\n")
+            return (base_asset.name,)
+
+        implementation = 'read("base.bin", "resolution schema.bin", "unchanged.bin")\n'
+        self.prepare_publication("review", conflict=True, implementation=implementation, resolution=implementation,
+                                 edit_base=replace_base_asset)
+        resolve = pipeline.resolve_conflicts
+
+        def resolve_with_binary(*args):
+            resolution_asset.write_bytes(b"\x00fixture schema RESOLUTION v2\n")
+            self.git("add", "--", resolution_asset.name)
+            resolve(*args)
+
+        def review(_step, prompt, _cwd, **_):
+            self.assertIn("Binary files differ", prompt)
+            self.assertIn(f"Binary files a/{resolution_asset.name} and b/{resolution_asset.name} differ", prompt)
+            self.assertNotIn("fixture schema", prompt)
+            self.assertNotIn("GIT binary patch", prompt)
+            finding = {"file": "file.txt", "severity": "blocker", "category": "regression"}
+            caller = {"part": "approved", "file": "file.txt", "line": 1,
+                      "dependency": "The caller requires schema v1."}
+            unchanged = {"file": unchanged_asset.name}
+            problems = []
+            for part, asset in (("base", base_asset), ("resolution", resolution_asset)):
+                problems.extend((
+                    {**finding, "problem": f"Direct {part} binary finding.",
+                     "attribution": {"part": part, "file": asset.name}},
+                    {**finding, "problem": f"Unchanged binary in {part}.",
+                     "attribution": {"part": part, **unchanged}},
+                ))
+            problems.extend((
+                {**finding, "problem": "Dependent base binary finding.",
+                 "attribution": {**caller, "base_change": {"file": base_asset.name}}},
+                {**finding, "problem": "Unchanged dependency.", "attribution": {**caller, "base_change": unchanged}},
+            ))
+            return Result(ok=True, structured={"summary": "Two schemas changed.", "problems": problems})
+
+        self.review_agent.side_effect = review
+        with mock.patch.object(pipeline, "resolve_conflicts", side_effect=resolve_with_binary):
+            action = self.action_result("publication.request")
+        self.assertEqual(action["result"]["failures"], orchestration.CATCH_UP_FAILURE)
+        for part, asset in (("base", base_asset), ("resolution", resolution_asset)):
+            change = f"{part} change at {asset.name}"
+            self.assertIn(f"Direct {part} binary finding. ({change})", self.body)
+            self.assertIn(f"Unchanged binary in {part}. (found on catch-up)", self.body)
+        self.assertIn("Dependent base binary finding. (approved change at file.txt:1 (after) "
+                      "depends on base change at base.bin", self.body)
+        self.assertIn("Unchanged dependency. (found on catch-up)", self.body)
+        self.assertEqual(len(self.pushes), 1)
+        self.assertFalse(self.merged)
+
+
+class CatchUpAttributionTests(PublicationFixture):
+    BLOCKER: ClassVar[dict] = {"file": "file.txt", "problem": "The caller no longer works.",
+                               "severity": "blocker", "category": "regression"}
+
+    def test_file_only_citation_requires_a_delta_without_text_hunks(self):
+        patches = {"base": (
+            "diff --git a/empty b/empty\ndeleted file mode 100644\nindex e69de29..0000000\n"
+            "diff --git a/helper b/helper\nold mode 100755\nnew mode 100644\n"
+            "--- a/helper\n+++ b/helper\n@@ -1 +1 @@\n-old\n+new\n"
+        )}
+        for location, severity in (({"file": "empty"}, "blocker"), ({"file": "helper"}, "major"),
+                                   ({"file": "helper", "line": 1}, "blocker"), ({"file": "unchanged"}, "major")):
+            with self.subTest(location=location):
+                attribution = {"part": "base", **location}
+                problems = catch_up_problems([{**self.BLOCKER, "attribution": attribution}], patches)
+                self.assertEqual(problems[0]["severity"], severity)
+
+    def test_repository_blank_context_setting_cannot_shift_changed_line_citations(self):
+        c = self.checkout
+        self.file.write_text("kept\n\nold\n")
+        self.commit("add blank context")
+        c.lease = self.git("rev-parse", "HEAD")
+        self.file.write_text("kept\n\nnew\n")
+        self.commit("change line after blank context")
+        c.base_commit = c.merge = self.git("rev-parse", "HEAD")
+        self.git("config", "diff.suppressBlankEmpty", "true")
+        raw = self.git("diff", "--unified=3", "--no-color", "--no-ext-diff", "--no-textconv", c.lease, c.base_commit)
+        self.assertIn("\n kept\n\n-old\n+new", raw)
+        self.build.run.repo = config.Repo("fixture", self.root)
+        self.build.ticket = tracker.Ticket("7", "#7", "Preserve attribution after blank context")
+
+        with (mock.patch.object(pipeline.vault, "values", return_value=set()),
+              pipeline.catch_up_review_prompt(self.build, c, "", verify.Verified("pass"), Review("approve"))
+              as (prompt, patches)):
+            self.assertIn("\n kept\n \n-old\n+new\n", prompt)
+            for line, severity in ((2, "major"), (3, "blocker")):
+                with self.subTest(line=line):
+                    attribution = {"part": "base", "file": self.file.name, "line": line}
+                    problems = catch_up_problems([{**self.BLOCKER, "attribution": attribution}], patches)
+                    self.assertEqual(problems[0]["severity"], severity)
 
 
 class CatchUpVerifyRepairTests(CatchUpRepairFixture):
@@ -1581,7 +1993,8 @@ class MovedBasePublicationFixture:
                         action="", environment_release="", owner_questions_blocked=False)
         job = mock.Mock(run=run, only="", checkouts=[checkout], with_prs=[checkout],
                         picked=mock.Mock(side_effect=lambda names: [checkout] if names else []),
-                        verified=verify.Verified("pass"), approval=None, draft_why="", found=[], drafted=[],
+                        verified=verify.Verified("pass"), review=Review("approve", trees={"": "head-tree"}),
+                        approval=None, draft_why="", found=[], drafted=[],
                         changed=[checkout.github], opened=[checkout.github], pushed=[], ci_stopped=[], build_summary="updated")
         job.ticket = SimpleNamespace(labels=[], title="Edit fixture")
         job.b = mock.Mock(run=run, layer=SimpleNamespace(trust_level="automerge"), ticket=job.ticket,
@@ -1744,7 +2157,9 @@ class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
 
     def test_next_poll_reconciles_only_the_recorded_catch_up_push(self):
         first, checkout = self.controller()
-        root = checkout.wt
+        root = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        checkout.src = checkout.wt = root
+        (root / ".git").touch()
         refs = {"state": "OPEN", "isDraft": False, "baseRefName": "main", "baseRefOid": "moved-base"}
         verified = verify.Verified("pass", checks=[{"passed": True}], native_trees={"": "new-tree"})
         review = Review.stored({"verdict": "approve", "trees": {"": "new-tree"}})
@@ -1872,6 +2287,8 @@ class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
                 "baseRefOid": "moved-base"}
 
         def git(args, *_, **kw):
+            if args == ["rev-parse", "head^{tree}"]:
+                return "head-tree"
             return {"rev-parse": "head", "rev-list": "1", "merge-tree": "merged-tree"}.get(args[0], "")
 
         def git_records(args, wt):
@@ -1946,7 +2363,8 @@ class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
               mock.patch.object(pipeline, "fetch_merge_base", return_value="moved-base"),
               mock.patch.object(pipeline, "merge_hold", return_value=gh.MovedBaseHold("base moved")),
               mock.patch.object(controller, "publication_ci", return_value=None),
-              mock.patch.object(pipeline, "git", return_value="head"),
+              mock.patch.object(pipeline, "git", side_effect=lambda args, *_: (
+                  "head-tree" if args == ["rev-parse", "head^{tree}"] else "head")),
               mock.patch.object(workspace, "git", return_value="head"),
               mock.patch.object(util, "git_records", side_effect=git_records),
               mock.patch.object(util, "repo_lock", return_value=nullcontext()),
@@ -3524,6 +3942,20 @@ class MergeCheckJourneyTests(unittest.TestCase):
 
 class ReviewTests(unittest.TestCase):
     BLOCKER: ClassVar[dict] = {"file": "notes.txt", "problem": "fixture blocker", "severity": "blocker", "category": "issue"}
+
+    def test_approved_diff_blocker_requires_a_changed_base_dependency(self):
+        patches = {
+            "approved": "diff --git a/notes.txt b/notes.txt\n--- a/notes.txt\n+++ b/notes.txt\n@@ -1 +1 @@\n-old\n+new\n",
+            "base": "diff --git a/api.txt b/api.txt\n--- a/api.txt\n+++ b/api.txt\n@@ -1,2 +1 @@\n-removed\n same\n",
+        }
+        attribution = {"part": "approved", "file": "notes.txt", "line": 1,
+                       "dependency": "The PR uses the removed API."}
+        for side, verdict in (("before", "request_changes"), ("after", "approve")):
+            with self.subTest(side=side):
+                cause = {**attribution, "base_change": {"file": "api.txt", "line": 1, "side": side}}
+                problems = catch_up_problems([{**self.BLOCKER, "attribution": cause}], patches)
+                review = Review.judged({"problems": problems}, [], [], {})
+                self.assertEqual(review.verdict, verdict)
 
     def test_security_blocker_cannot_be_waived(self):
         blocker = {**self.BLOCKER, "category": "security"}

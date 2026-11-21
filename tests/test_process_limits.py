@@ -163,7 +163,10 @@ class CatchUpWorkspaceRecordTests(Isolated):
             run.workspace = self.ws, [self.checkout]
             build = pipeline.Build(self.cfg, run, self.local.get(self.ticket), self.ws, [self.checkout], self.layer,
                                    5, "Fixture worktree", tools=[], deny=[])
-            pipeline.catch_up_base(build, self.checkout, self.branch, base, "", "", before_push=self.unexpected_push)
+            tree = util.git(["rev-parse", f"{self.head}^{{tree}}"], self.ws).strip()
+            prior = pipeline.Review("approve", trees={"": tree})
+            pipeline.catch_up_base(build, self.checkout, self.branch, base, "", "", prior,
+                                   before_push=self.unexpected_push)
 
         status, row = self.run_ticket(drive)
         self.assertEqual((status, row["summary"]), (1, why))
