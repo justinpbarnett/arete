@@ -5,57 +5,79 @@ const path = "/api/v1/events";
 const name = "arete-events-v1";
 const retryDelay = 2000;
 const recoveryDelay = 60000;
+const leaseDuration = 40000;
 const kinds = new Set(["run.started", "run.changed", "run.ended", "step.started", "step.ended",
   "turn.appended", "principal.changed"]);
 
+function leaseStore() {
+  return new Promise((resolve, reject) => {
+    const open = indexedDB.open(name, 1);
+    open.onupgradeneeded = () => open.result.createObjectStore("leader");
+    open.onsuccess = () => resolve(open.result);
+    open.onerror = reject;
+  });
+}
+
+function takeLease(db, tab, { closing, departed } = {}) {
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction("leader", "readwrite");
+    const store = transaction.objectStore("leader");
+    const read = store.get(name);
+    let owned = false;
+    read.onsuccess = () => {
+      const current = read.result;
+      if (closing) {
+        if (current?.tab === tab) store.delete(name);
+      } else if (!current || current.tab === tab || current.tab === departed || current.until <= Date.now()) {
+        owned = true;
+        store.put({ tab, until: Date.now() + leaseDuration }, name);
+      }
+    };
+    transaction.oncomplete = () => resolve(owned);
+    transaction.onabort = reject;
+  });
+}
+
 export function openEvents(update) {
   const locks = globalThis.navigator?.locks && navigator.locks;
-  const channel = locks && globalThis.BroadcastChannel ? new BroadcastChannel(name) : null;
+  const channel = globalThis.BroadcastChannel ? new BroadcastChannel(name) : null;
   const lifetime = new AbortController();
   const subscriptions = new Map();
   const tab = Math.random().toString(36).slice(2);
-  let position = null;
+  let position, source, pending, timer, release, checkLease;
   let ready = false;
   let leader = false;
-  let source = null;
-  let pending = null;
-  let timer = null;
+  let connected = false;
   let failures = 0;
   let recoverAt = 0;
   let lastPulse = 0;
-  let connected = false;
   let run = "";
-  let release;
 
-  function send(message) { channel?.postMessage(message); }
+  function send(event) { channel?.postMessage(event); }
 
-  function deliver(message) {
-    if (message.type === "reset") {
+  function deliver(event) {
+    if (event.kind === "reset") {
       ready = false;
       position = null;
-      update({ kind: "reset" });
-      return;
     }
-    const advanced = newer(message.id, position);
-    if (advanced) position = message.id;
-    if (message.type === "pulse") update(message.event ?? { kind: "serve.beat" });
-    else if (message.type === "status") update(message.event);
-    else if (advanced && kinds.has(message.event?.kind)) update(message.event);
+    const advanced = newer(event.id, position);
+    if (advanced) position = event.id;
+    if (["reset", "serve.beat", "transport"].includes(event.kind) || advanced && kinds.has(event.kind)) update(event);
   }
 
-  function share(message) {
-    send(message);
-    deliver(message);
+  function share(event) {
+    send(event);
+    deliver(event);
   }
 
   function status(up) {
     if (connected === up) return;
     connected = up;
-    share({ type: "status", event: { kind: "transport", connected: up } });
+    share({ kind: "transport", connected });
   }
 
   function listen() {
-    if (!leader || !ready || lifetime.signal.aborted || source || pending || timer !== null) return;
+    if (!leader || !ready || lifetime.signal.aborted || source || pending || timer != null) return;
     if (!globalThis.EventSource || Date.now() < recoverAt) poll();
     else stream();
   }
@@ -70,14 +92,50 @@ export function openEvents(update) {
     source = null;
   }
 
-  function reset() {
-    stopSource();
-    share({ type: "reset" });
+  function lead(owned) {
+    if (owned === leader) return;
+    leader = owned;
+    if (owned) {
+      failures = 0;
+      listen();
+    } else {
+      stopSource();
+      pending?.abort();
+      clearTimeout(timer);
+      timer = null;
+      status(false);
+    }
   }
 
-  function turns() {
-    return [...new Set(subscriptions.values())].sort().join(",");
+  async function elect() {
+    const db = await leaseStore();
+    if (lifetime.signal.aborted) { db.close(); return; }
+    let checking = false;
+    let departed;
+    checkLease = async (tabLeft) => {
+      departed = tabLeft ?? departed;
+      if (checking || lifetime.signal.aborted) return;
+      checking = true;
+      try {
+        const last = departed;
+        departed = undefined;
+        const owned = await takeLease(db, tab, { departed: last });
+        if (!lifetime.signal.aborted) lead(owned);
+      } catch { lead(false); }
+      finally {
+        checking = false;
+        if (departed) checkLease();
+      }
+    };
+    const renew = setInterval(checkLease, retryDelay);
+    release = () => {
+      clearInterval(renew);
+      takeLease(db, tab, { closing: true }).finally(() => db.close()).catch(() => {});
+    };
+    await checkLease();
   }
+
+  function turns() { return [...new Set(subscriptions.values())].sort().join(","); }
 
   function url(timeout) {
     const query = new URLSearchParams({ since: position });
@@ -88,26 +146,25 @@ export function openEvents(update) {
   }
 
   function stream() {
-    const connection = new EventSource(url());
-    source = connection;
-    const receive = (type, message) => {
+    const connection = source = new EventSource(url());
+    const receive = (message) => {
       if (source !== connection) return;
       let event;
       try { event = JSON.parse(message.data); } catch { return; }
+      if (!event?.kind) return;
       failures = 0;
-      share({ type, event, id: message.lastEventId });
+      if (event.kind === "reset") stopSource();
+      if (event.kind === "serve.beat") checkLease?.();
+      share({ ...event, id: message.lastEventId });
     };
     connection.onopen = () => { if (source === connection) status(true); };
-    connection.onmessage = (message) => receive("event", message);
-    connection.addEventListener("serve.beat", (message) => receive("pulse", message));
-    connection.addEventListener("reset", () => {
-      if (source === connection) reset();
-    });
+    connection.onmessage = receive;
+    connection.addEventListener("serve.beat", receive);
+    connection.addEventListener("reset", receive);
     connection.onerror = () => {
       if (source !== connection) return;
       status(false);
-      failures += 1;
-      if (failures >= 3) {
+      if (++failures >= 3) {
         stopSource();
         recoverAt = Date.now() + recoveryDelay;
         listen();
@@ -119,26 +176,25 @@ export function openEvents(update) {
   }
 
   async function poll() {
-    const controller = new AbortController();
+    const controller = pending = new AbortController();
     const expiry = setTimeout(() => controller.abort(), 30000);
-    pending = controller;
     try {
       const response = await webFetch(url(25), { cache: "no-store", signal: controller.signal,
         headers: { Accept: "application/json", "Last-Event-ID": position } });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const result = await response.json();
-      if (lifetime.signal.aborted) return;
-      if (!cursor(result?.next) || !Array.isArray(result.events)) throw new Error("Malformed event response");
+      if (controller.signal.aborted || !leader) return;
+      if (!response.ok || !cursor(result?.next) || !Array.isArray(result.events)) throw new Error("Malformed event response");
+      checkLease?.();
       status(true);
-      if (result.reset) reset();
+      if (result.reset) share({ kind: "reset" });
       else {
-        for (const event of result.events) if (event) share({ type: "event", event, id: event.id });
+        for (const event of result.events) if (event) share(event);
         const pulse = Date.now() - lastPulse >= 15000;
         if (pulse) lastPulse = Date.now();
-        share({ type: pulse ? "pulse" : "cursor", id: result.next });
+        share({ kind: pulse ? "serve.beat" : "cursor", id: result.next });
       }
     } catch {
-      if (!lifetime.signal.aborted) {
+      if (leader && !controller.signal.aborted) {
         status(false);
         later(retryDelay);
       }
@@ -150,32 +206,39 @@ export function openEvents(update) {
   }
 
   function subscribe(id, selection) {
-    const before = source && turns();
+    const before = turns();
     if (selection) subscriptions.set(id, selection);
     else subscriptions.delete(id);
-    if (source && before !== turns()) {
+    if ((source || pending) && before !== turns()) {
       stopSource();
+      pending?.abort();
       later(0);
     }
   }
 
+  function announce() { send({ kind: "turns", tab, run }); }
+
   if (channel) {
     channel.onmessage = ({ data }) => {
-      if (data.type === "hello") {
-        send({ type: "turns", tab, run });
-        if (leader) send({ type: "status", event: { kind: "transport", connected } });
-      }
-      else if (data.type === "turns") subscribe(data.tab, data.run);
+      if (lifetime.signal.aborted) return;
+      if (data.kind === "hello") {
+        announce();
+        if (leader) send({ kind: "transport", connected });
+      } else if (data.kind === "turns") subscribe(data.tab, data.run);
+      else if (data.kind === "vacant") checkLease?.(data.tab);
       else if (!leader) deliver(data);
     };
-    send({ type: "hello" });
-    locks.request(name, { signal: lifetime.signal }, async () => {
-      if (lifetime.signal.aborted) return;
-      leader = true;
-      failures = 0;
-      await new Promise((resolve) => { release = resolve; listen(); });
-    }).catch(() => {});
-  } else leader = true;
+    send({ kind: "hello" });
+  }
+  const electOnHttp = () => elect().catch(() => {});
+  if (locks) locks.request(name, { signal: lifetime.signal }, () => {
+    if (lifetime.signal.aborted) return;
+    return new Promise((resolve) => {
+      release = resolve;
+      lead(true);
+    });
+  }).catch(() => { if (!lifetime.signal.aborted) electOnHttp(); });
+  else electOnHttp();
 
   return {
     baseline(seq) {
@@ -187,16 +250,17 @@ export function openEvents(update) {
     select(id) {
       run = /^[\w][\w.-]*$/.test(id) ? id : "";
       subscribe(tab, run);
-      send({ type: "turns", tab, run });
+      announce();
     },
     close() {
+      if (lifetime.signal.aborted) return;
       lifetime.abort();
-      stopSource();
-      pending?.abort();
-      clearTimeout(timer);
-      send({ type: "turns", tab, run: "" });
-      channel?.close();
+      lead(false);
+      run = "";
+      announce();
+      send({ kind: "vacant", tab });
       release?.();
+      channel?.close();
     },
   };
 }

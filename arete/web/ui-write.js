@@ -71,13 +71,12 @@ export async function sendWrite(request, onResponse = null) {
     throw new Error(`Request failed: ${cause.message}`);
   }
   onResponse?.(response);
-  const stale = response.status === 409 && request.versioned;
   const data = await response.json().catch(() => null);
   const valid = data && typeof data === "object" && !Array.isArray(data);
   if (!response.ok) {
     const error = new Error(typeof data?.error === "string" ? data.error : `Request failed (${response.status})`);
     error.status = response.status;
-    error.conflict = stale || response.status === 409 && (data?.error === "version_conflict" || data?.code === "version_conflict");
+    error.conflict = response.status === 409 && (data?.code ?? data?.error) === "version_conflict";
     if (error.conflict) staleWrite.value = "This item changed. Review the latest version before trying again.";
     error.current = data?.current;
     error.answer = data;

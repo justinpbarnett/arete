@@ -1,30 +1,48 @@
 import { batch, signal } from "./vendor-signals.js";
 import * as data from "./ui-data.js";
-import { newer } from "./ui-snapshot.js";
+import { coherent, newer } from "./ui-snapshot.js";
 import { openEvents } from "./ui-events.js";
 import { webFetch } from "./ui-request.js";
 
 const TIMEOUT_MS = 3000;
 const RETRY_MS = 5000;
+const REPORT_GRACE_MS = 5000;
+const OFFLINE_ROUNDS = 2;
 const STALE_SECONDS = 60;
-const cache = { sidebar: null, live: null, questions: null, at: 0, errors: {}, failures: 0, settled: false };
-const emptyRun = (id = "") => ({ id, queue: null, more: false, queueError: null, detail: null, detailError: null,
-  events: [], eventsError: null, turns: [], turnsError: null, turnsSource: "", settled: false });
+const cache = { sidebar: null, live: null, questions: null, sidebarAt: 0, errors: {}, failures: 0, settled: false };
 export const screenReads = signal({});
-export const runView = signal(emptyRun());
 let active;
 let feed;
 let connected = false;
 
+const asksCount = (asks) => {
+  if (!asks) return null;
+  const lists = ["approvals", "skipped", "ready"].map((part) => asks[part]?.rows ?? []);
+  const proposals = Object.values(asks.proposals?.rows ?? {});
+  return lists.reduce((sum, rows) => sum + rows.length, 0) + proposals.reduce((sum, rows) => sum + rows.length, 0) + (asks.draft ? 1 : 0);
+};
+
 function snapshotOf() {
-  const { sidebar, live, questions, at, errors, failures, settled } = cache;
-  const rows = live?.live?.rows;
+  const sidebar = cache.sidebar;
+  const payload = cache.live;
+  const rows = payload?.live?.rows;
   return {
-    needsYou: sidebar?.needs_you ?? null, questions, running: sidebar?.running ?? null,
-    health: sidebar?.health ?? null, serve: sidebar?.serve ?? null, received: at,
-    slots: rows?.slots ?? null, capacity: rows?.max_parallel ?? null, live, asks: live?.needs_you ?? null,
-    runs: rows?.runs ?? null, errors, fault: errors.live ?? errors.sidebar,
-    offline: failures >= 2, pending: !settled,
+    needsYou: sidebar?.needs_you ?? asksCount(payload?.needs_you),
+    questions: cache.questions ?? null,
+    running: sidebar?.running ?? null,
+    health: sidebar?.health ?? null,
+    serve: sidebar?.serve ?? null,
+    slots: rows?.slots ?? null,
+    capacity: rows?.max_parallel ?? null,
+    received: cache.sidebarAt,
+    live: payload,
+    asks: payload?.needs_you ?? null,
+    runs: rows?.runs ?? null,
+    errors: { ...cache.errors },
+    fault: cache.errors.live ?? cache.errors.sidebar,
+    failures: cache.failures,
+    offline: cache.failures >= OFFLINE_ROUNDS,
+    pending: !cache.settled,
   };
 }
 
@@ -45,66 +63,80 @@ export function readFault(screen, current) {
   return resourceError ?? (panel?.error ? { status: null, message: panel.error } : current.fault);
 }
 
-const malformed = () => ({ status: null, message: "Malformed response" });
 
-async function bounded(signal, read) {
+async function read(url, { text = false, versioned = false }, signal) {
   const controller = new AbortController();
+  if (signal.aborted) return {};
   const abort = () => controller.abort();
-  if (signal.aborted) return { error: { status: null, message: "Request canceled" } };
+  const expiry = setTimeout(abort, TIMEOUT_MS);
   signal.addEventListener("abort", abort, { once: true });
-  const timeout = setTimeout(abort, TIMEOUT_MS);
-  try { return await read(controller.signal); }
-  catch (error) {
+  try {
+    if (versioned) {
+      const result = await data.snapshotRead(url, controller.signal);
+      return { ...result, seq: result.data?.seq ?? result.seq };
+    }
+    const response = await webFetch(url, { cache: "no-store", signal: controller.signal });
+    if (response.ok && text) return { data: await response.text() };
+    const body = await response.json().catch(() => null);
+    const seq = response.headers.get("Arete-Seq") ?? body?.seq;
+    if (!response.ok) return { seq, error: { status: response.status, message: body?.error ?? `HTTP ${response.status}` } };
+    if (body && typeof body === "object" && !Array.isArray(body)) return { data: body, seq };
+    return { error: { status: response.status, message: "Malformed response" } };
+  } catch (error) {
     return { error: { status: null, message: error?.name === "AbortError" ? "Request timed out" : "Network error" } };
   } finally {
-    clearTimeout(timeout);
+    clearTimeout(expiry);
     signal.removeEventListener("abort", abort);
   }
 }
 
-async function legacy(url, signal, asText = false) {
-  return bounded(signal, async (signal) => {
-    const response = await webFetch(url, { cache: "no-store", signal });
-    if (response.ok && asText) return { data: await response.text() };
-    const body = await response.json().catch(() => null);
-    if (!response.ok) return { error: { status: response.status, message: body?.error ?? `HTTP ${response.status}` } };
-    return body && typeof body === "object" ? { data: body, seq: response.headers.get("Arete-Seq") ?? body.seq }
-      : { error: malformed() };
-  });
-}
 
 async function versioned(url, signal, fallback, select = (body) => body) {
-  const result = await bounded(signal, (signal) => data.snapshotRead(url, signal));
-  if (result.error?.status === 404) return { ...await fallback(), fallback: true };
-  if (result.error) return result;
-  return { data: select(result.data), seq: result.data.seq };
+  const result = await read(url, { versioned: true }, signal);
+  if (result.error?.status === 404) return fallback();
+  if (result.data) return { ...result, data: select(result.data) };
+  return result;
 }
 
-async function shell(signal) {
+const legacy = (url, signal, text = false) => read(url, { text }, signal);
+const malformed = () => ({ status: null, message: "Malformed response" });
+
+async function shell(signal, allowLegacy = () => true) {
   const result = await versioned(data.screen("live"), signal, async () => {
-    const [sidebar, view, asks] = await Promise.all(
-      ["/api/sidebar", "/api/live", "/api/asks"].map((url) => legacy(url, signal)));
+    if (!allowLegacy()) return null;
+    const latest = {};
+    const readers = Object.entries({ sidebar: "/api/sidebar", view: "/api/live", asks: "/api/asks" })
+      .map(([key, url]) => async () => (latest[key] = await legacy(url, signal)));
+    const group = await coherent(readers, (result) => result.seq ? [result.seq] : []);
+    const { sidebar, view, asks } = latest;
     const error = sidebar.error ?? view.error ?? asks.error;
-    return error ? { error } : { data: { sidebar: sidebar.data, view: view.data, asks: asks.data }, seq: sidebar.seq };
+    if (error) return { error };
+    if (!group && [sidebar, view, asks].every((result) => result.seq)) return { error: { message: "Dashboard is changing. Retrying." } };
+    return { data: { sidebar: sidebar.data, view: view.data, asks: asks.data }, seq: sidebar.seq };
   });
+  if (!result) return null;
   const body = result.data;
-  if (result.error || (Number.isInteger(body?.sidebar?.running) && body.view?.live && Array.isArray(body.asks?.asks))) return result;
-  return { error: malformed() };
+  return result.error || Number.isInteger(body?.sidebar?.running) && body.view?.live && Array.isArray(body.asks?.asks)
+    ? result : { error: malformed() };
 }
 
 const projection = (view, path, id) => (signal) => versioned(data.screen(view, id), signal, () => legacy(path, signal), (body) => body.view);
+const ticket = (run) => run.issue
+  ? `${run.repo ?? ""}${/^(?:[A-Z][A-Z0-9_]+-\d+|t-[a-f0-9]+)$/.test(run.issue) ? " " : "#"}${run.issue}`
+  : run.loop || run.repo || run.kind;
 
 async function runQueue(signal) {
   const result = await projection("runs", data.runs())(signal);
-  if (!result.data?.more || !Array.isArray(result.data.runs) || result.fallback) return result;
-  const history = await bounded(signal, (signal) => data.snapshotRead("/api/v1/runs", signal));
-  if (!Array.isArray(history.data?.runs) || history.data.seq !== result.seq) return result;
-  const current = new Set(result.data.runs.map((run) => run.id));
-  const tail = history.data.runs.filter((run) => !current.has(run.id)).map((run) => ({
-    ...run, ticket: run.issue ? `${run.repo ?? ""}${/^\d+$/.test(run.issue) ? "#" : " "}${run.issue}` : run.loop || run.repo || run.kind,
-  }));
-  const runs = [...result.data.runs, ...tail];
-  return { ...result, data: { runs: runs.slice(0, data.RUN_LIMIT), more: history.data.runs.length >= data.RUN_LIMIT } };
+  if (!result.data?.more || !Array.isArray(result.data.runs) || result.data.runs.length >= data.RUN_LIMIT) return result;
+  const history = await versioned("/api/v1/runs", signal, () => legacy(data.runs(), signal));
+  if (!Array.isArray(history.data?.runs)) return { error: history.error ?? malformed() };
+  const restored = result.seq && history.seq && result.seq.split(".")[0] !== history.seq.split(".")[0];
+  const head = restored ? [] : result.data.runs;
+  const current = new Set(head.map((run) => run.id));
+  const tail = history.data.runs.filter((run) => !current.has(run.id)).map((run) => ({ ...run, ticket: ticket(run) }));
+  const runs = [...head, ...tail];
+  return { seq: restored ? history.seq : result.seq, data: { runs: runs.slice(0, data.RUN_LIMIT),
+    more: Boolean(history.data.more) || runs.length > data.RUN_LIMIT || history.data.runs.length >= data.RUN_LIMIT } };
 }
 
 function readers(screen, id, repo) {
@@ -125,12 +157,13 @@ function readers(screen, id, repo) {
   return requests;
 }
 
+
 function publishShell(result) {
   if (result.data) {
     cache.sidebar = result.data.sidebar;
     cache.live = result.data.view;
     cache.questions = { data: result.data.asks };
-    cache.at = Date.now();
+    cache.sidebarAt = Date.now();
   } else cache.questions = { data: cache.questions?.data, error: result.error };
   cache.errors = { sidebar: result.error ?? null, live: result.error ?? null };
   cache.failures = result.error ? cache.failures + 1 : 0;
@@ -138,22 +171,36 @@ function publishShell(result) {
   snapshot.value = snapshotOf();
 }
 
-function publishRun(key, result) {
-  const run = runView.peek();
-  if (key === "queue") {
-    const valid = Array.isArray(result.data?.runs);
-    runView.value = { ...run, settled: true, queue: valid ? result.data.runs : run.queue,
-      more: valid ? Boolean(result.data.more) : run.more, queueError: valid ? null : result.error ?? malformed() };
-  } else {
-    const valid = result.data?.run?.id === run.id;
-    runView.value = { ...run, settled: true, detail: valid ? result.data : run.detail,
-      detailError: valid ? null : result.error ?? malformed() };
-  }
+function publishShellRefresh(run, result) {
+  if (!result?.data || result.unchanged || newer(run.positions.get("shell"), result.seq)) return;
+  const { sidebar, view, asks } = result.data;
+  const rows = cache.live.live.rows;
+  const projected = view.live.rows;
+  const byId = new Map(projected?.runs?.map((row) => [row.id, row]));
+  const runs = rows?.runs?.map((row) => {
+    const current = byId.get(row.id);
+    return current ? { ...row, slot: current.slot, paid: current.paid, seconds: current.seconds } : row;
+  }) ?? (result.seq === run.positions.get("shell") ? projected?.runs : undefined);
+  cache.sidebar = { ...sidebar, running: cache.sidebar.running, serve: cache.sidebar.serve };
+  cache.live = { ...view, live: { ...view.live, rows: rows || projected ? { ...rows, ...projected, runs } : undefined } };
+  cache.questions = { data: asks };
+  snapshot.value = snapshotOf();
 }
 
-function publish(key, result) {
+function publishRun(key, { data, error }, usageOnly) {
+  if (key === "queue") {
+    if (Array.isArray(data?.runs)) { rs.queue = data.runs; rs.more = Boolean(data.more); rs.queueError = null; }
+    else rs.queueError = error ?? malformed();
+  } else if (data?.run?.id === rs.id) {
+    rs.detail = usageOnly ? { ...rs.detail, models: data.models, run: { ...rs.detail.run, paid: data.run.paid } } : data;
+    rs.detailError = null;
+  } else rs.detailError = error ?? malformed();
+  rs.settled = true;
+}
+
+function publish(key, result, usageOnly) {
   if (key === "shell") publishShell(result);
-  else if (key === "queue" || key === "detail") publishRun(key, result);
+  else if (key === "queue" || key === "detail") publishRun(key, result, usageOnly);
   else {
     const previous = screenReads.peek();
     const body = result.data;
@@ -162,10 +209,45 @@ function publish(key, result) {
   }
 }
 
-async function feedLines(run, after, signal) {
-  const result = await versioned(data.lineStream(run.id, after), signal, () => legacy(data.run(run.id).feed(after), signal));
-  if (result.data) result.epoch = String(result.data.restore_epoch ?? result.seq?.split(".")[0] ?? "");
-  return result;
+const blankRuns = () => ({ queue: null, more: false, queueError: null, id: "", detail: null, detailError: null, events: [],
+  seqs: new Set(), seq: 0, steps: new Map(), eventsError: null, turns: [], turnsAfter: 0, turnsEpoch: null, turnsSource: "", turnsError: null, settled: false });
+const rs = blankRuns();
+
+const viewOf = () => ({ queue: rs.queue, more: rs.more, queueError: rs.queueError, id: rs.id, detail: rs.detail, detailError: rs.detailError,
+  events: [...rs.events, ...rs.steps.values()], eventsError: rs.eventsError, turns: rs.turns, turnsSource: rs.turnsSource, turnsError: rs.turnsError, settled: rs.settled });
+
+export const runView = signal(viewOf());
+const publishRuns = () => { runView.value = viewOf(); };
+
+function selectRun(id) {
+  const queue = { queue: rs.queue, more: rs.more, queueError: rs.queueError, settled: rs.settled };
+  Object.assign(rs, blankRuns(), queue, { id });
+  publishRuns();
+}
+
+function parseEvents(text) {
+  const found = [];
+  let bad = false;
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const event = JSON.parse(line);
+      if (event && typeof event === "object" && Number.isFinite(event.seq)) found.push(event);
+      else bad = true;
+    } catch { bad = true; }
+  }
+  return { found, bad };
+}
+
+function takeEvents(text) {
+  const { found, bad } = parseEvents(text);
+  const fresh = found.filter((event) => !rs.seqs.has(event.seq) && rs.seqs.add(event.seq));
+  if (fresh.length) {
+    rs.events = [...rs.events, ...fresh].sort((a, b) => a.seq - b.seq);
+    rs.seq = Math.max(rs.seq, ...fresh.map((event) => event.seq));
+    for (const event of fresh) rs.steps.delete(stepKey(event));
+  }
+  rs.eventsError = bad ? { status: null, message: "Malformed events" } : null;
 }
 
 function logTurns(lines) {
@@ -178,50 +260,50 @@ function logTurns(lines) {
   });
 }
 
-async function readTurns(run, source, signal) {
-  if (source !== "feed") {
-    const result = await legacy(data.run(run.id).log, signal);
-    return Array.isArray(result.data?.lines) ? { turns: logTurns(result.data.lines), turnsError: null }
-      : { turnsError: result.error ?? malformed() };
+async function readTurns(signal) {
+  const id = rs.id;
+  const source = rs.detail.lines_from;
+  const foundLines = (after) => source === "feed"
+    ? versioned(data.lineStream(id, after), signal, () => legacy(data.run(id).feed(after), signal))
+    : legacy(data.run(id).log, signal);
+  const epoch = (found) => String(found.data?.restore_epoch ?? found.seq?.split(".")[0] ?? "");
+  let found = await foundLines(rs.turnsAfter);
+  if (signal.aborted) return;
+  if (source === "feed" && found.data && rs.turnsEpoch != null && epoch(found) !== rs.turnsEpoch) {
+    rs.turns = [];
+    rs.turnsAfter = 0;
+    rs.turnsEpoch = epoch(found);
+    found = await foundLines(0);
+    if (signal.aborted) return;
   }
-  let result = await feedLines(run, run.after, signal);
-  const reset = result.data && run.epoch !== null && run.epoch !== result.epoch;
-  const after = reset ? 0 : run.after;
-  if (reset) result = await feedLines(run, 0, signal);
-  if (signal.aborted) return {};
-  if (!Array.isArray(result.data?.lines)) return { turnsError: result.error ?? malformed() };
-  const lines = result.data.lines.filter((line) => Number.isFinite(line?.id) && line.id > after);
-  run.epoch = result.epoch;
-  run.after = lines.reduce((max, line) => Math.max(max, line.id), after);
-  return { turns: [...(reset ? [] : runView.peek().turns), ...lines.map((line) => ({
-    id: `f:${line.id}`, at: line.ts ?? "", kind: line.kind ?? "", text: String(line.text ?? ""),
-  }))], turnsError: null };
+  const lines = found.data?.lines;
+  if (!Array.isArray(lines)) {
+    rs.turnsError = found.error ?? { status: null, message: "Malformed response" };
+    return;
+  }
+  rs.turnsError = null;
+  rs.turnsSource = source;
+  if (source === "feed") {
+    rs.turnsEpoch = epoch(found);
+    const fresh = lines.filter((line) => line && Number.isFinite(line.id) && line.id > rs.turnsAfter);
+    rs.turns = [...rs.turns, ...fresh.map((line) => ({ id: `f:${line.id}`, at: line.ts ?? "", kind: line.kind ?? "", text: String(line.text ?? "") }))];
+    rs.turnsAfter = Math.max(rs.turnsAfter, ...fresh.map((line) => line.id));
+  } else rs.turns = logTurns(lines);
 }
 
-async function readLogEvents(run, signal) {
-  const result = await legacy(data.run(run.id).events(run.from), signal, true);
-  if (signal.aborted) return {};
-  if (result.error) return { eventsError: result.error };
-  const events = new Map();
-  let bad = false;
-  for (const line of result.data.split("\n")) {
-    if (!line.trim()) continue;
-    try {
-      const event = JSON.parse(line);
-      if (!Number.isFinite(event?.seq)) bad = true;
-      else if (event.seq > run.from) events.set(event.seq, event);
-    } catch { bad = true; }
-  }
-  const fresh = [...events.values()].sort((a, b) => a.seq - b.seq);
-  if (fresh.length) run.from = fresh.at(-1).seq;
-  return { events: [...runView.peek().events, ...fresh], eventsError: bad ? { status: null, message: "Malformed events" } : null };
-}
+const stepKey = (event) => `${event.event}:${event.step}/${event.try ?? 1}`;
 
 async function readTranscript(run, signal) {
-  const source = runView.peek().detail?.lines_from;
-  if (!source) return;
-  const [turns, events] = await Promise.all([readTurns(run, source, signal), readLogEvents(run, signal)]);
-  if (!signal.aborted) runView.value = { ...runView.peek(), ...turns, ...events, turnsSource: source };
+  if (!rs.detail?.lines_from) return;
+  clearTimeout(run.reportTimer);
+  const [, events] = await Promise.all([readTurns(signal), legacy(data.run(rs.id).events(rs.seq), signal, true)]);
+  if (signal.aborted) return;
+  if (events.error) rs.eventsError = events.error;
+  else takeEvents(events.data);
+  publishRuns();
+  if (!rs.events.some((event) => event.event === "report") && Date.now() < run.reportUntil) {
+    run.reportTimer = setTimeout(() => invalidate(run, ["transcript"]), 1000);
+  }
 }
 
 function schedule(run) {
@@ -230,10 +312,11 @@ function schedule(run) {
   }
 }
 
-function invalidate(run, keys, seq) {
+function invalidate(run, keys, refreshOnly = false) {
   for (const key of keys) {
-    if ((run.reads[key] || key === "transcript" && run.reads.detail)
-      && (!seq || newer(seq, run.positions.get(key)))) run.dirty.add(key);
+    if ((run.reads[key] || key === "transcript" && run.reads.detail) && (!refreshOnly || !run.dirty.has(key))) {
+      run.dirty.set(key, refreshOnly);
+    }
   }
   schedule(run);
 }
@@ -243,31 +326,143 @@ async function flush(run) {
       || run.positions.has("shell") && document.activeElement?.matches?.("form.ops-form :is(input, textarea, select, [contenteditable=true])")) return;
   run.busy = true;
   const { signal } = run.controller;
-  const keys = [...run.dirty];
+  const keys = [...run.dirty.keys()];
+  const periodicShell = run.dirty.get("shell");
+  const connectedAtStart = connected;
+  const missingDetail = keys.includes("detail") && !rs.detail;
+  const refreshShellOnly = periodicShell && connectedAtStart && !run.incoherent && run.positions.has("shell") && !missingDetail;
+  const refreshDetailOnly = run.dirty.get("detail") && connectedAtStart && !run.incoherent && !missingDetail;
   run.dirty.clear();
+  const latest = new Map();
+  const readShell = () => shell(signal, () => !periodicShell || !(connectedAtStart || connected));
   const read = async (key) => {
-    const result = await run.reads[key](signal);
-    if (signal.aborted) return;
-    run.positions.set(key, result.seq);
-    if (result.error || result.fallback && (key !== "task" || !run.externalTask)) run.recheck.add(key);
-    else run.recheck.delete(key);
-    if (key === "shell") feed?.baseline(result.seq);
-    return [key, result];
+    const result = key === "shell" ? await readShell() : await run.reads[key](signal);
+    if (!result) return null;
+    latest.set(key, result);
+    return result.data && result.seq ? result : null;
   };
+  const grouped = keys.filter((key) => key === "shell" ? !refreshShellOnly
+    : key === "queue" || key === "detail" && !refreshDetailOnly);
+  const fullDetail = grouped.includes("detail");
+  const behind = (key, seq) => newer(run.positions.get(key), seq) || key === "detail"
+    && (newer(run.positions.get("usage"), seq) || seq && newer(run.usageNeeded, seq));
+  run.duringRead = grouped.length ? [] : null;
   try {
-    const reads = keys.filter((key) => key !== "transcript");
-    const first = reads.includes("shell") && !run.positions.has("shell") ? [await read("shell")] : [];
-    const results = [...first, ...await Promise.all(reads.filter((key) => !first.length || key !== "shell").map(read))];
+    const [group, shellRefresh] = await Promise.all([
+      grouped.length && coherent(grouped.map((key) => () => read(key)), (result) => result ? [result.seq] : []),
+      refreshShellOnly && readShell(),
+      ...keys.filter((key) => run.reads[key] && key !== "shell" && !grouped.includes(key)).map(read),
+    ]);
     if (signal.aborted) return;
-    batch(() => { for (const result of results) if (result) publish(...result); });
-    if (keys.includes("detail") || keys.includes("transcript")) await readTranscript(run, signal);
+    const missingShell = grouped.includes("shell") && !latest.has("shell") && !(missingDetail && run.positions.has("shell"));
+    const mismatch = grouped.some((key) => {
+      const result = latest.get(key);
+      return result?.data && behind(key, result.seq);
+    }) || !group && (grouped.filter((key) => latest.get(key)?.data && latest.get(key)?.seq).length > 1 || missingShell);
+    if (grouped.includes("shell")) run.incoherent = Boolean(mismatch || latest.get("shell")?.error);
+    if (latest.has("queue")) run.queueError = latest.get("queue").error;
+    batch(() => {
+      if (refreshShellOnly) publishShellRefresh(run, shellRefresh);
+      for (const [key, result] of latest) {
+        const usageOnly = key === "detail" && refreshDetailOnly;
+        if (grouped.includes(key) && result.data && (mismatch || key === "detail" && latest.get("shell")?.error)) continue;
+        if (usageOnly && result.data && behind(key, result.seq)) continue;
+        if (result.data && !usageOnly) run.positions.set(key, result.seq);
+        if (key === "detail" && result.data?.run?.id === rs.id) run.positions.set("usage", result.seq ?? run.usageNeeded);
+        if (key === "shell" && result.data) run.states.clear();
+        publish(key, result, usageOnly);
+      }
+      for (const event of run.duringRead ?? []) applyEvent(run, event);
+      if (grouped.length || refreshDetailOnly) publishRuns();
+    });
+    run.duringRead = null;
+    feed?.baseline(latest.get("shell")?.seq ?? (fullDetail ? latest.get("detail")?.seq : null) ?? latest.get("queue")?.seq);
+    const detail = rs.detail?.run;
+    if (fullDetail && detail?.kind === "pipeline" && detail.status !== "running") {
+      run.reportUntil = Math.max(run.reportUntil, Date.parse(detail.finished) + REPORT_GRACE_MS || 0);
+    }
+    if (keys.includes("transcript") || fullDetail && detail && !mismatch) await readTranscript(run, signal);
   } finally {
+    run.duringRead = null;
     run.busy = false;
     schedule(run);
   }
 }
 
 function all(run) { return [...Object.keys(run.reads), "transcript"]; }
+
+function floorRuns(runs) {
+  const panel = cache.live.live;
+  cache.live = { ...cache.live, live: { ...panel, rows: { ...panel.rows, runs } } };
+}
+
+function refreshUsage(run, seq) {
+  if (!newer(seq, run.usageNeeded) || !newer(seq, run.positions.get("usage"))) return;
+  run.usageNeeded = seq;
+  if (rs.detail) invalidate(run, ["detail"], true);
+}
+
+function applyRun(run, event) {
+  const id = event.subject?.match(/^run:(.+)$/)?.[1];
+  const row = event.data;
+  if (!id || row?.id !== id || typeof row.status !== "string") return;
+  const fresh = (key) => run.positions.has(key) && newer(event.id, run.positions.get(key));
+  const before = (rows) => rows?.find((item) => item.id === id);
+  const replace = (rows, patch) => before(rows) ? rows.map((item) => item.id === id ? { ...item, ...patch } : item) : [patch, ...rows];
+  const running = row.status === "running";
+  if (fresh("shell")) {
+    const rows = cache.live?.live?.rows;
+    const was = run.states.get(id) ?? (rows?.runs ? Boolean(before(rows.runs)) :
+      before(rs.queue)?.status === "running" || rs.detail?.run.id === id && rs.detail.run.status === "running"
+        || event.kind === "run.ended");
+    cache.sidebar = { ...cache.sidebar, running: Math.max(0, cache.sidebar.running + Number(running) - Number(was)) };
+    if (!rows?.runs) run.states.set(id, running);
+    if (rows?.runs) floorRuns(running ? replace(rows.runs, { ...row, ticket: ticket(row), stopping: Boolean(row.stop_asked) })
+      : rows.runs.filter((item) => item.id !== id));
+    run.positions.set("shell", event.id);
+    snapshot.value = snapshotOf();
+  }
+  if (fresh("queue") && rs.queue) {
+    const previous = before(rs.queue);
+    if ((!previous?.version || row.version > previous.version) && (previous || event.kind === "run.started" || running)) {
+      const rows = replace(rs.queue, { ...row, ticket: ticket(row), seconds: null });
+      rs.queue = rows.slice(0, data.RUN_LIMIT);
+      rs.more ||= rows.length > data.RUN_LIMIT;
+    }
+    run.positions.set("queue", event.id);
+  }
+  if (fresh("detail") && rs.detail?.run.id === id) {
+    const current = rs.detail.run;
+    rs.detail = { ...rs.detail, run: { ...current, ...row, ticket: ticket(row) } };
+    run.positions.set("detail", event.id);
+    if (current.status === "running" && !running) {
+      if (row.kind === "pipeline") run.reportUntil = Date.now() + REPORT_GRACE_MS;
+      invalidate(run, ["transcript"]);
+    }
+  }
+  if (id === rs.id) refreshUsage(run, event.id);
+}
+
+function applyStep(run, event) {
+  const step = event.data;
+  if (!step?.run || event.subject !== `step:${step.run}/${step.step}/${step.try}`) return;
+  const rows = cache.live?.live?.rows;
+  if (run.positions.has("shell") && newer(event.id, run.positions.get("shell")) && rows?.runs?.some((row) => row.id === step.run)) {
+    floorRuns(rows.runs.map((row) => row.id === step.run ? { ...row, step: step.step } : row));
+    run.positions.set("shell", event.id);
+    snapshot.value = snapshotOf();
+  }
+  if (step.run !== rs.id) return;
+  const line = { ...step, event: event.kind === "step.started" ? "step_start" : "step_end", seq: event.id };
+  const key = stepKey(line);
+  if (!rs.events.some((row) => stepKey(row) === key)) rs.steps.set(key, line);
+  if (event.kind === "step.ended") refreshUsage(run, event.id);
+}
+
+function applyEvent(run, event) {
+  if (event.kind.startsWith("run.")) applyRun(run, event);
+  else applyStep(run, event);
+}
 
 function update(event) {
   const run = active;
@@ -277,22 +472,25 @@ function update(event) {
     run.controller.abort();
     run.controller = new AbortController();
     run.positions.clear();
-    run.from = 0;
-    run.after = 0;
-    run.epoch = null;
-    runView.value = emptyRun(runView.peek().id);
+    run.usageNeeded = null;
+    run.reportUntil = 0;
+    clearTimeout(run.reportTimer);
+    Object.assign(rs, blankRuns(), { id: rs.id });
+    publishRuns();
     invalidate(run, all(run));
   } else if (event.kind === "transport") {
     connected = event.connected;
   } else if (event.kind === "serve.beat") {
-    const running = runView.peek().detail?.run.status === "running";
-    invalidate(run, ["shell", "tasks", ...(!run.externalTask ? ["task"] : []), "health", ...(running ? ["transcript"] : [])]);
+    if (event.at && cache.sidebar) {
+      cache.sidebar = { ...cache.sidebar, serve: event };
+      cache.sidebarAt = Date.now();
+      snapshot.value = snapshotOf();
+    }
+    if (rs.detail?.run.status === "running") invalidate(run, ["transcript"]);
   } else if (event.kind.startsWith("run.") || event.kind.startsWith("step.")) {
-    const id = event.kind.startsWith("run.") ? event.subject?.slice(4) : event.data?.run;
-    invalidate(run, ["shell", "queue", ...(id === run.id ? ["detail"] : [])], event.id);
-  } else if (event.kind === "turn.appended" && event.data?.run === run.id) {
-    invalidate(run, ["transcript"]);
-  }
+    run.duringRead?.push(event);
+    batch(() => { applyEvent(run, event); publishRuns(); });
+  } else if (event.kind === "turn.appended" && event.data?.run === run.id) invalidate(run, ["transcript"]);
 }
 
 function connect(run) {
@@ -322,6 +520,7 @@ function stopReaders() {
   run.controller.abort();
   clearInterval(run.interval);
   clearTimeout(run.timer);
+  clearTimeout(run.reportTimer);
   document.removeEventListener("visibilitychange", run.visibility);
 }
 
@@ -332,25 +531,31 @@ export function stop() {
 
 export function live(screen, id = "", repo = "") {
   stopReaders();
-  const next = screen === "run" ? emptyRun(id) : emptyRun();
-  if (screen === "run") Object.assign(next, { queue: runView.peek().queue, more: runView.peek().more });
-  runView.value = next;
+  selectRun(screen === "run" ? id : "");
   const previous = screenReads.peek();
   const reads = readers(screen, id, repo);
   screenReads.value = Object.fromEntries(["tasks", "health"].filter((key) => reads[key] && previous[key]).map((key) => [key, previous[key]]));
   const run = active = { screen, id, reads, externalTask: reads.task && !/^t-[a-f0-9]+$/i.test(id),
-    positions: new Map(), dirty: new Set(), recheck: new Set(),
-    controller: new AbortController(), from: 0, after: 0, epoch: null, busy: false, timer: null };
+    positions: new Map(), dirty: new Map(), states: new Map(), reportUntil: 0,
+    controller: new AbortController(), busy: false, timer: null };
   connect(run);
   const retry = () => {
-    for (const key of all(run)) run.dirty.add(key);
+    for (const key of all(run)) run.dirty.set(key, false);
     return flush(run);
   };
-  run.visibility = () => { if (!document.hidden) retry(); };
+  const refresh = (transcript = false) => {
+    if (document.hidden) return;
+    const keys = ["shell", "tasks", "health"];
+    const needsDetail = rs.detailError || newer(run.usageNeeded, run.positions.get("usage"));
+    if (!run.externalTask || !screenReads.peek().task?.data) keys.push("task");
+    if (run.queueError || needsDetail && !rs.detail) keys.push("queue");
+    if (needsDetail) keys.push("detail");
+    if (transcript && rs.detail?.run.status === "running") keys.push("transcript");
+    invalidate(run, connected && !run.incoherent ? keys : all(run), true);
+  };
+  run.visibility = () => refresh(true);
   document.addEventListener("visibilitychange", run.visibility);
-  run.interval = setInterval(() => {
-    if (!document.hidden) invalidate(run, connected ? run.recheck : all(run));
-  }, RETRY_MS);
+  run.interval = setInterval(refresh, RETRY_MS);
   retry();
   return { snapshot, stop, retry };
 }

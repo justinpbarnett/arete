@@ -11,13 +11,12 @@ export async function snapshotRead(url, signal) {
   const headers = saved?.etag ? { "If-None-Match": saved.etag } : {};
   const response = await webFetch(url, { headers, signal, cache: "no-store" });
   const seq = response.headers.get("Arete-Seq");
-  const unchanged = response.status === 304 && saved;
-  const etag = response.headers.get("ETag") ?? (unchanged ? saved.etag : null);
-  if (!unchanged && !response.ok) {
+  if (response.status === 304 && saved) return { data: saved.data, unchanged: true };
+  if (!response.ok) {
     const body = await response.json().catch(() => null);
     return { seq, error: { status: response.status, message: body?.detail ?? body?.error ?? `HTTP ${response.status}` } };
   }
-  const body = unchanged ? saved.data : await response.json().catch(() => null);
+  const body = await response.json().catch(() => null);
   const position = seq ?? body?.seq;
   if (!body || typeof body !== "object" || Array.isArray(body) || !cursor(position)) {
     return { error: { status: response.status, message: "Malformed snapshot" } };
@@ -25,7 +24,7 @@ export async function snapshotRead(url, signal) {
   const data = { ...body, seq: position };
   if (!signal.aborted) {
     snapshots.delete(url);
-    snapshots.set(url, { etag, data });
+    snapshots.set(url, { etag: response.headers.get("ETag"), data });
     if (snapshots.size > 32) snapshots.delete(snapshots.keys().next().value);
   }
   return { data };
