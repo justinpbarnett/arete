@@ -128,6 +128,12 @@ NETWORK_ERROR = re.compile(
     r"|temporary failure in name resolution|ssh: connect to host|unable to access",
     re.IGNORECASE,
 )
+PROVIDER_BUSY = re.compile(
+    r"overloaded|try again later|service unavailable|internal server error|bad gateway|gateway time-?out"
+    r"|(?:api error|status|http|error|code)\W{0,3}(?:500|502|503|504|529)\b",
+    re.IGNORECASE,
+)
+RATE_LIMITED = re.compile(r"rate.?limit|\b429\b|usage limit|quota", re.IGNORECASE)
 NEVER_SENT = re.compile(
     r"could not resolve host|no such host|temporary failure in name resolution|error connecting to"
     r"|dial tcp|connection refused|tls handshake timeout", re.IGNORECASE,
@@ -138,6 +144,10 @@ WAKE_NETWORK_WAIT_MINUTES = 3
 
 def is_network_error(text: str) -> bool:
     return bool(NETWORK_ERROR.search(text or ""))
+
+
+def is_provider_busy(text: str) -> bool:
+    return bool(PROVIDER_BUSY.search(text or "")) and not RATE_LIMITED.search(text or "")
 
 
 def online() -> bool:

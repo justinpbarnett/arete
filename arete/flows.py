@@ -129,9 +129,14 @@ def guard(job: Job, continues: str) -> str:
         checkouts = [workspace.Checkout.from_row(e) for e in listed]
         layer = pipeline.checked_layer(job.cfg, Path(data["layer"]))
         if held := workspace.scratch_held(job.ws, checkouts):
-            return (f"arete started no step and made no tracker call: verification scratch at {held[0]} is still "
-                    "held; poll finalizes it once its holders end, then run again")
+            error = workspace.scratch_failure(
+                f"verification scratch at {held[0]} is still held; poll finalizes it once its holders end, "
+                "then run again", job.ws, held)
+            job.run.failure = {"class": "environment", **error.recovery}
+            return f"arete started no step and made no tracker call: {error.why}"
         if why := workspace.kept_work(job.ws, checkouts, job.run.repo.path, layer.copy, commits=False):
+            error = workspace.worktree_failure(why, job.ws, branch)
+            job.run.failure = {"class": "environment", **error.recovery}
             return f"arete started no step and made no tracker call: {why}"
     except (workspace.RunFailed, RuntimeError, OSError, KeyError, TypeError) as e:
         return f"arete started no step and made no tracker call: could not check the worktree: {e}"
@@ -589,11 +594,11 @@ class Job:
         run.add_dirs += [d for d in map(Path, data["add_dirs"]) if d not in run.add_dirs]
         if stored and not run.workspace:
             if held := workspace.scratch_held(self.ws, self.checkouts):
-                raise workspace.RunFailed(f"verification scratch at {held[0]} is still held; poll finalizes it once "
-                                         "its holders end, then run again")
+                raise workspace.scratch_failure(f"verification scratch at {held[0]} is still held; poll finalizes it "
+                                                "once its holders end, then run again", self.ws, held)
             kept = workspace.kept_onto(self.ws, self.checkouts, self.branch)
             if why := workspace.kept_work(self.ws, self.checkouts, run.repo.path, self.layer.copy):
-                raise workspace.RunFailed(why)
+                raise workspace.worktree_failure(why, self.ws, self.branch)
             for c in self.checkouts:
                 c.onto = kept.get(str(c.wt), "")
         elif stored:
@@ -690,7 +695,7 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
         run.cfg, run.layer, run.kind = cfg, main_layer, t.kind
         pipeline.settle_starts(run, checkouts, main_layer, t, branch)
     except workspace.RunFailed as e:
-        return end_as("fail", "failed", why=e.why, detail=e.detail)
+        return end_as("fail", "failed", why=e.why, detail=e.detail, recovery=e.recovery)
     for c in checkouts:
         c.revision = util.git(["rev-parse", "HEAD"], c.wt).strip()
     layer = pipeline.resolve_layer(cfg, run, job.ws)
@@ -719,7 +724,7 @@ def plan(flow: factory.Flow) -> Outcome:
                     job.ws, role="plan", allowed_tools=prompt_loader.bash_rules(config.DEFAULT_ALLOW_BASH + reads),
                     json_schema=pipeline.PLAN_SCHEMA)
     if not res.ok or not isinstance(res.structured, dict):
-        return end_as("fail", "failed", why="planning step failed")
+        return end_as("fail", "failed", why="planning step failed", recovery=runner.start_failure(res, "plan"))
     found = res.structured
     plan_text = found.get("plan", "")
     run.save("plan.md", plan_text)
@@ -752,7 +757,8 @@ def patch(flow: factory.Flow, tree: str) -> Outcome:
         allowed_tools=prompt_loader.bash_rules(job.builder_bash), disallowed_tools=routing.NO_GIT_WRITES,
         json_schema=patching.SCHEMA)
     if not res.ok or not isinstance(res.structured, dict):
-        return end_as("fail", "failed", why="patch step failed", said=res.text)
+        return end_as("fail", "failed", why="patch step failed", said=res.text,
+                      recovery=runner.start_failure(res, BUILD))
     said = res.structured
     staged = pipeline.stage(job.checkouts, diffguard.denied_paths(job.layer))
     why = (str(said.get("reason") or "the builder requested a full plan") if said.get("needs_feature") else
@@ -781,7 +787,8 @@ def revision(flow: factory.Flow, tree: str) -> Outcome:
                     job.ws, role=BUILD, allowed_tools=prompt_loader.bash_rules(job.builder_bash),
                     disallowed_tools=routing.NO_GIT_WRITES, json_schema=pipeline.REVISE_SCHEMA)
     if not res.ok or not isinstance(res.structured, dict):
-        return end_as("fail", "failed", why="revise step failed", said=res.text)
+        return end_as("fail", "failed", why="revise step failed", said=res.text,
+                      recovery=runner.start_failure(res, BUILD))
     summary, replies = res.structured.get("summary", ""), res.structured.get("replies") or []
     if pipeline.stage(job.checkouts, diffguard.denied_paths(layer)).empty:
         return end_as("stop", "unchanged", summary=summary, replies=replies)
@@ -861,7 +868,8 @@ def build(job: Job) -> Outcome:
                     job.ws, role=BUILD, allowed_tools=prompt_loader.bash_rules(job.builder_bash),
                     disallowed_tools=routing.NO_GIT_WRITES)
     if not res.ok:
-        return end_as("fail", "failed", why="build step failed", said=res.text)
+        return end_as("fail", "failed", why="build step failed", said=res.text,
+                      recovery=runner.start_failure(res, BUILD))
     if not pipeline.stage(job.checkouts, diffguard.denied_paths(layer)).files:
         if job.estimate == 0:
             return end_as("stop", "nothing", summary=res.text)
@@ -1184,11 +1192,11 @@ def publish(flow: factory.Flow) -> Outcome:
 @factory.step("respond")
 def respond(flow: factory.Flow, ending: str, why: str = "", said: str = "", detail: str = "", comment: str = "",
             summary: str = "", status: str = "", replies: list[dict] | None = None, prs: bool = False,
-            asked: list[dict] | None = None, session: dict | None = None) -> Outcome:
+            asked: list[dict] | None = None, session: dict | None = None, recovery: dict | None = None) -> Outcome:
     job: Job = flow.ctx
     run, pr_url = job.run, ""
     if ending == "failed":
-        status, summary, _ = pipeline._fail(run, why, said, detail)
+        status, summary, _ = pipeline._fail(run, why, said, detail, recovery=recovery)
         pr_url = pipeline.record_prs(run, job.branch, job.with_prs) if prs else ""
     elif ending == "ask":
         status, summary, _ = pipeline._ask(run, job.ws, job.checkouts, comment, summary, asked, session)
@@ -1247,7 +1255,7 @@ def driven(flow: factory.Flow, drive: Callable[[factory.Flow], tuple[str, str, s
     try:
         return drive(flow)
     except workspace.RunFailed as e:
-        return finish(flow, "failed", why=e.why, detail=e.detail)
+        return finish(flow, "failed", why=e.why, detail=e.detail, recovery=e.recovery)
     except tracker.ERRORS as e:
         return finish(flow, "failed", why=f"tracker refused {flow.ctx.run.ref}: {e}")
     except owner_asks.Asked as e:

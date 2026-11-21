@@ -216,6 +216,7 @@ class Result:
     provider: str = ""
     runner: str = ""
     auth_mode: str = ""
+    auth_generation: str = field(default="", repr=False)
     aggregate_paid_usd: float | None = None
     auth_modes: tuple[str, ...] = ()
     calls: list[Result] = field(default_factory=list, repr=False)

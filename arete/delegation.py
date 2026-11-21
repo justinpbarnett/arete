@@ -210,7 +210,7 @@ def main() -> None:
                        "structured": result.structured, "error": result.error[:2000], "session": asdict(result.session),
                        "cost_usd": run.cost, "paid_usd": run.paid,
                        "runner": result.runner, "model": result.model, "effort": result.effort,
-                       "record": result.record})
+                       "record": result.record, "recovery": pipeline.runner.start_failure(result, launch["role"])})
     except pipeline.Stopped:
         pass
     except Exception as error:
