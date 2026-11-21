@@ -3,8 +3,8 @@ from __future__ import annotations
 import re
 import time
 from collections import Counter
-from collections.abc import Callable
-from dataclasses import dataclass, field
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import _test_stacks, gh, util
@@ -94,6 +94,7 @@ class Watched:
     read: bool = True
     reds: list[Red] = field(default_factory=list)
     conflicting: bool = False
+    rerun_reds: set[gh.CheckKey] = field(default_factory=set)
 
     def in_state(self, state: str) -> list[gh.Check]:
         return [c for c in self.checks.values() if c.state == state]
@@ -171,21 +172,94 @@ def conflicting(target: Target, log: Callable[[str], None]) -> bool:
         return False
 
 
-def watch(target: Target, log: Callable[[str], None]) -> Watched:
+def watch(target: Target, log: Callable[[str], None], *, reruns: Sequence[gh.WorkflowRerun] = ()) -> Watched:
+    completed: dict[int, set[gh.CheckKey]] = {}
+    exact: dict[gh.CheckKey, gh.Check] = {}
+
+    def superseded_jobs(checks, newer_attempts, pr_runs, options):
+        replaced = {r.run: r.check_keys | completed.get(r.run, set()) for r in reruns}
+        keys = set().union(*replaced.values())
+        job_ids = {job for r in reruns for job in r.jobs.values()} | {c.job for c in exact.values() if c.job}
+        attempts = {r.run: r.attempt for r in reruns}
+        for key in keys & checks.keys():
+            check = checks[key]
+            if check.job in job_ids:
+                yield key
+                continue
+            if not check.job:
+                continue
+            try:
+                job = gh.actions_job(target.github, target.sha, check.job, **options)
+                owner = job.get("run_id")
+                if job["name"] != check.name or type(owner) is not int or owner <= 0:
+                    continue
+                if owner in replaced:
+                    attempt = job.get("run_attempt")
+                    if key in replaced[owner] and type(attempt) is int and (
+                            attempt < attempts[owner] or attempt <= newer_attempts.get(owner, 0)):
+                        yield key
+                elif owner not in pr_runs:
+                    run = gh.workflow_run(target.github, target.sha, owner, **options)
+                    pulls = run.get("pull_requests") or []
+                    if run.get("event") == "pull_request" and pulls and all(
+                            type(pull.get("number")) is int and pull["number"] != gh.pr_number(target.pr) for pull in pulls):
+                        yield key
+            except READ_ERRORS:
+                continue
+
+    def snapshot(*, timeout: float = 120, retry: bool = True):
+        options = {"timeout": timeout, "retry": retry}
+        checks = gh.commit_checks(target.github, target.sha, **options)
+        runs = []
+        for rerun in reruns:
+            run = gh.workflow_run(target.github, target.sha, rerun.run, **options)
+            runs.append((rerun, run))
+            if rerun.run not in completed:
+                attempt = gh.rerun_checks(target.github, target.sha, rerun, run, **options)
+                if attempt:
+                    completed[rerun.run] = set(attempt)
+                    for check in attempt.values():
+                        if check.job:
+                            check = replace(check, workflow_run_id=rerun.run)
+                        exact[check.key] = check
+        awaiting_rerun = len(completed) < len(reruns)
+        newer_attempts, pr_runs = {}, set()
+        if reruns and not awaiting_rerun and not any(check.state == "fail" for check in exact.values()):
+            latest = gh.latest_pr_workflows(target.github, target.pr, target.sha, **options)
+            pr_runs = {run["id"] for run in latest.values()}
+            for rerun, run in runs:
+                listed = latest.get(run["workflow_id"], run)
+                newest = max((run, listed), key=lambda row: (row["run_number"], row["run_attempt"]))
+                if (newest["run_number"], newest["run_attempt"]) > (run["run_number"], rerun.attempt):
+                    check = gh.workflow_check(newest)
+                    if check.state != "pass":
+                        checks[check.key] = check
+                        newer_attempts[newest["id"]] = newest["run_attempt"]
+        if reruns:
+            for key in superseded_jobs(checks, newer_attempts, pr_runs, options):
+                del checks[key]
+        return checks | exact, awaiting_rerun
+
+    def watched(checks: dict[gh.CheckKey, gh.Check], *, read=True, conflict=False) -> Watched:
+        return Watched(target, checks | exact, read=read, conflicting=conflict,
+                       rerun_reds={key for key, check in exact.items() if check.state == "fail"})
+
     log(f"ci: waiting on the checks of {target.pr_name} at {target.sha[:7]}")
     checks: dict[gh.CheckKey, gh.Check] = {}
+    awaiting_rerun = bool(reruns)
     waiting_on: list[str] | None = None
     while True:
         if conflicting(target, log):
             log(f"ci: stopped waiting on {target.pr_name} because GitHub reports a merge conflict with the base")
             try:
-                latest = gh.commit_checks(target.github, target.sha, timeout=CONFLICT_SNAPSHOT_TIMEOUT, retry=False)
+                latest, awaiting_rerun = snapshot(timeout=CONFLICT_SNAPSHOT_TIMEOUT, retry=False)
             except READ_ERRORS as e:
                 log(f"ci: reading the checks of {target.pr_name} failed: {util.first_line(str(e), 200)}")
-                return Watched(target, {}, read=False, conflicting=True)
-            return Watched(target, latest, conflicting=True)
+                return watched({}, read=False, conflict=True)
+            pending = bool(reruns) and any(c.state == "pending" for c in latest.values())
+            return watched(latest, read=not awaiting_rerun and not pending, conflict=True)
         try:
-            checks = gh.commit_checks(target.github, target.sha)
+            checks, awaiting_rerun = snapshot()
             just_read = True
         except READ_ERRORS as e:
             just_read = False
@@ -196,15 +270,18 @@ def watch(target: Target, log: Callable[[str], None]) -> Watched:
             log(f"ci: {target.pr_name} {len(checks) - len(pending)} of {util.count(len(checks), 'check')} done"
                 + (f", waiting on {', '.join(pending)}" if pending else ""))
             waiting_on = pending
-        if just_read and checks and not pending and waited >= SETTLE_SECONDS:
-            return Watched(target, checks)
-        if just_read and not checks and waited >= FIRST_CHECK_SECONDS:
+        if just_read and checks and not pending and not awaiting_rerun and waited >= SETTLE_SECONDS:
+            return watched(checks)
+        if just_read and not reruns and not checks and waited >= FIRST_CHECK_SECONDS:
             log(f"ci: no checks on {target.pr_name} within {minutes(FIRST_CHECK_SECONDS)} of the push")
             return Watched(target, checks)
         if waited >= WAIT_SECONDS:
+            if just_read and awaiting_rerun:
+                log(f"ci: {target.pr_name} did not report completed rerun checks after {minutes(WAIT_SECONDS)}")
+                return watched(checks, read=False)
             log(f"ci: {target.pr_name} still waiting on {', '.join(pending)} after {minutes(WAIT_SECONDS)}" if just_read
                 else f"ci: could not read the checks of {target.pr_name} within {minutes(WAIT_SECONDS)}")
-            return Watched(target, checks, read=just_read)
+            return watched(checks, read=just_read and not (reruns and pending))
         time.sleep(POLL_SECONDS)
 
 
@@ -219,7 +296,7 @@ def compare_with_base(w: Watched, log: Callable[[str], None]) -> Watched:
     except READ_ERRORS as e:
         log(f"ci: could not read the checks on {t.base} of {t.github}: {util.first_line(str(e), 200)}")
         base_sha, on_base = "", {}
-    w.reds = [Red(t, c, on_base.get(c.key), base_sha) for c in failed]
+    w.reds = [Red(t, c, on_base.get(c.context_key), base_sha) for c in failed]
     for r in w.reds:
         log(f"ci: {r.label} failed; it {r.base_result.replace('`', '')}")
     return w

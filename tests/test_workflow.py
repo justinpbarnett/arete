@@ -226,6 +226,332 @@ class PublicationFixture(unittest.TestCase):
         return job
 
 
+class UnchangedHeadCIRetryTests(PublicationFixture):
+    def setUp(self):
+        super().setUp()
+        self.record_pushed_head()
+        c, controller = self.checkout, self.controller
+        pushed_tree = factory.fingerprint(c.wt)
+        self.assertTrue(pushed_tree)
+        self.enterContext(mock.patch.object(factory, "fingerprint", return_value=pushed_tree))
+        repo = config.Repo("fixture", self.root, parts=[config.Part("", c.github)])
+        job = self.publication_job(repo, "arete/7-edit-fixture", verified=verify.Verified("pass"))
+        job.changed = job.opened = [c.github]
+        job.b.layer.trust_level = "automerge"
+        controller.stamp("verify", {"verdict": "pass"})
+
+        api = f"repos/{c.github}"
+        self.run_path = f"{api}/actions/runs/456"
+        self.workflow_runs_path = f"{api}/actions/runs?event=pull_request&head_sha={c.lease}&per_page=100"
+        self.jobs_path = f"{self.run_path}/attempts/3/jobs?per_page=100"
+        self.failed_job_path = f"{api}/actions/jobs/123"
+        self.failed = self.actions_job(123, 456, 2, "failure")
+        self.head_checks = [self.failed]
+        self.other_pr_check = self.actions_job(200, 789, 1, "success")
+        self.original_run = self.actions_run(456, 7, 2, "completed", "failure")
+        self.other_pr_run = self.actions_run(789, 8, 1, "completed", "failure")
+        self.workflow_runs = [self.original_run]
+
+        def transport(args, **options):
+            endpoint = args[1]
+            if endpoint == self.failed_job_path:
+                return self.failed
+            if endpoint == f"{api}/actions/jobs/200":
+                return self.other_pr_check
+            if endpoint == f"{api}/actions/runs/789":
+                return self.other_pr_run
+            if endpoint.startswith(f"{api}/actions/jobs/"):
+                return next(row for row in self.head_checks if row["id"] == int(endpoint.rsplit("/", 1)[1]))
+            if endpoint == self.workflow_runs_path:
+                return [{"workflow_runs": self.workflow_runs}]
+            if endpoint == self.run_path:
+                return self.actions_run(456, 7, *next(self.run_snapshots))
+            if endpoint == f"{self.run_path}/attempts/3":
+                return self.exact_attempt
+            if endpoint == f"{self.run_path}/attempts/2/jobs?per_page=100":
+                return [{"jobs": [self.failed]}]
+            if endpoint == self.jobs_path:
+                return [{"jobs": next(self.job_snapshots)}]
+            if endpoint.startswith(f"{api}/commits/{c.lease}/check-runs?"):
+                return [{"check_runs": self.head_checks}]
+            if endpoint.startswith(f"{api}/commits/base/check-runs?"):
+                return [{"check_runs": []}]
+            if "/statuses?" in endpoint:
+                return [[]]
+            self.fail(f"unexpected GitHub endpoint {endpoint}")
+
+        self.enterContext(mock.patch.object(gh, "branch_sha", return_value="base"))
+        self.enterContext(mock.patch.object(gh, "pr_merge_details", return_value={
+            "state": "OPEN", "headRefOid": c.lease, "baseRefName": c.base, "mergeable": "MERGEABLE",
+        }))
+        self.enterContext(mock.patch.object(ci, "SETTLE_SECONDS", 0))
+        self.sleep = self.enterContext(mock.patch.object(ci.time, "sleep"))
+        self.enterContext(mock.patch.object(controller, "ci_failures", return_value="checks failed"))
+        self.enterContext(mock.patch.object(pipeline, "publish_ci"))
+        self.enterContext(mock.patch.object(pipeline, "release_workspace"))
+        self.enterContext(mock.patch.object(pipeline, "record_prs", return_value=c.pr))
+        self.github = self.enterContext(mock.patch.object(gh, "gh_json", side_effect=transport))
+        self.command = self.enterContext(mock.patch.object(gh, "gh"))
+        self.draft = True
+
+        def set_draft(pr, draft):
+            self.assertEqual(pr, c.pr)
+            self.draft = draft
+
+        self.set_draft = self.enterContext(mock.patch.object(gh, "pr_set_draft", side_effect=set_draft))
+        self.enterContext(mock.patch.object(gh, "pr_draft_and_head", side_effect=lambda _: (self.draft, c.lease)))
+        self.merge = self.enterContext(mock.patch.object(pipeline, "try_automerge", return_value=None))
+        self.record_ci_failure()
+
+        for obj, name in ((job.b, "restage"), (job.b, "require_valid_diff"),
+                          (controller, "validate_publication_diff"), (pipeline, "commit_and_push")):
+            call = self.enterContext(mock.patch.object(obj, name, side_effect=AssertionError(f"unexpected {name}")))
+            self.addCleanup(call.assert_not_called)
+
+    def record_ci_failure(self):
+        controller, c = self.controller, self.checkout
+        self.assertIn("error", controller.publication_ci([c]))
+        self.assertEqual(controller.data["published_tree"], controller.fingerprint())
+        self.assertTrue(controller.data["ci_failed"])
+
+    def actions_run(self, run, pr, attempt, status, conclusion, *, workflow_id=99):
+        return {"id": run, "head_sha": self.checkout.lease, "workflow_id": workflow_id, "run_number": run,
+                "event": "pull_request", "pull_requests": [{"number": pr}],
+                "run_attempt": attempt, "status": status, "conclusion": conclusion}
+
+    def actions_job(self, job, run, attempt, conclusion, name="arete-checks"):
+        return {"id": job, "run_id": run, "run_attempt": attempt, "head_sha": self.checkout.lease,
+                "name": name, "status": "completed", "conclusion": conclusion,
+                "app": {"id": gh.GITHUB_ACTIONS_APP_ID, "slug": "github-actions"}}
+
+    def request_retry(self, action=None):
+        waits = self.controller.run.waiting.call_args_list[:]
+        self.assertIsNone(self.controller.dispatch(action or self.action))
+        self.command.assert_called_once_with(["run", "rerun", "456", "--failed", "--repo", self.checkout.github],
+                                             write=True)
+        self.assertEqual(self.controller.run.waiting.call_args_list, [*waits, mock.call("ci")])
+
+    def complete_retry(self, conclusion):
+        self.head_checks.append(self.other_pr_check)
+        previous, finished = (2, "completed", "failure"), (3, "completed", conclusion)
+        self.run_snapshots = iter([previous, (3, "in_progress", None), finished, finished, finished])
+        lagging_jobs = [[], [self.actions_job(124, 456, 2, "success")]] if conclusion == "success" else []
+        self.job_snapshots = iter([*lagging_jobs, [self.actions_job(125, 456, 3, conclusion)]])
+
+        def still_waiting(_):
+            self.assertTrue(self.draft)
+            self.merge.assert_not_called()
+
+        self.sleep.side_effect = still_waiting
+        self.request_retry()
+        self.assertEqual(self.sleep.call_count, 2 + len(lagging_jobs))
+
+    def test_publication_request_reruns_failed_jobs_and_resumes_publication_after_green_ci(self):
+        def merge(*args, **kwargs):
+            self.assertFalse(self.draft)
+
+        self.merge.side_effect = merge
+        self.complete_retry("success")
+        self.merge.assert_called_once()
+        self.assertEqual(self.controller.ending[0], "pr")
+        self.assertNotIn("ci_failed", self.controller.data)
+        self.assertEqual(self.transition.call_args.args[2], "succeeded")
+
+    def test_second_red_on_the_same_head_fails_publication_with_the_exact_reason(self):
+        self.complete_retry("failure")
+        self.assertEqual(self.controller.data["ci_retry"]["targets"][self.checkout.github]["jobs"], [125])
+        self.assert_second_red()
+
+    def test_unchanged_request_resumes_timed_out_rerun_and_reports_its_failure(self):
+        self.run_snapshots = iter([(3, "in_progress", None), (3, "completed", "failure")])
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "failure")]])
+        with mock.patch.object(ci, "WAIT_SECONDS", 0):
+            self.request_retry()
+        self.assert_retry_held()
+
+        self.controller.data = json.loads(json.dumps(self.controller.data))
+        verify_evidence = self.controller.data["evidence"]["verify"]
+        with mock.patch.dict(verify_evidence, tree="stale"):
+            stale_action = {**self.action, "id": "d0002-1"}
+            self.assertEqual(str(self.controller.dispatch(stale_action)), "publication needs current evidence: verify")
+        self.assert_second_red()
+        self.assertEqual(self.controller.run.waiting.call_args_list, [mock.call("ci")] * 3)
+
+    def test_unchanged_request_resumes_timed_out_rerun_and_publishes_on_green(self):
+        self.run_snapshots = iter([(3, "in_progress", None), (3, "completed", "success")])
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "success")]])
+        with mock.patch.object(ci, "WAIT_SECONDS", 0):
+            self.request_retry()
+        self.assert_retry_held()
+
+        self.assertIsNone(self.controller.dispatch({**self.action, "id": "d0002-0"}))
+        self.command.assert_called_once()
+        self.merge.assert_called_once()
+        self.assertFalse(self.draft)
+        self.assertNotIn("ci_retry", self.controller.data)
+
+    def assert_second_red(self):
+        self.assertIsNone(self.controller.ending)
+        self.assertTrue(self.draft)
+        next_action = {**self.action, "id": "d0002-0"}
+        self.assertIsNone(self.controller.dispatch(next_action))
+        reason = f"CI failed twice on the unchanged head {self.checkout.lease}"
+        self.assertEqual(self.controller.ending, ("failed", reason, self.checkout.pr))
+        self.transition.assert_called_with(self.controller.lease, next_action["id"], "failed", {"error": reason})
+        self.command.assert_called_once()
+        self.merge.assert_not_called()
+
+    def test_completed_attempt_without_the_replacement_job_keeps_publication_blocked(self):
+        self.head_checks.append(self.other_pr_check)
+        self.run_snapshots = iter([(3, "completed", "success")])
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "success", name="other-job")]])
+        with mock.patch.object(ci, "WAIT_SECONDS", 0):
+            self.request_retry()
+        self.assertTrue(self.controller.data["ci_failed"])
+        self.assertIsNone(self.controller.ending)
+        self.assertTrue(self.draft)
+        self.merge.assert_not_called()
+
+    def test_failed_attempt_without_the_replacement_job_counts_as_second_red(self):
+        self.run_snapshots = iter([(3, "completed", "failure")])
+        self.job_snapshots = iter([[]])
+        with mock.patch.object(ci, "WAIT_SECONDS", 0):
+            self.request_retry()
+        reds = self.controller.ci_failures.call_args.args[0].reds
+        self.assertEqual([r.check.description for r in reds], ["Workflow attempt 3 concluded failure"])
+        self.assert_second_red()
+
+    def test_newer_pending_attempt_keeps_publication_draft_after_the_requested_attempt_passes(self):
+        self.run_snapshots = iter([(4, "in_progress", None)])
+        self.exact_attempt = self.actions_run(456, 7, 3, "completed", "success")
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "success")]])
+        pending = self.actions_job(126, 456, 4, None)
+        self.head_checks.append({**pending, "status": "in_progress"})
+        with mock.patch.object(ci, "WAIT_SECONDS", 0):
+            self.request_retry()
+        self.assert_retry_held()
+        watched, = self.controller.ci_failures.call_args.args[0].seen
+        self.assertFalse(watched.read)
+        self.assertEqual([check.source for check in watched.in_state("pending")], ["workflow:456"])
+
+    def test_newer_failed_attempt_keeps_publication_draft_after_another_check_finishes(self):
+        independent = self.actions_job(300, 789, 1, None, name="independent")
+        self.head_checks.append({**independent, "status": "in_progress"})
+        self.run_snapshots = iter([(3, "completed", "success"), (4, "completed", "failure")])
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "success")]])
+
+        def finish_checks(_):
+            self.head_checks = [self.actions_job(126, 456, 4, "failure"),
+                                {**independent, "conclusion": "success"}]
+
+        self.sleep.side_effect = finish_checks
+        self.request_retry()
+        self.sleep.assert_called_once()
+        self.assert_retry_held()
+        reds = self.controller.ci_failures.call_args.args[0].reds
+        self.assertEqual([r.check.description for r in reds], ["Workflow attempt 4 concluded failure"])
+
+    def test_newer_run_of_the_same_workflow_keeps_publication_draft(self):
+        self.run_snapshots = iter([(3, "completed", "success")])
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "success")]])
+
+        def start_newer_run(*args, **kwargs):
+            self.workflow_runs.append(self.actions_run(457, 7, 1, "completed", "failure"))
+
+        self.command.side_effect = start_newer_run
+        self.request_retry()
+        self.assert_retry_held()
+        reds = self.controller.ci_failures.call_args.args[0].reds
+        self.assertEqual([r.check.source for r in reds], ["workflow:457"])
+
+    def assert_newer_check_from_separate_workflow_holds_publication(self, status, conclusion, state):
+        separate = self.actions_run(458, 7, 2, status, conclusion, workflow_id=100)
+        self.run_snapshots = iter([(3, "completed", "success")])
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "success")]])
+
+        def rerun_requested(*args, **kwargs):
+            self.workflow_runs.append(separate)
+            self.head_checks.append({**self.actions_job(127, 458, 2, conclusion), "status": status})
+
+        self.command.side_effect = rerun_requested
+        with mock.patch.object(ci, "WAIT_SECONDS", 0):
+            self.request_retry()
+        self.assert_retry_held()
+        watched, = self.controller.ci_failures.call_args.args[0].seen
+        self.assertEqual([check.job for check in watched.in_state(state)], [127])
+        self.assertEqual([check.job for check in watched.in_state("pass")], [125])
+
+    def test_newer_red_check_from_separate_same_name_workflow_keeps_publication_draft(self):
+        self.assert_newer_check_from_separate_workflow_holds_publication("completed", "failure", "fail")
+
+    def test_newer_pending_check_from_separate_same_name_workflow_keeps_publication_draft(self):
+        self.assert_newer_check_from_separate_workflow_holds_publication("in_progress", None, "pending")
+
+    def assert_retry_held(self):
+        self.assertTrue(self.draft)
+        self.assertNotIn(mock.call(self.checkout.pr, False), self.set_draft.call_args_list)
+        self.merge.assert_not_called()
+        self.assertIsNone(self.controller.ending)
+        self.assertTrue(self.controller.data.get("ci_failed"))
+
+    def test_newer_same_name_failure_on_another_pr_never_spends_this_prs_retry(self):
+        self.other_pr_check["conclusion"] = "failure"
+        self.head_checks.append(self.other_pr_check)
+        self.record_ci_failure()
+        self.assertEqual(self.controller.data["ci_retry"]["targets"][self.checkout.github]["jobs"], [200])
+        self.workflow_runs = [self.other_pr_run]
+        refusal = self.controller.dispatch(self.action)
+        self.assertEqual(str(refusal), "the failed CI has no GitHub Actions jobs to rerun")
+        self.command.assert_not_called()
+        self.assertFalse(self.controller.data["ci_retried_heads"])
+
+        self.workflow_runs.append(self.original_run)
+        self.run_snapshots = iter([(3, "completed", "success")])
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "success")]])
+        self.merge.side_effect = lambda *args, **kwargs: setattr(self, "draft", False)
+        self.request_retry({**self.action, "id": "d0002-0"})
+        self.github.assert_any_call(["api", f"repos/{self.checkout.github}/actions/jobs/200"])
+        self.merge.assert_called_once()
+
+    def test_failed_rerun_replaces_a_stale_skipped_dependent_check(self):
+        self.head_checks.append(self.actions_job(124, 456, 2, "skipped", name="dependent"))
+        self.run_snapshots = iter([(3, "completed", "failure")])
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "success"),
+                                    self.actions_job(126, 456, 3, "failure", name="dependent")]])
+        self.request_retry()
+        reds = self.controller.ci_failures.call_args.args[0].reds
+        self.assertEqual([(r.check.name, r.check.job) for r in reds], [("dependent", 126)])
+        self.assert_second_red()
+
+    def test_failed_workflow_conclusion_blocks_publication_when_the_rerun_job_passed(self):
+        self.run_snapshots = iter([(4, "completed", "success")])
+        self.exact_attempt = self.actions_run(456, 7, 3, "completed", "failure")
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "success")]])
+        self.request_retry()
+        reds = self.controller.ci_failures.call_args.args[0].reds
+        self.assertEqual([r.check.description for r in reds], ["Workflow attempt 3 concluded failure"])
+        self.assert_second_red()
+
+    def test_confirmed_second_red_is_kept_when_an_independent_check_times_out(self):
+        pending = self.actions_job(200, 789, 1, None, name="independent")
+        self.head_checks.append({**pending, "status": "in_progress"})
+        self.run_snapshots = iter([(3, "completed", "failure")])
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "failure")]])
+        with mock.patch.object(ci, "WAIT_SECONDS", 0):
+            self.request_retry()
+        watched, = self.controller.ci_failures.call_args.args[0].seen
+        self.assertFalse(watched.read)
+        self.assertEqual([check.name for check in watched.in_state("pending")], ["independent"])
+        self.assertEqual(self.controller.data["ci_retry"]["targets"][self.checkout.github]["jobs"], [125])
+        self.assert_second_red()
+
+    def test_publication_retry_requires_current_verification(self):
+        self.controller.data["evidence"]["verify"]["tree"] = "stale"
+        refusal = self.controller.dispatch(self.action)
+        self.assertEqual(str(refusal), "publication needs current evidence: verify")
+        self.command.assert_not_called()
+
+
 class SingleWorkerPublicationTests(PublicationFixture):
     def test_single_worker_repair_fails_required_gates_when_publication_is_refused(self):
         branch = "arete/7-edit-fixture"
@@ -2290,9 +2616,14 @@ class ServeStatusTests(unittest.TestCase):
         result = subprocess.run([str(installed), "status", *args], cwd=self.root,
                                 env=stack_env({**env, "PYTHONPATH": str(self.root), "PYTHONDONTWRITEBYTECODE": "1"}),
                                 capture_output=True, text=True, timeout=8)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
         self.assertIn("broken deployment fixture", result.stderr)
-        self.assertIn(f"running code {running}, checkout HEAD {checkout}", result.stdout)
+        self.assertIn(
+            f"last recorded serve heartbeat at 2026-11-21T00:00:00Z, running code {running}, checkout HEAD {checkout}",
+            result.stderr.splitlines(),
+        )
+        self.assertFalse((state_dir / "arete.db").exists())
 
     def test_installed_status_reads_revisions_when_candidate_common_raises(self):
         self.break_candidate_import("commands/common.py")
