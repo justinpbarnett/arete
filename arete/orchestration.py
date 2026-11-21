@@ -35,6 +35,8 @@ from .verify import Verified
 
 CI_FAILURES = "ci:failures"
 MAX_CI_FAILURE_CHARS = 24000
+CATCH_UP_FAILURE = "catch-up:failure"
+MAX_CATCH_UP_FEEDBACK_CHARS = 12000
 STATE_FIELDS = ("plan_text", "goal", "estimate", "left_for_a_person", "build_summary", "reviews", "fix_reply",
                 "document", "report_body", "draft_why", "summary", "opened", "found", "pushed", "drafted",
                 "ci_stopped", "changed", "ci_result", "committed")
@@ -292,8 +294,11 @@ class Controller:
         self.quiescent()
         for turn in ledger.pending(self.lease):
             ledger.reject(self.lease, turn["id"], "interrupted controller turn; admitted usage may be unknown")
+        catch_up = self.data.get("catch_up_hold", {})
         for action in ledger.actions(self.lease):
             result = action["result"]
+            if action["id"] == catch_up.get("action"):
+                self.data["evidence"] = {}
             if action["op"] == "owner.ask" and result.get("awaiting_owner"):
                 answers = [ask_store.ask_get(ask) for ask in result["ask_ids"]]
                 if not answers or any(not answer or answer["status"] not in ("answered", "taken") for answer in answers):
@@ -330,6 +335,8 @@ class Controller:
             self.catalog.add_context(f"evidence:{gate}", ledger.encoded(value))
         if self.data.get("ci_failures"):
             self.catalog.add_context(CI_FAILURES, self.data["ci_failures"])
+        if catch_up:
+            self.catalog.add_context(CATCH_UP_FAILURE, catch_up["feedback"])
         for action in ledger.actions(self.lease):
             run_lines.write(self.run.id, "action", action=action["id"], op=action["op"], state=action["state"],
                             recovered=True, source=action["run"])
@@ -443,18 +450,23 @@ class Controller:
                 writing or any(worker.writing for worker in self.workers.values()))):
             raise ValueError("worker or workspace mutation lease is busy; wait before starting this delegation")
         role = setting.step
-        if writing and (self.data.get("writes", 0) or self.run.repairs):
+        catch_up = self.data.get("catch_up_hold", {})
+        if writing and (self.data.get("writes", 0) or self.run.repairs or catch_up):
             role = ("ci_repair" if self.data.get("ci_failed") else "review_repair"
-                    if self.job.review.verdict == "request_changes" else "check_repair")
+                    if catch_up.get("gate") == "review" or self.job.review.verdict == "request_changes"
+                    else "check_repair")
             setting = pipeline.steps.resolve(self.job.cfg, self.job.layer, role, self.run.kind,
                                              {"runner": setting.runner, "model": setting.model,
                                               "provider": setting.provider, "effort": setting.effort})
         tools = tuple(tool for tool in BUNDLES[args["tool_bundle"]] if tool in setting.tools)
         if writing and not {"Write", "Edit"} & set(tools):
             raise ValueError("this role grants no implementation writing tools")
-        contexts = "\n\n".join(self.catalog.read(ref, 0, 8000)["text"] for ref in args["context_refs"] if ref != CI_FAILURES)
+        contexts = "\n\n".join(self.catalog.read(ref, 0, 8000)["text"] for ref in args["context_refs"]
+                               if ref != CI_FAILURES and not (ref == CATCH_UP_FAILURE and writing and catch_up))
         if self.data.get("ci_failures") and (self.data.get("ci_failed") or CI_FAILURES in args["context_refs"]):
             contexts = "\n\n".join(filter(None, (contexts, self.data["ci_failures"][:MAX_CI_FAILURE_CHARS])))
+        if writing and catch_up:
+            contexts = "\n\n".join(filter(None, (contexts, catch_up["feedback"])))
         if prior:
             contexts += "\n\nPrevious worker result:\n" + prior["result"].get("text", "")[:8000]
         goal = args["goal"]
@@ -626,6 +638,9 @@ class Controller:
             raise ValueError("publication requires the full owner check policy")
         if self.job.verified.verdict == "fail":
             raise ValueError("behavioral verification failed; repair or finish failed")
+        catch_up = self.data.get("catch_up_hold")
+        if catch_up and (not flows.retry_passed(self.job.verified) or not self.job.review.approved()):
+            raise ValueError("publication after a catch-up hold requires passing verification and an approving review")
         self.validate_publication_diff()
         if self.run.dry_run:
             self.ending = flows.end_dry_run(self.flow)
@@ -644,8 +659,11 @@ class Controller:
         self.data.pop("publication_intent", None)
         self.data["publication"] = outcome.data
         self.persist()
+        if catch_up:
+            for checkout in self.job.picked(self.job.changed):
+                pipeline.publish_gate_evidence(self.run, self.job.ticket, checkout, self.job.verified, self.job.review)
         if self.run.repo.parts and (failure := self.publication_ci(self.job.picked(self.job.changed))):
-            return failure
+            return self.settle_publication_failure(failure)
         return self.finish_publication()
 
     def publication_ci(self, pushed, *, caught_up=False):
@@ -681,6 +699,8 @@ class Controller:
     def automerge(self, candidates):
         job = self.job
         if not candidates or not pipeline.automerge_allowed(job.b, job.approval, job.draft_why):
+            if self.data.get("catch_up_hold"):
+                return {"park": True, "error": "the repaired PR is no longer eligible for automerge"}
             return None
         about = pipeline.automerge_about(job.ticket, job.build_summary)
         track_base = not pilot.is_pilot_task(str(self.run.tid))
@@ -689,14 +709,20 @@ class Controller:
                 hold = pipeline.try_automerge(job.b, checkout, job.verified, job.review, about,
                                               track_moved_base=track_base)
                 if hold is None:
+                    self.clear_catch_up_hold()
                     return None
                 if isinstance(hold, gh.MovedBaseHold):
                     hold = self.catch_up(checkout)
+                    if isinstance(hold, dict):
+                        return hold
                     if not hold:
                         if failure := self.publication_ci([checkout], caught_up=True):
                             return failure
                         continue
+                elif hold and self.data.get("catch_up_hold"):
+                    return {"park": True, "error": hold}
                 pipeline.report_automerge(self.run, checkout, hold)
+                self.clear_catch_up_hold()
                 break
         return None
 
@@ -719,25 +745,78 @@ class Controller:
         try:
             row = gh.pr_merge_details(checkout.pr)
             if hold := gh.merge_ref_hold(row, checkout.lease, checkout.base):
-                return hold
+                return self.catch_up_failure(hold)
             base_sha = row.get("baseRefOid")
             base_sha = pipeline.fetch_merge_base(checkout) or base_sha
             if not base_sha:
-                return "GitHub did not report the current base commit"
+                return self.catch_up_failure("GitHub did not report the current base commit")
             if b.catch_ups >= pipeline.AUTOMERGE_CATCH_UPS:
-                return f"the base `{checkout.base}` moved to `{base_sha}` after {b.catch_ups} catch-ups"
+                return self.catch_up_failure(f"the base `{checkout.base}` moved to `{base_sha}` after {b.catch_ups} catch-ups")
             b.catch_ups += 1
             job.verified, job.review = pipeline.catch_up_base(
                 b, checkout, job.branch, base_sha, job.with_left(job.goal), job.with_left(job.plan_text),
                 before_push=remember_push)
+        except pipeline.CatchUpGateHold as error:
+            return self.hold_catch_up(checkout, base_sha, error)
         except pipeline.CatchUpPushUnconfirmed:
             raise
         except (workspace.RunFailed, RuntimeError, OSError) as e:
             reason = e.why if isinstance(e, workspace.RunFailed) else util.first_line(str(e), 300)
             base = f"`{checkout.base}` at `{base_sha}`" if base_sha else f"`{checkout.base}`"
-            return f"could not catch up to {base}: {pipeline.public_text(self.run, reason)}"
+            failure = f"could not catch up to {base}: {pipeline.public_text(self.run, reason)}"
+            if isinstance(e, (pipeline.ConflictUnresolved, pipeline.CatchUpPathCollision, pipeline.CatchUpNeedsInput)):
+                return failure
+            return self.catch_up_failure(failure)
         self.note_caught_up(checkout)
         return ""
+
+    def catch_up_failure(self, reason):
+        return {"park": True, "error": reason} if self.data.get("catch_up_hold") else reason
+
+    def hold_catch_up(self, checkout, base_sha, hold):
+        reason = pipeline.public_text(
+            self.run, f"Catch-up to `{checkout.base}` at `{base_sha}` held on {hold.gate}: {hold.why}")
+        attempted = f"{reason}. Checked candidate `{hold.head}` and kept it in the worktree for repair."
+        evidence = [attempted]
+        if hold.gate == "checks":
+            evidence.append(util.tail(hold.report, MAX_CATCH_UP_FEEDBACK_CHARS))
+        if hold.verified is not None:
+            evidence.append(hold.verified.markdown())
+        if hold.review is not None:
+            evidence.append(hold.review.markdown())
+        feedback = "\n\n".join(evidence)
+        self.data["catch_up_hold"] = {"action": self.executing, "gate": hold.gate, "reason": reason,
+                                      "feedback": feedback}
+        for gate in self.data.get("evidence", {}):
+            self.catalog.context.pop(f"evidence:{gate}", None)
+        self.data["evidence"] = {}
+        self.catalog.add_context(CATCH_UP_FAILURE, feedback)
+        self.persist()
+        if pipeline.own_draft_state(self.run, checkout) is not None:
+            pipeline.publish_gate_evidence(self.run, self.job.ticket, checkout, hold.verified, hold.review, held=attempted)
+        return {"failures": CATCH_UP_FAILURE,
+                "error": f"{reason}. Delegate a repair using {CATCH_UP_FAILURE}, then rerun the publication gates."}
+
+    def clear_catch_up_hold(self):
+        self.data.pop("catch_up_hold", None)
+        self.catalog.context.pop(CATCH_UP_FAILURE, None)
+
+    def park_catch_up(self, reason):
+        held = self.data["catch_up_hold"]["reason"]
+        for checkout in self.job.with_prs:
+            if pipeline.own_draft_state(self.run, checkout) is False:
+                pipeline.set_draft(self.run, checkout, True, "automerge")
+        self.run.say(f"{held}. I parked the run because {reason}.")
+        return pipeline.park_run(self.run, f"{held}. {reason}")
+
+    def settle_publication_failure(self, failure):
+        if self.data.get("catch_up_hold"):
+            if failure.get("park"):
+                self.ending = self.park_catch_up(failure["error"])
+            elif self.run.budget and (limit := self.run.budget.repair_limit_reason()):
+                reason = f"Publication CI held: {failure['ci']}. {limit}" if failure.get("ci") else limit
+                self.ending = self.park_catch_up(reason)
+        return failure
 
     def reconcile_catch_up(self, pending):
         job = self.job
@@ -771,7 +850,7 @@ class Controller:
                                       {"reason": "the run resumed an interrupted catch-up push"}, expected=("accepted",))
             self.data.pop("publication_intent", None)
             self.persist()
-            result = failure
+            result = self.settle_publication_failure(failure)
         else:
             result = self.finish_publication()
         ledger.transition(self.lease, self.executing, "failed" if "error" in result else "succeeded", result,
@@ -789,6 +868,7 @@ class Controller:
 
         self.data["publication_intent"].pop("catch_up", None)
         self.persist()
+        pipeline.publish_gate_evidence(self.run, job.ticket, checkout, job.verified, job.review)
 
     def finish_publication(self):
         self.check_pilot_publication()
@@ -802,8 +882,8 @@ class Controller:
             self.data.pop("published", None)
             self.data.pop("published_tree", None)
         self.persist()
-        if self.data.get("ci_failed"):
-            return outcome.data
+        if self.data.get("catch_up_hold") or self.data.get("ci_failed"):
+            return self.settle_publication_failure(outcome.data)
         self.ending = flows.ended(self.flow, outcome)
         return outcome.data
 
@@ -919,10 +999,15 @@ class Controller:
                     raise ValueError("delivery has no successful current engine publication")
                 self.ending = (published["ending"], published.get("summary", ""),
                                " ".join(c.pr for c in self.job.with_prs))
+            elif self.data.get("catch_up_hold"):
+                self.ending = self.park_catch_up("the orchestrator stopped without delivery")
             elif args["reason"] == "noop":
                 if not self.job.b.restage().empty:
                     raise ValueError("noop cannot discard an implementation diff")
                 self.ending = flows.finish(self.flow, "nothing", summary=self.job.build_summary or "No change needed.")
+            elif (self.run.budget and (reason := self.run.budget.repair_limit_reason())
+                  and not zte.reserved(str(self.run.tid))):
+                self.ending = pipeline.park_run(self.run, reason)
             else:
                 self.ending = flows.finish(self.flow, "failed", why="the orchestrator stopped without delivery",
                                            recovery=self.failure_recovery())
@@ -1018,6 +1103,10 @@ class Controller:
                     if self.ending:
                         break
             return self.ending
+        except runlimits.Parked as error:
+            if self.data.get("catch_up_hold"):
+                return self.park_catch_up(str(error))
+            raise
         except ledger.Conflict as error:
             raise runlimits.Parked(str(error)) from error
         finally:

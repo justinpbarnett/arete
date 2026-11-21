@@ -500,6 +500,7 @@ class Job:
     noted: bool = False
     moved_base: str = ""
     patch_mode: bool = False
+    prepared_feedback_prs: list[str] = field(default_factory=list)
 
     @property
     def held_reason(self) -> str:
@@ -703,7 +704,8 @@ class Job:
         self.committed = bool(data.get("committed", True))
         if stored:
             for c in self.picked(self.changed):
-                c.note_pushed_head(c.onto or util.git(["rev-parse", "HEAD"], c.wt).strip())
+                head = c.publication_baseline or c.onto or util.git(["rev-parse", "HEAD"], c.wt).strip()
+                c.note_pushed_head(head)
             if self.with_prs:
                 pipeline.note_prs(self.run, self.branch, self.with_prs)
 
@@ -768,6 +770,7 @@ class Job:
 
     def prepared(self, data: dict, stored: bool, *, reconciling_catch_up: bool = False) -> None:
         run = self.run
+        self.prepared_feedback_prs = data.get("feedback_prs", [])
         self.ticket = tracker.Ticket(**data["ticket"])
         self.branch, self.attachments, self.triage = data["branch"], data["attachments"], data["triage"]
         self.expertise, self.approval = data["expertise"], data.get("approval")
@@ -850,8 +853,11 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
         return end_as("stop", "quiet", status="failed", summary=f"could not read {run.ref}: {e}")
     opened(run, t)
     mended = run_store.run_get(run.repairs) or {} if run.repairs else {}
-    if run.feedback:
-        if closed := run.feedback_closure():
+    feedback_prs = run.feedback_prs
+    if not (feedback_prs or run.repairs or run.alone) and run.path in ("feature", "patch"):
+        feedback_prs = list(dict.fromkeys(row["pr_url"] for row in pipeline.pending_feedback(repo.name, run.tid)))
+    if feedback_prs:
+        if closed := run.feedback_closure(feedback_prs):
             return end_as("stop", "quiet", status="noop", summary=closed)
     elif run.repairs:
         urls = str(mended.get("pr_url") or "").split()
@@ -898,8 +904,11 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
         return end_as("fail", "failed", why=why)
     workspace.note_made(job.ws, checkouts, pipeline.workspace_owner(run, job.ws, checkouts))
     approval = triage_store.triage_approval(run.triage_key)
-    return Outcome("pass", data=prepared_fields(t, branch, checkouts, layer, [run.dir / "images"] if images.paths else [],
-                                                pipeline.images_note(images), approval))
+    data = prepared_fields(t, branch, checkouts, layer, [run.dir / "images"] if images.paths else [],
+                           pipeline.images_note(images), approval)
+    if feedback_prs:
+        data["feedback_prs"] = feedback_prs
+    return Outcome("pass", data=data)
 
 
 def prepared_fields(ticket: tracker.Ticket, branch: str, checkouts: list[workspace.Checkout], layer: config.RepoLayer,
@@ -1221,13 +1230,16 @@ def adopt_open_prs(job: Job) -> list[workspace.Checkout]:
 def refuse_changed_prs(job: Job) -> None:
     run = job.run
     reason = f"the repair of run {run.repairs}" if run.repairs else "PR feedback"
-    for c in job.with_prs if run.repairs or run.feedback else []:
-        view = gh.pr_view(c.pr)
+    prs = job.prepared_feedback_prs + run.feedback_prs
+    if run.repairs or prs:
+        prs += [c.pr for c in job.with_prs]
+    for url in dict.fromkeys(prs):
+        view = gh.pr_view(url)
         if view.get("state") != "OPEN":
-            raise workspace.RunFailed(f"{c.pr} is {'merged' if view.get('mergedAt') else 'closed'}, so arete pushed "
+            raise workspace.RunFailed(f"{url} is {'merged' if view.get('mergedAt') else 'closed'}, so arete pushed "
                                      f"nothing for {reason}")
         if view.get("headRefName") != job.branch:
-            raise workspace.RunFailed(f"{c.pr} is on branch {view.get('headRefName')}, not {job.branch}, so arete "
+            raise workspace.RunFailed(f"{url} is on branch {view.get('headRefName')}, not {job.branch}, so arete "
                                      f"pushed nothing for {reason}")
 
 

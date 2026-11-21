@@ -592,6 +592,11 @@ class Budget:
             if self.run_deadline() > time.monotonic():
                 self.arm()
 
+    def repair_limit_reason(self) -> str:
+        if self.prior_repairs + self.repair_calls >= self.policy.max_repair_cycles:
+            return f"the repair chain used its {self.policy.max_repair_cycles} repair cycles"
+        return ""
+
     def charge(self, step: str, role: str) -> None:
         if time.monotonic() >= self.run_deadline() or (self.verify_deadline is not None
                                                and time.monotonic() >= self.verify_deadline):
@@ -599,16 +604,15 @@ class Budget:
         if role not in REPAIRS and not step.startswith(REPAIR_NAMES):
             self.checkpoint()
             return
-        count = self.check_repairs()
+        self.check_repairs()
         self.repair_calls += 1
         self.persist()
-        run_lines.write(self.run.id, "budget_repair", call=step, atom=role, used=count + 1)
+        run_lines.write(self.run.id, "budget_repair", call=step, atom=role, used=self.prior_repairs + self.repair_calls)
 
     def check_repairs(self) -> int:
-        count = self.prior_repairs + self.repair_calls
-        if count >= self.policy.max_repair_cycles:
-            raise Parked(f"the repair chain used its {self.policy.max_repair_cycles} repair cycles")
-        return count
+        if reason := self.repair_limit_reason():
+            raise Parked(reason)
+        return self.prior_repairs + self.repair_calls
 
     def park(self, reason: str, kept: dict | None = None) -> dict:
         row = run_store.run_get(self.run.id) or {}
