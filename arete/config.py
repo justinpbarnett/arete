@@ -4,11 +4,11 @@ import contextlib
 import math
 import re
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from . import outbound, paths, refusals, util
+from . import journeys, outbound, paths, refusals, util
 
 MODEL_ROLES = ("plan", "build", "verify", "review", "learn", "uat", "miner", "apply", "eval_mine", "triage", "chat",
                "classify", "loop", "session", "research", "research_plan", "research_search",
@@ -1124,10 +1124,19 @@ class Verify:
     probes: dict[str, str] = field(default_factory=dict)
     probe_seconds: float = 120
     allow_patch_gaps: bool = False
+    feature_map: dict[str, journeys.Journey] = field(default_factory=dict)
+    drivers: dict[str, str] = field(default_factory=dict)
 
     @property
     def bash(self) -> list[str]:
         return ["curl *", "echo *", *self.allow_bash]
+
+    def policy(self) -> dict:
+        values = asdict(self)
+        for name in ("feature_map", "drivers"):
+            if not values[name]:
+                del values[name]
+        return values
 
 
 @dataclass
@@ -1323,11 +1332,21 @@ def load_layer(layer_dir: Path, strict: bool = False, *, source_file: Path | Non
         allow_gaps = v.get("allow_patch_gaps", False)
         if type(allow_gaps) is not bool:
             raise ValueError("[verify] allow_patch_gaps must be true or false")
+        drivers = table_of(v.get("drivers", {}), "verify.drivers")
+        if any(not journeys.NAME.fullmatch(name) or not isinstance(cmd, str) or not cmd.strip()
+               for name, cmd in drivers.items()):
+            raise ValueError("[verify.drivers] must map lowercase, hyphen-separated names to nonempty commands")
+        bindings = table_of(v.get("journey_drivers", {}), "verify.journey_drivers")
+        for name, driver in bindings.items():
+            if not isinstance(driver, str) or driver not in drivers:
+                raise ValueError(f"[verify.journey_drivers] {name!r} must name a command in [verify.drivers]")
+        feature_map = journeys.load(v.get("feature_map", {}), source_dir, bindings)
         layer.verify = Verify(publish_evidence=publish_evidence, start=v.get("start", ""), url=v.get("url", Verify.url), ready=v.get("ready", "/"),
                               ready_seconds=int(v.get("ready_seconds", Verify.ready_seconds)),
                               allow_bash=list(v.get("allow_bash", [])), notes=v.get("notes", "").strip(),
                               preflight=dict(preflight), preflight_seconds=float(seconds), probes=dict(probes),
-                              probe_seconds=float(probe_seconds), allow_patch_gaps=allow_gaps)
+                              probe_seconds=float(probe_seconds), allow_patch_gaps=allow_gaps,
+                              feature_map=feature_map, drivers=drivers)
         outbound.keep_verify_private(layer.verify.url)
     layer.ignored = tuple(ignored or ())
     return layer

@@ -14,6 +14,7 @@ from . import (
     factory,
     flows,
     gh,
+    journeys,
     owner_asks,
     pilot,
     pipeline,
@@ -39,6 +40,8 @@ STATE_FIELDS = ("plan_text", "goal", "estimate", "left_for_a_person", "build_sum
 def policy_fingerprint(cfg, layer, closed_context):
     effective = asdict(layer)
     effective.pop("factory_path")
+    if layer.verify:
+        effective["verify"] = layer.verify.policy()
     return ledger.digest(json.loads(json.dumps({"layer": effective, "config": asdict(cfg),
                                                 "closed_context": closed_context}, default=str)))
 
@@ -335,7 +338,7 @@ class Controller:
             ledger.reject(self.lease, turn, error)
             self.data["error"] = error
             self.persist()
-            raise workspace.RunFailed(error)
+            raise workspace.RunFailed(error, recovery=result.get("recovery"))
         try:
             response = result.get("structured")
             if response is None:
@@ -388,6 +391,8 @@ class Controller:
         inputs = {"goal": goal, "context": contexts, "plan": self.job.plan_text, "checks": self.job.checks,
                   "denied": prompt_loader.code_list(diffguard.denied_paths(self.job.layer)),
                   "estimate": self.job.estimate, "verify": self.job.goal, "triage": self.job.triage, **args["inputs"]}
+        if name == "plan" and self.job.layer.verify:
+            inputs["journeys"] = journeys.guidance(self.job.layer.verify.feature_map, planning=True)
         if "verify" in args["inputs"] and pipeline.triage_checks(self.job.approval):
             inputs["verify"] = pipeline.triage_goal(str(inputs["verify"]), self.job.approval)
         prompt = self.job.brief.prompt("delegate" if name in ("delegate", "investigate") else name, **inputs)
@@ -577,6 +582,18 @@ class Controller:
             except pilot.Held as error:
                 raise runlimits.Parked(str(error)) from error
 
+    def failure_recovery(self):
+        actions = (action for action in ledger.actions(self.lease) if action["run"] == self.run.id)
+        for action in sorted(actions, key=lambda action: action["result"]["revision"], reverse=True):
+            op, result = action["op"], action["result"]
+            if op in ("worker.start", "worker.continue") and result.get("writing") is True:
+                return result.get("recovery") if action["state"] == "failed" and result.get("event") == "result" else None
+            if (op == "checks.run" and result.get("passed") is False
+                    or op == "verification.run" and result.get("verdict") == "fail"
+                    or op == "review.run" and result.get("verdict") == "request_changes"):
+                return None
+        return None
+
     def perform(self, action):
         args, op = action["request"], action["op"]
         if op == "worker.start":
@@ -665,7 +682,8 @@ class Controller:
                     raise ValueError("noop cannot discard an implementation diff")
                 self.ending = flows.finish(self.flow, "nothing", summary=self.job.build_summary or "No change needed.")
             else:
-                self.ending = flows.finish(self.flow, "failed", why="the orchestrator stopped without delivery")
+                self.ending = flows.finish(self.flow, "failed", why="the orchestrator stopped without delivery",
+                                           recovery=self.failure_recovery())
             return {"reason": args["reason"]}
         raise ValueError("unknown orchestration operation")
 
@@ -796,7 +814,8 @@ def single_worker(flow):
                     controller.collect()
                     time.sleep(0.05)
                 if any(a["state"] in ("failed", "interrupted") for a in ledger.actions(controller.lease)):
-                    return flows.finish(flow, "failed", why="single-worker execution did not pass its required gates")
+                    return flows.finish(flow, "failed", why="single-worker execution did not pass its required gates",
+                                        recovery=controller.failure_recovery())
                 if controller.ending:
                     return controller.ending
         return flows.finish(flow, "failed", why="single-worker execution did not deliver")

@@ -21,7 +21,7 @@ from .store import runs as run_store
 from .store import sources as source_store
 
 PR = re.compile(r"https://github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)", re.IGNORECASE)
-CHECK = re.compile(r"^- \*\*(?:Passed|Failed(?: \(environment\))?)\*\*:\s*(.+)$")
+CHECK = re.compile(r"^- \*\*(Driver )?(?:Passed|Failed(?: \(environment\))?)\*\*:\s*(.+)$")
 NUMBER = re.compile(r"^(?:step\s+)?#?(\d+)[.):\s]+(.+)$", re.IGNORECASE)
 HOLD_EXIT = 75
 
@@ -166,7 +166,7 @@ def report_steps(item: dict, neighbour: bool = False) -> list[Step]:
                 number = int(numbered[1]) if numbered else len(found) + 1
                 short = numbered[2] if numbered else name
                 found.append(Step(owner, number, util.one_line(short, 120), how, item["pr"], neighbour))
-            name, how = match[1].strip(), ""
+            name, how = "" if match[1] else match[2].strip(), ""
         elif name and line.startswith("  - How: "):
             how = line.removeprefix("  - How: ").strip()
     if not found or len({s.number for s in found}) != len(found):

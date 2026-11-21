@@ -35,6 +35,7 @@ from . import (
     gh,
     intake,
     jev,
+    journeys,
     learning,
     outbound,
     owner_asks,
@@ -449,6 +450,7 @@ class Run(AgentRun):
     action: str = ""
     action_only: bool = False
     workspace: tuple[Path, list[workspace.Checkout]] | None = None
+    failure: dict | None = None
     asks_made: int = 0
     answers_due: list[dict] = field(default_factory=list)
     base_note: str = ""
@@ -1248,7 +1250,10 @@ def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: boo
     end_line = f"done: {status} {pr_url or summary}"
     if echo_end:
         run.log(end_line)
-    record.settle(run.id, status, end_line=end_line, summary=summary, pr_url=pr_url)
+    failure = run.failure if run.failure is not None else {"class": "work"}
+    classified = {"failure": json.dumps(failure)} if status == "failed" and failure and not run.dry_run else {}
+    record.settle(run.id, status, end_line=end_line, summary=summary, pr_url=pr_url,
+                  **classified)
     write_report(run_store.run_get(run.id) or {"id": run.id, "status": status, "pr_url": pr_url}, flow, run)
 
 
@@ -1272,6 +1277,20 @@ def settle_zte_refusal(repo: str, tid: str, slot: slots.RunSlot, run_id: str, er
         except (OSError, RuntimeError, sqlite3.Error):
             pass  # The scheduled reaper settles abandoned registered runs.
     return 2
+
+
+def crash_failure(error: Exception) -> dict:
+    if runner.SANDBOX_START_ERROR in str(error).lower():
+        return {"class": "environment", "reason": "sandbox-start"}
+    traceback = error.__traceback__
+    while traceback and traceback.tb_next:
+        traceback = traceback.tb_next
+    external_command = (traceback and traceback.tb_frame.f_globals.get("__name__") == util.__name__
+                        and traceback.tb_frame.f_code.co_name in ("git", "sh"))
+    if (isinstance(error, (AttributeError, AssertionError, LookupError, NameError, TypeError, ValueError, RuntimeError))
+            and not external_command):
+        return {"class": "environment", "reason": "engine-crash"}
+    return {}
 
 
 def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool = False,
@@ -1376,7 +1395,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     return 1
             settled = [done for dead_row in run_store.ticket_runs_marked_running(repo.name, tid)
                        if (done := record.interrupt(dead_row))]
-            earlier = None if only else run_store.newest_whole_run(repo.name, tid)
+            earlier = None if only else run_store.newest_live_whole_run(repo.name, tid)
             restarting = bool(earlier) and earlier["status"] == "interrupted"
             mending = (script.repairs or repaired_by(script.continues or (earlier["id"] if restarting else ""))
                        ) if script else ""
@@ -1390,7 +1409,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     return 2
             def start():
                 return record.start("pipeline", tag=f"{repo.name}-{tid}", lock=lock, repo=repo.name, issue=tid,
-                                    only_step=only)
+                                    only_step=only, dry_run=int(dry_run))
 
             def check_start_cutoff():
                 pilot.require(time.monotonic() < wall_deadline, "ZTE deadline expired during run startup")
@@ -1553,7 +1572,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         except workspace.RunFailed as e:
             if zte_grant:
                 return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
-            status, summary, pr_url = _fail(run, e.why, detail=e.detail)
+            status, summary, pr_url = _fail(run, e.why, detail=e.detail, recovery=e.recovery)
         except tracker.ERRORS as e:
             if zte_grant:
                 return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
@@ -1562,6 +1581,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             if zte_grant:
                 return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
             run.log(f"crashed: {type(e).__name__}: {e}")
+            run.failure = crash_failure(e)
             status, summary, pr_url = "failed", f"crashed: {e}"[:300], ""
             run.give_up("crashed before finishing")
         finally:
@@ -1582,7 +1602,9 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         return 0 if (status in SUCCEEDED if passed is None else passed) else 1
 
 
-def _fail(run: Run, why: str, builder_said: str = "", detail: str = "") -> tuple[str, str, str]:
+def _fail(run: Run, why: str, builder_said: str = "", detail: str = "",
+          *, recovery: dict | None = None) -> tuple[str, str, str]:
+    run.failure = {"class": "environment", **recovery} if recovery else {"class": "work"}
     run.log(f"failed: {why}")
     run.enter(run.failed_state)
     extra = f"\n\n{detail.strip()}" if detail.strip() else ""
@@ -1796,7 +1818,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
         run.cfg, run.layer, run.kind = cfg, main_layer, t.kind
         settle_starts(run, checkouts, main_layer, t, branch)
     except workspace.RunFailed as e:
-        return _fail(run, e.why, detail=e.detail)
+        return _fail(run, e.why, detail=e.detail, recovery=e.recovery)
     layer = resolve_layer(cfg, run, ws)
     run.cfg, run.layer, run.kind = cfg, layer, t.kind
     if why := furnish(cfg, run, layer, ws):
@@ -1834,7 +1856,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
                         ws, role="build", allowed_tools=build_rules, disallowed_tools=routing.NO_GIT_WRITES,
                         json_schema=REVISE_SCHEMA)
         if not res.ok or not isinstance(res.structured, dict):
-            return _fail(run, "revise step failed", res.text)
+            return _fail(run, "revise step failed", res.text, recovery=runner.start_failure(res, "build"))
         run.facts["left_for_a_person"] = left_for_a_person
         build_summary = res.structured.get("summary", "")
         replies = res.structured.get("replies") or []
@@ -1842,10 +1864,11 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
             return answer_without_changes(run, ws, checkouts, branch, build_summary, replies)
     else:
         res = run.agent("plan", brief.prompt(
-            "plan", triage=triage_notes(approval), denied=prompt_loader.code_list(deny), checks=checks),
+            "plan", triage=triage_notes(approval), denied=prompt_loader.code_list(deny), checks=checks,
+            journeys=journeys.guidance(layer.verify.feature_map, planning=True) if layer.verify else ""),
                         ws, role="plan", allowed_tools=read_rules, json_schema=PLAN_SCHEMA)
         if not res.ok or not isinstance(res.structured, dict):
-            return _fail(run, "planning step failed")
+            return _fail(run, "planning step failed", recovery=runner.start_failure(res, "plan"))
         plan = res.structured
         plan_text = plan.get("plan", "")
         left_for_a_person = left_section(run, (plan.get("left_for_a_person") or "").strip())
@@ -1870,7 +1893,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
             "build", plan=plan_text, checks=runs_checks, estimate=estimate, verify=goal),
                         ws, role="build", allowed_tools=build_rules, disallowed_tools=routing.NO_GIT_WRITES)
         if not res.ok:
-            return _fail(run, "build step failed", res.text)
+            return _fail(run, "build step failed", res.text, recovery=runner.start_failure(res, "build"))
         build_summary = res.text
         if not stage(checkouts, deny).files:
             if estimate == 0:
@@ -2467,8 +2490,8 @@ def commit_edits_before_merge(run: AgentRun, checkouts: list[workspace.Checkout]
 
 
 class ConflictUnresolved(workspace.RunFailed):
-    def __init__(self, why: str, detail: str, paths: list[str]):
-        super().__init__(why, detail)
+    def __init__(self, error: workspace.RunFailed, paths: list[str]):
+        super().__init__(error.why, error.detail, recovery=error.recovery)
         self.paths = paths
 
 
@@ -2489,7 +2512,7 @@ def merge_base_into_kept(run: AgentRun, checkouts: list[workspace.Checkout], lay
             files = f" in {', '.join(e.paths)}" if isinstance(e, ConflictUnresolved) else ""
             raise workspace.RunFailed(f"merging `{c.origin_base}` into the edits kept in {c.github} failed{files}: {e.why}. "
                             f"The worktree is back at the kept commit and the answers are kept, so "
-                            f"`arete resume {run.id}` continues with them", e.detail) from e
+                            f"`arete resume {run.id}` continues with them", e.detail, recovery=e.recovery) from e
     for c in merged:
         if not c.resumes:
             c.onto = c.base_commit
@@ -2585,7 +2608,7 @@ def merge_moved_bases(run: AgentRun, checkouts: list[workspace.Checkout], layer:
                     try:
                         resolve_conflicts(run, c, conflicts, layer, ticket)
                     except workspace.RunFailed as e:
-                        raise ConflictUnresolved(e.why, e.detail, conflicts) from e
+                        raise ConflictUnresolved(e, conflicts) from e
                 else:
                     conflicts = []
                 rec["outcome"] = "resolved" if conflicts else "clean"
@@ -2639,7 +2662,8 @@ def resolve_conflicts(run: AgentRun, c: workspace.Checkout, conflicts: list[str]
             else:
                 run.sessions["build"] = previous
         if not res.ok:
-            raise workspace.RunFailed(f"the conflict resolution step failed: {res.error}", res.text)
+            raise workspace.RunFailed(f"the conflict resolution step failed: {res.error}", res.text,
+                                      recovery=runner.start_failure(res, "build"))
         answer = res.structured if isinstance(res.structured, dict) else {}
         if answer.get("resolved") is not True:
             raise workspace.RunFailed(f"the resolver could not keep both the branch's work and the base's in {c.github}: "
@@ -2917,13 +2941,22 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                 require_released: bool = False, **values) -> verify.Verified:
     from . import pilot, readme_verify, zte
 
-    run, v = b.run, verify.with_free_ports(b.layer.verify)
+    run, configured = b.run, b.layer.verify
     tid = str(run.tid)
     zte_verify = zte.reserved(tid) and prompt_name == role == "verify"
     readme_task = (pilot.is_pilot_task(tid) and prompt_name == role == "verify") or zte_verify
+    feature_map = configured.feature_map if prompt_name == role == "verify" and not readme_task else {}
+    requested = journeys.requested(feature_map, b.ticket.title, b.ticket.body)
+    step = b.next_step(step_name)
+    if unknown := [name for name in requested if name not in feature_map]:
+        return save_verification(run, step, verify.Verified(
+            "blocked", "An issue references a journey absent from the configured feature map.", finished=False,
+            blocked_by=", ".join(f"journey:{name}" for name in unknown)))
+    selected = {name: feature_map[name] for name in requested}
+    drivers = {name: journey.driver for name, journey in selected.items() if journey.driver}
+    v = verify.with_free_ports(replace(configured, drivers={name: configured.drivers[name] for name in drivers.values()}))
     merge_candidate = b.layer.trust_level == "automerge" or readme_task
     checked_trees = verification_trees(b) if prompt_name == role == "verify" and merge_candidate else {}
-    step = b.next_step(step_name)
     if refusal := verify.port_refusal(v):
         run.log(f"{step}: {refusal}")
         return verify.Verified("blocked", "Verification cannot use a port the live dashboard serves.",
@@ -2957,7 +2990,13 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
     try:
         attempt = scratch.make(run.id, step, b.ws, run.dir)
     except (OSError, ValueError) as e:
-        run.log(f"{step}: trusted scratch unavailable: {util.first_line(str(e), 300)}")
+        reason = util.first_line(str(e), 300)
+        run.log(f"{step}: trusted scratch unavailable: {reason}")
+        if drivers:
+            names = ", ".join(f"journey:{name}" for name in drivers)
+            return save_verification(run, step, verify.Verified(
+                "blocked", f"Configured drivers require trusted scratch confinement for {names}.",
+                blocked_by=reason, finished=False))
     agent_started, agent_finished = False, False
     lifetime = {"stopped": True}
     fixture_blocker = ""
@@ -2977,21 +3016,28 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                 attempt=attempt) as url:
             if url:
                 run.log(f"{step}: the app answers at {url}")
-            probes = (verify.run_probes(replace(v, probe_seconds=run.time_for(v.probe_seconds)), b.ws, attempt)
-                      if v.probes else None)
+            if v.probes or drivers:
+                probes = verify.run_probes(replace(v, probe_seconds=run.time_for(v.probe_seconds)), b.ws, attempt,
+                                           journey_drivers=drivers)
             if probes:
                 run.save(f"{step}-probes.json", json.dumps(asdict(probes), indent=2))
-                run.log(f"{step}: configured probes {probes.verdict}")
+                label = "configured verification commands" if drivers else "configured probes"
+                run.log(f"{step}: {label} {probes.verdict}")
                 if probes.verdict == "pass":
-                    v = replace(v, notes=v.notes + "\n\nArete already executed these owner-configured probes in a "
+                    name = "verification commands" if drivers else "probes"
+                    instructions = ("Check any remaining acceptance criteria. Arete adds the configured results to the "
+                                    "report. Return only the checks you performed.\n\n"
+                                    if drivers else "Check only acceptance criteria not covered by them.\n\n")
+                    v = replace(v, notes=v.notes + f"\n\nArete already executed these owner-configured {name} in a "
                                 "confined disposable workspace. Use their observed results as evidence; do not repeat "
-                                "these commands. Check only acceptance criteria not covered by them.\n\n" + probes.markdown())
+                                "these commands. " + instructions + probes.markdown())
             if not probes or probes.verdict == "pass":
                 agent_started = True
                 res = run.agent(step, b.brief.prompt(
                     prompt_name, surface=surface_note(v, url, evidence), notes=v.notes, scratch=scratch.note(attempt),
                     commands=prompt_loader.code_list(bash), checks=check_list(b.layer),
-                    compare=compare_with_fork(b.checkouts), owner=run.owner_note, **values),
+                    compare=compare_with_fork(b.checkouts), owner=run.owner_note,
+                    journeys=journeys.guidance(selected or feature_map), **values),
                                 b.ws, role=role,
                                 allowed_tools=prompt_loader.bash_rules(bash) + ([f"mcp__playwright__{t}" for t in verify.PLAYWRIGHT_TOOLS] if url else []),
                                 disallowed_tools=routing.NO_GIT_WRITES, json_schema=verify.SCHEMA,
@@ -3033,12 +3079,14 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
     if probes and probes.verdict != "pass":
         verified = probes
     elif not res.ok or not isinstance(res.structured, dict):
-        return verify.Verified("blocked", "The check in use did not finish.", finished=False,
-                               blocked_by=util.first_line(res.error or "the verifier returned no verdict", 300))
+        verified = verify.Verified("blocked", "The check in use did not finish.", finished=False,
+                                   blocked_by=util.first_line(res.error or "the verifier returned no verdict", 300))
+        if not drivers:
+            return verified
     else:
         verified = verify.Verified.from_agent(res.structured)
-        if probes:
-            verified.checks = probes.checks + verified.checks
+    if probes and probes.verdict == "pass":
+        verified.checks = probes.checks + verified.checks
     if fixture_blocker:
         verified.verdict, verified.blocked_by, verified.finished = "blocked", fixture_blocker, False
     if (verified.verdict == "pass" and checked_trees and agent_finished and res.runner in {"pi", "codex", "claude"}
@@ -3362,7 +3410,7 @@ def tell_ticket_run_died(cfg: config.Config, row: dict) -> None:
     repo = cfg.repo(row["repo"])
     run = Run(row["id"], repo, paths.RUNS_DIR / row["id"], tracker=tracker.for_ticket(cfg, repo, str(row["issue"])),
               tid=str(row["issue"]), feedback=pending_feedback(repo.name, str(row["issue"])),
-              alone=bool(row.get("only_step")))
+              alone=bool(row.get("only_step")), dry_run=bool(row.get("dry_run")))
     run.dir.mkdir(parents=True, exist_ok=True)
     if row["status"] != "stopped":
         run_lines.write(row["id"], "error", step=run_lines.last_step(row["id"]), message=row.get("summary") or "")

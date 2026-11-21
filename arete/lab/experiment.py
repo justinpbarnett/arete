@@ -419,7 +419,7 @@ def designed(data: dict, carried: Totals | None = None, follow: bool = False) ->
                    for role, s in held.items()},
         "tasks": {n: {"split": splits[n], "base": t.base, "evidence": evidence(t)} for n, t in tasks.items()},
         "grader": {"runner": grader.runner, "model": grader.model, "effort": grader.effort,
-                   "settings": effective(cfg, grader), "verify": sha_json(asdict(layer.verify)) if layer.verify else "",
+                   "settings": effective(cfg, grader), "verify": sha_json(layer.verify.policy()) if layer.verify else "",
                    "prompt": sha((paths.PROMPTS_DIR / "grade.md").read_bytes())},
         "fingerprints": shared,
         "engine": engine_code(),
