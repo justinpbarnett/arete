@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Iterable
 
 from . import tracker
 
@@ -9,7 +10,11 @@ def dependencies(ticket: tracker.Ticket) -> set[str]:
     if tracker.is_task_id(ticket.id):
         return set(tracker.waits_on_tasks(ticket.body))
     if ticket.id.isdigit():
-        return {str(number) for number in tracker.waits_on(ticket.body)}
+        numbers = set(tracker.waits_on(ticket.body))
+        if ticket.github_repo:
+            own = ticket.github_repo.casefold()
+            numbers.update(number for repo, number in tracker.github_waits(ticket.body, ticket.github_repo) if repo == own)
+        return {str(number) for number in numbers}
     return set(tracker.waits_on_jira(ticket.body))
 
 
@@ -44,6 +49,7 @@ def scores(tickets: list[tracker.Ticket]) -> dict[str, tuple[int, int]]:
     return result
 
 
-def prioritized(tickets: list[tracker.Ticket]) -> list[tracker.Ticket]:
-    rank = scores(tickets)
+def prioritized(tickets: list[tracker.Ticket], *, open_tickets: Iterable[tracker.Ticket] = ()) -> list[tracker.Ticket]:
+    graph = {str(ticket.id): ticket for ticket in (*tickets, *open_tickets)}
+    rank = scores(list(graph.values()))
     return sorted(tickets, key=lambda ticket: (-rank[str(ticket.id)][0], -rank[str(ticket.id)][1], ticket.created))

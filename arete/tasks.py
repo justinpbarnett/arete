@@ -165,9 +165,8 @@ def begin(cfg: config.Config, repo: config.Repo, tid: str, force: bool, poller_p
             return answer(tid, repo.name, run["id"], "running", "already running")
         if why := held(cfg, repo):
             return queued(repo, tid, why, poller_picks)
-        why, _ = runlimits.admission(repo, tid, tracker.for_ticket(cfg, repo, tid),
-                                     runlimits.Policy.of(config.load_layer(repo.layer_dir)), force)
-        if why:
+        if why := runlimits.admission(repo, tid, tracker.for_ticket(cfg, repo, tid),
+                                      runlimits.Policy.of(config.load_layer(repo.layer_dir)), force).reason:
             raise control.Refused(why)
         new, state = spawned(repo.name, tid, lambda: pipeline.spawn_run(repo.name, tid, force))
         if state != "exited":
@@ -259,9 +258,8 @@ def free_to_start(cfg: config.Config, repo: config.Repo, tid: str, after: str = 
         raise control.Busy(f"run {run['id']} of {tracker.issue_name(repo.name, tid)}")
     if not ahead and (why := held(cfg, repo)):
         raise slots.NoFreeSlot(why + after)
-    why, _ = runlimits.admission(repo, tid, tracker.for_ticket(cfg, repo, tid),
-                                 runlimits.Policy.of(config.load_layer(repo.layer_dir)), True)
-    if why:
+    if why := runlimits.admission(repo, tid, tracker.for_ticket(cfg, repo, tid),
+                                  runlimits.Policy.of(config.load_layer(repo.layer_dir)), True).reason:
         raise control.Refused(why)
 
 
@@ -345,8 +343,7 @@ def reply(run_id: str, text: str) -> dict:
             return reply_to_asks(cfg, repo, row, waiting, text)
         free_to_start(cfg, repo, tid, "; the answer was not stored")
         kept = store_answer(cfg, repo, tid, text)
-        (folder := paths.RUNS_DIR / run_id).mkdir(parents=True, exist_ok=True)
-        (folder / pipeline.ANSWER_FILE).write_text(text)
+        util.write_bytes_atomic(paths.RUNS_DIR / run_id / pipeline.ANSWER_FILE, text.encode())
         started = begin(cfg, repo, tid, force=True, poller_picks=repo.pipeline)
         return {**started, "why": f"{started['why']}; {kept}"} if kept else started
 

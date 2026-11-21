@@ -30,6 +30,12 @@ def update_pending(context, pending):
             raise RuntimeError("publication claim is no longer pending")
 
 
+def abandon(context):
+    with tx() as c:
+        c.execute("DELETE FROM idempotency WHERE actor = ? AND key = ? AND route = ? AND request_sha = ? AND status = 0",
+                  context)
+
+
 def complete(context, status, payload, seq):
     with tx() as c:
         c.execute("INSERT INTO idempotency (actor,key,route,request_sha,status,response,last_seq,at,via) "

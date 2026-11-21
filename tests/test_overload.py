@@ -128,8 +128,10 @@ class OverloadRunTests(unittest.TestCase):
     def test_claude_529_runs_the_next_route_and_holds_only_that_model(self):
         failed = claude.parse(claude_failure("API Error: 529 overloaded_error", 529), agent.NO_SESSION,
                               "claude-opus-4-7", None)
-        auth, res = self.run_chain("claude", ["claude-opus-4-7", "claude-sonnet-4-6"], "claude",
-                                   [failed, agent.Result(ok=True, text="done")], "claude-529-login")
+        # Keep run_chain's sleep assertion local to runner, away from subprocess polling.
+        with mock.patch.object(runner, "time", mock.Mock(wraps=runner.time)):
+            auth, res = self.run_chain("claude", ["claude-opus-4-7", "claude-sonnet-4-6"], "claude",
+                                       [failed, agent.Result(ok=True, text="done")], "claude-529-login")
         self.assertEqual(self.calls, ["claude-opus-4-7", "claude-sonnet-4-6"])
         self.assertTrue(res.ok)
         self.assertIsNotNone(routing.auth_hold(auth, "claude-opus-4-7"))

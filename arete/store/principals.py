@@ -14,7 +14,11 @@ _actor = ContextVar("principal", default="hand")
 
 
 def current():
-    return _actor.get()
+    actor = _actor.get()
+    if callable(actor):
+        actor = actor()
+        _actor.set(actor)
+    return actor
 
 
 def admit(principal):

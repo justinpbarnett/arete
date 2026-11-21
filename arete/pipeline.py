@@ -10,6 +10,7 @@ import shlex
 import shutil
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -37,6 +38,7 @@ from . import (
     jev,
     journeys,
     learning,
+    local_paths,
     outbound,
     owner_asks,
     paths,
@@ -441,6 +443,14 @@ class CatchUpNeedsInput(workspace.RunFailed):
     pass
 
 
+class CatchUpGateHold(workspace.RunFailed):
+    def __init__(self, gate: str, why: str, head: str, report: str,
+                 verified: verify.Verified | None = None, review: Review | None = None):
+        super().__init__(why)
+        self.gate, self.head, self.report = gate, head, report
+        self.verified, self.review = verified, review
+
+
 class CatchUpPushUnconfirmed(workspace.RunFailed):
     def __init__(self, why: str, detail: str, *, retryable: bool):
         super().__init__(why, detail)
@@ -548,7 +558,10 @@ class Run(AgentRun):
 
         options = {**kw, "fresh_prompt": fresh_prompt}
         if session.id and kw.get("persist", True):
-            parts = (owner_asks.answers_message(due), self.kept_note, self.base_note,
+            feedback = feedback_markdown(self.feedback) if due[0]["step"] == "revise" else ""
+            parts = (owner_asks.answers_message(due),
+                     f"Address the owner's PR feedback as well:\n\n{feedback}" if feedback else "",
+                     self.kept_note, self.base_note,
                      self.moved_folder_note(due[0]["run"]))
             message = "\n\n".join(part for part in parts if part)
             return message, {**options, "resume": session}
@@ -619,36 +632,27 @@ class Run(AgentRun):
         return f"Remove `{self.tracker.label_name('failed')}` to retry"
 
     def enter(self, status: str) -> None:
-        if not self.dry_run:
-            self.enter_label(status)
-            self.enter_workflow(status)
-
-    def enter_label(self, status: str) -> bool:
+        if self.dry_run:
+            return
         others = [s for s in self.tracker.states if s != status]
-        error = self.tracker.label(self.tid, add=[status], remove=others)
-        record.note(self.id, label_pending=status if error else "")
-        if error:
-            self.log(f"tracker: {util.first_line(error, 300)}")
-        return not error
-
-    def enter_workflow(self, status: str) -> bool:
-        if error := self.tracker.move(self.tid, status):
-            self.log(f"tracker: {util.first_line(error, 300)}")
-            return False
-        if isinstance(self.tracker, tracker.JiraTracker) and self.tracker.cfg.transitions.get(status):
+        labeled = self.tracker.label(self.tid, add=[status], remove=others)
+        record.note(self.id, label_pending=status if labeled else "")
+        moved = self.tracker.move(self.tid, status)
+        for err in (labeled, moved):
+            if err:
+                self.log(f"tracker: {util.first_line(err, 300)}")
+        if not moved and isinstance(self.tracker, tracker.JiraTracker) and self.tracker.cfg.transitions.get(status):
             record.note(self.id, moved=status)
-        return True
 
     def leave(self, status: str) -> None:
         if not self.dry_run and (err := self.tracker.label(self.tid, remove=[status])):
             self.log(f"tracker: {util.first_line(err, 300)}")
 
-    def say(self, body: str, *, on_ticket: bool = False) -> str:
+    def say(self, body: str) -> str:
         if self.dry_run:
             return ""
         body = public_text(self, body)
-        err = (self.say_on_prs(body) if self.feedback and not on_ticket
-               else self.tracker.comment(self.tid, f"{tracker.ARETE_TAG} {body}"))
+        err = self.say_on_prs(body) if self.feedback else self.tracker.comment(self.tid, f"{tracker.ARETE_TAG} {body}")
         if err:
             self.log(f"tracker: {util.first_line(err, 300)}")
         return err
@@ -764,22 +768,42 @@ class Staged(diffguard.Diff):
     patch: str = ""
     changed: list[workspace.Checkout] = field(default_factory=list)
     merged: list[workspace.Checkout] = field(default_factory=list)
+    bases: dict[str, str] = field(default_factory=dict)
 
     @property
     def empty(self) -> bool:
         return not self.files and not self.merged
 
 
+def base_of_head(c: workspace.Checkout, head: str = "HEAD", *, check: bool = True) -> str:
+    return git(["merge-base", c.origin_base, head], c.wt, check=check).strip()
+
+
+def has_unpublished_base(c: workspace.Checkout) -> bool:
+    published = c.publication_baseline or c.onto
+    if not published:
+        return False
+    base = base_of_head(c, check=False)
+    return bool(base) and git(["merge-base", base, published], c.wt, check=False).strip() not in ("", base)
+
+
+def comparison_label(c: workspace.Checkout, against: str, from_base: bool) -> str:
+    sha = git(["rev-parse", "--short=7", against], c.wt).strip()
+    name = c.base if from_base else ("HEAD" if against == "HEAD" else "the starting commit")
+    return f"{name} at {sha}"
+
+
 def stage(checkouts: list[workspace.Checkout], deny: list[str], from_base: bool = False) -> Staged:
     out = Staged()
     for c in checkouts:
         workspace.drop_untracked_bytecode(c.wt)
-        against = git(["merge-base", c.origin_base, "HEAD"], c.wt).strip() if from_base else (c.onto or "HEAD")
+        against = base_of_head(c) if from_base else (c.onto or "HEAD")
         diff = diffguard.stage(c.wt, deny, against=against, prefix=c.prefix)
         merged = pending_merge(c)
         if merged and not from_base:
             brought = diffguard.between(c.wt, c.lease, c.merge, prefix=c.prefix).counts
             diff.counts = {name: 0 for name in brought} | diff.counts
+        out.bases[c.github] = against
         if merged:
             out.merged.append(c)
         elif not diff.counts:
@@ -812,7 +836,7 @@ def checkout_patch(c: workspace.Checkout, locks: list[str], *revs: str) -> str:
     return patch + (f"\n(lockfile changes not shown: {', '.join(locks)})\n" if locks else "")
 
 
-def lines_by_file(staged: Staged, top: int = 12) -> str:
+def lines_by_file(staged: diffguard.Diff, top: int = 12) -> str:
     rows = sorted(((name, n) for name, n in staged.counts.items() if n), key=lambda r: (-r[1], r[0]))
     out = [f"- `{name}`: {n}" for name, n in rows[:top]]
     if len(rows) > top:
@@ -820,9 +844,98 @@ def lines_by_file(staged: Staged, top: int = 12) -> str:
     return "\n".join(out)
 
 
-def ignored_state(wt: Path) -> dict[str, str]:
-    return {n: workspace.fingerprint(wt / n, "") for n in workspace.ignored_file_paths(wt)
-            if not (Path(n).parent.name == "__pycache__" and Path(n).suffix == ".pyc")}
+VERIFY_SCRATCH_ROOT = Path(".arete-sandbox")
+VERIFY_SCRATCH_MARKER = ".arete-owned"
+VERIFY_SCRATCH_CONTENT = b"arete-verification-scratch-v1"
+
+
+def names_verification_wrapper(rule: str) -> bool:
+    try:
+        words = shlex.split(rule)
+    except ValueError:
+        return False
+    return bool(words) and verify.trusted_wrapper(words[0])
+
+
+def initialize_resolver_scratch(wt: Path, bash_rules: list[str]) -> None:
+    if not any(names_verification_wrapper(rule) for rule in bash_rules):
+        return
+    with local_paths.directory_fd(wt.resolve()) as wt_fd:
+        try:
+            os.mkdir(VERIFY_SCRATCH_ROOT, 0o700, dir_fd=wt_fd)
+        except FileExistsError:
+            return
+        with local_paths.directory_fd(VERIFY_SCRATCH_ROOT, wt_fd) as folder:
+            for name, content in ((".gitignore", b"*\n"), (VERIFY_SCRATCH_MARKER, VERIFY_SCRATCH_CONTENT + b"\n")):
+                fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=folder)
+                with os.fdopen(fd, "wb") as file:
+                    file.write(content)
+
+
+def resolver_scratch_paths(names: set[str], roots: set[Path]) -> set[str]:
+    return {n for n in names if roots and not roots.isdisjoint(Path(n).parents)}
+
+
+def restorable_scratch_paths(wt: Path, incoming: str, roots: set[Path]) -> set[str]:
+    if not roots:
+        return set()
+    deletions = ["diff", "--cached", "--no-renames", "--ignore-submodules=none", "--name-only", "--diff-filter=D"]
+    deleted = {path for parent in ("HEAD", incoming) for path in util.git_records([*deletions, parent], wt)}
+    return resolver_scratch_paths(deleted, roots)
+
+
+def resolver_file_metadata(path: Path) -> tuple[int, ...] | None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    return info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
+def resolver_scratch_metadata(wt: Path, name: str) -> tuple[int, ...] | dict[Path, tuple[int, ...] | None] | None:
+    path = wt / name
+    metadata = resolver_file_metadata(path)
+    if not name.endswith("/") or path.is_symlink():
+        return metadata
+    contents = {path: metadata}
+    for root, dirs, files in os.walk(path):
+        for child in dirs + files:
+            entry = Path(root, child)
+            contents[entry] = resolver_file_metadata(entry)
+    return contents
+
+
+def resolver_ignored_paths(wt: Path, parent_tracked: set[str]) -> set[str]:
+    return {n for n in workspace.ignored_file_paths(wt)
+            if n in parent_tracked or not (Path(n).parent.name == "__pycache__" and Path(n).suffix == ".pyc")}
+
+
+def verification_marker(wt_fd: int, root: Path) -> tuple[int, int, int] | None:
+    try:
+        with ExitStack() as opened:
+            folder = opened.enter_context(local_paths.directory_fd(root, wt_fd))
+            fd = os.open(VERIFY_SCRATCH_MARKER, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=folder)
+            opened.callback(os.close, fd)
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                return None
+            with os.fdopen(fd, "rb", closefd=False) as file:
+                if file.read(len(VERIFY_SCRATCH_CONTENT) + 2).removesuffix(b"\n") == VERIFY_SCRATCH_CONTENT:
+                    return info.st_dev, info.st_ino, info.st_ctime_ns
+    except OSError:
+        return None
+    return None
+
+
+def verification_scratch_markers(wt: Path, candidates: set[Path] | None = None) -> dict[Path, tuple[int, int, int]]:
+    if candidates is None:
+        markers = ["--exclude-standard", "--", f":(glob)**/{VERIFY_SCRATCH_MARKER}"]
+        visible = util.git_records(["ls-files", "--cached", "--others", *markers], wt)
+        ignored = util.git_records(["ls-files", "--ignored", "--others", *markers], wt)
+        candidates = {Path(n).parent for n in visible + ignored} - {Path(".")}
+        candidates.add(VERIFY_SCRATCH_ROOT)
+    with local_paths.directory_fd(wt.resolve()) as wt_fd:
+        return {root: marker for root in candidates if (marker := verification_marker(wt_fd, root)) is not None}
 
 
 def untracked_by_dir(dirs: list[Path]) -> dict[Path, set[str]]:
@@ -1050,15 +1163,34 @@ class Build(TicketWork):
     def validate_diff(self, staged: Staged, after: str, planned: str = "", *, from_base: bool | None = None) -> None:
         if staged.empty:
             raise workspace.RunFailed(f"{after} undid every change")
-        whole_diff = self.from_base if from_base is None else from_base
-        earlier = 0 if whole_diff else self.committed_lines + sum(c.resolved_lines for c in self.checkouts)
-        why = staged.refusal(self.layer.max_diff_lines, earlier=earlier)
         if staged.denied:
-            raise workspace.RunFailed(f"{after} {why}")
-        if why:
+            raise workspace.RunFailed(f"{after} {staged.refusal(self.layer.max_diff_lines)}")
+        whole_diff = self.from_base if from_base is None else from_base
+        counts, bases = staged, staged.bases
+        earlier = 0
+        if any(has_unpublished_base(c) for c in self.checkouts):
+            whole_diff = True
+            counts, bases, total = diffguard.Diff(), {}, 0
+            for c in self.checkouts:
+                against = bases[c.github] = base_of_head(c)
+                diff = diffguard.between(c.wt, "--cached", against, prefix=c.prefix, moves=True)
+                counts += diff
+                total += diff.lines
+        else:
+            if not whole_diff:
+                earlier = self.committed_lines + sum(c.resolved_lines for c in self.checkouts)
+            total = staged.lines + earlier
+        limit = self.layer.max_diff_lines
+        if total > limit:
+            comparisons = []
+            for c in self.checkouts:
+                label = comparison_label(c, bases[c.github], whole_diff)
+                comparisons.append(f"{c.github} {label}" if len(bases) > 1 else label)
+            against = ", ".join(comparisons)
+            why = f"the diff is {total} lines against {against}, over the {limit} line limit"
             pushed = f"\n- pushed earlier in this run: {earlier}" if earlier else ""
             raise workspace.RunFailed(f"after {after} {why}{planned}; split the work",
-                            f"### Lines changed by file\n\n{lines_by_file(staged)}{pushed}")
+                            f"### Lines changed by file\n\n{lines_by_file(counts)}{pushed}")
 
     def push(self, branch: str, message: str, *, before_push: Callable[[workspace.Checkout], str] | None = None) -> None:
         self.run.tracker.pr_link(self.ticket, whole=not self.left_for_a_person)
@@ -1298,63 +1430,8 @@ def park_run(run: Run, reason: str) -> tuple[str, str, str]:
     record.note(run.id, **kept)
     pr_url = kept["pr_url"]
     run.log(summary)
-    if not run.dry_run:
-        record.note(run.id, label_pending="failed")
-        run.enter("failed")
-        try:
-            with run.budget.watching(periodic=False):
-                run.say(f"Run `{run.id}` {outbound.screen(summary)}", on_ticket=True)
-        except runlimits.Parked as e:
-            run.log(f"parked: ticket updates cut short: {e}")
+    run.enter("failed")
     return status, summary, pr_url
-
-
-def save_failed_finish(run: Run, summary: str, rationale: str, recovery: dict | None,
-                       branch: str, checkouts: list[workspace.Checkout]) -> dict:
-    failure = failure_classification(recovery)
-    prs = {c.pr: c.lease for c in checkouts}
-    body = failure_comment(run, summary, detail=outbound.screen(rationale))
-    run_store.save_failed_finish(run.id, f"{tracker.ARETE_TAG} {public_text(run, body)}", prs,
-                                 summary=summary, failure=json.dumps(failure), **({"branch": branch} if prs else {}))
-    return failure
-
-
-def draft_failed_pr(run: Run, url: str, head: str) -> None:
-    state = gh.pr_view(url).get("state")
-    if state in ("CLOSED", "MERGED"):
-        return
-    if state != "OPEN":
-        raise gh.GhError("GitHub did not confirm the PR state")
-    row = run_store.run_get(run.id)
-    urls = (row.get("pr_url") or "").split()
-    if url not in urls:
-        record.note(run.id, pr_url=" ".join([*urls, url]))
-    if draft_state_for_head(run, url, head) is False:
-        gh.pr_set_draft(url, True, single_attempt=True)
-        run.log(f"failed: marked {url} a draft")
-
-
-def apply_failed_finish(run: Run, pending: dict) -> None:
-    if pending.pop("label_pending") and not run.enter_label("failed"):
-        return
-    if pending["comment"]:
-        marker = f"<!-- arete:failed-finish={run.id} -->"
-        if error := tracker.error_of(lambda: run.tracker.comment_once(run.tid, pending["comment"], marker)):
-            run.log(f"tracker: {util.first_line(error, 300)}")
-        else:
-            pending["comment"] = ""
-            run_store.note_failed_finish(run.id, **pending)
-    for url, head in list(pending["prs"].items()):
-        try:
-            draft_failed_pr(run, url, head)
-        except gh.GhError as e:
-            run.log(f"failed: could not settle {url}: {util.first_line(str(e), 300)}")
-            continue
-        del pending["prs"][url]
-        run_store.note_failed_finish(run.id, **pending)
-    if pending["ticket_pending"] and run.enter_workflow("failed"):
-        pending["ticket_pending"] = False
-        run_store.note_failed_finish(run.id, **pending)
 
 
 def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: bool, flow: factory.Flow | None,
@@ -1504,8 +1581,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 tk.require_ordinary(tid)
             budget_history = run_store.ticket_runs(repo.name, tid, limit=1, live=bool(retry_of or preview_of))
             readmission = None if force else runlimits.Readmission.decode(launch_lease.readmission(repo.name, str(tid)))
-            blocked, reset_budget = runlimits.admission(repo, str(tid), tk, runlimits.Policy.of(layer), force,
-                                                       readmission=readmission)
+            budget_admission = runlimits.admission(repo, str(tid), tk, runlimits.Policy.of(layer), force,
+                                                   readmission=readmission)
         except tracker.ERRORS as e:
             print(f"could not read {name}: {e}")
             return 2
@@ -1515,8 +1592,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         except (ValueError, OSError) as e:
             print(f"could not validate the process budget: {e}")
             return 2
-        if blocked and not dry_run:
-            print(blocked)
+        if budget_admission.reason and not dry_run:
+            print(budget_admission.reason)
             return 2
         if script and script.repairs and (later := run_store.later_run(repo.name, tid, script.repairs)):
             print(f"run {later['id']} of {name} came after run {script.repairs}, so it is not repaired twice")
@@ -1605,8 +1682,10 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 run_id = start()
             scratch.RUN_BASELINES[run_id] = producer_baseline
             scratch.RUN_LABELS[run_id] = service_labels
+            repair_with_feedback = script and script.path == "orchestrate" and script.continues and not script.action
             run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force,
-                      feedback=[] if mending or zte_grant or reconciling_catch_up else pending_feedback(repo.name, tid),
+                      feedback=[] if zte_grant or reconciling_catch_up or (mending and not repair_with_feedback)
+                      else pending_feedback(repo.name, tid),
                       repairs=mending,
                       answering=earlier if earlier and earlier["status"] == "needs-info" else {},
                       launch_gate=admission, launch_done=launch_done, closed_context=closed_context, preview_of=preview_of,
@@ -1680,36 +1759,30 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             if due and not slot.held and not dry_run and not flow.refusal:
                 slot.take(run.log, run.waiting, "answer")
             parent = parent_run(script, earlier, budget_history)
-            previous = "" if reset_budget and not retry_of else parent
+            previous = "" if budget_admission.reset_time and not retry_of else parent
+            repair_parent = "" if budget_admission.reset_repairs and not retry_of else parent
             fresh = bool(previous) and force and not retry_of and not restarting and not run.repairs and not run.alone and not (
                 flow and flow.continues)
             current = tk.get(tid) if fresh else None
+            answered_runs = ()
+            if not dry_run and not only and not (flow and flow.refusal):
+                answered_runs = tuple(a["run"] for a in run.answers_due)
+                if run.answering and answer_text(run.answering["id"]).strip():
+                    answered_runs += (run.answering["id"],)
             with handoff_io():
                 run.budget = runlimits.Budget(run, runlimits.Policy.of(layer), previous, current, fresh,
+                                              repair_previous=repair_parent, answered_runs=answered_runs,
                                               wall_deadline=wall_deadline, checkpoint_timeout=0 if zte_grant else None,
                                               checkpoint_gate=checkpoint_allowed if zte_grant else None)
-            try:
-                with run.budget.watching(admit=check_handoff if zte_grant else None,
-                                         work_admitted=(lambda: work_started and checkpoint_allowed()) if zte_grant else None,
-                                         periodic=not zte_grant):
-                    with handoff_io():
-                        if not (flow and flow.refusal):
-                            run.budget.capture(current or tk.get(tid))
-                    with run_lines.nonblocking_appends(check_work_log) if zte_grant else nullcontext():
-                        work_started = True
-                        status, summary, pr_url = flows.driven(flow, script.drive) if script else _run(cfg, run, slot)
-                        if flow and status == "failed" and (pending := run_store.failed_finish(run.id)):
-                            run.log(f"failed: {summary}")
-                            apply_failed_finish(run, pending)
-            except (runlimits.Parked, Stopped, Exception) as e:
-                if zte_grant or not flow or not run_store.failed_finish(run.id):
-                    raise
-                if isinstance(e, Stopped):
-                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
-                row = run_store.run_get(run.id)
-                status, summary, pr_url = "failed", row["summary"], row["pr_url"] or ""
-                run.failure = json.loads(row["failure"])
-                run.log(f"failed: finishing cut short: {type(e).__name__}: {e}")
+            with run.budget.watching(admit=check_handoff if zte_grant else None,
+                                     work_admitted=(lambda: work_started and checkpoint_allowed()) if zte_grant else None,
+                                     periodic=not zte_grant):
+                with handoff_io():
+                    if not (flow and flow.refusal):
+                        run.budget.capture(current or tk.get(tid))
+                with run_lines.nonblocking_appends(check_work_log) if zte_grant else nullcontext():
+                    work_started = True
+                    status, summary, pr_url = flows.driven(flow, script.drive) if script else _run(cfg, run, slot)
             if zte_grant:
                 check_work_log()
             if flow and flow.only:
@@ -1802,26 +1875,18 @@ def environment_retry_held(run: Run, continues: str, why: str) -> tuple[str, str
     return "pr", why, pr_url
 
 
-def failure_classification(recovery: dict | None) -> dict:
-    return {"class": "environment", **recovery} if recovery else {"class": "work"}
-
-
-def failure_comment(run: Run, why: str, builder_said: str = "", detail: str = "") -> str:
+def _fail(run: Run, why: str, builder_said: str = "", detail: str = "",
+          *, recovery: dict | None = None) -> tuple[str, str, str]:
+    run.failure = {"class": "environment", **recovery} if recovery else {"class": "work"}
+    run.log(f"failed: {why}")
+    run.enter(run.failed_state)
     extra = f"\n\n{detail.strip()}" if detail.strip() else ""
     if builder_said.strip():
         extra += f"\n\n### What the builder said\n\n{builder_said.strip()[:4000]}"
     task = ("apply your feedback" if run.feedback else "repair the review findings" if run.repairs
             else "finish this one")
-    return (f"Could not {task}: {why}{extra}\n\nRun `{run.id}`; details in `arete status` on the "
+    run.say(f"Could not {task}: {why}{extra}\n\nRun `{run.id}`; details in `arete status` on the "
             f"Mac. {run.retry_hint}.")
-
-
-def _fail(run: Run, why: str, builder_said: str = "", detail: str = "",
-          *, recovery: dict | None = None) -> tuple[str, str, str]:
-    run.failure = failure_classification(recovery)
-    run.log(f"failed: {why}")
-    run.enter(run.failed_state)
-    run.say(failure_comment(run, why, builder_said, detail))
     return "failed", why, ""
 
 
@@ -1866,11 +1931,15 @@ def assumptions_of(plan: dict) -> list[str]:
     return [a.strip() for a in listed if isinstance(a, str) and a.strip()] if isinstance(listed, list) else []
 
 
+def question_time(run: dict) -> str:
+    return next((line["ts"] for line in reversed(run_lines.read(run["id"]))
+                 if line.get("event") == "question" and line.get("ts")), None) or run.get("finished") or ""
+
+
 def opening_waits(run_id: str, answering: dict, passed_over: str) -> None:
     now = util.iso()
     if answering:
-        asked = next((line.get("ts") for line in reversed(run_lines.read(answering["id"]))
-                      if line.get("event") == "question"), None) or answering.get("finished")
+        asked = question_time(answering)
         if asked:
             run_lines.waited(run_id, "person", asked, passed_over or now)
     if passed_over:
@@ -2351,31 +2420,35 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
             raise workspace.RunFailed("the worktree has uncommitted files after merging the moved base")
         b.require_valid_diff("catching up the moved base", from_base=True)
         if not b.check():
-            raise workspace.RunFailed("the layer's local checks failed")
+            raise CatchUpGateHold("checks", "the layer's local checks failed", head, b.report)
         if not b.layer.verify:
-            raise workspace.RunFailed("the layer has no behavioral verification configured")
+            raise CatchUpGateHold("verify", "the layer has no behavioral verification configured", head, b.report)
         verified = check_in_use(b, goal, b.build_summary)
         review = _review(b, plan, verified, step=b.next_step("review"))
-        if hold := merge_evidence_hold(b, c, verified, review, head):
-            raise workspace.RunFailed(hold)
+        if problem := merge_evidence_problem(b, c, verified, review, head):
+            gate, why = problem
+            raise CatchUpGateHold(gate, why, head, b.report, verified, review)
         if git(["rev-parse", "HEAD"], c.wt).strip() != head or workspace.uncommitted(c.wt):
             raise workspace.RunFailed("the worktree changed while checking the merge")
         if hold := gh.merge_ref_hold(gh.pr_merge_details(c.pr), c.lease, c.base):
             raise workspace.RunFailed(hold)
         before_push(head, verified, review)
     except BaseException as error:
+        retained = isinstance(error, CatchUpGateHold)
         if isinstance(error, CatchUpPathCollision):
             worktree_files.add(error.name)
-        run.catch_up_preserved.update(c.prefix + name for name in worktree_files)
+            run.catch_up_preserved.add(c.prefix + error.name)
         abort_merge(c.wt)
-        if (git(["rev-parse", "HEAD"], c.wt).strip() != before.lease
+        restore_head = error.head if retained else before.lease
+        if (git(["rev-parse", "HEAD"], c.wt).strip() != restore_head
                 or workspace.uncommitted(c.wt, tracked_only=True)):
-            git(["reset", "--hard", before.lease], c.wt)
+            git(["reset", "--hard", restore_head], c.wt)
         after = workspace.untracked_files(c.wt) | workspace.ignored_file_paths(c.wt)
         for name in after - worktree_files:
             (c.wt / name).unlink(missing_ok=True)
-        c.__dict__.update(vars(before))
-        b.checked, b.report, b.staged = checked, report, staged
+        if not retained:
+            c.__dict__.update(vars(before))
+            b.checked, b.report, b.staged = checked, report, staged
         if isinstance(error, owner_asks.Asked):
             raise CatchUpNeedsInput("a catch-up worker needs owner input") from error
         raise
@@ -2417,19 +2490,25 @@ def push_caught_up_head(b: Build, c: workspace.Checkout, branch: str, head: str)
 
 
 def merge_evidence_hold(b: Build, c: workspace.Checkout, verified: verify.Verified, review: Review, head: str) -> str:
+    problem = merge_evidence_problem(b, c, verified, review, head)
+    return problem[1] if problem else ""
+
+
+def merge_evidence_problem(b: Build, c: workspace.Checkout, verified: verify.Verified,
+                           review: Review, head: str) -> tuple[str, str] | None:
     if verified.verdict != "pass" or not verified.finished or not verified.checks or verified.failed_checks:
-        return "native behavioral verification did not pass"
+        return "verify", "native behavioral verification did not pass"
     if not head:
-        return "this run has no published head to verify"
+        return "verify", "this run has no published head to verify"
     tree = git(["rev-parse", f"{head}^{{tree}}"], c.wt).strip()
     trees = {c.prefix: tree}
     if not tree or verified.native_trees != trees:
-        return "there is no native behavioral pass for the published tree"
+        return "verify", "there is no native behavioral pass for the published tree"
     if not review.approved() or review.trees != trees:
-        return "the published tree lacks a current approving review"
+        return "review", "the published tree lacks a current approving review"
     if not b.layer.checks or b.checked.get("tree") != tree or b.checked.get("commands") != b.layer.checks:
-        return "the published tree lacks the full local check result"
-    return ""
+        return "checks", "the published tree lacks the full local check result"
+    return None
 
 
 def merge_hold(b: Build, c: workspace.Checkout, verified: verify.Verified, review: Review, about: str, *,
@@ -2684,19 +2763,15 @@ def set_draft(run: AgentRun, c: workspace.Checkout, draft: bool, by: str = "ci")
 
 def own_draft_state(run: AgentRun, c: workspace.Checkout) -> bool | None:
     try:
-        return draft_state_for_head(run, c.pr, c.lease)
+        draft, head = gh.pr_draft_and_head(c.pr)
     except gh.GhError as e:
         run.log(f"pr: left {c.pr} as it is: arete could not read its state: {util.first_line(str(e), 300)}")
         return None
-
-
-def draft_state_for_head(run: AgentRun, url: str, expected_head: str) -> bool | None:
-    draft, head = gh.pr_draft_and_head(url)
-    if not head or not expected_head:
-        run.log(f"pr: left {url} as it is: arete could not compare its head with this run's push")
+    if not head or not c.lease:
+        run.log(f"pr: left {c.pr} as it is: arete could not compare its head with this run's push")
         return None
-    if head != expected_head:
-        run.log(f"pr: left {url} as it is: its head is {head[:12]}, not the {expected_head[:12]} this run pushed or "
+    if head != c.lease:
+        run.log(f"pr: left {c.pr} as it is: its head is {head[:12]}, not the {c.lease[:12]} this run pushed or "
                 "checked again, so someone changed it after the run started")
         return None
     return draft
@@ -3018,19 +3093,35 @@ def resolve_conflicts(run: AgentRun, c: workspace.Checkout, conflicts: list[str]
                       ticket: tracker.Ticket, incoming: tuple[str, str] | None = None) -> None:
     deny = diffguard.denied_paths(layer)
     named, commit = incoming or (c.origin_base, c.base_commit)
-    if protected := [p for p in conflicts if util.matches_any(p, deny) or util.matches_any(c.prefix + p, deny)]:
+
+    def denied(path: str) -> bool:
+        return util.matches_any(path, deny) or util.matches_any(c.prefix + path, deny)
+
+    if protected := [p for p in conflicts if denied(p)]:
         raise workspace.RunFailed(f"merging `{named}` conflicts in protected paths in {c.github} "
                         f"({', '.join(protected)}), which a person must merge")
+    conflict_paths = set(conflicts)
     own = {p for p in util.git_records(["diff", "--name-only", f"{commit}...HEAD"], c.wt)
-           if p not in conflicts and not (util.matches_any(p, deny) or util.matches_any(c.prefix + p, deny))}
+           if p not in conflict_paths and not denied(p)}
     incoming_paths = {p for p in util.git_records(["diff", "--name-only", f"HEAD...{commit}"], c.wt)
-                      if p not in conflicts and not (util.matches_any(p, deny) or util.matches_any(c.prefix + p, deny))}
+                      if p not in conflict_paths and not denied(p)}
     supplemental = own | incoming_paths
+    bash_rules = layer.builder_bash
+    initialize_resolver_scratch(c.wt, bash_rules)
+    scratch_markers = verification_scratch_markers(c.wt)
+    parent_tracked = restorable_scratch_paths(c.wt, commit, set(scratch_markers))
+    literal_paths = {"GIT_LITERAL_PATHSPECS": "1"}
     tries = max(1, run.settings("build").tries)
     feedback = "this is the first attempt"
+    restorations: set[str] = set()
     for n in range(1, tries + 1):
+        scratch_roots = set(scratch_markers)
         untracked_before = workspace.untracked_files(c.wt)
-        ignored_before = ignored_state(c.wt)
+        ignored_before = resolver_ignored_paths(c.wt, parent_tracked)
+        scratch_before = resolver_scratch_paths((untracked_before | ignored_before) - parent_tracked, scratch_roots)
+        scratch_metadata = {name: resolver_scratch_metadata(c.wt, name) for name in scratch_before}
+        watched_before = (ignored_before | (untracked_before & parent_tracked)) - scratch_before
+        fingerprints = {n: workspace.fingerprint(c.wt / n, "") for n in watched_before}
         previous = run.sessions.get("build")
         text = prompt_loader.prompt("resolve", repo=run.repo.name, github=c.github, base=named,
                       base_commit=commit[:12], head=git(["rev-parse", "HEAD"], c.wt).strip()[:12],
@@ -3039,11 +3130,11 @@ def resolve_conflicts(run: AgentRun, c: workspace.Checkout, conflicts: list[str]
                       own="\n".join(f"- `{p}`" for p in sorted(own)) or "- none",
                       branch_log=git(["log", "--oneline", "-n30", "MERGE_HEAD..HEAD"], c.wt),
                       base_log=git(["log", "--oneline", "-n30", "HEAD..MERGE_HEAD"], c.wt),
-                      commands=prompt_loader.code_list(layer.builder_bash), attempt=n, tries=tries, feedback=feedback,
+                      commands=prompt_loader.code_list(bash_rules), attempt=n, tries=tries, feedback=feedback,
                       owner=run.owner_note)
         try:
             res = run.agent(round_name("resolve", n), prompt_loader.task_prompt(text), c.wt, role="build",
-                            allowed_tools=prompt_loader.bash_rules(layer.builder_bash), disallowed_tools=routing.NO_GIT_WRITES,
+                            allowed_tools=prompt_loader.bash_rules(bash_rules), disallowed_tools=routing.NO_GIT_WRITES,
                             json_schema=RESOLVE_SCHEMA, resume=NO_SESSION, extra_env=dict(RESOLVER_SETS))
         finally:
             if previous is None:
@@ -3057,15 +3148,30 @@ def resolve_conflicts(run: AgentRun, c: workspace.Checkout, conflicts: list[str]
         if answer.get("resolved") is not True:
             raise workspace.RunFailed(f"the resolver could not keep both the branch's work and the base's in {c.github}: "
                             f"{answer.get('summary') or 'no reason given'}", res.text)
-        for name in workspace.untracked_files(c.wt) - untracked_before:
+        untracked_after = workspace.untracked_files(c.wt)
+        ignored_after = resolver_ignored_paths(c.wt, parent_tracked)
+        scratch_after = resolver_scratch_paths((untracked_after | ignored_after) - parent_tracked, scratch_roots)
+        watched_after = (ignored_after | (untracked_after & parent_tracked)) - scratch_after
+        new_untracked = untracked_after - untracked_before - scratch_after - parent_tracked
+        for name in new_untracked.copy():
             if Path(name).parent.name == "__pycache__" and Path(name).suffix == ".pyc":
                 workspace.remove_untracked(c.wt, name)
-        ignored_after = ignored_state(c.wt)
-        changed_ignored = {n for n in ignored_before.keys() | ignored_after.keys()
-                           if ignored_before.get(n) != ignored_after.get(n)}
-        touched = (set(util.git_records(["diff", "--name-only"], c.wt)) | (workspace.untracked_files(c.wt) - untracked_before)
-                   | changed_ignored)
-        if outside := sorted(touched - set(conflicts) - supplemental):
+                new_untracked.remove(name)
+        scratch_markers = {root: marker for root, marker in verification_scratch_markers(c.wt, scratch_roots).items()
+                           if marker == scratch_markers[root]}
+        changed_watched = watched_before ^ watched_after
+        changed_watched.update(n for n in watched_before & watched_after
+                               if fingerprints[n] != workspace.fingerprint(c.wt / n, ""))
+        restorations = (restorations | changed_watched) & watched_after & parent_tracked
+        invalidated_roots = scratch_roots - scratch_markers.keys()
+        invalidated_before = resolver_scratch_paths(scratch_before, invalidated_roots)
+        invalidated_after = resolver_scratch_paths(scratch_after, invalidated_roots)
+        invalidated_edits = invalidated_before ^ invalidated_after
+        invalidated_edits.update(name for name in invalidated_before & invalidated_after
+                                 if scratch_metadata[name] != resolver_scratch_metadata(c.wt, name))
+        tracked_edits = set(util.git_records(["diff", "--name-only"], c.wt))
+        touched = tracked_edits | new_untracked | changed_watched | restorations
+        if outside := sorted((touched - conflict_paths - supplemental) | invalidated_edits):
             raise workspace.RunFailed(f"the resolver edited files outside the conflict in {c.github}: {', '.join(outside)}")
         if left := marked(c.wt, conflicts):
             feedback = f"conflict markers remain in {', '.join(left)}; remove every one"
@@ -3073,7 +3179,13 @@ def resolve_conflicts(run: AgentRun, c: workspace.Checkout, conflicts: list[str]
                 raise workspace.RunFailed(f"conflict markers remain in {', '.join(left)} after {util.count(n, 'attempt')} "
                                 f"in {c.github}")
             continue
-        git(["add", "-A", "--", *conflicts, *sorted(touched & supplemental)], c.wt)
+        git(["add", "-u", "--", *conflicts, *sorted(tracked_edits & supplemental)], c.wt, env=literal_paths)
+        additions = (touched & supplemental) - tracked_edits - (parent_tracked - restorations)
+        ignored_restorations = additions & restorations & ignored_after
+        if ignored_restorations:
+            git(["add", "-f", "--", *sorted(ignored_restorations)], c.wt, env=literal_paths)
+        if additions := additions - ignored_restorations:
+            git(["add", "-A", "--", *sorted(additions)], c.wt, env=literal_paths)
         if unmerged_paths(c.wt):
             raise workspace.RunFailed(f"files are still unmerged in {c.github} after the resolver ran")
         with util.repo_lock(c.src):
@@ -3168,6 +3280,27 @@ def publish_ci(run: AgentRun, t: tracker.Ticket, pushed: list[workspace.Checkout
             run.log(f"ci: could not write the CI section on {c.pr}: {util.first_line(str(e), 300)}")
 
 
+def publish_gate_evidence(run: Run, t: tracker.Ticket, c: workspace.Checkout,
+                          verified: verify.Verified | None, review: Review | None, *, held: str = "") -> None:
+    checked = verified.markdown() if verified is not None else "Verification did not run."
+    if held:
+        checked = f"{held}\n\n{checked}"
+    sections = ((CHECKED_IN_USE_HEADING, f"{CHECKED_IN_USE_HEADING}\n\n{checked}"),
+                ("## Review", review.markdown() if review is not None else "## Review\n\nReview did not run."))
+    links = (run.tracker.pr_link(t, whole=True), run.tracker.pr_link(t, whole=False))
+    try:
+        kept, body = gh.split_link(gh.pr_body(c.pr), links)
+        for heading, section in sections:
+            pattern = re.compile(rf"^{re.escape(heading)}\n.*?(?=^## |\Z)", re.M | re.S)
+            if pattern.search(body):
+                body = pattern.sub(lambda _: f"{section.rstrip()}\n\n", body, count=1)
+            else:
+                body = f"{body.rstrip()}\n\n{section}"
+        gh.pr_edit_body(c.pr, public_text(run, body.rstrip()), link=kept)
+    except gh.GhError as e:
+        run.log(f"automerge: could not update gate evidence in {c.pr}: {util.first_line(str(e), 300)}")
+
+
 def comment_catch_up_ci(run: AgentRun, c: workspace.Checkout, ci_section: str,
                         verified: verify.Verified, review: Review) -> None:
     key = "catch-up-evidence"
@@ -3219,6 +3352,10 @@ def supersede_older_runs(run: Run, urls: list[str]) -> None:
 
 def pending_feedback(repo_name: str, tid: str) -> list[dict]:
     return insights_store.open_feedback([url for r in run_store.open_runs(repo_name, tid) for url in (r.get("pr_url") or "").split()])
+
+
+def feedback_key(row: dict) -> tuple[str, str, int]:
+    return row["pr_url"], row["kind"], row["gh_id"]
 
 
 def feedback_markdown(rows: list[dict]) -> str:
@@ -3739,36 +3876,6 @@ def commit_layer(layer_dir: Path, message: str, written: list[Path]) -> str:
         return commit_written(layer_dir, message, written)
 
 
-def sync_failed_finishes(cfg: config.Config) -> None:
-    from . import zte
-
-    for row in run_store.unfinished_failed_finishes():
-        issue = str(row["issue"])
-        try:
-            repo = cfg.repo(row["repo"])
-        except KeyError:
-            continue
-        with util.lock(run_store.run_lock("pipeline", repo.name, issue)) as free:
-            if not free or zte.reserved(issue):
-                continue
-            pending = run_store.failed_finish(row["id"])
-            if pending is None:
-                continue
-            newest = run_store.newest_live_whole_run(repo.name, issue)
-            if newest and newest["id"] != row["id"]:
-                run_store.discard_failed_finish(row["id"])
-                continue
-            run = Run(row["id"], repo, paths.RUNS_DIR / row["id"], tracker=tracker.for_ticket(cfg, repo, issue), tid=issue)
-            run.dir.mkdir(parents=True, exist_ok=True)
-            try:
-                if pending["label_pending"] or run.tracker.has_state(issue, "failed"):
-                    apply_failed_finish(run, pending)
-                else:
-                    run_store.discard_failed_finish(run.id)
-            except tracker.ERRORS as e:
-                run.log(f"tracker: {util.first_line(str(e), 300)}")
-
-
 def sync_labels(cfg: config.Config) -> None:
     seen: set[tuple[str, str]] = set()
     for r in run_store.runs(kind="pipeline", limit=200):
@@ -3780,8 +3887,6 @@ def sync_labels(cfg: config.Config) -> None:
         seen.add(key)
         want = r["label_pending"]
         if not want or r["status"] == "running" or util.lock_is_held(run_store.run_lock("pipeline", *key)):
-            continue
-        if want == "failed" and run_store.failed_finish(r["id"]):
             continue
         if r["status"] == "interrupted":
             record.note(r["id"], label_pending="")
@@ -3874,8 +3979,6 @@ def tell_ticket_run_died(cfg: config.Config, row: dict) -> None:
     if row["status"] != "stopped":
         run_lines.write(row["id"], "error", step=run_lines.last_step(row["id"]), message=row.get("summary") or "")
     write_report(row)
-    if run_store.failed_finish(row["id"]):
-        return
     if run.alone:
         run.log(f"{record.STOPPED if row['status'] == 'stopped' else record.INTERRUPTED}, a run of "
                 f"{row['only_step']} alone, so the ticket stays as it was")
@@ -3935,7 +4038,7 @@ def run_skipped(name: str) -> dict:
 
 
 def answered_run(repo_name: str, tid: str) -> dict | None:
-    newest = run_store.newest_whole_run(repo_name, tid)
+    newest = run_store.newest_live_whole_run(repo_name, tid)
     if (newest and newest["status"] == "needs-info" and asks_store.asks_due([newest["id"]])
             and not asks_store.asks_of(newest["id"], "open")):
         return newest
