@@ -3413,8 +3413,10 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                                 "these commands. " + instructions + probes.markdown())
             if not probes or probes.verdict == "pass":
                 agent_started = True
+                fault_controls = verify.fault_note(v) if url and delivery_verification else ""
                 res = run.agent(step, b.brief.prompt(
-                    prompt_name, surface=surface_note(v, url, evidence), notes=v.notes, scratch=scratch.note(attempt),
+                    prompt_name, surface=surface_note(v, url, evidence) + fault_controls, notes=v.notes,
+                    scratch=scratch.note(attempt),
                     commands=prompt_loader.code_list(bash), checks=check_list(b.layer),
                     compare=compare_with_fork(b.checkouts), owner=run.owner_note,
                     journeys=journeys.guidance(selected or feature_map), **values),
@@ -3510,7 +3512,8 @@ def surface_note(v: config.Verify, url: str, evidence: Path) -> str:
             "saved there also serves as a fixture.\n"
             "- Read `browser_console_messages` after each state. Name each console error and each dev error overlay "
             "or badge in `saw`, and say whether the change causes it.\n"
-            "- Send API requests with curl, shaped the way the app's clients send them, and read the status and body.")
+            "- For ordinary API checks, send requests with curl, shaped the way the app's clients send them, "
+            "and read the status and body.")
 
 
 def restore_worktrees(untracked_before: dict[Path, set[str]], evidence: Path) -> None:
