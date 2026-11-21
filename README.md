@@ -80,10 +80,10 @@ A killed loop's queued input gets one automatic recovery retry when serve reaps 
 Only one serve can hold a state folder on this machine. A second invocation exits naming the holder's PID and state folder. A separate `arete dashboard` beside serve leaves its live chats and feedback checks alone.
 
 Serve restarts itself when its own code changes, keeping ownership of the state folder across the restart.
-On each tick it looks at the `.py` files of the arete package and the dashboard's web files. Once a change has held still for one tick, it checks that the new code imports and reads the config, then runs `arete migrate --no-contracts` once for that code stamp, before waiting for its source polls, dashboard requests and chat messages to finish. A failed import or migration keeps the current code and prints the last error line. It then answers new dashboard and API writes with 503 and `Retry-After: 3` for that moment (reads keep working), checks again that nothing is in flight, and only then replaces itself with a fresh serve in the same process; if something started meanwhile, it opens writes again and waits.
+On each tick it looks at the `.py` files of the arete package and the dashboard's web files. Once a change has held still for one tick, it checks that the new code imports and reads the config, then runs `arete migrate --no-contracts` once for that code stamp. For ordinary edits, a failed import or migration keeps the current code and prints the last error line. Before restarting, serve waits for its source polls, dashboard requests and chat messages to finish. It then answers new dashboard and API writes with 503 and `Retry-After: 3` while it checks again that nothing is in flight. Reads keep working. If something started meanwhile, serve opens writes again and waits. Otherwise it replaces itself with a fresh serve in the same process.
 Runs and sessions are processes of their own, so they keep going across the restart, and the fresh serve reaps each one when it ends.
-New code that does not import is named in the serve log, and serve keeps the code it started with.
-A self restart is not a start, so loops with `run_at_load` do not fire again.
+Serve records the previous and new commits before a self-deploy fast forward. It waits for in-flight work to finish before checking the candidate. The candidate's first start opens a five-minute health window. Import, config and migration checks that fail count as failed starts. A start rolls back an unhealthy deploy after three failed starts or five minutes in that window. Rollback restores code only. The failed commit is held from deploy, and a ticket labeled `agent` includes a redacted excerpt from the local `serve.log` tail when available. A successful full tick and, when enabled, a dashboard readiness response mark the deploy healthy. Re-run `arete install` to give an existing service the guard that runs before the checkout's Python package loads.
+Loops with `run_at_load` keep their schedule across a self-restart.
 So a push to arete's own main, followed by a fast forward of the checkout serve runs from, reaches serve with no restart by hand.
 
 ## Loops
@@ -1006,7 +1006,7 @@ Approval, dependency, running-ticket and capacity checks still decide whether a 
 ## Develop locally
 
 `uv run arete status` runs from the checkout without the installed tool.
-`uv tool install --editable . --python 3.13 --force` refreshes the `arete` on PATH that launchd uses.
+`arete install` configures the service to check the self-deploy receipt before importing the checkout. A terminal `arete serve` reaches the same check through the CLI after the package initializer loads.
 
 To inspect a fresh local database without using your regular Arete config or state, run this from the checkout:
 

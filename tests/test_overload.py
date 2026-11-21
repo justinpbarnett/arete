@@ -95,25 +95,36 @@ class OverloadRunTests(unittest.TestCase):
 
     def route_chain(self, auth, which, models):
         def pick(trip):
+            skipped = []
             for model in models:
-                if not routing.auth_hold(auth, model):
-                    return runner.Picked(self.candidate(which, model), auth, None, model, "", {auth}, None), []
-            return None, [{"runner": which, "model": models[-1], "credential": "login", "state": "held",
-                           "detail": "", "until": ""}]
+                hold = routing.auth_hold(auth, model)
+                if not hold:
+                    return runner.Picked(self.candidate(which, model), auth, None, model, "", {auth}, None), skipped
+                skipped.append({"runner": which, "model": model, "credential": "login", "state": "held",
+                                "detail": hold["why"], "until": hold["until"]})
+            return None, skipped
         return pick
 
     def run_chain(self, which, models, family, results, identity):
         auth = accounts.Auth(mode="subscription", family=family, identity=identity)
+        results = iter(results)
 
         def launch(prompt, cwd, **kw):
             self.calls.append(kw["model"])
-            return results[len(self.calls) - 1]
+            return next(results)
         with (mock.patch.object(runner, "pick", self.route_chain(auth, which, models)),
               mock.patch.object(getattr(runner, which), "run", launch),
-              mock.patch.object(runner.time, "sleep", side_effect=AssertionError("slept"))):
+              mock.patch.object(runner, "wait_until", side_effect=AssertionError("unexpected limit wait"))):
             res = runner.run("review", ".", model=models[0], runner=which, cfg=self.cfg,
                              wait_out_limits=False, say=lambda text: None, trace=("overload-run", "review"))
         return auth, res
+
+    def test_overloaded_route_returns_without_waiting_for_its_limit(self):
+        failed = agent.Result(ok=False, error=CAPACITY, usage_limit=codex.usage_limit(CAPACITY, "gpt-6.2-sol"))
+        _, res = self.run_chain("codex", ["gpt-6.2-sol"], "codex", [failed], "overload-no-wait")
+        self.assertEqual(self.calls, ["gpt-6.2-sol"])
+        self.assertFalse(res.ok)
+        self.assertEqual(res.usage_limit.until, failed.usage_limit.until)
 
     def test_codex_capacity_runs_the_next_route_and_holds_only_that_model(self):
         failed = agent.Result(ok=False, error=CAPACITY, usage_limit=codex.usage_limit(CAPACITY, "gpt-6.2-sol"))
@@ -128,10 +139,8 @@ class OverloadRunTests(unittest.TestCase):
     def test_claude_529_runs_the_next_route_and_holds_only_that_model(self):
         failed = claude.parse(claude_failure("API Error: 529 overloaded_error", 529), agent.NO_SESSION,
                               "claude-opus-4-7", None)
-        # Keep run_chain's sleep assertion local to runner, away from subprocess polling.
-        with mock.patch.object(runner, "time", mock.Mock(wraps=runner.time)):
-            auth, res = self.run_chain("claude", ["claude-opus-4-7", "claude-sonnet-4-6"], "claude",
-                                       [failed, agent.Result(ok=True, text="done")], "claude-529-login")
+        auth, res = self.run_chain("claude", ["claude-opus-4-7", "claude-sonnet-4-6"], "claude",
+                                   [failed, agent.Result(ok=True, text="done")], "claude-529-login")
         self.assertEqual(self.calls, ["claude-opus-4-7", "claude-sonnet-4-6"])
         self.assertTrue(res.ok)
         self.assertIsNotNone(routing.auth_hold(auth, "claude-opus-4-7"))

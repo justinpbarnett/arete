@@ -1,4 +1,7 @@
+import ast
+import http.client
 import json
+import os
 import shlex
 import shutil
 import signal
@@ -12,11 +15,12 @@ import time
 import tomllib
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
+from contextlib import closing, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import asdict, replace
 from datetime import timedelta
 from io import StringIO
 from pathlib import Path
+from socket import socketpair
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from typing import ClassVar
@@ -24,9 +28,9 @@ from unittest import mock
 
 from adws import single_worker
 from arete import (
-    api_check, ci, codex, config, diffguard, evals, factory, flows, gh, guard, jev, journeys, loop_run, mergecheck,
-    miner, orchestration, outcomes, owner_asks, paths, pipeline, poll, queueing, runlimits, sandbox, serve, tracker,
-    util, verify, workspace,
+    api_check, ci, codex, config, dashboard, diffguard, evals, factory, flows, gh, guard, install, jev, journeys,
+    loop_run, mergecheck, miner, orchestration, outcomes, owner_asks, paths, pipeline, poll, principals, queueing,
+    runlimits, sandbox, serve, serve_guard, slots, tailnet, tracker, util, verify, workspace,
 )
 from arete.agent import NO_SESSION, Result
 from arete.orchestration_api import OPERATIONS
@@ -161,11 +165,8 @@ class QueueScoringTests(unittest.TestCase):
 class PublicationFixture(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
-        self.git("init", "-q", "--template=", "-b", "main")
         self.file = self.root / "file.txt"
-        self.file.write_text("base\n")
-        self.commit("base")
-        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        self.set_up_repository()
         self.checkout = workspace.Checkout("", "fixture/repo", self.root, self.root, "main")
         self.controller = orchestration.Controller.__new__(orchestration.Controller)
         run = mock.Mock(id="fixture-run", environment_release="", dry_run=False)
@@ -185,6 +186,21 @@ class PublicationFixture(unittest.TestCase):
                                                               return_value=None))
         self.enterContext(mock.patch.object(pipeline.record, "mark"))
         self.enterContext(mock.patch.object(orchestration.run_lines, "write"))
+
+    def set_up_repository(self):
+        self.create_repository(self.root)
+
+    @staticmethod
+    def create_repository(root):
+        def git(*args):
+            util.git(list(args), root)
+
+        git("init", "-q", "--template=", "-b", "main")
+        (root / "file.txt").write_text("base\n")
+        git("add", "--", "file.txt")
+        git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.com",
+            "-c", "commit.gpgSign=false", "commit", "-qm", "base")
+        git("update-ref", "refs/remotes/origin/main", "HEAD")
 
     def git(self, *args):
         return util.git(list(args), self.root).strip()
@@ -1359,6 +1375,7 @@ class CatchUpRepairFixture(PublicationFixture):
             controller.stamp("verify", asdict(job.verified))
             controller.stamp("review", job.review.asdict())
         controller.persist()
+        self.addCleanup(controller.release_merge_lease)
 
     def action_result(self, op, **args):
         controller = self.controller
@@ -1476,6 +1493,14 @@ class CatchUpReviewRepairTests(CatchUpRepairFixture):
 
 
 class CatchUpReviewTests(CatchUpRepairFixture):
+    @classmethod
+    def setUpClass(cls):
+        cls.repository_fixture = Path(cls.enterClassContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        cls.create_repository(cls.repository_fixture)
+
+    def set_up_repository(self):
+        shutil.copytree(self.repository_fixture, self.root, dirs_exist_ok=True)
+
     def test_catch_up_requires_approval_for_the_pushed_tree(self):
         self.record_pushed_head()
         c = self.checkout
@@ -2012,7 +2037,442 @@ class MovedBasePublicationFixture:
             flows.publish(controller.flow, **kw) if name == "publish"
             else factory.Outcome("pass", data={"heads": {checkout.github: checkout.lease}})))
         controller.catalog = mock.Mock(context={})
+        self.addCleanup(controller.release_merge_lease)
         return controller, checkout
+
+
+class AutomergeLeaseTests(MovedBasePublicationFixture, unittest.TestCase):
+    def setUp(self):
+        self.state = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        locks = self.state / "locks"
+        locks.mkdir()
+        self.enterContext(mock.patch.multiple(paths, LOCKS_DIR=locks, ensure_dirs=mock.DEFAULT))
+        self.running = []
+        self.enterContext(mock.patch.object(slots.run_store, "runs_marked_running", return_value=self.running))
+        self.enterContext(mock.patch.object(slots.chats_store, "chat_sessions", return_value=[]))
+        self.enterContext(mock.patch.object(slots.zte_store, "activation_pending", return_value=False))
+        self.enterContext(mock.patch.object(slots, "live_max_parallel", return_value=2))
+        self.sleep = mock.Mock(side_effect=AssertionError("unexpected wait for a run slot"))
+        self.enterContext(mock.patch.object(slots, "time", SimpleNamespace(sleep=self.sleep)))
+
+    def running_slot(self, tid):
+        run_id = f"run-{tid}"
+        self.running.append({"id": run_id, "kind": "pipeline", "repo": "repo", "issue": tid})
+        slot = slots.RunSlot("repo", tid, 2)
+        slot.hold()
+        self.addCleanup(slot.free)
+        return run_id, slot
+
+    def ready_run(self, tid):
+        controller, checkout = self.controller()
+        run, job = controller.run, controller.job
+        run.tid = tid
+        run.id, job.slot = self.running_slot(tid)
+        checkout.pr = f"https://github.com/{checkout.github}/pull/{tid}"
+        checkout.lease = f"head-{tid}"
+        checkout.src = checkout.wt = self.state / tid
+        job.b.checkouts = [checkout]
+        controller.data["publication"] = {"heads": {checkout.github: checkout.lease}}
+        controller.stamp = mock.Mock()
+        return controller, checkout
+
+    def test_waiter_catches_up_once_against_the_first_runs_merge(self):
+        self.waiter_catches_up(fixed=False)
+
+    def test_fixed_waiter_catches_up_after_refreshing_a_stale_base(self):
+        self.waiter_catches_up(fixed=True)
+
+    def test_timed_out_ci_waits_for_capacity_before_reading_the_moved_base(self):
+        self.waiter_catches_up(fixed=False, ci_after_base_move="pending")
+
+    def test_green_ci_waits_for_capacity_before_reading_the_moved_base(self):
+        self.waiter_catches_up(fixed=False, ci_after_base_move="pass")
+
+    def test_green_waiter_refreshes_an_unchanged_base_after_a_slot_frees(self):
+        first, a = self.ready_run("1")
+        second, b = self.ready_run("2")
+        _, other_slot = self.running_slot("3")
+        other_slot.free()
+        first.take_merge_lease(a)
+        waiting = threading.Event()
+        capacity_wait = threading.Event()
+        allow_resume = threading.Event()
+        second.run.log.side_effect = lambda line: waiting.set() if "waiting for the merge lease" in line else None
+        local_base = "stale-base"
+
+        def wait_for_capacity(_seconds):
+            self.assertTrue(util.lock_is_held("automerge-fixture%2Frepo"))
+            self.assertIsNone(second.job.slot.held)
+            capacity_wait.set()
+            self.assertTrue(allow_resume.wait(1.5))
+
+        self.sleep.side_effect = wait_for_capacity
+
+        def fetch(src, branch):
+            nonlocal local_base
+            self.assertEqual((src, branch), (b.src, "main"))
+            local_base = "current-base"
+
+        def merge(_build, checkout, _number, head, base, _about, **_):
+            self.assertEqual((checkout, head, base), (b, b.lease, "current-base"))
+            self.assertTrue(util.lock_is_held("automerge-fixture%2Frepo"))
+            self.assertTrue(first.job.slot.held and second.job.slot.held)
+            return ""
+
+        def watch(target, _log):
+            check = gh.Check("checks", "pass")
+            return ci.Watched(target, {check.key: check})
+
+        with (mock.patch.object(ci, "watch", side_effect=watch),
+              mock.patch.object(orchestration.pilot, "is_pilot_task", return_value=True),
+              mock.patch.object(second, "check_pilot_publication"),
+              mock.patch.object(pipeline, "publish_ci"),
+              mock.patch.object(pipeline, "merge_evidence_hold", return_value=""),
+              mock.patch.object(pipeline, "git", side_effect=lambda *_: local_base),
+              mock.patch.object(pipeline, "has_merge_base", side_effect=lambda _, head, base: base == "current-base"),
+              mock.patch.object(pipeline, "screen_and_merge", side_effect=merge) as merge_head,
+              mock.patch.object(pipeline, "catch_up_base") as catch_up,
+              mock.patch.object(workspace, "fetch", side_effect=fetch) as fetch_base,
+              mock.patch.object(gh, "merge_readiness", return_value=("title", "")),
+              mock.patch.object(jev, "ready", return_value=True),
+              mock.patch.object(flows, "ended", return_value=("pr", "published", b.pr)),
+              ThreadPoolExecutor(max_workers=1) as pool):
+            result = pool.submit(second.publish)
+            try:
+                self.assertTrue(waiting.wait(1.5))
+                self.assertIsNone(second.job.slot.held)
+                other_slot.take(mock.Mock())
+                self.assertEqual(len(slots.runs_in_slots()), 2)
+                fetch_base.assert_not_called()
+                first.release_merge_lease()
+                self.assertTrue(capacity_wait.wait(1.5))
+                fetch_base.assert_not_called()
+                merge_head.assert_not_called()
+                other_slot.free()
+            finally:
+                first.release_merge_lease()
+                allow_resume.set()
+            self.assertEqual(result.result(timeout=1.5)["ending"], "pr")
+            fetch_base.assert_called_once()
+            merge_head.assert_called_once()
+            catch_up.assert_not_called()
+        self.assertIsNone(second.merge_lease)
+        self.sleep.assert_called_once()
+
+    def test_classic_drafts_failed_catch_up_only_for_the_watched_head(self):
+        controller, checkout = self.controller()
+        job, run = controller.job, controller.run
+        job.b.checkouts = [checkout]
+        job.slot = mock.Mock(spec=slots.RunSlot)
+        for result, live_head in (
+            ("fail", "caught-up"),
+            ("unread", "caught-up"),
+            ("fail", "maintainer-head"),
+            ("unread", "maintainer-head"),
+            ("fail", ""),
+            ("unread", gh.GhError("PR unavailable")),
+            ("unread", ValueError("malformed PR state")),
+        ):
+            with self.subTest(ci=result, head=live_head):
+                checkout.note_pushed_head("previous-head")
+                job.b.catch_ups = 0
+                refs = {"state": "OPEN", "isDraft": False, "headRefOid": checkout.lease, "baseRefName": "main"}
+
+                def catch_up(*_):
+                    checkout.note_pushed_head("caught-up")
+                    return job.verified, job.review
+
+                def watch(target, _log):
+                    self.assertEqual(target.sha, "caught-up")
+                    check = gh.Check("checks", result)
+                    return ci.Watched(target, {check.key: check} if result == "fail" else {}, read=result == "fail")
+
+                with (mock.patch.object(pipeline, "merge_hold", return_value=gh.MovedBaseHold("base moved")) as hold,
+                      mock.patch.object(gh, "pr_merge_details", return_value=refs),
+                      mock.patch.object(pipeline, "fetch_merge_base", return_value="new-base"),
+                      mock.patch.object(pipeline, "catch_up_base", side_effect=catch_up),
+                      mock.patch.object(pipeline, "note_review"),
+                      mock.patch.object(pipeline, "publish_gate_evidence"),
+                      mock.patch.object(pipeline, "comment_catch_up_ci"),
+                      mock.patch.object(ci, "watch", side_effect=watch) as watch_ci,
+                      mock.patch.object(gh, "branch_sha", return_value="new-base"),
+                      mock.patch.object(gh, "commit_checks", return_value={}),
+                      mock.patch.object(gh, "pr_draft_and_head", return_value=(False, live_head),
+                                        side_effect=live_head if isinstance(live_head, Exception) else None) as state,
+                      mock.patch.object(gh, "pr_set_draft") as draft,
+                      mock.patch.object(gh, "pr_comment") as comment):
+                    summary = pipeline.automerge(job.b, None, "", job.verified, job.review, [checkout], "",
+                                                 slot=job.slot, branch="run", goal="", plan="")
+                watch_ci.assert_called_once()
+                state.assert_called_once_with(checkout.pr)
+                hold.assert_called_once()
+                self.assertEqual(run.facts["merge_held"], f"catch-up CI held: {summary}")
+                self.assertIn("A person merges it.", comment.call_args.args[1])
+                if live_head == "caught-up":
+                    draft.assert_called_once_with(checkout.pr, True)
+                else:
+                    draft.assert_not_called()
+
+    def test_orchestrated_catch_up_ci_leaves_a_replacement_head_ready(self):
+        for result in ("fail", "unread"):
+            with self.subTest(ci=result):
+                controller, checkout = self.ready_run("7")
+                self.addCleanup(controller.close)
+                pr = {"head": checkout.lease, "draft": False}
+
+                def catch_up(*_, before_push):
+                    evidence = verify.Verified("pass"), Review("approve")
+                    before_push("caught-up", *evidence)
+                    checkout.note_pushed_head("caught-up")
+                    pr["head"] = checkout.lease
+                    return evidence
+
+                def watch(target, _log):
+                    self.assertEqual(target.sha, pr["head"])
+                    self.assertEqual(target.sha, "caught-up")
+                    pr["head"] = "maintainer-head"
+                    check = gh.Check("checks", "fail")
+                    return ci.Watched(target, {check.key: check} if result == "fail" else {}, read=result == "fail")
+
+                def draft_pr(_, draft):
+                    pr["draft"] = draft
+
+                refs = {"state": "OPEN", "isDraft": False, "headRefOid": checkout.lease, "baseRefName": "main"}
+                controller.ci_failures = mock.Mock(return_value="CI needs diagnosis")
+                with (mock.patch.object(pipeline, "merge_hold", return_value=gh.MovedBaseHold("base moved")) as merge,
+                      mock.patch.object(gh, "pr_merge_details", return_value=refs),
+                      mock.patch.object(pipeline, "fetch_merge_base", return_value="new-base"),
+                      mock.patch.object(pipeline, "catch_up_base", side_effect=catch_up),
+                      mock.patch.object(pipeline, "note_review"),
+                      mock.patch.object(pipeline, "publish_gate_evidence"),
+                      mock.patch.object(pipeline, "comment_catch_up_ci"),
+                      mock.patch.object(ci, "watch", side_effect=watch),
+                      mock.patch.object(gh, "branch_sha", return_value="new-base"),
+                      mock.patch.object(gh, "commit_checks", return_value={}),
+                      mock.patch.object(gh, "pr_draft_and_head", side_effect=lambda _: (pr["draft"], pr["head"])) as state,
+                      mock.patch.object(gh, "pr_set_draft", side_effect=draft_pr) as draft):
+                    failure = controller.finish_publication()
+                self.assertEqual(failure["failures"], orchestration.CI_FAILURES)
+                self.assertEqual(pr, {"head": "maintainer-head", "draft": False})
+                state.assert_called_once_with(checkout.pr)
+                draft.assert_not_called()
+                merge.assert_called_once()
+                controller.close()
+                controller.job.slot.free()
+
+    def waiter_catches_up(self, *, fixed, ci_after_base_move=""):
+        first, a = self.ready_run("1")
+        second, b = self.ready_run("2")
+        if fixed:
+            second.run.path = "feature"
+            second.job.branch = "run-2"
+            second.job.goal, second.job.plan_text = "verify changes", "make a change"
+            second.job.with_left.side_effect = lambda text: text
+        watches = threading.Event()
+        finish_watch = threading.Event()
+        capacity_wait = threading.Event()
+        allow_resume = threading.Event()
+        waiting = threading.Event()
+        second.run.log.side_effect = lambda line: waiting.set() if "waiting for the merge lease" in line else None
+        base, merged, reads = "main-0", [], []
+        heads = {a.pr: a.lease, b.pr: b.lease}
+        checkouts = {c.src: c for c in (a, b)}
+        local_bases = dict.fromkeys(checkouts, base)
+        original_bases = {a.lease: "before-main-0", b.lease: "main-0"}
+        caught_up = {}
+
+        def fetch(src, branch):
+            self.assertEqual(branch, "main")
+            reads.append((checkouts[src].pr, base))
+            local_bases[src] = base
+
+        def git(args, wt):
+            self.assertEqual(args, ["rev-parse", "origin/main"])
+            return local_bases[wt]
+
+        def catch_up(build, checkout, branch, base_sha, *args, before_push=None):
+            self.assertTrue(util.lock_is_held("automerge-fixture%2Frepo"))
+            controller = first if build.run is first.run else second
+            self.assertIsNotNone(controller.job.slot.held)
+            self.assertLessEqual(len(slots.runs_in_slots()), 2)
+            if build.run is first.run and base_sha == "main-external" and ci_after_base_move == "pending":
+                self.assertIn("still running", first.job.ci_result)
+            if build.run is second.run and fixed:
+                self.assertEqual((branch, *args[:2]), ("run-2", "verify changes", "make a change"))
+            head = f"head-{build.run.tid}-caught-up-{build.catch_ups}"
+            evidence = verify.Verified("pass"), Review("approve")
+            caught_up[head] = base_sha
+            if before_push is not None:
+                before_push(head, *evidence)
+            heads[checkout.pr] = head
+            checkout.note_pushed_head(head)
+            return evidence
+
+        watch = ci.watch
+
+        def watch_ci(target, log):
+            if target.pr == a.pr and caught_up[target.sha] == "main-0":
+                self.assertIsNone(first.job.slot.held)
+                watches.set()
+                self.assertTrue(finish_watch.wait(1.5))
+                if ci_after_base_move:
+                    target.pushed_at -= ci.WAIT_SECONDS
+                    check = gh.Check("checks", ci_after_base_move)
+                    with mock.patch.object(gh, "commit_checks", return_value={check.key: check}):
+                        return watch(target, log)
+            passed = gh.Check("checks", "pass")
+            return ci.Watched(target, {passed.key: passed})
+
+        def wait_for_capacity(_seconds):
+            self.assertIsNone(first.job.slot.held)
+            self.assertEqual([r["id"] for r in slots.runs_waiting_for_a_slot()], [first.run.id])
+            self.assertTrue(util.lock_is_held("automerge-fixture%2Frepo"))
+            self.assertEqual(len(slots.runs_in_slots()), 2)
+            capacity_wait.set()
+            self.assertTrue(allow_resume.wait(1.5))
+
+        def merge(_repo, number, head, _branch, base_sha, **_):
+            nonlocal base
+            self.assertEqual(base_sha, base)
+            self.assertEqual(caught_up[head], base)
+            if number == 1:
+                self.assertEqual(len(slots.runs_in_slots()), 2)
+                third_slot.free()
+            merged.append(number)
+            base = f"main-after-{number}"
+            return ""
+
+        def publish(controller, *, fixed=False):
+            try:
+                if fixed:
+                    return flows.publish(controller.flow).data
+                result = controller.finish_publication()
+                self.assertIsNone(controller.merge_lease)
+                return result
+            finally:
+                controller.job.slot.free()
+                controller.close()
+
+        patches = {
+            pipeline: dict(merge_evidence_hold=mock.Mock(return_value=""), git=mock.Mock(side_effect=git),
+                           has_merge_base=mock.Mock(side_effect=lambda _, head, sha: caught_up.get(head, original_bases.get(head)) == sha),
+                           catch_up_base=mock.Mock(side_effect=catch_up), checkout_patch=mock.Mock(return_value="diff"),
+                           publish_gate_evidence=mock.DEFAULT, comment_catch_up_ci=mock.DEFAULT, note_review=mock.DEFAULT),
+            workspace: dict(fetch=mock.Mock(side_effect=fetch)),
+            gh: dict(pr_merge_details=mock.Mock(side_effect=lambda pr, repo="": {
+                "state": "OPEN", "isDraft": False, "headRefOid": heads[f"https://github.com/{repo}/pull/{pr}" if repo else pr],
+                "baseRefName": "main", "baseRefOid": base, "mergeStateStatus": "CLEAN", "mergeable": "MERGEABLE"}),
+                merge_ci_passed=mock.Mock(return_value=True), pr_merge_auto=mock.Mock(side_effect=merge),
+                pr_comment=mock.DEFAULT),
+            jev: dict(ready=mock.Mock(return_value=True), risk=mock.Mock(return_value=SimpleNamespace(hold=""))),
+            ci: dict(watch=mock.Mock(side_effect=watch_ci)),
+            flows: dict(ended=mock.Mock(return_value=("pr", "published", ""))),
+        }
+        for module, replacements in patches.items():
+            self.enterContext(mock.patch.multiple(module, **replacements))
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first_result = pool.submit(publish, first)
+            try:
+                self.assertTrue(watches.wait(1.5))
+                with slots.admitting():
+                    self.assertEqual(slots.slots_free_to_start(2), 1)
+                    _, third_slot = self.running_slot("3")
+                if ci_after_base_move:
+                    self.sleep.side_effect = wait_for_capacity
+                    base = "main-external"
+                    finish_watch.set()
+                    self.assertTrue(capacity_wait.wait(1.5))
+                if fixed:
+                    second.job.slot.free()
+                second_result = pool.submit(publish, second, fixed=fixed)
+                self.assertTrue(waiting.wait(1.5))
+                self.assertIsNone(second.job.slot.held)
+                self.assertEqual([r["id"] for r in slots.runs_waiting_for_merge_lease()], [second.run.id])
+                self.assertEqual(slots.slots_free_to_start(3), 0)
+                self.assertEqual(reads, [(a.pr, "main-0"), (a.pr, "main-0")])
+                pipeline.comment_catch_up_ci.assert_not_called()
+                self.assertEqual(merged, [])
+                self.assertEqual((first.job.b.catch_ups, second.job.b.catch_ups), (1, 0))
+            finally:
+                finish_watch.set()
+                allow_resume.set()
+            self.assertEqual(first_result.result(timeout=1.5)["ending"], "pr")
+            self.assertEqual(second_result.result(timeout=1.5)["ending"], "pr")
+        self.assertEqual(merged, [1, 2])
+        self.assertEqual((first.job.b.catch_ups, second.job.b.catch_ups), (2 if ci_after_base_move else 1, 1))
+        self.assertEqual(set(sha for pr, sha in reads if pr == b.pr), {"main-after-1"})
+        self.assertEqual(slots.runs_waiting_for_merge_lease(), [])
+        gh.pr_comment.assert_not_called()
+
+    def test_each_catch_up_ci_result_waits_for_a_free_slot(self):
+        for n, result in enumerate(("pass", "fail", "unread"), 1):
+            with self.subTest(ci=result):
+                controller, checkout = self.ready_run(f"{n}1")
+                controller.take_merge_lease(checkout)
+                occupied = []
+
+                def watch(target, _log):
+                    self.assertIsNone(controller.job.slot.held)
+                    occupied.extend(self.running_slot(f"{n}{i}")[1] for i in (2, 3))
+                    check = gh.Check("checks", result)
+                    return ci.Watched(target, {check.key: check} if result != "unread" else {}, read=result != "unread")
+
+                def free_capacity(_seconds):
+                    self.assertIsNone(controller.job.slot.held)
+                    self.assertEqual([r["id"] for r in slots.runs_waiting_for_a_slot()], [controller.run.id])
+                    self.assertTrue(util.lock_is_held("automerge-fixture%2Frepo"))
+                    self.assertEqual(len(slots.runs_in_slots()), 2)
+                    occupied[-1].free()
+
+                def failure_logs(_round):
+                    self.assertIsNotNone(controller.job.slot.held)
+                    self.assertEqual(len(slots.runs_in_slots()), 2)
+                    return "CI failed"
+
+                self.sleep.reset_mock()
+                self.sleep.side_effect = free_capacity
+                controller.ci_failures = mock.Mock(side_effect=failure_logs)
+                try:
+                    with (mock.patch.object(ci, "watch", side_effect=watch),
+                          mock.patch.object(gh, "branch_sha", return_value="main"),
+                          mock.patch.object(gh, "commit_checks", return_value={}),
+                          mock.patch.object(gh, "pr_draft_and_head", return_value=(False, checkout.lease)),
+                          mock.patch.object(pipeline, "comment_catch_up_ci"),
+                          mock.patch.object(pipeline, "set_draft")):
+                        failure = controller.publication_ci([checkout], caught_up=True)
+                    self.assertEqual(len(slots.runs_in_slots()), 2)
+                    self.sleep.assert_called_once()
+                    if result == "pass":
+                        self.assertIsNone(failure)
+                        controller.ci_failures.assert_not_called()
+                    else:
+                        self.assertEqual(failure["failures"], orchestration.CI_FAILURES)
+                        controller.ci_failures.assert_called_once()
+                finally:
+                    controller.close()
+                    controller.job.slot.free()
+                    for slot in occupied:
+                        slot.free()
+
+    def test_dead_process_releases_the_lease(self):
+        child = """
+import os
+import signal
+from types import SimpleNamespace
+from arete import slots, util
+run = SimpleNamespace(repo=SimpleNamespace(name='repo'), tid='1')
+lease = slots.take_merge_lease(run, 'fixture/repo')
+print(util.lock_is_held('automerge-fixture%2Frepo'), flush=True)
+os.kill(os.getpid(), signal.SIGKILL)
+"""
+        env = {**os.environ, "ARETE_STATE_DIR": str(self.state), "ARETE_LOG_DIR": str(self.state / "logs"),
+               "ARETE_WORKTREES_DIR": str(self.state / "worktrees")}
+        done = subprocess.run([sys.executable, "-c", child], capture_output=True, text=True, timeout=2, env=env)
+        self.assertEqual((done.returncode, done.stdout.strip()), (-signal.SIGKILL, "True"), done.stderr)
+        self.assertFalse(util.lock_is_held("automerge-fixture%2Frepo"))
+        run = SimpleNamespace(repo=SimpleNamespace(name="repo"), tid="2")
+        with slots.take_merge_lease(run, "fixture/repo"):
+            self.assertTrue(util.lock_is_held("automerge-fixture%2Frepo"))
 
 
 class CatchUpPublicationFailureTests(MovedBasePublicationFixture, unittest.TestCase):
@@ -2047,6 +2507,7 @@ class CatchUpPublicationFailureTests(MovedBasePublicationFixture, unittest.TestC
                 else:
                     self.assertIsNone(controller.ending)
                     park.assert_not_called()
+                controller.release_merge_lease()
 
     def test_final_readiness_failure_parks_except_preserved_catch_up_handoffs(self):
         for error, parked in (
@@ -2138,6 +2599,7 @@ class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
               mock.patch.object(pipeline, "publish_ci") as report,
               mock.patch.object(pipeline, "publish_gate_evidence"),
               mock.patch.object(controller, "ci_failures", return_value="failed check logs"),
+              mock.patch.object(gh, "pr_draft_and_head", side_effect=lambda _: (False, checkout.lease)),
               mock.patch.object(pipeline, "set_draft") as draft,
               mock.patch.object(gh, "find_own_pr_comment", return_value=None),
               mock.patch.object(gh, "pr_comment") as comment):
@@ -2180,6 +2642,7 @@ class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
               mock.patch.object(pipeline.time, "sleep")):
             with self.assertRaises(pipeline.CatchUpPushUnconfirmed) as unconfirmed:
                 first.publish()
+        first.release_merge_lease()
         self.assertTrue(unconfirmed.exception.retryable)
         self.assertEqual(push.call_count, 3)
         ticket = tracker.Ticket("7", "#7", "Restore context", "Issue body", "Owner clarification", kind="fix")
@@ -2267,6 +2730,7 @@ class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
                     self.assertEqual(resumed.job.b.catch_ups, 2)
                     self.assertEqual(retried.call_count, int(initial == "head" and tree == "new-tree"))
                     merge.assert_not_called()
+                resumed.release_merge_lease()
 
     def test_collision_file_survives_the_final_pr_hold(self):
         for kind in ("ignored", "untracked"):
@@ -2605,6 +3069,404 @@ class ServeDeploymentRefusalTests(ServeDeploymentFixture):
         self.ci_state = ("completed", "success")
         self.assertEqual(self.deploy(), other)
         self.assertIn(f"fast forwarded to {other} (second merge)", self.server.say.call_args.args[0])
+
+
+class SelfDeployRollbackTests(unittest.TestCase):
+    class_timeout = 5
+
+    def git(self, *args):
+        return subprocess.check_output(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+                                        "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", *args],
+                                       cwd=self.checkout,
+                                       text=True, timeout=2).strip()
+
+    def prepare_state(self):
+        root = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        self.checkout = root / "checkout"
+        self.state = root / "state"
+        self.github = "fixture/arete"
+        self.ref = "refs/remotes/origin/main"
+        self.previous, self.tip = "1" * 40, "2" * 40
+        self.enterContext(mock.patch.multiple(paths, HOME=root, PACKAGE_DIR=self.checkout / "arete",
+                                             STATE_DIR=self.state, CONFIG_DIR=root / "config",
+                                             CONFIG_FILE=root / "config" / "config.toml",
+                                             LOCKS_DIR=self.state / "locks", DB_FILE=self.state / "arete.db",
+                                             RUNS_DIR=self.state / "runs", LOG_DIR=root / "logs",
+                                             WORKTREES_DIR=root / "worktrees", SERVER_FILE=self.state / "server.json",
+                                             ISOLATED=False))
+        self.server = object.__new__(serve.Server)
+        self.server.deploy_refusals = set()
+        self.server.say = mock.Mock()
+
+    def prepare_checkout(self, candidate):
+        self.prepare_state()
+        self.checkout.mkdir()
+        self.git("init", "-q", "-b", "main")
+        package = self.checkout / "arete"
+        package.mkdir()
+        (package / "__init__.py").write_text("")
+        (package / "cli.py").write_text("def main():\n    print('last good started')\n    return 0\n")
+        self.git("add", "arete")
+        self.git("commit", "-qm", "working entry point")
+        for name, body in candidate.items():
+            file = self.checkout / name
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_text(body)
+        self.git("add", ".")
+        self.git("commit", "-qm", "new code", "--allow-empty")
+        self.tip, self.previous = self.git("log", "-2", "--format=%H").splitlines()
+
+    def receipt(self):
+        return serve_guard.read(self.state / serve_guard.RECEIPT)
+
+    def write_receipt(self, **updates):
+        created_at = updates.pop("created_at", time.time())
+        receipt = serve_guard.Receipt(str(self.checkout), "main", self.previous, self.tip, self.github, created_at,
+                                      **updates)
+        serve_guard.write(self.state / serve_guard.RECEIPT, asdict(receipt))
+
+    def start(self):
+        plist = install.serve_plist()
+        return subprocess.run(plist["ProgramArguments"], cwd=plist["WorkingDirectory"],
+                              env=plist["EnvironmentVariables"], capture_output=True, text=True, timeout=2)
+
+    def test_import_rejection_counts_as_a_failed_start(self):
+        self.prepare_state()
+        self.write_receipt()
+        self.server.code = frozenset({("HEAD", self.previous[:12])})
+        stamp = frozenset({("HEAD", self.tip[:12])})
+        self.server.code_seen = stamp
+        self.server.code_note = ""
+        failure = subprocess.CompletedProcess([], 1, "", "ImportError: broken candidate initializer")
+        attempted_at = time.time()
+
+        def failed_probe(*args, **kwargs):
+            clock.return_value = attempted_at + 60
+            return failure
+
+        with (mock.patch.object(serve, "code_stamp", return_value=stamp),
+              mock.patch.object(serve_guard.time, "time", return_value=attempted_at) as clock,
+              mock.patch.object(util, "sh", side_effect=failed_probe),
+              mock.patch.object(serve_guard, "at_tip", return_value=True),
+              mock.patch.object(self.server, "busy_with", return_value=""),
+              mock.patch.object(self.server, "restart_for_new_code") as restart):
+            self.server.load_new_code()
+        restart.assert_not_called()
+        self.assertIn("broken candidate initializer", self.server.code_note)
+        self.assertEqual((self.receipt()["starts"], self.receipt()["started_at"]), (1, attempted_at))
+        self.assertFalse(serve_guard.hold_path(self.state, self.tip).exists())
+
+    def test_launchd_rolls_back_after_three_failed_starts_and_holds_the_tip(self):
+        token = "ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ"
+        password = "synthetic-password-that-must-stay-local"
+        self.prepare_checkout({"arete/__init__.py": f"raise ImportError('cannot import module token={token} "
+                                                  f"password={password}')\n"})
+        untracked = self.checkout / "arete" / "local.py"
+        untracked.write_text("local = True\n")
+        install.write_serve_guard()
+        self.write_receipt(starts=2)
+        observed = self.receipt()
+        self.assertEqual((observed["previous"], observed["tip"], observed["starts"]),
+                         (self.previous, self.tip, 2))
+
+        self.write_receipt(healthy=True, starts=3, created_at=0)
+        serve_guard.startup(self.state, self.checkout, paths.LOG_DIR)
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.tip)
+        self.assertEqual(self.receipt()["starts"], 3)
+        self.assertFalse(serve_guard.hold_path(self.state, self.tip).exists())
+        serve_guard.write(self.state / serve_guard.RECEIPT, observed)
+
+        log = Path(install.serve_plist()["StandardErrorPath"])
+        log.parent.mkdir(parents=True, exist_ok=True)
+        failed = self.start()
+        self.assertNotEqual(failed.returncode, 0, failed.stdout)
+        self.assertIn("ImportError: cannot import module", failed.stderr)
+        log.write_text(failed.stderr)
+        self.assertEqual(self.receipt()["starts"], 3)
+        restored = self.start()
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        self.assertIn(f"deploy: rolled back to {self.previous} because 3 unhealthy starts", restored.stdout)
+        self.assertIn("last good started", restored.stdout)
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.previous)
+        self.assertEqual(untracked.read_text(), "local = True\n")
+        self.assertEqual(self.receipt()["starts"], 3)
+        self.assertEqual(self.receipt()["rollback"], "code_only")
+        self.assertIsNone(serve_guard.pending(self.state, self.checkout))
+        self.assertEqual(serve.deploy_refusal(self.checkout, "main", self.tip), "held after startup rollback")
+
+        held = serve_guard.read(serve_guard.hold_path(self.state, self.tip))
+        self.assertIn(token, held["log_tail"])
+        with (mock.patch.object(serve.codebase, "checkout_head", return_value=self.previous[:12]),
+              mock.patch.object(gh, "gh", return_value=f"https://github.com/{self.github}/issues/52") as github):
+            serve.report_rollbacks(self.checkout, self.server.say)
+            serve.report_rollbacks(self.checkout, self.server.say)
+        self.assertEqual(serve_guard.read(serve_guard.hold_path(self.state, self.tip))["issue"], 52)
+        github.assert_called_once()
+        self.assertEqual(github.call_args.args[0][:4], ["issue", "create", "--repo", self.github])
+        self.assertEqual(github.call_args.args[0][8:], ["--label", "agent"])
+        body = github.call_args.kwargs["input"]
+        self.assertIn("Redacted serve.log tail", body)
+        self.assertIn("ImportError: cannot import module", body)
+        for private in (token, password, str(self.checkout)):
+            self.assertNotIn(private, body)
+
+    def test_terminal_wrapper_checks_receipt_before_loading_cli_commands(self):
+        source = Path(serve_guard.__file__).parent
+        self.prepare_checkout({f"arete/{name}": (source / name).read_text()
+                               for name in ("cli.py", "local_paths.py", "serve_guard.py")})
+        wrapper = paths.HOME / "arete-cli"
+        wrapper.write_text(f"import sys\nsys.path.insert(0, {str(self.checkout)!r})\n"
+                           "from arete.cli import main\nraise SystemExit(main())\n")
+        self.write_receipt(starts=3, started_at=time.time())
+        restored = subprocess.run([sys.executable, "-I", "-S", str(wrapper), "serve"],
+                                  cwd=self.checkout, env=install.serve_plist()["EnvironmentVariables"],
+                                  capture_output=True, text=True, timeout=2)
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        self.assertIn("last good started", restored.stdout)
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.previous)
+        with (mock.patch.object(serve.codebase, "checkout_head", return_value=self.previous[:12]),
+              mock.patch.object(gh, "issue_create", return_value=52) as ticket):
+            serve.report_rollbacks(self.checkout, self.server.say)
+        self.assertIn(serve_guard.MISSING_TAIL, ticket.call_args.args[2])
+
+    def test_unstarted_deploy_waits_for_chat_before_opening_health_window(self):
+        self.prepare_state()
+        self.write_receipt(created_at=time.time() - 6 * 60)
+        self.server.code = frozenset({("HEAD", self.previous[:12])})
+        stamp = frozenset({("HEAD", self.tip[:12])})
+        self.server.code_seen = stamp
+        self.server.code_note = ""
+        self.server.migration_stamp = None
+        self.server.polls, self.server.jobs = {}, {}
+        self.server.oncall = self.server.sweep = None
+        self.server.lock = self.enterContext(tempfile.TemporaryFile())
+        with (mock.patch.object(serve, "code_stamp", return_value=stamp),
+              mock.patch.object(util, "sh", return_value=subprocess.CompletedProcess([], 0, "", "")) as run,
+              mock.patch.object(serve.chat, "any_busy", return_value=True) as busy,
+              mock.patch.object(serve.capture, "checking", return_value=False),
+              mock.patch.object(serve, "reap_children"),
+              mock.patch.object(serve.os, "environ", serve.os.environ.copy()),
+              mock.patch.object(serve.os, "execv", side_effect=OSError("restart candidate")) as restart):
+            self.server.load_new_code()
+            run.assert_not_called()
+            restart.assert_not_called()
+            self.server.say.assert_called_once_with("new code waits to load: a chat message is still running")
+            self.assertEqual(self.receipt()["starts"], 0)
+            busy.return_value = False
+            with self.assertRaisesRegex(OSError, "restart candidate"):
+                self.server.load_new_code()
+            restart.assert_called_once()
+
+        with mock.patch.object(serve_guard, "at_tip", return_value=True):
+            self.assertFalse(serve_guard.count_start(self.state, self.checkout, paths.LOG_DIR))
+        receipt = serve_guard.pending(self.state, self.checkout)
+        self.assertEqual(receipt.starts, 1)
+        self.assertGreater(receipt.started_at, receipt.created_at + serve_guard.AGE_LIMIT)
+        self.assertFalse(receipt.expired())
+        self.assertFalse(serve_guard.hold_path(self.state, self.tip).exists())
+        with (mock.patch.object(serve_guard.time, "time", return_value=receipt.started_at + serve_guard.AGE_LIMIT),
+              mock.patch.object(serve_guard, "at_tip", return_value=True),
+              mock.patch.object(serve_guard, "rollback", return_value=True) as rollback):
+            self.assertTrue(serve_guard.count_start(self.state, self.checkout, paths.LOG_DIR))
+        rollback.assert_called_once_with(self.state, self.checkout, paths.LOG_DIR, receipt, serve_guard.AGE_FAILURE)
+
+    def test_new_green_commit_deploys_after_config_rejection(self):
+        self.prepare_state()
+        self.write_receipt()
+        self.server.checkout_update = threading.Lock()
+        self.server.code = frozenset({("HEAD", self.previous[:12])})
+        stamp = frozenset({("HEAD", self.tip[:12])})
+        self.server.code_seen = stamp
+        self.server.code_note = ""
+        self.server.started_head = self.previous[:12]
+        good = subprocess.CompletedProcess([], 0, "", "")
+        bad_config = subprocess.CompletedProcess([], 1, "", "invalid candidate config")
+        with (mock.patch.object(serve, "code_stamp", return_value=stamp),
+              mock.patch.object(util, "sh", side_effect=[good, bad_config]),
+              mock.patch.object(self.server, "busy_with", return_value=""),
+              mock.patch.object(serve_guard, "at_tip", return_value=True),
+              mock.patch.object(config, "load_or_problem", return_value=(config.Config(), ""))):
+            self.server.load_new_code()
+        self.assertIn("invalid candidate config", self.server.code_problem)
+        self.server.acknowledge_deploy(True)
+        self.assertEqual(self.receipt()["starts"], 1)
+        self.assertFalse(self.receipt()["healthy"])
+
+        newer = "3" * 40
+        repo = config.Repo("arete", self.checkout, github=self.github)
+        cfg = config.Config(arete_repo=repo.name, repos=[repo])
+        self.checkout.mkdir()
+
+        def git(args, *_args, **_kwargs):
+            return {("rev-parse", "--show-toplevel"): str(self.checkout),
+                    ("rev-parse", "--verify", self.ref): newer,
+                    ("rev-parse", "--verify", "HEAD"): self.tip,
+                    ("branch", "--show-current"): "main",
+                    ("--no-replace-objects", "merge-base", self.tip, newer): self.tip,
+                    ("--no-replace-objects", "show", "-s", "--format=%s", newer): "new candidate"}.get(tuple(args), "")
+
+        with (mock.patch.object(util, "git", side_effect=git),
+              mock.patch.object(serve, "pilot_deploy_refusal", return_value=""),
+              mock.patch.object(util, "deploy_recovery", return_value=SimpleNamespace(head=self.tip)),
+              mock.patch.object(util, "deploy_fast_forward") as fast_forward,
+              mock.patch.object(gh, "default_branch", return_value="main"),
+              mock.patch.object(gh, "deployment_ci_refusal", return_value="") as ci_gate):
+            self.server.deploy_if_ready(cfg)
+        self.assertEqual(ci_gate.call_args.args[1], newer)
+        fast_forward.assert_called_once_with(self.checkout, newer)
+        self.assertEqual((self.receipt()["previous"], self.receipt()["tip"], self.receipt()["starts"]),
+                         (self.previous, newer, 0))
+
+    def test_deploy_requires_a_full_tick_and_dashboard_readiness(self):
+        self.prepare_state()
+        self.server.with_dashboard = False
+        cfg = config.Config()
+        with mock.patch.object(self.server, "deploy") as deploy:
+            self.server.deploy_if_ready(cfg)
+        deploy.assert_called_once_with(cfg)
+        self.write_receipt(starts=1)
+        stamp = frozenset({("HEAD", self.tip[:12])})
+        with (mock.patch.object(serve, "code_stamp", return_value=stamp),
+              mock.patch.object(serve.codebase, "RELEASE", self.previous)):
+            self.server = serve.Server()
+        self.addCleanup(self.server.pool.shutdown)
+        self.assertEqual(self.server.code, stamp)
+        self.write_receipt()
+        self.server.with_dashboard = True
+
+        self.server.contracts_waiting = False
+        self.server.code_problem = ""
+        self.server.every_loop = self.server.live = []
+        self.server.failing, self.server.logged = {}, {}
+        actions = ("reap", "forget_unpolled_errors", "watch_oncall", "zte_when_due", "dispatch", "approvals",
+                   "rotate_when_due", "prune_when_due", "sweep_when_due", "expire_asks", "release_closed_when_due",
+                   "remind")
+        with (mock.patch.multiple(self.server, load=mock.Mock(return_value=True),
+                                  **{action: mock.DEFAULT for action in actions}) as stages,
+              mock.patch.object(db, "ensure_schema"),
+              mock.patch.object(serve.loop_store, "loop_states", return_value={}),
+              mock.patch.object(serve.codebase, "RELEASE", ""),
+              mock.patch.object(serve_guard, "at_tip", return_value=True),
+              mock.patch.object(serve, "dashboard_answers", side_effect=[False, True]) as probe):
+            self.server.acknowledge_deploy(self.server.tick())
+            probe.assert_not_called()
+            self.write_receipt(starts=1)
+            stages["dispatch"].side_effect = RuntimeError("queue failure")
+            self.server.acknowledge_deploy(self.server.tick())
+            self.assertIn("stage:dispatch", self.server.failing)
+            self.assertFalse(self.receipt()["healthy"])
+            probe.assert_not_called()
+            stages["dispatch"].side_effect = None
+            self.server.acknowledge_deploy(self.server.tick())
+            self.assertFalse(self.receipt()["healthy"])
+            healthy_at_deploy = mock.Mock()
+            with mock.patch.multiple(self.server, load_new_code=mock.DEFAULT, reap_inherited=mock.DEFAULT,
+                                     watch_alerts=mock.DEFAULT, beat=mock.DEFAULT,
+                                     deploy_when_due=lambda: healthy_at_deploy(self.receipt()["healthy"])):
+                self.server.run_pass()
+            healthy_at_deploy.assert_called_once_with(True)
+        self.assertTrue(self.receipt()["healthy"])
+
+    def test_pending_deploy_delivers_tick_alert_at_normal_threshold(self):
+        self.prepare_state()
+        self.write_receipt(starts=1, created_at=time.time() - serve_guard.AGE_LIMIT)
+        self.server = serve.Server()
+        self.addCleanup(self.server.pool.shutdown)
+        self.server.cfg = config.Config()
+        self.server.say = mock.Mock()
+        dispatch = mock.Mock(return_value=True, side_effect=RuntimeError("queue failure"))
+        self.server.tick = lambda: self.server.guard("stage:dispatch", dispatch) is True
+        with (mock.patch.object(serve_guard, "at_tip", return_value=True),
+              mock.patch.multiple(self.server, load_new_code=mock.DEFAULT, deploy_when_due=mock.DEFAULT,
+                                  reap_inherited=mock.DEFAULT, beat=mock.DEFAULT,
+                                  busy_with=mock.Mock(return_value="a chat message is still running")),
+              mock.patch.multiple(serve.incident_store, alert_get=mock.DEFAULT, alert_set=mock.DEFAULT,
+                                  alert_clear=mock.DEFAULT) as incidents,
+              mock.patch.object(serve.alerts, "notify") as notify):
+            incidents["alert_get"].return_value = None
+            for _ in range(serve.ALERT_TICKS - 1):
+                self.server.run_pass()
+            self.assertIsNone(self.server.alert_last)
+            self.server.run_pass()
+            self.server.alert_last.result(timeout=1)
+            incidents["alert_set"].assert_called_once_with(serve.ALERT_KEY, None)
+            self.assertIn("stage:dispatch: RuntimeError: queue failure", notify.call_args.args[1])
+            self.server.run_pass()
+            self.server.alert_last.result(timeout=1)
+            notify.assert_called_once()
+            self.assertFalse(self.receipt()["healthy"])
+            incidents["alert_get"].return_value = {"issue": None}
+            dispatch.side_effect = None
+            self.server.run_pass()
+            self.server.alert_last.result(timeout=1)
+            incidents["alert_clear"].assert_called_once_with(serve.ALERT_KEY)
+
+    def test_rollback_leaves_contract_and_expansion_in_the_database(self):
+        self.prepare_checkout({})
+        self.write_receipt(starts=3)
+        with redirect_stdout(StringIO()):
+            with mock.patch.object(db.migrations, "load", return_value=db._CHAIN[:9]):
+                self.assertFalse(db.migrate())
+            with mock.patch.object(db.migrations, "load", return_value=db._CHAIN[:11]):
+                self.assertFalse(db.migrate())
+            with closing(db.connect_db(paths.DB_FILE)) as conn:
+                applied = conn.execute("SELECT phase FROM schema_migrations WHERE n >= 10 ORDER BY n").fetchall()
+                self.assertEqual(applied, [("contract",), ("expand",)])
+            contents = paths.DB_FILE.read_bytes()
+            self.assertTrue(serve_guard.count_start(self.state, self.checkout, paths.LOG_DIR))
+        self.assertEqual(paths.DB_FILE.read_bytes(), contents)
+        self.assertEqual(self.receipt()["rollback"], "code_only")
+        self.assertEqual(list((self.state / serve_guard.HOLDS).iterdir()),
+                         [serve_guard.hold_path(self.state, self.tip)])
+
+    def test_dashboard_readiness_preserves_normal_access_checks(self):
+        self.prepare_state()
+        address = "127.0.0.1"
+        node = tailnet.Node((address,), frozenset({address}), address)
+        logins = tailnet.Logins(SimpleNamespace(whois=lambda _: "visitor@example.test"))
+        server = SimpleNamespace(node=node, logins=logins, inside_serve=True)
+
+        def connect(conn):
+            browser, app = socketpair()
+            browser.settimeout(conn.timeout)
+
+            def handle():
+                with app:
+                    dashboard.Handler(app, (address, 0), server)
+
+            worker = threading.Thread(target=handle, daemon=True)
+            worker.start()
+            conn.sock = browser
+            self.addCleanup(worker.join, 1)
+
+        def get(path, headers):
+            with closing(http.client.HTTPConnection(address, 1234, timeout=1)) as conn:
+                conn.request("GET", path, headers=headers)
+                with conn.getresponse() as response:
+                    response.read()
+                    return response.status
+
+        tailnet.record_server(node, 1234, tailnet.Front("http", []))
+        with (mock.patch.object(http.client.HTTPConnection, "connect", connect),
+              mock.patch.object(principals, "for_login", return_value=None) as for_login,
+              mock.patch.object(dashboard.api, "meta", return_value={"schema": {"version": db.LATEST}}) as meta):
+            self.assertTrue(serve.dashboard_answers())
+            for_login.assert_not_called()
+            self.assertEqual(get(dashboard.READY_PATH, {}), 403)
+            self.assertEqual(get("/api/meta", {dashboard.READY_HEADER: dashboard.READY_TOKEN}), 403)
+            meta.assert_called_once()
+            meta.return_value = {"schema": {"version": db.NEEDED - 1}}
+            self.assertFalse(serve.dashboard_answers())
+
+    def test_guard_imports_only_standard_library(self):
+        tree = ast.parse(Path(serve_guard.__file__).read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                self.assertTrue(all(alias.name.split(".")[0] in sys.stdlib_module_names for alias in node.names))
+            elif isinstance(node, ast.ImportFrom):
+                self.assertEqual(node.level, 0)
+                self.assertIn(node.module.split(".")[0], sys.stdlib_module_names)
 
 
 class ServeDeploymentMergeTests(ServeDeploymentFixture):

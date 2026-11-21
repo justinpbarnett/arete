@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from dataclasses import asdict
 from math import inf
 from pathlib import Path
+from typing import TextIO
 from uuid import uuid4
 
 from . import (
@@ -25,6 +26,7 @@ from . import (
     repairs,
     run_lines,
     runlimits,
+    slots,
     util,
     workspace,
     zte,
@@ -63,6 +65,8 @@ def policy_fingerprint(cfg, layer, closed_context):
 
 
 class Controller:
+    merge_lease: TextIO | None = None
+
     def __init__(self, flow):
         self.flow, self.job = flow, flow.ctx
         self.run = self.job.run
@@ -684,6 +688,9 @@ class Controller:
             self.ending = ("pr", "Prepared an exact README candidate for engine-owned delivery", "")
             return {"prepared_head": grant.data["head"], "tree": grant.data["tree"]}
         self.check_pilot_publication()
+        if catch_up:
+            checkout, = self.job.checkouts
+            self.take_merge_lease(checkout)
         self.data["publication_intent"] = {"tree": self.fingerprint()}
         self.persist()
         outcome = self.atomic("pr", tree=str(self.job.ws))
@@ -720,6 +727,9 @@ class Controller:
             pushed.append(checkout)
         if failure := self.second_ci_failure(targets, retried):
             return failure
+        if retry["caught_up"]:
+            checkout, = pushed
+            self.take_merge_lease(checkout)
         for checkout in pushed:
             row = gh.pr_merge_details(checkout.pr)
             if (row.get("state") != "OPEN" or row.get("headRefOid") != checkout.lease
@@ -766,18 +776,8 @@ class Controller:
         return None
 
     def publication_ci(self, pushed, *, caught_up=False, reruns=None):
-        def watch(checkout):
-            options = {} if reruns is None else {"reruns": reruns.get(checkout.github, ())}
-            watched = pipeline.ci.watch(pipeline.ci_target(checkout), self.run.log, **options)
-            return pipeline.ci.compare_with_base(watched, self.run.log)
-
         tree = self.fingerprint()
-        self.job.slot.free()
-        try:
-            with self.run.waiting("ci"):
-                current = pipeline.ci.Round(1 if reruns is None else 2, [watch(c) for c in pushed])
-        finally:
-            self.job.slot.take(self.run.log, self.run.waiting)
+        current = pipeline.watch_publication_ci(self.run, self.job.slot, pushed, reruns=reruns)
         self.job.ci_result = current.summary()
         self.check_pilot_publication()
         section = pipeline.ci.section([current], current.n)
@@ -787,7 +787,7 @@ class Controller:
         else:
             pipeline.publish_ci(self.run, self.job.ticket, self.job.with_prs, section)
         self.data.pop("ci_retry", None)
-        if not current.reds and current.all_read:
+        if current.passed:
             self.data.pop("ci_failed", None)
             self.data.pop("ci_failures", None)
             self.catalog.context.pop(CI_FAILURES, None)
@@ -807,11 +807,25 @@ class Controller:
                                                    for repo, requested in reruns.items()}
         self.data["ci_failures"] = self.ci_failures(current)
         self.catalog.add_context(CI_FAILURES, self.data["ci_failures"])
+        check_head = caught_up or self.data.get("catch_up_hold")
+        watched_heads = {w.target.pr: w.target.sha for w in current.seen}
         for checkout in self.job.with_prs:
             self.check_pilot_publication()
+            if check_head and (watched_heads.get(checkout.pr) != checkout.lease
+                               or pipeline.own_draft_state(self.run, checkout) is None):
+                continue
             pipeline.set_draft(self.run, checkout, True)
         return {"ci": self.job.ci_result, "failures": CI_FAILURES,
                 "error": f"CI needs an explicit worker diagnosis or repair; its failure logs are context {CI_FAILURES}"}
+
+    def take_merge_lease(self, checkout):
+        if self.merge_lease is None:
+            self.merge_lease = slots.take_merge_lease(self.run, checkout.github, slot=self.job.slot)
+
+    def release_merge_lease(self):
+        if self.merge_lease is not None:
+            self.merge_lease.close()
+            self.merge_lease = None
 
     def automerge(self, candidates):
         job = self.job
@@ -822,6 +836,8 @@ class Controller:
         about = pipeline.automerge_about(job.ticket, job.build_summary)
         track_base = not pilot.is_pilot_task(str(self.run.tid))
         for checkout in candidates:
+            if len(job.checkouts) == 1:
+                self.take_merge_lease(checkout)
             while True:
                 hold = pipeline.try_automerge(job.b, checkout, job.verified, job.review, about,
                                               track_moved_base=track_base)
@@ -860,15 +876,9 @@ class Controller:
                 raise
 
         try:
-            row = gh.pr_merge_details(checkout.pr)
-            if hold := gh.merge_ref_hold(row, checkout.lease, checkout.base):
+            base_sha, hold = pipeline.catch_up_target(b, checkout, job.slot)
+            if hold:
                 return self.catch_up_failure(hold)
-            base_sha = row.get("baseRefOid")
-            base_sha = pipeline.fetch_merge_base(checkout) or base_sha
-            if not base_sha:
-                return self.catch_up_failure("GitHub did not report the current base commit")
-            if b.catch_ups >= pipeline.AUTOMERGE_CATCH_UPS:
-                return self.catch_up_failure(f"the base `{checkout.base}` moved to `{base_sha}` after {b.catch_ups} catch-ups")
             b.catch_ups += 1
             job.verified, job.review = pipeline.catch_up_base(
                 b, checkout, job.branch, base_sha, job.with_left(job.goal), job.with_left(job.plan_text),
@@ -933,6 +943,8 @@ class Controller:
             elif self.run.budget and (limit := self.run.budget.repair_limit_reason()):
                 reason = f"Publication CI held: {failure['ci']}. {limit}" if failure.get("ci") else limit
                 self.ending = self.park_catch_up(reason)
+        if self.ending:
+            self.release_merge_lease()
         return failure
 
     def reconcile_catch_up(self, pending):
@@ -956,6 +968,7 @@ class Controller:
         if hold := pipeline.merge_evidence_hold(job.b, checkout, verified, review, head):
             raise factory.Refused(f"cannot reconcile the catch-up push: {hold}")
         self.check_pilot_publication()
+        self.take_merge_lease(checkout)
         pipeline.note_prs(self.run, job.branch, job.with_prs)
         pipeline.push_caught_up_head(job.b, checkout, job.branch, head)
         job.verified, job.review = verified, review
@@ -1003,6 +1016,7 @@ class Controller:
         if self.data.get("catch_up_hold") or self.data.get("ci_failed"):
             return self.settle_publication_failure(outcome.data)
         self.ending = flows.ended(self.flow, outcome)
+        self.release_merge_lease()
         return outcome.data
 
     def check_pilot_publication(self):
@@ -1301,6 +1315,7 @@ class Controller:
                 del self.workers[key]
             except BaseException as error:
                 errors.append(error)
+        self.release_merge_lease()
         if errors:
             raise errors[0]
 

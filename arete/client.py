@@ -28,8 +28,12 @@ CALL_SECONDS = 120
 RETRY_SECONDS = 2
 RESTART_WAIT_SECONDS = 30
 RECONNECT_SECONDS = 120
+HOOK_EVENTS_PATH = "/api/v1/hook-events"
 WAIT_EVENTS = ("step_end", "question", "error", run_lines.END)
 BROKE = (OSError, http.client.HTTPException)
+LEGACY_ROUTES = {"task.list": "/api/tasks", "run.stop": "/api/runs/{run}/stop"}
+API_1_2_ONLY = frozenset({"status.get", "task.create", "comment.create", "task.close",
+                          "run.pin", "run.unpin", "run.steer"})
 _ACQUISITION_LOCK = threading.Lock()
 _acquisition_thread: threading.Thread | None = None
 
@@ -41,9 +45,11 @@ class Down(Exception):
 
 
 class Failed(Exception):
-    def __init__(self, answer: dict, code: int = 0):
+    def __init__(self, answer: dict, code: int = 0, *, retry_after: float | None = None):
         super().__init__(str(answer.get("error", "")))
         self.answer, self.code = answer, code
+        self.retry_after = retry_after
+        self.after_restart = False
 
 
 class Broken(Failed):
@@ -255,7 +261,11 @@ def upload_hook_events(where=None, *, wait=False):
         remote = server(time.monotonic() + CONNECT_SECONDS, where=where)
         if remote.instance == tool_events.local_instance():
             return
-        tool_events.upload_pending(remote.instance, send, wait=wait)
+        try:
+            tool_events.upload_pending(remote.instance, send, wait=wait)
+        except Failed as e:
+            if wait or e.after_restart or not unknown_route(e, "POST", HOOK_EVENTS_PATH):
+                raise
     except (Down, Failed, OSError) as e:
         if wait:
             if isinstance(e, OSError):
@@ -265,7 +275,7 @@ def upload_hook_events(where=None, *, wait=False):
 
 
 def send_hook_batch(body, key, deadline):
-    path = "/api/v1/hook-events"
+    path = HOOK_EVENTS_PATH
     answer = decoded(request("POST", path, body, key=key, buffered=True, deadline=deadline), "POST", path)
     if field(answer, "received", kind=int) != len(body["events"]):
         raise Failed({"error": "the server did not acknowledge the full hook event batch"})
@@ -362,7 +372,7 @@ def acquired_connection(where, deadline):
         if error is not None:
             raise error
         if result is None:
-            raise Broken({"error": "task start retry budget expired"})
+            raise Broken({"error": "request retry budget expired"})
         yield result
         delivered = True
     finally:
@@ -402,6 +412,9 @@ def request(method: str, path: str, body: dict | None = None,
             if restart is None:
                 raise
             pause = RETRY_SECONDS
+        except Failed as e:
+            e.after_restart = restart is not None
+            raise
         left = deadline - time.monotonic()
         if left <= 0:
             raise Failed(restart.answer, 503)
@@ -470,20 +483,21 @@ def request_once(method: str, path: str, body: dict | None = None,
     failure = {"error": f"the server at {address(where)} answered {resp.status}"}
     if isinstance(answer, dict):
         failure.update(answer)
-    wait = retry_after(resp.getheader("Retry-After"))
+    wait = retry_after(resp.getheader("Retry-After"), limit=None if resp.status == 429 else RESTART_WAIT_SECONDS)
     if key is not None and resp.status == 409 and failure.get("code") == "idempotency_in_flight":
         failure = InFlight(failure, resp.status)
         failure.seconds = 1 if wait is None else wait
         raise failure
     if resp.status == 503 and wait is not None:
         raise Restarting(failure, wait)
-    raise Failed(failure, resp.status)
+    raise Failed(failure, resp.status, retry_after=wait)
 
 
-def retry_after(header):
+def retry_after(header, *, limit):
     value = (header or "").strip()
     if value.isascii() and value.isdigit():
-        return min(float(value), RESTART_WAIT_SECONDS)
+        seconds = float(value)
+        return seconds if limit is None else min(seconds, limit)
     try:
         when = parsedate_to_datetime(value)
         return max(0, when.timestamp() - time.time()) if when.tzinfo else None
@@ -494,7 +508,7 @@ def retry_after(header):
 def budget_left(deadline):
     left = deadline - time.monotonic()
     if left <= 0:
-        raise Broken({"error": "task start retry budget expired"})
+        raise Broken({"error": "request retry budget expired"})
     return left
 
 
@@ -565,7 +579,98 @@ def call(method: str, path: str, body: dict | None = None, key: str | None = Non
             key = write_key()
     if key is not None and method == "POST" and path == "/api/tasks":
         return keyed_call(body, key, deadline=deadline)
-    return decoded(request(method, path, body, key=key, buffered=True, deadline=deadline), method, path)
+    where = server(deadline)
+    try:
+        response = request(method, path, body, key=key, where=where, buffered=True, deadline=deadline)
+    except Failed as e:
+        if not path.startswith("/api/v1/") or not unknown_route(e, method, path):
+            raise
+        from . import contract
+
+        if matched := contract.match(method, urlsplit(path).path):
+            operation, params = matched
+            if legacy := LEGACY_ROUTES.get(operation["name"]):
+                if e.after_restart:
+                    raise
+                return legacy_answer(method, operation, legacy.format(**params), body, key, where, deadline)
+            if operation["name"] in API_1_2_ONLY:
+                raise requires_api_1_2(method, path) from None
+        raise
+    return decoded(response, method, path)
+
+
+def requires_api_1_2(method: str, path: str) -> Failed:
+    return Failed({"error": f"{method} {path} requires Arete serve API version 1.2 or newer",
+                   "code": "unknown_route", "required_version": "1.2"}, 404)
+
+
+def unknown_route(error: Failed, method: str, path: str) -> bool:
+    if error.code != 404:
+        return False
+    answer = error.answer
+    return (
+        reason(answer) == "unknown_route"
+        or answer == {"error": f"Nothing at {method} {urlsplit(path).path}."}
+        or (
+            answer.get("type") == "urn:arete:problem:not_found"
+            and answer.get("code") == "not_found"
+            and answer.get("detail") == answer.get("error") == "No such route."
+        )
+    )
+
+
+def legacy_request(method, path, body, key, where, deadline):
+    try:
+        response = request_once(method, path, body, key=key, where=where, deadline=deadline, buffered=True)
+    except Restarting as e:
+        raise Failed(e.answer, 503) from None
+    seq = response.getheader("Arete-Seq") if method != "GET" else None
+    answer = decoded(response, method, path)
+    if seq:
+        answer.setdefault("seq", seq)
+    return answer
+
+
+def legacy_task_detail(path, where, deadline):
+    while True:
+        try:
+            return legacy_request("GET", path, None, None, where, deadline)
+        except Failed as e:
+            pause = e.retry_after
+            if e.code != 429 or pause is None or not 0 < pause < deadline - time.monotonic():
+                raise
+            time.sleep(pause)
+
+
+def legacy_task_rows(summaries, where, deadline):
+    deadline = deadline if deadline is not None else time.monotonic() + CALL_SECONDS
+    rows = []
+    for summary in summaries:
+        identity = field(summary, "id", "tasks[].id", kind=str)
+        path = f"/api/tasks/{quote(identity, safe='')}"
+        row = legacy_task_detail(path, where, deadline)
+        if row.get("id") != identity:
+            raise Failed({"error": f"GET {path} returned a different task"})
+        rows.append(row)
+    return sorted(rows, key=lambda row: field(row, "created", "task.created", kind=str))
+
+
+def legacy_answer(method, operation, legacy, body, key, where, deadline):
+    from . import api, contract
+
+    answer = legacy_request(method, legacy, body, key, where, deadline)
+    schema = operation["result"]
+    if operation["name"] == "task.list":
+        answer["tasks"] = legacy_task_rows(field(answer, "tasks", kind=list), where, deadline)
+    if method == "GET":
+        answer.pop("seq", None)
+        schema = {**schema, "required": [name for name in schema["required"] if name != "seq"]}
+    answer = api.serialize(answer, schema)
+    try:
+        contract.validate(answer, schema, "server answer")
+    except contract.Problem as e:
+        raise Failed({"error": str(e)}) from None
+    return answer
 
 
 def decoded(resp, method, path):
@@ -683,6 +788,19 @@ def run_command(run_id: str, action: str, body: dict | None = None, *, key_scope
 
 def run_info(run_id):
     return field(call("GET", f"/api/runs/{quote(run_id, safe='')}"), "run")
+
+
+def require_steering(run_id: str) -> None:
+    path = run_path(run_id, "steer", prefix="/api/v1")
+    try:
+        close_response(request("GET", path))
+    except Failed as error:
+        if error.code == 405 and reason(error.answer) == "method_not_allowed":
+            return
+        if unknown_route(error, "GET", path):
+            raise requires_api_1_2("POST", path) from None
+        raise
+    raise Failed({"error": f"GET {path} did not report that steering requires POST"})
 
 
 def steer(run_id, text):
