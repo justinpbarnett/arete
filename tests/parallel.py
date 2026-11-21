@@ -344,7 +344,6 @@ class Runner:
             where = "ran past its deadline" if first["timeout"] else "failed"
             print(f"{identifier}: {where} on its first run, "
                   f"then passed alone within twice its deadline in {report['seconds']:.2f}s", flush=True)
-            self.show_failures(identifier, first)
         if self.args.slowest:
             print("Slowest classes:")
             for name, report in sorted(self.results.items(), key=lambda item: -item[1]["seconds"])[:self.args.slowest]:
