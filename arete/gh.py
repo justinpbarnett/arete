@@ -154,8 +154,8 @@ def comment_key(path: str, key: str, start):
 
 
 def keyed_comment(args: list[str], body: str, path: str, mark: bool = False, envelope: bool = False,
-                  *, single_attempt: bool = False) -> str:
-    key, start = uuid.uuid4().hex, util.now()
+                  *, key: str = "", single_attempt: bool = False) -> str:
+    key, start = key or uuid.uuid4().hex, util.now()
     payload = outgoing(body, mark=mark, key=key)
     if envelope:
         payload = Outgoing(json.dumps({"body": payload}))
@@ -184,8 +184,9 @@ def split_link(body: str, links) -> tuple[str, str]:
     return "", body
 
 
-def issue_create(repo: str, title: str, body: str, labels: Sequence[str] = (), *, single_attempt: bool = False) -> int:
-    key = uuid.uuid4().hex
+def issue_create(repo: str, title: str, body: str, labels: Sequence[str] = (), *, key: str = "",
+                 single_attempt: bool = False) -> int:
+    key = key or uuid.uuid4().hex
     args = ["issue", "create", "--repo", repo, "--title", outbound.screen(title), "--body-file", "-"]
     for lb in labels:
         args += ["--label", lb]
@@ -204,8 +205,10 @@ def issue_create(repo: str, title: str, body: str, labels: Sequence[str] = (), *
         if number := recovery_lookup(find):
             return int(number)
         reply = gh(args, input=payload, write=True)
-    url = reply.strip().splitlines()[-1]
-    return int(url.rstrip("/").rsplit("/", 1)[-1])
+    parts = reply.strip().splitlines()
+    if not parts or not (number := re.fullmatch(r"https://[^/]+/[^/]+/[^/]+/issues/([1-9][0-9]*)/?", parts[-1])):
+        raise GhUnsure("GitHub did not confirm the created issue number")
+    return int(number[1])
 
 
 def recent_issues(repo: str, limit: int = 100) -> list[dict]:
@@ -294,6 +297,45 @@ def issue_edit_body(repo: str, number: int, body: str) -> None:
     gh(["issue", "edit", str(number), "--repo", repo, "--body-file", "-"], input=outgoing(body))
 
 
+def issue_merge_commit(repo: str, number: int, base: str) -> str:
+    owner, name = repo.split("/", 1)
+    query = """
+    query($owner:String!, $name:String!, $number:Int!) {
+      repository(owner:$owner, name:$name) {
+        issue(number:$number) {
+          state stateReason
+          timelineItems(last:1, itemTypes:[CLOSED_EVENT, REOPENED_EVENT]) {
+            nodes { ... on ClosedEvent { closer {
+              __typename
+              ... on PullRequest { ...Fix }
+              ... on Commit { oid associatedPullRequests(first:10) { nodes { ...Fix } } }
+            } } }
+          }
+        }
+      }
+    }
+    fragment Fix on PullRequest {
+      merged baseRefName repository { nameWithOwner } mergeCommit { oid }
+    }
+    """
+    result = gh_json(["api", "graphql", "-f", outgoing(f"query={query}"), "-f", outgoing(f"owner={owner}"),
+                      "-f", outgoing(f"name={name}"), "-F", outgoing(f"number={number}")]) or {}
+    issue = ((result.get("data") or {}).get("repository") or {}).get("issue") or {}
+    if (issue.get("state"), issue.get("stateReason")) != ("CLOSED", "COMPLETED"):
+        return ""
+    events = (issue.get("timelineItems") or {}).get("nodes") or []
+    closer = ((events[-1] or {}).get("closer") or {}) if events else {}
+    pulls = ([closer] if closer.get("__typename") == "PullRequest" else
+             (closer.get("associatedPullRequests") or {}).get("nodes") or [])
+    for pr in filter(None, pulls):
+        sha = (pr.get("mergeCommit") or {}).get("oid") or ""
+        actual_repo = (pr.get("repository") or {}).get("nameWithOwner") or ""
+        if (pr.get("merged") is True and pr.get("baseRefName") == base and actual_repo.casefold() == repo.casefold()
+                and re.fullmatch(r"[0-9a-f]{40}", sha) and (pr is closer or closer.get("oid") == sha)):
+            return sha
+    return ""
+
+
 def issue_reopen(repo: str, number: int) -> None:
     gh(["issue", "reopen", str(number), "--repo", repo])
 
@@ -354,9 +396,10 @@ def pr_edit_body(url: str, body: str, link: str = "") -> None:
     gh(["pr", "edit", url, "--body-file", "-"], input=outgoing(body, link))
 
 
-def pr_comment(url: str, body: str) -> None:
+def pr_comment(url: str, body: str, *, key: str = "", single_attempt: bool = False) -> None:
     keyed_comment(["pr", "comment", url, "--body-file", "-"], body,
-                  f"repos/{pr_repo(url)}/issues/{pr_number(url)}/comments", mark=True)
+                  f"repos/{pr_repo(url)}/issues/{pr_number(url)}/comments", mark=True,
+                  key=key, single_attempt=single_attempt)
 
 
 def find_own_pr_comment(repo: str, number: int, *markers: str) -> dict | None:

@@ -455,6 +455,16 @@ class Run(AgentRun):
     answers_due: list[dict] = field(default_factory=list)
     base_note: str = ""
     kept_note: str = ""
+    environment_release: str = ""
+    preview_of: str = ""
+
+    @property
+    def preview_branch(self) -> str:
+        return f"arete/dry-run/{self.id}" if self.preview_of else ""
+
+    @property
+    def workspace_key(self) -> str:
+        return self.id if self.preview_of else str(self.tid)
 
     @property
     def ref(self) -> str:
@@ -1056,11 +1066,12 @@ class Script:
     repairs: str = ""
     action: str = ""
     action_only: bool = False
+    environment_release: str = ""
 
     @property
     def run_fields(self) -> dict:
         return {"path": self.path, "alone": bool(self.only or self.action_only), "step_overrides": self.overrides,
-                "action": self.action, "action_only": self.action_only}
+                "action": self.action, "action_only": self.action_only, "environment_release": self.environment_release}
 
 
 def script_file(cfg: config.Config, name: str) -> Path:
@@ -1140,6 +1151,8 @@ def run_command(repo_name: str, tid: str | int, force: bool = False, dry_run: bo
         source = newest if newest and newest["status"] == "interrupted" else (
             next(iter(run_store.open_runs(repo_name, str(tid))), None)
             if not force and pending_feedback(repo_name, str(tid)) else None)
+        if dry_run and run_store.held_environment_branch(repo_name, str(tid)):
+            source = None
         previous = (orchestration.find(source["id"]) or {}).get("current_run", source["id"]) if source else ""
         return script_command(cfg, "orchestrate", repo_name, str(tid), *flags,
                               *(["--continue", previous] if previous else []))
@@ -1163,6 +1176,19 @@ def exec_script(repo_name: str, tid: str, dry_run: bool, force: bool) -> int:
 
 
 def script_refusal(cfg: config.Config, repo: config.Repo, tid: str, script: Script, dry_run: bool = False) -> str:
+    if script.environment_release:
+        from . import environment_gaps
+
+        reruns_verify = (script.again == "verify" if script.path in (*environment_gaps.STEP_PATHS, "classic") else
+                        script.path == "orchestrate" and bool(script.action)
+                        and script.action == environment_gaps.verification_action(script.continues))
+        if (not reruns_verify or not script.continues or dry_run or script.only or script.action_only
+                or script.repairs or pending_feedback(repo.name, tid)
+                or environment_gaps.live_release() != script.environment_release
+                or recorded_path(script.continues) != script.path
+                or (script.path in environment_gaps.STEP_PATHS and cfg.adws
+                    and cfg.adws.resolve() != paths.ADWS_DIR.resolve())):
+            return "the verification retry requires its selected release to be live and the PR to be awaiting verification"
     if script.action and (script.path != "orchestrate" or not script.continues or script.only or script.again):
         return "--action needs an orchestrated --continue without --only or --from"
     if script.action_only and not script.action:
@@ -1213,6 +1239,8 @@ def runnable(repo: config.Repo) -> bool:
 
 
 def parent_run(script: Script | None, earlier: dict | None, budget_history: list[dict]) -> str:
+    if script and script.environment_release:
+        return script.continues
     parent = (script.repairs or script.continues if script else "") or (
         earlier["id"] if earlier and earlier["status"] not in ENDED else "")
     if budget_history and budget_history[0]["status"] not in ENDED:
@@ -1252,6 +1280,10 @@ def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: boo
         run.log(end_line)
     failure = run.failure if run.failure is not None else {"class": "work"}
     classified = {"failure": json.dumps(failure)} if status == "failed" and failure and not run.dry_run else {}
+    if status == "pr" and pr_url and not (run.environment_release or run.dry_run or run.alone or run.feedback or run.repairs):
+        from . import environment_gaps
+
+        environment_gaps.save_hold(run.id, pr_url)
     record.settle(run.id, status, end_line=end_line, summary=summary, pr_url=pr_url,
                   **classified)
     write_report(run_store.run_get(run.id) or {"id": run.id, "status": status, "pr_url": pr_url}, flow, run)
@@ -1331,6 +1363,26 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         if not got:
             print(f"{name} is already running")
             return 0
+        retry_of = {}
+        preview_of = run_store.held_environment_branch(repo.name, str(tid)) if dry_run else ""
+        if preview_of and script and script.continues:
+            print(f"{name}: run the dry run without --continue to preview the held draft in its own workspace")
+            return 2
+        if script and script.environment_release:
+            from . import environment_gaps
+
+            source = run_store.run_get(script.continues) or {}
+            if ((source.get("repo"), str(source.get("issue"))) != (repo.name, str(tid))
+                    or run_store.later_run(repo.name, tid, script.continues, live=True)
+                    or not environment_gaps.confirm_retry(cfg, repo, source, script.environment_release)):
+                print(f"{name}: the held draft or its release evidence changed before verification could restart")
+                return 2
+            try:
+                flows.check_environment_workspace(repo, source, run_store.environment_hold(source["id"])["heads"])
+            except workspace.RunFailed as error:
+                print(f"{name}: verify retry still waiting for its workspace: {error.why}")
+                return 2
+            retry_of = {"environment_retry_of": source["id"], "pr_url": source["pr_url"], "branch": source["branch"]}
         try:
             layer = config.load_layer(repo.layer_dir)
             wall_deadline = math.inf
@@ -1354,7 +1406,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 wall_deadline = permit["deadline"]
             if isinstance(tk, tracker.GitHubTracker):
                 tk.require_ordinary(tid)
-            budget_history = run_store.ticket_runs(repo.name, tid, limit=1)
+            budget_history = run_store.ticket_runs(repo.name, tid, limit=1, live=bool(retry_of or preview_of))
             readmission = None if force else runlimits.Readmission.decode(launch_lease.readmission(repo.name, str(tid)))
             blocked, reset_budget = runlimits.admission(repo, str(tid), tk, runlimits.Policy.of(layer), force,
                                                        readmission=readmission)
@@ -1395,7 +1447,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     return 1
             settled = [done for dead_row in run_store.ticket_runs_marked_running(repo.name, tid)
                        if (done := record.interrupt(dead_row))]
-            earlier = None if only else run_store.newest_live_whole_run(repo.name, tid)
+            earlier = None if only or preview_of else run_store.newest_live_whole_run(repo.name, tid)
             restarting = bool(earlier) and earlier["status"] == "interrupted"
             mending = (script.repairs or repaired_by(script.continues or (earlier["id"] if restarting else ""))
                        ) if script else ""
@@ -1409,7 +1461,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     return 2
             def start():
                 return record.start("pipeline", tag=f"{repo.name}-{tid}", lock=lock, repo=repo.name, issue=tid,
-                                    only_step=only, dry_run=int(dry_run))
+                                    only_step=only, dry_run=int(dry_run), **retry_of)
 
             def check_start_cutoff():
                 pilot.require(time.monotonic() < wall_deadline, "ZTE deadline expired during run startup")
@@ -1458,15 +1510,17 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force,
                       feedback=[] if mending or zte_grant else pending_feedback(repo.name, tid), repairs=mending,
                       answering=earlier if earlier and earlier["status"] == "needs-info" else {},
-                      launch_gate=admission, launch_done=launch_done, closed_context=closed_context,
+                      launch_gate=admission, launch_done=launch_done, closed_context=closed_context, preview_of=preview_of,
                 **(script.run_fields if script else {}))
             try:
                 with handoff_io():
                     run.dir.mkdir(parents=True, exist_ok=True)
                     run_lines.write(run.id, "execution", path=run.path or "classic",
-                                    protocol=1 if run.path == "orchestrate" else 0)
+                                    protocol=1 if run.path == "orchestrate" else 0,
+                                    **({"environment_release": run.environment_release} if run.environment_release else {}))
             except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
                 if not zte_grant:
+                    slot.free()
                     raise
                 return settle_zte_refusal(repo.name, str(tid), slot, run_id, error, committed=True)
             if held_from := earlier["id"] if restarting or run.answering else (
@@ -1527,8 +1581,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             if due and not slot.held and not dry_run and not flow.refusal:
                 slot.take(run.log, run.waiting, "answer")
             parent = parent_run(script, earlier, budget_history)
-            previous = "" if reset_budget else parent
-            fresh = bool(previous) and force and not restarting and not run.repairs and not run.alone and not (
+            previous = "" if reset_budget and not retry_of else parent
+            fresh = bool(previous) and force and not retry_of and not restarting and not run.repairs and not run.alone and not (
                 flow and flow.continues)
             current = tk.get(tid) if fresh else None
             with handoff_io():
@@ -1561,7 +1615,10 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         except factory.Refused as e:
             if zte_grant:
                 return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
-            status, summary = "failed", str(e)
+            if run.environment_release:
+                status, summary, pr_url = environment_retry_held(run, script.continues, str(e))
+            else:
+                status, summary = "failed", str(e)
         except Stopped as e:
             if zte_grant:
                 return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
@@ -1572,22 +1629,33 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         except workspace.RunFailed as e:
             if zte_grant:
                 return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
-            status, summary, pr_url = _fail(run, e.why, detail=e.detail, recovery=e.recovery)
+            if run.environment_release:
+                status, summary, pr_url = environment_retry_held(run, script.continues, e.why)
+            else:
+                status, summary, pr_url = _fail(run, e.why, detail=e.detail, recovery=e.recovery)
         except tracker.ERRORS as e:
             if zte_grant:
                 return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
-            status, summary, pr_url = _fail(run, f"tracker refused {run.ref}: {e}")
+            why = f"tracker refused {run.ref}: {e}"
+            if run.environment_release:
+                status, summary, pr_url = environment_retry_held(run, script.continues, why)
+            else:
+                status, summary, pr_url = _fail(run, why)
         except Exception as e:
             if zte_grant:
                 return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
             run.log(f"crashed: {type(e).__name__}: {e}")
             run.failure = crash_failure(e)
             status, summary, pr_url = "failed", f"crashed: {e}"[:300], ""
-            run.give_up("crashed before finishing")
+            if run.environment_release:
+                status, summary, pr_url = environment_retry_held(run, script.continues, summary)
+            else:
+                run.give_up("crashed before finishing")
         finally:
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
             if run.workspace and not zte_grant:
-                keep_edits(run)
+                if not run.environment_release or ("requirements" in run.facts and flows.retry_passed(flow.ctx.verified)):
+                    keep_edits(run)
                 workspace.note_made(*run.workspace, workspace_owner(run, *run.workspace))
             slot.free()
         try:
@@ -1600,6 +1668,17 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         if status == "skipped" and not zte_grant:
             print(f"{name} was not run: {summary}. Pass --force to run it anyway.")
         return 0 if (status in SUCCEEDED if passed is None else passed) else 1
+
+
+def environment_retry_held(run: Run, continues: str, why: str) -> tuple[str, str, str]:
+    source = run_store.run_get(continues) or {}
+    own = run_store.run_get(run.id) or {}
+    pr_url = own.get("pr_url") or source.get("pr_url") or ""
+    record.note(run.id, branch=own.get("branch") or source.get("branch") or "", pr_url=pr_url)
+    run.facts["held"] = why
+    run.log(f"verification retry held: {why}")
+    run.enter("pr")
+    return "pr", why, pr_url
 
 
 def _fail(run: Run, why: str, builder_said: str = "", detail: str = "",
@@ -1774,6 +1853,8 @@ def triage_block(approval: dict | None) -> str:
 
 
 def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, str]:
+    from . import environment_gaps, flows
+
     repo, tk = run.repo, run.tracker
     try:
         t = intake.route_ticket(cfg, repo, tk, tk.get(run.tid), dry_run=run.dry_run, log=run.log)
@@ -1804,19 +1885,22 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
     attachments = images_note(images)
 
     main_layer = checked_layer(cfg, repo.layer_dir)
-    branch = open_branch(run) or prompt_loader.fill_template(main_layer.branch, config.RepoLayer.branch, kind=t.kind, id=t.id,
-                                               slug=prompt_loader.slug(t.title))
+    branch = run.preview_branch or open_branch(run) or prompt_loader.fill_template(
+        main_layer.branch, config.RepoLayer.branch, kind=t.kind, id=t.id, slug=prompt_loader.slug(t.title))
     if not run.dry_run:
         tk.prepare()
     run.enter("running")
 
     try:
-        ws, checkouts = workspace.make_workspace(run.id, repo, main_layer.base_branch, branch, t.id, main_layer.copy)
+        ws, checkouts = workspace.make_workspace(run.id, repo, main_layer.base_branch, branch, run.workspace_key,
+                                                 main_layer.copy, preview_of=run.preview_of)
         run.workspace = ws, checkouts
         for c in checkouts:
             run.log(f"worktree {c.wt} on {branch}, {c.starting_point}")
         run.cfg, run.layer, run.kind = cfg, main_layer, t.kind
         settle_starts(run, checkouts, main_layer, t, branch)
+        for c in checkouts:
+            c.revision = git(["rev-parse", "HEAD"], c.wt).strip()
     except workspace.RunFailed as e:
         return _fail(run, e.why, detail=e.detail, recovery=e.recovery)
     layer = resolve_layer(cfg, run, ws)
@@ -1901,6 +1985,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
             return _fail(run, f"the builder stopped without changing anything, though the plan estimated "
                               f"{util.count(estimate, 'line')}", build_summary)
     plan_to_review = plan_text
+    verify_goal = goal
     if left_for_a_person:
         not_checked = NOT_CHECKED_LEFT_FOR_A_PERSON + left_for_a_person
         goal, plan_to_review = f"{goal}\n\n{not_checked}", f"{plan_text}\n\n{not_checked}"
@@ -1975,6 +2060,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
     note_prs(run, branch, with_prs)
     ci_stopped = sync_pr_bodies(run, t, with_prs, opened, pushed, pushed, pr_report, left_for_a_person, link)
     drafted = hold_pushed(run, pushed, ci_stopped, draft_why)
+    heads = {c.github: c.lease for c in staged.changed}
     try:
         ci_result = watch_ci(b, slot, branch, staged.changed, with_prs, draft_why)
     except workspace.RunFailed as e:
@@ -1994,6 +2080,15 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
                 + published_note(draft_why, verified, opened, drafted))
     automerge(b, approval, draft_why, verified, review, opened + ready_pushed(run, pushed, ci_stopped, draft_why),
               automerge_about(t, build_summary))
+    if (not run.feedback and draft_why and review.approved()
+            and not ci_stopped and environment_gaps.gaps(asdict(verified))):
+        run_lines.write(run.id, "classic_hold",
+                        prepared=flows.prepared_fields(t, branch, checkouts, layer, run.add_dirs, attachments, approval),
+                        plan={"plan": plan_text, "goal": verify_goal, "estimate": estimate,
+                              "left_for_a_person": left_for_a_person},
+                        build={"summary": build_summary}, review=review.asdict(),
+                        publication={"draft_why": draft_why, "prs": {c.github: c.pr for c in with_prs},
+                                     "heads": heads, "verified": asdict(verified)})
     urls = record_prs(run, branch, with_prs)
     release_workspace(run, ws, checkouts)
     return "pr", outcome, urls
@@ -2585,10 +2680,15 @@ def merge_as_run(run_id: str, c: workspace.Checkout, commit: str, named: str) ->
 
 
 def merge_moved_bases(run: AgentRun, checkouts: list[workspace.Checkout], layer: config.RepoLayer, ticket: tracker.Ticket,
-                      log_prefix: str = "", reason: str = "since the base moved after the last push") -> list[workspace.Checkout]:
+                      log_prefix: str = "", reason: str = "since the base moved after the last push",
+                      *, environment_retry: bool = False) -> list[workspace.Checkout]:
     merged = []
     for c in checkouts:
-        c.base_commit = git(["rev-parse", c.origin_base], c.wt).strip()
+        base = git(["rev-parse", c.origin_base], c.wt).strip()
+        if environment_retry and (not c.base_commit or
+                                  git(["merge-base", c.base_commit, base], c.wt).strip() != c.base_commit):
+            raise workspace.RunFailed(f"the base for {c.github} no longer contains the saved base")
+        c.base_commit = base
         if git(["rev-list", "--count", f"HEAD..{c.base_commit}"], c.wt).strip() == "0":
             continue
         if edits := workspace.uncommitted(c.wt):
@@ -2604,6 +2704,8 @@ def merge_moved_bases(run: AgentRun, checkouts: list[workspace.Checkout], layer:
                     conflicts = unmerged_paths(c.wt)
                     if not conflicts:
                         raise workspace.RunFailed(f"git could not merge `{c.origin_base}` into the branch in {c.github}: {e}")
+                    if environment_retry:
+                        raise workspace.RunFailed(f"merging `{c.origin_base}` into the held draft conflicts in {c.github}")
                     rec["conflicts"] = conflicts
                     try:
                         resolve_conflicts(run, c, conflicts, layer, ticket)
@@ -3400,7 +3502,7 @@ def retry_scratch(days: float = 30) -> None:
 
 
 def tell_ticket_run_died(cfg: config.Config, row: dict) -> None:
-    from . import zte
+    from . import environment_gaps, zte
 
     if zte.reserved(str(row["issue"])):
         try:
@@ -3426,6 +3528,9 @@ def tell_ticket_run_died(cfg: config.Config, row: dict) -> None:
     elif row["status"] == "failed":
         run.log(f"{record.INTERRUPTED}, the second interruption in a row")
         run.give_up(f"{record.INTERRUPTED}, the second interruption in a row")
+    elif environment_gaps.was_retry(row):
+        run.enter("pr")
+        run.say(f"Run `{run.id}` was interrupted during the automatic verification retry. Check the PR before resuming it.")
     else:
         run.log(record.INTERRUPTED)
         run.leave("running")

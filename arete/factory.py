@@ -505,6 +505,7 @@ def main(fn: Callable, argv: list[str] | None = None) -> None:
                    help="run this step alone, the steps before it from the stored outcomes")
     p.add_argument("--from", dest="again", default="", choices=sorted(STEPS),
                    help="with --continue, run this step again and every step after it")
+    p.add_argument("--environment-release", default="", help=argparse.SUPPRESS)
     p.add_argument("--repair", dest="repairs", default="", metavar="RUN",
                    help="continue the open PR of this held run from its saved internal review")
     p.add_argument("--action", default="", help="rerun a durable adaptive action by ID with --continue")
@@ -517,7 +518,7 @@ def main(fn: Callable, argv: list[str] | None = None) -> None:
     except (ValueError, TypeError) as e:
         p.error(str(e))
     script = pipeline.Script(Path(inspect.getfile(fn)).stem, fn, args.continues, args.only, table, args.again,
-                             args.repairs, args.action, args.only_action)
+                             args.repairs, args.action, args.only_action, args.environment_release)
     try:
         with principals.acting(principals.cli_actor()):
             code = pipeline.run_issue(args.repo, args.ticket, args.dry_run, args.force, script)

@@ -303,8 +303,8 @@ def command_run(run_id, base_version):
     return cfg, repo, row
 
 
-def no_later_run(row: dict) -> None:
-    if later := run_store.later_run(row["repo"], row["issue"], row["id"]):
+def no_later_run(row: dict, *, live: bool = False) -> None:
+    if later := run_store.later_run(row["repo"], row["issue"], row["id"], live=live):
         raise control.Refused(f"run {row['id']} is not the ticket's latest run: run {later['id']} "
                               f"({later['status']}) came after it")
 
@@ -565,7 +565,7 @@ def release_closed(cfg: config.Config) -> list[str]:
     return notes
 
 
-def resume(run_id: str, step: str = "", base_version=None) -> dict:
+def resume(run_id: str, step: str = "", base_version=None, *, environment_release: str = "") -> dict:
     with util.lock(STEER_LOCK, wait=True):
         cfg, repo, row = command_run(run_id, base_version)
         if row.get("files_purged"):
@@ -586,19 +586,38 @@ def resume(run_id: str, step: str = "", base_version=None) -> dict:
             return continue_asked(cfg, repo, row, admission=(run_id, base_version))
         if row.get("only_step"):
             raise control.Refused(f"run {run_id} ran {row['only_step']} alone; resume the run it continued")
-        if row["status"] not in RESUMABLE:
+        environment_retry = bool(environment_release and row["status"] == "pr" and step == "verify")
+        if row["status"] not in RESUMABLE and not environment_retry:
             raise control.Refused(f"run {run_id} ended {row['status']}; a run resumes only when it ended "
                                   f"{', '.join(RESUMABLE[:-1])} or {RESUMABLE[-1]}")
-        no_later_run(row)
-        if script_path(row) == "orchestrate":
+        no_later_run(row, live=environment_retry)
+        path = pipeline.recorded_path(run_id)
+        if environment_retry:
+            from . import environment_gaps
+
+            if path not in environment_gaps.RESUME_PATHS or environment_gaps.live_release() != environment_release:
+                raise control.Refused(f"the release for run {run_id}'s verify retry is no longer live")
+            if path == "orchestrate":
+                if not (step := environment_gaps.verification_action(run_id)):
+                    raise control.Refused(f"run {run_id} has no saved verification action to rerun")
+            elif path == "classic":
+                tid = str(row["issue"])
+                return launch(cfg, repo, tid, control.command(["run", repo.name, tid, "--local", "--force",
+                              "--continue", run_id, "--environment-release", environment_release]),
+                              admission=(run_id, base_version))
+        if path == "classic":
+            path = ""
+        if path == "orchestrate":
             if step:
                 adaptive_action(row, step)
             return launch(cfg, repo, str(row["issue"]), command_of(
                 cfg, "orchestrate", repo.name, str(row["issue"]), "--force", "--continue", run_id,
-                *(["--action", step] if step else [])), admission=(run_id, base_version))
+                *(["--action", step] if step else []),
+                *(["--environment-release", environment_release] if environment_retry else [])),
+                admission=(run_id, base_version))
         if step and step_named(step) and not factory.started(run_id, step):
             raise control.Refused(f"run {run_id} never started {step}, so it cannot resume from it")
-        if not (path := script_path(row)) and flows.ran_on_seam(run_id):
+        if not path and flows.ran_on_seam(run_id):
             path = "revise" if pipeline.pending_feedback(row["repo"], str(row["issue"])) else "feature"
         if not path:
             raise control.Refused(f"run {run_id} ran on the classic path, so it cannot resume; start the ticket again "
@@ -608,7 +627,8 @@ def resume(run_id: str, step: str = "", base_version=None) -> dict:
             step = next((str(line.get("step") or "") for line in reversed(factory.history(factory.chain(run_id)))
                          if line.get("result") != "pass"), "")
         return launch(cfg, repo, tid, command_of(cfg, path, repo.name, tid, "--force", "--continue", run_id,
-                                                 *(["--from", step] if step else [])),
+                                                 *(["--from", step] if step else []),
+                                                 *(["--environment-release", environment_release] if environment_retry else [])),
                       admission=(run_id, base_version))
 
 
