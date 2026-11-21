@@ -17,6 +17,7 @@ START_LIMIT = 3
 AGE_LIMIT = 5 * 60
 SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 AGE_FAILURE = "the deploy receipt is older than 5 minutes"
+MISSING_TAIL = "(serve.log tail unavailable)"
 
 
 def is_serve_start(argv: list[str]) -> bool:
@@ -106,7 +107,7 @@ def log_tail(logs: Path) -> str:
                     return "\n".join(tail.splitlines()[-40:])
         except OSError:
             continue
-    return "(serve.log tail unavailable)"
+    return MISSING_TAIL
 
 
 def report_reason(held: dict) -> str:
@@ -142,19 +143,34 @@ def rollback(state: Path, checkout: Path, logs: Path, receipt: Receipt, reason: 
     return True
 
 
+def rollback_if_unhealthy(state: Path, checkout: Path, logs: Path, receipt: Receipt) -> bool:
+    if held := read(hold_path(state, receipt.tip)):
+        reason = report_reason(held)
+    elif receipt.expired():
+        reason = AGE_FAILURE
+    elif receipt.starts >= START_LIMIT:
+        reason = f"{receipt.starts} unhealthy starts"
+    else:
+        return False
+    return rollback(state, checkout, logs, receipt, reason)
+
+
+def record_start(state: Path, receipt: Receipt, at: float) -> None:
+    started_at = receipt.started_at
+    if started_at is None:
+        started_at = receipt.created_at if receipt.starts else at
+    receipt = replace(receipt, starts=receipt.starts + 1, started_at=started_at)
+    write(state / RECEIPT, asdict(receipt))
+
+
 def count_start(state: Path, checkout: Path, logs: Path) -> bool:
     receipt = pending(state, checkout)
     if receipt is None or not at_tip(checkout, receipt):
         return False
-    held = read(hold_path(state, receipt.tip))
-    reason = (report_reason(held) if held else AGE_FAILURE if receipt.expired()
-              else f"{receipt.starts} unhealthy starts" if receipt.starts >= START_LIMIT else "")
-    started_at = receipt.started_at
-    if started_at is None:
-        started_at = receipt.created_at if receipt.starts else time.time()
-    receipt = replace(receipt, starts=receipt.starts + 1, started_at=started_at)
-    write(state / RECEIPT, asdict(receipt))
-    return bool(reason) and rollback(state, checkout, logs, receipt, reason)
+    if rollback_if_unhealthy(state, checkout, logs, receipt):
+        return True
+    record_start(state, receipt, time.time())
+    return False
 
 
 def lock_start(state: Path) -> None:

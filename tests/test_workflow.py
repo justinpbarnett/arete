@@ -3119,15 +3119,22 @@ class SelfDeployRollbackTests(unittest.TestCase):
         self.server.code_seen = stamp
         self.server.code_note = ""
         failure = subprocess.CompletedProcess([], 1, "", "ImportError: broken candidate initializer")
+        attempted_at = time.time()
+
+        def failed_probe(*args, **kwargs):
+            clock.return_value = attempted_at + 60
+            return failure
+
         with (mock.patch.object(serve, "code_stamp", return_value=stamp),
-              mock.patch.object(util, "sh", return_value=failure),
+              mock.patch.object(serve_guard.time, "time", return_value=attempted_at) as clock,
+              mock.patch.object(util, "sh", side_effect=failed_probe),
               mock.patch.object(serve_guard, "at_tip", return_value=True),
               mock.patch.object(self.server, "busy_with", return_value=""),
               mock.patch.object(self.server, "restart_for_new_code") as restart):
             self.server.load_new_code()
         restart.assert_not_called()
         self.assertIn("broken candidate initializer", self.server.code_note)
-        self.assertEqual(self.receipt()["starts"], 1)
+        self.assertEqual((self.receipt()["starts"], self.receipt()["started_at"]), (1, attempted_at))
         self.assertFalse(serve_guard.hold_path(self.state, self.tip).exists())
 
     def test_launchd_rolls_back_after_three_failed_starts_and_holds_the_tip(self):
@@ -3163,6 +3170,7 @@ class SelfDeployRollbackTests(unittest.TestCase):
         self.assertIn("last good started", restored.stdout)
         self.assertEqual(self.git("rev-parse", "HEAD"), self.previous)
         self.assertEqual(untracked.read_text(), "local = True\n")
+        self.assertEqual(self.receipt()["starts"], 3)
         self.assertEqual(self.receipt()["rollback"], "code_only")
         self.assertIsNone(serve_guard.pending(self.state, self.checkout))
         self.assertEqual(serve.deploy_refusal(self.checkout, "main", self.tip), "held after startup rollback")
@@ -3182,6 +3190,25 @@ class SelfDeployRollbackTests(unittest.TestCase):
         self.assertIn("ImportError: cannot import module", body)
         for private in (token, password, str(self.checkout)):
             self.assertNotIn(private, body)
+
+    def test_terminal_wrapper_checks_receipt_before_loading_cli_commands(self):
+        source = Path(serve_guard.__file__).parent
+        self.prepare_checkout({f"arete/{name}": (source / name).read_text()
+                               for name in ("cli.py", "local_paths.py", "serve_guard.py")})
+        wrapper = paths.HOME / "arete-cli"
+        wrapper.write_text(f"import sys\nsys.path.insert(0, {str(self.checkout)!r})\n"
+                           "from arete.cli import main\nraise SystemExit(main())\n")
+        self.write_receipt(starts=3, started_at=time.time())
+        restored = subprocess.run([sys.executable, "-I", "-S", str(wrapper), "serve"],
+                                  cwd=self.checkout, env=install.serve_plist()["EnvironmentVariables"],
+                                  capture_output=True, text=True, timeout=2)
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        self.assertIn("last good started", restored.stdout)
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.previous)
+        with (mock.patch.object(serve.codebase, "checkout_head", return_value=self.previous[:12]),
+              mock.patch.object(gh, "issue_create", return_value=52) as ticket):
+            serve.report_rollbacks(self.checkout, self.server.say)
+        self.assertIn(serve_guard.MISSING_TAIL, ticket.call_args.args[2])
 
     def test_unstarted_deploy_waits_for_chat_before_opening_health_window(self):
         self.prepare_state()
@@ -3222,8 +3249,7 @@ class SelfDeployRollbackTests(unittest.TestCase):
               mock.patch.object(serve_guard, "at_tip", return_value=True),
               mock.patch.object(serve_guard, "rollback", return_value=True) as rollback):
             self.assertTrue(serve_guard.count_start(self.state, self.checkout, paths.LOG_DIR))
-        rollback.assert_called_once_with(self.state, self.checkout, paths.LOG_DIR,
-                                         replace(receipt, starts=2), serve_guard.AGE_FAILURE)
+        rollback.assert_called_once_with(self.state, self.checkout, paths.LOG_DIR, receipt, serve_guard.AGE_FAILURE)
 
     def test_new_green_commit_deploys_after_config_rejection(self):
         self.prepare_state()
@@ -3255,10 +3281,12 @@ class SelfDeployRollbackTests(unittest.TestCase):
         def git(args, *_args, **_kwargs):
             return {("rev-parse", "--show-toplevel"): str(self.checkout),
                     ("rev-parse", "--verify", self.ref): newer,
+                    ("rev-parse", "--verify", "HEAD"): self.tip,
+                    ("branch", "--show-current"): "main",
+                    ("--no-replace-objects", "merge-base", self.tip, newer): self.tip,
                     ("--no-replace-objects", "show", "-s", "--format=%s", newer): "new candidate"}.get(tuple(args), "")
 
         with (mock.patch.object(util, "git", side_effect=git),
-              mock.patch.object(self.server, "deploy_ready", return_value=True),
               mock.patch.object(serve, "pilot_deploy_refusal", return_value=""),
               mock.patch.object(util, "deploy_recovery", return_value=SimpleNamespace(head=self.tip)),
               mock.patch.object(util, "deploy_fast_forward") as fast_forward,
@@ -3312,7 +3340,12 @@ class SelfDeployRollbackTests(unittest.TestCase):
             stages["dispatch"].side_effect = None
             self.server.acknowledge_deploy(self.server.tick())
             self.assertFalse(self.receipt()["healthy"])
-            self.server.acknowledge_deploy(self.server.tick())
+            healthy_at_deploy = mock.Mock()
+            with mock.patch.multiple(self.server, load_new_code=mock.DEFAULT, reap_inherited=mock.DEFAULT,
+                                     watch_alerts=mock.DEFAULT, beat=mock.DEFAULT,
+                                     deploy_when_due=lambda: healthy_at_deploy(self.receipt()["healthy"])):
+                self.server.run_pass()
+            healthy_at_deploy.assert_called_once_with(True)
         self.assertTrue(self.receipt()["healthy"])
 
     def test_pending_deploy_delivers_tick_alert_at_normal_threshold(self):
@@ -3369,14 +3402,9 @@ class SelfDeployRollbackTests(unittest.TestCase):
 
     def test_dashboard_readiness_preserves_normal_access_checks(self):
         self.prepare_state()
-        with redirect_stdout(StringIO()):
-            db.migrate()
-        owner, host = "owner@example.test", "host@example.test"
-        principals.seed_owner(owner)
-        whois = mock.Mock(return_value=host)
         address = "127.0.0.1"
         node = tailnet.Node((address,), frozenset({address}), address)
-        logins = tailnet.Logins(SimpleNamespace(whois=whois))
+        logins = tailnet.Logins(SimpleNamespace(whois=lambda _: "visitor@example.test"))
         server = SimpleNamespace(node=node, logins=logins, inside_serve=True)
 
         def connect(conn):
@@ -3396,18 +3424,20 @@ class SelfDeployRollbackTests(unittest.TestCase):
             with closing(http.client.HTTPConnection(address, 1234, timeout=1)) as conn:
                 conn.request("GET", path, headers=headers)
                 with conn.getresponse() as response:
-                    return response.status, json.load(response)
+                    response.read()
+                    return response.status
 
         tailnet.record_server(node, 1234, tailnet.Front("http", []))
-        with mock.patch.object(http.client.HTTPConnection, "connect", connect):
+        with (mock.patch.object(http.client.HTTPConnection, "connect", connect),
+              mock.patch.object(principals, "for_login", return_value=None) as for_login,
+              mock.patch.object(dashboard.api, "meta", return_value={"schema": {"version": db.LATEST}}) as meta):
             self.assertTrue(serve.dashboard_answers())
-            self.assertEqual(get(dashboard.READY_PATH, {})[0], 403)
-            self.assertEqual(get("/api/meta", {dashboard.READY_HEADER: dashboard.READY_TOKEN})[0], 403)
-            whois.return_value = owner
-            logins.seen.clear()
-            status, body = get("/api/meta", {})
-            self.assertEqual(status, 200)
-            self.assertEqual(body["schema"]["version"], db.LATEST)
+            for_login.assert_not_called()
+            self.assertEqual(get(dashboard.READY_PATH, {}), 403)
+            self.assertEqual(get("/api/meta", {dashboard.READY_HEADER: dashboard.READY_TOKEN}), 403)
+            meta.assert_called_once()
+            meta.return_value = {"schema": {"version": db.NEEDED - 1}}
+            self.assertFalse(serve.dashboard_answers())
 
     def test_guard_imports_only_standard_library(self):
         tree = ast.parse(Path(serve_guard.__file__).read_text())

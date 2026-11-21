@@ -242,8 +242,10 @@ def report_rollbacks(src: Path, say: Callable[[str], None]) -> None:
                 held["report_started"] = True
                 serve_guard.write(path, held)
             if issue is None:
-                tracked = serve_guard.git(src, "ls-tree", "-r", "--name-only", tip).splitlines()
-                excerpt = startup_excerpt.redacted(held["log_tail"], str(src), frozenset(tracked), (tip, previous))
+                excerpt = held["log_tail"]
+                if excerpt != serve_guard.MISSING_TAIL:
+                    tracked = serve_guard.git(src, "ls-tree", "-r", "--name-only", tip).splitlines()
+                    excerpt = startup_excerpt.redacted(excerpt, str(src), frozenset(tracked), (tip, previous))
                 body = (f"Arete rolled back self-deploy code from `{tip[:12]}` to `{previous[:12]}` because "
                         f"{serve_guard.report_reason(held)}. Deploys of `{tip[:12]}` are held.\n\n"
                         f"Redacted serve.log tail\n\n```text\n{excerpt}\n```")
@@ -512,19 +514,19 @@ class Server:
             finally:
                 self.checkout_update.release()
         completed = self.guard("tick", self.tick)
-        self.guard("stage:deploy", self.deploy_when_due)
         self.guard("stage:inherited", self.reap_inherited)
         self.ticks += 1
         self.guard("stage:alerts", self.watch_alerts)
-        try:
-            self.beat()
-        except Exception as e:
-            self.say(f"beat failed: {type(e).__name__}: {e}")
         if self.checkout_update.acquire(blocking=False):
             try:
                 self.guard("stage:deploy-health", self.acknowledge_deploy, completed)
             finally:
                 self.checkout_update.release()
+        self.guard("stage:deploy", self.deploy_when_due)
+        try:
+            self.beat()
+        except Exception as e:
+            self.say(f"beat failed: {type(e).__name__}: {e}")
 
     def deploy_when_due(self) -> None:
         if self.deployment is not None:
@@ -551,9 +553,10 @@ class Server:
             self.restart_for_new_code()
 
     def deploy_if_ready(self, cfg: config.Config) -> None:
-        src = paths.PACKAGE_DIR.parent
-        report_rollbacks(src, self.say)
-        self.deploy(cfg)
+        try:
+            self.deploy(cfg)
+        finally:
+            report_rollbacks(paths.PACKAGE_DIR.parent, self.say)
 
     def deploy(self, cfg: config.Config) -> None:
         if not (repo := cfg.repo_for_path(paths.PACKAGE_DIR)):
@@ -993,11 +996,17 @@ class Server:
             return "a feedback request is still being checked or filed"
         return ""
 
-    def record_failed_start(self, receipt: serve_guard.Receipt) -> None:
-        if serve_guard.count_start(paths.STATE_DIR, paths.PACKAGE_DIR.parent, paths.LOG_DIR):
-            self.code_problem = ""
-            if codebase.RELEASE == receipt.previous and codebase.head_and_dirt() == (receipt.previous[:12], False):
-                self.code = self.code_seen = code_stamp()
+    def record_failed_start(self, receipt: serve_guard.Receipt, attempted_at: float) -> None:
+        if serve_guard.at_tip(paths.PACKAGE_DIR.parent, receipt):
+            serve_guard.record_start(paths.STATE_DIR, receipt, attempted_at)
+
+    def rollback_unhealthy_deploy(self, receipt: serve_guard.Receipt) -> bool:
+        if not serve_guard.rollback_if_unhealthy(paths.STATE_DIR, paths.PACKAGE_DIR.parent, paths.LOG_DIR, receipt):
+            return False
+        self.code_problem = ""
+        if codebase.RELEASE == receipt.previous and codebase.head_and_dirt() == (receipt.previous[:12], False):
+            self.code = self.code_seen = code_stamp()
+        return True
 
     def load_new_code(self) -> None:
         stamp = code_stamp()
@@ -1009,17 +1018,21 @@ class Server:
         receipt = serve_guard.pending(paths.STATE_DIR, paths.PACKAGE_DIR.parent)
         if receipt is not None and ("HEAD", receipt.tip[:12]) not in stamp:
             receipt = None
-        if receipt is not None and (busy := self.busy_with()):
-            self.note_once(f"new code waits to load: {busy}")
-            return
+        if receipt is not None:
+            if busy := self.busy_with():
+                self.note_once(f"new code waits to load: {busy}")
+                return
+            if self.rollback_unhealthy_deploy(receipt):
+                return
         entrypoint = f"import sys; sys.path.insert(0, {str(paths.PACKAGE_DIR.parent)!r}); "
+        attempted_at = time.time()
         check = util.sh([sys.executable, "-I", "-c", entrypoint + f"sys.argv[:] = {sys.argv!r}; " + IMPORT_CHECK],
                         timeout=120)
         if check.returncode != 0:
             problem = util.last_line(check.stderr or check.stdout, 300)
             if receipt is not None:
                 self.note_once("deploy: new code does not import: " + problem)
-                self.record_failed_start(receipt)
+                self.record_failed_start(receipt, attempted_at)
             else:
                 self.note_once("new code does not import, so serve keeps the code it started with: " + problem)
             return
@@ -1029,7 +1042,7 @@ class Server:
                                  + util.last_line(candidate.stderr or candidate.stdout, 300))
             self.note_once(self.code_problem)
             if receipt is not None:
-                self.record_failed_start(receipt)
+                self.record_failed_start(receipt, attempted_at)
             return
         if stamp != self.migration_stamp:
             migrated = util.sh(control.command(["migrate", "--no-contracts"]), timeout=120)
@@ -1037,7 +1050,7 @@ class Server:
             self.migration_error = ((util.last_line(migrated.stderr or migrated.stdout, 300)
                                      or f"migrate exited {migrated.returncode}") if migrated.returncode else "")
             if self.migration_error and receipt is not None:
-                self.record_failed_start(receipt)
+                self.record_failed_start(receipt, attempted_at)
         if self.migration_error:
             self.note_once("new code migration failed, so serve keeps its code: " + self.migration_error)
             return
