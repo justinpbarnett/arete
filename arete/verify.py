@@ -122,7 +122,8 @@ def preflight(v: config.Verify, cwd: Path, cfg: config.Config, repo: config.Repo
 
 
 def run_probes(v: config.Verify, cwd: Path, attempt: scratch.Attempt | None,
-               *, journey_drivers: dict[str, str] | None = None) -> Verified | None:
+               *, journey_drivers: dict[str, str] | None = None,
+               stop_on_driver_failure: bool = True) -> Verified | None:
     named = [(f"journey:{name}", v.drivers[driver]) for name, driver in sorted((journey_drivers or {}).items())]
     if not v.probes and not named:
         return None
@@ -132,6 +133,7 @@ def run_probes(v: config.Verify, cwd: Path, attempt: scratch.Attempt | None,
         return Verified("blocked", f"Configured {label} require trusted scratch confinement.",
                         blocked_by=f"{label} could not obtain scratch authority{requested}", finished=False)
     deadline, checks = time.monotonic() + v.probe_seconds, []
+    failure, blocked_by = "", ""
     env = environment.build((), scratch.attempt_env(attempt))
     env = {name: value for name, value in env.items() if not paths.CREDENTIAL_NAME.search(name)}
 
@@ -141,7 +143,8 @@ def run_probes(v: config.Verify, cwd: Path, attempt: scratch.Attempt | None,
 
     for index, (name, command) in enumerate((*v.probes.items(), *named)):
         is_driver = index >= len(v.probes)
-        remaining = deadline - time.monotonic()
+        replaying_driver = is_driver and not stop_on_driver_failure
+        remaining = v.probe_seconds if replaying_driver else deadline - time.monotonic()
         cause = "change"
         try:
             if remaining <= 0:
@@ -185,9 +188,19 @@ def run_probes(v: config.Verify, cwd: Path, attempt: scratch.Attempt | None,
             summary = f"Configured {label} failed."
             if named:
                 summary = f"Could not run {name}." if blocked else f"{name} failed."
-            return Verified("blocked" if blocked else "fail", summary, checks,
-                            blocked_by=(blocker if named else f"probes: {blocker}") if blocked else "",
-                            finished=not (named and blocked))
+            if not replaying_driver:
+                return Verified("blocked" if blocked else "fail", summary, checks,
+                                blocked_by=(blocker if named else f"probes: {blocker}") if blocked else "",
+                                finished=not (named and blocked))
+            if blocked:
+                blocked_by = blocked_by or blocker
+            else:
+                failure = failure or summary
+    if failure:
+        return Verified("fail", failure, checks)
+    if blocked_by:
+        return Verified("blocked", "A configured journey driver could not run.", checks,
+                        blocked_by=blocked_by, finished=False)
     return Verified("pass", f"Owner-configured {label} passed under scratch confinement.", checks)
 
 

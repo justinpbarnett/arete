@@ -12,9 +12,10 @@ import time
 import tomllib
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager, nullcontext
-from dataclasses import replace
+from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
+from dataclasses import asdict, replace
 from datetime import timedelta
+from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -23,8 +24,8 @@ from unittest import mock
 
 from adws import single_worker
 from arete import (
-    api_check, ci, config, diffguard, evals, factory, flows, gh, jev, mergecheck, miner, orchestration, owner_asks,
-    paths, pipeline, sandbox, serve, tracker, util, verify, workspace,
+    api_check, ci, config, diffguard, evals, factory, flows, gh, jev, journeys, loop_run, mergecheck, miner,
+    orchestration, owner_asks, paths, pipeline, sandbox, serve, tracker, util, verify, workspace,
 )
 from arete.agent import NO_SESSION, Result
 from arete.review import Review
@@ -1494,15 +1495,22 @@ class JourneyVerificationTests(unittest.TestCase):
         report = self.run.save.call_args.args[1]
         self.assertIn(self.work.layer.verify.drivers["prompt-inputs"], report)
         self.assertIn("Driver observed valid prompt", report)
+        item = {"run_id": "build", "pr": 646}
         with tempfile.NamedTemporaryFile(suffix=".md") as saved:
             path = Path(saved.name)
             path.write_text(report)
-            with mock.patch.object(mergecheck, "reports", return_value=("build", path)):
-                steps = mergecheck.report_steps({"run_id": "build", "pr": 646})
+            with mock.patch.object(mergecheck, "reports", return_value=("build", path, None)):
+                classic = mergecheck.report_steps(item)
+            recorded = [check for check in result.checks if check.get("driver") is True]
+            with mock.patch.object(mergecheck, "reports", return_value=("build", path, recorded)):
+                steps = mergecheck.report_steps(item)
 
-        self.assertEqual([step.goal(n) for n, step in enumerate(steps, 1)], [
+        self.assertEqual([step.goal(n) for n, step in enumerate(classic, 1)], [
             "1. [build step 1] Inspect the catalog: echo catalog",
             "2. [build step 2] journey:verifier-prompt-inputs: echo prompt",
+        ])
+        self.assertEqual(steps, [
+            *classic, mergecheck.Step("build", 3, "journey:verifier-prompt-inputs", "", 646, driver=True),
         ])
 
     def test_linked_map_cannot_redirect_an_owner_configured_binding(self):
@@ -1661,6 +1669,586 @@ class JourneyVerificationTests(unittest.TestCase):
         self.assertEqual(result.checks[0]["what"], "Ordinary CLI check")
         self.assertNotIn("Product feature map", self.run.agent.call_args.args[1])
         commands.assert_not_called()
+
+
+class MergeCheckJourneyTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(TemporaryDirectory())).resolve()
+        self.runs = self.root / "runs"
+        self.report = self.runs / "verified" / "verify.md"
+        self.report.parent.mkdir(parents=True)
+        self.item = {"run_id": "verified", "pr": 678, "key": "fixture/pull/678", "repo": "fixture", "merged_at": "now"}
+        self.provenance = {}
+        self.enterContext(mock.patch.object(paths, "RUNS_DIR", self.runs))
+        self.enterContext(mock.patch.object(factory, "chain", side_effect=self.history))
+
+    def history(self, run_id):
+        if run_id not in self.provenance:
+            return [[{"run": run_id}]]
+        return [[{"run": run_id, "event": "step_end", "step": "verify", "result": "pass",
+                  "data": {"verified": self.provenance[run_id]}}]]
+
+    def save_report(self, path, verified):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(verified.markdown())
+        self.provenance[path.parent.name] = asdict(replace(verified, saved=str(path)))
+        recorded = [check for check in verified.checks if check.get("driver") is True]
+        path.with_name(f"{path.stem}-probes.json").write_text(json.dumps({"checks": recorded}))
+
+    def prepare_replay(self, exit_code, *, output="merged checkout output", later_drivers=None, grade=None,
+                       cleanup_error=False, probe_exit=None):
+        exit_codes = {} if exit_code is None else {"checkout": exit_code, **(later_drivers or {})}
+        ordinary = {"what": "Inspect the catalog", "how": "echo catalog", "saw": "catalog", "passed": True}
+        self.save_report(self.report, verify.Verified("pass", checks=[
+            {"what": f"journey:{name}", "how": "exit 99", "saw": "old output", "passed": True, "driver": True}
+            for name in exit_codes
+        ] or [ordinary]))
+        self.items = [self.item]
+        if grade is not None and exit_codes:
+            self.items.append({**self.item, "run_id": "ordinary", "pr": 679, "key": "fixture/pull/679"})
+            self.save_report(self.runs / "ordinary" / "verify.md", verify.Verified("pass", checks=[ordinary]))
+        repo = config.Repo("fixture", self.root, pipeline=True)
+        layer = config.RepoLayer(self.root, base_branch="main", verify=config.Verify(
+            url="", drivers={name: f"cat product.txt; exit {code} # {name}" for name, code in exit_codes.items()},
+            feature_map={name: journeys.Journey(("Read product output",), "Product is ready", name)
+                         for name in exit_codes},
+        ))
+        self.cfg = config.Config(repos=[repo])
+        self.layer = layer
+        self.worktree = None
+        self.enterContext(mock.patch.object(config, "load_layer", return_value=layer))
+        self.enterContext(mock.patch.object(mergecheck, "changed", return_value={"product.txt"}))
+        self.enterContext(mock.patch.object(paths, "WORKTREES_DIR", self.root))
+        self.enterContext(mock.patch.object(mergecheck, "merged", return_value=self.items))
+        self.enterContext(mock.patch.object(mergecheck, "loop_dir", return_value=self.root / "loop"))
+        self.enterContext(mock.patch.object(mergecheck.record, "new_id", side_effect=["replay", "retry", "last"]))
+        self.enterContext(mock.patch.object(mergecheck.record, "start"))
+        self.settle = self.enterContext(mock.patch.object(mergecheck.record, "settle"))
+
+        def git(args, cwd):
+            if args[:2] == ["rev-parse", "--verify"]:
+                self.assertEqual(args[2], "origin/main^{commit}")
+                return "merged-sha"
+            if args[:2] == ["worktree", "add"]:
+                self.assertEqual((args[2], args[4]), ("--detach", "merged-sha"))
+                self.worktree = Path(args[3])
+                self.worktree.mkdir()
+            if args[:2] == ["worktree", "remove"] and cleanup_error:
+                raise RuntimeError("worktree removal failed")
+            return ""
+
+        def spawn(command, *, actor_confined, **kwargs):
+            self.assertTrue(actor_confined)
+            self.assertEqual(kwargs["cwd"], self.worktree)
+            code = int(command[-1].split(" # ", 1)[0].rsplit("exit ", 1)[1])
+            return mock.Mock(returncode=code, communicate=mock.Mock(return_value=(output + "\n", "")))
+
+        def agent(run, *_args, **_kwargs):
+            run.invoked = True
+            return SimpleNamespace(ok=True, structured=grade)
+
+        self.run_dir = self.runs / "replay-fixture"
+        self.enterContext(mock.patch.object(mergecheck.util, "git", side_effect=git))
+        self.enterContext(mock.patch.object(mergecheck.verifier_suites, "held", return_value=False))
+        self.enterContext(mock.patch.object(pipeline, "untracked_by_dir", return_value={}))
+        self.enterContext(mock.patch.object(pipeline, "restore_worktrees"))
+        self.enterContext(mock.patch.object(verify.scratch, "make",
+                                           return_value=SimpleNamespace(root=str(self.root / "scratch"))))
+        self.enterContext(mock.patch.object(verify.scratch, "end", return_value=("", [], [])))
+        self.enterContext(mock.patch.object(util, "stop_group"))
+        self.enterContext(mock.patch.object(verify.scratch, "service_command",
+                                           side_effect=lambda _, command: ["/bin/sh", "-c", command]))
+        self.spawn = self.enterContext(mock.patch.object(verify.scratch, "spawn", side_effect=spawn))
+        self.agent = self.enterContext(mock.patch.object(mergecheck.CheckRun, "agent", autospec=True, side_effect=agent))
+        if probe_exit is not None:
+            layer.verify.probes["ready"] = f"exit {probe_exit}"
+
+    def replay_driver(self, exit_code, **kwargs):
+        self.prepare_replay(exit_code, **kwargs)
+        repo = self.cfg.repo("fixture")
+        replay = mergecheck.plan(self.cfg, repo, self.items, self.items, self.run_dir.name)
+        return replay, mergecheck.execute(self.cfg, replay, self.run_dir.name)
+
+    def consume(self, events):
+        with (redirect_stdout(StringIO()) as stdout, redirect_stderr(StringIO()) as stderr,
+              mock.patch.object(config, "load", return_value=self.cfg),
+              mock.patch.object(mergecheck.sys, "stdin", StringIO(json.dumps(events)))):
+            code = mergecheck.command(SimpleNamespace(cmd="merge-check", repo="fixture", dry_run=False))
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def checked(self):
+        return json.loads((self.root / "loop/.state/checked.json").read_text())["fixture"]
+
+    def test_classic_driver_only_report_holds_as_on_main_even_with_a_probe_artifact(self):
+        self.prepare_replay(1)
+        self.provenance.pop("verified")
+
+        code, stdout, stderr = self.consume(self.items)
+
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("no usable, uniquely numbered checks", stderr)
+        self.assertEqual(self.checked(), [])
+        self.spawn.assert_not_called()
+        self.agent.assert_not_called()
+
+    def test_classic_report_with_a_driver_row_replays_the_ordinary_step(self):
+        self.prepare_replay(1, grade={
+            "verdict": "pass", "summary": "Catalog checked.",
+            "checks": [{"what": "Step 1: Inspect the catalog", "how": "echo catalog", "saw": "catalog", "passed": True}],
+        })
+        self.provenance.clear()
+        self.report.write_text(self.report.read_text() + "\n" +
+                               (self.runs / "ordinary" / "verify.md").read_text())
+        self.items.pop()
+
+        code, stdout, _ = self.consume(self.items)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(stdout), {"value": 1})
+        self.assertEqual(self.checked(), [self.item["key"]])
+        self.spawn.assert_not_called()
+        self.agent.assert_called_once()
+
+    def test_driver_only_failure_names_the_journey_and_its_observation(self):
+        self.prepare_replay(1)
+
+        code, stdout, _ = self.consume(self.items)
+
+        self.assertEqual(code, 0)
+        finding, metric = map(json.loads, stdout.splitlines())
+        self.assertIn("journey:checkout", finding["summary"])
+        self.assertIn("local merge-check record for replay-fixture", finding["summary"])
+        self.assertEqual(metric, {"value": 0})
+        self.assertEqual(self.checked(), [self.item["key"]])
+        self.assertEqual(json.loads((self.run_dir / "driver-failures.json").read_text()), {
+            "1": {"what": "journey:checkout", "saw": "exit 1: merged checkout output\n"},
+        })
+        self.spawn.assert_called_once()
+        self.agent.assert_not_called()
+
+    def test_failure_block_and_pending_driver_preserve_the_regression_and_retry_the_batch(self):
+        self.prepare_replay(1, later_drivers={"inventory": 127, "shipping": 0})
+        code, stdout, stderr = self.consume(self.items)
+
+        self.assertEqual(code, mergecheck.INCOMPLETE_EXIT)
+        self.assertEqual(self.checked(), [])
+        result = json.loads((self.run_dir / "result.json").read_text())
+        self.assertEqual(result["verdict"], "fail")
+        self.assertEqual([(c["what"], c.get("cause")) for c in result["checks"]], [
+            ("journey:checkout", "change"), ("journey:inventory", "environment"),
+            ("journey:shipping", None),
+        ])
+        finding = json.loads(stdout)
+        self.assertIn("journey:checkout", finding["summary"])
+        self.assertIn("journey:inventory", stderr)
+        self.assertNotIn("merged checkout output", stdout + stderr)
+        self.assertEqual(json.loads((self.run_dir / "driver-failures.json").read_text()), {
+            "1": {"what": "journey:checkout", "saw": "exit 1: merged checkout output\n"},
+        })
+        self.assertEqual(self.spawn.call_count, 3)
+        self.assertIn("journey:checkout: exit 1: merged checkout output", self.settle.call_args.kwargs["summary"])
+        self.agent.assert_not_called()
+
+        loop = SimpleNamespace(name="merge-check", command=["arete", "merge-check"], repo="", dir=self.root,
+                               timeout_minutes=30, emits=[{}])
+        run = SimpleNamespace(loop=loop, id="loop", trial=False, cfg=self.cfg, events=self.items,
+                              device=SimpleNamespace(remote=False), log=mock.Mock(), log_file=self.root / "loop.log")
+        with (mock.patch.object(loop_run, "run_command", return_value=(code, stdout + stderr)),
+              mock.patch.object(loop_run, "new_findings", side_effect=lambda _, findings: findings) as results,
+              mock.patch.object(loop_run.delivery, "deliver") as deliver,
+              mock.patch.object(loop_run, "hand_on")):
+            status, summary = loop_run.command_loop(run)
+        self.assertEqual(status, "failed")
+        self.assertIn("journey:inventory", summary)
+        self.assertEqual(results.call_args.args[1], [finding])
+        self.assertEqual(deliver.call_args.args[2], [finding])
+        self.assertEqual(deliver.call_args.args[3]["summary"], "")
+
+        self.layer.verify.drivers["inventory"] = "cat product.txt; exit 0 # inventory"
+        code, stdout, _ = self.consume([])
+        self.assertEqual(code, 0)
+        self.assertEqual(self.checked(), [self.item["key"]])
+        self.assertEqual(json.loads(stdout.splitlines()[0])["fingerprint"], finding["fingerprint"])
+        self.assertEqual(json.loads(stdout.splitlines()[1]), {"value": 0})
+        self.assertEqual(self.spawn.call_count, 6)
+        self.assertTrue(self.spawn.call_args.args[0][-1].endswith("# shipping"))
+
+    def test_environment_block_without_a_driver_failure_holds_replay(self):
+        marker = "synthetic private application output"
+        _, replay = self.replay_driver(127, output=marker)
+
+        self.assertIn("journey:checkout", replay.blocked_by)
+        self.assertNotIn(marker, replay.blocked_by)
+        self.assertEqual(replay.failed, [])
+        result = json.loads((self.run_dir / "result.json").read_text())
+        self.assertEqual(result["verdict"], "blocked")
+        self.assertIn(marker, result["blocked_by"])
+        self.assertFalse((self.run_dir / "driver-failures.json").exists())
+        self.agent.assert_not_called()
+
+    def test_replay_driver_without_trusted_scratch_holds_without_spawning(self):
+        self.prepare_replay(0)
+        with mock.patch.object(verify.scratch, "make", side_effect=sandbox.ConfinementUnavailable("unavailable")):
+            code, stdout, stderr = self.consume(self.items)
+
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("journey:checkout", stderr)
+        self.assertEqual(self.checked(), [])
+        self.spawn.assert_not_called()
+        self.agent.assert_not_called()
+
+    def test_later_driver_failure_wins_over_the_first_driver_exit_127(self):
+        replay, result = self.replay_driver(127, later_drivers={"inventory": 1})
+
+        self.assertEqual(self.spawn.call_count, 2)
+        self.assertEqual(result.failed, [2])
+        self.assertIn("journey:inventory: exit 1:", result.driver_reason)
+        self.assertIn("journey:inventory", mergecheck.finding(replay, result.failed)["summary"])
+        self.assertEqual(json.loads((self.run_dir / "result.json").read_text())["verdict"], "fail")
+
+    def test_later_driver_failure_is_reported_after_a_communicate_timeout(self):
+        self.prepare_replay(0, later_drivers={"inventory": 1})
+        elapsed = 0.0
+
+        def time_out(*, timeout):
+            nonlocal elapsed
+            elapsed += timeout
+            raise subprocess.TimeoutExpired("checkout", timeout)
+
+        checkout = mock.Mock(communicate=mock.Mock(side_effect=time_out))
+        inventory = mock.Mock(returncode=1, communicate=mock.Mock(return_value=("inventory missing\n", "")))
+        self.spawn.side_effect = [checkout, inventory]
+        with mock.patch.object(verify, "time", SimpleNamespace(monotonic=lambda: elapsed)):
+            code, stdout, stderr = self.consume(self.items)
+
+        self.assertEqual(code, mergecheck.INCOMPLETE_EXIT)
+        finding = json.loads(stdout)
+        self.assertIn("journey:inventory", finding["summary"])
+        self.assertNotIn("journey:checkout", finding["summary"])
+        self.assertIn("journey:checkout", stderr)
+        self.assertNotIn("inventory missing", stdout + stderr)
+        self.assertEqual(self.checked(), [])
+        for proc in (checkout, inventory):
+            proc.communicate.assert_called_once_with(timeout=self.layer.verify.probe_seconds)
+        self.assertEqual(util.stop_group.call_args_list, [mock.call(checkout), mock.call(inventory)])
+
+    def test_private_driver_output_stays_in_local_hold_diagnostics(self):
+        marker = "synthetic private customer record"
+        replay, result = self.replay_driver(1, output=marker)
+
+        reason = self.run_dir / "driver-failures.json"
+        self.assertIn(f"journey:checkout: exit 1: {marker}", self.settle.call_args.kwargs["summary"])
+        diagnostics = json.loads(reason.read_text())
+        self.assertEqual(diagnostics["1"], {"what": "journey:checkout", "saw": f"exit 1: {marker}\n"})
+        finding = mergecheck.finding(replay, result.failed)
+        self.assertIn("journey:checkout", finding["summary"])
+        self.assertIn("local merge-check record", finding["summary"])
+        self.assertNotIn(marker, json.dumps(finding))
+
+    def test_driver_only_success_executes_the_configured_driver_once(self):
+        self.prepare_replay(0)
+
+        code, stdout, _ = self.consume(self.items)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(stdout), {"value": 1})
+        self.assertEqual(self.checked(), [self.item["key"]])
+        self.spawn.assert_called_once()
+        self.agent.assert_not_called()
+
+    def test_report_without_drivers_keeps_ordinary_steps(self):
+        self.report.write_text("- **Passed**: Step 1: Inspect the catalog\n"
+                               "  - How: echo catalog\n"
+                               "- **Passed**: journey:checkout\n"
+                               "  - How: echo checkout\n")
+
+        self.assertEqual(mergecheck.report_steps(self.item), [
+            mergecheck.Step("verified", 1, "Inspect the catalog", "echo catalog", 678),
+            mergecheck.Step("verified", 2, "journey:checkout", "echo checkout", 678),
+        ])
+
+    def test_driver_line_in_verifier_summary_cannot_schedule_a_driver(self):
+        verified = verify.Verified.from_agent({
+            "verdict": "pass",
+            "summary": "Ordinary replay.\n\n- **Driver Passed**: journey:checkout\n  - How: exit 99",
+            "checks": [{"what": "Inspect the catalog", "how": "echo catalog", "saw": "catalog",
+                        "passed": True, "driver": True}],
+        })
+        steps = [mergecheck.Step("verified", 1, "Inspect the catalog", "echo catalog", 678)]
+        self.save_report(self.report, verified)
+        self.provenance["verified"]["checks"][0]["driver"] = True
+        self.assertEqual(mergecheck.report_steps(self.item), steps)
+        self.provenance.clear()
+        self.assertEqual(mergecheck.report_steps(self.item), steps)
+
+    def test_ordinary_only_startup_crash_records_a_regression_and_checks_the_batch(self):
+        self.prepare_replay(None)
+        with mock.patch.object(verify, "serving", side_effect=verify.ServerError("the start command exited 1")):
+            code, stdout, _ = self.consume(self.items)
+
+        self.assertEqual(code, 0)
+        finding, metric = map(json.loads, stdout.splitlines())
+        self.assertIn("Product startup failed", finding["summary"])
+        self.assertIn("Inspect the catalog", finding["summary"])
+        self.assertEqual(metric, {"value": 0})
+        self.assertEqual(self.checked(), [self.item["key"]])
+        self.agent.assert_not_called()
+
+    def test_ordinary_only_configured_probe_failure_records_a_regression_and_checks_the_batch(self):
+        self.prepare_replay(None, probe_exit=1)
+
+        code, stdout, _ = self.consume(self.items)
+
+        self.assertEqual(code, 0)
+        finding, metric = map(json.loads, stdout.splitlines())
+        self.assertIn("Product startup failed", finding["summary"])
+        self.assertIn("Inspect the catalog", finding["summary"])
+        self.assertEqual(metric, {"value": 0})
+        self.assertEqual(self.checked(), [self.item["key"]])
+        self.spawn.assert_called_once()
+        self.agent.assert_not_called()
+
+    def test_configured_probe_failure_before_drivers_preserves_the_ordinary_result(self):
+        self.prepare_replay(127, probe_exit=1, grade={})
+
+        code, stdout, _ = self.consume(self.items)
+
+        self.assertEqual(code, 0)
+        finding, metric = map(json.loads, stdout.splitlines())
+        self.assertIn("Product startup failed", finding["summary"])
+        self.assertIn("Inspect the catalog", finding["summary"])
+        self.assertNotIn("journey:checkout", finding["summary"])
+        self.assertEqual(metric, {"value": 0})
+        self.assertEqual(self.checked(), [item["key"] for item in self.items])
+        self.assertEqual([call.args[0][-1] for call in self.spawn.call_args_list], ["exit 1", "exit 1"])
+        self.agent.assert_not_called()
+
+    def test_worktree_removal_failure_stops_publication_and_leaves_the_batch_unchecked(self):
+        self.prepare_replay(None, cleanup_error=True, grade={
+            "verdict": "fail", "summary": "Catalog regressed.",
+            "checks": [{"what": "Step 1: Inspect the catalog", "how": "echo catalog", "saw": "empty", "passed": False}],
+        })
+
+        code, stdout, stderr = self.consume(self.items)
+
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("worktree removal failed", stderr)
+        self.assertEqual(self.checked(), [])
+        self.agent.assert_called_once()
+
+    def test_malformed_ordinary_manifest_holds_without_a_finding_and_can_retry(self):
+        check = {"what": "Step 1: Inspect the catalog", "how": "echo catalog", "saw": "empty", "passed": False}
+        grade = {"verdict": "fail", "summary": "Catalog regressed.", "checks": []}
+        self.prepare_replay(None, grade=grade)
+
+        grade["checks"] = [check, {**check, "what": "Malformed"}]
+        code, stdout, stderr = self.consume(self.items)
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("unknown or invalid step", stderr)
+        self.assertEqual(self.checked(), [])
+
+        grade.update(verdict="pass", checks=[{**check, "passed": True}])
+        code, stdout, _ = self.consume([])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(stdout), {"value": 1})
+        self.assertEqual(self.checked(), [self.item["key"]])
+
+    def test_driver_failure_and_independent_ordinary_failure_are_both_reported(self):
+        marker = "synthetic private order details"
+        self.prepare_replay(1, output=marker, grade={
+            "verdict": "fail", "summary": "Catalog regressed.",
+            "checks": [{"what": "Step 1: Inspect the catalog", "how": "echo catalog", "saw": "empty",
+                        "passed": False, "cause": "change"}],
+        })
+
+        code, stdout, _ = self.consume(self.items)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(self.checked(), [item["key"] for item in self.items])
+        self.agent.assert_called_once()
+        prompt = self.agent.call_args.args[2]
+        self.assertIn("1. [ordinary step 1] Inspect the catalog: echo catalog", prompt)
+        self.assertNotIn(marker, prompt + stdout)
+        finding, metric = [json.loads(line) for line in stdout.splitlines()]
+        self.assertIn("journey:checkout", finding["summary"])
+        self.assertIn("Inspect the catalog", finding["summary"])
+        self.assertEqual(metric, {"value": 0})
+
+    def test_driver_block_still_reports_the_ordinary_failure_and_leaves_the_batch_unchecked(self):
+        self.prepare_replay(127, grade={
+            "verdict": "fail", "summary": "Catalog regressed.",
+            "checks": [{"what": "Step 1: Inspect the catalog", "how": "echo catalog", "saw": "empty", "passed": False}],
+        })
+        code, stdout, stderr = self.consume(self.items)
+
+        self.assertEqual(code, mergecheck.INCOMPLETE_EXIT)
+        finding, metric = map(json.loads, stdout.splitlines())
+        self.assertIn("Inspect the catalog", finding["summary"])
+        self.assertNotIn("journey:checkout", finding["summary"])
+        self.assertIn("journey:checkout", stderr)
+        self.assertEqual(metric, {"value": 0})
+        self.assertEqual(self.checked(), [])
+        self.spawn.assert_called_once()
+        self.agent.assert_called_once()
+
+    def test_driver_and_ordinary_grader_each_see_their_own_seeded_state(self):
+        self.prepare_replay(0, grade={
+            "verdict": "pass", "summary": "Catalog checked.",
+            "checks": [{"what": "Step 1: Inspect the catalog", "how": "update catalog", "saw": "updated",
+                        "passed": True}],
+        })
+        self.layer.setup.append("seed catalog")
+        self.layer.verify.start = "serve catalog {scratch}"
+        self.layer.verify.url = "http://localhost:{port}"
+        phases, services = [], []
+        grade, spawn = self.agent.side_effect, self.spawn.side_effect
+
+        def setup(command, *_args, cwd, **_kwargs):
+            self.assertEqual(command, "seed catalog")
+            (cwd / "product.txt").write_text("seeded product")
+            return SimpleNamespace(returncode=0)
+
+        @contextmanager
+        def serving(configured, cwd, *_args, attempt, **_kwargs):
+            scratch_root = Path(attempt.root)
+            self.assertEqual(configured.start, f"serve catalog {scratch_root}")
+            (scratch_root / "catalog.txt").write_text("seeded scratch")
+            services.append((cwd, scratch_root, configured.url))
+            phases.append("start")
+            yield configured.url
+            phases.append("stop")
+
+        def mutate_catalog(cwd, scratch_root, phase):
+            phases.append(phase)
+            state = [(cwd / "product.txt", "seeded product"), (scratch_root / "catalog.txt", "seeded scratch")]
+            intact = all(path.read_text() == seed for path, seed in state)
+            for path, _ in state:
+                path.write_text(f"mutated by {phase}")
+            return intact
+
+        def mutate_as_grader(run, step, prompt, cwd, *, scratch, **kwargs):
+            graded = grade(run, step, prompt, cwd, scratch=scratch, **kwargs)
+            graded.structured["checks"][0]["passed"] = mutate_catalog(cwd, Path(scratch.root), "grade")
+            return graded
+
+        def mutate_as_driver(command, **kwargs):
+            proc = spawn(command, **kwargs)
+            scratch_root = Path(kwargs["env"][verify.scratch.ENV_NAME])
+            proc.returncode = 0 if mutate_catalog(kwargs["cwd"], scratch_root, "driver") else 1
+            return proc
+
+        def scratch_attempt(_run, step, cwd, _folder):
+            root = cwd / f"scratch-{step}"
+            root.mkdir()
+            return SimpleNamespace(root=str(root))
+
+        self.agent.side_effect = mutate_as_grader
+        self.spawn.side_effect = mutate_as_driver
+        with (mock.patch.object(pipeline.environment, "sh", side_effect=setup),
+              mock.patch.object(verify.scratch, "make", side_effect=scratch_attempt),
+              mock.patch.object(verify.browser, "free_port", side_effect=[12000, 12001]),
+              mock.patch.object(verify, "serving", side_effect=serving)):
+            code, stdout, _ = self.consume(self.items)
+
+        self.assertEqual(code, 0)
+        self.assertEqual([json.loads(line) for line in stdout.splitlines()], [{"value": 1}])
+        self.assertEqual(self.checked(), [item["key"] for item in self.items])
+        self.assertEqual(phases, ["start", "driver", "stop", "start", "grade", "stop"])
+        for driver_value, grader_value in zip(*services, strict=True):
+            self.assertNotEqual(driver_value, grader_value)
+
+    def test_driver_failure_and_hold_with_ordinary_pass_emit_a_failing_metric(self):
+        marker = "private driver diagnostic"
+        self.prepare_replay(1, later_drivers={"inventory": 127}, output=marker, grade={
+            "verdict": "pass", "summary": "Catalog checked.",
+            "checks": [{"what": "Step 1: Inspect the catalog", "how": "echo catalog", "saw": "catalog",
+                        "passed": True}],
+        })
+
+        code, stdout, stderr = self.consume(self.items)
+
+        self.assertEqual(code, mergecheck.INCOMPLETE_EXIT)
+        finding, metric = map(json.loads, stdout.splitlines())
+        self.assertIn("journey:checkout", finding["summary"])
+        self.assertNotIn("Inspect the catalog", finding["summary"])
+        self.assertIn("journey:inventory", stderr)
+        self.assertNotIn(marker, stdout + stderr)
+        self.assertEqual(metric, {"value": 0})
+        self.assertEqual(self.checked(), [])
+
+    def test_driver_failure_is_reported_while_ordinary_grader_holds_for_environment(self):
+        marker = "synthetic private checkout failure"
+        hold = "The catalog service is unavailable."
+        self.prepare_replay(1, output=marker, grade={
+            "verdict": "blocked", "summary": "Catalog could not be checked.", "blocked_by": hold, "checks": [],
+        })
+
+        code, stdout, stderr = self.consume(self.items)
+
+        self.assertEqual(code, mergecheck.INCOMPLETE_EXIT)
+        finding = json.loads(stdout)
+        self.assertIn("journey:checkout", finding["summary"])
+        self.assertIn("local merge-check record for replay-fixture", finding["summary"])
+        self.assertIn(hold, stderr)
+        self.assertNotIn(marker, stdout + stderr)
+        self.assertEqual(self.checked(), [])
+        self.assertEqual(json.loads((self.run_dir / "driver-failures.json").read_text()), {
+            "2": {"what": "journey:checkout", "saw": f"exit 1: {marker}\n"},
+        })
+        local_summary = self.settle.call_args.kwargs["summary"]
+        self.assertIn(hold, local_summary)
+        self.assertIn(marker, local_summary)
+
+    def test_ordinary_and_driver_holds_are_both_recorded_locally_without_a_metric(self):
+        marker = "private driver startup details"
+        hold = "The catalog service is unavailable."
+        self.prepare_replay(127, output=marker, grade={
+            "verdict": "blocked", "summary": "Catalog could not be checked.", "blocked_by": hold, "checks": [],
+        })
+
+        code, stdout, stderr = self.consume(self.items)
+
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn(hold, stderr)
+        self.assertNotIn(marker, stderr)
+        self.assertEqual(self.checked(), [])
+        local_summary = self.settle.call_args.kwargs["summary"]
+        self.assertIn(hold, local_summary)
+        self.assertIn(f"journey:checkout: exit 127: {marker}", local_summary)
+
+    def test_malformed_manifest_row_prevents_publication_even_when_both_kinds_of_check_fail(self):
+        check = {"what": "Step 1: Inspect the catalog", "how": "echo catalog", "saw": "empty", "passed": False}
+        self.prepare_replay(1, grade={"verdict": "fail", "summary": "Catalog regressed.",
+                                      "checks": [check, {**check, "what": "Malformed"}]})
+
+        code, stdout, stderr = self.consume(self.items)
+
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("unknown or invalid step", stderr)
+        self.assertEqual(self.checked(), [])
+        self.spawn.assert_called_once()
+
+    def test_driver_failure_with_an_unaccounted_ordinary_step_holds_without_a_finding(self):
+        check = {"what": "Inspect the catalog", "how": "echo catalog", "saw": "catalog", "passed": True}
+        self.prepare_replay(1, grade={"verdict": "fail", "summary": "Catalog failed.",
+                                      "checks": [{**check, "what": "Step 1: Inspect the catalog", "passed": False}]})
+        self.save_report(self.runs / "ordinary" / "verify.md", verify.Verified("pass", checks=[
+            check, {**check, "what": "Inspect inventory", "how": "echo inventory", "saw": "inventory"},
+        ]))
+
+        code, stdout, stderr = self.consume(self.items)
+
+        self.assertEqual(code, 1)
+        self.assertEqual(self.checked(), [])
+        self.assertIn("did not account for every manifest step", stderr)
+        self.assertEqual(stdout, "")
+        self.assertIn("2. [ordinary step 2] Inspect inventory", self.agent.call_args.args[2])
 
 
 class ReviewTests(unittest.TestCase):
