@@ -209,8 +209,8 @@ class Controller:
             if self.job.left_for_a_person or self.run.feedback or self.run.repairs or self.flow.continues:
                 raise factory.Refused("ZTE does not inherit owner work or previous attempts")
         self.data.setdefault("goal_base", self.job.goal)
-        known = {(f.get("pr_url"), f.get("kind"), f.get("gh_id")) for f in self.data.get("feedback", [])}
-        fresh = [f for f in self.run.feedback if (f.get("pr_url"), f.get("kind"), f.get("gh_id")) not in known]
+        known = {pipeline.feedback_key(f) for f in self.data.get("feedback", [])}
+        fresh = [f for f in self.run.feedback if pipeline.feedback_key(f) not in known]
         if fresh:
             self.data.setdefault("feedback", []).extend(fresh)
             feedback = pipeline.feedback_markdown(fresh)
@@ -917,6 +917,12 @@ class Controller:
                 if not self.job.b.restage().empty:
                     raise ValueError("noop cannot discard an implementation diff")
                 self.ending = flows.finish(self.flow, "nothing", summary=self.job.build_summary or "No change needed.")
+            elif zte.reserved(str(self.run.tid)):
+                self.ending = flows.finish(self.flow, "failed", why="the orchestrator stopped without delivery",
+                                           recovery=self.failure_recovery())
+            elif self.run.budget and (reason := self.run.budget.repair_limit_reason()):
+                self.ending = pipeline.park_run(self.run, reason)
+                return {"reason": args["reason"], "parked": True}
             else:
                 self.ending = flows.finish(self.flow, "quiet", status="failed",
                                            summary="the orchestrator stopped without delivery")
@@ -959,7 +965,8 @@ class Controller:
                 if gate and self.data.get("evidence", {}).get(gate, {}).get("producer") == action["id"]:
                     result["evidence"] = self.data["evidence"][gate]
                 if (action["op"] == "run.finish" and result.get("reason") == "failed"
-                        and not (self.flow.only or self.run.action_only or self.run.dry_run)):
+                        and not (result.get("parked") or self.flow.only or self.run.action_only or self.run.dry_run
+                                 or zte.reserved(str(self.run.tid)))):
                     rationale = ledger.turn_rationale(self.lease, action["turn"])
                     recovery = self.failure_recovery()
                     with db.tx():

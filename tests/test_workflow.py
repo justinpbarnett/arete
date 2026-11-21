@@ -30,6 +30,7 @@ from arete import (
 from arete.agent import NO_SESSION, Result
 from arete.review import Review
 from arete.store import db, orchestration as ledger
+from tests.parallel import stack_env
 
 
 class PublicationFixture(unittest.TestCase):
@@ -365,6 +366,93 @@ class PendingBaseMergePublicationTests(PublicationFixture):
         self.assertEqual(self.git("show", "HEAD:file.txt"), "implementation")
 
 
+class BaseMergeDiffLimitTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.enterContext(mock.patch.object(pipeline.record, "mark"))
+
+    def git(self, c, *args):
+        return util.git(["-c", "user.name=Fixture", "-c", "user.email=fixture@example.com",
+                         "-c", "commit.gpgSign=false", "-c", "core.hooksPath=/dev/null", *args], c.wt).strip()
+
+    def write_lines(self, c, name, count):
+        (c.wt / name).write_text(f"{name}\n" * count)
+
+    def commit(self, c, subject):
+        self.git(c, "add", ".")
+        self.git(c, "commit", "-qm", subject)
+
+    def checkout(self, name, lines):
+        root = self.root / name
+        root.mkdir()
+        c = workspace.Checkout(name, f"fixture/{name}", root, root, "main", resumes=True)
+        self.git(c, "init", "-q", "--template=", "-b", c.base)
+        self.git(c, "commit", "-qm", "base", "--allow-empty")
+        self.git(c, "switch", "-qc", "work")
+        self.write_lines(c, "work.txt", lines)
+        self.commit(c, "published work")
+        c.onto = self.git(c, "rev-parse", "HEAD")
+        c.note_pushed_head(c.onto)
+        return c
+
+    def advance_origin(self, c, lines):
+        self.git(c, "switch", "-q", "--detach", c.base)
+        self.write_lines(c, "incoming.txt", lines)
+        self.commit(c, "advance origin base")
+        self.git(c, "update-ref", f"refs/remotes/{c.origin_base}", "HEAD")
+        self.git(c, "switch", "-q", "work")
+
+    def build(self, limit, *checkouts, committed_lines=0):
+        return pipeline.Build(cfg=config.Config(), run=mock.Mock(id="diff-limit"), ticket=mock.Mock(),
+                              ws=self.root, checkouts=list(checkouts),
+                              layer=config.RepoLayer(dir=self.root, max_diff_lines=limit), timeout=0,
+                              workspace="diff-limit", tools=[], deny=[], committed_lines=committed_lines)
+
+    def test_committed_base_merge_passes_with_100_lines(self):
+        c = self.checkout("first", 100)
+        self.advance_origin(c, 500)
+        self.git(c, "merge", "-q", "--no-edit", c.origin_base)
+        self.build(300, c).require_valid_diff("the build")
+
+    def test_committed_base_merge_refusal_names_origin_base(self):
+        c = self.checkout("first", 400)
+        self.advance_origin(c, 500)
+        self.git(c, "merge", "-q", "--no-edit", c.origin_base)
+        base = self.git(c, "rev-parse", "--short=7", c.origin_base)
+        with self.assertRaisesRegex(workspace.RunFailed, f"the diff is 400 lines against main at {base}"):
+            self.build(300, c).require_valid_diff("the build")
+
+    def test_no_base_merge_counts_staged_pushed_and_resolved_lines(self):
+        c = self.checkout("first", 80)
+        self.advance_origin(c, 500)
+        self.write_lines(c, "work.txt", 110)
+        c.resolved_lines = 20
+        b = self.build(130, c, committed_lines=80)
+        b.require_valid_diff("the build")
+        b.layer.max_diff_lines = 129
+        with self.assertRaisesRegex(workspace.RunFailed, "the diff is 130 lines") as refused:
+            b.validate_diff(b.staged, "the build")
+        self.assertIn("pushed earlier in this run: 100", refused.exception.detail)
+
+    def test_one_base_merge_counts_both_repositories_against_their_bases(self):
+        first = self.checkout("first", 155)
+        self.advance_origin(first, 500)
+        self.git(first, "merge", "-q", "--no-edit", first.origin_base)
+        first.onto = self.git(first, "rev-parse", "HEAD")
+        second = self.checkout("second", 100)
+        self.advance_origin(second, 500)
+        self.write_lines(second, "work.txt", 120)
+        b = self.build(400, first, second, committed_lines=255)
+        b.require_valid_diff("the build")
+        b.layer.max_diff_lines = 274
+        with self.assertRaisesRegex(workspace.RunFailed, "the diff is 275 lines") as refused:
+            b.validate_diff(b.staged, "the build")
+        self.assertIn("`first/work.txt`: 155", refused.exception.detail)
+        self.assertIn("`second/work.txt`: 120", refused.exception.detail)
+        self.assertNotIn("pushed earlier", refused.exception.detail)
+
+
 class MovedBasePublicationTests(unittest.TestCase):
     def controller(self):
         root = Path(".")
@@ -676,21 +764,18 @@ class MovedBasePublicationTests(unittest.TestCase):
               mock.patch.object(pipeline, "merge_hold", return_value=gh.MovedBaseHold("base moved")),
               mock.patch.object(controller, "publication_ci", return_value=None),
               mock.patch.object(pipeline, "git", return_value="head"),
-              mock.patch.object(workspace, "git", return_value="head") as workspace_git,
+              mock.patch.object(workspace, "git", return_value="head"),
               mock.patch.object(util, "git_records", side_effect=git_records),
               mock.patch.object(util, "repo_lock", return_value=nullcontext()),
               mock.patch.object(pipeline, "merge_moved_bases", side_effect=resolve),
               mock.patch.object(pipeline, "abort_merge") as abort,
               mock.patch.object(pipeline, "commit_and_push") as push,
               mock.patch.object(workspace, "scratch_left", return_value=[]), mock.patch.object(paths, "STATE_DIR", root),
+              mock.patch.object(workspace, "remove_workspace", return_value=True) as remove,
               mock.patch.object(pipeline, "record_prs", return_value=checkout.pr),
               mock.patch.object(flows, "ended", side_effect=lambda flow, outcome: flows.respond(flow, **outcome.data))):
             self.assertEqual(controller.publish()["ending"], "pr")
-            self.assertEqual(existing.read_bytes(), b"keep me")
-            self.assertEqual(existing_untracked.read_bytes(), b"keep me too")
-            self.assertCountEqual(workspace.blocked_by(checkout.wt, [checkout]), ["ignored/", "kept"])
-            with self.assertRaisesRegex(workspace.RunFailed, "has no record of leaving there"):
-                workspace.clear_workspace(checkout.wt, [checkout], checkout.src, [])
+            self.assertEqual(workspace.blocked_by(checkout.wt, [checkout]), [])
         hold = controller.run.facts["merge_held"]
         self.assertIn("`main` at `moved-base`", hold)
         self.assertIn("needs owner input", hold)
@@ -700,7 +785,7 @@ class MovedBasePublicationTests(unittest.TestCase):
         self.assertEqual(existing.read_bytes(), b"keep me")
         self.assertEqual(existing_untracked.read_bytes(), b"keep me too")
         self.assertFalse(controller.run.owner_questions_blocked)
-        self.assertFalse(any(call.args[0][0] == "worktree" for call in workspace_git.call_args_list))
+        remove.assert_called_once_with(checkout.wt, [checkout])
         abort.assert_called_once_with(checkout.wt)
         push.assert_not_called()
 
@@ -1346,7 +1431,7 @@ class ServeStatusTests(unittest.TestCase):
         }))
         installed = Path(sysconfig.get_path("scripts")) / "arete"
         result = subprocess.run([str(installed), "status", *args], cwd=self.root,
-                                env={**env, "PYTHONPATH": str(self.root), "PYTHONDONTWRITEBYTECODE": "1"},
+                                env=stack_env({**env, "PYTHONPATH": str(self.root), "PYTHONDONTWRITEBYTECODE": "1"}),
                                 capture_output=True, text=True, timeout=8)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("broken deployment fixture", result.stderr)

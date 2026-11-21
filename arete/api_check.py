@@ -17,6 +17,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import quote, urlencode
 
+from . import _test_stacks
+
 ADDRESS = "127.0.0.1"
 LOGIN = "api-check@example.invalid"
 SOURCE = Path(__file__).resolve().parent.parent
@@ -32,7 +34,7 @@ def require(condition, message):
 def isolated_env(root):
     names = {"ARETE_CONFIG_DIR": "config", "ARETE_STATE_DIR": "state", "ARETE_LOG_DIR": "logs",
              "ARETE_WORKTREES_DIR": "worktrees", "TMPDIR": "tmp", "HOME": "home"}
-    env = {k: os.environ[k] for k in ("PATH", "LANG", "LC_ALL") if k in os.environ}
+    env = {k: os.environ[k] for k in ("PATH", "LANG", "LC_ALL", _test_stacks.PREFIX_ENV) if k in os.environ}
     for variable, name in names.items():
         folder = root / name
         folder.mkdir(exist_ok=True)
@@ -44,7 +46,8 @@ def isolated_env(root):
 
 
 def child_command(source, entry, *argv):
-    return [sys.executable, "-IB", "-c", f"import sys; sys.path.insert(0, {str(source)!r}); {entry}", *argv]
+    entrypoint = f"{_test_stacks.bootstrap()}import sys; sys.path.insert(0, {str(source)!r}); {entry}"
+    return [sys.executable, "-IB", "-c", entrypoint, *argv]
 
 
 CHECK_TIMEOUT = 60

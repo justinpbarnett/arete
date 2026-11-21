@@ -400,7 +400,7 @@ def handle(cfg: config.Config, repo: config.Repo, row: dict, dry_run: bool, *, c
         print(f"{util.iso()} {row['id']}: verify retry still waiting for its workspace: {error.why}")
         return False
     layer = config.load_layer(repo.layer_dir)
-    if runlimits.admission(repo, tid, source, runlimits.Policy.of(layer), False)[0]:
+    if runlimits.admission(repo, tid, source, runlimits.Policy.of(layer), False).reason:
         return False
     if not dry_run:
         try:

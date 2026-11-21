@@ -29,7 +29,8 @@ OPEN_PR_RUN = "(runs.status = 'pr' OR (runs.status IN ('failed', 'stopped') AND 
 
 WHOLE_RUN = "COALESCE(only_step, '') = ''"
 LIVE_RUN = "dry_run = 0 AND status != 'dry-run'"
-FAILED_FINISH_PENDING = "(ticket_pending = 1 OR comment != '' OR prs != '{}')"
+FAILED_FINISH_TICKET_PENDING = "(label_pending = 'failed' OR ticket_pending = 1 OR comment != '')"
+FAILED_FINISH_PENDING = f"({FAILED_FINISH_TICKET_PENDING} OR prs != '{{}}')"
 
 FIRINGS = ("(runs.kind = 'loop' AND runs.loop_kind = 'command' AND runs.status IN ('done', 'skipped') "
            "AND COALESCE(runs.cost_usd, 0) = 0)")
@@ -358,10 +359,11 @@ def unfinished_failed_finishes() -> list[dict]:
             f"WHERE {FAILED_FINISH_PENDING} AND r.status != 'running' ORDER BY r.started, r.rowid")]
 
 
-def failed_finish_pending(repo: str, issue: int | str) -> bool:
+def failed_finish_pending(repo: str, issue: int | str, *, include_drafts: bool = True) -> bool:
+    pending = FAILED_FINISH_PENDING if include_drafts else FAILED_FINISH_TICKET_PENDING
     with reader() as c:
         return c.execute("SELECT 1 FROM failed_finishes f JOIN runs r ON r.id = f.run_id "
-                         f"WHERE r.repo = ? AND r.issue = ? AND {FAILED_FINISH_PENDING} LIMIT 1",
+                         f"WHERE r.repo = ? AND r.issue = ? AND {pending} LIMIT 1",
                          (repo, issue)).fetchone() is not None
 
 

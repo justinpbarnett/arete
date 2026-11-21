@@ -147,7 +147,7 @@ def reconsider(cfg: config.Config, source: tracker.GitHubTracker, layer: config.
         ticket = source.get(issue)
         if not ticket.open or ticket.blocker or not source.queued_failure(ticket.labels):
             return None
-        if runlimits.admission(repo, issue, source, runlimits.Policy.of(layer), False)[0]:
+        if runlimits.admission(repo, issue, source, runlimits.Policy.of(layer), False).reason:
             return None
         now = util.now()
         entry, count = run_store.environment_requeue(run, util.iso(now - WINDOW))
