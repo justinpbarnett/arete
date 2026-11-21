@@ -22,7 +22,7 @@ from urllib.parse import quote, urlencode, urlsplit
 from . import config, paths, run_lines, util
 
 ENV = "ARETE_SERVER"
-MINOR = 2
+MINOR = 3
 CONNECT_SECONDS = 5
 CALL_SECONDS = 120
 RETRY_SECONDS = 2
@@ -70,11 +70,12 @@ class Server:
 
 
 class Invocation:
-    def __init__(self):
+    def __init__(self, *, upload_on_write=False):
         self.retry_prefix = os.environ.get("ARETE_IDEMPOTENCY_KEY")
         self.prefix = self.retry_prefix if self.retry_prefix is not None else secrets.token_hex(16)
         self.writes = 0
         self.server = None
+        self.upload_on_write = upload_on_write
 
     def key(self, *, exact=None, scope=""):
         self.writes += 1
@@ -93,8 +94,8 @@ _invocation = ContextVar("client_invocation", default=None)
 
 
 @contextmanager
-def invocation():
-    token = _invocation.set(Invocation())
+def invocation(*, upload_on_write=False):
+    token = _invocation.set(Invocation(upload_on_write=upload_on_write))
     try:
         yield
     finally:
@@ -142,7 +143,7 @@ def named_server(wanted: str, setting=ENV) -> Server:
     return Server(parts.scheme, host, port or config.discovery_port(), host)
 
 
-def discover() -> Server:
+def configured_server() -> Server | None:
     if wanted := os.environ.get(ENV, "").strip():
         return named_server(wanted)
     try:
@@ -157,8 +158,13 @@ def discover() -> Server:
         raise Failed({"error": f"cannot read server config at {paths.CONFIG_FILE}: {e}"}) from e
     if wanted:
         return named_server(wanted, "[server] url")
+
+
+def discover() -> Server:
+    if configured := configured_server():
+        return configured
     found, mine = util.read_json(paths.SERVER_FILE, None), paths.state_and_config()
-    default = f"http://127.0.0.1:{config.discovery_port(data)}"
+    default = f"http://127.0.0.1:{config.discovery_port()}"
     addresses = found.get("addresses") if isinstance(found, dict) else None
     if not isinstance(addresses, list) or not addresses or not all(isinstance(a, str) and a for a in addresses):
         raise Down(default, f"no server address in {paths.SERVER_FILE}")
@@ -213,11 +219,11 @@ def check_replay(where, deadline):
             raise changed_instance(where, where.instance, instance)
 
 
-def server(deadline=None) -> Server:
+def server(deadline=None, *, where=None) -> Server:
     current = _invocation.get()
     if current is not None and current.server is not None:
         return current.server
-    where = discover()
+    where = where or discover()
     resp = request("GET", "/api/meta", read_seconds=CONNECT_SECONDS, where=where, buffered=True, deadline=deadline)
     instance = instance_of(resp)
     check_instance(where, instance)
@@ -225,6 +231,49 @@ def server(deadline=None) -> Server:
     if current is not None:
         current.server = where
     return where
+
+
+def upload_hook_events(where=None, *, wait=False):
+    from . import tool_events
+
+    deadline = None
+
+    def send(body, key):
+        nonlocal deadline
+        if deadline is None:
+            deadline = time.monotonic() + CONNECT_SECONDS
+        send_hook_batch(body, key, deadline)
+
+    try:
+        if not tool_events.event_files() and not (paths.STATE_DIR / "hook-uploads").is_dir():
+            return
+        where = where or configured_server()
+        if where is None:
+            return
+        remote = server(time.monotonic() + CONNECT_SECONDS, where=where)
+        if remote.instance == tool_events.local_instance():
+            return
+        tool_events.upload_pending(remote.instance, send, wait=wait)
+    except (Down, Failed, OSError) as e:
+        if wait:
+            if isinstance(e, OSError):
+                raise Failed({"error": f"hook event upload: {e}"}) from e
+            raise
+        print(f"hook event upload: {e}", file=sys.stderr)
+
+
+def send_hook_batch(body, key, deadline):
+    path = "/api/v1/hook-events"
+    answer = decoded(request("POST", path, body, key=key, buffered=True, deadline=deadline), "POST", path)
+    if field(answer, "received", kind=int) != len(body["events"]):
+        raise Failed({"error": "the server did not acknowledge the full hook event batch"})
+
+
+def upload_hooks_before_write():
+    current = _invocation.get()
+    if current is not None and current.upload_on_write:
+        current.upload_on_write = False
+        upload_hook_events()
 
 
 def headers_for(where: Server) -> dict[str, str]:
@@ -508,8 +557,10 @@ def read_response(resp, deadline):
 
 def call(method: str, path: str, body: dict | None = None, key: str | None = None,
          *, deadline: float | None = None) -> dict:
-    if method != "GET" and key is None:
-        key = write_key()
+    if method != "GET":
+        upload_hooks_before_write()
+        if key is None:
+            key = write_key()
     if key is not None and method == "POST" and path == "/api/tasks":
         return keyed_call(body, key, deadline=deadline)
     return decoded(request(method, path, body, key=key, buffered=True, deadline=deadline), method, path)
@@ -583,6 +634,7 @@ def keyed_call(body, key, *, deadline=None):
 
 
 def start_task(body, key=None):
+    upload_hooks_before_write()
     deadline = time.monotonic() + RESTART_WAIT_SECONDS
     chosen = write_key(exact=key)
     print(f"Idempotency-Key: {chosen}", file=sys.stderr, flush=True)
