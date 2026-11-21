@@ -158,17 +158,17 @@ class Runner:
                     if not entry.is_file(follow_symlinks=False):
                         continue
                     with open(entry.path, "rb") as handle:
-                        fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    # An exec can reset the handler after this check. Unhandled SIGURG is ignored.
-                    try:
-                        os.kill(pid, _test_stacks.DUMP_SIGNAL)
-                    except OSError:
-                        continue
-                    requested.append((pid, entry.path))
+                        try:
+                            fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                        except BlockingIOError:
+                            if self.stopping:
+                                break
+                            # An exec can reset the handler after this check. Unhandled SIGURG is ignored.
+                            os.kill(pid, _test_stacks.DUMP_SIGNAL)
+                            requested.append((pid, entry.path))
                 except OSError:
                     continue
-        if requested:
+        if requested and not self.stopping:
             time.sleep(max(0, deadline - time.monotonic()))
         return requested
 
@@ -340,9 +340,10 @@ class Runner:
             pass
         for identifier in self.crowded:
             report = self.results[identifier]
+            first = self.first_timeouts[identifier]
             print(f"{identifier}: ran past its deadline beside other classes, "
-                  f"then passed alone within twice that deadline in {report['seconds']:.2f}s", flush=True)
-            self.show_failures(identifier, self.first_timeouts[identifier])
+                  f"then passed alone within twice that deadline in {report['seconds']:.2f}s\n\n"
+                  f"{first['timeout']}", flush=True)
         if self.args.slowest:
             print("Slowest classes:")
             for name, report in sorted(self.results.items(), key=lambda item: -item[1]["seconds"])[:self.args.slowest]:
