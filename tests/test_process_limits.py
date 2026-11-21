@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from string import Template
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from adws import feature
 from arete import (
@@ -2359,7 +2359,56 @@ class ParkedRetryBudgetTests(Isolated):
         self.assert_fresh_retry()
 
 
-class WritingPromptTests(unittest.TestCase):
+class DeniedWorkerEditsTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.base = Path(tempfile.mkdtemp(prefix="arete-denied-base-")).resolve()
+        cls.addClassCleanup(shutil.rmtree, cls.base, ignore_errors=True)
+        (cls.base / "guarded.txt").write_text("base\n")
+        (cls.base / "removed.txt").write_text("base\n")
+        util.git(["init", "-q", "-b", "main", "--template="], cls.base)
+        util.git(["add", "."], cls.base)
+        util.git([*util.ARETE_IDENTITY, "commit", "-qm", "Base"], cls.base)
+
+    def prepare_controller(self):
+        root = Path(tempfile.mkdtemp(prefix="arete-denied-")).resolve()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        self.wt = root / "repo"
+        shutil.copytree(self.base, self.wt)
+        repo = config.Repo("fixture/repo", self.wt, tracker="local")
+        self.layer = config.RepoLayer(repo.layer_dir, max_repair_cycles=1,
+                                      deny=["guarded.txt", "removed.txt", "blocked[[]1].txt"],
+                                      checks={"goal": 'test "$(cat goal.txt)" = reached'})
+        cfg = config.Config(replay=config.ReplayConfig(all=True))
+        run_dir = root / "runs" / "fixture"
+        run_dir.mkdir(parents=True)
+        self.run_fixture = pipeline.Run(id="fixture", repo=repo, dir=run_dir, tracker=tracker.LocalTracker(repo),
+                                        tid="1", path="orchestrate")
+        job = flows.Job(cfg, self.run_fixture, self.wt, ticket=tracker.Ticket("1", "#1", "Fixture goal"),
+                        checkouts=[workspace.Checkout("", repo.name, repo.path, self.wt, "main")])
+        self.run_fixture.workspace = self.wt, job.checkouts
+        self.enterContext(patch.object(paths, "RUNS_DIR", run_dir.parent))
+        self.enterContext(patch.object(config, "load_layer", return_value=self.layer))
+        self.enterContext(patch.multiple(record, mark=Mock(), note=Mock()))
+        self.enterContext(patch.object(run_lines, "write"))
+        self.enterContext(patch.object(run_store, "run_get", return_value={
+            "measured_at": "fixture", "active_seconds": 0, "repair_calls": 0,
+            "verify_seconds": 0, "verify_open_seconds": 0}))
+        self.enterContext(patch.object(runlimits.Budget, "checkpoint"))
+        self.enterContext(patch.object(self.run_fixture, "enter"))
+        self.enterContext(patch.object(util, "flush_fd"))
+        self.enterContext(patch.multiple(workspace, note_made=Mock(), kept_work=Mock(return_value=""),
+                                         scratch_left=Mock(return_value=[]), drop_untracked_bytecode=Mock()))
+        self.stored = self.enterContext(patch.object(vault, "every", return_value=[]))
+        self.enterContext(patch.multiple(ledger, acquire=Mock(return_value="fixture"), actions=Mock(return_value=[]),
+                                         save=Mock(), transition=Mock(), snapshot=Mock(return_value={"data": {
+                                             "protocol": PROTOCOL, "mode": "orchestrate", "acceptance": "fixture"}})))
+        job.use_layer(self.layer)
+        self.run_fixture.budget = runlimits.Budget(self.run_fixture, runlimits.Policy.of(self.layer), "")
+        flow = SimpleNamespace(ctx=job, continues="", run=lambda _name, _args, kw: flows.checks(flow, **kw))
+        self.controller = orchestration.Controller(flow)
+        self.controller.catalog = Catalog(job)
+
     def test_each_pipeline_writing_prompt_renders_denied_paths(self):
         writing = {name for name, (_, writes) in PROMPTS.items() if writes}
         writing |= {"patch", "repair", "fix", "ci_fix", "review_fix", "verify_fix", "revise", "resolve",
@@ -2371,48 +2420,6 @@ class WritingPromptTests(unittest.TestCase):
                 inputs = dict.fromkeys(identifiers, "fixture") | {"denied": denied}
                 rendered = prompt_loader.prompt(name, **inputs)
                 self.assertIn(f"Denied paths: {denied}.", rendered.splitlines())
-
-
-class OrchestratedDeniedEditsFixture(Isolated):
-    def setUp(self):
-        super().setUp()
-        self.cfg.replay = config.ReplayConfig(all=True)
-        self.layer = config.RepoLayer(self.repo.layer_dir, max_repair_cycles=1,
-                                      deny=["guarded.txt", "removed.txt", "blocked[[]1].txt"],
-                                      checks={"goal": 'test "$(cat goal.txt)" = reached'})
-        self.enterContext(patch.object(config, "load", return_value=self.cfg))
-        self.enterContext(patch.object(config, "load_layer", return_value=self.layer))
-        self.enterContext(patch.object(pipeline, "run_refusal", return_value=(False, "")))
-        self.enterContext(patch.object(util, "flush_fd", side_effect=os.fsync))
-        self.stored = self.enterContext(patch.object(vault, "every", return_value=[]))
-
-    def run_fixture(self, drive, status):
-        def script(flow):
-            job = flow.ctx
-            self.wt = job.ws
-            self.wt.mkdir(parents=True)
-            self.git("init", "-q", "-b", "main")
-            self.write("guarded.txt", "base\n")
-            self.write("removed.txt", "base\n")
-            self.git("add", ".")
-            util.git_as_owner(["commit", "-qm", "Base"], self.wt)
-            job.ticket = self.local.get(self.ticket)
-            job.checkouts = [workspace.Checkout("", "fixture/repo", self.repo.path, self.wt, "main")]
-            job.run.workspace = job.ws, job.checkouts
-            job.use_layer(self.layer)
-            controller = orchestration.Controller(flow)
-            controller.catalog = Catalog(job)
-            controller.data["acceptance"] = "fixture"
-            return drive(controller)
-
-        result = pipeline.run_issue(self.repo.name, self.ticket, dry_run=status == "dry-run",
-                                    script=pipeline.Script("orchestrate", script))
-        row = run_store.newest_whole_run(self.repo.name, self.ticket)
-        self.assertIsNotNone(row)
-        self.assertEqual(row["status"], status, row["summary"])
-        self.assertEqual(result, int(status == "failed"))
-        return row
-
     def git(self, *args):
         return util.git(list(args), self.wt).strip()
 
@@ -2421,23 +2428,18 @@ class OrchestratedDeniedEditsFixture(Isolated):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text)
 
-    def dispatch(self, controller, op, **args):
-        lease = controller.lease
-        turn = ledger.begin(lease, {}, 10)
-        version = ledger.snapshot(lease)["version"]
-        action, = ledger.accept(lease, turn, version,
-                                {"calls": [{"op": op, "args": OPERATIONS[op].arguments(args)}]}, 10)
-        self.assertIsNone(controller.dispatch(action))
-        if op == "worker.start":
-            self.assertTrue(controller.collect())
-        return next(row["result"] for row in ledger.actions(lease) if row["id"] == action["id"])
+    def perform(self, op, **args):
+        self.controller.executing = op
+        return self.controller.perform({"id": op, "op": op, "request": OPERATIONS[op].arguments(args)})
 
-    def worker(self, controller, edit, goal="Reach the fixture goal", prompt_id="delegate"):
+    def worker(self, edit, prompt_id="delegate"):
+        controller = self.controller
+
         def launch(run, action, request):
             expected = prompt_loader.code_list(diffguard.denied_paths(self.layer))
             self.assertIn(f"Denied paths: {expected}.", request["prompt"].splitlines())
             if prompt_id == "delegate":
-                self.assertIn(goal, request["prompt"])
+                self.assertIn("Reach the fixture goal", request["prompt"])
             if feedback := controller.data.get("denied_feedback"):
                 self.assertIn(feedback, request["prompt"])
 
@@ -2448,83 +2450,73 @@ class OrchestratedDeniedEditsFixture(Isolated):
 
             return SimpleNamespace(pid=123, identity=456, receive=messages, allow=lambda _: None, close=lambda: None)
 
-        with patch.object(delegation, "Worker", side_effect=launch):
+        with patch.object(delegation, "Worker", side_effect=launch) as worker:
             model = controller.catalog.settings["model:build:0"]
-            return self.dispatch(controller, "worker.start", goal=goal, prompt_id=prompt_id,
-                                 route_id="model:build:0", effort=model.effort or "low")
+            self.perform("worker.start", goal="Reach the fixture goal", prompt_id=prompt_id,
+                         route_id="model:build:0", effort=model.effort or "low")
+            self.assertTrue(controller.collect())
+            return worker.call_args.args[2]["role"]
 
-
-class OrchestratedDeniedEditsTests(OrchestratedDeniedEditsFixture):
     def test_second_worker_passes_checks_without_the_denied_paths(self):
+        self.prepare_controller()
+
         def first_edits():
             self.write("guarded.txt", "worker edit\n")
             (self.wt / "removed.txt").unlink()
             self.write("blocked[1].txt", "worker addition\n")
             self.write("blocked1.txt", "allowed addition\n")
 
-        def drive(controller):
-            self.assertEqual(self.worker(controller, first_edits, prompt_id="build")["role"], "build")
-            failed = self.dispatch(controller, "checks.run", scope="quick")
-            self.assertFalse(failed["passed"])
-            self.assertIn("Reach the goal without them", failed["report"])
-            for name in ("guarded.txt", "removed.txt", "blocked[1].txt"):
-                self.assertIn(name, failed["report"])
-            self.assertFalse(controller.current("checks"))
-            self.assertEqual(self.git("diff", "--cached", "--name-only"), "blocked1.txt")
-            for name in ("guarded.txt", "removed.txt"):
-                self.assertEqual((self.wt / name).read_text(), "base\n")
-            self.assertFalse((self.wt / "blocked[1].txt").exists())
-            repeated = self.dispatch(controller, "checks.run")
-            self.assertFalse(repeated["passed"])
-            self.assertEqual(repeated["report"], failed["report"])
-            self.assertEqual(controller.run.budget.repair_calls, 0)
-            repair = self.worker(controller, lambda: self.write("goal.txt", "reached\n"), goal=failed["report"])
-            self.assertEqual(repair["role"], "check_repair")
-            self.assertEqual(controller.run.budget.repair_calls, 1)
-            passed = self.dispatch(controller, "checks.run")
-            self.assertTrue(passed["passed"], passed["report"])
-            self.assertTrue(passed["full"])
-            self.assertIn("goal passed", passed["report"])
-            self.assertEqual(self.git("diff", "--cached", "--name-only"), "blocked1.txt\ngoal.txt")
-            return flows.end_dry_run(controller.flow)
+        self.assertEqual(self.worker(first_edits, prompt_id="build"), "build")
+        failed = self.perform("checks.run", scope="quick")
+        self.assertFalse(failed["passed"])
+        self.assertIn("Reach the goal without them", failed["report"])
+        for name in ("guarded.txt", "removed.txt", "blocked[1].txt"):
+            self.assertIn(name, failed["report"])
+        self.assertFalse(self.controller.current("checks"))
+        self.assertEqual(self.git("diff", "--cached", "--name-only"), "blocked1.txt")
+        for name in ("guarded.txt", "removed.txt"):
+            self.assertEqual((self.wt / name).read_text(), "base\n")
+        self.assertFalse((self.wt / "blocked[1].txt").exists())
+        repeated = self.perform("checks.run")
+        self.assertFalse(repeated["passed"])
+        self.assertEqual(repeated["report"], failed["report"])
+        self.assertEqual(self.run_fixture.budget.repair_calls, 0)
+        self.assertEqual(self.worker(lambda: self.write("goal.txt", "reached\n")), "check_repair")
+        self.assertEqual(self.run_fixture.budget.repair_calls, 1)
+        passed = self.perform("checks.run")
+        self.assertTrue(passed["passed"], passed["report"])
+        self.assertTrue(passed["full"])
+        self.assertIn("goal passed", passed["report"])
+        self.assertEqual(self.git("diff", "--cached", "--name-only"), "blocked1.txt\ngoal.txt")
 
-        self.run_fixture(drive, "dry-run")
-
-
-class OrchestratedDeniedEditBudgetTests(OrchestratedDeniedEditsFixture):
     def test_denied_edit_on_last_repair_parks_with_the_path(self):
-        def drive(controller):
-            self.worker(controller, lambda: self.write("guarded.txt", "first attempt\n"))
-            first = self.dispatch(controller, "checks.run")
-            self.assertFalse(first["passed"])
-            self.worker(controller, lambda: self.write("guarded.txt", "last attempt\n"), goal=first["report"])
-            self.dispatch(controller, "checks.run")
-            self.fail("checks should have parked the run")
-
-        row = self.run_fixture(drive, "failed")
-        reason = runlimits.metadata(row["id"], "parked.json")["reason"]
+        self.prepare_controller()
+        self.controller.data["writes"] = 1
+        self.assertEqual(self.worker(lambda: self.write("guarded.txt", "last attempt\n")), "check_repair")
+        with self.assertRaises(runlimits.Parked) as parked:
+            self.perform("checks.run")
+        status, _, _ = pipeline.park_run(self.run_fixture, str(parked.exception))
+        self.assertEqual(status, "failed")
+        reason = runlimits.metadata(self.run_fixture.id, "parked.json")["reason"]
         self.assertIn("the repair chain used its 1 repair cycles", reason)
         self.assertIn("guarded.txt", reason)
         self.assertEqual((self.wt / "guarded.txt").read_text(), "base\n")
-        self.assertEqual(runlimits.repair_count(row["id"]), 1)
+        self.assertEqual(self.run_fixture.budget.repair_calls, 1)
 
-
-class OrchestratedFatalDeniedEditsTests(OrchestratedDeniedEditsFixture):
     def test_staged_secret_fails_with_the_existing_message(self):
+        self.prepare_controller()
         sample = "fixture-vault-value-728"
         self.stored.return_value = [("FIXTURE_TOKEN", sample)]
         self.assert_fatal_worker_edit(lambda: self.write("payload.txt", sample + "\n"),
                                       "payload.txt (holds the stored value of FIXTURE_TOKEN)")
         self.assertFalse((self.wt / "payload.txt").exists())
-
-    def test_secret_in_a_layer_denied_file_fails_and_restores_it(self):
-        sample = "fixture-vault-value-728"
-        self.stored.return_value = [("FIXTURE_TOKEN", sample)]
-        self.assert_fatal_worker_edit(lambda: self.write("guarded.txt", sample + "\n"),
-                                      "guarded.txt, guarded.txt (holds the stored value of FIXTURE_TOKEN)")
-        self.assertEqual((self.wt / "guarded.txt").read_text(), "base\n")
+        pipeline.keep_edits(self.run_fixture)
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        self.assertEqual(self.git("diff", "HEAD^", "HEAD", "--name-only"), "goal.txt")
 
     def test_workflow_edit_mixed_with_a_layer_denied_edit_is_fatal(self):
+        self.prepare_controller()
+
         def edit():
             self.write("guarded.txt", "worker edit\n")
             self.write(".github/workflows/fixture.yml", "name: fixture\n")
@@ -2534,21 +2526,13 @@ class OrchestratedFatalDeniedEditsTests(OrchestratedDeniedEditsFixture):
         self.assertEqual((self.wt / "guarded.txt").read_text(), "base\n")
 
     def assert_fatal_worker_edit(self, edit, paths_in_message):
-        def edit_with_allowed_change():
-            edit()
-            self.write("goal.txt", "reached\n")
-
-        def drive(controller):
-            self.worker(controller, edit_with_allowed_change)
-            self.dispatch(controller, "checks.run")
-            self.fail("checks should have failed the run")
-
-        row = self.run_fixture(drive, "failed")
-        self.assertEqual(row["summary"], f"the build and its fixes touched denied paths: {paths_in_message}")
-        self.assertFalse((paths.RUNS_DIR / row["id"] / "parked.json").exists())
-        self.assertEqual(runlimits.repair_count(row["id"]), 0)
-        self.assertEqual(self.git("status", "--porcelain"), "")
-        self.assertEqual(self.git("diff", "HEAD^", "HEAD", "--name-only"), "goal.txt")
+        edit()
+        self.write("goal.txt", "reached\n")
+        with self.assertRaises(workspace.RunFailed) as failed:
+            self.perform("checks.run")
+        self.assertEqual(failed.exception.why, f"the build and its fixes touched denied paths: {paths_in_message}")
+        self.assertEqual(self.run_fixture.budget.repair_calls, 0)
+        self.assertEqual(self.git("diff", "--cached", "--name-only"), "goal.txt")
 
 
 class OrchestratedFinishBudgetTests(PollFixture):

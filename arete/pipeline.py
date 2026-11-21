@@ -847,10 +847,11 @@ def stage(checkouts: list[workspace.Checkout], deny: list[str], from_base: bool 
         restore_from = against if worker_trees is None else worker_trees.get(c.github, "HEAD")
         worker_diff = diff if restore_from == against else diffguard.between(
             c.wt, "--cached", restore_from, deny=deny, prefix=c.prefix)
-        workflows = {name for name in diff.denied + worker_diff.denied
+        worker_denied = worker_diff.denied
+        workflows = {name for name in diff.denied + worker_denied
                      if workflow_denied(name.removeprefix(c.prefix), c.prefix)}
-        out.earlier_denied.extend(name for name in diff.denied if name not in worker_diff.denied and name not in workflows)
-        diff.denied = sorted(set(worker_diff.denied) | workflows)
+        out.earlier_denied.extend(name for name in diff.denied if name not in worker_denied and name not in workflows)
+        diff.denied = sorted(set(worker_denied) | workflows)
         if not merged and not diff.counts and not worker_diff.files:
             continue
         shown = checkout_patch(c, diff.locks, "--cached", against)
@@ -872,11 +873,11 @@ def stage(checkouts: list[workspace.Checkout], deny: list[str], from_base: bool 
             out.fatal_denied = True
             if paths := [name.removeprefix(c.prefix) for name in diff.files if name in fatal]:
                 out.fatal_restores[c.github] = paths
-        if worker_diff.denied:
-            allowed = set(worker_diff.files).difference(worker_diff.denied).difference(fatal)
+        if worker_denied:
+            allowed = set(worker_diff.files).difference(worker_denied, fatal)
             allowed.update(c.prefix + name for name in workspace.ignored_file_paths(c.wt))
             paths = []
-            for name in worker_diff.denied:
+            for name in worker_denied:
                 if name in fatal:
                     continue
                 if any(name.startswith(path + "/") or path.startswith(name + "/") for path in allowed):
