@@ -3253,7 +3253,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
     from . import pilot, readme_verify, zte
 
     run, configured = b.run, b.layer.verify
-    replay_only = bool(replay_drivers) and not values.get("goal")
+    replay_only = replay_drivers is not None
     delivery_verification = prompt_name == role == "verify"
     tid = str(run.tid) if delivery_verification else ""
     zte_verify = delivery_verification and zte.reserved(tid)
@@ -3300,7 +3300,11 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
             verified = verify.Verified("blocked", "The exact README could not be verified.", finished=False,
                                        blocked_by=str(error))
         return save_verification(run, step, verified)
-    evidence = run_folder(run, "evidence")
+    if replay_only:
+        evidence = run.dir / f"{step}-evidence"
+        evidence.mkdir(exist_ok=True)
+    else:
+        evidence = run_folder(run, "evidence")
     untracked_before = untracked_by_dir(b.git_dirs)
     attempt = None
     try:
@@ -3332,11 +3336,8 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                 attempt=attempt) as url:
             if url:
                 run.log(f"{step}: the app answers at {url}")
-            if v.probes or drivers or replay:
-                probe_config = replace(v, probe_seconds=run.time_for(v.probe_seconds))
-            if replay:
-                probe_deadline = time.monotonic() + probe_config.probe_seconds
             if v.probes or drivers:
+                probe_config = replace(v, probe_seconds=run.time_for(v.probe_seconds))
                 probes = verify.run_probes(probe_config, b.ws, attempt, journey_drivers=drivers)
             if probes:
                 run.save(f"{step}-probes.json", json.dumps(asdict(probes), indent=2))
@@ -3350,10 +3351,13 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                     v = replace(v, notes=v.notes + f"\n\nArete already executed these owner-configured {name} in a "
                                 "confined disposable workspace. Use their observed results as evidence; do not repeat "
                                 "these commands. " + instructions + probes.markdown())
-            driver_config = None
-            if replay and (not probes or probes.verdict == "pass"):
-                driver_config = replace(v, probes={}, probe_seconds=probe_deadline - time.monotonic())
-            if not replay_only and (not probes or probes.verdict == "pass"):
+            probes_passed = not probes or probes.verdict == "pass"
+            if replay and probes_passed:
+                driver_config = replace(v, probes={}, probe_seconds=run.time_for(v.probe_seconds))
+                observed = verify.run_probes(driver_config, b.ws, attempt, journey_drivers=replay,
+                                             stop_on_driver_failure=False)
+                run.save(f"{step}-replay-drivers.json", asdict(observed))
+            if not replay_only and probes_passed:
                 agent_started = True
                 res = run.agent(step, b.brief.prompt(
                     prompt_name, surface=surface_note(v, url, evidence), notes=v.notes, scratch=scratch.note(attempt),
@@ -3366,10 +3370,6 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                                 mcp_config=browser.mcp_config(evidence) if url else "",
                                 scratch=attempt)
                 agent_finished = True
-            if driver_config:
-                observed = verify.run_probes(driver_config, b.ws, attempt, journey_drivers=replay,
-                                             stop_on_driver_failure=False)
-                run.save(f"{step}-replay-drivers.json", asdict(observed))
     except (owner_asks.Asked, CatchUpNeedsInput):
         agent_finished = True
         raise

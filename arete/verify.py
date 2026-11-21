@@ -142,7 +142,8 @@ def run_probes(v: config.Verify, cwd: Path, attempt: scratch.Attempt | None,
 
     for index, (name, command) in enumerate((*v.probes.items(), *named)):
         is_driver = index >= len(v.probes)
-        remaining = deadline - time.monotonic()
+        replaying_driver = is_driver and not stop_on_driver_failure
+        remaining = v.probe_seconds if replaying_driver else deadline - time.monotonic()
         cause = "change"
         try:
             if remaining <= 0:
@@ -186,7 +187,7 @@ def run_probes(v: config.Verify, cwd: Path, attempt: scratch.Attempt | None,
             summary = f"Configured {label} failed."
             if named:
                 summary = f"Could not run {name}." if blocked else f"{name} failed."
-            if not is_driver or stop_on_driver_failure:
+            if not replaying_driver:
                 return Verified("blocked" if blocked else "fail", summary, checks,
                                 blocked_by=(blocker if named else f"probes: {blocker}") if blocked else "",
                                 finished=not (named and blocked))

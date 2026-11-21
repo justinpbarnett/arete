@@ -1546,6 +1546,32 @@ class MergeCheckJourneyTests(unittest.TestCase):
         self.assertIn("journey:inventory", mergecheck.finding(replay, result.failed)["summary"])
         self.assertEqual(json.loads((self.run_dir / "result.json").read_text())["verdict"], "fail")
 
+    def test_later_driver_failure_is_reported_after_a_communicate_timeout(self):
+        self.prepare_replay(0, later_drivers={"inventory": 1})
+        elapsed = 0.0
+
+        def time_out(*, timeout):
+            nonlocal elapsed
+            elapsed += timeout
+            raise subprocess.TimeoutExpired("checkout", timeout)
+
+        checkout = mock.Mock(communicate=mock.Mock(side_effect=time_out))
+        inventory = mock.Mock(returncode=1, communicate=mock.Mock(return_value=("inventory missing\n", "")))
+        self.spawn.side_effect = [checkout, inventory]
+        with mock.patch.object(verify, "time", SimpleNamespace(monotonic=lambda: elapsed)):
+            code, stdout, stderr = self.consume(self.items)
+
+        self.assertEqual(code, mergecheck.INCOMPLETE_EXIT)
+        finding = json.loads(stdout)
+        self.assertIn("journey:inventory", finding["summary"])
+        self.assertNotIn("journey:checkout", finding["summary"])
+        self.assertIn("journey:checkout", stderr)
+        self.assertNotIn("inventory missing", stdout + stderr)
+        self.assertEqual(self.checked(), [])
+        for proc in (checkout, inventory):
+            proc.communicate.assert_called_once_with(timeout=self.layer.verify.probe_seconds)
+        self.assertEqual(util.stop_group.call_args_list, [mock.call(checkout), mock.call(inventory)])
+
     def test_private_driver_output_stays_in_local_hold_diagnostics(self):
         marker = "synthetic private customer record"
         replay, result = self.replay_driver(1, output=marker)
@@ -1634,7 +1660,7 @@ class MergeCheckJourneyTests(unittest.TestCase):
         self.assertNotIn("journey:checkout", finding["summary"])
         self.assertEqual(metric, {"value": 0})
         self.assertEqual(self.checked(), [item["key"] for item in self.items])
-        self.spawn.assert_called_once()
+        self.assertEqual([call.args[0][-1] for call in self.spawn.call_args_list], ["exit 1", "exit 1"])
         self.agent.assert_not_called()
 
     def test_worktree_removal_failure_stops_publication_and_leaves_the_batch_unchecked(self):
@@ -1695,10 +1721,6 @@ class MergeCheckJourneyTests(unittest.TestCase):
             "verdict": "fail", "summary": "Catalog regressed.",
             "checks": [{"what": "Step 1: Inspect the catalog", "how": "echo catalog", "saw": "empty", "passed": False}],
         })
-        replay = mock.Mock()
-        replay.attach_mock(self.agent, "grade")
-        replay.attach_mock(self.spawn, "driver")
-
         code, stdout, stderr = self.consume(self.items)
 
         self.assertEqual(code, mergecheck.INCOMPLETE_EXIT)
@@ -1708,7 +1730,134 @@ class MergeCheckJourneyTests(unittest.TestCase):
         self.assertIn("journey:checkout", stderr)
         self.assertEqual(metric, {"value": 0})
         self.assertEqual(self.checked(), [])
-        self.assertEqual([call[0] for call in replay.mock_calls], ["grade", "driver"])
+        self.spawn.assert_called_once()
+        self.agent.assert_called_once()
+
+    def test_driver_and_ordinary_grader_each_see_their_own_seeded_state(self):
+        self.prepare_replay(0, grade={
+            "verdict": "pass", "summary": "Catalog checked.",
+            "checks": [{"what": "Step 1: Inspect the catalog", "how": "update catalog", "saw": "updated",
+                        "passed": True}],
+        })
+        self.layer.setup.append("seed catalog")
+        self.layer.verify.start = "serve catalog {scratch}"
+        self.layer.verify.url = "http://localhost:{port}"
+        phases, services = [], []
+        grade, spawn = self.agent.side_effect, self.spawn.side_effect
+
+        def setup(command, *_args, cwd, **_kwargs):
+            self.assertEqual(command, "seed catalog")
+            (cwd / "product.txt").write_text("seeded product")
+            return SimpleNamespace(returncode=0)
+
+        @contextmanager
+        def serving(configured, cwd, *_args, attempt, **_kwargs):
+            scratch_root = Path(attempt.root)
+            self.assertEqual(configured.start, f"serve catalog {scratch_root}")
+            (scratch_root / "catalog.txt").write_text("seeded scratch")
+            services.append((cwd, scratch_root, configured.url))
+            phases.append("start")
+            yield configured.url
+            phases.append("stop")
+
+        def mutate_catalog(cwd, scratch_root, phase):
+            phases.append(phase)
+            state = [(cwd / "product.txt", "seeded product"), (scratch_root / "catalog.txt", "seeded scratch")]
+            intact = all(path.read_text() == seed for path, seed in state)
+            for path, _ in state:
+                path.write_text(f"mutated by {phase}")
+            return intact
+
+        def mutate_as_grader(run, step, prompt, cwd, *, scratch, **kwargs):
+            graded = grade(run, step, prompt, cwd, scratch=scratch, **kwargs)
+            graded.structured["checks"][0]["passed"] = mutate_catalog(cwd, Path(scratch.root), "grade")
+            return graded
+
+        def mutate_as_driver(command, **kwargs):
+            proc = spawn(command, **kwargs)
+            scratch_root = Path(kwargs["env"][verify.scratch.ENV_NAME])
+            proc.returncode = 0 if mutate_catalog(kwargs["cwd"], scratch_root, "driver") else 1
+            return proc
+
+        def scratch_attempt(_run, step, cwd, _folder):
+            root = cwd / f"scratch-{step}"
+            root.mkdir()
+            return SimpleNamespace(root=str(root))
+
+        self.agent.side_effect = mutate_as_grader
+        self.spawn.side_effect = mutate_as_driver
+        with (mock.patch.object(pipeline.environment, "sh", side_effect=setup),
+              mock.patch.object(verify.scratch, "make", side_effect=scratch_attempt),
+              mock.patch.object(verify.browser, "free_port", side_effect=[12000, 12001]),
+              mock.patch.object(verify, "serving", side_effect=serving)):
+            code, stdout, _ = self.consume(self.items)
+
+        self.assertEqual(code, 0)
+        self.assertEqual([json.loads(line) for line in stdout.splitlines()], [{"value": 1}])
+        self.assertEqual(self.checked(), [item["key"] for item in self.items])
+        self.assertEqual(phases, ["start", "driver", "stop", "start", "grade", "stop"])
+        for driver_value, grader_value in zip(*services, strict=True):
+            self.assertNotEqual(driver_value, grader_value)
+
+    def test_driver_failure_and_hold_with_ordinary_pass_emit_a_failing_metric(self):
+        marker = "private driver diagnostic"
+        self.prepare_replay(1, later_drivers={"inventory": 127}, output=marker, grade={
+            "verdict": "pass", "summary": "Catalog checked.",
+            "checks": [{"what": "Step 1: Inspect the catalog", "how": "echo catalog", "saw": "catalog",
+                        "passed": True}],
+        })
+
+        code, stdout, stderr = self.consume(self.items)
+
+        self.assertEqual(code, mergecheck.INCOMPLETE_EXIT)
+        finding, metric = map(json.loads, stdout.splitlines())
+        self.assertIn("journey:checkout", finding["summary"])
+        self.assertNotIn("Inspect the catalog", finding["summary"])
+        self.assertIn("journey:inventory", stderr)
+        self.assertNotIn(marker, stdout + stderr)
+        self.assertEqual(metric, {"value": 0})
+        self.assertEqual(self.checked(), [])
+
+    def test_driver_failure_is_reported_while_ordinary_grader_holds_for_environment(self):
+        marker = "synthetic private checkout failure"
+        hold = "The catalog service is unavailable."
+        self.prepare_replay(1, output=marker, grade={
+            "verdict": "blocked", "summary": "Catalog could not be checked.", "blocked_by": hold, "checks": [],
+        })
+
+        code, stdout, stderr = self.consume(self.items)
+
+        self.assertEqual(code, mergecheck.INCOMPLETE_EXIT)
+        finding = json.loads(stdout)
+        self.assertIn("journey:checkout", finding["summary"])
+        self.assertIn("local merge-check record for replay-fixture", finding["summary"])
+        self.assertIn(hold, stderr)
+        self.assertNotIn(marker, stdout + stderr)
+        self.assertEqual(self.checked(), [])
+        self.assertEqual(json.loads((self.run_dir / "driver-failures.json").read_text()), {
+            "2": {"what": "journey:checkout", "saw": f"exit 1: {marker}\n"},
+        })
+        local_summary = self.settle.call_args.kwargs["summary"]
+        self.assertIn(hold, local_summary)
+        self.assertIn(marker, local_summary)
+
+    def test_ordinary_and_driver_holds_are_both_recorded_locally_without_a_metric(self):
+        marker = "private driver startup details"
+        hold = "The catalog service is unavailable."
+        self.prepare_replay(127, output=marker, grade={
+            "verdict": "blocked", "summary": "Catalog could not be checked.", "blocked_by": hold, "checks": [],
+        })
+
+        code, stdout, stderr = self.consume(self.items)
+
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn(hold, stderr)
+        self.assertNotIn(marker, stderr)
+        self.assertEqual(self.checked(), [])
+        local_summary = self.settle.call_args.kwargs["summary"]
+        self.assertIn(hold, local_summary)
+        self.assertIn(f"journey:checkout: exit 127: {marker}", local_summary)
 
     def test_malformed_manifest_row_prevents_publication_even_when_both_kinds_of_check_fail(self):
         check = {"what": "Step 1: Inspect the catalog", "how": "echo catalog", "saw": "empty", "passed": False}

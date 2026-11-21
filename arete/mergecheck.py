@@ -351,6 +351,7 @@ class ReplayResult:
     failed: list[int] = field(default_factory=list)
     blocked_by: str = ""
     driver_reason: str = ""
+    ordinary_held: bool = False
 
 
 def execute(cfg: config.Config, p: Plan, run_id: str) -> ReplayResult:
@@ -386,17 +387,17 @@ def ordinary_failures(verified: verify.Verified, ordinary: list[int]) -> list[in
 
 def replay_result(p: Plan, run: CheckRun, verified: verify.Verified,
                   ordinary: list[int], drivers: dict[int, str], observed: verify.Verified | None) -> ReplayResult:
+    result = ReplayResult()
     if verified.verdict == "fail" and not run.invoked:
         p.startup_failed = True
-        prevented = ordinary or list(drivers)
-        run.save("startup-failure.json", {"prevented_steps": prevented})
-        return ReplayResult(failed=prevented)
-    if verified.verdict not in ("pass", "fail") or (ordinary and not run.invoked):
-        raise Blocked(verified.blocked_by or "the product or verifier did not start")
-
-    result = ReplayResult()
-    if ordinary:
-        result.failed = ordinary_failures(verified, ordinary)
+        result.failed = ordinary or list(drivers)
+        run.save("startup-failure.json", {"prevented_steps": result.failed})
+        if observed is None:
+            return result
+    else:
+        result.ordinary_held = verified.verdict not in ("pass", "fail") or (bool(ordinary) and not run.invoked)
+        if ordinary and not result.ordinary_held:
+            result.failed = ordinary_failures(verified, ordinary)
     checks = {check["what"]: check for check in observed.checks} if observed else {}
     failures, reasons, blocked = {}, [], []
     for n, name in drivers.items():
@@ -408,13 +409,67 @@ def replay_result(p: Plan, run: CheckRun, verified: verify.Verified,
         elif not check["passed"]:
             failures[n] = {"what": name, "saw": check["saw"]}
             reasons.append(f"{name}: {check['saw']}")
+    if result.ordinary_held:
+        result.blocked_by = verified.blocked_by or "the product or verifier did not start"
+        if not (failures or blocked):
+            raise Blocked(result.blocked_by)
+    elif blocked:
+        result.blocked_by = f"{', '.join(blocked)}: driver replay blocked. Details are in local run {run.id}."
     if failures:
         run.save("driver-failures.json", failures)
     result.driver_reason = "\n".join(reasons)
-    if blocked:
-        result.blocked_by = f"{', '.join(blocked)}: driver replay blocked. Details are in local run {run.id}."
     result.failed = sorted([*result.failed, *failures])
     return result
+
+
+@contextmanager
+def replay_checkout(run: CheckRun, path: Path, sha: str, step: str):
+    util.git(["worktree", "add", "--detach", str(path), sha], run.repo.path)
+    try:
+        yield
+    finally:
+        if (run.dir / f"{step}-retained.json").exists() or verifier_suites.held(run.dir, path, step):
+            print(f"merge-check: retained {path}; scratch ownership is unresolved", file=sys.stderr)
+            raise Blocked("verification scratch ownership is unresolved; workspace retained")
+        util.git(["worktree", "remove", "--force", str(path)], run.repo.path)
+
+
+def replay_work(p: Plan, run: CheckRun, path: Path, sha: str) -> TicketWork:
+    cfg = run.config
+    for rel in p.layer.copy:
+        dst = path / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(p.repo.path / rel, dst)
+    for command in p.layer.setup:
+        result = environment.sh(command, cfg, p.repo, cwd=path,
+                                timeout=max(1, run.deadline - time.monotonic()))
+        if result.returncode:
+            raise Blocked(f"{p.repo.name}: setup failed")
+    ticket = tracker.Ticket(id=run.id, ref=run.id, title="Use the merged base", body="")
+    return TicketWork(cfg, run, ticket, path,
+                      [workspace.Checkout("", p.repo.github, p.repo.path, path, p.base)], p.layer, 1800,
+                      workspace=f"Detached checkout of origin/{p.base} at {sha}.")
+
+
+def driver_observations(run: CheckRun, step: str) -> verify.Verified | None:
+    saved = read_json(run.dir / f"{step}-replay-drivers.json", None)
+    return verify.Verified.stored(saved) if saved is not None else None
+
+
+def isolated_driver_replay(p: Plan, run: CheckRun, sha: str, names: set[str]) -> verify.Verified | None:
+    step = "verify-drivers"
+    path = p.worktree.with_name(f"{p.worktree.name}-drivers")
+    with replay_checkout(run, path, sha, step):
+        try:
+            work = replay_work(p, run, path, sha)
+        except (Blocked, OSError) as error:
+            verified = verify.Verified("blocked", blocked_by=str(error), finished=False)
+        else:
+            verified = use_product(work, step, "grade", require_released=True, replay_drivers=names)
+        if observed := driver_observations(run, step):
+            return observed
+        run.save(f"{step}-result.json", asdict(verified))
+    return None
 
 
 def execute_attempt(cfg: config.Config, p: Plan, run_id: str) -> ReplayResult:
@@ -422,36 +477,23 @@ def execute_attempt(cfg: config.Config, p: Plan, run_id: str) -> ReplayResult:
     folder.mkdir(parents=True, exist_ok=False)
     run = CheckRun(id=run_id, repo=p.repo, dir=folder, cfg=cfg, layer=p.layer,
                    deadline=time.monotonic() + 1800, writes_lines=False)
-    made = False
+    ordinary = [n for n, s in enumerate(p.steps, 1) if not s.driver]
+    goal = "\n".join(p.steps[n - 1].goal(i) for i, n in enumerate(ordinary, 1))
+    drivers = {n: s.name for n, s in enumerate(p.steps, 1) if s.driver}
+    names = {name.removeprefix("journey:") for name in drivers.values()}
     with deadline():
-        try:
-            util.git(["fetch", "origin"], p.repo.path)
-            sha = util.git(["rev-parse", "--verify", f"origin/{p.base}^{{commit}}"], p.repo.path).strip()
-            p.worktree.parent.mkdir(parents=True, exist_ok=True)
-            util.git(["worktree", "add", "--detach", str(p.worktree), sha], p.repo.path)
-            made = True
+        util.git(["fetch", "origin"], p.repo.path)
+        sha = util.git(["rev-parse", "--verify", f"origin/{p.base}^{{commit}}"], p.repo.path).strip()
+        p.worktree.parent.mkdir(parents=True, exist_ok=True)
+        observed = isolated_driver_replay(p, run, sha, names) if ordinary and drivers else None
+        with replay_checkout(run, p.worktree, sha, "verify"):
             run.save("manifest.json", {"base": f"origin/{p.base}", "sha": sha, "worktree": str(p.worktree),
                                       "runs": p.batch, "steps": [asdict(s) for s in p.steps]})
-            for rel in p.layer.copy:
-                src, dst = p.repo.path / rel, p.worktree / rel
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, dst)
-            for command in p.layer.setup:
-                result = environment.sh(command, cfg, p.repo, cwd=p.worktree,
-                                        timeout=max(1, run.deadline - time.monotonic()))
-                if result.returncode:
-                    raise Blocked(f"{p.repo.name}: setup failed")
-            ticket = tracker.Ticket(id=run_id, ref=run_id, title="Use the merged base", body="")
-            work = TicketWork(cfg, run, ticket, p.worktree,
-                              [workspace.Checkout("", p.repo.github, p.repo.path, p.worktree, p.base)], p.layer, 1800,
-                              workspace=f"Detached checkout of origin/{p.base} at {sha}.")
-            ordinary = [n for n, s in enumerate(p.steps, 1) if not s.driver]
-            goal = "\n".join(p.steps[n - 1].goal(i) for i, n in enumerate(ordinary, 1))
-            drivers = {n: s.name for n, s in enumerate(p.steps, 1) if s.driver}
-            replay = {"replay_drivers": {name.removeprefix("journey:") for name in drivers.values()}} if drivers else {}
-            verified = use_product(work, "verify", "grade", goal=goal, require_released=True, **replay)
-            saved = read_json(folder / "verify-replay-drivers.json", None) if drivers else None
-            observed = verify.Verified.stored(saved) if saved is not None else None
+            work = replay_work(p, run, p.worktree, sha)
+            verified = use_product(work, "verify", "grade", goal=goal, require_released=True,
+                                   replay_drivers=names if not ordinary else None)
+            if not ordinary:
+                observed = driver_observations(run, "verify")
             result = verified
             if observed:
                 verdict = verified.verdict
@@ -462,12 +504,6 @@ def execute_attempt(cfg: config.Config, p: Plan, run_id: str) -> ReplayResult:
                                  finished=verified.finished and observed.finished)
             run.save("result.json", asdict(result))
             return replay_result(p, run, verified, ordinary, drivers, observed)
-        finally:
-            if made:
-                if (folder / "verify-retained.json").exists() or verifier_suites.held(folder, p.worktree, "verify"):
-                    print(f"merge-check: retained {p.worktree}; scratch ownership is unresolved", file=sys.stderr)
-                    raise Blocked("verification scratch ownership is unresolved; workspace retained")
-                util.git(["worktree", "remove", "--force", str(p.worktree)], p.repo.path)
 
 
 def consume(cfg: config.Config, repo_name: str, supplied: list[dict], dry_run: bool = False) -> int:
@@ -541,12 +577,10 @@ def consume_batch(cfg: config.Config, repo_name: str, supplied: list[dict], dry_
                 outputs.append(finding(p, result.failed, attempt_id))
             if result.blocked_by:
                 holds.append(result.blocked_by)
-                if any(not step.driver for step in p.steps):
-                    ordinary_failed = any(not p.steps[n - 1].driver for n in result.failed)
-                    outputs.append({"value": 0 if ordinary_failed else 1})
             else:
-                outputs.append({"value": 0 if result.failed else 1})
                 checked[p.repo.name] += [r["key"] for r in p.batch]
+            if not result.blocked_by or (not result.ordinary_held and any(not step.driver for step in p.steps)):
+                outputs.append({"value": 0 if result.failed else 1})
         save_json(folder / "checked.json", checked)
         for output in outputs:
             print(json.dumps(output, separators=(",", ":")))
