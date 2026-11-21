@@ -3,6 +3,7 @@ import io
 import json
 import os
 import shutil
+import signal
 import sqlite3
 import tempfile
 import unittest
@@ -2627,9 +2628,154 @@ class OrchestratedFinishBudgetTests(PollFixture):
         self.assertFalse((directory / "parked.json").exists())
 
 
+class FailedPollBudgetTests(PollFixture):
+    def failed_with_spent_repairs(self):
+        self.repo.layer_dir.mkdir()
+        (self.repo.layer_dir / "config.toml").write_text('[factory]\npath = "classic"\n[limits]\nmax_repair_cycles = 3\n')
+        self.cfg.replay = config.ReplayConfig(all=True)
+        failed = self.made_run()
+        record.note(failed.id, repair_calls=3)
+        record.settle(failed.id, "failed")
+        self.local.label(self.ticket, add=["failed"])
+        return failed
+
+    def check_failed_retry(self, *, edited):
+        failed = self.failed_with_spent_repairs()
+        if edited:
+            with foundation.db() as connection:
+                set_task_body(self.ticket, "A narrower specification", connection=connection)
+        self.local.label(self.ticket, remove=["failed"])
+
+        def work(cfg, run, slot):
+            self.assertFalse(run.force)
+            if not edited:
+                self.assertEqual(run.budget.prior_repairs, 3)
+            run.budget.charge("repair", "review_repair")
+            return "noop", "fixture finished", ""
+
+        self.assertEqual(self.poll_with(self.cfg, lambda repo, tid: self.run_polled_ticket(repo, tid, work)), 0)
+        retry = run_store.newest_live_whole_run(self.repo.name, self.ticket)
+        self.assertNotEqual(retry["id"], failed.id)
+        saved = runlimits.metadata(retry["id"], "budget.json")
+        log = (paths.RUNS_DIR / retry["id"] / "run.log").read_text()
+        if edited:
+            self.assertEqual(saved["parents"], [])
+            self.assertEqual(saved["repair_left_out"], [failed.id])
+            self.assertEqual(runlimits.repair_count(retry["id"]), 1)
+            self.assertIn("budget: left out 3 earlier repair cycles, 0.0 run minutes and 0.0 verification minutes "
+                          "of 1 earlier run because the ticket specification changed since they ran", log)
+        else:
+            self.assertEqual(saved["repair_parents"], [failed.id])
+            self.assertEqual(saved["repair_left_out"], [])
+            self.assertIn("the repair chain used its 3 repair cycles", log)
+
+    def test_poll_excludes_budget_after_failed_run_with_edited_specification(self):
+        self.check_failed_retry(edited=True)
+
+    def test_poll_keeps_budget_after_failed_run_with_unchanged_specification(self):
+        self.check_failed_retry(edited=False)
+
+    def test_poll_retry_parks_during_lookup_when_inherited_run_time_expires(self):
+        failed = self.failed_with_spent_repairs()
+        record.note(failed.id, active_seconds=3599.75)
+        self.local.label(self.ticket, remove=["failed"])
+        clock = [100.0]
+        work = Mock()
+
+        def launch_with_stalled_lookup(repo, tid):
+            with patch.object(runlimits, "time", SimpleNamespace(monotonic=lambda: clock[0])), \
+                    patch.object(signal, "setitimer") as timer:
+                def stalled_lookup(*_):
+                    timer.assert_called_once_with(signal.ITIMER_REAL, 0.25)
+                    self.assertTrue(callable(signal.getsignal(signal.SIGALRM)))
+                    clock[0] += 0.25
+                    signal.raise_signal(signal.SIGALRM)
+                    self.fail("the watchdog did not interrupt the lookup")
+
+                with patch.object(tracker.LocalTracker, "get", side_effect=stalled_lookup) as lookup:
+                    self.assertEqual(self.run_polled_ticket(repo, tid, work), 1)
+                lookup.assert_called_once()
+
+        self.assertEqual(self.poll_with(self.cfg, launch_with_stalled_lookup), 0)
+        work.assert_not_called()
+        retry = run_store.newest_live_whole_run(self.repo.name, self.ticket)
+        parked = runlimits.metadata(retry["id"], "parked.json")
+        self.assertEqual(parked.get("reason"), "the run chain reached its cumulative 60 minute budget")
+        self.assertEqual(parked["specification"], runlimits.recorded_specification(failed.id))
+        saved = runlimits.metadata(retry["id"], "budget.json")
+        self.assertEqual(saved["parents"], [failed.id])
+        self.assertEqual(saved["repair_parents"], [failed.id])
+        self.assertEqual(retry["active_seconds"], 0.25)
+
+    def test_poll_retry_charges_successful_lookup_to_active_run_time(self):
+        failed = self.failed_with_spent_repairs()
+        record.note(failed.id, active_seconds=30)
+        self.local.label(self.ticket, remove=["failed"])
+        ticket = self.local.get(self.ticket)
+        clock = [100.0]
+        budgets = []
+
+        def slow_lookup(*_):
+            clock[0] += 12
+            return ticket
+
+        def work(cfg, run, slot):
+            budgets.append(run.budget)
+            return "noop", "fixture finished", ""
+
+        def launch_with_slow_lookup(repo, tid):
+            with patch.object(runlimits, "time", SimpleNamespace(monotonic=lambda: clock[0])), \
+                    patch.object(signal, "setitimer"), \
+                    patch.object(tracker.LocalTracker, "get", side_effect=slow_lookup) as lookup:
+                self.assertEqual(self.run_polled_ticket(repo, tid, work), 0)
+                lookup.assert_called_once()
+
+        self.assertEqual(self.poll_with(self.cfg, launch_with_slow_lookup), 0)
+        retry = run_store.newest_live_whole_run(self.repo.name, self.ticket)
+        self.assertEqual(retry["status"], "noop")
+        self.assertEqual(retry["active_seconds"], 12)
+        [budget] = budgets
+        self.assertEqual(budget.prior_seconds, 30)
+        self.assertEqual(budget.run_deadline() - clock[0], 60 * 60 - 30 - 12)
+
+    def test_poll_keeps_budget_across_a_failed_ticket_fetch(self):
+        failed = self.failed_with_spent_repairs()
+        self.local.label(self.ticket, remove=["failed"])
+        work = Mock()
+
+        def launch_with_fetch_error(repo, tid):
+            with patch.object(tracker.LocalTracker, "get", side_effect=tracker.TaskError("ticket fetch failed")):
+                self.assertEqual(self.run_polled_ticket(repo, tid, work), 1)
+
+        self.assertEqual(self.poll_with(self.cfg, launch_with_fetch_error), 0)
+        retry = run_store.newest_live_whole_run(self.repo.name, self.ticket)
+        self.assertNotEqual(retry["id"], failed.id)
+        self.assertEqual(retry["status"], "failed")
+        self.assertIn("ticket fetch failed", retry["summary"])
+        work.assert_not_called()
+
+        self.local.label(self.ticket, remove=["failed"])
+
+        def charge_repair(cfg, run, slot):
+            run.budget.charge("repair", "review_repair")
+            return "noop", "fixture finished", ""
+
+        self.assertEqual(self.poll_with(self.cfg, lambda repo, tid: self.run_polled_ticket(repo, tid, charge_repair)), 0)
+        next_retry = run_store.newest_live_whole_run(self.repo.name, self.ticket)
+        self.assertNotEqual(next_retry["id"], retry["id"])
+        self.assertIn("the repair chain used its 3 repair cycles", next_retry["summary"])
+        self.assertEqual(runlimits.repair_count(next_retry["id"]), 0)
+        for key in ("parents", "repair_parents"):
+            self.assertEqual(runlimits.metadata(retry["id"], "budget.json")[key], [failed.id])
+            self.assertEqual(runlimits.metadata(next_retry["id"], "budget.json")[key], [retry["id"], failed.id])
+
+
 class BudgetReadmissionTests(ReadmissionFixture):
     def test_specification_edit_readmits_once_and_reparks_on_current_inputs(self):
         parked = self.park_ticket()
+        with contextlib.redirect_stdout(io.StringIO()) as unchanged:
+            self.assertEqual(self.poll_with(self.cfg, lambda *_: self.fail("started without an edit")), 0)
+        self.assertIn(f"parked after run {parked.id}: repair limit", unchanged.getvalue())
         with foundation.db() as connection:
             set_task_body(self.ticket, "A narrower specification", connection=connection)
         started = []

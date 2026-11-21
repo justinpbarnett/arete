@@ -18,6 +18,7 @@ from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, replace
+from functools import partial
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import TextIO
@@ -1728,6 +1729,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             if isinstance(tk, tracker.GitHubTracker):
                 tk.require_ordinary(tid)
             budget_history = run_store.ticket_runs(repo.name, tid, limit=1, live=bool(retry_of or preview_of))
+            latest = budget_history[0] if budget_history else None
             custom_feature = bool(script and script.path == "feature" and custom_revision_feature(cfg))
             may_revise = not (zte_grant or retry_of or reconciling_catch_up or only) and (
                 script is None or not script.repairs and (script.path in ("orchestrate", "revise") or custom_feature))
@@ -1740,6 +1742,9 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             else:
                 budget_admission = runlimits.admission(repo, str(tid), tk, runlimits.Policy.of(layer), force,
                                                        readmission=readmission)
+            poll_failure = (latest["id"] if not (dry_run or force or retry_of or readmission) and latest
+                            and latest["status"] == "failed" and not latest["dry_run"]
+                            and launch_lease.from_poll(repo.name, str(tid)) else "")
         except tracker.ERRORS as e:
             print(f"could not read {name}: {e}")
             return 2
@@ -1922,20 +1927,29 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             allow_reset = not (dry_run or retry_of)
             previous = "" if allow_reset and budget_admission.reset_time else parent
             repair_parent = "" if allow_reset and budget_admission.reset_repairs else parent
-            fresh = (bool(previous) and allow_reset and force and not restarting and not run.repairs
+            fresh = (bool(previous) and allow_reset and not restarting and not run.repairs
                      and not run.alone and not (flow and flow.continues))
-            current = tk.get(tid) if fresh else None
+            poll_retry = fresh and previous == poll_failure
+            forced_budget = fresh and force
+            current = tk.get(tid) if forced_budget else None
             answered_runs = ()
             if not dry_run and not only and not (flow and flow.refusal):
                 answered_runs = tuple(a["run"] for a in run.answers_due)
                 if run.answering and answer_text(run.answering["id"]).strip():
                     answered_runs += (run.answering["id"],)
+            new_budget = partial(runlimits.Budget, run, runlimits.Policy.of(layer), previous,
+                                 repair_previous=repair_parent, answered_runs=answered_runs,
+                                 wall_deadline=wall_deadline, checkpoint_timeout=0 if zte_grant else None,
+                                 checkpoint_gate=checkpoint_allowed if zte_grant else None, fixed_gaps=fixed_gaps)
+            budget_started = None
+            if poll_retry:
+                with handoff_io():
+                    run.budget = new_budget(poll_retry=True)
+                with run.budget.watching(admit=check_handoff if zte_grant else None, periodic=not zte_grant):
+                    current = tk.get(tid)
+                budget_started = run.budget.started
             with handoff_io():
-                run.budget = runlimits.Budget(run, runlimits.Policy.of(layer), previous, current, fresh,
-                                              repair_previous=repair_parent, answered_runs=answered_runs,
-                                              wall_deadline=wall_deadline, checkpoint_timeout=0 if zte_grant else None,
-                                              checkpoint_gate=checkpoint_allowed if zte_grant else None,
-                                              fixed_gaps=fixed_gaps)
+                run.budget = new_budget(current, forced_budget, poll_retry=poll_retry, started=budget_started)
             with run.budget.watching(admit=check_handoff if zte_grant else None,
                                      work_admitted=(lambda: drive_entered and checkpoint_allowed()) if zte_grant else None,
                                      periodic=not zte_grant):

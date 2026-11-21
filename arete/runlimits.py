@@ -339,10 +339,11 @@ idle_waits = budget_legacy.idle_waits
 
 class Budget:
     def __init__(self, run, policy: Policy, previous: str, ticket=None, forced: bool = False,
-                 *, repair_previous: str | None = None, answered_runs: tuple[str, ...] = (),
+                 *, poll_retry: bool = False, repair_previous: str | None = None, answered_runs: tuple[str, ...] = (),
                  wall_deadline: float = math.inf, checkpoint_timeout: float | None = None,
-                 checkpoint_gate=None, fixed_gaps: tuple[tuple[str, int], ...] = ()) -> None:
+                 checkpoint_gate=None, fixed_gaps: tuple[tuple[str, int], ...] = (), started: float | None = None) -> None:
         self.run, self.policy, self.wall_deadline = run, policy, wall_deadline
+        self.pending_specification = poll_retry and ticket is None
         self.checkpoint_timeout, self.checkpoint_gate = checkpoint_timeout, checkpoint_gate
         chain = family(previous)
         repair_chain = family(previous if repair_previous is None else repair_previous, repairs=True)
@@ -358,7 +359,8 @@ class Budget:
         fresh_feedback = (not run.dry_run and not run.alone and run.path == "orchestrate"
                           and insights_store.has_fresh_feedback(run.feedback))
         excluded = set(rows) if fresh_feedback else set()
-        if not (run.dry_run or fresh_feedback) and forced and current:
+        if not (run.dry_run or fresh_feedback) and current and (
+                forced or (poll_retry and specification_changed(metadata(previous, "budget.json"), current))):
             excluded = {rid for rid in rows if (found := recorded_specification(rid)) and found != current}
         left = [rid for rid in chain if rid in excluded]
         answer_omitted = repair_chain if not run.dry_run and set(answered_runs).intersection(repair_chain) else []
@@ -390,7 +392,7 @@ class Budget:
         self.verify_seconds += self.current_verification_seconds
         self.verification_active_since = None
         self.verify_started = None
-        self.started = time.monotonic() - active_seconds(run.id, own_row)
+        self.started = time.monotonic() - active_seconds(run.id, own_row) if started is None else started
         self.deadline = self.started + policy.max_run_minutes * 60 - self.prior_seconds
         self.verify_deadline = None
         self.specification = current or next(
@@ -412,6 +414,8 @@ class Budget:
                 for usage in self.charged.values():
                     usage["repair_calls"] = 0
         self.persist()
+        if self.pending_specification:
+            return
         omitted = ({"repair_left_out": answer_omitted, "reason": "owner answer"} if answer_omitted else {})
         run_lines.write(run.id, "budget_chain", charged=self.charged, **omitted)
         run.log("budget chain: " + ("; ".join(
@@ -504,7 +508,8 @@ class Budget:
 
         if admit:
             admit()
-        if self.run.path == "orchestrate" and self.run.feedback and not self.run.dry_run:
+        if (not self.pending_specification and self.run.path == "orchestrate"
+                and self.run.feedback and not self.run.dry_run):
             self.check_repairs()
         if self.run_deadline() <= time.monotonic():
             raise Parked(self.reason())
