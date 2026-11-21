@@ -5,6 +5,7 @@ import os
 import sys
 
 from .. import config, paths
+from ..store import db as foundation
 
 
 def piped_events() -> list[dict]:
@@ -90,13 +91,13 @@ def cmd_triage(args) -> int:
     else:
         code = 0
     if args.ref:
-        shown = triage.ticket(args.ref)
+        shown = triage.ticket(args.ref, connect=foundation.reader)
         if shown is None:
             print(f"no triage row for {args.ref}; `arete triage` lists them", file=sys.stderr)
             return 1
         print(shown)
     else:
-        print(triage.board())
+        print(triage.board(connect=foundation.reader))
     return code
 
 
@@ -130,7 +131,7 @@ def register(sub) -> None:
     p.add_argument("ref", nargs="?", default="", metavar="REF", help="show one ticket in full")
     p.add_argument("--refresh", action="store_true", help="triage what changed, then show the board")
     p.add_argument("--dry-run", action="store_true", help="list what a refresh would triage; no model calls, no writes")
-    p.set_defaults(fn=cmd_triage)
+    p.set_defaults(fn=cmd_triage, local_read=lambda args: not (args.refresh or args.dry_run))
 
     p = sub.add_parser("research", help="the reports arete writes for research tickets on the triage board")
     p.add_argument("ref", nargs="?", default="", metavar="REF", help="print one ticket's report")
@@ -140,7 +141,7 @@ def register(sub) -> None:
     p.add_argument("--next", action="store_true", help="research the next ticket due; what the research loop runs")
     p.add_argument("--dry-run", action="store_true",
                    help="say which ticket is due next, or with REF --run whether it would run; no model calls, no writes")
-    p.set_defaults(fn=cmd_research)
+    p.set_defaults(fn=cmd_research, local_read=lambda args: not (args.next or args.run or args.dry_run))
 
     p = sub.add_parser("poll", help="loop 3: run the pipeline on the oldest ready ticket in each pipeline repo")
     p.add_argument("--dry-run", action="store_true")
@@ -158,7 +159,7 @@ def register(sub) -> None:
     p.set_defaults(fn=cmd_audit)
 
     p = sub.add_parser("jira-check", help="read Jira with the configured token and count waiting tickets")
-    p.set_defaults(fn=cmd_jira_check)
+    p.set_defaults(fn=cmd_jira_check, local_read=True)
 
     p = sub.add_parser("eval", help="loop 4: run eval tasks (all repos with evals when REPO is left out); "
                                     "`eval mine [REPO]` writes tasks from merged arete PRs")

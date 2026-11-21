@@ -52,6 +52,7 @@ from .store import sources as source_store
 from .workspace import cleanup_worktrees
 
 MAX_STARTS_PER_POLL = 64
+FEEDBACK_PICK = "revising the PR for your review comments"
 SECRET_ASK_REPLY = "its ask holds a secret, which a tracker reply cannot answer; answer it on the dashboard"
 
 
@@ -105,7 +106,7 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
               other_routes: set[str], excluded: set[str] = frozenset(),
               recovered: tuple[tracker.Ticket, ...] = ()) -> Pick | None:
     excluded = excluded | oncall.parked(repo.name)
-    fresh = next_ticket(repo, tk, skips, other_routes, excluded, recovered)
+
     def eligible_again(tid):
         return (str(tid) not in excluded and not pilot.is_pilot_task(str(tid)) and not zte.reserved(str(tid))
                 and not run_store.issue_running(repo.name, tid))
@@ -114,13 +115,21 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
         return eligible_again(tid) and (not isinstance(tk, tracker.GitHubTracker) or tracker.is_task_id(tid)
                                         or not tk.in_zte_queue(str(tid)))
 
+    quiet_since = util.iso(util.now() - timedelta(minutes=pipeline.FEEDBACK_QUIET_MINUTES))
+    feedback_due = insights_store.feedback_due(repo.name, quiet_since)
     for tid in run_store.interrupted_tickets(repo.name):
         if (ordinary_history(tid) and (row := run_store.newest_live_whole_run(repo.name, tid))
                 and not environment_gaps.was_retry(row)):
+            if pipeline.recorded_path(row["id"]) not in ("feature", "patch"):
+                if tid in feedback_due:
+                    return Pick(tid, FEEDBACK_PICK, from_feedback=True)
+                if insights_store.has_new_feedback(pending_feedback(repo.name, tid)):
+                    excluded = excluded | {tid}
+                    continue
             return Pick(tid, "restarting after an interruption")
-    for tid in insights_store.feedback_due(repo.name, util.iso(util.now() - timedelta(minutes=pipeline.FEEDBACK_QUIET_MINUTES))):
+    for tid in feedback_due:
         if ordinary_history(tid):
-            return Pick(tid, "revising the PR for your review comments", from_feedback=True)
+            return Pick(tid, FEEDBACK_PICK, from_feedback=True)
     for source in ticket_queues(repo, tk):
         for t in source.replied():
             if not eligible_again(t.id):
@@ -132,6 +141,7 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
                 skips.note(tracker.ticket_name(repo.name, t.ref), t, blocker, repo.name)
                 continue
             return Pick(t.id, f"{t.title} (you replied to the question)")
+    fresh = next_ticket(repo, tk, skips, other_routes, excluded, recovered)
     return Pick(fresh.id, fresh.title, from_queue=True) if fresh else None
 
 
@@ -147,10 +157,13 @@ def step_without_route(cfg: config.Config, repo: config.Repo, ticket: tracker.Ti
             and not patching.specification_refusal(ticket)):
         first = ("build",)
     newest = run_store.newest_whole_run(repo.name, ticket.id)
-    if (layer.factory_path == pipeline.ADW and newest and newest["status"] == "interrupted"
+    feedback = pending_feedback(repo.name, ticket.id)
+    if pipeline.custom_feedback_fallback(cfg, mode, feedback):
+        first = ("build",)
+    elif (layer.factory_path == pipeline.ADW and newest and newest["status"] == "interrupted"
             and repaired_by(newest["id"])):
         first = ("review_repair",)
-    elif pending_feedback(repo.name, ticket.id):
+    elif feedback:
         source = next(iter(run_store.open_runs(repo.name, ticket.id)), None)
         if not source or pipeline.recorded_path(source["id"]) not in (pipeline.ORCHESTRATED, "orchestrate"):
             first = ("build",)
@@ -327,14 +340,20 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline
     if isinstance(source, tracker.GitHubTracker) and source.in_zte_queue(str(tid)):
         return "skipped"
     reply = tracker_reply(repo, source, str(tid), dry_run, from_queue=pick.from_queue, from_feedback=pick.from_feedback)
-    answering = not reply and pipeline.answered_run(repo.name, str(tid)) is not None
+    answered = pipeline.answered_run(repo.name, str(tid)) if not reply else None
+    answering = answered is not None
     if not answering and not reply and (waiting := held_back(cfg, repo.name, going, slots)):
         if not dry_run:
             source_store.pass_over(repo.name, str(tid))
         print(f"{util.iso()} {name}: waiting, {waiting}")
         return "held"
     ticket = source.get(tid)
-    blocked, readmission = runlimits.poll_admission(repo, str(tid), ticket, runlimits.Policy.of(layer))
+    fresh_feedback = False
+    if pick.from_feedback and not dry_run and insights_store.has_fresh_feedback(pending_feedback(repo.name, tid)):
+        mode = pipeline.recorded_path(answered["id"]) if answered else pipeline.dispatch_path(repo, str(tid))
+        fresh_feedback = mode in (pipeline.ORCHESTRATED, "orchestrate")
+    blocked, readmission = ("", None) if fresh_feedback else runlimits.poll_admission(
+        repo, str(tid), ticket, runlimits.Policy.of(layer))
     blocked = blocked or source.blocker(tid) or reply
     if not blocked:
         newest = run_store.newest_whole_run(repo.name, tid)

@@ -245,6 +245,7 @@ class Flow:
         self.carrying, self.carry = False, 0
         self.skipped, self.matching, self.done = 0, bool(continues or only), False
         self.redone, self.stepped = 0, False
+        self.work_started = False
         self.reopens = (bool(continues) and not only and again != OPENING and reopening(chained)
                         and bool(self.earlier) and self.earlier[0].get("step") == OPENING)
         if self.matching:
@@ -259,6 +260,8 @@ class Flow:
         if self.refusal:
             self.matching = False
             raise Refused(self.refusal)
+        if name == "revise" and (claim := getattr(self.ctx, "claim_revision_feedback", None)):
+            claim()
         if self.matching and name == self.renew:
             return self.renewed(name, args, kw)
         if not self.matching and self.carrying and (found := self.carried(name, kw)) is not None:
@@ -415,13 +418,15 @@ class Flow:
         try:
             labels = self.ctx.labels(name, kw)
         except Exception as e:
-            run_lines.write(self.run_id, "step_start", step=name, **{"try": n})
+            run_lines.write(self.run_id, "step_start", step=name, **{"try": n}, preflight=True)
             self.failed(name, n, e, calls, started, kw)
             raise
         began = ({"tree": os.path.abspath(kw["tree"]), "fingerprint": fingerprint(kw["tree"])}
                  if name == self.only and kw.get("tree") else {})
         run_lines.write(self.run_id, "step_start", step=name, **{"try": n}, **labels, **began)
         try:
+            if name != "respond":
+                self.work_started = True
             outcome = self.call(name, calls, args, kw)
         except owner_asks.Asked as e:
             outcome = Outcome("ask", feedback=owner_asks.summary(e.sent), data={"ask_ids": e.ask_ids, "call": e.call},

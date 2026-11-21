@@ -24,13 +24,13 @@ from unittest import mock
 
 from adws import single_worker
 from arete import (
-    api_check, ci, config, diffguard, evals, factory, flows, gh, jev, journeys, loop_run, mergecheck, miner,
+    api_check, ci, codex, config, diffguard, evals, factory, flows, gh, jev, journeys, loop_run, mergecheck, miner,
     orchestration, outcomes, owner_asks, paths, pipeline, poll, queueing, runlimits, sandbox, serve, tracker, util,
     verify, workspace,
 )
 from arete.agent import NO_SESSION, Result
 from arete.orchestration_api import OPERATIONS
-from arete.review import Review
+from arete.review import Review, catch_up_problems
 from arete.store import db, orchestration as ledger
 from tests.parallel import stack_env
 
@@ -224,6 +224,332 @@ class PublicationFixture(unittest.TestCase):
             controller.stamp("checks", {"full": True})
             controller.stamp("review", job.review.asdict())
         return job
+
+
+class UnchangedHeadCIRetryTests(PublicationFixture):
+    def setUp(self):
+        super().setUp()
+        self.record_pushed_head()
+        c, controller = self.checkout, self.controller
+        pushed_tree = factory.fingerprint(c.wt)
+        self.assertTrue(pushed_tree)
+        self.enterContext(mock.patch.object(factory, "fingerprint", return_value=pushed_tree))
+        repo = config.Repo("fixture", self.root, parts=[config.Part("", c.github)])
+        job = self.publication_job(repo, "arete/7-edit-fixture", verified=verify.Verified("pass"))
+        job.changed = job.opened = [c.github]
+        job.b.layer.trust_level = "automerge"
+        controller.stamp("verify", {"verdict": "pass"})
+
+        api = f"repos/{c.github}"
+        self.run_path = f"{api}/actions/runs/456"
+        self.workflow_runs_path = f"{api}/actions/runs?event=pull_request&head_sha={c.lease}&per_page=100"
+        self.jobs_path = f"{self.run_path}/attempts/3/jobs?per_page=100"
+        self.failed_job_path = f"{api}/actions/jobs/123"
+        self.failed = self.actions_job(123, 456, 2, "failure")
+        self.head_checks = [self.failed]
+        self.other_pr_check = self.actions_job(200, 789, 1, "success")
+        self.original_run = self.actions_run(456, 7, 2, "completed", "failure")
+        self.other_pr_run = self.actions_run(789, 8, 1, "completed", "failure")
+        self.workflow_runs = [self.original_run]
+
+        def transport(args, **options):
+            endpoint = args[1]
+            if endpoint == self.failed_job_path:
+                return self.failed
+            if endpoint == f"{api}/actions/jobs/200":
+                return self.other_pr_check
+            if endpoint == f"{api}/actions/runs/789":
+                return self.other_pr_run
+            if endpoint.startswith(f"{api}/actions/jobs/"):
+                return next(row for row in self.head_checks if row["id"] == int(endpoint.rsplit("/", 1)[1]))
+            if endpoint == self.workflow_runs_path:
+                return [{"workflow_runs": self.workflow_runs}]
+            if endpoint == self.run_path:
+                return self.actions_run(456, 7, *next(self.run_snapshots))
+            if endpoint == f"{self.run_path}/attempts/3":
+                return self.exact_attempt
+            if endpoint == f"{self.run_path}/attempts/2/jobs?per_page=100":
+                return [{"jobs": [self.failed]}]
+            if endpoint == self.jobs_path:
+                return [{"jobs": next(self.job_snapshots)}]
+            if endpoint.startswith(f"{api}/commits/{c.lease}/check-runs?"):
+                return [{"check_runs": self.head_checks}]
+            if endpoint.startswith(f"{api}/commits/base/check-runs?"):
+                return [{"check_runs": []}]
+            if "/statuses?" in endpoint:
+                return [[]]
+            self.fail(f"unexpected GitHub endpoint {endpoint}")
+
+        self.enterContext(mock.patch.object(gh, "branch_sha", return_value="base"))
+        self.enterContext(mock.patch.object(gh, "pr_merge_details", return_value={
+            "state": "OPEN", "headRefOid": c.lease, "baseRefName": c.base, "mergeable": "MERGEABLE",
+        }))
+        self.enterContext(mock.patch.object(ci, "SETTLE_SECONDS", 0))
+        self.sleep = self.enterContext(mock.patch.object(ci.time, "sleep"))
+        self.enterContext(mock.patch.object(controller, "ci_failures", return_value="checks failed"))
+        self.enterContext(mock.patch.object(pipeline, "publish_ci"))
+        self.enterContext(mock.patch.object(pipeline, "release_workspace"))
+        self.enterContext(mock.patch.object(pipeline, "record_prs", return_value=c.pr))
+        self.github = self.enterContext(mock.patch.object(gh, "gh_json", side_effect=transport))
+        self.command = self.enterContext(mock.patch.object(gh, "gh"))
+        self.draft = True
+
+        def set_draft(pr, draft):
+            self.assertEqual(pr, c.pr)
+            self.draft = draft
+
+        self.set_draft = self.enterContext(mock.patch.object(gh, "pr_set_draft", side_effect=set_draft))
+        self.enterContext(mock.patch.object(gh, "pr_draft_and_head", side_effect=lambda _: (self.draft, c.lease)))
+        self.merge = self.enterContext(mock.patch.object(pipeline, "try_automerge", return_value=None))
+        self.record_ci_failure()
+
+        for obj, name in ((job.b, "restage"), (job.b, "require_valid_diff"),
+                          (controller, "validate_publication_diff"), (pipeline, "commit_and_push")):
+            call = self.enterContext(mock.patch.object(obj, name, side_effect=AssertionError(f"unexpected {name}")))
+            self.addCleanup(call.assert_not_called)
+
+    def record_ci_failure(self):
+        controller, c = self.controller, self.checkout
+        self.assertIn("error", controller.publication_ci([c]))
+        self.assertEqual(controller.data["published_tree"], controller.fingerprint())
+        self.assertTrue(controller.data["ci_failed"])
+
+    def actions_run(self, run, pr, attempt, status, conclusion, *, workflow_id=99):
+        return {"id": run, "head_sha": self.checkout.lease, "workflow_id": workflow_id, "run_number": run,
+                "event": "pull_request", "pull_requests": [{"number": pr}],
+                "run_attempt": attempt, "status": status, "conclusion": conclusion}
+
+    def actions_job(self, job, run, attempt, conclusion, name="arete-checks"):
+        return {"id": job, "run_id": run, "run_attempt": attempt, "head_sha": self.checkout.lease,
+                "name": name, "status": "completed", "conclusion": conclusion,
+                "app": {"id": gh.GITHUB_ACTIONS_APP_ID, "slug": "github-actions"}}
+
+    def request_retry(self, action=None):
+        waits = self.controller.run.waiting.call_args_list[:]
+        self.assertIsNone(self.controller.dispatch(action or self.action))
+        self.command.assert_called_once_with(["run", "rerun", "456", "--failed", "--repo", self.checkout.github],
+                                             write=True)
+        self.assertEqual(self.controller.run.waiting.call_args_list, [*waits, mock.call("ci")])
+
+    def complete_retry(self, conclusion):
+        self.head_checks.append(self.other_pr_check)
+        previous, finished = (2, "completed", "failure"), (3, "completed", conclusion)
+        self.run_snapshots = iter([previous, (3, "in_progress", None), finished, finished, finished])
+        lagging_jobs = [[], [self.actions_job(124, 456, 2, "success")]] if conclusion == "success" else []
+        self.job_snapshots = iter([*lagging_jobs, [self.actions_job(125, 456, 3, conclusion)]])
+
+        def still_waiting(_):
+            self.assertTrue(self.draft)
+            self.merge.assert_not_called()
+
+        self.sleep.side_effect = still_waiting
+        self.request_retry()
+        self.assertEqual(self.sleep.call_count, 2 + len(lagging_jobs))
+
+    def test_publication_request_reruns_failed_jobs_and_resumes_publication_after_green_ci(self):
+        def merge(*args, **kwargs):
+            self.assertFalse(self.draft)
+
+        self.merge.side_effect = merge
+        self.complete_retry("success")
+        self.merge.assert_called_once()
+        self.assertEqual(self.controller.ending[0], "pr")
+        self.assertNotIn("ci_failed", self.controller.data)
+        self.assertEqual(self.transition.call_args.args[2], "succeeded")
+
+    def test_second_red_on_the_same_head_fails_publication_with_the_exact_reason(self):
+        self.complete_retry("failure")
+        self.assertEqual(self.controller.data["ci_retry"]["targets"][self.checkout.github]["jobs"], [125])
+        self.assert_second_red()
+
+    def test_unchanged_request_resumes_timed_out_rerun_and_reports_its_failure(self):
+        self.run_snapshots = iter([(3, "in_progress", None), (3, "completed", "failure")])
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "failure")]])
+        with mock.patch.object(ci, "WAIT_SECONDS", 0):
+            self.request_retry()
+        self.assert_retry_held()
+
+        self.controller.data = json.loads(json.dumps(self.controller.data))
+        verify_evidence = self.controller.data["evidence"]["verify"]
+        with mock.patch.dict(verify_evidence, tree="stale"):
+            stale_action = {**self.action, "id": "d0002-1"}
+            self.assertEqual(str(self.controller.dispatch(stale_action)), "publication needs current evidence: verify")
+        self.assert_second_red()
+        self.assertEqual(self.controller.run.waiting.call_args_list, [mock.call("ci")] * 3)
+
+    def test_unchanged_request_resumes_timed_out_rerun_and_publishes_on_green(self):
+        self.run_snapshots = iter([(3, "in_progress", None), (3, "completed", "success")])
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "success")]])
+        with mock.patch.object(ci, "WAIT_SECONDS", 0):
+            self.request_retry()
+        self.assert_retry_held()
+
+        self.assertIsNone(self.controller.dispatch({**self.action, "id": "d0002-0"}))
+        self.command.assert_called_once()
+        self.merge.assert_called_once()
+        self.assertFalse(self.draft)
+        self.assertNotIn("ci_retry", self.controller.data)
+
+    def assert_second_red(self):
+        self.assertIsNone(self.controller.ending)
+        self.assertTrue(self.draft)
+        next_action = {**self.action, "id": "d0002-0"}
+        self.assertIsNone(self.controller.dispatch(next_action))
+        reason = f"CI failed twice on the unchanged head {self.checkout.lease}"
+        self.assertEqual(self.controller.ending, ("failed", reason, self.checkout.pr))
+        self.transition.assert_called_with(self.controller.lease, next_action["id"], "failed", {"error": reason})
+        self.command.assert_called_once()
+        self.merge.assert_not_called()
+
+    def test_completed_attempt_without_the_replacement_job_keeps_publication_blocked(self):
+        self.head_checks.append(self.other_pr_check)
+        self.run_snapshots = iter([(3, "completed", "success")])
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "success", name="other-job")]])
+        with mock.patch.object(ci, "WAIT_SECONDS", 0):
+            self.request_retry()
+        self.assertTrue(self.controller.data["ci_failed"])
+        self.assertIsNone(self.controller.ending)
+        self.assertTrue(self.draft)
+        self.merge.assert_not_called()
+
+    def test_failed_attempt_without_the_replacement_job_counts_as_second_red(self):
+        self.run_snapshots = iter([(3, "completed", "failure")])
+        self.job_snapshots = iter([[]])
+        with mock.patch.object(ci, "WAIT_SECONDS", 0):
+            self.request_retry()
+        reds = self.controller.ci_failures.call_args.args[0].reds
+        self.assertEqual([r.check.description for r in reds], ["Workflow attempt 3 concluded failure"])
+        self.assert_second_red()
+
+    def test_newer_pending_attempt_keeps_publication_draft_after_the_requested_attempt_passes(self):
+        self.run_snapshots = iter([(4, "in_progress", None)])
+        self.exact_attempt = self.actions_run(456, 7, 3, "completed", "success")
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "success")]])
+        pending = self.actions_job(126, 456, 4, None)
+        self.head_checks.append({**pending, "status": "in_progress"})
+        with mock.patch.object(ci, "WAIT_SECONDS", 0):
+            self.request_retry()
+        self.assert_retry_held()
+        watched, = self.controller.ci_failures.call_args.args[0].seen
+        self.assertFalse(watched.read)
+        self.assertEqual([check.source for check in watched.in_state("pending")], ["workflow:456"])
+
+    def test_newer_failed_attempt_keeps_publication_draft_after_another_check_finishes(self):
+        independent = self.actions_job(300, 789, 1, None, name="independent")
+        self.head_checks.append({**independent, "status": "in_progress"})
+        self.run_snapshots = iter([(3, "completed", "success"), (4, "completed", "failure")])
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "success")]])
+
+        def finish_checks(_):
+            self.head_checks = [self.actions_job(126, 456, 4, "failure"),
+                                {**independent, "conclusion": "success"}]
+
+        self.sleep.side_effect = finish_checks
+        self.request_retry()
+        self.sleep.assert_called_once()
+        self.assert_retry_held()
+        reds = self.controller.ci_failures.call_args.args[0].reds
+        self.assertEqual([r.check.description for r in reds], ["Workflow attempt 4 concluded failure"])
+
+    def test_newer_run_of_the_same_workflow_keeps_publication_draft(self):
+        self.run_snapshots = iter([(3, "completed", "success")])
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "success")]])
+
+        def start_newer_run(*args, **kwargs):
+            self.workflow_runs.append(self.actions_run(457, 7, 1, "completed", "failure"))
+
+        self.command.side_effect = start_newer_run
+        self.request_retry()
+        self.assert_retry_held()
+        reds = self.controller.ci_failures.call_args.args[0].reds
+        self.assertEqual([r.check.source for r in reds], ["workflow:457"])
+
+    def assert_newer_check_from_separate_workflow_holds_publication(self, status, conclusion, state):
+        separate = self.actions_run(458, 7, 2, status, conclusion, workflow_id=100)
+        self.run_snapshots = iter([(3, "completed", "success")])
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "success")]])
+
+        def rerun_requested(*args, **kwargs):
+            self.workflow_runs.append(separate)
+            self.head_checks.append({**self.actions_job(127, 458, 2, conclusion), "status": status})
+
+        self.command.side_effect = rerun_requested
+        with mock.patch.object(ci, "WAIT_SECONDS", 0):
+            self.request_retry()
+        self.assert_retry_held()
+        watched, = self.controller.ci_failures.call_args.args[0].seen
+        self.assertEqual([check.job for check in watched.in_state(state)], [127])
+        self.assertEqual([check.job for check in watched.in_state("pass")], [125])
+
+    def test_newer_red_check_from_separate_same_name_workflow_keeps_publication_draft(self):
+        self.assert_newer_check_from_separate_workflow_holds_publication("completed", "failure", "fail")
+
+    def test_newer_pending_check_from_separate_same_name_workflow_keeps_publication_draft(self):
+        self.assert_newer_check_from_separate_workflow_holds_publication("in_progress", None, "pending")
+
+    def assert_retry_held(self):
+        self.assertTrue(self.draft)
+        self.assertNotIn(mock.call(self.checkout.pr, False), self.set_draft.call_args_list)
+        self.merge.assert_not_called()
+        self.assertIsNone(self.controller.ending)
+        self.assertTrue(self.controller.data.get("ci_failed"))
+
+    def test_newer_same_name_failure_on_another_pr_never_spends_this_prs_retry(self):
+        self.other_pr_check["conclusion"] = "failure"
+        self.head_checks.append(self.other_pr_check)
+        self.record_ci_failure()
+        self.assertEqual(self.controller.data["ci_retry"]["targets"][self.checkout.github]["jobs"], [200])
+        self.workflow_runs = [self.other_pr_run]
+        refusal = self.controller.dispatch(self.action)
+        self.assertEqual(str(refusal), "the failed CI has no GitHub Actions jobs to rerun")
+        self.command.assert_not_called()
+        self.assertFalse(self.controller.data["ci_retried_heads"])
+
+        self.workflow_runs.append(self.original_run)
+        self.run_snapshots = iter([(3, "completed", "success")])
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "success")]])
+        self.merge.side_effect = lambda *args, **kwargs: setattr(self, "draft", False)
+        self.request_retry({**self.action, "id": "d0002-0"})
+        self.github.assert_any_call(["api", f"repos/{self.checkout.github}/actions/jobs/200"])
+        self.merge.assert_called_once()
+
+    def test_failed_rerun_replaces_a_stale_skipped_dependent_check(self):
+        self.head_checks.append(self.actions_job(124, 456, 2, "skipped", name="dependent"))
+        self.run_snapshots = iter([(3, "completed", "failure")])
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "success"),
+                                    self.actions_job(126, 456, 3, "failure", name="dependent")]])
+        self.request_retry()
+        reds = self.controller.ci_failures.call_args.args[0].reds
+        self.assertEqual([(r.check.name, r.check.job) for r in reds], [("dependent", 126)])
+        self.assert_second_red()
+
+    def test_failed_workflow_conclusion_blocks_publication_when_the_rerun_job_passed(self):
+        self.run_snapshots = iter([(4, "completed", "success")])
+        self.exact_attempt = self.actions_run(456, 7, 3, "completed", "failure")
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "success")]])
+        self.request_retry()
+        reds = self.controller.ci_failures.call_args.args[0].reds
+        self.assertEqual([r.check.description for r in reds], ["Workflow attempt 3 concluded failure"])
+        self.assert_second_red()
+
+    def test_confirmed_second_red_is_kept_when_an_independent_check_times_out(self):
+        pending = self.actions_job(200, 789, 1, None, name="independent")
+        self.head_checks.append({**pending, "status": "in_progress"})
+        self.run_snapshots = iter([(3, "completed", "failure")])
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "failure")]])
+        with mock.patch.object(ci, "WAIT_SECONDS", 0):
+            self.request_retry()
+        watched, = self.controller.ci_failures.call_args.args[0].seen
+        self.assertFalse(watched.read)
+        self.assertEqual([check.name for check in watched.in_state("pending")], ["independent"])
+        self.assertEqual(self.controller.data["ci_retry"]["targets"][self.checkout.github]["jobs"], [125])
+        self.assert_second_red()
+
+    def test_publication_retry_requires_current_verification(self):
+        self.controller.data["evidence"]["verify"]["tree"] = "stale"
+        refusal = self.controller.dispatch(self.action)
+        self.assertEqual(str(refusal), "publication needs current evidence: verify")
+        self.command.assert_not_called()
 
 
 class SingleWorkerPublicationTests(PublicationFixture):
@@ -861,13 +1187,17 @@ class FirstUseResolverScratchTests(SharedResolverScratchFixture):
 
 
 class CatchUpRepairFixture(PublicationFixture):
-    def prepare_publication(self, gate, *, spent=False, move_base_again=False):
+    def prepare_publication(self, gate, *, spent=False, move_base_again=False, conflict=False,
+                            implementation="implementation\n", resolution="resolved implementation\n", edit_base=None):
         c, b, controller = self.checkout, self.build, self.controller
         branch = "arete/7-edit-fixture"
         self.git("branch", branch)
         incoming = self.root / "incoming.txt"
         incoming.write_text("new base\n" * 100)
-        self.commit("base moved", "incoming.txt")
+        if conflict:
+            self.file.write_text(self.file.read_text().replace("base\n", "base implementation\n", 1))
+        extra = edit_base() if edit_base else ()
+        self.commit("base moved", "incoming.txt", "file.txt", *extra)
         self.base = self.git("rev-parse", "HEAD")
         next_base = ""
         if move_base_again:
@@ -875,7 +1205,7 @@ class CatchUpRepairFixture(PublicationFixture):
             self.commit("base moved again", "incoming.txt")
             next_base = self.git("rev-parse", "HEAD")
         self.git("switch", "-q", branch)
-        self.file.write_text("implementation\n")
+        self.file.write_text(implementation)
         repo = config.Repo("fixture", self.root, github=c.github, parts=[config.Part("", c.github)])
         b.layer.trust_level, b.layer.verify, b.layer.checks = "automerge", config.Verify(), {"local": "check"}
         b.layer.max_diff_lines = 20
@@ -906,7 +1236,8 @@ class CatchUpRepairFixture(PublicationFixture):
         self.pushes, self.ci_heads, self.labels, self.comments = [], [], set(), []
         self.message = {"checks": "local check output from the merged base",
                         "verify": "verification reproduced the bug on the merged base",
-                        "review": "review found a blocker specific to the merged base"}[gate]
+                        "review": "review found a blocker specific to the merged base",
+                        "unrelated": "the approved implementation has an unrelated problem"}[gate]
         fingerprints = {}
         git_fingerprint = factory.fingerprint
 
@@ -919,7 +1250,7 @@ class CatchUpRepairFixture(PublicationFixture):
         self.enterContext(mock.patch.object(factory, "fingerprint", side_effect=fingerprint))
 
         def holds():
-            return incoming.exists() and self.file.read_text() == "implementation\n"
+            return incoming.exists() and self.file.read_text() == implementation
 
         def check(*_, **__):
             return (False, self.message) if gate == "checks" and holds() else (True, "local checks passed")
@@ -931,14 +1262,31 @@ class CatchUpRepairFixture(PublicationFixture):
                 {"what": "fixture behavior", "how": "read fixture", "saw": summary, "passed": not failed}],
                 native_trees=pipeline.verification_trees(b) if trees is None else trees)
 
-        def review(*_, trees=None, **__):
-            if gate == "review" and holds():
-                result = {"verdict": "request_changes", "summary": "catch-up review holds", "problems": [
-                    {"file": "file.txt", "severity": "blocker", "category": "issue", "problem": self.message}]}
-            else:
-                result = {"verdict": "approve", "summary": "approved on the new base" if incoming.exists()
-                          else "pre-catch-up review"}
-            return Review.stored({**result, "trees": pipeline.verification_trees(b) if trees is None else trees})
+        real_review = pipeline._review
+
+        def review(*args, catch_up=None, **kwargs):
+            if catch_up is not None:
+                return real_review(*args, catch_up=catch_up, **kwargs)
+            return Review.judged({"summary": "approved on the new base", "problems": []}, [], [],
+                                 pipeline.verification_trees(b))
+
+        def review_answer(*_, **__):
+            problems = []
+            if gate in ("review", "unrelated") and holds():
+                finding = {"file": "file.txt", "severity": "blocker", "category": "issue", "problem": self.message}
+                if gate == "review":
+                    finding["attribution"] = {"part": "base", "file": "incoming.txt", "line": 1}
+                problems.append(finding)
+            return Result(ok=True, structured={"summary": "Reviewed the moved base.", "problems": problems})
+
+        self.review_agent = self.enterContext(mock.patch.object(run, "agent", side_effect=review_answer))
+
+        if conflict:
+            def resolve(*_):
+                self.file.write_text(resolution)
+                self.commit("Resolve fixture conflict")
+
+            self.enterContext(mock.patch.object(pipeline, "resolve_conflicts", side_effect=resolve))
 
         def git(args, cwd, **kw):
             if args[0] != "push":
@@ -1002,7 +1350,8 @@ class CatchUpRepairFixture(PublicationFixture):
             self.enterContext(mock.patch.multiple(module, **replacements))
         trees = pipeline.verification_trees(b)
         job.verified = verification(trees=trees)
-        job.review = review(trees=trees)
+        job.review = Review.judged({"summary": "pre-catch-up review", "problems": [
+            {"file": "file.txt", "severity": "minor", "problem": "Earlier approved note"}]}, [], [], trees)
         b.report = "local checks passed"
         b.checked = {"tree": trees[c.prefix], "commands": b.layer.checks, "report": b.report}
         with mock.patch.object(controller, "fingerprint", return_value=ledger.digest({c.github: trees[c.prefix]})):
@@ -1038,6 +1387,8 @@ class CatchUpRepairFixture(PublicationFixture):
         self.assertEqual(self.git("merge-base", candidate, self.base), self.base)
         self.assertEqual(self.git("merge-base", candidate, self.head), self.head)
         self.assertIn(f"held on {gate}", self.body)
+        if gate == "review":
+            self.assertIn("base change at incoming.txt:1 (after)", self.body)
         self.assertIn("Closes #7", self.body)
         self.assertIn("Keep this.", self.body)
         self.assertNotIn("pre-catch-up review", self.body)
@@ -1122,6 +1473,393 @@ class CatchUpRepairFixture(PublicationFixture):
 class CatchUpReviewRepairTests(CatchUpRepairFixture):
     def test_review_hold_repairs_and_automerge_closes_ticket(self):
         self.repair_and_publish("review", "review_repair")
+
+
+class CatchUpReviewTests(CatchUpRepairFixture):
+    def test_catch_up_requires_approval_for_the_pushed_tree(self):
+        self.record_pushed_head()
+        c = self.checkout
+        prior = Review("approve", trees={"": self.git("rev-parse", "origin/main^{tree}")})
+        push = mock.Mock()
+        with (mock.patch.object(pipeline, "merge_moved_bases") as merge,
+              self.assertRaisesRegex(workspace.RunFailed, "lacks a current approving review")):
+            pipeline.catch_up_base(self.build, c, "fixture", self.git("rev-parse", "origin/main"), "", "", prior,
+                                   before_push=push)
+        merge.assert_not_called()
+        push.assert_not_called()
+        self.assertEqual(self.git("rev-parse", "HEAD"), c.lease)
+
+    def test_prompt_includes_approval_and_separates_base_from_resolution(self):
+        self.prepare_publication("review", conflict=True)
+        prior_trees = self.controller.job.review.trees
+        self.review_agent.side_effect = None
+        self.review_agent.return_value = Result(ok=True, structured={
+            "summary": "The resolution lost behavior.",
+            "problems": [{"severity": "blocker", "category": "regression", "file": "file.txt",
+                          "problem": "The conflict resolution changed the output.",
+                          "attribution": {"part": "resolution", "file": "file.txt", "line": 1}}],
+        })
+        action = self.action_result("publication.request")
+        self.assertEqual(action["result"]["failures"], orchestration.CATCH_UP_FAILURE)
+        self.assertIn("resolution change at file.txt:1 (after)", self.body)
+        self.review_agent.assert_called_once()
+        prompt = self.review_agent.call_args.args[1]
+        approval, _, deltas = prompt.partition("## Approved diff")
+        self.assertIn(self.head, approval)
+        self.assertIn('"verdict": "approve"', approval)
+        self.assertIn("pre-catch-up review", approval)
+        self.assertIn("Earlier approved note", approval)
+        self.assertIn(prior_trees[""], approval)
+        approved, _, deltas = deltas.partition("## Base changes")
+        base, _, resolution = deltas.partition("## Conflict-resolution changes")
+        self.assertIn("\n+implementation\n", approved)
+        self.assertIn("\n+base implementation\n", base)
+        self.assertIn("\n+new base\n", base)
+        self.assertNotIn("resolved implementation", base)
+        self.assertIn("\n+resolved implementation\n", resolution)
+        self.assertNotIn("\n+new base\n", resolution)
+
+    def test_base_executable_bit_regression_holds_for_direct_and_dependent_citations(self):
+        self.git("config", "core.fileMode", "true")
+        helper = self.root / "helper tool"
+        helper.write_text("#!/bin/sh\nprintf 'worked\\n'\n")
+        helper.chmod(0o755)
+        self.commit("add executable helper", helper.name)
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+
+        def remove_executable_bit():
+            helper.chmod(0o644)
+            return (helper.name,)
+
+        def invoke_caller():
+            return subprocess.run(["/bin/sh", self.file.name], cwd=self.root, capture_output=True, text=True)
+
+        self.prepare_publication("review", implementation="exec './helper tool'\n", edit_base=remove_executable_bit)
+        self.assertEqual(invoke_caller().stdout, "worked\n")
+        mode = {"file": helper.name}
+        finding = {"file": "file.txt", "problem": "The helper gets permission denied.",
+                   "severity": "blocker", "category": "regression"}
+
+        def review(*_args, **_kwargs):
+            self.assertEqual(invoke_caller().returncode, 126)
+            return Result(ok=True, structured={"summary": "The caller stopped working.", "problems": [
+                {**finding, "attribution": {"part": "base", **mode}},
+                {**finding, "attribution": {"part": "approved", "file": "file.txt", "line": 1,
+                                            "base_change": mode, "dependency": "The caller executes the helper directly."}},
+            ]})
+
+        self.review_agent.side_effect = review
+        action = self.action_result("publication.request")
+        self.assertEqual(action["result"]["failures"], orchestration.CATCH_UP_FAILURE)
+        change = "base change at helper tool"
+        self.assertIn(f"permission denied. ({change})", self.body)
+        self.assertIn(f"approved change at file.txt:1 (after) depends on {change}", self.body)
+        self.assertEqual(len(self.pushes), 1)
+        self.assertFalse(self.merged)
+
+    def test_read_only_reviewer_can_cite_resolution_hunk_omitted_from_prompt(self):
+        context = "unchanged\n" * 8
+        remainder = f"{context}old middle\n{context}old last\n"
+        self.file.write_text("base\n" + remainder)
+        self.commit("add context")
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        padding = "x" * (pipeline.MAX_FIX_DIFF_IN_PROMPT // 2 + 100)
+        omitted = "resolver broke the middle output"
+        resolution = f"head {padding}\n{context}{omitted}\n{context}tail {padding}\n"
+        self.prepare_publication("review", conflict=True, implementation="implementation\n" + remainder,
+                                 resolution=resolution)
+        patch_path = None
+
+        def review(_step, prompt, cwd, *, allowed_tools, **_):
+            nonlocal patch_path
+            self.assertNotIn(omitted, prompt)
+            self.assertNotIn("--remerge-diff", prompt)
+            self.assertFalse(codex.writes(None, allowed_tools))
+            notice = "The resolution excerpt is truncated. Read the full patch at `"
+            self.assertIn(notice, prompt)
+            name = prompt.split(notice, 1)[1].split("`", 1)[0]
+            patch_path = cwd / name
+            command = ["cat", name]
+            self.assertEqual(codex.guard_reason({"tool_name": "Bash", "tool_input": {"command": command},
+                                                 "cwd": str(cwd)}, False, []), "")
+            patch = subprocess.run(command, cwd=cwd, check=True, capture_output=True, text=True).stdout
+            self.assertGreater(len(patch), pipeline.MAX_FIX_DIFF_IN_PROMPT)
+            self.assertEqual(patch.count("\n@@ "), 3)
+            self.assertIn(f"\n+{omitted}\n", patch)
+            return Result(ok=True, structured={"summary": "The resolution changed the middle output.", "problems": [
+                {"severity": "blocker", "category": "regression", "file": "file.txt", "problem": omitted,
+                 "attribution": {"part": "resolution", "file": "file.txt", "line": 10}},
+            ]})
+
+        self.review_agent.side_effect = review
+        action = self.action_result("publication.request")
+        self.assertEqual(action["result"].get("failures"), orchestration.CATCH_UP_FAILURE,
+                         self.build.run.log.call_args_list)
+        self.assertIn(f"{omitted} (resolution change at file.txt:10 (after))", self.body)
+        self.review_agent.assert_called_once()
+        self.assertFalse(patch_path.exists())
+        self.assertEqual(len(self.pushes), 1)
+        self.assertFalse(self.merged)
+
+    def test_unrelated_blocker_becomes_pr_note_and_merged_tree_is_approved(self):
+        self.prepare_publication("unrelated")
+        self.build.steps["review"] = 1
+        action = self.action_result("publication.request")
+        self.assertEqual(action["state"], "succeeded")
+        self.assertTrue(self.merged)
+        self.assertEqual(self.ci_heads, self.pushes)
+        self.assertEqual(len(self.pushes), 2)
+        self.assertNotEqual(self.git("rev-parse", f"{self.pushes[0]}^{{tree}}"), self.git("rev-parse", "HEAD^{tree}"))
+        review = self.controller.job.review
+        self.assertTrue(review.approved())
+        self.assertEqual(review.trees, {"": self.git("rev-parse", "HEAD^{tree}")})
+        self.assertIn(f"{self.message} (found on catch-up)", self.body)
+        self.assertIn("### Review notes", self.body)
+        self.assertIn("Keep this.", self.body)
+        self.review_agent.assert_called_once()
+        self.assertEqual(self.review_agent.call_args.args[0], "review2")
+        self.assertEqual(self.review_agent.call_args.kwargs["role"], "review")
+        self.assertEqual(self.build.steps["review"], 2)
+
+
+class CatchUpReviewSafetyTests(CatchUpRepairFixture):
+    def prepare_renamed_helpers(self):
+        renames = {"base": ("base helper.txt", "moved helper.txt"),
+                   "resolution": ("resolution helper.txt", "resolved\thelper.txt")}
+        for part, (old, _) in renames.items():
+            (self.root / old).write_text(f"{part} helper behavior\n")
+        self.commit("add helpers", *(old for old, _ in renames.values()))
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+
+        def rename(part):
+            old, new = renames[part]
+            (self.root / old).rename(self.root / new)
+            return old, new
+
+        implementation = 'load("base helper.txt", "resolution helper.txt")\n'
+        self.prepare_publication("review", conflict=True, implementation=implementation, resolution=implementation,
+                                 edit_base=lambda: rename("base"))
+        resolve = pipeline.resolve_conflicts
+
+        def resolve_with_rename(*args):
+            self.git("add", "--", *rename("resolution"))
+            resolve(*args)
+
+        self.enterContext(mock.patch.object(pipeline, "resolve_conflicts", side_effect=resolve_with_rename))
+        return renames
+
+    def test_rename_only_changes_hold_for_direct_and_dependent_citations(self):
+        renames = self.prepare_renamed_helpers()
+        caller = {"part": "approved", "file": "file.txt", "line": 1,
+                  "dependency": "The approved caller still loads the old path."}
+
+        def review(_step, prompt, _cwd, **_):
+            self.assertIn("similarity index 100%\nrename from base helper.txt\nrename to moved helper.txt", prompt)
+            self.assertIn('similarity index 100%\nrename from resolution helper.txt\nrename to "resolved\\thelper.txt"',
+                          prompt)
+            finding = {"file": "file.txt", "severity": "blocker", "category": "regression"}
+            problems = [{**finding, "problem": f"Direct {part} rename finding.",
+                         "attribution": {"part": part, "file": new}} for part, (_, new) in renames.items()]
+            problems.append({**finding, "problem": "Dependent base rename finding.",
+                             "attribution": {**caller, "base_change": {"file": renames["base"][0]}}})
+            return Result(ok=True, structured={"summary": "The old paths no longer resolve.", "problems": problems})
+
+        self.review_agent.side_effect = review
+        action = self.action_result("publication.request")
+        self.assertEqual(action["result"].get("failures"), orchestration.CATCH_UP_FAILURE)
+        for part, (_, new) in renames.items():
+            self.assertIn(f"Direct {part} rename finding. ({part} change at {new})", self.body)
+        self.assertIn("Dependent base rename finding. (approved change at file.txt:1 (after) "
+                      "depends on base change at base helper.txt", self.body)
+        self.assertEqual(len(self.pushes), 1)
+        self.assertFalse(self.merged)
+
+    def test_incorrect_rename_citations_become_pr_notes(self):
+        renames = self.prepare_renamed_helpers()
+        base, resolution = renames["base"][1], renames["resolution"][1]
+        caller = {"part": "approved", "file": "file.txt", "line": 1, "dependency": "The caller uses the helper."}
+        citations = [
+            {"part": "base", "file": resolution},
+            {"part": "resolution", "file": base},
+            {**caller, "base_change": {"file": resolution}},
+        ]
+        self.review_agent.side_effect = None
+        self.review_agent.return_value = Result(ok=True, structured={
+            "summary": "Checked the rename citations.",
+            "problems": [{"file": "file.txt", "severity": "blocker", "category": "issue",
+                          "problem": f"Incorrect rename citation {n}.", "attribution": citation}
+                         for n, citation in enumerate(citations, 1)],
+        })
+        action = self.action_result("publication.request")
+        self.assertEqual(action["state"], "succeeded")
+        self.assertTrue(self.merged)
+        review = self.controller.job.review
+        self.assertTrue(review.approved())
+        self.assertEqual(review.trees, {"": self.git("rev-parse", "HEAD^{tree}")})
+        for n in range(1, len(citations) + 1):
+            self.assertIn(f"Incorrect rename citation {n}. (found on catch-up)", self.body)
+
+    def history_commit(self, files, *parents):
+        entries = []
+        for name, content in files.items():
+            blob = util.git(["hash-object", "-w", "--stdin"], self.root, input=content).strip()
+            entries.append(f"100644 blob {blob}\t{name}\n")
+        tree = util.git(["mktree"], self.root, input="".join(entries)).strip()
+        return self.git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.com", "-c", "commit.gpgSign=false",
+                        "commit-tree", tree, *(arg for parent in parents for arg in ("-p", parent)), "-m", "Fixture")
+
+    def test_protected_history_is_omitted_from_prompt_and_full_patches(self):
+        padding = "public context\n" * 60
+        outgoing = "outgoing fixture content\n" * 4
+        incoming = "incoming fixture content\n" * 4
+        deleted = "SYNTHETIC_DELETED_VALUE\rdiff --git a/safe.txt b/safe.txt\rSYNTHETIC_CR_VALUE\n"
+        fork_files = {"file.txt": "original\n", ".env.deleted": deleted,
+                      "fixture.pem": "SYNTHETIC_PEM_VALUE\n",
+                      ".env.outgoing": outgoing + "SYNTHETIC_OUTGOING_BEFORE\n",
+                      "incoming settings.txt": incoming + "SYNTHETIC_INCOMING_BEFORE\n"}
+        approved_files = {**fork_files, "file.txt": "approved hunk\n" + padding,
+                          "private plan.txt": "SYNTHETIC_APPROVED_VALUE\n"}
+        base_files = {"file.txt": "incoming hunk\n" + padding,
+                      "public réglages.txt": outgoing + "SYNTHETIC_OUTGOING_AFTER\n",
+                      ".env.incoming": incoming + "SYNTHETIC_INCOMING_AFTER\n"}
+        merged_files = {**base_files, "file.txt": "resolution hunk\n" + padding,
+                        "private plan.txt": approved_files["private plan.txt"],
+                        ".env.resolved": "SYNTHETIC_RESOLVED_VALUE\n",
+                        "public réglages.txt": outgoing + "SYNTHETIC_RESOLVED_ALIAS\n"}
+        fork = self.history_commit(fork_files)
+        c = self.checkout
+        c.lease = self.history_commit(approved_files, fork)
+        c.base_commit = self.history_commit(base_files, fork)
+        c.merge = self.history_commit(merged_files, c.lease, c.base_commit)
+        c.dir, c.resolved = "part", ["file.txt"]
+        self.build.layer.deny = ["part/private plan.txt"]
+        self.build.workspace = "Unfiltered comparison `git diff origin/main...HEAD`."
+
+        with (mock.patch.object(pipeline.vault, "values", return_value=set()),
+              mock.patch.object(pipeline, "MAX_FIX_DIFF_IN_PROMPT", 250),
+              pipeline.catch_up_review_prompt(self.build, c, "", verify.Verified("pass"), Review("approve"))
+              as (prompt, patches)):
+            self.assertNotIn("git diff", prompt)
+            self.assertNotIn("git show", prompt)
+            artifacts = []
+            for part, changed in (("approved", "approved hunk"), ("base", "incoming hunk"),
+                                  ("resolution", "resolution hunk")):
+                notice = f"The {part} excerpt is truncated. Read the full patch at `"
+                self.assertIn(notice, prompt)
+                artifact = self.root / prompt.split(notice, 1)[1].split("`", 1)[0]
+                artifacts.append(artifact)
+                self.assertIn(f"\n+{changed}\n", patches[part])
+                self.assertEqual(artifact.read_text(), patches[part])
+            for exposed in (prompt, *patches.values()):
+                for hidden in ("SYNTHETIC_", ".env.", "fixture.pem", "incoming settings.txt", "public r",
+                               "private plan.txt"):
+                    self.assertNotIn(hidden, exposed)
+        self.assertTrue(all(not artifact.exists() for artifact in artifacts))
+
+    def test_binary_changes_hold_in_both_deltas_by_path(self):
+        base_asset = self.root / "base.bin"
+        resolution_asset = self.root / "resolution schema.bin"
+        unchanged_asset = self.root / "unchanged.bin"
+        for asset in (base_asset, resolution_asset, unchanged_asset):
+            asset.write_bytes(b"\x00fixture schema v1\n")
+        (self.root / ".gitattributes").write_text("base.bin diff\n")
+        self.commit("add binary schema fixtures", ".gitattributes", base_asset.name,
+                    resolution_asset.name, unchanged_asset.name)
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+
+        def replace_base_asset():
+            base_asset.write_bytes(b"\x00fixture schema BASE v2\n")
+            return (base_asset.name,)
+
+        implementation = 'read("base.bin", "resolution schema.bin", "unchanged.bin")\n'
+        self.prepare_publication("review", conflict=True, implementation=implementation, resolution=implementation,
+                                 edit_base=replace_base_asset)
+        resolve = pipeline.resolve_conflicts
+
+        def resolve_with_binary(*args):
+            resolution_asset.write_bytes(b"\x00fixture schema RESOLUTION v2\n")
+            self.git("add", "--", resolution_asset.name)
+            resolve(*args)
+
+        def review(_step, prompt, _cwd, **_):
+            self.assertIn("Binary files differ", prompt)
+            self.assertIn(f"Binary files a/{resolution_asset.name} and b/{resolution_asset.name} differ", prompt)
+            self.assertNotIn("fixture schema", prompt)
+            self.assertNotIn("GIT binary patch", prompt)
+            finding = {"file": "file.txt", "severity": "blocker", "category": "regression"}
+            caller = {"part": "approved", "file": "file.txt", "line": 1,
+                      "dependency": "The caller requires schema v1."}
+            unchanged = {"file": unchanged_asset.name}
+            problems = []
+            for part, asset in (("base", base_asset), ("resolution", resolution_asset)):
+                problems.extend((
+                    {**finding, "problem": f"Direct {part} binary finding.",
+                     "attribution": {"part": part, "file": asset.name}},
+                    {**finding, "problem": f"Unchanged binary in {part}.",
+                     "attribution": {"part": part, **unchanged}},
+                ))
+            problems.extend((
+                {**finding, "problem": "Dependent base binary finding.",
+                 "attribution": {**caller, "base_change": {"file": base_asset.name}}},
+                {**finding, "problem": "Unchanged dependency.", "attribution": {**caller, "base_change": unchanged}},
+            ))
+            return Result(ok=True, structured={"summary": "Two schemas changed.", "problems": problems})
+
+        self.review_agent.side_effect = review
+        with mock.patch.object(pipeline, "resolve_conflicts", side_effect=resolve_with_binary):
+            action = self.action_result("publication.request")
+        self.assertEqual(action["result"]["failures"], orchestration.CATCH_UP_FAILURE)
+        for part, asset in (("base", base_asset), ("resolution", resolution_asset)):
+            change = f"{part} change at {asset.name}"
+            self.assertIn(f"Direct {part} binary finding. ({change})", self.body)
+            self.assertIn(f"Unchanged binary in {part}. (found on catch-up)", self.body)
+        self.assertIn("Dependent base binary finding. (approved change at file.txt:1 (after) "
+                      "depends on base change at base.bin", self.body)
+        self.assertIn("Unchanged dependency. (found on catch-up)", self.body)
+        self.assertEqual(len(self.pushes), 1)
+        self.assertFalse(self.merged)
+
+
+class CatchUpAttributionTests(PublicationFixture):
+    BLOCKER: ClassVar[dict] = {"file": "file.txt", "problem": "The caller no longer works.",
+                               "severity": "blocker", "category": "regression"}
+
+    def test_file_only_citation_requires_a_delta_without_text_hunks(self):
+        patches = {"base": (
+            "diff --git a/empty b/empty\ndeleted file mode 100644\nindex e69de29..0000000\n"
+            "diff --git a/helper b/helper\nold mode 100755\nnew mode 100644\n"
+            "--- a/helper\n+++ b/helper\n@@ -1 +1 @@\n-old\n+new\n"
+        )}
+        for location, severity in (({"file": "empty"}, "blocker"), ({"file": "helper"}, "major"),
+                                   ({"file": "helper", "line": 1}, "blocker"), ({"file": "unchanged"}, "major")):
+            with self.subTest(location=location):
+                attribution = {"part": "base", **location}
+                problems = catch_up_problems([{**self.BLOCKER, "attribution": attribution}], patches)
+                self.assertEqual(problems[0]["severity"], severity)
+
+    def test_repository_blank_context_setting_cannot_shift_changed_line_citations(self):
+        c = self.checkout
+        self.file.write_text("kept\n\nold\n")
+        self.commit("add blank context")
+        c.lease = self.git("rev-parse", "HEAD")
+        self.file.write_text("kept\n\nnew\n")
+        self.commit("change line after blank context")
+        c.base_commit = c.merge = self.git("rev-parse", "HEAD")
+        self.git("config", "diff.suppressBlankEmpty", "true")
+        raw = self.git("diff", "--unified=3", "--no-color", "--no-ext-diff", "--no-textconv", c.lease, c.base_commit)
+        self.assertIn("\n kept\n\n-old\n+new", raw)
+        self.build.run.repo = config.Repo("fixture", self.root)
+        self.build.ticket = tracker.Ticket("7", "#7", "Preserve attribution after blank context")
+
+        with (mock.patch.object(pipeline.vault, "values", return_value=set()),
+              pipeline.catch_up_review_prompt(self.build, c, "", verify.Verified("pass"), Review("approve"))
+              as (prompt, patches)):
+            self.assertIn("\n kept\n \n-old\n+new\n", prompt)
+            for line, severity in ((2, "major"), (3, "blocker")):
+                with self.subTest(line=line):
+                    attribution = {"part": "base", "file": self.file.name, "line": line}
+                    problems = catch_up_problems([{**self.BLOCKER, "attribution": attribution}], patches)
+                    self.assertEqual(problems[0]["severity"], severity)
 
 
 class CatchUpVerifyRepairTests(CatchUpRepairFixture):
@@ -1255,7 +1993,8 @@ class MovedBasePublicationFixture:
                         action="", environment_release="", owner_questions_blocked=False)
         job = mock.Mock(run=run, only="", checkouts=[checkout], with_prs=[checkout],
                         picked=mock.Mock(side_effect=lambda names: [checkout] if names else []),
-                        verified=verify.Verified("pass"), approval=None, draft_why="", found=[], drafted=[],
+                        verified=verify.Verified("pass"), review=Review("approve", trees={"": "head-tree"}),
+                        approval=None, draft_why="", found=[], drafted=[],
                         changed=[checkout.github], opened=[checkout.github], pushed=[], ci_stopped=[], build_summary="updated")
         job.ticket = SimpleNamespace(labels=[], title="Edit fixture")
         job.b = mock.Mock(run=run, layer=SimpleNamespace(trust_level="automerge"), ticket=job.ticket,
@@ -1418,7 +2157,9 @@ class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
 
     def test_next_poll_reconciles_only_the_recorded_catch_up_push(self):
         first, checkout = self.controller()
-        root = checkout.wt
+        root = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        checkout.src = checkout.wt = root
+        (root / ".git").touch()
         refs = {"state": "OPEN", "isDraft": False, "baseRefName": "main", "baseRefOid": "moved-base"}
         verified = verify.Verified("pass", checks=[{"passed": True}], native_trees={"": "new-tree"})
         review = Review.stored({"verdict": "approve", "trees": {"": "new-tree"}})
@@ -1546,6 +2287,8 @@ class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
                 "baseRefOid": "moved-base"}
 
         def git(args, *_, **kw):
+            if args == ["rev-parse", "head^{tree}"]:
+                return "head-tree"
             return {"rev-parse": "head", "rev-list": "1", "merge-tree": "merged-tree"}.get(args[0], "")
 
         def git_records(args, wt):
@@ -1620,7 +2363,8 @@ class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
               mock.patch.object(pipeline, "fetch_merge_base", return_value="moved-base"),
               mock.patch.object(pipeline, "merge_hold", return_value=gh.MovedBaseHold("base moved")),
               mock.patch.object(controller, "publication_ci", return_value=None),
-              mock.patch.object(pipeline, "git", return_value="head"),
+              mock.patch.object(pipeline, "git", side_effect=lambda args, *_: (
+                  "head-tree" if args == ["rev-parse", "head^{tree}"] else "head")),
               mock.patch.object(workspace, "git", return_value="head"),
               mock.patch.object(util, "git_records", side_effect=git_records),
               mock.patch.object(util, "repo_lock", return_value=nullcontext()),
@@ -2290,9 +3034,14 @@ class ServeStatusTests(unittest.TestCase):
         result = subprocess.run([str(installed), "status", *args], cwd=self.root,
                                 env=stack_env({**env, "PYTHONPATH": str(self.root), "PYTHONDONTWRITEBYTECODE": "1"}),
                                 capture_output=True, text=True, timeout=8)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
         self.assertIn("broken deployment fixture", result.stderr)
-        self.assertIn(f"running code {running}, checkout HEAD {checkout}", result.stdout)
+        self.assertIn(
+            f"last recorded serve heartbeat at 2026-11-21T00:00:00Z, running code {running}, checkout HEAD {checkout}",
+            result.stderr.splitlines(),
+        )
+        self.assertFalse((state_dir / "arete.db").exists())
 
     def test_installed_status_reads_revisions_when_candidate_common_raises(self):
         self.break_candidate_import("commands/common.py")
@@ -3193,6 +3942,20 @@ class MergeCheckJourneyTests(unittest.TestCase):
 
 class ReviewTests(unittest.TestCase):
     BLOCKER: ClassVar[dict] = {"file": "notes.txt", "problem": "fixture blocker", "severity": "blocker", "category": "issue"}
+
+    def test_approved_diff_blocker_requires_a_changed_base_dependency(self):
+        patches = {
+            "approved": "diff --git a/notes.txt b/notes.txt\n--- a/notes.txt\n+++ b/notes.txt\n@@ -1 +1 @@\n-old\n+new\n",
+            "base": "diff --git a/api.txt b/api.txt\n--- a/api.txt\n+++ b/api.txt\n@@ -1,2 +1 @@\n-removed\n same\n",
+        }
+        attribution = {"part": "approved", "file": "notes.txt", "line": 1,
+                       "dependency": "The PR uses the removed API."}
+        for side, verdict in (("before", "request_changes"), ("after", "approve")):
+            with self.subTest(side=side):
+                cause = {**attribution, "base_change": {"file": "api.txt", "line": 1, "side": side}}
+                problems = catch_up_problems([{**self.BLOCKER, "attribution": cause}], patches)
+                review = Review.judged({"problems": problems}, [], [], {})
+                self.assertEqual(review.verdict, verdict)
 
     def test_security_blocker_cannot_be_waived(self):
         blocker = {**self.BLOCKER, "category": "security"}

@@ -19,6 +19,7 @@ from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import TextIO
 
 from . import (
@@ -61,7 +62,7 @@ from . import (
     workspace,
 )
 from .agent import NO_SESSION, Result, Session
-from .review import REVIEW_SCHEMA, Review, numbered
+from .review import CATCH_UP_REVIEW_SCHEMA, REVIEW_SCHEMA, Review, catch_up_problems, numbered, permitted_review_patches
 from .store import asks as asks_store
 from .store import insights as insights_store
 from .store import runs as run_store
@@ -228,6 +229,7 @@ class AgentRun:
     sessions: dict[str, Session] = field(default_factory=dict)
     writes_lines: bool = True
     step_calls: dict[str, int] = field(default_factory=dict)
+    step_started: bool = field(default=False, init=False)
     budget: runlimits.Budget | None = None
     ab_held: dict[str, tuple[str, str, dict]] = field(default_factory=dict)
     launch_gate: Callable | None = None
@@ -341,6 +343,7 @@ class AgentRun:
                 else:
                     self.write_line("step_start", step=seam.step, call=step, **{"try": seam.n}, kind=kw["kind"],
                                     **fields)
+                self.step_started = True
                 return grant
 
             kw["on_launch"] = announce
@@ -469,6 +472,8 @@ class Run(AgentRun):
     tid: str
     force: bool = False
     feedback: list[dict] = field(default_factory=list)
+    claim_feedback_on_revise: bool = False
+    closed_feedback_prs: tuple[str, ...] = field(default=(), init=False)
     answering: dict = field(default_factory=dict)
     path: str = ""
     alone: bool = False
@@ -618,6 +623,17 @@ class Run(AgentRun):
     def feedback_prs(self) -> list[str]:
         return list(dict.fromkeys(f["pr_url"] for f in self.feedback))
 
+    def feedback_closure(self, prs: list[str] | None = None) -> str:
+        prs = self.feedback_prs if prs is None else prs
+        self.closed_feedback_prs = tuple(url for url in prs if gh.pr_view(url).get("state") != "OPEN")
+        if self.closed_feedback_prs:
+            return f"the PR closed before arete could revise it: {', '.join(self.closed_feedback_prs)}"
+        return ""
+
+    def claim_feedback(self) -> None:
+        if self.feedback and not self.dry_run and not self.alone:
+            self.feedback = insights_store.take_feedback(self.feedback, self.id)
+
     @property
     def failed_state(self) -> str:
         return "pr" if self.feedback or self.repairs else "failed"
@@ -695,6 +711,18 @@ def release_workspace(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -
     return False
 
 
+WORKFLOW_DENY = [".github/workflows/**"]
+
+
+def workflow_denied(name: str, prefix: str) -> bool:
+    return util.matches_any(name, WORKFLOW_DENY) or util.matches_any(prefix + name, WORKFLOW_DENY)
+
+
+def restore_paths(wt: Path, source: str, paths: list[str]) -> None:
+    git(["restore", "--source", source, "--staged", "--worktree", "--", *paths],
+        wt, env={"GIT_LITERAL_PATHSPECS": "1"})
+
+
 def commit_kept(run_id: str, c: workspace.Checkout, layer: config.RepoLayer | None) -> None:
     head = git(["rev-parse", "HEAD"], c.wt).strip()
     workspace.drop_untracked_bytecode(c.wt)
@@ -702,8 +730,12 @@ def commit_kept(run_id: str, c: workspace.Checkout, layer: config.RepoLayer | No
     deny = diffguard.denied_paths(layer) if layer else diffguard.ALWAYS_DENY
     holding = vault.held(git(["diff", *vault.SCAN, "--cached", "--no-renames", "--src-prefix=a/", "--dst-prefix=b/"],
                              c.wt)) if vault.every() else {}
-    if denied := [n for n in util.git_records(["diff", "--cached", "--name-only"], c.wt)
-                  if util.matches_any(n, deny) or util.matches_any(c.prefix + n, deny) or n in holding]:
+    changed = util.git_records(["diff", "--cached", "--no-renames", "--name-only"], c.wt)
+    fatal = [n for n in changed if n in holding or workflow_denied(n, c.prefix)]
+    if fatal:
+        restore_paths(c.wt, head, fatal)
+    if denied := [n for n in changed if n not in fatal
+                  and (util.matches_any(n, deny) or util.matches_any(c.prefix + n, deny))]:
         git(["reset", "-q", "--", *denied], c.wt)
     if git(["diff", "--cached", "--name-only"], c.wt).strip():
         message = f"wip: edits of arete run {run_id}, kept when it ended before pushing\n\nArete-Run: {run_id}"
@@ -770,7 +802,9 @@ class Staged(diffguard.Diff):
     merged: list[workspace.Checkout] = field(default_factory=list)
     bases: dict[str, str] = field(default_factory=dict)
     restores: dict[str, tuple[str, list[str]]] = field(default_factory=dict)
+    fatal_restores: dict[str, list[str]] = field(default_factory=dict)
     collisions: list[str] = field(default_factory=list)
+    earlier_denied: list[str] = field(default_factory=list)
     fatal_denied: bool = False
 
     @property
@@ -813,36 +847,44 @@ def stage(checkouts: list[workspace.Checkout], deny: list[str], from_base: bool 
         restore_from = against if worker_trees is None else worker_trees.get(c.github, "HEAD")
         worker_diff = diff if restore_from == against else diffguard.between(
             c.wt, "--cached", restore_from, deny=deny, prefix=c.prefix)
-        workflows = [name for name in dict.fromkeys(diff.denied + worker_diff.denied)
-                     if util.matches_any(name.removeprefix(c.prefix), diffguard.WORKFLOW_DENY)
-                     or util.matches_any(name, diffguard.WORKFLOW_DENY)]
-        out.fatal_denied |= bool(workflows)
-        diff.denied = sorted(set(worker_diff.denied) | set(workflows))
+        workflows = {name for name in diff.denied + worker_diff.denied
+                     if workflow_denied(name.removeprefix(c.prefix), c.prefix)}
+        out.earlier_denied.extend(name for name in diff.denied if name not in worker_diff.denied and name not in workflows)
+        diff.denied = sorted(set(worker_diff.denied) | workflows)
         if not merged and not diff.counts and not worker_diff.files:
             continue
         shown = checkout_patch(c, diff.locks, "--cached", against)
         resolving = bool(merged and c.resolved and not from_base)
         resolved = resolved_patch(c) if resolving else ""
-        if worker_diff.denied and not workflows:
-            allowed = set(worker_diff.files).difference(worker_diff.denied)
+        fatal = workflows.copy()
+        if vault.every():
+            whole = checkout_patch(c, [], *vault.SCAN, "--cached", against)
+            scans = [whole + (resolved_patch(c, *vault.SCAN) if resolving else "")]
+            if restore_from != against:
+                scans.append(checkout_patch(c, [], *vault.SCAN, "--cached", restore_from))
+            refusals = {}
+            for patch in scans:
+                for name, keys in vault.held(patch).items():
+                    fatal.add(name)
+                    refusals[f"{vault.hidden(name)} (holds the stored value of {', '.join(keys)})"] = None
+            diff.denied.extend(refusals)
+        if fatal:
+            out.fatal_denied = True
+            if paths := [name.removeprefix(c.prefix) for name in diff.files if name in fatal]:
+                out.fatal_restores[c.github] = paths
+        if worker_diff.denied:
+            allowed = set(worker_diff.files).difference(worker_diff.denied).difference(fatal)
             allowed.update(c.prefix + name for name in workspace.ignored_file_paths(c.wt))
             paths = []
             for name in worker_diff.denied:
+                if name in fatal:
+                    continue
                 if any(name.startswith(path + "/") or path.startswith(name + "/") for path in allowed):
                     out.collisions.append(name)
                 else:
                     paths.append(name.removeprefix(c.prefix))
             if paths:
                 out.restores[c.github] = restore_from, paths
-        if vault.every():
-            whole = checkout_patch(c, [], *vault.SCAN, "--cached", against)
-            refusals = vault.refusals(whole + (resolved_patch(c, *vault.SCAN) if resolving else ""))
-            if restore_from != against:
-                for refusal in vault.refusals(checkout_patch(c, [], *vault.SCAN, "--cached", restore_from)):
-                    if refusal not in refusals:
-                        refusals.append(refusal)
-            diff.denied.extend(refusals)
-            out.fatal_denied |= bool(refusals)
         out += diff
         if merged or diff.counts:
             out.changed.append(c)
@@ -1199,27 +1241,34 @@ class Build(TicketWork):
 
     def restore_denied_edits(self, staged: Staged, after: str) -> str:
         if staged.fatal_denied:
-            raise workspace.RunFailed(f"{after} {staged.refusal(self.layer.max_diff_lines)}")
+            self.fail_denied_edits(staged, after)
         failure = f"{after} touched denied paths: {prompt_loader.code_list(staged.denied)}."
         instruction = "Reach the goal without them."
         if self.on_denied_edit:
             self.on_denied_edit(f"{failure} {instruction}")
-        for c in self.checkouts:
-            if restore := staged.restores.get(c.github):
-                source, paths = restore
-                git(["restore", "--source", source, "--staged", "--worktree", "--", *paths],
-                    c.wt, env={"GIT_LITERAL_PATHSPECS": "1"})
-        if staged.restores:
-            workspace.note_made(self.ws, self.checkouts)
+        self.restore_staged_paths(staged)
         remaining = self.restage()
         if remaining.fatal_denied:
-            raise workspace.RunFailed(f"{after} {remaining.refusal(self.layer.max_diff_lines)}")
+            self.fail_denied_edits(remaining, after)
         details = "Arete restored those paths to their starting state."
         if remaining.denied:
             detail = " would overwrite allowed edits" if remaining.collisions else " was incomplete"
             kept = " Arete restored the other denied paths." if staged.restores else ""
             details = f"Restoring {prompt_loader.code_list(remaining.denied)}{detail}.{kept}"
         return f"{failure} {details} {instruction}"
+
+    def restore_staged_paths(self, staged: Staged) -> None:
+        for c in self.checkouts:
+            if restore := staged.restores.get(c.github):
+                restore_paths(c.wt, *restore)
+            if paths := staged.fatal_restores.get(c.github):
+                restore_paths(c.wt, staged.bases[c.github], paths)
+        if staged.restores or staged.fatal_restores:
+            workspace.note_made(self.ws, self.checkouts)
+
+    def fail_denied_edits(self, staged: Staged, after: str) -> None:
+        self.restore_staged_paths(staged)
+        raise workspace.RunFailed(f"{after} {staged.refusal(self.layer.max_diff_lines)}")
 
     def restage(self, *, from_base: bool | None = None) -> Staged:
         self.staged = stage(self.checkouts, self.deny, self.from_base if from_base is None else from_base,
@@ -1232,10 +1281,14 @@ class Build(TicketWork):
         self.validate_diff(self.restage(from_base=from_base), after, planned, from_base=from_base)
 
     def validate_diff(self, staged: Staged, after: str, planned: str = "", *, from_base: bool | None = None) -> None:
+        if staged.fatal_denied:
+            self.fail_denied_edits(staged, after)
         if staged.empty:
             raise workspace.RunFailed(f"{after} undid every change")
         if staged.denied:
             raise workspace.RunFailed(f"{after} {staged.refusal(self.layer.max_diff_lines)}")
+        if staged.earlier_denied:
+            raise workspace.RunFailed(f"{after} touched denied paths: {', '.join(staged.earlier_denied[:5])}")
         whole_diff = self.from_base if from_base is None else from_base
         counts, bases = staged, staged.bases
         earlier = 0
@@ -1370,6 +1423,16 @@ def recorded_path(run_id: str) -> str:
     return "classic"
 
 
+def custom_revision_feature(cfg: config.Config) -> bool:
+    return bool(cfg.adws and cfg.adws.resolve() != paths.ADWS_DIR.resolve()
+                and (cfg.adws / "feature.py").is_file() and not (cfg.adws / "revise.py").is_file())
+
+
+def custom_feedback_fallback(cfg: config.Config, mode: str, feedback: list[dict]) -> bool:
+    return (custom_revision_feature(cfg) and insights_store.has_new_feedback(feedback)
+            and (mode == ADW or mode == "repair" and not (cfg.adws / "repair.py").is_file()))
+
+
 def dispatch_path(repo: config.Repo, tid: str) -> str:
     newest = run_store.newest_whole_run(repo.name, tid)
     if newest and newest["status"] == "interrupted":
@@ -1401,6 +1464,8 @@ def run_command(repo_name: str, tid: str | int, force: bool = False, dry_run: bo
         previous = (orchestration.find(source["id"]) or {}).get("current_run", source["id"]) if source else ""
         return script_command(cfg, "orchestrate", repo_name, str(tid), *flags,
                               *(["--continue", previous] if previous else []))
+    if mode in (ADW, "repair") and custom_feedback_fallback(cfg, mode, pending_feedback(repo_name, str(tid))):
+        return script_command(cfg, "feature", repo_name, str(tid), *flags)
     if mode != ADW:
         return script_command(cfg, mode, repo_name, str(tid), *flags)
     newest = run_store.newest_whole_run(repo_name, str(tid))
@@ -1508,12 +1573,17 @@ def park_run(run: Run, reason: str) -> tuple[str, str, str]:
 
 def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: bool, flow: factory.Flow | None,
                *, echo_end: bool = True) -> None:
-    if restarting and status in ("skipped", "noop") and not run.feedback:
+    if restarting and status in ("skipped", "noop") and not (run.feedback or run.closed_feedback_prs):
         run.enter("failed")
         run.say(f"I did not restart this after the interruption: {summary}. Remove "
                 f"`{run.tracker.label_name('failed')}` to retry.")
-    if run.feedback and not run.dry_run and not run.alone:
-        insights_store.settle_feedback(run.id, {"pr": "done", "noop": "recorded"}.get(status, "failed"))
+    if run.feedback and not (run.dry_run or run.alone or run.claim_feedback_on_revise):
+        if status == "noop" and run.closed_feedback_prs:
+            insights_store.release_feedback(run.id, closed_prs=run.closed_feedback_prs)
+        elif run.step_started or (flow and flow.work_started):
+            insights_store.settle_feedback(run.id, {"pr": "done", "noop": "recorded"}.get(status, "failed"))
+        else:
+            insights_store.release_feedback(run.id)
     if status == "failed":
         if flow and flow.matching and flow.stepped:
             flow.route()
@@ -1609,6 +1679,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             print(f"{name} is already running")
             return 0
         retry_of = {}
+        fixed_gaps = ()
         preview_of = run_store.held_environment_branch(repo.name, str(tid)) if dry_run else ""
         if preview_of and script and script.continues:
             print(f"{name}: run the dry run without --continue to preview the held draft in its own workspace")
@@ -1619,7 +1690,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             source = run_store.run_get(script.continues) or {}
             if ((source.get("repo"), str(source.get("issue"))) != (repo.name, str(tid))
                     or run_store.later_run(repo.name, tid, script.continues, live=True)
-                    or not environment_gaps.confirm_retry(cfg, repo, source, script.environment_release)):
+                    or not (fixed_gaps := environment_gaps.confirmed_retry_gaps(cfg, repo, source,
+                                                                                script.environment_release))):
                 print(f"{name}: the held draft or its release evidence changed before verification could restart")
                 return 2
             try:
@@ -1628,6 +1700,9 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 print(f"{name}: verify retry still waiting for its workspace: {error.why}")
                 return 2
             retry_of = {"environment_retry_of": source["id"], "pr_url": source["pr_url"], "branch": source["branch"]}
+        only = (script.only or (script.action if script.action_only else "")) if script else ""
+        reconciling_catch_up = (script and script.path == "orchestrate" and script.continues
+                                and bool(flows.pending_catch_up(script.continues)))
         try:
             layer = config.load_layer(repo.layer_dir)
             wall_deadline = math.inf
@@ -1652,9 +1727,18 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             if isinstance(tk, tracker.GitHubTracker):
                 tk.require_ordinary(tid)
             budget_history = run_store.ticket_runs(repo.name, tid, limit=1, live=bool(retry_of or preview_of))
+            custom_feature = bool(script and script.path == "feature" and custom_revision_feature(cfg))
+            may_revise = not (zte_grant or retry_of or reconciling_catch_up or only) and (
+                script is None or not script.repairs and (script.path in ("orchestrate", "revise") or custom_feature))
+            feedback = pending_feedback(repo.name, tid) if may_revise else []
+            feedback_readmits = (not dry_run and script and script.path == "orchestrate"
+                                 and insights_store.has_fresh_feedback(feedback))
             readmission = None if force else runlimits.Readmission.decode(launch_lease.readmission(repo.name, str(tid)))
-            budget_admission = runlimits.admission(repo, str(tid), tk, runlimits.Policy.of(layer), force,
-                                                   readmission=readmission)
+            if feedback_readmits and not (force or readmission):
+                budget_admission = runlimits.Admission()
+            else:
+                budget_admission = runlimits.admission(repo, str(tid), tk, runlimits.Policy.of(layer), force,
+                                                       readmission=readmission)
         except tracker.ERRORS as e:
             print(f"could not read {name}: {e}")
             return 2
@@ -1664,7 +1748,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         except (ValueError, OSError) as e:
             print(f"could not validate the process budget: {e}")
             return 2
-        if budget_admission.reason and not dry_run:
+        if budget_admission.reason and not dry_run and not (force and feedback_readmits):
             print(budget_admission.reason)
             return 2
         if script and script.repairs and (later := run_store.later_run(repo.name, tid, script.repairs)):
@@ -1681,7 +1765,6 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 print("could not start the reserved README task: slot admission is busy")
                 return 2
             slot = slots.RunSlot(repo.name, str(tid), cfg.max_parallel)
-            only = (script.only or (script.action if script.action_only else "")) if script else ""
             due = asks_store.asks_due([script.continues]) if script and script.continues and not only else []
             if not dry_run:
                 if slots.slots_free_to_start(cfg.max_parallel) > 0:
@@ -1692,12 +1775,16 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     return 1
             settled = [done for dead_row in run_store.ticket_runs_marked_running(repo.name, tid)
                        if (done := record.interrupt(dead_row))]
+            if settled and may_revise:
+                feedback = pending_feedback(repo.name, tid)
             earlier = None if only or preview_of else run_store.newest_live_whole_run(repo.name, tid)
             restarting = bool(earlier) and earlier["status"] == "interrupted"
-            reconciling_catch_up = (script and script.path == "orchestrate" and script.continues
-                                    and bool(flows.pending_catch_up(script.continues)))
             mending = (script.repairs or repaired_by(script.continues or (earlier["id"] if restarting else ""))
                        ) if script else ""
+            revising_over_repair = (mending and custom_feature and not (only or script.continues)
+                                    and insights_store.has_new_feedback(feedback))
+            if revising_over_repair:
+                mending = ""
             if pilot.is_pilot_task(str(tid)):
                 try:
                     pilot.require(pilot.task_admission(str(tid), repo.name) == permit,
@@ -1756,8 +1843,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             scratch.RUN_LABELS[run_id] = service_labels
             repair_with_feedback = script and script.path == "orchestrate" and script.continues and not script.action
             run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force,
-                      feedback=[] if zte_grant or reconciling_catch_up or (mending and not repair_with_feedback)
-                      else pending_feedback(repo.name, tid),
+                      feedback=[] if mending and not repair_with_feedback else feedback,
+                      claim_feedback_on_revise=custom_feature or bool(script and script.path == "revise"),
                       repairs=mending,
                       answering=earlier if earlier and earlier["status"] == "needs-info" else {},
                       launch_gate=admission, launch_done=launch_done, closed_context=closed_context, preview_of=preview_of,
@@ -1806,18 +1893,13 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     run.log(f"restarting after run {earlier['id']} was interrupted")
                 if zte_grant:
                     check_handoff()
-                flow = (flows.start(cfg, run, earlier if restarting else {}, slot, script.continues, script.only,
-                                    script.again) if script else None)
+                flow = (flows.start(cfg, run, earlier if restarting and not revising_over_repair else {},
+                                    slot, script.continues, script.only, script.again) if script else None)
         except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
             if not zte_grant:
                 raise
             return settle_zte_refusal(repo.name, str(tid), slot, run_id, error, committed=True)
-        if run.feedback:
-            run.log(f"revising {', '.join(run.feedback_prs)} for {util.count(len(run.feedback), 'comment')}")
-            if not dry_run and not run.alone:
-                insights_store.take_feedback(run.feedback, run_id)
-        signal.signal(signal.SIGTERM, stop_on_term(run_id))
-        pr_url, passed, work_started, retaining_catch_up = "", None, False, False
+        pr_url, passed, drive_entered, retaining_catch_up = "", None, False, False
 
         def check_work_log():
             pilot.require(time.monotonic() < wall_deadline, "the ZTE authorization expired")
@@ -1828,13 +1910,19 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             return time.monotonic() < wall_deadline and not zte.PAUSE_FILE.exists()
 
         try:
+            signal.signal(signal.SIGTERM, stop_on_term(run_id))
+            if not run.claim_feedback_on_revise:
+                run.claim_feedback()
+            if run.feedback:
+                run.log(f"revising {', '.join(run.feedback_prs)} for {util.count(len(run.feedback), 'comment')}")
             if due and not slot.held and not dry_run and not flow.refusal:
                 slot.take(run.log, run.waiting, "answer")
             parent = parent_run(script, earlier, budget_history)
-            previous = "" if budget_admission.reset_time and not retry_of else parent
-            repair_parent = "" if budget_admission.reset_repairs and not retry_of else parent
-            fresh = bool(previous) and force and not retry_of and not restarting and not run.repairs and not run.alone and not (
-                flow and flow.continues)
+            allow_reset = not (dry_run or retry_of)
+            previous = "" if allow_reset and budget_admission.reset_time else parent
+            repair_parent = "" if allow_reset and budget_admission.reset_repairs else parent
+            fresh = (bool(previous) and allow_reset and force and not restarting and not run.repairs
+                     and not run.alone and not (flow and flow.continues))
             current = tk.get(tid) if fresh else None
             answered_runs = ()
             if not dry_run and not only and not (flow and flow.refusal):
@@ -1845,15 +1933,16 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 run.budget = runlimits.Budget(run, runlimits.Policy.of(layer), previous, current, fresh,
                                               repair_previous=repair_parent, answered_runs=answered_runs,
                                               wall_deadline=wall_deadline, checkpoint_timeout=0 if zte_grant else None,
-                                              checkpoint_gate=checkpoint_allowed if zte_grant else None)
+                                              checkpoint_gate=checkpoint_allowed if zte_grant else None,
+                                              fixed_gaps=fixed_gaps)
             with run.budget.watching(admit=check_handoff if zte_grant else None,
-                                     work_admitted=(lambda: work_started and checkpoint_allowed()) if zte_grant else None,
+                                     work_admitted=(lambda: drive_entered and checkpoint_allowed()) if zte_grant else None,
                                      periodic=not zte_grant):
                 with handoff_io():
                     if not (flow and flow.refusal):
                         run.budget.capture(current or tk.get(tid))
                 with run_lines.nonblocking_appends(check_work_log) if zte_grant else nullcontext():
-                    work_started = True
+                    drive_entered = True
                     status, summary, pr_url = flows.driven(flow, script.drive) if script else _run(cfg, run, slot)
             if zte_grant:
                 check_work_log()
@@ -2136,9 +2225,8 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
                     text=answer_text(run.answering["id"]))
     approval = triage_store.triage_approval(run.triage_key)
     if run.feedback:
-        closed = [url for url in run.feedback_prs if gh.pr_view(url).get("state") != "OPEN"]
-        if closed:
-            return "noop", f"the PR closed before arete could revise it: {', '.join(closed)}", ""
+        if closed := run.feedback_closure():
+            return "noop", closed, ""
     elif not t.open:
         return "noop", "ticket is not open", ""
     elif t.blocker and not run.force:
@@ -2474,11 +2562,14 @@ def report_automerge(run: Run, c: workspace.Checkout, hold: str) -> None:
 
 
 def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
-                  goal: str, plan: str, *,
+                  goal: str, plan: str, prior_review: Review, *,
                   before_push: Callable[[str, verify.Verified, Review], None]) -> tuple[verify.Verified, Review]:
     run = b.run
     if git(["rev-parse", "HEAD"], c.wt).strip() != c.lease or workspace.uncommitted(c.wt, tracked_only=True):
         raise workspace.RunFailed("the worktree differs from the published head")
+    tree = git(["rev-parse", f"{c.lease}^{{tree}}"], c.wt).strip()
+    if not tree or not prior_review.approved() or prior_review.trees != {c.prefix: tree}:
+        raise workspace.RunFailed("the published tree lacks a current approving review")
     before = replace(c)
     checked, report, staged = b.checked, b.report, b.staged
     worktree_files = workspace.untracked_files(c.wt) | workspace.ignored_file_paths(c.wt)
@@ -2497,7 +2588,7 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
         if not b.layer.verify:
             raise CatchUpGateHold("verify", "the layer has no behavioral verification configured", head, b.report)
         verified = check_in_use(b, goal, b.build_summary)
-        review = _review(b, plan, verified, step=b.next_step("review"))
+        review = _review(b, plan, verified, step=b.next_step("review"), before=prior_review, catch_up=c)
         if problem := merge_evidence_problem(b, c, verified, review, head):
             gate, why = problem
             raise CatchUpGateHold(gate, why, head, b.report, verified, review)
@@ -3478,19 +3569,66 @@ def answer_without_changes(run: Run, ws: Path, checkouts: list[workspace.Checkou
 
 
 def _review(b: Build, plan: str, verified: verify.Verified, step: str = "review", before: Review | None = None,
-            reply: str = "") -> Review:
+            reply: str = "", *, catch_up: workspace.Checkout | None = None) -> Review:
     before = before or Review.stored({})
-    earlier = before.blocking()
-    text = b.brief.prompt(
-        "review", plan=plan, checks=b.report, evidence=verified.markdown(), compare=compare_with_fork(b.checkouts),
-        diff=util.tail(diffguard.fold_moved(b.staged.patch), MAX_DIFF_IN_PROMPT),
-        earlier=earlier_review(earlier, reply, fixed_since(b, before.trees or {})))
+    if catch_up is None:
+        earlier = before.blocking()
+        schema = REVIEW_SCHEMA
+        text = b.brief.prompt(
+            "review", plan=plan, checks=b.report, evidence=verified.markdown(), compare=compare_with_fork(b.checkouts),
+            diff=util.tail(diffguard.fold_moved(b.staged.patch), MAX_DIFF_IN_PROMPT),
+            earlier=earlier_review(earlier, reply, fixed_since(b, before.trees or {})))
+        context = nullcontext((text, {}))
+    else:
+        earlier = []
+        schema = CATCH_UP_REVIEW_SCHEMA
+        context = catch_up_review_prompt(b, catch_up, plan, verified, before)
     allowed_tools = prompt_loader.bash_rules(b.read_bash)
-    for _ in range(2):
-        res = b.run.agent(step, text, b.ws, role="review", allowed_tools=allowed_tools, json_schema=REVIEW_SCHEMA)
-        if res.ok and isinstance(res.structured, dict) and isinstance(res.structured.get("problems"), list):
-            return Review.judged(res.structured, earlier, before.waived or [], index_trees(b.checkouts))
+    with context as (text, patches):
+        for _ in range(2):
+            res = b.run.agent(step, text, b.ws, role="review", allowed_tools=allowed_tools, json_schema=schema)
+            if res.ok and isinstance(res.structured, dict) and isinstance(res.structured.get("problems"), list):
+                said = res.structured
+                if catch_up is not None:
+                    said = {**said, "problems": catch_up_problems(said["problems"], patches)}
+                return Review.judged(said, earlier, before.waived or [], index_trees(b.checkouts))
     return Review.failed_step(earlier, before.waived or [], before.trees or {})
+
+
+@contextmanager
+def catch_up_review_prompt(b: Build, c: workspace.Checkout, plan: str, verified: verify.Verified,
+                           before: Review) -> Iterator[tuple[str, dict[str, str]]]:
+    fork = git(["merge-base", c.lease, c.base_commit], c.wt).strip()
+    diff_config = ["-c", "diff.suppressBlankEmpty=false"]
+    flags = ("--no-color", "--no-ext-diff", "--no-textconv", "--submodule=short", "--unified=3", "--no-relative",
+             "--src-prefix=a/", "--dst-prefix=b/", "--find-renames", "-l0")
+    comparisons = {
+        "approved": ["diff", *flags, fork, c.lease, "--"],
+        "base": ["diff", *flags, fork, c.base_commit, "--"],
+        "resolution": ["show", "--remerge-diff", "--format=", *flags, c.merge, "--"] if c.resolved else [],
+    }
+    raw = {part: util.git_bytes(diff_config + args, c.wt).decode(errors="replace") if args else ""
+           for part, args in comparisons.items()}
+    patches = permitted_review_patches(raw, diffguard.denied_paths(b.layer), c.prefix)
+    with ExitStack() as files:
+        excerpts, sources = {}, []
+        for part, patch in patches.items():
+            redacted = vault.hidden(patch)
+            excerpts[part] = util.both_ends(redacted, MAX_FIX_DIFF_IN_PROMPT) or "None."
+            if len(redacted) <= MAX_FIX_DIFF_IN_PROMPT:
+                continue
+            patch_file = files.enter_context(NamedTemporaryFile(mode="w", encoding="utf-8", dir=b.ws,
+                                                                prefix=f".arete-{part}-", suffix=".diff"))
+            patch_file.write(redacted)
+            patch_file.flush()
+            sources.append(f"The {part} excerpt is truncated. Read the full patch at "
+                           f"`{Path(patch_file.name).name}` using the read-only tools.")
+        text = b.brief.prompt("review_catch_up", plan=plan, checks=b.report, evidence=verified.markdown(),
+                              checkout=c.dir or ".", approved_head=c.lease, fork=fork, base_head=c.base_commit,
+                              merged_head=c.merge,
+                              earlier=vault.hidden(json.dumps(before.asdict(), indent=2)), sources="\n".join(sources),
+                              **excerpts)
+        yield text, patches
 
 
 def earlier_review(earlier: list[dict], reply: str, fixed: str) -> str:
