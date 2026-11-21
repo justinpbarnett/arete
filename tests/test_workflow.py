@@ -29,11 +29,11 @@ from unittest import mock
 from adws import single_worker
 from arete import (
     api_check, ci, codex, config, dashboard, diffguard, evals, factory, flows, gh, guard, install, jev, journeys,
-    loop_run, mergecheck, miner, orchestration, outcomes, owner_asks, paths, pipeline, poll, principals, queueing,
-    runlimits, sandbox, serve, serve_guard, slots, tailnet, tracker, util, verify, workspace,
+    loop_run, mergecheck, miner, orchestration, outcomes, owner_asks, paths, pipeline, poll, principals, prompt_loader,
+    queueing, runlimits, sandbox, serve, serve_guard, slots, tailnet, tracker, util, verify, workspace,
 )
 from arete.agent import NO_SESSION, Result
-from arete.orchestration_api import OPERATIONS
+from arete.orchestration_api import OPERATIONS, help_text
 from arete.review import Review, catch_up_problems
 from arete.store import db, orchestration as ledger
 from tests.parallel import stack_env
@@ -240,6 +240,69 @@ class PublicationFixture(unittest.TestCase):
             controller.stamp("checks", {"full": True})
             controller.stamp("review", job.review.asdict())
         return job
+
+
+class LiveOutsideEventPublicationTests(PublicationFixture):
+    def test_rendered_prompt_requests_publication_for_one_live_outside_event(self):
+        rendered = prompt_loader.prompt("orchestrate", api=help_text(), observation="{}")
+
+        self.assertIn(
+            "Ask the owner only for information or permission you cannot obtain safely through workers.\n"
+            "When verification can check everything in use except one requirement that depends on a live outside "
+            "event the run cannot cause", rendered)
+        self.assertIn("do not ask the owner for that event or a decision about publishing without it.", rendered)
+        self.assertIn("explicitly list that requirement as unverified in its summary and record the stubbed evidence "
+                      "that covers it, then request publication so both appear in the PR body.", rendered)
+        self.assertIn("Keep the existing automerge rules and continue to ask for credentials, permissions, "
+                      "and decisions the issue leaves open.", rendered)
+
+    def test_publication_request_includes_the_unverified_requirement_and_stubbed_evidence(self):
+        controller, checkout = self.controller, self.checkout
+        self.file.write_text("implementation\n")
+        self.build.layer.verify = config.Verify(publish_evidence=False)
+        repo = config.Repo("fixture", self.root, parts=[config.Part("", checkout.github)])
+        self.publication_job(repo, "arete/7-edit-fixture", verified=verify.Verified("unverified"))
+        controller.run.path = "orchestrate"
+        controller.catalog.route.return_value = SimpleNamespace(step="verify")
+        verification = {"id": "d0001-0", "op": "verification.run", "state": "accepted",
+                        "request": {"route_id": "fixture", "effort": "", "goal_refs": []}}
+        publication = {**self.action, "id": "d0002-0"}
+        requirement = "A real PR with an unrelated hosted CI timeout gets one rerun and automerges on green."
+        stub_observation = "The stub recorded one rerun request and a merge after green CI."
+        verified = verify.Verified.from_agent({
+            "verdict": "blocked",
+            "summary": f"Unverified in use: {requirement}",
+            "blocked_by": "The run cannot cause an unrelated timeout on a hosted runner.",
+            "checks": [
+                {"what": "A PR with green CI completes publication", "how": "Publish with green CI",
+                 "saw": "The PR was published", "passed": True},
+                {"what": "Rerun an unrelated timeout with a stubbed GitHub response",
+                 "how": "Replay a timeout followed by a green rerun", "saw": stub_observation, "passed": True},
+            ],
+        })
+        pr = "https://github.com/fixture/repo/pull/7"
+        with (mock.patch.object(pipeline, "check_in_use", return_value=verified),
+              mock.patch.object(pipeline, "commit_and_push"),
+              mock.patch.object(pipeline, "release_workspace"),
+              mock.patch.object(pipeline, "supersede_older_runs"),
+              mock.patch.object(pipeline.record, "note"),
+              mock.patch.object(pipeline.record, "metered_spent", return_value=0),
+              mock.patch.object(ci, "watch", side_effect=lambda target, log: ci.Watched(target, {})),
+              mock.patch.object(gh, "open_pr_url", return_value=""),
+              mock.patch.object(gh, "pr_create", return_value=pr) as create,
+              mock.patch.object(gh, "pr_body", side_effect=lambda _: create.call_args.args[4]),
+              mock.patch.object(gh, "pr_edit_body") as edit):
+            self.assertIsNone(controller.dispatch(verification))
+            self.assertIsNone(controller.dispatch(publication))
+
+        self.assertEqual(self.transition.call_args.args[:3], (controller.lease, publication["id"], "succeeded"))
+        self.assertEqual((controller.ending[0], controller.ending[2]), ("pr", pr))
+        create.assert_called_once()
+        edit.assert_called_once()
+        body = edit.call_args.args[1]
+        self.assertIn(f"Unverified in use: {requirement}", body)
+        self.assertIn("**Passed**: A PR with green CI completes publication", body)
+        self.assertIn(stub_observation, body)
 
 
 class UnchangedHeadCIRetryTests(PublicationFixture):
