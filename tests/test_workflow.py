@@ -1,4 +1,3 @@
-import functools
 import json
 import os
 import shlex
@@ -162,7 +161,7 @@ class QueueScoringTests(unittest.TestCase):
 
 class PublicationFixture(unittest.TestCase):
     def setUp(self):
-        self.root = self.fixture_dir()
+        self.root = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
         self.file = self.root / "file.txt"
         self.set_up_repository()
         self.checkout = workspace.Checkout("", "fixture/repo", self.root, self.root, "main")
@@ -185,14 +184,20 @@ class PublicationFixture(unittest.TestCase):
         self.enterContext(mock.patch.object(pipeline.record, "mark"))
         self.enterContext(mock.patch.object(orchestration.run_lines, "write"))
 
-    def fixture_dir(self):
-        return Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
-
     def set_up_repository(self):
-        self.git("init", "-q", "--template=", "-b", "main")
-        self.file.write_text("base\n")
-        self.commit("base")
-        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        self.create_repository(self.root)
+
+    @staticmethod
+    def create_repository(root):
+        def git(*args):
+            util.git(list(args), root)
+
+        git("init", "-q", "--template=", "-b", "main")
+        (root / "file.txt").write_text("base\n")
+        git("add", "--", "file.txt")
+        git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.com",
+            "-c", "commit.gpgSign=false", "commit", "-qm", "base")
+        git("update-ref", "refs/remotes/origin/main", "HEAD")
 
     def git(self, *args):
         return util.git(list(args), self.root).strip()
@@ -1218,11 +1223,11 @@ class CatchUpRepairFixture(PublicationFixture):
         b.layer.trust_level, b.layer.verify, b.layer.checks = "automerge", config.Verify(), {"local": "check"}
         b.layer.max_diff_lines = 20
         job = self.publication_job(repo, branch, verified=verify.Verified("pass"), stamp=False)
-        state = self.fixture_dir()
+        state = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
         self.enterContext(mock.patch.multiple(paths, STATE_DIR=state, DB_FILE=state / "arete.db",
                                              RUNS_DIR=state / "runs", LOCKS_DIR=state / "locks",
                                              WORKTREES_DIR=state / "worktrees", LOG_DIR=state / "logs"))
-        self.initialize_database()
+        db.migrate()
         rid = pipeline.record.start("pipeline", repo=repo.name, issue="7")
         folder = paths.RUNS_DIR / rid
         folder.mkdir(parents=True)
@@ -1369,9 +1374,6 @@ class CatchUpRepairFixture(PublicationFixture):
         controller.persist()
         self.addCleanup(controller.release_merge_lease)
 
-    def initialize_database(self):
-        db.migrate()
-
     def action_result(self, op, **args):
         controller = self.controller
         turn = ledger.begin(controller.lease, {}, 100)
@@ -1490,53 +1492,11 @@ class CatchUpReviewRepairTests(CatchUpRepairFixture):
 class CatchUpReviewTests(CatchUpRepairFixture):
     @classmethod
     def setUpClass(cls):
-        cls.seed = Path(tempfile.mkdtemp())
-        cls.addClassCleanup(shutil.rmtree, cls.seed, ignore_errors=True)
-
-    def setUp(self):
-        self.enterContext(mock.patch.object(util, "flush_fd"))
-        self.enterContext(mock.patch.dict(os.environ, {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.fsync",
-                                                       "GIT_CONFIG_VALUE_0": "none"}))
-        super().setUp()
-
-    def fixture_dir(self):
-        root = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
-        return root
+        cls.repository_fixture = Path(cls.enterClassContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        cls.create_repository(cls.repository_fixture)
 
     def set_up_repository(self):
-        seed = self.seed / "repository"
-        if seed.exists():
-            shutil.copytree(seed, self.root, dirs_exist_ok=True)
-            return
-        super().set_up_repository()
-        shutil.copytree(self.root, seed)
-
-    def initialize_database(self):
-        seed = self.seed / "arete.db"
-        if seed.exists():
-            paths.ensure_dirs()
-            shutil.copyfile(seed, paths.DB_FILE)
-            return
-        with mock.patch.object(db.migrations, "owners", functools.cache(db.migrations.owners)):
-            super().initialize_database()
-        shutil.copyfile(paths.DB_FILE, seed)
-
-    def prepare_publication(self, gate, **kwargs):
-        super().prepare_publication(gate, **kwargs)
-        self.enterContext(mock.patch.object(self.controller, "validate_publication_diff"))
-        self.enterContext(mock.patch.object(flows, "pr", self.publish_initial_head))
-        self.enterContext(mock.patch.object(pipeline.record, "timed", side_effect=lambda *args, **kw: nullcontext({})))
-
-    def publish_initial_head(self, flow, tree):
-        self.commit("implementation")
-        self.head = self.git("rev-parse", "HEAD")
-        self.pushes.append(self.head)
-        c = self.checkout
-        c.note_pushed_head(self.head)
-        staged = pipeline.Staged(changed=[c])
-        return flows.open_or_refresh_prs(flow.ctx, found=[], staged=staged, size="", outcome="",
-                                         subject=flow.ctx.ticket.title, draft_why="", committed=True)
+        shutil.copytree(self.repository_fixture, self.root, dirs_exist_ok=True)
 
     def test_catch_up_requires_approval_for_the_pushed_tree(self):
         self.record_pushed_head()
