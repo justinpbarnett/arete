@@ -9,7 +9,7 @@ const RETRY_MS = 5000;
 const REPORT_GRACE_MS = 5000;
 const OFFLINE_ROUNDS = 2;
 const STALE_SECONDS = 60;
-const cache = { sidebar: null, live: null, questions: null, sidebarAt: 0, errors: {}, failures: 0, settled: false };
+const cache = { sidebar: null, live: null, questions: null, serve: null, heartbeatAt: 0, errors: {}, failures: 0, settled: false };
 export const screenReads = signal({});
 let active;
 let feed;
@@ -31,10 +31,10 @@ function snapshotOf() {
     questions: cache.questions ?? null,
     running: sidebar?.running ?? null,
     health: sidebar?.health ?? null,
-    serve: sidebar?.serve ?? null,
+    serve: cache.serve,
     slots: rows?.slots ?? null,
     capacity: rows?.max_parallel ?? null,
-    received: cache.sidebarAt,
+    received: cache.heartbeatAt,
     live: payload,
     asks: payload?.needs_you ?? null,
     runs: rows?.runs ?? null,
@@ -79,7 +79,7 @@ async function read(url, { text = false, versioned = false }, signal) {
     if (response.ok && text) return { data: await response.text() };
     const body = await response.json().catch(() => null);
     const seq = response.headers.get("Arete-Seq") ?? body?.seq;
-    if (!response.ok) return { seq, error: { status: response.status, message: body?.error ?? `HTTP ${response.status}` } };
+    if (!response.ok) return { seq, error: { status: response.status, message: body?.detail ?? body?.error ?? `HTTP ${response.status}` } };
     if (body && typeof body === "object" && !Array.isArray(body)) return { data: body, seq };
     return { error: { status: response.status, message: "Malformed response" } };
   } catch (error) {
@@ -99,7 +99,11 @@ async function versioned(url, signal, fallback, select = (body) => body) {
 }
 
 const legacy = (url, signal, text = false) => read(url, { text }, signal);
-const taskList = (signal, select) => versioned("/api/v1/tasks", signal, () => legacy("/api/tasks", signal), select);
+async function taskList(signal, { conditional = true, select } = {}) {
+  const result = await read("/api/v1/tasks", { versioned: conditional }, signal);
+  if (result.error?.status === 404) return legacy("/api/tasks", signal);
+  return result.data && select ? { ...result, data: select(result.data) } : result;
+}
 
 const malformed = () => ({ status: null, message: "Malformed response" });
 
@@ -148,12 +152,13 @@ function readers(screen, id, repo) {
     if (id) requests.detail = projection("run", data.run(id).detail, id);
   }
   if (screen === "board") {
-    requests.tasks = (signal) => data.boardTasks((url) => read(url, { versioned: true }, signal), () => taskList(signal));
+    requests.tasks = (signal) => data.boardTasks((url) => read(url, { versioned: true }, signal),
+      () => taskList(signal, { conditional: false }));
   }
   if (screen === "task") {
-    requests.tasks = (signal) => taskList(signal, (body) => ({
+    requests.tasks = (signal) => taskList(signal, { select: (body) => ({
       tasks: Array.isArray(body.tasks) ? data.sortTasks(body.tasks) : null,
-    }));
+    }) });
     if (id) {
       requests.task = projection("task", data.taskDetail(id, repo), /^t-[a-f0-9]+$/i.test(id) ? id.toLowerCase() : id);
     }
@@ -163,14 +168,27 @@ function readers(screen, id, repo) {
 }
 
 
+function takeHeartbeat(serve, received = Date.now()) {
+  if (!serve?.at) {
+    cache.serve ??= serve ?? null;
+    return;
+  }
+  const previous = cache.serve?.at;
+  if (previous && serve.at < previous) return;
+  if (serve.at === previous) {
+    cache.serve = { ...serve, age_seconds: cache.serve.age_seconds };
+    return;
+  }
+  cache.serve = serve;
+  cache.heartbeatAt = received;
+}
+
 function publishShell(result) {
   if (result.data) {
-    const received = result.received ?? Date.now();
-    const keepBeat = result.unchanged && cache.sidebarAt >= received;
-    cache.sidebar = keepBeat ? { ...result.data.sidebar, serve: cache.sidebar.serve } : result.data.sidebar;
+    cache.sidebar = result.data.sidebar;
     cache.live = result.data.view;
     cache.questions = { data: result.data.asks };
-    if (!keepBeat) cache.sidebarAt = received;
+    if (!result.unchanged) takeHeartbeat(cache.sidebar.serve, result.received);
   } else cache.questions = { data: cache.questions?.data, error: result.error };
   cache.errors = { sidebar: result.error ?? null, live: result.error ?? null };
   cache.failures = result.error ? cache.failures + 1 : 0;
@@ -180,7 +198,7 @@ function publishShell(result) {
 
 function publishShellRefresh(run, result) {
   const polling = transport === "poll";
-  if (!result?.data || (result.unchanged && !polling) || newer(run.positions.get("shell"), result.seq)) return;
+  if (!result?.data || result.unchanged || newer(run.positions.get("shell"), result.seq)) return;
   const { sidebar, view, asks } = result.data;
   const rows = cache.live.live.rows;
   const projected = view.live.rows;
@@ -189,8 +207,8 @@ function publishShellRefresh(run, result) {
     const current = byId.get(row.id);
     return current ? { ...row, slot: current.slot, paid: current.paid, seconds: current.seconds } : row;
   }) ?? (result.seq === run.positions.get("shell") ? projected?.runs : undefined);
-  cache.sidebar = { ...sidebar, running: cache.sidebar.running, serve: polling ? sidebar.serve : cache.sidebar.serve };
-  if (polling) cache.sidebarAt = Date.now();
+  cache.sidebar = { ...sidebar, running: cache.sidebar.running };
+  if (polling) takeHeartbeat(sidebar.serve, result.received);
   cache.live = { ...view, live: { ...view.live, rows: rows || projected ? { ...rows, ...projected, runs } : undefined } };
   cache.questions = { data: asks };
   snapshot.value = snapshotOf();
@@ -344,14 +362,9 @@ async function flush(run) {
   run.dirty.clear();
   const latest = new Map();
   run.readingBoard = run.screen === "board" && keys.includes("tasks");
-  const boardRead = run.readingBoard ? run.reads.tasks(signal) : null;
-  const readShell = async () => {
-    const board = !refreshShellOnly && await boardRead;
-    if (board?.shell) return { ...board, data: board.shell };
-    return shell(signal, () => !periodicShell || !(connectedAtStart || transport));
-  };
+  const readShell = () => shell(signal, () => !periodicShell || !(connectedAtStart || transport));
   const read = async (key) => {
-    const result = await (key === "shell" ? readShell() : (key === "tasks" && boardRead) || run.reads[key](signal));
+    const result = key === "shell" ? await readShell() : await run.reads[key](signal);
     if (!result) return null;
     latest.set(key, result);
     return result.data && result.seq ? result : null;
@@ -381,14 +394,11 @@ async function flush(run) {
       for (const [key, result] of latest) {
         const usageOnly = key === "detail" && refreshDetailOnly;
         if (grouped.includes(key) && result.data && (mismatch || key === "detail" && latest.get("shell")?.error)) continue;
-        if (run.readingBoard && key === "tasks" && result.data && behind(key, result.seq)) continue;
+        if (run.readingBoard && key === "tasks" && result.data && result.seq && behind(key, result.seq)) continue;
         if (usageOnly && result.data && behind(key, result.seq)) continue;
         if (result.data && !usageOnly) run.positions.set(key, result.seq);
         if (key === "detail" && result.data?.run?.id === rs.id) run.positions.set("usage", result.seq ?? run.usageNeeded);
-        if (key === "shell" && result.data) {
-          run.states.clear();
-          run.runningIds = Array.isArray(result.data.runningIds) ? new Set(result.data.runningIds) : null;
-        }
+        if (key === "shell" && result.data) run.states.clear();
         publish(key, result, usageOnly);
       }
       for (const event of run.duringRead ?? []) applyEvent(run, event);
@@ -435,14 +445,11 @@ function applyRun(run, event) {
   const running = row.status === "running";
   if (fresh("shell")) {
     const rows = cache.live?.live?.rows;
-    const was = run.runningIds?.has(id) ?? run.states.get(id) ?? (rows?.runs ? Boolean(before(rows.runs)) :
+    const was = run.states.get(id) ?? (rows?.runs ? Boolean(before(rows.runs)) :
       before(rs.queue)?.status === "running" || rs.detail?.run.id === id && rs.detail.run.status === "running"
         || event.kind === "run.ended");
     cache.sidebar = { ...cache.sidebar, running: Math.max(0, cache.sidebar.running + Number(running) - Number(was)) };
-    if (run.runningIds) {
-      if (running) run.runningIds.add(id);
-      else run.runningIds.delete(id);
-    } else if (!rows?.runs) run.states.set(id, running);
+    if (!rows?.runs) run.states.set(id, running);
     if (rows?.runs) floorRuns(running ? replace(rows.runs, { ...row, ticket: ticket(row), stopping: Boolean(row.stop_asked) })
       : rows.runs.filter((item) => item.id !== id));
     run.positions.set("shell", event.id);
@@ -498,7 +505,7 @@ function applyBoard(run, event) {
   const previous = rows.find((task) => task.id === patch.id);
   const fromRun = event.kind.startsWith("run.");
   if (fromRun && (!previous || previous.repo !== event.data.repo)) return;
-  run.positions.set("tasks", event.id);
+  if (run.positions.get("tasks")) run.positions.set("tasks", event.id);
   if (previous?.version >= patch.version) return;
   const tasks = data.sortTasks(previous ? rows.map((task) => task.id === patch.id ? { ...task, ...patch } : task) : [...rows, patch]);
   screenReads.value = { ...reads, tasks: { ...reads.tasks, data: { tasks } } };
@@ -527,9 +534,8 @@ function update(event) {
   } else if (event.kind === "transport") {
     transport = event.transport;
   } else if (event.kind === "serve.beat") {
-    if (event.at && cache.sidebar) {
-      cache.sidebar = { ...cache.sidebar, serve: event };
-      cache.sidebarAt = Date.now();
+    if (event.at) {
+      takeHeartbeat(event);
       snapshot.value = snapshotOf();
     }
     if (rs.detail?.run.status === "running") invalidate(run, ["transcript"]);
@@ -577,13 +583,19 @@ export function stop() {
 }
 
 export function live(screen, id = "", repo = "") {
+  const existingShell = screen === "board" && transport && active?.positions.has("shell") && !cache.errors.sidebar ? active : null;
+  const positions = new Map();
+  if (existingShell) positions.set("shell", existingShell.positions.get("shell"));
+  if (screen === "board" && active?.screen === "board" && active.positions.has("tasks")) {
+    positions.set("tasks", active.positions.get("tasks"));
+  }
   stopReaders();
   selectRun(screen === "run" ? id : "");
   const previous = screenReads.peek();
   const reads = readers(screen, id, repo);
   screenReads.value = Object.fromEntries(["tasks", "health"].filter((key) => reads[key] && previous[key]).map((key) => [key, previous[key]]));
   const run = active = { screen, id, reads, externalTask: reads.task && !/^t-[a-f0-9]+$/i.test(id),
-    positions: new Map(), dirty: new Map(), states: new Map(), reportUntil: 0,
+    positions, dirty: new Map(), states: existingShell?.states ?? new Map(), reportUntil: 0,
     controller: new AbortController(), busy: false, timer: null };
   connect(run);
   const retry = () => {
@@ -599,12 +611,13 @@ export function live(screen, id = "", repo = "") {
     if (needsDetail) keys.push("detail");
     if (transcript && rs.detail?.run.status === "running") keys.push("transcript");
     const refreshKeys = transport && !run.incoherent ? keys : all(run);
-    const boardCurrent = run.screen === "board" && transport && run.positions.has("tasks") && !screenReads.peek().tasks?.error;
+    const boardCurrent = run.screen === "board" && transport && run.positions.get("tasks") && !screenReads.peek().tasks?.error;
     invalidate(run, boardCurrent ? refreshKeys.filter((key) => key !== "tasks") : refreshKeys, true);
   };
   run.visibility = () => refresh(true);
   document.addEventListener("visibilitychange", run.visibility);
   run.interval = setInterval(refresh, RETRY_MS);
-  retry();
+  if (existingShell) invalidate(run, ["tasks"]);
+  else retry();
   return { snapshot, stop, retry };
 }

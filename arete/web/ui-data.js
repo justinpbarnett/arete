@@ -11,10 +11,10 @@ export async function snapshotRead(url, signal) {
   const headers = saved?.etag ? { "If-None-Match": saved.etag } : {};
   const response = await webFetch(url, { headers, signal, cache: "no-store" });
   const seq = response.headers.get("Arete-Seq");
-  if (response.status === 304 && saved) return { data: saved.data, received: saved.received, unchanged: true };
+  if (response.status === 304 && saved) return { data: saved.data, unchanged: true };
   if (!response.ok) {
     const body = await response.json().catch(() => null);
-    return { seq, error: { status: response.status, code: body?.code, message: body?.detail ?? body?.error ?? `HTTP ${response.status}` } };
+    return { seq, error: { status: response.status, message: body?.detail ?? body?.error ?? `HTTP ${response.status}` } };
   }
   const body = await response.json().catch(() => null);
   const position = seq ?? body?.seq;
@@ -25,7 +25,7 @@ export async function snapshotRead(url, signal) {
   const received = Date.now();
   if (!signal.aborted) {
     snapshots.delete(url);
-    snapshots.set(url, { etag: response.headers.get("ETag"), data, received });
+    snapshots.set(url, { etag: response.headers.get("ETag"), data });
     if (snapshots.size > 32) snapshots.delete(snapshots.keys().next().value);
   }
   return { data, received };
@@ -38,17 +38,14 @@ export const sortTasks = (tasks) => [...tasks].sort((a, b) => b.updated.localeCo
 export async function boardTasks(read, readTasks) {
   let result = await read(screen("board"));
   const { error } = result;
-  const unknownView = error?.status === 400 && error.code === "invalid_input" && error.message === "Unknown view board";
-  if (error?.status === 404 || unknownView) {
+  if (error?.status === 404 || error?.status === 400) {
     result = await readTasks();
   }
-  const { view, tasks = view?.tasks, sidebar, asks } = result.data ?? {};
+  const { view, tasks = view?.tasks } = result.data ?? {};
   if (!Array.isArray(tasks) || tasks.some((task) => typeof task?.updated !== "string" || typeof task.id !== "string")) {
     return { error: result.error ?? { status: null, message: "Malformed response" } };
   }
-  const shell = Number.isInteger(sidebar?.running) && Array.isArray(asks?.asks)
-    ? { sidebar, asks, view: { live: {} }, runningIds: view?.running_ids } : null;
-  return { ...result, data: { tasks: sortTasks(tasks) }, shell };
+  return { ...result, data: { tasks: sortTasks(tasks) } };
 }
 
 export function visit(row) {
