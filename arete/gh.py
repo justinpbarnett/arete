@@ -10,7 +10,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import timedelta
@@ -259,7 +259,7 @@ def issue_close(repo: str, number: int, comment: str = "") -> None:
     if comment:
         args += ["--comment", outgoing(comment, key=key)]
     try:
-        gh(args, write=True)
+        gh(args, write=True, retry=not comment)
     except GhUnsure:
         def reconcile():
             status = issue_state(repo, number)
@@ -271,17 +271,61 @@ def issue_close(repo: str, number: int, comment: str = "") -> None:
             return args[:5] if found else args
         retry = recovery_lookup(reconcile)
         if retry is not None:
-            gh(retry, write=True)
+            gh(retry, write=True, retry="--comment" not in retry)
 
 
-def issue_labels(repo: str, number: int, add: list[str] = (), remove: list[str] = (), *, single_attempt=False) -> None:
+def issue_labels(repo: str, number: int, add: list[str] = (), remove: list[str] = (), *, single_attempt=False,
+                 retry: bool = True) -> None:
     args = ["issue", "edit", str(number), "--repo", repo]
     for lb in add:
         args += ["--add-label", lb]
     for lb in remove:
         args += ["--remove-label", lb]
     if len(args) > 5:
-        gh(args, write=single_attempt)
+        gh(args, write=single_attempt, retry=retry)
+
+
+def issue_label_events(repo: str, number: int) -> Iterator[tuple[str, str, str]]:
+    owner, name = repo.split("/", 1)
+    query = """
+    query($owner:String!, $name:String!, $number:Int!, $before:String) {
+      repository(owner:$owner, name:$name) {
+        issue(number:$number) {
+          timelineItems(last:100, before:$before, itemTypes:[LABELED_EVENT, UNLABELED_EVENT]) {
+            pageInfo { hasPreviousPage startCursor }
+            nodes {
+              __typename
+              ... on LabeledEvent { id label { name } }
+              ... on UnlabeledEvent { id label { name } }
+            }
+          }
+        }
+      }
+    }
+    """
+    args = ["api", "graphql", "-f", outgoing(f"query={query}"), "-f", outgoing(f"owner={owner}"),
+            "-f", outgoing(f"name={name}"), "-F", outgoing(f"number={number}")]
+    before = ""
+    while True:
+        page = gh_json([*args, *(["-f", outgoing(f"before={before}")] if before else [])], retry=False)
+        try:
+            timeline = page["data"]["repository"]["issue"]["timelineItems"]
+            if page.get("errors") or not isinstance(timeline["nodes"], list):
+                raise ValueError("incomplete label history")
+            info = timeline["pageInfo"]
+            for event in reversed(timeline["nodes"]):
+                kind = event["__typename"]
+                if kind not in ("LabeledEvent", "UnlabeledEvent") or not event["id"]:
+                    raise ValueError("unexpected label event")
+                yield event["id"], event["label"]["name"], kind
+            if info["hasPreviousPage"] is False:
+                return
+            cursor = info["startCursor"]
+            if info["hasPreviousPage"] is not True or not cursor or cursor == before:
+                raise ValueError("invalid label history cursor")
+        except (KeyError, TypeError, ValueError) as e:
+            raise GhError("GitHub did not confirm the issue's label history") from e
+        before = cursor
 
 
 def issue_state(repo: str, number: int) -> str:

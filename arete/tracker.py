@@ -314,8 +314,12 @@ class GitHubTracker:
         gh.issue_labels(self.repo.github, int(tid), add=[LABEL])
 
     def label(self, tid: str, add=(), remove=()) -> str:
-        return error_of(lambda: self.require_ordinary(tid) or gh.issue_labels(
-            self.repo.github, int(tid), add=[self.label_name(s) for s in add], remove=[self.label_name(s) for s in remove]))
+        return error_of(lambda: self.edit_labels(tid, add, remove))
+
+    def edit_labels(self, tid: str, add=(), remove=(), *, single_attempt: bool = False) -> None:
+        self.require_ordinary(tid)
+        gh.issue_labels(self.repo.github, int(tid), add=[self.label_name(s) for s in add],
+                        remove=[self.label_name(s) for s in remove], single_attempt=single_attempt, retry=not single_attempt)
 
     def comment(self, tid: str, body: str) -> str:
         return error_of(lambda: self.require_ordinary(tid) or gh.issue_comment(self.repo.github, int(tid), body))

@@ -335,9 +335,14 @@ def save_failed_finish(run_id: str, comment: str, prs: dict[str, str], **fields)
 
 def failed_finish(run_id: str) -> dict | None:
     with reader() as c:
-        row = c.execute("SELECT r.label_pending, f.ticket_pending, f.comment, f.prs "
+        row = c.execute("SELECT r.label_pending, f.label_checkpoint, f.ticket_pending, f.comment, f.prs "
                         "FROM failed_finishes f JOIN runs r ON r.id = f.run_id WHERE f.run_id = ?", (run_id,)).fetchone()
     return {**row, "prs": json.loads(row["prs"])} if row else None
+
+
+def checkpoint_failed_label(run_id: str, event_id: str) -> None:
+    with db() as c:
+        c.execute("UPDATE failed_finishes SET label_checkpoint = ? WHERE run_id = ?", (event_id, run_id))
 
 
 def note_failed_finish(run_id: str, *, ticket_pending: bool, comment: str, prs: dict[str, str]) -> None:

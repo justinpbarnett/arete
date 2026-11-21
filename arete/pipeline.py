@@ -1367,18 +1367,55 @@ def draft_failed_pr(run: Run, url: str, head: str) -> None:
         return
     if state != "OPEN":
         raise gh.GhError("GitHub did not confirm the PR state")
-    row = run_store.run_get(run.id)
-    urls = (row.get("pr_url") or "").split()
-    if url not in urls:
-        record.note(run.id, pr_url=" ".join([*urls, url]))
     if draft_state_for_head(run, url, head) is False:
         gh.pr_set_draft(url, True, single_attempt=True)
         run.log(f"failed: marked {url} a draft")
 
 
-def apply_failed_finish(run: Run, pending: dict) -> None:
-    if pending.pop("label_pending"):
+def failed_label_change(events, checkpoint: str, label: str) -> str:
+    change = ""
+    for event_id, name, kind in events:
+        if event_id == checkpoint:
+            return change
+        if name == label and not change:
+            change = kind
+    if checkpoint:
+        raise gh.GhUnsure("GitHub label history did not reach the recorded checkpoint")
+    return change
+
+
+def label_failed_finish(run: Run, checkpoint: str | None) -> bool:
+    source = run.tracker
+    if not isinstance(source, tracker.GitHubTracker):
         run.enter_label("failed")
+        return True
+    events = gh.issue_label_events(source.repo.github, int(run.tid))
+    if checkpoint is None:
+        event_id, _, _ = next(events, ("", "", ""))
+        run_store.checkpoint_failed_label(run.id, event_id)
+    else:
+        if source.has_state(run.tid, "failed"):
+            record.note(run.id, label_pending="")
+            return True
+        change = failed_label_change(events, checkpoint, source.label_name("failed"))
+        if change == "UnlabeledEvent":
+            run_store.discard_failed_finish(run.id)
+            return False
+        if change == "LabeledEvent":
+            raise gh.GhUnsure("GitHub label history shows the failed label was added but its current state is absent")
+    source.edit_labels(run.tid, add=["failed"], remove=[s for s in source.states if s != "failed"], single_attempt=True)
+    record.note(run.id, label_pending="")
+    return True
+
+
+def apply_failed_finish(run: Run, pending: dict) -> None:
+    checkpoint = pending.pop("label_checkpoint")
+    if pending.pop("label_pending"):
+        try:
+            if not label_failed_finish(run, checkpoint):
+                return
+        except Exception as e:
+            run.log(f"tracker: {util.first_line(str(e), 300)}")
     if pending["ticket_pending"]:
         source = run.tracker
         try:
@@ -1387,26 +1424,25 @@ def apply_failed_finish(run: Run, pending: dict) -> None:
                 record.note(run.id, moved="failed")
                 if moved.error:
                     run.log(f"tracker: {util.first_line(moved.error, 300)}")
-        except tracker.ERRORS as e:
-            run.log(f"tracker: {util.first_line(str(e), 300)}")
-        else:
             pending["ticket_pending"] = False
             run_store.note_failed_finish(run.id, **pending)
+        except Exception as e:
+            run.log(f"tracker: {util.first_line(str(e), 300)}")
     if pending["comment"]:
         marker = f"<!-- arete:failed-finish={run.id} -->"
-        if error := tracker.error_of(lambda: run.tracker.comment_once(run.tid, pending["comment"], marker)):
-            run.log(f"tracker: {util.first_line(error, 300)}")
-        else:
+        try:
+            run.tracker.comment_once(run.tid, pending["comment"], marker)
             pending["comment"] = ""
             run_store.note_failed_finish(run.id, **pending)
+        except Exception as e:
+            run.log(f"tracker: {util.first_line(str(e), 300)}")
     for url, head in list(pending["prs"].items()):
         try:
             draft_failed_pr(run, url, head)
-        except gh.GhError as e:
+            del pending["prs"][url]
+            run_store.note_failed_finish(run.id, **pending)
+        except Exception as e:
             run.log(f"failed: could not settle {url}: {util.first_line(str(e), 300)}")
-            continue
-        del pending["prs"][url]
-        run_store.note_failed_finish(run.id, **pending)
 
 
 def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: bool, flow: factory.Flow | None,

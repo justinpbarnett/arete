@@ -33,6 +33,7 @@ from arete import (
     poll,
     principals,
     record,
+    requeue,
     repairs,
     routing,
     run_lines,
@@ -55,6 +56,7 @@ from arete.store import runs as run_store
 from arete.store import tasks as tasks_store
 from arete.store import zte as zte_store
 from tests.harness import set_task_body
+from tests.test_write_recovery import GithubWriteLedger
 
 
 class Isolated(unittest.TestCase):
@@ -1183,7 +1185,7 @@ class UnansweredRepairBudgetTests(OwnerAnswerBudgetFixture):
         def issue_list(repo, label, **kwargs):
             return [issue_view(repo, int(self.ticket))] if label in labels else []
 
-        def edit_labels(repo, number, add=(), remove=()):
+        def edit_labels(repo, number, add=(), remove=(), **kwargs):
             labels.difference_update(remove)
             labels.update(add)
 
@@ -2106,6 +2108,7 @@ class OrchestrationFinishTests(GitHubTicketFixture):
         self.pr = {"state": "OPEN", "isDraft": False, "draft_calls": 0}
         self.remote_head = self.HEAD
         for name, func in (
+            ("issue_label_events", lambda *args: iter(())),
             ("find_issue_comment_marker", self.find_comment),
             ("pr_view", lambda url: self.pr),
             ("pr_draft_and_head", lambda url: (self.pr["isDraft"], self.remote_head)),
@@ -2159,7 +2162,7 @@ class OrchestrationFinishTests(GitHubTicketFixture):
             ("run.finish", {"reason": "failed"}, "The merge conflicts remain. See http://127.0.0.1:8000/logs."),
         ])
         row, pr = self.run_controller(lambda controller: self.controller_action(controller, *next(decisions)), code=1)
-        self.assertEqual((row["status"], row["pr_url"]), ("failed", self.PR))
+        self.assertEqual((row["status"], row["pr_url"]), ("failed", ""))
         self.assertEqual(self.labels, {"agent", "agent:failed"})
         comment, = self.comments
         self.assertIn("The merge conflicts remain. See [private address]/logs.", comment)
@@ -2173,7 +2176,7 @@ class OrchestrationFinishTests(GitHubTicketFixture):
             return self.controller_action(controller, "run.finish", {"reason": "failed"}, "Could not finish the repair.")
 
         row, pr = self.run_controller(decide, code=1, remote_head="b" * 40)
-        self.assertEqual((row["status"], row["pr_url"]), ("failed", self.PR))
+        self.assertEqual((row["status"], row["pr_url"]), ("failed", ""))
         self.assertEqual(self.labels, {"agent", "agent:failed"})
         comment, = self.comments
         self.assertIn("Could not finish the repair.", comment)
@@ -2474,6 +2477,271 @@ class OrchestrationFinishTests(GitHubTicketFixture):
 
                 row = self.run_failure(script=pipeline.Script("adw", drive))
                 self.assertEqual(json.loads(row["failure"]), expected)
+
+
+class FailedFinishSettlementTests(GitHubTicketFixture):
+    PR = "https://github.com/owner/project/pull/685"
+    HEAD = "a" * 40
+
+    def setUp(self):
+        self.real_issue_labels = gh.issue_labels
+        self.real_gh_json = gh.gh_json
+        super().setUp()
+        self.label_events = []
+        self.patches.enter_context(patch.object(gh, "gh_json", side_effect=self.github_json))
+        self.patches.enter_context(patch.object(gh, "pr_view", return_value={"state": "OPEN"}))
+        self.patches.enter_context(patch.object(gh, "pr_draft_and_head", return_value=(False, self.HEAD)))
+        self.patches.enter_context(patch.object(gh, "find_issue_comment_marker", return_value=False))
+        self.draft = self.patches.enter_context(patch.object(gh, "pr_set_draft"))
+
+    def edit_labels(self, repo, number, add=(), remove=(), **kwargs):
+        before = self.labels.copy()
+        super().edit_labels(repo, number, add, remove, **kwargs)
+        for kind, names in (("LabeledEvent", self.labels - before), ("UnlabeledEvent", before - self.labels)):
+            for name in sorted(names):
+                self.label_events.append({"__typename": kind, "id": str(len(self.label_events) + 1),
+                                          "label": {"name": name}})
+
+    def github_json(self, args, **kwargs):
+        if args[:2] != ["api", "graphql"] or "LABELED_EVENT" not in args[3]:
+            return self.real_gh_json(args, **kwargs)
+        end = next((int(arg.removeprefix("before=")) - 1 for arg in args if arg.startswith("before=")),
+                   len(self.label_events))
+        start = max(0, end - 2)
+        timeline = {"nodes": self.label_events[start:end],
+                    "pageInfo": {"hasPreviousPage": start > 0, "startCursor": str(start + 1)}}
+        return {"data": {"repository": {"issue": {"timelineItems": timeline}}}}
+
+    @contextlib.contextmanager
+    def ambiguous_label_write(self, run, *, applied=False, interrupted=False):
+        checkpoint = self.label_events[-1]["id"]
+
+        def write(command, **kwargs):
+            self.assertEqual(command[:4], ["gh", "issue", "edit", self.issue])
+            self.assertEqual(run_store.failed_finish(run.id)["label_checkpoint"], checkpoint)
+            if applied:
+                self.edit_labels(self.repo.github, self.issue, add=["agent:failed"], remove=["agent:running"])
+            if interrupted:
+                raise runlimits.Parked("run deadline reached during the label write")
+            return SimpleNamespace(returncode=util.TIMED_OUT, stdout="", stderr="timed out waiting for the label edit reply")
+
+        with (patch.object(gh, "issue_labels", self.real_issue_labels),
+              patch.object(util, "sh", side_effect=write) as command,
+              patch.object(gh, "issue_comment", side_effect=gh.GhError("comment unavailable"))):
+            yield
+        command.assert_called_once()
+
+    def failed_run(self):
+        rid = record.start("pipeline", repo=self.repo.name, issue=self.issue)
+        directory = paths.RUNS_DIR / rid
+        directory.mkdir()
+        source = tracker.for_ticket(self.cfg, self.repo, self.issue)
+        run = pipeline.Run(rid, self.repo, directory, tracker=source, tid=self.issue)
+        run_store.save_failed_finish(rid, f"Run {rid} failed.", {self.PR: self.HEAD})
+        record.settle(rid, "failed")
+        return run
+
+    def record_existing_pr(self):
+        rid = record.start("pipeline", repo=self.repo.name, issue=self.issue)
+        record.settle(rid, "pr", pr_url=self.PR)
+
+    def jira_client(self):
+        self.repo.tracker = "jira"
+        self.issue = "FIXTURE-658"
+        self.cfg.jira.transitions["failed"] = "Failed"
+        client = jira.Client("https://example.invalid", "unused", "unused")
+        self.patches.enter_context(patch.dict(tracker._clients, {"": client}))
+        self.patches.enter_context(patch.object(client, "edit_labels", side_effect=lambda key, add, remove:
+                                                self.edit_labels("", key, add, remove)))
+        self.patches.enter_context(patch.object(client, "find_comment_marker", return_value=False))
+        self.patches.enter_context(patch.object(client, "comment", side_effect=lambda key, body, **kwargs:
+                                                self.post_comment("", key, body, **kwargs)))
+        return client
+
+    def start_pick(self, source, pick, skips):
+        queue = poll.RepoQueue(self.repo, source, set(), config.load_layer(self.repo.layer_dir),
+                               routing.Discovery(self.cfg, self.repo, priced=False))
+        self.assertIsNotNone(pick)
+        with patch.object(poll, "spawn_unparked", return_value=True) as spawn:
+            self.assertEqual(poll.start_pick(self.cfg, queue, pick, skips, False, Counter(), 1), "started")
+        spawn.assert_called_once()
+
+    def test_unavailable_transition_clears_and_feedback_runs_while_draft_is_pending(self):
+        client = self.jira_client()
+        self.record_existing_pr()
+        run = self.failed_run()
+        self.draft.side_effect = [gh.GhError("conversion unavailable"), None]
+        insights_store.add_feedback([{"pr_url": self.PR, "kind": "comment", "gh_id": 1, "repo": self.repo.name,
+                                      "issue": self.issue, "body": "Please revise", "created": util.iso(),
+                                      "at_once": 1, "pr_state": "OPEN", "status": "new"}])
+        with (patch.object(client, "issue", side_effect=lambda key, fields: {
+                  "fields": {"labels": sorted(self.labels), "status": {"name": "In Progress"}}}),
+              patch.object(client, "move", return_value=False) as move,
+              patch.object(tracker.JiraTracker, "todo", return_value=[]),
+              patch.object(tracker.JiraTracker, "replied", return_value=[]),
+              patch.object(tracker.JiraTracker, "get", side_effect=lambda tid:
+                           tracker.Ticket(tid, tid, "Fixture", labels=sorted(self.labels))),
+              patch.object(tracker.JiraTracker, "blocker", return_value="")):
+            pipeline.apply_failed_finish(run, run_store.failed_finish(run.id))
+            self.assertFalse(run_store.failed_finish_pending(self.repo.name, self.issue, include_drafts=False))
+            self.assertTrue(run_store.failed_finish_pending(self.repo.name, self.issue))
+            skips = pipeline.SkipLog({})
+            pick = poll.next_pick(self.repo, run.tracker, skips, set())
+            self.assertTrue(pick and pick.from_feedback)
+            self.start_pick(run.tracker, pick, skips)
+            pipeline.sync_failed_finishes(self.cfg)
+            outcomes.sync_moves(self.cfg)
+        move.assert_called_once_with(self.issue, "Failed")
+        self.assertFalse(run_store.failed_finish_pending(self.repo.name, self.issue))
+        self.assertIn("agent-failed", self.labels)
+        self.assertEqual(len(self.comments), 1)
+        self.assertEqual(self.draft.call_count, 2)
+
+    def test_settlement_attempts_each_step_and_keeps_owner_done_on_retry(self):
+        client = self.jira_client()
+        run = self.failed_run()
+        with (patch.object(client, "edit_labels", side_effect=json.JSONDecodeError("invalid JSON", "", 0)) as label,
+              patch.object(client, "issue", side_effect=jira.JiraError("status unavailable")) as status,
+              patch.object(client, "comment", side_effect=jira.JiraError("comment unavailable")) as comment):
+            pipeline.apply_failed_finish(run, run_store.failed_finish(run.id))
+        label.assert_called_once()
+        status.assert_called_once()
+        comment.assert_called_once()
+        self.draft.assert_called_once_with(self.PR, True, single_attempt=True)
+        pending = run_store.failed_finish(run.id)
+        self.assertEqual(pending["label_pending"], "failed")
+        self.assertTrue(pending["ticket_pending"])
+        self.assertTrue(pending["comment"])
+
+        done = {"name": "Done", "statusCategory": {"key": "done"}}
+        with (patch.object(client, "issue", return_value={"fields": {"status": done}}),
+              patch.object(client, "move") as move):
+            pipeline.sync_failed_finishes(self.cfg)
+        move.assert_not_called()
+        self.assertIn("agent-failed", self.labels)
+        self.assertEqual(len(self.comments), 1)
+        self.assertEqual(self.draft.call_count, 1)
+        self.assertFalse(run_store.failed_finish_pending(self.repo.name, self.issue))
+
+    def test_pick_discards_pending_comment_and_draft_after_owner_removes_label(self):
+        run = self.failed_run()
+        with (patch.object(gh, "issue_comment", side_effect=gh.GhError("comment unavailable")),
+              patch.object(gh, "pr_set_draft", side_effect=gh.GhError("conversion unavailable"))):
+            pipeline.sync_failed_finishes(self.cfg)
+        self.assertTrue(run_store.failed_finish_pending(self.repo.name, self.issue))
+        self.labels.remove("agent:failed")
+        skips = pipeline.SkipLog({})
+        with patch.object(gh, "issues", return_value=[self.issue_view(self.repo.github, int(self.issue))]):
+            pick = poll.next_pick(self.repo, run.tracker, skips, set())
+        self.assertTrue(pick and pick.from_queue)
+        self.start_pick(run.tracker, pick, skips)
+        self.assertFalse(run_store.failed_finish_pending(self.repo.name, self.issue))
+        pipeline.sync_failed_finishes(self.cfg)
+        self.assertEqual(self.labels, {"agent"})
+        self.assertEqual(self.comments, [])
+        self.draft.assert_not_called()
+
+    def test_unapplied_label_timeout_and_failed_comment_retry_on_poll(self):
+        self.edit_labels(self.repo.github, self.issue, add=["agent:failed"])
+        self.edit_labels(self.repo.github, self.issue, remove=["agent:failed"])
+        self.edit_labels(self.repo.github, self.issue, add=["agent:running"])
+        run = self.failed_run()
+        with self.ambiguous_label_write(run):
+            pipeline.apply_failed_finish(run, run_store.failed_finish(run.id))
+        self.assertEqual(self.labels, {"agent", "agent:running"})
+        self.assertEqual(self.comments, [])
+        pending = run_store.failed_finish(run.id)
+        self.assertEqual(pending["label_pending"], "failed")
+        self.assertTrue(pending["comment"])
+        self.draft.assert_called_once_with(self.PR, True, single_attempt=True)
+
+        pipeline.sync_failed_finishes(self.cfg)
+        pipeline.sync_labels(self.cfg)
+        pipeline.sync_failed_finishes(self.cfg)
+        self.assertEqual(self.labels, {"agent", "agent:failed"})
+        self.assertEqual(len(self.comments), 1)
+        self.assertIn(run.id, self.comments[0])
+        self.assertFalse(run_store.failed_finish_pending(self.repo.name, self.issue))
+        self.draft.assert_called_once()
+
+    def check_owner_removal_after_applied_write(self, *, interrupted):
+        self.edit_labels(self.repo.github, self.issue, add=["agent:running"])
+        run = self.failed_run()
+        self.draft.side_effect = gh.GhError("conversion unavailable")
+        deadline = self.assertRaises(runlimits.Parked) if interrupted else contextlib.nullcontext()
+        with self.ambiguous_label_write(run, applied=True, interrupted=interrupted), deadline:
+            pipeline.apply_failed_finish(run, run_store.failed_finish(run.id))
+        self.assertEqual(self.labels, {"agent", "agent:failed"})
+        self.assertEqual(run_store.failed_finish(run.id)["label_pending"], "failed")
+        self.edit_labels(self.repo.github, self.issue, remove=["agent:failed"])
+
+        with patch.object(gh, "issue_labels", wraps=self.edit_labels) as edit:
+            pipeline.sync_failed_finishes(self.cfg)
+            pipeline.sync_labels(self.cfg)
+        edit.assert_not_called()
+        self.assertEqual(self.labels, {"agent"})
+        self.assertFalse(run_store.failed_finish_pending(self.repo.name, self.issue))
+        self.assertEqual(self.comments, [])
+        self.assertEqual(self.draft.call_count, 0 if interrupted else 1)
+        skips = pipeline.SkipLog({})
+        with patch.object(gh, "issues", return_value=[self.issue_view(self.repo.github, int(self.issue))]):
+            pick = poll.next_pick(self.repo, run.tracker, skips, set())
+        self.assertTrue(pick and pick.from_queue)
+        self.start_pick(run.tracker, pick, skips)
+
+    def test_owner_removal_after_applied_label_times_out_allows_admission(self):
+        self.check_owner_removal_after_applied_write(interrupted=False)
+
+    def test_owner_removal_after_deadline_interrupts_applied_label_allows_admission(self):
+        self.check_owner_removal_after_applied_write(interrupted=True)
+
+    def test_close_reconciles_comment_written_before_connection_is_refused(self):
+        backend = GithubWriteLedger(error='Post "https://api.github.com/graphql": dial tcp: connection refused')
+        backend.issues = [{"number": 1, "state": "OPEN"}]
+        backend.close_comment_only = True
+        with (patch.object(util, "sh", side_effect=backend.sh),
+              patch.object(util, "wait_for_network", return_value=True),
+              patch.object(gh, "gh_json", self.real_gh_json)):
+            gh.issue_close(self.repo.github, 1, "Recovered")
+        self.assertEqual(backend.issues[0]["state"], "CLOSED")
+        self.assertEqual(len(backend.comments), 1)
+        self.assertEqual(backend.writes, 2)
+        self.assertNotIn("--comment", backend.calls[-1])
+
+    def test_draft_lookup_failure_does_not_block_environment_requeue(self):
+        run = self.failed_run()
+        record.note(run.id, failure=json.dumps({"class": "environment", "reason": "engine-crash"}))
+        with patch.object(gh, "pr_view", side_effect=gh.GhError("PR unavailable")):
+            pipeline.sync_failed_finishes(self.cfg)
+        self.assertFalse(run_store.failed_finish_pending(self.repo.name, self.issue, include_drafts=False))
+        self.assertTrue(run_store.failed_finish_pending(self.repo.name, self.issue))
+        layer = config.load_layer(self.repo.layer_dir)
+        with patch.object(requeue, "cleared", return_value=True):
+            requeue.reconsider(self.cfg, run.tracker, layer, self.issue, dry_run=False)
+        self.assertEqual(self.labels, {"agent"})
+        self.assertIn("Requeued this issue", self.comments[-1])
+
+    def test_draft_conversion_failure_allows_requeue_after_runner_starts(self):
+        self.record_existing_pr()
+        run = self.failed_run()
+        startup = Result(ok=False, runner="claude", error="claude not found: fixture")
+        recovery = pipeline.runner.start_failure(startup, "build")
+        record.note(run.id, failure=json.dumps(pipeline.failure_classification(recovery)))
+        self.draft.side_effect = gh.GhError("conversion unavailable")
+        pipeline.sync_failed_finishes(self.cfg)
+        self.draft.assert_called_once_with(self.PR, True, single_attempt=True)
+        self.assertEqual(run_store.failed_finish(run.id)["prs"], {self.PR: self.HEAD})
+        self.assertEqual(self.labels, {"agent", "agent:failed"})
+
+        layer = config.load_layer(self.repo.layer_dir)
+        with patch.object(pipeline.runner, "started_now", side_effect=[False, True]) as probe:
+            requeue.reconsider(self.cfg, run.tracker, layer, self.issue, dry_run=False)
+            self.assertIn("agent:failed", self.labels)
+            requeue.reconsider(self.cfg, run.tracker, layer, self.issue, dry_run=False)
+        self.assertEqual([call.args for call in probe.call_args_list], [("claude",), ("claude",)])
+        self.assertFalse(run_store.run_get(run.id)["pr_url"])
+        self.assertEqual(self.labels, {"agent"})
+        self.assertIn("Requeued this issue because the runner answered its startup check.", self.comments[-1])
 
 
 class EnvironmentRequeueTests(GitHubTicketFixture):

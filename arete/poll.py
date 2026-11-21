@@ -325,11 +325,6 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline
     name = tracker.ticket_name(repo.name, source.ref(tid))
     if isinstance(source, tracker.GitHubTracker) and source.in_zte_queue(str(tid)):
         return "skipped"
-    if run_store.failed_finish_pending(repo.name, tid, include_drafts=False) and (
-            run_store.pending_label(repo.name, tid) or source.has_state(tid, "failed")):
-        ticket = source.get(tid)
-        skips.note(name, ticket, "its failed run's tracker updates are pending", repo.name)
-        return "blocked"
     reply = tracker_reply(repo, source, str(tid), dry_run, from_queue=pick.from_queue, from_feedback=pick.from_feedback)
     answering = not reply and pipeline.answered_run(repo.name, str(tid)) is not None
     if not answering and not reply and (waiting := held_back(cfg, repo.name, going, slots)):
@@ -338,6 +333,18 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline
         print(f"{util.iso()} {name}: waiting, {waiting}")
         return "held"
     ticket = source.get(tid)
+    if run_store.failed_finish_pending(repo.name, tid):
+        newest = run_store.newest_live_whole_run(repo.name, tid)
+        if newest and (pending := run_store.failed_finish(newest["id"])):
+            owes_label = pending["label_pending"] == "failed"
+            labeled = (source.has_state(tid, "failed") if isinstance(source, tracker.LocalTracker)
+                       else source.label_name("failed") in ticket.labels)
+            if not (owes_label or labeled):
+                if not dry_run:
+                    run_store.discard_failed_finish(newest["id"])
+            elif owes_label or pending["ticket_pending"] or pending["comment"]:
+                skips.note(name, ticket, "its failed run's tracker updates are pending", repo.name)
+                return "blocked"
     blocked, readmission = runlimits.poll_admission(repo, str(tid), ticket, runlimits.Policy.of(layer))
     blocked = blocked or source.blocker(tid) or reply
     if not blocked:
