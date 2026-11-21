@@ -3,6 +3,8 @@ import { setTimeout as delay } from "node:timers/promises";
 import { openEvents } from "../arete/web/ui-events.js";
 import { prepareWrite, sendWrite } from "../arete/web/ui-write.js";
 import { clientNotice, staleWrite } from "../arete/web/ui-notice.js";
+import { parse } from "../arete/web/ui-router.js";
+import { TaskQueue } from "../arete/web/ui-work.js";
 import { effect } from "../arete/web/vendor-signals.js";
 
 const locks = {
@@ -252,7 +254,7 @@ async function snapshots() {
     assert.deepEqual(ui.runView.value.detail.models, models, "step completion refreshes model totals");
     assert.equal(snapshots(), initialReads + 1, "the usage refresh reads only run detail");
     log.push({ ...step, event: "step_start", seq: 1 }, { ...step, event: "step_end", seq: 2, result: "pass" });
-    last().send({ kind: "serve.beat", at: "now", age_seconds: 0 }, "serve.beat", "5.44");
+    last().send({ kind: "serve.beat", at: "2026-11-21T05:00:00Z", age_seconds: 0 }, "serve.beat", "5.44");
     await until(() => ui.runView.value.events.at(-1).seq === 2, "canonical log replaces streamed steps");
     assert.equal(ui.runView.value.events.length, 2);
     assert.equal(snapshots(), initialReads + 1);
@@ -323,13 +325,13 @@ async function snapshots() {
     assert.equal(ui.runView.value.queue.find((row) => row.id === "third").status, "running");
     last().send(event(seq, "run.ended", runs[2]));
     assert.equal(feed.snapshot.value.running, 1);
-    last().send({ kind: "serve.beat", at: "latest heartbeat", age_seconds: 0 }, "serve.beat", seq);
+    last().send({ kind: "serve.beat", at: "2026-11-21T05:01:00Z", age_seconds: 0 }, "serve.beat", seq);
     const acceptedTag = reads("live").at(-1).tag;
     refresh();
     await until(() => reads("live").at(-1).status === 304, "the next refresh is conditional");
     await delay(0);
     assert.equal(reads("live").at(-1).headers.get("If-None-Match"), acceptedTag);
-    assert.equal(feed.snapshot.value.serve.at, "latest heartbeat");
+    assert.equal(feed.snapshot.value.serve.at, "2026-11-21T05:01:00Z");
     assert.equal(feed.snapshot.value.running, 1);
     assert.equal(ui.runView.value.queue.find((row) => row.id === "third").status, "pr");
 
@@ -398,7 +400,7 @@ async function snapshots() {
     Date.now = () => clock;
     const latestPoll = () => reads("/api/v1/events").at(-1);
     last().open();
-    last().send({ kind: "serve.beat", at: "last stream beat", age_seconds: 40 }, "serve.beat", seq);
+    last().send({ kind: "serve.beat", at: "2026-11-21T05:02:00Z", age_seconds: 40 }, "serve.beat", seq);
     for (let i = 0; i < 3; i++) last().onerror();
     const emptyPoll = () => json({ events: [], next: seq, reset: null });
     clock += 25000;
@@ -417,7 +419,7 @@ async function snapshots() {
     slotNote = "waiting for review";
     health = "warn";
     waiting = { rows: { tickets: [{ ticket: "repo#43", comments: 1 }], quiet_minutes: 5 } };
-    serve = { at: "new snapshot beat", age_seconds: 2, alive: true };
+    serve = { at: "2026-11-21T05:03:00Z", age_seconds: 57, alive: true };
     refresh();
     await until(() => feed.snapshot.value.needsYou === 5, "fields refresh while the next long poll is idle");
     assert.equal(latestPoll(), idlePoll);
@@ -432,11 +434,25 @@ async function snapshots() {
     assert.equal(feed.snapshot.value.received, clock);
     assert.equal(ui.connectivity(feed.snapshot.value, clock), "");
 
+    const received = feed.snapshot.value.received;
+    const liveBefore304 = reads("live").length;
     clock += 5000;
     refresh();
-    await until(() => feed.snapshot.value.received === clock, "304 revalidates the long-poll serve status");
+    await until(() => reads("live").length === liveBefore304 + 1, "the long-poll shell revalidates its snapshot");
+    await delay(0);
     assert.equal(reads("live").at(-1).status, 304);
+    assert.equal(feed.snapshot.value.received, received);
+    assert.equal(ui.connectivity(feed.snapshot.value, clock), "STALE");
     assert.equal(reads("/api/sidebar").length, 0);
+
+    serve = { at: "2026-11-21T05:01:00Z", age_seconds: 0 };
+    needsYou = 6;
+    refresh();
+    await until(() => feed.snapshot.value.needsYou === 6, "the long-poll shell publishes a new answer");
+    assert.equal(latestPoll(), idlePoll);
+    assert.deepEqual(feed.snapshot.value.serve, serve);
+    assert.equal(feed.snapshot.value.received, clock);
+    assert.equal(ui.connectivity(feed.snapshot.value, clock), "", "an earlier heartbeat from the long-poll shell clears STALE");
 
     clock += 20000;
     seq = "6.2";
@@ -489,6 +505,235 @@ async function snapshots() {
   }
 }
 
+async function boardSnapshots() {
+  const calls = [];
+  const task = { id: "t-1234", repo: "sample", title: "Board card", state: "todo", updated: "1", version: 1 };
+  const closed = { ...task, id: "t-9999", state: "closed" };
+  let rows = [task, closed];
+  let seq = "9.10";
+  let boardStatus = 200;
+  let taskListStatus = 200;
+  let taskListSequenced = true;
+  let holdBoard = false;
+  let releaseBoard;
+  const { setInterval: interval, Date: { now } } = globalThis;
+  let clock = now();
+  Date.now = () => clock;
+  let refresh;
+  globalThis.setInterval = (fn, ms, ...args) => ms === 5000 ? (refresh = fn, null) : interval(fn, ms, ...args);
+  globalThis.fetch = async (path, options) => {
+    const key = new URL(path, "http://dashboard.test").searchParams.get("view") ?? path;
+    const tag = `"${key}-${seq}"`;
+    const validator = options.headers.get("If-None-Match");
+    const configured = key === "board" ? boardStatus : key === "/api/v1/tasks" ? taskListStatus : 200;
+    const status = configured !== 200 ? configured : validator === tag ? 304 : 200;
+    calls.push({ key, status, validator });
+    if (status >= 400) return json(key === "board" ? { error: "Board unavailable" }
+      : { detail: "Task list unavailable" }, status);
+    const headers = { ETag: tag, "Arete-Seq": seq };
+    if (key === "board" && holdBoard) await new Promise((resolve) => { releaseBoard = resolve; });
+    if (status === 304) return new Response(null, { status, headers });
+    if (key === "board") return json({ sidebar: { running: 17, serve: { at: "2099-01-01T00:00:00Z", age_seconds: 0 } },
+      asks: { asks: [] }, view: { tasks: rows, running_ids: [] } }, 200, headers);
+    if (key === "/api/v1/tasks") return json({ tasks: rows }, 200, taskListSequenced ? headers : {});
+    if (key === "/api/tasks") return json({ tasks: rows });
+    assert.equal(key, "live");
+    const runs = seq === "9.10" ? [{ id: "already-running" }] : [];
+    const sidebar = { running: runs.length, needs_you: runs.length ? 0 : 1,
+      serve: { at: "2026-11-21T05:04:00Z", age_seconds: 0 } };
+    return json({ sidebar, asks: { asks: [] }, view: { live: { rows: { runs } } } }, 200, headers);
+  };
+  const open = (hash) => { const route = parse(hash); return ui.live(route.screen, ...route.path); };
+  const last = () => streams.at(-1);
+  const boardCalls = () => calls.filter(({ key }) => key === "board");
+  const taskListCalls = () => calls.filter(({ key }) => key === "/api/v1/tasks" || key === "/api/tasks");
+  const tasks = () => ui.screenReads.value.tasks;
+  const state = () => tasks().data.tasks.find((row) => row.id === task.id).state;
+  const groups = (hash) => {
+    const queue = new TaskQueue().render({ route: parse(hash), resource: tasks() }, { query: "" });
+    return queue.props.children(tasks().data).props.children[1].filter(Boolean);
+  };
+  const columns = (hash) => {
+    return Object.fromEntries(groups(hash).map((group) => {
+      const [label, , count] = group.props.children[0].props.children;
+      return [label, count.props.children];
+    }));
+  };
+  const sendRun = (id, kind, status, row, subject = "run:board-run") => last().send({ id, kind, subject,
+    data: { id: "board-run", issue: task.id, repo: task.repo, status, board_task: row } });
+  try {
+    open("#board");
+    await until(() => last().url.searchParams.get("since") === "9.10", "Board keeps its own snapshot cursor");
+    last().open();
+    assert.equal(state(), "todo");
+    assert.deepEqual(calls.map(({ key }) => key), ["live", "board"]);
+    assert.equal(ui.snapshot.value.running, 1);
+    last().send(event("9.11", "run.changed", { id: "already-running", status: "running" }));
+    assert.equal(ui.snapshot.value.running, 1, "a change to an active run leaves the badge unchanged");
+    last().send(event("9.12", "run.ended", { id: "already-running", status: "done" }));
+    assert.equal(ui.snapshot.value.running, 0, "ending the pre-existing run clears the badge");
+    clock += 61000;
+    const staleReceipt = ui.snapshot.value.received;
+    assert.equal(ui.connectivity(ui.snapshot.value, clock), "STALE");
+    holdBoard = true;
+    open("#board/open-work");
+    await until(() => releaseBoard, "Open work reads the Board projection once");
+    assert.deepEqual(calls.map(({ key }) => key), ["live", "board", "board"]);
+    assert.deepEqual(boardCalls().at(-1), { key: "board", status: 304, validator: '"board-9.10"' });
+
+    const running = { ...task, state: "running", updated: "2", version: 2 };
+    sendRun("9.13", "run.started", "running", task);
+    assert.equal(state(), "todo", "a registered run can precede the stored task transition");
+    last().send({ id: "9.14", kind: "task.changed", subject: `task:${task.id}`, data: running });
+    holdBoard = false;
+    releaseBoard();
+    await until(() => state() === "running", "an event during the conditional read moves the cached card");
+    assert.equal(ui.connectivity(ui.snapshot.value, clock), "STALE", "the Board 304 preserves heartbeat age");
+    assert.equal(ui.snapshot.value.received, staleReceipt);
+    assert.equal(ui.snapshot.value.running, 1, "the Board 304 preserves the event-driven badge");
+    last().send({ kind: "serve.beat", at: "2026-11-21T05:04:00Z", age_seconds: 0 }, "serve.beat", "9.14");
+    assert.equal(ui.connectivity(ui.snapshot.value, clock), "STALE");
+    assert.equal(ui.snapshot.value.received, staleReceipt, "an identical beat keeps the original receipt time");
+    last().send({ kind: "serve.beat", at: "2026-11-21T05:03:00Z", age_seconds: 0 }, "serve.beat", "9.14");
+    assert.equal(ui.connectivity(ui.snapshot.value, clock), "", "a fresh beat after a backward clock correction clears STALE");
+    assert.equal(ui.snapshot.value.received, clock);
+    assert.deepEqual(columns("#board"), { Running: 1, Closed: 1 });
+    assert.deepEqual(columns("#board/open-work"), { Running: 1 });
+    const review = { ...task, state: "pr", updated: "3", version: 3 };
+    sendRun("9.15", "run.changed", "pr", review, "run:other-run");
+    assert.equal(state(), "running");
+    sendRun("9.16", "run.changed", "running", review);
+    assert.equal(state(), "pr", "run events apply the task snapshot even if run status differs");
+    const done = { ...task, state: "done", updated: "4", version: 4 };
+    sendRun("9.17", "run.ended", "pr", done);
+    assert.equal(state(), "done");
+    seq = "9.18";
+    assert.equal(ui.snapshot.value.running, 0);
+    assert.equal(tasks().data.tasks.find((row) => row.id === closed.id).state, "closed");
+    refresh();
+    await until(() => ui.snapshot.value.needsYou === 1, "shell refresh is independent");
+    assert.equal(ui.snapshot.value.running, 0, "refresh leaves the finished run off the badge");
+    assert.equal(calls.filter(({ key }) => key === "live").length, 2);
+    assert.equal(boardCalls().length, 2);
+    assert.equal(taskListCalls().length, 0);
+
+    seq = "9.19";
+    const boardStart = calls.length;
+    let board = open("#board");
+    await until(() => state() === "todo", "Board reads separately from the shared shell");
+    assert.deepEqual(calls.slice(boardStart).map(({ key }) => key), ["board"]);
+    assert.equal(ui.snapshot.value.running, 0, "a fresh Board snapshot leaves the badge intact");
+    assert.equal(ui.snapshot.value.serve.at, "2026-11-21T05:03:00Z");
+    seq = "9.20";
+    rows = [done, closed];
+    last().send({ id: seq, kind: "principal.changed", subject: "principal:u:1234", data: { id: "u:1234" } });
+    await until(() => state() === "done", "principal changes revalidate Board access");
+    assert.equal(boardCalls().length, 4);
+    assert.equal(boardCalls().at(-1).validator, '"board-9.19"');
+    boardStatus = 503;
+    await board.retry();
+    assert.equal(tasks().error?.status, 503, "service errors surface without falling back");
+    assert.equal(taskListCalls().length, 0);
+
+    open("#floor");
+    assert.equal(tasks(), undefined);
+    boardStatus = 404;
+    rows = [{ ...done, title: "Finished fallback card" }, { ...closed, title: "Closed fallback card" }];
+    const firstFallback = calls.length;
+    const messages = [];
+    const { error, warn } = console;
+    console.error = (...args) => messages.push(["error", ...args]);
+    console.warn = (...args) => messages.push(["warn", ...args]);
+    try {
+      board = open("#board");
+      await until(() => tasks()?.data, "Board renders the v1 task list on its first read");
+      assert.deepEqual(calls.slice(firstFallback).filter(({ key }) => key !== "live").map(({ key, status }) => [key, status]),
+        [["board", 404], ["/api/v1/tasks", 200]]);
+      assert.equal(tasks().error, null);
+      assert.deepEqual(columns("#board"), { Done: 1, Closed: 1 });
+      const cards = groups("#board").flatMap((group) => {
+        const list = group.props.children[1];
+        return list.type(list.props).props.children;
+      });
+      assert.deepEqual(cards.map((card) => [card.props["data-item"], card.props.children[0].props.children[0].props.children]),
+        [[task.id, "Finished fallback card"], [closed.id, "Closed fallback card"]]);
+      assert.deepEqual(messages, [], "a missing Board view emits no console errors or warnings");
+    } finally {
+      console.error = error;
+      console.warn = warn;
+    }
+
+    boardStatus = 400;
+    taskListSequenced = false;
+    rows = [task, closed];
+    await board.retry();
+    assert.equal(boardCalls().at(-1).status, 400);
+    assert.deepEqual(taskListCalls().slice(1).map(({ key, status }) => [key, status]), [["/api/v1/tasks", 200]]);
+    assert.equal(tasks().error, null);
+    assert.equal(state(), "todo", "an unsequenced v1 task list replaces a sequenced Board snapshot");
+    sendRun("9.21", "run.changed", "running", task);
+
+    boardStatus = 200;
+    seq = "9.19";
+    rows = [running, closed];
+    await board.retry();
+    assert.equal(state(), "running", "the next sequenced answer restarts the guard");
+    seq = "9.18";
+    rows = [task, closed];
+    await board.retry();
+    assert.equal(state(), "running", "an older sequenced answer cannot replace a newer one");
+
+    boardStatus = 404;
+    taskListStatus = 404;
+    const fallbackStart = calls.length;
+    rows = [review, closed];
+    await board.retry();
+    assert.deepEqual(calls.slice(fallbackStart).filter(({ key }) => key !== "live").map(({ key, status }) => [key, status]),
+      [["board", 404], ["/api/v1/tasks", 404], ["/api/tasks", 200]]);
+    assert.equal(tasks().error, null);
+    assert.deepEqual(columns("#board"), { "In review": 1, Closed: 1 });
+    assert.deepEqual(columns("#board/open-work"), { "In review": 1 });
+
+    taskListStatus = 503;
+    const start = taskListCalls().length;
+    await board.retry();
+    assert.equal(tasks().error?.message, "Task list unavailable", "a v1 task list service failure surfaces");
+    assert.deepEqual(taskListCalls().slice(start).map(({ key, status }) => [key, status]), [["/api/v1/tasks", 503]]);
+
+    taskListSequenced = true;
+    for (const [status, startSeq, endSeq] of [[404, "9.22", "9.23"], [200, "9.24", "9.25"]]) {
+      taskListStatus = status;
+      open("#floor");
+      assert.equal(tasks(), undefined);
+      rows = [running, closed];
+      seq = startSeq;
+      const firstRead = calls.length;
+      open("#board");
+      await until(() => tasks()?.data, "Board renders the fallback list on its first read");
+      assert.deepEqual(columns("#board"), { Running: 1, Closed: 1 });
+
+      assert.equal(last().readyState, 1);
+      const path = status === 404 ? "/api/tasks" : "/api/v1/tasks";
+      const fallbackCalls = () => calls.slice(firstRead).filter(({ key }) => key === path);
+      assert.equal(fallbackCalls().length, 1);
+      rows = [review, closed];
+      seq = endSeq;
+      sendRun(seq, "run.ended", "pr");
+      assert.equal(state(), "running", "an end event without a task patch leaves the card in Running");
+      refresh();
+      await until(() => state() === "pr", `a connected Board refreshes ${path} after an end event without a task update`);
+      assert.equal(fallbackCalls().length, 2);
+      assert.deepEqual(columns("#board"), { "In review": 1, Closed: 1 });
+      assert.deepEqual(columns("#board/open-work"), { "In review": 1 });
+    }
+  } finally {
+    ui.stop();
+    Date.now = now;
+    globalThis.setInterval = interval;
+  }
+}
+
 await transport(false);
 await transport(true);
 await snapshots();
+await boardSnapshots();

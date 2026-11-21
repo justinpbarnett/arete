@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from urllib.parse import unquote
 
 from . import board, codebase, config, contract, control, events, record, refusals, settings, tasks, triage
@@ -8,7 +9,9 @@ from .store import db as foundation
 from .store import tasks as task_store
 
 VIEWS = {"live": "Live", "runs": "Runs", "sessions": "Sessions", "loops": "Loops", "triage": "Triage",
-         "outcomes": "Outcomes", "health": "Health", "incidents": "Incidents", "settings": "Settings", "usage": "Usage"}
+         "outcomes": "Outcomes", "health": "Health", "incidents": "Incidents", "settings": "Settings", "usage": "Usage",
+         "board": "Board"}
+BOARD_STATES = ("needs-info", "failed", "running", "pr", "todo", "done", "closed")
 
 
 def run_object(row):
@@ -44,6 +47,13 @@ def meta():
 
 
 def projection(name, identity=""):
+    if name == "board":
+        rows = task_rows()
+        counts = Counter(row["state"] for row in rows)
+        states = dict.fromkeys((*BOARD_STATES, *counts))
+        running_ids = [row["id"] for row in runs.runs_marked_running(connect=foundation.reader)]
+        return {"tasks": rows, "columns": [{"state": state, "count": counts[state]} for state in states if counts[state]],
+                "running_ids": running_ids}
     return provider(None, "get_" + ("run" if name == "run" else name), identity, {})
 
 
@@ -55,8 +65,6 @@ def provider(handler, name, rest, query):
 
 def resources(name, values):
     cfg = config.load_or_problem()[0]
-    if name == "task":
-        return task_store.tasks()
     if name == "run":
         return [run_object(r) for r in runs.runs(limit=500)]
     if name == "project":
@@ -84,6 +92,10 @@ def resources(name, values):
     if name == "chat":
         return [{"id": str(r["id"]), "detail": r} for r in chats.chats()]
     raise contract.Problem("invalid_input", f"Unknown resource {name}")
+
+
+def task_rows():
+    return [serialize(row, contract.TASK) for row in task_store.tasks()]
 
 
 def prepare(name, values):
@@ -123,7 +135,7 @@ def read(name, values, handler):
     if name == "screen.get":
         view = values.get("view", "live")
         if view not in VIEWS and view not in ("run", "task", "chat", "loop", "incident"):
-            raise contract.Problem("invalid_input", f"Unknown view {view}")
+            raise contract.Problem("not_found" if view == "board" else "invalid_input", f"Unknown view {view}")
         if view == "task":
             needed(task_store.task_get(values.get("id", "")), values.get("id", ""))
         return {"sidebar": projection("sidebar"), "asks": tasks.asks_view(),
@@ -150,6 +162,8 @@ def read(name, values, handler):
         task = needed(task_store.task_get(identity), identity)
         return {"comments": task_store.versioned_comments(identity),
                 "runs": [run_object(r) for r in runs.ticket_runs(task["repo"], identity, limit=500)]}
+    if name == "task.list":
+        return {"tasks": task_rows()}
     resource, action = name.split(".")
     if action == "get" and resource == "run":
         return {"run": run_object(projection("run", identity)["run"])}
