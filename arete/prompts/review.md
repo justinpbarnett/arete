@@ -56,6 +56,17 @@ real caller takes:
 For each blocker set `severity` to `blocker` and `category` to the test it meets, and in `problem` name the path: who
 or what does what, and what goes wrong. If you cannot name that path, it is not a blocker.
 
+Arete can use these optional observations if the repair budget runs out. Keep them factual.
+
+- For an `issue` blocker, supply `scope_gap` only when the requirement is one standalone line under
+  Acceptance criteria, the prerequisite is absent on the base, and adding it is explicitly outside the ticket's
+  scope. Copy the complete line, including its list marker, into `requirement`. Name the missing interface,
+  projection or capability in `prerequisite` and describe its absence in the blocker.
+- For an `issue` or `regression` blocker, supply `recurring_failure` when you can name its observable
+  failure (stale, missing, incorrect, rejected or duplicated), the product path, and the affected fields or
+  cases. Use short names for `path` and each of `instances` and include those names in the blocker. Use the
+  same path name when a distinct instance fails in the same way through that path.
+
 ## Notes
 
 Everything else is a note. Notes never stop the merge; they go on the PR.

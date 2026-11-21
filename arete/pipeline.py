@@ -37,6 +37,7 @@ from . import (
     jev,
     journeys,
     learning,
+    narrowing,
     outbound,
     owner_asks,
     paths,
@@ -455,6 +456,7 @@ class Run(AgentRun):
     answers_due: list[dict] = field(default_factory=list)
     base_note: str = ""
     kept_note: str = ""
+    readmitted_branch: str = ""
 
     @property
     def ref(self) -> str:
@@ -1114,7 +1116,9 @@ def recorded_path(run_id: str) -> str:
     return "classic"
 
 
-def dispatch_path(repo: config.Repo, tid: str) -> str:
+def dispatch_path(repo: config.Repo, tid: str, *, replan: bool = False) -> str:
+    if replan:
+        return wanted(repo)
     newest = run_store.newest_whole_run(repo.name, tid)
     if newest and newest["status"] == "interrupted":
         return recorded_path(newest["id"])
@@ -1123,16 +1127,29 @@ def dispatch_path(repo: config.Repo, tid: str) -> str:
     return wanted(repo)
 
 
+def narrowing_readmission(source: tracker.Tracker, tid: str, proof: runlimits.Readmission | None) -> bool:
+    return bool(proof and narrowing.completed(source, tid, proof.run_id))
+
+
 def run_command(repo_name: str, tid: str | int, force: bool = False, dry_run: bool = False) -> list[str]:
+    from . import launch_lease
+
     cfg = config.load()
+    repo = cfg.repo(repo_name)
+    lease = launch_lease.CURRENT.get()
+    proof = runlimits.Readmission.decode(lease.readmission) if lease else None
+    replan = bool(proof and narrowing_readmission(tracker.for_ticket(cfg, repo, tid), str(tid), proof))
     flags = [*(["--force"] if force else []), *(["--dry-run"] if dry_run else [])]
-    mode = dispatch_path(cfg.repo(repo_name), str(tid))
-    if (asked := answered_run(repo_name, str(tid))) and not dry_run:
+    mode = dispatch_path(repo, str(tid), replan=replan)
+    if not replan and (asked := answered_run(repo_name, str(tid))) and not dry_run:
         mode = recorded_path(asked["id"])
         if mode != "classic":
             return script_command(cfg, mode, repo_name, str(tid), *flags, "--continue", asked["id"])
     if mode == "classic":
         return control.command(["run", repo_name, str(tid), "--local", *flags])
+    if replan:
+        name = "feature" if mode == ADW else "orchestrate" if mode == ORCHESTRATED else mode
+        return script_command(cfg, name, repo_name, str(tid), *flags)
     if mode in (ORCHESTRATED, "orchestrate"):
         from .store import orchestration
 
@@ -1220,13 +1237,28 @@ def parent_run(script: Script | None, earlier: dict | None, budget_history: list
     return parent
 
 
-def park_run(run: Run, reason: str) -> tuple[str, str, str]:
+def park_run(run: Run, error: runlimits.Parked) -> tuple[str, str, str]:
+    from . import pilot
+
+    reason = str(error)
     keep_edits(run)
     held = kept_heads(run)
-    status, summary = "failed", (f"parked: {reason}; branch and evidence retained, workspace left in place"
-                                 f"{', edits kept in a local commit' if held else ''}. {runlimits.RETRY}")
     kept = run.budget.park(reason, held)
     record.note(run.id, **kept)
+    retry = runlimits.RETRY
+    if isinstance(error, runlimits.RepairsExhausted) and not pilot.is_pilot_task(str(run.tid)):
+        try:
+            if outcome := narrowing.attempt(run):
+                reason += f" ({outcome})"
+                if outcome == narrowing.CAP:
+                    saved = runlimits.metadata(run.id, "parked.json")
+                    util.write_json(runlimits.artifact(run.id, "parked.json"), {**saved, "reason": reason})
+                if outcome == narrowing.NARROWED:
+                    retry = "Poll will reconsider the updated ticket with a fresh budget."
+        except Exception as e:
+            run.log(f"automatic narrowing deferred: {type(e).__name__}: {outbound.sanitize(str(e), 200)}")
+    status, summary = "failed", (f"parked: {reason}; branch and evidence retained, workspace left in place"
+                                 f"{', edits kept in a local commit' if held else ''}. {retry}")
     pr_url = kept["pr_url"]
     run.log(summary)
     run.enter("failed")
@@ -1318,8 +1350,14 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
     except ValueError as e:
         print(f"{repo_name}: {e}")
         return 1
+    try:
+        readmission = None if force else runlimits.Readmission.decode(launch_lease.readmission(repo.name, str(tid)))
+    except (ValueError, OSError) as e:
+        print(f"could not validate poll readmission: {e}")
+        return 2
+    replan = narrowing_readmission(tk, str(tid), readmission)
     if not script:
-        adw = dispatch_path(repo, str(tid)) != "classic"
+        adw = dispatch_path(repo, str(tid), replan=replan) != "classic"
     if adw and not script:
         return exec_script(repo.name, tid, dry_run, force)
     if script and (refusal := script_refusal(cfg, repo, tid, script, dry_run)):
@@ -1354,8 +1392,10 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 wall_deadline = permit["deadline"]
             if isinstance(tk, tracker.GitHubTracker):
                 tk.require_ordinary(tid)
+            if not dry_run and narrowing.pending(tk, str(tid)):
+                print(narrowing.PENDING)
+                return 2
             budget_history = run_store.ticket_runs(repo.name, tid, limit=1)
-            readmission = None if force else runlimits.Readmission.decode(launch_lease.readmission(repo.name, str(tid)))
             blocked, reset_budget = runlimits.admission(repo, str(tid), tk, runlimits.Policy.of(layer), force,
                                                        readmission=readmission)
         except tracker.ERRORS as e:
@@ -1370,6 +1410,13 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         if blocked and not dry_run:
             print(blocked)
             return 2
+        replan = replan and reset_budget
+        readmitted_branch = ""
+        if replan:
+            row, parked = runlimits.latest_park(repo.name, str(tid))
+            readmitted_branch = runlimits.park_branch(row, parked)
+            if script:
+                script = replace(script, continues="", repairs="")
         if script and script.repairs and (later := run_store.later_run(repo.name, tid, script.repairs)):
             print(f"run {later['id']} of {name} came after run {script.repairs}, so it is not repaired twice")
             return 1
@@ -1396,7 +1443,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             settled = [done for dead_row in run_store.ticket_runs_marked_running(repo.name, tid)
                        if (done := record.interrupt(dead_row))]
             earlier = None if only else run_store.newest_live_whole_run(repo.name, tid)
-            restarting = bool(earlier) and earlier["status"] == "interrupted"
+            restarting = not replan and bool(earlier) and earlier["status"] == "interrupted"
             mending = (script.repairs or repaired_by(script.continues or (earlier["id"] if restarting else ""))
                        ) if script else ""
             if pilot.is_pilot_task(str(tid)):
@@ -1456,8 +1503,9 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             scratch.RUN_BASELINES[run_id] = producer_baseline
             scratch.RUN_LABELS[run_id] = service_labels
             run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force,
-                      feedback=[] if mending or zte_grant else pending_feedback(repo.name, tid), repairs=mending,
-                      answering=earlier if earlier and earlier["status"] == "needs-info" else {},
+                      feedback=[] if mending or zte_grant or replan else pending_feedback(repo.name, tid), repairs=mending,
+                      answering=earlier if earlier and earlier["status"] == "needs-info" and not replan else {},
+                      readmitted_branch=readmitted_branch,
                       launch_gate=admission, launch_done=launch_done, closed_context=closed_context,
                 **(script.run_fields if script else {}))
             try:
@@ -1553,7 +1601,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         except runlimits.Parked as e:
             if zte_grant:
                 return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
-            status, summary, pr_url = park_run(run, str(e))
+            status, summary, pr_url = park_run(run, e)
         except factory.OnlyDone as e:
             if zte_grant:
                 return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
@@ -1922,6 +1970,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
     reviews, n = max(1, run.settings("review").tries), 1
     review, reply = _review(b, plan_to_review, verified), ""
     note_review(run, review, verified)
+    narrowing.review_record(run, t, review)
     while review.verdict == "request_changes" and n < reviews:
         if problems := review.findings():
             run.story.append(f"Review requested changes:\n{problems}")
@@ -1933,8 +1982,8 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
         n += 1
         review = _review(b, plan_to_review, verified, round_name("review", n), review, reply)
         note_review(run, review, verified)
+        narrowing.review_record(run, t, review)
     draft_why = draft_reason(review, verified, n)
-    note_review(run, review, verified)
     run.facts["held"] = draft_why
     _learn(run, ws, layer.expertise_file, t.title, apply=True)
     staged = b.restage()
@@ -2791,7 +2840,8 @@ def images_note(images: tracker.SavedImages) -> str:
 
 
 def open_branch(run: Run) -> str:
-    return next((r["branch"] for r in run_store.open_runs(run.repo.name, run.tid) if r.get("branch")), "")
+    return run.readmitted_branch or next(
+        (r["branch"] for r in run_store.open_runs(run.repo.name, run.tid) if r.get("branch")), "")
 
 
 def with_siblings(body: str, section: str) -> str:
@@ -2933,8 +2983,10 @@ def repair_in_use(b: Build, attempt: int, tries: int, verified: verify.Verified)
 
 @runlimits.verification
 def check_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
-    return use_product(b, "verify", "verify", goal=goal, summary=summary.strip()[:4000],
-                       diff=util.tail(diffguard.fold_moved(b.staged.patch), MAX_DIFF_IN_PROMPT))
+    verified = use_product(b, "verify", "verify", goal=goal, summary=summary.strip()[:4000],
+                           diff=util.tail(diffguard.fold_moved(b.staged.patch), MAX_DIFF_IN_PROMPT))
+    narrowing.verification_record(b.run, b.ticket, verified)
+    return verified
 
 
 def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "verify",
@@ -3421,6 +3473,8 @@ def tell_ticket_run_died(cfg: config.Config, row: dict) -> None:
     elif row["status"] == "stopped":
         run.log(record.STOPPED)
         run.give_up("was stopped by request")
+    elif runlimits.artifact(run.id, "parked.json").is_file():
+        run.enter("failed")
     elif row["status"] == "failed":
         run.log(f"{record.INTERRUPTED}, the second interruption in a row")
         run.give_up(f"{record.INTERRUPTED}, the second interruption in a row")

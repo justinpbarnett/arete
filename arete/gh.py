@@ -146,9 +146,14 @@ def comment_key(path: str, key: str, start):
 
 
 def keyed_comment(args: list[str], body: str, path: str, mark: bool = False, envelope: bool = False,
-                  *, single_attempt: bool = False) -> str:
+                  *, single_attempt: bool = False, run_link: tuple[str, int] | None = None) -> str:
     key, start = uuid.uuid4().hex, util.now()
     payload = outgoing(body, mark=mark, key=key)
+    if run_link:
+        run_id, port = run_link
+        if not re.fullmatch(r"[a-zA-Z0-9_.-]+", run_id) or type(port) is not int or not 0 < port < 65536:
+            raise ValueError("invalid local dashboard run link")
+        payload = Outgoing(f"{payload}\n\n[Run `{run_id}`](http://localhost:{port}/#run/{run_id})")
     if envelope:
         payload = Outgoing(json.dumps({"body": payload}))
     try:
@@ -236,9 +241,9 @@ def find_pr_marker(repo: str, branch: str, marker: str) -> str:
 
 
 def issue_comment(repo: str, number: int, body: str, *, return_url: bool = False,
-                  single_attempt: bool = False) -> str | None:
+                  single_attempt: bool = False, run_link: tuple[str, int] | None = None) -> str | None:
     url = keyed_comment(["issue", "comment", str(number), "--repo", repo, "--body-file", "-"], body,
-                        f"repos/{repo}/issues/{number}/comments", single_attempt=single_attempt)
+                        f"repos/{repo}/issues/{number}/comments", single_attempt=single_attempt, run_link=run_link)
     return url if return_url else None
 
 
@@ -282,8 +287,9 @@ def issue_state(repo: str, number: int) -> str:
         raise
 
 
-def issue_edit_body(repo: str, number: int, body: str) -> None:
-    gh(["issue", "edit", str(number), "--repo", repo, "--body-file", "-"], input=outgoing(body))
+def issue_edit_body(repo: str, number: int, body: str, *, single_attempt: bool = False) -> None:
+    gh(["issue", "edit", str(number), "--repo", repo, "--body-file", "-"], input=outgoing(body),
+       write=single_attempt, retry=not single_attempt)
 
 
 def issue_reopen(repo: str, number: int) -> None:

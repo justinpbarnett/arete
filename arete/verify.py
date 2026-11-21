@@ -44,6 +44,7 @@ SCHEMA = {
                 "what": {"type": "string"},
                 "how": {"type": "string"},
                 "saw": {"type": "string"},
+                "missing_prerequisite": {"type": "string"},
                 "passed": {"type": "boolean"},
                 "cause": {"type": "string", "enum": ["change", "environment"]},
                 "screenshot": {"type": "string"},

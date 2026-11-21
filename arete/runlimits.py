@@ -31,6 +31,10 @@ class Parked(BaseException):
     pass
 
 
+class RepairsExhausted(Parked):
+    pass
+
+
 @dataclass(frozen=True)
 class Policy:
     max_repair_cycles: int = 2
@@ -547,7 +551,7 @@ class Budget:
             return
         count = self.prior_repairs + self.repair_calls
         if count >= self.policy.max_repair_cycles:
-            raise Parked(f"the repair chain used its {self.policy.max_repair_cycles} repair cycles")
+            raise RepairsExhausted(f"the repair chain used its {self.policy.max_repair_cycles} repair cycles")
         self.repair_calls += 1
         self.persist()
         run_lines.write(self.run.id, "budget_repair", call=step, atom=role, used=count + 1)

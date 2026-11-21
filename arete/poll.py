@@ -11,6 +11,7 @@ from . import (
     intake,
     jira,
     launch_lease,
+    narrowing,
     oncall,
     outcomes,
     owner_asks,
@@ -44,6 +45,7 @@ from .slots import slots_free_to_start
 from .store import asks as ask_store
 from .store import asks as asks_store
 from .store import insights as insights_store
+from .store import narrowings as narrowing_store
 from .store import runs as run_store
 from .store import sources as source_store
 from .workspace import cleanup_worktrees
@@ -122,10 +124,10 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
 
 
 def step_without_route(cfg: config.Config, repo: config.Repo, ticket: tracker.Ticket,
-                  discovery: routing.Discovery, layer: config.RepoLayer) -> str:
+                  discovery: routing.Discovery, layer: config.RepoLayer, *, replan: bool = False) -> str:
     if cfg.replay.all:
         return ""
-    mode = pipeline.dispatch_path(repo, str(ticket.id))
+    mode = pipeline.dispatch_path(repo, str(ticket.id), replan=replan)
     adaptive = mode in (pipeline.ORCHESTRATED, "orchestrate")
     first = ("orchestrate", "build") if adaptive else ("plan", "build")
     if (not adaptive and layer.factory_path == pipeline.ADW and len(repo.parts) <= 1
@@ -133,10 +135,10 @@ def step_without_route(cfg: config.Config, repo: config.Repo, ticket: tracker.Ti
             and not patching.specification_refusal(ticket)):
         first = ("build",)
     newest = run_store.newest_whole_run(repo.name, ticket.id)
-    if (layer.factory_path == pipeline.ADW and newest and newest["status"] == "interrupted"
+    if (not replan and layer.factory_path == pipeline.ADW and newest and newest["status"] == "interrupted"
             and repaired_by(newest["id"])):
         first = ("review_repair",)
-    elif pending_feedback(repo.name, ticket.id):
+    elif not replan and pending_feedback(repo.name, ticket.id):
         source = next(iter(run_store.open_runs(repo.name, ticket.id)), None)
         if not source or pipeline.recorded_path(source["id"]) not in (pipeline.ORCHESTRATED, "orchestrate"):
             first = ("build",)
@@ -214,6 +216,14 @@ class RepoQueue:
     recovered: tuple[tracker.Ticket, ...] = ()
 
 
+def reconcile_narrowings(queue: RepoQueue, errors: list[str]) -> None:
+    source = queue.tracker
+    if isinstance(source, tracker.GitHubTracker):
+        for operation in narrowing_store.pending(source.repo.github.casefold()):
+            guard(errors, tracker.issue_name(queue.repo.name, operation["issue"]),
+                  lambda: narrowing.recover(source, operation))
+
+
 def requeue_failures(cfg: config.Config, queue: RepoQueue, dry_run: bool, errors: list[str]) -> None:
     source = queue.tracker
     if not isinstance(source, tracker.GitHubTracker) or not queue.repo.parts:
@@ -281,12 +291,14 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: tuple[str, str], skip
         print(f"{util.iso()} {name}: waiting, {waiting}")
         return "held"
     ticket = source.get(tid)
-    blocked, readmission = runlimits.poll_admission(repo, str(tid), ticket, runlimits.Policy.of(layer))
+    blocked, readmission = (narrowing.PENDING, None) if narrowing.pending(source, str(tid)) else (
+        runlimits.poll_admission(repo, str(tid), ticket, runlimits.Policy.of(layer)))
     blocked = blocked or source.blocker(tid) or reply
     if not blocked:
         if not zte.reserved(str(tid)):
             ticket = intake.route_ticket(cfg, repo, source, ticket, dry_run=dry_run)
-        blocked = step_without_route(cfg, repo, ticket, queue.discovery, layer)
+        replan = pipeline.narrowing_readmission(source, str(tid), readmission)
+        blocked = step_without_route(cfg, repo, ticket, queue.discovery, layer, replan=replan)
     if blocked:
         skips.note(name, ticket, blocked, repo.name)
         print(f"{util.iso()} {name}: {blocked}")
@@ -380,6 +392,8 @@ def poll(dry_run: bool = False) -> int:
         routes = jira_routes_by_project(cfg)
         queues, reached_clients = repo_queues(cfg, pipeline_repos, routes, skips, errors)
         for queue in queues:
+            if not dry_run:
+                guard(errors, f"{queue.repo.name} ticket narrowing", lambda: reconcile_narrowings(queue, errors))
             guard(errors, f"{queue.repo.name} environment requeues", lambda: requeue_failures(cfg, queue, dry_run, errors))
         selected_work = fill_slots(cfg, queues, skips, dry_run, errors, going, slots)
         report_unrouted(routes, reached_clients, skips, errors)

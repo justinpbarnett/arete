@@ -164,6 +164,12 @@ def run_get(run_id: str, connect=reader) -> dict | None:
         return dict(r) if r else None
 
 
+def chronological_run_ids(ids: list[str]) -> list[str]:
+    with reader() as c:
+        return [r["id"] for r in c.execute(
+            f"SELECT id FROM runs WHERE id IN ({','.join('?' for _ in ids)}) ORDER BY started, rowid", ids)]
+
+
 def save_report(run_id: str, report: dict, connect=db) -> None:
     with connect() as c:
         c.execute("INSERT OR REPLACE INTO reports (run_id, saved, report) VALUES (?, ?, ?)",

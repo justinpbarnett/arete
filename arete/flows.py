@@ -918,6 +918,7 @@ def verify(flow: factory.Flow, tree: str, single: bool = False) -> Outcome:
         check = pipeline.check_in_use if single else pipeline.verify_in_use
         verified = check(b, job.with_left(job.goal), job.build_summary)
     return Outcome("pass", data={"verified": asdict(verified), "names": dict(b.steps), "story": job.run.story,
+                                 "specification": pipeline.runlimits.specification(job.ticket),
                                  "policy": job.policy("verify", {}), "checked": b.checked})
 
 
@@ -929,7 +930,8 @@ def review(flow: factory.Flow, second: bool = False, attempt: int = 1, tries: in
     said = pipeline._review(job.staged(), job.with_left(job.plan_text), job.verified,
                             pipeline.round_name("review", attempt), job.review if attempt > 1 else None,
                             job.fix_reply)
-    data = {"review": said.asdict(), "attempt": attempt, "story": run.story}
+    data = {"review": said.asdict(), "attempt": attempt, "story": run.story,
+            "specification": pipeline.runlimits.specification(job.ticket)}
     if said.verdict != "request_changes":
         return Outcome("pass", data=data)
     problems = said.findings()

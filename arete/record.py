@@ -159,6 +159,8 @@ def dead_status(row: dict) -> str:
     if row.get("only_step"):
         return "interrupted"
     if row["kind"] == "pipeline":
+        if (paths.RUNS_DIR / row["id"] / "parked.json").is_file():
+            return "failed"
         earlier = [r for r in run_store.ticket_runs(row["repo"], row["issue"], limit=2, whole=True, live=True)
                    if r["id"] != row["id"]]
         return "failed" if earlier and earlier[0]["status"] == "interrupted" else "interrupted"

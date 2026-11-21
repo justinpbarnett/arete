@@ -3,6 +3,13 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 
 BLOCKER_CATEGORIES = ("issue", "regression", "security", "data_loss")
+RECURRING_FAILURES = {
+    "stale": "stay current",
+    "missing": "remain available",
+    "incorrect": "return the expected result",
+    "rejected": "accept supported input",
+    "duplicated": "appear only once",
+}
 UNWAIVABLE = ("security", "data_loss")
 EARLIER_STATUSES = ("fixed", "open", "waived")
 NOTE_SEVERITIES = ("major", "minor")
@@ -21,6 +28,23 @@ REVIEW_SCHEMA = {
                     "problem": {"type": "string"},
                     "severity": {"type": "string", "enum": ["blocker", "major", "minor"]},
                     "category": {"type": "string", "enum": list(BLOCKER_CATEGORIES)},
+                    "scope_gap": {
+                        "type": "object",
+                        "properties": {
+                            "requirement": {"type": "string"},
+                            "prerequisite": {"type": "string"},
+                        },
+                        "required": ["requirement", "prerequisite"],
+                    },
+                    "recurring_failure": {
+                        "type": "object",
+                        "properties": {
+                            "failure": {"type": "string", "enum": list(RECURRING_FAILURES)},
+                            "path": {"type": "string"},
+                            "instances": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "required": ["failure", "path", "instances"],
+                    },
                 },
                 "required": ["problem", "severity"],
             },
@@ -161,7 +185,8 @@ def review_problems(listed) -> list[dict]:
     return [{"file": p.get("file") or "", "problem": p.get("problem") or "",
              "severity": str(p.get("severity") or "unrated").strip().lower(),
              "category": str(p.get("category") or "").strip().lower()
-             if str(p.get("category") or "").strip().lower() in BLOCKER_CATEGORIES else ""}
+             if str(p.get("category") or "").strip().lower() in BLOCKER_CATEGORIES else "",
+             **{key: p[key] for key in ("scope_gap", "recurring_failure") if isinstance(p.get(key), dict)}}
             for p in listed if isinstance(p, dict)]
 
 

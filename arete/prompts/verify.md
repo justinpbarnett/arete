@@ -66,6 +66,8 @@ $journeys## Rules
   - `what`: the behavior, in the user's words.
   - `how`: the exact command, request, or clicks.
   - `saw`: what came back. Quote the output, the status and body, or what the page showed.
+  - `missing_prerequisite`: optional short name of a capability this check observed was already absent on
+    the base. Include that name and the observation in `saw`. Leave it out if absence was inferred.
   - `passed`: true only when what you saw is what the change should give.
   - `cause`: on a check with `passed` false, `environment` when your own tools or sandbox could not run the check, such as a
     denied command or the browser tool failing before the page loaded; `change` when the product misbehaved, including a
