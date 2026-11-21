@@ -4,6 +4,8 @@ voice and format, as briefly as it can be said.
 
 $proposals
 
+Denied paths: $denied.
+
 Rules:
 
 - Only touch the files named. Never touch settings.json, hooks, CI, or code.

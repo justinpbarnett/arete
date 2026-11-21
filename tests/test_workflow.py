@@ -1525,21 +1525,21 @@ class CatchUpRepairFixture(PublicationFixture):
         self.assertIsNone(controller.ending)
         controller.recover()
         self.assertEqual(controller.data["evidence"], {})
-        setting = SimpleNamespace(step="build", runner="codex", model="test", provider="", effort="low", tools=("Edit",))
+        setting = pipeline.steps.resolve(self.build.cfg, self.build.layer, "build", controller.run.kind,
+                                         {"runner": "codex", "model": "test", "effort": "low"})
         controller.catalog.worker.return_value = setting, "delegate", True
-        worker = mock.Mock(pid=123, identity=456, step="worker")
-        worker.proc.poll.return_value = None
-        worker.receive.return_value = [{"event": "launch", "step": "worker", "role": role, "route": ""},
-                                       {"event": "result", "ok": True, "text": "Repaired"}]
 
         def repair(_):
             self.assertEqual(self.git("rev-parse", "HEAD"), candidate)
             self.assertTrue((self.root / "incoming.txt").is_file())
             self.file.write_text("repaired implementation\n")
 
-        worker.allow.side_effect = repair
-        request = mock.Mock()
-        repair_setting = SimpleNamespace(**{**vars(setting), "step": role})
+        messages = [{"event": "launch", "step": "worker", "role": role, "route": {}},
+                    {"event": "result", "ok": True, "text": "Repaired"}]
+        worker = SimpleNamespace(pid=123, identity=456, step="worker", receive=lambda: messages,
+                                 allow=repair, close=lambda: None)
+        request = mock.Mock(wraps=orchestration.delegation.request)
+        repair_setting = replace(setting, step=role)
         with (mock.patch.object(pipeline.steps, "resolve", return_value=repair_setting),
               mock.patch.object(orchestration.delegation, "Worker", return_value=worker),
               mock.patch.object(orchestration.delegation, "request", request),
