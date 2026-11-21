@@ -387,7 +387,11 @@ def outside_scratch(ws: Path, names: list[str], held: list[Path]) -> list[str]:
 def note_made(ws: Path, checkouts: list[Checkout], owner: dict | None = None,
               *, preserve: Collection[str] = (), excluded: Collection[Path] = ()) -> None:
     try:
-        owner = owner or owner_in(made_before(ws))
+        before = made_before(ws) if excluded or not owner else {}
+        owner = owner or owner_in(before)
+        salt = salt_of(before) if excluded else ""
+        excluded_records = {n: digest for n, digest in before.items() if salt and not n.startswith("\0")
+                            and any((ws / n).is_relative_to(wt) for wt in excluded)}
         names, held = [], []
         if ws.is_dir():
             names, held = leftovers(ws, checkouts, excluded=excluded), scratch_left(ws, checkouts)
@@ -398,9 +402,9 @@ def note_made(ws: Path, checkouts: list[Checkout], owner: dict | None = None,
                 names = [n for n in names if Path(n) not in protected]
         heads = {head_key(c): git(["rev-parse", "HEAD"], c.wt).strip() for c in checkouts if (c.wt / ".git").exists()}
         heads |= {onto_key(c): c.onto for c in checkouts if c.onto and (c.wt / ".git").exists()}
-        if names or heads:
-            salt = os.urandom(16).hex()
-            made = {n: fingerprint(ws / n, salt) for n in names} | heads | {SALT_KEY: salt}
+        if names or heads or excluded_records:
+            salt = salt if excluded_records else os.urandom(16).hex()
+            made = excluded_records | {n: fingerprint(ws / n, salt) for n in names} | heads | {SALT_KEY: salt}
             if owner:
                 made[OWNER_KEY] = owner
             if held:
@@ -416,37 +420,52 @@ def note_made(ws: Path, checkouts: list[Checkout], owner: dict | None = None,
     made_record(ws).unlink(missing_ok=True)
 
 
-def kept_work(ws: Path, checkouts: list[Checkout], source: Path, copies: list[str], commits: bool = True,
-              held: list[Path] | None = None, *, excluded: Collection[Path] = ()) -> str:
-    made = made_before(ws)
-    salt = salt_of(made)
+def unrecorded_files(ws: Path, names: list[str], source: Path, copies: list[str], made: dict,
+                     held: list[Path] | None) -> list[str]:
+    if held:
+        names = outside_scratch(ws, names, held)
+    return [n for n in names if not made_copy(ws, source, copies, n) and not recorded(made, ws, n)]
 
-    def unknown(names: list[str]) -> list[str]:
-        if held:
-            names = outside_scratch(ws, names, held)
-        return [n for n in names if not made_copy(ws, source, copies, n)
-                and not (salt and made.get(n) == fingerprint(ws / n, salt))]
 
-    examined = {c.wt for c in checkouts if (c.wt / ".git").exists()}
-    for c in checkouts:
-        if c.wt not in examined:
-            continue
-        try:
-            edits = unknown([c.prefix + n for n in uncommitted(c.wt)])
-            ignored = unknown([c.prefix + n for n in ignored_files(c.wt)])
+def kept_checkout(ws: Path, c: Checkout, source: Path, copies: list[str], *,
+                  made: dict | None = None, commits: bool = True, held: list[Path] | None = None,
+                  closed: bool = False) -> str:
+    try:
+        if closed and not (c.wt / ".git").exists():
+            if c.wt.is_symlink() or (c.wt.exists() and any(c.wt.iterdir())):
+                return f"The closed PR checkout `{c.github}` at `{c.wt}` is incomplete. Arete left its files in place."
+            return ""
+        made = made_before(ws) if made is None else made
+        edits = uncommitted(c.wt)
+        if edits and closed:
+            return f"The closed PR checkout `{c.github}` at `{c.wt}` has uncommitted edits. Arete left them in place."
+        edits = unrecorded_files(ws, [c.prefix + n for n in edits], source, copies, made, held)
+        ignored = unrecorded_files(ws, [c.prefix + n for n in ignored_files(c.wt)], source, copies, made, held)
+        ahead = "0"
+        if not closed:
             ahead = git(["rev-list", "--count", "HEAD", "--not", "--remotes=origin"], c.wt).strip() if commits else "0"
             if head_recorded(made, c) == git(["rev-parse", "HEAD"], c.wt).strip():
                 ahead = "0"
-        except (RuntimeError, OSError) as e:
-            return f"arete could not read the existing worktree {c.wt} of {c.github}, so it left it as it is: {e}"
-        if edits or ignored or ahead != "0":
-            what = (f"uncommitted edits that arete has no record of leaving there ({', '.join(edits[:5])})" if edits
-                    else (f"git-ignored files that arete has no record of leaving there ({', '.join(ignored[:5])})"
-                          if ignored else f"{util.count(int(ahead), 'commit')} that are not on origin"))
-            return (f"the existing worktree {c.wt} of {c.github} holds {what}, so arete did not make it again and "
-                    "left them as they are; move or remove them, then run again")
+    except (RuntimeError, OSError) as e:
+        return f"arete could not read the existing worktree {c.wt} of {c.github}, so it left it as it is: {e}"
+    if edits or ignored or ahead != "0":
+        what = (f"uncommitted edits that arete has no record of leaving there ({', '.join(edits[:5])})" if edits
+                else (f"git-ignored files that arete has no record of leaving there ({', '.join(ignored[:5])})"
+                      if ignored else f"{util.count(int(ahead), 'commit')} that are not on origin"))
+        return (f"the existing worktree {c.wt} of {c.github} holds {what}, so arete did not make it again and "
+                "left them as they are; move or remove them, then run again")
+    return ""
+
+
+def kept_work(ws: Path, checkouts: list[Checkout], source: Path, copies: list[str], commits: bool = True,
+              held: list[Path] | None = None, *, excluded: Collection[Path] = ()) -> str:
+    made = made_before(ws)
+    examined = {c.wt for c in checkouts if (c.wt / ".git").exists()}
+    for c in checkouts:
+        if c.wt in examined and (why := kept_checkout(ws, c, source, copies, made=made, commits=commits, held=held)):
+            return why
     try:
-        others = unknown(unexamined(ws, examined.union(excluded)))
+        others = unrecorded_files(ws, unexamined(ws, examined.union(excluded)), source, copies, made, held)
     except OSError as e:
         return f"arete could not read the existing workspace {ws}, so it left it as it is: {e}"
     if others:

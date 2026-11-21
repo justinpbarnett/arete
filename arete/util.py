@@ -88,18 +88,15 @@ def sh(
     input: str | None = None,
     inherit: bool = True,
     keeps: tuple[str, ...] = (),
-    *,
-    write_denied: tuple[Path, ...] = (),
 ) -> subprocess.CompletedProcess:
-    return _sh(cmd, cwd, timeout, check, env, input, inherit, keeps, write_denied=write_denied)
+    return _sh(cmd, cwd, timeout, check, env, input, inherit, keeps)
 
 
 def _sh(cmd, cwd=None, timeout=600, check=False, env=None, input=None, inherit=True, keeps=(), *,
         deploy=False, restore_paths=(), binary=False, graceful_timeout=False,
-        index_lock: _DeployIndexLock | None = None, write_denied=()) -> subprocess.CompletedProcess:
+        index_lock: _DeployIndexLock | None = None) -> subprocess.CompletedProcess:
     full_env = foreground_maintenance({**(os.environ if inherit else {}), **(env or {})})
-    confinement = {"write_denied": write_denied} if write_denied else {}
-    command = sandbox.protected_command(cmd, cwd, keeps, _deploy=deploy, _restore_paths=restore_paths, **confinement)
+    command = sandbox.protected_command(cmd, cwd, keeps, _deploy=deploy, _restore_paths=restore_paths)
     try:
         res = run_whole_tree(
             command,

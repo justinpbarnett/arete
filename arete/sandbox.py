@@ -118,13 +118,11 @@ def already_protects_authority() -> bool:
                for root in (paths.ZTE_REHEARSAL_INSTALL, paths.ZTE_LIVE_INSTALL))
 
 
-def protected_command(command, cwd=None, keeps=(), *, write_denied=(), _deploy=False, _restore_paths=()):
-    if write_denied and not can_confine(False):
-        raise ConfinementUnavailable("closed PR worktrees require local filesystem confinement")
-    if not can_confine(False) or (not write_denied and sandboxed() and already_protects_authority()):
+def protected_command(command, cwd=None, keeps=(), *, _deploy=False, _restore_paths=()):
+    if not can_confine(False) or (sandboxed() and already_protects_authority()):
         return command
     words = ["/bin/sh", "-c", command] if isinstance(command, str) else list(command)
-    return write_confinement(Path(cwd or Path.cwd()), [], restrict_writes=False, write_denied=write_denied,
+    return write_confinement(Path(cwd or Path.cwd()), [], restrict_writes=False,
                              keeps=tuple(keeps), _deploy=_deploy, _restore_paths=_restore_paths) + words
 
 
@@ -136,7 +134,6 @@ def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = 
                       mach: tuple[tuple[str, ...], str] | None = None, tcp_port: int | None = None,
                       denied_ports: tuple[int, ...] = (), listen_port: int | None = None,
                       private_temporary: bool = False, read_roots: tuple[Path, ...] | None = None,
-                      write_denied: tuple[Path, ...] = (),
                       _deploy: bool = False, _restore_paths: tuple[Path, ...] = ()) -> list[str]:
     hidden = tuple(dict.fromkeys((*hidden, *authority_roots())))
     roots = [cwd, *add_dirs, *([AGENT_DIR, LOGIN_DIR, KEY_DIR, SESSIONS_DIR] if agent_roots else [])]
@@ -166,9 +163,6 @@ def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = 
     for i, path in enumerate(hidden):
         params += ["-D", f"H{i}={real_path(path)}"]
         profile += f'(deny file-read* file-write* file-link (subpath (param "H{i}")))'
-    for i, path in enumerate(write_denied):
-        params += ["-D", f"NO_WRITE{i}={real_path(path)}"]
-        profile += f'(deny file-write* file-link (subpath (param "NO_WRITE{i}")))'
     if peers:
         params += ["-D", f"PEERS={real_path(peers)}", "-D", f"WORK={real_path(cwd)}"]
         profile += ('(deny file-read* file-write* (require-all (subpath (param "PEERS")) '
@@ -204,7 +198,7 @@ def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = 
     for i, root in enumerate((paths.ZTE_REHEARSAL_INSTALL, paths.ZTE_LIVE_INSTALL)):
         params += ["-D", f"INSTALL{i}={real_path(root)}"]
         profile += f'(deny file-write* file-link (subpath (param "INSTALL{i}")))'
-    ancestors = {*engine.parents, *(p for root in (*hidden, *write_denied, Path(sys.prefix)) for p in real_path(root).parents)}
+    ancestors = {*engine.parents, *(p for root in (*hidden, Path(sys.prefix)) for p in real_path(root).parents)}
     for i, path in enumerate(sorted(ancestors)):
         params += ["-D", f"A{i}={path}"]
         profile += f'(deny file-write* (literal (param "A{i}")))'

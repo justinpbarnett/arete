@@ -444,7 +444,7 @@ def rebuild(job: Job, line: dict, *, layer: config.RepoLayer | None = None, setu
     ws = Path(line["tree"])
     admitted = layer is not None
     layer = layer or pipeline.checked_layer(job.cfg, Path(line["data"]["layer"]) if setup else job.run.repo.layer_dir)
-    excluded = job.run.excluded_worktrees
+    excluded = job.run.closed_checkout_paths
     if excluded:
         if held := workspace.scratch_held(ws, made):
             return f"verification scratch at {held[0]} is still held; poll finalizes it once its holders end"
@@ -523,7 +523,6 @@ class Job:
     patch_mode: bool = False
     prepared_feedback_prs: list[str] = field(default_factory=list)
     closed_prs: set[str] = field(default_factory=set)
-    closed_checkouts: list[workspace.Checkout] = field(default_factory=list)
     policy_retry: dict = field(default_factory=dict)
     check_publication_targets: Callable[[], None] | None = None
 
@@ -536,27 +535,27 @@ class Job:
             return "the check in use was blocked; this change requires behavioral evidence"
         return pipeline.draft_reason(self.review, self.verified, self.reviews)
 
-    def merge_moved_base(self, name: str) -> list[workspace.Checkout]:
+    def merge_moved_base(self, name: str, *, before_resolve: Callable[[], None] | None = None) -> list[workspace.Checkout]:
         moved, self.moved_base = self.moved_base, ""
         held = [c for c in self.checkouts if c.onto]
         merged = []
         if moved and held:
             self.run.log(f"{moved} since run {self.continues} prepared, so arete merges the new base into the edits "
                          f"that run kept before {name} runs with the answers")
-            merged = pipeline.merge_base_into_kept(self.run, held, self.layer, self.ticket)
+            merged = pipeline.merge_base_into_kept(self.run, held, self.layer, self.ticket, before_resolve=before_resolve)
             if merged:
                 self.run.base_note = pipeline.base_merge_note(merged)
                 if self.built is not None:
                     self.built.workspace = self.workspace
                     for checkout in merged:
                         self.built.worker_trees.pop(checkout.github, None)
-                workspace.note_made(self.ws, self.checkouts, excluded=self.run.excluded_worktrees)
+                workspace.note_made(self.ws, self.checkouts, excluded=self.run.closed_checkout_paths)
         self.run.kept_note = pipeline.kept_edits_note(held) if self.run.answers_due else ""
         return merged
 
     @property
     def workspace_checkouts(self) -> list[workspace.Checkout]:
-        return self.checkouts + self.closed_checkouts
+        return self.checkouts + self.run.closed_checkouts
 
     @property
     def with_prs(self) -> list[workspace.Checkout]:
@@ -810,7 +809,7 @@ class Job:
         self.expertise, self.approval = data["expertise"], data.get("approval")
         checkouts = [workspace.Checkout.from_row(c) for c in data["checkouts"]]
         self.checkouts = [c for c in checkouts if c.pr not in self.closed_prs]
-        self.closed_checkouts = [c for c in checkouts if c.pr in self.closed_prs]
+        run.closed_checkouts = [c for c in checkouts if c.pr in self.closed_prs]
         leases = {c.github: c.lease for c in self.checkouts}
         for c in self.checkouts:
             if str(c.wt) in self.restored:
@@ -824,7 +823,7 @@ class Job:
             if not reconciling_catch_up:
                 kept = workspace.kept_onto(self.ws, self.checkouts, self.branch)
                 if why := workspace.kept_work(self.ws, self.checkouts, run.repo.path, self.layer.copy,
-                                              excluded=run.excluded_worktrees):
+                                              excluded=run.closed_checkout_paths):
                     raise workspace.worktree_failure(why, self.ws, self.branch)
                 for c in self.checkouts:
                     c.onto = kept.get(str(c.wt), "")
@@ -921,17 +920,21 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
         parts = {(p.dir, p.github, job.ws / p.dir) for p in repo.parts}
         closed = [workspace.Checkout.from_row(row) for row in job.policy_retry.get("closed_checkouts", ())]
         closed = [c for c in closed if (c.dir, c.github, c.wt) in parts]
-        if not any((c.wt / ".git").exists() and workspace.uncommitted(c.wt) for c in closed):
-            job.closed_checkouts = closed
+        attached = [c for c in closed if (c.wt / ".git").exists()]
+        if not any(workspace.uncommitted(c.wt) for c in attached):
+            for c in attached:
+                if why := workspace.kept_checkout(job.ws, c, repo.path, main_layer.copy, closed=True):
+                    error = workspace.worktree_failure(why, job.ws, branch)
+                    return end_as("fail", "failed", why=why, recovery=error.recovery)
+            run.closed_checkouts = closed
             job.closed_prs = {c.pr for c in closed}
-            run.excluded_worktrees = {c.wt for c in closed}
     if not run.dry_run:
         tk.prepare()
     if not run.alone:
         run.enter("running")
     try:
         if repo.parts and (not run.dry_run or run.preview_of):
-            exclusion = {"excluded": run.excluded_worktrees} if run.excluded_worktrees else {}
+            exclusion = {"excluded": run.closed_checkout_paths} if run.closed_checkouts else {}
             checkouts = workspace.make_workspace(run.id, repo, main_layer.base_branch, branch, run.workspace_key,
                                                 main_layer.copy, preview_of=run.preview_of, **exclusion)[1]
         else:
@@ -949,9 +952,9 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
     if why := pipeline.furnish(cfg, run, layer, job.ws):
         return end_as("fail", "failed", why=why)
     workspace.note_made(job.ws, checkouts, pipeline.workspace_owner(run, job.ws, checkouts),
-                        excluded=run.excluded_worktrees)
+                        excluded=run.closed_checkout_paths)
     approval = triage_store.triage_approval(run.triage_key)
-    data = prepared_fields(t, branch, [*checkouts, *job.closed_checkouts], layer,
+    data = prepared_fields(t, branch, [*checkouts, *run.closed_checkouts], layer,
                            [run.dir / "images"] if images.paths else [],
                            pipeline.images_note(images), approval)
     if job.closed_prs:

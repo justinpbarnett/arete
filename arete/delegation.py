@@ -140,8 +140,7 @@ def reports_progress(event: dict) -> bool:
 
 
 class PolicyChanged(ValueError):
-    def __init__(self, message: str = "worker policy changed after action acceptance"):
-        super().__init__(message)
+    pass
 
 
 def at_default(f, value) -> bool:
@@ -199,7 +198,6 @@ def request(job, action: str, prompt: str, setting, tools: tuple, rules: list[st
                           "session": "resume" if session.id else "fresh"},
             "rules": rules, "kind": job.run.kind, "session": asdict(session),
             "closed_context": job.run.closed_context,
-            "excluded_worktrees": [str(wt) for wt in sorted(getattr(job.run, "excluded_worktrees", ()))],
             "config_sha": settings_sha(job.cfg), "layer_sha": settings_sha(job.layer)}
 
 
@@ -244,8 +242,7 @@ def main() -> None:
         check_policy(launch, cfg, layer)
         run = pipeline.AgentRun(launch["run"], repo, paths.RUNS_DIR / launch["run"], cfg=cfg, layer=layer,
                                 kind=launch["kind"], step_overrides={launch["role"]: launch["overrides"]},
-                                closed_context=tuple(launch["closed_context"]),
-                                excluded_worktrees={Path(wt) for wt in launch.get("excluded_worktrees", ())})
+                                closed_context=tuple(launch["closed_context"]))
         kept = Session(**launch["session"])
         if kept.id:
             run.sessions[config.INHERITS.get(launch["role"], launch["role"])] = kept

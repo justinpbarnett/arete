@@ -709,12 +709,10 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
     which = picked.candidate.runner
     floor = None if target.remote else guard.floor(trace[0], cwd or Path.cwd(), kw.get("add_dirs") or [])
     closed_context = tuple(Path(path).absolute() for path in kw.pop("closed_context", ()))
-    excluded = kw.pop("excluded_worktrees", ())
-    if closed_context or excluded:
+    if closed_context:
         if target.remote:
-            raise ValueError("closed PR worktrees require a local runner" if excluded
-                             else "closed grading context requires a local runner")
-        floor = replace(floor, closed=(*floor.closed, *closed_context, *excluded))
+            raise ValueError("closed grading context requires a local runner")
+        floor = replace(floor, closed=(*floor.closed, *closed_context))
     kw["effort"] = picked.candidate.effort
     kw["instructions"] = list(picked.candidate.instructions)
     request = getattr(trip, "request", None)
@@ -761,8 +759,6 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
             kw.pop("max_budget_usd", None)
         if not target.remote:
             kw = local_claude(kw, cfg, trace[0], ask_jev, say, repo, hook, floor=floor, closed_context=closed_context)
-            if excluded:
-                kw["excluded_worktrees"] = excluded
     elif which == "codex":
         kw.pop("max_budget_usd", None)
         if not target.remote:
@@ -777,10 +773,6 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
             kw["providers"] = cfg.environment.providers
             kw["floor"] = floor
             kw["judge"] = cfg.jev.guard
-            if excluded:
-                kw["excluded_worktrees"] = excluded
-    elif which == REPLAY and excluded:
-        kw["excluded_worktrees"] = excluded
     if uploads.granted(kw.get("allowed_tools")) and (not TRAITS[which].uploads_supported or target.remote):
         kw["allowed_tools"] = uploads.without(kw["allowed_tools"])
         browser.with_note(kw, uploads.WITHHELD)
@@ -909,9 +901,8 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
             if budget_error:
                 res = Result(ok=False, error=budget_error, session=resume, runner=which, model=name)
             elif which == REPLAY:
-                excluded = kw.get("excluded_worktrees")
                 res = meter.guard(replay.run, cwd, trace, cfg, meter.watching(rec.line), resume, kw.get("timeout"),
-                                  prompt=prompt, **({"excluded_worktrees": excluded} if excluded else {}))
+                                  prompt=prompt)
             elif which == "codex":
                 protected = [sandbox.AUTHORITY, paths.WORKTREES_DIR]
                 res = meter.guard(codex.run, prompt, cwd, model=name, resume=resume,

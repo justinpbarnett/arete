@@ -6,7 +6,6 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable
-from pathlib import Path
 
 from . import scratch, util
 from .agent import Cut
@@ -19,11 +18,9 @@ SETTLE_POLL_SECONDS = 1
 
 
 def stream(cmd: list[str], cwd: str | None, prompt: str, env: dict[str, str], timeout: float,
-           on_line: Callable[[str], None], *, actor_confined: bool = False,
-           write_denied: tuple[Path, ...] = ()) -> subprocess.CompletedProcess:
-    confinement = {"write_denied": write_denied} if write_denied else {}
+           on_line: Callable[[str], None], *, actor_confined: bool = False) -> subprocess.CompletedProcess:
     child = scratch.spawn(cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          text=True, errors="replace", env=env, actor_confined=actor_confined, **confinement)
+                          text=True, errors="replace", env=env, actor_confined=actor_confined)
     out: list[str] = []
     err: list[str] = []
     cuts: list[Cut] = []

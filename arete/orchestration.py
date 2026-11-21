@@ -170,8 +170,6 @@ class Controller:
                 if self.run.action_only and (ending := self.hold_dirty_closed_checkout(prepared["checkouts"])):
                     return ending
             active = [c for c in prepared["checkouts"] if c.get("pr") not in self.job.closed_prs]
-            self.run.excluded_worktrees = {Path(c["wt"]) for c in prepared["checkouts"]
-                                           if c.get("pr") in self.job.closed_prs}
             missing = any(not (Path(c["wt"]) / ".git").exists() for c in active)
             if missing:
                 if any(Path(c["wt"]).exists() for c in active):
@@ -185,6 +183,8 @@ class Controller:
                 flows.restore_environment_draft(self.job, prepared)
             else:
                 if missing:
+                    self.run.closed_checkouts = [workspace.Checkout.from_row(c) for c in prepared["checkouts"]
+                                                 if c.get("pr") in self.job.closed_prs]
                     line = {"step": "prepare", "tree": str(self.job.ws), "data": {**prepared, "checkouts": active}}
                     if why := self.job.restore(line, layer=self.job.layer):
                         raise factory.Refused(why)
@@ -198,6 +198,7 @@ class Controller:
             self.job.b.report = self.data.get("report", "")
             self.job.b.catch_ups = self.data.get("catch_ups", 0)
             self.job.b.worker_trees = self.data.get("worker_trees", {})
+            self.job.b.ignored_denied_paths = self.data.get("ignored_denied_paths", {})
             self.job.b.from_base = True
             self.job.b.plan_text, self.job.b.build_summary = self.job.plan_text, self.job.build_summary
             if pending_push:
@@ -221,8 +222,9 @@ class Controller:
             self.job.plan_text = ""
         if self.run.repairs:
             found = repairs.source(pipeline.run_store.run_get(self.run.repairs) or {})
-            targets = [c for c in self.job.checkouts if c.pr in found.prs]
-            if set(found.prs) != {c.pr for c in targets}:
+            expected = set(found.prs) - self.job.closed_prs
+            targets = [c for c in self.job.with_prs if c.pr in expected]
+            if not expected or expected != {c.pr for c in targets}:
                 raise factory.Refused("the repair findings do not name this workspace's open PRs")
             for checkout in targets:
                 repairs.matched_head(checkout.wt, checkout.lease, found)
@@ -306,16 +308,15 @@ class Controller:
             self.job.check_publication_targets = self.check_push_targets
 
     def hold_dirty_closed_checkout(self, checkouts):
-        closed = self.job.closed_prs
+        job = self.job
+        closed = job.closed_prs
+        revision_pr = next((c["pr"] for c in checkouts if c.get("pr") and c["pr"] not in closed), "")
         for c in checkouts:
             if c.get("pr") not in closed:
                 continue
-            wt = Path(c["wt"])
-            if (wt / ".git").exists() and workspace.uncommitted(wt):
-                revision_pr = next((row["pr"] for row in checkouts if row.get("pr") and row["pr"] not in closed),
-                                   c["pr"])
-                return self.hold_revision(revision_pr, f"The closed PR checkout `{c['github']}` at `{wt}` has "
-                                                       "uncommitted edits. Arete left them in place.")
+            checkout = workspace.Checkout.from_row(c)
+            if why := workspace.kept_checkout(job.ws, checkout, self.run.repo.path, job.layer.copy, closed=True):
+                return self.hold_revision(revision_pr or checkout.pr, why)
 
     def check_push_targets(self):
         for checkout in self.job.with_prs:
@@ -350,18 +351,44 @@ class Controller:
             if self.run.answers_due:
                 kept = {c.github for c in job.checkouts if c.onto}
                 job.moved_base = flows.base_moved(self.flow.continues, repos=kept) if kept else ""
-                if job.merge_moved_base("orchestrate"):
+                if job.merge_moved_base("orchestrate", before_resolve=self.check_merged_policy):
                     self.check_merged_policy()
             return
+        deny = diffguard.denied_paths(job.layer)
+
+        def visible_denied(checkout):
+            return {path for path in pipeline.stageable_untracked(checkout.wt)
+                    if util.matches_any(path, deny) or util.matches_any(checkout.prefix + path, deny)}
+
+        denied_before = {}
+
+        def remember_denied(checkout):
+            denied_before[checkout.github] = visible_denied(checkout)
+
         for checkout in prs:
             checkout.resumes = True
             workspace.fetch(checkout.src, checkout.base)
-        merged = pipeline.merge_moved_bases(self.run, prs, job.layer, job.ticket, allow_untracked=True)
+        merged = pipeline.merge_moved_bases(self.run, prs, job.layer, job.ticket, allow_untracked=True,
+                                           before_merge=remember_denied,
+                                           before_resolve=self.check_merged_policy)
         if merged:
             self.check_merged_policy()
+            b = job.b
             for checkout in merged:
-                job.b.worker_trees.pop(checkout.github, None)
-            workspace.note_made(job.ws, job.checkouts, excluded=self.run.excluded_worktrees)
+                repo = checkout.github
+                visible = visible_denied(checkout)
+                if hidden := denied_before[repo] - visible:
+                    b.ignored_denied_paths[repo] = sorted(hidden.union(b.ignored_denied_paths.get(repo, ())))
+                denied = sorted(visible.union(b.ignored_denied_paths.get(repo, ())))
+                previous = b.worker_trees.pop(repo, "")
+                if denied:
+                    b.worker_trees[repo] = (
+                        factory.tree_with_paths(checkout.wt, checkout.merge, previous, denied)
+                        if previous else checkout.merge)
+            self.data["worker_trees"] = b.worker_trees
+            if b.ignored_denied_paths:
+                self.data["ignored_denied_paths"] = b.ignored_denied_paths
+            workspace.note_made(job.ws, job.checkouts, excluded=self.run.closed_checkout_paths)
         if self.run.answers_due:
             self.run.kept_note = pipeline.kept_edits_note([c for c in job.checkouts if c.onto])
             self.run.base_note = pipeline.base_merge_note([c for c in merged if c.onto])
@@ -370,11 +397,14 @@ class Controller:
     def check_merged_policy(self):
         job = self.job
         layer = pipeline.resolve_layer(job.cfg, self.run, job.ws)
-        if delegation.settings_sha(layer) != delegation.settings_sha(job.layer):
+        launch = {"config_sha": delegation.settings_sha(job.cfg), "layer_sha": delegation.settings_sha(job.layer)}
+        try:
+            delegation.check_policy(launch, job.cfg, layer)
+        except delegation.PolicyChanged as error:
             recovery = {"reason": "policy-changed"}
-            if job.closed_checkouts:
-                recovery.update(branch=job.branch, closed_checkouts=[c.to_row() for c in job.closed_checkouts])
-            raise workspace.RunFailed(pipeline.worker_policy_changed(), recovery=recovery)
+            if self.run.closed_checkouts:
+                recovery.update(branch=job.branch, closed_checkouts=[c.to_row() for c in self.run.closed_checkouts])
+            raise workspace.RunFailed(pipeline.record.failure(error), recovery=recovery) from error
 
     def lineage(self):
         self.catalog = Catalog(self.job)
@@ -673,7 +703,7 @@ class Controller:
                     result = {**message, "effective": worker.effective, "writing": worker.writing}
                     if worker.writing:
                         checkouts = self.job.checkouts
-                        excluded = self.run.excluded_worktrees
+                        excluded = self.run.closed_checkout_paths
                         workspace.note_made(self.job.ws, checkouts,
                                             pipeline.workspace_owner(self.run, self.job.ws, checkouts), excluded=excluded)
                         if why := workspace.kept_work(self.job.ws, checkouts, self.run.repo.path,
@@ -816,6 +846,8 @@ class Controller:
         self.data.pop("publication_intent", None)
         self.data.pop("worker_trees", None)
         self.job.b.worker_trees = {}
+        self.data.pop("ignored_denied_paths", None)
+        self.job.b.ignored_denied_paths = {}
         self.data["publication"] = outcome.data
         self.persist()
         if catch_up:
@@ -1087,7 +1119,14 @@ class Controller:
         self.check_pilot_publication()
         self.take_merge_lease(checkout)
         pipeline.note_prs(self.run, job.branch, job.with_prs)
-        pipeline.push_caught_up_head(job.b, checkout, job.branch, head)
+        try:
+            pipeline.push_caught_up_head(job.b, checkout, job.branch, head, check_targets=self.check_push_targets)
+        except RetargetedPR as error:
+            self.ending = self.hold_revision(error.pr, str(error))
+            self.data.pop("publication_intent", None)
+            ledger.transition(self.lease, self.executing, "failed", {"error": str(error)}, expected=(action["state"],))
+            self.persist()
+            return {"error": str(error)}
         job.verified, job.review = verified, review
         self.note_caught_up(checkout)
         if failure := self.publication_ci([checkout], caught_up=True):

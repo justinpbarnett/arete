@@ -10,7 +10,7 @@ from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
 
-from . import accounts, background, child, config, device_turns, devices, environment, paths, sandbox, ssh, util
+from . import accounts, background, child, config, device_turns, devices, environment, paths, ssh, util
 from .agent import (
     NO_SESSION,
     Result,
@@ -182,7 +182,6 @@ def _run(
     auth: accounts.Auth | None = None,
     api_key: str = "",
     leaf: str = "",
-    excluded_worktrees: tuple[Path, ...] = (),
 ) -> Result:
     fresh_session = "" if resume.id or not persist else str(uuid.uuid4())
     cmd = command(cwd, model=model, effort=effort, tools=tools, allowed_tools=allowed_tools,
@@ -202,12 +201,7 @@ def _run(
                                     on_mark=lambda kind, n: on_line(json.dumps({"arete": kind, "offset": n}) + "\n"),
                                     leaf=leaf or f"agent-{os.getpid()}-{uuid.uuid4().hex}", settle_answer=True)
         else:
-            confinement = {"write_denied": excluded_worktrees} if excluded_worktrees else {}
-            proc = child.stream(cmd, str(cwd), prompt, env, timeout, on_line, **confinement)
-    except sandbox.ConfinementUnavailable as error:
-        if not excluded_worktrees:
-            raise
-        return Result(ok=False, session=resume, error=str(error))
+            proc = child.stream(cmd, str(cwd), prompt, env, timeout, on_line)
     except device_turns.Lost as e:
         session = Session(fresh_session, 0.0, "claude") if e.started and fresh_session else resume
         result = parse(subprocess.CompletedProcess(cmd, 1, e.output, ""), session, model, json_schema)

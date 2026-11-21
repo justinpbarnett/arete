@@ -236,7 +236,6 @@ class AgentRun:
     launch_gate: Callable | None = None
     launch_done: Callable | None = None
     closed_context: tuple[str, ...] = ()
-    excluded_worktrees: set[Path] = field(default_factory=set)
     resolved_settings: dict[str, steps.Settings] = field(default_factory=dict)
 
     @property
@@ -327,8 +326,6 @@ class AgentRun:
         kw.setdefault("layer", self.layer)
         if self.closed_context:
             kw.setdefault("closed_context", self.closed_context)
-        if self.excluded_worktrees:
-            kw["excluded_worktrees"] = tuple(sorted(self.excluded_worktrees))
         seam = factory.inside(self.id)
         if s:
             kw.setdefault("settings", s)
@@ -483,6 +480,7 @@ class Run(AgentRun):
     alone: bool = False
     facts: dict = field(default_factory=dict)
     catch_up_preserved: set[str] = field(default_factory=set)
+    closed_checkouts: list[workspace.Checkout] = field(default_factory=list)
     repairs: str = ""
     action: str = ""
     action_only: bool = False
@@ -495,6 +493,10 @@ class Run(AgentRun):
     owner_questions_blocked: bool = False
     environment_release: str = ""
     preview_of: str = ""
+
+    @property
+    def closed_checkout_paths(self) -> set[Path]:
+        return {c.wt for c in self.closed_checkouts}
 
     @property
     def preview_branch(self) -> str:
@@ -705,8 +707,8 @@ def workspace_owner(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> 
 
 def release_workspace(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> bool:
     workspace.note_made(ws, checkouts, workspace_owner(run, ws, checkouts), preserve=run.catch_up_preserved,
-                        excluded=run.excluded_worktrees)
-    if run.excluded_worktrees:
+                        excluded=run.closed_checkout_paths)
+    if run.closed_checkouts:
         run.log(f"workspace kept at {ws}: it contains closed PR worktrees")
         return False
     if run.catch_up_preserved:
@@ -839,12 +841,22 @@ def comparison_label(c: workspace.Checkout, against: str, from_base: bool) -> st
     return f"{name} at {sha}"
 
 
+def stageable_untracked(wt: Path, *, ignored: bool = False) -> set[str]:
+    flags = ["--ignored"] if ignored else []
+    return set(util.git_records(["ls-files", "--others", *flags, "--exclude-standard", "--", ".",
+                                 *diffguard.NEVER_STAGED], wt))
+
+
 def stage(checkouts: list[workspace.Checkout], deny: list[str], from_base: bool = False, *,
-          worker_trees: dict[str, str] | None = None) -> Staged:
+          worker_trees: dict[str, str] | None = None, ignored_denied_paths: dict[str, list[str]] | None = None) -> Staged:
     out = Staged()
     for c in checkouts:
         workspace.drop_untracked_bytecode(c.wt)
         against = base_of_head(c) if from_base else (c.onto or "HEAD")
+        if retained := (ignored_denied_paths or {}).get(c.github):
+            if names := stageable_untracked(c.wt, ignored=True).intersection(retained):
+                git(["add", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"], c.wt,
+                    input="\0".join(sorted(names)) + "\0", env={"GIT_LITERAL_PATHSPECS": "1"})
         diff = diffguard.stage(c.wt, deny, against=against, prefix=c.prefix)
         merged = pending_merge(c)
         if merged and not from_base:
@@ -1178,6 +1190,7 @@ class Build(TicketWork):
     build_summary: str = ""
     catch_ups: int = 0
     worker_trees: dict[str, str] = field(default_factory=dict)
+    ignored_denied_paths: dict[str, list[str]] = field(default_factory=dict)
     denied_feedback: str = ""
     on_denied_edit: Callable[[str], None] | None = None
 
@@ -1274,7 +1287,7 @@ class Build(TicketWork):
             if paths := staged.fatal_restores.get(c.github):
                 restore_paths(c.wt, staged.bases[c.github], paths)
         if staged.restores or staged.fatal_restores:
-            workspace.note_made(self.ws, self.checkouts, excluded=self.run.excluded_worktrees)
+            workspace.note_made(self.ws, self.checkouts, excluded=self.run.closed_checkout_paths)
 
     def fail_denied_edits(self, staged: Staged, after: str) -> None:
         self.restore_staged_paths(staged)
@@ -1282,7 +1295,7 @@ class Build(TicketWork):
 
     def restage(self, *, from_base: bool | None = None) -> Staged:
         self.staged = stage(self.checkouts, self.deny, self.from_base if from_base is None else from_base,
-                            worker_trees=self.worker_trees)
+                            worker_trees=self.worker_trees, ignored_denied_paths=self.ignored_denied_paths)
         record.mark(self.run.id, "diff", files=self.staged.files, lines=self.staged.lines, denied=self.staged.denied,
                     patch=self.staged.patch)
         return self.staged
@@ -1622,7 +1635,7 @@ def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: boo
 def worker_policy_changed() -> str:
     from .delegation import PolicyChanged
 
-    return record.failure(PolicyChanged())
+    return record.failure(PolicyChanged("worker policy changed after action acceptance"))
 
 
 def settle_zte_refusal(repo: str, tid: str, slot: slots.RunSlot, run_id: str, error: BaseException, *, committed: bool) -> int:
@@ -2052,7 +2065,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                         not run.environment_release or ("requirements" in run.facts and flows.retry_passed(flow.ctx.verified))):
                     keep_edits(run)
                 workspace.note_made(*run.workspace, workspace_owner(run, *run.workspace), preserve=run.catch_up_preserved,
-                                    excluded=run.excluded_worktrees)
+                                    excluded=run.closed_checkout_paths)
             slot.free()
         try:
             with handoff_io():
@@ -2498,18 +2511,14 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
 def furnish(cfg: config.Config, run: Run, layer: config.RepoLayer, ws: Path) -> str:
     for rel in layer.copy:
         dest = ws / rel
-        if run.excluded_worktrees and any(dest.resolve().is_relative_to(wt.resolve()) for wt in run.excluded_worktrees):
+        if any(dest.resolve().is_relative_to(wt.resolve()) for wt in run.closed_checkout_paths):
             continue
         if (src := run.repo.path / rel).exists():
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dest)
     for cmd in layer.setup:
         with record.timed(run.id, "setup", command=cmd) as setup:
-            confinement = {"write_denied": tuple(sorted(run.excluded_worktrees))} if run.excluded_worktrees else {}
-            try:
-                res = environment.sh(cmd, cfg, run.repo, cwd=ws, timeout=1200, **confinement)
-            except sandbox.ConfinementUnavailable as error:
-                return str(error)
+            res = environment.sh(cmd, cfg, run.repo, cwd=ws, timeout=1200)
             setup["exit"] = res.returncode
         run.log(f"setup `{cmd}`: exit {res.returncode}")
         if res.returncode != 0:
@@ -2725,7 +2734,12 @@ def push_caught_up_head(b: Build, c: workspace.Checkout, branch: str, head: str,
     pending_push = True
     why = f"the catch-up push to `{branch}` could not be confirmed"
     detail = f"Previous head `{c.lease}`, attempted head `{head}`, PR {c.pr}."
-    target_check = {"check_targets": check_targets} if check_targets else {}
+
+    def exact_head(_):
+        if check_targets:
+            check_targets()
+        return head
+
     for attempt in range(4):
         try:
             row = gh.pr_merge_details(c.pr)
@@ -2742,7 +2756,7 @@ def push_caught_up_head(b: Build, c: workspace.Checkout, branch: str, head: str,
             break
         if pending_push and remote == c.lease:
             try:
-                commit_and_push([candidate], [candidate], branch, "", before_push=lambda _: head, **target_check)
+                commit_and_push([candidate], [candidate], branch, "", before_push=exact_head)
                 pending_push = False
             except (workspace.RunFailed, RuntimeError, OSError) as failed:
                 b.run.log(f"automerge: catch-up push failed: {public_text(b.run, util.first_line(str(failed), 300))}")
@@ -3204,7 +3218,8 @@ class ConflictUnresolved(workspace.RunFailed):
 
 
 def merge_base_into_kept(run: AgentRun, checkouts: list[workspace.Checkout], layer: config.RepoLayer,
-                         ticket: tracker.Ticket) -> list[workspace.Checkout]:
+                         ticket: tracker.Ticket, *,
+                         before_resolve: Callable[[], None] | None = None) -> list[workspace.Checkout]:
     merged = []
     for c in checkouts:
         try:
@@ -3215,7 +3230,8 @@ def merge_base_into_kept(run: AgentRun, checkouts: list[workspace.Checkout], lay
         try:
             commit_edits_before_merge(run, [c], layer)
             merged += merge_moved_bases(run, [c], layer, ticket,
-                                        reason="since the base moved while the run waited for its answer")
+                                        reason="since the base moved while the run waited for its answer",
+                                        before_resolve=before_resolve)
         except workspace.RunFailed as e:
             files = f" in {', '.join(e.paths)}" if isinstance(e, ConflictUnresolved) else ""
             raise workspace.RunFailed(f"merging `{c.origin_base}` into the edits kept in {c.github} failed{files}: {e.why}. "
@@ -3319,7 +3335,9 @@ def merge_as_run(run_id: str, c: workspace.Checkout, commit: str, named: str, *,
 def merge_moved_bases(run: AgentRun, checkouts: list[workspace.Checkout], layer: config.RepoLayer, ticket: tracker.Ticket,
                       log_prefix: str = "", reason: str = "since the base moved after the last push", *,
                       bases: dict[str, str] | None = None, allow_untracked: bool = False,
-                      environment_retry: bool = False) -> list[workspace.Checkout]:
+                      environment_retry: bool = False,
+                      before_merge: Callable[[workspace.Checkout], None] | None = None,
+                      before_resolve: Callable[[], None] | None = None) -> list[workspace.Checkout]:
     merged = []
     for c in checkouts:
         base = (bases or {}).get(c.github) or git(["rev-parse", c.origin_base], c.wt).strip()
@@ -3335,6 +3353,8 @@ def merge_moved_bases(run: AgentRun, checkouts: list[workspace.Checkout], layer:
             raise workspace.RunFailed(f"{c.github} has uncommitted edits ({', '.join(edits[:5])}), so arete merged nothing into "
                             "them and left them as they are")
         head = git(["rev-parse", "HEAD"], c.wt).strip()
+        if before_merge:
+            before_merge(c)
         with record.timed(run.id, "base_merge", repo=c.github, base=c.base, base_commit=c.base_commit,
                           head=head) as rec:
             try:
@@ -3347,6 +3367,8 @@ def merge_moved_bases(run: AgentRun, checkouts: list[workspace.Checkout], layer:
                     if environment_retry:
                         raise workspace.RunFailed(f"merging `{c.origin_base}` into the held draft conflicts in {c.github}")
                     rec["conflicts"] = conflicts
+                    if before_resolve:
+                        before_resolve()
                     try:
                         resolve_conflicts(run, c, conflicts, layer, ticket)
                     except workspace.RunFailed as e:

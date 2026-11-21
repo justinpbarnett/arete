@@ -125,6 +125,27 @@ def fingerprint(folder: Path | str) -> str:
         index.with_name(index.name + ".lock").unlink(missing_ok=True)
 
 
+def tree_with_paths(folder: Path, base: str, source: str, names: list[str]) -> str:
+    entries = util.git_records(["ls-tree", "-r", source, "--", *names], folder,
+                               env={"GIT_LITERAL_PATHSPECS": "1"})
+    wanted = set(names)
+    entries = [entry for entry in entries if entry.partition("\t")[2] in wanted]
+    if not entries:
+        return base
+    handle, name = tempfile.mkstemp(prefix="arete-index-")
+    os.close(handle)
+    index = Path(name)
+    try:
+        index.unlink()
+        env = {"GIT_INDEX_FILE": str(index)}
+        util.git(["read-tree", base], folder, env=env)
+        util.git(["update-index", "-z", "--index-info"], folder, input="\0".join(entries) + "\0", env=env)
+        return util.git(["write-tree"], folder, env=env).strip()
+    finally:
+        index.unlink(missing_ok=True)
+        index.with_name(index.name + ".lock").unlink(missing_ok=True)
+
+
 def first(read: list[dict], event: str) -> dict:
     return next((line for line in read if line.get("event") == event), {})
 
