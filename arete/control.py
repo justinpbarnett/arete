@@ -44,6 +44,7 @@ STUCK_TICKS = 3
 def serious_failure(key: str) -> bool:
     return key in ("tick", "tick:load") or key.startswith(("stage:", "loop:"))
 DETACHED_LOG = "loops.log"
+WORKER_ENV = "ARETE_WORKER"
 COST_DAYS = 7
 COST_GROUPS = ("step", "kind", "model", "route")
 STEP_FIELD_OF = {"step": "step", "kind": "task_kind", "model": "model"}
@@ -87,6 +88,27 @@ def command(args: list[str]) -> list[str]:
     return paths.cli_command(*args)
 
 
+def worker_kind(args):
+    match args:
+        case ["run", *options] if "--local" in options:
+            return "run"
+        case ["file-rule", _, "--local"]:
+            return "file-rule"
+        case ["loop", "new", *options] if "--run-id" in options:
+            return "loop new"
+        case ["loop", "exec", "--run-id", _]:
+            return "loop exec"
+        case ["session", "exec", _]:
+            return "session exec"
+    return ""
+
+
+def require_worker(kind, *, development=False):
+    if os.getenv(WORKER_ENV) == kind or development and os.getenv("ARETE_DEVELOPMENT") == "1":
+        return
+    raise Refused(f"{kind} in this form is started by Arete")
+
+
 def detach(args: list[str], log_name: str = DETACHED_LOG, keep: tuple[int, ...] = ()) -> subprocess.Popen:
     return launch(command(args), log_name, keep)
 
@@ -95,6 +117,10 @@ def launch(command: list[str], log_name: str = DETACHED_LOG, keep: tuple[int, ..
            start_new_session: bool = True) -> subprocess.Popen:
     paths.ensure_dirs()
     keep, env = launch_lease.child_environment(keep)
+    cli_prefix = paths.cli_command()
+    env.pop(WORKER_ENV, None)
+    if command[:len(cli_prefix)] == cli_prefix and (kind := worker_kind(command[len(cli_prefix):])):
+        env[WORKER_ENV] = kind
     with open(paths.LOG_DIR / log_name, "a") as log:
         proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log,
                                 stderr=subprocess.STDOUT, start_new_session=start_new_session, pass_fds=keep,

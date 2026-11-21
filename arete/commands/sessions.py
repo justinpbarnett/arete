@@ -139,8 +139,9 @@ def session_stop(args) -> int:
 
 @local_only
 def session_exec(args) -> int:
-    from .. import sessions
+    from .. import control, sessions
 
+    control.require_worker("session exec")
     return 0 if sessions.execute(args.id) in ("done", "stopped", "busy") else 1
 
 

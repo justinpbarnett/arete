@@ -454,7 +454,13 @@ class Handler(BaseHTTPRequestHandler):
         key = self.headers.get("Idempotency-Key")
         if key is None:
             return action()
-        sha = idempotency.fingerprint(method, route, parameters, self.body())
+        body = self.body()
+        if self.headers.get("X-Arete-Auto-Version") == "1" and (
+            route == "/api/v1/runs/{run}/stop" or
+            route == "/api/runs/*" and parameters["path"].endswith("/stop")
+        ):
+            body = {k: v for k, v in body.items() if k != "base_version"}
+        sha = idempotency.fingerprint(method, route, parameters, body)
         with idempotency.owning(principals.current(), key, sha, route) as context:
             row = idempotency.matching_claim(context)
             if row and row["status"]:

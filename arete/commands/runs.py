@@ -24,6 +24,10 @@ def cmd_merge_check(args) -> int:
 def cmd_run(args) -> int:
     from .. import client, pipeline
 
+    if args.local:
+        from .. import control
+
+        control.require_worker("run", development=True)
     if args.local or args.dry_run:
         return pipeline.run_issue(args.repo, args.issue, dry_run=args.dry_run, force=args.force)
     return client.steered(lambda: run_followed(client.start_task(

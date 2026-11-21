@@ -1,12 +1,17 @@
+import argparse
+import ast
 import base64
 import json
+import os
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
-from contextlib import ExitStack, redirect_stderr
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from http.client import HTTPConnection, HTTPResponse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO, StringIO
 from pathlib import Path
 from socket import SHUT_WR, create_connection
@@ -27,6 +32,490 @@ from tests import support, versioned_api_fixture
 
 def setUpModule():
     support.isolate_live_state()
+
+
+class CliThroughServeTests(unittest.TestCase):
+    class_timeout = 30
+    OWNER = "cli-owner@example.test"
+    ONLINE = (
+        "run replay-sample 7", "task add --repo replay-sample change", "task list", "task show t-1234",
+        "task reply t-1234 answer", "task close t-1234", "task start --repo replay-sample change",
+        "task run replay-sample 7", "answer r1", "resume r1", "repair r1", "step r1 build", "wait r1",
+        "lines r1", "status", "stop r1", "events", "approve 1", "forget 1", "file-rule 1", "reject-rule 1",
+        "loop start example", "loop enable example", "loop disable example", "loop stop example",
+        "session start work", "session attach r1", "session send r1 hello", "session stop r1",
+        "oncall off", "oncall on", "oncall cancel 1", "oncall dismiss 1", "oncall retry 1",
+    )
+    ONLINE_VARIANTS = (
+        "status --json r1", "status --json", "record pin r1", "record unpin r1", "approve 1 --reject",
+        "loop start example -f", "session --chat 1 start work", "session --chat 1 list",
+        "session --chat 1 report r1", "session --chat 1 stop r1",
+    )
+    READS = (
+        "ab", "api diff --check-artifact", "backup --check", "benchmark report missing", "costs", "devices", "doctor",
+        "experiment summary missing", "jev report", "jira-check", "loop feed r1", "loop list", "loop status poll",
+        "merged", "oncall list", "oncall show 1", "prices diff", "prices recompute r1 build", "prompts",
+        "hold", "record r1", "research", "secrets replay-sample", "session list", "session report r1",
+        "steps --repo replay-sample", "triage", "verifiers report missing",
+        "webhook secret missing", "writers report r1", "zte status",
+    )
+    READ_VARIANTS = ("approve", "mcp-ask --check",
+                     "status --offline", "status --json --offline r1", "lines --offline r1",
+                     "task show --offline --json {task}")
+    LOCAL = {
+        "api check": "api_check", "ask": "jev_ask", "audit": "audit", "background": "background",
+        "benchmark fixture": "lab.benchmark", "benchmark run": "lab.benchmark", "benchmark sample": "lab.benchmark",
+        "codex-guard": "codex", "dashboard": "dashboard", "devices probe": "devices",
+        "document": "document", "eval": "evals", "experiment optimize": "lab.optimize",
+        "experiment promote": "lab.optimize", "experiment run": "lab.experiment", "experiment sample": "lab.experiment",
+        "guard": "guard", "heartbeat": "heartbeat", "hook": "tool_events", "init": "commands.setup",
+        "install": "install", "jev compare": "lab.calibrate", "jev sample": "lab.calibrate",
+        "loop exec": "loop_run", "loop new": "scaffold", "loop requeue": "store.loops", "loop try": "scaffold",
+        "mcp-ask": "owner_asks", "merge-check": "mergecheck", "migrate": "store.db", "mine": "miner",
+        "oncall scan": "oncall", "pilot-doc-fix": "pilot", "poll": "poll", "prices import": "prices",
+        "replay sample": "replay", "retrieval run": "lab.retrieval", "retrieval sample": "lab.retrieval",
+        "rotate-authority": "scratch", "serve": "serve", "session exec": "sessions", "uninstall": "install",
+        "upload-guard": "uploads",
+        "verifiers run": "lab.verifier_suites", "verifiers sample": "lab.verifier_suites",
+        "writers export": "lab.writer_eval", "writers rate": "lab.writer_eval", "writers run": "lab.writer_eval",
+        "writers sample": "lab.writer_eval", "zte pause": "zte",
+    }
+    LOCAL_VARIANTS = {
+        "run replay-sample 7 --dry-run": "pipeline.run_issue / record.start",
+        "run replay-sample 7 --local": "pipeline.run_issue", "file-rule 1 --local": "miner.file_rule",
+        "loop new --run-id r1 work": "scaffold.draft", "loop start example --events sample.json": "loop_run.launch",
+        "session start --task work": "sessions.launch", "session start --task --draft-pr work": "sessions.launch",
+        "research --next": "research.next_due", "research replay-sample#7 --run": "research.run_now",
+        "triage --refresh": "triage.run", "hold claude 1h": "store.devices",
+        "hold claude --release": "store.devices", "costs --correct r1 1 --why correction": "record.correct",
+        "costs --backfill": "store.runs", "backup": "backup.snapshot", "backup --restore backup.db": "backup.restore",
+        "secrets rm replay-sample secret": "vault", "api diff": "contract_evolution",
+    }
+
+    def in_subprocess(self, case):
+        with tempfile.TemporaryDirectory(prefix="arete-cli-") as temp:
+            root = Path(temp).resolve()
+            entry = ("import faulthandler; faulthandler.dump_traceback_later(15); "
+                     "from tests.test_behavior import CliThroughServeTests; "
+                     "from unittest import TextTestRunner; "
+                     "sys.exit(not TextTestRunner().run(CliThroughServeTests(sys.argv[1])).wasSuccessful())")
+            command = api_check.child_command(Path(__file__).resolve().parents[1], entry, case)
+            try:
+                result = subprocess.run(command, cwd=root, env=api_check.isolated_env(root), capture_output=True,
+                                        text=True, timeout=18, check=False)
+            except subprocess.TimeoutExpired as error:
+                output = (error.stderr or b"").decode(errors="replace")
+                self.fail(f"{case} timed out after {error.timeout:g}s\n{output}")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def setUp(self):
+        if not self._testMethodName.startswith("check_"):
+            return
+        from arete import paths
+
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        for name in ("urllib.request.urlopen", "arete.gh.gh"):
+            self.stack.enter_context(mock.patch(name, side_effect=AssertionError(name)))
+        lines, _ = api_check.prepare_replay(Path.cwd())
+        self.fixture_config = "\n".join(lines) + "\n"
+        paths.CONFIG_FILE.write_text(self.fixture_config)
+
+    def cli(self, command):
+        from arete import cli
+
+        out, err = StringIO(), StringIO()
+        with redirect_stdout(out), redirect_stderr(err), mock.patch("sys.stdin", StringIO()):
+            code = cli.main(command.split())
+        return code, out.getvalue().splitlines(), err.getvalue()
+
+    def problem(self, command, reason):
+        code, lines, err = self.cli(command)
+        self.assertEqual(code, 1, (command, lines, err))
+        self.assertEqual(len(lines), 1, (command, lines, err))
+        self.assertNotIn("Traceback", err)
+        answer = json.loads(lines[0])
+        self.assertEqual(answer.get("reason") or answer.get("code"), reason, (command, answer))
+        return answer
+
+    @contextmanager
+    def listening(self, server):
+        with server, mock.patch.dict(os.environ, {"ARETE_SERVER": f"http://127.0.0.1:{server.server_port}"}):
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": .01})
+            thread.start()
+            try:
+                yield
+            finally:
+                server.shutdown()
+                thread.join()
+
+    @contextmanager
+    def serve_at(self, requests):
+        db.migrate()
+        principals.seed_owner(self.OWNER)
+
+        class Handler(dashboard.Handler):
+            def send_response(handler, code, message=None):
+                requests.append((handler.command, handler.path, code, handler.headers.get("Idempotency-Key")))
+                super().send_response(code, message)
+
+            def log_request(self, *_):
+                pass
+
+        address = "127.0.0.1"
+        node = tailnet.Node((address,), frozenset({address}), address)
+        logins = tailnet.Logins(mock.Mock())
+        with mock.patch.object(logins, "of", return_value=self.OWNER), mock.patch("socket.getfqdn", return_value=address):
+            server = tailnet.Server(address, 0, node, logins, False, Handler, dashboard.Redirect)
+            with self.listening(server):
+                yield server
+
+    @contextmanager
+    def stub(self, response):
+        class Handler(BaseHTTPRequestHandler):
+            def reply(handler):
+                status, answer, headers = response(handler)
+                raw = json.dumps(answer).encode()
+                handler.send_response(status)
+                for name, value in headers.items():
+                    handler.send_header(name, value)
+                handler.send_header("Content-Length", str(len(raw)))
+                handler.end_headers()
+                handler.wfile.write(raw)
+
+            do_GET = do_POST = reply
+
+            def log_message(self, *_):
+                pass
+
+        with self.listening(ThreadingHTTPServer(("127.0.0.1", 0), Handler)):
+            yield
+
+    def test_parser_groups_and_cli_calls(self):
+        self.in_subprocess("check_parser_groups_and_cli_calls")
+
+    def check_parser_groups_and_cli_calls(self):
+        from arete import cli
+        from arete.commands import common
+
+        def leaves(parser, prefix=()):
+            for action in parser._actions:
+                if isinstance(action, argparse._SubParsersAction):
+                    if prefix and not action.required:
+                        yield prefix
+                    for name, sub in action.choices.items():
+                        yield from leaves(sub, (*prefix, name))
+                    return
+                if action.dest == "action" and action.choices:
+                    yield from ((*prefix, name) for name in action.choices)
+                    return
+            yield prefix
+
+        parser = cli.parser()
+        actual = set(leaves(parser))
+        groups = {}
+        for group, case in ((1, self.ONLINE), (2, self.READS), (3, self.LOCAL)):
+            for command in case:
+                words = tuple(command.split())
+                match = next((words[:n] for n in (2, 1) if words[:n] in actual), words)
+                self.assertNotIn(match, groups)
+                groups[match] = group
+        self.assertSetEqual(actual, set(groups))
+        for command in (*self.ONLINE, *self.ONLINE_VARIANTS, *self.READS, *self.READ_VARIANTS, *self.LOCAL_VARIANTS):
+            parser.parse_args(command.split())
+        forbidden = {"record": {"pin", "unpin"}, "control": {"decide", "switch", "stop_run"},
+                     "sessions": {"send"}, "chat": {"start_session", "stop_session"}, "oncall": {"switch"}}
+        files = [Path(cli.__file__), *Path(common.__file__).parent.glob("*.py")]
+        for path in files:
+            for call in (node for node in ast.walk(ast.parse(path.read_text())) if isinstance(node, ast.Call)):
+                function = call.func
+                if isinstance(function, ast.Attribute) and isinstance(function.value, ast.Name):
+                    module, name = function.value.id, function.attr
+                    self.assertNotIn(name, forbidden.get(module, ()), f"{path.name}:{call.lineno}")
+                    if module == "state":
+                        self.assertIn(("connect", "state.reader"),
+                                      [(kw.arg, ast.unparse(kw.value)) for kw in call.keywords])
+                elif isinstance(function, ast.Name) and function.id == "getattr" and call.args:
+                    self.assertNotEqual(ast.unparse(call.args[0]), "oncall")
+
+    def test_commands_fail_when_serve_is_down(self):
+        self.in_subprocess("check_commands_fail_when_serve_is_down")
+
+    def check_commands_fail_when_serve_is_down(self):
+        from socket import AF_INET, SOCK_STREAM, socket
+
+        from arete import paths
+
+        for name in ("pipeline.run_issue", "delivery.send", "miner.file_rule", "loop_run.launch", "sessions.launch",
+                     "control.stop_run", "record.pin", "oncall.dismiss", "chat.start_session", "chat.stop_session"):
+            self.stack.enter_context(mock.patch("arete." + name, side_effect=AssertionError(name)))
+        with socket(AF_INET, SOCK_STREAM) as reserved:
+            reserved.bind(("127.0.0.1", 0))
+            port = reserved.getsockname()[1]
+        with self.assertRaises(ConnectionRefusedError), create_connection(("127.0.0.1", port), timeout=1):
+            pass
+        url = f"http://127.0.0.1:{port}"
+        paths.CONFIG_FILE.write_text(self.fixture_config + f'\n[server]\nurl = "{url}"\n')
+        for command in (*self.ONLINE, *self.ONLINE_VARIANTS):
+            with self.subTest(command=command):
+                self.assertIn(url, self.problem(command, "server_down")["error"])
+                self.assertFalse(paths.DB_FILE.exists())
+        paths.CONFIG_FILE.write_text(self.fixture_config)
+        exited = subprocess.Popen([sys.executable, "-c", "pass"])
+        exited.wait(timeout=3)
+        util.write_json(paths.SERVER_FILE, {**paths.state_and_config(), "pid": exited.pid,
+                                           "addresses": ["127.0.0.1"], "port": port})
+        self.assertIn("process has ended", self.problem("run replay-sample 7", "server_down")["error"])
+        with mock.patch.dict(os.environ, {"ARETE_SERVER": url}):
+            self.problem("run replay-sample 7", "server_down")
+            self.problem("loop start example", "server_down")
+        self.assertFalse(paths.DB_FILE.exists())
+
+    def test_readers_and_worker_guards(self):
+        self.in_subprocess("check_readers_and_worker_guards")
+
+    def check_readers_and_worker_guards(self):
+        from arete import record, run_lines
+        from arete.store import tasks as task_store
+
+        db.migrate()
+        task = task_store.task_add("replay-sample", "work")
+        run = record.start("session", run_id="r1", pid=None)
+        record.settle(run, "done", end_line="done")
+        run_lines.write(run, run_lines.END, status="done")
+        calls = []
+        real_connect = db.connect_db
+
+        def readonly(*args, **kwargs):
+            if not kwargs.get("readonly"):
+                calls.append((args, kwargs))
+                raise AssertionError("CLI opened the database for writing")
+            return real_connect(*args, **kwargs)
+
+        with mock.patch.object(db, "connect_db", readonly):
+            for command in (*self.READS, *self.READ_VARIANTS):
+                with self.subTest(command=command):
+                    self.cli(command.format(task=task))
+                    self.assertFalse(calls)
+            for command in ("run replay-sample 7 --local", "file-rule 1 --local", "loop new --run-id r1 work",
+                            "loop exec --run-id r1", "session exec r1"):
+                code, _, error = self.cli(command)
+                self.assertEqual(code, 1)
+                self.assertIn("started by Arete", error)
+            for command in ("lines --offline r1", "status --json --offline r1", f"task show --offline --json {task}"):
+                code, lines, _ = self.cli(command)
+                self.assertEqual(code, 0)
+                self.assertTrue(lines)
+                self.assertTrue(all(json.loads(line)["source"] == "local" for line in lines))
+
+    def test_identity_change_blocks_writes(self):
+        self.in_subprocess("check_identity_change_blocks_writes")
+
+    def check_identity_change_blocks_writes(self):
+        sent = []
+        instances = iter(("first", "second"))
+
+        def response(request):
+            sent.append(request.command)
+            body = ({"instance": {"id": next(instances)}} if request.command == "GET" else
+                    {"task": {"id": "t-1234"}})
+            return 200, body, {}
+
+        with self.stub(response):
+            self.assertEqual(self.cli("task add --repo replay-sample first")[0], 0)
+            self.problem("task add --repo replay-sample second", "server_identity_changed")
+        self.assertEqual(sent, ["GET", "POST", "GET"])
+
+    def test_approval_waits_out_drain(self):
+        self.in_subprocess("check_approval_waits_out_drain")
+
+    def check_approval_waits_out_drain(self):
+        from arete import client, delivery
+
+        seen, refused = [], []
+        with self.serve_at(seen), mock.patch.object(delivery.EMITS["push"], "execute", return_value="sent") as send:
+            number = approvals_store.add_approval("example", "", {"type": "push", "item": {}}, "deliver")
+            connect = client.connect
+
+            def reconnect(where, *args):
+                if not refused and any(status == 503 for _, _, status, _ in seen):
+                    refused.append(True)
+                    raise client.Down(client.address(where), "connection refused")
+                return connect(where, *args)
+
+            dashboard.POSTS_IN_FLIGHT.close()
+            timer = threading.Timer(1, dashboard.POSTS_IN_FLIGHT.reopen)
+            timer.start()
+            try:
+                with mock.patch.object(client, "connect", reconnect), mock.patch.object(client, "RETRY_SECONDS", .01):
+                    code, lines, err = self.cli(f"approve {number}")
+                self.assertEqual(code, 0, (lines, err))
+            finally:
+                timer.cancel()
+                timer.join()
+                dashboard.POSTS_IN_FLIGHT.reopen()
+            send.assert_called_once()
+            self.assertEqual(approvals_store.approval(number)["status"], "done")
+        self.assertEqual(refused, [True])
+        writes = [(code, key) for method, _, code, key in seen if method == "POST"]
+        self.assertEqual([code for code, _ in writes], [503, 200])
+        self.assertIsNotNone(writes[0][1])
+        self.assertEqual(writes[0][1], writes[1][1])
+
+    def test_file_rule_detaches_a_marked_worker_once(self):
+        self.in_subprocess("check_file_rule_detaches_a_marked_worker_once")
+
+    def check_file_rule_detaches_a_marked_worker_once(self):
+        from arete import miner
+
+        seen, workers = [], []
+        real_detach = control.detach
+
+        def detach(args):
+            workers.append(args)
+            return real_detach(args)
+
+        def spawn(argv, *, env, **_):
+            self.assertEqual(env.get(control.WORKER_ENV), "file-rule")
+            with mock.patch.dict(os.environ, env):
+                thread = threading.Thread(target=lambda: self.cli(" ".join(argv[-3:])))
+                thread.start()
+                thread.join(timeout=3)
+                self.assertFalse(thread.is_alive())
+            return SimpleNamespace(pid=1, wait=lambda: 0)
+
+        child = SimpleNamespace(Popen=spawn, DEVNULL=subprocess.DEVNULL, STDOUT=subprocess.STDOUT)
+        with self.serve_at(seen), mock.patch.object(control, "detach", side_effect=detach), \
+                mock.patch.object(control, "subprocess", child), \
+                mock.patch.object(miner, "file_rule", return_value="filed") as file_rule:
+            approvals_store.add_proposal("", {"repo": "replay-sample"}, "approve")
+            number = approvals_store.proposals()[0]["id"]
+            code, lines, err = self.cli(f"file-rule {number}")
+            self.assertEqual(code, 0, (lines, err))
+            file_rule.assert_called_once_with(number)
+        self.assertEqual(workers, [["file-rule", str(number), "--local"]])
+        self.assertEqual([path for method, path, _, _ in seen if method == "POST"], [f"/api/proposals/{number}/approve"])
+
+    def test_version_and_missing_field_errors_are_flat(self):
+        self.in_subprocess("check_version_and_missing_field_errors_are_flat")
+
+    def check_version_and_missing_field_errors_are_flat(self):
+        versions = []
+
+        def old(request):
+            versions.append(request.headers.get("X-Arete-Client"))
+            return 400, {"reason": "client_too_old", "required_version": "1.99"}, {}
+
+        with self.stub(old):
+            for command in ("wait r1", "answer r1", "status --json r1"):
+                self.assertIn("1.99", self.problem(command, "client_too_old")["error"])
+        self.assertEqual(len(versions), 3)
+        for version in versions:
+            self.assertRegex(version, r"^cli/1\.\d+$")
+
+        with self.stub(lambda request: (200, {"instance": {"id": "first"}} if request.path == "/api/meta" else {}, {})):
+            self.assertIn("asks", self.problem("answer r1", None)["error"])
+
+    def test_task_updates_and_stop_replay(self):
+        self.in_subprocess("check_task_updates_and_stop_replay")
+
+    def check_task_updates_and_stop_replay(self):
+        from arete import client, record
+        from arete.store import runs, tasks as task_store
+
+        seen = []
+        with self.serve_at(seen):
+            code, lines, err = self.cli("task add --repo replay-sample change")
+            self.assertEqual(code, 0, (lines, err))
+            task = lines[0]
+            self.assertEqual(task_store.task_get(task)["state"], "todo")
+            self.assertFalse(runs.runs())
+            self.assertEqual(json.loads(self.cli("task list")[1][0])["id"], task)
+            before = task_store.task_get(task)["version"]
+            with client.invocation():
+                path = f"/api/v1/tasks/{task}"
+                changed = client.call("PATCH", path, {"base_version": before, "title": "Edited"})["task"]
+                self.assertEqual(changed["title"], "Edited")
+                with self.assertRaises(client.Failed) as stale:
+                    client.call("PATCH", path, {"base_version": before, "title": "Stale"})
+                self.assertEqual(stale.exception.code, 409)
+            self.assertEqual(self.cli(f"task reply {task} reply")[0], 0)
+            self.assertEqual([(c["author"], c["body"]) for c in task_store.task_comments(task)], [("owner", "reply")])
+            self.assertEqual(self.cli(f"task close {task}")[0], 0)
+            self.problem(f"task close {task}", "invalid_state")
+            run = record.start("session", run_id="r1", pid=None)
+            with mock.patch.dict(os.environ, {"ARETE_IDEMPOTENCY_KEY": "stop-replay"}):
+                first = self.cli(f"stop {run}")
+                self.assertEqual(first[0], 0, first)
+                self.assertEqual(self.cli(f"stop {run}")[:2], first[:2])
+            self.assertEqual(runs.run_get(run)["status"], "stopped")
+
+    def check_pin_commands(self):
+        from arete import paths
+
+        with self.serve_at([]):
+            paths.record_dir("r1").mkdir(parents=True)
+            for command, code in (("pin r1", 0), ("unpin r1", 0), ("unpin r1", 1), ("pin missing", 1), ("pin", 2)):
+                self.assertEqual(self.cli(f"record {command}")[0], code, command)
+
+    def test_legacy_fallback_keeps_the_key(self):
+        self.in_subprocess("check_legacy_fallback_keeps_the_key")
+
+    def check_legacy_fallback_keeps_the_key(self):
+        writes = []
+        result = (404, "unknown_route")
+
+        def response(request):
+            if request.path == "/api/meta":
+                return 200, {"instance": {"id": "legacy"}}, {}
+            writes.append((request.path, request.headers.get("Idempotency-Key")))
+            if request.path.startswith("/api/v1/"):
+                status, reason = result
+                return status, {"error": reason, "reason": reason}, {}
+            return 200, {"id": "r1", "queued": True}, {}
+
+        with self.stub(response), mock.patch.dict(os.environ, {"ARETE_IDEMPOTENCY_KEY": "fallback-test"}):
+            self.assertEqual(self.cli("session send r1 message")[0], 0)
+            self.assertEqual(writes, [("/api/v1/runs/r1/steer", "fallback-test:1"),
+                                      ("/api/sessions/r1/send", "fallback-test:1")])
+            for result in ((404, "not_found"), (409, "conflict")):
+                writes.clear()
+                self.problem("session send r1 message", result[1])
+                self.assertEqual(writes, [("/api/v1/runs/r1/steer", "fallback-test:1")])
+
+    def test_hook_batches_replay_from_the_saved_offset(self):
+        self.in_subprocess("check_hook_batches_replay_from_the_saved_offset")
+
+    def check_hook_batches_replay_from_the_saved_offset(self):
+        from arete import paths, tool_events
+
+        remote = Path("receiver/events.jsonl")
+        remote.parent.mkdir()
+        url = "http://receiver.example.test:8080"
+        rows = [{"index": index, "detail": "🍊" * 400} for index in range(20)]
+        tool_events.append_events(rows)
+        sent = []
+
+        def send(body, key):
+            self.assertLessEqual(len(api_http.json_bytes(body)), api_http.MAX_JSON_BYTES)
+            sent.append((key, body))
+            with mock.patch.object(paths, "EVENTS_FILE", remote):
+                tool_events.ingest(body["origin"], body["offset"], body["events"])
+            if len(sent) == 1:
+                raise ConnectionError("response lost")
+
+        with self.assertRaises(ConnectionError):
+            tool_events.send_pending(url, send)
+        added = {"index": len(rows)}
+        tool_events.append_events([added])
+        tool_events.send_pending(url, send)
+        self.assertEqual(sent[0], sent[1])
+        self.assertGreater(len(sent), 2)
+        tool_events.send_pending(url, lambda *_: self.fail("sent a batch after its offset was acknowledged"))
+        self.assertEqual(tool_events.read_event_file(remote, None), [*rows, added])
+        tool_events.send_pending("http://local-alias.example.test:8080",
+                                 lambda body, _: tool_events.ingest(body["origin"], body["offset"], body["events"]))
+        self.assertEqual(tool_events.read_events(), [*rows, added])
 
 
 class ApiCheckTests(unittest.TestCase):
@@ -519,8 +1008,8 @@ class VersionedApiTests(unittest.TestCase):
 
         registry, _ = request("/api/v1/contract")
         operations = registry["operations"]
-        self.assertEqual(len(operations), 33)
-        self.assertEqual(len({op["name"] for op in operations}), 33)
+        self.assertEqual(len(operations), 46)
+        self.assertEqual(len({op["name"] for op in operations}), 46)
         for op in operations:
             with self.subTest(op=op["name"]):
                 contract.validate(op["example"]["input"], op["input"])

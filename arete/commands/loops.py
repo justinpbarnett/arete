@@ -80,8 +80,10 @@ def loop_list(args) -> int:
 
 @loop_errors
 def loop_new(args) -> int:
-    from .. import scaffold, util
+    from .. import control, scaffold, util
 
+    if args.run_id:
+        control.require_worker("loop new")
     made = scaffold.draft(scaffold.DraftRequest(" ".join(args.words), args.name, args.repo, args.model),
                           run_id=args.run_id)
     print(f"drafted {made['name']} in {paths.short_path(made['dir'])} (off, {util.paid_note(made['paid'])})\n")
@@ -94,8 +96,9 @@ def loop_new(args) -> int:
 
 @loop_errors
 def loop_exec(args) -> int:
-    from .. import loop_run
+    from .. import control, loop_run
 
+    control.require_worker("loop exec")
     return 0 if loop_run.carry_opened(args.run_id) in ("done", "skipped") else 1
 
 

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import fcntl
-import hashlib
 import getpass
+import hashlib
 import http.client
 import ipaddress
 import json
@@ -16,7 +16,8 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from email.utils import parsedate_to_datetime
 from urllib.parse import quote, urlencode, urlsplit
 
 from . import config, paths, run_lines, util
@@ -55,7 +56,7 @@ class InFlight(Failed):
 
 
 class Restarting(Exception):
-    def __init__(self, answer: dict, seconds: int):
+    def __init__(self, answer: dict, seconds: float):
         super().__init__(str(answer.get("error", "")))
         self.answer, self.seconds = answer, seconds
 
@@ -66,6 +67,8 @@ class Server:
     host: str
     port: int
     name: str
+    instance: str = ""
+    local: bool = False
 
 
 class Invocation:
@@ -118,7 +121,7 @@ def discover() -> Server:
         raise Down(f"http://127.0.0.1:{cfg.dashboard_port}", f"no server address in {paths.SERVER_FILE}")
     addresses = [str(a) for a in found["addresses"]]
     host, port = next((a for a in addresses if ":" not in a), addresses[0]), int(found["port"])
-    where = Server(found.get("scheme") or "http", host, port, found.get("host") or host)
+    where = Server(found.get("scheme") or "http", host, port, found.get("host") or host, local=True)
     if not util.pid_alive(found.get("pid")):
         raise Down(address(where), "the server process has ended")
     if {k: found.get(k) for k in mine} != mine:
@@ -128,8 +131,6 @@ def discover() -> Server:
 
 def check_instance(where, instance):
     url = address(where)
-    if not isinstance(instance, str) or not instance:
-        raise Failed({"error": "the server answer has an invalid instance.id"})
     folder = paths.CONFIG_DIR / "server-instances"
     folder.mkdir(parents=True, exist_ok=True)
     identity = folder / hashlib.sha256(url.encode()).hexdigest()
@@ -139,8 +140,29 @@ def check_instance(where, instance):
         if saved is None and not identity.exists():
             util.write_json(identity, instance)
         elif saved != instance:
-            raise Failed({"error": f"server instance at {url} changed (expected {saved}, got {instance})",
-                          "reason": "server_identity_changed"})
+            raise changed_instance(where, saved, instance)
+
+
+def instance_of(resp):
+    answer = decoded(resp, "GET", "/api/meta")
+    instance = field(field(answer, "instance"), "id", "instance.id")
+    if not isinstance(instance, str) or not instance:
+        raise Failed({"error": "the server answer has an invalid instance.id"})
+    return instance
+
+
+def changed_instance(where, saved, instance):
+    return Failed({"error": f"server instance at {address(where)} changed (expected {saved}, got {instance})",
+                   "reason": "server_identity_changed"})
+
+
+def check_replay(where, deadline):
+    if where.instance:
+        resp = request_once("GET", "/api/meta", read_seconds=CONNECT_SECONDS, deadline=deadline, where=where,
+                            buffered=True)
+        instance = instance_of(resp)
+        if where.instance != instance:
+            raise changed_instance(where, where.instance, instance)
 
 
 def server() -> Server:
@@ -148,20 +170,26 @@ def server() -> Server:
     if current is not None and current.server is not None:
         return current.server
     where = discover()
-    resp = request("GET", "/api/meta", read_seconds=CONNECT_SECONDS, where=where)
-    answer = decoded(resp, "GET", "/api/meta")
-    check_instance(where, field(field(answer, "instance"), "id", "instance.id"))
-    where = getattr(resp, "arete_server", where)
+    resp = request("GET", "/api/meta", read_seconds=CONNECT_SECONDS, where=where, buffered=True)
+    instance = instance_of(resp)
+    check_instance(where, instance)
+    where = replace(resp.arete_server, instance=instance)
     if current is not None:
         current.server = where
         if remote(where):
             from . import tool_events
 
-            tool_events.send_pending(address(where), lambda body, key: call("POST", "/api/v1/hook-events", body, key))
+            try:
+                tool_events.send_pending(address(where), lambda body, key: call("POST", "/api/v1/hook-events", body, key))
+            except Failed as e:
+                if e.code != 404 or not unknown_route(e.answer):
+                    raise
     return where
 
 
 def remote(where):
+    if where.local:
+        return False
     try:
         if ipaddress.ip_address(where.host).is_loopback:
             return False
@@ -267,7 +295,8 @@ def acquired_connection(where, deadline):
 
 def request(method: str, path: str, body: dict | None = None,
             read_seconds: float | None = CALL_SECONDS, key: str | None = None,
-            *, where: Server | None = None) -> http.client.HTTPResponse:
+            *, where: Server | None = None, buffered: bool = False,
+            auto_version: bool = False) -> http.client.HTTPResponse:
     where = where or server()
     deadline = None
     restart = None
@@ -276,8 +305,11 @@ def request(method: str, path: str, body: dict | None = None,
         if within is not None and within <= 0:
             raise Failed(restart.answer, 503)
         try:
-            return request_once(method, path, body, read_seconds, within,
-                                key=key, deadline=deadline, where=where)
+            if deadline is not None and method != "GET":
+                check_replay(where, deadline)
+                within = budget_left(deadline)
+            return request_once(method, path, body, read_seconds, within, key=key, deadline=deadline, where=where,
+                                buffered=buffered, auto_version=auto_version)
         except Restarting as e:
             restart, pause = e, e.seconds
         except Down:
@@ -299,7 +331,8 @@ def request(method: str, path: str, body: dict | None = None,
 def request_once(method: str, path: str, body: dict | None = None,
                  read_seconds: float | None = CALL_SECONDS, within: float | None = None,
                  key: str | None = None, *, deadline: float | None = None,
-                 where: Server | None = None) -> http.client.HTTPResponse:
+                 where: Server | None = None, buffered: bool = False,
+                 auto_version: bool = False) -> http.client.HTTPResponse:
     if deadline is None and within is not None:
         deadline = time.monotonic() + within
     where = where or server()
@@ -320,6 +353,8 @@ def request_once(method: str, path: str, body: dict | None = None,
                     headers = headers_for(where)
                     if key is not None:
                         headers["Idempotency-Key"] = key
+                    if auto_version:
+                        headers["X-Arete-Auto-Version"] = "1"
                     if payload is not None:
                         headers["Content-Type"] = "application/json"
                     if deadline is not None:
@@ -332,9 +367,11 @@ def request_once(method: str, path: str, body: dict | None = None,
                     resp.arete_server = where
                 if not followed and (moved := util.https_upgrade(resp, where.port)):
                     read_response(resp, deadline)
-                    where, followed = Server("https", where.host, where.port, moved.hostname), True
+                    where, followed = replace(where, scheme="https", name=moved.hostname), True
                     continue
                 if resp.status < 400:
+                    if buffered and deadline is not None:
+                        resp.arete_payload = read_response(resp, deadline)
                     returned = True
                     return resp
                 text = read_response(resp, deadline)
@@ -355,14 +392,25 @@ def request_once(method: str, path: str, body: dict | None = None,
     failure = {"error": f"the server at {address(where)} answered {resp.status}"}
     if isinstance(answer, dict):
         failure.update(answer)
-    wait = (resp.getheader("Retry-After") or "").strip()
+    wait = retry_after(resp.getheader("Retry-After"))
     if key is not None and resp.status == 409 and failure.get("code") == "idempotency_in_flight":
         failure = InFlight(failure, resp.status)
-        failure.seconds = int(wait) if wait.isascii() and wait.isdigit() else 1
+        failure.seconds = 1 if wait is None else wait
         raise failure
-    if resp.status == 503 and wait.isascii() and wait.isdigit():
-        raise Restarting(failure, int(wait))
+    if resp.status == 503 and wait is not None:
+        raise Restarting(failure, wait)
     raise Failed(failure, resp.status)
+
+
+def retry_after(header):
+    value = (header or "").strip()
+    if value.isascii() and value.isdigit():
+        return min(float(value), RESTART_WAIT_SECONDS)
+    try:
+        when = parsedate_to_datetime(value)
+        return max(0, when.timestamp() - time.time()) if when.tzinfo else None
+    except (ValueError, OverflowError, OSError):
+        return None
 
 
 def budget_left(deadline):
@@ -432,47 +480,62 @@ def read_response(resp, deadline):
 
 
 def call(method: str, path: str, body: dict | None = None, key: str | None = None,
-         *, legacy: str = "", legacy_body: dict | None = None) -> dict:
+         *, legacy: str = "", legacy_body: dict | None = None, auto_version: bool = False) -> dict:
     if method != "GET" and key is None:
         key = write_key()
     if key is not None and method == "POST" and path == "/api/tasks":
         return keyed_call(body, key)
     try:
-        return decoded(request(method, path, body, key=key), method, path)
+        return decoded(request(method, path, body, key=key, buffered=True, auto_version=auto_version), method, path)
     except Failed as e:
         if not legacy or e.code != 404 or not unknown_route(e.answer):
             raise
-    return decoded(request(method, legacy, body if legacy_body is None else legacy_body, key=key), method, legacy)
+    response = request(method, legacy, body if legacy_body is None else legacy_body, key=key,
+                       buffered=True, auto_version=auto_version)
+    return decoded(response, method, legacy)
 
 
 def decoded(resp, method, path):
     try:
-        return json.loads(resp.read())
+        raw = resp.arete_payload if hasattr(resp, "arete_payload") else resp.read()
+        return answer_object(raw, method, path)
     except BROKE as e:
         raise Failed({"error": f"the server broke off: {e}"}) from None
-    except ValueError:
-        raise Failed({"error": f"the server answered {method} {path} with no JSON"}) from None
     finally:
         close_response(resp)
 
 
-def keyed_call(body, key):
-    where = server()
+def answer_object(raw, method, path):
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        raise Failed({"error": f"the server answered {method} {path} with no JSON"}) from None
+    if not isinstance(value, dict):
+        raise Failed({"error": f"the server answered {method} {path} with an invalid JSON object"})
+    return value
+
+
+def keyed_call(body, key, *, where=None):
+    where = where or server()
     deadline = time.monotonic() + 30
     retries, restart, failure = 0, None, None
     uncertain = False
+    replaying = False
     while True:
         left = deadline - time.monotonic()
         if left <= 0:
-            raise failure or Failed({"error": "task start retry budget expired"})
+            raise restart or failure or Failed({"error": "task start retry budget expired"})
         if uncertain:
             if retries >= 2:
                 raise failure
             retries += 1
         resp = None
         try:
+            if replaying:
+                check_replay(where, deadline)
+            replaying = True
             resp = request_once("POST", "/api/tasks", body, within=left, key=key, deadline=deadline, where=where)
-            answer = json.loads(read_response(resp, deadline))
+            answer = answer_object(read_response(resp, deadline), "POST", "/api/tasks")
             budget_left(deadline)
             return answer
         except BROKE as e:
@@ -492,8 +555,6 @@ def keyed_call(body, key):
             if not uncertain and restart is None:
                 raise
             failure, pause = restart or Broken(e.answer), RETRY_SECONDS
-        except ValueError:
-            raise Failed({"error": "the server answered POST /api/tasks with no JSON"}) from None
         finally:
             if resp is not None:
                 close_response(resp)
@@ -501,9 +562,10 @@ def keyed_call(body, key):
 
 
 def start_task(body, key=None):
+    where = server()
     chosen = key if key is not None else write_key()
     print(f"Idempotency-Key: {chosen}", file=sys.stderr, flush=True)
-    return call("POST", "/api/tasks", body, key=chosen)
+    return keyed_call(body, chosen, where=where)
 
 
 def stream(path: str, query: dict) -> Iterator[dict]:
@@ -536,7 +598,7 @@ def run_command(run_id: str, action: str, body: dict | None = None, *, legacy: s
         path = run_path(run_id, action)
         if action == "stop":
             answer = call("POST", run_path(run_id, "stop", prefix="/api/v1"), data,
-                          legacy=legacy or path, legacy_body={} if legacy else None)
+                          legacy=legacy or path, legacy_body={} if legacy else None, auto_version=True)
             emit({k: v for k, v in answer.items() if k != "seq"})
         else:
             emit(call("POST", path, data))

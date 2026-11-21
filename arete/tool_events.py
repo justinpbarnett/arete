@@ -9,10 +9,9 @@ import socket
 import sys
 from datetime import UTC, datetime
 
-from . import paths, refusals, util
+from . import api_http, paths, refusals, util
 
 INGEST_MARK = "_arete_ingest"
-BATCH_BYTES = 65536
 
 BASH_CLASSES = [
     ("missing_tool", r"command not found"),
@@ -150,11 +149,24 @@ def ingest(origin, offset, events):
         raise refusals.Invalid("Hook ingest needs a source identifier and a nonnegative offset")
     tag = f"{origin}:{offset}:"
     with util.lock("hook-events", wait=True):
-        seen = {item[INGEST_MARK] for path in event_files() for item in read_event_file(path, None, internal=True)
+        files = event_files()
+        for path in files:
+            with path.open("rb") as source:
+                if event_origin(source, os.fstat(source.fileno())) == origin:
+                    return len(events)
+        seen = {item[INGEST_MARK] for path in files for item in read_event_file(path, None, internal=True)
                 if isinstance(item.get(INGEST_MARK), str) and item[INGEST_MARK].startswith(tag)}
         append_events([{**event, INGEST_MARK: f"{tag}{index}"} for index, event in enumerate(events)
                        if f"{tag}{index}" not in seen], durable=True)
     return len(events)
+
+
+def event_origin(stream, info):
+    first = stream.readline()
+    if not first.endswith(b"\n"):
+        return ""
+    location = f"{socket.gethostname()}:{paths.STATE_DIR}:{info.st_dev}:{info.st_ino}:".encode()
+    return hashlib.sha256(location + first).hexdigest()[:32]
 
 
 def send_pending(url, send):
@@ -171,41 +183,50 @@ def send_pending(url, send):
                 continue
             with stream:
                 info = os.fstat(stream.fileno())
-                if not (first := stream.readline()).endswith(b"\n"):
+                if not (origin := event_origin(stream, info)):
                     continue
-                machine = f"{socket.gethostname()}:{paths.STATE_DIR}:{info.st_dev}:{info.st_ino}:".encode()
-                origin = hashlib.sha256(machine + first).hexdigest()[:32]
                 sources.add(origin)
                 offset, pending = offsets.get(origin, (0, None))
                 stream.seek(offset)
-                end, events = read_batch(stream, pending)
-                if end == offset:
-                    continue
-                if events:
-                    offsets[origin] = (offset, end)
-                    util.write_json(checkpoint, offsets)
-                    send({"origin": origin, "offset": offset, "events": events}, f"hook:{origin}:{offset}")
-                offsets[origin] = (end, None)
+                while offset < info.st_size:
+                    body = {"origin": origin, "offset": offset, "events": []}
+                    end = read_batch(stream, body, info.st_size, pending)
+                    if end == offset:
+                        break
+                    if body["events"]:
+                        offsets[origin] = (offset, end)
+                        util.write_json(checkpoint, offsets)
+                        send(body, f"hook:{origin}:{offset}")
+                    offset, pending = end, None
+                    offsets[origin] = (offset, pending)
         util.write_json(checkpoint, {source: offsets[source] for source in sources if source in offsets})
 
 
-def read_batch(stream, pending):
-    offset = end = stream.tell()
-    events = []
-    while pending is None or end < pending:
+def read_batch(stream, body, size, pending):
+    end = stream.tell()
+    used = len(api_http.json_bytes(body))
+    events = body["events"]
+    while end < (size if pending is None else pending):
         raw = stream.readline()
-        if not raw.endswith(b"\n") or (end > offset and pending is None and stream.tell() - offset > BATCH_BYTES):
+        if not raw.endswith(b"\n") or stream.tell() > size:
             break
-        end = stream.tell()
         try:
             item = json.loads(raw)
         except (ValueError, UnicodeError):
-            continue
+            item = None
         if isinstance(item, dict) and INGEST_MARK not in item:
+            added = len(api_http.json_bytes(item)) + (2 if events else 0)
+            if pending is None and used + added > api_http.MAX_JSON_BYTES:
+                if not events:
+                    raise refusals.Invalid(f"A hook event at offset {end} exceeds the server's JSON body limit")
+                break
             events.append(item)
+            used += added
+        end = stream.tell()
     if pending is not None and end != pending:
         raise refusals.Invalid("The pending hook batch is no longer in the local event file")
-    return end, events
+    stream.seek(end)
+    return end
 
 
 def dated_events():
@@ -283,11 +304,11 @@ def read_events(since_hours: float | None = None, since_ts: float | None = None,
 
 def read_event_file(path, cutoff, until=None, *, internal=False) -> list[dict]:
     out = []
-    with path.open() as f:
+    with path.open("rb") as f:
         for line in f:
             try:
                 ev = json.loads(line)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, UnicodeError):
                 continue
             if not isinstance(ev, dict):
                 continue

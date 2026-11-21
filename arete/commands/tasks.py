@@ -91,8 +91,9 @@ def cmd_forget(args) -> int:
 def cmd_file_rule(args) -> int:
     if not args.local:
         return client.say("POST", f"/api/proposals/{args.id}/approve")
-    from .. import miner
+    from .. import control, miner
 
+    control.require_worker("file-rule", development=True)
     try:
         print(miner.file_rule(args.id))
     except LookupError as e:
