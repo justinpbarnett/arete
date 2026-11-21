@@ -19,6 +19,7 @@ from . import config, outbound, paths, util
 
 ARETE_MARK = "<!-- arete -->"
 GITHUB_API = "https://api.github.com"
+GITHUB_ACTIONS_APP_ID = 15368
 CLONE_TOKEN_PERMISSIONS = {"contents": "read"}
 NO_ISSUE = "Could not resolve to an issue"
 
@@ -351,6 +352,19 @@ def pr_comment(url: str, body: str) -> None:
                   f"repos/{pr_repo(url)}/issues/{pr_number(url)}/comments", mark=True)
 
 
+def find_own_pr_comment(repo: str, number: int, marker: str) -> dict | None:
+    author = me()
+    return next((row for row in api_list(f"repos/{repo}/issues/{number}/comments")
+                 if author and (row.get("user") or {}).get("login") == author
+                 and marker in (row.get("body") or "").splitlines()), None)
+
+
+def pr_edit_comment(repo: str, comment_id: int, body: str) -> None:
+    payload = Outgoing(json.dumps({"body": outgoing(body, mark=True)}))
+    gh(["api", "-X", "PATCH", f"repos/{repo}/issues/comments/{comment_id}", "--input", "-"],
+       input=payload, write=True)
+
+
 def pr_reply(url: str, comment_id: int, body: str) -> None:
     keyed_comment(["api", f"repos/{pr_repo(url)}/pulls/{pr_number(url)}/comments/{comment_id}/replies", "-X", "POST",
                    "--input", "-"], body, f"repos/{pr_repo(url)}/pulls/{pr_number(url)}/comments",
@@ -490,9 +504,8 @@ def actions_check_passed(repo: str, head: str, name: str) -> bool:
     rows = reply.get("check_runs", [])
     if reply.get("total_count", len(rows)) > len(rows):
         return False
-    # 15368 is the GitHub Actions app that publishes the required check.
     runs = [row for row in rows if row.get("name") == name
-            and row.get("head_sha") == head and (row.get("app") or {}).get("id") == 15368]
+            and row.get("head_sha") == head and (row.get("app") or {}).get("id") == GITHUB_ACTIONS_APP_ID]
     return bool(runs) and all(row.get("status") == "completed" and row.get("conclusion") == "success" for row in runs)
 
 

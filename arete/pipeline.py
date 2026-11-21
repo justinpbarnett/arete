@@ -2947,7 +2947,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
     zte_verify = delivery_verification and zte.reserved(tid)
     readme_task = (delivery_verification and pilot.is_pilot_task(tid)) or zte_verify
     feature_map = configured.feature_map if delivery_verification and not readme_task else {}
-    requested = journeys.requested(feature_map, b.ticket.title, b.ticket.body) if feature_map else []
+    requested = journeys.requested(feature_map, b.ticket.title, b.ticket.body)
     step = b.next_step(step_name)
     if unknown := [name for name in requested if name not in feature_map]:
         return save_verification(run, step, verify.Verified(

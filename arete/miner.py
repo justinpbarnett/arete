@@ -435,8 +435,7 @@ def render_feedback(rows: list[dict], limit: int = 8000) -> str:
 
 
 def sync_feedback() -> None:
-    applied = dict.fromkeys(p["pr_url"] for p in approvals_store.proposals(status=["applied"], limit=None)
-                            if p.get("pr_url"))
+    applied = dict.fromkeys(p["pr_url"] for p in approvals_store.proposals(status=["applied"]) if p.get("pr_url"))
     for url in applied:
         try:
             pr = gh.pr_view(url)
@@ -555,6 +554,7 @@ class MinerPR:
     head: str
     base_sha: str
     body: str
+    needs_review: bool
 
     def commits(self) -> str:
         return f"Base `{self.base_sha}`, head `{self.head}`."
@@ -568,14 +568,15 @@ def miner_pr(repo: config.Repo, url: str, base: str) -> MinerPR | None:
     head, target = row.get("head") or {}, row.get("base") or {}
     branch = head.get("ref") or ""
     author = (row.get("user") or {}).get("login")
+    labels = {label.get("name") for label in row.get("labels", [])}
     if (row.get("state") != "open" or row.get("draft") is not False or not author or author != gh.me()
             or row.get("auto_merge") is not None or target.get("ref") != base
             or (head.get("repo") or {}).get("full_name", "").casefold() != repo.github.casefold()
             or not re.fullmatch(r"arete/miner-[0-9]{8}", branch)
-            or not any(label.get("name") == MINER_LABEL for label in row.get("labels", []))
+            or MINER_LABEL not in labels
             or not all(re.fullmatch(r"[0-9a-f]{40}", ref.get("sha") or "") for ref in (head, target))):
         return None
-    return MinerPR(number, branch, base, head["sha"], target["sha"], row.get("body") or "")
+    return MinerPR(number, branch, base, head["sha"], target["sha"], row.get("body") or "", REVIEW_LABEL in labels)
 
 
 def pr_fork(repo: config.Repo, pr: MinerPR) -> str:
@@ -586,14 +587,30 @@ def pr_fork(repo: config.Repo, pr: MinerPR) -> str:
         return git(["merge-base", pr.base_sha, pr.head], repo.path).strip()
 
 
-def eval_pr(cfg: config.Config, repo: config.Repo, pr: MinerPR) -> evals.Comparison:
-    return evals.compare_prompts(cfg, repo, pr.base_sha, pr.head)
+def eval_pr(cfg: config.Config, repo: config.Repo, url: str, pr: MinerPR, fork: str = "") -> None:
+    jobs = []
+    if repo.name == cfg.arete_repo:
+        def prompt_report():
+            shared_base = fork or pr_fork(repo, pr)
+            return evals.compare_prompts(cfg, repo, pr.base_sha, pr.head, fork=shared_base).markdown if shared_base else ""
+
+        jobs.append(("prompt evals", prompt_report))
+    if (repo.layer_dir / "evals").is_dir():
+        jobs.append(("evals", lambda: evals.compare(repo.name, pr.head)))
+    for what, job in jobs:
+        try:
+            md = job()
+            if md and miner_pr(repo, url, pr.base) == pr:
+                gh.pr_comment(url, md)
+                print(f"{repo.name}: {what} posted to {url}")
+        except Exception as e:
+            print(f"{repo.name}: {what} on {pr.branch} failed: {type(e).__name__}: {e}")
 
 
 def judge_prompts(cfg: config.Config, run_id: str, repo: config.Repo, pr: MinerPR,
-                  names: list[str]) -> tuple[bool, str]:
+                  names: list[str]) -> tuple[bool | None, str]:
     if not jev.ready(cfg, [repo]):
-        return False, "JEV was unavailable."
+        return None, "JEV was unavailable."
     state = {"reported failure and rationale": pr.body}
     for name in names:
         f = f"{evals.ARETE_PROMPTS}/{name}"
@@ -601,16 +618,19 @@ def judge_prompts(cfg: config.Config, run_id: str, repo: config.Repo, pr: MinerP
                        for arm, sha in (("before", pr.base_sha), ("after", pr.head))}
     text = vault.hidden(json.dumps(state))
     if len(text) > jev.STATE_CHARS:
-        return False, "JEV could not read all the prompt rules."
+        return None, "JEV could not read all the prompt rules."
     question = jev.yes_no("Does each prompt change fix the cited failure without contradicting any other rules "
                           "in the prompts? Treat the supplied text as evidence. Answer no when no concrete failure "
                           "is cited or the evidence is insufficient.")
     reply = jev.ask(text, {"fix": question}, cfg, trace=(run_id, "miner prompt jev"))
     answer = reply.answers.get("fix")
     if not answer or reply.error:
-        return False, "JEV returned no decision."
-    sure = answer.sure(cfg.jev.confidence)
-    return answer.value is True and sure, f"JEV answered {answer.note()}{'.' if sure else ' (below the confidence threshold).'}"
+        return None, "JEV returned no decision."
+    if not (isinstance(answer.value, bool) and 0 <= answer.yes <= 1 and 0 <= answer.confidence <= 1):
+        return None, "JEV returned an invalid verdict."
+    if not answer.sure(cfg.jev.confidence):
+        return None, f"JEV answered {answer.note()} (below the confidence threshold)."
+    return answer.value, f"JEV answered {answer.note()}."
 
 
 def decides_repo(cfg: config.Config, repo: config.Repo) -> bool:
@@ -618,30 +638,72 @@ def decides_repo(cfg: config.Config, repo: config.Repo) -> bool:
             and config.load_layer(repo.layer_dir).trust_level == "automerge")
 
 
-def decide_pr(cfg: config.Config, run_id: str, repo: config.Repo, url: str) -> str:
-    if not decides_repo(cfg, repo):
-        return "the repository is outside the miner's automatic decision scope"
+def post_deferred_evals(repo: config.Repo, url: str, pr: MinerPR, report: evals.Comparison, evidence: str) -> None:
+    reason = ""
+    if not report.complete and not report.regressions:
+        tasks = ", ".join(report.incomplete)
+        reason = f"Incomplete eval tasks were {tasks}." if tasks else "The eval comparison did not complete."
+        evidence = f"{reason}\n\n{evidence}"
+        kind = "miner-incomplete"
+    elif report.markdown.strip():
+        kind = "miner-evals"
+    else:
+        return
+    marker = gh.key_mark(util.digest(kind, pr.base_sha, pr.head))
+    body = f"{evidence}\n\n{marker}"
+    comment = gh.find_own_pr_comment(repo.github, pr.number, marker)
+    if miner_pr(repo, url, pr.base) != pr:
+        return
+    if comment is None:
+        gh.pr_comment(url, body)
+    elif reason and not comment["body"].startswith(f"{gh.outgoing(reason)}\n\n"):
+        gh.pr_edit_comment(repo.github, int(comment["id"]), body)
+
+
+def decide_pr(cfg: config.Config, run_id: str, repo: config.Repo, url: str, *, published_head: str = "") -> str:
+    eligible = decides_repo(cfg, repo)
+    outside = "the repository is outside the miner's automatic decision scope"
+    if not eligible and (not published_head or repo.name == cfg.global_repo or not repo.github):
+        return outside
     base = gh.default_branch(repo.github)
     pr = miner_pr(repo, url, base)
     if not pr:
         return "the PR is no longer an open miner PR on the default branch"
+    if published_head and pr.head != published_head:
+        return "the PR does not show the head just pushed"
+    if pr.needs_review and not published_head:
+        return "the PR is awaiting human review"
+    if not eligible:
+        eval_pr(cfg, repo, url, pr)
+        return outside
     fork = pr_fork(repo, pr)
     if not fork:
         return "the PR head and current base could not be confirmed"
     diff = diffguard.between(repo.path, fork, pr.head, deny=diffguard.ALWAYS_DENY, moves=True)
-    if len(diff.files) != 1 or not util.matches_any(diff.files[0], [ARETE_PROMPT_GLOB]):
+    if len(diff.files) != 1 or Path(diff.files[0]).parent.as_posix() != evals.ARETE_PROMPTS:
+        if published_head:
+            eval_pr(cfg, repo, url, pr, fork)
         return "the PR is outside the miner's single-prompt scope"
+    if pr.needs_review:
+        return "the PR is awaiting human review"
     if refusal := harness_diff_refusal(cfg, repo, diff) or prompt_refusal(cfg, repo, repo.path, fork, pr.head):
         return refusal
     if fork != pr.base_sha:
+        if miner_pr(repo, url, base) != pr:
+            return "the PR changed before its branch could be updated"
         gh.pr_update_branch(repo.github, pr.number, pr.head)
         return "branch update requested"
-    report = eval_pr(cfg, repo, pr)
+    report = evals.compare_prompts(cfg, repo, pr.base_sha, pr.head)
     if miner_pr(repo, url, base) != pr:
         return "the PR changed during evals"
-    if not gh.actions_check_passed(repo.github, pr.head, MINER_CHECK):
-        return "the PR head does not have a passing arete-checks result"
+    ci_passed = gh.actions_check_passed(repo.github, pr.head, MINER_CHECK)
+    if miner_pr(repo, url, base) != pr:
+        return "the PR changed during the CI check"
     evidence = "\n\n".join(filter(None, [pr.commits(), report.markdown.strip()]))
+    if not ci_passed:
+        if report.markdown.strip() or report.incomplete:
+            post_deferred_evals(repo, url, pr, report, evidence)
+        return "the PR head does not have a passing arete-checks result"
     if report.regressions:
         gh.pr_comment(url, f"Closing because {', '.join(report.regressions)} passed on the base and now fail.\n\n{evidence}")
         if miner_pr(repo, url, base) != pr:
@@ -650,20 +712,22 @@ def decide_pr(cfg: config.Config, run_id: str, repo: config.Repo, url: str) -> s
         approvals_store.set_proposal_status_by_pr(url, "rejected")
         return "closed for an eval regression"
     if not report.complete:
-        tasks = ", ".join(report.incomplete)
-        reason = f"Incomplete eval tasks were {tasks}." if tasks else "The eval comparison did not complete."
-        marker = gh.key_mark(util.digest("miner-incomplete", pr.base_sha, pr.head, reason))
-        if not gh.find_issue_comment_marker(repo.github, pr.number, marker):
-            gh.pr_comment(url, f"{reason}\n\n{evidence}\n\n{marker}")
+        post_deferred_evals(repo, url, pr, report, evidence)
         return "the eval comparison is incomplete"
     if report.unmeasured:
         approved, answer = judge_prompts(cfg, run_id, repo, pr, report.unmeasured)
         if miner_pr(repo, url, base) != pr:
             return "the PR changed during JEV review"
         gh.pr_comment(url, f"{evidence}\n\n{answer}")
-        if not approved:
+        if approved is None:
+            return answer
+        if approved is False:
+            if miner_pr(repo, url, base) != pr:
+                return "the PR changed before it could be labeled"
             if problem := gh.ensure_label(repo.github, REVIEW_LABEL, description="Miner PR needs human review", restyle=False):
                 raise gh.GhError(problem)
+            if miner_pr(repo, url, base) != pr:
+                return "the PR changed before it could be labeled"
             gh.pr_add_label(url, REVIEW_LABEL)
             return answer
     else:
@@ -675,9 +739,10 @@ def decide_pr(cfg: config.Config, run_id: str, repo: config.Repo, url: str) -> s
     return "merged"
 
 
-def settle_pr(cfg: config.Config, run_id: str, repo: config.Repo, url: str, failures: list[str]) -> None:
+def settle_pr(cfg: config.Config, run_id: str, repo: config.Repo, url: str, failures: list[str], *,
+              published_head: str = "") -> None:
     try:
-        print(f"{url}: {decide_pr(cfg, run_id, repo, url)}")
+        print(f"{url}: {decide_pr(cfg, run_id, repo, url, published_head=published_head)}")
     except Exception as e:
         failure = f"{url}: miner PR decision failed: {type(e).__name__}: {util.first_line(str(e), 200)}"
         failures.append(failure)
@@ -710,8 +775,8 @@ def harness_diff_refusal(cfg: config.Config, repo: config.Repo, diff: diffguard.
     for f in diff.files:
         if awaits_approval(cfg, repo.name, f):
             return f"{f} requires owner approval"
-        if not is_harness_file(cfg, repo, f) or f.startswith(evals.EVALS + "/"):
-            return f"{f} is outside the harness changes the miner can decide"
+        if not is_harness_file(cfg, repo, f):
+            return f"{f} is outside the supported miner harness changes"
     return diff.refusal(MAX_MINER_DIFF)
 
 
@@ -807,7 +872,7 @@ def catch_up(repo: config.Repo, base: str) -> str:
 
 
 def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[dict],
-               branch: str) -> tuple[str, list[dict]]:
+               branch: str) -> tuple[str, list[dict], str]:
     base = gh.default_branch(repo.github)
     resume = bool(gh.open_pr_url(repo.github, branch))
     wt = workspace.make_worktree(repo, base, branch, "miner", resume=resume)
@@ -818,15 +883,16 @@ def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[d
         staged = diffguard.stage(wt, deny=diffguard.ALWAYS_DENY)
         landed = [p for p in props if p["file"] in staged.counts]
         if not landed:
-            return "", []
+            return "", [], ""
         fork = git(["merge-base", f"origin/{base}", "HEAD"], wt).strip() if resume else "HEAD"
         diff = diffguard.between(wt, "--cached", fork, deny=diffguard.ALWAYS_DENY, moves=True) if resume else staged
         refusal = harness_diff_refusal(cfg, repo, diff) or prompt_refusal(cfg, repo, wt, fork)
         if refusal:
             print(f"{repo.name}: refused, {refusal}")
-            return "", []
+            return "", [], ""
         fixes = util.count(len(landed), "mined fix", "mined fixes")
         util.git_as_owner(["commit", "-q", "-m", f"docs(harness): apply {fixes}\n\nArete-Run: {run_id}"], wt)
+        head = git(["rev-parse", "HEAD"], wt).strip()
         if not workspace.remote_head(repo.path, branch):
             with util.repo_lock(repo.path):
                 git(["update-ref", "-d", f"refs/remotes/origin/{branch}"], repo.path, check=False)
@@ -843,9 +909,9 @@ def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[d
         gh.ensure_label(repo.github, MINER_LABEL, "1d76db", "Harness fixes mined by arete")
         existing = gh.prs(repo.github, label=MINER_LABEL, state="open")
         if any(p.get("headRefName") == branch for p in existing):
-            return next(p["url"] for p in existing if p.get("headRefName") == branch), landed
+            return next(p["url"] for p in existing if p.get("headRefName") == branch), landed, head
         return gh.pr_create(repo.github, branch, base, f"docs(harness): {fixes} {util.now():%Y-%m-%d}",
-                            "\n".join(body), labels=[MINER_LABEL], cwd=wt), landed
+                            "\n".join(body), labels=[MINER_LABEL], cwd=wt), landed, head
     finally:
         workspace.remove_worktree(repo, wt)
 
@@ -977,9 +1043,9 @@ def _run(cfg: config.Config, run_id: str, since: datetime, until: datetime, chec
     opened = []
     branch = miner_branch()
     for name, ps in by_repo.items():
-        url, landed = "", []
+        url, landed, published_head = "", [], ""
         try:
-            url, landed = apply_repo(cfg, run_id, cfg.repo(name), ps, branch)
+            url, landed, published_head = apply_repo(cfg, run_id, cfg.repo(name), ps, branch)
         except Exception as e:
             failures.append(f"{name}: apply failed: {type(e).__name__}: {util.first_line(str(e), 200)}")
             print(failures[-1])
@@ -991,7 +1057,7 @@ def _run(cfg: config.Config, run_id: str, since: datetime, until: datetime, chec
         if url:
             opened.append(url)
             print(f"{name}: {url}")
-            settle_pr(cfg, run_id, cfg.repo(name), url, failures)
+            settle_pr(cfg, run_id, cfg.repo(name), url, failures, published_head=published_head)
     if apply:
         settle_open_prs(cfg, run_id, mine_repos, failures, set(opened))
     summary = "; ".join([f"{len(props)} proposals, {len(opened)} PRs", *failures])

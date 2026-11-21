@@ -138,15 +138,13 @@ def runs_cited_by_kept_proposals(run_ids, connect=reader) -> set[str]:
     return {r for r in run_ids if any(r == row["run_id"] or r in (row["evidence"] or "") for row in rows)}
 
 
-def proposals(status: list[str] | None = None, limit: int | None = 200, connect=reader) -> list[dict]:
+def proposals(status: list[str] | None = None, limit: int = 200, connect=reader) -> list[dict]:
     q, args = "SELECT * FROM proposals", []
     if status:
         q += f" WHERE status IN ({','.join('?' * len(status))})"
         args += status
-    q += " ORDER BY id DESC"
-    if limit is not None:
-        q += " LIMIT ?"
-        args.append(limit)
+    q += " ORDER BY id DESC LIMIT ?"
+    args.append(limit)
     with connect() as c:
         return [dict(r) for r in c.execute(q, args)]
 
