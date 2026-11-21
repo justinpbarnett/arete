@@ -2884,9 +2884,11 @@ def merge_moved_bases(run: AgentRun, checkouts: list[workspace.Checkout], layer:
         if environment_retry and (not c.base_commit or
                                   git(["merge-base", c.base_commit, base], c.wt).strip() != c.base_commit):
             raise workspace.RunFailed(f"the base for {c.github} no longer contains the saved base")
-        c.base_commit = base
-        if git(["rev-list", "--count", f"HEAD..{c.base_commit}"], c.wt).strip() == "0":
+        if git(["rev-list", "--count", f"HEAD..{base}"], c.wt).strip() == "0":
+            if not pending_merge(c):
+                c.base_commit = base
             continue
+        c.base_commit = base
         if edits := workspace.uncommitted(c.wt, tracked_only=allow_untracked):
             raise workspace.RunFailed(f"{c.github} has uncommitted edits ({', '.join(edits[:5])}), so arete merged nothing into "
                             "them and left them as they are")

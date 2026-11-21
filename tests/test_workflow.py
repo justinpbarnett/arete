@@ -21,15 +21,17 @@ from types import SimpleNamespace
 from typing import ClassVar
 from unittest import mock
 
+from adws import single_worker
 from arete import (
     api_check, ci, config, diffguard, evals, factory, flows, gh, jev, mergecheck, miner, orchestration, owner_asks,
     paths, pipeline, sandbox, serve, tracker, util, verify, workspace,
 )
 from arete.agent import NO_SESSION, Result
 from arete.review import Review
+from arete.store import db, orchestration as ledger
 
 
-class PublicationDiffTests(unittest.TestCase):
+class PublicationFixture(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
         self.git("init", "-q", "-b", "main")
@@ -52,7 +54,8 @@ class PublicationDiffTests(unittest.TestCase):
         self.controller.persist = mock.Mock()
         self.controller.atomic = mock.Mock()
         self.action = {"id": "d0001-0", "op": "publication.request", "state": "accepted", "request": {}}
-        self.transition = self.enterContext(mock.patch.object(orchestration.ledger, "transition"))
+        self.transition = self.enterContext(mock.patch.object(ledger, "transition", wraps=ledger.transition,
+                                                              return_value=None))
         self.enterContext(mock.patch.object(pipeline.record, "mark"))
         self.enterContext(mock.patch.object(orchestration.run_lines, "write"))
 
@@ -94,23 +97,65 @@ class PublicationDiffTests(unittest.TestCase):
         controller.stamp("review", job.review.asdict())
         return job
 
-    def test_unchanged_pushed_tree_refuses_publication_and_keeps_the_run_open(self):
-        self.record_pushed_head()
-        self.controller.data["ci_failed"] = True
-        self.controller.job.verified.checks = [{"passed": True}]
-        for from_base, release in ((False, ""), (True, ""), (True, "live-release")):
-            with self.subTest(from_base=from_base, release=release):
-                self.build.from_base = from_base
-                self.controller.run.environment_release = release
-                self.controller.dispatch(self.action)
-                self.transition.assert_called_with(
-                    self.controller.lease, self.action["id"], "failed",
-                    {"error": f"nothing changed since the pushed head `{self.checkout.lease}`"})
-                self.assertIsNone(self.controller.ending)
-                self.assertTrue(self.controller.data["ci_failed"])
-                self.assertNotIn("publication_intent", self.controller.data)
-        self.controller.atomic.assert_not_called()
 
+class SingleWorkerPublicationTests(PublicationFixture):
+    def test_single_worker_repair_keeps_the_draft_when_only_publication_is_refused(self):
+        branch = "arete/7-edit-fixture"
+        self.git("switch", "-qc", branch)
+        self.record_pushed_head()
+        c, controller, b = self.checkout, self.controller, self.build
+        c.resumes = True
+        repo = config.Repo("fixture", self.root, parts=[config.Part("", c.github)])
+        self.publication_job(repo, branch, verified=verify.Verified("pass"))
+        controller.run.repairs = "saved-review"
+        b.from_base, b.layer.verify = True, config.Verify()
+        controller.policy = config.Orchestration()
+        catalog = controller.catalog
+        catalog.context["task"] = "Check the saved review findings"
+        catalog.settings = {f"model:{role}:0": SimpleNamespace(step=role, effort="low")
+                            for role in ("build", "verify", "review")}
+        catalog.route.side_effect = lambda key, *_: catalog.settings[key]
+        catalog.validate.side_effect = lambda *args: orchestration.Catalog.validate(catalog, *args)
+
+        state = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        self.enterContext(mock.patch.multiple(paths, STATE_DIR=state, DB_FILE=state / "arete.db",
+                                             RUNS_DIR=state / "runs", LOCKS_DIR=state / "locks",
+                                             WORKTREES_DIR=state / "worktrees", LOG_DIR=state / "logs"))
+        db.migrate()
+        self.transition.return_value = mock.DEFAULT
+        del controller.persist
+
+        unchanged = f"nothing changed since the pushed head `{c.lease}`"
+        for verified, review, error, status in (
+            ("pass", "approve", unchanged, "pr"),
+            ("fail", "approve", "behavioral verification failed; repair or finish failed", "failed"),
+            ("pass", "request_changes", unchanged, "failed"),
+        ):
+            with self.subTest(verified=verified, review=review):
+                controller.run.id = f"fixture-{verified}-{review}"
+                controller.lease = ledger.acquire(controller.run.id, "", controller.data)
+                with (mock.patch.object(orchestration, "Controller", return_value=controller),
+                      mock.patch.object(controller, "prepare", return_value=None),
+                      mock.patch.object(controller, "worker_start", return_value={"text": "Head already fixes the findings"}),
+                      mock.patch.object(pipeline, "check_in_use", return_value=verify.Verified(verified)),
+                      mock.patch.object(pipeline, "_review", return_value=Review.stored({"verdict": review})),
+                      mock.patch.object(pipeline.record, "note"),
+                      mock.patch.object(pipeline, "release_workspace"),
+                      mock.patch.object(pipeline, "commit_and_push", side_effect=AssertionError("unexpected push")) as push,
+                      mock.patch.object(gh, "pr_set_draft", side_effect=AssertionError("unexpected draft change")) as draft):
+                    ending = single_worker.single_worker(controller.flow)
+                publication = ledger.actions(controller.lease)[-1]
+                self.assertEqual((publication["op"], publication["state"], publication["result"]["error"]),
+                                 ("publication.request", "failed", error))
+                self.assertEqual(ending[0], status)
+                if status == "pr":
+                    self.assertEqual(ending, ("pr", unchanged, c.pr))
+                self.assertEqual(self.git("rev-parse", "HEAD"), c.lease)
+                push.assert_not_called()
+                draft.assert_not_called()
+
+
+class ClosedPRPublicationTests(PublicationFixture):
     def test_closed_pr_rerun_publishes_with_the_remote_only_lease(self):
         other = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
         self.git("clone", "-q", "--shared", str(self.root), str(other))
@@ -177,6 +222,25 @@ class PublicationDiffTests(unittest.TestCase):
         create.assert_called_once()
         fetch.assert_called_once_with(self.root, "main")
 
+
+class PublicationDiffTests(PublicationFixture):
+    def test_unchanged_pushed_tree_refuses_publication_and_keeps_the_run_open(self):
+        self.record_pushed_head()
+        self.controller.data["ci_failed"] = True
+        self.controller.job.verified.checks = [{"passed": True}]
+        for from_base, release in ((False, ""), (True, ""), (True, "live-release")):
+            with self.subTest(from_base=from_base, release=release):
+                self.build.from_base = from_base
+                self.controller.run.environment_release = release
+                self.controller.dispatch(self.action)
+                self.transition.assert_called_with(
+                    self.controller.lease, self.action["id"], "failed",
+                    {"error": f"nothing changed since the pushed head `{self.checkout.lease}`"})
+                self.assertIsNone(self.controller.ending)
+                self.assertTrue(self.controller.data["ci_failed"])
+                self.assertNotIn("publication_intent", self.controller.data)
+        self.controller.atomic.assert_not_called()
+
     def test_verified_environment_resume_readies_the_existing_draft_without_a_push(self):
         self.record_pushed_head()
         c, controller, b = self.checkout, self.controller, self.build
@@ -240,6 +304,66 @@ class PublicationDiffTests(unittest.TestCase):
                 with self.assertRaisesRegex(workspace.RunFailed, "the final orchestrated tree undid every change"):
                     self.controller.dispatch(self.action)
         self.controller.atomic.assert_not_called()
+
+
+class PendingBaseMergePublicationTests(PublicationFixture):
+    def resume_with_pending_base_merge(self):
+        c, controller, b = self.checkout, self.controller, self.build
+        branch = "arete/7-edit-fixture"
+        fork = self.git("rev-parse", "origin/main")
+        self.git("switch", "-qc", branch)
+        self.record_pushed_head()
+        c.resumes = True
+
+        self.git("switch", "-qc", "moved-base", fork)
+        (self.root / "upstream.txt").write_text("upstream change\n")
+        self.git("add", "--", "upstream.txt")
+        self.commit("moved base")
+        self.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        self.git("switch", "-q", branch)
+        self.git("config", "commit.gpgSign", "false")
+        with mock.patch.object(pipeline.record, "timed", return_value=nullcontext({})):
+            pipeline.settle_starts(controller.run, [c], b.layer, b.ticket, branch)
+        # A later fetch can update the tracking ref while the merge is still unpushed.
+        self.git("update-ref", "refs/remotes/origin/main", fork)
+        self.assertEqual(pipeline.merge_moved_bases(controller.run, [c], b.layer, b.ticket), [])
+        self.assertTrue(pipeline.pending_merge(c))
+        self.assertEqual(c.base_commit, self.git("rev-parse", "HEAD^2"))
+        return branch
+
+    def test_pending_base_merge_fails_before_push_when_the_implementation_is_undone(self):
+        branch = self.resume_with_pending_base_merge()
+        c, controller = self.checkout, self.controller
+        self.file.write_text("base\n")
+        repo = config.Repo("fixture", self.root, parts=[config.Part("", c.github)])
+        self.publication_job(repo, branch, verified=verify.Verified("pass"))
+        controller.stamp("verify", {"verdict": "pass"})
+
+        with mock.patch.object(pipeline, "commit_and_push", side_effect=AssertionError("unexpected push")) as push:
+            with self.assertRaisesRegex(workspace.RunFailed, "the final orchestrated tree undid every change"):
+                controller.dispatch(self.action)
+        push.assert_not_called()
+        self.assertEqual(self.git("diff", "--cached", "--name-only", c.base_commit), "")
+        self.assertNotIn("publication_intent", controller.data)
+
+    def test_pending_base_merge_reaches_push_with_the_implementation_intact(self):
+        branch = self.resume_with_pending_base_merge()
+        c, controller = self.checkout, self.controller
+        repo = config.Repo("fixture", self.root, parts=[config.Part("", c.github)])
+        self.publication_job(repo, branch, verified=verify.Verified("pass"))
+        controller.stamp("verify", {"verdict": "pass"})
+        push = mock.Mock(side_effect=RuntimeError("stubbed push"))
+
+        def git(args, cwd, **kw):
+            return push(args, cwd) if args[0] == "push" else util.git(args, cwd, **kw)
+
+        with (mock.patch.object(workspace, "remote_head", return_value=c.lease),
+              mock.patch.object(pipeline, "git", side_effect=git)):
+            with self.assertRaisesRegex(workspace.RunFailed, "the push to fixture/repo failed"):
+                controller.dispatch(self.action)
+        push.assert_called_once_with(["push", "-q", f"--force-with-lease={branch}:{c.lease}", "-u", "origin", branch],
+                                     self.root)
+        self.assertEqual(self.git("show", "HEAD:file.txt"), "implementation")
 
 
 class MovedBasePublicationTests(unittest.TestCase):
