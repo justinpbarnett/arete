@@ -50,6 +50,7 @@ from arete.store import insights as insights_store
 from arete.store import orchestration as ledger
 from arete.store import runs as run_store
 from arete.store import tasks as tasks_store
+from arete.store import zte as zte_store
 from tests.harness import set_task_body
 
 
@@ -1650,6 +1651,98 @@ class ParkedRetryBudgetTests(Isolated):
         self.park_spent_ticket()
         self.layer.write_text(self.layer.read_text() + "max_run_minutes = 90\n")
         self.assert_fresh_retry()
+
+
+class OrchestratedFinishBudgetTests(PollFixture):
+    def setUp(self):
+        super().setUp()
+        self.repo.layer_dir.mkdir()
+        (self.repo.layer_dir / "config.toml").write_text(
+            '[factory]\npath = "classic"\n[limits]\nmax_repair_cycles = 3\n')
+        self.cfg.replay = config.ReplayConfig(all=True)
+        self.patches.enter_context(patch.object(config, "load", return_value=self.cfg))
+        self.patches.enter_context(patch.object(pipeline, "run_refusal", return_value=(False, "")))
+
+    def dispatch_failed_finish(self, controller):
+        controller.data["acceptance"] = "fixture"
+        lease = controller.lease
+        turn = ledger.begin(lease, {}, 1)
+        version = ledger.snapshot(lease)["version"]
+        action, = ledger.accept(lease, turn, version,
+                                {"calls": [{"op": "run.finish", "args": {"reason": "failed"}}]}, 1)
+        self.assertIsNone(controller.dispatch(action))
+        finished, = ledger.actions(lease)
+        self.assertEqual(finished["state"], "succeeded")
+        return controller.ending
+
+    def finish_failed(self, repairs):
+        def drive(flow):
+            controller = orchestration.Controller(flow)
+            for _ in range(repairs):
+                controller.run.budget.charge("repair", "review_repair")
+            return self.dispatch_failed_finish(controller)
+
+        self.assertEqual(pipeline.run_issue(self.repo.name, self.ticket, script=pipeline.Script("orchestrate", drive)), 1)
+        self.assertEqual(tasks_store.task_get(self.ticket)["state"], "failed")
+        return run_store.newest_whole_run(self.repo.name, self.ticket)
+
+    def test_failed_finish_on_spent_repair_chain_parks_and_ticket_edit_readmits(self):
+        prior = self.made_run()
+        prior.budget.charge("repair", "review_repair")
+        record.settle(prior.id, "failed")
+        failed = self.finish_failed(2)
+        parked, saved = runlimits.latest_park(self.repo.name, self.ticket)
+        self.assertEqual(parked["id"], failed["id"])
+        self.assertEqual(saved.get("reason"), "the repair chain used its 3 repair cycles")
+        self.assertEqual(saved["specification"], runlimits.specification(self.local.get(self.ticket)))
+        with foundation.db() as connection:
+            set_task_body(self.ticket, "A narrower specification", connection=connection)
+
+        started = []
+
+        def work(cfg, run, slot):
+            started.append(run.id)
+            self.assertEqual(run.budget.prior_repairs, 0)
+            self.assertEqual(run.budget.repair_parents, [])
+            for _ in range(3):
+                run.budget.charge("repair", "review_repair")
+            return "noop", "fixture finished", ""
+
+        def spawn(repo, tid):
+            self.assertEqual(self.run_polled_ticket(repo, tid, work), 0)
+
+        self.assertEqual(self.poll_with(self.cfg, spawn), 0)
+        self.assertEqual(len(started), 1)
+        log = (paths.RUNS_DIR / started[0] / "run.log").read_text()
+        self.assertIn("budget chain: no parents\n", log)
+
+    def test_failed_finish_with_repair_cycle_left_does_not_park(self):
+        failed = self.finish_failed(2)
+        self.assertIn("the orchestrator stopped without delivery", failed["summary"])
+        self.assertFalse((paths.RUNS_DIR / failed["id"] / "parked.json").exists())
+
+    def test_reserved_zte_failed_finish_on_spent_budget_fails_task_and_succeeds_in_ledger(self):
+        deadline = util.iso(util.now() + timedelta(minutes=10))
+        delivery = zte_store.reserve("fixture-policy", self.repo.name, "a" * 40, deadline,
+                                     "Fixture ZTE task", "fix", "Fixture ZTE specification", {})
+        tid = delivery.task
+        rid = record.start("pipeline", repo=self.repo.name, issue=tid)
+        delivery = zte_store.transition(delivery, "dispatching")
+        zte_store.transition(delivery, "running", run=rid)
+        directory = paths.RUNS_DIR / rid
+        directory.mkdir()
+        run = pipeline.Run(rid, self.repo, directory, tracker=self.local, tid=tid, cfg=self.cfg, path="orchestrate")
+        run.enter("running")
+        self.assertEqual(tasks_store.task_get(tid)["state"], "running")
+        run.budget = runlimits.Budget(run, runlimits.Policy(max_repair_cycles=1), "", self.local.get(tid))
+        run.budget.charge("repair", "review_repair")
+
+        status, summary, _ = self.dispatch_failed_finish(orchestration.Controller(flows.start(self.cfg, run, {})))
+
+        self.assertEqual(status, "failed")
+        self.assertEqual(summary, "the orchestrator stopped without delivery")
+        self.assertEqual(tasks_store.task_get(tid)["state"], "failed")
+        self.assertFalse((directory / "parked.json").exists())
 
 
 class BudgetReadmissionTests(ReadmissionFixture):
