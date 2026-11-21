@@ -21,11 +21,11 @@ from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import TextIO
 
 from . import (
     alerts,
     browser,
+    check_process,
     ci,
     config,
     context,
@@ -87,7 +87,6 @@ SKIPPED_FILE = paths.STATE_DIR / "skipped.json"
 CONTINUE_AFTER_DROP = "The connection dropped mid step. Carry on from where you stopped and finish the step."
 CONTINUE_AFTER_BUSY = "The provider was busy mid step. Carry on from where you stopped and finish the step."
 BUSY_WAITS = (30, 90, 270)
-CHECKS_LOCK = "checks"
 LEFT_TITLE = "Left for a person"
 LEFT_HEADING = f"## {LEFT_TITLE}"
 LEFT_START, LEFT_END = "<!-- arete:left -->", "<!-- /arete:left -->"
@@ -104,7 +103,6 @@ RUNS_LOG = "runs.log"
 RUN_START_SECONDS = 10
 SUCCEEDED = ("pr", "noop", "needs-info", "dry-run", "done")
 ANSWER_FILE = "answer.md"
-CHECK_LANE_POLL_SECONDS = 2
 CHECKS_SCRIPT = "checks"
 NO_CHECKS = "(none configured)"
 SUMMARY_CHARS = 3000
@@ -1020,33 +1018,6 @@ def untracked_added_since(before: dict[Path, set[str]]) -> list[tuple[Path, str]
     return [(d, name) for d, names in before.items() for name in sorted(workspace.untracked_files(d) - names)]
 
 
-def check_lanes(layer: config.RepoLayer, run: AgentRun) -> list[str]:
-    if not layer.parallel_checks:
-        return [CHECKS_LOCK]
-    return [f"{CHECKS_LOCK}-{n}" for n in range(run.config.max_parallel_checks)]
-
-
-def take_free_lane(files: list[TextIO]) -> bool:
-    for f in files:
-        if util.flock_now(f):
-            util.mark_holder(f, os.getpid())
-            return True
-    return False
-
-
-@contextmanager
-def check_lane(layer: config.RepoLayer, run: AgentRun):
-    with ExitStack() as stack:
-        files = [stack.enter_context(util.lock_file(name)) for name in check_lanes(layer, run)]
-        if not take_free_lane(files):
-            run.log("checks: waiting for another run's checks to finish" if len(files) == 1 else
-                    f"checks: waiting for a free check lane (max_parallel_checks {len(files)})")
-            with run.waiting("slot"):
-                while not take_free_lane(files):
-                    time.sleep(CHECK_LANE_POLL_SECONDS)
-        yield
-
-
 def tail_of_both_streams(stdout: str, stderr: str, n: int) -> str:
     stdout_room = n - min(len(stderr), n // 2)
     stderr_room = n - min(len(stdout), n // 2)
@@ -1076,11 +1047,12 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
     untracked_before = untracked_by_dir(git_dirs)
     report, ok = [], True
 
-    def execute(items):
+    def execute(items, hold_fds):
         nonlocal ok
         for name, cmd in items:
             with record.timed(run.id, "check", name=name, command=cmd) as check:
-                res = environment.sh(cmd, run.config, run.repo, cwd=cwd, timeout=run.time_for(timeout))
+                res = environment.sh(cmd, run.config, run.repo, cwd=cwd, timeout=run.time_for(timeout),
+                                     hold_fds=hold_fds)
                 check["exit"] = res.returncode
             passed = res.returncode == 0
             ok = ok and passed
@@ -1091,11 +1063,10 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
                 report.append(f"### {name} passed: `{cmd}`")
 
     try:
-        with nullcontext() if layer.parallel_checks else check_lane(layer, run):
-            execute(quick)
+        with slots.check_slot(run, parallel=layer.parallel_checks) as lease, check_process.suite(lease) as hold_fds:
+            execute(quick, hold_fds)
             if slow and ok:
-                with check_lane(layer, run) if layer.parallel_checks else nullcontext():
-                    execute(slow)
+                execute(slow, hold_fds)
             elif slow:
                 report.append("Not run because cheap checks failed: " + ", ".join(name for name, _ in slow))
         if selected is not None and set(commands) != set(layer.checks):

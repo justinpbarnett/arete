@@ -20,14 +20,14 @@ import tempfile
 import threading
 import time
 from collections.abc import Iterable
-from contextlib import ExitStack, closing, contextmanager, suppress
+from contextlib import ExitStack, closing, contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO
 from urllib.parse import SplitResult, urlsplit
 
-from . import paths, sandbox
+from . import check_process, paths, sandbox
 
 PROBE_GRACE_SECONDS = 0.2
 DEPLOY_TERMINATION_GRACE = 1
@@ -88,34 +88,34 @@ def sh(
     input: str | None = None,
     inherit: bool = True,
     keeps: tuple[str, ...] = (),
+    hold_fds: tuple[int, ...] = (),
 ) -> subprocess.CompletedProcess:
-    return _sh(cmd, cwd, timeout, check, env, input, inherit, keeps)
+    return _sh(cmd, cwd, timeout, check, env, input, inherit, keeps, hold_fds=hold_fds)
 
 
 def _sh(cmd, cwd=None, timeout=600, check=False, env=None, input=None, inherit=True, keeps=(), *,
         deploy=False, restore_paths=(), binary=False, graceful_timeout=False,
-        index_lock: _DeployIndexLock | None = None) -> subprocess.CompletedProcess:
+        index_lock: _DeployIndexLock | None = None, hold_fds: tuple[int, ...] = ()) -> subprocess.CompletedProcess:
     full_env = foreground_maintenance({**(os.environ if inherit else {}), **(env or {})})
-    command = sandbox.protected_command(cmd, cwd, keeps, _deploy=deploy, _restore_paths=restore_paths)
+    words = ["/bin/sh", "-c", cmd] if isinstance(cmd, str) else cmd
+    supervised = check_process.launch(words, timeout, hold_fds) if hold_fds else nullcontext((cmd, (), None))
     try:
-        res = run_whole_tree(
-            command,
-            timeout,
-            input,
-            cwd=str(cwd) if cwd else None,
-            shell=isinstance(command, str),
-            text=not binary,
-            errors=None if binary else "replace",
-            env=full_env,
-            graceful_timeout=graceful_timeout,
-            index_lock=index_lock,
-        )
+        with supervised as (launch, fds, cancel):
+            command = sandbox.protected_command(launch, cwd, keeps, _deploy=deploy, _restore_paths=restore_paths)
+            res = run_whole_tree(
+                command, timeout, input, cwd=str(cwd) if cwd else None, shell=isinstance(command, str),
+                text=not binary, errors=None if binary else "replace", env=full_env,
+                graceful_timeout=graceful_timeout, index_lock=index_lock,
+                **({"hold_fds": fds, "cancel": cancel} if fds else {}),
+            )
     except subprocess.TimeoutExpired as e:
         res = subprocess.CompletedProcess(
             cmd, TIMED_OUT, stdout=_s(e.stdout), stderr=_s(e.stderr) + f"\n[arete] timed out after {timeout}s"
         )
     except FileNotFoundError as e:
         res = subprocess.CompletedProcess(cmd, 127, stdout="", stderr=str(e))
+    if hold_fds:
+        res.args = cmd
     if check and res.returncode != 0:
         raise RuntimeError(f"{cmd!r} failed ({res.returncode}): {res.stderr.strip() or res.stdout.strip()}")
     return res
@@ -123,8 +123,10 @@ def _sh(cmd, cwd=None, timeout=600, check=False, env=None, input=None, inherit=T
 
 def run_whole_tree(command, timeout: float | None, input: str | bytes | None, *,
                    graceful_timeout: bool = False, index_lock: _DeployIndexLock | None = None,
-                   **kw) -> subprocess.CompletedProcess:
+                   hold_fds: tuple[int, ...] = (), cancel=None, **kw) -> subprocess.CompletedProcess:
     stdin = subprocess.PIPE if input is not None else None
+    if hold_fds:
+        kw["pass_fds"] = hold_fds
     if graceful_timeout:
         kw.update(own_group_args())
     with ExitStack() as cleanup:
@@ -138,7 +140,10 @@ def run_whole_tree(command, timeout: float | None, input: str | bytes | None, *,
         try:
             out, err = proc.communicate(input, timeout=timeout)
         except BaseException:
-            if graceful_timeout:
+            if hold_fds:
+                with suppress(OSError):
+                    cancel.send(b"stop")
+            elif graceful_timeout:
                 _stop_deploy_process(proc, index_lock)
             else:
                 with suppress(Exception):
