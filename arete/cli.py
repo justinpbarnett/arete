@@ -82,6 +82,10 @@ def main(argv: list[str] | None = None) -> int:
             raise foundation.NoDatabase
         recovery = args.cmd in ("init", "migrate") or (args.cmd == "backup" and args.restore)
         with client.invocation(), principals.acting("hand" if recovery else principals.cli_actor):
+            if (args.cmd not in (*paths.PER_CALL_HOOKS, "upload-guard", "doctor", "events")
+                    and not getattr(args, "offline", False)
+                    and not (args.cmd == "install" and args.dry_run)):
+                client.upload_hook_events()
             return args.fn(args) or 0
     except client.Down as e:
         client.emit(e.answer)

@@ -9,7 +9,7 @@ from functools import cache
 
 from . import refusals
 
-MINOR = 2
+MINOR = 3
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -68,6 +68,8 @@ CHAT = obj({"id": INTEGER, **dict.fromkeys(("title", "project", "created", "upda
             "busy": {"type": ["boolean", "integer"]}, "paid_usd": {"type": ["number", "null"]},
             "spent": {"type": ["number", "null"]}, "messages": array(obj({"id": INTEGER, "sender": STRING, "text": NULL_TEXT,
               "cost": NUMBER, "paid_usd": {"type": ["number", "null"]}, "ts": STRING}))}, ["id", "title"])
+HOOK_EVENT = obj({**dict.fromkeys(("ts", "hook", "tool", "cwd", "kind", "cls", "detail", "error"), STRING),
+                  "session": NULL_TEXT, "agent": BOOLEAN}, ["ts", "kind", "cls"])
 RESOURCE = {
     "task": TASK, "run": RUN,
     "project": obj(dict.fromkeys(("id", "name", "github", "path"), STRING)),
@@ -225,6 +227,12 @@ OPERATIONS += [
               {"chat": "1"}, "DELETE"),
     operation("serve.install", "serve/install", envelope({"restarting": BOOLEAN, "said": STRING}),
               method="POST"),
+    operation("hook_event.list", "hook-events", envelope({"events": array(mapping(JSON))}), obj({"since": STRING}, [])),
+    operation("hook.ingest", "hook-events", envelope({"received": INTEGER}),
+              obj({"origin": {**STRING, "pattern": "^[0-9a-f]{32}$"}, "stream": {**STRING, "pattern": "^[0-9a-f]{64}$"},
+                   "offset": {**INTEGER, "minimum": 0}, "events": array(HOOK_EVENT)}, ["origin", "offset", "events"]),
+              {"origin": "0123456789abcdef0123456789abcdef", "offset": 0,
+               "events": [{"ts": "2026-01-01T00:00:00Z", "kind": "skill", "cls": "invoked", "session": None}]}, "POST"),
     operation("batch.run", "batch", envelope({"results": array(mapping(JSON))}),
               obj({"requests": array(obj({"operation": STRING, "input": mapping(JSON)}, ["operation"]))}),
               {"requests": [{"operation": "meta.get"}]}, "POST"),
