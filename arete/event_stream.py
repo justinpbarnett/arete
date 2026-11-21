@@ -44,6 +44,8 @@ def stream(handler, query, code):
     started = time.monotonic()
     if fmt == "json":
         while True:
+            if handler.verify_controls is not None:
+                handler.verify_controls.poll()
             with foundation.one_read() as c:
                 instance = foundation.metadata(c)["instance_id"]
                 epoch, top, rows, reason, meta = events.scan(c, epoch, seq, selected)
@@ -63,8 +65,11 @@ def stream(handler, query, code):
     with foundation.one_read() as c:
         instance = foundation.metadata(c)["instance_id"]
         head = events.metadata(c)["head"]
-    start("application/x-ndjson" if fmt == "ndjson" else "text/event-stream", instance, head)
-    with foundation.reader(streaming=True) as c:
+    if fmt == "sse" and seq is None:
+        epoch, seq = events.cursor(head)
+    with handler.event_connection() as dropped, foundation.reader(streaming=True) as c:
+        start("application/x-ndjson" if fmt == "ndjson" else "text/event-stream", instance, head)
+
         def write(value):
             handler.wfile.write(value)
             handler.wfile.flush()
@@ -82,19 +87,20 @@ def stream(handler, query, code):
         try:
             if fmt == "sse":
                 write(b"retry: 2000\n\n")
-            while True:
+            while dropped is None or not dropped():
                 epoch, top, rows, reason, meta = events.scan(c, epoch, seq, selected)
                 if reason:
                     message("reset", {"kind": "reset", "reason": reason})
                     return
                 for row in rows:
-                    message(row["kind"], events.envelope(c, row, epoch), f"{epoch}.{row['seq']}")
+                    position = f"{epoch}.{row['seq']}"
+                    message(row["kind"], events.envelope(c, row, epoch), position)
                     if time.monotonic() >= beat:
                         message("serve.beat", {**control.serve_beat(), "kind": "serve.beat", "code": code,
-                                               "head": meta["head"]}, f"{epoch}.{seq if seq is not None else top}")
+                                               "head": meta["head"]}, position)
                         beat = time.monotonic() + 15
                 seq = top
-                if fmt != "json" and time.monotonic() >= beat:
+                if time.monotonic() >= beat:
                     message("serve.beat", {**control.serve_beat(), "kind": "serve.beat", "code": code,
                                            "head": meta["head"]}, f"{epoch}.{seq}")
                     beat = time.monotonic() + 15

@@ -1320,6 +1320,30 @@ class JourneyVerificationTests(unittest.TestCase):
         self.enterContext(mock.patch.object(verify.scratch, "spawn", return_value=process))
         self.enterContext(mock.patch.object(util, "stop_group"))
 
+    def test_fault_cli_guidance_only_for_the_wrapped_dashboard(self):
+        root = Path(self.enterContext(TemporaryDirectory())).resolve()
+        self.run.dir = root
+        self.run.agent.return_value.structured["checks"] = [
+            {"what": "Inspect the fixture", "how": "Open the app", "saw": "The fixture opened", "passed": True},
+        ]
+        wrapper = root / "verification-runtime/harness/sandbox"
+        wrapped = "sandbox uv run arete dashboard --port {port}"
+        self.enterContext(mock.patch.object(verify, "serving", return_value=nullcontext("http://127.0.0.1:4242")))
+        self.enterContext(mock.patch.object(verify.browser, "free_port", return_value=4242))
+
+        for start in ("uv run arete dashboard --port {port}", "./sandbox uv run arete dashboard", wrapped,
+                      f"{wrapper} uv run arete dashboard --port {{port}}"):
+            with self.subTest(start=start):
+                self.work.layer.verify = config.Verify(start=start, allow_bash=[f"{wrapper} *"])
+                self.assertEqual(self.verify().verdict, "pass")
+                prompt = self.run.agent.call_args.args[1]
+                if start in (wrapped, f"{wrapper} uv run arete dashboard --port {{port}}"):
+                    for command in ("arm", "drop-streams", "event", "clear"):
+                        self.assertIn(f"{wrapper} uv run arete verify-fault {command}", prompt)
+                    self.assertIn("Do not use page scripts or write directly to the store", prompt)
+                else:
+                    self.assertNotIn("verify-fault", prompt)
+
     def test_passing_driver_cannot_supply_missing_verifier_checks(self):
         self.ticket.body = "Also inspect the catalog."
         self.work.layer.trust_level = "automerge"
