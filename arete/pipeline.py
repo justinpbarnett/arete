@@ -2167,7 +2167,7 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
                 or workspace.uncommitted(c.wt, tracked_only=True)):
             git(["reset", "--hard", before.lease], c.wt)
         for name in workspace.untracked_files(c.wt) - untracked:
-            workspace.remove_untracked(c.wt, name)
+            (c.wt / name).unlink(missing_ok=True)
         c.__dict__.update(vars(before))
         b.checked, b.report, b.staged = checked, report, staged
         if isinstance(error, owner_asks.Asked):
@@ -2709,9 +2709,31 @@ def merge_kept(run: AgentRun, c: workspace.Checkout, layer: config.RepoLayer, ti
     c.kept = ""
 
 
-def merge_as_run(run_id: str, c: workspace.Checkout, commit: str, named: str) -> None:
+def check_ignored_merge_paths(wt: Path, commit: str) -> None:
+    ignored = util.git_records(["ls-files", "--others", "--ignored", "--exclude-standard"], wt)
+    if not ignored:
+        return
+    tree = git(["merge-tree", "--write-tree", "--no-messages", "HEAD", commit], wt, check=False).partition("\n")[0]
+    if not tree:
+        raise workspace.RunFailed("Git could not preview the merge to check for ignored file collisions")
+    added = util.git_records(["diff", "--no-renames", "--ignore-submodules=none", "--name-only", "--diff-filter=A",
+                              "HEAD", tree], wt)
+    ignore_case = git(["config", "--bool", "core.ignoreCase"], wt, check=False).strip() == "true"
+    targets = {Path(name.casefold() if ignore_case else name) for name in added}
+    directories = {parent for path in targets for parent in path.parents}
+    for name in ignored:
+        path = Path(name.casefold() if ignore_case else name)
+        if path in targets or path in directories or not targets.isdisjoint(path.parents):
+            raise workspace.RunFailed(f"the merge would overwrite ignored file `{name}`")
+
+
+def merge_as_run(run_id: str, c: workspace.Checkout, commit: str, named: str, *, overwrite_ignore: bool = True) -> None:
     with util.repo_lock(c.src):
-        util.git_as_owner(["merge", "-q", "--no-edit", "-m", f"Merge {named} at {commit[:12]}",
+        options = []
+        if not overwrite_ignore:
+            check_ignored_merge_paths(c.wt, commit)
+            options = ["--no-overwrite-ignore", "-s", "ort"]
+        util.git_as_owner(["merge", "-q", "--no-edit", *options, "-m", f"Merge {named} at {commit[:12]}",
                            "-m", f"Arete-Run: {run_id}", commit], c.wt)
 
 
@@ -2731,7 +2753,7 @@ def merge_moved_bases(run: AgentRun, checkouts: list[workspace.Checkout], layer:
                           head=head) as rec:
             try:
                 try:
-                    merge_as_run(run.id, c, c.base_commit, c.origin_base)
+                    merge_as_run(run.id, c, c.base_commit, c.origin_base, overwrite_ignore=not allow_untracked)
                 except RuntimeError as e:
                     conflicts = unmerged_paths(c.wt)
                     if not conflicts:
