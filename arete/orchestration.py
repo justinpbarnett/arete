@@ -80,6 +80,7 @@ class Controller:
         if self.job.built:
             self.data["checked"] = self.job.b.checked
             self.data["report"] = self.job.b.report
+            self.data["catch_ups"] = self.job.b.catch_ups
         ledger.save(self.lease, self.data)
 
     def atomic(self, name, **kw):
@@ -119,6 +120,7 @@ class Controller:
         self.write_lineage_event()
         if self.flow.refusal:
             raise factory.Refused(self.flow.refusal)
+        pending_push = ledger.catch_up_push(self.data)
         if self.run.feedback and (closed := [url for url in self.run.feedback_prs if gh.pr_view(url).get("state") != "OPEN"]):
             self.quiescent()
             return "noop", f"the PR closed before arete could revise it: {', '.join(closed)}", ""
@@ -144,7 +146,9 @@ class Controller:
                 if ledger.publication_pending(self.run.id) or not any(
                         a["op"] == "publication.request" and a["state"] == "succeeded" for a in ledger.actions(self.lease)):
                     raise factory.Refused("the missing workspace has no settled publication; reconcile before resuming")
-            if self.run.environment_release:
+            if pending_push:
+                self.job.prepared(prepared, stored=True, reconciling_catch_up=True)
+            elif self.run.environment_release:
                 flows.restore_environment_draft(self.job, prepared)
             else:
                 if missing:
@@ -158,8 +162,14 @@ class Controller:
             self.job.verified = Verified.stored(self.data.get("verified", {}))
             self.job.b.checked = self.data.get("checked", {})
             self.job.b.report = self.data.get("report", "")
+            self.job.b.catch_ups = self.data.get("catch_ups", 0)
             self.job.b.from_base = True
             self.job.b.plan_text, self.job.b.build_summary = self.job.plan_text, self.job.build_summary
+            if pending_push:
+                self.catalog.refresh_context()
+                self.quiescent()
+                self.publish()
+                return self.ending
         else:
             self.quiescent()
             if self.run.environment_release:
@@ -567,6 +577,10 @@ class Controller:
 
     def publish(self):
         self.barrier()
+        if pending := ledger.catch_up_push(self.data):
+            return self.reconcile_catch_up(pending)
+        if self.data.get("publication_intent"):
+            raise factory.Refused("publication was interrupted; reconcile its branch/PR effects before resuming")
         needed = [gate for gate in ("checks", "review", "verify") if not self.current(gate)]
         if needed:
             raise ValueError("publication needs current evidence: " + ", ".join(needed))
@@ -592,33 +606,157 @@ class Controller:
         self.data.pop("publication_intent", None)
         self.data["publication"] = outcome.data
         self.persist()
-        if self.run.repo.parts:
-            self.job.slot.free()
-            try:
-                with self.run.waiting("ci"):
-                    current = pipeline.ci.Round(1, [pipeline.ci.compare_with_base(
-                        pipeline.ci.watch(pipeline.ci_target(c), self.run.log), self.run.log)
-                        for c in self.job.picked(self.job.changed)])
-            finally:
-                self.job.slot.take(self.run.log, self.run.waiting)
-            self.job.ci_result = current.summary()
-            self.check_pilot_publication()
-            pipeline.publish_ci(self.run, self.job.ticket, self.job.with_prs, pipeline.ci.section([current], 1))
-            if current.reds or not current.all_read:
-                self.data["ci_failed"] = True
-                self.data["ci_failures"] = self.ci_failures(current)
-                self.catalog.add_context(CI_FAILURES, self.data["ci_failures"])
-                for checkout in self.job.with_prs:
-                    self.check_pilot_publication()
-                    pipeline.set_draft(self.run, checkout, True)
-                return {"ci": self.job.ci_result, "failures": CI_FAILURES,
-                        "error": f"CI needs an explicit worker diagnosis or repair; its failure logs are context {CI_FAILURES}"}
+        if self.run.repo.parts and (failure := self.publication_ci(self.job.picked(self.job.changed))):
+            return failure
+        return self.finish_publication()
+
+    def publication_ci(self, pushed, *, caught_up=False):
+        self.job.slot.free()
+        try:
+            with self.run.waiting("ci"):
+                current = pipeline.ci.Round(1, [pipeline.ci.compare_with_base(
+                    pipeline.ci.watch(pipeline.ci_target(c), self.run.log), self.run.log) for c in pushed])
+        finally:
+            self.job.slot.take(self.run.log, self.run.waiting)
+        self.job.ci_result = current.summary()
+        self.check_pilot_publication()
+        section = pipeline.ci.section([current], 1)
+        if caught_up:
+            for checkout in pushed:
+                pipeline.comment_catch_up_ci(self.run, checkout, section, self.job.verified, self.job.review)
+        else:
+            pipeline.publish_ci(self.run, self.job.ticket, self.job.with_prs, section)
+        if not current.reds and current.all_read:
             self.data.pop("ci_failed", None)
             self.data.pop("ci_failures", None)
+            self.catalog.context.pop(CI_FAILURES, None)
+            return None
+        self.data["ci_failed"] = True
+        self.data["ci_failures"] = self.ci_failures(current)
+        self.catalog.add_context(CI_FAILURES, self.data["ci_failures"])
+        for checkout in self.job.with_prs:
+            self.check_pilot_publication()
+            pipeline.set_draft(self.run, checkout, True)
+        return {"ci": self.job.ci_result, "failures": CI_FAILURES,
+                "error": f"CI needs an explicit worker diagnosis or repair; its failure logs are context {CI_FAILURES}"}
+
+    def automerge(self, candidates):
+        job = self.job
+        if not candidates or not pipeline.automerge_allowed(job.b, job.approval, job.draft_why):
+            return None
+        about = pipeline.automerge_about(job.ticket, job.build_summary)
+        track_base = not pilot.is_pilot_task(str(self.run.tid))
+        for checkout in candidates:
+            while True:
+                hold = pipeline.try_automerge(job.b, checkout, job.verified, job.review, about,
+                                              track_moved_base=track_base)
+                if hold is None:
+                    return None
+                if isinstance(hold, gh.MovedBaseHold):
+                    hold = self.catch_up(checkout)
+                    if not hold:
+                        if failure := self.publication_ci([checkout], caught_up=True):
+                            return failure
+                        continue
+                pipeline.report_automerge(self.run, checkout, hold)
+                break
+        return None
+
+    def catch_up(self, checkout):
+        job, b = self.job, self.job.b
+        base_sha = ""
+
+        def remember_push(head, verified, review):
+            self.data["publication_intent"]["catch_up"] = {
+                "action": self.executing,
+                "pr": checkout.pr, "previous": checkout.lease, "head": head, "base": base_sha,
+                "verified": asdict(verified), "review": review.asdict(),
+            }
+            try:
+                self.persist()
+            except BaseException:
+                self.data["publication_intent"].pop("catch_up", None)
+                raise
+
+        try:
+            row = gh.pr_merge_details(checkout.pr)
+            if hold := gh.merge_ref_hold(row, checkout.lease, checkout.base):
+                return hold
+            base_sha = row.get("baseRefOid")
+            base_sha = pipeline.fetch_merge_base(checkout) or base_sha
+            if not base_sha:
+                return "GitHub did not report the current base commit"
+            if b.catch_ups >= pipeline.AUTOMERGE_CATCH_UPS:
+                return f"the base `{checkout.base}` moved to `{base_sha}` after {b.catch_ups} catch-ups"
+            b.catch_ups += 1
+            job.verified, job.review = pipeline.catch_up_base(
+                b, checkout, job.branch, base_sha, job.with_left(job.goal), job.with_left(job.plan_text),
+                before_push=remember_push)
+        except pipeline.CatchUpPushUnconfirmed:
+            raise
+        except (workspace.RunFailed, RuntimeError, OSError) as e:
+            reason = e.why if isinstance(e, workspace.RunFailed) else util.first_line(str(e), 300)
+            base = f"`{checkout.base}` at `{base_sha}`" if base_sha else f"`{checkout.base}`"
+            return f"could not catch up to {base}: {pipeline.public_text(self.run, reason)}"
+        self.note_caught_up(checkout)
+        return ""
+
+    def reconcile_catch_up(self, pending):
+        job = self.job
+        self.executing = pending["action"]
+        actions = ledger.actions(self.lease)
+        action = next((a for a in actions if a["id"] == self.executing), None)
+        if (not action or action["op"] != "publication.request"
+                or action["state"] not in ("running", "reconciliation-required")):
+            raise factory.Refused("the catch-up push has no interrupted publication action")
+        if len(job.checkouts) != 1:
+            raise factory.Refused("the catch-up push does not match the retained checkout")
+        checkout = job.checkouts[0]
+        head = pending["head"]
+        if (checkout.pr != pending["pr"] or checkout.lease != pending["previous"] or checkout.merge != head
+                or checkout.base_commit != pending["base"]
+                or self.data["publication"]["heads"].get(checkout.github) != checkout.lease
+                or util.git(["rev-parse", "HEAD"], checkout.wt).strip() != head or workspace.uncommitted(checkout.wt)):
+            raise factory.Refused("the catch-up push does not match the retained checkout")
+        verified, review = Verified.stored(pending["verified"]), pipeline.Review.stored(pending["review"])
+        if hold := pipeline.merge_evidence_hold(job.b, checkout, verified, review, head):
+            raise factory.Refused(f"cannot reconcile the catch-up push: {hold}")
+        self.check_pilot_publication()
+        pipeline.note_prs(self.run, job.branch, job.with_prs)
+        pipeline.push_caught_up_head(job.b, checkout, job.branch, head)
+        job.verified, job.review = verified, review
+        self.note_caught_up(checkout)
+        if failure := self.publication_ci([checkout], caught_up=True):
+            for prior in actions:
+                if prior["state"] == "accepted" and prior["op"] == "owner.ask":
+                    ledger.transition(self.lease, prior["id"], "cancelled",
+                                      {"reason": "the run resumed an interrupted catch-up push"}, expected=("accepted",))
+            self.data.pop("publication_intent", None)
+            self.persist()
+            result = failure
+        else:
+            result = self.finish_publication()
+        ledger.transition(self.lease, self.executing, "failed" if "error" in result else "succeeded", result,
+                          expected=(action["state"],))
+        return result
+
+    def note_caught_up(self, checkout):
+        job, b = self.job, self.job.b
+        self.data["publication"]["heads"][checkout.github] = checkout.lease
+        pipeline.note_review(self.run, job.review, job.verified)
+        self.run.log(f"automerge: pushed catch-up {b.catch_ups} to {checkout.pr} at {checkout.lease}")
+        self.stamp("checks", {"full": True, "checked": b.checked, "report": b.report})
+        self.stamp("verify", asdict(job.verified))
+        self.stamp("review", job.review.asdict())
+
+        self.data["publication_intent"].pop("catch_up", None)
+        self.persist()
+
+    def finish_publication(self):
         self.check_pilot_publication()
         self.data["publication_intent"] = {"tree": self.fingerprint(), "phase": "publish"}
         self.persist()
-        outcome = self.atomic("publish")
+        outcome = self.atomic("publish", merge=self.automerge)
         self.data.pop("publication_intent", None)
         if outcome.passed:
             self.data["published"], self.data["published_tree"] = outcome.data, self.fingerprint()
@@ -626,6 +764,8 @@ class Controller:
             self.data.pop("published", None)
             self.data.pop("published_tree", None)
         self.persist()
+        if self.data.get("ci_failed"):
+            return outcome.data
         self.ending = flows.ended(self.flow, outcome)
         return outcome.data
 
