@@ -7,6 +7,7 @@ let chatBusy = false;
 let chatTimer = 0;
 let chatCount = 0;
 let openChat = 0;
+let visibleDraft = null;
 let chatPickKey = "";
 let chatProjectsKey = "";
 const unsent = new Map();
@@ -188,11 +189,13 @@ function drawChat(c) {
   document.getElementById("draft").hidden = !c?.draft;
   if (!c?.draft) document.getElementById("draft-result").hidden = true;
   if (!c) {
+    visibleDraft = null;
     chatSeen = "";
     document.getElementById("chat-sessions").hidden = true;
     return fill("messages", quiet("No chat yet. Pick a project, or none, under New chat on and press New chat."));
   }
   if (c.id !== openChat) return;
+  visibleDraft = c.draft;
   about.textContent = chatAbout(c);
   document.getElementById("chat-send").disabled = c.busy;
   if (c.draft) {
@@ -263,7 +266,8 @@ async function draftAction(action, btn) {
   document.getElementById("draft-result").hidden = true;
   btn.disabled = true;
   try {
-    const answered = await call(`/api/chats/${openChat}/${action}`, {});
+    const body = action === "file" && visibleDraft?.chat === openChat ? { draft: visibleDraft.fingerprint } : {};
+    const answered = await call(`/api/chats/${openChat}/${action}`, body);
     drawChat(answered);
     if (action === "file") say("draft-result", "ok", answered.messages.at(-1)?.text || "Filed the issue.");
   } catch (e) {

@@ -230,20 +230,3 @@ export class List extends Component {
         h("button", { onClick: () => list.dismiss() }, "Close")) : null);
   }
 }
-
-const states = ["Needs you", "Running", "Done", "Fault"];
-const titles = ["Review shared list header", "Check the local worker heartbeat", "Confirm repository access", "Inspect a long running build and its latest behavioral checks", "Read prompt changes"];
-export const demoRows = Object.freeze(Array.from({ length: 40 }, (_, i) => Object.freeze({
-  id: `health-${i + 1}`, title: `${titles[i % titles.length]} ${i + 1}`, state: states[i < 12 ? 0 : i < 24 ? 1 : i < 32 ? 2 : 3],
-  repo: i % 2 ? "workshop" : "arete", priority: ["HIGH", "MED", "LOW"][i % 3], number: i + 1,
-})));
-const demoOptions = {
-  rows: demoRows, total: 40, group: "priority",
-  groups: [{ id: "priority", label: "Priority" }, { id: "state", label: "State" }, { id: "repo", label: "Repository" }],
-  facets: [{ key: "state", label: "State", values: states }, { key: "repo", label: "Repository", values: ["arete", "workshop"] },
-    { key: "priority", label: "Priority", values: ["HIGH", "MED", "LOW"] }],
-  sorts: [{ id: "source", label: "Source order" }, { id: "title", label: "Title", key: "title" },
-    { id: "number", label: "Number", key: "number" }, { id: "newest", label: "Newest first", key: "number", direction: -1 }],
-};
-export const demoQueue = createList({ ...demoOptions, selected: { state: ["Needs you"] } });
-export const demoFocus = createList({ ...demoOptions, onCreate: () => {}, toggle: { label: "Show done", matches: (row) => row.state !== "Done" } });

@@ -13,12 +13,13 @@ TABLES = {
 }
 
 
-def task_add(repo: str, body: str, title: str = "", kind: str = "feat", parent: str = "", claim=None) -> str:
+def task_add(repo: str, body: str, title: str = "", kind: str = "feat", parent: str = "", claim=None,
+             *, reserved_id: str = "") -> str:
     ts = util.iso()
     digits = 4
     with writes.atomic() as c:
         while True:
-            tid = f"t-{secrets.randbits(4 * digits):0{digits}x}"
+            tid = reserved_id or f"t-{secrets.randbits(4 * digits):0{digits}x}"
             try:
                 writes.insert("tasks", {"repo": repo, "title": title, "body": body, "kind": kind, "state": "todo",
                                         "parent": parent, "created": ts, "updated": ts}, tid)
@@ -28,7 +29,7 @@ def task_add(repo: str, body: str, title: str = "", kind: str = "feat", parent: 
                     idempotency.claim(claim, seq)
                 return tid
             except sqlite3.IntegrityError as e:
-                if str(e) != "UNIQUE constraint failed: tasks.id":
+                if reserved_id or str(e) != "UNIQUE constraint failed: tasks.id":
                     raise
                 digits += 1
 
@@ -47,6 +48,12 @@ def tasks(repo: str = "", in_state: str = "", connect=reader) -> list[dict]:
             args.append(value)
     with connect() as c:
         return [dict(r) for r in c.execute(q + " ORDER BY created, rowid", args)]
+
+
+def task_summaries(connect=reader) -> list[dict]:
+    with connect() as c:
+        rows = c.execute("SELECT id, repo, title, kind, state, updated FROM tasks ORDER BY updated DESC, id")
+        return [dict(row) for row in rows]
 
 
 def task_children(parent: str, connect=reader) -> list[dict]:
@@ -72,6 +79,12 @@ def task_comments(tid: str, connect=reader) -> list[dict]:
     with connect() as c:
         return [dict(r) for r in c.execute("SELECT author, body, ts FROM task_comments WHERE task = ? ORDER BY rowid",
                                            (tid,))]
+
+
+def versioned_comments(tid: str) -> list[dict]:
+    with reader() as c:
+        return [dict(r) for r in c.execute("SELECT version, author, body, ts FROM task_comments "
+                                           "WHERE task = ? ORDER BY rowid", (tid,))]
 
 
 def tasks_replied(repo: str) -> list[dict]:

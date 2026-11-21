@@ -29,11 +29,10 @@ def stream(handler, query, code):
         raise Refusal(400, str(e)) from None
     accept = handler.headers.get("Accept", "")
     fmt = "json" if "application/json" in accept else "ndjson" if "application/x-ndjson" in accept else "sse"
-    with foundation.reader(streaming=True) as c:
-        instance = foundation.metadata(c)["instance_id"]
+    def start(content_type, instance, head):
+        handler.read_seq = head
         handler.send_response(200)
-        handler.send_header("Content-Type", {"json": "application/json", "ndjson": "application/x-ndjson",
-                                             "sse": "text/event-stream"}[fmt])
+        handler.send_header("Content-Type", content_type)
         handler.send_header("X-Arete-Code", code)
         for key, value in (("Cache-Control", "no-store"), ("X-Accel-Buffering", "no"),
                            ("Connection", "close"), ("Arete-Instance", instance)):
@@ -42,6 +41,30 @@ def stream(handler, query, code):
         handler.close_connection = True
         handler.connection.settimeout(30)
 
+    started = time.monotonic()
+    if fmt == "json":
+        while True:
+            with foundation.one_read() as c:
+                instance = foundation.metadata(c)["instance_id"]
+                epoch, top, rows, reason, meta = events.scan(c, epoch, seq, selected)
+                if reason:
+                    data = {"events": [], "next": f"{epoch}.{seq or 0}", "reset": {"kind": "reset", "reason": reason}}
+                elif rows or time.monotonic() - started >= timeout:
+                    data = {"events": [events.envelope(c, row, epoch) for row in rows], "next": meta["head"], "reset": None}
+                else:
+                    data = None
+            if data is not None:
+                start("application/json", instance, meta["head"])
+                handler.wfile.write(json.dumps(data).encode())
+                return
+            seq = top
+            time.sleep(min(.25, max(0, timeout - (time.monotonic() - started))))
+
+    with foundation.one_read() as c:
+        instance = foundation.metadata(c)["instance_id"]
+        head = events.metadata(c)["head"]
+    start("application/x-ndjson" if fmt == "ndjson" else "text/event-stream", instance, head)
+    with foundation.reader(streaming=True) as c:
         def write(value):
             handler.wfile.write(value)
             handler.wfile.flush()
@@ -55,7 +78,6 @@ def stream(handler, query, code):
                     frame += f"event: {kind}\n"
                 write((frame + "data: " + json.dumps(data) + "\n\n").encode())
 
-        started = time.monotonic()
         beat = started + 15
         try:
             if fmt == "sse":
@@ -63,23 +85,14 @@ def stream(handler, query, code):
             while True:
                 epoch, top, rows, reason, meta = events.scan(c, epoch, seq, selected)
                 if reason:
-                    reset = {"kind": "reset", "reason": reason}
-                    if fmt == "json":
-                        write(json.dumps({"events": [], "next": f"{epoch}.{seq or 0}", "reset": reset}).encode())
-                    else:
-                        message("reset", reset)
+                    message("reset", {"kind": "reset", "reason": reason})
                     return
-                if fmt == "json" and (rows or time.monotonic() - started >= timeout):
-                    write(json.dumps({"events": [events.envelope(c, r, epoch) for r in rows],
-                                      "next": f"{epoch}.{top}", "reset": None}).encode())
-                    return
-                if fmt != "json":
-                    for row in rows:
-                        message(row["kind"], events.envelope(c, row, epoch), f"{epoch}.{row['seq']}")
-                        if time.monotonic() >= beat:
-                            message("serve.beat", {**control.serve_beat(), "kind": "serve.beat", "code": code,
-                                                   "head": meta["head"]}, f"{epoch}.{seq if seq is not None else top}")
-                            beat = time.monotonic() + 15
+                for row in rows:
+                    message(row["kind"], events.envelope(c, row, epoch), f"{epoch}.{row['seq']}")
+                    if time.monotonic() >= beat:
+                        message("serve.beat", {**control.serve_beat(), "kind": "serve.beat", "code": code,
+                                               "head": meta["head"]}, f"{epoch}.{seq if seq is not None else top}")
+                        beat = time.monotonic() + 15
                 seq = top
                 if fmt != "json" and time.monotonic() >= beat:
                     message("serve.beat", {**control.serve_beat(), "kind": "serve.beat", "code": code,

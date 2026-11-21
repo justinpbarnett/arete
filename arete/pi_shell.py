@@ -25,6 +25,7 @@ from . import environment, paths, sandbox, scratch, util
 if TYPE_CHECKING:
     from . import guard
 
+TOOL = "arete_shell"
 MAX_REQUEST = 65536
 MAX_OUTPUT = 32768
 MAX_SECONDS = 120

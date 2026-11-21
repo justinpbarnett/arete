@@ -700,6 +700,10 @@ def last_report(run_id: str) -> dict:
     return next((line for line in reversed(run_lines.read(run_id)) if line.get("event") == run_lines.END), {})
 
 
+def task_summaries() -> list[dict]:
+    return task_store.task_summaries(connect=foundation.reader)
+
+
 def view(task_id: str, repo_name: str = "") -> dict:
     tid = task_id.strip()
     if tracker.is_task_id(tid):

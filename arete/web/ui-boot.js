@@ -1,11 +1,11 @@
 import { h, render } from "./vendor-preact.js";
-import { signal, effect } from "./vendor-signals.js";
-import { Shell, applyRuns } from "./ui-shell.js";
+import { signal, effect, batch } from "./vendor-signals.js";
+import { Shell } from "./ui-shell.js";
 import { current, listen } from "./ui-router.js";
 import { visit } from "./ui-data.js";
-import { live, connectivity, readFault, runView } from "./ui-live.js";
+import { live, connectivity, readFault, runView, screenReads } from "./ui-live.js";
 import { applyQueue } from "./ui-run.js";
-import { startKeys, marks, screenKeys, pending, sheet, mode, connection, readRetry } from "./ui-keys.js";
+import { startKeys, marks, screenKeys, pending, sheet, mode, connection, readRetry, activatePane } from "./ui-keys.js";
 import { configurePalette, globalCommands } from "./ui-palette.js";
 import { actions, dispatch } from "./ui-actions.js";
 import { dismissMenu } from "./ui-menu.js";
@@ -14,7 +14,8 @@ import { feedbackCommand, startFeedback } from "./ui-feedback.js";
 import { normalizePrimary } from "./ui-list.js";
 
 const route = signal(current());
-let feed = live(route.value.screen, route.value.path[0]);
+const connect = ({ screen, path }) => live(screen, ...path.slice(0, 2));
+let feed = connect(route.value);
 const snapshot = feed.snapshot;
 const now = signal(Date.now());
 const tab = [...crypto.getRandomValues(new Uint8Array(8))].map((byte) => byte.toString(16).padStart(2, "0")).join("");
@@ -36,7 +37,6 @@ function finish() {
 
 const retry = () => feed.retry();
 
-effect(() => applyRuns(snapshot.value.runs));
 effect(() => applyQueue(runView.value));
 
 effect(() => {
@@ -46,17 +46,26 @@ effect(() => {
   const runFault = selected.screen === "run" && (runs.queueError || runs.detailError);
   connection.value = connectivity(latest, now.value);
   readRetry.value = readFault(selected.screen, latest) || runFault ? retry : null;
-  render(h(Shell, { route: selected, snapshot: latest, now: now.value, retry, runs }), document.getElementById("app"));
+  render(h(Shell, { route: selected, snapshot: latest, resources: screenReads.value, now: now.value, retry, runs }), document.getElementById("app"));
   marks();
   normalizePrimary();
-  document.title = `arete · ${selected.screen === "board" && selected.active === "my-work" ? "My work" : selected.screen}`;
+  document.title = `arete · ${selected.screen === "board" && selected.active === "my-work" ? "Open work" : selected.screen}`;
 });
 
 listen((selected) => {
   if (selected.hash === route.value.hash) return;
   finish();
-  feed = live(selected.screen, selected.path[0]);
-  route.value = selected;
+  batch(() => {
+    feed = connect(selected);
+    route.value = selected;
+  });
+  const opensItem = selected.screen === "task" ? selected.path[0] : ["triage", "outbox"].includes(selected.screen) && selected.path[1];
+  const grid = document.querySelector(".pane-grid");
+  if (grid && selected.screen !== "run") grid.scrollTop = 0;
+  if (opensItem) {
+    const focus = document.getElementById("pane-focus");
+    if (focus) { focus.scrollTop = 0; focus.focus({ preventScroll: true }); }
+  } else if (selected.screen !== "run") activatePane("queue");
   start(via);
   via = "hash";
 });
@@ -73,7 +82,7 @@ window.addEventListener("pageshow", () => start("return"));
 setInterval(() => { now.value = Date.now(); }, 1000);
 start("open");
 const destinations = [
-  ["▦", "lines, timeline, health"], ["!", "needs you"], ["○", "open work owned by you"], ["▤", "open work by state"],
+  ["▦", "lines, timeline, health"], ["!", "needs you"], ["○", "open local tasks"], ["▤", "open work by state"],
   ["▷", "running work"], ["↓", "incoming items"], ["↑", "drafts and sends"], ["≡", "prompt files"],
   ["◇", "workflows"], ["▥", "charts"], ["⚙", "bridges, devices, rules"],
 ];

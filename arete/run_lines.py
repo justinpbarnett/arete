@@ -8,6 +8,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 
 from . import codebase, events, paths, principals, util
@@ -21,9 +22,44 @@ END = "report"
 FIXED = ("ts", "run", "seq", "event")
 WAIT_CAUSES = ("limit", "ci", "slot", "person")
 TAIL_BYTES = 4096
+GUARDED_TAIL_BYTES = 64 * 1024
 
-_writing = threading.Lock()
 _named: set[tuple[int, str]] = set()
+_append_guard: ContextVar[Callable[[], None] | None] = ContextVar("run_line_append_guard", default=None)
+
+
+class AppendRefused(RuntimeError):
+    pass
+
+
+@contextmanager
+def nonblocking_appends(check: Callable[[], None]):
+    token = _append_guard.set(check)
+    try:
+        check()
+        yield
+        check()
+    finally:
+        _append_guard.reset(token)
+
+
+@contextmanager
+def locked_log(target: Path, check: Callable[[], None] | None):
+    if check:
+        check()
+    with open(target, "a+b", buffering=0 if check else -1) as stream:
+        if check:
+            check()
+        # Each open has its own flock identity, even for threads in one process.
+        try:
+            fcntl.flock(stream, fcntl.LOCK_EX | (fcntl.LOCK_NB if check else 0))
+        except BlockingIOError as error:
+            if check:
+                raise AppendRefused("the run event log is locked") from error
+            raise
+        if check:
+            check()
+        yield stream
 
 
 def path(run_id: str) -> Path:
@@ -51,11 +87,15 @@ def seq_of(line: dict) -> int:
     return seq if type(seq) is int else 0
 
 
-def tail(f) -> tuple[int, bool]:
+def tail(f, check: Callable[[], None] | None = None) -> tuple[int, bool]:
     end = f.seek(0, 2)
     f.seek(max(0, end - 1))
     torn, size = bool(end) and f.read(1) != b"\n", TAIL_BYTES
     while True:
+        if check:
+            check()
+            if min(end, size) > GUARDED_TAIL_BYTES:
+                raise AppendRefused("cannot recover the run event sequence within the tail limit")
         start = max(0, end - size)
         f.seek(start)
         data = f.read(end - start)
@@ -70,21 +110,29 @@ def write(run_id: str, event: str, **fields) -> dict:
     line = {"ts": util.iso(), "run": run_id, "seq": 0, "event": event,
             **{k: v for k, v in fields.items() if k not in FIXED + ("engine",)}}
     target = path(run_id)
+    check = _append_guard.get()
     try:
+        if check:
+            check()
         target.parent.mkdir(parents=True, exist_ok=True)
-        with _writing, open(target, "a+b") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            seq, torn = tail(f)
+        with locked_log(target, check) as f:
+            seq, torn = tail(f, check)
             line["ts"], line["seq"] = util.iso(), seq + 1
             first = (os.getpid(), run_id) not in _named
             if first:
                 line["engine"] = codebase.STAMP
             text = json.dumps(line, ensure_ascii=False, default=str)
-            f.write((b"\n" if torn else b"") + text.encode() + b"\n")
+            payload = (b"\n" if torn else b"") + text.encode() + b"\n"
+            if check:
+                check()
+            if f.write(payload) != len(payload):
+                raise OSError("incomplete run event append")
             f.flush()
             if first:
                 _named.add((os.getpid(), run_id))
     except OSError as e:
+        if check:
+            raise
         text = json.dumps(line, ensure_ascii=False, default=str)
         print(f"{util.iso()} could not write {event} to {target}: {e}", file=sys.stderr, flush=True)
     if event in ("step_start", "step_end"):
@@ -94,8 +142,11 @@ def write(run_id: str, event: str, **fields) -> dict:
             events.emit("step.started" if event == "step_start" else "step.ended",
                         f"step:{run_id}/{step}/{attempt}", cls="derived", task=row["issue"] if row else None,
                         data={**fields, "run": run_id, "step": step, "try": attempt})
-    sys.stdout.write(text + "\n")
-    sys.stdout.flush()
+    if check:
+        check()
+    else:
+        sys.stdout.write(text + "\n")
+        sys.stdout.flush()
     return line
 
 
@@ -178,9 +229,26 @@ def wait_minutes(run_id: str) -> dict:
 @contextmanager
 def beating(run_id: str, step: str):
     started = time.monotonic()
+    append_guard = _append_guard.get()
+    closed = threading.Event()
+
+    def check():
+        append_guard()
+        if closed.is_set():
+            raise AppendRefused("the step heartbeat ended")
 
     def beat() -> None:
-        write(run_id, "heartbeat", step=step, seconds=round(time.monotonic() - started, 1))
+        if append_guard is None:
+            write(run_id, "heartbeat", step=step, seconds=round(time.monotonic() - started, 1))
+            return
+        try:
+            with nonblocking_appends(check):
+                write(run_id, "heartbeat", step=step, seconds=round(time.monotonic() - started, 1))
+        except (OSError, RuntimeError):
+            return  # A diagnostic heartbeat must not delay the step or its unwind.
 
-    with util.repeating(HEARTBEAT_SECONDS, beat, f"heartbeat {run_id}"):
-        yield
+    with util.repeating(HEARTBEAT_SECONDS, beat, f"heartbeat {run_id}", wait_on_exit=append_guard is None):
+        try:
+            yield
+        finally:
+            closed.set()

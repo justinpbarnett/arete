@@ -1,14 +1,20 @@
-import { signal } from "./vendor-signals.js";
+import { batch, signal } from "./vendor-signals.js";
 import * as data from "./ui-data.js";
+import { coherent } from "./ui-snapshot.js";
 
-const endpoints = { sidebar: "/api/sidebar", live: "/api/live" };
+const endpoints = { sidebar: "/api/sidebar", live: "/api/live", questions: "/api/asks", health: "/api/health", tasks: "/api/tasks" };
+const resources = {
+  settings: [["health", endpoints.health, (x) => x.serve && x.checks]],
+  board: [["tasks", endpoints.tasks, (x) => Array.isArray(x.tasks)]],
+};
+export const screenReads = signal({});
 const FAST_MS = 5000;
 const RUN_MS = 2500;
 const SLOW_MS = 30000;
 const TIMEOUT_MS = 3000;
 const OFFLINE_ROUNDS = 2;
 const STALE_SECONDS = 60;
-const fastScreens = new Set(["floor", "triage", "board", "task", "run"]);
+const fastScreens = new Set(["floor", "triage", "outbox", "board", "task", "run"]);
 
 const cache = { sidebar: null, sidebarAt: 0, live: null, liveAt: 0, liveTried: 0, errors: { sidebar: null, live: null }, failures: 0, settled: false };
 const controllers = new Set();
@@ -30,6 +36,7 @@ function snapshotOf() {
   const rows = payload?.live?.rows;
   return {
     needsYou: sidebar?.needs_you ?? asksCount(payload?.needs_you),
+    questions: cache.questions ?? null,
     running: sidebar?.running ?? null,
     health: sidebar?.health ?? null,
     serve: sidebar?.serve ?? null,
@@ -60,7 +67,9 @@ export function connectivity(current, now) {
 export function readFault(screen, current) {
   const panel = screen === "floor" ? current.live?.live : screen === "triage"
     ? Object.values(current.asks ?? {}).find((part) => part?.error) : null;
-  return panel?.error ? { status: null, message: panel.error } : current.fault;
+  const resourceError = Object.values(screenReads.value).find((part) => part.error)?.error
+    ?? (["triage", "run"].includes(screen) ? current.questions?.error : null);
+  return resourceError ?? (panel?.error ? { status: null, message: panel.error } : current.fault);
 }
 
 async function refusal(response) {
@@ -74,7 +83,8 @@ async function read(url, { text = false, say = false } = {}) {
   controllers.add(controller);
   try {
     const response = await fetch(url, { cache: "no-store", signal: controller.signal });
-    if (!response.ok) return { error: { status: response.status, message: say ? await refusal(response) : `HTTP ${response.status}` } };
+    if (!response.ok) return { seq: response.headers.get("Arete-Seq"),
+      error: { status: response.status, message: say ? await refusal(response) : `HTTP ${response.status}` } };
     if (text) return { data: await response.text() };
     const data = await response.json().catch(() => null);
     if (data && typeof data === "object" && !Array.isArray(data)) return { data };
@@ -216,11 +226,9 @@ async function readTurns(selection, token, run) {
   return true;
 }
 
-async function readRun(run, token) {
+async function readRun(run, token, queue, detail) {
   const selection = rs.selection;
   const id = run.id;
-  const wantDetail = id && (rs.force || !rs.detail || rs.detail.run?.status === "running");
-  const [queue, detail] = await Promise.all([read(data.runs(), { say: true }), wantDetail ? read(data.run(id).detail, { say: true }) : null]);
   const stale = () => token !== generation || active !== run || selection !== rs.selection;
   if (stale()) return;
   if (Array.isArray(queue.data?.runs)) { rs.queue = queue.data.runs; rs.more = Boolean(queue.data.more); rs.queueError = null; }
@@ -251,6 +259,23 @@ async function readRun(run, token) {
   publishRuns();
 }
 
+function screenResources(run) {
+  if (run.screen !== "task") return resources[run.screen] ?? [];
+  if (!run.id) return resources.board;
+  return [...resources.board, ["task", data.taskDetail(run.id, run.repo), (x) => typeof x.id === "string"]];
+}
+
+function validRead(result, valid) {
+  if (result.error || valid(result.data)) return result;
+  return { error: { status: null, message: "Malformed response" } };
+}
+
+async function readExternalTask(run, task) {
+  const previous = screenReads.value.task;
+  if (previous?.data && !previous.error && !run.refreshDetail) return null;
+  return validRead(await read(task[1], { say: true }), task[2]);
+}
+
 async function round(run) {
   pause();
   if (document.hidden || active !== run) { dropStream(); return; }
@@ -258,22 +283,80 @@ async function round(run) {
   const began = Date.now();
   const delay = fastScreens.has(run.screen) ? FAST_MS : SLOW_MS;
   const wantLive = liveDue || delay <= FAST_MS || began - cache.liveTried >= delay - 500;
-  const [sidebar, live] = await Promise.all([read(endpoints.sidebar), wantLive ? read(endpoints.live) : null,
-    run.screen === "run" ? readRun(run, token) : null]);
-  if (token !== generation || active !== run) return;
+  const screens = screenResources(run);
+  const externalTask = !/^t-[a-f0-9]+$/i.test(run.id) && screens.find(([key]) => key === "task");
+  const localScreens = screens.filter((entry) => entry !== externalTask);
+  const entries = [
+    ["sidebar", endpoints.sidebar, (x) => Number.isInteger(x.running)],
+    ["live", endpoints.live, (x) => !!x.live],
+    ["questions", endpoints.questions, (x) => Array.isArray(x.asks)],
+    ...localScreens,
+  ];
+  const readingRuns = run.screen === "run";
+  if (readingRuns) entries.push(["queue", data.runs(), (x) => Array.isArray(x.runs)]);
+  if (readingRuns && run.id) entries.push(["detail", data.run(run.id).detail, (x) => x.run && typeof x.run === "object"]);
+  const latest = {};
+  let fetchedLive = false;
+  const current = () => token === generation && active === run;
+  const readers = entries.map(([key, url, valid]) => async () => {
+    if (!current()) return { error: { message: "Superseded" } };
+    if (key === "live") {
+      if (!latest.live && !wantLive && cache.live) {
+        latest.live = { data: cache.live };
+        return { seq: cache.live.seq };
+      }
+      fetchedLive = true;
+    }
+    const result = latest[key] = validRead(await read(url, { say: true }), valid);
+    if ((key === "detail" || key === "task") && result.error?.status === 404 && result.seq) return { seq: result.seq };
+    return result.error ? result : { seq: result.data.seq };
+  });
+  const [group, external] = await Promise.all([
+    coherent(readers),
+    externalTask ? readExternalTask(run, externalTask) : null,
+  ]);
+  if (!current()) return;
   const finished = Date.now();
-  if (sidebar.data) { cache.sidebar = sidebar.data; cache.sidebarAt = finished; }
-  cache.errors.sidebar = sidebar.error ?? null;
-  if (live) {
-    cache.liveTried = began;
-    if (live.data) { cache.live = live.data; cache.liveAt = finished; }
-    cache.errors.live = live.error ?? null;
+  const { sidebar, live, questions, queue, detail } = latest;
+  const editing = document.activeElement?.matches?.("form.ops-form :is(input, textarea, select, [contenteditable=true])");
+  const publish = group && !editing;
+  if (publish) {
+    cache.sidebar = sidebar.data;
+    cache.sidebarAt = finished;
+    cache.questions = { data: questions.data };
+    cache.live = live.data;
+    if (fetchedLive) cache.liveAt = finished;
+  } else if (questions.error) {
+    cache.questions = { data: cache.questions?.data, error: questions.error };
   }
-  const failed = Boolean(sidebar.error || live?.error);
+  if (fetchedLive) cache.liveTried = began;
+  cache.errors.sidebar = sidebar.error ?? null;
+  cache.errors.live = live.error ?? null;
+  const failed = Boolean(sidebar.error || live.error);
   cache.failures = failed ? cache.failures + 1 : 0;
   cache.settled = true;
-  liveDue = failed;
-  snapshot.value = snapshotOf();
+  liveDue = !group;
+  const screen = { ...screenReads.value };
+  for (const [key] of localScreens) {
+    if (latest[key].error) screen[key] = { data: screen[key]?.data, error: latest[key].error };
+    else if (publish) screen[key] = { data: latest[key].data };
+  }
+  if (external) screen.task = external.error ? { data: screen.task?.data, error: external.error } : external;
+  run.refreshDetail = false;
+  let pending;
+  batch(() => {
+    snapshot.value = snapshotOf();
+    if (screens.length) screenReads.value = screen;
+    if (readingRuns && publish) pending = readRun(run, token, queue, detail);
+    else if (readingRuns && (queue.error || detail?.error)) {
+      rs.queueError = queue.error ?? null;
+      rs.detailError = detail?.error ?? null;
+      rs.settled = true;
+      publishRuns();
+    }
+  });
+  await pending;
+  if (!current()) return;
   const every = run.screen === "run" ? RUN_MS : FAST_MS;
   timer = setTimeout(() => round(run), Math.max(0, every - (Date.now() - began)));
 }
@@ -286,11 +369,14 @@ export function stop() {
   run?.release();
 }
 
-export function live(screen, id = "") {
+export function live(screen, id = "", repo = "") {
   stop();
   selectRun(screen === "run" ? id : "");
+  const sharedTasks = ["board", "task"].includes(screen) ? screenReads.value.tasks : null;
+  const sharedHealth = screen === "settings" ? screenReads.value.health : null;
+  screenReads.value = { ...(sharedTasks ? { tasks: sharedTasks } : {}), ...(sharedHealth ? { health: sharedHealth } : {}) };
   liveDue = true;
-  const run = { screen, id };
+  const run = { screen, id, repo, refreshDetail: false };
   const visibility = () => { liveDue = true; round(run); };
   document.addEventListener("visibilitychange", visibility);
   run.release = () => document.removeEventListener("visibilitychange", visibility);
@@ -303,6 +389,7 @@ export function live(screen, id = "") {
       if (active !== run) return Promise.resolve();
       liveDue = true;
       rs.force = true;
+      run.refreshDetail = true;
       return round(run);
     },
   };

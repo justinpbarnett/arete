@@ -50,14 +50,14 @@ if TYPE_CHECKING:
     from . import guard
 
 TOOLS_OF = {"Read": ("read",), "Glob": ("find", "ls"), "Grep": ("grep",), "LS": ("ls",), "Edit": ("edit",),
-            "MultiEdit": ("edit",), "Write": ("write",), "Bash": ("bash",)}
-WRITING = {"edit", "write", "bash"}
+            "MultiEdit": ("edit",), "Write": ("write",), "Bash": (pi_shell.TOOL,)}
+WRITING = {"edit", "write", pi_shell.TOOL}
 PI_HOME = paths.HOME / ".pi"
 KEYS_FILE = paths.PI_KEYS_FILE
 GUARD_FILE = paths.PACKAGE_DIR / "pi_guard.mjs"
 ASK_FILE = paths.PACKAGE_DIR / "pi_ask.mjs"
 SHELL_FILE = paths.PACKAGE_DIR / "pi_shell.mjs"
-GUARDED_TOOLS = frozenset({"read", "edit", "write", "grep", "find", "ls", "bash"})
+GUARDED_TOOLS = frozenset({"read", "edit", "write", "grep", "find", "ls", pi_shell.TOOL})
 SCHEMA_RULE = ("No tool takes this answer, so write it as the text of your last reply. Reply with only one JSON value "
                "that matches this JSON schema, in a ```json fence, and nothing after it:\n\n{schema}")
 PARENT_SESSION_VARS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")
@@ -323,7 +323,7 @@ def child_env(provider: str, available: dict, passing: list[str], providers: dic
     env = environment.build(names, {"ARETE_AGENT": "1"}, never=(*PARENT_SESSION_VARS, *never), source=available)
     for n in ("PI_CODING_AGENT_DIR", "ARETE_PI_GUARD_PATHS", "ARETE_PI_REFRESH_FD", "ARETE_PI_REFRESH_ACK_FD",
               "ARETE_PI_REFRESH_PROVIDER",
-              "ARETE_PI_SHELL_FD", "NODE_OPTIONS", "NODE_PATH"):
+              "ARETE_PI_SHELL_FD", "ARETE_PI_OBSERVE", "NODE_OPTIONS", "NODE_PATH"):
         env.pop(n, None)
     if not chosen_login and managed:
         env.update(managed.env)
@@ -523,8 +523,8 @@ def tool_names(tools: list[str] | None, allowed_tools: list[str] | None, disallo
             continue
         names += [n for n in TOOLS_OF.get(tool, ()) if n not in names]
     if "Bash" not in denied and (tools is None or "Bash" in tools) and any(
-            t.startswith("Bash(") for t in allowed_tools or []) and "bash" not in names:
-        names.append("bash")
+            t.startswith("Bash(") for t in allowed_tools or []) and pi_shell.TOOL not in names:
+        names.append(pi_shell.TOOL)
     return names
 
 
@@ -569,8 +569,9 @@ def guard_env(floor: guard.Floor, auth_paths: list[Path] | None = None,
                 inodes.append(f"{stat.st_dev}:{stat.st_ino}")
             except OSError:
                 pass
-    return {"ARETE_PI_GUARD_PATHS": json.dumps({"delegation_only": delegation_only, "shell": shell,
-                                              "inodes": inodes, "shell_file": str(SHELL_FILE),
+    return {"ARETE_PI_GUARD_PATHS": json.dumps({"delegation_only": delegation_only,
+                                              "shell_tool": pi_shell.TOOL if shell else "", "shell_file": str(SHELL_FILE),
+                                              "inodes": inodes,
                                               "secret_names": sandbox.SECRET_NAMES, "safe_names": sandbox.SAFE_NAMES,
                                               "secret_dirs": sorted(sandbox.SECRET_DIRS),
                                               "roots": list(map(str, roots)), "files": list(map(str, files)),
@@ -583,17 +584,18 @@ def confinement(cwd: Path, add_dirs: list[Path], floor: guard.Floor, selected: R
     return sandbox.write_confinement(
         cwd, add_dirs, selected.owner if selected and selected.using_login else None,
         state=(paths.STATE_DIR, (*floor.open, sandbox.SESSIONS_DIR, sandbox.AGENT_DIR, sandbox.LOGIN_DIR,
-                                 sandbox.KEY_DIR)),
+                                 sandbox.KEY_DIR, paths.PACKAGE_DIR)),
         hidden=(paths.CONFIG_DIR, paths.LOG_DIR, paths.CLIENT_DIR), peers=paths.WORKTREES_DIR)
 
 
 def command(names: list[str], *, model: str = "", effort: str = "", resume: Session = NO_SESSION, system: str = "",
-            persist: bool = True, add_dirs: list[Path] | None = None, ask_owner: bool = False) -> list[str]:
+            persist: bool = True, add_dirs: list[Path] | None = None, ask_owner: bool = False,
+            observe: bool = False) -> list[str]:
     cmd = [binary(), "-p", "--mode", "json", "--no-context-files", "--no-skills", "--no-extensions",
            "--no-prompt-templates", "--no-themes", "--no-approve", "--no-mcp", "--extension", str(GUARD_FILE)]
     if ask_owner:
         cmd += ["--extension", str(ASK_FILE)]
-    if "bash" in names:
+    if observe or pi_shell.TOOL in names:
         cmd += ["--extension", str(SHELL_FILE)]
     names = [*names, owner_asks.TOOL] if ask_owner else names
     cmd += ["--tools", ",".join(names)] if names else ["--no-tools"]
@@ -813,6 +815,7 @@ def _run(
     delegation_only: bool = False,
     judge: bool = False,
     read_roots: tuple[Path, ...] = (),
+    native_observation: str = "",
 ) -> Result:
     auth = auth if auth is not None else accounts.Auth("api_key")
     if mcp_servers(mcp_config):
@@ -828,21 +831,27 @@ def _run(
 
         floor = guard.floor(os.environ.get("ARETE_RUN_ID", ""), cwd, add_dirs)
     names = [name for name in tool_names(tools, allowed_tools, disallowed_tools) if name in GUARDED_TOOLS]
+    observing = bool(native_observation)
+    if observing and (names or ask_owner or persist or resume.id or add_dirs or delegation_only
+                      or auth.mode != "subscription" or not json_schema or not pi_shell.simple_command(native_observation)
+                      or f"Bash({native_observation})" not in (allowed_tools or [])):
+        raise ValueError("native observation requires a fresh tool-free subscription with one exact command")
     if delegation_only and (names or ask_owner or resume.id or json_schema is not None or system or add_dirs or read_roots or persist):
         raise ValueError("controller requires a fresh tool-free, non-restating invocation")
     if persist or resume.id:
         sandbox.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     launch_model = selected.model.partition("/")[2] if selected else model
     cmd = command(names, model=launch_model, effort=effort, resume=resume, system=system, persist=persist, add_dirs=add_dirs,
-                  ask_owner=ask_owner)
+                  ask_owner=ask_owner, observe=observing)
     if selected and selected.provider:
         cmd += ["--provider", selected.provider]
     if json_schema is not None:
         prompt = f"{prompt}\n\n{SCHEMA_RULE.format(schema=json.dumps(json_schema))}"
     confined = False
-    if writing := sorted(WRITING & set(names)):
+    writing = sorted(WRITING & set(names))
+    if writing or observing:
         if not sandbox.can_confine(False):
-            return Result(ok=False, error=f"{sandbox.NO_CONFINEMENT_REASON}, so pi cannot {', '.join(writing)} here",
+            return Result(ok=False, error=f"{sandbox.NO_CONFINEMENT_REASON}, so pi cannot run confined commands here",
                           session=resume, runner="pi", model=model)
         cmd = confinement(cwd, add_dirs, floor, selected) + cmd
         confined = True
@@ -853,14 +862,18 @@ def _run(
     folder = selected.view
     env = {**selected.env, **(extra_env or {}), "PI_CODING_AGENT_DIR": str(folder),
            **guard_env(floor, [selected.owner, folder / "auth.json"], selected.sensitive_files,
-                       delegation_only=delegation_only, shell="bash" in names),
+                       delegation_only=delegation_only, shell=pi_shell.TOOL in names),
            **({"ARETE_ASK_TOOL": json.dumps(owner_asks.pi_tool())} if ask_owner else {})}
     protection = json.loads(env["ARETE_PI_GUARD_PATHS"])
-    shell = (pi_shell.Shell(cwd, tuple(add_dirs), floor, tuple(allowed_tools or ()), tuple(disallowed_tools or ()),
+    env.pop("ARETE_PI_OBSERVE", None)
+    if observing:
+        env["ARETE_PI_OBSERVE"] = native_observation
+    allowed = (f"Bash({native_observation})",) if observing else tuple(allowed_tools or ())
+    shell = (pi_shell.Shell(cwd, tuple(add_dirs), floor, allowed, tuple(disallowed_tools or ()),
                             pi_shell.command_env(passing, extra_env, selected.hidden),
                             (selected.owner, folder, *selected.sensitive_files, *map(Path, protection["files"])),
                             judge, time.monotonic() + timeout, tuple(read_roots))
-             if "bash" in names else None)
+             if observing or pi_shell.TOOL in names else None)
     try:
         with refresh_channel(selected, env) as refresh, pi_shell.channel(shell, env) as terminal:
             descriptors = (*refresh, *terminal)

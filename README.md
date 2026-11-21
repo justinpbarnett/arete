@@ -579,7 +579,7 @@ The agent runs as your user, so it can still read a file your user can; the guar
 JEV is a classifier model from TypeSafe, reached through OpenRouter. It reads text and answers a yes or no question, picks one of a few labels, or rates on a scale, each with a confidence, fast and for $0.042 per million input tokens. Arete asks it first where a classifier can settle the question, and leaves the question to the model only when JEV is unsure:
 
 - Loops: a loop fed by outside text drops each event JEV reads as instructions to an agent before the agent sees it, and a ticket emit drawn from outside text waits for approval on the same check. A `[classify]` step asks JEV first and sends only the events it is unsure of to the model. A finding JEV matches to a known one, even worded another way, counts as that finding, not a new one.
-- Risk: the automerge of a pipeline PR, opened, pushed to or checked again by the run, waits for a person when JEV rates the diff risky (how much depends on what it changes, how near it comes to credentials, money or data, and how far it strays from its description), or reads it as a change a revert will not undo.
+- Risk: a pipeline PR waits for a person if JEV is unavailable, cannot judge the diff, rates it risky, or reads it as a change a revert will not undo.
 - Push screen: a `push` emit under `automerge` that no static rule holds lands only when JEV reads its diff as a narrow fix.
   It waits for approval when JEV's chance for one screen question reaches that question's line in `[jev.screen_lines]`: the diff weakens a protection, exposes credentials or personal data, sends data somewhere new or builds a command from outside text, does harm a revert will not undo, adds a capability, removes a behavior instead of fixing it, or renames something other code or config uses, or it reaches past the fix it names.
   The approval names each question that held it, with JEV's chance and the question's line.
@@ -1003,9 +1003,29 @@ Approval, dependency, running-ticket and capacity checks still decide whether a 
 - Logs: `~/Library/Logs/arete/`. A log over 5 MB rotates by rename into five numbered copies (`runs.log.1` newest to `runs.log.5`), hourly by `arete serve`; `serve.log` rotates the same way when serve starts, including each restart for new code.
 - Per repo: `config.toml`, `expertise.md` and `evals/` in the layer, `.agents/` in the repo or the folder that `layer` names
 
-## Develop
+## Develop locally
 
-`uv run arete status` runs from the checkout without the installed tool. `uv tool install --editable . --python 3.13 --force` refreshes the `arete` on PATH that launchd uses.
+`uv run arete status` runs from the checkout without the installed tool.
+`uv tool install --editable . --python 3.13 --force` refreshes the `arete` on PATH that launchd uses.
+
+To inspect a fresh local database without using your regular Arete config or state, run this from the checkout:
+
+```sh
+(
+  set -eu
+  sandbox=$(mktemp -d "${TMPDIR:-/tmp}/arete-status.XXXXXX")
+  trap 'rm -rf -- "$sandbox"' EXIT
+  export ARETE_CONFIG_DIR="$sandbox/config"
+  export ARETE_STATE_DIR="$sandbox/state"
+  export ARETE_LOG_DIR="$sandbox/logs"
+  export ARETE_WORKTREES_DIR="$sandbox/worktrees"
+  uv run arete migrate
+  uv run arete status
+)
+```
+
+`migrate` initializes the disposable database without starting a service.
+If you add a pipeline repository to that config, the delivery rows show the configured strategy and controller route, not whether the provider is currently available.
 
 No runtime dependencies: stdlib only, so the tool install needs nothing from PyPI. Add one with `uv add`, never pip. The verifier's browser is `@playwright/mcp`, pinned in `arete/verify.py` and started with `npx`, so it needs node and Chrome on the machine. Under trusted scratch on the Codex runner the engine instead resolves that pinned version once, from the npm registry, into a private folder under its state (`browser-server/<version>`), checks it against the published integrity at every launch, and starts it with the engine's own `node` and no `npx`. On the Claude runner the engine starts that same pinned server itself, under the browser profile and outside the Claude process tree, as an HTTP MCP server on a loopback port it picks before the app starts; the app's profile denies outbound TCP to that port, and Claude gets one `http` entry named `playwright`. Before it starts the server, a preflight dumps `about:blank` with headless Chrome under the same profile within 30 seconds. When the preflight or the server start fails, the verify runs without browser tools and its prompt carries Chrome's first error line, so the browser checks are recorded as blocked with that line. The output of the server and of Chrome goes to `<step>-browser.log` in the run folder.
 
@@ -1214,7 +1234,7 @@ path = "classic"
 | `checks` | Every check must exit 0 before review. The agent may run them while it builds. |
 | `limits` | Diff size, paths the change may not touch, fix attempts (which also cap the CI fix rounds), the timeout of each step and of the checks, and cumulative `max_repair_cycles`, `max_run_minutes` and `max_verify_minutes` process budgets. These budgets must be positive integers. `max_run_minutes` leaves out `limit` and `slot` waits. Checks remain serialized by default; `parallel_checks = true` explicitly allows a repo whose checks use isolated resources to overlap them across worktrees, up to the machine's `max_parallel_checks`. `max_attempts` and `timeout_minutes` are the defaults for each step's `tries` and `timeout_minutes`, which [Steps](#steps) can set apart. Code enforces the diff size and the paths after the agent finishes. Every repo also denies `.agents/config.toml`, `.github/workflows/` and `.env` files. It denies `.claude/` too, since Claude Code refuses agent writes there. The planner names a change in a denied path for a human to make. The PR shows it under "Left for a person", and a rerun on an open PR writes, rewrites or removes that section to match its plan. The verifier and the reviewer are told that a person makes it, so its absence never fails the run. The CI fix step counts a red check that only that change fixes as not caused by the PR. |
 | `agent.allow_bash` | Bash patterns the agent may run, on top of read only git and file commands. |
-| `trust.level` | `pr`, or `automerge` once earned. |
+| `trust.level` | `pr`, or `automerge` once earned. See [Pipeline auto-merge](#pipeline-auto-merge). |
 | `trust.automerge_after` | Merged PRs in a row before arete opens a PR proposing automerge. |
 | `git.base` | Branch PRs target. Defaults to the GitHub default branch. |
 | `git.subject` | Commit subject and PR title. Fields: `{kind}` (`feat` or `fix`) and `{title}`. The ticket ref is appended to the commit subject, like `(#35)` or `(ABC-12)`, and to a Jira PR title; a GitHub PR links its issue with `Closes #35` instead, or with `Part of #35` when the plan leaves a change for a person. |
@@ -1244,6 +1264,56 @@ A layer outside the repo is made a git repo, and arete commits each accepted rew
 A clean run learns nothing.
 
 Lessons merge when runs overlap. The learn step reads `expertise.md` when it starts, not the copy the run planned with. Before it writes, it takes a lock for the layer and reads the file again. When another run changed the file meanwhile, it runs once more as `learn2` on the current file, under the lock, and writes that; a rewrite whose base moved is never written. When the second pass gives no usable file, the first rewrite is saved in the run folder and not applied. The commit holds `expertise.md` alone, and an eval mine commit holds its eval file alone; other changed files in the layer stay uncommitted. The commit sha is saved as `expertise-commit.txt` in the run folder. The lock is a file lock on this host, so runs on separate hosts are not covered.
+
+### Pipeline auto-merge
+
+Pipeline auto-merge requires full local checks, approving review, and native verification of the published tree.
+GitHub must report at least one CI result, and every reported check and current status must be successful on that head.
+JEV must complete its risk screen on the diff and not hold it.
+Arete attempts only a head-matched squash merge on an open, ready PR whose head contains the target base.
+It never arms a later merge and leaves changes spanning repositories for a person.
+Set required checks and require an up-to-date branch in GitHub so the server enforces those rules even if the base or CI changes during the merge request.
+
+#### One-shot delivery pilot with owner merge
+
+The local owner can authorize one exact README line replacement from a pinned `main` commit without changing PR trust.
+Run `arete pilot-doc-fix --base FULL_SHA --old-line 'exact old line' --new-line 'exact new line'` to check the signal without starting work.
+Add `--execute` to spend that authorization and leave the watcher running.
+The command creates one local task for the scheduled poller, not a GitHub issue.
+Before pushing a feature branch, Arete requires a single commit on the pinned base containing only the authorized edit, with matching native verification, full local checks, and independent review.
+After exact-head GitHub Actions and JEV screening pass, the watcher prints the PR URL, expected head, and base for the GitHub repository owner to squash-merge.
+Arete does not request a merge because GitHub's squash API cannot pin the target branch and commit at the write.
+The watcher only accepts a merge attributed by GitHub to the repository owner after the handoff, with the approved head and target branch, exact squash parent and tree, and passing CI on that release.
+It then fast-forwards a clean, idle local checkout and waits for a fresh healthy service heartbeat and API response.
+The README-only deployment does not need a service restart.
+The write-admission window is at most 40 minutes, and an operation already started can take longer to finish.
+The poller skips spent or expired tasks, including when the watcher process is no longer running.
+On a hold or interruption, inspect the printed receipt and any branch, PR, or merge already present; the same authorization is never automatically retried.
+
+#### Standing README delivery lane
+
+The standing lane is off unless the local owner installs and approves its repository policy and managed runtime.
+It watches one exact README heading on protected `main` and accepts no other edit, target, or source of tasks.
+It does not change the regular PR trust level or use the one-shot pilot's receipts.
+`arete zte status --dry-run` reads the signal without creating a task, and `arete zte status` shows the recorded delivery phase and evidence.
+`arete zte pause` stops new effects at the local interlock; a GitHub write already sent may still land.
+The worker reconciles that result by reading, not by retrying a write or reverting Git history.
+GitHub pins the squash head but not the target or target tip, so a landing with the wrong target, parent, or tree is never deployed.
+
+Install the launchd supervisor outside the selectable releases and migrate to the current schema during bootstrap, before enabling the policy.
+From that private, pinned checkout, `python -m arete.zte_release write-launch-agents` writes the service and release-agent plists without loading them.
+The installation must already have a private release profile, a verified selector, and a healthy known-good runtime matching protected `main`.
+Before squashing, the lane checks that the last-good runtime is healthy and the release worker is loaded.
+The worker keeps the previous runtime until it sees two fresh authenticated HTTPS health beats on the replacement.
+On an unhealthy activation it restores the last-good runtime, checks that runtime's health and pauses the lane without changing Git or rolling back the database.
+
+A later violation can open a new task only after a healthy delivery, an intervening conforming observation, and the daily quota reset.
+The protected `main` tip must already be running in the managed installation; ZTE never deploys unrelated changes to make a finding eligible.
+Advance that baseline through the normal reviewed release process, not by editing the selector to bypass health checks.
+A held, uncertain, or rolled-back delivery does not rearm automatically.
+If recovery cannot verify the database, the worker stops the managed service and leaves run admission closed.
+Keep its evidence and the Stop latch in place; inspect the remote state and recover the installation separately.
+There is no command to clear the ledger or retry that shipment under the old authorization.
 
 ## Steps
 
@@ -1583,6 +1653,7 @@ Product behavior, migration compatibility and limits are unchanged by the covera
 Workers own process groups that the runner cleans up on completion or interruption, and a lifeline ends workers if the runner dies.
 The runner exits nonzero on any failure or error and does not retry; the first failure is authoritative.
 Either command can serve as the business-suite command under `[checks]` in Arete's layer.
+For Arete's own layer, use `lint = "sh tools/lint-arete"` to run the same pinned Ruff as hosted CI, rather than resolving a floating Ruff version at each run.
 
 Configure cheap environment prerequisites under `[verify.preflight]`:
 
@@ -1683,7 +1754,7 @@ Missing requirements, invented facts and damaged commands are counted separately
 
 The result is `unreviewed` until every text has all five values from at least `raters` raters; an unreviewed report proposes nothing. Once reviewed, the proposal is the eligible candidate with the highest preference, with its lead over the next one and whether the interval is clear of zero. Proposals only.
 
-## CI
+## Continuous integration
 
 After the push, the run waits for the checks on the PR. It waits up to 30 minutes, or 3 minutes when no check reports at all. The run frees its `max_parallel` slot for the wait, so another ticket can start, and takes a slot back before a CI fix step. Arete compares each failed check with the same check on the head of the base branch.
 
@@ -2138,10 +2209,26 @@ Uncertain classifications fall back to a read-only haiku step that reads the tic
 - Repos: the one it belongs in. A code ticket that names none, or needs more than one, gets a question to name it or split it.
 - Ready: the pipeline could build it as written.
 - Questions: only real blockers. The ticket does not say what to change and the code does not settle it, an attachment or copy it mentions is missing, a business decision changes the whole build, it needs an account or setup outside the repos, or it says it is parked, blocked or a duplicate.
-- Checks: up to six acceptance checks for a fix or feature, each one thing a person does on the running product and what it must show, so you see what done means before the build. Empty for research and work for a person. Triage writes and shows them; it does not yet feed them to the plan or verify steps.
+- Checks: up to six acceptance checks for a fix or feature, each describing an action on the running product and what it must show.
+  Research and work for a person have no checks.
+  After approval, classic, ADW and orchestrated planners receive the checks and must not drop or weaken them.
+  If the code disproves a check, the plan explains why in its assumptions.
+  The verifier receives the original checks as a separate numbered list even when the planner omitted a check or the run skipped planning.
+  The verifier reports an outcome for each check, and the PR lists the checks in their original order.
+  The owner's board answers override contradictory checks and assumptions; verification identifies the superseded check and gives evidence for the replacement behavior.
+  Tickets without approved checks keep their existing behavior.
 - Assumptions: the small choices the build will make where the ticket leaves them open, such as wording, placement or a default. They are not questions; the pipeline's plan reads them, and the PR lists them for you to check.
 - Size S, M or L. L means split it, so it is never ready.
 - A plan of up to 6 steps.
+
+Exercise the classic and ADW handoff offline with `<sandbox> python docs/triage-checks-fixture.py approved`, then `overrides`, `legacy`, `patch` and `inspect` with the same prefix.
+Use the configured verification sandbox executable for `<sandbox>`.
+The `patch` exercise covers an approved fix routed through `route_fixes` that completes without escalating to planning.
+Each exercise creates fresh disposable state and local bare origins beneath `.arete-sandbox/triage-checks-fixture/`, uses replay answers and dry-run publication, and prints the retained evidence paths.
+Inspect the plan, build and verify prompts, the plan outcome, `verify.md` and `pr_body.md` there.
+The exercises cover a planner-omitted check, a nearby planner-added check, empty planner verification, owner overrides, code-disproved checks and legacy tickets.
+They refuse external transports and credential lookup.
+Replay proves prompt propagation and report persistence, not that a live model obeyed the instructions.
 
 The fallback agent reads only inside its repos, has no MCP servers, and costs at most $0.30 a ticket.
 A ticket is assessed again when its updated time changes or the classifier's policy changes.
@@ -2209,7 +2296,9 @@ When `alert_repo` is set and private, the board is also one issue there, "[arete
 
 ## Dashboard
 
-`arete serve` serves one page from this machine to its owner over Tailscale, so it opens from a phone or another computer on the tailnet; `arete dashboard` serves it alone.
+`arete serve` serves the dashboard from this machine to its owner over Tailscale, so it opens from a phone or another computer on the tailnet; `arete dashboard` serves it alone.
+Open `/ui.html` for the new dashboard's Floor, Runs, Triage inbox, Outbox, local task Board, and live Health.
+The classic dashboard stays at `/` and still handles the full intake, console, sessions, configuration, incidents, and usage views.
 It listens only on the machine's tailnet addresses.
 A request from any other tailnet login gets 403, and a change also needs the `X-Arete` header that the page sends.
 Admission maps the whois login through `principal_logins` to an active human principal.
@@ -2373,7 +2462,47 @@ Explicit subscription calls contribute no paid spend and retain all their tokens
 
 ### API
 
-These routes pass the same caller check as the page, and the POST needs the `X-Arete` header. A bad request gets 400, an unknown task or run 404, a ticket whose run is going on or no free slot 409, and a tracker that fails 502.
+The versioned interface is under `/api/v1`.
+Read `/api/v1/meta` for the API version, contract hash, server revision, and oldest supported clients.
+Read `/api/v1/contract` for the live registry or see the generated [OpenAPI document](docs/openapi.json) for this checkout.
+Legacy URLs keep their existing shapes and are tracked as deprecated aliases.
+
+#### Checking API changes
+
+Run these steps from the checkout after `uv sync` and `git fetch origin main`:
+
+1. Run `uv run arete api check`.
+   It starts an isolated loopback server on disposable state and exercises the registry, examples, keyed replay, stale writes, problem responses, CLI, MCP, streaming, response shapes, aliases, and reserved names.
+   It does not start or connect to the live dashboard or use external accounts.
+   The fixture gives Python only loopback networking and invokes Git with file-only transport and no inherited configuration or hooks.
+   It is a behavior check for trusted checkout code, not a sandbox for running arbitrary code.
+2. Run `uv run arete api diff` to compare against `origin/main`, or pass a commit or tag as the reference.
+   The command reads the reference's Git objects without importing its code and regenerates `docs/openapi.json` from the working registry.
+   Advance the API minor for a contract change and stage the generated file with the registry.
+   Run the same command again to confirm the artifact is deterministic.
+3. Run `uv run python docs/versioned-api-fixture.py exercise contract-evolution` to verify that an optional result addition passes after a minor bump, that removals and tighter inputs are diagnosed, and that each removal gate is enforced.
+   It uses a disposable clone; add `--root PATH` to keep its evidence in a new directory.
+4. Run `uv run python docs/versioned-api-fixture.py exercise nearby` to check legacy reads, keyed replays, and publication recovery.
+5. Optionally run `just hooks` to opt into the repository's pre-commit check.
+   It sets the repository's `core.hooksPath` to `.githooks` and refuses to replace a different hooks path or disable an active default hook.
+   The hook checks compatibility from the staged tree and refuses a commit when its generated OpenAPI document is missing or stale.
+   It does not rewrite the working tree.
+
+For a breaking change, the reference route must already be deprecated, its Sunset must have passed, and explicit evidence must show zero requests in the last seven days.
+Pass that evidence as `--usage FILE`, a JSON object keyed by `METHOD /path` with an explicit integer `requests` count and timezone-aware `from` and `through` timestamps covering the last seven days through the current minute.
+For a versioned GET operation, include a separate `batch_requests` count for calls through `POST /api/v1/batch` in the same window; the direct count alone is insufficient.
+The oldest supported client versions are fixed within v1.
+Pass `--owner-approval FILE` only for a recorded owner decision, with `approved: true`, the exact `base_commit` and candidate `contract_sha` printed by `api diff`, and the approved `routes` list.
+Missing usage or approval fails the check.
+For the opt-in hook, the corresponding file paths are `ARETE_API_USAGE` and `ARETE_API_OWNER_APPROVAL`.
+
+#### Route reference
+
+These routes pass the same caller check as the page, and a POST needs the `X-Arete: 1` header.
+A bad request gets 400, an unknown task or run 404, a ticket whose run is going on or no free slot 409, and a tracker that fails 502.
+Send JSON bodies with `Content-Type: application/json` and a single `Content-Length`.
+Unkeyed legacy routes still accept an omitted media type, or no length for an empty body, but a supplied unsupported media type now returns 415.
+Evidence uploads still accept the supported image and video types or `application/octet-stream`.
 
 A chat's sessions have four routes: `GET /api/chats/N/sessions` lists them with the chat's limits (`max_sessions`, `running`, `budget_usd`, `spent`, `left`), `GET /api/chats/N/sessions/ID/report` returns a session's report, `POST /api/chats/N/sessions` starts one (body `prompt`, and optionally `repo`, `device`, `model`, `runner`, `budget_usd`; a missing `repo` means the chat's project), and `POST /api/chats/N/sessions/ID/stop` stops one. A session another chat started answers 404.
 
@@ -2389,6 +2518,9 @@ In a repo the poller does not pick, `why` names the task and the `ticket` body t
 A queued task in a `pipeline = true` repo starts at a later poll.
 A ticket whose run is going on answers that run's id with `already running` and never starts twice.
 Once a keyed response is committed, identical resends replay that answer unchanged; use a fresh key with the task's ticket to request a new start.
+
+`GET /api/tasks` returns local task summaries (`id`, `repo`, `title`, `kind`, `state`, `updated`), most recently updated first.
+It does not fetch tracker items or include task bodies or comments.
 
 `GET /api/tasks/ID` returns the task: a local task's row with its `comments`, or a tracker item's `id`, `ref`, `title`, `url` and `state`, with `?repo=NAME` when no run names it yet. Both add `runs` (`id`, `status`, `started`, `finished`, `prs`, `cost_usd`, and `report`, the run's [`report` line](#run-lines), or `{}` while it has none), newest first, and `children`, the local tasks whose parent it is.
 
@@ -2509,12 +2641,20 @@ Successful run writes retain their legacy response bodies and identify the commi
 Every displayed run action sends its selected `base_version`.
 A stale action shows the conflict once, refreshes and sends no second POST; a deliberate action after refresh uses the new displayed version.
 
-The missing-version grace deadline starts inactive.
-Migration and startup never activate it.
-The later v1 screen release must explicitly call `arete.store.writes.activate_grace()` once; it persists activation plus 30 days, and repeated activation cannot extend it.
+Migration leaves the missing-version grace deadline inactive.
+Serving `/ui.html` for the first time activates the 30-day grace period.
+The deadline is persisted and does not move on later views or restarts.
 Before that deadline, legacy commands without versions work.
 At the exact deadline they return 409 `version_conflict` with the current persisted object.
 Explicit versions always compare; internal conditional writes remain versionless.
+
+`GET /api/v1/contract` lists the versioned operations with their inputs, result shapes, examples, and errors.
+`GET /api/v1/meta` reports the API version, engine and client versions, and contract hash.
+Legacy paths retain their existing fields and report `Deprecation: true`.
+Read results include a `seq` cursor and carry it in `Arete-Seq`; legacy writes keep their receipt in the header only.
+`POST /api/v1/batch` accepts up to 50 declared reads and evaluates them against one database snapshot.
+If dashboard fragments disagree, both dashboards refetch at most twice, keep the last coherent display if they still disagree, and try again on the next refresh.
+If a classic dashboard sidebar or questions request fails, the view can still refresh without showing the unavailable fragment as current.
 
 ## Rules
 

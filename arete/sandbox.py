@@ -85,21 +85,43 @@ def sandboxed() -> bool:
     return lib.sandbox_check(os.getpid(), None, 0) == 1
 
 
-def protected_command(command, cwd=None, keeps=()):
-    if not can_confine(False):
-        return command
-    if sandboxed():
-        lib = ctypes.CDLL(None)
-        lib.sandbox_check.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int)
+def authority_roots() -> tuple[Path, ...]:
+    return (AUTHORITY, paths.ZTE_AUTHORITY, AUTHORITY.parent / "zte-authority", paths.ZTE_STOP,
+            *(root / "current.json" for root in (paths.ZTE_REHEARSAL_INSTALL, paths.ZTE_LIVE_INSTALL)))
+
+
+def already_protects_authority() -> bool:
+    lib = ctypes.CDLL(None)
+    lib.sandbox_check.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p)
+
+    def denied(path: Path, *operations: bytes) -> bool:
+        return all(lib.sandbox_check(os.getpid(), op, 1, os.fsencode(path)) == 1 for op in operations)
+
+    def absent(path: Path) -> bool:
         try:
-            os.lstat(AUTHORITY)
+            path.lstat()
+        except FileNotFoundError:
+            return True
         except OSError:
-            return command
-        if all(lib.sandbox_check(os.getpid(), op, 1, ctypes.c_char_p(os.fsencode(AUTHORITY))) == 1
-               for op in (b"file-read-data", b"file-write-data")):
-            return command
+            return False
+        return False
+
+    for path in authority_roots():
+        if denied(path, b"file-read-data", b"file-write-data", b"file-write-create"):
+            continue
+        if absent(path) and (path != paths.ZTE_STOP or all(absent(root) for root in (
+                paths.ZTE_AUTHORITY, AUTHORITY.parent / "zte-authority"))):
+            continue
+        return False
+    return all(denied(root, b"file-write-data", b"file-write-create") or absent(root)
+               for root in (paths.ZTE_REHEARSAL_INSTALL, paths.ZTE_LIVE_INSTALL))
+
+
+def protected_command(command, cwd=None, keeps=()):
+    if not can_confine(False) or (sandboxed() and already_protects_authority()):
+        return command
     words = ["/bin/sh", "-c", command] if isinstance(command, str) else list(command)
-    return write_confinement(Path(cwd or Path.cwd()), [], hidden=(AUTHORITY,), restrict_writes=False,
+    return write_confinement(Path(cwd or Path.cwd()), [], restrict_writes=False,
                              keeps=tuple(keeps)) + words
 
 
@@ -111,7 +133,7 @@ def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = 
                       mach: tuple[tuple[str, ...], str] | None = None, tcp_port: int | None = None,
                       denied_ports: tuple[int, ...] = (), listen_port: int | None = None,
                       private_temporary: bool = False, read_roots: tuple[Path, ...] | None = None) -> list[str]:
-    hidden = tuple(dict.fromkeys((*hidden, AUTHORITY)))
+    hidden = tuple(dict.fromkeys((*hidden, *authority_roots())))
     roots = [cwd, *add_dirs, *([AGENT_DIR, LOGIN_DIR, KEY_DIR, SESSIONS_DIR] if agent_roots else [])]
     allow = " ".join(f'(subpath (param "W{i}"))' for i in range(len(roots)))
     if temp_writes and not private_temporary:
@@ -160,6 +182,9 @@ def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = 
                     '(require-not (regex (param "SAFE")))))(deny file-read* file-write* (regex (param "DIRS")))')
     params += ["-D", f"ENGINE={real_path(paths.PACKAGE_DIR)}", "-D", f"RUNTIME={real_path(sys.prefix)}"]
     profile += '(deny file-write* (subpath (param "ENGINE")) (subpath (param "RUNTIME")))'
+    for i, root in enumerate((paths.ZTE_REHEARSAL_INSTALL, paths.ZTE_LIVE_INSTALL)):
+        params += ["-D", f"INSTALL{i}={real_path(root)}"]
+        profile += f'(deny file-write* file-link (subpath (param "INSTALL{i}")))'
     ancestors = {p for root in (*hidden, paths.PACKAGE_DIR, Path(sys.prefix)) for p in real_path(root).parents}
     for i, path in enumerate(sorted(ancestors)):
         params += ["-D", f"A{i}={path}"]

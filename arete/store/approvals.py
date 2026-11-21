@@ -56,14 +56,23 @@ def approval_of(row) -> dict:
     return {**dict(row), "emit": json.loads(row["emit"] or "{}"), "review": json.loads(row["review"] or "{}")}
 
 
-def claim_approval(approval_id: int, until: str, came_from: tuple[str, ...] = DECIDABLE) -> str:
+def claim_approval(approval_id: int, until: str, came_from: tuple[str, ...] = DECIDABLE, *, previous="") -> str:
     token = secrets.token_hex(8)
     with db() as c:
         before = c.total_changes
         c.execute(f"UPDATE approvals SET status = 'approved', result = '', decided = ?, claimed_by = ?, "
-                  f"claimed_until = ? WHERE id = ? AND status IN ({','.join('?' * len(came_from))})",
-                  (util.iso(), token, until, approval_id, *came_from))
+                  f"claimed_until = ? WHERE id = ? AND (status IN ({','.join('?' * len(came_from))}) "
+                  "OR (status = 'approved' AND claimed_by = ? AND claimed_by != ''))",
+                  (util.iso(), token, until, approval_id, *came_from, previous))
         return token if c.total_changes > before else ""
+
+
+def bind_publication(approval_id: int, token: str, marker: str) -> bool:
+    with db() as c:
+        return c.execute("UPDATE approvals SET emit = json_set(emit, '$._publication_marker', ?) "
+                         "WHERE id = ? AND status = 'approved' AND claimed_by = ? "
+                         "AND json_extract(emit, '$._publication_marker') IS NULL",
+                         (marker, approval_id, token)).rowcount == 1
 
 
 def renew_claim(approval_id: int, token: str, until: str) -> bool:

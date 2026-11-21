@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
 import shlex
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -458,6 +460,10 @@ class Run(AgentRun):
         if not self.asks_owner:
             return super().agent(step, text, cwd, role, **kw)
         due = self.due_for(step)
+        if kw.get("native_observation"):
+            if due:
+                raise RuntimeError("a pending owner decision precludes unattended native verification")
+            return super().agent(step, text, cwd, role, **kw)
         if due:
             text, kw = self.with_answers(due, text, kw)
         res = super().agent(step, text, cwd, role, ask_owner=True, **kw)
@@ -742,14 +748,6 @@ def checkout_patch(c: workspace.Checkout, locks: list[str], *revs: str) -> str:
     return patch + (f"\n(lockfile changes not shown: {', '.join(locks)})\n" if locks else "")
 
 
-def patch_from_base(checkouts: list[workspace.Checkout]) -> str:
-    patch = ""
-    for c in checkouts:
-        since_base = f"{c.origin_base}...HEAD"
-        patch += checkout_patch(c, diffguard.between(c.wt, since_base, prefix=c.prefix).locks, since_base)
-    return patch
-
-
 def lines_by_file(staged: Staged, top: int = 12) -> str:
     rows = sorted(((name, n) for name, n in staged.counts.items() if n), key=lambda r: (-r[1], r[0]))
     out = [f"- `{name}`: {n}" for name, n in rows[:top]]
@@ -995,9 +993,9 @@ class Build(TicketWork):
             raise workspace.RunFailed(f"after {after} {why}{planned}; split the work",
                             f"### Lines changed by file\n\n{lines_by_file(staged)}{pushed}")
 
-    def push(self, branch: str, message: str) -> None:
+    def push(self, branch: str, message: str, *, before_push: Callable[[workspace.Checkout], str] | None = None) -> None:
         self.run.tracker.pr_link(self.ticket, whole=not self.left_for_a_person)
-        commit_and_push(self.checkouts, self.staged.changed, branch, message)
+        commit_and_push(self.checkouts, self.staged.changed, branch, message, before_push=before_push)
         self.committed_lines += self.staged.lines
 
     def check_with_repairs(self, step_name: Callable[[int], str] | None = None) -> tuple[bool, int]:
@@ -1120,7 +1118,15 @@ def run_command(repo_name: str, tid: str | int, force: bool = False, dry_run: bo
     if mode == "classic":
         return control.command(["run", repo_name, str(tid), "--local", *flags])
     if mode in (ORCHESTRATED, "orchestrate"):
-        return script_command(cfg, "orchestrate", repo_name, str(tid), *flags)
+        from .store import orchestration
+
+        newest = run_store.newest_whole_run(repo_name, str(tid))
+        source = newest if newest and newest["status"] == "interrupted" else (
+            next(iter(run_store.open_runs(repo_name, str(tid))), None)
+            if not force and pending_feedback(repo_name, str(tid)) else None)
+        previous = (orchestration.find(source["id"]) or {}).get("current_run", source["id"]) if source else ""
+        return script_command(cfg, "orchestrate", repo_name, str(tid), *flags,
+                              *(["--continue", previous] if previous else []))
     if mode != ADW:
         return script_command(cfg, mode, repo_name, str(tid), *flags)
     newest = run_store.newest_whole_run(repo_name, str(tid))
@@ -1211,7 +1217,8 @@ def park_run(run: Run, reason: str) -> tuple[str, str, str]:
     return status, summary, pr_url
 
 
-def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: bool, flow: factory.Flow | None) -> None:
+def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: bool, flow: factory.Flow | None,
+               *, echo_end: bool = True) -> None:
     if restarting and status in ("skipped", "noop") and not run.feedback:
         run.enter("failed")
         run.say(f"I did not restart this after the interruption: {summary}. Remove "
@@ -1225,9 +1232,32 @@ def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: boo
             run_lines.write(run.id, "error", step=run_lines.last_step(run.id), message=summary)
     pr_url = pr_url or str((run_store.run_get(run.id) or {}).get("pr_url") or "")
     end_line = f"done: {status} {pr_url or summary}"
-    run.log(end_line)
+    if echo_end:
+        run.log(end_line)
     record.settle(run.id, status, end_line=end_line, summary=summary, pr_url=pr_url)
     write_report(run_store.run_get(run.id) or {"id": run.id, "status": status, "pr_url": pr_url}, flow, run)
+
+
+def settle_zte_refusal(repo: str, tid: str, slot: slots.RunSlot, run_id: str, error: BaseException, *, committed: bool) -> int:
+    from . import launch_lease
+    from .store import db
+
+    slot.free()
+    if run_id:
+        try:
+            if not committed:
+                with db.one_read(timeout=0):
+                    committed = bool(run_store.run_get(run_id))
+            if committed:
+                try:
+                    launch_lease.registered(repo, tid)
+                finally:
+                    outcome = "stopped" if isinstance(error, Stopped) else "failed"
+                    with db.tx(timeout=0):
+                        run_store.settle(run_id, {"status": outcome, "finished": util.iso(), "summary": str(error)})
+        except (OSError, RuntimeError, sqlite3.Error):
+            pass  # The scheduled reaper settles abandoned registered runs.
+    return 2
 
 
 def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool = False,
@@ -1241,7 +1271,10 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
     paths.ensure_dirs()
     cfg = config.load()
     repo = cfg.repo(repo_name)
-    from . import flows
+    from . import flows, launch_lease, pilot, zte
+    from .store import db
+    from .store import zte as zte_store
+
     adw, refusal = run_refusal(repo, script is not None)
     if refusal:
         print(refusal)
@@ -1267,10 +1300,34 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             return 0
         try:
             layer = config.load_layer(repo.layer_dir)
+            wall_deadline = math.inf
+            zte_grant = None
+            if zte.reserved(str(tid)):
+                pilot.require(script and script.path == "orchestrate" and not any(
+                    (dry_run, force, script.continues, script.only, script.again, script.repairs, script.action,
+                     script.overrides, closed_context)), "ZTE requires its original scheduled orchestration")
+                zte_grant = zte.admit_run(cfg, repo, str(tid))
+                wall_deadline = zte.wall_deadline(zte_grant)
+            if pilot.is_pilot_task(str(tid)):
+                from .orchestration import policy_fingerprint
+
+                permit = pilot.task_admission(str(tid), repo.name)
+                pilot.require(principals.current() == "rule:poll" and script and script.path == "orchestrate"
+                              and not any((dry_run, force, script.continues, script.only, script.again, script.repairs,
+                                           script.action, script.overrides, closed_context))
+                              and permit["policy"] == policy_fingerprint(cfg, layer, ())
+                              and layer.factory_path == ORCHESTRATED,
+                              "the one-shot task requires the approved first scheduled orchestration")
+                wall_deadline = permit["deadline"]
+            if isinstance(tk, tracker.GitHubTracker):
+                tk.require_ordinary(tid)
             budget_history = run_store.ticket_runs(repo.name, tid, limit=1)
             blocked, reset_budget = runlimits.admission(repo, str(tid), tk, runlimits.Policy.of(layer), force)
         except tracker.ERRORS as e:
             print(f"could not read {name}: {e}")
+            return 2
+        except pilot.Held as e:
+            print(f"could not admit the reserved README task: {e}")
             return 2
         except (ValueError, OSError) as e:
             print(f"could not validate the process budget: {e}")
@@ -1281,14 +1338,23 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         if script and script.repairs and (later := run_store.later_run(repo.name, tid, script.repairs)):
             print(f"run {later['id']} of {name} came after run {script.repairs}, so it is not repaired twice")
             return 1
-        with slots.admitting():
+        if zte_grant:
+            try:
+                zte.require_launch_base(zte_grant)
+            except (OSError, RuntimeError, ValueError) as error:
+                print(f"could not start the reserved README task: {error}")
+                return 2
+        with slots.admitting(wait=zte_grant is None) as admitting:
+            if not admitting:
+                print("could not start the reserved README task: slot admission is busy")
+                return 2
             slot = slots.RunSlot(repo.name, str(tid), cfg.max_parallel)
             only = (script.only or (script.action if script.action_only else "")) if script else ""
             due = asks_store.asks_due([script.continues]) if script and script.continues and not only else []
             if not dry_run:
                 if slots.slots_free_to_start(cfg.max_parallel) > 0:
                     slot.hold()
-                elif not due:
+                elif not due or zte_store.activation_pending():
                     print(f"{name} was not started: {slots.no_free_slot(cfg.max_parallel)}. Wait for a run to "
                           f"finish or raise max_parallel in {paths.short_path(paths.CONFIG_FILE)}.")
                     return 1
@@ -1298,17 +1364,76 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             restarting = bool(earlier) and earlier["status"] == "interrupted"
             mending = (script.repairs or repaired_by(script.continues or (earlier["id"] if restarting else ""))
                        ) if script else ""
-            run_id = record.start("pipeline", tag=f"{repo.name}-{tid}", lock=lock, repo=repo.name, issue=tid,
-                                  only_step=only)
+            if pilot.is_pilot_task(str(tid)):
+                try:
+                    pilot.require(pilot.task_admission(str(tid), repo.name) == permit,
+                                  "the authorization changed before the run was started")
+                except pilot.Held as e:
+                    print(f"could not admit the one-shot task: {e}")
+                    slot.free()
+                    return 2
+            def start():
+                return record.start("pipeline", tag=f"{repo.name}-{tid}", lock=lock, repo=repo.name, issue=tid,
+                                    only_step=only)
+
+            def check_start_cutoff():
+                pilot.require(time.monotonic() < wall_deadline, "ZTE deadline expired during run startup")
+
+            def check_handoff():
+                check_start_cutoff()
+                pilot.require(not zte.PAUSE_FILE.exists(), "ZTE was stopped before the flow started")
+                check_start_cutoff()
+
+            @contextmanager
+            def handoff_io():
+                with ExitStack() as stack:
+                    if zte_grant:
+                        stack.enter_context(db.nonblocking_transactions(wall_deadline, check_handoff))
+                        stack.enter_context(run_lines.nonblocking_appends(check_handoff))
+                    yield
+
+            if zte_grant:
+                run_id = ""
+                committed = False
+                try:
+                    with util.lock(zte.INTERLOCK) as got_interlock:
+                        pilot.require(got_interlock, "ZTE run registration is interlocked")
+                        check_start_cutoff()
+                        with db.one_read(timeout=0):
+                            fresh_grant = zte.admit_run(config.load(), repo, str(tid))
+                        pilot.require(fresh_grant == zte_grant, "ZTE authorization changed before run start")
+                        readme_rule = zte.active(fresh_grant).signal(fresh_grant.base)
+                        check_start_cutoff()
+                        with db.tx(timeout=0, before_commit=check_start_cutoff):
+                            check_start_cutoff()
+                            pilot.require(zte.task_version(fresh_grant, readme_rule, "todo") == fresh_grant.data["task_version"],
+                                          "the reserved task was edited before ZTE launch")
+                            check_start_cutoff()
+                            run_id = start()
+                            zte_store.transition(fresh_grant, "running", run=run_id)
+                        committed = True
+                        launch_lease.registered(repo.name, str(tid))
+                        check_start_cutoff()
+                except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
+                    return settle_zte_refusal(repo.name, str(tid), slot, run_id, error, committed=committed)
+            else:
+                run_id = start()
             scratch.RUN_BASELINES[run_id] = producer_baseline
             scratch.RUN_LABELS[run_id] = service_labels
             run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force,
-                      feedback=[] if mending else pending_feedback(repo.name, tid), repairs=mending,
+                      feedback=[] if mending or zte_grant else pending_feedback(repo.name, tid), repairs=mending,
                       answering=earlier if earlier and earlier["status"] == "needs-info" else {},
                       launch_gate=admission, launch_done=launch_done, closed_context=closed_context,
                 **(script.run_fields if script else {}))
-            run.dir.mkdir(parents=True, exist_ok=True)
-            run_lines.write(run.id, "execution", path=run.path or "classic", protocol=1 if run.path == "orchestrate" else 0)
+            try:
+                with handoff_io():
+                    run.dir.mkdir(parents=True, exist_ok=True)
+                    run_lines.write(run.id, "execution", path=run.path or "classic",
+                                    protocol=1 if run.path == "orchestrate" else 0)
+            except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
+                if not zte_grant:
+                    raise
+                return settle_zte_refusal(repo.name, str(tid), slot, run_id, error, committed=True)
             if held_from := earlier["id"] if restarting or run.answering else (
                     script.continues or script.repairs if script else ""):
                 run.ab_held = run_store.ab_held(held_from)
@@ -1324,18 +1449,45 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             if done["status"] != "stopped":
                 run_lines.write(done["id"], "error", step=run_lines.last_step(done["id"]), message=done.get("summary") or "")
             write_report(done)
-        opening_waits(run_id, run.answering,
-                      "" if dry_run or run.alone else source_store.take_passed_over(repo.name, str(tid)))
-        if restarting:
-            run.log(f"restarting after run {earlier['id']} was interrupted")
-        flow = (flows.start(cfg, run, earlier if restarting else {}, slot, script.continues, script.only,
-                            script.again) if script else None)
+        try:
+            with handoff_io():
+                if zte_grant:
+                    with util.lock(zte.INTERLOCK) as got:
+                        pilot.require(got, "ZTE startup accounting is interlocked")
+                        check_handoff()
+                        with db.tx():
+                            passed_over = source_store.take_passed_over(repo.name, str(tid))
+                    check_handoff()
+                else:
+                    passed_over = "" if dry_run or run.alone else source_store.take_passed_over(repo.name, str(tid))
+                opening_waits(run_id, run.answering, passed_over)
+                if zte_grant:
+                    check_handoff()
+                if restarting:
+                    run.log(f"restarting after run {earlier['id']} was interrupted")
+                if zte_grant:
+                    check_handoff()
+                flow = (flows.start(cfg, run, earlier if restarting else {}, slot, script.continues, script.only,
+                                    script.again) if script else None)
+        except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
+            if not zte_grant:
+                raise
+            return settle_zte_refusal(repo.name, str(tid), slot, run_id, error, committed=True)
         if run.feedback:
             run.log(f"revising {', '.join(run.feedback_prs)} for {util.count(len(run.feedback), 'comment')}")
             if not dry_run and not run.alone:
                 insights_store.take_feedback(run.feedback, run_id)
         signal.signal(signal.SIGTERM, stop_on_term(run_id))
-        pr_url, passed = "", None
+        pr_url, passed, work_started = "", None, False
+
+        def check_work_log():
+            pilot.require(time.monotonic() < wall_deadline, "the ZTE authorization expired")
+            pilot.require(not zte.PAUSE_FILE.exists(), "ZTE was stopped")
+            pilot.require(time.monotonic() < wall_deadline, "the ZTE authorization expired")
+
+        def checkpoint_allowed():
+            return time.monotonic() < wall_deadline and not zte.PAUSE_FILE.exists()
+
         try:
             if due and not slot.held and not dry_run and not flow.refusal:
                 slot.take(run.log, run.waiting, "answer")
@@ -1344,42 +1496,72 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             fresh = bool(previous) and force and not restarting and not run.repairs and not run.alone and not (
                 flow and flow.continues)
             current = tk.get(tid) if fresh else None
-            run.budget = runlimits.Budget(run, runlimits.Policy.of(layer), previous, current, fresh)
-            with run.budget.watching():
-                if not (flow and flow.refusal):
-                    run.budget.capture(current or tk.get(tid))
-                status, summary, pr_url = flows.driven(flow, script.drive) if script else _run(cfg, run, slot)
+            with handoff_io():
+                run.budget = runlimits.Budget(run, runlimits.Policy.of(layer), previous, current, fresh,
+                                              wall_deadline=wall_deadline, checkpoint_timeout=0 if zte_grant else None,
+                                              checkpoint_gate=checkpoint_allowed if zte_grant else None)
+            with run.budget.watching(admit=check_handoff if zte_grant else None,
+                                     work_admitted=(lambda: work_started and checkpoint_allowed()) if zte_grant else None,
+                                     periodic=not zte_grant):
+                with handoff_io():
+                    if not (flow and flow.refusal):
+                        run.budget.capture(current or tk.get(tid))
+                with run_lines.nonblocking_appends(check_work_log) if zte_grant else nullcontext():
+                    work_started = True
+                    status, summary, pr_url = flows.driven(flow, script.drive) if script else _run(cfg, run, slot)
+            if zte_grant:
+                check_work_log()
             if flow and flow.only:
                 status, summary, passed = flows.alone(flow)
             elif run.action_only:
                 passed = status == "step"
         except runlimits.Parked as e:
+            if zte_grant:
+                return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
             status, summary, pr_url = park_run(run, str(e))
-        except factory.OnlyDone:
+        except factory.OnlyDone as e:
+            if zte_grant:
+                return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
             status, summary, passed = flows.alone(flow)
         except factory.Refused as e:
+            if zte_grant:
+                return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
             status, summary = "failed", str(e)
-        except Stopped:
+        except Stopped as e:
+            if zte_grant:
+                return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
             status, summary, pr_url = "stopped", record.STOPPED, ""
             run.log(record.STOPPED)
             run.give_up("was stopped by request")
         except workspace.RunFailed as e:
+            if zte_grant:
+                return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
             status, summary, pr_url = _fail(run, e.why, detail=e.detail)
         except tracker.ERRORS as e:
+            if zte_grant:
+                return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
             status, summary, pr_url = _fail(run, f"tracker refused {run.ref}: {e}")
         except Exception as e:
+            if zte_grant:
+                return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
             run.log(f"crashed: {type(e).__name__}: {e}")
             status, summary, pr_url = "failed", f"crashed: {e}"[:300], ""
             run.give_up("crashed before finishing")
         finally:
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
-            if run.workspace:
+            if run.workspace and not zte_grant:
                 keep_edits(run)
                 workspace.note_made(*run.workspace, workspace_owner(run, *run.workspace))
             slot.free()
-        settle_run(run, status, summary, pr_url, restarting, flow)
-        if status == "skipped":
+        try:
+            with handoff_io():
+                settle_run(run, status, summary, pr_url, restarting, flow, echo_end=not zte_grant)
+        except (OSError, RuntimeError, ValueError, sqlite3.Error) as e:
+            if not zte_grant:
+                raise
+            return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
+        if status == "skipped" and not zte_grant:
             print(f"{name} was not run: {summary}. Pass --force to run it anyway.")
         return 0 if (status in SUCCEEDED if passed is None else passed) else 1
 
@@ -1478,9 +1660,9 @@ def _ask(run: Run, ws: Path, checkouts: list[workspace.Checkout], comment: str, 
     return "needs-info", summary[:300], ""
 
 
-def checked_layer(cfg: config.Config, layer_dir: Path) -> config.RepoLayer:
+def checked_layer(cfg: config.Config, layer_dir: Path, *, source_file: Path | None = None) -> config.RepoLayer:
     try:
-        layer = config.load_layer(layer_dir)
+        layer = config.load_layer(layer_dir, source_file=source_file)
         steps.check(cfg, layer)
     except (ValueError, TypeError) as e:
         raise workspace.RunFailed(f"{paths.short_path(layer_dir / 'config.toml')}: {e}") from e
@@ -1497,6 +1679,25 @@ def resolve_layer(cfg: config.Config, run: Run, ws: Path) -> config.RepoLayer:
     return checked_layer(cfg, repo.path / ".agents")
 
 
+def triage_checks(approval: dict | None) -> str:
+    checks = (approval or {}).get("checks")
+    if not isinstance(checks, list):
+        return ""
+    return "\n".join(f"{n}. {check}" for n, check in enumerate(checks, 1))
+
+
+def triage_goal(goal: str, approval: dict | None) -> str:
+    if not (checks := triage_checks(approval)):
+        return goal
+    return (f"{goal}\n\n## Triage checks\n\n{checks}\n\n"
+            "Report an explicit outcome and evidence for every triage check, including any omitted from the planner's "
+            "steps. Do not drop or weaken a check. An owner's comment starting "
+            f"\"{prompt_loader.TRIAGE_ANSWERS}\" overrides contradictory checks and assumptions. Keep the original "
+            "check identifiable, mark it superseded, and explain the replacement behavior and its evidence. "
+            "A check disputed by the plan still needs an outcome. Follow the existing blocked-result rules when a "
+            "check cannot be performed; never invent passing evidence.")
+
+
 def triage_notes(approval: dict | None) -> str:
     if not approval:
         return ""
@@ -1504,6 +1705,12 @@ def triage_notes(approval: dict | None) -> str:
     assumption_rule = ("Keep an assumption only where the ticket still leaves it open. End `plan` with an \"Assumed\" list "
                        "of every choice the ticket leaves open, these and your own, so the owner can check them in the "
                        "pull request.")
+    if checks := triage_checks(approval):
+        assumption_rule += (f"\n\n## Triage checks\n\n{checks}\n\n"
+                            "Your `verify` must cover every triage check. You may add steps, but may not drop or weaken "
+                            "a check. If the code shows a check is wrong, explain why in the plan's assumptions. "
+                            f"An owner's comment starting \"{prompt_loader.TRIAGE_ANSWERS}\" overrides contradictory "
+                            "checks and assumptions.")
     if principals.is_person(approval["sent_by"]):
         return (f"## Sent by its owner after triage\n\nIts owner sent this ticket to the pipeline from arete's triage "
                 f"board at {approval['ts']}, after reading triage's questions and assumptions. Any answers they gave are "
@@ -1517,11 +1724,15 @@ def triage_block(approval: dict | None) -> str:
     if not approval:
         return ""
     assumed = "".join(f"\n- {a}" for a in approval["assumptions"])
+    checks = triage_checks(approval)
+    checks_block = f"### Triage checks\n\n{checks}\n\n" if checks else ""
     if principals.is_person(approval["sent_by"]):
-        return (f"## Sent from the triage board\n\nIts owner sent this ticket from arete's triage board. Triage "
-                f"assumed:{assumed}\n\n") if assumed else ""
+        if not assumed and not checks:
+            return ""
+        return ("## Sent from the triage board\n\nIts owner sent this ticket from arete's triage board."
+                + (f" Triage assumed:{assumed}" if assumed else "") + "\n\n" + checks_block)
     return ("## Approved by triage\n\nArete's triage approved this ticket on its own, so check the choices it made"
-            + (f". It assumed:{assumed}" if assumed else "; the plan below lists them.") + "\n\n")
+            + (f". It assumed:{assumed}" if assumed else "; the plan below lists them.") + "\n\n" + checks_block)
 
 
 def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, str]:
@@ -1624,7 +1835,8 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
         left_for_a_person = left_section(run, (plan.get("left_for_a_person") or "").strip())
         run.save("plan.md", plan_text)
         estimate = int(plan.get("estimated_lines") or 0)
-        goal = plan.get("verify", "").strip() or "The planner gave no steps: check what the issue asks for."
+        goal = triage_goal(plan.get("verify", "").strip() or "The planner gave no steps: check what the issue asks for.",
+                           approval)
         if plan.get("ambiguous") and plan.get("question"):
             run.log("plan: ambiguous, asking the author")
             return _ask(run, ws, checkouts, f"Before I build this I need one answer:\n\n{plan['question']}\n\n"
@@ -1741,8 +1953,8 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
     else:
         run.say(f"PRs for this ticket:\n\n{pr_status_lines(with_prs, opened, pushed)}\n\nCI: {ci_result}."
                 + published_note(draft_why, verified, opened, drafted))
-    automerge(cfg, run, layer, approval, draft_why, opened + ready_pushed(run, pushed, ci_stopped, draft_why),
-              automerge_about(t, build_summary), ticket=t)
+    automerge(b, approval, draft_why, verified, review, opened + ready_pushed(run, pushed, ci_stopped, draft_why),
+              automerge_about(t, build_summary))
     urls = record_prs(run, branch, with_prs)
     release_workspace(run, ws, checkouts)
     return "pr", outcome, urls
@@ -1808,42 +2020,71 @@ def report_body(run: Run, *, summary: str, review: Review, verified: verify.Veri
     ))
 
 
-def automerge(cfg: config.Config, run: Run, layer: config.RepoLayer, approval: dict | None, draft_why: str,
-              opened: list[workspace.Checkout], about: str, *, ticket: tracker.Ticket | None = None) -> None:
-    if draft_why or layer.trust_level != "automerge":
+def automerge(b: Build, approval: dict | None, draft_why: str, verified: verify.Verified, review: Review,
+              opened: list[workspace.Checkout], about: str) -> None:
+    run = b.run
+    if not opened or draft_why or b.layer.trust_level != "automerge" or run.feedback or run.repairs:
         return
-    if (approval and approval["sent_by"] == "triage") or (ticket and intake.AUTO_LABEL in ticket.labels):
-        run.log("automerge left off: triage approved the ticket, so a person merges it")
+    if (approval and approval["sent_by"] == "triage") or intake.AUTO_LABEL in b.ticket.labels:
         run.facts["merge_held"] = "triage approved the ticket, so a person merges it"
+        run.log(f"automerge left off: {run.facts['merge_held']}")
         return
-    try:
-        risk = jev.risk(vault.hidden(patch_from_base(opened)), about, cfg,
-                        trace=(run.id, "automerge risk jev")) if opened and jev.ready(cfg, [run.repo]) else None
-        hold = risk.hold if risk else ""
-    except jev.Unjudged as e:
-        run.log(f"automerge risk: JEV could not judge the diff: {e}")
-        hold = "JEV could not judge the diff"
     for c in opened:
         try:
-            if hold:
-                run.facts["merge_held"] = hold
-                run.log(f"automerge left off on {c.pr}: {hold}")
-                gh.pr_comment(c.pr, public_text(run, f"Automerge stays off for this PR: {hold}. A person merges it."))
-                continue
-            try:
-                did, why = gh.pr_merge_auto(c.github, gh.pr_number(c.pr))
-            except gh.GhError as e:
-                did, why = "left", f"a GitHub call failed: {str(e).rstrip('.')}"
-            if did == "merged":
-                run.log(f"automerged {c.pr}")
-            elif did == "auto":
-                run.log(f"automerge enabled on {c.pr}")
-            else:
-                run.facts["merge_held"] = why
-                run.log(f"automerge left {c.pr} for a person: {why}")
-                gh.pr_comment(c.pr, public_text(run, f"Automerge could not merge this PR: {why}. A person merges it."))
+            hold = merge_hold(b, c, verified, review, about)
+        except gh.GhUnsure:
+            run.facts["merge_held"] = "GitHub did not confirm whether it merged the PR"
+            run.log(f"automerge: {run.facts['merge_held']} at {c.lease}; check {c.pr} before retrying")
+            return
+        except (RuntimeError, OSError, KeyError, TypeError, ValueError) as e:
+            run.log(f"automerge could not establish eligibility: {public_text(run, util.first_line(str(e), 300))}")
+            hold = "the merge gate could not be completed"
+        if not hold:
+            run.log(f"automerged {c.pr} at {c.lease}")
+            continue
+        run.facts["merge_held"] = hold
+        run.log(f"automerge left {c.pr} for a person: {hold}")
+        try:
+            gh.pr_comment(c.pr, public_text(run, f"Automerge stays off for this PR: {hold}. A person merges it."))
         except gh.GhError as e:
-            run.log(f"automerge failed on {c.pr}: {e}")
+            run.log(f"automerge could not report the hold on {c.pr}: {e}")
+
+
+def merge_hold(b: Build, c: workspace.Checkout, verified: verify.Verified, review: Review, about: str) -> str:
+    if len(b.checkouts) != 1:
+        return "a change spanning repositories cannot be merged atomically"
+    if verified.verdict != "pass" or not verified.finished or not verified.checks or verified.failed_checks:
+        return "native behavioral verification did not pass"
+    head = c.lease
+    if not head:
+        return "this run has no published head to verify"
+    tree = git(["rev-parse", f"{head}^{{tree}}"], c.wt).strip()
+    trees = {c.prefix: tree}
+    if not tree or verified.native_trees != trees:
+        return "there is no native behavioral pass for the published tree"
+    if not review.approved() or review.trees != trees:
+        return "the published tree lacks a current approving review"
+    if not b.layer.checks or b.checked.get("tree") != tree or b.checked.get("commands") != b.layer.checks:
+        return "the published tree lacks the full local check result"
+    if not jev.ready(b.cfg, [b.run.repo]):
+        return "JEV risk screening is unavailable"
+    base_sha = git(["rev-parse", c.origin_base], c.wt).strip()
+    if not base_sha or git(["merge-base", base_sha, head], c.wt).strip() != base_sha:
+        return "the checked head does not contain the target base"
+    number = gh.pr_number(c.pr)
+    _, hold = gh.merge_readiness(c.github, number, head, c.base, base_sha, wait=gh.MERGE_WAIT_SECONDS)
+    if hold:
+        return hold
+    patch = checkout_patch(c, [], f"{base_sha}..{head}")
+    if not patch:
+        return "there is no diff to risk screen"
+    try:
+        risk = jev.risk(vault.hidden(patch), vault.hidden(about), b.cfg, trace=(b.run.id, "automerge risk jev"))
+    except jev.Unjudged:
+        return "JEV could not judge the diff"
+    if risk.hold:
+        return risk.hold
+    return gh.pr_merge_auto(c.github, number, head, c.base, base_sha)
 
 
 def nothing_to_build(run: Run, t: tracker.Ticket, ws: Path, checkouts: list[workspace.Checkout], branch: str, summary: str,
@@ -1955,7 +2196,8 @@ def note_prs(run: Run, branch: str, with_prs: list[workspace.Checkout]) -> None:
     record.note(run.id, branch=branch, pr_url=" ".join(c.pr for c in with_prs))
 
 
-def commit_and_push(checkouts: list[workspace.Checkout], changed: list[workspace.Checkout], branch: str, message: str) -> None:
+def commit_and_push(checkouts: list[workspace.Checkout], changed: list[workspace.Checkout], branch: str, message: str,
+                    *, before_push: Callable[[workspace.Checkout], str] | None = None) -> None:
     for c in changed:
         if not git(["diff", "--cached", "--name-only"], c.wt).strip():
             continue
@@ -1971,13 +2213,23 @@ def commit_and_push(checkouts: list[workspace.Checkout], changed: list[workspace
                         "Someone pushed to that branch after this run started. A retry builds on top of their work.")
     pushed: list[workspace.Checkout] = []
     for c in changed:
+        if before_push:
+            head = before_push(c)
+            ref = f"refs/heads/{branch}"
+            argv = ["push", "-q", "--no-follow-tags", "--recurse-submodules=no", f"--force-with-lease={ref}:{c.lease}",
+                    "origin", f"{head}:{ref}"]
+        else:
+            head = ""
+            argv = ["push", "-q", f"--force-with-lease={branch}:{c.lease}", "-u", "origin", branch]
         try:
-            git(["push", "-q", f"--force-with-lease={branch}:{c.lease}", "-u", "origin", branch], c.wt, timeout=600)
+            git(argv, c.wt, timeout=600, retry=not before_push)
         except RuntimeError as e:
             done = ", ".join(p.github for p in pushed) or "nothing"
+            aftermath = ("The pilot will not retry the push." if before_push
+                         else "A retry builds on whatever reached the branch.")
             raise workspace.RunFailed(f"the push to {c.github} failed after arete pushed {done}",
-                            f"{e}\n\nA retry builds on whatever reached the branch.") from e
-        c.lease = git(["rev-parse", "HEAD"], c.wt).strip()
+                                      f"{e}\n\n{aftermath}") from e
+        c.lease = head or git(["rev-parse", "HEAD"], c.wt).strip()
         c.onto = ""
         pushed.append(c)
 
@@ -2647,7 +2899,14 @@ def check_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
 
 def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "verify",
                 require_released: bool = False, **values) -> verify.Verified:
+    from . import pilot, readme_verify, zte
+
     run, v = b.run, verify.with_free_ports(b.layer.verify)
+    tid = str(run.tid)
+    zte_verify = zte.reserved(tid) and prompt_name == role == "verify"
+    readme_task = (pilot.is_pilot_task(tid) and prompt_name == role == "verify") or zte_verify
+    merge_candidate = b.layer.trust_level == "automerge" or readme_task
+    checked_trees = verification_trees(b) if prompt_name == role == "verify" and merge_candidate else {}
     step = b.next_step(step_name)
     if refusal := verify.port_refusal(v):
         run.log(f"{step}: {refusal}")
@@ -2660,6 +2919,22 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
             ready.saved = os.path.abspath(run.dir / f"{step}-preflight.md")
             run.save(f"{step}-preflight.md", ready.markdown())
             return ready
+    if readme_task and not (v.start or v.probes):
+        try:
+            if zte_verify:
+                grant, policy = zte.for_run(run.repo, tid, run.id, "running")
+                signal = policy.signal(grant.base)
+            else:
+                signal = pilot.Signal(**pilot.live_receipt(tid, run.repo.name)["signal"])
+            pilot.require(checked_trees.keys() == {""}, "the README verifier requires one exact candidate tree")
+            verified = readme_verify.check(run, b.ws, step, signal, checked_trees[""])
+            if verified.verdict == "pass":
+                pilot.require(checked_trees == verification_trees(b), "the candidate tree changed during verification")
+                verified.native_trees = checked_trees
+        except pilot.Held as error:
+            verified = verify.Verified("blocked", "The exact README could not be verified.", finished=False,
+                                       blocked_by=str(error))
+        return save_verification(run, step, verified)
     evidence = run_folder(run, "evidence")
     untracked_before = untracked_by_dir(b.git_dirs)
     attempt = None
@@ -2750,11 +3025,23 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
             verified.checks = probes.checks + verified.checks
     if fixture_blocker:
         verified.verdict, verified.blocked_by, verified.finished = "blocked", fixture_blocker, False
+    if (verified.verdict == "pass" and checked_trees and agent_finished and res.runner in {"pi", "codex", "claude"}
+            and checked_trees == verification_trees(b)):
+        verified.native_trees = checked_trees
+    return save_verification(run, step, verified)
+
+
+def save_verification(run: Run, step: str, verified: verify.Verified) -> verify.Verified:
     verified.saved = os.path.abspath(run.dir / f"{step}.md")
     run.save(f"{step}.md", verified.markdown())
     run.log(f"{step}: {verified.verdict}, {len(verified.checks) - len(verified.failed_checks)} of "
             f"{util.count(len(verified.checks), 'check')} passed")
     return verified
+
+
+def verification_trees(b: TicketWork) -> dict[str, str]:
+    trees = {c.prefix: factory.fingerprint(c.wt) for c in b.checkouts}
+    return trees if len(trees) == len(b.checkouts) and all(trees.values()) else {}
 
 
 def surface_note(v: config.Verify, url: str, evidence: Path) -> str:
@@ -3047,6 +3334,15 @@ def retry_scratch(days: float = 30) -> None:
 
 
 def tell_ticket_run_died(cfg: config.Config, row: dict) -> None:
+    from . import zte
+
+    if zte.reserved(str(row["issue"])):
+        try:
+            with run_lines.nonblocking_appends(lambda: None):
+                run_lines.write(row["id"], "error", message="Reserved README run ended without an active child; it will not be retried.")
+        except (OSError, run_lines.AppendRefused):
+            pass
+        return
     repo = cfg.repo(row["repo"])
     run = Run(row["id"], repo, paths.RUNS_DIR / row["id"], tracker=tracker.for_ticket(cfg, repo, str(row["issue"])),
               tid=str(row["issue"]), feedback=pending_feedback(repo.name, str(row["issue"])),

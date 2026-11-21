@@ -4,13 +4,17 @@ import json
 import time
 from contextlib import contextmanager
 from dataclasses import asdict
+from pathlib import Path
 
 from . import (
     codebase,
     delegation,
+    diffguard,
     factory,
     flows,
+    gh,
     owner_asks,
+    pilot,
     pipeline,
     prompt_loader,
     repairs,
@@ -18,6 +22,7 @@ from . import (
     runlimits,
     util,
     workspace,
+    zte,
 )
 from .agent import NO_SESSION, Session, json_from_text
 from .orchestration_api import BUNDLES, PROTOCOL, Catalog, help_text
@@ -28,6 +33,13 @@ from .verify import Verified
 STATE_FIELDS = ("plan_text", "goal", "estimate", "left_for_a_person", "build_summary", "reviews", "fix_reply",
                 "document", "report_body", "draft_why", "summary", "opened", "found", "pushed", "drafted",
                 "ci_stopped", "changed", "ci_result", "committed")
+
+
+def policy_fingerprint(cfg, layer, closed_context):
+    effective = asdict(layer)
+    effective.pop("factory_path")
+    return ledger.digest(json.loads(json.dumps({"layer": effective, "config": asdict(cfg),
+                                                "closed_context": closed_context}, default=str)))
 
 
 class Controller:
@@ -42,6 +54,10 @@ class Controller:
             raise factory.Refused("this controller protocol needs compatible code before it can resume")
         self.policy = pipeline.config.Orchestration(**self.data.get("limits", asdict(
             pipeline.config.load_layer(self.run.repo.layer_dir).orchestration)))
+        self.run.overrides = {**self.data.get("overrides", {}), **self.run.overrides}
+        inherited = self.data.get("step_overrides", {})
+        self.run.step_overrides = {role: {**inherited.get(role, {}), **self.run.step_overrides.get(role, {})}
+                                  for role in inherited.keys() | self.run.step_overrides.keys()}
         self.catalog = None
         self.last_progress, self.ending = time.monotonic(), None
 
@@ -62,12 +78,45 @@ class Controller:
         self.job.take(name, outcome, stored=False)
         return outcome
 
+    def quiescent(self):
+        for turn in ledger.pending(self.lease):
+            launch = turn["response"] or {}
+            if delegation.live(launch.get("pid"), launch.get("identity")):
+                raise factory.Refused("the prior controller inference is still live; no replacement was launched")
+        for action in ledger.actions(self.lease):
+            result = action["result"]
+            if action["state"] == "running" and delegation.live(result.get("pid"), result.get("identity")):
+                raise factory.Refused(f"worker {action['id']} is still live; no replacement was launched")
+
     def prepare(self):
         if self.flow.refusal:
             raise factory.Refused(self.flow.refusal)
+        self.quiescent()
+        if self.run.feedback and (closed := [url for url in self.run.feedback_prs if gh.pr_view(url).get("state") != "OPEN"]):
+            return "noop", f"the PR closed before arete could revise it: {', '.join(closed)}", ""
         self.flow.matching = False
         run_lines.write(self.run.id, "route", continues=self.flow.continues, mode="orchestrated", protocol=PROTOCOL)
         if self.data.get("prepared"):
+            if not {"run_settings", "overrides", "step_overrides"} <= self.data.keys():
+                raise factory.Refused("the saved controller lacks accepted invocation settings; reconcile before resuming")
+            prepared = self.data["prepared"]
+            layer_dir, source_file = Path(prepared["layer"]), None
+            if not layer_dir.exists():
+                for checkout in map(workspace.Checkout.from_row, prepared["checkouts"]):
+                    if layer_dir.is_relative_to(checkout.wt):
+                        source_file = checkout.src / layer_dir.relative_to(checkout.wt) / "config.toml"
+                        break
+            self.job.layer = pipeline.checked_layer(self.job.cfg, layer_dir, source_file=source_file)
+            self.run.cfg, self.run.layer, self.run.kind = self.job.cfg, self.job.layer, prepared["ticket"]["kind"]
+            self.lineage()
+            if any(not (Path(c["wt"]) / ".git").exists() for c in prepared["checkouts"]):
+                if any(Path(c["wt"]).exists() for c in prepared["checkouts"]):
+                    raise factory.Refused("the retained workspace is incomplete; reconcile without discarding its edits")
+                if ledger.publication_pending(self.run.id) or not any(
+                        a["op"] == "publication.request" and a["state"] == "succeeded" for a in ledger.actions(self.lease)):
+                    raise factory.Refused("the missing workspace has no settled publication; reconcile before resuming")
+                if why := self.job.restore({"step": "prepare", "tree": str(self.job.ws), "data": prepared}, layer=self.job.layer):
+                    raise factory.Refused(why)
             self.job.take("prepare", factory.Outcome("pass", data=self.data["prepared"]), stored=True)
             for name, value in self.data.get("job", {}).items():
                 if name in STATE_FIELDS:
@@ -103,26 +152,30 @@ class Controller:
                 self.job.reviews = 1
                 self.job.goal += f"\n\nCheck the saved review findings are fixed:\n{found.review.findings()}"
                 self.job.left_for_a_person = found.left_for_a_person
-        if self.run.feedback and not self.data.get("feedback"):
-            self.data["feedback"] = self.run.feedback
-            feedback = pipeline.feedback_markdown(self.run.feedback)
+        if zte.reserved(str(self.run.tid)):
+            grant, policy = zte.for_run(self.run.repo, str(self.run.tid), self.run.id, "running")
+            zte.check_checkout(grant, policy, self.run.repo, self.job.checkouts)
+            if self.job.left_for_a_person or self.run.feedback or self.run.repairs or self.flow.continues:
+                raise factory.Refused("ZTE does not inherit owner work or previous attempts")
+        self.data.setdefault("goal_base", self.job.goal)
+        known = {(f.get("pr_url"), f.get("kind"), f.get("gh_id")) for f in self.data.get("feedback", [])}
+        fresh = [f for f in self.run.feedback if (f.get("pr_url"), f.get("kind"), f.get("gh_id")) not in known]
+        if fresh:
+            self.data.setdefault("feedback", []).extend(fresh)
+            feedback = pipeline.feedback_markdown(fresh)
             self.run.story.append(feedback)
-            self.job.goal += f"\n\nCheck each change the owner's PR feedback asks for:\n{feedback}"
+            self.data["goal_base"] += f"\n\nCheck each change the owner's PR feedback asks for:\n{feedback}"
             self.job.left_for_a_person = pipeline.left_on_prs(self.run.feedback_prs)
         if self.run.answers_due:
             answer = owner_asks.fresh_note(self.run.answers_due)
             self.run.story.append(answer)
             self.data.setdefault("owner_answers", []).append(answer)
-        self.data.setdefault("goal_base", self.job.goal)
-        self.job.goal = self.data["goal_base"] + "\n" + "\n".join(self.data.get("owner_answers", []))
+        goal = self.data["goal_base"] + "\n" + "\n".join(self.data.get("owner_answers", []))
+        self.job.goal = pipeline.triage_goal(goal, self.job.approval)
+        self.job.triage = pipeline.triage_notes(self.job.approval)
         self.job.b.plan_text, self.job.b.left_for_a_person = self.job.plan_text, self.job.left_for_a_person
-        self.catalog = Catalog(self.job)
-        lineage = {"catalog_sha": self.catalog.fingerprint, "policy_sha": self.policy_sha(),
-                   "controller_prompt": ledger.digest(prompt_loader.template("orchestrate").template),
-                   "controller_settings": ledger.digest(asdict(self.run.settings("orchestrate")))}
-        if any(key in self.data and self.data[key] != value for key, value in lineage.items()):
-            raise factory.Refused("the admitted catalog, controller or policy changed; reconcile before resuming")
-        self.data.update(lineage)
+        self.data.update(self.lineage())
+        self.data["overrides"], self.data["step_overrides"] = self.run.overrides, self.run.step_overrides
         self.data.setdefault("code", codebase.STAMP)
         self.data["recovery_code"] = codebase.STAMP
         self.data["limits"] = asdict(self.policy)
@@ -135,11 +188,18 @@ class Controller:
         self.persist()
         return None
 
+    def lineage(self):
+        self.catalog = Catalog(self.job)
+        found = {"catalog_sha": self.catalog.fingerprint, "policy_sha": self.policy_sha(),
+                 "controller_prompt": ledger.digest(prompt_loader.template("orchestrate").template),
+                 "controller_settings": ledger.digest(asdict(self.run.settings("orchestrate"))),
+                 "run_settings": ledger.digest([self.run.overrides, self.run.step_overrides])}
+        if any(key in self.data and self.data[key] != value for key, value in found.items()):
+            raise factory.Refused("the admitted catalog, controller or policy changed; reconcile before resuming")
+        return found
+
     def policy_sha(self):
-        layer = asdict(self.job.layer)
-        layer.pop("factory_path")
-        return ledger.digest(json.loads(json.dumps({"layer": layer, "config": asdict(self.job.cfg),
-                                                    "closed_context": self.run.closed_context}, default=str)))
+        return policy_fingerprint(self.job.cfg, self.job.layer, self.run.closed_context)
 
     def fingerprint(self):
         prints = {c.github: factory.fingerprint(c.wt) for c in self.job.checkouts}
@@ -159,11 +219,8 @@ class Controller:
                     and found.get("acceptance") == self.data["acceptance"])
 
     def recover(self):
+        self.quiescent()
         for turn in ledger.pending(self.lease):
-            launch = turn["response"] or {}
-            pid, identity = launch.get("pid"), launch.get("identity")
-            if delegation.live(pid, identity):
-                raise factory.Refused("the prior controller inference is still live; no replacement was launched")
             ledger.reject(self.lease, turn["id"], "interrupted controller turn; admitted usage may be unknown")
         for action in ledger.actions(self.lease):
             result = action["result"]
@@ -172,9 +229,6 @@ class Controller:
                 if not answers or any(not answer or answer["status"] not in ("answered", "taken") for answer in answers):
                     raise factory.Refused("owner answers or interrupted question settlement need reconciliation before resuming")
             if action["state"] == "running":
-                pid, identity = result.get("pid"), result.get("identity")
-                if delegation.live(pid, identity):
-                    raise factory.Refused(f"worker {action['id']} is still live; no replacement was launched")
                 state = "reconciliation-required" if action["op"] == "publication.request" else "interrupted"
                 ledger.transition(self.lease, action["id"], state,
                                   {**result, "error": "execution interrupted; usage may be unknown", "usage_unknown": True})
@@ -217,6 +271,7 @@ class Controller:
         return {"version": PROTOCOL, "state_version": snapshot["version"], "cursor": snapshot["version"],
                 "root": self.lease.root,
                 "task": self.catalog.read("task", 0, 8000), "owner_context": self.run.story[-8:],
+                **({"triage": self.job.triage} if self.job.triage else {}),
                 "catalog_sha": self.catalog.fingerprint,
                 "catalog": {kind: self.catalog.list(kind, 0, 10) for kind in ("models", "prompts", "tools", "context")},
                 "actions": [{**{k: a[k] for k in ("id", "op", "state")},
@@ -326,8 +381,13 @@ class Controller:
         goal = args["goal"]
         queued = self.data.setdefault("steering", {}).pop((prior or action)["id"], [])
         goal += "\n" + "\n".join(queued) if queued else ""
+        if name in ("delegate", "investigate") and self.job.triage:
+            contexts = "\n\n".join(filter(None, (self.job.triage, contexts)))
         inputs = {"goal": goal, "context": contexts, "plan": self.job.plan_text, "checks": self.job.checks,
-                  "estimate": self.job.estimate, "verify": self.job.goal, **args["inputs"]}
+                  "denied": prompt_loader.code_list(diffguard.denied_paths(self.job.layer)),
+                  "estimate": self.job.estimate, "verify": self.job.goal, "triage": self.job.triage, **args["inputs"]}
+        if "verify" in args["inputs"] and pipeline.triage_checks(self.job.approval):
+            inputs["verify"] = pipeline.triage_goal(str(inputs["verify"]), self.job.approval)
         prompt = self.job.brief.prompt("delegate" if name in ("delegate", "investigate") else name, **inputs)
         session = NO_SESSION
         previous = (prior or {}).get("result", {})
@@ -415,6 +475,11 @@ class Controller:
         if self.run.dry_run:
             self.ending = flows.end_dry_run(self.flow)
             return {"status": "dry-run"}
+        if zte.reserved(str(self.run.tid)):
+            grant = zte.prepare_candidate(self.run, self.job, self.data)
+            self.ending = ("pr", "Prepared an exact README candidate for engine-owned delivery", "")
+            return {"prepared_head": grant.data["head"], "tree": grant.data["tree"]}
+        self.check_pilot_publication()
         self.data["publication_intent"] = {"tree": self.fingerprint()}
         self.persist()
         outcome = self.atomic("pr", tree=str(self.job.ws))
@@ -434,13 +499,16 @@ class Controller:
             finally:
                 self.job.slot.take(self.run.log, self.run.waiting)
             self.job.ci_result = current.summary()
+            self.check_pilot_publication()
             pipeline.publish_ci(self.run, self.job.ticket, self.job.with_prs, pipeline.ci.section([current], 1))
             if current.reds or not current.all_read:
                 self.data["ci_failed"] = True
                 for checkout in self.job.with_prs:
+                    self.check_pilot_publication()
                     pipeline.set_draft(self.run, checkout, True)
                 return {"ci": self.job.ci_result, "error": "CI needs an explicit worker diagnosis or repair"}
             self.data.pop("ci_failed", None)
+        self.check_pilot_publication()
         self.data["publication_intent"] = {"tree": self.fingerprint(), "phase": "publish"}
         self.persist()
         outcome = self.atomic("publish")
@@ -453,6 +521,20 @@ class Controller:
         self.persist()
         self.ending = flows.ended(self.flow, outcome)
         return outcome.data
+
+    def check_pilot_publication(self):
+        if pilot.is_pilot_task(str(self.run.tid)):
+            try:
+                repo, tid = self.run.repo, str(self.run.tid)
+                receipt = pilot.live_receipt(tid, repo.name)
+                layer = pipeline.config.load_layer(repo.layer_dir)
+                run = pilot.scheduled_run(repo.name, tid)
+                pilot.require(run and run["id"] == self.run.id, "the approved one-shot run changed")
+                pilot.require(layer.factory_path == "orchestrated"
+                              and self.policy_sha() == receipt["policy"] == policy_fingerprint(
+                                  pipeline.config.load(), layer, ()), "the one-shot run changed its admitted policy")
+            except pilot.Held as error:
+                raise runlimits.Parked(str(error)) from error
 
     def perform(self, action):
         args, op = action["request"], action["op"]
@@ -528,6 +610,8 @@ class Controller:
             self.stamp(role, result)
             return {"operation_passed": outcome.passed, **result}
         if op == "owner.ask":
+            if zte.reserved(str(self.run.tid)):
+                raise ValueError("the standing README lane cannot request owner intervention; stop without delivery")
             ask, errors = owner_asks.validate(args["request"])
             if errors:
                 raise ValueError("; ".join(errors))

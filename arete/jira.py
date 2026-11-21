@@ -168,13 +168,25 @@ class Client:
     def comments(self, key: str) -> list[dict]:
         return self._paged(f"/rest/api/2/issue/{_path_segment(key)}/comment", key="comments", orderBy="created")
 
-    def comment(self, key: str, markdown: str) -> None:
+    def find_comment_marker(self, key: str, marker: str) -> str:
+        for row in self.comments(key):
+            if marker in (row.get("body") or "").splitlines():
+                return self.comment_url(key, row["id"])
+        return ""
+
+    def comment_url(self, key: str, comment_id) -> str:
+        return f"{self.browse_url(key)}?focusedCommentId={_path_segment(str(comment_id))}"
+
+    def comment(self, key: str, markdown: str, *, return_url: bool = False,
+                single_attempt: bool = False) -> str | None:
         token, start = uuid.uuid4().hex, util.now()
         path = f"/rest/api/3/issue/{_path_segment(key)}/comment"
         body = {"body": adf.from_markdown(outbound.screen(markdown)), "properties": [{"key": "arete", "value": {"key": token}}]}
         try:
-            self.request("POST", path, body=body)
+            posted = self.request("POST", path, body=body)
         except JiraUnsure:
+            if single_attempt:
+                raise
             try:
                 if not util.wait_for_network():
                     raise JiraUnsure("network unavailable")
@@ -197,11 +209,12 @@ class Client:
                     if not isinstance(prop, dict) or not isinstance(prop.get("value"), dict):
                         raise JiraUnsure("comment property lookup returned no value")
                     if prop["value"].get("key") == token:
-                        return
-                self.request("POST", path, body=body)
+                        return self.comment_url(key, row["id"]) if return_url else None
+                posted = self.request("POST", path, body=body)
             except (JiraError, ValueError, TypeError, KeyError, AttributeError) as e:
                 raise JiraUnsure(f"Jira comment reply was lost; check the ticket before sending again: {e}",
                                  getattr(e, "status", 0)) from e
+        return self.comment_url(key, posted["id"]) if return_url and isinstance(posted, dict) and posted.get("id") else None
 
     def edit_labels(self, key: str, add: list[str] = (), remove: list[str] = ()) -> None:
         ops = [{"add": a} for a in add] + [{"remove": r} for r in remove]

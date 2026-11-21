@@ -121,8 +121,12 @@ def record_feedback(cfg: config.Config, r: dict, urls: list[str], prs: list[dict
 
 
 def sync_outcomes(cfg: config.Config) -> None:
+    from . import zte
+
     seen, fresh = util.read_json(PR_SEEN_FILE, {}), {}
     for r in run_store.runs_reading_pr_comments(util.iso(util.now() - REJECTED_PR_LISTEN)):
+        if zte.reserved(str(r["issue"])):
+            continue
         urls = r["pr_url"].split()
         try:
             prs = [gh.pr_view(url) for url in urls]

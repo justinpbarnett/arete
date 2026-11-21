@@ -136,6 +136,10 @@ def check_run(run_id, base_version=None, *, public=False):
 
 
 def activate_grace():
+    with reader() as c:
+        saved = c.execute("SELECT value FROM schema_meta WHERE key = 'versioned_api_grace_deadline'").fetchone()[0]
+    if saved:
+        return saved
     with tx() as c:
         deadline = util.iso(util.now() + timedelta(days=30))
         c.execute("UPDATE schema_meta SET value = ? WHERE key = 'versioned_api_grace_deadline' AND value = ''",

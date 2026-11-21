@@ -429,16 +429,20 @@ def rejection(e: Exception, rotating: bool) -> str:
     return reason
 
 
-def survey() -> View:
+def survey(*, check=lambda: None) -> View:
     try:
+        check()
         with authority_fd() as fd:
+            check()
             listing = os.listdir(fd)
             try:
+                check()
                 key = read_secret(fd)
             except FileNotFoundError:
                 key = None
             good, unreadable = [], []
             for name in sorted(n for n in listing if n.endswith(".json")):
+                check()
                 path = str(sandbox.AUTHORITY / name)
                 if key is None:
                     unreadable.append(claimed(path, "no signing secret", inspected(fd, name), key, name))
@@ -448,10 +452,12 @@ def survey() -> View:
                 except FileNotFoundError:
                     continue
                 except (OSError, ValueError, KeyError, TypeError) as e:
+                    check()
                     unreadable.append(claimed(path, rejection(e, NEXT_SECRET in listing), inspected(fd, name),
                                               key, name))
             return View(good, unreadable, False)
     except FileNotFoundError:
+        check()
         if os.path.lexists(sandbox.AUTHORITY):
             raise
         return View([], [], True)
@@ -467,17 +473,31 @@ def alive(u: Unreadable) -> bool:
     return True
 
 
-def holds(view: View, workspace: Path) -> list:
+def holds(view: View, workspace: Path, *, check=lambda: None) -> list:
+    check()
     ws = workspace.resolve()
-    found = [d for d in view.good if d["state"] != "done" and overlap(Path(d["attempt"]["workspace"]), ws)]
-    return found + [u for u in view.unreadable
-                    if not u.workspace or (overlap(Path(u.workspace), ws) and alive(u))]
+    found = []
+    for document in view.good:
+        check()
+        if document["state"] != "done" and overlap(Path(document["attempt"]["workspace"]), ws):
+            found.append(document)
+    for unreadable in view.unreadable:
+        check()
+        if unreadable.workspace:
+            if not overlap(Path(unreadable.workspace), ws):
+                continue
+            check()
+            if not alive(unreadable):
+                continue
+        found.append(unreadable)
+    return found
 
 
-def pending(workspace: Path) -> bool:
+def pending(workspace: Path, *, check=lambda: None) -> bool:
     try:
-        return bool(holds(survey(), workspace))
+        return bool(holds(survey(check=check), workspace, check=check))
     except (OSError, ValueError, KeyError, TypeError):
+        check()
         return os.path.lexists(sandbox.AUTHORITY)
 
 

@@ -16,10 +16,18 @@ def lookup(actor, key):
         return dict(row) if row else None
 
 
-def claim(context, seq):
+def claim(context, seq, pending=b""):
     with tx() as c:
         c.execute("INSERT INTO idempotency (actor,key,route,request_sha,status,response,first_seq,at,via) "
-                  "VALUES (?,?,?,?,0,?,?,?,?)", (*context, b"", seq, util.iso(), events.provenance()))
+                  "VALUES (?,?,?,?,0,?,?,?,?)", (*context, pending, seq, util.iso(), events.provenance()))
+
+
+def update_pending(context, pending):
+    with tx() as c:
+        changed = c.execute("UPDATE idempotency SET response = ? WHERE actor = ? AND key = ? "
+                            "AND route = ? AND request_sha = ? AND status = 0", (pending, *context)).rowcount
+        if not changed:
+            raise RuntimeError("publication claim is no longer pending")
 
 
 def complete(context, status, payload, seq):

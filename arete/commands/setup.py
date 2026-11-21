@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sys
 
-from .. import __version__, config, paths
+from .. import __version__, config, paths, routing, steps
 from ..store import db as foundation
 from ..store import runs as run_store
 from .common import (
@@ -94,8 +94,12 @@ def cmd_status(args) -> int:
         print("arete status --json RUN_ID prints one run's steps", file=sys.stderr)
         return 2
     cfg, problem = config.load_or_problem()
-    views = control.loop_views(cfg)
-    snap = board.snapshot(recent_runs=args.limit)
+    try:
+        views = control.loop_views(cfg)
+        snap = board.snapshot(recent_runs=args.limit)
+    except foundation.NoDatabase as e:
+        print(e, file=sys.stderr)
+        return 1
     print(f"arete {__version__}  config {paths.CONFIG_FILE}")
     if problem:
         print(f"config does not load: {problem}")
@@ -120,8 +124,32 @@ def cmd_status(args) -> int:
     show(snap["triage"], "triage", print_triage)
     pipeline_repos = [f"{r.name} ({r.tracker})" for r in cfg.repos if r.pipeline]
     print(f"pipeline repos: {', '.join(pipeline_repos) or 'none'}")
+    print_delivery(cfg)
     show(snap["live"], "the live runs", print_live)
     return 0
+
+
+def print_delivery(cfg: config.Config) -> None:
+    repos = [repo for repo in cfg.repos if repo.pipeline]
+    if not repos:
+        return
+    print("delivery configuration (availability not checked):")
+    for repo in repos:
+        try:
+            layer = config.load_layer(repo.layer_dir)
+            steps.check(cfg, layer)
+            detail = layer.factory_path
+            if layer.factory_path == "orchestrated":
+                setting = steps.resolve(cfg, layer, "orchestrate")
+                provider = setting.provider or routing.identity(setting.runner, setting.model)[0]
+                model = setting.model or "(runner default)"
+                qualified = model if "/" in model else f"{provider}/{model}"
+                detail += (f"; controller runner={setting.runner} model={qualified}"
+                           f" effort={setting.effort_on(setting.runner) or 'default'}")
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError) as error:
+            detail = (f"configuration problem ({type(error).__name__}); "
+                      f"check {paths.short_path(repo.layer_dir / 'config.toml')}")
+        print(f"  {repo.name}: {detail}")
 
 
 def status_lines(run_id: str) -> int:

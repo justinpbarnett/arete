@@ -133,24 +133,28 @@ def recovery_lookup(lookup):
         raise GhUnsure(f"GitHub reply was lost; could not reconcile the write: {e}") from e
 
 
-def comment_key(path: str, key: str, start) -> bool:
+def comment_key(path: str, key: str, start):
     query = urlencode({"since": util.iso(start - timedelta(seconds=60)), "per_page": 100})
     pages = gh_json(["api", f"{path}?{query}", "--paginate", "--slurp"])
     if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
         raise GhUnsure("GitHub comment lookup returned no list")
-    return any(key_mark(key) in (row.get("body") or "") for page in pages for row in page)
+    return next((row for page in pages for row in page if key_mark(key) in (row.get("body") or "")), None)
 
 
-def keyed_comment(args: list[str], body: str, path: str, mark: bool = False, envelope: bool = False) -> None:
+def keyed_comment(args: list[str], body: str, path: str, mark: bool = False, envelope: bool = False,
+                  *, single_attempt: bool = False) -> str:
     key, start = uuid.uuid4().hex, util.now()
     payload = outgoing(body, mark=mark, key=key)
     if envelope:
         payload = Outgoing(json.dumps({"body": payload}))
     try:
-        gh(args, input=payload, write=True)
+        return gh(args, input=payload, write=True).strip()
     except GhUnsure:
-        if not recovery_lookup(lambda: comment_key(path, key, start)):
-            gh(args, input=payload, write=True)
+        if single_attempt:
+            raise
+        if found := recovery_lookup(lambda: comment_key(path, key, start)):
+            return found.get("html_url", "")
+        return gh(args, input=payload, write=True).strip()
 
 
 def split_link(body: str, links) -> tuple[str, str]:
@@ -168,7 +172,7 @@ def split_link(body: str, links) -> tuple[str, str]:
     return "", body
 
 
-def issue_create(repo: str, title: str, body: str, labels: Sequence[str] = ()) -> int:
+def issue_create(repo: str, title: str, body: str, labels: Sequence[str] = (), *, single_attempt: bool = False) -> int:
     key = uuid.uuid4().hex
     args = ["issue", "create", "--repo", repo, "--title", outbound.screen(title), "--body-file", "-"]
     for lb in labels:
@@ -177,6 +181,9 @@ def issue_create(repo: str, title: str, body: str, labels: Sequence[str] = ()) -
     try:
         reply = gh(args, input=payload, write=True)
     except GhUnsure:
+        if single_attempt:
+            raise
+
         def find():
             rows = gh_json(["issue", "list", "--repo", repo, "--state", "all", "--limit", "20", "--json", "number,body"])
             if not isinstance(rows, list):
@@ -198,9 +205,37 @@ def issue_url(repo: str, number: int | str) -> str:
     return f"https://github.com/{repo}/issues/{number}"
 
 
-def issue_comment(repo: str, number: int, body: str) -> None:
-    keyed_comment(["issue", "comment", str(number), "--repo", repo, "--body-file", "-"], body,
-                  f"repos/{repo}/issues/{number}/comments")
+def publication_url(path: str, marker: str, **query) -> str:
+    query = urlencode({"per_page": 100, **query})
+    pages = gh_json(["api", f"{path}?{query}", "--paginate", "--slurp"])
+    if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+        raise GhError("GitHub publication lookup returned no list")
+    for page in pages:
+        for row in page:
+            if "pull_request" not in row and marker in (row.get("body") or "").splitlines():
+                if not row.get("html_url"):
+                    raise GhError("GitHub publication lookup returned no URL")
+                return row["html_url"]
+    return ""
+
+
+def find_issue_marker(repo: str, marker: str) -> str:
+    return publication_url(f"repos/{repo}/issues", marker, state="all")
+
+
+def find_issue_comment_marker(repo: str, number: int, marker: str) -> str:
+    return publication_url(f"repos/{repo}/issues/{number}/comments", marker)
+
+
+def find_pr_marker(repo: str, branch: str, marker: str) -> str:
+    return publication_url(f"repos/{repo}/pulls", marker, state="all", head=f"{repo.split('/')[0]}:{branch}")
+
+
+def issue_comment(repo: str, number: int, body: str, *, return_url: bool = False,
+                  single_attempt: bool = False) -> str | None:
+    url = keyed_comment(["issue", "comment", str(number), "--repo", repo, "--body-file", "-"], body,
+                        f"repos/{repo}/issues/{number}/comments", single_attempt=single_attempt)
+    return url if return_url else None
 
 
 def issue_close(repo: str, number: int, comment: str = "") -> None:
@@ -252,7 +287,7 @@ def issue_reopen(repo: str, number: int) -> None:
 
 
 def pr_create(repo: str, head: str, base: str, title: str, body: str, labels: Sequence[str] = (),
-              draft: bool = False, cwd=None, link: str = "") -> str:
+              draft: bool = False, cwd=None, link: str = "", *, single_attempt: bool = False) -> str:
     args = ["pr", "create", "--repo", repo, "--head", head, "--base", base, "--title", outbound.screen(title),
             "--body-file", "-"]
     for lb in labels:
@@ -262,7 +297,7 @@ def pr_create(repo: str, head: str, base: str, title: str, body: str, labels: Se
     try:
         return gh(args, cwd=cwd, input=outgoing(body, link), write=True).strip().splitlines()[-1]
     except GhError as e:
-        if not isinstance(e, GhUnsure) and "already exists" not in str(e).lower():
+        if single_attempt or (not isinstance(e, GhUnsure) and "already exists" not in str(e).lower()):
             raise
         url = recovery_lookup(lambda: open_pr_url(repo, head)) if isinstance(e, GhUnsure) else open_pr_url(repo, head)
         if url:
@@ -426,71 +461,68 @@ def pr_draft_and_head(url: str) -> tuple[bool, str]:
     return bool(row.get("isDraft")), str(row.get("headRefOid") or "")
 
 
-MERGE_NOW = {"CLEAN", "HAS_HOOKS", "UNSTABLE"}
-MERGE_LATER = {"BLOCKED", "BEHIND"}
 MERGE_WAIT_SECONDS = 120
 MERGE_POLL_SECONDS = 5
 
 
-def merge_action(state: str, mergeable: str, auto_allowed: bool) -> str:
-    state, mergeable = (state or "UNKNOWN").upper(), (mergeable or "UNKNOWN").upper()
-    if "UNKNOWN" in (state, mergeable):
-        return "wait"
-    if mergeable == "CONFLICTING":
-        return "leave"
-    if state in MERGE_NOW:
-        return "merge"
-    if state in MERGE_LATER and auto_allowed:
-        return "auto"
-    return "leave"
+def merge_ci_passed(repo: str, head: str, *, required: dict | None = None) -> bool:
+    path = f"repos/{repo}/commits/{head}"
+    checks = gh_json(["api", f"{path}/check-runs?filter=latest&per_page=100", "--paginate", "--slurp"])
+    statuses = gh_json(["api", f"{path}/statuses?per_page=100", "--paginate", "--slurp"])
+    if (not isinstance(checks, list) or not checks
+            or any(not isinstance(page, dict) or not isinstance(page.get("check_runs"), list) for page in checks)
+            or not isinstance(statuses, list) or not statuses):
+        return False
+    runs = [row for page in checks for row in page["check_runs"]]
+    if required and not any(row.get("head_sha") == head and row.get("name") == required["context"]
+                            and row.get("app", {}).get("id") == required["app_id"] for row in runs):
+        return False
+    contexts = {}
+    for page in statuses:
+        if not isinstance(page, list):
+            return False
+        for row in page:
+            contexts.setdefault(row["context"], row["state"])
+    return (bool(runs or contexts) and all(row["status"] == "completed" and row["conclusion"] == "success"
+                                           for row in runs) and all(state == "success" for state in contexts.values()))
 
 
-def leave_reason(state: str, mergeable: str, auto_allowed: bool) -> str:
-    if mergeable == "CONFLICTING" or state == "DIRTY":
-        return "it conflicts with the base branch"
-    if state == "DRAFT":
-        return "it is a draft"
-    if state == "BLOCKED" and not auto_allowed:
-        return "GitHub blocks the merge until a required review or check passes, and the repo has auto merge off"
-    if state == "BEHIND" and not auto_allowed:
-        return "it is behind the base branch, and the repo has auto merge off"
-    return f"GitHub reports merge state {state}, mergeable {mergeable}"
-
-
-def pr_merge_state(repo: str, number: int) -> tuple[str, str]:
-    row = gh_json(["pr", "view", str(number), "--repo", repo, "--json", "mergeStateStatus,mergeable"]) or {}
-    return (row.get("mergeStateStatus") or "UNKNOWN").upper(), (row.get("mergeable") or "UNKNOWN").upper()
-
-
-def squash_subject(repo: str, number: int) -> list[str]:
-    title = ((gh_json(["pr", "view", str(number), "--repo", repo, "--json", "title"]) or {}).get("title") or "").strip()
-    return ["--subject", f"{title} (#{number})"] if title else []
-
-
-def repo_allows_auto_merge(repo: str) -> bool:
-    return bool((gh_json(["api", f"repos/{repo}"]) or {}).get("allow_auto_merge"))
-
-
-def pr_merge_auto(repo: str, number: int, wait: float = MERGE_WAIT_SECONDS,
-                  poll: float = MERGE_POLL_SECONDS) -> tuple[str, str]:
-    auto_allowed = repo_allows_auto_merge(repo)
+def merge_readiness(repo: str, number: int, head: str, base: str, base_sha: str, *, wait: float = 0,
+                    required: dict | None = None) -> tuple[str, str]:
+    if not head or not base or not base_sha:
+        return "", "the checked head and base are not known"
     deadline = time.monotonic() + wait
+    fields = "state,isDraft,headRefOid,baseRefName,baseRefOid,mergeStateStatus,mergeable,title"
     while True:
-        state, mergeable = pr_merge_state(repo, number)
-        action = merge_action(state, mergeable, auto_allowed)
-        if action != "wait" or time.monotonic() >= deadline:
+        row = gh_json(["pr", "view", str(number), "--repo", repo, "--json", fields]) or {}
+        if row.get("state") != "OPEN" or row.get("isDraft") is not False:
+            return "", "the PR is not open and ready for review"
+        if row.get("headRefOid") != head:
+            return "", "the PR head changed after verification"
+        if row.get("baseRefName") != base or row.get("baseRefOid") != base_sha:
+            return "", "the PR base changed after verification"
+        state, mergeable = row.get("mergeStateStatus"), row.get("mergeable")
+        remaining = deadline - time.monotonic()
+        if "UNKNOWN" not in (state, mergeable) or remaining <= 0:
             break
-        time.sleep(max(0.0, min(poll, deadline - time.monotonic())))
-    if action == "merge":
-        gh(["pr", "merge", str(number), "--repo", repo, "--squash", "--delete-branch", *squash_subject(repo, number)])
-        return "merged", ""
-    if action == "auto":
-        gh(["pr", "merge", str(number), "--repo", repo, "--squash", "--auto", "--delete-branch",
-            *squash_subject(repo, number)])
-        return "auto", ""
-    if action == "wait":
-        return "left", f"GitHub still reported the merge state as unknown after {wait:g} seconds"
-    return "left", leave_reason(state, mergeable, auto_allowed)
+        time.sleep(min(MERGE_POLL_SECONDS, remaining))
+    if state != "CLEAN" or mergeable != "MERGEABLE":
+        return "", f"GitHub reports merge state {state}, mergeable {mergeable}"
+    if not merge_ci_passed(repo, head, required=required):
+        return "", "GitHub has no fully passing CI result for the verified head"
+    return str(row.get("title") or "").strip(), ""
+
+
+def pr_merge_auto(repo: str, number: int, head: str, base: str, base_sha: str) -> str:
+    subject, hold = merge_readiness(repo, number, head, base, base_sha)
+    if hold:
+        return hold
+    payload = {"sha": head, "merge_method": "squash"}
+    if subject:
+        payload["commit_title"] = f"{subject} (#{number})"
+    result = json.loads(gh(["api", "-X", "PUT", f"repos/{repo}/pulls/{number}/merge", "--input", "-"],
+                           input=Outgoing(json.dumps(payload)), write=True) or "{}")
+    return "" if result.get("merged") is True else "GitHub did not confirm the merge"
 
 
 def default_branch(repo: str) -> str:
@@ -504,13 +536,13 @@ def base64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 
 
-def key_signature(app: config.GithubApp, signing_input: bytes) -> bytes:
+def key_signature(app: config.GithubApp, signing_input: bytes, *, timeout: float = 30) -> bytes:
     failed = f"openssl could not sign with [github_app] private_key {paths.short_path(app.private_key)}"
     if paths.ISOLATED and paths.confined(app.private_key) is None:
         raise GhError("isolated arete uses no key of this machine; put the [github_app] private_key in the scratch folder")
     try:
         res = subprocess.run(["openssl", "dgst", "-sha256", "-sign", str(app.private_key)], input=signing_input,
-                             capture_output=True, timeout=30, check=False)
+                             capture_output=True, timeout=timeout, check=False)
     except (OSError, subprocess.SubprocessError) as e:
         raise GhError(f"{failed}: {e}") from None
     if res.returncode != 0:
@@ -518,11 +550,11 @@ def key_signature(app: config.GithubApp, signing_input: bytes) -> bytes:
     return res.stdout
 
 
-def app_jwt(app: config.GithubApp) -> str:
+def app_jwt(app: config.GithubApp, *, timeout: float = 30) -> str:
     now = int(time.time())
     signed = ".".join(base64url(json.dumps(part, separators=(",", ":")).encode()) for part in (
         {"alg": "RS256", "typ": "JWT"}, {"iat": now - 60, "exp": now + 540, "iss": app.app_id}))
-    return f"{signed}.{base64url(key_signature(app, signed.encode()))}"
+    return f"{signed}.{base64url(key_signature(app, signed.encode(), timeout=timeout))}"
 
 
 def clone_token(app: config.GithubApp, repo: str) -> str:

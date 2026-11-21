@@ -7,14 +7,14 @@ import { dispatch, actions, runContext, runPageContext, repairThisRun, step as r
 import { register } from "./ui-palette.js";
 import { notice } from "./ui-notice.js";
 import { parse } from "./ui-router.js";
+import { runHash as hashOf, taskHash } from "./ui-data.js";
 
 const html = htm.bind(h);
 export const GROUPS = ["Running", "Waiting on you", "Fault", "Done"];
 const GLYPHS = { Running: "▷", "Waiting on you": "◆", Fault: "×", Done: "✓" };
 const FAULTS = ["failed", "interrupted", "stopped"];
 const STEP_STATES = { running: "▷ RUNNING", pass: "✓ PASS", fail: "× FAIL", ask: "◆ ASK", stop: "■ STOP", interrupted: "■ INTERRUPTED" };
-const hashOf = (id) => `#run/${encodeURIComponent(id)}`;
-const taskHash = (ticket) => `#task/${encodeURIComponent(ticket)}`;
+const taskOf = (run) => run?.issue && taskHash(run.issue, run.repo);
 const safeLink = (url) => /^https?:\/\//i.test(String(url ?? "")) ? url : "";
 
 export const groupOf = (status) => status === "running" ? "Running" : status === "needs-info" ? "Waiting on you"
@@ -182,7 +182,7 @@ function Head({ view, now }) {
   return html`<header class="run-head">
     <div class="run-head-line"><span class=${`run-state ${group === "Fault" ? "fault" : ""}`} data-state-word>${wordOf(run.status)}</span>
       <span class="run-id mono">${run.id}</span>
-      ${run.ticket ? html`<a class="run-task" href=${taskHash(run.ticket)}>${run.ticket}</a>` : null}
+      ${taskOf(run) ? html`<a class="run-task" href=${taskOf(run)}>${run.ticket || run.issue}</a>` : null}
       ${run.status === "running" ? html`<span class="run-live" aria-label="Live">● LIVE</span>` : null}</div>
     <h2 class="run-summary">${run.summary || run.id}</h2>
     <p class="run-meta mono"><span>step ${steps} of ${steps}</span><span>${duration(elapsed(run, now))}</span><span>${money(run.paid)}</span>
@@ -219,10 +219,10 @@ export class RunFocus extends Component {
     const run = this.props.view.detail?.run;
     const url = safeLink(run?.pr_url);
     if (url) window.open(url, "_blank", "noopener,noreferrer");
-    else if (run?.ticket) location.hash = taskHash(run.ticket);
+    else if (taskOf(run)) location.hash = taskOf(run);
     else notice.value = "Nothing to open for this run";
   };
-  openTask = () => { const ticket = this.props.view.detail?.run?.ticket; if (ticket) location.hash = taskHash(ticket); };
+  openTask = () => { const href = taskOf(this.props.view.detail?.run); if (href) location.hash = href; };
   actionOf = () => {
     const run = this.props.view.detail?.run;
     if (!run) return null;
@@ -277,7 +277,7 @@ export class RunFocus extends Component {
         ${group === "Fault" ? html`<span class="strip-text">× ${fault || wordOf(run.status)}</span>` : null}
         ${group === "Waiting on you" ? html`<span class="strip-text">◆ waits on ${run.ticket || run.id}</span>` : null}
         <span class="strip-actions">
-          ${group === "Waiting on you" && run.ticket ? html`<button type="button" data-act="open-task" onClick=${this.openTask}><kbd class="cap">gx</kbd> Open task</button>` : null}
+          ${group === "Waiting on you" && taskOf(run) ? html`<button type="button" data-act="open-task" onClick=${this.openTask}><kbd class="cap">gx</kbd> Open task</button>` : null}
           ${context?.run.retry ? html`<button type="button" data-act="retry-run" onClick=${() => dispatch(context.run.retry, context)}><kbd class="cap">⇧r</kbd> Retry</button>` : null}
           ${run.status === "running" ? html`<button type="button" data-act="stop-run" disabled=${Boolean(run.stop_asked)} onClick=${() => dispatch(actions.stop, context)}><kbd class="cap">dd</kbd> ${run.stop_asked ? "Stopping" : "Stop the run"}</button>` : null}
         </span>

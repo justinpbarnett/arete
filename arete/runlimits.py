@@ -183,8 +183,11 @@ idle_waits = budget_legacy.idle_waits
 
 
 class Budget:
-    def __init__(self, run, policy: Policy, previous: str, ticket=None, forced: bool = False) -> None:
-        self.run, self.policy = run, policy
+    def __init__(self, run, policy: Policy, previous: str, ticket=None, forced: bool = False,
+                 *, wall_deadline: float = math.inf, checkpoint_timeout: float | None = None,
+                 checkpoint_gate=None) -> None:
+        self.run, self.policy, self.wall_deadline = run, policy, wall_deadline
+        self.checkpoint_timeout, self.checkpoint_gate = checkpoint_timeout, checkpoint_gate
         chain = family(previous)
         rows = {rid: run_store.run_get(rid) for rid in chain}
         if any(row is None or (row["repo"], str(row["issue"])) != (run.repo.name, str(run.tid))
@@ -251,6 +254,8 @@ class Budget:
 
     def checkpoint(self) -> None:
         with self.lock:
+            if self.checkpoint_gate is not None and not self.checkpoint_gate():
+                return
             now, at = time.monotonic(), util.iso()
             opened = now - self.idle_since if self.idle_since is not None else 0
             active = max(0, now - self.started - self.idled - opened)
@@ -260,7 +265,7 @@ class Budget:
                 "specification": self.specification, **self.left_out_waits(now)}
             compatibility = getattr(self, "compatibility", True)
             try:
-                with foundation.tx() as conn:
+                with foundation.tx(timeout=self.checkpoint_timeout) as conn:
                     compatibility = not contracted(conn)
                     self.compatibility = compatibility
                     run_store.checkpoint(self.run.id, active, self.current_verification_seconds,
@@ -283,7 +288,7 @@ class Budget:
                                                   for cause in IDLE_WAITS}}
 
     def run_deadline(self) -> float:
-        return math.inf if self.idle_since is not None else self.deadline
+        return min(self.wall_deadline, math.inf if self.idle_since is not None else self.deadline)
 
     def capture(self, ticket) -> None:
         self.specification = specification(ticket)
@@ -292,6 +297,8 @@ class Budget:
     def reason(self) -> str:
         if self.verify_deadline is not None and self.verify_deadline <= self.run_deadline():
             return f"verification reached its cumulative {self.policy.max_verify_minutes:g} minute budget"
+        if self.run_deadline() == self.wall_deadline and not math.isinf(self.wall_deadline):
+            return "the one-shot pilot authorization expired"
         return f"the run chain reached its cumulative {self.policy.max_run_minutes:g} minute budget"
 
     def arm(self) -> None:
@@ -304,11 +311,13 @@ class Budget:
         signal.setitimer(signal.ITIMER_REAL, max(0.001, deadline - time.monotonic()))
 
     @contextmanager
-    def watching(self):
+    def watching(self, *, admit=None, work_admitted=None, periodic: bool = True):
         def expire(*_):
             raise Parked(self.reason())
 
-        if self.deadline <= time.monotonic():
+        if admit:
+            admit()
+        if self.run_deadline() <= time.monotonic():
             raise Parked(self.reason())
         previous = signal.signal(signal.SIGALRM, expire)
         previous_timer = signal.getitimer(signal.ITIMER_REAL)
@@ -317,11 +326,15 @@ class Budget:
 
         def checkpointing():
             while not stopped.wait(CHECKPOINT_SECONDS):
-                self.checkpoint()
+                if work_admitted is None or work_admitted():
+                    self.checkpoint()
 
-        worker = threading.Thread(target=checkpointing, name=f"budget-{self.run.id}", daemon=True)
+        worker = threading.Thread(target=checkpointing, name=f"budget-{self.run.id}", daemon=True) if periodic else None
         try:
-            worker.start()
+            if admit:
+                admit()
+            if worker is not None:
+                worker.start()
             self.arm()
             yield
         finally:
@@ -329,9 +342,10 @@ class Budget:
             signal.setitimer(signal.ITIMER_REAL, *previous_timer)
             signal.signal(signal.SIGALRM, previous)
             stopped.set()
-            if worker.ident is not None:
+            if worker is not None and worker.ident is not None:
                 worker.join()
-            self.checkpoint()
+            if work_admitted is None or work_admitted():
+                self.checkpoint()
 
     @contextmanager
     def idling(self, cause: str):
