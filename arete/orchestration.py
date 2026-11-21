@@ -251,7 +251,10 @@ class Controller:
                 prs = self.job.with_prs
                 for checkout in prs:
                     checkout.resumes = True
-                if pipeline.merge_moved_bases(self.run, prs, self.job.layer, self.job.ticket):
+                merged = pipeline.merge_moved_bases(self.run, prs, self.job.layer, self.job.ticket, allow_untracked=True)
+                if merged:
+                    for checkout in merged:
+                        self.job.b.worker_trees.pop(checkout.github, None)
                     workspace.note_made(self.job.ws, self.job.checkouts)
                 self.job.b.workspace = self.job.workspace
         if old_lineage:
