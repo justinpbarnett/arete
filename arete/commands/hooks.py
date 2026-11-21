@@ -151,7 +151,21 @@ def cmd_guard(args) -> int:
 
     scratch.HOOK.update(root=args.scratch, id=args.scratch_id, saves=args.scratch_saves)
     guard.LOGIN_FOLDERS = (*guard.LOGIN_FOLDERS, *(paths.expand(path) for path in getattr(args, "closed", ())))
-    return guard.main(args.judge, args.open)
+    return run_guard(args, guard.main, args.judge, args.open)
+
+
+def run_guard(args, call, *argv) -> int:
+    from .. import guard_settings
+
+    raw = getattr(args, "judge_settings", "")
+    try:
+        cfg = guard_settings.decode(raw) if raw else None
+    except (ValueError, TypeError, RecursionError):
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                                 "permissionDecisionReason": "Arete could not read the guard settings"}}))
+        return 0
+    with config.using_settings(cfg):
+        return call(*argv)
 
 
 def cmd_upload_guard(args) -> int:
@@ -170,11 +184,18 @@ def scratch_hook(p) -> None:
     p.add_argument("--scratch-saves", default="", help="must match the authenticated evidence destination")
 
 
+def guard_options(p) -> None:
+    p.add_argument("--judge", action="store_true")
+    p.add_argument("--judge-settings", default="", help="JEV settings accepted by the launching run")
+    p.add_argument("--open", action="append", default=[])
+    scratch_hook(p)
+
+
 def cmd_codex_guard(args) -> int:
     from .. import codex, routing, scratch
 
     scratch.HOOK.update(root=args.scratch, id=args.scratch_id, saves=args.scratch_saves)
-    return codex.guard_main(args.judge, routing.NO_GIT_WRITES, args.open)
+    return run_guard(args, codex.guard_main, args.judge, routing.NO_GIT_WRITES, args.open)
 
 
 def cmd_mcp_ask(args) -> int:
@@ -215,10 +236,8 @@ def register(sub) -> None:
     p = sub.add_parser("guard", help="PreToolUse hook for arete's agents: enforces the directory floor and secret rules; "
                                      "with --judge, "
                                      "stops shell commands git cannot undo (reads a payload on stdin)")
-    p.add_argument("--judge", action="store_true")
-    p.add_argument("--open", action="append", default=[])
+    guard_options(p)
     p.add_argument("--closed", action="append", default=[], help="add a protected grading-context folder")
-    scratch_hook(p)
     p.set_defaults(fn=cmd_guard)
 
     p = sub.add_parser("upload-guard", help="PreToolUse hook for the verifier's browser_file_upload: allows only files "
@@ -227,9 +246,7 @@ def register(sub) -> None:
 
     p = sub.add_parser("codex-guard", help="PreToolUse hook for arete's codex agents: enforces the directory floor, "
                                            "git write and secret rules; with --judge, asks JEV (reads a payload on stdin)")
-    p.add_argument("--judge", action="store_true")
-    p.add_argument("--open", action="append", default=[])
-    scratch_hook(p)
+    guard_options(p)
     p.set_defaults(fn=cmd_codex_guard)
 
     p = sub.add_parser("mcp-ask", help="stdio MCP server that gives arete's agents the ask_owner tool; with --check, "

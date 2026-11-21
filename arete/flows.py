@@ -134,7 +134,7 @@ def guard(job: Job, continues: str) -> str:
     job.branch = branch
     try:
         checkouts = [workspace.Checkout.from_row(e) for e in listed]
-        layer = pipeline.checked_layer(job.cfg, Path(data["layer"]))
+        layer = pipeline.checked_layer(job.cfg, Path(data["layer"]), pinned=saved_layer(data))
         if held := workspace.scratch_held(job.ws, checkouts):
             error = workspace.scratch_failure(
                 f"verification scratch at {held[0]} is still held; poll finalizes it once its holders end, "
@@ -171,6 +171,20 @@ def prepared_data(continues: str) -> dict:
         return prepared
     prepared = factory.passed_data(factory.history(factory.chain(continues)), "prepare")
     return prepared[-1] if prepared else classic_hold(continues).get("prepared", {})
+
+
+def saved_layer(prepared: dict) -> config.RepoLayer | None:
+    from . import delegation
+
+    if "layer_settings" not in prepared:
+        return None
+    try:
+        layer = json.loads(prepared["layer_settings"], object_hook=delegation.unpack_settings)
+        if isinstance(layer, config.RepoLayer) and layer.dir == Path(prepared["layer"]):
+            return layer
+    except (ValueError, TypeError, KeyError, RecursionError):
+        pass
+    raise workspace.RunFailed("the saved repository layer is invalid; reconcile before resuming")
 
 
 def classic_hold(run_id: str) -> dict:
@@ -211,7 +225,8 @@ def environment_checkouts(repo: config.Repo, ws: Path, data: dict, heads: dict[s
         raise workspace.RunFailed("the saved workspace does not match the published draft")
     if left := workspace.scratch_held(ws, checkouts):
         raise workspace.scratch_failure(f"verification scratch at {left[0]} is still held", ws, left)
-    if why := workspace.kept_work(ws, checkouts, repo.path, config.load_layer(repo.layer_dir).copy, commits=False):
+    layer = saved_layer(data) or repo.configured_layer()
+    if why := workspace.kept_work(ws, checkouts, repo.path, layer.copy, commits=False):
         raise workspace.RunFailed(why)
     branch = data["branch"]
     for c in checkouts:
@@ -252,7 +267,8 @@ def restore_environment_workspace(job: Job, data: dict, heads: dict[str, str]) -
         workspace.fetch(c.src, c.base)
     try:
         pipeline.merge_moved_bases(job.run, job.checkouts, job.layer, job.ticket, environment_retry=True)
-        job.use_layer(pipeline.resolve_layer(job.cfg, job.run, job.ws))
+        if "layer_settings" not in data:
+            job.use_layer(pipeline.resolve_layer(job.cfg, job.run, job.ws))
         if why := pipeline.furnish(job.cfg, job.run, job.layer, job.ws):
             raise workspace.RunFailed(why)
         for c in job.checkouts:
@@ -429,7 +445,8 @@ def rebuild(job: Job, line: dict, *, layer: config.RepoLayer | None = None, setu
             return why
     ws = Path(line["tree"])
     admitted = layer is not None
-    layer = layer or pipeline.checked_layer(job.cfg, Path(line["data"]["layer"]) if setup else job.run.repo.layer_dir)
+    layer = layer or saved_layer(line["data"]) or pipeline.checked_layer(
+        job.cfg, Path(line["data"]["layer"]) if setup else job.run.repo.layer_dir)
     try:
         workspace.clear_workspace(ws, made, job.run.repo.path, layer.copy)
     except workspace.RunFailed as e:
@@ -447,7 +464,7 @@ def rebuild(job: Job, line: dict, *, layer: config.RepoLayer | None = None, setu
     job.run.log(f"made {ws} again from origin/{branch}")
     if not setup:
         return ""
-    if admitted and layer != pipeline.checked_layer(job.cfg, layer.dir):
+    if admitted and "layer_settings" not in line["data"] and layer != pipeline.checked_layer(job.cfg, layer.dir):
         return "the restored repository layer changed; reconcile before setup"
     return pipeline.furnish(job.cfg, job.run, layer, ws)
 
@@ -501,6 +518,7 @@ class Job:
     moved_base: str = ""
     patch_mode: bool = False
     prepared_feedback_prs: list[str] = field(default_factory=list)
+    worker_settings: bytes = b""
 
     @property
     def held_reason(self) -> str:
@@ -783,7 +801,10 @@ class Job:
         for c in self.checkouts:
             if str(c.wt) in self.restored:
                 c.lease = self.restored[str(c.wt)]
-        self.use_layer(pipeline.checked_layer(self.cfg, Path(data["layer"])))
+        layer_dir = Path(data["layer"])
+        layer = run.layer if run.layer is not None and run.layer.dir == layer_dir else None
+        self.use_layer(layer or pipeline.checked_layer(self.cfg, layer_dir,
+                                                       pinned=saved_layer(data) or run.repo.pinned_layer))
         run.add_dirs += [d for d in map(Path, data["add_dirs"]) if d not in run.add_dirs]
         if stored and not run.workspace:
             if held := workspace.scratch_held(self.ws, self.checkouts):
@@ -879,7 +900,7 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
         run.log(f"images: saved {util.count(len(images.paths), 'image')} from {run.ref}")
     if images.left_out:
         run.log(f"images: left out {', '.join(images.left_out)}")
-    main_layer = pipeline.checked_layer(cfg, repo.layer_dir)
+    main_layer = pipeline.checked_layer(cfg, repo.layer_dir, pinned=repo.pinned_layer)
     branch = (run.preview_branch or mended.get("branch") or pipeline.open_branch(run)
               or prompt_loader.fill_template(main_layer.branch, config.RepoLayer.branch, kind=t.kind, id=t.id,
                                         slug=prompt_loader.slug(t.title)))
@@ -903,6 +924,7 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
     for c in checkouts:
         c.revision = util.git(["rev-parse", "HEAD"], c.wt).strip()
     layer = pipeline.resolve_layer(cfg, run, job.ws)
+    run.layer = layer
     if why := pipeline.furnish(cfg, run, layer, job.ws):
         return end_as("fail", "failed", why=why)
     workspace.note_made(job.ws, checkouts, pipeline.workspace_owner(run, job.ws, checkouts))

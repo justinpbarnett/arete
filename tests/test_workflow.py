@@ -1982,15 +1982,17 @@ class BaseMergeDiffLimitTests(unittest.TestCase):
 
 
 class MovedBasePublicationFixture:
-    def controller(self):
+    def controller(self, *, data=None, continues=""):
         root = Path(".")
         checkout = workspace.Checkout("", "fixture/repo", root, root, "main",
                                       pr="https://github.com/fixture/repo/pull/7", lease="head")
-        controller = orchestration.Controller.__new__(orchestration.Controller)
+        repo = config.Repo("repo", root, layer=root / "fixture-layer",
+                           parts=[config.Part(checkout.dir, checkout.github)])
         run = mock.Mock(id="fixture-run", path="orchestrate", dry_run=False, alone=False, tid="7",
-                        repo=SimpleNamespace(name="repo", parts=[checkout], public=False), catch_up_preserved=set(),
+                        repo=repo, catch_up_preserved=set(),
                         waiting=mock.Mock(return_value=nullcontext()), feedback=[], repairs="", facts={},
-                        action="", environment_release="", owner_questions_blocked=False)
+                        action="", environment_release="", owner_questions_blocked=False,
+                        overrides={}, step_overrides={})
         job = mock.Mock(run=run, only="", checkouts=[checkout], with_prs=[checkout],
                         picked=mock.Mock(side_effect=lambda names: [checkout] if names else []),
                         verified=verify.Verified("pass"), review=Review("approve", trees={"": "head-tree"}),
@@ -1999,11 +2001,14 @@ class MovedBasePublicationFixture:
         job.ticket = SimpleNamespace(labels=[], title="Edit fixture")
         job.b = mock.Mock(run=run, layer=SimpleNamespace(trust_level="automerge"), ticket=job.ticket,
                           checked={}, report="", staged=None, catch_ups=0)
-        controller.run, controller.job = run, job
-        controller.flow = SimpleNamespace(ctx=job, refusal="", continues="")
-        controller.data = {"mode": "orchestrate", "evidence": {"checks": {"result": {"full": True}}}}
-        controller.workers = {}
-        controller.executing, controller.lease, controller.ending = "d0001-0", "fixture-lease", None
+        flow = SimpleNamespace(ctx=job, refusal="", continues=continues)
+        if data is None:
+            data = {"protocol": orchestration.PROTOCOL, "mode": run.path,
+                    "evidence": {"checks": {"result": {"full": True}}}}
+        with (mock.patch.object(ledger, "acquire", return_value="fixture-lease"),
+              mock.patch.object(ledger, "snapshot", return_value={"data": data})):
+            controller = orchestration.Controller(flow)
+        controller.executing = "d0001-0"
         controller.current = mock.Mock(return_value=True)
         controller.fingerprint = mock.Mock(return_value="tree")
         controller.persist = mock.Mock()
@@ -2195,9 +2200,7 @@ class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
         for initial, tree in (("new-head", "new-tree"), ("head", "new-tree"), ("unrelated-head", "new-tree"),
                               ("head", "different-tree")):
             with self.subTest(pr_head=initial, tree=tree):
-                resumed, _ = self.controller()
-                resumed.flow.continues = first.run.id
-                resumed.data = json.loads(saved)
+                resumed, _ = self.controller(data=json.loads(saved), continues=first.run.id)
                 resumed.job = resumed.flow.ctx = flows.Job(config.Config(), resumed.run, root, built=resumed.job.b)
                 resumed.run.add_dirs, resumed.run.story, resumed.run.workspace = [], [], None
                 resumed.run.settings.return_value = SimpleNamespace(chain=[])
@@ -2233,8 +2236,8 @@ class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
                       mock.patch.multiple(resumed, lineage=mock.Mock(side_effect=lineage),
                                           write_lineage_event=mock.DEFAULT, quiescent=mock.DEFAULT, stamp=mock.DEFAULT),
                       mock.patch.object(orchestration.run_lines, "write"),
-                      mock.patch.multiple(pipeline, checked_layer=mock.Mock(return_value=SimpleNamespace(
-                          checks={"local": "check"})), check_script=mock.Mock(return_value=([], [])), note_prs=mock.DEFAULT,
+                      mock.patch.multiple(pipeline, checked_layer=mock.Mock(return_value=config.RepoLayer(
+                          root, checks={"local": "check"})), check_script=mock.Mock(return_value=([], [])), note_prs=mock.DEFAULT,
                                           publish_gate_evidence=mock.DEFAULT),
                       mock.patch.object(resumed, "publication_ci", side_effect=ci_gate) as watched,
                       mock.patch.object(pipeline, "catch_up_base") as merge,

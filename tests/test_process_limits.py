@@ -2,12 +2,18 @@ import contextlib
 import io
 import json
 import os
+import shlex
 import shutil
+import socket
 import sqlite3
+import subprocess
 import tempfile
+import time
+import tomllib
 import unittest
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
 from string import Template
 from types import SimpleNamespace
@@ -15,20 +21,27 @@ from unittest.mock import Mock, patch
 
 from adws import feature
 from arete import (
+    accounts,
+    claude,
     codebase,
+    codex,
     config,
     dbstats,
     delegation,
     diffguard,
+    devices,
     environment_gaps,
     factory,
     flows,
     gh,
+    guard,
+    jev,
     jira,
     launch_lease,
     orchestration,
     outcomes,
     paths,
+    pi,
     pipeline,
     poll,
     principals,
@@ -37,6 +50,7 @@ from arete import (
     repairs,
     run_lines,
     runlimits,
+    runner,
     sandbox,
     scratch,
     steps,
@@ -660,6 +674,328 @@ class OrchestrationLineageTests(Isolated):
                         self.assertEqual((row["status"], row["run_id"]), ("new", None))
                     self.assertEqual(insights_store.feedback_due(self.repo.name, "2026-01-01T00:10:00Z"),
                                      [] if launched else [self.ticket])
+
+
+class RunSettingsFixture(Isolated):
+    def setUp(self):
+        super().setUp()
+        self.layer_dir = self.root / "layer"
+        self.layer_dir.mkdir()
+        self.enterContext(patch.object(paths, "RUNS_DIR", paths.STATE_DIR / "runs"))
+        self.enterContext(patch.object(paths, "ISOLATED", False))
+        self.enterContext(patch.dict(os.environ, {
+            "ARETE_CONFIG_DIR": str(paths.CONFIG_DIR), "ARETE_STATE_DIR": str(paths.STATE_DIR),
+            "ARETE_LOG_DIR": str(paths.LOG_DIR), "ARETE_WORKTREES_DIR": str(paths.WORKTREES_DIR),
+            "ARETE_VERIFY_SCRATCH": "", "ARETE_REPLAY_DIR": "",
+            "SNAPSHOT_ORIGINAL": "fixture", "SNAPSHOT_EDITED": "fixture",
+        }))
+        self.enterContext(patch.object(pipeline, "workspace_note", return_value="Fixture workspace"))
+
+    def write_settings(self, name, risk, *, checked_in=False):
+        answers = self.root / name
+        answers.mkdir()
+        (answers / "worker.json").write_text(json.dumps({"text": f"{name} global settings"}))
+        paths.CONFIG_FILE.write_text(f"""[jev]
+risk_hold = {risk}
+[replay]
+all = true
+dir = '{answers}'
+[[repo]]
+name = '{self.repo.name}'
+path = '{self.repo.path}'
+tracker = 'local'
+""" + ("" if checked_in else f"layer = '{self.layer_dir}'\n"))
+        self.write_layer(self.repo.layer_dir if checked_in else self.layer_dir, name)
+
+    def write_layer(self, directory, name):
+        directory.mkdir(exist_ok=True)
+        (directory / "voice.md").write_text("Fixture voice\n")
+        (directory / "config.toml").write_text(
+            f"[checks]\nbehavior = 'echo {name} layer'\n[environment]\npass = ['SNAPSHOT_{name.upper()}']\n"
+            "[document]\nvoice = ['voice.md']\n")
+
+    def controller(self, previous=""):
+        cfg = config.load()
+        repo = cfg.repo(self.repo.name)
+        run_id = record.start("pipeline", repo=repo.name, issue=self.ticket, dry_run=1)
+        directory = paths.RUNS_DIR / run_id
+        directory.mkdir(parents=True)
+        source = tracker.for_ticket(cfg, repo, self.ticket)
+        run = pipeline.Run(run_id, repo, directory, dry_run=True, tracker=source, tid=self.ticket, path="orchestrate")
+        controller = orchestration.Controller(flows.start(cfg, run, {}, continues=previous))
+        self.addCleanup(controller.close)
+        return controller
+
+    def accept_worker(self, controller):
+        lease = controller.lease
+        turn = ledger.begin(lease, {}, controller.policy.max_decisions)
+        version = ledger.snapshot(lease)["version"]
+        route = "model:plan:0"
+        calls = [{"op": "worker.start", "args": {
+            "route_id": route, "effort": controller.catalog.entries[route]["efforts"][0],
+            "prompt_id": "plan", "goal": "Read the fixture", "tool_bundle": "read",
+        }}]
+        decision = {"version": PROTOCOL, "decision_id": turn, "state_version": version,
+                    "rationale": "Read the fixture", "calls": calls}
+        accepted = controller.catalog.validate(decision, turn, version, {})
+        action, = ledger.accept(lease, turn, version, accepted, controller.policy.max_actions)
+        return action
+
+    def launch_worker(self, controller, action):
+        self.assertIsNone(controller.dispatch(action))
+        deadline = time.monotonic() + 4
+        while controller.workers and time.monotonic() < deadline:
+            controller.collect()
+            if controller.workers:
+                time.sleep(0.01)
+        self.assertFalse(controller.workers, "worker did not settle")
+        result, = ledger.actions(controller.lease)
+        return result
+
+    def mock_worktree(self, fetched_layer=None):
+        def make(run, base, branch, ws, copies):
+            ws.mkdir(exist_ok=True)
+            if fetched_layer is not None:
+                shutil.copytree(fetched_layer, ws / ".agents")
+            return []
+
+        self.enterContext(patch.object(flows, "local_workspace", side_effect=make))
+
+
+class RunSettingsSnapshotTests(RunSettingsFixture):
+    def test_live_run_keeps_its_settings_and_next_run_reads_edits(self):
+        self.mock_worktree()
+        self.write_settings("original", 0.5)
+        controller = self.controller()
+
+        self.write_settings("edited", 0.7)
+        self.assertIsNone(controller.prepare())
+        controller.run.launch_gate = Mock(return_value=None)
+        result = self.launch_worker(controller, self.accept_worker(controller))
+        self.assertEqual(result["state"], "succeeded", result["result"])
+        self.assertEqual(result["result"]["text"], "original global settings")
+        launched = controller.run.launch_gate.call_args.args[2]
+        self.assertIn("SNAPSHOT_ORIGINAL", launched["env"])
+        self.assertNotIn("SNAPSHOT_EDITED", launched["env"])
+        self.assertEqual(controller.run.config.jev.risk_hold, 0.5)
+        self.assertIn("`echo original layer`", flows.report(controller.job, "", {}, ""))
+
+        newer = self.controller()
+        self.assertIsNone(newer.prepare())
+        self.assertEqual(newer.run.config.jev.risk_hold, 0.7)
+        self.assertEqual(newer.run.config.replay.dir, self.root / "edited")
+        self.assertIn("`echo edited layer`", flows.report(newer.job, "", {}, ""))
+
+
+class WorkerSnapshotRefusalTests(RunSettingsFixture):
+    def test_worker_refuses_a_snapshot_with_a_different_accepted_layer(self):
+        self.mock_worktree()
+        self.write_settings("original", 0.5)
+        controller = self.controller()
+        self.assertIsNone(controller.prepare())
+        action = self.accept_worker(controller)
+        changed_layer = replace(controller.job.layer, checks={"behavior": "echo changed layer"})
+        controller.job.worker_settings = delegation.snapshot_settings(replace(controller.job, layer=changed_layer))
+
+        result = self.launch_worker(controller, action)
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["result"]["error"], "PolicyChanged: worker policy changed after action acceptance")
+        self.assertFalse(controller.run.step_started)
+
+
+class CheckedInLayerSnapshotTests(RunSettingsFixture):
+    def test_prepare_keeps_checked_in_layer_when_origin_changes(self):
+        self.write_settings("original", 0.5, checked_in=True)
+        controller = self.controller()
+
+        fetched_layer = self.root / "fetched-layer"
+        self.write_layer(fetched_layer, "edited")
+        self.mock_worktree(fetched_layer)
+        self.assertIsNone(controller.prepare())
+        worktree_layer = controller.job.ws / ".agents"
+        self.assertIn("echo edited layer", (worktree_layer / "config.toml").read_text())
+        self.assertEqual(controller.job.layer.dir, worktree_layer)
+        self.assertEqual(controller.job.layer.document["voice"], (str(worktree_layer / "voice.md"),))
+        controller.run.launch_gate = Mock(return_value=None)
+        result = self.launch_worker(controller, self.accept_worker(controller))
+        self.assertEqual(result["state"], "succeeded", result["result"])
+        env = controller.run.launch_gate.call_args.args[2]["env"]
+        self.assertIn("SNAPSHOT_ORIGINAL", env)
+        self.assertNotIn("SNAPSHOT_EDITED", env)
+        self.assertIn("`echo original layer`", flows.report(controller.job, "", {}, ""))
+
+
+class UpstreamLayerSettingsTests(RunSettingsFixture):
+    def test_uses_upstream_at_startup_and_keeps_it_through_prepare(self):
+        self.write_settings("original", 0.5, checked_in=True)
+        source = self.repo.path
+        origin = self.root / "origin"
+        util.git(["init", "-q", "-b", "main", "--template="], source)
+        self.commit_layer(source, "Source")
+        util.git(["clone", "-q", str(source), str(origin)], self.root)
+        util.git(["remote", "add", "origin", str(origin)], source)
+
+        upstream = origin / ".agents"
+        self.write_layer(upstream, "edited")
+        (upstream / "config.toml").write_text((upstream / "config.toml").read_text().replace("voice.md", "new-voice.md"))
+        (upstream / "new-voice.md").write_text("Upstream voice\n")
+        self.commit_layer(origin, "Before startup")
+        controller = self.controller()
+        self.assertEqual(controller.run.repo.configured_layer().checks["behavior"], "echo edited layer")
+        self.assertIn("echo original layer", (source / ".agents" / "config.toml").read_text())
+
+        self.write_layer(upstream, "later")
+        self.commit_layer(origin, "After startup")
+        self.mock_worktree(upstream)
+        self.assertIsNone(controller.prepare())
+        worktree_layer = controller.job.ws / ".agents"
+        self.assertIn("echo later layer", (worktree_layer / "config.toml").read_text())
+        self.assertEqual(controller.job.layer.document["voice"], (str(worktree_layer / "new-voice.md"),))
+        self.assertIn("`echo edited layer`", flows.report(controller.job, "", {}, ""))
+
+    def commit_layer(self, checkout, message):
+        util.git(["add", "-f", ".agents"], checkout)
+        util.git([*util.ARETE_IDENTITY, "commit", "-qm", message], checkout)
+
+
+class PreparedLayerResumeTests(RunSettingsFixture):
+    def test_resume_reuses_the_accepted_layer_when_the_worktree_differs(self):
+        self.write_settings("original", 0.5, checked_in=True)
+        controller = self.controller()
+        edited = self.root / "fetched-layer"
+        self.write_layer(edited, "edited")
+        self.mock_worktree(edited)
+        self.assertIsNone(controller.prepare())
+        worktree_layer = controller.job.ws / ".agents"
+        self.assertIn("echo edited layer", (worktree_layer / "config.toml").read_text())
+        self.assertEqual(controller.job.layer.checks["behavior"], "echo original layer")
+        record.move(controller.run.id, "interrupted", ("running",))
+
+        resumed = self.controller(controller.run.id)
+        self.assertIsNone(resumed.prepare())
+        self.assertEqual(resumed.job.layer, controller.job.layer)
+        self.assertEqual(resumed.data["policy_sha"], controller.data["policy_sha"])
+        self.assertIn("`echo original layer`", flows.report(resumed.job, "", {}, ""))
+
+
+class NativeGuardSettingsFixture:
+    def check_hook(self, module, blocked, refusal):
+        with tempfile.TemporaryDirectory(prefix="arete-guard-settings-") as directory:
+            root = Path(directory).resolve()
+            cwd = root / "repo"
+            cwd.mkdir()
+            settings = root / "config" / "config.toml"
+            settings.parent.mkdir()
+            self.enterContext(patch.object(paths, "CONFIG_FILE", settings))
+            self.enterContext(patch.object(paths, "ISOLATED", False))
+            self.enterContext(patch.dict(os.environ, {"ARETE_CONFIG_DIR": str(settings.parent),
+                                                      "ARETE_STATE_DIR": str(root / "state")}))
+            settings.write_text("[jev]\nguard = true\nirreversible_hold = 0.5\n")
+            cfg = config.load()
+            job = SimpleNamespace(cfg=cfg, layer=config.RepoLayer(root),
+                                  run=SimpleNamespace(repo=config.Repo("fixture", root)))
+            raw = delegation.snapshot_settings(job)
+            settings.write_text("[jev]\nguard = true\nirreversible_hold = 0.7\n")
+            accepted, layer, _ = delegation.load_settings(raw, sha256(raw).hexdigest())
+            trip = runner.Trip(accepted, None, devices.LOCAL, None, Session(), None, None, layer=layer)
+
+            candidate = SimpleNamespace(runner=module.__name__.split(".")[-1], effort="", instructions=())
+            auth = accounts.Auth("api_key")
+            picked = runner.Picked(candidate, auth, None, "fixture", "", set(), None)
+            kw = runner.launch_kwargs({"tools": ["Bash"], "allowed_tools": ["Bash"], "persist": False},
+                                      picked, trip, ("", ""), False, Mock(), cwd=cwd)
+            command = self.hook_command(module, cwd, kw, auth)
+            shell_tool = "Bash" if module is claude else "shell"
+            self.assertIn("git cannot undo (p 0.60)", self.hook_decision(command, cwd, shell_tool, "echo fixture"))
+            self.assertIn(refusal, self.hook_decision(command, cwd, shell_tool, blocked))
+            self.assertEqual(config.load().jev.irreversible_hold, 0.7)
+
+    def hook_command(self, module, root, kw, auth):
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        if module is claude:
+            with patch.object(claude.child, "stream", return_value=completed) as launch:
+                claude.run("Fixture", root, model="fixture", auth=auth, **kw)
+            argv = launch.call_args.args[0]
+            return json.loads(argv[argv.index("--settings") + 1])["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        with (patch.object(codex, "launch", return_value=completed) as launch,
+              patch.object(codex, "isolation_problem", return_value=""), patch.object(codex, "home", return_value=root)):
+            codex.run("Fixture", root, model="fixture", auth=auth, **kw)
+        setting = next(arg for arg in launch.call_args.args[0] if arg.startswith("hooks.PreToolUse="))
+        return tomllib.loads(setting)["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+
+    def hook_decision(self, command, cwd, tool, bash):
+        argv = shlex.split(command)
+        entrypoint = argv.index("-c") + 1
+        setup = ("from arete import jev; jev.key = lambda *a: 'fixture'; "
+                 "jev.ask = lambda *a, **kw: jev.Reply({'effect': jev.Answer('irreversible', 0.6, "
+                 "{'irreversible': 0.6})}); ")
+        at = argv[entrypoint].index("from arete.cli")
+        argv[entrypoint] = argv[entrypoint][:at] + setup + argv[entrypoint][at:]
+        payload = {"tool_name": tool, "tool_input": {"command": bash}, "cwd": str(cwd)}
+        proc = subprocess.run(argv, input=json.dumps(payload), capture_output=True, text=True, timeout=2, cwd=cwd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        result = json.loads(proc.stdout)["hookSpecificOutput"]
+        self.assertEqual(result["permissionDecision"], "deny")
+        return result["permissionDecisionReason"]
+
+
+class ClaudeGuardSettingsTests(NativeGuardSettingsFixture, unittest.TestCase):
+    def test_hook_uses_accepted_jev_settings_and_enforces_the_floor(self):
+        self.check_hook(claude, "cat ../state/other-run.txt", "outside the agent's reach")
+
+
+class CodexGuardSettingsTests(NativeGuardSettingsFixture, unittest.TestCase):
+    def test_hook_uses_accepted_jev_settings_and_refuses_git_writes(self):
+        self.check_hook(codex, "git add fixture.txt", "git add")
+
+
+class PiShellSettingsTests(unittest.TestCase):
+    def test_pi_shell_judges_with_accepted_settings_and_enforces_the_floor(self):
+        with tempfile.TemporaryDirectory(prefix="arete-pi-settings-") as directory:
+            root = Path(directory).resolve()
+            settings = root / "config.toml"
+            self.enterContext(patch.object(paths, "CONFIG_FILE", settings))
+            self.enterContext(patch.object(paths, "ISOLATED", False))
+            settings.write_text("[jev]\nguard = true\nirreversible_hold = 0.5\n")
+            cfg = config.load()
+            job = SimpleNamespace(cfg=cfg, layer=config.RepoLayer(root),
+                                  run=SimpleNamespace(repo=config.Repo("fixture", root)))
+            raw = delegation.snapshot_settings(job)
+            settings.write_text("[jev]\nguard = true\nirreversible_hold = 0.7\n")
+            accepted, layer, _ = delegation.load_settings(raw, sha256(raw).hexdigest())
+
+            auth = accounts.Auth("api_key")
+            selected = pi.Route("fixture", "fixture/model", auth, owner=root / "owner", view=root)
+            candidate = SimpleNamespace(runner="pi", effort="", instructions=())
+            picked = runner.Picked(candidate, auth, selected, selected.model, "", set(), None)
+            trip = runner.Trip(accepted, None, devices.LOCAL, None, Session(), None, None, layer=layer)
+            kw = runner.launch_kwargs({"tools": ["Bash"], "allowed_tools": ["Bash"], "persist": False,
+                                       "closed_context": [root / "closed"]},
+                                      picked, trip, ("", ""), True, Mock(), cwd=root)
+            replies = []
+
+            def stream(command, cwd, env, *args, pass_fds):
+                with socket.socket(fileno=os.dup(int(env["ARETE_PI_SHELL_FD"]))) as terminal:
+                    terminal.settimeout(1)
+                    with terminal.makefile("rb") as source:
+                        for bash in ("echo fixture", "cat closed/fixture.txt"):
+                            terminal.sendall(json.dumps({"command": bash}).encode() + b"\n")
+                            replies.append(json.loads(source.readline()))
+                return None, ""
+
+            answer = jev.Answer("irreversible", 0.6, {"irreversible": 0.6})
+            with (patch.object(jev, "key", return_value="fixture"),
+                  patch.object(jev, "ask", return_value=jev.Reply({"effect": answer})) as ask,
+                  patch.object(guard, "note"), patch.object(sandbox, "can_confine", return_value=True),
+                  patch.object(pi, "confinement", return_value=[]), patch.object(pi, "stream", side_effect=stream),
+                  patch.object(pi, "parse", return_value=Result(ok=True)), patch.object(scratch, "spawn") as spawn):
+                self.assertTrue(pi.run("Fixture", root, model=selected.model, auth=auth, **kw).ok)
+                self.assertIn("JEV reads it as a step git cannot undo (p 0.60)", replies[0]["error"])
+                self.assertIn("outside the agent's reach", replies[1]["error"])
+                ask.assert_called_once()
+                self.assertIs(ask.call_args.args[2], accepted)
+                spawn.assert_not_called()
+            self.assertEqual(config.load().jev.irreversible_hold, 0.7)
 
 
 class OrchestrationWaitTests(Isolated):
@@ -2043,7 +2379,7 @@ class OrchestratedFeedbackAnswerTests(PrAnswerFixture):
             self.add_issue_reply(issue_reply)
         expected = issue_reply or comment
 
-        def decide(run, turn, request):
+        def decide(run, turn, request, _snapshot):
             self.assertIn(f"Answer: {expected}", request["prompt"])
             for body in comments:
                 self.assertIn(body, request["prompt"])
@@ -2435,7 +2771,7 @@ class DeniedWorkerEditsTests(unittest.TestCase):
     def worker(self, edit, prompt_id="delegate"):
         controller = self.controller
 
-        def launch(run, action, request):
+        def launch(run, action, request, _snapshot):
             expected = prompt_loader.code_list(diffguard.denied_paths(self.layer))
             self.assertIn(f"Denied paths: {expected}.", request["prompt"].splitlines())
             if prompt_id == "delegate":

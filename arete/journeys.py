@@ -4,6 +4,7 @@ import os
 import re
 import stat
 import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,20 +22,25 @@ class Journey:
     driver: str = ""
 
 
-def linked_map(value: str, source_dir: Path) -> dict:
+def linked_map(value: str, source_dir: Path, read_file: Callable[[str], bytes | None] | None = None) -> dict:
     path = Path(value)
     target = source_dir.resolve() / path
     if (path.is_absolute() or path.suffix != ".toml" or ".." in path.parts or ".git" in path.parts
             or sandbox.secret_path(target)):
         raise ValueError("[verify] feature_map must name a local TOML file inside the layer directory")
     try:
-        with paths.directory_fd(target.parent) as parent:
-            fd = os.open(target.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
-        with os.fdopen(fd, "rb") as source:
-            info = os.fstat(source.fileno())
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-                raise ValueError("expected a regular file with one link")
-            data = source.read(MAX_MAP_BYTES + 1)
+        if read_file:
+            data = read_file(path.as_posix())
+            if data is None:
+                raise ValueError("expected a regular tracked file")
+        else:
+            with paths.directory_fd(target.parent) as parent:
+                fd = os.open(target.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+            with os.fdopen(fd, "rb") as source:
+                info = os.fstat(source.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise ValueError("expected a regular file with one link")
+                data = source.read(MAX_MAP_BYTES + 1)
         if len(data) > MAX_MAP_BYTES:
             raise ValueError(f"exceeds {MAX_MAP_BYTES} bytes")
         return tomllib.loads(data.decode())
@@ -42,8 +48,9 @@ def linked_map(value: str, source_dir: Path) -> dict:
         raise ValueError(f"[verify] cannot read feature_map {value!r}: {error}") from error
 
 
-def load(value, source_dir: Path, bindings: dict[str, str]) -> dict[str, Journey]:
-    entries = linked_map(value, source_dir) if isinstance(value, str) else value
+def load(value, source_dir: Path, bindings: dict[str, str], *,
+         read_file: Callable[[str], bytes | None] | None = None) -> dict[str, Journey]:
+    entries = linked_map(value, source_dir, read_file) if isinstance(value, str) else value
     if not isinstance(entries, dict):
         raise ValueError("[verify] feature_map must be a table or a relative TOML filename")
     journeys = {}

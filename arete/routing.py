@@ -381,7 +381,7 @@ def request_for(cfg: config.Config, repo: config.Repo | None, which: str, name: 
 
 def layer_of(repo: config.Repo | None):
     try:
-        return config.load_layer(repo.layer_dir) if repo else None
+        return repo.configured_layer() if repo else None
     except (ValueError, OSError):
         return None
 
@@ -413,7 +413,7 @@ def budget_blocked(found: list[Candidate]) -> bool:
 
 def modes_for(cfg: config.Config, repo: config.Repo | None) -> tuple[str, ...]:
     try:
-        return config.allowed_payment_modes(cfg, config.load_layer(repo.layer_dir) if repo else None)
+        return config.allowed_payment_modes(cfg, repo.configured_layer() if repo else None)
     except (ValueError, TypeError, OSError):
         return ()
 
@@ -421,7 +421,7 @@ def modes_for(cfg: config.Config, repo: config.Repo | None) -> tuple[str, ...]:
 def paid_for(cfg: config.Config, repo: config.Repo | None,
              layer: config.RepoLayer | None = None) -> config.PaidRoutes:
     try:
-        return config.allowed_paid_routes(cfg, layer or (config.load_layer(repo.layer_dir) if repo else None))
+        return config.allowed_paid_routes(cfg, layer or (repo.configured_layer() if repo else None))
     except (ValueError, TypeError, OSError):
         return cfg.paid
 

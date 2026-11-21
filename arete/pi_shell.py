@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from . import environment, paths, sandbox, scratch, util
+from . import config, environment, paths, sandbox, scratch, util
 
 if TYPE_CHECKING:
     from . import guard
@@ -91,6 +91,7 @@ class Shell:
     judge: bool
     deadline: float
     read_roots: tuple[Path, ...] = ()
+    guard_config: config.Config | None = None
 
     def __post_init__(self):
         writable = (self.cwd, *self.add_dirs, *map(Path, sandbox.WRITABLE_ALWAYS), sandbox.AGENT_DIR,
@@ -164,9 +165,10 @@ class Shell:
             raise ValueError("command is outside this step's Bash permissions; patterned grants need one simple command")
         if why := codex.git_write(command, list(self.denied)):
             raise ValueError(f"Arete owns publication and git mutation: {why}")
-        if why := guard.decide({"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(self.cwd)},
-                               self.judge, self.floor):
-            raise ValueError(why)
+        with config.using_settings(self.guard_config):
+            if why := guard.decide({"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(self.cwd)},
+                                   self.judge, self.floor):
+                raise ValueError(why)
         until = min(self.deadline, time.monotonic() + timeout)
         if stopped.is_set() or until <= time.monotonic():
             raise ValueError("shell invocation stopped or its deadline expired")

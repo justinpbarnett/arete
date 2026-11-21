@@ -10,14 +10,24 @@ import sys
 import threading
 import time
 from dataclasses import MISSING, asdict, fields, is_dataclass
+from datetime import date, datetime, time as time_of_day
+from hashlib import sha256
 from math import inf
 from pathlib import Path
 
-from . import child, codebase, config, paths, pipeline, record, routing, scratch, util
+from . import child, codebase, config, journeys, paths, pipeline, record, routing, scratch, util
 from .agent import NO_SESSION, Session
 from .store.orchestration import digest
 
 MAX_MESSAGE = 2 * 1024 * 1024
+SETTINGS_TAG = "$type"
+SETTINGS_TYPES = {cls.__name__: cls for cls in (
+    config.Config, config.RepoLayer, config.Part, config.Repo, config.Job, config.Probe, config.JiraConfig,
+    config.TriageConfig, config.JevConfig, config.GithubApp, config.ReplayConfig, config.Environment,
+    config.PaidRoutes, config.AskConfig, config.Retention, config.BackupConfig, config.ChatConfig,
+    config.OncallConfig, config.OncallSource, config.PatchPolicy, config.Verify, config.Orchestration, journeys.Journey,
+)}
+SETTINGS_DATES = {cls.__name__: cls for cls in (date, datetime, time_of_day)}
 
 
 def identity_of(pid: int) -> int | None:
@@ -51,7 +61,7 @@ def send(channel: socket.socket, value: dict) -> None:
 
 
 class Worker:
-    def __init__(self, run: pipeline.AgentRun, action: str, request: dict):
+    def __init__(self, run: pipeline.AgentRun, action: str, request: dict, snapshot: bytes):
         self.action, self.buffer, self.messages = action, b"", []
         self.progress, self.sources = [], {}
         self.report = (0, {})
@@ -68,7 +78,8 @@ class Worker:
                 # The trusted SDK broker applies the runner's sandbox; nesting it prevents native startup on macOS.
                 self.proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=output, stderr=output,
                                              pass_fds=(peer.fileno(),), start_new_session=True)
-            self.proc.stdin.write(json.dumps(request).encode())
+            self.proc.stdin.write(json.dumps(request).encode() + b"\n")
+            self.proc.stdin.write(snapshot)
             self.proc.stdin.close()
             self.pid = self.proc.pid
             self.identity = identity_of(self.pid)
@@ -168,6 +179,52 @@ def settings_shas(value) -> set[str]:
     return {settings_sha(value), digest(json.loads(json.dumps(asdict(value), default=str)))}
 
 
+def pack_settings(value):
+    if type(value).__name__ in SETTINGS_TYPES:
+        data = {f.name: pack_settings(getattr(value, f.name)) for f in fields(value)}
+        return {SETTINGS_TAG: type(value).__name__, "value": data}
+    if isinstance(value, Path):
+        return {SETTINGS_TAG: "path", "value": str(value)}
+    if isinstance(value, tuple):
+        return {SETTINGS_TAG: "tuple", "value": [pack_settings(item) for item in value]}
+    if isinstance(value, list):
+        return [pack_settings(item) for item in value]
+    if isinstance(value, dict):
+        data = {key: pack_settings(item) for key, item in value.items()}
+        return {SETTINGS_TAG: "dict", "value": list(data.items())} if SETTINGS_TAG in data else data
+    if type(value).__name__ in SETTINGS_DATES:
+        return {SETTINGS_TAG: type(value).__name__, "value": value.isoformat()}
+    return value
+
+
+def unpack_settings(data):
+    if SETTINGS_TAG not in data:
+        return data
+    kind, value = data[SETTINGS_TAG], data["value"]
+    if kind == "path":
+        return Path(value)
+    if kind == "tuple":
+        return tuple(value)
+    if kind == "dict":
+        return dict(value)
+    if kind in SETTINGS_DATES:
+        return SETTINGS_DATES[kind].fromisoformat(value)
+    return SETTINGS_TYPES[kind](**value)
+
+
+def snapshot_settings(job) -> bytes:
+    return json.dumps(pack_settings((job.cfg, job.layer, job.run.repo.pinned_layer))).encode()
+
+
+def load_settings(raw: bytes, snapshot_sha: str):
+    try:
+        if sha256(raw).hexdigest() == snapshot_sha:
+            return json.loads(raw, object_hook=unpack_settings)
+    except (ValueError, TypeError, KeyError, RecursionError):
+        pass
+    raise PolicyChanged("worker policy changed after action acceptance")
+
+
 def request(job, action: str, prompt: str, setting, tools: tuple, rules: list[str], session=NO_SESSION) -> dict:
     return {"run": job.run.id, "repo": job.run.repo.name, "action": action, "step": f"worker-{action}",
             "cwd": str(job.ws), "layer_dir": str(job.layer.dir), "prompt": prompt, "role": setting.step,
@@ -177,7 +234,8 @@ def request(job, action: str, prompt: str, setting, tools: tuple, rules: list[st
                           "session": "resume" if session.id else "fresh"},
             "rules": rules, "kind": job.run.kind, "session": asdict(session),
             "closed_context": job.run.closed_context,
-            "config_sha": settings_sha(job.cfg), "layer_sha": settings_sha(job.layer)}
+            "config_sha": settings_sha(job.cfg), "layer_sha": settings_sha(job.layer),
+            "snapshot_sha": sha256(job.worker_settings).hexdigest()}
 
 
 def main() -> None:
@@ -204,16 +262,22 @@ def main() -> None:
 
     threading.Thread(target=listening, daemon=True).start()
     try:
-        raw = sys.stdin.buffer.read(MAX_MESSAGE + 1)
-        if len(raw) > MAX_MESSAGE:
+        raw = sys.stdin.buffer.readline(MAX_MESSAGE + 1)
+        if len(raw.rstrip(b"\n")) > MAX_MESSAGE:
             raise ValueError("oversized worker launch request")
         launch = json.loads(raw)
-        cfg = config.load()
-        repo = cfg.repo(launch["repo"])
-        layer = config.load_layer(Path(launch["layer_dir"]))
+        directory = paths.RUNS_DIR / launch["run"]
+        pinned_layer = None
+        if "snapshot_sha" in launch:
+            cfg, layer, pinned_layer = load_settings(sys.stdin.buffer.read(), launch["snapshot_sha"])
+        else:
+            cfg = config.load()
+            layer = config.load_layer(Path(launch["layer_dir"]))
         if launch["config_sha"] not in settings_shas(cfg) or launch["layer_sha"] not in settings_shas(layer):
             raise PolicyChanged("worker policy changed after action acceptance")
-        run = pipeline.AgentRun(launch["run"], repo, paths.RUNS_DIR / launch["run"], cfg=cfg, layer=layer,
+        repo = cfg.repo(launch["repo"])
+        repo.pinned_layer = pinned_layer
+        run = pipeline.AgentRun(launch["run"], repo, directory, cfg=cfg, layer=layer,
                                 kind=launch["kind"], step_overrides={launch["role"]: launch["overrides"]},
                                 closed_context=tuple(launch["closed_context"]))
         kept = Session(**launch["session"])

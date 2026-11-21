@@ -313,9 +313,10 @@ class AgentRun:
             kw = {**s.call, **reach,
                   "resume": self.sessions.get(config.INHERITS.get(s.step, s.step), NO_SESSION)
                   if s.session == "resume" else NO_SESSION, **kw}
+        kw["cfg"] = kw.get("cfg") or self.config
         kw = self.fit_route(step, text, s, kw)
         run_with = kw.get("runner", "") or kw.get("resume", NO_SESSION).runner
-        which, model = routing.chosen(kw.get("model", ""), run_with, kw.get("cfg") or self.config)
+        which, model = routing.chosen(kw.get("model", ""), run_with, kw["cfg"])
         chosen = (which, model, kw.get("effort", ""))
         started, spent = time.monotonic(), self.cost
         kw.setdefault("tier", s.tier if s else "")
@@ -1651,7 +1652,9 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
     service_labels = scratch.service_labels()
     paths.ensure_dirs()
     cfg = config.load()
-    repo = cfg.repo(repo_name)
+    configured_repo = cfg.repo(repo_name)
+    repo = replace(configured_repo)
+    cfg = replace(cfg, repos=[repo if item is configured_repo else item for item in cfg.repos])
     from . import flows, launch_lease, pilot, zte
     from .store import db
     from .store import zte as zte_store
@@ -1705,7 +1708,10 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         reconciling_catch_up = (script and script.path == "orchestrate" and script.continues
                                 and bool(flows.pending_catch_up(script.continues)))
         try:
-            layer = config.load_layer(repo.layer_dir)
+            prepared = flows.prepared_data(script.continues) if script and script.continues else {}
+            layer = flows.saved_layer(prepared)
+            if layer is None:
+                layer = config.load_layer(repo.layer_dir) if prepared else pin_layer(repo)
             wall_deadline = math.inf
             zte_grant = None
             if zte.reserved(str(tid)):
@@ -1746,7 +1752,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         except pilot.Held as e:
             print(f"could not admit the reserved README task: {e}")
             return 2
-        except (ValueError, OSError) as e:
+        except (ValueError, OSError, RuntimeError, workspace.RunFailed) as e:
             print(f"could not validate the process budget: {e}")
             return 2
         if budget_admission.reason and not dry_run and not (force and feedback_readmits):
@@ -1843,7 +1849,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             scratch.RUN_BASELINES[run_id] = producer_baseline
             scratch.RUN_LABELS[run_id] = service_labels
             repair_with_feedback = script and script.path == "orchestrate" and script.continues and not script.action
-            run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force,
+            repo.pinned_layer = layer
+            run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, cfg=cfg, tracker=tk, tid=tid, force=force,
                       feedback=[] if mending and not repair_with_feedback else feedback,
                       claim_feedback_on_revise=custom_feature or bool(script and script.path == "revise"),
                       repairs=mending,
@@ -2137,23 +2144,66 @@ def _ask(run: Run, ws: Path, checkouts: list[workspace.Checkout], comment: str, 
     return "needs-info", summary[:300], ""
 
 
-def checked_layer(cfg: config.Config, layer_dir: Path, *, source_file: Path | None = None) -> config.RepoLayer:
+def checked_layer(cfg: config.Config, layer_dir: Path, *, source_file: Path | None = None,
+                  pinned: config.RepoLayer | None = None) -> config.RepoLayer:
     try:
-        layer = config.load_layer(layer_dir, source_file=source_file)
+        layer = pinned if pinned is not None and pinned.dir == layer_dir else config.load_layer(
+            layer_dir, source_file=source_file)
         steps.check(cfg, layer)
     except (ValueError, TypeError) as e:
         raise workspace.RunFailed(f"{paths.short_path(layer_dir / 'config.toml')}: {e}") from e
     return layer
 
 
+def pin_layer(repo: config.Repo) -> config.RepoLayer:
+    if repo.pinned_layer is not None:
+        return repo.pinned_layer
+    repo.pinned_layer = startup_layer(repo)
+    return repo.pinned_layer
+
+
+def startup_layer(repo: config.Repo) -> config.RepoLayer:
+    directory = repo.layer_dir
+    if repo.layer or not has_origin(repo):
+        return config.load_layer(directory)
+    root = util.git(["rev-parse", "--show-toplevel"], repo.path, check=False).strip()
+    if not root or Path(root).resolve() != repo.path.resolve():
+        return config.load_layer(directory)
+    local = None
+    try:
+        local = config.load_layer(directory)
+    except (ValueError, TypeError, OSError):
+        pass
+    base = (local.base_branch if local else "") or util.origin_default_branch(repo.path)
+    with util.repo_lock(repo.path):
+        util.git(["fetch", "origin", f"refs/heads/{base}"], repo.path)
+        revision = util.git(["rev-parse", "--verify", "FETCH_HEAD"], repo.path).strip()
+
+    def read_file(name: str) -> bytes | None:
+        entry = util.git(["--literal-pathspecs", "ls-tree", "--full-tree", revision, "--", f".agents/{name}"], repo.path)
+        if not entry or not entry.startswith(("100644 blob ", "100755 blob ")):
+            return None
+        oid = entry.split(None, 3)[2]
+        return util.git_bytes(["cat-file", "blob", oid], repo.path)
+
+    committed = read_file("config.toml")
+    repo.pinned_layer_committed = committed is not None
+    if committed is None:
+        return local if local is not None else config.load_layer(directory)
+    return config.parse_layer(directory, committed.decode(), read_file=read_file)
+
+
 def resolve_layer(cfg: config.Config, run: Run, ws: Path) -> config.RepoLayer:
     repo = run.repo
     if repo.layer:
-        return checked_layer(cfg, repo.layer)
-    if (ws / ".agents" / "config.toml").exists():
-        return checked_layer(cfg, ws / ".agents")
+        return checked_layer(cfg, repo.layer, pinned=repo.pinned_layer)
+    layer_dir = ws / ".agents"
+    committed = repo.pinned_layer_committed
+    if committed is True or (committed is None and (layer_dir / "config.toml").exists()):
+        pinned = repo.pinned_layer.at(layer_dir) if repo.pinned_layer is not None else None
+        return checked_layer(cfg, layer_dir, pinned=pinned)
     run.log(f"layer: {paths.short_path(repo.path / '.agents')} is not committed; lessons stay in the main checkout")
-    return checked_layer(cfg, repo.path / ".agents")
+    return checked_layer(cfg, repo.layer_dir, pinned=repo.pinned_layer)
 
 
 def triage_checks(approval: dict | None) -> str:
@@ -2243,7 +2293,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
         run.log(f"images: left out {', '.join(images.left_out)}")
     attachments = images_note(images)
 
-    main_layer = checked_layer(cfg, repo.layer_dir)
+    main_layer = checked_layer(cfg, repo.layer_dir, pinned=repo.pinned_layer)
     branch = run.preview_branch or open_branch(run) or prompt_loader.fill_template(
         main_layer.branch, config.RepoLayer.branch, kind=t.kind, id=t.id, slug=prompt_loader.slug(t.title))
     if not run.dry_run:
