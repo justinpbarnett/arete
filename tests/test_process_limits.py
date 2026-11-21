@@ -13,6 +13,7 @@ from string import Template
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from adws import feature
 from arete import (
     codebase,
     config,
@@ -101,6 +102,76 @@ class Isolated(unittest.TestCase):
         run = pipeline.Run(rid, self.repo, directory, tracker=self.local, tid=self.ticket, cfg=self.cfg)
         run.budget = runlimits.Budget(run, runlimits.Policy(), previous, self.local.get(self.ticket), forced)
         return run
+
+
+class ReviewRetryTests(Isolated):
+    PR = "https://github.com/example/fixture/pull/1"
+    BLOCKER = {"file": "notes.txt", "problem": "fixture blocker", "severity": "blocker", "category": "issue"}
+
+    def review_build(self, *replies):
+        run = self.made_run()
+        run.step_overrides["review"] = {"tries": 2}
+        flow = flows.start(self.cfg, run, {})
+        job = flow.ctx
+        job.ticket = self.local.get(self.ticket)
+        with patch.object(pipeline, "workspace_note", return_value="Fixture workspace"):
+            job.b.staged = pipeline.Staged(counts={"notes.txt": 1})
+
+        def open_pr(flow, tree):
+            return factory.Outcome("pass", data={
+                "prs": {}, "opened": [], "changed": [], "pushed": [], "committed_lines": 1,
+                "draft_why": flow.ctx.held_reason, "report_body": "", "summary": "",
+            })
+
+        with (patch.object(pipeline.runner, "run", side_effect=replies) as agent,
+              patch.object(factory, "fingerprint", return_value="fixture-tree"),
+              patch.object(flows, "documents", return_value=False),
+              patch.dict(factory.STEPS, {
+                  "checks": lambda *a, **kw: factory.Outcome("pass"),
+                  "verify": lambda *a, **kw: factory.Outcome("pass", data={"verified": {"verdict": "pass"}, "names": []}),
+                  "learn": lambda *a, **kw: factory.Outcome("pass"),
+                  "pr": open_pr,
+                  "publish": lambda *a: factory.Outcome("pass", data={"ending": "pr", "pr_url": self.PR}),
+                  "respond": lambda _, ending, **kw: factory.Outcome("pass", data={"status": ending, "summary": "", **kw}),
+              })):
+            ending = feature.built(flow, [], prepared=True)
+        self.assertEqual(ending, ("pr", "", self.PR))
+        return flow, agent.call_args_list
+
+    def test_review_retry_approves_and_reaches_publication_without_repair(self):
+        for ok in (False, True):
+            with self.subTest(ok=ok):
+                first = Result(ok=ok, error="" if ok else "fixture call failed")
+                flow, calls = self.review_build(first, Result(ok=True, structured={"summary": "Fine.", "problems": []}))
+                self.assertEqual([call.kwargs["trace"][1] for call in calls], ["review", "review"])
+                self.assertEqual(calls[0].args, calls[1].args)
+                self.assertEqual(flow.tries["review"], 1)
+                self.assertEqual(flow.ctx.run.budget.repair_calls, 0)
+                self.assertTrue(flow.ctx.review.approved())
+                self.assertEqual(flow.ctx.draft_why, "")
+
+    def test_review_double_failure_keeps_earlier_blockers_and_the_draft(self):
+        changes = Result(ok=True, structured={"summary": "Needs a fix.", "problems": [self.BLOCKER]})
+        failed = Result(ok=False, error="fixture call failed")
+        flow, calls = self.review_build(changes, Result(ok=True), failed, failed)
+        self.assertEqual([call.kwargs["trace"][1] for call in calls], ["review", "review_fix", "review2", "review2"])
+        self.assertEqual(flow.tries["review"], 2)
+        self.assertEqual(flow.ctx.run.budget.repair_calls, 1)
+        self.assertEqual(flow.ctx.review.verdict, "request_changes")
+        self.assertTrue(flow.ctx.review.failed)
+        self.assertEqual(flow.ctx.review.blocking()[0]["problem"], self.BLOCKER["problem"])
+        self.assertIn("1 earlier blocker", flow.ctx.draft_why)
+
+    def test_request_changes_starts_repair_without_retrying_review(self):
+        changes = Result(ok=True, structured={"summary": "Needs a fix.", "problems": [self.BLOCKER]})
+        approved = Result(ok=True, structured={
+            "summary": "Fixed.", "problems": [], "earlier": [{"id": "B1", "status": "fixed", "why": "Rechecked."}],
+        })
+        flow, calls = self.review_build(changes, Result(ok=True), approved)
+        self.assertEqual([call.kwargs["trace"][1] for call in calls], ["review", "review_fix", "review2"])
+        self.assertIn(self.BLOCKER["problem"], calls[1].args[0])
+        self.assertEqual(flow.ctx.run.budget.repair_calls, 1)
+        self.assertTrue(flow.ctx.review.approved())
 
 
 class OrchestrationLineageTests(Isolated):
