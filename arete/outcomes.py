@@ -178,8 +178,6 @@ def sync_moves(cfg: config.Config) -> None:
         tk = tracker.for_ticket(cfg, repo, str(r["issue"]))
         if not isinstance(tk, tracker.JiraTracker):
             continue
-        if status == "failed" and run_store.failed_finish(r["id"]):
-            continue
         try:
             m = tk.shift(str(r["issue"]), target, keep_done=True)
         except jira.JiraError as e:

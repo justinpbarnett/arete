@@ -1,16 +1,22 @@
+import argparse
+import ast
 import base64
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
-from contextlib import ExitStack, closing, contextmanager, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, chdir, closing, contextmanager, redirect_stderr, redirect_stdout
+from contextvars import Context
 from http.client import HTTPConnection, HTTPResponse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO, StringIO
 from pathlib import Path
-from socket import SHUT_WR, create_connection, socketpair
+from socket import SHUT_WR, create_connection, socket, socketpair
 from types import SimpleNamespace
 from unittest import mock
 
@@ -30,6 +36,1029 @@ from tests import support, versioned_api_fixture
 
 def setUpModule():
     support.isolate_live_state()
+
+
+class _CliThroughServeCase(unittest.TestCase):
+    class_timeout = 30
+    class_worker = None
+    OWNER = "cli-owner@example.test"
+    ONLINE = (
+        "run replay-sample 7", "task add --repo replay-sample change", "task list", "task show t-1234",
+        "task reply t-1234 answer", "task close t-1234", "task start --repo replay-sample change",
+        "task run replay-sample 7", "answer r1", "resume r1", "repair r1", "step r1 build", "wait r1",
+        "lines r1", "status", "stop r1", "approve 1", "forget 1", "file-rule 1", "reject-rule 1",
+        "loop start example", "loop enable example", "loop disable example", "loop stop example",
+        "session start work", "session attach r1", "session send r1 hello", "session stop r1",
+        "oncall off", "oncall on", "oncall cancel 1", "oncall dismiss 1", "oncall retry 1",
+    )
+    ONLINE_VARIANTS = (
+        "status --json r1", "status --json", "record pin r1", "record unpin r1", "approve 1 --reject",
+        "loop start example -f", "session --chat 1 start work", "session --chat 1 list",
+        "session --chat 1 report r1", "session --chat 1 stop r1",
+    )
+    READS = (
+        "ab", "backup --check", "benchmark report missing", "costs", "devices", "doctor", "events",
+        "experiment summary missing", "jev report", "jira-check", "loop feed r1", "loop list", "loop status poll",
+        "merged", "oncall list", "oncall show 1", "prices diff", "prices recompute r1 build", "prompts",
+        "hold", "record r1", "research", "secrets replay-sample", "session list", "session report r1",
+        "steps --repo replay-sample", "triage", "verifiers report missing",
+        "writers report r1", "zte status",
+    )
+    READ_VARIANTS = ("approve", "mcp-ask --check", "status --offline", "status --json --offline",
+                     "status --json --offline r1", "lines --offline r1",
+                     "task show --offline --json {task}")
+    LOCAL = {
+        "api check": "api_check", "api diff": "contract_evolution", "ask": "jev_ask", "audit": "audit", "background": "background",
+        "benchmark fixture": "lab.benchmark", "benchmark run": "lab.benchmark", "benchmark sample": "lab.benchmark",
+        "codex-guard": "codex", "dashboard": "dashboard", "devices probe": "devices",
+        "document": "document", "eval": "evals", "experiment optimize": "lab.optimize",
+        "experiment promote": "lab.optimize", "experiment run": "lab.experiment", "experiment sample": "lab.experiment",
+        "guard": "guard", "heartbeat": "heartbeat", "hook": "tool_events", "init": "commands.setup",
+        "install": "install", "jev compare": "lab.calibrate", "jev sample": "lab.calibrate",
+        "loop exec": "loop_run", "loop new": "scaffold", "loop requeue": "store.loops", "loop try": "scaffold",
+        "mcp-ask": "owner_asks", "merge-check": "mergecheck", "migrate": "store.db", "mine": "miner",
+        "oncall scan": "oncall", "pilot-doc-fix": "pilot", "poll": "poll", "prices import": "prices",
+        "replay sample": "replay", "retrieval run": "lab.retrieval", "retrieval sample": "lab.retrieval",
+        "rotate-authority": "scratch", "serve": "serve", "session exec": "sessions", "uninstall": "install",
+        "upload-guard": "uploads", "webhook secret": "webhooks.secret",
+        "verify-fault arm": "verify_faults", "verify-fault clear": "verify_faults",
+        "verify-fault drop-streams": "verify_faults", "verify-fault event": "verify_faults",
+        "verifiers run": "lab.verifier_suites", "verifiers sample": "lab.verifier_suites",
+        "verify-fault arm": "verify_faults", "verify-fault clear": "verify_faults",
+        "verify-fault drop-streams": "verify_faults", "verify-fault event": "verify_faults",
+        "writers export": "lab.writer_eval", "writers rate": "lab.writer_eval", "writers run": "lab.writer_eval",
+        "writers sample": "lab.writer_eval", "zte pause": "zte",
+    }
+    LOCAL_VARIANTS = {
+        "run replay-sample 7 --dry-run": "pipeline.run_issue / record.start",
+        "run replay-sample 7 --local": "pipeline.run_issue", "file-rule 1 --local": "miner.file_rule",
+        "loop new --run-id r1 work": "scaffold.draft", "loop start example --events sample.json": "loop_run.launch",
+        "session start --task work": "sessions.launch", "session start --task --draft-pr work": "sessions.launch",
+        "research --next": "research.next_due", "research replay-sample#7 --run": "research.run_now",
+        "triage --refresh": "triage.run", "hold claude 1h": "store.devices",
+        "hold claude --release": "store.devices", "costs --correct r1 1 --why correction": "record.correct",
+        "costs --backfill": "store.runs", "backup": "backup.snapshot", "backup --restore backup.db": "backup.restore",
+        "secrets rm replay-sample secret": "vault",
+    }
+
+    @classmethod
+    def setUpClass(cls):
+        stack = ExitStack()
+        cls.addClassCleanup(stack.close)
+        cls.addClassCleanup(setattr, cls, "class_worker", None)
+        cls.class_worker = stack.enter_context(cls.start_worker())
+
+    @staticmethod
+    def prepare_fixture(root):
+        from arete import paths
+
+        lines, _ = api_check.prepare_replay(root)
+        config_text = "\n".join(lines) + "\n"
+        paths.CONFIG_FILE.write_text(config_text)
+        # The copied checkout should use the copy of its bare origin.
+        subprocess.run(["git", "remote", "set-url", "origin", "../origin.git"],
+                       cwd=root / "sample/repo", check=True, timeout=10)
+        db.migrate()
+        return config_text
+
+    @classmethod
+    @contextmanager
+    def start_worker(cls):
+        with (tempfile.TemporaryDirectory(prefix="arete-cli-fixture-") as directory,
+              ExitStack() as stack):
+            root = Path(directory).resolve()
+            parent, child = socketpair()
+            stack.enter_context(parent)
+            stack.enter_context(child)
+            output = root / "worker.log"
+            entry = ("from tests import test_behavior; "
+                     "getattr(test_behavior, sys.argv[1]).run_checks(int(sys.argv[2]))")
+            command = api_check.child_command(Path(__file__).resolve().parents[1], entry,
+                                              cls.__name__, str(child.fileno()))
+            with output.open("w") as log:
+                process = subprocess.Popen(command, cwd=root, env=api_check.isolated_env(root),
+                                           stdin=subprocess.DEVNULL, stdout=log, stderr=log, pass_fds=(child.fileno(),))
+            child.close()
+            parent.settimeout(cls.class_timeout - 2)
+            try:
+                with parent.makefile("rwb") as channel:
+                    yield channel, output
+            finally:
+                parent.close()
+                try:
+                    status = process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    status = process.wait()
+            if status:
+                raise RuntimeError(f"CLI test worker exited with status {status}\n{output.read_text(errors='replace')}")
+
+    def in_subprocess(self, case):
+        if self.class_worker is None:
+            # PinCommandTests also uses this fixture outside the three classes.
+            with self.start_worker() as worker:
+                self.run_check(worker, case)
+        else:
+            self.run_check(self.class_worker, case)
+
+    def run_check(self, worker, case):
+        channel, log = worker
+        try:
+            channel.write(case.encode() + b"\n")
+            channel.flush()
+            reply = channel.readline()
+        except OSError as error:
+            self.fail(f"{case}: {error}\n{log.read_text(errors='replace')}")
+        if not reply:
+            self.fail(f"worker exited during {case}\n{log.read_text(errors='replace')}")
+        ok, output = json.loads(reply)
+        if not ok:
+            self.fail(f"{output}\n{log.read_text(errors='replace')}")
+
+    @classmethod
+    def run_checks(cls, fd):
+        import faulthandler
+
+        from arete import codebase
+
+        with (socket(fileno=fd) as connection, connection.makefile("rwb") as channel,
+              mock.patch("urllib.request.urlopen", side_effect=AssertionError("urllib.request.urlopen")),
+              mock.patch.object(gh, "gh", side_effect=AssertionError("arete.gh.gh"))):
+            connection.set_inheritable(False)
+            faulthandler.dump_traceback_later(cls.class_timeout - 4)
+            fixture_root = Path.cwd()
+            config_text = cls.prepare_fixture(fixture_root)
+            # Import once so all module-level paths can be rebound for each check.
+            codebase.import_everything()
+            faulthandler.cancel_dump_traceback_later()
+            for request in channel:
+                test = cls(request.decode().strip())
+                test.fixture_root = fixture_root
+                test.fixture_config = config_text
+                output = StringIO()
+                faulthandler.dump_traceback_later(cls.class_timeout - 4)
+                try:
+                    result = Context().run(unittest.TextTestRunner(stream=output, verbosity=2).run, test)
+                finally:
+                    faulthandler.cancel_dump_traceback_later()
+                channel.write(json.dumps([result.wasSuccessful(), output.getvalue()]).encode() + b"\n")
+                channel.flush()
+
+    def setUp(self):
+        if not self._testMethodName.startswith("check_"):
+            return
+        from arete import client, dbstats, guard, paths, sandbox
+
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        directory = self.stack.enter_context(tempfile.TemporaryDirectory(prefix="check-", dir=self.fixture_root))
+        root = Path(directory)
+        env = api_check.isolated_env(root)
+        self.stack.enter_context(mock.patch.dict(os.environ, env, clear=True))
+        self.stack.enter_context(chdir(root))
+        self.stack.enter_context(mock.patch.object(tempfile, "tempdir", env["TMPDIR"]))
+        for name, module in tuple(sys.modules.items()):
+            if name.startswith("arete.") and module is not None:
+                paths_here = {key: root / value.relative_to(self.fixture_root) for key, value in vars(module).items()
+                              if isinstance(value, Path) and value.is_relative_to(self.fixture_root)}
+                if paths_here:
+                    self.stack.enter_context(mock.patch.multiple(module, **paths_here))
+        self.stack.enter_context(mock.patch.object(guard, "LOGIN_FILES", tuple(
+            root / path.relative_to(self.fixture_root) for path in guard.LOGIN_FILES)))
+        self.stack.enter_context(mock.patch.object(sandbox, "AUTHORITY", paths.CONFIG_DIR / "verification-authority"))
+        # Keep code imports warm while resetting state keyed by requests, processes and databases.
+        for patch in (mock.patch.object(api_http, "RATES", api_http.RateLimits()),
+                      mock.patch.object(api_http, "ALIAS_DAYS", {}),
+                      mock.patch.object(contract, "USES", contract.USES.copy()),
+                      mock.patch.object(dashboard, "POSTS_IN_FLIGHT", dashboard.Gauge()),
+                      mock.patch.object(db, "_CHECKED", set()),
+                      mock.patch.object(dbstats, "SUMMARIES", {}),
+                      mock.patch.object(idempotency, "ACTIVE", {}),
+                      mock.patch.object(client, "_acquisition_thread", None)):
+            self.stack.enter_context(patch)
+        for cached in (gh.me, util.github_token):
+            cached.cache_clear()
+            self.stack.callback(cached.cache_clear)
+        shutil.copytree(self.fixture_root / "sample", root / "sample")
+        original = json.dumps(str(self.fixture_root / "sample"))[1:-1]
+        copied = json.dumps(str(root / "sample"))[1:-1]
+        self.fixture_config = self.fixture_config.replace(original, copied)
+        paths.CONFIG_FILE.write_text(self.fixture_config)
+
+    def prepare_state(self):
+        from arete import paths
+
+        if not paths.DB_FILE.exists():
+            shutil.copytree(self.fixture_root / "state", paths.STATE_DIR, dirs_exist_ok=True)
+
+    def cli(self, command, stdin=""):
+        from arete import cli
+
+        out, err = StringIO(), StringIO()
+        with redirect_stdout(out), redirect_stderr(err), mock.patch("sys.stdin", StringIO(stdin)):
+            code = cli.main(command.split())
+        return code, out.getvalue().splitlines(), err.getvalue()
+
+    def problem(self, command, reason):
+        code, lines, err = self.cli(command)
+        self.assertEqual(code, 1, (command, lines, err))
+        self.assertEqual(len(lines), 1, (command, lines, err))
+        self.assertNotIn("Traceback", err)
+        answer = json.loads(lines[0])
+        self.assertEqual(answer.get("reason") or answer.get("code"), reason, (command, answer))
+        return answer
+
+    @contextmanager
+    def listening(self, server):
+        # Join request threads before unwinding the environment and path patches.
+        server.daemon_threads = False
+        with mock.patch.dict(os.environ, {"ARETE_SERVER": f"http://127.0.0.1:{server.server_port}"}), server:
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": .01})
+            thread.start()
+            try:
+                yield
+            finally:
+                server.shutdown()
+                thread.join()
+
+    @contextmanager
+    def serve_at(self, requests, *, write_instances=None):
+        self.prepare_state()
+        principals.seed_owner(self.OWNER)
+
+        class Handler(dashboard.Handler):
+            def send_response(handler, code, message=None):
+                requests.append((handler.command, handler.path, code, handler.headers.get("Idempotency-Key")))
+                if write_instances is not None and handler.command != "GET":
+                    write_instances.append(handler.headers.get("X-Arete-Instance"))
+                super().send_response(code, message)
+
+            def log_request(self, *_):
+                pass
+
+        address = "127.0.0.1"
+        node = tailnet.Node((address,), frozenset({address}), address)
+        logins = tailnet.Logins(mock.Mock())
+        with mock.patch.object(logins, "of", return_value=self.OWNER), mock.patch("socket.getfqdn", return_value=address):
+            server = tailnet.Server(address, 0, node, logins, False, Handler, dashboard.Redirect)
+            with self.listening(server):
+                yield server
+
+    @contextmanager
+    def stub(self, response):
+        class Handler(BaseHTTPRequestHandler):
+            def reply(handler):
+                result = response(handler)
+                if result is None:
+                    handler.rfile.read(int(handler.headers.get("Content-Length", "0")))
+                    handler.close_connection = True
+                    return
+                status, answer, headers = result
+                raw = answer if isinstance(answer, bytes) else json.dumps(answer).encode()
+                handler.send_response(status)
+                for name, value in headers.items():
+                    handler.send_header(name, value)
+                handler.send_header("Content-Length", str(len(raw)))
+                handler.end_headers()
+                handler.wfile.write(raw)
+
+            do_GET = do_POST = reply
+
+            def log_message(self, *_):
+                pass
+
+        address = "127.0.0.1"
+        with mock.patch("socket.getfqdn", return_value=address):
+            server = ThreadingHTTPServer((address, 0), Handler)
+        with self.listening(server):
+            yield
+
+
+class CliThroughServeAccessTests(_CliThroughServeCase):
+    def test_parser_groups_and_cli_calls(self):
+        self.in_subprocess("check_parser_groups_and_cli_calls")
+
+    def check_parser_groups_and_cli_calls(self):
+        from arete import cli
+        from arete.commands import common
+
+        def leaves(parser, prefix=()):
+            for action in parser._actions:
+                if isinstance(action, argparse._SubParsersAction):
+                    if prefix and not action.required:
+                        yield prefix
+                    for name, sub in action.choices.items():
+                        yield from leaves(sub, (*prefix, name))
+                    return
+                if action.dest == "action" and action.choices:
+                    yield from ((*prefix, name) for name in action.choices)
+                    return
+            yield prefix
+
+        parser = cli.parser()
+        actual = set(leaves(parser))
+        groups = {}
+        for group, case in ((1, self.ONLINE), (2, self.READS), (3, self.LOCAL)):
+            for command in case:
+                words = tuple(command.split())
+                match = next((words[:n] for n in (2, 1) if words[:n] in actual), words)
+                self.assertNotIn(match, groups)
+                groups[match] = group
+        self.assertSetEqual(actual, set(groups))
+        for command in (*self.ONLINE, *self.ONLINE_VARIANTS, *self.READS, *self.READ_VARIANTS, *self.LOCAL_VARIANTS,
+                        "api diff --check-artifact"):
+            parser.parse_args(command.split())
+        forbidden = {"record": {"pin", "unpin"}, "control": {"decide", "switch", "stop_run"},
+                     "sessions": {"send"}, "chat": {"start_session", "stop_session"}, "oncall": {"switch"}}
+        files = [Path(cli.__file__), *Path(common.__file__).parent.glob("*.py")]
+        for path in files:
+            for call in (node for node in ast.walk(ast.parse(path.read_text())) if isinstance(node, ast.Call)):
+                function = call.func
+                if isinstance(function, ast.Attribute) and isinstance(function.value, ast.Name):
+                    module, name = function.value.id, function.attr
+                    self.assertNotIn(name, forbidden.get(module, ()), f"{path.name}:{call.lineno}")
+                    if module == "state":
+                        self.assertIn(("connect", "state.reader"),
+                                      [(kw.arg, ast.unparse(kw.value)) for kw in call.keywords])
+                elif isinstance(function, ast.Name) and function.id == "getattr" and call.args:
+                    self.assertNotEqual(ast.unparse(call.args[0]), "oncall")
+
+    def test_commands_fail_when_serve_is_down(self):
+        self.in_subprocess("check_commands_fail_when_serve_is_down")
+
+    def check_commands_fail_when_serve_is_down(self):
+        from errno import ECONNREFUSED
+
+        from arete import paths
+
+        paths.SERVE_BEAT_FILE.write_text(json.dumps({"at": "2000-01-01T00:00:00Z", "engine": "old-engine"}))
+        for name in ("pipeline.run_issue", "delivery.send", "miner.file_rule", "loop_run.launch", "sessions.launch",
+                     "control.stop_run", "record.pin", "oncall.dismiss", "chat.start_session", "chat.stop_session"):
+            self.stack.enter_context(mock.patch("arete." + name, side_effect=AssertionError(name)))
+        host, port = "127.0.0.1", 1
+        url = f"http://{host}:{port}"
+
+        def refuse_connection(address, *args, **kwargs):
+            self.assertEqual(address, (host, port))
+            raise ConnectionRefusedError(ECONNREFUSED, os.strerror(ECONNREFUSED))
+
+        self.stack.enter_context(mock.patch("socket.create_connection", side_effect=refuse_connection))
+        paths.CONFIG_FILE.write_text(self.fixture_config + f'\n[server]\nurl = "{url}"\n')
+        for command in (*self.ONLINE, *self.ONLINE_VARIANTS):
+            with self.subTest(command=command):
+                self.assertIn(url, self.problem(command, "server_down")["error"])
+                self.assertFalse(paths.DB_FILE.exists())
+        paths.CONFIG_FILE.write_text(self.fixture_config)
+        exited = subprocess.Popen([sys.executable, "-c", "pass"])
+        exited.wait(timeout=3)
+        util.write_json(paths.SERVER_FILE, {**paths.state_and_config(), "pid": exited.pid,
+                                           "addresses": ["127.0.0.1"], "port": port})
+        self.assertIn("process has ended", self.problem("run replay-sample 7", "server_down")["error"])
+        with mock.patch.dict(os.environ, {"ARETE_SERVER": url}):
+            self.problem("run replay-sample 7", "server_down")
+            self.problem("loop start example", "server_down")
+        self.assertFalse(paths.DB_FILE.exists())
+
+    def test_status_reports_stale_heartbeat_when_import_fails(self):
+        self.in_subprocess("check_status_reports_stale_heartbeat_when_import_fails")
+
+    def check_status_reports_stale_heartbeat_when_import_fails(self):
+        from arete import codebase, paths
+
+        paths.SERVE_BEAT_FILE.write_text(json.dumps({
+            "at": "2000-01-01T00:00:00Z", "engine": "old-engine", "checkout_head": "broken-head",
+        }))
+        problem = "arete: cannot import arete.commands.setup: RuntimeError: broken candidate"
+        with mock.patch.object(codebase, "load", side_effect=SystemExit(problem)):
+            code, lines, err = self.cli("status --limit 1")
+        self.assertEqual((code, lines), (1, []))
+        self.assertEqual(err.splitlines(), [
+            problem,
+            "last recorded serve heartbeat at 2000-01-01T00:00:00Z, running code old-engine, checkout HEAD broken-head",
+        ])
+        self.assertFalse(paths.DB_FILE.exists())
+
+    def test_readers_and_worker_guards(self):
+        self.in_subprocess("check_readers_and_worker_guards")
+
+    def test_readers_report_missing_database(self):
+        self.in_subprocess("check_readers_report_missing_database")
+
+    def check_readers_report_missing_database(self):
+        from arete import paths
+
+        with mock.patch.object(db, "connect_db", side_effect=AssertionError("opened missing database")) as connect_db:
+            for command in (*self.READS, *self.READ_VARIANTS):
+                with self.subTest(command=command):
+                    code, lines, err = self.cli(command.format(task="t-1234"))
+                    self.assertEqual((code, err), (1, ""))
+                    self.assertEqual(len(lines), 1)
+                    self.assertEqual(json.loads(lines[0])["error"],
+                                     f"no arete.db at {paths.DB_FILE}; run arete serve or arete migrate")
+                    self.assertFalse(paths.DB_FILE.exists())
+            connect_db.assert_not_called()
+
+    def test_events_read_the_local_log(self):
+        self.in_subprocess("check_events_read_the_local_log")
+
+    def check_events_read_the_local_log(self):
+        from arete import client, paths
+
+        self.prepare_state()
+        event = {"ts": util.iso(), "kind": "tool", "cls": "fixture"}
+        paths.EVENTS_FILE.write_text(json.dumps(event) + "\n")
+        with mock.patch.object(client, "server", side_effect=AssertionError("events contacted serve")):
+            code, lines, err = self.cli("events --raw")
+        self.assertEqual((code, lines, err), (0, [json.dumps(event)], ""))
+
+    def check_readers_and_worker_guards(self):
+        from arete import record, run_lines
+        from arete.store import tasks as task_store
+
+        self.prepare_state()
+        task = task_store.task_add("replay-sample", "work")
+        run = record.start("session", run_id="r1", pid=None)
+        record.settle(run, "done", end_line="done")
+        run_lines.write(run, run_lines.END, status="done")
+        calls = []
+        real_connect = db.connect_db
+
+        def readonly(*args, **kwargs):
+            if not kwargs.get("readonly"):
+                calls.append((args, kwargs))
+                raise AssertionError("CLI opened the database for writing")
+            return real_connect(*args, **kwargs)
+
+        with mock.patch.object(db, "connect_db", readonly):
+            for command in (*self.READS, *self.READ_VARIANTS):
+                with self.subTest(command=command):
+                    self.cli(command.format(task=task))
+                    self.assertFalse(calls)
+            for command in ("run replay-sample 7 --local", "file-rule 1 --local", "loop new --run-id r1 work",
+                            "loop exec --run-id r1", "session exec r1"):
+                code, _, error = self.cli(command)
+                self.assertEqual(code, 1)
+                self.assertIn("started by Arete", error)
+            for command in ("lines --offline r1", "status --offline", "status --json --offline r1",
+                            f"task show --offline {task}"):
+                code, lines, _ = self.cli(command)
+                self.assertEqual(code, 0)
+                self.assertTrue(lines)
+                self.assertTrue(all(json.loads(line)["source"] == "local" for line in lines))
+
+    def test_identity_change_blocks_writes(self):
+        self.in_subprocess("check_identity_change_blocks_writes")
+
+    def check_identity_change_blocks_writes(self):
+        from arete import paths
+
+        paths.CONFIG_FILE.write_text(self.fixture_config + '\n[server]\nurl = "http://127.0.0.1:1"\n')
+        sent = []
+        instances = iter(("first", "second"))
+
+        def response(request):
+            sent.append(request.command)
+            body = ({"instance": {"id": next(instances)}} if request.command == "GET" else
+                    {"task": {"id": "t-1234"}})
+            return 200, body, {}
+
+        with self.stub(response):
+            self.assertEqual(self.cli("task add --repo replay-sample first")[0], 0)
+            self.problem("task add --repo replay-sample second", "server_identity_changed")
+        self.assertEqual(sent, ["GET", "POST", "GET"])
+
+    def test_receiving_serve_rejects_mismatched_write_instances(self):
+        self.in_subprocess("check_receiving_serve_rejects_mismatched_write_instances")
+
+    def check_receiving_serve_rejects_mismatched_write_instances(self):
+        from arete import api
+        from arete.store import tasks as task_store
+
+        seen, instances = [], []
+        with self.serve_at(seen, write_instances=instances) as server:
+            headers = {"X-Arete": "1", "Idempotency-Key": "existing-key", "Content-Type": "application/json"}
+            conn = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+            try:
+                conn.request("POST", "/api/v1/tasks",
+                             json.dumps({"repo": "replay-sample", "body": "change", "title": "", "kind": "feat"}),
+                             headers)
+                response = conn.getresponse()
+                self.assertEqual(response.status, 200, response.read())
+            finally:
+                conn.close()
+            before = task_store.tasks()
+            with (mock.patch.object(api, "meta", return_value={"instance": {"id": "previous-instance"}}),
+                  mock.patch.object(idempotency, "owning", wraps=idempotency.owning) as owning):
+                for command, key in (("task add --repo replay-sample change", "existing-key"),
+                                     ("task add --repo replay-sample other", "fresh-key"),
+                                     ("loop disable poll", "loop-key"),
+                                     ("task start --repo replay-sample work", "start-key")):
+                    with self.subTest(command=command), mock.patch.dict(os.environ, {"ARETE_IDEMPOTENCY_KEY": key}):
+                        self.assertIn("instance changed", self.problem(command, "conflict")["error"])
+                owning.assert_not_called()
+            self.assertEqual(len(before), 1)
+            self.assertEqual(task_store.tasks(), before)
+        self.assertEqual([code for method, _, code, _ in seen if method == "POST"], [200, 409, 409, 409, 409])
+        self.assertEqual(instances, [None] + ["previous-instance"] * 4)
+
+    def test_server_discovery_ignores_unrelated_config_values(self):
+        self.in_subprocess("check_server_discovery_ignores_unrelated_config_values")
+
+    def check_server_discovery_ignores_unrelated_config_values(self):
+        from arete import paths, run_lines
+
+        with self.serve_at([]) as server:
+            port = server.server_port
+            url = os.environ["ARETE_SERVER"]
+            record = {**paths.state_and_config(), "pid": os.getpid(), "addresses": ["127.0.0.1"], "port": port}
+            util.write_json(paths.SERVER_FILE, record)
+            run_lines.write("r1", run_lines.END, status="done")
+            invalid = self.fixture_config + '\n[document]\nenabled = "invalid"\n'
+
+            def report():
+                code, lines, err = self.cli("status --json r1")
+                self.assertEqual(code, 0, (lines, err))
+                self.assertEqual([json.loads(line)["status"] for line in lines], ["done"])
+
+            with mock.patch.dict(os.environ, {"ARETE_SERVER": ""}):
+                paths.CONFIG_FILE.write_text(invalid)
+                report()
+                util.write_json(paths.SERVER_FILE, {**record, "addresses": []})
+                paths.CONFIG_FILE.write_text(invalid + f'\n[server]\nurl = "{url}"\n')
+                report()
+            paths.CONFIG_FILE.write_text(invalid + "\n[server]\nurl = false\n")
+            report()
+
+
+class CliThroughServeCommandTests(_CliThroughServeCase):
+    def test_approval_waits_out_drain(self):
+        self.in_subprocess("check_approval_waits_out_drain")
+
+    def check_approval_waits_out_drain(self):
+        from arete import client, delivery
+
+        seen, refused, instances = [], [], []
+        with (self.serve_at(seen, write_instances=instances),
+              mock.patch.object(delivery.EMITS["push"], "execute", return_value="sent") as send):
+            number = approvals_store.add_approval("example", "", {"type": "push", "item": {}}, "deliver")
+            connect = client.connect
+
+            def reconnect(where, *args):
+                if not refused and any(status == 503 for _, _, status, _ in seen):
+                    refused.append(True)
+                    raise client.Down(client.address(where), "connection refused")
+                return connect(where, *args)
+
+            dashboard.POSTS_IN_FLIGHT.close()
+            timer = threading.Timer(1, dashboard.POSTS_IN_FLIGHT.reopen)
+            timer.start()
+            try:
+                with mock.patch.object(client, "connect", reconnect), mock.patch.object(client, "RETRY_SECONDS", .01):
+                    code, lines, err = self.cli(f"approve {number}")
+                self.assertEqual(code, 0, (lines, err))
+            finally:
+                timer.cancel()
+                timer.join()
+                dashboard.POSTS_IN_FLIGHT.reopen()
+            send.assert_called_once()
+            self.assertEqual(approvals_store.approval(number)["status"], "done")
+        self.assertEqual(refused, [True])
+        writes = [(code, key) for method, _, code, key in seen if method == "POST"]
+        self.assertEqual([code for code, _ in writes], [503, 200])
+        self.assertIsNotNone(writes[0][1])
+        self.assertEqual(writes[0][1], writes[1][1])
+        with db.reader() as conn:
+            self.assertEqual(instances, [db.metadata(conn)["instance_id"]] * 2)
+
+    def test_file_rule_detaches_a_marked_worker_once(self):
+        self.in_subprocess("check_file_rule_detaches_a_marked_worker_once")
+
+    def check_file_rule_detaches_a_marked_worker_once(self):
+        from arete import miner
+
+        seen, workers = [], []
+        real_detach = control.detach
+
+        def detach(args):
+            workers.append(args)
+            return real_detach(args)
+
+        def spawn(argv, *, env, **_):
+            self.assertEqual(env.get(control.WORKER_ENV), "file-rule")
+            with mock.patch.dict(os.environ, env):
+                thread = threading.Thread(target=lambda: self.cli(" ".join(argv[-3:])))
+                thread.start()
+                thread.join(timeout=3)
+                self.assertFalse(thread.is_alive())
+            return SimpleNamespace(pid=1, wait=lambda: 0)
+
+        child = SimpleNamespace(Popen=spawn, DEVNULL=subprocess.DEVNULL, STDOUT=subprocess.STDOUT)
+        with self.serve_at(seen), mock.patch.object(control, "detach", side_effect=detach), \
+                mock.patch.object(control, "subprocess", child), \
+                mock.patch.object(miner, "file_rule", return_value="filed") as file_rule:
+            approvals_store.add_proposal("", {"repo": "replay-sample"}, "approve")
+            number = approvals_store.proposals()[0]["id"]
+            code, lines, err = self.cli(f"file-rule {number}")
+            self.assertEqual(code, 0, (lines, err))
+            file_rule.assert_called_once_with(number)
+        self.assertEqual(workers, [["file-rule", str(number), "--local"]])
+        self.assertEqual([path for method, path, _, _ in seen if method == "POST"], [f"/api/proposals/{number}/approve"])
+
+    def test_version_and_missing_field_errors_are_flat(self):
+        self.in_subprocess("check_version_and_missing_field_errors_are_flat")
+
+    def check_version_and_missing_field_errors_are_flat(self):
+        versions = []
+
+        def old(request):
+            versions.append(request.headers.get("X-Arete-Client"))
+            return 400, {"reason": "client_too_old", "required_version": "1.99"}, {}
+
+        with self.stub(old):
+            for command in ("wait r1", "answer r1", "status --json r1"):
+                self.assertIn("1.99", self.problem(command, "client_too_old")["error"])
+        self.assertEqual(len(versions), 3)
+        for version in versions:
+            self.assertRegex(version, r"^cli/1\.\d+$")
+
+        with self.stub(lambda request: (200, {"instance": {"id": "first"}} if request.path == "/api/meta" else {}, {})):
+            self.assertIn("asks", self.problem("answer r1", None)["error"])
+
+        def missing_task(request):
+            if request.path == "/api/meta":
+                return 200, {"instance": {"id": "session"}}, {}
+            return 200, {"id": "r1", "runner": "pi", "model": "sample", "device": "local", "cwd": "/fixture",
+                         "branch": "", "tools": []}, {}
+
+        with self.stub(missing_task):
+            self.assertIn("task", self.problem("session start work", None)["error"])
+
+    def test_follow_preambles_wait_for_valid_feed(self):
+        self.in_subprocess("check_follow_preambles_wait_for_valid_feed")
+
+    def check_follow_preambles_wait_for_valid_feed(self):
+        feed = {"lines": []}
+
+        def response(request):
+            if request.path == "/api/meta":
+                return 200, {"instance": {"id": "follower"}}, {}
+            if request.command == "POST":
+                return 200, {"id": "r1", "task": "", "runner": "pi", "model": "sample", "device": "local",
+                             "cwd": "/fixture", "branch": "", "tools": []}, {}
+            if request.path == "/api/runs/r1":
+                return 200, {"run": {"kind": "session", "status": "done"}}, {}
+            return 200, feed, {}
+
+        with self.stub(response):
+            for command in ("loop start example -f", "session attach r1", "session start --attach work"):
+                with self.subTest(command=command):
+                    self.assertIn("restore_epoch", self.problem(command, None)["error"])
+            feed.update(restore_epoch=0, lines=[{"id": 1, "text": "ready", "ts": "", "kind": "loop"}, {"id": 2}])
+            self.assertIn("feed.lines.text", self.problem("loop start example -f", None)["error"])
+
+    def test_task_updates_and_stop_replay(self):
+        self.in_subprocess("check_task_updates_and_stop_replay")
+
+    def check_task_updates_and_stop_replay(self):
+        from arete import client, record
+        from arete.store import runs, tasks as task_store
+
+        seen = []
+        with self.serve_at(seen):
+            code, lines, err = self.cli("task add --repo replay-sample change")
+            self.assertEqual(code, 0, (lines, err))
+            task = lines[0]
+            self.assertEqual(task_store.task_get(task)["state"], "todo")
+            self.assertFalse(runs.runs())
+            self.assertEqual(json.loads(self.cli("task list")[1][0])["id"], task)
+            before = task_store.task_get(task)["version"]
+            with client.invocation():
+                path = f"/api/v1/tasks/{task}"
+                changed = client.call("PATCH", path, {"base_version": before, "title": "Edited"})["task"]
+                self.assertEqual(changed["title"], "Edited")
+                with self.assertRaises(client.Failed) as stale:
+                    client.call("PATCH", path, {"base_version": before, "title": "Stale"})
+                self.assertEqual(stale.exception.code, 409)
+            self.assertEqual(self.cli(f"task reply {task} reply")[0], 0)
+            self.assertEqual([(c["author"], c["body"]) for c in task_store.task_comments(task)], [("owner", "reply")])
+            self.assertEqual(self.cli(f"task close {task}")[0], 0)
+            self.problem(f"task close {task}", "invalid_state")
+            run = record.start("session", run_id="r1", pid=None)
+            with mock.patch.dict(os.environ, {"ARETE_IDEMPOTENCY_KEY": "stop-replay"}):
+                first = self.cli(f"stop {run}")
+                self.assertEqual(first[0], 0, first)
+                self.assertEqual(self.cli(f"stop {run}")[:2], first[:2])
+            self.assertEqual(runs.run_get(run)["status"], "stopped")
+
+    def test_loop_stop_resolves_the_current_run(self):
+        self.in_subprocess("check_loop_stop_resolves_the_current_run")
+
+    def check_loop_stop_resolves_the_current_run(self):
+        from arete import record
+        from arete.store import runs
+
+        seen = []
+        with self.serve_at(seen), mock.patch.dict(os.environ, {"ARETE_IDEMPOTENCY_KEY": "loop-stop"}):
+            record.start("loop", run_id="r1", loop="poll", pid=None)
+            first = self.cli("loop stop poll")
+            self.assertEqual(first[0], 0, first)
+            self.assertEqual(runs.run_get("r1")["status"], "stopped")
+            self.assertEqual(self.cli("loop stop poll"), (0, ["not running"], ""))
+            record.start("loop", run_id="r2", loop="poll", pid=None)
+            next_run = self.cli("loop stop poll")
+            self.assertEqual(next_run[0], 0, next_run)
+            self.assertEqual(runs.run_get("r2")["status"], "stopped")
+        self.assertEqual([key for method, _, _, key in seen if method == "POST"], ["loop-stop:r1", "loop-stop:r2"])
+        self.assertEqual([path for method, path, _, _ in seen if method == "GET"].count("/api/loops/poll"), 3)
+
+
+class CliThroughServeRunTests(_CliThroughServeCase):
+    def test_task_start_recovers_from_a_dropped_response_and_reload(self):
+        self.in_subprocess("check_task_start_recovers_from_a_dropped_response_and_reload")
+
+    def check_task_start_recovers_from_a_dropped_response_and_reload(self):
+        from errno import ECONNREFUSED
+        from socket import create_connection
+
+        from arete import client
+
+        started = {"task": "t-1234", "state": "queued", "run": ""}
+        sent, refused = [], []
+
+        def response(request):
+            if request.path == "/api/meta":
+                return 200, {"instance": {"id": "reloading"}}, {}
+            sent.append((request.path, request.headers.get("Idempotency-Key")))
+            if len(sent) == 1:
+                return None
+            if len(sent) == 2:
+                return 503, {"error": "server is draining", "code": "draining"}, {"Retry-After": "0"}
+            return 200, started, {}
+
+        def connect(address, *args, **kwargs):
+            if len(sent) == 2 and not refused:
+                refused.append(address)
+                raise ConnectionRefusedError(ECONNREFUSED, os.strerror(ECONNREFUSED))
+            return create_connection(address, *args, **kwargs)
+
+        key = "restart-key"
+        with (self.stub(response), mock.patch("socket.create_connection", side_effect=connect),
+              mock.patch.object(client, "RETRY_SECONDS", 0), mock.patch.dict(os.environ, {"ARETE_IDEMPOTENCY_KEY": key})):
+            code, lines, err = self.cli("run replay-sample 7")
+        self.assertEqual((code, list(map(json.loads, lines)), err), (0, [started], f"Idempotency-Key: {key}\n"))
+        self.assertEqual(len(refused), 1)
+        self.assertEqual(sent, [("/api/tasks", key)] * 3)
+
+    def test_run_validates_terminal_status_before_printing(self):
+        self.in_subprocess("check_run_validates_terminal_status_before_printing")
+
+    def check_run_validates_terminal_status_before_printing(self):
+        from arete import client
+
+        started = {"task": "t-1234", "state": "running", "run": "r1"}
+        step = {"event": "step_end", "seq": 1, "step": "plan"}
+        report = {"event": "report", "seq": 2}
+        events = client.events
+
+        def response(request):
+            if request.path == "/api/meta":
+                return 200, {"instance": {"id": "reports"}}, {}
+            if request.path == "/api/runs/r1/events?from=0&follow=1":
+                return 200, b"".join(json.dumps(line).encode() + b"\n" for line in (step, report)), {}
+            return 200, started, {}
+
+        def observed_events(*args, **kwargs):
+            self.assertEqual(list(map(json.loads, sys.stdout.getvalue().splitlines())), [started])
+            with closing(events(*args, **kwargs)) as stream:
+                yield next(stream)
+                self.assertEqual(list(map(json.loads, sys.stdout.getvalue().splitlines())), [started, step])
+                yield from stream
+
+        with self.stub(response), mock.patch.object(client, "events", side_effect=observed_events):
+            code, lines, err = self.cli("run replay-sample 7")
+            error = {"error": "server answer is missing or has an invalid field status"}
+            self.assertEqual((code, list(map(json.loads, lines))), (1, [started, step, error]), err)
+            self.assertNotIn("Traceback", err)
+            report["status"] = "done"
+            code, lines, err = self.cli("run replay-sample 7")
+        self.assertEqual((code, list(map(json.loads, lines))), (0, [started, step, report]), err)
+
+    def test_run_retries_keep_the_original_version(self):
+        self.in_subprocess("check_run_retries_keep_the_original_version")
+
+    def check_run_retries_keep_the_original_version(self):
+        from arete import record
+        from arete.store import runs
+
+        seen = []
+        with self.serve_at(seen):
+            record.start("loop", run_id="r2", loop="poll", pid=None)
+            for action, command, args in (("resume", "resume r2", ("r2", "")),
+                                          ("repair", "repair r2", ("r2",)),
+                                          ("run_step", "step r2 build", ("r2", "build", {}))):
+                version = runs.run_get("r2")["version"]
+                with (mock.patch.object(tasks, action, return_value={"run": "r2"}) as handler,
+                      mock.patch.dict(os.environ, {"ARETE_IDEMPOTENCY_KEY": f"run-{action}"})):
+                    first = self.cli(command)
+                    self.assertEqual(first[0], 0, first)
+                    runs.note("r2", summary=action)
+                    self.assertGreater(runs.run_get("r2")["version"], version)
+                    self.assertEqual(self.cli(command)[:2], first[:2])
+                    handler.assert_called_once_with(*args, version)
+
+        reads, writes = [], []
+
+        def respond(request):
+            if request.path == "/api/meta":
+                return 200, {"instance": {"id": "ask-replay"}}, {}
+            if request.command == "GET":
+                reads.append(request.path)
+                asks = [{"id": "ask1", "run": "r1"}] if not writes else []
+                return 200, {"asks": asks}, {}
+            writes.append((request.path, request.headers["Idempotency-Key"]))
+            return 200, {"answered": True}, {}
+
+        with self.stub(respond), mock.patch.dict(os.environ, {"ARETE_IDEMPOTENCY_KEY": "ask-replay"}):
+            command = 'answer r1 --json {"answers":[{"text":"yes"}]}'
+            first = self.cli(command)
+            self.assertEqual(first[0], 0, first)
+            self.assertEqual(self.cli(command)[:2], first[:2])
+        self.assertEqual(reads, ["/api/asks"])
+        self.assertEqual(writes, [("/api/asks/ask1/answer", "ask-replay")] * 2)
+
+    def test_interrupted_launch_does_not_repeat(self):
+        self.in_subprocess("check_interrupted_launch_does_not_repeat")
+
+    def check_interrupted_launch_does_not_repeat(self):
+        from arete import record, sessions
+        from arete.store import runs
+
+        def launched(*args, **kwargs):
+            record.start("session", pid=None)
+            raise RuntimeError("interrupted after launch")
+
+        with (self.serve_at([]), mock.patch.object(sessions, "launch", side_effect=launched) as launch,
+              mock.patch.dict(os.environ, {"ARETE_IDEMPOTENCY_KEY": "session-start"})):
+            self.problem("session start work", 500)
+            reply = self.problem("session start work", 409)
+            self.assertIn("earlier request", reply["error"])
+            launch.assert_called_once()
+            self.assertEqual(len(runs.runs(kind="session")), 1)
+
+    def test_deferred_session_attach_can_send_input(self):
+        self.in_subprocess("check_deferred_session_attach_can_send_input")
+
+    def check_deferred_session_attach_can_send_input(self):
+        from arete import client, sessions
+        from arete.commands import sessions as commands
+
+        def follow(run, *, send, remote, on_start):
+            self.assertFalse(remote)
+            on_start()
+            send()
+
+        launched = {"id": "r1", "runner": "pi", "model": "sample", "device": "local", "cwd": str(Path.cwd()),
+                    "branch": "", "tools": [], "task": True}
+        with (mock.patch.object(client, "server", side_effect=AssertionError("contacted serve")),
+              mock.patch.object(sessions, "launch", return_value=launched) as launch,
+              mock.patch.object(sessions, "send") as send, mock.patch.object(commands, "follow", side_effect=follow),
+              mock.patch("select.select", return_value=([True], [], []))):
+            for options in ("", "--draft-pr --repo replay-sample"):
+                code, lines, err = self.cli(f"session start --task --attach {options} work", "hello\n")
+                self.assertEqual(code, 0, (lines, err))
+                self.assertTrue(launch.call_args.kwargs["task"])
+                self.assertEqual(launch.call_args.kwargs["draft_pr"], bool(options))
+                send.assert_called_once_with("r1", "hello\n")
+                send.reset_mock()
+
+    def test_session_attach_uses_serve_for_feed_and_input(self):
+        self.in_subprocess("check_session_attach_uses_serve_for_feed_and_input")
+
+    def check_session_attach_uses_serve_for_feed_and_input(self):
+        from arete import record, sessions
+        from arete.store import runs
+
+        send = sessions.send
+
+        def finish_after_message(session, text):
+            queued = send(session, text)
+            record.settle(session, "done", end_line="done")
+            return queued
+
+        seen = []
+        with (self.serve_at(seen), mock.patch.object(sessions, "send", side_effect=finish_after_message) as steer,
+              mock.patch("select.select", return_value=([True], [], []))):
+            record.start("session", run_id="r1", pid=None)
+            runs.add_feed("r1", "session", "ready for input")
+            code, lines, error = self.cli("session attach r1", "hello\n")
+            self.assertEqual(code, 0, (lines, error))
+            self.assertTrue(lines[0].startswith("following;"))
+            self.assertTrue(any("ready for input" in line for line in lines), lines)
+            steer.assert_called_once_with("r1", "hello\n")
+            self.assertEqual(runs.run_get("r1")["status"], "done")
+        routes = [(method, path) for method, path, status, _ in seen if status == 200]
+        self.assertIn(("GET", "/api/feed/r1?after=0"), routes)
+        self.assertIn(("GET", "/api/runs/r1"), routes)
+        self.assertIn(("POST", "/api/v1/runs/r1/steer"), routes)
+
+    def check_pin_commands(self):
+        from arete import paths
+
+        with self.serve_at([]):
+            paths.record_dir("r1").mkdir(parents=True)
+            for command, code in (("pin r1", 0), ("unpin r1", 0), ("unpin r1", 1), ("pin missing", 1), ("pin", 2)):
+                self.assertEqual(self.cli(f"record {command}")[0], code, command)
+
+    def test_routes_do_not_fall_back(self):
+        self.in_subprocess("check_routes_do_not_fall_back")
+
+    def check_routes_do_not_fall_back(self):
+        writes = []
+
+        def response(request):
+            if request.path == "/api/meta":
+                return 200, {"instance": {"id": "v1-only"}}, {}
+            writes.append((request.path, request.headers.get("Idempotency-Key")))
+            return 404, {"error": "No such route", "code": "not_found"}, {}
+
+        with self.stub(response), mock.patch.dict(os.environ, {"ARETE_IDEMPOTENCY_KEY": "v1-only-key"}):
+            self.problem("session send r1 message", "not_found")
+        self.assertEqual(writes, [("/api/v1/runs/r1/steer", "v1-only-key")])
+
+    def test_invocation_write_keys(self):
+        self.in_subprocess("check_invocation_write_keys")
+
+    def check_invocation_write_keys(self):
+        import hashlib
+
+        from arete import client
+
+        sent = []
+
+        def response(request):
+            if request.path == "/api/meta":
+                return 200, {"instance": {"id": "keys"}}, {}
+            sent.append((request.path, request.headers["Idempotency-Key"]))
+            return 200, {"task": "t-1234", "state": "queued", "run": ""}, {}
+
+        with self.stub(response):
+            long_key = "a" * 128
+            with mock.patch.dict(os.environ, {"ARETE_IDEMPOTENCY_KEY": long_key}):
+                code, lines, err = self.cli("task start --repo replay-sample work")
+                self.assertEqual(code, 0, (lines, err))
+                self.assertIn(long_key, err)
+                with client.invocation(), redirect_stderr(StringIO()):
+                    client.start_task({"repo": "replay-sample", "prompt": "work"})
+                    client.call("POST", "/api/v1/tasks", {"repo": "replay-sample", "body": "work"})
+            with mock.patch.dict(os.environ, {"ARETE_IDEMPOTENCY_KEY": "another-key"}), client.invocation():
+                client.call("POST", "/api/v1/tasks")
+                client.call("POST", "/api/v1/tasks")
+        self.assertEqual(sent, [
+            ("/api/tasks", long_key),
+            ("/api/tasks", long_key),
+            ("/api/v1/tasks", hashlib.sha256((long_key + ":2").encode()).hexdigest()),
+            ("/api/v1/tasks", "another-key"),
+            ("/api/v1/tasks", "another-key:2"),
+        ])
+
+
+class WaitReconnectTests(unittest.TestCase):
+    def test_wait_resumes_after_stream_drop_and_status_502(self):
+        from arete import client, codebase
+
+        step = {"event": "step_end", "seq": 1, "step": "plan"}
+        report = {"event": "report", "seq": 2, "status": "done"}
+        responses = iter((
+            (b"200 OK", json.dumps(step).encode() + b"\n"),
+            (b"502 Bad Gateway", b'{"error":"bad gateway"}'),
+            (b"200 OK", json.dumps(report).encode() + b"\n"),
+        ))
+        requests = []
+
+        def connect(_):
+            status, body = next(responses)
+            transport = mock.Mock()
+            transport.makefile.return_value = BytesIO(b"HTTP/1.0 " + status + b"\r\n\r\n" + body)
+            response = HTTPResponse(transport)
+            response.begin()
+            conn = mock.Mock(sock=transport)
+            conn.request.side_effect = lambda method, path, *_: requests.append((method, path))
+            conn.getresponse.return_value = response
+            return conn
+
+        where = client.Server("http", "127.0.0.1", 80, "127.0.0.1")
+        output = StringIO()
+        with (mock.patch.object(codebase, "load"), mock.patch.object(client, "server", return_value=where),
+              mock.patch.object(client, "connect", side_effect=connect),
+              mock.patch.object(client, "RETRY_SECONDS", 0), redirect_stdout(output)):
+            self.assertEqual(cli.main(["wait", "r1"]), 0, output.getvalue())
+
+        self.assertEqual(list(map(json.loads, output.getvalue().splitlines())), [step, report])
+        self.assertEqual(requests, [
+            ("GET", "/api/runs/r1/events?from=0&follow=1"),
+            ("GET", "/api/runs/r1"),
+            ("GET", "/api/runs/r1/events?from=1&follow=1"),
+        ])
 
 
 class DashboardSnapshotTests(unittest.TestCase):
@@ -890,8 +1919,8 @@ class VersionedApiTests(unittest.TestCase):
 
         registry, _ = request("/api/v1/contract")
         operations = registry["operations"]
-        self.assertEqual(len(operations), 33)
-        self.assertEqual(len({op["name"] for op in operations}), 33)
+        self.assertEqual(len(operations), 44)
+        self.assertEqual(len({op["name"] for op in operations}), 44)
         for op in operations:
             with self.subTest(op=op["name"]):
                 contract.validate(op["example"]["input"], op["input"])

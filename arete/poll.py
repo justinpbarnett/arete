@@ -76,7 +76,8 @@ def next_ticket(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
         listed = source.todo(parked=lambda tid: bool(runlimits.latest_park(repo.name, tid)[1]))
         known = {str(t.id) for t in listed}
         extra = [t for t in recovered if str(t.id) not in known] if source is tk else []
-        for t in queueing.prioritized([*listed, *extra]):
+        open_tickets = source.open_agent_tickets if isinstance(source, tracker.GitHubTracker) else ()
+        for t in queueing.prioritized([*listed, *extra], open_tickets=open_tickets):
             tid = str(t.id)
             if (tid in excluded or other_routes & set(t.labels) or run_store.issue_running(repo.name, t.id)
                     or not pilot.pickable(tid, repo.name)
@@ -333,18 +334,6 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline
         print(f"{util.iso()} {name}: waiting, {waiting}")
         return "held"
     ticket = source.get(tid)
-    if run_store.failed_finish_pending(repo.name, tid):
-        newest = run_store.newest_live_whole_run(repo.name, tid)
-        if newest and (pending := run_store.failed_finish(newest["id"])):
-            owes_label = pending["label_pending"] == "failed"
-            labeled = (source.has_state(tid, "failed") if isinstance(source, tracker.LocalTracker)
-                       else source.label_name("failed") in ticket.labels)
-            if not (owes_label or labeled):
-                if not dry_run:
-                    run_store.discard_failed_finish(newest["id"])
-            elif owes_label or pending["ticket_pending"] or pending["comment"]:
-                skips.note(name, ticket, "its failed run's tracker updates are pending", repo.name)
-                return "blocked"
     blocked, readmission = runlimits.poll_admission(repo, str(tid), ticket, runlimits.Policy.of(layer))
     blocked = blocked or source.blocker(tid) or reply
     if not blocked:
@@ -456,7 +445,6 @@ def poll(dry_run: bool = False) -> int:
         if not dry_run:
             guard(errors, "settling abandoned runs", lambda: settle_abandoned_runs(cfg))
             guard(errors, "syncing PR outcomes", lambda: outcomes.sync_outcomes(cfg))
-            guard(errors, "settling failed runs", lambda: pipeline.sync_failed_finishes(cfg))
             guard(errors, "labeling tickets", lambda: sync_labels(cfg))
         going = Counter(r["repo"] for r in live_pipeline_runs())
         slots = slots_free_to_start(cfg.max_parallel)

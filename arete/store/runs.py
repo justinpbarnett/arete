@@ -21,7 +21,6 @@ TABLES = {
     "environment_holds": "with run",
     "environment_hold_prs": "with run",
     "environment_gap_creations": "kept",
-    "failed_finishes": "with run",
 }
 
 
@@ -29,8 +28,6 @@ OPEN_PR_RUN = "(runs.status = 'pr' OR (runs.status IN ('failed', 'stopped') AND 
 
 WHOLE_RUN = "COALESCE(only_step, '') = ''"
 LIVE_RUN = "dry_run = 0 AND status != 'dry-run'"
-FAILED_FINISH_TICKET_PENDING = "(label_pending = 'failed' OR ticket_pending = 1 OR comment != '')"
-FAILED_FINISH_PENDING = f"({FAILED_FINISH_TICKET_PENDING} OR prs != '{{}}')"
 
 FIRINGS = ("(runs.kind = 'loop' AND runs.loop_kind = 'command' AND runs.status IN ('done', 'skipped') "
            "AND COALESCE(runs.cost_usd, 0) = 0)")
@@ -324,52 +321,6 @@ def newest_whole_run(repo: str, issue: int | str) -> dict | None:
 
 def newest_live_whole_run(repo: str, issue: int | str) -> dict | None:
     return next(iter(ticket_runs(repo, issue, limit=1, whole=True, live=True)), None)
-
-
-def save_failed_finish(run_id: str, comment: str, prs: dict[str, str], **fields) -> None:
-    with writes.atomic() as c:
-        c.execute("INSERT INTO failed_finishes (run_id, comment, prs) VALUES (?, ?, ?)",
-                  (run_id, comment, json.dumps(prs)))
-        note(run_id, label_pending="failed", **fields)
-
-
-def failed_finish(run_id: str) -> dict | None:
-    with reader() as c:
-        row = c.execute("SELECT r.label_pending, f.label_checkpoint, f.ticket_pending, f.comment, f.prs "
-                        "FROM failed_finishes f JOIN runs r ON r.id = f.run_id WHERE f.run_id = ?", (run_id,)).fetchone()
-    return {**row, "prs": json.loads(row["prs"])} if row else None
-
-
-def checkpoint_failed_label(run_id: str, event_id: str) -> None:
-    with db() as c:
-        c.execute("UPDATE failed_finishes SET label_checkpoint = ? WHERE run_id = ?", (event_id, run_id))
-
-
-def note_failed_finish(run_id: str, *, ticket_pending: bool, comment: str, prs: dict[str, str]) -> None:
-    with db() as c:
-        c.execute("UPDATE failed_finishes SET ticket_pending = ?, comment = ?, prs = ? WHERE run_id = ?",
-                  (ticket_pending, comment, json.dumps(prs), run_id))
-
-
-def discard_failed_finish(run_id: str) -> None:
-    with writes.atomic():
-        note_failed_finish(run_id, ticket_pending=False, comment="", prs={})
-        note(run_id, label_pending="")
-
-
-def unfinished_failed_finishes() -> list[dict]:
-    with reader() as c:
-        return [dict(row) for row in c.execute(
-            "SELECT r.id, r.repo, r.issue FROM failed_finishes f JOIN runs r ON r.id = f.run_id "
-            f"WHERE {FAILED_FINISH_PENDING} AND r.status != 'running' ORDER BY r.started, r.rowid")]
-
-
-def failed_finish_pending(repo: str, issue: int | str, *, include_drafts: bool = True) -> bool:
-    pending = FAILED_FINISH_PENDING if include_drafts else FAILED_FINISH_TICKET_PENDING
-    with reader() as c:
-        return c.execute("SELECT 1 FROM failed_finishes f JOIN runs r ON r.id = f.run_id "
-                         f"WHERE r.repo = ? AND r.issue = ? AND {pending} LIMIT 1",
-                         (repo, issue)).fetchone() is not None
 
 
 def environment_requeue(run: dict, since: str) -> tuple[dict, int]:

@@ -25,18 +25,143 @@ from unittest import mock
 from adws import single_worker
 from arete import (
     api_check, ci, config, diffguard, evals, factory, flows, gh, jev, journeys, loop_run, mergecheck, miner,
-    orchestration, owner_asks, paths, pipeline, sandbox, serve, tracker, util, verify, workspace,
+    orchestration, outcomes, owner_asks, paths, pipeline, poll, queueing, runlimits, sandbox, serve, tracker, util,
+    verify, workspace,
 )
 from arete.agent import NO_SESSION, Result
+from arete.orchestration_api import OPERATIONS
 from arete.review import Review
 from arete.store import db, orchestration as ledger
 from tests.parallel import stack_env
 
 
+class QueueScoringTests(unittest.TestCase):
+    def setUp(self):
+        remote = "fixture/repo"
+        self.repo = config.Repo("fixture", Path("."), github=remote, parts=[config.Part("", remote)])
+        self.source = tracker.for_repo(config.Config(), self.repo)
+
+    def issue(self, number, *labels, body="", created="2026-11-21T00:00:00Z", author="fixture"):
+        return {"number": number, "title": f"Issue {number}", "body": body, "createdAt": created,
+                "author": {"login": author}, "labels": [{"name": name} for name in ("agent", *labels)]}
+
+    def next_ticket(self):
+        self.enterContext(mock.patch.object(poll.runlimits, "latest_park", return_value=(None, None)))
+        self.enterContext(mock.patch.multiple(poll.run_store, issue_running=mock.Mock(return_value=False),
+                                             pending_label=mock.Mock(return_value=""),
+                                             environment_waits=mock.Mock(return_value=[])))
+        self.enterContext(mock.patch.object(poll.pilot, "pickable", return_value=True))
+        self.enterContext(mock.patch.object(poll.zte, "reserved", return_value=False))
+        self.enterContext(mock.patch.object(tracker.LocalTracker, "todo", return_value=[]))
+        return poll.next_ticket(self.repo, self.source, pipeline.SkipLog({}))
+
+    def test_waits_on_ignores_oversized_reference(self):
+        oversized = "9" * 4500
+        self.assertEqual(tracker.waits_on(f"Waits on #12, #{oversized}, #34 and #12."), [12, 34])
+
+    def test_poll_uses_valid_reference_alongside_oversized_reference(self):
+        oversized = "9" * 4500
+        body = (f"Waits on #{oversized}, fixture/repo#{oversized}, "
+                f"https://github.com/fixture/repo/issues/{oversized} and #1.")
+        issues = [self.issue(1), self.issue(2, "agent:pr", body=body), self.issue(3, created="2026-11-20T00:00:00Z")]
+        self.enterContext(mock.patch.object(gh, "issues", return_value=issues))
+
+        self.assertEqual(self.next_ticket().id, "1")
+
+    def test_poll_ranks_only_same_repository_references(self):
+        cases = [
+            ("Fixture/Repo#708", "708"),
+            ("https://github.com/Fixture/Repo/issues/708", "708"),
+            ("fixture/other#708", "692"),
+            ("https://github.com/fixture/other/issues/708", "692"),
+        ]
+        for reference, expected in cases:
+            with self.subTest(reference=reference):
+                issues = [self.issue(708), self.issue(283, "agent:pr", body=f"Waits on {reference}."),
+                          self.issue(692, created="2026-11-20T00:00:00Z")]
+                with mock.patch.object(gh, "issues", return_value=issues):
+                    self.assertEqual(self.next_ticket().id, expected)
+
+    def test_poll_prioritizes_prerequisite_of_in_flight_chain(self):
+        issues = [self.issue(1), self.issue(2, "agent:pr", body="Waits on #1."),
+                  self.issue(3, "agent:running", body="Waits on #2."),
+                  self.issue(4, created="2026-11-20T00:00:00Z")]
+        self.enterContext(mock.patch.object(gh, "issues", return_value=issues))
+
+        todo = self.source.todo()
+        self.assertEqual([ticket.id for ticket in todo], ["4", "1"])
+        self.assertEqual(self.next_ticket().id, "1")
+        self.assertEqual(queueing.scores(list(self.source.open_agent_tickets))["1"], (3, 2))
+
+    def test_poll_counts_local_waits_on_inside_underscores(self):
+        older = [self.issue(number, created="2026-11-20T00:00:00Z") for number in (692, 693, 697, 698)]
+        issues = [*older, self.issue(708), self.issue(283, "agent:pr", body="__Waits on #708__")]
+        self.enterContext(mock.patch.object(gh, "issues", return_value=issues))
+
+        todo = self.source.todo()
+        ranked = queueing.prioritized(todo, open_tickets=self.source.open_agent_tickets)
+        self.assertEqual([ticket.id for ticket in ranked], ["708", "692", "693", "697", "698"])
+        self.assertEqual(self.next_ticket().id, "708")
+
+    def test_poll_uses_one_limited_listing_and_main_prerequisite_cache(self):
+        candidate = self.issue(1, body="Waits on #1001.")
+        issues = [candidate, *(self.issue(n, "agent:pr") for n in range(2, 1001))]
+        github = self.enterContext(mock.patch.object(gh, "gh_json", side_effect=[issues, {"state": "CLOSED"}]))
+
+        self.assertEqual(self.next_ticket().id, "1")
+        self.assertEqual(len(self.source.open_agent_tickets), 1000)
+        self.assertIs(self.source.is_open(2), True)
+        self.assertIs(self.source.is_open(1001), False)
+        self.assertEqual(github.call_args_list, [
+            mock.call(["issue", "list", "--repo", "fixture/repo", "--state", "open", "--limit", "1000", "--json",
+                       "number,title,body,labels,url,createdAt,updatedAt,author", "--label", "agent"]),
+            mock.call(["issue", "view", "1001", "--repo", "fixture/repo", "--json",
+                       "number,title,body,labels,url,comments,state,author,updatedAt"]),
+        ])
+
+    def test_poll_preserves_candidate_cycle_ranking_with_unrelated_in_flight_issue(self):
+        issues = [self.issue(1), self.issue(2, body="Waits on #1 and #3."), self.issue(3, body="Waits on #2."),
+                  self.issue(5), self.issue(6, body="Waits on #5.")]
+        with mock.patch.object(gh, "issues", return_value=issues):
+            self.assertEqual(self.next_ticket().id, "5")
+
+        with mock.patch.object(gh, "issues", return_value=[*issues, self.issue(7, "agent:pr")]):
+            self.assertEqual(self.next_ticket().id, "5")
+
+    def test_rank_counts_failed_and_other_ineligible_open_agent_tickets(self):
+        issues = [self.issue(1), self.issue(2, created="2026-11-19T00:00:00Z"),
+                  self.issue(3, "agent:failed", body="Waits on #1, #1, #2 and #6."),
+                  self.issue(4, "agent:zte", body="Waits on #1."), self.issue(5, body="Waits on #1.", author="other"),
+                  self.issue(6, created="2026-11-20T00:00:00Z")]
+        self.enterContext(mock.patch.object(gh, "issues", return_value=issues))
+
+        todo = self.source.todo()
+        self.assertEqual([ticket.id for ticket in todo], ["2", "6", "1"])
+        open_tickets = self.source.open_agent_tickets
+        scores = queueing.scores(list(open_tickets))
+        self.assertEqual((scores["1"], scores["2"], scores["6"]), ((2, 3), (2, 1), (2, 1)))
+        ranked = queueing.prioritized(todo[::-1], open_tickets=open_tickets)
+        self.assertEqual([ticket.id for ticket in ranked], ["1", "2", "6"])
+
+        parked = self.source.todo(parked=lambda tid: tid == "3")
+        self.assertEqual({ticket.id for ticket in parked}, {"1", "2", "3", "6"})
+        self.assertEqual(queueing.scores(list(self.source.open_agent_tickets)), scores)
+
+    def test_todo_refresh_drops_dependents_no_longer_in_open_agent_list(self):
+        first = [self.issue(1), self.issue(2, "agent:pr", body="Waits on #1 and #99.")]
+        self.enterContext(mock.patch.object(gh, "issues", side_effect=[first, first[:1]]))
+
+        self.source.todo()
+        self.assertEqual(queueing.scores(list(self.source.open_agent_tickets)), {"1": (2, 1), "2": (1, 0)})
+
+        self.source.todo()
+        self.assertEqual(queueing.scores(list(self.source.open_agent_tickets)), {"1": (1, 0)})
+
+
 class PublicationFixture(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
-        self.git("init", "-q", "-b", "main")
+        self.git("init", "-q", "--template=", "-b", "main")
         self.file = self.root / "file.txt"
         self.file.write_text("base\n")
         self.commit("base")
@@ -64,8 +189,8 @@ class PublicationFixture(unittest.TestCase):
     def git(self, *args):
         return util.git(list(args), self.root).strip()
 
-    def commit(self, subject):
-        self.git("add", "--", "file.txt")
+    def commit(self, subject, *files):
+        self.git("add", "--", *(files or ("file.txt",)))
         self.git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.com",
                  "-c", "commit.gpgSign=false", "commit", "-qm", subject)
 
@@ -76,7 +201,7 @@ class PublicationFixture(unittest.TestCase):
         self.checkout.pr = "https://github.com/fixture/repo/pull/7"
         self.controller.data["publication"] = {"heads": {self.checkout.github: self.checkout.lease}}
 
-    def publication_job(self, repo, branch, *, verified, carried=False, continues=""):
+    def publication_job(self, repo, branch, *, verified, carried=False, continues="", stamp=True):
         c, controller, b = self.checkout, self.controller, self.build
         run = controller.run
         run.configure_mock(dir=self.root, tid="7", repairs="", feedback=[], feedback_prs=[], facts={}, story=[],
@@ -95,9 +220,336 @@ class PublicationFixture(unittest.TestCase):
         controller.catalog = mock.Mock(context={})
         del controller.atomic, controller.current
         controller.executing = "prior-action"
-        controller.stamp("checks", {"full": True})
-        controller.stamp("review", job.review.asdict())
+        if stamp:
+            controller.stamp("checks", {"full": True})
+            controller.stamp("review", job.review.asdict())
         return job
+
+
+class UnchangedHeadCIRetryTests(PublicationFixture):
+    def setUp(self):
+        super().setUp()
+        self.record_pushed_head()
+        c, controller = self.checkout, self.controller
+        pushed_tree = factory.fingerprint(c.wt)
+        self.assertTrue(pushed_tree)
+        self.enterContext(mock.patch.object(factory, "fingerprint", return_value=pushed_tree))
+        repo = config.Repo("fixture", self.root, parts=[config.Part("", c.github)])
+        job = self.publication_job(repo, "arete/7-edit-fixture", verified=verify.Verified("pass"))
+        job.changed = job.opened = [c.github]
+        job.b.layer.trust_level = "automerge"
+        controller.stamp("verify", {"verdict": "pass"})
+
+        api = f"repos/{c.github}"
+        self.run_path = f"{api}/actions/runs/456"
+        self.workflow_runs_path = f"{api}/actions/runs?event=pull_request&head_sha={c.lease}&per_page=100"
+        self.jobs_path = f"{self.run_path}/attempts/3/jobs?per_page=100"
+        self.failed_job_path = f"{api}/actions/jobs/123"
+        self.failed = self.actions_job(123, 456, 2, "failure")
+        self.head_checks = [self.failed]
+        self.other_pr_check = self.actions_job(200, 789, 1, "success")
+        self.original_run = self.actions_run(456, 7, 2, "completed", "failure")
+        self.other_pr_run = self.actions_run(789, 8, 1, "completed", "failure")
+        self.workflow_runs = [self.original_run]
+
+        def transport(args, **options):
+            endpoint = args[1]
+            if endpoint == self.failed_job_path:
+                return self.failed
+            if endpoint == f"{api}/actions/jobs/200":
+                return self.other_pr_check
+            if endpoint == f"{api}/actions/runs/789":
+                return self.other_pr_run
+            if endpoint.startswith(f"{api}/actions/jobs/"):
+                return next(row for row in self.head_checks if row["id"] == int(endpoint.rsplit("/", 1)[1]))
+            if endpoint == self.workflow_runs_path:
+                return [{"workflow_runs": self.workflow_runs}]
+            if endpoint == self.run_path:
+                return self.actions_run(456, 7, *next(self.run_snapshots))
+            if endpoint == f"{self.run_path}/attempts/3":
+                return self.exact_attempt
+            if endpoint == f"{self.run_path}/attempts/2/jobs?per_page=100":
+                return [{"jobs": [self.failed]}]
+            if endpoint == self.jobs_path:
+                return [{"jobs": next(self.job_snapshots)}]
+            if endpoint.startswith(f"{api}/commits/{c.lease}/check-runs?"):
+                return [{"check_runs": self.head_checks}]
+            if endpoint.startswith(f"{api}/commits/base/check-runs?"):
+                return [{"check_runs": []}]
+            if "/statuses?" in endpoint:
+                return [[]]
+            self.fail(f"unexpected GitHub endpoint {endpoint}")
+
+        self.enterContext(mock.patch.object(gh, "branch_sha", return_value="base"))
+        self.enterContext(mock.patch.object(gh, "pr_merge_details", return_value={
+            "state": "OPEN", "headRefOid": c.lease, "baseRefName": c.base, "mergeable": "MERGEABLE",
+        }))
+        self.enterContext(mock.patch.object(ci, "SETTLE_SECONDS", 0))
+        self.sleep = self.enterContext(mock.patch.object(ci.time, "sleep"))
+        self.enterContext(mock.patch.object(controller, "ci_failures", return_value="checks failed"))
+        self.enterContext(mock.patch.object(pipeline, "publish_ci"))
+        self.enterContext(mock.patch.object(pipeline, "release_workspace"))
+        self.enterContext(mock.patch.object(pipeline, "record_prs", return_value=c.pr))
+        self.github = self.enterContext(mock.patch.object(gh, "gh_json", side_effect=transport))
+        self.command = self.enterContext(mock.patch.object(gh, "gh"))
+        self.draft = True
+
+        def set_draft(pr, draft):
+            self.assertEqual(pr, c.pr)
+            self.draft = draft
+
+        self.set_draft = self.enterContext(mock.patch.object(gh, "pr_set_draft", side_effect=set_draft))
+        self.enterContext(mock.patch.object(gh, "pr_draft_and_head", side_effect=lambda _: (self.draft, c.lease)))
+        self.merge = self.enterContext(mock.patch.object(pipeline, "try_automerge", return_value=None))
+        self.record_ci_failure()
+
+        for obj, name in ((job.b, "restage"), (job.b, "require_valid_diff"),
+                          (controller, "validate_publication_diff"), (pipeline, "commit_and_push")):
+            call = self.enterContext(mock.patch.object(obj, name, side_effect=AssertionError(f"unexpected {name}")))
+            self.addCleanup(call.assert_not_called)
+
+    def record_ci_failure(self):
+        controller, c = self.controller, self.checkout
+        self.assertIn("error", controller.publication_ci([c]))
+        self.assertEqual(controller.data["published_tree"], controller.fingerprint())
+        self.assertTrue(controller.data["ci_failed"])
+
+    def actions_run(self, run, pr, attempt, status, conclusion, *, workflow_id=99):
+        return {"id": run, "head_sha": self.checkout.lease, "workflow_id": workflow_id, "run_number": run,
+                "event": "pull_request", "pull_requests": [{"number": pr}],
+                "run_attempt": attempt, "status": status, "conclusion": conclusion}
+
+    def actions_job(self, job, run, attempt, conclusion, name="arete-checks"):
+        return {"id": job, "run_id": run, "run_attempt": attempt, "head_sha": self.checkout.lease,
+                "name": name, "status": "completed", "conclusion": conclusion,
+                "app": {"id": gh.GITHUB_ACTIONS_APP_ID, "slug": "github-actions"}}
+
+    def request_retry(self, action=None):
+        waits = self.controller.run.waiting.call_args_list[:]
+        self.assertIsNone(self.controller.dispatch(action or self.action))
+        self.command.assert_called_once_with(["run", "rerun", "456", "--failed", "--repo", self.checkout.github],
+                                             write=True)
+        self.assertEqual(self.controller.run.waiting.call_args_list, [*waits, mock.call("ci")])
+
+    def complete_retry(self, conclusion):
+        self.head_checks.append(self.other_pr_check)
+        previous, finished = (2, "completed", "failure"), (3, "completed", conclusion)
+        self.run_snapshots = iter([previous, (3, "in_progress", None), finished, finished, finished])
+        lagging_jobs = [[], [self.actions_job(124, 456, 2, "success")]] if conclusion == "success" else []
+        self.job_snapshots = iter([*lagging_jobs, [self.actions_job(125, 456, 3, conclusion)]])
+
+        def still_waiting(_):
+            self.assertTrue(self.draft)
+            self.merge.assert_not_called()
+
+        self.sleep.side_effect = still_waiting
+        self.request_retry()
+        self.assertEqual(self.sleep.call_count, 2 + len(lagging_jobs))
+
+    def test_publication_request_reruns_failed_jobs_and_resumes_publication_after_green_ci(self):
+        def merge(*args, **kwargs):
+            self.assertFalse(self.draft)
+
+        self.merge.side_effect = merge
+        self.complete_retry("success")
+        self.merge.assert_called_once()
+        self.assertEqual(self.controller.ending[0], "pr")
+        self.assertNotIn("ci_failed", self.controller.data)
+        self.assertEqual(self.transition.call_args.args[2], "succeeded")
+
+    def test_second_red_on_the_same_head_fails_publication_with_the_exact_reason(self):
+        self.complete_retry("failure")
+        self.assertEqual(self.controller.data["ci_retry"]["targets"][self.checkout.github]["jobs"], [125])
+        self.assert_second_red()
+
+    def test_unchanged_request_resumes_timed_out_rerun_and_reports_its_failure(self):
+        self.run_snapshots = iter([(3, "in_progress", None), (3, "completed", "failure")])
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "failure")]])
+        with mock.patch.object(ci, "WAIT_SECONDS", 0):
+            self.request_retry()
+        self.assert_retry_held()
+
+        self.controller.data = json.loads(json.dumps(self.controller.data))
+        verify_evidence = self.controller.data["evidence"]["verify"]
+        with mock.patch.dict(verify_evidence, tree="stale"):
+            stale_action = {**self.action, "id": "d0002-1"}
+            self.assertEqual(str(self.controller.dispatch(stale_action)), "publication needs current evidence: verify")
+        self.assert_second_red()
+        self.assertEqual(self.controller.run.waiting.call_args_list, [mock.call("ci")] * 3)
+
+    def test_unchanged_request_resumes_timed_out_rerun_and_publishes_on_green(self):
+        self.run_snapshots = iter([(3, "in_progress", None), (3, "completed", "success")])
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "success")]])
+        with mock.patch.object(ci, "WAIT_SECONDS", 0):
+            self.request_retry()
+        self.assert_retry_held()
+
+        self.assertIsNone(self.controller.dispatch({**self.action, "id": "d0002-0"}))
+        self.command.assert_called_once()
+        self.merge.assert_called_once()
+        self.assertFalse(self.draft)
+        self.assertNotIn("ci_retry", self.controller.data)
+
+    def assert_second_red(self):
+        self.assertIsNone(self.controller.ending)
+        self.assertTrue(self.draft)
+        next_action = {**self.action, "id": "d0002-0"}
+        self.assertIsNone(self.controller.dispatch(next_action))
+        reason = f"CI failed twice on the unchanged head {self.checkout.lease}"
+        self.assertEqual(self.controller.ending, ("failed", reason, self.checkout.pr))
+        self.transition.assert_called_with(self.controller.lease, next_action["id"], "failed", {"error": reason})
+        self.command.assert_called_once()
+        self.merge.assert_not_called()
+
+    def test_completed_attempt_without_the_replacement_job_keeps_publication_blocked(self):
+        self.head_checks.append(self.other_pr_check)
+        self.run_snapshots = iter([(3, "completed", "success")])
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "success", name="other-job")]])
+        with mock.patch.object(ci, "WAIT_SECONDS", 0):
+            self.request_retry()
+        self.assertTrue(self.controller.data["ci_failed"])
+        self.assertIsNone(self.controller.ending)
+        self.assertTrue(self.draft)
+        self.merge.assert_not_called()
+
+    def test_failed_attempt_without_the_replacement_job_counts_as_second_red(self):
+        self.run_snapshots = iter([(3, "completed", "failure")])
+        self.job_snapshots = iter([[]])
+        with mock.patch.object(ci, "WAIT_SECONDS", 0):
+            self.request_retry()
+        reds = self.controller.ci_failures.call_args.args[0].reds
+        self.assertEqual([r.check.description for r in reds], ["Workflow attempt 3 concluded failure"])
+        self.assert_second_red()
+
+    def test_newer_pending_attempt_keeps_publication_draft_after_the_requested_attempt_passes(self):
+        self.run_snapshots = iter([(4, "in_progress", None)])
+        self.exact_attempt = self.actions_run(456, 7, 3, "completed", "success")
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "success")]])
+        pending = self.actions_job(126, 456, 4, None)
+        self.head_checks.append({**pending, "status": "in_progress"})
+        with mock.patch.object(ci, "WAIT_SECONDS", 0):
+            self.request_retry()
+        self.assert_retry_held()
+        watched, = self.controller.ci_failures.call_args.args[0].seen
+        self.assertFalse(watched.read)
+        self.assertEqual([check.source for check in watched.in_state("pending")], ["workflow:456"])
+
+    def test_newer_failed_attempt_keeps_publication_draft_after_another_check_finishes(self):
+        independent = self.actions_job(300, 789, 1, None, name="independent")
+        self.head_checks.append({**independent, "status": "in_progress"})
+        self.run_snapshots = iter([(3, "completed", "success"), (4, "completed", "failure")])
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "success")]])
+
+        def finish_checks(_):
+            self.head_checks = [self.actions_job(126, 456, 4, "failure"),
+                                {**independent, "conclusion": "success"}]
+
+        self.sleep.side_effect = finish_checks
+        self.request_retry()
+        self.sleep.assert_called_once()
+        self.assert_retry_held()
+        reds = self.controller.ci_failures.call_args.args[0].reds
+        self.assertEqual([r.check.description for r in reds], ["Workflow attempt 4 concluded failure"])
+
+    def test_newer_run_of_the_same_workflow_keeps_publication_draft(self):
+        self.run_snapshots = iter([(3, "completed", "success")])
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "success")]])
+
+        def start_newer_run(*args, **kwargs):
+            self.workflow_runs.append(self.actions_run(457, 7, 1, "completed", "failure"))
+
+        self.command.side_effect = start_newer_run
+        self.request_retry()
+        self.assert_retry_held()
+        reds = self.controller.ci_failures.call_args.args[0].reds
+        self.assertEqual([r.check.source for r in reds], ["workflow:457"])
+
+    def assert_newer_check_from_separate_workflow_holds_publication(self, status, conclusion, state):
+        separate = self.actions_run(458, 7, 2, status, conclusion, workflow_id=100)
+        self.run_snapshots = iter([(3, "completed", "success")])
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "success")]])
+
+        def rerun_requested(*args, **kwargs):
+            self.workflow_runs.append(separate)
+            self.head_checks.append({**self.actions_job(127, 458, 2, conclusion), "status": status})
+
+        self.command.side_effect = rerun_requested
+        with mock.patch.object(ci, "WAIT_SECONDS", 0):
+            self.request_retry()
+        self.assert_retry_held()
+        watched, = self.controller.ci_failures.call_args.args[0].seen
+        self.assertEqual([check.job for check in watched.in_state(state)], [127])
+        self.assertEqual([check.job for check in watched.in_state("pass")], [125])
+
+    def test_newer_red_check_from_separate_same_name_workflow_keeps_publication_draft(self):
+        self.assert_newer_check_from_separate_workflow_holds_publication("completed", "failure", "fail")
+
+    def test_newer_pending_check_from_separate_same_name_workflow_keeps_publication_draft(self):
+        self.assert_newer_check_from_separate_workflow_holds_publication("in_progress", None, "pending")
+
+    def assert_retry_held(self):
+        self.assertTrue(self.draft)
+        self.assertNotIn(mock.call(self.checkout.pr, False), self.set_draft.call_args_list)
+        self.merge.assert_not_called()
+        self.assertIsNone(self.controller.ending)
+        self.assertTrue(self.controller.data.get("ci_failed"))
+
+    def test_newer_same_name_failure_on_another_pr_never_spends_this_prs_retry(self):
+        self.other_pr_check["conclusion"] = "failure"
+        self.head_checks.append(self.other_pr_check)
+        self.record_ci_failure()
+        self.assertEqual(self.controller.data["ci_retry"]["targets"][self.checkout.github]["jobs"], [200])
+        self.workflow_runs = [self.other_pr_run]
+        refusal = self.controller.dispatch(self.action)
+        self.assertEqual(str(refusal), "the failed CI has no GitHub Actions jobs to rerun")
+        self.command.assert_not_called()
+        self.assertFalse(self.controller.data["ci_retried_heads"])
+
+        self.workflow_runs.append(self.original_run)
+        self.run_snapshots = iter([(3, "completed", "success")])
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "success")]])
+        self.merge.side_effect = lambda *args, **kwargs: setattr(self, "draft", False)
+        self.request_retry({**self.action, "id": "d0002-0"})
+        self.github.assert_any_call(["api", f"repos/{self.checkout.github}/actions/jobs/200"])
+        self.merge.assert_called_once()
+
+    def test_failed_rerun_replaces_a_stale_skipped_dependent_check(self):
+        self.head_checks.append(self.actions_job(124, 456, 2, "skipped", name="dependent"))
+        self.run_snapshots = iter([(3, "completed", "failure")])
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "success"),
+                                    self.actions_job(126, 456, 3, "failure", name="dependent")]])
+        self.request_retry()
+        reds = self.controller.ci_failures.call_args.args[0].reds
+        self.assertEqual([(r.check.name, r.check.job) for r in reds], [("dependent", 126)])
+        self.assert_second_red()
+
+    def test_failed_workflow_conclusion_blocks_publication_when_the_rerun_job_passed(self):
+        self.run_snapshots = iter([(4, "completed", "success")])
+        self.exact_attempt = self.actions_run(456, 7, 3, "completed", "failure")
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "success")]])
+        self.request_retry()
+        reds = self.controller.ci_failures.call_args.args[0].reds
+        self.assertEqual([r.check.description for r in reds], ["Workflow attempt 3 concluded failure"])
+        self.assert_second_red()
+
+    def test_confirmed_second_red_is_kept_when_an_independent_check_times_out(self):
+        pending = self.actions_job(200, 789, 1, None, name="independent")
+        self.head_checks.append({**pending, "status": "in_progress"})
+        self.run_snapshots = iter([(3, "completed", "failure")])
+        self.job_snapshots = iter([[self.actions_job(125, 456, 3, "failure")]])
+        with mock.patch.object(ci, "WAIT_SECONDS", 0):
+            self.request_retry()
+        watched, = self.controller.ci_failures.call_args.args[0].seen
+        self.assertFalse(watched.read)
+        self.assertEqual([check.name for check in watched.in_state("pending")], ["independent"])
+        self.assertEqual(self.controller.data["ci_retry"]["targets"][self.checkout.github]["jobs"], [125])
+        self.assert_second_red()
+
+    def test_publication_retry_requires_current_verification(self):
+        self.controller.data["evidence"]["verify"]["tree"] = "stale"
+        refusal = self.controller.dispatch(self.action)
+        self.assertEqual(str(refusal), "publication needs current evidence: verify")
+        self.command.assert_not_called()
 
 
 class SingleWorkerPublicationTests(PublicationFixture):
@@ -366,6 +818,670 @@ class PendingBaseMergePublicationTests(PublicationFixture):
         self.assertEqual(self.git("show", "HEAD:file.txt"), "implementation")
 
 
+class ResolverScratchFixture(unittest.TestCase):
+    MARKER = "arete-verification-scratch-v1\n"
+    LOG = ".arete-sandbox/logs/db.log"
+    TRACKED = ".arete-sandbox/logs/tracked.txt"
+    merge_fixture = None
+
+    def setUp(self):
+        self.enterContext(mock.patch.object(util, "repo_lock", return_value=nullcontext()))
+
+    @classmethod
+    def create_merge(cls, root, tracked_changed_by="", tracked_added_by_base=False):
+        def git(*args, check=True):
+            subprocess.run(["git", *args], cwd=root, check=check, capture_output=True, text=True)
+
+        git("init", "-q", "-b", "main", "--template=")
+        git("config", "user.name", "Fixture")
+        git("config", "user.email", "fixture@example.test")
+        git("config", "commit.gpgsign", "false")
+        (root / ".gitignore").write_text(".arete-sandbox/\nignored.local\nproject/.arete-owned\nproject/private.local\n")
+        (root / "project").mkdir()
+        (root / "project/tracked.txt").write_text("untouched\n")
+        (root / "conflict.txt").write_text("original\n")
+        tracked = root / cls.TRACKED
+        if tracked_changed_by or tracked_added_by_base:
+            tracked.parent.mkdir(parents=True)
+            (root / ".arete-sandbox/.arete-owned").write_text(cls.MARKER)
+        if tracked_changed_by:
+            tracked.write_text("original tracked content\n")
+            git("add", "-f", "--", cls.TRACKED)
+        git("add", ".")
+        git("commit", "-qm", "original")
+        git("checkout", "-qb", "branch")
+        (root / "conflict.txt").write_text("branch\n")
+        (root / "supplemental.txt").write_text("branch addition\n")
+        if tracked_changed_by in ("branch", "both"):
+            tracked.write_text("branch content\n")
+        git("add", ".")
+        git("commit", "-qm", "branch change")
+        git("checkout", "-q", "main")
+        (root / "conflict.txt").write_text("base\n")
+        if tracked_changed_by in ("base", "both") or tracked_added_by_base:
+            tracked.write_text("base content\n")
+        if tracked_changed_by == "removed by base":
+            tracked.unlink()
+        if tracked_added_by_base:
+            (root / "incoming.txt").write_text("incoming addition\n")
+            git("add", "-f", "--", cls.TRACKED)
+            git("add", "--", "incoming.txt")
+        git("commit", "-qam", "base change")
+        git("checkout", "-q", "branch")
+        git("merge", "--no-commit", "main", check=False)
+
+    def merge(self, tracked_changed_by="", tracked_added_by_base=False):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        if self.merge_fixture is not None:
+            shutil.copytree(self.merge_fixture, self.root, dirs_exist_ok=True)
+        else:
+            self.create_merge(self.root, tracked_changed_by, tracked_added_by_base)
+        self.conflicts = [self.TRACKED, "conflict.txt"] if tracked_changed_by == "both" else ["conflict.txt"]
+        self.assertEqual(pipeline.unmerged_paths(self.root), self.conflicts)
+        self.checkout = workspace.Checkout("", "fixture/repo", self.root, self.root, "main",
+                                           base_commit=self.git("rev-parse", "main"))
+        self.layer = config.RepoLayer(self.root)
+        self.run = mock.Mock(repo=SimpleNamespace(name="repo"), sessions={}, owner_note="",
+                             settings=mock.Mock(return_value=SimpleNamespace(tries=1)))
+
+    def git(self, *args, check=True):
+        return util.git(list(args), self.root, check=check).strip()
+
+    def resolve(self, edit):
+        def agent(*args, **kwargs):
+            (self.root / "conflict.txt").write_text("branch and base\n")
+            edit()
+            return Result(ok=True, structured={"resolved": True})
+
+        self.run.agent.side_effect = agent
+        pipeline.resolve_conflicts(self.run, self.checkout, self.conflicts, self.layer,
+                                   tracker.Ticket("719", "#719", "Scratch exemption", "", ""))
+
+    def write_log(self):
+        log = self.root / self.LOG
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a") as out:
+            out.write("verification ran\n")
+
+    def assert_outside_conflict(self, edit, paths):
+        with self.assertRaises(workspace.RunFailed) as failed:
+            self.resolve(edit)
+        self.assertEqual(str(failed.exception), f"the resolver edited files outside the conflict in fixture/repo: {paths}")
+
+
+class SharedResolverScratchFixture(ResolverScratchFixture):
+    @classmethod
+    def setUpClass(cls):
+        cls.merge_fixture = Path(tempfile.mkdtemp())
+        cls.addClassCleanup(shutil.rmtree, cls.merge_fixture, ignore_errors=True)
+        cls.create_merge(cls.merge_fixture)
+
+
+class ResolverScratchTests(SharedResolverScratchFixture):
+    def test_wrapper_scratch_stays_out_of_merge(self):
+        self.merge()
+        scratch = self.root / ".arete-sandbox"
+        scratch.mkdir()
+        (scratch / ".gitignore").write_text("*\n")
+        (scratch / ".arete-owned").write_text(self.MARKER)
+        (self.root / "project/.arete-owned").write_text(self.MARKER.removesuffix("\n"))
+
+        def edit():
+            self.write_log()
+            (self.root / "project/untracked.txt").write_text("untracked scratch\n")
+            (self.root / "supplemental.txt").write_text("updated branch addition\n")
+
+        with mock.patch.object(pipeline, "git", wraps=pipeline.git) as git:
+            self.resolve(edit)
+        staged = [call.args[0] for call in git.call_args_list if call.args[0][0] == "add"]
+        self.assertEqual(staged, [["add", "-u", "--", "conflict.txt", "supplemental.txt"]])
+        self.assertEqual(len(self.git("rev-list", "--parents", "-n", "1", "HEAD").split()), 3)
+        self.assertEqual(self.git("show", "HEAD:conflict.txt"), "branch and base")
+        self.assertEqual(self.git("show", "HEAD:supplemental.txt"), "updated branch addition")
+        self.assertEqual(self.git("ls-tree", "-r", "--name-only", "HEAD", "--", ".arete-sandbox"), "")
+        self.assertEqual((self.root / self.LOG).read_text(), "verification ran\n")
+        self.assertEqual(workspace.untracked_files(self.root), {"project/untracked.txt"})
+
+    def test_invalid_scratch_markers_do_not_exempt_ignored_log_changes(self):
+        self.merge()
+        scratch = self.root / ".arete-sandbox"
+        marker = scratch / ".arete-owned"
+        (self.root / ".arete-owned").write_text(self.MARKER)
+        for kind in ("missing", "symlink", "wrong text", "blank line"):
+            with self.subTest(marker=kind):
+                marker.unlink(missing_ok=True)
+                self.write_log()
+                if kind == "symlink":
+                    marker.symlink_to("../.arete-owned")
+                elif kind == "wrong text":
+                    marker.write_text("someone else's scratch\n")
+                elif kind == "blank line":
+                    marker.write_text(self.MARKER + "\n")
+                self.assert_outside_conflict(self.write_log, self.LOG)
+
+    def test_scratch_exemption_preserves_other_path_checks(self):
+        self.merge()
+        folder = self.root / "project"
+        (folder / ".arete-owned").write_text(self.MARKER.removesuffix("\n"))
+        self.write_log()
+        (self.root / ".arete-sandbox/.arete-owned").write_text(self.MARKER)
+        (self.root / "ignored.local").write_text("ignored original\n")
+
+        def edit():
+            self.write_log()
+            (self.root / "ignored.local").write_text("ignored edit\n")
+            (folder / "private.local").write_text("scratch edit\n")
+            (folder / "tracked.txt").write_text("tracked edit\n")
+            (folder / "untracked.txt").write_text("untracked addition\n")
+            (self.root / "outside.txt").write_text("outside addition\n")
+
+        self.assert_outside_conflict(edit, "ignored.local, outside.txt, project/tracked.txt")
+
+    def test_resolving_without_the_wrapper_leaves_scratch_absent(self):
+        self.merge()
+        scratch = self.root / ".arete-sandbox"
+        self.assertFalse(scratch.exists())
+        self.resolve(lambda: None)
+        self.assertFalse(scratch.exists())
+
+    def test_first_use_keeps_existing_scratch_entry(self):
+        self.merge()
+        self.layer.allow_bash.append("sandbox *")
+        scratch = self.root / ".arete-sandbox"
+        scratch.symlink_to("missing", target_is_directory=True)
+        self.resolve(lambda: self.assertEqual(scratch.readlink(), Path("missing")))
+        self.assertFalse((self.root / "missing").exists())
+
+    def test_resolver_cannot_exempt_a_new_scratch_directory(self):
+        self.merge()
+        scratch = self.root / ".arete-sandbox"
+        self.assertFalse(scratch.exists())
+        for forged_marker in (False, True):
+            with self.subTest(forged_marker=forged_marker):
+                def edit():
+                    scratch.mkdir(exist_ok=True)
+                    (scratch / "unrelated.txt").write_text(f"outside edit {forged_marker}\n")
+                    if forged_marker:
+                        (scratch / ".arete-owned").write_text(self.MARKER)
+
+                expected = ".arete-sandbox/unrelated.txt"
+                if forged_marker:
+                    expected = ".arete-sandbox/.arete-owned, " + expected
+                self.assert_outside_conflict(edit, expected)
+
+    def test_unreadable_ignored_scratch_requires_a_still_valid_marker(self):
+        self.merge()
+        self.write_log()
+        marker = self.root / ".arete-sandbox/.arete-owned"
+        log = self.root / self.LOG
+        fingerprint = workspace.fingerprint
+
+        def fingerprint_file(path, salt):
+            if path == log:
+                raise PermissionError(path)
+            return fingerprint(path, salt)
+
+        for invalidate in (True, False):
+            with self.subTest(invalidate=invalidate):
+                marker.write_text(self.MARKER)
+
+                def edit():
+                    self.write_log()
+                    if invalidate:
+                        marker.unlink()
+
+                with mock.patch.object(workspace, "fingerprint", side_effect=fingerprint_file):
+                    if invalidate:
+                        self.assert_outside_conflict(edit, f".arete-sandbox/.arete-owned, {self.LOG}")
+                    else:
+                        self.resolve(edit)
+                        self.assertEqual(self.git("ls-tree", "-r", "--name-only", "HEAD", "--", self.LOG), "")
+
+    def test_invalidated_scratch_markers_do_not_exempt_ignored_log_changes(self):
+        self.merge()
+        self.write_log()
+        marker = self.root / ".arete-sandbox/.arete-owned"
+        for kind in ("missing", "symlink", "wrong text", "blank line", "replacement"):
+            with self.subTest(marker=kind):
+                marker.unlink(missing_ok=True)
+                marker.write_text(self.MARKER)
+                (marker.parent / "marker-source").write_text(self.MARKER)
+
+                def edit():
+                    self.write_log()
+                    if kind in ("missing", "symlink"):
+                        marker.unlink()
+                        if kind == "symlink":
+                            marker.symlink_to("marker-source")
+                    elif kind == "replacement":
+                        marker.with_name("marker-source").replace(marker)
+                    else:
+                        marker.write_text("wrong text\n" if kind == "wrong text" else self.MARKER + "\n")
+
+                expected = f".arete-sandbox/.arete-owned, {self.LOG}"
+                if kind == "replacement":
+                    expected += ", .arete-sandbox/marker-source"
+                self.assert_outside_conflict(edit, expected)
+
+    def test_resolver_cannot_make_an_ignored_path_scratch(self):
+        self.merge()
+        marker = self.root / "project/.arete-owned"
+        ignored = self.root / "project/private.local"
+        for initial in (None, "wrong text\n"):
+            with self.subTest(initial=initial):
+                if initial is not None:
+                    marker.write_text(initial)
+                ignored.write_text("original\n")
+
+                def edit():
+                    marker.write_text(self.MARKER)
+                    ignored.write_text("ignored edit\n")
+
+                self.assert_outside_conflict(edit, "project/.arete-owned, project/private.local")
+
+
+class TrackedResolverScratchTests(ResolverScratchFixture):
+    def test_incoming_tracked_addition_is_preserved(self):
+        self.merge(tracked_added_by_base=True)
+        staged = self.git("diff", "--cached", "--name-only", "--diff-filter=A").splitlines()
+        self.assertEqual(staged, [self.TRACKED, "incoming.txt"])
+        self.resolve(self.write_log)
+        self.assertEqual(self.git("show", f"HEAD:{self.TRACKED}"), "base content")
+        self.assertEqual(self.git("ls-tree", "-r", "--name-only", "HEAD", "--", self.LOG), "")
+        self.assertEqual(self.git("show", "HEAD:incoming.txt"), "incoming addition")
+        self.assertEqual(workspace.uncommitted(self.root), [])
+
+    def test_unrelated_tracked_scratch_edit_fails(self):
+        self.merge(tracked_changed_by="neither")
+        head = self.git("rev-parse", "HEAD")
+        tracked = self.root / self.TRACKED
+
+        def edit():
+            self.write_log()
+            tracked.write_text("unrelated edit\n")
+
+        self.assert_outside_conflict(edit, self.TRACKED)
+        self.assertEqual(tracked.read_text(), "unrelated edit\n")
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+
+    def test_tracked_supplemental_scratch_edit_reaches_the_merge_commit(self):
+        for parent in ("branch", "base"):
+            with self.subTest(parent=parent):
+                self.merge(tracked_changed_by=parent)
+
+                def edit():
+                    self.write_log()
+                    (self.root / self.TRACKED).write_text("adapted content\n")
+
+                with mock.patch.object(pipeline, "git", wraps=pipeline.git) as git:
+                    self.resolve(edit)
+                staged = [call.args[0] for call in git.call_args_list if call.args[0][0] == "add"]
+                self.assertEqual(staged, [["add", "-u", "--", "conflict.txt", self.TRACKED]])
+                self.assertEqual(self.git("show", f"HEAD:{self.TRACKED}"), "adapted content")
+                self.assertEqual(self.git("ls-tree", "-r", "--name-only", "HEAD", "--", self.LOG), "")
+                self.assertEqual((self.root / self.LOG).read_text(), "verification ran\n")
+                self.assertEqual(workspace.uncommitted(self.root), [])
+
+    def test_parent_tracked_path_under_logs_can_be_restored(self):
+        self.merge(tracked_changed_by="removed by base")
+        tracked = self.root / self.TRACKED
+        self.assertFalse(tracked.exists())
+
+        def edit():
+            self.write_log()
+            tracked.write_text("restored parent content\n")
+
+        self.resolve(edit)
+        self.assertEqual(self.git("show", f"HEAD:{self.TRACKED}"), "restored parent content")
+        self.assertEqual(self.git("ls-tree", "-r", "--name-only", "HEAD", "--", self.LOG), "")
+
+    def test_tracked_scratch_conflict_is_resolved(self):
+        self.merge(tracked_changed_by="both")
+
+        def edit():
+            self.write_log()
+            (self.root / self.TRACKED).write_text("resolved content\n")
+
+        self.resolve(edit)
+        self.assertEqual(self.git("show", f"HEAD:{self.TRACKED}"), "resolved content")
+        self.assertEqual(self.git("ls-tree", "-r", "--name-only", "HEAD", "--", self.LOG), "")
+        self.assertEqual(pipeline.unmerged_paths(self.root), [])
+
+    def test_tracked_scratch_conflict_respects_repository_deny(self):
+        self.merge(tracked_changed_by="both")
+        self.layer.deny.append(self.TRACKED)
+        with self.assertRaisesRegex(workspace.RunFailed, r"conflicts in protected paths"):
+            self.resolve(self.write_log)
+        self.run.agent.assert_not_called()
+
+
+class FirstUseResolverScratchTests(SharedResolverScratchFixture):
+    def test_first_use_initializes_scratch_for_trusted_wrapper(self):
+        self.merge()
+        scratch = self.root / ".arete-sandbox"
+        self.assertFalse(scratch.exists())
+        self.layer.allow_bash.append("sandbox *")
+
+        def edit():
+            self.assertEqual(stat.S_IMODE(scratch.stat().st_mode), 0o700)
+            self.assertEqual((scratch / ".arete-owned").read_text(), self.MARKER)
+            self.assertEqual((scratch / ".gitignore").read_text(), "*\n")
+            self.write_log()
+
+        self.resolve(edit)
+        self.assertEqual(self.git("show", "HEAD:conflict.txt"), "branch and base")
+        self.assertEqual(self.git("ls-tree", "-r", "--name-only", "HEAD", "--", ".arete-sandbox"), "")
+
+    def test_first_use_without_trusted_wrapper_rejects_scratch_write(self):
+        self.merge()
+        self.layer.allow_bash.extend(["echo sandbox *", "./sandbox *"])
+        scratch = self.root / ".arete-sandbox"
+        self.assertFalse(scratch.exists())
+
+        def edit():
+            self.assertFalse(scratch.exists())
+            self.write_log()
+
+        self.assert_outside_conflict(edit, self.LOG)
+
+
+class CatchUpRepairFixture(PublicationFixture):
+    def prepare_publication(self, gate, *, spent=False, move_base_again=False):
+        c, b, controller = self.checkout, self.build, self.controller
+        branch = "arete/7-edit-fixture"
+        self.git("branch", branch)
+        incoming = self.root / "incoming.txt"
+        incoming.write_text("new base\n" * 100)
+        self.commit("base moved", "incoming.txt")
+        self.base = self.git("rev-parse", "HEAD")
+        next_base = ""
+        if move_base_again:
+            incoming.write_text("newer base\n" * 100)
+            self.commit("base moved again", "incoming.txt")
+            next_base = self.git("rev-parse", "HEAD")
+        self.git("switch", "-q", branch)
+        self.file.write_text("implementation\n")
+        repo = config.Repo("fixture", self.root, github=c.github, parts=[config.Part("", c.github)])
+        b.layer.trust_level, b.layer.verify, b.layer.checks = "automerge", config.Verify(), {"local": "check"}
+        b.layer.max_diff_lines = 20
+        job = self.publication_job(repo, branch, verified=verify.Verified("pass"), stamp=False)
+        state = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        self.enterContext(mock.patch.multiple(paths, STATE_DIR=state, DB_FILE=state / "arete.db",
+                                             RUNS_DIR=state / "runs", LOCKS_DIR=state / "locks",
+                                             WORKTREES_DIR=state / "worktrees", LOG_DIR=state / "logs"))
+        db.migrate()
+        rid = pipeline.record.start("pipeline", repo=repo.name, issue="7")
+        folder = paths.RUNS_DIR / rid
+        folder.mkdir(parents=True)
+        run = pipeline.Run(rid, repo, folder, tracker=tracker.GitHubTracker(repo), tid="7",
+                           path="orchestrate", layer=b.layer, workspace=(self.root, [c]))
+        controller.run = job.run = b.run = run
+        self.enterContext(mock.patch.object(run, "log"))
+        run.budget = runlimits.Budget(run, runlimits.Policy(max_repair_cycles=1), "")
+        if spent:
+            run.budget.charge("earlier_worker", "review_repair")
+        self.transition.return_value = mock.DEFAULT
+        del controller.persist
+        controller.policy = config.Orchestration()
+        controller.lease = ledger.acquire(run.id, "", controller.data)
+        controller.catalog.route.side_effect = lambda key, *_: SimpleNamespace(step=key, runner="codex")
+        controller.catalog.add_context.side_effect = controller.catalog.context.__setitem__
+        controller.selected = mock.Mock(return_value=nullcontext())
+        self.head, self.body, self.draft, self.merged, self.ticket_open = "", "", False, False, True
+        self.pushes, self.ci_heads, self.labels, self.comments = [], [], set(), []
+        self.message = {"checks": "local check output from the merged base",
+                        "verify": "verification reproduced the bug on the merged base",
+                        "review": "review found a blocker specific to the merged base"}[gate]
+        fingerprints = {}
+        git_fingerprint = factory.fingerprint
+
+        def fingerprint(folder):
+            files = tuple((p.name, p.read_bytes()) for p in (self.file, incoming) if p.exists())
+            if files not in fingerprints:
+                fingerprints[files] = git_fingerprint(folder)
+            return fingerprints[files]
+
+        self.enterContext(mock.patch.object(factory, "fingerprint", side_effect=fingerprint))
+
+        def holds():
+            return incoming.exists() and self.file.read_text() == "implementation\n"
+
+        def check(*_, **__):
+            return (False, self.message) if gate == "checks" and holds() else (True, "local checks passed")
+
+        def verification(*_, trees=None):
+            failed = gate == "verify" and holds()
+            summary = self.message if failed else "verified with the new base" if incoming.exists() else "pre-catch-up verification"
+            return verify.Verified("fail" if failed else "pass", summary, checks=[
+                {"what": "fixture behavior", "how": "read fixture", "saw": summary, "passed": not failed}],
+                native_trees=pipeline.verification_trees(b) if trees is None else trees)
+
+        def review(*_, trees=None, **__):
+            if gate == "review" and holds():
+                result = {"verdict": "request_changes", "summary": "catch-up review holds", "problems": [
+                    {"file": "file.txt", "severity": "blocker", "category": "issue", "problem": self.message}]}
+            else:
+                result = {"verdict": "approve", "summary": "approved on the new base" if incoming.exists()
+                          else "pre-catch-up review"}
+            return Review.stored({**result, "trees": pipeline.verification_trees(b) if trees is None else trees})
+
+        def git(args, cwd, **kw):
+            if args[0] != "push":
+                return util.git(args, cwd, **kw)
+            self.head = self.git("rev-parse", "HEAD")
+            self.pushes.append(self.head)
+            return ""
+
+        def ci_watch(target, _log):
+            if not self.ci_heads:
+                self.git("update-ref", f"refs/remotes/{c.origin_base}", self.base)
+            elif next_base and len(self.ci_heads) == 1:
+                self.base = next_base
+                self.git("update-ref", f"refs/remotes/{c.origin_base}", self.base)
+            self.ci_heads.append(target.sha)
+            return ci.Watched(target, {})
+
+        def edit_body(_url, body, *, link):
+            self.body = gh.outgoing(body, link)
+
+        def create_pr(*args, link, **_):
+            url = "https://github.com/fixture/repo/pull/7"
+            edit_body(url, args[4] + "\n\n## Owner note\n\nKeep this.", link=link)
+            self.assertIn("**approve**: pre-catch-up review", self.body)
+            self.assertIn("**pass**: pre-catch-up verification", self.body)
+            return url
+
+        def merge(_repo, _number, head, _base, base_sha, **_):
+            self.assertEqual(head, self.head)
+            self.assertEqual(base_sha, self.git("merge-base", self.base, head))
+            self.assertTrue(self.body.startswith("Closes #7\n"))
+            self.merged = True
+            self.ticket_open = False
+            return ""
+
+        def label(_repo, _number, add, remove):
+            self.labels.difference_update(remove)
+            self.labels.update(add)
+
+        patches = {
+            pipeline: dict(git=mock.Mock(side_effect=git), run_checks=mock.Mock(side_effect=check),
+                           check_in_use=mock.Mock(side_effect=verification), _review=mock.Mock(side_effect=review),
+                           release_workspace=mock.DEFAULT),
+            workspace: dict(fetch=mock.DEFAULT, remote_head=mock.Mock(side_effect=lambda *_: self.head)),
+            runlimits: dict(branch_head=mock.Mock(side_effect=lambda *_: self.head)),
+            ci: dict(watch=mock.Mock(side_effect=ci_watch)),
+            jev: dict(ready=mock.Mock(return_value=True), risk=mock.Mock(return_value=SimpleNamespace(hold=""))),
+            gh: dict(open_pr_url=mock.Mock(return_value=""), pr_create=mock.Mock(side_effect=create_pr),
+                     pr_merge_details=mock.Mock(side_effect=lambda _: {"state": "OPEN", "isDraft": self.draft,
+                         "headRefOid": self.head, "baseRefName": "main", "baseRefOid": self.base}),
+                     pr_body=mock.Mock(side_effect=lambda _: self.body), pr_edit_body=mock.Mock(side_effect=edit_body),
+                     pr_comment=mock.DEFAULT, find_own_pr_comment=mock.Mock(return_value=None),
+                     pr_set_draft=mock.Mock(side_effect=lambda _, draft: setattr(self, "draft", draft)),
+                     pr_draft_and_head=mock.Mock(side_effect=lambda _: (self.draft, self.head)),
+                     merge_readiness=mock.Mock(return_value=("", "")), pr_merge_auto=mock.Mock(side_effect=merge),
+                     issue_labels=mock.Mock(side_effect=label), issue_comment=mock.Mock(
+                         side_effect=lambda _repo, _number, body: self.comments.append(body)),
+                     issue=mock.Mock(return_value={"labels": []})),
+        }
+        for module, replacements in patches.items():
+            self.enterContext(mock.patch.multiple(module, **replacements))
+        trees = pipeline.verification_trees(b)
+        job.verified = verification(trees=trees)
+        job.review = review(trees=trees)
+        b.report = "local checks passed"
+        b.checked = {"tree": trees[c.prefix], "commands": b.layer.checks, "report": b.report}
+        with mock.patch.object(controller, "fingerprint", return_value=ledger.digest({c.github: trees[c.prefix]})):
+            controller.stamp("checks", {"full": True, "checked": b.checked, "report": b.report})
+            controller.stamp("verify", asdict(job.verified))
+            controller.stamp("review", job.review.asdict())
+        controller.persist()
+
+    def action_result(self, op, **args):
+        controller = self.controller
+        turn = ledger.begin(controller.lease, {}, 100)
+        version = ledger.snapshot(controller.lease)["version"]
+        action = ledger.accept(controller.lease, turn, version,
+                               {"calls": [{"op": op, "args": OPERATIONS[op].arguments(args)}]}, 100)[0]
+        controller.dispatch(action)
+        return ledger.actions(controller.lease)[-1]
+
+    def gates(self):
+        self.action_result("checks.run")
+        self.action_result("verification.run", route_id="verify", effort="low")
+        self.action_result("review.run", route_id="review", effort="low")
+
+    def publish_held(self, gate):
+        controller = self.controller
+        action = self.action_result("publication.request")
+        self.assertEqual(action["state"], "failed")
+        self.assertEqual(action["result"]["failures"], orchestration.CATCH_UP_FAILURE)
+        self.assertIn(self.message, controller.data["catch_up_hold"]["feedback"])
+        self.assertEqual(controller.data["evidence"], {})
+        candidate = self.git("rev-parse", "HEAD")
+        self.assertEqual(candidate, self.checkout.merge)
+        self.assertNotEqual(candidate, self.head)
+        self.assertEqual(self.git("merge-base", candidate, self.base), self.base)
+        self.assertEqual(self.git("merge-base", candidate, self.head), self.head)
+        self.assertIn(f"held on {gate}", self.body)
+        self.assertIn("Closes #7", self.body)
+        self.assertIn("Keep this.", self.body)
+        self.assertNotIn("pre-catch-up review", self.body)
+        self.assertNotIn("pre-catch-up verification", self.body)
+        self.assertEqual(self.build.report, self.message if gate == "checks" else "local checks passed")
+
+    def repair_and_publish(self, gate, role, *, last_catch_up=False, readiness_hold=""):
+        self.prepare_publication(gate, move_base_again=last_catch_up)
+        if last_catch_up:
+            self.build.catch_ups = pipeline.AUTOMERGE_CATCH_UPS - 1
+        self.publish_held(gate)
+        self.assertIn("**request_changes**" if gate == "review" else "**fail**", self.body)
+        candidate = self.checkout.merge
+        controller = self.controller
+        self.assertIsNone(controller.ending)
+        controller.recover()
+        self.assertEqual(controller.data["evidence"], {})
+        setting = SimpleNamespace(step="build", runner="codex", model="test", provider="", effort="low", tools=("Edit",))
+        controller.catalog.worker.return_value = setting, "delegate", True
+        worker = mock.Mock(pid=123, identity=456, step="worker")
+        worker.proc.poll.return_value = None
+        worker.receive.return_value = [{"event": "launch", "step": "worker", "role": role, "route": ""},
+                                       {"event": "result", "ok": True, "text": "Repaired"}]
+
+        def repair(_):
+            self.assertEqual(self.git("rev-parse", "HEAD"), candidate)
+            self.assertTrue((self.root / "incoming.txt").is_file())
+            self.file.write_text("repaired implementation\n")
+
+        worker.allow.side_effect = repair
+        request = mock.Mock()
+        repair_setting = SimpleNamespace(**{**vars(setting), "step": role})
+        with (mock.patch.object(pipeline.steps, "resolve", return_value=repair_setting),
+              mock.patch.object(orchestration.delegation, "Worker", return_value=worker),
+              mock.patch.object(orchestration.delegation, "request", request),
+              mock.patch.object(workspace, "note_made"), mock.patch.object(workspace, "kept_work", return_value="")):
+            launched = self.action_result("worker.start", goal="Repair the catch-up", route_id="build", effort="low")
+            self.assertEqual(launched["result"]["role"], role)
+            self.assertIs(request.call_args.args[3], repair_setting)
+            self.assertIn(self.message, request.call_args.args[2])
+            controller.collect()
+        self.assertEqual(controller.run.budget.repair_calls, 1)
+        self.gates()
+        if readiness_hold:
+            gh.merge_readiness.return_value = "", readiness_hold
+        delivered = self.action_result("publication.request")
+        self.assertEqual(len(self.pushes), 2)
+        self.assertEqual(self.git("merge-base", candidate, self.pushes[-1]), candidate)
+        if last_catch_up or readiness_hold:
+            self.assertEqual(delivered["state"], "failed")
+            self.assertEqual(controller.ending[0], "failed")
+            self.assertEqual(self.labels, {"agent:failed"})
+            self.assertTrue(self.draft)
+            self.assertFalse(self.merged)
+            if last_catch_up:
+                self.assertEqual(self.build.catch_ups, pipeline.AUTOMERGE_CATCH_UPS)
+                self.assertIn(f"after {pipeline.AUTOMERGE_CATCH_UPS} catch-ups", self.comments[-1])
+            else:
+                self.assertIn(readiness_hold, self.comments[-1])
+            self.assertIn("held on review", self.comments[-1])
+            return
+        self.assertEqual(delivered["state"], "succeeded")
+        self.assertEqual(controller.ending[0], "pr")
+        self.assertTrue(self.merged)
+        self.assertFalse(self.ticket_open)
+        self.assertEqual(self.build.catch_ups, 1)
+        self.assertEqual(self.ci_heads, self.pushes)
+        self.assertEqual(self.git("show", "HEAD:file.txt"), "repaired implementation")
+        self.assertIn("**approve**: approved on the new base", self.body)
+        self.assertIn("**pass**: verified with the new base", self.body)
+        self.assertNotIn(self.message, self.body)
+        self.assertNotIn("merge_held", controller.run.facts)
+        status, summary, url = controller.ending
+        pipeline.record.settle(controller.run.id, status, summary=summary, pr_url=url)
+        with (mock.patch.object(outcomes, "PR_SEEN_FILE", paths.STATE_DIR / "pr_seen.json"),
+              mock.patch.object(outcomes, "record_feedback"),
+              mock.patch.object(gh, "pr_view", return_value={"state": "MERGED", "mergedAt": util.iso()})):
+            outcomes.sync_outcomes(config.Config())
+        self.assertEqual(pipeline.run_store.run_get(controller.run.id)["status"], "merged")
+
+
+class CatchUpReviewRepairTests(CatchUpRepairFixture):
+    def test_review_hold_repairs_and_automerge_closes_ticket(self):
+        self.repair_and_publish("review", "review_repair")
+
+
+class CatchUpVerifyRepairTests(CatchUpRepairFixture):
+    def test_verify_hold_repairs_and_automerge_closes_ticket(self):
+        self.repair_and_publish("verify", "check_repair")
+
+
+class CatchUpLimitTests(CatchUpRepairFixture):
+    def test_repair_keeps_the_per_run_catch_up_limit(self):
+        self.repair_and_publish("review", "review_repair", last_catch_up=True)
+
+
+class CatchUpReadinessParkingTests(CatchUpRepairFixture):
+    def test_readiness_failure_after_last_repair_parks_and_drafts(self):
+        self.repair_and_publish("review", "review_repair", readiness_hold="a required check is missing")
+
+
+class CatchUpParkingTests(CatchUpRepairFixture):
+    def test_checks_hold_with_no_repair_cycles_parks_and_drafts(self):
+        self.prepare_publication("checks", spent=True)
+        self.publish_held("checks")
+        self.assertEqual(self.controller.ending[0], "failed")
+        self.assertEqual(self.labels, {"agent:failed"})
+        self.assertTrue(self.draft)
+        self.assertFalse(self.merged)
+        self.assertEqual(len(self.pushes), 1)
+        self.assertEqual(self.controller.run.budget.repair_calls, 1)
+        self.assertIn("held on checks", self.comments[-1])
+        self.assertIn("local checks failed", self.comments[-1])
+        self.assertIn("repair cycles", self.comments[-1])
+        self.assertIn("Verification did not run.", self.body)
+        self.assertIn("Review did not run.", self.body)
+
+
 class BaseMergeDiffLimitTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
@@ -453,7 +1569,7 @@ class BaseMergeDiffLimitTests(unittest.TestCase):
         self.assertNotIn("pushed earlier", refused.exception.detail)
 
 
-class MovedBasePublicationTests(unittest.TestCase):
+class MovedBasePublicationFixture:
     def controller(self):
         root = Path(".")
         checkout = workspace.Checkout("", "fixture/repo", root, root, "main",
@@ -485,6 +1601,71 @@ class MovedBasePublicationTests(unittest.TestCase):
         controller.catalog = mock.Mock(context={})
         return controller, checkout
 
+
+class CatchUpPublicationFailureTests(MovedBasePublicationFixture, unittest.TestCase):
+    def test_publication_ci_after_a_catch_up_repair_parks_only_when_spent(self):
+        spent = "the repair chain used its 1 repair cycles"
+        for limit in ("", spent):
+            with self.subTest(limit=limit):
+                controller, checkout = self.controller()
+                controller.data["catch_up_hold"] = {"reason": "Catch-up held on review"}
+                controller.job.verified = verify.Verified("pass", checks=[{"passed": True}])
+                controller.job.review = Review.stored({"verdict": "approve"})
+                controller.run.budget.repair_limit_reason.return_value = limit
+                controller.ci_failures = mock.Mock(return_value="CI check failed on the repaired head")
+                with (mock.patch.object(ci, "watch", side_effect=lambda target, _: ci.Watched(target, {}, read=False)),
+                      mock.patch.object(pipeline, "publish_gate_evidence"),
+                      mock.patch.object(pipeline, "publish_ci"),
+                      mock.patch.object(pipeline, "own_draft_state", return_value=True),
+                      mock.patch.object(pipeline, "set_draft") as draft,
+                      mock.patch.object(pipeline, "park_run", return_value=("failed", "parked", checkout.pr)) as park):
+                    failure = controller.publish()
+                self.assertEqual(failure["failures"], orchestration.CI_FAILURES)
+                self.assertTrue(controller.data["ci_failed"])
+                self.assertTrue(controller.data["catch_up_hold"])
+                controller.catalog.add_context.assert_called_once_with(
+                    orchestration.CI_FAILURES, "CI check failed on the repaired head")
+                draft.assert_called_once_with(controller.run, checkout, True)
+                if limit:
+                    self.assertEqual(controller.ending, park.return_value)
+                    self.assertIn(spent, park.call_args.args[1])
+                    self.assertIn(failure["ci"], park.call_args.args[1])
+                    self.assertIn("Catch-up held on review", controller.run.say.call_args.args[0])
+                else:
+                    self.assertIsNone(controller.ending)
+                    park.assert_not_called()
+
+    def test_final_readiness_failure_parks_except_preserved_catch_up_handoffs(self):
+        for error, parked in (
+            (workspace.RunFailed("the published head already contains the fetched base"), True),
+            (pipeline.ConflictUnresolved(workspace.RunFailed("a protected file conflicts"), ["file.txt"]), False),
+            (pipeline.CatchUpNeedsInput("a catch-up worker needs owner input"), False),
+        ):
+            with self.subTest(error=error):
+                controller, checkout = self.controller()
+                controller.data["catch_up_hold"] = {"reason": "Catch-up held on verify"}
+                controller.run.budget.repair_limit_reason.return_value = "the repair chain used its 1 repair cycles"
+                refs = {"state": "OPEN", "isDraft": False, "headRefOid": checkout.lease, "baseRefName": "main"}
+                with (mock.patch.object(gh, "pr_merge_details", return_value=refs),
+                      mock.patch.object(pipeline, "merge_hold", return_value=gh.MovedBaseHold("base moved")),
+                      mock.patch.object(pipeline, "fetch_merge_base", return_value="moved-base"),
+                      mock.patch.object(pipeline, "catch_up_base", side_effect=error),
+                      mock.patch.object(pipeline, "report_automerge") as report,
+                      mock.patch.object(controller, "park_catch_up", return_value=("failed", "parked", checkout.pr)) as park,
+                      mock.patch.object(flows, "ended", return_value=("pr", "held", checkout.pr))):
+                    controller.finish_publication()
+                self.assertEqual(controller.job.b.catch_ups, 1)
+                if parked:
+                    self.assertEqual(controller.ending, park.return_value)
+                    self.assertIn(error.why, park.call_args.args[0])
+                    report.assert_not_called()
+                else:
+                    self.assertEqual(controller.ending[0], "pr")
+                    self.assertIn(error.why, report.call_args.args[2])
+                    park.assert_not_called()
+
+
+class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
     def test_conflict_after_a_rerun_passes_reaches_catch_up(self):
         controller, checkout = self.controller()
         clean = {"state": "OPEN", "headRefOid": checkout.lease, "mergeable": "MERGEABLE"}
@@ -542,6 +1723,7 @@ class MovedBasePublicationTests(unittest.TestCase):
               mock.patch.object(gh, "branch_sha", return_value="moved-base"),
               mock.patch.object(gh, "gh_json", side_effect=transport),
               mock.patch.object(pipeline, "publish_ci") as report,
+              mock.patch.object(pipeline, "publish_gate_evidence"),
               mock.patch.object(controller, "ci_failures", return_value="failed check logs"),
               mock.patch.object(pipeline, "set_draft") as draft,
               mock.patch.object(gh, "find_own_pr_comment", return_value=None),
@@ -637,7 +1819,8 @@ class MovedBasePublicationTests(unittest.TestCase):
                                           write_lineage_event=mock.DEFAULT, quiescent=mock.DEFAULT, stamp=mock.DEFAULT),
                       mock.patch.object(orchestration.run_lines, "write"),
                       mock.patch.multiple(pipeline, checked_layer=mock.Mock(return_value=SimpleNamespace(
-                          checks={"local": "check"})), check_script=mock.Mock(return_value=([], [])), note_prs=mock.DEFAULT),
+                          checks={"local": "check"})), check_script=mock.Mock(return_value=([], [])), note_prs=mock.DEFAULT,
+                                          publish_gate_evidence=mock.DEFAULT),
                       mock.patch.object(resumed, "publication_ci", side_effect=ci_gate) as watched,
                       mock.patch.object(pipeline, "catch_up_base") as merge,
                       mock.patch.multiple(workspace, uncommitted=mock.Mock(return_value=[]),
@@ -1433,9 +2616,14 @@ class ServeStatusTests(unittest.TestCase):
         result = subprocess.run([str(installed), "status", *args], cwd=self.root,
                                 env=stack_env({**env, "PYTHONPATH": str(self.root), "PYTHONDONTWRITEBYTECODE": "1"}),
                                 capture_output=True, text=True, timeout=8)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
         self.assertIn("broken deployment fixture", result.stderr)
-        self.assertIn(f"running code {running}, checkout HEAD {checkout}", result.stdout)
+        self.assertIn(
+            f"last recorded serve heartbeat at 2026-11-21T00:00:00Z, running code {running}, checkout HEAD {checkout}",
+            result.stderr.splitlines(),
+        )
+        self.assertFalse((state_dir / "arete.db").exists())
 
     def test_installed_status_reads_revisions_when_candidate_common_raises(self):
         self.break_candidate_import("commands/common.py")
