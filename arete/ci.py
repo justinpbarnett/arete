@@ -20,6 +20,7 @@ LOG_TIMESTAMP = re.compile(r"^\d{4}-\d\d-\d\dT[\d:.]+Z ", re.MULTILINE)
 TEST_TIMEOUT = re.compile(rf"^{re.escape(_test_stacks.REPORT_START)}\r?\n.*?\r?\n"
                           rf"^{re.escape(_test_stacks.REPORT_END)}\r?$", re.DOTALL | re.MULTILINE)
 PYTHON_STACK = re.compile(r"^(Python (?:class|child) stack \(PID \d+\))\r?\n", re.MULTILINE)
+TIMEOUT_OMISSION = re.compile(r"\.\.\. \d+ timeout reports omitted")
 SECTION_START, SECTION_END = "<!-- arete:ci -->", "<!-- /arete:ci -->"
 SECTION = re.compile(rf"\n*^{re.escape(SECTION_START)}\r?$.*?^{re.escape(SECTION_END)}\r?$", re.DOTALL | re.MULTILINE)
 STOPPED = "Arete stopped:"
@@ -305,13 +306,15 @@ def timeout_summary(reports: list[str]) -> str:
     minimum = MIN_TIMEOUT_REPORT_CHARS + 2
     if remaining < len(overflow) * minimum:
         notice_budget = len(f"... {len(overflow)} timeout reports omitted") + 2
-        if remaining >= notice_budget:
-            remaining -= notice_budget
-            count = remaining // minimum
-            notice = f"... {len(overflow) - count} timeout reports omitted"
-            overflow = overflow[len(overflow) - count:]
-        else:
-            overflow = []
+        if remaining < notice_budget:
+            index = max(range(len(summaries)), key=lambda index: len(summaries[index]))
+            report = summaries[index]
+            summaries[index] = util.both_ends(report, len(report) - (notice_budget - remaining))
+            remaining += len(report) - len(summaries[index])
+        remaining -= notice_budget
+        count = remaining // minimum
+        notice = f"... {len(overflow) - count} timeout reports omitted"
+        overflow = overflow[len(overflow) - count:]
 
     for offset, index in enumerate(overflow):
         limit = remaining // (len(overflow) - offset) - 2
@@ -347,6 +350,9 @@ def _log_excerpt(log_text: str) -> tuple[str, bool]:
         surrounding = util.both_ends(surrounding[last_error:], remaining)
     elif len(surrounding) > remaining:
         surrounding = util.tail(surrounding, remaining - len("...\n"))
+    kept_reports, _, notice = summary.rpartition("\n\n")
+    if TIMEOUT_OMISSION.fullmatch(notice):
+        return "\n\n".join(filter(None, (kept_reports, surrounding, notice))), True
     return "\n\n".join(filter(None, (summary, surrounding))), True
 
 
