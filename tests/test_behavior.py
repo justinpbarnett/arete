@@ -10,12 +10,13 @@ import sys
 import tempfile
 import threading
 import unittest
-from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, chdir, contextmanager, redirect_stderr, redirect_stdout
+from contextvars import Context
 from http.client import HTTPConnection, HTTPResponse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO, StringIO
 from pathlib import Path
-from socket import SHUT_WR, create_connection
+from socket import SHUT_WR, create_connection, socket, socketpair
 from types import SimpleNamespace
 from unittest import mock
 
@@ -37,7 +38,7 @@ def setUpModule():
 
 class _CliThroughServeCase(unittest.TestCase):
     class_timeout = 30
-    fixture_root = None
+    class_worker = None
     OWNER = "cli-owner@example.test"
     ONLINE = (
         "run replay-sample 7", "task add --repo replay-sample change", "task list", "task show t-1234",
@@ -96,79 +97,152 @@ class _CliThroughServeCase(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        directory = tempfile.TemporaryDirectory(prefix="arete-cli-fixture-")
-        cls.addClassCleanup(directory.cleanup)
-        cls.addClassCleanup(setattr, cls, "fixture_root", None)
-        root = Path(directory.name).resolve()
-        entry = "from tests.test_behavior import _CliThroughServeCase; _CliThroughServeCase.prepare_fixture()"
-        result = cls.run_child(root, entry)
-        if result.returncode:
-            raise RuntimeError(result.stdout + result.stderr)
-        cls.fixture_root = root
+        stack = ExitStack()
+        cls.addClassCleanup(stack.close)
+        cls.addClassCleanup(setattr, cls, "class_worker", None)
+        cls.class_worker = stack.enter_context(cls.start_worker())
 
     @staticmethod
-    def prepare_fixture():
+    def prepare_fixture(root):
         from arete import paths
 
-        root = Path.cwd()
         lines, _ = api_check.prepare_replay(root)
-        paths.CONFIG_FILE.write_text("\n".join(lines) + "\n")
+        config_text = "\n".join(lines) + "\n"
+        paths.CONFIG_FILE.write_text(config_text)
         # The copied checkout should use the copy of its bare origin.
         subprocess.run(["git", "remote", "set-url", "origin", "../origin.git"],
                        cwd=root / "sample/repo", check=True, timeout=10)
         db.migrate()
+        return config_text
 
-    @staticmethod
-    def run_child(root, entry, *args):
-        command = api_check.child_command(Path(__file__).resolve().parents[1], entry, *args)
-        return subprocess.run(command, cwd=root, env=api_check.isolated_env(root), capture_output=True,
-                              text=True, timeout=18, check=False)
+    @classmethod
+    @contextmanager
+    def start_worker(cls):
+        with (tempfile.TemporaryDirectory(prefix="arete-cli-fixture-") as directory,
+              ExitStack() as stack):
+            root = Path(directory).resolve()
+            parent, child = socketpair()
+            stack.enter_context(parent)
+            stack.enter_context(child)
+            output = root / "worker.log"
+            entry = ("from tests import test_behavior; "
+                     "getattr(test_behavior, sys.argv[1]).run_checks(int(sys.argv[2]))")
+            command = api_check.child_command(Path(__file__).resolve().parents[1], entry,
+                                              cls.__name__, str(child.fileno()))
+            with output.open("w") as log:
+                process = subprocess.Popen(command, cwd=root, env=api_check.isolated_env(root),
+                                           stdin=subprocess.DEVNULL, stdout=log, stderr=log, pass_fds=(child.fileno(),))
+            child.close()
+            parent.settimeout(cls.class_timeout - 2)
+            try:
+                with parent.makefile("rwb") as channel:
+                    yield channel, output
+            finally:
+                parent.close()
+                try:
+                    status = process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    status = process.wait()
+            if status:
+                raise RuntimeError(f"CLI test worker exited with status {status}\n{output.read_text(errors='replace')}")
 
     def in_subprocess(self, case):
-        with tempfile.TemporaryDirectory(prefix="arete-cli-") as temp:
-            root = Path(temp).resolve()
-            entry = ("import faulthandler; faulthandler.dump_traceback_later(15); "
-                     "from pathlib import Path; "
-                     "from tests import test_behavior; "
-                     "from unittest import TextTestRunner; "
-                     "test = getattr(test_behavior, sys.argv[1])(sys.argv[2]); "
-                     "test.fixture_root = Path(sys.argv[3]) if sys.argv[3] else None; "
-                     "sys.exit(not TextTestRunner().run(test).wasSuccessful())")
-            try:
-                result = self.run_child(root, entry, type(self).__name__, case, str(self.fixture_root or ""))
-            except subprocess.TimeoutExpired as error:
-                output = (error.stderr or b"").decode(errors="replace")
-                self.fail(f"{case} timed out after {error.timeout:g}s\n{output}")
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        if self.class_worker is None:
+            # PinCommandTests also uses this fixture outside the three classes.
+            with self.start_worker() as worker:
+                self.run_check(worker, case)
+        else:
+            self.run_check(self.class_worker, case)
+
+    def run_check(self, worker, case):
+        channel, log = worker
+        try:
+            channel.write(case.encode() + b"\n")
+            channel.flush()
+            reply = channel.readline()
+        except OSError as error:
+            self.fail(f"{case}: {error}\n{log.read_text(errors='replace')}")
+        if not reply:
+            self.fail(f"worker exited during {case}\n{log.read_text(errors='replace')}")
+        ok, output = json.loads(reply)
+        if not ok:
+            self.fail(f"{output}\n{log.read_text(errors='replace')}")
+
+    @classmethod
+    def run_checks(cls, fd):
+        import faulthandler
+
+        from arete import codebase
+
+        with (socket(fileno=fd) as connection, connection.makefile("rwb") as channel,
+              mock.patch("urllib.request.urlopen", side_effect=AssertionError("urllib.request.urlopen")),
+              mock.patch.object(gh, "gh", side_effect=AssertionError("arete.gh.gh"))):
+            connection.set_inheritable(False)
+            faulthandler.dump_traceback_later(cls.class_timeout - 4)
+            fixture_root = Path.cwd()
+            config_text = cls.prepare_fixture(fixture_root)
+            # Import once so all module-level paths can be rebound for each check.
+            codebase.import_everything()
+            faulthandler.cancel_dump_traceback_later()
+            for request in channel:
+                test = cls(request.decode().strip())
+                test.fixture_root = fixture_root
+                test.fixture_config = config_text
+                output = StringIO()
+                faulthandler.dump_traceback_later(cls.class_timeout - 4)
+                try:
+                    result = Context().run(unittest.TextTestRunner(stream=output, verbosity=2).run, test)
+                finally:
+                    faulthandler.cancel_dump_traceback_later()
+                channel.write(json.dumps([result.wasSuccessful(), output.getvalue()]).encode() + b"\n")
+                channel.flush()
 
     def setUp(self):
         if not self._testMethodName.startswith("check_"):
             return
-        from arete import paths
+        from arete import client, dbstats, guard, paths, sandbox
 
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
-        for name in ("urllib.request.urlopen", "arete.gh.gh"):
-            self.stack.enter_context(mock.patch(name, side_effect=AssertionError(name)))
-        root = Path.cwd()
-        if self.fixture_root is None:
-            # The pin check invokes a single case directly, outside this class fixture.
-            lines, _ = api_check.prepare_replay(root)
-            self.fixture_config = "\n".join(lines) + "\n"
-        else:
-            shutil.copytree(self.fixture_root / "sample", root / "sample")
-            config_text = (self.fixture_root / "config/config.toml").read_text()
-            original = json.dumps(str(self.fixture_root / "sample"))[1:-1]
-            copied = json.dumps(str(root / "sample"))[1:-1]
-            self.fixture_config = config_text.replace(original, copied)
+        directory = self.stack.enter_context(tempfile.TemporaryDirectory(prefix="check-", dir=self.fixture_root))
+        root = Path(directory)
+        env = api_check.isolated_env(root)
+        self.stack.enter_context(mock.patch.dict(os.environ, env, clear=True))
+        self.stack.enter_context(chdir(root))
+        self.stack.enter_context(mock.patch.object(tempfile, "tempdir", env["TMPDIR"]))
+        for name, module in tuple(sys.modules.items()):
+            if name.startswith("arete.") and module is not None:
+                paths_here = {key: root / value.relative_to(self.fixture_root) for key, value in vars(module).items()
+                              if isinstance(value, Path) and value.is_relative_to(self.fixture_root)}
+                if paths_here:
+                    self.stack.enter_context(mock.patch.multiple(module, **paths_here))
+        self.stack.enter_context(mock.patch.object(guard, "LOGIN_FILES", tuple(
+            root / path.relative_to(self.fixture_root) for path in guard.LOGIN_FILES)))
+        self.stack.enter_context(mock.patch.object(sandbox, "AUTHORITY", paths.CONFIG_DIR / "verification-authority"))
+        # Keep code imports warm while resetting state keyed by requests, processes and databases.
+        for patch in (mock.patch.object(api_http, "RATES", api_http.RateLimits()),
+                      mock.patch.object(api_http, "ALIAS_DAYS", {}),
+                      mock.patch.object(contract, "USES", contract.USES.copy()),
+                      mock.patch.object(dashboard, "POSTS_IN_FLIGHT", dashboard.Gauge()),
+                      mock.patch.object(db, "_CHECKED", set()),
+                      mock.patch.object(dbstats, "SUMMARIES", {}),
+                      mock.patch.object(idempotency, "ACTIVE", {}),
+                      mock.patch.object(client, "_acquisition_thread", None)):
+            self.stack.enter_context(patch)
+        for cached in (gh.me, util.github_token):
+            cached.cache_clear()
+            self.stack.callback(cached.cache_clear)
+        shutil.copytree(self.fixture_root / "sample", root / "sample")
+        original = json.dumps(str(self.fixture_root / "sample"))[1:-1]
+        copied = json.dumps(str(root / "sample"))[1:-1]
+        self.fixture_config = self.fixture_config.replace(original, copied)
         paths.CONFIG_FILE.write_text(self.fixture_config)
 
     def prepare_state(self):
         from arete import paths
 
-        if self.fixture_root is None:
-            db.migrate()
-        elif not paths.DB_FILE.exists():
+        if not paths.DB_FILE.exists():
             shutil.copytree(self.fixture_root / "state", paths.STATE_DIR, dirs_exist_ok=True)
 
     def cli(self, command, stdin=""):
@@ -190,7 +264,9 @@ class _CliThroughServeCase(unittest.TestCase):
 
     @contextmanager
     def listening(self, server):
-        with server, mock.patch.dict(os.environ, {"ARETE_SERVER": f"http://127.0.0.1:{server.server_port}"}):
+        # Join request threads before unwinding the environment and path patches.
+        server.daemon_threads = False
+        with mock.patch.dict(os.environ, {"ARETE_SERVER": f"http://127.0.0.1:{server.server_port}"}), server:
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": .01})
             thread.start()
             try:
