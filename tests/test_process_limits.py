@@ -28,6 +28,7 @@ from arete import (
     paths,
     pipeline,
     poll,
+    principals,
     record,
     run_lines,
     runlimits,
@@ -98,8 +99,9 @@ class Isolated(unittest.TestCase):
         rid = record.start("pipeline", repo=self.repo.name, issue=self.ticket)
         directory = paths.RUNS_DIR / rid
         directory.mkdir()
-        run = pipeline.Run(rid, self.repo, directory, tracker=self.local, tid=self.ticket, cfg=self.cfg)
-        run.budget = runlimits.Budget(run, runlimits.Policy(), previous, self.local.get(self.ticket), forced)
+        source = tracker.for_ticket(self.cfg, self.repo, self.ticket)
+        run = pipeline.Run(rid, self.repo, directory, tracker=source, tid=self.ticket, cfg=self.cfg)
+        run.budget = runlimits.Budget(run, runlimits.Policy(), previous, source.get(self.ticket), forced)
         return run
 
 
@@ -655,13 +657,15 @@ class BudgetTests(Isolated):
         with patch.object(runlimits, "heads", return_value={"": "old"}):
             run.budget.park("repair limit")
             record.settle(run.id, "failed", branch="fixture")
-            why, reset = runlimits.admission(self.repo, self.ticket, self.local, run.budget.policy, True)
-            self.assertIn("parked", why)
-            self.assertFalse(reset)
+            admission = runlimits.admission(self.repo, self.ticket, self.local, run.budget.policy, True)
+            self.assertIn("parked", admission.reason)
+            self.assertFalse(admission.reset_time)
+            self.assertFalse(admission.reset_repairs)
             with foundation.db() as connection:
                 set_task_body(self.ticket, "A narrower specification", connection=connection)
-            self.assertTrue(runlimits.admission(self.repo, self.ticket, self.local, run.budget.policy, False)[0])
-            self.assertEqual(runlimits.admission(self.repo, self.ticket, self.local, run.budget.policy, True), ("", True))
+            self.assertTrue(runlimits.admission(self.repo, self.ticket, self.local, run.budget.policy, False).reason)
+            self.assertEqual(runlimits.admission(self.repo, self.ticket, self.local, run.budget.policy, True),
+                             runlimits.Admission(reset_time=True, reset_repairs=True))
 
     def test_corrupt_budget_is_not_silently_reset(self):
         run = self.made_run()
@@ -746,6 +750,286 @@ class BudgetTests(Isolated):
 
 
 class QueueTests(Isolated):
+    def spent_question(self, *, structured=False):
+        self.repo.layer_dir.mkdir()
+        (self.repo.layer_dir / "config.toml").write_text(
+            '[factory]\npath = "classic"\n[limits]\nmax_repair_cycles = 3\n')
+        self.cfg.replay = config.ReplayConfig(all=True)
+        first = self.made_run()
+        first.budget.charge("repair", "review_repair")
+        record.settle(first.id, "failed")
+        asked = self.made_run(first.id)
+        asked.budget = runlimits.Budget(asked, runlimits.Policy(max_repair_cycles=3), first.id)
+        for _ in range(2):
+            asked.budget.charge("repair", "review_repair")
+        question = "Where is the CI log?"
+        asks = [{"ask_id": "ask-fixture", "step": "review", "call": "review", "questions": [
+            {"kind": "text", "header": "CI log", "question": question}]}] if structured else None
+        if structured:
+            run_lines.write(asked.id, "execution", path="feature")
+        with patch.object(pipeline, "release_workspace"):
+            status, summary, _ = pipeline._ask(asked, self.repo.path, [], question, question, asks,
+                                               {} if structured else None)
+        self.assertEqual(status, "needs-info")
+        record.settle(asked.id, status, summary=summary)
+        with foundation.tx():
+            run_store.checkpoint(first.id, 60, 20, 0, 1, util.iso())
+            run_store.checkpoint(asked.id, 120, 40, 0, 2, util.iso())
+        return first, asked
+
+    def assert_answer_budget(self, run, first, asked, preview=None):
+        parents = [asked.id, first.id]
+        seconds = (180, 60)
+        if preview:
+            parents.insert(0, preview)
+            seconds = (210, 70)
+        self.assertEqual((run.budget.prior_seconds, run.budget.verify_seconds), seconds)
+        self.assertEqual(run.budget.prior_repairs, 0)
+        run.budget.charge("repair", "review_repair")
+        self.assertEqual(runlimits.repair_count(run.id), 1)
+        audit = next(line for line in (run.dir / "run.log").read_text().splitlines() if "budget chain:" in line)
+        _, reason, omitted = audit.partition("because of an owner answer: ")
+        self.assertTrue(reason, audit)
+        self.assertCountEqual(omitted.split(", "), parents)
+        self.assertEqual(runlimits.family(run.id, repairs=True), [run.id])
+        self.assertEqual(set(runlimits.family(run.id)), {run.id, *parents})
+
+    def consume_tracker_answers(self, run, expected):
+        self.assertEqual({a["id"]: a["answers"][0]["text"] for a in run.answers_due}, expected)
+        with patch.object(factory, "inside", return_value=factory.Calls(run.id, "review")), \
+                patch.object(pipeline.AgentRun, "agent", return_value=Result(ok=True)) as agent:
+            run.agent("review", "Review the change.", self.repo.path)
+        for ask_id, text in expected.items():
+            self.assertIn(text, agent.call_args.args[1])
+            self.assertEqual(ask_store.ask_get(ask_id)["taken_by"], run.id)
+        self.assertEqual(run.answers_due, [])
+
+    def run_polled_answer(self, repo, tid, asked, work):
+        self.assertEqual(pipeline.run_command(repo, tid)[-2:], ["--continue", asked.id])
+        script = pipeline.Script("feature", lambda flow: work(flow.ctx.run), continues=asked.id)
+        self.assertEqual(self.run_polled_ticket(repo, tid, lambda *_: self.fail("started an ordinary run"), script), 0)
+
+    def test_cli_answer_gives_the_first_repair_a_fresh_budget_and_resume_keeps_the_cutoff(self):
+        first, asked = self.spent_question(structured=True)
+
+        def work(flow):
+            run = flow.ctx.run
+            self.assertEqual([a["run"] for a in run.answers_due], [asked.id])
+            self.assert_answer_budget(run, first, asked)
+            flow.route()
+            return "interrupted", "stopped before the answer was consumed", ""
+
+        def launch(command, log):
+            self.assertEqual(command[-3:], ["--force", "--continue", asked.id])
+            script = pipeline.Script("feature", work, continues=asked.id)
+            self.assertEqual(pipeline.run_issue(self.repo.name, self.ticket, force=True, script=script), 1)
+            return run_store.newest_whole_run(self.repo.name, self.ticket)["id"]
+
+        with patch.object(config, "load", return_value=self.cfg), \
+                patch.object(pipeline, "run_refusal", return_value=(True, "")), \
+                patch.object(tasks, "spawned", side_effect=lambda repo, tid, spawn: (spawn(), "interrupted")), \
+                patch.object(tasks.control, "launch", side_effect=launch):
+            started = tasks.answer_ask("ask-fixture", {"answers": [{"text": "See the attached log."}]})
+            answered = started["run"]
+
+            def resume(flow):
+                run = flow.ctx.run
+                self.assertEqual([a["run"] for a in run.answers_due], [asked.id])
+                self.assertEqual(run.budget.repair_parents, [answered])
+                self.assertEqual(run.budget.prior_repairs, 1)
+                for _ in range(2):
+                    run.budget.charge("repair", "review_repair")
+                with self.assertRaisesRegex(runlimits.Parked, "3 repair cycles"):
+                    run.budget.charge("repair", "review_repair")
+                return "noop", "fixture finished", ""
+
+            script = pipeline.Script("feature", resume, continues=answered)
+            self.assertEqual(pipeline.run_issue(self.repo.name, self.ticket, force=True, script=script), 0)
+
+    def expired_question(self):
+        with patch.object(util, "now", return_value=datetime(2026, 1, 1, tzinfo=UTC)):
+            first, asked = self.spent_question(structured=True)
+        with patch.object(util, "now", return_value=datetime(2026, 1, 2, tzinfo=UTC)):
+            with principals.acting(principals.seed_owner("fixture@example.test")):
+                tasks_store.task_comment(self.ticket, principals.current(), "An older comment.")
+        with patch.object(util, "now", return_value=datetime(2026, 1, 15, tzinfo=UTC)), \
+                patch.object(config, "load", return_value=self.cfg), \
+                patch.object(tasks, "kept_folder_removed", return_value=True):
+            self.assertEqual(len(tasks.expire_asks(self.cfg)), 1)
+        self.assertEqual(ask_store.ask_get("ask-fixture")["status"], "expired")
+        self.assertIn("Reply here and remove", self.local.get(self.ticket).comments)
+        return first, asked
+
+    def check_tracker_reply_budget(self, *, structured, expired=False, dry_run=False):
+        if expired:
+            first, asked = self.expired_question()
+        else:
+            first, asked = self.spent_question(structured=structured)
+        preview = None
+        if dry_run:
+            with patch.object(config, "load", return_value=self.cfg), \
+                    patch.object(pipeline, "run_refusal", return_value=(False, "")), \
+                    patch.object(pipeline, "_run", return_value=("dry-run", "preview finished", "")):
+                self.assertEqual(pipeline.run_issue(self.repo.name, self.ticket, dry_run=True), 0)
+            preview = run_store.newest_whole_run(self.repo.name, self.ticket)["id"]
+            self.assertNotEqual(preview, asked.id)
+            with foundation.tx():
+                run_store.checkpoint(preview, 30, 10, 0, 0, util.iso())
+
+        self.assertEqual(self.poll_with(self.cfg, lambda *_: self.fail("launched without a reply")), 0)
+        replied_at = datetime(2026, 1, 16, tzinfo=UTC) if expired else util.now()
+        with patch.object(util, "now", return_value=replied_at), \
+                principals.acting(principals.seed_owner("fixture@example.test")):
+            tasks_store.task_comment(self.ticket, principals.current(), "See the attached log.")
+        if expired:
+            self.local.label(self.ticket, remove=["needs-info"])
+        self.assertEqual(self.poll_with(self.cfg, lambda *_: self.fail("dry poll launched"), dry_run=True), 0)
+        self.assertFalse(pipeline.answer_text(asked.id))
+        if structured:
+            self.assertEqual(ask_store.ask_get("ask-fixture")["status"], "expired" if expired else "open")
+
+        def work(run):
+            self.assert_answer_budget(run, first, asked, preview)
+            if structured and not expired:
+                self.consume_tracker_answers(run, {"ask-fixture": "See the attached log."})
+            else:
+                self.assertEqual(run.answering["id"], asked.id)
+                self.assertEqual(pipeline.answer_text(asked.id), "See the attached log.")
+            return "noop", "fixture finished", ""
+
+        started = []
+
+        def spawn(repo, tid):
+            started.append(tid)
+            if structured and not expired:
+                self.run_polled_answer(repo, tid, asked, work)
+                return
+            if expired:
+                self.assertNotIn("--continue", pipeline.run_command(repo, tid))
+            self.assertEqual(self.run_polled_ticket(repo, tid, lambda cfg, run, slot: work(run)), 0)
+
+        self.assertEqual(self.poll_with(self.cfg, spawn), 0)
+        self.assertEqual(started, [self.ticket])
+
+    def test_tracker_reply_to_a_structured_question_gives_a_fresh_budget(self):
+        self.check_tracker_reply_budget(structured=True)
+
+    def test_tracker_reply_to_an_unstructured_question_gives_a_fresh_budget(self):
+        self.check_tracker_reply_budget(structured=False)
+
+    def test_tracker_restart_after_an_expired_structured_question_gives_a_fresh_budget(self):
+        self.check_tracker_reply_budget(structured=True, expired=True)
+        self.assertEqual(ask_store.ask_get("ask-fixture")["status"], "expired")
+
+    def test_tracker_reply_to_an_unstructured_question_gives_a_fresh_budget_after_a_dry_run(self):
+        self.check_tracker_reply_budget(structured=False, dry_run=True)
+
+    def test_tracker_reply_to_a_structured_question_gives_a_fresh_budget_after_a_dry_run(self):
+        self.check_tracker_reply_budget(structured=True, dry_run=True)
+
+    def test_github_label_removal_without_a_reply_admits_a_run_with_spent_repairs(self):
+        self.repo = replace(self.repo, name="github-fixture", github="owner/project", tracker="github",
+                            parts=[config.Part("", "owner/project")])
+        self.cfg.repos = [self.repo]
+        self.ticket = "697"
+        labels = {tracker.LABEL}
+        source = tracker.GitHubTracker(self.repo)
+
+        def issue_view(repo, number):
+            return {"number": number, "title": "Fixture issue", "body": "Fixture description", "state": "OPEN",
+                    "author": {"login": "owner"}, "labels": [{"name": label} for label in sorted(labels)],
+                    "comments": []}
+
+        def issue_list(repo, label, **kwargs):
+            return [issue_view(repo, int(self.ticket))] if label in labels else []
+
+        def edit_labels(repo, number, add=(), remove=()):
+            labels.difference_update(remove)
+            labels.update(add)
+
+        with (patch.object(gh, "issue", side_effect=issue_view), patch.object(gh, "issues", side_effect=issue_list),
+              patch.object(gh, "issue_labels", side_effect=edit_labels), patch.object(gh, "issue_comment")):
+            first, asked = self.spent_question(structured=True)
+            self.assertIn(source.label_name("needs-info"), labels)
+            self.assertEqual(self.poll_with(self.cfg, lambda *_: self.fail("launched before label removal")), 0)
+            self.assertEqual(source.label(self.ticket, remove=["needs-info"]), "")
+            started = []
+
+            def work(cfg, run, slot):
+                started.append(run.id)
+                self.assertEqual(ask_store.ask_get("ask-fixture")["status"], "open")
+                self.assertEqual(run.answers_due, [])
+                self.assertFalse(pipeline.answer_text(asked.id))
+                self.assertEqual(run.budget.repair_left_out, [])
+                self.assertCountEqual(run.budget.repair_parents, [first.id, asked.id])
+                self.assertEqual(run.budget.prior_repairs, 3)
+                with self.assertRaisesRegex(runlimits.Parked, "3 repair cycles"):
+                    run.budget.charge("repair", "review_repair")
+                return "noop", "fixture finished", ""
+
+            def spawn(repo, tid):
+                self.assertNotIn("--continue", pipeline.run_command(repo, tid))
+                self.assertEqual(self.run_polled_ticket(repo, tid, work), 0)
+
+            self.assertEqual(self.poll_with(self.cfg, spawn), 0)
+            self.assertEqual(len(started), 1)
+
+    def test_tracker_reply_keeps_the_dashboard_answer_written_during_lookup(self):
+        asked_at = datetime(2026, 1, 2, tzinfo=UTC)
+        with patch.object(util, "now", return_value=asked_at):
+            first, asked = self.spent_question(structured=True)
+            ask_store.ask_add("ask-second", asked.id, self.repo.name, self.ticket, "review", "review", "", "", [
+                {"kind": "text", "header": "Failed job", "question": "Which CI job failed?"}], {})
+        owner = principals.seed_owner("fixture@example.test")
+        with patch.object(util, "now", return_value=asked_at - timedelta(days=1)), principals.acting(owner):
+            tasks_store.task_comment(self.ticket, principals.current(), "An older comment.")
+        self.assertEqual(self.poll_with(self.cfg, lambda *_: self.fail("launched with open asks")), 0)
+        self.assertEqual(len(ask_store.asks_of(asked.id, "open")), 2)
+        with patch.object(util, "now", return_value=asked_at + timedelta(days=1)), principals.acting(owner):
+            tasks_store.task_comment(self.ticket, principals.current(), "The lint job failed.")
+
+        reply_since = tracker.LocalTracker.reply_since
+
+        def reply_after_dashboard_answer(source, tid, since):
+            self.assertFalse(util.lock_is_held(tasks.STEER_LOCK))
+            answer = tasks.answer_ask("ask-fixture", {"answers": [{"text": "The log is on the dashboard."}]})
+            self.assertEqual(answer["state"], "waiting")
+            self.assertEqual(ask_store.ask_get("ask-second")["status"], "open")
+            return reply_since(source, tid, since)
+
+        started = []
+
+        def work(run):
+            started.append(run.id)
+            self.assert_answer_budget(run, first, asked)
+            self.consume_tracker_answers(run, {"ask-fixture": "The log is on the dashboard.",
+                                               "ask-second": "The lint job failed."})
+            return "noop", "fixture finished", ""
+
+        with patch.object(tracker.LocalTracker, "reply_since", autospec=True, side_effect=reply_after_dashboard_answer):
+            self.assertEqual(self.poll_with(self.cfg, lambda repo, tid: self.run_polled_answer(repo, tid, asked, work)), 0)
+        self.assertEqual(len(started), 1)
+
+    def test_tracker_restart_after_expiry_without_a_qualifying_reply_keeps_spent_repairs(self):
+        _, asked = self.expired_question()
+        self.local.comment(self.ticket, "An unrelated bot comment after expiry.")
+        self.local.label(self.ticket, remove=["needs-info"])
+        started = []
+
+        def work(cfg, run, slot):
+            started.append(run.id)
+            self.assertFalse(pipeline.answer_text(asked.id))
+            self.assertEqual(run.budget.prior_repairs, 3)
+            with self.assertRaisesRegex(runlimits.Parked, "3 repair cycles"):
+                run.budget.charge("repair", "review_repair")
+            return "noop", "fixture finished", ""
+
+        def spawn(repo, tid):
+            self.assertEqual(self.run_polled_ticket(repo, tid, work), 0)
+
+        self.assertEqual(self.poll_with(self.cfg, spawn), 0)
+        self.assertEqual(len(started), 1)
+
     def park_ticket(self, branch=""):
         self.repo.layer_dir.mkdir()
         (self.repo.layer_dir / "config.toml").write_text('[factory]\npath = "classic"\n')
@@ -758,12 +1042,12 @@ class QueueTests(Isolated):
         self.cfg.replay = config.ReplayConfig(all=True)
         return run
 
-    def run_polled_ticket(self, repo, tid, work):
+    def run_polled_ticket(self, repo, tid, work, script=None):
         _, env = launch_lease.child_environment(())
         with patch.dict(os.environ, env), patch.object(launch_lease, "registered"), \
                 patch.object(pipeline, "run_refusal", return_value=(False, "")), \
                 patch.object(pipeline, "_run", side_effect=work):
-            return pipeline.run_issue(repo, tid)
+            return pipeline.run_issue(repo, tid, script=script)
 
     def test_interrupted_ticket_rechecks_dependencies_before_starting(self):
         interrupted = self.made_run()
@@ -777,7 +1061,7 @@ class QueueTests(Isolated):
         self.assertNotIn(self.ticket, started)
         self.assertIn(prerequisite, started)
 
-    def poll_with(self, cfg, spawn):
+    def poll_with(self, cfg, spawn, *, dry_run=False):
         def launch_pending(repo, tid, launch):
             with launch_lease.acquiring(repo, tid):
                 return launch()
@@ -791,7 +1075,7 @@ class QueueTests(Isolated):
                 patch.object(poll, "retry_scratch"), \
                 patch.object(poll, "cleanup_worktrees"), patch.object(poll, "mark_loop"), \
                 patch.object(pipeline, "SKIPPED_FILE", self.root / "skipped.json"):
-            return poll.poll()
+            return poll.poll(dry_run=dry_run)
 
     def test_specification_edit_readmits_once_and_reparks_on_current_inputs(self):
         parked = self.park_ticket()
@@ -818,8 +1102,8 @@ class QueueTests(Isolated):
         self.assertIn(f"parked after run {started[0]}: repair limit again", output.getvalue())
         self.assertIn(runlimits.RETRY, output.getvalue())
 
-    def test_raised_layer_budget_readmits_a_failed_ticket(self):
-        self.park_ticket()
+    def test_raised_layer_budget_readmits_a_failed_ticket_with_earlier_repairs(self):
+        parked = self.park_ticket()
         (self.repo.layer_dir / "config.toml").write_text('[factory]\npath = "classic"\n[limits]\nmax_repair_cycles = 3\n')
         started = []
 
@@ -827,6 +1111,12 @@ class QueueTests(Isolated):
             started.append(run.budget.policy.max_repair_cycles)
             self.assertFalse(run.force)
             self.assertEqual(run.budget.parents, [])
+            self.assertEqual(run.budget.repair_parents, [parked.id])
+            self.assertEqual(run.budget.prior_repairs, 1)
+            for _ in range(2):
+                run.budget.charge("repair", "review_repair")
+            with self.assertRaisesRegex(runlimits.Parked, "3 repair cycles"):
+                run.budget.charge("repair", "review_repair")
             return "noop", "fixture finished", ""
 
         self.assertEqual(self.poll_with(self.cfg, lambda repo, tid: self.run_polled_ticket(repo, tid, work)), 0)
@@ -852,6 +1142,7 @@ class QueueTests(Isolated):
             started.append(run.id)
             self.assertFalse(run.force)
             self.assertEqual(run.budget.parents, [])
+            self.assertEqual(run.budget.prior_repairs, 1)
             return "noop", "fixture finished", ""
 
         def spawn(repo, tid):
@@ -917,7 +1208,7 @@ class QueueTests(Isolated):
                 self.assertEqual(self.poll_with(self.cfg, spawn), 0)
             self.assertIn("Poll already tried these inputs.", output.getvalue())
             self.assertEqual(runlimits.admission(self.repo, self.ticket, self.local, runlimits.Policy(), True),
-                             ("", True))
+                             runlimits.Admission(reset_time=True, reset_repairs=True))
         self.assertEqual(starts, [self.ticket, self.ticket])
 
     def test_multi_origin_readmission_checks_complete_exact_refs_and_revalidates_origins(self):

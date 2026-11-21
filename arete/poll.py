@@ -45,13 +45,21 @@ from .pipeline import (
 )
 from .slots import slots_free_to_start
 from .store import asks as ask_store
-from .store import asks as asks_store
+from .store import db
 from .store import insights as insights_store
 from .store import runs as run_store
 from .store import sources as source_store
 from .workspace import cleanup_worktrees
 
 MAX_STARTS_PER_POLL = 64
+SECRET_ASK_REPLY = "its ask holds a secret, which a tracker reply cannot answer; answer it on the dashboard"
+
+
+@dataclass(frozen=True)
+class Pick:
+    tid: str
+    why: str
+    from_queue: bool = False
 
 
 def ticket_queues(repo: config.Repo, tk: tracker.Tracker) -> list[tracker.Tracker]:
@@ -93,7 +101,7 @@ def jira_routes_by_project(cfg: config.Config) -> dict[str, set[str]]:
 
 def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
               other_routes: set[str], excluded: set[str] = frozenset(),
-              recovered: tuple[tracker.Ticket, ...] = ()) -> tuple[str, str] | None:
+              recovered: tuple[tracker.Ticket, ...] = ()) -> Pick | None:
     excluded = excluded | oncall.parked(repo.name)
     fresh = next_ticket(repo, tk, skips, other_routes, excluded, recovered)
     def eligible_again(tid):
@@ -107,10 +115,10 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
     for tid in run_store.interrupted_tickets(repo.name):
         if (ordinary_history(tid) and (row := run_store.newest_live_whole_run(repo.name, tid))
                 and not environment_gaps.was_retry(row)):
-            return tid, "restarting after an interruption"
+            return Pick(tid, "restarting after an interruption")
     for tid in insights_store.feedback_due(repo.name, util.iso(util.now() - timedelta(minutes=pipeline.FEEDBACK_QUIET_MINUTES))):
         if ordinary_history(tid):
-            return tid, "revising the PR for your review comments"
+            return Pick(tid, "revising the PR for your review comments")
     for source in ticket_queues(repo, tk):
         for t in source.replied():
             if not eligible_again(t.id):
@@ -121,8 +129,8 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
             if blocker := source.blocker(t.id):
                 skips.note(tracker.ticket_name(repo.name, t.ref), t, blocker, repo.name)
                 continue
-            return t.id, f"{t.title} (you replied to the question)"
-    return (fresh.id, fresh.title) if fresh else None
+            return Pick(t.id, f"{t.title} (you replied to the question)")
+    return Pick(fresh.id, fresh.title, from_queue=True) if fresh else None
 
 
 def step_without_route(cfg: config.Config, repo: config.Repo, ticket: tracker.Ticket,
@@ -155,20 +163,54 @@ def step_without_route(cfg: config.Config, repo: config.Repo, ticket: tracker.Ti
     return ""
 
 
-def tracker_reply(repo: config.Repo, tk: tracker.Tracker, tid: str, dry_run: bool) -> str:
-    newest = run_store.newest_whole_run(repo.name, str(tid))
+def tracker_reply(repo: config.Repo, tk: tracker.Tracker, tid: str, dry_run: bool, *, from_queue: bool) -> str:
+    newest = run_store.newest_live_whole_run(repo.name, tid)
     if not newest or newest["status"] != "needs-info":
         return ""
-    waiting = asks_store.asks_of(newest["id"], "open")
-    if not waiting:
-        return ""
+    run_id = newest["id"]
+    asks = ask_store.asks_of(run_id)
+    waiting = [a for a in asks if a["status"] == "open"]
     if any(owner_asks.has_secret(a["questions"]) for a in waiting):
-        return "its ask holds a secret, which a tracker reply cannot answer; answer it on the dashboard"
-    text = tk.reply_since(tid, waiting[0]["asked"])
-    if text and not dry_run:
-        with util.lock(owner_asks.STEER_LOCK, wait=True):
-            for a in asks_store.asks_of(newest["id"], "open"):
-                ask_store.ask_close(a["id"], "answered", owner_asks.text_answers(a, text))
+        return SECRET_ASK_REPLY
+    if dry_run:
+        return ""
+    if waiting:
+        since = waiting[0]["asked"]
+    elif not asks:
+        since = pipeline.question_time(newest)
+    elif all(a["status"] == "expired" and a["answered"] and not owner_asks.has_secret(a["questions"]) for a in asks):
+        since = max(a["answered"] for a in asks)
+    else:
+        return ""
+    if not waiting and pipeline.answer_text(run_id):
+        return ""
+    text = tk.reply_since(tid, since) if since else ""
+    if not waiting and not text:
+        return ""
+    with util.lock(owner_asks.STEER_LOCK, wait=True), db.tx():
+        current = run_store.newest_live_whole_run(repo.name, tid)
+        if not current or current["id"] != run_id or current["status"] != "needs-info":
+            return "its waiting run changed during tracker reply lookup"
+        current_asks = ask_store.asks_of(run_id)
+        if waiting:
+            open_asks = [a for a in current_asks if a["status"] == "open"]
+            if any(owner_asks.has_secret(a["questions"]) for a in open_asks):
+                return SECRET_ASK_REPLY
+            waiting_ids = {a["id"] for a in waiting}
+            if text:
+                for a in open_asks:
+                    if a["id"] in waiting_ids:
+                        ask_store.ask_close(a["id"], "answered", owner_asks.text_answers(a, text))
+            elif from_queue and current_asks == asks:
+                return ""
+            if ask_store.asks_of(run_id, "open"):
+                return "its asks are still waiting for an owner answer"
+            if any(a["status"] == "expired" for a in current_asks if a["id"] in waiting_ids):
+                return "its asks expired during tracker reply lookup"
+        elif current_asks != asks:
+            return "its asks changed during tracker reply lookup"
+        elif not pipeline.answer_text(run_id):
+            util.write_bytes_atomic(paths.RUNS_DIR / run_id / pipeline.ANSWER_FILE, text.encode())
     return ""
 
 
@@ -261,12 +303,12 @@ def repo_queues(cfg: config.Config, pipeline_repos: list[config.Repo], routes: d
     return queues, reached_clients
 
 
-def start_pick(cfg: config.Config, queue: RepoQueue, pick: tuple[str, str], skips: pipeline.SkipLog,
+def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline.SkipLog,
                dry_run: bool, going: Counter, slots: int) -> str:
     from . import tasks
 
     repo, layer = queue.repo, queue.layer
-    tid, why = pick
+    tid = pick.tid
     if not pilot.pickable(str(tid), repo.name) or (
             zte.reserved(str(tid)) and not (zte.scheduled_poll() and zte.pickable(str(tid), repo.name))):
         return "skipped"
@@ -277,7 +319,7 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: tuple[str, str], skip
     name = tracker.ticket_name(repo.name, source.ref(tid))
     if isinstance(source, tracker.GitHubTracker) and source.in_zte_queue(str(tid)):
         return "skipped"
-    reply = tracker_reply(repo, source, str(tid), dry_run)
+    reply = tracker_reply(repo, source, str(tid), dry_run, from_queue=pick.from_queue)
     answering = not reply and pipeline.answered_run(repo.name, str(tid)) is not None
     if not answering and not reply and (waiting := held_back(cfg, repo.name, going, slots)):
         if not dry_run:
@@ -297,7 +339,7 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: tuple[str, str], skip
         skips.note(name, ticket, blocked, repo.name)
         print(f"{util.iso()} {name}: {blocked}")
         return "blocked"
-    print(f"{util.iso()} {name}: {why}" + (" (dry run, not started)" if dry_run else ""))
+    print(f"{util.iso()} {name}: {pick.why}" + (" (dry run, not started)" if dry_run else ""))
     if not dry_run:
         source_store.drop_passed_over(repo.name, keep=str(tid))
         spawned = spawn_unparked(repo.name, tid, readmission)
@@ -325,7 +367,7 @@ def fill_slots(cfg: config.Config, queues: list[RepoQueue], skips: pipeline.Skip
                     if not dry_run:
                         source_store.drop_passed_over(repo.name)
                     continue
-                queue.selected.add(str(pick[0]))
+                queue.selected.add(str(pick.tid))
                 examined += 1
                 progressed = True
                 result = start_pick(cfg, queue, pick, skips, dry_run, going, slots)
