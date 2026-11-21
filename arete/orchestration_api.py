@@ -136,7 +136,7 @@ class Catalog:
         self.context = {"task": f"{job.ticket.title}\n\n{job.ticket.body}\n\n{job.ticket.comments or ''}",
                         "expertise": job.expertise, "attachments": job.attachments,
                         "feedback": "\n".join(job.run.story)}
-        self.fingerprint = digest({"entries": self.entries, "operations": describe_operations()})
+        self.fingerprint = digest(self.entries)
 
     def add_context(self, name: str, text: str) -> None:
         self.context[name] = text

@@ -28,7 +28,7 @@ from . import (
     zte,
 )
 from .agent import NO_SESSION, Session, json_from_text
-from .orchestration_api import BUNDLES, PROTOCOL, Catalog, help_text
+from .orchestration_api import BUNDLES, PROTOCOL, Catalog, describe_operations, help_text
 from .store import asks as ask_store
 from .store import orchestration as ledger
 from .verify import Verified
@@ -38,7 +38,7 @@ MAX_CI_FAILURE_CHARS = 24000
 STATE_FIELDS = ("plan_text", "goal", "estimate", "left_for_a_person", "build_summary", "reviews", "fix_reply",
                 "document", "report_body", "draft_why", "summary", "opened", "found", "pushed", "drafted",
                 "ci_stopped", "changed", "ci_result", "committed")
-REFRESHABLE_LINEAGE = {"catalog_sha", "controller_prompt"}
+REFRESHABLE_LINEAGE = {"catalog_sha", "controller_prompt", "operations_sha"}
 
 
 def policy_fingerprint(cfg, layer, closed_context):
@@ -223,7 +223,8 @@ class Controller:
 
     def lineage(self):
         self.catalog = Catalog(self.job)
-        found = {"catalog_sha": self.catalog.fingerprint, "policy_sha": self.policy_sha(),
+        found = {"catalog_sha": self.catalog.fingerprint, "operations_sha": ledger.digest(describe_operations()),
+                 "policy_sha": self.policy_sha(),
                  "controller_prompt": ledger.digest(prompt_loader.template("orchestrate").template),
                  "controller_settings": ledger.digest(asdict(self.run.settings("orchestrate"))),
                  "run_settings": ledger.digest([self.run.overrides, self.run.step_overrides])}

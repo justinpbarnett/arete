@@ -40,7 +40,7 @@ from arete import (
     workspace,
 )
 from arete.agent import Result
-from arete.orchestration_api import MAX_BYTES, OPERATIONS, PROTOCOL, Catalog
+from arete.orchestration_api import MAX_BYTES, OPERATIONS, PROTOCOL, Catalog, describe_operations
 from arete.store import asks as ask_store
 from arete.store import db as foundation
 from arete.store import orchestration as ledger
@@ -141,7 +141,7 @@ class OrchestrationLineageTests(Isolated):
     def audits(self, controller):
         return [line for line in run_lines.read(controller.run.id) if line["event"] == "lineage"]
 
-    def test_catalog_refresh_reaches_the_next_decision_and_audits_once(self):
+    def test_operations_refresh_reaches_the_next_decision_and_audits_once(self):
         wait = OPERATIONS["run.wait"]
         old_wait = replace(wait, description="Old wait", constraints={"timeout_seconds": {"minimum": 1}})
         with patch.dict(OPERATIONS, {"run.wait": old_wait}):
@@ -150,17 +150,20 @@ class OrchestrationLineageTests(Isolated):
         resumed = self.controller(prior.run.id)
         with patch.object(codebase, "STAMP", "new-engine"):
             self.assertIsNone(resumed.prepare())
-        new = resumed.catalog.fingerprint
+        catalog_sha = prior.data["catalog_sha"]
+        new = ledger.digest(describe_operations())
         audit, = self.audits(resumed)
-        self.assertEqual(audit["old"], {"catalog_sha": prior.data["catalog_sha"]})
-        self.assertEqual(audit["new"], {"catalog_sha": new})
+        self.assertEqual(audit["old"], {"operations_sha": prior.data["operations_sha"]})
+        self.assertEqual(audit["new"], {"operations_sha": new})
         self.assertNotEqual(audit["old"], audit["new"])
         self.assertEqual(audit["engine_commit"], "new-engine")
-        self.assertEqual(ledger.snapshot(resumed.lease)["data"]["catalog_sha"], new)
+        data = ledger.snapshot(resumed.lease)["data"]
+        self.assertEqual(data["operations_sha"], new)
+        self.assertEqual(data["catalog_sha"], catalog_sha)
 
         def decide(job, turn, prompt, *args):
             self.assertIn(wait.description, prompt)
-            self.assertIn(f'"catalog_sha": "{new}"', prompt)
+            self.assertIn(f'"catalog_sha": "{catalog_sha}"', prompt)
             response = {"version": PROTOCOL, "decision_id": turn, "rationale": "",
                         "state_version": ledger.snapshot(resumed.lease)["version"],
                         "calls": [{"op": "run.wait", "args": {"timeout_seconds": 0}}]}
@@ -177,7 +180,7 @@ class OrchestrationLineageTests(Isolated):
         record.move(resumed.run.id, "interrupted", ("running",))
         repeated = self.controller(resumed.run.id)
         self.assertIsNone(repeated.prepare())
-        self.assertEqual(repeated.catalog.fingerprint, new)
+        self.assertEqual(repeated.data["operations_sha"], new)
         self.assertEqual(self.audits(resumed), [audit])
         self.assertEqual(self.audits(repeated), [])
 
@@ -187,23 +190,43 @@ class OrchestrationLineageTests(Isolated):
         prior = self.admit()
         record.move(prior.run.id, "failed", ("running",))
         resumed = self.controller(prior.run.id)
-        original = {"catalog_sha": prior.data["catalog_sha"]}
+        original = {"operations_sha": prior.data["operations_sha"]}
         with patch.object(codebase, "STAMP", "deploy"):
             for deployed in (changed_wait, wait, changed_wait):
                 with patch.dict(OPERATIONS, {"run.wait": deployed}):
                     self.assertIsNone(resumed.prepare())
 
-        changed = {"catalog_sha": resumed.catalog.fingerprint}
+        changed = {"operations_sha": ledger.digest({**describe_operations(), "run.wait": changed_wait.describe()})}
         self.assertNotEqual(changed, original)
         audits = self.audits(resumed)
         self.assertEqual([(line["old"], line["new"]) for line in audits],
                          [(original, changed), (changed, original), (original, changed)])
         self.assertEqual([line["engine_commit"] for line in audits], ["deploy"] * 3)
-        self.assertEqual(ledger.snapshot(resumed.lease)["data"]["catalog_sha"], changed["catalog_sha"])
+        self.assertEqual(ledger.snapshot(resumed.lease)["data"]["operations_sha"], changed["operations_sha"])
 
-    def test_legacy_catalog_audit_survives_interruption_after_append(self):
+    def test_main_format_resumes_an_accepted_action_without_a_lineage_event(self):
         prior = self.admit()
-        prior.data["catalog_sha"] = ledger.digest(prior.catalog.entries)
+        catalog_sha = ledger.digest(prior.catalog.entries)
+        prior.data["catalog_sha"] = catalog_sha
+        del prior.data["operations_sha"]
+        ledger.save(prior.lease, prior.data)
+        action_id = self.accept(prior, "run.finish", "accepted", {"reason": "noop", "evidence_refs": []})
+        record.move(prior.run.id, "interrupted", ("running",))
+
+        resumed = self.controller(prior.run.id)
+        with patch.object(resumed, "decide", side_effect=AssertionError("the accepted action should finish the run")):
+            self.assertEqual(resumed.drive()[0], "needs-info")
+        action, = ledger.actions(resumed.lease)
+        self.assertEqual((action["id"], action["state"]), (action_id, "succeeded"))
+        data = ledger.snapshot(resumed.lease)["data"]
+        self.assertEqual(data["catalog_sha"], catalog_sha)
+        self.assertEqual(data["operations_sha"], ledger.digest(describe_operations()))
+        self.assertEqual(self.audits(resumed), [])
+
+    def test_catalog_audit_survives_interruption_after_append(self):
+        prior = self.admit()
+        old_entries = {key: entry for key, entry in prior.catalog.entries.items() if key != "prompt:delegate"}
+        prior.data["catalog_sha"] = ledger.digest(old_entries)
         ledger.save(prior.lease, prior.data)
         record.move(prior.run.id, "interrupted", ("running",))
         resumed = self.controller(prior.run.id)
@@ -345,9 +368,9 @@ class OrchestrationLineageTests(Isolated):
                 resumed = self.controller(prior.run.id)
                 with (patch.dict(OPERATIONS, {"run.wait": replace(wait, description="Updated wait")}),
                       patch.object(delegation, "live", side_effect=lambda pid, identity: (pid, identity) == (123, 456))):
-                    with self.assertRaisesRegex(factory.Refused, f"catalog_sha changed .*{reason}"):
+                    with self.assertRaisesRegex(factory.Refused, f"operations_sha changed .*{reason}"):
                         resumed.prepare()
-                self.assertEqual(ledger.snapshot(resumed.lease)["data"]["catalog_sha"], prior.data["catalog_sha"])
+                self.assertEqual(ledger.snapshot(resumed.lease)["data"]["operations_sha"], prior.data["operations_sha"])
                 stored = ledger.pending(resumed.lease) if state == "pending" else ledger.actions(resumed.lease)
                 self.assertEqual(stored[0]["state"], state)
                 self.assertEqual(self.audits(resumed), [])
