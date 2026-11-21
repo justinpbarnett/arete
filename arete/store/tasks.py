@@ -66,6 +66,10 @@ def task_set_state(tid: str, new: str, from_states: tuple[str, ...] = (), base_v
                          expect=from_states, base_version=base_version) is not None
 
 
+def task_update(tid: str, base_version: int, fields: dict) -> dict | None:
+    return writes.update("tasks", tid, {**fields, "updated": util.iso()}, base_version=base_version)
+
+
 def task_comment(tid: str, author: str, body: str) -> bool:
     ts = util.iso()
     with writes.atomic():

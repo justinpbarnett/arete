@@ -270,7 +270,7 @@ def register(sub) -> None:
     a = esub.add_parser("summary", help="summarize a results file")
     a.add_argument("file", metavar="FILE", help="the results file")
     a.add_argument("--json", action="store_true", help="print one JSON line")
-    a.set_defaults(fn=experiment_summary)
+    a.set_defaults(fn=experiment_summary, local_read=True)
     a = esub.add_parser("optimize", help="search for a better setting")
     a.add_argument("plan", metavar="PLAN", help="the plan")
     a.add_argument("--dry-run", action="store_true", help="validate and print the plan; writes and calls nothing")
@@ -310,7 +310,7 @@ def register(sub) -> None:
     b = bsub.add_parser("fixture", help="serve built-in fixture endpoints on loopback for a bounded time")
     b.add_argument("--port", type=int, required=True)
     b.add_argument("--seconds", type=float, default=60, help="how long to serve, 1 to 3600 (default 60)")
-    p.set_defaults(fn=cmd_benchmark)
+    p.set_defaults(fn=cmd_benchmark, local_read=lambda args: args.action == "report")
 
     p = sub.add_parser("verifiers", help="compare visual verifiers against known passes and regressions: "
                                          "`sample FOLDER`, `run SUITE`, `report FILE`")
@@ -325,7 +325,7 @@ def register(sub) -> None:
     a = vsub.add_parser("report", help="summarize a results file")
     a.add_argument("file", metavar="FILE", help="the results file")
     a.add_argument("--json", action="store_true", help="the summary as one JSON line")
-    a.set_defaults(fn=verifiers_report)
+    a.set_defaults(fn=verifiers_report, local_read=True)
 
     p = sub.add_parser("writers", help="compare owner-configured writer routes with blinded team ratings and "
                                        "factual checks; proposals only")
@@ -349,7 +349,7 @@ def register(sub) -> None:
     a = wsub.add_parser("report", help="report a run")
     a.add_argument("run", metavar="RUN", help="a run id")
     a.add_argument("--json", action="store_true", help="one JSON line")
-    a.set_defaults(fn=writers_report)
+    a.set_defaults(fn=writers_report, local_read=True)
 
     p = sub.add_parser("retrieval", help="offline experiment: compare exact, hybrid, embedding and rerank retrieval on "
                                          "a layer's labeled queries; `retrieval sample FOLDER` writes a fixture")

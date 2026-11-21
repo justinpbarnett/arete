@@ -126,17 +126,28 @@ def openapi(registry, minor, source_hashes, oldest_client):
             entry["deprecated"] = op["deprecated"]
         if "sunset" in op:
             entry["x-arete-sunset"] = op["sunset"]
-        if method == "POST":
-            entry["parameters"] = [{"name": "X-Arete", "in": "header", "required": True,
-                                    "schema": {"type": "string", "const": "1"}}]
-            entry["requestBody"] = {"required": True, "content": {"application/json": {
-                "schema": ref(f"{name}.input"), "example": example["input"]}}}
-        else:
-            entry["parameters"] = [{"name": field, "in": "path" if "{" + field + "}" in path else "query",
-                                    "required": field in op["input"].get("required", []), "schema": schema,
-                                    **({"example": example["input"][field]} if field in example["input"] else {})}
-                                   for field, schema in sorted(op["input"].get("properties", {}).items())]
+        inputs = op["input"]
+        fields = inputs.get("properties", {})
+        required = inputs.get("required", [])
+        path_fields = set(re.findall(r"\{(\w+)\}", path))
+        entry["parameters"] = [{"name": field, "in": "path" if field in path_fields else "query",
+                                "required": field in required, "schema": schema,
+                                **({"example": example["input"][field]} if field in example["input"] else {})}
+                               for field, schema in sorted(fields.items()) if method == "GET" or field in path_fields]
+        if method == "GET":
             responses["304"] = {"description": "The representation matches If-None-Match"}
+        else:
+            entry["parameters"].append({"name": "X-Arete", "in": "header", "required": True,
+                                        "schema": {"type": "string", "const": "1"}})
+            if contract.keyed_write(op):
+                entry["parameters"].append({"name": "Idempotency-Key", "in": "header", "required": True,
+                                            "schema": {"type": "string", "minLength": 8, "maxLength": 128}})
+            if method != "DELETE" or fields.keys() - path_fields:
+                body = inputs if not path_fields else {**inputs, "properties": {k: v for k, v in fields.items()
+                         if k not in path_fields}, "required": [k for k in required if k not in path_fields]}
+                entry["requestBody"] = {"required": True, "content": {"application/json": {
+                    "schema": ref(f"{name}.input") if not path_fields else body,
+                    "example": {k: v for k, v in example["input"].items() if k not in path_fields}}}}
         paths.setdefault(path, {})[method.lower()] = entry
     return {"openapi": "3.1.0", "info": {"title": "Arete API", "version": f"1.{minor}"}, "paths": paths,
             "components": {"schemas": schemas, "responses": problems}, "x-arete-contract-sources-sha256": source_hashes,

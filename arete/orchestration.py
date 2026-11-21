@@ -54,7 +54,9 @@ def policy_fingerprint(cfg, layer, closed_context):
         effective.pop("required_check")
     if layer.verify:
         effective["verify"] = layer.verify.policy()
-    return ledger.digest(json.loads(json.dumps({"layer": effective, "config": asdict(cfg),
+    policy_config = asdict(cfg)
+    policy_config.pop("server_url")
+    return ledger.digest(json.loads(json.dumps({"layer": effective, "config": policy_config,
                                                 "closed_context": closed_context}, default=str)))
 
 
