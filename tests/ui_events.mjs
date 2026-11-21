@@ -540,10 +540,12 @@ async function boardSnapshots() {
   const taskListCalls = () => calls.filter(({ key }) => key === "/api/v1/tasks" || key === "/api/tasks");
   const tasks = () => ui.screenReads.value.tasks;
   const state = () => tasks().data.tasks.find((row) => row.id === task.id).state;
-  const columns = (hash) => {
+  const groups = (hash) => {
     const queue = new TaskQueue().render({ route: parse(hash), resource: tasks() }, { query: "" });
-    const groups = queue.props.children(tasks().data).props.children[1];
-    return Object.fromEntries(groups.filter(Boolean).map((group) => {
+    return queue.props.children(tasks().data).props.children[1].filter(Boolean);
+  };
+  const columns = (hash) => {
+    return Object.fromEntries(groups(hash).map((group) => {
       const [label, , count] = group.props.children[0].props.children;
       return [label, count.props.children];
     }));
@@ -582,8 +584,8 @@ async function boardSnapshots() {
     assert.equal(ui.snapshot.value.running, 1, "the Board 304 preserves the event-driven badge");
     last().send({ kind: "serve.beat", at: "2026-11-21T05:04:00Z", age_seconds: 0 }, "serve.beat", "9.14");
     assert.equal(ui.connectivity(ui.snapshot.value, clock), "STALE");
-    last().send({ kind: "serve.beat", at: "2026-11-21T05:05:00Z", age_seconds: 0 }, "serve.beat", "9.14");
-    assert.equal(ui.connectivity(ui.snapshot.value, clock), "");
+    last().send({ kind: "serve.beat", at: "2026-11-21T05:03:00Z", age_seconds: 0 }, "serve.beat", "9.14");
+    assert.equal(ui.connectivity(ui.snapshot.value, clock), "", "a fresh beat after a backward clock correction clears STALE");
     assert.deepEqual(columns("#board"), { Running: 1, Closed: 1 });
     assert.deepEqual(columns("#board/open-work"), { Running: 1 });
     const review = { ...task, state: "pr", updated: "3", version: 3 };
@@ -606,11 +608,11 @@ async function boardSnapshots() {
 
     seq = "9.19";
     const boardStart = calls.length;
-    const board = open("#board");
+    let board = open("#board");
     await until(() => state() === "todo", "Board reads separately from the shared shell");
     assert.deepEqual(calls.slice(boardStart).map(({ key }) => key), ["board"]);
     assert.equal(ui.snapshot.value.running, 0, "a fresh Board snapshot leaves the badge intact");
-    assert.equal(ui.snapshot.value.serve.at, "2026-11-21T05:05:00Z");
+    assert.equal(ui.snapshot.value.serve.at, "2026-11-21T05:03:00Z");
     seq = "9.20";
     rows = [done, closed];
     last().send({ id: seq, kind: "principal.changed", subject: "principal:u:1234", data: { id: "u:1234" } });
@@ -621,11 +623,34 @@ async function boardSnapshots() {
     await board.retry();
     assert.equal(tasks().error?.status, 503, "service errors surface without falling back");
     assert.equal(taskListCalls().length, 0);
+
+    open("#floor");
+    assert.equal(tasks(), undefined);
     boardStatus = 404;
-    await board.retry();
-    assert.deepEqual(taskListCalls().map(({ key, status }) => [key, status]), [["/api/v1/tasks", 200]]);
-    assert.equal(tasks().error, null);
-    assert.deepEqual(columns("#board"), { Done: 1, Closed: 1 });
+    rows = [{ ...done, title: "Finished fallback card" }, { ...closed, title: "Closed fallback card" }];
+    const firstFallback = calls.length;
+    const messages = [];
+    const { error, warn } = console;
+    console.error = (...args) => messages.push(["error", ...args]);
+    console.warn = (...args) => messages.push(["warn", ...args]);
+    try {
+      board = open("#board");
+      await until(() => tasks()?.data, "Board renders the v1 task list on its first read");
+      assert.deepEqual(calls.slice(firstFallback).filter(({ key }) => key !== "live").map(({ key, status }) => [key, status]),
+        [["board", 404], ["/api/v1/tasks", 200]]);
+      assert.equal(tasks().error, null);
+      assert.deepEqual(columns("#board"), { Done: 1, Closed: 1 });
+      const cards = groups("#board").flatMap((group) => {
+        const list = group.props.children[1];
+        return list.type(list.props).props.children;
+      });
+      assert.deepEqual(cards.map((card) => [card.props["data-item"], card.props.children[0].props.children[0].props.children]),
+        [[task.id, "Finished fallback card"], [closed.id, "Closed fallback card"]]);
+      assert.deepEqual(messages, [], "a missing Board view emits no console errors or warnings");
+    } finally {
+      console.error = error;
+      console.warn = warn;
+    }
 
     boardStatus = 400;
     taskListSequenced = false;
@@ -664,20 +689,24 @@ async function boardSnapshots() {
     assert.equal(tasks().error?.message, "Task list unavailable", "a v1 task list service failure surfaces");
     assert.deepEqual(taskListCalls().slice(start).map(({ key, status }) => [key, status]), [["/api/v1/tasks", 503]]);
 
-    taskListStatus = 404;
-    open("#floor");
-    assert.equal(tasks(), undefined);
-    rows = [running, closed];
-    open("#board");
-    await until(() => tasks()?.data, "Board renders the legacy list on its first read");
-    assert.deepEqual(columns("#board"), { Running: 1, Closed: 1 });
+    taskListSequenced = true;
+    for (const [status, position] of [[404, "9.22"], [200, "9.23"]]) {
+      taskListStatus = status;
+      open("#floor");
+      assert.equal(tasks(), undefined);
+      rows = [running, closed];
+      open("#board");
+      await until(() => tasks()?.data, "Board renders the fallback list on its first read");
+      assert.deepEqual(columns("#board"), { Running: 1, Closed: 1 });
 
-    assert.equal(last().readyState, 1);
-    rows = [review, closed];
-    sendRun("9.22", "run.ended", "pr");
-    refresh();
-    await until(() => state() === "pr", "a connected Board refreshes legacy rows after an end event without a task update");
-    assert.deepEqual(columns("#board/open-work"), { "In review": 1 });
+      assert.equal(last().readyState, 1);
+      rows = [review, closed];
+      sendRun(position, "run.ended", "pr");
+      refresh();
+      const path = status === 404 ? "/api/tasks" : "/api/v1/tasks";
+      await until(() => state() === "pr", `a connected Board refreshes ${path} after an end event without a task update`);
+      assert.deepEqual(columns("#board/open-work"), { "In review": 1 });
+    }
   } finally {
     ui.stop();
     Date.now = now;

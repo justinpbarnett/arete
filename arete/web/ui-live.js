@@ -174,7 +174,7 @@ function takeHeartbeat(serve, received = Date.now()) {
     return;
   }
   const previous = cache.serve?.at;
-  if (previous && serve.at < previous) return;
+  if (previous && serve.at < previous && serve.kind !== "serve.beat") return;
   if (serve.at === previous) {
     cache.serve = { ...serve, age_seconds: cache.serve.age_seconds };
     return;
