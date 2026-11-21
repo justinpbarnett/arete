@@ -17,8 +17,9 @@ from importlib.metadata import Distribution
 from importlib.util import spec_from_file_location
 from pathlib import Path
 from unittest.mock import Mock, patch
+from zipfile import ZipFile
 
-from arete import paths, releasebuild, releasejourneys
+from arete import devices, loop_run, paths, record, releasebuild, releasejourneys, scratch
 
 BUILD = "0.1.0 sha256." + "a" * 64
 OTHER_BUILD = "0.1.0 sha256." + "b" * 64
@@ -34,7 +35,7 @@ command = [sys.executable, "-c", sys.argv[1], *sys.argv[2:]]
 with patch.object(control, "command", return_value=command):
     try:
         with record.stoppable():
-            loop_run.run_command(["arete", "release-journeys"], Path.cwd(), timeout=30, env={}, device=devices.LOCAL)
+            loop_run.run_command(["arete", "release-journeys"], Path.cwd(), timeout=None, env={}, device=devices.LOCAL)
     except record.Stopped:
         sys.exit(0)
 sys.exit("loop command completed before stop")
@@ -47,9 +48,10 @@ from pathlib import Path
 from arete import releasejourneys
 
 scratch = Path(sys.argv[1])
+selected = releasejourneys.Selection(Path(sys.executable), scratch / "unused.whl", "", ())
 releasejourneys.SETTINGS_PROBE = f"import runpy; runpy.run_path({sys.argv[2]!r}, run_name='__main__')"
 try:
-    releasejourneys.invoke(Path(sys.executable), releasejourneys.SETTINGS_ACTION, scratch, time.monotonic() + 20)
+    releasejourneys.invoke(selected, releasejourneys.SETTINGS_ACTION, scratch, time.monotonic() + 1)
 finally:
     (scratch / "controller-finally").touch()
 """
@@ -83,12 +85,12 @@ def holds_lock(path):
 
 
 class WheelIdentityTests(unittest.TestCase):
-    def install_inventory(self, site: Path, asset: bytes) -> str:
+    def install_inventory(self, site: Path, asset: bytes) -> Path:
         wheel_info = "arete-0.1.0.dist-info"
         files = {
             "arete/__init__.py": b'__version__ = "0.1.0"\n',
             "arete/web/index.html": asset,
-            f"{wheel_info}/METADATA": b"Name: arete\nVersion: 0.1.0\n",
+            f"{wheel_info}/METADATA": b"Name: arete\nVersion: 0.1.0.post1\n",
             f"{wheel_info}/WHEEL": b"Wheel-Version: 1.0\n",
             f"{wheel_info}/entry_points.txt": b"[console_scripts]\narete = arete.cli:main\n",
         }
@@ -100,46 +102,66 @@ class WheelIdentityTests(unittest.TestCase):
             digest = base64.urlsafe_b64encode(hashlib.sha256(content).digest()).rstrip(b"=").decode()
             rows.append(f"{name},sha256={digest},{len(content)}\n")
         (site / wheel_info / "RECORD").write_text("".join(rows))
-        return self.identity(site, wheel_info)
+        wheel = site.with_suffix(".whl")
+        with ZipFile(wheel, "w") as archive:
+            for name, content in files.items():
+                archive.writestr(name, content)
+        (site / wheel_info / "direct_url.json").write_text(json.dumps({"archive_info": {"hashes": {
+            "sha256": hashlib.sha256(wheel.read_bytes()).hexdigest()}}}))
+        return wheel
 
-    def identity(self, site: Path, wheel_info: str = "arete-0.1.0.dist-info") -> str:
+    def identity(self, site: Path, wheel: Path) -> str:
         spec = spec_from_file_location("arete", site / "arete" / "__init__.py")
-        with (patch.object(releasebuild, "distribution", return_value=Distribution.at(site / wheel_info)),
+        with (patch.object(releasebuild, "distribution", return_value=Distribution.at(site / "arete-0.1.0.dist-info")),
               patch.object(releasebuild.importlib.util, "find_spec", return_value=spec)):
-            return releasebuild.wheel_identity()
+            return releasebuild.wheel_identity(wheel)
 
     def test_installed_identities_use_package_contents_under_a_shared_parent(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             one, two = (Path(directory) / name / "site-packages" for name in ("first", "second"))
-            first = self.install_inventory(one, b"first wheel")
-            second = self.install_inventory(two, b"second wheel")
-            self.assertRegex(first, releasebuild.BUILD)
+            first_wheel = self.install_inventory(one, b"first wheel")
+            second_wheel = self.install_inventory(two, b"second wheel")
+            first = self.identity(one, first_wheel)
+            second = self.identity(two, second_wheel)
+            self.assertEqual(first, f"0.1.0.post1 sha256.{hashlib.sha256(first_wheel.read_bytes()).hexdigest()}")
             self.assertNotEqual(first, second)
+            with self.assertRaisesRegex(ValueError, "archive digest differs"):
+                self.identity(one, second_wheel)
             cache = one / "arete" / "__pycache__"
             cache.mkdir()
             (cache / "__init__.cpython-313.pyc").write_bytes(b"generated during install")
             with (one / "arete-0.1.0.dist-info" / "RECORD").open("a") as record:
                 record.write("arete/__pycache__/__init__.cpython-313.pyc,,\n")
-            self.assertEqual(self.identity(one), first)
-            self.assertEqual(self.identity(two), second)
+            self.assertEqual(self.identity(one, first_wheel), first)
+            self.assertEqual(self.identity(two, second_wheel), second)
+            with ZipFile(first_wheel, "a") as archive:
+                archive.comment = b"same payload, different wheel bytes"
+            with self.assertRaisesRegex(ValueError, "archive digest differs"):
+                self.identity(one, first_wheel)
             (two / "arete" / "web" / "index.html").write_bytes(b"locally modified")
             with self.assertRaisesRegex(ValueError, "installed file differs from the wheel"):
-                self.identity(two)
+                self.identity(two, second_wheel)
 
 
 class ReleaseJourneyTests(unittest.TestCase):
     def setUp(self):
-        directory = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(directory.cleanup)
-        self.root = Path(directory.name).resolve()
+        self.root = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         self.output = self.root / "evidence"
         self.config = self.root / "selection.toml"
+        self.enterContext(patch.object(releasejourneys, "ACTION_SECONDS", 1))
 
-    def exercise(self, invoke, *journeys, build=BUILD, confined_state=True, cleanup_results=None, real_cleanup=False):
-        self.config.write_text(f'python = "/release/bin/python"\nbuild = "{build}"\njourneys = {json.dumps(journeys)}\n')
+    def exercise(self, invoke, *journeys, build=BUILD, confined_state=True, real_cleanup=False):
+        self.config.write_text(f'python = "/release/bin/python"\nwheel = "/release/arete.whl"\n'
+                               f'build = "{build}"\njourneys = {json.dumps(journeys)}\n')
         cleanup = (contextlib.nullcontext() if real_cleanup else
-                   patch.object(releasejourneys, "cleanup_scratch", return_value=None, side_effect=cleanup_results))
-        action = patch.object(releasejourneys, "invoke", side_effect=invoke) if invoke else contextlib.nullcontext()
+                   patch.object(releasejourneys, "cleanup_scratches", return_value=None))
+
+        def action_result(*args):
+            result = invoke(*args)
+            return result if isinstance(result, releasejourneys.ActionResult) else releasejourneys.ActionResult(*result)
+
+        action = patch.object(releasejourneys, "invoke", side_effect=action_result) if invoke else contextlib.nullcontext()
         with action, cleanup, patch.object(paths, "ON_MAC", confined_state):
             return self.run_config()
 
@@ -176,7 +198,7 @@ class ReleaseJourneyTests(unittest.TestCase):
     def test_passing_journeys_record_build_and_actions_without_a_finding(self):
         code, report, findings = self.exercise(self.release, "first-run", "config-protection")
         self.assertEqual((code, report["outcome"], findings), (0, "pass", []))
-        self.assertEqual((report["build"], report["actions"]), (BUILD, 10))
+        self.assertEqual((report["build"], report["actions"]), (BUILD, 9))
         self.assertEqual([row["outcome"] for row in report["journeys"]], ["pass", "pass"])
         attempt = report["journeys"][0]["attempts"][0]
         self.assertEqual(attempt["observed_build"], BUILD)
@@ -257,51 +279,49 @@ class ReleaseJourneyTests(unittest.TestCase):
         self.assertEqual(attempt["actions"][-1], {"argv": ["migrate"], "exit": 0})
         self.assertFalse((self.output / "findings").exists())
 
-    def test_failed_replay_cleanup_cannot_confirm_an_assertion(self):
+    def test_scratch_removal_follows_report_and_failure_only_warns(self):
         def overwrite(python, argv, scratch, deadline):
             return self.release(python, argv, scratch, deadline, overwrite=True)
 
-        failure = releasejourneys.Blocked("infrastructure", "scratch-cleanup-failed")
-        code, report, findings = self.exercise(overwrite, "config-protection", cleanup_results=[None, failure])
-        self.assertEqual((code, report["outcome"], findings), (1, "blocked", []))
-        first, replay = report["journeys"][0]["attempts"]
-        self.assertEqual(first["outcome"], "assertion")
-        self.assertEqual((replay["outcome"], replay["reason"]), ("infrastructure", "scratch-cleanup-failed"))
-        self.assertEqual(replay["actions"], first["actions"])
-        self.assertEqual(replay["checks"], first["checks"])
-        self.assertFalse((self.output / "findings").exists())
+        def refuse_removal(scratch):
+            saved = json.loads((scratch.parent / "report.json").read_text())
+            self.assertEqual(saved["outcome"], "product-failure")
+            raise PermissionError(SECRET.decode())
 
-    def test_stalled_cleanup_is_killed_and_report_keeps_attempt_evidence(self):
-        popen = subprocess.Popen
-        workers = []
-
-        def remember_worker(*args, **kwargs):
-            worker = popen(*args, **kwargs)
-            workers.append(worker)
-            return worker
-
-        def overwrite(python, argv, scratch, deadline):
-            return self.release(python, argv, scratch, deadline, overwrite=True)
-
-        started = time.monotonic()
-        with (patch.object(releasejourneys, "RUN_SECONDS", 4),
-              patch.object(releasejourneys, "CLEANUP_PROGRAM", "import time; time.sleep(8)"),
-              patch.object(releasejourneys.subprocess, "Popen", side_effect=remember_worker)):
+        with (patch.object(releasejourneys.shutil, "rmtree", side_effect=refuse_removal) as remove,
+              self.assertLogs(releasejourneys.LOG, "WARNING") as warnings):
             code, report, findings = self.exercise(overwrite, "config-protection", real_cleanup=True)
-        self.assertLess(time.monotonic() - started, 5)
-        self.assertLess(report["seconds"], 4)
-        worker, = workers
-        self.assertEqual(worker.returncode, -signal.SIGKILL)
-        self.assertEqual((code, report["outcome"], report["findings"], findings), (1, "blocked", [], []))
+        self.assertEqual((code, report["outcome"], len(findings), remove.call_count), (0, "product-failure", 1, 2))
+        self.assertIn("scratch-cleanup-failed (PermissionError)", warnings.output[0])
+        self.assertNotIn(SECRET.decode(), "\n".join(warnings.output))
+
+    def test_action_at_deadline_is_killed_and_reported(self):
+        fixture = self.root / "release_action.py"
+        fixture.write_text(STOP_ACTION)
+        invoke = releasejourneys.invoke
+        scratch_paths = []
+
+        def run_stub(selected, argv, scratch, deadline):
+            if argv != ("init",):
+                return self.release(selected, argv, scratch, deadline)
+            scratch_paths.append(scratch)
+            selected = releasejourneys.Selection(Path(sys.executable), selected.wheel, selected.build, ())
+            return invoke(selected, releasejourneys.SETTINGS_ACTION, scratch, deadline)
+
+        with patch.object(releasejourneys, "SETTINGS_PROBE", f"import runpy; runpy.run_path({str(fixture)!r})"):
+            code, report, findings = self.exercise(run_stub, "first-run")
+        self.assertEqual((code, report["outcome"], findings), (1, "blocked", []))
         attempt, = report["journeys"][0]["attempts"]
-        self.assertEqual((attempt["outcome"], attempt["reason"]), ("infrastructure", "scratch-cleanup-timeout"))
-        self.assertEqual(attempt["observed_build"], BUILD)
-        self.assertEqual(attempt["actions"][-1], {"argv": ["init"], "exit": 0})
-        self.assertEqual(attempt["checks"], [{"invariant": "existing-config-preserved", "passed": False}])
-        self.assertFalse((self.output / "findings").exists())
+        self.assertEqual((attempt["outcome"], attempt["reason"]), ("timeout", "action-timeout"))
+        scratch, = scratch_paths
+        self.assertTrue((scratch / "descendant").is_file())
+        deadline = time.monotonic() + 1
+        while any(holds_lock(scratch / name) for name in ("action", "descendant")):
+            self.assertLess(time.monotonic(), deadline, "release action or descendant survived its deadline")
+            time.sleep(0.01)
 
     def test_unreaped_action_timeout_still_writes_a_report(self):
-        proc = Mock(spec=subprocess.Popen, stdin=io.BytesIO(), stdout=io.BytesIO(), stderr=io.BytesIO())
+        proc = Mock(spec=subprocess.Popen, pid=1234, stdin=io.BytesIO(), stdout=io.BytesIO(), stderr=io.BytesIO())
 
         def unreapable(*, timeout):
             self.assertTrue(proc.stdin.closed)
@@ -310,35 +330,95 @@ class ReleaseJourneyTests(unittest.TestCase):
             raise subprocess.TimeoutExpired("release action", timeout)
 
         proc.wait.side_effect = unreapable
-        timeout = releasejourneys.Blocked("infrastructure", "action-timeout")
+        timeout = releasejourneys.Blocked("timeout", "action-timeout")
         with (patch.object(releasejourneys.subprocess, "Popen", return_value=proc),
-              patch.object(releasejourneys, "read_output", side_effect=timeout)):
+              patch.object(releasejourneys, "read_output", side_effect=timeout),
+              patch.object(releasejourneys.os, "killpg") as kill):
             code, report, findings = self.exercise(None, "config-protection")
         self.assertEqual((code, report["outcome"], findings), (1, "blocked", []))
         attempt, = report["journeys"][0]["attempts"]
-        self.assertEqual((attempt["outcome"], attempt["reason"]), ("startup", "action-timeout"))
+        self.assertEqual((attempt["outcome"], attempt["reason"]), ("timeout", "action-timeout"))
         self.assertEqual(attempt["actions"], [{"argv": ["build-identity"], "error": "action-timeout",
                                                "cleanup": "action-cleanup-timeout"}])
         self.assertEqual(proc.wait.call_count, 1)
+        kill.assert_called_once_with(proc.pid, signal.SIGKILL)
         self.assertTrue(proc.stdout.closed and proc.stderr.closed)
 
     def test_loop_stop_kills_in_flight_action_and_descendant(self):
         fixture = self.root / "release_action.py"
         fixture.write_text(STOP_ACTION)
+        self.check_controller_stop(fixture, wrapped=True)
+
+    def test_stop_during_controller_startup_cleans_up_before_propagating(self):
+        self.addCleanup(signal.signal, signal.SIGTERM, signal.getsignal(signal.SIGTERM))
+        self.enterContext(record.stoppable())
+        for boundary in ("spawn", "first-thread-start"):
+            with self.subTest(boundary=boundary):
+                proc = Mock(spec=subprocess.Popen, returncode=None)
+
+                def spawn(*args, **kwargs):
+                    if boundary == "spawn":
+                        signal.raise_signal(signal.SIGTERM)
+                    return proc
+
+                with (patch.object(scratch, "spawn", side_effect=spawn),
+                      patch.object(loop_run.threading.Thread, "start", side_effect=record.Stopped) as start,
+                      patch.object(loop_run.util, "kill_group") as kill):
+                    proc.wait.side_effect = lambda _: kill.assert_called_once_with(proc)
+                    with self.assertRaises(record.Stopped):
+                        loop_run.run_command(["arete", "release-journeys"], self.root,
+                                             timeout=None, env={}, device=devices.LOCAL)
+                    kill.assert_called_once_with(proc)
+                    proc.wait.assert_called_once()
+                    self.assertEqual(start.call_count, int(boundary == "first-thread-start"))
+
+    def test_stop_after_command_leader_is_reaped_kills_its_group(self):
+        self.addCleanup(signal.signal, signal.SIGTERM, signal.getsignal(signal.SIGTERM))
+        self.enterContext(record.stoppable())
+        read_stdin = [sys.executable, "-c", "import sys; sys.stdin.read()"]
+        with (subprocess.Popen(read_stdin, process_group=0,
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as leader,
+              subprocess.Popen(read_stdin, process_group=leader.pid, stdin=subprocess.PIPE) as worker):
+            wait = leader.wait
+
+            def stop_after_reap(timeout):
+                reaped = leader.returncode is not None
+                code = wait(timeout)
+                if not reaped:
+                    self.assertEqual(leader.returncode, 0)
+                    signal.raise_signal(signal.SIGTERM)
+                return code
+
+            with (patch.object(scratch, "spawn", return_value=leader),
+                  patch.object(leader, "wait", side_effect=stop_after_reap),
+                  patch.object(loop_run.util, "kill_group", wraps=loop_run.util.kill_group) as kill):
+                with self.assertRaises(record.Stopped):
+                    loop_run.run_command(["command"], self.root, timeout=1, env={}, device=devices.LOCAL)
+                kill.assert_called_once_with(leader)
+            self.assertEqual(worker.wait(timeout=1), -signal.SIGKILL)
+
+    def test_sigkill_of_controller_kills_action_group(self):
+        fixture = self.root / "release_action.py"
+        fixture.write_text(STOP_ACTION)
+        self.check_controller_stop(fixture, wrapped=False)
+
+    def check_controller_stop(self, fixture, *, wrapped):
         locks = [self.root / "action", self.root / "descendant"]
-        driver = subprocess.Popen([sys.executable, "-c", STOP_DRIVER, STOP_CONTROLLER, str(self.root), str(fixture)],
-                                  start_new_session=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        command = [sys.executable, "-c", STOP_CONTROLLER, str(self.root), str(fixture)]
+        if wrapped:
+            command.insert(2, STOP_DRIVER)
+        driver = subprocess.Popen(command, start_new_session=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + 2
             while not all(holds_lock(path) and path.read_text() for path in locks):
                 self.assertIsNone(driver.poll())
                 self.assertLess(time.monotonic(), deadline, "release action and descendant did not start")
                 time.sleep(0.01)
 
-            os.killpg(driver.pid, signal.SIGTERM)
-            _, stderr = driver.communicate(timeout=5)
-            self.assertEqual(driver.returncode, 0, stderr.decode())
-            deadline = time.monotonic() + 5
+            os.killpg(driver.pid, signal.SIGTERM if wrapped else signal.SIGKILL)
+            _, stderr = driver.communicate(timeout=1)
+            self.assertEqual(driver.returncode, 0 if wrapped else -signal.SIGKILL, stderr.decode())
+            deadline = time.monotonic() + 1
             while any(holds_lock(path) for path in locks):
                 self.assertLess(time.monotonic(), deadline, "release action or descendant survived loop stop")
                 time.sleep(0.01)
@@ -346,7 +426,7 @@ class ReleaseJourneyTests(unittest.TestCase):
         finally:
             if driver.poll() is None:
                 os.killpg(driver.pid, signal.SIGKILL)
-            driver.communicate(timeout=5)
+            driver.communicate(timeout=1)
             for path in locks:
                 if holds_lock(path) and (pid := path.read_text()):
                     with contextlib.suppress(ProcessLookupError):
@@ -442,43 +522,18 @@ class ReleaseJourneyTests(unittest.TestCase):
         self.assertEqual((code, report["outcome"], report["reason"], report["actions"], findings),
                          (1, "environment", "config-unreadable", 0, []))
 
-    def test_stalled_selection_leaves_time_to_save_infrastructure_outcome(self):
-        started = time.monotonic()
-        with (patch.object(releasejourneys, "RUN_SECONDS", 4),
-              patch.object(releasejourneys, "read_file", side_effect=lambda _: time.sleep(12))):
-            code, report, findings = self.run_config()
-        self.assertLess(time.monotonic() - started, 5)
-        self.assertEqual((code, report["outcome"], report["reason"], report["actions"], findings),
-                         (1, "infrastructure", "config-io-timeout", 0, []))
+    def test_selection_read_and_parse_errors_are_environment_outcomes(self):
+        for text in ('syntactically = [', None):
+            with self.subTest(text=text):
+                if text is not None:
+                    self.config.write_text(text)
+                else:
+                    self.config.unlink()
+                code, report, findings = self.run_config()
+                self.assertEqual((code, report["outcome"], report["reason"], report["actions"], findings),
+                                 (1, "environment", "config-unreadable", 0, []))
 
-    def test_stalled_scratch_read_keeps_attempts_without_confirming_regression(self):
-        read = paths.read_scratch_file
-        attempts = []
-
-        def overwrite(python, argv, scratch, deadline):
-            if argv == releasejourneys.BUILD_ACTION:
-                attempts.append(scratch)
-            return self.release(python, argv, scratch, deadline, overwrite=True)
-
-        def stalled(path, limit):
-            if len(attempts) == 2:
-                time.sleep(12)
-            return read(path, limit)
-
-        started = time.monotonic()
-        with (patch.object(releasejourneys, "RUN_SECONDS", 4.5),
-              patch.object(paths, "read_scratch_file", side_effect=stalled)):
-            code, report, findings = self.exercise(overwrite, "config-protection")
-        self.assertLess(time.monotonic() - started, 5.5)
-        self.assertEqual((code, report["outcome"], report["findings"], findings), (1, "blocked", [], []))
-        first, replay = report["journeys"][0]["attempts"]
-        self.assertEqual((first["outcome"], first["reason"]), ("assertion", "existing-config-preserved"))
-        self.assertEqual((replay["outcome"], replay["reason"]), ("infrastructure", "scratch-io-timeout"))
-        self.assertEqual(replay["observed_build"], BUILD)
-        self.assertEqual(replay["actions"], first["actions"])
-        self.assertEqual(replay["checks"], [])
-
-    def test_stalled_report_or_finding_writes_keep_available_evidence(self):
+    def test_failed_report_or_finding_writes_keep_available_evidence(self):
         write = releasejourneys.util.write_durably
 
         def overwrite(python, argv, scratch, deadline):
@@ -486,18 +541,15 @@ class ReleaseJourneyTests(unittest.TestCase):
 
         for phase in ("report", "finding"):
             with self.subTest(phase=phase):
-                def stalled(path, *args, **kwargs):
+                def unavailable(path, *args, **kwargs):
                     if path.name != "infrastructure.json" and (path.name == "report.json") == (phase == "report"):
-                        time.sleep(12)
+                        raise PermissionError(SECRET.decode())
                     write(path, *args, **kwargs)
 
-                started = time.monotonic()
-                with (patch.object(releasejourneys, "RUN_SECONDS", 4.5),
-                      patch.object(releasejourneys.util, "write_durably", side_effect=stalled)):
+                with patch.object(releasejourneys.util, "write_durably", side_effect=unavailable):
                     code, report, findings = self.exercise(overwrite, "config-protection")
-                self.assertLess(time.monotonic() - started, 5.5)
                 self.assertEqual((code, report["outcome"], report["reason"], report["findings"], findings),
-                                 (1, "infrastructure", f"{phase}-io-timeout", [], []))
+                                 (1, "infrastructure", f"{phase}-io-failed", [], []))
                 self.assertEqual(report["journeys"][0]["outcome"], "product-failure")
                 self.assertEqual(list((self.output / "findings").glob("*.json")), [])
                 if phase == "report":
@@ -506,29 +558,31 @@ class ReleaseJourneyTests(unittest.TestCase):
                     completed = json.loads((self.output / report["completed_report"]).read_text())
                     self.assertEqual(completed["journeys"], report["journeys"])
 
-    def test_probe_and_scratch_cleanup_failures_are_both_reported(self):
-        failure = releasejourneys.Blocked("infrastructure", "scratch-cleanup-failed")
+    def test_probe_and_action_teardown_failures_are_both_reported(self):
         cases = [
-            (lambda *_: (1, SECRET), "startup", "build-probe-failed"),
-            (None, "environment", "release-executable-unavailable"),
+            (1, "startup", "build-probe-failed"),
+            (2, "environment", "release-wheel-unverified"),
         ]
-        for invoke, outcome, reason in cases:
+        for exit_code, outcome, reason in cases:
             with self.subTest(outcome=outcome):
-                code, report, findings = self.exercise(invoke, "config-protection", cleanup_results=[failure])
+                def probe(*_):
+                    return releasejourneys.ActionResult(exit_code, SECRET, "action-cleanup-failed")
+
+                code, report, findings = self.exercise(probe, "config-protection")
                 self.assertEqual((code, report["outcome"], findings), (1, "blocked", []))
                 journey, = report["journeys"]
                 attempt, = journey["attempts"]
                 self.assertEqual(journey["outcome"], outcome)
-                self.assertEqual((attempt["outcome"], attempt["reason"], attempt["cleanup"]),
-                                 (outcome, reason, "scratch-cleanup-failed"))
+                self.assertEqual((attempt["outcome"], attempt["reason"]), (outcome, reason))
+                self.assertEqual(attempt["actions"][0]["cleanup"], "action-cleanup-failed")
 
     def test_action_cap_prevents_unconfirmed_assertion_from_publishing(self):
-        with patch.object(releasejourneys, "MAX_ACTIONS", 3):
+        with patch.object(releasejourneys, "MAX_ACTIONS", 2):
             def overwrite(python, argv, scratch, deadline):
                 return self.release(python, argv, scratch, deadline, overwrite=True)
 
             code, report, findings = self.exercise(overwrite, "config-protection")
-        self.assertEqual((code, report["actions"], findings), (1, 3, []))
+        self.assertEqual((code, report["actions"], findings), (1, 2, []))
         first, replay = report["journeys"][0]["attempts"]
         self.assertEqual(first["outcome"], "assertion")
         self.assertEqual((replay["outcome"], replay["reason"], replay["actions"]),

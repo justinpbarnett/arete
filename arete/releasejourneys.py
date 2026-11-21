@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import selectors
+import shutil
 import signal
 import stat
 import subprocess
@@ -13,7 +15,7 @@ import time
 import tomllib
 import uuid
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
@@ -25,9 +27,6 @@ MAX_JOURNEYS = 2
 MAX_ACTIONS = 16
 RUN_SECONDS = 60
 ACTION_SECONDS = 10
-CLEANUP_RESERVE_SECONDS = 1
-REPORT_RESERVE_SECONDS = 2
-RECOVERY_RESERVE_SECONDS = 0.75
 REAP_SECONDS = 0.25
 MAX_OUTPUT = 65536
 CUSTOM_CONFIG = b"max_parallel = 2\n"
@@ -82,23 +81,7 @@ else:
     finally:
         os.killpg(0, signal.SIGKILL)
 """
-CLEANUP_PROGRAM = """\
-import os
-import shutil
-import sys
-from threading import Thread
-
-def watch_owner():
-    os.read(0, 1)
-    os._exit(1)
-
-Thread(target=watch_owner, daemon=True).start()
-try:
-    shutil.rmtree(sys.argv[1])
-except FileNotFoundError as error:
-    if error.filename != sys.argv[1]:
-        raise
-"""
+LOG = logging.getLogger(__name__)
 
 
 class Blocked(Exception):
@@ -112,145 +95,85 @@ class Blocked(Exception):
 @dataclass(frozen=True)
 class Selection:
     python: Path
+    wheel: Path
     build: str
     journeys: tuple[str, ...]
 
 
 def read_file(path: Path) -> bytes:
-    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK), "rb") as stream:
-        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
-            raise OSError("expected regular file")
+    if not stat.S_ISREG(path.stat().st_mode):
+        raise OSError("expected regular file")
+    with path.open("rb") as stream:
         return stream.read(MAX_OUTPUT + 1)
 
 
-def selection(path: Path, deadline: float) -> Selection:
+def selection(path: Path) -> Selection:
     try:
-        data = storage(deadline, "config", read_file, path)
+        data = read_file(path)
         if len(data) > MAX_OUTPUT:
             raise ValueError
         config = tomllib.loads(data.decode())
-    except (OSError, ValueError, RecursionError):
+    except Exception:
         raise Blocked("environment", "config-unreadable") from None
-    python, build, names = (config.get(key) for key in ("python", "build", "journeys"))
+    python, wheel, build, names = (config.get(key) for key in ("python", "wheel", "build", "journeys"))
     if not isinstance(python, str) or not Path(python).is_absolute() or "\x00" in python:
         raise Blocked("environment", "absolute-release-python-required")
+    if (not isinstance(wheel, str) or not Path(wheel).is_absolute()
+            or "\x00" in wheel or Path(wheel).suffix != ".whl"):
+        raise Blocked("environment", "absolute-release-wheel-required")
     if not isinstance(build, str) or not BUILD.fullmatch(build):
         raise Blocked("environment", "release-build-identity-required")
     if (not isinstance(names, list) or not 1 <= len(names) <= MAX_JOURNEYS
             or any(not isinstance(name, str) or name not in JOURNEYS for name in names)
             or len(set(names)) != len(names)):
         raise Blocked("environment", "invalid-journey-selection")
-    return Selection(Path(python), build, tuple(names))
+    return Selection(Path(python), Path(wheel), build, tuple(names))
 
 
 @dataclass
 class Budget:
-    deadline: float = field(default_factory=lambda: time.monotonic() + RUN_SECONDS)
+    remaining: float
     actions: int = 0
 
-    @property
-    def cleanup_deadline(self) -> float:
-        return self.deadline - REPORT_RESERVE_SECONDS
-
-    @property
-    def action_deadline(self) -> float:
-        return self.cleanup_deadline - CLEANUP_RESERVE_SECONDS
-
-    @property
-    def report_deadline(self) -> float:
-        return self.deadline - RECOVERY_RESERVE_SECONDS
-
-    def start(self) -> float:
-        now = time.monotonic()
-        if self.actions >= MAX_ACTIONS or now >= self.action_deadline:
+    def start(self, now: float) -> float:
+        if self.actions >= MAX_ACTIONS or self.remaining <= 0:
             raise Blocked("infrastructure", "run-limit")
         self.actions += 1
-        return min(self.action_deadline, now + ACTION_SECONDS)
+        return now + min(self.remaining, ACTION_SECONDS)
 
 
-def read_pipe(stream: BinaryIO, deadline: float, limit: int) -> bytes:
+def read_output(stream: BinaryIO, deadline: float) -> bytes:
     data = bytearray()
     with selectors.DefaultSelector() as readable:
         readable.register(stream, selectors.EVENT_READ)
         while (left := deadline - time.monotonic()) > 0 and readable.select(left):
-            chunk = stream.read1(limit + 1 - len(data))
+            chunk = stream.read1(MAX_OUTPUT + 1 - len(data))
             if not chunk:
                 return bytes(data)
             data.extend(chunk)
-            if len(data) > limit:
-                raise OverflowError
-    raise TimeoutError
+            if len(data) > MAX_OUTPUT:
+                raise Blocked("infrastructure", "output-limit")
+    raise Blocked("timeout", "action-timeout")
 
 
-def read_output(stream: BinaryIO, deadline: float) -> bytes:
+def stop_action(proc: subprocess.Popen) -> str | None:
+    failure = None
     try:
-        return read_pipe(stream, deadline, MAX_OUTPUT)
-    except TimeoutError:
-        raise Blocked("infrastructure", "action-timeout") from None
-    except OverflowError:
-        raise Blocked("infrastructure", "output-limit") from None
-
-
-def reap_storage(pid: int, deadline: float) -> None:
-    with suppress(ChildProcessError):
-        while not os.waitpid(pid, os.WNOHANG)[0]:
-            left = deadline - time.monotonic()
-            if left <= 0:
-                return
-            time.sleep(min(0.005, left))
-
-
-def storage_worker(incoming: BinaryIO, outgoing: BinaryIO, fn, args: tuple) -> None:
-    status = 1
+        with suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        failure = "action-cleanup-failed"
     try:
-        incoming.close()
-        for fd in (0, 1, 2):
-            if fd != outgoing.fileno():
-                with suppress(OSError):
-                    os.close(fd)
-        result = fn(*args)
-        with outgoing:
-            outgoing.write(b"1" + (result if result is not None else b""))
-        status = 0
-    finally:
-        os._exit(status)
-
-
-def storage(deadline: float, operation: str, fn, *args) -> bytes:
-    stop_at = deadline - REAP_SECONDS
-    if time.monotonic() >= stop_at:
-        raise Blocked("infrastructure", f"{operation}-io-timeout")
-    reader, writer = os.pipe()
-    with os.fdopen(reader, "rb") as incoming, os.fdopen(writer, "wb") as outgoing:
-        pid = os.fork()
-        if pid == 0:
-            storage_worker(incoming, outgoing, fn, args)
-        finished = False
-        try:
-            outgoing.close()
-            result = read_pipe(incoming, stop_at, MAX_OUTPUT + 2)
-            finished = True
-        except TimeoutError:
-            raise Blocked("infrastructure", f"{operation}-io-timeout") from None
-        except OverflowError:
-            raise OSError(f"{operation}-io-failed") from None
-        finally:
-            if not finished:
-                with suppress(ProcessLookupError):
-                    os.kill(pid, signal.SIGKILL)
-            reap_storage(pid, min(deadline, time.monotonic() + REAP_SECONDS))
-    if not result.startswith(b"1"):
-        raise OSError(f"{operation}-io-failed")
-    return result[1:]
-
-
-def stop_action(proc: subprocess.Popen, deadline: float) -> bool:
-    proc.stdin.close()
+        proc.stdin.close()
+    except OSError:
+        failure = "action-cleanup-failed"
     try:
-        proc.wait(timeout=min(REAP_SECONDS, max(0, deadline - time.monotonic())))
+        proc.wait(timeout=REAP_SECONDS)
     except subprocess.TimeoutExpired:
-        return False
-    return True
+        return failure or "action-cleanup-timeout"
+    except OSError:
+        return "action-cleanup-failed"
+    return failure
 
 
 def action_result(proc: subprocess.Popen, deadline: float) -> tuple[int, bytes]:
@@ -268,19 +191,25 @@ def action_result(proc: subprocess.Popen, deadline: float) -> tuple[int, bytes]:
     return int(status), out
 
 
-def invoke(python: Path, argv: tuple[str, ...], scratch: Path, deadline: float) -> tuple[int, bytes]:
-    stop_at = deadline - REAP_SECONDS
-    if time.monotonic() >= stop_at:
-        raise Blocked("infrastructure", "action-timeout")
+@dataclass(frozen=True)
+class ActionResult:
+    code: int
+    output: bytes
+    cleanup: str | None = None
+
+
+def invoke(selected: Selection, argv: tuple[str, ...], scratch: Path, deadline: float) -> ActionResult:
+    if time.monotonic() >= deadline:
+        raise Blocked("timeout", "action-timeout")
     env = {paths.SCRATCH_ENV: str(scratch), "PATH": os.defpath, "TMPDIR": str(scratch),
            "HOME": str(scratch), "XDG_STATE_HOME": str(scratch / "client")}
     if argv == BUILD_ACTION:
-        command = (str(BUILD_PROBE),)
+        command = (str(BUILD_PROBE), str(selected.wheel))
     elif argv == SETTINGS_ACTION:
         command = ("-c", SETTINGS_PROBE)
     else:
         command = ("-m", "arete.cli", *argv)
-    release = (str(python), "-I", "-B", "-X", f"pycache_prefix={scratch / 'bytecode'}", *command)
+    release = (str(selected.python), "-I", "-B", "-X", f"pycache_prefix={scratch / 'bytecode'}", *command)
     try:
         proc = subprocess.Popen([sys.executable, "-I", "-S", "-B", "-c", ACTION_PROGRAM,
                                  str(scratch), *release], env=env,
@@ -291,18 +220,15 @@ def invoke(python: Path, argv: tuple[str, ...], scratch: Path, deadline: float) 
     error = None
     with proc.stdout, proc.stderr:
         try:
-            result = action_result(proc, stop_at)
+            code, out = action_result(proc, deadline)
         except Blocked as failure:
             error = failure
         finally:
-            stopped = stop_action(proc, deadline)
+            cleanup = stop_action(proc)
     if error is not None:
-        if not stopped:
-            error.cleanup = "action-cleanup-timeout"
+        error.cleanup = cleanup
         raise error
-    if not stopped:
-        raise Blocked("infrastructure", "action-cleanup-timeout")
-    return result
+    return ActionResult(code, out, cleanup)
 
 
 @dataclass
@@ -316,38 +242,42 @@ class Attempt:
     def config(self) -> Path:
         return self.scratch / "config" / "config.toml"
 
-    def call(self, *argv: str) -> tuple[int, bytes]:
-        deadline = self.budget.start()
+    def call(self, *argv: str, expected_error: bytes | None = None) -> tuple[int, bytes]:
+        started = time.monotonic()
+        deadline = self.budget.start(started)
         log = {"argv": list(argv)}
         self.evidence["actions"].append(log)
         try:
-            code, out = invoke(self.selected.python, argv, self.scratch, deadline)
+            result = invoke(self.selected, argv, self.scratch, deadline)
         except Blocked as error:
             log["error"] = error.reason
             if error.cleanup is not None:
                 log["cleanup"] = error.cleanup
             raise
-        log["exit"] = code
-        return code, out
+        finally:
+            self.budget.remaining -= min(deadline, time.monotonic()) - started
+        log["exit"] = result.code
+        if result.cleanup is not None:
+            log["cleanup"] = result.cleanup
+        if argv == BUILD_ACTION:
+            self.verify_build(result.code, result.output)
+        elif result.code != 0 and (result.code, result.output) != (1, expected_error):
+            raise Blocked("infrastructure", "unexpected-command-exit")
+        if result.cleanup is not None:
+            raise Blocked("infrastructure", result.cleanup)
+        return result.code, result.output
 
     def ok(self, *argv: str) -> bytes:
-        code, out = self.call(*argv)
-        if code != 0:
-            raise Blocked("infrastructure", "unexpected-command-exit")
-        return out
+        return self.call(*argv)[1]
 
     def check(self, invariant: str, passed: bool) -> None:
         self.evidence["checks"].append({"invariant": invariant, "passed": passed})
         if not passed:
             raise Blocked("assertion", invariant)
 
-    def verify_build(self) -> None:
-        try:
-            code, out = self.call(*BUILD_ACTION)
-        except Blocked as error:
-            if error.reason == "action-timeout":
-                raise Blocked("startup", error.reason) from None
-            raise
+    def verify_build(self, code: int, out: bytes) -> None:
+        if code == 2:
+            raise Blocked("environment", "release-wheel-unverified")
         build = out.strip().decode("ascii", errors="replace")
         if code != 0 or not BUILD.fullmatch(build):
             raise Blocked("startup", "build-probe-failed")
@@ -356,7 +286,7 @@ class Attempt:
             raise Blocked("environment", "release-build-mismatch")
 
     def read_scratch(self, path: Path, limit: int) -> bytes:
-        return storage(self.budget.action_deadline, "scratch", paths.read_scratch_file, path, limit)
+        return paths.read_scratch_file(path, limit) or b""
 
     def config_contents(self) -> bytes:
         return self.read_scratch(self.config, MAX_OUTPUT + 1)
@@ -386,18 +316,13 @@ def seed_config(path: Path) -> None:
 
 
 def config_protection(attempt: Attempt) -> None:
-    deadline = attempt.budget.start()
     attempt.evidence["actions"].append({"fixture": "custom-config"})
-    storage(deadline, "scratch", seed_config, attempt.config)
-    code, out = attempt.call("init")
+    seed_config(attempt.config)
     expected = f"{attempt.config} exists; pass --force to overwrite\n".encode()
-    if code != 0 and (code, out) != (1, expected):
-        raise Blocked("infrastructure", "unexpected-command-exit")
+    code, _ = attempt.call("init", expected_error=expected)
     attempt.check("existing-config-preserved", attempt.config_contents() == CUSTOM_CONFIG)
     attempt.check("overwrite-refused", code == 1)
-    code, out = attempt.call("init", "--force")
-    if code != 0 and (code, out) != (1, expected):
-        raise Blocked("infrastructure", "unexpected-command-exit")
+    code, _ = attempt.call("init", "--force", expected_error=expected)
     changed = attempt.config_contents()
     attempt.check("forced-init-replaces-config", code == 0 and changed != CUSTOM_CONFIG and 0 < len(changed) <= MAX_OUTPUT)
     attempt.check_settings("forced-config-loads")
@@ -406,66 +331,40 @@ def config_protection(attempt: Attempt) -> None:
 JOURNEYS = {"first-run": first_run, "config-protection": config_protection}
 
 
-def cleanup_scratch(scratch: Path, deadline: float) -> None:
-    stop_at = deadline - REAP_SECONDS
-    try:
-        if stop_at <= time.monotonic():
-            raise Blocked("infrastructure", "scratch-cleanup-timeout")
-        proc = subprocess.Popen([sys.executable, "-I", "-S", "-B", "-c", CLEANUP_PROGRAM, str(scratch)],
-                                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        with proc.stdin:
-            try:
-                if proc.wait(timeout=max(0, stop_at - time.monotonic())) != 0:
-                    raise Blocked("infrastructure", "scratch-cleanup-failed")
-            finally:
-                if proc.returncode is None:
-                    proc.kill()
-                    proc.wait(timeout=max(0, deadline - time.monotonic()))
-    except subprocess.TimeoutExpired:
-        raise Blocked("infrastructure", "scratch-cleanup-timeout") from None
-    except OSError:
-        raise Blocked("infrastructure", "scratch-cleanup-failed") from None
+def cleanup_scratches(scratches: list[Path]) -> None:
+    for scratch in scratches:
+        try:
+            shutil.rmtree(scratch)
+        except FileNotFoundError:
+            pass
+        except Exception as error:
+            LOG.warning("%s: scratch-cleanup-failed (%s)", NAME, type(error).__name__)
 
 
-def make_scratch(scratch: Path) -> None:
-    scratch.mkdir(mode=0o700)
-
-
-def run_attempt(selected: Selection, name: str, folder: Path, budget: Budget) -> dict:
+def run_attempt(selected: Selection, name: str, folder: Path, budget: Budget, scratches: list[Path]) -> dict:
     evidence = {"actions": [], "checks": []}
     scratch = folder / (paths.SCRATCH_PREFIX + uuid.uuid4().hex[:16])
-    created = False
     try:
-        if time.monotonic() >= budget.action_deadline:
-            raise Blocked("infrastructure", "run-limit")
-        created = True
-        storage(budget.action_deadline, "scratch", make_scratch, scratch)
+        scratch.mkdir(mode=0o700)
+        scratches.append(scratch)
         attempt = Attempt(selected, scratch, budget, evidence)
-        attempt.verify_build()
+        attempt.call(*BUILD_ACTION)
         JOURNEYS[name](attempt)
         evidence["outcome"] = "pass"
     except Blocked as error:
         evidence.update(outcome=error.outcome, reason=error.reason)
     except OSError:
         evidence.update(outcome="environment", reason="scratch-io-failed")
-    finally:
-        if created:
-            try:
-                cleanup_scratch(scratch, budget.cleanup_deadline)
-            except Blocked as error:
-                evidence["cleanup"] = error.reason
-                if evidence.get("outcome") in ("pass", "assertion"):
-                    evidence.update(outcome=error.outcome, reason=error.reason)
     return evidence
 
 
-def run_journey(selected: Selection, name: str, folder: Path, budget: Budget) -> dict:
-    first = run_attempt(selected, name, folder, budget)
+def run_journey(selected: Selection, name: str, folder: Path, budget: Budget, scratches: list[Path]) -> dict:
+    first = run_attempt(selected, name, folder, budget, scratches)
     attempts = [first]
     outcome = first["outcome"]
     result = {"journey": name, "attempts": attempts, "outcome": outcome}
     if outcome == "assertion":
-        replay = run_attempt(selected, name, folder, budget)
+        replay = run_attempt(selected, name, folder, budget, scratches)
         attempts.append(replay)
         if replay["outcome"] == "assertion" and replay["reason"] == first["reason"]:
             result.update(outcome="product-failure", invariant=first["reason"])
@@ -485,7 +384,7 @@ def save_json(path: Path, data: dict) -> None:
     util.write_durably(path, json.dumps(data, indent=2).encode() + b"\n", mode=0o600)
 
 
-def coalesce(root: Path, folder: Path, row: dict) -> bytes:
+def coalesce(root: Path, folder: Path, row: dict) -> bool:
     key = hashlib.sha256(row["fingerprint"].encode()).hexdigest()
     canonical = root / "findings" / f"{key}.json"
     canonical.parent.mkdir(mode=0o700, exist_ok=True)
@@ -494,45 +393,42 @@ def coalesce(root: Path, folder: Path, row: dict) -> bytes:
     try:
         os.link(candidate, canonical)
     except FileExistsError:
-        return b""
+        return False
     finally:
         candidate.unlink()
     util.flush_folder(canonical.parent)
-    return b"1"
+    return True
 
 
-def prepare_folder(root: Path, relative: str) -> bytes:
-    root = root.resolve()
-    root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    (root / relative).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    return os.fsencode(root)
-
-
-def recovery_report(root: Path, relative: str, report: dict, deadline: float, reason: str, saved: bool) -> str:
+def recovery_report(root: Path, relative: str, report: dict, reason: str, saved: bool) -> str:
     failure = dict(report, outcome="infrastructure", reason=reason, findings=[])
     if saved:
         failure["completed_report"] = relative
     recovery = str(Path(relative).with_name("infrastructure.json"))
     try:
-        storage(deadline, "report", save_json, root / recovery, failure)
-    except (OSError, Blocked):
+        save_json(root / recovery, failure)
+    except OSError:
         return relative if saved else ""
     return recovery
 
 
-def finish(root: Path, relative: str, report: dict, budget: Budget, trial: bool) -> int:
-    saved = False
+def finish(root: Path, relative: str, report: dict, scratches: list[Path], trial: bool) -> int:
+    location = ""
+    reason = None
     phase = "report"
     try:
-        storage(budget.report_deadline, phase, save_json, root / relative, report)
-        saved = True
+        save_json(root / relative, report)
+        location = relative
         phase = "finding"
         for row in report["findings"]:
-            if trial or storage(budget.report_deadline, phase, coalesce, root, (root / relative).parent, row):
+            if trial or coalesce(root, (root / relative).parent, row):
                 print(json.dumps(row))
-    except (OSError, Blocked) as error:
-        reason = error.reason if isinstance(error, Blocked) else f"{phase}-io-failed"
-        location = recovery_report(root, relative, report, budget.deadline, reason, saved)
+    except OSError:
+        reason = f"{phase}-io-failed"
+        location = recovery_report(root, relative, report, reason, bool(location))
+    if location:
+        cleanup_scratches(scratches)
+    if reason:
         suffix = f"; local report {location}" if location else ""
         print(f"{NAME}: infrastructure; {reason}{suffix}")
         return 1
@@ -542,16 +438,18 @@ def finish(root: Path, relative: str, report: dict, budget: Budget, trial: bool)
 
 def run(config: Path, root: Path, *, trial: bool = False) -> int:
     started = time.monotonic()
-    budget = Budget()
+    budget = Budget(RUN_SECONDS)
+    scratches = []
     run_id = uuid.uuid4().hex
     relative = f"runs/{run_id}/report.json"
     report = {"run": run_id, "started": util.iso(), "journeys": [], "findings": []}
     try:
-        root = Path(os.fsdecode(storage(budget.action_deadline, "evidence", prepare_folder, root, relative)))
-        selected = selection(config, budget.action_deadline)
+        root = root.resolve()
+        (root / relative).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        selected = selection(config)
         report["build"] = selected.build
         for name in selected.journeys:
-            result = run_journey(selected, name, (root / relative).parent, budget)
+            result = run_journey(selected, name, (root / relative).parent, budget, scratches)
             report["journeys"].append(result)
             if result["outcome"] == "product-failure":
                 report["findings"].append(finding(result, relative))
@@ -563,7 +461,7 @@ def run(config: Path, root: Path, *, trial: bool = False) -> int:
     except OSError:
         report.update(outcome="infrastructure", reason="evidence-io-failed")
     report.update(actions=budget.actions, seconds=round(time.monotonic() - started, 3))
-    return finish(root, relative, report, budget, trial)
+    return finish(root, relative, report, scratches, trial)
 
 
 def builtin(loop: loops.Loop) -> bool:

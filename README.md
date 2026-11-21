@@ -2654,7 +2654,7 @@ Scheduler dispatch releases the claimed input and consults the persisted reset b
 Dry-run displays a quota hold without reserving.
 
 The disabled `release-journeys` companion runs configured CLI journeys against a release wheel
-pinned by its installed content digest. The release journey guide covers pinning, local findings
+pinned by its archive SHA-256 and metadata version. The release journey guide covers pinning, local findings
 and offline verification. [Release journey guide](arete/loops/README.md#release-journeys)
 
 ## Versioned writes

@@ -245,37 +245,42 @@ manual starts with `arete loop enable release-journeys`, then start it after eac
 
 ```toml
 python = "/absolute/path/to/release/bin/python"
+wheel = "/absolute/path/to/arete-0.1.0-py3-none-any.whl"
 build = "0.1.0 sha256.0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 journeys = ["first-run", "config-protection"]
 ```
 
-Set `build` to the output of that interpreter's `-I -B -m arete.releasebuild`. Use a non-editable
-wheel installation and keep it immutable throughout the run. The identity includes the wheel
-version and a SHA-256 digest of the installed package files and wheel metadata, checked against
-the wheel's RECORD. It is independent of the enclosing checkout and the install path. Each
-attempt, including confirmation replays, records the identity observed before its journey actions.
+Set `build` to the output of that interpreter's `-I -B -m arete.releasebuild WHEEL`. Install the
+wheel with a tool that records its archive SHA-256 in `direct_url.json`, such as pip installing
+directly from the wheel file. Keep the wheel and its installation immutable throughout the run.
+The probe checks the file's SHA-256 against the installation provenance and verifies the
+installed package and metadata against the archive. Each attempt, including confirmation
+replays, records the archive SHA-256 and the version from the wheel's `METADATA`.
 
 | Journey | Actions and invariants |
 |---|---|
 | `first-run` | Run `init`, validate the generated settings, then run `migrate` and `status --json`. Check that migration creates state and status shows zero live runs. |
 | `config-protection` | Seed `max_parallel = 2`, run `init`, then `init --force`. Check that the first call refuses and preserves the exact settings and that the forced call replaces them. Validate the replacement settings. |
 
-Each attempt starts with fresh scratch config and state. The whole run allows at most two journeys,
-16 actions including identity and fixture actions, and a shared 60-second deadline. Each command
-has at most 10 seconds and 64 KiB of captured stdout. The report keeps command arguments, exit codes,
-checked invariants and the build identity. Product output and fixture contents are discarded.
+Each attempt starts with fresh scratch config and state. A run allows at most two journeys, 16 release
+actions including identity probes, and 60 seconds of cumulative action time. Each release action
+has at most 10 seconds and 64 KiB of captured stdout. The controller kills the action process group
+at its deadline, and the group also dies if the controller exits. The report keeps command
+arguments, exit codes, checked invariants and the build identity. Product output and fixture
+contents are discarded.
 The `validate-settings` action runs the selected build's settings loader in the release interpreter
 and requires the generated file. Use a build that includes this validation contract. The
 `first-run` journey requires macOS for confined SQLite. On other hosts it records an environment
 block after the identity probe. `config-protection` can run without confined SQLite support.
 
 A successful action that leaves an expected file missing can fail an invariant. An unsafe or
-unreadable scratch file and malformed selection TOML produce environment blocks. Selection reads,
-scratch operations, teardown, and durable report and finding writes share the run deadline.
-An I/O timeout records an infrastructure outcome and retains available action and invariant
-evidence. An attempt with incomplete evidence or failed teardown cannot confirm a regression.
-A failed identity probe is a startup outcome, a build mismatch is an environment outcome, and
-unexpected action exits and command I/O errors are infrastructure outcomes.
+unreadable scratch file and malformed selection TOML produce environment blocks. Controller
+file operations run outside the action budget. Scratch removal follows the durable report
+write, and a removal failure logs a warning. An action timeout is recorded on the attempt.
+If action teardown also fails, the report keeps both causes and the first failure decides
+the attempt's outcome. A failed identity probe is a startup outcome, an unverified wheel or
+build mismatch is an environment outcome, and unexpected action exits and command I/O errors
+are infrastructure outcomes.
 
 An invariant has to fail twice on the same pinned build before it becomes a finding. Inconsistent
 replays are inconclusive. Findings are coalesced by journey and invariant across builds. Reports
@@ -287,28 +292,28 @@ without reserving their fingerprints. The shipped loop keeps findings local for 
 A completed run exits 0, including a confirmed product failure. A blocked run exits 1 unless it also
 has a confirmed finding to report. Read the per-journey outcomes when a run reports `partial`.
 
-### Independent release verification
+### Release verification recipe
 
 On a macOS verification host, use the verification step's approved sandbox and disposable config,
-state, and log directories. Use Python 3.13 and an owned scratch directory that permits installer
-renames and journey teardown. For the enclosing-checkout check, place both virtual environments
-under the same disposable candidate checkout. Use an approved location for the build and install
-scratch. Record an infrastructure block if the sandbox denies a required filesystem operation.
+state, and log directories. Use Python 3.13 and an owned scratch directory that permits wheel
+installation and journey teardown. Record an infrastructure block if the sandbox denies a
+required filesystem operation.
 
 ```sh
 git log -1 --format=%H
 release_python=$(command -v python3.13)
 journey_dir=$(mktemp -d "$PWD/.arete-release-journeys.XXXXXX")
 uv build --wheel --offline --python "$release_python" --out-dir "$journey_dir/wheels"
-shasum -a 256 "$journey_dir"/wheels/arete-*.whl
-uv venv --offline --python "$release_python" "$journey_dir/release"
-uv pip install --offline --no-index --no-deps --link-mode copy --cache-dir "$journey_dir/uv-cache" \
-  --python "$journey_dir/release/bin/python" "$journey_dir"/wheels/arete-*.whl
-"$journey_dir/release/bin/python" -I -B -m arete.releasebuild
+wheel=$(echo "$journey_dir"/wheels/arete-*.whl)
+shasum -a 256 "$wheel"
+"$release_python" -m venv "$journey_dir/release"
+"$journey_dir/release/bin/python" -m pip install --no-index --no-deps "$wheel"
+"$journey_dir/release/bin/python" -I -B -m arete.releasebuild "$wheel"
 ```
 
 Write the selection above to `$journey_dir/release-journeys.toml` using that interpreter's
-absolute path and observed build. Run the installed command with disposable config, state and logs.
+absolute path, the absolute wheel path, and the observed build. Run the installed command with
+disposable config, state and logs.
 
 ```sh
 env -i PATH=/usr/bin:/bin HOME="$journey_dir" TMPDIR="$journey_dir" \
@@ -318,27 +323,35 @@ env -i PATH=/usr/bin:/bin HOME="$journey_dir" TMPDIR="$journey_dir" \
 ```
 
 Open the reported path under `$journey_dir/state/release-journeys/` and verify that both journeys
-passed, every observed identity matches the pin, all ten actions are accounted for, and the report
-has no findings. Keep the source commit, wheel archive SHA-256, installed identity, and report
+passed, every observed identity matches the pin and `shasum` output, all nine release actions are
+accounted for, and the report has no findings. Keep the source commit, installed identity, and report
 together for each artifact.
 
 For a regression check, build a second wheel from a disposable copy of the same revision with the
 existing-file guard in `arete/commands/setup.py`'s `cmd_init` refusing even when `--force` is
 passed. Install it in a second virtual environment under the same checkout as the candidate
 environment using the same offline procedure. Record its archive digest and installed identity.
-Confirm that the two installed identities differ. Select the seeded interpreter and candidate
-pin for `config-protection`. Expect an environment block after a single identity action, the
+Confirm that the two installed identities differ. Select the seeded interpreter and wheel with
+the candidate pin for `config-protection`. Expect an environment block after a single identity action, the
 seeded identity recorded as observed, and no finding.
 
 Set the seed's identity in `$journey_dir/config/release-journeys.toml` and select only
-`config-protection`. Using the disposable environment above, run the following with the candidate
-interpreter.
+`config-protection`. Migrate the disposable state before running the loop commands. The
+`first-run` journey migrates its own scratch database.
 
 ```sh
-"$journey_dir/release/bin/python" -I -B -m arete.cli loop try release-journeys
-"$journey_dir/release/bin/python" -I -B -m arete.cli loop status release-journeys
-"$journey_dir/release/bin/python" -I -B -m arete.cli loop status merge-check
-"$journey_dir/release/bin/python" -I -B -m arete.cli merge-check --dry-run </dev/null
+disposable_arete() {
+  env -i PATH=/usr/bin:/bin HOME="$journey_dir" TMPDIR="$journey_dir" \
+    ARETE_CONFIG_DIR="$journey_dir/config" ARETE_STATE_DIR="$journey_dir/state" \
+    ARETE_LOG_DIR="$journey_dir/logs" XDG_STATE_HOME="$journey_dir/client" \
+    "$journey_dir/release/bin/python" -I -B -m arete.cli "$@"
+}
+
+disposable_arete migrate &&
+  disposable_arete loop try release-journeys &&
+  disposable_arete loop status release-journeys &&
+  disposable_arete loop status merge-check &&
+  disposable_arete merge-check --dry-run </dev/null
 ```
 
 The bundled trial should preview one finding, show the seed's identity on both fresh attempts,
