@@ -167,13 +167,7 @@ def settings_digest(data) -> str:
 def worker_settings_digest(value, serialize) -> str:
     data = serialize(value)
     if isinstance(value, config.Config):
-        for name in ("max_parallel", "max_parallel_per_repo"):
-            data.pop(name, None)
-        if "jev" in data:
-            for name in ("risk_hold", "irreversible_hold", "secrets_hold"):
-                data["jev"].pop(name, None)
-            if not data["jev"]:
-                del data["jev"]
+        config.remove_controller_only_settings(data)
     return settings_digest(data)
 
 

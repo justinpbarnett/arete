@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from . import (
     codebase,
+    config,
     delegation,
     diffguard,
     factory,
@@ -58,7 +59,7 @@ class RetargetedPR(ValueError):
         super().__init__(f"The PR base changed from `{previous}` to `{current}`. A person needs to revise it.")
 
 
-def policy_fingerprint(cfg, layer, closed_context):
+def policy_fingerprint(cfg, layer, closed_context, *, resume=False):
     effective = asdict(layer)
     effective.pop("factory_path")
     if layer.required_check is None:
@@ -67,6 +68,8 @@ def policy_fingerprint(cfg, layer, closed_context):
         effective["verify"] = layer.verify.policy()
     policy_config = asdict(cfg)
     policy_config.pop("server_url")
+    if resume:
+        config.remove_controller_only_settings(policy_config)
     return ledger.digest(json.loads(json.dumps({"layer": effective, "config": policy_config,
                                                 "closed_context": closed_context}, default=str)))
 
@@ -432,8 +435,12 @@ class Controller:
 
     def lineage(self):
         self.catalog = Catalog(self.job)
+        policy = self.policy_sha()
+        saved_policy = self.data.get("policy_sha")
+        if saved_policy is not None and self.matches_policy(saved_policy, policy):
+            policy = saved_policy
         found = {"catalog_sha": self.catalog.fingerprint, "operations_sha": ledger.digest(describe_operations()),
-                 "policy_sha": self.policy_sha(),
+                 "policy_sha": policy,
                  "controller_prompt": ledger.digest(prompt_loader.template("orchestrate").template),
                  "controller_settings": ledger.digest(asdict(self.run.settings("orchestrate"))),
                  "run_settings": ledger.digest([self.run.overrides, self.run.step_overrides])}
@@ -453,7 +460,13 @@ class Controller:
         return "\n\n".join(["## CI failures", "", current.summary(), *notes])
 
     def policy_sha(self):
-        return policy_fingerprint(self.job.cfg, self.job.layer, self.run.closed_context)
+        tid = str(getattr(self.run, "tid", ""))
+        authorized = pilot.is_pilot_task(tid) or zte.reserved(tid)
+        return policy_fingerprint(self.job.cfg, self.job.layer, self.run.closed_context, resume=not authorized)
+
+    def matches_policy(self, saved, current):
+        return saved == current or saved == policy_fingerprint(
+            self.job.cfg, self.job.layer, self.run.closed_context)
 
     def fingerprint(self):
         prints = {c.github: factory.fingerprint(c.wt) for c in self.job.checkouts}
@@ -471,7 +484,8 @@ class Controller:
         if gate == "checks" and self.data.get("denied_feedback"):
             return False
         found = self.data.get("evidence", {}).get(gate, {})
-        return bool(found and found["tree"] == self.fingerprint() and found["policy"] == self.policy_sha()
+        return bool(found and found["tree"] == self.fingerprint()
+                    and self.matches_policy(found["policy"], self.policy_sha())
                     and found.get("acceptance") == self.data["acceptance"])
 
     def recover(self):
