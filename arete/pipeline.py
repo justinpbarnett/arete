@@ -818,65 +818,39 @@ VERIFY_SCRATCH_MARKER = ".arete-owned"
 VERIFY_SCRATCH_CONTENT = b"arete-verification-scratch-v1"
 
 
-def ignored_state(wt: Path, scratch_roots: set[Path]) -> dict[str, str]:
-    return {n: workspace.fingerprint(wt / n, "") for n in workspace.ignored_file_paths(wt)
-            if scratch_roots.isdisjoint(Path(n).parents)
-            and not (Path(n).parent.name == "__pycache__" and Path(n).suffix == ".pyc")}
+def resolver_ignored_paths(wt: Path, scratch_roots: set[Path]) -> tuple[set[str], set[str]]:
+    ignored = {n for n in workspace.ignored_file_paths(wt)
+               if not (Path(n).parent.name == "__pycache__" and Path(n).suffix == ".pyc")}
+    scratch = {n for n in ignored if not scratch_roots.isdisjoint(Path(n).parents)}
+    return ignored - scratch, scratch
 
 
-def initialize_verification_scratch(wt_fd: int) -> None:
-    try:
-        os.mkdir(VERIFY_SCRATCH_ROOT, 0o700, dir_fd=wt_fd)
-    except FileExistsError:
-        return
-    with local_paths.directory_fd(VERIFY_SCRATCH_ROOT, wt_fd) as folder:
-        for name, content in ((".gitignore", b"*\n"), (VERIFY_SCRATCH_MARKER, VERIFY_SCRATCH_CONTENT + b"\n")):
-            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=folder)
-            with os.fdopen(fd, "wb") as file:
-                file.write(content)
-
-
-def has_verification_marker(wt_fd: int, root: Path) -> bool:
+def verification_marker(wt_fd: int, root: Path) -> tuple[int, int, int] | None:
     try:
         with ExitStack() as opened:
             folder = opened.enter_context(local_paths.directory_fd(root, wt_fd))
             fd = os.open(VERIFY_SCRATCH_MARKER, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=folder)
             opened.callback(os.close, fd)
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
-                return False
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                return None
             with os.fdopen(fd, "rb", closefd=False) as file:
-                return file.read().removesuffix(b"\n") == VERIFY_SCRATCH_CONTENT
+                if file.read(len(VERIFY_SCRATCH_CONTENT) + 2).removesuffix(b"\n") == VERIFY_SCRATCH_CONTENT:
+                    return info.st_dev, info.st_ino, info.st_ctime_ns
     except OSError:
-        return False
+        return None
+    return None
 
 
-def verification_scratch_roots(wt: Path) -> set[Path]:
-    with local_paths.directory_fd(wt.resolve()) as wt_fd:
-        initialize_verification_scratch(wt_fd)
+def verification_scratch_markers(wt: Path, candidates: set[Path] | None = None) -> dict[Path, tuple[int, int, int]]:
+    if candidates is None:
         markers = ["--exclude-standard", "--", f":(glob)**/{VERIFY_SCRATCH_MARKER}"]
         visible = util.git_records(["ls-files", "--cached", "--others", *markers], wt)
         ignored = util.git_records(["ls-files", "--ignored", "--others", *markers], wt)
         candidates = {Path(n).parent for n in visible + ignored} - {Path(".")}
         candidates.add(VERIFY_SCRATCH_ROOT)
-        return {root for root in candidates if has_verification_marker(wt_fd, root)}
-
-
-def stages_verification_scratch(name: str, roots: set[Path]) -> bool:
-    path = Path(name)
-    return not roots.isdisjoint(path.parents) or any(root.is_relative_to(path) for root in roots)
-
-
-def restore_verification_scratch(wt: Path, roots: set[Path], tracked_edits: set[str]) -> None:
-    if not roots:
-        return
-    added = {name for name in util.git_records(["diff", "--cached", "--no-renames", "--name-only", "--diff-filter=A"], wt)
-             if not roots.isdisjoint(Path(name).parents)}
-    edited = {name for name in tracked_edits - added if not roots.isdisjoint(Path(name).parents)}
-    literal = {"GIT_LITERAL_PATHSPECS": "1"}
-    if added:
-        git(["restore", "--source=HEAD", "--staged", "--worktree", "--", *sorted(added)], wt, env=literal)
-    if edited:
-        git(["restore", "--worktree", "--", *sorted(edited)], wt, env=literal)
+    with local_paths.directory_fd(wt.resolve()) as wt_fd:
+        return {root: marker for root in candidates if (marker := verification_marker(wt_fd, root)) is not None}
 
 
 def untracked_by_dir(dirs: list[Path]) -> dict[Path, set[str]]:
@@ -2987,28 +2961,34 @@ def resolve_conflicts(run: AgentRun, c: workspace.Checkout, conflicts: list[str]
                       ticket: tracker.Ticket, incoming: tuple[str, str] | None = None) -> None:
     deny = diffguard.denied_paths(layer)
     named, commit = incoming or (c.origin_base, c.base_commit)
-    scratch_roots = verification_scratch_roots(c.wt)
-    if protected := [p for p in conflicts if stages_verification_scratch(p, scratch_roots) or util.matches_any(p, deny)
-                     or util.matches_any(c.prefix + p, deny)]:
+
+    def denied(path: str) -> bool:
+        return util.matches_any(path, deny) or util.matches_any(c.prefix + path, deny)
+
+    if protected := [p for p in conflicts if denied(p)]:
         raise workspace.RunFailed(f"merging `{named}` conflicts in protected paths in {c.github} "
                         f"({', '.join(protected)}), which a person must merge")
+    conflict_paths = set(conflicts)
     own = {p for p in util.git_records(["diff", "--name-only", f"{commit}...HEAD"], c.wt)
-           if p not in conflicts and not (util.matches_any(p, deny) or util.matches_any(c.prefix + p, deny))}
+           if p not in conflict_paths and not denied(p)}
     incoming_paths = {p for p in util.git_records(["diff", "--name-only", f"HEAD...{commit}"], c.wt)
-                      if p not in conflicts and not (util.matches_any(p, deny) or util.matches_any(c.prefix + p, deny))}
+                      if p not in conflict_paths and not denied(p)}
     supplemental = own | incoming_paths
-    stageable = {p for p in supplemental if not stages_verification_scratch(p, scratch_roots)}
+    scratch_markers = verification_scratch_markers(c.wt)
+    literal_paths = {"GIT_LITERAL_PATHSPECS": "1"}
     tries = max(1, run.settings("build").tries)
     feedback = "this is the first attempt"
     for n in range(1, tries + 1):
+        scratch_roots = set(scratch_markers)
         untracked_before = workspace.untracked_files(c.wt)
-        ignored_before = ignored_state(c.wt, scratch_roots)
+        ignored_before, scratch_before = resolver_ignored_paths(c.wt, scratch_roots)
+        ignored_fingerprints = {n: workspace.fingerprint(c.wt / n, "") for n in ignored_before}
         previous = run.sessions.get("build")
         text = prompt_loader.prompt("resolve", repo=run.repo.name, github=c.github, base=named,
                       base_commit=commit[:12], head=git(["rev-parse", "HEAD"], c.wt).strip()[:12],
                       ref=ticket.ref, title=ticket.title, body=ticket.body,
                       conflicts="\n".join(f"- `{p}`" for p in conflicts),
-                      own="\n".join(f"- `{p}`" for p in sorted(own & stageable)) or "- none",
+                      own="\n".join(f"- `{p}`" for p in sorted(own)) or "- none",
                       branch_log=git(["log", "--oneline", "-n30", "MERGE_HEAD..HEAD"], c.wt),
                       base_log=git(["log", "--oneline", "-n30", "HEAD..MERGE_HEAD"], c.wt),
                       commands=prompt_loader.code_list(layer.builder_bash), attempt=n, tries=tries, feedback=feedback,
@@ -3032,12 +3012,17 @@ def resolve_conflicts(run: AgentRun, c: workspace.Checkout, conflicts: list[str]
         for name in workspace.untracked_files(c.wt) - untracked_before:
             if Path(name).parent.name == "__pycache__" and Path(name).suffix == ".pyc":
                 workspace.remove_untracked(c.wt, name)
-        ignored_after = ignored_state(c.wt, scratch_roots)
-        changed_ignored = {n for n in ignored_before.keys() | ignored_after.keys()
-                           if ignored_before.get(n) != ignored_after.get(n)}
+        ignored_after, scratch_after = resolver_ignored_paths(c.wt, scratch_roots)
+        scratch_markers = {root: marker for root, marker in verification_scratch_markers(c.wt, scratch_roots).items()
+                           if marker == scratch_markers[root]}
+        changed_ignored = ignored_before ^ ignored_after
+        changed_ignored.update(n for n in ignored_before & ignored_after
+                               if ignored_fingerprints[n] != workspace.fingerprint(c.wt / n, ""))
+        unverified_ignored = {n for n in scratch_before | scratch_after
+                              if scratch_markers.keys().isdisjoint(Path(n).parents)}
         tracked_edits = set(util.git_records(["diff", "--name-only"], c.wt))
         touched = tracked_edits | (workspace.untracked_files(c.wt) - untracked_before) | changed_ignored
-        if outside := sorted(touched - set(conflicts) - supplemental):
+        if outside := sorted((touched | unverified_ignored) - conflict_paths - supplemental):
             raise workspace.RunFailed(f"the resolver edited files outside the conflict in {c.github}: {', '.join(outside)}")
         if left := marked(c.wt, conflicts):
             feedback = f"conflict markers remain in {', '.join(left)}; remove every one"
@@ -3045,10 +3030,11 @@ def resolve_conflicts(run: AgentRun, c: workspace.Checkout, conflicts: list[str]
                 raise workspace.RunFailed(f"conflict markers remain in {', '.join(left)} after {util.count(n, 'attempt')} "
                                 f"in {c.github}")
             continue
-        git(["add", "-A", "--", *conflicts, *sorted(touched & stageable)], c.wt, env={"GIT_LITERAL_PATHSPECS": "1"})
+        git(["add", "-u", "--", *conflicts, *sorted(tracked_edits & supplemental)], c.wt, env=literal_paths)
+        if additions := (touched & supplemental) - tracked_edits:
+            git(["add", "-A", "--", *sorted(additions)], c.wt, env=literal_paths)
         if unmerged_paths(c.wt):
             raise workspace.RunFailed(f"files are still unmerged in {c.github} after the resolver ran")
-        restore_verification_scratch(c.wt, scratch_roots, tracked_edits)
         with util.repo_lock(c.src):
             util.git_as_owner(["commit", "-q", "--no-edit"], c.wt)
         return
