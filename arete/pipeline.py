@@ -3044,10 +3044,11 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
     from . import pilot, readme_verify, zte
 
     run, configured = b.run, b.layer.verify
-    tid = str(run.tid)
-    zte_verify = zte.reserved(tid) and prompt_name == role == "verify"
-    readme_task = (pilot.is_pilot_task(tid) and prompt_name == role == "verify") or zte_verify
-    feature_map = configured.feature_map if prompt_name == role == "verify" and not readme_task else {}
+    delivery_verification = prompt_name == role == "verify"
+    tid = str(run.tid) if delivery_verification else ""
+    zte_verify = delivery_verification and zte.reserved(tid)
+    readme_task = (delivery_verification and pilot.is_pilot_task(tid)) or zte_verify
+    feature_map = configured.feature_map if delivery_verification and not readme_task else {}
     requested = journeys.requested(feature_map, b.ticket.title, b.ticket.body)
     step = b.next_step(step_name)
     if unknown := [name for name in requested if name not in feature_map]:
@@ -3058,7 +3059,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
     drivers = {name: journey.driver for name, journey in selected.items() if journey.driver}
     v = verify.with_free_ports(replace(configured, drivers={name: configured.drivers[name] for name in drivers.values()}))
     merge_candidate = b.layer.trust_level == "automerge" or readme_task
-    checked_trees = verification_trees(b) if prompt_name == role == "verify" and merge_candidate else {}
+    checked_trees = verification_trees(b) if delivery_verification and merge_candidate else {}
     if refusal := verify.port_refusal(v):
         run.log(f"{step}: {refusal}")
         return verify.Verified("blocked", "Verification cannot use a port the live dashboard serves.",
@@ -3157,8 +3158,9 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
         if fault := verify.environment_fault(str(e)):
             return verify.Verified("blocked", "The app could not start in the verifier's sandbox.",
                                    blocked_by=f"the app could not start in the verifier's sandbox ({fault}); "
-                                              "the start log stays in the run folder", finished=False)
-        return verify.Verified("fail", f"The app did not start: {e}")
+                                              "the start log stays in the run folder", finished=False,
+                                   behavior_reached=False)
+        return verify.Verified("fail", f"The app did not start: {e}", behavior_reached=False)
     finally:
         try:
             if require_released and not lifetime["stopped"]:

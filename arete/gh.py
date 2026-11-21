@@ -11,6 +11,7 @@ import urllib.error
 import urllib.request
 import uuid
 from collections.abc import Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import timedelta
 from urllib.parse import urlencode
@@ -19,8 +20,10 @@ from . import config, outbound, paths, util
 
 ARETE_MARK = "<!-- arete -->"
 GITHUB_API = "https://api.github.com"
+GITHUB_ACTIONS_APP_ID = 15368
 CLONE_TOKEN_PERMISSIONS = {"contents": "read"}
 NO_ISSUE = "Could not resolve to an issue"
+_deployment_ci_deadline: ContextVar[float | None] = ContextVar("deployment_ci_deadline", default=None)
 
 
 class GhError(RuntimeError):
@@ -81,8 +84,13 @@ def gh(args: list[str], cwd=None, timeout: float = 120, input: str | None = None
     return res.stdout
 
 
-def gh_json(args: list[str], cwd=None, timeout: float = 120):
-    out = gh(args, cwd=cwd, timeout=timeout)
+def gh_json(args: list[str], cwd=None, timeout: float = 120, *, retry: bool = True):
+    if (deadline := _deployment_ci_deadline.get()) is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise GhError("deployment CI lookup timed out")
+        timeout, retry = min(timeout, remaining), False
+    out = gh(args, cwd=cwd, timeout=timeout, retry=retry)
     return json.loads(out) if out.strip() else None
 
 
@@ -359,6 +367,12 @@ def prs(repo: str, label: str = "", state: str = "open", limit: int = 50) -> lis
     return gh_json(args) or []
 
 
+def open_labeled_pr_urls(repo: str, label: str) -> list[str]:
+    query = urlencode({"state": "open", "labels": label, "per_page": 100})
+    pages = gh_json(["api", f"repos/{repo}/issues?{query}", "--paginate", "--slurp"]) or []
+    return [row["html_url"] for page in pages for row in page if "pull_request" in row]
+
+
 def open_pr_url(repo: str, head: str) -> str:
     rows = gh_json(["pr", "list", "--repo", repo, "--head", head, "--state", "open", "--limit", "1", "--json", "url"])
     return rows[0]["url"] if rows else ""
@@ -386,6 +400,22 @@ def pr_comment(url: str, body: str, *, key: str = "", single_attempt: bool = Fal
     keyed_comment(["pr", "comment", url, "--body-file", "-"], body,
                   f"repos/{pr_repo(url)}/issues/{pr_number(url)}/comments", mark=True,
                   key=key, single_attempt=single_attempt)
+
+
+def find_own_pr_comment(repo: str, number: int, *markers: str) -> dict | None:
+    author = me()
+    if not author:
+        return None
+    own = [(row, (row.get("body") or "").splitlines())
+           for row in api_list(f"repos/{repo}/issues/{number}/comments")
+           if (row.get("user") or {}).get("login") == author]
+    return next((row for marker in markers for row, lines in own if marker in lines), None)
+
+
+def pr_edit_comment(repo: str, comment_id: int, body: str) -> None:
+    payload = Outgoing(json.dumps({"body": outgoing(body, mark=True)}))
+    gh(["api", "-X", "PATCH", f"repos/{repo}/issues/comments/{comment_id}", "--input", "-"],
+       input=payload, write=True)
 
 
 def pr_reply(url: str, comment_id: int, body: str) -> None:
@@ -503,6 +533,35 @@ def pr_set_draft(url: str, draft: bool) -> None:
     gh(["pr", "ready", url, *(["--undo"] if draft else [])])
 
 
+def pr_close(url: str) -> None:
+    gh(["pr", "close", url], write=True)
+
+
+def pr_add_label(url: str, name: str) -> None:
+    gh(["pr", "edit", url, "--add-label", name], write=True)
+
+
+def pr_update_branch(repo: str, number: int, head: str) -> None:
+    gh(["api", "-X", "PUT", f"repos/{repo}/pulls/{number}/update-branch", "--input", "-"],
+       input=Outgoing(json.dumps({"expected_head_sha": head})), write=True)
+
+
+def pr_squash(repo: str, number: int, head: str) -> None:
+    gh(["pr", "merge", str(number), "--repo", repo, "--squash", "--match-head-commit", head], write=True)
+
+
+def actions_check_passed(repo: str, head: str, name: str) -> bool:
+    query = urlencode({"check_name": name, "filter": "latest", "per_page": 100})
+    path = f"repos/{repo}/commits/{head}/check-runs?{query}"
+    reply = json.loads(gh(["api", path], retry=False) or "{}")
+    rows = reply.get("check_runs", [])
+    if reply.get("total_count", len(rows)) > len(rows):
+        return False
+    runs = [row for row in rows if row.get("name") == name
+            and row.get("head_sha") == head and (row.get("app") or {}).get("id") == GITHUB_ACTIONS_APP_ID]
+    return bool(runs) and all(row.get("status") == "completed" and row.get("conclusion") == "success" for row in runs)
+
+
 def pr_draft_and_head(url: str) -> tuple[bool, str]:
     row = gh_json(["pr", "view", url, "--json", "isDraft,headRefOid"]) or {}
     return bool(row.get("isDraft")), str(row.get("headRefOid") or "")
@@ -532,6 +591,29 @@ def merge_ci_passed(repo: str, head: str, *, required: dict | None = None) -> bo
             contexts.setdefault(row["context"], row["state"])
     return (bool(runs or contexts) and all(row["status"] == "completed" and row["conclusion"] == "success"
                                            for row in runs) and all(state == "success" for state in contexts.values()))
+
+
+def deployment_ci_refusal(repo: str, head: str, required: dict, *, timeout: float) -> str:
+    token = _deployment_ci_deadline.set(time.monotonic() + timeout)
+    try:
+        return "" if merge_ci_passed(repo, head, required=required) else _required_ci_refusal(repo, head, required)
+    except (GhError, OSError, ValueError, KeyError, TypeError, AttributeError):
+        return "CI unavailable"
+    finally:
+        _deployment_ci_deadline.reset(token)
+
+
+def _required_ci_refusal(repo: str, head: str, required: dict) -> str:
+    query = urlencode({"filter": "latest", "per_page": 100, "check_name": required["context"]})
+    pages = gh_json(["api", f"repos/{repo}/commits/{head}/check-runs?{query}", "--paginate", "--slurp"])
+    runs = [row for page in pages for row in page["check_runs"]
+            if row.get("head_sha") == head and row.get("name") == required["context"]
+            and (row.get("app") or {}).get("id") == required["app_id"]]
+    if any(row["status"] == "completed" and row["conclusion"] != "success" for row in runs):
+        return "CI failed"
+    if not runs or any(row["status"] != "completed" for row in runs):
+        return "CI pending"
+    return "CI not passing"
 
 
 def merge_readiness(repo: str, number: int, head: str, base: str, base_sha: str, *, wait: float = 0,
@@ -572,11 +654,12 @@ def pr_merge_auto(repo: str, number: int, head: str, base: str, base_sha: str) -
     return "" if result.get("merged") is True else "GitHub did not confirm the merge"
 
 
-def default_branch(repo: str) -> str:
+def default_branch(repo: str, *, fallback: str = "main", timeout: float = 120, retry: bool = True) -> str:
     try:
-        return (gh_json(["repo", "view", repo, "--json", "defaultBranchRef"]) or {})["defaultBranchRef"]["name"]
+        row = gh_json(["repo", "view", repo, "--json", "defaultBranchRef"], timeout=timeout, retry=retry) or {}
+        return row["defaultBranchRef"]["name"] or fallback
     except (GhError, KeyError, TypeError):
-        return "main"
+        return fallback
 
 
 def base64url(data: bytes) -> str:
