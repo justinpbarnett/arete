@@ -74,7 +74,13 @@ def next_ticket(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
                 other_routes: set[str] = frozenset(), excluded: set[str] = frozenset(),
                 recovered: tuple[tracker.Ticket, ...] = ()) -> tracker.Ticket | None:
     for source in ticket_queues(repo, tk):
-        listed = source.todo(parked=lambda tid: bool(runlimits.latest_park(repo.name, tid)[1]))
+        def retry_failed(tid: str) -> bool:
+            if runlimits.latest_park(repo.name, tid)[1]:
+                return True
+            return (not isinstance(source, tracker.GitHubTracker)
+                    and requeue.policy_retry(run_store.newest_live_whole_run(repo.name, tid)))
+
+        listed = source.todo(parked=retry_failed)
         known = {str(t.id) for t in listed}
         extra = [t for t in recovered if str(t.id) not in known] if source is tk else []
         open_tickets = source.open_agent_tickets if isinstance(source, tracker.GitHubTracker) else ()
