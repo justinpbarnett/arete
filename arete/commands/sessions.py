@@ -27,41 +27,28 @@ def chosen_chat(args) -> int | None:
     return args.chat if args.chat is not None else args.chat_before
 
 
-def session_errors(handler):
-    @functools.wraps(handler)
-    def guarded(args) -> int:
-
-        return handler(args)
-
-    return guarded
-
-
 def chat_routed(handler):
-    guarded = session_errors(handler)
-
     @functools.wraps(handler)
     def routed(args) -> int:
         if (chat := chosen_chat(args)) is not None:
             return chat_session(args, chat)
-        return guarded(args)
+        return handler(args)
 
     return routed
 
 
 def local_only(handler):
-    guarded = session_errors(handler)
-
     @functools.wraps(handler)
     def routed(args) -> int:
         if chosen_chat(args) is not None:
             print(f"--chat works with arete session {', '.join(CHAT_SESSION_ACTIONS)}", file=sys.stderr)
             return 2
-        return guarded(args)
+        return handler(args)
 
     return routed
 
 
-def attached(session_id: str, *, remote=True) -> int:
+def attached(session_id: str, *, remote=True, summary="") -> int:
     import select
     import threading
 
@@ -75,7 +62,11 @@ def attached(session_id: str, *, remote=True) -> int:
 
         steer = sessions.send
     stop = threading.Event()
-    print("following; type a line and press enter to send it, ctrl-c to detach", flush=True)
+
+    def started() -> None:
+        if summary:
+            print(summary)
+        print("following; type a line and press enter to send it, ctrl-c to detach", flush=True)
 
     def send_typed() -> None:
         if stop.is_set() or not sys.stdin.isatty() and sys.stdin.closed:
@@ -88,7 +79,7 @@ def attached(session_id: str, *, remote=True) -> int:
             elif line.strip():
                 steer(session_id, line)
     try:
-        follow(session_id, send=send_typed, remote=remote)
+        follow(session_id, send=send_typed, remote=remote, on_start=started)
     except KeyboardInterrupt:
         print(f"\ndetached; the session keeps running. `arete session stop {session_id}` ends it")
     return 0
@@ -108,15 +99,15 @@ def session_start(args) -> int:
         s = client.call("POST", "/api/sessions", {"prompt": prompt, "device": args.device, "model": args.model,
                                                 "runner": args.runner, "tools": tools, "repo": args.repo or "",
                                                 "budget_usd": args.budget})
-    print(f"session {s['id']}: {s['runner']} {s['model']} on {s['device']} in {paths.short_path(s['cwd'])}"
-          + (f" on {s['branch']}" if s["branch"] else "") + f"; tools {', '.join(s['tools']) or 'none'}")
-    if s["task"] and not args.attach:
-        print(f"`arete session report {s['id']}` prints its report when it ends")
-        return 0
+    identity, task = s["id"], s["task"]
+    summary = (f"session {identity}: {s['runner']} {s['model']} on {s['device']} in {paths.short_path(s['cwd'])}"
+               + (f" on {s['branch']}" if s["branch"] else "") + f"; tools {', '.join(s['tools']) or 'none'}")
     if not args.attach:
-        print(f"`arete session attach {s['id']}` follows it and sends what you type")
+        print(summary)
+        print(f"`arete session report {identity}` prints its report when it ends" if task
+              else f"`arete session attach {identity}` follows it and sends what you type")
         return 0
-    return attached(s["id"], remote=not (args.task or args.draft_pr))
+    return attached(identity, remote=not (args.task or args.draft_pr), summary=summary)
 
 
 @local_only
@@ -140,7 +131,7 @@ def session_send(args) -> int:
 
 @chat_routed
 def session_stop(args) -> int:
-    return client.run_command(args.id, "stop", legacy=f"/api/sessions/{quote(args.id, safe='')}/stop")
+    return client.run_command(args.id, "stop")
 
 
 @local_only
@@ -155,7 +146,7 @@ def session_exec(args) -> int:
 def session_list(args) -> int:
     from .. import sessions, util
 
-    rows = sessions.views(connect=foundation.reader) if paths.DB_FILE.exists() else []
+    rows = sessions.views(connect=foundation.reader)
     for s in rows:
         print(f"{s['id']:<28} {s['status']:<11} {s['runner'] or '':<6} {s['model'] or '':<24} "
               f"{s['device'] or '':<10} {util.paid_note(s['paid']):<12}  {s['prompt'][:70]}")
@@ -222,6 +213,8 @@ def register(sub) -> None:
         a.add_argument("id", metavar="ID", help="the session id")
         chat_option(a)
         a.set_defaults(fn=handler)
+        if name == "report":
+            a.set_defaults(local_read=lambda args: chosen_chat(args) is None)
 
     a = ssub.add_parser("send", help="send text to a session")
     a.add_argument("id", metavar="ID", help="the session id")
@@ -231,4 +224,4 @@ def register(sub) -> None:
 
     a = ssub.add_parser("list", help="every session")
     chat_option(a)
-    a.set_defaults(fn=session_list)
+    a.set_defaults(fn=session_list, local_read=lambda args: chosen_chat(args) is None)

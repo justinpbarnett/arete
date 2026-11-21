@@ -3,18 +3,17 @@ from __future__ import annotations
 import json
 import sys
 from collections import Counter
-from datetime import timedelta
-from urllib.parse import urlencode
 
-from .. import client, config, paths, util
+from .. import client, config, paths
 from ..store import db as foundation
 from ..store import incidents as incident_store
 from .common import when
 
 
 def cmd_events(args) -> int:
-    query = urlencode({"since": util.iso(util.now() - timedelta(hours=args.hours))})
-    evs = client.field(client.call("GET", f"/api/v1/hook-events?{query}"), "events")
+    from .. import tool_events
+
+    evs = tool_events.read_events(args.hours)
     if args.raw:
         for e in evs[max(len(evs) - args.limit, 0):]:
             print(json.dumps(e))
@@ -70,8 +69,7 @@ def oncall_incident_action(args) -> int:
 def oncall_show(args) -> int:
     from .. import oncall
 
-    found = (incident_store.incident(int(args.id), connect=foundation.reader)
-             if args.id.isdigit() and paths.DB_FILE.exists() else None)
+    found = incident_store.incident(int(args.id), connect=foundation.reader) if args.id.isdigit() else None
     if not found:
         print(f"no incident {args.id}", file=sys.stderr)
         return 1
@@ -98,7 +96,7 @@ def oncall_show(args) -> int:
 def oncall_list(args) -> int:
     from .. import oncall
 
-    rows = incident_store.incidents(connect=foundation.reader) if paths.DB_FILE.exists() else []
+    rows = incident_store.incidents(connect=foundation.reader)
     if args.json:
         for row in rows:
             print(json.dumps(row))
@@ -110,8 +108,7 @@ def oncall_list(args) -> int:
         if line := oncall.repair_line(r):
             print(f"      repair: {line}")
     cfg = config.load()
-    now = (oncall.status(cfg, connect=foundation.reader) if paths.DB_FILE.exists()
-           else {"enabled": cfg.oncall.enabled, "last_scan": "", "expected": 0, "wakes": "on"})
+    now = oncall.status(cfg, connect=foundation.reader)
     if not now["enabled"]:
         print(f"on-call is off; `[oncall] enabled = true` in {paths.CONFIG_FILE} turns it on")
     else:
@@ -228,7 +225,7 @@ def register(sub) -> None:
     p = sub.add_parser("mcp-ask", help="stdio MCP server that gives arete's agents the ask_owner tool; with --check, "
                                        "validates one call read from stdin")
     p.add_argument("--check", action="store_true")
-    p.set_defaults(fn=cmd_mcp_ask)
+    p.set_defaults(fn=cmd_mcp_ask, local_read=lambda args: args.check)
 
     p = sub.add_parser("background", help="Stop hook for arete's claude agents: an agent that answers while commands it "
                                           "started in the background still run is told to stop them and answer again "
@@ -253,7 +250,7 @@ def register(sub) -> None:
                                                 "(default: out next to the spec)")
     p.add_argument("--days", type=float, default=7, help="how far back to read (default 7)")
     p.add_argument("--json", action="store_true", help="print JSON")
-    p.set_defaults(fn=cmd_jev)
+    p.set_defaults(fn=cmd_jev, local_read=lambda args: args.action == "report")
 
     p = sub.add_parser("heartbeat", help="loop 0: check jobs, probes, auth, hook, disk")
     p.add_argument("--dry-run", action="store_true", help="print actions instead of opening or closing alerts")
@@ -265,10 +262,10 @@ def register(sub) -> None:
     p.add_argument("--hours", type=float, default=24)
     p.add_argument("--raw", action="store_true")
     p.add_argument("--limit", type=int, default=50)
-    p.set_defaults(fn=cmd_events)
+    p.set_defaults(fn=cmd_events, local_read=True)
 
     p = sub.add_parser("oncall", help="the on-call watcher: incidents found in logs, run files and the heartbeat")
     p.add_argument("action", nargs="?", default="list", choices=("list", "show", "scan", "cancel", "dismiss", "retry", "off", "on"))
     p.add_argument("id", nargs="?", default="", help="with show, cancel, dismiss or retry: the incident number")
     p.add_argument("--json", action="store_true", help="one JSON line per incident")
-    p.set_defaults(fn=cmd_oncall)
+    p.set_defaults(fn=cmd_oncall, local_read=lambda args: args.action in ("list", "show"))

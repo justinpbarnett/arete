@@ -19,13 +19,13 @@ def task_shown(task_id: str, repo: str, one_line: bool, offline=False) -> int:
             print(json.dumps(found, ensure_ascii=False, default=str, indent=2), flush=True)
 
     if offline:
-        from .. import control, paths, tasks, tracker
+        from .. import control, tasks, tracker
 
         try:
-            if not tracker.is_task_id(task_id.strip()) or not paths.DB_FILE.exists():
+            if not tracker.is_task_id(task_id.strip()):
                 raise control.NotFound(f"no local task {task_id}")
-            show({**tasks.view(task_id, repo), "source": "local"})
-        except (control.NotFound, foundation.NoDatabase) as e:
+            client.emit({**tasks.view(task_id, repo), "source": "local"})
+        except control.NotFound as e:
             client.emit({"error": str(e), "source": "local"})
             return 1
     else:
@@ -47,8 +47,9 @@ def task_add(args) -> int:
 
 def task_list(args) -> int:
     rows = client.field(client.call("GET", "/api/v1/tasks"), "tasks")
-    print_lines(json.dumps(row, ensure_ascii=False) for row in rows
-                if (not args.repo or row["repo"] == args.repo) and (not args.state or row["state"] == args.state))
+    lines = [json.dumps(row, ensure_ascii=False) for row in rows
+             if (not args.repo or row["repo"] == args.repo) and (not args.state or row["state"] == args.state)]
+    print_lines(lines)
     return 0
 
 
@@ -116,10 +117,10 @@ def approval_notes(a: dict) -> list[str]:
 
 
 def cmd_approve(args) -> int:
-    from .. import delivery, paths
+    from .. import delivery
 
     if args.id is None:
-        pending = delivery.waiting(connect=foundation.reader) if paths.DB_FILE.exists() else []
+        pending = delivery.waiting(connect=foundation.reader)
         for a in pending:
             print(textwrap.fill(f"#{a['id']:<4} {a['loop']:<20} {a['repo'] or 'none':<12} {when(a['created'])}  "
                                 f"{a['plain_summary'] or a['what']}", shutil.get_terminal_size().columns,
@@ -138,7 +139,7 @@ def register(sub) -> None:
                                        "approving a failed one tries the delivery again")
     p.add_argument("id", type=int, nargs="?", default=None)
     p.add_argument("--reject", action="store_true")
-    p.set_defaults(fn=cmd_approve)
+    p.set_defaults(fn=cmd_approve, local_read=lambda args: args.id is None)
 
     p = sub.add_parser("task", help="local tasks, which have no tracker issue: add, list, show, reply to and close them; "
                                     "start one from a prompt or a ticket through the server")
@@ -158,7 +159,7 @@ def register(sub) -> None:
     t.add_argument("--repo", default="", help="the repo of a tracker item no run names yet")
     t.add_argument("--json", action="store_true", help="print it as one JSON line")
     t.add_argument("--offline", action="store_true", help="read a task from the local store")
-    t.set_defaults(fn=task_show)
+    t.set_defaults(fn=task_show, local_read=lambda args: args.offline)
     t = tsub.add_parser("reply", help="answer a task's question as its owner")
     t.add_argument("id")
     t.add_argument("text", nargs="+")

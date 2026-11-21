@@ -892,6 +892,19 @@ def dashboard_https(value: object) -> bool:
     return value
 
 
+def read_data(path: Path | None = None) -> dict:
+    return tomllib.loads(paths.read_confined(path or paths.CONFIG_FILE).decode())
+
+
+def discovery_port(data: dict | None = None) -> int:
+    try:
+        data = read_data() if data is None else data
+        dashboard = data.get("dashboard", {})
+        return int(dashboard.get("port", paths.DASHBOARD_PORT))
+    except (OSError, ValueError, TypeError, AttributeError, OverflowError):
+        return paths.DASHBOARD_PORT
+
+
 def load_or_problem(path: Path | None = None) -> tuple[Config, str]:
     try:
         return load(path), ""
@@ -899,13 +912,12 @@ def load_or_problem(path: Path | None = None) -> tuple[Config, str]:
         problem = f"{type(e).__name__}: {e}"
     fallback = Config()
     try:
-        data = tomllib.loads(paths.read_confined(path or paths.CONFIG_FILE).decode())
+        data = read_data(path)
         dashboard = data.get("dashboard", {})
         dashboard = dashboard if isinstance(dashboard, dict) else {}
     except Exception:
         return fallback, problem
-    with contextlib.suppress(Exception):
-        fallback.dashboard_port = int(dashboard.get("port", paths.DASHBOARD_PORT))
+    fallback.dashboard_port = discovery_port(data)
     with contextlib.suppress(Exception):
         fallback.dashboard_https = dashboard_https(dashboard.get("https", False))
     if isinstance(dashboard.get("owner", ""), str):
@@ -926,7 +938,7 @@ def load(path: Path | None = None, strict: bool = False) -> Config:
     path = path or paths.CONFIG_FILE
     ignored: list[str] | None = None if strict else []
     try:
-        data = tomllib.loads(paths.read_confined(path).decode())
+        data = read_data(path)
     except FileNotFoundError:
         return Config()
     cfg = Config(

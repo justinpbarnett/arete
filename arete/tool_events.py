@@ -1,17 +1,13 @@
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import json
 import os
 import re
-import socket
 import sys
 from datetime import UTC, datetime
 
-from . import api_http, paths, refusals, util
-
-INGEST_MARK = "_arete_ingest"
+from . import paths
 
 BASH_CLASSES = [
     ("missing_tool", r"command not found"),
@@ -119,8 +115,9 @@ def main() -> int:
         payload = json.loads(raw) if raw.strip() else {}
         ev = build_event(payload)
         if ev:
-            with util.lock("hook-events", wait=True):
-                append_events([ev])
+            paths.STATE_DIR.mkdir(parents=True, exist_ok=True)
+            with open(paths.EVENTS_FILE, "a") as f:
+                f.write(json.dumps(ev, ensure_ascii=False) + "\n")
     except Exception as e:
         with contextlib.suppress(OSError):
             paths.LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -129,154 +126,10 @@ def main() -> int:
     return 0
 
 
-def append_events(events):
-    finish_ingest()
-    with paths.EVENTS_FILE.open("a+b") as out:
-        out.seek(0, os.SEEK_END)
-        if out.tell():
-            out.seek(-1, os.SEEK_END)
-            if out.read(1) != b"\n":
-                out.write(b"\n")
-        for event in events:
-            out.write(json.dumps(event, ensure_ascii=False).encode() + b"\n")
-
-
-def ingest_checkpoint():
-    path = paths.EVENTS_FILE.with_name("hook-ingest.json")
-    checkpoint = util.read_json(path, None)
-    if checkpoint is None:
-        if path.exists():
-            raise OSError(f"cannot read hook ingest checkpoint {path}")
-        checkpoint = {"offsets": {}}
-    return path, checkpoint
-
-
-def finish_ingest():
-    path, checkpoint = ingest_checkpoint()
-    if not (pending := checkpoint.get("pending")):
-        return path, checkpoint
-    data = pending["data"].encode()
-    with paths.EVENTS_FILE.open("a+b") as out:
-        out.seek(0, os.SEEK_END)
-        start = pending["start"]
-        if not start <= out.tell() <= start + len(data):
-            raise OSError("hook event file changed during an unfinished upload")
-        out.seek(start)
-        written = out.read()
-        if not data.startswith(written):
-            raise OSError("hook event file changed during an unfinished upload")
-        out.write(data[len(written):])
-        out.flush()
-        util.flush_fd(out.fileno())
-        util.flush_folder(paths.EVENTS_FILE.parent)
-    checkpoint["offsets"][pending["origin"]] = [pending["offset"], pending["sha"]]
-    del checkpoint["pending"]
-    util.write_json(path, checkpoint)
-    return path, checkpoint
-
-
-def ingest(origin, offset, events):
-    if not re.fullmatch(r"[0-9a-f]{32}", origin) or offset < 0:
-        raise refusals.Invalid("Hook ingest needs a source identifier and a nonnegative offset")
-    with util.lock("hook-events", wait=True):
-        checkpoint_path, checkpoint = finish_ingest()
-        data = "".join(json.dumps(event) + "\n" for event in events)
-        sha = hashlib.sha256(data.encode()).hexdigest()
-        received, prior = checkpoint["offsets"].get(origin, (-1, ""))
-        if offset == received and sha != prior:
-            raise refusals.Conflict("Hook events at this source offset have changed")
-        if offset <= received or not data:
-            return len(events)
-        for path in event_files():
-            with path.open("rb") as source:
-                if event_origin(source, os.fstat(source.fileno())) == origin:
-                    return len(events)
-        start = 0
-        try:
-            with paths.EVENTS_FILE.open("rb") as out:
-                start = out.seek(0, os.SEEK_END)
-                if start:
-                    out.seek(-1, os.SEEK_END)
-                    if out.read(1) != b"\n":
-                        data = "\n" + data
-        except FileNotFoundError:
-            pass
-        checkpoint["pending"] = {"origin": origin, "offset": offset, "sha": sha, "start": start, "data": data}
-        util.write_json(checkpoint_path, checkpoint)
-        finish_ingest()
-    return len(events)
-
-
-def event_origin(stream, info):
-    first = stream.readline()
-    if not first.endswith(b"\n"):
-        return ""
-    location = f"{socket.gethostname()}:{paths.STATE_DIR}:{info.st_dev}:{info.st_ino}:".encode()
-    return hashlib.sha256(location + first).hexdigest()[:32]
-
-
-def send_pending(url, send):
-    if not paths.EVENTS_FILE.exists() and not dated_events():
-        return
-    checkpoint = paths.STATE_DIR / ("hook-offsets-" + hashlib.sha256(url.encode()).hexdigest()[:32] + ".json")
-    with util.lock(checkpoint.stem, wait=True):
-        offsets = util.read_json(checkpoint, {})
-        for path in event_files():
-            try:
-                stream = path.open("rb")
-            except FileNotFoundError:
-                continue
-            with stream:
-                info = os.fstat(stream.fileno())
-                if not (origin := event_origin(stream, info)):
-                    continue
-                offset, pending = offsets.get(origin, (0, None))
-                stream.seek(offset)
-                while offset < info.st_size:
-                    body = {"origin": origin, "offset": offset, "events": []}
-                    end = read_batch(stream, body, info.st_size, pending)
-                    if end == offset:
-                        break
-                    if body["events"]:
-                        offsets[origin] = (offset, end)
-                        util.write_json(checkpoint, offsets)
-                        send(body, f"hook:{origin}:{offset}")
-                    offset, pending = end, None
-                    offsets[origin] = (offset, pending)
-        util.write_json(checkpoint, offsets)
-
-
-def read_batch(stream, body, size, pending):
-    end = stream.tell()
-    used = len(api_http.json_bytes(body))
-    events = body["events"]
-    while end < (size if pending is None else pending):
-        raw = stream.readline()
-        if not raw.endswith(b"\n") or stream.tell() > size:
-            break
-        try:
-            item = json.loads(raw)
-        except (ValueError, UnicodeError):
-            item = None
-        if isinstance(item, dict) and INGEST_MARK not in item:
-            added = len(api_http.json_bytes(item)) + (2 if events else 0)
-            if pending is None and used + added > api_http.MAX_JSON_BYTES:
-                if not events:
-                    raise refusals.Invalid(f"A hook event at offset {end} exceeds the server's JSON body limit")
-                break
-            events.append(item)
-            used += added
-        end = stream.tell()
-    if pending is not None and end != pending:
-        raise refusals.Invalid("The pending hook batch is no longer in the local event file")
-    stream.seek(end)
-    return end
-
-
 def dated_events():
-    return sorted((p for p in paths.EVENTS_FILE.parent.glob("events-*.jsonl")
-                   if re.fullmatch(r"events-\d{4}(0[1-9]|1[0-2])(-\d{4,})?\.jsonl", p.name)
-                   and not p.is_symlink() and p.is_file()), key=lambda p: p.stem)
+    return sorted(p for p in paths.EVENTS_FILE.parent.glob("events-*.jsonl")
+                  if re.fullmatch(r"events-\d{4}(0[1-9]|1[0-2])\.jsonl", p.name)
+                  and not p.is_symlink() and p.is_file())
 
 
 def event_files():
@@ -297,12 +150,6 @@ def event_stats():
 
 
 def rotate_events(keep_days: float) -> None:
-    with util.lock("hook-events", wait=True):
-        rotate_locked(keep_days)
-
-
-def rotate_locked(keep_days: float) -> None:
-    finish_ingest()
     try:
         with paths.EVENTS_FILE.open() as f:
             first = f.readline()
@@ -314,10 +161,8 @@ def rotate_locked(keep_days: float) -> None:
         month = ""
     if month and month < datetime.now(UTC).strftime("%Y%m"):
         target = paths.EVENTS_FILE.with_name(f"events-{month}.jsonl")
-        number = 0
-        while target.exists() or target.is_symlink():
-            number += 1
-            target = target.with_name(f"events-{month}-{number:04d}.jsonl")
+        if target.exists() or target.is_symlink():
+            raise FileExistsError(f"event archive already exists: {target}")
         os.replace(paths.EVENTS_FILE, target)
     cutoff = datetime.now(UTC).timestamp() - keep_days * 86400
     for path in dated_events():
@@ -351,11 +196,11 @@ def read_events(since_hours: float | None = None, since_ts: float | None = None,
 
 def read_event_file(path, cutoff, until=None) -> list[dict]:
     out = []
-    with path.open("rb") as f:
+    with path.open() as f:
         for line in f:
             try:
                 ev = json.loads(line)
-            except (json.JSONDecodeError, UnicodeError):
+            except json.JSONDecodeError:
                 continue
             if not isinstance(ev, dict):
                 continue
@@ -366,6 +211,5 @@ def read_event_file(path, cutoff, until=None) -> list[dict]:
                     continue
                 if (cutoff is not None and t < cutoff) or (until is not None and t >= until):
                     continue
-            ev.pop(INGEST_MARK, None)
             out.append(ev)
     return out

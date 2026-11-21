@@ -728,7 +728,7 @@ Run folders, including logs, evidence and continuation files, go after `lines_da
 `arete record pin RUN_ID` keeps a record; `arete record unpin RUN_ID` lets it age out like any other.
 `arete status` shows a `records:` line with the size of the store, its oldest record and the number of pins.
 Protected records and bytes outside `record/` can keep `runs/` over budget; the serve log reports this. `lines_days` must be at least `days`; both allow positive fractions.
-Hook events rotate monthly from `events.jsonl` into `events-YYYYMM.jsonl`, named for the first event's UTC month. If a delayed upload causes another rotation for the same month, the new archive gets a numbered suffix. Readers include these archives, and dated files last written more than `lines_days` ago are removed.
+Hook events rotate monthly from `events.jsonl` into `events-YYYYMM.jsonl`, named for the first event's UTC month. Readers include these archives; dated files last written more than `lines_days` ago are removed.
 
 ## Backups
 
@@ -2588,7 +2588,7 @@ curl -H 'X-Arete: 1' --data-binary @shot.png 'http://HOST:PORT/api/capture/evide
 
 ### From the CLI
 
-Each of these commands makes one call to the server and prints JSON and nothing else. All but `task show` print one JSON object per line; `task show` prints the task as indented JSON, and as one line with `--json`:
+These commands contact serve and print JSON. All but `task show` print one JSON object per line. `task show` prints indented JSON by default and one line with `--json`.
 
 | command | route |
 |---|---|
@@ -2605,14 +2605,14 @@ Each of these commands makes one call to the server and prints JSON and nothing 
 | `arete resume RUN_ID [--step STEP]` | `POST /api/runs/RUN_ID/resume` |
 | `arete repair RUN_ID` | `POST /api/runs/RUN_ID/repair` |
 | `arete step RUN_ID STEP [key=value ...]` | `POST /api/runs/RUN_ID/steps/STEP` |
-| `arete stop RUN_ID` | `POST /api/runs/RUN_ID/stop` |
+| `arete stop RUN_ID` | `POST /api/v1/runs/RUN_ID/stop` |
 | `arete status --json [RUN_ID]` | `GET /api/live` for one line per live run; with a run id, `GET /api/runs/RUN_ID/events` for one line per step with `"event": "step"` (`state` is the step's result, or `running`), then the report |
 
-The CLI looks for `ARETE_SERVER` first, then `url` in the `[server]` section of `config.toml`. Set either to `https://NAME:PORT` or `http://HOST:PORT`. With neither set, the CLI reads `server.json` in its state folder and checks that the named process is live and uses the same state folder and config file. HTTPS verifies the server certificate, and HTTP follows the dashboard's HTTPS upgrade. On first connection the CLI saves the server's instance ID for that URL under the config directory. Each invocation checks the instance before sending a write. A changed ID fails the command.
+The CLI looks for `ARETE_SERVER` first, then `url` in the `[server]` section of `config.toml`. Set either to `https://NAME:PORT` or `http://HOST:PORT`. With neither set, the CLI reads `server.json` in its state folder and checks that the named process is live and uses the same state folder and config file. HTTPS verifies the server certificate, and HTTP follows the dashboard's HTTPS upgrade. On first connection the CLI saves the server's instance ID for that URL under the config directory. Each invocation checks the instance and sends the verified ID in `X-Arete-Instance` on every write attempt. Serve rejects a mismatched ID before acting on the write or looking up its idempotency key.
 
-Failed server commands print one JSON error line and exit 1. An unreachable server reports `reason: "server_down"` and names the URL. `task show`, `lines` and `status` accept `--offline` to read the local store in read-only mode and label the output with `source: local`. Without that flag these commands require serve. When a stream drops, `wait`, `lines --follow` and `arete run` reconnect from the last line they read. They report an error when the run ended without a report or when two minutes pass without a line. During code reload the CLI retries a 503 with `Retry-After` and any ensuing refused connections for up to 30 seconds, keeping the write's idempotency key. If the deadline expires the command reports the 503.
+Failed server commands print one JSON error line and exit 1. An unreachable server reports `reason: "server_down"` and names the URL. Server-backed commands require serve. To read the local store, use `task show --offline`, `lines --offline` or `status --offline`. Each JSON line from those reads includes `"source": "local"`. When a stream drops, `wait`, `lines --follow` and `arete run` reconnect from the last line they read. They report an error when the run ended without a report or when two minutes pass without a line. During code reload the CLI retries a 503 with `Retry-After` and any ensuing refused connections for up to 30 seconds, keeping the write's idempotency key. If the deadline expires the command reports the 503.
 
-`arete hook` appends to the local event log. The next CLI command that contacts a remote serve uploads pending hook events. `arete events` reads the server's log.
+`arete hook` appends to the local event log. `arete events` reads that log from the local state folder.
 
 `arete run REPO TICKET` sends `POST /api/tasks` with `"force"` set by `--force`, prints the answer, then follows the run to its report. It exits 0 for a successful report or a queued ticket. Ctrl-c detaches and leaves the run going. Arete marks the classic run and rule-filing workers it launches with `--local`. For a development invocation, set `ARETE_DEVELOPMENT=1` with `--local`. `run --dry-run` still runs locally and records the run.
 
@@ -2660,7 +2660,7 @@ Dry-run displays a quota hold without reserving.
 Keyed task starts hash the canonical request and replay the exact committed response for the same principal and key.
 A live duplicate is rejected while its request is in flight; keys are separate for each principal.
 Idempotency records expire strictly after 30 days through serve pruning.
-The CLI uses a fresh idempotency key prefix per invocation and appends `:1`, `:2` and so on to its writes. Set `ARETE_IDEMPOTENCY_KEY` to reuse the prefix when retrying an invocation. Retries from the same CLI config directory reuse any run version, loop run or open ask the CLI selected for the first attempt. Task starts print the key on stderr and accept an exact key via `--key`.
+The CLI generates one idempotency key per invocation. Set `ARETE_IDEMPOTENCY_KEY` to reuse it when retrying the same invocation. The first write uses the key verbatim, and subsequent writes append `:2`, `:3` and so on. `loop stop NAME` looks up the current run and adds its ID to the key. If a suffix makes the key longer than 128 characters, the CLI sends its SHA-256 hex digest. Task starts print the key on stderr and accept an exact key via `--key`.
 Task starts share a 30-second deadline across connection, headers, response bodies and waits, with at most two resends after an uncertain result and the same key throughout.
 
 Successful run writes retain their legacy response bodies and identify the committed event in `Arete-Seq`.

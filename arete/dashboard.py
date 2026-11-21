@@ -320,6 +320,8 @@ class Handler(BaseHTTPRequestHandler):
             parts = urlsplit(self.path)
             path = parts.path
             self.admit(method, path)
+            if method in ("POST", "PATCH", "DELETE"):
+                self.check_write_instance()
             if canonical_path(path) and not self.operation and method not in (allowed := canonical_methods(path)) and allowed:
                 self.allowed_methods = allowed
                 raise contract.Problem("method_not_allowed", "The route does not accept this method.")
@@ -363,6 +365,17 @@ class Handler(BaseHTTPRequestHandler):
             retry = (RESTART_RETRY_SECONDS if getattr(e, "code", None) == "draining" else
                      1 if isinstance(e, idempotency.InFlight) else getattr(e, "retry_after", 0))
             self.send_json(refusal_status(e) or 500, refusal_answer(e), retry_after=retry)
+
+    def check_write_instance(self):
+        expected = self.headers.get_all("X-Arete-Instance", [])
+        if not expected:
+            return
+        if len(expected) != 1:
+            raise contract.Problem("invalid_framing", "Send at most one X-Arete-Instance.")
+        with foundation.reader() as conn:
+            instance = foundation.metadata(conn).get("instance_id")
+        if expected[0] != instance:
+            raise contract.Problem("conflict", "The server instance changed before this write.")
 
     def validate_transport(self, method, path):
         if self.api_path and (self.restarting or
@@ -450,7 +463,7 @@ class Handler(BaseHTTPRequestHandler):
             self.write_receipt = claims.receipt(row["last_seq"])
             return json.loads(row["response"])
 
-    def keyed_action(self, method, route, parameters, action, *, atomic=False, recoverable=False):
+    def keyed_action(self, method, route, parameters, action, *, atomic=False):
         key = self.headers.get("Idempotency-Key")
         if key is None:
             return action()
@@ -462,20 +475,19 @@ class Handler(BaseHTTPRequestHandler):
             elif row:
                 raise idempotency.Unconfirmed("The earlier request did not record a result. Check its effect before trying again.")
             else:
-                row = self.complete_action(context, action, atomic, recoverable)
+                row = self.complete_action(context, action, atomic)
             self.write_receipt = claims.receipt(row["last_seq"])
             return json.loads(row["response"])
 
-    def complete_action(self, context, action, atomic, recoverable):
-        guard = not (atomic or recoverable)
-        if guard:
+    def complete_action(self, context, action, atomic):
+        if not atomic:
             claims.claim(context, None)
         with (foundation.tx() if atomic else nullcontext()), event_store.collect_receipts() as collected:
             try:
                 result = action()
             except Exception as e:
                 status = refusal_status(e)
-                if guard and (isinstance(e, NoRoute) or status is not None and 400 <= status < 500):
+                if not atomic and (isinstance(e, NoRoute) or status is not None and 400 <= status < 500):
                     claims.abandon(context)
                 raise
             receipt = self.write_receipt or event_store.committed_receipt()
@@ -521,8 +533,6 @@ class Handler(BaseHTTPRequestHandler):
                     return route(self, rest, query)
                 except NoRoute:
                     break
-        if canonical_path(path):
-            raise contract.Problem("unknown_route", "No such route")
         raise Refusal(404, "No such route.")
 
     def loop_action(self, name: str, action: str):

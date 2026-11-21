@@ -6,6 +6,7 @@ import sys
 from . import __version__, client, codebase, config, paths, pilot, principals, zte
 from .commands import api, costs, hooks, lab, loops, records, research, runs, sessions, setup, tasks
 from .commands.common import Parser, serve_line
+from .store import db as foundation
 
 __all__ = ["main", "parser", "serve_line"]
 
@@ -42,6 +43,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd not in PER_CALL_HOOKS:
         codebase.load()
     try:
+        local_read = getattr(args, "local_read", False)
+        if (local_read(args) if callable(local_read) else local_read) and not paths.DB_FILE.is_file():
+            raise foundation.NoDatabase
         recovery = args.cmd in ("init", "migrate") or (args.cmd == "backup" and args.restore)
         with client.invocation(), principals.acting("hand" if recovery else principals.cli_actor):
             return args.fn(args) or 0
@@ -50,6 +54,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except client.Failed as e:
         return client.failed(e)
+    except foundation.NoDatabase as e:
+        message = str(e) or f"no arete.db at {paths.DB_FILE}; run arete serve or arete migrate"
+        client.emit({"error": message, **({"source": "local"} if getattr(args, "offline", False) else {})})
+        return 1
     except (config.UnknownRepo, refusals.Refusal) as e:
         print(e, file=sys.stderr)
         return 1

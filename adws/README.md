@@ -19,7 +19,7 @@ Run the recipes from this checkout, so `uv run arete` runs this checkout's code.
 ## Versioned API
 
 For direct integrations use `/api/v1/meta` to check the server's API version and contract hash, and `/api/v1/contract` to discover operations.
-The recipes keep their JSON output when the CLI uses a versioned route. The CLI tries the older route with the same key when serve reports `unknown_route` and an equivalent route exists.
+The recipes keep their JSON output when the CLI uses a versioned route. Run the CLI and serve from the same release.
 If a keyed task start loses its reply, resend the same key with the same arguments; a different body with that key is refused.
 Before changing the registry or how an operation behaves, follow the [API verification and compatibility workflow](../README.md#checking-api-changes).
 
@@ -80,7 +80,7 @@ If a child finishes during registration or task-start recovery finds an ended ru
 `starting` is accepted and exits 0; look up the task to find its run once registration finishes.
 `why` explains the result.
 
-The CLI creates an idempotency key prefix for each invocation and appends `:1`, `:2` and so on for its writes. The recipes inherit `ARETE_IDEMPOTENCY_KEY`, which sets that prefix. `arete task start`, `arete task run` and server-backed `arete run` also accept a complete key via `--key` and print `Idempotency-Key: KEY` on stderr once. Complete keys contain 8–128 ASCII letters, digits or `_ . : / -`.
+The CLI generates one idempotency key per invocation. The recipes inherit `ARETE_IDEMPOTENCY_KEY`, which sets that key. The first write uses it verbatim and subsequent writes append `:2`, `:3` and so on. `arete task start`, `arete task run` and server-backed `arete run` also accept an exact key via `--key` and print `Idempotency-Key: KEY` on stderr once. Keys contain 8–128 ASCII letters, digits or `_ . : / -`.
 
 Task starts automatically retry broken connections, including truncated response bodies, at most twice within one 30-second budget. They keep the same key and body through retries and HTTPS redirects. After an uncertain result, resend the identical command with its printed `--key` (or the same environment key). The server returns the original response bytes, status and receipt with `Idempotent-Replayed: true`, even after restarting. Keys belong to the admitted principal, so another login for the same person shares the answer.
 

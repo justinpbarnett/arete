@@ -130,7 +130,7 @@ def register(sub) -> None:
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true", help="check the newest snapshot and compare its row counts with the live file")
     mode.add_argument("--restore", metavar="FILE", help="replace arete.db with a snapshot; refused while serve or a run is live")
-    p.set_defaults(fn=cmd_backup)
+    p.set_defaults(fn=cmd_backup, local_read=lambda args: args.check)
 
     p = sub.add_parser("record", help="a run's timeline and record files, or one agent call's record as normalized "
                                       "events; `pin RUN_ID` and `unpin RUN_ID` keep a record from rotating out")
@@ -138,7 +138,7 @@ def register(sub) -> None:
     p.add_argument("step", nargs="?", default="", help="a record file name, with or without .jsonl.gz")
     p.add_argument("--raw", action="store_true", help="print the recorded lines as they were written")
     p.add_argument("-f", "--follow", action="store_true", help="follow a STEP until its Arete result or the run ends")
-    p.set_defaults(fn=cmd_record)
+    p.set_defaults(fn=cmd_record, local_read=lambda args: args.run_id not in ("pin", "unpin"))
 
     p = sub.add_parser("document", help="write a short message, ticket, PR text or doc edit from a JSON brief of "
                                         "verified facts; prints one JSON line")
@@ -151,7 +151,7 @@ def register(sub) -> None:
     p = sub.add_parser("secrets", help="list the names of the secrets stored for a repo (REPO), or remove one "
                                        "(rm REPO NAME); it never prints a value")
     p.add_argument("words", nargs="+", metavar="[rm] REPO [NAME]")
-    p.set_defaults(fn=cmd_secrets)
+    p.set_defaults(fn=cmd_secrets, local_read=lambda args: len(args.words) == 1)
 
     p = sub.add_parser("rotate-authority", help="re-sign every scratch record and the browser pin under a new "
                                                 "verification signing secret, then swap it in; refuses while a run, "

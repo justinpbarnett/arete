@@ -4,7 +4,6 @@ import fcntl
 import getpass
 import hashlib
 import http.client
-import ipaddress
 import json
 import os
 import secrets
@@ -68,19 +67,26 @@ class Server:
     port: int
     name: str
     instance: str = ""
-    local: bool = False
 
 
 class Invocation:
     def __init__(self):
         self.retry_prefix = os.environ.get("ARETE_IDEMPOTENCY_KEY")
-        self.prefix = self.retry_prefix or secrets.token_hex(16)
+        self.prefix = self.retry_prefix if self.retry_prefix is not None else secrets.token_hex(16)
         self.writes = 0
         self.server = None
 
-    def key(self):
+    def key(self, *, exact=None, scope=""):
         self.writes += 1
-        return f"{self.prefix}:{self.writes}"
+        if exact is not None:
+            return exact
+        parts = [self.prefix]
+        if self.writes > 1:
+            parts.append(str(self.writes))
+        if scope:
+            parts.append(scope)
+        key = ":".join(parts)
+        return hashlib.sha256(key.encode()).hexdigest() if len(parts) > 1 and len(key) > 128 else key
 
 
 _invocation = ContextVar("client_invocation", default=None)
@@ -95,8 +101,8 @@ def invocation():
         _invocation.reset(token)
 
 
-def write_key():
-    return (_invocation.get() or Invocation()).key()
+def write_key(*, exact=None, scope=""):
+    return (_invocation.get() or Invocation()).key(exact=exact, scope=scope)
 
 
 def resolved_write(key, inputs, resolve):
@@ -128,26 +134,43 @@ def named_server(wanted: str, setting=ENV) -> Server:
         parts = urlsplit(wanted if setting != ENV or "://" in wanted else f"http://{wanted}")
         host, port = parts.hostname, parts.port
         if (parts.scheme not in ("http", "https") or not host or parts.username is not None
-                or parts.path not in ("", "/") or parts.query or parts.fragment or port == 0):
+                or parts.path not in ("", "/") or parts.query or parts.fragment or port == 0
+                or setting != ENV and port is None):
             raise ValueError
     except ValueError:
         raise Failed({"error": f"{setting} must be http://HOST:PORT or https://HOST:PORT"}) from None
-    return Server(parts.scheme, host, port or config.load_or_problem()[0].dashboard_port, host)
+    return Server(parts.scheme, host, port or config.discovery_port(), host)
 
 
 def discover() -> Server:
     if wanted := os.environ.get(ENV, "").strip():
         return named_server(wanted)
-    cfg = config.load()
-    if cfg.server_url:
-        return named_server(cfg.server_url, "[server] url")
+    try:
+        data = config.read_data()
+    except FileNotFoundError:
+        data = {}
+    except (OSError, ValueError) as e:
+        raise Failed({"error": f"cannot read server config at {paths.CONFIG_FILE}: {e}"}) from e
+    try:
+        wanted = config.server_url(data)
+    except TypeError as e:
+        raise Failed({"error": f"cannot read server config at {paths.CONFIG_FILE}: {e}"}) from e
+    if wanted:
+        return named_server(wanted, "[server] url")
     found, mine = util.read_json(paths.SERVER_FILE, None), paths.state_and_config()
-    if not isinstance(found, dict) or not (found.get("addresses") and found.get("port")):
-        raise Down(f"http://127.0.0.1:{cfg.dashboard_port}", f"no server address in {paths.SERVER_FILE}")
-    addresses = [str(a) for a in found["addresses"]]
-    host, port = next((a for a in addresses if ":" not in a), addresses[0]), int(found["port"])
-    where = Server(found.get("scheme") or "http", host, port, found.get("host") or host, local=True)
-    if not util.pid_alive(found.get("pid")):
+    default = f"http://127.0.0.1:{config.discovery_port(data)}"
+    addresses = found.get("addresses") if isinstance(found, dict) else None
+    if not isinstance(addresses, list) or not addresses or not all(isinstance(a, str) and a for a in addresses):
+        raise Down(default, f"no server address in {paths.SERVER_FILE}")
+    try:
+        port, pid = int(found["port"]), int(found.get("pid") or 0)
+        if not 0 < port <= 65535 or pid < 0:
+            raise ValueError
+    except (KeyError, ValueError, TypeError, OverflowError):
+        raise Down(default, f"invalid port or pid in {paths.SERVER_FILE}") from None
+    host = next((a for a in addresses if ":" not in a), addresses[0])
+    where = Server(found.get("scheme") or "http", host, port, found.get("host") or host)
+    if not util.pid_alive(pid):
         raise Down(address(where), "the server process has ended")
     if {k: found.get(k) for k in mine} != mine:
         raise Down(address(where), "server.json names a different state or config")
@@ -201,33 +224,7 @@ def server(deadline=None) -> Server:
     where = replace(resp.arete_server, instance=instance)
     if current is not None:
         current.server = where
-        if remote(where):
-            from . import tool_events
-
-            try:
-                tool_events.send_pending(address(where), lambda body, key: send_hook_batch(body, key, deadline))
-            except Failed as e:
-                if e.code != 404 or not unknown_route(e.answer):
-                    raise
     return where
-
-
-def send_hook_batch(body, key, deadline):
-    answer = call("POST", "/api/v1/hook-events", body, key, deadline=deadline)
-    received = field(answer, "received")
-    if type(received) is not int or received != len(body["events"]):
-        raise Failed({"error": "the server did not acknowledge the full hook event batch"})
-
-
-def remote(where):
-    if where.local:
-        return False
-    try:
-        if ipaddress.ip_address(where.host).is_loopback:
-            return False
-    except ValueError:
-        pass
-    return where.host not in {"localhost", socket.gethostname().lower(), socket.getfqdn().lower()}
 
 
 def headers_for(where: Server) -> dict[str, str]:
@@ -328,7 +325,7 @@ def acquired_connection(where, deadline):
 def request(method: str, path: str, body: dict | None = None,
             read_seconds: float | None = CALL_SECONDS, key: str | None = None,
             *, where: Server | None = None, buffered: bool = False,
-            deadline: float | None = None, legacy: str = "", legacy_body: dict | None = None) -> http.client.HTTPResponse:
+            deadline: float | None = None) -> http.client.HTTPResponse:
     where = where or server(deadline)
     restart = None
     while True:
@@ -354,13 +351,6 @@ def request(method: str, path: str, body: dict | None = None,
             if restart is None:
                 raise
             pause = RETRY_SECONDS
-        except Failed as e:
-            if not legacy or e.code != 404 or not unknown_route(e.answer):
-                raise
-            path, legacy = legacy, ""
-            if legacy_body is not None:
-                body = legacy_body
-            continue
         left = deadline - time.monotonic()
         if left <= 0:
             raise Failed(restart.answer, 503)
@@ -393,6 +383,7 @@ def request_once(method: str, path: str, body: dict | None = None,
                         headers["Idempotency-Key"] = key
                     if payload is not None:
                         headers["Content-Type"] = "application/json"
+                        headers["X-Arete-Instance"] = where.instance
                     if deadline is not None:
                         budget_left(deadline)
                     conn.request(method, path, payload, headers)
@@ -401,7 +392,6 @@ def request_once(method: str, path: str, body: dict | None = None,
                     resp = conn.getresponse()
                     resp.arete_transport = transport
                     resp.arete_server = where
-                    resp.arete_path = path
                 if not followed and (moved := util.https_upgrade(resp, where.port)):
                     read_response(resp, deadline)
                     where, followed = replace(where, scheme="https", name=moved.hostname), True
@@ -517,14 +507,12 @@ def read_response(resp, deadline):
 
 
 def call(method: str, path: str, body: dict | None = None, key: str | None = None,
-         *, legacy: str = "", legacy_body: dict | None = None, deadline: float | None = None) -> dict:
+         *, deadline: float | None = None) -> dict:
     if method != "GET" and key is None:
         key = write_key()
     if key is not None and method == "POST" and path == "/api/tasks":
         return keyed_call(body, key, deadline=deadline)
-    response = request(method, path, body, key=key, buffered=True, deadline=deadline,
-                       legacy=legacy, legacy_body=legacy_body)
-    return decoded(response, method, getattr(response, "arete_path", path))
+    return decoded(request(method, path, body, key=key, buffered=True, deadline=deadline), method, path)
 
 
 def decoded(resp, method, path):
@@ -596,7 +584,7 @@ def keyed_call(body, key, *, deadline=None):
 
 def start_task(body, key=None):
     deadline = time.monotonic() + RESTART_WAIT_SECONDS
-    chosen = key if key is not None else write_key()
+    chosen = write_key(exact=key)
     print(f"Idempotency-Key: {chosen}", file=sys.stderr, flush=True)
     return keyed_call(body, chosen, deadline=deadline)
 
@@ -624,22 +612,16 @@ def run_path(run_id: str, action: str, *, prefix="/api") -> str:
     return f"{prefix}/runs/{quote(run_id, safe='')}/{action}"
 
 
-def run_command(run_id: str, action: str, body: dict | None = None, *, legacy: str = "", resolve=None) -> int:
+def run_command(run_id: str, action: str, body: dict | None = None, *, key_scope: str = "") -> int:
     def selected():
-        def target():
-            identity = resolve() if resolve else run_id
-            return identity, field(run_info(identity), "version", "run.version")
-
-        key = write_key()
-        identity, version = resolved_write(key, [run_id, action, body, legacy, bool(resolve)], target)
+        key = write_key(scope=key_scope)
+        version = resolved_write(key, [run_id, action, body], lambda: field(run_info(run_id), "version", "run.version"))
         data = {**(body or {}), "base_version": version}
-        path = run_path(identity, action)
         if action == "stop":
-            answer = call("POST", run_path(identity, "stop", prefix="/api/v1"), data, key,
-                          legacy=legacy or path, legacy_body={} if legacy else None)
+            answer = call("POST", run_path(run_id, "stop", prefix="/api/v1"), data, key)
             emit({k: v for k, v in answer.items() if k != "seq"})
         else:
-            emit(call("POST", path, data, key))
+            emit(call("POST", run_path(run_id, action), data, key))
         return 0
 
     return steered(selected)
@@ -650,8 +632,7 @@ def run_info(run_id):
 
 
 def steer(run_id, text):
-    answer = call("POST", run_path(run_id, "steer", prefix="/api/v1"), {"text": text},
-                  legacy=f"/api/sessions/{quote(run_id, safe='')}/send")
+    answer = call("POST", run_path(run_id, "steer", prefix="/api/v1"), {"text": text})
     return {k: v for k, v in answer.items() if k != "seq"}
 
 
@@ -661,7 +642,7 @@ def events(run_id: str, start: int = 0, follow: bool = False) -> Iterator[dict]:
 
 def run_status(run_id: str) -> str:
     try:
-        return str((call("GET", f"/api/runs/{quote(run_id, safe='')}").get("run") or {}).get("status") or "")
+        return field(run_info(run_id), "status", "run.status")
     except (Down, Broken):
         return ""
 
@@ -712,16 +693,14 @@ def reason(answer):
     return answer.get("reason") or answer.get("code")
 
 
-def unknown_route(answer):
-    code = reason(answer)
-    return code == "unknown_route" or (code == "not_found" and answer.get("detail") == "No such route.")
-
-
-def field(answer, name, label=None):
+def field(answer, name, label=None, *, kind=None):
     try:
-        return answer[name]
-    except (KeyError, TypeError) as e:
-        raise Failed({"error": f"server answer is missing or has an invalid field {label or name}"}) from e
+        value = answer[name]
+        if kind is None or type(value) is kind:
+            return value
+    except (KeyError, TypeError):
+        pass
+    raise Failed({"error": f"server answer is missing or has an invalid field {label or name}"})
 
 
 def answer_error(e):

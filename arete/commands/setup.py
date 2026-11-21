@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import sys
+from contextlib import redirect_stdout
+from io import StringIO
 
 from .. import __version__, client, config, paths, routing, steps
 from ..store import db as foundation
@@ -95,18 +97,28 @@ def cmd_status(args) -> int:
         return 2
     cfg, problem = config.load_or_problem()
     if args.offline:
-        try:
-            with foundation.one_read():
-                views = control.loop_views(cfg, connect=foundation.reader)
-                snap = board.snapshot(recent_runs=args.limit)
-                records = board.panel(record.store)
-        except foundation.NoDatabase as e:
-            client.emit({"error": str(e), "source": "local"})
-            return 1
+        with foundation.one_read():
+            views = control.loop_views(cfg, connect=foundation.reader)
+            snap = board.snapshot(recent_runs=args.limit)
+            records = board.panel(record.store)
+        server_url = ""
     else:
         answer = client.call("GET", f"/api/v1/status?limit={args.limit}")
         views, snap, records = (client.field(answer, key) for key in ("loops", "snapshot", "records"))
-    print(f"arete {__version__}  local config {paths.CONFIG_FILE}" + ("  source: local" if args.offline else ""))
+        server_url = client.address(client.server())
+    rendered = StringIO()
+    with redirect_stdout(rendered):
+        print_status(cfg, problem, views, snap, records, server_url)
+    if args.offline:
+        for line in rendered.getvalue().splitlines():
+            client.emit({"message": line, "source": "local"})
+    else:
+        print(rendered.getvalue(), end="")
+    return 0
+
+
+def print_status(cfg, problem, views, snap, records, server_url):
+    print(f"arete {__version__}  local config {paths.CONFIG_FILE}")
     if problem:
         print(f"config does not load: {problem}")
     if cfg.ignored:
@@ -118,8 +130,8 @@ def cmd_status(args) -> int:
     pipeline_repos = [f"{r.name} ({r.tracker})" for r in cfg.repos if r.pipeline]
     print(f"pipeline repos: {', '.join(pipeline_repos) or 'none'}")
     print_delivery(cfg)
-    if not args.offline:
-        print(f"serve at {client.address(client.server())}")
+    if server_url:
+        print(f"serve at {server_url}")
     show(snap["checks"], "the heartbeat", print_checks)
     show(snap["serve"], "the serve beat", lambda beat: print(serve_line(beat)))
     marks = {m["name"]: m for m in snap["checks"].get("rows", {}).get("loops", [])}
@@ -129,12 +141,11 @@ def cmd_status(args) -> int:
     show(snap["alerts"], "the alerts", print_alerts)
     show(snap["recent"], "the recent runs", print_recent)
     show(snap["proposals"], "the miner proposals", print_proposals)
-    show(records, "the record store", lambda s: print_records(s, cfg.retention if args.offline else None))
+    show(records, "the record store", lambda s: print_records(s, None if server_url else cfg.retention))
     show(snap["skipped"], "the skipped tickets", print_skipped)
     show(snap["waiting"], "the review feedback", print_waiting)
     show(snap["triage"], "triage", print_triage)
     show(snap["live"], "the live runs", print_live)
-    return 0
 
 
 def print_delivery(cfg: config.Config) -> None:
@@ -170,8 +181,7 @@ def status_lines(run_id: str, offline: bool) -> int:
         if offline:
             from .. import board
 
-            panel = (board.panel(lambda: board.live(run_store.runs_marked_running(connect=foundation.reader)))
-                     if paths.DB_FILE.exists() else {"rows": {"runs": []}})
+            panel = board.panel(lambda: board.live(run_store.runs_marked_running(connect=foundation.reader)))
         else:
             panel = client.field(client.call("GET", "/api/live"), "live")
         if "error" in panel:
@@ -266,7 +276,7 @@ def register(sub) -> None:
     p.add_argument("--limit", type=int, default=10)
     p.add_argument("--json", action="store_true", help="one JSON line per live run, or per step of RUN_ID")
     p.add_argument("--offline", action="store_true", help="read local status and run lines")
-    p.set_defaults(fn=cmd_status)
+    p.set_defaults(fn=cmd_status, local_read=lambda args: args.offline)
 
     p = sub.add_parser("install", help="run arete serve at login: one launchd agent on a Mac, one systemd user unit on "
                                        "Linux; retires the old per loop agents")
@@ -284,11 +294,11 @@ def register(sub) -> None:
     p = sub.add_parser("prompts", help="validate prompt templates and list their required inputs, without model calls")
     p.add_argument("name", nargs="?", default="", help="one template's file stem; omit to inspect every template")
     p.add_argument("--json", action="store_true", help="one JSON object per template, including validation errors")
-    p.set_defaults(fn=cmd_prompts)
+    p.set_defaults(fn=cmd_prompts, local_read=True)
 
     p = sub.add_parser("doctor", help="read only check of arete's own state: cost drift, orphan rows, stray folders, "
                                       "stuck work, the database and its backup; it reports and never repairs")
-    p.set_defaults(fn=cmd_doctor)
+    p.set_defaults(fn=cmd_doctor, local_read=True)
 
     p = sub.add_parser("dashboard", help="serve the dashboard to its owner on the tailnet")
     p.add_argument("--port", type=int, default=None, help="the port to listen on; the config's [dashboard] port by default")

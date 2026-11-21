@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from urllib.parse import unquote
 
-from . import board, codebase, config, contract, control, events, record, refusals, settings, tasks, tool_events, triage, util
+from . import board, codebase, config, contract, control, events, record, refusals, settings, tasks, triage
 from .store import chats, insights, runs
 from .store import db as foundation
 from .store import tasks as task_store
@@ -138,13 +138,6 @@ def read(name, values, handler):
         if not limit.isascii() or not limit.isdecimal() or len(limit) > 6:
             raise contract.Problem("invalid_input", "limit must be a nonnegative integer")
         return {"snapshot": board.snapshot(int(limit)), "loops": control.loop_views(), "records": board.panel(record.store)}
-    if name == "hook_event.list":
-        since = values.get("since")
-        try:
-            cutoff = None if since is None else util.parse_iso(since).timestamp()
-        except (ValueError, OverflowError):
-            raise contract.Problem("invalid_input", "since must be a timestamp") from None
-        return {"events": tool_events.read_events(since_ts=cutoff)}
     if name == "line_stream.read":
         after = values.get("after", "0")
         if not after.isdecimal():
@@ -195,8 +188,7 @@ def dispatch(handler, op, path_values, query):
         if write:
             prepare(name, values)
             return handler.keyed_action(method, op["path"], path_values, lambda: mutation(name, values, handler),
-                                        atomic=name not in ("run.stop", "serve.install", "hook.ingest"),
-                                        recoverable=name == "hook.ingest")
+                                        atomic=name not in ("run.stop", "serve.install"))
         return execute(name, values, handler)
     except refusals.Refusal as error:
         if not getattr(error, "code", None) and error.status in (400, 404):
@@ -224,10 +216,8 @@ def mutation(name, values, handler):
         result = {"chat": dashboard.drop_chat(values["chat"])}
     elif name == "serve.install":
         result = dashboard.install_serve(handler.server.inside_serve)
-    elif name == "hook.ingest":
-        result = {"received": tool_events.ingest(values["origin"], values["offset"], values["events"])}
     else:
-        raise contract.Problem("unknown_route", f"Unknown operation {name}")
+        raise contract.Problem("not_found", f"Unknown operation {name}")
     with foundation.reader() as conn:
         return {"seq": events.metadata(conn)["head"], **result}
 

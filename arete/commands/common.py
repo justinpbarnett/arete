@@ -180,12 +180,22 @@ def loop_line(v: dict) -> str:
             + (f"\n    {v['error']}" if v["error"] else ""))
 
 
+def feed_line(line: dict) -> str:
+    from .. import client
+
+    text = client.field(line, "text", "feed.lines.text", kind=str).replace("\n", "\n    ")
+    try:
+        stamp = when(line["ts"])
+    except (TypeError, ValueError) as e:
+        raise client.Failed({"error": "server answer has an invalid field feed.lines.ts"}) from e
+    return f"{stamp[6:]} [{line['kind']}] {text}"
+
+
 def print_feed_line(line: dict) -> None:
-    text = line["text"].replace("\n", "\n    ")
-    print(f"{when(line['ts'])[6:]} [{line['kind']}] {text}", flush=True)
+    print(feed_line(line), flush=True)
 
 
-def follow(run_id: str, alive=None, after: int = 0, send=None, *, remote=False) -> int:
+def follow(run_id: str, alive=None, after: int = 0, send=None, *, remote=False, on_start=None) -> int:
     import time
     from urllib.parse import quote
 
@@ -194,25 +204,31 @@ def follow(run_id: str, alive=None, after: int = 0, send=None, *, remote=False) 
     epoch = None
 
     def drain():
-        nonlocal after, epoch
+        nonlocal after, epoch, on_start
         while True:
             found = (client.call("GET", f"/api/feed/{quote(run_id, safe='')}?after={after}") if remote
                      else control.feed(run_id, after))
-            current = found["restore_epoch"]
+            current = client.field(found, "restore_epoch", kind=int)
             if epoch != current:
                 changed = epoch is not None
                 epoch = current
                 if changed:
                     after = 0
                     continue
-            for line in found["lines"]:
-                print_feed_line(line)
-                after = line["id"]
-            return client.run_info(run_id) if remote else found["run"]
+            status = (client.field(client.run_info(run_id), "status", "run.status", kind=str) if remote
+                      else (found["run"] or {}).get("status"))
+            lines = [(client.field(line, "id", "feed.lines.id", kind=int), feed_line(line))
+                     for line in client.field(found, "lines", kind=list)]
+            if on_start is not None:
+                on_start()
+                on_start = None
+            for after, rendered in lines:
+                print(rendered, flush=True)
+            return status == "running"
 
     while True:
-        r = drain()
-        if not (alive() if alive else r.get("status") == "running"):
+        running = drain()
+        if not (alive() if alive else running):
             drain()
             return after
         if send:

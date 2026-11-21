@@ -83,7 +83,6 @@ RESOURCE = {
 }
 ERRORS = [{"code": code, "status": status, "description": description} for code, status, description in (
     ("not_found", 404, "The selected resource does not exist."),
-    ("unknown_route", 404, "The server does not recognize this route."),
     ("unavailable", 404, "No saved diff is available."),
     ("unknown_field", 422, "Undeclared request fields; fields lists rejected paths."),
     ("invalid_input", 400, "The input does not match the operation schema."),
@@ -122,7 +121,7 @@ def operation(name, path, result, inputs=None, example=None, method="GET", *, er
     shown = sample(result)
     if "seq" in result.get("properties", {}):
         shown["seq"] = "0.1"
-    new_errors = {"unknown_route", "invalid_state", "task_version_conflict"}
+    new_errors = {"invalid_state", "task_version_conflict"}
     return {"name": name, "method": method, "path": "/api/v1/" + path,
             "input": inputs or obj({}), "result": result,
             "errors": [r["code"] for r in ERRORS if r["code"] not in new_errors or r["code"] in errors],
@@ -226,11 +225,6 @@ OPERATIONS += [
               {"chat": "1"}, "DELETE"),
     operation("serve.install", "serve/install", envelope({"restarting": BOOLEAN, "said": STRING}),
               method="POST"),
-    operation("hook_event.list", "hook-events", envelope({"events": array(mapping(JSON))}), obj({"since": STRING}, [])),
-    operation("hook.ingest", "hook-events", envelope({"received": INTEGER}),
-              obj({"events": array(mapping(JSON)), "origin": {**STRING, "pattern": "^[0-9a-f]{32}$"},
-                   "offset": {**INTEGER, "minimum": 0}}),
-              {"origin": "0123456789abcdef0123456789abcdef", "offset": 0, "events": []}, "POST"),
     operation("batch.run", "batch", envelope({"results": array(mapping(JSON))}),
               obj({"requests": array(obj({"operation": STRING, "input": mapping(JSON)}, ["operation"]))}),
               {"requests": [{"operation": "meta.get"}]}, "POST"),

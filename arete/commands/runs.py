@@ -37,9 +37,10 @@ def cmd_run(args) -> int:
 def run_followed(started: dict) -> int:
     from .. import client, pipeline, run_lines
 
+    run_id, status = started["run"], started["state"]
     client.emit(started)
-    if not (run_id := started.get("run")):
-        return 0 if started.get("state") in ("queued", "starting") else 1
+    if not run_id:
+        return 0 if status in ("queued", "starting") else 1
     try:
         for line in client.followed(run_id):
             client.emit(line)
@@ -55,11 +56,9 @@ def local_lines(run_id: str, start: int, follow: bool) -> Iterable[dict] | None:
     from .. import run_lines
 
     def ended():
-        row = run_store.run_get(run_id, connect=foundation.reader) if paths.DB_FILE.exists() else None
+        row = run_store.run_get(run_id, connect=foundation.reader)
         return not row or row["status"] != "running"
 
-    if not run_lines.path(run_id).exists() and not paths.DB_FILE.exists():
-        return None
     if not run_lines.path(run_id).exists() and not run_store.run_get(run_id, connect=foundation.reader):
         return None
     return (run_lines.follow(run_id, start, ended=ended) if follow
@@ -144,7 +143,7 @@ def cmd_replay(args) -> int:
 def register(sub) -> None:
     p = sub.add_parser("merged", help="print newly merged pipeline PRs as JSON events")
     p.add_argument("--since-cursor", action="store_true", help="omit PRs already seen by this command source")
-    p.set_defaults(fn=cmd_merged)
+    p.set_defaults(fn=cmd_merged, local_read=True)
 
     p = sub.add_parser("merge-check", help="use the merged origin base for landed pipeline PRs")
     p.add_argument("repo", nargs="?", default="", help="configured repository; otherwise read events on stdin")
@@ -214,4 +213,4 @@ def register(sub) -> None:
                    help="start after the line with this seq")
     p.add_argument("--step", default="", help="print only this step's lines")
     p.add_argument("--offline", action="store_true", help="read local run lines")
-    p.set_defaults(fn=cmd_lines)
+    p.set_defaults(fn=cmd_lines, local_read=lambda args: args.offline)

@@ -308,7 +308,7 @@ class Check:
             self.request("GET", "/api/v1/meta", headers={"X-Arete-Client": f"{client}/{minimum}"})
         self.request("POST", "/api/v1/batch", {"requests": []}, headers={"X-Arete": ""}, status=403)
         for method, path, body, custom, code in (
-            ("GET", "/api/v1/no-such-operation", None, {}, "unknown_route"),
+            ("GET", "/api/v1/no-such-operation", None, {}, "not_found"),
             ("PUT", "/api/v1/meta", None, {}, "method_not_allowed"),
             ("GET", "/api/v1/meta", None, {"X-Arete-Client": "cli/0.9"}, "client_too_old"),
             ("POST", "/api/v1/batch", b'{"requests":[],"requests":[]}', {}, "invalid_json"),
