@@ -30,6 +30,7 @@ from .agent import NO_SESSION, Session, json_from_text
 from .orchestration_api import BUNDLES, PROTOCOL, Catalog, help_text
 from .store import asks as ask_store
 from .store import orchestration as ledger
+from .store import writes
 from .verify import Verified
 
 STATE_FIELDS = ("plan_text", "goal", "estimate", "left_for_a_person", "build_summary", "reviews", "fix_reply",
@@ -74,6 +75,7 @@ class Controller:
         if self.job.built:
             self.data["checked"] = self.job.b.checked
             self.data["report"] = self.job.b.report
+            self.data["catch_ups"] = self.job.b.catch_ups
         ledger.save(self.lease, self.data)
 
     def atomic(self, name, **kw):
@@ -116,7 +118,7 @@ class Controller:
             if any(not (Path(c["wt"]) / ".git").exists() for c in prepared["checkouts"]):
                 if any(Path(c["wt"]).exists() for c in prepared["checkouts"]):
                     raise factory.Refused("the retained workspace is incomplete; reconcile without discarding its edits")
-                if ledger.publication_pending(self.run.id) or not any(
+                if self.data.get("publication_pause") or ledger.publication_pending(self.run.id) or not any(
                         a["op"] == "publication.request" and a["state"] == "succeeded" for a in ledger.actions(self.lease)):
                     raise factory.Refused("the missing workspace has no settled publication; reconcile before resuming")
                 if why := self.job.restore({"step": "prepare", "tree": str(self.job.ws), "data": prepared}, layer=self.job.layer):
@@ -129,6 +131,7 @@ class Controller:
             self.job.verified = Verified.stored(self.data.get("verified", {}))
             self.job.b.checked = self.data.get("checked", {})
             self.job.b.report = self.data.get("report", "")
+            self.job.b.catch_ups = self.data.get("catch_ups", 0)
             self.job.b.from_base = True
             self.job.b.plan_text, self.job.b.build_summary = self.job.plan_text, self.job.build_summary
         else:
@@ -186,6 +189,8 @@ class Controller:
         self.data["acceptance"] = ledger.digest([self.catalog.context["task"], self.job.goal,
                                                  self.job.left_for_a_person])
         self.recover()
+        if paused := self.data.get("publication_pause"):
+            return self.resume_publication(paused)
         if self.flow.continues and (moved := flows.base_moved(self.flow.continues)):
             self.job.moved_base = moved
             self.job.merge_moved_base("orchestrate")
@@ -226,9 +231,10 @@ class Controller:
         self.quiescent()
         for turn in ledger.pending(self.lease):
             ledger.reject(self.lease, turn["id"], "interrupted controller turn; admitted usage may be unknown")
+        paused_action = self.data.get("publication_pause", {}).get("action")
         for action in ledger.actions(self.lease):
             result = action["result"]
-            if action["op"] == "owner.ask" and result.get("awaiting_owner"):
+            if ((action["op"] == "owner.ask" or action["id"] == paused_action) and result.get("awaiting_owner")):
                 answers = [ask_store.ask_get(ask) for ask in result["ask_ids"]]
                 if not answers or any(not answer or answer["status"] not in ("answered", "taken") for answer in answers):
                     raise factory.Refused("owner answers or interrupted question settlement need reconciliation before resuming")
@@ -510,6 +516,8 @@ class Controller:
 
     def publish(self):
         self.barrier()
+        if self.data.get("publication_intent"):
+            raise factory.Refused("publication was interrupted; reconcile its branch/PR effects before resuming")
         needed = [gate for gate in ("checks", "review", "verify") if not self.current(gate)]
         if needed:
             raise ValueError("publication needs current evidence: " + ", ".join(needed))
@@ -547,26 +555,78 @@ class Controller:
             self.job.ci_result = current.summary()
             self.check_pilot_publication()
             pipeline.publish_ci(self.run, self.job.ticket, self.job.with_prs, pipeline.ci.section([current], 1))
-            if current.reds or not current.all_read:
-                self.data["ci_failed"] = True
-                for checkout in self.job.with_prs:
-                    self.check_pilot_publication()
-                    pipeline.set_draft(self.run, checkout, True)
-                return {"ci": self.job.ci_result, "error": "CI needs an explicit worker diagnosis or repair"}
+            if failure := self.publication_ci_error(current):
+                return failure
+        return self.finish_publication()
+
+    def publication_ci_error(self, current):
+        if not current.reds and current.all_read:
             self.data.pop("ci_failed", None)
+            return None
+        self.data["ci_failed"] = True
+        for checkout in self.job.with_prs:
+            self.check_pilot_publication()
+            if pipeline.own_draft_state(self.run, checkout) is False:
+                pipeline.set_draft(self.run, checkout, True)
+        return {"ci": self.job.ci_result, "error": "CI needs an explicit worker diagnosis or repair"}
+
+    def note_published_heads(self):
+        for checkout in self.job.picked(self.job.changed):
+            self.data["publication"]["heads"][checkout.github] = checkout.lease
+
+    def finish_publication(self, resume: pipeline.CatchUpPause | None = None):
+        self.barrier()
+        if self.data.get("publication_intent"):
+            raise factory.Refused("publication was interrupted; reconcile its branch/PR effects before resuming")
         self.check_pilot_publication()
         self.data["publication_intent"] = {"tree": self.fingerprint(), "phase": "publish"}
         self.persist()
-        outcome = self.atomic("publish")
+        outcome = self.atomic("publish", resume=resume, ci_guard=self.publication_ci_error)
+        self.note_published_heads()
         self.data.pop("publication_intent", None)
+        self.data.pop("publication_pause", None)
         if outcome.passed:
             self.data["published"], self.data["published_tree"] = outcome.data, self.fingerprint()
         else:
             self.data.pop("published", None)
             self.data.pop("published_tree", None)
         self.persist()
+        if self.data.get("ci_failed"):
+            self.job.slot.take(self.run.log, self.run.waiting)
+            return outcome.data
         self.ending = flows.ended(self.flow, outcome)
         return outcome.data
+
+    def resume_publication(self, paused):
+        pause = pipeline.CatchUpPause(**paused["catch_up"])
+        action = next((a for a in ledger.actions(self.lease) if a["id"] == paused["action"]), {})
+        checkouts = self.job.checkouts
+        if (self.run.action or self.run.dry_run or not self.data.get("publication") or self.data.get("ci_failed")
+                or action.get("op") != "publication.request" or action["state"] != "succeeded"
+                or not action["result"].get("awaiting_owner") or len(checkouts) != 1 or not paused["tree"]
+                or self.fingerprint() != paused["tree"]
+                or not pause.matches(checkouts[0])
+                or not 1 <= pause.attempt <= pipeline.AUTOMERGE_CATCH_UPS):
+            raise factory.Refused("the paused automerge checkout or publication changed; reconcile before resuming")
+        self.dispatch(action, resume=pause)
+        return self.ending
+
+    def park_publication(self, action, asked):
+        if (not isinstance(asked, pipeline.CatchUpAsked)
+                or self.data.get("publication_intent", {}).get("phase") != "publish"
+                or not self.data.get("publication")):
+            return "reconciliation-required"
+        tree = self.fingerprint()
+        if not tree:
+            return "reconciliation-required"
+        if not workspace.kept_work(self.job.ws, self.job.checkouts, self.run.repo.path, self.job.layer.copy,
+                                   commits=False):
+            workspace.note_made(self.job.ws, self.job.checkouts)
+        self.note_published_heads()
+        self.job.ci_result = asked.ci_result or self.job.ci_result
+        self.data["publication_pause"] = {"action": action["id"], "tree": tree, "catch_up": asdict(asked.pause)}
+        self.data.pop("publication_intent", None)
+        return "succeeded"
 
     def check_pilot_publication(self):
         if pilot.is_pilot_task(str(self.run.tid)):
@@ -687,20 +747,23 @@ class Controller:
             return {"reason": args["reason"]}
         raise ValueError("unknown orchestration operation")
 
-    def dispatch(self, action):
-        if action["state"] != "accepted":
+    def dispatch(self, action, *, resume=None):
+        expected = "succeeded" if resume else "accepted"
+        if action["state"] != expected:
             return
         if action["op"] != "worker.start" and action["op"] != "worker.continue":
             ledger.transition(self.lease, action["id"], "running", {"input_stamp": {
-                "tree": self.fingerprint(), "policy": self.policy_sha(), "acceptance": self.data["acceptance"]}})
+                "tree": self.fingerprint(), "policy": self.policy_sha(), "acceptance": self.data["acceptance"]}},
+                expected=(expected,))
         try:
             self.executing = action["id"]
-            result = self.perform(action)
+            result = self.finish_publication(resume) if resume else self.perform(action)
         except owner_asks.Asked as asked:
-            ledger.transition(self.lease, action["id"], "succeeded",
-                              {"ask_ids": asked.ask_ids, "awaiting_owner": True})
-            self.persist()
-            run_lines.write(self.run.id, "action", action=action["id"], op=action["op"], state="succeeded")
+            state = self.park_publication(action, asked) if action["op"] == "publication.request" else "succeeded"
+            with writes.atomic():
+                ledger.transition(self.lease, action["id"], state, {"ask_ids": asked.ask_ids, "awaiting_owner": True})
+                self.persist()
+            run_lines.write(self.run.id, "action", action=action["id"], op=action["op"], state=state)
             raise
         except ValueError as error:
             result = {"error": str(error)[:2000]}

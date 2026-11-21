@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from . import (
+    ci,
     config,
     diffguard,
     document,
@@ -1161,7 +1162,8 @@ def watch(flow: factory.Flow, tree: str) -> Outcome:
 
 
 @factory.step("publish")
-def publish(flow: factory.Flow) -> Outcome:
+def publish(flow: factory.Flow, resume: pipeline.CatchUpPause | None = None,
+            ci_guard: Callable[[ci.Round], dict | None] | None = None) -> Outcome:
     job: Job = flow.ctx
     run = job.run
     if not run.repo.parts:
@@ -1172,6 +1174,19 @@ def publish(flow: factory.Flow) -> Outcome:
     opened, pushed, with_prs = job.picked(job.opened), job.picked(job.pushed), job.with_prs
     fresh = [c for c in opened if c.github not in job.found]
     run.enter("pr")
+    if resume:
+        candidates = with_prs
+    else:
+        standing = [c for c in job.picked(job.changed) if c not in fresh]
+        candidates = fresh + pipeline.ready_pushed(run, standing, job.picked(job.ci_stopped), job.draft_why)
+    caught_up_ci = pipeline.automerge(job.b, job.approval, job.draft_why, job.verified, job.review, candidates,
+                                    pipeline.automerge_about(job.ticket, job.build_summary), branch=job.branch,
+                                    slot=job.slot, goal=job.with_left(job.goal), plan=job.with_left(job.plan_text),
+                                    resume=resume, orchestrated=ci_guard is not None)
+    if caught_up_ci:
+        job.ci_result = caught_up_ci.summary()
+        if ci_guard and (failure := ci_guard(caught_up_ci)):
+            return Outcome("fail", feedback=failure["error"], data=failure)
     if run.feedback:
         pipeline.answer_feedback(run, job.replies, "Done in the latest push.")
         run.say(f"Revised for your review.\n\n{job.report_body}\n\nCI: {job.ci_result}.")
@@ -1182,10 +1197,6 @@ def publish(flow: factory.Flow) -> Outcome:
     else:
         run.say(f"PRs for this ticket:\n\n{pipeline.pr_status_lines(with_prs, opened, pushed)}\n\nCI: {job.ci_result}."
                 + pipeline.published_note(job.draft_why, job.verified, fresh, job.picked(job.drafted)))
-    standing = [c for c in job.picked(job.changed) if c not in fresh]
-    ready = pipeline.ready_pushed(run, standing, job.picked(job.ci_stopped), job.draft_why)
-    pipeline.automerge(job.b, job.approval, job.draft_why, job.verified, job.review, fresh + ready,
-                       pipeline.automerge_about(job.ticket, job.build_summary))
     return end_as("pass", "pr", summary=f"{job.summary}, CI: {job.ci_result}")
 
 

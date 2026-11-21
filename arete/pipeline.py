@@ -96,6 +96,7 @@ NOT_CAUSED_LEFT_FOR_A_PERSON = (f"{LEFT_HEADING}\n\n{LEFT_BY_A_PERSON} A red che
                                 "is not caused by the PR: set `caused_by_pr` to false, say in its reason that it waits "
                                 "on the change left for a person, and do not make it pass another way.\n\n")
 CHECKED_IN_USE_HEADING = "## Checked in use"
+REVIEW_HEADING = "## Review"
 RUNS_LOG = "runs.log"
 RUN_START_SECONDS = 10
 SUCCEEDED = ("pr", "noop", "needs-info", "dry-run", "done")
@@ -168,6 +169,7 @@ CI_FIX_SCHEMA = {
     "required": ["checks", "summary"],
 }
 MAX_CI_REASON_CHARS = 700
+AUTOMERGE_CATCH_UPS = 2
 FEEDBACK_QUIET_MINUTES = 10
 
 
@@ -499,6 +501,9 @@ class Run(AgentRun):
     def due_for(self, call: str) -> list[dict]:
         seam = factory.inside(self.id).step
         here = [a for a in self.answers_due if a["step"] == seam]
+        if seam == "publish":
+            resolver = re.fullmatch(r"resolve\d*", call) is not None
+            here = [a for a in here if (re.fullmatch(r"resolve\d*", a["call"]) is not None) == resolver]
         return [a for a in here if a["call"] == call] or here
 
     def fresh_text(self, text: str, due: list[dict]) -> str:
@@ -934,6 +939,7 @@ class Build(TicketWork):
     from_base: bool = False
     plan_text: str = ""
     build_summary: str = ""
+    catch_ups: int = 0
 
     def resume(self, step: str, text: str, role: str = "build", **kw) -> Result:
         saved = self.run.sessions.get("build", NO_SESSION)
@@ -996,11 +1002,12 @@ class Build(TicketWork):
                     patch=self.staged.patch)
         return self.staged
 
-    def require_valid_diff(self, after: str, planned: str = "") -> None:
-        staged = self.restage()
+    def require_valid_diff(self, after: str, planned: str = "", *, from_base: bool | None = None) -> None:
+        staged = self.restage(from_base=from_base)
         if staged.empty:
             raise workspace.RunFailed(f"{after} undid every change")
-        earlier = 0 if self.from_base else self.committed_lines + sum(c.resolved_lines for c in self.checkouts)
+        whole_diff = self.from_base if from_base is None else from_base
+        earlier = 0 if whole_diff else self.committed_lines + sum(c.resolved_lines for c in self.checkouts)
         why = staged.refusal(self.layer.max_diff_lines, earlier=earlier)
         if staged.denied:
             raise workspace.RunFailed(f"{after} {why}")
@@ -1984,7 +1991,6 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
         status, why, _ = _fail(run, e.why, detail=f"{e.detail}\n\n### PRs\n\n{prs}\n\nReview comments on a PR "
                                                   "start a revision, as on any arete PR.")
         return status, why, record_prs(run, branch, with_prs)
-    outcome += f", CI: {ci_result}"
     run.enter("pr")
     if run.feedback:
         answer_feedback(run, replies, "Done in the latest push.")
@@ -1992,11 +1998,14 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
     else:
         run.say(f"PRs for this ticket:\n\n{pr_status_lines(with_prs, opened, pushed)}\n\nCI: {ci_result}."
                 + published_note(draft_why, verified, opened, drafted))
-    automerge(b, approval, draft_why, verified, review, opened + ready_pushed(run, pushed, ci_stopped, draft_why),
-              automerge_about(t, build_summary))
+    caught_up_ci = automerge(b, approval, draft_why, verified, review,
+                             opened + ready_pushed(run, pushed, ci_stopped, draft_why),
+                             automerge_about(t, build_summary), branch=branch, slot=slot, goal=goal, plan=plan_to_review)
+    if caught_up_ci:
+        ci_result = caught_up_ci.summary()
     urls = record_prs(run, branch, with_prs)
     release_workspace(run, ws, checkouts)
-    return "pr", outcome, urls
+    return "pr", f"{outcome}, CI: {ci_result}", urls
 
 
 def furnish(cfg: config.Config, run: Run, layer: config.RepoLayer, ws: Path) -> str:
@@ -2060,41 +2069,170 @@ def report_body(run: Run, *, summary: str, review: Review, verified: verify.Veri
 
 
 def automerge(b: Build, approval: dict | None, draft_why: str, verified: verify.Verified, review: Review,
-              opened: list[workspace.Checkout], about: str) -> None:
+              opened: list[workspace.Checkout], about: str, *, branch: str, slot: slots.RunSlot | None,
+              goal: str, plan: str, resume: CatchUpPause | None = None, orchestrated: bool = False) -> ci.Round | None:
     run = b.run
     if not opened or draft_why or b.layer.trust_level != "automerge" or run.feedback or run.repairs:
-        return
+        return None
     if (approval and approval["sent_by"] == "triage") or intake.AUTO_LABEL in b.ticket.labels:
         run.facts["merge_held"] = "triage approved the ticket, so a person merges it"
         run.log(f"automerge left off: {run.facts['merge_held']}")
-        return
+        return None
+    current = None
     for c in opened:
         try:
-            hold = merge_hold(b, c, verified, review, about)
+            hold, current = merge_with_catch_ups(b, c, verified, review, about, branch, slot, goal, plan, resume,
+                                                orchestrated=orchestrated)
         except gh.GhUnsure:
             run.facts["merge_held"] = "GitHub did not confirm whether it merged the PR"
             run.log(f"automerge: {run.facts['merge_held']} at {c.lease}; check {c.pr} before retrying")
-            return
+            return current
         except (RuntimeError, OSError, KeyError, TypeError, ValueError) as e:
             run.log(f"automerge could not establish eligibility: {public_text(run, util.first_line(str(e), 300))}")
             hold = "the merge gate could not be completed"
         if not hold:
             run.log(f"automerged {c.pr} at {c.lease}")
             continue
+        if orchestrated and current and (current.reds or not current.all_read):
+            run.log(f"automerge stopped on {c.pr}: {hold}")
+            return current
         run.facts["merge_held"] = hold
         run.log(f"automerge left {c.pr} for a person: {hold}")
         try:
             gh.pr_comment(c.pr, public_text(run, f"Automerge stays off for this PR: {hold}. A person merges it."))
         except gh.GhError as e:
             run.log(f"automerge could not report the hold on {c.pr}: {e}")
+    return current
 
 
-def merge_hold(b: Build, c: workspace.Checkout, verified: verify.Verified, review: Review, about: str) -> str:
-    if len(b.checkouts) != 1:
-        return "a change spanning repositories cannot be merged atomically"
+@dataclass(frozen=True)
+class CatchUpPause:
+    pr: str
+    head: str
+    base: str
+    base_sha: str
+    attempt: int
+
+    def matches(self, checkout: workspace.Checkout) -> bool:
+        return (self.pr, self.head, self.base) == (checkout.pr, checkout.lease, checkout.base)
+
+
+class CatchUpAsked(owner_asks.Asked):
+    def __init__(self, asked: owner_asks.Asked, pause: CatchUpPause) -> None:
+        super().__init__(asked.sent, asked.ask_ids, asked.step, asked.call, NO_SESSION)
+        self.pause = pause
+        self.ci_result = ""
+
+
+def merge_with_catch_ups(b: Build, c: workspace.Checkout, verified: verify.Verified, review: Review, about: str,
+                         branch: str, slot: slots.RunSlot | None, goal: str, plan: str,
+                         resume: CatchUpPause | None, *, orchestrated: bool) -> tuple[str, ci.Round | None]:
+    from . import pilot
+
+    run, current = b.run, None
+    if resume and (len(b.checkouts) != 1 or not resume.matches(c) or pilot.is_pilot_task(str(run.tid))):
+        return "the paused automerge no longer matches the published checkout", current
+    if resume:
+        b.catch_ups = max(b.catch_ups, resume.attempt)
+    while True:
+        if not resume:
+            hold = merge_hold(b, c, verified, review, about)
+            if not isinstance(hold, gh.MovedBaseHold) or pilot.is_pilot_task(str(run.tid)):
+                return hold, current
+        row = gh.pr_merge_details(c.pr)
+        if ref_hold := gh.merge_ref_hold(row, c.lease, c.base):
+            return ref_hold, current
+        base_sha = row.get("baseRefOid")
+        if not base_sha:
+            return "GitHub did not report the current base commit", current
+        prior_base = c.base_commit
+        try:
+            if slot:
+                slot.take(run.log, run.waiting, what="automerge")
+            base_sha = fetch_merge_base(c)
+            if not resume or resume.base_sha != base_sha:
+                if b.catch_ups >= AUTOMERGE_CATCH_UPS:
+                    return f"the base `{c.base}` moved to `{base_sha}` after {b.catch_ups} catch-ups", current
+                b.catch_ups += 1
+            resume = None
+            verified, review = catch_up_base(b, c, branch, goal, plan, b.catch_ups,
+                                            allow_resolver_pause=orchestrated)
+        except CatchUpAsked as asked:
+            asked.ci_result = current.summary() if current else ""
+            raise
+        except (workspace.RunFailed, RuntimeError, OSError) as e:
+            reason = e.why if isinstance(e, workspace.RunFailed) else util.first_line(str(e), 300)
+            moved = c.base_commit if c.base_commit != prior_base else base_sha
+            return f"could not catch up to `{c.base}` at `{moved}`: {public_text(run, reason)}", current
+        if slot:
+            slot.free()
+        with run.waiting("ci"):
+            current = ci.Round(1, [ci.compare_with_base(ci.watch(ci_target(c), run.log), run.log)])
+        try:
+            ref_hold = gh.merge_ref_hold(gh.pr_merge_details(c.pr), c.lease, c.base)
+        except gh.GhError as e:
+            run.log(f"automerge: could not check {c.pr}: {public_text(run, util.first_line(str(e), 300))}")
+            return "the PR refs could not be confirmed for the caught-up head", current
+        if ref_hold:
+            return ref_hold, current
+        try:
+            publish_ci(run, b.ticket, [c], ci.section([current], 1), (verified, review))
+        except gh.GhError as e:
+            run.log(f"automerge: could not refresh {c.pr}: {public_text(run, util.first_line(str(e), 300))}")
+            return "the PR body could not be updated for the caught-up head", current
+        if current.reds:
+            return "CI reported failures for the caught-up head", current
+        if orchestrated and not current.all_read:
+            return "CI checks could not be read for the caught-up head", current
+
+
+def catch_up_base(b: Build, c: workspace.Checkout, branch: str, goal: str, plan: str,
+                  attempt: int, *, allow_resolver_pause: bool) -> tuple[verify.Verified, Review]:
+    run = b.run
+    if git(["rev-parse", "HEAD"], c.wt).strip() != c.lease:
+        raise workspace.RunFailed("the worktree head differs from the published head")
+    try:
+        merged = merge_moved_bases(run, [c], b.layer, b.ticket, "automerge: ")
+    except owner_asks.Asked as asked:
+        if asked.limit is not None:
+            raise workspace.RunFailed(f"the conflict resolver reached the ask limit of {asked.limit}") from asked
+        if not allow_resolver_pause:
+            raise workspace.RunFailed("the conflict resolver needs owner input") from asked
+        if (git(["rev-parse", "HEAD"], c.wt).strip() != c.lease or workspace.uncommitted(c.wt)
+                or git(["rev-parse", "-q", "--verify", "MERGE_HEAD"], c.wt, check=False).strip()):
+            raise
+        raise CatchUpAsked(asked, CatchUpPause(c.pr, c.lease, c.base, c.base_commit, attempt)) from asked
+    if not merged:
+        raise workspace.RunFailed("the published head already contains the fetched base")
+    head = c.merge
+    b.require_valid_diff("catching up the moved base", from_base=True)
+    if not b.check():
+        raise workspace.RunFailed("the layer's local checks failed")
+    if not b.layer.verify:
+        raise workspace.RunFailed("the layer has no behavioral verification configured")
+    try:
+        verified = check_in_use(b, goal, b.build_summary)
+    except owner_asks.Asked as asked:
+        raise workspace.RunFailed("behavioral verification needs owner input") from asked
+    try:
+        review = _review(b, plan, verified, step=f"automerge-review{attempt}")
+    except owner_asks.Asked as asked:
+        raise workspace.RunFailed("review needs owner input") from asked
+    if hold := merge_evidence_hold(b, c, verified, review, head):
+        raise workspace.RunFailed(hold)
+    if git(["rev-parse", "HEAD"], c.wt).strip() != head or workspace.uncommitted(c.wt):
+        raise workspace.RunFailed("the worktree changed while checking the merge")
+    if hold := gh.merge_ref_hold(gh.pr_merge_details(c.pr), c.lease, c.base):
+        raise workspace.RunFailed(hold)
+    commit_and_push(b.checkouts, [c], branch, "", before_push=lambda _: head)
+    note_review(run, review, verified)
+    run.log(f"automerge: pushed catch-up {attempt} to {c.pr} at {c.lease}")
+    return verified, review
+
+
+def merge_evidence_hold(b: Build, c: workspace.Checkout, verified: verify.Verified, review: Review, head: str) -> str:
     if verified.verdict != "pass" or not verified.finished or not verified.checks or verified.failed_checks:
         return "native behavioral verification did not pass"
-    head = c.lease
     if not head:
         return "this run has no published head to verify"
     tree = git(["rev-parse", f"{head}^{{tree}}"], c.wt).strip()
@@ -2105,15 +2243,39 @@ def merge_hold(b: Build, c: workspace.Checkout, verified: verify.Verified, revie
         return "the published tree lacks a current approving review"
     if not b.layer.checks or b.checked.get("tree") != tree or b.checked.get("commands") != b.layer.checks:
         return "the published tree lacks the full local check result"
+    return ""
+
+
+def merge_hold(b: Build, c: workspace.Checkout, verified: verify.Verified, review: Review, about: str) -> str:
+    if len(b.checkouts) != 1:
+        return "a change spanning repositories cannot be merged atomically"
+    head = c.lease
+    if hold := merge_evidence_hold(b, c, verified, review, head):
+        return hold
     if not jev.ready(b.cfg, [b.run.repo]):
         return "JEV risk screening is unavailable"
-    base_sha = git(["rev-parse", c.origin_base], c.wt).strip()
-    if not base_sha or git(["merge-base", base_sha, head], c.wt).strip() != base_sha:
-        return "the checked head does not contain the target base"
+    base_sha = fetch_merge_base(c)
+    if not has_merge_base(c, head, base_sha):
+        return gh.MovedBaseHold("the checked head does not contain the target base")
     number = gh.pr_number(c.pr)
     _, hold = gh.merge_readiness(c.github, number, head, c.base, base_sha, wait=gh.MERGE_WAIT_SECONDS)
-    if hold:
-        return hold
+    if not hold:
+        hold = screen_and_merge(b, c, number, head, base_sha, about)
+    if isinstance(hold, gh.BaseTipChanged) and not has_merge_base(c, head, fetch_merge_base(c)):
+        return gh.MovedBaseHold("the checked head does not contain the target base")
+    return hold
+
+
+def fetch_merge_base(c: workspace.Checkout) -> str:
+    workspace.fetch(c.src, c.base)
+    return git(["rev-parse", c.origin_base], c.wt).strip()
+
+
+def has_merge_base(c: workspace.Checkout, head: str, base_sha: str) -> bool:
+    return bool(base_sha) and git(["merge-base", base_sha, head], c.wt, check=False).strip() == base_sha
+
+
+def screen_and_merge(b: Build, c: workspace.Checkout, number: int, head: str, base_sha: str, about: str) -> str:
     patch = checkout_patch(c, [], f"{base_sha}..{head}")
     if not patch:
         return "there is no diff to risk screen"
@@ -2264,7 +2426,7 @@ def commit_and_push(checkouts: list[workspace.Checkout], changed: list[workspace
             git(argv, c.wt, timeout=600, retry=not before_push)
         except RuntimeError as e:
             done = ", ".join(p.github for p in pushed) or "nothing"
-            aftermath = ("The pilot will not retry the push." if before_push
+            aftermath = ("Arete will not retry the push." if before_push
                          else "A retry builds on whatever reached the branch.")
             raise workspace.RunFailed(f"the push to {c.github} failed after arete pushed {done}",
                                       f"{e}\n\n{aftermath}") from e
@@ -2769,13 +2931,28 @@ def ci_fix_message(b: Build, caused: list[ci.Red]) -> str:
     return f"{tracker.with_ref(subject, b.ticket.ref)}\n\nArete-Run: {b.run.id}"
 
 
-def publish_ci(run: AgentRun, t: tracker.Ticket, pushed: list[workspace.Checkout], ci_section: str) -> None:
+def replace_pr_section(body: str, heading: str, section: str) -> str:
+    pattern = re.compile(rf"^{re.escape(heading)}\n.*?(?=^## |\Z)", re.MULTILINE | re.DOTALL)
+    body, replaced = pattern.subn(lambda _: f"{section.rstrip()}\n\n", body, count=1)
+    return body if replaced else f"{body.rstrip()}\n\n{section.rstrip()}\n"
+
+
+def publish_ci(run: AgentRun, t: tracker.Ticket, pushed: list[workspace.Checkout], ci_section: str,
+               evidence: tuple[verify.Verified, Review] | None = None) -> None:
     links = (run.tracker.pr_link(t, whole=True), run.tracker.pr_link(t, whole=False))
     for c in pushed:
         try:
             kept, text = gh.split_link(gh.pr_body(c.pr), links)
+            if evidence:
+                text = ci.SECTION.sub("", text)
+                verified, review = evidence
+                text = replace_pr_section(text, CHECKED_IN_USE_HEADING,
+                                          f"{CHECKED_IN_USE_HEADING}\n\nHead `{c.lease[:7]}`\n\n{verified.markdown()}")
+                text = replace_pr_section(text, REVIEW_HEADING, review.markdown())
             gh.pr_edit_body(c.pr, public_text(run, ci.with_section(text, ci_section)), link=kept)
         except gh.GhError as e:
+            if evidence:
+                raise
             run.log(f"ci: could not write the CI section on {c.pr}: {util.first_line(str(e), 300)}")
 
 

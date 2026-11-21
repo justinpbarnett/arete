@@ -87,23 +87,26 @@ class Watched:
     checks: dict[str, gh.Check]
     read: bool = True
     reds: list[Red] = field(default_factory=list)
+    conflicting: bool = False
 
     def in_state(self, state: str) -> list[gh.Check]:
         return [c for c in self.checks.values() if c.state == state]
 
     def markdown(self) -> list[str]:
+        lines = ["- Arete stopped waiting because GitHub reports a merge conflict with the base."] if self.conflicting else []
         if not self.read:
-            return [f"- Arete could not read the checks within {minutes(WAIT_SECONDS)} of the push."]
+            when = "when Arete stopped waiting" if self.conflicting else f"within {minutes(WAIT_SECONDS)} of the push"
+            lines.append(f"- Arete could not read the checks {when}.")
         if not self.checks:
-            return [f"- No checks reported within {minutes(FIRST_CHECK_SECONDS)} of the push."]
-        lines = []
+            return lines or [f"- No checks reported within {minutes(FIRST_CHECK_SECONDS)} of the push."]
         if passed := self.in_state("pass"):
             lines.append(f"- Passed: {', '.join(map(linked, passed))}")
         if skipped := self.in_state("skipped"):
             lines.append(f"- Skipped: {', '.join(map(linked, skipped))}")
         lines += [r.markdown() for r in self.reds]
         if pending := self.in_state("pending"):
-            lines.append(f"- Still running after {minutes(WAIT_SECONDS)}: {', '.join(map(linked, pending))}")
+            when = "when Arete stopped waiting" if self.conflicting else f"after {minutes(WAIT_SECONDS)}"
+            lines.append(f"- Still running {when}: {', '.join(map(linked, pending))}")
         return lines
 
 
@@ -133,10 +136,12 @@ class Round:
             parts.append(f"{skipped} skipped")
         kinds = Counter(r.kind for r in self.reds)
         parts += [f"{kinds[kind]} {words}" for kind, words in RED_COUNT.items() if kinds[kind]]
-        if pending := sum(c.state == "pending" for c in checks):
+        if pending := sum(len(w.in_state("pending")) for w in self.seen if not w.conflicting):
             parts.append(f"{pending} still running after {minutes(WAIT_SECONDS)}")
         if unread := [w.target.pr_name for w in self.seen if not w.read]:
             parts.append(f"could not read the checks of {', '.join(unread)}")
+        if conflicts := [w.target.pr_name for w in self.seen if w.conflicting]:
+            parts.append(f"GitHub reports merge conflicts on {', '.join(conflicts)}")
         return ", ".join(parts) or "no checks reported"
 
 
@@ -148,17 +153,39 @@ def linked(c: gh.Check) -> str:
     return f"[{c.name}]({c.link})" if c.link else f"`{c.name}`"
 
 
+def conflicting(target: Target, log: Callable[[str], None]) -> bool:
+    try:
+        row = gh.pr_merge_details(target.pr)
+        return (row.get("state") == "OPEN" and row.get("headRefOid") == target.sha
+                and (row.get("mergeable") == "CONFLICTING" or row.get("mergeStateStatus") == "DIRTY"))
+    except READ_ERRORS as e:
+        log(f"ci: could not read mergeability for {target.pr_name}: {util.first_line(str(e), 200)}")
+        return False
+
+
 def watch(target: Target, log: Callable[[str], None]) -> Watched:
     log(f"ci: waiting on the checks of {target.pr_name} at {target.sha[:7]}")
     checks: dict[str, gh.Check] = {}
+    observed: dict[str, gh.Check] = {}
     waiting_on: list[str] | None = None
     while True:
+        conflict = conflicting(target, log)
+        if conflict:
+            log(f"ci: stopped waiting on {target.pr_name} because GitHub reports a merge conflict with the base")
         try:
             checks = gh.commit_checks(target.github, target.sha)
+            for name, check in checks.items():
+                earlier = observed.get(name)
+                if earlier and earlier.state == "fail" and check.state != "fail":
+                    continue
+                observed[name] = check
             just_read = True
         except READ_ERRORS as e:
             just_read = False
-            log(f"ci: reading the checks of {target.pr_name} failed, trying again: {util.first_line(str(e), 200)}")
+            retry = "" if conflict else ", trying again"
+            log(f"ci: reading the checks of {target.pr_name} failed{retry}: {util.first_line(str(e), 200)}")
+        if conflict:
+            return Watched(target, observed, read=just_read, conflicting=True)
         waited = time.monotonic() - target.pushed_at
         pending = sorted(c.name for c in checks.values() if c.state == "pending")
         if checks and pending != waiting_on:

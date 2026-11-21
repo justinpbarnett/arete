@@ -467,6 +467,35 @@ def pr_draft_and_head(url: str) -> tuple[bool, str]:
 
 MERGE_WAIT_SECONDS = 120
 MERGE_POLL_SECONDS = 5
+MOVED_BASE_STATES = {"BEHIND", "DIRTY"}
+BASE_MERGE_REJECTION = r"(?:Pull Request is not mergeable|Base branch was modified\. Review and try the merge again)\.?"
+BASE_MERGE_HTTP_REJECTION = re.compile(rf"(?:^|: ){BASE_MERGE_REJECTION}\s*\(HTTP (?:405|409)\)$", re.IGNORECASE)
+
+
+class MovedBaseHold(str):
+    pass
+
+
+class BaseTipChanged(str):
+    pass
+
+
+def pr_merge_details(pr: str, repo: str = "") -> dict:
+    fields = "state,isDraft,headRefOid,baseRefName,baseRefOid,mergeStateStatus,mergeable,title"
+    args = ["pr", "view", pr, "--json", fields]
+    if repo:
+        args += ["--repo", repo]
+    return gh_json(args) or {}
+
+
+def merge_ref_hold(row: dict, head: str, base: str) -> str:
+    if row.get("state") != "OPEN" or row.get("isDraft") is not False:
+        return "the PR is not open and ready for review"
+    if row.get("headRefOid") != head:
+        return "the PR head changed after verification"
+    if row.get("baseRefName") != base:
+        return "the PR base changed after verification"
+    return ""
 
 
 def merge_ci_passed(repo: str, head: str, *, required: dict | None = None) -> bool:
@@ -496,16 +525,15 @@ def merge_readiness(repo: str, number: int, head: str, base: str, base_sha: str,
     if not head or not base or not base_sha:
         return "", "the checked head and base are not known"
     deadline = time.monotonic() + wait
-    fields = "state,isDraft,headRefOid,baseRefName,baseRefOid,mergeStateStatus,mergeable,title"
     while True:
-        row = gh_json(["pr", "view", str(number), "--repo", repo, "--json", fields]) or {}
-        if row.get("state") != "OPEN" or row.get("isDraft") is not False:
-            return "", "the PR is not open and ready for review"
-        if row.get("headRefOid") != head:
-            return "", "the PR head changed after verification"
-        if row.get("baseRefName") != base or row.get("baseRefOid") != base_sha:
-            return "", "the PR base changed after verification"
+        row = pr_merge_details(str(number), repo)
+        if hold := merge_ref_hold(row, head, base):
+            return "", hold
         state, mergeable = row.get("mergeStateStatus"), row.get("mergeable")
+        if state in MOVED_BASE_STATES:
+            return "", MovedBaseHold(f"GitHub reports merge state {state}, mergeable {mergeable}")
+        if row.get("baseRefOid") != base_sha:
+            return "", BaseTipChanged("the PR base changed after verification")
         remaining = deadline - time.monotonic()
         if "UNKNOWN" not in (state, mergeable) or remaining <= 0:
             break
@@ -517,6 +545,15 @@ def merge_readiness(repo: str, number: int, head: str, base: str, base_sha: str,
     return str(row.get("title") or "").strip(), ""
 
 
+def merge_rejection_hold(repo: str, number: int, head: str, base: str, base_sha: str) -> str:
+    row = pr_merge_details(str(number), repo)
+    if hold := merge_ref_hold(row, head, base):
+        return hold
+    if row.get("baseRefOid") and row["baseRefOid"] != base_sha:
+        return BaseTipChanged("GitHub rejected the merge after the PR base changed")
+    return ""
+
+
 def pr_merge_auto(repo: str, number: int, head: str, base: str, base_sha: str) -> str:
     subject, hold = merge_readiness(repo, number, head, base, base_sha)
     if hold:
@@ -524,9 +561,26 @@ def pr_merge_auto(repo: str, number: int, head: str, base: str, base_sha: str) -
     payload = {"sha": head, "merge_method": "squash"}
     if subject:
         payload["commit_title"] = f"{subject} (#{number})"
-    result = json.loads(gh(["api", "-X", "PUT", f"repos/{repo}/pulls/{number}/merge", "--input", "-"],
-                           input=Outgoing(json.dumps(payload)), write=True) or "{}")
-    return "" if result.get("merged") is True else "GitHub did not confirm the merge"
+    try:
+        reply = gh(["api", "-X", "PUT", f"repos/{repo}/pulls/{number}/merge", "--input", "-"],
+                   input=Outgoing(json.dumps(payload)), write=True)
+    except GhError as error:
+        if not isinstance(error, GhUnsure) and BASE_MERGE_HTTP_REJECTION.search(str(error)):
+            if hold := merge_rejection_hold(repo, number, head, base, base_sha):
+                return hold
+        raise
+    try:
+        result = json.loads(reply)
+    except ValueError:
+        raise GhUnsure("GitHub did not return a definite merge outcome") from None
+    if not isinstance(result, dict) or type(result.get("merged")) is not bool:
+        raise GhUnsure("GitHub did not return a definite merge outcome")
+    if result["merged"]:
+        return ""
+    if re.fullmatch(BASE_MERGE_REJECTION, str(result.get("message", "")).strip(), re.IGNORECASE):
+        if hold := merge_rejection_hold(repo, number, head, base, base_sha):
+            return hold
+    return "GitHub rejected the merge"
 
 
 def default_branch(repo: str) -> str:
