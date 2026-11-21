@@ -303,9 +303,10 @@ def fingerprint(p: Path, salt: str) -> str:
         for name in sorted(dirs + files):
             q = Path(root, name)
             st = q.lstat()
-            h.update(f"{q.relative_to(p.parent).as_posix()}\0{st.st_mode}\0{st.st_size}\0{st.st_mtime_ns}\n".encode())
+            entry = f"{q.relative_to(p.parent).as_posix()}\0{st.st_mode}\0{st.st_size}\0{st.st_mtime_ns}\n"
+            h.update(entry.encode(errors="surrogateescape"))
             if stat.S_ISLNK(st.st_mode):
-                h.update(os.readlink(q).encode())
+                h.update(os.readlink(q).encode(errors="surrogateescape"))
             elif stat.S_ISREG(st.st_mode):
                 with open(q, "rb") as f:
                     while chunk := f.read(1 << 20):
@@ -698,12 +699,14 @@ def uncommitted(wt: Path, *, tracked_only: bool = False) -> list[str]:
     return [r[3:] for r in util.git_records(["status", "--porcelain", "--no-renames", f"--untracked-files={untracked}"], wt)]
 
 
-def untracked_files(wt: Path) -> set[str]:
-    return set(util.git_records(["ls-files", "--others", "--exclude-standard"], wt))
+def untracked_files(wt: Path, *, preserve_path_bytes: bool = False) -> set[str]:
+    records = util.git_path_records if preserve_path_bytes else util.git_records
+    return set(records(["ls-files", "--others", "--exclude-standard"], wt))
 
 
-def ignored_file_paths(wt: Path) -> set[str]:
-    return set(util.git_records(["ls-files", "--others", "--ignored", "--exclude-standard"], wt))
+def ignored_file_paths(wt: Path, *, preserve_path_bytes: bool = False) -> set[str]:
+    records = util.git_path_records if preserve_path_bytes else util.git_records
+    return set(records(["ls-files", "--others", "--ignored", "--exclude-standard"], wt))
 
 
 def remove_untracked(wt: Path, name: str) -> None:

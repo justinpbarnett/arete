@@ -1063,7 +1063,8 @@ def selected_checks(layer: config.RepoLayer, files: list[str]) -> set[str]:
 
 
 def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: AgentRun,
-               timeout: float, *, selected: set[str] | None = None) -> tuple[bool, str]:
+               timeout: float, *, selected: set[str] | None = None,
+               defer_failed_cleanup: bool = False) -> tuple[bool, str]:
     commands = layer.checks
     if selected is not None:
         available = layer.checks | layer.targeted_commands
@@ -1076,6 +1077,7 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
     slow = [(name, command) for name, command in commands.items() if name not in layer.quick_checks]
     untracked_before = untracked_by_dir(git_dirs)
     report, ok = [], True
+    cleanup_untracked = not defer_failed_cleanup
 
     def execute(items):
         nonlocal ok
@@ -1101,9 +1103,11 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
                 report.append("Not run because cheap checks failed: " + ", ".join(name for name, _ in slow))
         if selected is not None and set(commands) != set(layer.checks):
             report.append("Targeted pass only; the full suite is still required before publication.")
+        cleanup_untracked = cleanup_untracked or ok
     finally:
-        for d, name in untracked_added_since(untracked_before):
-            workspace.remove_untracked(d, name)
+        if cleanup_untracked:
+            for d, name in untracked_added_since(untracked_before):
+                workspace.remove_untracked(d, name)
     return ok, "\n\n".join(report)
 
 
@@ -1204,7 +1208,7 @@ class Build(TicketWork):
                               disallowed_tools=routing.NO_GIT_WRITES, fresh_prompt=primed, add_dirs=call_dirs, **kw)
 
     def check(self, *, quick: bool = False, after: str = "the build and its fixes",
-              staged: Staged | None = None) -> bool:
+              staged: Staged | None = None, defer_failed_cleanup: bool = False) -> bool:
         previous, self.checked = self.checked, {}
         self.report = "Checks started but did not complete; no passing result from this attempt."
         try:
@@ -1215,7 +1219,7 @@ class Build(TicketWork):
             elif self.denied_feedback:
                 self.report = self.denied_feedback
             else:
-                return self.check_commands_on_tree(staged, quick, previous)
+                return self.check_commands_on_tree(staged, quick, previous, defer_failed_cleanup=defer_failed_cleanup)
         except BaseException as e:
             self.checked = {}
             self.report = f"Checks did not complete: {type(e).__name__}: {util.first_line(str(e), 300)}"
@@ -1226,11 +1230,13 @@ class Build(TicketWork):
             raise runlimits.Parked(f"{reason}. {self.report}")
         return False
 
-    def check_commands_on_tree(self, staged: Staged, quick: bool, previous: dict) -> bool:
+    def check_commands_on_tree(self, staged: Staged, quick: bool, previous: dict, *,
+                               defer_failed_cleanup: bool = False) -> bool:
         selected = selected_checks(self.layer, staged.files) if quick else None
         full = selected is None or selected == set(self.layer.checks)
         before = factory.fingerprint(self.ws)
-        ok, self.report = run_checks(self.layer, self.ws, self.git_dirs, self.run, self.timeout, selected=selected)
+        ok, self.report = run_checks(self.layer, self.ws, self.git_dirs, self.run, self.timeout, selected=selected,
+                                     defer_failed_cleanup=defer_failed_cleanup)
         if ok:
             after = factory.fingerprint(self.ws)
             if before and after and before != after:
@@ -2643,10 +2649,9 @@ def catch_up_existing_paths(wt: Path) -> tuple[set[Path], set[Path]]:
 
 
 def log_catch_up_failure(run: AgentRun, action: str, error: BaseException) -> None:
-    reason = util.first_line(str(error), 300) or type(error).__name__
-    line = public_text(run, f"automerge: catch-up {action}: {reason}")
-    with suppress(OSError, UnicodeError):
-        run.log(line.encode("ascii", "backslashreplace").decode("ascii"))
+    with suppress(Exception):
+        reason = util.first_line(str(error), 300) or type(error).__name__
+        run.log(public_text(run, f"automerge: catch-up {action}: {reason}"))
 
 
 def catch_up_spelling_index(paths: set[Path]) -> dict[Path, list[Path]]:
@@ -2678,19 +2683,34 @@ def catch_up_path_alias(root: int, path: Path, spellings: dict[Path, list[Path]]
 
 
 def remove_catch_up_paths(run: AgentRun, wt: Path, after: set[str], existing: set[Path],
-                          unreadable: set[Path]) -> None:
+                          unreadable: set[Path]) -> bool:
     existing_spellings = catch_up_spelling_index(existing)
     unreadable_spellings = catch_up_spelling_index(unreadable)
+    removed_all = True
+    parents = set()
+    pending = sorted(after, reverse=True)
     with local_paths.directory_fd(wt) as root:
-        for name in sorted(after):
+        while pending:
+            name = pending.pop()
             path = Path(name)
-            if path in existing or not unreadable.isdisjoint(path.parents):
+            inspect_contents = name.endswith("/") and path.name.casefold() != ".git"
+            if path in existing and not inspect_contents:
                 continue
             try:
                 if not path.parts or path.is_absolute() or ".." in path.parts:
                     raise PermissionError("path is not inside the worktree")
-                if catch_up_path_alias(root, path, existing_spellings) or (unreadable_spellings and any(
-                        catch_up_path_alias(root, parent, unreadable_spellings) for parent in path.parents)):
+                existed = path in existing or catch_up_path_alias(root, path, existing_spellings)
+                if existed and not inspect_contents:
+                    continue
+                path_and_parents = (path, *path.parents)
+                if not unreadable.isdisjoint(path_and_parents) or (unreadable_spellings and any(
+                        catch_up_path_alias(root, prior, unreadable_spellings) for prior in path_and_parents)):
+                    raise PermissionError("could not determine if the path existed before the catch-up")
+                if existed:
+                    with local_paths.directory_fd(path, root) as directory, os.scandir(directory) as entries:
+                        for entry in sorted(entries, key=lambda e: e.name, reverse=True):
+                            child = (path / entry.name).as_posix()
+                            pending.append(child + "/" if entry.is_dir(follow_symlinks=False) else child)
                     continue
                 with local_paths.directory_fd(path.parent, root) as parent:
                     mode = os.stat(path.name, dir_fd=parent, follow_symlinks=False).st_mode
@@ -2698,10 +2718,27 @@ def remove_catch_up_paths(run: AgentRun, wt: Path, after: set[str], existing: se
                         shutil.rmtree(path.name, dir_fd=parent)
                     else:
                         os.unlink(path.name, dir_fd=parent)
+                parents.update(p for p in path.parents if p.parts and p not in existing)
             except FileNotFoundError:
                 continue
             except Exception as failed:
+                removed_all = False
                 log_catch_up_failure(run, f"cleanup could not remove {name!r}", failed)
+        for path in sorted(parents, key=lambda p: (-len(p.parts), p)):
+            try:
+                if catch_up_path_alias(root, path, existing_spellings):
+                    continue
+                with local_paths.directory_fd(path, root) as directory:
+                    if os.listdir(directory):
+                        continue
+                with local_paths.directory_fd(path.parent, root) as parent:
+                    os.rmdir(path.name, dir_fd=parent)
+            except FileNotFoundError:
+                continue
+            except Exception as failed:
+                removed_all = False
+                log_catch_up_failure(run, f"cleanup could not remove {str(path)!r}", failed)
+    return removed_all
 
 
 def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
@@ -2727,7 +2764,7 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
         if workspace.uncommitted(c.wt):
             raise workspace.RunFailed("the worktree has uncommitted files after merging the moved base")
         b.require_valid_diff("catching up the moved base", from_base=True)
-        if not b.check(staged=b.staged):
+        if not b.check(staged=b.staged, defer_failed_cleanup=True):
             raise CatchUpGateHold("checks", "the layer's local checks failed", head, b.report)
         if not b.layer.verify:
             raise CatchUpGateHold("verify", "the layer has no behavioral verification configured", head, b.report)
@@ -2748,22 +2785,25 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
         if isinstance(error, CatchUpPathCollision):
             existing.add(Path(error.name))
             run.catch_up_preserved.add(c.prefix + error.name)
+        tracked_restored = paths_restored = False
         try:
             abort_merge(c.wt)
             restore_head = gate_hold.head if gate_hold else before.lease
             if (git(["rev-parse", "HEAD"], c.wt).strip() != restore_head
                     or workspace.uncommitted(c.wt, tracked_only=True)):
                 git(["reset", "--hard", restore_head], c.wt)
-            if gate_hold:
-                gate_hold.candidate_restored = True
+            tracked_restored = True
         except Exception as failed:
             log_catch_up_failure(run, "cleanup could not restore the worktree head", failed)
         try:
-            after = workspace.untracked_files(c.wt) | workspace.ignored_file_paths(c.wt)
-            remove_catch_up_paths(run, wt, after, existing, unreadable)
+            after = (workspace.untracked_files(c.wt, preserve_path_bytes=True)
+                     | workspace.ignored_file_paths(c.wt, preserve_path_bytes=True))
+            paths_restored = remove_catch_up_paths(run, wt, after, existing, unreadable)
         except Exception as failed:
             log_catch_up_failure(run, f"cleanup could not clean {str(wt)!r}", failed)
-        if not gate_hold:
+        if gate_hold:
+            gate_hold.candidate_restored = tracked_restored and paths_restored
+        else:
             c.__dict__.update(vars(before))
             b.checked, b.report, b.staged = checked, report, staged
         if isinstance(error, owner_asks.Asked):

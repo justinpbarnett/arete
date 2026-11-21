@@ -1,4 +1,5 @@
 import ast
+import errno
 import http.client
 import json
 import os
@@ -18,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import asdict, replace
 from datetime import timedelta
-from io import BytesIO, StringIO, TextIOWrapper
+from io import StringIO
 from pathlib import Path
 from socket import socketpair
 from tempfile import TemporaryDirectory
@@ -1500,19 +1501,22 @@ class CatchUpCleanupTests(unittest.TestCase):
         self.scratch = self.wt / ".arete-sandbox/tmp"
         self.scratch.mkdir(parents=True)
         self.prior = Review("approve", trees={"": "tree"})
-        self.checkout = workspace.Checkout("", "fixture", self.wt, self.wt, "main", lease="published")
+        self.checkout = workspace.Checkout("", "fixture", self.wt, self.wt, "main", lease="published",
+                                           pr="https://github.com/fixture/repo/pull/7")
         self.logs = []
-        run = SimpleNamespace(log=self.logs.append, repo=config.Repo("fixture", self.wt), owner_questions_blocked=False)
+        run = SimpleNamespace(log=self.logs.append, repo=config.Repo("fixture", self.wt), owner_questions_blocked=False,
+                              tid="7", facts={}, feedback=[], repairs="")
         self.build = SimpleNamespace(run=run, checked={}, report="", staged=None, build_summary="",
-                                     layer=config.RepoLayer(root, verify=config.Verify()), ticket=None,
+                                     layer=config.RepoLayer(root, verify=config.Verify(), trust_level="automerge"),
+                                     ticket=tracker.Ticket("7", "#7", "Edit fixture"), catch_ups=0,
                                      require_valid_diff=mock.Mock(), check=mock.Mock())
         self.failure = workspace.RunFailed("verification stopped before review")
         self.git = self.enterContext(mock.patch.object(pipeline, "git", side_effect=["published", "tree", "published"]))
         self.uncommitted = self.enterContext(mock.patch.object(workspace, "uncommitted", wraps=workspace.uncommitted,
                                                               return_value=[]))
         self.abort = self.enterContext(mock.patch.object(pipeline, "abort_merge"))
-        self.merge_bases = self.enterContext(mock.patch.object(pipeline, "merge_moved_bases", side_effect=self.merge))
-        self.enterContext(mock.patch.object(pipeline, "check_in_use", side_effect=self.failure))
+        self.enterContext(mock.patch.object(pipeline, "merge_moved_bases", side_effect=self.merge))
+        self.verify = self.enterContext(mock.patch.object(pipeline, "check_in_use", side_effect=self.failure))
         self.push = self.enterContext(mock.patch.object(pipeline, "push_caught_up_head"))
 
     def merge(self, *_args, **_kwargs):
@@ -1528,12 +1532,45 @@ class CatchUpCleanupTests(unittest.TestCase):
         self.assertFalse(self.build.run.owner_questions_blocked)
         self.push.assert_not_called()
 
+    def hold_after_checks(self, reason):
+        checkout, b = self.checkout, self.build
+        controller = orchestration.Controller.__new__(orchestration.Controller)
+        controller.run, controller.data = b.run, {}
+        controller.catalog = mock.Mock(context={})
+        controller.take_merge_lease = mock.Mock()
+        controller.hold_catch_up = mock.Mock(return_value={"failures": "catch-up"})
+        controller.job = SimpleNamespace(b=b, checkouts=[checkout], approval=None, draft_why="", ticket=b.ticket,
+                                         build_summary="", branch="fixture", slot=None, goal="", plan_text="",
+                                         with_left=str, verified=verify.Verified("pass"), review=self.prior)
+        with (mock.patch.object(pipeline, "try_automerge", return_value=gh.MovedBaseHold("base moved")),
+              mock.patch.object(pipeline, "catch_up_target", return_value=("new-base", "")),
+              mock.patch.object(gh, "pr_comment") as comment):
+            self.assertIsNone(controller.automerge([checkout]))
+
+        hold = f"could not catch up to `main` at `new-base`: {reason}"
+        self.assertEqual(b.run.facts["merge_held"], hold)
+        comment.assert_called_once_with(checkout.pr, f"Automerge stays off for this PR: {hold}. A person merges it.")
+        controller.hold_catch_up.assert_not_called()
+        self.assertFalse(b.run.owner_questions_blocked)
+        self.push.assert_not_called()
+
+    def require_directory_removal(self):
+        probe = self.wt.parent / "removable-directory"
+        probe.mkdir()
+        try:
+            probe.rmdir()
+        except PermissionError as error:
+            self.skipTest(f"scratch directory removal is unavailable: {error}")
+
     def test_removes_new_embedded_repository_and_preserves_existing_paths(self):
-        util.git(["init", "-q", "--template="], self.wt)
-        (self.wt / ".gitignore").write_text(".arete-sandbox/\n")
-        embedded = self.scratch / "embedded\rrepo"
+        self.require_directory_removal()
+        subprocess.run(["git", "init", "-q", "--template="], cwd=self.wt, check=True)
+        (self.wt / ".git/info").mkdir(exist_ok=True)
+        (self.wt / ".git/info/exclude").write_text(".arete-sandbox/\n")
+        embedded = self.scratch / "embedded"
         existing = self.scratch / "existing"
         existing.mkdir()
+        subprocess.run(["git", "init", "-q", "--template="], cwd=existing, check=True)
         outside = self.wt.parent / "outside"
         outside.mkdir()
         sentinel = outside / "keep"
@@ -1541,24 +1578,50 @@ class CatchUpCleanupTests(unittest.TestCase):
         link = self.scratch / "link"
 
         def check(**_):
-            util.git(["init", "-q", "--template=", str(embedded)], self.wt)
-            util.git(["init", "-q", "--template=", str(existing)], self.wt)
+            embedded.mkdir()
+            subprocess.run(["git", "init", "-q", "--template="], cwd=embedded, check=True)
             (embedded / "external").symlink_to(outside, target_is_directory=True)
             link.symlink_to(outside, target_is_directory=True)
             return True
 
-        self.fail_after_checks(check)
+        self.build.check.side_effect = check
+        self.hold_after_checks(self.failure.why)
         self.assertFalse(embedded.exists(), self.logs)
         self.assertFalse(link.is_symlink())
-        self.assertTrue(existing.is_dir())
+        self.assertTrue((existing / ".git/HEAD").is_file())
         self.assertEqual(sentinel.read_text(), "keep\n")
-        self.assertEqual(self.logs, ["automerge: catch-up failed: verification stopped before review"])
+        self.assertEqual(len(self.logs), 2)
+        self.assertEqual(self.logs[0], "automerge: catch-up failed: verification stopped before review")
+
+    def test_success_reaches_push_without_cleanup(self):
+        verified = verify.Verified("pass")
+        review = Review("approve")
+        self.verify.side_effect = None
+        self.verify.return_value = verified
+        self.build.check.return_value = True
+        self.build.next_step = mock.Mock(return_value="review")
+        self.git.side_effect = ["published", "tree", "candidate"]
+        before_push = mock.Mock()
+        with (mock.patch.object(pipeline, "_review", return_value=review),
+              mock.patch.object(pipeline, "merge_evidence_problem", return_value=None),
+              mock.patch.object(gh, "pr_merge_details", return_value={}),
+              mock.patch.object(gh, "merge_ref_hold", return_value=""),
+              mock.patch.object(pipeline, "remove_catch_up_paths") as cleanup):
+            result = pipeline.catch_up_base(self.build, self.checkout, "fixture", "base", "", "", self.prior,
+                                            before_push=before_push)
+
+        self.assertEqual(result, (verified, review))
+        before_push.assert_called_once_with("candidate", verified, review)
+        self.push.assert_called_once_with(self.build, self.checkout, "fixture", "candidate")
+        self.abort.assert_not_called()
+        cleanup.assert_not_called()
+        self.assertFalse(self.build.run.owner_questions_blocked)
 
     def test_preserves_existing_paths_when_git_reports_a_different_spelling(self):
         existing = self.scratch / "cafe\u0301.txt"
         existing.write_text("original\n")
         embedded = self.scratch / "re\u0301po"
-        util.git(["init", "-q", "--template=", str(embedded)], self.wt)
+        embedded.mkdir()
         sentinel = embedded / "keep"
         sentinel.write_text("original\n")
         normalized = self.scratch / "caf\u00e9.txt"
@@ -1593,16 +1656,16 @@ class CatchUpCleanupTests(unittest.TestCase):
         self.assertEqual(self.logs, ["automerge: catch-up failed: verification stopped before review"])
 
     def test_removal_failure_logs_path_after_original_error_and_continues(self):
-        blocked = self.scratch / "répo"
+        blocked = self.scratch / "repo"
         removable = self.scratch / "z-removable"
-        blocked_name = ".arete-sandbox/tmp/répo/"
+        blocked_name = ".arete-sandbox/tmp/repo/"
         self.enterContext(mock.patch.object(workspace, "untracked_files", return_value=set()))
         self.enterContext(mock.patch.object(workspace, "ignored_file_paths",
                                             return_value={blocked_name, ".arete-sandbox/tmp/z-removable"}))
         repo = self.build.run.repo
         run = pipeline.Run("fixture", repo, self.wt.parent, tracker=tracker.GitHubTracker(repo), tid="7")
         self.build.run = run
-        output = BytesIO()
+        output = StringIO()
         original = "automerge: catch-up failed: verification stopped before review"
 
         def check(**_):
@@ -1611,20 +1674,23 @@ class CatchUpCleanupTests(unittest.TestCase):
             return True
 
         def refuse_removal(*_args, **_kwargs):
-            self.assertTrue(output.getvalue().decode("ascii").endswith(original + "\n"))
+            self.assertTrue(output.getvalue().endswith(original + "\n"))
             raise PermissionError("fixture removal denied")
 
-        with (TextIOWrapper(output, encoding="ascii", errors="strict") as stdout, redirect_stdout(stdout),
+        self.build.check.side_effect = check
+        with (redirect_stdout(output),
               mock.patch.object(pipeline.shutil, "rmtree", side_effect=refuse_removal)):
-            self.fail_after_checks(check)
-            logged = output.getvalue().decode("ascii")
+            self.hold_after_checks(self.failure.why)
+        logged = output.getvalue()
         self.assertTrue(blocked.is_dir())
         self.assertFalse(removable.exists())
         self.assertEqual((run.dir / "run.log").read_text(), logged)
-        self.assertEqual([line.split("] ", 1)[1] for line in logged.splitlines()], [
+        messages = [line.split("] ", 1)[1] for line in logged.splitlines()]
+        self.assertEqual(messages[:2], [
             original,
-            f"automerge: catch-up cleanup could not remove {ascii(blocked_name)}: fixture removal denied",
+            f"automerge: catch-up cleanup could not remove {blocked_name!r}: fixture removal denied",
         ])
+        self.assertEqual(len(messages), 3)
 
     def test_stop_during_tracked_rollback_propagates(self):
         stop = pipeline.Stopped("operator stopped the run")
@@ -1651,61 +1717,215 @@ class CatchUpCleanupTests(unittest.TestCase):
         self.push.assert_not_called()
 
     def test_reset_failure_reports_check_hold_without_repair_handoff(self):
-        PublicationFixture.create_repository(self.wt)
         tracked = self.wt / "file.txt"
-        checkout, b = self.checkout, self.build
-        checkout.lease = util.git(["rev-parse", "HEAD"], self.wt).strip()
-        checkout.pr = "https://github.com/fixture/repo/pull/7"
-        self.prior.trees = {"": util.git(["rev-parse", "HEAD^{tree}"], self.wt).strip()}
-        b.catch_ups = 0
-        b.ticket = tracker.Ticket("7", "#7", "Edit fixture")
-        b.layer.trust_level = "automerge"
-        b.run.tid, b.run.facts, b.run.feedback, b.run.repairs = "7", {}, [], ""
-
-        def merge(*_args, **_kwargs):
-            util.git([*util.ARETE_IDENTITY, "-c", "commit.gpgSign=false", "commit", "-qm", "candidate", "--allow-empty"],
-                     self.wt)
-            checkout.merge = util.git(["rev-parse", "HEAD"], self.wt).strip()
-            return [checkout]
+        tracked.write_text("published content\n")
 
         def fail_check(**_):
             tracked.write_text("check left tracked changes\n")
             return False
 
-        def deny_reset(args, cwd):
-            if args[0] == "reset":
-                self.assertEqual(args, ["reset", "--hard", checkout.merge])
-                raise RuntimeError("git reset --hard: fixture reset denied")
-            return util.git(args, cwd)
+        self.git.side_effect = ["published", "tree", "candidate", RuntimeError("git reset --hard: fixture reset denied")]
+        self.uncommitted.side_effect = [[], [], ["file.txt"]]
+        self.build.check.side_effect = fail_check
+        with (mock.patch.object(workspace, "untracked_files", return_value=set()),
+              mock.patch.object(workspace, "ignored_file_paths", return_value=set())):
+            self.hold_after_checks("the layer's local checks failed")
 
-        self.merge_bases.side_effect = merge
-        b.check.side_effect = fail_check
-        self.git.side_effect = deny_reset
-        self.uncommitted.return_value = mock.DEFAULT
-        controller = orchestration.Controller.__new__(orchestration.Controller)
-        controller.run, controller.data = b.run, {}
-        controller.catalog = mock.Mock(context={})
-        controller.take_merge_lease = mock.Mock()
-        controller.job = SimpleNamespace(b=b, checkouts=[checkout], approval=None, draft_why="", ticket=b.ticket,
-                                         build_summary="", branch="fixture", slot=None, goal="", plan_text="",
-                                         with_left=str, verified=verify.Verified("pass"), review=self.prior)
-        with (mock.patch.object(pipeline, "try_automerge", return_value=gh.MovedBaseHold("base moved")),
-              mock.patch.object(pipeline, "catch_up_target", return_value=("new-base", "")),
-              mock.patch.object(gh, "pr_comment") as comment):
-            self.assertIsNone(controller.automerge([checkout]))
-
-        self.git.assert_any_call(["reset", "--hard", checkout.merge], self.wt)
+        self.git.assert_called_with(["reset", "--hard", "candidate"], self.wt)
         self.assertEqual(tracked.read_text(), "check left tracked changes\n")
-        hold = "could not catch up to `main` at `new-base`: the layer's local checks failed"
-        self.assertEqual(b.run.facts["merge_held"], hold)
-        comment.assert_called_once_with(checkout.pr, f"Automerge stays off for this PR: {hold}. A person merges it.")
-        self.assertNotIn("catch_up_hold", controller.data)
-        controller.catalog.add_context.assert_not_called()
         self.assertEqual(self.logs[:2], [
             "automerge: catch-up failed: the layer's local checks failed",
             "automerge: catch-up cleanup could not restore the worktree head: git reset --hard: fixture reset denied",
         ])
+
+    def use_checks(self, command):
+        subprocess.run(["git", "init", "-q", "--template="], cwd=self.wt, check=True)
+        cfg, repo = config.Config(), self.build.run.repo
+        run = pipeline.Run("", repo, self.wt.parent, cfg=cfg, tracker=tracker.GitHubTracker(repo), tid="7")
+        layer = replace(self.build.layer, checks={"fixture": command})
+        self.build = pipeline.Build(cfg=cfg, run=run, ticket=self.build.ticket, ws=self.wt,
+                                    checkouts=[self.checkout], layer=layer, timeout=5, workspace="fixture",
+                                    tools=[], deny=[])
+        self.build.require_valid_diff = mock.Mock()
+        self.git.side_effect = ["published", "tree", "candidate", ""]
+        self.enterContext(mock.patch.object(pipeline, "check_lane", return_value=nullcontext()))
+        self.enterContext(mock.patch.object(pipeline.factory, "fingerprint", return_value="tree"))
+        return run
+
+    def deny_removal(self, operation, name):
+        remove = getattr(os, operation)
+
+        def refuse(path, *, dir_fd=None):
+            if Path(path) == self.wt / name or (dir_fd is not None and path == name):
+                raise PermissionError("fixture removal denied")
+            return remove(path, dir_fd=dir_fd)
+
+        return mock.patch.object(os, operation, side_effect=refuse)
+
+    def test_untracked_removal_failure_reports_check_hold_without_repair_handoff(self):
+        run = self.use_checks("printf 'left by failed check' > stray\nexit 17")
+        with redirect_stdout(StringIO()), self.deny_removal("unlink", "stray"):
+            self.hold_after_checks("the layer's local checks failed")
+
+        self.verify.assert_not_called()
+        self.assertEqual((self.wt / "stray").read_text(), "left by failed check")
+        self.assertIn("exit 17", (run.dir / "checks.md").read_text())
+        messages = [line.split("] ", 1)[1] for line in (run.dir / "run.log").read_text().splitlines()]
+        self.assertEqual(messages[:3], [
+            "check fixture: FAIL (exit 17)",
+            "automerge: catch-up failed: the layer's local checks failed",
+            "automerge: catch-up cleanup could not remove 'stray': fixture removal denied",
+        ])
+        self.assertEqual(len(messages), 4)
+
+    def test_interrupted_check_keeps_stop_when_unlink_fails(self):
+        run = self.use_checks("printf 'left by interrupted check' > stray")
+        stop = pipeline.Stopped("operator stopped the run")
+        shell = pipeline.environment.sh
+
+        def interrupt(*args, **kwargs):
+            self.assertEqual(shell(*args, **kwargs).returncode, 0)
+            raise stop
+
+        with (redirect_stdout(StringIO()), self.deny_removal("unlink", "stray"),
+              mock.patch.object(pipeline.environment, "sh", side_effect=interrupt),
+              self.assertRaises(pipeline.Stopped) as caught):
+            pipeline.catch_up_base(self.build, self.checkout, "fixture", "base", "", "", self.prior)
+
+        self.assertIs(caught.exception, stop)
+        self.assertEqual((self.wt / "stray").read_text(), "left by interrupted check")
+        self.assertFalse(run.owner_questions_blocked)
+        self.verify.assert_not_called()
         self.push.assert_not_called()
+        messages = [line.split("] ", 1)[1] for line in (run.dir / "run.log").read_text().splitlines()]
+        self.assertEqual(messages, [
+            "automerge: catch-up failed: operator stopped the run",
+            "automerge: catch-up cleanup could not remove 'stray': fixture removal denied",
+        ])
+
+    def test_failing_check_prunes_new_empty_parents(self):
+        self.require_directory_removal()
+        existing = self.wt / "existing"
+        existing.mkdir()
+        self.use_checks("mkdir -p scratchdir/nested existing/new\n"
+                        "touch scratchdir/nested/log existing/new/log existing/log\nexit 17")
+        with redirect_stdout(StringIO()), self.assertRaises(pipeline.CatchUpGateHold) as caught:
+            pipeline.catch_up_base(self.build, self.checkout, "fixture", "base", "", "", self.prior)
+
+        self.assertTrue(caught.exception.candidate_restored)
+        self.assertFalse((self.wt / "scratchdir").exists())
+        self.assertEqual(list(existing.iterdir()), [])
+
+    def test_failing_check_removes_embedded_repo_from_existing_directory(self):
+        self.require_directory_removal()
+        existing = self.wt / "existing"
+        existing.mkdir()
+        kept = existing / "kept"
+        kept.write_text("keep me")
+        run = self.use_checks("git init -q --template= existing && touch existing/stray || exit 1\nexit 17")
+        with redirect_stdout(StringIO()), self.assertRaises(pipeline.CatchUpGateHold) as caught:
+            pipeline.catch_up_base(self.build, self.checkout, "fixture", "base", "", "", self.prior)
+
+        self.assertTrue(caught.exception.candidate_restored)
+        self.assertIn("check fixture: FAIL (exit 17)", (run.dir / "run.log").read_text())
+        self.assertEqual(list(existing.iterdir()), [kept])
+        self.assertEqual(kept.read_text(), "keep me")
+
+    def test_embedded_repo_removal_failure_holds_without_repair_handoff(self):
+        existing = self.wt / "existing"
+        existing.mkdir()
+        run = self.use_checks("git init -q --template= existing || exit 1\nexit 17")
+        with (redirect_stdout(StringIO()), mock.patch.object(pipeline.shutil, "rmtree",
+                                                            side_effect=PermissionError("fixture removal denied"))):
+            self.hold_after_checks("the layer's local checks failed")
+
+        self.assertTrue((existing / ".git").is_dir())
+        logged = (run.dir / "run.log").read_text()
+        self.assertIn("check fixture: FAIL (exit 17)", logged)
+        self.assertIn("automerge: catch-up cleanup could not remove 'existing/.git/': fixture removal denied", logged)
+
+    def test_parent_removal_failure_reports_check_hold_without_repair_handoff(self):
+        run = self.use_checks("mkdir scratchdir\ntouch scratchdir/log\nexit 17")
+        with redirect_stdout(StringIO()), self.deny_removal("rmdir", "scratchdir"):
+            self.hold_after_checks("the layer's local checks failed")
+
+        self.assertEqual(list((self.wt / "scratchdir").iterdir()), [])
+        self.assertIn("automerge: catch-up cleanup could not remove 'scratchdir': fixture removal denied",
+                      (run.dir / "run.log").read_text())
+
+    def test_rollback_decodes_raw_git_record_before_removing_path(self):
+        stray = self.wt / "stray"
+        raw_name = b"stray\xff"
+        stat, unlink = os.stat, os.unlink
+        results = [subprocess.CompletedProcess([], 0, output, b"") for output in (raw_name + b"\0", b"")]
+        self.git.side_effect = ["published", "tree", "candidate"]
+        self.build.check.side_effect = lambda **_: stray.touch() or False
+
+        def stat_raw(path, *args, **kwargs):
+            return stat(stray.name if path == os.fsdecode(raw_name) else path, *args, **kwargs)
+
+        def unlink_raw(path, *, dir_fd):
+            self.assertEqual(os.fsencode(path), raw_name)
+            unlink(stray.name, dir_fd=dir_fd)
+
+        with (mock.patch.object(util, "_sh", side_effect=results) as git_shell,
+              mock.patch.object(os, "stat", side_effect=stat_raw), mock.patch.object(os, "unlink", side_effect=unlink_raw),
+              self.assertRaises(pipeline.CatchUpGateHold) as caught):
+            pipeline.catch_up_base(self.build, self.checkout, "fixture", "base", "", "", self.prior)
+
+        self.assertTrue(caught.exception.candidate_restored)
+        self.assertFalse(stray.exists())
+        git_shell.assert_has_calls([
+            mock.call(["git", "ls-files", "-z", "--others", "--exclude-standard"],
+                      cwd=self.wt, timeout=mock.ANY, binary=True),
+            mock.call(["git", "ls-files", "-z", "--others", "--ignored", "--exclude-standard"],
+                      cwd=self.wt, timeout=mock.ANY, binary=True),
+        ])
+
+    def test_note_made_handles_non_utf8_git_record(self):
+        ignored = self.wt / "ignored"
+        ignored.mkdir()
+        raw_path = os.fsencode(ignored) + b"/stray\xff"
+        try:
+            with open(raw_path, "xb") as f:
+                f.write(b"left by a run")
+        except OSError as error:
+            if error.errno not in (errno.EILSEQ, errno.EPERM):
+                raise
+            self.skipTest(f"scratch filesystem rejected a non-UTF-8 filename: {error}")
+
+        PublicationFixture.create_repository(self.wt)
+        (self.wt / ".git/info").mkdir(exist_ok=True)
+        (self.wt / ".git/info/exclude").write_text("ignored/\n")
+        args = ["ls-files", "--others", "--ignored", "--exclude-standard"]
+        self.assertEqual(util.git_bytes([args[0], "-z", *args[1:]], self.wt), b"ignored/stray\xff\0")
+        self.assertEqual(util.git_records(args, self.wt), ["ignored/stray\ufffd"])
+        self.assertEqual(workspace.ignored_files(self.wt), ["ignored/"])
+        self.uncommitted.return_value = mock.DEFAULT
+        with mock.patch.object(paths, "STATE_DIR", self.wt.parent):
+            workspace.note_made(self.wt, [self.checkout])
+            made = workspace.made_before(self.wt)
+
+        salt = workspace.salt_of(made)
+        self.assertEqual(made["ignored/"], workspace.fingerprint(ignored, salt))
+        with open(raw_path, "ab") as f:
+            f.write(b" changed")
+        self.assertNotEqual(made["ignored/"], workspace.fingerprint(ignored, salt))
+
+        new_path = os.fsencode(ignored) + b"/new\xff"
+
+        def fail_check(**_):
+            with open(new_path, "xb") as f:
+                f.write(b"left by a failed check")
+            return False
+
+        self.git.side_effect = ["published", "tree", "candidate"]
+        self.build.check.side_effect = fail_check
+        with self.assertRaises(pipeline.CatchUpGateHold) as caught:
+            pipeline.catch_up_base(self.build, self.checkout, "fixture", "base", "", "", self.prior)
+        self.assertTrue(caught.exception.candidate_restored)
+        self.assertFalse(os.path.lexists(new_path))
+        self.assertTrue(os.path.lexists(raw_path))
 
 
 class CatchUpReviewTests(CatchUpRepairFixture):
@@ -3013,11 +3233,12 @@ class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
         checkout.wt = controller.job.ws = root / "checkout"
         ignored = checkout.wt / "ignored"
         ignored.mkdir(parents=True)
-        (checkout.wt / ".git").touch()
+        subprocess.run(["git", "init", "-q", "--template="], cwd=checkout.wt, check=True)
+        (checkout.wt / ".git/info").mkdir(exist_ok=True)
+        (checkout.wt / ".git/info/exclude").write_text("ignored/\n")
         existing, created = ignored / "kept", ignored / "resolver"
         existing_untracked, untracked = checkout.wt / "kept", checkout.wt / "resolver"
-        for path in (existing, created, existing_untracked, untracked, checkout.wt / ".git",
-                     root / "workspaces" / "checkout.json"):
+        for path in (existing, created, existing_untracked, untracked, root / "workspaces" / "checkout.json"):
             self.addCleanup(path.unlink, missing_ok=True)
         existing.write_bytes(b"keep me")
         existing_untracked.write_bytes(b"keep me too")
@@ -3030,15 +3251,6 @@ class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
             untracked.write_text("remove me too")
             raise owner_asks.Asked([], [], "publish", "resolve", NO_SESSION)
 
-        def git_records(args, wt):
-            files = (existing, created) if "--ignored" in args else (existing_untracked, untracked)
-            names = [str(path.relative_to(wt)) for path in files if path.exists()]
-            if args[0] == "ls-files":
-                return names
-            if "--ignored=matching" in args:
-                return ["!! ignored/"]
-            return [f"?? {name}" for name in names] if "--untracked-files=all" in args else []
-
         with (mock.patch.object(gh, "pr_merge_details", return_value=refs), mock.patch.object(gh, "pr_comment"),
               mock.patch.object(pipeline, "fetch_merge_base", return_value="moved-base"),
               mock.patch.object(pipeline, "merge_hold", return_value=gh.MovedBaseHold("base moved")),
@@ -3046,7 +3258,6 @@ class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
               mock.patch.object(pipeline, "git", side_effect=lambda args, *_: (
                   "head-tree" if args == ["rev-parse", "head^{tree}"] else "head")),
               mock.patch.object(workspace, "git", return_value="head"),
-              mock.patch.object(util, "git_records", side_effect=git_records),
               mock.patch.object(util, "repo_lock", return_value=nullcontext()),
               mock.patch.object(pipeline, "merge_moved_bases", side_effect=resolve),
               mock.patch.object(pipeline, "abort_merge") as abort,

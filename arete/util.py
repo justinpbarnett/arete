@@ -248,12 +248,9 @@ def git(args: list[str], cwd: Path, timeout: float = 300, check: bool = True, in
     return res.stdout
 
 
-def git_bytes(args: list[str], cwd: Path, timeout: float = 300, *, check: bool = True) -> bytes:
+def git_bytes(args: list[str], cwd: Path, timeout: float = 300) -> bytes:
     res = _sh(["git", *args], cwd=cwd, timeout=timeout, binary=True)
-    if check:
-        _check_git(args, res)
-    if isinstance(res.stdout, str):
-        return os.fsencode(res.stdout)
+    _check_git(args, res)
     return res.stdout
 
 
@@ -464,7 +461,11 @@ def git_as_owner(args: list[str], cwd: Path, **kw) -> str:
 
 
 def git_records(args: list[str], cwd: Path, **kw) -> list[str]:
-    return [os.fsdecode(r) for r in git_bytes([args[0], "-z", *args[1:]], cwd, **kw).split(b"\0") if r]
+    return [r for r in git([args[0], "-z", *args[1:]], cwd, **kw).split("\0") if r]
+
+
+def git_path_records(args: list[str], cwd: Path) -> list[str]:
+    return [os.fsdecode(r) for r in git_bytes([args[0], "-z", *args[1:]], cwd).split(b"\0") if r]
 
 
 def origin_default_branch(src: Path) -> str:
