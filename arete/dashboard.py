@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import sys
 import threading
@@ -262,17 +261,6 @@ class Handler(BaseHTTPRequestHandler):
         except contract.Problem as error:
             self.send_error(error.status, str(error), problem_code=error.code)
             return False
-        if verify_faults.is_control(self.api_path):
-            if (self.command == "HEAD" and self.api_path == verify_faults.FAULT and self.verify_controls is not None
-                    and (proof := self.verify_controls.prove(self.headers))):
-                self.head(404, "application/json", "no-store", 0)
-                self.send_header(verify_faults.PROOF_HEADER, proof)
-                self.end_headers()
-                return False
-            if ((self.command, self.api_path) not in verify_faults.ROUTES or self.verify_controls is None
-                    or not self.verify_controls.allows(self.headers)):
-                self.send_error(404)
-                return False
         if self.command not in ("GET", "POST") and canonical_methods(self.api_path):
             self.answer(self.command)
             return False
@@ -296,12 +284,6 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         self.answer("GET")
 
-    def do_DELETE(self) -> None:
-        if self.api_path == verify_faults.CLEAR:
-            self.answer("DELETE")
-        else:
-            self.send_error(501)
-
     def do_POST(self) -> None:
         entered = POSTS_IN_FLIGHT.enter()
         self.restarting = not entered
@@ -318,8 +300,6 @@ class Handler(BaseHTTPRequestHandler):
         route = (self.alias or (self.operation[0] if self.operation else {})).get("path")
         self.route = route or ("/api/v1/principals/{id}" if path.startswith("/api/v1/principals/") else
                                path if path in ("/api/v1/events", "/api/v1/principals") else "unmatched")
-        if verify_faults.is_control(path):
-            self.route = path
         with principals.acting("hand"), event_store.request_scope(f"{method} {self.route}"):
             self.write_receipt = None
             self.keyed_delivery = False
@@ -342,13 +322,10 @@ class Handler(BaseHTTPRequestHandler):
                 got = webhooks.receive(unquote(path[len(webhooks.HOOK_PATH):]), self.headers, self.hook_body())
                 return self.send_json(202 if got["queued"] else 200, got)
             self.validate_transport(method, path)
-            if self.verify_controls is not None:
-                if verify_faults.is_control(path):
-                    return self.answer_verify(path)
-                if fault := self.verify_controls.take(path, parts.query):
-                    kind = "application/problem+json" if canonical_path(path) and fault.status >= 400 else "application/json"
-                    body = b"" if fault.status in (204, 205, 304) else fault.body
-                    return self.send(fault.status, body, kind, "no-store")
+            if self.verify_controls is not None and (fault := self.verify_controls.poll(path, parts.query)):
+                kind = "application/problem+json" if canonical_path(path) and fault.status >= 400 else "application/json"
+                body = b"" if fault.status in (204, 205, 304) else fault.body
+                return self.send(fault.status, body, kind, "no-store")
             if method == "GET" and path in WEB_BY_PATH:
                 if path == "/ui.html":
                     writes.activate_grace()
@@ -388,17 +365,6 @@ class Handler(BaseHTTPRequestHandler):
                      1 if isinstance(e, idempotency.InFlight) else getattr(e, "retry_after", 0))
             self.send_json(refusal_status(e) or 500, refusal_answer(e), retry_after=retry)
 
-    def answer_verify(self, path: str) -> None:
-        if path == verify_faults.FAULT:
-            self.verify_controls.arm(self.body())
-        elif path == verify_faults.DROP:
-            self.verify_controls.drop()
-        elif path == verify_faults.EVENT:
-            verify_faults.emit(self.body())
-        else:
-            self.verify_controls.clear()
-        self.send_json(200, {"ok": True})
-
     def event_connection(self):
         return self.verify_controls.stream(self.connection) if self.verify_controls else nullcontext()
 
@@ -411,7 +377,7 @@ class Handler(BaseHTTPRequestHandler):
             raise contract.Problem("client_too_old", f"This client needs version {required}", required_version=required)
         post = method == "POST"
         legacy = bool(self.alias) and "Idempotency-Key" not in self.headers
-        self.content_size = api_http.content_length(self.headers, required=post and not legacy and path != verify_faults.DROP)
+        self.content_size = api_http.content_length(self.headers, required=post and not legacy)
         if not post and self.content_size:
             raise contract.Problem("invalid_framing", "This method does not take a body.")
         if not self.api_path:
@@ -671,7 +637,7 @@ class Handler(BaseHTTPRequestHandler):
             with self.event_connection() as dropped:
                 self.end_headers()
                 ended = run_ended(run_id)
-                until = (lambda: dropped.is_set() or ended()) if dropped else ended
+                until = (lambda: dropped() or ended()) if dropped else ended
                 for line in run_lines.follow(run_id, start, until):
                     self.wfile.write(event_line(line))
                     self.wfile.flush()
@@ -1137,18 +1103,20 @@ ROUTES = tuple((entry["method"], entry["path"], globals()[entry["provider"]]) fo
 
 
 def handlers() -> tailnet.Handlers:
-    token = os.environ.get(verify_faults.ENV)
-    if not paths.ISOLATED or not token:
+    state = verify_faults.state_path()
+    if state is None or state != paths.STATE_DIR.absolute():
         return tailnet.Handlers(Handler, Redirect)
-    controls = verify_faults.Controls(token)
+    try:
+        with verify_faults.scratch_state(state):
+            pass
+    except OSError:
+        return tailnet.Handlers(Handler, Redirect)
+    controls = verify_faults.Controls(state)
 
     class ScratchHandler(Handler):
         verify_controls = controls
 
-    class ScratchRedirect(Redirect):
-        verify_controls = controls
-
-    return tailnet.Handlers(ScratchHandler, ScratchRedirect)
+    return tailnet.Handlers(ScratchHandler, Redirect)
 
 
 def serve(port: int | None = None, inside_serve: bool = False, host: tailnet.Tailscale | None = None) -> NoReturn:

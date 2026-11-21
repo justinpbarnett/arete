@@ -44,6 +44,8 @@ def stream(handler, query, code):
     started = time.monotonic()
     if fmt == "json":
         while True:
+            if handler.verify_controls is not None:
+                handler.verify_controls.poll()
             with foundation.one_read() as c:
                 instance = foundation.metadata(c)["instance_id"]
                 epoch, top, rows, reason, meta = events.scan(c, epoch, seq, selected)
@@ -60,16 +62,12 @@ def stream(handler, query, code):
             seq = top
             time.sleep(min(.25, max(0, timeout - (time.monotonic() - started))))
 
-    with handler.event_connection() as dropped:
-        return follow(handler, query, code, fmt, start, started, epoch, seq, selected, dropped)
-
-
-def follow(handler, query, code, fmt, start, started, epoch, seq, selected, dropped):
     with foundation.one_read() as c:
         instance = foundation.metadata(c)["instance_id"]
         head = events.metadata(c)["head"]
-    start("application/x-ndjson" if fmt == "ndjson" else "text/event-stream", instance, head)
-    with foundation.reader(streaming=True) as c:
+    with handler.event_connection() as dropped, foundation.reader(streaming=True) as c:
+        start("application/x-ndjson" if fmt == "ndjson" else "text/event-stream", instance, head)
+
         def write(value):
             handler.wfile.write(value)
             handler.wfile.flush()
@@ -87,7 +85,7 @@ def follow(handler, query, code, fmt, start, started, epoch, seq, selected, drop
         try:
             if fmt == "sse":
                 write(b"retry: 2000\n\n")
-            while dropped is None or not dropped.is_set():
+            while dropped is None or not dropped():
                 epoch, top, rows, reason, meta = events.scan(c, epoch, seq, selected)
                 if reason:
                     message("reset", {"kind": "reset", "reason": reason})
@@ -104,9 +102,6 @@ def follow(handler, query, code, fmt, start, started, epoch, seq, selected, drop
                     message("serve.beat", {**control.serve_beat(), "kind": "serve.beat", "code": code,
                                            "head": meta["head"]}, f"{epoch}.{seq}")
                     beat = time.monotonic() + 15
-                if dropped is None:
-                    time.sleep(0.25)
-                else:
-                    dropped.wait(0.25)
+                time.sleep(0.25)
         except (OSError, TimeoutError):
             return
