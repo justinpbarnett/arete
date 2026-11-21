@@ -1081,24 +1081,23 @@ def format_timeout_summary(details: object, redact: Callable[[str], str]) -> str
     def redact_name(name: str) -> str:
         return redact(name).encode(errors="replace").decode().replace("\r", "\\r").replace("\n", "\\n")
 
-    identifier = redact_name(class_name)
-    metadata = f" ({count} tests)\nclass exceeded {deadline:g}s"
-    match details:
-        case {"completed": int(completed), "never_started": int(never_started)}:
-            metadata += f"\n{completed} completed, {never_started} never started"
-    metadata = redact(metadata)
-    guidance = _test_stacks.TIMEOUT_REMEDIATION
-    room = _test_stacks.MAX_TIMEOUT_SUMMARY_CHARS - len(metadata) - len(guidance) - 1
-    if room < 3:
-        return ""
     timed_names = []
     for timing in timings[:5]:
         match timing:
             case [int() | float() as duration, str(name)]:
                 timed_names.append((redact(f"  {duration:.3f}s "), redact_name(name)))
 
+    identifier = redact_name(class_name)
+    metadata = f" ({count} tests)\nclass exceeded {deadline:g}s\n{len(timed_names)} timing rows"
+    if isinstance(never_started := details.get("never_started"), int):
+        metadata += f", {never_started} never started"
+    metadata = redact(metadata)
+    guidance = _test_stacks.TIMEOUT_REMEDIATION
+    room = _test_stacks.MAX_TIMEOUT_SUMMARY_CHARS - len(metadata) - len(guidance) - 1
+    if room < 3:
+        return ""
     class_label = shorten_timeout_name(identifier, room)
-    timing_heading = "Slowest completed tests:"
+    timing_heading = "Slowest recorded tests:"
     remaining = room - len(class_label) - len(timing_heading) - 1
     if sum(len(prefix) + len(name) + 1 for prefix, name in timed_names) > remaining:
         timed_names = [(prefix, name.removeprefix(f"{identifier}.")) for prefix, name in timed_names]
@@ -1176,7 +1175,9 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
             with ExitStack() as cleanup:
                 sidecar = None
                 with suppress(OSError):
-                    sidecar = cleanup.enter_context(NamedTemporaryFile(dir=run.dir, prefix="check-timeouts-"))
+                    sidecar = NamedTemporaryFile(dir=run.dir, prefix="check-timeouts-", delete=False)
+                    cleanup.callback(Path(sidecar.name).unlink, missing_ok=True)
+                    cleanup.enter_context(sidecar)
                 sets = {_test_stacks.SUMMARY_FILE_ENV: sidecar.name if sidecar else ""}
                 with record.timed(run.id, "check", name=name, command=cmd) as check:
                     res, redact = environment.sh_with_redactor(

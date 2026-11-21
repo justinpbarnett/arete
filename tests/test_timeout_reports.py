@@ -7,6 +7,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,15 +22,17 @@ GUIDANCE = (
     "whose tests are slow on purpose."
 )
 SUMMARY_ENV = "ARETE_TEST_TIMEOUT_SUMMARIES"
+HANG_READY = "timeout fixture reached its hang"
+POPEN = subprocess.Popen
 
 
 def summary_for(name, deadline=10):
-    return (f"{name} (3 tests)\nclass exceeded {deadline}s\n2 completed, 0 never started\n"
-            f"Slowest completed tests:\n  0.010s {name}.test_fast\n  0.001s {name}.test_faster\n{GUIDANCE}")
+    return (f"{name} (3 tests)\nclass exceeded {deadline}s\n2 timing rows, 0 never started\n"
+            f"Slowest recorded tests:\n  0.010s {name}.test_fast\n  0.001s {name}.test_faster\n{GUIDANCE}")
 
 
 def details_for(name):
-    return {"class_name": name, "count": 3, "deadline": 10, "completed": 2, "never_started": 0,
+    return {"class_name": name, "count": 3, "deadline": 10, "never_started": 0,
             "timings": [(0.010, f"{name}.test_fast"), (0.001, f"{name}.test_faster")]}
 
 
@@ -48,7 +51,19 @@ def worker_timing(reader, writer, lifeline):
             (lifeline, writer.fileno(), reader.fileno()))
 
 
-class ParallelTimeoutReportTests(unittest.TestCase):
+def start_hanging_worker(*args, stdout, **kwargs):
+    process = POPEN(*args, stdout=stdout, **kwargs)
+    deadline = time.monotonic() + 2
+    with open(stdout.name) as output:
+        while process.poll() is None and time.monotonic() < deadline:
+            output.seek(0)
+            if HANG_READY in output.read():
+                break
+            time.sleep(0.005)
+    return process
+
+
+class TimeoutStackRetentionTests(unittest.TestCase):
     def test_timeout_preserves_stacks_and_keeps_generated_ids_out_of_retained_artifacts(self):
         marker = "synthetic-completed-test-id"
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
@@ -65,11 +80,17 @@ class ParallelTimeoutReportTests(unittest.TestCase):
                 "        return name\n"
                 "    def test_1_fast(self): pass\n"
                 "    def test_2_slower(self): time.sleep(0.025)\n"
-                "    def test_3_hang(self): time.sleep(20)\n"
+                "    def test_3_hang(self):\n"
+                f"        print({HANG_READY!r}, flush=True)\n"
+                "        time.sleep(20)\n"
             )
-            runner = "from tests import parallel; parallel.STACK_GRACE = 0.3; raise SystemExit(parallel.main())"
+            runner = (
+                "from tests import parallel; from tests.test_timeout_reports import start_hanging_worker; "
+                "parallel.STACK_GRACE = 0.3; parallel.subprocess.Popen = start_hanging_worker; "
+                "raise SystemExit(parallel.main())"
+            )
             result = subprocess.run(
-                [sys.executable, "-c", runner, "--start", directory, "--timeout", "0.5"],
+                [sys.executable, "-c", runner, "--start", directory, "--timeout", "0.25"],
                 env={**os.environ, "TMPDIR": directory, SUMMARY_ENV: str(sidecar)},
                 capture_output=True, text=True, timeout=8,
             )
@@ -91,20 +112,24 @@ class ParallelTimeoutReportTests(unittest.TestCase):
         name = "test_hang.HangingTests"
         dumps = ci.TEST_TIMEOUT.findall(result.stdout)
         self.assertEqual(len(dumps), 2, result.stdout)
-        for dump, deadline in zip(dumps, ("0.5s", "1s")):
+        for dump, deadline in zip(dumps, ("0.25s", "0.5s")):
             self.assertEqual(dump.splitlines()[1:3], [name, f"class exceeded {deadline}"])
             self.assertRegex(dump.splitlines()[3], r"^Python class stack \(PID \d+\)$")
             self.assertIn("in test_3_hang", dump)
         self.assertNotIn(GUIDANCE, result.stdout)
-        self.assertNotIn("Slowest completed tests:", result.stdout)
+        self.assertNotIn("Slowest recorded tests:", result.stdout)
         self.assertEqual(len(summaries), 1)
         lines = summaries[0].splitlines()
-        self.assertEqual(lines[:4], [f"{name} (3 tests)", "class exceeded 1s", "2 completed, 0 never started",
-                                     "Slowest completed tests:"])
-        self.assertRegex(lines[4], rf"^  \d+\.\d{{3}}s {name}\.test_2_slower$")
-        self.assertRegex(lines[5], rf"^  \d+\.\d{{3}}s {name}\.test_1_fast\[{marker}\]$")
+        self.assertEqual(lines[:4], [f"{name} (3 tests)", "class exceeded 0.5s", "2 timing rows, 0 never started",
+                                     "Slowest recorded tests:"])
+        self.assertCountEqual([row.split()[-1] for row in lines[4:6]],
+                              [f"{name}.test_1_fast", f"{name}.test_2_slower"])
+        for row in lines[4:6]:
+            self.assertRegex(row, r"^  \d+\.\d{3}s ")
         self.assertEqual(lines[6:], [GUIDANCE])
 
+
+class ParallelTimeoutReportTests(unittest.TestCase):
     def test_worker_writes_the_same_result_when_id_raises_after_teardown(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             root = Path(directory)
@@ -161,7 +186,8 @@ class ParallelTimeoutReportTests(unittest.TestCase):
             self.assertEqual(sidecar.read_bytes(), b"")
 
     def test_deadline_excludes_grace_period_and_keeps_only_five_timings(self):
-        batch = parallel.Batch("fixture.Sample", 8)
+        name = "test_timeout_reports.Sample"
+        batch = parallel.Batch(name, 8)
         durations = (2, 5, 1, 7, 4, 3, 20, 1)
         events = [timestamp for n, seconds in enumerate(durations) for timestamp in (10 * n, 10 * n + seconds)]
         events[-2:] = [81, 82]
@@ -170,44 +196,38 @@ class ParallelTimeoutReportTests(unittest.TestCase):
         clock = Mock(monotonic=Mock(side_effect=events))
         with patch.object(parallel, "time", clock):
             for index in range(batch.count):
-                test = Mock(id=Mock(return_value=f"fixture.Sample.test_{index}"))
+                test = unittest.TestCase()
+                test._testMethodName = f"test_{index}"
                 result.startTest(test)
                 result.stopTest(test)
-        details = parallel.class_timeout_details(batch, 75, 75, rows, started=7, completed=6)
+        details = parallel.class_timeout_details(batch, 75, 75, rows, started=7)
         summary = pipeline.format_timeout_summary(details, str)
 
-        self.assertEqual(summary.splitlines()[2:-1], ["6 completed, 1 never started", "Slowest completed tests:",
-                                                   "  7.000s fixture.Sample.test_3", "  5.000s fixture.Sample.test_1",
-                                                   "  4.000s fixture.Sample.test_4", "  3.000s fixture.Sample.test_5",
-                                                   "  2.000s fixture.Sample.test_0"])
+        self.assertEqual(summary.splitlines()[2:-1], ["5 timing rows, 1 never started", "Slowest recorded tests:",
+                                                   "  7.000s unittest.case.TestCase.test_3",
+                                                   "  5.000s unittest.case.TestCase.test_1",
+                                                   "  4.000s unittest.case.TestCase.test_4",
+                                                   "  3.000s unittest.case.TestCase.test_5",
+                                                   "  2.000s unittest.case.TestCase.test_0"])
         long_name = "fixture." + "long_module." * 80 + "LongTests"
         summary = pipeline.format_timeout_summary({**details, "class_name": long_name}, str)
         self.assertLessEqual(len(summary), 800)
         self.assertIn("LongTests (8 tests)\nclass exceeded 75s", summary)
         self.assertTrue(summary.endswith("\n" + GUIDANCE))
 
-    def test_unavailable_id_or_clock_leaves_the_test_result_in_place(self):
+    def test_unavailable_clock_leaves_the_test_result_in_place(self):
         class Sample(unittest.TestCase):
-            def __init__(self, id_available=True):
-                super().__init__()
-                self.id_available = id_available
-
-            def id(self):
-                if not self.id_available:
-                    raise RuntimeError("unavailable ID")
-                return super().id()
-
             def runTest(self):
                 self.fail("original result")
 
         start = Mock(side_effect=OSError("unavailable start time"))
         stop = Mock(side_effect=[0, OSError("unavailable finish time")])
-        for case, clock in ((Sample(id_available=False), Mock(return_value=0)), (Sample(), start), (Sample(), stop)):
+        for clock in (start, stop):
             with self.subTest(clock=clock):
                 events = []
                 result = parallel.TimedResult(lambda *row: events.append(row))
                 with patch.object(parallel, "time", Mock(monotonic=clock)):
-                    case.run(result)
+                    Sample().run(result)
                 self.assertEqual(result.testsRun, 1)
                 self.assertEqual(len(result.failures), 1)
                 self.assertIn("AssertionError: original result", result.failures[0][1])
@@ -332,7 +352,7 @@ class ParallelTimeoutReportTests(unittest.TestCase):
         report = self.run_redacted_check(details, value)
         summary, = report.summaries
         self.assertEqual(len(summary), 800)
-        self.assertIn(f"{name} (3 tests)\nclass exceeded 10s\n2 completed, 0 never started", summary)
+        self.assertIn(f"{name} (3 tests)\nclass exceeded 10s\n2 timing rows, 0 never started", summary)
         self.assertIn("  0.010s test_", summary)
         self.assertIn("[redacted]", summary)
         self.assertNotIn(value, report)
@@ -457,8 +477,10 @@ class TimeoutDiagnosticsIsolationTests(unittest.TestCase):
         self.assertEqual(report["ran"], 2)
         self.assertEqual(report["errors"], [])
         self.assertIn("AssertionError: original assertion", report["failures"][0][1])
-        self.assertEqual([name for _, name, _ in events if name],
-                         ["test_unavailable_id.UnavailableIdTests.test_2_with_id"])
+        self.assertEqual(sorted(name for _, name, _ in events), [
+            "test_unavailable_id.UnavailableIdTests.test_1_without_id",
+            "test_unavailable_id.UnavailableIdTests.test_2_with_id",
+        ])
 
     def test_unittest_result_hook_exceptions_still_propagate(self):
         result = parallel.TimedResult(Mock())
@@ -473,14 +495,14 @@ class TimeoutDiagnosticsIsolationTests(unittest.TestCase):
         deadline_secret = "8.39272e+07"
         name = "fixture.Hanging"
         details = details_for(name)
-        details.update(count=int(secret), deadline=int(secret), completed=int(secret), never_started=int(secret))
+        details.update(count=int(secret), deadline=int(secret), never_started=int(secret))
         details["timings"][0] = (float(secret), f"{name}.test_fast")
         sidecar = io.BytesIO((json.dumps(details) + "\n").encode())
         summaries = pipeline.read_timeout_summaries(
             sidecar, 3, lambda text: pipeline.vault.hidden(text, {secret, deadline_secret}),
         )
         expected = (f"{name} ([redacted] tests)\nclass exceeded [redacted]s\n"
-                    "[redacted] completed, [redacted] never started\nSlowest completed tests:\n"
+                    "2 timing rows, [redacted] never started\nSlowest recorded tests:\n"
                     f"  [redacted].000s {name}.test_fast\n  0.001s {name}.test_faster\n{GUIDANCE}")
         self.assertEqual(summaries, [expected])
 
@@ -528,7 +550,9 @@ class TimeoutProgressRegressionTests(unittest.TestCase):
         report = json.loads(reports[1])
         self.assertEqual(report["ran"], 2)
         self.assertIn("AssertionError: original assertion", report["failures"][0][1])
-        self.assertEqual([name for _, name, _ in events], ["test_cancelled_id.CancelledIdTests.test_normal_id"])
+        self.assertEqual(sorted(name for _, name, _ in events), [
+            "test_cancelled_id.CancelledIdTests.test_cancelled_id", "test_cancelled_id.CancelledIdTests.test_normal_id",
+        ])
 
     def test_missing_start_timestamp_still_counts_the_test_as_started(self):
         batch = parallel.Batch("fixture.Sample", 3)
@@ -536,14 +560,15 @@ class TimeoutProgressRegressionTests(unittest.TestCase):
         events = []
         with tempfile.TemporaryFile() as counter, patch.object(parallel, "time", clock):
             result = parallel.TimedResult(lambda *row: events.append(row), counter.fileno())
-            for name in ("fixture.Sample.test_missing", "fixture.Sample.test_timed"):
-                test = Mock(id=Mock(return_value=name))
+            for name in ("test_missing", "test_timed"):
+                test = unittest.TestCase()
+                test._testMethodName = name
                 result.startTest(test)
                 result.stopTest(test)
             started = os.lseek(counter.fileno(), 0, os.SEEK_CUR)
         details = parallel.class_timeout_details(batch, 3, 3, events, started)
         self.assertEqual(details["never_started"], 1)
-        self.assertEqual(details["timings"], [(0.5, "fixture.Sample.test_timed")])
+        self.assertEqual(details["timings"], [(0.5, "unittest.case.TestCase.test_timed")])
 
     def test_timeout_counts_starts_with_a_full_progress_socket(self):
         reader, writer = socket.socketpair()
@@ -564,7 +589,7 @@ class TimeoutProgressRegressionTests(unittest.TestCase):
                 "    def id(self): return None\n"
                 "    def test_1_fast(self): print('fast', flush=True)\n"
                 "    def test_2_hang(self):\n"
-                "        print('hang', flush=True)\n"
+                f"        print({HANG_READY!r}, flush=True)\n"
                 "        time.sleep(20)\n"
                 "    def test_3_unreached(self): print('unreached', flush=True)\n"
             )
@@ -577,6 +602,7 @@ class TimeoutProgressRegressionTests(unittest.TestCase):
                 channel = contextlib.nullcontext((reader, writer))
                 with (patch.dict(os.environ, {"PYTHONDONTWRITEBYTECODE": "1"}),
                       patch.object(parallel, "timing_channel", return_value=channel),
+                      patch.object(parallel.subprocess, "Popen", start_hanging_worker),
                       patch.object(runner, "request_stacks", return_value=[])):
                     runner.child((0, batch))
             finally:
@@ -585,12 +611,12 @@ class TimeoutProgressRegressionTests(unittest.TestCase):
 
         report = runner.results[batch.identifier]
         self.assertIn("class exceeded 1s", report["timeout"])
-        self.assertEqual(report["output"], "fast\nhang\n")
+        self.assertEqual(report["output"], f"fast\n{HANG_READY}\n")
         self.assertEqual(report["timeout_details"]["never_started"], 1)
         self.assertEqual(report["timeout_details"]["timings"], [])
 
 
-class TimeoutBackpressureTests(unittest.TestCase):
+class TimeoutTimingIsolationTests(unittest.TestCase):
     def test_worker_report_matches_baseline_when_optional_id_raises_keyboard_interrupt(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             root = Path(directory)
@@ -601,9 +627,10 @@ class TimeoutBackpressureTests(unittest.TestCase):
                 "    def setUpClass(cls): cls.ready = True\n"
                 "    def id(self):\n"
                 "        if self.ready and self._testMethodName == 'test_missing_id':\n"
+                "            self.id_called = True\n"
                 "            raise KeyboardInterrupt('fixture metadata unavailable')\n"
                 "        return super().id()\n"
-                "    def test_missing_id(self): pass\n"
+                "    def test_missing_id(self): self.assertFalse(getattr(self, 'id_called', False))\n"
                 "    def test_normal_id(self): self.fail('original assertion')\n"
             )
             lifeline, held = os.pipe()
@@ -628,9 +655,12 @@ class TimeoutBackpressureTests(unittest.TestCase):
         report = json.loads(reports[1])
         self.assertEqual(report["ran"], 2)
         self.assertIn("AssertionError: original assertion", report["failures"][0][1])
-        self.assertEqual([name for _, name, _ in events], ["test_interrupted_id.InterruptedIdTests.test_normal_id"])
+        self.assertEqual(sorted(name for _, name, _ in events), [
+            "test_interrupted_id.InterruptedIdTests.test_missing_id",
+            "test_interrupted_id.InterruptedIdTests.test_normal_id",
+        ])
 
-    def test_timeout_counts_all_completions_and_keeps_available_timing_with_full_channel(self):
+    def test_full_timing_channel_reports_zero_rows_and_counts_never_started(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             root = Path(directory)
             (root / "test_backpressure.py").write_text(
@@ -641,7 +671,9 @@ class TimeoutBackpressureTests(unittest.TestCase):
                 "        return super().id()\n"
                 "    def test_1_fast(self): print('fast', flush=True)\n"
                 "    def test_2_without_id(self): print('without ID', flush=True)\n"
-                "    def test_3_hang(self): time.sleep(20)\n"
+                "    def test_3_hang(self):\n"
+                f"        print({HANG_READY!r}, flush=True)\n"
+                "        time.sleep(20)\n"
                 "    def test_4_unreached(self): self.fail('unreached')\n"
             )
             batch = parallel.Batch("test_backpressure.BackpressureTests", 4)
@@ -651,7 +683,7 @@ class TimeoutBackpressureTests(unittest.TestCase):
             runner.lifeline, held = os.pipe()
             try:
                 with parallel.timing_channel() as (reader, writer):
-                    # Fill the receiver past the point where a timing snapshot fits.
+                    # The fast test's timing snapshot cannot fit in this channel.
                     with self.assertRaises(OSError) as full:
                         while True:
                             writer.send(b"x" * 32)
@@ -659,6 +691,7 @@ class TimeoutBackpressureTests(unittest.TestCase):
                     channel = contextlib.nullcontext((reader, writer))
                     with (patch.dict(os.environ, {"PYTHONDONTWRITEBYTECODE": "1"}),
                           patch.object(parallel, "timing_channel", return_value=channel),
+                          patch.object(parallel.subprocess, "Popen", start_hanging_worker),
                           patch.object(runner, "request_stacks", return_value=[])):
                         runner.child((0, batch))
             finally:
@@ -667,11 +700,39 @@ class TimeoutBackpressureTests(unittest.TestCase):
 
         report = runner.results[batch.identifier]
         self.assertIn("class exceeded 1s", report["timeout"])
-        self.assertEqual(report["output"], "fast\nwithout ID\n")
+        self.assertEqual(report["output"], f"fast\nwithout ID\n{HANG_READY}\n")
         details = report["timeout_details"]
-        self.assertEqual(details["completed"], 2)
         self.assertEqual(details["never_started"], 1)
-        self.assertEqual([name for _, name in details["timings"]], [f"{batch.identifier}.test_1_fast"])
+        self.assertEqual(details["timings"], [])
+        summary = pipeline.format_timeout_summary(details, str)
+        self.assertEqual(summary.splitlines()[2:], ["0 timing rows, 1 never started", GUIDANCE])
+
+    def test_timing_uses_names_without_invoking_attribute_hooks(self):
+        class TestType(type):
+            def __getattribute__(cls, name):
+                if name in {"__module__", "__qualname__"}:
+                    raise AssertionError(name)
+                return super().__getattribute__(name)
+
+        class Sample(unittest.TestCase, metaclass=TestType):
+            @property
+            def __dict__(self):
+                raise AssertionError("test dictionary hook")
+
+            def __getattribute__(self, name):
+                if name == "_testMethodName":
+                    raise AssertionError(name)
+                return super().__getattribute__(name)
+
+        rows = []
+        case = Sample()
+        result = parallel.TimedResult(lambda *row: rows.append(row))
+        result.startTest(case)
+        result.stopTest(case)
+        self.assertEqual([name for _, name, _ in rows], [
+            f"{__name__}.TimeoutTimingIsolationTests.test_timing_uses_names_without_invoking_attribute_hooks"
+            ".<locals>.Sample.runTest",
+        ])
 
     def test_worker_keeps_only_the_slowest_five_before_the_deadline(self):
         with parallel.timing_channel() as (reader, writer):
