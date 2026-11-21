@@ -2639,17 +2639,13 @@ class FailedPollBudgetTests(PollFixture):
         self.local.label(self.ticket, add=["failed"])
         return failed
 
-    def check_failed_retry(self, *, edited):
+    def test_poll_keeps_budget_after_failed_run_with_unchanged_specification(self):
         failed = self.failed_with_spent_repairs()
-        if edited:
-            with foundation.db() as connection:
-                set_task_body(self.ticket, "A narrower specification", connection=connection)
         self.local.label(self.ticket, remove=["failed"])
 
         def work(cfg, run, slot):
             self.assertFalse(run.force)
-            if not edited:
-                self.assertEqual(run.budget.prior_repairs, 3)
+            self.assertEqual(run.budget.prior_repairs, 3)
             run.budget.charge("repair", "review_repair")
             return "noop", "fixture finished", ""
 
@@ -2658,24 +2654,19 @@ class FailedPollBudgetTests(PollFixture):
         self.assertNotEqual(retry["id"], failed.id)
         saved = runlimits.metadata(retry["id"], "budget.json")
         log = (paths.RUNS_DIR / retry["id"] / "run.log").read_text()
-        if edited:
-            self.assertEqual(saved["parents"], [])
-            self.assertEqual(saved["repair_left_out"], [failed.id])
-            self.assertEqual(runlimits.repair_count(retry["id"]), 1)
-            self.assertIn("budget: left out 3 earlier repair cycles, 0.0 run minutes and 0.0 verification minutes "
-                          "of 1 earlier run because the ticket specification changed since they ran", log)
-        else:
-            self.assertEqual(saved["repair_parents"], [failed.id])
-            self.assertEqual(saved["repair_left_out"], [])
-            self.assertIn("the repair chain used its 3 repair cycles", log)
+        self.assertEqual(saved["repair_parents"], [failed.id])
+        self.assertEqual(saved["repair_left_out"], [])
+        self.assertIn("the repair chain used its 3 repair cycles", log)
 
-    def test_poll_excludes_budget_after_failed_run_with_edited_specification(self):
-        self.check_failed_retry(edited=True)
+    def assert_failed_run_charged(self, retry, failed, minutes):
+        [chain] = [line for line in run_lines.read(retry["id"]) if line["event"] == "budget_chain"]
+        self.assertEqual(chain["charged"][failed.id]["repair_calls"], 3)
+        self.assertEqual(chain["charged"][failed.id]["run_minutes"], minutes)
+        log = (paths.RUNS_DIR / retry["id"] / "run.log").read_text()
+        self.assertIn(f"budget chain: {failed.id}: {minutes:.1f} run minutes, 0.0 verification minutes, "
+                      "3 repair calls", log)
 
-    def test_poll_keeps_budget_after_failed_run_with_unchanged_specification(self):
-        self.check_failed_retry(edited=False)
-
-    def test_poll_retry_parks_during_lookup_when_inherited_run_time_expires(self):
+    def test_poll_retry_keeps_budget_when_lookup_times_out(self):
         failed = self.failed_with_spent_repairs()
         record.note(failed.id, active_seconds=3599.75)
         self.local.label(self.ticket, remove=["failed"])
@@ -2686,9 +2677,9 @@ class FailedPollBudgetTests(PollFixture):
             with patch.object(runlimits, "time", SimpleNamespace(monotonic=lambda: clock[0])), \
                     patch.object(signal, "setitimer") as timer:
                 def stalled_lookup(*_):
-                    timer.assert_called_once_with(signal.ITIMER_REAL, 0.25)
+                    timer.assert_called_once_with(signal.ITIMER_REAL, 3600)
                     self.assertTrue(callable(signal.getsignal(signal.SIGALRM)))
-                    clock[0] += 0.25
+                    clock[0] += 3600
                     signal.raise_signal(signal.SIGALRM)
                     self.fail("the watchdog did not interrupt the lookup")
 
@@ -2705,11 +2696,14 @@ class FailedPollBudgetTests(PollFixture):
         saved = runlimits.metadata(retry["id"], "budget.json")
         self.assertEqual(saved["parents"], [failed.id])
         self.assertEqual(saved["repair_parents"], [failed.id])
-        self.assertEqual(retry["active_seconds"], 0.25)
+        self.assertEqual(retry["active_seconds"], 3600)
+        self.assert_failed_run_charged(retry, failed, 60.0)
 
-    def test_poll_retry_charges_successful_lookup_to_active_run_time(self):
+    def test_poll_retry_compares_an_edit_after_the_inherited_deadline_would_expire(self):
         failed = self.failed_with_spent_repairs()
-        record.note(failed.id, active_seconds=30)
+        record.note(failed.id, active_seconds=3599.75)
+        with foundation.db() as connection:
+            set_task_body(self.ticket, "A narrower specification", connection=connection)
         self.local.label(self.ticket, remove=["failed"])
         ticket = self.local.get(self.ticket)
         clock = [100.0]
@@ -2720,7 +2714,9 @@ class FailedPollBudgetTests(PollFixture):
             return ticket
 
         def work(cfg, run, slot):
+            self.assertFalse(run.force)
             budgets.append(run.budget)
+            run.budget.charge("repair", "review_repair")
             return "noop", "fixture finished", ""
 
         def launch_with_slow_lookup(repo, tid):
@@ -2732,11 +2728,19 @@ class FailedPollBudgetTests(PollFixture):
 
         self.assertEqual(self.poll_with(self.cfg, launch_with_slow_lookup), 0)
         retry = run_store.newest_live_whole_run(self.repo.name, self.ticket)
+        self.assertNotEqual(retry["id"], failed.id)
         self.assertEqual(retry["status"], "noop")
         self.assertEqual(retry["active_seconds"], 12)
         [budget] = budgets
-        self.assertEqual(budget.prior_seconds, 30)
-        self.assertEqual(budget.run_deadline() - clock[0], 60 * 60 - 30 - 12)
+        self.assertEqual(budget.parents, [])
+        self.assertEqual(budget.run_deadline() - clock[0], 60 * 60 - 12)
+        saved = runlimits.metadata(retry["id"], "budget.json")
+        self.assertEqual(saved["parents"], [])
+        self.assertEqual(saved["repair_left_out"], [failed.id])
+        self.assertEqual(runlimits.repair_count(retry["id"]), 1)
+        log = (paths.RUNS_DIR / retry["id"] / "run.log").read_text()
+        self.assertIn("budget: left out 3 earlier repair cycles, 60.0 run minutes and 0.0 verification minutes "
+                      "of 1 earlier run because the ticket specification changed since they ran", log)
 
     def test_poll_keeps_budget_across_a_failed_ticket_fetch(self):
         failed = self.failed_with_spent_repairs()
@@ -2753,6 +2757,7 @@ class FailedPollBudgetTests(PollFixture):
         self.assertEqual(retry["status"], "failed")
         self.assertIn("ticket fetch failed", retry["summary"])
         work.assert_not_called()
+        self.assert_failed_run_charged(retry, failed, 0.0)
 
         self.local.label(self.ticket, remove=["failed"])
 
@@ -2768,6 +2773,136 @@ class FailedPollBudgetTests(PollFixture):
         for key in ("parents", "repair_parents"):
             self.assertEqual(runlimits.metadata(retry["id"], "budget.json")[key], [failed.id])
             self.assertEqual(runlimits.metadata(next_retry["id"], "budget.json")[key], [retry["id"], failed.id])
+
+
+class OrchestrationFinishTests(Isolated):
+    PR = "https://github.com/owner/project/pull/685"
+
+    def setUp(self):
+        super().setUp()
+        self.repo = replace(self.repo, github="owner/project", tracker="github",
+                            parts=[config.Part("", "owner/project")])
+        self.cfg = config.Config(repos=[self.repo], replay=config.ReplayConfig(all=True))
+        self.issue = "658"
+        self.labels = {"agent"}
+        self.comments = []
+        self.prs = {self.PR: {"state": "OPEN", "isDraft": False}}
+        self.checkout = workspace.Checkout("", self.repo.github, self.repo.path,
+                                           paths.WORKTREES_DIR / f"{self.repo.name}-{self.issue}",
+                                           "main", pr=self.PR)
+        for module, name, func in (
+            (config, "load", lambda: self.cfg),
+            (gh, "issue", self.issue_view),
+            (gh, "issue_labels", self.edit_labels),
+            (gh, "issue_comment", self.post_comment),
+            (gh, "ensure_label", lambda *args: ""),
+            (gh, "default_branch", lambda repo: "main"),
+            (gh, "pr_merge_details", self.prs.__getitem__),
+            (gh, "pr_set_draft", self.set_draft),
+            (scratch, "process_ids", dict),
+            (scratch, "service_labels", dict),
+            (sandbox, "AUTHORITY", self.root / "authority"),
+        ):
+            self.patches.enter_context(patch.object(module, name, func))
+
+    def issue_view(self, repo, number):
+        return {"number": number, "title": "Fixture issue", "body": "Fixture description", "state": "OPEN",
+                "author": {"login": "owner"}, "labels": [{"name": label} for label in sorted(self.labels)]}
+
+    def edit_labels(self, repo, number, add=(), remove=(), **kwargs):
+        self.labels.difference_update(remove)
+        self.labels.update(add)
+
+    def post_comment(self, repo, number, body):
+        drafted = {url for url, pr in self.prs.items() if pr["isDraft"]}
+        self.comments.append((body, drafted, self.labels.copy()))
+
+    def set_draft(self, url, draft):
+        self.prs[url]["isDraft"] = draft
+
+    def run_controller(self, decide, code):
+        def prepare(flow, tree):
+            flow.ctx.run.enter("running")
+            return factory.Outcome("pass", data={
+                "layer": str(self.repo.layer_dir),
+                "checkouts": [replace(self.checkout, pr=url).to_row() for url in self.prs],
+                "ticket": asdict(flow.ctx.run.tracker.get(self.issue)), "branch": "arete/fixture",
+                "add_dirs": [], "attachments": "", "expertise": "", "triage": "",
+            })
+
+        def drive(flow):
+            controller = orchestration.Controller(flow)
+            with patch.object(controller, "decide", side_effect=lambda: decide(controller)):
+                return controller.drive()
+
+        with (patch.dict(factory.STEPS, {"prepare": prepare}),
+              patch.object(factory, "fingerprint", return_value="fixture-tree")):
+            self.assertEqual(pipeline.run_issue(self.repo.name, self.issue, script=pipeline.Script("orchestrate", drive)),
+                             code)
+        return run_store.newest_whole_run(self.repo.name, self.issue)
+
+    def controller_action(self, controller, op, args, rationale):
+        version = ledger.snapshot(controller.lease)["version"]
+        turn = ledger.begin(controller.lease, {}, controller.policy.max_decisions)
+        response = {"version": PROTOCOL, "decision_id": turn, "state_version": version,
+                    "rationale": rationale, "calls": [{"op": op, "args": args}]}
+        validated = controller.catalog.validate(response, turn, version, {})
+        return ledger.accept(controller.lease, turn, version, validated, controller.policy.max_actions)
+
+    def test_failed_finish_comments_with_its_rationale_and_drafts_open_prs(self):
+        other = "https://github.com/owner/other/pull/686"
+        closed = "https://github.com/owner/closed/pull/687"
+        self.prs[other] = {**self.prs[self.PR]}
+        self.prs[closed] = {**self.prs[self.PR], "state": "CLOSED"}
+        decisions = iter([
+            ("catalog.list", {"kind": "context"}, "The earlier decision only listed context."),
+            ("run.finish", {"reason": "failed"}, "The merge conflicts remain. See http://127.0.0.1:8000/logs."),
+        ])
+        row = self.run_controller(lambda controller: self.controller_action(controller, *next(decisions)), code=1)
+        self.assertEqual((row["status"], row["summary"]), ("failed", "the orchestrator stopped without delivery"))
+        self.assertEqual(self.labels, {"agent", "agent:failed"})
+        (comment, drafted, labels), = self.comments
+        self.assertIn("The merge conflicts remain. See [private address]/logs.", comment)
+        self.assertIn(row["id"], comment)
+        self.assertNotIn("The earlier decision", comment)
+        self.assertNotIn("127.0.0.1", comment)
+        self.assertEqual(drafted, {self.PR, other})
+        self.assertEqual(labels, {"agent", "agent:running"})
+        directory = paths.RUNS_DIR / row["id"]
+        self.assertFalse((directory / "parked.json").exists())
+        for text in (str(row), str(run_lines.read(row["id"])), (directory / "run.log").read_text(),
+                     str(ledger.view(row["id"]))):
+            self.assertNotIn("The merge conflicts remain", text)
+
+    def test_failed_finish_with_unpaired_surrogate_settles_a_local_task(self):
+        self.repo = replace(self.repo, tracker="local")
+        self.cfg = replace(self.cfg, repos=[self.repo])
+        self.issue = self.ticket
+        decisions = iter([("run.finish", {"reason": "failed"}, "Échec \ud800 de la fusion.")])
+
+        row = self.run_controller(lambda controller: self.controller_action(controller, *next(decisions)), code=1)
+
+        self.assertEqual((row["status"], row["summary"]), ("failed", "the orchestrator stopped without delivery"))
+        self.assertEqual(tasks_store.task_get(self.ticket)["state"], "failed")
+        comment, = tasks_store.task_comments(self.ticket)
+        self.assertIn(row["id"], comment["body"])
+        self.assertIn("Échec \\ud800 de la fusion.", comment["body"])
+
+    def test_delivered_finish_keeps_the_ready_pr_and_ticket_state(self):
+        def decide(controller):
+            controller.run.enter("pr")
+            controller.data["published"] = {"ending": "pr", "summary": "Delivered fixture"}
+            controller.data["published_tree"] = controller.fingerprint()
+            controller.executing = "fixture-publication"
+            for gate in ("checks", "verify", "review"):
+                controller.stamp(gate, {})
+            return self.controller_action(controller, "run.finish", {"reason": "delivered"}, "Published the change.")
+
+        row = self.run_controller(decide, code=0)
+        self.assertEqual((row["status"], row["summary"], row["pr_url"]), ("pr", "Delivered fixture", self.PR))
+        self.assertEqual(self.labels, {"agent", "agent:pr"})
+        self.assertEqual(self.comments, [])
+        self.assertFalse(self.prs[self.PR]["isDraft"])
 
 
 class BudgetReadmissionTests(ReadmissionFixture):

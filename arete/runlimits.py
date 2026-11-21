@@ -363,8 +363,8 @@ class Budget:
                 forced or (poll_retry and specification_changed(metadata(previous, "budget.json"), current))):
             excluded = {rid for rid in rows if (found := recorded_specification(rid)) and found != current}
         left = [rid for rid in chain if rid in excluded]
-        answer_omitted = repair_chain if not run.dry_run and set(answered_runs).intersection(repair_chain) else []
-        self.repair_left_out = answer_omitted or [rid for rid in repair_chain if rid in excluded]
+        self.answer_omitted = repair_chain if not run.dry_run and set(answered_runs).intersection(repair_chain) else []
+        self.repair_left_out = self.answer_omitted or [rid for rid in repair_chain if rid in excluded]
         self.repair_parents = [rid for rid in repair_chain if rid not in self.repair_left_out]
         left_repairs = sum(repair_count(rid) for rid in self.repair_left_out if rid in excluded)
         left_seconds = sum(active_seconds(rid, rows[rid]) for rid in left)
@@ -393,7 +393,9 @@ class Budget:
         self.verification_active_since = None
         self.verify_started = None
         self.started = time.monotonic() - active_seconds(run.id, own_row) if started is None else started
-        self.deadline = self.started + policy.max_run_minutes * 60 - self.prior_seconds
+        # The lookup must finish before we know whether to charge earlier runs.
+        inherited_seconds = 0 if self.pending_specification else self.prior_seconds
+        self.deadline = self.started + policy.max_run_minutes * 60 - inherited_seconds
         self.verify_deadline = None
         self.specification = current or next(
             (found for rid in self.parents if (found := recorded_specification(rid))), None)
@@ -416,20 +418,23 @@ class Budget:
         self.persist()
         if self.pending_specification:
             return
-        omitted = ({"repair_left_out": answer_omitted, "reason": "owner answer"} if answer_omitted else {})
-        run_lines.write(run.id, "budget_chain", charged=self.charged, **omitted)
-        run.log("budget chain: " + ("; ".join(
-            f"{rid}: {v['run_minutes']:.1f} run minutes, {v['verification_minutes']:.1f} verification minutes, "
-            f"{v['repair_calls']} repair calls" + (" (estimate)" if v["estimate"] else "")
-            for rid, v in self.charged.items()) or "no parents") +
-            (f"; left out of repair accounting because of an owner answer: {', '.join(answer_omitted)}"
-             if answer_omitted else ""))
+        self.log_chain()
         if left or (fresh_feedback and self.repair_left_out):
             reason = "the owner commented on the PR" if fresh_feedback else "the ticket specification changed"
             omitted_runs = len(set(left) | set(self.repair_left_out)) if fresh_feedback else len(left)
             run.log(f"budget: left out {util.count(left_repairs, 'earlier repair cycle')}, "
                     f"{left_seconds / 60:.1f} run minutes and {left_verify / 60:.1f} verification minutes of "
                     f"{util.count(omitted_runs, 'earlier run')} because {reason} since they ran")
+
+    def log_chain(self) -> None:
+        omitted = ({"repair_left_out": self.answer_omitted, "reason": "owner answer"} if self.answer_omitted else {})
+        run_lines.write(self.run.id, "budget_chain", charged=self.charged, **omitted)
+        self.run.log("budget chain: " + ("; ".join(
+            f"{rid}: {v['run_minutes']:.1f} run minutes, {v['verification_minutes']:.1f} verification minutes, "
+            f"{v['repair_calls']} repair calls" + (" (estimate)" if v["estimate"] else "")
+            for rid, v in self.charged.items()) or "no parents") +
+            (f"; left out of repair accounting because of an owner answer: {', '.join(self.answer_omitted)}"
+             if self.answer_omitted else ""))
 
     def persist(self) -> None:
         self.checkpoint()

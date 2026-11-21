@@ -1945,8 +1945,13 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             if poll_retry:
                 with handoff_io():
                     run.budget = new_budget(poll_retry=True)
-                with run.budget.watching(admit=check_handoff if zte_grant else None, periodic=not zte_grant):
-                    current = tk.get(tid)
+                try:
+                    with run.budget.watching(admit=check_handoff if zte_grant else None, periodic=not zte_grant):
+                        current = tk.get(tid)
+                except (Exception, runlimits.Parked, Stopped):
+                    with handoff_io():
+                        run.budget.log_chain()
+                    raise
                 budget_started = run.budget.started
             with handoff_io():
                 run.budget = new_budget(current, forced_budget, poll_retry=poll_retry, started=budget_started)
