@@ -119,9 +119,12 @@ class VerifyFaultTests(unittest.TestCase):
         return data["next"]
 
     @contextmanager
-    def stream(self, endpoint, cursor):
+    def stream(self, endpoint, cursor=None):
+        headers = {"Accept": "text/event-stream"}
+        if cursor is not None:
+            headers["Last-Event-ID"] = cursor
         with self.client(endpoint) as client:
-            client.request("GET", "/api/v1/events", headers={"Last-Event-ID": cursor, "Accept": "text/event-stream"})
+            client.request("GET", "/api/v1/events", headers=headers)
             with client.getresponse() as result:
                 self.assertEqual(result.status, 200)
                 self.assertEqual(result.readline(), b"retry: 2000\n")
@@ -339,6 +342,35 @@ class VerifyFaultTests(unittest.TestCase):
                 self.fault("drop-streams")
                 self.assertEqual(reconnected.read(), b"")
             self.assertEqual(last, before_beat["id"])
+
+    def test_cursorless_stream_delivers_event_queued_after_opening_frame_once(self):
+        self.mark_scratch()
+        run = "fault-before-first-scan"
+        self.start_run(run)
+        endpoint = self.endpoint()
+        controls = endpoint[0].verify_controls
+        poll = controls.poll
+        queued = threading.Event()
+
+        def wait_for_queued_event(route="", query=""):
+            if not route and not queued.wait(timeout=3):
+                raise TimeoutError("event was not queued before the first stream tick")
+            return poll(route, query)
+
+        with mock.patch.object(controls, "poll", wait_for_queued_event), self.stream(endpoint) as stream:
+            try:
+                self.fault("event", "--kind", "run.ended", "--run", run)
+                queued.set()
+                ended = self.read_event(stream)
+                self.assertEqual((ended["kind"], ended["subject"]), ("run.ended", f"run:{run}"))
+
+                following = "fault-after-first-scan"
+                self.start_run(following)
+                self.assertEqual(self.read_event(stream)["subject"], f"run:{following}")
+            finally:
+                self.fault("drop-streams")
+                queued.set()
+            self.assertEqual(stream.read(), b"")
 
     def test_run_ended_is_delivered_through_the_real_event_log(self):
         self.mark_scratch()

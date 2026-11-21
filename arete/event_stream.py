@@ -65,6 +65,8 @@ def stream(handler, query, code):
     with foundation.one_read() as c:
         instance = foundation.metadata(c)["instance_id"]
         head = events.metadata(c)["head"]
+    if fmt == "sse" and seq is None:
+        epoch, seq = events.cursor(head)
     with handler.event_connection() as dropped, foundation.reader(streaming=True) as c:
         start("application/x-ndjson" if fmt == "ndjson" else "text/event-stream", instance, head)
 
