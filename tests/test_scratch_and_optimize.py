@@ -1,12 +1,15 @@
 import io
 import json
 import os
+import plistlib
 import signal
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
-from contextlib import contextmanager, redirect_stdout
-from dataclasses import asdict
+from contextlib import contextmanager, redirect_stdout, suppress
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -185,6 +188,194 @@ class BundledXPCScratchTests(unittest.TestCase):
                 self.assertEqual(released["state"], "done")
                 self.assertNotIn(workspace.RETAINED_KEY, workspace.made_before(base))
                 self.assertIn("preserved and finalized verification scratch", output.getvalue())
+
+
+class ScratchRecordTests(unittest.TestCase):
+    def setUp(self):
+        self.base = Path(self.enterContext(tempfile.TemporaryDirectory(ignore_cleanup_errors=True))).resolve()
+        self.enterContext(patch.object(scratch, "registry", self.registry))
+
+    @contextmanager
+    def registry(self):
+        with paths.directory_fd(self.base) as fd:
+            yield fd, b"fixture signing material"
+
+    def record(self, attempt):
+        with self.registry() as (fd, key):
+            return scratch.load(fd, key, attempt.selector)
+
+    def attempt(self, letter, **fields):
+        workspace_dir, run_dir = self.base / f"workspace-{letter}", self.base / f"run-{letter}"
+        workspace_dir.mkdir()
+        run_dir.mkdir()
+        attempt = scratch.Attempt(letter * 64, "fixture", run_dir.name, "verify", str(workspace_dir),
+                                  str(workspace_dir / (paths.SCRATCH_PREFIX + "fixture")), str(run_dir), {}, {})
+        data = {"attempt": asdict(attempt), "version": 2, "source_mutations": False, "state": "prepared",
+                "run": scratch.identity(run_dir.stat()), "before": [], "producers": {}, **fields}
+        with self.registry() as (fd, key):
+            scratch.store(fd, key, data)
+            os.close(os.open(attempt.selector + ".lease", os.O_CREAT | os.O_WRONLY, 0o600, dir_fd=fd))
+        return attempt
+
+
+class AttemptScratchHoldersTests(ScratchRecordTests):
+    def setUp(self):
+        super().setUp()
+        self.processes = {}
+        self.enterContext(patch.object(scratch, "processes", return_value=self.processes))
+        self.enterContext(patch.object(scratch, "identity_of", side_effect=lambda pid: pid + 100))
+        self.enterContext(patch.object(scratch.os, "killpg", side_effect=self.check_group))
+
+    def check_group(self, group, signal):
+        if not any(p.group == group for p in self.processes.values()):
+            raise ProcessLookupError(group)
+
+    def detached_child(self, attempt, producer, child):
+        leader = scratch.Process(producer, producer + 100, 1, producer, "/bin/sh", uses_paths=False)
+        self.processes[leader.identity] = leader
+        scratch.producer_group(attempt, "verify", leader.group)
+        detached = scratch.Process(child, child + 100, leader.identity, child, "/bin/sleep", orphaned=True,
+                                   uses_paths=False)
+        self.processes[detached.identity] = detached
+        del self.processes[leader.identity]
+        return detached
+
+    def test_foreign_detached_child_does_not_hold_finished_attempt(self):
+        first, second = self.attempt("a"), self.attempt("b")
+        ended = self.detached_child(first, 10, 11)
+        running = self.detached_child(second, 20, 21)
+        del self.processes[ended.identity]
+
+        self.assertEqual(scratch.end(first, Path(first.run_dir))[2], [])
+        self.assertEqual(self.record(first)["state"], "done")
+        self.assertEqual(scratch.holders(self.record(second)), [scratch.holder(running, scratch.ORPHAN)])
+
+    def test_own_child_holds_after_leaving_its_producer_group(self):
+        attempt = self.attempt("a")
+        running = self.detached_child(attempt, 10, 11)
+
+        self.assertEqual(scratch.end(attempt, Path(attempt.run_dir))[2], [attempt.root])
+        self.assertEqual(self.record(attempt)["diagnostic"]["holders"], [scratch.holder(running, scratch.ORPHAN)])
+
+    def test_sealed_instance_holds_while_it_uses_a_workspace_file(self):
+        label = "com.apple.mdworker.shared"
+        plist = self.base / "worker.plist"
+        worker = scratch.Process(30, 130, 1, 30, "/usr/libexec/mdworker_shared", orphaned=True, uses_paths=False)
+        plist.write_bytes(plistlib.dumps({"Label": label, "Program": worker.executable}))
+        job = launchd.Job(f"gui/{os.getuid()}", label + ".new", str(plist), worker.pid)
+        for letter, loaded in (("a", label), ("b", label + ".old")):
+            with self.subTest(loaded=loaded):
+                attempt = self.attempt(letter, state="retained", labels={"gui": [loaded]},
+                                       producers={"verify": {"gated": True, "group": 10}},
+                                       diagnostic=scratch.holders_diagnostic(
+                                           scratch.WAITING, [scratch.holder(worker, scratch.SUBMITTED)]))
+                ws = Path(attempt.workspace)
+                made = ws / "workspace-record"
+                made.write_text(json.dumps({workspace.RETAINED_KEY: {"roots": [Path(attempt.root).name]}}))
+                self.processes[worker.identity] = worker
+                with (patch.object(launchd.Table, "job", return_value=job),
+                      patch.object(launchd, "sealed", return_value=True),
+                      patch.object(workspace, "made_record", return_value=made),
+                      patch.object(scratch, "survey", return_value=scratch.View([], [], False)),
+                      patch.object(scratch, "settle", return_value=[]), redirect_stdout(io.StringIO()) as output):
+                    self.assertEqual(scratch.holders(self.record(attempt)), [])
+                    self.processes[worker.identity] = replace(worker, uses_paths=True)
+                    self.assertEqual(scratch.end(attempt, Path(attempt.run_dir))[2], [attempt.root])
+                    self.assertEqual(self.record(attempt)["diagnostic"]["holders"],
+                                     [scratch.holder(worker, scratch.USING_PATHS)])
+                    self.processes[worker.identity] = worker
+                    poll.retry_scratch()
+                    self.assertEqual(self.record(attempt)["state"], "done")
+                    self.assertNotIn(workspace.RETAINED_KEY, workspace.made_before(ws))
+                    self.assertIn(f"preserved and finalized verification scratch {attempt.root}", output.getvalue())
+
+
+@unittest.skipUnless(paths.ON_MAC, "requires macOS process inspection")
+class NativeScratchHolderTests(ScratchRecordTests):
+    daemon = """
+import os
+import sys
+if (child := os.fork()) == 0:
+    os.setsid()
+    if sys.argv[1] == "double" and os.fork():
+        os._exit(0)
+    print(os.getpid(), flush=True)
+    os.chdir("/")
+    os.closerange(0, 256)
+    os.execve("/bin/sleep", ["sleep", "45"], {})
+if sys.argv[1] == "double":
+    os.waitpid(child, 0)
+"""
+
+    def setUp(self):
+        super().setUp()
+        self.enterContext(patch.object(launchd, "bundled", return_value=False))
+
+    def register_cleanup(self, pid):
+        owner = scratch.identity_of(pid)
+        self.addCleanup(self.stop, pid, owner)
+        return pid, owner
+
+    def stop(self, pid, owner):
+        if owner is not None and scratch.identity_of(pid) == owner:
+            with suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGTERM)
+        until = time.monotonic() + 3
+        while owner is not None and scratch.identity_of(pid) == owner and time.monotonic() < until:
+            time.sleep(.01)
+        self.assertTrue(owner is None or scratch.identity_of(pid) != owner, pid)
+
+    def start(self, attempt, modern):
+        command = [sys.executable, "-c", self.daemon, "double" if modern else "direct"]
+        monitors = {}
+        with scratch.producing(attempt):
+            if modern:
+                proc = scratch.spawn(command, actor_confined=True, cwd=attempt.workspace, stdout=subprocess.PIPE)
+                monitors = scratch.monitors(self.record(attempt))
+                for monitor in monitors.values():
+                    self.register_cleanup(monitor)
+            else:
+                proc = subprocess.Popen(command, cwd=attempt.workspace, stdout=subprocess.PIPE, start_new_session=True)
+        with proc:
+            output, _ = proc.communicate(timeout=5)
+            self.assertEqual(proc.returncode, 0)
+        pid, owner = self.register_cleanup(int(output))
+        processes = scratch.processes(attempt.workspace)
+        self.assertIn(owner, processes)
+        self.assertTrue(processes[owner].orphaned)
+        self.assertIs(processes[owner].uses_paths, False)
+        self.assertNotEqual(processes[owner].group, proc.pid)
+        for identity, group in monitors.items():
+            self.assertTrue(processes[identity].orphaned)
+            self.assertEqual(processes[identity].group, group)
+        return proc.pid, (pid, owner)
+
+    def test_double_fork_keeps_its_attempt_after_the_producer_exits(self):
+        first, second = self.attempt("a"), self.attempt("b")
+        _, own = self.start(first, modern=True)
+        _, foreign = self.start(second, modern=True)
+
+        self.assertEqual(scratch.end(first, Path(first.run_dir))[2], [first.root])
+        self.assertEqual(scratch.holding(first), [{"pid": own[0], "name": "sleep", "reason": scratch.MONITORED}])
+        self.stop(*own)
+        self.assertEqual(scratch.recover_pending(), [first.root])
+        self.assertEqual(scratch.holding(second), [{"pid": foreign[0], "name": "sleep", "reason": scratch.MONITORED}])
+
+    def test_legacy_record_holds_detached_child_during_recovery(self):
+        attempt = self.attempt("a", before=list(scratch.process_ids()))
+        group, child = self.start(attempt, modern=False)
+        with self.registry() as (fd, key):
+            data = scratch.load(fd, key, attempt.selector)
+            data.update(state="retained", producers={"verify": {"gated": True, "group": group}})
+            scratch.store(fd, key, data)
+
+        with patch.object(launchd.Table, "job", return_value=None):
+            self.assertEqual(scratch.recover_pending(), [])
+            self.assertEqual(scratch.holding(attempt),
+                             [{"pid": child[0], "name": "sleep", "reason": scratch.LEGACY_ORPHAN}])
+            self.stop(*child)
+            self.assertEqual(scratch.recover_pending(), [attempt.root])
+            self.assertEqual(self.record(attempt)["state"], "done")
 
 
 class OptimizeTests(unittest.TestCase):

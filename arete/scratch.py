@@ -11,6 +11,7 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -18,10 +19,10 @@ import time
 import unicodedata
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
-from . import launchd, paths, sandbox, util
+from . import launchd, paths, sandbox, scratch_process, util
 from .store import runs as run_store
 
 PREFIX = paths.SCRATCH_PREFIX
@@ -61,11 +62,14 @@ SELECTOR_FILE = re.compile(r"^[0-9a-f]{64}\.json$")
 PRODUCING: ContextVar[Attempt | None] = ContextVar("verification_attempt", default=None)
 IN_GROUP = "in a producer group"
 ORPHAN = "orphan of a producer"
+DESCENDANT = "descendant of a verification producer"
+MONITORED = "in a verification producer's process tree"
+LEGACY_ORPHAN = "possible descendant of a pre-upgrade producer"
+USING_PATHS = "using verification paths"
 SUBMITTED = "submitted launchd job"
 UNCLASSIFIED_HOLDER = "unclassified"
 WAITING = "waiting for registered verification producers to exit; authority revoked"
-GATED_EXEC = ("import os,sys; fd=int(sys.argv[1]); ready=os.read(fd,1); os.close(fd); "
-              "ready==b'1' or sys.exit(125); os.execvpe(sys.argv[2],sys.argv[2:],os.environ)")
+PROCESS_LAUNCHER = str(Path(scratch_process.__file__).resolve())
 
 
 def identity(st: os.stat_result) -> list[int]:
@@ -709,6 +713,7 @@ def make(run_id: str, step: str, workspace: Path, run_dir: Path) -> Attempt:
         data = {"version": 2, "engine": secrets.token_hex(16), "attempt": asdict(a), "run": run_identity,
                 "evidence": [], "state": "initializing", "diagnostic": "",
                 "archives": [], "producers": {}, "before": sorted(before), "labels": labels,
+                "run_process": identity_of(os.getpid()), "process_boot": boot_session(),
                 "source_mutations": False, "cleanup_version": 3}
         lease = None
         try:
@@ -784,6 +789,10 @@ class Process:
     parent: int
     group: int
     executable: str
+    orphaned: bool = False
+    uses_paths: bool | None = None
+    responsible: int = 0
+    started: float = 0
 
 
 def process_ids(*workspaces: str) -> dict[int, int]:
@@ -799,6 +808,15 @@ def identity_of(pid: int) -> int | None:
     return info[2]
 
 
+def boot_session() -> str | None:
+    if paths.ON_MAC:
+        value = ctypes.create_string_buffer(37)
+        size = ctypes.c_size_t(ctypes.sizeof(value))
+        if ctypes.CDLL(None).sysctlbyname(b"kern.bootsessionuuid", value, ctypes.byref(size), None, 0) == 0:
+            return value.value.decode("ascii")
+    return None
+
+
 def executable_of(lib, pid: int, short) -> str:
     buffer = ctypes.create_string_buffer(4096)
     if lib.proc_pidpath(pid, buffer, ctypes.sizeof(buffer)) > 0:
@@ -806,21 +824,81 @@ def executable_of(lib, pid: int, short) -> str:
     return os.fsdecode(bytes(short)[16:32].split(b"\0", 1)[0])
 
 
-def processes(*workspaces: str) -> dict[int, Process]:
+VNODE_INFO_SIZE = 152
+FILE_INFO_SIZE = 24
+MAX_PATH_LENGTH = 1024
+VNODE_PATH_SIZE = VNODE_INFO_SIZE + MAX_PATH_LENGTH
+PROC_PIDLISTFDS = 1
+PROC_PIDTBSDINFO = 3
+PROC_PIDVNODEPATHINFO = 9
+PROC_PIDFDVNODEPATHINFO = 2
+PROX_FDTYPE_VNODE = 1
+
+
+def started_at(lib, pid: int) -> float:
+    info = (ctypes.c_uint64 * 17)()
+    if lib.proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, info, ctypes.sizeof(info)) == ctypes.sizeof(info):
+        return info[-2] + info[-1] / 1_000_000
+    return 0
+
+
+def path_in_roots(raw: bytes, roots: tuple[tuple[str, str], ...]) -> bool:
+    path = os.fsdecode(raw.split(b"\0", 1)[0])
+    if not path.startswith("/"):
+        return False
+    if path.startswith(DATA_VOLUME_PREFIX):
+        path = path[len(DATA_VOLUME_PREFIX) - 1:]
+    name = folded_text(path)
+    return any(name == root or name.startswith(prefix) for root, prefix in roots)
+
+
+def uses_paths(lib, pid: int, roots: tuple[tuple[str, str], ...]) -> bool | None:
+    cwd = ctypes.create_string_buffer(2 * VNODE_PATH_SIZE)
+    cwd_read = lib.proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, cwd, ctypes.sizeof(cwd)) == ctypes.sizeof(cwd)
+    if cwd_read and path_in_roots(cwd.raw[VNODE_INFO_SIZE:VNODE_PATH_SIZE], roots):
+        return True
+    fd_size = 2 * ctypes.sizeof(ctypes.c_int)
+    size = lib.proc_pidinfo(pid, PROC_PIDLISTFDS, 0, None, 0)
+    if size <= 0 or size % fd_size:
+        return None
+    fds = (ctypes.c_int * (size // ctypes.sizeof(ctypes.c_int)))()
+    ctypes.set_errno(0)
+    used = lib.proc_pidinfo(pid, PROC_PIDLISTFDS, 0, fds, size)
+    if not 0 <= used <= size or used % fd_size or (not used and ctypes.get_errno()):
+        return None
+    complete = cwd_read and used < size
+    info = ctypes.create_string_buffer(FILE_INFO_SIZE + VNODE_PATH_SIZE)
+    for index in range(0, used // ctypes.sizeof(ctypes.c_int), 2):
+        if fds[index + 1] != PROX_FDTYPE_VNODE:
+            continue
+        ctypes.set_errno(0)
+        result = lib.proc_pidfdinfo(pid, fds[index], PROC_PIDFDVNODEPATHINFO, info, ctypes.sizeof(info))
+        if result == ctypes.sizeof(info):
+            if path_in_roots(info.raw[FILE_INFO_SIZE + VNODE_INFO_SIZE:], roots):
+                return True
+        elif ctypes.get_errno() not in (errno.EBADF, errno.ENOENT):
+            complete = False
+    return False if complete else None
+
+
+def processes(*workspaces: str, legacy: bool = False) -> dict[int, Process]:
     if not paths.ON_MAC:
         raise sandbox.ConfinementUnavailable("producer lifetime inspection unavailable")
     lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
     lib.proc_listpids.argtypes = (ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p, ctypes.c_int)
     lib.proc_pidinfo.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int)
+    lib.proc_pidfdinfo.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_int)
     lib.proc_pidpath.argtypes = (ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32)
     box = ctypes.CDLL(None)
-    box.sandbox_check.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int)
+    names = {str(path) for workspace in workspaces for path in spellings(Path(workspace))}
+    roots = tuple((name, name.rstrip("/") + "/") for name in names)
+    pids = (ctypes.c_int * (max(lib.proc_listpids(4, os.getuid(), None, 0), 0) // 4 + 1024))()
     for _ in range(50):
         found: dict[int, Process] = {}
-        pids = (ctypes.c_int * (max(lib.proc_listpids(4, os.getuid(), None, 0), 0) // 4 + 1024))()
         size = lib.proc_listpids(4, os.getuid(), pids, ctypes.sizeof(pids))
         settled = 0 < size < ctypes.sizeof(pids)
-        for pid in pids[:max(size, 0) // 4]:
+        listed = set(pids[:max(size, 0) // 4])
+        for pid in listed:
             info, after, parent = (ctypes.c_uint64 * 7)(), (ctypes.c_uint64 * 7)(), (ctypes.c_uint32 * 16)()
             if not pid or pid == os.getpid():
                 continue
@@ -829,33 +907,54 @@ def processes(*workspaces: str) -> dict[int, Process]:
                 box.sysctl((ctypes.c_int * 4)(1, 14, 1, pid), 4, kinfo, ctypes.byref(length), None, ctypes.c_size_t(0))
                 settled = settled and length.value == 648 and kinfo.raw[36] == 5
                 continue
-            if info[2] in found:
+            process_identity, original_parent = info[2:4]
+            if process_identity in found:
                 continue
-            outside = workspaces and (box.sandbox_check(pid, None, 0) == 0 or all(box.sandbox_check(
-                pid, b"file-write-create", 1, ctypes.c_char_p(os.fsencode(w))) == 1 for w in workspaces))
+            responsible = scratch_process.responsible_identity(pid) if roots else 0
+            started = started_at(lib, pid) if legacy else 0
             if (lib.proc_pidinfo(pid, 13, 0, parent, ctypes.sizeof(parent)) != ctypes.sizeof(parent)
                     or lib.proc_pidinfo(pid, 17, 0, after, ctypes.sizeof(after)) != ctypes.sizeof(after)
-                    or after[2] != info[2]):
+                    or after[2] != process_identity):
                 settled = False
                 continue
-            key = -1 if outside else info[3] if parent[1] != 1 else 0
-            found[info[2]] = Process(pid, info[2], key, parent[2],
-                                     executable_of(lib, pid, parent) if workspaces else "")
+            found[process_identity] = Process(pid, process_identity, original_parent, parent[2],
+                                              executable_of(lib, pid, parent) if roots else "", parent[1] == 1,
+                                              responsible=responsible, started=started)
         if settled:
-            return found
+            if not roots:
+                return found
+            count = lib.proc_listpids(4, os.getuid(), pids, ctypes.sizeof(pids)) // 4
+            if 0 < count < len(pids) and set(pids[:count]) <= listed:
+                for identity, process in found.items():
+                    accessed = uses_paths(lib, process.pid, roots)
+                    if accessed is not None and identity_of(process.pid) == identity:
+                        found[identity] = replace(process, uses_paths=accessed)
+                return found
     raise OSError(errno.EBUSY, "producer changed during enumeration")
 
 
-def producer_group(a: Attempt, producer: str, group: int | None) -> None:
+def producer_entry(group: int | None) -> dict:
+    entry = {"gated": True, "group": group}
+    if group:
+        if (identity := identity_of(group)) is None:
+            raise OSError(errno.ESRCH, "verification producer identity unavailable")
+        entry["identity"] = identity
+    return entry
+
+
+def producer_group(a: Attempt, producer: str, group: int | None, monitor: int | None = None) -> None:
     with registry() as (fd, key):
         fcntl.flock(fd, fcntl.LOCK_EX)
         data = load(fd, key, a.selector)
         if data["attempt"] != asdict(a) or data["state"] not in LIVE:
             raise PermissionError("verification producer authority revoked")
-        if producer not in data["producers"]:
-            data["producers"][producer] = {"gated": True}
-        entry = data["producers"][producer]
-        entry["group"] = group
+        entry = producer_entry(group)
+        if monitor is not None:
+            owner = identity_of(monitor)
+            if not owner or scratch_process.responsible_identity(monitor) != owner:
+                raise OSError(errno.ESRCH, "verification producer monitor identity unavailable")
+            entry["monitor"] = {"pid": monitor, "identity": owner}
+        data["producers"][producer] = entry
         store(fd, key, data)
 
 
@@ -882,6 +981,7 @@ def service_command(a: Attempt, command: str, browser_port: int | None = None) -
 
 
 DATA_VOLUME = Path("/System/Volumes/Data")
+DATA_VOLUME_PREFIX = str(DATA_VOLUME) + "/"
 
 
 def browser_path(run_dir: str) -> Path:
@@ -929,8 +1029,12 @@ def traversed(path: Path) -> tuple[set[Path], Path]:
     return seen, current
 
 
+def folded_text(path: str) -> str:
+    return unicodedata.normalize("NFD", unicodedata.normalize("NFD", path).casefold())
+
+
 def folded(path: Path) -> Path:
-    return Path(unicodedata.normalize("NFD", unicodedata.normalize("NFD", str(path)).casefold()))
+    return Path(folded_text(str(path)))
 
 
 def spellings(path: Path) -> set[Path]:
@@ -962,30 +1066,42 @@ def spawn(*args, actor_confined: bool = False, **kwargs) -> subprocess.Popen:
         command = [kwargs.pop("executable", None) or "/bin/sh", "-c", command]
     if a is None:
         return subprocess.Popen(sandbox.protected_command(command, kwargs.get("cwd")), *rest, **kwargs)
-    producer = secrets.token_hex(16)
-    producer_group(a, producer, None)
     kwargs.pop("process_group", None)
     if not actor_confined:
         with registry() as (fd, key):
             if load(fd, key, a.selector)["state"] == "active":
                 raise sandbox.ConfinementUnavailable("active authority requires verified actor confinement")
         command = sandbox.protected_command(command, kwargs.get("cwd"))
+    producer = secrets.token_hex(16)
+    producer_group(a, producer, None)
+    passed = tuple(kwargs.get("pass_fds", ()))
+    command = [os.fsdecode(word) for word in command]
     read_gate, release_gate = os.pipe()
     try:
-        proc = subprocess.Popen([str(Path(sys.executable).resolve()), "-I", "-c", GATED_EXEC,
-                                 str(read_gate), *command], *rest,
-                                **{**kwargs, "start_new_session": True,
-                                   "pass_fds": (*kwargs.get("pass_fds", ()), read_gate)})
-    except OSError:
-        producer_group(a, producer, 0)
-        raise
-    else:
+        registration, ready = os.pipe()
         try:
-            producer_group(a, producer, proc.pid)
-            os.write(release_gate, b"1")
-        except BaseException:
-            util.stop_group(proc)
-            raise
+            try:
+                proc = subprocess.Popen([str(Path(sys.executable).resolve()), "-I", PROCESS_LAUNCHER, "relay",
+                                         str(read_gate), str(ready), ",".join(map(str, passed)), *command], *rest,
+                                        **{**kwargs, "start_new_session": True,
+                                           "pass_fds": (*passed, read_gate, ready)})
+            finally:
+                os.close(ready)
+            try:
+                owner = os.read(registration, 32)
+                if not owner.isdigit():
+                    raise OSError(errno.EIO, "verification producer monitor did not start")
+                producer_group(a, producer, proc.pid, int(owner))
+                os.write(release_gate, b"1")
+            except BaseException:
+                util.stop_group(proc)
+                raise
+        finally:
+            os.close(registration)
+    except BaseException:
+        with suppress(OSError):
+            producer_group(a, producer, 0)
+        raise
     finally:
         os.close(read_gate)
         os.close(release_gate)
@@ -996,27 +1112,30 @@ def service_labels() -> dict[str, list[str]] | None:
     return launchd.labels(os.getuid())
 
 
-def service_reason(p: Process, current: dict[int, Process], unrelated: set[int], table: launchd.Table,
+def service_reason(p: Process, current: dict[int, Process], owned: set[int], table: launchd.Table,
                    labels: dict | None) -> str:
     try:
         job = table.job(p.pid, launchd.bundled(p.executable))
     except launchd.Unreadable:
-        return UNCLASSIFIED_HOLDER
+        return "" if p.uses_paths is False else UNCLASSIFIED_HOLDER
+    owner = current.get(int(job.domain[4:])) if job is not None and job.domain.startswith("pid/") else None
+    if p.uses_paths is False:
+        return (UNCLASSIFIED_HOLDER if owner is not None and owner.identity in owned
+                and identity_of(owner.pid) == owner.identity else "")
     if job is None:
-        return ORPHAN
+        return USING_PATHS if p.uses_paths else ORPHAN
     if not launchd.sealed(job.path):
         return SUBMITTED
     if not job.domain.startswith("pid/"):
         if not isinstance(labels, dict):
             return UNCLASSIFIED_HOLDER
-        if job.label not in labels.get(job.domain.split("/")[0], ()):
+        if not launchd.loaded_label(job, labels.get(job.domain.split("/")[0], ())):
             return SUBMITTED
     if (identity_of(p.pid) != p.identity or not launchd.sealed(p.executable)
             or not launchd.runs(job.path, p.executable)):
         return UNCLASSIFIED_HOLDER
     if job.domain.startswith("pid/"):
-        owner = current.get(int(job.domain[4:]))
-        if owner is None or owner.identity not in unrelated or identity_of(owner.pid) != owner.identity:
+        if owner is None or owner.identity in owned or identity_of(owner.pid) != owner.identity:
             return UNCLASSIFIED_HOLDER
     return ""
 
@@ -1025,16 +1144,76 @@ def holder(p: Process, reason: str) -> dict:
     return {"pid": p.pid, "name": os.path.basename(p.executable) or "unknown", "reason": reason}
 
 
-def live_groups(data: dict) -> list[int] | None:
+def monitors(data: dict) -> dict[int, int]:
+    return {entry["monitor"]["identity"]: entry["monitor"]["pid"] for entry in data.get("producers", {}).values()
+            if isinstance(entry, dict) and "monitor" in entry}
+
+
+def stop_monitors(data: dict) -> None:
+    recorded_boot = data.get("process_boot")
+    if recorded_boot and boot_session() != recorded_boot:
+        return
+    for owner, pid in monitors(data).items():
+        if identity_of(pid) == owner and scratch_process.responsible_identity(pid) == owner:
+            with suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGTERM)
+
+
+def legacy_groups(data: dict) -> set[int]:
+    return {group for entry in data["producers"].values()
+            if (group := entry.get("group") if isinstance(entry, dict) else entry)
+            and (not isinstance(entry, dict) or "identity" not in entry)}
+
+
+def record_legacy_window(data: dict, fd: int) -> None:
+    if not legacy_groups(data):
+        return
+    prior = data.get("diagnostic")
+    held = prior.get("holders", ()) if isinstance(prior, dict) else ()
+    if (window := data.get("legacy_window")) is not None:
+        if any(h["reason"] != SUBMITTED for h in held):
+            window[1] = max(window[1], time.time())
+        return
+    selector = data["attempt"]["selector"]
+    try:
+        lease = os.stat(selector + ".lease", dir_fd=fd, follow_symlinks=False)
+    except FileNotFoundError:
+        lease = os.stat(data["attempt"]["run_dir"], follow_symlinks=False)
+        checked(lease, data["run"], directory=True)
+    start = getattr(lease, "st_birthtime", lease.st_ctime)
+    saved = os.stat(selector + ".json", dir_fd=fd, follow_symlinks=False).st_mtime
+    only_submitted = (data["state"] == "retained" and isinstance(prior, dict) and prior.get("message") == WAITING
+                      and not prior.get("more") and held and all(h["reason"] == SUBMITTED for h in held))
+    data["legacy_window"] = [start, max(start, saved if only_submitted else time.time())]
+
+
+def legacy_reason(p: Process, window: list[float], current: dict[int, Process], owned: set[int],
+                  table: launchd.Table, labels: dict | None) -> str:
+    if p.orphaned and (p.started == 0 or window[0] <= p.started <= window[1]):
+        if service_reason(replace(p, uses_paths=None), current, owned, table, labels):
+            return LEGACY_ORPHAN
+    return ""
+
+
+def live_groups(data: dict, by_pid: dict[int, Process]) -> list[int] | None:
     live = []
-    for group in data["producers"].values():
-        if isinstance(group, dict) and group.get("gated") is True:
-            group = group["group"]
+    legacy = legacy_groups(data)
+    window = data.get("legacy_window")
+    for entry in data["producers"].values():
+        group = entry
+        if isinstance(entry, dict) and entry.get("gated") is True:
+            group = entry["group"]
             if group is None:
+                continue
+            leader = by_pid.get(group)
+            if leader is not None and "identity" in entry and leader.identity != entry["identity"]:
                 continue
         if group is None:
             return None
         if group:
+            if window and group in legacy and (leader := by_pid.get(group)) is not None:
+                if leader.started and not window[0] <= leader.started <= window[1]:
+                    continue
             try:
                 os.killpg(group, 0)
             except ProcessLookupError:
@@ -1049,38 +1228,56 @@ def holders(data: dict) -> list[dict]:
     unknown_holder = {"pid": 0, "name": "unknown", "reason": UNCLASSIFIED_HOLDER}
     if "producers" not in data or "before" not in data:
         return [unknown_holder]
-    groups = live_groups(data)
+    attempt = data["attempt"]
+    legacy = legacy_groups(data)
+    current = processes(attempt["workspace"], str(browser_path(attempt["run_dir"])),
+                        str(evidence_path(attempt["run_dir"])), legacy=bool(legacy))
+    by_pid = {p.pid: p for p in current.values()}
+    recorded_boot = data.get("process_boot")
+    current_boot = boot_session() if recorded_boot else None
+    same_boot = not current_boot or recorded_boot == current_boot
+    groups = live_groups(data, by_pid) if same_boot else []
     if groups is None:
         return [unknown_holder]
-    attempt = data["attempt"]
-    current = processes(attempt["workspace"], str(browser_path(attempt["run_dir"])), str(evidence_path(attempt["run_dir"])))
-    by_pid = {p.pid: p for p in current.values()}
+    tracked = monitors(data) if same_boot else {}
     why = {p.identity: IN_GROUP for p in current.values() if p.group in groups}
     held = [{"pid": g, "name": "unknown", "reason": IN_GROUP} for g in groups
             if not any(p.group == g for p in current.values())]
-    unrelated, table = {-1, *data["before"]}, launchd.Table(os.getuid(), by_pid)
-    while True:
-        while descendants := {i for i, p in current.items() if p.parent in unrelated} - unrelated:
-            unrelated.update(descendants)
-        exempt = {i for i, p in current.items() if p.parent == 0 and i not in unrelated and i not in why
-                  and not service_reason(p, by_pid, unrelated, table, data.get("labels"))}
-        if not exempt:
-            break
-        unrelated.update(exempt)
-    rest = [i for i in current if i not in unrelated and i not in why]
-    for i in rest:
-        if current[i].parent == 0:
-            why[i] = service_reason(current[i], by_pid, unrelated, table, data.get("labels")) or UNCLASSIFIED_HOLDER
-    rest = [i for i in rest if i not in why]
-    while rest:
-        placed = [i for i in rest if current[i].parent in why or current[i].parent not in current]
-        for i in placed:
-            why[i] = why.get(current[i].parent, UNCLASSIFIED_HOLDER)
-        if not placed:
-            placed = rest
-            for i in rest:
-                why[i] = UNCLASSIFIED_HOLDER
-        rest = [i for i in rest if i not in placed]
+    if not data.get("producers_drained"):
+        held.extend({"pid": pid, "name": scratch_process.MONITOR_NAME, "reason": UNCLASSIFIED_HOLDER}
+                    for owner, pid in tracked.items() if owner not in current)
+        why.update((i, MONITORED) for i, p in current.items()
+                   if i not in why and i not in tracked and p.responsible in tracked)
+    before = set(data["before"]) if same_boot else set()
+    excluded = before | tracked.keys()
+    parents = set(why)
+    if same_boot:
+        parents.update(entry["identity"] for entry in data["producers"].values()
+                       if isinstance(entry, dict) and "identity" in entry)
+        parents.update(by_pid[group].identity for group in legacy.intersection(groups) if group in by_pid)
+        if (owner := data.get("run_process")) is not None:
+            parents.add(owner)
+    while descendants := {i for i, p in current.items() if p.parent in parents} - excluded - why.keys():
+        why.update((i, ORPHAN if current[i].orphaned else DESCENDANT) for i in descendants)
+        parents = descendants
+    owned = set(why)
+    table = launchd.Table(os.getuid(), by_pid)
+    window = data.get("legacy_window") if legacy and same_boot else None
+    foreign = {owner for other in records() if other["attempt"]["selector"] != attempt["selector"]
+               for owner in monitors(other)} if window else set()
+    for i, p in current.items():
+        if i in why or (i in tracked and not p.uses_paths):
+            continue
+        if p.uses_paths:
+            why[i] = (service_reason(p, by_pid, owned, table, data.get("labels")) or USING_PATHS
+                      if p.orphaned and i not in tracked else USING_PATHS)
+        elif (i not in before and (p.orphaned or p.parent == 0) and (owned or p.uses_paths is None)
+              and launchd.bundled(p.executable)):
+            if reason := service_reason(p, by_pid, owned, table, data.get("labels")):
+                why[i] = reason
+        elif window and i not in before and p.responsible not in foreign:
+            if reason := legacy_reason(p, window, by_pid, owned, table, data.get("labels")):
+                why[i] = reason
     held.extend(holder(current[i], reason) for i, reason in why.items())
     return sorted(held, key=lambda h: h["pid"])
 
@@ -1102,6 +1299,9 @@ def blocking_holders(a: Attempt) -> list[dict] | None:
     for d in records():
         if (d["attempt"]["selector"] != a.selector and d["state"] != "done"
                 and overlap(Path(d["attempt"]["workspace"]), Path(a.workspace))):
+            if legacy_groups(d) and d["state"] not in OPENING:
+                with registry() as (fd, _):
+                    record_legacy_window(d, fd)
             held = holders(d) if d["state"] not in OPENING else []
             if held or d["state"] in OPENING:
                 blocked = True
@@ -1544,6 +1744,7 @@ def end(a: Attempt, run_dir: Path) -> tuple[str, list[str], list[str]]:
             matched = True
             if data["state"] == "done":
                 return "", [], [a.root] if os.path.lexists(a.root) else []
+            record_legacy_window(data, fd)
             data["state"] = "pending"
             store(fd, key, data)
             browser.stop_browser(data)
@@ -1552,6 +1753,11 @@ def end(a: Attempt, run_dir: Path) -> tuple[str, list[str], list[str]]:
                 data["diagnostic"] = holders_diagnostic(WAITING, held)
                 store(fd, key, data)
                 return "", [], kept
+            if monitors(data):
+                if not data.get("producers_drained"):
+                    data["producers_drained"] = True
+                    store(fd, key, data)
+                stop_monitors(data)
             if (blocked := blocking_holders(a)) is not None:
                 data["diagnostic"] = holders_diagnostic("another verification attempt still holds this workspace",
                                                         blocked)
@@ -1600,6 +1806,7 @@ def retain(a: Attempt) -> None:
         data = load(fd, key, a.selector)
         if data["attempt"] != asdict(a):
             return
+        record_legacy_window(data, fd)
         data["state"] = "retained"
         try:
             held = holders(data)[:MAX_HOLDERS]
