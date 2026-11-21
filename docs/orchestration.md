@@ -53,9 +53,15 @@ Use the ordinary task-start, status, wait, lines, stop, answer, resume, records 
 The controller has no owner-question tool; its validated `owner.ask` operation uses the existing owner-question lifecycle.
 Steering queues durable next-turn guidance and does not claim to interrupt an active tool call.
 Cancellation retains edits and requires the worker process group to become quiescent before another producer can take its place.
-A controller `run.wait` returns on worker completion or failure, no active workers, or its requested timeout of 1–120 seconds.
-Routine model progress and heartbeats remain available in records and viewers without ending that wait or spending another controller decision.
-Stop and run deadlines still interrupt the wait promptly.
+A controller `run.wait` returns on worker completion, failure, a new progress report, or the applicable timeout.
+Use `timeout_seconds: 0` to follow active workers until the earliest remaining worker step timeout or the run deadline.
+A positive timeout sets an additional bound and the default is 60 seconds.
+Early wakeups for progress are spaced by `progress_seconds`, with routine tool activity and heartbeats still available in records and viewers.
+Stop and the run deadline interrupt the wait promptly.
+
+A decision containing one wait that blocks and times out without a worker change releases its decision charge.
+A wait with no active workers returns immediately and spends a decision.
+Decisions with multiple calls spend a decision even when a wait in the batch times out.
 
 Run details include an additive `orchestration` object with lineage, generation, state version, controller decisions/launches and stable action IDs.
 Both run viewers list those actions, their results and effective requested settings.
@@ -93,7 +99,8 @@ Catalog prices that are unavailable remain unknown rather than zero.
 
 Read-only delegates may overlap within `max_workers`; implementation and mutation-capable gates serialize.
 Every provider launch requests parent admission, including route fallback.
-Controller turns and actual controller launches have finite ceilings; malformed responses consume admitted work.
+The controller records all inference launches and charges fallback launches against the launch ceiling.
+An exempt wait releases one launch charge, and malformed responses consume admitted work.
 Writing again consumes a semantic repair allowance regardless of the worker's name.
 Existing run/verification deadlines, data/payment policy and device/run admission remain authoritative.
 Adaptive structured review/verification excludes transports with hidden ungateable schema-restatement launches.
