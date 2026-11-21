@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from arete import cli, client, codebase, config, paths
+from arete import api_http, cli, client, codebase, config, paths
 from tests.test_behavior import _CliThroughServeCase
 
 
@@ -180,6 +180,72 @@ class CliRouteFallbackTests(unittest.TestCase):
                                 self.assertEqual([json.loads(line) for line in result[1]], [parent, task])
                             if legacy == "POST /api/runs/r1/stop":
                                 self.assertEqual(json.loads(seen[len(prefix) + 1][2]), {"base_version": 7})
+
+    def test_task_list_matches_v1_with_60_rate_limited_legacy_tasks(self):
+        rows = [
+            {"id": f"t-{i:04x}", "repo": "replay-sample", "title": f"Task {i}", "body": f"Task {i}\nDétails",
+             "kind": "feat" if i % 2 else "fix", "state": "todo" if i % 3 else "done",
+             "parent": "t-0000" if i % 2 else "", "created": f"2026-01-01T00:00:{i:02d}Z",
+             "updated": f"2026-01-03T00:00:{i * 17 % 60:02d}Z", "version": i + 1}
+            for i in range(60)
+        ]
+        summary_fields = ("id", "repo", "title", "kind", "state", "updated")
+        newest_updates = sorted(rows, key=lambda row: row["updated"], reverse=True)
+        summaries = [{k: row[k] for k in summary_fields} for row in newest_updates]
+        details = {f"/api/tasks/{row['id']}": {**row, "comments": [], "runs": [], "children": []}
+                   for row in newest_updates}
+        meta, primary, legacy = "/api/meta", "/api/v1/tasks", "/api/tasks"
+        now = 0.0
+        pauses = []
+        seen = []
+        old = False
+
+        def sleep(seconds):
+            nonlocal now
+            pauses.append(seconds)
+            now += seconds
+
+        clock = SimpleNamespace(monotonic=lambda: now, sleep=sleep)
+        limits = api_http.RateLimits(clock.monotonic)
+
+        def response(request):
+            nonlocal now
+            self.assertEqual(request.command, "GET")
+            self.assertNotIn("Idempotency-Key", request.headers)
+            path = request.path
+            seen.append(path)
+            headers = {"Arete-API": "1.1" if old else "1.2"}
+            now += 0.001
+            try:
+                limits.take("legacy" if old else "v1", command=False)
+            except api_http.RateLimited as error:
+                return (429, {"error": str(error), "code": error.code, **error.details},
+                        {**headers, "Retry-After": str(error.retry_after)})
+            if path == meta:
+                return 200, {"instance": {"id": "api-1-1"}}, headers
+            if path == primary:
+                if old:
+                    return 404, {"error": "Nothing at GET /api/v1/tasks."}, headers
+                return 200, {"seq": "1.9", "tasks": rows}, headers
+            if path == legacy:
+                return 200, {"tasks": summaries}, headers
+            return 200, details[path], headers
+
+        with self.stub(response), mock.patch.object(client, "time", clock):
+            current = self.cli("task list")
+            self.assertEqual((current[0], current[2]), (0, ""), current)
+            self.assertEqual([json.loads(line) for line in current[1]], rows)
+            self.assertEqual(seen, [meta, primary])
+
+            old = True
+            seen.clear()
+            fallback = self.cli("task list")
+
+        self.assertEqual(fallback, current)
+        self.assertEqual(pauses, [1])
+        self.assertEqual(seen[:3], [meta, primary, legacy])
+        self.assertEqual(list(dict.fromkeys(seen[3:])), list(details))
+        self.assertEqual(len(seen[3:]), 61)
 
     def test_api_1_0_missing_v1_routes(self):
         seen = []

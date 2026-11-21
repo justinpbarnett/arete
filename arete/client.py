@@ -45,9 +45,10 @@ class Down(Exception):
 
 
 class Failed(Exception):
-    def __init__(self, answer: dict, code: int = 0):
+    def __init__(self, answer: dict, code: int = 0, *, retry_after: float | None = None):
         super().__init__(str(answer.get("error", "")))
         self.answer, self.code = answer, code
+        self.retry_after = retry_after
         self.after_restart = False
 
 
@@ -369,7 +370,7 @@ def acquired_connection(where, deadline):
         if error is not None:
             raise error
         if result is None:
-            raise Broken({"error": "task start retry budget expired"})
+            raise Broken({"error": "request retry budget expired"})
         yield result
         delivered = True
     finally:
@@ -480,20 +481,21 @@ def request_once(method: str, path: str, body: dict | None = None,
     failure = {"error": f"the server at {address(where)} answered {resp.status}"}
     if isinstance(answer, dict):
         failure.update(answer)
-    wait = retry_after(resp.getheader("Retry-After"))
+    wait = retry_after(resp.getheader("Retry-After"), limit=None if resp.status == 429 else RESTART_WAIT_SECONDS)
     if key is not None and resp.status == 409 and failure.get("code") == "idempotency_in_flight":
         failure = InFlight(failure, resp.status)
         failure.seconds = 1 if wait is None else wait
         raise failure
     if resp.status == 503 and wait is not None:
         raise Restarting(failure, wait)
-    raise Failed(failure, resp.status)
+    raise Failed(failure, resp.status, retry_after=wait)
 
 
-def retry_after(header):
+def retry_after(header, *, limit):
     value = (header or "").strip()
     if value.isascii() and value.isdigit():
-        return min(float(value), RESTART_WAIT_SECONDS)
+        seconds = float(value)
+        return seconds if limit is None else min(seconds, limit)
     try:
         when = parsedate_to_datetime(value)
         return max(0, when.timestamp() - time.time()) if when.tzinfo else None
@@ -504,7 +506,7 @@ def retry_after(header):
 def budget_left(deadline):
     left = deadline - time.monotonic()
     if left <= 0:
-        raise Broken({"error": "task start retry budget expired"})
+        raise Broken({"error": "request retry budget expired"})
     return left
 
 
@@ -627,12 +629,24 @@ def legacy_request(method, path, body, key, where, deadline):
     return answer
 
 
+def legacy_task_detail(path, where, deadline):
+    while True:
+        try:
+            return legacy_request("GET", path, None, None, where, deadline)
+        except Failed as e:
+            pause = e.retry_after
+            if e.code != 429 or pause is None or not 0 < pause < deadline - time.monotonic():
+                raise
+            time.sleep(pause)
+
+
 def legacy_task_rows(summaries, where, deadline):
+    deadline = deadline if deadline is not None else time.monotonic() + CALL_SECONDS
     rows = []
     for summary in summaries:
         identity = field(summary, "id", "tasks[].id", kind=str)
         path = f"/api/tasks/{quote(identity, safe='')}"
-        row = legacy_request("GET", path, None, None, where, deadline)
+        row = legacy_task_detail(path, where, deadline)
         if row.get("id") != identity:
             raise Failed({"error": f"GET {path} returned a different task"})
         rows.append(row)
