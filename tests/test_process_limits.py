@@ -2627,6 +2627,136 @@ class OrchestratedFinishBudgetTests(PollFixture):
         self.assertFalse((directory / "parked.json").exists())
 
 
+class OrchestrationFinishTests(Isolated):
+    PR = "https://github.com/owner/project/pull/685"
+
+    def setUp(self):
+        super().setUp()
+        self.repo = replace(self.repo, github="owner/project", tracker="github",
+                            parts=[config.Part("", "owner/project")])
+        self.cfg = config.Config(repos=[self.repo], replay=config.ReplayConfig(all=True))
+        self.issue = "658"
+        self.labels = {"agent"}
+        self.comments = []
+        self.prs = {self.PR: {"state": "OPEN", "isDraft": False}}
+        self.checkout = workspace.Checkout("", self.repo.github, self.repo.path,
+                                           paths.WORKTREES_DIR / f"{self.repo.name}-{self.issue}",
+                                           "main", pr=self.PR)
+        for module, name, func in (
+            (config, "load", lambda: self.cfg),
+            (gh, "issue", self.issue_view),
+            (gh, "issue_labels", self.edit_labels),
+            (gh, "issue_comment", self.post_comment),
+            (gh, "ensure_label", lambda *args: ""),
+            (gh, "default_branch", lambda repo: "main"),
+            (gh, "pr_merge_details", self.prs.__getitem__),
+            (gh, "pr_set_draft", self.set_draft),
+            (scratch, "process_ids", dict),
+            (scratch, "service_labels", dict),
+            (sandbox, "AUTHORITY", self.root / "authority"),
+        ):
+            self.patches.enter_context(patch.object(module, name, func))
+
+    def issue_view(self, repo, number):
+        return {"number": number, "title": "Fixture issue", "body": "Fixture description", "state": "OPEN",
+                "author": {"login": "owner"}, "labels": [{"name": label} for label in sorted(self.labels)]}
+
+    def edit_labels(self, repo, number, add=(), remove=(), **kwargs):
+        self.labels.difference_update(remove)
+        self.labels.update(add)
+
+    def post_comment(self, repo, number, body):
+        drafted = {url for url, pr in self.prs.items() if pr["isDraft"]}
+        self.comments.append((body, drafted, self.labels.copy()))
+
+    def set_draft(self, url, draft):
+        self.prs[url]["isDraft"] = draft
+
+    def run_controller(self, decide, code):
+        def prepare(flow, tree):
+            flow.ctx.run.enter("running")
+            return factory.Outcome("pass", data={
+                "layer": str(self.repo.layer_dir),
+                "checkouts": [replace(self.checkout, pr=url).to_row() for url in self.prs],
+                "ticket": asdict(flow.ctx.run.tracker.get(self.issue)), "branch": "arete/fixture",
+                "add_dirs": [], "attachments": "", "expertise": "", "triage": "",
+            })
+
+        def drive(flow):
+            controller = orchestration.Controller(flow)
+            with patch.object(controller, "decide", side_effect=lambda: decide(controller)):
+                return controller.drive()
+
+        with (patch.dict(factory.STEPS, {"prepare": prepare}),
+              patch.object(factory, "fingerprint", return_value="fixture-tree")):
+            self.assertEqual(pipeline.run_issue(self.repo.name, self.issue, script=pipeline.Script("orchestrate", drive)),
+                             code)
+        return run_store.newest_whole_run(self.repo.name, self.issue)
+
+    def controller_action(self, controller, op, args, rationale):
+        version = ledger.snapshot(controller.lease)["version"]
+        turn = ledger.begin(controller.lease, {}, controller.policy.max_decisions)
+        response = {"version": PROTOCOL, "decision_id": turn, "state_version": version,
+                    "rationale": rationale, "calls": [{"op": op, "args": args}]}
+        validated = controller.catalog.validate(response, turn, version, {})
+        return ledger.accept(controller.lease, turn, version, validated, controller.policy.max_actions)
+
+    def test_failed_finish_comments_with_its_rationale_and_drafts_open_prs(self):
+        other = "https://github.com/owner/other/pull/686"
+        closed = "https://github.com/owner/closed/pull/687"
+        self.prs[other] = {**self.prs[self.PR]}
+        self.prs[closed] = {**self.prs[self.PR], "state": "CLOSED"}
+        decisions = iter([
+            ("catalog.list", {"kind": "context"}, "The earlier decision only listed context."),
+            ("run.finish", {"reason": "failed"}, "The merge conflicts remain. See http://127.0.0.1:8000/logs."),
+        ])
+        row = self.run_controller(lambda controller: self.controller_action(controller, *next(decisions)), code=1)
+        self.assertEqual((row["status"], row["summary"]), ("failed", "the orchestrator stopped without delivery"))
+        self.assertEqual(self.labels, {"agent", "agent:failed"})
+        (comment, drafted, labels), = self.comments
+        self.assertIn("The merge conflicts remain. See [private address]/logs.", comment)
+        self.assertIn(row["id"], comment)
+        self.assertNotIn("The earlier decision", comment)
+        self.assertNotIn("127.0.0.1", comment)
+        self.assertEqual(drafted, {self.PR, other})
+        self.assertEqual(labels, {"agent", "agent:running"})
+        directory = paths.RUNS_DIR / row["id"]
+        self.assertFalse((directory / "parked.json").exists())
+        for text in (str(row), str(run_lines.read(row["id"])), (directory / "run.log").read_text(),
+                     str(ledger.view(row["id"]))):
+            self.assertNotIn("The merge conflicts remain", text)
+
+    def test_failed_finish_with_unpaired_surrogate_settles_a_local_task(self):
+        self.repo = replace(self.repo, tracker="local")
+        self.cfg = replace(self.cfg, repos=[self.repo])
+        self.issue = self.ticket
+        decisions = iter([("run.finish", {"reason": "failed"}, "Échec \ud800 de la fusion.")])
+
+        row = self.run_controller(lambda controller: self.controller_action(controller, *next(decisions)), code=1)
+
+        self.assertEqual((row["status"], row["summary"]), ("failed", "the orchestrator stopped without delivery"))
+        self.assertEqual(tasks_store.task_get(self.ticket)["state"], "failed")
+        comment, = tasks_store.task_comments(self.ticket)
+        self.assertIn(row["id"], comment["body"])
+        self.assertIn("Échec \\ud800 de la fusion.", comment["body"])
+
+    def test_delivered_finish_keeps_the_ready_pr_and_ticket_state(self):
+        def decide(controller):
+            controller.run.enter("pr")
+            controller.data["published"] = {"ending": "pr", "summary": "Delivered fixture"}
+            controller.data["published_tree"] = controller.fingerprint()
+            controller.executing = "fixture-publication"
+            for gate in ("checks", "verify", "review"):
+                controller.stamp(gate, {})
+            return self.controller_action(controller, "run.finish", {"reason": "delivered"}, "Published the change.")
+
+        row = self.run_controller(decide, code=0)
+        self.assertEqual((row["status"], row["summary"], row["pr_url"]), ("pr", "Delivered fixture", self.PR))
+        self.assertEqual(self.labels, {"agent", "agent:pr"})
+        self.assertEqual(self.comments, [])
+        self.assertFalse(self.prs[self.PR]["isDraft"])
+
+
 class BudgetReadmissionTests(ReadmissionFixture):
     def test_specification_edit_readmits_once_and_reparks_on_current_inputs(self):
         parked = self.park_ticket()
