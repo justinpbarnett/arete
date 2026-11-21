@@ -6,6 +6,7 @@ import hashlib
 import http.client
 import json
 import os
+import re
 import secrets
 import socket
 import ssl
@@ -512,7 +513,76 @@ def call(method: str, path: str, body: dict | None = None, key: str | None = Non
         key = write_key()
     if key is not None and method == "POST" and path == "/api/tasks":
         return keyed_call(body, key, deadline=deadline)
-    return decoded(request(method, path, body, key=key, buffered=True, deadline=deadline), method, path)
+    where = server(deadline)
+    try:
+        response = request(method, path, body, key=key, where=where, buffered=True, deadline=deadline)
+    except Failed as e:
+        if not path.startswith("/api/v1/") or not unknown_route(e):
+            raise
+        if legacy := legacy_route(method, path):
+            return legacy_answer(method, path, legacy, body, key, where, deadline)
+        raise Failed({"error": f"{method} {path} requires Arete serve API version 1.2 or newer",
+                      "code": "unknown_route", "required_version": "1.2"}, 404) from None
+    return decoded(response, method, path)
+
+
+def unknown_route(error: Failed) -> bool:
+    if error.code != 404:
+        return False
+    answer = error.answer
+    return reason(answer) == "unknown_route" or (
+        answer.get("type") == "urn:arete:problem:not_found"
+        and answer.get("code") == "not_found"
+        and answer.get("detail") == answer.get("error") == "No such route."
+    )
+
+
+def legacy_route(method: str, path: str) -> str | None:
+    if method == "GET" and path == "/api/v1/tasks":
+        return "/api/tasks"
+    if method == "POST" and (run := re.fullmatch(r"/api/v1/runs/([^/]+)/stop", path)):
+        return f"/api/runs/{run[1]}/stop"
+    return None
+
+
+def legacy_request(method, path, body, key, where, deadline):
+    try:
+        response = request_once(method, path, body, key=key, where=where, deadline=deadline, buffered=True)
+    except Restarting as e:
+        raise Failed(e.answer, 503) from None
+    seq = response.getheader("Arete-Seq")
+    answer = decoded(response, method, path)
+    if seq:
+        answer.setdefault("seq", seq)
+    return answer
+
+
+def legacy_task_rows(summaries, where, deadline):
+    rows = []
+    for summary in summaries:
+        identity = field(summary, "id", "tasks[].id", kind=str)
+        path = f"/api/tasks/{quote(identity, safe='')}"
+        row = legacy_request("GET", path, None, None, where, deadline)
+        if row.get("id") != identity:
+            raise Failed({"error": f"GET {path} returned a different task"})
+        rows.append(row)
+    return sorted(rows, key=lambda row: field(row, "created", "task.created", kind=str))
+
+
+def legacy_answer(method, path, legacy, body, key, where, deadline):
+    from . import api, contract
+
+    answer = legacy_request(method, legacy, body, key, where, deadline)
+    op, _ = contract.match(method, path)
+    schema = op["result"]
+    if op["name"] == "task.list":
+        answer["tasks"] = legacy_task_rows(field(answer, "tasks", kind=list), where, deadline)
+    answer = api.serialize(answer, schema)
+    try:
+        contract.validate(answer, schema, "server answer")
+    except contract.Problem as e:
+        raise Failed({"error": str(e)}) from None
+    return answer
 
 
 def decoded(resp, method, path):

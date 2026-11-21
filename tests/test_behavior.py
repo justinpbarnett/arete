@@ -42,20 +42,54 @@ class _CliThroughServeCase(unittest.TestCase):
     class_timeout = 30
     class_worker = None
     OWNER = "cli-owner@example.test"
-    ONLINE = (
-        "run replay-sample 7", "task add --repo replay-sample change", "task list", "task show t-1234",
-        "task reply t-1234 answer", "task close t-1234", "task start --repo replay-sample change",
-        "task run replay-sample 7", "answer r1", "resume r1", "repair r1", "step r1 build", "wait r1",
-        "lines r1", "status", "stop r1", "approve 1", "forget 1", "file-rule 1", "reject-rule 1",
-        "loop start example", "loop enable example", "loop disable example", "loop stop example",
-        "session start work", "session attach r1", "session send r1 hello", "session stop r1",
-        "oncall off", "oncall on", "oncall cancel 1", "oncall dismiss 1", "oncall retry 1",
-    )
-    ONLINE_VARIANTS = (
-        "status --json r1", "status --json", "record pin r1", "record unpin r1", "approve 1 --reject",
-        "loop start example -f", "session --chat 1 start work", "session --chat 1 list",
-        "session --chat 1 report r1", "session --chat 1 stop r1",
-    )
+    ONLINE = {
+        "run replay-sample 7": "POST /api/tasks",
+        "task add --repo replay-sample change": None,
+        "task list": "GET /api/tasks",
+        "task show t-1234": "GET /api/tasks/{task}",
+        "task reply t-1234 answer": None,
+        "task close t-1234": None,
+        "task start --repo replay-sample change": "POST /api/tasks",
+        "task run replay-sample 7": "POST /api/tasks",
+        "answer r1": "POST /api/asks/{id}/answer",
+        "resume r1": "POST /api/runs/{run}/resume",
+        "repair r1": "POST /api/runs/{run}/repair",
+        "step r1 build": "POST /api/runs/{run}/steps/{step}",
+        "wait r1": "GET /api/runs/{run}/events",
+        "lines r1": "GET /api/runs/{run}/events",
+        "status": None,
+        "stop r1": "POST /api/runs/{run}/stop",
+        "approve 1": "POST /api/approvals/{id}",
+        "forget 1": "POST /api/proposals/{id}/done",
+        "file-rule 1": "POST /api/proposals/{id}/approve",
+        "reject-rule 1": "POST /api/proposals/{id}/reject",
+        "loop start example": "POST /api/loops/{name}/start",
+        "loop enable example": "POST /api/loops/{name}/enable",
+        "loop disable example": "POST /api/loops/{name}/disable",
+        "loop stop example": "POST /api/runs/{run}/stop",
+        "session start work": "POST /api/sessions",
+        "session attach r1": "POST /api/sessions/{run}/send",
+        "session send r1 hello": "POST /api/sessions/{run}/send",
+        "session stop r1": "POST /api/runs/{run}/stop",
+        "oncall off": "POST /api/incidents/switch",
+        "oncall on": "POST /api/incidents/switch",
+        "oncall cancel 1": "POST /api/incidents/{id}/cancel",
+        "oncall dismiss 1": "POST /api/incidents/{id}/dismiss",
+        "oncall retry 1": "POST /api/incidents/{id}/retry",
+    }
+    ONLINE_VARIANTS = {
+        "status --json r1": "GET /api/runs/{run}/events",
+        "status --json": "GET /api/live",
+        "record pin r1": None,
+        "record unpin r1": None,
+        "approve 1 --reject": "POST /api/approvals/{id}",
+        "loop start example -f": "POST /api/loops/{name}/start",
+        "session start --attach work": "POST /api/sessions/{run}/send",
+        "session --chat 1 start work": "POST /api/chats/{chat}/sessions",
+        "session --chat 1 list": "GET /api/chats/{chat}/sessions",
+        "session --chat 1 report r1": "GET /api/chats/{chat}/sessions/{session}/report",
+        "session --chat 1 stop r1": "POST /api/chats/{chat}/sessions/{session}/stop",
+    }
     READS = (
         "ab", "backup --check", "benchmark report missing", "costs", "devices", "doctor", "events",
         "experiment summary missing", "jev report", "jira-check", "loop feed r1", "loop list", "loop status poll",
@@ -969,21 +1003,234 @@ class CliThroughServeRunTests(_CliThroughServeCase):
             for command, code in (("pin r1", 0), ("unpin r1", 0), ("unpin r1", 1), ("pin missing", 1), ("pin", 2)):
                 self.assertEqual(self.cli(f"record {command}")[0], code, command)
 
-    def test_routes_do_not_fall_back(self):
-        self.in_subprocess("check_routes_do_not_fall_back")
+    def test_missing_v1_routes_fall_back_once(self):
+        self.in_subprocess("check_missing_v1_routes_fall_back_once")
 
-    def check_routes_do_not_fall_back(self):
-        writes = []
+    def check_missing_v1_routes_fall_back_once(self):
+        seq = "1.9"
+        summary = {"id": "t-1234", "repo": "replay-sample", "title": "Change", "kind": "feat", "state": "todo",
+                   "updated": "2026-01-03T00:00:00Z"}
+        task = {**summary, "body": "Full task description", "parent": "t-5678", "created": "2026-01-02T00:00:00Z",
+                "version": 8, "title": "Edited after the list was read"}
+        parent = {**task, "id": "t-5678", "title": "Parent", "body": "Parent description", "parent": "",
+                  "created": "2026-01-01T00:00:00Z", "updated": "2026-01-01T00:00:00Z", "version": 2}
+        parent_summary = {key: parent[key] for key in summary}
+        stop = {"id": "r1", "stopped": True, "pid": 123}
+        meta = "GET /api/meta"
+        info = "GET /api/runs/r1"
+        feed = "GET /api/feed/r1?after=0"
+        loop = "GET /api/loops/example"
+        ask = "GET /api/asks"
+        events_route = "GET /api/runs/r1/events?from=0"
+        follow_events = events_route + "&follow=1"
+        session_start = "POST /api/sessions"
+        steer = "POST /api/v1/runs/r1/steer"
+        task_details = ["GET /api/tasks/t-1234", "GET /api/tasks/t-5678"]
+        report = b'{"event":"report","seq":1,"status":"done"}\n'
+        replies = {
+            meta: {"instance": {"id": "fallback"}}, loop: {"running": "r1"},
+            ask: {"asks": [{"run": "r1", "id": "1", "questions": []}]},
+            feed: {"restore_epoch": 0, "lines": []},
+            events_route: report, follow_events: report,
+            "POST /api/tasks": {"run": "r1", "task": "t-1234", "state": "running"},
+            "GET /api/tasks": {"tasks": [summary, parent_summary], "seq": seq},
+            **{route: {**row, "seq": "1.10", "comments": [], "runs": [], "children": []}
+               for route, row in zip(task_details, (task, parent))},
+            "GET /api/v1/tasks": {"seq": seq, "tasks": [parent, task]},
+            "POST /api/runs/r1/stop": stop, "POST /api/v1/runs/r1/stop": {"seq": seq, **stop},
+            steer: {"seq": seq, "id": "r1", "queued": True},
+            "POST /api/sessions/r1/send": {"id": "r1", "queued": True},
+            "POST /api/asks/1/answer": {}, "POST /api/runs/r1/resume": {}, "POST /api/runs/r1/repair": {},
+            "POST /api/runs/r1/steps/build": {}, "POST /api/approvals/1": {},
+            "POST /api/proposals/1/done": {}, "POST /api/proposals/1/approve": {}, "POST /api/proposals/1/reject": {},
+            "POST /api/loops/example/start": {"id": "r1"},
+            "POST /api/loops/example/enable": {"name": "example", "enabled": True, "serve_up": True},
+            "POST /api/loops/example/disable": {"name": "example", "enabled": False},
+            session_start: {"id": "r1", "task": False, "runner": "pi", "model": "test", "device": "local",
+                            "cwd": "/tmp", "branch": "", "tools": []},
+            "POST /api/incidents/switch": {}, "POST /api/incidents/1/cancel": {"stopped": "", "cooldown_until": ""},
+            "POST /api/incidents/1/dismiss": {}, "POST /api/incidents/1/retry": {},
+            "GET /api/live": {"live": {"rows": {"runs": []}}},
+            "GET /api/chats/1/sessions": {}, "POST /api/chats/1/sessions": {},
+            "GET /api/chats/1/sessions/r1/report": {}, "POST /api/chats/1/sessions/r1/stop": {},
+        }
+        canonical = {"GET /api/tasks": "GET /api/v1/tasks", "POST /api/runs/r1/stop": "POST /api/v1/runs/r1/stop",
+                     "POST /api/sessions/r1/send": steer}
+        before = {
+            "answer r1": [ask], "resume r1": [info], "repair r1": [info], "step r1 build": [info],
+            "stop r1": [info], "session stop r1": [info], "loop stop example": [loop, info],
+            "session attach r1": [info, feed, info], "session start --attach work": [session_start, info, feed, info],
+        }
+        after = {"run replay-sample 7": [follow_events], "loop start example -f": [feed, info] * 2,
+                 "session attach r1": [feed, info] * 2, "session start --attach work": [feed, info] * 2}
+        values = dict(task="t-1234", run="r1", session="r1", id=1, step="build", name="example", chat=1)
+        seen = []
+        old = running = False
+
+        def response(request):
+            nonlocal running
+            path = request.path
+            route = f"{request.command} {path}"
+            body = request.rfile.read(int(request.headers.get("Content-Length", "0")))
+            seen.append((route, request.headers.get("Idempotency-Key"), body))
+            if old and path.startswith("/api/v1/"):
+                return 404, {"code": "unknown_route", "error": "No such route."}, {}
+            if route == info:
+                return 200, {"run": {"kind": "session", "status": "running" if running else "done", "version": 7}}, {}
+            if route == steer or route == "POST /api/sessions/r1/send":
+                running = False
+            if route in replies:
+                return 200, replies[route], {"Arete-Seq": seq}
+            return 500, {"error": f"unexpected request {route}"}, {}
+
+        with (self.stub(response), mock.patch("select.select", return_value=([True], [], [])),
+              mock.patch("time.sleep")):
+            config_dir = paths.CONFIG_DIR
+            for index, (command, template) in enumerate((self.ONLINE | self.ONLINE_VARIANTS).items()):
+                if template is None:
+                    continue
+                with self.subTest(command=command):
+                    legacy = template.format(**values)
+                    if legacy == "GET /api/runs/r1/events":
+                        legacy = follow_events if command == "wait r1" else events_route
+                    primary = canonical.get(legacy, legacy)
+                    prefix = [meta, *before.get(command, [])]
+                    suffix = after.get(command, [])
+                    key = f"compat-{index}"
+                    primary_key = {"loop stop example": f"{key}:r1",
+                                   "session start --attach work": f"{key}:2"}.get(command, key)
+
+                    def expected(routes):
+                        return [(route, None if route.startswith("GET ") else key if route == session_start
+                                 else primary_key) for route in routes]
+
+                    old, running = False, primary == steer
+                    seen.clear()
+                    with (mock.patch.object(paths, "CONFIG_DIR", config_dir / "current"),
+                          mock.patch.dict(os.environ, {"ARETE_IDEMPOTENCY_KEY": key})):
+                        current = self.cli(command, "hello\n")
+                    self.assertEqual(current[0], 0, current)
+                    self.assertEqual([(route, key) for route, key, _ in seen], expected([*prefix, primary, *suffix]))
+                    current_requests = seen.copy()
+
+                    old, running = True, primary == steer
+                    seen.clear()
+                    with (mock.patch.object(paths, "CONFIG_DIR", config_dir / "old"),
+                          mock.patch.dict(os.environ, {"ARETE_IDEMPOTENCY_KEY": key})):
+                        result = self.cli(command, "hello\n")
+                    if primary == steer:
+                        self.assertEqual((result[0], result[2]), (1, ""), result)
+                        self.assertEqual(json.loads(result[1][-1])["required_version"], "1.2")
+                        self.assertEqual(seen, current_requests[:len(prefix) + 1])
+                        continue
+
+                    retry = [] if primary == legacy else [legacy]
+                    if legacy == "GET /api/tasks":
+                        retry += task_details
+                        self.assertEqual([json.loads(line) for line in result[1]], [parent, task])
+                    self.assertEqual(result, current)
+                    self.assertEqual([(route, key) for route, key, _ in seen],
+                                     expected([*prefix, primary, *retry, *suffix]))
+                    self.assertEqual(seen[:len(prefix) + 1], current_requests[:len(prefix) + 1])
+                    if retry:
+                        self.assertEqual(seen[len(prefix) + 1][2], current_requests[len(prefix)][2])
+
+    def test_v1_failures_without_a_legacy_retry(self):
+        self.in_subprocess("check_v1_failures_without_a_legacy_retry")
+
+    def check_v1_failures_without_a_legacy_retry(self):
+        from arete import client
+
+        seen = []
+        status, reason, headers = 404, "unknown_route", {}
+        legacy_status = 503
 
         def response(request):
             if request.path == "/api/meta":
-                return 200, {"instance": {"id": "v1-only"}}, {}
-            writes.append((request.path, request.headers.get("Idempotency-Key")))
-            return 404, {"error": "No such route", "code": "not_found"}, {}
+                return 200, {"instance": {"id": "compat-errors"}}, {}
+            if request.path == "/api/runs/r1":
+                return 200, {"run": {"version": 7}}, {}
+            seen.append((request.path, request.headers.get("Idempotency-Key")))
+            if request.path.startswith("/api/v1/"):
+                if reason == "legacy_route_missing":
+                    return 404, {"code": "not_found", "type": "urn:arete:problem:not_found",
+                                 "error": "No such route.", "detail": "No such route."}, {}
+                return status, {"error": "The request failed.", "code": reason}, headers
+            return legacy_status, {"error": "The legacy request failed.", "code": "legacy_error"}, {"Retry-After": "0"}
 
-        with self.stub(response), mock.patch.dict(os.environ, {"ARETE_IDEMPOTENCY_KEY": "v1-only-key"}):
-            self.problem("session send r1 message", "not_found")
-        self.assertEqual(writes, [("/api/v1/runs/r1/steer", "v1-only-key")])
+        commands = {
+            "task add --repo replay-sample change": "/api/v1/tasks",
+            "task reply t-1234 answer": "/api/v1/tasks/t-1234/comments",
+            "task close t-1234": "/api/v1/tasks/t-1234/close",
+            "status": "/api/v1/status?limit=10",
+            "record pin r1": "/api/v1/runs/r1/pin",
+            "record unpin r1": "/api/v1/runs/r1/unpin",
+        }
+        with (self.stub(response), mock.patch.dict(os.environ, {"ARETE_IDEMPOTENCY_KEY": "compat-key"}),
+              mock.patch.object(client, "RESTART_WAIT_SECONDS", 0)):
+            self.assertEqual(set(commands), {cmd for cmd, route in (self.ONLINE | self.ONLINE_VARIANTS).items()
+                                             if route is None})
+            for command, path in commands.items():
+                with self.subTest(command=command):
+                    seen.clear()
+                    result, lines, err = self.cli(command)
+                    self.assertEqual((result, len(lines), err), (1, 1, ""))
+                    self.assertIn("requires Arete serve API version 1.2", json.loads(lines[0])["error"])
+                    self.assertEqual(seen, [(path, None if command == "status" else "compat-key")])
+
+            for status, reason, headers in ((404, "not_found", {}), (405, "method_not_allowed", {}),
+                                            (409, "unknown_route", {}),
+                                            (422, "unknown_route", {}), (503, "unknown_route", {}),
+                                            (503, "draining", {"Retry-After": "0"})):
+                with self.subTest(status=status, reason=reason):
+                    seen.clear()
+                    self.problem("stop r1", reason)
+                    self.assertEqual(seen, [("/api/v1/runs/r1/stop", "compat-key")])
+
+            status, headers = 404, {}
+            for reason, legacy_status in (("unknown_route", 404), ("unknown_route", 503), ("legacy_route_missing", 404)):
+                with self.subTest(reason=reason, legacy_status=legacy_status):
+                    seen.clear()
+                    self.problem("stop r1", "legacy_error")
+                    self.assertEqual(seen, [("/api/v1/runs/r1/stop", "compat-key"), ("/api/runs/r1/stop", "compat-key")])
+
+    def test_session_send_retry_after_serve_rollback(self):
+        self.in_subprocess("check_session_send_retry_after_serve_rollback")
+
+    def check_session_send_retry_after_serve_rollback(self):
+        from arete import client, record
+        from arete.store import asks
+
+        seen = []
+        canonical = "/api/v1/runs/r1/steer"
+        legacy = "/api/sessions/r1/send"
+        key = "steer-replay"
+        with self.serve_at(seen), mock.patch.dict(os.environ, {"ARETE_IDEMPOTENCY_KEY": key}):
+            record.start("session", run_id="r1", pid=None)
+            first = self.cli("session send r1 hello")
+            self.assertEqual(first, (0, ['{"id": "r1", "queued": true}'], ""))
+            self.assertEqual(self.cli("session send r1 hello"), first)
+
+            match = contract.match
+
+            def older_match(method, path):
+                if path != canonical:
+                    return match(method, path)
+                return None
+
+            aliases = tuple(route for route in dashboard.CLI_ALIASES if route is not dashboard.post_session)
+            with (mock.patch.object(contract, "match", older_match), mock.patch.object(contract, "VERSION", "1.1"),
+                  mock.patch.object(dashboard, "CLI_ALIASES", aliases)):
+                self.assertEqual(self.problem("session send r1 hello", "unknown_route")["required_version"], "1.2")
+                self.assertEqual([request for request in seen if request[0] == "POST"],
+                                 [("POST", canonical, status, key) for status in (200, 200, 404)])
+                self.assertEqual(asks.take_messages("r1"), ["hello"])
+
+                with client.invocation():
+                    for _ in range(2):
+                        self.assertEqual(client.call("POST", legacy, {"text": "hello"}, key), {"id": "r1", "queued": True})
+                self.assertEqual([request for request in seen if request[1] == legacy], [("POST", legacy, 200, key)] * 2)
+                self.assertEqual(asks.take_messages("r1"), ["hello", "hello"])
 
     def test_invocation_write_keys(self):
         self.in_subprocess("check_invocation_write_keys")
