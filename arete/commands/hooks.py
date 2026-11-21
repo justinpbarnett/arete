@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import sys
 from collections import Counter
+from datetime import timedelta
+from urllib.parse import urlencode
 
-from .. import client, config, paths
+from .. import client, config, paths, util
 from ..store import db as foundation
 from ..store import incidents as incident_store
 from .common import when
@@ -13,7 +15,15 @@ from .common import when
 def cmd_events(args) -> int:
     from .. import tool_events
 
-    evs = tool_events.read_events(args.hours)
+    if remote := client.configured_server():
+        client.upload_hook_events(remote, wait=True)
+        path = "/api/v1/hook-events"
+        if args.hours != float("inf"):
+            cutoff = util.now() - timedelta(hours=args.hours)
+            path += "?" + urlencode({"since": cutoff.isoformat()})
+        evs = client.field(client.call("GET", path), "events", kind=list)
+    else:
+        evs = tool_events.read_events(args.hours)
     if args.raw:
         for e in evs[max(len(evs) - args.limit, 0):]:
             print(json.dumps(e))
@@ -262,7 +272,7 @@ def register(sub) -> None:
     p.add_argument("--hours", type=float, default=24)
     p.add_argument("--raw", action="store_true")
     p.add_argument("--limit", type=int, default=50)
-    p.set_defaults(fn=cmd_events, local_read=True)
+    p.set_defaults(fn=cmd_events, local_read=lambda args: not client.configured_server())
 
     p = sub.add_parser("oncall", help="the on-call watcher: incidents found in logs, run files and the heartbeat")
     p.add_argument("action", nargs="?", default="list", choices=("list", "show", "scan", "cancel", "dismiss", "retry", "off", "on"))
