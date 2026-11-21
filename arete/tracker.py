@@ -157,6 +157,7 @@ class GitHubTracker:
         self._bodies: dict[str, str] = {}
         self._labels: dict[str, list[str]] = {}
         self._open: dict[int, bool | None] = {}
+        self._open_agent_tickets: list[Ticket] = []
 
     @property
     def queue_hint(self) -> str:
@@ -174,21 +175,29 @@ class GitHubTracker:
     def ref(self, tid: str) -> str:
         return f"#{tid}"
 
+    @property
+    def open_agent_tickets(self) -> tuple[Ticket, ...]:
+        return tuple(self._open_agent_tickets)
+
     def todo(self, *, parked: Callable[[str], bool] | None = None) -> list[Ticket]:
         failed = self.label_name("failed")
         skip = {ZTE_LABEL, *(self.label_name(s) for s in config.RUN_LABELS if s != "failed")}
         out = []
         self._bodies, self._labels, self._open = {}, {}, {}
+        self._open_agent_tickets = []
         for i in gh.issues(self.repo.github, LABEL, limit=MAX_AGENT_ISSUES):
-            self._bodies[str(i["number"])] = i.get("body") or ""
-            self._open[int(i["number"])] = True
+            tid = str(i["number"])
             names = {lb["name"] for lb in i.get("labels", [])}
-            self._labels[str(i["number"])] = sorted(names)
+            ticket = Ticket(tid, self.ref(tid), i["title"], body=i.get("body") or "",
+                            url=i.get("url", ""), created=i.get("createdAt", ""), labels=sorted(names))
+            self._bodies[tid] = ticket.body
+            self._open[int(tid)] = True
+            self._labels[tid] = ticket.labels.copy()
+            self._open_agent_tickets.append(ticket)
             if (names & skip or not self.by_owner(i)
-                    or failed in names and not (parked and parked(str(i["number"])))):
+                    or failed in names and not (parked and parked(tid))):
                 continue
-            out.append(Ticket(str(i["number"]), f"#{i['number']}", i["title"], body=self._bodies[str(i["number"])],
-                              url=i.get("url", ""), created=i.get("createdAt", ""), labels=sorted(names)))
+            out.append(ticket)
         return sorted(out, key=lambda t: t.created)
 
     def queued_failure(self, labels: list[str]) -> bool:

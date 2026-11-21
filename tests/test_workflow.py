@@ -25,11 +25,84 @@ from unittest import mock
 from adws import single_worker
 from arete import (
     api_check, ci, config, diffguard, evals, factory, flows, gh, jev, journeys, loop_run, mergecheck, miner,
-    orchestration, owner_asks, paths, pipeline, sandbox, serve, tracker, util, verify, workspace,
+    orchestration, owner_asks, paths, pipeline, poll, queueing, sandbox, serve, tracker, util, verify, workspace,
 )
 from arete.agent import NO_SESSION, Result
 from arete.review import Review
 from arete.store import db, orchestration as ledger
+
+
+class QueueScoringTests(unittest.TestCase):
+    def setUp(self):
+        remote = "fixture/repo"
+        self.repo = config.Repo("fixture", Path("."), github=remote, parts=[config.Part("", remote)])
+        self.source = tracker.for_repo(config.Config(), self.repo)
+
+    def issue(self, number, *labels, body="", created="2026-11-21T00:00:00Z", author="fixture"):
+        return {"number": number, "title": f"Issue {number}", "body": body, "createdAt": created,
+                "author": {"login": author}, "labels": [{"name": name} for name in ("agent", *labels)]}
+
+    def next_ticket(self):
+        self.enterContext(mock.patch.object(poll.runlimits, "latest_park", return_value=(None, None)))
+        self.enterContext(mock.patch.multiple(poll.run_store, issue_running=mock.Mock(return_value=False),
+                                             pending_label=mock.Mock(return_value=""),
+                                             environment_waits=mock.Mock(return_value=[])))
+        self.enterContext(mock.patch.object(poll.pilot, "pickable", return_value=True))
+        self.enterContext(mock.patch.object(poll.zte, "reserved", return_value=False))
+        return poll.next_ticket(self.repo, self.source, pipeline.SkipLog({}))
+
+    def test_poll_prioritizes_prerequisite_of_in_flight_chain(self):
+        issues = [self.issue(1), self.issue(2, "agent:pr", body="Waits on #1."),
+                  self.issue(3, "agent:running", body="Waits on #2."),
+                  self.issue(4, created="2026-11-20T00:00:00Z")]
+        self.enterContext(mock.patch.object(gh, "issues", return_value=issues))
+
+        todo = self.source.todo()
+        self.assertEqual([ticket.id for ticket in todo], ["4", "1"])
+        self.assertEqual(self.next_ticket().id, "1")
+        self.assertEqual(queueing.scores(todo, open_tickets=self.source.open_agent_tickets)["1"], (3, 2))
+
+    def test_poll_prioritizes_prerequisite_of_in_flight_cycle(self):
+        issues = [self.issue(1), self.issue(2, body="Waits on #1."),
+                  self.issue(3, "agent:pr", body="Waits on #2 and #4."),
+                  self.issue(4, "agent:running", body="Waits on #3."),
+                  self.issue(5, created="2026-11-20T00:00:00Z"), self.issue(6, body="Waits on #5.")]
+        self.enterContext(mock.patch.object(gh, "issues", return_value=issues))
+
+        todo = self.source.todo()
+        self.assertEqual([ticket.id for ticket in todo], ["5", "1", "2", "6"])
+        self.assertEqual(self.next_ticket().id, "1")
+        scores = queueing.scores(todo, open_tickets=self.source.open_agent_tickets)
+        self.assertEqual(scores, {"1": (3, 3), "2": (2, 2), "3": (1, 1), "4": (1, 1), "5": (2, 1), "6": (1, 0)})
+
+    def test_rank_counts_failed_and_other_ineligible_open_agent_tickets(self):
+        issues = [self.issue(1), self.issue(2, created="2026-11-19T00:00:00Z"),
+                  self.issue(3, "agent:failed", body="Waits on #1, #1, #2 and #6."),
+                  self.issue(4, "agent:zte", body="Waits on #1."), self.issue(5, body="Waits on #1.", author="other"),
+                  self.issue(6, created="2026-11-20T00:00:00Z")]
+        self.enterContext(mock.patch.object(gh, "issues", return_value=issues))
+
+        todo = self.source.todo()
+        self.assertEqual([ticket.id for ticket in todo], ["2", "6", "1"])
+        open_tickets = self.source.open_agent_tickets
+        scores = queueing.scores(todo, open_tickets=open_tickets)
+        self.assertEqual((scores["1"], scores["2"], scores["6"]), ((2, 3), (2, 1), (2, 1)))
+        ranked = queueing.prioritized(todo[::-1], open_tickets=open_tickets)
+        self.assertEqual([ticket.id for ticket in ranked], ["1", "2", "6"])
+
+        parked = self.source.todo(parked=lambda tid: tid == "3")
+        self.assertEqual({ticket.id for ticket in parked}, {"1", "2", "3", "6"})
+        self.assertEqual(queueing.scores(parked, open_tickets=self.source.open_agent_tickets), scores)
+
+    def test_todo_refresh_drops_dependents_no_longer_in_open_agent_list(self):
+        first = [self.issue(1), self.issue(2, "agent:pr", body="Waits on #1 and #99.")]
+        self.enterContext(mock.patch.object(gh, "issues", side_effect=[first, first[:1]]))
+
+        todo = self.source.todo()
+        self.assertEqual(queueing.scores(todo, open_tickets=self.source.open_agent_tickets), {"1": (2, 1), "2": (1, 0)})
+
+        todo = self.source.todo()
+        self.assertEqual(queueing.scores(todo, open_tickets=self.source.open_agent_tickets), {"1": (1, 0)})
 
 
 class PublicationFixture(unittest.TestCase):

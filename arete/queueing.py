@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import deque
+from collections.abc import Iterable, Iterator
 
 from . import tracker
 
@@ -13,25 +13,53 @@ def dependencies(ticket: tracker.Ticket) -> set[str]:
     return set(tracker.waits_on_jira(ticket.body))
 
 
-def scores(tickets: list[tracker.Ticket]) -> dict[str, tuple[int, int]]:
-    dependents = {str(ticket.id): set() for ticket in tickets}
-    for ticket in tickets:
-        for parent in dependencies(ticket) & dependents.keys():
-            dependents[parent].add(str(ticket.id))
-    parents = {key: set() for key in dependents}
-    remaining = {key: len(children) for key, children in dependents.items()}
-    depth = {key: 1 for key in dependents}
-    for parent, children in dependents.items():
-        for child in children:
-            parents[child].add(parent)
-    ready = deque(key for key, count in remaining.items() if not count)
-    while ready:
-        child = ready.popleft()
-        for parent in parents[child]:
-            depth[parent] = max(depth[parent], depth[child] + 1)
-            remaining[parent] -= 1
-            if not remaining[parent]:
-                ready.append(parent)
+def _topological_components(parents: dict[str, set[str]], dependents: dict[str, set[str]]) -> Iterator[set[str]]:
+    finished = []
+    seen = set()
+    for start in parents:
+        if start in seen:
+            continue
+        seen.add(start)
+        pending = [(start, iter(parents[start]))]
+        while pending:
+            tid, prerequisites = pending[-1]
+            parent = next(prerequisites, None)
+            if parent is None:
+                finished.append(tid)
+                pending.pop()
+            elif parent not in seen:
+                seen.add(parent)
+                pending.append((parent, iter(parents[parent])))
+
+    assigned = set()
+    for start in reversed(finished):
+        if start in assigned:
+            continue
+        component, pending_tickets = {start}, [start]
+        assigned.add(start)
+        while pending_tickets:
+            found = dependents[pending_tickets.pop()] - assigned
+            component.update(found)
+            assigned.update(found)
+            pending_tickets.extend(found)
+        yield component
+
+
+def scores(tickets: list[tracker.Ticket], *, open_tickets: Iterable[tracker.Ticket] = ()) -> dict[str, tuple[int, int]]:
+    graph = {str(ticket.id): ticket for ticket in tickets}
+    graph.update((str(ticket.id), ticket) for ticket in open_tickets)
+    parents = {tid: dependencies(ticket) & graph.keys() for tid, ticket in graph.items()}
+    dependents = {tid: set() for tid in graph}
+    for child, prerequisites in parents.items():
+        for parent in prerequisites:
+            dependents[parent].add(child)
+    depth = dict.fromkeys(graph, 1)
+    for component in _topological_components(parents, dependents):
+        level = max(depth[tid] for tid in component)
+        for tid in component:
+            depth[tid] = level
+            for parent in parents[tid] - component:
+                depth[parent] = max(depth[parent], level + 1)
     result = {}
     for key, children in dependents.items():
         seen, pending = {key}, list(children)
@@ -44,6 +72,6 @@ def scores(tickets: list[tracker.Ticket]) -> dict[str, tuple[int, int]]:
     return result
 
 
-def prioritized(tickets: list[tracker.Ticket]) -> list[tracker.Ticket]:
-    rank = scores(tickets)
+def prioritized(tickets: list[tracker.Ticket], *, open_tickets: Iterable[tracker.Ticket] = ()) -> list[tracker.Ticket]:
+    rank = scores(tickets, open_tickets=open_tickets)
     return sorted(tickets, key=lambda ticket: (-rank[str(ticket.id)][0], -rank[str(ticket.id)][1], ticket.created))

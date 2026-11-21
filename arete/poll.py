@@ -67,7 +67,8 @@ def next_ticket(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
         listed = source.todo(parked=lambda tid: bool(runlimits.latest_park(repo.name, tid)[1]))
         known = {str(t.id) for t in listed}
         extra = [t for t in recovered if str(t.id) not in known] if source is tk else []
-        for t in queueing.prioritized([*listed, *extra]):
+        open_tickets = source.open_agent_tickets if isinstance(source, tracker.GitHubTracker) else ()
+        for t in queueing.prioritized([*listed, *extra], open_tickets=open_tickets):
             tid = str(t.id)
             if (tid in excluded or other_routes & set(t.labels) or run_store.issue_running(repo.name, t.id)
                     or not pilot.pickable(tid, repo.name)
