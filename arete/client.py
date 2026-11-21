@@ -643,7 +643,7 @@ def events(run_id: str, start: int = 0, follow: bool = False) -> Iterator[dict]:
 def run_status(run_id: str) -> str:
     try:
         return field(run_info(run_id), "status", "run.status")
-    except (Down, Broken):
+    except (Down, Failed):
         return ""
 
 
@@ -661,7 +661,7 @@ def kept(run_id: str, seen: int, read: Iterator[dict] | None) -> Iterator[dict]:
                 yield line
                 if line.get("event") == run_lines.END:
                     return
-        except Broken:
+        except Failed:
             whole = False
         lost = lost or time.monotonic()
         status = run_status(run_id)
@@ -673,7 +673,7 @@ def kept(run_id: str, seen: int, read: Iterator[dict] | None) -> Iterator[dict]:
         time.sleep(RETRY_SECONDS)
         try:
             read = events(run_id, seen, follow=True)
-        except (Down, Broken):
+        except (Down, Failed):
             read = None
 
 

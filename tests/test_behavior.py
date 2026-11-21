@@ -81,6 +81,8 @@ class _CliThroughServeCase(unittest.TestCase):
         "replay sample": "replay", "retrieval run": "lab.retrieval", "retrieval sample": "lab.retrieval",
         "rotate-authority": "scratch", "serve": "serve", "session exec": "sessions", "uninstall": "install",
         "upload-guard": "uploads", "webhook secret": "webhooks.secret",
+        "verify-fault arm": "verify_faults", "verify-fault clear": "verify_faults",
+        "verify-fault drop-streams": "verify_faults", "verify-fault event": "verify_faults",
         "verifiers run": "lab.verifier_suites", "verifiers sample": "lab.verifier_suites",
         "verify-fault arm": "verify_faults", "verify-fault clear": "verify_faults",
         "verify-fault drop-streams": "verify_faults", "verify-fault event": "verify_faults",
@@ -1017,6 +1019,45 @@ class CliThroughServeRunTests(_CliThroughServeCase):
             ("/api/v1/tasks", hashlib.sha256((long_key + ":2").encode()).hexdigest()),
             ("/api/v1/tasks", "another-key"),
             ("/api/v1/tasks", "another-key:2"),
+        ])
+
+
+class WaitReconnectTests(unittest.TestCase):
+    def test_wait_resumes_after_stream_drop_and_status_502(self):
+        from arete import client, codebase
+
+        step = {"event": "step_end", "seq": 1, "step": "plan"}
+        report = {"event": "report", "seq": 2, "status": "done"}
+        responses = iter((
+            (b"200 OK", json.dumps(step).encode() + b"\n"),
+            (b"502 Bad Gateway", b'{"error":"bad gateway"}'),
+            (b"200 OK", json.dumps(report).encode() + b"\n"),
+        ))
+        requests = []
+
+        def connect(_):
+            status, body = next(responses)
+            transport = mock.Mock()
+            transport.makefile.return_value = BytesIO(b"HTTP/1.0 " + status + b"\r\n\r\n" + body)
+            response = HTTPResponse(transport)
+            response.begin()
+            conn = mock.Mock(sock=transport)
+            conn.request.side_effect = lambda method, path, *_: requests.append((method, path))
+            conn.getresponse.return_value = response
+            return conn
+
+        where = client.Server("http", "127.0.0.1", 80, "127.0.0.1")
+        output = StringIO()
+        with (mock.patch.object(codebase, "load"), mock.patch.object(client, "server", return_value=where),
+              mock.patch.object(client, "connect", side_effect=connect),
+              mock.patch.object(client, "RETRY_SECONDS", 0), redirect_stdout(output)):
+            self.assertEqual(cli.main(["wait", "r1"]), 0, output.getvalue())
+
+        self.assertEqual(list(map(json.loads, output.getvalue().splitlines())), [step, report])
+        self.assertEqual(requests, [
+            ("GET", "/api/runs/r1/events?from=0&follow=1"),
+            ("GET", "/api/runs/r1"),
+            ("GET", "/api/runs/r1/events?from=1&follow=1"),
         ])
 
 
