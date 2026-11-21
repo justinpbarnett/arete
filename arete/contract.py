@@ -9,7 +9,7 @@ from functools import cache
 
 from . import refusals
 
-MINOR = 0
+MINOR = 1
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -88,6 +88,26 @@ ERRORS = [{"code": code, "status": status, "description": description} for code,
     ("invalid_input", 400, "The input does not match the operation schema."),
     ("client_too_old", 400, "Upgrade the client to required_version."),
     ("version_conflict", 409, "Refresh current before trying again."),
+    ("invalid_framing", 400, "Use a single decimal Content-Length for a body and omit Transfer-Encoding."),
+    ("invalid_json", 400, "Send a UTF-8 JSON object with unique names, at most 32 levels, finite numbers, and "
+                          "integers between -9007199254740991 and 9007199254740991."),
+    ("forbidden", 403, "The request was not authorized."),
+    ("method_not_allowed", 405, "The route does not accept this method."),
+    ("conflict", 409, "The request conflicts with current state."),
+    ("idempotency_in_flight", 409, "Try again with the same key after Retry-After."),
+    ("body_too_large", 413, "The request body exceeds the route's size limit."),
+    ("uri_too_long", 414, "The request target is too long."),
+    ("unsupported_media_type", 415, "The route does not accept this Content-Type."),
+    ("misdirected_request", 421, "Use the server's tailnet name or address."),
+    ("invalid_fields", 422, "The request fields could not be processed."),
+    ("idempotency_key_reused", 422, "Use a new key for different content."),
+    ("rate_limited", 429, "Wait Retry-After seconds before sending more requests."),
+    ("headers_too_large", 431, "A request takes at most 100 headers."),
+    ("internal_error", 500, "The server could not complete the request."),
+    ("not_implemented", 501, "The server does not implement this method."),
+    ("upstream_failed", 502, "The target could not complete the request."),
+    ("draining", 503, "Serve is loading new code. Try again after Retry-After."),
+    ("unsupported_http_version", 505, "Use HTTP/1.0 or HTTP/1.1."),
 )]
 
 
@@ -118,11 +138,14 @@ def sample(schema):
 
 
 for _error in ERRORS:
-    _details = ({"fields": array(STRING)} if _error["code"] == "unknown_field" else
-                {"required_version": STRING} if _error["code"] == "client_too_old" else
-                {"current": RUN} if _error["code"] == "version_conflict" else {})
-    _error["schema"] = obj({"error": STRING, "code": {"type": "string", "enum": [_error["code"]]}, **_details})
-    _error["example"] = {**sample(_error["schema"]), "error": _error["description"]}
+    _code, _status, _description = (_error[k] for k in ("code", "status", "description"))
+    _details = {"unknown_field": {"fields": array(STRING)}, "client_too_old": {"required_version": STRING},
+                "version_conflict": {"current": RUN}, "rate_limited": {"retry_after": INTEGER}}.get(_code, {})
+    _error["schema"] = obj({"type": {"type": "string", "enum": [f"urn:arete:problem:{_code}"]}, "title": STRING,
+                            "status": {"type": "integer", "enum": [_status]}, "detail": STRING, "error": STRING,
+                            "code": {"type": "string", "enum": [_code]}, **_details})
+    _error["example"] = {**sample(_error["schema"]), "type": f"urn:arete:problem:{_code}", "status": _status,
+                         "detail": _description, "error": _description}
 
 
 META = envelope({"api": obj({"version": STRING, "minor": INTEGER, "contract_sha": STRING}),
@@ -143,9 +166,12 @@ FEED_LINE = obj({"id": INTEGER, "run_id": STRING, "ts": STRING, "kind": STRING, 
 ERROR = obj({"code": STRING, "status": INTEGER, "description": STRING, "schema": mapping(JSON), "example": mapping(JSON)})
 OPERATION = obj({"name": STRING, "method": STRING, "path": STRING, "input": mapping(JSON),
                  "result": mapping(JSON), "errors": array(STRING),
-                 "example": obj({"input": mapping(JSON), "result": mapping(JSON)})})
+                 "example": obj({"input": mapping(JSON), "result": mapping(JSON)}),
+                 "deprecated": BOOLEAN, "sunset": STRING},
+                ["name", "method", "path", "input", "result", "errors", "example"])
 ALIAS = obj({"method": STRING, "path": STRING, "provider": STRING, "adapter": STRING, "input": mapping(JSON),
-             "actions": mapping(mapping(JSON)), "transport": BOOLEAN}, ["method", "path", "provider", "adapter", "input"])
+             "actions": mapping(mapping(JSON)), "transport": BOOLEAN, "deprecated": BOOLEAN, "sunset": STRING},
+            ["method", "path", "provider", "adapter", "input"])
 OPERATIONS = [operation("meta.get", "meta", META),
               operation("contract.get", "contract", envelope({"operations": array(OPERATION),
                         "errors": array(ERROR), "aliases": array(ALIAS), "contract_sha": STRING})),
@@ -190,7 +216,9 @@ BY_NAME["usage.record"]["input"]["properties"].update(
     ms={"type": "integer", "minimum": 0, "maximum": 86400000})
 BY_NAME["meta.get"]["example"]["result"].update(
     api={"version": VERSION, "minor": MINOR, "contract_sha": "0" * 64},
-    server={"engine_sha": "example-engine"}, oldest_client=OLDEST_CLIENT)
+    server={"engine_sha": "code.7b1170924da4"}, oldest_client=OLDEST_CLIENT,
+    instance={"id": "a1b2c3d4", "tag": "demo", "name": "Demo", "created": "2026-01-01T00:00:00Z"},
+    stream={"complete": True, "head": "0.1", "trim": {}})
 ALIASES = []
 USES = Counter()
 USE_LOCK = threading.Lock()
@@ -313,6 +341,8 @@ def alias_input(provider, rest):
     if provider == "post_chat":
         if rest.endswith("/sessions"):
             return SESSION_INPUT
+        if rest.endswith("/file"):
+            return obj({"draft": STRING}, [])
         return fields("text") if rest.endswith("/send") else obj({})
     if provider == "post_session":
         return fields("text") if rest.endswith("/send") else obj({})
@@ -403,6 +433,33 @@ ALIASES[:0] = [{"method": method, "path": path, "provider": provider, "adapter":
     ("GET", "/api/runs/*/events", "send_events"),
     ("GET", "/api/events", "event_stream.serve"),
 )]
+
+
+def complete_examples():
+    instances = {"task": "t-a1b2", "project": "replay-sample", "line": "replay-sample", "view": "live",
+                 "run": "pip-demo-1", "step": "1", "loop": "poll", "incident": "1",
+                 "triage": "demo#7", "research": "demo#7", "chat": "1"}
+    for name, identity in instances.items():
+        get = BY_NAME[f"{name}.get"]["example"]
+        get["input"]["id"] = identity
+        row = get["result"][name]
+        row["id"] = int(identity) if name == "step" else identity
+        BY_NAME[f"{name}.list"]["example"]["result"][PLURALS[name]] = [row.copy()]
+    for name in ("step.get", "step.list", "line_stream.read"):
+        BY_NAME[name]["example"]["input"]["run"] = instances["run"]
+    BY_NAME["step.get"]["example"]["result"]["step"].update(run_id=instances["run"], name="plan")
+    BY_NAME["run.diff"]["example"]["input"]["id"] = instances["run"]
+    BY_NAME["run.diff"]["example"]["result"]["diff"] = "--- a/notes.txt\n+++ b/notes.txt\n@@ -1 +1,2 @@\n Notes\n+kumquat\n"
+    BY_NAME["task.history"]["example"]["input"]["id"] = instances["task"]
+    BY_NAME["line_stream.read"]["example"]["result"].update(after=1, lines=[{
+        "id": 1, "run_id": instances["run"], "ts": "2026-01-01T00:00:00Z", "kind": "plan", "text": "Add kumquat"}])
+    BY_NAME["batch.run"]["example"]["result"]["results"] = [BY_NAME["meta.get"]["example"]["result"]]
+    BY_NAME["error.list"]["example"]["result"]["errors"] = ERRORS[:1]
+    BY_NAME["contract.get"]["example"]["result"].update(
+        operations=[BY_NAME["meta.get"]], errors=ERRORS[:1], aliases=ALIASES[:1], contract_sha="0" * 64)
+
+
+complete_examples()
 
 
 def alias_match(method, path):

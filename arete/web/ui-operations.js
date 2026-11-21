@@ -1,6 +1,6 @@
 import { Component, h } from "./vendor-preact.js";
 import htm from "./vendor-htm.js";
-import { prepareWrite, sendWrite } from "./ui-write.js";
+import { isPublication, prepareWrite, sendPublication, sendWrite } from "./ui-write.js";
 import { notice } from "./ui-notice.js";
 import { Empty, Fault, Loading } from "./ui-states.js";
 
@@ -44,9 +44,10 @@ export class Operation extends Component {
     sending.add(path);
     this.setState({ busy: true, error: "" });
     try {
-      const request = prepareWrite(path, body);
+      const publication = isPublication(path, body);
+      const request = publication ? null : prepareWrite(path, body);
       clearSecret?.();
-      const result = await sendWrite(request);
+      const result = publication ? await sendPublication(path, body) : await sendWrite(request);
       notice.value = say(result);
       return true;
     } catch (fault) {

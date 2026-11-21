@@ -89,11 +89,15 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
         return (str(tid) not in excluded and not pilot.is_pilot_task(str(tid)) and not zte.reserved(str(tid))
                 and not run_store.issue_running(repo.name, tid))
 
+    def ordinary_history(tid):
+        return eligible_again(tid) and (not isinstance(tk, tracker.GitHubTracker) or tracker.is_task_id(tid)
+                                        or not tk.in_zte_queue(str(tid)))
+
     for tid in run_store.interrupted_tickets(repo.name):
-        if eligible_again(tid):
+        if ordinary_history(tid):
             return tid, "restarting after an interruption"
     for tid in insights_store.feedback_due(repo.name, util.iso(util.now() - timedelta(minutes=pipeline.FEEDBACK_QUIET_MINUTES))):
-        if eligible_again(tid):
+        if ordinary_history(tid):
             return tid, "revising the PR for your review comments"
     for source in ticket_queues(repo, tk):
         for t in source.replied():
@@ -234,6 +238,8 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: tuple[str, str], skip
             return "skipped"
     source = tracker.for_ticket(cfg, repo, tid)
     name = tracker.ticket_name(repo.name, source.ref(tid))
+    if isinstance(source, tracker.GitHubTracker) and source.in_zte_queue(str(tid)):
+        return "skipped"
     reply = tracker_reply(repo, source, str(tid), dry_run)
     answering = not reply and pipeline.answered_run(repo.name, str(tid)) is not None
     if not answering and not reply and (waiting := held_back(cfg, repo.name, going, slots)):

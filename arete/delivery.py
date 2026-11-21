@@ -6,7 +6,7 @@ import traceback
 from contextlib import contextmanager, suppress
 from datetime import timedelta
 
-from . import config, util
+from . import config, gh, jira, util
 from .emits import Emit, PullRequest, Ticket, ToLoop
 from .loops import Loop
 from .push import Push
@@ -26,6 +26,10 @@ class Failed(RuntimeError):
         super().__init__(why)
         self.cause = cause
         self.trace = trace
+
+    @property
+    def upstream(self) -> bool:
+        return isinstance(self.cause, (gh.GhError, jira.JiraError))
 
     def kept_by(self, emit: Emit) -> bool:
         return isinstance(self.cause, emit.kept_failures)
@@ -96,10 +100,12 @@ def objections(loop: Loop, run_id: str, outcome: dict, cfg: config.Config) -> di
     return {}
 
 
-def send(delivery: dict, loop_name: str, run_id: str, cfg: config.Config, *, wrap_crashes: bool = False) -> str:
+def send(delivery: dict, loop_name: str, run_id: str, cfg: config.Config, *, wrap_crashes: bool = False,
+         publication=None) -> str:
     kind = delivery["type"]
     try:
-        return EMITS[kind].execute(delivery["item"], delivery.get("batch") or [], loop_name, run_id, cfg)
+        args = delivery["item"], delivery.get("batch") or [], loop_name, run_id, cfg
+        return EMITS[kind].execute(*args, publication=publication) if publication else EMITS[kind].execute(*args)
     except (*SAYS_WHY, KeyError) as e:
         raise Failed(why_failed(kind, e), e) from e
     except Exception as e:
@@ -109,6 +115,8 @@ def send(delivery: dict, loop_name: str, run_id: str, cfg: config.Config, *, wra
 
 
 def why_failed(kind: str, e: Exception) -> str:
+    if isinstance(e, (gh.GhError, jira.JiraError)):
+        return f"{kind} failed: the external tracker did not confirm the request"
     said = util.first_line(str(e), 300)
     if said and isinstance(e, SAYS_WHY):
         return f"{kind} failed: {said}"
@@ -202,12 +210,17 @@ def release_lapsed() -> list[int]:
     return released
 
 
-def decide(approval_id: int, yes: bool, by: str = "", came_from: tuple[str, ...] = approvals_store.DECIDABLE) -> str:
+def decide(approval_id: int, yes: bool, by: str = "", came_from: tuple[str, ...] = approvals_store.DECIDABLE,
+           *, publication=None) -> str:
+    pending = (publication.pending or {}) if publication else {}
+    if "result" in pending:
+        return pending["result"]
     row = approvals_store.approval(approval_id)
     if not row:
         raise LookupError(f"no approval #{approval_id}")
     delivery, verb = row["emit"], "approved" if yes else "rejected"
     emit = EMITS[delivery["type"]]
+    publication = publication if yes and isinstance(emit, (Ticket, PullRequest)) else None
     cfg = config.load() if yes else None
 
     def log(kind: str, text: str) -> None:
@@ -220,17 +233,37 @@ def decide(approval_id: int, yes: bool, by: str = "", came_from: tuple[str, ...]
         emit.rejected(delivery["item"])
         log("emit", f"nothing sent: {row['summary']}")
         return "rejected"
-    token = approvals_store.claim_approval(approval_id, claim_deadline(), came_from)
-    if not token:
-        raise already_decided(approval_id)
+    with foundation.tx():
+        current = approvals_store.approval(approval_id)
+        if bound := (current or {}).get("emit", {}).get("_publication_marker"):
+            if not publication or not pending.get("send_started") or bound != publication.marker:
+                from .idempotency import Unconfirmed
+
+                raise Unconfirmed("This approval has a pending publication. Retry with the original request key.")
+        token = approvals_store.claim_approval(approval_id, claim_deadline(), came_from, previous=pending.get("token", ""))
+        if not token:
+            raise already_decided(approval_id)
+        if publication:
+            publication.remember({**pending, "token": token})
+
+    def bind_send(marker: str) -> None:
+        if not approvals_store.bind_publication(approval_id, token, marker):
+            raise already_decided(approval_id)
+
+    if publication:
+        publication.bind_send = bind_send
 
     def settle_as(status: str, outcome: str, why: str) -> bool:
         return approvals_store.settle_approval(approval_id, status, outcome, why, judged=emit.judged, token=token)
 
     with renewed(approval_id, token):
         try:
-            done = send(delivery, row["loop"], row["run_id"], cfg, wrap_crashes=True)
-            landed = settle_as("done", "approved", done)
+            done = send(delivery, row["loop"], row["run_id"], cfg, wrap_crashes=True, publication=publication)
+            with foundation.tx():
+                landed = settle_as("done", "approved", done)
+                if landed and publication:
+                    emit.landed(delivery.get("batch") or [], row["loop"], done)
+                    publication.record(f"approval:{approval_id}", done, done)
         except Failed as e:
             if e.kept_by(emit):
                 settle_as("failed", "failed", str(e))
@@ -247,6 +280,7 @@ def decide(approval_id: int, yes: bool, by: str = "", came_from: tuple[str, ...]
             raise
     if not landed:
         raise already_decided(approval_id)
-    emit.landed(delivery.get("batch") or [], row["loop"], done)
+    if not publication:
+        emit.landed(delivery.get("batch") or [], row["loop"], done)
     log("emit", f"{delivery['type']}: {done}")
     return done

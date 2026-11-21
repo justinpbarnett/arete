@@ -151,13 +151,13 @@ function draftRow(draft) {
       foldText("draft:body", "Show the body", draft.body)]),
     cell(""),
     cell(el("div", { class: "row-buttons" },
-      button("File this issue", "file-draft", (btn) => fileDraft(draft.chat, btn)),
+      button("File this issue", "file-draft", (btn) => fileDraft(draft, btn)),
       button("Drop", "drop-draft", (btn) => dropDraft(draft.chat, btn)),
       button("Open the console", "open-console", () => setConsole(true, { focus: true })))));
 }
 
-function fileDraft(chat, btn) {
-  return act(btn, "needs", `/api/chats/${chat}/file`, {}, (view) => {
+function fileDraft(draft, btn) {
+  return act(btn, "needs", `/api/chats/${draft.chat}/file`, { draft: draft.fingerprint }, (view) => {
     drawChat(view);
     return view.messages.at(-1)?.text || "Filed the issue.";
   });

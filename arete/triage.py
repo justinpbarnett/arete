@@ -37,7 +37,7 @@ from .store import triage as triage_store
 
 ISSUE_TITLE = "[arete] triage"
 ISSUE_LABEL = "arete-triage"
-SKIP_LABELS = {tracker.LABEL, alerts.LABEL, ISSUE_LABEL, "loop"}
+SKIP_LABELS = {tracker.LABEL, tracker.ZTE_LABEL, alerts.LABEL, ISSUE_LABEL, "loop"}
 AUTO_SKIP_LABELS = {"no-agent", "agent:hold", "duplicate", "invalid", "wontfix",
                     *(f"agent:{state}" for state in config.RUN_LABELS), *tracker.JIRA_STATE_LABELS}
 MAX_CALLS = 20
@@ -112,6 +112,7 @@ class TicketText:
     comments: str
     updated: str = ""
     labels: tuple[str, ...] = ()
+    title: str = ""
 
     @property
     def text(self) -> str:
@@ -204,7 +205,7 @@ class JiraSource(Source):
         comments = [((cm.get("author") or {}).get("displayName", "someone"), cm.get("created", ""), cm.get("body") or "")
                     for cm in client.comments(c.id)]
         return TicketText("\n".join(facts), (f.get("description") or "").strip(), tracker.comments_text(comments),
-                          f.get("updated") or "", tuple(f.get("labels") or []))
+                          f.get("updated") or "", tuple(f.get("labels") or []), (f.get("summary") or "").strip())
 
     def brief(self, key: str) -> str:
         f = self.client.issue(key, ["summary", "description"]).get("fields") or {}
@@ -228,8 +229,13 @@ class JiraSource(Source):
     def route(self, repo: str) -> str:
         return tracker.route_label(self.by_name()[repo]) if repo else ""
 
-    def comment(self, ref: str, text: str) -> None:
-        self.client.comment(ref, text)
+    def comment(self, ref: str, text: str, *, return_url=False) -> str | None:
+        if return_url:
+            return self.client.comment(ref, text, return_url=True, single_attempt=True)
+        return self.client.comment(ref, text)
+
+    def find_comment(self, ref: str, marker: str) -> str:
+        return self.client.find_comment_marker(ref, marker)
 
     def approve(self, r: dict) -> None:
         self.client.edit_labels(r["ref"], labels_to_add(r))
@@ -269,10 +275,13 @@ class GitHubSource(Source):
         if issue.get("state") != "OPEN":
             raise gh.GhError(f"{c.ref} is no longer open")
         labels = tuple(lb["name"] for lb in issue.get("labels", []))
+        if tracker.ZTE_LABEL in labels:
+            raise tracker.TaskError(tracker.ZTE_QUEUE)
         comments = [(tk.owner, cm.get("createdAt", ""), cm.get("body", ""))
                     for cm in issue.get("comments", []) if tk.by_owner(cm)]
         return TicketText(f"Labels: {', '.join(labels) or 'none'}", (issue.get("body") or "").strip(),
-                          tracker.comments_text(comments), issue.get("updatedAt") or "", labels)
+                          tracker.comments_text(comments), issue.get("updatedAt") or "", labels,
+                          (issue.get("title") or "").strip())
 
     def brief(self, key: str) -> str:
         return ""
@@ -289,8 +298,16 @@ class GitHubSource(Source):
     def route(self, repo: str) -> str:
         return ""
 
-    def comment(self, ref: str, text: str) -> None:
-        gh.issue_comment(self.key, int(self.tid(ref)), text)
+    def comment(self, ref: str, text: str, *, return_url=False) -> str | None:
+        tid = self.tid(ref)
+        self.issues.require_ordinary(tid)
+        number = int(tid)
+        if return_url:
+            return gh.issue_comment(self.key, number, text, return_url=True, single_attempt=True)
+        return gh.issue_comment(self.key, number, text)
+
+    def find_comment(self, ref: str, marker: str) -> str:
+        return gh.find_issue_comment_marker(self.key, int(self.tid(ref)), marker)
 
     def approve(self, r: dict) -> None:
         intake.add_labels(self.issues, self.tid(r["ref"]), labels_to_add(r))
@@ -639,8 +656,13 @@ def approve(cfg: config.Config, src: TriageSource, r: dict) -> str:
 
 def to_pipeline(src: TriageSource, r: dict, sent_by: str) -> None:
     src.approve({**r, "automatic": sent_by == "triage"})
-    triage_store.triage_approve(r, sent_by)
-    triage_store.triage_drop(r["ref"])
+    with foundation.tx():
+        record_send(r, sent_by)
+
+
+def record_send(row: dict, sent_by: str) -> None:
+    triage_store.triage_approve(row, sent_by)
+    triage_store.triage_drop(row["ref"])
 
 
 class NotOnBoard(refusals.NotFound, LookupError):
@@ -676,8 +698,37 @@ def answers_comment(pairs: list[tuple[str, str]]) -> str:
     return f"{prompt_loader.TRIAGE_ANSWERS}:\n\n" + "\n\n".join(f"**{q}**\n{a}" for q, a in pairs)
 
 
-def send(cfg: config.Config, ref: str, questions: list[str], answers: list[str], repo_name: str) -> str:
+def send(cfg: config.Config, ref: str, questions: list[str], answers: list[str], repo_name: str,
+         *, publication=None) -> str:
     with util.lock(BOARD_LOCK, wait=True):
+        if publication and publication.pending:
+            pending = publication.pending
+            if "result" in pending:
+                return pending["result"]
+            sent_row = pending["row"]
+            src = send_source(cfg, sent_row)
+            if comment_target(src, sent_row) != pending["target"]:
+                raise NotSendable("The tracker target changed while this send was pending.")
+            current = board_row(ref)
+            repo = src.by_name().get(sent_row["repo"])
+            if (not current or current != pending.get("board") or not repo or standing(current) not in SENDABLE
+                    or repo.name not in repo_choices(src, current) or src.route(repo.name) != sent_row["route"]):
+                raise NotSendable(f"Triage changed {ref} while the send was pending. Read it again.")
+
+            def revalidate(*, posted=False):
+                now = read_send_ticket(src, current)
+                if [now.title, now.body] != pending["content"]:
+                    raise NotSendable(f"{ref} changed since triage read it, so the next refresh triages it again.")
+                if set(now.labels) & AUTO_SKIP_LABELS:
+                    raise NotSendable(f"{ref} now has a label that requires a person to release it.")
+                if pending.get("labels_started") and set(labels_to_add(sent_row)) <= set(now.labels):
+                    return True
+                if not posted:
+                    require_send_revision(now, current)
+                screen_send(cfg, current, repo, sent_row, now)
+                return False
+
+            return send_to_tracker(src, sent_row, pending["comment"], publication, revalidate=revalidate)
         r = board_row(ref)
         if not r:
             if a := triage_store.triage_approval(ref.strip()):
@@ -691,9 +742,7 @@ def send(cfg: config.Config, ref: str, questions: list[str], answers: list[str],
                               "again.")
         if len(answers) != len(questions):
             raise BadAnswers(f"Send one answer for each of the {util.count(len(questions), 'question')}.")
-        src = next((s for s in sources(cfg) if s.name == r["source"]), None)
-        if not src:
-            raise NotSendable(f"{r['source']} is no longer a triage source, so the next refresh drops {r['ref']}.")
+        src = send_source(cfg, r)
         if r["repo"] and repo_name not in ("", r["repo"]):
             raise BadAnswers(f"Triage settled {r['ref']} on {r['repo']}, not {repo_name}.")
         choices = repo_choices(src, r)
@@ -704,35 +753,90 @@ def send(cfg: config.Config, ref: str, questions: list[str], answers: list[str],
                              if repo_name else f"Pick the repo {r['ref']} is for, from {', '.join(choices)}.")
         repo = src.by_name()[r["repo"] or repo_name]
         sent_row = {**r, "repo": repo.name, "route": src.route(repo.name)}
-        labels = " and ".join(labels_to_add(sent_row))
-        try:
-            now = src.ticket(src.candidate(r))
-        except tracker.ERRORS as e:
-            raise TrackerFailed(f"Could not read {r['ref']} ({tracker_said(e)}).") from e
-        if now.updated != r["updated"]:
-            raise NotSendable(f"{r['ref']} changed since triage read it, so the next refresh triages it again.")
-        screened = screening.screen(f"{r['title']}\n\n{now.text}", cfg, [repo],
-                                    ("", f"triage {r['ref']} send injection jev"))
-        if screening.held(screened, screening.Posture.WHEN_ON):
-            if screened.status != screening.FLAGGED:
-                raise NotSendable(f"JEV could not screen {r['ref']} for injected instructions this time. Try again.")
-            raise NotSendable(f"JEV reads text in {r['ref']} as instructions to an agent (p {screened.p:.2f}). "
-                              f"Read the ticket, then add {labels} by hand to send it.")
+        now = read_send_ticket(src, r)
+        require_send_revision(now, r)
+        screen_send(cfg, r, repo, sent_row, now)
         pairs = [(q, a.strip()) for q, a in zip(questions, answers, strict=True) if q != repo_question(r) and a.strip()]
-        if pairs:
-            try:
-                src.comment(r["ref"], answers_comment(pairs))
-            except tracker.ERRORS as e:
-                raise TrackerFailed(f"Could not post your answers to {r['ref']} ({tracker_said(e)}).") from e
+        comment = answers_comment(pairs) if pairs else ""
+        if publication:
+            publication.remember({"row": sent_row, "board": r, "target": comment_target(src, sent_row),
+                                  "comment": comment, "content": [now.title, now.body]})
+        return send_to_tracker(src, sent_row, comment, publication)
+
+
+def read_send_ticket(src, row):
+    try:
+        return src.ticket(src.candidate(row))
+    except tracker.ERRORS as e:
+        raise TrackerFailed(f"Could not read {row['ref']}.") from e
+
+
+def require_send_revision(now, row):
+    if now.updated != row["updated"]:
+        raise NotSendable(f"{row['ref']} changed since triage read it, so the next refresh triages it again.")
+
+
+def screen_send(cfg, row, repo, sent_row, now):
+    ref = row["ref"]
+    screened = screening.screen(f"{row['title']}\n\n{now.text}", cfg, [repo], ("", f"triage {ref} send injection jev"))
+    if screening.held(screened, screening.Posture.WHEN_ON):
+        if screened.status != screening.FLAGGED:
+            raise NotSendable(f"JEV could not screen {ref} for injected instructions this time. Try again.")
+        labels = " and ".join(labels_to_add(sent_row))
+        raise NotSendable(f"JEV reads text in {ref} as instructions to an agent (p {screened.p:.2f}). "
+                          f"Read the ticket, then add {labels} by hand to send it.")
+
+
+def send_source(cfg, row):
+    src = next((s for s in sources(cfg) if s.name == row["source"]), None)
+    if not src:
+        raise NotSendable(f"{row['source']} is no longer a triage source, so the next refresh drops {row['ref']}.")
+    return src
+
+
+def comment_target(src, row):
+    return src.client.browse_url(row["ref"]) if isinstance(src, JiraSource) else row["url"]
+
+
+def send_to_tracker(src, row, comment, publication, *, revalidate=None):
+    ref = row["ref"]
+    labels = " and ".join(labels_to_add(row))
+    url = row["url"]
+    labels_present = revalidate() if revalidate and not comment else False
+    if comment:
         try:
-            to_pipeline(src, sent_row, principals.current())
+            if publication:
+                url = src.find_comment(ref, publication.marker)
+                if url and revalidate:
+                    labels_present = revalidate(posted=True)
+                if not url:
+                    if revalidate:
+                        revalidate()
+                    publication.begin_send()
+                    url = src.comment(ref, publication.text(comment), return_url=True)
+                if not url:
+                    raise TrackerFailed(f"Could not confirm the URL of the answers posted to {ref}. Try again.")
+            else:
+                src.comment(ref, comment)
         except tracker.ERRORS as e:
-            if pairs:
-                raise TrackerFailed(f"Posted your answers, but could not add {labels} to {r['ref']} ({tracker_said(e)}). "
-                                    "Add them by hand, or the next refresh triages it again with your answers.") from e
-            raise TrackerFailed(f"Could not add {labels} to {r['ref']} ({tracker_said(e)}).") from e
-    done = f"posted your answers and added {labels}" if pairs else f"added {labels}"
-    return f"Sent {r['ref']} to the pipeline for {repo.name}: {done}."
+            raise TrackerFailed(f"Could not post your answers to {ref} ({tracker_said(e)}).") from e
+    try:
+        if not labels_present:
+            if publication and not publication.pending.get("labels_started"):
+                publication.remember({**publication.pending, "labels_started": True})
+            src.approve({**row, "automatic": False})
+    except tracker.ERRORS as e:
+        if comment:
+            raise TrackerFailed(f"Posted your answers, but could not add {labels} to {ref} ({tracker_said(e)}). "
+                                "Add them by hand, or the next refresh triages it again with your answers.") from e
+        raise TrackerFailed(f"Could not add {labels} to {ref} ({tracker_said(e)}).") from e
+    done = f"posted your answers and added {labels}" if comment else f"added {labels}"
+    result = f"Sent {ref} to the pipeline for {row['repo']}: {done}."
+    with foundation.tx():
+        record_send(row, principals.current())
+        if publication:
+            publication.record(f"triage:{ref}", url, result)
+    return result
 
 
 def preview(srcs: list[TriageSource], read: dict[str, list[Candidate]], old: dict[str, dict],

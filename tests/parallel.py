@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from unittest.loader import _FailedTest
 
 TAIL = 4000
+DEFAULT_CLASS_TIMEOUT = 10
 HISTORY = os.path.join(tempfile.gettempdir(), "arete-parallel-durations.json")
 
 
@@ -58,6 +59,7 @@ class Batch:
     identifier: str
     count: int
     serial: bool = False
+    timeout: float = DEFAULT_CLASS_TIMEOUT
 
 
 class Runner:
@@ -119,12 +121,13 @@ class Runner:
             else:
                 self.live[process] = batch.identifier
         if process is not None:
+            timeout = self.args.timeout if self.args.timeout is not None else batch.timeout
             try:
-                process.wait(self.args.timeout)
+                process.wait(timeout)
                 if process.returncode:
                     problem = f"worker exited with status {process.returncode}"
             except subprocess.TimeoutExpired:
-                problem = f"class exceeded {self.args.timeout:g}s"
+                problem = f"class exceeded {timeout:g}s"
             finally:
                 self.kill(process)
                 process.wait()
@@ -163,7 +166,10 @@ class Runner:
                                            "seconds": 0.0, "output": ""}
                 continue
             identifier = test.id().rsplit(".", 1)[0]
-            batch = batches.setdefault(identifier, Batch(identifier, 0, getattr(type(test), "serial", False)))
+            test_class = type(test)
+            batch = batches.setdefault(identifier, Batch(
+                identifier, 0, serial=getattr(test_class, "serial", False),
+                timeout=getattr(test_class, "class_timeout", DEFAULT_CLASS_TIMEOUT)))
             batch.count += 1
         items = list(enumerate(sorted(batches.values(), key=lambda batch: -self.history.get(batch.identifier, 0))))
         began = time.monotonic()
@@ -231,7 +237,7 @@ def main():
     parser = argparse.ArgumentParser(prog="tests.parallel")
     parser.add_argument("-s", "--start", default=os.path.dirname(os.path.abspath(__file__)))
     parser.add_argument("-j", "--jobs", type=int, default=4)
-    parser.add_argument("--timeout", type=float, default=10)
+    parser.add_argument("--timeout", type=float, help="override the per-class deadline (default: 10 seconds unless declared)")
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--slowest", type=int, default=0)
     parser.add_argument("--lifeline", type=int)
@@ -241,7 +247,8 @@ def main():
     args.start = os.path.abspath(args.start)
     if args.one:
         return run_one(args.one, args.start, args.result, args.lifeline)
-    if args.jobs < 1 or not math.isfinite(args.timeout) or args.timeout <= 0 or args.slowest < 0:
+    if (args.jobs < 1 or args.slowest < 0
+            or (args.timeout is not None and (not math.isfinite(args.timeout) or args.timeout <= 0))):
         parser.error("jobs and timeout must be positive; slowest must be nonnegative")
     tests = list(flatten(unittest.TestLoader().discover(args.start)))
     return Runner(args).run(tests)

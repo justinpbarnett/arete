@@ -277,6 +277,10 @@ async function call(path, body, signal) {
     : { cache: "no-store", signal };
   if (changes) changesInFlight++;
   try {
+    if (changes && !raw) {
+      const { isPublication, sendPublication } = await import("./ui-write.js");
+      if (isPublication(path, body)) return await sendPublication(path, body, noteServedCode);
+    }
     const response = await fetch(path, options).catch(() => { throw new NoAnswer("The connection to arete failed."); });
     noteServedCode(response);
     const data = await response.json().catch(() => ({ error: `The server answered ${response.status} with no JSON.` }));

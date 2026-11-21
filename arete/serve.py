@@ -729,7 +729,7 @@ class Server:
             return "an on-call scan is still running"
         if self.sweeping():
             return "a sweep of left-over VMs is still running"
-        if dashboard.POSTS_IN_FLIGHT.count:
+        if dashboard.POSTS_IN_FLIGHT.active():
             return "the dashboard is still answering a request"
         if chat.any_busy():
             return "a chat message is still running"
@@ -850,6 +850,7 @@ def cleanup_legacy() -> None:
 
 
 def run(with_dashboard: bool = True) -> NoReturn:
+    codebase.load()
     rotation_notes = install.rotate_own_log()
     with principals.acting("hand"):
         held = take_serve_lock()
