@@ -13,6 +13,8 @@ from unittest.mock import patch
 from arete import (
     config,
     dbstats,
+    delegation,
+    orchestration,
     outcomes,
     paths,
     pipeline,
@@ -25,7 +27,9 @@ from arete import (
     tracker,
     util,
 )
+from arete.orchestration_api import PROTOCOL, Catalog
 from arete.store import db as foundation
+from arete.store import orchestration as ledger
 from arete.store import runs as run_store
 from arete.store import tasks as tasks_store
 from tests.harness import set_task_body
@@ -83,6 +87,126 @@ class Isolated(unittest.TestCase):
         run = pipeline.Run(rid, self.repo, directory, tracker=self.local, tid=self.ticket, cfg=self.cfg)
         run.budget = runlimits.Budget(run, runlimits.Policy(), previous, self.local.get(self.ticket), forced)
         return run
+
+
+class OrchestrationWaitTests(Isolated):
+    def setUp(self):
+        super().setUp()
+        self.now = 0.0
+        self.patches.enter_context(patch.object(orchestration, "time", SimpleNamespace(
+            monotonic=lambda: self.now, sleep=self.advance)))
+        controller = self.controller = orchestration.Controller.__new__(orchestration.Controller)
+        controller.run = SimpleNamespace(id="wait-run", budget=None, launch_gate=None, launch_done=None,
+                                         cost=0, paid=0)
+        controller.lease = ledger.acquire(controller.run.id, "", {})
+        controller.workers, controller.progress, controller.reported = {}, {}, {}
+        controller.last_progress = float("-inf")
+        controller.policy = config.Orchestration()
+        controller.catalog = Catalog.__new__(Catalog)
+        controller.catalog.context = {}
+        controller.data = {"acceptance": "fixture"}
+        controller.fingerprint = controller.policy_sha = lambda: "fixture"
+        controller.persist = lambda: None
+
+    def advance(self, seconds):
+        self.now += seconds
+
+    def accept(self, calls, maximum, *, validate=True):
+        lease = self.controller.lease
+        version = ledger.snapshot(lease)["version"]
+        turn = ledger.begin(lease, {}, maximum)
+        ledger.launched(lease, maximum)
+        response = {"version": PROTOCOL, "decision_id": turn, "state_version": version,
+                    "rationale": "", "calls": calls}
+        if validate:
+            response = self.controller.catalog.validate(
+                response, turn, version, {row["id"]: row for row in ledger.actions(lease)})
+        return ledger.accept(lease, turn, version, response, self.controller.policy.max_actions)
+
+    def start_worker(self, deadline, *, finish=None, ok=True):
+        controller = self.controller
+        action, = self.accept([{"op": "worker.start", "args": {}}], 2, validate=False)
+        worker = delegation.Worker.__new__(delegation.Worker)
+        worker.action, worker.deadline, worker.writing = action["id"], deadline, False
+        worker.run_id, worker.step = controller.run.id, f"worker-{worker.action}"
+        worker.effective = {"prompt_id": "investigate"}
+        worker.progress, worker.sources, worker.report = [], {}, (0, {})
+        worker.proc = SimpleNamespace(poll=lambda: None)
+        worker.close = lambda: None
+        worker.receive = lambda: ([{"event": "result", "ok": ok}] if finish is not None and self.now >= finish else [])
+        controller.workers[worker.action] = worker
+        ledger.transition(controller.lease, worker.action, "running", {})
+        return worker
+
+    def wait(self, args, maximum=8, extra=()):
+        actions = self.accept([{"op": "run.wait", "args": args}, *extra], maximum)
+        for action in actions:
+            self.controller.dispatch(action)
+        return next(row for row in ledger.actions(self.controller.lease) if row["id"] == actions[0]["id"])
+
+    def test_explicit_60_second_wait_keeps_cap_and_long_wait_reaches_worker_result(self):
+        worker = self.start_worker(2700, finish=1800)
+        capped = self.wait({"timeout_seconds": 60}, maximum=2)
+        self.assertEqual((self.now, capped["result"]["active"]), (60, [worker.action]))
+        self.assertEqual(ledger.snapshot(self.controller.lease)["turns"], 1)
+        completed = self.wait({"timeout_seconds": 0}, maximum=2)
+        self.assertLess(self.now - 1800, 0.1)
+        self.assertEqual((completed["id"], completed["result"]["active"]), ("d0003-0", []))
+        state = ledger.view(self.controller.run.id)
+        self.assertEqual((state["decisions"], state["launches"]), (2, 3))
+        self.assertEqual(state["actions"][0]["state"], "succeeded")
+
+    def test_idle_waits_return_immediately_and_exhaust_decisions(self):
+        for _ in range(2):
+            self.assertEqual(self.wait({}, maximum=2)["result"]["active"], [])
+        self.assertEqual(self.now, 0)
+        with self.assertRaisesRegex(ledger.Conflict, "decision allowance"):
+            self.wait({}, maximum=2)
+
+    def test_mixed_decision_keeps_charge_for_unchanged_wait(self):
+        worker = self.start_worker(2700)
+        steer = {"op": "worker.steer", "args": {"worker_id": worker.action, "message": "Check the log."}}
+        settled = self.wait({}, maximum=2, extra=(steer,))
+        self.assertEqual((self.now, settled["result"]["active"]), (60, [worker.action]))
+        self.assertEqual(self.controller.data["steering"], {worker.action: ["Check the log."]})
+        with self.assertRaisesRegex(ledger.Conflict, "decision allowance"):
+            self.wait({}, maximum=2)
+
+    def test_wait_ends_at_worker_deadline_and_an_expired_wait_costs_a_decision(self):
+        self.start_worker(10)
+        self.now = 4
+        self.wait({"timeout_seconds": 1800}, maximum=2)
+        self.assertEqual(self.now, 10)
+        self.assertEqual(ledger.snapshot(self.controller.lease)["turns"], 1)
+        self.wait({"timeout_seconds": 0}, maximum=2)
+        self.assertEqual(self.now, 10)
+        with self.assertRaisesRegex(ledger.Conflict, "decision allowance"):
+            self.wait({}, maximum=2)
+
+    def test_run_deadline_interrupts_long_wait(self):
+        self.start_worker(2700)
+        self.controller.run.budget = SimpleNamespace(run_deadline=lambda: 2, reason=lambda: "run deadline")
+        with self.assertRaisesRegex(runlimits.Parked, "run deadline"):
+            self.wait({"timeout_seconds": 0})
+        self.assertEqual(self.now, 2)
+
+    def test_new_progress_wakes_wait_and_worker_failure_wakes_next_wait(self):
+        worker = self.start_worker(300, finish=5, ok=False)
+        source = paths.record_dir(worker.run_id) / (worker.step + record.RECORD_SUFFIX)
+        source.parent.mkdir(parents=True, exist_ok=True)
+        with source.open("ab") as output:
+            for event in ({"type": "replay"}, {"type": "heartbeat"},
+                          {"type": "item.completed", "item": {"type": "command_execution"}},
+                          {"type": "item.completed", "item": {"type": "agent_message", "text": "Checks are running."}}):
+                record.append(output.fileno(), json.dumps(event))
+        update = self.wait({"timeout_seconds": 0})
+        self.assertIn("Checks are running.", update["result"]["progress"][worker.action]["excerpt"])
+        self.assertEqual(self.now, 0)
+        self.assertEqual(ledger.snapshot(self.controller.lease)["turns"], 2)
+        failed = self.wait({"timeout_seconds": 60})
+        self.assertEqual(failed["result"]["active"], [])
+        self.assertLess(self.now - 5, 0.1)
+        self.assertEqual(ledger.view(self.controller.run.id)["actions"][0]["state"], "failed")
 
 
 class BudgetTests(Isolated):

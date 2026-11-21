@@ -11,6 +11,7 @@ from .db import reader, tx
 TABLES = {"orchestrations": "run lineage", "orchestration_turns": "run lineage",
           "orchestration_actions": "run lineage"}
 TERMINAL = ("succeeded", "failed", "cancelled", "interrupted", "reconciliation-required")
+UNCHANGED_WAIT = "accepted-unchanged-wait"
 
 
 class Conflict(ValueError):
@@ -91,7 +92,14 @@ def fenced(c, lease: Lease):
 
 def snapshot(lease: Lease) -> dict:
     with reader() as c:
-        return decoded(fenced(c, lease))
+        row = decoded(fenced(c, lease))
+        row["turns"] -= unchanged_waits(c, lease.root)
+        return row
+
+
+def unchanged_waits(c, root: str) -> int:
+    return c.execute("SELECT count(*) FROM orchestration_turns WHERE root = ? AND state = ?",
+                     (root, UNCHANGED_WAIT)).fetchone()[0]
 
 
 def save(lease: Lease, data: dict) -> None:
@@ -104,7 +112,7 @@ def save(lease: Lease, data: dict) -> None:
 def begin(lease: Lease, observation: dict, maximum: int) -> str:
     with tx() as c:
         row = fenced(c, lease)
-        if row["turns"] >= maximum:
+        if row["turns"] - unchanged_waits(c, lease.root) >= maximum:
             raise Conflict(f"controller used its {maximum} decision allowance")
         turn = f"d{row['turns'] + 1:04d}"
         c.execute("INSERT INTO orchestration_turns VALUES (?,?,?,?,?,?,?)",
@@ -130,7 +138,7 @@ def pending(lease: Lease) -> list[dict]:
 def launched(lease: Lease, maximum: int) -> None:
     with tx() as c:
         row = fenced(c, lease)
-        if row["launches"] >= maximum:
+        if row["launches"] - unchanged_waits(c, lease.root) >= maximum:
             raise Conflict(f"controller used its {maximum} inference-launch allowance")
         c.execute("UPDATE orchestrations SET launches = launches + 1 WHERE root = ?", (lease.root,))
 
@@ -150,7 +158,7 @@ def accept(lease: Lease, turn: str, version: int, response: dict, maximum: int) 
                             (lease.root, turn)).fetchone()
         if earlier is None:
             raise Conflict("unknown controller decision")
-        if earlier["state"] == "accepted":
+        if earlier["state"] in ("accepted", UNCHANGED_WAIT):
             if earlier["response"] != body:
                 raise Conflict("decision identity reused with different content")
             return [decoded(r) for r in c.execute(
@@ -191,6 +199,11 @@ def transition(lease: Lease, action: str, state: str, result: dict, expected=("a
                   **result}
         c.execute("UPDATE orchestration_actions SET state = ?, result = ?, at = ? WHERE root = ? AND id = ?",
                   (state, encoded(result), util.iso(), lease.root, action))
+        if (row["op"] == "run.wait" and row["state"] == "running" and state == "succeeded"
+                and result.get("reason") == "timeout" and result.get("active")):
+            c.execute("UPDATE orchestration_turns SET state = ? WHERE root = ? AND id = ? AND state = 'accepted' "
+                      "AND (SELECT count(*) FROM orchestration_actions WHERE root = ? AND turn = ?) = 1",
+                      (UNCHANGED_WAIT, lease.root, row["turn"], lease.root, row["turn"]))
         c.execute("UPDATE orchestrations SET version = version + 1, at = ? WHERE root = ?", (util.iso(), lease.root))
         return {**decoded(row), "state": state, "result": result}
 
@@ -206,7 +219,8 @@ def view(run_id: str, connect=reader) -> dict | None:
             "SELECT * FROM orchestration_actions WHERE root = ? ORDER BY id", (found["root"],))]
         return {"root": found["root"], "current_run": found["current_run"], "generation": found["generation"],
                 "mode": found["data"].get("mode", "orchestrate"),
-                "version": found["version"], "decisions": found["turns"], "launches": found["launches"],
+                "version": found["version"], "decisions": found["turns"] - unchanged_waits(c, found["root"]),
+                "launches": found["launches"],
                 "actions": [{key: action[key] for key in ("id", "run", "op", "state", "at", "request", "result")}
                             for action in actions]}
 
