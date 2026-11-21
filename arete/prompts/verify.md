@@ -41,7 +41,7 @@ $notes
 
 $scratch
 
-## Rules
+$journeys## Rules
 
 - Check every behavior the issue asks for, each edge and error case it names, and one thing near the change that
   worked before and must still work.
