@@ -1,5 +1,6 @@
 import json
 import subprocess
+import time
 import unittest
 from datetime import timedelta
 from unittest import mock
@@ -110,10 +111,21 @@ class OverloadRunTests(unittest.TestCase):
             return results[len(self.calls) - 1]
         with (mock.patch.object(runner, "pick", self.route_chain(auth, which, models)),
               mock.patch.object(getattr(runner, which), "run", launch),
+              mock.patch.object(runner, "time", mock.Mock(wraps=runner.time)),
               mock.patch.object(runner.time, "sleep", side_effect=AssertionError("slept"))):
             res = runner.run("review", ".", model=models[0], runner=which, cfg=self.cfg,
                              wait_out_limits=False, say=lambda text: None, trace=("overload-run", "review"))
         return auth, res
+
+    def test_run_chain_only_blocks_sleep_inside_runner(self):
+        def check_sleep(*args, **kwargs):
+            time.sleep(0)
+            with self.assertRaisesRegex(AssertionError, "^slept$"):
+                runner.wait_until(None, util.now() + timedelta(minutes=1))
+
+        with (mock.patch.object(runner, "run", side_effect=check_sleep),
+              mock.patch.object(runner, "HOLD_CHECK_SECONDS", 1)):
+            self.run_chain("codex", ["gpt-6.2-sol"], "codex", [], "sleep-check")
 
     def test_codex_capacity_runs_the_next_route_and_holds_only_that_model(self):
         failed = agent.Result(ok=False, error=CAPACITY, usage_limit=codex.usage_limit(CAPACITY, "gpt-6.2-sol"))
@@ -128,10 +140,8 @@ class OverloadRunTests(unittest.TestCase):
     def test_claude_529_runs_the_next_route_and_holds_only_that_model(self):
         failed = claude.parse(claude_failure("API Error: 529 overloaded_error", 529), agent.NO_SESSION,
                               "claude-opus-4-7", None)
-        # Keep run_chain's sleep assertion local to runner, away from subprocess polling.
-        with mock.patch.object(runner, "time", mock.Mock(wraps=runner.time)):
-            auth, res = self.run_chain("claude", ["claude-opus-4-7", "claude-sonnet-4-6"], "claude",
-                                       [failed, agent.Result(ok=True, text="done")], "claude-529-login")
+        auth, res = self.run_chain("claude", ["claude-opus-4-7", "claude-sonnet-4-6"], "claude",
+                                   [failed, agent.Result(ok=True, text="done")], "claude-529-login")
         self.assertEqual(self.calls, ["claude-opus-4-7", "claude-sonnet-4-6"])
         self.assertTrue(res.ok)
         self.assertIsNotNone(routing.auth_hold(auth, "claude-opus-4-7"))
