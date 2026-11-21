@@ -80,6 +80,8 @@ REFUSAL_WORDS = re.compile(r"guard|jev|credential|secret|confine|authority", re.
 SIBLINGS = re.compile(r"\n*## Other PRs for [^\n]*\n(?:\n- \[[^\n]*)+")
 SKIPPED_FILE = paths.STATE_DIR / "skipped.json"
 CONTINUE_AFTER_DROP = "The connection dropped mid step. Carry on from where you stopped and finish the step."
+CONTINUE_AFTER_BUSY = "The provider was busy mid step. Carry on from where you stopped and finish the step."
+BUSY_WAITS = (30, 90, 270)
 CHECKS_LOCK = "checks"
 LEFT_TITLE = "Left for a person"
 LEFT_HEADING = f"## {LEFT_TITLE}"
@@ -198,6 +200,10 @@ def seam_facts(run_id: str) -> dict:
 
 def public_text(run: AgentRun, text: str) -> str:
     return outbound.redact(text) if run.repo.public else text
+
+
+def provider_busy(res: Result) -> bool:
+    return not (res.ok or res.connection_failed or res.usage_limit) and util.is_provider_busy(res.error)
 
 
 @dataclass
@@ -376,18 +382,26 @@ class AgentRun:
                 if res.connection_failed:
                     self.log(f"{step}: lost the connection after {util.count(res.turns, 'turn')}, waiting for the network")
                     if self.wait_for_network():
-                        dropped = res
                         self.log(f"{step}: the network is back, the dropped attempt cost {runner.cost_note(res)}")
-                        if res.session.id and res.turns > 1 and kw.get("persist", True):
-                            res = runner.run(CONTINUE_AFTER_DROP, cwd, trace=(self.id, step),
-                                             **{**kw, "resume": res.session, **self.retry_kw()})
-                        else:
-                            res = runner.run(text, cwd, trace=(self.id, step), **{**kw, **self.retry_kw()})
-                        res = runner.with_spent(res, [dropped])
+                        res = self.again(step, text, cwd, kw, res, CONTINUE_AFTER_DROP)
+                for n, wait in enumerate(BUSY_WAITS, 2):
+                    if not provider_busy(res) or self.time_for(wait) < wait:
+                        break
+                    self.log(f"{step}: {res.error.strip().splitlines()[0][:200]}; "
+                             f"try {n} of {len(BUSY_WAITS) + 1} in {wait}s")
+                    time.sleep(wait)
+                    res = self.again(step, text, cwd, kw, res, CONTINUE_AFTER_BUSY)
             return res
         finally:
             if s:
                 record.label_step(self.id, step, attempt_no, atom=s.step, ab=s.ab_name, ab_side=s.ab_side)
+
+    def again(self, step: str, text: str, cwd: Path, kw: dict, failed: Result, carry_on: str) -> Result:
+        if failed.session.id and failed.turns > 1 and kw.get("persist", True):
+            res = runner.run(carry_on, cwd, trace=(self.id, step), **{**kw, "resume": failed.session, **self.retry_kw()})
+        else:
+            res = runner.run(text, cwd, trace=(self.id, step), **{**kw, **self.retry_kw()})
+        return runner.with_spent(res, [failed])
 
     def record_step(self, step: str, res: Result, s: steps.Settings | None, kw: dict, seam, attempt_no: int,
                     started: float, spent: float, chosen: tuple[str, str, str]) -> Result:
