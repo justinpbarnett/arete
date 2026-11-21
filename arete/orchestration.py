@@ -30,9 +30,10 @@ from .agent import NO_SESSION, Session, json_from_text
 from .orchestration_api import BUNDLES, PROTOCOL, Catalog, help_text
 from .store import asks as ask_store
 from .store import orchestration as ledger
-from .store import writes
 from .verify import Verified
 
+CI_FAILURES = "ci:failures"
+MAX_CI_FAILURE_CHARS = 24000
 STATE_FIELDS = ("plan_text", "goal", "estimate", "left_for_a_person", "build_summary", "reviews", "fix_reply",
                 "document", "report_body", "draft_why", "summary", "opened", "found", "pushed", "drafted",
                 "ci_stopped", "changed", "ci_result", "committed")
@@ -118,7 +119,7 @@ class Controller:
             if any(not (Path(c["wt"]) / ".git").exists() for c in prepared["checkouts"]):
                 if any(Path(c["wt"]).exists() for c in prepared["checkouts"]):
                     raise factory.Refused("the retained workspace is incomplete; reconcile without discarding its edits")
-                if self.data.get("publication_pause") or ledger.publication_pending(self.run.id) or not any(
+                if ledger.publication_pending(self.run.id) or not any(
                         a["op"] == "publication.request" and a["state"] == "succeeded" for a in ledger.actions(self.lease)):
                     raise factory.Refused("the missing workspace has no settled publication; reconcile before resuming")
                 if why := self.job.restore({"step": "prepare", "tree": str(self.job.ws), "data": prepared}, layer=self.job.layer):
@@ -189,8 +190,6 @@ class Controller:
         self.data["acceptance"] = ledger.digest([self.catalog.context["task"], self.job.goal,
                                                  self.job.left_for_a_person])
         self.recover()
-        if paused := self.data.get("publication_pause"):
-            return self.resume_publication(paused)
         if self.flow.continues and (moved := flows.base_moved(self.flow.continues)):
             self.job.moved_base = moved
             self.job.merge_moved_base("orchestrate")
@@ -206,6 +205,12 @@ class Controller:
         if any(key in self.data and self.data[key] != value for key, value in found.items()):
             raise factory.Refused("the admitted catalog, controller or policy changed; reconcile before resuming")
         return found
+
+    def ci_failures(self, current):
+        logs = pipeline.run_folder(self.run, "ci")
+        notes = [pipeline.ci.failure_note(r, logs / f"publish-{i}-{prompt_loader.slug(r.label)}.log")
+                 for i, r in enumerate(current.reds, 1)]
+        return "\n\n".join(["## CI failures", "", current.summary(), *notes])
 
     def policy_sha(self):
         return policy_fingerprint(self.job.cfg, self.job.layer, self.run.closed_context)
@@ -231,10 +236,9 @@ class Controller:
         self.quiescent()
         for turn in ledger.pending(self.lease):
             ledger.reject(self.lease, turn["id"], "interrupted controller turn; admitted usage may be unknown")
-        paused_action = self.data.get("publication_pause", {}).get("action")
         for action in ledger.actions(self.lease):
             result = action["result"]
-            if ((action["op"] == "owner.ask" or action["id"] == paused_action) and result.get("awaiting_owner")):
+            if action["op"] == "owner.ask" and result.get("awaiting_owner"):
                 answers = [ask_store.ask_get(ask) for ask in result["ask_ids"]]
                 if not answers or any(not answer or answer["status"] not in ("answered", "taken") for answer in answers):
                     raise factory.Refused("owner answers or interrupted question settlement need reconciliation before resuming")
@@ -268,6 +272,8 @@ class Controller:
             raise factory.Refused("publication was interrupted; reconcile its branch/PR effects before resuming")
         for gate, value in self.data.get("evidence", {}).items():
             self.catalog.add_context(f"evidence:{gate}", ledger.encoded(value))
+        if self.data.get("ci_failures"):
+            self.catalog.add_context(CI_FAILURES, self.data["ci_failures"])
         for action in ledger.actions(self.lease):
             run_lines.write(self.run.id, "action", action=action["id"], op=action["op"], state=action["state"],
                             recovered=True, source=action["run"])
@@ -386,7 +392,9 @@ class Controller:
         tools = tuple(tool for tool in BUNDLES[args["tool_bundle"]] if tool in setting.tools)
         if writing and not {"Write", "Edit"} & set(tools):
             raise ValueError("this role grants no implementation writing tools")
-        contexts = "\n\n".join(self.catalog.read(ref, 0, 8000)["text"] for ref in args["context_refs"])
+        contexts = "\n\n".join(self.catalog.read(ref, 0, 8000)["text"] for ref in args["context_refs"] if ref != CI_FAILURES)
+        if self.data.get("ci_failures") and (self.data.get("ci_failed") or CI_FAILURES in args["context_refs"]):
+            contexts = "\n\n".join(filter(None, (contexts, self.data["ci_failures"][:MAX_CI_FAILURE_CHARS])))
         if prior:
             contexts += "\n\nPrevious worker result:\n" + prior["result"].get("text", "")[:8000]
         goal = args["goal"]
@@ -445,8 +453,9 @@ class Controller:
                         workspace.note_made(self.job.ws, self.job.checkouts,
                                             pipeline.workspace_owner(self.run, self.job.ws, self.job.checkouts))
                         if why := workspace.kept_work(self.job.ws, self.job.checkouts, self.run.repo.path,
-                                                       self.job.layer.copy, commits=False):
-                            raise factory.Refused(why)
+                                                       self.job.layer.copy, commits=False,
+                                                       held=workspace.scratch_left(self.job.ws, self.job.checkouts)):
+                            raise workspace.worktree_failure(why, self.job.ws, self.job.branch)
                     ledger.transition(self.lease, key, "succeeded" if message.get("ok") else "failed", result)
                     self.catalog.add_context(key, message.get("text", message.get("error", "")))
                     if worker.writing:
@@ -562,29 +571,26 @@ class Controller:
     def publication_ci_error(self, current):
         if not current.reds and current.all_read:
             self.data.pop("ci_failed", None)
+            self.data.pop("ci_failures", None)
+            self.catalog.context.pop(CI_FAILURES, None)
             return None
         self.data["ci_failed"] = True
+        self.data["ci_failures"] = self.ci_failures(current)
+        self.catalog.add_context(CI_FAILURES, self.data["ci_failures"])
         for checkout in self.job.with_prs:
             self.check_pilot_publication()
-            if pipeline.own_draft_state(self.run, checkout) is False:
-                pipeline.set_draft(self.run, checkout, True)
-        return {"ci": self.job.ci_result, "error": "CI needs an explicit worker diagnosis or repair"}
+            pipeline.set_draft(self.run, checkout, True)
+        return {"ci": self.job.ci_result, "failures": CI_FAILURES,
+                "error": f"CI needs an explicit worker diagnosis or repair; its failure logs are context {CI_FAILURES}"}
 
-    def note_published_heads(self):
-        for checkout in self.job.picked(self.job.changed):
-            self.data["publication"]["heads"][checkout.github] = checkout.lease
-
-    def finish_publication(self, resume: pipeline.CatchUpPause | None = None):
-        self.barrier()
-        if self.data.get("publication_intent"):
-            raise factory.Refused("publication was interrupted; reconcile its branch/PR effects before resuming")
+    def finish_publication(self):
         self.check_pilot_publication()
         self.data["publication_intent"] = {"tree": self.fingerprint(), "phase": "publish"}
         self.persist()
-        outcome = self.atomic("publish", resume=resume, ci_guard=self.publication_ci_error)
-        self.note_published_heads()
+        outcome = self.atomic("publish", ci_guard=self.publication_ci_error)
+        for checkout in self.job.picked(self.job.changed):
+            self.data["publication"]["heads"][checkout.github] = checkout.lease
         self.data.pop("publication_intent", None)
-        self.data.pop("publication_pause", None)
         if outcome.passed:
             self.data["published"], self.data["published_tree"] = outcome.data, self.fingerprint()
         else:
@@ -592,41 +598,9 @@ class Controller:
             self.data.pop("published_tree", None)
         self.persist()
         if self.data.get("ci_failed"):
-            self.job.slot.take(self.run.log, self.run.waiting)
             return outcome.data
         self.ending = flows.ended(self.flow, outcome)
         return outcome.data
-
-    def resume_publication(self, paused):
-        pause = pipeline.CatchUpPause(**paused["catch_up"])
-        action = next((a for a in ledger.actions(self.lease) if a["id"] == paused["action"]), {})
-        checkouts = self.job.checkouts
-        if (self.run.action or self.run.dry_run or not self.data.get("publication") or self.data.get("ci_failed")
-                or action.get("op") != "publication.request" or action["state"] != "succeeded"
-                or not action["result"].get("awaiting_owner") or len(checkouts) != 1 or not paused["tree"]
-                or self.fingerprint() != paused["tree"]
-                or not pause.matches(checkouts[0])
-                or not 1 <= pause.attempt <= pipeline.AUTOMERGE_CATCH_UPS):
-            raise factory.Refused("the paused automerge checkout or publication changed; reconcile before resuming")
-        self.dispatch(action, resume=pause)
-        return self.ending
-
-    def park_publication(self, action, asked):
-        if (not isinstance(asked, pipeline.CatchUpAsked)
-                or self.data.get("publication_intent", {}).get("phase") != "publish"
-                or not self.data.get("publication")):
-            return "reconciliation-required"
-        tree = self.fingerprint()
-        if not tree:
-            return "reconciliation-required"
-        if not workspace.kept_work(self.job.ws, self.job.checkouts, self.run.repo.path, self.job.layer.copy,
-                                   commits=False):
-            workspace.note_made(self.job.ws, self.job.checkouts)
-        self.note_published_heads()
-        self.job.ci_result = asked.ci_result or self.job.ci_result
-        self.data["publication_pause"] = {"action": action["id"], "tree": tree, "catch_up": asdict(asked.pause)}
-        self.data.pop("publication_intent", None)
-        return "succeeded"
 
     def check_pilot_publication(self):
         if pilot.is_pilot_task(str(self.run.tid)):
@@ -747,23 +721,20 @@ class Controller:
             return {"reason": args["reason"]}
         raise ValueError("unknown orchestration operation")
 
-    def dispatch(self, action, *, resume=None):
-        expected = "succeeded" if resume else "accepted"
-        if action["state"] != expected:
+    def dispatch(self, action):
+        if action["state"] != "accepted":
             return
         if action["op"] != "worker.start" and action["op"] != "worker.continue":
             ledger.transition(self.lease, action["id"], "running", {"input_stamp": {
-                "tree": self.fingerprint(), "policy": self.policy_sha(), "acceptance": self.data["acceptance"]}},
-                expected=(expected,))
+                "tree": self.fingerprint(), "policy": self.policy_sha(), "acceptance": self.data["acceptance"]}})
         try:
             self.executing = action["id"]
-            result = self.finish_publication(resume) if resume else self.perform(action)
+            result = self.perform(action)
         except owner_asks.Asked as asked:
-            state = self.park_publication(action, asked) if action["op"] == "publication.request" else "succeeded"
-            with writes.atomic():
-                ledger.transition(self.lease, action["id"], state, {"ask_ids": asked.ask_ids, "awaiting_owner": True})
-                self.persist()
-            run_lines.write(self.run.id, "action", action=action["id"], op=action["op"], state=state)
+            ledger.transition(self.lease, action["id"], "succeeded",
+                              {"ask_ids": asked.ask_ids, "awaiting_owner": True})
+            self.persist()
+            run_lines.write(self.run.id, "action", action=action["id"], op=action["op"], state="succeeded")
             raise
         except ValueError as error:
             result = {"error": str(error)[:2000]}

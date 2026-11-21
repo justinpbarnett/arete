@@ -9,7 +9,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import asdict
+from dataclasses import MISSING, asdict, fields, is_dataclass
 from math import inf
 from pathlib import Path
 
@@ -139,8 +139,33 @@ def reports_progress(event: dict) -> bool:
                     for block in record.blocks(message.get("content"))))
 
 
+class PolicyChanged(ValueError):
+    pass
+
+
+def at_default(f, value) -> bool:
+    if f.default is not MISSING:
+        return value == f.default
+    return f.default_factory is not MISSING and value == f.default_factory()
+
+
+def explicit(value):
+    if is_dataclass(value) and not isinstance(value, type):
+        return {f.name: explicit(getattr(value, f.name)) for f in fields(value)
+                if not at_default(f, getattr(value, f.name))}
+    if isinstance(value, (list, tuple)):
+        return [explicit(v) for v in value]
+    if isinstance(value, dict):
+        return {k: explicit(v) for k, v in value.items()}
+    return value
+
+
 def settings_sha(value) -> str:
-    return digest(json.loads(json.dumps(asdict(value), default=str)))
+    return digest(json.loads(json.dumps(explicit(value), default=str)))
+
+
+def settings_shas(value) -> set[str]:
+    return {settings_sha(value), digest(json.loads(json.dumps(asdict(value), default=str)))}
 
 
 def request(job, action: str, prompt: str, setting, tools: tuple, rules: list[str], session=NO_SESSION) -> dict:
@@ -186,8 +211,8 @@ def main() -> None:
         cfg = config.load()
         repo = cfg.repo(launch["repo"])
         layer = config.load_layer(Path(launch["layer_dir"]))
-        if settings_sha(cfg) != launch["config_sha"] or settings_sha(layer) != launch["layer_sha"]:
-            raise ValueError("worker policy changed after action acceptance")
+        if launch["config_sha"] not in settings_shas(cfg) or launch["layer_sha"] not in settings_shas(layer):
+            raise PolicyChanged("worker policy changed after action acceptance")
         run = pipeline.AgentRun(launch["run"], repo, paths.RUNS_DIR / launch["run"], cfg=cfg, layer=layer,
                                 kind=launch["kind"], step_overrides={launch["role"]: launch["overrides"]},
                                 closed_context=tuple(launch["closed_context"]))
@@ -213,6 +238,8 @@ def main() -> None:
                        "record": result.record, "recovery": pipeline.runner.start_failure(result, launch["role"])})
     except pipeline.Stopped:
         pass
+    except PolicyChanged as error:
+        send(channel, {"event": "error", "error": record.failure(error), "recovery": {"reason": "engine-crash"}})
     except Exception as error:
         send(channel, {"event": "error", "error": record.failure(error)})
     finally:

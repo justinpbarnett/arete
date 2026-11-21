@@ -93,7 +93,9 @@ class Watched:
         return [c for c in self.checks.values() if c.state == state]
 
     def markdown(self) -> list[str]:
-        lines = ["- Arete stopped waiting because GitHub reports a merge conflict with the base."] if self.conflicting else []
+        lines = []
+        if self.conflicting:
+            lines.append("- Arete stopped waiting because GitHub reports a merge conflict with the base.")
         if not self.read:
             when = "when Arete stopped waiting" if self.conflicting else f"within {minutes(WAIT_SECONDS)} of the push"
             lines.append(f"- Arete could not read the checks {when}.")
@@ -166,7 +168,6 @@ def conflicting(target: Target, log: Callable[[str], None]) -> bool:
 def watch(target: Target, log: Callable[[str], None]) -> Watched:
     log(f"ci: waiting on the checks of {target.pr_name} at {target.sha[:7]}")
     checks: dict[str, gh.Check] = {}
-    observed: dict[str, gh.Check] = {}
     waiting_on: list[str] | None = None
     while True:
         conflict = conflicting(target, log)
@@ -174,18 +175,13 @@ def watch(target: Target, log: Callable[[str], None]) -> Watched:
             log(f"ci: stopped waiting on {target.pr_name} because GitHub reports a merge conflict with the base")
         try:
             checks = gh.commit_checks(target.github, target.sha)
-            for name, check in checks.items():
-                earlier = observed.get(name)
-                if earlier and earlier.state == "fail" and check.state != "fail":
-                    continue
-                observed[name] = check
             just_read = True
         except READ_ERRORS as e:
             just_read = False
             retry = "" if conflict else ", trying again"
             log(f"ci: reading the checks of {target.pr_name} failed{retry}: {util.first_line(str(e), 200)}")
         if conflict:
-            return Watched(target, observed, read=just_read, conflicting=True)
+            return Watched(target, checks if just_read else {}, read=just_read, conflicting=True)
         waited = time.monotonic() - target.pushed_at
         pending = sorted(c.name for c in checks.values() if c.state == "pending")
         if checks and pending != waiting_on:
