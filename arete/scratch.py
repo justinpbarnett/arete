@@ -1332,7 +1332,8 @@ def refusal(st: os.stat_result, device: int, least: int | None) -> str:
     return ""
 
 
-def examined(folder: int, prefix: str, names, device: int, least: int | None, failed: dict, waiting: list) -> None:
+def examined(folder: int, prefix: str, names, device: int, least: int | None, failed: dict, waiting: list,
+             linked: dict) -> None:
     for name in names:
         try:
             st = os.stat(name, dir_fd=folder, follow_symlinks=False)
@@ -1340,6 +1341,8 @@ def examined(folder: int, prefix: str, names, device: int, least: int | None, fa
             failed[prefix + name] = f"{UNCLASSIFIED}: {type(error).__name__}"
             continue
         reason = refusal(st, device, least)
+        if reason == LINKED:
+            linked.setdefault(st.st_ino, (st.st_nlink, []))[1].append(prefix + name)
         if reason:
             failed[prefix + name] = reason
         elif stat.S_ISDIR(st.st_mode):
@@ -1353,7 +1356,8 @@ def unknown_fd(a: Attempt, root: int) -> dict[str, str]:
     expected = {n for n in a.directories if n} | {n for n in a.files if "/" not in n}
     failed = {"missing:" + n: MISSING for n in expected - names}
     waiting: list[tuple[str, list[int]]] = []
-    examined(root, "", names - expected, device, least, failed, waiting)
+    linked: dict[int, tuple[int, list[str]]] = {}
+    examined(root, "", names - expected, device, least, failed, waiting, linked)
     for name in names & expected:
         if name in a.files:
             checked(os.stat(name, dir_fd=root, follow_symlinks=False), a.files[name])
@@ -1363,7 +1367,7 @@ def unknown_fd(a: Attempt, root: int) -> dict[str, str]:
                 children = set(os.listdir(folder))
                 wanted = {n.partition("/")[2] for n in a.files if n.startswith(name + "/")}
                 failed.update({"missing:" + name + "/" + n: MISSING for n in wanted - children})
-                examined(folder, name + "/", children - wanted, device, least, failed, waiting)
+                examined(folder, name + "/", children - wanted, device, least, failed, waiting, linked)
                 for child in children & wanted:
                     checked(os.stat(child, dir_fd=folder, follow_symlinks=False), a.files[name + "/" + child])
             checked(os.stat(name, dir_fd=root, follow_symlinks=False), a.directories[name], True)
@@ -1373,9 +1377,16 @@ def unknown_fd(a: Attempt, root: int) -> dict[str, str]:
             with paths.directory_fd(Path(path), root) as folder:
                 if identity(os.fstat(folder)) != expected_identity:
                     raise OSError(errno.ESTALE, "resource replaced")
-                examined(folder, path + "/", os.listdir(folder), device, least, failed, waiting)
+                examined(folder, path + "/", os.listdir(folder), device, least, failed, waiting, linked)
         except OSError as error:
             failed[path] = f"{UNCLASSIFIED}: {type(error).__name__}"
+    for inode, (count, inside) in linked.items():
+        if len(inside) == count:
+            for name in inside:
+                if inode > least:
+                    del failed[name]
+                else:
+                    failed[name] = EXISTED
     return failed
 
 
