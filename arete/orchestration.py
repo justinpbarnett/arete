@@ -134,10 +134,10 @@ class Controller:
             return "noop", closed, ""
         self.flow.matching = False
         run_lines.write(self.run.id, "route", continues=self.flow.continues, mode="orchestrated", protocol=PROTOCOL)
-        if self.data.get("prepared"):
+        prepared = self.data.get("prepared")
+        if prepared:
             if not {"run_settings", "overrides", "step_overrides"} <= self.data.keys():
                 raise factory.Refused("the saved controller lacks accepted invocation settings; reconcile before resuming")
-            prepared = self.data["prepared"]
             layer_dir, source_file = Path(prepared["layer"]), None
             if not layer_dir.exists():
                 for checkout in map(workspace.Checkout.from_row, prepared["checkouts"]):
@@ -240,9 +240,19 @@ class Controller:
         if self.run.environment_release:
             self.data.pop("published", None)
             self.data.pop("published_tree", None)
-        elif self.flow.continues and (moved := flows.base_moved(self.flow.continues)):
-            self.job.moved_base = moved
-            self.job.merge_moved_base("orchestrate")
+        else:
+            if self.flow.continues and (moved := flows.base_moved(self.flow.continues)):
+                self.job.moved_base = moved
+                self.job.merge_moved_base("orchestrate")
+            if prepared:
+                for checkout in self.job.checkouts:
+                    workspace.fetch(checkout.src, checkout.base)
+                prs = self.job.with_prs
+                for checkout in prs:
+                    checkout.resumes = True
+                if pipeline.merge_moved_bases(self.run, prs, self.job.layer, self.job.ticket):
+                    workspace.note_made(self.job.ws, self.job.checkouts)
+                self.job.b.workspace = self.job.workspace
         if old_lineage:
             self.data["lineage_event"] = {"run": self.run.id, "event_id": uuid4().hex, "old": old_lineage,
                                           "new": {key: lineage[key] for key in old_lineage},

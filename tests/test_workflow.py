@@ -158,6 +158,125 @@ class QueueScoringTests(unittest.TestCase):
         self.assertEqual(queueing.scores(list(self.source.open_agent_tickets)), {"1": (1, 0)})
 
 
+class RestoredPrepareTests(unittest.TestCase):
+    def setUp(self):
+        root = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        wt = root / "checkout"
+        wt.mkdir()
+        (wt / ".git").touch()
+        c = self.checkout = workspace.Checkout("", "fixture/repo", root / "source", wt, "main",
+                                               pr="https://github.com/fixture/repo/pull/7", lease="pr-head",
+                                               revision="old-base", base_commit="old-base")
+        layer = config.RepoLayer(dir=root)
+        ticket = tracker.Ticket("7", "#7", "Revise the PR")
+        repo = config.Repo("fixture", c.src, parts=[config.Part("", c.github)])
+        run = pipeline.Run(id="revision-run", repo=repo, tracker=mock.Mock(), tid="7", dir=root, alone=True)
+        self.enterContext(mock.patch.object(run, "log"))
+        job = flows.Job(config.Config(), run, wt, continues="prior-run")
+        controller = self.controller = orchestration.Controller.__new__(orchestration.Controller)
+        controller.run, controller.job = run, job
+        controller.flow = SimpleNamespace(ctx=job, continues=job.continues, refusal="")
+        controller.lease, controller.ending, controller.workers = "fixture-lease", None, {}
+        controller.policy = config.Orchestration()
+        controller.data = {"prepared": flows.prepared_fields(ticket, "revision", [c], layer, [], "", None),
+                           "run_settings": "", "overrides": {}, "step_overrides": {}, "job": {"goal": ticket.title},
+                           "verified": asdict(job.verified)}
+        controller.catalog = mock.Mock(context={"task": ticket.title})
+        controller.lineage = mock.Mock(return_value=({}, {}))
+        self.action = {"id": "first-worker", "op": "worker.start", "state": "accepted", "result": {}, "run": run.id}
+        self.enterContext(mock.patch.multiple(ledger, actions=mock.Mock(return_value=[self.action]),
+                                             pending=mock.Mock(return_value=[])))
+        self.saved = self.enterContext(mock.patch.object(ledger, "save"))
+        self.dispatch = self.enterContext(mock.patch.object(controller, "dispatch"))
+        self.resolver = self.enterContext(mock.patch.object(pipeline, "resolve_conflicts"))
+        self.merge = self.enterContext(mock.patch.object(pipeline, "merge_as_run"))
+        self.abort = self.enterContext(mock.patch.object(pipeline, "abort_merge"))
+        self.enterContext(mock.patch.object(pipeline.record, "timed", return_value=nullcontext({})))
+        self.enterContext(mock.patch.object(pipeline, "unmerged_paths", return_value=["file.txt"]))
+        self.enterContext(mock.patch.object(pipeline, "resolution_diff", return_value=diffguard.Diff()))
+        self.enterContext(mock.patch.object(orchestration.run_lines, "write"))
+        self.enterContext(mock.patch.object(flows, "base_moved", return_value=""))
+        self.enterContext(mock.patch.object(flows, "authors", return_value={"prior-run"}))
+        self.enterContext(mock.patch.object(flows, "authority", return_value=(c.lease, True)))
+        self.enterContext(mock.patch.object(job, "reclaim", return_value=""))
+        self.enterContext(mock.patch.object(orchestration.zte, "reserved", return_value=False))
+        self.enterContext(mock.patch.multiple(workspace, kept_onto=mock.Mock(return_value={}),
+                                             kept_work=mock.Mock(return_value=""), scratch_held=mock.Mock(return_value=[]),
+                                             uncommitted=mock.Mock(return_value=[]), note_made=mock.DEFAULT))
+        self.remote_base = self.origin_base = c.base_commit
+        self.head = c.lease
+        self.fetch = self.enterContext(mock.patch.object(workspace, "fetch", side_effect=self.fetch_base))
+        self.enterContext(mock.patch.object(pipeline, "git", side_effect=self.git))
+
+    def fetch_base(self, src, ref):
+        self.assertEqual((src, ref), (self.checkout.src, "main"))
+        self.origin_base = self.remote_base
+
+    def git(self, args, cwd):
+        self.assertEqual(cwd, self.checkout.wt)
+        return {
+            ("rev-parse", "origin/main"): self.origin_base,
+            ("rev-list", "--count", f"HEAD..{self.origin_base}"): str(int(self.origin_base != self.checkout.base_commit)),
+            ("rev-parse", "HEAD"): self.head,
+        }[tuple(args)]
+
+    def drive_to_first_worker(self, check):
+        ending = ("pr", "fixture complete", "")
+
+        def dispatch(action):
+            self.assertEqual(action, self.action)
+            self.saved.assert_called_once()
+            check(self.saved.call_args.args[1]["prepared"]["checkouts"][0])
+            self.controller.ending = ending
+
+        self.dispatch.side_effect = dispatch
+        self.assertEqual(self.controller.drive(), ending)
+        self.dispatch.assert_called_once_with(self.action)
+
+    def test_resolves_moved_base_before_first_worker(self):
+        self.remote_base = "moved-base"
+        self.merge.side_effect = RuntimeError("merge conflict")
+
+        def resolve(run, checkout, conflicts, layer, ticket):
+            self.dispatch.assert_not_called()
+            self.merge.assert_called_once_with(run.id, checkout, self.remote_base, "origin/main", overwrite_ignore=True)
+            self.assertEqual(conflicts, ["file.txt"])
+            self.head = "resolved-merge"
+
+        def check(saved):
+            self.resolver.assert_called_once()
+            self.assertEqual(saved["merge"], "resolved-merge")
+            self.assertEqual(saved["base_commit"], self.remote_base)
+
+        self.resolver.side_effect = resolve
+        self.drive_to_first_worker(check)
+
+    def test_keeps_head_when_base_is_unchanged(self):
+        def check(saved):
+            self.fetch.assert_called_once_with(self.checkout.src, "main")
+            self.merge.assert_not_called()
+            self.resolver.assert_not_called()
+            self.assertEqual(saved["merge"], "")
+            self.assertEqual(saved["base_commit"], self.checkout.base_commit)
+            self.assertEqual(self.head, self.checkout.lease)
+
+        self.drive_to_first_worker(check)
+
+    def test_ends_prepare_when_conflict_cannot_be_resolved(self):
+        self.remote_base = "moved-base"
+        self.merge.side_effect = RuntimeError("merge conflict")
+        self.resolver.side_effect = workspace.RunFailed("fixture conflict remains")
+        ending = ("failed", "fixture conflict remains", "")
+        with mock.patch.object(flows, "finish", return_value=ending) as finish:
+            self.assertEqual(flows.driven(self.controller.flow, lambda _: self.controller.drive()), ending)
+        finish.assert_called_once_with(self.controller.flow, "failed", why="fixture conflict remains",
+                                       detail="", recovery=None)
+        self.resolver.assert_called_once()
+        self.abort.assert_called_once_with(self.checkout.wt)
+        self.dispatch.assert_not_called()
+        self.saved.assert_not_called()
+
+
 class PublicationFixture(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
