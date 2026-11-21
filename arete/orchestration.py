@@ -20,6 +20,7 @@ from . import (
     owner_asks,
     pilot,
     pipeline,
+    principals,
     prompt_loader,
     repairs,
     run_lines,
@@ -1003,7 +1004,17 @@ class Controller:
                 return None
         return None
 
-    def prepare_failed_finish(self, turn: str) -> str:
+    @contextmanager
+    def report_failed_finish(self, turn: str | None):
+        if not turn or self.flow.only or self.run.action_only or self.run.dry_run:
+            yield
+            return
+        with ledger.reader() as connection:
+            ledger.fenced(connection, self.lease)
+            row = connection.execute(
+                "SELECT response FROM orchestration_turns WHERE root = ? AND id = ? AND state = 'accepted'",
+                (self.lease.root, turn)).fetchone()
+        rationale = ledger.decoded(row).get("response", {}).get("rationale")
         for checkout in self.job.with_prs:
             try:
                 pr = gh.pr_merge_details(checkout.pr)
@@ -1012,15 +1023,21 @@ class Controller:
             except (gh.GhError, ValueError) as error:
                 self.run.log(f"pr: could not inspect {checkout.pr}: {util.first_line(str(error), 300)}")
                 continue
-            if (pr.get("state") == "OPEN" and pr.get("isDraft") is False
-                    and checkout.lease and pr.get("headRefOid") == checkout.lease):
+            if pr.get("state") == "OPEN" and pr.get("isDraft") is False:
                 pipeline.set_draft(self.run, checkout, True, "failed")
-        with ledger.reader() as connection:
-            ledger.fenced(connection, self.lease)
-            row = connection.execute(
-                "SELECT response FROM orchestration_turns WHERE root = ? AND id = ? AND state = 'accepted'",
-                (self.lease.root, turn)).fetchone()
-        return outbound.screen(ledger.decoded(row).get("response", {}).get("rationale", ""))
+        if rationale is None:
+            yield
+            return
+        comment_rationale = outbound.screen(rationale.strip()).encode("utf-8", "backslashreplace").decode("utf-8")
+        with principals.acting(f"run:{self.run.id}/respond"):
+            self.run.say(f"Run `{self.run.id}` failed without delivery.\n\n{comment_rationale}"
+                         f"\n\n{self.run.retry_hint}.")
+        say = self.run.say
+        self.run.say = lambda _body: ""
+        try:
+            yield
+        finally:
+            self.run.say = say
 
     def perform(self, action):
         args, op = action["request"], action["op"]
@@ -1118,11 +1135,9 @@ class Controller:
                   and not zte.reserved(str(self.run.tid))):
                 self.ending = pipeline.park_run(self.run, reason)
             else:
-                detail = ""
-                if (turn := action.get("turn")) and not (self.flow.only or self.run.action_only or self.run.dry_run):
-                    detail = self.prepare_failed_finish(turn)
-                self.ending = flows.finish(self.flow, "failed", why="the orchestrator stopped without delivery",
-                                           detail=detail, recovery=self.failure_recovery())
+                with self.report_failed_finish(action.get("turn")):
+                    self.ending = flows.finish(self.flow, "failed", why="the orchestrator stopped without delivery",
+                                               recovery=self.failure_recovery())
             return {"reason": args["reason"]}
         raise ValueError("unknown orchestration operation")
 
