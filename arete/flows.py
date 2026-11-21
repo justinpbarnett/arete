@@ -696,7 +696,8 @@ class Job:
         self.committed = bool(data.get("committed", True))
         if stored:
             for c in self.picked(self.changed):
-                c.note_pushed_head(c.onto or util.git(["rev-parse", "HEAD"], c.wt).strip())
+                head = c.publication_baseline or c.onto or util.git(["rev-parse", "HEAD"], c.wt).strip()
+                c.note_pushed_head(head)
             if self.with_prs:
                 pipeline.note_prs(self.run, self.branch, self.with_prs)
 
