@@ -100,7 +100,7 @@ class PublicationFixture(unittest.TestCase):
 
 
 class SingleWorkerPublicationTests(PublicationFixture):
-    def test_single_worker_repair_keeps_the_draft_when_only_publication_is_refused(self):
+    def test_single_worker_repair_fails_required_gates_when_publication_is_refused(self):
         branch = "arete/7-edit-fixture"
         self.git("switch", "-qc", branch)
         self.record_pushed_head()
@@ -127,10 +127,10 @@ class SingleWorkerPublicationTests(PublicationFixture):
         del controller.persist
 
         unchanged = f"nothing changed since the pushed head `{c.lease}`"
-        for verified, review, error, status in (
-            ("pass", "approve", unchanged, "pr"),
-            ("fail", "approve", "behavioral verification failed; repair or finish failed", "failed"),
-            ("pass", "request_changes", unchanged, "failed"),
+        for verified, review, error in (
+            ("pass", "approve", unchanged),
+            ("fail", "approve", "behavioral verification failed; repair or finish failed"),
+            ("pass", "request_changes", unchanged),
         ):
             with self.subTest(verified=verified, review=review):
                 controller.run.id = f"fixture-{verified}-{review}"
@@ -148,9 +148,7 @@ class SingleWorkerPublicationTests(PublicationFixture):
                 publication = ledger.actions(controller.lease)[-1]
                 self.assertEqual((publication["op"], publication["state"], publication["result"]["error"]),
                                  ("publication.request", "failed", error))
-                self.assertEqual(ending[0], status)
-                if status == "pr":
-                    self.assertEqual(ending, ("pr", unchanged, c.pr))
+                self.assertEqual(ending, ("failed", "single-worker execution did not pass its required gates", ""))
                 self.assertEqual(self.git("rev-parse", "HEAD"), c.lease)
                 push.assert_not_called()
                 draft.assert_not_called()

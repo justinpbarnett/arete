@@ -1066,16 +1066,12 @@ def single_worker(flow):
                 "calls": batch}, turn, snapshot["version"], {a["id"]: a for a in ledger.actions(controller.lease)})
             actions = ledger.accept(controller.lease, turn, snapshot["version"], response, controller.policy.max_actions)
             for action in actions:
-                refusal = controller.dispatch(action)
+                controller.dispatch(action)
                 while controller.workers:
                     controller.collect()
                     time.sleep(0.05)
                 failed = [a["id"] for a in ledger.actions(controller.lease) if a["state"] in ("failed", "interrupted")]
                 if failed:
-                    if (isinstance(refusal, UnchangedPushedHead) and failed == [action["id"]]
-                            and controller.job.review.approved()):
-                        ending = "dry-run" if controller.run.dry_run else "pr"
-                        return flows.finish(flow, ending, summary=str(refusal))
                     return flows.finish(flow, "failed", why="single-worker execution did not pass its required gates",
                                         recovery=controller.failure_recovery())
                 if controller.ending:
