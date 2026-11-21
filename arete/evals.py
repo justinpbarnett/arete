@@ -333,7 +333,7 @@ def harness_files(src: Source) -> list[str]:
     return [f for f in src.files() if util.matches_any(f, globs) and not f.startswith(EVALS + "/")]
 
 
-def copy_harness_file(src: Source, rel: str, dest: Path) -> None:
+def copy_harness_file(src: Source, rel: str, dest: Path) -> str | None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     target = src.link(rel)
     if target is not None:
@@ -342,20 +342,33 @@ def copy_harness_file(src: Source, rel: str, dest: Path) -> None:
         dest.write_bytes(src.read(rel))
         if src.executable(rel):
             dest.chmod(dest.stat().st_mode | 0o111)
+    return target
 
 
-def overlay_harness(src: Source, wt: Path) -> list[str]:
+def overlay_harness(src: Source, wt: Path) -> tuple[list[str], set[tuple[int, int]]]:
+    root = wt.resolve()
+    copied = harness_files(src)
+    paired = isinstance(src, HarnessOverlay)
+    original_links = {}
+    if paired:
+        for f in copied:
+            dest = root / f
+            if dest.is_symlink() and dest.parent.resolve() == dest.parent:
+                original_links[f] = os.readlink(dest)
     shutil.rmtree(wt / EVALS, ignore_errors=True)
     remove_base_harness(wt, harness_globs())
-    copied = harness_files(src)
+    overlay_links = set()
     for f in copied:
-        dest = wt / f
-        if dest.parent.resolve() != wt.resolve() / Path(f).parent:
+        dest = root / f
+        if dest.parent.resolve() != dest.parent:
             raise workspace.RunFailed(f"harness path {f} has a symlink parent")
         if dest.is_symlink() or dest.is_file():
             dest.unlink()
-        copy_harness_file(src, f, dest)
-    return copied
+        target = copy_harness_file(src, f, dest)
+        if paired and target is not None and target != original_links.get(f):
+            info = dest.lstat()
+            overlay_links.add((info.st_dev, info.st_ino))
+    return copied, overlay_links
 
 
 def commit_without_evals(repo_path: Path, sha: str, staging: Path) -> str:
@@ -448,8 +461,41 @@ def overlay_owns_copy(root: Path, dest: Path, overlay_paths: frozenset[str]) -> 
         return probe.with_name(probe.name.upper()).exists()
 
 
+def check_copy_links(path: Path, overlay_links: set[tuple[int, int]]) -> None:
+    if not overlay_links:
+        return
+    current = Path(path.anchor)
+    pending = list(reversed(path.parts[1:]))
+    links = 0
+    while pending:
+        part = pending.pop()
+        if part == "..":
+            current = current.parent
+            continue
+        entry = current / part
+        try:
+            info = entry.lstat()
+        except (FileNotFoundError, NotADirectoryError):
+            current = entry
+            continue
+        if not stat.S_ISLNK(info.st_mode):
+            current = entry
+            continue
+        if (info.st_dev, info.st_ino) in overlay_links:
+            raise workspace.RunFailed(f"setup.copy path {path} uses a link introduced or retargeted by the harness overlay")
+        links += 1
+        if links > 40:
+            raise workspace.RunFailed(f"setup.copy path {path} passes through too many symbolic links")
+        target = entry.readlink()
+        if target.is_absolute():
+            current = Path(target.anchor)
+            pending.extend(reversed(target.parts[1:]))
+        else:
+            pending.extend(reversed(target.parts))
+
+
 def prepare(repo: config.Repo, src: Source, wt: Path, run: EvalRun) -> config.RepoLayer:
-    copied = overlay_harness(src, wt)
+    copied, overlay_links = overlay_harness(src, wt)
     run.harness_paths = copied
     run.log(f"harness from {src.label} ({len(copied)} files)")
     local_layer = repo.path / LAYER_CONFIG
@@ -461,23 +507,29 @@ def prepare(repo: config.Repo, src: Source, wt: Path, run: EvalRun) -> config.Re
     for c in layer.copy:
         s = repo.path / c
         if s.exists():
-            root = wt.resolve()
-            rel = Path(c)
-            path = root / rel
-            if (overlay_paths and not rel.is_absolute() and path.is_symlink()
-                    and overlay_owns_copy(root, path.parent.resolve() / path.name, overlay_paths)):
-                continue
-            dest = fixture_path(root, c)
-            if overlay_owns_copy(root, dest, overlay_paths):
-                continue
-            if overlay_paths and dest.is_dir():
-                target = dest / s.name
-                if overlay_owns_copy(root, target, overlay_paths) or (
-                    target.is_symlink() and overlay_owns_copy(root, target.resolve(), overlay_paths)
+            path = wt / c
+            if overlay_paths:
+                root = wt.resolve()
+                configured = root / c
+                if overlay_owns_copy(root, configured, overlay_paths):
+                    continue
+                check_copy_links(configured, overlay_links)
+                if configured.is_symlink() and overlay_owns_copy(
+                    root, configured.parent.resolve() / configured.name, overlay_paths
                 ):
                     continue
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(s, dest)
+                dest = configured.resolve()
+                if overlay_owns_copy(root, dest, overlay_paths):
+                    continue
+                if dest.is_dir():
+                    target = dest / s.name
+                    if overlay_owns_copy(root, target, overlay_paths):
+                        continue
+                    check_copy_links(target, overlay_links)
+                    if target.is_symlink() and overlay_owns_copy(root, target.resolve(), overlay_paths):
+                        continue
+            path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(s, path)
     for cmd in layer.setup:
         if environment.sh(cmd, run.config, repo, cwd=wt, timeout=run.time_for(1200)).returncode != 0:
             raise workspace.RunFailed(f"setup `{cmd}` failed")
