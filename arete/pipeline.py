@@ -1166,19 +1166,40 @@ def recorded_path(run_id: str) -> str:
     return "classic"
 
 
-def dispatch_path(repo: config.Repo, tid: str) -> str:
+def feedback_script(cfg: config.Config, path: str) -> str:
+    if cfg.adws and cfg.adws.resolve() != paths.ADWS_DIR.resolve():
+        if path not in (ADW, "repair"):
+            return path
+        if not (cfg.adws / "revise.py").is_file():
+            return "feature"
+    return "revise" if path in (ADW, "feature", "patch", "repair") else path
+
+
+def dispatch(cfg: config.Config, repo: config.Repo, tid: str) -> tuple[str, dict | None]:
     newest = run_store.newest_whole_run(repo.name, tid)
+    feedback = pending_feedback(repo.name, tid)
     if newest and newest["status"] == "interrupted":
-        return recorded_path(newest["id"])
-    if pending_feedback(repo.name, tid) and (source := next(iter(run_store.open_runs(repo.name, tid)), None)):
-        return recorded_path(source["id"])
-    return wanted(repo)
+        rid = newest["id"]
+        path = recorded_path(rid)
+        if path in (ORCHESTRATED, "orchestrate"):
+            return path, newest
+        repair = path == "repair" or bool(repaired_by(rid))
+        if not (repair and insights_store.has_new_feedback(feedback)):
+            if path == ADW:
+                path = "repair" if repair else feedback_script(cfg, path) if feedback else "feature"
+            return path, newest
+    if feedback and (source := next(iter(run_store.open_runs(repo.name, tid)), None)):
+        while (parent := repaired_by(source["id"])) and (original := run_store.run_get(parent)):
+            source = original
+        return feedback_script(cfg, recorded_path(source["id"])), source
+    path = wanted(repo)
+    return ("feature" if path == ADW else path), None
 
 
 def run_command(repo_name: str, tid: str | int, force: bool = False, dry_run: bool = False) -> list[str]:
     cfg = config.load()
     flags = [*(["--force"] if force else []), *(["--dry-run"] if dry_run else [])]
-    mode = dispatch_path(cfg.repo(repo_name), str(tid))
+    mode, source = dispatch(cfg, cfg.repo(repo_name), str(tid))
     if (asked := answered_run(repo_name, str(tid))) and not dry_run:
         mode = recorded_path(asked["id"])
         if mode != "classic":
@@ -1188,22 +1209,13 @@ def run_command(repo_name: str, tid: str | int, force: bool = False, dry_run: bo
     if mode in (ORCHESTRATED, "orchestrate"):
         from .store import orchestration
 
-        newest = run_store.newest_whole_run(repo_name, str(tid))
-        source = newest if newest and newest["status"] == "interrupted" else (
-            next(iter(run_store.open_runs(repo_name, str(tid))), None)
-            if not force and pending_feedback(repo_name, str(tid)) else None)
-        if dry_run and run_store.held_environment_branch(repo_name, str(tid)):
+        if (force and source and source["status"] != "interrupted"
+                or dry_run and run_store.held_environment_branch(repo_name, str(tid))):
             source = None
         previous = (orchestration.find(source["id"]) or {}).get("current_run", source["id"]) if source else ""
         return script_command(cfg, "orchestrate", repo_name, str(tid), *flags,
                               *(["--continue", previous] if previous else []))
-    if mode != ADW:
-        return script_command(cfg, mode, repo_name, str(tid), *flags)
-    newest = run_store.newest_whole_run(repo_name, str(tid))
-    if newest and newest["status"] == "interrupted" and repaired_by(newest["id"]):
-        return script_command(cfg, "repair", repo_name, str(tid), *flags)
-    name = "revise" if pending_feedback(repo_name, str(tid)) else "feature"
-    return script_command(cfg, name, repo_name, str(tid), *flags)
+    return script_command(cfg, mode, repo_name, str(tid), *flags)
 
 
 def exec_script(repo_name: str, tid: str, dry_run: bool, force: bool) -> int:
@@ -1397,7 +1409,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         print(f"{repo_name}: {e}")
         return 1
     if not script:
-        adw = dispatch_path(repo, str(tid)) != "classic"
+        adw = dispatch(cfg, repo, str(tid))[0] != "classic"
     if adw and not script:
         return exec_script(repo.name, tid, dry_run, force)
     if script and (refusal := script_refusal(cfg, repo, tid, script, dry_run)):
@@ -1508,6 +1520,10 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             restarting = bool(earlier) and earlier["status"] == "interrupted"
             mending = (script.repairs or repaired_by(script.continues or (earlier["id"] if restarting else ""))
                        ) if script else ""
+            revising_over_repair = (mending and script.path != "repair" and not (only or script.action)
+                                    and insights_store.has_new_feedback(feedback))
+            if revising_over_repair:
+                mending = ""
             if pilot.is_pilot_task(str(tid)):
                 try:
                     pilot.require(pilot.task_admission(str(tid), repo.name) == permit,
@@ -1614,8 +1630,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     run.log(f"restarting after run {earlier['id']} was interrupted")
                 if zte_grant:
                     check_handoff()
-                flow = (flows.start(cfg, run, earlier if restarting else {}, slot, script.continues, script.only,
-                                    script.again) if script else None)
+                flow = (flows.start(cfg, run, earlier if restarting and not revising_over_repair else {},
+                                    slot, script.continues, script.only, script.again) if script else None)
         except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
             if not zte_grant:
                 raise

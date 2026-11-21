@@ -35,6 +35,7 @@ from .agent import NO_SESSION, Result
 from .factory import Outcome
 from .review import Review
 from .store import asks as asks_store
+from .store import insights as insights_store
 from .store import runs as run_store
 from .store import triage as triage_store
 from .verify import Verified
@@ -589,6 +590,15 @@ class Job:
         return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
     def accepts(self, name: str, outcome: Outcome, kw: dict) -> bool:
+        if name == "revise" and self.run.feedback and not self.run.alone:
+            if "feedback_ids" in outcome.data:
+                matches = outcome.data["feedback_ids"] == feedback_ids(self.run.feedback)
+            else:
+                matches = (not insights_store.has_fresh_feedback(self.run.feedback)
+                           and outcome.data.get("plan") == revision_plan(pipeline.feedback_markdown(self.run.feedback)))
+            if not matches:
+                self.run.log("revise: owner feedback changed since the saved revision")
+                return False
         if (expected := self.policy(name, kw)) and outcome.data.get("policy") != expected:
             self.run.log(f"{name}: stored evidence used a different policy; rerunning is required")
             return False
@@ -829,11 +839,11 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
     except tracker.ERRORS as e:
         return end_as("stop", "quiet", status="failed", summary=f"could not read {run.ref}: {e}")
     opened(run, t)
+    mended = run_store.run_get(run.repairs) or {} if run.repairs else {}
     if run.feedback:
         if closed := run.feedback_closure():
             return end_as("stop", "quiet", status="noop", summary=closed)
     elif run.repairs:
-        mended = run_store.run_get(run.repairs) or {}
         urls = str(mended.get("pr_url") or "").split()
         if closed := [url for url in urls if gh.pr_view(url).get("state") != "OPEN"]:
             return end_as("stop", "quiet", status="noop",
@@ -955,10 +965,20 @@ def patch(flow: factory.Flow, tree: str) -> Outcome:
     }, session=job.run.sessions.get(BUILD, NO_SESSION))
 
 
+def feedback_ids(rows: list[dict]) -> list[list[str | int]]:
+    return sorted([f["pr_url"], f["kind"], f["gh_id"]] for f in rows)
+
+
+def revision_plan(feedback: str) -> str:
+    return f"Revise the open PR for the owner's feedback:\n\n{feedback}"
+
+
 @factory.step("revise")
 def revision(flow: factory.Flow, tree: str) -> Outcome:
     job: Job = flow.ctx
     run, layer = job.run, job.layer
+    if flow.skipped and run.feedback and not run.alone and (closed := run.feedback_closure()):
+        return end_as("stop", "quiet", status="noop", summary=closed)
     feedback = pipeline.feedback_markdown(run.feedback)
     left = pipeline.left_on_prs(run.feedback_prs)
     run.story.append(f"The owner reviewed the PR and left this feedback:\n\n{feedback}")
@@ -972,7 +992,7 @@ def revision(flow: factory.Flow, tree: str) -> Outcome:
     if pipeline.stage(job.checkouts, diffguard.denied_paths(layer)).empty:
         return end_as("stop", "unchanged", summary=summary, replies=replies)
     return Outcome("pass", data={
-        "plan": f"Revise the open PR for the owner's feedback:\n\n{feedback}", "left_for_a_person": left,
+        "plan": revision_plan(feedback), "left_for_a_person": left, "feedback_ids": feedback_ids(run.feedback),
         "goal": ("Check each change the owner's feedback asks for, and that what the issue asks for still works.\n\n"
                  + feedback),
         "summary": summary, "replies": replies, "story": run.story}, session=run.sessions.get(BUILD, NO_SESSION))

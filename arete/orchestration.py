@@ -125,7 +125,7 @@ class Controller:
         if self.flow.refusal:
             raise factory.Refused(self.flow.refusal)
         pending_push = ledger.catch_up_push(self.data)
-        if closed := self.run.feedback_closure():
+        if self.run.feedback and (closed := self.run.feedback_closure()):
             self.quiescent()
             return "noop", closed, ""
         self.flow.matching = False

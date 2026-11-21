@@ -340,9 +340,8 @@ class Flow:
     def carried(self, name: str, kw: dict) -> Outcome | None:
         line = self.earlier[self.carry] if self.carry < len(self.earlier) else {}
         if (line.get("step") == name and line.get("result") == "pass" and self.ctx.keeps(name, kw)
-                and (not self.again or self.carry < self.again_at)):
+                and (not self.again or self.carry < self.again_at) and (outcome := self.accepted(name, line, kw))):
             n = self.tries[name] = self.tries.get(name, 0) + 1
-            outcome = outcome_of(line)
             self.end(name, n, outcome, "", Calls(self.run_id, name, n=n), time.monotonic(), kw,
                      carried=self.continues)
             self.carry += 1
@@ -353,12 +352,16 @@ class Flow:
     def takes(self, name: str) -> bool:
         return name != self.only and (name != self.again or self.at < self.again_at)
 
+    def accepted(self, name: str, line: dict, kw: dict) -> Outcome | None:
+        outcome = outcome_of(line)
+        accepts = getattr(self.ctx, "accepts", None)
+        return outcome if accepts is None or accepts(name, outcome, kw) else None
+
     def stored(self, name: str, kw: dict) -> Outcome | None:
         line = self.earlier[self.at] if self.at < len(self.earlier) else {}
         if line.get("step") != name or not self.takable(line):
             return None
-        accepts = getattr(self.ctx, "accepts", None)
-        if accepts is not None and not accepts(name, outcome_of(line), kw):
+        if not (outcome := self.accepted(name, line, kw)):
             return None
         if (self.only or self.again) and line.get("tree") and not os.path.isdir(line["tree"]):
             why = self.ctx.restore(line)
@@ -372,7 +375,7 @@ class Flow:
             now = self.print_of(kw.get("tree") or line["tree"])
             if not now or now != self.expected(self.at, str(line["tree"])):
                 return None
-        return outcome_of(line)
+        return outcome
 
     def takable(self, line: dict) -> bool:
         if line.get("result") == "pass":

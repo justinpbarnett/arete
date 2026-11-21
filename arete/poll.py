@@ -36,7 +36,6 @@ from .pipeline import (
     held_back,
     live_pipeline_runs,
     pending_feedback,
-    repaired_by,
     retry_scratch,
     runnable,
     settle_abandoned_runs,
@@ -96,7 +95,7 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
               other_routes: set[str], excluded: set[str] = frozenset(),
               recovered: tuple[tracker.Ticket, ...] = ()) -> tuple[str, str] | None:
     excluded = excluded | oncall.parked(repo.name)
-    fresh = next_ticket(repo, tk, skips, other_routes, excluded, recovered)
+
     def eligible_again(tid):
         return (str(tid) not in excluded and not pilot.is_pilot_task(str(tid)) and not zte.reserved(str(tid))
                 and not run_store.issue_running(repo.name, tid))
@@ -112,8 +111,10 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
                 and not environment_gaps.was_retry(row)):
             if tid in feedback_due:
                 return tid, FEEDBACK_PICK
-            if not insights_store.has_fresh_feedback(pending_feedback(repo.name, tid)):
-                return tid, "restarting after an interruption"
+            if insights_store.has_new_feedback(pending_feedback(repo.name, tid)):
+                excluded = excluded | {tid}
+                continue
+            return tid, "restarting after an interruption"
     for tid in feedback_due:
         if ordinary_history(tid):
             return tid, FEEDBACK_PICK
@@ -128,6 +129,7 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
                 skips.note(tracker.ticket_name(repo.name, t.ref), t, blocker, repo.name)
                 continue
             return t.id, f"{t.title} (you replied to the question)"
+    fresh = next_ticket(repo, tk, skips, other_routes, excluded, recovered)
     return (fresh.id, fresh.title) if fresh else None
 
 
@@ -135,21 +137,19 @@ def step_without_route(cfg: config.Config, repo: config.Repo, ticket: tracker.Ti
                   discovery: routing.Discovery, layer: config.RepoLayer) -> str:
     if cfg.replay.all:
         return ""
-    mode = pipeline.dispatch_path(repo, str(ticket.id))
+    mode, source = pipeline.dispatch(cfg, repo, str(ticket.id))
     adaptive = mode in (pipeline.ORCHESTRATED, "orchestrate")
     first = ("orchestrate", "build") if adaptive else ("plan", "build")
     if (not adaptive and layer.factory_path == pipeline.ADW and len(repo.parts) <= 1
             and patching.requested(layer, ticket, automatic=cfg.triage.route_fixes)
             and not patching.specification_refusal(ticket)):
         first = ("build",)
-    newest = run_store.newest_whole_run(repo.name, ticket.id)
-    if (layer.factory_path == pipeline.ADW and newest and newest["status"] == "interrupted"
-            and repaired_by(newest["id"])):
+    if mode == "repair" or (layer.factory_path == pipeline.ADW and source and source["status"] == "interrupted"
+                            and pipeline.repaired_by(source["id"])
+                            and not insights_store.has_new_feedback(pending_feedback(repo.name, ticket.id))):
         first = ("review_repair",)
-    elif pending_feedback(repo.name, ticket.id):
-        source = next(iter(run_store.open_runs(repo.name, ticket.id)), None)
-        if not source or pipeline.recorded_path(source["id"]) not in (pipeline.ORCHESTRATED, "orchestrate"):
-            first = ("build",)
+    elif not adaptive and (mode == "revise" or pending_feedback(repo.name, ticket.id)):
+        first = ("build",)
     for role in (*first, *(("verify",) if layer.verify else ()), "review"):
         setting = steps.resolve(cfg, layer, role, ticket.kind, ticket=(repo.name, str(ticket.id)))
         if setting.runner == REPLAY:

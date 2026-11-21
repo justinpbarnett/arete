@@ -334,7 +334,7 @@ class Budget:
         current = specification(ticket) if ticket else None
         if run.environment_release or run.preview_of:
             chain = [rid for rid in chain if not rows[rid]["dry_run"] and rows[rid]["status"] != "dry-run"]
-        if insights_store.has_fresh_feedback(run.feedback):
+        if not run.alone and insights_store.has_fresh_feedback(run.feedback):
             left, reason = chain, "the owner commented on the PR"
         else:
             left = [rid for rid in chain
@@ -471,7 +471,7 @@ class Budget:
 
         if admit:
             admit()
-        if self.run.feedback:
+        if self.run.feedback and not self.run.alone and self.policy.max_repair_cycles == 0:
             self.check_repairs()
         if self.run_deadline() <= time.monotonic():
             raise Parked(self.reason())

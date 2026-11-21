@@ -157,6 +157,10 @@ def has_fresh_feedback(rows: list[dict]) -> bool:
     return any(row["status"] == "new" and row["run_id"] is None for row in rows)
 
 
+def has_new_feedback(rows: list[dict]) -> bool:
+    return any(row["status"] == "new" for row in rows)
+
+
 def take_feedback(rows: list[dict], run_id: str) -> list[dict]:
     with tx() as c:
         return [r for r in rows if c.execute(
