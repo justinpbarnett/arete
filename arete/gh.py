@@ -11,6 +11,7 @@ import urllib.error
 import urllib.request
 import uuid
 from collections.abc import Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import timedelta
 from urllib.parse import urlencode
@@ -22,6 +23,7 @@ GITHUB_API = "https://api.github.com"
 GITHUB_ACTIONS_APP_ID = 15368
 CLONE_TOKEN_PERMISSIONS = {"contents": "read"}
 NO_ISSUE = "Could not resolve to an issue"
+_deployment_ci_deadline: ContextVar[float | None] = ContextVar("deployment_ci_deadline", default=None)
 
 
 class GhError(RuntimeError):
@@ -82,8 +84,13 @@ def gh(args: list[str], cwd=None, timeout: float = 120, input: str | None = None
     return res.stdout
 
 
-def gh_json(args: list[str], cwd=None, timeout: float = 120):
-    out = gh(args, cwd=cwd, timeout=timeout)
+def gh_json(args: list[str], cwd=None, timeout: float = 120, *, retry: bool = True):
+    if (deadline := _deployment_ci_deadline.get()) is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise GhError("deployment CI lookup timed out")
+        timeout, retry = min(timeout, remaining), False
+    out = gh(args, cwd=cwd, timeout=timeout, retry=retry)
     return json.loads(out) if out.strip() else None
 
 
@@ -543,6 +550,29 @@ def merge_ci_passed(repo: str, head: str, *, required: dict | None = None) -> bo
                                            for row in runs) and all(state == "success" for state in contexts.values()))
 
 
+def deployment_ci_refusal(repo: str, head: str, required: dict, *, timeout: float) -> str:
+    token = _deployment_ci_deadline.set(time.monotonic() + timeout)
+    try:
+        return "" if merge_ci_passed(repo, head, required=required) else _required_ci_refusal(repo, head, required)
+    except (GhError, OSError, ValueError, KeyError, TypeError, AttributeError):
+        return "CI unavailable"
+    finally:
+        _deployment_ci_deadline.reset(token)
+
+
+def _required_ci_refusal(repo: str, head: str, required: dict) -> str:
+    query = urlencode({"filter": "latest", "per_page": 100, "check_name": required["context"]})
+    pages = gh_json(["api", f"repos/{repo}/commits/{head}/check-runs?{query}", "--paginate", "--slurp"])
+    runs = [row for page in pages for row in page["check_runs"]
+            if row.get("head_sha") == head and row.get("name") == required["context"]
+            and (row.get("app") or {}).get("id") == required["app_id"]]
+    if any(row["status"] == "completed" and row["conclusion"] != "success" for row in runs):
+        return "CI failed"
+    if not runs or any(row["status"] != "completed" for row in runs):
+        return "CI pending"
+    return "CI not passing"
+
+
 def merge_readiness(repo: str, number: int, head: str, base: str, base_sha: str, *, wait: float = 0,
                     required: dict | None = None) -> tuple[str, str]:
     if not head or not base or not base_sha:
@@ -581,11 +611,12 @@ def pr_merge_auto(repo: str, number: int, head: str, base: str, base_sha: str) -
     return "" if result.get("merged") is True else "GitHub did not confirm the merge"
 
 
-def default_branch(repo: str) -> str:
+def default_branch(repo: str, *, fallback: str = "main", timeout: float = 120, retry: bool = True) -> str:
     try:
-        return (gh_json(["repo", "view", repo, "--json", "defaultBranchRef"]) or {})["defaultBranchRef"]["name"]
+        row = gh_json(["repo", "view", repo, "--json", "defaultBranchRef"], timeout=timeout, retry=retry) or {}
+        return row["defaultBranchRef"]["name"] or fallback
     except (GhError, KeyError, TypeError):
-        return "main"
+        return fallback
 
 
 def base64url(data: bytes) -> str:

@@ -1,32 +1,13 @@
 from __future__ import annotations
 
-import argparse
-import json
 import os
 import sys
 from collections.abc import Iterable
-from typing import NoReturn
 
-
-class Parser(argparse.ArgumentParser):
-    json_errors = False
-
-    def parse_known_args(self, args=None, namespace=None):
-        found, extra = super().parse_known_args(args, namespace)
-        if self.json_errors and extra:
-            self.error(f"unrecognized arguments: {' '.join(extra)}")
-        return found, extra
-
-    def error(self, message: str) -> NoReturn:
-        if not self.json_errors:
-            super().error(message)
-        print(json.dumps({"error": message, "usage": self.format_usage().strip()}), flush=True)
-        sys.exit(1)
-
-
-def steering(p: Parser) -> Parser:
-    p.json_errors = True
-    return p
+from ..codebase import serve_revisions as serve_revisions
+from .arguments import Parser as Parser
+from .arguments import status_arguments as status_arguments
+from .arguments import steering as steering
 
 
 def when(stamp: str | None) -> str:
@@ -159,10 +140,12 @@ def serve_line(beat: dict) -> str:
     paused = f"; config does not load: {beat['config_problem']}" if beat.get("config_problem") else ""
     paused +=f"; new code paused: {beat['code_problem']}" if beat.get("code_problem") else ""
     failing = "".join(f"; tick fails at {key}: {found['error']}" for key, found in (beat.get("failing") or {}).items())
+    code = serve_revisions(beat)
     running, pending = ("unknown" if beat[k] is None else beat[k] for k in ("running", "pending"))
     return (f"serve: up, pid {beat['pid']}, {util.count(beat['loops'], 'loop')} on, {beat['off']} off, "
             f"{running} running, {pending} waiting"
-            + (f", {len(beat['broken'])} broken" if beat.get("broken") else "") + paused + failing)
+            + (f", {len(beat['broken'])} broken" if beat.get("broken") else "")
+            + (f", {code}" if code else "") + paused + failing)
 
 
 def loop_line(v: dict) -> str:

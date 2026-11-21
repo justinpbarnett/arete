@@ -1156,6 +1156,7 @@ class RepoLayer:
     trust_level: Literal["pr", "automerge"] = "pr"
     automerge_after: int = 5
     base_branch: str = ""
+    required_check: dict[str, str | int] | None = None
     subject: str = "{kind}: {title}"
     branch: str = "arete/{id}-{slug}"
     timeout_minutes: int = 45
@@ -1287,6 +1288,12 @@ def load_layer(layer_dir: Path, strict: bool = False, *, source_file: Path | Non
     layer.automerge_after = int(trust.get("automerge_after", 5))
     g = section(data, "git")
     layer.base_branch = g.get("base", "")
+    if "required_check" in g:
+        check = table_of(g["required_check"], "git.required_check")
+        if (set(check) != {"context", "app_id"} or not isinstance(check["context"], str)
+                or not check["context"].strip() or type(check["app_id"]) is not int or check["app_id"] < 1):
+            raise ValueError("[git.required_check] needs a nonempty context and a positive integer app_id")
+        layer.required_check = check
     layer.subject = g.get("subject", layer.subject)
     layer.branch = g.get("branch", layer.branch)
     layer.research_dir = str(section(data, "research").get("dir", "")).strip().strip("/")
