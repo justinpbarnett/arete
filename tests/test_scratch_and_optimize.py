@@ -369,7 +369,14 @@ if sys.argv[1] == "double":
             data.update(state="retained", producers={"verify": {"gated": True, "group": group}})
             scratch.store(fd, key, data)
 
-        with patch.object(launchd.Table, "job", return_value=None):
+        scan_processes = scratch.processes
+
+        def child_processes(*workspaces, legacy=False):
+            current = scan_processes(*workspaces, legacy=legacy)
+            return {identity: process for identity, process in current.items() if identity == child[1]}
+
+        with (patch.object(scratch, "processes", side_effect=child_processes),
+              patch.object(launchd.Table, "job", return_value=None)):
             self.assertEqual(scratch.recover_pending(), [])
             self.assertEqual(scratch.holding(attempt),
                              [{"pid": child[0], "name": "sleep", "reason": scratch.LEGACY_ORPHAN}])
