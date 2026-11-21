@@ -25,6 +25,7 @@ from tempfile import NamedTemporaryFile
 from . import (
     alerts,
     browser,
+    check_command,
     check_process,
     ci,
     config,
@@ -2261,7 +2262,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
 
     expertise = layer.expertise_file.read_text() if layer.expertise_file.exists() else "(none yet)"
     checks = check_list(layer)
-    check_commands, check_rules = check_script(run.dir, layer, ws)
+    check_commands, check_rules = check_script(run.dir, layer, ws, run.where)
     runs_checks = check_calls(check_commands)
     reads = git_reads(checkouts)
     builder_bash = layer.builder_bash + reads + check_rules
@@ -4023,11 +4024,12 @@ def check_calls(commands: list[str]) -> str:
     return prompt_loader.code_list(commands) or NO_CHECKS
 
 
-def check_script(folder: Path, layer: config.RepoLayer, cwd: Path) -> tuple[list[str], list[str]]:
+def check_script(folder: Path, layer: config.RepoLayer, cwd: Path, where: str = "") -> tuple[list[str], list[str]]:
     if not layer.checks:
         return [], []
     script = folder / CHECKS_SCRIPT
-    arms = "".join(f"{shlex.quote(name)}) exec sh -c {shlex.quote(cmd)} ;;\n" for name, cmd in layer.checks.items())
+    slotted = check_command.launcher(folder, where or folder.name, layer.parallel_checks)
+    arms = "".join(f"{shlex.quote(name)}) exec {slotted} {shlex.quote(cmd)} ;;\n" for name, cmd in layer.checks.items())
     usage = shlex.quote(f"usage: {script} NAME, where NAME is one of: {', '.join(layer.checks)}")
     folder.mkdir(parents=True, exist_ok=True)
     script.write_text(f"#!/bin/sh\ncd {shlex.quote(str(cwd))} || exit 1\ncase \"${{1-}}\" in\n{arms}"

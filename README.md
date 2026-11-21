@@ -930,6 +930,8 @@ A cheap failure prevents the expensive group from starting.
 Each configured suite, including a quick-only pass, holds a machine-wide check slot until its commands finish.
 Repos that set `parallel_checks = true` can overlap their suites up to the machine's `max_parallel_checks`. Repos that use serialized checks also share one serialization lock.
 Regular and scratch instances under the same OS account share the pool. Admission uses the lowest limit among active and waiting suites.
+A suite's slot stays held while any process of its check tree, a helper in another session included, still holds the inherited lock descriptor, even after the run that took it is killed. A helper that closes inherited descriptors and leaves its session between two process scans is not covered.
+The `checks NAME` script handed to a builder takes the same slot and logs its wait to the run log. That wait runs inside the builder's own step, so it counts against that step's time.
 
 Patch builds and intermediate ADW review repairs run the quick checks plus any checks selected by changed-file patterns.
 When no quick or targeted check applies, they fall back to the full suite.

@@ -1,4 +1,5 @@
 import ctypes
+import fcntl
 import os
 import signal
 import socket
@@ -68,12 +69,18 @@ class DarwinProcesses:
         return found
 
 
+def release(leases):
+    for lease in leases:
+        fcntl.flock(lease, fcntl.LOCK_UN)
+
+
 @contextmanager
 def suite(leases):
     watcher, owner = socket.socketpair()
     with watcher, owner:
         yield (*leases, watcher.fileno())
         owner.send(b"done")
+        release(leases)
 
 
 @contextmanager
@@ -120,7 +127,7 @@ def reap_adopted():
             pass
 
 
-def supervise(command, timeout, owner, cancel, complete):
+def supervise(command, timeout, owner, cancel, complete, inherited=()):
     stopping = False
 
     def stop(*_):
@@ -140,7 +147,7 @@ def supervise(command, timeout, owner, cancel, complete):
             return posix_members(group, known, adopted_by)
     deadline = time.monotonic() + timeout if timeout is not None else float("inf")
     try:
-        proc = subprocess.Popen(command, start_new_session=True)
+        proc = subprocess.Popen(command, start_new_session=True, pass_fds=inherited)
     except FileNotFoundError as error:
         print(error, file=sys.stderr)
         complete(127, False)
@@ -199,7 +206,7 @@ def run(command, timeout, fds):
 
         try:
             with socket.socket(fileno=fds[-2]) as owner, socket.socket(fileno=fds[-1]) as cancel:
-                supervise(command, timeout, owner, cancel, complete)
+                supervise(command, timeout, owner, cancel, complete, fds[:-2])
         except Exception:
             traceback.print_exc()
         finally:

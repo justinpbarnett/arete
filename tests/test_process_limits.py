@@ -298,7 +298,7 @@ import os, subprocess, sys, time
 from pathlib import Path
 pid_file, release = map(Path, sys.argv[1:3])
 pid_file.write_text(str(os.getpid()))
-subprocess.Popen([sys.executable, "-I", "-c", sys.argv[3], *sys.argv[4:]], start_new_session=True,
+subprocess.Popen([sys.executable, "-I", "-c", sys.argv[3], *sys.argv[4:]], start_new_session=True, close_fds=False,
                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 while not release.exists():
     time.sleep(0.01)
@@ -484,6 +484,152 @@ pipeline = true
                 workflows.wait_for_candidate(process, trial, receiver, 2)
         self.assertEqual(process.wait.call_count, 1)
         self.assertEqual(trial.check_slot_seconds(clock[0]), 0)
+
+    LEFT_BEHIND_HELPER = """\
+import os, sys, time
+from pathlib import Path
+started, release = map(Path, sys.argv[1:3])
+if os.fork() == 0:
+    os.setsid()
+    with open(os.devnull, "r+b") as quiet:
+        for fd in (0, 1, 2):
+            os.dup2(quiet.fileno(), fd)
+    pending = started.with_suffix(".tmp")
+    pending.write_text(str(os.getpid()))
+    pending.replace(started)
+    while not release.exists():
+        time.sleep(0.01)
+    os._exit(0)
+"""
+
+    def wait_until_free(self, name):
+        deadline = time.monotonic() + self.sync_timeout
+        while self.held(name) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(self.held(name))
+
+    def test_busy_admission_lock_is_a_logged_wait_and_not_a_block(self):
+        order, logged, left = [], threading.Event(), threading.Event()
+
+        @contextlib.contextmanager
+        def waiting(cause):
+            order.append(f"wait {cause}")
+            try:
+                yield
+            finally:
+                order.append("done")
+                left.set()
+
+        def log(line):
+            order.append(line)
+            logged.set()
+
+        run = SimpleNamespace(config=self.cfg, log=log, waiting=waiting)
+        with paths.directory_fd(paths.CHECK_LOCKS_DIR, create=True) as directory:
+            admission = slots.check_lock_file(directory, slots.CHECK_SLOTS_LOCK)
+        with (patch.object(slots, "CHECK_SLOT_POLL_SECONDS", 0.01), ThreadPoolExecutor(1) as worker, admission):
+            self.assertTrue(util.flock_now(admission))
+
+            def take():
+                with slots.check_slot(run, parallel=True):
+                    self.assertTrue(left.is_set())
+                    self.assertTrue(self.held("checks-0"))
+
+            taking = worker.submit(take)
+            self.assertTrue(logged.wait(self.sync_timeout))
+            self.assertFalse(left.is_set())
+            admission.close()
+            taking.result(timeout=self.sync_timeout)
+        self.assertEqual(order, ["wait slot", "checks: waiting for a check slot (another run is admitting checks)",
+                                 "done"])
+        self.assertFalse(self.held("checks-0"))
+
+    def test_reparented_helper_in_its_own_session_keeps_the_slot_after_every_other_holder_dies(self):
+        started, release, owners = (self.root / name for name in ("helper-started", "helper-release", "owners"))
+        code = self.LEFT_BEHIND_HELPER + """\
+else:
+    note = Path(sys.argv[3])
+    pending = note.with_suffix(".tmp")
+    pending.write_text(f"{os.getppid()} {os.getpid()}")
+    pending.replace(note)
+    time.sleep(60)
+"""
+        pipeline_stand_in = self.start_checks(
+            self.root / "orphan", "exec " + shlex.join([sys.executable, "-I", "-c", code, str(started),
+                                                         str(release), str(owners)]), isolated=False)
+        try:
+            self.assertEqual(self.read_child_line(pipeline_stand_in).strip(), "ready")
+            pipeline_stand_in.stdin.write("start\n")
+            pipeline_stand_in.stdin.flush()
+            self.wait_for_file(started, pipeline_stand_in)
+            self.wait_for_file(owners, pipeline_stand_in)
+            self.assertTrue(self.held("checks-0"))
+            supervisor, command = map(int, owners.read_text().split())
+            helper = int(started.read_text())
+            self.assertNotEqual(os.getsid(helper), os.getsid(command))
+            pipeline_stand_in.kill()
+            self.assertEqual(pipeline_stand_in.wait(timeout=self.sync_timeout), -signal.SIGKILL)
+            os.kill(supervisor, signal.SIGKILL)
+            os.kill(command, signal.SIGKILL)
+            deadline = time.monotonic() + self.sync_timeout
+            while (util.pid_alive(supervisor) or util.pid_alive(command)) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertFalse(util.pid_alive(supervisor) or util.pid_alive(command))
+            self.assertTrue(util.pid_alive(helper))
+            self.assertTrue(self.held("checks-0"))
+            self.assertTrue(self.held("checks"))
+        finally:
+            release.touch()
+        self.wait_until_free("checks-0")
+        self.wait_until_free("checks")
+
+    def test_helper_left_behind_by_a_finished_suite_does_not_keep_the_slot(self):
+        started, release = (self.root / name for name in ("left-started", "left-release"))
+        command = "exec " + shlex.join([sys.executable, "-I", "-c", self.LEFT_BEHIND_HELPER, str(started),
+                                         str(release)])
+        layer = config.RepoLayer(self.repo.path, checks={"behavior": command}, parallel_checks=True)
+        run = pipeline.AgentRun("left-behind", self.repo, self.root, cfg=self.cfg, writes_lines=False)
+        try:
+            ok, report = pipeline.run_checks(layer, self.repo.path, [], run, 5)
+            self.assertTrue(ok, report)
+            deadline = time.monotonic() + self.sync_timeout
+            while not started.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(util.pid_alive(int(started.read_text())))
+            self.assertFalse(self.held("checks-0"))
+        finally:
+            release.touch()
+
+    def test_generated_checks_script_takes_a_check_slot_and_logs_the_wait(self):
+        folder, ran = self.root / "script-run", self.root / "script-ran"
+        folder.mkdir()
+        layer = config.RepoLayer(self.repo.path, checks={"behavior": f"touch {shlex.quote(str(ran))}; exit 3"},
+                                 parallel_checks=True)
+        commands, rules = pipeline.check_script(folder, layer, self.repo.path, "fixture#7")
+        script = folder / pipeline.CHECKS_SCRIPT
+        self.assertEqual(commands, [shlex.join([str(script), "behavior"])])
+        self.assertEqual(rules, [f"{shlex.quote(str(script))} *"])
+        with contextlib.ExitStack() as occupied:
+            occupied.enter_context(slots.check_slot(SimpleNamespace(config=self.cfg), parallel=True))
+            env = {key: value for key, value in os.environ.items() if key != paths.SCRATCH_ENV}
+            child = subprocess.Popen([str(script), "behavior"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                     text=True, env=env)
+            self.addCleanup(lambda: child.poll() is None and child.kill())
+            log = folder / "run.log"
+            deadline = time.monotonic() + self.sync_timeout
+            while "waiting for a check slot" not in (log.read_text() if log.exists() else ""):
+                if child.poll() is not None:
+                    self.fail(child.communicate()[0])
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.01)
+            self.assertFalse(ran.exists())
+            self.assertTrue(self.held("checks-0"))
+        output, _ = child.communicate(timeout=self.sync_timeout)
+        self.assertEqual(child.returncode, 3, output)
+        self.assertTrue(ran.exists())
+        self.assertIn("[fixture#7] checks: waiting for a check slot (max_parallel_checks 1)", log.read_text())
+        self.assertIn("waiting for a check slot", output)
+        self.assertFalse(self.held("checks-0"))
 
 
 class CatchUpWorkspaceRecordTests(Isolated):

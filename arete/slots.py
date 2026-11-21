@@ -164,23 +164,41 @@ def check_slot_usage(directory: int, limit: int) -> tuple[set[str], int]:
     return occupied, limit
 
 
-def take_free_check_slot(locks: ExitStack, directory: int, request: TextIO, limit: int,
-                         serial: TextIO | None) -> tuple[TextIO | None, str]:
-    with check_lock_file(directory, CHECK_SLOTS_LOCK) as admission:
-        util.take_lock(admission, wait=True)
-        request.seek(0)
-        util.mark_holder(request, limit)
-        occupied, limit = check_slot_usage(directory, limit)
-        if len(occupied) >= limit:
-            return None, f"max_parallel_checks {limit}"
-        if serial is not None and not util.flock_now(serial):
-            return None, "serialized checks"
-        names = (f"{CHECKS_LOCK}-{i}" for i in range(limit))
-        lease = locks.enter_context(check_lock_file(directory, next(name for name in names if name not in occupied)))
-        util.take_lock(lease, wait=True)
-        if serial is not None:
-            util.mark_holder(serial, os.getpid())
-        return lease, ""
+@dataclass
+class CheckSlotSeeker:
+    locks: ExitStack
+    directory: int
+    serial: TextIO | None
+    request: TextIO | None = None
+
+    def register(self, limit: int) -> None:
+        if self.request is None:
+            self.request = self.locks.enter_context(
+                check_lock_file(self.directory, f"{CHECK_LIMIT_PREFIX}{uuid4().hex}"))
+            util.flock_now(self.request)
+        self.request.seek(0)
+        util.mark_holder(self.request, limit)
+
+    def take_free(self, limit: int) -> tuple[TextIO | None, str]:
+        with check_lock_file(self.directory, CHECK_SLOTS_LOCK) as admission:
+            if not util.flock_now(admission):
+                return None, "another run is admitting checks"
+            util.mark_holder(admission, os.getpid())
+            self.register(limit)
+            occupied, limit = check_slot_usage(self.directory, limit)
+            if len(occupied) >= limit:
+                return None, f"max_parallel_checks {limit}"
+            if self.serial is not None and not util.flock_now(self.serial):
+                return None, "serialized checks"
+            names = (f"{CHECKS_LOCK}-{i}" for i in range(limit))
+            lease = check_lock_file(self.directory, next(name for name in names if name not in occupied))
+            if not util.flock_now(lease):
+                lease.close()
+                return None, f"max_parallel_checks {limit}"
+            util.mark_holder(lease, os.getpid())
+            if self.serial is not None:
+                util.mark_holder(self.serial, os.getpid())
+            return self.locks.enter_context(lease), ""
 
 
 @contextmanager
@@ -197,21 +215,17 @@ def check_slot(run, *, parallel: bool):
         if info.st_uid != os.getuid() or info.st_mode & 0o077:
             raise PermissionError("check lock directory must be private to this user")
         limit = live_max_parallel_checks(run.config.max_parallel_checks)
-        with check_lock_file(directory, CHECK_SLOTS_LOCK) as admission:
-            util.take_lock(admission, wait=True)
-            request = locks.enter_context(check_lock_file(directory, f"{CHECK_LIMIT_PREFIX}{uuid4().hex}"))
-            util.flock_now(request)
-            util.mark_holder(request, limit)
         serial = None if parallel else locks.enter_context(check_lock_file(directory, CHECKS_LOCK))
-        lease, reason = take_free_check_slot(locks, directory, request, limit, serial)
+        seeker = CheckSlotSeeker(locks, directory, serial)
+        lease, reason = seeker.take_free(limit)
         if lease is None:
             with waiting_for_check(run):
                 run.log(f"checks: waiting for a check slot ({reason})")
                 while lease is None:
                     time.sleep(CHECK_SLOT_POLL_SECONDS)
                     limit = live_max_parallel_checks(limit)
-                    lease, _ = take_free_check_slot(locks, directory, request, limit, serial)
-        yield tuple(lock.fileno() for lock in (lease, request, serial) if lock is not None)
+                    lease, _ = seeker.take_free(limit)
+        yield tuple(lock.fileno() for lock in (lease, seeker.request, serial) if lock is not None)
 
 
 def take_merge_lease(run, github: str, *, slot: RunSlot | None = None) -> TextIO:
