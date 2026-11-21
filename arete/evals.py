@@ -205,11 +205,10 @@ class Comparison:
 
 
 class Source:
-    def __init__(self, repo: config.Repo, ref: str = "", *, overlay: dict[str, bytes | str] | None = None):
+    def __init__(self, repo: config.Repo, ref: str = ""):
         self.repo, self.ref = repo, ref
         self.label = ref or insights_store.BASELINE_SOURCE
         self._modes: dict[str, str] | None = None
-        self.overlay = overlay or {}
 
     def modes(self) -> dict[str, str]:
         if self._modes is None:
@@ -222,29 +221,25 @@ class Source:
         return self._modes
 
     def files(self, under: str = "") -> list[str]:
-        prefix = under.rstrip("/") + "/" if under else ""
         if self.ref:
-            keep = [f for f in self.modes() if f.startswith(prefix)]
-        else:
-            out = util.git_records(["ls-files", "--cached", "--others", "--exclude-standard", "--deduplicate", "--",
-                                    under or "."], self.repo.path)
-            keep = [f for f in out if (self.repo.path / f).is_symlink() or (self.repo.path / f).is_file()]
-        keep.extend(f for f in self.overlay if f.startswith(prefix) and f not in keep)
+            prefix = under.rstrip("/") + "/" if under else ""
+            return [f for f in self.modes() if f.startswith(prefix)]
+        out = util.git_records(["ls-files", "--cached", "--others", "--exclude-standard", "--deduplicate", "--",
+                                under or "."], self.repo.path)
+        keep = []
+        for f in out:
+            p = self.repo.path / f
+            if p.is_symlink() or p.is_file():
+                keep.append(f)
         return keep
 
     def link(self, rel: str) -> str | None:
-        if rel in self.overlay:
-            value = self.overlay[rel]
-            return value if isinstance(value, str) else None
         if self.ref:
             return self.read(rel).decode() if self.modes().get(rel) == "120000" else None
         p = self.repo.path / rel
         return os.readlink(p) if p.is_symlink() else None
 
     def read(self, rel: str) -> bytes:
-        if rel in self.overlay:
-            value = self.overlay[rel]
-            return value.encode() if isinstance(value, str) else value
         if self.ref:
             res = subprocess.run(sandbox.protected_command(["git", "show", f"{self.ref}:{rel}"], self.repo.path),
                                  cwd=self.repo.path, capture_output=True,
@@ -506,8 +501,11 @@ def acceptance(cfg, run, layer, wt, task, brief, result, plan, report, ok, timeo
         graded = grade(cfg, run, layer, wt, task.title, task.prompt, task.verify, run.time_for(timeout))
         result.verify = graded.verdict
         evidence = graded.markdown()
-        complete = graded.finished and graded.verdict in ("pass", "fail")
-        result.required_behavior_failed = complete and graded.verdict == "fail"
+        complete = graded.behavior_reached and graded.finished and graded.verdict in ("pass", "fail")
+        result.required_behavior_failed = (complete and graded.verdict == "fail") or any(
+            check.get("passed") is False and str(check.get("cause") or "").strip().lower() != "environment"
+            for check in graded.failed_checks
+        )
         if graded.verdict != "pass":
             failures.append(grade_failure(graded))
     if run.reviews:
@@ -517,7 +515,7 @@ def acceptance(cfg, run, layer, wt, task, brief, result, plan, report, ok, timeo
             failures.append(util.count(blocking, "blocking review finding"))
     if task.check:
         res = hidden_check(cfg, run.repo, task, wt, run.time_for(timeout))
-        check_complete = not isinstance(res, util.CommandIncomplete) and not (
+        check_complete = not isinstance(res, util.CommandIncomplete) and res.returncode not in (124, 126, 127) and not (
             res.returncode and re.search(r"^sandbox-exec:", res.stderr, re.M)
         )
         complete = complete and check_complete
@@ -796,23 +794,6 @@ def prompt_arms(repo: config.Repo, base: str, head: str, fork: str) -> tuple[dic
     return arms, changed
 
 
-def paired_harness(repo: config.Repo, base: str) -> Source:
-    working = Source(repo)
-    if not base:
-        return working
-    overlay: dict[str, bytes | str] = {}
-    if not repo.layer:
-        for name in (LAYER_CONFIG, ".agents/expertise.md"):
-            try:
-                overlay[name] = working.read(name)
-            except FileNotFoundError:
-                pass
-    for name in working.files(".claude/skills") + working.files("skills"):
-        link = working.link(name)
-        overlay[name] = link if link is not None else working.read(name)
-    return Source(repo, base, overlay=overlay)
-
-
 def compare_prompts(cfg: config.Config, arete: config.Repo, base: str, head: str, *, fork: str = "") -> Comparison:
     arms, changed = prompt_arms(arete, base, head, fork)
     if not changed:
@@ -820,29 +801,25 @@ def compare_prompts(cfg: config.Config, arete: config.Repo, base: str, head: str
     if not any(Path(name).stem in BUILDER_PROMPTS for name in changed):
         return unmeasured_prompts(changed)
     ran, skipped = [], []
-    for repo in [arete, *(r for r in suites(cfg) if r.name != arete.name)]:
-        if any(p.dir for p in repo.parts):
-            skipped.append((repo, "it has parts", []))
-            continue
+    for repo in suites(cfg):
+        multipart = any(p.dir for p in repo.parts)
         suite_base = base if repo.name == arete.name else ""
         try:
-            tasks = paired_tasks(repo, suite_base)
+            tasks = load_tasks(*task_source(repo, Source(repo))) if multipart else paired_tasks(repo, suite_base)
         except (ValueError, TypeError, KeyError, RuntimeError, OSError) as e:
             print(f"{repo.name}: eval tasks do not load: {type(e).__name__}: {e}")
             skipped.append((repo, "its eval tasks do not load", []))
             continue
         if not tasks:
             continue
+        if multipart:
+            skipped.append((repo, "it has parts", [task.name for task in tasks]))
+            continue
         with util.lock(run_store.run_lock("eval", repo.name)) as got:
             if not got:
                 skipped.append((repo, "its evals were already running", [task.name for task in tasks]))
                 continue
-            try:
-                src = paired_harness(repo, suite_base)
-            except (OSError, RuntimeError) as e:
-                print(f"{repo.name}: eval harness does not load: {type(e).__name__}: {e}")
-                skipped.append((repo, "its eval harness does not load", [task.name for task in tasks]))
-                continue
+            src = Source(repo)
             ran.append((repo, {arm: run_suite(cfg, repo, src, tasks, f"{repo.name}-{arm}", prompts)
                                for arm, prompts in arms.items()}))
     if not ran and not skipped:
@@ -880,6 +857,9 @@ def comparison(target: config.Repo, base: str, lead: str, ran: list[tuple[config
     def inputs(r: TaskResult) -> tuple[str, ...]:
         return (r.base_commit, r.context_sha, r.settings)
 
+    def confirmed(r: TaskResult) -> bool:
+        return r.graded or r.required_behavior_failed
+
     lines = [lead, ""]
     regressions = []
     incomplete = []
@@ -889,16 +869,16 @@ def comparison(target: config.Repo, base: str, lead: str, ran: list[tuple[config
         lines += [f"| suite | `{base[:12]}` | this branch | tasks that changed |", "|---|---|---|---|"]
         for repo, result in ran:
             main, pr = result["main"], result["pr"]
-            before = {r.task: r for r in main.results if r.graded}
-            paired = [(prior, r) for r in pr.results if (prior := before.get(r.task))
+            before = {r.task: r for r in main.results if confirmed(r)}
+            paired = [(prior, r) for r in pr.results if confirmed(r) and (prior := before.get(r.task))
                       and r.base_commit and r.context_sha and inputs(prior) == inputs(r)]
             exercised.update(name for r in pr.results for name in r.prompts_used)
-            flips = [r for prior, r in paired if prior.passed != r.passed and (r.graded or r.required_behavior_failed)]
+            flips = [r for prior, r in paired if prior.passed != r.passed]
             lines.append(f"| {shown(repo)} | {main.score} | {pr.score} | {show_flips(flips, hidden(repo))} |")
             failed = [r.task for r in flips if not r.passed]
             if failed:
                 regressions.append(shown_tasks(repo, failed))
-            paired_names = {r.task for _, r in paired if r.graded}
+            paired_names = {r.task for _, r in paired}
             unfinished = sorted({r.task for r in main.results + pr.results} - paired_names)
             if unfinished:
                 incomplete.append(shown_tasks(repo, unfinished))

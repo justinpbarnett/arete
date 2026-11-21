@@ -3056,8 +3056,9 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
         if fault := verify.environment_fault(str(e)):
             return verify.Verified("blocked", "The app could not start in the verifier's sandbox.",
                                    blocked_by=f"the app could not start in the verifier's sandbox ({fault}); "
-                                              "the start log stays in the run folder", finished=False)
-        return verify.Verified("fail", f"The app did not start: {e}")
+                                              "the start log stays in the run folder", finished=False,
+                                   behavior_reached=False)
+        return verify.Verified("fail", f"The app did not start: {e}", behavior_reached=False)
     finally:
         try:
             if require_released and not lifetime["stopped"]:

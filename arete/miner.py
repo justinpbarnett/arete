@@ -587,7 +587,8 @@ def pr_fork(repo: config.Repo, pr: MinerPR) -> str:
         return git(["merge-base", pr.base_sha, pr.head], repo.path).strip()
 
 
-def eval_pr(cfg: config.Config, repo: config.Repo, url: str, pr: MinerPR, fork: str = "") -> None:
+def eval_pr(cfg: config.Config, repo: config.Repo, url: str, pr: MinerPR, fork: str = "", *,
+            require_automerge: bool = False) -> None:
     jobs = []
     if repo.name == cfg.arete_repo:
         def prompt_report():
@@ -601,6 +602,8 @@ def eval_pr(cfg: config.Config, repo: config.Repo, url: str, pr: MinerPR, fork: 
         try:
             md = job()
             if md and miner_pr(repo, url, pr.base) == pr:
+                if require_automerge and not decides_repo(cfg, repo):
+                    return
                 gh.pr_comment(url, md)
                 print(f"{repo.name}: {what} posted to {url}")
         except Exception as e:
@@ -638,26 +641,51 @@ def decides_repo(cfg: config.Config, repo: config.Repo) -> bool:
             and config.load_layer(repo.layer_dir).trust_level == "automerge")
 
 
-def post_deferred_evals(repo: config.Repo, url: str, pr: MinerPR, report: evals.Comparison, evidence: str) -> None:
+def pr_action_refusal(cfg: config.Config, repo: config.Repo, url: str, pr: MinerPR, changed: str) -> str:
+    if miner_pr(repo, url, pr.base) != pr:
+        return changed
+    if not decides_repo(cfg, repo):
+        return "repository trust no longer permits automatic miner PR actions"
+    return ""
+
+
+def post_eval_feedback(cfg: config.Config, repo: config.Repo, url: str, pr: MinerPR, evidence: str, *,
+                       incomplete_reason: str = "", deferred: bool = False, edit_only: bool = False) -> str:
+    marker = gh.key_mark(util.digest("miner-incomplete"))
+    comment = gh.find_own_pr_comment(repo.github, pr.number, marker)
+    previous = comment["body"] if comment else ""
+    was_incomplete = previous.startswith(("Incomplete eval tasks were ", "The eval comparison did not complete."))
+    if incomplete_reason:
+        evidence = f"{incomplete_reason}\n\n{evidence}"
+        if previous.startswith(gh.outgoing(f"{incomplete_reason}\n\n{pr.commits()}")):
+            return ""
+    elif edit_only and not was_incomplete:
+        return ""
+    elif not was_incomplete and not re.search(rf"^Base `[0-9a-f]{{40}}`, head `{pr.head}`\.$", previous, re.M):
+        comment = None
+        marker = gh.key_mark(util.digest("miner-evals", pr.base_sha, pr.head)) if deferred else ""
+        if marker and gh.find_own_pr_comment(repo.github, pr.number, marker):
+            return ""
+    body = f"{evidence}\n\n{marker}" if marker else evidence
+    if comment and previous.startswith(gh.outgoing(body, mark=True)):
+        return ""
+    if refusal := pr_action_refusal(cfg, repo, url, pr, "the PR changed before eval feedback could be posted"):
+        return refusal
+    if comment is None:
+        gh.pr_comment(url, body)
+    else:
+        gh.pr_edit_comment(repo.github, int(comment["id"]), body)
+    return ""
+
+
+def post_deferred_evals(cfg: config.Config, repo: config.Repo, url: str, pr: MinerPR,
+                        report: evals.Comparison, evidence: str) -> str:
     reason = ""
     if not report.complete and not report.regressions:
         tasks = ", ".join(report.incomplete)
         reason = f"Incomplete eval tasks were {tasks}." if tasks else "The eval comparison did not complete."
-        evidence = f"{reason}\n\n{evidence}"
-        kind = "miner-incomplete"
-    elif report.markdown.strip():
-        kind = "miner-evals"
-    else:
-        return
-    marker = gh.key_mark(util.digest(kind, pr.base_sha, pr.head))
-    body = f"{evidence}\n\n{marker}"
-    comment = gh.find_own_pr_comment(repo.github, pr.number, marker)
-    if miner_pr(repo, url, pr.base) != pr:
-        return
-    if comment is None:
-        gh.pr_comment(url, body)
-    elif reason and not comment["body"].startswith(f"{gh.outgoing(reason)}\n\n"):
-        gh.pr_edit_comment(repo.github, int(comment["id"]), body)
+    return post_eval_feedback(cfg, repo, url, pr, evidence, incomplete_reason=reason, deferred=True,
+                              edit_only=not (reason or report.markdown.strip()))
 
 
 def decide_pr(cfg: config.Config, run_id: str, repo: config.Repo, url: str, *, published_head: str = "") -> str:
@@ -682,58 +710,62 @@ def decide_pr(cfg: config.Config, run_id: str, repo: config.Repo, url: str, *, p
     diff = diffguard.between(repo.path, fork, pr.head, deny=diffguard.ALWAYS_DENY, moves=True)
     if len(diff.files) != 1 or Path(diff.files[0]).parent.as_posix() != evals.ARETE_PROMPTS:
         if published_head:
-            eval_pr(cfg, repo, url, pr, fork)
+            eval_pr(cfg, repo, url, pr, fork, require_automerge=True)
         return "the PR is outside the miner's single-prompt scope"
     if pr.needs_review:
         return "the PR is awaiting human review"
     if refusal := harness_diff_refusal(cfg, repo, diff) or prompt_refusal(cfg, repo, repo.path, fork, pr.head):
         return refusal
     if fork != pr.base_sha:
-        if miner_pr(repo, url, base) != pr:
-            return "the PR changed before its branch could be updated"
+        if refusal := pr_action_refusal(cfg, repo, url, pr, "the PR changed before its branch could be updated"):
+            return refusal
         gh.pr_update_branch(repo.github, pr.number, pr.head)
         return "branch update requested"
     report = evals.compare_prompts(cfg, repo, pr.base_sha, pr.head)
-    if miner_pr(repo, url, base) != pr:
-        return "the PR changed during evals"
+    if refusal := pr_action_refusal(cfg, repo, url, pr, "the PR changed during evals"):
+        return refusal
     ci_passed = gh.actions_check_passed(repo.github, pr.head, MINER_CHECK)
-    if miner_pr(repo, url, base) != pr:
-        return "the PR changed during the CI check"
+    if refusal := pr_action_refusal(cfg, repo, url, pr, "the PR changed during the CI check"):
+        return refusal
     evidence = "\n\n".join(filter(None, [pr.commits(), report.markdown.strip()]))
     if not ci_passed:
-        if report.markdown.strip() or report.incomplete:
-            post_deferred_evals(repo, url, pr, report, evidence)
+        if report.markdown.strip() or report.incomplete or report.complete:
+            if refusal := post_deferred_evals(cfg, repo, url, pr, report, evidence):
+                return refusal
         return "the PR head does not have a passing arete-checks result"
     if report.regressions:
-        gh.pr_comment(url, f"Closing because {', '.join(report.regressions)} passed on the base and now fail.\n\n{evidence}")
-        if miner_pr(repo, url, base) != pr:
-            return "the PR changed before it could be closed"
+        feedback = f"Closing because {', '.join(report.regressions)} passed on the base and now fail.\n\n{evidence}"
+        if refusal := post_eval_feedback(cfg, repo, url, pr, feedback):
+            return refusal
+        if refusal := pr_action_refusal(cfg, repo, url, pr, "the PR changed before it could be closed"):
+            return refusal
         gh.pr_close(url)
         approvals_store.set_proposal_status_by_pr(url, "rejected")
         return "closed for an eval regression"
     if not report.complete:
-        post_deferred_evals(repo, url, pr, report, evidence)
-        return "the eval comparison is incomplete"
+        return post_deferred_evals(cfg, repo, url, pr, report, evidence) or "the eval comparison is incomplete"
     if report.unmeasured:
         approved, answer = judge_prompts(cfg, run_id, repo, pr, report.unmeasured)
-        if miner_pr(repo, url, base) != pr:
-            return "the PR changed during JEV review"
-        gh.pr_comment(url, f"{evidence}\n\n{answer}")
         if approved is None:
-            return answer
+            return post_eval_feedback(cfg, repo, url, pr, evidence, edit_only=True) or answer
+        if refusal := pr_action_refusal(cfg, repo, url, pr, "the PR changed during JEV review"):
+            return refusal
+        if refusal := post_eval_feedback(cfg, repo, url, pr, f"{evidence}\n\n{answer}"):
+            return refusal
         if approved is False:
-            if miner_pr(repo, url, base) != pr:
-                return "the PR changed before it could be labeled"
+            changed = "the PR changed before it could be labeled"
+            if refusal := pr_action_refusal(cfg, repo, url, pr, changed):
+                return refusal
             if problem := gh.ensure_label(repo.github, REVIEW_LABEL, description="Miner PR needs human review", restyle=False):
                 raise gh.GhError(problem)
-            if miner_pr(repo, url, base) != pr:
-                return "the PR changed before it could be labeled"
+            if refusal := pr_action_refusal(cfg, repo, url, pr, changed):
+                return refusal
             gh.pr_add_label(url, REVIEW_LABEL)
             return answer
-    else:
-        gh.pr_comment(url, evidence)
-    if miner_pr(repo, url, base) != pr:
-        return "the PR changed before it could be merged"
+    elif refusal := post_eval_feedback(cfg, repo, url, pr, evidence):
+        return refusal
+    if refusal := pr_action_refusal(cfg, repo, url, pr, "the PR changed before it could be merged"):
+        return refusal
     gh.pr_squash(repo.github, pr.number, pr.head)
     approvals_store.set_proposal_status_by_pr(url, "merged")
     return "merged"

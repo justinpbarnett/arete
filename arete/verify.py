@@ -112,6 +112,8 @@ def preflight(v: config.Verify, cwd: Path, cfg: config.Config, repo: config.Repo
         if not passed:
             break
     failed = next((check for check in checks if not check["passed"]), None)
+    if failed:
+        failed["cause"] = "environment"
     return Verified("blocked" if failed else "pass", "Verification prerequisites are unavailable." if failed else
                     "Configured verification prerequisites passed.", checks,
                     blocked_by=f"{failed['what']}: {failed['saw']}" if failed else "", finished=not bool(failed))
@@ -356,6 +358,7 @@ class Verified:
     finished: bool = True
     saved: str = ""
     native_trees: dict[str, str] = field(default_factory=dict)
+    behavior_reached: bool = True
 
     @classmethod
     def from_agent(cls, found: dict) -> Verified:
