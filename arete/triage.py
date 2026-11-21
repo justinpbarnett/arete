@@ -1002,9 +1002,9 @@ def auto_note(cfg: config.Config) -> str:
     return "add the labels to approve"
 
 
-def board() -> str:
+def board(connect=foundation.db) -> str:
     meta = util.read_json(META_FILE, {})
-    v = view()
+    v = view(connect=connect)
     rows = v["rows"]
     if not meta.get("refreshed") and not rows:
         return "no triage yet; run `arete triage --refresh`"
@@ -1052,11 +1052,12 @@ def board() -> str:
     return "\n".join(lines)
 
 
-def ticket(ref: str) -> str | None:
+def ticket(ref: str, connect=foundation.db) -> str | None:
     want = ref.strip().lower()
-    r = next((r for r in triage_store.triage_rows() if r["ref"].lower() == want), None)
+    r = next((r for r in triage_store.triage_rows(connect=connect) if r["ref"].lower() == want), None)
     if not r:
-        a = next((a for a in sent() if a["ref"].lower() == want), None) or triage_store.triage_approval(want)
+        a = (next((a for a in sent(connect=connect) if a["ref"].lower() == want), None)
+             or triage_store.triage_approval(want, connect=connect))
         if not a:
             return None
         by = " by you" if principals.is_person(a["sent_by"]) else " by triage"

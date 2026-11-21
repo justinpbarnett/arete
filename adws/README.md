@@ -14,12 +14,12 @@ A task has many runs. An answer, a resume and a step each start a **new** run wi
 
 ## Setup
 
-Run the recipes from this checkout, so `uv run arete` runs this checkout's code. The server is `arete serve`, or `arete dashboard` alone. The recipes call only the server that works on their own state and config: once it listens, the server writes where it listens, its state folder and its config file to `server.json` in the state folder. `ARETE_SERVER=https://NAME:PORT` or `http://HOST:PORT` names a server and skips that check.
+Run the recipes from this checkout, so `uv run arete` runs this checkout's code. The server is `arete serve`, or `arete dashboard` alone. The CLI uses `ARETE_SERVER` first, then `[server] url` in `config.toml`. With neither set it uses `server.json` and verifies that it names a live process with the same state and config. On first connection the CLI saves the server's instance ID for that URL and checks it on each invocation.
 
 ## Versioned API
 
 For direct integrations use `/api/v1/meta` to check the server's API version and contract hash, and `/api/v1/contract` to discover operations.
-The recipes still use the existing routes; their response and replay behavior does not change with the addition of versioned routes.
+The recipes keep their JSON output when the CLI uses a versioned route. Run the CLI and serve from the same release.
 If a keyed task start loses its reply, resend the same key with the same arguments; a different body with that key is refused.
 Before changing the registry or how an operation behaves, follow the [API verification and compatibility workflow](../README.md#checking-api-changes).
 
@@ -45,17 +45,17 @@ With no `code`, the recipe failed on its own side. The start of `error` says why
 
 | `error` starts with | means | then |
 |---|---|---|
-| `no arete server is up`, `the arete server is not up`, `the arete server named in` | no server works on this checkout's state and config | tell the person; do not start arete yourself |
-| `ARETE_SERVER=` | `ARETE_SERVER` is not `http://HOST:PORT` or `https://HOST:PORT` | tell the person |
+| `server unreachable at` | the selected server could not be reached (`reason: server_down`) | tell the person the URL and cause |
+| `ARETE_SERVER must be` | the server address needs `http://HOST:PORT` or `https://HOST:PORT` | tell the person |
 | `the server` … `broke off`, `the server answered` … `with no JSON` | the call dropped halfway and may have gone through | resend a keyed task start with its original key and identical arguments; for answer, resume, step or stop, look with `just adw-status <id>` before sending again |
 | `run` … `with no report line` | the run ended and wrote no report | read `just adw-logs <id>` and tell the person |
 | `the server stopped sending run` | the run's lines stopped for 2 minutes, and the run may still be going | `just adw-wait <id>` again |
 | `write each setting as key=value` | an `adw-step` setting has no `=` | fix the call |
-| `no run` | with no server, `adw-status <id>` and `adw-logs` read the local state, and it has no such run | check the id |
+| `no run` | the selected server has no such run | check the id |
 
 A failed line that also has a `usage` field means the recipe's arguments did not parse, such as a missing id or an unknown flag; `usage` shows the form the command takes. Fix the call.
 
-When the server restarts on new code, `just adw-wait` connects again by itself and goes on from the last line it read.
+When the server restarts on new code, `just adw-wait` connects again by itself and goes on from the last line it read. On a 503 with `Retry-After`, the CLI waits up to 30 seconds and reuses the write's key.
 
 ## The recipes
 
@@ -80,7 +80,7 @@ If a child finishes during registration or task-start recovery finds an ended ru
 `starting` is accepted and exits 0; look up the task to find its run once registration finishes.
 `why` explains the result.
 
-`arete task start`, `arete task run` and remote `arete run` choose `--key` first, then `ARETE_IDEMPOTENCY_KEY`, otherwise mint a key for that invocation. They print `Idempotency-Key: KEY` on stderr once. Keys contain 8–128 ASCII letters, digits or `_ . : / -`. The recipes inherit `ARETE_IDEMPOTENCY_KEY`; direct CLI commands also accept `--key`.
+The CLI generates one idempotency key per invocation. The recipes inherit `ARETE_IDEMPOTENCY_KEY`, which sets that key. The first write uses it verbatim and subsequent writes append `:2`, `:3` and so on. `arete task start`, `arete task run` and server-backed `arete run` also accept an exact key via `--key` and print `Idempotency-Key: KEY` on stderr once. Keys contain 8–128 ASCII letters, digits or `_ . : / -`.
 
 Task starts automatically retry broken connections, including truncated response bodies, at most twice within one 30-second budget. They keep the same key and body through retries and HTTPS redirects. After an uncertain result, resend the identical command with its printed `--key` (or the same environment key). The server returns the original response bytes, status and receipt with `Idempotent-Replayed: true`, even after restarting. Keys belong to the admitted principal, so another login for the same person shares the answer.
 
@@ -89,7 +89,7 @@ Changed content under the same key gets HTTP 422 `idempotency_key_reused`; use a
 Every committed response remains the answer for that key, including `queued`, `starting`, terminal-state and handled-error answers.
 To request a new start, including for a queued task after capacity changes, use a fresh key with `task run` and its ticket.
 Claims expire after 30 days, so keep recovery resends within that period.
-Other writes retain their existing behavior; check their state before resending after a disconnect.
+For run steering, repeat the same invocation with the same prefix and CLI config directory to reuse the original target and version. If serve reports that it could not confirm the earlier result, check the operation's effect before starting a new invocation with a new key.
 
 ## One whole session
 

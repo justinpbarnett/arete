@@ -32,4 +32,6 @@ def status_arguments(p: Parser) -> Parser:
     p.add_argument("run_id", nargs="?", default="", help="with --json: this run's steps, then its report")
     p.add_argument("--limit", type=int, default=10)
     p.add_argument("--json", action="store_true", help="one JSON line per live run, or per step of RUN_ID")
+    p.add_argument("--offline", action="store_true", help="read local status and run lines")
+    p.set_defaults(local_read=lambda args: args.offline)
     return p

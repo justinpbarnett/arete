@@ -818,6 +818,374 @@ class PendingBaseMergePublicationTests(PublicationFixture):
         self.assertEqual(self.git("show", "HEAD:file.txt"), "implementation")
 
 
+class ResolverScratchFixture(unittest.TestCase):
+    MARKER = "arete-verification-scratch-v1\n"
+    LOG = ".arete-sandbox/logs/db.log"
+    TRACKED = ".arete-sandbox/logs/tracked.txt"
+    merge_fixture = None
+
+    def setUp(self):
+        self.enterContext(mock.patch.object(util, "repo_lock", return_value=nullcontext()))
+
+    @classmethod
+    def create_merge(cls, root, tracked_changed_by="", tracked_added_by_base=False):
+        def git(*args, check=True):
+            subprocess.run(["git", *args], cwd=root, check=check, capture_output=True, text=True)
+
+        git("init", "-q", "-b", "main", "--template=")
+        git("config", "user.name", "Fixture")
+        git("config", "user.email", "fixture@example.test")
+        git("config", "commit.gpgsign", "false")
+        (root / ".gitignore").write_text(".arete-sandbox/\nignored.local\nproject/.arete-owned\nproject/private.local\n")
+        (root / "project").mkdir()
+        (root / "project/tracked.txt").write_text("untouched\n")
+        (root / "conflict.txt").write_text("original\n")
+        tracked = root / cls.TRACKED
+        if tracked_changed_by or tracked_added_by_base:
+            tracked.parent.mkdir(parents=True)
+            (root / ".arete-sandbox/.arete-owned").write_text(cls.MARKER)
+        if tracked_changed_by:
+            tracked.write_text("original tracked content\n")
+            git("add", "-f", "--", cls.TRACKED)
+        git("add", ".")
+        git("commit", "-qm", "original")
+        git("checkout", "-qb", "branch")
+        (root / "conflict.txt").write_text("branch\n")
+        (root / "supplemental.txt").write_text("branch addition\n")
+        if tracked_changed_by in ("branch", "both"):
+            tracked.write_text("branch content\n")
+        git("add", ".")
+        git("commit", "-qm", "branch change")
+        git("checkout", "-q", "main")
+        (root / "conflict.txt").write_text("base\n")
+        if tracked_changed_by in ("base", "both") or tracked_added_by_base:
+            tracked.write_text("base content\n")
+        if tracked_changed_by == "removed by base":
+            tracked.unlink()
+        if tracked_added_by_base:
+            (root / "incoming.txt").write_text("incoming addition\n")
+            git("add", "-f", "--", cls.TRACKED)
+            git("add", "--", "incoming.txt")
+        git("commit", "-qam", "base change")
+        git("checkout", "-q", "branch")
+        git("merge", "--no-commit", "main", check=False)
+
+    def merge(self, tracked_changed_by="", tracked_added_by_base=False):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        if self.merge_fixture is not None:
+            shutil.copytree(self.merge_fixture, self.root, dirs_exist_ok=True)
+        else:
+            self.create_merge(self.root, tracked_changed_by, tracked_added_by_base)
+        self.conflicts = [self.TRACKED, "conflict.txt"] if tracked_changed_by == "both" else ["conflict.txt"]
+        self.assertEqual(pipeline.unmerged_paths(self.root), self.conflicts)
+        self.checkout = workspace.Checkout("", "fixture/repo", self.root, self.root, "main",
+                                           base_commit=self.git("rev-parse", "main"))
+        self.layer = config.RepoLayer(self.root)
+        self.run = mock.Mock(repo=SimpleNamespace(name="repo"), sessions={}, owner_note="",
+                             settings=mock.Mock(return_value=SimpleNamespace(tries=1)))
+
+    def git(self, *args, check=True):
+        return util.git(list(args), self.root, check=check).strip()
+
+    def resolve(self, edit):
+        def agent(*args, **kwargs):
+            (self.root / "conflict.txt").write_text("branch and base\n")
+            edit()
+            return Result(ok=True, structured={"resolved": True})
+
+        self.run.agent.side_effect = agent
+        pipeline.resolve_conflicts(self.run, self.checkout, self.conflicts, self.layer,
+                                   tracker.Ticket("719", "#719", "Scratch exemption", "", ""))
+
+    def write_log(self):
+        log = self.root / self.LOG
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a") as out:
+            out.write("verification ran\n")
+
+    def assert_outside_conflict(self, edit, paths):
+        with self.assertRaises(workspace.RunFailed) as failed:
+            self.resolve(edit)
+        self.assertEqual(str(failed.exception), f"the resolver edited files outside the conflict in fixture/repo: {paths}")
+
+
+class SharedResolverScratchFixture(ResolverScratchFixture):
+    @classmethod
+    def setUpClass(cls):
+        cls.merge_fixture = Path(tempfile.mkdtemp())
+        cls.addClassCleanup(shutil.rmtree, cls.merge_fixture, ignore_errors=True)
+        cls.create_merge(cls.merge_fixture)
+
+
+class ResolverScratchTests(SharedResolverScratchFixture):
+    def test_wrapper_scratch_stays_out_of_merge(self):
+        self.merge()
+        scratch = self.root / ".arete-sandbox"
+        scratch.mkdir()
+        (scratch / ".gitignore").write_text("*\n")
+        (scratch / ".arete-owned").write_text(self.MARKER)
+        (self.root / "project/.arete-owned").write_text(self.MARKER.removesuffix("\n"))
+
+        def edit():
+            self.write_log()
+            (self.root / "project/untracked.txt").write_text("untracked scratch\n")
+            (self.root / "supplemental.txt").write_text("updated branch addition\n")
+
+        with mock.patch.object(pipeline, "git", wraps=pipeline.git) as git:
+            self.resolve(edit)
+        staged = [call.args[0] for call in git.call_args_list if call.args[0][0] == "add"]
+        self.assertEqual(staged, [["add", "-u", "--", "conflict.txt", "supplemental.txt"]])
+        self.assertEqual(len(self.git("rev-list", "--parents", "-n", "1", "HEAD").split()), 3)
+        self.assertEqual(self.git("show", "HEAD:conflict.txt"), "branch and base")
+        self.assertEqual(self.git("show", "HEAD:supplemental.txt"), "updated branch addition")
+        self.assertEqual(self.git("ls-tree", "-r", "--name-only", "HEAD", "--", ".arete-sandbox"), "")
+        self.assertEqual((self.root / self.LOG).read_text(), "verification ran\n")
+        self.assertEqual(workspace.untracked_files(self.root), {"project/untracked.txt"})
+
+    def test_invalid_scratch_markers_do_not_exempt_ignored_log_changes(self):
+        self.merge()
+        scratch = self.root / ".arete-sandbox"
+        marker = scratch / ".arete-owned"
+        (self.root / ".arete-owned").write_text(self.MARKER)
+        for kind in ("missing", "symlink", "wrong text", "blank line"):
+            with self.subTest(marker=kind):
+                marker.unlink(missing_ok=True)
+                self.write_log()
+                if kind == "symlink":
+                    marker.symlink_to("../.arete-owned")
+                elif kind == "wrong text":
+                    marker.write_text("someone else's scratch\n")
+                elif kind == "blank line":
+                    marker.write_text(self.MARKER + "\n")
+                self.assert_outside_conflict(self.write_log, self.LOG)
+
+    def test_scratch_exemption_preserves_other_path_checks(self):
+        self.merge()
+        folder = self.root / "project"
+        (folder / ".arete-owned").write_text(self.MARKER.removesuffix("\n"))
+        self.write_log()
+        (self.root / ".arete-sandbox/.arete-owned").write_text(self.MARKER)
+        (self.root / "ignored.local").write_text("ignored original\n")
+
+        def edit():
+            self.write_log()
+            (self.root / "ignored.local").write_text("ignored edit\n")
+            (folder / "private.local").write_text("scratch edit\n")
+            (folder / "tracked.txt").write_text("tracked edit\n")
+            (folder / "untracked.txt").write_text("untracked addition\n")
+            (self.root / "outside.txt").write_text("outside addition\n")
+
+        self.assert_outside_conflict(edit, "ignored.local, outside.txt, project/tracked.txt")
+
+    def test_resolving_without_the_wrapper_leaves_scratch_absent(self):
+        self.merge()
+        scratch = self.root / ".arete-sandbox"
+        self.assertFalse(scratch.exists())
+        self.resolve(lambda: None)
+        self.assertFalse(scratch.exists())
+
+    def test_first_use_keeps_existing_scratch_entry(self):
+        self.merge()
+        self.layer.allow_bash.append("sandbox *")
+        scratch = self.root / ".arete-sandbox"
+        scratch.symlink_to("missing", target_is_directory=True)
+        self.resolve(lambda: self.assertEqual(scratch.readlink(), Path("missing")))
+        self.assertFalse((self.root / "missing").exists())
+
+    def test_resolver_cannot_exempt_a_new_scratch_directory(self):
+        self.merge()
+        scratch = self.root / ".arete-sandbox"
+        self.assertFalse(scratch.exists())
+        for forged_marker in (False, True):
+            with self.subTest(forged_marker=forged_marker):
+                def edit():
+                    scratch.mkdir(exist_ok=True)
+                    (scratch / "unrelated.txt").write_text(f"outside edit {forged_marker}\n")
+                    if forged_marker:
+                        (scratch / ".arete-owned").write_text(self.MARKER)
+
+                expected = ".arete-sandbox/unrelated.txt"
+                if forged_marker:
+                    expected = ".arete-sandbox/.arete-owned, " + expected
+                self.assert_outside_conflict(edit, expected)
+
+    def test_unreadable_ignored_scratch_requires_a_still_valid_marker(self):
+        self.merge()
+        self.write_log()
+        marker = self.root / ".arete-sandbox/.arete-owned"
+        log = self.root / self.LOG
+        fingerprint = workspace.fingerprint
+
+        def fingerprint_file(path, salt):
+            if path == log:
+                raise PermissionError(path)
+            return fingerprint(path, salt)
+
+        for invalidate in (True, False):
+            with self.subTest(invalidate=invalidate):
+                marker.write_text(self.MARKER)
+
+                def edit():
+                    self.write_log()
+                    if invalidate:
+                        marker.unlink()
+
+                with mock.patch.object(workspace, "fingerprint", side_effect=fingerprint_file):
+                    if invalidate:
+                        self.assert_outside_conflict(edit, f".arete-sandbox/.arete-owned, {self.LOG}")
+                    else:
+                        self.resolve(edit)
+                        self.assertEqual(self.git("ls-tree", "-r", "--name-only", "HEAD", "--", self.LOG), "")
+
+    def test_invalidated_scratch_markers_do_not_exempt_ignored_log_changes(self):
+        self.merge()
+        self.write_log()
+        marker = self.root / ".arete-sandbox/.arete-owned"
+        for kind in ("missing", "symlink", "wrong text", "blank line", "replacement"):
+            with self.subTest(marker=kind):
+                marker.unlink(missing_ok=True)
+                marker.write_text(self.MARKER)
+                (marker.parent / "marker-source").write_text(self.MARKER)
+
+                def edit():
+                    self.write_log()
+                    if kind in ("missing", "symlink"):
+                        marker.unlink()
+                        if kind == "symlink":
+                            marker.symlink_to("marker-source")
+                    elif kind == "replacement":
+                        marker.with_name("marker-source").replace(marker)
+                    else:
+                        marker.write_text("wrong text\n" if kind == "wrong text" else self.MARKER + "\n")
+
+                expected = f".arete-sandbox/.arete-owned, {self.LOG}"
+                if kind == "replacement":
+                    expected += ", .arete-sandbox/marker-source"
+                self.assert_outside_conflict(edit, expected)
+
+    def test_resolver_cannot_make_an_ignored_path_scratch(self):
+        self.merge()
+        marker = self.root / "project/.arete-owned"
+        ignored = self.root / "project/private.local"
+        for initial in (None, "wrong text\n"):
+            with self.subTest(initial=initial):
+                if initial is not None:
+                    marker.write_text(initial)
+                ignored.write_text("original\n")
+
+                def edit():
+                    marker.write_text(self.MARKER)
+                    ignored.write_text("ignored edit\n")
+
+                self.assert_outside_conflict(edit, "project/.arete-owned, project/private.local")
+
+
+class TrackedResolverScratchTests(ResolverScratchFixture):
+    def test_incoming_tracked_addition_is_preserved(self):
+        self.merge(tracked_added_by_base=True)
+        staged = self.git("diff", "--cached", "--name-only", "--diff-filter=A").splitlines()
+        self.assertEqual(staged, [self.TRACKED, "incoming.txt"])
+        self.resolve(self.write_log)
+        self.assertEqual(self.git("show", f"HEAD:{self.TRACKED}"), "base content")
+        self.assertEqual(self.git("ls-tree", "-r", "--name-only", "HEAD", "--", self.LOG), "")
+        self.assertEqual(self.git("show", "HEAD:incoming.txt"), "incoming addition")
+        self.assertEqual(workspace.uncommitted(self.root), [])
+
+    def test_unrelated_tracked_scratch_edit_fails(self):
+        self.merge(tracked_changed_by="neither")
+        head = self.git("rev-parse", "HEAD")
+        tracked = self.root / self.TRACKED
+
+        def edit():
+            self.write_log()
+            tracked.write_text("unrelated edit\n")
+
+        self.assert_outside_conflict(edit, self.TRACKED)
+        self.assertEqual(tracked.read_text(), "unrelated edit\n")
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+
+    def test_tracked_supplemental_scratch_edit_reaches_the_merge_commit(self):
+        for parent in ("branch", "base"):
+            with self.subTest(parent=parent):
+                self.merge(tracked_changed_by=parent)
+
+                def edit():
+                    self.write_log()
+                    (self.root / self.TRACKED).write_text("adapted content\n")
+
+                with mock.patch.object(pipeline, "git", wraps=pipeline.git) as git:
+                    self.resolve(edit)
+                staged = [call.args[0] for call in git.call_args_list if call.args[0][0] == "add"]
+                self.assertEqual(staged, [["add", "-u", "--", "conflict.txt", self.TRACKED]])
+                self.assertEqual(self.git("show", f"HEAD:{self.TRACKED}"), "adapted content")
+                self.assertEqual(self.git("ls-tree", "-r", "--name-only", "HEAD", "--", self.LOG), "")
+                self.assertEqual((self.root / self.LOG).read_text(), "verification ran\n")
+                self.assertEqual(workspace.uncommitted(self.root), [])
+
+    def test_parent_tracked_path_under_logs_can_be_restored(self):
+        self.merge(tracked_changed_by="removed by base")
+        tracked = self.root / self.TRACKED
+        self.assertFalse(tracked.exists())
+
+        def edit():
+            self.write_log()
+            tracked.write_text("restored parent content\n")
+
+        self.resolve(edit)
+        self.assertEqual(self.git("show", f"HEAD:{self.TRACKED}"), "restored parent content")
+        self.assertEqual(self.git("ls-tree", "-r", "--name-only", "HEAD", "--", self.LOG), "")
+
+    def test_tracked_scratch_conflict_is_resolved(self):
+        self.merge(tracked_changed_by="both")
+
+        def edit():
+            self.write_log()
+            (self.root / self.TRACKED).write_text("resolved content\n")
+
+        self.resolve(edit)
+        self.assertEqual(self.git("show", f"HEAD:{self.TRACKED}"), "resolved content")
+        self.assertEqual(self.git("ls-tree", "-r", "--name-only", "HEAD", "--", self.LOG), "")
+        self.assertEqual(pipeline.unmerged_paths(self.root), [])
+
+    def test_tracked_scratch_conflict_respects_repository_deny(self):
+        self.merge(tracked_changed_by="both")
+        self.layer.deny.append(self.TRACKED)
+        with self.assertRaisesRegex(workspace.RunFailed, r"conflicts in protected paths"):
+            self.resolve(self.write_log)
+        self.run.agent.assert_not_called()
+
+
+class FirstUseResolverScratchTests(SharedResolverScratchFixture):
+    def test_first_use_initializes_scratch_for_trusted_wrapper(self):
+        self.merge()
+        scratch = self.root / ".arete-sandbox"
+        self.assertFalse(scratch.exists())
+        self.layer.allow_bash.append("sandbox *")
+
+        def edit():
+            self.assertEqual(stat.S_IMODE(scratch.stat().st_mode), 0o700)
+            self.assertEqual((scratch / ".arete-owned").read_text(), self.MARKER)
+            self.assertEqual((scratch / ".gitignore").read_text(), "*\n")
+            self.write_log()
+
+        self.resolve(edit)
+        self.assertEqual(self.git("show", "HEAD:conflict.txt"), "branch and base")
+        self.assertEqual(self.git("ls-tree", "-r", "--name-only", "HEAD", "--", ".arete-sandbox"), "")
+
+    def test_first_use_without_trusted_wrapper_rejects_scratch_write(self):
+        self.merge()
+        self.layer.allow_bash.extend(["echo sandbox *", "./sandbox *"])
+        scratch = self.root / ".arete-sandbox"
+        self.assertFalse(scratch.exists())
+
+        def edit():
+            self.assertFalse(scratch.exists())
+            self.write_log()
+
+        self.assert_outside_conflict(edit, self.LOG)
+
+
 class CatchUpRepairFixture(PublicationFixture):
     def prepare_publication(self, gate, *, spent=False, move_base_again=False):
         c, b, controller = self.checkout, self.build, self.controller
@@ -2248,9 +2616,14 @@ class ServeStatusTests(unittest.TestCase):
         result = subprocess.run([str(installed), "status", *args], cwd=self.root,
                                 env=stack_env({**env, "PYTHONPATH": str(self.root), "PYTHONDONTWRITEBYTECODE": "1"}),
                                 capture_output=True, text=True, timeout=8)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
         self.assertIn("broken deployment fixture", result.stderr)
-        self.assertIn(f"running code {running}, checkout HEAD {checkout}", result.stdout)
+        self.assertIn(
+            f"last recorded serve heartbeat at 2026-11-21T00:00:00Z, running code {running}, checkout HEAD {checkout}",
+            result.stderr.splitlines(),
+        )
+        self.assertFalse((state_dir / "arete.db").exists())
 
     def test_installed_status_reads_revisions_when_candidate_common_raises(self):
         self.break_candidate_import("commands/common.py")
