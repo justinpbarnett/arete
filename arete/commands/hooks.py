@@ -17,8 +17,11 @@ def cmd_events(args) -> int:
 
     if remote := client.configured_server():
         client.upload_hook_events(remote, wait=True)
-        query = urlencode({"since": util.iso(util.now() - timedelta(hours=args.hours))})
-        evs = client.field(client.call("GET", f"/api/v1/hook-events?{query}"), "events", kind=list)
+        path = "/api/v1/hook-events"
+        if args.hours != float("inf"):
+            cutoff = util.now() - timedelta(hours=args.hours)
+            path += "?" + urlencode({"since": cutoff.isoformat()})
+        evs = client.field(client.call("GET", path), "events", kind=list)
     else:
         evs = tool_events.read_events(args.hours)
     if args.raw:

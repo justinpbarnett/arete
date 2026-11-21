@@ -68,8 +68,8 @@ CHAT = obj({"id": INTEGER, **dict.fromkeys(("title", "project", "created", "upda
             "busy": {"type": ["boolean", "integer"]}, "paid_usd": {"type": ["number", "null"]},
             "spent": {"type": ["number", "null"]}, "messages": array(obj({"id": INTEGER, "sender": STRING, "text": NULL_TEXT,
               "cost": NUMBER, "paid_usd": {"type": ["number", "null"]}, "ts": STRING}))}, ["id", "title"])
-HOOK_EVENT = obj({**dict.fromkeys(("ts", "hook", "tool", "cwd", "kind", "cls", "detail", "error"), STRING),
-                  "session": NULL_TEXT, "agent": BOOLEAN}, ["ts", "kind", "cls"])
+HOOK_EVENT = obj({**dict.fromkeys(("ts", "hook", "kind", "cls", "detail", "error"), STRING),
+                  **dict.fromkeys(("tool", "cwd", "session"), JSON), "agent": BOOLEAN}, ["ts", "kind", "cls"])
 RESOURCE = {
     "task": TASK, "run": RUN,
     "project": obj(dict.fromkeys(("id", "name", "github", "path"), STRING)),

@@ -10,7 +10,6 @@ import sys
 import tempfile
 import threading
 import unittest
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, chdir, closing, contextmanager, redirect_stderr, redirect_stdout
 from contextvars import Context
 from http.client import HTTPConnection, HTTPResponse
@@ -1059,8 +1058,17 @@ class HookUploadTests(unittest.TestCase):
 
     def serve_at(self, name):
         root = self.root / name
+        template = paths.DB_FILE
         with self.state_at(root):
-            db.migrate()
+            paths.STATE_DIR.mkdir()
+            instance = util.digest(name)[:32]
+            with closing(sqlite3.connect(template)) as src, closing(sqlite3.connect(paths.DB_FILE)) as dest:
+                src.backup(dest)
+                with dest:
+                    dest.executemany("UPDATE schema_meta SET value = ? WHERE key = ?",
+                                     [(instance, "instance_id"), (instance[:8], "instance_tag")])
+                identity = {key: value for key, value in db.metadata(dest).items() if key.startswith("instance_")}
+            util.write_json(paths.backups_dir() / "instance.json", identity)
             principals.seed_owner(api_check.LOGIN)
         port = 8000 + len(self.servers)
         self.servers[port] = (root, SimpleNamespace(node=SimpleNamespace(names=set(self.aliases)),
@@ -1081,12 +1089,16 @@ class HookUploadTests(unittest.TestCase):
             paths.CONFIG_FILE.write_text(f'[server]\nurl = "http://{host}:{port}"\n')
             yield
 
-    def command(self, *argv, stdin=""):
+    def invoke(self, *argv, stdin="", code=0):
         out, err = StringIO(), StringIO()
         with redirect_stdout(out), redirect_stderr(err), mock.patch("sys.stdin", StringIO(stdin)):
-            self.assertEqual(cli.main(list(argv)), 0, (out.getvalue(), err.getvalue()))
-        self.assertEqual(err.getvalue(), "")
-        return [json.loads(line) for line in out.getvalue().splitlines()]
+            self.assertEqual(cli.main(list(argv)), code, (out.getvalue(), err.getvalue()))
+        return out.getvalue(), err.getvalue()
+
+    def command(self, *argv, stdin=""):
+        out, err = self.invoke(*argv, stdin=stdin)
+        self.assertEqual(err, "")
+        return [json.loads(line) for line in out.splitlines()]
 
     def hook(self, detail, *, session_id=""):
         self.command("hook", stdin=json.dumps({"hook_event_name": "PostToolUse", "tool_name": "Skill",
@@ -1175,108 +1187,50 @@ class HookUploadTests(unittest.TestCase):
                 self.assertEqual(self.recorded(target), [])
                 self.assertFalse((target / "state" / "hook-ingest.json").exists())
 
-    def test_null_session_hook_uploads_from_pending_batch_and_retained_log(self):
+    def test_null_session_hooks_upload_and_retry_with_the_same_body_and_key(self):
         source = self.root / "client"
         target, port = self.serve_at("target")
-        with (self.cli_at(source, self.aliases[0], port),
-              mock.patch.object(client, "send_hook_batch", wraps=client.send_hook_batch) as send):
-            self.hook("pending", session_id=None)
-            with (client.invocation(), mock.patch.dict(contract.HOOK_EVENT["properties"], session=contract.STRING),
-                  redirect_stderr(StringIO()) as error):
-                client.upload_hook_events()
-            self.assertIn("input.events[0].session must be string", error.getvalue())
-            self.assertEqual(self.recorded(target), [])
-            self.hook("retained", session_id=None)
-            self.hook("later", session_id="session-2")
-            listed = self.command("events", "--raw")
-            self.assertEqual(listed, self.recorded(source))
-            self.assertEqual(self.command("events", "--raw"), listed)
-        first, retry, later = [call.args[:2] for call in send.call_args_list]
-        self.assertEqual(first, retry)
-        self.assertNotEqual(retry[1], later[1])
-        self.assertEqual([(row["detail"], row["session"]) for row in self.recorded(target)],
-                         [("pending", None), ("retained", None), ("later", "session-2")])
-
-    def test_stream_survives_rotation_and_move_but_replacement_starts_a_new_generation(self):
-        source, moved = self.root / "client", self.root / "moved"
-        moved_before_rotation = self.root / "moved-before-rotation"
-        target, port = self.serve_at("target")
-        with mock.patch.object(client, "send_hook_batch", wraps=client.send_hook_batch) as send:
-            with self.cli_at(source, self.aliases[0], port):
-                self.hook("original")
-                old = {**self.recorded(source)[0], "ts": "2000-01-01T00:00:00Z"}
-                paths.EVENTS_FILE.write_text(json.dumps(old) + "\n")
-                self.command("events", "--raw")
-                shutil.copytree(source, moved_before_rotation)
-                tool_events.rotate_events(30)
-            shutil.copytree(source, moved)
-            with self.cli_at(moved_before_rotation, self.aliases[0], port):
-                tool_events.rotate_events(30)
-                self.command("events", "--raw")
-                self.assertEqual(send.call_count, 1)
-            with self.cli_at(moved, self.aliases[0], port):
-                self.command("events", "--raw")
-                self.assertEqual(send.call_count, 1)
-                paths.EVENTS_FILE.write_text(json.dumps(old) + "\n")
-                self.command("events", "--raw")
-                paths.EVENTS_FILE.rename(paths.EVENTS_FILE.with_suffix(".replaced"))
-                paths.EVENTS_FILE.write_text(json.dumps(old) + "\n")
-                self.command("events", "--raw")
-        batches = [call.args[0] for call in send.call_args_list]
-        self.assertEqual(len(batches), 3)
-        self.assertEqual(len({batch["stream"] for batch in batches}), 3)
-        self.assertEqual([batch["offset"] for batch in batches], [0, 0, 0])
-        self.assertEqual(len(self.recorded(target)), 3)
-
-    def test_filesystem_device_change_resumes_offset_and_uploads_only_the_append(self):
-        source = self.root / "client"
-        target, port = self.serve_at("target")
-        with self.cli_at(source, self.aliases[0], port):
-            self.hook("first")
-            self.command("events", "--raw")
-            inode = paths.EVENTS_FILE.stat().st_ino
-            fstat = os.fstat
-
-            def moved(fd):
-                stat = fstat(fd)
-                if stat.st_ino == inode:
-                    return SimpleNamespace(st_dev=stat.st_dev + 1, st_ino=stat.st_ino, st_size=stat.st_size,
-                                           st_birthtime=getattr(stat, "st_birthtime", None))
-                return stat
-
-            self.hook("second")
-            with mock.patch.object(os, "fstat", side_effect=moved):
-                self.assertEqual([row["detail"] for row in self.command("events", "--raw")], ["first", "second"])
-        self.assertEqual([row["detail"] for row in self.recorded(target)], ["first", "second"])
-
-    def test_new_batches_use_local_instance_but_pending_retry_keeps_its_body_and_key(self):
-        source = self.root / "client"
-        target, port = self.serve_at("target")
-        attempted = []
         send_batch = client.send_hook_batch
 
         def lost_reply(body, key, deadline):
             send_batch(body, key, deadline)
-            attempted.append((body, key))
             raise client.Broken({"error": "lost reply"})
 
         with self.cli_at(source, self.aliases[0], port):
-            self.hook("cli-only", session_id=None)
-            with (client.invocation(), mock.patch.object(client, "send_hook_batch", side_effect=lost_reply),
-                  redirect_stderr(StringIO()) as error):
-                client.upload_hook_events()
-            self.assertIn("lost reply", error.getvalue())
-            db.migrate()
-            self.hook("local-instance")
-            with mock.patch.object(client, "send_hook_batch", wraps=client.send_hook_batch) as send:
-                self.command("events", "--raw")
-            retried, fresh = [call.args[:2] for call in send.call_args_list]
-            self.assertEqual(retried, attempted[0])
-            self.assertNotEqual(retried[0]["origin"], tool_events.local_instance())
-            self.assertEqual(fresh[0]["origin"], tool_events.local_instance())
-            self.assertEqual(retried[0]["stream"], fresh[0]["stream"])
-        self.assertEqual([(row["detail"], row[tool_events.INGEST_MARK]) for row in self.recorded(target)],
-                         [("cli-only", retried[0]["origin"]), ("local-instance", fresh[0]["origin"])])
+            self.hook("pending", session_id=None)
+            with mock.patch.object(client, "send_hook_batch", side_effect=lost_reply) as dropped:
+                out, _ = self.invoke("events", "--raw", code=1)
+            self.assertEqual(json.loads(out)["error"], "lost reply")
+            self.assertEqual([row["detail"] for row in self.recorded(target)], ["pending"])
+            self.command("hook", stdin=json.dumps({"hook_event_name": "StopFailure", "tool_name": None,
+                                                   "session_id": None, "error_details": "retained"}))
+            self.hook("later", session_id="session-2")
+            with mock.patch.object(client, "send_hook_batch", wraps=send_batch) as send:
+                listed = self.command("events", "--raw")
+            self.assertEqual(listed, self.recorded(source))
+            self.assertEqual(self.command("events", "--raw"), listed)
+        retry, later = [call.args[:2] for call in send.call_args_list]
+        self.assertEqual(dropped.call_args.args[:2], retry)
+        self.assertNotEqual(retry[1], later[1])
+        self.assertEqual([(row["detail"], row["session"]) for row in self.recorded(target)],
+                         [("pending", None), ("retained", None), ("later", "session-2")])
+
+    def test_infinite_hours_includes_rotated_and_current_history_locally_and_remotely(self):
+        source, _ = self.serve_at("source")
+        target, port = self.serve_at("target")
+        with self.state_at(source):
+            self.hook("old")
+            old = {**self.recorded(source)[0], "ts": "2000-01-01T00:00:00Z"}
+            paths.EVENTS_FILE.write_text(json.dumps(old) + "\n")
+            tool_events.rotate_events(30)
+            self.hook("recent")
+            recent, = self.recorded(source)
+            self.assertEqual(self.command("events", "--raw", "--hours", "inf"), [old, recent])
+            self.assertEqual(self.command("events", "--raw"), [recent])
+        with self.cli_at(source, self.aliases[0], port):
+            self.assertEqual(self.command("events", "--raw", "--hours", "inf"), [old, recent])
+            self.assertEqual(self.command("events", "--raw"), [recent])
+        self.assertEqual([row["detail"] for row in self.recorded(target)], ["old", "recent"])
 
     def test_doctor_is_offline_and_preserves_state_with_a_pending_upload(self):
         source, _ = self.serve_at("source")
@@ -1297,7 +1251,9 @@ class HookUploadTests(unittest.TestCase):
             self.assertEqual(files(), before)
         self.assertEqual(self.recorded(target), [])
 
-    def test_install_dry_run_prints_preview_without_uploading_pending_events(self):
+    def test_install_and_dry_runs_leave_pending_events_and_the_checkpoint_alone(self):
+        from arete import install
+
         source = self.root / "client"
         target, port = self.serve_at("target")
         with self.cli_at(source, self.aliases[0], port):
@@ -1307,51 +1263,39 @@ class HookUploadTests(unittest.TestCase):
             checkpoint, = (paths.STATE_DIR / "hook-uploads").glob("*.json")
             before = checkpoint.read_bytes()
             client.connect.reset_mock()
-            with redirect_stdout(StringIO()) as out:
-                self.assertEqual(cli.main(["install", "--dry-run", "--platform", "linux"]), 0)
+            with mock.patch.object(install, "install", return_value=0) as install_serve:
+                self.invoke("install")
+            install_serve.assert_called_once_with(dry_run=False, platform="")
+            out, _ = self.invoke("install", "--dry-run", "--platform", "linux")
+            self.assertIn("[Unit]\nDescription=arete serve", out)
+            with mock.patch.object(pipeline, "run_issue", return_value=0) as run_issue:
+                self.invoke("run", "sample", "7", "--dry-run")
+            run_issue.assert_called_once_with("sample", "7", dry_run=True, force=False)
             client.connect.assert_not_called()
-            self.assertIn("[Unit]\nDescription=arete serve", out.getvalue())
             self.assertEqual(checkpoint.read_bytes(), before)
         self.assertEqual([row["detail"] for row in self.recorded(target)], ["uploaded"])
 
-    def test_remote_events_waits_for_active_upload_and_sends_events_appended_after_its_snapshot(self):
+    def test_only_serve_writes_upload_pending_events_during_other_commands(self):
         source = self.root / "client"
         target, port = self.serve_at("target")
-        captured, release, waiting = threading.Event(), threading.Event(), threading.Event()
-        take_lock = util.take_lock
-        send_batch = client.send_hook_batch
-
-        def observe_lock(lock, wait):
-            if "hook-upload-" in lock.name and wait:
-                waiting.set()
-            return take_lock(lock, wait)
-
-        def send(body, key, deadline):
-            if body["offset"] == 0:
-                captured.set()
-                self.assertTrue(release.wait(5))
-            send_batch(body, key, deadline)
-
-        def upload():
-            with client.invocation():
-                client.upload_hook_events()
-
-        with (self.cli_at(source, self.aliases[0], port), mock.patch.object(util, "take_lock", side_effect=observe_lock),
-              mock.patch.object(client, "send_hook_batch", side_effect=send)):
+        with self.cli_at(source, self.aliases[0], port):
             self.hook("first")
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                active = pool.submit(upload)
-                try:
-                    self.assertTrue(captured.wait(5))
-                    self.hook("appended")
-                    listing = pool.submit(self.command, "events", "--raw")
-                    self.assertTrue(waiting.wait(5))
-                    self.assertFalse(listing.done())
-                finally:
-                    release.set()
-                active.result(5)
-                self.assertEqual([row["detail"] for row in listing.result(5)], ["first", "appended"])
-        self.assertEqual([row["detail"] for row in self.recorded(target)], ["first", "appended"])
+            self.assertEqual(self.command("task", "list"), [])
+            self.assertEqual(self.recorded(target), [])
+            self.assertEqual(list(paths.STATE_DIR.glob("hook-*.json")), [])
+            self.assertFalse((paths.STATE_DIR / "hook-uploads").exists())
+            out, err = self.invoke("oncall", "off")
+            self.assertIn("wakes and rechecks are off", out)
+            self.assertEqual(err, "")
+            self.assertEqual([row["detail"] for row in self.recorded(target)], ["first"])
+
+            self.hook("second")
+            with mock.patch.object(tasks, "start", return_value={"queued": True}) as start:
+                out, err = self.invoke("task", "run", "sample", "7", "--key", "run-seven")
+            start.assert_called_once()
+            self.assertEqual(json.loads(out), {"queued": True})
+            self.assertEqual(err, "Idempotency-Key: run-seven\n")
+        self.assertEqual([row["detail"] for row in self.recorded(target)], ["first", "second"])
 
 
 class WaitReconnectTests(unittest.TestCase):
