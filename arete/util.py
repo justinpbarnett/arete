@@ -473,10 +473,6 @@ def git_records(args: list[str], cwd: Path, **kw) -> list[str]:
     return [r for r in git([args[0], "-z", *args[1:]], cwd, **kw).split("\0") if r]
 
 
-def git_path_records(args: list[str], cwd: Path) -> list[str]:
-    return [os.fsdecode(r) for r in git_bytes([args[0], "-z", *args[1:]], cwd).split(b"\0") if r]
-
-
 def origin_default_branch(src: Path) -> str:
     head = git(["ls-remote", "--symref", "origin", "HEAD"], src, check=False)
     found = re.search(r"^ref: refs/heads/(\S+)\s+HEAD$", head, re.MULTILINE)

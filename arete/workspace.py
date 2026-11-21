@@ -727,14 +727,12 @@ def uncommitted(wt: Path, *, tracked_only: bool = False) -> list[str]:
     return [r[3:] for r in util.git_records(["status", "--porcelain", "--no-renames", f"--untracked-files={untracked}"], wt)]
 
 
-def untracked_files(wt: Path, *, preserve_path_bytes: bool = False) -> set[str]:
-    records = util.git_path_records if preserve_path_bytes else util.git_records
-    return set(records(["ls-files", "--others", "--exclude-standard"], wt))
+def untracked_files(wt: Path) -> set[str]:
+    return set(util.git_records(["ls-files", "--others", "--exclude-standard"], wt))
 
 
-def ignored_file_paths(wt: Path, *, preserve_path_bytes: bool = False) -> set[str]:
-    records = util.git_path_records if preserve_path_bytes else util.git_records
-    return set(records(["ls-files", "--others", "--ignored", "--exclude-standard"], wt))
+def ignored_file_paths(wt: Path) -> set[str]:
+    return set(util.git_records(["ls-files", "--others", "--ignored", "--exclude-standard"], wt))
 
 
 def remove_untracked(wt: Path, name: str) -> None:
