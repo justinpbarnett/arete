@@ -1,9 +1,12 @@
 import json
+import shlex
 import shutil
 import subprocess
+import sys
 import sysconfig
 import tempfile
 import threading
+import time
 import tomllib
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -37,6 +40,8 @@ class ServeDeploymentTests(unittest.TestCase):
         package = self.writer / "arete"
         package.mkdir()
         (package / "fixture.py").write_text("version = 1\n")
+        (package / "other.py").write_text("other = 1\n")
+        (package / "shared.py").write_text("shared = 1\n")
         self.start = self.commit(self.writer, "initial code")
         self.git(self.writer, "push", "-q", "origin", "main")
         self.git(root, "clone", "-q", str(origin), str(self.checkout))
@@ -223,6 +228,187 @@ class ServeDeploymentTests(unittest.TestCase):
         self.assertEqual(self.deploy(), self.start)
         self.gate.assert_called_once_with(self.repo.github, self.tip,
                                           required={"context": "deployment-check", "app_id": 17})
+
+    @unittest.skipUnless(sandbox.can_confine(False), "requires macOS sandbox-exec")
+    @unittest.skipIf(sandbox.can_confine(False) and sandbox.sandboxed(),
+                     "sandbox-exec cannot install a profile inside the test runner's sandbox")
+    def test_deploy_fast_forwards_engine_file_in_real_sandbox(self):
+        (self.writer / "arete" / "fixture.py").write_text("version = 2\n")
+        tip = self.publish("engine update")
+        self.git(self.checkout, "fetch", "-q", "origin", "main")
+        with self.assertRaisesRegex(RuntimeError, "Operation not permitted"):
+            util.git(["merge", "--ff-only", tip], self.checkout, retry=False)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.start)
+        self.assertEqual(self.deploy(), tip)
+        self.assertEqual((self.checkout / "arete" / "fixture.py").read_text(), "version = 2\n")
+        self.server.say.assert_called_once_with(
+            f"deploy: {paths.short_path(self.checkout)} fast forwarded to {tip} (engine update)")
+
+    def test_failed_fast_forward_restores_tracked_paths_and_retries(self):
+        package = self.writer / "arete"
+        (package / "fixture.py").write_text("version = 2\n")
+        (package / "new.py").write_text("added = True\n")
+        tip = self.publish("engine update")
+        untracked = self.checkout / "untracked.txt"
+        untracked.write_text("owner's file\n")
+        lock = self.checkout / ".git" / "refs" / "heads" / "main.lock"
+        lock.touch()
+        restore_paths = util.restore_deploy_paths
+
+        def restore(src, base, recovery):
+            self.assertEqual((src / "arete" / "fixture.py").read_text(), "version = 2\n")
+            self.assertTrue((src / "arete" / "new.py").is_file())
+            return restore_paths(src, base, recovery)
+
+        try:
+            with mock.patch.object(util, "restore_deploy_paths", side_effect=restore) as restored:
+                self.assertEqual(self.deploy(), self.start)
+                restored.assert_called_once()
+        finally:
+            lock.unlink()
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "?? untracked.txt")
+        self.assertEqual((self.checkout / "arete" / "fixture.py").read_text(), "version = 1\n")
+        self.assertEqual(untracked.read_text(), "owner's file\n")
+        self.assertEqual(self.deploy(), tip)
+        messages = [call.args[0] for call in self.server.say.call_args_list]
+        restores = [message for message in messages if "restore" in message]
+        self.assertEqual(len(restores), 1, messages)
+        self.assertIn(f"restored tracked changes for {tip}", restores[0])
+        self.assertIn("main.lock", restores[0])
+
+    def test_interrupted_merge_removes_only_new_unedited_tip_additions(self):
+        additions = ("fresh [1].py", "owner-edited.py", "pre-existing.py", "pre-existing-dir.py")
+        content = "added = True\n"
+        for name in additions:
+            (self.writer / "arete" / name).write_text(content)
+        tip = self.publish("tip additions")
+        package = self.checkout / "arete"
+        (package / "pre-existing.py").write_text(content)
+        occupied = package / "pre-existing-dir.py"
+        occupied.mkdir()
+        (occupied / "keep").write_text("existing directory content")
+        unrelated = package / "unrelated.py"
+        unrelated.write_text(content)
+
+        def interrupt(src, checked_tip):
+            self.assertEqual((src, checked_tip), (self.checkout, tip))
+            (package / additions[0]).write_text(content)
+            (package / additions[1]).write_text("owner's edit\n")
+            self.assertEqual(self.git(src, "diff", "--cached", "--name-only"), "")
+            raise RuntimeError("interrupted before writing the index")
+
+        with mock.patch.object(util, "deploy_fast_forward", side_effect=interrupt):
+            self.assertEqual(self.deploy(), self.start)
+
+        self.assertFalse((package / additions[0]).exists())
+        self.assertEqual((package / additions[1]).read_text(), "owner's edit\n")
+        self.assertEqual((package / "pre-existing.py").read_text(), content)
+        self.assertEqual((occupied / "keep").read_text(), "existing directory content")
+        self.assertEqual(unrelated.read_text(), content)
+        messages = [call.args[0] for call in self.server.say.call_args_list]
+        self.assertEqual(sum("could not fully restore" in message for message in messages), 1, messages)
+        self.assertIn(tip, messages[0])
+        self.assertIn("interrupted before writing the index", messages[0])
+
+    def test_failed_merge_preserves_concurrent_tracked_edits(self):
+        (self.writer / "arete" / "fixture.py").write_text("version = 2\n")
+        (self.writer / "arete" / "shared.py").write_text("shared = 2\n")
+        self.publish("engine update")
+        lock = self.checkout / ".git" / "refs" / "heads" / "main.lock"
+        lock.touch()
+        fast_forward = util.deploy_fast_forward
+
+        def owner_edits_during_merge(src, tip):
+            try:
+                fast_forward(src, tip)
+            except RuntimeError:
+                package = src / "arete"
+                self.assertEqual((package / "fixture.py").read_text(), "version = 2\n")
+                self.assertEqual((package / "shared.py").read_text(), "shared = 2\n")
+                (package / "shared.py").write_text("shared = 'owner'\n")
+                (package / "other.py").write_text("other = 'staged by owner'\n")
+                self.git(src, "add", "arete/other.py")
+                (package / "other.py").write_text("other = 'also edited by owner'\n")
+                raise
+
+        with mock.patch.object(util, "deploy_fast_forward", side_effect=owner_edits_during_merge):
+            self.assertEqual(self.deploy(), self.start)
+
+        package = self.checkout / "arete"
+        self.assertEqual((package / "fixture.py").read_text(), "version = 1\n")
+        self.assertEqual((package / "shared.py").read_text(), "shared = 'owner'\n")
+        self.assertEqual((package / "other.py").read_text(), "other = 'also edited by owner'\n")
+        self.assertEqual(self.git(self.checkout, "show", ":arete/other.py"), "other = 'staged by owner'")
+        self.assertIn("preserved 1 path", self.server.say.call_args_list[0].args[0])
+
+    def test_timed_out_merge_releases_its_lock_and_retries(self):
+        (self.writer / "arete" / "fixture.py").write_text("version = 2\n")
+        (self.writer / "arete" / "fresh.py").write_text("added = True\n")
+        (self.writer / ".gitattributes").write_text("z-delayed.txt filter=delay\n")
+        (self.writer / "z-delayed.txt").write_text("tip content\n")
+        tip = self.publish("delayed checkout")
+        lock = self.checkout / ".git" / "index.lock"
+        ready = self.state.parent / "filter-started"
+        filter_code = "import pathlib, signal, sys; pathlib.Path(sys.argv[1]).touch(); signal.pause()"
+        self.git(self.checkout, "config", "filter.delay.smudge", shlex.join([sys.executable, "-c", filter_code,
+                                                                             str(ready)]))
+        self.git(self.checkout, "config", "filter.delay.required", "true")
+        self.git(self.checkout, "config", "checkout.workers", "1")
+        communicate = subprocess.Popen.communicate
+
+        def expire_while_git_holds_lock(proc, input=None, timeout=None):
+            if "--ff-only" in proc.args:
+                deadline = time.monotonic() + 5
+                while not ready.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists())
+                self.assertTrue(lock.exists())
+                self.assertTrue((self.checkout / "arete" / "fresh.py").is_file())
+                timeout = 0
+            return communicate(proc, input=input, timeout=timeout)
+
+        with mock.patch.object(subprocess.Popen, "communicate", expire_while_git_holds_lock):
+            self.assertEqual(self.deploy(), self.start)
+        self.assertFalse(lock.exists())
+        self.assertEqual(self.git(self.checkout, "status", "--porcelain"), "")
+        self.assertIn("timed out", self.server.say.call_args_list[0].args[0])
+
+        lock.write_text("another Git process")
+        self.assertEqual(self.deploy(), self.start)
+        self.assertEqual(lock.read_text(), "another Git process")
+        lock.unlink()
+        self.git(self.checkout, "config", "filter.delay.smudge", "cat")
+        self.assertEqual(self.deploy(), tip)
+
+
+class CommandConfinementTests(unittest.TestCase):
+    def test_only_deploy_merge_drops_the_engine_write_deny(self):
+        src = paths.PACKAGE_DIR.parent
+        tip = "a" * 40
+        with (mock.patch.object(sandbox, "can_confine", return_value=True),
+              mock.patch.object(sandbox, "sandboxed", return_value=False),
+              mock.patch.object(util, "run_whole_tree", return_value=subprocess.CompletedProcess([], 0, "", ""))
+              as run):
+            util.sh(["true"], cwd=src)
+            util.git(["status"], src)
+            util.deploy_fast_forward(src, tip)
+
+        shell, git, deploy = (call.args[0] for call in run.call_args_list)
+        engine = f"ENGINE={sandbox.real_path(paths.PACKAGE_DIR)}"
+        deny_engine = '(deny file-write* (subpath (param "ENGINE")))'
+        for command in (shell, git):
+            self.assertEqual(command[0], "/usr/bin/sandbox-exec")
+            self.assertIn(engine, command)
+            self.assertIn(f"RUNTIME={sandbox.real_path(sys.prefix)}", command)
+            profile = command[command.index("-p") + 1]
+            self.assertIn(deny_engine, profile)
+            self.assertIn('(deny file-write* (subpath (param "RUNTIME")))', profile)
+        profile_index = git.index("-p") + 1
+        engine_index = git.index(engine)
+        self.assertEqual(deploy[:deploy.index("-p") + 2], [
+            *git[:engine_index - 1], *git[engine_index + 1:profile_index], git[profile_index].replace(deny_engine, ""),
+        ])
+        self.assertEqual(deploy[-6:], ["merge", "-q", "--ff-only", "--no-autostash", "--no-overwrite-ignore", tip])
 
 
 class DeploymentCiTests(unittest.TestCase):

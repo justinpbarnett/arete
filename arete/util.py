@@ -13,12 +13,15 @@ import shutil
 import signal
 import socket
 import ssl
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+from collections.abc import Iterable
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO
@@ -27,6 +30,7 @@ from urllib.parse import SplitResult, urlsplit
 from . import paths, sandbox
 
 PROBE_GRACE_SECONDS = 0.2
+GIT_TERMINATE_GRACE_SECONDS = 1
 TIMED_OUT = 124
 
 
@@ -85,8 +89,13 @@ def sh(
     inherit: bool = True,
     keeps: tuple[str, ...] = (),
 ) -> subprocess.CompletedProcess:
+    return _sh(cmd, cwd, timeout, check, env, input, inherit, keeps)
+
+
+def _sh(cmd, cwd=None, timeout=600, check=False, env=None, input=None, inherit=True, keeps=(), *,
+        deploy=False, restore_paths=(), binary=False, graceful_timeout=False) -> subprocess.CompletedProcess:
     full_env = foreground_maintenance({**(os.environ if inherit else {}), **(env or {})})
-    command = sandbox.protected_command(cmd, cwd, keeps)
+    command = sandbox.protected_command(cmd, cwd, keeps, _deploy=deploy, _restore_paths=restore_paths)
     try:
         res = run_whole_tree(
             command,
@@ -94,9 +103,10 @@ def sh(
             input,
             cwd=str(cwd) if cwd else None,
             shell=isinstance(command, str),
-            text=True,
-            errors="replace",
+            text=not binary,
+            errors=None if binary else "replace",
             env=full_env,
+            graceful_timeout=graceful_timeout,
         )
     except subprocess.TimeoutExpired as e:
         res = subprocess.CompletedProcess(
@@ -109,15 +119,27 @@ def sh(
     return res
 
 
-def run_whole_tree(command, timeout: float | None, input: str | None, **kw) -> subprocess.CompletedProcess:
+def run_whole_tree(command, timeout: float | None, input: str | bytes | None, *,
+                   graceful_timeout: bool = False, **kw) -> subprocess.CompletedProcess:
     stdin = subprocess.PIPE if input is not None else None
+    if graceful_timeout:
+        kw.update(own_group_args())
     with subprocess.Popen(command, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kw) as proc:
         try:
             out, err = proc.communicate(input, timeout=timeout)
-        except BaseException:
-            with suppress(Exception):
-                kill_tree(proc.pid)
-            proc.kill()
+        except BaseException as error:
+            if graceful_timeout:
+                if isinstance(error, subprocess.TimeoutExpired):
+                    with suppress(ProcessLookupError):
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    with suppress(subprocess.TimeoutExpired):
+                        proc.wait(timeout=GIT_TERMINATE_GRACE_SECONDS)
+                with suppress(ProcessLookupError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+            else:
+                with suppress(Exception):
+                    kill_tree(proc.pid)
+                proc.kill()
             raise
     return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
 
@@ -196,9 +218,183 @@ def git(args: list[str], cwd: Path, timeout: float = 300, check: bool = True, in
     keeps = ("ssh-agent",) if git_command(args).partition(" ")[0] in NETWORK_GIT else ()
     call = sh_with_network if retry else sh
     res = call(["git", *args], cwd=cwd, timeout=timeout, input=input, env=env, keeps=keeps)
-    if check and res.returncode != 0:
-        raise RuntimeError(f"git {git_command(args)}: {git_error(res.stderr or res.stdout)}")
+    if check:
+        _check_git(args, res)
     return res.stdout
+
+
+def _check_git(args: list[str], res: subprocess.CompletedProcess) -> None:
+    if res.returncode != 0:
+        raise RuntimeError(f"git {git_command(args)}: {git_error(_s(res.stderr or res.stdout))}")
+
+
+def deploy_fast_forward(src: Path, tip: str) -> None:
+    args = ["--no-replace-objects", "merge", "-q", "--ff-only", "--no-autostash", "--no-overwrite-ignore", tip]
+    _check_git(args, _deploy_git(src, args, deploy=True))
+
+
+type _DeployEntry = tuple[bytes, bytes]
+type _DeployDiff = dict[bytes, tuple[_DeployEntry, _DeployEntry]]
+type _DeployStamp = tuple[bytes, tuple[int, ...]]
+_DEPLOY_ABSENT = (b"000000", b"")
+_DEPLOY_FILE_MODES = {b"000000", b"100644", b"100755"}
+
+
+@dataclass(frozen=True)
+class DeployRecovery:
+    head: str
+    changes: _DeployDiff
+    before: dict[bytes, _DeployEntry]
+
+
+def _deploy_read(src: Path, *args: str) -> bytes:
+    result = _deploy_git(src, ["--no-replace-objects", "--no-optional-locks", *args], timeout=10, binary=True)
+    _check_git(list(args), result)
+    return result.stdout
+
+
+def _deploy_diff(src: Path, *revisions: str) -> _DeployDiff:
+    raw = _deploy_read(src, "diff", "--raw", "-z", "--no-abbrev", "--no-renames", "--no-ext-diff", "--no-color",
+                       "--ignore-submodules=none", *revisions, "--")
+    changes = {}
+    records = iter(raw.split(b"\0")[:-1])
+    for header, name in zip(records, records, strict=True):
+        old_mode, new_mode, old_id, new_id, status = header[1:].split()
+        old = _DEPLOY_ABSENT if old_mode == b"000000" else (old_mode, old_id)
+        new = _DEPLOY_ABSENT if new_mode == b"000000" else (new_mode, new_id)
+        if status == b"U":
+            changes[name] = old, (b"U", b"")
+        else:
+            changes.setdefault(name, (old, new))
+    return changes
+
+
+def _deploy_stamp(src: Path, name: bytes) -> _DeployStamp | None:
+    file = src
+    parts = os.fsdecode(name).split("/")
+    try:
+        for part in parts[:-1]:
+            file /= part
+            if not stat.S_ISDIR(file.lstat().st_mode):
+                return None
+        info = (file / parts[-1]).lstat()
+    except FileNotFoundError:
+        return _DEPLOY_ABSENT[0], ()
+    except OSError:
+        return None
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        return None
+    mode = b"100755" if info.st_mode & stat.S_IXUSR else b"100644"
+    return mode, (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _deploy_worktree(src: Path, names: Iterable[bytes]) -> dict[bytes, tuple[_DeployEntry, _DeployStamp]]:
+    stamps = {name: stamp for name in names if (stamp := _deploy_stamp(src, name)) is not None}
+    files = [name for name, (mode, _) in stamps.items() if mode != _DEPLOY_ABSENT[0]]
+    hashes = _deploy_read(src, "hash-object", "--no-filters", "--", *map(os.fsdecode, files)).splitlines() if files else []
+    entries = {name: (mode, b"") for name, (mode, _) in stamps.items()}
+    entries.update((name, (stamps[name][0], oid)) for name, oid in zip(files, hashes, strict=True))
+    return {name: (entries[name], stamp) for name, stamp in stamps.items() if _deploy_stamp(src, name) == stamp}
+
+
+def _deploy_head(src: Path) -> tuple[str, str]:
+    head, *refs = _deploy_read(src, "rev-parse", "HEAD", "--symbolic-full-name", "HEAD").splitlines()
+    return head.decode("ascii"), os.fsdecode(refs[0]) if refs else ""
+
+
+def deploy_recovery(src: Path, base: str, tip: str) -> DeployRecovery:
+    head, ref = _deploy_head(src)
+    if ref != f"refs/heads/{base}":
+        raise RuntimeError("on another branch")
+    changes = _deploy_diff(src, head, tip)
+    staged = _deploy_diff(src, "--cached", head)
+    names = (name for name in changes if name not in staged and not _deploy_path_overlaps(name, staged))
+    before = {name: entry for name, (entry, _) in _deploy_worktree(src, names).items()}
+    return DeployRecovery(head, changes, before)
+
+
+def _check_deploy_checkout(src: Path, base: str, head: str, lock: Path) -> None:
+    if _deploy_head(src) != (head, f"refs/heads/{base}"):
+        raise RuntimeError("HEAD or branch changed during deploy")
+    if lock.exists(follow_symlinks=False):
+        raise RuntimeError("Git index is locked")
+
+
+def _deploy_path_overlaps(name: bytes, paths: Iterable[bytes]) -> bool:
+    return any(other.startswith(name + b"/") or name.startswith(other + b"/") for other in paths)
+
+
+def restore_deploy_paths(src: Path, base: str, recovery: DeployRecovery) -> tuple[bool, bool, int]:
+    head = recovery.head
+    index_path = _deploy_read(src, "rev-parse", "--path-format=absolute", "--git-path", "index")
+    index = Path(os.fsdecode(index_path.removesuffix(b"\n")))
+    index_name = os.fsencode(index.name)
+    lock = index.with_name(index.name + ".lock")
+    _check_deploy_checkout(src, base, head, lock)
+    index_stamp = _deploy_stamp(index.parent, index_name)
+    staged = _deploy_diff(src, "--cached", head)
+    worktree = _deploy_worktree(src, recovery.changes)
+    tracked, untracked = {}, {}
+    preserved = 0
+    for name, (old, new) in recovery.changes.items():
+        index_entry = staged.get(name, (old, old))[1]
+        current, stamp = worktree.get(name, (None, None))
+        before = recovery.before.get(name)
+        if current is not None and current == before and index_entry == old:
+            continue
+        if (old[0] not in _DEPLOY_FILE_MODES or new[0] not in _DEPLOY_FILE_MODES or before != old
+                or current not in (old, new) or index_entry not in (old, new)
+                or _deploy_path_overlaps(name, staged)):
+            preserved += 1
+            continue
+        candidates = untracked if old == index_entry == _DEPLOY_ABSENT else tracked
+        candidates[name] = stamp
+
+    if tracked or untracked:
+        _check_deploy_checkout(src, base, head, lock)
+        if index_stamp is None or _deploy_stamp(index.parent, index_name) != index_stamp:
+            raise RuntimeError("Git index changed during recovery")
+    tracked_names = [name for name, stamp in tracked.items() if _deploy_stamp(src, name) == stamp]
+    if tracked_names:
+        _restore_deploy_tracked(src, head, tracked_names)
+    if tracked_names and untracked:
+        staged = _deploy_diff(src, "--cached", head)
+        _check_deploy_checkout(src, base, head, lock)
+    untracked_names = [name for name, stamp in untracked.items()
+                       if name not in staged and not _deploy_path_overlaps(name, staged)
+                       and _deploy_stamp(src, name) == stamp]
+    if untracked_names:
+        _remove_deploy_additions(src, untracked_names)
+    preserved += len(tracked) + len(untracked) - len(tracked_names) - len(untracked_names)
+    return bool(tracked_names), bool(untracked_names), preserved
+
+
+def _deploy_engine_paths(src: Path, names: list[bytes]) -> tuple[Path, ...]:
+    root, engine = sandbox.real_path(src), sandbox.real_path(paths.PACKAGE_DIR)
+    paths_changed = (root / os.fsdecode(path) for path in names)
+    engine_paths = {path for path in paths_changed if path.is_relative_to(engine)}
+    missing = {parent for path in engine_paths for parent in path.parents
+               if parent.is_relative_to(engine) and not parent.exists()}
+    return tuple(sorted(engine_paths | missing))
+
+
+def _restore_deploy_tracked(src: Path, head: str, names: list[bytes]) -> None:
+    args = ["--no-replace-objects", "--literal-pathspecs", "restore", f"--source={head}", "--staged", "--worktree",
+            "--no-recurse-submodules", "--pathspec-from-file=-", "--pathspec-file-nul"]
+    _check_git(args, _deploy_git(src, args, input=b"\0".join(names) + b"\0", binary=True,
+                                restore_paths=_deploy_engine_paths(src, names)))
+
+
+def _remove_deploy_additions(src: Path, names: list[bytes]) -> None:
+    result = _sh(["/bin/rm", "-f", "--", *map(os.fsdecode, names)], cwd=src, timeout=10,
+                 restore_paths=_deploy_engine_paths(src, names))
+    if result.returncode != 0:
+        raise RuntimeError(f"removing tip additions: {git_error(result.stderr or result.stdout)}")
+
+
+def _deploy_git(src: Path, args: list[str], *, timeout: float = 30, **kwargs) -> subprocess.CompletedProcess:
+    return _sh(["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", *args],
+               cwd=src, timeout=timeout, graceful_timeout=True, **kwargs)
 
 
 NETWORK_GIT = frozenset({"fetch", "push", "pull", "clone", "ls-remote"})
