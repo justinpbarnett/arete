@@ -1,0 +1,9 @@
+[verify]
+url = ""
+feature_map = "feature-map.toml"
+
+[verify.journey_drivers]
+verifier-prompt-inputs = "prompt-inputs"
+
+[verify.drivers]
+prompt-inputs = "python3.13 -B docs/examples/product-verification/prompt_inputs.py"
