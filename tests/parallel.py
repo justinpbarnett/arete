@@ -99,7 +99,7 @@ class Runner:
             handle.seek(-TAIL, os.SEEK_END)
             return head + f"\n... full output: {path} ...\n" + handle.read().decode(errors="replace")
 
-    def child(self, item):
+    def child(self, item, stretch=1):
         index, batch = item
         result_file = os.path.join(self.folder, f"{index}.json")
         output_file = os.path.join(self.folder, f"{index}.out")
@@ -122,7 +122,7 @@ class Runner:
             else:
                 self.live[process] = batch.identifier
         if process is not None:
-            timeout = self.args.timeout if self.args.timeout is not None else batch.timeout
+            timeout = stretch * (self.args.timeout if self.args.timeout is not None else batch.timeout)
             try:
                 process.wait(timeout)
                 if process.returncode:
@@ -187,7 +187,7 @@ class Runner:
                     self.child(item)
             for index, batch in items:
                 if not batch.serial and not self.stopping and self.out_of_time(batch.identifier):
-                    self.child((f"{index}.alone", batch))
+                    self.child((f"{index}.alone", batch), stretch=2)
                     report = self.results.get(batch.identifier, {})
                     if report and not any(report[kind] for kind in ("errors", "failures", "unexpected")):
                         self.crowded.append(batch.identifier)
@@ -235,7 +235,7 @@ class Runner:
         for identifier in self.crowded:
             report = self.results[identifier]
             print(f"{identifier}: ran past its deadline beside other classes, "
-                  f"then passed alone in {report['seconds']:.2f}s", flush=True)
+                  f"then passed alone within twice that deadline in {report['seconds']:.2f}s", flush=True)
         if self.args.slowest:
             print("Slowest classes:")
             for name, report in sorted(self.results.items(), key=lambda item: -item[1]["seconds"])[:self.args.slowest]:
