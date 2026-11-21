@@ -1390,6 +1390,90 @@ class UnchangedHeadCIRetryTests(PublicationFixture):
         self.command.assert_not_called()
 
 
+class RedPublicationLifecycleTests(PublicationFixture):
+    def test_noop_refuses_red_ci_with_an_empty_restaged_diff(self):
+        self.record_pushed_head()
+        controller = self.controller
+        repo = config.Repo("fixture", self.root, parts=[config.Part("", self.checkout.github)])
+        self.publication_job(repo, "arete/7-edit-fixture", verified=verify.Verified("pass"), stamp=False)
+        controller.data["ci_failed"] = True
+        self.assertTrue(self.build.restage().empty)
+
+        action = {**self.action, "op": "run.finish", "request": {"reason": "noop"}}
+        with mock.patch.object(flows, "finish", return_value=("pr", "No change needed.", self.checkout.pr)) as finish:
+            with self.assertRaisesRegex(ValueError, r"retry CI through publication\.request, repair, or finish failed"):
+                controller.perform(action)
+
+        finish.assert_not_called()
+        self.assertIsNone(controller.ending)
+
+    def test_publication_retries_a_reported_red_after_a_polling_error(self):
+        controller, c = self.controller, self.checkout
+        self.file.write_text("implementation\n")
+        self.enterContext(mock.patch.object(controller, "fingerprint", return_value="fixture-tree"))
+        repo = config.Repo("fixture", self.root, parts=[config.Part("", c.github)])
+        self.publication_job(repo, "arete/7-edit-fixture", verified=verify.Verified("pass"))
+        controller.merge_lease = None
+        controller.stamp("verify", {"verdict": "pass"})
+        original_run = controller.flow.run
+
+        def run_step(name, args, kw):
+            if name == "pr":
+                self.record_pushed_head()
+                return factory.Outcome("pass", data={
+                    **controller.data["publication"], "prs": {c.github: c.pr}, "opened": [c.github],
+                    "pushed": [c.github], "changed": [c.github], "ci_stopped": [], "draft_why": "",
+                    "report_body": "", "summary": "Edit fixture", "committed_lines": 2,
+                })
+            return original_run(name, args, kw)
+
+        red = gh.Check("arete-checks", "fail", job=123, source=f"app:{gh.GITHUB_ACTIONS_APP_ID}")
+        base = replace(red, state="pass", job=122, updated="2026-11-21")
+        green = replace(red, state="pass", job=125)
+        rerun = gh.WorkflowRerun(456, 2, {red.name: red.job})
+
+        def watch(target, log, *, reruns=()):
+            if reruns:
+                self.assertEqual(reruns, [rerun])
+                launch.assert_called_once_with(c.github, rerun.run)
+                return ci.Watched(target, {green.key: green})
+            return ci.Watched(target, {red.key: red}, read=False)
+
+        controller.flow.run = run_step
+        self.enterContext(mock.patch.object(ci, "watch", side_effect=watch))
+        self.enterContext(mock.patch.object(gh, "branch_sha", return_value="base"))
+        self.enterContext(mock.patch.object(gh, "commit_checks", return_value={base.key: base}))
+        self.enterContext(mock.patch.object(gh, "pr_merge_details", side_effect=lambda _: {
+            "state": "OPEN", "headRefOid": c.lease, "baseRefName": c.base,
+        }))
+        self.enterContext(mock.patch.object(gh, "pr_draft_and_head", side_effect=lambda _: (True, c.lease)))
+        draft = self.enterContext(mock.patch.object(gh, "pr_set_draft"))
+        find_jobs = self.enterContext(mock.patch.object(gh, "failed_job_reruns", return_value=[rerun]))
+        launch = self.enterContext(mock.patch.object(gh, "rerun_failed_jobs"))
+        report = self.enterContext(mock.patch.object(pipeline, "publish_ci"))
+        self.enterContext(mock.patch.object(controller, "ci_failures", return_value="failed check logs"))
+        self.enterContext(mock.patch.object(pipeline, "release_workspace"))
+        self.enterContext(mock.patch.object(pipeline, "record_prs", side_effect=lambda *_: c.pr))
+
+        controller.dispatch(self.action)
+        first_result = self.transition.call_args.args[-1]
+        self.assertIn("CI needs an explicit worker diagnosis or repair", first_result["error"])
+        self.assertIn("passed on `main`", report.call_args.args[-1])
+        self.assertIsNone(controller.ending)
+        draft.assert_called_once_with(c.pr, True)
+        launch.assert_not_called()
+        head = c.lease
+
+        retry = {**self.action, "id": "d0002-0"}
+        self.assertIsNone(controller.dispatch(retry))
+        self.assertEqual(self.transition.call_args.args[:3], (controller.lease, retry["id"], "succeeded"))
+        find_jobs.assert_called_once_with(c.github, c.pr, head, [red.job])
+        self.assertEqual(draft.call_args_list, [mock.call(c.pr, True), mock.call(c.pr, False)])
+        self.assertEqual((controller.ending[0], controller.ending[2]), ("pr", c.pr))
+        self.assertNotIn("ci_failed", controller.data)
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+
+
 class SingleWorkerPublicationTests(PublicationFixture):
     def test_single_worker_repair_fails_required_gates_when_publication_is_refused(self):
         branch = "arete/7-edit-fixture"

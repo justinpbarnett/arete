@@ -640,19 +640,16 @@ class CliThroughServeCommandTests(_CliThroughServeCase):
             def reconnect(where, *args):
                 if not refused and any(status == 503 for _, _, status, _ in seen):
                     refused.append(True)
+                    dashboard.POSTS_IN_FLIGHT.reopen()
                     raise client.Down(client.address(where), "connection refused")
                 return connect(where, *args)
 
             dashboard.POSTS_IN_FLIGHT.close()
-            timer = threading.Timer(1, dashboard.POSTS_IN_FLIGHT.reopen)
-            timer.start()
             try:
                 with mock.patch.object(client, "connect", reconnect), mock.patch.object(client, "RETRY_SECONDS", .01):
                     code, lines, err = self.cli(f"approve {number}")
                 self.assertEqual(code, 0, (lines, err))
             finally:
-                timer.cancel()
-                timer.join()
                 dashboard.POSTS_IN_FLIGHT.reopen()
             send.assert_called_once()
             self.assertEqual(approvals_store.approval(number)["status"], "done")
