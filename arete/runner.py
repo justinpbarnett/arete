@@ -368,7 +368,8 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
                                    for s in routing.limit_scopes(a, picked.name)], set_before=started)
             return with_spent(res, limited)
         limit = res.usage_limit
-        why = f"{chosen_route.runner} {limit.kind or 'usage'} limit reached"
+        why = (f"{chosen_route.runner} model overloaded" if limit.kind == "overloaded"
+               else f"{chosen_route.runner} {limit.kind or 'usage'} limit reached")
         for a in picked.auths:
             devices_store.hold(accounts.scope(a, limit.scope, picked.unknown), limit.until, why)
         limited.append(res)
@@ -914,8 +915,9 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
             res.provider = res.provider or routing.provider_of(res.model)
             if which != REPLAY:
                 res.auth_mode = auth.mode
-                if res.usage_limit and (res.usage_limit.scope not in routing.limit_scopes(auth, name) or
-                                       res.usage_limit.billing != ("subscription" if auth.mode == "subscription" else "credit")):
+                if res.usage_limit and (
+                        res.usage_limit.scope not in routing.limit_scopes(auth, name) or
+                        res.usage_limit.billing != ("subscription" if auth.mode == "subscription" else "credit")):
                     res.usage_limit = None
             if res.calls:
                 for call in res.calls:
