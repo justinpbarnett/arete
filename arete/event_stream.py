@@ -60,6 +60,11 @@ def stream(handler, query, code):
             seq = top
             time.sleep(min(.25, max(0, timeout - (time.monotonic() - started))))
 
+    with handler.event_connection() as dropped:
+        return follow(handler, query, code, fmt, start, started, epoch, seq, selected, dropped)
+
+
+def follow(handler, query, code, fmt, start, started, epoch, seq, selected, dropped):
     with foundation.one_read() as c:
         instance = foundation.metadata(c)["instance_id"]
         head = events.metadata(c)["head"]
@@ -82,22 +87,26 @@ def stream(handler, query, code):
         try:
             if fmt == "sse":
                 write(b"retry: 2000\n\n")
-            while True:
+            while dropped is None or not dropped.is_set():
                 epoch, top, rows, reason, meta = events.scan(c, epoch, seq, selected)
                 if reason:
                     message("reset", {"kind": "reset", "reason": reason})
                     return
                 for row in rows:
-                    message(row["kind"], events.envelope(c, row, epoch), f"{epoch}.{row['seq']}")
+                    position = f"{epoch}.{row['seq']}"
+                    message(row["kind"], events.envelope(c, row, epoch), position)
                     if time.monotonic() >= beat:
                         message("serve.beat", {**control.serve_beat(), "kind": "serve.beat", "code": code,
-                                               "head": meta["head"]}, f"{epoch}.{seq if seq is not None else top}")
+                                               "head": meta["head"]}, position)
                         beat = time.monotonic() + 15
                 seq = top
-                if fmt != "json" and time.monotonic() >= beat:
+                if time.monotonic() >= beat:
                     message("serve.beat", {**control.serve_beat(), "kind": "serve.beat", "code": code,
                                            "head": meta["head"]}, f"{epoch}.{seq}")
                     beat = time.monotonic() + 15
-                time.sleep(0.25)
+                if dropped is None:
+                    time.sleep(0.25)
+                else:
+                    dropped.wait(0.25)
         except (OSError, TimeoutError):
             return

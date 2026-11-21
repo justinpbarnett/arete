@@ -376,6 +376,54 @@ class JourneyVerificationTests(unittest.TestCase):
         self.enterContext(mock.patch.object(verify.scratch, "spawn", return_value=process))
         self.enterContext(mock.patch.object(util, "stop_group"))
 
+    def test_tailnet_scratch_serve_discovers_faults_without_sending_the_credential(self):
+        root = Path(self.enterContext(TemporaryDirectory())).resolve()
+        (root / "config.toml").write_text('[verify]\nstart = "fixture --port {port}"\n'
+                                         'url = "http://scratch.example.test:{port}"\nready = "/ui.html"\n')
+        self.run.repo.layer = root
+        self.work.layer = pipeline.resolve_layer(self.work.cfg, self.run, self.work.ws)
+        self.run.dir = root
+        self.scratch.return_value.root = str(root / ".arete-scratch-0123456789abcdef")
+        self.run.agent.return_value.structured["checks"] = [
+            {"what": "Inspect the fixture", "how": "Open the app", "saw": "The fixture opened", "passed": True},
+        ]
+        credential = "arete-placeholder-" + "0123456789abcdef" * 3
+        challenge = "a" * 48
+        reach = "http://127.0.0.1:4343"
+        process = mock.Mock(stdout=[f"start trace: {credential}\n".encode()])
+        proof = verify.verify_faults.discovery_proof(credential.encode(), challenge)
+        response = mock.Mock(status=404, getheader=mock.Mock(return_value=proof))
+        with (
+            mock.patch.multiple(verify.browser, free_port=mock.Mock(return_value=4242), app_port=mock.Mock(),
+                                listen_port=mock.Mock(), update_browser=mock.Mock()),
+            mock.patch.object(verify.scratch, "service_command", side_effect=lambda _, command, port: [command]),
+            mock.patch.object(verify.scratch, "spawn", return_value=process) as spawn,
+            mock.patch.object(verify.secrets, "token_hex", side_effect=["0123456789abcdef" * 3, challenge]),
+            mock.patch.object(verify.environment, "started", return_value=({verify.verify_faults.ENV: "inherited"}, {})),
+            mock.patch.object(verify, "wait_until_ready") as ready,
+            mock.patch.object(verify, "relayed", return_value=nullcontext(reach)) as relayed,
+            mock.patch.object(verify.http.client, "HTTPConnection") as connect,
+            mock.patch.object(util, "stop_group"),
+            mock.patch.object(verify.os, "killpg", side_effect=ProcessLookupError),
+        ):
+            connect.return_value.getresponse.return_value = response
+            result = self.verify()
+
+        self.assertEqual(result.verdict, "pass")
+        self.assertEqual(spawn.call_args.args, (["fixture --port 4242"],))
+        env = spawn.call_args.kwargs["env"]
+        self.assertEqual(env[paths.SCRATCH_ENV], self.scratch.return_value.root)
+        self.assertEqual(env[verify.verify_faults.ENV], credential)
+        relayed.assert_called_once_with("http://scratch.example.test:4242")
+        self.assertEqual(ready.call_args.args[1], "http://scratch.example.test:4242/ui.html")
+        connect.assert_called_once_with("127.0.0.1", 4343, timeout=2)
+        connect.return_value.request.assert_called_once_with(
+            "HEAD", verify.verify_faults.FAULT, headers={verify.verify_faults.CHALLENGE_HEADER: challenge})
+        self.assertIn(verify.verify_faults.FAULT, self.run.agent.call_args.args[1])
+        self.assertIn("no approved curl transport", self.run.agent.call_args.args[1])
+        self.assertNotIn(credential, repr(self.run.mock_calls))
+        self.assertEqual((root / "verify-server.log").read_text(), f"start trace: {verify.vault.REDACTED}\n")
+
     def test_passing_driver_cannot_supply_missing_verifier_checks(self):
         self.ticket.body = "Also inspect the catalog."
         self.work.layer.trust_level = "automerge"

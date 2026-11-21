@@ -1,11 +1,12 @@
 import base64
 import json
+import os
 import sqlite3
 import subprocess
 import tempfile
 import threading
 import unittest
-from contextlib import ExitStack, redirect_stderr
+from contextlib import ExitStack, closing, contextmanager, redirect_stderr
 from http.client import HTTPConnection, HTTPResponse
 from io import BytesIO, StringIO
 from pathlib import Path
@@ -14,13 +15,14 @@ from types import SimpleNamespace
 from unittest import mock
 
 from arete import (
-    accounts, api_check, api_http, chat, config, contract, control, dashboard, events, gh, idempotency, jira, pipeline, principals,
-    screening, serve, tailnet, tasks, triage, util,
+    accounts, api_check, api_http, chat, config, contract, control, dashboard, event_stream, events, gh, idempotency,
+    jira, paths, pipeline, principals, screening, serve, tailnet, tasks, triage, util, verify,
 )
 from arete.store import approvals as approvals_store
 from arete.store import chats as chats_store
 from arete.store import db
 from arete.store import idempotency as claims
+from arete.store import runs as run_store
 from arete.store import triage as triage_store
 from tests import support, versioned_api_fixture
 
@@ -45,6 +47,186 @@ class DashboardSnapshotTests(unittest.TestCase):
             capture_output=True, text=True, timeout=8, check=False,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class VerifyFaultTests(unittest.TestCase):
+    token = "arete-placeholder-fault-test"
+    controls = (("POST", "/api/_verify/fault"), ("POST", "/api/_verify/streams/drop"),
+                ("POST", "/api/_verify/event"), ("DELETE", "/api/_verify/faults"))
+
+    def setUp(self):
+        self.login = "fixture@example.test"
+        self.actor = principals.seed_owner(self.login)
+
+    @contextmanager
+    def server(self, token, *, isolated=True):
+        with mock.patch.dict(os.environ), mock.patch.object(paths, "ISOLATED", isolated):
+            if token is None:
+                os.environ.pop("ARETE_VERIFY_FAULTS", None)
+            else:
+                os.environ["ARETE_VERIFY_FAULTS"] = token
+            handlers = dashboard.handlers()
+        address = "127.0.0.1"
+        node = SimpleNamespace(names={address})
+        logins = SimpleNamespace(of=lambda _: self.login)
+        with tailnet.Server(address, 0, node, logins, not isolated, handlers.open, handlers.redirect) as server:
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": .01})
+            thread.start()
+            try:
+                yield server.server_port
+            finally:
+                server.shutdown()
+                thread.join()
+
+    def request(self, port, method, path, *, token=None, body=None, headers=()):
+        headers = dict(headers)
+        if token is not None:
+            headers["X-Arete-Verify-Faults"] = token
+        if body is not None:
+            body = json.dumps(body)
+            headers["Content-Type"] = "application/json"
+        if method == "POST":
+            headers["X-Arete"] = "1"
+        with closing(HTTPConnection("127.0.0.1", port, timeout=3)) as client:
+            client.request(method, path, body, headers)
+            with client.getresponse() as result:
+                return result.status, json.load(result)
+
+    def armed(self, port, route, count):
+        return self.request(port, "POST", "/api/_verify/fault", token=self.token,
+                            body={"route": route, "status": 404, "body": {"fault": "armed"}, "count": count})
+
+    def initial_cursor(self, port):
+        status, data = self.request(port, "GET", "/api/v1/events?timeout=0", headers={"Accept": "application/json"})
+        self.assertEqual(status, 200)
+        return data["next"]
+
+    @contextmanager
+    def stream(self, port, cursor):
+        with closing(HTTPConnection("127.0.0.1", port, timeout=3)) as client:
+            client.request("GET", "/api/v1/events", headers={"Last-Event-ID": cursor, "Accept": "text/event-stream"})
+            with client.getresponse() as result:
+                self.assertEqual(result.status, 200)
+                self.assertEqual(result.readline(), b"retry: 2000\n")
+                self.assertEqual(result.readline(), b"\n")
+                yield result
+
+    def read_event(self, stream):
+        position = stream.readline().removeprefix(b"id: ").strip().decode()
+        data = json.loads(stream.readline().removeprefix(b"data: "))
+        self.assertEqual(stream.readline(), b"\n")
+        self.assertEqual(position, data["id"])
+        return data
+
+    def test_control_routes_are_off_without_opt_in_and_on_live_serve(self):
+        for token, isolated in ((None, True), (self.token, False)):
+            with self.subTest(isolated=isolated), self.server(token, isolated=isolated) as port:
+                for method, path in self.controls:
+                    with self.subTest(path=path):
+                        self.assertEqual(self.request(port, method, path, token=self.token)[0], 404)
+                self.assertEqual(verify.fault_note(f"http://127.0.0.1:{port}", self.token), "")
+
+    def test_every_control_rejects_missing_or_wrong_token(self):
+        with self.server(self.token) as port:
+            for method, path in self.controls:
+                for supplied in (None, "another-attempt"):
+                    with self.subTest(path=path, token=supplied):
+                        self.assertEqual(self.request(port, method, path, token=supplied)[0], 404)
+
+    def test_relayed_fault_discovery_requires_this_attempts_proof(self):
+        faults = verify.verify_faults
+        with (self.server(self.token) as port, verify.relayed(f"http://127.0.0.1:{port}") as reach,
+              mock.patch.object(faults.Controls, "prove", autospec=True, side_effect=faults.Controls.prove) as prove):
+            note = verify.fault_note(reach, self.token)
+            for _, path in self.controls:
+                self.assertIn(path, note)
+            self.assertEqual(verify.fault_note(reach, "another-attempt"), "")
+
+        first, second = (call.args[1] for call in prove.call_args_list)
+        self.assertNotIn(faults.HEADER, first)
+        self.assertNotIn(faults.HEADER, second)
+        self.assertNotEqual(first[faults.CHALLENGE_HEADER], second[faults.CHALLENGE_HEADER])
+
+    def test_armed_response_is_consumed_twice_then_normal_dispatch_resumes(self):
+        with self.server(self.token) as port:
+            for route, normal_status in (("/api/v1/screen/board", 404), ("/api/v1/screen?view=live", 200)):
+                with self.subTest(route=route):
+                    before = self.request(port, "GET", route)
+                    self.assertEqual(before[0], normal_status)
+                    self.assertEqual(self.armed(port, route, count=2), (200, {"ok": True}))
+                    for _ in range(2):
+                        self.assertEqual(self.request(port, "GET", route), (404, {"fault": "armed"}))
+                    self.assertEqual(self.request(port, "GET", route), before)
+                    self.assertEqual(self.armed(port, route, count=2)[0], 200)
+                    self.assertEqual(self.request(port, "DELETE", "/api/_verify/faults", token=self.token)[0], 200)
+                    self.assertEqual(self.request(port, "GET", route), before)
+            note = verify.fault_note(f"http://127.0.0.1:{port}", self.token)
+            for _, path in self.controls:
+                self.assertIn(path, note)
+
+    def start_run(self, run):
+        with principals.acting(self.actor):
+            run_store.insert_run(run, {"kind": "pipeline", "started": util.iso(), "status": "running"})
+
+    def test_drop_closes_open_streams_and_reconnect_resumes_after_last_event(self):
+        with self.server(self.token) as port:
+            cursor = self.initial_cursor(port)
+            with self.stream(port, cursor) as first, self.stream(port, cursor) as second:
+                self.start_run("fault-drop-first")
+                last = self.read_event(first)["id"]
+                self.assertEqual(self.read_event(second)["id"], last)
+                self.assertEqual(self.request(port, "POST", "/api/_verify/streams/drop", token=self.token)[0], 200)
+                self.assertEqual(first.read(), b"")
+                self.assertEqual(second.read(), b"")
+            status, polled = self.request(port, "GET", "/api/v1/events?timeout=0",
+                                          headers={"Accept": "application/json", "Last-Event-ID": last})
+            self.assertEqual((status, polled), (200, {"events": [], "next": last, "reset": None}))
+            with self.stream(port, last) as reconnected:
+                self.start_run("fault-drop-second")
+                self.assertEqual(self.read_event(reconnected)["subject"], "run:fault-drop-second")
+
+    def test_drop_after_heartbeat_reconnects_from_the_last_received_id(self):
+        clock = mock.Mock()
+        clock.monotonic.return_value = 0
+        envelope = events.envelope
+
+        def make_beat_due(conn, row, epoch):
+            data = envelope(conn, row, epoch)
+            if data["subject"] == "run:fault-before-beat":
+                clock.monotonic.return_value = 15
+            return data
+
+        with (mock.patch.object(event_stream, "time", clock),
+              mock.patch.object(events, "envelope", side_effect=make_beat_due), self.server(self.token) as port):
+            with self.stream(port, self.initial_cursor(port)) as stream:
+                self.start_run("fault-before-beat")
+                before_beat = self.read_event(stream)
+                last = stream.readline().removeprefix(b"id: ").strip().decode()
+                self.assertEqual(stream.readline(), b"event: serve.beat\n")
+                self.assertEqual(json.loads(stream.readline().removeprefix(b"data: "))["kind"], "serve.beat")
+                self.assertEqual(stream.readline(), b"\n")
+                self.assertEqual(self.request(port, "POST", "/api/_verify/streams/drop", token=self.token)[0], 200)
+                self.assertEqual(stream.read(), b"")
+            with self.stream(port, last) as reconnected:
+                self.start_run("fault-after-beat")
+                self.assertEqual(self.read_event(reconnected)["subject"], "run:fault-after-beat")
+            self.assertEqual(last, before_beat["id"])
+
+    def test_run_ended_is_delivered_through_the_real_event_log(self):
+        run = "fault-event-run"
+        self.start_run(run)
+        with self.server(self.token) as port, self.stream(port, self.initial_cursor(port)) as stream:
+            with principals.acting(self.actor):
+                settled = run_store.settle(run, {"status": "failed", "finished": util.iso()})
+            real = self.read_event(stream)
+            self.assertEqual(real["kind"], "run.ended")
+            self.assertEqual(self.request(port, "POST", "/api/_verify/event", token=self.token,
+                                          body={"kind": "run.ended", "run": run})[0], 200)
+            synthetic = self.read_event(stream)
+            self.assertGreater(synthetic["seq"], real["seq"])
+            for field in real.keys() - {"seq", "at", "id", "via"}:
+                self.assertEqual(synthetic[field], real[field], field)
+            self.assertEqual(run_store.run_get(run), settled)
 
 
 class ApiCheckTests(unittest.TestCase):

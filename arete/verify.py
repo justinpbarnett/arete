@@ -1,22 +1,24 @@
 from __future__ import annotations
 
+import hmac
 import http.client
 import json
 import os
 import re
+import secrets
 import stat
 import subprocess
 import threading
 import time
 import urllib.error
 import urllib.request
-from contextlib import contextmanager, nullcontext
+from contextlib import closing, contextmanager, nullcontext
 from dataclasses import dataclass, field, fields, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import SplitResult, urlsplit
 
-from . import browser, config, environment, paths, sandbox, scratch, util, vault
+from . import browser, config, environment, paths, sandbox, scratch, util, vault, verify_faults
 from .util import git
 
 PLAYWRIGHT_TOOLS = tuple("browser_" + n for n in (
@@ -268,11 +270,11 @@ def relayed(url: str):
 @contextmanager
 def serving(v: config.Verify, cwd: Path, log: Path, cfg: config.Config | None = None,
             repo: config.Repo | None = None, lifetime: dict | None = None,
-            attempt: scratch.Attempt | None = None):
+            attempt: scratch.Attempt | None = None, *, enable_faults: bool = False):
     if lifetime is not None:
         lifetime["stopped"] = True
     if not v.start:
-        yield ""
+        yield "", ""
         return
     url = v.url.rstrip("/")
     with relayed(url) if attempt and not browser.loopback(url) else nullcontext(url) as reach:
@@ -283,21 +285,31 @@ def serving(v: config.Verify, cwd: Path, log: Path, cfg: config.Config | None = 
             browser.update_browser(attempt, listen=listen)
         command = scratch.service_command(attempt, v.start, listen) if attempt else v.start
         env, kept = environment.started(cfg or config.load(), repo)
+        env.pop(verify_faults.ENV, None)
+        fault_token = ""
         if attempt:
             env = {k: v for k, v in env.items() if not paths.CREDENTIAL_NAME.search(k) or kept.get(k) == v}
             env.update(scratch.attempt_env(attempt))
+            if enable_faults:
+                fault_token = "arete-placeholder-" + secrets.token_hex(24)
+                env[verify_faults.ENV] = fault_token
         log.write_text("")
         with scratch.producing(attempt):
             proc = scratch.spawn(command, shell=isinstance(command, str), cwd=cwd, stdout=subprocess.PIPE,
                                  stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env,
                                  actor_confined=bool(attempt), **util.own_group_args())
-        pump = threading.Thread(target=write_hidden, args=(proc, log, set(kept.values())), daemon=True)
+        hidden = set(kept.values()) | ({fault_token} if fault_token else set())
+        pump = threading.Thread(target=write_hidden, args=(proc, log, hidden), daemon=True)
         pump.start()
         if lifetime is not None:
             lifetime["stopped"] = False
         try:
             wait_until_ready(proc, url + "/" + v.ready.lstrip("/"), v.ready_seconds, log)
-            yield reach
+            fault_controls = fault_note(reach, fault_token) if fault_token else ""
+            if fault_token and not fault_controls and reach != url:
+                fault_controls = ("\n\nThe app relay did not return valid fault discovery proof from this attempt's "
+                                  "isolated scratch service. Report checks that require fault controls as blocked.")
+            yield reach, fault_controls
         finally:
             util.stop_group(proc)
             pump.join(util.GROUP_STOP_SECONDS)
@@ -308,6 +320,35 @@ def serving(v: config.Verify, cwd: Path, log: Path, cfg: config.Config | None = 
                     lifetime["stopped"] = True
                 except PermissionError:
                     pass
+
+
+def fault_note(url: str, token: str) -> str:
+    if not browser.loopback(url):
+        return ""
+    target = urlsplit(url)
+    connect = http.client.HTTPSConnection if target.scheme == "https" else http.client.HTTPConnection
+    challenge = secrets.token_hex(24)
+    expected = verify_faults.discovery_proof(token.encode(), challenge).encode()
+    try:
+        with closing(connect(target.hostname, target.port, timeout=2)) as connection:
+            connection.request("HEAD", verify_faults.FAULT, headers={verify_faults.CHALLENGE_HEADER: challenge})
+            response = connection.getresponse()
+            proof = response.getheader(verify_faults.PROOF_HEADER, "").encode()
+            if response.status != 404 or not hmac.compare_digest(expected, proof):
+                return ""
+    except (OSError, ValueError, http.client.HTTPException):
+        return ""
+    return ("\n\n## Scratch fault controls\n\n"
+            "This scratch app offers the routes below. The attempt credential stays with the service and controller. "
+            "The verifier has no approved curl transport that can reach this app and supply the credential. "
+            "If a required check needs you to arm a fault, report it as blocked for that reason. "
+            "Observe the app with person-level browser tools. Existing rules prohibit page scripts and direct store writes.\n\n"
+            f"- `POST {verify_faults.FAULT}` with `route`, `status`, `body` and `count` replaces the next "
+            "`count` responses on that path. Include a query string in `route` to match that query only.\n"
+            f"- `POST {verify_faults.DROP}` closes the current event streams. New streams open as usual.\n"
+            f"- `POST {verify_faults.EVENT}` with `kind` and `run` emits an event for an existing scratch "
+            "run without changing the run.\n"
+            f"- `DELETE {verify_faults.CLEAR}` clears armed responses.")
 
 
 def wait_until_ready(proc: subprocess.Popen, url: str, seconds: int, log: Path) -> None:
