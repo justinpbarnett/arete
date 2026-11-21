@@ -517,7 +517,7 @@ def call(method: str, path: str, body: dict | None = None, key: str | None = Non
     try:
         response = request(method, path, body, key=key, where=where, buffered=True, deadline=deadline)
     except Failed as e:
-        if not path.startswith("/api/v1/") or not unknown_route(e):
+        if not path.startswith("/api/v1/") or not unknown_route(e, method, path):
             raise
         if legacy := legacy_route(method, path):
             return legacy_answer(method, path, legacy, body, key, where, deadline)
@@ -526,14 +526,18 @@ def call(method: str, path: str, body: dict | None = None, key: str | None = Non
     return decoded(response, method, path)
 
 
-def unknown_route(error: Failed) -> bool:
+def unknown_route(error: Failed, method: str, path: str) -> bool:
     if error.code != 404:
         return False
     answer = error.answer
-    return reason(answer) == "unknown_route" or (
-        answer.get("type") == "urn:arete:problem:not_found"
-        and answer.get("code") == "not_found"
-        and answer.get("detail") == answer.get("error") == "No such route."
+    return (
+        reason(answer) == "unknown_route"
+        or answer == {"error": f"Nothing at {method} {urlsplit(path).path}."}
+        or (
+            answer.get("type") == "urn:arete:problem:not_found"
+            and answer.get("code") == "not_found"
+            and answer.get("detail") == answer.get("error") == "No such route."
+        )
     )
 
 

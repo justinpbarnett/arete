@@ -1135,6 +1135,53 @@ class CliThroughServeRunTests(_CliThroughServeCase):
                     if retry:
                         self.assertEqual(seen[len(prefix) + 1][2], current_requests[len(prefix)][2])
 
+    def test_api_1_0_missing_v1_routes(self):
+        self.in_subprocess("check_api_1_0_missing_v1_routes")
+
+    def check_api_1_0_missing_v1_routes(self):
+        seen = []
+        stop = "/api/v1/runs/r1/stop"
+        steer = "/api/v1/runs/r1/steer"
+        legacy_stop = "/api/runs/r1/stop"
+        key = "api-1-0"
+        stopped = {"id": "r1", "stopped": True, "pid": 123}
+        status, failure = 404, None
+
+        def response(request):
+            path = request.path
+            if request.command == "GET" and path == "/api/meta":
+                return 200, {"instance": {"id": "api-1-0"}}, {}
+            if request.command == "GET" and path == "/api/runs/r1":
+                return 200, {"run": {"version": 7}}, {}
+            seen.append((request.command, path, request.headers.get("Idempotency-Key")))
+            if path.startswith("/api/v1/"):
+                return status, failure or {"error": f"Nothing at {request.command} {path}."}, {"Arete-API": "1.0"}
+            if path == legacy_stop:
+                return 200, stopped, {"Arete-Seq": "1.9"}
+            return 500, {"error": f"Unexpected request to {path}."}, {}
+
+        with self.stub(response), mock.patch.dict(os.environ, {"ARETE_IDEMPOTENCY_KEY": key}):
+            code, lines, err = self.cli("stop r1")
+            self.assertEqual((code, len(lines), err), (0, 1, ""), lines)
+            self.assertEqual(json.loads(lines[0]), stopped)
+            self.assertEqual(seen, [("POST", stop, key), ("POST", legacy_stop, key)])
+
+            seen.clear()
+            code, lines, err = self.cli("session send r1 hello")
+            self.assertEqual((code, len(lines), err), (1, 1, ""), lines)
+            self.assertEqual(json.loads(lines[0])["error"],
+                             f"POST {steer} requires Arete serve API version 1.2 or newer")
+            self.assertEqual(seen, [("POST", steer, key)])
+
+            for status, message in ((404, "No such run."), (404, f"Nothing at GET {stop}."),
+                                    (404, f"Nothing at POST {steer}."), (409, f"Nothing at POST {stop}."),
+                                    (422, f"Nothing at POST {stop}."), (503, f"Nothing at POST {stop}.")):
+                with self.subTest(status=status, message=message):
+                    failure = {"error": message}
+                    seen.clear()
+                    self.assertEqual(self.problem("stop r1", status)["error"], message)
+                    self.assertEqual(seen, [("POST", stop, key)])
+
     def test_v1_failures_without_a_legacy_retry(self):
         self.in_subprocess("check_v1_failures_without_a_legacy_retry")
 
