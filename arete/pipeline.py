@@ -16,7 +16,7 @@ import sys
 import time
 from collections import Counter
 from collections.abc import Callable, Iterator
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from pathlib import Path
@@ -453,6 +453,7 @@ class CatchUpGateHold(workspace.RunFailed):
         super().__init__(why)
         self.gate, self.head, self.report = gate, head, report
         self.verified, self.review = verified, review
+        self.candidate_restored = False
 
 
 class CatchUpPushUnconfirmed(workspace.RunFailed):
@@ -2627,6 +2628,82 @@ def catch_up_target(b: Build, c: workspace.Checkout, slot: slots.RunSlot) -> tup
     return base_sha, ""
 
 
+def catch_up_existing_paths(wt: Path) -> tuple[set[Path], set[Path]]:
+    existing, unreadable = set(), set()
+
+    def preserve_unreadable(error: OSError) -> None:
+        unreadable.add(Path(error.filename).relative_to(wt))
+
+    for folder, dirs, files in wt.walk(on_error=preserve_unreadable):
+        relative = folder.relative_to(wt)
+        existing.update(relative / name for name in dirs + files)
+        if ".git" in dirs:
+            dirs.remove(".git")
+    return existing, unreadable
+
+
+def log_catch_up_failure(run: AgentRun, action: str, error: BaseException) -> None:
+    reason = util.first_line(str(error), 300) or type(error).__name__
+    line = public_text(run, f"automerge: catch-up {action}: {reason}")
+    with suppress(OSError, UnicodeError):
+        run.log(line.encode("ascii", "backslashreplace").decode("ascii"))
+
+
+def catch_up_spelling_index(paths: set[Path]) -> dict[Path, list[Path]]:
+    spellings: dict[Path, list[Path]] = {}
+    for path in paths:
+        spellings.setdefault(scratch.folded(path), []).append(path)
+    return spellings
+
+
+def catch_up_path_alias(root: int, path: Path, spellings: dict[Path, list[Path]]) -> bool:
+    prior_paths = spellings.get(scratch.folded(path))
+    if not prior_paths:
+        return False
+    with local_paths.directory_fd(path.parent, root) as parent:
+        directory = os.fstat(parent)
+        current = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+        for prior in prior_paths:
+            with suppress(FileNotFoundError, NotADirectoryError):
+                with local_paths.directory_fd(prior.parent, root) as prior_parent:
+                    if not os.path.samestat(directory, os.fstat(prior_parent)):
+                        continue
+                previous = os.stat(prior.name, dir_fd=parent, follow_symlinks=False)
+                if not os.path.samestat(current, previous):
+                    continue
+                if (path.name == prior.name or stat.S_ISDIR(current.st_mode) or current.st_nlink == 1
+                        or not {path.name, prior.name}.issubset(os.listdir(parent))):
+                    return True
+    return False
+
+
+def remove_catch_up_paths(run: AgentRun, wt: Path, after: set[str], existing: set[Path],
+                          unreadable: set[Path]) -> None:
+    existing_spellings = catch_up_spelling_index(existing)
+    unreadable_spellings = catch_up_spelling_index(unreadable)
+    with local_paths.directory_fd(wt) as root:
+        for name in sorted(after):
+            path = Path(name)
+            if path in existing or not unreadable.isdisjoint(path.parents):
+                continue
+            try:
+                if not path.parts or path.is_absolute() or ".." in path.parts:
+                    raise PermissionError("path is not inside the worktree")
+                if catch_up_path_alias(root, path, existing_spellings) or (unreadable_spellings and any(
+                        catch_up_path_alias(root, parent, unreadable_spellings) for parent in path.parents)):
+                    continue
+                with local_paths.directory_fd(path.parent, root) as parent:
+                    mode = os.stat(path.name, dir_fd=parent, follow_symlinks=False).st_mode
+                    if not stat.S_ISLNK(mode) and (name.endswith("/") or stat.S_ISDIR(mode)):
+                        shutil.rmtree(path.name, dir_fd=parent)
+                    else:
+                        os.unlink(path.name, dir_fd=parent)
+            except FileNotFoundError:
+                continue
+            except Exception as failed:
+                log_catch_up_failure(run, f"cleanup could not remove {name!r}", failed)
+
+
 def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
                   goal: str, plan: str, prior_review: Review, *,
                   before_push: Callable[[str, verify.Verified, Review], None] | None = None) -> tuple[verify.Verified, Review]:
@@ -2638,7 +2715,8 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
         raise workspace.RunFailed("the published tree lacks a current approving review")
     before = replace(c)
     checked, report, staged = b.checked, b.report, b.staged
-    worktree_files = workspace.untracked_files(c.wt) | workspace.ignored_file_paths(c.wt)
+    wt = c.wt.resolve()
+    existing, unreadable = catch_up_existing_paths(wt)
     blocked = run.owner_questions_blocked
     run.owner_questions_blocked = True
     try:
@@ -2665,19 +2743,27 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
         if before_push is not None:
             before_push(head, verified, review)
     except BaseException as error:
-        retained = isinstance(error, CatchUpGateHold)
+        log_catch_up_failure(run, "failed", error)
+        gate_hold = error if isinstance(error, CatchUpGateHold) else None
         if isinstance(error, CatchUpPathCollision):
-            worktree_files.add(error.name)
+            existing.add(Path(error.name))
             run.catch_up_preserved.add(c.prefix + error.name)
-        abort_merge(c.wt)
-        restore_head = error.head if retained else before.lease
-        if (git(["rev-parse", "HEAD"], c.wt).strip() != restore_head
-                or workspace.uncommitted(c.wt, tracked_only=True)):
-            git(["reset", "--hard", restore_head], c.wt)
-        after = workspace.untracked_files(c.wt) | workspace.ignored_file_paths(c.wt)
-        for name in after - worktree_files:
-            (c.wt / name).unlink(missing_ok=True)
-        if not retained:
+        try:
+            abort_merge(c.wt)
+            restore_head = gate_hold.head if gate_hold else before.lease
+            if (git(["rev-parse", "HEAD"], c.wt).strip() != restore_head
+                    or workspace.uncommitted(c.wt, tracked_only=True)):
+                git(["reset", "--hard", restore_head], c.wt)
+            if gate_hold:
+                gate_hold.candidate_restored = True
+        except Exception as failed:
+            log_catch_up_failure(run, "cleanup could not restore the worktree head", failed)
+        try:
+            after = workspace.untracked_files(c.wt) | workspace.ignored_file_paths(c.wt)
+            remove_catch_up_paths(run, wt, after, existing, unreadable)
+        except Exception as failed:
+            log_catch_up_failure(run, f"cleanup could not clean {str(wt)!r}", failed)
+        if not gate_hold:
             c.__dict__.update(vars(before))
             b.checked, b.report, b.staged = checked, report, staged
         if isinstance(error, owner_asks.Asked):
