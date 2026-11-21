@@ -38,4 +38,5 @@ Do not invent a plan document or run the full check gate unless your delegated g
 Arete runs the required independent checks before publication.
 Change at most $max_lines lines and leave all Git writes to Arete.
 These shell commands are available: $commands.
+Before you read, grep or cat a path, confirm it exists with ls or rg --files. Do not guess file names from memory or reuse a path you saw elsewhere.
 Report what you actually observed, what changed, remaining risks and any question the owner must answer.
