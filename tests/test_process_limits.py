@@ -104,6 +104,102 @@ class Isolated(unittest.TestCase):
         return run
 
 
+class CatchUpWorkspaceRecordTests(Isolated):
+    branch = "arete/fixture"
+    build_files = (".venv/pyvenv.cfg", "__pycache__/app.pyc")
+
+    def setUp(self):
+        super().setUp()
+        self.ws = paths.WORKTREES_DIR / f"{self.repo.name}-{self.ticket}"
+        self.layer = config.RepoLayer(self.repo.layer_dir, branch=self.branch, base_branch="main", verify=config.Verify())
+        for patcher in (patch.object(config, "load", return_value=self.cfg),
+                        patch.object(config, "load_layer", return_value=self.layer),
+                        patch.object(sandbox, "AUTHORITY", self.root / "authority")):
+            self.patches.enter_context(patcher)
+        src = self.repo.path
+        util.git(["init", "-q", "-b", "main"], src)
+        util.git(["remote", "add", "origin", str(src)], src)
+        (src / ".gitignore").write_text(".venv/\n__pycache__/\nlocal.txt\n")
+        util.git(["add", ".gitignore"], src)
+        util.git_as_owner(["commit", "-qm", "Initial base"], src)
+        util.add_worktree(src, self.ws, self.branch, "main")
+        (self.ws / "feature.txt").write_text("Branch change\n")
+        util.git(["add", "feature.txt"], self.ws)
+        util.git_as_owner(["commit", "-qm", "Branch change"], self.ws)
+        self.head = util.git(["rev-parse", "HEAD"], self.ws).strip()
+        self.checkout = workspace.Checkout("", self.repo.name, src, self.ws, "main", lease=self.head, onto=self.head)
+        for name in self.build_files:
+            path = self.ws / name
+            path.parent.mkdir()
+            path.write_text("Build output\n")
+
+    def run_ticket(self, drive):
+        status = pipeline.run_issue(self.repo.name, self.ticket, force=True, script=pipeline.Script("adw", drive))
+        return status, run_store.newest_whole_run(self.repo.name, self.ticket)
+
+    def fail_catch_up(self, incoming, why):
+        src = self.repo.path
+        (src / incoming).write_text("Base change\n")
+        util.git(["add", "-f", incoming], src)
+        util.git_as_owner(["commit", "-qm", "Move the base"], src)
+        workspace.fetch(src, "main")
+        base = util.git(["rev-parse", "origin/main"], self.ws).strip()
+
+        def drive(flow):
+            run = flow.ctx.run
+            run.workspace = self.ws, [self.checkout]
+            build = pipeline.Build(self.cfg, run, self.local.get(self.ticket), self.ws, [self.checkout], self.layer,
+                                   5, "Fixture worktree", tools=[], deny=[])
+            pipeline.catch_up_base(build, self.checkout, self.branch, base, "", "", before_push=self.unexpected_push)
+
+        status, row = self.run_ticket(drive)
+        self.assertEqual((status, row["summary"]), (1, why))
+        self.assertEqual(util.git(["rev-parse", "HEAD"], self.ws).strip(), self.head)
+        made = workspace.made_before(self.ws)
+        for name in self.build_files:
+            self.assertIn(f"{Path(name).parent}/", made)
+            self.assertEqual((self.ws / name).read_text(), "Build output\n")
+        return made
+
+    def unexpected_push(self, *_):
+        self.fail("A failed catch-up reached the push")
+
+    def retry(self):
+        def drive(flow):
+            prepared = flows.step(flow, "prepare", tree=str(self.ws))
+            return flows.ended(flow, flows.step(flow, "plan") if prepared.passed else prepared)
+
+        with patch.object(pipeline.Run, "agent", return_value=Result(ok=False, error="Stop at the first worker")) as agent:
+            status, row = self.run_ticket(drive)
+        self.assertEqual(status, 1, row["summary"])
+        return row["summary"], [call.args[0] for call in agent.call_args_list]
+
+    def test_review_hold_records_build_files_and_retry_starts_planning(self):
+        def verified(build, *_):
+            tree = util.git(["rev-parse", "HEAD^{tree}"], build.ws).strip()
+            return pipeline.verify.Verified("pass", checks=[{"passed": True}], native_trees={"": tree})
+
+        with (patch.object(pipeline.Build, "check", return_value=True),
+              patch.object(pipeline, "check_in_use", side_effect=verified),
+              patch.object(pipeline, "_review", return_value=pipeline.Review("request_changes"))):
+            self.fail_catch_up("incoming.txt", "the published tree lacks a current approving review")
+
+        self.assertEqual(self.retry(), ("planning step failed", ["plan"]))
+
+    def test_collision_leaves_the_path_off_record_and_retry_refuses_it(self):
+        collision = self.ws / "local.txt"
+        collision.write_text("Keep this file\n")
+
+        made = self.fail_catch_up(collision.name, "the merge would overwrite ignored file `local.txt`")
+
+        self.assertNotIn(collision.name, made)
+        self.assertEqual(self.retry(), (
+            f"the existing worktree {self.ws} of {self.repo.name} holds git-ignored files that arete has no record of "
+            "leaving there (local.txt), so arete did not make it again and left them as they are; "
+            "move or remove them, then run again", []))
+        self.assertEqual(collision.read_text(), "Keep this file\n")
+
+
 class ReviewRetryTests(Isolated):
     PR = "https://github.com/example/fixture/pull/1"
     BLOCKER = {"file": "notes.txt", "problem": "fixture blocker", "severity": "blocker", "category": "issue"}

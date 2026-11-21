@@ -1073,7 +1073,9 @@ class Build(TicketWork):
         return self.staged
 
     def require_valid_diff(self, after: str, planned: str = "", *, from_base: bool | None = None) -> None:
-        staged = self.restage(from_base=from_base)
+        self.validate_diff(self.restage(from_base=from_base), after, planned, from_base=from_base)
+
+    def validate_diff(self, staged: Staged, after: str, planned: str = "", *, from_base: bool | None = None) -> None:
         if staged.empty:
             raise workspace.RunFailed(f"{after} undid every change")
         whole_diff = self.from_base if from_base is None else from_base
@@ -2316,7 +2318,7 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
     except BaseException as error:
         if isinstance(error, CatchUpPathCollision):
             worktree_files.add(error.name)
-        run.catch_up_preserved.update(c.prefix + name for name in worktree_files)
+            run.catch_up_preserved.add(c.prefix + error.name)
         abort_merge(c.wt)
         if (git(["rev-parse", "HEAD"], c.wt).strip() != before.lease
                 or workspace.uncommitted(c.wt, tracked_only=True)):
@@ -2348,7 +2350,8 @@ def push_caught_up_head(b: Build, c: workspace.Checkout, branch: str, head: str)
             row = {}
         remote = row.get("headRefOid")
         if remote == head:
-            c.lease, c.onto = head, ""
+            c.note_pushed_head(head)
+            c.onto = ""
             return
         if remote and (hold := gh.merge_ref_hold(row, c.lease, c.base)):
             raise CatchUpPushUnconfirmed(f"{why}: {hold}", f"{detail} GitHub reports `{remote}`.", retryable=False)
@@ -2568,7 +2571,7 @@ def commit_and_push(checkouts: list[workspace.Checkout], changed: list[workspace
             aftermath = ("The pilot will not retry the push." if before_push
                          else "A retry builds on whatever reached the branch.")
             raise workspace.RunFailed(f"the push to {c.github} failed after arete pushed {done}", f"{e}\n\n{aftermath}") from e
-        c.lease = head or git(["rev-parse", "HEAD"], c.wt).strip()
+        c.note_pushed_head(head or git(["rev-parse", "HEAD"], c.wt).strip())
         c.onto = ""
         pushed.append(c)
 
@@ -2918,9 +2921,11 @@ def merge_moved_bases(run: AgentRun, checkouts: list[workspace.Checkout], layer:
         if environment_retry and (not c.base_commit or
                                   git(["merge-base", c.base_commit, base], c.wt).strip() != c.base_commit):
             raise workspace.RunFailed(f"the base for {c.github} no longer contains the saved base")
-        c.base_commit = base
-        if git(["rev-list", "--count", f"HEAD..{c.base_commit}"], c.wt).strip() == "0":
+        if git(["rev-list", "--count", f"HEAD..{base}"], c.wt).strip() == "0":
+            if not pending_merge(c):
+                c.base_commit = base
             continue
+        c.base_commit = base
         if edits := workspace.uncommitted(c.wt, tracked_only=allow_untracked):
             raise workspace.RunFailed(f"{c.github} has uncommitted edits ({', '.join(edits[:5])}), so arete merged nothing into "
                             "them and left them as they are")
