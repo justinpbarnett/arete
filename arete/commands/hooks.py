@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import sys
 from collections import Counter
-from pathlib import Path
 
 from .. import config, paths
 from ..store import incidents as incident_store
@@ -144,7 +143,7 @@ def cmd_guard(args) -> int:
 
     scratch.HOOK.update(root=args.scratch, id=args.scratch_id, saves=args.scratch_saves)
     guard.LOGIN_FOLDERS = (*guard.LOGIN_FOLDERS, *(paths.expand(path) for path in getattr(args, "closed", ())))
-    return guard.main(args.judge, args.open, skill_plugin=Path(args.skill_plugin) if args.skill_plugin else None)
+    return guard.main(args.judge, args.open)
 
 
 def cmd_upload_guard(args) -> int:
@@ -211,7 +210,6 @@ def register(sub) -> None:
     p.add_argument("--judge", action="store_true")
     p.add_argument("--open", action="append", default=[])
     p.add_argument("--closed", action="append", default=[], help="add a protected grading-context folder")
-    p.add_argument("--skill-plugin", default="", help="allow reads of bundled files in the eval's skill directory")
     scratch_hook(p)
     p.set_defaults(fn=cmd_guard)
 

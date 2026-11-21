@@ -35,10 +35,16 @@ from .verify import Verified
 
 CI_FAILURES = "ci:failures"
 MAX_CI_FAILURE_CHARS = 24000
+CATCH_UP_FAILURE = "catch-up:failure"
+MAX_CATCH_UP_FEEDBACK_CHARS = 12000
 STATE_FIELDS = ("plan_text", "goal", "estimate", "left_for_a_person", "build_summary", "reviews", "fix_reply",
                 "document", "report_body", "draft_why", "summary", "opened", "found", "pushed", "drafted",
                 "ci_stopped", "changed", "ci_result", "committed")
 REFRESHABLE_LINEAGE = {"catalog_sha", "controller_prompt", "operations_sha"}
+
+
+class UnchangedPushedHead(ValueError):
+    pass
 
 
 def policy_fingerprint(cfg, layer, closed_context):
@@ -80,6 +86,7 @@ class Controller:
         if self.job.built:
             self.data["checked"] = self.job.b.checked
             self.data["report"] = self.job.b.report
+            self.data["catch_ups"] = self.job.b.catch_ups
         ledger.save(self.lease, self.data)
 
     def atomic(self, name, **kw):
@@ -119,6 +126,7 @@ class Controller:
         self.write_lineage_event()
         if self.flow.refusal:
             raise factory.Refused(self.flow.refusal)
+        pending_push = ledger.catch_up_push(self.data)
         if self.run.feedback and (closed := [url for url in self.run.feedback_prs if gh.pr_view(url).get("state") != "OPEN"]):
             self.quiescent()
             return "noop", f"the PR closed before arete could revise it: {', '.join(closed)}", ""
@@ -144,7 +152,9 @@ class Controller:
                 if ledger.publication_pending(self.run.id) or not any(
                         a["op"] == "publication.request" and a["state"] == "succeeded" for a in ledger.actions(self.lease)):
                     raise factory.Refused("the missing workspace has no settled publication; reconcile before resuming")
-            if self.run.environment_release:
+            if pending_push:
+                self.job.prepared(prepared, stored=True, reconciling_catch_up=True)
+            elif self.run.environment_release:
                 flows.restore_environment_draft(self.job, prepared)
             else:
                 if missing:
@@ -158,8 +168,14 @@ class Controller:
             self.job.verified = Verified.stored(self.data.get("verified", {}))
             self.job.b.checked = self.data.get("checked", {})
             self.job.b.report = self.data.get("report", "")
+            self.job.b.catch_ups = self.data.get("catch_ups", 0)
             self.job.b.from_base = True
             self.job.b.plan_text, self.job.b.build_summary = self.job.plan_text, self.job.build_summary
+            if pending_push:
+                self.catalog.refresh_context()
+                self.quiescent()
+                self.publish()
+                return self.ending
         else:
             self.quiescent()
             if self.run.environment_release:
@@ -194,8 +210,8 @@ class Controller:
             if self.job.left_for_a_person or self.run.feedback or self.run.repairs or self.flow.continues:
                 raise factory.Refused("ZTE does not inherit owner work or previous attempts")
         self.data.setdefault("goal_base", self.job.goal)
-        known = {(f.get("pr_url"), f.get("kind"), f.get("gh_id")) for f in self.data.get("feedback", [])}
-        fresh = [f for f in self.run.feedback if (f.get("pr_url"), f.get("kind"), f.get("gh_id")) not in known]
+        known = {pipeline.feedback_key(f) for f in self.data.get("feedback", [])}
+        fresh = [f for f in self.run.feedback if pipeline.feedback_key(f) not in known]
         if fresh:
             self.data.setdefault("feedback", []).extend(fresh)
             feedback = pipeline.feedback_markdown(fresh)
@@ -278,8 +294,11 @@ class Controller:
         self.quiescent()
         for turn in ledger.pending(self.lease):
             ledger.reject(self.lease, turn["id"], "interrupted controller turn; admitted usage may be unknown")
+        catch_up = self.data.get("catch_up_hold", {})
         for action in ledger.actions(self.lease):
             result = action["result"]
+            if action["id"] == catch_up.get("action"):
+                self.data["evidence"] = {}
             if action["op"] == "owner.ask" and result.get("awaiting_owner"):
                 answers = [ask_store.ask_get(ask) for ask in result["ask_ids"]]
                 if not answers or any(not answer or answer["status"] not in ("answered", "taken") for answer in answers):
@@ -316,6 +335,8 @@ class Controller:
             self.catalog.add_context(f"evidence:{gate}", ledger.encoded(value))
         if self.data.get("ci_failures"):
             self.catalog.add_context(CI_FAILURES, self.data["ci_failures"])
+        if catch_up:
+            self.catalog.add_context(CATCH_UP_FAILURE, catch_up["feedback"])
         for action in ledger.actions(self.lease):
             run_lines.write(self.run.id, "action", action=action["id"], op=action["op"], state=action["state"],
                             recovered=True, source=action["run"])
@@ -425,18 +446,23 @@ class Controller:
                 writing or any(worker.writing for worker in self.workers.values()))):
             raise ValueError("worker or workspace mutation lease is busy; wait before starting this delegation")
         role = setting.step
-        if writing and (self.data.get("writes", 0) or self.run.repairs):
+        catch_up = self.data.get("catch_up_hold", {})
+        if writing and (self.data.get("writes", 0) or self.run.repairs or catch_up):
             role = ("ci_repair" if self.data.get("ci_failed") else "review_repair"
-                    if self.job.review.verdict == "request_changes" else "check_repair")
+                    if catch_up.get("gate") == "review" or self.job.review.verdict == "request_changes"
+                    else "check_repair")
             setting = pipeline.steps.resolve(self.job.cfg, self.job.layer, role, self.run.kind,
                                              {"runner": setting.runner, "model": setting.model,
                                               "provider": setting.provider, "effort": setting.effort})
         tools = tuple(tool for tool in BUNDLES[args["tool_bundle"]] if tool in setting.tools)
         if writing and not {"Write", "Edit"} & set(tools):
             raise ValueError("this role grants no implementation writing tools")
-        contexts = "\n\n".join(self.catalog.read(ref, 0, 8000)["text"] for ref in args["context_refs"] if ref != CI_FAILURES)
+        contexts = "\n\n".join(self.catalog.read(ref, 0, 8000)["text"] for ref in args["context_refs"]
+                               if ref != CI_FAILURES and not (ref == CATCH_UP_FAILURE and writing and catch_up))
         if self.data.get("ci_failures") and (self.data.get("ci_failed") or CI_FAILURES in args["context_refs"]):
             contexts = "\n\n".join(filter(None, (contexts, self.data["ci_failures"][:MAX_CI_FAILURE_CHARS])))
+        if writing and catch_up:
+            contexts = "\n\n".join(filter(None, (contexts, catch_up["feedback"])))
         if prior:
             contexts += "\n\nPrevious worker result:\n" + prior["result"].get("text", "")[:8000]
         goal = args["goal"]
@@ -565,8 +591,39 @@ class Controller:
         finally:
             self.run.resolved_settings = previous
 
+    def validate_publication_diff(self):
+        b = self.job.b
+        staged = b.restage()
+        checkouts = self.job.checkouts
+        after = "the final orchestrated tree"
+        if any(c.lease for c in checkouts):
+            bases = {
+                c.github: (c.base_commit if c in staged.merged
+                           else util.git(["merge-base", c.origin_base, "HEAD"], c.wt).strip())
+                for c in checkouts
+            }
+            if not any(util.git(["diff", "--cached", "--name-only", bases[c.github]], c.wt) for c in checkouts):
+                raise workspace.RunFailed(f"{after} undid every change")
+            heads = {c.github: head for c in checkouts if (head := c.publication_baseline)}
+            if not staged.merged and heads and not any(
+                util.git(["diff", "--cached", "--name-only", heads.get(c.github, bases[c.github])], c.wt)
+                for c in checkouts
+            ):
+                if (self.run.environment_release and not self.data.get("ci_failed")
+                        and flows.retry_passed(self.job.verified) and any(c.pr and c.github in heads for c in checkouts)):
+                    whole = staged if b.from_base else b.restage(from_base=True)
+                    return b.validate_diff(whole, after, from_base=True)
+                label = "head" if len(heads) == 1 else "heads"
+                shas = ", ".join(f"`{head}`" for head in heads.values())
+                raise UnchangedPushedHead(f"nothing changed since the pushed {label} {shas}")
+        b.validate_diff(staged, after)
+
     def publish(self):
         self.barrier()
+        if pending := ledger.catch_up_push(self.data):
+            return self.reconcile_catch_up(pending)
+        if self.data.get("publication_intent"):
+            raise factory.Refused("publication was interrupted; reconcile its branch/PR effects before resuming")
         needed = [gate for gate in ("checks", "review", "verify") if not self.current(gate)]
         if needed:
             raise ValueError("publication needs current evidence: " + ", ".join(needed))
@@ -574,7 +631,10 @@ class Controller:
             raise ValueError("publication requires the full owner check policy")
         if self.job.verified.verdict == "fail":
             raise ValueError("behavioral verification failed; repair or finish failed")
-        self.job.b.require_valid_diff("the final orchestrated tree")
+        catch_up = self.data.get("catch_up_hold")
+        if catch_up and (not flows.retry_passed(self.job.verified) or not self.job.review.approved()):
+            raise ValueError("publication after a catch-up hold requires passing verification and an approving review")
+        self.validate_publication_diff()
         if self.run.dry_run:
             self.ending = flows.end_dry_run(self.flow)
             return {"status": "dry-run"}
@@ -592,33 +652,222 @@ class Controller:
         self.data.pop("publication_intent", None)
         self.data["publication"] = outcome.data
         self.persist()
-        if self.run.repo.parts:
-            self.job.slot.free()
-            try:
-                with self.run.waiting("ci"):
-                    current = pipeline.ci.Round(1, [pipeline.ci.compare_with_base(
-                        pipeline.ci.watch(pipeline.ci_target(c), self.run.log), self.run.log)
-                        for c in self.job.picked(self.job.changed)])
-            finally:
-                self.job.slot.take(self.run.log, self.run.waiting)
-            self.job.ci_result = current.summary()
-            self.check_pilot_publication()
-            pipeline.publish_ci(self.run, self.job.ticket, self.job.with_prs, pipeline.ci.section([current], 1))
-            if current.reds or not current.all_read:
-                self.data["ci_failed"] = True
-                self.data["ci_failures"] = self.ci_failures(current)
-                self.catalog.add_context(CI_FAILURES, self.data["ci_failures"])
-                for checkout in self.job.with_prs:
-                    self.check_pilot_publication()
-                    pipeline.set_draft(self.run, checkout, True)
-                return {"ci": self.job.ci_result, "failures": CI_FAILURES,
-                        "error": f"CI needs an explicit worker diagnosis or repair; its failure logs are context {CI_FAILURES}"}
+        if catch_up:
+            for checkout in self.job.picked(self.job.changed):
+                pipeline.publish_gate_evidence(self.run, self.job.ticket, checkout, self.job.verified, self.job.review)
+        if self.run.repo.parts and (failure := self.publication_ci(self.job.picked(self.job.changed))):
+            return self.settle_publication_failure(failure)
+        return self.finish_publication()
+
+    def publication_ci(self, pushed, *, caught_up=False):
+        self.job.slot.free()
+        try:
+            with self.run.waiting("ci"):
+                current = pipeline.ci.Round(1, [pipeline.ci.compare_with_base(
+                    pipeline.ci.watch(pipeline.ci_target(c), self.run.log), self.run.log) for c in pushed])
+        finally:
+            self.job.slot.take(self.run.log, self.run.waiting)
+        self.job.ci_result = current.summary()
+        self.check_pilot_publication()
+        section = pipeline.ci.section([current], 1)
+        if caught_up:
+            for checkout in pushed:
+                pipeline.comment_catch_up_ci(self.run, checkout, section, self.job.verified, self.job.review)
+        else:
+            pipeline.publish_ci(self.run, self.job.ticket, self.job.with_prs, section)
+        if not current.reds and current.all_read:
             self.data.pop("ci_failed", None)
             self.data.pop("ci_failures", None)
+            self.catalog.context.pop(CI_FAILURES, None)
+            return None
+        self.data["ci_failed"] = True
+        self.data["ci_failures"] = self.ci_failures(current)
+        self.catalog.add_context(CI_FAILURES, self.data["ci_failures"])
+        for checkout in self.job.with_prs:
+            self.check_pilot_publication()
+            pipeline.set_draft(self.run, checkout, True)
+        return {"ci": self.job.ci_result, "failures": CI_FAILURES,
+                "error": f"CI needs an explicit worker diagnosis or repair; its failure logs are context {CI_FAILURES}"}
+
+    def automerge(self, candidates):
+        job = self.job
+        if not candidates or not pipeline.automerge_allowed(job.b, job.approval, job.draft_why):
+            if self.data.get("catch_up_hold"):
+                return {"park": True, "error": "the repaired PR is no longer eligible for automerge"}
+            return None
+        about = pipeline.automerge_about(job.ticket, job.build_summary)
+        track_base = not pilot.is_pilot_task(str(self.run.tid))
+        for checkout in candidates:
+            while True:
+                hold = pipeline.try_automerge(job.b, checkout, job.verified, job.review, about,
+                                              track_moved_base=track_base)
+                if hold is None:
+                    self.clear_catch_up_hold()
+                    return None
+                if isinstance(hold, gh.MovedBaseHold):
+                    hold = self.catch_up(checkout)
+                    if isinstance(hold, dict):
+                        return hold
+                    if not hold:
+                        if failure := self.publication_ci([checkout], caught_up=True):
+                            return failure
+                        continue
+                elif hold and self.data.get("catch_up_hold"):
+                    return {"park": True, "error": hold}
+                pipeline.report_automerge(self.run, checkout, hold)
+                self.clear_catch_up_hold()
+                break
+        return None
+
+    def catch_up(self, checkout):
+        job, b = self.job, self.job.b
+        base_sha = ""
+
+        def remember_push(head, verified, review):
+            self.data["publication_intent"]["catch_up"] = {
+                "action": self.executing,
+                "pr": checkout.pr, "previous": checkout.lease, "head": head, "base": base_sha,
+                "verified": asdict(verified), "review": review.asdict(),
+            }
+            try:
+                self.persist()
+            except BaseException:
+                self.data["publication_intent"].pop("catch_up", None)
+                raise
+
+        try:
+            row = gh.pr_merge_details(checkout.pr)
+            if hold := gh.merge_ref_hold(row, checkout.lease, checkout.base):
+                return self.catch_up_failure(hold)
+            base_sha = row.get("baseRefOid")
+            base_sha = pipeline.fetch_merge_base(checkout) or base_sha
+            if not base_sha:
+                return self.catch_up_failure("GitHub did not report the current base commit")
+            if b.catch_ups >= pipeline.AUTOMERGE_CATCH_UPS:
+                return self.catch_up_failure(f"the base `{checkout.base}` moved to `{base_sha}` after {b.catch_ups} catch-ups")
+            b.catch_ups += 1
+            job.verified, job.review = pipeline.catch_up_base(
+                b, checkout, job.branch, base_sha, job.with_left(job.goal), job.with_left(job.plan_text),
+                before_push=remember_push)
+        except pipeline.CatchUpGateHold as error:
+            return self.hold_catch_up(checkout, base_sha, error)
+        except pipeline.CatchUpPushUnconfirmed:
+            raise
+        except (workspace.RunFailed, RuntimeError, OSError) as e:
+            reason = e.why if isinstance(e, workspace.RunFailed) else util.first_line(str(e), 300)
+            base = f"`{checkout.base}` at `{base_sha}`" if base_sha else f"`{checkout.base}`"
+            failure = f"could not catch up to {base}: {pipeline.public_text(self.run, reason)}"
+            if isinstance(e, (pipeline.ConflictUnresolved, pipeline.CatchUpPathCollision, pipeline.CatchUpNeedsInput)):
+                return failure
+            return self.catch_up_failure(failure)
+        self.note_caught_up(checkout)
+        return ""
+
+    def catch_up_failure(self, reason):
+        return {"park": True, "error": reason} if self.data.get("catch_up_hold") else reason
+
+    def hold_catch_up(self, checkout, base_sha, hold):
+        reason = pipeline.public_text(
+            self.run, f"Catch-up to `{checkout.base}` at `{base_sha}` held on {hold.gate}: {hold.why}")
+        attempted = f"{reason}. Checked candidate `{hold.head}` and kept it in the worktree for repair."
+        evidence = [attempted]
+        if hold.gate == "checks":
+            evidence.append(util.tail(hold.report, MAX_CATCH_UP_FEEDBACK_CHARS))
+        if hold.verified is not None:
+            evidence.append(hold.verified.markdown())
+        if hold.review is not None:
+            evidence.append(hold.review.markdown())
+        feedback = "\n\n".join(evidence)
+        self.data["catch_up_hold"] = {"action": self.executing, "gate": hold.gate, "reason": reason,
+                                      "feedback": feedback}
+        for gate in self.data.get("evidence", {}):
+            self.catalog.context.pop(f"evidence:{gate}", None)
+        self.data["evidence"] = {}
+        self.catalog.add_context(CATCH_UP_FAILURE, feedback)
+        self.persist()
+        if pipeline.own_draft_state(self.run, checkout) is not None:
+            pipeline.publish_gate_evidence(self.run, self.job.ticket, checkout, hold.verified, hold.review, held=attempted)
+        return {"failures": CATCH_UP_FAILURE,
+                "error": f"{reason}. Delegate a repair using {CATCH_UP_FAILURE}, then rerun the publication gates."}
+
+    def clear_catch_up_hold(self):
+        self.data.pop("catch_up_hold", None)
+        self.catalog.context.pop(CATCH_UP_FAILURE, None)
+
+    def park_catch_up(self, reason):
+        held = self.data["catch_up_hold"]["reason"]
+        for checkout in self.job.with_prs:
+            if pipeline.own_draft_state(self.run, checkout) is False:
+                pipeline.set_draft(self.run, checkout, True, "automerge")
+        self.run.say(f"{held}. I parked the run because {reason}.")
+        return pipeline.park_run(self.run, f"{held}. {reason}")
+
+    def settle_publication_failure(self, failure):
+        if self.data.get("catch_up_hold"):
+            if failure.get("park"):
+                self.ending = self.park_catch_up(failure["error"])
+            elif self.run.budget and (limit := self.run.budget.repair_limit_reason()):
+                reason = f"Publication CI held: {failure['ci']}. {limit}" if failure.get("ci") else limit
+                self.ending = self.park_catch_up(reason)
+        return failure
+
+    def reconcile_catch_up(self, pending):
+        job = self.job
+        self.executing = pending["action"]
+        actions = ledger.actions(self.lease)
+        action = next((a for a in actions if a["id"] == self.executing), None)
+        if (not action or action["op"] != "publication.request"
+                or action["state"] not in ("running", "reconciliation-required")):
+            raise factory.Refused("the catch-up push has no interrupted publication action")
+        if len(job.checkouts) != 1:
+            raise factory.Refused("the catch-up push does not match the retained checkout")
+        checkout = job.checkouts[0]
+        head = pending["head"]
+        if (checkout.pr != pending["pr"] or checkout.lease != pending["previous"] or checkout.merge != head
+                or checkout.base_commit != pending["base"]
+                or self.data["publication"]["heads"].get(checkout.github) != checkout.lease
+                or util.git(["rev-parse", "HEAD"], checkout.wt).strip() != head or workspace.uncommitted(checkout.wt)):
+            raise factory.Refused("the catch-up push does not match the retained checkout")
+        verified, review = Verified.stored(pending["verified"]), pipeline.Review.stored(pending["review"])
+        if hold := pipeline.merge_evidence_hold(job.b, checkout, verified, review, head):
+            raise factory.Refused(f"cannot reconcile the catch-up push: {hold}")
+        self.check_pilot_publication()
+        pipeline.note_prs(self.run, job.branch, job.with_prs)
+        pipeline.push_caught_up_head(job.b, checkout, job.branch, head)
+        job.verified, job.review = verified, review
+        self.note_caught_up(checkout)
+        if failure := self.publication_ci([checkout], caught_up=True):
+            for prior in actions:
+                if prior["state"] == "accepted" and prior["op"] == "owner.ask":
+                    ledger.transition(self.lease, prior["id"], "cancelled",
+                                      {"reason": "the run resumed an interrupted catch-up push"}, expected=("accepted",))
+            self.data.pop("publication_intent", None)
+            self.persist()
+            result = self.settle_publication_failure(failure)
+        else:
+            result = self.finish_publication()
+        ledger.transition(self.lease, self.executing, "failed" if "error" in result else "succeeded", result,
+                          expected=(action["state"],))
+        return result
+
+    def note_caught_up(self, checkout):
+        job, b = self.job, self.job.b
+        self.data["publication"]["heads"][checkout.github] = checkout.lease
+        pipeline.note_review(self.run, job.review, job.verified)
+        self.run.log(f"automerge: pushed catch-up {b.catch_ups} to {checkout.pr} at {checkout.lease}")
+        self.stamp("checks", {"full": True, "checked": b.checked, "report": b.report})
+        self.stamp("verify", asdict(job.verified))
+        self.stamp("review", job.review.asdict())
+
+        self.data["publication_intent"].pop("catch_up", None)
+        self.persist()
+        pipeline.publish_gate_evidence(self.run, job.ticket, checkout, job.verified, job.review)
+
+    def finish_publication(self):
         self.check_pilot_publication()
         self.data["publication_intent"] = {"tree": self.fingerprint(), "phase": "publish"}
         self.persist()
-        outcome = self.atomic("publish")
+        outcome = self.atomic("publish", merge=self.automerge)
         self.data.pop("publication_intent", None)
         if outcome.passed:
             self.data["published"], self.data["published_tree"] = outcome.data, self.fingerprint()
@@ -626,6 +875,8 @@ class Controller:
             self.data.pop("published", None)
             self.data.pop("published_tree", None)
         self.persist()
+        if self.data.get("catch_up_hold") or self.data.get("ci_failed"):
+            return self.settle_publication_failure(outcome.data)
         self.ending = flows.ended(self.flow, outcome)
         return outcome.data
 
@@ -741,22 +992,28 @@ class Controller:
                     raise ValueError("delivery has no successful current engine publication")
                 self.ending = (published["ending"], published.get("summary", ""),
                                " ".join(c.pr for c in self.job.with_prs))
+            elif self.data.get("catch_up_hold"):
+                self.ending = self.park_catch_up("the orchestrator stopped without delivery")
             elif args["reason"] == "noop":
                 if not self.job.b.restage().empty:
                     raise ValueError("noop cannot discard an implementation diff")
                 self.ending = flows.finish(self.flow, "nothing", summary=self.job.build_summary or "No change needed.")
+            elif (self.run.budget and (reason := self.run.budget.repair_limit_reason())
+                  and not zte.reserved(str(self.run.tid))):
+                self.ending = pipeline.park_run(self.run, reason)
             else:
                 self.ending = flows.finish(self.flow, "failed", why="the orchestrator stopped without delivery",
                                            recovery=self.failure_recovery())
             return {"reason": args["reason"]}
         raise ValueError("unknown orchestration operation")
 
-    def dispatch(self, action):
+    def dispatch(self, action) -> ValueError | None:
         if action["state"] != "accepted":
             return
         if action["op"] != "worker.start" and action["op"] != "worker.continue":
             ledger.transition(self.lease, action["id"], "running", {"input_stamp": {
                 "tree": self.fingerprint(), "policy": self.policy_sha(), "acceptance": self.data["acceptance"]}})
+        refusal = None
         try:
             self.executing = action["id"]
             result = self.perform(action)
@@ -767,6 +1024,7 @@ class Controller:
             run_lines.write(self.run.id, "action", action=action["id"], op=action["op"], state="succeeded")
             raise
         except ValueError as error:
+            refusal = error
             result = {"error": str(error)[:2000]}
             ledger.transition(self.lease, action["id"], "failed", result)
         except BaseException as error:
@@ -788,6 +1046,7 @@ class Controller:
         self.persist()
         run_lines.write(self.run.id, "action", action=action["id"], op=action["op"],
                         state="running" if result is None else "failed" if "error" in result else "succeeded")
+        return refusal
 
     def drive(self):
         verification_passed = False
@@ -837,6 +1096,10 @@ class Controller:
                     if self.ending:
                         break
             return self.ending
+        except runlimits.Parked as error:
+            if self.data.get("catch_up_hold"):
+                return self.park_catch_up(str(error))
+            raise
         except ledger.Conflict as error:
             raise runlimits.Parked(str(error)) from error
         finally:
@@ -896,7 +1159,8 @@ def single_worker(flow):
                 while controller.workers:
                     controller.collect()
                     time.sleep(0.05)
-                if any(a["state"] in ("failed", "interrupted") for a in ledger.actions(controller.lease)):
+                failed = [a["id"] for a in ledger.actions(controller.lease) if a["state"] in ("failed", "interrupted")]
+                if failed:
                     return flows.finish(flow, "failed", why="single-worker execution did not pass its required gates",
                                         recovery=controller.failure_recovery())
                 if controller.ending:

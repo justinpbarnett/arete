@@ -133,10 +133,14 @@ class Catalog:
         for name, tools in BUNDLES.items():
             key = f"tools:{name}"
             self.entries[key] = {"id": key, "kind": "tools", "tools": list(tools)}
-        self.context = {"task": f"{job.ticket.title}\n\n{job.ticket.body}\n\n{job.ticket.comments or ''}",
-                        "expertise": job.expertise, "attachments": job.attachments,
-                        "feedback": "\n".join(job.run.story)}
+        self.context = {}
+        self.refresh_context()
         self.fingerprint = digest(self.entries)
+
+    def refresh_context(self) -> None:
+        job = self.job
+        self.context.update(task=f"{job.ticket.title}\n\n{job.ticket.body}\n\n{job.ticket.comments or ''}",
+                            expertise=job.expertise, attachments=job.attachments, feedback="\n".join(job.run.story))
 
     def add_context(self, name: str, text: str) -> None:
         self.context[name] = text

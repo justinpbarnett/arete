@@ -140,6 +140,11 @@ def descriptors(passed):
 
 
 if __name__ == "__main__":
+    if os.environ.get("ARETE_TEST_STACK_PREFIX"):
+        import runpy
+
+        with suppress(OSError):
+            runpy.run_path(os.path.join(os.path.dirname(__file__), "_test_stacks.py"))["arm"]()
     mode, *args = sys.argv[1:]
     if mode == "monitor":
         group, gate, status, passed, *command = args

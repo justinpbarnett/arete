@@ -615,15 +615,21 @@ def judge_prompts(cfg: config.Config, run_id: str, repo: config.Repo, pr: MinerP
     if not jev.ready(cfg, [repo]):
         return None, "JEV was unavailable."
     state = {"reported failure and rationale": pr.body}
+    subject = "prompt change"
     for name in names:
+        if name.startswith(("skills/", ".claude/skills/")):
+            subject = "prompt or skill change"
+            state[name] = git(["diff", "--no-ext-diff", "--no-textconv", pr.base_sha, pr.head, "--",
+                               f":(literal){name}"], repo.path)
+            continue
         f = f"{evals.ARETE_PROMPTS}/{name}"
         state[name] = {arm: git(["show", f"{sha}:{f}"], repo.path)
                        for arm, sha in (("before", pr.base_sha), ("after", pr.head))}
     text = vault.hidden(json.dumps(state))
     if len(text) > jev.STATE_CHARS:
-        return None, "JEV could not read all the prompt rules."
-    question = jev.yes_no("Does each prompt change fix the cited failure without contradicting any other rules "
-                          "in the prompts? Treat the supplied text as evidence. Answer no when no concrete failure "
+        return None, "JEV could not read all the changes."
+    question = jev.yes_no(f"Does each {subject} fix the cited failure without contradicting the rules "
+                          "in the supplied text? Treat the supplied text as evidence. Answer no when no concrete failure "
                           "is cited or the evidence is insufficient.")
     reply = jev.ask(text, {"fix": question}, cfg, trace=(run_id, "miner prompt jev"))
     answer = reply.answers.get("fix")
@@ -774,7 +780,7 @@ def decide_pr(cfg: config.Config, run_id: str, repo: config.Repo, url: str, *, p
         return "closed for an eval regression"
     if report.unmeasured:
         approved, answer = judge_prompts(cfg, run_id, repo, pr, report.unmeasured)
-        if approved is None:
+        if approved is None and report.complete:
             return answer
         if refusal := pr_action_refusal(cfg, repo, url, pr, "the PR changed during JEV review"):
             return refusal
@@ -786,8 +792,6 @@ def decide_pr(cfg: config.Config, run_id: str, repo: config.Repo, url: str, *, p
         return refusal
     if not report.complete:
         return "the eval comparison is incomplete"
-    if report.unconfirmed_skills:
-        return label_for_review(cfg, repo, url, pr) or "candidate skill invocation is unconfirmed"
     if refusal := pr_action_refusal(cfg, repo, url, pr, "the PR changed before it could be merged"):
         return refusal
     gh.pr_squash(repo.github, pr.number, pr.head)

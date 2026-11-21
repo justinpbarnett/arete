@@ -368,7 +368,8 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
                                    for s in routing.limit_scopes(a, picked.name)], set_before=started)
             return with_spent(res, limited)
         limit = res.usage_limit
-        why = f"{chosen_route.runner} {limit.kind or 'usage'} limit reached"
+        why = (f"{chosen_route.runner} model overloaded" if limit.kind == "overloaded"
+               else f"{chosen_route.runner} {limit.kind or 'usage'} limit reached")
         for a in picked.auths:
             devices_store.hold(accounts.scope(a, limit.scope, picked.unknown), limit.until, why)
         limited.append(res)
@@ -738,14 +739,6 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
             kw["stored_values"] = [*(kw.get("stored_values") or ()), api_key]
     hook = ()
     kw.pop("verification_attempt", None)
-    skill_plugin = kw.pop("skill_plugin", None)
-    allowed = kw.get("allowed_tools") or []
-    if (skill_plugin and which == "claude" and not target.remote and "user" in kw["instructions"]
-            and kw.get("tools") is None and "Read" in allowed):
-        kw["skill_plugin"] = skill_plugin
-        kw["allowed_tools"] = list(dict.fromkeys([*allowed, "Skill", f"Read(/{skill_plugin}/skills/**)"]))
-        browser.with_note(kw, f"For a repository skill requested by this eval, call the Skill tool with "
-                             f"`{claude.EVAL_SKILL_PLUGIN}:<skill-name>` to use this eval's version.")
     if trip.scratch:
         kw, hook = browser.confine(kw, trip.scratch, which, bool(target.remote), say)
     if asking and hook:
@@ -922,8 +915,9 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
             res.provider = res.provider or routing.provider_of(res.model)
             if which != REPLAY:
                 res.auth_mode = auth.mode
-                if res.usage_limit and (res.usage_limit.scope not in routing.limit_scopes(auth, name) or
-                                       res.usage_limit.billing != ("subscription" if auth.mode == "subscription" else "credit")):
+                if res.usage_limit and (
+                        res.usage_limit.scope not in routing.limit_scopes(auth, name) or
+                        res.usage_limit.billing != ("subscription" if auth.mode == "subscription" else "credit")):
                     res.usage_limit = None
             if res.calls:
                 for call in res.calls:
@@ -993,7 +987,7 @@ def local_claude(kw: dict, cfg: config.Config, run_id: str, ask_jev: bool, say: 
                  closed_context: tuple[Path, ...] = ()) -> dict:
     kw = {**kw, "extra_env": {**(kw.get("extra_env") or {}), **run_env(run_id)}}
     if guard.wanted(kw.get("tools")):
-        kw["settings"] = guard.settings(cfg.jev.guard, floor.open, skill_plugin=kw.get("skill_plugin"))
+        kw["settings"] = guard.settings(cfg.jev.guard, floor.open)
         if closed_context:
             for group in kw["settings"]["hooks"]["PreToolUse"]:
                 for hook in group["hooks"]:

@@ -14,7 +14,6 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import (
-    claude,
     codebase,
     config,
     environment,
@@ -32,7 +31,7 @@ from . import (
     verify,
     workspace,
 )
-from .agent import BUILD_TOOLS, READ_TOOLS, Result
+from .agent import BUILD_TOOLS, READ_TOOLS
 from .diffguard import denied_paths
 from .heartbeat import mark_loop
 from .pipeline import (
@@ -86,8 +85,6 @@ class EvalRun(AgentRun):
     checks_required: bool = False
     harness_paths: list[str] = field(default_factory=list)
     local_layer_settings: bytes | None = None
-    skill_plugin: Path | None = None
-    skills_used: set[str] = field(default_factory=set)
     executor: str = ""
     execution: dict = field(default_factory=dict)
 
@@ -107,14 +104,6 @@ class EvalRun(AgentRun):
 
     def adopt(self, cfg: config.Config, layer: config.RepoLayer) -> None:
         return None
-
-    def agent_as_step(self, step: str, text: str, cwd: Path, role: str = "", **kw) -> Result:
-        if self.skill_plugin:
-            kw["skill_plugin"] = self.skill_plugin
-        res = super().agent_as_step(step, text, cwd, role, **kw)
-        if self.skill_plugin and res.ok and res.runner == "claude" and res.record:
-            self.skills_used.update(invoked_skills(paths.record_dir(self.id) / res.record, self.skill_plugin))
-        return res
 
     def gate(self, layer, wt: Path, task, timeout: float) -> tuple[bool, str]:
         return run_checks(layer, wt, [wt], self, self.time_for(timeout))
@@ -192,7 +181,6 @@ class TaskResult:
     changed: list[str] = field(default_factory=list)
     graded: bool = False
     prompts_used: set[str] = field(default_factory=set)
-    skills_used: set[str] = field(default_factory=set)
     required_behavior_failed: bool = False
     shared_context_sha: str = ""
 
@@ -218,7 +206,6 @@ class Comparison:
     unmeasured: list[str] = field(default_factory=list)
     complete: bool = False
     incomplete: list[str] = field(default_factory=list)
-    unconfirmed_skills: list[str] = field(default_factory=list)
 
 
 class Source:
@@ -368,46 +355,6 @@ def overlay_harness(src: Source, wt: Path) -> list[str]:
             dest.unlink()
         copy_harness_file(src, f, dest)
     return copied
-
-
-def changed_skills(files) -> frozenset[str]:
-    return frozenset(p.split("/", 2)[1] for p in files if p.startswith("skills/"))
-
-
-def install_eval_skills(src: HarnessOverlay, plugin: Path) -> None:
-    manifest = plugin / ".claude-plugin" / "plugin.json"
-    manifest.parent.mkdir()
-    manifest.write_text(json.dumps({"name": claude.EVAL_SKILL_PLUGIN}))
-    installed = plugin / "skills"
-    installed.mkdir()
-    copied = src.files("skills")
-    for rel in copied:
-        dest = plugin / rel
-        if dest.parent.resolve() != dest.parent or dest.exists() or dest.is_symlink():
-            raise workspace.RunFailed(f"installed skill path {rel} conflicts with another path")
-        copy_harness_file(src, rel, dest)
-    for rel in copied:
-        dest = plugin / rel
-        if dest.is_symlink() and not dest.resolve(strict=True).is_relative_to(installed):
-            raise workspace.RunFailed(f"installed skill path {rel} leaves the eval skill directory")
-
-
-def invoked_skills(trace: Path, plugin: Path) -> set[str]:
-    calls, launched, loaded = {}, set(), set()
-    prefix = "Base directory for this skill: "
-    namespace = f"{claude.EVAL_SKILL_PLUGIN}:"
-    for event in record.events(trace):
-        if event["kind"] == "tool_call" and event.get("name") == "Skill":
-            args = event.get("input")
-            if isinstance(args, dict) and isinstance(name := args.get("skill"), str) and name.startswith(namespace):
-                calls[event["id"]] = name.removeprefix(namespace)
-        elif event["kind"] == "tool_result" and not event["error"] and event["id"] in calls:
-            launched.add(calls[event["id"]])
-        elif event["kind"] == "message" and event["role"] == "user" and event["text"].startswith(prefix):
-            base = Path(event["text"].splitlines()[0].removeprefix(prefix))
-            if base.parent == plugin / "skills":
-                loaded.add(base.name)
-    return launched & loaded
 
 
 def commit_without_evals(repo_path: Path, sha: str, staging: Path) -> str:
@@ -677,10 +624,6 @@ def run_task(cfg: config.Config, src: Source, task: Task, prompts: Prompts, run:
         run.log(f"checkout at {base} ({result.base_commit[:12]})")
         layer = prepare(repo, src, wt, run)
         run.adopt(cfg, layer)
-        if isinstance(src, HarnessOverlay) and changed_skills(src.changed):
-            paths.EVAL_SKILLS_DIR.mkdir(parents=True, exist_ok=True)
-            run.skill_plugin = Path(tempfile.mkdtemp(dir=paths.EVAL_SKILLS_DIR)).resolve()
-            install_eval_skills(src, run.skill_plugin)
         if prompts.label:
             run.log(f"plan, build and fix prompts from {prompts.label}")
         if task.verify and not layer.verify:
@@ -764,10 +707,6 @@ def run_task(cfg: config.Config, src: Source, task: Task, prompts: Prompts, run:
         run.log(f"crashed: {result.why}")
         return result
     finally:
-        result.skills_used = run.skills_used.copy()
-        if run.skill_plugin:
-            shutil.rmtree(run.skill_plugin, ignore_errors=True)
-            run.skill_plugin = None
         result.cost, result.paid = run.cost, run.paid
         result.seconds = round(time.time() - started, 1)
         shutil.rmtree(wt, ignore_errors=True)
@@ -988,7 +927,9 @@ def compare_arms(cfg: config.Config, target: config.Repo, base: str, head: str, 
                 else "No eval suite ran") + "."
     if changed:
         lead += f" Changed prompts were {prompt_loader.code_list(changed)}."
-    return comparison(target, base, lead, ran, changed, skipped, skills=changed_skills(harness))
+    # The paired evals do not load or track the changed skill.
+    skills = tuple(sorted(f for f in harness if f.startswith(("skills/", ".claude/skills/"))))
+    return comparison(target, base, lead, ran, changed, skipped, skills=skills)
 
 
 def show_flips(flips: list[tuple[str, bool]], private: bool) -> str:
@@ -1004,7 +945,7 @@ def show_flips(flips: list[tuple[str, bool]], private: bool) -> str:
 
 def comparison(target: config.Repo, base: str, lead: str, ran: list[tuple[config.Repo, dict[str, Arm]]],
                changed_prompts: list[str], skipped: list[tuple[config.Repo, str, list[str]]], *,
-               skills: frozenset[str] = frozenset()) -> Comparison:
+               skills: tuple[str, ...] = ()) -> Comparison:
     aliases: dict[str, str] = {}
 
     def hidden(repo: config.Repo) -> bool:
@@ -1027,7 +968,6 @@ def comparison(target: config.Repo, base: str, lead: str, ran: list[tuple[config
     regressions = []
     incomplete = []
     exercised = set()
-    invoked = set()
     complete = bool(ran) and not skipped
     if ran:
         lines += [f"| suite | `{base[:12]}` | this branch | tasks that changed |", "|---|---|---|---|"]
@@ -1036,9 +976,7 @@ def comparison(target: config.Repo, base: str, lead: str, ran: list[tuple[config
             before = {r.task: r for r in main.results if confirmed(r)}
             paired = [(prior, r) for r in pr.results if confirmed(r) and (prior := before.get(r.task))
                       and r.base_commit and r.context_sha and inputs(prior) == inputs(r)]
-            exercised.update(name for r in pr.results for name in r.prompts_used)
-            if repo.name == target.name:
-                invoked.update(name for _, r in paired for name in r.skills_used)
+            exercised.update(name for r in pr.results if r.graded for name in r.prompts_used)
             flips = [(r.task, not r.required_behavior_failed) for prior, r in paired
                      if prior.required_behavior_failed != r.required_behavior_failed]
             lines.append(f"| {shown(repo)} | {main.score} | {pr.score} | {show_flips(flips, hidden(repo))} |")
@@ -1057,14 +995,7 @@ def comparison(target: config.Repo, base: str, lead: str, ran: list[tuple[config
         ids = [a.run_id for repo, result in ran if not hidden(repo) for a in result.values()]
         lines.append(f"{util.paid_note(totals['main'].paid + totals['pr'].paid).capitalize()}."
                      + (f" Runs {prompt_loader.code_list(ids)}." if ids else ""))
-    unconfirmed_skills = sorted(skills - invoked)
-    if unconfirmed_skills:
-        lines.append(f"Candidate skill invocation unconfirmed: {prompt_loader.code_list(unconfirmed_skills)}.")
-    builder_prompts = {f"{name}.md" for name in BUILDER_PROMPTS}
-    candidates = [r for _, arms in ran for r in arms["pr"].results]
-    all_built = not skipped and bool(candidates) and all("build.md" in r.prompts_used for r in candidates)
-    unmeasured = [name for name in changed_prompts if name not in exercised
-                  and (complete or name not in builder_prompts or (name == "fix.md" and all_built))]
+    unmeasured = [name for name in changed_prompts if name not in exercised] + list(skills)
     if unmeasured:
         lines.append(f"Not measured in the candidate arm: {prompt_loader.code_list(unmeasured)}.")
     incomplete.extend(shown_tasks(repo, tasks) for repo, _, tasks in skipped if tasks)
@@ -1072,4 +1003,4 @@ def comparison(target: config.Repo, base: str, lead: str, ran: list[tuple[config
         lines.append(f"Incomplete eval tasks: {', '.join(incomplete)}.")
     if skipped:
         lines.append("Skipped: " + ", ".join(f"{shown(repo)} ({why})" for repo, why, _ in skipped) + ".")
-    return Comparison("\n".join(lines).rstrip() + "\n", regressions, unmeasured, complete, incomplete, unconfirmed_skills)
+    return Comparison("\n".join(lines).rstrip() + "\n", regressions, unmeasured, complete, incomplete)
