@@ -118,30 +118,6 @@ def issues(repo: str, label: str = "", state: str = "open", limit: int = 30, aut
     return gh_json(args) or []
 
 
-def all_open_issues(repo: str, label: str) -> list[dict]:
-    owner, name = repo.split("/", 1)
-    query = """
-    query($owner: String!, $name: String!, $label: String!, $endCursor: String) {
-      repository(owner: $owner, name: $name) {
-        issues(first: 100, after: $endCursor, states: [OPEN], labels: [$label],
-               orderBy: {field: CREATED_AT, direction: DESC}) {
-          nodes { number title body url createdAt labels(first: 100) { nodes { name } } }
-          pageInfo { hasNextPage endCursor }
-        }
-      }
-    }
-    """
-    pages = gh_json(["api", "graphql", "--paginate", "--slurp", "-f", outgoing(f"query={query}"),
-                     "-f", outgoing(f"owner={owner}"), "-f", outgoing(f"name={name}"), "-f", outgoing(f"label={label}")])
-    if not isinstance(pages, list) or not pages:
-        raise GhError("GitHub did not return issue pages")
-    try:
-        return [{**row, "labels": row["labels"]["nodes"]} for page in pages
-                for row in page["data"]["repository"]["issues"]["nodes"]]
-    except (KeyError, TypeError) as e:
-        raise GhError("GitHub returned incomplete issue pages") from e
-
-
 def issue(repo: str, number: int) -> dict:
     return gh_json(
         ["issue", "view", str(number), "--repo", repo, "--json", "number,title,body,labels,url,comments,state,author,updatedAt"]
