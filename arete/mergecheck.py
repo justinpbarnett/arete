@@ -14,7 +14,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from . import config, environment, factory, loops, paths, record, tracker, util, workspace
+from . import config, environment, factory, journeys, loops, paths, record, tracker, util, verify, workspace
 from .lab import verifier_suites
 from .pipeline import AgentRun, TicketWork, use_product
 from .store import runs as run_store
@@ -24,6 +24,7 @@ PR = re.compile(r"https://github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)", re.IGNORECA
 CHECK = re.compile(r"^- \*\*(Driver )?(?:Passed|Failed(?: \(environment\))?)\*\*:\s*(.+)$")
 NUMBER = re.compile(r"^(?:step\s+)?#?(\d+)[.):\s]+(.+)$", re.IGNORECASE)
 HOLD_EXIT = 75
+INCOMPLETE_EXIT = 76
 
 
 class Blocked(ValueError):
@@ -116,14 +117,16 @@ class Step:
     how: str
     pr: int
     neighbour: bool = False
+    driver: bool = False
 
     def goal(self, n: int) -> str:
         return f"{n}. [{self.run} step {self.number}] {self.name}: {self.how}"
 
 
-def reports(item: dict) -> tuple[str, Path]:
+def reports(item: dict) -> tuple[str, Path, list[dict] | None]:
     run_id = item["run_id"]
-    history = factory.history(factory.chain(run_id))
+    chain = factory.chain(run_id)
+    history = factory.history(chain)
     applicable = [line for line in history if line.get("step") == "verify"]
     if applicable:
         last = applicable[-1]
@@ -137,31 +140,77 @@ def reports(item: dict) -> tuple[str, Path]:
         if not re.fullmatch(r"verify\d*\.md", name):
             raise Blocked(f"{run_id}: latest verification has an invalid saved report name")
         saved_owner = Path(saved).parent.name
-        owners = {run_id, *(str(line.get("run") or "") for read in factory.chain(run_id) for line in read)}
+        owners = {run_id, *(str(line.get("run") or "") for read in chain for line in read)}
         if saved_owner in owners:
             owner = saved_owner
-        return owner, paths.RUNS_DIR / owner / name
-    for read in factory.chain(run_id):
+        return owner, paths.RUNS_DIR / owner / name, verified.get("checks") or []
+    for read in chain:
         owner = str(next((line.get("run") for line in read if line.get("run")), run_id))
         folder = paths.RUNS_DIR / owner
         names = [p for p in folder.glob("verify*.md") if re.fullmatch(r"verify\d*\.md", p.name)]
         if names:
-            return owner, max(names, key=lambda p: int(p.stem[6:] or 1))
+            return owner, max(names, key=lambda p: int(p.stem[6:] or 1)), None
     raise Blocked(f"{run_id}: missing saved verification report")
 
 
-def report_steps(item: dict, neighbour: bool = False) -> list[Step]:
-    owner, path = reports(item)
+def driver_checks(run_id: str, checks) -> list[dict]:
+    if not isinstance(checks, list) or any(not isinstance(check, dict) for check in checks):
+        raise Blocked(f"{run_id}: invalid recorded verification checks")
+    return [check for check in checks if check.get("driver") is True]
+
+
+def driver_names(run_id: str, names) -> list[str]:
+    if not isinstance(names, list) or any(
+        not isinstance(name, str) or not name.startswith("journey:")
+        or not journeys.NAME.fullmatch(name.removeprefix("journey:")) for name in names
+    ):
+        raise Blocked(f"{run_id}: invalid recorded driver name")
+    return list(dict.fromkeys(names))
+
+
+def driver_rows(lines: list[str]) -> list[list[str]]:
+    return [lines[i:i + 3] for i, line in enumerate(lines) if (match := CHECK.match(line)) and match[1]]
+
+
+def classic_drivers(run_id: str, path: Path, report: bytes, lines: list[str]) -> list[str]:
+    missing = object()
     try:
-        text = path.read_text()
-    except OSError:
-        raise Blocked(f"{item['run_id']}: unreadable verification report {path}") from None
+        evidence = read_json(path.with_name(f"{path.stem}-drivers.json"), missing)
+        probes = read_json(path.with_name(f"{path.stem}-probes.json"), {"checks": []}) if evidence is missing else None
+    except (OSError, ValueError):
+        raise Blocked(f"{run_id}: unreadable driver evidence for {path.name}") from None
+    if evidence is not missing:
+        if not isinstance(evidence, dict) or evidence.get("report_sha256") != hashlib.sha256(report).hexdigest():
+            raise Blocked(f"{run_id}: recorded driver evidence does not match {path.name}")
+        return driver_names(run_id, evidence.get("drivers"))
+
+    checks = driver_checks(run_id, probes.get("checks") if isinstance(probes, dict) else None)
+    names = driver_names(run_id, [check.get("what") for check in checks])
+    if any(type(check.get("passed")) is not bool or not isinstance(check.get("how"), str)
+           or not isinstance(check.get("saw"), str) for check in checks):
+        raise Blocked(f"{run_id}: invalid recorded driver check")
+    recorded = verify.Verified("pass", checks=[{**check, "screenshot": ""} for check in checks])
+    if driver_rows(lines) != driver_rows(recorded.markdown().splitlines()):
+        raise Blocked(f"{run_id}: {path.name} has driver rows without matching engine evidence")
+    return names
+
+
+def report_steps(item: dict, neighbour: bool = False) -> list[Step]:
+    run_id = item["run_id"]
+    owner, path, checks = reports(item)
+    try:
+        report = path.read_bytes()
+        lines = report.decode().splitlines()
+    except (OSError, UnicodeError):
+        raise Blocked(f"{run_id}: unreadable verification report {path}") from None
+    drivers = (classic_drivers(run_id, path, report, lines) if checks is None else
+               driver_names(run_id, [check.get("what") for check in driver_checks(run_id, checks)]))
     found, name, how = [], "", ""
-    for line in [*text.splitlines(), "- **Passed**: __end__"]:
+    for line in [*lines, "- **Passed**: __end__"]:
         if match := CHECK.match(line):
             if name:
                 if not how:
-                    raise Blocked(f"{item['run_id']}: check {name!r} has no How instructions")
+                    raise Blocked(f"{run_id}: check {name!r} has no How instructions")
                 numbered = NUMBER.match(name)
                 number = int(numbered[1]) if numbered else len(found) + 1
                 short = numbered[2] if numbered else name
@@ -169,8 +218,11 @@ def report_steps(item: dict, neighbour: bool = False) -> list[Step]:
             name, how = "" if match[1] else match[2].strip(), ""
         elif name and line.startswith("  - How: "):
             how = line.removeprefix("  - How: ").strip()
-    if not found or len({s.number for s in found}) != len(found):
-        raise Blocked(f"{item['run_id']}: verification report has no usable, uniquely numbered checks")
+    if not (found or drivers) or len({s.number for s in found}) != len(found):
+        raise Blocked(f"{run_id}: verification report has no usable, uniquely numbered checks")
+    last = max((s.number for s in found), default=0)
+    found.extend(Step(owner, n, name, "", item["pr"], neighbour, driver=True)
+                 for n, name in enumerate(drivers, last + 1))
     return found
 
 
@@ -233,7 +285,8 @@ def plan(cfg: config.Config, repo: config.Repo, rows: list[dict], batch: list[di
     for item in reversed(earlier):
         if overlap := files & changed(item):
             neighbour, matches = item, sorted(overlap)
-            selected.append(report_steps(item, neighbour=True)[0])
+            replay = report_steps(item, neighbour=True)
+            selected.extend(s for n, s in enumerate(replay) if n == 0 or s.driver)
             break
     return Plan(repo, layer, batch, selected, base, paths.WORKTREES_DIR / f"{run_id}-{repo.name}", neighbour, matches)
 
@@ -310,23 +363,104 @@ def deadline():
         signal.signal(signal.SIGTERM, old_term)
 
 
-def execute(cfg: config.Config, p: Plan, run_id: str) -> list[int]:
+@dataclass
+class ReplayResult:
+    failed: list[int] = field(default_factory=list)
+    blocked_by: str = ""
+    driver_reason: str = ""
+
+
+def execute(cfg: config.Config, p: Plan, run_id: str) -> ReplayResult:
     record.start("merge-check", run_id=run_id, repo=p.repo.name)
     try:
-        failed = execute_attempt(cfg, p, run_id)
+        result = execute_attempt(cfg, p, run_id)
     except BaseException:
         record.settle(run_id, "failed", summary="merge-check blocked; evidence retained locally")
         raise
-    record.settle(run_id, "done", summary="merged base failed in use" if failed else "merged base passed in use")
+    summary = result.blocked_by or ("merged base failed in use" if result.failed else "merged base passed in use")
+    if result.driver_reason:
+        summary = f"{result.driver_reason}. {summary}"
+    record.settle(run_id, "failed" if result.blocked_by else "done", summary=summary)
+    return result
+
+
+def ordinary_failures(verified: verify.Verified, ordinary: list[int]) -> set[int]:
+    accounted, failed = set(), set()
+    environment_step = None
+    for check in verified.checks:
+        if check.get("driver") is True:
+            continue
+        what = check.get("what")
+        match = NUMBER.match(what) if isinstance(what, str) else None
+        try:
+            n = int(match[1]) if match else 0
+        except ValueError:
+            n = 0
+        if not 0 < n <= len(ordinary) or type(check.get("passed")) is not bool:
+            raise Blocked("verifier returned an unknown or invalid step")
+        accounted.add(n)
+        if not check["passed"]:
+            if str(check.get("cause") or "").strip().lower() == "environment":
+                environment_step = environment_step or n
+            else:
+                failed.add(ordinary[n - 1])
+    if len(accounted) != len(ordinary):
+        raise Blocked("verifier did not account for every manifest step")
+    if environment_step:
+        raise Blocked(f"ordinary check {environment_step} was blocked by the environment")
     return failed
 
 
-def execute_attempt(cfg: config.Config, p: Plan, run_id: str) -> list[int]:
+def replay_result(p: Plan, run: CheckRun, verified: verify.Verified,
+                  ordinary: list[int], drivers: dict[int, str]) -> ReplayResult:
+    result = ReplayResult()
+    driver_checks = {check["what"]: check for check in verified.checks if check.get("driver") is True}
+    failures = {n: {"what": name, "saw": check["saw"]} for n, name in drivers.items()
+                if (check := driver_checks.get(name)) and check.get("cause") == "change"}
+    if failures:
+        run.save("driver-failures.json", failures)
+        result.driver_reason = f"See {run.dir / 'driver-failures.json'} for the failing journeys and their observations"
+        result.failed.extend(failures)
+
+    blocked_driver = next((name for name, check in driver_checks.items() if check.get("cause") == "environment"), "")
+    if blocked_driver:
+        result.blocked_by = f"{blocked_driver}: driver was blocked. See the local result.json."
+    elif verified.verdict not in ("pass", "fail") or not verified.finished:
+        result.blocked_by = (verified.blocked_by if not (drivers and run.invoked) else
+                             "the grader did not finish; see the local result.json")
+        result.blocked_by = result.blocked_by or "the product or verifier did not start"
+    elif verified.verdict == "fail" and not run.invoked and (not drivers or not verified.behavior_reached):
+        prevented = list(range(1, len(p.steps) + 1))
+        run.save("startup-failure.json", {"prevented_steps": prevented})
+        if drivers:
+            result.blocked_by = "product startup prevented replay; see the local result.json"
+        else:
+            p.startup_failed = True
+            result.failed = prevented
+        return result
+
+    if set(drivers.values()) != driver_checks.keys():
+        result.blocked_by = result.blocked_by or "verification did not account for every manifest driver"
+    if ordinary and not run.invoked:
+        result.blocked_by = result.blocked_by or "the verifier did not start"
+    elif ordinary and verified.finished and verified.verdict in ("pass", "fail"):
+        try:
+            result.failed.extend(ordinary_failures(verified, ordinary))
+        except Blocked as error:
+            result.blocked_by = result.blocked_by or str(error)
+    if verified.verdict == "fail" and not result.failed:
+        result.blocked_by = result.blocked_by or "verifier reported failure without a failed manifest step"
+    result.failed = sorted(set(result.failed))
+    return result
+
+
+def execute_attempt(cfg: config.Config, p: Plan, run_id: str) -> ReplayResult:
     folder = paths.RUNS_DIR / run_id
     folder.mkdir(parents=True, exist_ok=False)
     run = CheckRun(id=run_id, repo=p.repo, dir=folder, cfg=cfg, layer=p.layer,
                    deadline=time.monotonic() + 1800, writes_lines=False)
     made = False
+    replay = None
     with deadline():
         try:
             util.git(["fetch", "origin"], p.repo.path)
@@ -349,36 +483,32 @@ def execute_attempt(cfg: config.Config, p: Plan, run_id: str) -> list[int]:
             work = TicketWork(cfg, run, ticket, p.worktree,
                               [workspace.Checkout("", p.repo.github, p.repo.path, p.worktree, p.base)], p.layer, 1800,
                               workspace=f"Detached checkout of origin/{p.base} at {sha}.")
-            goal = "\n".join(s.goal(n) for n, s in enumerate(p.steps, 1))
-            verified = use_product(work, "verify", "grade", goal=goal, require_released=True)
+            ordinary = [n for n, s in enumerate(p.steps, 1) if not s.driver]
+            goal = "\n".join(p.steps[n - 1].goal(i) for i, n in enumerate(ordinary, 1))
+            drivers = {n: s.name for n, s in enumerate(p.steps, 1) if s.driver}
+            try:
+                verified = use_product(work, "verify", "grade", goal=goal, require_released=True,
+                                       replay_drivers={name.removeprefix("journey:") for name in drivers.values()})
+            except (Blocked, OSError, RuntimeError) as error:
+                saved_probes = read_json(folder / "verify-probes.json", {}) if drivers else {}
+                if not saved_probes:
+                    raise
+                driver_checks = [check for check in saved_probes.get("checks", []) if check.get("driver") is True]
+                verified = verify.Verified("blocked", "Replay was interrupted.", driver_checks,
+                                           blocked_by=str(error), finished=False)
             run.save("result.json", asdict(verified))
-            if verified.verdict == "fail" and not run.invoked:
-                p.startup_failed = True
-                prevented = list(range(1, len(p.steps) + 1))
-                run.save("startup-failure.json", {"prevented_steps": prevented})
-                return prevented
-            if verified.verdict not in ("pass", "fail") or not run.invoked:
-                raise Blocked(verified.blocked_by or "the product or verifier did not start")
-            accounted: dict[int, bool] = {}
-            for check in verified.checks:
-                match = NUMBER.match(str(check.get("what") or ""))
-                if not match or int(match[1]) not in range(1, len(p.steps) + 1) or type(check.get("passed")) is not bool:
-                    raise Blocked("verifier returned an unknown or invalid step")
-                n = int(match[1])
-                accounted[n] = accounted.get(n, True) and check["passed"]
-            if len(accounted) != len(p.steps):
-                raise Blocked("verifier did not account for every manifest step")
-            failed = [n for n, passed in sorted(accounted.items()) if not passed]
-            if verified.verdict == "fail" and not failed:
-                raise Blocked("verifier reported failure without a failed manifest step")
-            return failed
+            replay = replay_result(p, run, verified, ordinary, drivers)
+            return replay
         finally:
             if made:
-                if (folder / "verify-retained.json").exists() or verifier_suites.held(folder, p.worktree, "verify"):
-                    print(f"merge-check: retained {p.worktree}; scratch ownership is unresolved", file=sys.stderr)
-                    raise Blocked("verification scratch ownership is unresolved; workspace retained")
-                else:
+                try:
+                    if (folder / "verify-retained.json").exists() or verifier_suites.held(folder, p.worktree, "verify"):
+                        raise Blocked(f"verification scratch ownership is unresolved; retained workspace {p.worktree}")
                     util.git(["worktree", "remove", "--force", str(p.worktree)], p.repo.path)
+                except (Blocked, OSError, RuntimeError) as error:
+                    if replay is None:
+                        raise
+                    replay.blocked_by = ". ".join(filter(None, (replay.blocked_by, util.first_line(str(error), 300))))
 
 
 def consume(cfg: config.Config, repo_name: str, supplied: list[dict], dry_run: bool = False) -> int:
@@ -444,16 +574,27 @@ def consume_batch(cfg: config.Config, repo_name: str, supplied: list[dict], dry_
             data, used, _ = quota(folder, p.repo.name)
             data[p.repo.name] = {"day": str(datetime.now(UTC).date()), "attempts": used + 1}
             save_json(folder / "quota.json", data)
-        outputs = []
+        outputs, holds = [], []
         for p in plans:
-            failed = execute(cfg, p, run_id + "-" + p.repo.name)
-            if failed:
-                outputs.append(finding(p, failed))
-            outputs.append({"value": 0 if failed else 1})
-            checked[p.repo.name] += [r["key"] for r in p.batch]
+            try:
+                result = execute(cfg, p, run_id + "-" + p.repo.name)
+            except (Blocked, OSError, RuntimeError) as error:
+                holds.append(str(error))
+                continue
+            if result.failed:
+                outputs.append(finding(p, result.failed))
+            if result.blocked_by:
+                holds.append(". ".join(filter(None, (result.driver_reason, result.blocked_by))))
+            else:
+                outputs.append({"value": 0 if result.failed else 1})
+                checked[p.repo.name] += [r["key"] for r in p.batch]
         save_json(folder / "checked.json", checked)
         for output in outputs:
             print(json.dumps(output, separators=(",", ":")))
+        for reason in holds:
+            print(f"merge-check: {util.first_line(reason, 400)}", file=sys.stderr)
+        if holds:
+            return INCOMPLETE_EXIT if any("fingerprint" in output for output in outputs) else 1
     return 0
 
 

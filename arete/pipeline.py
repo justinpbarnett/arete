@@ -3040,23 +3040,30 @@ def check_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
 
 
 def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "verify",
-                require_released: bool = False, **values) -> verify.Verified:
+                require_released: bool = False, *, replay_drivers: set[str] | None = None, **values) -> verify.Verified:
     from . import pilot, readme_verify, zte
 
     run, configured = b.run, b.layer.verify
+    replay_only = bool(replay_drivers) and not values.get("goal")
     delivery_verification = prompt_name == role == "verify"
     tid = str(run.tid) if delivery_verification else ""
     zte_verify = delivery_verification and zte.reserved(tid)
     readme_task = (delivery_verification and pilot.is_pilot_task(tid)) or zte_verify
-    feature_map = configured.feature_map if delivery_verification and not readme_task else {}
-    requested = journeys.requested(feature_map, b.ticket.title, b.ticket.body)
+    feature_map = configured.feature_map if replay_drivers or (delivery_verification and not readme_task) else {}
+    requested = sorted(replay_drivers) if replay_drivers else journeys.requested(feature_map, b.ticket.title, b.ticket.body)
     step = b.next_step(step_name)
     if unknown := [name for name in requested if name not in feature_map]:
+        source = "A verification report" if replay_drivers else "An issue"
         return save_verification(run, step, verify.Verified(
-            "blocked", "An issue references a journey absent from the configured feature map.", finished=False,
+            "blocked", f"{source} references a journey absent from the configured feature map.", finished=False,
             blocked_by=", ".join(f"journey:{name}" for name in unknown)))
     selected = {name: feature_map[name] for name in requested}
     drivers = {name: journey.driver for name, journey in selected.items() if journey.driver}
+    if replay_drivers and (missing := replay_drivers - drivers.keys()):
+        names = ", ".join(f"journey:{name}" for name in sorted(missing))
+        return save_verification(run, step, verify.Verified(
+            "blocked", "A verification report used a journey with no configured driver.", finished=False,
+            blocked_by=f"No configured driver for {names}"))
     v = verify.with_free_ports(replace(configured, drivers={name: configured.drivers[name] for name in drivers.values()}))
     merge_candidate = b.layer.trust_level == "automerge" or readme_task
     checked_trees = verification_trees(b) if delivery_verification and merge_candidate else {}
@@ -3099,11 +3106,12 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
             names = ", ".join(f"journey:{name}" for name in drivers)
             return save_verification(run, step, verify.Verified(
                 "blocked", f"Configured drivers require trusted scratch confinement for {names}.",
-                blocked_by=reason, finished=False))
+                blocked_by=f"{names}: {reason}" if replay_drivers else reason, finished=False))
     agent_started, agent_finished = False, False
     lifetime = {"stopped": True}
     fixture_blocker = ""
     probes = None
+    replay_grade = False
     try:
         if attempt:
             run.log(f"{step}: scratch folder {attempt.root}")
@@ -3121,12 +3129,14 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                 run.log(f"{step}: the app answers at {url}")
             if v.probes or drivers:
                 probes = verify.run_probes(replace(v, probe_seconds=run.time_for(v.probe_seconds)), b.ws, attempt,
-                                           journey_drivers=drivers)
+                                           journey_drivers=drivers, stop_on_driver_failure=not replay_drivers)
             if probes:
                 run.save(f"{step}-probes.json", json.dumps(asdict(probes), indent=2))
                 label = "configured verification commands" if drivers else "configured probes"
                 run.log(f"{step}: {label} {probes.verdict}")
-                if probes.verdict == "pass":
+                replay_grade = bool(replay_drivers and probes.verdict == "fail" and probes.failed_checks
+                                    and all(c.get("driver") is True for c in probes.failed_checks))
+                if probes.verdict == "pass" and not replay_drivers:
                     name = "verification commands" if drivers else "probes"
                     instructions = ("Check any remaining acceptance criteria. Arete adds the configured results to the "
                                     "report. Return only the checks you performed.\n\n"
@@ -3134,7 +3144,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                     v = replace(v, notes=v.notes + f"\n\nArete already executed these owner-configured {name} in a "
                                 "confined disposable workspace. Use their observed results as evidence; do not repeat "
                                 "these commands. " + instructions + probes.markdown())
-            if not probes or probes.verdict == "pass":
+            if not replay_only and (not probes or probes.verdict == "pass" or replay_grade):
                 agent_started = True
                 res = run.agent(step, b.brief.prompt(
                     prompt_name, surface=surface_note(v, url, evidence), notes=v.notes, scratch=scratch.note(attempt),
@@ -3151,7 +3161,8 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
         agent_finished = True
         raise
     except sandbox.ConfinementUnavailable as e:
-        return verify.Verified("blocked", "Trusted fixture verification could not start.", finished=False,
+        return verify.Verified("blocked", "Trusted fixture verification could not start.",
+                               probes.checks if replay_drivers and probes else [], finished=False,
                                blocked_by=util.first_line(str(e), 300))
     except verify.ServerError as e:
         run.log(f"{step}: the app did not start")
@@ -3180,7 +3191,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                 run.log(retained_line(step, attempt))
         finally:
             restore_worktrees(untracked_before, evidence)
-    if probes and probes.verdict != "pass":
+    if probes and not agent_started:
         verified = probes
     elif not res.ok or not isinstance(res.structured, dict):
         verified = verify.Verified("blocked", "The check in use did not finish.", finished=False,
@@ -3188,9 +3199,17 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
         if not drivers:
             return verified
     else:
-        verified = verify.Verified.from_agent(res.structured)
-    if probes and probes.verdict == "pass":
-        verified.checks = probes.checks + verified.checks
+        verified = verify.Verified.from_agent(res.structured, strict=replay_drivers is not None)
+    if probes and agent_started:
+        if replay_drivers:
+            if verified.verdict == "fail" and not verified.failed_checks:
+                verified.verdict = "blocked"
+                verified.blocked_by = "the grader reported failure without a failed check"
+            elif verified.verdict == "pass" and probes.verdict == "fail":
+                verified.verdict, verified.summary = "fail", probes.summary
+            verified.checks = [c for c in probes.checks if c.get("driver") is True] + verified.checks
+        else:
+            verified.checks = probes.checks + verified.checks
     if fixture_blocker:
         verified.verdict, verified.blocked_by, verified.finished = "blocked", fixture_blocker, False
     if (verified.verdict == "pass" and checked_trees and agent_finished and res.runner in {"pi", "codex", "claude"}
@@ -3201,7 +3220,12 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
 
 def save_verification(run: Run, step: str, verified: verify.Verified) -> verify.Verified:
     verified.saved = os.path.abspath(run.dir / f"{step}.md")
-    run.save(f"{step}.md", verified.markdown())
+    report = verified.markdown()
+    run.save(f"{step}-drivers.json", {
+        "report_sha256": hashlib.sha256(report.encode()).hexdigest(),
+        "drivers": [check["what"] for check in verified.checks if check.get("driver") is True],
+    })
+    run.save(f"{step}.md", report)
     run.log(f"{step}: {verified.verdict}, {len(verified.checks) - len(verified.failed_checks)} of "
             f"{util.count(len(verified.checks), 'check')} passed")
     return verified
