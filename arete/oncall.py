@@ -15,6 +15,7 @@ from pathlib import Path
 from . import (
     config,
     control,
+    diffguard,
     jev,
     log_follower,
     outbound,
@@ -967,13 +968,14 @@ def route_refusal(cfg: config.Config, repo: config.Repo) -> tuple[str, bool]:
     return "", False
 
 
-def repair_prompt(row: dict, repairs: list[dict], limit: int) -> str:
+def repair_prompt(row: dict, repairs: list[dict], limit: int, layer: config.RepoLayer) -> str:
     earlier = "".join(f"- attempt {n}: task {r['task']}, run {last_run_id(r)}, ended {r['outcome'] or 'unfinished'}\n"
                       for n, r in enumerate(repairs, 1))
     return prompt_loader.prompt("oncall_repair", paths.PROMPTS_DIR,
         incident=row["id"], kind=row["class"], source=outbound.plain(row["source"], 200), count=row["count"],
         first_seen=row["first_seen"], last_seen=row["last_seen"], attempt=len(repairs) + 1,
-        max_attempts=limit, earlier=f"Earlier attempts:\n{earlier}" if earlier else "", evidence=subject(row))
+        max_attempts=limit, earlier=f"Earlier attempts:\n{earlier}" if earlier else "", evidence=subject(row),
+        denied=prompt_loader.code_list(diffguard.denied_paths(layer)))
 
 
 def exhausted(cfg: config.Config, row: dict) -> str:
@@ -1085,7 +1087,8 @@ def wake(cfg: config.Config, row: dict) -> bool:
     mine = attempts(row)
     name = repair_repo(cfg, row)
     try:
-        text = repair_prompt(row, mine, limits.max_attempts)
+        layer = config.load_layer(cfg.repo(name).layer_dir)
+        text = repair_prompt(row, mine, limits.max_attempts, layer)
     except (OSError, ValueError) as error:
         moved(row, "waiting", f"repair prompt refused: {outbound.sanitize(str(error), 160)}")
         return False

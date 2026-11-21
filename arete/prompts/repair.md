@@ -25,6 +25,8 @@ $expertise
 
 ## Rules
 
+Denied paths: $denied.
+
 - The branch already holds the PR's work. Read what it changes with `git log` and `git diff` against the PR base
   before you edit.
 - Fix every finding listed: each is a blocker from the last review. Where a finding and the plan disagree, the finding wins.
