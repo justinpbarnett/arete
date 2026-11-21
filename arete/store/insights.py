@@ -196,10 +196,11 @@ def release_interrupted_feedback(run_id: str) -> None:
                 release_feedback(run_id)
 
 
-def settle_feedback(run_id: str, status: str) -> None:
+def settle_feedback(run_id: str, status: str, *, prs: tuple[str, ...] = ()) -> None:
+    pr_filter = f" AND pr_url IN ({','.join('?' * len(prs))})" if prs else ""
     with db() as c:
-        c.execute("UPDATE feedback SET status = ?, previous_run_id = NULL WHERE run_id = ? AND status = 'taken'",
-                  (status, run_id))
+        c.execute(f"UPDATE feedback SET status = ?, previous_run_id = NULL WHERE run_id = ? AND status = 'taken'"
+                  f"{pr_filter}", (status, run_id, *prs))
 
 
 def feedback_between(since: str, until: str) -> list[dict]:

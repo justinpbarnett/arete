@@ -5,7 +5,10 @@ import subprocess
 from contextlib import nullcontext
 from datetime import timedelta
 
-from . import codebase, config, gh, oncall, paths, pilot, runlimits, runner, sandbox, scratch, tracker, util, workspace, zte
+from . import (
+    codebase, config, gh, oncall, paths, pilot, pipeline, runlimits, runner, sandbox, scratch, tracker, util, workspace,
+    zte,
+)
 from .store import orchestration
 from .store import runs as run_store
 
@@ -16,6 +19,7 @@ REASONS = {
     "worktree": ("a held worktree", "the worktree is free"),
     "worktree-removal": ("a worktree that could not be removed", "the worktree is gone"),
     "engine-crash": ("an Arete engine crash", "the Arete engine stamp changed"),
+    "policy-changed": ("a base merge changed the accepted worker policy", "a fresh run can load the merged policy"),
     "runner-start": ("a runner start failure", "the runner answered its startup check"),
     "runner-login": ("a runner login failure", "the runner login is available again"),
     "sandbox-start": ("a sandbox start failure", "the local sandbox started successfully"),
@@ -40,6 +44,12 @@ def recorded_failure(run: dict) -> dict:
     except (TypeError, ValueError):
         pass
     return {}
+
+
+def policy_retry(run: dict | None) -> bool:
+    return bool(run and run["status"] == "failed" and run.get("summary") == pipeline.worker_policy_changed()
+                and recorded_failure(run).get("reason") == "policy-changed"
+                and not orchestration.publication_pending(run["id"]))
 
 
 def workspace_ready(repo: config.Repo, layer: config.RepoLayer, issue: str, failure: dict) -> bool:
@@ -72,6 +82,8 @@ def cleared(cfg: config.Config, repo: config.Repo, layer: config.RepoLayer, tick
                 return workspace_ready(repo, layer, ticket.id, failure)
             case "engine-crash":
                 return bool(run.get("engine_sha") and codebase.STAMP and run["engine_sha"] != codebase.STAMP)
+            case "policy-changed":
+                return run.get("summary") == pipeline.worker_policy_changed()
             case "runner-start":
                 return runner.started_now(failure["runner"])
             case "runner-login":
