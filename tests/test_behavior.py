@@ -15,12 +15,14 @@ from unittest import mock
 
 from arete import (
     accounts, api_check, api_http, chat, config, contract, control, dashboard, events, gh, idempotency, jira, pipeline, principals,
-    screening, serve, tailnet, tasks, triage, util,
+    paths, screening, serve, tailnet, tasks, triage, util,
 )
 from arete.store import approvals as approvals_store
 from arete.store import chats as chats_store
 from arete.store import db
 from arete.store import idempotency as claims
+from arete.store import runs as run_store
+from arete.store import tasks as task_store
 from arete.store import triage as triage_store
 from tests import support, versioned_api_fixture
 
@@ -500,14 +502,19 @@ class VersionedApiTests(unittest.TestCase):
 
     def publication_post(self, path, body, key):
         payload = json.dumps(body).encode() if body is not None else b""
-        headers = f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Arete: 1\r\n"
+        headers = {"X-Arete": "1"}
         if payload:
-            headers += f"Content-Type: application/json\r\nContent-Length: {len(payload)}\r\n"
+            headers.update({"Content-Type": "application/json", "Content-Length": str(len(payload))})
         if key:
-            headers += f"Idempotency-Key: {key}\r\n"
-        incoming = BytesIO((headers + "\r\n").encode() + payload)
+            headers["Idempotency-Key"] = key
+        return self.wire_request("POST", path, headers, payload)
+
+    def wire_request(self, method, path, headers, payload=b""):
+        request = [f"{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n"]
+        request.extend(f"{name}: {value}\r\n" for name, value in headers.items())
+        incoming = BytesIO(("".join(request) + "\r\n").encode() + payload)
         outgoing = bytearray()
-        connection = SimpleNamespace(makefile=lambda *args: incoming, sendall=outgoing.extend)
+        connection = SimpleNamespace(makefile=lambda *args: incoming, sendall=outgoing.extend, settimeout=lambda _: None)
         server = SimpleNamespace(node=SimpleNamespace(names={"127.0.0.1"}),
                                  logins=SimpleNamespace(of=lambda _: "fixture@example.test"))
         dashboard.Handler(connection, ("127.0.0.1", 0), server)
@@ -595,6 +602,56 @@ class VersionedApiTests(unittest.TestCase):
         with mock.patch.object(db, "tx", side_effect=AssertionError("repeat page opened a write transaction")):
             page()
         self.assertEqual(grace(), deadline)
+
+    def test_board_view(self):
+        self.enterContext(mock.patch.object(paths, "DB_FILE", paths.DB_FILE.with_name("board.db")))
+        db.migrate()
+        principals.seed_owner("fixture@example.test")
+
+        def request(path, *, headers=None, status=200):
+            actual, response, raw = self.wire_request("GET", path, {"Accept": "application/json", **(headers or {})})
+            self.assertEqual(actual, status, (path, raw))
+            return (json.loads(raw) if raw else None), response
+
+        task = task_store.task_add(self.repo.name, "Board fixture", "Board card")
+        closed = task_store.task_add(self.repo.name, "Closed fixture", "Closed card")
+        task_store.task_set_state(closed, "closed")
+        board_url = "/api/v1/screen?view=board"
+        before, response = request(board_url)
+        self.assertEqual(before["seq"], response["Arete-Seq"])
+        view = before["view"]
+        listed, _ = request("/api/v1/tasks")
+        self.assertEqual(view["tasks"], listed["tasks"])
+        self.assertEqual(view["running_ids"], [])
+        self.assertEqual({col["state"]: col["count"] for col in view["columns"]},
+                         {row["state"]: sum(r["state"] == row["state"] for r in listed["tasks"]) for row in listed["tasks"]})
+        headers = {"If-None-Match": response["ETag"]}
+        self.assertTrue(headers["If-None-Match"])
+        with mock.patch.object(dashboard, "get_sidebar", return_value={**before["sidebar"], "now": "later"}):
+            body, unchanged = request(board_url, status=304, headers=headers)
+        self.assertIsNone(body)
+        self.assertEqual(unchanged["ETag"], headers["If-None-Match"])
+        self.assertEqual(unchanged["Arete-Seq"], before["seq"])
+
+        run = f"board-{task}"
+        fields = {"kind": "pipeline", "repo": self.repo.name, "issue": task, "status": "running", "started": util.iso()}
+        run_store.insert_run(run, fields)
+        task_store.task_set_state(task, "running")
+        active, _ = request(board_url)
+        self.assertEqual(active["view"]["running_ids"], [run])
+        self.assertEqual(active["sidebar"]["running"], 1)
+        run_store.note(run, summary="Building")
+        task_store.task_set_state(task, "pr")
+        run_store.settle(run, {"status": "pr", "finished": util.iso()})
+        found, _ = request(f"/api/v1/events?since={before['seq']}&timeout=0")
+        lifecycle = [(event["kind"], event["data"]["board_task"]["state"]) for event in found["events"]
+                     if event["subject"] == f"run:{run}"]
+        self.assertEqual(lifecycle, [("run.started", "todo"), ("run.changed", "running"), ("run.ended", "pr")])
+        after, response = request(board_url, headers=headers)
+        self.assertNotEqual(response["ETag"], headers["If-None-Match"])
+        self.assertEqual(next(row["state"] for row in after["view"]["tasks"] if row["id"] == task), "pr")
+        with mock.patch.object(dashboard.api, "VIEWS", {k: v for k, v in dashboard.api.VIEWS.items() if k != "board"}):
+            request(board_url, status=404)
 
     def check_transport(self, port):
         def exchange(method, path, headers=(), body=b""):
