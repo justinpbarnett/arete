@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import plistlib
 import re
@@ -7,7 +8,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from . import config, paths, tracker, util
+from . import config, paths, serve_guard, tracker, util
 
 AGENTS_DIR = paths.HOME / "Library" / "LaunchAgents"
 UNITS_DIR = paths.HOME / ".config" / "systemd" / "user"
@@ -46,16 +47,39 @@ def build_path() -> str:
     return ":".join(out)
 
 
-def arete_exe() -> str:
-    return shutil.which("arete") or str(paths.HOME / ".local" / "bin" / "arete")
+def serve_guard_file() -> Path:
+    return paths.STATE_DIR / "serve-start.py"
+
+
+def write_serve_guard() -> None:
+    util.write_durably(serve_guard_file(), Path(serve_guard.__file__).read_bytes(), mode=0o600)
+
+
+def serve_command() -> list[str]:
+    checkout = paths.PACKAGE_DIR.parent
+    entrypoint = (
+        "import sys; "
+        "sys.orig_argv = [sys.executable, '-I', '-S', *sys.argv[1:]]; "
+        "sys.pycache_prefix = '/dev/null'; sys.dont_write_bytecode = True; "
+        "sys.path.insert(0, sys.argv[3]); sys.argv[:] = ['arete', 'serve']; "
+        "from arete import cli; cli._serve_start_checked = True; raise SystemExit(cli.main())"
+    )
+    return [sys.executable, "-I", "-S", str(serve_guard_file()), str(paths.STATE_DIR), str(checkout),
+            str(paths.LOG_DIR), entrypoint]
+
+
+def serve_environment() -> dict[str, str]:
+    return {"ARETE_CONFIG_DIR": str(paths.CONFIG_DIR), "ARETE_STATE_DIR": str(paths.STATE_DIR),
+            "ARETE_LOG_DIR": str(paths.LOG_DIR)}
 
 
 def serve_plist() -> dict:
     log = str(paths.LOG_DIR / "serve.log")
     return {
         "Label": label(SERVE),
-        "ProgramArguments": [arete_exe(), SERVE],
-        "EnvironmentVariables": {"PATH": build_path(), "HOME": str(paths.HOME), "LANG": "en_US.UTF-8"},
+        "ProgramArguments": serve_command(),
+        "EnvironmentVariables": {"PATH": build_path(), "HOME": str(paths.HOME), "LANG": "en_US.UTF-8",
+                                 **serve_environment()},
         "StandardOutPath": log,
         "StandardErrorPath": log,
         "WorkingDirectory": str(paths.HOME),
@@ -67,14 +91,21 @@ def serve_plist() -> dict:
     }
 
 
+def unit_arg(value: str) -> str:
+    return json.dumps(value.replace("%", "%%"), ensure_ascii=False)
+
+
 def serve_unit() -> str:
+    command = " ".join(unit_arg(arg.replace("$", "$$")) for arg in serve_command())
+    environment = "\n".join(f"Environment={unit_arg(f'{k}={v}')}" for k, v in serve_environment().items())
     return f"""[Unit]
 Description=arete serve: loops, webhooks, sessions and the dashboard
 Wants=network-online.target
 After=network-online.target
 
 [Service]
-ExecStart={arete_exe()} {SERVE}
+ExecStart={command}
+{environment}
 Restart=always
 RestartSec=10
 KillMode=process
@@ -135,6 +166,7 @@ def install(dry_run: bool = False, platform: str = "") -> int:
 
 def install_launchd() -> int:
     AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+    write_serve_guard()
     for name in RETIRED:
         retire(label(name))
     pl = serve_plist()
@@ -148,6 +180,7 @@ def install_launchd() -> int:
 
 def install_systemd() -> int:
     UNITS_DIR.mkdir(parents=True, exist_ok=True)
+    write_serve_guard()
     serve_file("linux").write_text(serve_unit())
     for step in (["daemon-reload"], ["enable", "--now", SERVE_UNIT], ["restart", SERVE_UNIT]):
         res = util.sh(["systemctl", "--user", *step], timeout=60)
