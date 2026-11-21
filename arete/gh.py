@@ -62,11 +62,15 @@ def unscreened_text(args: list[str], input: str | None) -> bool:
                for flag, value in itertools.pairwise(args))
 
 
-def gh(args: list[str], cwd=None, timeout: float = 120, input: str | None = None, write: bool = False) -> str:
+def gh(args: list[str], cwd=None, timeout: float = 120, input: str | None = None, write: bool = False,
+       *, retry: bool = True) -> str:
     if unscreened_text(args, input):
         raise TypeError("text sent to GitHub must come from gh.outgoing")
-    res = util.sh_with_network(["gh", *args], cwd=cwd, timeout=timeout, input=input,
-                               rerun=util.NEVER_SENT if write else util.NETWORK_ERROR)
+    if retry:
+        res = util.sh_with_network(["gh", *args], cwd=cwd, timeout=timeout, input=input,
+                                   rerun=util.NEVER_SENT if write else util.NETWORK_ERROR)
+    else:
+        res = util.sh(["gh", *args], cwd=cwd, timeout=timeout, input=input)
     if res.returncode != 0:
         command = " ".join(itertools.takewhile(lambda arg: not arg.startswith("-"), args))
         output = res.stdout + res.stderr
@@ -259,14 +263,14 @@ def issue_close(repo: str, number: int, comment: str = "") -> None:
             gh(retry, write=True)
 
 
-def issue_labels(repo: str, number: int, add: list[str] = (), remove: list[str] = ()) -> None:
+def issue_labels(repo: str, number: int, add: list[str] = (), remove: list[str] = (), *, single_attempt=False) -> None:
     args = ["issue", "edit", str(number), "--repo", repo]
     for lb in add:
         args += ["--add-label", lb]
     for lb in remove:
         args += ["--remove-label", lb]
     if len(args) > 5:
-        gh(args)
+        gh(args, write=single_attempt)
 
 
 def issue_state(repo: str, number: int) -> str:
@@ -668,6 +672,48 @@ def commit_checks(repo: str, ref: str) -> dict[str, Check]:
 
 def branch_sha(repo: str, branch: str) -> str:
     return gh(["api", f"repos/{repo}/commits/{branch}", "--jq", ".sha"]).strip()
+
+
+def origin_project(url: str) -> str:
+    match = re.fullmatch(
+        r"(?:(?:https://(?:[A-Za-z0-9._~%:-]+@)?github\.com(?::443)?"
+        r"|ssh://git@(?:github\.com(?::22)?|ssh\.github\.com:443))/|git@github\.com:)"
+        r"([A-Za-z0-9-]+/[A-Za-z0-9_.-]+)", url, re.IGNORECASE | re.ASCII)
+    return match[1].casefold().removesuffix(".git") if match else ""
+
+
+def branch_heads(projects: set[str], branch: str) -> dict[str, str]:
+    aliases = {f"part{i}": project for i, project in enumerate(sorted(projects))}
+    selections = []
+    for alias, project in aliases.items():
+        owner, name = project.split("/")
+        selections.append(f'{alias}: repository(owner: {json.dumps(owner)}, name: {json.dumps(name)}) '
+                          '{ nameWithOwner ref(qualifiedName: $ref) { prefix name target { oid } } }')
+    query = "query($ref: String!) { " + " ".join(selections) + " }"
+    payload = Outgoing(json.dumps({"query": query, "variables": {"ref": f"refs/heads/{branch}"}}))
+    reply = json.loads(gh(["api", "graphql", "--hostname", "github.com", "--input", "-"],
+                          input=payload, timeout=10, retry=False))
+    incomplete = "GitHub did not return complete parked branch heads"
+    if (not isinstance(reply, dict) or reply.get("errors", []) != []
+            or not isinstance(data := reply.get("data"), dict)):
+        raise GhError(incomplete)
+    found = {}
+    for alias, project in aliases.items():
+        repo = data.get(alias)
+        if (not isinstance(repo, dict) or not isinstance(name := repo.get("nameWithOwner"), str)
+                or name.casefold() != project
+                or "ref" not in repo):
+            raise GhError(incomplete)
+        ref = repo["ref"]
+        if ref is None:
+            found[project] = ""
+            continue
+        if (not isinstance(ref, dict) or ref.get("prefix") != "refs/heads/" or ref.get("name") != branch
+                or not isinstance(target := ref.get("target"), dict)
+                or not isinstance(oid := target.get("oid"), str) or not re.fullmatch(r"[0-9a-f]{40}", oid)):
+            raise GhError(incomplete)
+        found[project] = oid
+    return found
 
 
 def job_log(repo: str, job: int) -> str:

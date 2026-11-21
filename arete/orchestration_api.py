@@ -82,10 +82,11 @@ OPERATIONS = {
     "review.run": Operation("One independent review of the current tree.",
                              {"context_refs": (list, []), "route_id": required(str), "effort": required(str)}),
     "owner.ask": Operation("Ask through the existing owner-question lifecycle.", {"request": required(dict)}),
-    "run.wait": Operation("Wait for worker completion or failure, or the bounded timeout; routine progress stays visible "
-                          "without waking the controller. Use the longest useful timeout for active work.",
+    "run.wait": Operation("Wait for worker completion, failure or a new progress report. For active work use a single "
+                          "run.wait call with timeout_seconds=0 to follow the worker to its step or run deadline. "
+                          "A positive timeout caps the wait further and omission defaults to 60 seconds.",
                           {"after": (int, 0), "timeout_seconds": (int, 60)},
-                          {"after": {"minimum": 0}, "timeout_seconds": {"minimum": 1, "maximum": 120}}),
+                          {"after": {"minimum": 0}, "timeout_seconds": {"minimum": 0}}),
     "publication.request": Operation("Request existing engine publication; current evidence and authority are required.", {}),
     "run.finish": Operation("Finish failed, noop or delivered; delivered requires engine publication.",
                              {"reason": required(str), "evidence_refs": (list, [])},

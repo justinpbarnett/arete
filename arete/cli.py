@@ -4,12 +4,12 @@ import argparse
 import sys
 
 from . import __version__, codebase, paths, pilot, principals, zte
-from .commands import costs, hooks, lab, loops, records, research, runs, sessions, setup, tasks
+from .commands import api, costs, hooks, lab, loops, records, research, runs, sessions, setup, tasks
 from .commands.common import Parser, serve_line
 
 __all__ = ["main", "serve_line"]
 
-REGISTRATIONS = (runs.register, tasks.register, loops.register, sessions.register, hooks.register, costs.register,
+REGISTRATIONS = (api.register, runs.register, tasks.register, loops.register, sessions.register, hooks.register, costs.register,
                  records.register, research.register, lab.register, setup.register, pilot.register, zte.register)
 
 PER_CALL_HOOKS = paths.PER_CALL_HOOKS
@@ -33,6 +33,8 @@ def main(argv: list[str] | None = None) -> int:
     for register in REGISTRATIONS:
         register(sub)
     args = ap.parse_args(argv)
+    if args.cmd == "api":
+        return args.fn(args) or 0
     if args.cmd not in PER_CALL_HOOKS:
         codebase.load()
     try:

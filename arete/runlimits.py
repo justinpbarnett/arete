@@ -3,16 +3,17 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import signal
 import sqlite3
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, replace
 from functools import wraps
 from pathlib import Path
 
-from . import budget_legacy, paths, run_lines, util
+from . import budget_legacy, gh, paths, run_lines, util
 from .store import db as foundation
 from .store import runs as run_store
 
@@ -22,6 +23,8 @@ REPAIRS = {"check_repair", "review_repair", "ci_repair"}
 REPAIR_NAMES = ("repair", "fix", "verify_fix", "review_fix", "ci_fix")
 RETRY = ("Change the ticket specification, published branch head, or budget settings, then retry with "
          "arete run REPO TICKET --force.")
+HEAD_ERROR = "could not confirm the parked branch head; work remains parked"
+OID = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 
 
 class Parked(BaseException):
@@ -101,19 +104,35 @@ def recorded_specification(run_id: str) -> str:
     return ""
 
 
+def checkouts(repo) -> list[tuple[str, Path]]:
+    return [(p.dir, repo.path / p.dir) for p in repo.parts] or [("", repo.path)]
+
+
+def branch_head(src: Path, branch: str) -> str:
+    ref = f"refs/heads/{branch}"
+    result = util.sh(["git", "ls-remote", "origin", ref], cwd=src, timeout=10, keeps=("ssh-agent",))
+    if result.returncode:
+        raise ValueError(HEAD_ERROR)
+    if not result.stdout:
+        return ""
+    head = ""
+    for line in result.stdout.removesuffix("\n").split("\n"):
+        oid, tab, name = line.partition("\t")
+        if not tab or not name.startswith("refs/") or not OID.fullmatch(oid):
+            raise ValueError(HEAD_ERROR)
+        if name == ref:
+            if head:
+                raise ValueError(HEAD_ERROR)
+            head = oid
+        elif not name.endswith(f"/{ref}"):
+            raise ValueError(HEAD_ERROR)
+    return head
+
+
 def heads(repo, branch: str) -> dict[str, str]:
     if not branch:
         return {}
-    found = {}
-    parts = [(p.dir, repo.path / p.dir) for p in repo.parts] or [("", repo.path)]
-    for name, src in parts:
-        result = util.sh(["git", "ls-remote", "origin", f"refs/heads/{branch}"], cwd=src, timeout=10,
-                         keeps=("ssh-agent",))
-        if result.returncode:
-            raise ValueError("could not confirm the parked branch head; work remains parked")
-        row = result.stdout.split()
-        found[name] = row[0] if row else ""
-    return found
+    return {name: branch_head(src, branch) for name, src in checkouts(repo)}
 
 
 def latest_park(repo: str, tid: str) -> tuple[dict, dict]:
@@ -125,18 +144,134 @@ def latest_park(repo: str, tid: str) -> tuple[dict, dict]:
     return row, {}
 
 
-def admission(repo, tid: str, tracker, policy: Policy, explicit: bool) -> tuple[str, bool]:
+def park_reason(row: dict, saved: dict) -> str:
+    return f"parked after run {row['id']}: {saved.get('reason', 'its process budget expired')}. {RETRY}"
+
+
+def park_branch(row: dict, saved: dict) -> str:
+    return str(saved.get("branch") or row.get("branch") or "")
+
+
+def inputs_changed(saved: dict, spec: str, policy: dict) -> bool:
+    return (bool(saved.get("specification")) and saved["specification"] != spec
+            or saved.get("policy") != policy)
+
+
+def readmission_key(value) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
+def effective_origins(repo) -> dict[str, str]:
+    parts = checkouts(repo)
+    projects = {p.dir: p.github.casefold() for p in repo.parts} if len(parts) > 1 else {}
+    bindings = {}
+    for name, src in parts:
+        result = util.sh(["git", "remote", "get-url", "origin"], cwd=src, timeout=10)
+        url = result.stdout.removesuffix("\n")
+        if result.returncode or not url or "\n" in url or name in bindings:
+            raise ValueError(HEAD_ERROR)
+        if projects:
+            project = gh.origin_project(url)
+            if not project or project != projects[name]:
+                raise ValueError(f"could not confirm {name}'s origin matches its configured GitHub project")
+            bindings[name] = project
+        else:
+            bindings[name] = readmission_key([str(src.resolve()), url])
+    return bindings
+
+
+def complete_heads(value, names: set[str]) -> bool:
+    return (isinstance(value, dict) and value.keys() == names
+            and all(isinstance(oid, str) and (not oid or OID.fullmatch(oid)) for oid in value.values()))
+
+
+@dataclass(frozen=True)
+class Readmission:
+    run_id: str
+    baseline: str
+    inputs: str
+    branch: str = ""
+    origins: dict[str, str] = field(default_factory=dict)
+    heads: dict[str, str] = field(default_factory=dict)
+
+    @classmethod
+    def decode(cls, data: str) -> Readmission | None:
+        if not data:
+            return None
+        try:
+            return cls(**json.loads(data))
+        except TypeError as error:
+            raise ValueError("invalid poll readmission") from error
+
+    def matches(self, repo, row: dict, saved: dict, ticket, policy: Policy) -> bool:
+        spec, limits = specification(ticket), asdict(policy)
+        if self.baseline != readmission_key(saved) or self.inputs != readmission_key([spec, limits]):
+            return False
+        if not self.branch:
+            return inputs_changed(saved, spec, limits)
+        names = {name for name, _ in checkouts(repo)}
+        return (self.branch == park_branch(row, saved) and complete_heads(saved.get("heads"), names)
+                and complete_heads(self.heads, names) and self.heads != saved["heads"]
+                and self.origins == effective_origins(repo))
+
+    def attempted(self, *, record: bool = False) -> bool:
+        attempts = metadata(self.run_id, "poll-readmissions.json")
+        key = readmission_key(asdict(self))
+        if key in attempts:
+            return True
+        if record:
+            util.write_json(artifact(self.run_id, "poll-readmissions.json"), {**attempts, key: True})
+        return False
+
+
+def admission(repo, tid: str, tracker, policy: Policy, explicit: bool, *,
+              readmission: Readmission | None = None) -> tuple[str, bool]:
     row, saved = latest_park(repo.name, tid)
     if not saved:
-        return "", False
-    reason = f"parked after run {row['id']}: {saved.get('reason', 'its process budget expired')}. {RETRY}"
-    if not explicit:
-        return reason, False
-    changed = (bool(saved.get("specification")) and saved["specification"] != specification(tracker.get(tid))
-               or saved.get("policy") != asdict(policy))
-    if not changed and isinstance(saved.get("heads"), dict):
-        changed = saved.get("heads") != heads(repo, str(saved.get("branch") or row.get("branch") or ""))
-    return ("", True) if changed else (reason, False)
+        return ("the parked run changed before launch", False) if readmission else ("", False)
+    if explicit:
+        spec = specification(tracker.get(tid)) if saved.get("specification") else ""
+        if inputs_changed(saved, spec, asdict(policy)):
+            return "", True
+        if isinstance(saved.get("heads"), dict) and saved["heads"] != heads(repo, park_branch(row, saved)):
+            return "", True
+    if readmission and readmission.run_id == row["id"] and readmission.matches(repo, row, saved, tracker.get(tid), policy):
+        return "", True
+    return park_reason(row, saved), False
+
+
+def poll_admission(repo, tid: str, ticket, policy: Policy) -> tuple[str, Readmission | None]:
+    row, saved = latest_park(repo.name, tid)
+    if not saved:
+        return "", None
+    reason = park_reason(row, saved)
+    tried = f"{reason} Poll already tried these inputs."
+    spec, limits = specification(ticket), asdict(policy)
+    proof = Readmission(row["id"], readmission_key(saved), readmission_key([spec, limits]))
+    try:
+        if inputs_changed(saved, spec, limits):
+            if not proof.attempted():
+                return "", proof
+            reason = tried
+        branch = park_branch(row, saved)
+        if not branch or not complete_heads(saved.get("heads"), {name for name, _ in checkouts(repo)}):
+            return reason, None
+        origins = effective_origins(repo)
+        if len(origins) > 1:
+            published = gh.branch_heads(set(origins.values()), branch)
+            current = {name: published[project] for name, project in origins.items()}
+        else:
+            current = heads(repo, branch)
+        if current == saved["heads"]:
+            return reason, None
+        proof = replace(proof, branch=branch, origins=origins, heads=current)
+        if proof.attempted():
+            return tried, None
+        return "", proof
+    except gh.GhError:
+        return f"{reason} GitHub could not confirm every parked branch head.", None
+    except (OSError, ValueError) as error:
+        return f"{reason} {error}", None
 
 
 def contracted(conn=None) -> bool:
