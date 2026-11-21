@@ -893,8 +893,8 @@ class ParkRetryFixture(PollFixture):
         self.age_park(run.id)
         record.settle(run.id, "failed")
 
-    def remote_run(self, source, issue):
-        rid = record.start("pipeline", repo=self.repo.name, issue=issue)
+    def remote_run(self, source, issue, *, tag=""):
+        rid = record.start("pipeline", tag=tag, repo=self.repo.name, issue=issue)
         directory = paths.RUNS_DIR / rid
         directory.mkdir()
         run = pipeline.Run(rid, self.repo, directory, tracker=source, tid=issue, cfg=self.cfg)
@@ -941,7 +941,8 @@ class LocalParkRetryTests(ParkRetryFixture):
         self.assertNotIn(private, retry.body)
         self.assertEqual(park_retries.ticket_evidence(self.repo.name, replace(ticket, id=unrelated), parked.id), [])
         for bad in ("../other", r"Client\Tools", "Client\nTools", "Client\tTools", "Client-->Tools"):
-            self.assertIsNone(tracker.retry_marker(retry.body.replace(self.repo.name, bad)))
+            body = retry.body.replace(self.repo.name, bad)
+            self.assertEqual(tracker.retry_comments([(retry.when, body)], self.repo.name, self.ticket), [])
 
         ws = paths.WORKTREES_DIR / f"{self.repo.name}-{self.ticket}"
         ws.mkdir()
@@ -1232,6 +1233,34 @@ class LocalParkRetryTests(ParkRetryFixture):
         self.assertEqual(len(tasks_store.task_comments(self.ticket)), 1)
 
 class GitHubParkRetryTests(ParkRetryFixture):
+    def test_written_retry_markers_round_trip_for_generated_repo_tags(self):
+        issue = self.github_batch()
+        issue["labels"].remove({"name": "agent:batch"})
+        source = tracker.GitHubTracker(self.repo)
+        comments = issue["comments"]
+
+        def post(_args, *, input, write):
+            self.assertTrue(write)
+            comments.append({"body": input, "viewerDidAuthor": True, "createdAt": util.iso()})
+            return "https://example.invalid/issue-comment"
+
+        with patch.object(gh, "issue", return_value=issue) as read, patch.object(gh, "gh", side_effect=post):
+            for alias in ("Client+Tools", "Équipe"):
+                with self.subTest(alias=alias):
+                    self.repo.name = alias
+                    parked = self.remote_run(source, "17", tag=f"{alias}-17")
+                    self.park_for_triage(parked)
+                    self.assertIsNone(park_retries.retry_ticket(source, "17", ()))
+                    posted = comments[-1]["body"]
+                    self.assertEqual(tracker.retry_marker(posted).groups(), (parked.id, "1"))
+
+                    missing_id = record.new_id("pip", f"{alias}-unrecorded")
+                    comments.append({**comments[-1], "body": f"<!-- arete:retry run={missing_id} n=2 -->"})
+                    self.assertEqual([retry.run_id for retry in source.get("17").retries], [parked.id])
+                    read.return_value = {**issue, "number": 18}
+                    self.assertEqual(source.get("18").retries, [])
+                    read.return_value = issue
+
     def test_github_retries_use_approved_criteria_and_record_pointers(self):
         unsafe = ("Paste password hidden-literal", "Report ghp_synthetic12345678", "Read files from /tmp/private.txt",
                   r"Read C:\outside\private.txt", "Read ../private.txt", "<p>Private page contents</p>",
@@ -1338,7 +1367,7 @@ outcome = "No approved tracker text"
         def work(cfg, run, slot):
             self.assertEqual(run.budget.parents, [])
             run.enter("running")
-            ticket = run.task_ticket()
+            ticket = run.task_ticket(audit=True)
             self.assertEqual(ticket.body, original)
             started.append(run.id)
             job = SimpleNamespace(run=run, cfg=cfg, layer=config.load_layer(self.repo.layer_dir),
@@ -1351,6 +1380,13 @@ outcome = "No approved tracker text"
             self.assertNotIn(blocker, output)
             self.assertNotIn(error, output)
             self.assertIn("Review blocker — run", output)
+            self.assertFalse(run.feedback)
+            report = pipeline.report_body(
+                run, summary="Updated draft handling", review=pipeline.Review("approve"),
+                verified=verify.Verified("pass", "Draft kept"), left="", images={}, approval=None,
+                attempts=1, checks="fixture checks", plan_text=f"Address this finding: {blocker}", size="small")
+            self.assertNotIn("<details><summary>Plan</summary>", report)
+            self.assertNotIn(blocker, report)
             if len(started) == 1:
                 self.assertIn(error, context)
                 self.assertNotIn("Private raw page text", context)
@@ -1571,6 +1607,9 @@ outcome = "No approved tracker text"
             revision["labels"][-1] = {"name": "agent:failed"}
             revision["title"] = "Owner updated the specification"
             review(2)
+            why, proof = runlimits.poll_admission(self.repo, "17", source.get("17"), parked_revision.budget.policy)
+            self.assertEqual(why, "")
+            self.assertFalse(proof.feedback)
             self.assertEqual(self.poll_with(self.cfg, spawn), 0)
         self.assertEqual(started, ["17", "17"])
         self.assertEqual([call.args for call in pr_view.call_args_list], [(pr,), (pr,)])
@@ -1912,11 +1951,13 @@ class ParkRecoveryTests(ParkRetryFixture):
                 self.assertEqual(json.loads(journal.read_text())["rewrites"], {})
 
     def test_retry_requires_the_newest_comment_to_be_newer_than_this_park(self):
+        older = self.made_run()
+        self.park_for_triage(older)
         run = self.made_run()
         self.park_for_triage(run)
         self.local.label(self.ticket, add=["failed"])
         current = f"<!-- arete:retry run={run.id} n=1 -->\n\nFixture acceptance criteria"
-        other = current.replace(run.id, "pip-20240102-030405-aaaa-older")
+        other = current.replace(run.id, older.id)
 
         def proof():
             _, admission = runlimits.poll_admission(self.repo, self.ticket, self.local.get(self.ticket),
