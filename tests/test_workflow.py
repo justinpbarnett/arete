@@ -2689,12 +2689,25 @@ class CatchUpPublicationFailureTests(MovedBasePublicationFixture, unittest.TestC
 class CatchUpRecoveryTests(MovedBasePublicationFixture, unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.state = Path(cls.enterClassContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        cls.state = Path(tempfile.mkdtemp(prefix="arete-catch-up-"))
+        cls.addClassCleanup(shutil.rmtree, cls.state, ignore_errors=True)
         cls.enterClassContext(mock.patch.multiple(paths, STATE_DIR=cls.state, DB_FILE=cls.state / "arete.db",
                                                   RUNS_DIR=cls.state / "runs", LOCKS_DIR=cls.state / "locks",
                                                   LOG_DIR=cls.state / "logs", WORKTREES_DIR=cls.state / "worktrees"))
         cls.enterClassContext(mock.patch.object(db.dbstats.Timing, "finished"))
-        db.migrate()
+        connect = db.connect_db
+
+        def scratch_connection(*args, **kwargs):
+            conn = connect(*args, **kwargs)
+            if not kwargs.get("readonly"):
+                conn.execute("PRAGMA journal_mode=MEMORY")
+            conn.execute("PRAGMA synchronous=OFF")
+            return conn
+
+        cls.enterClassContext(mock.patch.object(db, "connect_db", scratch_connection))
+        cls.enterClassContext(mock.patch.multiple(util, flush_fd=mock.DEFAULT, flush_folder=mock.DEFAULT))
+        with mock.patch.object(db.migrations, "load", return_value=db._CHAIN):
+            db.migrate()
 
     def setUp(self):
         self.ctrl, self.checkout = self.controller()
@@ -2713,11 +2726,10 @@ class CatchUpRecoveryTests(MovedBasePublicationFixture, unittest.TestCase):
         self.body = ("Closes #7\n\n## Checked in use\n\nEarlier verification.\n\n## Review\n\nEarlier review.\n\n"
                      "## Owner note\n\nKeep this.")
         self.head, self.draft = c.lease, False
-        self.enterContext(mock.patch.object(gh, "gh", side_effect=AssertionError("unexpected GitHub call")))
+        self.edit = self.enterContext(mock.patch.object(gh, "gh", side_effect=self.edit_body))
         self.enterContext(mock.patch.object(gh, "pr_body", side_effect=lambda _: self.body))
         self.enterContext(mock.patch.object(gh, "pr_draft_and_head", side_effect=lambda _: (self.draft, self.head)))
         self.enterContext(mock.patch.object(gh, "pr_set_draft", side_effect=lambda _, draft: setattr(self, "draft", draft)))
-        self.edit = self.enterContext(mock.patch.object(gh, "pr_edit_body", side_effect=self.edit_body))
         issue = {"number": 7, "title": job.ticket.title, "author": {"login": "fixture"},
                  "labels": [{"name": tracker.LABEL}], "state": "OPEN"}
         self.enterContext(mock.patch.object(gh, "issue", return_value=issue))
@@ -2736,9 +2748,12 @@ class CatchUpRecoveryTests(MovedBasePublicationFixture, unittest.TestCase):
         self.enterContext(mock.patch.object(run, "enter"))
         return run
 
-    def edit_body(self, url, text, *, link):
+    def edit_body(self, args, *, input):
+        url = args[2]
         self.assertEqual(url, self.checkout.pr)
-        self.body = gh.outgoing(text, link)
+        self.assertEqual(args, ["pr", "edit", url, "--body-file", "-"])
+        self.assertIsInstance(input, gh.Outgoing)
+        self.body = str(input)
 
     def catch_up_hold(self):
         verified = verify.Verified("fail", "Verification failed on the new base.")
@@ -3072,6 +3087,112 @@ class CatchUpRecoveryTests(MovedBasePublicationFixture, unittest.TestCase):
         self.assertTrue(flows.publish(self.ctrl.flow).passed)
         self.assert_body_refreshed(call.args[0] for call in self.run.log.call_args_list)
 
+    def test_pending_refresh_preserves_current_closing_lines(self):
+        self.fail_body_edit()
+        self.body = self.body.replace("Closes #7\n", "Closes #7\nCloses #8\n")
+        self.body = self.body.replace("Earlier review.", "Earlier review.\n\n```\nCloses #100\n```\n\nFixes #9")
+        self.body += "\n\n- Resolves org/repo#10"
+        job = self.ctrl.job
+        job.changed = job.opened = job.pushed = []
+        self.assertTrue(flows.publish(self.ctrl.flow).passed)
+        self.assert_body_refreshed(call.args[0] for call in self.run.log.call_args_list)
+        self.assertTrue(self.body.startswith("Closes #7\nCloses #8\n"))
+        self.assertIn("Fixes #9\n\n## Owner note", self.body)
+        self.assertTrue(self.body.endswith("\n\n- Resolves org/repo#10"))
+        self.assertNotIn("Closes #100", self.body)
+
+    def test_pr_body_sync_preserves_owner_closing_line_before_pending_refresh(self):
+        self.fail_body_edit()
+        self.body = self.body.replace("Closes #7\n", "Closes #7\nCloses #8\n")
+        commented = "<!--\n## Checked in use\nCloses #12\n-->"
+        self.body = self.body.replace("## Checked in use", f"{commented}\n\n## Checked in use", 1)
+        self.body = self.body.replace("Keep this.", "Keep this. @body-owner https://body.internal")
+        job = self.ctrl.job
+        left = "Fixes #99 @new-author https://new.internal"
+
+        pipeline.sync_pr_bodies(self.run, job.ticket, [self.checkout], [], [], [], "", left, "")
+
+        self.assertIn("\nCloses #8\n", self.body)
+        self.assertIn(commented, self.body)
+        self.assertIn("Keep this. <code>@body-owner</code> [private address]", self.body)
+        self.assertIn("Fixes <code>#99</code> <code>@new-author</code> [private address]", self.body)
+        self.assertEqual(len(pipeline.run_store.pr_gate_refreshes(self.repo.name, "7")), 1)
+        job.changed = job.opened = job.pushed = []
+        self.assertTrue(flows.publish(self.ctrl.flow).passed)
+        self.assertIn("\nCloses #8\n", self.body)
+        self.assertIn(commented, self.body)
+        self.push.assert_not_called()
+
+    def test_pending_refresh_does_not_expose_commented_closing_lines(self):
+        self.fail_body_edit()
+        self.body = self.body.replace("Earlier review.",
+                                      "Earlier review. The literal marker `<!--` is an example.\n\n"
+                                      "<!--\nCloses #8\n\n## Hidden heading\n"
+                                      "```\nFixes #9\n-->\n\nCloses #10")
+        job = self.ctrl.job
+        job.changed = job.opened = job.pushed = []
+
+        self.assertTrue(flows.publish(self.ctrl.flow).passed)
+
+        self.assert_body_refreshed(call.args[0] for call in self.run.log.call_args_list)
+        self.assertNotIn("Closes #8", self.body)
+        self.assertNotIn("Fixes #9", self.body)
+        self.assertNotIn("## Hidden heading", self.body)
+        self.assertIn("\nCloses #10\n\n## Owner note", self.body)
+
+    def test_pending_refresh_replaces_review_with_headings_inside_fenced_examples(self):
+        self.fail_body_edit()
+        example = ("````markdown\n## Checked in use\n```\nCloses #100\n````\n\n"
+                   "  ~~~ markdown\n## Review\nFixes #101\n ~~~~\n")
+        self.body = self.body.replace("Earlier review.", f"Earlier review.\n\n{example}\nCloses #8")
+        job = self.ctrl.job
+        job.changed = job.opened = job.pushed = []
+
+        self.assertTrue(flows.publish(self.ctrl.flow).passed)
+
+        self.assert_body_refreshed(call.args[0] for call in self.run.log.call_args_list)
+        self.assertEqual(self.body.splitlines().count("## Checked in use"), 1)
+        self.assertTrue(self.body.endswith("## Review\n\nReview did not run.\n\nCloses #8\n\n## Owner note\n\nKeep this."))
+
+    def test_owner_closing_line_added_during_ci_survives_pending_refresh_and_merge(self):
+        self.catch_up_hold()
+        job, checkout = self.ctrl.job, self.checkout
+        job.verified = verify.Verified("pass", "Repaired head verified.", checks=[
+            {"passed": True, "what": "repair", "how": "run the check", "saw": "passed"}])
+        job.review = Review("approve", "Repaired head approved.")
+        self.ctrl.data["evidence"]["checks"] = {"result": {"full": True}}
+        del self.ctrl.publication_ci
+        self.edit.reset_mock()
+        self.edit.side_effect = gh.GhError("edit rejected")
+        target = ci.Target(checkout.github, checkout.pr, "Closes #99 @ci-owner https://ci.internal", self.head, checkout.base)
+
+        def watch(*_args, **_kwargs):
+            self.edit.assert_called_once()
+            self.assertIn("Verification failed on the new base.", self.body)
+            self.assertEqual(len(pipeline.run_store.pr_gate_refreshes(self.repo.name, "7")), 1)
+            self.body = self.body.replace("Closes #7\n", "Closes #7\nCloses #8\n")
+            self.body = self.body.replace("Keep this.", "Keep this. @body-owner https://body.internal")
+            self.body += f"\n\n{ci.SECTION_START}\n## CI\n\nFixes #9\n\n{ci.SECTION_END}"
+            self.edit.side_effect = self.edit_body
+            return ci.Round(1, [ci.Watched(target, {})])
+
+        def merge(*_args, **_kwargs):
+            self.assertEqual(self.edit.call_count, 3)
+            self.assertEqual(pipeline.run_store.pr_gate_refreshes(self.repo.name, "7"), [])
+            self.assertTrue(self.body.startswith("Closes #7\nCloses #8\n"))
+            self.assertIn("\nFixes #9\n", self.body)
+            self.assertIn("Repaired head approved.", self.body)
+            self.assertIn("## CI", self.body)
+            self.assertIn("Keep this. <code>@body-owner</code> [private address]", self.body)
+            self.assertIn("Closes <code>#99</code> <code>@ci-owner</code> [private address]", self.body)
+
+        with (mock.patch.object(pipeline, "watch_publication_ci", side_effect=watch),
+              mock.patch.object(pipeline, "try_automerge", side_effect=merge) as merge_attempt,
+              mock.patch.object(flows, "ended", return_value=("pr", "published", checkout.pr))):
+            self.assertEqual(self.ctrl.publish()["ending"], "pr")
+        merge_attempt.assert_called_once()
+        self.push.assert_not_called()
+
     def test_later_publish_retries_body_before_merge_callback(self):
         self.fail_body_edit()
         job = self.ctrl.job
@@ -3196,9 +3317,10 @@ class CatchUpRecoveryTests(MovedBasePublicationFixture, unittest.TestCase):
         old_url = f"https://{old_host}/health"
         attempts = []
 
-        def reject_edit(url, text, *, link):
+        def reject_edit(args, *, input):
+            url = args[2]
             self.assertEqual(url, self.checkout.pr)
-            attempts.append(gh.outgoing(text, link))
+            attempts.append(input)
             raise gh.GhError("edit rejected")
 
         with (mock.patch.object(outbound, "extra_hosts", set()),
@@ -3270,6 +3392,35 @@ class CatchUpRecoveryTests(MovedBasePublicationFixture, unittest.TestCase):
         self.assertIn("Verified on the new base.", self.body)
         self.assertIn("Reviewed on the new base.", self.body)
         self.assertEqual(pipeline.run_store.pr_gate_refreshes(self.repo.name, "7"), [])
+
+    def test_failed_refresh_during_catch_up_is_retried_before_merge(self):
+        c = self.checkout
+        current = verify.Verified("pass", "Verified on the new base."), Review("approve", "Reviewed on the new base.")
+
+        def catch_up(*_, before_push):
+            before_push("caught-up", *current)
+            self.head = "caught-up"
+            c.note_pushed_head(self.head)
+            self.edit.side_effect = gh.GhError("edit rejected")
+            return current
+
+        def watch(*_, **_kw):
+            self.assertIn("Earlier verification.", self.body)
+            self.edit.side_effect = self.edit_body
+
+        def merge(*_, **_kw):
+            if merge_attempt.call_count == 1:
+                return gh.MovedBaseHold("base moved")
+            self.assertIn("Verified on the new base.", self.body)
+            self.assertEqual(pipeline.run_store.pr_gate_refreshes(self.repo.name, "7"), [])
+
+        self.ctrl.publication_ci.side_effect = watch
+        with (mock.patch.object(pipeline, "try_automerge", side_effect=merge) as merge_attempt,
+              mock.patch.object(pipeline, "catch_up_base", side_effect=catch_up)):
+            self.assertIsNone(self.ctrl.automerge([c]))
+        self.assertEqual(merge_attempt.call_count, 2)
+        self.assertEqual(self.edit.call_count, 2)
+        self.push.assert_not_called()
 
 
 class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):

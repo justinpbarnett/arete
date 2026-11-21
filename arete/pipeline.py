@@ -82,7 +82,8 @@ NO_FIX_REPLY = "The builder gave no reply."
 MAX_FIX_REPLY_IN_PROMPT = 4000
 NO_FIX_DIFF = "Arete could not read what changed; judge the diff above."
 REFUSAL_WORDS = re.compile(r"guard|jev|credential|secret|confine|authority", re.IGNORECASE)
-SIBLINGS = re.compile(r"\n*## Other PRs for [^\n]*\n(?:\n- \[[^\n]*)+")
+SIBLINGS = re.compile(r"\n*(## Other PRs for [^\n]*\n(?:\n- \[[^\n]*)+)")
+PR_COMMENT_OR_CODE = re.compile(r"\\[\\<`]|(?<!`)(`+)(?!`).*?(?<!`)\1(?!`)|<!--")
 SKIPPED_FILE = paths.STATE_DIR / "skipped.json"
 CONTINUE_AFTER_DROP = "The connection dropped mid step. Carry on from where you stopped and finish the step."
 CONTINUE_AFTER_BUSY = "The provider was busy mid step. Carry on from where you stopped and finish the step."
@@ -485,7 +486,6 @@ class Run(AgentRun):
     action: str = ""
     action_only: bool = False
     workspace: tuple[Path, list[workspace.Checkout]] | None = None
-    workspace_retention_blocked: bool = False
     failure: dict | None = None
     asks_made: int = 0
     answers_due: list[dict] = field(default_factory=list)
@@ -1575,10 +1575,11 @@ def parent_run(script: Script | None, earlier: dict | None, budget_history: list
 
 
 def park_run(run: Run, reason: str) -> tuple[str, str, str]:
-    held = {}
-    if not run.workspace_retention_blocked:
-        keep_edits(run)
-        held = kept_heads(run)
+    keep_edits(run)
+    return record_park(run, reason, kept_heads(run))
+
+
+def record_park(run: Run, reason: str, held: dict) -> tuple[str, str, str]:
     status, summary = "failed", (f"parked: {reason}; branch and evidence retained, workspace left in place"
                                  f"{', edits kept in a local commit' if held else ''}. {runlimits.RETRY}")
     kept = run.budget.park(reason, held)
@@ -2052,6 +2053,12 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     keep_edits(run)
                 workspace.note_made(*run.workspace, workspace_owner(run, *run.workspace), preserve=run.catch_up_preserved)
             slot.free()
+        if run.catch_up_cleanup_park and (held := kept_heads(run)):
+            try:
+                if parked := runlimits.metadata(run.id, "parked.json"):
+                    util.write_json(runlimits.artifact(run.id, "parked.json"), {**parked, "kept": held})
+            except (OSError, ValueError) as e:
+                run.log(f"could not record retained heads for the catch-up park: {e}")
         try:
             with handoff_io():
                 settle_run(run, status, summary, pr_url, restarting, flow, echo_end=not zte_grant)
@@ -2590,6 +2597,7 @@ def automerge(b: Build, approval: dict | None, draft_why: str, verified: verify.
                         set_draft(run, c, True)
                     hold = f"catch-up CI held: {ci_result}"
                     break
+                run.retry_gate_evidence()
             report_automerge(run, c, hold)
     return ci_result
 
@@ -2829,12 +2837,13 @@ def nothing_to_build(run: Run, t: tracker.Ticket, ws: Path, checkouts: list[work
     return "pr", f"nothing to build: {why}", urls
 
 
-def synced_pr_body(run: Run, pr: str, body: str, t: tracker.Ticket, left: str) -> tuple[str, str]:
+def synced_pr_body(run: Run, pr: str, body: str, t: tracker.Ticket, left: str, *,
+                   keep_closing: bool = False) -> tuple[str, str]:
     wanted = run.tracker.pr_link(t, whole=not left)
     had, text = gh.split_link(body, (run.tracker.pr_link(t, whole=True), run.tracker.pr_link(t, whole=False)))
     if had and had != wanted:
         run.log(f"{pr} now links the ticket with: {wanted}")
-    left_synced = with_left_section(text, left)
+    left_synced = with_left_section(text, left, keep_closing=keep_closing)
     if left_synced != text:
         run.log(f"{pr}: {'wrote' if left else 'removed'} the {LEFT_TITLE} section")
     return (wanted if had else ""), public_text(run, left_synced)
@@ -2843,6 +2852,8 @@ def synced_pr_body(run: Run, pr: str, body: str, t: tracker.Ticket, left: str) -
 def sync_pr_bodies(run, t, with_prs, opened, standing, pushed, report, left, link, stops=None, committed=True):
     stops = stops or {}
     ci_stopped = []
+    pending = ({row["pr_url"] for row in run_store.pr_gate_refreshes(run.repo.name, str(t.id))}
+               if any(c not in opened for c in with_prs) else set())
     for c in with_prs:
         others = sibling_section(t.ref, c, with_prs)
         if c in opened:
@@ -2854,10 +2865,15 @@ def sync_pr_bodies(run, t, with_prs, opened, standing, pushed, report, left, lin
         body = gh.pr_body(c.pr)
         if c in standing and ci.stopped(body):
             ci_stopped.append(c)
-        kept, text = synced_pr_body(run, c.pr, body, t, left)
+        keep_closing = c.pr in pending
+        kept, text = synced_pr_body(run, c.pr, body, t, left, keep_closing=keep_closing)
         if opened:
-            text = with_siblings(text, others)
-        if gh.outgoing(text, kept) != body:
+            text = with_siblings(text, others, keep_closing=keep_closing)
+        if keep_closing:
+            outgoing = gh.outgoing(text, kept, keep_closing=True)
+            if outgoing != body:
+                gh.pr_write_body(c.pr, outgoing)
+        elif gh.outgoing(text, kept) != body:
             gh.pr_edit_body(c.pr, text, link=kept)
         if c in pushed and c.pr not in run.feedback_prs:
             gh.pr_comment(c.pr, f"Pushed more work for {t.ref}.\n\n{report}")
@@ -2885,16 +2901,26 @@ def left_block(left: str) -> str:
     return f"{LEFT_START}\n{LEFT_HEADING}\n\n{left}\n\n{LEFT_END}\n\n" if left else ""
 
 
-def with_left_section(body: str, left: str) -> str:
+def with_left_section(body: str, left: str, *, keep_closing: bool = False) -> str:
     found = LEFT_FOR_A_PERSON.search(body)
     if (found.group(1) if found else "") == left:
         return body
+    if keep_closing:
+        left = gh.outgoing(left)
     if found:
-        return body[:found.start()] + left_block(left) + body[found.end():]
-    checked = body.find(f"\n{CHECKED_IN_USE_HEADING}\n")
-    if checked < 0:
+        kept = pr_closing_lines(found.group(1)) if keep_closing else []
+        preserved = "\n".join(kept) + "\n\n" if kept else ""
+        return body[:found.start()] + left_block(left) + preserved + body[found.end():]
+    if keep_closing:
+        lines = body.splitlines(keepends=True)
+        checked = next((index for index, line in pr_prose_lines(lines) if line == CHECKED_IN_USE_HEADING), None)
+        offset = sum(map(len, lines[:checked])) if checked is not None else None
+    else:
+        checked = body.find(f"\n{CHECKED_IN_USE_HEADING}\n")
+        offset = checked + 1 if checked >= 0 else None
+    if offset is None:
         return f"{body.rstrip()}\n\n{left_block(left).rstrip()}"
-    return body[:checked + 1] + left_block(left) + body[checked + 1:]
+    return body[:offset] + left_block(left) + body[offset:]
 
 
 def left_on_prs(urls: list[str]) -> str:
@@ -3533,12 +3559,20 @@ def ci_fix_message(b: Build, caused: list[ci.Red]) -> str:
     return f"{tracker.with_ref(subject, b.ticket.ref)}\n\nArete-Run: {b.run.id}"
 
 
-def publish_ci(run: AgentRun, t: tracker.Ticket, pushed: list[workspace.Checkout], ci_section: str) -> None:
+def publish_ci(run: Run, t: tracker.Ticket, pushed: list[workspace.Checkout], ci_section: str) -> None:
     links = (run.tracker.pr_link(t, whole=True), run.tracker.pr_link(t, whole=False))
+    pending = {row["pr_url"] for row in run_store.pr_gate_refreshes(run.repo.name, str(t.id))}
     for c in pushed:
         try:
-            kept, text = gh.split_link(gh.pr_body(c.pr), links)
-            gh.pr_edit_body(c.pr, public_text(run, ci.with_section(text, ci_section)), link=kept)
+            body = gh.pr_body(c.pr)
+            if c.pr in pending:
+                body = ci.SECTION.sub(lambda found: "\n\n" + "\n".join(pr_closing_lines(found[0])), body)
+                published = gh.outgoing(public_text(run, body), keep_closing=True)
+                section = gh.outgoing(public_text(run, ci_section))
+                gh.pr_write_body(c.pr, gh.Outgoing(f"{published.rstrip()}\n\n{section}"))
+            else:
+                kept, text = gh.split_link(body, links)
+                gh.pr_edit_body(c.pr, public_text(run, ci.with_section(text, ci_section)), link=kept)
         except gh.GhError as e:
             run.log(f"ci: could not write the CI section on {c.pr}: {util.first_line(str(e), 300)}")
 
@@ -3550,18 +3584,20 @@ def publish_gate_evidence(run: Run, t: tracker.Ticket, c: workspace.Checkout,
         checked = f"{held}\n\n{checked}"
     reviewed = review.markdown() if review is not None else "## Review\n\nReview did not run."
     evidence = {
-        "links": tuple(outbound.screen(run.tracker.pr_link(t, whole=whole)) for whole in (True, False)),
         "checked": public_text(run, outbound.screen(checked)),
         "review": public_text(run, outbound.screen(reviewed)),
     }
-    target = run.repo.name, str(run.tid), c.pr
-    if run_store.save_pr_gate_refresh(*target, run.id, c.lease, evidence):
+    target = run.repo.name, str(t.id), c.pr
+    retrying = run_store.save_pr_gate_refresh(*target, run.id, c.lease, evidence)
+    if retrying:
         run.log(f"automerge: retrying gate evidence refresh in {c.pr}")
-    if update_pr_gate_evidence(run, c.pr, evidence):
+    links = None if retrying else (run.tracker.pr_link(t, whole=True), run.tracker.pr_link(t, whole=False))
+    if update_pr_gate_evidence(run, c.pr, evidence, links=links):
         run_store.clear_pr_gate_refresh(*target)
 
 
-def update_pr_gate_evidence(run: Run, pr: str, evidence: dict, *, expected_head: str = "") -> bool:
+def update_pr_gate_evidence(run: Run, pr: str, evidence: dict, *, expected_head: str = "",
+                            links: tuple[str, str] | None = None) -> bool:
     sections = ((CHECKED_IN_USE_HEADING, f"{CHECKED_IN_USE_HEADING}\n\n{evidence['checked']}"),
                 ("## Review", evidence["review"]))
     try:
@@ -3572,18 +3608,75 @@ def update_pr_gate_evidence(run: Run, pr: str, evidence: dict, *, expected_head:
             if head != expected_head:
                 run.log(f"automerge: discarded pending gate evidence in {pr} because its head changed")
                 return True
-        kept, body = gh.split_link(gh.pr_body(pr), evidence["links"])
-        for heading, section in sections:
-            pattern = re.compile(rf"^{re.escape(heading)}\n.*?(?=^## |\Z)", re.M | re.S)
-            if pattern.search(body):
-                body = pattern.sub(lambda _: f"{section.rstrip()}\n\n", body, count=1)
-            else:
-                body = f"{body.rstrip()}\n\n{section}"
-        gh.pr_edit_body(pr, public_text(run, body.rstrip()), link=kept)
+        body = gh.pr_body(pr)
+        if links is None:
+            for heading, section in sections:
+                screened = gh.outgoing(public_text(run, section)).rstrip()
+                body = replace_gate_section(body, heading, screened, keep_closing=True)
+            gh.pr_write_body(pr, gh.Outgoing(body))
+        else:
+            kept, body = gh.split_link(body, links)
+            for heading, section in sections:
+                body = replace_gate_section(body, heading, section.rstrip())
+            gh.pr_edit_body(pr, public_text(run, body.rstrip()), link=kept)
     except gh.GhError as e:
         run.log(f"automerge: could not update gate evidence in {pr}: {util.first_line(str(e), 300)}")
         return False
     return True
+
+
+def pr_prose_lines(lines: list[str]) -> Iterator[tuple[int, str]]:
+    closing_fence = None
+    in_comment = False
+    for index, line in enumerate(lines):
+        line = line.rstrip("\r\n")
+        if closing_fence:
+            if closing_fence.fullmatch(line):
+                closing_fence = None
+            continue
+        if not in_comment and (opening := outbound.FENCE_OPEN.match(line)):
+            marker = opening[2]
+            closing_fence = re.compile(rf" {{0,3}}{marker[0]}{{{len(marker)},}}[ \t]*")
+            continue
+        if not in_comment and ("<!--" not in line or line == ci.SECTION_START):
+            yield index, line
+            continue
+        prose = []
+        while line:
+            if in_comment:
+                _, end, line = line.partition("-->")
+                in_comment = not end
+            else:
+                start = next((token for token in PR_COMMENT_OR_CODE.finditer(line) if token[0] == "<!--"), None)
+                if start is None:
+                    prose.append(line)
+                    break
+                prose.append(line[:start.start()])
+                line = line[start.end():]
+                in_comment = True
+        if any(prose):
+            yield index, "<!-- -->".join(part for part in prose if part)
+
+
+def pr_closing_lines(text: str) -> list[str]:
+    return [line for _, line in pr_prose_lines(text.splitlines())
+            if (closing := outbound.CLOSING.findall(line)) and closing != outbound.CLOSING.findall(outbound.inert(line))]
+
+
+def replace_gate_section(body: str, heading: str, section: str, *, keep_closing: bool = False) -> str:
+    lines = body.splitlines(keepends=True)
+    prose = pr_prose_lines(lines)
+    start = next((index for index, line in prose if line == heading), None)
+    if start is None:
+        if not keep_closing:
+            body = body.rstrip()
+        return f"{body}\n\n{section}" if body else section
+    end = next((index for index, line in prose if line == ci.SECTION_START or re.match(r" {0,3}##(?:[ \t]|$)", line)),
+               len(lines))
+    if keep_closing and (kept := pr_closing_lines("".join(lines[start:end]))):
+        section += "\n\n" + "\n".join(kept)
+    rest = "".join(lines[end:])
+    return "".join(lines[:start]) + section + (f"\n\n{rest}" if rest else "")
 
 
 def comment_catch_up_ci(run: AgentRun, c: workspace.Checkout, ci_section: str,
@@ -3617,8 +3710,19 @@ def open_branch(run: Run) -> str:
     return next((r["branch"] for r in run_store.open_runs(run.repo.name, run.tid) if r.get("branch")), "")
 
 
-def with_siblings(body: str, section: str) -> str:
-    return SIBLINGS.sub("", body).rstrip() + section
+def with_siblings(body: str, section: str, *, keep_closing: bool = False) -> str:
+    if not keep_closing:
+        return SIBLINGS.sub("", body).rstrip() + section
+
+    headings = {index for index, line in pr_prose_lines(body.splitlines()) if line.startswith("## Other PRs for ")}
+
+    def preserve(found: re.Match) -> str:
+        if body.count("\n", 0, found.start(1)) not in headings:
+            return found[0]
+        kept = pr_closing_lines(found[0])
+        return "\n\n" + "\n".join(kept) if kept else ""
+
+    return SIBLINGS.sub(preserve, body).rstrip() + gh.outgoing(section)
 
 
 def sibling_section(ref: str, c: workspace.Checkout, with_prs: list[workspace.Checkout]) -> str:

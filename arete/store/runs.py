@@ -8,7 +8,7 @@ from datetime import timedelta
 from .. import refusals, util
 from ..agent import billing_of
 from . import events, writes
-from .db import db, reader, tx
+from .db import db, migration_applied, reader, tx
 
 TABLES = {
     "runs": "free command firings: 14 days; others kept",
@@ -338,6 +338,8 @@ def newest_live_whole_run(repo: str, issue: int | str) -> dict | None:
 
 def pr_gate_refreshes(repo: str, issue: str) -> list[dict]:
     with reader() as c:
+        if not migration_applied(20, c):
+            return []
         rows = c.execute("SELECT pr_url, run_id, head, evidence FROM pr_gate_refreshes WHERE repo = ? AND issue = ?",
                          (repo, issue))
         return [{**row, "evidence": json.loads(row["evidence"])} for row in rows]
