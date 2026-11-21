@@ -51,6 +51,8 @@ class DashboardSnapshotTests(unittest.TestCase):
 
 
 class VerifyFaultTests(unittest.TestCase):
+    board_route = "/api/v1/screen?view=board"
+
     def setUp(self):
         self.login = "fixture@example.test"
         self.actor = principals.seed_owner(self.login)
@@ -96,7 +98,7 @@ class VerifyFaultTests(unittest.TestCase):
             yield client
         thread.join(timeout=1)
 
-    def request(self, endpoint, method, path, *, body=None, headers=()):
+    def request(self, endpoint, method, path, *, body=None, headers=(), raw=False):
         headers = dict(headers)
         if body is not None:
             body = json.dumps(body)
@@ -106,11 +108,10 @@ class VerifyFaultTests(unittest.TestCase):
         with self.client(endpoint) as client:
             client.request(method, path, body, headers)
             with client.getresponse() as result:
-                return result.status, json.load(result)
+                return result.status, result.read() if raw else json.load(result)
 
     def arm_board(self):
-        self.fault("arm", "--route", "/api/v1/screen/board", "--status", "404",
-                   "--body", '{"fault":"armed"}', "--count", "2")
+        self.fault("arm", "--route", self.board_route, "--status", "404", "--count", "2")
 
     def initial_cursor(self, endpoint):
         status, data = self.request(endpoint, "GET", "/api/v1/events?timeout=0", headers={"Accept": "application/json"})
@@ -135,20 +136,22 @@ class VerifyFaultTests(unittest.TestCase):
         return data
 
     def test_cli_refuses_and_dashboard_ignores_planted_spec_without_wrapper_marker(self):
-        self.mark_scratch()
-        self.arm_board()
-        saved = self.spec.read_bytes()
-        self.marker.unlink()
-
         status, reason = self.command("clear")
         self.assertEqual(status, 1)
         self.assertIn("ARETE_STATE_DIR", reason)
         self.assertIn("verification sandbox wrapper", reason)
+        self.assertFalse(self.spec.exists())
+
+        self.mark_scratch()
+        self.arm_board()
+        saved = self.spec.read_bytes()
+        self.marker.unlink()
+        self.assertEqual(self.command("clear"), (status, reason))
 
         endpoint = self.endpoint()
-        status, body = self.request(endpoint, "GET", "/api/v1/screen/board")
-        self.assertEqual(status, 404)
-        self.assertNotIn("fault", body)
+        status, body = self.request(endpoint, "GET", self.board_route)
+        self.assertEqual(status, 200)
+        self.assertIn("view", body)
         self.assertEqual(self.spec.read_bytes(), saved)
 
         self.mark_scratch()
@@ -161,17 +164,22 @@ class VerifyFaultTests(unittest.TestCase):
 
     def test_board_fault_is_consumed_twice_across_unrelated_updates(self):
         self.mark_scratch()
-        route = "/api/v1/screen/board"
+        self.enterContext(mock.patch.object(util, "now", return_value=util.now()))
+        route = self.board_route
+        other = "/api/v1/screen?view=runs"
         endpoint = self.endpoint()
         before = self.request(endpoint, "GET", route)
-        self.assertEqual(before[0], 404)
+        self.assertEqual(before[0], 200)
         self.arm_board()
-        self.assertEqual(self.request(endpoint, "GET", route), (404, {"fault": "armed"}))
-        self.fault("arm", "--route", "/api/v1/screen?view=board", "--status", "503", "--body", "{}")
-        self.assertEqual(self.request(endpoint, "GET", route), (404, {"fault": "armed"}))
+        self.assertEqual(self.request(endpoint, "GET", other)[0], 200)
+        first = self.request(endpoint, "GET", route)
+        self.assertEqual((first[0], first[1]["code"]), (404, "not_found"))
+        explicit = '{ "fault": "armed" }\n'
+        self.fault("arm", "--route", other, "--status", "503", "--body", explicit)
+        self.assertEqual(self.request(endpoint, "GET", route), first)
         self.assertEqual(self.request(endpoint, "GET", route), before)
-        self.assertEqual(self.request(endpoint, "GET", "/api/v1/screen?view=board"), (503, {}))
-        self.assertEqual(self.request(endpoint, "GET", "/api/v1/screen?view=board")[0], 200)
+        self.assertEqual(self.request(endpoint, "GET", other, raw=True), (503, explicit.encode()))
+        self.assertEqual(self.request(endpoint, "GET", other)[0], 200)
         self.arm_board()
         self.fault("clear")
         self.assertEqual(self.request(endpoint, "GET", route), before)
@@ -179,6 +187,106 @@ class VerifyFaultTests(unittest.TestCase):
     def start_run(self, run):
         with principals.acting(self.actor):
             run_store.insert_run(run, {"kind": "pipeline", "started": util.iso(), "status": "running"})
+
+    def test_default_conflict_matches_contract_and_sets_dashboard_stale_notice(self):
+        self.mark_scratch()
+        run = "fault-conflict-run"
+        route = f"/api/runs/{run}/stop"
+        self.fault("arm", "--route", route, "--status", "409", "--count", "1")
+        self.start_run(run)
+        current = run_store.run_get(run)
+        status, raw = self.request(self.endpoint(), "POST", route, body={"base_version": current["version"]}, raw=True)
+        self.assertEqual(status, 409)
+        schema = next(error["schema"] for error in contract.ERRORS if error["code"] == "version_conflict")
+        problem = json.loads(raw)
+        contract.validate(problem, schema)
+        self.assertEqual(problem["current"], {k: v for k, v in current.items() if k in contract.RUN["properties"]})
+        self.assertEqual(run_store.run_get(run), current)
+
+        result = subprocess.run(["node", "--input-type=module", "-e", """
+            import assert from "node:assert/strict";
+            import { readFileSync } from "node:fs";
+            import { prepareWrite, sendWrite } from "./arete/web/ui-write.js";
+            import { staleWrite } from "./arete/web/ui-notice.js";
+
+            const [route, status] = process.argv.slice(1);
+            const body = readFileSync(0);
+            const { current } = JSON.parse(body);
+            globalThis.fetch = async () => new Response(body, { status: Number(status) });
+            await assert.rejects(sendWrite(prepareWrite(route, {}, current)), { status: 409, conflict: true, current });
+            assert.equal(staleWrite.value, "This item changed. Review the latest version before trying again.");
+        """, route, str(status)], input=raw, capture_output=True, timeout=8, check=False,
+                                cwd=Path(__file__).resolve().parents[1])
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+
+    def test_default_conflict_on_run_addressed_routes_returns_persisted_current(self):
+        self.mark_scratch()
+        run = "fault-read-run"
+        with principals.acting(self.actor):
+            run_store.insert_run(run, {"kind": "session", "started": util.iso(), "status": "running"})
+            chat_id = chats_store.chat_add("fixture")
+            chats_store.chat_link_session(chat_id, run, None)
+        endpoint = self.endpoint()
+        schema = next(error["schema"] for error in contract.ERRORS if error["code"] == "version_conflict")
+        routes = (
+            ("GET", "/api/log/fault%2Dread-run"),
+            ("GET", f"/api/feed/{run}?after=0"),
+            ("GET", f"/api/v1/screen?view=run&id={run}"),
+            ("GET", f"/api/v1/line-stream?run={run}&after=0"),
+            ("GET", f"/api/v1/steps?run={run}"),
+            ("GET", f"/api/v1/steps/1?run={run}"),
+            ("POST", f"/api/sessions/{run}/send"),
+            ("POST", f"/api/sessions/{run}/stop"),
+            ("GET", f"/api/chats/{chat_id}/sessions/{run}/report"),
+            ("POST", f"/api/chats/{chat_id}/sessions/{run}/stop"),
+        )
+        for method, route in routes:
+            with self.subTest(route=route):
+                self.fault("arm", "--route", route, "--status", "409")
+                with principals.acting(self.actor):
+                    run_store.note(run, summary=f"Updated after arming {route}")
+                current = run_store.run_get(run)
+                body = {} if method == "POST" else None
+                status, problem = self.request(endpoint, method, route, body=body)
+                self.assertEqual(status, 409)
+                contract.validate(problem, schema)
+                self.assertEqual(problem["current"], {k: v for k, v in current.items() if k in contract.RUN["properties"]})
+
+        route = f"/api/feed/{run}"
+        explicit = '{ "fault": "armed" }\n'
+        self.fault("arm", "--route", route, "--status", "409", "--body", explicit)
+        self.assertEqual(self.request(endpoint, "GET", route, raw=True), (409, explicit.encode()))
+
+    def test_default_event_conflict_returns_persisted_current_for_one_run(self):
+        self.mark_scratch()
+        run = "fault-stream-run"
+        other = "fault-stream-other"
+        self.start_run(run)
+        self.start_run(other)
+        endpoint = self.endpoint()
+        conflict = next(error for error in contract.ERRORS if error["code"] == "version_conflict")
+        selectors = (
+            (f"run={run}", True),
+            (f"subject=run%3A{run}", True),
+            (f"run={other}&run={run}", True),
+            (f"run={run}&subject=run:{run}", True),
+            (f"subject=run:{run},run:{other}", False),
+            (f"run={run}&subject=run:{other}", False),
+        )
+        for path in ("/api/v1/events", "/api/events"):
+            for selector, selects_run in selectors:
+                route = f"{path}?{selector}"
+                with self.subTest(route=route):
+                    self.fault("arm", "--route", route, "--status", "409")
+                    with principals.acting(self.actor):
+                        run_store.note(run, summary=f"Updated after arming {route}")
+                    status, problem = self.request(endpoint, "GET", route)
+                    self.assertEqual(status, 409)
+                    contract.validate(problem, conflict["schema"])
+                    current = conflict["example"]["current"]
+                    if selects_run:
+                        current = {k: v for k, v in run_store.run_get(run).items() if k in contract.RUN["properties"]}
+                    self.assertEqual(problem["current"], current)
 
     def test_drop_closes_open_streams_and_reconnect_resumes_after_last_event(self):
         self.mark_scratch()

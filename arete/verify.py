@@ -331,7 +331,9 @@ def fault_note(v: config.Verify) -> str:
             "Run these commands from the same worktree as the configured dashboard. Use the CLI to cause the fault, "
             "then observe the result with the browser tools. Do not use page scripts or write directly to the store.\n\n"
             f"- `{cli} arm --route ROUTE --status STATUS [--body TEXT] [--count COUNT]` replaces the next "
-            "response on that route by default. Pass a count for multiple responses and quote a JSON body as one argument.\n"
+            "response on that route by default. Include the query string for an exact query match and quote the route. "
+            "Omit the body to use the contract problem for a documented error status, or quote a JSON body as one argument. "
+            "Pass a count for multiple responses.\n"
             f"- `{cli} drop-streams` closes the open event streams. New connections can open as usual.\n"
             f"- `{cli} event --kind KIND --run RUN_ID` emits an event for an existing scratch run.\n"
             f"- `{cli} clear` clears response faults and pending events.")

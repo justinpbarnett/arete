@@ -69,7 +69,13 @@ WEB_TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf
 CODE_MARK = b'<meta name="arete-code" content="">'
 THEME_MARK = b'<meta name="theme-color" content="">'
 STEERING = ("dismiss", "retry", "cancel")
+EVENT_STREAM_PATHS = ("/api/events", "/api/v1/events")
 EVENTS_PATH = re.compile(r"/api/runs/([^/]+)/events")
+RUN_RESOURCE_PATH = re.compile(r"/api/(?:v1/)?runs/([^/]+)(?:/.*)?")
+RUN_READ_ALIAS_PATH = re.compile(r"/api/(?:log|feed)/([^/]+)")
+SESSION_RUN_PATH = re.compile(r"/api/sessions/([^/]+)/(?:send|stop)")
+CHAT_SESSION_RUN_PATH = re.compile(r"/api/chats/[^/]+/sessions/([^/]+)/(?:report|stop)")
+STEP_RESOURCE_PATH = re.compile(r"/api/v1/steps(?:/[^/]+)?")
 EVENTS_TYPE = "application/x-ndjson"
 EVIDENCE_PATH = "/api/capture/evidence"
 EVIDENCE_ITEM = re.compile(r"/api/capture/evidence/(\d+)")
@@ -232,6 +238,39 @@ def canonical_methods(path: str) -> tuple[str, ...]:
     return tuple(method for method in ("GET", "POST") if contract.match(method, path))
 
 
+def fault_run_id(path: str, query: dict[str, str]) -> str | None:
+    for route in (RUN_RESOURCE_PATH, RUN_READ_ALIAS_PATH, SESSION_RUN_PATH, CHAT_SESSION_RUN_PATH):
+        if match := route.fullmatch(path):
+            return unquote(match[1])
+    if path == "/api/v1/line-stream" or STEP_RESOURCE_PATH.fullmatch(path):
+        return query.get("run")
+    if path == "/api/v1/screen" and query.get("view") == "run":
+        return query.get("id")
+    if path in EVENT_STREAM_PATHS:
+        run = query.get("run")
+        if not (subject := query.get("subject")):
+            return run
+        subjects = set(subject.split(","))
+        if len(subjects) == 1:
+            kind, _, subject_run = subjects.pop().partition(":")
+            if kind == "run" and subject_run and run in (None, subject_run):
+                return subject_run
+    return None
+
+
+def fault_body(fault: verify_faults.Fault, path: str, query: dict[str, str]) -> bytes:
+    if fault.body:
+        return fault.body
+    problem = next((error for error in contract.ERRORS if error["status"] == fault.status), None)
+    if problem is None:
+        return b""
+    answer = dict(problem["example"])
+    if problem["code"] == "version_conflict" and (run_id := fault_run_id(path, query)):
+        if current := run_store.run_get(run_id):
+            answer["current"] = api.run_object(current)
+    return api_http.json_bytes(api_http.problem(fault.status, answer))
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "arete"
     sys_version = ""
@@ -322,18 +361,18 @@ class Handler(BaseHTTPRequestHandler):
                 got = webhooks.receive(unquote(path[len(webhooks.HOOK_PATH):]), self.headers, self.hook_body())
                 return self.send_json(202 if got["queued"] else 200, got)
             self.validate_transport(method, path)
+            query = {k: v[-1] for k, v in parse_qs(parts.query).items()}
             if self.verify_controls is not None and (fault := self.verify_controls.poll(path, parts.query)):
                 kind = "application/problem+json" if canonical_path(path) and fault.status >= 400 else "application/json"
-                body = b"" if fault.status in (204, 205, 304) else fault.body
+                body = b"" if fault.status in (204, 205, 304) else fault_body(fault, path, query)
                 return self.send(fault.status, body, kind, "no-store")
             if method == "GET" and path in WEB_BY_PATH:
                 if path == "/ui.html":
                     writes.activate_grace()
                 return self.send(200, *WEB_BY_PATH[path], "no-cache")
-            query = {k: v[-1] for k, v in parse_qs(parts.query).items()}
             if method == "POST" and path == "/api/tasks" and "Idempotency-Key" in self.headers:
                 return self.keyed_start()
-            if method == "GET" and path in ("/api/events", "/api/v1/events"):
+            if method == "GET" and path in EVENT_STREAM_PATHS:
                 return event_stream.serve(self, query, WEB_CODE)
             if method == "POST" and path == EVIDENCE_PATH:
                 return self.send_json(200, self.stage_evidence(query))
