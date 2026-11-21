@@ -32,7 +32,7 @@ jobs:
           package-manager-cache: false
       - run: uv sync --locked
       - name: Existing behavior checks
-        run: uv run --locked python -m tests.parallel
+        run: uv run --locked python -m tests.parallel --timeout 30
       - name: Python lint, compilation and imports
         run: |
           sh tools/lint-arete
