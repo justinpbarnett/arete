@@ -346,7 +346,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.write_receipt = event_store.committed_receipt()
                 if isinstance(result, dict) and isinstance(result.get("run"), str) and result["run"]:
                     self.write_receipt = writes.receipt(f"run:{result['run']}", kind="run.started") or self.write_receipt
-            self.send_json(200, result, conditional=method == "GET" and bool(self.read_seq))
+            conditional = method == "GET" and bool(self.read_seq)
+            tag = None
+            if conditional and self.route == "/api/v1/screen" and query.get("view") == "board":
+                tag = api_http.board_etag(result)
+            self.send_json(200, result, conditional=conditional, tag=tag)
         except Exception as e:
             if self.keyed_delivery:
                 raise
@@ -598,13 +602,13 @@ class Handler(BaseHTTPRequestHandler):
             self.parsed_body = api_http.json_object(api_http.read_body(self.rfile, self.content_size, api_http.MAX_JSON_BYTES))
         return self.parsed_body
 
-    def send_json(self, status: int, data, retry_after: int = 0, *, conditional=False) -> None:
+    def send_json(self, status: int, data, retry_after: int = 0, *, conditional=False, tag=None) -> None:
         kind = "application/json"
         if status >= 400 and canonical_path(getattr(self, "api_path", "")):
             data = api_http.problem(status, data)
             kind = "application/problem+json"
         self.send(status, api_http.json_bytes(data), kind, "private, no-cache" if conditional else "no-store",
-                  retry_after, conditional=conditional)
+                  retry_after, conditional=conditional, tag=tag)
 
     def send_events(self, run_id: str, query: dict) -> None:
         if not RUN_ID.fullmatch(run_id):
@@ -655,8 +659,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
 
-    def send(self, status: int, payload: bytes, kind: str, cache: str, retry_after: int = 0, *, conditional=False) -> None:
-        tag = api_http.etag(payload, kind, self.read_seq) if conditional else None
+    def send(self, status: int, payload: bytes, kind: str, cache: str, retry_after: int = 0, *, conditional=False, tag=None) -> None:
+        if conditional and tag is None:
+            tag = api_http.etag(payload, kind, self.read_seq)
         if tag and api_http.matches_etag(self.headers, tag):
             status, payload = 304, b""
         self.head(status, kind, cache, None if status == 304 else len(payload))
