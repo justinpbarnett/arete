@@ -1651,10 +1651,13 @@ Product behavior, migration compatibility and limits are unchanged by the covera
 `uv run python -m unittest discover -s tests -v` runs the same business cases serially.
 
 `uv run python -m tests.parallel [-j N] [-v] [--timeout S] [--slowest N]` uses four workers by default and runs each test class's existing cases together in a separate interpreter.
-`--timeout` defaults to 10 seconds per class; a timeout fails the run and cleans up the worker's process group.
+The default deadline is 10 seconds per class unless the class declares its own. `--timeout` overrides all class deadlines.
+At the deadline, the runner collects thread stacks from the class, its ordinary Python children and repository launchers that explicitly enable stack dumps before cleaning up the worker's process group. It prints the stacks with the timeout report.
+An unmodified child launched with `python -I` may produce no stack because isolated mode ignores the startup hook.
+A class that times out in the parallel phase reruns once by itself with twice its deadline. The first timeout and its stacks stay in the output even if the retry passes.
 `--slowest N` reports the slowest classes.
 Workers own process groups that the runner cleans up on completion or interruption, and a lifeline ends workers if the runner dies.
-The runner exits nonzero on any failure or error and does not retry; the first failure is authoritative.
+The runner uses the solo retry's result when a class reruns and exits nonzero if any final result is a failure, error or timeout.
 Either command can serve as the business-suite command under `[checks]` in Arete's layer.
 For Arete's own layer, use `lint = "sh tools/lint-arete"` to run the same pinned Ruff as hosted CI, rather than resolving a floating Ruff version at each run.
 

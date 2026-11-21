@@ -5,7 +5,7 @@ import json
 import os
 import shutil
 import stat
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -40,6 +40,7 @@ class Checkout:
     resolved_lines: int = 0
     onto: str = ""
     kept: str = ""
+    pushed_head: str = ""
 
     @classmethod
     def from_row(cls, row: dict) -> Checkout:
@@ -47,6 +48,13 @@ class Checkout:
 
     def to_row(self) -> dict:
         return {**asdict(self), "src": str(self.src), "wt": str(self.wt)}
+
+    def note_pushed_head(self, head: str) -> None:
+        self.lease = self.pushed_head = head
+
+    @property
+    def publication_baseline(self) -> str:
+        return self.lease if self.resumes or self.lease == self.pushed_head else ""
 
     @property
     def prefix(self) -> str:
@@ -372,13 +380,18 @@ def outside_scratch(ws: Path, names: list[str], held: list[Path]) -> list[str]:
             and not any(h.is_relative_to(ws / n) for h in held)]
 
 
-def note_made(ws: Path, checkouts: list[Checkout], owner: dict | None = None) -> None:
+def note_made(ws: Path, checkouts: list[Checkout], owner: dict | None = None,
+              *, preserve: Collection[str] = ()) -> None:
     try:
         owner = owner or owner_in(made_before(ws))
         names, held = [], []
         if ws.is_dir():
             names, held = leftovers(ws, checkouts), scratch_left(ws, checkouts)
             names = outside_scratch(ws, names, held)
+            if preserve:
+                protected = {Path(n) for n in preserve}
+                protected |= {parent for path in protected for parent in path.parents}
+                names = [n for n in names if Path(n) not in protected]
         heads = {head_key(c): git(["rev-parse", "HEAD"], c.wt).strip() for c in checkouts if (c.wt / ".git").exists()}
         heads |= {onto_key(c): c.onto for c in checkouts if c.onto and (c.wt / ".git").exists()}
         if names or heads:
@@ -680,12 +693,17 @@ class RunFailed(Exception):
         self.recovery = recovery
 
 
-def uncommitted(wt: Path) -> list[str]:
-    return [r[3:] for r in util.git_records(["status", "--porcelain", "--no-renames", "--untracked-files=all"], wt)]
+def uncommitted(wt: Path, *, tracked_only: bool = False) -> list[str]:
+    untracked = "no" if tracked_only else "all"
+    return [r[3:] for r in util.git_records(["status", "--porcelain", "--no-renames", f"--untracked-files={untracked}"], wt)]
 
 
 def untracked_files(wt: Path) -> set[str]:
     return set(util.git_records(["ls-files", "--others", "--exclude-standard"], wt))
+
+
+def ignored_file_paths(wt: Path) -> set[str]:
+    return set(util.git_records(["ls-files", "--others", "--ignored", "--exclude-standard"], wt))
 
 
 def remove_untracked(wt: Path, name: str) -> None:

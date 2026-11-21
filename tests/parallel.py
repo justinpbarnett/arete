@@ -1,7 +1,9 @@
 import argparse
+import fcntl
 import json
 import math
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -12,11 +14,44 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from importlib import import_module
 from unittest.loader import _FailedTest
 
 TAIL = 4000
 DEFAULT_CLASS_TIMEOUT = 10
+STACK_GRACE = 1
 HISTORY = os.path.join(tempfile.gettempdir(), "arete-parallel-durations.json")
+TESTS = os.path.dirname(os.path.abspath(__file__))
+STACK_SITE = os.path.join(TESTS, "_parallel_site")
+
+if __spec__ is None:
+    sys.path.insert(0, os.path.dirname(TESTS))
+_test_stacks = import_module("arete._test_stacks")
+THREAD = re.compile(r"(?:Current thread|Thread) (0x[0-9a-f]+) \(most recent call first\):")
+
+
+def stack_env(env):
+    if not env.get(_test_stacks.PREFIX_ENV):
+        return env
+    pythonpath = env.get("PYTHONPATH")
+    paths = pythonpath.split(os.pathsep) if pythonpath else []
+    if STACK_SITE in paths:
+        return env
+    return {**env, "PYTHONPATH": os.pathsep.join([STACK_SITE, *paths])}
+
+
+def main_thread_first(stack, ident):
+    threads = stack.split("\n\n")
+    for index, thread in enumerate(threads):
+        heading = THREAD.fullmatch(thread.partition("\n")[0])
+        if heading and int(heading[1], 16) == ident:
+            threads.insert(0, threads.pop(index))
+            break
+    return "\n\n".join(threads)
+
+
+def failed(report):
+    return any(report.get(kind) for kind in ("timeout", "errors", "failures", "unexpected"))
 
 
 def flatten(suite):
@@ -70,6 +105,8 @@ class Runner:
         self.stopping = False
         self.in_flight = []
         self.results = {}
+        self.crowded = []
+        self.first_timeouts = {}
         try:
             with open(HISTORY) as handle:
                 self.history = json.load(handle)
@@ -79,7 +116,7 @@ class Runner:
     def kill(self, process):
         try:
             os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
 
     def stop(self, *args):
@@ -98,41 +135,103 @@ class Runner:
             handle.seek(-TAIL, os.SEEK_END)
             return head + f"\n... full output: {path} ...\n" + handle.read().decode(errors="replace")
 
-    def child(self, item):
+    def request_stacks(self, prefix):
+        deadline = time.monotonic() + STACK_GRACE
+        requested = []
+        try:
+            entries = os.scandir(self.folder)
+        except OSError:
+            return requested
+        with entries:
+            for entry in entries:
+                if self.stopping or time.monotonic() >= deadline:
+                    break
+                if not entry.name.startswith(prefix):
+                    continue
+                suffix = entry.name[len(prefix):]
+                if not suffix.isascii() or not suffix.isdecimal():
+                    continue
+                pid = int(suffix)
+                if pid <= 1:
+                    continue
+                try:
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    with open(entry.path, "rb") as handle:
+                        try:
+                            fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                        except BlockingIOError:
+                            if self.stopping:
+                                break
+                            # An exec can reset the handler after this check. Unhandled SIGURG is ignored.
+                            os.kill(pid, _test_stacks.DUMP_SIGNAL)
+                            requested.append((pid, entry.path))
+                except OSError:
+                    continue
+        if requested and not self.stopping:
+            time.sleep(max(0, deadline - time.monotonic()))
+        return requested
+
+    def stack_output(self, requested, worker):
+        dumps = []
+        for pid, path in sorted(requested, key=lambda item: (item[0] != worker, item[0])):
+            try:
+                with open(path, "rb") as handle:
+                    size = os.fstat(handle.fileno()).st_size
+                    ident, _, stack = handle.read(size).decode(errors="replace").partition("\n")
+                    stack = main_thread_first(stack.rstrip(), int(ident, 16))
+            except (OSError, ValueError):
+                continue
+            if stack:
+                role = "class" if pid == worker else "child"
+                dumps.append(f"Python {role} stack (PID {pid})\n{stack}")
+        return "\n\n".join(dumps)
+
+    def child(self, item, stretch=1):
         index, batch = item
         result_file = os.path.join(self.folder, f"{index}.json")
         output_file = os.path.join(self.folder, f"{index}.out")
+        stack_prefix = f"{index}.stack."
+        env = stack_env({**os.environ, _test_stacks.PREFIX_ENV: os.path.join(self.folder, stack_prefix)})
         tail = ["--one", batch.identifier, "--start", self.args.start, "--result", result_file,
                 "--lifeline", str(self.lifeline)]
         command = ([sys.executable, "-m", "tests.parallel"] if __spec__ is not None else
                    [sys.executable, os.path.abspath(__file__)]) + tail
         began = time.monotonic()
         problem = None
+        timeout_report = ""
         with open(output_file, "w") as output, self.lock:
             if self.stopping:
                 return
             try:
                 process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=output,
                                            stderr=subprocess.STDOUT, start_new_session=True,
-                                           pass_fds=(self.lifeline,))
+                                           pass_fds=(self.lifeline,), env=env)
             except OSError as error:
                 process = None
                 problem = f"could not start {batch.identifier}: {error}"
             else:
                 self.live[process] = batch.identifier
         if process is not None:
-            timeout = self.args.timeout if self.args.timeout is not None else batch.timeout
+            timeout = stretch * (self.args.timeout if self.args.timeout is not None else batch.timeout)
+            requested = None
             try:
                 process.wait(timeout)
                 if process.returncode:
                     problem = f"worker exited with status {process.returncode}"
             except subprocess.TimeoutExpired:
                 problem = f"class exceeded {timeout:g}s"
+                requested = self.request_stacks(stack_prefix)
             finally:
                 self.kill(process)
                 process.wait()
                 with self.lock:
                     self.live.pop(process, None)
+            if requested is not None:
+                stacks = self.stack_output(requested, process.pid)
+                timeout_report = "\n".join(filter(None, (
+                    _test_stacks.REPORT_START, batch.identifier, problem, stacks, _test_stacks.REPORT_END,
+                )))
         try:
             with open(result_file) as handle:
                 report = json.load(handle)
@@ -145,13 +244,13 @@ class Runner:
         except (OSError, ValueError, KeyError, TypeError):
             report = {"ran": 0, "errors": [], "failures": [], "skipped": [], "unexpected": []}
             problem = problem or "worker exited without a complete report"
-        if problem:
+        if problem and not timeout_report:
             report["errors"].append((batch.identifier, problem))
-        report.update(seconds=time.monotonic() - began, output=self.output(output_file))
+        report.update(seconds=time.monotonic() - began, output=self.output(output_file), timeout=timeout_report)
         with self.lock:
             self.results[batch.identifier] = report
             if self.args.verbose:
-                outcome = "FAIL" if report["errors"] or report["failures"] or report["unexpected"] else "ok"
+                outcome = "FAIL" if failed(report) else "ok"
                 print(f"{batch.identifier}: {report['ran']} tests, {outcome} ({report['seconds']:.2f}s)", flush=True)
 
     def run(self, tests):
@@ -184,6 +283,14 @@ class Runner:
             for item in items:
                 if item[1].serial:
                     self.child(item)
+            for index, batch in items:
+                identifier = batch.identifier
+                first = self.results.get(identifier, {})
+                if not batch.serial and not self.stopping and first.get("timeout"):
+                    self.first_timeouts[identifier] = first
+                    self.child((f"{index}.alone", batch), stretch=2)
+                    if not failed(self.results[identifier]):
+                        self.crowded.append(identifier)
             complete = True
         finally:
             if not complete:
@@ -198,21 +305,32 @@ class Runner:
             return 130
         return self.finish(time.monotonic() - began)
 
+    def show_failures(self, identifier, report):
+        timeout_report = report.get("timeout")
+        if timeout_report:
+            print(f"\n{timeout_report}")
+            if report["output"]:
+                print(report["output"])
+        for kind in ("errors", "failures", "unexpected"):
+            if not report[kind]:
+                continue
+            print(f"\n{identifier}: {kind}")
+            for entry in report[kind]:
+                print(entry if isinstance(entry, str) else "\n".join(entry))
+            if report["output"] and not timeout_report:
+                print(report["output"])
+
     def finish(self, seconds):
-        failed = False
+        suite_failed = False
         ran = skipped = 0
         for identifier, report in self.results.items():
             ran += report["ran"]
             skipped += len(report["skipped"])
-            for kind in ("errors", "failures", "unexpected"):
-                if not report[kind]:
-                    continue
-                failed = True
-                print(f"\n{identifier}: {kind}")
-                for entry in report[kind]:
-                    print(entry if isinstance(entry, str) else "\n".join(entry))
-                if report["output"]:
-                    print(report["output"])
+            if failed(report):
+                suite_failed = True
+                if first := self.first_timeouts.get(identifier):
+                    self.show_failures(identifier, first)
+                self.show_failures(identifier, report)
         try:
             temporary = f"{HISTORY}.{os.getpid()}.tmp"
             with open(temporary, "w") as handle:
@@ -220,13 +338,19 @@ class Runner:
             os.replace(temporary, HISTORY)
         except OSError:
             pass
+        for identifier in self.crowded:
+            report = self.results[identifier]
+            first = self.first_timeouts[identifier]
+            print(f"{identifier}: ran past its deadline beside other classes, "
+                  f"then passed alone within twice that deadline in {report['seconds']:.2f}s\n\n"
+                  f"{first['timeout']}", flush=True)
         if self.args.slowest:
             print("Slowest classes:")
             for name, report in sorted(self.results.items(), key=lambda item: -item[1]["seconds"])[:self.args.slowest]:
                 print(f"  {report['seconds']:.2f}s {name} ({report['ran']} tests)")
-        print(f"Ran {ran} tests in {seconds:.2f}s: {'FAILED' if failed else 'OK'}" +
+        print(f"Ran {ran} tests in {seconds:.2f}s: {'FAILED' if suite_failed else 'OK'}" +
               (f" (skipped={skipped})" if skipped else ""), flush=True)
-        if failed:
+        if suite_failed:
             print(f"Worker reports and output retained in: {self.folder}", flush=True)
             return 1
         shutil.rmtree(self.folder)
@@ -235,7 +359,7 @@ class Runner:
 
 def main():
     parser = argparse.ArgumentParser(prog="tests.parallel")
-    parser.add_argument("-s", "--start", default=os.path.dirname(os.path.abspath(__file__)))
+    parser.add_argument("-s", "--start", default=TESTS)
     parser.add_argument("-j", "--jobs", type=int, default=4)
     parser.add_argument("--timeout", type=float, help="override the per-class deadline (default: 10 seconds unless declared)")
     parser.add_argument("-v", "--verbose", action="store_true")

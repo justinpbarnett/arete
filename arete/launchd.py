@@ -129,6 +129,21 @@ def declared_program(path: str) -> str:
     return ""
 
 
+def loaded_label(job: Job, labels: Iterable[str]) -> bool:
+    if job.label in labels:
+        return True
+    base, _, instance = job.label.rpartition(".")
+    if not base or not instance or not job.path.endswith(".plist"):
+        return False
+    if base not in labels and not any(label.rpartition(".")[0] == base and not label.endswith(".") for label in labels):
+        return False
+    try:
+        with open(job.path, "rb") as handle:
+            return plistlib.load(handle).get("Label") == base
+    except (OSError, ValueError, TypeError, AttributeError, plistlib.InvalidFileException):
+        return False
+
+
 def runs(path: str, executable: str) -> bool:
     program = declared_program(path)
     return bool(program and executable) and os.path.realpath(program) == os.path.realpath(executable)

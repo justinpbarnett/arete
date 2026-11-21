@@ -77,6 +77,7 @@ class Ticket:
     labels: list[str] = field(default_factory=list)
     blocker: str = ""
     images: list[Image] = field(default_factory=list)
+    github_repo: str = ""
 
     def __post_init__(self) -> None:
         self.title = self.title.strip()
@@ -157,6 +158,7 @@ class GitHubTracker:
         self._bodies: dict[str, str] = {}
         self._labels: dict[str, list[str]] = {}
         self._open: dict[int, bool | None] = {}
+        self._open_agent_tickets: list[Ticket] = []
 
     @property
     def queue_hint(self) -> str:
@@ -174,21 +176,30 @@ class GitHubTracker:
     def ref(self, tid: str) -> str:
         return f"#{tid}"
 
+    @property
+    def open_agent_tickets(self) -> tuple[Ticket, ...]:
+        return tuple(self._open_agent_tickets)
+
     def todo(self, *, parked: Callable[[str], bool] | None = None) -> list[Ticket]:
         failed = self.label_name("failed")
         skip = {ZTE_LABEL, *(self.label_name(s) for s in config.RUN_LABELS if s != "failed")}
         out = []
         self._bodies, self._labels, self._open = {}, {}, {}
+        self._open_agent_tickets = []
         for i in gh.issues(self.repo.github, LABEL, limit=MAX_AGENT_ISSUES):
-            self._bodies[str(i["number"])] = i.get("body") or ""
+            tid = str(i["number"])
+            self._bodies[tid] = i.get("body") or ""
             self._open[int(i["number"])] = True
             names = {lb["name"] for lb in i.get("labels", [])}
-            self._labels[str(i["number"])] = sorted(names)
+            self._labels[tid] = sorted(names)
+            ticket = Ticket(tid, self.ref(tid), i["title"], body=self._bodies[tid],
+                            url=i.get("url", ""), created=i.get("createdAt", ""), labels=self._labels[tid].copy(),
+                            github_repo=self.repo.github)
+            self._open_agent_tickets.append(ticket)
             if (names & skip or not self.by_owner(i)
-                    or failed in names and not (parked and parked(str(i["number"])))):
+                    or failed in names and not (parked and parked(tid))):
                 continue
-            out.append(Ticket(str(i["number"]), f"#{i['number']}", i["title"], body=self._bodies[str(i["number"])],
-                              url=i.get("url", ""), created=i.get("createdAt", ""), labels=sorted(names)))
+            out.append(ticket)
         return sorted(out, key=lambda t: t.created)
 
     def queued_failure(self, labels: list[str]) -> bool:
@@ -283,7 +294,7 @@ class GitHubTracker:
         ticket = Ticket(str(i["number"]), f"#{i['number']}", i["title"], body=i.get("body") or "(no description)",
                       comments=comments_text(comments), open=i.get("state") == "OPEN",
                       kind="fix" if FIX_LABELS & set(labels) else "feat", url=i.get("url", ""),
-                      updated=i.get("updatedAt") or "", labels=labels, blocker=blocker)
+                      updated=i.get("updatedAt") or "", labels=labels, blocker=blocker, github_repo=self.repo.github)
         if ZTE_LABEL not in labels:
             batch_ids(ticket)
         return ticket
@@ -741,14 +752,25 @@ WAIT_JIRA = re.compile(r"(?<![\w-])[A-Z][A-Z0-9_]+-\d+(?![\w-])", re.IGNORECASE)
 
 
 def waits_on(body: str) -> list[int]:
-    found = [int(n) for rest in WAIT_LINE.findall(body or "") for n in WAIT_REF.findall(rest)]
+    found = []
+    for rest in WAIT_LINE.findall(body or ""):
+        for number in WAIT_REF.findall(rest):
+            try:
+                found.append(int(number))
+            except ValueError:
+                continue
     return list(dict.fromkeys(found))
 
 
 def github_waits(body: str, repo: str) -> list[tuple[str, int]]:
-    found = [((qualified or url_repo or repo).casefold(), int(number or url_number or local))
-             for line in WAIT_LINE.findall(body or "")
-             for qualified, number, url_repo, url_number, local in WAIT_GITHUB.findall(line)]
+    found = []
+    for line in WAIT_LINE.findall(body or ""):
+        for qualified, number, url_repo, url_number, local in WAIT_GITHUB.findall(line):
+            try:
+                issue = int(number or url_number or local)
+            except ValueError:
+                continue
+            found.append(((qualified or url_repo or repo).casefold(), issue))
     return list(dict.fromkeys(found))
 
 

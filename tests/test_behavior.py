@@ -10,7 +10,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from contextlib import ExitStack, chdir, contextmanager, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, chdir, closing, contextmanager, redirect_stderr, redirect_stdout
 from contextvars import Context
 from http.client import HTTPConnection, HTTPResponse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -21,13 +21,15 @@ from types import SimpleNamespace
 from unittest import mock
 
 from arete import (
-    accounts, api_check, api_http, chat, config, contract, control, dashboard, events, gh, idempotency, jira, pipeline, principals,
-    screening, serve, tailnet, tasks, triage, util,
+    accounts, api_check, api_http, chat, cli, config, contract, control, dashboard, event_stream, events, gh,
+    idempotency, jira, paths, pipeline, principals, screening, serve, tailnet, tasks, triage, util, verify_faults,
 )
 from arete.store import approvals as approvals_store
 from arete.store import chats as chats_store
 from arete.store import db
 from arete.store import idempotency as claims
+from arete.store import runs as run_store
+from arete.store import tasks as task_store
 from arete.store import triage as triage_store
 from tests import support, versioned_api_fixture
 
@@ -79,6 +81,8 @@ class _CliThroughServeCase(unittest.TestCase):
         "replay sample": "replay", "retrieval run": "lab.retrieval", "retrieval sample": "lab.retrieval",
         "rotate-authority": "scratch", "serve": "serve", "session exec": "sessions", "uninstall": "install",
         "upload-guard": "uploads", "webhook secret": "webhooks.secret",
+        "verify-fault arm": "verify_faults", "verify-fault clear": "verify_faults",
+        "verify-fault drop-streams": "verify_faults", "verify-fault event": "verify_faults",
         "verifiers run": "lab.verifier_suites", "verifiers sample": "lab.verifier_suites",
         "writers export": "lab.writer_eval", "writers rate": "lab.writer_eval", "writers run": "lab.writer_eval",
         "writers sample": "lab.writer_eval", "zte pause": "zte",
@@ -941,6 +945,45 @@ class CliThroughServeRunTests(_CliThroughServeCase):
         ])
 
 
+class WaitReconnectTests(unittest.TestCase):
+    def test_wait_resumes_after_stream_drop_and_status_502(self):
+        from arete import client, codebase
+
+        step = {"event": "step_end", "seq": 1, "step": "plan"}
+        report = {"event": "report", "seq": 2, "status": "done"}
+        responses = iter((
+            (b"200 OK", json.dumps(step).encode() + b"\n"),
+            (b"502 Bad Gateway", b'{"error":"bad gateway"}'),
+            (b"200 OK", json.dumps(report).encode() + b"\n"),
+        ))
+        requests = []
+
+        def connect(_):
+            status, body = next(responses)
+            transport = mock.Mock()
+            transport.makefile.return_value = BytesIO(b"HTTP/1.0 " + status + b"\r\n\r\n" + body)
+            response = HTTPResponse(transport)
+            response.begin()
+            conn = mock.Mock(sock=transport)
+            conn.request.side_effect = lambda method, path, *_: requests.append((method, path))
+            conn.getresponse.return_value = response
+            return conn
+
+        where = client.Server("http", "127.0.0.1", 80, "127.0.0.1")
+        output = StringIO()
+        with (mock.patch.object(codebase, "load"), mock.patch.object(client, "server", return_value=where),
+              mock.patch.object(client, "connect", side_effect=connect),
+              mock.patch.object(client, "RETRY_SECONDS", 0), redirect_stdout(output)):
+            self.assertEqual(cli.main(["wait", "r1"]), 0, output.getvalue())
+
+        self.assertEqual(list(map(json.loads, output.getvalue().splitlines())), [step, report])
+        self.assertEqual(requests, [
+            ("GET", "/api/runs/r1/events?from=0&follow=1"),
+            ("GET", "/api/runs/r1"),
+            ("GET", "/api/runs/r1/events?from=1&follow=1"),
+        ])
+
+
 class DashboardSnapshotTests(unittest.TestCase):
     def test_event_client_surface(self):
         web = Path(__file__).resolve().parents[1] / "arete" / "web"
@@ -957,6 +1000,351 @@ class DashboardSnapshotTests(unittest.TestCase):
             capture_output=True, text=True, timeout=8, check=False,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class VerifyFaultTests(unittest.TestCase):
+    board_route = "/api/v1/screen?view=board"
+
+    def setUp(self):
+        self.login = "fixture@example.test"
+        self.actor = principals.seed_owner(self.login)
+        self.marker = paths.STATE_DIR.parent / ".arete-owned"
+        self.spec = paths.STATE_DIR / verify_faults.SPEC
+        self.addCleanup(self.marker.unlink, missing_ok=True)
+        self.addCleanup(self.spec.unlink, missing_ok=True)
+        self.enterContext(mock.patch.dict(os.environ, {"ARETE_STATE_DIR": str(paths.STATE_DIR)}))
+
+    def mark_scratch(self):
+        self.marker.write_bytes(verify_faults.MARKER + b"\n")
+
+    def command(self, *args):
+        with redirect_stderr(StringIO()) as err, redirect_stdout(StringIO()):
+            status = cli.main(["verify-fault", *args])
+        return status, err.getvalue()
+
+    def fault(self, *args):
+        self.assertEqual(self.command(*args), (0, ""))
+
+    def endpoint(self):
+        handlers = dashboard.handlers()
+        address = "127.0.0.1"
+        node = SimpleNamespace(names={address})
+        logins = SimpleNamespace(of=lambda _: self.login)
+        server = SimpleNamespace(node=node, logins=logins)
+        return handlers.open, server
+
+    @contextmanager
+    def client(self, endpoint):
+        handler, server = endpoint
+        browser, app = socketpair()
+        browser.settimeout(3)
+
+        def handle():
+            with app:
+                handler(app, ("127.0.0.1", 0), server)
+
+        thread = threading.Thread(target=handle, daemon=True)
+        thread.start()
+        with closing(HTTPConnection("127.0.0.1")) as client:
+            client.sock = browser
+            yield client
+        thread.join(timeout=1)
+
+    def request(self, endpoint, method, path, *, body=None, headers=(), raw=False):
+        headers = dict(headers)
+        if body is not None:
+            body = json.dumps(body)
+            headers["Content-Type"] = "application/json"
+        if method == "POST":
+            headers["X-Arete"] = "1"
+        with self.client(endpoint) as client:
+            client.request(method, path, body, headers)
+            with client.getresponse() as result:
+                return result.status, result.read() if raw else json.load(result)
+
+    def arm_board(self):
+        self.fault("arm", "--route", self.board_route, "--status", "404", "--count", "2")
+
+    def initial_cursor(self, endpoint):
+        status, data = self.request(endpoint, "GET", "/api/v1/events?timeout=0", headers={"Accept": "application/json"})
+        self.assertEqual(status, 200)
+        return data["next"]
+
+    @contextmanager
+    def stream(self, endpoint, cursor=None):
+        headers = {"Accept": "text/event-stream"}
+        if cursor is not None:
+            headers["Last-Event-ID"] = cursor
+        with self.client(endpoint) as client:
+            client.request("GET", "/api/v1/events", headers=headers)
+            with client.getresponse() as result:
+                self.assertEqual(result.status, 200)
+                self.assertEqual(result.readline(), b"retry: 2000\n")
+                self.assertEqual(result.readline(), b"\n")
+                yield result
+
+    def read_event(self, stream):
+        position = stream.readline().removeprefix(b"id: ").strip().decode()
+        data = json.loads(stream.readline().removeprefix(b"data: "))
+        self.assertEqual(stream.readline(), b"\n")
+        self.assertEqual(position, data["id"])
+        return data
+
+    def test_cli_refuses_and_dashboard_ignores_planted_spec_without_wrapper_marker(self):
+        status, reason = self.command("clear")
+        self.assertEqual(status, 1)
+        self.assertIn("ARETE_STATE_DIR", reason)
+        self.assertIn("verification sandbox wrapper", reason)
+        self.assertFalse(self.spec.exists())
+
+        self.mark_scratch()
+        self.arm_board()
+        saved = self.spec.read_bytes()
+        self.marker.unlink()
+        self.assertEqual(self.command("clear"), (status, reason))
+
+        endpoint = self.endpoint()
+        status, body = self.request(endpoint, "GET", self.board_route)
+        self.assertEqual(status, 200)
+        self.assertIn("view", body)
+        self.assertEqual(self.spec.read_bytes(), saved)
+
+        self.mark_scratch()
+        with tempfile.TemporaryDirectory(dir=paths.STATE_DIR.parent) as folder:
+            link = Path(folder) / "scratch"
+            link.symlink_to(paths.STATE_DIR.parent, target_is_directory=True)
+            with mock.patch.dict(os.environ, {"ARETE_STATE_DIR": str(link / "state")}):
+                self.assertEqual(self.command("clear")[0], 1)
+        self.assertEqual(self.spec.read_bytes(), saved)
+
+    def test_board_fault_is_consumed_twice_across_unrelated_updates(self):
+        self.mark_scratch()
+        self.enterContext(mock.patch.object(util, "now", return_value=util.now()))
+        route = self.board_route
+        other = "/api/v1/screen?view=runs"
+        endpoint = self.endpoint()
+        before = self.request(endpoint, "GET", route)
+        self.assertEqual(before[0], 200)
+        self.arm_board()
+        self.assertEqual(self.request(endpoint, "GET", other)[0], 200)
+        first = self.request(endpoint, "GET", route)
+        self.assertEqual((first[0], first[1]["code"]), (404, "not_found"))
+        explicit = '{ "fault": "armed" }\n'
+        self.fault("arm", "--route", other, "--status", "503", "--body", explicit)
+        self.assertEqual(self.request(endpoint, "GET", route), first)
+        self.assertEqual(self.request(endpoint, "GET", route), before)
+        self.assertEqual(self.request(endpoint, "GET", other, raw=True), (503, explicit.encode()))
+        self.assertEqual(self.request(endpoint, "GET", other)[0], 200)
+        self.arm_board()
+        self.fault("clear")
+        self.assertEqual(self.request(endpoint, "GET", route), before)
+
+    def start_run(self, run):
+        with principals.acting(self.actor):
+            run_store.insert_run(run, {"kind": "pipeline", "started": util.iso(), "status": "running"})
+
+    def test_default_conflict_matches_contract_and_sets_dashboard_stale_notice(self):
+        self.mark_scratch()
+        run = "fault-conflict-run"
+        route = f"/api/runs/{run}/stop"
+        self.fault("arm", "--route", route, "--status", "409", "--count", "1")
+        self.start_run(run)
+        current = run_store.run_get(run)
+        status, raw = self.request(self.endpoint(), "POST", route, body={"base_version": current["version"]}, raw=True)
+        self.assertEqual(status, 409)
+        schema = next(error["schema"] for error in contract.ERRORS if error["code"] == "version_conflict")
+        problem = json.loads(raw)
+        contract.validate(problem, schema)
+        self.assertEqual(problem["current"], {k: v for k, v in current.items() if k in contract.RUN["properties"]})
+        self.assertEqual(run_store.run_get(run), current)
+
+        result = subprocess.run(["node", "--input-type=module", "-e", """
+            import assert from "node:assert/strict";
+            import { readFileSync } from "node:fs";
+            import { prepareWrite, sendWrite } from "./arete/web/ui-write.js";
+            import { staleWrite } from "./arete/web/ui-notice.js";
+
+            const [route, status] = process.argv.slice(1);
+            const body = readFileSync(0);
+            const { current } = JSON.parse(body);
+            globalThis.fetch = async () => new Response(body, { status: Number(status) });
+            await assert.rejects(sendWrite(prepareWrite(route, {}, current)), { status: 409, conflict: true, current });
+            assert.equal(staleWrite.value, "This item changed. Review the latest version before trying again.");
+        """, route, str(status)], input=raw, capture_output=True, timeout=8, check=False,
+                                cwd=Path(__file__).resolve().parents[1])
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+
+    def test_default_conflict_on_run_addressed_routes_returns_persisted_current(self):
+        self.mark_scratch()
+        run = "fault-read-run"
+        with principals.acting(self.actor):
+            run_store.insert_run(run, {"kind": "session", "started": util.iso(), "status": "running"})
+            chat_id = chats_store.chat_add("fixture")
+            chats_store.chat_link_session(chat_id, run, None)
+        endpoint = self.endpoint()
+        schema = next(error["schema"] for error in contract.ERRORS if error["code"] == "version_conflict")
+        routes = (
+            ("GET", "/api/log/fault%2Dread-run"),
+            ("GET", f"/api/feed/{run}?after=0"),
+            ("GET", f"/api/v1/screen?view=run&id={run}"),
+            ("GET", f"/api/v1/line-stream?run={run}&after=0"),
+            ("GET", f"/api/v1/steps?run={run}"),
+            ("GET", f"/api/v1/steps/1?run={run}"),
+            ("POST", f"/api/sessions/{run}/send"),
+            ("POST", f"/api/sessions/{run}/stop"),
+            ("GET", f"/api/chats/{chat_id}/sessions/{run}/report"),
+            ("POST", f"/api/chats/{chat_id}/sessions/{run}/stop"),
+        )
+        for method, route in routes:
+            with self.subTest(route=route):
+                self.fault("arm", "--route", route, "--status", "409")
+                with principals.acting(self.actor):
+                    run_store.note(run, summary=f"Updated after arming {route}")
+                current = run_store.run_get(run)
+                body = {} if method == "POST" else None
+                status, problem = self.request(endpoint, method, route, body=body)
+                self.assertEqual(status, 409)
+                contract.validate(problem, schema)
+                self.assertEqual(problem["current"], {k: v for k, v in current.items() if k in contract.RUN["properties"]})
+
+        route = f"/api/feed/{run}"
+        explicit = '{ "fault": "armed" }\n'
+        self.fault("arm", "--route", route, "--status", "409", "--body", explicit)
+        self.assertEqual(self.request(endpoint, "GET", route, raw=True), (409, explicit.encode()))
+
+    def test_default_event_conflict_returns_persisted_current_for_one_run(self):
+        self.mark_scratch()
+        run = "fault-stream-run"
+        other = "fault-stream-other"
+        self.start_run(run)
+        self.start_run(other)
+        endpoint = self.endpoint()
+        conflict = next(error for error in contract.ERRORS if error["code"] == "version_conflict")
+        selectors = (
+            (f"run={run}", True),
+            (f"subject=run%3A{run}", True),
+            (f"run={other}&run={run}", True),
+            (f"run={run}&subject=run:{run}", True),
+            (f"subject=run:{run},run:{other}", False),
+            (f"run={run}&subject=run:{other}", False),
+        )
+        for path in ("/api/v1/events", "/api/events"):
+            for selector, selects_run in selectors:
+                route = f"{path}?{selector}"
+                with self.subTest(route=route):
+                    self.fault("arm", "--route", route, "--status", "409")
+                    with principals.acting(self.actor):
+                        run_store.note(run, summary=f"Updated after arming {route}")
+                    status, problem = self.request(endpoint, "GET", route)
+                    self.assertEqual(status, 409)
+                    contract.validate(problem, conflict["schema"])
+                    current = conflict["example"]["current"]
+                    if selects_run:
+                        current = {k: v for k, v in run_store.run_get(run).items() if k in contract.RUN["properties"]}
+                    self.assertEqual(problem["current"], current)
+
+    def test_drop_closes_open_streams_and_reconnect_resumes_after_last_event(self):
+        self.mark_scratch()
+        endpoint = self.endpoint()
+        cursor = self.initial_cursor(endpoint)
+        with self.stream(endpoint, cursor) as first, self.stream(endpoint, cursor) as second:
+            self.start_run("fault-drop-first")
+            last = self.read_event(first)["id"]
+            self.assertEqual(self.read_event(second)["id"], last)
+            self.fault("drop-streams")
+            self.assertEqual(first.read(), b"")
+            self.assertEqual(second.read(), b"")
+        status, polled = self.request(endpoint, "GET", "/api/v1/events?timeout=0",
+                                      headers={"Accept": "application/json", "Last-Event-ID": last})
+        self.assertEqual((status, polled), (200, {"events": [], "next": last, "reset": None}))
+        with self.stream(endpoint, last) as reconnected:
+            self.fault("clear")
+            self.start_run("fault-drop-second")
+            self.assertEqual(self.read_event(reconnected)["subject"], "run:fault-drop-second")
+            self.fault("drop-streams")
+            self.assertEqual(reconnected.read(), b"")
+
+    def test_drop_after_heartbeat_reconnects_from_the_last_received_id(self):
+        self.mark_scratch()
+        clock = mock.Mock(wraps=event_stream.time)
+        clock.monotonic.return_value = 0
+        envelope = events.envelope
+
+        def make_beat_due(conn, row, epoch):
+            data = envelope(conn, row, epoch)
+            if data["subject"] == "run:fault-before-beat":
+                clock.monotonic.return_value = 15
+            return data
+
+        with (mock.patch.object(event_stream, "time", clock),
+              mock.patch.object(events, "envelope", side_effect=make_beat_due)):
+            endpoint = self.endpoint()
+            with self.stream(endpoint, self.initial_cursor(endpoint)) as stream:
+                self.start_run("fault-before-beat")
+                before_beat = self.read_event(stream)
+                last = stream.readline().removeprefix(b"id: ").strip().decode()
+                self.assertEqual(stream.readline(), b"event: serve.beat\n")
+                self.assertEqual(json.loads(stream.readline().removeprefix(b"data: "))["kind"], "serve.beat")
+                self.assertEqual(stream.readline(), b"\n")
+                self.fault("drop-streams")
+                self.assertEqual(stream.read(), b"")
+            with self.stream(endpoint, last) as reconnected:
+                self.start_run("fault-after-beat")
+                self.assertEqual(self.read_event(reconnected)["subject"], "run:fault-after-beat")
+                self.fault("drop-streams")
+                self.assertEqual(reconnected.read(), b"")
+            self.assertEqual(last, before_beat["id"])
+
+    def test_cursorless_stream_delivers_event_queued_after_opening_frame_once(self):
+        self.mark_scratch()
+        run = "fault-before-first-scan"
+        self.start_run(run)
+        endpoint = self.endpoint()
+        controls = endpoint[0].verify_controls
+        poll = controls.poll
+        queued = threading.Event()
+
+        def wait_for_queued_event(route="", query=""):
+            if not route and not queued.wait(timeout=3):
+                raise TimeoutError("event was not queued before the first stream tick")
+            return poll(route, query)
+
+        with mock.patch.object(controls, "poll", wait_for_queued_event), self.stream(endpoint) as stream:
+            try:
+                self.fault("event", "--kind", "run.ended", "--run", run)
+                queued.set()
+                ended = self.read_event(stream)
+                self.assertEqual((ended["kind"], ended["subject"]), ("run.ended", f"run:{run}"))
+
+                following = "fault-after-first-scan"
+                self.start_run(following)
+                self.assertEqual(self.read_event(stream)["subject"], f"run:{following}")
+            finally:
+                self.fault("drop-streams")
+                queued.set()
+            self.assertEqual(stream.read(), b"")
+
+    def test_run_ended_is_delivered_through_the_real_event_log(self):
+        self.mark_scratch()
+        run = "fault-event-run"
+        self.start_run(run)
+        endpoint = self.endpoint()
+        with self.stream(endpoint, self.initial_cursor(endpoint)) as stream:
+            with principals.acting(self.actor):
+                settled = run_store.settle(run, {"status": "failed", "finished": util.iso()})
+            real = self.read_event(stream)
+            self.assertEqual(real["kind"], "run.ended")
+            self.fault("event", "--kind", "run.ended", "--run", run)
+            with mock.patch.object(verify_faults, "write_spec", side_effect=OSError("acknowledgment failed")):
+                synthetic = self.read_event(stream)
+            self.assertGreater(synthetic["seq"], real["seq"])
+            for field in real.keys() - {"seq", "at", "id", "via"}:
+                self.assertEqual(synthetic[field], real[field], field)
+            self.assertEqual(run_store.run_get(run), settled)
+            self.assertEqual(self.initial_cursor(endpoint), synthetic["id"])
+            self.assertEqual(json.loads(self.spec.read_bytes())["events"], [])
+            self.fault("drop-streams")
+            self.assertEqual(stream.read(), b"")
 
 
 class ApiCheckTests(unittest.TestCase):
@@ -1412,14 +1800,19 @@ class VersionedApiTests(unittest.TestCase):
 
     def publication_post(self, path, body, key):
         payload = json.dumps(body).encode() if body is not None else b""
-        headers = f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Arete: 1\r\n"
+        headers = {"X-Arete": "1"}
         if payload:
-            headers += f"Content-Type: application/json\r\nContent-Length: {len(payload)}\r\n"
+            headers.update({"Content-Type": "application/json", "Content-Length": str(len(payload))})
         if key:
-            headers += f"Idempotency-Key: {key}\r\n"
-        incoming = BytesIO((headers + "\r\n").encode() + payload)
+            headers["Idempotency-Key"] = key
+        return self.wire_request("POST", path, headers, payload)
+
+    def wire_request(self, method, path, headers, payload=b""):
+        request = [f"{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n"]
+        request.extend(f"{name}: {value}\r\n" for name, value in headers.items())
+        incoming = BytesIO(("".join(request) + "\r\n").encode() + payload)
         outgoing = bytearray()
-        connection = SimpleNamespace(makefile=lambda *args: incoming, sendall=outgoing.extend)
+        connection = SimpleNamespace(makefile=lambda *args: incoming, sendall=outgoing.extend, settimeout=lambda _: None)
         server = SimpleNamespace(node=SimpleNamespace(names={"127.0.0.1"}),
                                  logins=SimpleNamespace(of=lambda _: "fixture@example.test"))
         dashboard.Handler(connection, ("127.0.0.1", 0), server)
@@ -1507,6 +1900,56 @@ class VersionedApiTests(unittest.TestCase):
         with mock.patch.object(db, "tx", side_effect=AssertionError("repeat page opened a write transaction")):
             page()
         self.assertEqual(grace(), deadline)
+
+    def test_board_view(self):
+        self.enterContext(mock.patch.object(paths, "DB_FILE", paths.DB_FILE.with_name("board.db")))
+        db.migrate()
+        principals.seed_owner("fixture@example.test")
+
+        def request(path, *, headers=None, status=200):
+            actual, response, raw = self.wire_request("GET", path, {"Accept": "application/json", **(headers or {})})
+            self.assertEqual(actual, status, (path, raw))
+            return (json.loads(raw) if raw else None), response
+
+        task = task_store.task_add(self.repo.name, "Board fixture", "Board card")
+        closed = task_store.task_add(self.repo.name, "Closed fixture", "Closed card")
+        task_store.task_set_state(closed, "closed")
+        board_url = "/api/v1/screen?view=board"
+        before, response = request(board_url)
+        self.assertEqual(before["seq"], response["Arete-Seq"])
+        view = before["view"]
+        listed, _ = request("/api/v1/tasks")
+        self.assertEqual(view["tasks"], listed["tasks"])
+        self.assertEqual(view["running_ids"], [])
+        self.assertEqual({col["state"]: col["count"] for col in view["columns"]},
+                         {row["state"]: sum(r["state"] == row["state"] for r in listed["tasks"]) for row in listed["tasks"]})
+        headers = {"If-None-Match": response["ETag"]}
+        self.assertTrue(headers["If-None-Match"])
+        with mock.patch.object(dashboard, "get_sidebar", return_value={**before["sidebar"], "now": "later"}):
+            body, unchanged = request(board_url, status=304, headers=headers)
+        self.assertIsNone(body)
+        self.assertEqual(unchanged["ETag"], headers["If-None-Match"])
+        self.assertEqual(unchanged["Arete-Seq"], before["seq"])
+
+        run = f"board-{task}"
+        fields = {"kind": "pipeline", "repo": self.repo.name, "issue": task, "status": "running", "started": util.iso()}
+        run_store.insert_run(run, fields)
+        task_store.task_set_state(task, "running")
+        active, _ = request(board_url)
+        self.assertEqual(active["view"]["running_ids"], [run])
+        self.assertEqual(active["sidebar"]["running"], 1)
+        run_store.note(run, summary="Building")
+        task_store.task_set_state(task, "pr")
+        run_store.settle(run, {"status": "pr", "finished": util.iso()})
+        found, _ = request(f"/api/v1/events?since={before['seq']}&timeout=0")
+        lifecycle = [(event["kind"], event["data"]["board_task"]["state"]) for event in found["events"]
+                     if event["subject"] == f"run:{run}"]
+        self.assertEqual(lifecycle, [("run.started", "todo"), ("run.changed", "running"), ("run.ended", "pr")])
+        after, response = request(board_url, headers=headers)
+        self.assertNotEqual(response["ETag"], headers["If-None-Match"])
+        self.assertEqual(next(row["state"] for row in after["view"]["tasks"] if row["id"] == task), "pr")
+        with mock.patch.object(dashboard.api, "VIEWS", {k: v for k, v in dashboard.api.VIEWS.items() if k != "board"}):
+            request(board_url, status=404)
 
     def check_transport(self, port):
         def exchange(method, path, headers=(), body=b""):
