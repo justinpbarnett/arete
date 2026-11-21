@@ -114,7 +114,7 @@ class Batch:
     timeout: float = DEFAULT_CLASS_TIMEOUT
 
 
-def class_timeout_report(batch, timeout, deadline, progress_file, stacks):
+def class_timeout_details(batch, timeout, deadline, progress_file):
     started = 0
     completed = []
     try:
@@ -129,17 +129,16 @@ def class_timeout_report(batch, timeout, deadline, progress_file, stacks):
                     started += 1
                 else:
                     completed.append((duration, name))
-    except FileNotFoundError:
+    except (OSError, ValueError):
         pass
     slowest = sorted(completed, key=lambda entry: -entry[0])[:5]
     timings = [f"  {duration:.3f}s {name}" for duration, name in slowest]
     return "\n".join(filter(None, (
-        _test_stacks.REPORT_START,
         f"{batch.identifier} ({batch.count} tests)",
         f"class exceeded {timeout:g}s",
-        f"{len(completed)} completed, {batch.count - started} never started",
+        f"{len(completed)} completed, {max(0, batch.count - started)} never started",
         "Slowest completed tests:" if timings else "",
-        *timings, stacks, _test_stacks.TIMEOUT_REMEDIATION, _test_stacks.REPORT_END,
+        *timings,
     )))
 
 
@@ -245,7 +244,7 @@ class Runner:
                    [sys.executable, os.path.abspath(__file__)]) + tail
         began = time.monotonic()
         problem = None
-        timeout_report = ""
+        timeout_details = stacks = ""
         with open(output_file, "w") as output, self.lock:
             if self.stopping:
                 return
@@ -275,7 +274,7 @@ class Runner:
                     self.live.pop(process, None)
             if requested is not None:
                 stacks = self.stack_output(requested, process.pid)
-                timeout_report = class_timeout_report(batch, timeout, deadline, result_file + ".progress", stacks)
+                timeout_details = class_timeout_details(batch, timeout, deadline, result_file + ".progress")
         try:
             with open(result_file) as handle:
                 report = json.load(handle)
@@ -288,9 +287,10 @@ class Runner:
         except (OSError, ValueError, KeyError, TypeError):
             report = {"ran": 0, "errors": [], "failures": [], "skipped": [], "unexpected": []}
             problem = problem or "worker exited without a complete report"
-        if problem and not timeout_report:
+        if problem and not timeout_details:
             report["errors"].append((batch.identifier, problem))
-        report.update(seconds=time.monotonic() - began, output=self.output(output_file), timeout=timeout_report)
+        report.update(seconds=time.monotonic() - began, output=self.output(output_file),
+                      timeout=timeout_details, stacks=stacks)
         with self.lock:
             self.results[batch.identifier] = report
             if self.args.verbose:
@@ -349,10 +349,17 @@ class Runner:
             return 130
         return self.finish(time.monotonic() - began)
 
+    def show_timeout(self, report, *, recovered=False):
+        start = _test_stacks.RECOVERED_REPORT_START if recovered else _test_stacks.REPORT_START
+        stacks = "" if recovered else report["stacks"]
+        print("\n" + "\n".join(filter(None, (
+            start, report["timeout"], stacks, _test_stacks.TIMEOUT_REMEDIATION, _test_stacks.REPORT_END,
+        ))))
+
     def show_failures(self, identifier, report):
-        timeout_report = report.get("timeout")
-        if timeout_report:
-            print(f"\n{timeout_report}")
+        timeout = report.get("timeout")
+        if timeout:
+            self.show_timeout(report)
             if report["output"]:
                 print(report["output"])
         for kind in ("errors", "failures", "unexpected"):
@@ -361,7 +368,7 @@ class Runner:
             print(f"\n{identifier}: {kind}")
             for entry in report[kind]:
                 print(entry if isinstance(entry, str) else "\n".join(entry))
-            if report["output"] and not timeout_report:
+            if report["output"] and not timeout:
                 print(report["output"])
 
     def finish(self, seconds):
@@ -370,6 +377,9 @@ class Runner:
         for identifier, report in self.results.items():
             ran += report["ran"]
             skipped += len(report["skipped"])
+            if (first := self.first_failures.get(identifier)) and first["timeout"] and not failed(report):
+                self.show_timeout(first, recovered=True)
+        for identifier, report in self.results.items():
             if failed(report):
                 suite_failed = True
                 if (first := self.first_failures.get(identifier)) and first["timeout"]:

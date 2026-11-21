@@ -1054,13 +1054,9 @@ def tail_of_both_streams(stdout: str, stderr: str, n: int) -> str:
 
 
 def check_output_excerpt(stdout: str, stderr: str, limit: int) -> str:
-    if len(stdout) + len(stderr) <= limit:
-        return stdout + stderr
-    reports = ci.TEST_TIMEOUT.findall(stdout) + ci.TEST_TIMEOUT.findall(stderr)
-    if not reports:
-        return tail_of_both_streams(stdout, stderr, limit)
-    output = "\n".join(filter(None, (ci.TEST_TIMEOUT.sub("", stream).strip() for stream in (stdout, stderr))))
-    return ci.timeout_log_excerpt(reports, limit, output)
+    prefix = tail_of_both_streams(stdout, stderr, limit)
+    reports = ci.TIMEOUT_SUMMARY_REPORT.findall(stdout) + ci.TIMEOUT_SUMMARY_REPORT.findall(stderr)
+    return ci.append_timeout_summaries(prefix, reports)
 
 
 def selected_checks(layer: config.RepoLayer, files: list[str]) -> set[str]:

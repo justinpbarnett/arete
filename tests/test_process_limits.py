@@ -5,6 +5,8 @@ import os
 import shutil
 import signal
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 from dataclasses import asdict, replace
@@ -85,11 +87,9 @@ class ParallelTimeoutTests(unittest.TestCase):
                     test.id.return_value = f"fixture.Sample.test_{index}"
                     result.startTest(test)
                     result.stopTest(test)
-            report = parallel.class_timeout_report(
-                batch, 70, 70, progress.name, "Python class stack (PID 42)\n  File fixture.py"
-            )
+            details = parallel.class_timeout_details(batch, 70, 70, progress.name)
 
-        self.assertEqual(report.splitlines()[1:-1], [
+        self.assertEqual(details.splitlines(), [
             "fixture.Sample (8 tests)",
             "class exceeded 70s",
             "6 completed, 1 never started",
@@ -99,122 +99,164 @@ class ParallelTimeoutTests(unittest.TestCase):
             "  4.000s fixture.Sample.test_4",
             "  3.000s fixture.Sample.test_5",
             "  2.000s fixture.Sample.test_0",
-            "Python class stack (PID 42)",
-            "  File fixture.py",
-            self.guidance,
         ])
 
-    def oversized_timeout_output(self):
-        stack = ("Python class stack (PID 42)\nCurrent thread (most recent call first):\n" +
-                 '  File "fixture.py", line 42 in test_hang\n' * 300)
-        with tempfile.NamedTemporaryFile(mode="w", buffering=1) as progress:
-            for event in ((0, "fixture.Sample.test_fast", None), (1, "fixture.Sample.test_fast", 1),
-                          (2, "fixture.Sample.test_slower", None), (4, "fixture.Sample.test_slower", 2),
-                          (5, "fixture.Sample.test_hang", None)):
-                progress.write(json.dumps(event) + "\n")
-            batch = parallel.Batch("fixture.Sample", 3)
-            return "\n\n".join(parallel.class_timeout_report(batch, deadline, deadline, progress.name, stack)
-                               for deadline in (10, 20))
-
-    def nearly_full_timeout_report(self, size):
-        stack = 'Python class stack (PID 42)\n  File "fixture.py", line 42 in test_hang'
-        with tempfile.NamedTemporaryFile(mode="w", buffering=1) as progress:
-            for event in ((0, "fixture.Sample.test_fast", None), (1, "fixture.Sample.test_fast", 1),
-                          (2, "fixture.Sample.test_hang", None)):
-                progress.write(json.dumps(event) + "\n")
-            batch = parallel.Batch("fixture.Sample", 2)
-            report = parallel.class_timeout_report(batch, 10, 10, progress.name, stack)
-            stack += "\n  " + "x" * (size - len(report) - 3)
-            return parallel.class_timeout_report(batch, 10, 10, progress.name, stack)
-
-    def assert_timeout_excerpt(self, excerpt, limit):
-        self.assertEqual(excerpt.splitlines().count(self.guidance), 2)
-        first, solo, _ = excerpt.split(self.guidance)
-        for deadline, summary in ((10, first), (20, solo)):
-            self.assertIn(
-                f"fixture.Sample (3 tests)\nclass exceeded {deadline}s\n2 completed, 0 never started\n"
-                "Slowest completed tests:\n  2.000s fixture.Sample.test_slower\n  1.000s fixture.Sample.test_fast",
-                summary,
+    def test_scratch_hang_reports_finished_tests_and_still_fails_after_solo_rerun(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            Path(directory, "test_scratch_timeout.py").write_text(
+                "import time\n"
+                "import unittest\n"
+                "class ScratchTimeout(unittest.TestCase):\n"
+                "    def test_1_fast(self): pass\n"
+                "    def test_2_slower(self): time.sleep(0.02)\n"
+                "    def test_3_hang(self): time.sleep(30)\n"
             )
-            self.assertIn('  File "fixture.py", line 42 in test_hang', summary)
-        self.assertLessEqual(len(excerpt), limit)
+            result = subprocess.run(
+                [sys.executable, "-m", "tests.parallel", "--start", directory, "--timeout", "0.4"],
+                cwd=Path(__file__).resolve().parents[1], env={**os.environ, "TMPDIR": directory},
+                capture_output=True, text=True, timeout=5,
+            )
 
-    def test_local_repair_excerpt_keeps_both_timeout_summaries(self):
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        reports = ci.TEST_TIMEOUT.findall(result.stdout)
+        self.assertEqual(len(reports), 2, result.stdout)
+        for deadline, report in zip(("0.4s", "0.8s"), reports, strict=True):
+            with self.subTest(deadline=deadline):
+                lines = report.splitlines()
+                self.assertEqual(lines[1:5], [
+                    "test_scratch_timeout.ScratchTimeout (3 tests)",
+                    f"class exceeded {deadline}",
+                    "2 completed, 0 never started",
+                    "Slowest completed tests:",
+                ])
+                self.assertRegex(lines[5], r"^  \d+\.\d{3}s test_scratch_timeout\.ScratchTimeout\.test_2_slower$")
+                self.assertRegex(lines[6], r"^  \d+\.\d{3}s test_scratch_timeout\.ScratchTimeout\.test_1_fast$")
+                self.assertRegex(lines[7], r"^Python class stack \(PID \d+\)$")
+                self.assertIn("in test_3_hang", report)
+                self.assertEqual(lines[-2], self.guidance)
+
+    def timeout_report(self, name, deadline=10, timings=None, stack=""):
+        if timings is None:
+            timings = (f"  2.000s {name}.test_slower", f"  1.000s {name}.test_fast")
+        details = "\n".join((
+            f"{name} ({len(timings) + 1} tests)", f"class exceeded {deadline}s", f"{len(timings)} completed, 0 never started",
+            "Slowest completed tests:", *timings,
+        ))
+        report = "\n".join(filter(None, (
+            "=== Test class timeout ===", details, stack, self.guidance, "=== End test class timeout ===",
+        )))
+        return report, f"{details}\n{self.guidance}"
+
+    def test_recovered_timeout_keeps_main_assertion_in_ci_and_local_excerpts(self):
+        name = "fixture.Recovered"
+        frame = '  File "fixture.py", line 42 in test_hang'
+        report, summary = self.timeout_report(name)
+        stack = ("Python class stack (PID 42)" + f"\n{frame}" * 200)[:7970 - len(report) - 1]
+        full_report, _ = self.timeout_report(name, stack=stack)
+        self.assertEqual(len(full_report), 7970)
+        passed = dict(ran=3, errors=[], failures=[], skipped=[], unexpected=[], seconds=0.25, output="", timeout="")
+        other = "fixture.Failed"
+        assertion = "AssertionError: 7 != 8"
+        traceback = f'Traceback (most recent call last):\n  File "fixture.py", line 8 in test_failure\n{assertion}'
+        failure = dict(passed, ran=1, failures=[(f"{other}.test_failure", traceback)])
+        later = "fixture.AlsoFailed"
+        error = "ValueError: invalid fixture"
+        later_failure = dict(passed, ran=1, errors=[(f"{later}.test_error", error)])
+        stdout = io.StringIO()
+        with (tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory,
+              patch.object(parallel, "HISTORY", str(Path(directory, "durations.json"))),
+              contextlib.redirect_stdout(stdout)):
+            runner = parallel.Runner(SimpleNamespace(slowest=0))
+            runner.folder = directory
+            runner.results = {other: failure, name: passed, later: later_failure}
+            details = summary.removesuffix("\n" + self.guidance)
+            runner.first_failures = {name: dict(passed, ran=0, timeout=details, stacks=stack)}
+            runner.crowded = [name]
+
+            self.assertEqual(runner.finish(1), 1)
+
+        main_output = (
+            f"\n{other}: failures\n{other}.test_failure\n{traceback}\n"
+            f"\n{later}: errors\n{later}.test_error\n{error}\n"
+            f"{name}: ran past its deadline on its first run, then passed alone within twice its deadline in 0.25s\n"
+            f"Ran 5 tests in 1.00s: FAILED\nWorker reports and output retained in: {directory}\n"
+        )
+
+        def actions_log(output):
+            output += "##[error]Process completed with exit code 1.\nPost-job cleanup\n"
+            return "\n".join(f"2026-11-21T12:00:00Z {line}" for line in output.splitlines())
+
+        self.assertNotIn(assertion, ci._log_excerpt(actions_log(f"\n{full_report}\n{main_output}"))[0])
+        output = stdout.getvalue()
+        self.assertTrue(output.endswith(main_output), output)
+        self.assertEqual(ci.TEST_TIMEOUT.findall(output), [])
+        log = actions_log(output)
+        for excerpt, prefix, main_excerpt in (
+            (ci.excerpt(log), ci._log_excerpt(log)[0], ci._log_excerpt(actions_log(main_output))[0]),
+            (pipeline.check_output_excerpt(output, "", 6000), pipeline.tail_of_both_streams(output, "", 6000),
+             pipeline.tail_of_both_streams(main_output, "", 6000)),
+        ):
+            self.assertIn(traceback, main_excerpt)
+            self.assertTrue(prefix.endswith(main_excerpt), prefix)
+            self.assertEqual(excerpt, prefix + "\n\n" + summary)
+
+    def test_local_repair_appends_summary_after_exact_main_excerpt(self):
+        report, summary = self.timeout_report("fixture.Sample")
+        stdout = report + "\n" + "stdout\n" * 1000
+        stderr = "stderr\n" * 1000 + "AssertionError: 7 != 8"
+        prefix = "...\n" + stdout[-3000:] + "...\n" + stderr[-3000:]
         layer = config.RepoLayer(Path.cwd(), checks={"suite": "run suite"},
                                  quick_checks=["suite"], parallel_checks=True)
-        result = SimpleNamespace(returncode=1, stdout=self.oversized_timeout_output(),
-                                 stderr="check stderr\n" * 1000)
+        result = SimpleNamespace(returncode=1, stdout=stdout, stderr=stderr)
         with (patch.object(pipeline.environment, "sh", return_value=result),
               patch.object(record, "timed", return_value=contextlib.nullcontext({}))):
             ok, note = pipeline.run_checks(layer, Path.cwd(), [], Mock(), 30)
 
         self.assertFalse(ok)
-        excerpt = note.split("\n```\n")[1].removesuffix("\n```")
-        self.assert_timeout_excerpt(excerpt, 6000)
-        self.assertIn("check stderr", excerpt)
+        self.assertEqual(note.split("\n```\n")[1].removesuffix("\n```"), prefix + "\n\n" + summary)
+        self.assertEqual(pipeline.check_output_excerpt("short stdout\r\n", "stderr\n", 6000),
+                         "short stdout\r\nstderr\n")
 
-    def test_local_repair_excerpt_keeps_assertion_after_nearly_full_timeout_report(self):
-        report = self.nearly_full_timeout_report(5995)
-        self.assertEqual(len(report), 5995)
-        failure = "FAIL: fixture.Other.test_value\nAssertionError: 7 != 8"
-        excerpt = pipeline.check_output_excerpt(report + "\n\n" + failure, "", 6000)
-
-        self.assertIn(failure, excerpt)
-        self.assertIn(
-            "fixture.Sample (2 tests)\nclass exceeded 10s\n1 completed, 0 never started\n"
-            "Slowest completed tests:\n  1.000s fixture.Sample.test_fast",
-            excerpt,
-        )
-        self.assertIn(self.guidance, excerpt.splitlines())
-        self.assertLessEqual(len(excerpt), 6000)
-
-    def test_local_repair_excerpt_keeps_six_timeout_reports_after_verbose_output(self):
-        sample = self.oversized_timeout_output()
-        names = [f"fixture.test_workflow.test_pipeline_review_for_changed_dependencies.{name}Tests"
-                 for name in ("PublicationDiff", "CatchUpWorkspace", "ProcessQueue")]
-        reports = "\n\n".join(sample.replace("fixture.Sample", name) for name in names)
-        excerpt = pipeline.check_output_excerpt("verbose setup\n" * 1000 + "\n" + reports, "", 6000)
-
-        self.assertLessEqual(len(excerpt), 6000)
-        self.assertEqual(excerpt.splitlines().count(self.guidance), 6)
-        for name in names:
-            for deadline in (10, 20):
-                self.assertIn(f"{name} (3 tests)\nclass exceeded {deadline}s\n2 completed, 0 never started\n"
-                              f"Slowest completed tests:\n  2.000s {name}.test_slower\n  1.000s {name}.test_fast",
-                              excerpt)
-
-    def test_ci_repair_excerpt_keeps_both_timeout_summaries_and_saves_full_log(self):
+    def test_ci_repair_appends_summary_after_exact_main_excerpt(self):
+        heading = "Python class stack (PID 42)"
+        frame = '  File "fixture.py", line 42 in test_hang'
+        stack = "\n".join([heading, "Current thread (most recent call first):", *([frame] * 300)])
+        report, summary = self.timeout_report("fixture.Sample", stack=stack)
+        error = "##[error]Process completed with exit code 1."
+        output = f"setup\n{report}\npostlude\n{error}\nPost-job cleanup"
+        log = "\n".join(f"2026-11-21T12:00:00Z {line}" for line in output.splitlines())
+        prefix = "\n".join([summary.removesuffix("\n" + self.guidance), heading, *([frame] * 6),
+                            "", "setup", "", "postlude", error])
         target = ci.Target("owner/repo", "pr", "PR #1", "abcdef", "main")
         red = ci.Red(target, gh.Check("suite", "fail", job=42), None, "")
-        output = self.oversized_timeout_output() + "\n##[error]Process completed with exit code 1.\n"
-        log = "\n".join(f"2026-11-21T12:00:00Z {line}" for line in output.splitlines())
         with tempfile.NamedTemporaryFile() as saved, patch.object(gh, "job_log", return_value=log):
             log_file = Path(saved.name)
             note = ci.failure_note(red, log_file)
             self.assertEqual(log_file.read_text(), log)
 
-        excerpt = note.split("\n````\n")[1].removesuffix("\n````")
-        self.assert_timeout_excerpt(excerpt, 8000)
-        self.assertIn("##[error]Process completed with exit code 1.", excerpt)
+        self.assertEqual(note.split("\n````\n")[1].removesuffix("\n````"), prefix + "\n\n" + summary)
 
-    def test_ci_repair_excerpt_keeps_both_failures_after_nearly_full_timeout_report(self):
-        report = self.nearly_full_timeout_report(7995)
-        self.assertEqual(len(report), 7995)
-        failure = "FAIL: fixture.Other.test_value\nAssertionError: 7 != 8"
-        error = "##[error]Process completed with exit code 1."
-        for verbose in (False, True):
-            with self.subTest(verbose=verbose):
-                output = "verbose setup\n" * (1000 if verbose else 0)
-                output += f"{report}\n\n{failure}\n{error}\nPost-job cleanup"
-                log = "\n".join(f"2026-11-21T12:00:00Z {line}" for line in output.splitlines())
-                excerpt = ci.excerpt(log)
+    def test_appendix_keeps_at_most_three_classes_and_bounds_each_summary(self):
+        long_name = "fixture." + "long_module." * 80 + "LongTests"
+        timings = [f"  {seconds}.000s {long_name}.test_slow_{seconds}" for seconds in range(5, 0, -1)]
+        first, _ = self.timeout_report(long_name, timings=timings)
+        solo, _ = self.timeout_report(long_name, deadline=20, timings=timings)
+        other = [self.timeout_report(f"fixture.{name}")[0] for name in ("Second", "Third", "Fourth")]
+        stdout = "\n\n".join((first, *other, solo)) + "\n" + "x" * 6000
+        prefix = "...\n" + "x" * 6000
 
-                self.assertLessEqual(len(excerpt), 8000)
-                self.assertIn(f"{failure}\n{error}", excerpt)
-                self.assertIn("fixture.Sample (2 tests)\nclass exceeded 10s\n1 completed, 0 never started\n"
-                              "Slowest completed tests:\n  1.000s fixture.Sample.test_fast", excerpt)
-                self.assertIn(self.guidance, excerpt.splitlines())
-                self.assertNotIn("Post-job cleanup", excerpt)
+        excerpt = pipeline.check_output_excerpt(stdout, "", 6000)
+        self.assertTrue(excerpt.startswith(prefix + "\n\n"))
+        summaries = excerpt[len(prefix) + 2:].split("\n\n")
+        self.assertEqual(len(summaries), 3)
+        for summary in summaries:
+            self.assertLessEqual(len(summary), 800)
+            self.assertEqual(summary.splitlines()[-1], self.guidance)
+        self.assertIn("LongTests (6 tests)\nclass exceeded 20s", summaries[0])
+        self.assertEqual(summaries[0].splitlines()[4:9],
+                         [f"  {seconds}.000s test_slow_{seconds}" for seconds in range(5, 0, -1)])
+        self.assertTrue(summaries[1].startswith("fixture.Second (3 tests)\n"))
+        self.assertTrue(summaries[2].startswith("fixture.Third (3 tests)\n"))
 
 
 class PinCommandTests(unittest.TestCase):
