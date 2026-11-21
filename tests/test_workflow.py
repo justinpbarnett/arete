@@ -37,7 +37,7 @@ from tests.parallel import stack_env
 class PublicationFixture(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
-        self.git("init", "-q", "-b", "main")
+        self.git("init", "-q", "--template=", "-b", "main")
         self.file = self.root / "file.txt"
         self.file.write_text("base\n")
         self.commit("base")
@@ -415,6 +415,16 @@ class CatchUpRepairFixture(PublicationFixture):
         self.message = {"checks": "local check output from the merged base",
                         "verify": "verification reproduced the bug on the merged base",
                         "review": "review found a blocker specific to the merged base"}[gate]
+        fingerprints = {}
+        git_fingerprint = factory.fingerprint
+
+        def fingerprint(folder):
+            files = tuple((p.name, p.read_bytes()) for p in (self.file, incoming) if p.exists())
+            if files not in fingerprints:
+                fingerprints[files] = git_fingerprint(folder)
+            return fingerprints[files]
+
+        self.enterContext(mock.patch.object(factory, "fingerprint", side_effect=fingerprint))
 
         def holds():
             return incoming.exists() and self.file.read_text() == "implementation\n"
@@ -741,7 +751,7 @@ class BaseMergeDiffLimitTests(unittest.TestCase):
         self.assertNotIn("pushed earlier", refused.exception.detail)
 
 
-class MovedBasePublicationTests(unittest.TestCase):
+class MovedBasePublicationFixture:
     def controller(self):
         root = Path(".")
         checkout = workspace.Checkout("", "fixture/repo", root, root, "main",
@@ -773,6 +783,71 @@ class MovedBasePublicationTests(unittest.TestCase):
         controller.catalog = mock.Mock(context={})
         return controller, checkout
 
+
+class CatchUpPublicationFailureTests(MovedBasePublicationFixture, unittest.TestCase):
+    def test_publication_ci_after_a_catch_up_repair_parks_only_when_spent(self):
+        spent = "the repair chain used its 1 repair cycles"
+        for limit in ("", spent):
+            with self.subTest(limit=limit):
+                controller, checkout = self.controller()
+                controller.data["catch_up_hold"] = {"reason": "Catch-up held on review"}
+                controller.job.verified = verify.Verified("pass", checks=[{"passed": True}])
+                controller.job.review = Review.stored({"verdict": "approve"})
+                controller.run.budget.repair_limit_reason.return_value = limit
+                controller.ci_failures = mock.Mock(return_value="CI check failed on the repaired head")
+                with (mock.patch.object(ci, "watch", side_effect=lambda target, _: ci.Watched(target, {}, read=False)),
+                      mock.patch.object(pipeline, "publish_gate_evidence"),
+                      mock.patch.object(pipeline, "publish_ci"),
+                      mock.patch.object(pipeline, "own_draft_state", return_value=True),
+                      mock.patch.object(pipeline, "set_draft") as draft,
+                      mock.patch.object(pipeline, "park_run", return_value=("failed", "parked", checkout.pr)) as park):
+                    failure = controller.publish()
+                self.assertEqual(failure["failures"], orchestration.CI_FAILURES)
+                self.assertTrue(controller.data["ci_failed"])
+                self.assertTrue(controller.data["catch_up_hold"])
+                controller.catalog.add_context.assert_called_once_with(
+                    orchestration.CI_FAILURES, "CI check failed on the repaired head")
+                draft.assert_called_once_with(controller.run, checkout, True)
+                if limit:
+                    self.assertEqual(controller.ending, park.return_value)
+                    self.assertIn(spent, park.call_args.args[1])
+                    self.assertIn(failure["ci"], park.call_args.args[1])
+                    self.assertIn("Catch-up held on review", controller.run.say.call_args.args[0])
+                else:
+                    self.assertIsNone(controller.ending)
+                    park.assert_not_called()
+
+    def test_final_readiness_failure_parks_except_preserved_catch_up_handoffs(self):
+        for error, parked in (
+            (workspace.RunFailed("the published head already contains the fetched base"), True),
+            (pipeline.ConflictUnresolved(workspace.RunFailed("a protected file conflicts"), ["file.txt"]), False),
+            (pipeline.CatchUpNeedsInput("a catch-up worker needs owner input"), False),
+        ):
+            with self.subTest(error=error):
+                controller, checkout = self.controller()
+                controller.data["catch_up_hold"] = {"reason": "Catch-up held on verify"}
+                controller.run.budget.repair_limit_reason.return_value = "the repair chain used its 1 repair cycles"
+                refs = {"state": "OPEN", "isDraft": False, "headRefOid": checkout.lease, "baseRefName": "main"}
+                with (mock.patch.object(gh, "pr_merge_details", return_value=refs),
+                      mock.patch.object(pipeline, "merge_hold", return_value=gh.MovedBaseHold("base moved")),
+                      mock.patch.object(pipeline, "fetch_merge_base", return_value="moved-base"),
+                      mock.patch.object(pipeline, "catch_up_base", side_effect=error),
+                      mock.patch.object(pipeline, "report_automerge") as report,
+                      mock.patch.object(controller, "park_catch_up", return_value=("failed", "parked", checkout.pr)) as park,
+                      mock.patch.object(flows, "ended", return_value=("pr", "held", checkout.pr))):
+                    controller.finish_publication()
+                self.assertEqual(controller.job.b.catch_ups, 1)
+                if parked:
+                    self.assertEqual(controller.ending, park.return_value)
+                    self.assertIn(error.why, park.call_args.args[0])
+                    report.assert_not_called()
+                else:
+                    self.assertEqual(controller.ending[0], "pr")
+                    self.assertIn(error.why, report.call_args.args[2])
+                    park.assert_not_called()
+
+
+class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
     def test_conflict_after_a_rerun_passes_reaches_catch_up(self):
         controller, checkout = self.controller()
         clean = {"state": "OPEN", "headRefOid": checkout.lease, "mergeable": "MERGEABLE"}

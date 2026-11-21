@@ -656,7 +656,7 @@ class Controller:
             for checkout in self.job.picked(self.job.changed):
                 pipeline.publish_gate_evidence(self.run, self.job.ticket, checkout, self.job.verified, self.job.review)
         if self.run.repo.parts and (failure := self.publication_ci(self.job.picked(self.job.changed))):
-            return failure
+            return self.settle_publication_failure(failure)
         return self.finish_publication()
 
     def publication_ci(self, pushed, *, caught_up=False):
@@ -738,14 +738,13 @@ class Controller:
         try:
             row = gh.pr_merge_details(checkout.pr)
             if hold := gh.merge_ref_hold(row, checkout.lease, checkout.base):
-                return hold
+                return self.catch_up_failure(hold)
             base_sha = row.get("baseRefOid")
             base_sha = pipeline.fetch_merge_base(checkout) or base_sha
             if not base_sha:
-                return "GitHub did not report the current base commit"
+                return self.catch_up_failure("GitHub did not report the current base commit")
             if b.catch_ups >= pipeline.AUTOMERGE_CATCH_UPS:
-                reason = f"the base `{checkout.base}` moved to `{base_sha}` after {b.catch_ups} catch-ups"
-                return {"park": True, "error": reason} if self.data.get("catch_up_hold") else reason
+                return self.catch_up_failure(f"the base `{checkout.base}` moved to `{base_sha}` after {b.catch_ups} catch-ups")
             b.catch_ups += 1
             job.verified, job.review = pipeline.catch_up_base(
                 b, checkout, job.branch, base_sha, job.with_left(job.goal), job.with_left(job.plan_text),
@@ -757,9 +756,15 @@ class Controller:
         except (workspace.RunFailed, RuntimeError, OSError) as e:
             reason = e.why if isinstance(e, workspace.RunFailed) else util.first_line(str(e), 300)
             base = f"`{checkout.base}` at `{base_sha}`" if base_sha else f"`{checkout.base}`"
-            return f"could not catch up to {base}: {pipeline.public_text(self.run, reason)}"
+            failure = f"could not catch up to {base}: {pipeline.public_text(self.run, reason)}"
+            if isinstance(e, (pipeline.ConflictUnresolved, pipeline.CatchUpPathCollision, pipeline.CatchUpNeedsInput)):
+                return failure
+            return self.catch_up_failure(failure)
         self.note_caught_up(checkout)
         return ""
+
+    def catch_up_failure(self, reason):
+        return {"park": True, "error": reason} if self.data.get("catch_up_hold") else reason
 
     def hold_catch_up(self, checkout, base_sha, hold):
         reason = pipeline.public_text(
@@ -797,6 +802,15 @@ class Controller:
         self.run.say(f"{held}. I parked the run because {reason}.")
         return pipeline.park_run(self.run, f"{held}. {reason}")
 
+    def settle_publication_failure(self, failure):
+        if self.data.get("catch_up_hold"):
+            if failure.get("park"):
+                self.ending = self.park_catch_up(failure["error"])
+            elif self.run.budget and (limit := self.run.budget.repair_limit_reason()):
+                reason = f"Publication CI held: {failure['ci']}. {limit}" if failure.get("ci") else limit
+                self.ending = self.park_catch_up(reason)
+        return failure
+
     def reconcile_catch_up(self, pending):
         job = self.job
         self.executing = pending["action"]
@@ -829,7 +843,7 @@ class Controller:
                                       {"reason": "the run resumed an interrupted catch-up push"}, expected=("accepted",))
             self.data.pop("publication_intent", None)
             self.persist()
-            result = failure
+            result = self.settle_publication_failure(failure)
         else:
             result = self.finish_publication()
         ledger.transition(self.lease, self.executing, "failed" if "error" in result else "succeeded", result,
@@ -861,14 +875,8 @@ class Controller:
             self.data.pop("published", None)
             self.data.pop("published_tree", None)
         self.persist()
-        if self.data.get("catch_up_hold"):
-            reason = (outcome.data["error"] if outcome.data.get("park")
-                      else self.run.budget.repair_limit() if self.run.budget else "")
-            if reason:
-                self.ending = self.park_catch_up(reason)
-            return outcome.data
-        if self.data.get("ci_failed"):
-            return outcome.data
+        if self.data.get("catch_up_hold") or self.data.get("ci_failed"):
+            return self.settle_publication_failure(outcome.data)
         self.ending = flows.ended(self.flow, outcome)
         return outcome.data
 
@@ -990,6 +998,9 @@ class Controller:
                 if not self.job.b.restage().empty:
                     raise ValueError("noop cannot discard an implementation diff")
                 self.ending = flows.finish(self.flow, "nothing", summary=self.job.build_summary or "No change needed.")
+            elif (self.run.budget and (reason := self.run.budget.repair_limit_reason())
+                  and not zte.reserved(str(self.run.tid))):
+                self.ending = pipeline.park_run(self.run, reason)
             else:
                 self.ending = flows.finish(self.flow, "failed", why="the orchestrator stopped without delivery",
                                            recovery=self.failure_recovery())

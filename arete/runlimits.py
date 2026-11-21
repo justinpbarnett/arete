@@ -571,7 +571,7 @@ class Budget:
             if self.run_deadline() > time.monotonic():
                 self.arm()
 
-    def repair_limit(self) -> str:
+    def repair_limit_reason(self) -> str:
         if self.prior_repairs + self.repair_calls >= self.policy.max_repair_cycles:
             return f"the repair chain used its {self.policy.max_repair_cycles} repair cycles"
         return ""
@@ -583,7 +583,7 @@ class Budget:
         if role not in REPAIRS and not step.startswith(REPAIR_NAMES):
             self.checkpoint()
             return
-        if reason := self.repair_limit():
+        if reason := self.repair_limit_reason():
             raise Parked(reason)
         self.repair_calls += 1
         self.persist()
