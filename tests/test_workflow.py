@@ -1,7 +1,13 @@
+import json
+import shutil
 import subprocess
+import sysconfig
 import tempfile
+import threading
 import tomllib
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
@@ -9,8 +15,323 @@ from types import SimpleNamespace
 from typing import ClassVar
 from unittest import mock
 
-from arete import config, factory, flows, mergecheck, orchestration, pipeline, sandbox, tracker, util, verify, workspace
+from arete import (
+    api_check, config, factory, flows, gh, mergecheck, orchestration, paths, pipeline, sandbox, serve, tracker, util,
+    verify, workspace,
+)
 from arete.review import Review
+
+
+class ServeDeploymentTests(unittest.TestCase):
+    def setUp(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        origin = root / "origin.git"
+        self.writer = root / "writer"
+        self.checkout = root / "checkout"
+        self.state = root / "state"
+        self.git(root, "init", "-q", "--bare", "-b", "main", str(origin))
+        self.git(root, "init", "-q", "-b", "main", str(self.writer))
+        self.git(self.writer, "remote", "add", "origin", str(origin))
+        package = self.writer / "arete"
+        package.mkdir()
+        (package / "fixture.py").write_text("version = 1\n")
+        self.start = self.commit(self.writer, "initial code")
+        self.git(self.writer, "push", "-q", "origin", "main")
+        self.git(root, "clone", "-q", str(origin), str(self.checkout))
+        layer = root / "layer"
+        layer.mkdir()
+        (layer / "config.toml").write_text('[git.required_check]\ncontext = "deployment-check"\napp_id = 17\n')
+        self.repo = config.Repo("arete", self.checkout, github="fixture/arete", layer=layer)
+        self.cfg = config.Config(repos=[self.repo])
+        self.enterContext(mock.patch.multiple(paths, PACKAGE_DIR=self.checkout / "arete", STATE_DIR=self.state,
+                                             LOCKS_DIR=self.state / "locks", RUNS_DIR=self.state / "runs",
+                                             LOG_DIR=root / "logs", WORKTREES_DIR=root / "worktrees"))
+        self.server = object.__new__(serve.Server)
+        self.server.checkout_update = threading.Lock()
+        self.server.deploy_refusals = set()
+        self.server.say = mock.Mock()
+        self.ci_state = ("completed", "success")
+        self.gh_json = gh.gh_json
+        self.ci = self.enterContext(mock.patch.object(gh, "gh_json", side_effect=self.ci_response))
+        self.gate = self.enterContext(mock.patch.object(gh, "merge_ci_passed", wraps=gh.merge_ci_passed))
+        self.tip = self.publish("merged code")
+
+    def git(self, cwd, *args):
+        return subprocess.check_output(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+                                        "-c", "commit.gpgsign=false", *args], cwd=cwd, text=True, timeout=5).strip()
+
+    def commit(self, cwd, subject):
+        self.git(cwd, "add", ".")
+        self.git(cwd, "commit", "-qm", subject, "--allow-empty")
+        return self.git(cwd, "rev-parse", "HEAD")
+
+    def publish(self, subject):
+        head = self.commit(self.writer, subject)
+        self.git(self.writer, "push", "-q", "origin", "main")
+        return head
+
+    def ci_response(self, args, **kwargs):
+        if args[:2] == ["repo", "view"]:
+            self.assertEqual(args[2], self.repo.github)
+            return {"defaultBranchRef": {"name": "main"}}
+        endpoint = args[1]
+        self.assertTrue(endpoint.startswith(f"repos/{self.repo.github}/commits/"), endpoint)
+        head, query = endpoint.split("/")[4:6]
+        if query.startswith("statuses?"):
+            return [[]]
+        self.assertTrue(query.startswith("check-runs?"), endpoint)
+        status, conclusion = self.ci_state
+        return [{"check_runs": [{"head_sha": head, "name": "deployment-check", "app": {"id": 17},
+                                 "status": status, "conclusion": conclusion}]}]
+
+    def deploy(self):
+        self.server.deploy(self.cfg)
+        return self.git(self.checkout, "rev-parse", "HEAD")
+
+    def test_ci_rerun_goes_pending_while_waiting_for_repo_lock(self):
+        attempting = threading.Event()
+        repo_lock = util.repo_lock
+
+        @contextmanager
+        def observe_lock(src):
+            attempting.set()
+            with repo_lock(src):
+                yield
+
+        with mock.patch.object(util, "repo_lock", observe_lock):
+            self.check_ci_rerun_while_waiting(repo_lock(self.checkout), attempting)
+
+    def test_ci_rerun_goes_pending_while_waiting_for_checkout_guard(self):
+        attempting = threading.Event()
+        guard = self.server.checkout_update
+
+        @contextmanager
+        def observe_guard():
+            attempting.set()
+            with guard:
+                yield
+
+        self.server.checkout_update = observe_guard()
+        self.check_ci_rerun_while_waiting(guard, attempting)
+
+    def check_ci_rerun_while_waiting(self, held, attempting):
+        with ThreadPoolExecutor(1) as worker, mock.patch.object(util, "git", wraps=util.git) as git:
+            with held:
+                deployment = worker.submit(self.deploy)
+                self.assertTrue(attempting.wait(3))
+                self.gate.assert_not_called()
+                self.assertFalse(any(call.args[0][0] == "api" for call in self.ci.call_args_list))
+                self.assertFalse(any(call.args[0] == ["rev-parse", "--verify", "refs/remotes/origin/main"]
+                                     for call in git.call_args_list))
+                self.ci_state = ("in_progress", None)
+            self.assertEqual(deployment.result(timeout=5), self.start)
+        self.gate.assert_called_once_with(self.repo.github, self.tip,
+                                          required={"context": "deployment-check", "app_id": 17})
+        self.assertIn("CI pending", self.server.say.call_args.args[0])
+
+    def test_network_loss_under_repo_lock_allows_cleanup_and_heartbeat(self):
+        checking = threading.Event()
+        cleaning = threading.Event()
+        repo_lock, sh = util.repo_lock, util.sh
+        wt = self.state.parent / "kept"
+        checkout = workspace.Checkout("", self.repo.github, self.checkout, wt, "main")
+        beat = self.state / "serve.json"
+
+        @contextmanager
+        def observe_lock(src):
+            if checking.is_set():
+                cleaning.set()
+            with repo_lock(src):
+                yield
+
+        def serve_request(command, **kwargs):
+            if command[0] != "gh":
+                return sh(command, **kwargs)
+            if command[1] == "repo":
+                return subprocess.CompletedProcess(command, 0, json.dumps(self.ci_response(command[1:])), "")
+            checking.set()
+            self.assertTrue(cleaning.wait(5))
+            self.assertLessEqual(kwargs["timeout"], serve.DEPLOY_API_TIMEOUT)
+            return subprocess.CompletedProcess(command, 1, "", "connection reset")
+
+        def clean():
+            self.assertTrue(workspace.remove_workspace(wt, [checkout]))
+
+        with mock.patch.object(config, "load_or_problem", return_value=(self.cfg, "")):
+            server = serve.Server()
+        server.say = self.server.say
+        server.tick = clean
+        server.deploy_when_due = mock.Mock()
+        server.watch_alerts = mock.Mock()
+        with (mock.patch.object(gh, "gh_json", self.gh_json), mock.patch.object(util, "sh", side_effect=serve_request),
+              mock.patch.object(util, "repo_lock", observe_lock),
+              mock.patch.object(util, "wait_for_network", return_value=False) as wait,
+              mock.patch.object(serve.control, "BEAT_FILE", beat),
+              mock.patch.object(serve.loop_store, "pending", return_value=[]),
+              mock.patch.object(serve.run_store, "runs_marked_running", return_value=[]),
+              ThreadPoolExecutor(2) as worker):
+            deployment = worker.submit(server.deploy, self.cfg)
+            self.assertTrue(checking.wait(5))
+            tick = worker.submit(server.run_pass)
+            deployment.result(timeout=5)
+            tick.result(timeout=5)
+            wait.assert_not_called()
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.start)
+        heartbeat = json.loads(beat.read_text())
+        self.assertEqual(heartbeat["ticks"], 1)
+        self.assertTrue(heartbeat["tick_ok"], heartbeat["failing"])
+        self.assertIn("CI unavailable", server.say.call_args.args[0])
+
+    def test_live_pilot_receipt_blocks_until_held_or_spent(self):
+        receipt = self.state / "pilot-doc-fix" / "task" / "receipt.json"
+        receipt.parent.mkdir(parents=True)
+        receipt.write_text(json.dumps({"phase": "waiting_for_owner_merge"}))
+        self.assertEqual(self.deploy(), self.start)
+        self.assertEqual(self.deploy(), self.start)
+        self.gate.assert_not_called()
+        self.server.say.assert_called_once()
+        self.assertIn("live pilot receipt", self.server.say.call_args.args[0])
+        for terminal in ("held", "spent", "healthy"):
+            with self.subTest(terminal=terminal):
+                tip = self.tip if terminal == "held" else self.publish(f"merge after {terminal}")
+                receipt.write_text(json.dumps({"phase": terminal}))
+                self.assertEqual(self.deploy(), tip)
+
+    def test_refusal_logs_once_per_tip_and_reason(self):
+        for status, conclusion in (("queued", None), ("completed", "failure"), ("queued", None)):
+            self.ci_state = (status, conclusion)
+            self.assertEqual(self.deploy(), self.start)
+        other = self.publish("second merge")
+        self.assertEqual(self.deploy(), self.start)
+        messages = [call.args[0] for call in self.server.say.call_args_list]
+        self.assertEqual([message.split(" left alone for ")[1] for message in messages],
+                         [f"{self.tip} (CI pending)", f"{self.tip} (CI failed)", f"{other} (CI pending)"])
+        self.ci_state = ("completed", "success")
+        self.assertEqual(self.deploy(), other)
+        self.assertIn(f"fast forwarded to {other} (second merge)", self.server.say.call_args.args[0])
+
+    def test_origin_ref_moving_during_ci_is_rechecked(self):
+        def pass_ci(*args, **kwargs):
+            newer = self.publish("another merge")
+            self.git(self.checkout, "fetch", "-q", "origin", "main")
+            self.assertEqual(self.git(self.checkout, "rev-parse", "origin/main"), newer)
+            return True
+
+        self.gate.side_effect = pass_ci
+        self.assertEqual(self.deploy(), self.start)
+        self.gate.assert_called_once_with(self.repo.github, self.tip,
+                                          required={"context": "deployment-check", "app_id": 17})
+
+
+class DeploymentCiTests(unittest.TestCase):
+    def test_ci_lookup_and_classification_share_a_single_attempt_budget(self):
+        now = 0
+        timeouts = []
+        repo, tip = "fixture/arete", "a" * 40
+        required = {"context": "deployment-check", "app_id": 17}
+
+        def sh(command, *, timeout, **kwargs):
+            nonlocal now
+            timeouts.append(timeout)
+            now += 3
+            endpoint = command[2]
+            if "check_name=" in endpoint:
+                return subprocess.CompletedProcess(command, 1, "", "connection reset")
+            if "/statuses?" in endpoint:
+                return subprocess.CompletedProcess(command, 0, "[[]]", "")
+            self.assertIn("/check-runs?", endpoint)
+            result = [{"check_runs": [{"head_sha": tip, "name": required["context"], "app": {"id": required["app_id"]},
+                                       "status": "in_progress", "conclusion": None}]}]
+            return subprocess.CompletedProcess(command, 0, json.dumps(result), "")
+
+        with (mock.patch.object(util, "sh", side_effect=sh),
+              mock.patch.object(util, "wait_for_network", return_value=False) as wait,
+              mock.patch.object(gh, "time", SimpleNamespace(monotonic=lambda: now))):
+            self.assertEqual(gh.deployment_ci_refusal(repo, tip, required, timeout=9), "CI unavailable")
+            self.assertEqual(timeouts, [9, 6, 3])
+            wait.assert_not_called()
+            self.assertEqual(gh.deployment_ci_refusal(repo, tip, required, timeout=6), "CI unavailable")
+            self.assertEqual(timeouts, [9, 6, 3, 6, 3])
+            wait.assert_not_called()
+            with self.assertRaises(gh.GhError):
+                gh.gh_json(["api", "unrelated?check_name=fixture"])
+            wait.assert_called_once_with()
+            self.assertEqual(timeouts[-1], 120)
+
+
+class ServeStatusTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.env = api_check.isolated_env(self.root)
+
+    def break_candidate_import(self, module):
+        candidate = self.root / "arete"
+        shutil.copytree(Path(serve.__file__).parent, candidate, ignore=shutil.ignore_patterns("__pycache__"))
+        (candidate / module).write_text('raise RuntimeError("broken deployment fixture")\n')
+
+    def check_revisions(self, env, state_dir, *args):
+        running, checkout = "a" * 12, "b" * 12
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / "serve.json").write_text(json.dumps({
+            "at": "2026-11-21T00:00:00Z", "engine": running, "checkout_head": checkout,
+        }))
+        installed = Path(sysconfig.get_path("scripts")) / "arete"
+        result = subprocess.run([str(installed), "status", *args], cwd=self.root,
+                                env={**env, "PYTHONPATH": str(self.root), "PYTHONDONTWRITEBYTECODE": "1"},
+                                capture_output=True, text=True, timeout=8)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("broken deployment fixture", result.stderr)
+        self.assertIn(f"running code {running}, checkout HEAD {checkout}", result.stdout)
+
+    def test_installed_status_reads_revisions_when_candidate_common_raises(self):
+        self.break_candidate_import("commands/common.py")
+        self.check_revisions(self.env, Path(self.env["ARETE_STATE_DIR"]), "--limit", "1")
+
+    def test_installed_status_reads_revisions_when_candidate_paths_raises(self):
+        self.break_candidate_import("paths.py")
+        self.check_revisions(self.env, Path(self.env["ARETE_STATE_DIR"]))
+
+    def test_installed_status_finds_default_state_when_candidate_paths_raises(self):
+        self.break_candidate_import("paths.py")
+        del self.env["ARETE_CONFIG_DIR"], self.env["ARETE_STATE_DIR"]
+        self.check_revisions(self.env, Path(self.env["HOME"]) / ".local/share/arete")
+
+    def test_installed_status_finds_scratch_state_when_candidate_paths_raises(self):
+        self.break_candidate_import("paths.py")
+        scratch = self.root / ".arete-scratch-0123456789abcdef"
+        scratch.mkdir(mode=0o700)
+        del self.env["ARETE_CONFIG_DIR"], self.env["ARETE_STATE_DIR"]
+        self.check_revisions({**self.env, "ARETE_VERIFY_SCRATCH": str(scratch)}, scratch / "state")
+
+
+class SavedRunPolicyTests(unittest.TestCase):
+    def test_pre_upgrade_lineage_accepts_unchanged_policy_and_refuses_changes(self):
+        repo = config.Repo("fixture", Path("/fixture/repo"), github="fixture/repo")
+        cfg = config.Config(repos=[repo], loop_dirs=[])
+        run = pipeline.AgentRun("saved-run", repo, Path("/fixture/run"), cfg=cfg, kind="fix")
+        controller = object.__new__(orchestration.Controller)
+        controller.run = run
+        controller.job = SimpleNamespace(cfg=cfg, run=run, ticket=tracker.Ticket("1", "#1", "Fixture"),
+                                         expertise="", attachments="")
+        # Generated by Controller.lineage() at 65efb2d3a8a8 with this fixture.
+        saved_policy = "ab6163c172351fe95614fa84a09973fb8fa04bad4bbb9c0dffc4cce50369b70d"
+        controller.data = {"policy_sha": saved_policy}
+        controller.continuation_blocker = lambda **_: ""
+        original = "[limits]\nmax_diff_lines = 200\n"
+        with tempfile.NamedTemporaryFile() as file:
+            source = Path(file.name)
+            source.write_text(original)
+            controller.job.layer = run.layer = config.load_layer(repo.layer_dir, source_file=source)
+            self.assertEqual(controller.lineage()[0]["policy_sha"], saved_policy)
+
+            for changed in ("[limits]\nmax_diff_lines = 201\n",
+                            original + '[git.required_check]\ncontext = "deployment-check"\napp_id = 17\n'):
+                with self.subTest(layer=changed):
+                    source.write_text(changed)
+                    controller.job.layer = run.layer = config.load_layer(repo.layer_dir, source_file=source)
+                    with self.assertRaisesRegex(factory.Refused, "policy_sha changed"):
+                        controller.lineage()
+        self.assertEqual(controller.data["policy_sha"], saved_policy)
 
 
 class AskConfigTests(unittest.TestCase):
