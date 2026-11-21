@@ -316,7 +316,10 @@ class _CliThroughServeCase(unittest.TestCase):
             def log_message(self, *_):
                 pass
 
-        with self.listening(ThreadingHTTPServer(("127.0.0.1", 0), Handler)):
+        address = "127.0.0.1"
+        with mock.patch("socket.getfqdn", return_value=address):
+            server = ThreadingHTTPServer((address, 0), Handler)
+        with self.listening(server):
             yield
 
 
