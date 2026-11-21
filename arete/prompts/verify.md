@@ -64,6 +64,7 @@ $journeys## Rules
 
 - `checks`: one entry for each thing you checked.
   - `what`: the behavior, in the user's words.
+  - `criterion_ref`: the exact `criterion:` or `journey:` reference from the ticket when this check covers it.
   - `how`: the exact command, request, or clicks.
   - `saw`: what came back. Quote the output, the status and body, or what the page showed.
   - `passed`: true only when what you saw is what the change should give.

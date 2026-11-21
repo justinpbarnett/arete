@@ -1133,6 +1133,9 @@ class Verify:
 
     def policy(self) -> dict:
         values = asdict(self)
+        for journey in values["feature_map"].values():
+            if not journey["tracker_criterion"]:
+                del journey["tracker_criterion"]
         for name in ("feature_map", "drivers"):
             if not values[name]:
                 del values[name]

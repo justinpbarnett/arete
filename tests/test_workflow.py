@@ -1437,6 +1437,11 @@ class JourneyVerificationTests(unittest.TestCase):
         return pipeline.use_product(self.work, "verify", "verify", goal="Check the CLI output.", summary="",
                                     diff="")
 
+    def saved_report(self):
+        reports = [call.args[1] for call in self.run.save.call_args_list if call.args[0] == "verify.md"]
+        self.assertEqual(len(reports), 1)
+        return reports[0]
+
     def passing_driver(self):
         process = mock.Mock(returncode=0, communicate=mock.Mock(return_value=("Driver observed valid prompt", "")))
         self.enterContext(mock.patch.object(verify.scratch, "service_command", return_value=["driver"]))
@@ -1479,7 +1484,7 @@ class JourneyVerificationTests(unittest.TestCase):
         self.assertEqual(result.verdict, "blocked")
         self.assertEqual(result.blocked_by, "the verifier said pass but listed no checks")
         self.assertEqual(result.native_trees, {})
-        self.assertIn("Driver observed valid prompt", self.run.save.call_args.args[1])
+        self.assertIn("Driver observed valid prompt", self.saved_report())
 
     def test_merge_check_replays_numbered_verifier_step_without_the_driver(self):
         self.passing_driver()
@@ -1490,7 +1495,7 @@ class JourneyVerificationTests(unittest.TestCase):
 
         result = self.verify()
         self.assertEqual(result.verdict, "pass")
-        report = self.run.save.call_args.args[1]
+        report = self.saved_report()
         self.assertIn(self.work.layer.verify.drivers["prompt-inputs"], report)
         self.assertIn("Driver observed valid prompt", report)
         item = {"run_id": "build", "pr": 646}
@@ -1592,7 +1597,7 @@ class JourneyVerificationTests(unittest.TestCase):
         self.assertTrue(all(call.kwargs["actor_confined"] for call in spawn.call_args_list))
         self.assertIn("Expected outcome", self.run.agent.call_args.args[1])
         self.assertIn("exit 0: second output", self.run.agent.call_args.args[1])
-        self.assertIn("exit 0: second output", self.run.save.call_args.args[1])
+        self.assertIn("exit 0: second output", self.saved_report())
 
     def test_assertion_failure_and_unavailable_command_have_distinct_results(self):
         self.enterContext(mock.patch.object(verify.scratch, "service_command", return_value=["driver"]))

@@ -56,6 +56,27 @@ def policy_fingerprint(cfg, layer, closed_context):
                                                 "closed_context": closed_context}, default=str)))
 
 
+def _task_goal(title, body):
+    return f"Check the issue and owner's answers in use:\n{title}\n{body}"
+
+
+def lease_continuation_blocker(lease, *, decision_boundary=False):
+    for turn in ledger.pending(lease):
+        launch = turn["response"] or {}
+        if delegation.live(launch.get("pid"), launch.get("identity")):
+            return "the prior controller inference is still live; no replacement was launched"
+    actions = ledger.actions(lease)
+    for action in actions:
+        result = action["result"]
+        if action["state"] == "running" and delegation.live(result.get("pid"), result.get("identity")):
+            return f"worker {action['id']} is still live; no replacement was launched"
+    if decision_boundary:
+        for action in actions:
+            if action["state"] not in ledger.TERMINAL:
+                return f"accepted action {action['id']} is unfinished ({action['state']})"
+    return ""
+
+
 class Controller:
     def __init__(self, flow):
         self.flow, self.job = flow, flow.ctx
@@ -94,20 +115,7 @@ class Controller:
         return outcome
 
     def continuation_blocker(self, *, decision_boundary=False):
-        for turn in ledger.pending(self.lease):
-            launch = turn["response"] or {}
-            if delegation.live(launch.get("pid"), launch.get("identity")):
-                return "the prior controller inference is still live; no replacement was launched"
-        actions = ledger.actions(self.lease)
-        for action in actions:
-            result = action["result"]
-            if action["state"] == "running" and delegation.live(result.get("pid"), result.get("identity")):
-                return f"worker {action['id']} is still live; no replacement was launched"
-        if decision_boundary:
-            for action in actions:
-                if action["state"] not in ledger.TERMINAL:
-                    return f"accepted action {action['id']} is unfinished ({action['state']})"
-        return ""
+        return lease_continuation_blocker(self.lease, decision_boundary=decision_boundary)
 
     def quiescent(self):
         if why := self.continuation_blocker():
@@ -119,6 +127,17 @@ class Controller:
                             engine_commit=event["engine_commit"])
             del self.data["lineage_event"]
             ledger.save(self.lease, self.data)
+
+    def _refresh_retry_task(self, prepared):
+        current = self.run.tracker.get(self.run.tid)
+        ticket = prepared["ticket"]
+        previous_goal = _task_goal(ticket["title"], ticket["body"])
+        goal_base = self.data.get("goal_base", "")
+        if goal_base.startswith(previous_goal):
+            self.data["goal_base"] = _task_goal(current.title, current.body) + goal_base[len(previous_goal):]
+        ticket.update(title=current.title, body=current.body, comments=current.comments, labels=current.labels)
+        prepared.pop("retry_run", None)
+        prepared.update(flows.prepared_retry(current))
 
     def prepare(self):
         self.write_lineage_event()
@@ -158,6 +177,8 @@ class Controller:
                 if missing:
                     if why := self.job.restore({"step": "prepare", "tree": str(self.job.ws), "data": prepared}, layer=self.job.layer):
                         raise factory.Refused(why)
+                if self.run.readmitted_retry:
+                    self._refresh_retry_task(prepared)
                 self.job.take("prepare", factory.Outcome("pass", data=prepared), stored=True)
             for name, value in self.data.get("job", {}).items():
                 if name in STATE_FIELDS:
@@ -186,7 +207,7 @@ class Controller:
             if not outcome.passed:
                 return flows.ended(self.flow, outcome)
             self.data["prepared"] = outcome.data
-            self.job.goal = f"Check the issue and owner's answers in use:\n{self.job.ticket.title}\n{self.job.ticket.body}"
+            self.job.goal = _task_goal(self.job.ticket.title, self.job.ticket.body)
             self.job.plan_text = ""
         if self.run.repairs:
             found = repairs.source(pipeline.run_store.run_get(self.run.repairs) or {})

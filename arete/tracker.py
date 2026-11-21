@@ -32,6 +32,7 @@ MAX_IMAGES = 6
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 ARETE_TAG = "[arete]"
 TASK_ID = re.compile(r"t-[0-9a-f]{4,}", re.IGNORECASE)
+RETRY_MARKER = re.compile(r"<!-- arete:retry run=(.+) n=([12]) -->")
 
 
 class TaskError(LookupError):
@@ -63,6 +64,14 @@ class Moved:
 
 
 @dataclass
+class ParkComment:
+    run_id: str
+    when: str
+    body: str
+    number: int
+
+
+@dataclass
 class Ticket:
     id: str
     ref: str
@@ -77,6 +86,9 @@ class Ticket:
     labels: list[str] = field(default_factory=list)
     blocker: str = ""
     images: list[Image] = field(default_factory=list)
+    retries: list[ParkComment] = field(default_factory=list)
+    version: int | None = None
+    state: str = ""
 
     def __post_init__(self) -> None:
         self.title = self.title.strip()
@@ -214,6 +226,14 @@ class GitHubTracker:
         return (ZTE_QUEUE if ZTE_LABEL in ticket.labels else "") or error_of(lambda: batch_ids(ticket)) or self.wait_blocker(
             self.ticket_waits(tid, body))
 
+    @staticmethod
+    def authored_retry(comment: dict) -> bool:
+        if not retry_marker(comment.get("body") or ""):
+            return False
+        viewer = comment.get("viewerDidAuthor")
+        login = (comment.get("author") or {}).get("login") or ""
+        return viewer is True or (viewer is None and bool(login) and login.casefold() == gh.me().casefold())
+
     def ticket_waits(self, tid: str, body: str) -> list[tuple[str, int]]:
         return list(dict.fromkeys(github_waits(body, self.repo.github) + run_store.environment_waits(self.repo.name, tid)))
 
@@ -252,7 +272,7 @@ class GitHubTracker:
             if ZTE_LABEL in self._labels[str(i["number"])]:
                 continue
             mine = [(datetime.fromisoformat(c["createdAt"]), c.get("body") or "") for c in full.get("comments", [])
-                    if self.by_owner(c) and c.get("createdAt")]
+                    if self.by_owner(c) and c.get("createdAt") and not self.authored_retry(c)]
             if answered(mine):
                 out.append(Ticket(str(i["number"]), f"#{i['number']}", i["title"], url=i.get("url", ""),
                                   created=i.get("createdAt", "")))
@@ -263,7 +283,8 @@ class GitHubTracker:
         if any(label["name"] == ZTE_LABEL for label in full.get("labels", [])):
             return ""
         return reply_text([(datetime.fromisoformat(c["createdAt"]), c.get("body") or "")
-                           for c in full.get("comments", []) if self.by_owner(c) and c.get("createdAt")], since)
+                           for c in full.get("comments", [])
+                           if self.by_owner(c) and c.get("createdAt") and not self.authored_retry(c)], since)
 
     def save_images(self, t: Ticket, dest: Path) -> SavedImages:
         return SavedImages()
@@ -274,8 +295,13 @@ class GitHubTracker:
         self._bodies[str(tid)] = i.get("body") or ""
         self._labels[str(tid)] = labels
         author = (i.get("author") or {}).get("login", "")
-        comments = [(self.owner, c.get("createdAt", ""), c.get("body", "")) for c in i.get("comments", [])
-                    if self.by_owner(c)]
+        comments, retry_messages = [], []
+        for comment in i.get("comments", []):
+            when, body = comment.get("createdAt") or "", comment.get("body") or ""
+            if self.authored_retry(comment):
+                retry_messages.append((when, body))
+            elif self.by_owner(comment):
+                comments.append((self.owner, when, body))
         blocker = (ZTE_QUEUE if ZTE_LABEL in labels else "") or (
             "" if self.by_owner(i) else f"it was opened by {author or 'someone else'}, not {self.owner}") or (
             "" if LABEL in labels else f"it has no `{LABEL}` label") or self.wait_blocker(
@@ -283,7 +309,8 @@ class GitHubTracker:
         ticket = Ticket(str(i["number"]), f"#{i['number']}", i["title"], body=i.get("body") or "(no description)",
                       comments=comments_text(comments), open=i.get("state") == "OPEN",
                       kind="fix" if FIX_LABELS & set(labels) else "feat", url=i.get("url", ""),
-                      updated=i.get("updatedAt") or "", labels=labels, blocker=blocker)
+                      updated=i.get("updatedAt") or "", labels=labels, blocker=blocker,
+                      retries=retry_comments(retry_messages, self.repo.name, str(tid)))
         if ZTE_LABEL not in labels:
             batch_ids(ticket)
         return ticket
@@ -540,13 +567,19 @@ class LocalTracker:
     def get(self, tid: str, *, include_environment: bool = True) -> Ticket:
         if (row := tasks_store.task_get(tid)) is None:
             raise TaskError(f"no task {tid}")
+        rows = tasks_store.task_comments(tid)
+        retry_messages = ((c["ts"] or "", c["body"] or "") for c in rows if c["author"] == "arete")
+        retries = retry_comments(retry_messages, self.repo.name, tid)
         comments = [("Arete" if c["author"] == "arete" else "Owner", c["ts"] or "", c["body"] or "")
-                    for c in tasks_store.task_comments(tid)]
+                    for c in rows if c["author"] != "arete" or not retry_marker(c["body"] or "")]
         blocker = (f"it is a task of {row['repo']}, not {self.repo.name}" if row["repo"] != self.repo.name
                    else task_wait_blocker(waits_on_tasks(row["body"]), task_state))
         if include_environment and not blocker:
             blocker = environment_blocker(self.repo.name, tid)
-        return task_ticket(row, comments_text(comments), blocker)
+        ticket = task_ticket(row, comments_text(comments), blocker)
+        ticket.retries = retries
+        ticket.version, ticket.state = row.get("version"), row["state"]
+        return ticket
 
     def prepare(self) -> list[str]:
         return []
@@ -687,6 +720,19 @@ def safe_filename(name: str) -> str:
 
 def from_arete(body: str) -> bool:
     return body.lstrip().startswith(ARETE_TAG)
+
+
+def retry_marker(body: str) -> re.Match | None:
+    return RETRY_MARKER.fullmatch(body.partition("\n")[0])
+
+
+def retry_comments(messages: Iterable[tuple[str, str]], repo: str, issue: str) -> list[ParkComment]:
+    retries = []
+    for when, body in sorted(messages, key=lambda row: row[0]):
+        if when and (match := retry_marker(body)) and (run := run_store.run_get(match[1])):
+            if run["kind"] == "pipeline" and (run["repo"], str(run["issue"])) == (repo, issue):
+                retries.append(ParkComment(match[1], when, body, int(match[2])))
+    return retries
 
 
 def reply_text(comments: list[tuple[datetime, str]], since: str) -> str:

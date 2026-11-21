@@ -55,6 +55,8 @@ real caller takes:
 
 For each blocker set `severity` to `blocker` and `category` to the test it meets, and in `problem` name the path: who
 or what does what, and what goes wrong. If you cannot name that path, it is not a blocker.
+If a blocker concerns a named acceptance criterion, set `criterion_ref` to its exact `criterion:` or `journey:`
+reference from the ticket. Keep the finding in `problem` so the next reviewer can reproduce it.
 
 ## Notes
 

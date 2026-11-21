@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 
+from . import retry_findings
+
 BLOCKER_CATEGORIES = ("issue", "regression", "security", "data_loss")
 UNWAIVABLE = ("security", "data_loss")
 EARLIER_STATUSES = ("fixed", "open", "waived")
@@ -21,6 +23,7 @@ REVIEW_SCHEMA = {
                     "problem": {"type": "string"},
                     "severity": {"type": "string", "enum": ["blocker", "major", "minor"]},
                     "category": {"type": "string", "enum": list(BLOCKER_CATEGORIES)},
+                    "criterion_ref": retry_findings.REFERENCE_SCHEMA,
                 },
                 "required": ["problem", "severity"],
             },
@@ -161,10 +164,16 @@ def review_problems(listed) -> list[dict]:
     return [{"file": p.get("file") or "", "problem": p.get("problem") or "",
              "severity": str(p.get("severity") or "unrated").strip().lower(),
              "category": str(p.get("category") or "").strip().lower()
-             if str(p.get("category") or "").strip().lower() in BLOCKER_CATEGORIES else ""}
+             if str(p.get("category") or "").strip().lower() in BLOCKER_CATEGORIES else "",
+             **retry_fields(p)}
             for p in listed if isinstance(p, dict)]
 
 
+def retry_fields(problem: dict) -> dict:
+    ref = retry_findings.reference(problem.get("criterion_ref"))
+    return {"criterion_ref": ref} if ref else {}
+
+
 def reported(listed: list[dict]) -> list[dict]:
-    return [{"file": p["file"], "text": p["problem"], "severity": p["severity"], "category": p.get("category") or ""}
-            for p in listed]
+    return [{"file": p["file"], "text": p["problem"], "severity": p["severity"], "category": p.get("category") or "",
+             **retry_fields(p)} for p in listed]

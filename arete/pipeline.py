@@ -389,7 +389,8 @@ class AgentRun:
                 for n, wait in enumerate(BUSY_WAITS, 2):
                     if not provider_busy(res) or self.time_for(wait) < wait:
                         break
-                    self.log(f"{step}: {res.error.strip().splitlines()[0][:200]}; "
+                    reason = "provider busy" if run_lines.finding_step(step) else util.first_line(res.error, 200)
+                    self.log(f"{step}: {reason}; "
                              f"try {n} of {len(BUSY_WAITS) + 1} in {wait}s")
                     time.sleep(wait)
                     res = self.again(step, text, cwd, kw, res, CONTINUE_AFTER_BUSY)
@@ -433,7 +434,10 @@ class AgentRun:
                                    "turns": res.turns, "text": res.text, "structured": res.structured,
                                    "error": res.error, "runner": usage["runner"], "model": usage["model"],
                                    "skipped": res.skipped})
-        self.log(f"{step}: {'ok' if res.ok else 'FAILED ' + util.first_line(res.error)} {runner.cost_note(res)}")
+        status = "ok" if res.ok else "FAILED"
+        if not res.ok and not run_lines.finding_step(step):
+            status += f" {util.first_line(res.error)}"
+        self.log(f"{step}: {status} {runner.cost_note(res)}")
         return res
 
 
@@ -468,14 +472,21 @@ class Run(AgentRun):
     action: str = ""
     action_only: bool = False
     workspace: tuple[Path, list[workspace.Checkout]] | None = None
+    workspace_branch: str = ""
     failure: dict | None = None
     asks_made: int = 0
     answers_due: list[dict] = field(default_factory=list)
     base_note: str = ""
     kept_note: str = ""
+    parked_branch: str = ""
+    readmitted_retry: bool = False
+    retry_run: str = ""
     owner_questions_blocked: bool = False
     environment_release: str = ""
     preview_of: str = ""
+
+    def set_workspace(self, ws: Path, checkouts: list[workspace.Checkout], branch: str) -> None:
+        self.workspace, self.workspace_branch = (ws, checkouts), branch
 
     @property
     def preview_branch(self) -> str:
@@ -488,6 +499,33 @@ class Run(AgentRun):
     @property
     def ref(self) -> str:
         return self.tracker.ref(self.tid)
+
+    def task_ticket(self, ticket: tracker.Ticket | None = None, *, retry_run: str = "",
+                    audit: bool = False) -> tracker.Ticket:
+        from . import park_retries
+
+        ticket = ticket or self.tracker.get(self.tid)
+        if tracker.BATCH_LABEL in ticket.labels:
+            return ticket
+        if retry_run:
+            retries = self.tracker.get(self.tid).retries
+            retry = next((comment for comment in reversed(retries) if comment.run_id == retry_run), None)
+        else:
+            retry = ticket.retries[-1] if ticket.retries else None
+        if not retry:
+            return ticket
+        findings = park_retries.ticket_evidence(self.repo.name, ticket, retry.run_id)
+        if audit:
+            self.retry_run = retry.run_id
+            classes = [finding.kind for finding in findings]
+            self.write_line("prepare", parked_run=retry.run_id, finding_count=len(classes), finding_classes=classes)
+            self.log(f"prepare: parked run {retry.run_id}, {util.count(len(classes), 'finding')}"
+                     + (f" ({', '.join(classes)})" if classes else ""))
+        sections = [ticket.comments,
+                    "## Current acceptance criteria that add to the ticket body\n\n"
+                    f"Follow the owner's current specification if it conflicts with this retry.\n\n{retry.body}",
+                    park_retries.task_evidence(retry.run_id, findings)]
+        return replace(ticket, comments="\n\n".join(filter(None, sections)))
 
     @property
     def ab_ticket(self) -> tuple[str, str] | None:
@@ -1440,8 +1478,22 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 tk.require_ordinary(tid)
             budget_history = run_store.ticket_runs(repo.name, tid, limit=1, live=bool(retry_of or preview_of))
             readmission = None if force else runlimits.Readmission.decode(launch_lease.readmission(repo.name, str(tid)))
+            readmitted_ticket = tk.get(tid) if readmission else None
             blocked, reset_budget = runlimits.admission(repo, str(tid), tk, runlimits.Policy.of(layer), force,
-                                                       readmission=readmission)
+                                                       readmission=readmission, ticket=readmitted_ticket)
+            parked_branch, readmitted_retry = "", False
+            if reset_budget and readmission:
+                parked_run, park = runlimits.latest_park(repo.name, str(tid))
+                readmitted_retry = bool(park and runlimits.park_retry(parked_run, park, readmitted_ticket))
+                if readmitted_retry and not runlimits.retry_hold(readmitted_ticket):
+                    parked_branch = runlimits.park_branch(parked_run, park)
+                    if (not dry_run and script and script.path == "orchestrate"
+                            and script.continues == parked_run["id"] and not (script.only or script.again or script.action)
+                            and not flows.pending_catch_up(script.continues)):
+                        from .park_retries import restart_parked_revision
+
+                        if restart_parked_revision(cfg, repo, layer, closed_context, parked_run, park, readmitted_ticket):
+                            script = replace(script, continues="")
         except tracker.ERRORS as e:
             print(f"could not read {name}: {e}")
             return 2
@@ -1539,6 +1591,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     return settle_zte_refusal(repo.name, str(tid), slot, run_id, error, committed=committed)
             else:
                 run_id = start()
+            if readmitted_retry and readmission.feedback and not dry_run:
+                readmission.attempted(record=True)
             scratch.RUN_BASELINES[run_id] = producer_baseline
             scratch.RUN_LABELS[run_id] = service_labels
             run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force,
@@ -1546,6 +1600,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                       repairs=mending,
                       answering=earlier if earlier and earlier["status"] == "needs-info" else {},
                       launch_gate=admission, launch_done=launch_done, closed_context=closed_context, preview_of=preview_of,
+                      parked_branch=parked_branch, readmitted_retry=readmitted_retry,
                 **(script.run_fields if script else {}))
             try:
                 with handoff_io():
@@ -1901,7 +1956,8 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
 
     repo, tk = run.repo, run.tracker
     try:
-        t = intake.route_ticket(cfg, repo, tk, tk.get(run.tid), dry_run=run.dry_run, log=run.log)
+        source_ticket = intake.route_ticket(cfg, repo, tk, tk.get(run.tid), dry_run=run.dry_run, log=run.log)
+        t = run.task_ticket(source_ticket, audit=True)
     except tracker.ERRORS as e:
         return "failed", f"could not read {run.ref}: {e}", ""
     run_lines.write(run.id, "task", ticket=t.ref, kind=t.kind, repo=repo.name, title=t.title)
@@ -1938,7 +1994,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
     try:
         ws, checkouts = workspace.make_workspace(run.id, repo, main_layer.base_branch, branch, run.workspace_key,
                                                  main_layer.copy, preview_of=run.preview_of)
-        run.workspace = ws, checkouts
+        run.set_workspace(ws, checkouts, branch)
         for c in checkouts:
             run.log(f"worktree {c.wt} on {branch}, {c.starting_point}")
         run.cfg, run.layer, run.kind = cfg, main_layer, t.kind
@@ -2127,7 +2183,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
     if (not run.feedback and draft_why and review.approved()
             and not ci_stopped and environment_gaps.gaps(asdict(verified))):
         run_lines.write(run.id, "classic_hold",
-                        prepared=flows.prepared_fields(t, branch, checkouts, layer, run.add_dirs, attachments, approval),
+                        prepared=flows.prepared_fields(source_ticket, branch, checkouts, layer, run.add_dirs, attachments, approval),
                         plan={"plan": plan_text, "goal": verify_goal, "estimate": estimate,
                               "left_for_a_person": left_for_a_person},
                         build={"summary": build_summary}, review=review.asdict(),
@@ -2191,7 +2247,7 @@ def report_body(run: Run, *, summary: str, review: Review, verified: verify.Veri
         + review.markdown()
         + (f"\n\nHeld as a draft: {held}." if held else "")
         + f"\n\n## Checks\n\nAll passed after {util.count(attempts, 'attempt')}: {checks}\n\n"
-        + ("" if run.feedback else
+        + ("" if run.feedback or run.retry_run else
            f"<details><summary>Plan</summary>\n\n{cut_at_end(plan_text, PLAN_CHARS)}\n\n</details>\n\n")
         + f"Run `{run.id}`, {size}, {util.paid_note(record.metered_spent(run.id))}."
         + (f" Repairs the review findings of run `{run.repairs}`." if run.repairs else "")
@@ -3107,7 +3163,8 @@ def images_note(images: tracker.SavedImages) -> str:
 
 
 def open_branch(run: Run) -> str:
-    return next((r["branch"] for r in run_store.open_runs(run.repo.name, run.tid) if r.get("branch")), "")
+    return run.parked_branch or next((
+        r["branch"] for r in run_store.open_runs(run.repo.name, run.tid) if r.get("branch")), "")
 
 
 def with_siblings(body: str, section: str) -> str:
@@ -3256,6 +3313,40 @@ def check_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
 
 def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "verify",
                 require_released: bool = False, *, replay_drivers: set[str] | None = None, **values) -> verify.Verified:
+    step = b.next_step(step_name)
+    record_attempt = step_name == prompt_name == role == "verify"
+    if record_attempt:
+        b.run.write_line("verification_start", step=step)
+    startup_error = None
+    try:
+        verified = _use_product(b, step, prompt_name, role, require_released, replay_drivers, **values)
+    except verify.ServerError as error:
+        startup_error = str(error)
+        b.run.log(f"{step}: the app did not start")
+        fault = verify.environment_fault(startup_error)
+        verified = (verify.Verified("blocked", "The app could not start in the verifier's sandbox.",
+                                    blocked_by=f"the app could not start in the verifier's sandbox ({fault}); "
+                                               "the start log stays in the run folder", finished=False,
+                                    behavior_reached=False)
+                    if fault else verify.Verified("fail", f"The app did not start: {error}", behavior_reached=False))
+    if record_attempt:
+        from . import park_retries
+
+        startup_failed = startup_error is not None
+        if not verified.saved and verified.verdict != "pass":
+            attempt = {"verdict": verified.verdict, "summary": verified.summary,
+                       "blocked_by": verified.blocked_by, "checks": verified.checks}
+            if startup_failed and verified.verdict == "blocked":
+                attempt["error"] = startup_error
+            b.run.save(f"{step}-attempt.json", attempt)
+        classes = park_retries.verification_classes(verified.verdict, len(verified.failed_checks), startup_failed)
+        b.run.write_line("verification_end", step=step, verdict=verified.verdict, startup_failed=startup_failed,
+                         parked_run=b.run.retry_run, finding_count=len(classes), finding_classes=classes)
+    return verified
+
+
+def _use_product(b: TicketWork, step: str, prompt_name: str, role: str,
+                 require_released: bool, replay_drivers: set[str] | None, **values) -> verify.Verified:
     from . import pilot, readme_verify, zte
 
     run, configured = b.run, b.layer.verify
@@ -3266,7 +3357,6 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
     readme_task = (delivery_verification and pilot.is_pilot_task(tid)) or zte_verify
     feature_map = configured.feature_map if delivery_verification and not readme_task else {}
     requested = journeys.requested(feature_map, b.ticket.title, b.ticket.body)
-    step = b.next_step(step_name)
     if unknown := [name for name in requested if name not in feature_map]:
         return save_verification(run, step, verify.Verified(
             "blocked", "An issue references a journey absent from the configured feature map.", finished=False,
@@ -3384,14 +3474,6 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
     except sandbox.ConfinementUnavailable as e:
         return verify.Verified("blocked", "Trusted fixture verification could not start.", finished=False,
                                blocked_by=util.first_line(str(e), 300))
-    except verify.ServerError as e:
-        run.log(f"{step}: the app did not start")
-        if fault := verify.environment_fault(str(e)):
-            return verify.Verified("blocked", "The app could not start in the verifier's sandbox.",
-                                   blocked_by=f"the app could not start in the verifier's sandbox ({fault}); "
-                                              "the start log stays in the run folder", finished=False,
-                                   behavior_reached=False)
-        return verify.Verified("fail", f"The app did not start: {e}", behavior_reached=False)
     finally:
         try:
             if require_released and not lifetime["stopped"]:
@@ -3435,6 +3517,8 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
 def save_verification(run: Run, step: str, verified: verify.Verified) -> verify.Verified:
     verified.saved = os.path.abspath(run.dir / f"{step}.md")
     run.save(f"{step}.md", verified.markdown())
+    run.save(f"{step}-outcome.json", {"verdict": verified.verdict, "summary": verified.summary,
+                                    "blocked_by": verified.blocked_by, "checks": verified.checks})
     run.log(f"{step}: {verified.verdict}, {len(verified.checks) - len(verified.failed_checks)} of "
             f"{util.count(len(verified.checks), 'check')} passed")
     return verified

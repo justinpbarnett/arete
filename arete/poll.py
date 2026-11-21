@@ -188,7 +188,8 @@ def spawn_unparked(repo_name: str, tid: str | int, readmission: runlimits.Readmi
                     zte.bind_launch(repo_name, str(tid), lease)
                 if readmission:
                     lease.readmission = json.dumps(asdict(readmission))
-                    readmission.attempted(record=True)
+                    if not readmission.feedback:
+                        readmission.attempted(record=True)
                 return spawn_run(repo_name, tid)
 
             tasks.spawn_pending(repo_name, str(tid), spawn)

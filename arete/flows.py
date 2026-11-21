@@ -433,7 +433,7 @@ def rebuild(job: Job, line: dict, *, layer: config.RepoLayer | None = None, setu
         workspace.clear_workspace(ws, made, job.run.repo.path, layer.copy)
     except workspace.RunFailed as e:
         return e.why
-    job.run.workspace = ws, made
+    job.run.set_workspace(ws, made, branch)
     try:
         for c in made:
             if c.lease:
@@ -749,6 +749,8 @@ class Job:
     def prepared(self, data: dict, stored: bool, *, reconciling_catch_up: bool = False) -> None:
         run = self.run
         self.ticket = tracker.Ticket(**data["ticket"])
+        if retry_run := data.get("retry_run"):
+            self.ticket = run.task_ticket(self.ticket, retry_run=retry_run, audit=True)
         self.branch, self.attachments, self.triage = data["branch"], data["attachments"], data["triage"]
         self.expertise, self.approval = data["expertise"], data.get("approval")
         self.checkouts = [workspace.Checkout.from_row(c)
@@ -772,7 +774,7 @@ class Job:
         elif stored:
             for c in self.checkouts:
                 c.onto = ""
-        run.workspace = self.ws, self.checkouts
+        run.set_workspace(self.ws, self.checkouts, self.branch)
         if stored and not reconciling_catch_up:
             runs = authors(self.continues)
             for c in self.checkouts:
@@ -862,7 +864,7 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
                                                 main_layer.copy, preview_of=run.preview_of)[1]
         else:
             checkouts = local_workspace(run, main_layer.base_branch, branch, job.ws, main_layer.copy)
-        run.workspace = job.ws, checkouts
+        run.set_workspace(job.ws, checkouts, branch)
         for c in checkouts:
             run.log(f"worktree {c.wt} on {branch}, {c.starting_point}")
         run.cfg, run.layer, run.kind = cfg, main_layer, t.kind
@@ -880,9 +882,15 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
                                                 pipeline.images_note(images), approval))
 
 
+def prepared_retry(ticket: tracker.Ticket) -> dict[str, str]:
+    if ticket.retries and tracker.BATCH_LABEL not in ticket.labels:
+        return {"retry_run": ticket.retries[-1].run_id}
+    return {}
+
+
 def prepared_fields(ticket: tracker.Ticket, branch: str, checkouts: list[workspace.Checkout], layer: config.RepoLayer,
                     add_dirs: list[Path], attachments: str, approval: dict | None) -> dict:
-    return {"ticket": {k: getattr(ticket, k) for k in TICKET_FIELDS}, "branch": branch,
+    return {"ticket": {k: getattr(ticket, k) for k in TICKET_FIELDS}, **prepared_retry(ticket), "branch": branch,
             "checkouts": [c.to_row() for c in checkouts], "layer": str(layer.dir), "add_dirs": list(map(str, add_dirs)),
             "attachments": attachments, "triage": pipeline.triage_notes(approval), "approval": approval,
             "expertise": layer.expertise_file.read_text() if layer.expertise_file.exists() else "(none yet)"}

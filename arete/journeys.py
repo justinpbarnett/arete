@@ -19,6 +19,7 @@ class Journey:
     steps: tuple[str, ...]
     outcome: str
     driver: str = ""
+    tracker_criterion: str = ""
 
 
 def linked_map(value: str, source_dir: Path) -> dict:
@@ -51,14 +52,19 @@ def load(value, source_dir: Path, bindings: dict[str, str]) -> dict[str, Journey
         where = f"[verify.feature_map.{name}]"
         if not NAME.fullmatch(name):
             raise ValueError(f"{where} use a lowercase, hyphen-separated journey name")
-        if not isinstance(entry, dict) or entry.keys() - {"steps", "outcome"}:
-            raise ValueError(f"{where} expected steps and outcome; bind drivers in [verify.journey_drivers]")
+        if not isinstance(entry, dict) or entry.keys() - {"steps", "outcome", "tracker_criterion"}:
+            raise ValueError(f"{where} expected steps, outcome and optional tracker_criterion; "
+                             "bind drivers in [verify.journey_drivers]")
         steps, outcome = entry.get("steps"), entry.get("outcome")
         if not isinstance(steps, list) or not steps or any(not isinstance(s, str) or not s.strip() for s in steps):
             raise ValueError(f"{where} steps must be a nonempty list of nonempty strings")
         if not isinstance(outcome, str) or not outcome.strip():
             raise ValueError(f"{where} outcome must be a nonempty string")
-        journeys[name] = Journey(tuple(step.strip() for step in steps), outcome.strip(), bindings.get(name, ""))
+        criterion = entry.get("tracker_criterion", "")
+        if not isinstance(criterion, str) or len(criterion.splitlines()) > 1:
+            raise ValueError(f"{where} tracker_criterion must be a single line of tracker-safe text")
+        journeys[name] = Journey(tuple(step.strip() for step in steps), outcome.strip(), bindings.get(name, ""),
+                                 criterion.strip())
     if unknown := bindings.keys() - journeys.keys():
         raise ValueError(f"[verify.journey_drivers] unknown journeys: {', '.join(sorted(unknown))}")
     return journeys

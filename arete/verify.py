@@ -17,7 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import SplitResult, urlsplit
 
-from . import browser, config, environment, paths, sandbox, scratch, util, vault
+from . import browser, config, environment, paths, retry_findings, sandbox, scratch, util, vault
 from .util import git
 
 PLAYWRIGHT_TOOLS = tuple("browser_" + n for n in (
@@ -47,6 +47,7 @@ SCHEMA = {
                 "saw": {"type": "string"},
                 "passed": {"type": "boolean"},
                 "cause": {"type": "string", "enum": ["change", "environment"]},
+                "criterion_ref": retry_findings.REFERENCE_SCHEMA,
                 "screenshot": {"type": "string"},
             },
             "required": ["what", "how", "saw", "passed"],
