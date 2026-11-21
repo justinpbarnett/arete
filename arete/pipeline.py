@@ -80,6 +80,8 @@ REFUSAL_WORDS = re.compile(r"guard|jev|credential|secret|confine|authority", re.
 SIBLINGS = re.compile(r"\n*## Other PRs for [^\n]*\n(?:\n- \[[^\n]*)+")
 SKIPPED_FILE = paths.STATE_DIR / "skipped.json"
 CONTINUE_AFTER_DROP = "The connection dropped mid step. Carry on from where you stopped and finish the step."
+CONTINUE_AFTER_BUSY = "The provider was busy mid step. Carry on from where you stopped and finish the step."
+BUSY_WAITS = (30, 90, 270)
 CHECKS_LOCK = "checks"
 LEFT_TITLE = "Left for a person"
 LEFT_HEADING = f"## {LEFT_TITLE}"
@@ -198,6 +200,10 @@ def seam_facts(run_id: str) -> dict:
 
 def public_text(run: AgentRun, text: str) -> str:
     return outbound.redact(text) if run.repo.public else text
+
+
+def provider_busy(res: Result) -> bool:
+    return not (res.ok or res.connection_failed or res.usage_limit) and util.is_provider_busy(res.error)
 
 
 @dataclass
@@ -376,18 +382,26 @@ class AgentRun:
                 if res.connection_failed:
                     self.log(f"{step}: lost the connection after {util.count(res.turns, 'turn')}, waiting for the network")
                     if self.wait_for_network():
-                        dropped = res
                         self.log(f"{step}: the network is back, the dropped attempt cost {runner.cost_note(res)}")
-                        if res.session.id and res.turns > 1 and kw.get("persist", True):
-                            res = runner.run(CONTINUE_AFTER_DROP, cwd, trace=(self.id, step),
-                                             **{**kw, "resume": res.session, **self.retry_kw()})
-                        else:
-                            res = runner.run(text, cwd, trace=(self.id, step), **{**kw, **self.retry_kw()})
-                        res = runner.with_spent(res, [dropped])
+                        res = self.again(step, text, cwd, kw, res, CONTINUE_AFTER_DROP)
+                for n, wait in enumerate(BUSY_WAITS, 2):
+                    if not provider_busy(res) or self.time_for(wait) < wait:
+                        break
+                    self.log(f"{step}: {res.error.strip().splitlines()[0][:200]}; "
+                             f"try {n} of {len(BUSY_WAITS) + 1} in {wait}s")
+                    time.sleep(wait)
+                    res = self.again(step, text, cwd, kw, res, CONTINUE_AFTER_BUSY)
             return res
         finally:
             if s:
                 record.label_step(self.id, step, attempt_no, atom=s.step, ab=s.ab_name, ab_side=s.ab_side)
+
+    def again(self, step: str, text: str, cwd: Path, kw: dict, failed: Result, carry_on: str) -> Result:
+        if failed.session.id and failed.turns > 1 and kw.get("persist", True):
+            res = runner.run(carry_on, cwd, trace=(self.id, step), **{**kw, "resume": failed.session, **self.retry_kw()})
+        else:
+            res = runner.run(text, cwd, trace=(self.id, step), **{**kw, **self.retry_kw()})
+        return runner.with_spent(res, [failed])
 
     def record_step(self, step: str, res: Result, s: steps.Settings | None, kw: dict, seam, attempt_no: int,
                     started: float, spent: float, chosen: tuple[str, str, str]) -> Result:
@@ -435,6 +449,7 @@ class Run(AgentRun):
     action: str = ""
     action_only: bool = False
     workspace: tuple[Path, list[workspace.Checkout]] | None = None
+    failure: dict | None = None
     asks_made: int = 0
     answers_due: list[dict] = field(default_factory=list)
     base_note: str = ""
@@ -1234,7 +1249,10 @@ def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: boo
     end_line = f"done: {status} {pr_url or summary}"
     if echo_end:
         run.log(end_line)
-    record.settle(run.id, status, end_line=end_line, summary=summary, pr_url=pr_url)
+    failure = run.failure if run.failure is not None else {"class": "work"}
+    classified = {"failure": json.dumps(failure)} if status == "failed" and failure and not run.dry_run else {}
+    record.settle(run.id, status, end_line=end_line, summary=summary, pr_url=pr_url,
+                  **classified)
     write_report(run_store.run_get(run.id) or {"id": run.id, "status": status, "pr_url": pr_url}, flow, run)
 
 
@@ -1258,6 +1276,20 @@ def settle_zte_refusal(repo: str, tid: str, slot: slots.RunSlot, run_id: str, er
         except (OSError, RuntimeError, sqlite3.Error):
             pass  # The scheduled reaper settles abandoned registered runs.
     return 2
+
+
+def crash_failure(error: Exception) -> dict:
+    if runner.SANDBOX_START_ERROR in str(error).lower():
+        return {"class": "environment", "reason": "sandbox-start"}
+    traceback = error.__traceback__
+    while traceback and traceback.tb_next:
+        traceback = traceback.tb_next
+    external_command = (traceback and traceback.tb_frame.f_globals.get("__name__") == util.__name__
+                        and traceback.tb_frame.f_code.co_name in ("git", "sh"))
+    if (isinstance(error, (AttributeError, AssertionError, LookupError, NameError, TypeError, ValueError, RuntimeError))
+            and not external_command):
+        return {"class": "environment", "reason": "engine-crash"}
+    return {}
 
 
 def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool = False,
@@ -1362,7 +1394,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     return 1
             settled = [done for dead_row in run_store.ticket_runs_marked_running(repo.name, tid)
                        if (done := record.interrupt(dead_row))]
-            earlier = None if only else run_store.newest_whole_run(repo.name, tid)
+            earlier = None if only else run_store.newest_live_whole_run(repo.name, tid)
             restarting = bool(earlier) and earlier["status"] == "interrupted"
             mending = (script.repairs or repaired_by(script.continues or (earlier["id"] if restarting else ""))
                        ) if script else ""
@@ -1376,7 +1408,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     return 2
             def start():
                 return record.start("pipeline", tag=f"{repo.name}-{tid}", lock=lock, repo=repo.name, issue=tid,
-                                    only_step=only)
+                                    only_step=only, dry_run=int(dry_run))
 
             def check_start_cutoff():
                 pilot.require(time.monotonic() < wall_deadline, "ZTE deadline expired during run startup")
@@ -1539,7 +1571,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         except workspace.RunFailed as e:
             if zte_grant:
                 return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
-            status, summary, pr_url = _fail(run, e.why, detail=e.detail)
+            status, summary, pr_url = _fail(run, e.why, detail=e.detail, recovery=e.recovery)
         except tracker.ERRORS as e:
             if zte_grant:
                 return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
@@ -1548,6 +1580,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             if zte_grant:
                 return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
             run.log(f"crashed: {type(e).__name__}: {e}")
+            run.failure = crash_failure(e)
             status, summary, pr_url = "failed", f"crashed: {e}"[:300], ""
             run.give_up("crashed before finishing")
         finally:
@@ -1568,7 +1601,9 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         return 0 if (status in SUCCEEDED if passed is None else passed) else 1
 
 
-def _fail(run: Run, why: str, builder_said: str = "", detail: str = "") -> tuple[str, str, str]:
+def _fail(run: Run, why: str, builder_said: str = "", detail: str = "",
+          *, recovery: dict | None = None) -> tuple[str, str, str]:
+    run.failure = {"class": "environment", **recovery} if recovery else {"class": "work"}
     run.log(f"failed: {why}")
     run.enter(run.failed_state)
     extra = f"\n\n{detail.strip()}" if detail.strip() else ""
@@ -1782,7 +1817,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
         run.cfg, run.layer, run.kind = cfg, main_layer, t.kind
         settle_starts(run, checkouts, main_layer, t, branch)
     except workspace.RunFailed as e:
-        return _fail(run, e.why, detail=e.detail)
+        return _fail(run, e.why, detail=e.detail, recovery=e.recovery)
     layer = resolve_layer(cfg, run, ws)
     run.cfg, run.layer, run.kind = cfg, layer, t.kind
     if why := furnish(cfg, run, layer, ws):
@@ -1820,7 +1855,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
                         ws, role="build", allowed_tools=build_rules, disallowed_tools=routing.NO_GIT_WRITES,
                         json_schema=REVISE_SCHEMA)
         if not res.ok or not isinstance(res.structured, dict):
-            return _fail(run, "revise step failed", res.text)
+            return _fail(run, "revise step failed", res.text, recovery=runner.start_failure(res, "build"))
         run.facts["left_for_a_person"] = left_for_a_person
         build_summary = res.structured.get("summary", "")
         replies = res.structured.get("replies") or []
@@ -1831,7 +1866,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
             "plan", triage=triage_notes(approval), denied=prompt_loader.code_list(deny), checks=checks),
                         ws, role="plan", allowed_tools=read_rules, json_schema=PLAN_SCHEMA)
         if not res.ok or not isinstance(res.structured, dict):
-            return _fail(run, "planning step failed")
+            return _fail(run, "planning step failed", recovery=runner.start_failure(res, "plan"))
         plan = res.structured
         plan_text = plan.get("plan", "")
         left_for_a_person = left_section(run, (plan.get("left_for_a_person") or "").strip())
@@ -1856,7 +1891,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
             "build", plan=plan_text, checks=runs_checks, estimate=estimate, verify=goal),
                         ws, role="build", allowed_tools=build_rules, disallowed_tools=routing.NO_GIT_WRITES)
         if not res.ok:
-            return _fail(run, "build step failed", res.text)
+            return _fail(run, "build step failed", res.text, recovery=runner.start_failure(res, "build"))
         build_summary = res.text
         if not stage(checkouts, deny).files:
             if estimate == 0:
@@ -2453,8 +2488,8 @@ def commit_edits_before_merge(run: AgentRun, checkouts: list[workspace.Checkout]
 
 
 class ConflictUnresolved(workspace.RunFailed):
-    def __init__(self, why: str, detail: str, paths: list[str]):
-        super().__init__(why, detail)
+    def __init__(self, error: workspace.RunFailed, paths: list[str]):
+        super().__init__(error.why, error.detail, recovery=error.recovery)
         self.paths = paths
 
 
@@ -2475,7 +2510,7 @@ def merge_base_into_kept(run: AgentRun, checkouts: list[workspace.Checkout], lay
             files = f" in {', '.join(e.paths)}" if isinstance(e, ConflictUnresolved) else ""
             raise workspace.RunFailed(f"merging `{c.origin_base}` into the edits kept in {c.github} failed{files}: {e.why}. "
                             f"The worktree is back at the kept commit and the answers are kept, so "
-                            f"`arete resume {run.id}` continues with them", e.detail) from e
+                            f"`arete resume {run.id}` continues with them", e.detail, recovery=e.recovery) from e
     for c in merged:
         if not c.resumes:
             c.onto = c.base_commit
@@ -2571,7 +2606,7 @@ def merge_moved_bases(run: AgentRun, checkouts: list[workspace.Checkout], layer:
                     try:
                         resolve_conflicts(run, c, conflicts, layer, ticket)
                     except workspace.RunFailed as e:
-                        raise ConflictUnresolved(e.why, e.detail, conflicts) from e
+                        raise ConflictUnresolved(e, conflicts) from e
                 else:
                     conflicts = []
                 rec["outcome"] = "resolved" if conflicts else "clean"
@@ -2625,7 +2660,8 @@ def resolve_conflicts(run: AgentRun, c: workspace.Checkout, conflicts: list[str]
             else:
                 run.sessions["build"] = previous
         if not res.ok:
-            raise workspace.RunFailed(f"the conflict resolution step failed: {res.error}", res.text)
+            raise workspace.RunFailed(f"the conflict resolution step failed: {res.error}", res.text,
+                                      recovery=runner.start_failure(res, "build"))
         answer = res.structured if isinstance(res.structured, dict) else {}
         if answer.get("resolved") is not True:
             raise workspace.RunFailed(f"the resolver could not keep both the branch's work and the base's in {c.github}: "
@@ -3348,7 +3384,7 @@ def tell_ticket_run_died(cfg: config.Config, row: dict) -> None:
     repo = cfg.repo(row["repo"])
     run = Run(row["id"], repo, paths.RUNS_DIR / row["id"], tracker=tracker.for_ticket(cfg, repo, str(row["issue"])),
               tid=str(row["issue"]), feedback=pending_feedback(repo.name, str(row["issue"])),
-              alone=bool(row.get("only_step")))
+              alone=bool(row.get("only_step")), dry_run=bool(row.get("dry_run")))
     run.dir.mkdir(parents=True, exist_ok=True)
     if row["status"] != "stopped":
         run_lines.write(row["id"], "error", step=run_lines.last_step(row["id"]), message=row.get("summary") or "")

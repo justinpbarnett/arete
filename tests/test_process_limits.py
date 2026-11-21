@@ -6,15 +6,18 @@ import shutil
 import sqlite3
 import tempfile
 import unittest
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from arete import (
+    codebase,
     config,
     dbstats,
     delegation,
+    flows,
+    gh,
     jira,
     launch_lease,
     orchestration,
@@ -25,11 +28,15 @@ from arete import (
     record,
     run_lines,
     runlimits,
+    sandbox,
+    scratch,
     steps,
     tasks,
     tracker,
     util,
+    workspace,
 )
+from arete.agent import Result
 from arete.orchestration_api import PROTOCOL, Catalog
 from arete.store import db as foundation
 from arete.store import orchestration as ledger
@@ -64,7 +71,7 @@ class Isolated(unittest.TestCase):
     def setUp(self):
         self.folder = tempfile.TemporaryDirectory(prefix="arete-limits-")
         self.addCleanup(self.folder.cleanup)
-        self.root = Path(self.folder.name)
+        self.root = Path(self.folder.name).resolve()
         self.patches = contextlib.ExitStack()
         self.addCleanup(self.patches.close)
         self.patches.enter_context(patch.object(foundation, "_CHECKED", set()))
@@ -746,6 +753,377 @@ class QueueTests(Isolated):
         with patch.object(pipeline.routing, "Discovery", return_value=SimpleNamespace(routes=routes)):
             self.assertEqual(self.poll_with(self.cfg, start), 0)
         self.assertEqual(len(started), 1)
+
+
+class EnvironmentRequeueTests(Isolated):
+    class_timeout = 20
+
+    def setUp(self):
+        super().setUp()
+        tasks_store.task_set_state(self.ticket, "closed")
+        self.repo = config.Repo(name="github-fixture", path=self.repo.path, github="owner/project",
+                                parts=[config.Part("", "owner/project")], pipeline=True)
+        self.cfg = config.Config(repos=[self.repo], replay=config.ReplayConfig(all=True))
+        self.issue = "658"
+        self.labels = {"agent"}
+        self.comments = []
+        self.started = []
+        self.time = datetime(2026, 11, 21, 8, tzinfo=UTC)
+        self.ws = paths.WORKTREES_DIR / f"{self.repo.name}-{self.issue}"
+        self.authority = self.root / "authority"
+        for module, name, func in (
+            (config, "load", lambda: self.cfg),
+            (codebase, "STAMP", "old-engine"),
+            (util, "now", lambda: self.time),
+            (gh, "issue", self.issue_view),
+            (gh, "issues", self.issue_list),
+            (gh, "issue_labels", self.edit_labels),
+            (gh, "issue_comment", self.post_comment),
+            (gh, "find_issue_comment_marker", self.find_comment),
+            (gh, "ensure_label", lambda *args: ""),
+            (gh, "default_branch", lambda repo: "main"),
+            (poll, "network_up_or_skip", lambda *args: True),
+            (poll, "mark_loop", lambda *args: None),
+            (poll, "cleanup_worktrees", lambda **kwargs: None),
+            (outcomes, "sync_outcomes", lambda cfg: None),
+            (outcomes, "sync_moves", lambda cfg: None),
+            (outcomes, "sync_landings", lambda cfg: None),
+            (scratch, "process_ids", dict),
+            (scratch, "service_labels", dict),
+            (sandbox, "AUTHORITY", self.authority),
+            (pipeline, "SKIPPED_FILE", self.root / "skipped.json"),
+            (pipeline, "wanted", lambda repo: "classic"),
+            (tasks, "spawn_pending", lambda repo, tid, launch: self.started.append(tid)),
+        ):
+            self.patches.enter_context(patch.object(module, name, func))
+        with scratch.authority_fd(create=True) as fd:
+            scratch.create_secret(fd, scratch.SECRET)
+            self.key = scratch.read_secret(fd)
+
+    def issue_view(self, repo, number):
+        return {"number": number, "title": "Fixture issue", "body": "Fixture description", "state": "OPEN",
+                "author": {"login": "owner"}, "labels": [{"name": label} for label in sorted(self.labels)]}
+
+    def issue_list(self, repo, label, **kwargs):
+        return [self.issue_view(repo, int(self.issue))] if label in self.labels else []
+
+    def edit_labels(self, repo, number, add=(), remove=(), **kwargs):
+        self.labels.difference_update(remove)
+        self.labels.update(add)
+
+    def post_comment(self, repo, number, body, **kwargs):
+        self.comments.append(body)
+
+    def find_comment(self, repo, number, marker):
+        return next(("fixture" for body in self.comments if marker in body.splitlines()), "")
+
+    def run_failure(self, failure=None, script=None):
+        with patch.object(pipeline, "_run", side_effect=failure, wraps=pipeline._run):
+            self.assertEqual(pipeline.run_issue(self.repo.name, self.issue, script=script), 1)
+        self.assertIn("agent:failed", self.labels)
+        return run_store.newest_whole_run(self.repo.name, self.issue)
+
+    def test_authenticated_scratch_settlement_requeues_before_picking(self):
+        selector = "a" * 64
+        data = {"version": 2, "state": "retained", "source_mutations": False, "diagnostic": {},
+                "attempt": {"selector": selector, "workspace": str(self.ws),
+                            "root": str(self.ws / (paths.SCRATCH_PREFIX + "fixture"))}}
+        with scratch.authority_fd(create=True) as fd:
+            scratch.store(fd, self.key, data)
+        with patch.object(scratch, "recover_pending", return_value=[]):
+            row = self.run_failure()
+            self.assertEqual(json.loads(row["failure"])["selectors"], [selector])
+            self.assertEqual(poll.poll(), 0)
+        self.assertEqual(self.started, [])
+        self.assertIn("agent:failed", self.labels)
+        record_path = self.authority / (selector + ".json")
+        record_path.unlink()
+        self.assertEqual(poll.poll(), 0)
+        self.assertEqual(self.started, [])
+        self.assertIn("agent:failed", self.labels)
+
+        def settle():
+            with scratch.authority_fd() as fd:
+                scratch.store(fd, self.key, {**data, "state": "done"})
+                scratch.move_settled(fd, selector + ".json")
+            return [data["attempt"]["root"]]
+
+        with patch.object(scratch, "recover_pending", side_effect=settle):
+            self.assertEqual(poll.poll(), 0)
+        self.assertEqual(self.started, [self.issue])
+        self.assertNotIn("agent:failed", self.labels)
+        self.assertIn("verification scratch settled", self.comments[-1])
+
+    def test_pruned_scratch_requires_an_authenticated_receipt_when_tracker_returns(self):
+        self.cfg.retention = config.Retention(days=0)
+        selector = "b" * 64
+        name = selector + ".json"
+        data = {"version": 2, "state": "retained", "source_mutations": False, "diagnostic": {},
+                "attempt": {"selector": selector, "workspace": str(self.ws),
+                            "root": str(self.ws / (paths.SCRATCH_PREFIX + "fixture"))}}
+        with scratch.authority_fd(create=True) as fd:
+            scratch.store(fd, self.key, data)
+        with patch.object(scratch, "recover_pending", return_value=[]):
+            self.run_failure()
+            with scratch.authority_fd() as fd:
+                scratch.store(fd, self.key, {**data, "state": "done"})
+                scratch.move_settled(fd, name)
+            settled = self.authority / scratch.SETTLED / name
+            os.utime(settled, (1, 1))
+            with patch.object(sandbox, "can_confine", return_value=True), \
+                    patch.object(poll, "network_up_or_skip", return_value=False):
+                self.assertEqual(poll.poll(), 0)
+                self.assertEqual(scratch.rotate(), (1, 0))
+        self.assertFalse(settled.exists())
+        self.assertIn("agent:failed", self.labels)
+        self.assertEqual(self.started, [])
+        receipt = self.authority / scratch.RECEIPTS / name
+        original = receipt.read_bytes()
+        receipt.write_text(json.dumps({"data": {**data, "state": "done"}, "signature": "forged"}))
+        self.assertEqual(poll.poll(), 0)
+        self.assertIn("agent:failed", self.labels)
+        self.assertEqual(self.started, [])
+        receipt.write_bytes(original)
+        root = Path(data["attempt"]["root"])
+        root.mkdir(parents=True)
+        self.assertEqual(poll.poll(), 0)
+        self.assertIn("agent:failed", self.labels)
+        root.rmdir()
+        self.assertEqual(poll.poll(), 0)
+        self.assertEqual(self.started, [self.issue])
+
+    def test_disappearance_of_an_unidentifiable_scratch_record_does_not_requeue(self):
+        unreadable = self.authority / "unidentifiable.json"
+        unreadable.write_text("invalid scratch record")
+        with patch.object(scratch, "recover_pending", return_value=[]):
+            row = self.run_failure()
+            unreadable.unlink()
+            self.assertEqual(poll.poll(), 0)
+        self.assertTrue(json.loads(row["failure"])["unidentifiable_record"])
+        self.assertIn("agent:failed", self.labels)
+        self.assertEqual(self.started, [])
+
+    def test_dry_run_rows_cannot_override_live_environment_or_work_failures(self):
+        def preview(cfg, run, slot):
+            return pipeline._fail(run, "preview work failed")
+
+        self.run_failure(json.JSONDecodeError("Expecting value", "", 0))
+        with patch.object(pipeline, "_run", side_effect=preview):
+            self.assertEqual(pipeline.run_issue(self.repo.name, self.issue, dry_run=True), 1)
+        dry = run_store.newest_whole_run(self.repo.name, self.issue)
+        self.assertEqual((dry["dry_run"], dry["status"], dry["failure"]), (1, "failed", None))
+        abandoned = record.start("pipeline", repo=self.repo.name, issue=self.issue, dry_run=1, pid=None)
+        self.time += timedelta(minutes=5)
+        comments = list(self.comments)
+        self.assertEqual(poll.poll(), 0)
+        self.assertEqual(run_store.run_get(abandoned)["status"], "stopped")
+        self.assertEqual(self.comments, comments)
+        self.assertIn("agent:failed", self.labels)
+        with patch.object(codebase, "STAMP", "new-engine"):
+            self.assertEqual(poll.poll(), 0)
+        self.assertEqual(self.started, [self.issue])
+
+        self.run_failure(json.JSONDecodeError("Expecting value", "", 0))
+        self.run_failure(workspace.RunFailed("checks failed"))
+        with patch.object(pipeline, "_run", return_value=("dry-run", "preview passed", "")):
+            self.assertEqual(pipeline.run_issue(self.repo.name, self.issue, dry_run=True), 0)
+        with patch.object(codebase, "STAMP", "new-engine"):
+            self.assertEqual(poll.poll(), 0)
+        self.assertIn("agent:failed", self.labels)
+        self.assertEqual(self.started, [self.issue])
+
+    def test_worktree_rechecks_the_existing_hold_and_dry_run_preserves_retry_state(self):
+        self.ws.mkdir()
+        held = self.ws / "owner-file"
+        held.write_text("keep me")
+        def drive(flow):
+            return flows.ended(flow, flows.step(flow, "prepare", tree=str(self.ws)))
+        row = self.run_failure(script=pipeline.Script("adw", drive))
+        self.assertEqual(json.loads(row["failure"])["reason"], "worktree")
+        self.assertEqual(poll.poll(), 0)
+        self.assertEqual(self.started, [])
+        self.assertEqual(held.read_text(), "keep me")
+        held.unlink()
+        comments = list(self.comments)
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(poll.poll(dry_run=True), 0)
+        self.assertIn("would requeue because the worktree is free", output.getvalue())
+        self.assertEqual(self.comments, comments)
+        self.assertEqual(self.started, [])
+        self.assertIn("agent:failed", self.labels)
+        self.assertEqual(run_store.environment_requeue(row, util.iso(self.time - timedelta(days=1))), ({}, 0))
+        self.assertEqual(poll.poll(), 0)
+        self.assertEqual(self.started, [self.issue])
+
+    def test_crashes_require_a_changed_running_engine_and_work_or_legacy_stay_failed(self):
+        row = self.run_failure(json.JSONDecodeError("Expecting value", "", 0))
+        self.assertEqual(json.loads(row["failure"])["reason"], "engine-crash")
+        self.assertEqual(row["engine_sha"], "old-engine")
+        self.assertEqual(poll.poll(), 0)
+        with patch.object(codebase, "STAMP", ""):
+            self.assertEqual(poll.poll(), 0)
+        self.assertEqual(self.started, [])
+        with patch.object(codebase, "STAMP", "new-engine"):
+            self.assertEqual(poll.poll(), 0)
+            self.assertEqual(self.started, [self.issue])
+            for failure in ("checks failed", "verification failed", "review requested changes"):
+                row = self.run_failure(workspace.RunFailed(failure))
+                self.assertEqual(json.loads(row["failure"])["class"], "work")
+                self.assertEqual(poll.poll(), 0)
+                self.assertIn("agent:failed", self.labels)
+            legacy = record.start("pipeline", repo=self.repo.name, issue=self.issue)
+            record.settle(legacy, "failed", summary="crashed: Expecting value")
+            self.assertEqual(poll.poll(), 0)
+            self.assertIn("agent:failed", self.labels)
+        self.assertEqual(self.started, [self.issue])
+
+    def test_fourth_failure_is_capped_across_polls_and_ages_out(self):
+        began = self.time
+        for _ in range(3):
+            self.run_failure(json.JSONDecodeError("Expecting value", "", 0))
+            with patch.object(codebase, "STAMP", "new-engine"):
+                self.assertEqual(poll.poll(), 0)
+            self.time += timedelta(hours=2)
+        capped = self.run_failure(json.JSONDecodeError("Expecting value", "", 0))
+        def lost_reply(repo, number, body, **kwargs):
+            self.post_comment(repo, number, body)
+            raise gh.GhUnsure("reply lost after posting")
+        with patch.object(gh, "issue_comment", side_effect=lost_reply):
+            self.assertEqual(poll.poll(), 1)
+        self.assertEqual(poll.poll(), 0)
+        self.assertEqual(poll.poll(), 0)
+        self.assertIn("agent:failed", self.labels)
+        self.assertEqual(self.started, [self.issue] * 3)
+        notices = [c for c in self.comments if "Leaving this issue failed" in c]
+        self.assertEqual(len(notices), 1)
+        self.assertIn("Arete engine crash", notices[0])
+        entry, count = run_store.environment_requeue(capped, util.iso(self.time - timedelta(days=1)))
+        self.assertEqual((entry["cap_notified"], count), (1, 3))
+        self.time = began + timedelta(hours=24)
+        with patch.object(codebase, "STAMP", "new-engine"):
+            self.assertEqual(poll.poll(), 0)
+        self.assertEqual(self.started, [self.issue] * 4)
+
+    def test_rejected_label_edits_do_not_count_and_lost_replies_reconcile_once(self):
+        label = "agent:failed"
+
+        def reject(repo, number, add=(), remove=(), **kwargs):
+            self.assertEqual(list(remove), [label])
+            raise gh.GhError("label edit rejected")
+
+        def lost_reply(repo, number, add=(), remove=(), **kwargs):
+            self.assertTrue(kwargs["single_attempt"])
+            self.edit_labels(repo, number, add, remove)
+            raise gh.GhUnsure("reply lost after removing the label")
+
+        since = util.iso(self.time - timedelta(days=1))
+        for _ in range(3):
+            rejected = self.run_failure(json.JSONDecodeError("Expecting value", "", 0))
+            with patch.object(gh, "issue_labels", side_effect=reject), patch.object(codebase, "STAMP", "new-engine"):
+                self.assertEqual(poll.poll(), 1)
+            self.assertIn(label, self.labels)
+            entry, count = run_store.environment_requeue(rejected, since)
+            self.assertEqual((entry["edit_pending"], entry["requeued"], count), (None, 0, 0))
+        self.assertFalse(any("environment-requeue" in body for body in self.comments))
+
+        accepted = self.run_failure(json.JSONDecodeError("Expecting value", "", 0))
+        with patch.object(gh, "issue_labels", side_effect=gh.GhUnsure("reply lost before removal")), \
+                patch.object(codebase, "STAMP", "new-engine"):
+            self.assertEqual(poll.poll(), 1)
+        self.assertIn(label, self.labels)
+        self.assertTrue(run_store.environment_requeue(accepted, since)[0]["edit_pending"])
+        with patch.object(gh, "issue_labels", side_effect=lost_reply) as edit, \
+                patch.object(codebase, "STAMP", "new-engine"):
+            self.assertEqual(poll.poll(), 1)
+            pending, _ = run_store.environment_requeue(accepted, since)
+            self.assertEqual(pending["requeued"], 0)
+            self.assertTrue(pending["edit_pending"])
+            self.assertNotIn(label, self.labels)
+            self.assertEqual(self.started, [])
+            self.assertEqual(poll.poll(dry_run=True), 0)
+            self.assertEqual(run_store.environment_requeue(accepted, since), (pending, 0))
+            self.assertEqual(poll.poll(), 0)
+            self.assertEqual(poll.poll(), 0)
+            edit.assert_called_once()
+
+        next_run = self.run_failure(json.JSONDecodeError("Expecting value", "", 0))
+        self.assertEqual(run_store.environment_requeue(next_run, since), ({}, 1))
+        self.assertEqual(sum("environment-requeue" in body for body in self.comments), 1)
+        self.assertIn(self.issue, self.started)
+
+    def test_adaptive_finish_uses_the_blocking_build_result(self):
+        startup = Result(ok=False, runner="claude", error="claude not found: fixture")
+        recovery = pipeline.runner.start_failure(startup, "build")
+        build_start = ("worker.start", "failed", {"writing": True, "event": "result", "recovery": recovery})
+        unrelated = ("worker.start", "failed", {"writing": False, "event": "result", "recovery": recovery})
+        for actions, expected in (
+            ([build_start], {"class": "environment", **recovery}),
+            ([build_start, unrelated], {"class": "environment", **recovery}),
+            ([unrelated], {"class": "work"}),
+            ([build_start, ("worker.continue", "failed", {"writing": True, "event": "result"})], {"class": "work"}),
+            ([build_start, ("checks.run", "succeeded", {"passed": False})], {"class": "work"}),
+            ([build_start, ("verification.run", "succeeded", {"operation_passed": True, "verdict": "fail"})],
+             {"class": "work"}),
+        ):
+            with self.subTest(actions=actions):
+                def drive(flow):
+                    controller = orchestration.Controller(flow)
+                    lease = controller.lease
+                    turn = ledger.begin(lease, {}, 1)
+                    version = ledger.snapshot(lease)["version"]
+                    accepted = ledger.accept(lease, turn, version,
+                                             {"calls": [{"op": op, "args": {}} for op, _, _ in actions]}, 10)
+                    for action, (_, state, result) in zip(accepted, actions):
+                        ledger.transition(lease, action["id"], state, result)
+                    controller.perform({"op": "run.finish", "request": {"reason": "failed"}})
+                    return controller.ending
+
+                row = self.run_failure(script=pipeline.Script("adw", drive))
+                self.assertEqual(json.loads(row["failure"]), expected)
+
+    def test_runner_start_failure_requires_a_successful_probe(self):
+        failure = Result(ok=False, runner="claude", error="claude not found: fixture")
+        def drive(cfg, run, slot):
+            return pipeline._fail(run, "planning step failed",
+                                  recovery=pipeline.runner.start_failure(failure, "plan"))
+        row = self.run_failure(drive)
+        self.assertEqual(json.loads(row["failure"])["reason"], "runner-start")
+        with patch.object(pipeline.runner, "started_now", side_effect=[False, True]) as probe:
+            self.assertEqual(poll.poll(), 0)
+            self.assertIn("agent:failed", self.labels)
+            self.assertEqual(poll.poll(), 0)
+        self.assertEqual([call.args for call in probe.call_args_list], [("claude",), ("claude",)])
+        self.assertEqual(self.started, [self.issue])
+
+    def test_rejected_login_requires_a_ready_route_with_renewed_credentials(self):
+        failure = Result(ok=False, runner="claude", model="sonnet", credential="cli_login", turns=1,
+                         raw={"api_error": "authentication_failed"}, auth_generation="stale-login")
+        def drive(cfg, run, slot):
+            return pipeline._fail(run, "the conflict resolution step failed",
+                                  recovery=pipeline.runner.start_failure(failure, "build"))
+        row = self.run_failure(drive)
+        self.assertEqual(json.loads(row["failure"])["reason"], "runner-login")
+        route = SimpleNamespace(state="ready", runner="claude", model="sonnet", credential="cli_login")
+        with patch.object(pipeline.routing, "Discovery", return_value=SimpleNamespace(routes=lambda _: [route])), \
+                patch.object(pipeline.runner, "authentication", side_effect=[
+                    SimpleNamespace(generation="stale-login"), SimpleNamespace(generation="new-login")]):
+            self.assertEqual(poll.poll(), 0)
+            self.assertIn("agent:failed", self.labels)
+            self.assertEqual(poll.poll(), 0)
+        self.assertEqual(self.started, [self.issue])
+
+    def test_sandbox_start_checks_confinement_before_requeueing(self):
+        row = self.run_failure(RuntimeError(pipeline.runner.SANDBOX_START_ERROR))
+        self.assertEqual(json.loads(row["failure"])["reason"], "sandbox-start")
+        with patch.object(sandbox, "can_confine", return_value=True), \
+                patch.object(sandbox, "write_confinement", return_value=["sandbox-exec"]), \
+                patch.object(util, "run_whole_tree", side_effect=[
+                    SimpleNamespace(returncode=1), SimpleNamespace(returncode=0)]) as probe:
+            self.assertEqual(poll.poll(), 0)
+            self.assertIn("agent:failed", self.labels)
+            self.assertEqual(poll.poll(), 0)
+        self.assertEqual([call.args[0] for call in probe.call_args_list], [["sandbox-exec", "/usr/bin/true"]] * 2)
+        self.assertEqual(self.started, [self.issue])
 
 
 class RouteABTests(unittest.TestCase):

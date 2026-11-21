@@ -263,14 +263,14 @@ def issue_close(repo: str, number: int, comment: str = "") -> None:
             gh(retry, write=True)
 
 
-def issue_labels(repo: str, number: int, add: list[str] = (), remove: list[str] = ()) -> None:
+def issue_labels(repo: str, number: int, add: list[str] = (), remove: list[str] = (), *, single_attempt=False) -> None:
     args = ["issue", "edit", str(number), "--repo", repo]
     for lb in add:
         args += ["--add-label", lb]
     for lb in remove:
         args += ["--remove-label", lb]
     if len(args) > 5:
-        gh(args)
+        gh(args, write=single_attempt)
 
 
 def issue_state(repo: str, number: int) -> str:

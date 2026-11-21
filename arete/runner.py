@@ -33,6 +33,7 @@ from . import (
     routing,
     sandbox,
     scrub,
+    steps,
     uploads,
     util,
 )
@@ -60,6 +61,7 @@ KNOWN_TOOLS = READ_ONLY_TOOLS | routing.WRITING_TOOLS | {"Bash"}
 LOGIN_WARNING_DAYS = 7
 HOLD_CHECK_SECONDS = 60
 NO_ROUTE = "no route can run this call"
+SANDBOX_START_ERROR = "sandbox-exec: sandbox_apply: operation not permitted"
 HEADROOM_STATE = "headroom"
 CONTINUE_AFTER_LIMIT = "The usage limit cut the last step short. Carry on from where you stopped and finish the step."
 
@@ -156,6 +158,51 @@ def claude_login() -> tuple[bool, str]:
 def codex_login() -> tuple[bool, str]:
     ok, detail, _ = codex.login()
     return ok, detail
+
+
+def start_failure(res: Result, role: str) -> dict | None:
+    if res.ok:
+        return None
+    error = res.error.lower()
+    if not res.turns and SANDBOX_START_ERROR in error:
+        return {"reason": "sandbox-start"}
+    if not res.turns and res.runner in routing.RUNNERS and error.startswith(f"{res.runner} not found:"):
+        return {"reason": "runner-start", "runner": res.runner}
+    if error.startswith(NO_ROUTE):
+        targets = [[r["runner"], r["model"], r["credential"]] for r in res.skipped
+                   if r.get("state") in ("missing_login", "expired_login")]
+        if targets:
+            return {"reason": "runner-login", "role": role, "routes": targets}
+    if (res.runner in ("codex", "claude") and res.credential == "cli_login" and res.auth_generation
+            and (res.raw.get("api_error") in ("authentication_failed", "authentication_error")
+                 or any(phrase in error for phrase in ("authentication failed", "authentication_error",
+                                                       "failed to authenticate", "401 unauthorized", "not logged in")))):
+        return {"reason": "runner-login", "role": role, "routes": [[res.runner, res.model, res.credential]],
+                "generation": res.auth_generation}
+    return None
+
+
+def started_now(which: str) -> bool:
+    module = {"claude": claude, "codex": codex, "pi": pi}.get(which)
+    return module is not None and util.sh([module.binary(), "--version"], timeout=10).returncode == 0
+
+
+def login_restored(cfg: config.Config, repo: config.Repo, layer: config.RepoLayer, kind: str,
+                   issue: str, failure: dict) -> bool:
+    setting = steps.resolve(cfg, layer, failure["role"], kind, ticket=(repo.name, issue))
+    found = routing.Discovery(cfg, repo, priced=False, layer=layer)
+    for route in found.routes(setting):
+        if route.state != "ready" or [route.runner, route.model, route.credential] not in failure["routes"]:
+            continue
+        if route.runner == "codex" and route.credential == "cli_login" and not codex_login()[0]:
+            continue
+        generation = failure.get("generation")
+        if not generation:
+            return True
+        auth = authentication(route.model, route.runner, cfg=cfg, repo=repo)
+        if auth.generation and auth.generation != generation:
+            return True
+    return False
 
 
 def cost_note(res: Result) -> str:
@@ -886,6 +933,8 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
             for call in res.calls:
                 call.error = scrub.scrub(call.error, hidden)
             res.effort, res.credential = kw.get("effort", ""), route.get("credential", "")
+            if not target.remote:
+                res.auth_generation = auth.generation
             res.requested_effort, res.skipped = route.get("requested_effort", ""), route.get("skipped", [])
             res.record = rec.path.name if rec.path else ""
         except BaseException as error:

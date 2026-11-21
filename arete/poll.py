@@ -19,6 +19,7 @@ from . import (
     pilot,
     pipeline,
     queueing,
+    requeue,
     routing,
     runlimits,
     steps,
@@ -57,9 +58,13 @@ def ticket_queues(repo: config.Repo, tk: tracker.Tracker) -> list[tracker.Tracke
 
 
 def next_ticket(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
-                other_routes: set[str] = frozenset(), excluded: set[str] = frozenset()) -> tracker.Ticket | None:
+                other_routes: set[str] = frozenset(), excluded: set[str] = frozenset(),
+                recovered: tuple[tracker.Ticket, ...] = ()) -> tracker.Ticket | None:
     for source in ticket_queues(repo, tk):
-        for t in queueing.prioritized(source.todo(parked=lambda tid: bool(runlimits.latest_park(repo.name, tid)[1]))):
+        listed = source.todo(parked=lambda tid: bool(runlimits.latest_park(repo.name, tid)[1]))
+        known = {str(t.id) for t in listed}
+        extra = [t for t in recovered if str(t.id) not in known] if source is tk else []
+        for t in queueing.prioritized([*listed, *extra]):
             tid = str(t.id)
             if (tid in excluded or other_routes & set(t.labels) or run_store.issue_running(repo.name, t.id)
                     or not pilot.pickable(tid, repo.name)
@@ -84,9 +89,10 @@ def jira_routes_by_project(cfg: config.Config) -> dict[str, set[str]]:
 
 
 def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
-              other_routes: set[str], excluded: set[str] = frozenset()) -> tuple[str, str] | None:
+              other_routes: set[str], excluded: set[str] = frozenset(),
+              recovered: tuple[tracker.Ticket, ...] = ()) -> tuple[str, str] | None:
     excluded = excluded | oncall.parked(repo.name)
-    fresh = next_ticket(repo, tk, skips, other_routes, excluded)
+    fresh = next_ticket(repo, tk, skips, other_routes, excluded, recovered)
     def eligible_again(tid):
         return (str(tid) not in excluded and not pilot.is_pilot_task(str(tid)) and not zte.reserved(str(tid))
                 and not run_store.issue_running(repo.name, tid))
@@ -205,6 +211,29 @@ class RepoQueue:
     layer: config.RepoLayer
     discovery: routing.Discovery
     selected: set[str] = field(default_factory=set)
+    recovered: tuple[tracker.Ticket, ...] = ()
+
+
+def requeue_failures(cfg: config.Config, queue: RepoQueue, dry_run: bool, errors: list[str]) -> None:
+    source = queue.tracker
+    if not isinstance(source, tracker.GitHubTracker) or not queue.repo.parts:
+        return
+    if not dry_run:
+        for entry in run_store.unfinished_environment_requeues(queue.repo.name):
+            guard(errors, tracker.issue_name(queue.repo.name, entry["issue"]), lambda: requeue.reconcile(source, entry))
+    recovered = []
+    try:
+        for issue in source.failed_queue():
+            try:
+                if ticket := requeue.reconsider(cfg, source, queue.layer, issue, dry_run):
+                    recovered.append(ticket)
+            except Exception as e:
+                failed(errors, tracker.issue_name(queue.repo.name, issue), e)
+    finally:
+        if not dry_run:
+            queue.selected.update(entry["issue"] for entry in run_store.unfinished_environment_requeues(queue.repo.name)
+                                  if entry["edit_pending"])
+    queue.recovered = tuple(recovered)
 
 
 def repo_queues(cfg: config.Config, pipeline_repos: list[config.Repo], routes: dict[str, set[str]],
@@ -284,7 +313,7 @@ def fill_slots(cfg: config.Config, queues: list[RepoQueue], skips: pipeline.Skip
             if repo.name in exhausted or examined >= MAX_STARTS_PER_POLL:
                 continue
             try:
-                pick = next_pick(repo, queue.tracker, skips, queue.other_routes, queue.selected)
+                pick = next_pick(repo, queue.tracker, skips, queue.other_routes, queue.selected, queue.recovered)
                 if not pick:
                     exhausted.add(repo.name)
                     if not dry_run:
@@ -350,6 +379,8 @@ def poll(dry_run: bool = False) -> int:
         skips = pipeline.SkipLog({} if dry_run else util.read_json(pipeline.SKIPPED_FILE, {}))
         routes = jira_routes_by_project(cfg)
         queues, reached_clients = repo_queues(cfg, pipeline_repos, routes, skips, errors)
+        for queue in queues:
+            guard(errors, f"{queue.repo.name} environment requeues", lambda: requeue_failures(cfg, queue, dry_run, errors))
         selected_work = fill_slots(cfg, queues, skips, dry_run, errors, going, slots)
         report_unrouted(routes, reached_clients, skips, errors)
         if not dry_run:
