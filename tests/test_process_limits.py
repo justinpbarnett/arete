@@ -2104,7 +2104,8 @@ class OrchestratedFeedbackAnswerTests(PrAnswerFixture):
         self.check_polled_pr_answer("The integration job has the log.")
 
     def test_poll_delivers_pr_feedback_when_an_orchestrated_repair_recovers_an_issue_answer(self):
-        with (patch.object(workspace, "fetch", return_value=None),
+        with (patch.object(gh, "pr_merge_details", return_value={"state": "OPEN", "baseRefName": "main"}),
+              patch.object(workspace, "fetch", return_value=None),
               patch.object(pipeline, "merge_moved_bases", return_value=[])):
             self.check_polled_pr_answer("The integration job has the log.", repair=True)
 

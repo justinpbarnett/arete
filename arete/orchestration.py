@@ -232,7 +232,6 @@ class Controller:
         self.job.triage = pipeline.triage_notes(self.job.approval)
         self.job.b.plan_text, self.job.b.left_for_a_person = self.job.plan_text, self.job.left_for_a_person
         lineage, old_lineage = self.lineage()
-        self.data.update(lineage)
         self.data["overrides"], self.data["step_overrides"] = self.run.overrides, self.run.step_overrides
         self.data.setdefault("code", codebase.STAMP)
         self.data["recovery_code"] = codebase.STAMP
@@ -243,22 +242,19 @@ class Controller:
         if self.run.environment_release:
             self.data.pop("published", None)
             self.data.pop("published_tree", None)
-        else:
-            if self.flow.continues and (moved := flows.base_moved(self.flow.continues)):
-                self.job.moved_base = moved
-                self.job.merge_moved_base("orchestrate")
-            if prepared:
-                for checkout in self.job.checkouts:
-                    workspace.fetch(checkout.src, checkout.base)
-                prs = self.job.with_prs
-                for checkout in prs:
-                    checkout.resumes = True
-                merged = pipeline.merge_moved_bases(self.run, prs, self.job.layer, self.job.ticket, allow_untracked=True)
-                if merged:
-                    for checkout in merged:
-                        self.job.b.worker_trees.pop(checkout.github, None)
-                    workspace.note_made(self.job.ws, self.job.checkouts)
-                self.job.b.workspace = self.job.workspace
+        elif prepared:
+            if not self.run.action_only and self.merge_restored_bases():
+                layer = pipeline.resolve_layer(self.job.cfg, self.run, self.job.ws)
+                if layer != self.job.layer:
+                    context = self.catalog.context
+                    self.job.use_layer(layer)
+                    lineage, old_lineage = self.lineage()
+                    self.catalog.context.update(context)
+                    prepared["layer"] = str(layer.dir)
+        elif self.flow.continues and (moved := flows.base_moved(self.flow.continues)):
+            self.job.moved_base = moved
+            self.job.merge_moved_base("orchestrate")
+        self.data.update(lineage)
         if old_lineage:
             self.data["lineage_event"] = {"run": self.run.id, "event_id": uuid4().hex, "old": old_lineage,
                                           "new": {key: lineage[key] for key in old_lineage},
@@ -266,6 +262,44 @@ class Controller:
         self.persist()
         self.write_lineage_event()
         return None
+
+    def merge_restored_bases(self) -> bool:
+        prs = []
+        retargeted = set()
+        for checkout in self.job.with_prs:
+            pr = gh.pr_merge_details(checkout.pr)
+            if pr.get("state") != "OPEN":
+                continue
+            if not (base := pr.get("baseRefName")):
+                raise workspace.RunFailed(f"GitHub did not identify the target branch for {checkout.pr}")
+            if checkout.base != base:
+                checkout.base = base
+                retargeted.add(checkout.github)
+            checkout.resumes = True
+            prs.append(checkout)
+        if not prs:
+            return False
+        targets = {c.github: c.base for c in prs}
+        merged_kept = []
+        if self.flow.continues and (moved := flows.base_moved(self.flow.continues, targets=targets)):
+            self.job.moved_base = moved
+            merged_kept = self.job.merge_moved_base("orchestrate", repos=set(targets))
+        bases = {}
+        for checkout in prs:
+            workspace.fetch(checkout.src, checkout.base)
+            if checkout.github in retargeted:
+                base = bases[checkout.github] = util.git(["rev-parse", checkout.origin_base], checkout.wt).strip()
+                if checkout.base_commit != base:
+                    checkout.merge, checkout.merged_base = "", False
+                    checkout.resolved, checkout.resolved_lines = [], 0
+        merged = pipeline.merge_moved_bases(self.run, prs, self.job.layer, self.job.ticket, bases=bases,
+                                            allow_untracked=True)
+        if merged:
+            for checkout in merged:
+                self.job.b.worker_trees.pop(checkout.github, None)
+            workspace.note_made(self.job.ws, self.job.checkouts)
+        self.job.b.workspace = self.job.workspace
+        return bool(merged_kept or merged)
 
     def lineage(self):
         self.catalog = Catalog(self.job)

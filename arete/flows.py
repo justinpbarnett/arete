@@ -333,16 +333,21 @@ def action_workspace_refusal(run_id: str) -> str:
     return "adaptive action reruns need retained worktrees; the saved workspace was removed"
 
 
-def base_moved(continues: str) -> str:
+def base_moved(continues: str, *, targets: dict[str, str] | None = None) -> str:
     for c in prepared_data(continues).get("checkouts") or []:
         if not isinstance(c, dict) or not c.get("base_commit"):
             continue
+        base = c["base"] if targets is None else targets.get(c.get("github"))
+        if not base:
+            continue
         try:
-            now = workspace.remote_head(Path(c["src"]), c["base"])
+            now = workspace.remote_head(Path(c["src"]), base)
         except RuntimeError:
             continue
         if now and now != c["base_commit"]:
-            return f"`origin/{c['base']}` moved from {c['base_commit'][:12]} to {now[:12]} in {c['github']}"
+            if base != c["base"]:
+                return f"the PR in {c['github']} changed its base from `{c['base']}` to `{base}`"
+            return f"`origin/{base}` moved from {c['base_commit'][:12]} to {now[:12]} in {c['github']}"
     return ""
 
 
@@ -511,13 +516,14 @@ class Job:
             return "the check in use was blocked; this change requires behavioral evidence"
         return pipeline.draft_reason(self.review, self.verified, self.reviews)
 
-    def merge_moved_base(self, name: str) -> None:
+    def merge_moved_base(self, name: str, *, repos: set[str] | None = None) -> list[workspace.Checkout]:
         moved, self.moved_base = self.moved_base, ""
         held = [c for c in self.checkouts if c.onto]
-        if moved and held:
+        merged = []
+        if moved and (eligible := [c for c in held if repos is None or c.github in repos]):
             self.run.log(f"{moved} since run {self.continues} prepared, so arete merges the new base into the edits "
                          f"that run kept before {name} runs with the answers")
-            merged = pipeline.merge_base_into_kept(self.run, held, self.layer, self.ticket)
+            merged = pipeline.merge_base_into_kept(self.run, eligible, self.layer, self.ticket)
             if merged:
                 self.run.base_note = pipeline.base_merge_note(merged)
                 if self.built is not None:
@@ -526,6 +532,7 @@ class Job:
                         self.built.worker_trees.pop(checkout.github, None)
                 workspace.note_made(self.ws, self.checkouts)
         self.run.kept_note = pipeline.kept_edits_note(held) if self.run.answers_due else ""
+        return merged
 
     @property
     def with_prs(self) -> list[workspace.Checkout]:
@@ -812,6 +819,12 @@ class Job:
         self.layer = layer
         self.check_commands, self.check_rules = pipeline.check_script(self.run.dir, layer, self.ws)
         self.run.cfg, self.run.layer, self.run.kind = self.cfg, layer, self.ticket.kind
+        if self.built is not None:
+            self.built.layer = layer
+            self.built.timeout = layer.timeout_minutes * 60
+            self.built.tools = prompt_loader.bash_rules(self.builder_bash)
+            self.built.deny = diffguard.denied_paths(layer)
+            self.built.check_commands = self.checks
 
 
 def opened(run: pipeline.Run, t: tracker.Ticket) -> None:
