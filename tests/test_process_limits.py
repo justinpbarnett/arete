@@ -2628,19 +2628,23 @@ class OrchestratedFinishBudgetTests(PollFixture):
         self.assertFalse((directory / "parked.json").exists())
 
 
-class FailedPollBudgetTests(PollFixture):
-    def failed_with_spent_repairs(self):
+class FailedPollBudgetTests(ReadmissionFixture):
+    def failed_with_spent_repairs(self, previous="", *, pr_url=""):
         self.repo.layer_dir.mkdir()
         (self.repo.layer_dir / "config.toml").write_text('[factory]\npath = "classic"\n[limits]\nmax_repair_cycles = 3\n')
         self.cfg.replay = config.ReplayConfig(all=True)
-        failed = self.made_run()
+        failed = self.made_run(previous)
         record.note(failed.id, repair_calls=3)
-        record.settle(failed.id, "failed")
+        record.settle(failed.id, "failed", pr_url=pr_url)
         self.local.label(self.ticket, add=["failed"])
         return failed
 
     def test_poll_keeps_budget_after_failed_run_with_unchanged_specification(self):
-        failed = self.failed_with_spent_repairs()
+        older = self.made_run()
+        record.settle(older.id, "failed")
+        with foundation.db() as connection:
+            set_task_body(self.ticket, "The latest failed run used this specification", connection=connection)
+        failed = self.failed_with_spent_repairs(older.id)
         self.local.label(self.ticket, remove=["failed"])
 
         def work(cfg, run, slot):
@@ -2654,7 +2658,7 @@ class FailedPollBudgetTests(PollFixture):
         self.assertNotEqual(retry["id"], failed.id)
         saved = runlimits.metadata(retry["id"], "budget.json")
         log = (paths.RUNS_DIR / retry["id"] / "run.log").read_text()
-        self.assertEqual(saved["repair_parents"], [failed.id])
+        self.assertEqual(saved["repair_parents"], [failed.id, older.id])
         self.assertEqual(saved["repair_left_out"], [])
         self.assertIn("the repair chain used its 3 repair cycles", log)
 
@@ -2738,6 +2742,8 @@ class FailedPollBudgetTests(PollFixture):
         self.assertEqual(saved["parents"], [])
         self.assertEqual(saved["repair_left_out"], [failed.id])
         self.assertEqual(runlimits.repair_count(retry["id"]), 1)
+        [chain] = [line for line in run_lines.read(retry["id"]) if line["event"] == "budget_chain"]
+        self.assertEqual(chain["charged"], {})
         log = (paths.RUNS_DIR / retry["id"] / "run.log").read_text()
         self.assertIn("budget: left out 3 earlier repair cycles, 60.0 run minutes and 0.0 verification minutes "
                       "of 1 earlier run because the ticket specification changed since they ran", log)
@@ -2773,6 +2779,125 @@ class FailedPollBudgetTests(PollFixture):
         for key in ("parents", "repair_parents"):
             self.assertEqual(runlimits.metadata(retry["id"], "budget.json")[key], [failed.id])
             self.assertEqual(runlimits.metadata(next_retry["id"], "budget.json")[key], [retry["id"], failed.id])
+
+    def assert_fresh_feedback_logged_on_lookup_failure(self, *, timeout):
+        url = "https://github.com/owner/fixture/pull/1"
+        failed = self.failed_with_spent_repairs(pr_url=url)
+        run_lines.write(failed.id, "execution", path="orchestrate")
+        record.note(failed.id, active_seconds=180, verify_seconds=60)
+        insights_store.add_feedback([{"pr_url": url, "repo": self.repo.name, "issue": self.ticket,
+                                      "kind": "comment", "gh_id": 1, "body": "Please revise", "pr_state": "OPEN",
+                                      "status": "new", "at_once": 0, "created": "2026-01-01T00:00:00Z"}])
+        with foundation.db() as connection:
+            set_task_body(self.ticket, "A narrower specification", connection=connection)
+        self.local.label(self.ticket, remove=["failed"])
+        clock = [100.0]
+
+        def fail_lookup(*_):
+            if timeout:
+                clock[0] += 3600
+                signal.raise_signal(signal.SIGALRM)
+                self.fail("the watchdog did not interrupt the lookup")
+            raise tracker.TaskError("ticket fetch failed")
+
+        def spawn(repo, tid):
+            command = pipeline.run_command(repo, tid)
+            self.assertEqual(command[-4:], [repo, tid, "--continue", failed.id])
+            script = pipeline.Script("orchestrate", lambda _: self.fail("started work after lookup failure"),
+                                     continues=failed.id)
+            with patch.object(runlimits, "time", SimpleNamespace(monotonic=lambda: clock[0])), \
+                    patch.object(signal, "setitimer"), \
+                    patch.object(tracker.LocalTracker, "get", side_effect=fail_lookup) as lookup:
+                self.assertEqual(self.run_polled_ticket(repo, tid, Mock(), script), 1)
+                lookup.assert_called_once()
+
+        self.assertEqual(self.poll_with(self.cfg, spawn), 0)
+        retry = run_store.newest_live_whole_run(self.repo.name, self.ticket)
+        self.assertNotEqual(retry["id"], failed.id)
+        self.assertEqual(retry["status"], "failed")
+        self.assertIn("the run chain reached its cumulative 60 minute budget" if timeout else "ticket fetch failed",
+                      retry["summary"])
+        saved = runlimits.metadata(retry["id"], "budget.json")
+        self.assertEqual(saved["parents"], [])
+        self.assertEqual(saved["repair_parents"], [])
+        self.assertEqual(saved["left_out"], [failed.id])
+        self.assertEqual(saved["repair_left_out"], [failed.id])
+        self.assertIsNone(saved["specification"])
+        [chain] = [line for line in run_lines.read(retry["id"]) if line["event"] == "budget_chain"]
+        self.assertEqual(chain["charged"], {})
+        log = (paths.RUNS_DIR / retry["id"] / "run.log").read_text()
+        self.assertEqual(log.count("budget chain: no parents\n"), 1)
+        self.assertEqual([line.split("] ", 1)[-1] for line in log.splitlines() if "budget: left out" in line], [
+            "budget: left out 3 earlier repair cycles, 3.0 run minutes and 1.0 verification minutes "
+            "of 1 earlier run because the owner commented on the PR since they ran",
+        ])
+
+    def test_poll_logs_fresh_feedback_reset_when_lookup_errors(self):
+        self.assert_fresh_feedback_logged_on_lookup_failure(timeout=False)
+
+    def test_poll_logs_fresh_feedback_reset_when_lookup_times_out(self):
+        self.assert_fresh_feedback_logged_on_lookup_failure(timeout=True)
+
+    def test_poll_continuation_drops_spent_repairs_after_specification_edit(self):
+        url = "https://github.com/owner/fixture/pull/1"
+        failed = self.failed_with_spent_repairs(pr_url=url)
+        run_lines.write(failed.id, "execution", path="orchestrate")
+        insights_store.add_feedback([{"pr_url": url, "repo": self.repo.name, "issue": self.ticket,
+                                      "kind": "comment", "gh_id": 1, "body": "Please revise", "pr_state": "OPEN",
+                                      "status": "new", "at_once": 0, "created": "2026-01-01T00:00:00Z"}])
+        insights_store.take_feedback(insights_store.open_feedback([url]), failed.id)
+        insights_store.settle_feedback(failed.id, "failed")
+        record.note(failed.id, active_seconds=3599.75)
+        with foundation.db() as connection:
+            set_task_body(self.ticket, "A narrower specification", connection=connection)
+        self.local.label(self.ticket, remove=["failed"])
+        ticket = self.local.get(self.ticket)
+        clock = [100.0]
+
+        def drive(flow):
+            run = flow.ctx.run
+            self.assertEqual(flow.continues, failed.id)
+            self.assertEqual([row["run_id"] for row in run.feedback], [failed.id])
+            run.budget.charge("repair", "review_repair")
+            return "noop", "fixture finished", ""
+
+        def spawn(repo, tid):
+            command = pipeline.run_command(repo, tid)
+            self.assertEqual(command[-4:], [repo, tid, "--continue", failed.id])
+            script = pipeline.Script("orchestrate", drive, continues=command[-1])
+            timer = Mock()
+
+            def slow_lookup(*_):
+                timer.assert_called_once_with(signal.ITIMER_REAL, 3600)
+                clock[0] += 12
+                return ticket
+
+            with patch.object(runlimits, "time", SimpleNamespace(monotonic=lambda: clock[0])), \
+                    patch.object(signal, "setitimer", timer), \
+                    patch.object(tracker.LocalTracker, "get", side_effect=slow_lookup) as lookup:
+                self.assertEqual(self.run_polled_ticket(repo, tid, Mock(), script), 0)
+                lookup.assert_called_once()
+
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(self.poll_with(self.cfg, spawn), 0, output.getvalue())
+        retry = run_store.newest_live_whole_run(self.repo.name, self.ticket)
+        self.assertEqual(retry["status"], "noop")
+        self.assertEqual(retry["active_seconds"], 12)
+        saved = runlimits.metadata(retry["id"], "budget.json")
+        self.assertEqual(saved["parents"], [])
+        self.assertEqual(saved["repair_left_out"], [failed.id])
+        self.assertEqual(runlimits.repair_count(retry["id"]), 1)
+        log = (paths.RUNS_DIR / retry["id"] / "run.log").read_text()
+        self.assertIn("budget: left out 3 earlier repair cycles, 60.0 run minutes and 0.0 verification minutes "
+                      "of 1 earlier run because the ticket specification changed since they ran", log)
+
+    def test_poll_leaves_unchanged_park_in_place_after_failed_label_removed(self):
+        parked = self.park_ticket()
+        self.local.label(self.ticket, remove=["failed"])
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(self.poll_with(self.cfg, lambda *_: self.fail("started without an edit")), 0)
+        self.assertIn(f"parked after run {parked.id}: repair limit", output.getvalue())
+        self.assertEqual(run_store.newest_live_whole_run(self.repo.name, self.ticket)["id"], parked.id)
 
 
 class OrchestrationFinishTests(Isolated):
@@ -2908,9 +3033,6 @@ class OrchestrationFinishTests(Isolated):
 class BudgetReadmissionTests(ReadmissionFixture):
     def test_specification_edit_readmits_once_and_reparks_on_current_inputs(self):
         parked = self.park_ticket()
-        with contextlib.redirect_stdout(io.StringIO()) as unchanged:
-            self.assertEqual(self.poll_with(self.cfg, lambda *_: self.fail("started without an edit")), 0)
-        self.assertIn(f"parked after run {parked.id}: repair limit", unchanged.getvalue())
         with foundation.db() as connection:
             set_task_body(self.ticket, "A narrower specification", connection=connection)
         started = []
