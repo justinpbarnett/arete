@@ -24,7 +24,6 @@ from . import (
     repairs,
     run_lines,
     runlimits,
-    tracker,
     util,
     workspace,
     zte,
@@ -845,7 +844,7 @@ class Controller:
             b.catch_ups += 1
             job.verified, job.review = pipeline.catch_up_base(
                 b, checkout, job.branch, base_sha, job.with_left(job.goal), job.with_left(job.plan_text),
-                before_push=remember_push)
+                job.review, before_push=remember_push)
         except pipeline.CatchUpGateHold as error:
             return self.hold_catch_up(checkout, base_sha, error)
         except pipeline.CatchUpPushUnconfirmed:
@@ -898,39 +897,6 @@ class Controller:
                 pipeline.set_draft(self.run, checkout, True, "automerge")
         self.run.say(f"{held}. I parked the run because {reason}.")
         return pipeline.park_run(self.run, f"{held}. {reason}")
-
-    def finish_rationale(self, turn):
-        with ledger.reader() as connection:
-            ledger.fenced(connection, self.lease)
-            decision = connection.execute(
-                "SELECT response FROM orchestration_turns WHERE root = ? AND id = ? AND state = 'accepted'",
-                (self.lease.root, turn),
-            ).fetchone()
-        return ledger.decoded(decision).get("response", {}).get("rationale")
-
-    def finish_with_rationale(self, rationale):
-        recovery = self.failure_recovery()
-        reason = outbound.screen(rationale.strip())
-        why = "the orchestrator stopped without delivery"
-        if (recovery and recovery.get("reason") in ("runner-start", "runner-login", "sandbox-start")
-                and isinstance(self.run.tracker, tracker.GitHubTracker) and self.run.failed_state == "failed"
-                and not self.job.with_prs and not (pipeline.run_store.run_get(self.run.id) or {}).get("pr_url")):
-            return flows.finish(self.flow, "failed", why=why, detail=reason, recovery=recovery)
-
-        self.run.failure = {"class": "environment", **recovery} if recovery else {"class": "work"}
-        reason = reason or why
-        for checkout in self.job.with_prs:
-            try:
-                pr = gh.pr_merge_details(checkout.pr)
-                if not isinstance(pr, dict):
-                    raise ValueError("PR lookup did not return a JSON object")
-            except (gh.GhError, ValueError) as error:
-                self.run.log(f"pr: could not inspect {checkout.pr}: {util.first_line(str(error), 300)}")
-                continue
-            if pr.get("state") == "OPEN" and pr.get("isDraft") is False:
-                pipeline.set_draft(self.run, checkout, True, "orchestrator")
-        self.run.say(f"Run `{self.run.id}` parked without delivery.\n\n{reason}")
-        return pipeline.park_run(self.run, reason)
 
     def settle_publication_failure(self, failure):
         if self.data.get("catch_up_hold"):
@@ -1037,6 +1003,25 @@ class Controller:
                 return None
         return None
 
+    def prepare_failed_finish(self, turn: str) -> str:
+        for checkout in self.job.with_prs:
+            try:
+                pr = gh.pr_merge_details(checkout.pr)
+                if not isinstance(pr, dict):
+                    raise ValueError("PR lookup did not return a JSON object")
+            except (gh.GhError, ValueError) as error:
+                self.run.log(f"pr: could not inspect {checkout.pr}: {util.first_line(str(error), 300)}")
+                continue
+            if (pr.get("state") == "OPEN" and pr.get("isDraft") is False
+                    and checkout.lease and pr.get("headRefOid") == checkout.lease):
+                pipeline.set_draft(self.run, checkout, True, "failed")
+        with ledger.reader() as connection:
+            ledger.fenced(connection, self.lease)
+            row = connection.execute(
+                "SELECT response FROM orchestration_turns WHERE root = ? AND id = ? AND state = 'accepted'",
+                (self.lease.root, turn)).fetchone()
+        return outbound.screen(ledger.decoded(row).get("response", {}).get("rationale", ""))
+
     def perform(self, action):
         args, op = action["request"], action["op"]
         if op == "worker.start":
@@ -1132,13 +1117,12 @@ class Controller:
             elif (self.run.budget and (reason := self.run.budget.repair_limit_reason())
                   and not zte.reserved(str(self.run.tid))):
                 self.ending = pipeline.park_run(self.run, reason)
-            elif (self.run.budget and not (self.run.alone or self.run.action_only or self.run.dry_run)
-                  and not zte.reserved(str(self.run.tid)) and (turn := action.get("turn"))
-                  and (rationale := self.finish_rationale(turn)) is not None):
-                self.ending = self.finish_with_rationale(rationale)
             else:
+                detail = ""
+                if (turn := action.get("turn")) and not (self.flow.only or self.run.action_only or self.run.dry_run):
+                    detail = self.prepare_failed_finish(turn)
                 self.ending = flows.finish(self.flow, "failed", why="the orchestrator stopped without delivery",
-                                           recovery=self.failure_recovery())
+                                           detail=detail, recovery=self.failure_recovery())
             return {"reason": args["reason"]}
         raise ValueError("unknown orchestration operation")
 

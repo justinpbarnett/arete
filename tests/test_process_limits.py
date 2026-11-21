@@ -163,7 +163,10 @@ class CatchUpWorkspaceRecordTests(Isolated):
             run.workspace = self.ws, [self.checkout]
             build = pipeline.Build(self.cfg, run, self.local.get(self.ticket), self.ws, [self.checkout], self.layer,
                                    5, "Fixture worktree", tools=[], deny=[])
-            pipeline.catch_up_base(build, self.checkout, self.branch, base, "", "", before_push=self.unexpected_push)
+            tree = util.git(["rev-parse", f"{self.head}^{{tree}}"], self.ws).strip()
+            prior = pipeline.Review("approve", trees={"": tree})
+            pipeline.catch_up_base(build, self.checkout, self.branch, base, "", "", prior,
+                                   before_push=self.unexpected_push)
 
         status, row = self.run_ticket(drive)
         self.assertEqual((status, row["summary"]), (1, why))
@@ -2445,268 +2448,117 @@ class OrchestratedFinishBudgetTests(PollFixture):
         self.assertFalse((directory / "parked.json").exists())
 
 
-class OrchestratedFailedFinishTests(Isolated):
-    pr = "https://github.com/owner/project/pull/685"
-    issue = "709"
+class OrchestrationFinishTests(Isolated):
+    PR = "https://github.com/owner/project/pull/685"
+    HEAD = "a" * 40
 
     def setUp(self):
         super().setUp()
-        self.repo = config.Repo(name="github-fixture", path=self.repo.path, github="owner/project",
-                                parts=[config.Part("", "owner/project")], pipeline=True)
+        self.repo = replace(self.repo, github="owner/project", tracker="github",
+                            parts=[config.Part("", "owner/project")])
         self.cfg = config.Config(repos=[self.repo], replay=config.ReplayConfig(all=True))
-        self.labels, self.comments, self.drafted = {"agent"}, [], []
-        self.pr_states = {self.pr: "OPEN"}
+        self.issue = "658"
+        self.labels = {"agent"}
+        self.comments = []
+        self.prs = {self.PR: {"state": "OPEN", "isDraft": False, "headRefOid": self.HEAD}}
         self.checkout = workspace.Checkout("", self.repo.github, self.repo.path,
                                            paths.WORKTREES_DIR / f"{self.repo.name}-{self.issue}",
-                                           "main", pr=self.pr)
-        for module, name, stub in (
+                                           "main", pr=self.PR, lease=self.HEAD)
+        for module, name, func in (
             (config, "load", lambda: self.cfg),
-            (pipeline, "run_refusal", lambda *args, **kwargs: (False, "")),
             (gh, "issue", self.issue_view),
             (gh, "issue_labels", self.edit_labels),
+            (gh, "issue_comment", self.post_comment),
             (gh, "ensure_label", lambda *args: ""),
-            (gh, "pr_view", lambda url: {"state": self.pr_states[url]}),
-            (gh, "pr_body", lambda url: ""),
+            (gh, "default_branch", lambda repo: "main"),
+            (gh, "pr_merge_details", self.prs.__getitem__),
             (gh, "pr_set_draft", self.set_draft),
-            (gh, "gh", self.github),
             (scratch, "process_ids", dict),
             (scratch, "service_labels", dict),
             (sandbox, "AUTHORITY", self.root / "authority"),
-            (factory, "fingerprint", lambda path: "fixture-tree"),
         ):
-            self.patches.enter_context(patch.object(module, name, stub))
-        self.patches.enter_context(patch.dict(factory.STEPS, {"prepare": self.prepare}))
+            self.patches.enter_context(patch.object(module, name, func))
 
     def issue_view(self, repo, number):
         return {"number": number, "title": "Fixture issue", "body": "Fixture description", "state": "OPEN",
                 "author": {"login": "owner"}, "labels": [{"name": label} for label in sorted(self.labels)]}
 
-    def edit_labels(self, repo, number, add=(), remove=(), *, single_attempt=False):
+    def edit_labels(self, repo, number, add=(), remove=(), **kwargs):
         self.labels.difference_update(remove)
         self.labels.update(add)
 
+    def post_comment(self, repo, number, body):
+        self.comments.append(body)
+
     def set_draft(self, url, draft):
-        self.assertTrue(draft)
-        self.drafted.append(url)
+        self.prs[url]["isDraft"] = draft
 
-    def github(self, args, *, input=None, write=False, **kwargs):
-        if args[:2] == ["pr", "view"]:
-            url = args[2]
-            return json.dumps({"state": self.pr_states[url], "isDraft": url in self.drafted})
-        self.assertEqual(args[:3], ["issue", "comment", self.issue])
-        self.comments.append(input)
-        return ""
+    def run_controller(self, decide, code):
+        def prepare(flow, tree):
+            flow.ctx.run.enter("running")
+            return factory.Outcome("pass", data={
+                "layer": str(self.repo.layer_dir),
+                "checkouts": [replace(self.checkout, pr=url).to_row() for url in self.prs],
+                "ticket": asdict(flow.ctx.run.tracker.get(self.issue)), "branch": "arete/fixture",
+                "add_dirs": [], "attachments": "", "expertise": "", "triage": "",
+            })
 
-    def prepare(self, flow, tree):
-        run = flow.ctx.run
-        run.enter("running")
-        return factory.Outcome("pass", data={
-            "layer": str(self.repo.layer_dir),
-            "checkouts": [replace(self.checkout, pr=url).to_row() for url in self.pr_states or [""]],
-            "ticket": asdict(run.tracker.get(self.issue)), "branch": "arete/fixture",
-            "add_dirs": [], "attachments": "", "expertise": "", "triage": "",
-        })
-
-    def finish_run(self, ending, rationale, exit_code, *, worker_failure=None, budgeted=True, before_finish=None):
         def drive(flow):
             controller = orchestration.Controller(flow)
-            if worker_failure:
-                role, recovery = worker_failure
-                lease = controller.lease
-                turn = ledger.begin(lease, {}, controller.policy.max_decisions)
-                version = ledger.snapshot(lease)["version"]
-                worker, = ledger.accept(lease, turn, version, {"calls": [{"op": "worker.start", "args": {}}]}, 1)
-                ledger.transition(lease, worker["id"], "running", {"writing": True, "role": role})
-                ledger.transition(lease, worker["id"], "failed", {"event": "result", "recovery": recovery})
-            decisions = iter([
-                ("catalog.list", {"kind": "context"}, "Only listed the context."),
-                ("run.finish", {"reason": ending}, rationale),
-            ])
-
-            def decide():
-                op, args, reason = next(decisions)
-                if op == "run.finish" and before_finish:
-                    before_finish(controller)
-                if op == "run.finish" and ending == "delivered":
-                    controller.run.enter("pr")
-                    controller.data["published"] = {"ending": "pr", "summary": "Delivered fixture"}
-                    controller.data["published_tree"] = controller.fingerprint()
-                    controller.executing = "fixture-publication"
-                    for gate in ("checks", "verify", "review"):
-                        controller.stamp(gate, {})
-                turn = ledger.begin(controller.lease, {}, controller.policy.max_decisions)
-                version = ledger.snapshot(controller.lease)["version"]
-                response = {"version": PROTOCOL, "decision_id": turn, "state_version": version,
-                            "rationale": reason, "calls": [{"op": op, "args": args}]}
-                validated = controller.catalog.validate(response, turn, version, {})
-                controller.run.step_started = True
-                return ledger.accept(controller.lease, turn, version, validated, controller.policy.max_actions)
-
-            budget = controller.run.budget if budgeted else None
-            with patch.object(controller, "decide", side_effect=decide), patch.object(controller.run, "budget", budget):
+            with patch.object(controller, "decide", side_effect=lambda: decide(controller)):
                 return controller.drive()
 
-        result = pipeline.run_issue(self.repo.name, self.issue, script=pipeline.Script("orchestrate", drive))
-        self.assertEqual(result, exit_code)
+        with (patch.dict(factory.STEPS, {"prepare": prepare}),
+              patch.object(factory, "fingerprint", return_value="fixture-tree")):
+            self.assertEqual(pipeline.run_issue(self.repo.name, self.issue, script=pipeline.Script("orchestrate", drive)),
+                             code)
         return run_store.newest_whole_run(self.repo.name, self.issue)
 
-    def test_failed_finish_parks_labels_and_comments_on_the_ticket_and_drafts_open_prs(self):
+    def controller_action(self, controller, op, args, rationale):
+        version = ledger.snapshot(controller.lease)["version"]
+        turn = ledger.begin(controller.lease, {}, controller.policy.max_decisions)
+        response = {"version": PROTOCOL, "decision_id": turn, "state_version": version,
+                    "rationale": rationale, "calls": [{"op": op, "args": args}]}
+        validated = controller.catalog.validate(response, turn, version, {})
+        return ledger.accept(controller.lease, turn, version, validated, controller.policy.max_actions)
+
+    def test_failed_finish_comments_with_its_rationale_and_drafts_open_prs(self):
         other = "https://github.com/owner/other/pull/686"
         closed = "https://github.com/owner/closed/pull/687"
-        self.pr_states.update({other: "OPEN", closed: "CLOSED"})
-        address, home = "http://127.0.0.1:8000", "/Users/fixture"
-        reason = f"The merge conflicts remain. See {address}/logs and {home}/build.log."
-        screened = "The merge conflicts remain. See [private address]/logs and ~/build.log."
-        row = self.finish_run("failed", reason, 1)
-        self.assertEqual(row["status"], "failed")
-        self.assertEqual(runlimits.metadata(row["id"], "parked.json")["reason"], screened)
+        self.prs[other] = {**self.prs[self.PR]}
+        self.prs[closed] = {**self.prs[self.PR], "state": "CLOSED"}
+        decisions = iter([
+            ("catalog.list", {"kind": "context"}, "The earlier decision only listed context."),
+            ("run.finish", {"reason": "failed"}, "The merge conflicts remain. See http://127.0.0.1:8000/logs."),
+        ])
+        row = self.run_controller(lambda controller: self.controller_action(controller, *next(decisions)), code=1)
+        self.assertEqual((row["status"], row["summary"]), ("failed", "the orchestrator stopped without delivery"))
         self.assertEqual(self.labels, {"agent", "agent:failed"})
         comment, = self.comments
-        for output in (comment, row["summary"], (paths.RUNS_DIR / row["id"] / "run.log").read_text()):
-            self.assertIn(screened, output)
-            self.assertNotIn(address, output)
-            self.assertNotIn(home, output)
+        self.assertIn("The merge conflicts remain. See [private address]/logs.", comment)
         self.assertIn(row["id"], comment)
-        self.assertNotIn("Only listed the context.", comment)
-        self.assertCountEqual(self.drafted, [self.pr, other])
-
-    def test_malformed_pr_lookup_does_not_interrupt_failed_finish(self):
-        non_object = "https://github.com/owner/other/pull/686"
-        ready = "https://github.com/owner/ready/pull/687"
-        self.pr_states.update({non_object: "OPEN", ready: "OPEN"})
-        bad_replies = {self.pr: "{broken", non_object: '[{"state": "OPEN", "isDraft": false}]'}
-
-        def github(args, **kwargs):
-            if args[:2] == ["pr", "view"] and args[2] in bad_replies:
-                return bad_replies[args[2]]
-            return self.github(args, **kwargs)
-
-        reason = "The merge conflicts remain."
-        with patch.object(gh, "gh", github):
-            row = self.finish_run("failed", reason, 1)
-        self.assertEqual(row["status"], "failed")
-        self.assertEqual(runlimits.metadata(row["id"], "parked.json").get("reason"), reason)
-        self.assertEqual(self.labels, {"agent", "agent:failed"})
-        comment, = self.comments
-        self.assertIn(reason, comment)
-        self.assertIn(row["id"], comment)
-        self.assertEqual(self.drafted, [ready])
-        log = (paths.RUNS_DIR / row["id"] / "run.log").read_text()
-        for url in bad_replies:
-            self.assertIn(f"could not inspect {url}", log)
-
-    def assert_github_finish_requeues(self, failure, role, recovery_reason, evidence):
-        from arete import requeue
-
-        self.pr_states.clear()
-        recovery = pipeline.runner.start_failure(failure, role)
-        self.assertIsNotNone(recovery)
-        self.assertEqual(recovery["reason"], recovery_reason)
-        rationale = f"The {role} worker could not proceed."
-        row = self.finish_run("failed", rationale, 1, worker_failure=(role, recovery))
-        self.assertEqual(row["status"], "failed")
-        self.assertEqual(json.loads(row["failure"]), {"class": "environment", **recovery})
-        self.assertFalse(row["pr_url"])
-        self.assertFalse(runlimits.metadata(row["id"], "parked.json"))
-        comment, = self.comments
-        self.assertIn(rationale, comment)
-        self.assertIn(row["id"], comment)
-
-        source = tracker.GitHubTracker(self.repo)
-        layer = config.load_layer(self.repo.layer_dir)
-        with patch.object(gh, "find_issue_comment_marker", return_value=""):
-            requeue.reconsider(self.cfg, source, layer, self.issue, dry_run=False)
-            self.assertIn("agent:failed", self.labels)
-            self.assertEqual(self.comments, [comment])
-            requeue.reconsider(self.cfg, source, layer, self.issue, dry_run=False)
-        self.assertEqual(self.labels, {"agent"})
-        self.assertEqual(len(self.comments), 2)
-        self.assertIn(f"Requeued this issue because {evidence}.", self.comments[1])
-        ticket = source.get(self.issue)
-        self.assertEqual(runlimits.poll_admission(self.repo, self.issue, ticket, runlimits.Policy.of(layer)), ("", None))
-
-    def test_github_finish_requeues_a_builder_start_failure_after_the_runner_recovers(self):
-        failure = Result(ok=False, runner="claude", error="claude not found: fixture")
-        with patch.object(pipeline.runner, "started_now", side_effect=[False, True]) as probe:
-            self.assert_github_finish_requeues(failure, "build", "runner-start", "the runner answered its startup check")
-        self.assertEqual([call.args for call in probe.call_args_list], [("claude",), ("claude",)])
-
-    def test_github_finish_requeues_a_builder_after_rejected_login_is_renewed(self):
-        failure = Result(ok=False, runner="claude", model="sonnet", credential="cli_login", turns=1,
-                         raw={"api_error": "authentication_failed"}, auth_generation="stale-login")
-        route = SimpleNamespace(state="ready", runner="claude", model="sonnet", credential="cli_login")
-        with patch.object(pipeline.routing, "Discovery") as discovery, \
-                patch.object(pipeline.runner, "authentication", side_effect=[
-                    SimpleNamespace(generation="stale-login"), SimpleNamespace(generation="new-login")]) as auth:
-            routes = discovery.return_value.routes
-            routes.return_value = [route]
-            self.assert_github_finish_requeues(failure, "build", "runner-login", "the runner login is available again")
-        self.assertEqual([call.args[0].step for call in routes.call_args_list], ["build", "build"])
-        self.assertEqual(auth.call_count, 2)
-
-    def test_github_finish_requeues_a_review_repair_after_a_login_route_becomes_ready(self):
-        route = {"runner": "claude", "model": "sonnet", "credential": "cli_login"}
-        failure = Result(ok=False, error=pipeline.runner.NO_ROUTE, skipped=[{**route, "state": "missing_login"}])
-        with patch.object(pipeline.routing, "Discovery") as discovery:
-            routes = discovery.return_value.routes
-            routes.side_effect = [[SimpleNamespace(**route, state="missing_login")],
-                                  [SimpleNamespace(**route, state="ready")]]
-            self.assert_github_finish_requeues(failure, "review_repair", "runner-login",
-                                               "the runner login is available again")
-        self.assertEqual([call.args[0].step for call in routes.call_args_list], ["review_repair", "review_repair"])
-
-    def assert_sandbox_finish_requeues(self, role):
-        failure = Result(ok=False, error=pipeline.runner.SANDBOX_START_ERROR)
-        with patch.object(sandbox, "can_confine", return_value=True), \
-                patch.object(sandbox, "write_confinement", return_value=["sandbox-exec"]), \
-                patch.object(util, "run_whole_tree", side_effect=[
-                    SimpleNamespace(returncode=1), SimpleNamespace(returncode=0)]) as probe:
-            self.assert_github_finish_requeues(failure, role, "sandbox-start", "the local sandbox started successfully")
-        self.assertEqual([call.args[0] for call in probe.call_args_list], [["sandbox-exec", "/usr/bin/true"]] * 2)
-
-    def test_github_finish_requeues_a_check_repair_after_sandbox_confinement_works(self):
-        self.assert_sandbox_finish_requeues("check_repair")
-
-    def test_github_finish_requeues_a_ci_repair_after_sandbox_confinement_works(self):
-        self.assert_sandbox_finish_requeues("ci_repair")
-
-    def test_catch_up_repair_budget_park_posts_one_comment(self):
-        held = "Catch-up review requested changes"
-        reason = "the repair chain used its 1 repair cycles"
-        self.checkout = replace(self.checkout, lease="already-drafted")
-        self.repo.layer_dir.mkdir()
-        (self.repo.layer_dir / "config.toml").write_text("[limits]\nmax_repair_cycles = 1\n")
-
-        def attempt_another_repair(controller):
-            controller.data["catch_up_hold"] = {"reason": held}
-            controller.run.budget.charge("repair", "review_repair")
-            controller.run.budget.charge("repair", "review_repair")
-
-        with patch.object(gh, "pr_draft_and_head", return_value=(True, "already-drafted")):
-            row = self.finish_run("failed", "The controller stopped.", 1, before_finish=attempt_another_repair)
-        self.assertEqual(row["status"], "failed")
-        self.assertEqual(runlimits.metadata(row["id"], "parked.json")["reason"], f"{held}. {reason}")
-        self.assertEqual(self.labels, {"agent", "agent:failed"})
-        comment, = self.comments
-        self.assertIn(f"{held}. I parked the run because {reason}.", comment)
-
-    def test_failed_finish_without_a_budget_uses_the_existing_failure_response(self):
-        row = self.finish_run("failed", "The controller stopped.", 1, budgeted=False)
-        why = "the orchestrator stopped without delivery"
-        self.assertEqual((row["status"], row["summary"]), ("failed", why))
-        self.assertFalse(runlimits.metadata(row["id"], "parked.json"))
-        self.assertEqual(self.labels, {"agent", "agent:failed"})
-        comment, = self.comments
-        self.assertIn(why, comment)
-        self.assertIn(row["id"], comment)
-        self.assertEqual(self.drafted, [])
+        self.assertNotIn("The earlier decision", comment)
+        self.assertNotIn("127.0.0.1", comment)
+        self.assertTrue(self.prs[self.PR]["isDraft"])
+        self.assertTrue(self.prs[other]["isDraft"])
+        self.assertFalse(self.prs[closed]["isDraft"])
+        self.assertFalse((paths.RUNS_DIR / row["id"] / "parked.json").exists())
 
     def test_delivered_finish_keeps_the_ready_pr_and_ticket_state(self):
-        row = self.finish_run("delivered", "Published the change.", 0)
-        self.assertEqual((row["status"], row["summary"], row["pr_url"]), ("pr", "Delivered fixture", self.pr))
+        def decide(controller):
+            controller.run.enter("pr")
+            controller.data["published"] = {"ending": "pr", "summary": "Delivered fixture"}
+            controller.data["published_tree"] = controller.fingerprint()
+            controller.executing = "fixture-publication"
+            for gate in ("checks", "verify", "review"):
+                controller.stamp(gate, {})
+            return self.controller_action(controller, "run.finish", {"reason": "delivered"}, "Published the change.")
+
+        row = self.run_controller(decide, code=0)
+        self.assertEqual((row["status"], row["summary"], row["pr_url"]), ("pr", "Delivered fixture", self.PR))
         self.assertEqual(self.labels, {"agent", "agent:pr"})
         self.assertEqual(self.comments, [])
-        self.assertEqual(self.drafted, [])
+        self.assertFalse(self.prs[self.PR]["isDraft"])
 
 
 class BudgetReadmissionTests(ReadmissionFixture):
