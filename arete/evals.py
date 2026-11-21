@@ -442,8 +442,9 @@ def prepare(repo: config.Repo, src: Source, wt: Path, run: EvalRun) -> config.Re
         run.local_layer_settings = local_layer.read_bytes()
         write_fixture(wt, LAYER_CONFIG, run.local_layer_settings)
     layer = config.load_layer(repo.layer or wt / ".agents")
+    overlay_paths = src.changed.union(copied) if isinstance(src, HarnessOverlay) else frozenset()
     for c in layer.copy:
-        if isinstance(src, HarnessOverlay) and util.matches_any(os.path.normpath(c), harness_globs()):
+        if os.path.normpath(c) in overlay_paths:
             continue
         s = repo.path / c
         if s.exists():

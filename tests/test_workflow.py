@@ -3255,6 +3255,55 @@ class MinerGitHubTransportTests(unittest.TestCase):
             self.assertIsNone(call.kwargs["cwd"])
 
 
+class EvalOverlayCopyTests(unittest.TestCase):
+    def test_mixed_comparison_copies_local_agents_file_into_both_arms(self):
+        root = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        repo = config.Repo("arete", root / "repo")
+        cfg = config.Config(repos=[repo])
+        repo.layer_dir.mkdir(parents=True)
+        (repo.path / evals.LAYER_CONFIG).write_text('[setup]\ncopy = ["AGENTS.md"]\n')
+        local_rules = "Local agent instructions\n"
+        (repo.path / "AGENTS.md").write_text(local_rules)
+        base, head = "a" * 40, "b" * 40
+        rules = {base: b"Base Claude instructions", head: b"Candidate Claude instructions"}
+        prepared = {}
+        task = evals.Task("fixture", "Fixture", "Build it")
+
+        def suite(cfg, repo, source, tasks, tag, prompts):
+            checkout = root / tag
+            checkout.mkdir()
+            evals.prepare(repo, source, checkout, mock.Mock())
+            self.assertEqual(source.ref, prompts.commit)
+            self.assertEqual((checkout / "CLAUDE.md").read_bytes(), rules[source.ref])
+            prepared[source.ref] = checkout
+            result = evals.TaskResult(task.name, passed=True, graded=True, base_commit=base,
+                                      context_sha="fixture", prompts_used={"build.md"})
+            return evals.Arm(tag, [result])
+
+        def records(args, cwd):
+            if args[:2] == ["ls-tree", "-r"]:
+                return [f"100644 blob {args[2]}\tCLAUDE.md"]
+            return []
+
+        with (
+            mock.patch.multiple(evals, commit_overlay=mock.DEFAULT, run_suite=suite,
+                                paired_tasks=mock.Mock(return_value=[task]),
+                                export_prompts=lambda repo, ref, dest: {"build.md": ref.encode()}),
+            mock.patch.object(evals.Source, "read", lambda source, name: rules[source.ref]),
+            mock.patch.object(util, "git_records", side_effect=records),
+            mock.patch.object(util, "lock", return_value=nullcontext(True)),
+        ):
+            comparison = evals.compare_prompts(cfg, repo, base, head, harness=["CLAUDE.md"])
+
+        self.assertTrue(comparison.complete, comparison.markdown)
+        self.assertEqual(set(prepared), {base, head})
+        for ref, checkout in prepared.items():
+            with self.subTest(ref=ref):
+                copied = checkout / "AGENTS.md"
+                self.assertTrue(copied.is_file())
+                self.assertEqual(copied.read_text(), local_rules)
+
+
 class MinerLifecycleTests(unittest.TestCase):
     BASE = "a" * 40
     HEAD = "b" * 40
