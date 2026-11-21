@@ -250,13 +250,12 @@ def admission(repo, tid: str, tracker, policy: Policy, explicit: bool, *,
     if explicit:
         spec = specification(tracker.get(tid)) if saved.get("specification") else ""
         if inputs_changed(saved, spec, asdict(policy)):
-            return Admission(reset_time=True, reset_repairs=specification_changed(saved, spec))
+            return Admission(reset_time=True, reset_repairs=True)
         if isinstance(saved.get("heads"), dict) and saved["heads"] != heads(repo, park_branch(row, saved)):
-            return Admission(reset_time=True)
-    if readmission and readmission.run_id == row["id"]:
-        ticket = tracker.get(tid)
-        if readmission.matches(repo, row, saved, ticket, policy):
-            return Admission(reset_time=True, reset_repairs=specification_changed(saved, specification(ticket)))
+            return Admission(reset_time=True, reset_repairs=True)
+    if (readmission and readmission.run_id == row["id"]
+            and readmission.matches(repo, row, saved, tracker.get(tid), policy)):
+        return Admission(reset_time=True, reset_repairs=True)
     return Admission(park_reason(row, saved))
 
 

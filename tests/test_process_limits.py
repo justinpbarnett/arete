@@ -1509,6 +1509,53 @@ class ReadmissionFixture(PollFixture):
         return run
 
 
+class ParkedRetryBudgetTests(Isolated):
+    def setUp(self):
+        super().setUp()
+        self.layer = self.repo.layer_dir / "config.toml"
+        self.layer.parent.mkdir()
+        self.layer.write_text('[factory]\npath = "classic"\n[limits]\nmax_repair_cycles = 3\n')
+        self.cfg.replay = config.ReplayConfig(all=True)
+        self.patches.enter_context(patch.object(config, "load", return_value=self.cfg))
+        self.patches.enter_context(patch.object(pipeline, "run_refusal", return_value=(False, "")))
+
+    def park_spent_ticket(self, branch=""):
+        def spend(cfg, run, slot):
+            record.note(run.id, branch=branch)
+            for _ in range(run.budget.policy.max_repair_cycles + 1):
+                run.budget.charge("repair", "review_repair")
+
+        with patch.object(pipeline, "_run", side_effect=spend):
+            self.assertEqual(pipeline.run_issue(self.repo.name, self.ticket), 1)
+        parked, saved = runlimits.latest_park(self.repo.name, self.ticket)
+        self.assertEqual(saved["reason"], "the repair chain used its 3 repair cycles")
+        self.assertEqual(runlimits.repair_count(parked["id"]), 3)
+
+    def assert_fresh_retry(self):
+        def repair(cfg, run, slot):
+            run.budget.charge("repair", "review_repair")
+            return "noop", "fixture finished", ""
+
+        with patch.object(pipeline, "_run", side_effect=repair):
+            result = pipeline.run_issue(self.repo.name, self.ticket, force=True)
+        retry = run_store.newest_whole_run(self.repo.name, self.ticket)
+        self.assertEqual(result, 0, retry["summary"])
+        self.assertEqual(runlimits.repair_count(retry["id"]), 1)
+        log = (paths.RUNS_DIR / retry["id"] / "run.log").read_text()
+        self.assertIn("budget chain: no parents\n", log)
+
+    def test_explicit_retry_after_published_head_changes_resets_spent_repairs(self):
+        with patch.object(runlimits, "branch_head", return_value="a" * 40) as head:
+            self.park_spent_ticket("arete/fixture")
+            head.return_value = "b" * 40
+            self.assert_fresh_retry()
+
+    def test_explicit_retry_after_policy_changes_resets_spent_repairs(self):
+        self.park_spent_ticket()
+        self.layer.write_text(self.layer.read_text() + "max_run_minutes = 90\n")
+        self.assert_fresh_retry()
+
+
 class BudgetReadmissionTests(ReadmissionFixture):
     def test_specification_edit_readmits_once_and_reparks_on_current_inputs(self):
         parked = self.park_ticket()
@@ -1535,8 +1582,8 @@ class BudgetReadmissionTests(ReadmissionFixture):
         self.assertIn(f"parked after run {started[0]}: repair limit again", output.getvalue())
         self.assertIn(runlimits.RETRY, output.getvalue())
 
-    def test_raised_layer_budget_readmits_a_failed_ticket_with_earlier_repairs(self):
-        parked = self.park_ticket()
+    def test_raised_layer_budget_readmits_a_failed_ticket_with_fresh_repairs(self):
+        self.park_ticket()
         (self.repo.layer_dir / "config.toml").write_text('[factory]\npath = "classic"\n[limits]\nmax_repair_cycles = 3\n')
         started = []
 
@@ -1544,9 +1591,9 @@ class BudgetReadmissionTests(ReadmissionFixture):
             started.append(run.budget.policy.max_repair_cycles)
             self.assertFalse(run.force)
             self.assertEqual(run.budget.parents, [])
-            self.assertEqual(run.budget.repair_parents, [parked.id])
-            self.assertEqual(run.budget.prior_repairs, 1)
-            for _ in range(2):
+            self.assertEqual(run.budget.repair_parents, [])
+            self.assertEqual(run.budget.prior_repairs, 0)
+            for _ in range(3):
                 run.budget.charge("repair", "review_repair")
             with self.assertRaisesRegex(runlimits.Parked, "3 repair cycles"):
                 run.budget.charge("repair", "review_repair")
@@ -1620,7 +1667,7 @@ class TrackerReadmissionTests(ReadmissionFixture):
             started.append(run.id)
             self.assertFalse(run.force)
             self.assertEqual(run.budget.parents, [])
-            self.assertEqual(run.budget.prior_repairs, 1)
+            self.assertEqual(run.budget.prior_repairs, 0)
             return "noop", "fixture finished", ""
 
         def spawn(repo, tid):
