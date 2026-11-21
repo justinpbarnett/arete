@@ -81,8 +81,8 @@ def gh(args: list[str], cwd=None, timeout: float = 120, input: str | None = None
     return res.stdout
 
 
-def gh_json(args: list[str], cwd=None, timeout: float = 120):
-    out = gh(args, cwd=cwd, timeout=timeout)
+def gh_json(args: list[str], cwd=None, timeout: float = 120, *, retry: bool = True):
+    out = gh(args, cwd=cwd, timeout=timeout, retry=retry)
     return json.loads(out) if out.strip() else None
 
 
@@ -467,6 +467,8 @@ def pr_draft_and_head(url: str) -> tuple[bool, str]:
 
 MERGE_WAIT_SECONDS = 120
 MERGE_POLL_SECONDS = 5
+ARETE_CHECK = {"context": "arete-checks", "app_id": 15368}
+ARETE_WORKFLOW = "ci.yml"
 
 
 def merge_ci_passed(repo: str, head: str, *, required: dict | None = None) -> bool:
@@ -479,7 +481,7 @@ def merge_ci_passed(repo: str, head: str, *, required: dict | None = None) -> bo
         return False
     runs = [row for page in checks for row in page["check_runs"]]
     if required and not any(row.get("head_sha") == head and row.get("name") == required["context"]
-                            and row.get("app", {}).get("id") == required["app_id"] for row in runs):
+                            and (row.get("app") or {}).get("id") == required["app_id"] for row in runs):
         return False
     contexts = {}
     for page in statuses:
@@ -489,6 +491,42 @@ def merge_ci_passed(repo: str, head: str, *, required: dict | None = None) -> bo
             contexts.setdefault(row["context"], row["state"])
     return (bool(runs or contexts) and all(row["status"] == "completed" and row["conclusion"] == "success"
                                            for row in runs) and all(state == "success" for state in contexts.values()))
+
+
+def push_ci_state(repo: str, head: str, branch: str, *, timeout: float = 20) -> str:
+    path = f"repos/{repo}"
+
+    def rows(endpoint, key):
+        pages = gh_json(["api", f"{path}/{endpoint}", "--paginate", "--slurp"], timeout=timeout, retry=False)
+        return [row for page in pages or [] for row in page[key]]
+
+    query = urlencode({"event": "push", "branch": branch, "head_sha": head, "per_page": 100})
+    runs = rows(f"actions/workflows/{ARETE_WORKFLOW}/runs?{query}", "workflow_runs")
+    matching = [run for run in runs if (run.get("event"), run.get("head_branch"), run.get("head_sha"))
+                == ("push", branch, head)]
+    if not matching:
+        return "pending"
+    run = max(matching, key=lambda row: (row["run_number"], row["run_attempt"]))
+    if run.get("status") != "completed":
+        return "pending"
+    if run.get("conclusion") != "success":
+        return "fail"
+    jobs = rows(f"actions/runs/{run['id']}/attempts/{run['run_attempt']}/jobs?per_page=100", "jobs")
+    required = [job for job in jobs if job.get("name") == ARETE_CHECK["context"]]
+    if len(required) != 1:
+        return "pending"
+    job = required[0]
+    link = re.search(r"/check-runs/([0-9]+)$", job.get("check_run_url") or "")
+    if not link or job.get("status") != "completed":
+        return "pending"
+    if job.get("conclusion") != "success":
+        return "fail"
+    check_id = int(link[1])
+    check = gh_json(["api", f"{path}/check-runs/{check_id}"], timeout=timeout, retry=False) or {}
+    if ((check.get("id"), check.get("head_sha"), check.get("name"), (check.get("app") or {}).get("id"))
+            != (check_id, head, ARETE_CHECK["context"], ARETE_CHECK["app_id"]) or check.get("status") != "completed"):
+        return "pending"
+    return "pass" if check.get("conclusion") == "success" else "fail"
 
 
 def merge_readiness(repo: str, number: int, head: str, base: str, base_sha: str, *, wait: float = 0,
@@ -529,11 +567,12 @@ def pr_merge_auto(repo: str, number: int, head: str, base: str, base_sha: str) -
     return "" if result.get("merged") is True else "GitHub did not confirm the merge"
 
 
-def default_branch(repo: str) -> str:
+def default_branch(repo: str, *, fallback: str = "main", timeout: float = 120, retry: bool = True) -> str:
     try:
-        return (gh_json(["repo", "view", repo, "--json", "defaultBranchRef"]) or {})["defaultBranchRef"]["name"]
+        row = gh_json(["repo", "view", repo, "--json", "defaultBranchRef"], timeout=timeout, retry=retry) or {}
+        return row["defaultBranchRef"]["name"] or fallback
     except (GhError, KeyError, TypeError):
-        return "main"
+        return fallback
 
 
 def base64url(data: bytes) -> str:

@@ -29,6 +29,14 @@ def steering(p: Parser) -> Parser:
     return p
 
 
+def status_arguments(p: Parser) -> Parser:
+    steering(p)
+    p.add_argument("run_id", nargs="?", default="", help="with --json: this run's steps, then its report")
+    p.add_argument("--limit", type=int, default=10)
+    p.add_argument("--json", action="store_true", help="one JSON line per live run, or per step of RUN_ID")
+    return p
+
+
 def when(stamp: str | None) -> str:
     from .. import util
 
@@ -149,6 +157,15 @@ def print_live(live: dict) -> None:
                       r["slot"] or r["step"]) for r in live["runs"]], 200)
 
 
+def serve_revisions(beat: dict) -> str:
+    revisions = []
+    if beat.get("engine"):
+        revisions.append(f"running code {beat['engine']}")
+    if "checkout_head" in beat:
+        revisions.append(f"checkout HEAD {beat['checkout_head'] or 'unavailable'}")
+    return ", ".join(revisions)
+
+
 def serve_line(beat: dict) -> str:
     from .. import util
 
@@ -159,10 +176,12 @@ def serve_line(beat: dict) -> str:
     paused = f"; config does not load: {beat['config_problem']}" if beat.get("config_problem") else ""
     paused +=f"; new code paused: {beat['code_problem']}" if beat.get("code_problem") else ""
     failing = "".join(f"; tick fails at {key}: {found['error']}" for key, found in (beat.get("failing") or {}).items())
+    code = serve_revisions(beat)
     running, pending = ("unknown" if beat[k] is None else beat[k] for k in ("running", "pending"))
     return (f"serve: up, pid {beat['pid']}, {util.count(beat['loops'], 'loop')} on, {beat['off']} off, "
             f"{running} running, {pending} waiting"
-            + (f", {len(beat['broken'])} broken" if beat.get("broken") else "") + paused + failing)
+            + (f", {len(beat['broken'])} broken" if beat.get("broken") else "")
+            + (f", {code}" if code else "") + paused + failing)
 
 
 def loop_line(v: dict) -> str:

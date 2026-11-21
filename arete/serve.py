@@ -28,6 +28,7 @@ from . import (
     devices,
     environment,
     explain,
+    gh,
     hold_review,
     install,
     loop_run,
@@ -55,6 +56,8 @@ from .store import runs as run_store
 from .store import sources as source_store
 
 TICK_SECONDS = 20
+DEPLOY_SECONDS = 120
+DEPLOY_API_TIMEOUT = 20
 PRUNE_SECONDS = 3600
 ROTATE_SECONDS = 3600
 APPROVAL_RETRY_SECONDS = 900
@@ -151,7 +154,21 @@ def code_stamp() -> frozenset:
         except FileNotFoundError:
             continue
         stamp.add((str(p), st.st_mtime_ns, st.st_size))
+    if head := codebase.checkout_head():
+        stamp.add(("HEAD", head))
     return frozenset(stamp)
+
+
+def deploy_refusal(src: Path, base: str, tip: str) -> str | None:
+    head = util.git(["rev-parse", "--verify", "HEAD"], src, timeout=10).strip()
+    if head == tip:
+        return None
+    if util.git(["branch", "--show-current"], src, timeout=10).strip() != base:
+        return "on another branch"
+    if util.git(["status", "--porcelain", "--untracked-files=no", "--ignore-submodules=untracked"], src, timeout=10):
+        return "dirty"
+    ancestor = util.git(["merge-base", head, tip], src, check=False, timeout=10).strip()
+    return "" if ancestor == head else "diverged"
 
 
 def reap_children() -> None:
@@ -207,6 +224,10 @@ class Server:
         self.polls: dict[str, Future] = {}
         self.sweep: Future | None = None
         self.oncall: Future | None = None
+        self.deployment: Future | None = None
+        self.deploy_at = time.monotonic() - DEPLOY_SECONDS
+        self.deploy_refusals: set[tuple[str, str]] = set()
+        self.checkout_update = threading.Lock()
         self.zte_work: Future | None = None
         self.zte_at = 0.0
         self.oncall_error = ""
@@ -391,7 +412,12 @@ class Server:
             self.say(note)
 
     def run_pass(self) -> None:
-        self.guard("stage:code", self.load_new_code)
+        if self.checkout_update.acquire(blocking=False):
+            try:
+                self.guard("stage:code", self.load_new_code)
+            finally:
+                self.checkout_update.release()
+        self.guard("stage:deploy", self.deploy_when_due)
         self.guard("tick", self.tick)
         self.guard("stage:inherited", self.reap_inherited)
         self.ticks += 1
@@ -400,6 +426,64 @@ class Server:
             self.beat()
         except Exception as e:
             self.say(f"beat failed: {type(e).__name__}: {e}")
+
+    def deploy_when_due(self) -> None:
+        if self.deployment is not None:
+            if not self.deployment.done():
+                return
+            finished, self.deployment = self.deployment, None
+            finished.result()
+        now = time.monotonic()
+        if now - self.deploy_at >= DEPLOY_SECONDS and not self.config_problem:
+            self.deploy_at = now
+            self.deployment = self.pool.submit(self.deploy, self.cfg)
+
+    def deploy(self, cfg: config.Config) -> None:
+        if not (repo := cfg.repo_for_path(paths.PACKAGE_DIR)):
+            return
+        src = repo.path.resolve()
+        root = util.git(["rev-parse", "--show-toplevel"], paths.PACKAGE_DIR, check=False, timeout=10).strip()
+        if not root or Path(root).resolve() != src:
+            return
+        if not (github := repo.github or loops.github_remote(src)):
+            return
+        if not (base := gh.default_branch(github, fallback="", timeout=DEPLOY_API_TIMEOUT, retry=False)):
+            raise RuntimeError(f"could not determine the default branch of {github}")
+        ref = f"refs/remotes/origin/{base}"
+        with util.repo_lock(src):
+            util.git(["fetch", "-q", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules",
+                      "origin", f"+refs/heads/{base}:{ref}"], src,
+                     timeout=45, env={"GIT_TERMINAL_PROMPT": "0"}, retry=False)
+            tip = util.git(["rev-parse", "--verify", ref], src, timeout=10).strip()
+            if not self.deploy_ready(src, base, tip):
+                return
+        ci = gh.push_ci_state(github, tip, base, timeout=DEPLOY_API_TIMEOUT)
+        if ci != "pass":
+            self.deploy_refused(src, tip, "CI failed" if ci == "fail" else "CI pending")
+            return
+        with util.repo_lock(src), self.checkout_update:
+            if util.git(["rev-parse", "--verify", ref], src, timeout=10).strip() != tip:
+                return
+            if self.deploy_ready(src, base, tip):
+                subject = util.git(["show", "-s", "--format=%s", tip], src, timeout=10).strip()
+                try:
+                    util.git(["merge", "-q", "--ff-only", "--no-overwrite-ignore", tip], src, timeout=30)
+                except RuntimeError as error:
+                    self.deploy_refused(src, tip, str(error))
+                    return
+                self.say(f"deploy: {paths.short_path(src)} fast forwarded to {tip} ({subject})")
+
+    def deploy_ready(self, src: Path, base: str, tip: str) -> bool:
+        reason = deploy_refusal(src, base, tip)
+        if reason:
+            self.deploy_refused(src, tip, reason)
+        return reason == ""
+
+    def deploy_refused(self, src: Path, tip: str, reason: str) -> None:
+        key = (tip, reason)
+        if key not in self.deploy_refusals:
+            self.deploy_refusals.add(key)
+            self.say(f"deploy: {paths.short_path(src)} left alone for {tip} ({reason})")
 
     def watch_alerts(self) -> None:
         due = {k: v for k, v in self.failing.items()
@@ -814,7 +898,8 @@ class Server:
         util.write_json(control.BEAT_FILE, {
             "schema": foundation.LATEST,
             "db": db,
-            "pid": os.getpid(), "engine": codebase.STAMP, "at": at, "started": util.iso(self.started), "ticks": self.ticks,
+            "pid": os.getpid(), "engine": codebase.STAMP, "checkout_head": codebase.checkout_head(),
+            "at": at, "started": util.iso(self.started), "ticks": self.ticks,
             "tick_seconds": TICK_SECONDS, "loops": len(live), "off": len(every_loop) - len(live),
             "broken": {x.name: x.error for x in every_loop if x.error}, "pending": pending,
             "running": running, "poll_errors": dict(self.errors),

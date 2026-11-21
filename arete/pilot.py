@@ -24,7 +24,7 @@ BRANCH = "main"
 DOC = "README.md"
 TASK_TITLE = "Correct one README line"
 TASK_KIND = "fix"
-CHECK = {"context": "arete-checks", "app_id": 15368}
+CHECK = gh.ARETE_CHECK
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 PILOT_TASK = re.compile(r"t-[0-9a-f]{32}\Z")
 
@@ -139,10 +139,12 @@ def check_origin(repo: Path, github: str, *, until: float | None = None) -> None
                 "the checkout origin must have exactly one approved GitHub fetch and push URL")
 
 
-def have_checkout(repo: Path, base: str) -> None:
+def have_checkout(repo: Path, *allowed_heads: str) -> str:
+    head = git(repo, "rev-parse", "HEAD").strip()
     require(git(repo, "symbolic-ref", "--short", "HEAD").strip() == BRANCH
-            and git(repo, "rev-parse", "HEAD").strip() == base
+            and head in allowed_heads
             and not git(repo, "status", "--porcelain"), "the deployment checkout changed or is dirty")
+    return head
 
 
 def require_exact_tree(repo: Path, signal: Signal, tree: str, expected: str, *, until: float | None = None) -> None:
@@ -467,7 +469,7 @@ def execute(cfg: config.Config, repo: config.Repo, layer: config.RepoLayer, sign
 
         def ci_on_main():
             require(origin(signal.github) == merged, "main moved before deployment")
-            return gh.merge_ci_passed(signal.github, merged, required=CHECK)
+            return gh.push_ci_state(signal.github, merged, BRANCH) == "pass"
 
         wait_for(deadline, ci_on_main, "the merged commit has no passing CI before the deadline", interval=5)
         with util.repo_lock(repo.path):
@@ -479,17 +481,21 @@ def execute(cfg: config.Config, repo: config.Repo, layer: config.RepoLayer, sign
                     "main no longer names the tested single-parent release tree")
         with slots.admitting(), util.repo_lock(repo.path):
             check_policy()
-            have_checkout(repo.path, signal.base)
-            require(not any(r["kind"] == "pipeline" for r in runs.runs_marked_running()),
-                    "a pipeline is running; leave the checkout alone")
-            healthy()
+            head = have_checkout(repo.path, signal.base, merged)
+            if head == signal.base:
+                require(not any(r["kind"] == "pipeline" for r in runs.runs_marked_running()),
+                        "a pipeline is running; leave the checkout alone")
+                healthy()
             require(origin(signal.github) == merged, "main moved before the checkout could be updated")
             protected(signal.github)
-            require(gh.merge_ci_passed(signal.github, merged, required=CHECK), "release CI changed before deployment")
+            require(gh.push_ci_state(signal.github, merged, BRANCH) == "pass", "release CI changed before deployment")
             check_run()
-            record("deployment_requested")
             in_time()
-            git(repo.path, "merge", "--ff-only", merged)
+            if head == signal.base:
+                have_checkout(repo.path, head)
+                record("deployment_requested")
+                in_time()
+                git(repo.path, "merge", "--ff-only", "--no-overwrite-ignore", merged)
             have_checkout(repo.path, merged)
             deployed_at = util.iso()
             record("deployed_waiting_for_health", deployed_at=deployed_at)
