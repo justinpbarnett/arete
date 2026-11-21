@@ -130,8 +130,7 @@ class PushedPrDraftTests(unittest.TestCase):
                                "mergeStateStatus": "DRAFT" if self.draft else "CLEAN", "mergeable": "MERGEABLE"})
         elif args[0] == "api":
             if "/check-runs?" in args[1]:
-                sha = args[1].split("/")[4]
-                return json.dumps([{"check_runs": [{"head_sha": sha, "status": "completed", "conclusion": "success"}]}])
+                return json.dumps([{"check_runs": [{"status": "completed", "conclusion": "success"}]}])
             if "/statuses?" in args[1]:
                 return "[[]]"
             if args[:3] == ["api", "-X", "PUT"]:

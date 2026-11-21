@@ -4,6 +4,7 @@ import json
 import time
 from contextlib import contextmanager
 from dataclasses import asdict
+from math import inf
 from pathlib import Path
 
 from . import (
@@ -13,6 +14,7 @@ from . import (
     factory,
     flows,
     gh,
+    journeys,
     owner_asks,
     pilot,
     pipeline,
@@ -38,6 +40,8 @@ STATE_FIELDS = ("plan_text", "goal", "estimate", "left_for_a_person", "build_sum
 def policy_fingerprint(cfg, layer, closed_context):
     effective = asdict(layer)
     effective.pop("factory_path")
+    if layer.verify:
+        effective["verify"] = layer.verify.policy()
     return ledger.digest(json.loads(json.dumps({"layer": effective, "config": asdict(cfg),
                                                 "closed_context": closed_context}, default=str)))
 
@@ -46,7 +50,7 @@ class Controller:
     def __init__(self, flow):
         self.flow, self.job = flow, flow.ctx
         self.run = self.job.run
-        self.workers, self.progress = {}, {}
+        self.workers, self.progress, self.reported = {}, {}, {}
         self.lease = ledger.acquire(self.run.id, flow.continues,
                                     {"protocol": PROTOCOL, "mode": self.run.path, "evidence": {}})
         self.data = ledger.snapshot(self.lease)["data"]
@@ -59,7 +63,7 @@ class Controller:
         self.run.step_overrides = {role: {**inherited.get(role, {}), **self.run.step_overrides.get(role, {})}
                                   for role in inherited.keys() | self.run.step_overrides.keys()}
         self.catalog = None
-        self.last_progress, self.ending = time.monotonic(), None
+        self.last_progress, self.ending = -inf, None
 
     def persist(self):
         self.data["job"] = {name: getattr(self.job, name) for name in STATE_FIELDS}
@@ -268,6 +272,7 @@ class Controller:
         snapshot = ledger.snapshot(self.lease)
         for worker in self.workers.values():
             self.progress[worker.action] = worker.observations()
+            self.reported[worker.action] = worker.report[0]
         return {"version": PROTOCOL, "state_version": snapshot["version"], "cursor": snapshot["version"],
                 "root": self.lease.root,
                 "task": self.catalog.read("task", 0, 8000), "owner_context": self.run.story[-8:],
@@ -333,7 +338,7 @@ class Controller:
             ledger.reject(self.lease, turn, error)
             self.data["error"] = error
             self.persist()
-            raise workspace.RunFailed(error)
+            raise workspace.RunFailed(error, recovery=result.get("recovery"))
         try:
             response = result.get("structured")
             if response is None:
@@ -386,6 +391,8 @@ class Controller:
         inputs = {"goal": goal, "context": contexts, "plan": self.job.plan_text, "checks": self.job.checks,
                   "denied": prompt_loader.code_list(diffguard.denied_paths(self.job.layer)),
                   "estimate": self.job.estimate, "verify": self.job.goal, "triage": self.job.triage, **args["inputs"]}
+        if name == "plan" and self.job.layer.verify:
+            inputs["journeys"] = journeys.guidance(self.job.layer.verify.feature_map, planning=True)
         if "verify" in args["inputs"] and pipeline.triage_checks(self.job.approval):
             inputs["verify"] = pipeline.triage_goal(str(inputs["verify"]), self.job.approval)
         prompt = self.job.brief.prompt("delegate" if name in ("delegate", "investigate") else name, **inputs)
@@ -416,6 +423,9 @@ class Controller:
                         self.run.budget.charge(message["step"], message["role"])
                     grant = self.run.launch_gate(message["step"], message["role"], message["route"]) \
                         if self.run.launch_gate else None
+                    seconds = grant.get("timeout") if isinstance(grant, dict) else None
+                    if type(seconds) in (int, float) and seconds > 0:
+                        worker.deadline = min(worker.deadline, time.monotonic() + seconds)
                     worker.allow(grant)
                 elif message.get("event") in ("result", "error"):
                     worker.close()
@@ -452,6 +462,42 @@ class Controller:
                                   "error": "worker ended without a durable result", "usage_unknown": True})
                 changed = True
         return changed
+
+    def wait_workers(self, timeout_seconds):
+        started = time.monotonic()
+        run_deadline = self.run.budget.run_deadline() if self.run.budget else inf
+        progress_at = self.last_progress + self.policy.progress_seconds
+        slept = False
+        while self.workers:
+            if time.monotonic() >= run_deadline:
+                raise runlimits.Parked(self.run.budget.reason())
+            if self.collect():
+                break
+            deadline = min(run_deadline, min(worker.deadline for worker in self.workers.values()))
+            if timeout_seconds and timeout_seconds < deadline - started:
+                deadline = started + timeout_seconds
+            now = time.monotonic()
+            if now >= run_deadline:
+                raise runlimits.Parked(self.run.budget.reason())
+            if now >= progress_at or now >= deadline:
+                reports = {}
+                for key, worker in self.workers.items():
+                    self.progress[key] = worker.observations()
+                    count, report = worker.report
+                    if count > self.reported.get(key, 0):
+                        reports[key] = report
+                        self.reported[key] = count
+                if reports:
+                    self.last_progress = now
+                    return {"active": list(self.workers), "progress": reports}
+                progress_at = now + 1
+            if now >= deadline:
+                return {"active": list(self.workers), "reason": "timeout" if slept else "deadline"}
+            delay = min(0.05, deadline - time.monotonic())
+            if delay > 0:
+                time.sleep(delay)
+                slept = True
+        return {"active": list(self.workers)}
 
     @contextmanager
     def selected(self, setting):
@@ -536,6 +582,18 @@ class Controller:
             except pilot.Held as error:
                 raise runlimits.Parked(str(error)) from error
 
+    def failure_recovery(self):
+        actions = (action for action in ledger.actions(self.lease) if action["run"] == self.run.id)
+        for action in sorted(actions, key=lambda action: action["result"]["revision"], reverse=True):
+            op, result = action["op"], action["result"]
+            if op in ("worker.start", "worker.continue") and result.get("writing") is True:
+                return result.get("recovery") if action["state"] == "failed" and result.get("event") == "result" else None
+            if (op == "checks.run" and result.get("passed") is False
+                    or op == "verification.run" and result.get("verdict") == "fail"
+                    or op == "review.run" and result.get("verdict") == "request_changes"):
+                return None
+        return None
+
     def perform(self, action):
         args, op = action["request"], action["op"]
         if op == "worker.start":
@@ -573,15 +631,7 @@ class Controller:
                 raise ValueError("invalid observation bounds")
             return self.observe(args["limit"], args["after"])
         if op == "run.wait":
-            until = time.monotonic() + args["timeout_seconds"]
-            while self.workers and time.monotonic() < until:
-                if self.collect():
-                    break
-                progress = {key: worker.observations() for key, worker in self.workers.items()}
-                if progress != self.progress and time.monotonic() - self.last_progress >= self.policy.progress_seconds:
-                    self.progress, self.last_progress = progress, time.monotonic()
-                time.sleep(0.05)
-            return {"active": list(self.workers)}
+            return self.wait_workers(args["timeout_seconds"])
         self.barrier()
         if op == "checks.run":
             self.data.setdefault("evidence", {}).pop("checks", None)
@@ -632,7 +682,8 @@ class Controller:
                     raise ValueError("noop cannot discard an implementation diff")
                 self.ending = flows.finish(self.flow, "nothing", summary=self.job.build_summary or "No change needed.")
             else:
-                self.ending = flows.finish(self.flow, "failed", why="the orchestrator stopped without delivery")
+                self.ending = flows.finish(self.flow, "failed", why="the orchestrator stopped without delivery",
+                                           recovery=self.failure_recovery())
             return {"reason": args["reason"]}
         raise ValueError("unknown orchestration operation")
 
@@ -763,7 +814,8 @@ def single_worker(flow):
                     controller.collect()
                     time.sleep(0.05)
                 if any(a["state"] in ("failed", "interrupted") for a in ledger.actions(controller.lease)):
-                    return flows.finish(flow, "failed", why="single-worker execution did not pass its required gates")
+                    return flows.finish(flow, "failed", why="single-worker execution did not pass its required gates",
+                                        recovery=controller.failure_recovery())
                 if controller.ending:
                     return controller.ending
         return flows.finish(flow, "failed", why="single-worker execution did not deliver")

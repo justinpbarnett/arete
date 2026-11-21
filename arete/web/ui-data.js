@@ -1,4 +1,37 @@
 import { prepareWrite, sendWrite } from "./ui-write.js";
+import { webFetch } from "./ui-request.js";
+import { cursor } from "./ui-snapshot.js";
+
+const snapshots = new Map();
+
+export function clearSnapshots() { snapshots.clear(); }
+
+export async function snapshotRead(url, signal) {
+  const saved = snapshots.get(url);
+  const headers = saved?.etag ? { "If-None-Match": saved.etag } : {};
+  const response = await webFetch(url, { headers, signal, cache: "no-store" });
+  const seq = response.headers.get("Arete-Seq");
+  if (response.status === 304 && saved) return { data: saved.data, unchanged: true };
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    return { seq, error: { status: response.status, message: body?.detail ?? body?.error ?? `HTTP ${response.status}` } };
+  }
+  const body = await response.json().catch(() => null);
+  const position = seq ?? body?.seq;
+  if (!body || typeof body !== "object" || Array.isArray(body) || !cursor(position)) {
+    return { error: { status: response.status, message: "Malformed snapshot" } };
+  }
+  const data = { ...body, seq: position };
+  if (!signal.aborted) {
+    snapshots.delete(url);
+    snapshots.set(url, { etag: response.headers.get("ETag"), data });
+    if (snapshots.size > 32) snapshots.delete(snapshots.keys().next().value);
+  }
+  return { data };
+}
+
+export const screen = (view, id = "") => `/api/v1/screen?${new URLSearchParams(id ? { view, id } : { view })}`;
+export const lineStream = (run, after) => `/api/v1/line-stream?${new URLSearchParams({ run, after })}`;
 
 export function visit(row) {
   return sendWrite(prepareWrite("/api/usage",{ kind: "visit", ...row }, null, { keepalive: true })).catch(() => null);

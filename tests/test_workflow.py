@@ -1,8 +1,10 @@
 import json
 import subprocess
+import tempfile
 import tomllib
 import unittest
 from contextlib import nullcontext
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -10,7 +12,10 @@ from types import SimpleNamespace
 from typing import ClassVar
 from unittest import mock
 
-from arete import config, diffguard, evals, gh, jev, miner, pipeline, util, verify
+from arete import (
+    config, diffguard, evals, factory, flows, gh, jev, mergecheck, miner, orchestration, pipeline, sandbox,
+    tracker, util, verify, workspace,
+)
 from arete.agent import Result
 from arete.review import Review
 
@@ -25,6 +30,229 @@ class AskConfigTests(unittest.TestCase):
         self.assertEqual(config.ask_table(tomllib.loads("expire_days = 0.5")).expire_days, 0.5)
         longest = config.ask_table({"expire_days": config.MAX_ASK_EXPIRE_DAYS}).expire_days
         self.assertTrue(util.iso(util.now() - timedelta(days=longest)))
+
+
+class JourneyVerificationTests(unittest.TestCase):
+    def setUp(self):
+        self.example = Path(__file__).resolve().parents[1] / "docs/examples/product-verification"
+        self.ticket = tracker.Ticket("1", "#1", "Check journey:verifier-prompt-inputs")
+        self.run = mock.Mock(tid=1, repo=config.Repo("arete", self.example), dir=self.example,
+                             add_dirs=[], owner_note="")
+        self.run.time_for.side_effect = lambda seconds: seconds
+        self.run.agent.return_value = SimpleNamespace(ok=True, structured={
+            "verdict": "pass", "summary": "The configured journey passed.", "checks": [],
+        })
+        self.work = pipeline.TicketWork(config.Config(), self.run, self.ticket, self.example, [],
+                                        config.load_layer(self.example), 60, "test workspace")
+        self.scratch = self.enterContext(mock.patch.object(verify.scratch, "make"))
+        self.scratch.return_value = SimpleNamespace(root=str(self.example / "scratch"))
+        self.enterContext(mock.patch.object(verify.scratch, "end", return_value=("", [], [])))
+        self.enterContext(mock.patch.object(pipeline, "run_folder", return_value=self.example / "evidence"))
+        self.enterContext(mock.patch.object(pipeline, "restore_worktrees"))
+
+    def verify(self):
+        return pipeline.use_product(self.work, "verify", "verify", goal="Check the CLI output.", summary="",
+                                    diff="")
+
+    def passing_driver(self):
+        process = mock.Mock(returncode=0, communicate=mock.Mock(return_value=("Driver observed valid prompt", "")))
+        self.enterContext(mock.patch.object(verify.scratch, "service_command", return_value=["driver"]))
+        self.enterContext(mock.patch.object(verify.scratch, "spawn", return_value=process))
+        self.enterContext(mock.patch.object(util, "stop_group"))
+
+    def test_passing_driver_cannot_supply_missing_verifier_checks(self):
+        self.ticket.body = "Also inspect the catalog."
+        self.work.layer.trust_level = "automerge"
+        self.run.agent.return_value.runner = "codex"
+        self.enterContext(mock.patch.object(pipeline, "verification_trees", return_value={"": "candidate"}))
+        self.passing_driver()
+
+        result = self.verify()
+
+        self.assertEqual(result.verdict, "blocked")
+        self.assertEqual(result.blocked_by, "the verifier said pass but listed no checks")
+        self.assertEqual(result.native_trees, {})
+        self.assertIn("Driver observed valid prompt", self.run.save.call_args.args[1])
+
+    def test_merge_check_replays_numbered_verifier_step_without_the_driver(self):
+        self.passing_driver()
+        self.run.agent.return_value.structured["checks"] = [
+            {"what": "1. Inspect the catalog", "how": "echo catalog", "saw": "catalog", "passed": True},
+            {"what": "journey:verifier-prompt-inputs", "how": "echo prompt", "saw": "prompt", "passed": True},
+        ]
+
+        result = self.verify()
+        self.assertEqual(result.verdict, "pass")
+        report = self.run.save.call_args.args[1]
+        self.assertIn(self.work.layer.verify.drivers["prompt-inputs"], report)
+        self.assertIn("Driver observed valid prompt", report)
+        with tempfile.NamedTemporaryFile(suffix=".md") as saved:
+            path = Path(saved.name)
+            path.write_text(report)
+            with mock.patch.object(mergecheck, "reports", return_value=("build", path)):
+                steps = mergecheck.report_steps({"run_id": "build", "pr": 646})
+
+        self.assertEqual([step.goal(n) for n, step in enumerate(steps, 1)], [
+            "1. [build step 1] Inspect the catalog: echo catalog",
+            "2. [build step 2] journey:verifier-prompt-inputs: echo prompt",
+        ])
+
+    def test_linked_map_cannot_redirect_an_owner_configured_binding(self):
+        with (tempfile.NamedTemporaryFile(suffix=".toml") as source,
+              tempfile.NamedTemporaryFile(suffix=".toml") as linked):
+            config_file, map_file = Path(source.name), Path(linked.name)
+            configured = (self.example / "config.toml").read_text().replace("feature-map.toml", map_file.name)
+            config_file.write_text(configured + '\nother = "echo other"\n')
+            map_file.write_text((self.example / "feature-map.toml").read_text())
+            journey = config.load_layer(self.example, source_file=config_file).verify.feature_map["verifier-prompt-inputs"]
+            self.assertEqual(journey.driver, "prompt-inputs")
+
+            with map_file.open("a") as stream:
+                stream.write('driver = "other"\n')
+            with self.assertRaisesRegex(ValueError, r"bind drivers in \[verify\.journey_drivers\]"):
+                config.load_layer(self.example, source_file=config_file)
+
+    def test_orchestrated_plan_worker_sees_the_configured_journey(self):
+        checkout = workspace.Checkout("", "arete", self.example, self.example, "main")
+        job = flows.Job(self.work.cfg, self.run, self.example, ticket=self.ticket, layer=self.work.layer,
+                        checkouts=[checkout])
+        controller = orchestration.Controller.__new__(orchestration.Controller)
+        controller.job, controller.run, controller.lease = job, self.run, "fixture"
+        controller.workers, controller.data, controller.policy = {}, {}, config.Orchestration()
+        controller.catalog = mock.Mock()
+        setting = SimpleNamespace(step="plan", tools=("Read",), runner="codex", model="fixture")
+        controller.catalog.worker.return_value = setting, "plan", False
+        args = {"depends_on": [], "tool_bundle": "read", "context_refs": [], "goal": "Plan", "inputs": {}}
+        with (mock.patch.object(orchestration.ledger, "actions", return_value=[]),
+              mock.patch.object(orchestration.ledger, "transition"),
+              mock.patch.object(orchestration.delegation, "Worker"),
+              mock.patch.object(orchestration.delegation, "request") as request):
+            controller.worker_start({"id": "plan-1"}, args)
+
+        prompt = request.call_args.args[2]
+        self.assertIn("## Product feature map\n", prompt)
+        self.assertIn("`journey:verifier-prompt-inputs` (configured driver available)", prompt)
+        self.assertIn("Read the verification prompt's JSON record.", prompt)
+
+    def test_stored_evidence_requires_the_same_ticket_selection_with_a_map(self):
+        job = flows.Job(self.work.cfg, self.run, self.example, ticket=self.ticket, layer=self.work.layer,
+                        goal="Check the CLI output.")
+        passing = factory.Outcome("pass", data={"policy": job.policy("verify", {})})
+        self.ticket.body = "Repeat journey:verifier-prompt-inputs."
+        self.assertTrue(job.accepts("verify", passing, {}))
+        self.ticket.title, self.ticket.body = "Check prompt inputs", ""
+        self.assertFalse(job.accepts("verify", passing, {}))
+
+        job.layer.verify = config.Verify(url="")
+        passing.data["policy"] = job.policy("verify", {})
+        self.ticket.body = "Check journey:verifier-prompt-inputs."
+        self.assertTrue(job.accepts("verify", passing, {}))
+
+    def test_requested_driver_runs_after_probes_in_journey_order_and_reports_observations(self):
+        self.ticket.body = "Also check journey:another-journey and journey:verifier-prompt-inputs."
+        self.run.agent.return_value.structured["checks"] = [
+            {"what": "Inspect the catalog", "how": "echo catalog", "saw": "catalog", "passed": True},
+        ]
+        configured = self.work.layer.verify
+        configured.feature_map["another-journey"] = replace(configured.feature_map["verifier-prompt-inputs"],
+                                                           driver="another-driver")
+        configured.drivers["another-driver"] = "echo {port} {scratch}"
+        self.enterContext(mock.patch.object(verify.browser, "free_port", return_value=4242))
+        configured.probes["ready"] = "echo ready"
+        spawn = self.enterContext(mock.patch.object(verify.scratch, "spawn"))
+        spawn.side_effect = [mock.Mock(returncode=0, communicate=mock.Mock(return_value=(out, "")))
+                             for out in ("ready", "first output", "second output")]
+        confined = self.enterContext(mock.patch.object(verify.scratch, "service_command", side_effect=lambda _, cmd: [cmd]))
+        self.enterContext(mock.patch.object(util, "stop_group"))
+
+        result = self.verify()
+
+        self.assertEqual(result.verdict, "pass")
+        self.assertEqual([c["what"] for c in result.checks], [
+            "ready", "journey:another-journey", "journey:verifier-prompt-inputs", "Inspect the catalog",
+        ])
+        self.assertEqual(result.checks[2]["saw"], "exit 0: second output")
+        self.assertEqual([call.args[1] for call in confined.call_args_list],
+                         ["echo ready", f"echo 4242 {self.scratch.return_value.root}",
+                          configured.drivers["prompt-inputs"]])
+        self.assertTrue(all(call.kwargs["actor_confined"] for call in spawn.call_args_list))
+        self.assertIn("Expected outcome", self.run.agent.call_args.args[1])
+        self.assertIn("exit 0: second output", self.run.agent.call_args.args[1])
+        self.assertIn("exit 0: second output", self.run.save.call_args.args[1])
+
+    def test_assertion_failure_and_unavailable_command_have_distinct_results(self):
+        self.enterContext(mock.patch.object(verify.scratch, "service_command", return_value=["driver"]))
+        spawn = self.enterContext(mock.patch.object(verify.scratch, "spawn"))
+        self.enterContext(mock.patch.object(util, "stop_group"))
+        for code, stdout, stderr, verdict in ((1, "", "unexpected product response: EPERM", "fail"),
+                                               (1, "", "sandbox-exec: confinement unavailable", "blocked"),
+                                               (127, "", "driver: command not found", "blocked")):
+            with self.subTest(code=code, stderr=stderr):
+                spawn.return_value = mock.Mock(returncode=code, communicate=mock.Mock(return_value=(stdout, stderr)))
+
+                result = self.verify()
+
+                self.assertEqual(result.verdict, verdict)
+                self.assertEqual(result.finished, verdict == "fail")
+                self.assertIn("journey:verifier-prompt-inputs", result.summary)
+                self.assertEqual(result.checks[0]["saw"], f"exit {code}: {stdout or stderr}")
+        self.run.agent.assert_not_called()
+
+    def test_driver_timeout_reports_the_journey_and_stops_the_process_group(self):
+        self.enterContext(mock.patch.object(verify.scratch, "service_command", return_value=["driver"]))
+        process = mock.Mock()
+        process.communicate.side_effect = subprocess.TimeoutExpired("driver", 1)
+        self.enterContext(mock.patch.object(verify.scratch, "spawn", return_value=process))
+        stop = self.enterContext(mock.patch.object(util, "stop_group"))
+
+        result = self.verify()
+
+        self.assertEqual(result.verdict, "blocked")
+        self.assertIn("journey:verifier-prompt-inputs", result.blocked_by)
+        self.assertIn("Timed out waiting for the driver", result.checks[0]["saw"])
+        stop.assert_called_once_with(process)
+        self.run.agent.assert_not_called()
+
+    def test_driver_requires_trusted_scratch(self):
+        self.scratch.side_effect = sandbox.ConfinementUnavailable("fixture authority unavailable")
+        with mock.patch.object(verify, "run_probes") as commands:
+            result = self.verify()
+        self.assertEqual(result.verdict, "blocked")
+        self.assertEqual(result.blocked_by, "fixture authority unavailable")
+        self.assertIn("journey:verifier-prompt-inputs", result.summary)
+        commands.assert_not_called()
+        self.run.agent.assert_not_called()
+
+    def test_map_guides_the_verifier_without_scheduling_an_unrequested_driver(self):
+        self.ticket.title = "Check the verifier prompt inputs"
+        self.run.agent.return_value.structured["checks"] = [
+            {"what": "Verify prompt inputs", "how": "Open the prompt listing", "saw": "Valid prompt", "passed": True},
+        ]
+        with mock.patch.object(verify, "run_probes") as commands:
+            result = self.verify()
+        self.assertEqual(result.verdict, "pass")
+        self.assertIn("journey:verifier-prompt-inputs", self.run.agent.call_args.args[1])
+        commands.assert_not_called()
+
+    def test_unknown_reference_blocks_only_when_map_is_configured(self):
+        self.ticket.title = "Check journey:missing"
+        result = self.verify()
+        self.assertEqual(result.verdict, "blocked")
+        self.assertEqual(result.blocked_by, "journey:missing")
+        self.scratch.assert_not_called()
+        self.run.agent.assert_not_called()
+
+        self.work.layer.verify = config.Verify(url="")
+        self.scratch.side_effect = OSError("fixture authority unavailable")
+        self.run.agent.return_value.structured["checks"] = [
+            {"what": "Ordinary CLI check", "how": "echo ready", "saw": "ready", "passed": True},
+        ]
+        with mock.patch.object(verify, "run_probes") as commands:
+            result = self.verify()
+        self.assertEqual(result.verdict, "pass")
+        self.assertEqual(result.checks[0]["what"], "Ordinary CLI check")
+        self.assertNotIn("Product feature map", self.run.agent.call_args.args[1])
+        commands.assert_not_called()
 
 
 class ReviewTests(unittest.TestCase):
@@ -62,7 +290,6 @@ class MinerLifecycleTests(unittest.TestCase):
     BASE = "a" * 40
     HEAD = "b" * 40
     UPDATED = "c" * 40
-    MERGED = "d" * 40
     BRANCH = "arete/miner-20261120"
     URL = "https://github.com/example/arete/pull/8"
     PROMPT = "arete/prompts/build.md"
@@ -74,30 +301,26 @@ class MinerLifecycleTests(unittest.TestCase):
         self.base_name = "main"
         self.base = self.BASE
         self.head = self.HEAD
-        self.checkout = self.BASE
         self.status = "success"
         self.reported_ci_head = ""
         self.behind = False
         self.merged = False
-        self.merge_visible = True
-        self.merge_visible_after = 0
-        self.merge_fetches = 0
+        self.during_merge = lambda: None
         self.calls = []
+        self.ci_reads = []
         self.prs = []
         self.stored = []
-        self.readiness = []
-        self.elapsed = 0.0
-        self.green_at = 0.0
         self.root = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        self.layer = config.RepoLayer(self.root, trust_level="automerge")
+        self.enterContext(mock.patch.object(config, "load_layer", return_value=self.layer))
         self.enterContext(mock.patch.multiple(
             gh, gh_json=self.github_read, gh=self.github_write, me=lambda: "operator",
             pr_comment=lambda url, body: self.calls.append(("comment", url, body)),
+            find_issue_comment_marker=lambda repo, number, marker: next(
+                (call[1] for call in self.calls if call[0] == "comment" and marker in call[2].splitlines()), ""),
         ))
-        self.enterContext(mock.patch.object(miner.time, "monotonic", side_effect=lambda: self.elapsed))
-        self.sleep = self.enterContext(mock.patch.object(miner.time, "sleep", side_effect=self.advance))
         self.git_mock = self.enterContext(mock.patch.object(miner, "git", side_effect=self.git))
         self.enterContext(mock.patch.object(miner.paths, "RUNS_DIR", self.root / "runs"))
-        self.enterContext(mock.patch.object(miner.paths, "prompt_merges_dir", return_value=self.root / "pending"))
         self.enterContext(mock.patch.object(util, "repo_lock", return_value=nullcontext()))
         self.enterContext(mock.patch.object(util, "git_records", return_value=["M", self.PROMPT]))
         self.diff = self.enterContext(mock.patch.object(diffguard, "between", return_value=diffguard.Diff({self.PROMPT: 2})))
@@ -116,58 +339,42 @@ class MinerLifecycleTests(unittest.TestCase):
     def forget_applied(self, url, status):
         self.stored = [p for p in self.stored if p["pr_url"] != url]
 
-    def advance(self, seconds):
-        self.elapsed += seconds
-
     def github_read(self, args, **kwargs):
         if args[:2] == ["repo", "view"]:
             self.assertEqual(args[2], self.repo.github)
             return {"defaultBranchRef": {"name": self.base_name}}
-        if args[:2] == ["pr", "list"]:
-            self.assertEqual(args[args.index("--repo") + 1], self.repo.github)
-            return self.prs
+        if args[:2] == ["api", f"repos/{self.repo.github}/issues?state=open&labels=arete-miner&per_page=100"]:
+            self.assertEqual(args[2:], ["--paginate", "--slurp"])
+            return [self.prs]
         if args[:3] == ["pr", "view", self.url]:
-            return {"baseRefName": self.base_name, "mergeCommit": {"oid": self.MERGED},
-                    "state": "MERGED" if self.merged else "OPEN", "mergedAt": util.iso() if self.merged else None}
-        if args[:3] == ["pr", "view", "8"]:
-            self.assertEqual(args[args.index("--repo") + 1], self.repo.github)
-            state = "UNSTABLE" if self.elapsed < self.green_at else "CLEAN"
-            self.readiness.append(state)
-            return {"state": "OPEN", "isDraft": False, "baseRefName": self.base_name, "baseRefOid": self.base,
-                    "headRefOid": self.head, "mergeStateStatus": state, "mergeable": "MERGEABLE", "title": "Prompt fix"}
+            return {"state": "MERGED" if self.merged else "OPEN"}
         if args == ["api", f"repos/{self.repo.github}/pulls/8"]:
             return {"state": "open", "draft": False, "user": {"login": "operator"}, "body": "Why: fixes the cited failure.",
                     "labels": [{"name": miner.MINER_LABEL}],
                     "base": {"sha": self.base, "ref": self.base_name},
                     "head": {"sha": self.head, "ref": self.BRANCH, "repo": {"full_name": self.repo.github}}}
-        if args[0] == "api" and "/check-runs?" in args[1]:
-            self.assertTrue(args[1].startswith(f"repos/{self.repo.github}/commits/"))
-            sha = args[1].split("/")[4]
-            self.calls.append(("ci", sha))
-            return [{"check_runs": [{"head_sha": self.reported_ci_head or sha,
-                                     "status": "in_progress" if self.status == "pending" else "completed",
-                                     "conclusion": self.status}]}]
-        if args[0] == "api" and "/statuses?" in args[1]:
-            return [[]]
         self.fail(f"Unexpected GitHub read {args}")
 
     def github_write(self, args, **kwargs):
-        if args[:3] == ["api", "-X", "PUT"]:
+        checks = f"repos/{self.repo.github}/commits/{self.head}/check-runs?check_name=arete-checks&filter=latest&per_page=100"
+        if args == ["api", checks]:
+            self.assertFalse(kwargs["retry"])
+            self.ci_reads.append(self.head)
+            runs = [{"head_sha": self.reported_ci_head or self.head, "name": miner.MINER_CHECK, "app": {"id": 15368},
+                     "status": "in_progress" if self.status == "pending" else "completed", "conclusion": self.status}]
+            return json.dumps({"check_runs": [] if self.status == "missing" else runs})
+        if args == ["api", "-X", "PUT", f"repos/{self.repo.github}/pulls/8/update-branch", "--input", "-"]:
             self.assertTrue(kwargs["write"])
-            payload = json.loads(kwargs["input"])
-            if args[3].endswith("/update-branch"):
-                self.calls.append(("update", payload))
-                self.head = self.UPDATED
-                self.behind = False
-                return ""
-            self.assertEqual(args[3], f"repos/{self.repo.github}/pulls/8/merge")
-            if self.repo.name == self.cfg.arete_repo:
-                self.assertEqual(len(miner.paths.pending_prompt_merges()), 1)
-            if kwargs["deadline"] is not None:
-                self.assertGreater(kwargs["deadline"], self.elapsed)
-            self.calls.append(("merge", payload))
+            self.calls.append(("update", json.loads(kwargs["input"])))
+            self.head = self.UPDATED
+            self.behind = False
+            return ""
+        if args == ["pr", "merge", "8", "--repo", self.repo.github, "--squash", "--match-head-commit", self.head]:
+            self.assertTrue(kwargs["write"])
+            self.during_merge()
+            self.calls.append(("merge", self.head))
             self.merged = True
-            return json.dumps({"merged": True, "sha": self.MERGED})
+            return ""
         if args[:2] in (["pr", "close"], ["label", "create"], ["pr", "edit"]):
             self.calls.append(tuple(args))
             return ""
@@ -176,8 +383,6 @@ class MinerLifecycleTests(unittest.TestCase):
     def git(self, args, cwd, **kw):
         self.assertEqual(cwd, self.repo.path)
         if args[0] == "fetch":
-            if self.merged:
-                self.merge_fetches += 1
             return ""
         if args == ["rev-parse", f"origin/{self.base_name}", f"origin/{self.BRANCH}"]:
             return f"{self.base}\n{self.head}\n"
@@ -185,24 +390,12 @@ class MinerLifecycleTests(unittest.TestCase):
             return ("e" * 40 if self.behind else self.base) + "\n"
         if args[0] == "show":
             return "Rules for ${goal}"
-        if args == ["branch", "--show-current"]:
-            return "main\n"
-        if args == ["merge-base", self.MERGED, "origin/main"] and self.merged:
-            return self.MERGED + "\n" if self.merge_visible and self.merge_fetches >= self.merge_visible_after else ""
-        if args == ["merge-base", self.MERGED, "HEAD"]:
-            return self.MERGED + "\n" if self.checkout == self.MERGED else ""
-        if args == ["merge", "-q", "--ff-only", "origin/main"] and self.merged:
-            self.calls.append(("catch-up",))
-            self.checkout = self.MERGED
-            return ""
-        if args == ["rev-parse", "HEAD", "origin/main"] and self.merged:
-            return f"{self.checkout}\n{self.MERGED}\n"
         self.fail(f"Unexpected Git command {args}")
 
-    def decide(self, wait=10):
-        return miner.decide_pr(self.cfg, "min-test", self.repo, self.url, fresh=True, deadline=self.elapsed + wait)
+    def decide(self):
+        return miner.decide_pr(self.cfg, "min-test", self.repo, self.url)
 
-    def run_miner(self, *, proposals=(), dry_run=False, apply=True, deadline=None, apply_repo=None):
+    def run_miner(self, *, proposals=(), dry_run=False, apply=True):
         self.enterContext(mock.patch.multiple(
             miner, collect=mock.DEFAULT, collect_runs=mock.DEFAULT,
             render_events=mock.DEFAULT, proposal_status=mock.DEFAULT, apply_repo=mock.DEFAULT,
@@ -212,7 +405,6 @@ class MinerLifecycleTests(unittest.TestCase):
         miner.render_events.return_value = ""
         miner.proposal_status.return_value = "pending", ""
         miner.apply_repo.return_value = self.url, list(proposals)
-        miner.apply_repo.side_effect = apply_repo
         self.enterContext(mock.patch.object(miner.auditor, "latest_findings", return_value="(none)"))
         self.enterContext(mock.patch.object(miner.insights_store, "feedback_between", return_value=[]))
         self.enterContext(mock.patch.object(miner.jev, "ready", return_value=False))
@@ -221,98 +413,42 @@ class MinerLifecycleTests(unittest.TestCase):
         )))
         self.enterContext(mock.patch.object(miner.record, "settle"))
         now = util.now()
-        return miner._run(self.cfg, "min-test", now - timedelta(days=1), now, True, "", dry_run, apply,
-                          deadline=self.elapsed + 10 if deadline is None else deadline)
+        return miner._run(self.cfg, "min-test", now - timedelta(days=1), now, True, "", dry_run, apply)
 
-    def test_fresh_pr_merges_through_pipeline_path_and_fast_forwards_checkout(self):
+    def test_fresh_pr_merges_at_the_checked_head_without_moving_checkout_or_blocking_admission(self):
         proposal = {"repo": "arete", "layer": "repo", "file": self.PROMPT, "change": "fix prompt"}
-        self.assertEqual(self.run_miner(proposals=[proposal]), 0)
+        self.prs = [{"html_url": self.URL, "pull_request": {}}]
+        with mock.patch.object(pipeline.scratch, "process_ids", return_value=set()), mock.patch.object(
+            pipeline.scratch, "service_labels", return_value=set(),
+        ), mock.patch.object(pipeline.paths, "ensure_dirs"), mock.patch.object(
+            config, "load", return_value=self.cfg,
+        ), mock.patch.object(pipeline, "run_refusal", return_value=(False, "fixture reached admission")) as admission, \
+                mock.patch.object(util, "write_bytes_atomic") as receipt:
+            self.during_merge = lambda: self.assertEqual(pipeline.run_issue(self.repo.name, 7), 1)
+            self.assertEqual(self.run_miner(proposals=[proposal]), 0)
+            admission.assert_called_once_with(self.repo, False)
+            receipt.assert_not_called()
         self.eval.assert_called_once_with(self.cfg, self.repo, self.BASE, self.HEAD)
-        self.assertEqual(self.calls[-3:], [("ci", self.HEAD),
-                                           ("merge", {"sha": self.HEAD, "merge_method": "squash",
-                                                      "commit_title": "Prompt fix (#8)"}), ("catch-up",)])
-        self.assertEqual(self.checkout, self.MERGED)
+        self.assertEqual(self.ci_reads, [self.HEAD])
+        self.assertEqual(self.calls[-1], ("merge", self.HEAD))
+        self.assertEqual({call.args[0][0] for call in self.git_mock.call_args_list}, {"fetch", "rev-parse", "merge-base", "show"})
         self.proposals.assert_called_once_with(self.URL, "merged")
 
-    def test_stale_pr_is_decided_on_noop_run(self):
-        self.prs = [{"createdAt": util.iso(util.now() - age), "url": url}
-                    for age, url in ((timedelta(hours=1), "not due"), (timedelta(hours=48), self.URL))]
+    def test_previous_pr_is_decided_on_noop_run(self):
+        self.prs = [{"html_url": self.URL, "pull_request": {}}]
         self.assertEqual(self.run_miner(), 0)
         miner.runner.run.assert_not_called()
-        self.assertTrue(self.merged)
+        self.assertEqual(self.calls[-1], ("merge", self.HEAD))
 
-    def test_fresh_pr_merges_in_same_run_when_ci_turns_green_after_two_minutes(self):
-        self.green_at = 125
-        proposal = {"repo": "arete", "layer": "repo", "file": self.PROMPT, "change": "fix prompt"}
-        self.assertEqual(self.run_miner(proposals=[proposal], deadline=miner.miner_ci_deadline(self.elapsed)), 0)
-        self.assertEqual(self.elapsed, 125)
-        self.assertEqual(set(self.readiness[:-1]), {"UNSTABLE"})
-        self.assertEqual(self.readiness[-1], "CLEAN")
-        self.assertEqual(self.checkout, self.MERGED)
-
-    def test_second_fresh_pr_checks_ci_after_first_repo_uses_polling_budget(self):
-        second = config.Repo("other", Path("."), github="example/other")
-        second_url = "https://github.com/example/other/pull/8"
-        self.cfg.repos.append(second)
+    def test_deferred_pr_is_retried_on_a_later_run(self):
+        self.prs = [{"html_url": self.URL, "pull_request": {}}]
         self.status = "pending"
-        first = {"repo": self.repo.name, "layer": "repo", "file": self.PROMPT, "change": "fix prompt"}
-        other = {"repo": second.name, "layer": "repo", "file": "CLAUDE.md", "change": "clarify rules"}
-
-        def apply_repo(cfg, run_id, repo, proposals, branch):
-            if repo is second:
-                self.assertEqual(self.elapsed, 10)
-                self.assertFalse(self.merged)
-                self.repo, self.url = second, second_url
-                self.head, self.status = self.UPDATED, "success"
-                self.diff.return_value = diffguard.Diff({"CLAUDE.md": 1})
-            return self.url, proposals
-
-        with mock.patch.object(miner, "settle_open_prs"), mock.patch.object(
-            evals, "compare_harness", return_value=evals.Comparison("eval table", complete=True),
-        ):
-            self.assertEqual(self.run_miner(proposals=[first, other], apply_repo=apply_repo), 0)
-        self.assertEqual(self.elapsed, 10)
-        self.assertIn(("ci", self.HEAD), self.calls)
-        self.assertEqual([call for call in self.calls if call[:1] == ("merge",)], [
-            ("merge", {"sha": self.UPDATED, "merge_method": "squash", "commit_title": "Prompt fix (#8)"}),
-        ])
-        self.assertEqual(self.calls[-2], ("ci", self.UPDATED))
-        self.proposals.assert_called_once_with(second_url, "merged")
-
-    def test_deferred_pr_is_retried_without_new_proposals_before_48_hours(self):
-        proposal = {"repo": "arete", "layer": "repo", "file": self.PROMPT, "change": "fix prompt"}
-        self.status = "pending"
-        self.assertEqual(self.run_miner(proposals=[proposal]), 0)
+        self.assertEqual(self.run_miner(), 0)
         self.assertFalse(self.merged)
-        self.assertEqual(self.elapsed, 10)
-        self.prs = [{"createdAt": util.iso(), "url": self.URL}]
         self.status = "success"
         self.assertEqual(self.run_miner(), 0)
-        miner.runner.run.assert_not_called()
         self.assertTrue(self.merged)
-        self.assertEqual(self.eval.call_count, 2)
-
-    def test_configured_global_skills_use_their_own_repo_for_fresh_and_retry(self):
-        self.repo = config.Repo("shared", Path("."), github="example/skills")
-        self.cfg = config.Config(repos=[self.repo], global_repo=self.repo.name)
-        self.url = "https://github.com/example/skills/pull/8"
-        self.base_name = "trunk"
-        skill = "skills/example/SKILL.md"
-        self.diff.return_value = diffguard.Diff({skill: 2})
-        proposal = {"repo": self.repo.name, "layer": "global", "file": skill, "change": "clarify skill"}
-        self.status = "pending"
-        with mock.patch.object(evals, "compare_harness", return_value=evals.Comparison("eval table", complete=True)) as suite:
-            self.assertEqual(self.run_miner(proposals=[proposal]), 0)
-            self.assertFalse(self.merged)
-            self.assertEqual(self.run_miner(apply=False), 0)
-            suite.assert_called_once_with(self.cfg, self.repo, self.BASE, self.HEAD)
-            self.status = "success"
-            self.assertEqual(self.run_miner(), 0)
-        self.assertEqual(suite.call_args_list, [mock.call(self.cfg, self.repo, self.BASE, self.HEAD)] * 2)
-        self.assertTrue(self.merged)
-        self.eval.assert_not_called()
-        self.assertNotIn(("catch-up",), self.calls)
-        self.proposals.assert_called_once_with(self.url, "merged")
+        self.assertEqual(self.ci_reads, [self.HEAD, self.HEAD])
 
     def test_dry_run_leaves_stale_pr_untouched(self):
         self.prs = [{"createdAt": util.iso(util.now() - timedelta(days=3)), "url": self.URL}]
@@ -320,44 +456,45 @@ class MinerLifecycleTests(unittest.TestCase):
         self.assertFalse(self.calls)
         self.eval.assert_not_called()
 
-    def test_behind_pr_uses_new_head_for_diff_evals_and_ci(self):
+    def test_behind_pr_updates_and_only_reads_the_new_head_ci_next_run(self):
         self.behind = True
-        self.assertEqual(self.decide(), "merged")
-        self.assertEqual(self.calls[0], ("update", {"expected_head_sha": self.HEAD}))
-        self.diff.assert_called_once_with(self.repo.path, self.BASE, self.UPDATED,
-                                          deny=diffguard.ALWAYS_DENY, moves=True)
-        self.eval.assert_called_once_with(self.cfg, self.repo, self.BASE, self.UPDATED)
-        self.assertIn(("ci", self.UPDATED), self.calls)
-        self.assertNotIn(("ci", self.HEAD), self.calls)
-        self.assertEqual(self.calls[-2][1]["sha"], self.UPDATED)
-
-    def test_pending_or_failing_ci_holds_even_with_green_evals(self):
-        for wait in (10, -1):
-            for status in ("pending", "failure"):
-                with self.subTest(status=status, wait=wait):
-                    self.status = status
-                    self.assertIn("no fully passing CI", self.decide(wait=wait))
-                    self.assertFalse(self.merged)
-        self.proposals.assert_not_called()
-
-    def test_updated_pr_cannot_use_passing_ci_from_old_head(self):
-        self.behind = True
+        self.assertEqual(self.decide(), "branch update requested")
+        self.assertEqual(self.calls, [("update", {"expected_head_sha": self.HEAD})])
+        self.eval.assert_not_called()
+        self.assertEqual(self.ci_reads, [])
         self.reported_ci_head = self.HEAD
-        self.assertIn("no fully passing CI", self.decide())
-        self.eval.assert_called_once_with(self.cfg, self.repo, self.BASE, self.UPDATED)
+        self.assertIn("does not have a passing", self.decide())
+        self.assertEqual(self.ci_reads, [self.UPDATED])
         self.assertFalse(self.merged)
+        self.reported_ci_head = ""
+        self.assertEqual(self.decide(), "merged")
+        checked = mock.call(self.cfg, self.repo, self.BASE, self.UPDATED)
+        self.assertEqual(self.eval.call_args_list, [checked, checked])
+        self.assertEqual(self.calls[-1], ("merge", self.UPDATED))
+
+    def test_pending_missing_or_failing_ci_is_read_once_and_leaves_the_pr_open(self):
+        for status in ("pending", "failure", "missing"):
+            with self.subTest(status=status):
+                self.status = status
+                self.ci_reads.clear()
+                self.assertIn("does not have a passing", self.decide())
+                self.assertEqual(self.ci_reads, [self.HEAD])
+                self.assertFalse(self.calls)
+        self.proposals.assert_not_called()
 
     def test_oversized_or_incomplete_pr_stays_open(self):
         self.diff.return_value = diffguard.Diff({self.PROMPT: miner.MAX_MINER_DIFF + 1})
         self.assertIn("over the", self.decide())
         self.eval.assert_not_called()
         self.diff.return_value = diffguard.Diff({self.PROMPT: 2})
-        self.eval.return_value = evals.Comparison("Eval suite could not run.")
+        self.eval.return_value = evals.Comparison("Eval table.", incomplete=["`unavailable-task`"])
+        self.assertIn("incomplete", self.decide())
         self.assertIn("incomplete", self.decide())
         self.assertFalse(self.merged)
         self.assertEqual([call[0] for call in self.calls], ["comment"])
+        self.assertIn("unavailable-task", self.calls[0][2])
 
-    def test_global_rule_in_skill_diff_requires_approval_at_apply_and_merge(self):
+    def test_global_rule_in_skill_diff_requires_approval_at_apply(self):
         self.repo = config.Repo("shared", Path("."), github="example/skills")
         self.cfg = config.Config(repos=[self.repo], global_repo=self.repo.name)
         self.url = "https://github.com/example/skills/pull/8"
@@ -383,82 +520,8 @@ class MinerLifecycleTests(unittest.TestCase):
                                                       deny=diffguard.ALWAYS_DENY, moves=True)
                 else:
                     git.assert_not_called()
-        with mock.patch.object(evals, "compare_harness") as suite:
-            self.assertIn(f"{miner.GLOBAL_RULES} requires owner approval", self.decide())
-        suite.assert_not_called()
         self.assertFalse(self.calls)
 
-    def test_merge_catches_up_when_commit_appears_on_later_fetch(self):
-        self.merge_visible_after = 2
-        self.assertEqual(self.decide(), "merged")
-        self.assertEqual(self.merge_fetches, 2)
-        self.sleep.assert_called_once_with(gh.MERGE_POLL_SECONDS)
-        self.assertEqual(self.checkout, self.MERGED)
-        self.assertFalse(miner.paths.pending_prompt_merges())
-        self.proposals.assert_called_once_with(self.URL, "merged")
-
-    def test_catch_up_exhaustion_keeps_receipt_for_next_run_and_blocks_stale_pipeline(self):
-        self.merge_visible = False
-        with self.assertRaisesRegex(RuntimeError, "does not yet contain merge commit"):
-            self.decide()
-        self.assertEqual(self.elapsed, miner.PROMPT_CATCH_UP_SECONDS)
-        self.assertTrue(self.merged)
-        self.assertEqual(self.checkout, self.BASE)
-        self.proposals.assert_not_called()
-        pending, = miner.paths.pending_prompt_merges()
-        self.assertEqual(json.loads(pending.read_text())["commit"], self.MERGED)
-        with mock.patch.object(config, "load", side_effect=AssertionError("pipeline started on stale prompts")):
-            self.assertEqual(pipeline.run_issue("fixture", 7), 2)
-        self.stored = [{"repo": self.repo.name, "pr_url": self.URL, "file": self.PROMPT, "change": "fix prompt"}]
-        self.assertEqual(self.run_miner(dry_run=True), 0)
-        self.assertEqual(self.run_miner(apply=False), 0)
-        self.assertEqual(miner.paths.pending_prompt_merges(), [pending])
-        self.assertEqual(self.checkout, self.BASE)
-        self.proposals.assert_not_called()
-        self.merge_visible = True
-        self.assertEqual(self.run_miner(), 0)
-        self.assertEqual(self.checkout, self.MERGED)
-        self.assertEqual(miner.paths.pending_prompt_merges(), [])
-        self.proposals.assert_called_once_with(self.URL, "merged")
-
-    def test_prompt_merge_receipt_blocks_new_run_but_allows_next_call_in_active_run(self):
-        run = pipeline.Run(id="pipeline-fixture", repo=self.repo, dir=self.root, tracker=mock.Mock(), tid="7")
-        with mock.patch.object(pipeline.AgentRun, "agent", return_value=Result(ok=True)) as agent:
-            self.assertTrue(run.agent("build", "Build the fix", self.root).ok)
-            miner.PromptMerge(self.URL, self.base_name).save()
-            with mock.patch.object(config, "load", side_effect=AssertionError("pipeline started on stale prompts")):
-                self.assertEqual(pipeline.run_issue("fixture", 8), 2)
-            self.assertTrue(run.agent("verify", "Check the fix", self.root).ok)
-        self.assertEqual([call.args[0] for call in agent.call_args_list], ["build", "verify"])
-
-    def test_no_apply_keeps_an_observed_merge_pending_until_catch_up(self):
-        self.merged = True
-        self.stored = [{"repo": self.repo.name, "pr_url": self.URL, "file": self.PROMPT, "change": "fix prompt"}]
-        self.assertEqual(self.run_miner(apply=False), 0)
-        self.assertEqual(self.checkout, self.BASE)
-        self.proposals.assert_not_called()
-        self.assertTrue(miner.paths.pending_prompt_merges())
-        self.assertEqual(self.run_miner(), 0)
-        self.assertEqual(self.checkout, self.MERGED)
-        self.proposals.assert_called_once_with(self.URL, "merged")
-
-    def test_no_apply_reconciles_contained_manual_merge_without_fetch_or_checkout_write(self):
-        self.merged = True
-        for has_receipt in (False, True):
-            with self.subTest(has_receipt=has_receipt):
-                self.checkout = self.MERGED if not has_receipt else self.BASE
-                self.stored = [{"repo": self.repo.name, "pr_url": self.URL, "file": self.PROMPT, "change": "fix prompt"}]
-                if has_receipt:
-                    self.assertEqual(self.run_miner(apply=False), 0)
-                    self.assertTrue(miner.paths.pending_prompt_merges())
-                    self.checkout = self.MERGED
-                self.proposals.reset_mock()
-                self.git_mock.reset_mock()
-                self.assertEqual(self.run_miner(apply=False), 0)
-                self.git_mock.assert_called_once_with(["merge-base", self.MERGED, "HEAD"], self.repo.path,
-                                                      check=False, retry=False, env={"GIT_NO_LAZY_FETCH": "1"})
-                self.assertFalse(miner.paths.pending_prompt_merges())
-                self.proposals.assert_called_once_with(self.URL, "merged")
 
     def test_head_or_base_change_during_evals_holds(self):
         for field in ("head", "base"):
@@ -484,7 +547,6 @@ class MinerLifecycleTests(unittest.TestCase):
                                                  base_commit=self.BASE, context_sha="harness")])
 
         self.eval.side_effect = self.compare_prompts
-        self.status = "failure"
         export = mock.Mock(side_effect=lambda repo, ref, dest: {"build.md": ref.encode()})
         with mock.patch.multiple(evals, export_prompts=export, suites=lambda cfg: [self.repo],
                                  paired_tasks=lambda *args: [evals.Task("fixture", "Fixture", "fixture")],
@@ -499,51 +561,21 @@ class MinerLifecycleTests(unittest.TestCase):
         self.assertFalse(self.merged)
         self.proposals.assert_called_once_with(self.URL, "rejected")
 
-    def test_mixed_pr_compares_matching_prompt_and_harness_arms_on_the_base_tasks(self):
-        self.diff.return_value = diffguard.Diff({self.PROMPT: 2, "CLAUDE.md": 1})
-        task = evals.Task("interaction", "Interaction", "Check both edits", base=self.BASE)
-        arms = []
-
-        def suite(cfg, repo, source, tasks, tag, prompts):
-            self.assertEqual(tasks, [task])
-            arms.append((source.ref, prompts.commit))
-            fails = source.ref == prompts.commit == self.HEAD
-            return evals.Arm(tag, [evals.TaskResult(task.name, passed=not fails, graded=True,
-                                                  base_commit=task.base, context_sha=source.ref,
-                                                  prompts_used={"build.md"})])
-
-        with mock.patch.multiple(
-            evals, export_prompts=lambda repo, ref, dest: {"build.md": ref.encode()},
-            paired_tasks=mock.Mock(return_value=[task]), run_suite=suite,
-        ), mock.patch.object(util, "lock", return_value=nullcontext(True)):
-            self.assertEqual(self.decide(), "closed for an eval regression")
-            evals.paired_tasks.assert_called_once()
-            self.assertEqual(evals.paired_tasks.call_args.args[1].ref, self.BASE)
-            self.assertEqual(evals.paired_tasks.call_args.args[2], self.BASE)
+    def test_out_of_scope_prs_receive_no_actions(self):
+        self.behind = True
+        for extra in ("CLAUDE.md", "skills/example/SKILL.md", "arete/pipeline.py", "arete/prompts/fix.md"):
+            with self.subTest(extra=extra):
+                self.diff.return_value = diffguard.Diff({self.PROMPT: 2, extra: 1})
+                self.assertIn("outside", self.decide())
+        self.diff.return_value = diffguard.Diff({self.PROMPT: 2})
+        self.cfg.global_repo = self.cfg.arete_repo
+        self.assertIn("outside", self.decide())
+        self.cfg.global_repo = "shared"
+        self.layer.trust_level = "pr"
+        self.assertIn("outside", self.decide())
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.ci_reads, [])
         self.eval.assert_not_called()
-        self.assertEqual(arms, [(self.BASE, self.BASE), (self.HEAD, self.HEAD)])
-        self.assertIn("`interaction`", self.calls[0][2])
-        self.assertEqual(self.calls[1], ("pr", "close", self.URL))
-        self.assertFalse(self.merged)
-
-    def test_mixed_pr_stays_open_when_no_task_exercises_the_prompt_and_harness_together(self):
-        self.diff.return_value = diffguard.Diff({"arete/prompts/fix.md": 2, "CLAUDE.md": 1})
-        task = evals.Task("fixture", "Fixture", "fixture", base=self.BASE)
-
-        def suite(cfg, repo, source, tasks, tag, prompts):
-            self.assertEqual(source.ref, prompts.commit)
-            return evals.Arm(tag, [evals.TaskResult(task.name, passed=source.ref == self.BASE, graded=True,
-                                                  base_commit=task.base, prompts_used={"build.md"})])
-
-        with mock.patch.multiple(
-            evals, export_prompts=lambda repo, ref, dest: {"fix.md": ref.encode()},
-            paired_tasks=lambda *args: [task], run_suite=suite,
-        ), mock.patch.object(util, "lock", return_value=nullcontext(True)), mock.patch.object(miner, "judge_prompts") as judge:
-            self.assertIn("incomplete", self.decide())
-        judge.assert_not_called()
-        self.eval.assert_not_called()
-        self.assertEqual([call[0] for call in self.calls], ["comment"])
-        self.assertIn("Not measured", self.calls[0][2])
 
     def test_repair_only_on_base_leaves_candidate_fix_prompt_unmeasured(self):
         task = evals.Task("fixture", "Fixture", "fixture")

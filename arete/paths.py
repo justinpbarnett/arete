@@ -166,17 +166,6 @@ def backups_dir() -> Path:
     return DB_FILE.parent / "backups"
 
 
-def prompt_merges_dir() -> Path:
-    return STATE_DIR / "miner-prompt-merges"
-
-
-def pending_prompt_merges() -> list[Path]:
-    try:
-        return sorted(p for p in prompt_merges_dir().iterdir() if p.suffix == ".json")
-    except FileNotFoundError:
-        return []
-
-
 RUNS_DIR = STATE_DIR / "runs"
 WORKTREES_DIR = Path(os.environ.get("ARETE_WORKTREES_DIR", HOME / "Library" / "Developer" / "arete" / "worktrees"
                                     if ON_MAC and not ISOLATED else STATE_DIR / "worktrees"))

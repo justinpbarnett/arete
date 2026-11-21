@@ -8,7 +8,9 @@ import socket
 import subprocess
 import sys
 import threading
-from dataclasses import asdict
+import time
+from dataclasses import MISSING, asdict, fields, is_dataclass
+from math import inf
 from pathlib import Path
 
 from . import child, codebase, config, paths, pipeline, record, routing, scratch, util
@@ -52,6 +54,9 @@ class Worker:
     def __init__(self, run: pipeline.AgentRun, action: str, request: dict):
         self.action, self.buffer, self.messages = action, b"", []
         self.progress, self.sources = [], {}
+        self.report = (0, {})
+        seconds = request["overrides"]["timeout_minutes"] * 60
+        self.deadline = time.monotonic() + seconds if seconds else inf
         parent, peer = socket.socketpair()
         self.channel, self.proc = parent, None
         command = [sys.executable, "-I", "-c",
@@ -105,8 +110,11 @@ class Worker:
             for event in record.entries(source.read()):
                 if event.get("arete") or event.get("type") in ("ping", "heartbeat"):
                     continue
-                self.progress.append({"type": str(event.get("type") or "progress"),
-                                      "excerpt": json.dumps(event, ensure_ascii=False)[:1200]})
+                observed = {"type": str(event.get("type") or "progress"),
+                            "excerpt": json.dumps(event, ensure_ascii=False)[:1200]}
+                self.progress.append(observed)
+                if reports_progress(event):
+                    self.report = (self.report[0] + 1, observed)
         self.progress = self.progress[-8:]
         return self.progress
 
@@ -117,8 +125,47 @@ class Worker:
             raise RuntimeError("worker producer group did not become quiescent")
 
 
+def reports_progress(event: dict) -> bool:
+    kind = event.get("type")
+    if kind == "progress":
+        return True
+    if kind == "item.completed":
+        item = event.get("item")
+        return isinstance(item, dict) and item.get("type") == "agent_message" and bool(item.get("text"))
+    message = event.get("message")
+    return (isinstance(message, dict)
+            and (kind == "assistant" or (kind == "message_end" and message.get("role") == "assistant"))
+            and any(block.get("type") == "text" and block.get("text")
+                    for block in record.blocks(message.get("content"))))
+
+
+class PolicyChanged(ValueError):
+    pass
+
+
+def at_default(f, value) -> bool:
+    if f.default is not MISSING:
+        return value == f.default
+    return f.default_factory is not MISSING and value == f.default_factory()
+
+
+def explicit(value):
+    if is_dataclass(value) and not isinstance(value, type):
+        return {f.name: explicit(getattr(value, f.name)) for f in fields(value)
+                if not at_default(f, getattr(value, f.name))}
+    if isinstance(value, (list, tuple)):
+        return [explicit(v) for v in value]
+    if isinstance(value, dict):
+        return {k: explicit(v) for k, v in value.items()}
+    return value
+
+
 def settings_sha(value) -> str:
-    return digest(json.loads(json.dumps(asdict(value), default=str)))
+    return digest(json.loads(json.dumps(explicit(value), default=str)))
+
+
+def settings_shas(value) -> set[str]:
+    return {settings_sha(value), digest(json.loads(json.dumps(asdict(value), default=str)))}
 
 
 def request(job, action: str, prompt: str, setting, tools: tuple, rules: list[str], session=NO_SESSION) -> dict:
@@ -126,6 +173,7 @@ def request(job, action: str, prompt: str, setting, tools: tuple, rules: list[st
             "cwd": str(job.ws), "layer_dir": str(job.layer.dir), "prompt": prompt, "role": setting.step,
             "overrides": {"runner": setting.runner, "provider": setting.provider, "model": setting.model,
                           "effort": setting.effort, "tools": list(tools), "mcp": [],
+                          "timeout_minutes": setting.timeout_minutes,
                           "session": "resume" if session.id else "fresh"},
             "rules": rules, "kind": job.run.kind, "session": asdict(session),
             "closed_context": job.run.closed_context,
@@ -163,8 +211,8 @@ def main() -> None:
         cfg = config.load()
         repo = cfg.repo(launch["repo"])
         layer = config.load_layer(Path(launch["layer_dir"]))
-        if settings_sha(cfg) != launch["config_sha"] or settings_sha(layer) != launch["layer_sha"]:
-            raise ValueError("worker policy changed after action acceptance")
+        if launch["config_sha"] not in settings_shas(cfg) or launch["layer_sha"] not in settings_shas(layer):
+            raise PolicyChanged("worker policy changed after action acceptance")
         run = pipeline.AgentRun(launch["run"], repo, paths.RUNS_DIR / launch["run"], cfg=cfg, layer=layer,
                                 kind=launch["kind"], step_overrides={launch["role"]: launch["overrides"]},
                                 closed_context=tuple(launch["closed_context"]))
@@ -187,9 +235,11 @@ def main() -> None:
                        "structured": result.structured, "error": result.error[:2000], "session": asdict(result.session),
                        "cost_usd": run.cost, "paid_usd": run.paid,
                        "runner": result.runner, "model": result.model, "effort": result.effort,
-                       "record": result.record})
+                       "record": result.record, "recovery": pipeline.runner.start_failure(result, launch["role"])})
     except pipeline.Stopped:
         pass
+    except PolicyChanged as error:
+        send(channel, {"event": "error", "error": record.failure(error), "recovery": {"reason": "engine-crash"}})
     except Exception as error:
         send(channel, {"event": "error", "error": record.failure(error)})
     finally:

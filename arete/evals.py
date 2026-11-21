@@ -208,6 +208,7 @@ class Comparison:
     regressions: list[str] = field(default_factory=list)
     unmeasured: list[str] = field(default_factory=list)
     complete: bool = False
+    incomplete: list[str] = field(default_factory=list)
 
 
 class Source:
@@ -859,6 +860,7 @@ def comparison(target: config.Repo, base: str, lead: str, ran: list[tuple[config
 
     lines = [lead, ""]
     regressions = []
+    incomplete = []
     exercised = set()
     complete = bool(ran) and not skipped
     if ran:
@@ -868,14 +870,19 @@ def comparison(target: config.Repo, base: str, lead: str, ran: list[tuple[config
             before = {r.task: r for r in main.results if r.graded}
             paired = [(prior, r) for r in pr.results if r.graded and (prior := before.get(r.task))
                       and inputs(prior) == inputs(r) and all(inputs(r))]
-            exercised.update(name for _, r in paired for name in r.prompts_used)
+            exercised.update(name for r in pr.results for name in r.prompts_used)
             flips = [r for prior, r in paired if prior.passed != r.passed]
             lines.append(f"| {shown(repo)} | {main.score} | {pr.score} | {show_flips(flips, hidden(repo))} |")
             failed = [r.task for r in flips if not r.passed]
             if failed:
                 regressions.append(f"{shown(repo)} ({util.count(len(failed), 'task')})" if hidden(repo) else
                                    f"{prompt_loader.code_list(failed)} in {shown(repo)}")
-            complete = complete and bool(paired) and len({r.task for _, r in paired}) == len(main.results) == len(pr.results)
+            paired_names = {r.task for _, r in paired}
+            unfinished = sorted({r.task for r in main.results + pr.results} - paired_names)
+            if unfinished:
+                incomplete.append(f"{shown(repo)} ({util.count(len(unfinished), 'task')})" if hidden(repo) else
+                                  f"{prompt_loader.code_list(unfinished)} in {shown(repo)}")
+            complete = complete and bool(paired) and len(paired_names) == len(main.results) == len(pr.results)
         totals = {arm: Arm("", [r for _, result in ran for r in result[arm].results]) for arm in ("main", "pr")}
         lines += [f"| all | {totals['main'].score} | {totals['pr'].score} | |", ""]
         ids = [a.run_id for repo, result in ran if not hidden(repo) for a in result.values()]
@@ -890,4 +897,4 @@ def comparison(target: config.Repo, base: str, lead: str, ran: list[tuple[config
                 regressions = []
     if skipped:
         lines.append("Skipped: " + ", ".join(f"{shown(repo)} ({why})" for repo, why in skipped) + ".")
-    return Comparison("\n".join(lines).rstrip() + "\n", regressions, unmeasured, complete)
+    return Comparison("\n".join(lines).rstrip() + "\n", regressions, unmeasured, complete, incomplete)

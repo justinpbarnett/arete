@@ -3,6 +3,12 @@ export function cursor(value) {
   return match ? [BigInt(match[1]), BigInt(match[2])] : null;
 }
 
+export function newer(value, previous) {
+  const next = cursor(value);
+  const last = cursor(previous);
+  return Boolean(next && (!last || next[0] > last[0] || next[0] === last[0] && next[1] > last[1]));
+}
+
 export function sequences(value) {
   if (typeof value === "function") return value.seqs ?? [];
   if (!value || typeof value !== "object") return [];

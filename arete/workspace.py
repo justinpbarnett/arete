@@ -133,7 +133,7 @@ def scratch_view() -> scratch.View | None:
 
 def record_holds(view: scratch.View | None, d: Path) -> list[Path]:
     if view is None:
-        return [d] if os.path.lexists(sandbox.AUTHORITY) else []
+        return [sandbox.AUTHORITY] if os.path.lexists(sandbox.AUTHORITY) else []
     return [Path(scratch.path_of(h)) for h in scratch.holds(view, d)]
 
 
@@ -141,9 +141,9 @@ def held_words(left: list[Path]) -> str:
     return ", ".join(list(dict.fromkeys(str(p) for p in left))[:5])
 
 
-def scratch_left(ws: Path, checkouts: list[Checkout]) -> list[Path]:
+def scratch_left(ws: Path, checkouts: list[Checkout], *, strict: bool = False) -> list[Path]:
     found, unproven = [], []
-    view = scratch_view()
+    view = scratch.survey() if strict else scratch_view()
     names = scratch.root_names(view) if view is not None else None
     scanned = {ws, *(c.wt for c in checkouts)}
     for d in scanned:
@@ -169,7 +169,7 @@ def scratch_left(ws: Path, checkouts: list[Checkout]) -> list[Path]:
                 dirs[:] = [n for n in dirs if n != ".git" and n not in held]
         except OSError:
             found.append(d)
-    late_view = scratch_view()
+    late_view = scratch.survey() if strict else scratch_view()
     late = scratch.root_names(late_view) if late_view is not None else None
     for d in scanned:
         if records := record_holds(late_view, d):
@@ -435,14 +435,31 @@ def kept_work(ws: Path, checkouts: list[Checkout], source: Path, copies: list[st
     return ""
 
 
-def clear_workspace(ws: Path, checkouts: list[Checkout], source: Path, copies: list[str]) -> None:
+def scratch_failure(why: str, ws: Path, held: list[Path]) -> RunFailed:
+    records = [p for p in held if p.parent == sandbox.AUTHORITY]
+    selectors = sorted({p.stem for p in records if scratch.SELECTOR_FILE.fullmatch(p.name)})
+    unidentifiable = sandbox.AUTHORITY in held or any(not scratch.SELECTOR_FILE.fullmatch(p.name) for p in records)
+    return RunFailed(why, recovery={"reason": "scratch", "workspace": str(ws), "selectors": selectors,
+                                    "unidentifiable_record": unidentifiable})
+
+
+def worktree_failure(why: str, ws: Path, branch: str) -> RunFailed:
+    return RunFailed(why, recovery={"reason": "worktree", "workspace": str(ws), "branch": branch})
+
+
+def clear_workspace(ws: Path, checkouts: list[Checkout], source: Path, copies: list[str],
+                    branch: str = "") -> None:
     if left := scratch_held(ws, checkouts):
-        raise RunFailed(
-            f"unresolved or unknown scratch resources keep the existing workspace retained ({held_words(left)})")
+        raise scratch_failure(
+            f"unresolved or unknown scratch resources keep the existing workspace retained ({held_words(left)})",
+            ws, left)
     if why := kept_work(ws, checkouts, source, copies):
-        raise RunFailed(why)
+        raise worktree_failure(why, ws, branch)
     if not remove_workspace(ws, checkouts):
-        raise RunFailed("workspace removal withheld to preserve scratch resources")
+        why = "workspace removal withheld to preserve scratch resources"
+        if left := scratch_left(ws, checkouts):
+            raise scratch_failure(why, ws, left)
+        raise RunFailed(why, recovery={"reason": "worktree-removal", "workspace": str(ws)})
 
 
 def kept_onto(ws: Path, checkouts: list[Checkout], branch: str) -> dict[str, str]:
@@ -456,8 +473,8 @@ def kept_onto(ws: Path, checkouts: list[Checkout], branch: str) -> dict[str, str
             head = git(["rev-parse", "HEAD"], c.wt).strip()
             on = git(["symbolic-ref", "-q", "--short", "HEAD"], c.wt, check=False).strip()
         except (RuntimeError, OSError) as e:
-            raise RunFailed(f"arete could not read the existing worktree {c.wt} of {c.github}, so it left it as it "
-                            f"is: {e}") from e
+            raise worktree_failure(f"arete could not read the existing worktree {c.wt} of {c.github}, so it left it as "
+                                   f"it is: {e}", ws, branch) from e
         recorded = head_recorded(made, c)
         if head != recorded:
             what = f"is at `{head[:12]}`, not at `{recorded[:12]}` where arete kept the last run's edits"
@@ -466,23 +483,25 @@ def kept_onto(ws: Path, checkouts: list[Checkout], branch: str) -> dict[str, str
         else:
             kept[str(c.wt)] = onto
             continue
-        raise RunFailed(f"the existing worktree {c.wt} of {c.github} {what}, so arete did not continue from it or "
-                        f"make it again; put it back with `git -C {c.wt} checkout -B {branch} {recorded}`, or remove "
-                        f"the worktree and the local branch `{branch}` to start from origin, then run again")
+        raise worktree_failure(
+            f"the existing worktree {c.wt} of {c.github} {what}, so arete did not continue from it or make it again; "
+            f"put it back with `git -C {c.wt} checkout -B {branch} {recorded}`, or remove "
+            f"the worktree and the local branch `{branch}` to start from origin, then run again", ws, branch)
     return kept
 
 
 def kept_or_cleared(ws: Path, checkouts: list[Checkout], source: Path, copies: list[str],
                     branch: str) -> dict[str, str]:
     if left := scratch_held(ws, checkouts):
-        raise RunFailed(
-            f"unresolved or unknown scratch resources keep the existing workspace retained ({held_words(left)})")
+        raise scratch_failure(
+            f"unresolved or unknown scratch resources keep the existing workspace retained ({held_words(left)})",
+            ws, left)
     kept = kept_onto(ws, checkouts, branch)
     if not kept:
-        clear_workspace(ws, checkouts, source, copies)
+        clear_workspace(ws, checkouts, source, copies, branch)
         return {}
     if why := kept_work(ws, checkouts, source, copies):
-        raise RunFailed(why)
+        raise worktree_failure(why, ws, branch)
     return kept
 
 
@@ -650,9 +669,10 @@ def held_summary() -> dict:
 
 
 class RunFailed(Exception):
-    def __init__(self, why: str, detail: str = ""):
+    def __init__(self, why: str, detail: str = "", *, recovery: dict | None = None):
         super().__init__(why)
         self.why, self.detail = why, detail
+        self.recovery = recovery
 
 
 def uncommitted(wt: Path) -> list[str]:
