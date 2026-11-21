@@ -1,7 +1,7 @@
 from dataclasses import replace
 
 from arete import factory, patching
-from arete.flows import BUILD, CHECK_REPAIR, REVIEW_FIX, documents, end_dry_run, ended, finish, step
+from arete.flows import BUILD, CHECK_REPAIR, REVIEW_FIX, deliver, ended, finish, retry_environment, step
 from arete.pipeline import round_name
 from arete.verify import Verified
 
@@ -16,6 +16,8 @@ def feature(flow):
 
 def start(flow, request_patch=False):
     job = flow.ctx
+    if job.run.environment_release:
+        return retry_environment(flow)
     ws = str(job.ws)
     if not (outcome := step(flow, "prepare", tree=ws)).passed:
         return ended(flow, outcome)
@@ -55,7 +57,8 @@ def built(flow, first, prepared=False, patch=False):
     elif patch:
         job.verified = Verified("unverified", "Focused verification follows review convergence on the final tree.")
     else:
-        step(flow, "verify", tree=ws)
+        if not (verified := step(flow, "verify", tree=ws)).passed:
+            return ended(flow, verified)
     reviews = max(1, job.run.settings("review").tries)
     if patch:
         reviews = min(reviews, job.layer.patch.review_tries)
@@ -83,7 +86,8 @@ def built(flow, first, prepared=False, patch=False):
     fixed = fixed or factory.fingerprint(ws) != before
     if job.review.approved() and (patch or fixed) and not skipped:
         before = factory.fingerprint(ws)
-        step(flow, "verify", tree=ws)
+        if not (verified := step(flow, "verify", tree=ws)).passed:
+            return ended(flow, verified)
         if patch and patching.allowed_gap(job.layer, job.ticket, job.verified):
             job.verified = replace(job.verified, verdict="unverified", summary=(
                 job.verified.summary + "\nThe owner's patch policy permits this environmental gap; it is not a pass."))
@@ -98,15 +102,7 @@ def built(flow, first, prepared=False, patch=False):
     if patch and (why := patching.change_refusal(job.layer.patch, job.b.restage().files, job.b.staged.lines)):
         job.run.log(f"patch: escalating to the feature flow: {why}")
         return built(flow, [("plan", {}), ("implement", {"tree": ws, "round": BUILD})], prepared=True)
-    step(flow, "learn", tree=ws, apply=True)
-    if documents(job):
-        step(flow, "document", tree=ws)
-    if job.run.dry_run:
-        return end_dry_run(flow)
-    for name, kw in [("pr", {"tree": ws}), *([("ci", {"tree": ws})] if job.run.repo.parts else []), ("publish", {})]:
-        if not (outcome := step(flow, name, **kw)).passed:
-            break
-    return ended(flow, outcome)
+    return deliver(flow)
 
 
 def final_checks(flow, ws):
