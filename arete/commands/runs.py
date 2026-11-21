@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import sys
 from collections.abc import Iterable
 
@@ -24,10 +25,21 @@ def cmd_merge_check(args) -> int:
 def cmd_run(args) -> int:
     from .. import client, pipeline
 
+    environment_retry = bool(args.continues or args.environment_release)
+    if environment_retry and (not (args.local and args.force and args.continues and args.environment_release)
+                              or args.dry_run):
+        print("The held verification retry needs a local run, its source run and its live release.")
+        return 2
     if args.local:
         from .. import control
 
         control.require_worker("run", development=True)
+    if environment_retry:
+        from .. import flows
+
+        script = pipeline.Script("classic", flows.retry_environment, continues=args.continues, again="verify",
+                                 environment_release=args.environment_release)
+        return pipeline.run_issue(args.repo, args.issue, force=args.force, script=script)
     if args.local or args.dry_run:
         return pipeline.run_issue(args.repo, args.issue, dry_run=args.dry_run, force=args.force)
     return client.steered(lambda: run_followed(client.start_task(
@@ -158,6 +170,8 @@ def register(sub) -> None:
     p.add_argument("--local", action="store_true", help="run in this process for a server spawn or development")
     p.set_defaults(fn=cmd_run)
     p.add_argument("--key", default=None, help="reuse an identical remote task-start request safely")
+    p.add_argument("--continue", dest="continues", default="", help=argparse.SUPPRESS)
+    p.add_argument("--environment-release", default="", help=argparse.SUPPRESS)
 
     p = steering(sub.add_parser("resume", help="continue a run that ended interrupted, stopped or failed, through the "
                                                "server"))

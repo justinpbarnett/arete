@@ -44,6 +44,8 @@ REFRESHABLE_LINEAGE = {"catalog_sha", "controller_prompt", "operations_sha"}
 def policy_fingerprint(cfg, layer, closed_context):
     effective = asdict(layer)
     effective.pop("factory_path")
+    if layer.required_check is None:
+        effective.pop("required_check")
     if layer.verify:
         effective["verify"] = layer.verify.policy()
     return ledger.digest(json.loads(json.dumps({"layer": effective, "config": asdict(cfg),
@@ -135,15 +137,20 @@ class Controller:
             self.job.layer = pipeline.checked_layer(self.job.cfg, layer_dir, source_file=source_file)
             self.run.cfg, self.run.layer, self.run.kind = self.job.cfg, self.job.layer, prepared["ticket"]["kind"]
             self.lineage()
-            if any(not (Path(c["wt"]) / ".git").exists() for c in prepared["checkouts"]):
+            missing = any(not (Path(c["wt"]) / ".git").exists() for c in prepared["checkouts"])
+            if missing:
                 if any(Path(c["wt"]).exists() for c in prepared["checkouts"]):
                     raise factory.Refused("the retained workspace is incomplete; reconcile without discarding its edits")
                 if ledger.publication_pending(self.run.id) or not any(
                         a["op"] == "publication.request" and a["state"] == "succeeded" for a in ledger.actions(self.lease)):
                     raise factory.Refused("the missing workspace has no settled publication; reconcile before resuming")
-                if why := self.job.restore({"step": "prepare", "tree": str(self.job.ws), "data": prepared}, layer=self.job.layer):
-                    raise factory.Refused(why)
-            self.job.take("prepare", factory.Outcome("pass", data=self.data["prepared"]), stored=True)
+            if self.run.environment_release:
+                flows.restore_environment_draft(self.job, prepared)
+            else:
+                if missing:
+                    if why := self.job.restore({"step": "prepare", "tree": str(self.job.ws), "data": prepared}, layer=self.job.layer):
+                        raise factory.Refused(why)
+                self.job.take("prepare", factory.Outcome("pass", data=prepared), stored=True)
             for name, value in self.data.get("job", {}).items():
                 if name in STATE_FIELDS:
                     setattr(self.job, name, value)
@@ -155,6 +162,8 @@ class Controller:
             self.job.b.plan_text, self.job.b.build_summary = self.job.plan_text, self.job.build_summary
         else:
             self.quiescent()
+            if self.run.environment_release:
+                raise factory.Refused("the held controller has no saved workspace for verification")
             if self.data.get("preparing"):
                 raise factory.Refused("preparation was interrupted before durable workspace authority; reconcile before restarting")
             self.data["preparing"] = True
@@ -210,7 +219,10 @@ class Controller:
         self.data["acceptance"] = ledger.digest([self.catalog.context["task"], self.job.goal,
                                                  self.job.left_for_a_person])
         self.recover()
-        if self.flow.continues and (moved := flows.base_moved(self.flow.continues)):
+        if self.run.environment_release:
+            self.data.pop("published", None)
+            self.data.pop("published_tree", None)
+        elif self.flow.continues and (moved := flows.base_moved(self.flow.continues)):
             self.job.moved_base = moved
             self.job.merge_moved_base("orchestrate")
         if old_lineage:
@@ -707,6 +719,9 @@ class Controller:
                 self.job.goal, self.job.fix_reply = goal, reply
             result = outcome.data.get("verified" if role == "verify" else "review", {})
             self.stamp(role, result)
+            if outcome.data.get("ending") == "environment-held":
+                self.ending = flows.ended(self.flow, outcome)
+                return {"operation_passed": False, **result}
             return {"operation_passed": outcome.passed, **result}
         if op == "owner.ask":
             if zte.reserved(str(self.run.tid)):
@@ -775,19 +790,22 @@ class Controller:
                         state="running" if result is None else "failed" if "error" in result else "succeeded")
 
     def drive(self):
+        verification_passed = False
         try:
             if ended := self.prepare():
                 return ended
             if self.run.action:
                 known = {action["id"]: action for action in ledger.actions(self.lease)}
                 prior = known.get(self.run.action)
-                allowed = ("worker.start", "worker.continue", "checks.run", "verification.run", "review.run")
+                allowed = (("verification.run",) if self.run.environment_release else
+                           ("worker.start", "worker.continue", "checks.run", "verification.run", "review.run"))
                 if prior is None or prior["op"] not in allowed or prior["state"] not in ledger.TERMINAL:
                     raise factory.Refused("rerun requires a finished worker/check/review/verification action ID")
                 snapshot = ledger.snapshot(self.lease)
                 turn = ledger.begin(self.lease, {"rerun": prior["id"]}, self.policy.max_decisions)
+                requester = "Live release retry" if self.run.environment_release else "Owner requested rerun"
                 response = {"version": PROTOCOL, "decision_id": turn, "state_version": snapshot["version"],
-                            "rationale": f"Owner requested rerun of {prior['id']}",
+                            "rationale": f"{requester} of {prior['id']}",
                             "calls": [{"op": prior["op"], "args": prior["request"]}]}
                 try:
                     response = self.catalog.validate(response, turn, snapshot["version"], known,
@@ -797,6 +815,13 @@ class Controller:
                     raise factory.Refused(f"cannot rerun {prior['id']} under the current catalog: {error}") from error
                 rerun = ledger.accept(self.lease, turn, snapshot["version"], response, self.policy.max_actions)[0]
                 self.dispatch(rerun)
+                if self.run.environment_release:
+                    if self.ending:
+                        return self.ending
+                    if (not flows.retry_passed(self.job.verified)
+                            or self.data.get("evidence", {}).get("verify", {}).get("producer") != rerun["id"]):
+                        raise factory.Refused("the saved verification action did not complete successfully")
+                    verification_passed = True
                 if self.run.action_only:
                     while self.workers:
                         self.collect()
@@ -816,6 +841,8 @@ class Controller:
             raise runlimits.Parked(str(error)) from error
         finally:
             self.close()
+            if self.run.environment_release and not verification_passed and flows.reset_environment_base(self.job.checkouts):
+                self.persist()
 
     def close(self):
         errors = []

@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import threading
 import time
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import (
@@ -51,7 +52,7 @@ EVALS = ".agents/evals"
 MAX_BASES = 4
 BASES: dict[tuple[str, str, str], Base] = {}
 BASES_LOCK = threading.Lock()
-OVERLAY_EXTRA = [".agents/config.toml"]
+LAYER_CONFIG = ".agents/config.toml"
 ARETE_PROMPTS = "arete/prompts"
 BUILDER_PROMPTS = ("plan", "build", "fix")
 
@@ -175,6 +176,9 @@ class TaskResult:
     settings: str = ""
     regressed: bool = False
     changed: list[str] = field(default_factory=list)
+    graded: bool = False
+    prompts_used: set[str] = field(default_factory=set)
+    required_behavior_failed: bool = False
 
 
 @dataclass
@@ -189,6 +193,15 @@ class Arm:
     @property
     def paid(self) -> float:
         return sum(r.paid for r in self.results)
+
+
+@dataclass
+class Comparison:
+    markdown: str
+    regressions: list[str] = field(default_factory=list)
+    unmeasured: list[str] = field(default_factory=list)
+    complete: bool = False
+    incomplete: list[str] = field(default_factory=list)
 
 
 class Source:
@@ -295,7 +308,7 @@ def remove_base_harness(wt: Path, globs: list[str]) -> None:
 
 
 def harness_globs() -> list[str]:
-    return [g for g in config.HARNESS_GLOBS if not g.startswith(EVALS)] + OVERLAY_EXTRA
+    return [g for g in config.HARNESS_GLOBS if not g.startswith(EVALS)] + [LAYER_CONFIG]
 
 
 def harness_files(src: Source) -> list[str]:
@@ -477,16 +490,38 @@ def review(run: EvalRun, wt: Path, brief: prompt_loader.Brief, plan: str, report
     return sum(p["severity"] == "blocker" for p in review_problems(res.structured.get("problems")))
 
 
+def required_check_outcome(verdict: str, cause: str | None = None, exit_code: int | None = None) -> str:
+    if verdict == "pass":
+        return "pass"
+    if (verdict == "fail" and cause in (None, "product") and exit_code is not None
+            and exit_code >= 0 and exit_code not in (124, 126, 127) and not 129 <= exit_code <= 192):
+        return "fail"
+    return ""
+
+
 def acceptance(cfg, run, layer, wt, task, brief, result, plan, report, ok, timeout):
     git(["add", "-A"], wt)
     diff = vault.hidden(git(["diff", "--cached", "HEAD"], wt))
     (run.dir / "diff.patch").write_text(diff)
     failures = result.failures + (["repo checks failing"] if run.checks_required and not ok else [])
+    complete = True
     evidence = "No check in use ran for this task."
     if task.verify:
         graded = grade(cfg, run, layer, wt, task.title, task.prompt, task.verify, run.time_for(timeout))
         result.verify = graded.verdict
         evidence = graded.markdown()
+        failed = []
+        if graded.behavior_reached:
+            for check in graded.failed_checks:
+                exit_status = re.match(r"\s*exit(?: code| status)?\s+(-?\d+)\b", check.get("saw", ""), re.I)
+                cause = check.get("cause")
+                failed.append(required_check_outcome("fail" if check.get("passed") is False else "",
+                                                     "product" if cause == "change" else cause,
+                                                     int(exit_status[1]) if exit_status else None))
+        complete = graded.behavior_reached and graded.finished and (
+            (graded.verdict == "pass" and not graded.failed_checks)
+            or (graded.verdict == "fail" and bool(failed) and all(failed)))
+        result.required_behavior_failed = "fail" in failed
         if graded.verdict != "pass":
             failures.append(grade_failure(graded))
     if run.reviews:
@@ -497,10 +532,15 @@ def acceptance(cfg, run, layer, wt, task, brief, result, plan, report, ok, timeo
     if task.check:
         res = hidden_check(cfg, run.repo, task, wt, run.time_for(timeout))
         result.hidden = "pass" if res.returncode == 0 else "fail"
+        cause = "environment" if re.search(r"^sandbox-exec:", res.stderr, re.M) else None
+        outcome = required_check_outcome(result.hidden, cause, res.returncode)
+        complete = complete and bool(outcome)
+        result.required_behavior_failed |= outcome == "fail"
         (run.dir / "check.log").write_text(res.stdout + res.stderr)
         run.log(f"held out check: {'PASS' if res.returncode == 0 else 'FAIL'}")
         if res.returncode != 0:
             failures.append(f"check exit {res.returncode}")
+    result.graded = complete
     result.passed = not failures
     result.failures = failures
     result.why = "; ".join(failures) + ("" if ok or not failures or run.checks_required else ", repo checks failing")
@@ -560,6 +600,7 @@ def run_task(cfg: config.Config, src: Source, task: Task, prompts: Prompts, run:
         if not res.ok or not isinstance(res.structured, dict):
             result.why = "plan step failed"
             return result
+        result.prompts_used.add("plan.md")
         plan = res.structured.get("plan", "")
         estimate = int(res.structured.get("estimated_lines") or 0)
         in_use = res.structured.get("verify", "")
@@ -571,6 +612,7 @@ def run_task(cfg: config.Config, src: Source, task: Task, prompts: Prompts, run:
         if not res.ok:
             result.why = "build step failed"
             return result
+        result.prompts_used.add("build.md")
         session, attempts, summary = res.session, 1, res.text
         max_attempts = run.repair_limit(layer)
         ok, report = run.gate(layer, wt, task, timeout)
@@ -584,6 +626,8 @@ def run_task(cfg: config.Config, src: Source, task: Task, prompts: Prompts, run:
                                 disallowed_tools=routing.NO_GIT_WRITES, resume=session, timeout=timeout,
                                 fresh_prompt=lambda which, fix=fix, summary=summary: switched_prompt(
                                     which, wt, task, plan, summary, fix))
+                if res.ok or res.turns:
+                    result.prompts_used.add("fix.md")
                 session, summary = res.session, res.text
                 ok, report = run.gate(layer, wt, task, timeout)
         except workspace.RunFailed:
@@ -735,83 +779,135 @@ def export_prompts(repo: config.Repo, ref: str, dest: Path) -> dict[str, bytes]:
     return found
 
 
-def compare_prompts(cfg: config.Config, arete: config.Repo, branch: str) -> str:
-    fetch_origin(arete)
+def paired_tasks(repo: config.Repo, default_base: str = "") -> list[Task]:
+    tasks = load_tasks(*task_source(repo, Source(repo)))
+    if not tasks:
+        return []
+    if not default_base:
+        fetch_origin(repo)
+        default_base = f"origin/{gh.default_branch(repo.github) if repo.github else 'main'}"
+    refs = dict.fromkeys(t.base or default_base for t in tasks)
+    commits = {ref: git(["rev-parse", "--verify", f"{ref}^{{commit}}"], repo.path, check=False).strip() or ref
+               for ref in refs}
+    return [replace(t, base=commits[t.base or default_base]) for t in tasks]
+
+
+def unmeasured_prompts(names: list[str]) -> Comparison:
+    return Comparison(f"Not measured, as no eval runs {prompt_loader.code_list(names)}.\n",
+                      unmeasured=names, complete=True)
+
+
+def prompt_arms(repo: config.Repo, base: str, head: str, fork: str) -> tuple[dict[str, Prompts], list[str]]:
     root = paths.RUNS_DIR / record.new_id("eva", "prompts")
-    arms = {"main": Prompts(root / "main", f"origin/{gh.default_branch(arete.github)}"),
-            "pr": Prompts(root / "pr", f"origin/{branch}")}
-    for p in arms.values():
-        p.commit = git(["rev-parse", f"{p.label}^{{commit}}"], arete.path).strip()
-    _, pr = (export_prompts(arete, p.label, p.dir) for p in arms.values())
-    fork = git(["merge-base", arms["main"].label, arms["pr"].label], arete.path).strip()
-    before = export_prompts(arete, fork, root / "fork")
+    arms = {"main": Prompts(root / "main", base, base), "pr": Prompts(root / "pr", head, head)}
+    before, pr = (export_prompts(repo, p.commit, p.dir) for p in arms.values())
+    if fork and fork != base:
+        before = export_prompts(repo, fork, root / "fork")
     changed = sorted(name for name in before.keys() | pr.keys() if before.get(name) != pr.get(name))
-    unmeasured = [name for name in changed if Path(name).stem not in BUILDER_PROMPTS]
+    return arms, changed
+
+
+def compare_prompts(cfg: config.Config, arete: config.Repo, base: str, head: str, *, fork: str = "") -> Comparison:
+    arms, changed = prompt_arms(arete, base, head, fork)
     if not changed:
-        return ""
-    if unmeasured == changed:
-        return f"No eval runs {prompt_loader.code_list(changed)}, so this change is not measured.\n"
+        return Comparison("")
+    if not any(Path(name).stem in BUILDER_PROMPTS for name in changed):
+        return unmeasured_prompts(changed)
     ran, skipped = [], []
     for repo in suites(cfg):
-        if any(p.dir for p in repo.parts):
-            skipped.append((repo, "it has parts"))
-            continue
+        multipart = any(p.dir for p in repo.parts)
+        suite_base = base if repo.name == arete.name else ""
         try:
-            tasks = load_tasks(*task_source(repo, Source(repo)))
-        except (tomllib.TOMLDecodeError, ValueError, TypeError, KeyError) as e:
+            tasks = load_tasks(*task_source(repo, Source(repo))) if multipart else paired_tasks(repo, suite_base)
+        except (ValueError, TypeError, KeyError, RuntimeError, OSError) as e:
             print(f"{repo.name}: eval tasks do not load: {type(e).__name__}: {e}")
-            skipped.append((repo, "its eval tasks do not load"))
+            skipped.append((repo, "its eval tasks do not load", []))
             continue
         if not tasks:
             continue
+        if multipart:
+            skipped.append((repo, "it has parts", [task.name for task in tasks]))
+            continue
         with util.lock(run_store.run_lock("eval", repo.name)) as got:
             if not got:
-                skipped.append((repo, "its evals were already running"))
+                skipped.append((repo, "its evals were already running", [task.name for task in tasks]))
                 continue
-            ran.append((repo, {arm: run_suite(cfg, repo, Source(repo), tasks, f"{repo.name}-{arm}", prompts)
+            src = Source(repo)
+            ran.append((repo, {arm: run_suite(cfg, repo, src, tasks, f"{repo.name}-{arm}", prompts)
                                for arm, prompts in arms.items()}))
-    return prompt_comparison(arete, arms, changed, unmeasured, ran, skipped)
+    if not ran and not skipped:
+        return unmeasured_prompts(changed)
+    lead = ("Each eval suite ran its tasks with main's prompts and this branch's prompts" if ran else "No eval suite ran")
+    return comparison(arete, base, f"{lead}. Changed prompts were {prompt_loader.code_list(changed)}.",
+                      ran, changed, skipped)
 
 
-def flipped_tasks(main: Arm, pr: Arm, private: bool) -> str:
-    before = {r.task: r.passed for r in main.results}
-    flips = [r for r in pr.results if before.get(r.task, r.passed) != r.passed]
+def show_flips(flips: list[tuple[str, bool]], private: bool) -> str:
     if not flips:
         return "none"
     if not private:
-        return ", ".join(f"`{r.task}` now {'passes' if r.passed else 'fails'}" for r in flips)
-    up = sum(r.passed for r in flips)
+        return ", ".join(f"`{task}` now {'passes' if passed else 'fails'}" for task, passed in flips)
+    up = sum(passed for _, passed in flips)
     down = len(flips) - up
     return ", ".join(filter(None, [f"{util.count(up, 'task')} now {'passes' if up == 1 else 'pass'}" if up else "",
                                    f"{util.count(down, 'task')} now {'fails' if down == 1 else 'fail'}" if down else ""]))
 
 
-def prompt_comparison(arete: config.Repo, arms: dict[str, Prompts], changed: list[str], unmeasured: list[str],
-                      ran: list[tuple[config.Repo, dict[str, Arm]]], skipped: list[tuple[config.Repo, str]]) -> str:
+def comparison(target: config.Repo, base: str, lead: str, ran: list[tuple[config.Repo, dict[str, Arm]]],
+               changed_prompts: list[str], skipped: list[tuple[config.Repo, str, list[str]]]) -> Comparison:
     aliases: dict[str, str] = {}
 
     def hidden(repo: config.Repo) -> bool:
-        return arete.public and not repo.public
+        return repo.name != target.name and not repo.public
 
     def shown(repo: config.Repo) -> str:
         return aliases.setdefault(repo.name, f"private repo {len(aliases) + 1}") if hidden(repo) else repo.name
 
-    main_label = arms["main"].label
-    lead = (f"each eval suite ran its tasks twice today, once with the prompts on `{main_label}` and once with this branch's"
-            if ran else "no eval suite ran")
-    lines = [f"Prompt evals: {lead}. Changed: {prompt_loader.code_list(changed)}.", ""]
+    def shown_tasks(repo: config.Repo, tasks: list[str]) -> str:
+        return (f"{shown(repo)} ({util.count(len(tasks), 'task')})" if hidden(repo)
+                else f"{prompt_loader.code_list(tasks)} in {shown(repo)}")
+
+    def inputs(r: TaskResult) -> tuple[str, ...]:
+        return (r.base_commit, r.context_sha, r.settings)
+
+    def confirmed(r: TaskResult) -> bool:
+        return r.graded or r.required_behavior_failed
+
+    lines = [lead, ""]
+    regressions = []
+    incomplete = []
+    exercised = set()
+    complete = bool(ran) and not skipped
     if ran:
-        lines += [f"| suite | `{main_label}` | this branch | tasks that changed |", "|---|---|---|---|"]
+        lines += [f"| suite | `{base[:12]}` | this branch | tasks that changed |", "|---|---|---|---|"]
         for repo, result in ran:
-            lines.append(f"| {shown(repo)} | {result['main'].score} | {result['pr'].score} | "
-                         f"{flipped_tasks(result['main'], result['pr'], hidden(repo))} |")
-        totals = {arm: Arm("", [r for _, result in ran for r in result[arm].results]) for arm in arms}
+            main, pr = result["main"], result["pr"]
+            before = {r.task: r for r in main.results if confirmed(r)}
+            paired = [(prior, r) for r in pr.results if confirmed(r) and (prior := before.get(r.task))
+                      and r.base_commit and r.context_sha and inputs(prior) == inputs(r)]
+            exercised.update(name for r in pr.results for name in r.prompts_used)
+            flips = [(r.task, not r.required_behavior_failed) for prior, r in paired
+                     if prior.required_behavior_failed != r.required_behavior_failed]
+            lines.append(f"| {shown(repo)} | {main.score} | {pr.score} | {show_flips(flips, hidden(repo))} |")
+            failed = [task for task, passed in flips if not passed]
+            if failed:
+                regressions.append(shown_tasks(repo, failed))
+            paired_names = {r.task for _, r in paired}
+            unfinished = sorted({r.task for r in main.results + pr.results} - paired_names)
+            if unfinished:
+                incomplete.append(shown_tasks(repo, unfinished))
+            complete = complete and bool(paired) and len(paired_names) == len(main.results) == len(pr.results)
+        totals = {arm: Arm("", [r for _, result in ran for r in result[arm].results]) for arm in ("main", "pr")}
         lines += [f"| all | {totals['main'].score} | {totals['pr'].score} | |", ""]
         ids = [a.run_id for repo, result in ran if not hidden(repo) for a in result.values()]
         lines.append(f"{util.paid_note(totals['main'].paid + totals['pr'].paid).capitalize()}."
                      + (f" Runs {prompt_loader.code_list(ids)}." if ids else ""))
+    unmeasured = [name for name in changed_prompts if name not in exercised]
     if unmeasured:
-        lines.append(f"Not measured, as no eval runs them: {prompt_loader.code_list(unmeasured)}.")
+        lines.append(f"Not measured in the candidate arm: {prompt_loader.code_list(unmeasured)}.")
+    incomplete.extend(shown_tasks(repo, tasks) for repo, _, tasks in skipped if tasks)
+    if incomplete:
+        lines.append(f"Incomplete eval tasks: {', '.join(incomplete)}.")
     if skipped:
-        lines.append("Skipped: " + ", ".join(f"{shown(repo)} ({why})" for repo, why in skipped) + ".")
-    return "\n".join(lines).rstrip() + "\n"
+        lines.append("Skipped: " + ", ".join(f"{shown(repo)} ({why})" for repo, why, _ in skipped) + ".")
+    return Comparison("\n".join(lines).rstrip() + "\n", regressions, unmeasured, complete, incomplete)

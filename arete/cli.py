@@ -38,7 +38,7 @@ def parser() -> argparse.ArgumentParser:
     return ap
 
 
-def report_status_import_failure(problem: SystemExit) -> None:
+def status_from_heartbeat(problem: SystemExit) -> int:
     _, state, isolated = local_paths.local_dirs(Path.home())
     print(problem, file=sys.stderr)
     try:
@@ -46,9 +46,10 @@ def report_status_import_failure(problem: SystemExit) -> None:
     except (OSError, ValueError):
         beat = None
     if isinstance(beat, dict) and (revisions := codebase.serve_revisions(beat)):
-        print(f"last recorded serve heartbeat at {beat.get('at', 'unknown time')}, {revisions}", file=sys.stderr)
-    else:
-        print("serve heartbeat has no recorded revisions", file=sys.stderr)
+        print(f"serve heartbeat at {beat.get('at', 'unknown time')}, {revisions}")
+        return 0
+    print("serve heartbeat has no recorded revisions", file=sys.stderr)
+    return 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -60,8 +61,7 @@ def main(argv: list[str] | None = None) -> int:
         except SystemExit as problem:
             if args.json or args.run_id or args.offline:
                 raise
-            report_status_import_failure(problem)
-            return 1
+            return status_from_heartbeat(problem)
         from .commands.setup import cmd_status
 
         args.cmd, args.fn = "status", cmd_status

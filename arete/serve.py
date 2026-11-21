@@ -28,12 +28,14 @@ from . import (
     devices,
     environment,
     explain,
+    gh,
     hold_review,
     install,
     loop_run,
     loops,
     oncall,
     paths,
+    pilot,
     principals,
     record,
     routing,
@@ -55,6 +57,9 @@ from .store import runs as run_store
 from .store import sources as source_store
 
 TICK_SECONDS = 20
+DEPLOY_SECONDS = 120
+DEPLOY_API_TIMEOUT = 20
+PILOT_LOCK = "pilot-doc-fix"
 PRUNE_SECONDS = 3600
 ROTATE_SECONDS = 3600
 APPROVAL_RETRY_SECONDS = 900
@@ -145,13 +150,48 @@ def next_due(loop: Loop, after: datetime) -> str:
 
 def code_stamp() -> frozenset:
     stamp = set()
-    for p in [*paths.PACKAGE_DIR.rglob("*.py"), *dashboard.web_files()]:
+    for p in [*paths.PACKAGE_DIR.rglob("*.py"), *paths.ADWS_DIR.glob("*.py"), *dashboard.web_files()]:
         try:
             st = p.stat()
         except FileNotFoundError:
             continue
         stamp.add((str(p), st.st_mtime_ns, st.st_size))
+    if head := codebase.checkout_head():
+        stamp.add(("HEAD", head))
     return frozenset(stamp)
+
+
+def deploy_refusal(src: Path, base: str, tip: str) -> str | None:
+    head = util.git(["rev-parse", "--verify", "HEAD"], src, timeout=10, retry=False).strip()
+    if head == tip:
+        return None
+    if util.git(["branch", "--show-current"], src, timeout=10, retry=False).strip() != base:
+        return "on another branch"
+    if util.git(["--no-replace-objects", "status", "--porcelain", "--untracked-files=no",
+                 "--ignore-submodules=untracked"], src, timeout=10, retry=False):
+        return "dirty"
+    ancestor = util.git(["--no-replace-objects", "merge-base", head, tip], src,
+                        check=False, timeout=10, retry=False).strip()
+    return "" if ancestor == head else "diverged"
+
+
+def pilot_deploy_refusal() -> str:
+    try:
+        tasks = list((paths.STATE_DIR / PILOT_LOCK).iterdir())
+    except FileNotFoundError:
+        return ""
+    except OSError:
+        return "pilot receipt unavailable"
+    for task in tasks:
+        try:
+            receipt = json.loads(paths.read_confined(task / "receipt.json"))
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except (OSError, ValueError):
+            return "pilot receipt unavailable"
+        if not isinstance(receipt, dict) or receipt.get("phase") not in ("held", "healthy", "spent"):
+            return "live pilot receipt"
+    return ""
 
 
 def reap_children() -> None:
@@ -207,6 +247,10 @@ class Server:
         self.polls: dict[str, Future] = {}
         self.sweep: Future | None = None
         self.oncall: Future | None = None
+        self.deployment: Future | None = None
+        self.deploy_at = time.monotonic() - DEPLOY_SECONDS
+        self.deploy_refusals: set[tuple[str, str]] = set()
+        self.checkout_update = threading.Lock()
         self.zte_work: Future | None = None
         self.zte_at = 0.0
         self.oncall_error = ""
@@ -235,7 +279,11 @@ class Server:
         self.alert_open = False
         self.alert_checked = False
         self.alert_last: Future | None = None
-        self.code = self.code_seen = code_stamp()
+        self.code_seen = code_stamp()
+        self.code = self.code_seen
+        if codebase.RELEASE:
+            self.code = frozenset(entry for entry in self.code if entry[0] != "HEAD") | {
+                ("HEAD", codebase.RELEASE[:12])}
         self.code_note = ""
         self.migration_stamp = None
         self.migration_error = ""
@@ -391,8 +439,13 @@ class Server:
             self.say(note)
 
     def run_pass(self) -> None:
-        self.guard("stage:code", self.load_new_code)
+        if self.checkout_update.acquire(blocking=False):
+            try:
+                self.guard("stage:code", self.load_new_code)
+            finally:
+                self.checkout_update.release()
         self.guard("tick", self.tick)
+        self.guard("stage:deploy", self.deploy_when_due)
         self.guard("stage:inherited", self.reap_inherited)
         self.ticks += 1
         self.guard("stage:alerts", self.watch_alerts)
@@ -400,6 +453,83 @@ class Server:
             self.beat()
         except Exception as e:
             self.say(f"beat failed: {type(e).__name__}: {e}")
+
+    def deploy_when_due(self) -> None:
+        if self.deployment is not None:
+            if not self.deployment.done():
+                return
+            finished, self.deployment = self.deployment, None
+            finished.result()
+        now = time.monotonic()
+        if now - self.deploy_at >= DEPLOY_SECONDS and not self.config_problem:
+            self.deploy_at = now
+            self.deployment = self.pool.submit(self.deploy, self.cfg)
+
+    def deploy(self, cfg: config.Config) -> None:
+        if not (repo := cfg.repo_for_path(paths.PACKAGE_DIR)):
+            return
+        src = repo.path.resolve()
+        root = util.git(["rev-parse", "--show-toplevel"], paths.PACKAGE_DIR, check=False, timeout=10).strip()
+        if not root or Path(root).resolve() != src:
+            return
+        required = config.load_layer(repo.layer_dir).required_check
+        if required is None and repo.name == cfg.arete_repo:
+            required = pilot.CHECK
+        if required is not None:
+            self.deploy_checkout(repo, src, required)
+
+    def deploy_checkout(self, repo: config.Repo, src: Path, required: dict) -> None:
+        with util.repo_lock(src):
+            if not (github := loops.github_remote(src) or repo.github):
+                return
+            if not (base := gh.default_branch(github, fallback="", timeout=DEPLOY_API_TIMEOUT, retry=False)):
+                raise RuntimeError(f"could not determine the default branch of {github}")
+            ref = f"refs/remotes/origin/{base}"
+            util.git(["fetch", "-q", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules",
+                      "origin", f"+refs/heads/{base}:{ref}"], src,
+                     timeout=45, env={"GIT_TERMINAL_PROMPT": "0"}, retry=False)
+            with self.checkout_update:
+                tip = util.git(["rev-parse", "--verify", ref], src, timeout=10, retry=False).strip()
+                if not self.deploy_ready(src, base, tip):
+                    return
+                if reason := pilot_deploy_refusal() or gh.deployment_ci_refusal(
+                    github, tip, required, timeout=DEPLOY_API_TIMEOUT,
+                ):
+                    self.deploy_refused(src, tip, reason)
+                    return
+                self.deploy_tip(src, base, ref, tip)
+
+    def deploy_tip(self, src: Path, base: str, ref: str, tip: str) -> None:
+        if util.git(["rev-parse", "--verify", ref], src, timeout=10, retry=False).strip() != tip:
+            return
+        if not self.deploy_ready(src, base, tip):
+            return
+        subject = util.git(["--no-replace-objects", "show", "-s", "--format=%s", tip], src,
+                           timeout=10, retry=False).strip()
+        with util.lock(PILOT_LOCK) as free:
+            reason = pilot_deploy_refusal() if free else "pilot is active"
+            if reason:
+                self.deploy_refused(src, tip, reason)
+                return
+            try:
+                util.git(["--no-replace-objects", "merge", "-q", "--ff-only", "--no-autostash",
+                          "--no-overwrite-ignore", tip], src, timeout=30, retry=False)
+            except RuntimeError as error:
+                self.deploy_refused(src, tip, str(error))
+                return
+        self.say(f"deploy: {paths.short_path(src)} fast forwarded to {tip} ({subject})")
+
+    def deploy_ready(self, src: Path, base: str, tip: str) -> bool:
+        reason = deploy_refusal(src, base, tip)
+        if reason:
+            self.deploy_refused(src, tip, reason)
+        return reason == ""
+
+    def deploy_refused(self, src: Path, tip: str, reason: str) -> None:
+        key = (tip, reason)
+        if key not in self.deploy_refusals:
+            self.deploy_refusals.add(key)
+            self.say(f"deploy: {paths.short_path(src)} left alone for {tip} ({reason})")
 
     def watch_alerts(self) -> None:
         due = {k: v for k, v in self.failing.items()
@@ -744,12 +874,13 @@ class Server:
             self.code_problem = ""
         if stamp == self.code or not steady:
             return
-        check = util.sh([sys.executable, "-c", IMPORT_CHECK], timeout=120)
+        entrypoint = f"import sys; sys.path.insert(0, {str(paths.PACKAGE_DIR.parent)!r}); "
+        check = util.sh([sys.executable, "-I", "-c", entrypoint + IMPORT_CHECK], timeout=120)
         if check.returncode != 0:
             self.note_once("new code does not import, so serve keeps the code it started with: "
                            + util.last_line(check.stderr or check.stdout, 300))
             return
-        candidate = util.sh([sys.executable, "-c", CONFIG_CHECK], timeout=120)
+        candidate = util.sh([sys.executable, "-I", "-c", entrypoint + CONFIG_CHECK], timeout=120)
         if candidate.returncode != 0 and not config.load_or_problem()[1]:
             self.code_problem = ("new code cannot read config.toml, so serve keeps the code it started with: "
                                  + util.last_line(candidate.stderr or candidate.stdout, 300))
@@ -812,6 +943,7 @@ class Server:
         except Exception:
             running = None
         util.write_json(control.BEAT_FILE, {
+            "release": codebase.RELEASE,
             "schema": foundation.LATEST,
             "db": db,
             "pid": os.getpid(), "engine": codebase.STAMP, "checkout_head": codebase.checkout_head(),
