@@ -41,6 +41,10 @@ STATE_FIELDS = ("plan_text", "goal", "estimate", "left_for_a_person", "build_sum
 REFRESHABLE_LINEAGE = {"catalog_sha", "controller_prompt", "operations_sha"}
 
 
+class UnchangedPushedHead(ValueError):
+    pass
+
+
 def policy_fingerprint(cfg, layer, closed_context):
     effective = asdict(layer)
     effective.pop("factory_path")
@@ -575,6 +579,33 @@ class Controller:
         finally:
             self.run.resolved_settings = previous
 
+    def validate_publication_diff(self):
+        b = self.job.b
+        staged = b.restage()
+        checkouts = self.job.checkouts
+        after = "the final orchestrated tree"
+        if any(c.lease for c in checkouts):
+            bases = {
+                c.github: (c.base_commit if c in staged.merged
+                           else util.git(["merge-base", c.origin_base, "HEAD"], c.wt).strip())
+                for c in checkouts
+            }
+            if not any(util.git(["diff", "--cached", "--name-only", bases[c.github]], c.wt) for c in checkouts):
+                raise workspace.RunFailed(f"{after} undid every change")
+            heads = {c.github: head for c in checkouts if (head := c.publication_baseline)}
+            if not staged.merged and heads and not any(
+                util.git(["diff", "--cached", "--name-only", heads.get(c.github, bases[c.github])], c.wt)
+                for c in checkouts
+            ):
+                if (self.run.environment_release and not self.data.get("ci_failed")
+                        and flows.retry_passed(self.job.verified) and any(c.pr and c.github in heads for c in checkouts)):
+                    whole = staged if b.from_base else b.restage(from_base=True)
+                    return b.validate_diff(whole, after, from_base=True)
+                label = "head" if len(heads) == 1 else "heads"
+                shas = ", ".join(f"`{head}`" for head in heads.values())
+                raise UnchangedPushedHead(f"nothing changed since the pushed {label} {shas}")
+        b.validate_diff(staged, after)
+
     def publish(self):
         self.barrier()
         if pending := ledger.catch_up_push(self.data):
@@ -588,7 +619,7 @@ class Controller:
             raise ValueError("publication requires the full owner check policy")
         if self.job.verified.verdict == "fail":
             raise ValueError("behavioral verification failed; repair or finish failed")
-        self.job.b.require_valid_diff("the final orchestrated tree")
+        self.validate_publication_diff()
         if self.run.dry_run:
             self.ending = flows.end_dry_run(self.flow)
             return {"status": "dry-run"}
@@ -891,12 +922,13 @@ class Controller:
             return {"reason": args["reason"]}
         raise ValueError("unknown orchestration operation")
 
-    def dispatch(self, action):
+    def dispatch(self, action) -> ValueError | None:
         if action["state"] != "accepted":
             return
         if action["op"] != "worker.start" and action["op"] != "worker.continue":
             ledger.transition(self.lease, action["id"], "running", {"input_stamp": {
                 "tree": self.fingerprint(), "policy": self.policy_sha(), "acceptance": self.data["acceptance"]}})
+        refusal = None
         try:
             self.executing = action["id"]
             result = self.perform(action)
@@ -907,6 +939,7 @@ class Controller:
             run_lines.write(self.run.id, "action", action=action["id"], op=action["op"], state="succeeded")
             raise
         except ValueError as error:
+            refusal = error
             result = {"error": str(error)[:2000]}
             ledger.transition(self.lease, action["id"], "failed", result)
         except BaseException as error:
@@ -928,6 +961,7 @@ class Controller:
         self.persist()
         run_lines.write(self.run.id, "action", action=action["id"], op=action["op"],
                         state="running" if result is None else "failed" if "error" in result else "succeeded")
+        return refusal
 
     def drive(self):
         verification_passed = False
@@ -1036,7 +1070,8 @@ def single_worker(flow):
                 while controller.workers:
                     controller.collect()
                     time.sleep(0.05)
-                if any(a["state"] in ("failed", "interrupted") for a in ledger.actions(controller.lease)):
+                failed = [a["id"] for a in ledger.actions(controller.lease) if a["state"] in ("failed", "interrupted")]
+                if failed:
                     return flows.finish(flow, "failed", why="single-worker execution did not pass its required gates",
                                         recovery=controller.failure_recovery())
                 if controller.ending:

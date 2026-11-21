@@ -755,7 +755,7 @@ class Staged(diffguard.Diff):
     patch: str = ""
     changed: list[workspace.Checkout] = field(default_factory=list)
     merged: list[workspace.Checkout] = field(default_factory=list)
-    comparisons: dict[str, tuple[str, diffguard.Diff]] = field(default_factory=dict)
+    bases: dict[str, str] = field(default_factory=dict)
 
     @property
     def empty(self) -> bool:
@@ -767,7 +767,7 @@ def base_of_head(c: workspace.Checkout, head: str = "HEAD", *, check: bool = Tru
 
 
 def unpublished_base(c: workspace.Checkout) -> str:
-    published = c.lease or c.onto
+    published = c.publication_baseline or c.onto
     if not published:
         return ""
     base = base_of_head(c, check=False)
@@ -778,40 +778,6 @@ def unpublished_base(c: workspace.Checkout) -> str:
 
 def limit_diff_from(c: workspace.Checkout, against: str) -> diffguard.Diff:
     return diffguard.between(c.wt, "--cached", against, prefix=c.prefix, moves=True)
-
-
-def legacy_published_lines(checkouts: list[workspace.Checkout], heads: dict[str, str], starts: dict[str, str],
-                           total: int, committed: bool, recorded_diffs: set[tuple[bool, str]]) -> dict[str, int]:
-    bases = (False, True) if committed else (True,)
-    matching, validated = [], []
-    for from_base in bases:
-        counts, patches = {}, []
-        try:
-            for c in checkouts:
-                head = heads.get(c.github)
-                if not head:
-                    break
-                start = base_of_head(c, head) if from_base else starts.get(c.github, c.revision)
-                if not start or git(["merge-base", start, head], c.wt).strip() != start:
-                    break
-                diff = diffguard.between(c.wt, start, head, prefix=c.prefix, moves=True)
-                counts[c.github] = diff.lines
-                if diff.files:
-                    patches.append((c, diff.locks, start, head))
-            else:
-                if sum(counts.values()) != total:
-                    continue
-                matching.append(counts)
-                if any(mode == from_base for mode, _ in recorded_diffs):
-                    patch = "".join(checkout_patch(c, locks, start, head) for c, locks, start, head in patches)
-                    if (from_base, vault.hidden(patch)) in recorded_diffs:
-                        validated.append(counts)
-        except (OSError, RuntimeError):
-            continue
-    candidates = validated or matching
-    if candidates and all(counts == candidates[0] for counts in candidates):
-        return candidates[0]
-    return {}
 
 
 def comparison_label(c: workspace.Checkout, against: str, from_base: bool) -> str:
@@ -830,7 +796,7 @@ def stage(checkouts: list[workspace.Checkout], deny: list[str], from_base: bool 
         if merged and not from_base:
             brought = diffguard.between(c.wt, c.lease, c.merge, prefix=c.prefix).counts
             diff.counts = {name: 0 for name in brought} | diff.counts
-        out.comparisons[c.github] = against, diff
+        out.bases[c.github] = against
         if merged:
             out.merged.append(c)
         elif not diff.counts:
@@ -1026,8 +992,6 @@ class Build(TicketWork):
     report: str = ""
     staged: Staged = field(default_factory=Staged)
     committed_lines: int = 0
-    committed_by_repo: dict[str, int] = field(default_factory=dict)
-    committed_lines_bounded: bool = False
     left_for_a_person: str = ""
     check_commands: str = NO_CHECKS
     checked: dict = field(default_factory=dict)
@@ -1097,78 +1061,45 @@ class Build(TicketWork):
                     patch=self.staged.patch)
         return self.staged
 
-    def earlier_committed_bounds(self, full_repos: set[str]) -> tuple[int, int]:
-        if all(c.github in full_repos for c in self.checkouts):
-            return 0, 0
-        upper = self.committed_lines - sum(self.committed_by_repo.get(repo, 0) for repo in full_repos)
-        if full_repos or self.committed_lines_bounded:
-            unallocated = self.committed_lines - sum(self.committed_by_repo.values())
-            return upper - unallocated, upper
-        return upper, upper
-
     def require_valid_diff(self, after: str, planned: str = "", *, from_base: bool | None = None) -> None:
-        staged = self.restage(from_base=from_base)
+        self.validate_diff(self.restage(from_base=from_base), after, planned, from_base=from_base)
+
+    def validate_diff(self, staged: Staged, after: str, planned: str = "", *, from_base: bool | None = None) -> None:
         if staged.empty:
             raise workspace.RunFailed(f"{after} undid every change")
         if staged.denied:
             raise workspace.RunFailed(f"{after} {staged.refusal(self.layer.max_diff_lines)}")
         whole_diff = self.from_base if from_base is None else from_base
-        counts = diffguard.Diff()
-        bases = {}
-        full_repos = set()
-        for c in self.checkouts:
-            against, diff = staged.comparisons[c.github]
-            merged_base = "" if whole_diff else unpublished_base(c)
-            if merged_base:
-                against = merged_base
+        counts, bases = staged, staged.bases
+        total = staged.lines
+        earlier = 0
+        if any(unpublished_base(c) for c in self.checkouts):
+            whole_diff = True
+            counts, bases, total = diffguard.Diff(), {}, 0
+            for c in self.checkouts:
+                against = bases[c.github] = base_of_head(c)
                 diff = limit_diff_from(c, against)
-            if whole_diff or merged_base:
-                full_repos.add(c.github)
-            counts.counts |= diff.counts
-            bases[c.github] = against
-        lower, earlier = self.earlier_committed_bounds(full_repos)
-        resolved = sum(c.resolved_lines for c in self.checkouts if c.github not in full_repos)
+                counts += diff
+                total += diff.lines
+        elif not whole_diff:
+            earlier = self.committed_lines + sum(c.resolved_lines for c in self.checkouts)
+            total += earlier
         limit = self.layer.max_diff_lines
-        current = counts.lines + resolved
-        total = current + earlier
         if total > limit:
             comparisons = []
             for c in self.checkouts:
-                label = comparison_label(c, bases[c.github], c.github in full_repos)
+                label = comparison_label(c, bases[c.github], whole_diff)
                 comparisons.append(f"{c.github} {label}" if len(bases) > 1 else label)
             against = ", ".join(comparisons)
-            if lower != earlier:
-                minimum = current + lower
-                if minimum <= limit:
-                    raise workspace.RunFailed(f"after {after} arete could not verify the {limit} line limit against "
-                                              f"{against}. The diff could be {total} lines because the saved "
-                                              "publication lacks line counts by repository")
-                size = f"at least {minimum}"
-            else:
-                size = str(total)
-            why = f"the diff is {size} lines against {against}, over the {limit} line limit"
-            pushed_lines = f"up to {earlier + resolved}" if lower != earlier else str(earlier + resolved)
-            pushed = f"\n- pushed earlier in this run: {pushed_lines}" if earlier or resolved else ""
+            why = f"the diff is {total} lines against {against}, over the {limit} line limit"
+            pushed = f"\n- pushed earlier in this run: {earlier}" if earlier else ""
             raise workspace.RunFailed(f"after {after} {why}{planned}; split the work",
                             f"### Lines changed by file\n\n{lines_by_file(counts)}{pushed}")
 
     def push(self, branch: str, message: str, *, before_push: Callable[[workspace.Checkout], str] | None = None) -> None:
         self.run.tracker.pr_link(self.ticket, whole=not self.left_for_a_person)
-        merged_lines = {c.github: limit_diff_from(c, base).lines
-                        for c in self.staged.changed if (base := unpublished_base(c))}
-        lower, earlier = self.earlier_committed_bounds(set(merged_lines))
         commit_and_push(self.checkouts, self.staged.changed, branch, message, before_push=before_push)
-        self.committed_lines = earlier
-        self.committed_lines_bounded = lower != earlier
-        for c in self.staged.changed:
-            if c.github in merged_lines:
-                lines = merged_lines[c.github]
-                self.committed_by_repo[c.github] = lines
-                c.resolved_lines = 0
-            else:
-                lines = self.staged.comparisons[c.github][1].lines
-                self.committed_by_repo[c.github] = self.committed_by_repo.get(c.github, 0) + lines
-            self.committed_lines += lines
+        self.committed_lines += self.staged.lines
 
     def check_with_repairs(self, step_name: Callable[[int], str] | None = None) -> tuple[bool, int]:
         step_name = step_name or (lambda n: self.next_step("check_repair"))
@@ -2395,7 +2326,7 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
     except BaseException as error:
         if isinstance(error, CatchUpPathCollision):
             worktree_files.add(error.name)
-        run.catch_up_preserved.update(c.prefix + name for name in worktree_files)
+            run.catch_up_preserved.add(c.prefix + error.name)
         abort_merge(c.wt)
         if (git(["rev-parse", "HEAD"], c.wt).strip() != before.lease
                 or workspace.uncommitted(c.wt, tracked_only=True)):
@@ -2427,7 +2358,8 @@ def push_caught_up_head(b: Build, c: workspace.Checkout, branch: str, head: str)
             row = {}
         remote = row.get("headRefOid")
         if remote == head:
-            c.lease, c.onto = head, ""
+            c.note_pushed_head(head)
+            c.onto = ""
             return
         if remote and (hold := gh.merge_ref_hold(row, c.lease, c.base)):
             raise CatchUpPushUnconfirmed(f"{why}: {hold}", f"{detail} GitHub reports `{remote}`.", retryable=False)
@@ -2647,7 +2579,7 @@ def commit_and_push(checkouts: list[workspace.Checkout], changed: list[workspace
             aftermath = ("The pilot will not retry the push." if before_push
                          else "A retry builds on whatever reached the branch.")
             raise workspace.RunFailed(f"the push to {c.github} failed after arete pushed {done}", f"{e}\n\n{aftermath}") from e
-        c.lease = head or git(["rev-parse", "HEAD"], c.wt).strip()
+        c.note_pushed_head(head or git(["rev-parse", "HEAD"], c.wt).strip())
         c.onto = ""
         pushed.append(c)
 
@@ -2997,9 +2929,11 @@ def merge_moved_bases(run: AgentRun, checkouts: list[workspace.Checkout], layer:
         if environment_retry and (not c.base_commit or
                                   git(["merge-base", c.base_commit, base], c.wt).strip() != c.base_commit):
             raise workspace.RunFailed(f"the base for {c.github} no longer contains the saved base")
-        c.base_commit = base
-        if git(["rev-list", "--count", f"HEAD..{c.base_commit}"], c.wt).strip() == "0":
+        if git(["rev-list", "--count", f"HEAD..{base}"], c.wt).strip() == "0":
+            if not pending_merge(c):
+                c.base_commit = base
             continue
+        c.base_commit = base
         if edits := workspace.uncommitted(c.wt, tracked_only=allow_untracked):
             raise workspace.RunFailed(f"{c.github} has uncommitted edits ({', '.join(edits[:5])}), so arete merged nothing into "
                             "them and left them as they are")
