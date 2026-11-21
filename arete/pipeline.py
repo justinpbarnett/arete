@@ -3177,15 +3177,16 @@ def _review(b: Build, plan: str, verified: verify.Verified, step: str = "review"
             reply: str = "") -> Review:
     before = before or Review.stored({})
     earlier = before.blocking()
-    res = b.run.agent(step, b.brief.prompt(
+    text = b.brief.prompt(
         "review", plan=plan, checks=b.report, evidence=verified.markdown(), compare=compare_with_fork(b.checkouts),
         diff=util.tail(diffguard.fold_moved(b.staged.patch), MAX_DIFF_IN_PROMPT),
-        earlier=earlier_review(earlier, reply, fixed_since(b, before.trees or {}))),
-                      b.ws, role="review", allowed_tools=prompt_loader.bash_rules(b.read_bash),
-                      json_schema=REVIEW_SCHEMA)
-    if not res.ok or not isinstance(res.structured, dict) or not isinstance(res.structured.get("problems"), list):
-        return Review.failed_step(earlier, before.waived or [], before.trees or {})
-    return Review.judged(res.structured, earlier, before.waived or [], index_trees(b.checkouts))
+        earlier=earlier_review(earlier, reply, fixed_since(b, before.trees or {})))
+    allowed_tools = prompt_loader.bash_rules(b.read_bash)
+    for _ in range(2):
+        res = b.run.agent(step, text, b.ws, role="review", allowed_tools=allowed_tools, json_schema=REVIEW_SCHEMA)
+        if res.ok and isinstance(res.structured, dict) and isinstance(res.structured.get("problems"), list):
+            return Review.judged(res.structured, earlier, before.waived or [], index_trees(b.checkouts))
+    return Review.failed_step(earlier, before.waived or [], before.trees or {})
 
 
 def earlier_review(earlier: list[dict], reply: str, fixed: str) -> str:
@@ -3359,8 +3360,10 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                 run.save(f"{step}-replay-drivers.json", asdict(observed))
             if not replay_only and probes_passed:
                 agent_started = True
+                fault_controls = verify.fault_note(v) if url and delivery_verification else ""
                 res = run.agent(step, b.brief.prompt(
-                    prompt_name, surface=surface_note(v, url, evidence), notes=v.notes, scratch=scratch.note(attempt),
+                    prompt_name, surface=surface_note(v, url, evidence) + fault_controls, notes=v.notes,
+                    scratch=scratch.note(attempt),
                     commands=prompt_loader.code_list(bash), checks=check_list(b.layer),
                     compare=compare_with_fork(b.checkouts), owner=run.owner_note,
                     journeys=journeys.guidance(selected or feature_map), **values),
@@ -3458,7 +3461,8 @@ def surface_note(v: config.Verify, url: str, evidence: Path) -> str:
             "saved there also serves as a fixture.\n"
             "- Read `browser_console_messages` after each state. Name each console error and each dev error overlay "
             "or badge in `saw`, and say whether the change causes it.\n"
-            "- Send API requests with curl, shaped the way the app's clients send them, and read the status and body.")
+            "- For ordinary API checks, send requests with curl, shaped the way the app's clients send them, "
+            "and read the status and body.")
 
 
 def restore_worktrees(untracked_before: dict[Path, set[str]], evidence: Path) -> None:

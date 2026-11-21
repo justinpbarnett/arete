@@ -4,6 +4,7 @@ import http.client
 import json
 import os
 import re
+import shlex
 import stat
 import subprocess
 import threading
@@ -321,6 +322,40 @@ def serving(v: config.Verify, cwd: Path, log: Path, cfg: config.Config | None = 
                     lifetime["stopped"] = True
                 except PermissionError:
                     pass
+
+
+def fault_note(v: config.Verify) -> str:
+    try:
+        wrapper, *command = shlex.split(v.start)
+    except ValueError:
+        return ""
+    if command[:4] != ["uv", "run", "arete", "dashboard"]:
+        return ""
+    if wrapper == "sandbox":
+        for pattern in v.allow_bash:
+            executable = pattern.removesuffix(" *")
+            if trusted_wrapper(executable) and executable != "sandbox":
+                wrapper = executable
+                break
+    if not trusted_wrapper(wrapper):
+        return ""
+    cli = shlex.quote(wrapper) + " uv run arete verify-fault"
+    return ("\n\n## Scratch fault controls\n\n"
+            "Run these commands from the same worktree as the configured dashboard. Use the CLI to cause the fault, "
+            "then observe the result with the browser tools. Do not use page scripts or write directly to the store.\n\n"
+            f"- `{cli} arm --route ROUTE --status STATUS [--body TEXT] [--count COUNT]` replaces the next "
+            "response on that route by default. Include the query string for an exact query match and quote the route. "
+            "Omit the body to use the contract problem for a documented error status, or quote a JSON body as one argument. "
+            "Pass a count for multiple responses.\n"
+            f"- `{cli} drop-streams` closes the open event streams. New connections can open as usual.\n"
+            f"- `{cli} event --kind KIND --run RUN_ID` emits an event for an existing scratch run.\n"
+            f"- `{cli} clear` clears response faults and pending events.")
+
+
+def trusted_wrapper(executable: str) -> bool:
+    path = Path(executable)
+    return executable == "sandbox" or (
+        path.is_absolute() and path.parts[-3:] == ("verification-runtime", "harness", "sandbox"))
 
 
 def wait_until_ready(proc: subprocess.Popen, url: str, seconds: int, log: Path) -> None:
