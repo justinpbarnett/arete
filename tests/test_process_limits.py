@@ -915,6 +915,10 @@ class BudgetTests(Isolated):
 
 
 class QueueTests(Isolated):
+    def setUp(self):
+        super().setUp()
+        self.enterContext(patch.object(scratch, "service_labels", side_effect=dict))
+
     def feedback_ticket(self):
         self.repo.layer_dir.mkdir()
         (self.repo.layer_dir / "config.toml").write_text('[factory]\npath = "classic"\n[limits]\nmax_repair_cycles = 3\n')
