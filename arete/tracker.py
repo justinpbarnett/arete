@@ -750,14 +750,25 @@ WAIT_JIRA = re.compile(r"(?<![\w-])[A-Z][A-Z0-9_]+-\d+(?![\w-])", re.IGNORECASE)
 
 
 def waits_on(body: str) -> list[int]:
-    found = [int(n) for rest in WAIT_LINE.findall(body or "") for n in WAIT_REF.findall(rest)]
+    found = []
+    for rest in WAIT_LINE.findall(body or ""):
+        for number in WAIT_REF.findall(rest):
+            try:
+                found.append(int(number))
+            except ValueError:
+                continue
     return list(dict.fromkeys(found))
 
 
 def github_waits(body: str, repo: str) -> list[tuple[str, int]]:
-    found = [((qualified or url_repo or repo).casefold(), int(number or url_number or local))
-             for line in WAIT_LINE.findall(body or "")
-             for qualified, number, url_repo, url_number, local in WAIT_GITHUB.findall(line)]
+    found = []
+    for line in WAIT_LINE.findall(body or ""):
+        for qualified, number, url_repo, url_number, local in WAIT_GITHUB.findall(line):
+            try:
+                issue = int(number or url_number or local)
+            except ValueError:
+                continue
+            found.append(((qualified or url_repo or repo).casefold(), issue))
     return list(dict.fromkeys(found))
 
 

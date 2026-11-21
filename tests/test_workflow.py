@@ -52,6 +52,33 @@ class QueueScoringTests(unittest.TestCase):
         self.enterContext(mock.patch.object(poll.zte, "reserved", return_value=False))
         return poll.next_ticket(self.repo, self.source, pipeline.SkipLog({}))
 
+    def test_waits_on_ignores_oversized_reference(self):
+        oversized = "9" * 4500
+        self.assertEqual(tracker.waits_on(f"Waits on #12, #{oversized}, #34 and #12."), [12, 34])
+
+    def test_poll_uses_valid_reference_alongside_oversized_reference(self):
+        oversized = "9" * 4500
+        body = (f"Waits on #{oversized}, fixture/repo#{oversized}, "
+                f"https://github.com/fixture/repo/issues/{oversized} and #1.")
+        issues = [self.issue(1), self.issue(2, "agent:pr", body=body), self.issue(3, created="2026-11-20T00:00:00Z")]
+        self.enterContext(mock.patch.object(gh, "issues", return_value=issues))
+
+        self.assertEqual(self.next_ticket().id, "1")
+
+    def test_poll_ranks_only_same_repository_references(self):
+        cases = [
+            ("Fixture/Repo#708", "708"),
+            ("https://github.com/Fixture/Repo/issues/708", "708"),
+            ("fixture/other#708", "692"),
+            ("https://github.com/fixture/other/issues/708", "692"),
+        ]
+        for reference, expected in cases:
+            with self.subTest(reference=reference):
+                issues = [self.issue(708), self.issue(283, "agent:pr", body=f"Waits on {reference}."),
+                          self.issue(692, created="2026-11-20T00:00:00Z")]
+                with mock.patch.object(gh, "issues", return_value=issues):
+                    self.assertEqual(self.next_ticket().id, expected)
+
     def test_poll_prioritizes_prerequisite_of_in_flight_chain(self):
         issues = [self.issue(1), self.issue(2, "agent:pr", body="Waits on #1."),
                   self.issue(3, "agent:running", body="Waits on #2."),
