@@ -30,6 +30,10 @@ PROBE_GRACE_SECONDS = 0.2
 TIMED_OUT = 124
 
 
+class CommandIncomplete(subprocess.CompletedProcess):
+    pass
+
+
 def digest(*parts: bytes | str) -> str:
     h = hashlib.sha256()
     for part in parts:
@@ -99,11 +103,11 @@ def sh(
             env=full_env,
         )
     except subprocess.TimeoutExpired as e:
-        res = subprocess.CompletedProcess(
+        res = CommandIncomplete(
             cmd, TIMED_OUT, stdout=_s(e.stdout), stderr=_s(e.stderr) + f"\n[arete] timed out after {timeout}s"
         )
     except FileNotFoundError as e:
-        res = subprocess.CompletedProcess(cmd, 127, stdout="", stderr=str(e))
+        res = CommandIncomplete(cmd, 127, stdout="", stderr=str(e))
     if check and res.returncode != 0:
         raise RuntimeError(f"{cmd!r} failed ({res.returncode}): {res.stderr.strip() or res.stdout.strip()}")
     return res

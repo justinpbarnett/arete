@@ -95,6 +95,7 @@ NOT_CAUSED_LEFT_FOR_A_PERSON = (f"{LEFT_HEADING}\n\n{LEFT_BY_A_PERSON} A red che
 CHECKED_IN_USE_HEADING = "## Checked in use"
 RUNS_LOG = "runs.log"
 RUN_START_SECONDS = 10
+PROMPT_CATCH_UP = "The prompt checkout is waiting to catch up with a miner PR merge."
 SUCCEEDED = ("pr", "noop", "needs-info", "dry-run", "done")
 ANSWER_FILE = "answer.md"
 CHECK_LANE_POLL_SECONDS = 2
@@ -1264,6 +1265,13 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
               script: Script | None = None, admission: Callable | None = None,
               launch_done: Callable | None = None, closed_context: tuple[str, ...] = ()) -> int:
     try:
+        if paths.pending_prompt_merges():
+            print(PROMPT_CATCH_UP)
+            return 2
+    except OSError as e:
+        print(f"Could not check prompt checkout catch-up: {e}")
+        return 2
+    try:
         producer_baseline = scratch.process_ids()
     except OSError:
         producer_baseline = None
@@ -1507,6 +1515,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     if not (flow and flow.refusal):
                         run.budget.capture(current or tk.get(tid))
                 with run_lines.nonblocking_appends(check_work_log) if zte_grant else nullcontext():
+                    if paths.pending_prompt_merges():
+                        raise factory.Refused(PROMPT_CATCH_UP)
                     work_started = True
                     status, summary, pr_url = flows.driven(flow, script.drive) if script else _run(cfg, run, slot)
             if zte_grant:
@@ -2902,11 +2912,12 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
     from . import pilot, readme_verify, zte
 
     run, v = b.run, verify.with_free_ports(b.layer.verify)
-    tid = str(run.tid)
-    zte_verify = zte.reserved(tid) and prompt_name == role == "verify"
-    readme_task = (pilot.is_pilot_task(tid) and prompt_name == role == "verify") or zte_verify
+    delivery_verification = prompt_name == role == "verify"
+    tid = str(run.tid) if delivery_verification else ""
+    zte_verify = delivery_verification and zte.reserved(tid)
+    readme_task = (delivery_verification and pilot.is_pilot_task(tid)) or zte_verify
     merge_candidate = b.layer.trust_level == "automerge" or readme_task
-    checked_trees = verification_trees(b) if prompt_name == role == "verify" and merge_candidate else {}
+    checked_trees = verification_trees(b) if delivery_verification and merge_candidate else {}
     step = b.next_step(step_name)
     if refusal := verify.port_refusal(v):
         run.log(f"{step}: {refusal}")

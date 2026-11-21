@@ -10,7 +10,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from urllib.parse import urlencode
@@ -21,6 +21,7 @@ ARETE_MARK = "<!-- arete -->"
 GITHUB_API = "https://api.github.com"
 CLONE_TOKEN_PERMISSIONS = {"contents": "read"}
 NO_ISSUE = "Could not resolve to an issue"
+REQUEST_TIMEOUT_SECONDS = 120
 
 
 class GhError(RuntimeError):
@@ -62,11 +63,18 @@ def unscreened_text(args: list[str], input: str | None) -> bool:
                for flag, value in itertools.pairwise(args))
 
 
-def gh(args: list[str], cwd=None, timeout: float = 120, input: str | None = None, write: bool = False) -> str:
+def gh(args: list[str], cwd=None, timeout: float = REQUEST_TIMEOUT_SECONDS, input: str | None = None, write: bool = False,
+       *, deadline: float | None = None) -> str:
     if unscreened_text(args, input):
         raise TypeError("text sent to GitHub must come from gh.outgoing")
-    res = util.sh_with_network(["gh", *args], cwd=cwd, timeout=timeout, input=input,
-                               rerun=util.NEVER_SENT if write else util.NETWORK_ERROR)
+    if deadline is None:
+        res = util.sh_with_network(["gh", *args], cwd=cwd, timeout=timeout, input=input,
+                                   rerun=util.NEVER_SENT if write else util.NETWORK_ERROR)
+    else:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise GhError("GitHub request deadline expired")
+        res = util.sh(["gh", *args], cwd=cwd, timeout=min(timeout, remaining), input=input)
     if res.returncode != 0:
         command = " ".join(itertools.takewhile(lambda arg: not arg.startswith("-"), args))
         output = res.stdout + res.stderr
@@ -77,8 +85,8 @@ def gh(args: list[str], cwd=None, timeout: float = 120, input: str | None = None
     return res.stdout
 
 
-def gh_json(args: list[str], cwd=None, timeout: float = 120):
-    out = gh(args, cwd=cwd, timeout=timeout)
+def gh_json(args: list[str], cwd=None, timeout: float = REQUEST_TIMEOUT_SECONDS, *, deadline: float | None = None):
+    out = gh(args, cwd=cwd, timeout=timeout, deadline=deadline)
     return json.loads(out) if out.strip() else None
 
 
@@ -307,7 +315,7 @@ def pr_create(repo: str, head: str, base: str, title: str, body: str, labels: Se
 
 def prs(repo: str, label: str = "", state: str = "open", limit: int = 50) -> list[dict]:
     args = ["pr", "list", "--repo", repo, "--state", state, "--limit", str(limit),
-            "--json", "number,title,url,state,mergedAt,closedAt,headRefName,labels,body"]
+            "--json", "number,title,url,state,createdAt,mergedAt,closedAt,headRefName,labels,body"]
     if label:
         args += ["--label", label]
     return gh_json(args) or []
@@ -425,7 +433,8 @@ def pr_number(url: str) -> int:
 
 
 def pr_view(url_or_number: str, repo: str = "") -> dict:
-    args = ["pr", "view", str(url_or_number), "--json", "number,state,mergedAt,mergeCommit,closedAt,updatedAt,url,headRefName"]
+    fields = "number,state,mergedAt,mergeCommit,closedAt,updatedAt,url,headRefName,baseRefName"
+    args = ["pr", "view", str(url_or_number), "--json", fields]
     if repo:
         args += ["--repo", repo]
     return gh_json(args) or {}
@@ -456,6 +465,19 @@ def pr_set_draft(url: str, draft: bool) -> None:
     gh(["pr", "ready", url, *(["--undo"] if draft else [])])
 
 
+def pr_close(url: str) -> None:
+    gh(["pr", "close", url], write=True)
+
+
+def pr_add_label(url: str, name: str) -> None:
+    gh(["pr", "edit", url, "--add-label", name], write=True)
+
+
+def pr_update_branch(repo: str, number: int, head: str) -> None:
+    gh(["api", "-X", "PUT", f"repos/{repo}/pulls/{number}/update-branch", "--input", "-"],
+       input=Outgoing(json.dumps({"expected_head_sha": head})), write=True)
+
+
 def pr_draft_and_head(url: str) -> tuple[bool, str]:
     row = gh_json(["pr", "view", url, "--json", "isDraft,headRefOid"]) or {}
     return bool(row.get("isDraft")), str(row.get("headRefOid") or "")
@@ -465,10 +487,10 @@ MERGE_WAIT_SECONDS = 120
 MERGE_POLL_SECONDS = 5
 
 
-def merge_ci_passed(repo: str, head: str, *, required: dict | None = None) -> bool:
+def merge_ci_passed(repo: str, head: str, *, required: dict | None = None, deadline: float | None = None) -> bool:
     path = f"repos/{repo}/commits/{head}"
-    checks = gh_json(["api", f"{path}/check-runs?filter=latest&per_page=100", "--paginate", "--slurp"])
-    statuses = gh_json(["api", f"{path}/statuses?per_page=100", "--paginate", "--slurp"])
+    checks = gh_json(["api", f"{path}/check-runs?filter=latest&per_page=100", "--paginate", "--slurp"], deadline=deadline)
+    statuses = gh_json(["api", f"{path}/statuses?per_page=100", "--paginate", "--slurp"], deadline=deadline)
     if (not isinstance(checks, list) or not checks
             or any(not isinstance(page, dict) or not isinstance(page.get("check_runs"), list) for page in checks)
             or not isinstance(statuses, list) or not statuses):
@@ -483,46 +505,72 @@ def merge_ci_passed(repo: str, head: str, *, required: dict | None = None) -> bo
             return False
         for row in page:
             contexts.setdefault(row["context"], row["state"])
-    return (bool(runs or contexts) and all(row["status"] == "completed" and row["conclusion"] == "success"
-                                           for row in runs) and all(state == "success" for state in contexts.values()))
+    return (bool(runs or contexts)
+            and all(row.get("head_sha") == head and row["status"] == "completed" and row["conclusion"] == "success"
+                    for row in runs)
+            and all(state == "success" for state in contexts.values()))
 
 
 def merge_readiness(repo: str, number: int, head: str, base: str, base_sha: str, *, wait: float = 0,
-                    required: dict | None = None) -> tuple[str, str]:
+                    required: dict | None = None, ci_deadline: float | None = None) -> tuple[str, str]:
     if not head or not base or not base_sha:
         return "", "the checked head and base are not known"
-    deadline = time.monotonic() + wait
+    started = time.monotonic()
+    deadline = ci_deadline if ci_deadline is not None else started + wait
+    request_deadline = started + REQUEST_TIMEOUT_SECONDS if ci_deadline is not None else None
+    hold = "the miner run budget expired while waiting for CI"
     fields = "state,isDraft,headRefOid,baseRefName,baseRefOid,mergeStateStatus,mergeable,title"
     while True:
-        row = gh_json(["pr", "view", str(number), "--repo", repo, "--json", fields]) or {}
-        if row.get("state") != "OPEN" or row.get("isDraft") is not False:
-            return "", "the PR is not open and ready for review"
-        if row.get("headRefOid") != head:
-            return "", "the PR head changed after verification"
-        if row.get("baseRefName") != base or row.get("baseRefOid") != base_sha:
-            return "", "the PR base changed after verification"
-        state, mergeable = row.get("mergeStateStatus"), row.get("mergeable")
+        try:
+            row = gh_json(["pr", "view", str(number), "--repo", repo, "--json", fields],
+                          deadline=request_deadline) or {}
+            state, mergeable = row.get("mergeStateStatus"), row.get("mergeable")
+            if row.get("state") != "OPEN" or row.get("isDraft") is not False:
+                return "", "the PR is not open and ready for review"
+            if row.get("headRefOid") != head:
+                return "", "the PR head changed after verification"
+            if row.get("baseRefName") != base or row.get("baseRefOid") != base_sha:
+                return "", "the PR base changed after verification"
+            if state == "CLEAN" and mergeable == "MERGEABLE":
+                if merge_ci_passed(repo, head, required=required, deadline=request_deadline):
+                    return str(row.get("title") or "").strip(), ""
+                hold = "GitHub has no fully passing CI result for the verified head"
+            else:
+                hold = f"GitHub reports merge state {state}, mergeable {mergeable}"
+        except GhError:
+            if request_deadline is None or time.monotonic() < request_deadline:
+                raise
+            break
         remaining = deadline - time.monotonic()
-        if "UNKNOWN" not in (state, mergeable) or remaining <= 0:
+        waiting = "UNKNOWN" in (state, mergeable) or (ci_deadline is not None and state in ("BLOCKED", "CLEAN", "UNSTABLE"))
+        if not waiting or remaining <= 0:
             break
         time.sleep(min(MERGE_POLL_SECONDS, remaining))
-    if state != "CLEAN" or mergeable != "MERGEABLE":
-        return "", f"GitHub reports merge state {state}, mergeable {mergeable}"
-    if not merge_ci_passed(repo, head, required=required):
-        return "", "GitHub has no fully passing CI result for the verified head"
-    return str(row.get("title") or "").strip(), ""
+        if ci_deadline is not None and time.monotonic() >= deadline:
+            break
+        request_deadline = ci_deadline
+    return "", hold
 
 
-def pr_merge_auto(repo: str, number: int, head: str, base: str, base_sha: str) -> str:
-    subject, hold = merge_readiness(repo, number, head, base, base_sha)
+def pr_merge_auto(repo: str, number: int, head: str, base: str, base_sha: str, *, ci_deadline: float | None = None,
+                  before_merge: Callable[[], None] | None = None,
+                  on_merged: Callable[[str], None] | None = None) -> str:
+    subject, hold = merge_readiness(repo, number, head, base, base_sha, ci_deadline=ci_deadline)
     if hold:
         return hold
     payload = {"sha": head, "merge_method": "squash"}
     if subject:
         payload["commit_title"] = f"{subject} (#{number})"
+    if before_merge:
+        before_merge()
+    merge_deadline = None if ci_deadline is None else time.monotonic() + REQUEST_TIMEOUT_SECONDS
     result = json.loads(gh(["api", "-X", "PUT", f"repos/{repo}/pulls/{number}/merge", "--input", "-"],
-                           input=Outgoing(json.dumps(payload)), write=True) or "{}")
-    return "" if result.get("merged") is True else "GitHub did not confirm the merge"
+                           input=Outgoing(json.dumps(payload)), write=True, deadline=merge_deadline) or "{}")
+    if result.get("merged") is True:
+        if on_merged:
+            on_merged(result.get("sha") or "")
+        return ""
+    return "GitHub did not confirm the merge"
 
 
 def default_branch(repo: str) -> str:

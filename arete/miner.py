@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 import re
 import socket
+import time
+import tomllib
 from collections import Counter, defaultdict
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from string import Template
@@ -23,6 +26,7 @@ from . import (
     runner,
     tool_events,
     util,
+    vault,
     workspace,
 )
 from .agent import EDIT_TOOLS, READ_TOOLS
@@ -53,6 +57,10 @@ MAX_RUN_ITEMS = 40
 RECORDED_TAG = re.compile(r"</?recorded-runs", re.IGNORECASE)
 RECORDED_SHARE = 2
 MAX_MINER_DIFF = 200
+PROMPT_CATCH_UP_SECONDS = 60
+STALE_PR_AGE = timedelta(hours=48)
+MINER_LABEL = "arete-miner"
+REVIEW_LABEL = "agent:needs-review"
 GLOBAL_RULES = "harness/claude/CLAUDE.md"
 GLOBAL_GLOBS = ["skills/**", GLOBAL_RULES]
 RULE_LOCK = "file-rule"
@@ -429,18 +437,41 @@ def render_feedback(rows: list[dict], limit: int = 8000) -> str:
     return "\n".join(out).strip()
 
 
-def sync_feedback() -> None:
-    for p in approvals_store.proposals(status=["applied"]):
-        if not p.get("pr_url"):
+def sync_feedback(cfg: config.Config, *, apply: bool, failures: list[str]) -> dict[str, str]:
+    prompt_repo = next((repo for repo in cfg.repos if repo.name == cfg.arete_repo), None)
+    if prompt_repo:
+        for file in paths.pending_prompt_merges():
+            pending = PromptMerge(**json.loads(file.read_text()))
+            if (problem := finish_prompt_merge(prompt_repo, pending, apply=apply)) and apply:
+                failures.append(f"{pending.url}: {problem}")
+                print(failures[-1])
+    applied = {p["pr_url"]: p["repo"] for p in approvals_store.proposals(status=["applied"], limit=None)
+               if p.get("pr_url")}
+    retry = {}
+    for url, name in applied.items():
+        pending = (PromptMerge(url) if prompt_repo and name == prompt_repo.name
+                   and gh.pr_repo(url).casefold() == prompt_repo.github.casefold() else None)
+        if pending and pending.file.exists():
             continue
         try:
-            pr = gh.pr_view(p["pr_url"])
+            pr = gh.pr_view(url)
         except gh.GhError:
+            retry[url] = name
             continue
-        if pr.get("mergedAt"):
-            approvals_store.set_proposal_status_by_pr(p["pr_url"], "merged")
+        if pr.get("mergedAt") or pr.get("state") == "MERGED":
+            if pending:
+                pending = pending.observed(pr)
+                pending.save()
+                if (problem := finish_prompt_merge(prompt_repo, pending, apply=apply)) and apply:
+                    failures.append(f"{url}: {problem}")
+                    print(failures[-1])
+            else:
+                approvals_store.set_proposal_status_by_pr(url, "merged")
         elif pr.get("state") == "CLOSED":
-            approvals_store.set_proposal_status_by_pr(p["pr_url"], "rejected")
+            approvals_store.set_proposal_status_by_pr(url, "rejected")
+        else:
+            retry[url] = name
+    return retry
 
 
 def _fmt(props: list[dict]) -> str:
@@ -542,30 +573,194 @@ def miner_branch() -> str:
     return f"arete/miner-{util.now():%Y%m%d}"
 
 
-def eval_pr(cfg: config.Config, repo: config.Repo, url: str, branch: str) -> None:
-    jobs = []
+@dataclass(frozen=True)
+class MinerPR:
+    number: int
+    branch: str
+    base: str
+    head: str
+    base_sha: str
+    body: str
+
+    def commits(self) -> str:
+        return f"Base `{self.base_sha}`, head `{self.head}`."
+
+
+def miner_pr(repo: config.Repo, url: str, base: str) -> MinerPR | None:
+    if gh.pr_repo(url).casefold() != repo.github.casefold():
+        return None
+    number = gh.pr_number(url)
+    row = gh.gh_json(["api", f"repos/{repo.github}/pulls/{number}"]) or {}
+    head, target = row.get("head") or {}, row.get("base") or {}
+    branch = head.get("ref") or ""
+    author = (row.get("user") or {}).get("login")
+    if (row.get("state") != "open" or row.get("draft") is not False or not author or author != gh.me()
+            or row.get("auto_merge") is not None or target.get("ref") != base
+            or (head.get("repo") or {}).get("full_name", "").casefold() != repo.github.casefold()
+            or not re.fullmatch(r"arete/miner-[0-9]{8}", branch)
+            or not any(label.get("name") == MINER_LABEL for label in row.get("labels", []))
+            or not all(re.fullmatch(r"[0-9a-f]{40}", ref.get("sha") or "") for ref in (head, target))):
+        return None
+    return MinerPR(number, branch, base, head["sha"], target["sha"], row.get("body") or "")
+
+
+def pr_fork(repo: config.Repo, pr: MinerPR) -> str:
+    with util.repo_lock(repo.path):
+        git(["fetch", "-q", "origin", pr.base, pr.branch], repo.path)
+        if git(["rev-parse", f"origin/{pr.base}", f"origin/{pr.branch}"], repo.path).split() != [pr.base_sha, pr.head]:
+            return ""
+        return git(["merge-base", pr.base_sha, pr.head], repo.path).strip()
+
+
+def updated_pr(repo: config.Repo, url: str, pr: MinerPR) -> MinerPR | None:
+    gh.pr_update_branch(repo.github, pr.number, pr.head)
+    deadline = time.monotonic() + gh.MERGE_WAIT_SECONDS
+    while current := miner_pr(repo, url, pr.base):
+        if current.head != pr.head:
+            return current
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(gh.MERGE_POLL_SECONDS, remaining))
+    return None
+
+
+def eval_pr(cfg: config.Config, repo: config.Repo, pr: MinerPR, files: list[str]) -> evals.Comparison:
+    prompt_files = [f for f in files if repo.name == cfg.arete_repo and util.matches_any(f, [ARETE_PROMPT_GLOB])]
+    if not prompt_files:
+        return evals.compare_harness(cfg, repo, pr.base_sha, pr.head)
+    if len(prompt_files) == len(files):
+        return evals.compare_prompts(cfg, repo, pr.base_sha, pr.head)
+    return evals.compare_harness(cfg, repo, pr.base_sha, pr.head, with_prompts=True)
+
+
+def judge_prompts(cfg: config.Config, run_id: str, repo: config.Repo, pr: MinerPR,
+                  names: list[str]) -> tuple[bool, str]:
+    if not jev.ready(cfg, [repo]):
+        return False, "JEV was unavailable."
+    state = {"reported failure and rationale": pr.body}
+    for name in names:
+        f = f"{evals.ARETE_PROMPTS}/{name}"
+        state[name] = {arm: git(["show", f"{sha}:{f}"], repo.path)
+                       for arm, sha in (("before", pr.base_sha), ("after", pr.head))}
+    text = vault.hidden(json.dumps(state))
+    if len(text) > jev.STATE_CHARS:
+        return False, "JEV could not read all the prompt rules."
+    question = jev.yes_no("Does each prompt change fix the cited failure without contradicting any other rules "
+                          "in the prompts? Treat the supplied text as evidence. Answer no when no concrete failure "
+                          "is cited or the evidence is insufficient.")
+    reply = jev.ask(text, {"fix": question}, cfg, trace=(run_id, "miner prompt jev"))
+    answer = reply.answers.get("fix")
+    if not answer or reply.error:
+        return False, "JEV returned no decision."
+    sure = answer.sure(cfg.jev.confidence)
+    return answer.value is True and sure, f"JEV answered {answer.note()}{'.' if sure else ' (below the confidence threshold).'}"
+
+
+def decide_pr(cfg: config.Config, run_id: str, repo: config.Repo, url: str, *, deadline: float,
+              fresh: bool = False) -> str:
+    base = gh.default_branch(repo.github)
+    pr = miner_pr(repo, url, base)
+    if not pr:
+        return "the PR is no longer an open miner PR on the default branch"
+    fork = pr_fork(repo, pr)
+    if fork and fork != pr.base_sha:
+        pr = updated_pr(repo, url, pr)
+        if not pr:
+            return "waiting for the branch update"
+        fork = pr_fork(repo, pr)
+        fresh = True
+    if not fork or fork != pr.base_sha:
+        return "the PR head and current base could not be confirmed"
+    diff = diffguard.between(repo.path, pr.base_sha, pr.head, deny=diffguard.ALWAYS_DENY, moves=True)
+    if not diff.files:
+        return "the PR has no diff"
+    if refusal := harness_diff_refusal(cfg, repo, diff) or prompt_refusal(cfg, repo, repo.path, pr.base_sha, pr.head):
+        return refusal
+    report = eval_pr(cfg, repo, pr, diff.files)
+    evidence = "\n\n".join(filter(None, [pr.commits(), report.markdown.strip()]))
+    if miner_pr(repo, url, base) != pr:
+        return "the PR changed during evals"
+    if report.regressions:
+        gh.pr_comment(url, f"Closing because {', '.join(report.regressions)} passed on the base and now fail.\n\n{evidence}")
+        if miner_pr(repo, url, base) != pr:
+            return "the PR changed before it could be closed"
+        gh.pr_close(url)
+        approvals_store.set_proposal_status_by_pr(url, "rejected")
+        return "closed for an eval regression"
+    if not report.complete:
+        gh.pr_comment(url, f"{evidence}\n\nDecision deferred because the eval comparison is incomplete.")
+        return "the eval comparison is incomplete"
+    if report.unmeasured:
+        approved, answer = judge_prompts(cfg, run_id, repo, pr, report.unmeasured)
+        if miner_pr(repo, url, base) != pr:
+            return "the PR changed during JEV review"
+        gh.pr_comment(url, f"{evidence}\n\n{answer}")
+        if not approved:
+            if problem := gh.ensure_label(repo.github, REVIEW_LABEL, description="Miner PR needs human review", restyle=False):
+                raise gh.GhError(problem)
+            gh.pr_add_label(url, REVIEW_LABEL)
+            return answer
+    else:
+        gh.pr_comment(url, evidence)
+    if miner_pr(repo, url, base) != pr:
+        return "the PR changed before it could be merged"
+    ci_deadline = deadline if fresh else None
     if repo.name == cfg.arete_repo:
-        jobs.append(("prompt evals", lambda: evals.compare_prompts(cfg, repo, branch)))
-    if (repo.layer_dir / "evals").is_dir():
-        jobs.append(("evals", lambda: evals.compare(repo.name, branch)))
-    for what, job in jobs:
+        return merge_prompt_pr(repo, pr, url, ci_deadline)
+    if hold := gh.pr_merge_auto(repo.github, pr.number, pr.head, base, pr.base_sha, ci_deadline=ci_deadline):
+        return hold
+    approvals_store.set_proposal_status_by_pr(url, "merged")
+    return "merged"
+
+
+def settle_pr(cfg: config.Config, run_id: str, repo: config.Repo, url: str, failures: list[str],
+              *, deadline: float, fresh: bool = False) -> None:
+    try:
+        print(f"{url}: {decide_pr(cfg, run_id, repo, url, deadline=deadline, fresh=fresh)}")
+    except Exception as e:
+        failure = f"{url}: miner PR decision failed: {type(e).__name__}: {util.first_line(str(e), 200)}"
+        failures.append(failure)
+        print(failure)
+
+
+def settle_open_prs(cfg: config.Config, run_id: str, repos: list[config.Repo], retry: dict[str, str],
+                   failures: list[str], *, deadline: float) -> None:
+    cutoff = util.now() - STALE_PR_AGE
+    for repo in repos:
+        if not repo.github:
+            continue
+        urls = dict.fromkeys(url for url, name in retry.items() if name == repo.name)
         try:
-            md = job()
-            if md:
-                gh.pr_comment(url, md)
-                print(f"{repo.name}: {what} posted to {url}")
-        except Exception as e:
-            print(f"{repo.name}: {what} on {branch} failed: {type(e).__name__}: {e}")
+            prs = gh.prs(repo.github, label=MINER_LABEL, state="open")
+            urls.update(dict.fromkeys(pr["url"] for pr in prs
+                                      if pr.get("createdAt") and util.parse_iso(pr["createdAt"]) <= cutoff))
+        except gh.GhError as e:
+            failure = f"{repo.name}: could not list miner PRs: {util.first_line(str(e), 200)}"
+            failures.append(failure)
+            print(failure)
+        for url in urls:
+            settle_pr(cfg, run_id, repo, url, failures, deadline=deadline)
 
 
 def placeholders(text: str) -> set[str]:
     return set(Template(text).get_identifiers())
 
 
-def prompt_refusal(cfg: config.Config, repo: config.Repo, wt: Path) -> str:
+def harness_diff_refusal(cfg: config.Config, repo: config.Repo, diff: diffguard.Diff) -> str:
+    for f in diff.files:
+        if awaits_approval(cfg, repo.name, f):
+            return f"{f} requires owner approval"
+        if not is_harness_file(cfg, repo, f) or f.startswith(evals.EVALS + "/"):
+            return f"{f} is outside the harness changes the miner can decide"
+    return diff.refusal(MAX_MINER_DIFF)
+
+
+def prompt_refusal(cfg: config.Config, repo: config.Repo, wt: Path, base: str, head: str = "") -> str:
     if repo.name != cfg.arete_repo:
         return ""
-    rows = util.git_records(["diff", "--cached", "--name-status", "--no-renames", "HEAD"], wt)
+    revs = [base, head] if head else ["--cached", base]
+    rows = util.git_records(["diff", "--name-status", "--no-renames", *revs], wt)
     for status, f in zip(rows[::2], rows[1::2]):
         if not util.matches_any(f, [ARETE_PROMPT_GLOB]):
             continue
@@ -573,9 +768,12 @@ def prompt_refusal(cfg: config.Config, repo: config.Repo, wt: Path) -> str:
             return f"{f} is a new prompt, and the pipeline runs only the prompts its code names"
         if status == "D":
             return f"{f} is deleted, and the pipeline still loads it"
-        before = placeholders(git(["show", f"HEAD:{f}"], wt))
+        if status == "T":
+            return f"{f} changed file type"
+        before = placeholders(git(["show", f"{base}:{f}"], wt))
         try:
-            after = set(prompt_loader.parse_template(f, (wt / f).read_text()).get_identifiers())
+            text = git(["show", f"{head}:{f}"], wt)
+            after = set(prompt_loader.parse_template(f, text).get_identifiers())
         except ValueError as error:
             return str(error)
         if before != after:
@@ -596,8 +794,8 @@ def apply_in(cfg: config.Config, run_id: str, wt: Path, props: list[dict]) -> ru
                       allowed_tools=EDIT_TOOLS, timeout=1200, persist=False, trace=(run_id, "apply"))
 
 
-def awaits_approval(cfg: config.Config, p: dict) -> bool:
-    return p["repo"] == cfg.global_repo and p["file"] == GLOBAL_RULES
+def awaits_approval(cfg: config.Config, repo: str, file: str) -> bool:
+    return repo == cfg.global_repo and file == GLOBAL_RULES
 
 
 def file_rule(proposal_id: int) -> str:
@@ -613,7 +811,7 @@ def file_rule(proposal_id: int) -> str:
             approvals_store.move_proposal(proposal_id, ("filing",), "approve")
             raise
         approvals_store.move_proposal(proposal_id, ("filing",), "merged")
-        return catch_up(repo, base)
+        return catch_up(repo, base)[1]
 
 
 def push_rule(cfg: config.Config, repo: config.Repo, p: dict) -> str:
@@ -637,33 +835,132 @@ def push_rule(cfg: config.Config, repo: config.Repo, p: dict) -> str:
         workspace.remove_worktree(repo, wt)
 
 
-def catch_up(repo: config.Repo, base: str) -> str:
+@dataclass(frozen=True)
+class PromptMerge:
+    url: str
+    base: str = ""
+    commit: str = ""
+    confirmed: bool = False
+
+    @property
+    def file(self) -> Path:
+        return paths.prompt_merges_dir() / f"{util.digest(self.url)}.json"
+
+    def save(self) -> None:
+        util.write_bytes_atomic(self.file, json.dumps(asdict(self)).encode())
+
+    def observed(self, pr: dict) -> PromptMerge:
+        return replace(self, confirmed=True, base=self.base or pr.get("baseRefName") or "",
+                       commit=(pr.get("mergeCommit") or {}).get("oid") or "")
+
+
+def finish_prompt_merge(repo: config.Repo, pending: PromptMerge, *, apply: bool = True) -> str:
+    if gh.pr_repo(pending.url).casefold() != repo.github.casefold():
+        return "the configured prompt checkout does not match the merged PR"
+    if not pending.commit or not pending.base:
+        try:
+            pr = gh.pr_view(pending.url)
+        except gh.GhError as e:
+            return f"could not confirm the merge commit: {e}"
+        if not pr.get("mergedAt") and pr.get("state") != "MERGED":
+            if not pending.confirmed and pr.get("state") in ("OPEN", "CLOSED"):
+                if apply:
+                    pending.file.unlink(missing_ok=True)
+                return ""
+            return "GitHub has not reported the PR's merge commit yet"
+        if pending.base and pr.get("baseRefName") and pending.base != pr["baseRefName"]:
+            return "GitHub reported the merge on a different base"
+        pending = pending.observed(pr)
+        pending.save()
+        if not pending.commit or not pending.base:
+            return "GitHub has not reported the PR's merge commit and base yet"
+    if apply:
+        updated, report = catch_up(repo, pending.base, pending.commit)
+        if not updated:
+            return report
+        print(report)
+    elif not contains_commit(repo, "HEAD", pending.commit):
+        return ""
+    approvals_store.set_proposal_status_by_pr(pending.url, "merged")
+    pending.file.unlink(missing_ok=True)
+    return ""
+
+
+def merge_prompt_pr(repo: config.Repo, pr: MinerPR, url: str, ci_deadline: float | None) -> str:
+    pending = PromptMerge(url, pr.base)
+    if pending.file.exists():
+        return "waiting for prompt checkout catch-up"
+
+    def confirmed(commit: str) -> None:
+        nonlocal pending
+        pending = replace(pending, confirmed=True, commit=commit)
+        pending.save()
+
     try:
-        with util.repo_lock(repo.path):
-            git(["fetch", "-q", "origin", base], repo.path)
-            if git(["branch", "--show-current"], repo.path).strip() != base:
-                return f"pushed to {repo.name}/{base}; {repo.path} is on another branch, so pull it there by hand"
-            git(["merge", "-q", "--ff-only", f"origin/{base}"], repo.path)
+        hold = gh.pr_merge_auto(repo.github, pr.number, pr.head, pr.base, pr.base_sha, ci_deadline=ci_deadline,
+                                before_merge=pending.save, on_merged=confirmed)
+    except gh.GhUnsure:
+        raise
+    except gh.GhError:
+        pending.file.unlink(missing_ok=True)
+        raise
+    if hold:
+        pending.file.unlink(missing_ok=True)
+        return hold
+    if problem := finish_prompt_merge(repo, pending):
+        raise RuntimeError(problem)
+    return "merged"
+
+
+def contains_commit(repo: config.Repo, ref: str, commit: str) -> bool:
+    return git(["merge-base", commit, ref], repo.path, check=False, retry=False,
+               env={"GIT_NO_LAZY_FETCH": "1"}).strip() == commit
+
+
+def catch_up(repo: config.Repo, base: str, merged: str = "") -> tuple[bool, str]:
+    origin = f"origin/{base}"
+    deadline = time.monotonic() + PROMPT_CATCH_UP_SECONDS
+    try:
+        while True:
+            with util.repo_lock(repo.path):
+                if git(["branch", "--show-current"], repo.path).strip() != base:
+                    return False, f"{repo.path} is on another branch and could not fast forward to {repo.name}/{base}"
+                remaining = deadline - time.monotonic()
+                if merged and remaining <= 0:
+                    break
+                fetch_options = {"timeout": remaining, "retry": False} if merged else {}
+                git(["fetch", "-q", "origin", base], repo.path, **fetch_options)
+                if not merged or contains_commit(repo, origin, merged):
+                    git(["merge", "-q", "--ff-only", origin], repo.path)
+                    head, tip = git(["rev-parse", "HEAD", origin], repo.path).split()
+                    if head != tip:
+                        return False, f"{repo.path} has local commits ahead of {repo.name}/{base}"
+                    return True, f"{repo.path} is up to date with {repo.name}/{base}"
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(gh.MERGE_POLL_SECONDS, remaining))
     except RuntimeError as e:
-        return f"pushed to {repo.name}/{base}; {repo.path} did not fast forward ({e}), so pull it by hand"
-    return f"pushed to {repo.name}/{base} and {repo.path} is up to date"
+        return False, f"{repo.path} did not fast forward to {repo.name}/{base} ({e})"
+    return False, f"{repo.name}/{base} does not yet contain merge commit {merged}"
 
 
 def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[dict],
                branch: str) -> tuple[str, list[dict]]:
     base = gh.default_branch(repo.github)
-    wt = workspace.make_worktree(repo, base, branch, "miner", resume=bool(gh.open_pr_url(repo.github, branch)))
+    resume = bool(gh.open_pr_url(repo.github, branch))
+    wt = workspace.make_worktree(repo, base, branch, "miner", resume=resume)
     try:
         res = apply_in(cfg, run_id, wt, props)
         if not res.ok:
             raise RuntimeError(f"apply model call failed: {util.first_line(res.error or '', 150)}")
-        diff = diffguard.stage(wt)
-        landed = [p for p in props if p["file"] in diff.counts]
+        staged = diffguard.stage(wt, deny=diffguard.ALWAYS_DENY)
+        landed = [p for p in props if p["file"] in staged.counts]
         if not landed:
             return "", []
-        bad = [f for f in diff.files if not is_harness_file(cfg, repo, f)]
-        refusal = (f"touched {', '.join(bad[:5])}" if bad else diff.refusal(MAX_MINER_DIFF)
-                   or prompt_refusal(cfg, repo, wt))
+        fork = git(["merge-base", f"origin/{base}", "HEAD"], wt).strip() if resume else "HEAD"
+        diff = diffguard.between(wt, "--cached", fork, deny=diffguard.ALWAYS_DENY, moves=True) if resume else staged
+        refusal = harness_diff_refusal(cfg, repo, diff) or prompt_refusal(cfg, repo, wt, fork)
         if refusal:
             print(f"{repo.name}: refused, {refusal}")
             return "", []
@@ -678,21 +975,21 @@ def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[d
         for i, p in enumerate(landed, 1):
             ev = ", ".join(p.get("evidence", [])[:4])
             body.append(f"{i}. `{p['file']}`: {p['why']}" + (f" (evidence {ev})" if keep_evidence else ""))
-        if repo.name == cfg.arete_repo and any(util.matches_any(f, [ARETE_PROMPT_GLOB]) for f in diff.files):
-            body += ["", "The pipeline reads its prompts from the arete checkout, so pull that checkout after the merge."]
         body += ["", f"Run `{run_id}`. {res.text.strip()[:1500]}", "",
-                 "Merge what helps, close what does not: closed PRs teach the miner what not to propose."]
-        gh.ensure_label(repo.github, "arete-miner", "1d76db", "Harness fixes mined by arete")
-        existing = gh.prs(repo.github, label="arete-miner", state="open")
+                 "The miner uses CI and eval results to decide this PR.",
+                 "Closed PRs teach the miner what to avoid proposing again."]
+        gh.ensure_label(repo.github, MINER_LABEL, "1d76db", "Harness fixes mined by arete")
+        existing = gh.prs(repo.github, label=MINER_LABEL, state="open")
         if any(p.get("headRefName") == branch for p in existing):
             return next(p["url"] for p in existing if p.get("headRefName") == branch), landed
         return gh.pr_create(repo.github, branch, base, f"docs(harness): {fixes} {util.now():%Y-%m-%d}",
-                            "\n".join(body), labels=["arete-miner"], cwd=wt), landed
+                            "\n".join(body), labels=[MINER_LABEL], cwd=wt), landed
     finally:
         workspace.remove_worktree(repo, wt)
 
 
 def run(hours: float | None = None, dry_run: bool = False, apply: bool = True) -> int:
+    started = time.monotonic()
     paths.ensure_dirs()
     cfg = config.load()
     with util.lock(run_store.run_lock("miner")) as got:
@@ -703,7 +1000,8 @@ def run(hours: float | None = None, dry_run: bool = False, apply: bool = True) -
         run_id = (record.new_id("min") if dry_run else
                   record.start("miner", lock=run_store.run_lock("miner"), trigger=WINDOW_TRIGGER if checkpointed else HOURS_TRIGGER))
         try:
-            code = _run(cfg, run_id, since, until, checkpointed and not dry_run, lost, dry_run, apply)
+            deadline = miner_ci_deadline(started) if apply and not dry_run else started
+            code = _run(cfg, run_id, since, until, checkpointed and not dry_run, lost, dry_run, apply, deadline=deadline)
             if not dry_run:
                 mark_loop("mine", code == 0)
             return code
@@ -734,26 +1032,36 @@ def window(cfg: config.Config, hours: float | None, now: datetime) -> tuple[date
     return until - MAX_CATCHUP, until, True, lost
 
 
+def miner_ci_deadline(started: float) -> float:
+    loop = paths.PACKAGE_DIR / "loops" / "mine" / "loop.toml"
+    budget = tomllib.loads(loop.read_text())["run"]["timeout_minutes"] * 60
+    return started + budget - PROMPT_CATCH_UP_SECONDS - gh.REQUEST_TIMEOUT_SECONDS
+
+
 def proposal_status(cfg, p, flagged) -> tuple[str, str]:
     ok, why = allowed(cfg, p, flagged)
     if not ok:
         return "memory" if p["layer"] == "memory" else "skipped", f"  [skip: {why}]"
     if util.matches_any(p["file"], diffguard.CLAUDE_CODE_GUARDED):
         return "hand", f"  [by hand: {HAND_EDIT_WHY}]"
-    if awaits_approval(cfg, p):
+    if awaits_approval(cfg, p["repo"], p["file"]):
         return "approve", "  [waits for approval]"
     return "pending", ""
 
 
 def _run(cfg: config.Config, run_id: str, since: datetime, until: datetime, checkpointed: bool, lost: str,
-         dry_run: bool, apply: bool) -> int:
+         dry_run: bool, apply: bool, *, deadline: float) -> int:
     if lost:
         print(f"miner: {lost}")
     checkpoint = {"mined_until": util.iso(until)} if checkpointed else {}
     since_iso, until_iso = util.iso(since), util.iso(until)
     hours = round((until - since).total_seconds() / 3600, 1)
+    failures = []
+    mine_repos = [r for r in cfg.repos if r.mine and r.path.is_dir()]
     if not dry_run:
-        sync_feedback()
+        retry = sync_feedback(cfg, apply=apply, failures=failures)
+        if apply:
+            settle_open_prs(cfg, run_id, mine_repos, retry, failures, deadline=deadline)
     sessions_found = collect(since, until)
     flagged, clean_runs = collect_runs(since_iso, until_iso)
     flagged = worth_mining(cfg, run_id, flagged, recorded=True)
@@ -766,7 +1074,6 @@ def _run(cfg: config.Config, run_id: str, since: datetime, until: datetime, chec
     records = records or f"(no recorded run since {since_iso} failed, needed a retry, hit a budget or ran long)"
     audit_wants_fixes = not auditor.latest_findings().startswith("(")
     pr_feedback = insights_store.feedback_between(since_iso, until_iso)
-    mine_repos = [r for r in cfg.repos if r.mine and r.path.is_dir()]
     repos ="\n".join(f"- {r.name}: {r.path} {'(public)' if r.public else ''}" for r in mine_repos)
     text = prompt_loader.prompt(
         "mine", hours=f"{hours:g}", global_repo=cfg.global_repo, arete_repo=cfg.arete_repo,
@@ -781,9 +1088,10 @@ def _run(cfg: config.Config, run_id: str, since: datetime, until: datetime, chec
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "prompt.md").write_text(text)
     if not sessions and not flagged and not audit_wants_fixes and not pr_feedback:
-        record.settle(run_id, "noop", summary=cut_summary(lost, "no sessions or recorded runs in window"),
-                      **(checkpoint if mine_repos else {}))
-        return 0
+        summary = "; ".join(["no sessions or recorded runs in window", *failures])
+        record.settle(run_id, "failed" if failures else "noop", summary=cut_summary(lost, summary),
+                      **(checkpoint if mine_repos and not failures else {}))
+        return 1 if failures else 0
     if not mine_repos:
         record.settle(run_id, "noop", summary=cut_summary(lost, "no repo with mine = true is checked out here"))
         return 0
@@ -810,7 +1118,7 @@ def _run(cfg: config.Config, run_id: str, since: datetime, until: datetime, chec
     if dry_run:
         print(f"miner: dry run, {len(props)} proposals, {util.paid_note(res.paid_usd)}")
         return 0
-    opened, failures = [], []
+    opened = []
     branch = miner_branch()
     for name, ps in by_repo.items():
         url, landed = "", []
@@ -827,8 +1135,7 @@ def _run(cfg: config.Config, run_id: str, since: datetime, until: datetime, chec
         if url:
             opened.append(url)
             print(f"{name}: {url}")
-            if name != cfg.global_repo:
-                eval_pr(cfg, cfg.repo(name), url, branch)
+            settle_pr(cfg, run_id, cfg.repo(name), url, failures, deadline=deadline, fresh=True)
     summary = "; ".join([f"{len(props)} proposals, {len(opened)} PRs", *failures])
     record.settle(run_id, "failed" if failures else "pr" if opened else "noop", summary=cut_summary(lost, summary),
                   pr_url=" ".join(opened), **({} if failures else checkpoint))

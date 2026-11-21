@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import threading
 import time
 import tomllib
-from dataclasses import dataclass, field
+from collections.abc import Sequence
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import (
@@ -175,6 +177,12 @@ class TaskResult:
     settings: str = ""
     regressed: bool = False
     changed: list[str] = field(default_factory=list)
+    graded: bool = False
+    prompts_used: set[str] = field(default_factory=set)
+
+    @property
+    def outcome(self) -> str:
+        return ("pass" if self.passed else "fail") if self.graded else "incomplete"
 
 
 @dataclass
@@ -184,11 +192,22 @@ class Arm:
 
     @property
     def score(self) -> str:
-        return f"{sum(r.passed for r in self.results)}/{len(self.results)}"
+        graded = [r for r in self.results if r.graded]
+        incomplete = len(self.results) - len(graded)
+        score = f"{sum(r.passed for r in graded)}/{len(graded)}"
+        return f"{score} ({incomplete} incomplete)" if incomplete else score
 
     @property
     def paid(self) -> float:
         return sum(r.paid for r in self.results)
+
+
+@dataclass
+class Comparison:
+    markdown: str
+    regressions: list[str] = field(default_factory=list)
+    unmeasured: list[str] = field(default_factory=list)
+    complete: bool = False
 
 
 class Source:
@@ -415,6 +434,8 @@ def prepare(repo: config.Repo, src: Source, wt: Path, run: EvalRun) -> config.Re
 
 def grade(cfg: config.Config, run: EvalRun, layer: config.RepoLayer, wt: Path, title: str, ask: str, steps: str,
           timeout: float, step: str = "grade") -> verify.Verified:
+    if not layer.verify:
+        return verify.Verified("blocked", blocked_by="the layer has no [verify] section", finished=False)
     ticket = tracker.Ticket(id=run.task, ref=run.task, title=title, body=ask)
     run.cfg, run.layer, run.overrides = cfg, layer, {"timeout_minutes": max(1, round(timeout / 60))}
     work = TicketWork(cfg, run, ticket, wt, [workspace.Checkout("", run.repo.github, run.repo.path, wt, "")], layer, timeout,
@@ -423,7 +444,7 @@ def grade(cfg: config.Config, run: EvalRun, layer: config.RepoLayer, wt: Path, t
 
 
 def grade_failure(graded: verify.Verified) -> str:
-    if graded.verdict == "blocked":
+    if not graded.finished or graded.verdict not in ("pass", "fail"):
         return f"grading blocked: {util.first_line(graded.blocked_by or graded.summary, 200)}"
     failed = graded.failed_checks
     return f"failed in use: {util.first_line(failed[0]['what'] if failed else graded.summary, 200)}"
@@ -482,28 +503,48 @@ def acceptance(cfg, run, layer, wt, task, brief, result, plan, report, ok, timeo
     diff = vault.hidden(git(["diff", "--cached", "HEAD"], wt))
     (run.dir / "diff.patch").write_text(diff)
     failures = result.failures + (["repo checks failing"] if run.checks_required and not ok else [])
+    incomplete = []
     evidence = "No check in use ran for this task."
     if task.verify:
-        graded = grade(cfg, run, layer, wt, task.title, task.prompt, task.verify, run.time_for(timeout))
+        try:
+            graded = grade(cfg, run, layer, wt, task.title, task.prompt, task.verify, run.time_for(timeout))
+        except (OSError, workspace.RunFailed) as e:
+            graded = verify.Verified("blocked", blocked_by=str(e), finished=False)
         result.verify = graded.verdict
         evidence = graded.markdown()
-        if graded.verdict != "pass":
+        if not graded.finished or graded.verdict not in ("pass", "fail"):
+            incomplete.append(grade_failure(graded))
+        elif graded.verdict == "fail":
             failures.append(grade_failure(graded))
     if run.reviews:
-        blocking = review(run, wt, brief, plan, report, evidence, diff, run.time_for(timeout))
-        result.blocking = blocking
-        if blocking:
-            failures.append(util.count(blocking, "blocking review finding"))
+        try:
+            result.blocking = review(run, wt, brief, plan, report, evidence, diff, run.time_for(timeout))
+        except (OSError, workspace.RunFailed) as e:
+            incomplete.append(f"review did not complete: {util.first_line(str(e), 200)}")
+        if result.blocking:
+            failures.append(util.count(result.blocking, "blocking review finding"))
     if task.check:
-        res = hidden_check(cfg, run.repo, task, wt, run.time_for(timeout))
-        result.hidden = "pass" if res.returncode == 0 else "fail"
-        (run.dir / "check.log").write_text(res.stdout + res.stderr)
-        run.log(f"held out check: {'PASS' if res.returncode == 0 else 'FAIL'}")
-        if res.returncode != 0:
-            failures.append(f"check exit {res.returncode}")
-    result.passed = not failures
+        try:
+            res = hidden_check(cfg, run.repo, task, wt, run.time_for(timeout))
+        except OSError as e:
+            incomplete.append(f"held out check did not complete: {util.first_line(str(e), 200)}")
+        else:
+            (run.dir / "check.log").write_text(res.stdout + res.stderr)
+            if isinstance(res, util.CommandIncomplete) or (
+                res.returncode and re.search(r"^sandbox-exec:", res.stderr, re.M)
+            ):
+                incomplete.append(f"held out check did not complete (exit {res.returncode})")
+            else:
+                result.hidden = "pass" if res.returncode == 0 else "fail"
+                run.log(f"held out check: {result.hidden.upper()}")
+                if res.returncode != 0:
+                    failures.append(f"check exit {res.returncode}")
+    result.graded = bool(failures) or not incomplete
+    result.passed = result.graded and not failures
     result.failures = failures
-    result.why = "; ".join(failures) + ("" if ok or not failures or run.checks_required else ", repo checks failing")
+    result.why = "; ".join(failures + incomplete)
+    if not ok and failures and not run.checks_required:
+        result.why += ", repo checks failing"
     return result
 
 
@@ -526,7 +567,7 @@ def run_task(cfg: config.Config, src: Source, task: Task, prompts: Prompts, run:
         run.adopt(cfg, layer)
         if prompts.label:
             run.log(f"plan, build and fix prompts from {prompts.label}")
-        if task.verify and not layer.verify:
+        if task.verify and not task.check and not layer.verify:
             raise workspace.RunFailed("the task has `verify` steps but the layer has no `[verify]` section")
 
         expertise = layer.expertise_file.read_text() if layer.expertise_file.exists() else "(none yet)"
@@ -560,6 +601,7 @@ def run_task(cfg: config.Config, src: Source, task: Task, prompts: Prompts, run:
         if not res.ok or not isinstance(res.structured, dict):
             result.why = "plan step failed"
             return result
+        result.prompts_used.add("plan.md")
         plan = res.structured.get("plan", "")
         estimate = int(res.structured.get("estimated_lines") or 0)
         in_use = res.structured.get("verify", "")
@@ -571,25 +613,30 @@ def run_task(cfg: config.Config, src: Source, task: Task, prompts: Prompts, run:
         if not res.ok:
             result.why = "build step failed"
             return result
+        result.prompts_used.add("build.md")
         session, attempts, summary = res.session, 1, res.text
         max_attempts = run.repair_limit(layer)
         ok, report = run.gate(layer, wt, task, timeout)
         try:
             while not ok and run.may_repair(attempts, max_attempts):
                 attempts += 1
-                fix = prompt_loader.prompt("fix", prompts.dir, attempt=attempts, max_attempts=max_attempts, failures=report,
-                             checks=runs_checks)
+                fix = prompt_loader.prompt("fix", prompts.dir, attempt=attempts, max_attempts=max_attempts,
+                                           failures=report, checks=runs_checks)
                 res = run.agent(f"fix{attempts}", prompt_loader.task_prompt(fix), wt,
                                 **run.call_kw(cfg, "check_repair", BUILD_TOOLS, rules),
                                 disallowed_tools=routing.NO_GIT_WRITES, resume=session, timeout=timeout,
                                 fresh_prompt=lambda which, fix=fix, summary=summary: switched_prompt(
                                     which, wt, task, plan, summary, fix))
+                result.repairs = attempts - 1
+                if not res.ok:
+                    result.why = "repair step failed"
+                    return result
+                result.prompts_used.add("fix.md")
                 session, summary = res.session, res.text
                 ok, report = run.gate(layer, wt, task, timeout)
         except workspace.RunFailed:
             result.repairs = sum(run_store.step_tries(run.id, f"fix{n}") > 0 for n in range(2, attempts + 1))
             raise
-        result.repairs = attempts - 1
         result.checks = "pass" if ok else "fail"
         return acceptance(cfg, run, layer, wt, task, brief, result, plan, report, ok, timeout)
     except workspace.RunFailed as e:
@@ -653,8 +700,9 @@ def run_suite(cfg: config.Config, repo: config.Repo, src: Source, tasks: list[Ta
                                                        task=t.name))
             current = {**lineage, "base_commit": r.base_commit, "context_sha": r.context_sha,
                        "settings": r.settings, "after_step": after_step, "last_step": run_store.last_step_id(run_id)}
-            insights_store.add_eval(run_id, repo.name, t.name, r.passed, r.seconds, r.cost, label, current)
-            r.regressed = len(prior) == 3 and all(p["passed"] for p in prior) and not r.passed
+            if r.graded:
+                insights_store.add_eval(run_id, repo.name, t.name, r.passed, r.seconds, r.cost, label, current)
+            r.regressed = r.graded and len(prior) == 3 and all(p["passed"] for p in prior) and not r.passed
             if r.regressed:
                 r.changed = (lineage_changes(prior[0], current) or ["nothing recorded changed"]
                              if has_lineage(prior[0]) else ["the last pass predates lineage"])
@@ -664,18 +712,17 @@ def run_suite(cfg: config.Config, repo: config.Repo, src: Source, tasks: list[Ta
         record.settle(run_id, "done", summary=summary)
     print(f"{repo.name}: {summary}, {util.paid_note(record.metered_spent(run_id))}")
     for r in results:
-        print(f"  {'PASS' if r.passed else 'FAIL'} {r.task:<28} {r.seconds:>6.0f}s {util.paid_note(r.paid):>12} {r.why}"
+        print(f"  {r.outcome.upper()} {r.task:<28} {r.seconds:>6.0f}s {util.paid_note(r.paid):>12} {r.why}"
               + (f"  REGRESSED: {', '.join(r.changed)}" if r.regressed else ""))
     (paths.RUNS_DIR / run_id / "results.md").write_text(results_md(repo.name, label, results))
     return arm
 
 
 def results_md(repo: str, source: str, results: list[TaskResult]) -> str:
-    passed = sum(r.passed for r in results)
-    lines = [f"Evals for {repo} on `{source}`: {passed}/{len(results)} passed.", "",
+    lines = [f"Evals for {repo} on `{source}`: {Arm('', results).score} passed.", "",
              "| task | result | time | paid |", "|---|---|---|---|"]
     for r in results:
-        res = "pass" if r.passed else f"fail ({r.why})"
+        res = r.outcome if r.passed else f"{r.outcome} ({r.why})"
         if r.regressed:
             res += f", passed the three runs before; REGRESSED: {', '.join(r.changed)}"
         res = res.replace("|", "\\|")
@@ -697,32 +744,6 @@ def run_all(dry_run: bool = False) -> int:
     return code
 
 
-def compare(repo_name: str, ref: str) -> str:
-    cfg = config.load()
-    repo = cfg.repo(repo_name)
-    before = {h["run_id"]: h for h in insights_store.eval_history(repo.name, 50)}
-    run(repo_name, ref=ref)
-    after = [h for h in insights_store.eval_history(repo.name, 50) if h["run_id"] not in before]
-    base = next((h for h in before.values() if h["source"] == insights_store.BASELINE_SOURCE), None)
-    if not after:
-        return ""
-    a = after[0]
-    line = f"Evals on this branch: {a['passed']}/{a['total']} passed"
-    if base:
-        line += f"; the last baseline run (`{base['source']}`, {base['ts'][:10]}) passed {base['passed']}/{base['total']}"
-        baseline = {r["task"]: r for r in insights_store.eval_rows(base["run_id"])}
-        changes = []
-        for row in insights_store.eval_rows(a["run_id"]):
-            if prior := baseline.get(row["task"]):
-                changes.extend(lineage_changes(prior, row, skip=("harness",)) if has_lineage(prior)
-                               else ["the baseline predates lineage"])
-        if changes:
-            line += f"; since that run: {', '.join(dict.fromkeys(changes))}"
-    table = (paths.RUNS_DIR / a["run_id"] / "results.md")
-    return (line + ".\n\n" + (table.read_text() if table.exists() else "")
-            + "\nThe repo's eval tasks, run with this branch's harness.\n")
-
-
 def export_prompts(repo: config.Repo, ref: str, dest: Path) -> dict[str, bytes]:
     src = Source(repo, ref)
     dest.mkdir(parents=True, exist_ok=True)
@@ -735,29 +756,63 @@ def export_prompts(repo: config.Repo, ref: str, dest: Path) -> dict[str, bytes]:
     return found
 
 
-def compare_prompts(cfg: config.Config, arete: config.Repo, branch: str) -> str:
-    fetch_origin(arete)
+def paired_tasks(repo: config.Repo, src: Source, default_base: str = "") -> list[Task]:
+    tasks = load_tasks(*task_source(repo, src))
+    if not tasks:
+        return []
+    if not default_base:
+        fetch_origin(repo)
+        default_base = f"origin/{gh.default_branch(repo.github) if repo.github else 'main'}"
+    refs = dict.fromkeys(t.base or default_base for t in tasks)
+    commits = {ref: git(["rev-parse", f"{ref}^{{commit}}"], repo.path).strip() for ref in refs}
+    return [replace(t, base=commits[t.base or default_base]) for t in tasks]
+
+
+def compare_harness(cfg: config.Config, repo: config.Repo, base: str, head: str, *,
+                    with_prompts: bool = False) -> Comparison:
+    sources = {"main": Source(repo, base), "pr": Source(repo, head)}
+    subject = "Joint prompt and harness" if with_prompts else "Harness"
+    with util.lock(run_store.run_lock("eval", repo.name)) as got:
+        if not got or any(p.dir for p in repo.parts):
+            return Comparison(f"{subject} evals could not run.")
+        tasks = paired_tasks(repo, sources["main"], base)
+        if not tasks:
+            return Comparison(f"No tasks ran for the {subject.lower()} comparison.")
+        prompts, changed = prompt_arms(repo, base, head) if with_prompts else ({arm: Prompts() for arm in sources}, [])
+        if with_prompts and not any(Path(name).stem in BUILDER_PROMPTS for name in changed):
+            return Comparison("No eval can exercise the prompt edits in the joint comparison.")
+        results = {arm: run_suite(cfg, repo, src, tasks, f"{repo.name}-{arm}", prompts[arm])
+                   for arm, src in sources.items()}
+    return comparison(repo, base, f"{subject} evals ran each task against both versions.", [(repo, results)], changed)
+
+
+def unmeasured_prompts(names: list[str]) -> Comparison:
+    return Comparison(f"Not measured, as no eval runs {prompt_loader.code_list(names)}.\n",
+                      unmeasured=names, complete=True)
+
+
+def prompt_arms(repo: config.Repo, base: str, head: str) -> tuple[dict[str, Prompts], list[str]]:
     root = paths.RUNS_DIR / record.new_id("eva", "prompts")
-    arms = {"main": Prompts(root / "main", f"origin/{gh.default_branch(arete.github)}"),
-            "pr": Prompts(root / "pr", f"origin/{branch}")}
-    for p in arms.values():
-        p.commit = git(["rev-parse", f"{p.label}^{{commit}}"], arete.path).strip()
-    _, pr = (export_prompts(arete, p.label, p.dir) for p in arms.values())
-    fork = git(["merge-base", arms["main"].label, arms["pr"].label], arete.path).strip()
-    before = export_prompts(arete, fork, root / "fork")
+    arms = {"main": Prompts(root / "main", base, base), "pr": Prompts(root / "pr", head, head)}
+    before, pr = (export_prompts(repo, p.commit, p.dir) for p in arms.values())
     changed = sorted(name for name in before.keys() | pr.keys() if before.get(name) != pr.get(name))
-    unmeasured = [name for name in changed if Path(name).stem not in BUILDER_PROMPTS]
+    return arms, changed
+
+
+def compare_prompts(cfg: config.Config, arete: config.Repo, base: str, head: str) -> Comparison:
+    arms, changed = prompt_arms(arete, base, head)
     if not changed:
-        return ""
-    if unmeasured == changed:
-        return f"No eval runs {prompt_loader.code_list(changed)}, so this change is not measured.\n"
+        return Comparison("")
+    if not any(Path(name).stem in BUILDER_PROMPTS for name in changed):
+        return unmeasured_prompts(changed)
     ran, skipped = [], []
     for repo in suites(cfg):
         if any(p.dir for p in repo.parts):
             skipped.append((repo, "it has parts"))
             continue
+        src = Source(repo, base) if repo.name == arete.name else Source(repo)
         try:
-            tasks = load_tasks(*task_source(repo, Source(repo)))
+            tasks = paired_tasks(repo, src, base if repo.name == arete.name else "")
         except (tomllib.TOMLDecodeError, ValueError, TypeError, KeyError) as e:
             print(f"{repo.name}: eval tasks do not load: {type(e).__name__}: {e}")
             skipped.append((repo, "its eval tasks do not load"))
@@ -768,14 +823,16 @@ def compare_prompts(cfg: config.Config, arete: config.Repo, branch: str) -> str:
             if not got:
                 skipped.append((repo, "its evals were already running"))
                 continue
-            ran.append((repo, {arm: run_suite(cfg, repo, Source(repo), tasks, f"{repo.name}-{arm}", prompts)
+            ran.append((repo, {arm: run_suite(cfg, repo, src, tasks, f"{repo.name}-{arm}", prompts)
                                for arm, prompts in arms.items()}))
-    return prompt_comparison(arete, arms, changed, unmeasured, ran, skipped)
+    if not ran and not skipped:
+        return unmeasured_prompts(changed)
+    lead = ("Each eval suite ran its tasks with main's prompts and this branch's prompts" if ran else "No eval suite ran")
+    return comparison(arete, base, f"{lead}. Changed prompts were {prompt_loader.code_list(changed)}.",
+                      ran, changed, skipped, same_harness=True)
 
 
-def flipped_tasks(main: Arm, pr: Arm, private: bool) -> str:
-    before = {r.task: r.passed for r in main.results}
-    flips = [r for r in pr.results if before.get(r.task, r.passed) != r.passed]
+def show_flips(flips: list[TaskResult], private: bool) -> str:
     if not flips:
         return "none"
     if not private:
@@ -786,32 +843,51 @@ def flipped_tasks(main: Arm, pr: Arm, private: bool) -> str:
                                    f"{util.count(down, 'task')} now {'fails' if down == 1 else 'fail'}" if down else ""]))
 
 
-def prompt_comparison(arete: config.Repo, arms: dict[str, Prompts], changed: list[str], unmeasured: list[str],
-                      ran: list[tuple[config.Repo, dict[str, Arm]]], skipped: list[tuple[config.Repo, str]]) -> str:
+def comparison(target: config.Repo, base: str, lead: str, ran: list[tuple[config.Repo, dict[str, Arm]]],
+               changed_prompts: Sequence[str] = (), skipped: Sequence[tuple[config.Repo, str]] = (), *,
+               same_harness: bool = False) -> Comparison:
     aliases: dict[str, str] = {}
 
     def hidden(repo: config.Repo) -> bool:
-        return arete.public and not repo.public
+        return target.public and not repo.public
 
     def shown(repo: config.Repo) -> str:
         return aliases.setdefault(repo.name, f"private repo {len(aliases) + 1}") if hidden(repo) else repo.name
 
-    main_label = arms["main"].label
-    lead = (f"each eval suite ran its tasks twice today, once with the prompts on `{main_label}` and once with this branch's"
-            if ran else "no eval suite ran")
-    lines = [f"Prompt evals: {lead}. Changed: {prompt_loader.code_list(changed)}.", ""]
+    def inputs(r: TaskResult) -> tuple[str, ...]:
+        return (r.base_commit, r.context_sha) if same_harness else (r.base_commit,)
+
+    lines = [lead, ""]
+    regressions = []
+    exercised = set()
+    complete = bool(ran) and not skipped
     if ran:
-        lines += [f"| suite | `{main_label}` | this branch | tasks that changed |", "|---|---|---|---|"]
+        lines += [f"| suite | `{base[:12]}` | this branch | tasks that changed |", "|---|---|---|---|"]
         for repo, result in ran:
-            lines.append(f"| {shown(repo)} | {result['main'].score} | {result['pr'].score} | "
-                         f"{flipped_tasks(result['main'], result['pr'], hidden(repo))} |")
-        totals = {arm: Arm("", [r for _, result in ran for r in result[arm].results]) for arm in arms}
+            main, pr = result["main"], result["pr"]
+            before = {r.task: r for r in main.results if r.graded}
+            paired = [(prior, r) for r in pr.results if r.graded and (prior := before.get(r.task))
+                      and inputs(prior) == inputs(r) and all(inputs(r))]
+            exercised.update(name for _, r in paired for name in r.prompts_used)
+            flips = [r for prior, r in paired if prior.passed != r.passed]
+            lines.append(f"| {shown(repo)} | {main.score} | {pr.score} | {show_flips(flips, hidden(repo))} |")
+            failed = [r.task for r in flips if not r.passed]
+            if failed:
+                regressions.append(f"{shown(repo)} ({util.count(len(failed), 'task')})" if hidden(repo) else
+                                   f"{prompt_loader.code_list(failed)} in {shown(repo)}")
+            complete = complete and bool(paired) and len({r.task for _, r in paired}) == len(main.results) == len(pr.results)
+        totals = {arm: Arm("", [r for _, result in ran for r in result[arm].results]) for arm in ("main", "pr")}
         lines += [f"| all | {totals['main'].score} | {totals['pr'].score} | |", ""]
         ids = [a.run_id for repo, result in ran if not hidden(repo) for a in result.values()]
         lines.append(f"{util.paid_note(totals['main'].paid + totals['pr'].paid).capitalize()}."
                      + (f" Runs {prompt_loader.code_list(ids)}." if ids else ""))
+    unmeasured = [name for name in changed_prompts if name not in exercised]
     if unmeasured:
-        lines.append(f"Not measured, as no eval runs them: {prompt_loader.code_list(unmeasured)}.")
+        lines.append(f"Not measured in the candidate arm: {prompt_loader.code_list(unmeasured)}.")
+        if not same_harness:
+            complete = False
+            if len(unmeasured) == len(changed_prompts):
+                regressions = []
     if skipped:
         lines.append("Skipped: " + ", ".join(f"{shown(repo)} ({why})" for repo, why in skipped) + ".")
-    return "\n".join(lines).rstrip() + "\n"
+    return Comparison("\n".join(lines).rstrip() + "\n", regressions, unmeasured, complete)
