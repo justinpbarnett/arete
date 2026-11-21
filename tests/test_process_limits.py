@@ -6,8 +6,10 @@ import shutil
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from string import Template
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -16,6 +18,7 @@ from arete import (
     config,
     dbstats,
     delegation,
+    factory,
     flows,
     gh,
     jira,
@@ -37,7 +40,8 @@ from arete import (
     workspace,
 )
 from arete.agent import Result
-from arete.orchestration_api import PROTOCOL, Catalog
+from arete.orchestration_api import MAX_BYTES, OPERATIONS, PROTOCOL, Catalog
+from arete.store import asks as ask_store
 from arete.store import db as foundation
 from arete.store import orchestration as ledger
 from arete.store import runs as run_store
@@ -97,6 +101,304 @@ class Isolated(unittest.TestCase):
         run = pipeline.Run(rid, self.repo, directory, tracker=self.local, tid=self.ticket, cfg=self.cfg)
         run.budget = runlimits.Budget(run, runlimits.Policy(), previous, self.local.get(self.ticket), forced)
         return run
+
+
+class OrchestrationLineageTests(Isolated):
+    def setUp(self):
+        super().setUp()
+        self.patches.enter_context(patch.object(pipeline, "workspace_note", return_value="Fixture workspace"))
+
+    def controller(self, previous="", feedback=()):
+        run = self.made_run(previous)
+        run.path = "orchestrate"
+        run.feedback = list(feedback)
+        return orchestration.Controller(flows.start(self.cfg, run, {}, continues=previous))
+
+    def admit(self):
+        controller = self.controller()
+        outcome = factory.Outcome("pass", data={
+            "layer": str(self.repo.layer_dir), "checkouts": [], "ticket": asdict(self.local.get(self.ticket)),
+            "branch": "fixture", "add_dirs": [], "attachments": "", "expertise": "", "triage": "",
+        })
+
+        def prepare_step(*args, **kwargs):
+            controller.job.take("prepare", outcome, stored=False)
+            return outcome
+
+        with patch.object(controller, "atomic", side_effect=prepare_step):
+            self.assertIsNone(controller.prepare())
+        return controller
+
+    def accept(self, controller, op, state, args=None, **result):
+        lease = controller.lease
+        version = ledger.snapshot(lease)["version"]
+        turn = ledger.begin(lease, {}, 10)
+        action, = ledger.accept(lease, turn, version, {"calls": [{"op": op, "args": args or {}}]}, 10)
+        if state != "accepted":
+            ledger.transition(lease, action["id"], state, result)
+        return action["id"]
+
+    def audits(self, controller):
+        return [line for line in run_lines.read(controller.run.id) if line["event"] == "lineage"]
+
+    def test_catalog_refresh_reaches_the_next_decision_and_audits_once(self):
+        wait = OPERATIONS["run.wait"]
+        old_wait = replace(wait, description="Old wait", constraints={"timeout_seconds": {"minimum": 1}})
+        with patch.dict(OPERATIONS, {"run.wait": old_wait}):
+            prior = self.admit()
+        record.move(prior.run.id, "failed", ("running",))
+        resumed = self.controller(prior.run.id)
+        with patch.object(codebase, "STAMP", "new-engine"):
+            self.assertIsNone(resumed.prepare())
+        new = resumed.catalog.fingerprint
+        audit, = self.audits(resumed)
+        self.assertEqual(audit["old"], {"catalog_sha": prior.data["catalog_sha"]})
+        self.assertEqual(audit["new"], {"catalog_sha": new})
+        self.assertNotEqual(audit["old"], audit["new"])
+        self.assertEqual(audit["engine_commit"], "new-engine")
+        self.assertEqual(ledger.snapshot(resumed.lease)["data"]["catalog_sha"], new)
+
+        def decide(job, turn, prompt, *args):
+            self.assertIn(wait.description, prompt)
+            self.assertIn(f'"catalog_sha": "{new}"', prompt)
+            response = {"version": PROTOCOL, "decision_id": turn, "rationale": "",
+                        "state_version": ledger.snapshot(resumed.lease)["version"],
+                        "calls": [{"op": "run.wait", "args": {"timeout_seconds": 0}}]}
+            worker.receive.return_value = [{"ok": True, "structured": response}]
+            return {}
+
+        with (patch.object(delegation, "request", side_effect=decide),
+              patch.object(delegation, "Worker") as launch):
+            worker = launch.return_value
+            worker.pid, worker.identity = 123, 456
+            action, = resumed.decide()
+        self.assertEqual(action["request"]["timeout_seconds"], 0)
+        resumed.dispatch(action)
+        record.move(resumed.run.id, "interrupted", ("running",))
+        repeated = self.controller(resumed.run.id)
+        self.assertIsNone(repeated.prepare())
+        self.assertEqual(repeated.catalog.fingerprint, new)
+        self.assertEqual(self.audits(resumed), [audit])
+        self.assertEqual(self.audits(repeated), [])
+
+    def test_successive_refreshes_in_one_run_each_write_an_audit_line(self):
+        wait = OPERATIONS["run.wait"]
+        changed_wait = replace(wait, description="Deployed wait")
+        prior = self.admit()
+        record.move(prior.run.id, "failed", ("running",))
+        resumed = self.controller(prior.run.id)
+        original = {"catalog_sha": prior.data["catalog_sha"]}
+        with patch.object(codebase, "STAMP", "deploy"):
+            for deployed in (changed_wait, wait, changed_wait):
+                with patch.dict(OPERATIONS, {"run.wait": deployed}):
+                    self.assertIsNone(resumed.prepare())
+
+        changed = {"catalog_sha": resumed.catalog.fingerprint}
+        self.assertNotEqual(changed, original)
+        audits = self.audits(resumed)
+        self.assertEqual([(line["old"], line["new"]) for line in audits],
+                         [(original, changed), (changed, original), (original, changed)])
+        self.assertEqual([line["engine_commit"] for line in audits], ["deploy"] * 3)
+        self.assertEqual(ledger.snapshot(resumed.lease)["data"]["catalog_sha"], changed["catalog_sha"])
+
+    def test_legacy_catalog_audit_survives_interruption_after_append(self):
+        prior = self.admit()
+        prior.data["catalog_sha"] = ledger.digest(prior.catalog.entries)
+        ledger.save(prior.lease, prior.data)
+        record.move(prior.run.id, "interrupted", ("running",))
+        resumed = self.controller(prior.run.id)
+        write = run_lines.write
+
+        def interrupt_after_write(run_id, event, **fields):
+            line = write(run_id, event, **fields)
+            if event == "lineage":
+                raise OSError("interrupted after append")
+            return line
+
+        with patch.object(run_lines, "write", side_effect=interrupt_after_write):
+            with self.assertRaisesRegex(OSError, "interrupted after append"):
+                resumed.prepare()
+        audit, = self.audits(resumed)
+        pending = ledger.snapshot(resumed.lease)["data"]["lineage_event"]
+        self.assertEqual(pending["run"], resumed.run.id)
+        self.assertEqual(pending["event_id"], audit["event_id"])
+        self.assertEqual(pending["old"], audit["old"])
+        self.assertEqual(pending["new"], audit["new"])
+        record.move(resumed.run.id, "interrupted", ("running",))
+        repeated = self.controller(resumed.run.id)
+        self.assertIsNone(repeated.prepare())
+        self.assertEqual(self.audits(resumed), [audit])
+        self.assertEqual(self.audits(repeated), [])
+        self.assertNotIn("lineage_event", ledger.snapshot(repeated.lease)["data"])
+
+    def test_lineage_row_missing_its_newline_recovers_in_either_append_order(self):
+        fields = {"event_id": "refresh", "old": {"catalog_sha": "old"}, "new": {"catalog_sha": "new"},
+                  "engine_commit": "deploy"}
+        for error_first in (False, True):
+            with self.subTest(error_first=error_first):
+                run_id = f"torn-lineage-{error_first}"
+                route = run_lines.write(run_id, "route")
+                audit = {"ts": route["ts"], "run": run_id, "seq": route["seq"] + 1, "event": "lineage", **fields}
+                with run_lines.path(run_id).open("ab") as log:
+                    log.write(json.dumps(audit).encode())
+                if error_first:
+                    error = run_lines.write(run_id, "error", reason="interrupted append")
+                self.assertEqual(run_lines.write(run_id, "lineage", **fields), audit)
+                if not error_first:
+                    self.assertEqual(run_lines.read(run_id), [route, audit])
+                    error = run_lines.write(run_id, "error", reason="interrupted append")
+                self.assertEqual(error["seq"], audit["seq"] + 1)
+                self.assertEqual(run_lines.read(run_id), [route, audit, error])
+                self.assertEqual(list(run_lines.follow(run_id, start=audit["seq"], ended=lambda: True)), [error])
+
+    def test_explicit_rerun_uses_the_refreshed_catalog(self):
+        checks = replace(OPERATIONS["checks.run"], constraints={"scope": {"enum": ["full"]}})
+        for scope in ("quick", "full"):
+            with self.subTest(scope=scope):
+                prior = self.admit()
+                action_id = self.accept(prior, "checks.run", "succeeded", {"scope": scope})
+                record.move(prior.run.id, "failed", ("running",))
+                resumed = self.controller(prior.run.id)
+                resumed.run.action, resumed.run.action_only = action_id, True
+                with (patch.dict(OPERATIONS, {"checks.run": checks}),
+                      patch.object(resumed, "dispatch", wraps=resumed.dispatch) as dispatch,
+                      patch.object(ledger, "accept", wraps=ledger.accept) as accept,
+                      patch.object(resumed, "fingerprint", return_value="fixture-tree"),
+                      patch.object(resumed, "atomic", return_value=factory.Outcome("pass")) as atomic):
+                    if scope == "quick":
+                        with self.assertRaisesRegex(factory.Refused, rf"{action_id}.*scope must be one of: full"):
+                            resumed.drive()
+                        accept.assert_not_called()
+                        dispatch.assert_not_called()
+                        atomic.assert_not_called()
+                    else:
+                        self.assertEqual(resumed.drive()[0], "step")
+                        accept.assert_called_once()
+                        dispatch.assert_called_once()
+                        atomic.assert_called_once_with("checks", tree=str(resumed.job.ws), quick=False)
+                self.assertEqual(ledger.pending(resumed.lease), [])
+                self.assertEqual(len(self.audits(resumed)), 1)
+                original, *reruns = ledger.actions(resumed.lease)
+                self.assertEqual(original["id"], action_id)
+                self.assertEqual(original["request"], {"scope": scope})
+                self.assertEqual([(a["state"], a["request"]) for a in reruns],
+                                 [("succeeded", {"scope": "full"})] if scope == "full" else [])
+
+    def test_explicit_rerun_accepts_a_near_limit_worker_decision_after_normalization(self):
+        prior = self.admit()
+        route = "model:build:0"
+        effort = prior.catalog.entries[route]["efforts"][0]
+        sizes = iter((MAX_BYTES + 1, MAX_BYTES - 1))
+
+        def decide(job, turn, prompt, *settings):
+            request = {"goal": "", "route_id": route, "effort": effort}
+            response = {"version": PROTOCOL, "decision_id": turn, "rationale": "",
+                        "state_version": ledger.snapshot(prior.lease)["version"],
+                        "calls": [{"op": "worker.start", "args": request}]}
+            size = next(sizes)
+            escaped, padding = divmod(size - len(json.dumps(response)), len(json.dumps("\u00e9")) - 2)
+            request["goal"] = "\u00e9" * escaped + "x" * padding
+            self.assertEqual(len(json.dumps(response).encode()), size)
+            worker.receive.return_value = [{"ok": True, "structured": response}]
+            return {}
+
+        with (patch.object(delegation, "request", side_effect=decide),
+              patch.object(delegation, "Worker") as launch):
+            worker = launch.return_value
+            worker.pid, worker.identity = 123, 456
+            self.assertEqual(prior.decide(), [])
+            self.assertEqual(ledger.actions(prior.lease), [])
+            action, = prior.decide()
+        self.assertEqual(action["request"]["prompt_id"], "delegate")
+        ledger.transition(prior.lease, action["id"], "succeeded", {})
+        record.move(prior.run.id, "failed", ("running",))
+
+        resumed = self.controller(prior.run.id)
+        resumed.run.action, resumed.run.action_only = action["id"], True
+        with (patch.object(resumed, "worker_start", return_value={}) as start,
+              patch.object(ledger, "accept", wraps=ledger.accept) as accept):
+            self.assertEqual(resumed.drive()[0], "step")
+        accept.assert_called_once()
+        self.assertGreater(len(json.dumps(accept.call_args.args[3]).encode()), MAX_BYTES)
+        original, rerun = ledger.actions(resumed.lease)
+        self.assertEqual((rerun["state"], rerun["request"]), ("succeeded", original["request"]))
+        start.assert_called_once()
+        self.assertEqual(start.call_args.args[0]["id"], rerun["id"])
+
+    def test_refresh_refuses_with_live_workers_or_unfinished_actions(self):
+        wait = OPERATIONS["run.wait"]
+        cases = (
+            ("pending", 123, "prior controller inference is still live"),
+            ("running", 123, "worker .* is still live"),
+            ("running", 321, "unfinished \\(running\\)"),
+            ("accepted", None, "unfinished \\(accepted\\)"),
+        )
+        for state, pid, reason in cases:
+            with self.subTest(state=state, pid=pid):
+                prior = self.admit()
+                if state == "pending":
+                    turn = ledger.begin(prior.lease, {}, 10)
+                    ledger.turn_started(prior.lease, turn, pid, 456)
+                else:
+                    self.accept(prior, "worker.start", state, pid=pid, identity=456)
+                record.move(prior.run.id, "interrupted", ("running",))
+                resumed = self.controller(prior.run.id)
+                with (patch.dict(OPERATIONS, {"run.wait": replace(wait, description="Updated wait")}),
+                      patch.object(delegation, "live", side_effect=lambda pid, identity: (pid, identity) == (123, 456))):
+                    with self.assertRaisesRegex(factory.Refused, f"catalog_sha changed .*{reason}"):
+                        resumed.prepare()
+                self.assertEqual(ledger.snapshot(resumed.lease)["data"]["catalog_sha"], prior.data["catalog_sha"])
+                stored = ledger.pending(resumed.lease) if state == "pending" else ledger.actions(resumed.lease)
+                self.assertEqual(stored[0]["state"], state)
+                self.assertEqual(self.audits(resumed), [])
+
+    def test_refresh_refuses_and_names_authority_changes(self):
+        for key in ("policy_sha", "controller_settings", "run_settings"):
+            with self.subTest(key=key):
+                prior = self.admit()
+                prior.data[key] = "old-authority"
+                ledger.save(prior.lease, prior.data)
+                record.move(prior.run.id, "failed", ("running",))
+                resumed = self.controller(prior.run.id)
+                with self.assertRaisesRegex(factory.Refused, f"{key} changed"):
+                    resumed.prepare()
+                self.assertEqual(ledger.snapshot(resumed.lease)["data"][key], "old-authority")
+                self.assertEqual(self.audits(resumed), [])
+
+    def test_prompt_refresh_on_owner_answer_and_pr_feedback(self):
+        source = orchestration.prompt_loader.template
+
+        def deployed_prompt(name):
+            template = source(name)
+            return Template(template.template + "\nFollow the deployed prompt.") if name == "orchestrate" else template
+
+        for continuation in ("owner answer", "PR feedback"):
+            with self.subTest(continuation=continuation):
+                prior = self.admit()
+                feedback = []
+                if continuation == "owner answer":
+                    question = {"header": "Scope", "question": "Which scope?", "kind": "text"}
+                    ask_store.ask_add("ask-lineage", prior.run.id, self.repo.name, self.ticket, "orchestrate",
+                                      "orchestrate", "", "", [question], {})
+                    self.accept(prior, "owner.ask", "succeeded", ask_ids=["ask-lineage"], awaiting_owner=True)
+                    record.move(prior.run.id, "needs-info", ("running",))
+                    ask_store.ask_close("ask-lineage", "answered", [{"text": "Keep the existing scope"}])
+                    context = "Keep the existing scope"
+                else:
+                    pr = "https://github.com/example/fixture/pull/1"
+                    context = "Revise the status message"
+                    feedback = [{"pr_url": pr, "kind": "comment", "gh_id": 1, "body": context}]
+                    record.move(prior.run.id, "pr", ("running",), pr_url=pr)
+                resumed = self.controller(prior.run.id, feedback)
+                with (patch.object(orchestration.prompt_loader, "template", side_effect=deployed_prompt),
+                      patch.object(gh, "pr_view", return_value={"state": "OPEN"}),
+                      patch.object(gh, "pr_body", return_value="")):
+                    self.assertIsNone(resumed.prepare())
+                audit, = self.audits(resumed)
+                self.assertEqual(audit["old"], {"controller_prompt": prior.data["controller_prompt"]})
+                self.assertEqual(audit["new"], {"controller_prompt": resumed.data["controller_prompt"]})
+                self.assertNotEqual(audit["old"], audit["new"])
+                self.assertIn(context, resumed.job.goal)
 
 
 class OrchestrationWaitTests(Isolated):
