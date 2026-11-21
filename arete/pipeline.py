@@ -845,7 +845,7 @@ def has_verification_marker(wt_fd: int, root: Path) -> bool:
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 return False
             with os.fdopen(fd, "rb", closefd=False) as file:
-                return file.read().rstrip(b"\n") == VERIFY_SCRATCH_CONTENT
+                return file.read().removesuffix(b"\n") == VERIFY_SCRATCH_CONTENT
     except OSError:
         return False
 
@@ -864,6 +864,19 @@ def verification_scratch_roots(wt: Path) -> set[Path]:
 def stages_verification_scratch(name: str, roots: set[Path]) -> bool:
     path = Path(name)
     return not roots.isdisjoint(path.parents) or any(root.is_relative_to(path) for root in roots)
+
+
+def restore_verification_scratch(wt: Path, roots: set[Path], tracked_edits: set[str]) -> None:
+    if not roots:
+        return
+    added = {name for name in util.git_records(["diff", "--cached", "--no-renames", "--name-only", "--diff-filter=A"], wt)
+             if not roots.isdisjoint(Path(name).parents)}
+    edited = {name for name in tracked_edits - added if not roots.isdisjoint(Path(name).parents)}
+    literal = {"GIT_LITERAL_PATHSPECS": "1"}
+    if added:
+        git(["restore", "--source=HEAD", "--staged", "--worktree", "--", *sorted(added)], wt, env=literal)
+    if edited:
+        git(["restore", "--worktree", "--", *sorted(edited)], wt, env=literal)
 
 
 def untracked_by_dir(dirs: list[Path]) -> dict[Path, set[str]]:
@@ -3022,8 +3035,8 @@ def resolve_conflicts(run: AgentRun, c: workspace.Checkout, conflicts: list[str]
         ignored_after = ignored_state(c.wt, scratch_roots)
         changed_ignored = {n for n in ignored_before.keys() | ignored_after.keys()
                            if ignored_before.get(n) != ignored_after.get(n)}
-        touched = (set(util.git_records(["diff", "--name-only"], c.wt)) | (workspace.untracked_files(c.wt) - untracked_before)
-                   | changed_ignored)
+        tracked_edits = set(util.git_records(["diff", "--name-only"], c.wt))
+        touched = tracked_edits | (workspace.untracked_files(c.wt) - untracked_before) | changed_ignored
         if outside := sorted(touched - set(conflicts) - supplemental):
             raise workspace.RunFailed(f"the resolver edited files outside the conflict in {c.github}: {', '.join(outside)}")
         if left := marked(c.wt, conflicts):
@@ -3035,6 +3048,7 @@ def resolve_conflicts(run: AgentRun, c: workspace.Checkout, conflicts: list[str]
         git(["add", "-A", "--", *conflicts, *sorted(touched & stageable)], c.wt, env={"GIT_LITERAL_PATHSPECS": "1"})
         if unmerged_paths(c.wt):
             raise workspace.RunFailed(f"files are still unmerged in {c.github} after the resolver ran")
+        restore_verification_scratch(c.wt, scratch_roots, tracked_edits)
         with util.repo_lock(c.src):
             util.git_as_owner(["commit", "-q", "--no-edit"], c.wt)
         return

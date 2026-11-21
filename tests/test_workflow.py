@@ -38,7 +38,7 @@ class ResolverScratchFixture(unittest.TestCase):
         self.enterContext(mock.patch.object(util, "repo_lock", return_value=nullcontext()))
 
     @classmethod
-    def create_merge(cls, root, log_changed_by=""):
+    def create_merge(cls, root, log_changed_by="", log_added_by_base=False):
         def git(*args, check=True):
             subprocess.run(["git", *args], cwd=root, check=check, capture_output=True, text=True)
 
@@ -46,16 +46,17 @@ class ResolverScratchFixture(unittest.TestCase):
         git("config", "user.name", "Fixture")
         git("config", "user.email", "fixture@example.test")
         git("config", "commit.gpgsign", "false")
-        scratch_ignore = ".arete-sandbox/.arete-owned" if log_changed_by else ".arete-sandbox/"
+        scratch_ignore = ".arete-sandbox/.arete-owned" if log_changed_by or log_added_by_base else ".arete-sandbox/"
         (root / ".gitignore").write_text(f"{scratch_ignore}\nignored.local\nproject/.arete-owned\nproject/private.local\n")
         (root / "project").mkdir()
         (root / "project/tracked.txt").write_text("untouched\n")
         (root / "conflict.txt").write_text("original\n")
         log = root / cls.LOG
-        if log_changed_by:
+        if log_changed_by or log_added_by_base:
             log.parent.mkdir(parents=True)
-            log.write_text("verification ran\n")
             (log.parent.parent / ".arete-owned").write_text(cls.MARKER)
+        if log_changed_by:
+            log.write_text("verification ran\n")
         git("add", ".")
         git("commit", "-qm", "original")
         git("checkout", "-qb", "branch")
@@ -67,18 +68,21 @@ class ResolverScratchFixture(unittest.TestCase):
         git("commit", "-qm", "branch change")
         git("checkout", "-q", "main")
         (root / "conflict.txt").write_text("base\n")
-        if log_changed_by in ("base", "both"):
+        if log_changed_by in ("base", "both") or log_added_by_base:
             log.write_text("base log\n")
+        if log_added_by_base:
+            (root / "incoming.txt").write_text("incoming addition\n")
+            git("add", "--", cls.LOG, "incoming.txt")
         git("commit", "-qam", "base change")
         git("checkout", "-q", "branch")
         git("merge", "--no-commit", "main", check=False)
 
-    def merge(self, log_changed_by=""):
+    def merge(self, log_changed_by="", log_added_by_base=False):
         self.root = Path(self.enterContext(TemporaryDirectory()))
         if self.merge_fixture is not None:
             shutil.copytree(self.merge_fixture, self.root, dirs_exist_ok=True)
         else:
-            self.create_merge(self.root, log_changed_by)
+            self.create_merge(self.root, log_changed_by, log_added_by_base)
         self.conflicts = [self.LOG, "conflict.txt"] if log_changed_by == "both" else ["conflict.txt"]
         self.assertEqual(pipeline.unmerged_paths(self.root), self.conflicts)
         self.checkout = workspace.Checkout("", "fixture/repo", self.root, self.root, "main",
@@ -143,7 +147,7 @@ class ResolverScratchTests(ResolverScratchFixture):
         scratch = self.root / ".arete-sandbox"
         marker = scratch / ".arete-owned"
         (self.root / ".arete-owned").write_text(self.MARKER)
-        for kind in ("missing", "symlink", "wrong text"):
+        for kind in ("missing", "symlink", "wrong text", "blank line"):
             with self.subTest(marker=kind):
                 marker.unlink(missing_ok=True)
                 self.write_log()
@@ -151,12 +155,14 @@ class ResolverScratchTests(ResolverScratchFixture):
                     marker.symlink_to("../.arete-owned")
                 elif kind == "wrong text":
                     marker.write_text("someone else's scratch\n")
+                elif kind == "blank line":
+                    marker.write_text(self.MARKER + "\n")
                 self.assert_outside_conflict(self.write_log, self.LOG)
 
     def test_scratch_exemption_preserves_other_path_checks(self):
         self.merge()
         folder = self.root / "project"
-        (folder / ".arete-owned").write_text(self.MARKER)
+        (folder / ".arete-owned").write_text(self.MARKER.removesuffix("\n"))
         self.write_log()
         (self.root / ".arete-sandbox/.arete-owned").write_text(self.MARKER)
 
@@ -200,13 +206,23 @@ class ResolverScratchTests(ResolverScratchFixture):
 
 
 class TrackedResolverScratchTests(ResolverScratchFixture):
-    def test_tracked_supplemental_scratch_edits_stay_out_of_merge(self):
+    def test_incoming_scratch_addition_stays_out_of_merge(self):
+        self.merge(log_added_by_base=True)
+        staged = self.git("diff", "--cached", "--name-only", "--diff-filter=A").splitlines()
+        self.assertEqual(staged, [self.LOG, "incoming.txt"])
+        self.resolve(lambda: None)
+        self.assertEqual(self.git("ls-tree", "-r", "--name-only", "HEAD", "--", self.LOG), "")
+        self.assertEqual(self.git("show", "HEAD:incoming.txt"), "incoming addition")
+        self.assertEqual(workspace.uncommitted(self.root), [])
+
+    def test_tracked_supplemental_scratch_edits_are_restored_to_merge_state(self):
         for parent in ("branch", "base"):
             with self.subTest(parent=parent):
                 self.merge(log_changed_by=parent)
                 self.resolve(self.write_log)
                 self.assertEqual(self.git("show", f"HEAD:{self.LOG}"), f"{parent} log")
-                self.assertEqual((self.root / self.LOG).read_text(), f"{parent} log\nverification ran\n")
+                self.assertEqual((self.root / self.LOG).read_text(), f"{parent} log\n")
+                self.assertEqual(workspace.uncommitted(self.root), [])
 
     def test_scratch_conflict_requires_a_person(self):
         self.merge(log_changed_by="both")
