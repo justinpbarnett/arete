@@ -9,6 +9,7 @@ from .commands.common import Parser, serve_line, serve_revisions, status_argumen
 
 __all__ = ["main", "serve_line"]
 
+
 class ShowVersion(argparse.Action):
     def __init__(self, option_strings, dest, **kw):
         super().__init__(option_strings, dest, nargs=0, default=argparse.SUPPRESS, help="show the version and exit")
@@ -35,7 +36,7 @@ def status_from_heartbeat(problem: SystemExit) -> int:
 
     print(problem, file=sys.stderr)
     try:
-        beat = json.loads(paths.read_confined(paths.STATE_DIR / "serve.json"))
+        beat = json.loads(paths.read_confined(paths.SERVE_BEAT_FILE))
     except (OSError, ValueError):
         beat = None
     if isinstance(beat, dict) and (revisions := serve_revisions(beat)):

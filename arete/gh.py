@@ -13,7 +13,7 @@ import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import timedelta
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 from . import config, outbound, paths, util
 
@@ -467,8 +467,8 @@ def pr_draft_and_head(url: str) -> tuple[bool, str]:
 
 MERGE_WAIT_SECONDS = 120
 MERGE_POLL_SECONDS = 5
-ARETE_CHECK = {"context": "arete-checks", "app_id": 15368}
-ARETE_WORKFLOW = "ci.yml"
+ACTIONS_APP_ID = 15368
+ARETE_CHECK = {"context": "arete-checks", "app_id": ACTIONS_APP_ID}
 
 
 def merge_ci_passed(repo: str, head: str, *, required: dict | None = None) -> bool:
@@ -493,40 +493,149 @@ def merge_ci_passed(repo: str, head: str, *, required: dict | None = None) -> bo
                                            for row in runs) and all(state == "success" for state in contexts.values()))
 
 
-def push_ci_state(repo: str, head: str, branch: str, *, timeout: float = 20) -> str:
-    path = f"repos/{repo}"
+def check_requirement(context, app_id=None) -> tuple[str, int | None]:
+    if (not isinstance(context, str) or not context.strip()
+            or (app_id is not None and (type(app_id) is not int or (app_id != -1 and app_id < 1)))):
+        raise GhError("GitHub returned an invalid required check")
+    return context, app_id if app_id != -1 else None
 
-    def rows(endpoint, key):
-        pages = gh_json(["api", f"{path}/{endpoint}", "--paginate", "--slurp"], timeout=timeout, retry=False)
-        return [row for page in pages or [] for row in page[key]]
 
+def ci_rows(pages, field: str = "") -> list[dict]:
+    if not isinstance(pages, list) or not pages:
+        raise GhError("GitHub returned no paginated CI evidence")
+    groups = [page[field] for page in pages] if field else pages
+    if any(not isinstance(group, list) or any(not isinstance(row, dict) for row in group) for group in groups):
+        raise GhError("GitHub returned incomplete CI evidence")
+    rows = [row for group in groups for row in group]
+    if field and any(page.get("total_count", len(rows)) != len(rows) for page in pages):
+        raise GhError("GitHub returned incomplete CI evidence")
+    return rows
+
+
+def branch_required_checks(read, branch: str, head: str) -> set[tuple[str, int | None]]:
+    escaped = quote(branch, safe="")
+    branch_path = f"branches/{escaped}"
+    info = read(branch_path)
+    if info["name"] != branch or info["commit"]["sha"] != head or type(info["protected"]) is not bool:
+        raise GhError("GitHub did not confirm the fetched branch tip")
+    required = set()
+    if info["protected"]:
+        try:
+            protection = read(f"{branch_path}/protection")
+        except GhError as error:
+            if "Branch not protected (HTTP 404)" not in str(error):
+                raise
+        else:
+            if not isinstance(protection, dict) or not protection.get("url"):
+                raise GhError("GitHub returned no branch protection details")
+            if (status := protection.get("required_status_checks")) is not None:
+                if not isinstance(status["contexts"], list):
+                    raise GhError("GitHub returned invalid branch protection details")
+                pinned = {check_requirement(row["context"], row["app_id"]) for row in ci_rows([status["checks"]])}
+                legacy = {check_requirement(context) for context in status["contexts"]}
+                pinned_names = {name for name, _ in pinned}
+                required.update(pinned)
+                required.update(rule for rule in legacy if rule[0] not in pinned_names)
+    rules = ci_rows(read(f"rules/branches/{escaped}?per_page=100", pages=True))
+    for rule in rules:
+        if rule["type"] in ("workflows", "code_scanning", "required_deployments"):
+            raise GhError("GitHub requires branch checks outside the status checks API")
+        if rule["type"] == "required_status_checks":
+            checks = ci_rows([rule["parameters"]["required_status_checks"]])
+            if not checks:
+                raise GhError("GitHub returned a status check rule without checks")
+            required.update(check_requirement(row["context"], row.get("integration_id"))
+                            for row in checks)
+    return required
+
+
+def check_state(check: dict) -> str:
+    if check["status"] != "completed":
+        return "pending"
+    return "pass" if check["conclusion"] == "success" else "fail"
+
+
+def push_action_checks(read, head: str, branch: str, checks: list[dict]) -> dict[str, list[str]]:
     query = urlencode({"event": "push", "branch": branch, "head_sha": head, "per_page": 100})
-    runs = rows(f"actions/workflows/{ARETE_WORKFLOW}/runs?{query}", "workflow_runs")
-    matching = [run for run in runs if (run.get("event"), run.get("head_branch"), run.get("head_sha"))
-                == ("push", branch, head)]
-    if not matching:
-        return "pending"
-    run = max(matching, key=lambda row: (row["run_number"], row["run_attempt"]))
-    if run.get("status") != "completed":
-        return "pending"
-    if run.get("conclusion") != "success":
-        return "fail"
-    jobs = rows(f"actions/runs/{run['id']}/attempts/{run['run_attempt']}/jobs?per_page=100", "jobs")
-    required = [job for job in jobs if job.get("name") == ARETE_CHECK["context"]]
-    if len(required) != 1:
-        return "pending"
-    job = required[0]
-    link = re.search(r"/check-runs/([0-9]+)$", job.get("check_run_url") or "")
-    if not link or job.get("status") != "completed":
-        return "pending"
-    if job.get("conclusion") != "success":
-        return "fail"
-    check_id = int(link[1])
-    check = gh_json(["api", f"{path}/check-runs/{check_id}"], timeout=timeout, retry=False) or {}
-    if ((check.get("id"), check.get("head_sha"), check.get("name"), (check.get("app") or {}).get("id"))
-            != (check_id, head, ARETE_CHECK["context"], ARETE_CHECK["app_id"]) or check.get("status") != "completed"):
-        return "pending"
-    return "pass" if check.get("conclusion") == "success" else "fail"
+    runs = [row for row in ci_rows(read(f"actions/runs?{query}", pages=True), "workflow_runs")
+            if (row["event"], row["head_branch"], row["head_sha"]) == ("push", branch, head)]
+    latest = {}
+    for run in sorted(runs, key=lambda row: (row["run_number"], row["run_attempt"])):
+        latest[run["workflow_id"]] = run
+    workflows = {run["check_suite_id"]: run["workflow_id"] for run in runs}
+    contexts = {}
+    for check in checks:
+        if (workflow := workflows.get(check["check_suite"]["id"])) is not None:
+            contexts.setdefault(workflow, set()).add(check["name"])
+    states = {}
+    for workflow, names in contexts.items():
+        run = latest[workflow]
+        if run["status"] not in ("completed", "in_progress"):
+            for name in names:
+                states.setdefault(name, []).append("pending")
+            continue
+        endpoint = f"actions/runs/{run['id']}/attempts/{run['run_attempt']}/jobs?per_page=100"
+        jobs = ci_rows(read(endpoint, pages=True), "jobs")
+        current = {check["url"]: check for check in checks if check["check_suite"]["id"] == run["check_suite_id"]}
+        for name in names:
+            found = []
+            for job in jobs:
+                if job["name"] != name:
+                    continue
+                check = current.get(job["check_run_url"])
+                found.append(ci_state((check_state(job), check_state(check)))
+                             if check and check["name"] == name and job["head_sha"] == head else "pending")
+            states.setdefault(name, []).append(ci_state(found))
+    return states
+
+
+def required_check_state(checks: list[dict], status: dict | None, app_id: int | None, actions: list[str]) -> str:
+    states = list(actions) if app_id in (None, ACTIONS_APP_ID) else []
+    for check in checks:
+        source = (check["app"] or {}).get("id")
+        if app_id is not None and source != app_id:
+            continue
+        if source == ACTIONS_APP_ID:
+            if not actions:
+                states.append("pending")
+        else:
+            states.append(check_state(check))
+    if status is not None:
+        states.append({"success": "pass", "pending": "pending", "error": "fail", "failure": "fail"}.get(
+            status["state"], "unknown") if app_id is None else "unknown")
+    return ci_state(states)
+
+
+def ci_state(states) -> str:
+    states = set(states)
+    return next((state for state in ("fail", "unknown", "pending") if state in states),
+                "pass" if states == {"pass"} else "pending")
+
+
+def push_ci_state(repo: str, head: str, branch: str, *, timeout: float = 20, required: dict | None = None) -> str:
+    def read(endpoint, *, pages=False):
+        return gh_json(["api", f"repos/{repo}/{endpoint}", *(["--paginate", "--slurp"] if pages else [])],
+                       timeout=timeout, retry=False)
+
+    try:
+        requirements = branch_required_checks(read, branch, head)
+        if not requirements or (required and check_requirement(required["context"], required["app_id"])
+                                not in requirements):
+            return "unknown"
+        contexts = {name for name, _ in requirements}
+        checks = ci_rows(read(f"commits/{head}/check-runs?filter=latest&per_page=100", pages=True), "check_runs")
+        checks = [row for row in checks if row["head_sha"] == head and row["name"] in contexts]
+        statuses = {}
+        for row in ci_rows(read(f"commits/{head}/statuses?per_page=100", pages=True)):
+            statuses.setdefault(row["context"].casefold(), row)
+        actions = [check for check in checks if (check["app"] or {}).get("id") == ACTIONS_APP_ID
+                   and ((check["name"], ACTIONS_APP_ID) in requirements or (check["name"], None) in requirements)]
+        push_checks = push_action_checks(read, head, branch, actions) if actions else {}
+        return ci_state(required_check_state([check for check in checks if check["name"] == name],
+                                             statuses.get(name.casefold()), app_id, push_checks.get(name, []))
+                        for name, app_id in requirements)
+    except (GhError, OSError, ValueError, KeyError, TypeError, AttributeError):
+        return "unknown"
 
 
 def merge_readiness(repo: str, number: int, head: str, base: str, base_sha: str, *, wait: float = 0,

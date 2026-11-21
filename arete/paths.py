@@ -170,6 +170,7 @@ RUNS_DIR = STATE_DIR / "runs"
 WORKTREES_DIR = Path(os.environ.get("ARETE_WORKTREES_DIR", HOME / "Library" / "Developer" / "arete" / "worktrees"
                                     if ON_MAC and not ISOLATED else STATE_DIR / "worktrees"))
 HEARTBEAT_FILE = STATE_DIR / "heartbeat.json"
+SERVE_BEAT_FILE = STATE_DIR / "serve.json"
 SERVER_FILE = STATE_DIR / "server.json"
 DASHBOARD_PORT = 8796
 TLS_CERT_FILE = STATE_DIR / "dashboard.crt"

@@ -35,6 +35,7 @@ from . import (
     loops,
     oncall,
     paths,
+    pilot,
     principals,
     record,
     routing,
@@ -165,9 +166,10 @@ def deploy_refusal(src: Path, base: str, tip: str) -> str | None:
         return None
     if util.git(["branch", "--show-current"], src, timeout=10).strip() != base:
         return "on another branch"
-    if util.git(["status", "--porcelain", "--untracked-files=no", "--ignore-submodules=untracked"], src, timeout=10):
+    if util.git(["--no-replace-objects", "status", "--porcelain", "--untracked-files=no",
+                 "--ignore-submodules=untracked"], src, timeout=10):
         return "dirty"
-    ancestor = util.git(["merge-base", head, tip], src, check=False, timeout=10).strip()
+    ancestor = util.git(["--no-replace-objects", "merge-base", head, tip], src, check=False, timeout=10).strip()
     return "" if ancestor == head else "diverged"
 
 
@@ -417,8 +419,8 @@ class Server:
                 self.guard("stage:code", self.load_new_code)
             finally:
                 self.checkout_update.release()
-        self.guard("stage:deploy", self.deploy_when_due)
         self.guard("tick", self.tick)
+        self.guard("stage:deploy", self.deploy_when_due)
         self.guard("stage:inherited", self.reap_inherited)
         self.ticks += 1
         self.guard("stage:alerts", self.watch_alerts)
@@ -445,29 +447,46 @@ class Server:
         root = util.git(["rev-parse", "--show-toplevel"], paths.PACKAGE_DIR, check=False, timeout=10).strip()
         if not root or Path(root).resolve() != src:
             return
-        if not (github := repo.github or loops.github_remote(src)):
-            return
-        if not (base := gh.default_branch(github, fallback="", timeout=DEPLOY_API_TIMEOUT, retry=False)):
-            raise RuntimeError(f"could not determine the default branch of {github}")
-        ref = f"refs/remotes/origin/{base}"
+        with util.lock(pilot.PILOT_LOCK) as free:
+            if free:
+                self.deploy_checkout(repo, src)
+
+    def deploy_checkout(self, repo: config.Repo, src: Path) -> None:
         with util.repo_lock(src):
+            if not (github := loops.github_remote(src) or repo.github):
+                return
+            if not (base := gh.default_branch(github, fallback="", timeout=DEPLOY_API_TIMEOUT, retry=False)):
+                raise RuntimeError(f"could not determine the default branch of {github}")
+            ref = f"refs/remotes/origin/{base}"
             util.git(["fetch", "-q", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules",
                       "origin", f"+refs/heads/{base}:{ref}"], src,
                      timeout=45, env={"GIT_TERMINAL_PROMPT": "0"}, retry=False)
             tip = util.git(["rev-parse", "--verify", ref], src, timeout=10).strip()
             if not self.deploy_ready(src, base, tip):
                 return
-        ci = gh.push_ci_state(github, tip, base, timeout=DEPLOY_API_TIMEOUT)
-        if ci != "pass":
-            self.deploy_refused(src, tip, "CI failed" if ci == "fail" else "CI pending")
-            return
-        with util.repo_lock(src), self.checkout_update:
-            if util.git(["rev-parse", "--verify", ref], src, timeout=10).strip() != tip:
+            try:
+                pilot_merges = pilot.pending_checkout_merges(github, timeout=DEPLOY_API_TIMEOUT)
+            except (RuntimeError, OSError, ValueError, KeyError, TypeError, AttributeError):
+                self.deploy_refused(src, tip, "pilot deployment state unavailable")
                 return
-            if self.deploy_ready(src, base, tip):
-                subject = util.git(["show", "-s", "--format=%s", tip], src, timeout=10).strip()
+            ci = gh.push_ci_state(github, tip, base, timeout=DEPLOY_API_TIMEOUT)
+            if ci != "pass":
+                self.deploy_refused(src, tip, {"fail": "CI failed", "pending": "CI pending"}.get(ci, "CI unavailable"))
+                return
+            with self.checkout_update:
+                if util.git(["rev-parse", "--verify", ref], src, timeout=10).strip() != tip:
+                    return
+                if not self.deploy_ready(src, base, tip):
+                    return
+                if pilot_merges:
+                    incoming = util.git(["--no-replace-objects", "rev-list", f"HEAD..{tip}"], src, timeout=10)
+                    if pilot_merges.intersection(incoming.splitlines()):
+                        self.deploy_refused(src, tip, "one-shot pilot deployment held")
+                        return
+                subject = util.git(["--no-replace-objects", "show", "-s", "--format=%s", tip], src, timeout=10).strip()
                 try:
-                    util.git(["merge", "-q", "--ff-only", "--no-overwrite-ignore", tip], src, timeout=30)
+                    util.git(["--no-replace-objects", "merge", "-q", "--ff-only", "--no-autostash",
+                              "--no-overwrite-ignore", tip], src, timeout=30)
                 except RuntimeError as error:
                     self.deploy_refused(src, tip, str(error))
                     return
@@ -805,6 +824,8 @@ class Server:
                 self.inherited.discard(pid)
 
     def busy_with(self) -> str:
+        if self.deployment and not self.deployment.done():
+            return "a checkout update is still running"
         if sum(not f.done() for f in self.polls.values()):
             return "a source poll is still running"
         if running := [job.while_running for job in APPROVAL_JOBS if self.job_running(job)]:
@@ -828,12 +849,13 @@ class Server:
             self.code_problem = ""
         if stamp == self.code or not steady:
             return
-        check = util.sh([sys.executable, "-c", IMPORT_CHECK], timeout=120)
+        entrypoint = f"import sys; sys.path.insert(0, {str(paths.PACKAGE_DIR.parent)!r}); "
+        check = util.sh([sys.executable, "-I", "-c", entrypoint + IMPORT_CHECK], timeout=120)
         if check.returncode != 0:
             self.note_once("new code does not import, so serve keeps the code it started with: "
                            + util.last_line(check.stderr or check.stdout, 300))
             return
-        candidate = util.sh([sys.executable, "-c", CONFIG_CHECK], timeout=120)
+        candidate = util.sh([sys.executable, "-I", "-c", entrypoint + CONFIG_CHECK], timeout=120)
         if candidate.returncode != 0 and not config.load_or_problem()[1]:
             self.code_problem = ("new code cannot read config.toml, so serve keeps the code it started with: "
                                  + util.last_line(candidate.stderr or candidate.stdout, 300))
