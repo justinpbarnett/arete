@@ -983,8 +983,6 @@ def revision_plan(feedback: str) -> str:
 def revision(flow: factory.Flow, tree: str) -> Outcome:
     job: Job = flow.ctx
     run, layer = job.run, job.layer
-    if flow.skipped and run.feedback and not run.alone and (closed := run.feedback_closure()):
-        return end_as("stop", "quiet", status="noop", summary=closed)
     feedback = pipeline.feedback_markdown(run.feedback)
     left = pipeline.left_on_prs(run.feedback_prs)
     run.story.append(f"The owner reviewed the PR and left this feedback:\n\n{feedback}")

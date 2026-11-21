@@ -119,11 +119,12 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
     for tid in run_store.interrupted_tickets(repo.name):
         if (ordinary_history(tid) and (row := run_store.newest_live_whole_run(repo.name, tid))
                 and not environment_gaps.was_retry(row)):
-            if tid in feedback_due:
-                return Pick(tid, FEEDBACK_PICK, from_feedback=True)
-            if insights_store.has_new_feedback(pending_feedback(repo.name, tid)):
-                excluded = excluded | {tid}
-                continue
+            if pipeline.recorded_path(row["id"]) not in ("feature", "patch"):
+                if tid in feedback_due:
+                    return Pick(tid, FEEDBACK_PICK, from_feedback=True)
+                if insights_store.has_new_feedback(pending_feedback(repo.name, tid)):
+                    excluded = excluded | {tid}
+                    continue
             return Pick(tid, "restarting after an interruption")
     for tid in feedback_due:
         if ordinary_history(tid):

@@ -1595,7 +1595,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             repair_with_feedback = script and script.path == "orchestrate" and script.continues and not script.action
             run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force,
                       feedback=[] if mending and not repair_with_feedback else feedback,
-                      claim_feedback_on_revise=custom_feature,
+                      claim_feedback_on_revise=custom_feature or bool(script and script.path == "revise"),
                       repairs=mending,
                       answering=earlier if earlier and earlier["status"] == "needs-info" else {},
                       launch_gate=admission, launch_done=launch_done, closed_context=closed_context, preview_of=preview_of,

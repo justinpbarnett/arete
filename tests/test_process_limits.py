@@ -1524,6 +1524,80 @@ class ClassicFeedbackBudgetTests(FeedbackRevisionBudgetFixture):
         self.assertEqual(insights_store.open_feedback([url]), [])
 
 
+class FeedbackRevisionRegressionTests(FeedbackRevisionBudgetFixture):
+    def test_classic_revision_returns_open_pr_feedback_when_another_pr_closes(self):
+        parent = self.feedback_ticket(path="classic")
+        closed = self.feedback_row["pr_url"]
+        opened = "https://github.com/owner/fixture/pull/2"
+        record.note(parent.id, pr_url=f"{closed} {opened}", active_seconds=10 * 60)
+        insights_store.add_feedback([{**self.feedback_row, "pr_url": opened, "gh_id": 2}])
+
+        with (patch.object(config, "load", return_value=self.cfg),
+              patch.object(pipeline, "run_refusal", return_value=(False, "")),
+              patch.object(gh, "pr_view", side_effect=lambda url: {"state": "CLOSED" if url == closed else "OPEN"}),
+              patch.object(pipeline.runner, "run") as model):
+            self.assertEqual(pipeline.run_issue(self.repo.name, self.ticket), 0)
+
+        revision = run_store.newest_whole_run(self.repo.name, self.ticket)
+        self.assertEqual(revision["status"], "noop")
+        feedback = {row["pr_url"]: (row["status"], row["run_id"])
+                    for row in insights_store.feedback_between("2025-01-01", "9999-01-01")}
+        self.assertEqual(feedback, {closed: ("recorded", revision["id"]), opened: ("new", None)})
+        self.assertEqual(insights_store.feedback_due(self.repo.name, "2026-01-01T00:10:00Z"), [self.ticket])
+        model.assert_not_called()
+
+    def test_adw_without_a_revision_step_leaves_feedback_pending(self):
+        parent = self.feedback_ticket(path="feature")
+        record.note(parent.id, active_seconds=10 * 60)
+        url = self.feedback_row["pr_url"]
+
+        def drive(flow):
+            run = flow.ctx.run
+            self.assertEqual(run.budget.prior_repairs, 3)
+            row, = insights_store.open_feedback([url])
+            self.assertEqual((row["status"], row["run_id"]), ("new", None))
+            flow.step("prepare", tree=str(flow.ctx.ws))
+            return "noop", "ended before revise", ""
+
+        with (patch.object(config, "load", return_value=self.cfg),
+              patch.object(pipeline, "run_refusal", return_value=(True, "")),
+              patch.dict(factory.STEPS, {"prepare": lambda *args, **kw: factory.Outcome("pass")})):
+            for path in ("feature", "patch", "revise"):
+                with self.subTest(path=path):
+                    script = pipeline.Script(path, drive)
+                    self.assertEqual(pipeline.run_issue(self.repo.name, self.ticket, script=script), 0)
+                    row, = insights_store.open_feedback([url])
+                    self.assertEqual((row["status"], row["run_id"]), ("new", None))
+
+    def test_interrupted_adw_feature_can_resume_during_the_feedback_quiet_period(self):
+        parent = self.feedback_ticket(path="feature")
+        interrupted = self.made_run(parent.id)
+        run_lines.write(interrupted.id, "execution", path="feature")
+        record.settle(interrupted.id, "interrupted")
+
+        with patch.object(util, "now", return_value=datetime(2026, 1, 1, 0, 1, tzinfo=UTC)):
+            picked = poll.next_pick(self.repo, self.local, pipeline.SkipLog({}), set())
+
+        self.assertEqual(picked, poll.Pick(self.ticket, "restarting after an interruption"))
+
+    def test_dry_run_keeps_budget_parents_even_when_admission_grants_a_reset(self):
+        parent = self.feedback_ticket()
+        record.note(parent.id, active_seconds=10 * 60)
+        script = pipeline.Script("orchestrate", lambda flow: ("dry-run", "preview finished", ""))
+        with (patch.object(config, "load", return_value=self.cfg),
+              patch.object(pipeline, "run_refusal", return_value=(True, "")),
+              patch.object(runlimits, "admission", return_value=runlimits.Admission(reset_time=True, reset_repairs=True))):
+            self.assertEqual(pipeline.run_issue(self.repo.name, self.ticket, dry_run=True, force=True, script=script), 0)
+
+        preview = run_store.newest_whole_run(self.repo.name, self.ticket)
+        saved = runlimits.metadata(preview["id"], "budget.json")
+        self.assertEqual((saved["parents"], saved["repair_parents"]), ([parent.id], [parent.id]))
+        self.assertNotIn("left_out", saved)
+        self.assertNotIn("repair_left_out", saved)
+        row, = insights_store.open_feedback([self.feedback_row["pr_url"]])
+        self.assertEqual((row["status"], row["run_id"]), ("new", None))
+
+
 class OwnerAnswerBudgetFixture(PollFixture):
     def spent_question(self, *, structured=False):
         self.repo.layer_dir.mkdir()
