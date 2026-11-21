@@ -49,8 +49,6 @@ def backups_dir() -> Path:
 
 
 RUNS_DIR = STATE_DIR / "runs"
-SETTINGS_SNAPSHOT_FILE = "settings-snapshot.json"
-SETTINGS_SNAPSHOT_STORE = ".settings"
 WORKTREES_DIR = Path(os.environ.get("ARETE_WORKTREES_DIR", HOME / "Library" / "Developer" / "arete" / "worktrees"
                                     if ON_MAC and not ISOLATED else STATE_DIR / "worktrees"))
 HEARTBEAT_FILE = STATE_DIR / "heartbeat.json"
@@ -88,17 +86,12 @@ def expand(p: str | Path) -> Path:
 
 
 def dashboard_ports() -> frozenset[int]:
-    from . import config
-
     found = {DASHBOARD_PORT}
-    if (cfg := config.snapshot_config()) is not None:
-        found.add(cfg.dashboard_port)
-    else:
-        try:
-            data = tomllib.loads(read_confined(CONFIG_FILE).decode())
-            found.add(int(data.get("dashboard", {}).get("port", DASHBOARD_PORT)))
-        except (OSError, ValueError, TypeError):
-            pass
+    try:
+        data = tomllib.loads(read_confined(CONFIG_FILE).decode())
+        found.add(int(data.get("dashboard", {}).get("port", DASHBOARD_PORT)))
+    except (OSError, ValueError, TypeError):
+        pass
     try:
         record = json.loads(SERVER_FILE.read_text())
     except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError):
@@ -118,10 +111,6 @@ def short_path(p: str | Path) -> str:
         return "~"
     below_home = home.rstrip(os.sep) + os.sep
     return "~/" + s[len(below_home):] if s.startswith(below_home) else s
-
-
-def settings_store() -> Path:
-    return RUNS_DIR / SETTINGS_SNAPSHOT_STORE
 
 
 def scratch_dir(run_id: str) -> Path:

@@ -336,28 +336,13 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline
     with tasks.PENDING_LOCK, (nullcontext() if dry_run else util.lock(tasks.START_LOCK, wait=True)):
         if tasks.pending_start(repo.name, str(tid)) or run_store.issue_running(repo.name, tid):
             return "skipped"
-    run_cfg, discovery = cfg, queue.discovery
-    previous = run_store.newest_live_whole_run(repo.name, tid) if not dry_run else None
-    saved = (flows.saved_settings(flows.prepared_data(previous["id"]))
-             if previous and previous["status"] in ("interrupted", "needs-info") else None)
-    if saved:
-        run_cfg, _, layer = saved
-        repo = run_cfg.repo(repo.name)
-        discovery = routing.Discovery(run_cfg, repo, priced=False, layer=layer)
-    source = tracker.for_ticket(run_cfg, repo, tid)
+    source = tracker.for_ticket(cfg, repo, tid)
+    name = tracker.ticket_name(repo.name, source.ref(tid))
     if isinstance(source, tracker.GitHubTracker) and source.in_zte_queue(str(tid)):
         return "skipped"
     reply = tracker_reply(repo, source, str(tid), dry_run, from_queue=pick.from_queue, from_feedback=pick.from_feedback)
     answered = pipeline.answered_run(repo.name, str(tid)) if not reply else None
     answering = answered is not None
-    if saved and previous["status"] == "needs-info" and not (reply or answering):
-        run_id = previous["id"]
-        if not (pipeline.answer_text(run_id) and pipeline.recorded_path(run_id) == "classic"):
-            run_cfg, repo, layer, discovery = cfg, queue.repo, queue.layer, queue.discovery
-            source = tracker.for_ticket(run_cfg, repo, tid)
-            if isinstance(source, tracker.GitHubTracker) and source.in_zte_queue(str(tid)):
-                return "skipped"
-    name = tracker.ticket_name(repo.name, source.ref(tid))
     if not answering and not reply and (waiting := held_back(cfg, repo.name, going, slots)):
         if not dry_run:
             source_store.pass_over(repo.name, str(tid))
@@ -375,8 +360,8 @@ def start_pick(cfg: config.Config, queue: RepoQueue, pick: Pick, skips: pipeline
         newest = run_store.newest_whole_run(repo.name, tid)
         if not (newest and newest["status"] == "interrupted" and flows.pending_catch_up(newest["id"])):
             if not zte.reserved(str(tid)):
-                ticket = intake.route_ticket(run_cfg, repo, source, ticket, dry_run=dry_run)
-            blocked = step_without_route(run_cfg, repo, ticket, discovery, layer)
+                ticket = intake.route_ticket(cfg, repo, source, ticket, dry_run=dry_run)
+            blocked = step_without_route(cfg, repo, ticket, queue.discovery, layer)
     if blocked:
         skips.note(name, ticket, blocked, repo.name)
         print(f"{util.iso()} {name}: {blocked}")

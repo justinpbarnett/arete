@@ -75,8 +75,6 @@ def start(cfg: config.Config, run: pipeline.Run, earlier: dict, slot: slots.RunS
     continues = continues or (earlier["id"] if earlier.get("status") == "interrupted" and ran_on_seam(earlier["id"])
                               else "")
     job = Job(cfg, run, ws, slot=slot, continues=continues, only=only)
-    if continues:
-        job.load_snapshot(prepared_data(continues))
     catch_up = not only and run.path == "orchestrate" and pending_catch_up(continues)
     if continues and not only and not catch_up:
         run.answers_due = asks_store.asks_due(sorted(factory.chain_runs(continues)))
@@ -136,8 +134,7 @@ def guard(job: Job, continues: str) -> str:
     job.branch = branch
     try:
         checkouts = [workspace.Checkout.from_row(e) for e in listed]
-        layer = pipeline.checked_layer(job.cfg, Path(data["layer"]),
-                                       pinned=job.cfg.prepared_layer or saved_layer(data))
+        layer = pipeline.checked_layer(job.cfg, Path(data["layer"]))
         if held := workspace.scratch_held(job.ws, checkouts):
             error = workspace.scratch_failure(
                 f"verification scratch at {held[0]} is still held; poll finalizes it once its holders end, "
@@ -173,36 +170,7 @@ def prepared_data(continues: str) -> dict:
     if prepared := adaptive_state(continues).get("prepared"):
         return prepared
     prepared = factory.passed_data(factory.history(factory.chain(continues)), "prepare")
-    if prepared:
-        return prepared[-1]
-    if held := classic_hold(continues).get("prepared"):
-        return held
-    return factory.first(run_lines.read(continues), "settings_snapshot")
-
-
-def saved_layer(prepared: dict) -> config.RepoLayer | None:
-    from . import delegation
-
-    if settings := saved_settings(prepared):
-        return settings[1]
-    if "layer_settings" not in prepared:
-        return None
-    try:
-        layer = json.loads(prepared["layer_settings"], object_hook=delegation.unpack_settings)
-        if isinstance(layer, config.RepoLayer) and layer.dir == Path(prepared["layer"]):
-            return layer
-    except (ValueError, TypeError, KeyError, RecursionError):
-        pass
-    raise workspace.RunFailed("the saved repository layer is invalid; reconcile before resuming")
-
-
-def saved_settings(prepared: dict):
-    from . import delegation
-
-    if "settings_snapshot" not in prepared:
-        return None
-    snapshot = prepared["settings_snapshot"]
-    return delegation.read_snapshot(Path(snapshot["path"]), snapshot["sha"])
+    return prepared[-1] if prepared else classic_hold(continues).get("prepared", {})
 
 
 def classic_hold(run_id: str) -> dict:
@@ -243,9 +211,7 @@ def environment_checkouts(repo: config.Repo, ws: Path, data: dict, heads: dict[s
         raise workspace.RunFailed("the saved workspace does not match the published draft")
     if left := workspace.scratch_held(ws, checkouts):
         raise workspace.scratch_failure(f"verification scratch at {left[0]} is still held", ws, left)
-    settings = saved_settings(data)
-    layer = settings[2] if settings else repo.configured_layer()
-    if why := workspace.kept_work(ws, checkouts, repo.path, layer.copy, commits=False):
+    if why := workspace.kept_work(ws, checkouts, repo.path, config.load_layer(repo.layer_dir).copy, commits=False):
         raise workspace.RunFailed(why)
     branch = data["branch"]
     for c in checkouts:
@@ -286,8 +252,7 @@ def restore_environment_workspace(job: Job, data: dict, heads: dict[str, str]) -
         workspace.fetch(c.src, c.base)
     try:
         pipeline.merge_moved_bases(job.run, job.checkouts, job.layer, job.ticket, environment_retry=True)
-        if not any(key in data for key in ("settings_snapshot", "layer_settings")):
-            job.use_layer(pipeline.resolve_layer(job.cfg, job.run, job.ws))
+        job.use_layer(pipeline.resolve_layer(job.cfg, job.run, job.ws))
         if why := pipeline.furnish(job.cfg, job.run, job.layer, job.ws):
             raise workspace.RunFailed(why)
         for c in job.checkouts:
@@ -464,14 +429,7 @@ def rebuild(job: Job, line: dict, *, layer: config.RepoLayer | None = None, setu
             return why
     ws = Path(line["tree"])
     admitted = layer is not None
-    if layer is None:
-        data = line["data"]
-        repo = job.run.repo
-        if setup:
-            layer = saved_layer(data) or pipeline.checked_layer(job.cfg, Path(data["layer"]))
-        else:
-            settings = saved_settings(data)
-            layer = settings[2] if settings else pipeline.checked_layer(job.cfg, repo.layer_dir)
+    layer = layer or pipeline.checked_layer(job.cfg, Path(line["data"]["layer"]) if setup else job.run.repo.layer_dir)
     try:
         workspace.clear_workspace(ws, made, job.run.repo.path, layer.copy)
     except workspace.RunFailed as e:
@@ -489,8 +447,7 @@ def rebuild(job: Job, line: dict, *, layer: config.RepoLayer | None = None, setu
     job.run.log(f"made {ws} again from origin/{branch}")
     if not setup:
         return ""
-    if (admitted and not any(key in line["data"] for key in ("settings_snapshot", "layer_settings"))
-            and layer != pipeline.checked_layer(job.cfg, layer.dir)):
+    if admitted and layer != pipeline.checked_layer(job.cfg, layer.dir):
         return "the restored repository layer changed; reconcile before setup"
     return pipeline.furnish(job.cfg, job.run, layer, ws)
 
@@ -544,18 +501,6 @@ class Job:
     moved_base: str = ""
     patch_mode: bool = False
     prepared_feedback_prs: list[str] = field(default_factory=list)
-
-    def load_snapshot(self, data: dict) -> config.RepoLayer | None:
-        if self.cfg.settings_snapshot is not None:
-            path, sha = self.cfg.settings_snapshot
-            if data.get("settings_snapshot") == {"path": str(path), "sha": sha}:
-                return self.cfg.prepared_layer
-        if settings := saved_settings(data):
-            self.cfg, layer, _ = settings
-            self.run.cfg = self.cfg
-            self.run.repo = self.cfg.repo(self.run.repo.name)
-            return layer
-        return saved_layer(data)
 
     @property
     def held_reason(self) -> str:
@@ -838,7 +783,7 @@ class Job:
         for c in self.checkouts:
             if str(c.wt) in self.restored:
                 c.lease = self.restored[str(c.wt)]
-        self.use_layer(self.load_snapshot(data) or pipeline.checked_layer(self.cfg, Path(data["layer"])))
+        self.use_layer(pipeline.checked_layer(self.cfg, Path(data["layer"])))
         run.add_dirs += [d for d in map(Path, data["add_dirs"]) if d not in run.add_dirs]
         if stored and not run.workspace:
             if held := workspace.scratch_held(self.ws, self.checkouts):
@@ -902,8 +847,6 @@ def local_workspace(run: pipeline.Run, base: str, branch: str, ws: Path, copies:
 
 @factory.step("prepare")
 def prepare(flow: factory.Flow, tree: str) -> Outcome:
-    from . import delegation
-
     job: Job = flow.ctx
     cfg, run = job.cfg, job.run
     repo, tk = run.repo, run.tracker
@@ -936,7 +879,7 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
         run.log(f"images: saved {util.count(len(images.paths), 'image')} from {run.ref}")
     if images.left_out:
         run.log(f"images: left out {', '.join(images.left_out)}")
-    main_layer = pipeline.checked_layer(cfg, repo.layer_dir, pinned=repo.pinned_layer)
+    main_layer = pipeline.checked_layer(cfg, repo.layer_dir)
     branch = (run.preview_branch or mended.get("branch") or pipeline.open_branch(run)
               or prompt_loader.fill_template(main_layer.branch, config.RepoLayer.branch, kind=t.kind, id=t.id,
                                         slug=prompt_loader.slug(t.title)))
@@ -966,9 +909,6 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
     approval = triage_store.triage_approval(run.triage_key)
     data = prepared_fields(t, branch, checkouts, layer, [run.dir / "images"] if images.paths else [],
                            pipeline.images_note(images), approval)
-    if cfg.settings_snapshot is None:
-        layer = pipeline.checked_layer(cfg, layer.dir)
-    data["settings_snapshot"] = delegation.freeze_settings(cfg, run, layer, source_layer=main_layer)
     if feedback_prs:
         data["feedback_prs"] = feedback_prs
     return Outcome("pass", data=data)

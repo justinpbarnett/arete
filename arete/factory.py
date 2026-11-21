@@ -540,7 +540,7 @@ def main(fn: Callable, argv: list[str] | None = None) -> None:
 
 
 def earlier(argv: list[str]) -> tuple[Callable, list[str]]:
-    from . import delegation, flows, pipeline
+    from . import flows, pipeline
 
     p = argparse.ArgumentParser(description="run one step of an earlier run alone, on the script that run used")
     p.add_argument("run")
@@ -556,12 +556,7 @@ def earlier(argv: list[str]) -> tuple[Callable, list[str]]:
     if not started(args.run, args.step):
         raise SystemExit(f"run {args.run} never started {args.step}, so it cannot run it alone")
     try:
-        saved = flows.saved_settings(flows.prepared_data(args.run))
-        cfg = saved[0] if saved else config.load()
-        with config.using_settings(cfg):
-            fn = pipeline.flow_function(cfg, path)
-    except delegation.PolicyChanged as e:
-        raise SystemExit(pipeline.record.failure(e)) from None
+        fn = pipeline.flow_function(config.load(), path)
     except (FileNotFoundError, AttributeError) as e:
         raise SystemExit(str(e)) from None
     return fn, [row["repo"], str(row["issue"]), "--continue", args.run, "--only", args.step,

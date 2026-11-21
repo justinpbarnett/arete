@@ -813,8 +813,7 @@ def stored() -> list[Stored]:
 def run_folders() -> list[Path]:
     if not paths.RUNS_DIR.exists():
         return []
-    return sorted(p for p in paths.RUNS_DIR.iterdir()
-                  if p.name != paths.SETTINGS_SNAPSHOT_STORE and not p.is_symlink() and p.is_dir())
+    return sorted(p for p in paths.RUNS_DIR.iterdir() if not p.is_symlink() and p.is_dir())
 
 
 def runs_bytes() -> int:
@@ -855,13 +854,9 @@ def purge_folders() -> Purged:
     folders, size, errors = 0, 0, []
     for run_id in sorted(queued):
         folder = paths.RUNS_DIR / run_id
-        settings = paths.settings_store() / run_id
         try:
-            if (not one_component(run_id) or run_id == paths.SETTINGS_SNAPSHOT_STORE or folder.is_symlink()
-                    or settings.parent.is_symlink() or settings.is_symlink()):
+            if not one_component(run_id) or folder.is_symlink():
                 raise ValueError(f"unsafe run folder {run_id}")
-            if settings.exists():
-                shutil.rmtree(settings)
             if folder.exists():
                 measured = scanned(run_id, folder).size
                 shutil.rmtree(folder)

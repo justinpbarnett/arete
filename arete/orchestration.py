@@ -76,8 +76,8 @@ class Controller:
         self.data = ledger.snapshot(self.lease)["data"]
         if self.data.get("protocol") != PROTOCOL or self.data.get("mode") != self.run.path:
             raise factory.Refused("this controller protocol needs compatible code before it can resume")
-        self.policy = (pipeline.config.Orchestration(**self.data["limits"]) if "limits" in self.data
-                       else self.run.repo.configured_layer().orchestration)
+        self.policy = pipeline.config.Orchestration(**self.data.get("limits", asdict(
+            pipeline.config.load_layer(self.run.repo.layer_dir).orchestration)))
         self.run.overrides = {**self.data.get("overrides", {}), **self.run.overrides}
         inherited = self.data.get("step_overrides", {})
         self.run.step_overrides = {role: {**inherited.get(role, {}), **self.run.step_overrides.get(role, {})}
@@ -145,13 +145,12 @@ class Controller:
                 raise factory.Refused("the saved controller lacks accepted invocation settings; reconcile before resuming")
             prepared = self.data["prepared"]
             layer_dir, source_file = Path(prepared["layer"]), None
-            saved = self.job.load_snapshot(prepared)
-            if saved is None and not layer_dir.exists():
+            if not layer_dir.exists():
                 for checkout in map(workspace.Checkout.from_row, prepared["checkouts"]):
                     if layer_dir.is_relative_to(checkout.wt):
                         source_file = checkout.src / layer_dir.relative_to(checkout.wt) / "config.toml"
                         break
-            self.job.layer = saved or pipeline.checked_layer(self.job.cfg, layer_dir, source_file=source_file)
+            self.job.layer = pipeline.checked_layer(self.job.cfg, layer_dir, source_file=source_file)
             self.run.cfg, self.run.layer, self.run.kind = self.job.cfg, self.job.layer, prepared["ticket"]["kind"]
             self.lineage()
             missing = any(not (Path(c["wt"]) / ".git").exists() for c in prepared["checkouts"])
@@ -237,9 +236,6 @@ class Controller:
         self.job.triage = pipeline.triage_notes(self.job.approval)
         self.job.b.plan_text, self.job.b.left_for_a_person = self.job.plan_text, self.job.left_for_a_person
         lineage, old_lineage = self.lineage()
-        if "settings_snapshot" not in self.data["prepared"]:
-            self.data["prepared"]["settings_snapshot"] = delegation.freeze_settings(
-                self.job.cfg, self.run, self.job.layer)
         self.data.update(lineage)
         self.data["overrides"], self.data["step_overrides"] = self.run.overrides, self.run.step_overrides
         self.data.setdefault("code", codebase.STAMP)
@@ -387,7 +383,6 @@ class Controller:
         return {"ref": action["id"], "excerpt": text[:2000], "characters": len(text)}
 
     def decide(self):
-        self.check_snapshot()
         observation = self.observe()
         turn = ledger.begin(self.lease, observation, self.policy.max_decisions)
         observation["decision_id"] = turn
@@ -1024,12 +1019,12 @@ class Controller:
             try:
                 repo, tid = self.run.repo, str(self.run.tid)
                 receipt = pilot.live_receipt(tid, repo.name)
-                cfg, layer = pilot.live_policy(repo)
+                layer = pipeline.config.load_layer(repo.layer_dir)
                 run = pilot.scheduled_run(repo.name, tid)
                 pilot.require(run and run["id"] == self.run.id, "the approved one-shot run changed")
                 pilot.require(layer.factory_path == "orchestrated"
                               and self.policy_sha() == receipt["policy"] == policy_fingerprint(
-                                  cfg, layer, ()), "the one-shot run changed its admitted policy")
+                                  pipeline.config.load(), layer, ()), "the one-shot run changed its admitted policy")
             except pilot.Held as error:
                 raise runlimits.Parked(str(error)) from error
 
@@ -1198,9 +1193,6 @@ class Controller:
         self.data["denied_feedback"] = feedback
         self.persist()
 
-    def check_snapshot(self):
-        flows.saved_settings(self.data.get("prepared") or {})
-
     def dispatch(self, action) -> ValueError | None:
         if action["state"] != "accepted":
             return
@@ -1210,7 +1202,6 @@ class Controller:
         refusal = None
         try:
             self.executing = action["id"]
-            self.check_snapshot()
             result = self.perform(action)
         except owner_asks.Asked as asked:
             ledger.transition(self.lease, action["id"], "succeeded",
@@ -1220,8 +1211,7 @@ class Controller:
             raise
         except ValueError as error:
             refusal = error
-            result = {"error": (pipeline.record.failure(error) if isinstance(error, delegation.PolicyChanged)
-                                else str(error))[:2000]}
+            result = {"error": str(error)[:2000]}
             ledger.transition(self.lease, action["id"], "failed", result)
         except BaseException as error:
             if action["id"] in self.workers:

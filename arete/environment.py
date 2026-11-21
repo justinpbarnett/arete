@@ -31,7 +31,7 @@ def passed(cfg: config.Config, repo: config.Repo | None = None) -> list[str]:
     if repo is None:
         return names
     try:
-        return names + list(repo.configured_layer().passes)
+        return names + list(config.load_layer(repo.layer_dir).passes)
     except (ValueError, TypeError, OSError):
         return names
 

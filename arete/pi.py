@@ -582,13 +582,11 @@ def guard_env(floor: guard.Floor, auth_paths: list[Path] | None = None,
 
 
 def confinement(cwd: Path, add_dirs: list[Path], floor: guard.Floor, selected: Route | None) -> list[str]:
-    snapshots = tuple(path for path in floor.files if path.name == paths.SETTINGS_SNAPSHOT_FILE)
     return sandbox.write_confinement(
         cwd, add_dirs, selected.owner if selected and selected.using_login else None,
         state=(paths.STATE_DIR, (*floor.open, sandbox.SESSIONS_DIR, sandbox.AGENT_DIR, sandbox.LOGIN_DIR,
                                  sandbox.KEY_DIR, paths.PACKAGE_DIR)),
-        hidden=(paths.CONFIG_DIR, paths.LOG_DIR, paths.CLIENT_DIR, paths.settings_store(), *snapshots),
-        peers=paths.WORKTREES_DIR)
+        hidden=(paths.CONFIG_DIR, paths.LOG_DIR, paths.CLIENT_DIR), peers=paths.WORKTREES_DIR)
 
 
 def command(names: list[str], *, model: str = "", effort: str = "", resume: Session = NO_SESSION, system: str = "",
@@ -821,7 +819,6 @@ def _run(
     judge: bool = False,
     read_roots: tuple[Path, ...] = (),
     native_observation: str = "",
-    guard_config: config.Config | None = None,
 ) -> Result:
     auth = auth if auth is not None else accounts.Auth("api_key")
     if mcp_servers(mcp_config):
@@ -878,7 +875,7 @@ def _run(
     shell = (pi_shell.Shell(cwd, tuple(add_dirs), floor, allowed, tuple(disallowed_tools or ()),
                             pi_shell.command_env(passing, extra_env, selected.hidden),
                             (selected.owner, folder, *selected.sensitive_files, *map(Path, protection["files"])),
-                            judge, time.monotonic() + timeout, tuple(read_roots), guard_config=guard_config)
+                            judge, time.monotonic() + timeout, tuple(read_roots))
              if observing or pi_shell.TOOL in names else None)
     try:
         with refresh_channel(selected, env) as refresh, pi_shell.channel(shell, env) as terminal:

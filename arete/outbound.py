@@ -55,31 +55,17 @@ def keep_verify_private(url: str) -> None:
 
 
 def keep_configured_private() -> None:
-    from . import config
-
-    if (cfg := config.snapshot_config()) is not None:
-        keep_private(*cfg.snapshot_private_hosts)
-        return
     try:
         repos = tomllib.loads(paths.CONFIG_FILE.read_text()).get("repo", [])
     except (OSError, ValueError):
         return
-    if not isinstance(repos, list):
-        return
     for repo in repos:
-        if not isinstance(repo, dict) or not isinstance(location := repo.get("layer") or repo.get("path"), str):
+        layer = paths.expand(repo["layer"]) if repo.get("layer") else paths.expand(repo["path"]) / ".agents"
+        try:
+            data = tomllib.loads((layer / "config.toml").read_text())
+            keep_verify_private(data.get("verify", {}).get("url", ""))
+        except (OSError, ValueError):
             continue
-        layer = paths.expand(location) if repo.get("layer") else paths.expand(location) / ".agents"
-        keep_layer_private(layer)
-
-
-def keep_layer_private(layer) -> None:
-    try:
-        verify = tomllib.loads((layer / "config.toml").read_text()).get("verify")
-    except (OSError, ValueError):
-        return
-    if isinstance(verify, dict) and isinstance(url := verify.get("url"), str):
-        keep_verify_private(url)
 
 
 def machine_hosts() -> list[str]:

@@ -151,20 +151,7 @@ def cmd_guard(args) -> int:
 
     scratch.HOOK.update(root=args.scratch, id=args.scratch_id, saves=args.scratch_saves)
     guard.LOGIN_FOLDERS = (*guard.LOGIN_FOLDERS, *(paths.expand(path) for path in getattr(args, "closed", ())))
-    return run_guard(guard.main, args.judge, args.open)
-
-
-def run_guard(call, *argv) -> int:
-    from ..delegation import PolicyChanged
-
-    try:
-        cfg = config.snapshot_config()
-    except PolicyChanged:
-        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
-                                                 "permissionDecisionReason": "Arete could not read the guard settings"}}))
-        return 0
-    with config.using_settings(cfg):
-        return call(*argv)
+    return guard.main(args.judge, args.open)
 
 
 def cmd_upload_guard(args) -> int:
@@ -187,7 +174,7 @@ def cmd_codex_guard(args) -> int:
     from .. import codex, routing, scratch
 
     scratch.HOOK.update(root=args.scratch, id=args.scratch_id, saves=args.scratch_saves)
-    return run_guard(codex.guard_main, args.judge, routing.NO_GIT_WRITES, args.open)
+    return codex.guard_main(args.judge, routing.NO_GIT_WRITES, args.open)
 
 
 def cmd_mcp_ask(args) -> int:

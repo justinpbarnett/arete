@@ -7,7 +7,6 @@ import shutil
 import subprocess
 import uuid
 from collections.abc import Callable
-from contextlib import nullcontext
 from datetime import timedelta
 from pathlib import Path
 
@@ -183,10 +182,7 @@ def _run(
     auth: accounts.Auth | None = None,
     api_key: str = "",
     leaf: str = "",
-    ask_policy: tuple[tuple[Path, str], Path] | None = None,
 ) -> Result:
-    from . import jev_ask
-
     fresh_session = "" if resume.id or not persist else str(uuid.uuid4())
     cmd = command(cwd, model=model, effort=effort, tools=tools, allowed_tools=allowed_tools,
                   disallowed_tools=disallowed_tools, permission_mode=permission_mode, json_schema=json_schema,
@@ -199,17 +195,13 @@ def _run(
         cmd = ["env", "-u", "ANTHROPIC_API_KEY", *cmd]
     else:
         env = agent_env(passing, extra_env, api_key=api_key)
-        env.pop(jev_ask.POLICY_DIR, None)
     try:
         if remote:
             proc = device_turns.run(remote, cmd, cwd, env, prompt, timeout=timeout, on_line=on_line,
                                     on_mark=lambda kind, n: on_line(json.dumps({"arete": kind, "offset": n}) + "\n"),
                                     leaf=leaf or f"agent-{os.getpid()}-{uuid.uuid4().hex}", settle_answer=True)
         else:
-            with jev_ask.serve_policy(*ask_policy) if ask_policy else nullcontext() as mailbox:
-                if mailbox is not None:
-                    env[jev_ask.POLICY_DIR] = mailbox
-                proc = child.stream(cmd, str(cwd), prompt, env, timeout, on_line)
+            proc = child.stream(cmd, str(cwd), prompt, env, timeout, on_line)
     except device_turns.Lost as e:
         session = Session(fresh_session, 0.0, "claude") if e.started and fresh_session else resume
         result = parse(subprocess.CompletedProcess(cmd, 1, e.output, ""), session, model, json_schema)
@@ -333,19 +325,6 @@ def usage_limit(data: dict | list | str, text: str, model: str = "") -> UsageLim
 
 def local_roots(folders: list[Path | str]) -> list[str]:
     return list(dict.fromkeys(f"/{p}" for f in folders for p in (Path(f).absolute(), Path(f).resolve())))
-
-
-def protect_settings(settings: dict, snapshot: Path, opened: tuple[Path, ...]) -> None:
-    store = paths.settings_store()
-    private = tuple(dict.fromkeys(str(p) for root in (store, snapshot) for p in (root.absolute(), root.resolve())))
-    settings["permissions"] = {"deny": [f"{tool}(/{p}{suffix})" for tool in ("Read", "Edit")
-                                        for p in private for suffix in ("", "/**")]}
-    settings["sandbox"] = {
-        "enabled": True, "failIfUnavailable": True, "allowUnsandboxedCommands": False,
-        "autoAllowBashIfSandboxed": False, "excludedCommands": [],
-        "filesystem": {"disabled": False, "denyRead": list(private), "denyWrite": list(private),
-                       "allowRead": [], "allowWrite": [str(p) for p in opened]},
-    }
 
 
 def remote_root(folder: Path | str) -> str:

@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from . import config, environment, paths, sandbox, scratch, util
+from . import environment, paths, sandbox, scratch, util
 
 if TYPE_CHECKING:
     from . import guard
@@ -91,7 +91,6 @@ class Shell:
     judge: bool
     deadline: float
     read_roots: tuple[Path, ...] = ()
-    guard_config: config.Config | None = None
 
     def __post_init__(self):
         writable = (self.cwd, *self.add_dirs, *map(Path, sandbox.WRITABLE_ALWAYS), sandbox.AGENT_DIR,
@@ -151,7 +150,7 @@ class Shell:
         return profile
 
     def execute(self, request: dict, stopped: threading.Event) -> dict:
-        from . import codex, delegation, guard
+        from . import codex, guard
 
         if type(request) is not dict or request.keys() - {"command", "timeout"}:
             raise ValueError("shell accepts only command and timeout")
@@ -165,13 +164,9 @@ class Shell:
             raise ValueError("command is outside this step's Bash permissions; patterned grants need one simple command")
         if why := codex.git_write(command, list(self.denied)):
             raise ValueError(f"Arete owns publication and git mutation: {why}")
-        cfg = self.guard_config
-        if cfg is not None and cfg.settings_snapshot is not None:
-            delegation.snapshot_bytes(*cfg.settings_snapshot)
-        with config.using_settings(cfg):
-            if why := guard.decide({"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(self.cwd)},
-                                   self.judge, self.floor):
-                raise ValueError(why)
+        if why := guard.decide({"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(self.cwd)},
+                               self.judge, self.floor):
+            raise ValueError(why)
         until = min(self.deadline, time.monotonic() + timeout)
         if stopped.is_set() or until <= time.monotonic():
             raise ValueError("shell invocation stopped or its deadline expired")
