@@ -4,6 +4,7 @@ import http.client
 import json
 import os
 import stat
+import subprocess
 import sys
 import threading
 import time
@@ -45,6 +46,7 @@ from . import (
     serve_guard,
     sessions,
     sources,
+    startup_excerpt,
     store,
     tasks,
     tool_events,
@@ -232,9 +234,6 @@ def report_rollbacks(src: Path, say: Callable[[str], None]) -> None:
             if not all(serve_guard.SHA.fullmatch(sha) for sha in (tip, previous)):
                 continue
             key = f"serve-rollback-{tip}"
-            body = (f"Arete rolled back self-deploy `{tip[:12]}` to `{previous[:12]}` because "
-                    f"{serve_guard.report_reason(held)}. Deploys of `{tip[:12]}` are held.\n\n"
-                    f"Failure types in the local serve.log tail: {serve_guard.report_log_types(held)}.")
             issue = None
             if held.get("report_started"):
                 issue = next((row["number"] for row in gh.recent_issues(repo, limit=20)
@@ -243,11 +242,16 @@ def report_rollbacks(src: Path, say: Callable[[str], None]) -> None:
                 held["report_started"] = True
                 serve_guard.write(path, held)
             if issue is None:
+                tracked = serve_guard.git(src, "ls-tree", "-r", "--name-only", tip).splitlines()
+                excerpt = startup_excerpt.redacted(held["log_tail"], str(src), frozenset(tracked), (tip, previous))
+                body = (f"Arete rolled back self-deploy `{tip[:12]}` to `{previous[:12]}` because "
+                        f"{serve_guard.report_reason(held)}. Deploys of `{tip[:12]}` are held.\n\n"
+                        f"Redacted serve.log tail\n\n```text\n{excerpt}\n```")
                 issue = gh.issue_create(repo, f"{tracker.ARETE_TAG} Serve self-deploy {tip[:12]} rolled back",
                                         body, [tracker.LABEL, "bug"], key=key)
             serve_guard.write(path, {**held, "issue": issue})
             say(f"deploy: reported rollback of {tip} in {gh.issue_url(repo, issue)}")
-        except (OSError, RuntimeError, KeyError, TypeError, ValueError) as error:
+        except (OSError, RuntimeError, KeyError, TypeError, ValueError, subprocess.SubprocessError) as error:
             say(f"deploy: could not report rollback: {util.first_line(str(error), 300)}")
 
 
@@ -528,11 +532,13 @@ class Server:
 
     def acknowledge_deploy(self, completed: bool) -> None:
         receipt = serve_guard.pending(paths.STATE_DIR, paths.PACKAGE_DIR.parent)
-        if receipt is None or receipt.tip != codebase.RELEASE:
+        if (receipt is None or receipt.tip != codebase.RELEASE
+                or serve_guard.hold_path(paths.STATE_DIR, receipt.tip).exists()):
             return
         if completed and (not self.with_dashboard or dashboard_answers()):
             serve_guard.write(paths.STATE_DIR / serve_guard.RECEIPT, asdict(replace(receipt, healthy=True)))
             self.say(f"deploy: {receipt.tip} is healthy")
+            serve_guard.contract_snapshot(paths.STATE_DIR, receipt).unlink(missing_ok=True)
         elif receipt.expired():
             self.restart_for_new_code()
 
@@ -593,6 +599,9 @@ class Server:
                 return
             if not self.deploy_ready(src, base, tip):
                 return
+            if reason := install.deploy_restart_refusal(src):
+                self.deploy_refused(src, tip, reason)
+                return
             try:
                 recovery = util.deploy_recovery(src, base, tip)
             except (OSError, RuntimeError) as error:
@@ -642,8 +651,6 @@ class Server:
             self.say(f"deploy: {paths.short_path(src)} left alone for {tip} ({reason})")
 
     def watch_alerts(self) -> None:
-        if foundation.deploy_pending():
-            return
         due = {k: v for k, v in self.failing.items()
                if v["ticks"] >= ALERT_TICKS and (k in ALERT_STAGES or k.startswith("loop:"))}
         self.alerted = {k: e for k, e in self.alerted.items() if k in self.failing}
@@ -1015,16 +1022,17 @@ class Server:
                                  + util.last_line(candidate.stderr or candidate.stdout, 300))
             self.note_once(self.code_problem)
             return
-        if deploying:
-            self.restart_for_new_code()
-            return
         if stamp != self.migration_stamp:
             migrated = util.sh(control.command(["migrate", "--no-contracts"]), timeout=120)
             self.migration_stamp = stamp
             self.migration_error = ((util.last_line(migrated.stderr or migrated.stdout, 300)
                                      or f"migrate exited {migrated.returncode}") if migrated.returncode else "")
         if self.migration_error:
-            self.note_once("new code migration failed, so serve keeps its code: " + self.migration_error)
+            if deploying:
+                self.note_once("deploy: new code migration failed: " + self.migration_error)
+                self.rollback_deploy(receipt, serve_guard.MIGRATION_FAILURE)
+            else:
+                self.note_once("new code migration failed, so serve keeps its code: " + self.migration_error)
             return
         self.restart_for_new_code()
 

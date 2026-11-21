@@ -2,6 +2,8 @@ import ast
 import hashlib
 import http.client
 import json
+import os
+import plistlib
 import shlex
 import shutil
 import signal
@@ -2427,6 +2429,7 @@ class ServeDeploymentFixture(unittest.TestCase):
         self.server.checkout_update = threading.Lock()
         self.server.deploy_refusals = set()
         self.server.say = mock.Mock()
+        self.enterContext(mock.patch.object(install, "deploy_restart_refusal", return_value=""))
         self.ci_state = ("completed", "success")
         self.gh_json = gh.gh_json
         self.ci = self.enterContext(mock.patch.object(gh, "gh_json", side_effect=self.ci_response))
@@ -2616,15 +2619,18 @@ class SelfDeployRollbackTests(unittest.TestCase):
 
     def git(self, *args):
         return subprocess.check_output(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
-                                        "-c", "commit.gpgsign=false", *args], cwd=self.checkout,
+                                        "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", *args],
+                                       cwd=self.checkout,
                                        text=True, timeout=2).strip()
 
     def prepare_state(self):
-        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        root = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
         self.checkout = root / "checkout"
         self.state = root / "state"
         self.github = "fixture/arete"
         self.ref = "refs/remotes/origin/main"
+        self.previous, self.tip = "1" * 40, "2" * 40
         self.enterContext(mock.patch.multiple(paths, HOME=root, PACKAGE_DIR=self.checkout / "arete",
                                              STATE_DIR=self.state, CONFIG_DIR=root / "config",
                                              CONFIG_FILE=root / "config" / "config.toml",
@@ -2659,67 +2665,109 @@ class SelfDeployRollbackTests(unittest.TestCase):
         return serve_guard.read(self.state / serve_guard.RECEIPT)
 
     def write_receipt(self, **updates):
-        receipt = serve_guard.Receipt(str(self.checkout), "main", self.previous, self.tip, self.github, time.time(),
+        created_at = updates.pop("created_at", time.time())
+        receipt = serve_guard.Receipt(str(self.checkout), "main", self.previous, self.tip, self.github, created_at,
                                       **updates)
         serve_guard.write(self.state / serve_guard.RECEIPT, asdict(receipt))
 
-    def test_legacy_launcher_keeps_running_when_candidate_fails_import(self):
-        self.prepare_checkout({"arete/cli.py": "raise ImportError('broken deployment')\n"})
+    def start(self):
+        plist = install.serve_plist()
+        return subprocess.run(plist["ProgramArguments"], cwd=plist["WorkingDirectory"],
+                              env=plist["EnvironmentVariables"], capture_output=True, text=True, timeout=2)
+
+    def prepare_launch_agent(self):
+        self.git("update-ref", self.ref, self.tip)
+        self.git("reset", "-q", "--hard", self.previous)
+        self.enterContext(mock.patch.object(paths, "ON_MAC", True))
+        agents = self.state.parent / "LaunchAgents"
+        agents.mkdir()
+        self.enterContext(mock.patch.object(install, "AGENTS_DIR", agents))
+        return install.serve_file("mac")
+
+    def assert_legacy_launch_agent_defers(self, agent, guarded):
+        legacy = ["/fixture/bin/arete", "serve"]
+        agent.write_bytes(plistlib.dumps({**guarded, "ProgramArguments": legacy}))
+        with (mock.patch.object(sys, "orig_argv", legacy),
+              mock.patch.object(install.launchd, "printed") as loaded,
+              mock.patch.object(util, "deploy_fast_forward") as merge):
+            self.server.deploy_tip(self.checkout, "main", self.ref, self.tip, self.github)
+            loaded.assert_not_called()
+            merge.assert_not_called()
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.previous)
+        self.assertIsNone(self.receipt())
+        self.assertFalse(install.serve_guard_file().exists())
+        self.assertIn("run `arete install`", self.server.say.call_args.args[0])
+        agent.write_bytes(plistlib.dumps(guarded))
+        with mock.patch.object(sys, "orig_argv", legacy):
+            self.assertIn("run `arete install`", install.deploy_restart_refusal(self.checkout))
+        with (mock.patch.object(sys, "orig_argv", guarded["ProgramArguments"]),
+              mock.patch.object(install.launchd, "printed", return_value=f"\tpath = {agent}\n\tpid = 0\n")):
+            self.assertIn("run `arete install`", install.deploy_restart_refusal(self.checkout))
+
+    def test_running_daemon_rolls_back_when_candidate_fails_import_preflight(self):
+        self.prepare_state()
         self.write_receipt()
         self.server.code = frozenset({("HEAD", self.previous[:12])})
+        self.server.code_seen = self.server.code
         self.server.code_note = ""
         self.assertFalse(install.serve_guard_file().exists())
-        with (mock.patch.multiple(serve.codebase, CHECKOUT=self.checkout, RELEASE=self.previous),
+        stamp = frozenset({("HEAD", self.tip[:12])})
+        check = subprocess.CompletedProcess([], 1, "", "ImportError: broken deployment")
+        with (mock.patch.object(serve.codebase, "RELEASE", self.previous),
+              mock.patch.object(serve.codebase, "head_and_dirt", return_value=(self.previous[:12], False)),
+              mock.patch.object(serve, "code_stamp", return_value=stamp),
+              mock.patch.object(util, "sh", return_value=check),
               mock.patch.object(self.server, "restart_for_new_code") as restart,
-              redirect_stdout(StringIO()) as out):
-            self.server.code_seen = serve.code_stamp()
+              mock.patch.object(serve_guard, "rollback", return_value=True) as rollback):
             self.server.load_new_code()
             self.server.load_new_code()
         restart.assert_not_called()
         self.assertIn("broken deployment", self.server.code_note)
-        self.assertIn(serve_guard.IMPORT_FAILURE, out.getvalue())
-        self.assertEqual(self.git("rev-parse", "HEAD"), self.previous)
-        self.assertTrue(serve_guard.hold_path(self.state, self.tip).exists())
+        rollback.assert_called_once_with(self.state, self.checkout, paths.LOG_DIR,
+                                         serve_guard.pending(self.state, self.checkout), serve_guard.IMPORT_FAILURE)
 
-    def test_launchd_rolls_back_three_import_failures_and_holds_the_tip(self):
+    def test_launchd_rolls_back_after_three_failed_starts_and_holds_the_tip(self):
         token = "ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ"
         password = "synthetic-password-that-must-stay-local"
-        self.prepare_checkout({"arete/__init__.py": f"raise ImportError('token={token} password={password}')\n"})
-        self.git("update-ref", self.ref, self.tip)
-        self.git("reset", "-q", "--hard", self.previous)
-        self.server.deploy_tip(self.checkout, "main", self.ref, self.tip, self.github)
-        self.assertEqual(self.git("rev-parse", "HEAD"), self.tip)
-        install.write_serve_guard()
+        self.prepare_checkout({"arete/__init__.py": f"raise ImportError('cannot import module token={token} "
+                                                  f"password={password}')\n"})
+        agent = self.prepare_launch_agent()
         plist = install.serve_plist()
+        self.enterContext(mock.patch.object(self.server, "deploy_ready", return_value=True))
+        self.enterContext(mock.patch.object(util, "deploy_recovery", return_value=util.DeployRecovery(
+            self.previous, (), (), ())))
+        self.assert_legacy_launch_agent_defers(agent, plist)
+        with (mock.patch.object(sys, "orig_argv", plist["ProgramArguments"]),
+              mock.patch.object(install.launchd, "printed", return_value=f"\tpath = {agent}\n\tpid = {os.getpid()}\n")):
+            self.server.deploy_tip(self.checkout, "main", self.ref, self.tip, self.github)
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.tip)
+        self.assertTrue(install.serve_guard_file().is_file())
         observed = self.receipt()
         self.assertEqual((observed["previous"], observed["tip"], observed["starts"]),
                          (self.previous, self.tip, 0))
-        serve_guard.write(self.state / serve_guard.RECEIPT, {**observed, "healthy": True, "starts": 3, "created_at": 0})
+
+        self.write_receipt(healthy=True, starts=3, created_at=0)
         serve_guard.startup(self.state, self.checkout, paths.LOG_DIR)
         self.assertEqual(self.git("rev-parse", "HEAD"), self.tip)
         self.assertEqual(self.receipt()["starts"], 3)
         self.assertFalse(serve_guard.hold_path(self.state, self.tip).exists())
         serve_guard.write(self.state / serve_guard.RECEIPT, observed)
 
-        def start():
-            return subprocess.run(plist["ProgramArguments"], cwd=self.state.parent,
-                                  env=plist["EnvironmentVariables"], capture_output=True, text=True, timeout=2)
-
-        log = Path(plist["StandardErrorPath"])
+        log = Path(install.serve_plist()["StandardErrorPath"])
         log.parent.mkdir(parents=True, exist_ok=True)
-        for starts in range(1, 4):
-            failed = start()
-            self.assertNotEqual(failed.returncode, 0, failed.stdout)
-            self.assertIn(f"ImportError: token={token} password={password}", failed.stderr)
-            log.write_text(failed.stderr)
-            self.assertEqual(self.receipt()["starts"], starts)
-        restored = start()
+        failed = self.start()
+        self.assertNotEqual(failed.returncode, 0, failed.stdout)
+        self.assertIn("ImportError: cannot import module", failed.stderr)
+        log.write_text(failed.stderr)
+        self.assertEqual(self.receipt()["starts"], 1)
+        self.write_receipt(starts=3)
+        restored = self.start()
         self.assertEqual(restored.returncode, 0, restored.stderr)
         self.assertIn(f"deploy: rolled back to {self.previous} because 3 unhealthy starts", restored.stdout)
         self.assertIn("last good started", restored.stdout)
-        self.server.deploy_tip(self.checkout, "main", self.ref, self.tip, self.github)
         self.assertEqual(self.git("rev-parse", "HEAD"), self.previous)
-        self.assertIn("held after startup rollback", self.server.say.call_args.args[0])
+        self.assertIsNone(serve_guard.pending(self.state, self.checkout))
+        self.assertEqual(serve.deploy_refusal(self.checkout, "main", self.tip), "held after startup rollback")
 
         held = serve_guard.read(serve_guard.hold_path(self.state, self.tip))
         self.assertIn(token, held["log_tail"])
@@ -2730,19 +2778,30 @@ class SelfDeployRollbackTests(unittest.TestCase):
         issue.assert_called_once()
         self.assertEqual(issue.call_args.args[0][-4:], ["--label", "agent", "--label", "bug"])
         body = issue.call_args.kwargs["input"]
-        self.assertIn("Failure types in the local serve.log tail: ImportError.", body)
+        self.assertIn("Redacted serve.log tail", body)
+        self.assertIn("ImportError: cannot import module", body)
         for secret in (token, password, str(self.checkout)):
             self.assertNotIn(secret, body)
 
-    def test_headless_deploy_requires_dispatch_to_succeed(self):
+    def test_expired_receipt_triggers_rollback_on_first_start(self):
         self.prepare_state()
-        self.previous, self.tip = "1" * 40, "2" * 40
+        self.write_receipt(created_at=time.time() - serve_guard.AGE_LIMIT)
+        with (mock.patch.object(serve_guard, "at_tip", return_value=True),
+              mock.patch.object(serve_guard, "rollback", return_value=True) as rollback):
+            self.assertTrue(serve_guard.count_start(self.state, self.checkout, paths.LOG_DIR))
+        receipt = serve_guard.pending(self.state, self.checkout)
+        self.assertEqual(receipt.starts, 1)
+        rollback.assert_called_once_with(self.state, self.checkout, paths.LOG_DIR, receipt, serve_guard.AGE_FAILURE)
+
+    def test_deploy_requires_a_full_tick_and_dashboard_readiness(self):
+        self.prepare_state()
         self.server.with_dashboard = False
         cfg = config.Config()
         with mock.patch.object(self.server, "deploy") as deploy:
             self.server.deploy_if_ready(cfg)
         deploy.assert_called_once_with(cfg)
         self.write_receipt()
+        self.server.with_dashboard = True
 
         self.server.contracts_waiting = False
         self.server.code_problem = ""
@@ -2756,15 +2815,102 @@ class SelfDeployRollbackTests(unittest.TestCase):
               mock.patch.object(db, "ensure_schema"),
               mock.patch.object(serve.loop_store, "loop_states", return_value={}),
               mock.patch.object(serve.codebase, "RELEASE", self.tip),
-              mock.patch.object(serve, "dashboard_answers") as probe):
+              mock.patch.object(serve, "dashboard_answers", side_effect=[False, True]) as probe):
             stages["dispatch"].side_effect = RuntimeError("queue failure")
             self.server.acknowledge_deploy(self.server.tick())
             self.assertIn("stage:dispatch", self.server.failing)
             self.assertFalse(self.receipt()["healthy"])
+            probe.assert_not_called()
             stages["dispatch"].side_effect = None
             self.server.acknowledge_deploy(self.server.tick())
-            probe.assert_not_called()
+            self.assertFalse(self.receipt()["healthy"])
+            self.server.acknowledge_deploy(self.server.tick())
         self.assertTrue(self.receipt()["healthy"])
+
+    def test_pending_deploy_delivers_tick_alert_at_normal_threshold(self):
+        self.prepare_state()
+        self.write_receipt(created_at=time.time() - serve_guard.AGE_LIMIT)
+        self.server = serve.Server()
+        self.addCleanup(self.server.pool.shutdown)
+        self.server.cfg = config.Config()
+        self.server.say = mock.Mock()
+        dispatch = mock.Mock(return_value=True, side_effect=RuntimeError("queue failure"))
+        self.server.tick = lambda: self.server.guard("stage:dispatch", dispatch) is True
+        with (mock.patch.object(serve.codebase, "RELEASE", self.tip),
+              mock.patch.multiple(self.server, load_new_code=mock.DEFAULT, deploy_when_due=mock.DEFAULT,
+                                  reap_inherited=mock.DEFAULT, beat=mock.DEFAULT,
+                                  busy_with=mock.Mock(return_value="a chat message is still running")),
+              mock.patch.multiple(serve.incident_store, alert_get=mock.DEFAULT, alert_set=mock.DEFAULT,
+                                  alert_clear=mock.DEFAULT) as incidents,
+              mock.patch.object(serve.alerts, "notify") as notify):
+            incidents["alert_get"].return_value = None
+            for _ in range(serve.ALERT_TICKS - 1):
+                self.server.run_pass()
+            self.assertIsNone(self.server.alert_last)
+            self.server.run_pass()
+            self.server.alert_last.result(timeout=1)
+            incidents["alert_set"].assert_called_once_with(serve.ALERT_KEY, None)
+            self.assertIn("stage:dispatch: RuntimeError: queue failure", notify.call_args.args[1])
+            self.server.run_pass()
+            self.server.alert_last.result(timeout=1)
+            notify.assert_called_once()
+            self.assertFalse(self.receipt()["healthy"])
+            incidents["alert_get"].return_value = {"issue": None}
+            dispatch.side_effect = None
+            self.server.run_pass()
+            self.server.alert_last.result(timeout=1)
+            incidents["alert_clear"].assert_called_once_with(serve.ALERT_KEY)
+
+    def test_required_contract_and_expansion_keep_a_recoverable_database(self):
+        old_version = 9
+        self.prepare_state()
+        self.enterContext(mock.patch.object(serve_guard, "previous_schema", return_value=old_version))
+        with (redirect_stdout(StringIO()) as out,
+              mock.patch.multiple(serve.codebase, CHECKOUT=self.checkout, RELEASE=self.previous),
+              mock.patch.object(db.migrations, "load", return_value=db._CHAIN[:old_version])):
+            self.assertFalse(db.migrate())
+            db.enable_wal()
+            with closing(db.connect_db(paths.DB_FILE)) as conn:
+                conn.execute("CREATE TABLE deploy_fixture (value TEXT)")
+                conn.execute("INSERT INTO deploy_fixture VALUES ('prior write')")
+                conn.execute("INSERT INTO runs (id, kind, status, started, pid, schema_version) "
+                             "VALUES ('old-worker', 'loop', 'running', ?, ?, 9)", (util.iso(), os.getpid()))
+                conn.commit()
+        self.write_receipt(starts=3)
+        receipt = serve_guard.pending(self.state, self.checkout)
+        snapshot = serve_guard.contract_snapshot(self.state, receipt)
+        with (redirect_stdout(out),
+              mock.patch.multiple(serve.codebase, CHECKOUT=self.checkout, RELEASE=self.tip),
+              mock.patch.multiple(db, LATEST=11, NEEDED=11),
+              mock.patch.object(db.migrations, "load", return_value=db._CHAIN[:11])):
+            self.assertTrue(db.migrate())
+            self.assertIn("m0010_", out.getvalue())
+            self.assertIn(" waits for old-worker", out.getvalue())
+            self.assertFalse(snapshot.exists())
+            with closing(db.connect_db(paths.DB_FILE)) as conn:
+                conn.execute("UPDATE runs SET status = 'done' WHERE id = 'old-worker'")
+                conn.commit()
+            self.assertTrue(db.migrate(contracts=False))
+            self.assertFalse(db.migrate())
+            self.assertTrue(snapshot.is_file())
+            with db.tx() as conn:
+                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 11)
+                conn.execute("INSERT INTO deploy_fixture VALUES ('candidate write')")
+            archive = serve_guard.recover_database(self.state, self.checkout, receipt)
+            with self.assertRaises(db.IncompatibleSchema), db.tx():
+                pass
+        serve_guard.write(self.state / serve_guard.RECEIPT, asdict(replace(receipt, settled="rolled_back")))
+        with (mock.patch.multiple(serve.codebase, CHECKOUT=self.checkout, RELEASE=self.previous),
+              mock.patch.multiple(db, LATEST=old_version, NEEDED=old_version),
+              mock.patch.object(db.migrations, "load", return_value=db._CHAIN[:old_version])):
+            self.assertFalse(db.migrate())
+            with db.tx() as conn:
+                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], old_version)
+                self.assertEqual([row[0] for row in conn.execute("SELECT value FROM deploy_fixture")], ["prior write"])
+        with closing(db.connect_db(archive, readonly=True)) as conn:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 11)
+            self.assertEqual(conn.execute("SELECT value FROM deploy_fixture ORDER BY rowid").fetchall(),
+                             [("prior write",), ("candidate write",)])
 
     def test_rollback_recovers_migrated_database_and_dashboard_with_distinct_owner(self):
         expansion = "CREATE TABLE deploy_fixture (value TEXT);"
@@ -2773,7 +2919,8 @@ class SelfDeployRollbackTests(unittest.TestCase):
                  f"m{db.LATEST + 2:04d}_foundation_deploy_contract.py": ("contract", contract)}
         source = {f"arete/store/migrations/{name}": f"PHASE = {phase!r}\nSQL = {sql!r}\n"
                   for name, (phase, sql) in files.items()}
-        self.prepare_checkout(source)
+        self.prepare_state()
+        self.enterContext(mock.patch.object(serve_guard, "previous_schema", return_value=db.LATEST))
         chain = list(db._CHAIN)
         self.enterContext(mock.patch.object(db.migrations, "load", return_value=db._CHAIN))
         for name, (phase, sql) in files.items():
@@ -2788,9 +2935,13 @@ class SelfDeployRollbackTests(unittest.TestCase):
         with db.tx() as conn:
             conn.execute("INSERT INTO deploy_fixture VALUES ('candidate write')")
         with mock.patch.multiple(serve.codebase, RELEASE=self.previous, CHECKOUT=self.checkout, STAMP=self.previous[:12]):
-            with self.assertRaises(db.migrations.Refused):
-                db.migrate()
-            with redirect_stdout(StringIO()):
+            with mock.patch.object(serve_guard, "at_tip", return_value=True):
+                with self.assertRaises(db.migrations.Refused):
+                    db.migrate()
+            with (redirect_stdout(StringIO()), mock.patch.object(serve_guard, "at_tip", return_value=True),
+                  mock.patch.object(serve_guard, "git", side_effect=["", str(self.checkout), self.previous, ""]),
+                  mock.patch.object(serve_guard, "migration_manifest", return_value={
+                      m.name: m.sha256 for m in chain[len(db._CHAIN):]})):
                 self.assertTrue(serve_guard.count_start(self.state, self.checkout, paths.LOG_DIR))
             self.assertFalse(db.migrate())
             db.ensure_schema()
