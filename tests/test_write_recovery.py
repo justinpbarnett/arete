@@ -207,10 +207,9 @@ class JiraWriteLedger:
 class JiraWriteRecoveryTests(unittest.TestCase):
     def setUp(self):
         self.client = jira.Client("https://jira.fixture.invalid", "fixture", "fixture")
-        for patch in (mock.patch.object(util, "wait_for_network", return_value=True),
-                      mock.patch.object(jira.time, "sleep", side_effect=AssertionError("unexpected retry sleep"))):
-            patch.start()
-            self.addCleanup(patch.stop)
+        self.enterContext(mock.patch.object(util, "wait_for_network", return_value=True))
+        clock = self.enterContext(mock.patch.object(jira, "time", mock.Mock(wraps=jira.time)))
+        clock.sleep.side_effect = AssertionError("unexpected retry sleep")
 
     def test_comments_reconcile_each_lost_reply(self):
         for error, lookup_fails in (("502", False), ("timeout", False), ("502", True)):
