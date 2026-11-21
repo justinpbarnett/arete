@@ -46,7 +46,7 @@ def task_add(args) -> int:
 
 
 def task_list(args) -> int:
-    rows = client.field(client.call("GET", "/api/v1/tasks", legacy="/api/tasks"), "tasks")
+    rows = client.field(client.call("GET", "/api/v1/tasks"), "tasks")
     print_lines(json.dumps(row, ensure_ascii=False) for row in rows
                 if (not args.repo or row["repo"] == args.repo) and (not args.state or row["state"] == args.state))
     return 0

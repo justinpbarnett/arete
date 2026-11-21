@@ -43,7 +43,7 @@ def main(argv: list[str] | None = None) -> int:
         codebase.load()
     try:
         recovery = args.cmd in ("init", "migrate") or (args.cmd == "backup" and args.restore)
-        with client.invocation(), principals.acting("hand" if recovery else principals.cli_actor()):
+        with client.invocation(), principals.acting("hand" if recovery else principals.cli_actor):
             return args.fn(args) or 0
     except client.Down as e:
         client.emit(e.answer)

@@ -121,11 +121,11 @@ class CliThroughServeTests(unittest.TestCase):
         self.fixture_config = "\n".join(lines) + "\n"
         paths.CONFIG_FILE.write_text(self.fixture_config)
 
-    def cli(self, command):
+    def cli(self, command, stdin=""):
         from arete import cli
 
         out, err = StringIO(), StringIO()
-        with redirect_stdout(out), redirect_stderr(err), mock.patch("sys.stdin", StringIO()):
+        with redirect_stdout(out), redirect_stderr(err), mock.patch("sys.stdin", StringIO(stdin)):
             code = cli.main(command.split())
         return code, out.getvalue().splitlines(), err.getvalue()
 
@@ -150,7 +150,7 @@ class CliThroughServeTests(unittest.TestCase):
                 thread.join()
 
     @contextmanager
-    def serve_at(self, requests):
+    def serve_at(self, requests, names=()):
         db.migrate()
         principals.seed_owner(self.OWNER)
 
@@ -163,7 +163,7 @@ class CliThroughServeTests(unittest.TestCase):
                 pass
 
         address = "127.0.0.1"
-        node = tailnet.Node((address,), frozenset({address}), address)
+        node = tailnet.Node((address,), frozenset({address, *names}), address)
         logins = tailnet.Logins(mock.Mock())
         with mock.patch.object(logins, "of", return_value=self.OWNER), mock.patch("socket.getfqdn", return_value=address):
             server = tailnet.Server(address, 0, node, logins, False, Handler, dashboard.Redirect)
@@ -312,6 +312,9 @@ class CliThroughServeTests(unittest.TestCase):
         self.in_subprocess("check_identity_change_blocks_writes")
 
     def check_identity_change_blocks_writes(self):
+        from arete import paths
+
+        paths.CONFIG_FILE.write_text(self.fixture_config + '\n[server]\nurl = "http://127.0.0.1:1"\n')
         sent = []
         instances = iter(("first", "second"))
 
@@ -450,6 +453,131 @@ class CliThroughServeTests(unittest.TestCase):
                 self.assertEqual(self.cli(f"stop {run}")[:2], first[:2])
             self.assertEqual(runs.run_get(run)["status"], "stopped")
 
+    def test_run_retries_keep_the_original_target_and_version(self):
+        self.in_subprocess("check_run_retries_keep_the_original_target_and_version")
+
+    def check_run_retries_keep_the_original_target_and_version(self):
+        from arete import record
+        from arete.store import runs
+
+        seen = []
+        with self.serve_at(seen):
+            record.start("loop", run_id="r1", loop="example", pid=None)
+            record.start("loop", run_id="r2", loop="example", pid=None)
+            with mock.patch.object(control, "loop_detail", side_effect=[{"running": "r1"}, {"running": "r2"}]) as detail:
+                with mock.patch.dict(os.environ, {"ARETE_IDEMPOTENCY_KEY": "loop-stop"}):
+                    first = self.cli("loop stop example")
+                    self.assertEqual(first[0], 0, first)
+                    self.assertEqual(self.cli("loop stop example")[:2], first[:2])
+                self.assertEqual(detail.call_count, 1)
+            self.assertEqual(runs.run_get("r1")["status"], "stopped")
+            self.assertEqual(runs.run_get("r2")["status"], "running")
+            for action, command, args in (("resume", "resume r2", ("r2", "")),
+                                          ("repair", "repair r2", ("r2",)),
+                                          ("run_step", "step r2 build", ("r2", "build", {}))):
+                version = runs.run_get("r2")["version"]
+                with (mock.patch.object(tasks, action, return_value={"run": "r2"}) as handler,
+                      mock.patch.dict(os.environ, {"ARETE_IDEMPOTENCY_KEY": f"run-{action}"})):
+                    first = self.cli(command)
+                    self.assertEqual(first[0], 0, first)
+                    runs.note("r2", summary=action)
+                    self.assertGreater(runs.run_get("r2")["version"], version)
+                    self.assertEqual(self.cli(command)[:2], first[:2])
+                    handler.assert_called_once_with(*args, version)
+
+        reads, writes = [], []
+
+        def respond(request):
+            if request.path == "/api/meta":
+                return 200, {"instance": {"id": "ask-replay"}}, {}
+            if request.command == "GET":
+                reads.append(request.path)
+                asks = [{"id": "ask1", "run": "r1"}] if not writes else []
+                return 200, {"asks": asks}, {}
+            writes.append((request.path, request.headers["Idempotency-Key"]))
+            return 200, {"answered": True}, {}
+
+        with self.stub(respond), mock.patch.dict(os.environ, {"ARETE_IDEMPOTENCY_KEY": "ask-replay"}):
+            command = 'answer r1 --json {"answers":[{"text":"yes"}]}'
+            first = self.cli(command)
+            self.assertEqual(first[0], 0, first)
+            self.assertEqual(self.cli(command)[:2], first[:2])
+        self.assertEqual(reads, ["/api/asks"])
+        self.assertEqual(writes, [("/api/asks/ask1/answer", "ask-replay:1")] * 2)
+
+    def test_interrupted_launch_does_not_repeat(self):
+        self.in_subprocess("check_interrupted_launch_does_not_repeat")
+
+    def check_interrupted_launch_does_not_repeat(self):
+        from arete import record, sessions
+        from arete.store import runs
+
+        def launched(*args, **kwargs):
+            record.start("session", pid=None)
+            raise RuntimeError("interrupted after launch")
+
+        with (self.serve_at([]), mock.patch.object(sessions, "launch", side_effect=launched) as launch,
+              mock.patch.dict(os.environ, {"ARETE_IDEMPOTENCY_KEY": "session-start"})):
+            self.problem("session start work", 500)
+            reply = self.problem("session start work", 409)
+            self.assertIn("earlier request", reply["error"])
+            launch.assert_called_once()
+            self.assertEqual(len(runs.runs(kind="session")), 1)
+
+    def test_deferred_session_attach_can_send_input(self):
+        self.in_subprocess("check_deferred_session_attach_can_send_input")
+
+    def check_deferred_session_attach_can_send_input(self):
+        from arete import client, sessions
+        from arete.commands import sessions as commands
+
+        def follow(run, *, send, remote):
+            self.assertFalse(remote)
+            send()
+
+        launched = {"id": "r1", "runner": "pi", "model": "sample", "device": "local", "cwd": str(Path.cwd()),
+                    "branch": "", "tools": [], "task": True}
+        with (mock.patch.object(client, "server", side_effect=AssertionError("contacted serve")),
+              mock.patch.object(sessions, "launch", return_value=launched) as launch,
+              mock.patch.object(sessions, "send") as send, mock.patch.object(commands, "follow", side_effect=follow),
+              mock.patch("select.select", return_value=([True], [], []))):
+            for options in ("", "--draft-pr --repo replay-sample"):
+                code, lines, err = self.cli(f"session start --task --attach {options} work", "hello\n")
+                self.assertEqual(code, 0, (lines, err))
+                self.assertTrue(launch.call_args.kwargs["task"])
+                self.assertEqual(launch.call_args.kwargs["draft_pr"], bool(options))
+                send.assert_called_once_with("r1", "hello\n")
+                send.reset_mock()
+
+    def test_session_attach_uses_serve_for_feed_and_input(self):
+        self.in_subprocess("check_session_attach_uses_serve_for_feed_and_input")
+
+    def check_session_attach_uses_serve_for_feed_and_input(self):
+        from arete import record, sessions
+        from arete.store import runs
+
+        send = sessions.send
+
+        def finish_after_message(session, text):
+            queued = send(session, text)
+            record.settle(session, "done", end_line="done")
+            return queued
+
+        seen = []
+        with (self.serve_at(seen), mock.patch.object(sessions, "send", side_effect=finish_after_message) as steer,
+              mock.patch("select.select", return_value=([True], [], []))):
+            record.start("session", run_id="r1", pid=None)
+            runs.add_feed("r1", "session", "ready for input")
+            code, lines, error = self.cli("session attach r1", "hello\n")
+            self.assertEqual(code, 0, (lines, error))
+            self.assertTrue(any("ready for input" in line for line in lines), lines)
+            steer.assert_called_once_with("r1", "hello\n")
+            self.assertEqual(runs.run_get("r1")["status"], "done")
+        routes = [(method, path) for method, path, status, _ in seen if status == 200]
+        self.assertIn(("GET", "/api/feed/r1?after=0"), routes)
+        self.assertIn(("GET", "/api/runs/r1"), routes)
+        self.assertIn(("POST", "/api/v1/runs/r1/steer"), routes)
+
     def check_pin_commands(self):
         from arete import paths
 
@@ -482,6 +610,10 @@ class CliThroughServeTests(unittest.TestCase):
                 writes.clear()
                 self.problem("session send r1 message", result[1])
                 self.assertEqual(writes, [("/api/v1/runs/r1/steer", "fallback-test:1")])
+            result = (404, "unknown_route")
+            writes.clear()
+            self.problem("task list", "unknown_route")
+            self.assertEqual(writes, [("/api/v1/tasks", None)])
 
     def test_hook_batches_replay_from_the_saved_offset(self):
         self.in_subprocess("check_hook_batches_replay_from_the_saved_offset")
@@ -489,33 +621,93 @@ class CliThroughServeTests(unittest.TestCase):
     def check_hook_batches_replay_from_the_saved_offset(self):
         from arete import paths, tool_events
 
-        remote = Path("receiver/events.jsonl")
-        remote.parent.mkdir()
-        url = "http://receiver.example.test:8080"
-        rows = [{"index": index, "detail": "🍊" * 400} for index in range(20)]
-        tool_events.append_events(rows)
+        host = "receiver.example.test"
+        root = Path.cwd() / "sender"
+        root.mkdir()
+        env = api_check.isolated_env(root)
+        local = root / "state/events.jsonl"
+        corrupt_db = local.with_name("arete.db")
+        corrupt_db.write_bytes(b"corrupt local database")
+        rows = [{"ts": "2020-01-01T00:00:00Z", "index": index, "detail": "🍊" * 400} for index in range(20)]
+        local.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows))
+        other = {"ts": rows[0]["ts"], "detail": "already archived"}
+        archive = paths.EVENTS_FILE.with_name("events-202001.jsonl")
+        archive.write_text(json.dumps(other) + "\n")
+        seen = []
         sent = []
+        interrupted = []
+        lost = []
+        finish = tool_events.finish_ingest
+        respond = dashboard.Handler.send_json
 
-        def send(body, key):
-            self.assertLessEqual(len(api_http.json_bytes(body)), api_http.MAX_JSON_BYTES)
-            sent.append((key, body))
-            with mock.patch.object(paths, "EVENTS_FILE", remote):
-                tool_events.ingest(body["origin"], body["offset"], body["events"])
-            if len(sent) == 1:
-                raise ConnectionError("response lost")
+        def partial_append():
+            _, checkpoint = tool_events.ingest_checkpoint()
+            if not interrupted and (pending := checkpoint.get("pending")):
+                data = pending["data"].encode()
+                paths.EVENTS_FILE.write_bytes(data[:data.index(b"\n") + 11])
+                interrupted.append(True)
+                raise OSError("interrupted during append")
+            return finish()
 
-        with self.assertRaises(ConnectionError):
-            tool_events.send_pending(url, send)
-        added = {"index": len(rows)}
-        tool_events.append_events([added])
-        tool_events.send_pending(url, send)
-        self.assertEqual(sent[0], sent[1])
-        self.assertGreater(len(sent), 2)
-        tool_events.send_pending(url, lambda *_: self.fail("sent a batch after its offset was acknowledged"))
-        self.assertEqual(tool_events.read_event_file(remote, None), [*rows, added])
-        tool_events.send_pending("http://local-alias.example.test:8080",
-                                 lambda body, _: tool_events.ingest(body["origin"], body["offset"], body["events"]))
-        self.assertEqual(tool_events.read_events(), [*rows, added])
+        def respond_or_disconnect(handler, code, data, *args, **kwargs):
+            if handler.command == "POST" and handler.path == "/api/v1/hook-events":
+                sent.append((handler.headers["Idempotency-Key"], handler.body()))
+                if code == 200 and not lost:
+                    lost.append(True)
+                    handler.connection.shutdown(SHUT_WR)
+                    return
+            return respond(handler, code, data, *args, **kwargs)
+
+        def cli_child(command, payload=None):
+            entry = ("import socket; from unittest.mock import patch; from arete.cli import main; "
+                     "resolve = socket.getaddrinfo; "
+                     "local = lambda host, *a, **kw: resolve('127.0.0.1', *a, **kw) "
+                     "if host == 'receiver.example.test' else resolve(host, *a, **kw); "
+                     "blocked = AssertionError('unexpected external call'); "
+                     "patch('socket.getaddrinfo', local).start(); "
+                     "patch('urllib.request.urlopen', side_effect=blocked).start(); "
+                     "patch('arete.gh.gh', side_effect=blocked).start(); sys.exit(main())")
+            args = api_check.child_command(versioned_api_fixture.SOURCE, entry, *command.split())
+            return subprocess.run(args, cwd=root, env=env, input=payload, capture_output=True, text=True, timeout=5)
+
+        with self.serve_at(seen, names=(host,)) as server:
+            url = f"http://{host}:{server.server_port}"
+            (root / "config/config.toml").write_text(f'[server]\nurl = "{url}"\n')
+            with mock.patch.object(tool_events, "finish_ingest", side_effect=partial_append), \
+                    mock.patch.object(dashboard.Handler, "send_json", respond_or_disconnect):
+                first = cli_child("events --raw --hours 1000000")
+                self.assertEqual(first.returncode, 1, first)
+                self.assertEqual(json.loads(first.stdout)["code"], "internal_error")
+                self.assertEqual(interrupted, [True])
+                tool_events.rotate_events(365)
+                self.assertTrue(archive.with_name("events-202001-0001.jsonl").is_file())
+                payload = json.dumps({"hook_event_name": "PostToolUse", "tool_name": "Skill",
+                                      "tool_input": {"skill": "after-restart"}})
+                hooked = cli_child("hook", payload)
+                self.assertEqual(hooked.returncode, 0, hooked)
+                self.assertEqual(len(sent), 1)
+                added = json.loads(local.read_text().splitlines()[-1])
+                self.assertEqual(added["detail"], "after-restart")
+                dropped = cli_child("events --raw --hours 1000000")
+                self.assertEqual(dropped.returncode, 1, dropped)
+                self.assertEqual(lost, [True])
+                replay = cli_child("events --raw --hours 1000000")
+                self.assertEqual(replay.returncode, 0, replay)
+                expected = [other, *rows, added]
+                self.assertEqual([json.loads(line) for line in replay.stdout.splitlines()], expected)
+                self.assertEqual(sent[0], sent[1])
+                self.assertEqual(sent[1], sent[2])
+                self.assertGreater(len(sent), 3)
+                count = len(sent)
+                created = cli_child("task add --repo replay-sample remote")
+                self.assertEqual(created.returncode, 0, created)
+                status = cli_child("status")
+                self.assertEqual(status.returncode, 0, status)
+                self.assertIn(f"serve at {url}", status.stdout)
+                self.assertEqual(len(sent), count)
+        raw = [json.loads(line) for path in tool_events.event_files() for line in path.read_text().splitlines()]
+        self.assertEqual(raw, expected)
+        self.assertEqual(corrupt_db.read_bytes(), b"corrupt local database")
 
 
 class ApiCheckTests(unittest.TestCase):

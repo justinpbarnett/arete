@@ -87,11 +87,11 @@ def print_recent(runs: list[dict]) -> None:
 def print_records(s: dict, limits) -> None:
     from .. import record, util
 
-    kept = f"kept {limits.days:g} days, up to {limits.max_gb:g} GB"
+    kept = f" (kept {limits.days:g} days, up to {limits.max_gb:g} GB)" if limits else ""
     if not s["oldest"]:
-        print(f"records: none ({kept}), {s['pins']} pinned")
+        print(f"records: none{kept}, {s['pins']} pinned")
         return
-    print(f"records: {record.size_text(s['bytes'])} in {util.count(s['records'], 'record')} ({kept}), "
+    print(f"records: {record.size_text(s['bytes'])} in {util.count(s['records'], 'record')}{kept}, "
           f"oldest {s['oldest']['run_id']} written {when(s['oldest']['written'])}, {s['pins']} pinned")
 
 

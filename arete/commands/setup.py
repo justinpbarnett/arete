@@ -106,7 +106,7 @@ def cmd_status(args) -> int:
     else:
         answer = client.call("GET", f"/api/v1/status?limit={args.limit}")
         views, snap, records = (client.field(answer, key) for key in ("loops", "snapshot", "records"))
-    print(f"arete {__version__}  config {paths.CONFIG_FILE}" + ("  source: local" if args.offline else ""))
+    print(f"arete {__version__}  local config {paths.CONFIG_FILE}" + ("  source: local" if args.offline else ""))
     if problem:
         print(f"config does not load: {problem}")
     if cfg.ignored:
@@ -115,6 +115,11 @@ def cmd_status(args) -> int:
     print("models:" + "".join(f"\n  {role:<15} {cfg.model(role) or 'claude CLI'}" for role in config.MODEL_ROLES))
     if cfg.unused_model_keys():
         print(f"  [models] keys arete never reads: {', '.join(cfg.unused_model_keys())}")
+    pipeline_repos = [f"{r.name} ({r.tracker})" for r in cfg.repos if r.pipeline]
+    print(f"pipeline repos: {', '.join(pipeline_repos) or 'none'}")
+    print_delivery(cfg)
+    if not args.offline:
+        print(f"serve at {client.address(client.server())}")
     show(snap["checks"], "the heartbeat", print_checks)
     show(snap["serve"], "the serve beat", lambda beat: print(serve_line(beat)))
     marks = {m["name"]: m for m in snap["checks"].get("rows", {}).get("loops", [])}
@@ -124,13 +129,10 @@ def cmd_status(args) -> int:
     show(snap["alerts"], "the alerts", print_alerts)
     show(snap["recent"], "the recent runs", print_recent)
     show(snap["proposals"], "the miner proposals", print_proposals)
-    show(records, "the record store", lambda s: print_records(s, cfg.retention))
+    show(records, "the record store", lambda s: print_records(s, cfg.retention if args.offline else None))
     show(snap["skipped"], "the skipped tickets", print_skipped)
     show(snap["waiting"], "the review feedback", print_waiting)
     show(snap["triage"], "triage", print_triage)
-    pipeline_repos = [f"{r.name} ({r.tracker})" for r in cfg.repos if r.pipeline]
-    print(f"pipeline repos: {', '.join(pipeline_repos) or 'none'}")
-    print_delivery(cfg)
     show(snap["live"], "the live runs", print_live)
     return 0
 

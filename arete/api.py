@@ -195,7 +195,8 @@ def dispatch(handler, op, path_values, query):
         if write:
             prepare(name, values)
             return handler.keyed_action(method, op["path"], path_values, lambda: mutation(name, values, handler),
-                                        atomic=name not in ("run.stop", "serve.install", "hook.ingest"))
+                                        atomic=name not in ("run.stop", "serve.install", "hook.ingest"),
+                                        recoverable=name == "hook.ingest")
         return execute(name, values, handler)
     except refusals.Refusal as error:
         if not getattr(error, "code", None) and error.status in (400, 404):

@@ -728,7 +728,7 @@ Run folders, including logs, evidence and continuation files, go after `lines_da
 `arete record pin RUN_ID` keeps a record; `arete record unpin RUN_ID` lets it age out like any other.
 `arete status` shows a `records:` line with the size of the store, its oldest record and the number of pins.
 Protected records and bytes outside `record/` can keep `runs/` over budget; the serve log reports this. `lines_days` must be at least `days`; both allow positive fractions.
-Hook events rotate monthly from `events.jsonl` into `events-YYYYMM.jsonl`, named for the first event's UTC month. Readers include these archives; dated files last written more than `lines_days` ago are removed.
+Hook events rotate monthly from `events.jsonl` into `events-YYYYMM.jsonl`, named for the first event's UTC month. If a delayed upload causes another rotation for the same month, the new archive gets a numbered suffix. Readers include these archives, and dated files last written more than `lines_days` ago are removed.
 
 ## Backups
 
@@ -2636,7 +2636,7 @@ Dry-run displays a quota hold without reserving.
 Keyed task starts hash the canonical request and replay the exact committed response for the same principal and key.
 A live duplicate is rejected while its request is in flight; keys are separate for each principal.
 Idempotency records expire strictly after 30 days through serve pruning.
-The CLI uses a fresh idempotency key prefix per invocation and appends `:1`, `:2` and so on to its writes. Set `ARETE_IDEMPOTENCY_KEY` to reuse the prefix when retrying an invocation. Task starts print the key on stderr and accept an exact key via `--key`.
+The CLI uses a fresh idempotency key prefix per invocation and appends `:1`, `:2` and so on to its writes. Set `ARETE_IDEMPOTENCY_KEY` to reuse the prefix when retrying an invocation. Retries from the same CLI config directory reuse any run version, loop run or open ask the CLI selected for the first attempt. Task starts print the key on stderr and accept an exact key via `--key`.
 Task starts share a 30-second deadline across connection, headers, response bodies and waits, with at most two resends after an uncertain result and the same key throughout.
 
 Successful run writes retain their legacy response bodies and identify the committed event in `Arete-Seq`.

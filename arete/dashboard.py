@@ -450,30 +450,39 @@ class Handler(BaseHTTPRequestHandler):
             self.write_receipt = claims.receipt(row["last_seq"])
             return json.loads(row["response"])
 
-    def keyed_action(self, method, route, parameters, action, *, atomic=False):
+    def keyed_action(self, method, route, parameters, action, *, atomic=False, recoverable=False):
         key = self.headers.get("Idempotency-Key")
         if key is None:
             return action()
-        body = self.body()
-        if self.headers.get("X-Arete-Auto-Version") == "1" and (
-            route == "/api/v1/runs/{run}/stop" or
-            route == "/api/runs/*" and parameters["path"].endswith("/stop")
-        ):
-            body = {k: v for k, v in body.items() if k != "base_version"}
-        sha = idempotency.fingerprint(method, route, parameters, body)
+        sha = idempotency.fingerprint(method, route, parameters, self.body())
         with idempotency.owning(principals.current(), key, sha, route) as context:
             row = idempotency.matching_claim(context)
             if row and row["status"]:
                 self.idempotent_replayed = True
+            elif row:
+                raise idempotency.Unconfirmed("The earlier request did not record a result. Check its effect before trying again.")
             else:
-                with foundation.tx() if atomic else nullcontext():
-                    result = action()
-                    receipt = self.write_receipt or event_store.committed_receipt()
-                    cursor = receipt["event_seq"] if receipt else result.get("seq") if atomic else None
-                    seq = int(cursor.rsplit(".", 1)[1]) if cursor else None
-                    row = claims.complete(context, 200, api_http.json_bytes(result), seq)
+                row = self.complete_action(context, action, atomic, recoverable)
             self.write_receipt = claims.receipt(row["last_seq"])
             return json.loads(row["response"])
+
+    def complete_action(self, context, action, atomic, recoverable):
+        guard = not (atomic or recoverable)
+        if guard:
+            claims.claim(context, None)
+        with (foundation.tx() if atomic else nullcontext()), event_store.collect_receipts() as collected:
+            try:
+                result = action()
+            except Exception as e:
+                status = refusal_status(e)
+                if guard and (isinstance(e, NoRoute) or status is not None and 400 <= status < 500):
+                    claims.abandon(context)
+                raise
+            receipt = self.write_receipt or event_store.committed_receipt()
+            seq = int(receipt["event_seq"].rsplit(".", 1)[1]) if receipt else None
+            if atomic and collected:
+                seq = collected[-1][0]
+            return claims.complete(context, 200, api_http.json_bytes(result), seq)
 
     def admit(self, method: str, path: str) -> None:
         node: tailnet.Node = self.server.node
@@ -507,7 +516,8 @@ class Handler(BaseHTTPRequestHandler):
             if rest is not None:
                 try:
                     if method == "POST" and route in CLI_ALIASES and not (route is post_chat and rest.endswith("/file")):
-                        return self.keyed_action(method, template, {"path": rest}, lambda: route(self, rest, query))
+                        return self.keyed_action(method, template, {"path": rest}, lambda: route(self, rest, query),
+                                                 atomic=atomic_alias(route, unquote(rest)))
                     return route(self, rest, query)
                 except NoRoute:
                     break
@@ -1140,6 +1150,12 @@ ROUTES = tuple((entry["method"], entry["path"], globals()[entry["provider"]]) fo
                if not entry.get("transport"))
 CLI_ALIASES = (post_ask, post_chat, post_incident_switch, post_incident, post_loop, post_proposal, post_run,
                post_serve_install, post_session, post_sessions)
+
+
+def atomic_alias(route, rest):
+    return ((route is post_chat and rest.endswith("/drop"))
+            or (route is post_session and rest.endswith("/send"))
+            or (route is post_proposal and rest.endswith(("/done", "/reject"))))
 
 
 def serve(port: int | None = None, inside_serve: bool = False, host: tailnet.Tailscale | None = None) -> NoReturn:

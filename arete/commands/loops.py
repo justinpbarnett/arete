@@ -143,16 +143,18 @@ def loop_start(args) -> int:
 
 @loop_errors
 def loop_stop(args) -> int:
-    target = args.name
-    try:
-        loop = client.call("GET", f"/api/loops/{quote(target, safe='')}")
-    except client.Failed as e:
-        if e.code != 404:
-            raise
-    else:
+    def running():
+        try:
+            loop = client.call("GET", f"/api/loops/{quote(args.name, safe='')}")
+        except client.Failed as e:
+            if e.code != 404:
+                raise
+            return args.name
         if not (target := client.field(loop, "running")):
             raise client.Failed({"error": f"{args.name} has no run going"})
-    return client.run_command(target, "stop")
+        return target
+
+    return client.run_command(args.name, "stop", resolve=running)
 
 
 @loop_errors

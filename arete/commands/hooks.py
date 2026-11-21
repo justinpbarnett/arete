@@ -32,10 +32,10 @@ def cmd_heartbeat(args) -> int:
     return heartbeat.run(dry_run=args.dry_run, force_probes=args.force_probes, quiet=args.quiet)
 
 
-def oncall_scan(args, cfg) -> int:
+def oncall_scan(args) -> int:
     from .. import oncall
 
-    summary = oncall.scan(cfg)
+    summary = oncall.scan(config.load())
     if summary is None:
         print(f"on-call is off; set [oncall] enabled = true in {paths.CONFIG_FILE}")
     elif "skipped" in summary:
@@ -45,13 +45,13 @@ def oncall_scan(args, cfg) -> int:
     return 0
 
 
-def oncall_toggle(args, cfg) -> int:
+def oncall_toggle(args) -> int:
     client.call("POST", "/api/incidents/switch", {"on": args.action == "on"})
     print(f"on-call wakes and rechecks are {args.action}")
     return 0
 
 
-def oncall_incident_action(args, cfg) -> int:
+def oncall_incident_action(args) -> int:
     if not args.id.isdigit():
         print(f"no incident {args.id}" if args.id else f"{args.action} needs an incident number", file=sys.stderr)
         return 1
@@ -67,7 +67,7 @@ def oncall_incident_action(args, cfg) -> int:
     return 0
 
 
-def oncall_show(args, cfg) -> int:
+def oncall_show(args) -> int:
     from .. import oncall
 
     found = (incident_store.incident(int(args.id), connect=foundation.reader)
@@ -83,6 +83,7 @@ def oncall_show(args, cfg) -> int:
     print(f"decision: {oncall.decision_line(found)}")
     if line := oncall.repair_line(found):
         print(f"repair: {line}")
+    cfg = config.load()
     for n, r in enumerate(found["repairs"], 1):
         print(f"  attempt {n} of {cfg.oncall.max_attempts}: task {r['task'] or '-'}, run {oncall.last_run_id(r)}, "
               f"{r['started']}, {r['outcome'] or ('running' if r['task'] else 'starting')}")
@@ -94,7 +95,7 @@ def oncall_show(args, cfg) -> int:
     return 0
 
 
-def oncall_list(args, cfg) -> int:
+def oncall_list(args) -> int:
     from .. import oncall
 
     rows = incident_store.incidents(connect=foundation.reader) if paths.DB_FILE.exists() else []
@@ -108,6 +109,7 @@ def oncall_list(args, cfg) -> int:
         print(f"      {oncall.decision_line(r)}")
         if line := oncall.repair_line(r):
             print(f"      repair: {line}")
+    cfg = config.load()
     now = (oncall.status(cfg, connect=foundation.reader) if paths.DB_FILE.exists()
            else {"enabled": cfg.oncall.enabled, "last_scan": "", "expected": 0, "wakes": "on"})
     if not now["enabled"]:
@@ -128,8 +130,7 @@ ONCALL_ACTIONS = {"scan": oncall_scan, "off": oncall_toggle, "on": oncall_toggle
 
 
 def cmd_oncall(args) -> int:
-    cfg = config.load()
-    return ONCALL_ACTIONS[args.action](args, cfg)
+    return ONCALL_ACTIONS[args.action](args)
 
 
 def cmd_hook(args) -> int:

@@ -73,7 +73,8 @@ class Server:
 
 class Invocation:
     def __init__(self):
-        self.prefix = os.environ.get("ARETE_IDEMPOTENCY_KEY") or secrets.token_hex(16)
+        self.retry_prefix = os.environ.get("ARETE_IDEMPOTENCY_KEY")
+        self.prefix = self.retry_prefix or secrets.token_hex(16)
         self.writes = 0
         self.server = None
 
@@ -96,6 +97,30 @@ def invocation():
 
 def write_key():
     return (_invocation.get() or Invocation()).key()
+
+
+def resolved_write(key, inputs, resolve):
+    current = _invocation.get()
+    if current is None or not current.retry_prefix:
+        return resolve()
+    where = server()
+    identity = json.dumps([address(where), where.instance, key]).encode()
+    fingerprint = hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
+    folder = paths.CONFIG_DIR / "write-retries"
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / hashlib.sha256(identity).hexdigest()
+    with path.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if path.exists():
+            saved = util.read_json(path, None)
+            if not isinstance(saved, dict) or "resolved" not in saved:
+                raise Failed({"error": "the saved request could not be read"})
+            if saved.get("fingerprint") != fingerprint:
+                raise Failed({"error": "This key was used with different content", "reason": "idempotency_key_reused"}, 422)
+            return saved["resolved"]
+        result = resolve()
+        util.write_json(path, {"fingerprint": fingerprint, "resolved": result})
+        return result
 
 
 def named_server(wanted: str, setting=ENV) -> Server:
@@ -165,12 +190,12 @@ def check_replay(where, deadline):
             raise changed_instance(where, where.instance, instance)
 
 
-def server() -> Server:
+def server(deadline=None) -> Server:
     current = _invocation.get()
     if current is not None and current.server is not None:
         return current.server
     where = discover()
-    resp = request("GET", "/api/meta", read_seconds=CONNECT_SECONDS, where=where, buffered=True)
+    resp = request("GET", "/api/meta", read_seconds=CONNECT_SECONDS, where=where, buffered=True, deadline=deadline)
     instance = instance_of(resp)
     check_instance(where, instance)
     where = replace(resp.arete_server, instance=instance)
@@ -180,11 +205,18 @@ def server() -> Server:
             from . import tool_events
 
             try:
-                tool_events.send_pending(address(where), lambda body, key: call("POST", "/api/v1/hook-events", body, key))
+                tool_events.send_pending(address(where), lambda body, key: send_hook_batch(body, key, deadline))
             except Failed as e:
                 if e.code != 404 or not unknown_route(e.answer):
                     raise
     return where
+
+
+def send_hook_batch(body, key, deadline):
+    answer = call("POST", "/api/v1/hook-events", body, key, deadline=deadline)
+    received = field(answer, "received")
+    if type(received) is not int or received != len(body["events"]):
+        raise Failed({"error": "the server did not acknowledge the full hook event batch"})
 
 
 def remote(where):
@@ -296,21 +328,23 @@ def acquired_connection(where, deadline):
 def request(method: str, path: str, body: dict | None = None,
             read_seconds: float | None = CALL_SECONDS, key: str | None = None,
             *, where: Server | None = None, buffered: bool = False,
-            auto_version: bool = False) -> http.client.HTTPResponse:
-    where = where or server()
-    deadline = None
+            deadline: float | None = None, legacy: str = "", legacy_body: dict | None = None) -> http.client.HTTPResponse:
+    where = where or server(deadline)
     restart = None
     while True:
         within = None if deadline is None else deadline - time.monotonic()
         if within is not None and within <= 0:
-            raise Failed(restart.answer, 503)
+            raise Failed(restart.answer, 503) if restart else Broken({"error": "request retry budget expired"})
         try:
-            if deadline is not None and method != "GET":
+            if restart is not None and method != "GET":
                 check_replay(where, deadline)
                 within = budget_left(deadline)
             return request_once(method, path, body, read_seconds, within, key=key, deadline=deadline, where=where,
-                                buffered=buffered, auto_version=auto_version)
+                                buffered=buffered)
         except Restarting as e:
+            if restart is None:
+                limit = time.monotonic() + RESTART_WAIT_SECONDS
+                deadline = limit if deadline is None else min(deadline, limit)
             restart, pause = e, e.seconds
         except Down:
             if restart is None:
@@ -320,8 +354,13 @@ def request(method: str, path: str, body: dict | None = None,
             if restart is None:
                 raise
             pause = RETRY_SECONDS
-        if deadline is None:
-            deadline = time.monotonic() + RESTART_WAIT_SECONDS
+        except Failed as e:
+            if not legacy or e.code != 404 or not unknown_route(e.answer):
+                raise
+            path, legacy = legacy, ""
+            if legacy_body is not None:
+                body = legacy_body
+            continue
         left = deadline - time.monotonic()
         if left <= 0:
             raise Failed(restart.answer, 503)
@@ -331,8 +370,7 @@ def request(method: str, path: str, body: dict | None = None,
 def request_once(method: str, path: str, body: dict | None = None,
                  read_seconds: float | None = CALL_SECONDS, within: float | None = None,
                  key: str | None = None, *, deadline: float | None = None,
-                 where: Server | None = None, buffered: bool = False,
-                 auto_version: bool = False) -> http.client.HTTPResponse:
+                 where: Server | None = None, buffered: bool = False) -> http.client.HTTPResponse:
     if deadline is None and within is not None:
         deadline = time.monotonic() + within
     where = where or server()
@@ -353,8 +391,6 @@ def request_once(method: str, path: str, body: dict | None = None,
                     headers = headers_for(where)
                     if key is not None:
                         headers["Idempotency-Key"] = key
-                    if auto_version:
-                        headers["X-Arete-Auto-Version"] = "1"
                     if payload is not None:
                         headers["Content-Type"] = "application/json"
                     if deadline is not None:
@@ -365,6 +401,7 @@ def request_once(method: str, path: str, body: dict | None = None,
                     resp = conn.getresponse()
                     resp.arete_transport = transport
                     resp.arete_server = where
+                    resp.arete_path = path
                 if not followed and (moved := util.https_upgrade(resp, where.port)):
                     read_response(resp, deadline)
                     where, followed = replace(where, scheme="https", name=moved.hostname), True
@@ -480,19 +517,14 @@ def read_response(resp, deadline):
 
 
 def call(method: str, path: str, body: dict | None = None, key: str | None = None,
-         *, legacy: str = "", legacy_body: dict | None = None, auto_version: bool = False) -> dict:
+         *, legacy: str = "", legacy_body: dict | None = None, deadline: float | None = None) -> dict:
     if method != "GET" and key is None:
         key = write_key()
     if key is not None and method == "POST" and path == "/api/tasks":
-        return keyed_call(body, key)
-    try:
-        return decoded(request(method, path, body, key=key, buffered=True, auto_version=auto_version), method, path)
-    except Failed as e:
-        if not legacy or e.code != 404 or not unknown_route(e.answer):
-            raise
-    response = request(method, legacy, body if legacy_body is None else legacy_body, key=key,
-                       buffered=True, auto_version=auto_version)
-    return decoded(response, method, legacy)
+        return keyed_call(body, key, deadline=deadline)
+    response = request(method, path, body, key=key, buffered=True, deadline=deadline,
+                       legacy=legacy, legacy_body=legacy_body)
+    return decoded(response, method, getattr(response, "arete_path", path))
 
 
 def decoded(resp, method, path):
@@ -515,9 +547,9 @@ def answer_object(raw, method, path):
     return value
 
 
-def keyed_call(body, key, *, where=None):
-    where = where or server()
-    deadline = time.monotonic() + 30
+def keyed_call(body, key, *, deadline=None):
+    deadline = deadline if deadline is not None else time.monotonic() + RESTART_WAIT_SECONDS
+    where = server(deadline)
     retries, restart, failure = 0, None, None
     uncertain = False
     replaying = False
@@ -534,7 +566,8 @@ def keyed_call(body, key, *, where=None):
             if replaying:
                 check_replay(where, deadline)
             replaying = True
-            resp = request_once("POST", "/api/tasks", body, within=left, key=key, deadline=deadline, where=where)
+            resp = request_once("POST", "/api/tasks", body, within=budget_left(deadline), key=key, deadline=deadline,
+                                where=where)
             answer = answer_object(read_response(resp, deadline), "POST", "/api/tasks")
             budget_left(deadline)
             return answer
@@ -562,10 +595,10 @@ def keyed_call(body, key, *, where=None):
 
 
 def start_task(body, key=None):
-    where = server()
+    deadline = time.monotonic() + RESTART_WAIT_SECONDS
     chosen = key if key is not None else write_key()
     print(f"Idempotency-Key: {chosen}", file=sys.stderr, flush=True)
-    return keyed_call(body, chosen, where=where)
+    return keyed_call(body, chosen, deadline=deadline)
 
 
 def stream(path: str, query: dict) -> Iterator[dict]:
@@ -591,17 +624,22 @@ def run_path(run_id: str, action: str, *, prefix="/api") -> str:
     return f"{prefix}/runs/{quote(run_id, safe='')}/{action}"
 
 
-def run_command(run_id: str, action: str, body: dict | None = None, *, legacy: str = "") -> int:
+def run_command(run_id: str, action: str, body: dict | None = None, *, legacy: str = "", resolve=None) -> int:
     def selected():
-        run = run_info(run_id)
-        data = {**(body or {}), "base_version": field(run, "version", "run.version")}
-        path = run_path(run_id, action)
+        def target():
+            identity = resolve() if resolve else run_id
+            return identity, field(run_info(identity), "version", "run.version")
+
+        key = write_key()
+        identity, version = resolved_write(key, [run_id, action, body, legacy, bool(resolve)], target)
+        data = {**(body or {}), "base_version": version}
+        path = run_path(identity, action)
         if action == "stop":
-            answer = call("POST", run_path(run_id, "stop", prefix="/api/v1"), data,
-                          legacy=legacy or path, legacy_body={} if legacy else None, auto_version=True)
+            answer = call("POST", run_path(identity, "stop", prefix="/api/v1"), data, key,
+                          legacy=legacy or path, legacy_body={} if legacy else None)
             emit({k: v for k, v in answer.items() if k != "seq"})
         else:
-            emit(call("POST", path, data))
+            emit(call("POST", path, data, key))
         return 0
 
     return steered(selected)
@@ -739,7 +777,7 @@ def prompted(i: int, q: dict) -> dict:
     return {"text": line} if line else {"declined": True}
 
 
-def answered_ask(run_id: str, ask_id: str, raw: str) -> dict:
+def open_ask(run_id: str, ask_id: str) -> dict:
     asks = field(call("GET", "/api/asks"), "asks")
     if not isinstance(asks, list):
         raise Failed({"error": "server answer has an invalid field asks"})
@@ -747,6 +785,12 @@ def answered_ask(run_id: str, ask_id: str, raw: str) -> dict:
                  if a["run"] == run_id and (not ask_id or a["id"] == ask_id)]
     if not open_asks:
         raise Failed({"error": f"run {run_id} has no open ask"})
+    return open_asks[0]
+
+
+def answered_ask(run_id: str, ask_id: str, raw: str) -> dict:
+    key = write_key()
+    body = None
     if raw:
         try:
             body = json.loads(raw)
@@ -758,9 +802,15 @@ def answered_ask(run_id: str, ask_id: str, raw: str) -> dict:
         if isinstance(given, list) and any(isinstance(a, dict) and "secret" in a for a in given):
             raise Failed({"error": "a secret value is never given as an argument; run `arete answer "
                                    f"{run_id}` and type or pipe it"})
-    else:
-        body = {"answers": [prompted(i, q) for i, q in enumerate(open_asks[0]["questions"], 1)]}
-    return call("POST", f"/api/asks/{quote(open_asks[0]['id'], safe='')}/answer", body)
+
+    def target():
+        found = open_ask(run_id, ask_id)
+        return found["id"], found["questions"] if body is None else []
+
+    identity, questions = resolved_write(key, ["answer ask", run_id, ask_id, body], target)
+    if body is None:
+        body = {"answers": [prompted(i, q) for i, q in enumerate(questions, 1)]}
+    return call("POST", f"/api/asks/{quote(identity, safe='')}/answer", body, key)
 
 
 def answer(run_id: str, text: str, raw: str, ask_id: str) -> int:

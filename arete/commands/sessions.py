@@ -61,13 +61,19 @@ def local_only(handler):
     return routed
 
 
-def attached(session_id: str) -> int:
+def attached(session_id: str, *, remote=True) -> int:
     import select
     import threading
 
-    r = client.run_info(session_id)
-    if client.field(r, "kind", "run.kind") != "session":
-        raise client.Failed({"error": f"no session {session_id}"})
+    if remote:
+        r = client.run_info(session_id)
+        if client.field(r, "kind", "run.kind") != "session":
+            raise client.Failed({"error": f"no session {session_id}"})
+        steer = client.steer
+    else:
+        from .. import sessions
+
+        steer = sessions.send
     stop = threading.Event()
     print("following; type a line and press enter to send it, ctrl-c to detach", flush=True)
 
@@ -80,9 +86,9 @@ def attached(session_id: str) -> int:
             if not line:
                 stop.set()
             elif line.strip():
-                client.steer(session_id, line)
+                steer(session_id, line)
     try:
-        follow(session_id, send=send_typed, remote=True)
+        follow(session_id, send=send_typed, remote=remote)
     except KeyboardInterrupt:
         print(f"\ndetached; the session keeps running. `arete session stop {session_id}` ends it")
     return 0
@@ -110,7 +116,7 @@ def session_start(args) -> int:
     if not args.attach:
         print(f"`arete session attach {s['id']}` follows it and sends what you type")
         return 0
-    return attached(s["id"]) if not (args.task or args.draft_pr) else follow(s["id"])
+    return attached(s["id"], remote=not (args.task or args.draft_pr))
 
 
 @local_only
