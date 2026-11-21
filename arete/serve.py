@@ -150,7 +150,7 @@ def next_due(loop: Loop, after: datetime) -> str:
 
 def code_stamp() -> frozenset:
     stamp = set()
-    for p in [*paths.PACKAGE_DIR.rglob("*.py"), *dashboard.web_files()]:
+    for p in [*paths.PACKAGE_DIR.rglob("*.py"), *paths.ADWS_DIR.glob("*.py"), *dashboard.web_files()]:
         try:
             st = p.stat()
         except FileNotFoundError:
@@ -279,7 +279,11 @@ class Server:
         self.alert_open = False
         self.alert_checked = False
         self.alert_last: Future | None = None
-        self.code = self.code_seen = code_stamp()
+        self.code_seen = code_stamp()
+        self.code = self.code_seen
+        if codebase.RELEASE:
+            self.code = frozenset(entry for entry in self.code if entry[0] != "HEAD") | {
+                ("HEAD", codebase.RELEASE[:12])}
         self.code_note = ""
         self.migration_stamp = None
         self.migration_error = ""
@@ -963,6 +967,7 @@ class Server:
         except Exception:
             running = None
         util.write_json(control.BEAT_FILE, {
+            "release": codebase.RELEASE,
             "schema": foundation.LATEST,
             "db": db,
             "pid": os.getpid(), "engine": codebase.STAMP, "checkout_head": codebase.checkout_head(),

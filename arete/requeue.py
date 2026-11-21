@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from contextlib import nullcontext
 from datetime import timedelta
 
 from . import codebase, config, gh, oncall, paths, pilot, runlimits, runner, sandbox, scratch, tracker, util, workspace, zte
@@ -137,7 +138,8 @@ def reconsider(cfg: config.Config, source: tracker.GitHubTracker, layer: config.
     repo = source.repo
     if issue in oncall.parked(repo.name) or pilot.is_pilot_task(issue) or zte.reserved(issue):
         return None
-    with util.lock(run_store.run_lock("pipeline", repo.name, issue)) as free:
+    lock = run_store.run_lock("pipeline", repo.name, issue)
+    with (nullcontext(not util.lock_is_held(lock)) if dry_run else util.lock(lock)) as free:
         if (not free or tasks.pending_start(repo.name, issue) or run_store.issue_running(repo.name, issue)
                 or run_store.pending_label(repo.name, issue)):
             return None
