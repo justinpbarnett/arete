@@ -98,6 +98,35 @@ def evolution_exercise(root):
         command = api_check.child_command(clone, entrypoint, "api", "diff", *args)
         return run(clone, command, env)
 
+    def check_evidence(cases):
+        entrypoint = """import argparse
+import json
+from contextlib import redirect_stderr, redirect_stdout
+from functools import cache
+from io import StringIO
+from arete import contract_evolution
+from arete.commands import api
+
+# Evidence cases share immutable Git refs in this scratch checkout.
+contract_evolution.git = cache(contract_evolution.git)
+parser = argparse.ArgumentParser()
+api.register(parser.add_subparsers(required=True))
+results = []
+for arguments in json.loads(sys.argv[1]):
+    args = parser.parse_args(arguments)
+    out, err = StringIO(), StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        status = args.fn(args)
+    results.append((status, out.getvalue(), err.getvalue()))
+print(json.dumps(results))
+"""
+        commands = [["api", "diff", *args] for args, *_ in cases]
+        command = api_check.child_command(clone, entrypoint, json.dumps(commands))
+        done = run(clone, command, env)
+        api_check.require(done.returncode == 0, f"API evidence checks failed to run:\n{done.stdout}{done.stderr}")
+        for (args, *expected), (status, out, err) in zip(cases, json.loads(done.stdout), strict=True):
+            exhibit(subprocess.CompletedProcess(args, status, out, err), *expected)
+
     def candidate(text, *, bump=True):
         working = original.replace(f"MINOR = {contract.MINOR}\n", f"MINOR = {contract.MINOR + 1}\n", 1) if bump else original
         (clone / evolution.SOURCE).write_text(working + text)
@@ -129,36 +158,44 @@ def evolution_exercise(root):
     broken = exhibit(diff("original"), "removed result field", 1, "settings.get (GET /api/v1/settings): result.settings removed",
                      "route is not deprecated", "no valid Sunset", "missing seven-day usage", "missing explicit owner approval")
     digest = broken.split("working contract ", 1)[1].split(",", 1)[0]
-    usage_path, approval_path = root / "usage.json", root / "approval.json"
+    commits = {ref: git(clone, env, "rev-parse", ref) for ref in ("original", "future", "expired")}
+    evidence_count = 0
 
     def evidence(ref, *, count=0, batch_count=0, days=8, approved=True, routes=(ROUTE,)):
+        nonlocal evidence_count
+        evidence_count += 1
+        usage_path = root / f"usage-{evidence_count}.json"
+        approval_path = root / f"approval-{evidence_count}.json"
         now = datetime.now(UTC)
         usage = {"from": (now - timedelta(days=days)).isoformat(), "through": now.isoformat(), "requests": count}
         if batch_count is not None:
             usage["batch_requests"] = batch_count
         usage_path.write_text(json.dumps({ROUTE: usage}))
-        commit = git(clone, env, "rev-parse", ref)
         approval_path.write_text(json.dumps({"approved": approved, "routes": routes, "contract_sha": digest,
-                                             "base_commit": commit}))
+                                             "base_commit": commits[ref]}))
         return ("--usage", str(usage_path), "--owner-approval", str(approval_path))
 
-    exhibit(diff("original", *evidence("original")), "deprecation required", 1, "route is not deprecated")
-    exhibit(diff("future", *evidence("future")), "future Sunset", 1, "Sunset has not passed")
-    exhibit(diff("expired", *evidence("expired", count=1)), "recent direct route use", 1, "shows 1 direct request(s)")
-    exhibit(diff("expired", *evidence("expired", batch_count=1)), "recent batch route use", 1, "shows 1 batch request(s)")
-    exhibit(diff("expired", *evidence("expired", batch_count=None)), "missing batch usage evidence", 1, "batch_requests")
-    exhibit(diff("expired", *evidence("expired", days=1)), "incomplete usage window", 1, "does not cover the last seven days")
-    exhibit(diff("expired", *evidence("expired")[2:]), "missing usage evidence", 1, "missing seven-day usage evidence")
-    exhibit(diff("expired", *evidence("expired", approved=False)), "missing approval", 1, "missing explicit owner approval")
-    exhibit(diff("expired", *evidence("expired", routes=("GET /api/meta",))), "approval for another route", 1,
-            "missing explicit owner approval")
-    exhibit(diff("expired", *evidence("expired")), "all field removal gates satisfied", 0, "Approved: settings.get")
+    check_evidence((
+        (("original", *evidence("original")), "deprecation required", 1, "route is not deprecated"),
+        (("future", *evidence("future")), "future Sunset", 1, "Sunset has not passed"),
+        (("expired", *evidence("expired", count=1)), "recent direct route use", 1, "shows 1 direct request(s)"),
+        (("expired", *evidence("expired", batch_count=1)), "recent batch route use", 1, "shows 1 batch request(s)"),
+        (("expired", *evidence("expired", batch_count=None)), "missing batch usage evidence", 1, "batch_requests"),
+        (("expired", *evidence("expired", days=1)), "incomplete usage window", 1, "does not cover the last seven days"),
+        (("expired", *evidence("expired")[2:]), "missing usage evidence", 1, "missing seven-day usage evidence"),
+        (("expired", *evidence("expired", approved=False)), "missing approval", 1, "missing explicit owner approval"),
+        (("expired", *evidence("expired", routes=("GET /api/meta",))), "approval for another route", 1,
+         "missing explicit owner approval"),
+        (("expired", *evidence("expired")), "all field removal gates satisfied", 0, "Approved: settings.get"),
+    ))
     candidate(REMOVE_READ)
     broken = exhibit(diff("expired"), "removed read operation", 1, "settings.get (GET /api/v1/settings): route removed")
     digest = broken.split("working contract ", 1)[1].split(",", 1)[0]
-    exhibit(diff("expired", *evidence("expired", batch_count=1)), "removed read still called through batch", 1,
-            "shows 1 batch request(s)")
-    exhibit(diff("expired", *evidence("expired")), "all read removal gates satisfied", 0, "Approved: settings.get")
+    check_evidence((
+        (("expired", *evidence("expired", batch_count=1)), "removed read still called through batch", 1,
+         "shows 1 batch request(s)"),
+        (("expired", *evidence("expired")), "all read removal gates satisfied", 0, "Approved: settings.get"),
+    ))
 
 
 def evolution_temp():
