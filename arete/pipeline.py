@@ -461,6 +461,7 @@ class Run(AgentRun):
     tid: str
     force: bool = False
     feedback: list[dict] = field(default_factory=list)
+    closed_feedback_prs: tuple[str, ...] = field(default=(), init=False)
     answering: dict = field(default_factory=dict)
     path: str = ""
     alone: bool = False
@@ -550,7 +551,10 @@ class Run(AgentRun):
 
         options = {**kw, "fresh_prompt": fresh_prompt}
         if session.id and kw.get("persist", True):
-            parts = (owner_asks.answers_message(due), self.kept_note, self.base_note,
+            feedback = feedback_markdown(self.feedback) if due[0]["step"] == "revise" else ""
+            parts = (owner_asks.answers_message(due),
+                     f"Address the owner's PR feedback as well:\n\n{feedback}" if feedback else "",
+                     self.kept_note, self.base_note,
                      self.moved_folder_note(due[0]["run"]))
             message = "\n\n".join(part for part in parts if part)
             return message, {**options, "resume": session}
@@ -606,6 +610,12 @@ class Run(AgentRun):
     @property
     def feedback_prs(self) -> list[str]:
         return list(dict.fromkeys(f["pr_url"] for f in self.feedback))
+
+    def feedback_closure(self) -> str:
+        self.closed_feedback_prs = tuple(url for url in self.feedback_prs if gh.pr_view(url).get("state") != "OPEN")
+        if self.closed_feedback_prs:
+            return f"the PR closed before arete could revise it: {', '.join(self.closed_feedback_prs)}"
+        return ""
 
     @property
     def failed_state(self) -> str:
@@ -1038,7 +1048,9 @@ class Build(TicketWork):
         return self.staged
 
     def require_valid_diff(self, after: str, planned: str = "", *, from_base: bool | None = None) -> None:
-        staged = self.restage(from_base=from_base)
+        self.validate_diff(self.restage(from_base=from_base), after, planned, from_base=from_base)
+
+    def validate_diff(self, staged: Staged, after: str, planned: str = "", *, from_base: bool | None = None) -> None:
         if staged.empty:
             raise workspace.RunFailed(f"{after} undid every change")
         whole_diff = self.from_base if from_base is None else from_base
@@ -1300,10 +1312,12 @@ def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: boo
         run.say(f"I did not restart this after the interruption: {summary}. Remove "
                 f"`{run.tracker.label_name('failed')}` to retry.")
     if run.feedback and not run.dry_run and not run.alone:
-        if status == "noop" or run.step_started or (flow and flow.work_started):
+        if status == "noop" and run.closed_feedback_prs:
+            insights_store.release_feedback(run.id, closed_prs=run.closed_feedback_prs)
+        elif run.step_started or (flow and flow.work_started):
             insights_store.settle_feedback(run.id, {"pr": "done", "noop": "recorded"}.get(status, "failed"))
         else:
-            insights_store.release_feedback(run.feedback, run.id)
+            insights_store.release_feedback(run.id)
     if status == "failed":
         if flow and flow.matching and flow.stepped:
             flow.route()
@@ -1447,14 +1461,17 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             if isinstance(tk, tracker.GitHubTracker):
                 tk.require_ordinary(tid)
             budget_history = run_store.ticket_runs(repo.name, tid, limit=1, live=bool(retry_of or preview_of))
-            feedback = [] if (zte_grant or retry_of or reconciling_catch_up or script and script.repairs) else (
-                pending_feedback(repo.name, tid))
-            if not only and insights_store.has_fresh_feedback(feedback):
-                blocked, reset_budget = "", False
+            may_revise = not (zte_grant or retry_of or reconciling_catch_up or only) and (
+                script is None or script.path in ("orchestrate", "revise") and not script.repairs)
+            feedback = pending_feedback(repo.name, tid) if may_revise else []
+            feedback_readmits = (not dry_run and script and script.path == "orchestrate"
+                                 and insights_store.has_fresh_feedback(feedback))
+            readmission = None if force else runlimits.Readmission.decode(launch_lease.readmission(repo.name, str(tid)))
+            if feedback_readmits and not (force or readmission):
+                budget_admission = runlimits.Admission()
             else:
-                readmission = None if force else runlimits.Readmission.decode(launch_lease.readmission(repo.name, str(tid)))
-                blocked, reset_budget = runlimits.admission(repo, str(tid), tk, runlimits.Policy.of(layer), force,
-                                                           readmission=readmission)
+                budget_admission = runlimits.admission(repo, str(tid), tk, runlimits.Policy.of(layer), force,
+                                                       readmission=readmission)
         except tracker.ERRORS as e:
             print(f"could not read {name}: {e}")
             return 2
@@ -1464,8 +1481,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         except (ValueError, OSError) as e:
             print(f"could not validate the process budget: {e}")
             return 2
-        if blocked and not dry_run:
-            print(blocked)
+        if budget_admission.reason and not dry_run and not (force and feedback_readmits):
+            print(budget_admission.reason)
             return 2
         if script and script.repairs and (later := run_store.later_run(repo.name, tid, script.repairs)):
             print(f"run {later['id']} of {name} came after run {script.repairs}, so it is not repaired twice")
@@ -1491,6 +1508,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     return 1
             settled = [done for dead_row in run_store.ticket_runs_marked_running(repo.name, tid)
                        if (done := record.interrupt(dead_row))]
+            if settled and may_revise:
+                feedback = pending_feedback(repo.name, tid)
             earlier = None if only or preview_of else run_store.newest_live_whole_run(repo.name, tid)
             restarting = bool(earlier) and earlier["status"] == "interrupted"
             mending = (script.repairs or repaired_by(script.continues or (earlier["id"] if restarting else ""))
@@ -1551,8 +1570,9 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 run_id = start()
             scratch.RUN_BASELINES[run_id] = producer_baseline
             scratch.RUN_LABELS[run_id] = service_labels
+            repair_with_feedback = script and script.path == "orchestrate" and script.continues and not script.action
             run = Run(run_id, repo, paths.RUNS_DIR / run_id, dry_run, tracker=tk, tid=tid, force=force,
-                      feedback=[] if mending else feedback,
+                      feedback=[] if mending and not repair_with_feedback else feedback,
                       repairs=mending,
                       answering=earlier if earlier and earlier["status"] == "needs-info" else {},
                       launch_gate=admission, launch_done=launch_done, closed_context=closed_context, preview_of=preview_of,
@@ -1626,12 +1646,20 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             if due and not slot.held and not dry_run and not flow.refusal:
                 slot.take(run.log, run.waiting, "answer")
             parent = parent_run(script, earlier, budget_history)
-            previous = "" if reset_budget and not (retry_of or run.feedback) else parent
-            fresh = bool(previous) and force and not retry_of and not restarting and not run.repairs and not run.alone and not (
-                flow and flow.continues)
+            allow_reset = not (dry_run or retry_of)
+            previous = "" if allow_reset and budget_admission.reset_time else parent
+            repair_parent = "" if allow_reset and budget_admission.reset_repairs else parent
+            fresh = (bool(previous) and allow_reset and force and not restarting and not run.repairs
+                     and not run.alone and not (flow and flow.continues))
             current = tk.get(tid) if fresh else None
+            answered_runs = ()
+            if not dry_run and not only and not (flow and flow.refusal):
+                answered_runs = tuple(a["run"] for a in run.answers_due)
+                if run.answering and answer_text(run.answering["id"]).strip():
+                    answered_runs += (run.answering["id"],)
             with handoff_io():
                 run.budget = runlimits.Budget(run, runlimits.Policy.of(layer), previous, current, fresh,
+                                              repair_previous=repair_parent, answered_runs=answered_runs,
                                               wall_deadline=wall_deadline, checkpoint_timeout=0 if zte_grant else None,
                                               checkpoint_gate=checkpoint_allowed if zte_grant else None,
                                               fixed_gaps=fixed_gaps)
@@ -1792,11 +1820,15 @@ def assumptions_of(plan: dict) -> list[str]:
     return [a.strip() for a in listed if isinstance(a, str) and a.strip()] if isinstance(listed, list) else []
 
 
+def question_time(run: dict) -> str:
+    return next((line["ts"] for line in reversed(run_lines.read(run["id"]))
+                 if line.get("event") == "question" and line.get("ts")), None) or run.get("finished") or ""
+
+
 def opening_waits(run_id: str, answering: dict, passed_over: str) -> None:
     now = util.iso()
     if answering:
-        asked = next((line.get("ts") for line in reversed(run_lines.read(answering["id"]))
-                      if line.get("event") == "question"), None) or answering.get("finished")
+        asked = question_time(answering)
         if asked:
             run_lines.waited(run_id, "person", asked, passed_over or now)
     if passed_over:
@@ -1921,9 +1953,8 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
                     text=answer_text(run.answering["id"]))
     approval = triage_store.triage_approval(run.triage_key)
     if run.feedback:
-        closed = [url for url in run.feedback_prs if gh.pr_view(url).get("state") != "OPEN"]
-        if closed:
-            return "noop", f"the PR closed before arete could revise it: {', '.join(closed)}", ""
+        if closed := run.feedback_closure():
+            return "noop", closed, ""
     elif not t.open:
         return "noop", "ticket is not open", ""
     elif t.blocker and not run.force:
@@ -2292,7 +2323,7 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
     except BaseException as error:
         if isinstance(error, CatchUpPathCollision):
             worktree_files.add(error.name)
-        run.catch_up_preserved.update(c.prefix + name for name in worktree_files)
+            run.catch_up_preserved.add(c.prefix + error.name)
         abort_merge(c.wt)
         if (git(["rev-parse", "HEAD"], c.wt).strip() != before.lease
                 or workspace.uncommitted(c.wt, tracked_only=True)):
@@ -2324,7 +2355,8 @@ def push_caught_up_head(b: Build, c: workspace.Checkout, branch: str, head: str)
             row = {}
         remote = row.get("headRefOid")
         if remote == head:
-            c.lease, c.onto = head, ""
+            c.note_pushed_head(head)
+            c.onto = ""
             return
         if remote and (hold := gh.merge_ref_hold(row, c.lease, c.base)):
             raise CatchUpPushUnconfirmed(f"{why}: {hold}", f"{detail} GitHub reports `{remote}`.", retryable=False)
@@ -2544,7 +2576,7 @@ def commit_and_push(checkouts: list[workspace.Checkout], changed: list[workspace
             aftermath = ("The pilot will not retry the push." if before_push
                          else "A retry builds on whatever reached the branch.")
             raise workspace.RunFailed(f"the push to {c.github} failed after arete pushed {done}", f"{e}\n\n{aftermath}") from e
-        c.lease = head or git(["rev-parse", "HEAD"], c.wt).strip()
+        c.note_pushed_head(head or git(["rev-parse", "HEAD"], c.wt).strip())
         c.onto = ""
         pushed.append(c)
 
@@ -2894,9 +2926,11 @@ def merge_moved_bases(run: AgentRun, checkouts: list[workspace.Checkout], layer:
         if environment_retry and (not c.base_commit or
                                   git(["merge-base", c.base_commit, base], c.wt).strip() != c.base_commit):
             raise workspace.RunFailed(f"the base for {c.github} no longer contains the saved base")
-        c.base_commit = base
-        if git(["rev-list", "--count", f"HEAD..{c.base_commit}"], c.wt).strip() == "0":
+        if git(["rev-list", "--count", f"HEAD..{base}"], c.wt).strip() == "0":
+            if not pending_merge(c):
+                c.base_commit = base
             continue
+        c.base_commit = base
         if edits := workspace.uncommitted(c.wt, tracked_only=allow_untracked):
             raise workspace.RunFailed(f"{c.github} has uncommitted edits ({', '.join(edits[:5])}), so arete merged nothing into "
                             "them and left them as they are")
@@ -3140,6 +3174,10 @@ def pending_feedback(repo_name: str, tid: str) -> list[dict]:
     return insights_store.open_feedback([url for r in run_store.open_runs(repo_name, tid) for url in (r.get("pr_url") or "").split()])
 
 
+def feedback_key(row: dict) -> tuple[str, str, int]:
+    return row["pr_url"], row["kind"], row["gh_id"]
+
+
 def feedback_markdown(rows: list[dict]) -> str:
     out = []
     for url in dict.fromkeys(f["pr_url"] for f in rows):
@@ -3263,10 +3301,11 @@ def check_in_use(b: Build, goal: str, summary: str) -> verify.Verified:
 
 
 def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "verify",
-                require_released: bool = False, **values) -> verify.Verified:
+                require_released: bool = False, *, replay_drivers: set[str] | None = None, **values) -> verify.Verified:
     from . import pilot, readme_verify, zte
 
     run, configured = b.run, b.layer.verify
+    replay_only = replay_drivers is not None
     delivery_verification = prompt_name == role == "verify"
     tid = str(run.tid) if delivery_verification else ""
     zte_verify = delivery_verification and zte.reserved(tid)
@@ -3280,7 +3319,10 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
             blocked_by=", ".join(f"journey:{name}" for name in unknown)))
     selected = {name: feature_map[name] for name in requested}
     drivers = {name: journey.driver for name, journey in selected.items() if journey.driver}
-    v = verify.with_free_ports(replace(configured, drivers={name: configured.drivers[name] for name in drivers.values()}))
+    replay = {name: journey.driver for name in replay_drivers or ()
+              if (journey := configured.feature_map.get(name)) and journey.driver in configured.drivers}
+    commands = {name: configured.drivers[name] for name in (*drivers.values(), *replay.values())}
+    v = verify.with_free_ports(replace(configured, drivers=commands))
     merge_candidate = b.layer.trust_level == "automerge" or readme_task
     checked_trees = verification_trees(b) if delivery_verification and merge_candidate else {}
     if refusal := verify.port_refusal(v):
@@ -3310,7 +3352,11 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
             verified = verify.Verified("blocked", "The exact README could not be verified.", finished=False,
                                        blocked_by=str(error))
         return save_verification(run, step, verified)
-    evidence = run_folder(run, "evidence")
+    if replay_only:
+        evidence = run.dir / f"{step}-evidence"
+        evidence.mkdir(exist_ok=True)
+    else:
+        evidence = run_folder(run, "evidence")
     untracked_before = untracked_by_dir(b.git_dirs)
     attempt = None
     try:
@@ -3343,8 +3389,8 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
             if url:
                 run.log(f"{step}: the app answers at {url}")
             if v.probes or drivers:
-                probes = verify.run_probes(replace(v, probe_seconds=run.time_for(v.probe_seconds)), b.ws, attempt,
-                                           journey_drivers=drivers)
+                probe_config = replace(v, probe_seconds=run.time_for(v.probe_seconds))
+                probes = verify.run_probes(probe_config, b.ws, attempt, journey_drivers=drivers)
             if probes:
                 run.save(f"{step}-probes.json", json.dumps(asdict(probes), indent=2))
                 label = "configured verification commands" if drivers else "configured probes"
@@ -3357,10 +3403,18 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                     v = replace(v, notes=v.notes + f"\n\nArete already executed these owner-configured {name} in a "
                                 "confined disposable workspace. Use their observed results as evidence; do not repeat "
                                 "these commands. " + instructions + probes.markdown())
-            if not probes or probes.verdict == "pass":
+            probes_passed = not probes or probes.verdict == "pass"
+            if replay and probes_passed:
+                driver_config = replace(v, probes={}, probe_seconds=run.time_for(v.probe_seconds))
+                observed = verify.run_probes(driver_config, b.ws, attempt, journey_drivers=replay,
+                                             stop_on_driver_failure=False)
+                run.save(f"{step}-replay-drivers.json", asdict(observed))
+            if not replay_only and probes_passed:
                 agent_started = True
+                fault_controls = verify.fault_note(v) if url and delivery_verification else ""
                 res = run.agent(step, b.brief.prompt(
-                    prompt_name, surface=surface_note(v, url, evidence), notes=v.notes, scratch=scratch.note(attempt),
+                    prompt_name, surface=surface_note(v, url, evidence) + fault_controls, notes=v.notes,
+                    scratch=scratch.note(attempt),
                     commands=prompt_loader.code_list(bash), checks=check_list(b.layer),
                     compare=compare_with_fork(b.checkouts), owner=run.owner_note,
                     journeys=journeys.guidance(selected or feature_map), **values),
@@ -3405,6 +3459,8 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
             restore_worktrees(untracked_before, evidence)
     if probes and probes.verdict != "pass":
         verified = probes
+    elif replay_only:
+        verified = verify.Verified("pass", "No ordinary steps to replay.")
     elif not res.ok or not isinstance(res.structured, dict):
         verified = verify.Verified("blocked", "The check in use did not finish.", finished=False,
                                    blocked_by=util.first_line(res.error or "the verifier returned no verdict", 300))
@@ -3412,7 +3468,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
             return verified
     else:
         verified = verify.Verified.from_agent(res.structured)
-    if probes and probes.verdict == "pass":
+    if probes and probes.verdict == "pass" and not replay_only:
         verified.checks = probes.checks + verified.checks
     if fixture_blocker:
         verified.verdict, verified.blocked_by, verified.finished = "blocked", fixture_blocker, False
@@ -3456,7 +3512,8 @@ def surface_note(v: config.Verify, url: str, evidence: Path) -> str:
             "saved there also serves as a fixture.\n"
             "- Read `browser_console_messages` after each state. Name each console error and each dev error overlay "
             "or badge in `saw`, and say whether the change causes it.\n"
-            "- Send API requests with curl, shaped the way the app's clients send them, and read the status and body.")
+            "- For ordinary API checks, send requests with curl, shaped the way the app's clients send them, "
+            "and read the status and body.")
 
 
 def restore_worktrees(untracked_before: dict[Path, set[str]], evidence: Path) -> None:
@@ -3801,7 +3858,7 @@ def run_skipped(name: str) -> dict:
 
 
 def answered_run(repo_name: str, tid: str) -> dict | None:
-    newest = run_store.newest_whole_run(repo_name, tid)
+    newest = run_store.newest_live_whole_run(repo_name, tid)
     if (newest and newest["status"] == "needs-info" and asks_store.asks_due([newest["id"]])
             and not asks_store.asks_of(newest["id"], "open")):
         return newest

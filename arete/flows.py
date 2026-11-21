@@ -589,10 +589,23 @@ class Job:
         return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
     def accepts(self, name: str, outcome: Outcome, kw: dict) -> bool:
+        if name == "revise" and not self.only and not self.includes_feedback(outcome.data):
+            self.run.log(f"{name}: pending PR feedback was absent from the saved outcome; rerunning is required")
+            return False
         if (expected := self.policy(name, kw)) and outcome.data.get("policy") != expected:
             self.run.log(f"{name}: stored evidence used a different policy; rerunning is required")
             return False
         return True
+
+    def includes_feedback(self, data: dict) -> bool:
+        feedback = self.run.feedback
+        if not feedback:
+            return True
+        if "feedback_keys" in data:
+            known = {tuple(key) for key in data["feedback_keys"]}
+            return all(pipeline.feedback_key(row) in known for row in feedback)
+        return (all(row.get("status") != "new" for row in feedback)
+                and data.get("plan") == revision_plan(pipeline.feedback_markdown(feedback)))
 
     def keeps(self, name: str, kw: dict) -> bool:
         return any(c.onto for c in self.checkouts) and (
@@ -683,7 +696,7 @@ class Job:
         self.committed = bool(data.get("committed", True))
         if stored:
             for c in self.picked(self.changed):
-                c.lease = c.onto or util.git(["rev-parse", "HEAD"], c.wt).strip()
+                c.note_pushed_head(c.onto or util.git(["rev-parse", "HEAD"], c.wt).strip())
             if self.with_prs:
                 pipeline.note_prs(self.run, self.branch, self.with_prs)
 
@@ -739,7 +752,7 @@ class Job:
                         "published nothing")
         except RuntimeError as e:
             return f"arete could not check {branch} of {c.github} against origin: {util.first_line(str(e), 300)}"
-        c.lease = remote
+        c.note_pushed_head(remote)
         if head != c.revision:
             self.carried = True
         if head not in (remote, c.revision) and c.github not in self.pending:
@@ -830,12 +843,14 @@ def prepare(flow: factory.Flow, tree: str) -> Outcome:
         return end_as("stop", "quiet", status="failed", summary=f"could not read {run.ref}: {e}")
     opened(run, t)
     mended = run_store.run_get(run.repairs) or {} if run.repairs else {}
-    if run.feedback or run.repairs:
-        urls = run.feedback_prs or str(mended.get("pr_url") or "").split()
+    if run.feedback:
+        if closed := run.feedback_closure():
+            return end_as("stop", "quiet", status="noop", summary=closed)
+    elif run.repairs:
+        urls = str(mended.get("pr_url") or "").split()
         if closed := [url for url in urls if gh.pr_view(url).get("state") != "OPEN"]:
             return end_as("stop", "quiet", status="noop",
-                          summary=f"the PR closed before arete could {'revise' if run.feedback else 'repair'} it: "
-                                  f"{', '.join(closed)}")
+                          summary=f"the PR closed before arete could repair it: {', '.join(closed)}")
     elif not t.open:
         return end_as("stop", "quiet", status="noop", summary="ticket is not open")
     elif t.blocker and not run.force:
@@ -953,6 +968,10 @@ def patch(flow: factory.Flow, tree: str) -> Outcome:
     }, session=job.run.sessions.get(BUILD, NO_SESSION))
 
 
+def revision_plan(feedback: str) -> str:
+    return f"Revise the open PR for the owner's feedback:\n\n{feedback}"
+
+
 @factory.step("revise")
 def revision(flow: factory.Flow, tree: str) -> Outcome:
     job: Job = flow.ctx
@@ -970,9 +989,10 @@ def revision(flow: factory.Flow, tree: str) -> Outcome:
     if pipeline.stage(job.checkouts, diffguard.denied_paths(layer)).empty:
         return end_as("stop", "unchanged", summary=summary, replies=replies)
     return Outcome("pass", data={
-        "plan": f"Revise the open PR for the owner's feedback:\n\n{feedback}", "left_for_a_person": left,
+        "plan": revision_plan(feedback), "left_for_a_person": left,
         "goal": ("Check each change the owner's feedback asks for, and that what the issue asks for still works.\n\n"
                  + feedback),
+        "feedback_keys": [pipeline.feedback_key(row) for row in run.feedback],
         "summary": summary, "replies": replies, "story": run.story}, session=run.sessions.get(BUILD, NO_SESSION))
 
 
@@ -1214,7 +1234,7 @@ def settle_unpushed_checkouts(job: Job, before_push=None):
         head = util.git(["rev-parse", "HEAD"], c.wt).strip()
         remote = workspace.remote_head(c.src, job.branch)
         if remote == head:
-            c.lease = head
+            c.note_pushed_head(head)
         elif remote == c.lease and (not remote or ancestor(c.wt, remote, head)):
             unpushed.append(c)
         else:

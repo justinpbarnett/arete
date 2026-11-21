@@ -40,6 +40,7 @@ class Checkout:
     resolved_lines: int = 0
     onto: str = ""
     kept: str = ""
+    pushed_head: str = ""
 
     @classmethod
     def from_row(cls, row: dict) -> Checkout:
@@ -47,6 +48,13 @@ class Checkout:
 
     def to_row(self) -> dict:
         return {**asdict(self), "src": str(self.src), "wt": str(self.wt)}
+
+    def note_pushed_head(self, head: str) -> None:
+        self.lease = self.pushed_head = head
+
+    @property
+    def publication_baseline(self) -> str:
+        return self.lease if self.resumes or self.lease == self.pushed_head else ""
 
     @property
     def prefix(self) -> str:
