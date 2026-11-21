@@ -1,4 +1,5 @@
 import argparse
+import errno
 import fcntl
 import json
 import math
@@ -6,6 +7,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -13,7 +15,7 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from importlib import import_module
 from unittest.loader import _FailedTest
@@ -24,6 +26,10 @@ STACK_GRACE = 1
 HISTORY = os.path.join(tempfile.gettempdir(), "arete-parallel-durations.json")
 TESTS = os.path.dirname(os.path.abspath(__file__))
 STACK_SITE = os.path.join(TESTS, "_parallel_site")
+TIMING_LIMIT = 5
+TIMING_ID_BYTES = 8192
+TIMING_PACKET_BYTES = 48 * 1024
+LONG_TIMING_ID = "[test ID too long]"
 
 if __spec__ is None:
     sys.path.insert(0, os.path.dirname(TESTS))
@@ -75,30 +81,138 @@ def end_with_runner(lifeline):
 
 
 class TimedResult(unittest.TestResult):
-    def __init__(self, progress):
+    def __init__(self, record, started_fd=None, completed_fd=None):
         super().__init__()
-        self.progress = progress
+        self.record = record
+        self.started_fd = started_fd
+        self.completed_fd = completed_fd
+        self.completed = 0
 
     def startTest(self, test):
         super().startTest(test)
-        self.started = time.monotonic()
-        self.progress.write(json.dumps([self.started, None, None]) + "\n")
+        self.started = self.name = None
+        with suppress(BaseException):
+            if self.started_fd is not None:
+                os.lseek(self.started_fd, self.testsRun, os.SEEK_SET)
+        with suppress(BaseException):
+            if self.record is not None:
+                started = time.monotonic()
+                if math.isfinite(started):
+                    self.started = started
+                    name = test.id()
+                    if isinstance(name, str):
+                        self.name = LONG_TIMING_ID if str.__len__(name) > TIMING_ID_BYTES else name
 
     def stopTest(self, test):
         super().stopTest(test)
-        finished = time.monotonic()
-        self.progress.write(json.dumps([finished, test.id(), finished - self.started]) + "\n")
+        self.completed += 1
+        with suppress(BaseException):
+            if self.completed_fd is not None:
+                os.lseek(self.completed_fd, self.completed, os.SEEK_SET)
+        with suppress(BaseException):
+            if self.started is not None and isinstance(self.name, str):
+                finished = time.monotonic()
+                duration = finished - self.started
+                if 0 <= duration < math.inf:
+                    self.record(finished, self.name, duration)
 
 
-def run_one(identifier, start, result_file, lifeline, progress_fd=None):
+def pending_packets(sock, size):
+    with suppress(BlockingIOError):
+        while True:
+            yield sock.recv(size)
+
+
+class TimingPublisher:
+    def __init__(self, writer, reader):
+        self.writer = writer
+        self.reader = reader
+        self.deadline = None
+        self.rows = []
+
+    def record(self, finished, name, duration):
+        if self.deadline is None:
+            with suppress(BlockingIOError):
+                self.deadline = float(self.writer.recv(64))
+        if self.deadline is not None and finished > self.deadline:
+            return
+        if len(self.rows) == TIMING_LIMIT and duration <= self.rows[-1][2]:
+            return
+        if str.__len__(name) > TIMING_ID_BYTES or len(json.dumps(name)) > TIMING_ID_BYTES:
+            name = LONG_TIMING_ID
+        rows = sorted([*self.rows, (finished, name, duration)], key=lambda row: -row[2])[:TIMING_LIMIT]
+        packet = json.dumps(rows).encode()
+        try:
+            self.writer.send(packet)
+        except OSError as error:
+            if error.errno not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.ENOBUFS):
+                raise
+            for _ in pending_packets(self.reader, 1):
+                pass
+            self.writer.send(packet)
+        else:
+            # Publish first so a worker killed during replacement leaves a complete snapshot.
+            if self.rows:
+                with suppress(BlockingIOError):
+                    self.reader.recv(1)
+        self.rows = rows
+
+
+@contextmanager
+def timing_channel():
+    with ExitStack() as cleanup:
+        try:
+            reader, writer = socket.socketpair(type=socket.SOCK_DGRAM)
+            cleanup.enter_context(reader)
+            cleanup.enter_context(writer)
+            # Reserve space for the old and new snapshots during replacement.
+            writer.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * TIMING_PACKET_BYTES)
+            reader.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * TIMING_PACKET_BYTES)
+            reader.setblocking(False)
+            writer.setblocking(False)
+        except OSError:
+            yield None
+            return
+        yield reader, writer
+
+
+def timing_rows(reader):
+    rows = []
+    with suppress(OSError):
+        for packet in pending_packets(reader, TIMING_PACKET_BYTES):
+            with suppress(ValueError, RecursionError):
+                snapshot = json.loads(packet)
+                if isinstance(snapshot, list) and len(snapshot) <= TIMING_LIMIT:
+                    rows = [row for row in snapshot if isinstance(row, list) and len(row) == 3
+                            and isinstance(row[0], (int, float)) and isinstance(row[1], str)
+                            and isinstance(row[2], (int, float))]
+    return rows
+
+
+def private_fd(fd):
+    if fd is not None:
+        try:
+            os.set_inheritable(fd, False)
+        except BaseException:
+            return None
+    return fd
+
+
+def run_one(identifier, start, result_file, lifeline, progress_fd=None, progress_peer_fd=None,
+            started_fd=None, completed_fd=None):
     os.set_inheritable(lifeline, False)
-    if progress_fd is not None:
-        os.set_inheritable(progress_fd, False)
     threading.Thread(target=end_with_runner, args=(lifeline,), daemon=True).start()
+    record = None
+    with suppress(BaseException):
+        writer_fd, reader_fd = private_fd(progress_fd), private_fd(progress_peer_fd)
+        if writer_fd is not None and reader_fd is not None:
+            writer, reader = socket.socket(fileno=writer_fd), socket.socket(fileno=reader_fd)
+            record = TimingPublisher(writer, reader).record
+    started_fd, completed_fd = private_fd(started_fd), private_fd(completed_fd)
+    result = (TimedResult(record, started_fd, completed_fd)
+              if record is not None or started_fd is not None or completed_fd is not None else unittest.TestResult())
     sys.path.insert(0, start)
-    with (os.fdopen(progress_fd, "w", buffering=1) if progress_fd is not None else nullcontext()) as progress:
-        result = TimedResult(progress) if progress is not None else unittest.TestResult()
-        unittest.defaultTestLoader.loadTestsFromName(identifier).run(result)
+    unittest.defaultTestLoader.loadTestsFromName(identifier).run(result)
     report = {"ran": result.testsRun, "errors": [[str(t), text] for t, text in result.errors],
               "failures": [[str(t), text] for t, text in result.failures],
               "skipped": [[str(t), why] for t, why in result.skipped],
@@ -117,26 +231,16 @@ class Batch:
     timeout: float = DEFAULT_CLASS_TIMEOUT
 
 
-def class_timeout_details(batch, timeout, deadline, progress):
-    started = 0
-    completed = []
-    try:
-        progress.seek(0)
-        for line in progress:
-            if not line.endswith(b"\n"):
-                break
-            timestamp, name, duration = json.loads(line)
-            if timestamp > deadline:
-                break
-            if duration is None:
-                started += 1
-            else:
-                completed.append((duration, name))
-    except (OSError, ValueError):
-        pass
-    return {"class_name": batch.identifier, "count": batch.count, "deadline": timeout,
-            "completed": len(completed), "never_started": max(0, batch.count - started),
-            "timings": sorted(completed, key=lambda entry: -entry[0])[:5]}
+def class_timeout_details(batch, timeout, deadline, events, started, completed=None):
+    timings = [(duration, name) for timestamp, name, duration in events
+               if deadline is not None and timestamp <= deadline and isinstance(name, str) and 0 <= duration < math.inf]
+    details = {"class_name": batch.identifier, "count": batch.count, "deadline": timeout,
+               "timings": sorted(timings, key=lambda entry: -entry[0])[:TIMING_LIMIT]}
+    if started is not None:
+        details["never_started"] = max(0, batch.count - started)
+    if completed is not None:
+        details["completed"] = completed
+    return details
 
 
 class Runner:
@@ -244,15 +348,29 @@ class Runner:
         began = time.monotonic()
         problem = None
         timeout_report = ""
-        timeout_details = None
-        with (tempfile.TemporaryFile() if self.summary_path else nullcontext()) as progress:
+        deadline = None
+        events = ()
+        started = completed = None
+        with ExitStack() as cleanup:
+            progress = cleanup.enter_context(timing_channel()) if self.summary_path else None
             pass_fds = (self.lifeline,)
             if progress is not None:
-                command += ["--progress-fd", str(progress.fileno())]
-                pass_fds += (progress.fileno(),)
+                reader, writer = progress
+                command += ["--progress-fd", str(writer.fileno()), "--progress-peer-fd", str(reader.fileno())]
+                pass_fds += (writer.fileno(), reader.fileno())
+            counters = {}
             with open(output_file, "w") as output, self.lock:
                 if self.stopping:
                     return
+                if self.summary_path:
+                    # Each counter shares its own offset with the worker without changing stdout or file contents.
+                    for counter in ("started", "completed"):
+                        with suppress(OSError):
+                            fd = os.open(output_file, os.O_RDONLY)
+                            cleanup.callback(os.close, fd)
+                            counters[counter] = fd
+                            command += [f"--{counter}-fd", str(fd)]
+                            pass_fds += (fd,)
                 try:
                     process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=output,
                                                stderr=subprocess.STDOUT, start_new_session=True,
@@ -265,12 +383,21 @@ class Runner:
             if process is not None:
                 timeout = stretch * (self.args.timeout if self.args.timeout is not None else batch.timeout)
                 requested = None
-                deadline = time.monotonic() + timeout if progress is not None else None
+                if progress is not None:
+                    with suppress(Exception):
+                        deadline = time.monotonic() + timeout
+                        # The worker excludes stack-dump grace time before ranking its five rows.
+                        reader.send(str(deadline).encode())
                 try:
                     process.wait(timeout)
                     if process.returncode:
                         problem = f"worker exited with status {process.returncode}"
                 except subprocess.TimeoutExpired:
+                    counts = {}
+                    for counter, fd in counters.items():
+                        with suppress(OSError):
+                            counts[counter] = os.lseek(fd, 0, os.SEEK_CUR)
+                    started, completed = counts.get("started"), counts.get("completed")
                     problem = f"class exceeded {timeout:g}s"
                     requested = self.request_stacks(stack_prefix)
                 finally:
@@ -279,12 +406,12 @@ class Runner:
                     with self.lock:
                         self.live.pop(process, None)
                 if requested is not None:
+                    if progress is not None:
+                        events = timing_rows(reader)
                     stacks = self.stack_output(requested, process.pid)
                     timeout_report = "\n".join(filter(None, (
                         _test_stacks.REPORT_START, batch.identifier, problem, stacks, _test_stacks.REPORT_END,
                     )))
-                    if deadline is not None:
-                        timeout_details = class_timeout_details(batch, timeout, deadline, progress)
         try:
             with open(result_file) as handle:
                 report = json.load(handle)
@@ -299,8 +426,9 @@ class Runner:
             problem = problem or "worker exited without a complete report"
         if problem and not timeout_report:
             report["errors"].append((batch.identifier, problem))
-        report.update(seconds=time.monotonic() - began, output=self.output(output_file), timeout=timeout_report,
-                      timeout_details=timeout_details)
+        report.update(seconds=time.monotonic() - began, output=self.output(output_file), timeout=timeout_report)
+        if timeout_report and self.summary_path:
+            report["timeout_details"] = class_timeout_details(batch, timeout, deadline, events, started, completed)
         with self.lock:
             self.results[batch.identifier] = report
             if self.args.verbose:
@@ -413,7 +541,8 @@ class Runner:
             print(f"Worker reports and output retained in: {self.folder}", flush=True)
             if summaries:
                 try:
-                    with open(self.summary_path, "ab", buffering=0) as sidecar:
+                    with open(self.summary_path, "ab", buffering=0,
+                              opener=lambda path, flags: os.open(path, flags & ~os.O_CREAT)) as sidecar:
                         for summary in summaries:
                             sidecar.write((json.dumps(summary) + "\n").encode())
                 except OSError:
@@ -434,10 +563,14 @@ def main():
     parser.add_argument("--one")
     parser.add_argument("--result")
     parser.add_argument("--progress-fd", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--progress-peer-fd", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--started-fd", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--completed-fd", type=int, help=argparse.SUPPRESS)
     args = parser.parse_args()
     args.start = os.path.abspath(args.start)
     if args.one:
-        return run_one(args.one, args.start, args.result, args.lifeline, args.progress_fd)
+        return run_one(args.one, args.start, args.result, args.lifeline,
+                       args.progress_fd, args.progress_peer_fd, args.started_fd, args.completed_fd)
     if (args.jobs < 1 or args.slowest < 0
             or (args.timeout is not None and (not math.isfinite(args.timeout) or args.timeout <= 0))):
         parser.error("jobs and timeout must be positive; slowest must be nonnegative")

@@ -16,7 +16,7 @@ import sys
 import time
 from collections import Counter
 from collections.abc import Callable, Iterator
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from pathlib import Path
@@ -1073,7 +1073,7 @@ def shorten_timeout_name(name: str, room: int) -> str:
 def format_timeout_summary(details: object, redact: Callable[[str], str]) -> str:
     match details:
         case {"class_name": str(class_name), "count": int(count), "deadline": int() | float() as deadline,
-              "completed": int(completed), "never_started": int(never_started), "timings": list(timings)}:
+              "timings": list(timings)}:
             pass
         case _:
             return ""
@@ -1082,7 +1082,11 @@ def format_timeout_summary(details: object, redact: Callable[[str], str]) -> str
         return redact(name).encode(errors="replace").decode().replace("\r", "\\r").replace("\n", "\\n")
 
     identifier = redact_name(class_name)
-    metadata = f" ({count} tests)\nclass exceeded {deadline:g}s\n{completed} completed, {never_started} never started"
+    metadata = f" ({count} tests)\nclass exceeded {deadline:g}s"
+    match details:
+        case {"completed": int(completed), "never_started": int(never_started)}:
+            metadata += f"\n{completed} completed, {never_started} never started"
+    metadata = redact(metadata)
     guidance = _test_stacks.TIMEOUT_REMEDIATION
     room = _test_stacks.MAX_TIMEOUT_SUMMARY_CHARS - len(metadata) - len(guidance) - 1
     if room < 3:
@@ -1091,7 +1095,7 @@ def format_timeout_summary(details: object, redact: Callable[[str], str]) -> str
     for timing in timings[:5]:
         match timing:
             case [int() | float() as duration, str(name)]:
-                timed_names.append((f"  {duration:.3f}s ", redact_name(name)))
+                timed_names.append((redact(f"  {duration:.3f}s "), redact_name(name)))
 
     class_label = shorten_timeout_name(identifier, room)
     timing_heading = "Slowest completed tests:"
@@ -1107,21 +1111,22 @@ def format_timeout_summary(details: object, redact: Callable[[str], str]) -> str
         rows.append(prefix + shorten_timeout_name(name, room))
         remaining -= len(rows[-1]) + 1
     timing_lines = (timing_heading, *rows) if rows else ()
-    return "\n".join((class_label + metadata, *timing_lines, guidance))
+    summary = redact("\n".join((class_label + metadata, *timing_lines, guidance)))
+    return summary if len(summary) <= _test_stacks.MAX_TIMEOUT_SUMMARY_CHARS else ""
 
 
 def read_timeout_summaries(sidecar: BinaryIO, limit: int, redact: Callable[[str], str]) -> list[str]:
     summaries = []
-    for _ in range(limit):
-        line = sidecar.readline()
-        if not line.endswith(b"\n"):
-            break
-        try:
-            summary = format_timeout_summary(json.loads(line), redact)
-        except (ValueError, OverflowError, RecursionError):
-            continue
-        if summary:
-            summaries.append(summary)
+    with suppress(OSError):
+        for line in sidecar:
+            if len(summaries) >= limit or not line.endswith(b"\n"):
+                break
+            try:
+                summary = format_timeout_summary(json.loads(line), redact)
+            except (ValueError, OverflowError, RecursionError):
+                continue
+            if summary:
+                summaries.append(summary)
     return summaries
 
 
@@ -1168,11 +1173,15 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
     def execute(items):
         nonlocal ok
         for name, cmd in items:
-            with NamedTemporaryFile(prefix="arete-check-timeouts-") as sidecar:
+            with ExitStack() as cleanup:
+                sidecar = None
+                with suppress(OSError):
+                    sidecar = cleanup.enter_context(NamedTemporaryFile(dir=run.dir, prefix="check-timeouts-"))
+                sets = {_test_stacks.SUMMARY_FILE_ENV: sidecar.name if sidecar else ""}
                 with record.timed(run.id, "check", name=name, command=cmd) as check:
                     res, redact = environment.sh_with_redactor(
                         cmd, run.config, run.repo, cwd=cwd, timeout=run.time_for(timeout),
-                        sets={_test_stacks.SUMMARY_FILE_ENV: sidecar.name},
+                        sets=sets,
                     )
                     check["exit"] = res.returncode
                 passed = res.returncode == 0
@@ -1180,8 +1189,8 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
                 run.log(f"check {name}: {'pass' if passed else f'FAIL (exit {res.returncode})'}")
                 if not passed:
                     report.append(f"### {name} failed: `{cmd}` exit {res.returncode}\n```\n{tail_of_both_streams(res.stdout, res.stderr, 6000)}\n```")
-                    remaining = _test_stacks.MAX_TIMEOUT_SUMMARY_CLASSES - len(diagnostics)
-                    diagnostics.extend(read_timeout_summaries(sidecar, remaining, redact))
+                    if sidecar and (remaining := _test_stacks.MAX_TIMEOUT_SUMMARY_CLASSES - len(diagnostics)):
+                        diagnostics.extend(read_timeout_summaries(sidecar, remaining, redact))
                 else:
                     report.append(f"### {name} passed: `{cmd}`")
 

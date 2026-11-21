@@ -1,7 +1,9 @@
 import contextlib
+import errno
 import io
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -41,22 +43,33 @@ def summaries_in(path):
         return pipeline.read_timeout_summaries(sidecar, 3, str)
 
 
+def worker_timing(reader, writer, lifeline):
+    return (["--progress-fd", str(writer.fileno()), "--progress-peer-fd", str(reader.fileno())],
+            (lifeline, writer.fileno(), reader.fileno()))
+
+
 class ParallelTimeoutReportTests(unittest.TestCase):
     def test_timeout_preserves_stacks_and_keeps_generated_ids_out_of_retained_artifacts(self):
         marker = "synthetic-completed-test-id"
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             root = Path(directory)
             sidecar = root / "summaries.jsonl"
+            sidecar.touch()
             (root / "test_hang.py").write_text(
-                "import time\nimport unittest\n\n"
+                "import sys\nimport time\nimport unittest\n\n"
                 "class HangingTests(unittest.TestCase):\n"
-                "    def id(self): return super().id() + getattr(self, 'suffix', '')\n"
-                f"    def test_1_fast(self): self.suffix = '[{marker}]'\n"
+                "    def id(self):\n"
+                "        name = super().id()\n"
+                "        if '--one' in sys.argv and self._testMethodName == 'test_1_fast':\n"
+                f"            return name + '[{marker}]'\n"
+                "        return name\n"
+                "    def test_1_fast(self): pass\n"
                 "    def test_2_slower(self): time.sleep(0.025)\n"
                 "    def test_3_hang(self): time.sleep(20)\n"
             )
+            runner = "from tests import parallel; parallel.STACK_GRACE = 0.3; raise SystemExit(parallel.main())"
             result = subprocess.run(
-                [sys.executable, "-m", "tests.parallel", "--start", directory, "--timeout", "0.5"],
+                [sys.executable, "-c", runner, "--start", directory, "--timeout", "0.5"],
                 env={**os.environ, "TMPDIR": directory, SUMMARY_ENV: str(sidecar)},
                 capture_output=True, text=True, timeout=8,
             )
@@ -92,20 +105,75 @@ class ParallelTimeoutReportTests(unittest.TestCase):
         self.assertRegex(lines[5], rf"^  \d+\.\d{{3}}s {name}\.test_1_fast\[{marker}\]$")
         self.assertEqual(lines[6:], [GUIDANCE])
 
+    def test_worker_writes_the_same_result_when_id_raises_after_teardown(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            root = Path(directory)
+            (root / "test_teardown.py").write_text(
+                "import unittest\n\n"
+                "class TeardownTests(unittest.TestCase):\n"
+                "    def id(self):\n"
+                "        if getattr(self, 'done', False):\n"
+                "            raise RuntimeError('id called after teardown')\n"
+                "        return super().id()\n"
+                "    def tearDown(self): self.done = True\n"
+                "    def test_pass(self): pass\n"
+                "    def test_failure(self): self.fail('original assertion')\n"
+            )
+            lifeline, held = os.pipe()
+            reports = []
+            try:
+                with parallel.timing_channel() as (reader, writer):
+                    command = [sys.executable, "-m", "tests.parallel", "--one", "test_teardown.TeardownTests",
+                               "--start", directory, "--lifeline", str(lifeline)]
+                    for enabled in (False, True):
+                        path = root / f"result-{enabled}.json"
+                        timing, fds = worker_timing(reader, writer, lifeline) if enabled else ([], (lifeline,))
+                        result = subprocess.run([*command, "--result", str(path), *timing], pass_fds=fds,
+                                                capture_output=True, text=True, timeout=2)
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        reports.append(path.read_bytes())
+                    events = sorted(parallel.timing_rows(reader))
+            finally:
+                os.close(lifeline)
+                os.close(held)
+            self.assertEqual(reports[1], reports[0])
+            report = json.loads(reports[1])
+            self.assertEqual(report["ran"], 2)
+            self.assertEqual(report["errors"], [])
+            self.assertIn("AssertionError: original assertion", report["failures"][0][1])
+            self.assertEqual([name for _, name, _ in events if name],
+                             ["test_teardown.TeardownTests.test_failure", "test_teardown.TeardownTests.test_pass"])
+
+    def test_passing_class_keeps_the_runner_output(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            sidecar = Path(directory) / "summaries.jsonl"
+            sidecar.touch()
+            with (patch.dict(os.environ, {SUMMARY_ENV: str(sidecar)}),
+                  patch.object(parallel, "HISTORY", str(Path(directory) / "history.json")),
+                  patch.object(parallel.shutil, "rmtree") as cleanup,
+                  contextlib.redirect_stdout(io.StringIO()) as output):
+                runner = parallel.Runner(SimpleNamespace(slowest=0))
+                runner.folder = directory
+                runner.results["fixture.Passing"] = {"ran": 2, "skipped": [], "seconds": 0.25}
+                self.assertEqual(runner.finish(1), 0)
+                cleanup.assert_called_once_with(directory)
+            self.assertEqual(output.getvalue(), "Ran 2 tests in 1.00s: OK\n")
+            self.assertEqual(sidecar.read_bytes(), b"")
+
     def test_deadline_excludes_grace_period_and_keeps_only_five_timings(self):
         batch = parallel.Batch("fixture.Sample", 8)
         durations = (2, 5, 1, 7, 4, 3, 20, 1)
         events = [timestamp for n, seconds in enumerate(durations) for timestamp in (10 * n, 10 * n + seconds)]
         events[-2:] = [81, 82]
-        with io.StringIO() as progress:
-            result = parallel.TimedResult(progress)
-            clock = Mock(monotonic=Mock(side_effect=events))
-            with patch.object(parallel, "time", clock):
-                for index in range(batch.count):
-                    test = Mock(id=Mock(return_value=f"fixture.Sample.test_{index}"))
-                    result.startTest(test)
-                    result.stopTest(test)
-            details = parallel.class_timeout_details(batch, 75, 75, io.BytesIO(progress.getvalue().encode()))
+        rows = []
+        result = parallel.TimedResult(lambda *row: rows.append(row))
+        clock = Mock(monotonic=Mock(side_effect=events))
+        with patch.object(parallel, "time", clock):
+            for index in range(batch.count):
+                test = Mock(id=Mock(return_value=f"fixture.Sample.test_{index}"))
+                result.startTest(test)
+                result.stopTest(test)
+        details = parallel.class_timeout_details(batch, 75, 75, rows, started=7, completed=6)
         summary = pipeline.format_timeout_summary(details, str)
 
         self.assertEqual(summary.splitlines()[2:-1], ["6 completed, 1 never started", "Slowest completed tests:",
@@ -117,6 +185,34 @@ class ParallelTimeoutReportTests(unittest.TestCase):
         self.assertLessEqual(len(summary), 800)
         self.assertIn("LongTests (8 tests)\nclass exceeded 75s", summary)
         self.assertTrue(summary.endswith("\n" + GUIDANCE))
+
+    def test_unavailable_id_or_clock_leaves_the_test_result_in_place(self):
+        class Sample(unittest.TestCase):
+            def __init__(self, id_available=True):
+                super().__init__()
+                self.id_available = id_available
+
+            def id(self):
+                if not self.id_available:
+                    raise RuntimeError("unavailable ID")
+                return super().id()
+
+            def runTest(self):
+                self.fail("original result")
+
+        start = Mock(side_effect=OSError("unavailable start time"))
+        stop = Mock(side_effect=[0, OSError("unavailable finish time")])
+        for case, clock in ((Sample(id_available=False), Mock(return_value=0)), (Sample(), start), (Sample(), stop)):
+            with self.subTest(clock=clock):
+                events = []
+                result = parallel.TimedResult(lambda *row: events.append(row))
+                with patch.object(parallel, "time", Mock(monotonic=clock)):
+                    case.run(result)
+                self.assertEqual(result.testsRun, 1)
+                self.assertEqual(len(result.failures), 1)
+                self.assertIn("AssertionError: original result", result.failures[0][1])
+                details = parallel.class_timeout_details(parallel.Batch("Sample", 1), 1, 1, events, result.testsRun)
+                self.assertEqual(details["timings"], [])
 
     def test_crowded_timeout_only_prints_the_note_beside_a_failed_retry(self):
         class Recovered(unittest.TestCase):
@@ -139,6 +235,7 @@ class ParallelTimeoutReportTests(unittest.TestCase):
                       contextlib.redirect_stdout(io.StringIO()) as output):
                     os.environ.pop(SUMMARY_ENV, None)
                     if path:
+                        path.touch()
                         os.environ[SUMMARY_ENV] = str(path)
                     runner = parallel.Runner(SimpleNamespace(jobs=1, slowest=0))
 
@@ -170,8 +267,6 @@ class ParallelTimeoutReportTests(unittest.TestCase):
                     self.assertFalse(sidecar.exists())
                     self.assertEqual(set(root.iterdir()), {root / "history.json"})
 
-
-class TimeoutSummaryRedactionTests(unittest.TestCase):
     def run_redacted_check(self, details, value):
         layer = config.RepoLayer(Path.cwd(), checks={"suite": "run suite"}, quick_checks=["suite"],
                                  parallel_checks=True)
@@ -188,11 +283,13 @@ class TimeoutSummaryRedactionTests(unittest.TestCase):
             stored.return_value = {}
             return subprocess.CompletedProcess(cmd, 1, f"failure in {value}\n", f"stderr in {value}")
 
-        with (patch.object(pipeline.environment, "stored", stored),
+        with (tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory,
+              patch.object(pipeline.environment, "stored", stored),
               patch.object(pipeline.environment, "passed", return_value=[]),
               patch.object(pipeline.vault, "hidden", side_effect=positional_redactor),
               patch.object(pipeline.util, "sh", side_effect=sh),
               patch.object(record, "timed", return_value=contextlib.nullcontext({}))):
+            run.dir = Path(directory)
             ok, report = pipeline.run_checks(layer, Path.cwd(), [], run, 30)
 
         self.assertFalse(ok)
@@ -241,8 +338,6 @@ class TimeoutSummaryRedactionTests(unittest.TestCase):
         self.assertNotIn(value, report)
         self.assertTrue(summary.endswith("\n" + GUIDANCE))
 
-
-class LocalTimeoutReportTests(unittest.TestCase):
     def run_checks(self, outputs, *, slow=()):
         commands = {name: f"run {name}" for name in (*outputs, *slow)}
         layer = config.RepoLayer(Path.cwd(), checks=commands, quick_checks=list(outputs), parallel_checks=True)
@@ -250,17 +345,22 @@ class LocalTimeoutReportTests(unittest.TestCase):
 
         def sh(cmd, *, env, **_kw):
             path = Path(env[SUMMARY_ENV])
+            self.assertEqual(path.parent, run_dir)
+            self.assertTrue(path.is_file())
             paths.append(path)
             stdout, stderr, summaries = outputs[cmd.removeprefix("run ")]
             path.write_text("".join(json.dumps(summary) + "\n" for summary in summaries))
             return SimpleNamespace(returncode=1, stdout=stdout, stderr=stderr)
 
-        with (patch.object(pipeline.util, "sh", side_effect=sh),
+        with (tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory,
+              patch.object(pipeline.util, "sh", side_effect=sh),
               patch.object(record, "timed", side_effect=lambda *_, **__: contextlib.nullcontext({}))):
-            ok, report = pipeline.run_checks(layer, Path.cwd(), [], Mock(config=config.Config(), repo=None), 30)
-        self.assertFalse(ok)
-        self.assertEqual(len(set(paths)), len(outputs))
-        self.assertFalse(any(path.exists() for path in paths))
+            run_dir = Path(directory)
+            run = Mock(config=config.Config(), repo=None, dir=run_dir)
+            ok, report = pipeline.run_checks(layer, Path.cwd(), [], run, 30)
+            self.assertFalse(ok)
+            self.assertEqual(len(set(paths)), len(outputs))
+            self.assertFalse(any(path.exists() for path in paths))
         return report
 
     def test_two_checks_append_at_most_three_summaries_after_the_full_report(self):
@@ -315,3 +415,284 @@ class LocalTimeoutReportTests(unittest.TestCase):
         self.assertGreater(len(plain) + len(summary) + 2, 8000)
         actions_log = "".join(f"2026-11-21T12:00:00Z {line}" for line in plain.splitlines(keepends=True))
         self.assertEqual(ci.excerpt(actions_log).encode(), plain.encode())
+
+
+class TimeoutDiagnosticsIsolationTests(unittest.TestCase):
+    def test_worker_writes_normal_result_when_optional_id_raises_system_exit(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            root = Path(directory)
+            (root / "test_unavailable_id.py").write_text(
+                "import unittest\n\n"
+                "class UnavailableIdTests(unittest.TestCase):\n"
+                "    ready = False\n"
+                "    @classmethod\n"
+                "    def setUpClass(cls): cls.ready = True\n"
+                "    def id(self):\n"
+                "        if self.ready and self._testMethodName == 'test_1_without_id':\n"
+                "            raise SystemExit('fixture metadata unavailable')\n"
+                "        return super().id()\n"
+                "    def test_1_without_id(self): pass\n"
+                "    def test_2_with_id(self): self.fail('original assertion')\n"
+            )
+            lifeline, held = os.pipe()
+            reports = []
+            try:
+                with parallel.timing_channel() as (reader, writer):
+                    command = [sys.executable, "-B", "-m", "tests.parallel", "--one",
+                               "test_unavailable_id.UnavailableIdTests", "--start", directory,
+                               "--lifeline", str(lifeline)]
+                    for timing, fds in (([], (lifeline,)), worker_timing(reader, writer, lifeline)):
+                        path = root / f"result-{len(reports)}.json"
+                        result = subprocess.run([*command, "--result", str(path), *timing], pass_fds=fds,
+                                                capture_output=True, text=True, timeout=2)
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        reports.append(path.read_bytes())
+                    events = parallel.timing_rows(reader)
+            finally:
+                os.close(lifeline)
+                os.close(held)
+
+        self.assertEqual(reports[1], reports[0])
+        report = json.loads(reports[1])
+        self.assertEqual(report["ran"], 2)
+        self.assertEqual(report["errors"], [])
+        self.assertIn("AssertionError: original assertion", report["failures"][0][1])
+        self.assertEqual([name for _, name, _ in events if name],
+                         ["test_unavailable_id.UnavailableIdTests.test_2_with_id"])
+
+    def test_unittest_result_hook_exceptions_still_propagate(self):
+        result = parallel.TimedResult(Mock())
+        case = unittest.TestCase()
+        for hook in ("startTest", "stopTest"):
+            with self.subTest(hook=hook), patch.object(unittest.TestResult, hook, side_effect=SystemExit(7)):
+                with self.assertRaises(SystemExit):
+                    getattr(result, hook)(case)
+
+    def test_rendered_summary_redacts_numeric_values(self):
+        secret = "83927164"
+        deadline_secret = "8.39272e+07"
+        name = "fixture.Hanging"
+        details = details_for(name)
+        details.update(count=int(secret), deadline=int(secret), completed=int(secret), never_started=int(secret))
+        details["timings"][0] = (float(secret), f"{name}.test_fast")
+        sidecar = io.BytesIO((json.dumps(details) + "\n").encode())
+        summaries = pipeline.read_timeout_summaries(
+            sidecar, 3, lambda text: pipeline.vault.hidden(text, {secret, deadline_secret}),
+        )
+        expected = (f"{name} ([redacted] tests)\nclass exceeded [redacted]s\n"
+                    "[redacted] completed, [redacted] never started\nSlowest completed tests:\n"
+                    f"  [redacted].000s {name}.test_fast\n  0.001s {name}.test_faster\n{GUIDANCE}")
+        self.assertEqual(summaries, [expected])
+
+    def test_redaction_matches_across_rendered_summary_fields(self):
+        name = "fixture.Hanging"
+        secret = "Hanging (3 tests)"
+        summary = pipeline.format_timeout_summary(details_for(name), lambda text: pipeline.vault.hidden(text, {secret}))
+        self.assertEqual(summary, summary_for(name).replace(secret, "[redacted]"))
+
+
+class TimeoutProgressRegressionTests(unittest.TestCase):
+    def test_worker_publishes_the_same_result_when_optional_id_is_cancelled(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            root = Path(directory)
+            (root / "test_cancelled_id.py").write_text(
+                "from asyncio import CancelledError\nimport unittest\n\n"
+                "class CancelledIdTests(unittest.TestCase):\n"
+                "    @classmethod\n"
+                "    def setUpClass(cls): cls.ready = True\n"
+                "    def id(self):\n"
+                "        if self.ready and self._testMethodName == 'test_cancelled_id':\n"
+                "            raise CancelledError('fixture metadata unavailable')\n"
+                "        return super().id()\n"
+                "    def test_cancelled_id(self): pass\n"
+                "    def test_normal_id(self): self.fail('original assertion')\n"
+            )
+            lifeline, held = os.pipe()
+            reports = []
+            try:
+                with parallel.timing_channel() as (reader, writer):
+                    command = [sys.executable, "-B", "-m", "tests.parallel", "--one",
+                               "test_cancelled_id.CancelledIdTests", "--start", directory, "--lifeline", str(lifeline)]
+                    for timing, fds in (([], (lifeline,)), worker_timing(reader, writer, lifeline)):
+                        path = root / f"result-{len(reports)}.json"
+                        child = subprocess.run([*command, "--result", str(path), *timing], pass_fds=fds,
+                                               capture_output=True, text=True, timeout=2)
+                        self.assertEqual(child.returncode, 0, child.stdout + child.stderr)
+                        reports.append(path.read_bytes())
+                    events = parallel.timing_rows(reader)
+            finally:
+                os.close(lifeline)
+                os.close(held)
+
+        self.assertEqual(reports[1], reports[0])
+        report = json.loads(reports[1])
+        self.assertEqual(report["ran"], 2)
+        self.assertIn("AssertionError: original assertion", report["failures"][0][1])
+        self.assertEqual([name for _, name, _ in events], ["test_cancelled_id.CancelledIdTests.test_normal_id"])
+
+    def test_missing_start_timestamp_still_counts_the_test_as_started(self):
+        batch = parallel.Batch("fixture.Sample", 3)
+        clock = Mock(monotonic=Mock(side_effect=[OSError("start time unavailable"), 2, 2.5]))
+        events = []
+        with tempfile.TemporaryFile() as counter, patch.object(parallel, "time", clock):
+            result = parallel.TimedResult(lambda *row: events.append(row), counter.fileno())
+            for name in ("fixture.Sample.test_missing", "fixture.Sample.test_timed"):
+                test = Mock(id=Mock(return_value=name))
+                result.startTest(test)
+                result.stopTest(test)
+            started = os.lseek(counter.fileno(), 0, os.SEEK_CUR)
+        details = parallel.class_timeout_details(batch, 3, 3, events, started)
+        self.assertEqual(details["never_started"], 1)
+        self.assertEqual(details["timings"], [(0.5, "fixture.Sample.test_timed")])
+
+    def test_timeout_counts_starts_with_a_full_progress_socket(self):
+        reader, writer = socket.socketpair()
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory, reader, writer:
+            writer.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+            reader.setblocking(False)
+            writer.setblocking(False)
+            with self.assertRaises(BlockingIOError):
+                while True:
+                    writer.send(b"x" * 4096)
+            with self.assertRaises(BlockingIOError):
+                writer.send(b"x")
+
+            root = Path(directory)
+            (root / "test_full_socket.py").write_text(
+                "import time\nimport unittest\n\n"
+                "class FullSocketTests(unittest.TestCase):\n"
+                "    def id(self): return None\n"
+                "    def test_1_fast(self): print('fast', flush=True)\n"
+                "    def test_2_hang(self):\n"
+                "        print('hang', flush=True)\n"
+                "        time.sleep(20)\n"
+                "    def test_3_unreached(self): print('unreached', flush=True)\n"
+            )
+            batch = parallel.Batch("test_full_socket.FullSocketTests", 3)
+            with patch.dict(os.environ, {SUMMARY_ENV: str(root / "summaries.jsonl")}):
+                runner = parallel.Runner(SimpleNamespace(start=directory, timeout=1, verbose=False))
+            runner.folder = directory
+            runner.lifeline, held = os.pipe()
+            try:
+                channel = contextlib.nullcontext((reader, writer))
+                with (patch.dict(os.environ, {"PYTHONDONTWRITEBYTECODE": "1"}),
+                      patch.object(parallel, "timing_channel", return_value=channel),
+                      patch.object(runner, "request_stacks", return_value=[])):
+                    runner.child((0, batch))
+            finally:
+                os.close(runner.lifeline)
+                os.close(held)
+
+        report = runner.results[batch.identifier]
+        self.assertIn("class exceeded 1s", report["timeout"])
+        self.assertEqual(report["output"], "fast\nhang\n")
+        self.assertEqual(report["timeout_details"]["never_started"], 1)
+        self.assertEqual(report["timeout_details"]["timings"], [])
+
+
+class TimeoutBackpressureTests(unittest.TestCase):
+    def test_worker_report_matches_baseline_when_optional_id_raises_keyboard_interrupt(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            root = Path(directory)
+            (root / "test_interrupted_id.py").write_text(
+                "import unittest\n\n"
+                "class InterruptedIdTests(unittest.TestCase):\n"
+                "    @classmethod\n"
+                "    def setUpClass(cls): cls.ready = True\n"
+                "    def id(self):\n"
+                "        if self.ready and self._testMethodName == 'test_missing_id':\n"
+                "            raise KeyboardInterrupt('fixture metadata unavailable')\n"
+                "        return super().id()\n"
+                "    def test_missing_id(self): pass\n"
+                "    def test_normal_id(self): self.fail('original assertion')\n"
+            )
+            lifeline, held = os.pipe()
+            reports = []
+            try:
+                with parallel.timing_channel() as (reader, writer):
+                    command = [sys.executable, "-B", "-m", "tests.parallel", "--one",
+                               "test_interrupted_id.InterruptedIdTests", "--start", directory,
+                               "--lifeline", str(lifeline)]
+                    for timing, fds in (([], (lifeline,)), worker_timing(reader, writer, lifeline)):
+                        path = root / f"result-{len(reports)}.json"
+                        child = subprocess.run([*command, "--result", str(path), *timing], pass_fds=fds,
+                                               capture_output=True, text=True, timeout=2)
+                        self.assertEqual(child.returncode, 0, child.stdout + child.stderr)
+                        reports.append(path.read_bytes())
+                    events = parallel.timing_rows(reader)
+            finally:
+                os.close(lifeline)
+                os.close(held)
+
+        self.assertEqual(reports[1], reports[0])
+        report = json.loads(reports[1])
+        self.assertEqual(report["ran"], 2)
+        self.assertIn("AssertionError: original assertion", report["failures"][0][1])
+        self.assertEqual([name for _, name, _ in events], ["test_interrupted_id.InterruptedIdTests.test_normal_id"])
+
+    def test_timeout_counts_all_completions_and_keeps_available_timing_with_full_channel(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            root = Path(directory)
+            (root / "test_backpressure.py").write_text(
+                "import time\nimport unittest\n\n"
+                "class BackpressureTests(unittest.TestCase):\n"
+                "    def id(self):\n"
+                "        if self._testMethodName == 'test_2_without_id': raise RuntimeError()\n"
+                "        return super().id()\n"
+                "    def test_1_fast(self): print('fast', flush=True)\n"
+                "    def test_2_without_id(self): print('without ID', flush=True)\n"
+                "    def test_3_hang(self): time.sleep(20)\n"
+                "    def test_4_unreached(self): self.fail('unreached')\n"
+            )
+            batch = parallel.Batch("test_backpressure.BackpressureTests", 4)
+            with patch.dict(os.environ, {SUMMARY_ENV: str(root / "summaries.jsonl")}):
+                runner = parallel.Runner(SimpleNamespace(start=directory, timeout=1, verbose=False))
+            runner.folder = directory
+            runner.lifeline, held = os.pipe()
+            try:
+                with parallel.timing_channel() as (reader, writer):
+                    # Fill the receiver past the point where a timing snapshot fits.
+                    with self.assertRaises(OSError) as full:
+                        while True:
+                            writer.send(b"x" * 32)
+                    self.assertIn(full.exception.errno, (errno.EAGAIN, errno.EWOULDBLOCK, errno.ENOBUFS))
+                    channel = contextlib.nullcontext((reader, writer))
+                    with (patch.dict(os.environ, {"PYTHONDONTWRITEBYTECODE": "1"}),
+                          patch.object(parallel, "timing_channel", return_value=channel),
+                          patch.object(runner, "request_stacks", return_value=[])):
+                        runner.child((0, batch))
+            finally:
+                os.close(runner.lifeline)
+                os.close(held)
+
+        report = runner.results[batch.identifier]
+        self.assertIn("class exceeded 1s", report["timeout"])
+        self.assertEqual(report["output"], "fast\nwithout ID\n")
+        details = report["timeout_details"]
+        self.assertEqual(details["completed"], 2)
+        self.assertEqual(details["never_started"], 1)
+        self.assertEqual([name for _, name in details["timings"]], [f"{batch.identifier}.test_1_fast"])
+
+    def test_worker_keeps_only_the_slowest_five_before_the_deadline(self):
+        with parallel.timing_channel() as (reader, writer):
+            reader.send(b"10")
+            publisher = parallel.TimingPublisher(writer, reader)
+            for finished, duration in enumerate((1, 2, 3, 4, 5, 6, 7), 1):
+                publisher.record(finished, f"fixture.Sample.test_{finished}", duration)
+            publisher.record(11, "fixture.Sample.test_grace", 11)
+            rows = parallel.timing_rows(reader)
+
+        self.assertEqual([duration for _, _, duration in rows], [7, 6, 5, 4, 3])
+
+    def test_keyboard_interrupt_from_test_body_or_result_hook_still_propagates(self):
+        class Interrupted(unittest.TestCase):
+            def runTest(self):
+                raise KeyboardInterrupt("test body")
+
+        with self.assertRaisesRegex(KeyboardInterrupt, "test body"):
+            Interrupted().run(parallel.TimedResult(Mock()))
+        for hook in ("startTest", "stopTest"):
+            result = parallel.TimedResult(Mock())
+            with self.subTest(hook=hook), patch.object(unittest.TestResult, hook, side_effect=KeyboardInterrupt(hook)):
+                with self.assertRaisesRegex(KeyboardInterrupt, hook):
+                    getattr(result, hook)(Interrupted())
