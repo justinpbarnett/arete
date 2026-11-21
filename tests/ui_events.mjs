@@ -144,6 +144,7 @@ async function snapshots() {
   const log = [];
   const reportTicks = [];
   const { setTimeout: timeout, setInterval: interval } = globalThis;
+  const now = Date.now;
   globalThis.setTimeout = (fn, ms, ...args) => ms === 1000 ? reportTicks.push(fn) : timeout(fn, ms, ...args);
   let refresh;
   globalThis.setInterval = (fn, ms, ...args) => ms === 5000 ? (refresh = fn, null) : interval(fn, ms, ...args);
@@ -152,8 +153,10 @@ async function snapshots() {
   let needsYou = 2;
   let asks = { asks: [] };
   let slots = 3;
+  let notedRun = "second";
   let slotNote = "";
   let health = "ok";
+  let serve;
   let waiting = { rows: { tickets: [], quiet_minutes: 5 } };
   let detailUnavailable = false;
   let models = [];
@@ -167,14 +170,15 @@ async function snapshots() {
   const snapshots = () => reads("live").length + reads("runs").length + reads("run").length + reads("/api/v1/runs").length;
   const running = () => runs.filter((run) => run.status === "running");
   const live = () => ({ waiting, live: { rows: { slots, max_parallel: 3,
-    runs: running().map(({ status, ...row }) => ({ ...row, slot: row.id === "second" ? slotNote : "" })) } } });
-  const sidebar = () => ({ running: running().length, needs_you: needsYou, health });
+    runs: running().map(({ status, ...row }) => ({ ...row, slot: row.id === notedRun ? slotNote : "" })) } } });
+  const sidebar = () => ({ running: running().length, needs_you: needsYou, health, serve });
   globalThis.fetch = async (path, options) => {
     const url = new URL(path, "http://dashboard.test");
     const view = url.searchParams.get("view");
     const call = { key: view ?? url.pathname, headers: options.headers, body: options.body };
     calls.push(call);
     assert.equal(options.headers.get("X-Arete-Client"), "web/1.1");
+    if (url.pathname === "/api/v1/events") return new Promise((respond) => { call.respond = respond; });
     if (url.pathname.endsWith("/stop")) return json(writeConflict, 409);
     if (view === "health" || view === "live" && missingShell) {
       call.status = 404;
@@ -385,9 +389,70 @@ async function snapshots() {
     page.dispatchEvent(new Event("pageshow"));
     await until(() => last().url.searchParams.get("since") === "5.51", "304 keeps the cached snapshot cursor");
     seq = "6.1";
+    Object.assign(runs[2], { status: "running", version: 3 });
     last().send({ kind: "reset", reason: "epoch" }, "reset");
     await until(() => last().url.searchParams.get("since") === "6.1", "reset opens from a fresh snapshot");
     assert.equal(reads("live").at(-1).headers.get("If-None-Match"), null);
+
+    let clock = now();
+    Date.now = () => clock;
+    const latestPoll = () => reads("/api/v1/events").at(-1);
+    last().open();
+    last().send({ kind: "serve.beat", at: "last stream beat", age_seconds: 40 }, "serve.beat", seq);
+    for (let i = 0; i < 3; i++) last().onerror();
+    const emptyPoll = () => json({ events: [], next: seq, reset: null });
+    clock += 25000;
+    latestPoll().respond(emptyPoll());
+    await until(() => reads("/api/v1/events").length === 2, "long polling continues after an idle response");
+    assert.equal(latestPoll().headers.get("Last-Event-ID"), seq);
+    assert.equal(ui.connectivity(feed.snapshot.value, clock), "STALE");
+
+    const previousTag = reads("live").at(-1).tag;
+    const beforePollRefresh = snapshots();
+    const idlePoll = latestPoll();
+    needsYou = 5;
+    asks = { asks: [{ id: "idle-question" }] };
+    slots = 0;
+    notedRun = "third";
+    slotNote = "waiting for review";
+    health = "warn";
+    waiting = { rows: { tickets: [{ ticket: "repo#43", comments: 1 }], quiet_minutes: 5 } };
+    serve = { at: "new snapshot beat", age_seconds: 2, alive: true };
+    refresh();
+    await until(() => feed.snapshot.value.needsYou === 5, "fields refresh while the next long poll is idle");
+    assert.equal(latestPoll(), idlePoll);
+    assert.equal(reads("live").at(-1).headers.get("If-None-Match"), previousTag);
+    assert.equal(snapshots(), beforePollRefresh + 1);
+    assert.deepEqual(feed.snapshot.value.questions.data, asks);
+    assert.equal(feed.snapshot.value.slots, slots);
+    assert.equal(feed.snapshot.value.runs.find((row) => row.id === notedRun).slot, slotNote);
+    assert.deepEqual(feed.snapshot.value.live.waiting, waiting);
+    assert.equal(feed.snapshot.value.health, health);
+    assert.deepEqual(feed.snapshot.value.serve, serve);
+    assert.equal(feed.snapshot.value.received, clock);
+    assert.equal(ui.connectivity(feed.snapshot.value, clock), "");
+
+    clock += 5000;
+    refresh();
+    await until(() => feed.snapshot.value.received === clock, "304 revalidates the long-poll serve status");
+    assert.equal(reads("live").at(-1).status, 304);
+    assert.equal(reads("/api/sidebar").length, 0);
+
+    clock += 20000;
+    seq = "6.2";
+    Object.assign(runs[2], { status: "pr", version: 4 });
+    idlePoll.respond(json({ events: [event(seq, "run.ended", runs[2])], next: seq, reset: null }));
+    await until(() => reads("/api/v1/events").length === 3, "long polling continues from the run end");
+    assert.equal(feed.snapshot.value.running, 0);
+    assert.equal(ui.runView.value.detail.run.status, "pr");
+    assert.equal(ui.runView.value.queue.length, 30);
+    assert.equal(latestPoll().headers.get("Last-Event-ID"), seq);
+
+    clock += 25000;
+    const beforeRecovery = streams.length;
+    latestPoll().respond(emptyPoll());
+    await until(() => streams.length === beforeRecovery + 1, "SSE resumes after idle long polling");
+    assert.equal(last().url.searchParams.get("since"), seq);
 
     missingShell = true;
     last().open();
@@ -397,13 +462,14 @@ async function snapshots() {
     assert.equal(reads("/api/sidebar").length, 0);
     assert.equal(feed.snapshot.value.fault, null);
     const settings = ui.live("settings", "health");
-    await until(() => ui.screenReads.value.health?.data, "404 falls back to legacy shell and Health");
+    await until(() => ui.screenReads.value.health?.data && !last().url.searchParams.has("turns"),
+      "404 falls back to legacy shell and Health while the stream drops the run subscription");
     assert.equal(ui.screenReads.value.health.error, null);
     assert.equal(reads("/api/sidebar").length, 1);
     last().open();
-    last().send(event("6.2", "run.started", { id: "new", status: "running", version: 1 }));
+    last().send(event("6.3", "run.started", { id: "new", status: "running", version: 1 }));
     assert.equal(settings.snapshot.value.running, 1);
-    last().send({ kind: "serve.beat" }, "serve.beat", "6.2");
+    last().send({ kind: "serve.beat" }, "serve.beat", "6.3");
     const shellReads = reads("live").length;
     refresh();
     await until(() => reads("live").length > shellReads, "connected legacy shell still probes v1");
@@ -417,6 +483,7 @@ async function snapshots() {
     assert.match(clientNotice.value, /Reload the page/);
   } finally {
     ui.stop();
+    Date.now = now;
     globalThis.setTimeout = timeout;
     globalThis.setInterval = interval;
   }

@@ -13,7 +13,7 @@ const cache = { sidebar: null, live: null, questions: null, sidebarAt: 0, errors
 export const screenReads = signal({});
 let active;
 let feed;
-let connected = false;
+let transport = null;
 
 const asksCount = (asks) => {
   if (!asks) return null;
@@ -172,7 +172,8 @@ function publishShell(result) {
 }
 
 function publishShellRefresh(run, result) {
-  if (!result?.data || result.unchanged || newer(run.positions.get("shell"), result.seq)) return;
+  const polling = transport === "poll";
+  if (!result?.data || (result.unchanged && !polling) || newer(run.positions.get("shell"), result.seq)) return;
   const { sidebar, view, asks } = result.data;
   const rows = cache.live.live.rows;
   const projected = view.live.rows;
@@ -181,7 +182,8 @@ function publishShellRefresh(run, result) {
     const current = byId.get(row.id);
     return current ? { ...row, slot: current.slot, paid: current.paid, seconds: current.seconds } : row;
   }) ?? (result.seq === run.positions.get("shell") ? projected?.runs : undefined);
-  cache.sidebar = { ...sidebar, running: cache.sidebar.running, serve: cache.sidebar.serve };
+  cache.sidebar = { ...sidebar, running: cache.sidebar.running, serve: polling ? sidebar.serve : cache.sidebar.serve };
+  if (polling) cache.sidebarAt = Date.now();
   cache.live = { ...view, live: { ...view.live, rows: rows || projected ? { ...rows, ...projected, runs } : undefined } };
   cache.questions = { data: asks };
   snapshot.value = snapshotOf();
@@ -328,13 +330,13 @@ async function flush(run) {
   const { signal } = run.controller;
   const keys = [...run.dirty.keys()];
   const periodicShell = run.dirty.get("shell");
-  const connectedAtStart = connected;
+  const connectedAtStart = Boolean(transport);
   const missingDetail = keys.includes("detail") && !rs.detail;
   const refreshShellOnly = periodicShell && connectedAtStart && !run.incoherent && run.positions.has("shell") && !missingDetail;
   const refreshDetailOnly = run.dirty.get("detail") && connectedAtStart && !run.incoherent && !missingDetail;
   run.dirty.clear();
   const latest = new Map();
-  const readShell = () => shell(signal, () => !periodicShell || !(connectedAtStart || connected));
+  const readShell = () => shell(signal, () => !periodicShell || !(connectedAtStart || transport));
   const read = async (key) => {
     const result = key === "shell" ? await readShell() : await run.reads[key](signal);
     if (!result) return null;
@@ -479,7 +481,7 @@ function update(event) {
     publishRuns();
     invalidate(run, all(run));
   } else if (event.kind === "transport") {
-    connected = event.connected;
+    transport = event.transport;
   } else if (event.kind === "serve.beat") {
     if (event.at && cache.sidebar) {
       cache.sidebar = { ...cache.sidebar, serve: event };
@@ -501,7 +503,7 @@ function connect(run) {
 function disconnect() {
   feed?.close();
   feed = null;
-  connected = false;
+  transport = null;
 }
 
 globalThis.addEventListener?.("pagehide", disconnect);
@@ -551,7 +553,7 @@ export function live(screen, id = "", repo = "") {
     if (run.queueError || needsDetail && !rs.detail) keys.push("queue");
     if (needsDetail) keys.push("detail");
     if (transcript && rs.detail?.run.status === "running") keys.push("transcript");
-    invalidate(run, connected && !run.incoherent ? keys : all(run), true);
+    invalidate(run, transport && !run.incoherent ? keys : all(run), true);
   };
   run.visibility = () => refresh(true);
   document.addEventListener("visibilitychange", run.visibility);

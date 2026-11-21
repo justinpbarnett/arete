@@ -47,7 +47,7 @@ export function openEvents(update) {
   let position, source, pending, timer, release, checkLease;
   let ready = false;
   let leader = false;
-  let connected = false;
+  let transport = null;
   let failures = 0;
   let recoverAt = 0;
   let lastPulse = 0;
@@ -70,10 +70,10 @@ export function openEvents(update) {
     deliver(event);
   }
 
-  function status(up) {
-    if (connected === up) return;
-    connected = up;
-    share({ kind: "transport", connected });
+  function status(next) {
+    if (transport === next) return;
+    transport = next;
+    share({ kind: "transport", transport });
   }
 
   function listen() {
@@ -103,7 +103,7 @@ export function openEvents(update) {
       pending?.abort();
       clearTimeout(timer);
       timer = null;
-      status(false);
+      status(null);
     }
   }
 
@@ -157,13 +157,13 @@ export function openEvents(update) {
       if (event.kind === "serve.beat") checkLease?.();
       share({ ...event, id: message.lastEventId });
     };
-    connection.onopen = () => { if (source === connection) status(true); };
+    connection.onopen = () => { if (source === connection) status("stream"); };
     connection.onmessage = receive;
     connection.addEventListener("serve.beat", receive);
     connection.addEventListener("reset", receive);
     connection.onerror = () => {
       if (source !== connection) return;
-      status(false);
+      status(null);
       if (++failures >= 3) {
         stopSource();
         recoverAt = Date.now() + recoveryDelay;
@@ -185,7 +185,7 @@ export function openEvents(update) {
       if (controller.signal.aborted || !leader) return;
       if (!response.ok || !cursor(result?.next) || !Array.isArray(result.events)) throw new Error("Malformed event response");
       checkLease?.();
-      status(true);
+      status("poll");
       if (result.reset) share({ kind: "reset" });
       else {
         for (const event of result.events) if (event) share(event);
@@ -195,7 +195,7 @@ export function openEvents(update) {
       }
     } catch {
       if (leader && !controller.signal.aborted) {
-        status(false);
+        status(null);
         later(retryDelay);
       }
     } finally {
@@ -223,7 +223,7 @@ export function openEvents(update) {
       if (lifetime.signal.aborted) return;
       if (data.kind === "hello") {
         announce();
-        if (leader) send({ kind: "transport", connected });
+        if (leader) send({ kind: "transport", transport });
       } else if (data.kind === "turns") subscribe(data.tab, data.run);
       else if (data.kind === "vacant") checkLease?.(data.tab);
       else if (!leader) deliver(data);
