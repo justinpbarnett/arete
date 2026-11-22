@@ -607,6 +607,7 @@ def claude_reader(header: dict) -> Callable[[dict], list[dict]]:
     counted: set[str] = set()
     resumed = header.get("resume") if isinstance(header.get("resume"), dict) else {}
     spent_before = float(resumed.get("spent_usd") or 0)
+    usage_rates = header.get("usage_rates")
 
     def read(e: dict) -> list[dict]:
         message = e.get("message") if isinstance(e.get("message"), dict) else {}
@@ -637,9 +638,11 @@ def claude_reader(header: dict) -> Callable[[dict], list[dict]]:
                     out.append({"kind": "message", "role": "user", "text": b.get("text", "")})
         elif e.get("type") == "result":
             session_cost = e.get("total_cost_usd")
+            tokens = agent.claude_tokens(e.get("usage") or {})
+            cost = (agent.token_cost(usage_rates, **tokens) if usage_rates is not None else
+                    None if session_cost is None else max(0.0, float(session_cost) - spent_before))
             out.append({"kind": "usage", "total": True, "model": next(iter(e.get("modelUsage") or {}), ""),
-                        **agent.claude_tokens(e.get("usage") or {}),
-                        "cost_usd": None if session_cost is None else max(0.0, float(session_cost) - spent_before)})
+                        **tokens, "cost_usd": cost})
         return out
 
     return read
