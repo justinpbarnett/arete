@@ -15,6 +15,8 @@ class VerifyPromptEnvTests(unittest.TestCase):
         self.assertEqual(prompt.count("env ARETE_SERVER="), 1)
         self.assertIn("`<allowed command> env API_KEY=arete-placeholder-1 <program>`", prompt)
         self.assertNotRegex(prompt, r"`[A-Z_]+=[^`]+ [^`]+`")
+        self.assertIn("solely because it starts with `NAME=value`, retry once", prompt)
+        self.assertIn("For any other refusal, or if the retry is refused", prompt)
 
     def test_verify_prompt_prefers_a_configured_relative_sandbox(self):
         for rule in ("./sandbox *", "./sandbox env *"):
@@ -42,7 +44,7 @@ class VerifyPromptEnvTests(unittest.TestCase):
         self.assertEqual(prompt.count("env ARETE_SERVER="), 1)
 
     def test_verify_prompt_prefers_the_first_wrapper_with_options(self):
-        for wrapper in ("/usr/bin/env --", "/usr/bin/env -i --"):
+        for wrapper in ("verify-wrapper --", f"{self.HARNESS} -i --"):
             with self.subTest(wrapper=wrapper):
                 rule = f"{wrapper} *"
                 prompt = self.render_prompt([rule, f"{self.HARNESS} *"])
@@ -51,6 +53,23 @@ class VerifyPromptEnvTests(unittest.TestCase):
                 self.assertEqual(prompt.count("For example, run"), 1)
                 command = example.replace("<url>", "http://127.0.0.1:51390")
                 self.assertTrue(pi_shell.rules_match(command, (f"Bash({rule})",)))
+
+    def test_verify_prompt_skips_env_executables_and_uses_the_next_wrapper(self):
+        for rule in ("/usr/bin/env -u ARETE_REVIEW_UNUSED -- *", "/usr/bin/env -i -- *", "env *",
+                     "'/usr/bin/env' *", "env env ARETE_SERVER=* uv run arete task list"):
+            with self.subTest(rule=rule):
+                prompt = self.render_prompt([rule, "verify-wrapper *"])
+                self.assertIn("For example, run `verify-wrapper env ARETE_SERVER=<url> uv run arete task list`", prompt)
+                self.assertEqual(prompt.count("For example, run"), 1)
+
+    def test_verify_prompt_skips_an_env_rule_with_a_joined_terminal_wildcard(self):
+        rule = f"{self.HARNESS} env ARETE_SERVER=* uv run arete task list*"
+        prompt = self.render_prompt([rule])
+        self.assertIn("`<allowed command> env NAME=value <program> …`", prompt)
+        self.assertNotIn("For example, run", prompt)
+
+        prompt = self.render_prompt([rule, "verify-wrapper *"])
+        self.assertIn("For example, run `verify-wrapper env ARETE_SERVER=<url> uv run arete task list`", prompt)
 
     def test_verify_prompt_fills_wildcards_in_an_explicit_env_rule(self):
         for wrapper, assignments, example_assignments in (

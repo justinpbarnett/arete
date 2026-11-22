@@ -38,7 +38,9 @@ SHELL_QUOTING = r"""'[^'\n]*'|"(?:[^"\\\n]|\\.)*"|\\."""
 SHELL_WORD_BREAKS = r"""\s'"\\;&|()<>"""
 SHELL_LITERAL = rf"(?:[^{SHELL_WORD_BREAKS}*?]|{SHELL_QUOTING})"
 ENV_RULE_PREFIX = re.compile(
-    rf"(?![A-Za-z_][A-Za-z0-9_]*=){SHELL_LITERAL}+[ \t]+(?:-{SHELL_LITERAL}*[ \t]+)*(?P<env>env[ \t]+)?")
+    rf"(?![A-Za-z_][A-Za-z0-9_]*=)(?P<program>{SHELL_LITERAL}+)[ \t]+"
+    rf"(?:-{SHELL_LITERAL}*[ \t]+)*(?P<env>env[ \t]+)?")
+JOINED_TERMINAL_WILDCARD = re.compile(r"[^ \t]\*[ \t]*$")
 ENV_ASSIGNMENT = re.compile(
     rf"(?P<name>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>(?:[^{SHELL_WORD_BREAKS}]|{SHELL_QUOTING})*)(?P<space>[ \t]+|$)")
 EXAMPLE_SERVER_PORT = "51390"
@@ -370,7 +372,10 @@ def trusted_wrapper(executable: str) -> bool:
 def env_example(allow_bash: list[str], url: str) -> str:
     for pattern in allow_bash:
         prefix = ENV_RULE_PREFIX.match(pattern)
-        if not prefix:
+        if not prefix or JOINED_TERMINAL_WILDCARD.search(pattern):
+            continue
+        program, = shlex.split(prefix["program"], comments=False)
+        if Path(program).name == "env":
             continue
         args = pattern[prefix.end():]
         if args == "*":
