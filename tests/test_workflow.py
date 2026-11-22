@@ -8777,6 +8777,31 @@ class ReviewRepairPromptTests(unittest.TestCase):
         self.assertIn("Keep all other changes within what the findings ask. No scope growth", rules)
 
 
+class ReviewScopePromptTests(unittest.TestCase):
+    def setUp(self):
+        brief = prompt_loader.Brief("fixture", "test checkout", "#824", "Review scope", "Review the stated scope.")
+        self.rendered = brief.prompt("review", plan="", checks="", evidence="", compare="abc1234", diff="", earlier="")
+
+    def test_regression_uses_the_starting_commit(self):
+        blockers = self.rendered.split("## Blockers\n", 1)[1].split("\n## Notes", 1)[0]
+        blockers = " ".join(blockers.split())
+        self.assertIn("`regression`: something that worked on abc1234, the commit this change starts from", blockers)
+        self.assertIn(
+            "A case that worked in an earlier revision of this PR is a regression only if it also worked on abc1234.",
+            blockers,
+        )
+
+    def test_unnamed_cases_and_existing_command_gaps_are_major_notes(self):
+        notes = self.rendered.split("## Notes\n", 1)[1].split("\n## Evidence", 1)[0]
+        major = " ".join(notes.split("- `major`: ", 1)[1].split("\n- `minor`:", 1)[0].split())
+        self.assertIn(
+            "A defect involving a form of a configured value, an input shape, or a runner the issue does not name "
+            "is a note unless a Done when line names it.",
+            major,
+        )
+        self.assertIn("A gap that the same command also encounters on abc1234 is a note.", major)
+
+
 class ReviewTests(unittest.TestCase):
     BLOCKER: ClassVar[dict] = {"file": "notes.txt", "problem": "fixture blocker", "severity": "blocker", "category": "issue"}
 
