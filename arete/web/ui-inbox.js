@@ -80,7 +80,7 @@ function detailFor({ kind, item: x }) {
           `Write this rule to ${x.repo}/${x.file} and push it?`, stated("Rule approved for writing")),
         ...(x.status === "filing" ? [] : [option("Reject rule", `/api/proposals/${x.id}/reject`, "Reject this proposed rule?", stated("Rejected the proposed rule"))])] };
     default:
-      return { body: x.change, why: kind === "hand" ? "Make the change yourself before marking it done." : "File this fact by hand before marking it done.",
+      return { body: x.change, why: kind === "hand" ? "Review the proposal and make any approved change yourself." : "File this fact by hand before marking it done.",
         options: [option("Mark done", `/api/proposals/${x.id}/done`, "Mark this proposal done without making any changes?", stated("Marked done"))] };
   }
 }
