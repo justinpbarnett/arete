@@ -131,9 +131,10 @@ class Runner:
         self.first_failures = {}
         try:
             with open(HISTORY) as handle:
-                self.history = json.load(handle)
+                history = json.load(handle)
         except (OSError, ValueError):
-            self.history = {}
+            history = {}
+        self.history = history if isinstance(history, dict) else {}
 
     def kill(self, process):
         try:
@@ -372,10 +373,20 @@ class Runner:
                     self.show_failures(identifier, first)
                 self.show_failures(identifier, report)
         try:
-            temporary = f"{HISTORY}.{os.getpid()}.tmp"
-            with open(temporary, "w") as handle:
-                json.dump({name: report["seconds"] for name, report in self.results.items()}, handle)
-            os.replace(temporary, HISTORY)
+            with open(f"{HISTORY}.lock", "a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                try:
+                    with open(HISTORY) as handle:
+                        history = json.load(handle)
+                except (OSError, ValueError):
+                    history = {}
+                if not isinstance(history, dict):
+                    history = {}
+                history.update({name: report["seconds"] for name, report in self.results.items()})
+                temporary = f"{HISTORY}.{os.getpid()}.tmp"
+                with open(temporary, "w") as handle:
+                    json.dump(history, handle)
+                os.replace(temporary, HISTORY)
         except OSError:
             pass
         if self.args.slowest:
