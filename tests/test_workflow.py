@@ -4279,8 +4279,6 @@ class CatchUpCleanupTests(unittest.TestCase):
         output = self.wt / "check-output"
         self.assertFalse((output / "nested/result").exists())
         self.assertFalse((output / "link").is_symlink())
-        if output.exists():
-            self.require_directory_removal()
         self.assertTrue(caught.exception.candidate_restored, (run.dir / "run.log").read_text())
         self.assertFalse(output.exists())
 
