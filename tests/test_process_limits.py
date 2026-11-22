@@ -403,8 +403,8 @@ tracker = "local"
 pipeline = true
 '''
         paths.CONFIG_FILE.write_text(cfg_text.format(limit=1, runs=1))
-        layer = config.RepoLayer(self.root / "layer", verify=config.Verify(), payment_modes=("subscription",),
-                                 routing_fallback=False,
+        layer = config.RepoLayer(self.root / "layer", verify=config.Verify(),
+                                 routing=config.Routing(fallback=False, payment_modes=("subscription",)),
                                  max_run_minutes=40, max_verify_minutes=15, max_repair_cycles=1,
                                  orchestration=config.Orchestration(max_workers=1, max_decisions=16, max_actions=64),
                                  checks={"lint": "sh tools/lint-arete", "compile": "true", "imports": "true",

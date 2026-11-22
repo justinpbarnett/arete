@@ -165,7 +165,7 @@ def settings(cfg: config.Config, policy: Policy) -> tuple[config.Repo, config.Re
                   and layer.verify and not layer.verify.start and not layer.verify.probes
                   and set(layer.checks) >= {"lint", "compile", "imports", "web", "behavior"}
                   and layer.checks["lint"] == "sh tools/lint-arete"
-                  and (layer.payment_modes or cfg.payment_modes) == ("subscription",)
+                  and (layer.routing.payment_modes or cfg.routing.payment_modes) == ("subscription",)
                   and (control.runner, control.model, control.effort) == ("pi", "openai/gpt-6.2-sol", "low")
                   and check.runner == "pi" and not control.fallback and not check.fallback
                   and cfg.jev.model == "jev-latest" and cfg.jev_allowed([repo])
