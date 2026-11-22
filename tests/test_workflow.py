@@ -8611,6 +8611,32 @@ class MergeCheckJourneyTests(unittest.TestCase):
         self.assertIn("2. [ordinary step 2] Inspect inventory", self.agent.call_args.args[2])
 
 
+class ReviewRepairPromptTests(unittest.TestCase):
+    brief = prompt_loader.Brief("fixture", "test checkout", "#817", "Review and repair", "Cover analogous paths.")
+
+    def test_review_checks_and_reports_analogous_paths_before_holding(self):
+        rendered = self.brief.prompt("review", plan="", checks="", evidence="", compare="", diff="", earlier="")
+        blockers = rendered.split("## Blockers\n", 1)[1].split("\n## Notes", 1)[0]
+        blockers = " ".join(blockers.split())
+        self.assertIn(
+            "Before holding on a blocker, check every other path in this diff where the same kind of problem can occur.",
+            blockers,
+        )
+        self.assertIn("List each failing path as its own blocker in the same review.", blockers)
+
+    def test_repair_fixes_and_names_analogous_paths_within_scope(self):
+        rendered = self.brief.prompt("repair", plan="", source="fixture", findings="Fix the named path.", checks="")
+        rules = rendered.split("## Rules\n", 1)[1].split("\n## What to return", 1)[0]
+        rules = " ".join(rules.split())
+        self.assertIn(
+            "fix the named path and every other path in the change where the same problem occurs.",
+            rules,
+        )
+        self.assertIn("These fixes are part of what the finding asks.", rules)
+        self.assertIn("Name each extra path you fixed in the summary.", rules)
+        self.assertIn("Keep all other changes within what the findings ask. No scope growth", rules)
+
+
 class ReviewTests(unittest.TestCase):
     BLOCKER: ClassVar[dict] = {"file": "notes.txt", "problem": "fixture blocker", "severity": "blocker", "category": "issue"}
 

@@ -56,6 +56,10 @@ real caller takes:
 For each blocker set `severity` to `blocker` and `category` to the test it meets, and in `problem` name the path: who
 or what does what, and what goes wrong. If you cannot name that path, it is not a blocker.
 
+Before holding on a blocker, check every other path in this diff where the same kind of problem can occur. For example,
+check every place the change writes the same data or every caller of the changed function. List each failing path as
+its own blocker in the same review.
+
 ## Notes
 
 Everything else is a note. Notes never stop the merge; they go on the PR.
