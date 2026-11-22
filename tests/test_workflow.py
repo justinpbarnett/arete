@@ -6849,6 +6849,35 @@ signal.pause()
         restore.assert_not_called()
         self.assertIn(f"left alone for {tip} ({error})", self.server.say.call_args.args[0])
 
+
+class StopDeployProcessPermissionTests(unittest.TestCase):
+    def process(self, *waits):
+        proc = mock.Mock(pid=4242)
+        proc.wait.side_effect = list(waits)
+        return proc
+
+    def kill(self, signals):
+        def killpg(pid, sig):
+            signals.append(sig)
+            if sig == signal.SIGKILL:
+                raise PermissionError
+        return killpg
+
+    def test_permission_error_after_exit_on_term_still_waits_twice(self):
+        proc = self.process(0, 0)
+        signals = []
+        with mock.patch.object(util.os, "killpg", self.kill(signals)):
+            util._stop_deploy_process(proc, None)
+        self.assertEqual(signals, [signal.SIGTERM, signal.SIGKILL])
+        self.assertEqual(proc.wait.call_count, 2)
+
+    def test_permission_error_while_still_running_raises(self):
+        proc = self.process(subprocess.TimeoutExpired("git", 1), 0)
+        signals = []
+        with (mock.patch.object(util.os, "killpg", self.kill(signals)),
+              self.assertRaisesRegex(util.DeployStillRunning, "could not confirm Git stopped")):
+            util._stop_deploy_process(proc, None)
+
     def test_timed_out_merge_releases_its_lock_and_retries(self):
         (self.writer / "arete" / "fixture.py").write_text("version = 2\n")
         (self.writer / "arete" / "fresh.py").write_text("added = True\n")
