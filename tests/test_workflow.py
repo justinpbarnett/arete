@@ -2587,7 +2587,7 @@ class VerifierMeasurementPublicationTests(PublicationFixture):
         limitation = "The verifier could not time the class alone because sandbox migrations were included."
         verified = verify.Verified("pass", limitation, checks=[
             {"what": "Rendered controller rule", "how": "Read the rendered prompt", "saw": "Rule present", "passed": True},
-        ])
+        ], unmeasured_requirements=[requirement])
         pr = "https://github.com/fixture/repo/pull/7"
         with (mock.patch.object(pipeline, "check_in_use", return_value=verified) as check,
               mock.patch.object(pipeline, "commit_and_push"),
@@ -2620,8 +2620,8 @@ class VerifierMeasurementPublicationTests(PublicationFixture):
         for body in (create.call_args.args[4], edit.call_args.args[1]):
             self.assertIn(f"## Summary\n\n{changes}", body)
             self.assertIn(limitation, body)
-            self.assertIn(f"## Unverified requirement\n\n{requirement}", body)
-            self.assertIn(f"**Recorded measurement**\n\n{job.build_summary}", body)
+            self.assertIn(pipeline.unverified_measurement_section(
+                {"requirement": requirement, "measurement": job.build_summary}), body)
 
 
 class MeasurementPublicationRetryTests(AutomaticCIRerunFixture, unittest.TestCase):
@@ -2640,42 +2640,85 @@ class MeasurementPublicationRetryTests(AutomaticCIRerunFixture, unittest.TestCas
         self.assertEqual(pr, self.checkout.pr)
         self.pr_text = gh.outgoing(body, link)
 
-    def test_refreshing_a_standing_pr_measurement_preserves_the_ci_stop_for_replacement(self):
+    def test_standing_pr_preserves_unmarked_and_fenced_disclosures(self):
+        checkout = self.checkout
+        section = pipeline.unverified_measurement_section(self.disclosure)
+        lookalike = "## Unverified requirement\n\nMaintainer's requirement.\n\n**Recorded measurement**\n\nOwner: 3 s."
+        example = f"   ~~~~markdown\n{section}~~~\n   ~~~~"
+        self.pr_text += f"\n\n{example}\n\n{lookalike}"
+        self.pr_text = ci.with_section(self.pr_text, ci.section([], 0, "Checks passed."))
+        original = self.pr_text
+
+        pipeline.sync_pr_bodies(self.run, self.build.ticket, [checkout], [], [checkout], [], "", "", self.link)
+        self.body.assert_not_called()
+        self.assertEqual(self.pr_text, original)
+
+        pipeline.sync_pr_bodies(self.run, self.build.ticket, [checkout], [], [checkout], [], "", "", self.link,
+                                measurement_section=section)
+        self.assertEqual(self.pr_text, f"{original}\n\n{section}")
+
+    def test_refreshing_a_standing_pr_measurement_preserves_maintainer_notes_and_ci_stop(self):
         checkout = self.checkout
         earlier_disclosure = {**self.disclosure, "measurement": "The builder measured 4.900 s."}
         old = pipeline.unverified_measurement_section(earlier_disclosure)
+        summary = self.pr_text
+        notes = "### Rollout notes\n\nKeep the existing rollout order."
         ci_stop = ci.section([], 0, f"{ci.STOPPED} Checks failed on the previous revision.")
-        self.pr_text = ci.with_section(f"{self.pr_text}\n\n{old}", ci_stop)
+        self.pr_text = ci.with_section(f"{summary}\n\n{old}{notes}", ci_stop)
         measurement = pipeline.unverified_measurement_section(self.disclosure)
 
         stopped = pipeline.sync_pr_bodies(self.run, self.build.ticket, [checkout], [], [checkout], [], "", "",
                                           self.link, measurement_section=measurement)
 
         self.assertEqual(stopped, [checkout])
-        self.assertEqual(ci.stopped_section(self.pr_text), ci_stop)
-        pipeline.publish_ci(self.run, self.build.ticket, [checkout], ci.section([], 0, "Checks passed."))
-        self.assertTrue(self.pr_text.startswith(f"{self.link}\n\n## Summary"))
-        self.assertIn(measurement.rstrip(), self.pr_text)
-        self.assertNotIn("4.900 s", self.pr_text)
-        self.assertEqual(self.pr_text.count("## CI\n"), 1)
-        self.assertIn("Checks passed.", self.pr_text)
-        self.assertNotIn("Checks failed on the previous revision.", self.pr_text)
+        self.assertEqual(self.pr_text, f"{summary}\n\n{measurement}{notes}\n\n{ci_stop}")
+        ci_pass = ci.section([], 0, "Checks passed.")
+        pipeline.publish_ci(self.run, self.build.ticket, [checkout], ci_pass)
+        self.assertEqual(self.pr_text, f"{summary}\n\n{measurement}{notes}\n\n{ci_pass}")
+
+    def test_refresh_after_repair_removes_the_disclosure_when_the_requirement_is_verified(self):
+        checkout = self.checkout
+        summary = self.pr_text
+        measurement = pipeline.unverified_measurement_section(self.disclosure)
+        notes = "### Rollout notes\n\n- Keep the existing rollout order.\n\n## Maintainer checklist\n\n- [ ] Roll out"
+        ci_stop = ci.section([], 0, f"{ci.STOPPED} Checks failed on the previous revision.")
+        self.pr_text = ci.with_section(f"{summary}\n\n{measurement}{notes}", ci_stop)
+        report = "## Checked in use\n\nThe verifier measured the class alone at 4.2 s on the repaired revision."
+
+        stopped = pipeline.sync_pr_bodies(self.run, self.build.ticket, [checkout], [], [checkout], [checkout],
+                                          report, "", self.link)
+
+        self.assertEqual(stopped, [checkout])
+        self.assertEqual(self.pr_text, f"{summary}\n\n{notes}\n\n{ci_stop}")
+        self.comment.assert_called_once_with(checkout.pr, f"Pushed more work for #7.\n\n{report}")
 
     def test_same_head_ci_retry_writes_the_disclosure_before_finishing_publication(self):
         self.verdicts = {}
         controller = self.controller()
         controller.job.opened = controller.job.found = controller.job.ci_stopped = []
         measurement = pipeline.unverified_measurement_section(self.disclosure).rstrip()
+        notes = "### Rollout notes\n\nKeep the existing rollout order."
+        self.pr_text += f"\n\n{notes}"
+
+        def reruns(*_):
+            self.assertEqual(ci.SECTION.search(self.pr_text).group().strip(), failed_ci)
+            self.assertIn(notes, self.pr_text)
+            self.assertIn(measurement, self.pr_text)
+            return [gh.WorkflowRerun(456, 2, {"checks": 101})]
 
         def finish():
             self.assertTrue(self.pr_text.startswith(f"{self.link}\n\n## Summary"))
             self.assertIn(measurement, self.pr_text)
+            self.assertIn(notes, self.pr_text)
+            self.assertEqual(self.pr_text.count(ci.SECTION_START), 1)
+            self.assertEqual(self.pr_text.count(ci.SECTION_END), 1)
             return {"ending": "done"}
 
         controller.finish_publication.side_effect = finish
         with (mock.patch.object(pipeline, "set_draft"),
-              mock.patch.object(gh, "failed_job_reruns", return_value=[gh.WorkflowRerun(456, 2, {"checks": 101})])):
+              mock.patch.object(gh, "failed_job_reruns", side_effect=reruns)):
             self.assertEqual(controller.publish()["failures"], orchestration.CI_FAILURES)
+            failed_ci = ci.SECTION.search(self.pr_text).group().strip()
             self.assertNotIn(measurement, self.pr_text)
             with mock.patch.object(gh, "pr_edit_body", side_effect=gh.GhError("write failed")):
                 with self.assertRaisesRegex(ValueError, "could not update the unverified requirement"):
@@ -2685,6 +2728,44 @@ class MeasurementPublicationRetryTests(AutomaticCIRerunFixture, unittest.TestCas
             controller.finish_publication.assert_not_called()
             self.assertEqual(controller.publish(self.disclosure), {"ending": "done"})
 
+        gh.gh.assert_called_once()
+        controller.finish_publication.assert_called_once()
+
+    def test_same_head_ci_retry_removes_only_the_disclosure_for_the_measured_requirement(self):
+        self.verdicts = {}
+        controller = self.controller()
+        controller.job.opened = controller.job.found = controller.job.ci_stopped = []
+        measurement = pipeline.unverified_measurement_section(self.disclosure)
+        example = f"```markdown\n{measurement}```"
+        notes = "### Rollout notes\n\nKeep the existing rollout order."
+        original = f"{self.pr_text}\n\n{example}\n\n{notes}"
+        published = f"{self.pr_text}\n\n{example}\n\n{measurement}{notes}"
+        self.pr_text = published
+
+        def reruns(*_):
+            self.assertEqual(self.pr_text, ci.with_section(original, failed_ci))
+            return [gh.WorkflowRerun(456, 2, {"checks": 101})]
+
+        with (mock.patch.object(pipeline, "set_draft"),
+              mock.patch.object(gh, "failed_job_reruns", side_effect=reruns)):
+            self.assertEqual(controller.publish(self.disclosure)["failures"], orchestration.CI_FAILURES)
+            failed_ci = ci.SECTION.search(self.pr_text).group().strip()
+            controller.job.verified = verify.Verified.from_agent({
+                "verdict": "pass", "summary": "The class finished alone at 4.2 s.", "checks": [
+                    {"what": self.disclosure["requirement"], "how": "Run the class alone", "saw": "4.2 s", "passed": True},
+                ],
+            })
+            with mock.patch.object(gh, "pr_edit_body", side_effect=gh.GhError("write failed")):
+                with self.assertRaisesRegex(ValueError, "could not update the unverified requirement"):
+                    controller.publish()
+            self.assertTrue(controller.data["ci_failed"])
+            self.assertEqual(self.pr_text, ci.with_section(published, failed_ci))
+            gh.gh.assert_not_called()
+            controller.finish_publication.assert_not_called()
+            self.assertEqual(controller.publish(), {"ending": "done"})
+
+        self.assertTrue(self.pr_text.startswith(original))
+        self.assertEqual(self.pr_text.count(pipeline.MEASUREMENT_START), 1)
         gh.gh.assert_called_once()
         controller.finish_publication.assert_called_once()
 
@@ -6269,6 +6350,104 @@ class CatchUpRecoveryTests(MovedBasePublicationFixture, unittest.TestCase):
         self.assertEqual(merge_attempt.call_count, 2)
         self.assertEqual(self.edit.call_count, 2)
         self.push.assert_not_called()
+
+
+class MeasurementCatchUpPublicationTests(MovedBasePublicationFixture, unittest.TestCase):
+    def test_fresh_verification_on_moved_base_replaces_the_old_disclosure(self):
+        self.publish_with_catch_up("measured")
+
+    def test_fresh_verification_on_moved_base_preserves_a_still_unmeasured_requirement(self):
+        self.publish_with_catch_up("unmeasured")
+
+    def test_observed_failure_on_moved_base_holds_publication(self):
+        self.publish_with_catch_up("failed")
+
+    def publish_with_catch_up(self, result):
+        controller, checkout = self.controller()
+        job, run = controller.job, controller.run
+        run.budget = None
+        job.ticket = tracker.Ticket("7", "#7", "Fixture")
+        run.tracker.pr_link.return_value = "Closes #7"
+        controller.data["acceptance"] = "fixture"
+        controller.policy_sha = mock.Mock(return_value="policy")
+        disclosure = {"requirement": "The class finishes alone in under 5 seconds.",
+                      "measurement": "The builder measured 4.683 s on the original tree."}
+        failed = result == "failed"
+        unmeasured = result == "unmeasured"
+        if unmeasured:
+            summary = "The sandbox timing still includes migrations, so it cannot measure the class alone."
+            check = {"what": "Rendered controller rule", "how": "Load the prompt", "saw": "Rule present", "passed": True}
+        else:
+            timing = "5.4 s" if failed else "4.2 s"
+            summary = f"The verifier measured the class alone at {timing} on the new base."
+            check = {"what": disclosure["requirement"], "how": "Run the class alone", "saw": timing, "passed": not failed}
+        fresh = verify.Verified.from_agent({"verdict": "fail" if failed else "pass", "summary": summary, "checks": [check],
+                                            "unmeasured_requirements": [disclosure["requirement"]] if unmeasured else []})
+        review = Review("approve", "Reviewed on the new base.")
+        ci_text = ci.section([], 0, "Checks passed.")
+        notes = "### Rollout notes\n\nKeep the existing rollout order."
+        lookalike = "## Unverified requirement\n\nMaintainer's requirement.\n\n**Recorded measurement**\n\nOwner: 3 s."
+        body = ""
+
+        def edit(pr, text, *, link):
+            nonlocal body
+            self.assertEqual(pr, checkout.pr)
+            body = gh.outgoing(text, link)
+
+        def atomic(name, **kwargs):
+            if name == "publish":
+                return flows.publish(controller.flow, **kwargs)
+            section = kwargs["measurement_section"]
+            initial = "## Checked in use\n\nVerifier environment could not measure the class."
+            example = f"```markdown\n{section}```"
+            edit(checkout.pr, f"{initial}\n\n{section}{notes}\n\n{lookalike}\n\n"
+                 f"## Review\n\nEarlier review.\n\n{example}\n\n{ci_text}", link="Closes #7")
+            return factory.Outcome("pass", data={"heads": {checkout.github: checkout.lease}})
+
+        def catch_up(*_, before_push):
+            self.assertIn(disclosure["measurement"], body)
+            if failed:
+                raise pipeline.CatchUpGateHold("verify", "standalone timing failed", "candidate", "", verified=fresh,
+                                               review=review)
+            before_push("caught-up", fresh, review)
+            checkout.note_pushed_head("caught-up")
+            controller.fingerprint.return_value = "new-tree"
+            return fresh, review
+
+        controller.atomic.side_effect = atomic
+        with (mock.patch.object(controller, "publication_ci", return_value=None) as watch,
+              mock.patch.object(pipeline.slots, "take_merge_lease"),
+              mock.patch.object(pipeline, "try_automerge", side_effect=[gh.MovedBaseHold("base moved"), None]) as merge,
+              mock.patch.object(pipeline, "catch_up_target", return_value=("new-base", "")),
+              mock.patch.object(pipeline, "catch_up_base", side_effect=catch_up),
+              mock.patch.object(pipeline, "own_draft_state", return_value=False),
+              mock.patch.object(pipeline, "note_review"),
+              mock.patch.multiple(pipeline.run_store, save_pr_gate_refresh=mock.Mock(return_value=False),
+                                  clear_pr_gate_refresh=mock.DEFAULT),
+              mock.patch.object(gh, "pr_body", side_effect=lambda _: body),
+              mock.patch.object(gh, "pr_edit_body", side_effect=edit),
+              mock.patch.object(flows, "ended")):
+            publication = controller.publish(disclosure)
+
+        checked = fresh.markdown()
+        if failed:
+            self.assertEqual(publication["failures"], orchestration.CATCH_UP_FAILURE)
+            merge.assert_called_once()
+            watch.assert_called_once_with([checkout])
+            self.assertEqual(checkout.lease, "head")
+            checked = ("Catch-up to `main` at `new-base` held on verify: standalone timing failed. "
+                       f"Checked candidate `candidate` and kept it in the worktree for repair.\n\n{checked}")
+        else:
+            self.assertEqual(publication["ending"], "pr")
+            self.assertEqual(merge.call_count, 2)
+            self.assertEqual(merge.call_args.args[2:4], (fresh, review))
+            self.assertEqual(watch.call_args_list, [mock.call([checkout]), mock.call([checkout], caught_up=True)])
+            self.assertEqual(controller.data["evidence"]["verify"]["tree"], "new-tree")
+        section = pipeline.unverified_measurement_section(disclosure)
+        example = f"```markdown\n{section}```"
+        retained = section if unmeasured else ""
+        self.assertEqual(body, f"Closes #7\n\n## Checked in use\n\n{checked}\n\n{retained}{notes}\n\n"
+                         f"{lookalike}\n\n{review.markdown().rstrip()}\n\n{example}\n\n{ci_text}")
 
 
 class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):

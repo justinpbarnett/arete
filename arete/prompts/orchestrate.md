@@ -21,6 +21,8 @@ Have the verifier explicitly list that requirement as unverified in its summary 
 When two verifications on the same final tree each report that their environment cannot measure the same requirement (such as timing that includes sandbox setup), stop retrying verification for that requirement.
 Request publication with `unverified_measurement` containing `requirement` and `measurement`. Copy the actual measurement and its source from the builder or checks even if the verifier reports only the limitation. The PR body will label the requirement as unverified and show the measurement.
 Never apply this exception to a requirement any verifier observed fail.
+Use the same requirement wording as the verifier's `unmeasured_requirements` entry, when present.
+If you retry publication on the same head after CI fails, omit the disclosure once fresh verification measures the requirement.
 Keep the existing automerge rules and continue to ask for credentials, permissions, and decisions the issue leaves open.
 
 Workers start asynchronously.

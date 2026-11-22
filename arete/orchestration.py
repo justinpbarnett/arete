@@ -976,10 +976,12 @@ class Controller:
             if (row.get("state") != "OPEN" or row.get("headRefOid") != checkout.lease
                     or row.get("baseRefName") != checkout.base):
                 raise ValueError("the PR no longer matches this run's published head and base")
-        if measurement_section:
+        observed = [] if measurement_section else pipeline.observed_measurements(self.run, job.verified)
+        if measurement_section or observed:
             for checkout in pushed:
                 try:
-                    pipeline.publish_unverified_measurement(self.run, job.ticket, checkout.pr, measurement_section)
+                    pipeline.publish_unverified_measurement(self.run, job.ticket, checkout.pr, measurement_section,
+                                                            observed_requirements=observed)
                 except gh.GhError as error:
                     raise ValueError(f"could not update the unverified requirement in {checkout.pr}") from error
         saved = retry.get("reruns")
@@ -1326,10 +1328,10 @@ class Controller:
         self.stamp("checks", {"full": True, "checked": b.checked, "report": b.report})
         self.stamp("verify", asdict(job.verified))
         self.stamp("review", job.review.asdict())
+        pipeline.publish_gate_evidence(self.run, job.ticket, checkout, job.verified, job.review)
 
         self.data["publication_intent"].pop("catch_up", None)
         self.persist()
-        pipeline.publish_gate_evidence(self.run, job.ticket, checkout, job.verified, job.review)
 
     def finish_publication(self):
         self.check_pilot_publication()
