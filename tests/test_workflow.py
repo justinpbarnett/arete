@@ -1,5 +1,6 @@
 import ast
 import errno
+import fcntl
 import http.client
 import json
 import os
@@ -42,6 +43,126 @@ from arete.store import db, orchestration as ledger
 from tests import parallel
 from tests.parallel import stack_env
 from tests.subprocess_helpers import CHILD_HANG_TIMEOUT
+
+
+class ParallelDurationHistoryTests(unittest.TestCase):
+    class A(unittest.TestCase):
+        def runTest(self):
+            pass
+
+    class B(unittest.TestCase):
+        def runTest(self):
+            pass
+
+    def setUp(self):
+        self.history = Path(self.enterContext(TemporaryDirectory())) / "durations.json"
+        self.enterContext(mock.patch.object(parallel, "HISTORY", self.history))
+        self.a = self.A().id().rsplit(".", 1)[0]
+        self.b = self.B().id().rsplit(".", 1)[0]
+
+    def run_classes(self, runner, *tests):
+        started = []
+
+        def record_result(item):
+            _, batch = item
+            started.append(batch.identifier)
+            runner.results[batch.identifier] = dict(
+                ran=batch.count, errors=[], failures=[], skipped=[], unexpected=[], seconds=2.5,
+            )
+
+        with mock.patch.object(runner, "child", new=record_result), redirect_stdout(StringIO()):
+            self.assertEqual(runner.run(tests), 0)
+        return started
+
+    def test_partial_run_preserves_latest_duration_for_unrun_class(self):
+        self.history.write_text(json.dumps({self.a: 1.0, self.b: 5.0}))
+        runner = parallel.Runner(SimpleNamespace(jobs=1, slowest=0))
+        self.history.write_text(json.dumps({self.a: 3.0, self.b: 5.0}))
+
+        self.run_classes(runner, self.B())
+
+        self.assertEqual(json.loads(self.history.read_text()), {self.a: 3.0, self.b: 2.5})
+
+    def test_overlapping_runs_preserve_both_duration_updates(self):
+        self.history.write_text(json.dumps({self.a: 1.0, self.b: 5.0}))
+        runner = parallel.Runner(SimpleNamespace(slowest=0))
+        runner.folder = tempfile.mkdtemp(dir=self.history.parent)
+        runner.results[self.b] = dict(ran=1, errors=[], failures=[], skipped=[], unexpected=[], seconds=2.5)
+        first_writer = """
+import os
+import sys
+import tempfile
+from pathlib import Path
+from socket import socket
+from types import SimpleNamespace
+from unittest import mock
+
+from tests import parallel
+from tests.subprocess_helpers import CHILD_HANG_TIMEOUT
+
+parallel.HISTORY = Path(sys.argv[1])
+runner = parallel.Runner(SimpleNamespace(slowest=0))
+runner.folder = tempfile.mkdtemp(dir=parallel.HISTORY.parent)
+runner.results[sys.argv[2]] = dict(ran=1, errors=[], failures=[], skipped=[], unexpected=[], seconds=3.0)
+replace = os.replace
+
+with socket(fileno=int(sys.argv[3])) as peer:
+    peer.settimeout(CHILD_HANG_TIMEOUT)
+
+    def pause_at_replace(source, target):
+        peer.sendall(b"R")
+        assert peer.recv(1) == b"W"
+        replace(source, target)
+        peer.sendall(b"W")
+        assert peer.recv(1) == b"F"
+
+    with mock.patch.object(os, "replace", side_effect=pause_at_replace):
+        sys.exit(runner.finish(0))
+"""
+        peer, child_peer = socketpair()
+        with peer, child_peer, subprocess.Popen(
+            [sys.executable, "-c", first_writer, str(self.history), self.a, str(child_peer.fileno())],
+            pass_fds=(child_peer.fileno(),), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        ) as first:
+            child_peer.close()
+            peer.settimeout(CHILD_HANG_TIMEOUT)
+            flock = fcntl.flock
+
+            def contend(lock, operation):
+                with self.assertRaises(BlockingIOError):
+                    flock(lock, operation | fcntl.LOCK_NB)
+                peer.sendall(b"W")
+                self.assertEqual(peer.recv(1), b"W")
+                # A fresh open after replacement must still contend with the first writer.
+                with open(lock.name, "a") as reopened, self.assertRaises(BlockingIOError):
+                    flock(reopened, operation | fcntl.LOCK_NB)
+                peer.sendall(b"F")
+                output, _ = first.communicate(timeout=CHILD_HANG_TIMEOUT)
+                self.assertEqual(first.returncode, 0, output)
+                flock(lock, operation | fcntl.LOCK_NB)
+
+            try:
+                self.assertEqual(peer.recv(1), b"R")
+                with mock.patch.object(fcntl, "flock", side_effect=contend), redirect_stdout(StringIO()):
+                    self.assertEqual(runner.finish(0), 0)
+            finally:
+                first.kill()
+
+        self.assertEqual(json.loads(self.history.read_text()), {self.a: 3.0, self.b: 2.5})
+
+    def test_unreadable_history_is_replaced_with_this_runs_durations(self):
+        self.history.write_bytes(b"\xff")
+        runner = parallel.Runner(SimpleNamespace(jobs=1, slowest=0))
+
+        self.run_classes(runner, self.B())
+
+        self.assertEqual(json.loads(self.history.read_text()), {self.b: 2.5})
+
+    def test_full_suite_starts_longest_recorded_class_first(self):
+        self.history.write_text(json.dumps({self.a: 1.0, self.b: 5.0}))
+        runner = parallel.Runner(SimpleNamespace(jobs=1, slowest=0))
+
+        self.assertEqual(self.run_classes(runner, self.A(), self.B()), [self.b, self.a])
 
 
 class ParallelStackEnvironmentTests(unittest.TestCase):
