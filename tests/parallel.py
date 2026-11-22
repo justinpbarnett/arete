@@ -15,11 +15,16 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from importlib import import_module
+from unittest import case
 from unittest.loader import _FailedTest
+from unittest.suite import _ErrorHolder
+from unittest.util import strclass
 
 KEPT_LINES = 40
 DEFAULT_CLASS_TIMEOUT = 10
 STACK_GRACE = 1
+LOAD_POLL_INTERVAL = 5
+LOAD_WAIT_BUDGET = 5 * 60
 HISTORY = os.path.join(tempfile.gettempdir(), "arete-parallel-durations.json")
 TESTS = os.path.dirname(os.path.abspath(__file__))
 STACK_SITE = os.path.join(TESTS, "_parallel_site")
@@ -29,6 +34,8 @@ if __spec__ is None:
 _test_stacks = import_module("arete._test_stacks")
 lanes = import_module("arete.lanes")
 THREAD = re.compile(r"(?:Current thread|Thread) (0x[0-9a-f]+) \(most recent call first\):")
+# Let unittest omit runner frames from cleanup tracebacks.
+__unittest = True
 
 
 def stack_env(env):
@@ -75,19 +82,98 @@ def end_with_runner(lifeline):
     os.kill(os.getpid(), signal.SIGKILL)
 
 
+class WorkerResult(unittest.TestResult):
+    def __init__(self, result_file):
+        super().__init__()
+        self.result_file = result_file
+        self.module_setup_holder = None
+
+    def write_report(self, *, complete=False, cleanup_errors=()):
+        report = {"ran": self.testsRun, "errors": [[str(t), text] for t, text in (*self.errors, *cleanup_errors)],
+                  "failures": [[str(t), text] for t, text in self.failures],
+                  "skipped": [[str(t), why] for t, why in self.skipped],
+                  "unexpected": [str(t) for t in self.unexpectedSuccesses], "complete": complete}
+        temporary = self.result_file + ".tmp"
+        with open(temporary, "w") as handle:
+            json.dump(report, handle)
+        os.replace(temporary, self.result_file)
+
+    def addFailure(self, test, err):
+        super().addFailure(test, err)
+        self.write_report()
+
+    def addError(self, test, err):
+        super().addError(test, err)
+        if getattr(self, "_moduleSetUpFailed", False):
+            self.module_setup_holder = test
+        self.write_report()
+
+    def addSkip(self, test, reason):
+        super().addSkip(test, reason)
+        if getattr(self, "_moduleSetUpFailed", False):
+            self.module_setup_holder = test
+
+    def addSubTest(self, test, subtest, err):
+        super().addSubTest(test, subtest, err)
+        if err is not None:
+            self.write_report()
+
+    def addUnexpectedSuccess(self, test):
+        super().addUnexpectedSuccess(test)
+        self.write_report()
+
+    def do_class_cleanups(self, cls):
+        # Keep unittest's LIFO stack and deferred reporting while saving errors for a possible timeout.
+        cls.tearDown_exceptions = []
+        cleanup_errors = []
+        while cls._class_cleanups:
+            function, args, kwargs = cls._class_cleanups.pop()
+            try:
+                function(*args, **kwargs)
+            except Exception as error:
+                info = sys.exc_info()
+                cls.tearDown_exceptions.append(info)
+                if not isinstance(error, unittest.SkipTest):
+                    phase = "setUpClass" if getattr(cls, "_classSetupFailed", False) else "tearDownClass"
+                    holder = _ErrorHolder(f"{phase} ({strclass(cls)})")
+                    cleanup_errors.append((holder, self._exc_info_to_string(info, holder)))
+                    self.write_report(cleanup_errors=cleanup_errors)
+
+    def do_module_cleanups(self):
+        holder = None
+        if getattr(self, "_moduleSetUpFailed", False):
+            holder = self.module_setup_holder
+        elif (cls := getattr(self, "_previousTestClass", None)) is not None:
+            holder = _ErrorHolder(f"tearDownModule ({cls.__module__})")
+        exceptions = []
+        saved_error = False
+        while case._module_cleanups:
+            function, args, kwargs = case._module_cleanups.pop()
+            try:
+                function(*args, **kwargs)
+            except Exception as error:
+                exceptions.append(error)
+                if holder is not None and not saved_error and not isinstance(error, unittest.SkipTest):
+                    text = self._exc_info_to_string(sys.exc_info(), holder)
+                    self.write_report(cleanup_errors=((holder, text),))
+                    saved_error = True
+        if exceptions:
+            # unittest reports only the first exception when the stack finishes.
+            if saved_error and isinstance(exceptions[0], unittest.SkipTest):
+                self.write_report()
+            raise exceptions[0]
+
+
 def run_one(identifier, start, result_file, lifeline):
     os.set_inheritable(lifeline, False)
     threading.Thread(target=end_with_runner, args=(lifeline,), daemon=True).start()
     sys.path.insert(0, start)
-    result = unittest.TestResult()
+    result = WorkerResult(result_file)
+    unittest.TestCase.doClassCleanups = classmethod(lambda cls: result.do_class_cleanups(cls))
+    # TestSuite calls the case module's cleanup function after setup failure and teardown.
+    case.doModuleCleanups = result.do_module_cleanups
     unittest.defaultTestLoader.loadTestsFromName(identifier).run(result)
-    report = {"ran": result.testsRun, "errors": [[str(t), text] for t, text in result.errors],
-              "failures": [[str(t), text] for t, text in result.failures],
-              "skipped": [[str(t), why] for t, why in result.skipped],
-              "unexpected": [str(t) for t in result.unexpectedSuccesses]}
-    with open(result_file + ".tmp", "w") as handle:
-        json.dump(report, handle)
-    os.replace(result_file + ".tmp", result_file)
+    result.write_report(complete=True)
     return 0
 
 
@@ -109,6 +195,8 @@ class Runner:
         self.results = {}
         self.crowded = []
         self.first_failures = {}
+        self.first_solo_timeouts = {}
+        self.retry_loads = {}
         try:
             with open(HISTORY) as handle:
                 self.history = json.load(handle)
@@ -242,7 +330,9 @@ class Runner:
                     or any(not isinstance(report.get(key), list)
                            for key in ("errors", "failures", "skipped", "unexpected"))):
                 raise TypeError("invalid report")
-            if report["ran"] != batch.count and not (report["errors"] or report["skipped"]):
+            if not report.pop("complete", True):
+                problem = problem or "worker exited without a complete report"
+            elif report["ran"] != batch.count and not (report["errors"] or report["skipped"]):
                 problem = problem or f"worker ran {report['ran']} tests; expected {batch.count}"
         except (OSError, ValueError, KeyError, TypeError):
             report = {"ran": 0, "errors": [], "failures": [], "skipped": [], "unexpected": []}
@@ -288,14 +378,7 @@ class Runner:
             for item in items:
                 if item[1].serial:
                     self.child(item)
-            for index, batch in items:
-                identifier = batch.identifier
-                first = self.results.get(identifier, {})
-                if not self.stopping and failed(first):
-                    self.first_failures[identifier] = first
-                    self.child((f"{index}.alone", batch), stretch=2)
-                    if not failed(self.results[identifier]):
-                        self.crowded.append(identifier)
+            self.rerun_failed(items)
             complete = True
         finally:
             if not complete:
@@ -309,6 +392,50 @@ class Runner:
             print(f"Worker reports and output retained in: {self.folder}", flush=True)
             return 130
         return self.finish(time.monotonic() - began)
+
+    def wait_for_load(self, identifier, capacity, budget):
+        load = os.getloadavg()[0]
+        waited = 0
+        if load > capacity and budget > 0 and not self.stopping:
+            print(f"{identifier}: waiting for host load to fall from {load:g} to {capacity} or less", flush=True)
+            began = time.monotonic()
+            while load > capacity and waited < budget and not self.stopping:
+                time.sleep(min(LOAD_POLL_INTERVAL, budget - waited))
+                load = os.getloadavg()[0]
+                waited = time.monotonic() - began
+        if not self.stopping:
+            print(f"{identifier}: starting alone at host load {load:g} after waiting {waited:.2f}s", flush=True)
+        return load, waited
+
+    def rerun_failed(self, items):
+        capacity = os.cpu_count() or 1
+        budget = LOAD_WAIT_BUDGET
+        for index, batch in items:
+            if self.stopping:
+                break
+            identifier = batch.identifier
+            first = self.results.get(identifier, {})
+            if not failed(first):
+                continue
+            self.first_failures[identifier] = first
+            load, waited = self.wait_for_load(identifier, capacity, budget)
+            budget -= waited
+            if self.stopping:
+                break
+            self.child((f"{index}.alone", batch), stretch=2)
+            alone = self.results[identifier]
+            if (not self.stopping and load > capacity and alone["timeout"]
+                    and not any(alone[kind] for kind in ("failures", "errors", "unexpected"))):
+                retry_load, waited = self.wait_for_load(identifier, capacity, budget)
+                budget -= waited
+                if self.stopping:
+                    break
+                self.retry_loads[identifier] = (load, retry_load)
+                self.child((f"{index}.alone-retry", batch), stretch=2)
+                if failed(self.results[identifier]):
+                    self.first_solo_timeouts[identifier] = alone
+            if not failed(self.results[identifier]):
+                self.crowded.append(identifier)
 
     def show_failures(self, identifier, report):
         timeout_report = report.get("timeout")
@@ -327,6 +454,12 @@ class Runner:
             report = self.results[identifier]
             first = self.first_failures[identifier]
             where = "ran past its deadline" if first["timeout"] else "failed"
+            if identifier in self.retry_loads:
+                load, retry_load = self.retry_loads[identifier]
+                print(f"{identifier}: {where} on its first run, ran past its deadline alone at host load {load:g}, "
+                      f"then passed alone at host load {retry_load:g} within twice its deadline "
+                      f"in {report['seconds']:.2f}s", flush=True)
+                continue
             print(f"{identifier}: {where} on its first run, "
                   f"then passed alone within twice its deadline in {report['seconds']:.2f}s", flush=True)
         failed_classes = []
@@ -338,6 +471,8 @@ class Runner:
                 failed_classes.append(identifier)
                 if (first := self.first_failures.get(identifier)) and first["timeout"]:
                     self.show_failures(identifier, first)
+                if first_solo := self.first_solo_timeouts.get(identifier):
+                    self.show_failures(identifier, first_solo)
                 self.show_failures(identifier, report)
         try:
             temporary = f"{HISTORY}.{os.getpid()}.tmp"
