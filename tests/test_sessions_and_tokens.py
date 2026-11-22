@@ -86,6 +86,19 @@ class CloneTokenTests(unittest.TestCase):
                     self.assertEqual(json.loads(request.data), READ_ONLY_GRANT)
 
 
+class JevPromptTests(unittest.TestCase):
+    def test_irreversible_question_requires_rollback_compatibility_for_additive_expands(self):
+        question = jev.risk_questions()["irreversible"]["instructions"]
+        self.assertEqual(jev.SCREEN["irreversible"][0], question)
+        self.assertIn("dropping, rewriting or backfilling stored data", question)
+        self.assertIn("running a contract migration", question)
+        self.assertIn("A code rollback leaves added tables, columns and indexes in place", question)
+        self.assertIn("Treat a purely additive expand migration as reversible only if it preserves existing reads "
+                      "and writes on the rollback target and the rollback target accepts the newer expand ledger rows",
+                      question)
+        self.assertIn("adding even a nullable column can break an existing INSERT without a column list", question)
+
+
 class PushedPrDraftTests(unittest.TestCase):
     URL = "https://github.com/fixture/repo/pull/7"
 

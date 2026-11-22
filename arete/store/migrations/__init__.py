@@ -86,13 +86,18 @@ def validate(conn, chain, version):
     if not version:
         return
     try:
-        rows = list(conn.execute("SELECT n, name, sha256 FROM schema_migrations ORDER BY n"))
+        rows = list(conn.execute("SELECT n, name, sha256, phase FROM schema_migrations ORDER BY n"))
     except Exception as e:
         raise Refused(f"user_version {version} has no schema_migrations ledger") from e
     by_n = {m.n: m for m in chain}
+    highest = max(by_n, default=0)
     if [r[0] for r in rows] != list(range(1, version + 1)):
         raise Refused(f"schema_migrations disagrees with user_version {version}")
-    for n, name, digest in rows:
+    for n, name, digest, phase in rows:
+        if n > highest:
+            if phase != "expand":
+                raise Refused(f"{name}: {phase} migration is past this code's migration chain")
+            continue
         migration = by_n.get(n)
         if migration is None or migration.name != name or migration.sha256 != digest:
             expected = migration.name if migration else "missing migration file"
