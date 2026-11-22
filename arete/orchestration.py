@@ -253,7 +253,6 @@ class Controller:
             self.data["prepared"] = outcome.data
             self.job.goal = f"Check the issue and owner's answers in use:\n{self.job.ticket.title}\n{self.job.ticket.body}"
             self.job.plan_text = ""
-        self.run.answers_due = [ask for ask in self.run.answers_due if ask["step"] != "prepare"]
         if self.run.repairs:
             found = repairs.source(pipeline.run_store.run_get(self.run.repairs) or {})
             expected = set(found.prs) - self.job.closed_prs

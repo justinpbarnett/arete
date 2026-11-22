@@ -552,7 +552,7 @@ class Run(AgentRun):
     def owner_note(self) -> str:
         return owner_asks.GUIDE if self.asks_owner else owner_asks.NOBODY
 
-    def agent(self, step: str, text: str, cwd: Path, role: str = "", *, answer_call: str = "", **kw) -> Result:
+    def agent(self, step: str, text: str, cwd: Path, role: str = "", **kw) -> Result:
         if kw.get("read_only"):
             return super().agent(step, text, cwd, role, **kw)
         if not self.asks_owner:
@@ -562,8 +562,7 @@ class Run(AgentRun):
                     for event in record.events(paths.record_dir(self.id) / res.record)):
                 raise CatchUpNeedsInput(f"{step} needs owner input")
             return res
-        call = answer_call or step
-        due = self.due_for(call)
+        due = self.due_for(step)
         if kw.get("native_observation"):
             if due:
                 raise RuntimeError("a pending owner decision precludes unattended native verification")
@@ -579,7 +578,7 @@ class Run(AgentRun):
             self.answers_due = [a for a in self.answers_due if a not in due]
         while res.record and (sent := owner_asks.found(record.events(paths.record_dir(self.id) / res.record))):
             kept = res.session if kw.get("persist", True) else NO_SESSION
-            self.owner_ask(call, sent, kept)
+            self.owner_ask(step, sent, kept)
             res = super().agent(step, owner_asks.settled_message(sent), cwd, role, ask_owner=True,
                                 **{**kw, "resume": kept, "resume_only": True})
         return res
@@ -587,8 +586,7 @@ class Run(AgentRun):
     def due_for(self, call: str) -> list[dict]:
         seam = factory.inside(self.id).step
         here = [a for a in self.answers_due if a["step"] == seam]
-        matching = [a for a in here if a["call"] == call]
-        return matching if seam == "prepare" else matching or here
+        return [a for a in here if a["call"] == call] or here
 
     def fresh_text(self, text: str, due: list[dict]) -> str:
         return "\n\n".join(part for part in (text, owner_asks.fresh_note(due), self.kept_note, self.base_note)
@@ -3817,10 +3815,6 @@ def resolve_conflicts(run: AgentRun, c: workspace.Checkout, conflicts: list[str]
     tries = max(1, run.settings("build").tries)
     feedback = "this is the first attempt"
     restorations: set[str] = set()
-    scope = {}
-    if isinstance(run, Run) and (seam := factory.inside(run.id)) and seam.step == "prepare":
-        phase = "kept-edits" if incoming else "moved-base"
-        scope["answer_call"] = f"resolve {phase} {json.dumps([c.github, c.dir])}"
     for n in range(1, tries + 1):
         scratch_roots = set(scratch_markers)
         untracked_before = workspace.untracked_files(c.wt)
@@ -3842,7 +3836,7 @@ def resolve_conflicts(run: AgentRun, c: workspace.Checkout, conflicts: list[str]
         try:
             res = run.agent(round_name("resolve", n), prompt_loader.task_prompt(text), c.wt, role="build",
                             allowed_tools=prompt_loader.bash_rules(bash_rules), disallowed_tools=routing.NO_GIT_WRITES,
-                            json_schema=RESOLVE_SCHEMA, resume=NO_SESSION, extra_env=dict(RESOLVER_SETS), **scope)
+                            json_schema=RESOLVE_SCHEMA, resume=NO_SESSION, extra_env=dict(RESOLVER_SETS))
         finally:
             if previous is None:
                 run.sessions.pop("build", None)
