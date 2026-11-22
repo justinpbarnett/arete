@@ -20,7 +20,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import asdict, replace
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from io import StringIO
 from itertools import chain, repeat
 from pathlib import Path
@@ -8357,6 +8357,70 @@ class ServeStatusTests(unittest.TestCase):
         scratch.mkdir(mode=0o700)
         del self.env["ARETE_CONFIG_DIR"], self.env["ARETE_STATE_DIR"]
         self.check_revisions({**self.env, "ARETE_VERIFY_SCRATCH": str(scratch)}, scratch / "state")
+
+
+class DBStatsRetentionTests(unittest.TestCase):
+    def setUp(self):
+        logs = Path(self.enterContext(TemporaryDirectory()))
+        self.enterContext(mock.patch.object(paths, "LOG_DIR", logs))
+        self.enterContext(mock.patch.object(dbstats, "SUMMARIES", {}))
+        self.folder = logs / "dbstats"
+        self.now = datetime(2026, 11, 22, 18, tzinfo=UTC)
+
+    def write_summary(self, hours_ago):
+        hour = (self.now - timedelta(hours=hours_ago)).isoformat()
+        dbstats.retain("database", hour, {"mode": "read", "caller": "test", "process_kind": "cli",
+                                         "total_ms": 12, "begin_ms": 2, "commit_ms": 0, "error": ""})
+        return self.folder / f"database-{dbstats.INCARNATION}-{hour[:13]}.json"
+
+    def test_prune_uses_filename_hour_and_keeps_the_cutoff(self):
+        kept = {self.write_summary(hours) for hours in (1, 47, 48)}
+        self.write_summary(49)
+        unreadable = self.folder / "database-incarnation-2025-11-20T99.json"
+        unreadable.write_text("{}")
+        self.assertEqual(dbstats.prune(self.now), 1)
+        self.assertEqual(set(self.folder.iterdir()), kept | {unreadable})
+
+    def test_transaction_totals_opens_only_filenames_in_the_window(self):
+        self.write_summary(2)
+        self.write_summary(0)
+        included = self.write_summary(1)
+        wrong_content_hour = self.folder / included.name.replace(dbstats.INCARNATION, "other")
+        wrong_content_hour.write_text(self.write_summary(3).read_text())
+
+        with mock.patch.object(Path, "open", autospec=True, side_effect=Path.open) as opened:
+            totals = dbstats.transaction_totals(self.now - timedelta(hours=1), self.now, "database")
+
+        self.assertCountEqual([call.args[0] for call in opened.call_args_list], [included, wrong_content_hour])
+        self.assertEqual(totals, {"transaction_count": 1, "p95_ms": 12, "max_ms": 12,
+                                  "transactions_by_kind": {"cli": 1}})
+
+    def test_serve_reports_dbstats_prune_and_continues_after_failure(self):
+        limits = SimpleNamespace(lines_days=3, days=30, max_gb=1)
+        cfg = SimpleNamespace(retention=limits, oncall=SimpleNamespace(keep_days=7))
+        for result, error, messages in (
+            (2, None, [mock.call("dbstats: removed 2 files")]),
+            (0, None, []),
+            (None, OSError("cannot unlink"), [mock.call("dbstats prune failed: OSError: cannot unlink")]),
+        ):
+            with self.subTest(result=result, error=error):
+                server = mock.Mock(cfg=cfg)
+                with (
+                    mock.patch.object(serve.backup, "snapshot", return_value=None),
+                    mock.patch.object(dbstats, "prune", return_value=result, side_effect=error) as prune,
+                    mock.patch.object(serve.store, "prune") as state_prune,
+                    mock.patch.object(record, "purge_folders", return_value=record.Purged(0, 0, ())) as purge,
+                    mock.patch.object(record, "prune", return_value=SimpleNamespace(removed=[], over=False)) as records,
+                    mock.patch.object(serve.tool_events, "rotate_events") as rotate,
+                ):
+                    serve.Server.prune_data(server)
+
+                prune.assert_called_once_with()
+                state_prune.assert_called_once_with(lines_days=3, keep_days=7)
+                purge.assert_called_once_with()
+                records.assert_called_once_with(30, 1)
+                rotate.assert_called_once_with(3)
+                self.assertEqual(server.say.call_args_list, messages)
 
 
 class ServeLoopCountsTests(unittest.TestCase):
