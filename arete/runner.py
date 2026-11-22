@@ -246,7 +246,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         route: dict | None = None, refusal: str = "", mode: str = "", layer: config.RepoLayer | None = None,
         scratch: verification_scratch.Attempt | None = None, remaining_tokens: Callable[[], int] | None = None,
         hard_cap: bool = False, needs_server: bool = False, codex_headroom: dict | None = None,
-        max_steps: int | None = None, **kw) -> Result:
+        max_steps: int | None = None, claude_tools: tuple[str, ...] = (), **kw) -> Result:
     cfg = cfg or config.load()
     if settings and settings.requires.delegation_only:
         kw.update(tools=[], allowed_tools=[], disallowed_tools=[], instructions=[], mcp_config="", add_dirs=[],
@@ -330,7 +330,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
             return Result(ok=False, runner=chosen_route.runner, model=name,
                           error="native observation requires local Pi subscription")
         text, session = session_for(trip, picked, prompt, fresh_prompt, previous, kw, record_id)
-        launch_kw = launch_kwargs(kw, picked, trip, trace, ask_jev, say, cwd=cwd)
+        launch_kw = launch_kwargs(kw, picked, trip, trace, ask_jev, say, cwd=cwd, claude_tools=claude_tools)
         final_size = routing.routing_size(text, settings, launch_kw)
         measured = max(measured, final_size)
         if (trip.request.requires.declared and final_size > trip.request.size
@@ -703,10 +703,12 @@ def reserved(name: str) -> str:
 
 
 def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str], ask_jev: bool,
-                  say: Callable[[str], None], *, cwd: Path | str | None = None) -> dict:
+                  say: Callable[[str], None], *, cwd: Path | str | None = None, claude_tools: tuple[str, ...] = ()) -> dict:
     kw = {k: list(v) if isinstance(v, list) else v for k, v in base.items()}
     cfg, repo, target = trip.cfg, trip.repo, trip.target
     which = picked.candidate.runner
+    if which == "claude" and claude_tools:
+        kw["allowed_tools"] = [*(kw.get("allowed_tools") or ()), *claude_tools]
     floor = None if target.remote else guard.floor(trace[0], cwd or Path.cwd(), kw.get("add_dirs") or [])
     closed_context = tuple(Path(path).absolute() for path in kw.pop("closed_context", ()))
     if closed_context:

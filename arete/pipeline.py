@@ -317,6 +317,10 @@ class AgentRun:
             kw = {**s.call, **reach,
                   "resume": self.sessions.get(config.INHERITS.get(s.step, s.step), NO_SESSION)
                   if s.session == "resume" else NO_SESSION, **kw}
+        rule = f"Bash({class_check_rule(self.dir)})"
+        if rule in (kw.get("allowed_tools") or ()):
+            kw["allowed_tools"] = [tool for tool in kw["allowed_tools"] if tool != rule]
+            kw["claude_tools"] = (rule,)
         kw["extra_env"] = {**(kw.get("extra_env") or {}), **self.lane_env()}
         kw = self.fit_route(step, text, s, kw)
         run_with = kw.get("runner", "") or kw.get("resume", NO_SESSION).runner
@@ -2386,7 +2390,8 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
 
     brief = prompt_loader.Brief(repo.name, workspace_text, t.ref, t.title, t.body,
                                 comments=t.comments, attachments=attachments, expertise=expertise,
-                                commands=commands, max_lines=limit, denied=prompt_loader.code_list(deny))
+                                commands=commands, max_lines=limit, denied=prompt_loader.code_list(deny),
+                                class_check=class_check_example(run.dir, layer))
 
     if run.feedback:
         feedback = feedback_markdown(run.feedback)
@@ -4485,17 +4490,42 @@ def check_calls(commands: list[str]) -> str:
     return prompt_loader.code_list(commands) or NO_CHECKS
 
 
+def class_check_example(folder: Path, layer: config.RepoLayer) -> str:
+    if "classes" not in layer.targeted_commands:
+        return ""
+    return shlex.join([str(folder / CHECKS_SCRIPT), "classes", "test_x.SomeTests"])
+
+
+def class_check_rule(folder: Path) -> str:
+    return f"{shlex.quote(str(folder / CHECKS_SCRIPT))} classes *"
+
+
 def check_script(folder: Path, layer: config.RepoLayer, cwd: Path) -> tuple[list[str], list[str]]:
-    if not layer.checks:
+    classes = layer.targeted_commands.get("classes")
+    if not layer.checks and classes is None:
         return [], []
     script = folder / CHECKS_SCRIPT
+    names = list(layer.checks)
     arms = "".join(f"{shlex.quote(name)}) exec sh -c {shlex.quote(cmd)} ;;\n" for name, cmd in layer.checks.items())
-    usage = shlex.quote(f"usage: {script} NAME, where NAME is one of: {', '.join(layer.checks)}")
+    if classes is not None:
+        names.append("classes")
+        command = shlex.join(config.class_command_words(classes))
+        class_usage = shlex.quote(f"usage: {script} classes CLASS [CLASS ...]")
+        arms += ("classes)\n"
+                 f"    usage() {{ echo {class_usage} >&2; exit 2; }}\n"
+                 '    shift\n'
+                 '    [ "$#" -gt 0 ] || usage\n'
+                 '    for arg in "$@"; do\n'
+                 '        case "$arg" in ""|-*) usage ;; esac\n'
+                 '    done\n'
+                 f'    exec {command} "$@" ;;\n')
+    usage = shlex.quote(f"usage: {script} NAME, where NAME is one of: {', '.join(names)}")
     folder.mkdir(parents=True, exist_ok=True)
     script.write_text(f"#!/bin/sh\ncd {shlex.quote(str(cwd))} || exit 1\ncase \"${{1-}}\" in\n{arms}"
                       f"*) echo {usage} >&2\n   exit 2 ;;\nesac\n")
     script.chmod(0o755)
-    return [shlex.join([str(script), name]) for name in layer.checks], [f"{shlex.quote(str(script))} *"]
+    rule = f"{shlex.quote(str(script))} *" if layer.checks else class_check_rule(folder)
+    return [shlex.join([str(script), name]) for name in layer.checks], [rule]
 
 
 def cut_at_end(text: str, limit: int) -> str:
