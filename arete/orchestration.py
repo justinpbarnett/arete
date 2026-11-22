@@ -897,8 +897,7 @@ class Controller:
             if not checkout or checkout.pr != target["pr"] or checkout.lease != head or heads.get(repo) != head:
                 raise ValueError("the failed CI no longer matches this run's published head")
             pushed.append(checkout)
-        requested_heads = self.data.get("ci_rerun_requested_heads", {})
-        automatic_requested = any(c.lease in requested_heads.get(c.github, []) for c in pushed)
+        automatic_requested = self.rerun_requested(pushed)
         if not automatic_requested and (failure := self.second_ci_failure(targets, retried)):
             return failure
         if retry["caught_up"]:
@@ -980,6 +979,10 @@ class Controller:
                 return {"error": reason}
         return None
 
+    def rerun_requested(self, pushed):
+        requested = self.data.get("ci_rerun_requested_heads", {})
+        return any(c.lease in requested.get(c.github, []) for c in pushed)
+
     def remember_ci_rerun(self, repo, head):
         self.data.setdefault("ci_rerun_requested_heads", {}).setdefault(repo, []).append(head)
         self.persist()
@@ -1042,8 +1045,7 @@ class Controller:
             retry = self.data["ci_retry"] = {"caught_up": caught_up, "targets": targets}
             if any((c.github, c.lease) in requested_heads for c in pushed):
                 retry["round_stories"] = [r.story for r in rounds if r.story]
-            elif reruns is None and not any(w.red_workflows - {0} for w in current.seen) and not any(
-                    r.caused is not None or r.check.actions_workflow(r.target.github) for r in current.reds):
+            elif reruns is None and not self.rerun_requested(pushed) and not any(r.caused for r in current.reds):
                 retry["legacy_rerun"] = True
             if interrupted_watch:
                 retry["reruns"] = {repo: [asdict(rerun) for rerun in attempts] for repo, attempts in requested.items()}
