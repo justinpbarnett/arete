@@ -16,12 +16,11 @@ import sys
 import time
 from collections import Counter
 from collections.abc import Callable, Iterator
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import TextIO
 
 from . import (
     alerts,
@@ -39,6 +38,7 @@ from . import (
     intake,
     jev,
     journeys,
+    lanes,
     learning,
     local_paths,
     outbound,
@@ -87,7 +87,6 @@ SKIPPED_FILE = paths.STATE_DIR / "skipped.json"
 CONTINUE_AFTER_DROP = "The connection dropped mid step. Carry on from where you stopped and finish the step."
 CONTINUE_AFTER_BUSY = "The provider was busy mid step. Carry on from where you stopped and finish the step."
 BUSY_WAITS = (30, 90, 270)
-CHECKS_LOCK = "checks"
 LEFT_TITLE = "Left for a person"
 LEFT_HEADING = f"## {LEFT_TITLE}"
 LEFT_START, LEFT_END = "<!-- arete:left -->", "<!-- /arete:left -->"
@@ -316,6 +315,7 @@ class AgentRun:
             kw = {**s.call, **reach,
                   "resume": self.sessions.get(config.INHERITS.get(s.step, s.step), NO_SESSION)
                   if s.session == "resume" else NO_SESSION, **kw}
+        kw["extra_env"] = {**(kw.get("extra_env") or {}), **self.lane_env()}
         kw = self.fit_route(step, text, s, kw)
         run_with = kw.get("runner", "") or kw.get("resume", NO_SESSION).runner
         which, model = routing.chosen(kw.get("model", ""), run_with, kw.get("cfg") or self.config)
@@ -363,6 +363,15 @@ class AgentRun:
         finally:
             if self.launch_done:
                 self.launch_done(step, bool(res and (res.ok or res.turns)))
+
+    def lane_env(self) -> dict[str, str]:
+        if self.layer is None:
+            return {}
+        names = check_lanes(self.layer, self)
+        with suppress(OSError):
+            for name in names:
+                util.lock_file(name).close()
+        return {lanes.ENV: ",".join(names)}
 
     def fit_route(self, step: str, text: str, s: steps.Settings | None, kw: dict) -> dict:
         cfg = kw.get("cfg") or self.config
@@ -1050,28 +1059,18 @@ def untracked_added_since(before: dict[Path, set[str]]) -> list[tuple[Path, str]
 
 
 def check_lanes(layer: config.RepoLayer, run: AgentRun) -> list[str]:
-    if not layer.parallel_checks:
-        return [CHECKS_LOCK]
-    return [f"{CHECKS_LOCK}-{n}" for n in range(run.config.max_parallel_checks)]
-
-
-def take_free_lane(files: list[TextIO]) -> bool:
-    for f in files:
-        if util.flock_now(f):
-            util.mark_holder(f, os.getpid())
-            return True
-    return False
+    return lanes.names(layer.parallel_checks, run.config.max_parallel_checks)
 
 
 @contextmanager
 def check_lane(layer: config.RepoLayer, run: AgentRun):
     with ExitStack() as stack:
         files = [stack.enter_context(util.lock_file(name)) for name in check_lanes(layer, run)]
-        if not take_free_lane(files):
+        if not lanes.take_free(files):
             run.log("checks: waiting for another run's checks to finish" if len(files) == 1 else
                     f"checks: waiting for a free check lane (max_parallel_checks {len(files)})")
             with run.waiting("slot"):
-                while not take_free_lane(files):
+                while not lanes.take_free(files):
                     time.sleep(CHECK_LANE_POLL_SECONDS)
         yield
 
