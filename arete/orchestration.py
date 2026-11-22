@@ -240,8 +240,15 @@ class Controller:
                 raise factory.Refused("preparation was interrupted before durable workspace authority; reconcile before restarting")
             self.data["preparing"] = True
             ledger.save(self.lease, self.data)
-            outcome = self.atomic("prepare", tree=str(self.job.ws))
+            try:
+                outcome = self.atomic("prepare", tree=str(self.job.ws))
+            except owner_asks.Asked:
+                del self.data["preparing"]
+                ledger.save(self.lease, self.data)
+                raise
             if not outcome.passed:
+                del self.data["preparing"]
+                ledger.save(self.lease, self.data)
                 return flows.ended(self.flow, outcome)
             self.data["prepared"] = outcome.data
             self.job.goal = f"Check the issue and owner's answers in use:\n{self.job.ticket.title}\n{self.job.ticket.body}"
