@@ -732,6 +732,8 @@ class Controller:
             inputs["journeys"] = journeys.guidance(self.job.layer.verify.feature_map, planning=True)
         if "verify" in args["inputs"] and pipeline.triage_checks(self.job.approval):
             inputs["verify"] = pipeline.triage_goal(str(inputs["verify"]), self.job.approval)
+        if not writing:
+            inputs["class_check"] = ""
         prompt = self.job.brief.prompt("delegate" if name in ("delegate", "investigate") else name, **inputs)
         if writing and denied_feedback:
             prompt += f"\n\n## Check failure to repair\n\n{denied_feedback}"

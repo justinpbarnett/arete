@@ -586,7 +586,8 @@ class Job:
         return prompt_loader.Brief(self.run.repo.name, self.workspace, t.ref, t.title, t.body,
                                    owner=self.run.owner_note, comments=t.comments, attachments=self.attachments,
                                    expertise=self.expertise, commands=self.commands, max_lines=self.layer.max_diff_lines,
-                                   denied=prompt_loader.code_list(diffguard.denied_paths(self.layer)))
+                                   denied=prompt_loader.code_list(diffguard.denied_paths(self.layer)),
+                                   class_check=pipeline.class_check_example(self.run.dir, self.layer))
 
     @property
     def b(self) -> pipeline.Build:
