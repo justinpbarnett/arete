@@ -44,6 +44,80 @@ from tests.parallel import stack_env
 from tests.subprocess_helpers import CHILD_HANG_TIMEOUT
 
 
+class ParallelStackEnvironmentTests(unittest.TestCase):
+    def setUp(self):
+        self.home = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True))).resolve()
+
+    def test_stack_env_creates_fresh_directories_outside_live_arete(self):
+        home = Path.home().resolve()
+        live = {"ARETE_STATE_DIR": home / ".local/share/arete",
+                "ARETE_CONFIG_DIR": home / ".config/arete",
+                "ARETE_LOG_DIR": home / "Library/Logs/arete"}
+        inherited = {name: str(self.home / directory.relative_to(home)) for name, directory in live.items()}
+        inherited["HOME"] = str(self.home)
+        first, second = stack_env(inherited), stack_env(inherited)
+
+        self.assertNotEqual(first["ARETE_STATE_DIR"], second["ARETE_STATE_DIR"])
+        for env in (first, second):
+            state, config_dir, log_dir = (Path(env[name]).resolve() for name in live)
+            self.assertIn(state, config_dir.parents)
+            self.assertIn(state, log_dir.parents)
+            for directory in (state, config_dir, log_dir):
+                self.assertTrue(directory.is_dir())
+                self.assertFalse(any(directory.is_relative_to(root) for root in live.values()), directory)
+
+    def test_child_import_resolves_locks_under_stack_state(self):
+        env = stack_env({"HOME": str(self.home)})
+        state = Path(env["ARETE_STATE_DIR"])
+        child = subprocess.run([sys.executable, "-c", "from arete.paths import LOCKS_DIR; print(LOCKS_DIR)"],
+                               env=env, check=True, capture_output=True, text=True, timeout=CHILD_HANG_TIMEOUT)
+        self.assertEqual(Path(child.stdout.strip()), state / "locks")
+
+    def scratch_child(self, settings):
+        env = stack_env({"HOME": str(self.home), "ARETE_FIXTURE_TOKEN": "synthetic", **settings})
+        probe = """
+import os
+from arete import paths
+
+print(paths.CONFIG_DIR)
+print(paths.LOCKS_DIR)
+print(paths.ISOLATED)
+print("ARETE_FIXTURE_TOKEN" in os.environ)
+"""
+        return subprocess.run(
+            [sys.executable, "-c", probe],
+            env=env, capture_output=True, text=True, timeout=CHILD_HANG_TIMEOUT,
+        )
+
+    def test_child_scrubs_credentials_for_each_scratch_selector(self):
+        scratch = self.home / (paths.SCRATCH_PREFIX + "0123456789abcdef")
+        scratch.mkdir(mode=0o700)
+        for name, selected in ((paths.SCRATCH_ENV, scratch),
+                               ("ARETE_CONFIG_DIR", scratch / "custom-config"),
+                               ("ARETE_STATE_DIR", scratch / "custom-state")):
+            with self.subTest(selector=name):
+                child = self.scratch_child({name: str(selected)})
+                config_dir = selected if name == "ARETE_CONFIG_DIR" else scratch / "config"
+                state_dir = selected if name == "ARETE_STATE_DIR" else scratch / "state"
+                self.assertEqual(child.returncode, 0, child.stderr)
+                self.assertEqual(child.stdout.splitlines(), [str(config_dir), str(state_dir / "locks"), "True", "False"])
+
+    def test_child_refuses_invalid_scratch_settings(self):
+        invalid = self.home / (paths.SCRATCH_PREFIX + "invalid")
+        invalid.mkdir(mode=0o700)
+        alias = self.home / "alias"
+        alias.symlink_to(invalid, target_is_directory=True)
+        for name, selected in ((paths.SCRATCH_ENV, invalid),
+                               ("ARETE_CONFIG_DIR", invalid / "config"),
+                               ("ARETE_STATE_DIR", invalid / "state"),
+                               ("ARETE_STATE_DIR", alias / "state"),
+                               ("HOME", invalid / "home")):
+            with self.subTest(selector=name, path=selected):
+                child = self.scratch_child({name: str(selected)})
+                self.assertNotEqual(child.returncode, 0)
+                self.assertIn("refusing to start", child.stderr)
+
+
 class ParallelClassDeadlineTests(unittest.TestCase):
     def run_first_attempt(self, load_ratio):
         folder = self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True))
@@ -7678,8 +7752,10 @@ class ServeStatusTests(unittest.TestCase):
             "at": "2026-11-21T00:00:00Z", "engine": running, "checkout_head": checkout,
         }))
         installed = Path(sysconfig.get_path("scripts")) / "arete"
-        result = subprocess.run([str(installed), "status", *args], cwd=self.root,
-                                env=stack_env({**env, "PYTHONPATH": str(self.root), "PYTHONDONTWRITEBYTECODE": "1"}),
+        child_env = {**env, "PYTHONPATH": str(self.root), "PYTHONDONTWRITEBYTECODE": "1"}
+        stacked = stack_env(child_env)
+        child_env.update(PYTHONPATH=stacked["PYTHONPATH"], ARETE_DESKTOP_NOTIFY=stacked["ARETE_DESKTOP_NOTIFY"])
+        result = subprocess.run([str(installed), "status", *args], cwd=self.root, env=child_env,
                                 capture_output=True, text=True, timeout=CHILD_HANG_TIMEOUT)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertEqual(result.stdout, "")

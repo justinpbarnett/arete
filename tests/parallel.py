@@ -32,7 +32,27 @@ THREAD = re.compile(r"(?:Current thread|Thread) (0x[0-9a-f]+) \(most recent call
 
 
 def stack_env(env):
+    import atexit
+    from pathlib import Path
+    from pwd import getpwuid
+
+    from arete.local_paths import SCRATCH_ENV, inside_scratch
+
     env = {**env, "ARETE_DESKTOP_NOTIFY": "0"}
+    # Preserve scratch selectors so worker startup can validate them.
+    if not env.get(SCRATCH_ENV):
+        home = Path((env["HOME"] if "HOME" in env else getpwuid(os.getuid()).pw_dir) or os.sep)
+        config = Path(env.get("ARETE_CONFIG_DIR", home / ".config" / "arete"))
+        state = Path(env.get("ARETE_STATE_DIR", home / ".local" / "share" / "arete"))
+        if not (inside_scratch(config) or inside_scratch(state)):
+            temporary = tempfile.TemporaryDirectory(prefix="arete-test-state-", ignore_cleanup_errors=True)
+            atexit.register(temporary.cleanup)
+            state = Path(temporary.name)
+            config = state / "config"
+            logs = state / "logs"
+            config.mkdir()
+            logs.mkdir()
+            env.update(ARETE_STATE_DIR=str(state), ARETE_CONFIG_DIR=str(config), ARETE_LOG_DIR=str(logs))
     if not env.get(_test_stacks.PREFIX_ENV):
         return env
     pythonpath = env.get("PYTHONPATH")
