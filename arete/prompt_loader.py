@@ -90,6 +90,7 @@ class Brief:
     commands: str | None = None
     max_lines: int | None = None
     journeys: str = ""
+    denied: str = ""
 
     def prompt(self, name: str, prompts_dir: Path = paths.PROMPTS_DIR, **step) -> str:
         values = {f.name: getattr(self, f.name) for f in fields(self)}

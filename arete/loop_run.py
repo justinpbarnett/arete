@@ -541,22 +541,24 @@ def command_loop(run: LoopRun) -> tuple[str, str]:
         else:
             said.append(line)
     took = f"exit {code} in {time.monotonic() - started:.0f}s"
-    if code != 0:
-        from . import mergecheck
+    from . import mergecheck
 
+    partial = code == mergecheck.INCOMPLETE_EXIT and mergecheck.builtin(loop) and bool(found)
+    if code != 0 and not partial:
         if mergecheck.builtin(loop) and code == mergecheck.HOLD_EXIT:
             loop_store.release_claimed_items(run.id)
             return "skipped", "merge-check quota hold; input waits until the next UTC day"
         return "failed", f"{took}: {util.first_line(lines[-1] if lines else '', 300)}"
-    from . import mergecheck
-
     if not found and (not said or mergecheck.builtin(loop)):
         return "skipped", took + ", no output; zero model calls"
     fresh = new_findings(run, found)
-    outcome = {"summary": util.first_line(said[-1], 300) if said else "", "trust": weakest_trust(run.events)}
+    outcome = {"summary": util.first_line(said[-1], 300) if said and not partial else "",
+               "trust": weakest_trust(run.events)}
     if loop.emits:
         delivery.deliver(loop, run.id, fresh, outcome, trial=run.trial, log=run.log, cfg=run.cfg)
     hand_on(run, fresh)
+    if partial:
+        return "failed", f"{took}: {util.first_line(said[-1] if said else '', 300)}"
     return "done", took + (f", {util.count(len(fresh), 'new finding')}" if found else "")
 
 

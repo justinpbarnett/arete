@@ -11,7 +11,8 @@ import urllib.error
 import urllib.request
 import uuid
 from collections.abc import Sequence
-from dataclasses import dataclass
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from datetime import timedelta
 from urllib.parse import urlencode
 
@@ -19,8 +20,10 @@ from . import config, outbound, paths, util
 
 ARETE_MARK = "<!-- arete -->"
 GITHUB_API = "https://api.github.com"
+GITHUB_ACTIONS_APP_ID = 15368
 CLONE_TOKEN_PERMISSIONS = {"contents": "read"}
 NO_ISSUE = "Could not resolve to an issue"
+_deployment_ci_deadline: ContextVar[float | None] = ContextVar("deployment_ci_deadline", default=None)
 
 
 class GhError(RuntimeError):
@@ -28,6 +31,10 @@ class GhError(RuntimeError):
 
 
 class GhUnsure(GhError):
+    pass
+
+
+class WorkflowNotForPR(GhError):
     pass
 
 
@@ -81,8 +88,13 @@ def gh(args: list[str], cwd=None, timeout: float = 120, input: str | None = None
     return res.stdout
 
 
-def gh_json(args: list[str], cwd=None, timeout: float = 120):
-    out = gh(args, cwd=cwd, timeout=timeout)
+def gh_json(args: list[str], cwd=None, timeout: float = 120, *, retry: bool = True):
+    if (deadline := _deployment_ci_deadline.get()) is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise GhError("deployment CI lookup timed out")
+        timeout, retry = min(timeout, remaining), False
+    out = gh(args, cwd=cwd, timeout=timeout, retry=retry)
     return json.loads(out) if out.strip() else None
 
 
@@ -146,8 +158,8 @@ def comment_key(path: str, key: str, start):
 
 
 def keyed_comment(args: list[str], body: str, path: str, mark: bool = False, envelope: bool = False,
-                  *, single_attempt: bool = False) -> str:
-    key, start = uuid.uuid4().hex, util.now()
+                  *, key: str = "", single_attempt: bool = False) -> str:
+    key, start = key or uuid.uuid4().hex, util.now()
     payload = outgoing(body, mark=mark, key=key)
     if envelope:
         payload = Outgoing(json.dumps({"body": payload}))
@@ -176,8 +188,9 @@ def split_link(body: str, links) -> tuple[str, str]:
     return "", body
 
 
-def issue_create(repo: str, title: str, body: str, labels: Sequence[str] = (), *, single_attempt: bool = False) -> int:
-    key = uuid.uuid4().hex
+def issue_create(repo: str, title: str, body: str, labels: Sequence[str] = (), *, key: str = "",
+                 single_attempt: bool = False) -> int:
+    key = key or uuid.uuid4().hex
     args = ["issue", "create", "--repo", repo, "--title", outbound.screen(title), "--body-file", "-"]
     for lb in labels:
         args += ["--label", lb]
@@ -196,8 +209,10 @@ def issue_create(repo: str, title: str, body: str, labels: Sequence[str] = (), *
         if number := recovery_lookup(find):
             return int(number)
         reply = gh(args, input=payload, write=True)
-    url = reply.strip().splitlines()[-1]
-    return int(url.rstrip("/").rsplit("/", 1)[-1])
+    parts = reply.strip().splitlines()
+    if not parts or not (number := re.fullmatch(r"https://[^/]+/[^/]+/[^/]+/issues/([1-9][0-9]*)/?", parts[-1])):
+        raise GhUnsure("GitHub did not confirm the created issue number")
+    return int(number[1])
 
 
 def recent_issues(repo: str, limit: int = 100) -> list[dict]:
@@ -286,6 +301,45 @@ def issue_edit_body(repo: str, number: int, body: str) -> None:
     gh(["issue", "edit", str(number), "--repo", repo, "--body-file", "-"], input=outgoing(body))
 
 
+def issue_merge_commit(repo: str, number: int, base: str) -> str:
+    owner, name = repo.split("/", 1)
+    query = """
+    query($owner:String!, $name:String!, $number:Int!) {
+      repository(owner:$owner, name:$name) {
+        issue(number:$number) {
+          state stateReason
+          timelineItems(last:1, itemTypes:[CLOSED_EVENT, REOPENED_EVENT]) {
+            nodes { ... on ClosedEvent { closer {
+              __typename
+              ... on PullRequest { ...Fix }
+              ... on Commit { oid associatedPullRequests(first:10) { nodes { ...Fix } } }
+            } } }
+          }
+        }
+      }
+    }
+    fragment Fix on PullRequest {
+      merged baseRefName repository { nameWithOwner } mergeCommit { oid }
+    }
+    """
+    result = gh_json(["api", "graphql", "-f", outgoing(f"query={query}"), "-f", outgoing(f"owner={owner}"),
+                      "-f", outgoing(f"name={name}"), "-F", outgoing(f"number={number}")]) or {}
+    issue = ((result.get("data") or {}).get("repository") or {}).get("issue") or {}
+    if (issue.get("state"), issue.get("stateReason")) != ("CLOSED", "COMPLETED"):
+        return ""
+    events = (issue.get("timelineItems") or {}).get("nodes") or []
+    closer = ((events[-1] or {}).get("closer") or {}) if events else {}
+    pulls = ([closer] if closer.get("__typename") == "PullRequest" else
+             (closer.get("associatedPullRequests") or {}).get("nodes") or [])
+    for pr in filter(None, pulls):
+        sha = (pr.get("mergeCommit") or {}).get("oid") or ""
+        actual_repo = (pr.get("repository") or {}).get("nameWithOwner") or ""
+        if (pr.get("merged") is True and pr.get("baseRefName") == base and actual_repo.casefold() == repo.casefold()
+                and re.fullmatch(r"[0-9a-f]{40}", sha) and (pr is closer or closer.get("oid") == sha)):
+            return sha
+    return ""
+
+
 def issue_reopen(repo: str, number: int) -> None:
     gh(["issue", "reopen", str(number), "--repo", repo])
 
@@ -317,6 +371,12 @@ def prs(repo: str, label: str = "", state: str = "open", limit: int = 50) -> lis
     return gh_json(args) or []
 
 
+def open_labeled_pr_urls(repo: str, label: str) -> list[str]:
+    query = urlencode({"state": "open", "labels": label, "per_page": 100})
+    pages = gh_json(["api", f"repos/{repo}/issues?{query}", "--paginate", "--slurp"]) or []
+    return [row["html_url"] for page in pages for row in page if "pull_request" in row]
+
+
 def open_pr_url(repo: str, head: str) -> str:
     rows = gh_json(["pr", "list", "--repo", repo, "--head", head, "--state", "open", "--limit", "1", "--json", "url"])
     return rows[0]["url"] if rows else ""
@@ -340,9 +400,26 @@ def pr_edit_body(url: str, body: str, link: str = "") -> None:
     gh(["pr", "edit", url, "--body-file", "-"], input=outgoing(body, link))
 
 
-def pr_comment(url: str, body: str) -> None:
+def pr_comment(url: str, body: str, *, key: str = "", single_attempt: bool = False) -> None:
     keyed_comment(["pr", "comment", url, "--body-file", "-"], body,
-                  f"repos/{pr_repo(url)}/issues/{pr_number(url)}/comments", mark=True)
+                  f"repos/{pr_repo(url)}/issues/{pr_number(url)}/comments", mark=True,
+                  key=key, single_attempt=single_attempt)
+
+
+def find_own_pr_comment(repo: str, number: int, *markers: str) -> dict | None:
+    author = me()
+    if not author:
+        return None
+    own = [(row, (row.get("body") or "").splitlines())
+           for row in api_list(f"repos/{repo}/issues/{number}/comments")
+           if (row.get("user") or {}).get("login") == author]
+    return next((row for marker in markers for row, lines in own if marker in lines), None)
+
+
+def pr_edit_comment(repo: str, comment_id: int, body: str, *, key: str = "") -> None:
+    payload = Outgoing(json.dumps({"body": outgoing(body, mark=True, key=key)}))
+    gh(["api", "-X", "PATCH", f"repos/{repo}/issues/comments/{comment_id}", "--input", "-"],
+       input=payload, write=True)
 
 
 def pr_reply(url: str, comment_id: int, body: str) -> None:
@@ -460,6 +537,35 @@ def pr_set_draft(url: str, draft: bool) -> None:
     gh(["pr", "ready", url, *(["--undo"] if draft else [])])
 
 
+def pr_close(url: str) -> None:
+    gh(["pr", "close", url], write=True)
+
+
+def pr_add_label(url: str, name: str) -> None:
+    gh(["pr", "edit", url, "--add-label", name], write=True)
+
+
+def pr_update_branch(repo: str, number: int, head: str) -> None:
+    gh(["api", "-X", "PUT", f"repos/{repo}/pulls/{number}/update-branch", "--input", "-"],
+       input=Outgoing(json.dumps({"expected_head_sha": head})), write=True)
+
+
+def pr_squash(repo: str, number: int, head: str) -> None:
+    gh(["pr", "merge", str(number), "--repo", repo, "--squash", "--match-head-commit", head], write=True)
+
+
+def actions_check_passed(repo: str, head: str, name: str) -> bool:
+    query = urlencode({"check_name": name, "filter": "latest", "per_page": 100})
+    path = f"repos/{repo}/commits/{head}/check-runs?{query}"
+    reply = json.loads(gh(["api", path], retry=False) or "{}")
+    rows = reply.get("check_runs", [])
+    if reply.get("total_count", len(rows)) > len(rows):
+        return False
+    runs = [row for row in rows if row.get("name") == name
+            and row.get("head_sha") == head and (row.get("app") or {}).get("id") == GITHUB_ACTIONS_APP_ID]
+    return bool(runs) and all(row.get("status") == "completed" and row.get("conclusion") == "success" for row in runs)
+
+
 def pr_draft_and_head(url: str) -> tuple[bool, str]:
     row = gh_json(["pr", "view", url, "--json", "isDraft,headRefOid"]) or {}
     return bool(row.get("isDraft")), str(row.get("headRefOid") or "")
@@ -467,6 +573,35 @@ def pr_draft_and_head(url: str) -> tuple[bool, str]:
 
 MERGE_WAIT_SECONDS = 120
 MERGE_POLL_SECONDS = 5
+MOVED_BASE_STATES = {"BEHIND", "DIRTY"}
+BASE_MERGE_REJECTION = r"(?:Pull Request is not mergeable|Base branch was modified\. Review and try the merge again)\.?"
+BASE_MERGE_HTTP_REJECTION = re.compile(rf"(?:^|: ){BASE_MERGE_REJECTION}\s*\(HTTP (?:405|409)\)$", re.IGNORECASE)
+
+
+class MovedBaseHold(str):
+    pass
+
+
+class BaseTipChanged(str):
+    pass
+
+
+def pr_merge_details(pr: str, repo: str = "", *, timeout: float = 120, retry: bool = True) -> dict:
+    fields = "state,isDraft,headRefOid,baseRefName,baseRefOid,mergeStateStatus,mergeable,title"
+    args = ["pr", "view", pr, "--json", fields]
+    if repo:
+        args += ["--repo", repo]
+    return gh_json(args, timeout=timeout, retry=retry) or {}
+
+
+def merge_ref_hold(row: dict, head: str, base: str) -> str:
+    if row.get("state") != "OPEN" or row.get("isDraft") is not False:
+        return "the PR is not open and ready for review"
+    if row.get("headRefOid") != head:
+        return "the PR head changed after verification"
+    if row.get("baseRefName") != base:
+        return "the PR base changed after verification"
+    return ""
 
 
 def merge_ci_passed(repo: str, head: str, *, required: dict | None = None) -> bool:
@@ -491,21 +626,44 @@ def merge_ci_passed(repo: str, head: str, *, required: dict | None = None) -> bo
                                            for row in runs) and all(state == "success" for state in contexts.values()))
 
 
+def deployment_ci_refusal(repo: str, head: str, required: dict, *, timeout: float) -> str:
+    token = _deployment_ci_deadline.set(time.monotonic() + timeout)
+    try:
+        return "" if merge_ci_passed(repo, head, required=required) else _required_ci_refusal(repo, head, required)
+    except (GhError, OSError, ValueError, KeyError, TypeError, AttributeError):
+        return "CI unavailable"
+    finally:
+        _deployment_ci_deadline.reset(token)
+
+
+def _required_ci_refusal(repo: str, head: str, required: dict) -> str:
+    query = urlencode({"filter": "latest", "per_page": 100, "check_name": required["context"]})
+    pages = gh_json(["api", f"repos/{repo}/commits/{head}/check-runs?{query}", "--paginate", "--slurp"])
+    runs = [row for page in pages for row in page["check_runs"]
+            if row.get("head_sha") == head and row.get("name") == required["context"]
+            and (row.get("app") or {}).get("id") == required["app_id"]]
+    if any(row["status"] == "completed" and row["conclusion"] != "success" for row in runs):
+        return "CI failed"
+    if not runs or any(row["status"] != "completed" for row in runs):
+        return "CI pending"
+    return "CI not passing"
+
+
 def merge_readiness(repo: str, number: int, head: str, base: str, base_sha: str, *, wait: float = 0,
-                    required: dict | None = None) -> tuple[str, str]:
+                    required: dict | None = None, track_moved_base: bool = False) -> tuple[str, str]:
     if not head or not base or not base_sha:
         return "", "the checked head and base are not known"
     deadline = time.monotonic() + wait
-    fields = "state,isDraft,headRefOid,baseRefName,baseRefOid,mergeStateStatus,mergeable,title"
     while True:
-        row = gh_json(["pr", "view", str(number), "--repo", repo, "--json", fields]) or {}
-        if row.get("state") != "OPEN" or row.get("isDraft") is not False:
-            return "", "the PR is not open and ready for review"
-        if row.get("headRefOid") != head:
-            return "", "the PR head changed after verification"
-        if row.get("baseRefName") != base or row.get("baseRefOid") != base_sha:
-            return "", "the PR base changed after verification"
+        row = pr_merge_details(str(number), repo)
+        if hold := merge_ref_hold(row, head, base):
+            return "", hold
         state, mergeable = row.get("mergeStateStatus"), row.get("mergeable")
+        if track_moved_base and state in MOVED_BASE_STATES:
+            return "", MovedBaseHold(f"GitHub reports merge state {state}, mergeable {mergeable}")
+        if row.get("baseRefOid") != base_sha:
+            hold = "the PR base changed after verification"
+            return "", BaseTipChanged(hold) if track_moved_base else hold
         remaining = deadline - time.monotonic()
         if "UNKNOWN" not in (state, mergeable) or remaining <= 0:
             break
@@ -517,23 +675,53 @@ def merge_readiness(repo: str, number: int, head: str, base: str, base_sha: str,
     return str(row.get("title") or "").strip(), ""
 
 
-def pr_merge_auto(repo: str, number: int, head: str, base: str, base_sha: str) -> str:
-    subject, hold = merge_readiness(repo, number, head, base, base_sha)
+def merge_rejection_hold(repo: str, number: int, head: str, base: str, base_sha: str) -> str:
+    row = pr_merge_details(str(number), repo)
+    if hold := merge_ref_hold(row, head, base):
+        return hold
+    if row.get("baseRefOid") and row["baseRefOid"] != base_sha:
+        return BaseTipChanged("GitHub rejected the merge after the PR base changed")
+    return ""
+
+
+def pr_merge_auto(repo: str, number: int, head: str, base: str, base_sha: str, *, track_moved_base: bool = False) -> str:
+    subject, hold = merge_readiness(repo, number, head, base, base_sha, track_moved_base=track_moved_base)
     if hold:
         return hold
     payload = {"sha": head, "merge_method": "squash"}
     if subject:
         payload["commit_title"] = f"{subject} (#{number})"
-    result = json.loads(gh(["api", "-X", "PUT", f"repos/{repo}/pulls/{number}/merge", "--input", "-"],
-                           input=Outgoing(json.dumps(payload)), write=True) or "{}")
-    return "" if result.get("merged") is True else "GitHub did not confirm the merge"
-
-
-def default_branch(repo: str) -> str:
     try:
-        return (gh_json(["repo", "view", repo, "--json", "defaultBranchRef"]) or {})["defaultBranchRef"]["name"]
+        reply = gh(["api", "-X", "PUT", f"repos/{repo}/pulls/{number}/merge", "--input", "-"],
+                   input=Outgoing(json.dumps(payload)), write=True)
+    except GhError as error:
+        if track_moved_base and not isinstance(error, GhUnsure) and BASE_MERGE_HTTP_REJECTION.search(str(error)):
+            if hold := merge_rejection_hold(repo, number, head, base, base_sha):
+                return hold
+        raise
+    if not track_moved_base:
+        result = json.loads(reply or "{}")
+        return "" if result.get("merged") is True else "GitHub did not confirm the merge"
+    try:
+        result = json.loads(reply)
+    except ValueError:
+        raise GhUnsure("GitHub did not return a definite merge outcome") from None
+    if not isinstance(result, dict) or type(result.get("merged")) is not bool:
+        raise GhUnsure("GitHub did not return a definite merge outcome")
+    if result["merged"]:
+        return ""
+    if re.fullmatch(BASE_MERGE_REJECTION, str(result.get("message", "")).strip(), re.IGNORECASE):
+        if hold := merge_rejection_hold(repo, number, head, base, base_sha):
+            return hold
+    return "GitHub rejected the merge"
+
+
+def default_branch(repo: str, *, fallback: str = "main", timeout: float = 120, retry: bool = True) -> str:
+    try:
+        row = gh_json(["repo", "view", repo, "--json", "defaultBranchRef"], timeout=timeout, retry=retry) or {}
+        return row["defaultBranchRef"]["name"] or fallback
     except (GhError, KeyError, TypeError):
-        return "main"
+        return fallback
 
 
 def base64url(data: bytes) -> str:
@@ -628,6 +816,7 @@ def repo_private(repo: str) -> bool | None:
 
 PASSING_CONCLUSIONS = {"success", "neutral"}
 STATUS_STATES = {"success": "pass", "pending": "pending", "failure": "fail", "error": "fail"}
+CheckKey = tuple[str, str]
 
 
 @dataclass
@@ -639,19 +828,47 @@ class Check:
     job: int = 0
     description: str = ""
     check_run_id: int = 0
+    source: str = "status"
+    workflow_run_id: int = 0
+    details_url: str = ""
+    actions_only: bool = False
+
+    @property
+    def key(self) -> CheckKey:
+        if self.actions_only:
+            return f"actions-job:{self.job}", self.name
+        if self.workflow_run_id:
+            return f"workflow-job:{self.workflow_run_id}", self.name
+        return self.context_key
+
+    @property
+    def context_key(self) -> CheckKey:
+        return self.source, self.name
+
+    def actions_workflow(self, repo: str) -> int:
+        from_link = actions_run_id(repo, self.link)
+        from_details = actions_run_id(repo, self.details_url)
+        if from_link and from_details and from_link != from_details:
+            return 0
+        return from_link or from_details
+
+
+def check_state(row: dict) -> str:
+    if row.get("status") != "completed":
+        return "pending"
+    if row.get("conclusion") == "skipped":
+        return "skipped"
+    return "pass" if row.get("conclusion") in PASSING_CONCLUSIONS else "fail"
 
 
 def check_from_run(row: dict) -> Check:
-    if row.get("status") != "completed":
-        state = "pending"
-    elif row.get("conclusion") == "skipped":
-        state = "skipped"
-    else:
-        state = "pass" if row.get("conclusion") in PASSING_CONCLUSIONS else "fail"
-    actions = (row.get("app") or {}).get("slug") == "github-actions"
-    return Check(row["name"], state, row.get("completed_at") or row.get("started_at") or "",
-                 row.get("html_url") or row.get("details_url") or "", row["id"] if actions else 0,
-                 ((row.get("output") or {}).get("title") or "").strip(), row["id"])
+    app = row.get("app") or {}
+    actions = app.get("slug") == "github-actions"
+    details_url = row.get("details_url") or ""
+    return Check(row["name"], check_state(row), row.get("completed_at") or row.get("started_at") or "",
+                 row.get("html_url") or details_url, row["id"] if actions else 0,
+                 ((row.get("output") or {}).get("title") or "").strip(), row["id"],
+                 f"app:{app.get('id') or app.get('slug') or ''}", details_url=details_url)
 
 
 def check_from_status(row: dict) -> Check:
@@ -659,15 +876,97 @@ def check_from_status(row: dict) -> Check:
                  row.get("target_url") or "", 0, (row.get("description") or "").strip())
 
 
-def commit_checks(repo: str, ref: str) -> dict[str, Check]:
-    pages = gh_json(["api", f"repos/{repo}/commits/{ref}/check-runs?per_page=100", "--paginate", "--slurp"]) or []
-    runs = sorted((check_from_run(r) for page in pages for r in page.get("check_runs", [])), key=lambda c: c.check_run_id)
-    statuses = (gh_json(["api", f"repos/{repo}/commits/{ref}/status?per_page=100"]) or {}).get("statuses", [])
-    newest: dict[str, Check] = {c.name: c for c in runs}
-    for c in map(check_from_status, statuses):
-        if c.name not in newest or c.updated > newest[c.name].updated:
-            newest[c.name] = c
+def commit_checks(repo: str, ref: str, *, timeout: float = 120, retry: bool = True,
+                  red_workflows: set[int] | None = None, latest: bool = False) -> dict[CheckKey, Check]:
+    path = f"repos/{repo}/commits/{ref}"
+    filter_runs = "latest" if latest else "all"
+    pages = gh_json(["api", f"{path}/check-runs?filter={filter_runs}&per_page=100", "--paginate", "--slurp"],
+                    timeout=timeout, retry=retry)
+    if not isinstance(pages, list) or not pages or any(
+            not isinstance(page, dict) or not isinstance(page.get("check_runs"), list) for page in pages):
+        raise GhError("GitHub did not return check runs")
+    runs = sorted((check_from_run(r) for page in pages for r in page["check_runs"]), key=lambda c: c.check_run_id)
+    statuses = gh_json(["api", f"{path}/statuses?per_page=100", "--paginate", "--slurp"], timeout=timeout, retry=retry)
+    if not isinstance(statuses, list) or not statuses or any(
+            not isinstance(page, list) for page in statuses):
+        raise GhError("GitHub did not return commit statuses")
+    newest = ({c.key: c for c in runs} if red_workflows is None
+              else current_workflow_checks(repo, ref, runs, red_workflows, timeout=timeout))
+    # GitHub returns commit statuses in reverse chronological order.
+    for c in (check_from_status(row) for page in statuses for row in page):
+        newest.setdefault(c.key, c)
     return newest
+
+
+def publication_ci_passed(repo: str, head: str, *,
+                          actions_failures: Sequence[tuple[int, str] | tuple[int, str, int]] = ()) -> bool:
+    checks = commit_checks(repo, head, latest=True, red_workflows=set(), retry=False)
+    if any(check.state not in {"pass", "skipped"} for check in checks.values()):
+        return False
+    current_jobs = [(check.job, check.name, check.actions_workflow(repo)) for check in checks.values() if check.job]
+    unresolved = set()
+    for job, name, *workflow in actions_failures:
+        run = workflow[0] if workflow else 0
+        if not name:
+            row = actions_job(repo, head, job, retry=False)
+            name, run = row["name"], row.get("run_id")
+            if not run:
+                return False
+        if job and any(newer > job and current_name == name and (not run or current_run == run)
+                       for newer, current_name, current_run in current_jobs):
+            continue
+        if not run and job:
+            run = actions_job(repo, head, job, retry=False).get("run_id")
+        if type(run) is not int or run <= 0:
+            return False
+        unresolved.add(run)
+    unresolved.update(row["id"] for row in head_workflow_runs(repo, head, retry=False))
+    for run in sorted(unresolved):
+        row = workflow_run(repo, head, run, retry=False)
+        if row.get("status") != "completed":
+            return False
+        failures, _ = workflow_job_failures(repo, head, run, row["run_attempt"], retry=False)
+        if failures or check_state(row) == "fail":
+            return False
+    return bool(checks or unresolved)
+
+
+def run_number(row: dict) -> int:
+    return row["run_number"] if type(row.get("run_number")) is int else 0
+
+
+def head_workflow_runs(repo: str, head: str, **options) -> list[dict]:
+    query = urlencode({"head_sha": head, "per_page": 100})
+    latest: dict[object, dict] = {}
+    for row in actions_rows(f"repos/{repo}/actions/runs?{query}", "workflow_runs", **options):
+        if not isinstance(row, dict) or row.get("head_sha") != head or type(row.get("id")) is not int:
+            continue
+        key = row.get("workflow_id") or ("run", row["id"])
+        if key not in latest or run_number(row) >= run_number(latest[key]):
+            latest[key] = row
+    return list(latest.values())
+
+
+def current_workflow_checks(repo: str, head: str, runs: list[Check], red_workflows: set[int], *,
+                            timeout: float) -> dict[CheckKey, Check]:
+    red_workflows.clear()
+    red_workflows.update(c.actions_workflow(repo) for c in runs if c.state == "fail")
+    current, superseded = {}, set()
+    for run in sorted(red_workflows - {0}):
+        failures, replaced = current_workflow_failures(repo, head, run, timeout=timeout, retry=False)
+        superseded.update(replaced)
+        current.update((job, (run, name)) for job, name in failures.items())
+    runs = [c for c in runs if c.state != "fail" or c.job not in superseded]
+    red_workflows.intersection_update(c.actions_workflow(repo) for c in runs if c.state == "fail")
+    red_workflows.update(run for run, _ in current.values())
+    checks = {c.key: c for c in runs}
+    reported = {c.job for c in checks.values() if c.state == "fail"}
+    for job in sorted(current.keys() - reported):
+        run, name = current[job]
+        check = Check(name, "fail", link=f"https://github.com/{repo}/actions/runs/{run}/job/{job}", job=job,
+                      check_run_id=job, source=f"app:{GITHUB_ACTIONS_APP_ID}", actions_only=True)
+        checks[check.key] = check
+    return checks
 
 
 def branch_sha(repo: str, branch: str) -> str:
@@ -718,3 +1017,219 @@ def branch_heads(projects: set[str], branch: str) -> dict[str, str]:
 
 def job_log(repo: str, job: int) -> str:
     return gh(["api", f"repos/{repo}/actions/jobs/{job}/logs"], timeout=300)
+
+
+@dataclass(frozen=True)
+class WorkflowRerun:
+    run: int
+    attempt: int
+    jobs: dict[str, int]
+    unrelated: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def check_keys(self) -> set[CheckKey]:
+        return {(f"app:{GITHUB_ACTIONS_APP_ID}", name) for name in self.jobs}
+
+
+def workflow_lists_pr(pulls, number: int) -> bool:
+    return (isinstance(pulls, list) and len(pulls) == 1 and isinstance(pulls[0], dict)
+            and type(pulls[0].get("number")) is int and pulls[0]["number"] == number)
+
+
+def workflow_belongs_to_pr(row: dict, number: int) -> bool:
+    return row.get("event") == "pull_request" and workflow_lists_pr(row.get("pull_requests"), number)
+
+
+def workflow_belongs_to_head_branch(row: dict, repo: str, number: int, head: str, **options) -> bool:
+    pulls = row.get("pull_requests")
+    if not row.get("head_branch") or not (pulls == [] or row.get("event") == "push" and isinstance(pulls, list)):
+        return False
+    pull = gh_json(["api", f"repos/{repo}/pulls/{number}"], **options) or {}
+    ref = pull.get("head") or {}
+    branch_repo = (ref.get("repo") or {}).get("full_name")
+    run_repo = (row.get("head_repository") or {}).get("full_name")
+    return (type(pull.get("number")) is int and pull["number"] == number and pull.get("state") == "open"
+            and ref.get("sha") == head and ref.get("ref") == row["head_branch"]
+            and isinstance(branch_repo, str) and isinstance(run_repo, str)
+            and bool(branch_repo) and branch_repo.casefold() == run_repo.casefold())
+
+
+def workflow_run(repo: str, head: str, run: int, *, pr: str = "", allow_head_branch: bool = False, attempt: int = 0,
+                 timeout: float = 120, retry: bool = True) -> dict:
+    path = f"repos/{repo}/actions/runs/{run}" + (f"/attempts/{attempt}" if attempt else "")
+    row = gh_json(["api", path], timeout=timeout, retry=retry) or {}
+    actual = row.get("run_attempt")
+    if (type(row.get("id")) is not int or row["id"] != run or row.get("head_sha") != head
+            or type(actual) is not int or actual <= 0
+            or (attempt and actual != attempt)):
+        raise GhError(f"GitHub did not identify the workflow attempt for run {run} on {head}")
+    if pr:
+        number = pr_number(pr)
+        if pr_repo(pr).casefold() != repo.casefold() or not (
+                workflow_belongs_to_pr(row, number) or allow_head_branch and workflow_belongs_to_head_branch(
+                    row, repo, number, head, timeout=timeout, retry=retry)):
+            raise WorkflowNotForPR(f"GitHub did not identify workflow run {run} as belonging to {pr}")
+    return row
+
+
+def actions_rows(path: str, field: str, *, timeout: float = 120, retry: bool = True) -> list[dict]:
+    pages = gh_json(["api", path, "--paginate", "--slurp"], timeout=timeout, retry=retry)
+    if not isinstance(pages, list) or not pages or any(
+            not isinstance(page, dict) or not isinstance(page.get(field), list) for page in pages):
+        raise GhError(f"GitHub did not return Actions {field}")
+    return [row for page in pages for row in page[field]]
+
+
+def workflow_attempt_jobs(repo: str, head: str, run: int, attempt: int, *,
+                          timeout: float = 120, retry: bool = True) -> list[dict]:
+    path = f"repos/{repo}/actions/runs/{run}/attempts/{attempt}/jobs?per_page=100"
+    return [row for row in actions_rows(path, "jobs", timeout=timeout, retry=retry)
+            if row.get("run_id") == run and row.get("head_sha") == head
+            and row.get("run_attempt", attempt) == attempt
+            and type(row.get("id")) is int and row["id"] > 0
+            and isinstance(row.get("name"), str) and row["name"]]
+
+
+def failed_workflow_jobs(repo: str, head: str, run: int, attempt: int) -> dict[int, str]:
+    failed, _ = workflow_job_failures(repo, head, run, attempt)
+    return failed
+
+
+def current_workflow_failures(repo: str, head: str, run: int, **options) -> tuple[dict[int, str], set[int]]:
+    try:
+        row = workflow_run(repo, head, run, **options)
+        if row["run_attempt"] > 1:
+            return workflow_job_failures(repo, head, run, row["run_attempt"], **options)
+    except (GhError, OSError, KeyError, TypeError, ValueError, AttributeError):
+        pass
+    return {}, set()
+
+
+def workflow_job_failures(repo: str, head: str, run: int, attempt: int, **options) -> tuple[dict[int, str], set[int]]:
+    path = f"repos/{repo}/actions/runs/{run}/jobs?filter=all&per_page=100"
+    pages = gh_json(["api", path, "--paginate", "--slurp"], **options)
+    incomplete = f"GitHub did not return complete job results for workflow run {run} on {head}"
+    if not isinstance(pages, list) or not pages or any(
+            not isinstance(page, dict) or not isinstance(page.get("jobs"), list) for page in pages):
+        raise GhError(incomplete)
+    rows = [row for page in pages for row in page["jobs"]]
+    if not rows or any(type(page.get("total_count")) is not int or page["total_count"] != len(rows) for page in pages):
+        raise GhError(incomplete)
+    seen, attempts = set(), set()
+    jobs_by_name: dict[str, dict[int, list[dict]]] = {}
+    for row in rows:
+        if (not isinstance(row, dict) or type(row.get("run_id")) is not int or row["run_id"] != run
+                or row.get("head_sha") != head or type(row.get("run_attempt")) is not int
+                or not 0 < row["run_attempt"] <= attempt or row.get("status") != "completed"
+                or not isinstance(row.get("conclusion"), str) or not row["conclusion"]
+                or not isinstance(row.get("name"), str) or not row["name"]
+                or type(row.get("id")) is not int or row["id"] <= 0 or row["id"] in seen):
+            raise GhError(incomplete)
+        job_attempt = row["run_attempt"]
+        seen.add(row["id"])
+        attempts.add(job_attempt)
+        jobs_by_name.setdefault(row["name"], {}).setdefault(job_attempt, []).append(row)
+    if attempt not in attempts:
+        raise GhError(incomplete)
+    failed, superseded = {}, set()
+    for name, attempts_for_job in jobs_by_name.items():
+        if len(attempts_for_job) > 1 and any(len(jobs) > 1 for jobs in attempts_for_job.values()):
+            raise GhError(f"GitHub returned ambiguous attempts for jobs named {name} in workflow run {run}")
+        latest = max(attempts_for_job)
+        for job_attempt, jobs in attempts_for_job.items():
+            failures = [job["id"] for job in jobs if check_state(job) == "fail"]
+            if job_attempt == latest:
+                failed.update((job, name) for job in failures)
+            else:
+                superseded.update(failures)
+    return failed, superseded
+
+
+def latest_pr_workflows(repo: str, pr: str, head: str, **options) -> dict[int, dict]:
+    query = urlencode({"event": "pull_request", "head_sha": head, "per_page": 100})
+    number = pr_number(pr)
+    candidates = [row for row in actions_rows(f"repos/{repo}/actions/runs?{query}", "workflow_runs", **options)
+                  if row.get("head_sha") == head and workflow_belongs_to_pr(row, number)]
+    return {row["workflow_id"]: row for row in sorted(candidates, key=lambda row: row["run_number"])}
+
+
+def actions_job(repo: str, head: str, job: int, **options) -> dict:
+    row = gh_json(["api", f"repos/{repo}/actions/jobs/{job}"], **options) or {}
+    name = row.get("name")
+    if row.get("id") != job or row.get("head_sha") != head or not isinstance(name, str) or not name:
+        raise GhError(f"GitHub did not identify the Actions job {job} on {head}")
+    return row
+
+
+def failed_job_reruns(repo: str, pr: str, head: str, jobs: list[int]) -> list[WorkflowRerun]:
+    if not jobs or pr_repo(pr).casefold() != repo.casefold():
+        return []
+    names = {actions_job(repo, head, job)["name"] for job in jobs}
+
+    reruns = []
+    for current in latest_pr_workflows(repo, pr, head).values():
+        if not current.get("conclusion") or check_state(current) != "fail":
+            continue
+        run, attempt = current.get("id"), current.get("run_attempt")
+        if type(run) is not int or run <= 0 or type(attempt) is not int or attempt <= 0:
+            raise GhError(f"GitHub did not identify the workflow attempt for PR {pr_number(pr)} on {head}")
+        failed = {}
+        for row in workflow_attempt_jobs(repo, head, run, attempt):
+            if row.get("conclusion") and check_state(row) == "fail":
+                name, job = row["name"], row["id"]
+                if failed.setdefault(name, job) != job:
+                    raise GhError(f"GitHub returned multiple failed jobs named {name} in workflow run {run}")
+        if names.intersection(failed):
+            reruns.append(WorkflowRerun(run, attempt + 1, failed))
+    return reruns
+
+
+def workflow_check(run: dict) -> Check:
+    attempt, conclusion = run["run_attempt"], run.get("conclusion")
+    state, description = "pending", f"Workflow attempt {attempt} has no terminal result yet"
+    if run.get("status") == "completed" and conclusion:
+        state = "pass" if conclusion == "success" else "fail"
+        description = f"Workflow attempt {attempt} concluded {conclusion}"
+    return Check(run.get("name") or "GitHub Actions", state, run.get("updated_at") or "", run.get("html_url") or "",
+                 description=description, source=f"workflow:{run['id']}")
+
+
+def rerun_checks(repo: str, pr: str, head: str, rerun: WorkflowRerun, run: dict, **options) -> dict[CheckKey, Check]:
+    if run["run_attempt"] > rerun.attempt:
+        run = workflow_run(repo, head, rerun.run, pr=pr, allow_head_branch=bool(rerun.unrelated),
+                           attempt=rerun.attempt, **options)
+    if run["run_attempt"] != rerun.attempt or (workflow := workflow_check(run)).state == "pending":
+        return {}
+    try:
+        rows = workflow_attempt_jobs(repo, head, rerun.run, rerun.attempt, **options)
+    except GhError:
+        if workflow.state == "fail":
+            return {workflow.key: workflow}
+        raise
+    found: dict[CheckKey, Check] = {}
+    for row in rows:
+        name, job = row["name"], row["id"]
+        if job == rerun.jobs.get(name):
+            continue
+        check = Check(name, check_state(row), row.get("completed_at") or "", row.get("html_url") or "",
+                      job=job, check_run_id=job, source=f"app:{GITHUB_ACTIONS_APP_ID}")
+        if check.key in found or check.state == "pending" or not row.get("conclusion"):
+            return {workflow.key: workflow} if workflow.state == "fail" else {}
+        found[check.key] = check
+    if workflow.state == "pass":
+        return found if rerun.check_keys <= found.keys() else {}
+    if not any(check.state == "fail" for check in found.values()):
+        found[workflow.key] = workflow
+    return found
+
+
+def rerun_failed_jobs(repo: str, run: int) -> None:
+    gh(["run", "rerun", str(run), "--failed", "--repo", repo], write=True)
+
+
+def actions_run_id(repo: str, link: str) -> int:
+    if not isinstance(link, str):
+        return 0
+    match = re.fullmatch(rf"https://github\.com/{re.escape(repo)}/actions/runs/([1-9][0-9]{{0,19}})(?:[/?#].*)?",
+                         link, re.IGNORECASE)
+    return int(match[1]) if match else 0

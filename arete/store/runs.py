@@ -18,6 +18,10 @@ TABLES = {
     "reports": "kept",
     "run_purges": "until file cleanup",
     "environment_requeues": "kept",
+    "environment_holds": "with run",
+    "environment_hold_prs": "with run",
+    "environment_gap_creations": "kept",
+    "environment_budget_resets": "kept",
 }
 
 
@@ -153,8 +157,91 @@ def open_runs(repo: str, issue: int | str) -> list[dict]:
                                            "ORDER BY started DESC", (repo, issue))]
 
 
+def environment_holds(repo: str) -> list[dict]:
+    with reader() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT r.*, retry.id AS retry_id, retry.status AS retry_status "
+            "FROM environment_holds h JOIN runs r ON h.run_id = r.id "
+            "LEFT JOIN runs retry ON retry.environment_retry_of = r.id "
+            "AND retry.dry_run = 0 AND retry.status != 'dry-run' "
+            "WHERE r.repo = ? AND r.dry_run = 0 AND h.released = 0 AND (r.status = 'pr' OR retry.id IS NOT NULL) "
+            "ORDER BY r.started, r.id", (repo,))]
+
+
+def save_environment_hold(run_id: str, prs: list[tuple[str, int, str, str]]) -> None:
+    with db() as c:
+        c.execute("INSERT OR IGNORE INTO environment_holds (run_id) VALUES (?)", (run_id,))
+        c.executemany("INSERT OR IGNORE INTO environment_hold_prs (run_id, repo, number, url, head) "
+                      "VALUES (?, ?, ?, ?, ?)", [(run_id, *pr) for pr in prs])
+
+
+def held_environment_branch(repo: str, issue: str) -> str:
+    with reader() as c:
+        row = c.execute("SELECT r.branch FROM environment_holds h JOIN runs r ON h.run_id = r.id "
+                        "WHERE r.repo = ? AND r.issue = ? AND r.status = 'pr' AND r.dry_run = 0 AND h.released = 0 "
+                        "ORDER BY r.rowid DESC LIMIT 1", (repo, issue)).fetchone()
+    return (row["branch"] or "") if row else ""
+
+
+def environment_hold(run_id: str) -> dict:
+    with reader() as c:
+        row = c.execute("SELECT * FROM environment_holds WHERE run_id = ?", (run_id,)).fetchone()
+        if row is None:
+            return {}
+        heads = {r["url"]: r["head"] for r in c.execute(
+            "SELECT url, head FROM environment_hold_prs WHERE run_id = ? ORDER BY repo, number", (run_id,))}
+        return {**dict(row), "heads": heads, "waits": json.loads(row["waits"])}
+
+
+def set_environment_waits(run_id: str, waits: dict[str, tuple[str, int]]) -> None:
+    with db() as c:
+        c.execute("UPDATE environment_holds SET waits = ? WHERE run_id = ? AND released = 0",
+                  (json.dumps(waits, sort_keys=True), run_id))
+
+
+def release_environment_hold(run_id: str) -> None:
+    with db() as c:
+        c.execute("UPDATE environment_holds SET released = 1, waits = '{}' WHERE run_id = ?", (run_id,))
+
+
+def environment_waits(repo: str, issue: str) -> list[tuple[str, int]]:
+    with reader() as c:
+        return [(r[0], r[1]) for r in c.execute(
+            "SELECT DISTINCT json_extract(w.value, '$[0]'), json_extract(w.value, '$[1]') "
+            "FROM environment_holds h JOIN runs r ON h.run_id = r.id, json_each(h.waits) w "
+            "WHERE r.repo = ? AND r.issue = ? AND r.status = 'pr' AND r.dry_run = 0 AND h.released = 0", (repo, issue))]
+
+
+def environment_retry(run_id: str) -> bool:
+    with reader() as c:
+        return c.execute(f"SELECT 1 FROM runs WHERE environment_retry_of = ? AND {LIVE_RUN}", (run_id,)).fetchone() is not None
+
+
+def claim_environment_gap(repo: str, signature: str, day: str) -> bool:
+    with db() as c:
+        return c.execute("INSERT OR IGNORE INTO environment_gap_creations VALUES (?, ?, ?)",
+                         (repo, signature, day)).rowcount == 1
+
+
+def unclaim_environment_gap(repo: str, signature: str, day: str) -> None:
+    with db() as c:
+        c.execute("DELETE FROM environment_gap_creations WHERE repo = ? AND signature = ? AND day = ?",
+                  (repo, signature, day))
+
+
+def claim_environment_budget_resets(repo: str, issue: str, run_id: str,
+                                    gaps: tuple[tuple[str, int], ...]) -> list[int]:
+    with tx() as c:
+        return [number for project, number in gaps if c.execute(
+            "INSERT INTO environment_budget_resets (repo, issue, gap_repo, gap_issue, run_id) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT (repo, issue, gap_repo, gap_issue) DO UPDATE SET run_id = excluded.run_id "
+            "WHERE environment_budget_resets.run_id = excluded.run_id",
+            (repo, issue, project, number, run_id)).rowcount]
+
+
 def run_lock(kind: str, repo: str | None = None, issue: int | str | None = None) -> str:
     return {"pipeline": f"run-{repo}-{issue}", "slot": f"slot-{repo}-{issue}", "slot-wait": f"slot-wait-{repo}-{issue}",
+            "merge-wait": f"merge-wait-{repo}-{issue}",
             "eval": f"eval-{repo}", "experiment": f"experiment-{repo}", "eval-mine": "eval-mine", "miner": "mine"}[kind]
 
 
@@ -318,10 +405,11 @@ def ticket_runs_since(repo: str, issue: int | str, since: str, connect=reader) -
                                            "AND started >= ? ORDER BY started", (repo, issue, since))]
 
 
-def later_run(repo: str, issue: int | str, run_id: str, connect=reader) -> dict | None:
+def later_run(repo: str, issue: int | str, run_id: str, connect=reader, *, live: bool = False) -> dict | None:
     with connect() as c:
         r = c.execute(f"SELECT * FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? AND {WHOLE_RUN} "
-                      "AND rowid > (SELECT rowid FROM runs WHERE id = ?) ORDER BY rowid LIMIT 1",
+                      + (f"AND {LIVE_RUN} " if live else "")
+                      + "AND rowid > (SELECT rowid FROM runs WHERE id = ?) ORDER BY rowid LIMIT 1",
                       (repo, issue, run_id)).fetchone()
         return dict(r) if r else None
 
@@ -497,6 +585,10 @@ def settle(run_id: str, fields: dict, end_line: str = "", base_version=None) -> 
         settled = writes.update("runs", run_id, fields, expect=("running",), kind="run.ended", base_version=base_version)
         if not settled:
             return None
+        if settled["kind"] == "pipeline" and settled["status"] in ("interrupted", "stopped"):
+            from . import insights
+
+            insights.release_interrupted_feedback(run_id)
         if end_line:
             insert_feed(run_id, "end", end_line)
         return settled

@@ -22,16 +22,29 @@ export async function snapshotRead(url, signal) {
     return { error: { status: response.status, message: "Malformed snapshot" } };
   }
   const data = { ...body, seq: position };
+  const received = Date.now();
   if (!signal.aborted) {
     snapshots.delete(url);
     snapshots.set(url, { etag: response.headers.get("ETag"), data });
     if (snapshots.size > 32) snapshots.delete(snapshots.keys().next().value);
   }
-  return { data };
+  return { data, received };
 }
 
 export const screen = (view, id = "") => `/api/v1/screen?${new URLSearchParams(id ? { view, id } : { view })}`;
 export const lineStream = (run, after) => `/api/v1/line-stream?${new URLSearchParams({ run, after })}`;
+export const sortTasks = (tasks) => [...tasks].sort((a, b) => b.updated.localeCompare(a.updated) || a.id.localeCompare(b.id));
+
+export async function boardTasks(read, readTasks) {
+  const board = await read(screen("board"));
+  const fallback = board.error?.status === 404 || board.error?.status === 400;
+  const result = fallback ? await readTasks() : board;
+  const { view, tasks = view?.tasks } = result.data ?? {};
+  if (!Array.isArray(tasks) || tasks.some((task) => typeof task?.updated !== "string" || typeof task.id !== "string")) {
+    return { error: result.error ?? { status: null, message: "Malformed response" } };
+  }
+  return { ...result, source: fallback ? "fallback" : "board", data: { tasks: sortTasks(tasks) } };
+}
 
 export function visit(row) {
   return sendWrite(prepareWrite("/api/usage",{ kind: "visit", ...row }, null, { keepalive: true })).catch(() => null);

@@ -13,6 +13,7 @@ from pathlib import Path
 from . import paths
 
 ENV = "ARETE_LAUNCH_LEASE"
+POLL = "ARETE_POLL_LAUNCH"
 READMISSION = "ARETE_POLL_READMISSION"
 CURRENT = ContextVar("task_launch_lease", default=None)
 
@@ -107,6 +108,7 @@ class Lease:
     message: str
     passed: bool = False
     readmission: str = ""
+    poll: bool = False
 
 
 @contextmanager
@@ -131,10 +133,13 @@ def acquiring(repo: str, tid: str):
 def child_environment(keep: tuple[int, ...]) -> tuple[tuple[int, ...], dict]:
     env = dict(os.environ)
     env.pop(ENV, None)
+    env.pop(POLL, None)
     env.pop(READMISSION, None)
     if lease := CURRENT.get():
         keep = tuple(dict.fromkeys((*keep, lease.fd)))
         env[ENV] = lease.message
+        if lease.poll:
+            env[POLL] = "1"
         if lease.readmission:
             env[READMISSION] = lease.readmission
     return keep, env
@@ -169,9 +174,17 @@ def verify(repo: str, tid: str, *, release: bool = False) -> None:
         if release:
             os.close(fd)
             os.environ.pop(ENV, None)
+            os.environ.pop(POLL, None)
             os.environ.pop(READMISSION, None)
     except (OSError, ValueError, TypeError) as e:
         raise PermissionError("invalid inherited task launch lease") from e
+
+
+def from_poll(repo: str, tid: str) -> bool:
+    if os.environ.get(POLL) != "1":
+        return False
+    verify(repo, tid)
+    return True
 
 
 def readmission(repo: str, tid: str) -> str:

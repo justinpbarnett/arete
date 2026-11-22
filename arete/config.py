@@ -288,6 +288,7 @@ class Config:
     max_parallel_per_repo: int = 1
     max_parallel_checks: int = 2
     dashboard_port: int = paths.DASHBOARD_PORT
+    server_url: str = ""
     dashboard_owner: str = ""
     dashboard_https: bool = False
     loop_dirs: list[Path] = field(default_factory=lambda: [paths.CONFIG_DIR / "loops"])
@@ -358,6 +359,16 @@ class Config:
 
     def unused_model_keys(self) -> list[str]:
         return sorted(set(self.models) - set(MODEL_ROLES))
+
+
+def remove_controller_only_settings(data: dict) -> None:
+    for name in ("max_parallel", "max_parallel_per_repo"):
+        data.pop(name, None)
+    if "jev" in data:
+        for name in ("risk_hold", "irreversible_hold", "secrets_hold"):
+            data["jev"].pop(name, None)
+        if not data["jev"]:
+            del data["jev"]
 
 
 def moves_table(jira: dict, table: str, states: tuple[str, ...], hints: dict[str, str] | None = None) -> dict[str, str]:
@@ -891,6 +902,19 @@ def dashboard_https(value: object) -> bool:
     return value
 
 
+def read_data(path: Path | None = None) -> dict:
+    return tomllib.loads(paths.read_confined(path or paths.CONFIG_FILE).decode())
+
+
+def discovery_port(data: dict | None = None) -> int:
+    try:
+        data = read_data() if data is None else data
+        dashboard = data.get("dashboard", {})
+        return int(dashboard.get("port", paths.DASHBOARD_PORT))
+    except (OSError, ValueError, TypeError, AttributeError, OverflowError):
+        return paths.DASHBOARD_PORT
+
+
 def load_or_problem(path: Path | None = None) -> tuple[Config, str]:
     try:
         return load(path), ""
@@ -898,17 +922,26 @@ def load_or_problem(path: Path | None = None) -> tuple[Config, str]:
         problem = f"{type(e).__name__}: {e}"
     fallback = Config()
     try:
-        dashboard = tomllib.loads(paths.read_confined(path or paths.CONFIG_FILE).decode()).get("dashboard", {})
+        data = read_data(path)
+        dashboard = data.get("dashboard", {})
         dashboard = dashboard if isinstance(dashboard, dict) else {}
     except Exception:
         return fallback, problem
-    with contextlib.suppress(Exception):
-        fallback.dashboard_port = int(dashboard.get("port", paths.DASHBOARD_PORT))
+    fallback.dashboard_port = discovery_port(data)
     with contextlib.suppress(Exception):
         fallback.dashboard_https = dashboard_https(dashboard.get("https", False))
     if isinstance(dashboard.get("owner", ""), str):
         fallback.dashboard_owner = dashboard.get("owner", "")
+    with contextlib.suppress(TypeError):
+        fallback.server_url = server_url(data)
     return fallback, problem
+
+
+def server_url(data: dict) -> str:
+    server = data.get("server", {})
+    if not isinstance(server, dict) or not isinstance(server.get("url", ""), str):
+        raise TypeError("[server] url must be a URL string")
+    return server.get("url", "").strip()
 
 
 def load_required() -> Config:
@@ -919,7 +952,7 @@ def load(path: Path | None = None, strict: bool = False, *, required: bool = Fal
     path = path or paths.CONFIG_FILE
     ignored: list[str] | None = None if strict else []
     try:
-        data = tomllib.loads(paths.read_confined(path).decode())
+        data = read_data(path)
     except FileNotFoundError:
         if required:
             raise
@@ -935,6 +968,7 @@ def load(path: Path | None = None, strict: bool = False, *, required: bool = Fal
         max_parallel_per_repo=max(1, int(data.get("max_parallel_per_repo", 1))),
         max_parallel_checks=max(1, int(data.get("max_parallel_checks", 2))),
         dashboard_port=int(data.get("dashboard", {}).get("port", paths.DASHBOARD_PORT)),
+        server_url=server_url(data),
         dashboard_owner=data.get("dashboard", {}).get("owner", ""),
         dashboard_https=dashboard_https(data.get("dashboard", {}).get("https", False)),
     )
@@ -1162,6 +1196,7 @@ class RepoLayer:
     trust_level: Literal["pr", "automerge"] = "pr"
     automerge_after: int = 5
     base_branch: str = ""
+    required_check: dict[str, str | int] | None = None
     subject: str = "{kind}: {title}"
     branch: str = "arete/{id}-{slug}"
     timeout_minutes: int = 45
@@ -1293,6 +1328,12 @@ def load_layer(layer_dir: Path, strict: bool = False, *, source_file: Path | Non
     layer.automerge_after = int(trust.get("automerge_after", 5))
     g = section(data, "git")
     layer.base_branch = g.get("base", "")
+    if "required_check" in g:
+        check = table_of(g["required_check"], "git.required_check")
+        if (set(check) != {"context", "app_id"} or not isinstance(check["context"], str)
+                or not check["context"].strip() or type(check["app_id"]) is not int or check["app_id"] < 1):
+            raise ValueError("[git.required_check] needs a nonempty context and a positive integer app_id")
+        layer.required_check = check
     layer.subject = g.get("subject", layer.subject)
     layer.branch = g.get("branch", layer.branch)
     layer.research_dir = str(section(data, "research").get("dir", "")).strip().strip("/")

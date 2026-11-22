@@ -133,10 +133,14 @@ class Catalog:
         for name, tools in BUNDLES.items():
             key = f"tools:{name}"
             self.entries[key] = {"id": key, "kind": "tools", "tools": list(tools)}
-        self.context = {"task": f"{job.ticket.title}\n\n{job.ticket.body}\n\n{job.ticket.comments or ''}",
-                        "expertise": job.expertise, "attachments": job.attachments,
-                        "feedback": "\n".join(job.run.story)}
+        self.context = {}
+        self.refresh_context()
         self.fingerprint = digest(self.entries)
+
+    def refresh_context(self) -> None:
+        job = self.job
+        self.context.update(task=f"{job.ticket.title}\n\n{job.ticket.body}\n\n{job.ticket.comments or ''}",
+                            expertise=job.expertise, attachments=job.attachments, feedback="\n".join(job.run.story))
 
     def add_context(self, name: str, text: str) -> None:
         self.context[name] = text
@@ -210,13 +214,14 @@ class Catalog:
         roles = (role, "check_repair", "review_repair", "ci_repair") if writing else (role,)
         return self.route(request["route_id"], request["effort"], roles), name, writing
 
-    def validate(self, response, turn: str, version: int, known: dict[str, dict]) -> dict:
+    def validate(self, response, turn: str, version: int, known: dict[str, dict], *, enforce_size_limit=True) -> dict:
         if (not isinstance(response, dict) or set(response) != {"version", "decision_id", "state_version", "rationale", "calls"}
                 or type(response["version"]) is not int or response["version"] != PROTOCOL
                 or response["decision_id"] != turn or type(response["state_version"]) is not int
                 or response["state_version"] != version or type(response["rationale"]) is not str
                 or len(response["rationale"]) > 2000 or type(response["calls"]) is not list
-                or not 1 <= len(response["calls"]) <= 8 or len(json.dumps(response)) > MAX_BYTES):
+                or not 1 <= len(response["calls"]) <= 8
+                or (enforce_size_limit and len(json.dumps(response)) > MAX_BYTES)):
             raise ValueError("invalid decision envelope or stale state version")
         calls = []
         for call in response["calls"]:
@@ -265,5 +270,9 @@ class Catalog:
         return {**response, "calls": calls}
 
 
+def describe_operations() -> dict:
+    return {name: operation.describe() for name, operation in OPERATIONS.items()}
+
+
 def help_text() -> str:
-    return json.dumps({name: operation.describe() for name, operation in OPERATIONS.items()}, separators=(",", ":"))
+    return json.dumps(describe_operations(), separators=(",", ":"))

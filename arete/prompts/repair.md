@@ -25,12 +25,16 @@ $expertise
 
 ## Rules
 
+Denied paths: $denied.
+
 - The branch already holds the PR's work. Read what it changes with `git log` and `git diff` against the PR base
   before you edit.
 - Fix every finding listed: each is a blocker from the last review. Where a finding and the plan disagree, the finding wins.
 - Keep the change to what the findings ask. No scope growth, no drive by refactors, no formatting churn.
 - Arete runs the full check gate after you finish: $checks.
-  Do not duplicate the full suite here.
+  Do not duplicate the full suite here; leave it to the checks step.
+  Run the test classes for the files you changed by name, for example `uv run python -m tests.parallel test_x.SomeTests`;
+  a full suite run here waits for a free check lane.
   Use focused reproductions when helpful and report what you ran; never work around a sandbox refusal.
 - Shell commands you may run: $commands. Others are refused. If a finding needs one, change nothing for it and say
   in your reply exactly what a human must run.

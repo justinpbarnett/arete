@@ -1,32 +1,13 @@
 from __future__ import annotations
 
-import argparse
-import json
 import os
 import sys
 from collections.abc import Iterable
-from typing import NoReturn
 
-
-class Parser(argparse.ArgumentParser):
-    json_errors = False
-
-    def parse_known_args(self, args=None, namespace=None):
-        found, extra = super().parse_known_args(args, namespace)
-        if self.json_errors and extra:
-            self.error(f"unrecognized arguments: {' '.join(extra)}")
-        return found, extra
-
-    def error(self, message: str) -> NoReturn:
-        if not self.json_errors:
-            super().error(message)
-        print(json.dumps({"error": message, "usage": self.format_usage().strip()}), flush=True)
-        sys.exit(1)
-
-
-def steering(p: Parser) -> Parser:
-    p.json_errors = True
-    return p
+from ..codebase import serve_revisions as serve_revisions
+from .arguments import Parser as Parser
+from .arguments import status_arguments as status_arguments
+from .arguments import steering as steering
 
 
 def when(stamp: str | None) -> str:
@@ -87,11 +68,11 @@ def print_recent(runs: list[dict]) -> None:
 def print_records(s: dict, limits) -> None:
     from .. import record, util
 
-    kept = f"kept {limits.days:g} days, up to {limits.max_gb:g} GB"
+    kept = f" (kept {limits.days:g} days, up to {limits.max_gb:g} GB)" if limits else ""
     if not s["oldest"]:
-        print(f"records: none ({kept}), {s['pins']} pinned")
+        print(f"records: none{kept}, {s['pins']} pinned")
         return
-    print(f"records: {record.size_text(s['bytes'])} in {util.count(s['records'], 'record')} ({kept}), "
+    print(f"records: {record.size_text(s['bytes'])} in {util.count(s['records'], 'record')}{kept}, "
           f"oldest {s['oldest']['run_id']} written {when(s['oldest']['written'])}, {s['pins']} pinned")
 
 
@@ -159,10 +140,12 @@ def serve_line(beat: dict) -> str:
     paused = f"; config does not load: {beat['config_problem']}" if beat.get("config_problem") else ""
     paused +=f"; new code paused: {beat['code_problem']}" if beat.get("code_problem") else ""
     failing = "".join(f"; tick fails at {key}: {found['error']}" for key, found in (beat.get("failing") or {}).items())
+    code = serve_revisions(beat)
     running, pending = ("unknown" if beat[k] is None else beat[k] for k in ("running", "pending"))
     return (f"serve: up, pid {beat['pid']}, {util.count(beat['loops'], 'loop')} on, {beat['off']} off, "
             f"{running} running, {pending} waiting"
-            + (f", {len(beat['broken'])} broken" if beat.get("broken") else "") + paused + failing)
+            + (f", {len(beat['broken'])} broken" if beat.get("broken") else "")
+            + (f", {code}" if code else "") + paused + failing)
 
 
 def loop_line(v: dict) -> str:
@@ -180,37 +163,55 @@ def loop_line(v: dict) -> str:
             + (f"\n    {v['error']}" if v["error"] else ""))
 
 
+def feed_line(line: dict) -> str:
+    from .. import client
+
+    text = client.field(line, "text", "feed.lines.text", kind=str).replace("\n", "\n    ")
+    try:
+        stamp = when(line["ts"])
+    except (TypeError, ValueError) as e:
+        raise client.Failed({"error": "server answer has an invalid field feed.lines.ts"}) from e
+    return f"{stamp[6:]} [{line['kind']}] {text}"
+
+
 def print_feed_line(line: dict) -> None:
-    text = line["text"].replace("\n", "\n    ")
-    print(f"{when(line['ts'])[6:]} [{line['kind']}] {text}", flush=True)
+    print(feed_line(line), flush=True)
 
 
-def follow(run_id: str, alive=None, after: int = 0, send=None) -> int:
+def follow(run_id: str, alive=None, after: int = 0, send=None, *, remote=False, on_start=None) -> int:
     import time
+    from urllib.parse import quote
 
-    from .. import control
+    from .. import client, control
 
     epoch = None
 
     def drain():
-        nonlocal after, epoch
+        nonlocal after, epoch, on_start
         while True:
-            found = control.feed(run_id, after)
-            current = found["restore_epoch"]
+            found = (client.call("GET", f"/api/feed/{quote(run_id, safe='')}?after={after}") if remote
+                     else control.feed(run_id, after))
+            current = client.field(found, "restore_epoch", kind=int)
             if epoch != current:
                 changed = epoch is not None
                 epoch = current
                 if changed:
                     after = 0
                     continue
-            for line in found["lines"]:
-                print_feed_line(line)
-                after = line["id"]
-            return found["run"]
+            status = (client.field(client.run_info(run_id), "status", "run.status", kind=str) if remote
+                      else (found["run"] or {}).get("status"))
+            lines = [(client.field(line, "id", "feed.lines.id", kind=int), feed_line(line))
+                     for line in client.field(found, "lines", kind=list)]
+            if on_start is not None:
+                on_start()
+                on_start = None
+            for after, rendered in lines:
+                print(rendered, flush=True)
+            return status == "running"
 
     while True:
-        r = drain()
-        if not (alive() if alive else r.get("status") == "running"):
+        running = drain()
+        if not (alive() if alive else running):
             drain()
             return after
         if send:

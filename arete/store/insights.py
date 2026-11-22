@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import timedelta
 
-from .. import util
+from .. import run_lines, util
 from ._rows import insert_sql
 from .db import db, reader, tx
 from .runs import OPEN_PR_RUN
@@ -153,15 +153,54 @@ def open_feedback(pr_urls: list[str]) -> list[dict]:
             "AND status IN ('new', 'taken', 'failed') ORDER BY created", pr_urls)]
 
 
-def take_feedback(rows: list[dict], run_id: str) -> None:
-    with db() as c:
-        c.executemany("UPDATE feedback SET status = 'taken', run_id = ? WHERE pr_url = ? AND kind = ? AND gh_id = ?",
-                      [(run_id, r["pr_url"], r["kind"], r["gh_id"]) for r in rows])
+def has_fresh_feedback(rows: list[dict]) -> bool:
+    return any(row["status"] == "new" and row["run_id"] is None for row in rows)
 
 
-def settle_feedback(run_id: str, status: str) -> None:
+def has_new_feedback(rows: list[dict]) -> bool:
+    return any(row["status"] == "new" for row in rows)
+
+
+def take_feedback(rows: list[dict], run_id: str) -> list[dict]:
+    with tx() as c:
+        return [r for r in rows if c.execute(
+            "UPDATE feedback SET status = 'taken', previous_run_id = run_id, run_id = ? "
+            "WHERE pr_url = ? AND kind = ? AND gh_id = ? "
+            "AND status = ? AND run_id IS ? AND (status IN ('new', 'failed') OR (status = 'taken' "
+            "AND NOT EXISTS (SELECT 1 FROM runs WHERE id = feedback.run_id AND status = 'running')))",
+            (run_id, r["pr_url"], r["kind"], r["gh_id"], r["status"], r.get("run_id"))).rowcount]
+
+
+def release_feedback(run_id: str, *, closed_prs: tuple[str, ...] = ()) -> None:
+    with tx() as c:
+        if closed_prs:
+            c.execute(f"UPDATE feedback SET status = 'recorded', previous_run_id = NULL "
+                      f"WHERE run_id = ? AND status = 'taken' AND pr_url IN ({','.join('?' * len(closed_prs))})",
+                      (run_id, *closed_prs))
+        # Runs launched before the migration saved the previous claim in the run log.
+        previous = next((line["previous"] for line in run_lines.read(run_id)
+                         if line.get("event") == "feedback_claim"), [])
+        c.executemany("UPDATE feedback SET status = 'new', run_id = ? WHERE pr_url = ? AND kind = ? AND gh_id = ? "
+                      "AND run_id = ? AND status = 'taken' AND previous_run_id IS NULL",
+                      [(prior, url, kind, gh_id, run_id) for url, kind, gh_id, prior in previous])
+        c.execute("UPDATE feedback SET status = 'new', run_id = previous_run_id, previous_run_id = NULL "
+                  "WHERE run_id = ? AND status = 'taken'", (run_id,))
+
+
+def release_interrupted_feedback(run_id: str) -> None:
+    with tx() as c:
+        if c.execute("SELECT 1 FROM feedback WHERE run_id = ? AND status = 'taken' LIMIT 1", (run_id,)).fetchone():
+            if not any(line.get("event") == "work_start" or (line.get("event") == "step_start"
+                       and line.get("step") != "respond" and not line.get("preflight"))
+                       for line in run_lines.read(run_id)):
+                release_feedback(run_id)
+
+
+def settle_feedback(run_id: str, status: str, *, prs: tuple[str, ...] = ()) -> None:
+    pr_filter = f" AND pr_url IN ({','.join('?' * len(prs))})" if prs else ""
     with db() as c:
-        c.execute("UPDATE feedback SET status = ? WHERE run_id = ? AND status = 'taken'", (status, run_id))
+        c.execute(f"UPDATE feedback SET status = ?, previous_run_id = NULL WHERE run_id = ? AND status = 'taken'"
+                  f"{pr_filter}", (status, run_id, *prs))
 
 
 def feedback_between(since: str, until: str) -> list[dict]:

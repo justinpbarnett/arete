@@ -27,6 +27,8 @@ $base_log
 
 ## Rules
 
+Denied paths: $denied.
+
 - Edit only the conflicting files, the branch's own files listed above, and incoming-side files for the reason
   permitted above. Remove every conflict marker (`<<<<<<<`, `|||||||`, `=======`, `>>>>>>>`).
 - Keep both the branch's requested work and the base's already-landed behaviour. Never drop either side to make the
@@ -37,11 +39,12 @@ $base_log
   after it checks your result, and deletes the `__pycache__` your commands leave, so do not mention it.
 - Shell commands you may run: $commands. Others are refused.
 - Never edit `.agents/`, CI workflows, or env files.
-- Optional validation must be cache-free and must not change files: no formatters or `--fix`, no installs, and nothing
-  that writes caches, build output or other files. Run Ruff as `uvx ruff check --no-cache ...` (arete also sets
-  `RUFF_NO_CACHE`). Skip any check that cannot run without writing outside the listed files, because arete's own
-  checks run it later. Any new or changed file outside the listed conflicts, the branch's own files and the
-  permitted incoming-side files, including ignored files and caches, makes arete stop the merge.
+- You may run a check through the layer's verification wrapper when the shell rules allow it. The wrapper's
+  untracked and ignored scratch files are exempt when the same valid ownership marker is present before and
+  after resolution. Tracked files in that folder follow the same editing rules as other tracked files.
+- Keep other optional validation cache-free and read-only. Skip checks that write outside the permitted files.
+  Run Ruff as `uvx ruff check --no-cache ...` (arete also sets `RUFF_NO_CACHE`). Arete stops the merge if it
+  detects edits outside the permitted files and exempt scratch files, including other ignored files and caches.
 - This is attempt $attempt of $tries; $feedback.
 
 ## What to return

@@ -4,6 +4,7 @@ import json
 import re
 import socket
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from string import Template
@@ -23,6 +24,7 @@ from . import (
     runner,
     tool_events,
     util,
+    vault,
     workspace,
 )
 from .agent import EDIT_TOOLS, READ_TOOLS
@@ -53,6 +55,9 @@ MAX_RUN_ITEMS = 40
 RECORDED_TAG = re.compile(r"</?recorded-runs", re.IGNORECASE)
 RECORDED_SHARE = 2
 MAX_MINER_DIFF = 200
+MINER_LABEL = "arete-miner"
+REVIEW_LABEL = "agent:needs-review"
+MINER_CHECK = "arete-checks"
 GLOBAL_RULES = "harness/claude/CLAUDE.md"
 GLOBAL_GLOBS = ["skills/**", GLOBAL_RULES]
 RULE_LOCK = "file-rule"
@@ -430,17 +435,16 @@ def render_feedback(rows: list[dict], limit: int = 8000) -> str:
 
 
 def sync_feedback() -> None:
-    for p in approvals_store.proposals(status=["applied"]):
-        if not p.get("pr_url"):
-            continue
+    applied = dict.fromkeys(p["pr_url"] for p in approvals_store.proposals(status=["applied"]) if p.get("pr_url"))
+    for url in applied:
         try:
-            pr = gh.pr_view(p["pr_url"])
+            pr = gh.pr_view(url)
         except gh.GhError:
             continue
-        if pr.get("mergedAt"):
-            approvals_store.set_proposal_status_by_pr(p["pr_url"], "merged")
+        if pr.get("mergedAt") or pr.get("state") == "MERGED":
+            approvals_store.set_proposal_status_by_pr(url, "merged")
         elif pr.get("state") == "CLOSED":
-            approvals_store.set_proposal_status_by_pr(p["pr_url"], "rejected")
+            approvals_store.set_proposal_status_by_pr(url, "rejected")
 
 
 def _fmt(props: list[dict]) -> str:
@@ -542,30 +546,305 @@ def miner_branch() -> str:
     return f"arete/miner-{util.now():%Y%m%d}"
 
 
-def eval_pr(cfg: config.Config, repo: config.Repo, url: str, branch: str) -> None:
+@dataclass(frozen=True)
+class MinerPR:
+    number: int
+    branch: str
+    base: str
+    head: str
+    base_sha: str
+    body: str
+    needs_review: bool
+
+    def commits(self) -> str:
+        return f"Base `{self.base_sha}`, head `{self.head}`."
+
+
+def miner_pr(repo: config.Repo, url: str, base: str) -> MinerPR | None:
+    if gh.pr_repo(url).casefold() != repo.github.casefold():
+        return None
+    number = gh.pr_number(url)
+    row = gh.gh_json(["api", f"repos/{repo.github}/pulls/{number}"]) or {}
+    head, target = row.get("head") or {}, row.get("base") or {}
+    branch = head.get("ref") or ""
+    author = (row.get("user") or {}).get("login")
+    labels = {label.get("name") for label in row.get("labels", [])}
+    if (row.get("state") != "open" or row.get("draft") is not False or not author or author != gh.me()
+            or row.get("auto_merge") is not None or target.get("ref") != base
+            or (head.get("repo") or {}).get("full_name", "").casefold() != repo.github.casefold()
+            or not re.fullmatch(r"arete/miner-[0-9]{8}", branch)
+            or MINER_LABEL not in labels
+            or not all(re.fullmatch(r"[0-9a-f]{40}", ref.get("sha") or "") for ref in (head, target))):
+        return None
+    return MinerPR(number, branch, base, head["sha"], target["sha"], row.get("body") or "", REVIEW_LABEL in labels)
+
+
+def pr_fork(repo: config.Repo, pr: MinerPR) -> str:
+    with util.repo_lock(repo.path):
+        git(["fetch", "-q", "origin", pr.base, pr.branch], repo.path)
+        if git(["rev-parse", f"origin/{pr.base}", f"origin/{pr.branch}"], repo.path).split() != [pr.base_sha, pr.head]:
+            return ""
+        return git(["merge-base", pr.base_sha, pr.head], repo.path).strip()
+
+
+def eval_pr(cfg: config.Config, repo: config.Repo, url: str, pr: MinerPR, fork: str = "", *,
+            require_automerge: bool = False) -> None:
     jobs = []
     if repo.name == cfg.arete_repo:
-        jobs.append(("prompt evals", lambda: evals.compare_prompts(cfg, repo, branch)))
+        def prompt_report():
+            shared_base = fork or pr_fork(repo, pr)
+            return evals.compare_prompts(cfg, repo, pr.base_sha, pr.head, fork=shared_base).markdown if shared_base else ""
+
+        jobs.append(("prompt evals", prompt_report))
     if (repo.layer_dir / "evals").is_dir():
-        jobs.append(("evals", lambda: evals.compare(repo.name, branch)))
+        jobs.append(("evals", lambda: evals.compare(repo.name, pr.head)))
     for what, job in jobs:
         try:
             md = job()
-            if md:
+            if md and miner_pr(repo, url, pr.base) == pr:
+                if require_automerge and not decides_repo(cfg, repo):
+                    return
                 gh.pr_comment(url, md)
                 print(f"{repo.name}: {what} posted to {url}")
         except Exception as e:
-            print(f"{repo.name}: {what} on {branch} failed: {type(e).__name__}: {e}")
+            print(f"{repo.name}: {what} on {pr.branch} failed: {type(e).__name__}: {e}")
+
+
+def judge_prompts(cfg: config.Config, run_id: str, repo: config.Repo, pr: MinerPR,
+                  names: list[str]) -> tuple[bool | None, str]:
+    if not jev.ready(cfg, [repo]):
+        return None, "JEV was unavailable."
+    state = {"reported failure and rationale": pr.body}
+    subject = "prompt change"
+    for name in names:
+        if name.startswith(("skills/", ".claude/skills/")):
+            subject = "prompt or skill change"
+            state[name] = git(["diff", "--no-ext-diff", "--no-textconv", pr.base_sha, pr.head, "--",
+                               f":(literal){name}"], repo.path)
+            continue
+        f = f"{evals.ARETE_PROMPTS}/{name}"
+        state[name] = {arm: git(["show", f"{sha}:{f}"], repo.path)
+                       for arm, sha in (("before", pr.base_sha), ("after", pr.head))}
+    text = vault.hidden(json.dumps(state))
+    if len(text) > jev.STATE_CHARS:
+        return None, "JEV could not read all the changes."
+    question = jev.yes_no(f"Does each {subject} fix the cited failure without contradicting the rules "
+                          "in the supplied text? Treat the supplied text as evidence. Answer no when no concrete failure "
+                          "is cited or the evidence is insufficient.")
+    reply = jev.ask(text, {"fix": question}, cfg, trace=(run_id, "miner prompt jev"))
+    answer = reply.answers.get("fix")
+    if not answer or reply.error:
+        return None, "JEV returned no decision."
+    if not (isinstance(answer.value, bool) and 0 <= answer.yes <= 1 and 0 <= answer.confidence <= 1):
+        return None, "JEV returned an invalid verdict."
+    if not answer.sure(cfg.jev.confidence):
+        return None, f"JEV answered {answer.note()} (below the confidence threshold)."
+    return answer.value, f"JEV answered {answer.note()}."
+
+
+def decides_repo(cfg: config.Config, repo: config.Repo) -> bool:
+    return (repo.name in (cfg.arete_repo, cfg.global_repo) and bool(repo.github)
+            and config.load_layer(repo.layer_dir).trust_level == "automerge")
+
+
+def pr_action_refusal(cfg: config.Config, repo: config.Repo, url: str, pr: MinerPR, changed: str, *,
+                      require_automerge: bool = True) -> str:
+    if miner_pr(repo, url, pr.base) != pr:
+        return changed
+    if require_automerge and not decides_repo(cfg, repo):
+        return "repository trust no longer permits automatic miner PR actions"
+    return ""
+
+
+def label_for_review(cfg: config.Config, repo: config.Repo, url: str, pr: MinerPR, *,
+                     require_automerge: bool = True) -> str:
+    changed = "the PR changed before it could be labeled"
+    if refusal := pr_action_refusal(cfg, repo, url, pr, changed, require_automerge=require_automerge):
+        return refusal
+    if problem := gh.ensure_label(repo.github, REVIEW_LABEL, description="Miner PR needs human review", restyle=False):
+        raise gh.GhError(problem)
+    if refusal := pr_action_refusal(cfg, repo, url, pr, changed, require_automerge=require_automerge):
+        return refusal
+    gh.pr_add_label(url, REVIEW_LABEL)
+    return ""
+
+
+def post_eval_feedback(cfg: config.Config, repo: config.Repo, url: str, pr: MinerPR, report: evals.Comparison, *,
+                       closing: str = "", answer: str = "") -> str:
+    marker = gh.key_mark(util.digest("miner-evals", pr.head))
+    incomplete_marker = gh.key_mark(util.digest("miner-incomplete"))
+    legacy = gh.key_mark(util.digest("miner-evals", pr.base_sha, pr.head))
+    comment = gh.find_own_pr_comment(repo.github, pr.number, marker, legacy, incomplete_marker)
+    previous = comment["body"] if comment else ""
+    if (comment and not previous.startswith(("Incomplete eval tasks were ", "The eval comparison did not complete."))
+            and not any(key in previous.splitlines() for key in (marker, legacy))
+            and not re.search(rf"^Base `[0-9a-f]{{40}}`, head `{pr.head}`\.$", previous, re.M)):
+        comment, previous = None, ""
+    incomplete = bool(report.incomplete) or not (report.complete or report.regressions)
+    status = ""
+    if incomplete and not report.regressions:
+        tasks = ", ".join(report.incomplete)
+        status = f"Incomplete eval tasks were {tasks}." if tasks else "The eval comparison did not complete."
+    if not incomplete and (incomplete_marker in previous.splitlines() or "Incomplete eval tasks: none." in previous):
+        status = "Incomplete eval tasks: none."
+    body = "\n\n".join(filter(None, [closing, status, pr.commits(), report.markdown.strip(), answer, marker,
+                                     incomplete_marker if incomplete else ""]))
+    if previous.startswith(gh.outgoing(body, mark=True)):
+        return ""
+    if refusal := pr_action_refusal(cfg, repo, url, pr, "the PR changed before eval feedback could be posted"):
+        return refusal
+    if comment is None:
+        gh.pr_comment(url, body)
+    else:
+        gh.pr_edit_comment(repo.github, int(comment["id"]), body)
+    return ""
+
+
+def decide_pr(cfg: config.Config, run_id: str, repo: config.Repo, url: str, *, published_head: str = "") -> str:
+    global_repo = repo.name == cfg.global_repo
+    eligible = not global_repo and decides_repo(cfg, repo)
+    outside = "the repository is outside the miner's automatic decision scope"
+    if not repo.github or not (eligible or published_head or global_repo):
+        return outside
+    base = gh.default_branch(repo.github)
+    pr = miner_pr(repo, url, base)
+    if not pr:
+        return "the PR is no longer an open miner PR on the default branch"
+    if published_head and pr.head != published_head:
+        return "the PR does not show the head just pushed"
+    if pr.needs_review and not published_head:
+        return "the PR is awaiting human review"
+    if not eligible and not global_repo:
+        eval_pr(cfg, repo, url, pr)
+        return outside
+    fork = pr_fork(repo, pr)
+    if not fork:
+        return "the PR head and current base could not be confirmed"
+    diff = diffguard.between(repo.path, fork, pr.head, deny=diffguard.ALWAYS_DENY, moves=True)
+    if global_repo and GLOBAL_RULES in diff.files:
+        if pr.needs_review:
+            return "the PR is awaiting human review"
+        return (label_for_review(cfg, repo, url, pr, require_automerge=False)
+                or f"{GLOBAL_RULES} requires owner approval")
+    if global_repo:
+        if not decides_repo(cfg, repo):
+            return outside
+        harness = diff.files
+        in_scope = bool(harness) and all(f.startswith("skills/") for f in harness)
+    else:
+        prompts = [f for f in diff.files if Path(f).parent.as_posix() == evals.ARETE_PROMPTS and f.endswith(".md")]
+        harness = [f for f in diff.files if f not in prompts]
+        in_scope = (len(prompts) == 1 and not harness) or (bool(prompts and harness) and all(
+            util.matches_any(f, evals.harness_globs()) and is_harness_file(cfg, repo, f) for f in harness))
+    if not in_scope:
+        if published_head and not global_repo:
+            eval_pr(cfg, repo, url, pr, fork, require_automerge=True)
+        return "the PR changes files outside the miner's automatic decision scope"
+    if pr.needs_review:
+        return "the PR is awaiting human review"
+    if refusal := harness_diff_refusal(cfg, repo, diff) or prompt_refusal(cfg, repo, repo.path, fork, pr.head):
+        return refusal
+    if fork != pr.base_sha:
+        if refusal := pr_action_refusal(cfg, repo, url, pr, "the PR changed before its branch could be updated"):
+            return refusal
+        gh.pr_update_branch(repo.github, pr.number, pr.head)
+        return "branch update requested"
+    if global_repo:
+        report = evals.compare_harness(cfg, repo, pr.base_sha, pr.head, harness)
+    elif harness:
+        report = evals.compare_prompts(cfg, repo, pr.base_sha, pr.head, harness=harness)
+    else:
+        report = evals.compare_prompts(cfg, repo, pr.base_sha, pr.head)
+    if refusal := pr_action_refusal(cfg, repo, url, pr, "the PR changed during evals"):
+        return refusal
+    if global_repo:
+        required = config.load_layer(repo.layer_dir).required_check
+        ci_passed = gh.merge_ci_passed(repo.github, pr.head, required=required)
+        check = required["context"] if required else "repository CI"
+    else:
+        ci_passed = gh.actions_check_passed(repo.github, pr.head, MINER_CHECK)
+        check = MINER_CHECK
+    if refusal := pr_action_refusal(cfg, repo, url, pr, "the PR changed during the CI check"):
+        return refusal
+    if not ci_passed:
+        return (post_eval_feedback(cfg, repo, url, pr, report)
+                or f"the PR head does not have a passing {check} result")
+    if report.regressions:
+        closing = f"Closing because {', '.join(report.regressions)} passed on the base and now fail."
+        if refusal := post_eval_feedback(cfg, repo, url, pr, report, closing=closing):
+            return refusal
+        if refusal := pr_action_refusal(cfg, repo, url, pr, "the PR changed before it could be closed"):
+            return refusal
+        gh.pr_close(url)
+        approvals_store.set_proposal_status_by_pr(url, "rejected")
+        return "closed for an eval regression"
+    if report.unmeasured:
+        approved, answer = judge_prompts(cfg, run_id, repo, pr, report.unmeasured)
+        if approved is None and report.complete:
+            return answer
+        if refusal := pr_action_refusal(cfg, repo, url, pr, "the PR changed during JEV review"):
+            return refusal
+        if refusal := post_eval_feedback(cfg, repo, url, pr, report, answer=answer):
+            return refusal
+        if approved is False:
+            return label_for_review(cfg, repo, url, pr) or answer
+    elif refusal := post_eval_feedback(cfg, repo, url, pr, report):
+        return refusal
+    if not report.complete:
+        return "the eval comparison is incomplete"
+    if refusal := pr_action_refusal(cfg, repo, url, pr, "the PR changed before it could be merged"):
+        return refusal
+    gh.pr_squash(repo.github, pr.number, pr.head)
+    approvals_store.set_proposal_status_by_pr(url, "merged")
+    return "merged"
+
+
+def settle_pr(cfg: config.Config, run_id: str, repo: config.Repo, url: str, failures: list[str], *,
+              published_head: str = "") -> None:
+    try:
+        print(f"{url}: {decide_pr(cfg, run_id, repo, url, published_head=published_head)}")
+    except Exception as e:
+        failure = f"{url}: miner PR decision failed: {type(e).__name__}: {util.first_line(str(e), 200)}"
+        failures.append(failure)
+        print(failure)
+
+
+def settle_open_prs(cfg: config.Config, run_id: str, repos: list[config.Repo], failures: list[str],
+                   attempted: set[str]) -> None:
+    for repo in repos:
+        if not repo.github or (repo.name != cfg.global_repo and not decides_repo(cfg, repo)):
+            continue
+        try:
+            urls = gh.open_labeled_pr_urls(repo.github, MINER_LABEL)
+        except gh.GhError as e:
+            failure = f"{repo.name}: could not list miner PRs: {util.first_line(str(e), 200)}"
+            failures.append(failure)
+            print(failure)
+            continue
+        for url in urls:
+            if url not in attempted:
+                attempted.add(url)
+                settle_pr(cfg, run_id, repo, url, failures)
 
 
 def placeholders(text: str) -> set[str]:
     return set(Template(text).get_identifiers())
 
 
-def prompt_refusal(cfg: config.Config, repo: config.Repo, wt: Path) -> str:
+def harness_diff_refusal(cfg: config.Config, repo: config.Repo, diff: diffguard.Diff) -> str:
+    for f in diff.files:
+        if awaits_approval(cfg, repo.name, f):
+            return f"{f} requires owner approval"
+        if not is_harness_file(cfg, repo, f):
+            return f"{f} is outside the supported miner harness changes"
+    return diff.refusal(MAX_MINER_DIFF)
+
+
+def prompt_refusal(cfg: config.Config, repo: config.Repo, wt: Path, base: str, head: str = "") -> str:
     if repo.name != cfg.arete_repo:
         return ""
-    rows = util.git_records(["diff", "--cached", "--name-status", "--no-renames", "HEAD"], wt)
+    revs = [base, head] if head else ["--cached", base]
+    rows = util.git_records(["diff", "--name-status", "--no-renames", *revs], wt)
     for status, f in zip(rows[::2], rows[1::2]):
         if not util.matches_any(f, [ARETE_PROMPT_GLOB]):
             continue
@@ -573,9 +852,12 @@ def prompt_refusal(cfg: config.Config, repo: config.Repo, wt: Path) -> str:
             return f"{f} is a new prompt, and the pipeline runs only the prompts its code names"
         if status == "D":
             return f"{f} is deleted, and the pipeline still loads it"
-        before = placeholders(git(["show", f"HEAD:{f}"], wt))
+        if status == "T":
+            return f"{f} changed file type"
+        before = placeholders(git(["show", f"{base}:{f}"], wt))
         try:
-            after = set(prompt_loader.parse_template(f, (wt / f).read_text()).get_identifiers())
+            text = git(["show", f"{head}:{f}"], wt)
+            after = set(prompt_loader.parse_template(f, text).get_identifiers())
         except ValueError as error:
             return str(error)
         if before != after:
@@ -592,12 +874,14 @@ def proposals_text(props: list[dict]) -> str:
 
 
 def apply_in(cfg: config.Config, run_id: str, wt: Path, props: list[dict]) -> runner.Result:
-    return runner.run(prompt_loader.prompt("apply", proposals=proposals_text(props)), wt, model=cfg.model("apply"),
+    denied = list(dict.fromkeys(diffguard.ALWAYS_DENY + NEVER))
+    text = prompt_loader.prompt("apply", proposals=proposals_text(props), denied=prompt_loader.code_list(denied))
+    return runner.run(text, wt, model=cfg.model("apply"),
                       allowed_tools=EDIT_TOOLS, timeout=1200, persist=False, trace=(run_id, "apply"))
 
 
-def awaits_approval(cfg: config.Config, p: dict) -> bool:
-    return p["repo"] == cfg.global_repo and p["file"] == GLOBAL_RULES
+def awaits_approval(cfg: config.Config, repo: str, file: str) -> bool:
+    return repo == cfg.global_repo and file == GLOBAL_RULES
 
 
 def file_rule(proposal_id: int) -> str:
@@ -650,25 +934,27 @@ def catch_up(repo: config.Repo, base: str) -> str:
 
 
 def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[dict],
-               branch: str) -> tuple[str, list[dict]]:
+               branch: str) -> tuple[str, list[dict], str]:
     base = gh.default_branch(repo.github)
-    wt = workspace.make_worktree(repo, base, branch, "miner", resume=bool(gh.open_pr_url(repo.github, branch)))
+    resume = bool(gh.open_pr_url(repo.github, branch))
+    wt = workspace.make_worktree(repo, base, branch, "miner", resume=resume)
     try:
         res = apply_in(cfg, run_id, wt, props)
         if not res.ok:
             raise RuntimeError(f"apply model call failed: {util.first_line(res.error or '', 150)}")
-        diff = diffguard.stage(wt)
-        landed = [p for p in props if p["file"] in diff.counts]
+        staged = diffguard.stage(wt, deny=diffguard.ALWAYS_DENY)
+        landed = [p for p in props if p["file"] in staged.counts]
         if not landed:
-            return "", []
-        bad = [f for f in diff.files if not is_harness_file(cfg, repo, f)]
-        refusal = (f"touched {', '.join(bad[:5])}" if bad else diff.refusal(MAX_MINER_DIFF)
-                   or prompt_refusal(cfg, repo, wt))
+            return "", [], ""
+        fork = git(["merge-base", f"origin/{base}", "HEAD"], wt).strip() if resume else "HEAD"
+        diff = diffguard.between(wt, "--cached", fork, deny=diffguard.ALWAYS_DENY, moves=True) if resume else staged
+        refusal = harness_diff_refusal(cfg, repo, diff) or prompt_refusal(cfg, repo, wt, fork)
         if refusal:
             print(f"{repo.name}: refused, {refusal}")
-            return "", []
+            return "", [], ""
         fixes = util.count(len(landed), "mined fix", "mined fixes")
         util.git_as_owner(["commit", "-q", "-m", f"docs(harness): apply {fixes}\n\nArete-Run: {run_id}"], wt)
+        head = git(["rev-parse", "HEAD"], wt).strip()
         if not workspace.remote_head(repo.path, branch):
             with util.repo_lock(repo.path):
                 git(["update-ref", "-d", f"refs/remotes/origin/{branch}"], repo.path, check=False)
@@ -678,16 +964,16 @@ def apply_repo(cfg: config.Config, run_id: str, repo: config.Repo, props: list[d
         for i, p in enumerate(landed, 1):
             ev = ", ".join(p.get("evidence", [])[:4])
             body.append(f"{i}. `{p['file']}`: {p['why']}" + (f" (evidence {ev})" if keep_evidence else ""))
-        if repo.name == cfg.arete_repo and any(util.matches_any(f, [ARETE_PROMPT_GLOB]) for f in diff.files):
-            body += ["", "The pipeline reads its prompts from the arete checkout, so pull that checkout after the merge."]
         body += ["", f"Run `{run_id}`. {res.text.strip()[:1500]}", "",
-                 "Merge what helps, close what does not: closed PRs teach the miner what not to propose."]
-        gh.ensure_label(repo.github, "arete-miner", "1d76db", "Harness fixes mined by arete")
-        existing = gh.prs(repo.github, label="arete-miner", state="open")
+                 "The miner uses CI and evals to decide eligible Arete prompt changes and global skill changes. "
+                 "Other changes go to human review.",
+                 "Closed PRs teach the miner what to avoid proposing again."]
+        gh.ensure_label(repo.github, MINER_LABEL, "1d76db", "Harness fixes mined by arete")
+        existing = gh.prs(repo.github, label=MINER_LABEL, state="open")
         if any(p.get("headRefName") == branch for p in existing):
-            return next(p["url"] for p in existing if p.get("headRefName") == branch), landed
+            return next(p["url"] for p in existing if p.get("headRefName") == branch), landed, head
         return gh.pr_create(repo.github, branch, base, f"docs(harness): {fixes} {util.now():%Y-%m-%d}",
-                            "\n".join(body), labels=["arete-miner"], cwd=wt), landed
+                            "\n".join(body), labels=[MINER_LABEL], cwd=wt), landed, head
     finally:
         workspace.remove_worktree(repo, wt)
 
@@ -740,7 +1026,7 @@ def proposal_status(cfg, p, flagged) -> tuple[str, str]:
         return "memory" if p["layer"] == "memory" else "skipped", f"  [skip: {why}]"
     if util.matches_any(p["file"], diffguard.CLAUDE_CODE_GUARDED):
         return "hand", f"  [by hand: {HAND_EDIT_WHY}]"
-    if awaits_approval(cfg, p):
+    if awaits_approval(cfg, p["repo"], p["file"]):
         return "approve", "  [waits for approval]"
     return "pending", ""
 
@@ -752,6 +1038,8 @@ def _run(cfg: config.Config, run_id: str, since: datetime, until: datetime, chec
     checkpoint = {"mined_until": util.iso(until)} if checkpointed else {}
     since_iso, until_iso = util.iso(since), util.iso(until)
     hours = round((until - since).total_seconds() / 3600, 1)
+    failures = []
+    mine_repos = [r for r in cfg.repos if r.mine and r.path.is_dir()]
     if not dry_run:
         sync_feedback()
     sessions_found = collect(since, until)
@@ -766,7 +1054,6 @@ def _run(cfg: config.Config, run_id: str, since: datetime, until: datetime, chec
     records = records or f"(no recorded run since {since_iso} failed, needed a retry, hit a budget or ran long)"
     audit_wants_fixes = not auditor.latest_findings().startswith("(")
     pr_feedback = insights_store.feedback_between(since_iso, until_iso)
-    mine_repos = [r for r in cfg.repos if r.mine and r.path.is_dir()]
     repos ="\n".join(f"- {r.name}: {r.path} {'(public)' if r.public else ''}" for r in mine_repos)
     text = prompt_loader.prompt(
         "mine", hours=f"{hours:g}", global_repo=cfg.global_repo, arete_repo=cfg.arete_repo,
@@ -781,9 +1068,12 @@ def _run(cfg: config.Config, run_id: str, since: datetime, until: datetime, chec
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "prompt.md").write_text(text)
     if not sessions and not flagged and not audit_wants_fixes and not pr_feedback:
-        record.settle(run_id, "noop", summary=cut_summary(lost, "no sessions or recorded runs in window"),
-                      **(checkpoint if mine_repos else {}))
-        return 0
+        if apply and not dry_run:
+            settle_open_prs(cfg, run_id, mine_repos, failures, set())
+        summary = "; ".join(["no sessions or recorded runs in window", *failures])
+        record.settle(run_id, "failed" if failures else "noop", summary=cut_summary(lost, summary),
+                      **(checkpoint if mine_repos and not failures else {}))
+        return 1 if failures else 0
     if not mine_repos:
         record.settle(run_id, "noop", summary=cut_summary(lost, "no repo with mine = true is checked out here"))
         return 0
@@ -794,6 +1084,8 @@ def _run(cfg: config.Config, run_id: str, since: datetime, until: datetime, chec
                                                      "error": res.error}, indent=2))
     if not res.ok or not isinstance(res.structured, dict):
         print(f"miner: model call failed: {util.first_line(res.error)}")
+        if apply and not dry_run:
+            settle_open_prs(cfg, run_id, mine_repos, failures, set())
         record.settle(run_id, "failed", summary=cut_summary(lost, "model call failed"))
         return 1
     props = res.structured.get("proposals", [])[:MAX_PROPOSALS]
@@ -810,12 +1102,12 @@ def _run(cfg: config.Config, run_id: str, since: datetime, until: datetime, chec
     if dry_run:
         print(f"miner: dry run, {len(props)} proposals, {util.paid_note(res.paid_usd)}")
         return 0
-    opened, failures = [], []
+    opened = []
     branch = miner_branch()
     for name, ps in by_repo.items():
-        url, landed = "", []
+        url, landed, published_head = "", [], ""
         try:
-            url, landed = apply_repo(cfg, run_id, cfg.repo(name), ps, branch)
+            url, landed, published_head = apply_repo(cfg, run_id, cfg.repo(name), ps, branch)
         except Exception as e:
             failures.append(f"{name}: apply failed: {type(e).__name__}: {util.first_line(str(e), 200)}")
             print(failures[-1])
@@ -827,8 +1119,9 @@ def _run(cfg: config.Config, run_id: str, since: datetime, until: datetime, chec
         if url:
             opened.append(url)
             print(f"{name}: {url}")
-            if name != cfg.global_repo:
-                eval_pr(cfg, cfg.repo(name), url, branch)
+            settle_pr(cfg, run_id, cfg.repo(name), url, failures, published_head=published_head)
+    if apply:
+        settle_open_prs(cfg, run_id, mine_repos, failures, set(opened))
     summary = "; ".join([f"{len(props)} proposals, {len(opened)} PRs", *failures])
     record.settle(run_id, "failed" if failures else "pr" if opened else "noop", summary=cut_summary(lost, summary),
                   pr_url=" ".join(opened), **({} if failures else checkpoint))
