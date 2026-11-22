@@ -249,9 +249,9 @@ class Runner:
         if process is not None:
             timeout = stretch * (self.args.timeout if self.args.timeout is not None else batch.timeout)
             deadline = timeout * load_factor
-            remaining = deadline
             requested = None
-            started = time.monotonic()
+            class_started = time.monotonic()
+            remaining = deadline
             try:
                 while True:
                     try:
@@ -261,7 +261,7 @@ class Runner:
                         if new_factor > load_factor:
                             load_factor = new_factor
                             deadline = timeout * load_factor
-                            remaining = max(0, deadline - (time.monotonic() - started))
+                            remaining = max(0, class_started + deadline - time.monotonic())
                             continue
                         problem = f"class exceeded {deadline:g}s"
                         if load_factor > 1:
