@@ -2672,6 +2672,10 @@ Quota holds exit 75 without starting work or recording a result.
 Scheduler dispatch releases the claimed input and consults the persisted reset before trying again; a concurrent dispatch reports busy.
 Dry-run displays a quota hold without reserving.
 
+The disabled `release-journeys` companion runs configured CLI journeys against a release wheel
+pinned by its archive SHA-256 and metadata version. The release journey guide covers pinning, local findings
+and offline verification. [Release journey guide](arete/loops/README.md#release-journeys)
+
 ## Versioned writes
 
 Keyed task starts hash the canonical request and replay the exact committed response for the same principal and key.

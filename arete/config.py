@@ -944,12 +944,18 @@ def server_url(data: dict) -> str:
     return server.get("url", "").strip()
 
 
-def load(path: Path | None = None, strict: bool = False) -> Config:
+def load_required() -> Config:
+    return load(required=True)
+
+
+def load(path: Path | None = None, strict: bool = False, *, required: bool = False) -> Config:
     path = path or paths.CONFIG_FILE
     ignored: list[str] | None = None if strict else []
     try:
         data = read_data(path)
     except FileNotFoundError:
+        if required:
+            raise
         return Config()
     cfg = Config(
         alert_repo=data.get("alert_repo", ""),

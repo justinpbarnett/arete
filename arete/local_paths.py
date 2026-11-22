@@ -3,7 +3,7 @@ import os
 import re
 import stat
 import sys
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 SCRATCH_PREFIX = ".arete-scratch-"
@@ -98,25 +98,35 @@ def read_confined(p: Path, limit: int | None = None, *, isolated: bool) -> bytes
     if not isolated:
         with open(p, "rb") as f:
             return f.read(-1 if limit is None else limit)
-    root = scratch_root(p)
-    parts = Path(os.path.abspath(p)).parts
-    if root is None or len(parts) <= len(root.parts) or ".." in Path(p).parts:
-        raise FileNotFoundError(errno.ENOENT, "not a file inside a scratch folder", str(p))
     try:
-        expected = os.lstat(root)
-        with directory_fd(root) as root_fd:
-            current = os.fstat(root_fd)
-            if (expected.st_dev, expected.st_ino) != (current.st_dev, current.st_ino):
-                raise PermissionError("scratch credential root replaced")
-            with directory_fd(p.absolute().parent.relative_to(root), root_fd) as parent:
-                source = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
-                with os.fdopen(source, "rb") as f:
-                    st = os.fstat(source)
-                    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid != os.getuid():
-                        raise FileNotFoundError(errno.ENOENT, "not a plain file of this user", str(p))
-                    return f.read(-1 if limit is None else limit)
-    except OSError as e:
-        raise FileNotFoundError(errno.ENOENT, "not a file inside a scratch folder", str(p)) from e
+        data = read_scratch_file(p, limit)
+    except OSError as error:
+        raise FileNotFoundError(errno.ENOENT, "not a file inside a scratch folder", str(p)) from error
+    if data is None:
+        raise FileNotFoundError(errno.ENOENT, "not a file inside a scratch folder", str(p))
+    return data
+
+
+def read_scratch_file(p: Path, limit: int | None = None) -> bytes | None:
+    root = scratch_root(p)
+    if root is None or p.absolute() == root or ".." in p.parts:
+        raise PermissionError("not a file inside a scratch folder")
+    expected = os.lstat(root)
+    with directory_fd(root) as root_fd, ExitStack() as stack:
+        current = os.fstat(root_fd)
+        if ((expected.st_dev, expected.st_ino) != (current.st_dev, current.st_ino)
+                or current.st_uid != os.getuid() or current.st_mode & 0o077):
+            raise PermissionError("scratch root replaced or unsafe")
+        try:
+            parent = stack.enter_context(directory_fd(p.absolute().parent.relative_to(root), root_fd))
+            source = os.open(p.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        except FileNotFoundError:
+            return None
+        with os.fdopen(source, "rb") as f:
+            st = os.fstat(source)
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid != os.getuid():
+                raise PermissionError("not a plain file of this user")
+            return f.read(-1 if limit is None else limit)
 
 
 def isolated_dirs() -> tuple[Path, Path]:
