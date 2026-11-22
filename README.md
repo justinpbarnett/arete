@@ -1658,6 +1658,11 @@ A class that times out in the parallel phase reruns once by itself with twice it
 `--slowest N` reports the slowest classes.
 Workers own process groups that the runner cleans up on completion or interruption, and a lifeline ends workers if the runner dies.
 The runner uses the solo retry's result when a class reruns and exits nonzero if any final result is a failure, error or timeout.
+`uv run python -m tests.parallel NAME...` runs only the named classes or tests (for example `test_workflow.SomeTests`) and takes no check lane.
+A full run started inside a pipeline agent step waits for a free check lane, the same lanes the checks step uses (`max_parallel_checks`), and holds it until the suite ends.
+While it waits it prints one `tests.parallel: waiting for a free check lane` line.
+Arete gives each agent step the lane names in `ARETE_CHECK_LANES` and opens only those lane lock files to the pi shell's sandbox.
+Build and repair prompts tell workers to run the classes for the files they changed and to leave the full suite to the checks step.
 Either command can serve as the business-suite command under `[checks]` in Arete's layer.
 For Arete's own layer, use `lint = "sh tools/lint-arete"` to run the same pinned Ruff as hosted CI, rather than resolving a floating Ruff version at each run.
 
