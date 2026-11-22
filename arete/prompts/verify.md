@@ -47,11 +47,18 @@ $journeys## Rules
   worked before and must still work.
 - Do what the user does: the commands they type, the requests their clients send, the clicks they make. Read
   the real output, not the code that makes it.
-- Shell commands you may run: $commands. Others are refused.
-- A refused command is an environment problem, not a product problem. Do not get the same result another way (another interpreter, cat, sed, head, or a heredoc that writes a file). Record the check with `passed` false and `cause` `environment`, and name the command in `blocked_by`.
+- Shell commands you may run: $commands. Others are refused.$env_example
+- To set a variable for a program, use `<allowed command> env NAME=value <program> …` with an allowed command that
+  runs the program you pass it. The verification harness runs its arguments with `exec "$$@"`.
+- If the permission mode refuses a command solely because it starts with `NAME=value`, retry once with the same
+  allowed command, assignment, and program in the `env` form above. That retry is allowed under the rule against
+  getting the same result another way.
+- For any other refusal, or if the retry is refused, do not get the same result another way (another interpreter, cat,
+  sed, head, or a heredoc that writes a file). Record the check with `passed` false and `cause` `environment`, and name
+  the command in `blocked_by`.
 - Arete's guard stops a command it reads as showing a credential or as harm git cannot undo. When a command needs a
   key or token you were not given, give it a value that starts `arete-placeholder`, such as
-  `API_KEY=arete-placeholder-1 <command>`, so it carries no credential. A request to localhost, 127.0.0.1 or [::1]
+  `<allowed command> env API_KEY=arete-placeholder-1 <program>`, so it carries no credential. A request to localhost, 127.0.0.1 or [::1]
   reaches the product you started, not an outside service, so the guard counts it as reversible. Fixture writes belong in the scratch folder below.
 - A step you never started is not a failed check. Leave it out of `checks`. A check you started that your tools broke
   off goes in `checks` with `passed` false and `cause` `environment`. When the step is essential to know

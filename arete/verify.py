@@ -358,6 +358,15 @@ def trusted_wrapper(executable: str) -> bool:
         path.is_absolute() and path.parts[-3:] == ("verification-runtime", "harness", "sandbox"))
 
 
+def env_example(allow_bash: list[str]) -> str:
+    for pattern in allow_bash:
+        match = re.fullmatch(r"(sandbox|(?:[\w.-]*/)+[\w.-]+)(?: env)? \*", pattern)
+        if match:
+            wrapper = match[1]
+            return f" For example, run `{wrapper} env ARETE_SERVER=<url> uv run arete task list`."
+    return ""
+
+
 def wait_until_ready(proc: subprocess.Popen, url: str, seconds: int, log: Path) -> None:
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
