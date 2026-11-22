@@ -3956,7 +3956,7 @@ class CatchUpRecoveryTests(MovedBasePublicationFixture, unittest.TestCase):
         run = self.ctrl.run
         self.assertEqual(errors, [error])
         commit.assert_any_call(run.id, checkout, run.layer)
-        note_made.assert_called_once_with(checkout.wt, [checkout], mock.ANY, preserve=set())
+        note_made.assert_called_once_with(checkout.wt, [checkout], mock.ANY, preserve=set(), excluded=set())
         self.assertTrue(self.draft)
         hold_comments = [call.args[2] for call in self.comment.call_args_list if "held on verify" in call.args[2]]
         self.assertEqual(len(hold_comments), 1)
@@ -4007,7 +4007,7 @@ class CatchUpRecoveryTests(MovedBasePublicationFixture, unittest.TestCase):
             self.assertIn(text, parked["reason"])
         self.assertIn(f"crashed: RuntimeError: {error}", (run.dir / "run.log").read_text())
         keep.assert_called_once_with(run)
-        note_made.assert_called_once_with(checkout.wt, [checkout], mock.ANY, preserve=set())
+        note_made.assert_called_once_with(checkout.wt, [checkout], mock.ANY, preserve=set(), excluded=set())
 
     def test_budget_expiry_during_limit_cleanup_preserves_catch_up_park(self):
         self.use_last_repair()
@@ -4164,110 +4164,22 @@ class CatchUpRecoveryTests(MovedBasePublicationFixture, unittest.TestCase):
         self.assertTrue(flows.publish(self.ctrl.flow).passed)
         self.assert_body_refreshed(call.args[0] for call in self.run.log.call_args_list)
 
-    def test_pending_refresh_preserves_current_closing_lines(self):
+    def test_pending_refresh_copies_every_other_byte_of_the_current_body(self):
         self.fail_body_edit()
-        self.body = self.body.replace("Closes #7\n", "Closes #7\nCloses #8\n")
-        self.body = self.body.replace("Earlier review.", "Earlier review.\n\n```\nCloses #100\n```\n\nFixes #9")
-        self.body += "\n\n- Resolves org/repo#10"
-        job = self.ctrl.job
-        job.changed = job.opened = job.pushed = []
-        self.assertTrue(flows.publish(self.ctrl.flow).passed)
-        self.assert_body_refreshed(call.args[0] for call in self.run.log.call_args_list)
-        self.assertTrue(self.body.startswith("Closes #7\nCloses #8\n"))
-        self.assertIn("Fixes #9\n\n## Owner note", self.body)
-        self.assertTrue(self.body.endswith("\n\n- Resolves org/repo#10"))
-        self.assertNotIn("Closes #100", self.body)
-
-    def test_pr_body_sync_preserves_owner_closing_line_before_pending_refresh(self):
-        self.fail_body_edit()
-        self.body = self.body.replace("Closes #7\n", "Closes #7\nCloses #8\n")
-        commented = "<!--\n## Checked in use\nCloses #12\n-->"
-        self.body = self.body.replace("## Checked in use", f"{commented}\n\n## Checked in use", 1)
-        self.body = self.body.replace("Keep this.", "Keep this. @body-owner https://body.internal")
-        job = self.ctrl.job
-        left = "Fixes #99 @new-author https://new.internal"
-
-        pipeline.sync_pr_bodies(self.run, job.ticket, [self.checkout], [], [], [], "", left, "")
-
-        self.assertIn("\nCloses #8\n", self.body)
-        self.assertIn(commented, self.body)
-        self.assertIn("Keep this. <code>@body-owner</code> [private address]", self.body)
-        self.assertIn("Fixes <code>#99</code> <code>@new-author</code> [private address]", self.body)
-        self.assertEqual(len(pipeline.run_store.pr_gate_refreshes(self.repo.name, "7")), 1)
-        job.changed = job.opened = job.pushed = []
-        self.assertTrue(flows.publish(self.ctrl.flow).passed)
-        self.assertIn("\nCloses #8\n", self.body)
-        self.assertIn(commented, self.body)
-        self.push.assert_not_called()
-
-    def test_pending_refresh_does_not_expose_commented_closing_lines(self):
-        self.fail_body_edit()
-        self.body = self.body.replace("Earlier review.",
-                                      "Earlier review. The literal marker `<!--` is an example.\n\n"
-                                      "<!--\nCloses #8\n\n## Hidden heading\n"
-                                      "```\nFixes #9\n-->\n\nCloses #10")
+        owner_note = "## Owner note\n\nKeep this. @body-owner https://body.internal\nCloses #8\r\n- Fixes #9 "
+        self.body = self.body.replace("## Owner note\n\nKeep this.", owner_note)
+        self.body = self.body.replace("Earlier review.", "Earlier review.\n\n<!-- Closes #8 -->")
         job = self.ctrl.job
         job.changed = job.opened = job.pushed = []
 
         self.assertTrue(flows.publish(self.ctrl.flow).passed)
 
-        self.assert_body_refreshed(call.args[0] for call in self.run.log.call_args_list)
-        self.assertNotIn("Closes #8", self.body)
-        self.assertNotIn("Fixes #9", self.body)
-        self.assertNotIn("## Hidden heading", self.body)
-        self.assertIn("\nCloses #10\n\n## Owner note", self.body)
-
-    def test_pending_refresh_replaces_review_with_headings_inside_fenced_examples(self):
-        self.fail_body_edit()
-        example = ("````markdown\n## Checked in use\n```\nCloses #100\n````\n\n"
-                   "  ~~~ markdown\n## Review\nFixes #101\n ~~~~\n")
-        self.body = self.body.replace("Earlier review.", f"Earlier review.\n\n{example}\nCloses #8")
-        job = self.ctrl.job
-        job.changed = job.opened = job.pushed = []
-
-        self.assertTrue(flows.publish(self.ctrl.flow).passed)
-
-        self.assert_body_refreshed(call.args[0] for call in self.run.log.call_args_list)
-        self.assertEqual(self.body.splitlines().count("## Checked in use"), 1)
-        self.assertTrue(self.body.endswith("## Review\n\nReview did not run.\n\nCloses #8\n\n## Owner note\n\nKeep this."))
-
-    def test_owner_closing_line_added_during_ci_survives_pending_refresh_and_merge(self):
-        self.catch_up_hold()
-        job, checkout = self.ctrl.job, self.checkout
-        job.verified = verify.Verified("pass", "Repaired head verified.", checks=[
-            {"passed": True, "what": "repair", "how": "run the check", "saw": "passed"}])
-        job.review = Review("approve", "Repaired head approved.")
-        self.ctrl.data["evidence"]["checks"] = {"result": {"full": True}}
-        del self.ctrl.publication_ci
-        self.edit.reset_mock()
-        self.edit.side_effect = gh.GhError("edit rejected")
-        target = ci.Target(checkout.github, checkout.pr, "Closes #99 @ci-owner https://ci.internal", self.head, checkout.base)
-
-        def watch(*_args, **_kwargs):
-            self.edit.assert_called_once()
-            self.assertIn("Verification failed on the new base.", self.body)
-            self.assertEqual(len(pipeline.run_store.pr_gate_refreshes(self.repo.name, "7")), 1)
-            self.body = self.body.replace("Closes #7\n", "Closes #7\nCloses #8\n")
-            self.body = self.body.replace("Keep this.", "Keep this. @body-owner https://body.internal")
-            self.body += f"\n\n{ci.SECTION_START}\n## CI\n\nFixes #9\n\n{ci.SECTION_END}"
-            self.edit.side_effect = self.edit_body
-            return ci.Round(1, [ci.Watched(target, {})])
-
-        def merge(*_args, **_kwargs):
-            self.assertEqual(self.edit.call_count, 3)
-            self.assertEqual(pipeline.run_store.pr_gate_refreshes(self.repo.name, "7"), [])
-            self.assertTrue(self.body.startswith("Closes #7\nCloses #8\n"))
-            self.assertIn("\nFixes #9\n", self.body)
-            self.assertIn("Repaired head approved.", self.body)
-            self.assertIn("## CI", self.body)
-            self.assertIn("Keep this. <code>@body-owner</code> [private address]", self.body)
-            self.assertIn("Closes <code>#99</code> <code>@ci-owner</code> [private address]", self.body)
-
-        with (mock.patch.object(pipeline, "watch_publication_ci", side_effect=watch),
-              mock.patch.object(pipeline, "try_automerge", side_effect=merge) as merge_attempt,
-              mock.patch.object(flows, "ended", return_value=("pr", "published", checkout.pr))):
-            self.assertEqual(self.ctrl.publish()["ending"], "pr")
-        merge_attempt.assert_called_once()
+        self.assertEqual(pipeline.run_store.pr_gate_refreshes(self.repo.name, "7"), [])
+        self.assertTrue(self.body.startswith("Closes #7\n\n## Checked in use\n\n"))
+        self.assertIn("Verification failed on the new base.", self.body)
+        self.assertTrue(self.body.endswith(f"\n\n{owner_note}"))
+        self.assertNotIn("<!--", self.body)
+        self.assertEqual(self.body.count("Closes #8"), 1)
         self.push.assert_not_called()
 
     def test_later_publish_retries_body_before_merge_callback(self):

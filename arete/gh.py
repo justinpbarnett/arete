@@ -124,8 +124,8 @@ def issue(repo: str, number: int) -> dict:
     )
 
 
-def outgoing(text: str, link: str = "", mark: bool = False, key: str = "", *, keep_closing: bool = False) -> Outgoing:
-    text = outbound.inert(outbound.screen(text), keep_closing=keep_closing)
+def outgoing(text: str, link: str = "", mark: bool = False, key: str = "") -> Outgoing:
+    text = outbound.inert(outbound.screen(text))
     if link:
         text = f"{outbound.screen(link)}\n\n{text}"
     text = marked(text) if mark else text

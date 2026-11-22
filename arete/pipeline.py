@@ -82,8 +82,7 @@ NO_FIX_REPLY = "The builder gave no reply."
 MAX_FIX_REPLY_IN_PROMPT = 4000
 NO_FIX_DIFF = "Arete could not read what changed; judge the diff above."
 REFUSAL_WORDS = re.compile(r"guard|jev|credential|secret|confine|authority", re.IGNORECASE)
-SIBLINGS = re.compile(r"\n*(## Other PRs for [^\n]*\n(?:\n- \[[^\n]*)+)")
-PR_COMMENT_OR_CODE = re.compile(r"\\[\\<`]|(?<!`)(`+)(?!`).*?(?<!`)\1(?!`)|<!--")
+SIBLINGS = re.compile(r"\n*## Other PRs for [^\n]*\n(?:\n- \[[^\n]*)+")
 SKIPPED_FILE = paths.STATE_DIR / "skipped.json"
 CONTINUE_AFTER_DROP = "The connection dropped mid step. Carry on from where you stopped and finish the step."
 CONTINUE_AFTER_BUSY = "The provider was busy mid step. Carry on from where you stopped and finish the step."
@@ -2887,13 +2886,12 @@ def nothing_to_build(run: Run, t: tracker.Ticket, ws: Path, checkouts: list[work
     return "pr", f"nothing to build: {why}", urls
 
 
-def synced_pr_body(run: Run, pr: str, body: str, t: tracker.Ticket, left: str, *,
-                   keep_closing: bool = False) -> tuple[str, str]:
+def synced_pr_body(run: Run, pr: str, body: str, t: tracker.Ticket, left: str) -> tuple[str, str]:
     wanted = run.tracker.pr_link(t, whole=not left)
     had, text = gh.split_link(body, (run.tracker.pr_link(t, whole=True), run.tracker.pr_link(t, whole=False)))
     if had and had != wanted:
         run.log(f"{pr} now links the ticket with: {wanted}")
-    left_synced = with_left_section(text, left, keep_closing=keep_closing)
+    left_synced = with_left_section(text, left)
     if left_synced != text:
         run.log(f"{pr}: {'wrote' if left else 'removed'} the {LEFT_TITLE} section")
     return (wanted if had else ""), public_text(run, left_synced)
@@ -2902,8 +2900,6 @@ def synced_pr_body(run: Run, pr: str, body: str, t: tracker.Ticket, left: str, *
 def sync_pr_bodies(run, t, with_prs, opened, standing, pushed, report, left, link, stops=None, committed=True):
     stops = stops or {}
     ci_stopped = []
-    pending = ({row["pr_url"] for row in run_store.pr_gate_refreshes(run.repo.name, str(t.id))}
-               if any(c not in opened for c in with_prs) else set())
     for c in with_prs:
         others = sibling_section(t.ref, c, with_prs)
         if c in opened:
@@ -2915,15 +2911,10 @@ def sync_pr_bodies(run, t, with_prs, opened, standing, pushed, report, left, lin
         body = gh.pr_body(c.pr)
         if c in standing and ci.stopped(body):
             ci_stopped.append(c)
-        keep_closing = c.pr in pending
-        kept, text = synced_pr_body(run, c.pr, body, t, left, keep_closing=keep_closing)
+        kept, text = synced_pr_body(run, c.pr, body, t, left)
         if opened:
-            text = with_siblings(text, others, keep_closing=keep_closing)
-        if keep_closing:
-            outgoing = gh.outgoing(text, kept, keep_closing=True)
-            if outgoing != body:
-                gh.pr_write_body(c.pr, outgoing)
-        elif gh.outgoing(text, kept) != body:
+            text = with_siblings(text, others)
+        if gh.outgoing(text, kept) != body:
             gh.pr_edit_body(c.pr, text, link=kept)
         if c in pushed and c.pr not in run.feedback_prs:
             gh.pr_comment(c.pr, f"Pushed more work for {t.ref}.\n\n{report}")
@@ -2951,26 +2942,16 @@ def left_block(left: str) -> str:
     return f"{LEFT_START}\n{LEFT_HEADING}\n\n{left}\n\n{LEFT_END}\n\n" if left else ""
 
 
-def with_left_section(body: str, left: str, *, keep_closing: bool = False) -> str:
+def with_left_section(body: str, left: str) -> str:
     found = LEFT_FOR_A_PERSON.search(body)
     if (found.group(1) if found else "") == left:
         return body
-    if keep_closing:
-        left = gh.outgoing(left)
     if found:
-        kept = pr_closing_lines(found.group(1)) if keep_closing else []
-        preserved = "\n".join(kept) + "\n\n" if kept else ""
-        return body[:found.start()] + left_block(left) + preserved + body[found.end():]
-    if keep_closing:
-        lines = body.splitlines(keepends=True)
-        checked = next((index for index, line in pr_prose_lines(lines) if line == CHECKED_IN_USE_HEADING), None)
-        offset = sum(map(len, lines[:checked])) if checked is not None else None
-    else:
-        checked = body.find(f"\n{CHECKED_IN_USE_HEADING}\n")
-        offset = checked + 1 if checked >= 0 else None
-    if offset is None:
+        return body[:found.start()] + left_block(left) + body[found.end():]
+    checked = body.find(f"\n{CHECKED_IN_USE_HEADING}\n")
+    if checked < 0:
         return f"{body.rstrip()}\n\n{left_block(left).rstrip()}"
-    return body[:offset] + left_block(left) + body[offset:]
+    return body[:checked + 1] + left_block(left) + body[checked + 1:]
 
 
 def left_on_prs(urls: list[str]) -> str:
@@ -3643,20 +3624,12 @@ def ci_fix_message(b: Build, caused: list[ci.Red]) -> str:
     return f"{tracker.with_ref(subject, b.ticket.ref)}\n\nArete-Run: {b.run.id}"
 
 
-def publish_ci(run: Run, t: tracker.Ticket, pushed: list[workspace.Checkout], ci_section: str) -> None:
+def publish_ci(run: AgentRun, t: tracker.Ticket, pushed: list[workspace.Checkout], ci_section: str) -> None:
     links = (run.tracker.pr_link(t, whole=True), run.tracker.pr_link(t, whole=False))
-    pending = {row["pr_url"] for row in run_store.pr_gate_refreshes(run.repo.name, str(t.id))}
     for c in pushed:
         try:
-            body = gh.pr_body(c.pr)
-            if c.pr in pending:
-                body = ci.SECTION.sub(lambda found: "\n\n" + "\n".join(pr_closing_lines(found[0])), body)
-                published = gh.outgoing(public_text(run, body), keep_closing=True)
-                section = gh.outgoing(public_text(run, ci_section))
-                gh.pr_write_body(c.pr, gh.Outgoing(f"{published.rstrip()}\n\n{section}"))
-            else:
-                kept, text = gh.split_link(body, links)
-                gh.pr_edit_body(c.pr, public_text(run, ci.with_section(text, ci_section)), link=kept)
+            kept, text = gh.split_link(gh.pr_body(c.pr), links)
+            gh.pr_edit_body(c.pr, public_text(run, ci.with_section(text, ci_section)), link=kept)
         except gh.GhError as e:
             run.log(f"ci: could not write the CI section on {c.pr}: {util.first_line(str(e), 300)}")
 
@@ -3696,7 +3669,7 @@ def update_pr_gate_evidence(run: Run, pr: str, evidence: dict, *, expected_head:
         if links is None:
             for heading, section in sections:
                 screened = gh.outgoing(public_text(run, section)).rstrip()
-                body = replace_gate_section(body, heading, screened, keep_closing=True)
+                body = replace_gate_section(body, heading, screened, exact=True)
             gh.pr_write_body(pr, gh.Outgoing(body))
         else:
             kept, body = gh.split_link(body, links)
@@ -3709,58 +3682,18 @@ def update_pr_gate_evidence(run: Run, pr: str, evidence: dict, *, expected_head:
     return True
 
 
-def pr_prose_lines(lines: list[str]) -> Iterator[tuple[int, str]]:
-    closing_fence = None
-    in_comment = False
-    for index, line in enumerate(lines):
-        line = line.rstrip("\r\n")
-        if closing_fence:
-            if closing_fence.fullmatch(line):
-                closing_fence = None
-            continue
-        if not in_comment and (opening := outbound.FENCE_OPEN.match(line)):
-            marker = opening[2]
-            closing_fence = re.compile(rf" {{0,3}}{marker[0]}{{{len(marker)},}}[ \t]*")
-            continue
-        if not in_comment and ("<!--" not in line or line == ci.SECTION_START):
-            yield index, line
-            continue
-        prose = []
-        while line:
-            if in_comment:
-                _, end, line = line.partition("-->")
-                in_comment = not end
-            else:
-                start = next((token for token in PR_COMMENT_OR_CODE.finditer(line) if token[0] == "<!--"), None)
-                if start is None:
-                    prose.append(line)
-                    break
-                prose.append(line[:start.start()])
-                line = line[start.end():]
-                in_comment = True
-        if any(prose):
-            yield index, "<!-- -->".join(part for part in prose if part)
+def replace_gate_section(body: str, heading: str, section: str, *, exact: bool = False) -> str:
+    pattern = re.compile(rf"^{re.escape(heading)}\n.*?(?=^## |\Z)", re.M | re.S)
+    if not pattern.search(body):
+        if exact:
+            return f"{body}\n\n{section}" if body else section
+        return f"{body.rstrip()}\n\n{section}"
 
+    def replacement(found: re.Match) -> str:
+        last = exact and found.end() == len(body)
+        return section.rstrip() + ("" if last else "\n\n")
 
-def pr_closing_lines(text: str) -> list[str]:
-    return [line for _, line in pr_prose_lines(text.splitlines())
-            if (closing := outbound.CLOSING.findall(line)) and closing != outbound.CLOSING.findall(outbound.inert(line))]
-
-
-def replace_gate_section(body: str, heading: str, section: str, *, keep_closing: bool = False) -> str:
-    lines = body.splitlines(keepends=True)
-    prose = pr_prose_lines(lines)
-    start = next((index for index, line in prose if line == heading), None)
-    if start is None:
-        if not keep_closing:
-            body = body.rstrip()
-        return f"{body}\n\n{section}" if body else section
-    end = next((index for index, line in prose if line == ci.SECTION_START or re.match(r" {0,3}##(?:[ \t]|$)", line)),
-               len(lines))
-    if keep_closing and (kept := pr_closing_lines("".join(lines[start:end]))):
-        section += "\n\n" + "\n".join(kept)
-    rest = "".join(lines[end:])
-    return "".join(lines[:start]) + section + (f"\n\n{rest}" if rest else "")
+    return pattern.sub(replacement, body, count=1)
 
 
 def comment_catch_up_ci(run: AgentRun, c: workspace.Checkout, ci_section: str,
@@ -3794,19 +3727,8 @@ def open_branch(run: Run) -> str:
     return next((r["branch"] for r in run_store.open_runs(run.repo.name, run.tid) if r.get("branch")), "")
 
 
-def with_siblings(body: str, section: str, *, keep_closing: bool = False) -> str:
-    if not keep_closing:
-        return SIBLINGS.sub("", body).rstrip() + section
-
-    headings = {index for index, line in pr_prose_lines(body.splitlines()) if line.startswith("## Other PRs for ")}
-
-    def preserve(found: re.Match) -> str:
-        if body.count("\n", 0, found.start(1)) not in headings:
-            return found[0]
-        kept = pr_closing_lines(found[0])
-        return "\n\n" + "\n".join(kept) if kept else ""
-
-    return SIBLINGS.sub(preserve, body).rstrip() + gh.outgoing(section)
+def with_siblings(body: str, section: str) -> str:
+    return SIBLINGS.sub("", body).rstrip() + section
 
 
 def sibling_section(ref: str, c: workspace.Checkout, with_prs: list[workspace.Checkout]) -> str:

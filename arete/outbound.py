@@ -182,7 +182,7 @@ def close_reference(found: re.Match) -> str:
     return f"{closing}{gap}<code>{found.group('reference')}</code>"
 
 
-def inert_prose(text: str, urls: bool = True, *, keep_closing: bool = False) -> str:
+def inert_prose(text: str, urls: bool = True) -> str:
     pattern = MENTIONS_AND_URLS if urls else MENTIONS
 
     def mention(found: re.Match) -> str:
@@ -191,8 +191,7 @@ def inert_prose(text: str, urls: bool = True, *, keep_closing: bool = False) -> 
         gap = " " if found.string[found.start() - 1:found.start()] == "\\" else ""
         return f"{gap}<code>{found.group()}</code>"
 
-    if not keep_closing:
-        text = between_own(text, lambda gap: CLOSING.sub(close_reference, gap))
+    text = between_own(text, lambda gap: CLOSING.sub(close_reference, gap))
     return between_own(text, lambda gap: pattern.sub(mention, gap))
 
 
@@ -200,7 +199,7 @@ def span_end(runs: list[re.Match], i: int, size: int) -> int | None:
     return next((k for k in range(i + 1, len(runs)) if runs[k].end() - runs[k].start() == size), None)
 
 
-def inert_markdown(text: str, *, keep_closing: bool = False) -> str:
+def inert_markdown(text: str) -> str:
     runs = list(TICKS.finditer(text))
     out = []
     at = 0
@@ -218,11 +217,11 @@ def inert_markdown(text: str, *, keep_closing: bool = False) -> str:
         since = OWN.sub("", text[at:start])
         if "\n" in span or "|" in span or "<" in since or LINK_DESTINATION.search(since):
             break
-        out.append(inert_prose(text[at:start], keep_closing=keep_closing))
+        out.append(inert_prose(text[at:start]))
         out.append(span)
         at = runs[closer].end()
         i = closer + 1
-    out.append(inert_prose(text[at:], keep_closing=keep_closing))
+    out.append(inert_prose(text[at:]))
     return "".join(out)
 
 
@@ -244,7 +243,7 @@ def fence_end(lines: list[str], i: int) -> int | None:
     return j if all(line.startswith(margin) for line in lines[i:j + 1] if line.strip()) else None
 
 
-def inert(text: str, *, keep_closing: bool = False) -> str:
+def inert(text: str) -> str:
     out: list[str] = []
     block: list[str] = []
     html = False
@@ -253,8 +252,7 @@ def inert(text: str, *, keep_closing: bool = False) -> str:
     def flush() -> None:
         if block:
             joined = "".join(block)
-            out.append(inert_prose(joined, urls=False, keep_closing=keep_closing) if html
-                       else inert_markdown(joined, keep_closing=keep_closing))
+            out.append(inert_prose(joined, urls=False) if html else inert_markdown(joined))
             block.clear()
 
     lines = text.splitlines(keepends=True)
