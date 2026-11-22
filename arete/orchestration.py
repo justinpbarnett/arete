@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import time
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from math import inf
 from pathlib import Path
 from typing import TextIO
@@ -47,6 +47,21 @@ STATE_FIELDS = ("plan_text", "goal", "estimate", "left_for_a_person", "build_sum
                 "document", "report_body", "draft_why", "summary", "opened", "found", "pushed", "drafted",
                 "ci_stopped", "changed", "ci_result", "committed")
 REFRESHABLE_LINEAGE = {"catalog_sha", "controller_prompt", "operations_sha"}
+CONTROLLER_STALL = "controller-stall"
+
+
+def stall_routes(setting):
+    routes = [setting, setting]
+    if setting.chain[1:]:
+        later = setting.chain[1]
+        routes.append(replace(setting, runner=later.runner, provider=later.provider, model=later.model,
+                              effort=later.effort))
+    return routes
+
+
+def stalled_before_reply(result):
+    return (not result.get("ok") and result.get("turns") == 0 and not result.get("paid_usd")
+            and not result.get("cost_usd") and not result.get("recovery"))
 
 
 class UnchangedPushedHead(ValueError):
@@ -593,15 +608,7 @@ class Controller:
         self.catalog.add_context(action["id"], text)
         return {"ref": action["id"], "excerpt": text[:2000], "characters": len(text)}
 
-    def decide(self):
-        observation = self.observe()
-        turn = ledger.begin(self.lease, observation, self.policy.max_decisions)
-        observation["decision_id"] = turn
-        place = self.run.dir / "controller"
-        place.mkdir(exist_ok=True)
-        prompt = prompt_loader.prompt("orchestrate", api=help_text(), observation=json.dumps(observation))
-        request = delegation.request(self.job, turn, prompt, self.run.settings("orchestrate"), (), [])
-        request.update(step=f"orchestrate-{turn}", cwd=str(place))
+    def controller_turn(self, turn, request, retried):
         controller = delegation.Worker(self.run, turn, request)
         result = {"ok": False, "error": "controller exited without a decision; usage may be unknown"}
         complete = False
@@ -611,11 +618,12 @@ class Controller:
                 self.collect()
                 for message in controller.receive():
                     if message.get("event") == "launch":
-                        if self.run.budget:
+                        if self.run.budget and not retried:
                             self.run.budget.charge(message["step"], message["role"])
                         grant = self.run.launch_gate(message["step"], message["role"], message["route"]) \
                             if self.run.launch_gate else None
-                        ledger.launched(self.lease, self.policy.max_decisions)
+                        if not retried:
+                            ledger.launched(self.lease, self.policy.max_decisions)
                         if self.run.feedback and not self.run.step_started:
                             run_lines.write(self.run.id, "work_start")
                         controller.allow(grant)
@@ -634,12 +642,31 @@ class Controller:
                 ledger.reject(self.lease, turn, "controller stopped; admitted usage may be unknown")
             if self.run.launch_done:
                 self.run.launch_done(controller.step, bool(result.get("ok")))
+        return result
+
+    def decide(self):
+        observation = self.observe()
+        turn = ledger.begin(self.lease, observation, self.policy.max_decisions)
+        observation["decision_id"] = turn
+        place = self.run.dir / "controller"
+        place.mkdir(exist_ok=True)
+        prompt = prompt_loader.prompt("orchestrate", api=help_text(), observation=json.dumps(observation))
+        result = {}
+        for retry, setting in enumerate(stall_routes(self.run.settings("orchestrate"))):
+            request = delegation.request(self.job, turn, prompt, setting, (), [])
+            request.update(step=f"orchestrate-{turn}", cwd=str(place))
+            result = self.controller_turn(turn, request, retried=retry > 0)
+            if not stalled_before_reply(result):
+                break
+            self.run.log(f"{request['step']}: no reply from {setting.runner} {setting.model}: "
+                         f"{util.first_line(str(result.get('error') or ''), 200)}")
+        stalled = stalled_before_reply(result)
         if not result.get("ok"):
             error = str(result.get("error") or "controller returned no decision")[:2000]
             ledger.reject(self.lease, turn, error)
             self.data["error"] = error
             self.persist()
-            raise workspace.RunFailed(error, recovery=result.get("recovery"))
+            raise workspace.RunFailed(error, recovery={"reason": CONTROLLER_STALL} if stalled else result.get("recovery"))
         self.run.step_started = True
         try:
             response = result.get("structured")
@@ -1135,6 +1162,7 @@ class Controller:
                     if not hold:
                         if failure := self.publication_ci([checkout], caught_up=True):
                             return failure
+                        self.run.retry_gate_evidence()
                         continue
                 elif hold and self.data.get("catch_up_hold"):
                     return {"park": True, "error": hold}
@@ -1168,11 +1196,11 @@ class Controller:
             job.verified, job.review = pipeline.catch_up_base(
                 b, checkout, job.branch, base_sha, job.with_left(job.goal), job.with_left(job.plan_text),
                 job.review, before_push=remember_push, **target_check)
-        except pipeline.CatchUpGateHold as error:
-            return self.hold_catch_up(checkout, base_sha, error)
         except pipeline.CatchUpPushUnconfirmed:
             raise
         except (workspace.RunFailed, RuntimeError, OSError) as e:
+            if isinstance(e, pipeline.CatchUpGateHold) and e.candidate_restored:
+                return self.hold_catch_up(checkout, base_sha, e)
             reason = e.why if isinstance(e, workspace.RunFailed) else util.first_line(str(e), 300)
             base = f"`{checkout.base}` at `{base_sha}`" if base_sha else f"`{checkout.base}`"
             failure = f"could not catch up to {base}: {pipeline.public_text(self.run, reason)}"
@@ -1213,13 +1241,16 @@ class Controller:
         self.data.pop("catch_up_hold", None)
         self.catalog.context.pop(CATCH_UP_FAILURE, None)
 
-    def park_catch_up(self, reason):
+    def park_catch_up(self, reason, *, on_ticket=False, close_failed=False):
         held = self.data["catch_up_hold"]["reason"]
         for checkout in self.job.with_prs:
             if pipeline.own_draft_state(self.run, checkout) is False:
                 pipeline.set_draft(self.run, checkout, True, "automerge")
-        self.run.say(f"{held}. I parked the run because {reason}.")
-        return pipeline.park_run(self.run, f"{held}. {reason}")
+        self.run.say(f"{held}. I parked the run because {reason}.", on_ticket=on_ticket)
+        reason = f"{held}. {reason}"
+        if close_failed:
+            return pipeline.record_park(self.run, reason, {})
+        return pipeline.park_run(self.run, reason)
 
     def settle_publication_failure(self, failure):
         if self.data.get("catch_up_hold"):
@@ -1541,6 +1572,7 @@ class Controller:
 
     def drive(self):
         verification_passed = False
+        park_reason = None
         try:
             if ended := self.prepare():
                 return ended
@@ -1592,11 +1624,23 @@ class Controller:
                 return self.park_catch_up(str(error))
             raise
         except ledger.Conflict as error:
-            raise runlimits.Parked(str(error)) from error
+            if not (isinstance(error, ledger.Limit) and self.data.get("catch_up_hold")):
+                raise runlimits.Parked(str(error)) from error
+            park_reason = str(error)
         finally:
-            self.close()
+            try:
+                self.close()
+            except BaseException as cleanup_error:
+                if park_reason is not None:
+                    try:
+                        self.run.catch_up_cleanup_park = self.park_catch_up(
+                            park_reason, on_ticket=True, close_failed=True)
+                    except BaseException as park_error:
+                        cleanup_error.add_note(f"Could not park the catch-up: {park_error}")
+                raise
             if self.run.environment_release and not verification_passed and flows.reset_environment_base(self.job.checkouts):
                 self.persist()
+        return self.park_catch_up(park_reason, on_ticket=True)
 
     def close(self):
         errors = []

@@ -1,4 +1,5 @@
 import ast
+import errno
 import http.client
 import json
 import os
@@ -30,7 +31,7 @@ from unittest import mock
 from adws import single_worker
 from arete import (
     api_check, ci, codebase, codex, config, dashboard, dbstats, diffguard, evals, factory, flows, gh, guard, install, jev,
-    journeys, launch_lease, loop_run, mergecheck, miner, orchestration, outcomes, owner_asks, paths, pipeline,
+    journeys, launch_lease, loop_run, mergecheck, miner, orchestration, outbound, outcomes, owner_asks, paths, pipeline,
     poll, principals, prompt_loader, queueing, record, runlimits, sandbox, serve, serve_guard, slots, tailnet,
     tasks, tracker, util, verify, workspace,
 )
@@ -3947,6 +3948,469 @@ class CatchUpReviewRepairTests(CatchUpRepairFixture):
         self.repair_and_publish("review", "review_repair")
 
 
+class CatchUpCleanupTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.empty_repo = Path(tempfile.mkdtemp()).resolve()
+        cls.addClassCleanup(shutil.rmtree, cls.empty_repo, ignore_errors=True)
+        subprocess.run(["git", "init", "-q", "--template=", "-b", "fixture"],
+                       cwd=cls.empty_repo, check=True, capture_output=True)
+
+    def setUp(self):
+        root = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        self.enterContext(mock.patch.object(sandbox, "AUTHORITY", root / "verification-authority"))
+        self.enterContext(mock.patch.object(sandbox, "can_confine", return_value=False))
+        self.wt = root / "worktree"
+        self.wt.mkdir()
+        self.init_repo()
+        self.scratch = self.wt / ".arete-sandbox/tmp"
+        self.scratch.mkdir(parents=True)
+        self.prior = Review("approve", trees={"": "tree"})
+        self.checkout = workspace.Checkout("", "fixture", self.wt, self.wt, "main", lease="published",
+                                           pr="https://github.com/fixture/repo/pull/7")
+        self.logs = []
+        run = SimpleNamespace(log=self.logs.append, repo=config.Repo("fixture", self.wt), owner_questions_blocked=False,
+                              tid="7", facts={}, feedback=[], repairs="")
+        self.build = SimpleNamespace(run=run, checked={}, report="", staged=None, build_summary="",
+                                     layer=config.RepoLayer(root, verify=config.Verify(), trust_level="automerge"),
+                                     ticket=tracker.Ticket("7", "#7", "Edit fixture"), catch_ups=0,
+                                     require_valid_diff=mock.Mock(), check=mock.Mock())
+        self.failure = workspace.RunFailed("verification stopped before review")
+        self.git = self.enterContext(mock.patch.object(pipeline, "git", side_effect=["published", "tree", "published"]))
+        self.uncommitted = self.enterContext(mock.patch.object(workspace, "uncommitted", wraps=workspace.uncommitted,
+                                                              return_value=[]))
+        self.abort = self.enterContext(mock.patch.object(pipeline, "abort_merge"))
+        self.list_paths = self.enterContext(mock.patch.object(pipeline, "catch_up_paths", return_value=set(),
+                                                              wraps=pipeline.catch_up_paths))
+        self.enterContext(mock.patch.object(pipeline, "merge_moved_bases", side_effect=self.merge))
+        self.verify = self.enterContext(mock.patch.object(pipeline, "check_in_use", side_effect=self.failure))
+        self.push = self.enterContext(mock.patch.object(pipeline, "push_caught_up_head"))
+
+    def merge(self, *_args, **_kwargs):
+        self.checkout.merge = "candidate"
+        return [self.checkout]
+
+    def repo_git(self, *args, cwd=None):
+        return subprocess.run(["git", *args], cwd=cwd or self.wt, check=True, capture_output=True, text=True).stdout
+
+    def init_repo(self, cwd=None):
+        shutil.copytree(self.empty_repo / ".git", (cwd or self.wt) / ".git", dirs_exist_ok=True)
+
+    def list_paths_after_check(self, before):
+        self.list_paths.side_effect = [before, before, mock.DEFAULT]
+        self.list_paths.return_value = mock.DEFAULT
+
+    def hold_after_checks(self, reason):
+        checkout, b = self.checkout, self.build
+        controller = orchestration.Controller.__new__(orchestration.Controller)
+        controller.run, controller.data = b.run, {}
+        controller.catalog = mock.Mock(context={})
+        controller.take_merge_lease = mock.Mock()
+        controller.hold_catch_up = mock.Mock(return_value={"failures": "catch-up"})
+        controller.job = SimpleNamespace(b=b, checkouts=[checkout], approval=None, draft_why="", ticket=b.ticket,
+                                         build_summary="", branch="fixture", slot=None, goal="", plan_text="",
+                                         with_left=str, verified=verify.Verified("pass"), review=self.prior,
+                                         check_publication_targets=None)
+        with (mock.patch.object(pipeline, "try_automerge", return_value=gh.MovedBaseHold("base moved")),
+              mock.patch.object(pipeline, "catch_up_target", return_value=("new-base", "")),
+              mock.patch.object(gh, "pr_comment") as comment):
+            self.assertIsNone(controller.automerge([checkout]))
+
+        hold = f"could not catch up to `main` at `new-base`: {reason}"
+        self.assertEqual(b.run.facts["merge_held"], hold)
+        comment.assert_called_once_with(checkout.pr, f"Automerge stays off for this PR: {hold}. A person merges it.")
+        controller.hold_catch_up.assert_not_called()
+        self.assertFalse(b.run.owner_questions_blocked)
+        self.push.assert_not_called()
+
+    def test_embedded_repository_in_scratch_stays_and_hold_names_the_later_failure(self):
+        self.ignore(".arete-sandbox/")
+        embedded = self.scratch / "embedded"
+        existing = self.scratch / "existing"
+        existing.mkdir()
+        self.init_repo(existing)
+        self.list_paths_after_check({".arete-sandbox/tmp/existing/"})
+        outside = self.wt.parent / "outside"
+        outside.mkdir()
+        sentinel = outside / "keep"
+        sentinel.write_text("keep\n")
+        link = self.scratch / "link"
+
+        def check(**_):
+            embedded.mkdir()
+            self.init_repo(embedded)
+            (embedded / "result").write_text("check output")
+            link.symlink_to(outside, target_is_directory=True)
+            return True
+
+        self.build.check.side_effect = check
+        self.hold_after_checks(self.failure.why)
+        self.assertFalse(link.is_symlink())
+        self.assertTrue((existing / ".git/HEAD").is_file())
+        self.assertEqual(sentinel.read_text(), "keep\n")
+        self.assertEqual((embedded / "result").read_text(), "check output")
+        self.assertTrue((embedded / ".git/HEAD").is_file())
+        self.assertEqual(self.logs[0], "automerge: catch-up failed: verification stopped before review")
+        self.assertTrue(self.logs[1].startswith(
+            "automerge: catch-up cleanup could not remove '.arete-sandbox/tmp/embedded/': "), self.logs)
+        self.assertEqual([line for line in self.logs if "could not remove" in line], self.logs[1:2])
+
+    def test_success_reaches_push_without_cleanup(self):
+        verified = verify.Verified("pass")
+        review = Review("approve")
+        self.verify.side_effect = None
+        self.verify.return_value = verified
+        self.build.check.return_value = True
+        self.build.next_step = mock.Mock(return_value="review")
+        self.git.side_effect = ["published", "tree", "candidate"]
+        before_push = mock.Mock()
+        with (mock.patch.object(pipeline, "_review", return_value=review),
+              mock.patch.object(pipeline, "merge_evidence_problem", return_value=None),
+              mock.patch.object(gh, "pr_merge_details", return_value={}),
+              mock.patch.object(gh, "merge_ref_hold", return_value=""),
+              mock.patch.object(pipeline, "remove_new_paths") as cleanup):
+            result = pipeline.catch_up_base(self.build, self.checkout, "fixture", "base", "", "", self.prior,
+                                            before_push=before_push)
+
+        self.assertEqual(result, (verified, review))
+        before_push.assert_called_once_with("candidate", verified, review)
+        self.push.assert_called_once_with(self.build, self.checkout, "fixture", "candidate")
+        self.abort.assert_not_called()
+        cleanup.assert_not_called()
+        self.assertFalse(self.build.run.owner_questions_blocked)
+
+    def test_removal_failure_logs_path_after_original_error_and_continues(self):
+        blocked = self.scratch / "repo"
+        removable = self.scratch / "z-removable"
+        blocked_name = ".arete-sandbox/tmp/repo/"
+        self.list_paths.side_effect = [set(), set(), {blocked_name, ".arete-sandbox/tmp/z-removable"}]
+        repo = self.build.run.repo
+        run = pipeline.Run("fixture", repo, self.wt.parent, tracker=tracker.GitHubTracker(repo), tid="7")
+        self.build.run = run
+        output = StringIO()
+        original = "automerge: catch-up failed: verification stopped before review"
+
+        def check(**_):
+            blocked.mkdir()
+            removable.write_text("scratch\n")
+            return True
+
+        rmdir = os.rmdir
+
+        def refuse_removal(name, *, dir_fd=None):
+            if name != blocked.name:
+                return rmdir(name, dir_fd=dir_fd)
+            self.assertTrue(output.getvalue().endswith(original + "\n"))
+            raise PermissionError("fixture removal denied")
+
+        self.build.check.side_effect = check
+        with (redirect_stdout(output),
+              mock.patch.object(pipeline.os, "rmdir", side_effect=refuse_removal)):
+            self.hold_after_checks(self.failure.why)
+        logged = output.getvalue()
+        self.assertTrue(blocked.is_dir())
+        self.assertFalse(removable.exists())
+        self.assertEqual((run.dir / "run.log").read_text(), logged)
+        messages = [line.split("] ", 1)[1] for line in logged.splitlines()]
+        self.assertEqual(messages[:2], [
+            original,
+            f"automerge: catch-up cleanup could not remove {blocked_name!r}: fixture removal denied",
+        ])
+        self.assertEqual(len(messages), 3)
+
+    def test_stop_during_path_removal_propagates(self):
+        stray = self.scratch / "stray"
+        stop = pipeline.Stopped("operator stopped the run")
+        self.build.check.side_effect = lambda **_: stray.touch() or True
+        self.list_paths.side_effect = [set(), set(), {stray.relative_to(self.wt).as_posix()}]
+        with (mock.patch.object(pipeline.os, "unlink", side_effect=stop),
+              self.assertRaises(pipeline.Stopped) as caught):
+            pipeline.catch_up_base(self.build, self.checkout, "fixture", "base", "", "", self.prior)
+        self.assertIs(caught.exception, stop)
+        self.assertTrue(stray.exists())
+        self.assertFalse(self.build.run.owner_questions_blocked)
+        self.push.assert_not_called()
+
+    def test_reset_failure_reports_check_hold_without_repair_handoff(self):
+        tracked = self.wt / "file.txt"
+        tracked.write_text("published content\n")
+
+        def fail_check(**_):
+            tracked.write_text("check left tracked changes\n")
+            return False
+
+        self.git.side_effect = ["published", "tree", "candidate", RuntimeError("git reset --hard: fixture reset denied")]
+        self.uncommitted.side_effect = [[], [], ["file.txt"]]
+        self.build.check.side_effect = fail_check
+        self.hold_after_checks("the layer's local checks failed")
+
+        self.git.assert_called_with(["reset", "--hard", "candidate"], self.wt)
+        self.assertEqual(tracked.read_text(), "check left tracked changes\n")
+        self.assertEqual(self.logs[:2], [
+            "automerge: catch-up failed: the layer's local checks failed",
+            "automerge: catch-up cleanup could not restore the worktree head: git reset --hard: fixture reset denied",
+        ])
+
+    def ignore(self, pattern):
+        (self.wt / ".git/info").mkdir(exist_ok=True)
+        (self.wt / ".git/info/exclude").write_text(pattern + "\n")
+
+    def use_checks(self, command):
+        cfg, repo = config.Config(), self.build.run.repo
+        run = pipeline.Run("", repo, self.wt.parent, cfg=cfg, tracker=tracker.GitHubTracker(repo), tid="7")
+        layer = replace(self.build.layer, checks={"fixture": command})
+        self.build = pipeline.Build(cfg=cfg, run=run, ticket=self.build.ticket, ws=self.wt,
+                                    checkouts=[self.checkout], layer=layer, timeout=5, workspace="fixture",
+                                    tools=[], deny=[])
+        self.build.require_valid_diff = mock.Mock()
+        self.git.side_effect = ["published", "tree", "candidate", ""]
+        self.enterContext(mock.patch.object(pipeline, "check_lane", return_value=nullcontext()))
+        self.enterContext(mock.patch.object(pipeline.factory, "fingerprint", return_value="tree"))
+        self.enterContext(mock.patch.object(pipeline, "untracked_by_dir", return_value={self.wt: set()}))
+        return run
+
+    def deny_unlink(self, name):
+        unlink = os.unlink
+
+        def refuse(path, *, dir_fd=None):
+            if Path(path) == self.wt / name or (dir_fd is not None and path == name):
+                raise PermissionError("fixture removal denied")
+            return unlink(path, dir_fd=dir_fd)
+
+        return mock.patch.object(os, "unlink", side_effect=refuse)
+
+    def test_untracked_removal_failure_reports_check_hold_without_repair_handoff(self):
+        self.init_repo()
+        self.list_paths.side_effect = [set(), set(), {"stray"}]
+        run = self.use_checks("printf 'left by failed check' > stray\nexit 17")
+        with redirect_stdout(StringIO()), self.deny_unlink("stray"):
+            self.hold_after_checks("the layer's local checks failed")
+
+        self.verify.assert_not_called()
+        self.assertEqual((self.wt / "stray").read_text(), "left by failed check")
+        self.assertIn("exit 17", (run.dir / "checks.md").read_text())
+        messages = [line.split("] ", 1)[1] for line in (run.dir / "run.log").read_text().splitlines()]
+        self.assertEqual(messages[:3], [
+            "check fixture: FAIL (exit 17)",
+            "automerge: catch-up failed: the layer's local checks failed",
+            "automerge: catch-up cleanup could not remove 'stray': fixture removal denied",
+        ])
+        self.assertEqual(len(messages), 4)
+
+    def test_failing_check_preserves_the_contents_of_an_existing_ignored_checkout(self):
+        self.init_repo()
+        self.ignore("existing/")
+        existing = self.wt / "existing"
+        existing.mkdir()
+        self.init_repo(existing)
+        kept = existing / "kept.txt"
+        kept.write_text("base\n")
+        commit = [*util.ARETE_IDENTITY, "-c", "commit.gpgSign=false", "commit", "-qm"]
+        self.repo_git("add", kept.name, cwd=existing)
+        self.repo_git(*commit, "base", cwd=existing)
+        added = existing / "new.txt"
+        added.write_text("added in the second revision\n")
+        self.repo_git("add", added.name, cwd=existing)
+        self.repo_git(*commit, "add a file", cwd=existing)
+        self.repo_git("checkout", "-q", "--detach", "HEAD^", cwd=existing)
+        self.assertFalse(added.exists())
+        self.assertEqual(workspace.ignored_file_paths(self.wt), {"existing/"})
+        self.list_paths_after_check({"existing/"})
+        run = self.use_checks("git -C existing checkout -q fixture || exit 1\nexit 17")
+        with redirect_stdout(StringIO()), self.assertRaises(pipeline.CatchUpGateHold) as caught:
+            pipeline.catch_up_base(self.build, self.checkout, "fixture", "base", "", "", self.prior)
+
+        self.assertTrue(caught.exception.candidate_restored)
+        self.assertIn("check fixture: FAIL (exit 17)", (run.dir / "run.log").read_text())
+        self.assertEqual(self.repo_git("branch", "--show-current", cwd=existing).strip(), "fixture")
+        self.assertEqual(self.repo_git("status", "--porcelain", cwd=existing), "")
+        self.assertEqual(kept.read_text(), "base\n")
+        self.assertEqual(added.read_text(), "added in the second revision\n")
+
+    def test_failing_check_unlinks_file_replacing_former_parent_directory(self):
+        cache = self.wt / "cache"
+        self.list_paths.side_effect = [{"cache/old.txt"}, {"cache/old.txt"}, {"cache"}]
+
+        def fail_check(**_):
+            cache.write_text("check left a regular file")
+            return False
+
+        self.build.check.side_effect = fail_check
+        self.git.side_effect = ["published", "tree", "candidate"]
+        with self.assertRaises(pipeline.CatchUpGateHold) as caught:
+            pipeline.catch_up_base(self.build, self.checkout, "fixture", "base", "", "", self.prior)
+
+        self.assertTrue(caught.exception.candidate_restored)
+        self.assertFalse(cache.exists())
+
+    def test_failing_check_unlinks_file_replacing_ignored_checkout(self):
+        self.init_repo()
+        self.ignore("cache/")
+        cache = self.wt / "cache"
+        self.list_paths_after_check({"cache/"})
+
+        def fail_check(**_):
+            cache.write_text("check left a regular file")
+            self.assertEqual(workspace.untracked_files(self.wt), {"cache"})
+            return False
+
+        self.build.check.side_effect = fail_check
+        self.git.side_effect = ["published", "tree", "candidate"]
+        with self.assertRaises(pipeline.CatchUpGateHold) as caught:
+            pipeline.catch_up_base(self.build, self.checkout, "fixture", "base", "", "", self.prior)
+
+        self.assertTrue(caught.exception.candidate_restored)
+        self.assertFalse(cache.exists())
+
+    def test_failing_check_removes_new_files_symlinks_and_empty_directories(self):
+        self.init_repo()
+        self.list_paths_after_check(set())
+        outside = self.wt.parent / "outside"
+        outside.write_text("keep")
+        run = self.use_checks(
+            "mkdir -p check-output/nested && printf result > check-output/nested/result && "
+            "ln -s ../../outside check-output/link || exit 1\nexit 17")
+        with redirect_stdout(StringIO()), self.assertRaises(pipeline.CatchUpGateHold) as caught:
+            pipeline.catch_up_base(self.build, self.checkout, "fixture", "base", "", "", self.prior)
+
+        self.assertIn("exit 17", caught.exception.report)
+        self.assertEqual(outside.read_text(), "keep")
+        output = self.wt / "check-output"
+        self.assertFalse((output / "nested/result").exists())
+        self.assertFalse((output / "link").is_symlink())
+        self.assertTrue(caught.exception.candidate_restored, (run.dir / "run.log").read_text())
+        self.assertFalse(output.exists())
+
+    def test_failing_check_leaves_new_embedded_checkout_and_holds(self):
+        self.init_repo()
+        self.list_paths.side_effect = [set(), set(), {".arete-sandbox/tmp/cache/"}]
+        self.ignore(".arete-sandbox/")
+        run = self.use_checks(
+            "git init -q --template= -b fixture .arete-sandbox/tmp/cache && "
+            "printf result > .arete-sandbox/tmp/cache/output || exit 1\nexit 17")
+        with redirect_stdout(StringIO()):
+            self.hold_after_checks("the layer's local checks failed")
+
+        cache = self.scratch / "cache"
+        self.assertEqual((cache / "output").read_text(), "result")
+        self.assertEqual((cache / ".git/HEAD").read_text(), "ref: refs/heads/fixture\n")
+        self.assertTrue((cache / ".git/objects").is_dir())
+        self.assertIn("exit 17", (run.dir / "checks.md").read_text())
+        self.assertIn("cleanup could not remove '.arete-sandbox/tmp/cache/'", (run.dir / "run.log").read_text())
+        self.verify.assert_not_called()
+
+    def test_failing_check_init_in_existing_ignored_directory_holds(self):
+        self.init_repo()
+        before = {"cache/keep.txt"}
+        self.list_paths.side_effect = [before, before, {"cache/"}]
+        self.ignore("cache/")
+        cache = self.wt / "cache"
+        cache.mkdir()
+        (cache / "keep.txt").write_text("keep")
+        run = self.use_checks("git init -q --template= -b fixture cache || exit 1\nexit 17")
+        with redirect_stdout(StringIO()):
+            self.hold_after_checks("the layer's local checks failed")
+
+        self.assertEqual((cache / "keep.txt").read_text(), "keep")
+        self.assertEqual((cache / ".git/HEAD").read_text(), "ref: refs/heads/fixture\n")
+        self.assertIn("exit 17", (run.dir / "checks.md").read_text())
+        self.assertIn("cleanup could not remove 'cache/'", (run.dir / "run.log").read_text())
+
+    def test_failing_check_leaves_case_renamed_directory_and_holds(self):
+        self.init_repo()
+        before = {".arete-sandbox/tmp/Cache/"}
+        self.list_paths.side_effect = [before, before, {".arete-sandbox/tmp/cache/"}]
+        self.init_repo(self.scratch / "cache")
+        (self.scratch / "cache/keep.txt").write_text("keep")
+        self.build.check.return_value = False
+        self.git.side_effect = ["published", "tree", "candidate"]
+        self.hold_after_checks("the layer's local checks failed")
+
+        self.assertEqual(os.listdir(self.scratch), ["cache"])
+        self.assertEqual((self.scratch / "cache/keep.txt").read_text(), "keep")
+        self.assertEqual((self.scratch / "cache/.git/HEAD").read_text(), "ref: refs/heads/fixture\n")
+        self.assertIn("cleanup could not remove '.arete-sandbox/tmp/cache/'", self.logs[1])
+
+    def test_failing_check_keeps_directory_holding_other_files_without_holding(self):
+        src = self.wt / "src"
+        src.mkdir()
+        (src / "old.txt").write_text("before the check")
+        self.list_paths_after_check({"src/old.txt"})
+
+        def fail_check(**_):
+            (src / "new.txt").write_text("check output")
+            return False
+
+        self.build.check.side_effect = fail_check
+        self.git.side_effect = ["published", "tree", "candidate"]
+        with self.assertRaises(pipeline.CatchUpGateHold) as caught:
+            pipeline.catch_up_base(self.build, self.checkout, "fixture", "base", "", "", self.prior)
+
+        self.assertTrue(caught.exception.candidate_restored, self.logs)
+        self.assertFalse((src / "new.txt").exists())
+        self.assertEqual((src / "old.txt").read_text(), "before the check")
+
+    def test_note_made_handles_non_utf8_git_record(self):
+        self.init_repo()
+        self.repo_git(*util.ARETE_IDENTITY, "-c", "commit.gpgSign=false", "commit", "-qm", "base", "--allow-empty")
+        args = ["status", "--porcelain", "--no-renames", "--untracked-files=all"]
+        raw = b"?? stray\xff\0"
+        protect = util.sandbox.protected_command
+
+        def report_raw_name(command, *positional, **kwargs):
+            if command == ["git", args[0], "-z", *args[1:]]:
+                command = [sys.executable, "-c", f"import sys; sys.stdout.buffer.write({raw!r})"]
+            return protect(command, *positional, **kwargs)
+
+        self.uncommitted.return_value = mock.DEFAULT
+        with (mock.patch.object(util.sandbox, "protected_command", side_effect=report_raw_name),
+              mock.patch.object(paths, "STATE_DIR", self.wt.parent)):
+            self.assertEqual(util.git_records(args, self.wt), ["?? stray\ufffd"])
+            workspace.note_made(self.wt, [self.checkout])
+            made = workspace.made_before(self.wt)
+
+        self.assertEqual(made["stray\ufffd"], "missing")
+        self.assertTrue(workspace.head_recorded(made, self.checkout))
+
+    def test_note_made_fingerprints_nested_non_utf8_filename(self):
+        self.init_repo()
+        self.repo_git(*util.ARETE_IDENTITY, "-c", "commit.gpgSign=false", "commit", "-qm", "base", "--allow-empty")
+        self.ignore("cache/")
+        nested = self.wt / "cache/nested"
+        nested.mkdir(parents=True)
+        raw = nested / os.fsdecode(b"result\xff")
+        try:
+            raw.write_text("check output")
+        except OSError as error:
+            if error.errno not in (errno.EILSEQ, errno.EINVAL, errno.EPERM):
+                raise
+            stored = raw.with_name("result")
+            stored.write_text("check output")
+            walk, lstat = os.walk, Path.lstat
+
+            def walk_raw(top, *args, **kwargs):
+                for root, dirs, files in walk(top, *args, **kwargs):
+                    if top == nested.parent and Path(root) == nested:
+                        files = [raw.name if name == stored.name else name for name in files]
+                    yield root, dirs, files
+
+            def open_raw(path, *args, **kwargs):
+                return open(stored if path == raw else path, *args, **kwargs)
+
+            self.enterContext(mock.patch.object(os, "walk", side_effect=walk_raw))
+            self.enterContext(mock.patch.object(Path, "lstat", lambda path: lstat(stored if path == raw else path)))
+            self.enterContext(mock.patch.object(workspace, "open", side_effect=open_raw, create=True))
+
+        self.assertEqual(workspace.ignored_files(self.wt), ["cache/"])
+        with mock.patch.object(paths, "STATE_DIR", self.wt.parent):
+            workspace.note_made(self.wt, [self.checkout])
+            made = workspace.made_before(self.wt)
+
+        self.assertRegex(made["cache/"], r"^[0-9a-f]{64}$")
+        self.assertTrue(workspace.head_recorded(made, self.checkout))
+
+
 class CatchUpReviewTests(CatchUpRepairFixture):
     @classmethod
     def setUpClass(cls):
@@ -4996,6 +5460,655 @@ class CatchUpPublicationFailureTests(MovedBasePublicationFixture, unittest.TestC
                     self.assertEqual(controller.ending[0], "pr")
                     self.assertIn(error.why, report.call_args.args[2])
                     park.assert_not_called()
+
+
+class CatchUpRecoveryTests(MovedBasePublicationFixture, unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.state = Path(tempfile.mkdtemp(prefix="arete-catch-up-"))
+        cls.addClassCleanup(shutil.rmtree, cls.state, ignore_errors=True)
+        cls.enterClassContext(mock.patch.multiple(paths, STATE_DIR=cls.state, DB_FILE=cls.state / "arete.db",
+                                                  RUNS_DIR=cls.state / "runs", LOCKS_DIR=cls.state / "locks",
+                                                  LOG_DIR=cls.state / "logs", WORKTREES_DIR=cls.state / "worktrees"))
+        cls.enterClassContext(mock.patch.object(db.dbstats.Timing, "finished"))
+        connect = db.connect_db
+
+        def scratch_connection(*args, **kwargs):
+            conn = connect(*args, **kwargs)
+            if not kwargs.get("readonly"):
+                conn.execute("PRAGMA journal_mode=MEMORY")
+            conn.execute("PRAGMA synchronous=OFF")
+            return conn
+
+        cls.enterClassContext(mock.patch.object(db, "connect_db", scratch_connection))
+        cls.enterClassContext(mock.patch.multiple(util, flush_fd=mock.DEFAULT, flush_folder=mock.DEFAULT))
+        with mock.patch.object(db.migrations, "load", return_value=db._CHAIN):
+            db.migrate()
+
+    def setUp(self):
+        self.ctrl, self.checkout = self.controller()
+        job, c = self.ctrl.job, self.checkout
+        self.repo = config.Repo(self._testMethodName, self.state, github=c.github, parts=[config.Part("", c.github)])
+        self.run = self.new_run()
+        self.ctrl.run = job.run = job.b.run = self.run
+        job.ticket = job.b.ticket = tracker.Ticket("7", "#7", "Edit fixture")
+        self.ctrl.data.update(publication_intent={}, publication={"heads": {c.github: c.lease}})
+        self.ctrl.lease = ledger.acquire(self.run.id, "", self.ctrl.data)
+        self.ctrl.prepare = mock.Mock(return_value=None)
+        self.ctrl.observe = mock.Mock(side_effect=lambda: {"state_version": ledger.snapshot(self.ctrl.lease)["version"]})
+        self.ctrl.take_merge_lease = mock.Mock()
+        self.ctrl.publication_ci = mock.Mock(return_value=None)
+        self.ctrl.stamp = mock.Mock()
+        self.body = ("Closes #7\n\n## Checked in use\n\nEarlier verification.\n\n## Review\n\nEarlier review.\n\n"
+                     "## Owner note\n\nKeep this.")
+        self.head, self.draft = c.lease, False
+        self.edit = self.enterContext(mock.patch.object(gh, "gh", side_effect=self.edit_body))
+        self.enterContext(mock.patch.object(gh, "pr_body", side_effect=lambda _: self.body))
+        self.enterContext(mock.patch.object(gh, "pr_draft_and_head", side_effect=lambda _: (self.draft, self.head)))
+        self.enterContext(mock.patch.object(gh, "pr_set_draft", side_effect=lambda _, draft: setattr(self, "draft", draft)))
+        issue = {"number": 7, "title": job.ticket.title, "author": {"login": "fixture"},
+                 "labels": [{"name": tracker.LABEL}], "state": "OPEN"}
+        self.enterContext(mock.patch.object(gh, "issue", return_value=issue))
+        self.enterContext(mock.patch.object(gh, "issue_labels", return_value=""))
+        self.comment = self.enterContext(mock.patch.object(gh, "issue_comment", return_value=""))
+        self.push = self.enterContext(mock.patch.object(pipeline, "commit_and_push"))
+        self.enterContext(mock.patch.object(pipeline, "git", side_effect=AssertionError("unexpected git call")))
+        self.enterContext(mock.patch.object(pipeline, "catch_up_target", return_value=("new-base", "")))
+
+    def new_run(self):
+        rid = pipeline.record.start("pipeline", repo=self.repo.name, issue="7")
+        folder = paths.RUNS_DIR / rid
+        folder.mkdir(parents=True)
+        run = pipeline.Run(rid, self.repo, folder, tracker=tracker.GitHubTracker(self.repo), tid="7")
+        self.enterContext(mock.patch.object(run, "log"))
+        self.enterContext(mock.patch.object(run, "enter"))
+        return run
+
+    def edit_body(self, args, *, input):
+        url = args[2]
+        self.assertEqual(url, self.checkout.pr)
+        self.assertEqual(args, ["pr", "edit", url, "--body-file", "-"])
+        self.assertIsInstance(input, gh.Outgoing)
+        self.body = str(input)
+
+    def catch_up_hold(self):
+        verified = verify.Verified("fail", "Verification failed on the new base.")
+        error = pipeline.CatchUpGateHold("verify", "verification found a blocker", "candidate", "", verified=verified)
+        with mock.patch.object(pipeline, "catch_up_base", side_effect=error):
+            result = self.ctrl.catch_up(self.checkout)
+        self.assertEqual(result["failures"], orchestration.CATCH_UP_FAILURE)
+
+    def use_last_repair(self):
+        self.catch_up_hold()
+        self.run.budget = runlimits.Budget(self.run, runlimits.Policy(max_repair_cycles=1), "")
+        self.run.budget.charge("repair", "review_repair")
+        self.assertTrue(self.run.budget.repair_limit_reason())
+
+    def assert_parked_for(self, limit):
+        status, summary, _ = self.ctrl.drive()
+        self.assertEqual(status, "failed")
+        self.assertIn(limit, summary)
+        self.assertTrue(self.draft)
+        self.comment.assert_called_once()
+        ticket_comment = self.comment.call_args.args[2]
+        self.assertIn("Catch-up to `main` at `new-base` held on verify", ticket_comment)
+        self.assertIn(limit, ticket_comment)
+
+    def test_last_repair_parks_at_decision_limit(self):
+        self.use_last_repair()
+        self.ctrl.policy = config.Orchestration(max_decisions=1)
+        ledger.begin(self.ctrl.lease, {}, self.ctrl.policy.max_decisions)
+        self.assert_parked_for("1 decision allowance")
+
+    def test_decision_limit_stops_repair_before_retaining_workspace(self):
+        self.use_last_repair()
+        self.ctrl.policy = config.Orchestration(max_decisions=1)
+        worker = self.start_writing_worker()
+
+        def close():
+            self.assertFalse(self.draft)
+            self.comment.assert_not_called()
+
+        def keep_edits(run):
+            self.assertIs(run, self.run)
+            worker.close.assert_called_once_with()
+            self.assertFalse(self.ctrl.workers)
+            self.assertEqual(ledger.actions(self.ctrl.lease)[0]["state"], "interrupted")
+
+        held = {".": {"head": "retained-head", "onto": "candidate"}}
+        worker.close.side_effect = close
+        with (mock.patch.object(pipeline, "keep_edits", side_effect=keep_edits) as keep,
+              mock.patch.object(pipeline, "kept_heads", return_value=held)):
+            self.assert_parked_for("1 decision allowance")
+        keep.assert_called_once_with(self.run)
+        parked = runlimits.metadata(self.run.id, "parked.json")
+        self.assertEqual(parked["kept"], held)
+        self.assertIn("held on verify", parked["reason"])
+        self.assertIn("1 decision allowance", parked["reason"])
+
+    def test_decision_limit_parks_even_when_worker_cleanup_fails(self):
+        self.use_last_repair()
+        self.ctrl.policy = config.Orchestration(max_decisions=1)
+        self.run.workspace = self.state, [self.checkout]
+        self.run.feedback = [{"body": "Please revise."}]
+        worker = self.start_writing_worker()
+        error = RuntimeError("worker producer group did not become quiescent")
+
+        def close():
+            self.assertFalse(self.draft)
+            self.comment.assert_not_called()
+            raise error
+
+        worker.close.side_effect = close
+        with (mock.patch.object(pipeline, "keep_edits") as keep,
+              mock.patch.object(util, "group_alive", return_value=True)):
+            with self.assertRaises(RuntimeError) as raised:
+                self.ctrl.drive()
+        self.assertIs(raised.exception, error)
+        worker.close.assert_called_once_with()
+        self.assertEqual(ledger.actions(self.ctrl.lease)[0]["state"], "running")
+        self.assertTrue(self.draft)
+        self.comment.assert_called_once()
+        ticket_comment = self.comment.call_args.args[2]
+        reason = runlimits.metadata(self.run.id, "parked.json")["reason"]
+        for text in ("Catch-up to `main` at `new-base` held on verify", "1 decision allowance"):
+            self.assertIn(text, ticket_comment)
+            self.assertIn(text, reason)
+        keep.assert_not_called()
+
+    def test_decision_limit_retains_workspace_when_stopped_workers_ledger_update_fails(self):
+        self.catch_up_hold()
+        checkout = self.checkout
+        checkout.wt = self.state / "retained-repair"
+        checkout.wt.mkdir()
+        (checkout.wt / ".git").touch()
+        checkout.onto = "candidate"
+        error = RuntimeError("ledger update failed")
+        errors = []
+
+        def drive(flow):
+            run = flow.ctx.run
+            self.ctrl.run = self.ctrl.job.run = self.ctrl.job.b.run = run
+            run.workspace = checkout.wt, [checkout]
+            self.ctrl.lease = ledger.acquire(run.id, "", self.ctrl.data)
+            self.ctrl.policy = config.Orchestration(max_decisions=1)
+            worker = self.start_writing_worker()
+
+            def interrupt(*_):
+                worker.close.assert_called_once_with()
+                self.assertFalse(self.draft)
+                self.comment.assert_not_called()
+                raise error
+
+            with (mock.patch.object(ledger, "transition", side_effect=interrupt),
+                  mock.patch.object(util, "group_alive", return_value=False)):
+                try:
+                    return self.ctrl.drive()
+                except RuntimeError as raised:
+                    errors.append(raised)
+                    raise
+
+        with (mock.patch.object(pipeline, "commit_kept") as commit,
+              mock.patch.object(pipeline, "git", return_value="retained-head\n"),
+              mock.patch.object(workspace, "note_made") as note_made):
+            self.assertEqual(self.run_ticket_again(drive), 1)
+        run = self.ctrl.run
+        self.assertEqual(errors, [error])
+        commit.assert_any_call(run.id, checkout, run.layer)
+        note_made.assert_called_once_with(checkout.wt, [checkout], mock.ANY, preserve=set(), excluded=set())
+        self.assertTrue(self.draft)
+        hold_comments = [call.args[2] for call in self.comment.call_args_list if "held on verify" in call.args[2]]
+        self.assertEqual(len(hold_comments), 1)
+        self.assertIn("1 decision allowance", hold_comments[0])
+        parked = runlimits.metadata(run.id, "parked.json")
+        self.assertIn("1 decision allowance", parked["reason"])
+        self.assertEqual(parked["kept"], {".": {"head": "retained-head", "onto": "candidate"}})
+
+    def test_outer_cleanup_retains_workspace_when_writing_worker_survives(self):
+        self.catch_up_hold()
+        checkout = self.checkout
+        checkout.wt = self.state / "surviving-repair"
+        checkout.wt.mkdir()
+        error = RuntimeError("worker producer group did not become quiescent")
+
+        def drive(flow):
+            run = flow.ctx.run
+            self.ctrl.run = self.ctrl.job.run = self.ctrl.job.b.run = run
+            run.workspace = checkout.wt, [checkout]
+            self.ctrl.lease = ledger.acquire(run.id, "", self.ctrl.data)
+            self.ctrl.policy = config.Orchestration(max_decisions=1)
+            worker = self.start_writing_worker()
+
+            def close():
+                self.assertFalse(self.draft)
+                self.comment.assert_not_called()
+                raise error
+
+            worker.close.side_effect = close
+            with self.assertRaises(RuntimeError) as raised:
+                self.ctrl.drive()
+            self.assertIs(raised.exception, error)
+            worker.close.assert_called_once_with()
+            raise raised.exception
+
+        with (mock.patch.object(util, "group_alive", return_value=True),
+              mock.patch.object(pipeline, "keep_edits") as keep,
+              mock.patch.object(workspace, "note_made") as note_made):
+            self.assertEqual(self.run_ticket_again(drive), 1)
+
+        run = self.ctrl.run
+        self.assertTrue(self.draft)
+        parked = runlimits.metadata(run.id, "parked.json")
+        hold_comments = [call.args[2] for call in self.comment.call_args_list if "held on verify" in call.args[2]]
+        self.assertEqual(len(hold_comments), 1)
+        for text in ("Catch-up to `main` at `new-base` held on verify", "1 decision allowance"):
+            self.assertIn(text, hold_comments[0])
+            self.assertIn(text, parked["reason"])
+        self.assertIn(f"crashed: RuntimeError: {error}", (run.dir / "run.log").read_text())
+        keep.assert_called_once_with(run)
+        note_made.assert_called_once_with(checkout.wt, [checkout], mock.ANY, preserve=set(), excluded=set())
+
+    def test_budget_expiry_during_limit_cleanup_preserves_catch_up_park(self):
+        self.use_last_repair()
+
+        def drive(flow):
+            run = flow.ctx.run
+            self.ctrl.run = self.ctrl.job.run = self.ctrl.job.b.run = run
+            self.ctrl.lease = ledger.acquire(run.id, "", self.ctrl.data)
+            self.ctrl.policy = config.Orchestration(max_decisions=1)
+            worker = self.start_writing_worker()
+            error = runlimits.Parked(run.budget.reason())
+            worker.close.side_effect = error
+            with self.assertRaises(runlimits.Parked) as raised:
+                self.ctrl.drive()
+            self.assertIs(raised.exception, error)
+            worker.close.assert_called_once_with()
+            raise raised.exception
+
+        with mock.patch.object(util, "group_alive", return_value=True):
+            self.assertEqual(self.run_ticket_again(drive), 1)
+
+        self.assertTrue(self.draft)
+        self.comment.assert_called_once()
+        ticket_comment = self.comment.call_args.args[2]
+        reason = runlimits.metadata(self.ctrl.run.id, "parked.json")["reason"]
+        for text in ("Catch-up to `main` at `new-base` held on verify", "1 decision allowance"):
+            self.assertIn(text, ticket_comment)
+            self.assertIn(text, reason)
+
+    def start_writing_worker(self):
+        lease = self.ctrl.lease
+        turn = ledger.begin(lease, {}, self.ctrl.policy.max_decisions)
+        action, = ledger.accept(lease, turn, ledger.snapshot(lease)["version"],
+                                {"calls": [{"op": "worker.start", "args": {}}]}, self.ctrl.policy.max_actions)
+        ledger.transition(lease, action["id"], "running", {"writing": True, "role": "check_repair"})
+        worker = mock.Mock(writing=True, effective={})
+        worker.receive.return_value = []
+        worker.proc.poll.return_value = None
+        self.ctrl.workers[action["id"]] = worker
+        return worker
+
+    def test_time_limit_reports_hold_when_writer_shutdown_fails(self):
+        self.catch_up_hold()
+        error = RuntimeError("worker producer group did not become quiescent")
+
+        def drive(flow):
+            run = flow.ctx.run
+            self.ctrl.run = self.ctrl.job.run = self.ctrl.job.b.run = run
+            self.ctrl.lease = ledger.acquire(run.id, "", self.ctrl.data)
+            self.ctrl.policy = config.Orchestration()
+            self.ctrl.last_progress = 0
+            worker = self.start_writing_worker()
+            def close():
+                self.assertTrue(self.draft)
+                self.comment.assert_called_once()
+                raise error
+
+            worker.close.side_effect = close
+            self.ctrl.decide = mock.Mock(side_effect=lambda: self.ctrl.wait_workers(0))
+            with mock.patch.object(run.budget, "run_deadline", return_value=0):
+                try:
+                    return self.ctrl.drive()
+                finally:
+                    worker.close.assert_called_once_with()
+
+        with (mock.patch.object(pipeline, "commit_kept") as keep,
+              mock.patch.object(pipeline, "git", side_effect=AssertionError("unexpected workspace read")) as kept,
+              mock.patch.object(workspace, "note_made") as note_made):
+            self.assertEqual(self.run_ticket_again(drive), 1)
+        run = self.ctrl.run
+        self.assertTrue(self.draft)
+        hold_comments = [call.args[2] for call in self.comment.call_args_list if "held on verify" in call.args[2]]
+        self.assertEqual(len(hold_comments), 1)
+        self.assertIn("Catch-up to `main` at `new-base` held on verify", hold_comments[0])
+        self.assertIn("minute budget", hold_comments[0])
+        self.assertIn(f"crashed: RuntimeError: {error}", (run.dir / "run.log").read_text())
+        keep.assert_not_called()
+        kept.assert_not_called()
+        note_made.assert_not_called()
+
+    def test_last_repair_parks_at_action_limit(self):
+        self.use_last_repair()
+        self.ctrl.policy = config.Orchestration(max_actions=1)
+        lease = self.ctrl.lease
+        turn = ledger.begin(lease, {}, self.ctrl.policy.max_decisions)
+        calls = [{"op": "checks.run", "args": {}}]
+        version = ledger.snapshot(lease)["version"]
+        action, = ledger.accept(lease, turn, version, {"calls": calls}, self.ctrl.policy.max_actions)
+        ledger.transition(lease, action["id"], "succeeded", {})
+        self.run.action = action["id"]
+        self.ctrl.catalog.validate.side_effect = lambda response, *args, **kw: response
+        self.assert_parked_for("1 action allowance")
+
+    def controller_batches(self, *batches):
+        self.ctrl.catalog.validate.side_effect = lambda response, *_: response
+        replies = [[{"ok": True, "structured": {"calls": calls}}] for calls in batches]
+        worker = mock.Mock(pid=1, identity=None, receive=mock.Mock(side_effect=replies))
+        self.enterContext(mock.patch.object(orchestration.delegation, "Worker", return_value=worker))
+        self.enterContext(mock.patch.object(orchestration.delegation, "request", return_value={}))
+        self.enterContext(mock.patch.object(self.run, "settings", return_value=mock.Mock(chain=())))
+
+    def test_oversized_gate_batch_can_retry_with_four_actions(self):
+        self.use_last_repair()
+        self.ctrl.policy = config.Orchestration(max_actions=4, max_decisions=2)
+        self.ctrl.policy_sha = mock.Mock(return_value="policy")
+        self.ctrl.data["acceptance"] = "current"
+        calls = [{"op": "checks.run", "args": {}},
+                 {"op": "verification.run", "args": {"route_id": "model:verify:0", "effort": "low"}},
+                 {"op": "review.run", "args": {"route_id": "model:review:0", "effort": "low"}},
+                 {"op": "publication.request", "args": {}}]
+        observation = {"op": "run.observe", "args": {"after": 0, "limit": 20}}
+        self.controller_batches([observation, *calls], calls)
+
+        def perform(action):
+            if action["op"] == "publication.request":
+                self.ctrl.ending = ("pr", "gates passed", self.checkout.pr)
+            return {}
+
+        with mock.patch.object(self.ctrl, "perform", side_effect=perform):
+            self.assertEqual(self.ctrl.drive(), ("pr", "gates passed", self.checkout.pr))
+        actions = ledger.actions(self.ctrl.lease)
+        self.assertEqual([(a["turn"], a["op"], a["state"]) for a in actions],
+                         [("d0002", call["op"], "succeeded") for call in calls])
+        self.assertFalse(self.draft)
+        self.comment.assert_not_called()
+
+    def fail_body_edit(self):
+        self.edit.side_effect = gh.GhError("edit rejected")
+        self.catch_up_hold()
+        pending, = pipeline.run_store.pr_gate_refreshes(self.repo.name, "7")
+        self.assertEqual((pending["run_id"], pending["head"]), (self.run.id, self.head))
+        self.assertIn("Earlier verification.", self.body)
+        failures = [call.args[0] for call in self.run.log.call_args_list if "could not update" in call.args[0]]
+        self.assertEqual(len(failures), 1)
+        self.assertIn("edit rejected", failures[0])
+        self.edit.side_effect = self.edit_body
+
+    def assert_body_refreshed(self, log_lines):
+        self.assertEqual(pipeline.run_store.pr_gate_refreshes(self.repo.name, "7"), [])
+        self.assertIn("Verification failed on the new base.", self.body)
+        self.assertIn("Review did not run.", self.body)
+        self.assertIn("Catch-up to `main` at `new-base` held on verify", self.body)
+        self.assertIn("## Owner note\n\nKeep this.", self.body)
+        self.assertTrue(self.body.startswith("Closes #7\n"))
+        self.assertNotIn("Earlier review.", self.body)
+        retries = [line for line in log_lines if "retrying gate evidence" in line]
+        self.assertEqual(len(retries), 1)
+        self.push.assert_not_called()
+
+    def test_later_publish_retries_body_without_pushing(self):
+        self.fail_body_edit()
+        job = self.ctrl.job
+        job.changed = job.opened = job.pushed = []
+        self.assertTrue(flows.publish(self.ctrl.flow).passed)
+        self.assert_body_refreshed(call.args[0] for call in self.run.log.call_args_list)
+
+    def test_pending_refresh_copies_every_other_byte_of_the_current_body(self):
+        self.fail_body_edit()
+        owner_note = "## Owner note\n\nKeep this. @body-owner https://body.internal\nCloses #8\r\n- Fixes #9 "
+        self.body = self.body.replace("## Owner note\n\nKeep this.", owner_note)
+        self.body = self.body.replace("Earlier review.", "Earlier review.\n\n<!-- Closes #8 -->")
+        job = self.ctrl.job
+        job.changed = job.opened = job.pushed = []
+
+        self.assertTrue(flows.publish(self.ctrl.flow).passed)
+
+        self.assertEqual(pipeline.run_store.pr_gate_refreshes(self.repo.name, "7"), [])
+        self.assertTrue(self.body.startswith("Closes #7\n\n## Checked in use\n\n"))
+        self.assertIn("Verification failed on the new base.", self.body)
+        self.assertTrue(self.body.endswith(f"\n\n{owner_note}"))
+        self.assertNotIn("<!--", self.body)
+        self.assertEqual(self.body.count("Closes #8"), 1)
+        self.push.assert_not_called()
+
+    def test_later_publish_retries_body_before_merge_callback(self):
+        self.fail_body_edit()
+        job = self.ctrl.job
+        job.changed = job.opened = job.pushed = []
+
+        def merge(candidates):
+            self.assertEqual(candidates, [])
+            self.assert_body_refreshed(call.args[0] for call in self.run.log.call_args_list)
+
+        callback = mock.Mock(side_effect=merge)
+        self.assertTrue(flows.publish(self.ctrl.flow, merge=callback).passed)
+        callback.assert_called_once()
+
+    def test_classic_publication_retries_body_after_startup_retry_fails(self):
+        self.fail_body_edit()
+        self.edit.reset_mock()
+        self.edit.side_effect = gh.GhError("startup edit rejected")
+        checkout = self.checkout
+        checkout.wt = self.state
+        layer = config.RepoLayer(self.state, factory_path="classic", trust_level="automerge")
+        staged = pipeline.Staged(counts={"file.txt": 1}, changed=[checkout])
+        verified, review = verify.Verified("pass"), Review("approve")
+
+        def watch_ci(*args):
+            self.edit.assert_called_once()
+            self.assertIn("Earlier verification.", self.body)
+            self.edit.side_effect = self.edit_body
+            return "passed"
+
+        def merge(b, candidate, *_args, **_kwargs):
+            self.assertIs(candidate, checkout)
+            self.assertEqual(self.edit.call_count, 2)
+            self.assertEqual(pipeline.run_store.pr_gate_refreshes(self.repo.name, "7"), [])
+            self.assertIn("Verification failed on the new base.", self.body)
+            self.assertIn("## Owner note\n\nKeep this.", self.body)
+            self.push.assert_called_once()
+
+        self.enterContext(mock.patch.object(config, "load_layer", return_value=layer))
+        self.enterContext(mock.patch.object(tracker.GitHubTracker, "prepare"))
+        self.enterContext(mock.patch.object(gh, "pr_comment"))
+        self.enterContext(mock.patch.object(workspace, "make_workspace", return_value=(self.state, [checkout])))
+        self.enterContext(mock.patch.object(workspace, "note_made"))
+        self.enterContext(mock.patch.multiple(pipeline, settle_starts=mock.DEFAULT, _learn=mock.DEFAULT,
+                                              release_workspace=mock.DEFAULT))
+        self.enterContext(mock.patch.object(pipeline, "git", return_value=self.head))
+        self.enterContext(mock.patch.object(pipeline, "stage", return_value=staged))
+        self.enterContext(mock.patch.object(pipeline.Run, "agent",
+                                            side_effect=[Result(True, structured={"plan": "Edit the file."}),
+                                                         Result(True, text="Edited the file.")]))
+        self.enterContext(mock.patch.object(pipeline.Build, "check_with_repairs", return_value=(True, 1)))
+        self.enterContext(mock.patch.object(pipeline.Build, "require_valid_diff"))
+        self.enterContext(mock.patch.object(pipeline, "verify_in_use", return_value=verified))
+        self.enterContext(mock.patch.object(pipeline, "_review", return_value=review))
+        self.enterContext(mock.patch.object(pipeline, "watch_ci", side_effect=watch_ci))
+        self.enterContext(mock.patch.object(slots, "take_merge_lease", return_value=nullcontext()))
+        merge_attempt = self.enterContext(mock.patch.object(pipeline, "try_automerge", side_effect=merge))
+
+        result = self.run_ticket_again()
+        row = pipeline.run_store.newest_whole_run(self.repo.name, "7")
+        log = (paths.RUNS_DIR / row["id"] / "run.log").read_text()
+        self.assertEqual(result, 0, log)
+        merge_attempt.assert_called_once()
+        self.assertEqual(self.edit.call_count, 2)
+        self.push.assert_called_once()
+
+    def test_controller_retries_new_evidence_before_merge(self):
+        self.publish_repaired_catch_up(retry_fails=False)
+
+    def test_controller_keeps_new_evidence_pending_when_retry_fails(self):
+        self.publish_repaired_catch_up(retry_fails=True)
+
+    def publish_repaired_catch_up(self, *, retry_fails):
+        self.catch_up_hold()
+        job = self.ctrl.job
+        self.ctrl.data["evidence"]["checks"] = {"result": {"full": True}}
+        job.verified = verify.Verified("pass", "Repaired head verified.", checks=[
+            {"passed": True, "what": "repair", "how": "run the check", "saw": "passed"}])
+        job.review = Review("approve", "Repaired head approved.")
+        self.edit.reset_mock()
+
+        def edit_body(*args, **kwargs):
+            if self.edit.call_count == 1 or retry_fails:
+                raise gh.GhError("edit rejected")
+            self.edit_body(*args, **kwargs)
+
+        def merge(*_args, **_kwargs):
+            self.assertEqual(self.edit.call_count, 2)
+            pending = pipeline.run_store.pr_gate_refreshes(self.repo.name, "7")
+            if retry_fails:
+                row, = pending
+                self.assertEqual(row["head"], self.head)
+                self.assertIn("Repaired head verified.", row["evidence"]["checked"])
+                self.assertIn("Verification failed on the new base.", self.body)
+            else:
+                self.assertEqual(pending, [])
+                self.assertIn("Repaired head verified.", self.body)
+                self.assertIn("Repaired head approved.", self.body)
+
+        self.edit.side_effect = edit_body
+        with (mock.patch.object(pipeline, "try_automerge", side_effect=merge) as merge_attempt,
+              mock.patch.object(flows, "ended", return_value=("pr", "published", self.checkout.pr))):
+            self.assertEqual(self.ctrl.publish()["ending"], "pr")
+        merge_attempt.assert_called_once()
+        self.assertEqual(bool(pipeline.run_store.pr_gate_refreshes(self.repo.name, "7")), retry_fails)
+        self.assertEqual([call.args[0] for call in self.ctrl.atomic.call_args_list], ["pr", "publish"])
+        self.push.assert_not_called()
+        log_lines = [call.args[0] for call in self.run.log.call_args_list]
+        self.assertEqual(sum("retrying gate evidence" in line for line in log_lines), 1)
+        self.assertEqual(sum("could not update gate evidence" in line for line in log_lines), 2 if retry_fails else 1)
+
+    def test_new_run_of_ticket_retries_saved_body_refresh(self):
+        self.fail_body_edit()
+        drive = mock.Mock(return_value=("noop", "fixture done", ""))
+        self.assertEqual(self.run_ticket_again(drive), 0)
+        drive.assert_called_once()
+        run = drive.call_args.args[0].ctx.run
+        self.assertNotEqual(run.id, self.run.id)
+        self.assert_body_refreshed((run.dir / "run.log").read_text().splitlines())
+
+    def test_new_run_retries_screened_evidence_after_verify_url_changes(self):
+        old_host = "old-verifier.example.com"
+        old_url = f"https://{old_host}/health"
+        attempts = []
+
+        def reject_edit(args, *, input):
+            url = args[2]
+            self.assertEqual(url, self.checkout.pr)
+            attempts.append(input)
+            raise gh.GhError("edit rejected")
+
+        with (mock.patch.object(outbound, "extra_hosts", set()),
+              mock.patch.object(outbound, "keep_configured_private")):
+            outbound.keep_verify_private(old_url)
+            self.edit.side_effect = reject_edit
+            pipeline.publish_gate_evidence(self.run, self.ctrl.job.ticket, self.checkout,
+                                           verify.Verified("fail", f"Checked {old_url}."),
+                                           Review("request_changes", f"Could not verify {old_host}."))
+            pending, = pipeline.run_store.pr_gate_refreshes(self.repo.name, "7")
+            first, = attempts
+            self.assertNotIn(old_host, first)
+
+            outbound.extra_hosts.clear()
+            outbound.keep_verify_private("https://new-verifier.example.com/health")
+            self.assertEqual(outbound.screen(old_url), old_url)
+            self.edit.side_effect = self.edit_body
+            self.assertEqual(self.run_ticket_again(lambda _: ("noop", "fixture done", "")), 0)
+
+        self.assertNotIn(old_host, self.body)
+        self.assertNotIn(old_host, json.dumps(pending["evidence"]))
+        self.assertIn("Checked [private address]/health.", self.body)
+        self.assertIn("Could not verify [private address].", self.body)
+        self.assertEqual(pipeline.run_store.pr_gate_refreshes(self.repo.name, "7"), [])
+        self.push.assert_not_called()
+
+    def run_ticket_again(self, drive=None):
+        pipeline.record.settle(self.run.id, "failed")
+        script = pipeline.Script("orchestrate", drive) if drive is not None else None
+        self.addCleanup(signal.signal, signal.SIGTERM, signal.getsignal(signal.SIGTERM))
+        with (mock.patch.object(config, "load", return_value=config.Config(repos=[self.repo])),
+              mock.patch.multiple(pipeline.scratch, process_ids=dict, service_labels=dict, RUN_BASELINES={}, RUN_LABELS={}),
+              redirect_stdout(StringIO())):
+            return pipeline.run_issue(self.repo.name, "7", script=script)
+
+    def test_newer_gate_results_replace_the_pending_hold(self):
+        self.fail_body_edit()
+        c = self.checkout
+        self.head = "repaired-head"
+        c.note_pushed_head(self.head)
+        self.body = self.body.replace("Keep this.", "Updated while refresh was pending.")
+        pipeline.publish_gate_evidence(self.run, self.ctrl.job.ticket, c,
+                                       verify.Verified("pass", "Repaired head verified."),
+                                       Review("approve", "Repaired head approved."))
+        self.assertIn("Repaired head verified.", self.body)
+        self.assertIn("Repaired head approved.", self.body)
+        self.assertIn("Updated while refresh was pending.", self.body)
+        self.assertNotIn("Verification failed on the new base.", self.body)
+        self.assertEqual(pipeline.run_store.pr_gate_refreshes(self.repo.name, "7"), [])
+
+    def test_passing_catch_up_refreshes_evidence_and_retries_merge_as_before(self):
+        c = self.checkout
+        current = verify.Verified("pass", "Verified on the new base."), Review("approve", "Reviewed on the new base.")
+
+        def catch_up(*_, before_push):
+            before_push("caught-up", *current)
+            self.head = "caught-up"
+            c.note_pushed_head(self.head)
+            return current
+
+        with (mock.patch.object(pipeline, "try_automerge", side_effect=[gh.MovedBaseHold("base moved"), None]) as merge,
+              mock.patch.object(pipeline, "catch_up_base", side_effect=catch_up)):
+            self.assertIsNone(self.ctrl.automerge([c]))
+        self.assertEqual(merge.call_count, 2)
+        self.assertEqual(merge.call_args.args[2:4], current)
+        self.ctrl.publication_ci.assert_called_once_with([c], caught_up=True)
+        self.assertFalse(self.draft)
+        self.assertEqual(self.ctrl.data["publication"]["heads"][c.github], "caught-up")
+        self.assertIn("Verified on the new base.", self.body)
+        self.assertIn("Reviewed on the new base.", self.body)
+        self.assertEqual(pipeline.run_store.pr_gate_refreshes(self.repo.name, "7"), [])
+
+    def test_failed_refresh_during_catch_up_is_retried_before_merge(self):
+        c = self.checkout
+        current = verify.Verified("pass", "Verified on the new base."), Review("approve", "Reviewed on the new base.")
+
+        def catch_up(*_, before_push):
+            before_push("caught-up", *current)
+            self.head = "caught-up"
+            c.note_pushed_head(self.head)
+            self.edit.side_effect = gh.GhError("edit rejected")
+            return current
+
+        def watch(*_, **_kw):
+            self.assertIn("Earlier verification.", self.body)
+            self.edit.side_effect = self.edit_body
+
+        def merge(*_, **_kw):
+            if merge_attempt.call_count == 1:
+                return gh.MovedBaseHold("base moved")
+            self.assertIn("Verified on the new base.", self.body)
+            self.assertEqual(pipeline.run_store.pr_gate_refreshes(self.repo.name, "7"), [])
+
+        self.ctrl.publication_ci.side_effect = watch
+        with (mock.patch.object(pipeline, "try_automerge", side_effect=merge) as merge_attempt,
+              mock.patch.object(pipeline, "catch_up_base", side_effect=catch_up)):
+            self.assertIsNone(self.ctrl.automerge([c]))
+        self.assertEqual(merge_attempt.call_count, 2)
+        self.assertEqual(self.edit.call_count, 2)
+        self.push.assert_not_called()
 
 
 class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):

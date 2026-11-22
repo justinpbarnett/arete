@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from importlib import import_module
 from unittest.loader import _FailedTest
 
-TAIL = 4000
+KEPT_LINES = 40
 DEFAULT_CLASS_TIMEOUT = 10
 STACK_GRACE = 1
 HISTORY = os.path.join(tempfile.gettempdir(), "arete-parallel-durations.json")
@@ -129,12 +129,12 @@ class Runner:
 
     def output(self, path):
         with open(path, "rb") as handle:
-            size = os.fstat(handle.fileno()).st_size
-            if size <= 2 * TAIL:
-                return handle.read().decode(errors="replace")
-            head = handle.read(TAIL).decode(errors="replace")
-            handle.seek(-TAIL, os.SEEK_END)
-            return head + f"\n... full output: {path} ...\n" + handle.read().decode(errors="replace")
+            lines = handle.read().decode(errors="replace").splitlines()
+        if len(lines) <= KEPT_LINES:
+            return "\n".join(lines)
+        dropped = len(lines) - KEPT_LINES
+        note = f"... {dropped} earlier output lines dropped; all of them are in {path} ..."
+        return "\n".join([note, *lines[-KEPT_LINES:]])
 
     def request_stacks(self, prefix):
         deadline = time.monotonic() + STACK_GRACE
@@ -310,20 +310,23 @@ class Runner:
 
     def show_failures(self, identifier, report):
         timeout_report = report.get("timeout")
+        kinds = [kind for kind in ("errors", "failures", "unexpected") if report[kind]]
+        if report["output"] and (timeout_report or kinds):
+            print(report["output"])
         if timeout_report:
             print(f"\n{timeout_report}")
-            if report["output"]:
-                print(report["output"])
-        for kind in ("errors", "failures", "unexpected"):
-            if not report[kind]:
-                continue
+        for kind in kinds:
             print(f"\n{identifier}: {kind}")
             for entry in report[kind]:
                 print(entry if isinstance(entry, str) else "\n".join(entry))
-            if report["output"] and not timeout_report:
-                print(report["output"])
 
     def finish(self, seconds):
+        for identifier in self.crowded:
+            report = self.results[identifier]
+            first = self.first_failures[identifier]
+            where = "ran past its deadline" if first["timeout"] else "failed"
+            print(f"{identifier}: {where} on its first run, "
+                  f"then passed alone within twice its deadline in {report['seconds']:.2f}s", flush=True)
         suite_failed = False
         ran = skipped = 0
         for identifier, report in self.results.items():
@@ -341,12 +344,6 @@ class Runner:
             os.replace(temporary, HISTORY)
         except OSError:
             pass
-        for identifier in self.crowded:
-            report = self.results[identifier]
-            first = self.first_failures[identifier]
-            where = "ran past its deadline" if first["timeout"] else "failed"
-            print(f"{identifier}: {where} on its first run, "
-                  f"then passed alone within twice its deadline in {report['seconds']:.2f}s", flush=True)
         if self.args.slowest:
             print("Slowest classes:")
             for name, report in sorted(self.results.items(), key=lambda item: -item[1]["seconds"])[:self.args.slowest]:

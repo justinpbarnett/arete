@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import importlib.util
 import json
@@ -465,6 +466,7 @@ class CatchUpGateHold(workspace.RunFailed):
         super().__init__(why)
         self.gate, self.head, self.report = gate, head, report
         self.verified, self.review = verified, review
+        self.candidate_restored = True
 
 
 class CatchUpPushUnconfirmed(workspace.RunFailed):
@@ -492,6 +494,7 @@ class Run(AgentRun):
     alone: bool = False
     facts: dict = field(default_factory=dict)
     catch_up_preserved: set[str] = field(default_factory=set)
+    catch_up_cleanup_park: tuple[str, str, str] | None = field(default=None, init=False)
     closed_checkouts: list[workspace.Checkout] = field(default_factory=list)
     repairs: str = ""
     action: str = ""
@@ -685,11 +688,14 @@ class Run(AgentRun):
         if not self.dry_run and (err := self.tracker.label(self.tid, remove=[status])):
             self.log(f"tracker: {util.first_line(err, 300)}")
 
-    def say(self, body: str) -> str:
+    def say(self, body: str, *, on_ticket: bool = False) -> str:
         if self.dry_run:
             return ""
         body = public_text(self, body)
-        err = self.say_on_prs(body) if self.feedback else self.tracker.comment(self.tid, f"{tracker.ARETE_TAG} {body}")
+        if self.feedback and not on_ticket:
+            err = self.say_on_prs(body)
+        else:
+            err = self.tracker.comment(self.tid, f"{tracker.ARETE_TAG} {body}")
         if err:
             self.log(f"tracker: {util.first_line(err, 300)}")
         return err
@@ -702,6 +708,15 @@ class Run(AgentRun):
             except gh.GhError as e:
                 errors.append(f"{url}: {e}")
         return "; ".join(errors)
+
+    def retry_gate_evidence(self) -> None:
+        if self.dry_run or not self.repo.parts:
+            return
+        for pending in run_store.pr_gate_refreshes(self.repo.name, str(self.tid)):
+            pr = pending["pr_url"]
+            self.log(f"automerge: retrying gate evidence refresh in {pr}")
+            if update_pr_gate_evidence(self, pr, pending["evidence"], expected_head=pending["head"]):
+                run_store.clear_pr_gate_refresh(self.repo.name, str(self.tid), pr)
 
     def give_up(self, why: str) -> None:
         if self.alone:
@@ -1097,7 +1112,8 @@ def check_lane(layer: config.RepoLayer, run: AgentRun):
 
 
 def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: AgentRun,
-               timeout: float, *, selected: set[str] | None = None) -> tuple[bool, str]:
+               timeout: float, *, selected: set[str] | None = None,
+               defer_failed_cleanup: bool = False) -> tuple[bool, str]:
     commands = layer.checks
     if selected is not None:
         available = layer.checks | layer.targeted_commands
@@ -1110,6 +1126,7 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
     slow = [(name, command) for name, command in commands.items() if name not in layer.quick_checks]
     untracked_before = untracked_by_dir(git_dirs)
     report, ok = [], True
+    cleanup_untracked = not defer_failed_cleanup
 
     def execute(items, hold_fds):
         nonlocal ok
@@ -1135,9 +1152,11 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
                 report.append("Not run because cheap checks failed: " + ", ".join(name for name, _ in slow))
         if selected is not None and set(commands) != set(layer.checks):
             report.append("Targeted pass only; the full suite is still required before publication.")
+        cleanup_untracked = cleanup_untracked or ok
     finally:
-        for d, name in untracked_added_since(untracked_before):
-            workspace.remove_untracked(d, name)
+        if cleanup_untracked:
+            for d, name in untracked_added_since(untracked_before):
+                workspace.remove_untracked(d, name)
     return ok, "\n\n".join(report)
 
 
@@ -1240,7 +1259,7 @@ class Build(TicketWork):
                               disallowed_tools=routing.NO_GIT_WRITES, fresh_prompt=primed, add_dirs=call_dirs, **kw)
 
     def check(self, *, quick: bool = False, after: str = "the build and its fixes",
-              staged: Staged | None = None) -> bool:
+              staged: Staged | None = None, defer_failed_cleanup: bool = False) -> bool:
         previous, self.checked = self.checked, {}
         self.report = "Checks started but did not complete; no passing result from this attempt."
         try:
@@ -1251,7 +1270,7 @@ class Build(TicketWork):
             elif self.denied_feedback:
                 self.report = self.denied_feedback
             else:
-                return self.check_commands_on_tree(staged, quick, previous)
+                return self.check_commands_on_tree(staged, quick, previous, defer_failed_cleanup=defer_failed_cleanup)
         except BaseException as e:
             self.checked = {}
             self.report = f"Checks did not complete: {type(e).__name__}: {util.first_line(str(e), 300)}"
@@ -1262,11 +1281,13 @@ class Build(TicketWork):
             raise runlimits.Parked(f"{reason}. {self.report}")
         return False
 
-    def check_commands_on_tree(self, staged: Staged, quick: bool, previous: dict) -> bool:
+    def check_commands_on_tree(self, staged: Staged, quick: bool, previous: dict, *,
+                               defer_failed_cleanup: bool = False) -> bool:
         selected = selected_checks(self.layer, staged.files) if quick else None
         full = selected is None or selected == set(self.layer.checks)
         before = factory.fingerprint(self.ws)
-        ok, self.report = run_checks(self.layer, self.ws, self.git_dirs, self.run, self.timeout, selected=selected)
+        ok, self.report = run_checks(self.layer, self.ws, self.git_dirs, self.run, self.timeout, selected=selected,
+                                     defer_failed_cleanup=defer_failed_cleanup)
         if ok:
             after = factory.fingerprint(self.ws)
             if before and after and before != after:
@@ -1603,7 +1624,10 @@ def parent_run(script: Script | None, earlier: dict | None, budget_history: list
 
 def park_run(run: Run, reason: str) -> tuple[str, str, str]:
     keep_edits(run)
-    held = kept_heads(run)
+    return record_park(run, reason, kept_heads(run))
+
+
+def record_park(run: Run, reason: str, held: dict) -> tuple[str, str, str]:
     status, summary = "failed", (f"parked: {reason}; branch and evidence retained, workspace left in place"
                                  f"{', edits kept in a local commit' if held else ''}. {runlimits.RETRY}")
     kept = run.budget.park(reason, held)
@@ -2011,6 +2035,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     if not (flow and flow.refusal):
                         run.budget.capture(current or tk.get(tid))
                 with run_lines.nonblocking_appends(check_work_log) if zte_grant else nullcontext():
+                    if not (only or zte_grant or (flow and flow.refusal)):
+                        run.retry_gate_evidence()
                     drive_entered = True
                     status, summary, pr_url = flows.driven(flow, script.drive) if script else _run(cfg, run, slot)
             if zte_grant:
@@ -2022,7 +2048,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         except runlimits.Parked as e:
             if zte_grant:
                 return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
-            status, summary, pr_url = park_run(run, str(e))
+            status, summary, pr_url = run.catch_up_cleanup_park or park_run(run, str(e))
         except factory.OnlyDone as e:
             if zte_grant:
                 return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
@@ -2083,6 +2109,12 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 workspace.note_made(*run.workspace, workspace_owner(run, *run.workspace), preserve=run.catch_up_preserved,
                                     excluded=run.closed_checkout_paths)
             slot.free()
+        if run.catch_up_cleanup_park and (held := kept_heads(run)):
+            try:
+                if parked := runlimits.metadata(run.id, "parked.json"):
+                    util.write_json(runlimits.artifact(run.id, "parked.json"), {**parked, "kept": held})
+            except (OSError, ValueError) as e:
+                run.log(f"could not record retained heads for the catch-up park: {e}")
         try:
             with handoff_io():
                 settle_run(run, status, summary, pr_url, restarting, flow, echo_end=not zte_grant)
@@ -2499,7 +2531,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
         status, why, _ = _fail(run, e.why, detail=f"{e.detail}\n\n### PRs\n\n{prs}\n\nReview comments on a PR "
                                                   "start a revision, as on any arete PR.")
         return status, why, record_prs(run, branch, with_prs)
-    run.enter("pr")
+    flows.enter_publication(run)
     ready = opened + ready_pushed(run, pushed, ci_stopped, draft_why)
     ci_result = automerge(b, approval, draft_why, verified, review, ready, automerge_about(t, build_summary),
                           slot=slot, branch=branch, goal=goal, plan=plan_to_review) or ci_result
@@ -2626,6 +2658,7 @@ def automerge(b: Build, approval: dict | None, draft_why: str, verified: verify.
                         set_draft(run, c, True)
                     hold = f"catch-up CI held: {ci_result}"
                     break
+                run.retry_gate_evidence()
             report_automerge(run, c, hold)
     return ci_result
 
@@ -2681,6 +2714,55 @@ def catch_up_target(b: Build, c: workspace.Checkout, slot: slots.RunSlot) -> tup
     return base_sha, ""
 
 
+def log_catch_up_failure(run: AgentRun, action: str, error: BaseException) -> None:
+    with suppress(Exception):
+        reason = util.first_line(str(error), 300) or type(error).__name__
+        run.log(public_text(run, f"automerge: catch-up {action}: {reason}"))
+
+
+def catch_up_paths(wt: Path) -> set[str]:
+    return workspace.untracked_files(wt) | workspace.ignored_file_paths(wt)
+
+
+def remove_new_paths(run: AgentRun, wt: Path, before: set[str], after: set[str], untracked: set[str]) -> bool:
+    restored = True
+    directories: dict[Path, bool] = {}
+    with local_paths.directory_fd(wt) as root:
+        for name in sorted(after - before):
+            path = Path(name)
+            try:
+                if not path.parts or path.is_absolute() or ".." in path.parts:
+                    raise PermissionError("path is not inside the worktree")
+                if name.endswith("/"):
+                    directories[path] = True
+                    continue
+                try:
+                    with local_paths.directory_fd(path.parent, root) as parent:
+                        os.unlink(path.name, dir_fd=parent)
+                except FileNotFoundError:
+                    pass
+                if name in untracked:
+                    for ancestor in path.parents:
+                        if ancestor.parts:
+                            directories.setdefault(ancestor, False)
+            except Exception as failed:
+                restored = False
+                log_catch_up_failure(run, f"cleanup could not remove {name!r}", failed)
+        for path in sorted(directories, key=lambda p: (len(p.parts), p.as_posix()), reverse=True):
+            record = directories[path]
+            try:
+                with local_paths.directory_fd(path.parent, root) as parent:
+                    os.rmdir(path.name, dir_fd=parent)
+            except FileNotFoundError:
+                continue
+            except Exception as failed:
+                occupied = isinstance(failed, OSError) and failed.errno in (errno.ENOTEMPTY, errno.EEXIST)
+                if record or not occupied:
+                    restored = False
+                    log_catch_up_failure(run, f"cleanup could not remove {path.as_posix() + '/'!r}", failed)
+    return restored
+
+
 def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
                   goal: str, plan: str, prior_review: Review, *,
                   before_push: Callable[[str, verify.Verified, Review], None] | None = None,
@@ -2693,7 +2775,9 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
         raise workspace.RunFailed("the published tree lacks a current approving review")
     before = replace(c)
     checked, report, staged = b.checked, b.report, b.staged
-    worktree_files = workspace.untracked_files(c.wt) | workspace.ignored_file_paths(c.wt)
+    wt = c.wt.resolve()
+    worktree_files = catch_up_paths(c.wt)
+    check_files = None
     blocked = run.owner_questions_blocked
     run.owner_questions_blocked = True
     try:
@@ -2704,7 +2788,8 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
         if workspace.uncommitted(c.wt):
             raise workspace.RunFailed("the worktree has uncommitted files after merging the moved base")
         b.require_valid_diff("catching up the moved base", from_base=True)
-        if not b.check(staged=b.staged):
+        check_files = catch_up_paths(c.wt)
+        if not b.check(staged=b.staged, defer_failed_cleanup=True):
             raise CatchUpGateHold("checks", "the layer's local checks failed", head, b.report)
         if not b.layer.verify:
             raise CatchUpGateHold("verify", "the layer has no behavioral verification configured", head, b.report)
@@ -2720,19 +2805,30 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
         if before_push is not None:
             before_push(head, verified, review)
     except BaseException as error:
-        retained = isinstance(error, CatchUpGateHold)
+        log_catch_up_failure(run, "failed", error)
+        gate_hold = error if isinstance(error, CatchUpGateHold) else None
         if isinstance(error, CatchUpPathCollision):
             worktree_files.add(error.name)
             run.catch_up_preserved.add(c.prefix + error.name)
-        abort_merge(c.wt)
-        restore_head = error.head if retained else before.lease
-        if (git(["rev-parse", "HEAD"], c.wt).strip() != restore_head
-                or workspace.uncommitted(c.wt, tracked_only=True)):
-            git(["reset", "--hard", restore_head], c.wt)
-        after = workspace.untracked_files(c.wt) | workspace.ignored_file_paths(c.wt)
-        for name in after - worktree_files:
-            (c.wt / name).unlink(missing_ok=True)
-        if not retained:
+        tracked_restored = paths_restored = False
+        try:
+            abort_merge(c.wt)
+            restore_head = gate_hold.head if gate_hold else before.lease
+            if (git(["rev-parse", "HEAD"], c.wt).strip() != restore_head
+                    or workspace.uncommitted(c.wt, tracked_only=True)):
+                git(["reset", "--hard", restore_head], c.wt)
+            tracked_restored = True
+        except Exception as failed:
+            log_catch_up_failure(run, "cleanup could not restore the worktree head", failed)
+        try:
+            baseline = worktree_files if check_files is None else check_files
+            paths_restored = remove_new_paths(run, wt, baseline, catch_up_paths(c.wt),
+                                              workspace.untracked_files(c.wt))
+        except Exception as failed:
+            log_catch_up_failure(run, f"cleanup could not clean {str(wt)!r}", failed)
+        if gate_hold:
+            gate_hold.candidate_restored = tracked_restored and paths_restored
+        else:
             c.__dict__.update(vars(before))
             b.checked, b.report, b.staged = checked, report, staged
         if isinstance(error, owner_asks.Asked):
@@ -3826,20 +3922,61 @@ def publish_gate_evidence(run: Run, t: tracker.Ticket, c: workspace.Checkout,
     checked = verified.markdown() if verified is not None else "Verification did not run."
     if held:
         checked = f"{held}\n\n{checked}"
-    sections = ((CHECKED_IN_USE_HEADING, f"{CHECKED_IN_USE_HEADING}\n\n{checked}"),
-                ("## Review", review.markdown() if review is not None else "## Review\n\nReview did not run."))
-    links = (run.tracker.pr_link(t, whole=True), run.tracker.pr_link(t, whole=False))
+    reviewed = review.markdown() if review is not None else "## Review\n\nReview did not run."
+    evidence = {
+        "checked": public_text(run, outbound.screen(checked)),
+        "review": public_text(run, outbound.screen(reviewed)),
+    }
+    target = run.repo.name, str(t.id), c.pr
+    retrying = run_store.save_pr_gate_refresh(*target, run.id, c.lease, evidence)
+    if retrying:
+        run.log(f"automerge: retrying gate evidence refresh in {c.pr}")
+    links = None if retrying else (run.tracker.pr_link(t, whole=True), run.tracker.pr_link(t, whole=False))
+    if update_pr_gate_evidence(run, c.pr, evidence, links=links):
+        run_store.clear_pr_gate_refresh(*target)
+
+
+def update_pr_gate_evidence(run: Run, pr: str, evidence: dict, *, expected_head: str = "",
+                            links: tuple[str, str] | None = None) -> bool:
+    sections = ((CHECKED_IN_USE_HEADING, f"{CHECKED_IN_USE_HEADING}\n\n{evidence['checked']}"),
+                ("## Review", evidence["review"]))
     try:
-        kept, body = gh.split_link(gh.pr_body(c.pr), links)
-        for heading, section in sections:
-            pattern = re.compile(rf"^{re.escape(heading)}\n.*?(?=^## |\Z)", re.M | re.S)
-            if pattern.search(body):
-                body = pattern.sub(lambda _: f"{section.rstrip()}\n\n", body, count=1)
-            else:
-                body = f"{body.rstrip()}\n\n{section}"
-        gh.pr_edit_body(c.pr, public_text(run, body.rstrip()), link=kept)
+        if expected_head:
+            _, head = gh.pr_draft_and_head(pr)
+            if not head:
+                raise gh.GhError("could not confirm the PR head")
+            if head != expected_head:
+                run.log(f"automerge: discarded pending gate evidence in {pr} because its head changed")
+                return True
+        body = gh.pr_body(pr)
+        if links is None:
+            for heading, section in sections:
+                screened = gh.outgoing(public_text(run, section)).rstrip()
+                body = replace_gate_section(body, heading, screened, exact=True)
+            gh.pr_write_body(pr, gh.Outgoing(body))
+        else:
+            kept, body = gh.split_link(body, links)
+            for heading, section in sections:
+                body = replace_gate_section(body, heading, section.rstrip())
+            gh.pr_edit_body(pr, public_text(run, body.rstrip()), link=kept)
     except gh.GhError as e:
-        run.log(f"automerge: could not update gate evidence in {c.pr}: {util.first_line(str(e), 300)}")
+        run.log(f"automerge: could not update gate evidence in {pr}: {util.first_line(str(e), 300)}")
+        return False
+    return True
+
+
+def replace_gate_section(body: str, heading: str, section: str, *, exact: bool = False) -> str:
+    pattern = re.compile(rf"^{re.escape(heading)}\n.*?(?=^## |\Z)", re.M | re.S)
+    if not pattern.search(body):
+        if exact:
+            return f"{body}\n\n{section}" if body else section
+        return f"{body.rstrip()}\n\n{section}"
+
+    def replacement(found: re.Match) -> str:
+        last = exact and found.end() == len(body)
+        return section.rstrip() + ("" if last else "\n\n")
+
+    return pattern.sub(replacement, body, count=1)
 
 
 def comment_catch_up_ci(run: AgentRun, c: workspace.Checkout, ci_section: str,
