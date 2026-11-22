@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import math
 import re
+import shlex
 import tomllib
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -1287,6 +1288,20 @@ def section(data: dict, name: str) -> dict:
         raise ValueError(f"[{name}] is not a table") from None
 
 
+def class_command_words(value: object) -> list[str]:
+    error = "targeted_commands.classes must be a plain command line"
+    if not isinstance(value, str) or "\n" in value or "\0" in value:
+        raise ValueError(error)
+    try:
+        words = shlex.split(value)
+    except ValueError as exc:
+        raise ValueError(error) from exc
+    if (not words or not words[0] or words[0].startswith("-")
+            or any(char in word for word in words for char in ";&|<>()$`#")):
+        raise ValueError(error)
+    return words
+
+
 def load_layer(layer_dir: Path, strict: bool = False, *, source_file: Path | None = None) -> RepoLayer:
     ignored: list[str] | None = None if strict else []
     layer = RepoLayer(dir=layer_dir)
@@ -1299,6 +1314,8 @@ def load_layer(layer_dir: Path, strict: bool = False, *, source_file: Path | Non
     layer.copy = list(setup.get("copy", []))
     for name in ("checks", "targeted_commands"):
         commands = dict(section(data, name))
+        if name == "targeted_commands" and "classes" in commands:
+            class_command_words(commands["classes"])
         if any(not isinstance(command, str) or not command.strip() for command in commands.values()):
             raise ValueError(f"[{name}] must map names to nonempty commands")
         setattr(layer, name, commands)

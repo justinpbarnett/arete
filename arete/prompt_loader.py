@@ -44,6 +44,11 @@ def template(name: str, prompts_dir: Path = paths.PROMPTS_DIR) -> Template:
 def prompt(name: str, prompts_dir: Path = paths.PROMPTS_DIR, **values) -> str:
     source = template(name, prompts_dir)
     values.setdefault("owner", owner_asks.NOBODY)
+    class_check = values.get("class_check")
+    values.setdefault("test_classes", class_check or "uv run python -m tests.parallel test_x.SomeTests")
+    values.setdefault("class_check_guidance", (
+        f"Run the test classes for the files you changed by name, for example `{class_check}`.\n" if class_check else ""
+    ))
     if missing := sorted(set(source.get_identifiers()) - values.keys()):
         raise ValueError(f"prompt {name}: missing inputs: {', '.join(missing)}")
     return source.substitute({k: ("" if v is None else str(v)) for k, v in values.items()})
@@ -91,6 +96,7 @@ class Brief:
     max_lines: int | None = None
     journeys: str = ""
     denied: str = ""
+    class_check: str = ""
 
     def prompt(self, name: str, prompts_dir: Path = paths.PROMPTS_DIR, **step) -> str:
         values = {f.name: getattr(self, f.name) for f in fields(self)}

@@ -30,10 +30,10 @@ from unittest import mock
 
 from adws import single_worker
 from arete import (
-    api_check, ci, codebase, codex, config, dashboard, dbstats, diffguard, evals, factory, flows, gh, guard, install, jev,
-    journeys, launch_lease, loop_run, mergecheck, miner, orchestration, outbound, outcomes, owner_asks, paths, pipeline,
-    poll, principals, prompt_loader, queueing, record, runlimits, sandbox, serve, serve_guard, slots, tailnet,
-    tasks, tracker, util, verify, workspace,
+    accounts, api_check, ci, claude, codebase, codex, config, dashboard, dbstats, diffguard, evals, factory, flows, gh,
+    guard, install, jev, journeys, launch_lease, loop_run, mergecheck, miner, orchestration, outbound, outcomes, owner_asks,
+    paths, pipeline, poll, principals, prompt_loader, queueing, record, routing, runlimits, runner, sandbox, serve,
+    serve_guard, slots, tailnet, tasks, tracker, util, verify, workspace,
 )
 from arete.agent import NO_SESSION, Result
 from arete.orchestration_api import OPERATIONS, help_text
@@ -8749,6 +8749,122 @@ class MergeCheckJourneyTests(unittest.TestCase):
         self.assertIn("did not account for every manifest step", stderr)
         self.assertEqual(stdout, "")
         self.assertIn("2. [ordinary step 2] Inspect inventory", self.agent.call_args.args[2])
+
+
+class NamedClassCheckTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(TemporaryDirectory())).resolve()
+        self.worktree = self.root / "work tree"
+        self.worktree.mkdir()
+        self.run_dir = self.root / "run"
+        self.script = self.run_dir / "checks"
+        self.config_file = self.root / "config.toml"
+        self.started = self.root / "started"
+        stand_in = self.root / "stand in.py"
+        stand_in.write_text(
+            "import json, os, sys\n"
+            "from pathlib import Path\n"
+            "Path(sys.argv[1]).touch()\n"
+            "print(json.dumps([os.getcwd(), *sys.argv[2:]]))\n"
+        )
+        self.command = shlex.join([sys.executable, str(stand_in), str(self.started)])
+
+    def load_layer(self, command=None, *, other_check=False):
+        source = '[checks]\nlint = "printf lint | cat"\n' if other_check else ""
+        if command is not None:
+            source += f"[targeted_commands]\nclasses = {json.dumps(command)}\n"
+        self.config_file.write_text(source)
+        return config.load_layer(self.root, source_file=self.config_file)
+
+    def run_check(self, *args):
+        return subprocess.run([self.script, *args], cwd=self.root, capture_output=True, text=True,
+                              timeout=CHILD_HANG_TIMEOUT)
+
+    def test_classes_passes_literal_arguments_in_the_worktree(self):
+        fixture = self.worktree / "keep.txt"
+        fixture.write_text("keep me")
+        layer = self.load_layer(self.command, other_check=True)
+        pipeline.check_script(self.run_dir, layer, self.worktree)
+
+        result = self.run_check("classes", "test_a.B", "x; rm -rf .")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), [str(self.worktree), "test_a.B", "x; rm -rf ."])
+        self.assertEqual(list(self.worktree.iterdir()), [fixture])
+        self.assertEqual(fixture.read_text(), "keep me")
+        self.assertEqual(self.run_check("lint").stdout, "lint")
+
+    def test_classes_rejects_invalid_arguments_before_execution(self):
+        pipeline.check_script(self.run_dir, self.load_layer(self.command), self.worktree)
+        for args in ((), ("--all",), ("",), ("test_a.B", "--all")):
+            with self.subTest(args=args):
+                result = self.run_check("classes", *args)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(f"usage: {self.script} classes", result.stderr)
+                self.assertFalse(self.started.exists())
+
+    def test_layer_refuses_a_shell_command_for_classes(self):
+        for command in ("uv run python -m tests.parallel; echo x", "echo '$HOME'", "echo '# comment'", "echo x\necho y",
+                        "echo 'unclosed", "", 123):
+            with self.subTest(command=command), self.assertRaisesRegex(ValueError, r"targeted_commands\.classes"):
+                self.load_layer(command)
+
+    def job(self, layer):
+        cfg = config.Config()
+        repo = config.Repo("fixture", self.worktree)
+        run = pipeline.Run("run", repo, self.run_dir, tracker=tracker.GitHubTracker(repo), tid="825", cfg=cfg,
+                           layer=layer, overrides={"runner": "claude", "model": "claude-sonnet-4-6"},
+                           writes_lines=False)
+        checkout = workspace.Checkout("", "fixture/repo", self.worktree, self.worktree, "main")
+        job = flows.Job(cfg, run, self.worktree, layer=layer, checkouts=[checkout])
+        job.check_commands, job.check_rules = pipeline.check_script(self.run_dir, layer, self.worktree)
+        return job
+
+    def test_worker_prompts_only_advertise_the_classes_arm_when_configured(self):
+        example = f"`{self.script} classes test_x.SomeTests`"
+        original = "`uv run python -m tests.parallel test_x.SomeTests`"
+        for command in (None, self.command):
+            with self.subTest(configured=bool(command)):
+                job = self.job(self.load_layer(command))
+                build = job.brief.prompt("build", plan="", checks=job.checks, estimate=0, verify="")
+                repair = job.brief.prompt("repair", plan="", source="", findings="", checks=job.checks)
+                delegate = job.brief.prompt("delegate", goal="", context="", denied="")
+                for rendered in (build, repair):
+                    self.assertIn(example if command else original, rendered)
+                    self.assertNotIn(original if command else example, rendered)
+                self.assertEqual(example in delegate, bool(command))
+
+    def test_claude_build_grants_the_check_script_rule_and_review_does_not(self):
+        job = self.job(self.load_layer(self.command))
+        model = "claude-sonnet-4-6"
+        auth = accounts.Auth(mode="subscription", family="claude")
+        route = routing.Candidate(order=0, model=model, runner="claude", provider="anthropic", credential="login",
+                                  billing="subscription", tier="", position=0, requested=True, effort="",
+                                  instructions=(), price=None, state="ready", detail="")
+        picked = runner.Picked(route, auth, None, model, "", {auth}, None)
+        reply = json.dumps({"type": "result", "structured_output": {"verdict": "approve", "problems": []}})
+        completed = subprocess.CompletedProcess([], 0, reply, "")
+        self.enterContext(mock.patch.object(paths, "RUNS_DIR", self.root))
+        self.enterContext(mock.patch.object(pipeline, "check_lanes", return_value=[]))
+        self.enterContext(mock.patch.object(pipeline.vault, "values", return_value=set()))
+        self.enterContext(mock.patch.object(runner.run_store, "step_tries", return_value=0))
+        self.enterContext(mock.patch.multiple(record, steps=mock.DEFAULT, label_step=mock.DEFAULT))
+        self.enterContext(mock.patch.object(runner.environment, "stored", return_value={}))
+        self.enterContext(mock.patch.object(runner.jev, "ready", return_value=False))
+        self.enterContext(mock.patch.object(runner, "pick", return_value=(picked, [])))
+        stream = self.enterContext(mock.patch.object(claude.child, "stream", return_value=completed))
+        self.enterContext(mock.patch.object(pipeline, "stage", return_value=pipeline.Staged(counts={"keep.txt": 1})))
+
+        self.assertTrue(flows.build(job).passed)
+        review = pipeline._review(replace(job.b, checkouts=[]), "", job.verified)
+
+        self.assertEqual(review.verdict, "approve")
+        build_call, review_call = stream.call_args_list
+        build_args, review_args = build_call.args[0], review_call.args[0]
+        build_allowed = build_args[build_args.index("--allowedTools") + 1:build_args.index("--disallowedTools")]
+        review_allowed = review_args[review_args.index("--allowedTools") + 1:review_args.index("--disallowedTools")]
+        self.assertIn(f"Bash({self.script} classes *)", build_allowed)
+        self.assertFalse(any(str(self.script) in rule for rule in review_allowed))
 
 
 class ReviewRepairPromptTests(unittest.TestCase):
