@@ -25,6 +25,7 @@ from tempfile import NamedTemporaryFile
 from . import (
     alerts,
     browser,
+    check_process,
     ci,
     config,
     context,
@@ -1062,19 +1063,6 @@ def check_lanes(layer: config.RepoLayer, run: AgentRun) -> list[str]:
     return lanes.names(layer.parallel_checks, run.config.max_parallel_checks)
 
 
-@contextmanager
-def check_lane(layer: config.RepoLayer, run: AgentRun):
-    with ExitStack() as stack:
-        files = [stack.enter_context(util.lock_file(name)) for name in check_lanes(layer, run)]
-        if not lanes.take_free(files):
-            run.log("checks: waiting for another run's checks to finish" if len(files) == 1 else
-                    f"checks: waiting for a free check lane (max_parallel_checks {len(files)})")
-            with run.waiting("slot"):
-                while not lanes.take_free(files):
-                    time.sleep(CHECK_LANE_POLL_SECONDS)
-        yield
-
-
 def tail_of_both_streams(stdout: str, stderr: str, n: int) -> str:
     stdout_room = n - min(len(stderr), n // 2)
     stderr_room = n - min(len(stdout), n // 2)
@@ -1087,6 +1075,25 @@ def selected_checks(layer: config.RepoLayer, files: list[str]) -> set[str]:
         if any(util.matches_any(name, [pattern]) for name in files):
             selected.update(names)
     return selected or set(layer.checks)
+
+
+@contextmanager
+def worker_suite_lane(layer: config.RepoLayer, run: AgentRun):
+    with ExitStack() as stack:
+        files = [stack.enter_context(util.lock_file(name)) for name in check_lanes(layer, run)]
+        if not lanes.take_free(files):
+            run.log("checks: waiting for an agent's full suite run to finish")
+            with run.waiting("slot"):
+                while not lanes.take_free(files):
+                    time.sleep(CHECK_LANE_POLL_SECONDS)
+        yield
+
+
+@contextmanager
+def check_lane(layer: config.RepoLayer, run: AgentRun):
+    with (slots.check_slot(run, parallel=layer.parallel_checks) as lease, check_process.suite(lease) as hold_fds,
+          worker_suite_lane(layer, run)):
+        yield hold_fds
 
 
 def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: AgentRun,
@@ -1104,11 +1111,12 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
     untracked_before = untracked_by_dir(git_dirs)
     report, ok = [], True
 
-    def execute(items):
+    def execute(items, hold_fds):
         nonlocal ok
+        held = {"hold_fds": hold_fds} if hold_fds else {}
         for name, cmd in items:
             with record.timed(run.id, "check", name=name, command=cmd) as check:
-                res = environment.sh(cmd, run.config, run.repo, cwd=cwd, timeout=run.time_for(timeout))
+                res = environment.sh(cmd, run.config, run.repo, cwd=cwd, timeout=run.time_for(timeout), **held)
                 check["exit"] = res.returncode
             passed = res.returncode == 0
             ok = ok and passed
@@ -1119,11 +1127,10 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
                 report.append(f"### {name} passed: `{cmd}`")
 
     try:
-        with nullcontext() if layer.parallel_checks else check_lane(layer, run):
-            execute(quick)
+        with check_lane(layer, run) as hold_fds:
+            execute(quick, hold_fds)
             if slow and ok:
-                with check_lane(layer, run) if layer.parallel_checks else nullcontext():
-                    execute(slow)
+                execute(slow, hold_fds)
             elif slow:
                 report.append("Not run because cheap checks failed: " + ", ".join(name for name, _ in slow))
         if selected is not None and set(commands) != set(layer.checks):

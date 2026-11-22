@@ -68,6 +68,7 @@ def policy_fingerprint(cfg, layer, closed_context, *, resume=False):
         effective["verify"] = layer.verify.policy()
     policy_config = asdict(cfg)
     policy_config.pop("server_url")
+    policy_config["max_parallel_checks"] = config.Config.max_parallel_checks
     if resume:
         config.remove_controller_only_settings(policy_config)
     return ledger.digest(json.loads(json.dumps({"layer": effective, "config": policy_config,
