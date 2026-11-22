@@ -279,14 +279,12 @@ def bullets(items) -> str:
     return "\n".join(f"- {item}" for item in items) or "- none"
 
 
-def fill(brief: Brief, doc: config.Document, samples: list[str], target: tuple[int, int] | None, *,
-         live: bool = True) -> str:
+def fill(brief: Brief, doc: config.Document, samples: list[str], target: tuple[int, int] | None) -> str:
     supplied = [f"{name}: {getattr(brief, name)}" for name in SUPPLIED if getattr(brief, name)]
     voice = "\n".join(f"- {clipped(line)}" for line in samples)
     words = f"about {target[0]} to {target[1]} words" if target else "as short as completeness allows"
     pinned = protected(brief)
-    render = prompt_loader.live_prompt if live else prompt_loader.prompt
-    return render("document", paths.PROMPTS_DIR,
+    return prompt_loader.prompt("document", paths.PROMPTS_DIR,
         kind=brief.kind, audience=brief.audience or "the reader", channel=brief.channel or "plain text",
         action=brief.action, facts=bullets(brief.facts), acceptance=bullets(brief.acceptance),
         supplied="\n".join(f"- {s}" for s in supplied) or "- none", draft=brief.draft.strip() or "none",
@@ -326,7 +324,7 @@ def write(brief: Brief, cfg: config.Config, *, repo=None, layer=None, run=None) 
         doc = config.document_for(cfg, repo, layer)
         target = doc.words.get(brief.kind)
         samples = voice_lines(doc.voice)
-        text, feedback, problems = fill(brief, doc, samples, target, live=run is None), "", []
+        text, feedback, problems = fill(brief, doc, samples, target), "", []
         for n in range(1, s.tries + 1):
             res = ask(text + feedback, s, cfg, repo, layer, run)
             found = res.structured if res.ok and isinstance(res.structured, dict) else {}

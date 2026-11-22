@@ -21,7 +21,6 @@ from .. import (
     paths,
     pipeline,
     prices,
-    prompt_loader,
     record,
     replay,
     routing,
@@ -853,7 +852,7 @@ def run_trial(exp: Experiment, path: Path, task: str, arm: str, repeat: int, use
             trial = exp.make_run(exp, arm, given) if exp.make_run else TrialRun(**given)
             trial.dir.mkdir(parents=True, exist_ok=True)
             try:
-                with alive(path, run_id, started), replay_folder(exp, task, arm, repeat), prompt_loader.live_templates():
+                with alive(path, run_id, started), replay_folder(exp, task, arm, repeat):
                     extra = exp.extras.get(arm, {})
                     prompts = evals.Prompts(Path(extra["prompts"]), paths.short_path(extra["prompts"])) \
                         if "prompts" in extra else evals.Prompts()

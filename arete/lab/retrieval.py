@@ -591,8 +591,8 @@ class Experiment:
         if self.charged >= self.suite.spend:
             row["accepted_why"] = row["failure"] = f"not run: the spend limit of ${self.suite.spend:g} was reached"
             return
-        question = prompt_loader.live_prompt("retrieval_answer", question=query.text,
-                                             context="\n\n".join(p.block for p in supplied))
+        question = prompt_loader.prompt("retrieval_answer", question=query.text,
+                                   context="\n\n".join(p.block for p in supplied))
         extra = {"effort": gen.effort} if gen.effort else {}
         started = time.perf_counter()
         res = runner.run(question, self.run_dir, model=gen.model, runner=gen.runner, tools=[], persist=False,

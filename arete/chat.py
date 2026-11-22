@@ -291,7 +291,7 @@ def summarize(chat_id: int, summary: str, old: list[dict], cfg: config.Config,
             return "", cost, paid
         with tempfile.TemporaryDirectory() as cwd:
             res = runner.run(
-                prompt_loader.live_prompt("chat_summary", summary=summary or "(none yet)", messages=render_all(batch)),
+                prompt_loader.prompt("chat_summary", summary=summary or "(none yet)", messages=render_all(batch)),
                 cwd, model=cfg.chat.summary_model, tools=[], persist=False,
                 timeout=SUMMARY_TIMEOUT_SECONDS, max_budget_usd=min(SUMMARY_BUDGET_USD, allowance - cost),
                 hard_cap=True, wait_out_limits=False,
@@ -526,8 +526,8 @@ def arete_repo(cfg: config.Config) -> config.Repo:
 def project_section(repo: config.Repo) -> str:
     layer = config.load_layer(repo.layer_dir)
     expertise = layer.expertise_file.read_text().strip() if layer.expertise_file.exists() else ""
-    return prompt_loader.live_prompt("chat_project", repo=repo.name, path=repo.path, layer=layer.dir,
-                                    checks=pipeline.check_list(layer), expertise=expertise or "(none yet)")
+    return prompt_loader.prompt("chat_project", repo=repo.name, path=repo.path, layer=layer.dir,
+                           checks=pipeline.check_list(layer), expertise=expertise or "(none yet)")
 
 
 def session_rules(chat_id: int) -> list[str]:
@@ -555,10 +555,10 @@ def ask(chat_id: int, prompt: str, project: str, cfg: config.Config, budget_usd:
                        "Bash(arete record*)", "Bash(arete lines*)",
                        "Bash(git show*)", *reads_issues, *session_rules(chat_id)],
         json_schema=REPLY_SCHEMA,
-        system=prompt_loader.live_prompt("chat", code=arete.path, workdir=work.path, context=CONTEXT_FILE,
-                                        github=github or "(no GitHub repo set)", chat=chat_id,
-                                        max_sessions=cfg.chat.max_sessions, budget=f"{cfg.chat.budget_usd:g}",
-                                        project=project_section(work) if project else ""),
+        system=prompt_loader.prompt("chat", code=arete.path, workdir=work.path, context=CONTEXT_FILE,
+                               github=github or "(no GitHub repo set)", chat=chat_id,
+                               max_sessions=cfg.chat.max_sessions, budget=f"{cfg.chat.budget_usd:g}",
+                               project=project_section(work) if project else ""),
         max_budget_usd=budget_usd,
         hard_cap=True,
         needs_server=True,

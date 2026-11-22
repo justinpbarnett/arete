@@ -20,7 +20,6 @@ from .. import (
     evals,
     outbound,
     paths,
-    prompt_loader,
     record,
     routing,
     scratch,
@@ -409,8 +408,7 @@ def run_trial(suite: Suite, cfg: config.Config, run_id: str, n: int, task: Task,
         work = TicketWork(cfg, run, ticket, wt, [workspace.Checkout("", repo.github, repo.path, wt, "")], layer, timeout * 60,
                           workspace="You are in a checkout of its code.")
         stage = "verifier call"
-        with prompt_loader.live_templates():
-            verified = use_product(work, step, "grade", role="verify", goal=numbered(task))
+        verified = use_product(work, step, "grade", role="verify", goal=numbered(task))
         if not (trial_dir / f"{step}.md").exists():
             run.save(f"{step}.md", verified.markdown())
         row["verdict"] = verified.verdict

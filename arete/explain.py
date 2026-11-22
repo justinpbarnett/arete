@@ -29,9 +29,9 @@ def write_plain_summary(approval: dict, cfg: config.Config) -> str:
 
 def plain_summary(approval: dict, cfg: config.Config) -> str:
     item = approval["emit"]["item"]
-    text = prompt_loader.live_prompt("explain", loop=approval["loop"], repo=delivery.repo_of(approval) or "none",
-                                    mark=secrets.token_hex(8), action=approval["summary"],
-                                    briefing=delivery.emit_of(approval).briefing(item)[:BRIEFING_SHOWN])
+    text = prompt_loader.prompt("explain", loop=approval["loop"], repo=delivery.repo_of(approval) or "none",
+                           mark=secrets.token_hex(8), action=approval["summary"],
+                           briefing=delivery.emit_of(approval).briefing(item)[:BRIEFING_SHOWN])
     with tempfile.TemporaryDirectory() as cwd:
         res = runner.run(text, cwd, model=cfg.model("explain"), tools=[],
                          json_schema=SCHEMA, persist=False, timeout=TIMEOUT_SECONDS, wait_out_limits=False,

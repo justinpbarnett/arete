@@ -501,7 +501,7 @@ def look_at(row: dict, draft_id: int, s: steps.Settings, print_: str, cfg: confi
     name = f"{row['sha256']}.{EXTENSIONS[row['type']]}"
     kept = tuple(m for m in s.requires.modalities if m not in MEDIA)
     settings = replace(s, requires=replace(s.requires, modalities=(*kept, row["kind"]), structured_output=True))
-    text = prompt_loader.live_prompt("capture_evidence", file=name, kind=row["kind"])
+    text = prompt_loader.prompt("capture_evidence", file=name, kind=row["kind"])
     with tempfile.TemporaryDirectory(prefix="arete-capture-") as room:
         shutil.copyfile(CAPTURES_DIR / str(draft_id) / row["sha256"], Path(room) / name)
         res = runner.run(text, Path(room), **s.call, tools=list(s.tools), allowed_tools=list(s.tools),
