@@ -7932,6 +7932,185 @@ class CommandConfinementTests(unittest.TestCase):
             self.assertEqual(command[command.index("-p") + 1], recovery_profile)
 
 
+class CodexReadOnlyTempTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(TemporaryDirectory()))
+        self.worktree = self.root / "worktree"
+        self.added = self.root / "added"
+        self.authority = self.root / "authority"
+        self.parent_tmp = self.root / "parent-tmp"
+        for folder in (self.worktree, self.added, self.authority, self.parent_tmp):
+            folder.mkdir()
+        self.report = self.root / "report.json"
+        fake = self.root / "codex"
+        script = self.root / "fake.py"
+        script.write_text(f"""\
+import json, os, sys
+from pathlib import Path
+
+env = {{name: os.environ.get(name) for name in ('TMPDIR', 'TMP', 'TEMP')}}
+folder = Path(env['TMPDIR'])
+contents = sorted(p.name for p in folder.iterdir()) if folder.is_dir() else None
+if folder.name.startswith('arete-codex-tmp-'):
+    (folder / 'created-by-fake').touch()
+Path({str(self.report)!r}).write_text(json.dumps({{'argv': sys.argv[1:], 'env': env, 'contents': contents}}))
+print(json.dumps({{'type': 'thread.started', 'thread_id': 'fixture'}}))
+sys.exit(int(sys.stdin.read()))
+""")
+        fake.write_text(f'#!/bin/sh\nexec {shlex.join([sys.executable, str(script)])} "$@"\n')
+        fake.chmod(0o700)
+        self.enterContext(mock.patch.object(codex, "binary", return_value=str(fake)))
+        self.enterContext(mock.patch.object(codex, "home", return_value=self.root / "codex-home"))
+        self.enterContext(mock.patch.object(sandbox, "authority_roots", return_value=(self.authority,)))
+        self.enterContext(mock.patch.object(tempfile, "gettempdir", return_value=str(self.parent_tmp)))
+        self.enterContext(mock.patch.dict(os.environ, TMPDIR=str(self.parent_tmp)))
+
+    def run_codex(self, status=0, tools=None):
+        return codex.run(str(status), self.worktree, tools=tools or ["Read", "Glob", "Grep"],
+                         add_dirs=[self.added], auth=accounts.Auth(), timeout=3)
+
+    def settings(self, argv):
+        return tomllib.loads("\n".join(value for flag, value in zip(argv, argv[1:]) if flag == "-c"))
+
+    def grants(self, settings, profile):
+        self.assertEqual(settings["default_permissions"], profile)
+        return {path for path, mode in settings["permissions"][profile]["filesystem"].items() if mode == "write"}
+
+    def test_read_only_call_gets_a_fresh_directory_and_cleans_it_up_after_either_exit(self):
+        alias = self.root / "tmp-alias"
+        alias.symlink_to(self.parent_tmp, target_is_directory=True)
+        seen = set()
+        for status in (0, 1):
+            with (self.subTest(status=status),
+                  mock.patch.object(tempfile, "gettempdir", return_value=str(alias))):
+                result = self.run_codex(status)
+                self.assertEqual(result.ok, status == 0, result.error)
+                if status:
+                    self.assertEqual(result.error, "exit 1")
+                report = json.loads(self.report.read_text())
+                folder = Path(report["env"]["TMPDIR"])
+                self.assertEqual(folder.parent.resolve(), self.parent_tmp.resolve())
+                self.assertTrue(folder.name.startswith("arete-codex-tmp-"))
+                self.assertNotIn(folder, seen)
+                seen.add(folder)
+                self.assertEqual(report["contents"], [])
+                self.assertEqual(report["env"], dict.fromkeys(("TMPDIR", "TMP", "TEMP"), str(folder)))
+                settings = self.settings(report["argv"])
+                self.assertEqual(self.grants(settings, "read_only"), {str(folder.absolute()), str(folder.resolve())})
+                self.assertTrue({"TMPDIR", "TMP", "TEMP"} <= set(settings["shell_environment_policy"]["include_only"]))
+                self.assertFalse(folder.exists())
+
+    def test_writing_call_uses_the_parent_temp_directory(self):
+        result = self.run_codex(tools=["Read", "Edit"])
+        self.assertTrue(result.ok, result.error)
+        report = json.loads(self.report.read_text())
+        expected = {str(p) for root in (self.worktree, self.added) for p in (root.absolute(), root.resolve())}
+        self.assertEqual(self.grants(self.settings(report["argv"]), "workspace_write"), expected)
+        self.assertEqual(report["env"]["TMPDIR"], str(self.parent_tmp))
+        self.assertEqual(report["contents"], [])
+
+    def assert_temp_dir_rejected(self, parent):
+        with (mock.patch.object(tempfile, "gettempdir", return_value=str(parent)),
+              mock.patch.object(tempfile, "mkdtemp", wraps=tempfile.mkdtemp) as mkdtemp,
+              mock.patch.dict(os.environ, TMPDIR=str(parent))):
+            base = codex.command(self.worktree, tools=["Read", "Glob", "Grep"], add_dirs=[self.added])
+            env = codex.agent_env()
+            result = self.run_codex()
+        self.assertTrue(result.ok, result.error)
+        mkdtemp.assert_called_once_with(prefix="arete-codex-tmp-")
+        report = json.loads(self.report.read_text())
+        settings = self.settings(report["argv"])
+        self.assertEqual(self.grants(settings, "read_only"), set())
+        self.assertEqual(settings, self.settings(base))
+        self.assertEqual(report["env"], {name: env.get(name) for name in ("TMPDIR", "TMP", "TEMP")})
+        self.assertEqual(report["contents"], [])
+        self.assertEqual(list(parent.iterdir()), [])
+
+    def test_read_only_call_rejects_temp_directories_under_protected_roots(self):
+        alias = self.root / "alias"
+        alias.symlink_to(self.authority, target_is_directory=True)
+        for root in (self.worktree, self.added, alias):
+            with self.subTest(root=root):
+                parent = root / "tmp"
+                parent.mkdir()
+                self.assert_temp_dir_rejected(parent)
+
+    def test_read_only_call_checks_filesystem_identity_of_different_case_roots(self):
+        for root in (self.worktree, self.added, self.authority):
+            with self.subTest(root=root):
+                alternate = root.with_name(root.name.upper())
+                parent = alternate / "nested" / "tmp"
+                parent.mkdir(parents=True)
+                if alternate.samefile(root):
+                    self.assert_temp_dir_rejected(parent)
+                    continue
+                with mock.patch.object(tempfile, "gettempdir", return_value=str(parent)):
+                    result = self.run_codex()
+                self.assertTrue(result.ok, result.error)
+                report = json.loads(self.report.read_text())
+                folder = Path(report["env"]["TMPDIR"])
+                self.assertEqual(folder.parent, parent)
+                self.assertEqual(self.grants(self.settings(report["argv"]), "read_only"), set(codex.both(folder)))
+                self.assertFalse(folder.exists())
+
+                stat_path = Path.stat
+                alias_paths = {alternate, alternate.resolve()}
+
+                def alias_stat(path, **kwargs):
+                    return stat_path(root if path in alias_paths else path, **kwargs)
+
+                with mock.patch.object(Path, "stat", alias_stat):
+                    self.assert_temp_dir_rejected(parent)
+
+    def test_read_only_call_rejects_the_data_volume_spelling_of_the_worktree(self):
+        worktree = self.worktree.resolve()
+        alternate = Path("/System/Volumes/Data") / worktree.relative_to(worktree.anchor)
+        if not alternate.is_dir() or not alternate.samefile(worktree):
+            self.skipTest("worktree has no macOS Data-volume alias")
+        parent = alternate / "nested" / "tmp"
+        parent.mkdir(parents=True)
+        self.assert_temp_dir_rejected(parent)
+
+    def test_trusted_scratch_uses_the_parent_temp_directory(self):
+        producer = codex.verification_scratch.PRODUCING
+        token = producer.set(mock.sentinel.attempt)
+        try:
+            with mock.patch.object(codex, "launch", return_value=subprocess.CompletedProcess(
+                    [], 0, '{"type":"thread.started","thread_id":"fixture"}', "")) as launch:
+                result = self.run_codex()
+        finally:
+            producer.reset(token)
+        self.assertTrue(result.ok, result.error)
+        argv, _, _, env, *_ = launch.call_args.args
+        self.assertEqual(self.grants(self.settings(argv), "read_only"), set())
+        self.assertEqual(env["TMPDIR"], str(self.parent_tmp))
+        self.assertEqual(list(self.parent_tmp.iterdir()), [])
+
+    def test_cleans_up_after_timeout_and_launch_error(self):
+        for error, message in ((subprocess.TimeoutExpired("codex", 3), "timed out"),
+                               (FileNotFoundError("fixture"), "codex not found")):
+            with self.subTest(error=error):
+                def fail(argv, cwd, prompt, env, *args, **kwargs):
+                    self.assertTrue(Path(env["TMPDIR"]).is_dir())
+                    raise error
+
+                with mock.patch.object(codex, "launch", side_effect=fail) as launch:
+                    result = self.run_codex()
+                self.assertFalse(result.ok)
+                self.assertIn(message, result.error)
+                folder = Path(launch.call_args.args[3]["TMPDIR"])
+                self.assertEqual(folder.parent, self.parent_tmp)
+                self.assertFalse(folder.exists())
+
+    def test_cleanup_error_is_logged_without_changing_the_result(self):
+        with (mock.patch.object(shutil, "rmtree", side_effect=PermissionError("fixture")),
+              self.assertLogs(codex.__name__, level="WARNING") as logs):
+            result = self.run_codex()
+        self.assertTrue(result.ok, result.error)
+        self.assertIn("Could not remove Codex temporary directory", logs.output[0])
+        self.assertIn("fixture", logs.output[0])
+
+
 class DeploymentCiTests(unittest.TestCase):
     def test_ci_lookup_and_classification_share_a_single_attempt_budget(self):
         now = 0
