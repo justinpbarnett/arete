@@ -23,7 +23,9 @@ REASONS = {
     "runner-start": ("a runner start failure", "the runner answered its startup check"),
     "runner-login": ("a runner login failure", "the runner login is available again"),
     "sandbox-start": ("a sandbox start failure", "the local sandbox started successfully"),
+    "controller-stall": ("a controller turn that stalled before its first reply", "the controller stall is 10 minutes old"),
 }
+STALL_WAIT = timedelta(minutes=10)
 DETAILS = {
     "scratch": {"workspace": str, "selectors": list},
     "worktree": {"workspace": str, "branch": str},
@@ -84,6 +86,8 @@ def cleared(cfg: config.Config, repo: config.Repo, layer: config.RepoLayer, tick
                 return bool(run.get("engine_sha") and codebase.STAMP and run["engine_sha"] != codebase.STAMP)
             case "policy-changed":
                 return run.get("summary") == pipeline.worker_policy_changed()
+            case "controller-stall":
+                return bool(run.get("finished")) and util.now() - util.parse_iso(run["finished"]) >= STALL_WAIT
             case "runner-start":
                 return runner.started_now(failure["runner"])
             case "runner-login":
