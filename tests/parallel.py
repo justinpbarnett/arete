@@ -27,6 +27,7 @@ STACK_SITE = os.path.join(TESTS, "_parallel_site")
 if __spec__ is None:
     sys.path.insert(0, os.path.dirname(TESTS))
 _test_stacks = import_module("arete._test_stacks")
+lanes = import_module("arete.lanes")
 THREAD = re.compile(r"(?:Current thread|Thread) (0x[0-9a-f]+) \(most recent call first\):")
 
 
@@ -253,9 +254,12 @@ class Runner:
                 outcome = "FAIL" if failed(report) else "ok"
                 print(f"{batch.identifier}: {report['ran']} tests, {outcome} ({report['seconds']:.2f}s)", flush=True)
 
-    def run(self, tests):
+    def run(self, tests, named=()):
         batches = {}
-        for test in tests:
+        entries = [(test.id().rsplit(".", 1)[0], test) for test in tests]
+        for name in named:
+            entries += [(name, test) for test in flatten(unittest.defaultTestLoader.loadTestsFromName(name))]
+        for identifier, test in entries:
             if isinstance(test, _FailedTest):
                 result = unittest.TestResult()
                 test.run(result)
@@ -264,7 +268,6 @@ class Runner:
                                            "failures": [], "skipped": [], "unexpected": [],
                                            "seconds": 0.0, "output": ""}
                 continue
-            identifier = test.id().rsplit(".", 1)[0]
             test_class = type(test)
             batch = batches.setdefault(identifier, Batch(
                 identifier, 0, serial=getattr(test_class, "serial", False),
@@ -367,6 +370,7 @@ def main():
     parser.add_argument("--lifeline", type=int)
     parser.add_argument("--one")
     parser.add_argument("--result")
+    parser.add_argument("names", nargs="*", help="classes or tests to run by name; takes no check lane")
     args = parser.parse_args()
     args.start = os.path.abspath(args.start)
     if args.one:
@@ -374,8 +378,12 @@ def main():
     if (args.jobs < 1 or args.slowest < 0
             or (args.timeout is not None and (not math.isfinite(args.timeout) or args.timeout <= 0))):
         parser.error("jobs and timeout must be positive; slowest must be nonnegative")
-    tests = list(flatten(unittest.TestLoader().discover(args.start)))
-    return Runner(args).run(tests)
+    if args.names:
+        sys.path.insert(0, args.start)
+        return Runner(args).run([], args.names)
+    with lanes.held_by_worker(os.environ, lambda note: print(f"tests.parallel: {note}", flush=True)):
+        tests = list(flatten(unittest.TestLoader().discover(args.start)))
+        return Runner(args).run(tests)
 
 
 if __name__ == "__main__":
