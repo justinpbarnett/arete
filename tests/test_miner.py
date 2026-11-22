@@ -57,7 +57,7 @@ class EnforcementProposalTests(unittest.TestCase):
                                  apply_repo=mock.DEFAULT), \
                 mock.patch.object(miner.auditor, "latest_findings", return_value="(none)"), \
                 mock.patch.object(miner.record, "settle"), mock.patch.object(miner.runner, "run", return_value=result) as call:
-            miner.apply_repo.return_value = "", []
+            miner.apply_repo.return_value = "", [], ""
             self.assertEqual(miner._run(self.cfg, self.id(), self.since, self.until, True, "", dry_run, True), 0)
             return call.call_args.args[0], miner.apply_repo.call_args_list
 
