@@ -77,8 +77,17 @@ def next_ticket(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
         def retry_failed(tid: str) -> bool:
             if runlimits.latest_park(repo.name, tid)[1]:
                 return True
-            return (not isinstance(source, tracker.GitHubTracker)
-                    and requeue.policy_retry(run_store.newest_live_whole_run(repo.name, tid)))
+            if (isinstance(source, tracker.GitHubTracker)
+                    or not requeue.policy_retry(run_store.newest_live_whole_run(repo.name, tid))):
+                return False
+            now = util.now()
+            since = util.iso(now - requeue.WINDOW)
+            failures = run_store.failed_ticket_runs_since(repo.name, tid, since)
+            if sum(requeue.recorded_failure(run).get("reason") == "policy-changed" for run in failures) <= requeue.LIMIT:
+                return True
+            print(f"{util.iso(now)} {tracker.issue_name(repo.name, tid)}: "
+                  f"kept failed after {requeue.LIMIT} policy requeues in 24 hours")
+            return False
 
         listed = source.todo(parked=retry_failed)
         known = {str(t.id) for t in listed}

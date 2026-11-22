@@ -41,6 +41,8 @@ from arete.agent import NO_SESSION, Result
 from arete.orchestration_api import OPERATIONS, help_text
 from arete.review import Review, catch_up_problems
 from arete.store import db, orchestration as ledger
+from arete.store import runs as run_store
+from arete.store import tasks as task_store
 from tests import parallel
 from tests.parallel import stack_env
 from tests.subprocess_helpers import CHILD_HANG_TIMEOUT
@@ -535,6 +537,102 @@ class QueueScoringTests(unittest.TestCase):
 
         self.source.todo()
         self.assertEqual(queueing.scores(list(self.source.open_agent_tickets)), {"1": (1, 0)})
+
+
+class PolicyRetryCapTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.state = Path(cls.enterClassContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        cls.template = cls.state / "template.db"
+        cls.enterClassContext(mock.patch.multiple(paths, STATE_DIR=cls.state, DB_FILE=cls.template,
+                                                 RUNS_DIR=cls.state / "runs", LOCKS_DIR=cls.state / "locks",
+                                                 WORKTREES_DIR=cls.state / "worktrees", LOG_DIR=cls.state / "logs"))
+        db.migrate()
+
+    def setUp(self):
+        database = self.state / f"{self._testMethodName}.db"
+        shutil.copyfile(self.template, database)
+        self.enterContext(mock.patch.object(paths, "DB_FILE", database))
+        self.now = util.parse_iso("2026-11-22T16:00:00Z")
+        self.enterContext(mock.patch.object(util, "now", return_value=self.now))
+        self.enterContext(mock.patch.object(poll.pilot, "pickable", return_value=True))
+        self.enterContext(mock.patch.object(poll.zte, "reserved", return_value=False))
+        remote = "fixture/repo"
+        self.repo = config.Repo("fixture", self.state, github=remote, parts=[config.Part("", remote)])
+        self.local = tracker.LocalTracker(self.repo)
+        self.tid = task_store.task_add(self.repo.name, "Retry policy fixture", reserved_id="t-0845")
+        task_store.task_set_state(self.tid, "failed")
+
+    def add_run(self, hours, *, tid=None, repo=None, status="failed", reason="policy-changed", duration=1):
+        tid = self.tid if tid is None else tid
+        repo = self.repo.name if repo is None else repo
+        run_store.insert_run(f"{repo}-{tid}-{hours}-{status}-{reason}", {
+            "kind": "pipeline", "repo": repo, "issue": tid, "status": status,
+            "started": util.iso(self.now - timedelta(hours=hours + duration)),
+            "finished": util.iso(self.now - timedelta(hours=hours)),
+            "summary": pipeline.worker_policy_changed(),
+            "failure": json.dumps({"class": "environment", "reason": reason}),
+        })
+
+    def pick(self, source):
+        output = StringIO()
+        with redirect_stdout(output):
+            ticket = poll.next_ticket(self.repo, source, pipeline.SkipLog({}))
+        return ticket, output.getvalue()
+
+    def test_local_retries_at_three_recent_policy_failures(self):
+        for hours in (1, 2, 3, 24):
+            self.add_run(hours)
+        self.add_run(4, status="stopped")
+        self.add_run(5, reason="engine-crash")
+        self.add_run(6, tid="t-0001")
+        self.add_run(7, repo="other")
+
+        ticket, output = self.pick(self.local)
+
+        self.assertEqual(ticket.id, self.tid)
+        self.assertEqual(output, "")
+
+    def test_local_stays_failed_at_four_recent_policy_failures(self):
+        for hours in (1, 2, 3):
+            self.add_run(hours)
+        self.add_run(4, duration=24)
+
+        with db.reader():
+            ticket, output = self.pick(self.local)
+
+        self.assertIsNone(ticket)
+        self.assertEqual(output.splitlines(), [
+            f"{util.iso(self.now)} {self.repo.name} {self.tid}: kept failed after 3 policy requeues in 24 hours",
+        ])
+
+    def test_local_retries_when_older_policy_failures_age_out(self):
+        for hours in (1, 2, 25, 26):
+            self.add_run(hours)
+
+        ticket, output = self.pick(self.local)
+
+        self.assertEqual(ticket.id, self.tid)
+        self.assertEqual(output, "")
+
+    def test_github_admission_still_depends_on_failed_label_and_park(self):
+        source = tracker.for_repo(config.Config(), self.repo)
+        tid = "845"
+        for hours in (1, 2, 3, 4):
+            self.add_run(hours, tid=tid)
+        issue = {"number": int(tid), "title": "GitHub retry fixture", "author": {"login": source.owner},
+                 "labels": [{"name": "agent"}, {"name": source.label_name("failed")}]}
+        self.enterContext(mock.patch.object(gh, "issues", return_value=[issue]))
+
+        self.assertEqual(self.pick(source), (None, ""))
+        with mock.patch.object(runlimits, "latest_park", return_value=({}, {"reason": "parked"})):
+            ticket, output = self.pick(source)
+        self.assertEqual(ticket.id, tid)
+        self.assertEqual(output, "")
+        issue["labels"].pop()
+        ticket, output = self.pick(source)
+        self.assertEqual(ticket.id, tid)
+        self.assertEqual(output, "")
 
 
 class RestoredPRRevisionTests(unittest.TestCase):
