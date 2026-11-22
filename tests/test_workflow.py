@@ -3163,13 +3163,14 @@ class MeasurementPublicationRetryTests(AutomaticCIRerunFixture, unittest.TestCas
         self.assertEqual(self.pr_text, f"{summary}\n\n{notes}\n\n{ci_stop}")
         self.comment.assert_called_once_with(checkout.pr, f"Pushed more work for #7.\n\n{report}")
 
-    def test_same_head_ci_retry_writes_the_disclosure_before_finishing_publication(self):
+    def test_same_head_ci_retry_updates_the_disclosure_before_finishing_publication(self):
         self.verdicts = {}
         controller = self.controller()
         controller.job.opened = controller.job.found = controller.job.ci_stopped = []
         measurement = pipeline.unverified_measurement_section(self.disclosure).rstrip()
+        earlier = pipeline.unverified_measurement_section({**self.disclosure, "measurement": "Builder measured 4.900 s."})
         notes = "### Rollout notes\n\nKeep the existing rollout order."
-        self.pr_text += f"\n\n{notes}"
+        self.pr_text += f"\n\n{earlier}{notes}"
 
         def reruns(*_):
             self.assertEqual(ci.SECTION.search(self.pr_text).group().strip(), failed_ci)
@@ -3239,6 +3240,47 @@ class MeasurementPublicationRetryTests(AutomaticCIRerunFixture, unittest.TestCas
         self.assertEqual(self.pr_text.count(pipeline.MEASUREMENT_START), 1)
         gh.gh.assert_called_once()
         controller.finish_publication.assert_called_once()
+
+
+class MeasurementCIRetryFallbackTests(AutomaticCIRerunFixture, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.verdicts = {"checks": True}
+        self.publication = self.controller()
+        self.publication.job.opened = self.publication.job.found = self.publication.job.ci_stopped = []
+        self.enterContext(mock.patch.object(pipeline, "set_draft"))
+        self.assertEqual(self.publication.publish()["failures"], orchestration.CI_FAILURES)
+        self.failed = [self.job("checks", 201, "success")]
+        self.body.reset_mock()
+        gh.pr_body.reset_mock()
+
+    def assert_ci_refreshed(self, disclosure=None):
+        self.assertEqual(self.publication.publish(disclosure), {"ending": "done"})
+        self.assertEqual(self.checkout.lease, "original-head")
+        self.assertNotIn("ci_failed", self.publication.data)
+        self.publication.atomic.assert_called_once()
+        self.publication.finish_publication.assert_called_once()
+        gh.gh.assert_not_called()
+        gh.pr_body.assert_called_with(self.checkout.pr)
+
+    def test_body_read_failure_with_a_measured_requirement_still_refreshes_ci(self):
+        self.publication.job.verified = verify.Verified("pass", checks=[
+            {"what": "The class finishes alone in under 5 seconds.", "passed": True},
+        ])
+        gh.pr_body.side_effect = gh.GhError("body unavailable")
+
+        self.assert_ci_refreshed()
+
+        self.body.assert_not_called()
+
+    def test_body_without_a_disclosure_only_refreshes_ci(self):
+        self.assert_ci_refreshed({"requirement": "The class finishes alone in under 5 seconds.",
+                                  "measurement": "The builder measured 4.683 s."})
+
+        self.body.assert_called_once()
+        body = self.body.call_args.args[1]
+        self.assertIn("GitHub now reports passing checks on the published head.", body)
+        self.assertNotIn(pipeline.UNVERIFIED_REQUIREMENT_HEADING, body)
 
 
 class LiveOutsideEventPublicationTests(PublicationFixture):

@@ -2684,7 +2684,8 @@ def markdown_fences(body: str) -> Iterator[tuple[int, int]]:
         yield start, offset
 
 
-def with_unverified_measurement(body: str, section: str, *, observed_requirements: list[str] | None = None) -> str:
+def with_unverified_measurement(body: str, section: str, *, observed_requirements: list[str] | None = None,
+                                existing_only: bool = False) -> str:
     found = MEASUREMENT_SECTION.search(body)
     if found:
         for start, end in markdown_fences(body):
@@ -2697,7 +2698,7 @@ def with_unverified_measurement(body: str, section: str, *, observed_requirement
             return body
         replacement = section.rstrip() + found["separator"] if section else ""
         return body[:found.start()] + replacement + body[found.end():]
-    if section:
+    if section and not existing_only:
         return f"{body}\n\n{section}" if body else section
     return body
 
@@ -3104,10 +3105,15 @@ def synced_pr_body(run: Run, pr: str, body: str, t: tracker.Ticket, left: str) -
 
 def publish_unverified_measurement(run: Run, t: tracker.Ticket, pr: str, section: str, *,
                                    observed_requirements: list[str]) -> None:
-    body = gh.pr_body(pr)
+    try:
+        body = gh.pr_body(pr)
+    except ci.READ_ERRORS as error:
+        run.log(f"ci: could not read the unverified requirement in {pr}: {util.first_line(str(error), 300)}")
+        return
     links = (run.tracker.pr_link(t, whole=True), run.tracker.pr_link(t, whole=False))
     kept, text = gh.split_link(body, links)
-    updated = with_unverified_measurement(text, public_text(run, section), observed_requirements=observed_requirements)
+    updated = with_unverified_measurement(text, public_text(run, section),
+                                         observed_requirements=observed_requirements, existing_only=True)
     if updated != text and gh.outgoing(updated, kept) != body:
         gh.pr_edit_body(pr, updated, link=kept)
 
