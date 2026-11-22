@@ -492,6 +492,7 @@ class Run(AgentRun):
     alone: bool = False
     facts: dict = field(default_factory=dict)
     catch_up_preserved: set[str] = field(default_factory=set)
+    catch_up_cleanup_park: tuple[str, str, str] | None = field(default=None, init=False)
     closed_checkouts: list[workspace.Checkout] = field(default_factory=list)
     repairs: str = ""
     action: str = ""
@@ -685,11 +686,14 @@ class Run(AgentRun):
         if not self.dry_run and (err := self.tracker.label(self.tid, remove=[status])):
             self.log(f"tracker: {util.first_line(err, 300)}")
 
-    def say(self, body: str) -> str:
+    def say(self, body: str, *, on_ticket: bool = False) -> str:
         if self.dry_run:
             return ""
         body = public_text(self, body)
-        err = self.say_on_prs(body) if self.feedback else self.tracker.comment(self.tid, f"{tracker.ARETE_TAG} {body}")
+        if self.feedback and not on_ticket:
+            err = self.say_on_prs(body)
+        else:
+            err = self.tracker.comment(self.tid, f"{tracker.ARETE_TAG} {body}")
         if err:
             self.log(f"tracker: {util.first_line(err, 300)}")
         return err
@@ -702,6 +706,15 @@ class Run(AgentRun):
             except gh.GhError as e:
                 errors.append(f"{url}: {e}")
         return "; ".join(errors)
+
+    def retry_gate_evidence(self) -> None:
+        if self.dry_run or not self.repo.parts:
+            return
+        for pending in run_store.pr_gate_refreshes(self.repo.name, str(self.tid)):
+            pr = pending["pr_url"]
+            self.log(f"automerge: retrying gate evidence refresh in {pr}")
+            if update_pr_gate_evidence(self, pr, pending["evidence"], expected_head=pending["head"]):
+                run_store.clear_pr_gate_refresh(self.repo.name, str(self.tid), pr)
 
     def give_up(self, why: str) -> None:
         if self.alone:
@@ -1603,7 +1616,10 @@ def parent_run(script: Script | None, earlier: dict | None, budget_history: list
 
 def park_run(run: Run, reason: str) -> tuple[str, str, str]:
     keep_edits(run)
-    held = kept_heads(run)
+    return record_park(run, reason, kept_heads(run))
+
+
+def record_park(run: Run, reason: str, held: dict) -> tuple[str, str, str]:
     status, summary = "failed", (f"parked: {reason}; branch and evidence retained, workspace left in place"
                                  f"{', edits kept in a local commit' if held else ''}. {runlimits.RETRY}")
     kept = run.budget.park(reason, held)
@@ -2011,6 +2027,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                     if not (flow and flow.refusal):
                         run.budget.capture(current or tk.get(tid))
                 with run_lines.nonblocking_appends(check_work_log) if zte_grant else nullcontext():
+                    if not (only or zte_grant or (flow and flow.refusal)):
+                        run.retry_gate_evidence()
                     drive_entered = True
                     status, summary, pr_url = flows.driven(flow, script.drive) if script else _run(cfg, run, slot)
             if zte_grant:
@@ -2022,7 +2040,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         except runlimits.Parked as e:
             if zte_grant:
                 return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
-            status, summary, pr_url = park_run(run, str(e))
+            status, summary, pr_url = run.catch_up_cleanup_park or park_run(run, str(e))
         except factory.OnlyDone as e:
             if zte_grant:
                 return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
@@ -2083,6 +2101,12 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 workspace.note_made(*run.workspace, workspace_owner(run, *run.workspace), preserve=run.catch_up_preserved,
                                     excluded=run.closed_checkout_paths)
             slot.free()
+        if run.catch_up_cleanup_park and (held := kept_heads(run)):
+            try:
+                if parked := runlimits.metadata(run.id, "parked.json"):
+                    util.write_json(runlimits.artifact(run.id, "parked.json"), {**parked, "kept": held})
+            except (OSError, ValueError) as e:
+                run.log(f"could not record retained heads for the catch-up park: {e}")
         try:
             with handoff_io():
                 settle_run(run, status, summary, pr_url, restarting, flow, echo_end=not zte_grant)
@@ -2499,7 +2523,7 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
         status, why, _ = _fail(run, e.why, detail=f"{e.detail}\n\n### PRs\n\n{prs}\n\nReview comments on a PR "
                                                   "start a revision, as on any arete PR.")
         return status, why, record_prs(run, branch, with_prs)
-    run.enter("pr")
+    flows.enter_publication(run)
     ready = opened + ready_pushed(run, pushed, ci_stopped, draft_why)
     ci_result = automerge(b, approval, draft_why, verified, review, ready, automerge_about(t, build_summary),
                           slot=slot, branch=branch, goal=goal, plan=plan_to_review) or ci_result
@@ -2626,6 +2650,7 @@ def automerge(b: Build, approval: dict | None, draft_why: str, verified: verify.
                         set_draft(run, c, True)
                     hold = f"catch-up CI held: {ci_result}"
                     break
+                run.retry_gate_evidence()
             report_automerge(run, c, hold)
     return ci_result
 
@@ -3826,20 +3851,61 @@ def publish_gate_evidence(run: Run, t: tracker.Ticket, c: workspace.Checkout,
     checked = verified.markdown() if verified is not None else "Verification did not run."
     if held:
         checked = f"{held}\n\n{checked}"
-    sections = ((CHECKED_IN_USE_HEADING, f"{CHECKED_IN_USE_HEADING}\n\n{checked}"),
-                ("## Review", review.markdown() if review is not None else "## Review\n\nReview did not run."))
-    links = (run.tracker.pr_link(t, whole=True), run.tracker.pr_link(t, whole=False))
+    reviewed = review.markdown() if review is not None else "## Review\n\nReview did not run."
+    evidence = {
+        "checked": public_text(run, outbound.screen(checked)),
+        "review": public_text(run, outbound.screen(reviewed)),
+    }
+    target = run.repo.name, str(t.id), c.pr
+    retrying = run_store.save_pr_gate_refresh(*target, run.id, c.lease, evidence)
+    if retrying:
+        run.log(f"automerge: retrying gate evidence refresh in {c.pr}")
+    links = None if retrying else (run.tracker.pr_link(t, whole=True), run.tracker.pr_link(t, whole=False))
+    if update_pr_gate_evidence(run, c.pr, evidence, links=links):
+        run_store.clear_pr_gate_refresh(*target)
+
+
+def update_pr_gate_evidence(run: Run, pr: str, evidence: dict, *, expected_head: str = "",
+                            links: tuple[str, str] | None = None) -> bool:
+    sections = ((CHECKED_IN_USE_HEADING, f"{CHECKED_IN_USE_HEADING}\n\n{evidence['checked']}"),
+                ("## Review", evidence["review"]))
     try:
-        kept, body = gh.split_link(gh.pr_body(c.pr), links)
-        for heading, section in sections:
-            pattern = re.compile(rf"^{re.escape(heading)}\n.*?(?=^## |\Z)", re.M | re.S)
-            if pattern.search(body):
-                body = pattern.sub(lambda _: f"{section.rstrip()}\n\n", body, count=1)
-            else:
-                body = f"{body.rstrip()}\n\n{section}"
-        gh.pr_edit_body(c.pr, public_text(run, body.rstrip()), link=kept)
+        if expected_head:
+            _, head = gh.pr_draft_and_head(pr)
+            if not head:
+                raise gh.GhError("could not confirm the PR head")
+            if head != expected_head:
+                run.log(f"automerge: discarded pending gate evidence in {pr} because its head changed")
+                return True
+        body = gh.pr_body(pr)
+        if links is None:
+            for heading, section in sections:
+                screened = gh.outgoing(public_text(run, section)).rstrip()
+                body = replace_gate_section(body, heading, screened, exact=True)
+            gh.pr_write_body(pr, gh.Outgoing(body))
+        else:
+            kept, body = gh.split_link(body, links)
+            for heading, section in sections:
+                body = replace_gate_section(body, heading, section.rstrip())
+            gh.pr_edit_body(pr, public_text(run, body.rstrip()), link=kept)
     except gh.GhError as e:
-        run.log(f"automerge: could not update gate evidence in {c.pr}: {util.first_line(str(e), 300)}")
+        run.log(f"automerge: could not update gate evidence in {pr}: {util.first_line(str(e), 300)}")
+        return False
+    return True
+
+
+def replace_gate_section(body: str, heading: str, section: str, *, exact: bool = False) -> str:
+    pattern = re.compile(rf"^{re.escape(heading)}\n.*?(?=^## |\Z)", re.M | re.S)
+    if not pattern.search(body):
+        if exact:
+            return f"{body}\n\n{section}" if body else section
+        return f"{body.rstrip()}\n\n{section}"
+
+    def replacement(found: re.Match) -> str:
+        last = exact and found.end() == len(body)
+        return section.rstrip() + ("" if last else "\n\n")
+
+    return pattern.sub(replacement, body, count=1)
 
 
 def comment_catch_up_ci(run: AgentRun, c: workspace.Checkout, ci_section: str,

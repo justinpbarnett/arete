@@ -1162,6 +1162,7 @@ class Controller:
                     if not hold:
                         if failure := self.publication_ci([checkout], caught_up=True):
                             return failure
+                        self.run.retry_gate_evidence()
                         continue
                 elif hold and self.data.get("catch_up_hold"):
                     return {"park": True, "error": hold}
@@ -1240,13 +1241,16 @@ class Controller:
         self.data.pop("catch_up_hold", None)
         self.catalog.context.pop(CATCH_UP_FAILURE, None)
 
-    def park_catch_up(self, reason):
+    def park_catch_up(self, reason, *, on_ticket=False, close_failed=False):
         held = self.data["catch_up_hold"]["reason"]
         for checkout in self.job.with_prs:
             if pipeline.own_draft_state(self.run, checkout) is False:
                 pipeline.set_draft(self.run, checkout, True, "automerge")
-        self.run.say(f"{held}. I parked the run because {reason}.")
-        return pipeline.park_run(self.run, f"{held}. {reason}")
+        self.run.say(f"{held}. I parked the run because {reason}.", on_ticket=on_ticket)
+        reason = f"{held}. {reason}"
+        if close_failed:
+            return pipeline.record_park(self.run, reason, {})
+        return pipeline.park_run(self.run, reason)
 
     def settle_publication_failure(self, failure):
         if self.data.get("catch_up_hold"):
@@ -1568,6 +1572,7 @@ class Controller:
 
     def drive(self):
         verification_passed = False
+        park_reason = None
         try:
             if ended := self.prepare():
                 return ended
@@ -1619,11 +1624,23 @@ class Controller:
                 return self.park_catch_up(str(error))
             raise
         except ledger.Conflict as error:
-            raise runlimits.Parked(str(error)) from error
+            if not (isinstance(error, ledger.Limit) and self.data.get("catch_up_hold")):
+                raise runlimits.Parked(str(error)) from error
+            park_reason = str(error)
         finally:
-            self.close()
+            try:
+                self.close()
+            except BaseException as cleanup_error:
+                if park_reason is not None:
+                    try:
+                        self.run.catch_up_cleanup_park = self.park_catch_up(
+                            park_reason, on_ticket=True, close_failed=True)
+                    except BaseException as park_error:
+                        cleanup_error.add_note(f"Could not park the catch-up: {park_error}")
+                raise
             if self.run.environment_release and not verification_passed and flows.reset_environment_base(self.job.checkouts):
                 self.persist()
+        return self.park_catch_up(park_reason, on_ticket=True)
 
     def close(self):
         errors = []
