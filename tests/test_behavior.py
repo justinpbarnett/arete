@@ -112,7 +112,7 @@ class _CliThroughServeCase(unittest.TestCase):
         "loop exec": "loop_run", "loop new": "scaffold", "loop requeue": "store.loops", "loop try": "scaffold",
         "mcp-ask": "owner_asks", "merge-check": "mergecheck", "migrate": "store.db", "mine": "miner",
         "oncall scan": "oncall", "pilot-doc-fix": "pilot", "poll": "poll", "prices import": "prices",
-        "replay sample": "replay", "retrieval run": "lab.retrieval", "retrieval sample": "lab.retrieval",
+        "release-journeys": "releasejourneys", "replay sample": "replay", "retrieval run": "lab.retrieval", "retrieval sample": "lab.retrieval",
         "rotate-authority": "scratch", "serve": "serve", "session exec": "sessions", "uninstall": "install",
         "upload-guard": "uploads", "webhook secret": "webhooks.secret",
         "verify-fault arm": "verify_faults", "verify-fault clear": "verify_faults",

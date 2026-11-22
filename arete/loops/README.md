@@ -259,7 +259,7 @@ replays, records the archive SHA-256 and the version from the wheel's `METADATA`
 
 | Journey | Actions and invariants |
 |---|---|
-| `first-run` | Run `init`, validate the generated settings, then run `migrate` and `status --json`. Check that migration creates state and status shows zero live runs. |
+| `first-run` | Run `init`, validate the generated settings, then run `migrate` and `status --json --offline`, which reads the local store and needs no running server. Check that migration creates state and status shows zero live runs. |
 | `config-protection` | Seed `max_parallel = 2`, run `init`, then `init --force`. Check that the first call refuses and preserves the exact settings and that the forced call replaces them. Validate the replacement settings. |
 
 Each attempt starts with fresh scratch config and state. A run allows at most two journeys, 16 release

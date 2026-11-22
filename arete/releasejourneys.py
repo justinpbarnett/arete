@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
-from . import local_paths, loops, paths, util
+from . import loops, paths, util
 from .releasebuild import BUILD
 
 NAME = "release-journeys"
@@ -286,10 +286,7 @@ class Attempt:
             raise Blocked("environment", "release-build-mismatch")
 
     def read_scratch(self, path: Path, limit: int) -> bytes:
-        try:
-            return local_paths.read_confined(path, limit, isolated=True)
-        except FileNotFoundError:
-            return b""
+        return paths.read_scratch_file(path, limit) or b""
 
     def config_contents(self) -> bytes:
         return self.read_scratch(self.config, MAX_OUTPUT + 1)
@@ -310,7 +307,7 @@ def first_run(attempt: Attempt) -> None:
     attempt.ok("migrate")
     database = attempt.scratch / "state" / "arete.db"
     attempt.check("state-initialized", bool(attempt.read_scratch(database, 1)))
-    attempt.check("no-live-runs-in-fresh-state", not attempt.ok("status", "--json").strip())
+    attempt.check("no-live-runs-in-fresh-state", not attempt.ok("status", "--json", "--offline").strip())
 
 
 def seed_config(path: Path) -> None:

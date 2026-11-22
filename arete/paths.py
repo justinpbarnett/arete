@@ -11,6 +11,7 @@ from .local_paths import SCRATCH_PREFIX as SCRATCH_PREFIX
 from .local_paths import SCRATCH_SUFFIX as SCRATCH_SUFFIX
 from .local_paths import confined as confined
 from .local_paths import directory_fd as directory_fd
+from .local_paths import read_scratch_file as read_scratch_file
 from .local_paths import scratch_root as scratch_root
 
 HOME = Path.home()

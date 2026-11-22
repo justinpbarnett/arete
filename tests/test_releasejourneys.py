@@ -193,7 +193,11 @@ class ReleaseJourneyTests(unittest.TestCase):
         if argv == ("migrate",):
             (scratch / "state").mkdir()
             (scratch / "state/arete.db").write_bytes(b"fixture state")
-        return 0, b"" if argv[0] == "status" else SECRET
+        if argv[0] == "status":
+            if "--offline" not in argv:
+                return 1, b'{"error": "no server", "reason": "server_down"}\n'
+            return 0, b""
+        return 0, SECRET
 
     def test_passing_journeys_record_build_and_actions_without_a_finding(self):
         code, report, findings = self.exercise(self.release, "first-run", "config-protection")
@@ -203,7 +207,7 @@ class ReleaseJourneyTests(unittest.TestCase):
         attempt = report["journeys"][0]["attempts"][0]
         self.assertEqual(attempt["observed_build"], BUILD)
         self.assertEqual([action["argv"] for action in attempt["actions"]],
-                         [["build-identity"], ["init"], ["validate-settings"], ["migrate"], ["status", "--json"]])
+                         [["build-identity"], ["init"], ["validate-settings"], ["migrate"], ["status", "--json", "--offline"]])
         self.assertFalse((self.output / "findings").exists())
 
     def test_normal_cleanup_removes_attempt_scratch(self):
