@@ -20,6 +20,7 @@ from unittest.mock import Mock, patch
 from zipfile import ZipFile
 
 from arete import devices, loop_run, paths, record, releasebuild, releasejourneys, scratch
+from tests.subprocess_helpers import CHILD_HANG_TIMEOUT
 
 BUILD = "0.1.0 sha256." + "a" * 64
 OTHER_BUILD = "0.1.0 sha256." + "b" * 64
@@ -420,7 +421,7 @@ class ReleaseJourneyTests(unittest.TestCase):
                 time.sleep(0.01)
 
             os.killpg(driver.pid, signal.SIGTERM if wrapped else signal.SIGKILL)
-            _, stderr = driver.communicate(timeout=10)
+            _, stderr = driver.communicate(timeout=CHILD_HANG_TIMEOUT)
             self.assertEqual(driver.returncode, 0 if wrapped else -signal.SIGKILL, stderr.decode())
             deadline = time.monotonic() + 10
             while any(holds_lock(path) for path in locks):
@@ -430,7 +431,7 @@ class ReleaseJourneyTests(unittest.TestCase):
         finally:
             if driver.poll() is None:
                 os.killpg(driver.pid, signal.SIGKILL)
-            driver.communicate(timeout=1)
+            driver.communicate(timeout=CHILD_HANG_TIMEOUT)
             for path in locks:
                 if holds_lock(path) and (pid := path.read_text()):
                     with contextlib.suppress(ProcessLookupError):

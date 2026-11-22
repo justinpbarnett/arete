@@ -32,6 +32,7 @@ from arete.store import runs as run_store
 from arete.store import tasks as task_store
 from arete.store import triage as triage_store
 from tests import support, versioned_api_fixture
+from tests.subprocess_helpers import CHILD_HANG_TIMEOUT
 
 
 def setUpModule():
@@ -151,7 +152,7 @@ class _CliThroughServeCase(unittest.TestCase):
         paths.CONFIG_FILE.write_text(config_text)
         # The copied checkout should use the copy of its bare origin.
         subprocess.run(["git", "remote", "set-url", "origin", "../origin.git"],
-                       cwd=root / "sample/repo", check=True, timeout=10)
+                       cwd=root / "sample/repo", check=True, timeout=CHILD_HANG_TIMEOUT)
         db.migrate()
         return config_text
 
@@ -1727,7 +1728,7 @@ class ApiCheckTests(unittest.TestCase):
             command = api_check.child_command(versioned_api_fixture.SOURCE, "from arete.cli import main; sys.exit(main())",
                                               "api", "check")
             result = subprocess.run(command, cwd=root, env=api_check.isolated_env(root),
-                                    timeout=api_check.CHECK_TIMEOUT + 5, check=False)
+                                    timeout=max(CHILD_HANG_TIMEOUT, api_check.CHECK_TIMEOUT + 5), check=False)
             self.assertEqual(result.returncode, 0, "the API smoke command failed; see its scenario output above")
 
 

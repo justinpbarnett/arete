@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from tests import parallel
+from tests.subprocess_helpers import CHILD_HANG_TIMEOUT
 
 ROOT = Path(__file__).resolve().parent.parent
 TAIL = 3000
@@ -82,7 +83,7 @@ class RunnerOutputTests(unittest.TestCase):
     def run_suite(self, *names):
         done = subprocess.run([sys.executable, "-m", "tests.parallel", "-s", str(self.suite), *names],
                               check=False, cwd=ROOT, env=self.env, stdin=subprocess.DEVNULL, capture_output=True,
-                              text=True, timeout=self.class_timeout)
+                              text=True, timeout=max(CHILD_HANG_TIMEOUT, self.class_timeout))
         return done.returncode, done.stdout + done.stderr
 
     def test_drive_flush_is_disabled_in_initial_and_alone_class_processes(self):

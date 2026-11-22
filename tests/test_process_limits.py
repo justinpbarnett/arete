@@ -69,6 +69,7 @@ from arete.store import tasks as tasks_store
 from arete.store import zte as zte_store
 from arete.zte_github import Identity
 from tests.harness import set_task_body
+from tests.subprocess_helpers import CHILD_HANG_TIMEOUT
 
 
 class PinCommandTests(unittest.TestCase):
@@ -278,7 +279,7 @@ sys.exit(0 if ok else 1)
         def clean():
             if child.poll() is None:
                 child.kill()
-            child.communicate(timeout=self.sync_timeout)
+            child.communicate(timeout=CHILD_HANG_TIMEOUT)
 
         self.addCleanup(clean)
         return child
@@ -291,7 +292,7 @@ sys.exit(0 if ok else 1)
         deadline = time.monotonic() + self.sync_timeout
         while not file.exists() and time.monotonic() < deadline:
             if child.poll() is not None:
-                self.fail(child.communicate()[0])
+                self.fail(child.communicate(timeout=CHILD_HANG_TIMEOUT)[0])
             time.sleep(0.01)
         self.assertTrue(file.exists(), file)
 
@@ -348,7 +349,7 @@ while not release.exists() and not abandoned():
         finally:
             release_command.touch()
             finish.touch()
-        output, _ = second.communicate(timeout=self.sync_timeout)
+        output, _ = second.communicate(timeout=CHILD_HANG_TIMEOUT)
         self.assertEqual(second.returncode, 0, output)
         self.assertTrue(reused.exists())
         self.assertFalse(self.held("checks-0"))
