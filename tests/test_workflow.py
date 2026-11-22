@@ -4411,15 +4411,27 @@ class CatchUpCleanupTests(unittest.TestCase):
         self.assertTrue(workspace.head_recorded(made, self.checkout))
 
 
-class CatchUpReviewTests(CatchUpRepairFixture):
+class CatchUpReviewFixture(CatchUpRepairFixture):
     @classmethod
     def setUpClass(cls):
-        cls.repository_fixture = Path(cls.enterClassContext(TemporaryDirectory(ignore_cleanup_errors=True)))
-        cls.create_repository(cls.repository_fixture)
+        super().setUpClass()
+        if sys.platform != "darwin" or shutil.which("git") != "/usr/bin/git":
+            return
+        # Resolve Apple's developer-tool launcher once for this Git-heavy fixture.
+        try:
+            found = subprocess.run(["/usr/bin/xcrun", "--find", "git"], capture_output=True, text=True)
+        except OSError:
+            return
+        git = Path(found.stdout.strip())
+        if found.returncode or not git.is_absolute() or git == Path("/usr/bin/git") or not os.access(git, os.X_OK):
+            return
+        commands = Path(cls.enterClassContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        (commands / "git").symlink_to(git)
+        path = os.pathsep.join((str(commands), os.environ.get("PATH", os.defpath)))
+        cls.enterClassContext(mock.patch.dict(os.environ, PATH=path))
 
-    def set_up_repository(self):
-        shutil.copytree(self.repository_fixture, self.root, dirs_exist_ok=True)
 
+class CatchUpReviewApprovalTests(CatchUpReviewFixture):
     def test_catch_up_requires_approval_for_the_pushed_tree(self):
         self.record_pushed_head()
         c = self.checkout
@@ -4433,6 +4445,8 @@ class CatchUpReviewTests(CatchUpRepairFixture):
         push.assert_not_called()
         self.assertEqual(self.git("rev-parse", "HEAD"), c.lease)
 
+
+class CatchUpReviewPromptTests(CatchUpReviewFixture):
     def test_prompt_includes_approval_and_separates_base_from_resolution(self):
         self.prepare_publication("review", conflict=True)
         prior_trees = self.controller.job.review.trees
@@ -4463,6 +4477,8 @@ class CatchUpReviewTests(CatchUpRepairFixture):
         self.assertIn("\n+resolved implementation\n", resolution)
         self.assertNotIn("\n+new base\n", resolution)
 
+
+class CatchUpReviewExecutableBitTests(CatchUpReviewFixture):
     def test_base_executable_bit_regression_holds_for_direct_and_dependent_citations(self):
         self.git("config", "core.fileMode", "true")
         helper = self.root / "helper tool"
@@ -4501,6 +4517,8 @@ class CatchUpReviewTests(CatchUpRepairFixture):
         self.assertEqual(len(self.pushes), 1)
         self.assertFalse(self.merged)
 
+
+class CatchUpReviewTruncatedPatchTests(CatchUpReviewFixture):
     def test_read_only_reviewer_can_cite_resolution_hunk_omitted_from_prompt(self):
         context = "unchanged\n" * 8
         remainder = f"{context}old middle\n{context}old last\n"
@@ -4545,6 +4563,8 @@ class CatchUpReviewTests(CatchUpRepairFixture):
         self.assertEqual(len(self.pushes), 1)
         self.assertFalse(self.merged)
 
+
+class CatchUpReviewMergeTests(CatchUpReviewFixture):
     def test_unrelated_blocker_becomes_pr_note_and_merged_tree_is_approved(self):
         self.prepare_publication("unrelated")
         self.build.steps["review"] = 1
@@ -4566,7 +4586,7 @@ class CatchUpReviewTests(CatchUpRepairFixture):
         self.assertEqual(self.build.steps["review"], 2)
 
 
-class CatchUpReviewSafetyTests(CatchUpRepairFixture):
+class CatchUpReviewRenameSafetyTests(CatchUpReviewFixture):
     def prepare_renamed_helpers(self):
         renames = {"base": ("base helper.txt", "moved helper.txt"),
                    "resolution": ("resolution helper.txt", "resolved\thelper.txt")}
@@ -4643,6 +4663,8 @@ class CatchUpReviewSafetyTests(CatchUpRepairFixture):
         for n in range(1, len(citations) + 1):
             self.assertIn(f"Incorrect rename citation {n}. (found on catch-up)", self.body)
 
+
+class CatchUpReviewPatchSafetyTests(CatchUpReviewFixture):
     def history_commit(self, files, *parents):
         entries = []
         for name, content in files.items():
