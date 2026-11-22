@@ -1,5 +1,6 @@
 import ast
 import errno
+import fcntl
 import http.client
 import json
 import os
@@ -42,6 +43,200 @@ from arete.store import db, orchestration as ledger
 from tests import parallel
 from tests.parallel import stack_env
 from tests.subprocess_helpers import CHILD_HANG_TIMEOUT
+
+
+class ParallelDurationHistoryTests(unittest.TestCase):
+    class A(unittest.TestCase):
+        def runTest(self):
+            pass
+
+    class B(unittest.TestCase):
+        def runTest(self):
+            pass
+
+    def setUp(self):
+        self.history = Path(self.enterContext(TemporaryDirectory())) / "durations.json"
+        self.enterContext(mock.patch.object(parallel, "HISTORY", self.history))
+        self.a = self.A().id().rsplit(".", 1)[0]
+        self.b = self.B().id().rsplit(".", 1)[0]
+
+    def run_classes(self, runner, *tests):
+        started = []
+
+        def record_result(item):
+            _, batch = item
+            started.append(batch.identifier)
+            runner.results[batch.identifier] = dict(
+                ran=batch.count, errors=[], failures=[], skipped=[], unexpected=[], seconds=2.5,
+            )
+
+        with mock.patch.object(runner, "child", new=record_result), redirect_stdout(StringIO()):
+            self.assertEqual(runner.run(tests), 0)
+        return started
+
+    def test_partial_run_preserves_latest_duration_for_unrun_class(self):
+        self.history.write_text(json.dumps({self.a: 1.0, self.b: 5.0}))
+        runner = parallel.Runner(SimpleNamespace(jobs=1, slowest=0))
+        self.history.write_text(json.dumps({self.a: 3.0, self.b: 5.0}))
+
+        self.run_classes(runner, self.B())
+
+        self.assertEqual(json.loads(self.history.read_text()), {self.a: 3.0, self.b: 2.5})
+
+    def test_overlapping_runs_preserve_both_duration_updates(self):
+        self.history.write_text(json.dumps({self.a: 1.0, self.b: 5.0}))
+        runner = parallel.Runner(SimpleNamespace(slowest=0))
+        runner.folder = tempfile.mkdtemp(dir=self.history.parent)
+        runner.results[self.b] = dict(ran=1, errors=[], failures=[], skipped=[], unexpected=[], seconds=2.5)
+        first_writer = """
+import os
+import sys
+import tempfile
+from pathlib import Path
+from socket import socket
+from types import SimpleNamespace
+from unittest import mock
+
+from tests import parallel
+from tests.subprocess_helpers import CHILD_HANG_TIMEOUT
+
+parallel.HISTORY = Path(sys.argv[1])
+runner = parallel.Runner(SimpleNamespace(slowest=0))
+runner.folder = tempfile.mkdtemp(dir=parallel.HISTORY.parent)
+runner.results[sys.argv[2]] = dict(ran=1, errors=[], failures=[], skipped=[], unexpected=[], seconds=3.0)
+replace = os.replace
+
+with socket(fileno=int(sys.argv[3])) as peer:
+    peer.settimeout(CHILD_HANG_TIMEOUT)
+
+    def pause_at_replace(source, target):
+        peer.sendall(b"R")
+        assert peer.recv(1) == b"W"
+        replace(source, target)
+        peer.sendall(b"W")
+        assert peer.recv(1) == b"F"
+
+    with mock.patch.object(os, "replace", side_effect=pause_at_replace):
+        sys.exit(runner.finish(0))
+"""
+        peer, child_peer = socketpair()
+        with peer, child_peer, subprocess.Popen(
+            [sys.executable, "-c", first_writer, str(self.history), self.a, str(child_peer.fileno())],
+            pass_fds=(child_peer.fileno(),), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        ) as first:
+            child_peer.close()
+            peer.settimeout(CHILD_HANG_TIMEOUT)
+            flock = fcntl.flock
+
+            def contend(lock, operation):
+                with self.assertRaises(BlockingIOError):
+                    flock(lock, operation | fcntl.LOCK_NB)
+                peer.sendall(b"W")
+                self.assertEqual(peer.recv(1), b"W")
+                # A fresh open after replacement must still contend with the first writer.
+                with open(lock.name, "a") as reopened, self.assertRaises(BlockingIOError):
+                    flock(reopened, operation | fcntl.LOCK_NB)
+                peer.sendall(b"F")
+                output, _ = first.communicate(timeout=CHILD_HANG_TIMEOUT)
+                self.assertEqual(first.returncode, 0, output)
+                flock(lock, operation | fcntl.LOCK_NB)
+
+            try:
+                self.assertEqual(peer.recv(1), b"R")
+                with mock.patch.object(fcntl, "flock", side_effect=contend), redirect_stdout(StringIO()):
+                    self.assertEqual(runner.finish(0), 0)
+            finally:
+                first.kill()
+
+        self.assertEqual(json.loads(self.history.read_text()), {self.a: 3.0, self.b: 2.5})
+
+    def test_unreadable_history_is_replaced_with_this_runs_durations(self):
+        self.history.write_bytes(b"\xff")
+        runner = parallel.Runner(SimpleNamespace(jobs=1, slowest=0))
+
+        self.run_classes(runner, self.B())
+
+        self.assertEqual(json.loads(self.history.read_text()), {self.b: 2.5})
+
+    def test_full_suite_starts_longest_recorded_class_first(self):
+        self.history.write_text(json.dumps({self.a: 1.0, self.b: 5.0}))
+        runner = parallel.Runner(SimpleNamespace(jobs=1, slowest=0))
+
+        self.assertEqual(self.run_classes(runner, self.A(), self.B()), [self.b, self.a])
+
+
+class ParallelStackEnvironmentTests(unittest.TestCase):
+    def setUp(self):
+        self.home = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True))).resolve()
+
+    def test_stack_env_creates_fresh_directories_outside_live_arete(self):
+        home = Path.home().resolve()
+        live = {"ARETE_STATE_DIR": home / ".local/share/arete",
+                "ARETE_CONFIG_DIR": home / ".config/arete",
+                "ARETE_LOG_DIR": home / "Library/Logs/arete"}
+        inherited = {name: str(self.home / directory.relative_to(home)) for name, directory in live.items()}
+        inherited["HOME"] = str(self.home)
+        first, second = stack_env(inherited), stack_env(inherited)
+
+        self.assertNotEqual(first["ARETE_STATE_DIR"], second["ARETE_STATE_DIR"])
+        for env in (first, second):
+            state, config_dir, log_dir = (Path(env[name]).resolve() for name in live)
+            self.assertIn(state, config_dir.parents)
+            self.assertIn(state, log_dir.parents)
+            for directory in (state, config_dir, log_dir):
+                self.assertTrue(directory.is_dir())
+                self.assertFalse(any(directory.is_relative_to(root) for root in live.values()), directory)
+
+    def test_child_import_resolves_locks_under_stack_state(self):
+        env = stack_env({"HOME": str(self.home)})
+        state = Path(env["ARETE_STATE_DIR"])
+        child = subprocess.run([sys.executable, "-c", "from arete.paths import LOCKS_DIR; print(LOCKS_DIR)"],
+                               env=env, check=True, capture_output=True, text=True, timeout=CHILD_HANG_TIMEOUT)
+        self.assertEqual(Path(child.stdout.strip()), state / "locks")
+
+    def scratch_child(self, settings):
+        env = stack_env({"HOME": str(self.home), "ARETE_FIXTURE_TOKEN": "synthetic", **settings})
+        probe = """
+import os
+from arete import paths
+
+print(paths.CONFIG_DIR)
+print(paths.LOCKS_DIR)
+print(paths.ISOLATED)
+print("ARETE_FIXTURE_TOKEN" in os.environ)
+"""
+        return subprocess.run(
+            [sys.executable, "-c", probe],
+            env=env, capture_output=True, text=True, timeout=CHILD_HANG_TIMEOUT,
+        )
+
+    def test_child_scrubs_credentials_for_each_scratch_selector(self):
+        scratch = self.home / (paths.SCRATCH_PREFIX + "0123456789abcdef")
+        scratch.mkdir(mode=0o700)
+        for name, selected in ((paths.SCRATCH_ENV, scratch),
+                               ("ARETE_CONFIG_DIR", scratch / "custom-config"),
+                               ("ARETE_STATE_DIR", scratch / "custom-state")):
+            with self.subTest(selector=name):
+                child = self.scratch_child({name: str(selected)})
+                config_dir = selected if name == "ARETE_CONFIG_DIR" else scratch / "config"
+                state_dir = selected if name == "ARETE_STATE_DIR" else scratch / "state"
+                self.assertEqual(child.returncode, 0, child.stderr)
+                self.assertEqual(child.stdout.splitlines(), [str(config_dir), str(state_dir / "locks"), "True", "False"])
+
+    def test_child_refuses_invalid_scratch_settings(self):
+        invalid = self.home / (paths.SCRATCH_PREFIX + "invalid")
+        invalid.mkdir(mode=0o700)
+        alias = self.home / "alias"
+        alias.symlink_to(invalid, target_is_directory=True)
+        for name, selected in ((paths.SCRATCH_ENV, invalid),
+                               ("ARETE_CONFIG_DIR", invalid / "config"),
+                               ("ARETE_STATE_DIR", invalid / "state"),
+                               ("ARETE_STATE_DIR", alias / "state"),
+                               ("HOME", invalid / "home")):
+            with self.subTest(selector=name, path=selected):
+                child = self.scratch_child({name: str(selected)})
+                self.assertNotEqual(child.returncode, 0)
+                self.assertIn("refusing to start", child.stderr)
 
 
 class ParallelClassDeadlineTests(unittest.TestCase):
@@ -7716,8 +7911,10 @@ class ServeStatusTests(unittest.TestCase):
             "at": "2026-11-21T00:00:00Z", "engine": running, "checkout_head": checkout,
         }))
         installed = Path(sysconfig.get_path("scripts")) / "arete"
-        result = subprocess.run([str(installed), "status", *args], cwd=self.root,
-                                env=stack_env({**env, "PYTHONPATH": str(self.root), "PYTHONDONTWRITEBYTECODE": "1"}),
+        child_env = {**env, "PYTHONPATH": str(self.root), "PYTHONDONTWRITEBYTECODE": "1"}
+        stacked = stack_env(child_env)
+        child_env.update(PYTHONPATH=stacked["PYTHONPATH"], ARETE_DESKTOP_NOTIFY=stacked["ARETE_DESKTOP_NOTIFY"])
+        result = subprocess.run([str(installed), "status", *args], cwd=self.root, env=child_env,
                                 capture_output=True, text=True, timeout=CHILD_HANG_TIMEOUT)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertEqual(result.stdout, "")
