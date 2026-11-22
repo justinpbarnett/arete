@@ -1,6 +1,7 @@
 import ast
 import errno
 import fcntl
+import gzip
 import http.client
 import json
 import os
@@ -40,6 +41,7 @@ from arete import (
 from arete.agent import NO_SESSION, Result
 from arete.orchestration_api import OPERATIONS, help_text
 from arete.review import Review, catch_up_problems
+from arete.store import asks as ask_store
 from arete.store import db, orchestration as ledger
 from arete.store import runs as run_store
 from arete.store import tasks as task_store
@@ -633,6 +635,219 @@ class PolicyRetryCapTests(unittest.TestCase):
         ticket, output = self.pick(source)
         self.assertEqual(ticket.id, tid)
         self.assertEqual(output, "")
+
+
+class PrepareResumeTests(unittest.TestCase):
+    branch = "arete/7-merge-conflict"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.state = Path(tempfile.mkdtemp()).resolve()
+        cls.addClassCleanup(shutil.rmtree, cls.state, ignore_errors=True)
+        cls.template = cls.state / "template.db"
+        connect = db.connect_db
+
+        def fixture_connect(*args, **kwargs):
+            conn = connect(*args, **kwargs)
+            if not kwargs.get("readonly"):
+                conn.execute("PRAGMA journal_mode=MEMORY")
+            conn.execute("PRAGMA synchronous=OFF")
+            return conn
+
+        cls.enterClassContext(mock.patch.object(db, "connect_db", fixture_connect))
+        cls.enterClassContext(mock.patch.object(db.dbstats.Timing, "finished"))
+        with (mock.patch.multiple(paths, STATE_DIR=cls.state, DB_FILE=cls.template, RUNS_DIR=cls.state / "runs",
+                                  LOCKS_DIR=cls.state / "locks", WORKTREES_DIR=cls.state / "worktrees",
+                                  LOG_DIR=cls.state / "logs"), redirect_stdout(StringIO())):
+            db.migrate()
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(dir=self.state))
+        shutil.copyfile(self.template, self.root / "arete.db")
+        self.enterContext(mock.patch.multiple(paths, STATE_DIR=self.root, DB_FILE=self.root / "arete.db",
+                                             RUNS_DIR=self.root / "runs", LOCKS_DIR=self.root / "locks",
+                                             WORKTREES_DIR=self.root / "worktrees", LOG_DIR=self.root / "logs"))
+        self.repo = config.Repo("fixture", self.root)
+        self.cfg = config.Config(repos=[self.repo])
+        self.tracker = mock.Mock(states=("running", "needs-info"), label_name=lambda status: status, ref=lambda tid: tid)
+        self.tracker.label.return_value = self.tracker.move.return_value = self.tracker.comment.return_value = ""
+        self.enterContext(mock.patch.object(pipeline.alerts, "ask_notice"))
+
+    def controller(self, run_id, previous=""):
+        record.start("pipeline", run_id=run_id, repo=self.repo.name, issue="7")
+        folder = self.root / run_id
+        folder.mkdir()
+        run = pipeline.Run(run_id, self.repo, folder, tracker=self.tracker, tid="7", path="orchestrate", cfg=self.cfg)
+        return orchestration.Controller(flows.start(self.cfg, run, {}, continues=previous))
+
+    def check_ask_resume(self, first_prepare):
+        first = self.controller("first")
+        prepare = mock.Mock(side_effect=first_prepare)
+        with mock.patch.dict(factory.STEPS, prepare=prepare):
+            status, summary, _ = flows.driven(first.flow, lambda _: first.prepare())
+        ask, answer = self.answer_prepare(first, status, summary)
+
+        resumed = self.controller("resumed", first.run.id)
+
+        def resolve(flow, tree):
+            flow.ctx.run.agent("resolve", "Resolve the merge.", Path(tree), resume=NO_SESSION)
+            return factory.Outcome("stop", data={"ending": "quiet", "status": "noop"})
+
+        prepare.side_effect = resolve
+        with (mock.patch.dict(factory.STEPS, prepare=prepare),
+              mock.patch.object(pipeline.AgentRun, "agent", return_value=Result(ok=True)) as agent):
+            self.assertEqual(resumed.prepare()[0], "noop")
+        prepare.assert_called_with(resumed.flow, tree=str(resumed.job.ws))
+        self.assertEqual(prepare.call_count, 2)
+        agent.assert_called_once()
+        self.assertIn(f"Answer: {answer}", agent.call_args.args[1])
+        self.assertEqual(ask_store.ask_get(ask["id"])["taken_by"], resumed.run.id)
+
+    def answer_prepare(self, first, status, summary, answer="Keep the branch change."):
+        self.assertEqual(status, "needs-info")
+        saved = ledger.snapshot(first.lease)["data"]
+        self.assertNotIn("preparing", saved)
+        self.assertNotIn("prepared", saved)
+        record.settle(first.run.id, status, summary=summary)
+        ask, = ask_store.asks_of(first.run.id, "open")
+        self.assertTrue(ask_store.ask_close(ask["id"], "answered", owner_asks.text_answers(ask, answer)))
+        return ask, answer
+
+    def test_returned_prepare_ask_resumes_with_the_answer(self):
+        def ask(flow, tree):
+            sent = owner_asks.text_ask("Which change should the merge keep?")
+            return factory.Outcome("ask", data={
+                "ending": "ask", "summary": "Resolve the merge", "session": asdict(NO_SESSION),
+                "asked": [{**sent, "ask_id": "first-a1", "step": "prepare", "call": "resolve"}],
+            })
+
+        self.check_ask_resume(ask)
+
+    def test_resolver_ask_resumes_with_the_answer(self):
+        def ask(flow, tree):
+            flow.ctx.run.owner_ask("resolve", [owner_asks.text_ask("Which change should the merge keep?")], NO_SESSION)
+
+        self.check_ask_resume(ask)
+
+    def seed_conflict(self, ws, part, *, kept=False):
+        wt = ws / part.dir
+        wt.mkdir(parents=True)
+        util.git(["init", "-q", "--template=", "-b", self.branch], wt)
+        published = f"refs/remotes/origin/{self.branch}"
+        active = f"refs/heads/{self.branch}"
+        commits = [("refs/heads/main", "common", ""), (published, "published", "from :1\n"),
+                   ("refs/remotes/origin/main", "upstream", "from :1\n")]
+        if kept:
+            commits.append((active, "kept", "from :2\n"))
+        script = "".join(f"commit {ref}\nmark :{mark}\ncommitter Fixture <fixture@example.com> 1 +0000\n"
+                         f"data {len(contents)}\n{contents}\n{parent}"
+                         f"M 100644 inline conflict.txt\ndata {len(contents) + 1}\n{contents}\n\n"
+                         for mark, (ref, contents, parent) in enumerate(commits, 1))
+        if not kept:
+            script += f"reset {active}\nfrom :2\n\n"
+        util.git(["fast-import", "--quiet"], wt, input=script + "done\n")
+        util.git(["reset", "-q", "--hard"], wt)
+        return workspace.Checkout(part.dir, part.github, wt, wt, "main", resumes=True)
+
+    def check_conflict_replay(self, *, kept):
+        self.enterContext(mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}))
+        self.tracker.get.return_value = tracker.Ticket("7", "#7", "Merge conflict")
+        self.tracker.save_images.return_value = tracker.SavedImages()
+        self.repo.parts = [config.Part("first", "fixture/first")]
+        if not kept:
+            self.repo.parts.append(config.Part("second", "fixture/second"))
+        first = self.controller("first")
+        ws = first.job.ws
+        git = shutil.which("git") or "git"
+        if sys.platform == "darwin" and git == "/usr/bin/git":
+            found = subprocess.run(["/usr/bin/xcrun", "--find", "git"], capture_output=True, text=True,
+                                   timeout=CHILD_HANG_TIMEOUT)
+            if not found.returncode and os.access(found.stdout.strip(), os.X_OK):
+                git = found.stdout.strip()
+
+        def local_git(command, *, cwd, timeout, env, input, keeps):
+            self.assertEqual(command[0], "git")
+            self.assertTrue(cwd.is_relative_to(ws))
+            return subprocess.run([git, *command[1:]], cwd=cwd, input=input, env={**os.environ, **(env or {})},
+                                  timeout=timeout, capture_output=True, text=True)
+
+        self.enterContext(mock.patch.object(util, "sh_with_network", new=local_git))
+        checkouts = [self.seed_conflict(ws, part, kept=kept) for part in self.repo.parts]
+        target = ("first", "kept") if kept else ("second", "published")
+        if kept:
+            checkout, = checkouts
+            checkout.kept = util.git(["rev-parse", "HEAD"], checkout.wt).strip()
+            checkout.onto = util.git(["rev-parse", f"origin/{self.branch}"], checkout.wt).strip()
+
+        def place_checkouts(run_id, repo, base, branch, key, copies, **kw):
+            self.assertEqual(branch, self.branch)
+            if run_id != first.run.id and not kept:
+                for c in checkouts:
+                    util.git(["reset", "-q", "--hard", workspace.start_of(c, branch)], c.wt)
+            return ws, [replace(c) for c in checkouts]
+
+        answer = "The second conflict should keep the owner-approved change."
+        calls = []
+
+        def agent(run, step, text, cwd, role="", **kw):
+            file = cwd / "conflict.txt"
+            marker, ours, *_ = file.read_text().splitlines()
+            self.assertEqual(marker, "<<<<<<< HEAD")
+            conflict = (cwd.name, ours)
+            got_answer = f"Answer: {answer}" in text
+            calls.append((run.id, conflict, got_answer))
+            if run is first.run and conflict == target:
+                folder = paths.record_dir(run.id)
+                tool = {"type": "tool_use", "id": "question", "name": owner_asks.TOOL,
+                        "input": owner_asks.text_ask("What should this conflict keep?")}
+                event = {"type": "assistant", "message": {"content": [tool]}}
+                with gzip.open(folder / "resolver.jsonl.gz", "wt") as events:
+                    events.write('{"arete": "header", "runner": "claude"}\n' + json.dumps(event) + "\n")
+                return Result(ok=True, record="resolver.jsonl.gz")
+            if conflict == target:
+                self.assertEqual(ask_store.ask_get(ask["id"])["taken_by"], "")
+            file.write_text(("owner-approved" if got_answer else "merged changes") + "\n")
+            return Result(ok=True, structured={"resolved": True})
+
+        with (mock.patch.object(workspace, "make_workspace", side_effect=place_checkouts),
+              mock.patch.object(pipeline.AgentRun, "agent", agent)):
+            status, summary, _ = flows.driven(first.flow, lambda _: first.prepare())
+            for c in checkouts:
+                self.assertFalse(util.git(["rev-parse", "-q", "--verify", "MERGE_HEAD"], c.wt, check=False))
+            if kept:
+                self.assertEqual(util.git(["rev-parse", "HEAD"], checkout.wt).strip(), checkout.kept)
+            ask, _ = self.answer_prepare(first, status, summary, answer)
+            resumed = self.controller("resumed", first.run.id)
+            self.assertIsNone(resumed.prepare())
+
+        earlier = ("first", "published")
+        self.assertEqual(calls, [("first", earlier, False), ("first", target, False),
+                                 ("resumed", earlier, False), ("resumed", target, True)])
+        self.assertEqual((resumed.job.ws / target[0] / "conflict.txt").read_text(), "owner-approved\n")
+        self.assertEqual(ask_store.ask_get(ask["id"])["taken_by"], resumed.run.id)
+
+    def test_prepare_replay_keeps_the_answer_for_the_asking_checkout(self):
+        self.check_conflict_replay(kept=False)
+
+    def test_prepare_replay_keeps_the_answer_for_the_kept_edits_merge(self):
+        self.check_conflict_replay(kept=True)
+
+    def test_interrupted_prepare_still_refuses_resume(self):
+        first = self.controller("first")
+        prepare = mock.Mock(side_effect=RuntimeError("prepare interrupted"))
+        with mock.patch.dict(factory.STEPS, prepare=prepare):
+            with self.assertRaisesRegex(RuntimeError, "prepare interrupted"):
+                first.prepare()
+        saved = ledger.snapshot(first.lease)["data"]
+        self.assertIs(saved["preparing"], True)
+        self.assertNotIn("prepared", saved)
+        record.settle(first.run.id, "interrupted")
+        resumed = self.controller("resumed", first.run.id)
+        prepare.reset_mock()
+        with mock.patch.dict(factory.STEPS, prepare=prepare):
+            with self.assertRaisesRegex(factory.Refused, "preparation was interrupted before durable workspace authority"):
+                resumed.prepare()
+        prepare.assert_not_called()
 
 
 class RestoredPRRevisionTests(unittest.TestCase):

@@ -240,12 +240,20 @@ class Controller:
                 raise factory.Refused("preparation was interrupted before durable workspace authority; reconcile before restarting")
             self.data["preparing"] = True
             ledger.save(self.lease, self.data)
-            outcome = self.atomic("prepare", tree=str(self.job.ws))
+            try:
+                outcome = self.atomic("prepare", tree=str(self.job.ws))
+            except owner_asks.Asked:
+                del self.data["preparing"]
+                ledger.save(self.lease, self.data)
+                raise
             if not outcome.passed:
+                del self.data["preparing"]
+                ledger.save(self.lease, self.data)
                 return flows.ended(self.flow, outcome)
             self.data["prepared"] = outcome.data
             self.job.goal = f"Check the issue and owner's answers in use:\n{self.job.ticket.title}\n{self.job.ticket.body}"
             self.job.plan_text = ""
+        self.run.answers_due = [ask for ask in self.run.answers_due if ask["step"] != "prepare"]
         if self.run.repairs:
             found = repairs.source(pipeline.run_store.run_get(self.run.repairs) or {})
             expected = set(found.prs) - self.job.closed_prs
