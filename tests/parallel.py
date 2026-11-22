@@ -206,6 +206,15 @@ class Runner:
         with open(output_file, "w") as output, self.lock:
             if self.stopping:
                 return
+            load_factor = 1.0
+            try:
+                load = os.getloadavg()[0]
+            except OSError:
+                pass
+            else:
+                cpu_count = os.cpu_count()
+                if cpu_count is not None:
+                    load_factor = min(4.0, max(1.0, load / cpu_count))
             try:
                 process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=output,
                                            stderr=subprocess.STDOUT, start_new_session=True,
@@ -217,13 +226,16 @@ class Runner:
                 self.live[process] = batch.identifier
         if process is not None:
             timeout = stretch * (self.args.timeout if self.args.timeout is not None else batch.timeout)
+            deadline = timeout * load_factor
             requested = None
             try:
-                process.wait(timeout)
+                process.wait(deadline)
                 if process.returncode:
                     problem = f"worker exited with status {process.returncode}"
             except subprocess.TimeoutExpired:
-                problem = f"class exceeded {timeout:g}s"
+                problem = f"class exceeded {deadline:g}s"
+                if load_factor > 1:
+                    problem += f" (deadline {timeout:g}s x load {load_factor:g})"
                 requested = self.request_stacks(stack_prefix)
             finally:
                 self.kill(process)
