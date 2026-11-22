@@ -71,7 +71,7 @@ $journeys## Rules
 ## What to return
 
 - `checks`: one entry for each thing you checked.
-  - `what`: the behavior, in the user's words.
+  - `what`: the behavior, using the exact wording of the user's requirement so a fresh measurement can be matched to it.
   - `how`: the exact command, request, or clicks.
   - `saw`: what came back. Quote the output, the status and body, or what the page showed.
   - `passed`: true only when what you saw is what the change should give.
@@ -80,6 +80,9 @@ $journeys## Rules
     page that crashed the tab or a request the product refused. When every
     failed check is `environment`, Arete treats the result as blocked, not as a failure of the change.
   - `screenshot`: the file name of the screenshot for a browser check, else leave it out.
+- `unmeasured_requirements`: list the exact wording of each requirement whose measurement your environment cannot
+  establish, and explain the limitation in `summary`. For example, timing that includes sandbox setup does not
+  establish standalone runtime. Keep observed failures in `checks` and follow the same verdict rules.
 - `verdict`: `pass` when every check passed. `fail` when the product does not do what the issue asks or something
   near it broke. `blocked` when you could not check something essential for a reason outside the change (no
   login, missing data, a command you may not run); say what in `blocked_by`.
