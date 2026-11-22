@@ -22,11 +22,11 @@ from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import TextIO
 
 from . import (
     alerts,
     browser,
+    check_process,
     ci,
     config,
     context,
@@ -40,6 +40,7 @@ from . import (
     intake,
     jev,
     journeys,
+    lanes,
     learning,
     local_paths,
     outbound,
@@ -63,7 +64,7 @@ from . import (
     webpush,
     workspace,
 )
-from .agent import NO_SESSION, Result, Session
+from .agent import NO_SESSION, READ_ONLY_TOOLS, Result, Session
 from .review import CATCH_UP_REVIEW_SCHEMA, REVIEW_SCHEMA, Review, catch_up_problems, numbered, permitted_review_patches
 from .store import asks as asks_store
 from .store import insights as insights_store
@@ -88,7 +89,6 @@ SKIPPED_FILE = paths.STATE_DIR / "skipped.json"
 CONTINUE_AFTER_DROP = "The connection dropped mid step. Carry on from where you stopped and finish the step."
 CONTINUE_AFTER_BUSY = "The provider was busy mid step. Carry on from where you stopped and finish the step."
 BUSY_WAITS = (30, 90, 270)
-CHECKS_LOCK = "checks"
 LEFT_TITLE = "Left for a person"
 LEFT_HEADING = f"## {LEFT_TITLE}"
 LEFT_START, LEFT_END = "<!-- arete:left -->", "<!-- /arete:left -->"
@@ -306,8 +306,10 @@ class AgentRun:
         with principals.acting(f"run:{self.id}/{step}"):
             return self.agent_as_step(step, text, cwd, role, **kw)
 
-    def agent_as_step(self, step: str, text: str, cwd: Path, role: str = "", **kw) -> Result:
+    def agent_as_step(self, step: str, text: str, cwd: Path, role: str = "", *, read_only: bool = False, **kw) -> Result:
         s = self.settings(role) if role else None
+        if s and read_only:
+            s = replace(s, step=step, tools=tuple(t for t in s.tools if t in READ_ONLY_TOOLS), mcp=(), session="fresh")
         if self.budget:
             self.budget.charge(step, s.step if s else role)
         if s:
@@ -315,6 +317,7 @@ class AgentRun:
             kw = {**s.call, **reach,
                   "resume": self.sessions.get(config.INHERITS.get(s.step, s.step), NO_SESSION)
                   if s.session == "resume" else NO_SESSION, **kw}
+        kw["extra_env"] = {**(kw.get("extra_env") or {}), **self.lane_env()}
         kw = self.fit_route(step, text, s, kw)
         run_with = kw.get("runner", "") or kw.get("resume", NO_SESSION).runner
         which, model = routing.chosen(kw.get("model", ""), run_with, kw.get("cfg") or self.config)
@@ -362,6 +365,15 @@ class AgentRun:
         finally:
             if self.launch_done:
                 self.launch_done(step, bool(res and (res.ok or res.turns)))
+
+    def lane_env(self) -> dict[str, str]:
+        if self.layer is None:
+            return {}
+        names = check_lanes(self.layer, self)
+        with suppress(OSError):
+            for name in names:
+                util.lock_file(name).close()
+        return {lanes.ENV: ",".join(names)}
 
     def fit_route(self, step: str, text: str, s: steps.Settings | None, kw: dict) -> dict:
         cfg = kw.get("cfg") or self.config
@@ -525,6 +537,8 @@ class Run(AgentRun):
         return owner_asks.GUIDE if self.asks_owner else owner_asks.NOBODY
 
     def agent(self, step: str, text: str, cwd: Path, role: str = "", **kw) -> Result:
+        if kw.get("read_only"):
+            return super().agent(step, text, cwd, role, **kw)
         if not self.asks_owner:
             res = super().agent(step, text, cwd, role, **kw)
             if self.owner_questions_blocked and res.record and any(
@@ -1048,30 +1062,7 @@ def untracked_added_since(before: dict[Path, set[str]]) -> list[tuple[Path, str]
 
 
 def check_lanes(layer: config.RepoLayer, run: AgentRun) -> list[str]:
-    if not layer.parallel_checks:
-        return [CHECKS_LOCK]
-    return [f"{CHECKS_LOCK}-{n}" for n in range(run.config.max_parallel_checks)]
-
-
-def take_free_lane(files: list[TextIO]) -> bool:
-    for f in files:
-        if util.flock_now(f):
-            util.mark_holder(f, os.getpid())
-            return True
-    return False
-
-
-@contextmanager
-def check_lane(layer: config.RepoLayer, run: AgentRun):
-    with ExitStack() as stack:
-        files = [stack.enter_context(util.lock_file(name)) for name in check_lanes(layer, run)]
-        if not take_free_lane(files):
-            run.log("checks: waiting for another run's checks to finish" if len(files) == 1 else
-                    f"checks: waiting for a free check lane (max_parallel_checks {len(files)})")
-            with run.waiting("slot"):
-                while not take_free_lane(files):
-                    time.sleep(CHECK_LANE_POLL_SECONDS)
-        yield
+    return lanes.names(layer.parallel_checks, run.config.max_parallel_checks)
 
 
 def tail_of_both_streams(stdout: str, stderr: str, n: int) -> str:
@@ -1086,6 +1077,25 @@ def selected_checks(layer: config.RepoLayer, files: list[str]) -> set[str]:
         if any(util.matches_any(name, [pattern]) for name in files):
             selected.update(names)
     return selected or set(layer.checks)
+
+
+@contextmanager
+def worker_suite_lane(layer: config.RepoLayer, run: AgentRun):
+    with ExitStack() as stack:
+        files = [stack.enter_context(util.lock_file(name)) for name in check_lanes(layer, run)]
+        if not lanes.take_free(files):
+            run.log("checks: waiting for an agent's full suite run to finish")
+            with run.waiting("slot"):
+                while not lanes.take_free(files):
+                    time.sleep(CHECK_LANE_POLL_SECONDS)
+        yield
+
+
+@contextmanager
+def check_lane(layer: config.RepoLayer, run: AgentRun):
+    with (slots.check_slot(run, parallel=layer.parallel_checks) as lease, check_process.suite(lease) as hold_fds,
+          worker_suite_lane(layer, run)):
+        yield hold_fds
 
 
 def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: AgentRun,
@@ -1105,11 +1115,12 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
     report, ok = [], True
     cleanup_untracked = not defer_failed_cleanup
 
-    def execute(items):
+    def execute(items, hold_fds):
         nonlocal ok
+        held = {"hold_fds": hold_fds} if hold_fds else {}
         for name, cmd in items:
             with record.timed(run.id, "check", name=name, command=cmd) as check:
-                res = environment.sh(cmd, run.config, run.repo, cwd=cwd, timeout=run.time_for(timeout))
+                res = environment.sh(cmd, run.config, run.repo, cwd=cwd, timeout=run.time_for(timeout), **held)
                 check["exit"] = res.returncode
             passed = res.returncode == 0
             ok = ok and passed
@@ -1120,11 +1131,10 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
                 report.append(f"### {name} passed: `{cmd}`")
 
     try:
-        with nullcontext() if layer.parallel_checks else check_lane(layer, run):
-            execute(quick)
+        with check_lane(layer, run) as hold_fds:
+            execute(quick, hold_fds)
             if slow and ok:
-                with check_lane(layer, run) if layer.parallel_checks else nullcontext():
-                    execute(slow)
+                execute(slow, hold_fds)
             elif slow:
                 report.append("Not run because cheap checks failed: " + ", ".join(name for name, _ in slow))
         if selected is not None and set(commands) != set(layer.checks):
@@ -1200,6 +1210,7 @@ class Build(TicketWork):
     plan_text: str = ""
     build_summary: str = ""
     catch_ups: int = 0
+    ci_rerun_requested_heads: set[tuple[str, str]] = field(default_factory=set)
     worker_trees: dict[str, str] = field(default_factory=dict)
     ignored_denied_paths: dict[str, list[str]] = field(default_factory=dict)
     denied_feedback: str = ""
@@ -2607,9 +2618,11 @@ def automerge(b: Build, approval: dict | None, draft_why: str, verified: verify.
                     verified, review = catch_up_base(b, c, branch, base_sha, goal, plan, review)
                     note_review(run, review, verified)
                     publish_gate_evidence(run, b.ticket, c, verified, review)
-                    current = watch_publication_ci(run, slot, [c])
+                    max_rounds = run.settings("ci_repair").tries
+                    rounds = watch_publication_ci(b, slot, [c], max_rounds)
+                    current = rounds[-1]
                     ci_result = current.summary()
-                    comment_catch_up_ci(run, c, ci.section([current], current.n), verified, review)
+                    comment_catch_up_ci(run, c, ci.section(rounds, max_rounds), verified, review)
                 except CatchUpPushUnconfirmed:
                     raise
                 except (workspace.RunFailed, RuntimeError, OSError) as e:
@@ -2879,11 +2892,22 @@ def merge_hold(b: Build, c: workspace.Checkout, verified: verify.Verified, revie
     number = gh.pr_number(c.pr)
     _, hold = gh.merge_readiness(c.github, number, head, c.base, base_sha, wait=gh.MERGE_WAIT_SECONDS,
                                  track_moved_base=track_moved_base)
+    if not hold and (c.github, head) in b.ci_rerun_requested_heads:
+        hold = rerun_head_hold(b, c, head)
     if not hold:
         hold = screen_and_merge(b, c, number, head, base_sha, about, track_moved_base=track_moved_base)
     if isinstance(hold, gh.BaseTipChanged) and not has_merge_base(c, head, fetch_merge_base(c)):
         return gh.MovedBaseHold("the checked head does not contain the target base")
     return hold
+
+
+def rerun_head_hold(b: Build, c: workspace.Checkout, head: str) -> str:
+    try:
+        if gh.publication_ci_passed(c.github, head):
+            return ""
+    except ci.READ_ERRORS as e:
+        b.run.log(f"ci: could not refresh the checks of {c.pr_name}: {util.first_line(str(e), 300)}")
+    return "GitHub has no fully passing CI result for the verified head"
 
 
 def fetch_merge_base(c: workspace.Checkout) -> str:
@@ -3080,7 +3104,7 @@ def watch_ci(b: Build, slot: slots.RunSlot, branch: str, pushed: list[workspace.
             raise
         raise failed from e
     last = rounds[-1]
-    if stopped_before and not draft_why and last.all_read:
+    if stopped_before and not draft_why and all(w.read or w.previous_failure for w in last.seen):
         for c in stopped_before:
             set_draft(run, c, False)
     elif stopped_before:
@@ -3174,17 +3198,25 @@ def ci_rounds(b: Build, slot: slots.RunSlot, branch: str, pushed: list[workspace
               fix: CiFix | None = None) -> Iterator[ci.Round]:
     run = b.run
     watched = list(pushed)
-    not_caused: dict[tuple[str, str, gh.CheckKey], str] = {}
+    not_caused: dict[tuple[str, str, gh.CheckKey], tuple[str, int, str]] = {}
+    reruns = classic_ci_reruns(b)
     for n in range(1, max_rounds + 1):
         slot.free()
         run.log(slots.FREED_SLOT_FOR_CI)
         with run.waiting("ci"):
-            current = ci.Round(n, [ci.compare_with_base(ci.watch(ci_target(c), run.log), run.log) for c in watched])
-        judged = [r for r in current.reds if r.kind != "base"]
+            current = ci.Round(n, [watch_checkout_ci(run, c, reruns.for_checkout(c)) for c in watched])
+        reruns.keep_failure_evidence(current)
+        reds = current.reds
+        judged = [r for r in reds if r.kind != "base"]
         for r in judged:
-            if r.key in not_caused:
-                r.caused, r.reason = False, not_caused[r.key]
-        fresh = [r for r in judged if r.key not in not_caused]
+            target = r.target
+            if (r.kind == "unjudged" and r.key in not_caused
+                    and (target.github, target.sha, target.pr) not in reruns.reruns):
+                r.caused = False
+                r.reason, judged_job, rerun_reason = not_caused[r.key]
+                if r.check.job == judged_job:
+                    r.rerun_reason = rerun_reason
+        fresh = [r for r in judged if r.kind == "unjudged"]
         if fresh:
             slot.take(run.log, run.waiting)
         try:
@@ -3192,12 +3224,15 @@ def ci_rounds(b: Build, slot: slots.RunSlot, branch: str, pushed: list[workspace
         except workspace.RunFailed:
             yield current
             raise
-        not_caused.update({r.key: r.reason for r in judged if not r.caused})
+        not_caused.update({r.key: (r.reason, r.check.job, r.rerun_reason) for r in judged if not r.caused})
+        retried = n < max_rounds and reruns.retry(run, current, reruns.candidate(current))
         yield current
         caused = current.caused
         if not caused:
             if fresh:
                 discard_edits(b)
+            if retried:
+                continue
             return
         names = ", ".join(r.label for r in caused)
         if n == max_rounds:
@@ -3206,6 +3241,103 @@ def ci_rounds(b: Build, slot: slots.RunSlot, branch: str, pushed: list[workspace
         watched += [c for c in b.staged.changed if c not in watched]
         current.story = f"{names} failed, caused by this PR, and arete pushed a fix: {fix_summary}".rstrip(": ")
         run.log(f"ci: pushed a fix for {names}")
+
+
+def classic_ci_reruns(b: Build) -> AutomaticCIReruns:
+    run = b.run
+    b.ci_rerun_requested_heads.update(
+        (line["repo"], line["head"]) for read in factory.chain(run.id) for line in read
+        if line.get("event") == "ci_rerun_request")
+
+    def remember(repo: str, head: str) -> None:
+        run.write_line("ci_rerun_request", event_id=f"{repo}@{head}", repo=repo, head=head)
+
+    return AutomaticCIReruns(b.ci_rerun_requested_heads, remember)
+
+
+class AutomaticCIReruns:
+    def __init__(self, requested_heads: set[tuple[str, str]], remember: Callable[[str, str], None] | None = None):
+        self.requested_heads = requested_heads
+        self.remember = remember
+        self.reruns: dict[tuple[str, str, str], list[gh.WorkflowRerun]] = {}
+        self.before: dict[tuple[str, str, str], ci.Watched] = {}
+
+    def for_checkout(self, c: workspace.Checkout):
+        return self.reruns.get((c.github, c.lease, c.pr), ())
+
+    def keep_failure_evidence(self, current: ci.Round) -> None:
+        for i, seen in enumerate(current.seen):
+            target = seen.target
+            before = self.before.get((target.github, target.sha, target.pr))
+            if before and not seen.read and not seen.rerun_reds:
+                current.seen[i] = replace(before, read=False, conflicting=seen.conflicting, previous_failure=True)
+
+    def candidate(self, current: ci.Round) -> tuple[str, str, str, int] | None:
+        if not current.reds or any(0 in w.red_workflows for w in current.seen):
+            return None
+        keys = {(w.target.github, w.target.sha, w.target.pr, workflow)
+                for w in current.seen for workflow in w.red_workflows}
+        for red in current.reds:
+            target = red.target
+            workflow = red.check.actions_workflow(target.github)
+            if not target.pr or not workflow or (target.github, target.sha) in self.requested_heads:
+                return None
+            keys.add((target.github, target.sha, target.pr, workflow))
+        return keys.pop() if len(keys) == 1 else None
+
+    def retry(self, run: Run, current: ci.Round, candidate: tuple[str, str, str, int] | None) -> bool:
+        checks = current.reds
+        if not candidate or not current.all_read or any(
+                r.kind != "base" and (r.kind != "not caused" or not r.rerun_reason) for r in checks):
+            return False
+        repo, head, pr, workflow = candidate
+        names = ", ".join(r.label for r in checks)
+        try:
+            row = gh.workflow_run(repo, head, workflow, pr=pr, allow_head_branch=True)
+            if not row.get("conclusion") or gh.check_state(row) != "fail":
+                return False
+            failed_jobs = gh.failed_workflow_jobs(repo, head, workflow, row["run_attempt"])
+            judged_jobs = {r.check.job: r.check.name for r in checks if type(r.check.job) is int}
+            if len(judged_jobs) != len(checks) or failed_jobs != judged_jobs:
+                run.log(f"ci: could not account for all failed jobs in workflow run {workflow}; keeping the CI hold")
+                return False
+            pull = gh.pr_merge_details(pr)
+            if pull.get("state") != "OPEN" or pull.get("headRefOid") != head:
+                return False
+        except ci.READ_ERRORS as e:
+            run.log(f"ci: could not identify the workflow for {names}: {util.first_line(str(e), 300)}")
+            return False
+        if self.remember:
+            self.remember(repo, head)
+        self.requested_heads.add((repo, head))
+        unsure = None
+        failed = False
+        try:
+            gh.rerun_failed_jobs(repo, workflow)
+            current.story = f"Arete reran failed jobs for {names}. GitHub accepted the rerun request."
+        except gh.GhUnsure as e:
+            unsure = util.first_line(str(e), 300)
+            current.story = f"Arete requested a rerun for {names} and did not receive confirmation."
+        except ci.READ_ERRORS as e:
+            failed = True
+            current.story = f"Arete requested a rerun for {names}. The request failed."
+            run.log(f"ci: could not rerun failed jobs for {names}: {util.first_line(str(e), 300)}")
+        for red in checks:
+            reason = red.base_result if red.kind == "base" else red.rerun_reason
+            reason = util.first_line(reason.replace("`", ""), 200)
+            if unsure is not None:
+                run.log(f"ci: rerun request for {red.label} was unconfirmed ({unsure}): {reason}")
+            elif failed:
+                run.log(f"ci: requested a rerun for {red.label}: {reason}")
+            else:
+                run.log(f"ci: reran failed jobs for {red.label}: {reason}")
+        if failed:
+            return False
+        jobs = {r.check.name: r.check.job for r in checks}
+        reasons = {r.check.name: f"It {r.base_result}." if r.kind == "base" else r.rerun_reason for r in checks}
+        self.reruns[(repo, head, pr)] = [gh.WorkflowRerun(workflow, row["run_attempt"] + 1, jobs, reasons)]
+        self.before[(repo, head, pr)] = next(w for w in current.seen if w.target is checks[0].target)
+        return True
 
 
 def push_ci_fix(b: Build, branch: str, caused: list[ci.Red], names: str, n: int) -> None:
@@ -3228,18 +3360,37 @@ def ci_target(c: workspace.Checkout) -> ci.Target:
     return ci.Target(c.github, c.pr, c.pr_name, c.lease, c.base)
 
 
-def watch_publication_ci(run: Run, slot: slots.RunSlot, pushed: list[workspace.Checkout], *,
-                         reruns: dict[str, list[gh.WorkflowRerun]] | None = None) -> ci.Round:
-    def watch(checkout):
-        options = {} if reruns is None else {"reruns": reruns.get(checkout.github, ())}
-        return ci.compare_with_base(ci.watch(ci_target(checkout), run.log, **options), run.log)
+def watch_checkout_ci(run: Run, checkout: workspace.Checkout, reruns=()) -> ci.Watched:
+    options = {"reruns": reruns} if reruns else {}
+    return ci.compare_with_base(ci.watch(ci_target(checkout), run.log, **options), run.log)
 
-    slot.free()
-    try:
-        with run.waiting("ci"):
-            return ci.Round(1 if reruns is None else 2, [watch(c) for c in pushed])
-    finally:
-        slot.take(run.log, run.waiting)
+
+def watch_publication_ci(b: Build, slot: slots.RunSlot, pushed: list[workspace.Checkout], max_rounds: int, *,
+                         automatic: AutomaticCIReruns | None = None,
+                         reruns: dict[str, list[gh.WorkflowRerun]] | None = None) -> list[ci.Round]:
+    run = b.run
+    automatic = automatic if automatic is not None else classic_ci_reruns(b)
+    rounds = []
+    n = 1 if reruns is None else 2
+    while True:
+        slot.free()
+        try:
+            with run.waiting("ci"):
+                current = ci.Round(n, [watch_checkout_ci(
+                    run, c, automatic.for_checkout(c) if reruns is None else reruns.get(c.github, ())) for c in pushed])
+        finally:
+            slot.take(run.log, run.waiting)
+        rounds.append(current)
+        automatic.keep_failure_evidence(current)
+        if (reruns is not None or not current.all_read or not (candidate := automatic.candidate(current))
+                or n >= max_rounds):
+            return rounds
+        unjudged = [r for r in current.reds if r.kind == "unjudged"]
+        if unjudged:
+            judge_publication_ci(b, pushed, unjudged, n)
+        if not automatic.retry(run, current, candidate):
+            return rounds
+        n += 1
 
 
 def unmerged_paths(wt: Path) -> list[str]:
@@ -3631,9 +3782,7 @@ def judge_ci(b: Build, reds: list[ci.Red], n: int, max_rounds: int, watched: lis
         for r in reds:
             r.reason = "Arete could not merge the moved base before judging this check."
         raise workspace.RunFailed(e.why, ci.red_list(reds))
-    logs = run_folder(run, "ci")
-    failures = "\n\n".join(ci.failure_note(r, logs / f"round{n}-{i}-{prompt_loader.slug(r.label)}.log")
-                           for i, r in enumerate(reds, 1))
+    failures = ci_failure_notes(run, reds, f"round{n}")
     diff = ", ".join(f"`{c.diff_from_base}`" for c in b.checkouts)
     left = NOT_CAUSED_LEFT_FOR_A_PERSON + b.left_for_a_person if b.left_for_a_person else ""
     name = b.next_step("ci_fix")
@@ -3644,13 +3793,76 @@ def judge_ci(b: Build, reds: list[ci.Red], n: int, max_rounds: int, watched: lis
         for r in reds:
             r.reason = "The CI fix step failed before it judged this check."
         raise workspace.RunFailed("the CI fix step failed", ci.red_list(reds))
-    verdicts = {name_key(v.get("name", "")): v for v in res.structured.get("checks", []) if isinstance(v, dict)}
-    for r in reds:
-        v = verdicts.get(name_key(r.label)) or verdicts.get(name_key(r.check.name)) or {}
-        r.caused = v.get("caused_by_pr") is not False
-        r.reason = ci.clip(v.get("reason") or "The fix step gave no verdict for this check.", MAX_CI_REASON_CHARS)
-        run.log(f"ci: {r.label} {'caused' if r.caused else 'not caused'} by the PR: {util.first_line(r.reason, 200)}")
+    apply_ci_verdicts(run, reds, res, assume_caused=True)
     return ci.clip(res.structured.get("summary", ""), MAX_CI_REASON_CHARS)
+
+
+def judge_publication_ci(b: Build, pushed: list[workspace.Checkout], reds: list[ci.Red], n: int) -> None:
+    run = b.run
+    try:
+        patch = "\n".join(checkout_patch(c, [], f"{c.origin_base}...{c.lease}") for c in pushed)
+        failures = ci_failure_notes(run, reds, f"publish-judge{n}")
+        diff = util.both_ends(vault.hidden(patch), MAX_FIX_DIFF_IN_PROMPT)
+        text = ("Judge whether the published PR caused each CI failure. Compare the failure evidence with the "
+                "published diff below. Unrelated failures can include flaky tests, unavailable services, or failures "
+                "also present on the base. Report a check as unrelated only when the evidence supports that verdict. "
+                "Use the exact check headings below and give the reason for each verdict. Make no edits.\n\n"
+                f"{failures}\n\n## Published diff\n\n```diff\n{diff}\n```")
+        res = run.agent(b.next_step("ci_judge"), prompt_loader.task_prompt(text), b.ws, role="ci_repair",
+                        read_only=True, persist=False, json_schema=CI_FIX_SCHEMA)
+    except (RuntimeError, OSError, ValueError) as e:
+        run.log(f"ci: could not judge the published checks: {util.first_line(str(e), 300)}")
+        return
+    if res.ok and isinstance(res.structured, dict):
+        apply_ci_verdicts(run, reds, res)
+
+
+def ci_failure_notes(run: Run, reds: list[ci.Red], prefix: str) -> str:
+    logs = run_folder(run, "ci")
+    return "\n\n".join(ci.failure_note(r, logs / f"{prefix}-{i}-{prompt_loader.slug(r.label)}.log")
+                       for i, r in enumerate(reds, 1))
+
+
+def apply_ci_verdicts(run: Run, reds: list[ci.Red], res: Result, *, assume_caused=False) -> None:
+    checks = res.structured.get("checks", [])
+    if not isinstance(checks, list):
+        checks = []
+    named = [v for v in checks if isinstance(v, dict) and isinstance(v.get("name"), str)]
+    exact = exact_ci_verdicts(reds, named) if len(named) == len(checks) else {}
+    repair = {name_key(v["name"]): v for v in named} if assume_caused else {}
+    for i, r in enumerate(reds):
+        rerun_verdict = exact.get(i, {})
+        reason = rerun_verdict.get("reason")
+        if rerun_verdict.get("caused_by_pr") is False and isinstance(reason, str) and reason.strip():
+            r.rerun_reason = ci.clip(reason, MAX_CI_REASON_CHARS)
+        v = rerun_verdict
+        if assume_caused:
+            v = repair.get(name_key(r.label)) or repair.get(name_key(r.check.name)) or {}
+        verdict, reason = v.get("caused_by_pr"), v.get("reason")
+        if not assume_caused and (type(verdict) is not bool or not isinstance(reason, str) or not reason.strip()):
+            continue
+        r.caused = verdict is not False
+        r.reason = ci.clip(reason or "The fix step gave no verdict for this check.", MAX_CI_REASON_CHARS)
+        run.log(f"ci: {r.label} {'caused' if r.caused else 'not caused'} by the PR: {util.first_line(r.reason, 200)}")
+
+
+def exact_ci_verdicts(reds: list[ci.Red], verdicts: list[dict]) -> dict[int, dict]:
+    exact: dict[str, set[int]] = {}
+    for i, red in enumerate(reds):
+        for name in (red.label, red.check.name):
+            exact.setdefault(name, set()).add(i)
+    matched = {}
+    for verdict in verdicts:
+        matches = exact.get(verdict["name"])
+        if not matches:
+            continue
+        if len(matches) != 1:
+            return {}
+        index, = matches
+        if index in matched:
+            return {}
+        matched[index] = verdict
+    return matched
 
 
 def name_key(name: str) -> str:

@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from . import (
     codebase,
+    config,
     delegation,
     diffguard,
     factory,
@@ -58,7 +59,7 @@ class RetargetedPR(ValueError):
         super().__init__(f"The PR base changed from `{previous}` to `{current}`. A person needs to revise it.")
 
 
-def policy_fingerprint(cfg, layer, closed_context):
+def policy_fingerprint(cfg, layer, closed_context, *, resume=False):
     effective = asdict(layer)
     effective.pop("factory_path")
     if layer.required_check is None:
@@ -67,12 +68,16 @@ def policy_fingerprint(cfg, layer, closed_context):
         effective["verify"] = layer.verify.policy()
     policy_config = asdict(cfg)
     policy_config.pop("server_url")
+    policy_config["max_parallel_checks"] = config.Config.max_parallel_checks
+    if resume:
+        config.remove_controller_only_settings(policy_config)
     return ledger.digest(json.loads(json.dumps({"layer": effective, "config": policy_config,
                                                 "closed_context": closed_context}, default=str)))
 
 
 class Controller:
     merge_lease: TextIO | None = None
+    starts_new_lineage = False
 
     def __init__(self, flow):
         self.flow, self.job = flow, flow.ctx
@@ -133,8 +138,12 @@ class Controller:
 
     def write_lineage_event(self):
         if event := self.data.get("lineage_event"):
+            started = {"new_lineage": True} if event.get("new_lineage") else {}
             run_lines.write(event["run"], "lineage", event_id=event["event_id"], old=event["old"], new=event["new"],
-                            engine_commit=event["engine_commit"])
+                            engine_commit=event["engine_commit"], **started)
+            if started:
+                self.run.log("lineage: started a new controller lineage; " + ", ".join(
+                    f"{key} {event['old'][key]} → {event['new'][key]}" for key in event["old"]))
             del self.data["lineage_event"]
             ledger.save(self.lease, self.data)
 
@@ -162,6 +171,8 @@ class Controller:
             self.job.layer = pipeline.checked_layer(self.job.cfg, layer_dir, source_file=source_file)
             self.run.cfg, self.run.layer, self.run.kind = self.job.cfg, self.job.layer, prepared["ticket"]["kind"]
             self.lineage()
+            if self.starts_new_lineage:
+                self.discard_gate_state()
             if restore_prs:
                 if ending := self.restore_pr_targets(prepared):
                     return ending
@@ -283,7 +294,8 @@ class Controller:
         if old_lineage:
             self.data["lineage_event"] = {"run": self.run.id, "event_id": uuid4().hex, "old": old_lineage,
                                           "new": {key: lineage[key] for key in old_lineage},
-                                          "engine_commit": util.engine_commit()}
+                                          "engine_commit": util.engine_commit(),
+                                          **({"new_lineage": True} if old_lineage.keys() - REFRESHABLE_LINEAGE else {})}
         self.persist()
         self.write_lineage_event()
         return None
@@ -430,19 +442,38 @@ class Controller:
         launch = {"config_sha": delegation.settings_sha(job.cfg), "layer_sha": delegation.settings_sha(job.layer)}
         delegation.check_policy(launch, job.cfg, layer)
 
+    def discard_gate_state(self):
+        self.data["stale_actions"] = sorted({*self.data.get("stale_actions", ()),
+                                             *(action["id"] for action in ledger.actions(self.lease))})
+        self.data["evidence"] = {}
+        self.data["review"] = pipeline.Review.stored({}).asdict()
+        self.data["verified"] = asdict(Verified("unverified"))
+        for name in ("checked", "report"):
+            self.data.pop(name, None)
+        if "job" in self.data:
+            self.data["job"] = {**self.data["job"], "reviews": 0, "ci_result": ""}
+
     def lineage(self):
+        tid = str(getattr(self.run, "tid", ""))
+        pinned = pilot.is_pilot_task(tid) or zte.reserved(tid)
+        restarts = not pinned and any(c.get("pr") for c in self.data.get("prepared", {}).get("checkouts", ()))
         self.catalog = Catalog(self.job)
+        policy = self.policy_sha()
+        saved_policy = self.data.get("policy_sha")
+        if saved_policy is not None and self.matches_policy(saved_policy, policy):
+            policy = saved_policy
         found = {"catalog_sha": self.catalog.fingerprint, "operations_sha": ledger.digest(describe_operations()),
-                 "policy_sha": self.policy_sha(),
+                 "policy_sha": policy,
                  "controller_prompt": ledger.digest(prompt_loader.template("orchestrate").template),
                  "controller_settings": ledger.digest(asdict(self.run.settings("orchestrate"))),
                  "run_settings": ledger.digest([self.run.overrides, self.run.step_overrides])}
         old = {key: self.data[key] for key, value in found.items() if key in self.data and self.data[key] != value}
         changes = ", ".join(f"{key} changed ({str(value)[:8]} → {found[key][:8]})" for key, value in old.items())
-        if old.keys() - REFRESHABLE_LINEAGE:
+        if old.keys() - REFRESHABLE_LINEAGE and not restarts:
             raise factory.Refused(f"{changes}; reconcile before resuming")
         if why := self.continuation_blocker(decision_boundary=bool(old)):
             raise factory.Refused(f"{changes}; {why}; reconcile before resuming" if old else why)
+        self.starts_new_lineage = bool(old.keys() - REFRESHABLE_LINEAGE)
         return found, old
 
     def ci_failures(self, current):
@@ -453,7 +484,13 @@ class Controller:
         return "\n\n".join(["## CI failures", "", current.summary(), *notes])
 
     def policy_sha(self):
-        return policy_fingerprint(self.job.cfg, self.job.layer, self.run.closed_context)
+        tid = str(getattr(self.run, "tid", ""))
+        authorized = pilot.is_pilot_task(tid) or zte.reserved(tid)
+        return policy_fingerprint(self.job.cfg, self.job.layer, self.run.closed_context, resume=not authorized)
+
+    def matches_policy(self, saved, current):
+        return saved == current or saved == policy_fingerprint(
+            self.job.cfg, self.job.layer, self.run.closed_context)
 
     def fingerprint(self):
         prints = {c.github: factory.fingerprint(c.wt) for c in self.job.checkouts}
@@ -471,7 +508,8 @@ class Controller:
         if gate == "checks" and self.data.get("denied_feedback"):
             return False
         found = self.data.get("evidence", {}).get(gate, {})
-        return bool(found and found["tree"] == self.fingerprint() and found["policy"] == self.policy_sha()
+        return bool(found and found["tree"] == self.fingerprint()
+                    and self.matches_policy(found["policy"], self.policy_sha())
                     and found.get("acceptance") == self.data["acceptance"])
 
     def recover(self):
@@ -479,8 +517,11 @@ class Controller:
         for turn in ledger.pending(self.lease):
             ledger.reject(self.lease, turn["id"], "interrupted controller turn; admitted usage may be unknown")
         catch_up = self.data.get("catch_up_hold", {})
+        stale = set(self.data.get("stale_actions", ()))
         for action in ledger.actions(self.lease):
             result = action["result"]
+            gate = {"checks.run": "checks", "verification.run": "verify", "review.run": "review"}.get(action["op"])
+            old_gate = bool(gate) and action["id"] in stale
             if action["id"] == catch_up.get("action"):
                 self.data["evidence"] = {}
             if action["op"] == "owner.ask" and result.get("awaiting_owner"):
@@ -491,18 +532,16 @@ class Controller:
                 state = "reconciliation-required" if action["op"] == "publication.request" else "interrupted"
                 ledger.transition(self.lease, action["id"], state,
                                   {**result, "error": "execution interrupted; usage may be unknown", "usage_unknown": True})
-            if result.get("text"):
+            if result.get("text") and not old_gate:
                 self.catalog.add_context(action["id"], result["text"])
-            gate = {"checks.run": "checks", "verification.run": "verify", "review.run": "review"}.get(action["op"])
-            if gate and action["state"] != "accepted":
+            if gate and not old_gate and action["state"] != "accepted":
                 self.data.setdefault("evidence", {}).pop(gate, None)
             if action["state"] == "succeeded":
                 if result.get("writing"):
                     self.job.build_summary = self.job.b.build_summary = result.get("text", self.job.build_summary)
                 elif result.get("effective", {}).get("prompt_id", "").removeprefix("prompt:") == "plan":
                     self.job.plan_text = self.job.b.plan_text = result.get("text", self.job.plan_text)
-                gate = {"checks.run": "checks", "verification.run": "verify", "review.run": "review"}.get(action["op"])
-                if gate and result.get("evidence"):
+                if gate and not old_gate and result.get("evidence"):
                     self.data.setdefault("evidence", {})[gate] = result["evidence"]
                     if gate == "checks":
                         self.job.b.checked, self.job.b.report = result.get("checked", {}), result.get("report", "")
@@ -888,7 +927,7 @@ class Controller:
         flows.refuse_changed_prs(job)
         checkouts = {c.github: c for c in job.with_prs}
         heads = self.data["publication"]["heads"]
-        retried = self.data.setdefault("ci_retried_heads", {})
+        retried = self.data.get("ci_retried_heads", {})
         pushed = []
         targets = retry["targets"]
         for repo, target in targets.items():
@@ -897,7 +936,8 @@ class Controller:
             if not checkout or checkout.pr != target["pr"] or checkout.lease != head or heads.get(repo) != head:
                 raise ValueError("the failed CI no longer matches this run's published head")
             pushed.append(checkout)
-        if failure := self.second_ci_failure(targets, retried):
+        automatic_requested = self.rerun_requested(pushed)
+        if not automatic_requested and (failure := self.second_ci_failure(targets, retried)):
             return failure
         if retry["caught_up"]:
             checkout, = pushed
@@ -908,10 +948,16 @@ class Controller:
                     or row.get("baseRefName") != checkout.base):
                 raise ValueError("the PR no longer matches this run's published head and base")
         saved = retry.get("reruns")
+        if automatic_requested or (saved is None and not retry.get("legacy_rerun")):
+            if self.refresh_publication_ci(pushed, retry, automatic_requested):
+                return self.finish_ci_retry()
+            if saved is None:
+                return self.settle_publication_failure(self.publication_ci_failure())
         launches = {}
         if saved is not None:
             reruns = {repo: [gh.WorkflowRerun(**row) for row in requested] for repo, requested in saved.items()}
         else:
+            self.data.setdefault("ci_retried_heads", retried)
             reruns = {c.github: gh.failed_job_reruns(c.github, c.pr, c.lease, targets[c.github]["jobs"])
                       for c in pushed if c.lease not in retried.get(c.github, [])}
             if not any(reruns.values()):
@@ -928,15 +974,40 @@ class Controller:
         failure = self.publication_ci(pushed, caught_up=retry["caught_up"], reruns=reruns)
         if failure:
             self.data.pop("publication_intent", None)
-            if saved is not None:
+            if saved is not None and not automatic_requested:
                 targets = self.data["ci_retry"]["targets"]
                 if second_failure := self.second_ci_failure(targets, retried):
                     return second_failure
             return self.settle_publication_failure(failure)
+        return self.finish_ci_retry()
+
+    def finish_ci_retry(self):
+        job = self.job
         flows.require_environment_owner_clear(job)
         fresh = [c for c in job.picked(job.opened) if c.github not in job.found]
         pipeline.ready_pushed(self.run, fresh, job.picked(job.ci_stopped), job.draft_why)
         return self.finish_publication()
+
+    def refresh_publication_ci(self, pushed, retry, automatic_requested):
+        try:
+            for checkout in pushed:
+                target = retry["targets"][checkout.github]
+                actions_failures = target.get("actions_failures")
+                if actions_failures is None:
+                    actions_failures = [(job, "") for job in target.get("jobs", ())] if automatic_requested else []
+                if not gh.publication_ci_passed(checkout.github, checkout.lease, actions_failures=actions_failures):
+                    return False
+        except pipeline.ci.READ_ERRORS as error:
+            self.run.log(f"ci: could not refresh published checks: {util.first_line(str(error), 300)}")
+            return False
+        self.job.ci_result = "passed on the published head"
+        stories = retry.get("round_stories", [])
+        if automatic_requested and not stories:
+            stories = ["Arete previously requested a CI rerun."]
+        ending = "\n\n".join([*stories, "GitHub now reports passing checks on the published head."])
+        self.report_publication_ci(pushed, retry["caught_up"], pipeline.ci.section([], 0, ending))
+        self.clear_ci_failure()
+        return True
 
     def second_ci_failure(self, targets, retried):
         for repo, target in targets.items():
@@ -947,36 +1018,78 @@ class Controller:
                 return {"error": reason}
         return None
 
-    def publication_ci(self, pushed, *, caught_up=False, reruns=None):
-        tree = self.fingerprint()
-        current = pipeline.watch_publication_ci(self.run, self.job.slot, pushed, reruns=reruns)
-        self.job.ci_result = current.summary()
+    def rerun_requested(self, pushed):
+        requested = self.data.get("ci_rerun_requested_heads", {})
+        return any(c.lease in requested.get(c.github, []) for c in pushed)
+
+    def remember_ci_rerun(self, repo, head):
+        self.data.setdefault("ci_rerun_requested_heads", {}).setdefault(repo, []).append(head)
+        self.persist()
+
+    def publication_ci_failure(self):
+        return {"ci": self.job.ci_result, "failures": CI_FAILURES,
+                "error": f"CI needs an explicit worker diagnosis or repair; its failure logs are context {CI_FAILURES}"}
+
+    def clear_ci_failure(self):
+        for key in ("ci_retry", "ci_failed", "ci_failures"):
+            self.data.pop(key, None)
+        self.catalog.context.pop(CI_FAILURES, None)
+
+    def report_publication_ci(self, pushed, caught_up, section):
         self.check_pilot_publication()
-        section = pipeline.ci.section([current], current.n)
         if caught_up:
             for checkout in pushed:
                 pipeline.comment_catch_up_ci(self.run, checkout, section, self.job.verified, self.job.review)
         else:
             pipeline.publish_ci(self.run, self.job.ticket, self.job.with_prs, section)
-        self.data.pop("ci_retry", None)
+
+    def publication_ci(self, pushed, *, caught_up=False, reruns=None):
+        tree = self.fingerprint()
+        saved = self.data.get("ci_retry", {}) if reruns is not None else {}
+        max_rounds = saved.get("max_rounds", 2) if reruns is not None else self.run.settings("ci_repair").tries
+        earlier = [pipeline.ci.Round(n, [], story) for n, story in enumerate(saved.get("round_stories", []), 1)]
+        requested_heads = {(repo, head) for name in ("ci_rerun_requested_heads", "ci_retried_heads")
+                           for repo, heads in self.data.get(name, {}).items() for head in heads}
+        automatic = pipeline.AutomaticCIReruns(requested_heads, self.remember_ci_rerun)
+        rounds = pipeline.watch_publication_ci(self.job.b, self.job.slot, pushed, max_rounds,
+                                               automatic=automatic, reruns=reruns)
+        current = rounds[-1]
+        if earlier:
+            current.n = len(earlier) + 1
+            rounds = earlier + rounds
+        self.job.ci_result = current.summary()
+        self.report_publication_ci(pushed, caught_up, pipeline.ci.section(rounds, max_rounds))
+        automatic_reruns = {c.github: attempts for c in pushed if (attempts := automatic.for_checkout(c))}
         if current.passed:
-            self.data.pop("ci_failed", None)
-            self.data.pop("ci_failures", None)
-            self.catalog.context.pop(CI_FAILURES, None)
+            self.clear_ci_failure()
             return None
+        self.data.pop("ci_retry", None)
         self.data["ci_failed"] = True
         targets = {}
         for w in current.seen:
-            reds = [r for r in w.reds if reruns is None or w.read or r.check.key in w.rerun_reds]
+            reds = [r for r in w.reds if reruns is None or w.read or r.check.key in w.rerun_reds or r.check.actions_only]
+            actions_failures = []
+            for red in reds:
+                check = red.check
+                run = check.workflow_run_id or check.actions_workflow(w.target.github)
+                if check.job or (run and check.source == f"workflow:{run}"):
+                    actions_failures.append((check.job, check.name, run))
             targets[w.target.github] = {"head": w.target.sha, "pr": w.target.pr, "red": bool(reds),
-                                        "jobs": [r.check.job for r in reds if r.check.job]}
-        interrupted_watch = reruns is not None and not current.all_read
+                                        "jobs": [r.check.job for r in reds if r.check.job],
+                                        "actions_failures": actions_failures}
+        requested = automatic_reruns if reruns is None else reruns
+        interrupted_watch = bool(requested) and not current.all_read
         if interrupted_watch or any(t["red"] for t in targets.values()):
             self.data["published_tree"] = tree
-            self.data["ci_retry"] = {"caught_up": caught_up, "targets": targets}
+            retry = self.data["ci_retry"] = {"caught_up": caught_up, "targets": targets}
+            if any((c.github, c.lease) in requested_heads for c in pushed):
+                retry["round_stories"] = [r.story for r in rounds if r.story]
+            elif reruns is None and not self.rerun_requested(pushed) and not any(r.caused for r in current.reds):
+                retry["legacy_rerun"] = True
             if interrupted_watch:
-                self.data["ci_retry"]["reruns"] = {repo: [asdict(rerun) for rerun in requested]
-                                                   for repo, requested in reruns.items()}
+                retry["reruns"] = {repo: [asdict(rerun) for rerun in attempts] for repo, attempts in requested.items()}
+                if earlier or automatic_reruns:
+                    retry.update(max_rounds=max_rounds, round_stories=[r.story for r in rounds[:-1]])
         self.data["ci_failures"] = self.ci_failures(current)
         self.catalog.add_context(CI_FAILURES, self.data["ci_failures"])
         check_head = caught_up or self.data.get("catch_up_hold")
@@ -987,8 +1100,7 @@ class Controller:
                                or pipeline.own_draft_state(self.run, checkout) is None):
                 continue
             pipeline.set_draft(self.run, checkout, True)
-        return {"ci": self.job.ci_result, "failures": CI_FAILURES,
-                "error": f"CI needs an explicit worker diagnosis or repair; its failure logs are context {CI_FAILURES}"}
+        return self.publication_ci_failure()
 
     def take_merge_lease(self, checkout):
         if self.merge_lease is None:
