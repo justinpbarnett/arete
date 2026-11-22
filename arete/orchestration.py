@@ -732,6 +732,8 @@ class Controller:
             inputs["journeys"] = journeys.guidance(self.job.layer.verify.feature_map, planning=True)
         if "verify" in args["inputs"] and pipeline.triage_checks(self.job.approval):
             inputs["verify"] = pipeline.triage_goal(str(inputs["verify"]), self.job.approval)
+        if not writing:
+            inputs["class_check"] = ""
         prompt = self.job.brief.prompt("delegate" if name in ("delegate", "investigate") else name, **inputs)
         if writing and denied_feedback:
             prompt += f"\n\n## Check failure to repair\n\n{denied_feedback}"
@@ -1249,8 +1251,8 @@ class Controller:
         self.run.say(f"{held}. I parked the run because {reason}.", on_ticket=on_ticket)
         reason = f"{held}. {reason}"
         if close_failed:
-            return pipeline.record_park(self.run, reason, {})
-        return pipeline.park_run(self.run, reason)
+            return pipeline.record_park(self.run, reason, {}, comment=False)
+        return pipeline.park_run(self.run, reason, comment=False)
 
     def settle_publication_failure(self, failure):
         if self.data.get("catch_up_hold"):
@@ -1568,6 +1570,8 @@ class Controller:
         self.persist()
         run_lines.write(self.run.id, "action", action=action["id"], op=action["op"],
                         state="running" if result is None else "failed" if "error" in result else "succeeded")
+        if isinstance(refusal, prompt_loader.MissingInputs):
+            raise refusal
         return refusal
 
     def drive(self):

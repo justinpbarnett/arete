@@ -50,6 +50,7 @@ from .agent import (
     UsageLimit,
     streamed_turn,
     subscription,
+    token_cost,
     traits_of,
 )
 from .store import devices as devices_store
@@ -246,7 +247,7 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
         route: dict | None = None, refusal: str = "", mode: str = "", layer: config.RepoLayer | None = None,
         scratch: verification_scratch.Attempt | None = None, remaining_tokens: Callable[[], int] | None = None,
         hard_cap: bool = False, needs_server: bool = False, codex_headroom: dict | None = None,
-        max_steps: int | None = None, **kw) -> Result:
+        max_steps: int | None = None, claude_tools: tuple[str, ...] = (), **kw) -> Result:
     cfg = cfg or config.load()
     if settings and settings.requires.delegation_only:
         kw.update(tools=[], allowed_tools=[], disallowed_tools=[], instructions=[], mcp_config="", add_dirs=[],
@@ -330,7 +331,11 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
             return Result(ok=False, runner=chosen_route.runner, model=name,
                           error="native observation requires local Pi subscription")
         text, session = session_for(trip, picked, prompt, fresh_prompt, previous, kw, record_id)
-        launch_kw = launch_kwargs(kw, picked, trip, trace, ask_jev, say, cwd=cwd)
+        launch_kw = launch_kwargs(kw, picked, trip, trace, ask_jev, say, cwd=cwd, claude_tools=claude_tools)
+        openrouter = routing.claude_openrouter(chosen_route.runner, chosen_route.provider)
+        config_run = session.openrouter_run or record_id
+        if openrouter:
+            launch_kw["openrouter_config"] = paths.RUNS_DIR / config_run / "claude-openrouter"
         final_size = routing.routing_size(text, settings, launch_kw)
         measured = max(measured, final_size)
         if (trip.request.requires.declared and final_size > trip.request.size
@@ -349,19 +354,23 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
                  "effort": chosen_route.effort, "requested_effort": trip.request.effort, "tier": chosen_route.tier,
                  "position": chosen_route.position, "requested": chosen_route.requested,
                  "env": launch_env(picked, cfg, repo, trace[0], launch_kw.get("extra_env"),
-                                   launch_kw.get("ask_owner", False)),
+                                   launch_kw.get("ask_owner", False),
+                                   openrouter_config=launch_kw.get("openrouter_config")),
                  "skipped": skipped, "launch": launches,
                  **({"request_tokens": final_size} if trip.request.requires.declared else {})}
         launch_kw = admitted(launch_kw, on_launch(route))
         started = util.iso()
         with verification_scratch.producing(launch_kw.pop("verification_attempt", None)):
             res = attempt(chosen_route.runner, picked.name, text, cwd, session, cfg, trace, record_id, target, launch_kw,
-                          tier, kind, picked.auth, route, try_no, atom)
+                          tier, kind, picked.auth, route, try_no, atom,
+                          openrouter_quote=chosen_route.price if openrouter else None)
         res.credential, res.effort, res.requested_effort, res.skipped = (
             chosen_route.credential, chosen_route.effort, trip.request.effort, skipped)
         if res.session.id:
             res.session = replace(res.session, credential=chosen_route.credential, account=account_of(picked.auth),
                                   generation=picked.auth.generation)
+            if openrouter:
+                res.session = replace(res.session, openrouter_model=picked.name, openrouter_run=config_run)
         if not res.usage_limit:
             if res.ok:
                 devices_store.clear_holds([accounts.scope(a, s, picked.unknown) for a in picked.auths
@@ -551,8 +560,8 @@ def pick(trip: Trip) -> tuple[Picked | None, list[dict]]:
     found = discovery.routes(trip.request, request_tokens=trip.request.size)
     wanted = trip.resume
     if wanted.id and not trip.launched:
-        found.sort(key=lambda c: not (c.runner == wanted.runner and (not wanted.credential
-                                                                    or c.credential == wanted.credential)))
+        found.sort(key=lambda c: not (session_route(wanted, c) and (not wanted.credential
+                                                                   or c.credential == wanted.credential)))
     skipped: list[dict] = []
     for candidate in found:
         key = routing.route_key(candidate)
@@ -658,10 +667,16 @@ def account_of(auth: accounts.Auth) -> str:
     return accounts.fingerprint(auth.mode, auth.family, auth.provider, who) if who else ""
 
 
+def session_route(session: Session, candidate: routing.Candidate) -> bool:
+    model = candidate.model if routing.claude_openrouter(candidate.runner, candidate.provider) else ""
+    return (session.runner == candidate.runner and session.openrouter_model == model
+            and (not model or record.one_component(session.openrouter_run)))
+
+
 def continues(stopped: Stopped, picked: Picked, persist: bool) -> bool:
     before, now = stopped.picked.auth, picked.auth
     res = stopped.res
-    return (stopped.picked.candidate.runner == picked.candidate.runner and bool(res.session.id) and res.turns > 1
+    return (session_route(res.session, picked.candidate) and bool(res.session.id) and res.turns > 1
             and persist and (before == now or (bool(account_of(before)) and account_of(before) == account_of(now))
                              or devices_store.refresh_continues(before.generation, now.generation)))
 
@@ -670,7 +685,7 @@ def session_for(trip: Trip, picked: Picked, prompt: str, fresh_prompt: Callable[
                 previous: Stopped | None, kw: dict, record_id: str) -> tuple[str, Session]:
     which = picked.candidate.runner
     saved = trip.resume
-    usable = saved.id and saved.runner == which and (
+    usable = saved.id and session_route(saved, picked.candidate) and (
         not saved.account or saved.account == account_of(picked.auth)
         or devices_store.refresh_continues(saved.generation, picked.auth.generation))
     if previous is None and usable:
@@ -703,10 +718,12 @@ def reserved(name: str) -> str:
 
 
 def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str], ask_jev: bool,
-                  say: Callable[[str], None], *, cwd: Path | str | None = None) -> dict:
+                  say: Callable[[str], None], *, cwd: Path | str | None = None, claude_tools: tuple[str, ...] = ()) -> dict:
     kw = {k: list(v) if isinstance(v, list) else v for k, v in base.items()}
     cfg, repo, target = trip.cfg, trip.repo, trip.target
     which = picked.candidate.runner
+    if which == "claude" and claude_tools:
+        kw["allowed_tools"] = [*(kw.get("allowed_tools") or ()), *claude_tools]
     floor = None if target.remote else guard.floor(trace[0], cwd or Path.cwd(), kw.get("add_dirs") or [])
     closed_context = tuple(Path(path).absolute() for path in kw.pop("closed_context", ()))
     if closed_context:
@@ -758,6 +775,9 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
         else:
             kw.pop("max_budget_usd", None)
         if not target.remote:
+            if routing.claude_openrouter(which, picked.candidate.provider):
+                configs = (os.environ.get("CLAUDE_CONFIG_DIR"), (kw.get("extra_env") or {}).get("CLAUDE_CONFIG_DIR"))
+                closed_context += tuple(Path(folder) for folder in dict.fromkeys(configs) if folder)
             kw = local_claude(kw, cfg, trace[0], ask_jev, say, repo, hook, floor=floor, closed_context=closed_context)
     elif which == "codex":
         kw.pop("max_budget_usd", None)
@@ -780,12 +800,13 @@ def launch_kwargs(base: dict, picked: Picked, trip: Trip, trace: tuple[str, str]
 
 
 def launch_env(picked: Picked, cfg: config.Config, repo: config.Repo | None, run_id: str,
-               extra: dict | None = None, asking: bool = False) -> list[str]:
+               extra: dict | None = None, asking: bool = False, *, openrouter_config: Path | None = None) -> list[str]:
     if picked.selected:
         return sorted({*pi.launch_env_names(picked.selected), *(extra or {}), *(["ARETE_ASK_TOOL"] if asking else [])})
-    passing = environment.passed(cfg, repo)
-    return sorted((codex if picked.candidate.runner == "codex" else claude).agent_env(
-        passing, {**(extra or {}), **run_env(run_id)}, api_key=getattr(picked, "api_key", "")))
+    agent = codex if picked.candidate.runner == "codex" else claude
+    transport = {"openrouter_config": openrouter_config, "model": picked.name} if openrouter_config else {}
+    return sorted(agent.agent_env(environment.passed(cfg, repo), {**(extra or {}), **run_env(run_id)},
+                                  api_key=getattr(picked, "api_key", ""), **transport))
 
 
 def with_spent(res: Result, earlier: list[Result]) -> Result:
@@ -824,7 +845,7 @@ def refresh_redactions(hidden: scrub.Redactions, selected: pi.Route | None) -> N
 def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session, cfg: config.Config,
             trace: tuple[str, str], record_id: str, target: devices.Device, kw: dict, tier: str = "",
             kind: str = "", auth: accounts.Auth | None = None, route: dict | None = None, try_no: int = 0,
-            atom: str = "") -> Result:
+            atom: str = "", *, openrouter_quote: routing.Quote | None = None) -> Result:
     auth = auth or (authentication(name, which, cfg=cfg, device=target) if which != REPLAY else accounts.Auth())
     if target.remote and which == "claude":
         kw["leaf"] = f"{record.slug(trace[1])}-{try_no}"
@@ -850,6 +871,8 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
         instructions=kw.get("instructions"), allowed_tools=kw.get("allowed_tools"), mcp_servers=header["mcp_servers"])
     if atom:
         header["atom"] = atom
+    if openrouter_quote is not None:
+        header.update(provider=route["provider"], env=route["env"], usage_rates=openrouter_quote.rates)
     if route.get("selection"):
         header["route"] = route
     found = secret_files([cwd, *(kw.get("add_dirs") or [])], target, cfg)
@@ -871,6 +894,11 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
     max_tokens = kw.pop("max_tokens", None)
     on_local = route.get("credential") == "local"
 
+    def charged(res: Result) -> float:
+        if openrouter_quote is not None:
+            return token_cost(openrouter_quote.rates, res.tokens_in, res.tokens_out, res.cache_read, res.cache_write)
+        return 0.0 if on_local else priced(res, cfg)
+
     def persist(res: Result) -> None:
         try:
             if trace[0]:
@@ -887,12 +915,12 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
         refresh_redactions(hidden, selected)
         seen = replace(meter.seen, provider=header["provider"],
                        error=scrub.scrub(rec.exception_text(error), hidden))
-        seen.cost_usd = 0.0 if on_local else priced(seen, cfg)
+        seen.cost_usd = charged(seen)
         persist(seen)
         rec.finish(seen, time.monotonic() - started)
 
-    meter = Meter(max_tokens, kw.get("max_budget_usd") if max_tokens is not None else None,
-                  lambda r: priced(r, cfg),
+    meter = Meter(max_tokens, kw.get("max_budget_usd") if max_tokens is not None or openrouter_quote is not None else None,
+                  (lambda r: priced(r, cfg)) if openrouter_quote is None else charged,
                   Result(ok=False, session=resume, runner=which, model=name, auth_mode=auth.mode),
                   actions=kw.pop("action_limit", None), reader=record.READERS[which](header))
     with record.Recorder(record_id, trace[1], header, hidden) as rec:
@@ -913,6 +941,8 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
             res.runner = which
             res.model = res.model or name
             res.provider = res.provider or routing.provider_of(res.model)
+            if openrouter_quote is not None:
+                res.model, res.provider = name, header["provider"]
             if which != REPLAY:
                 res.auth_mode = auth.mode
                 if res.usage_limit and (
@@ -921,13 +951,20 @@ def attempt(which: str, name: str, prompt: str, cwd: Path | str, resume: Session
                     res.usage_limit = None
             if res.calls:
                 for call in res.calls:
-                    call.cost_usd = 0.0 if on_local else priced(call, cfg)
+                    call.cost_usd = charged(call)
                 res.cost_usd = sum(call.cost_usd for call in res.calls)
                 res.aggregate_paid_usd = sum(call.paid_usd for call in res.calls)
             else:
-                res.cost_usd = 0.0 if on_local else priced(res, cfg)
+                res.cost_usd = charged(res)
+            if openrouter_quote is not None and res.session.id:
+                res.session = replace(res.session, spent_usd=resume.spent_usd + res.cost_usd)
             if not budget_error:
-                quote_calls(res, which, name, at)
+                if openrouter_quote is not None:
+                    res.quote = openrouter_quote.applied
+                    res.reference_usd = prices.reference_usd(res.quote, res.tokens_in, res.tokens_out,
+                                                            res.cache_read, res.cache_write)
+                else:
+                    quote_calls(res, which, name, at)
             refresh_redactions(hidden, selected)
             res.error = scrub.scrub(res.error, hidden)
             res.text = scrub.scrub(res.text, hidden)

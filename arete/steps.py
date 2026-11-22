@@ -89,7 +89,7 @@ def selected_tiers(cfg: config.Config, layer: config.RepoLayer) -> dict[str, tup
 
 
 def holds_model(entries: tuple[dict[str, str], ...], wanted: tuple[str, str]) -> bool:
-    return any(e.get("model") and routing.identity(*routing.source_route(e)[:2]) == wanted for e in entries)
+    return any(e.get("model") and routing.identity(*routing.source_route(e)) == wanted for e in entries)
 
 
 def tier_of(cfg: config.Config, layer: config.RepoLayer, named: str, wanted: tuple[str, str]) -> tuple[str, tuple]:
@@ -105,11 +105,14 @@ def chain_of(requested: tuple[str, str, str], tier: str, entries: tuple[dict[str
         return routing.Link(name, which, provider, tier, position, position == 0, routing.nearest_effort(which, effort),
                             traits_of(which).default_instructions if explicit is None else explicit)
 
-    wanted = routing.identity(*requested[:2])
+    wanted = routing.identity(*requested)
+    openrouter = routing.claude_openrouter(requested[0], requested[2])
     chain = [link(*requested, 0)]
     for entry in entries:
         which, name, provider = routing.source_route(entry)
-        if entry.get("model") and routing.identity(which, name) != wanted:
+        same_route = (routing.identity(which, name, provider) == wanted
+                      and routing.claude_openrouter(which, provider) == openrouter)
+        if entry.get("model") and not same_route:
             chain.append(link(which, name, provider, len(chain)))
     return tuple(chain)
 
@@ -265,7 +268,7 @@ def resolve(cfg: config.Config, layer: config.RepoLayer | None, step: str, kind:
     notes = codex.NOTES if which == "codex" else ()
     link_tier = tier
     if not tier:
-        link_tier, entries = tier_of(cfg, layer, found.get("tier", ""), routing.identity(which, name))
+        link_tier, entries = tier_of(cfg, layer, found.get("tier", ""), routing.identity(which, name, provider))
     if cfg.replay.all:
         name = f"codex:{name}" if which == "codex" and routing.route(name)[0] != which else name
         which = REPLAY
@@ -276,7 +279,7 @@ def resolve(cfg: config.Config, layer: config.RepoLayer | None, step: str, kind:
     runners = {link.runner for link in chain if fallback or link.requested}
     if fallback:
         runners.update({"openai": "codex", "anthropic": "claude"}[vendor]
-                       for link in chain if (vendor := routing.identity(link.runner, link.model)[0])
+                       for link in chain if (vendor := routing.identity(link.runner, link.model, link.provider)[0])
                        in ("openai", "anthropic"))
     supported = {level for run_with in runners for level in TRAITS[run_with].efforts}
     if effort and effort not in supported:

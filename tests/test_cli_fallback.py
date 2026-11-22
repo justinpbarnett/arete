@@ -1,16 +1,38 @@
 import json
 import os
+import shlex
 import sys
 import tempfile
 import unittest
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from dataclasses import asdict
 from http.client import HTTPResponse
 from io import BytesIO, StringIO
 from pathlib import Path
+from subprocess import CompletedProcess
 from types import SimpleNamespace
 from unittest import mock
 
-from arete import api_http, cli, client, codebase, config, paths
+from arete import (
+    accounts,
+    api_http,
+    claude,
+    cli,
+    client,
+    codebase,
+    config,
+    devices,
+    factory,
+    oncall,
+    paths,
+    pi,
+    prices,
+    record,
+    routing,
+    runner,
+    steps,
+    util,
+)
 from tests.test_behavior import _CliThroughServeCase
 
 
@@ -493,3 +515,338 @@ class CliRouteFallbackTests(unittest.TestCase):
             current = False
             self.assertEqual(self.problem("session send r1 hello", "unknown_route")["required_version"], "1.2")
             self.assertEqual(sent, [(key, {"text": "hello"})])
+
+
+class ClaudeOpenRouterTests(unittest.TestCase):
+    model = "deepseek/deepseek-v4.1-flash-1017"
+    key = "fixture-openrouter-key"
+    anthropic_key = "fixture-anthropic-key"
+    anthropic_model = "claude-sonnet-5-5"
+    plan_token = "sk-ant-oat-fixture"
+
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory(ignore_cleanup_errors=True)))
+        self.state = self.root / "state"
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        self.keys = self.root / "keys.conf"
+        self.keys.write_text(f"OPENROUTER_API_KEY={self.key}\nANTHROPIC_API_KEY={self.anthropic_key}\n")
+        self.enterContext(mock.patch.dict(os.environ, {
+            "OPENROUTER_API_KEY": "", "ANTHROPIC_API_KEY": "ambient-anthropic-key",
+            "ANTHROPIC_AUTH_TOKEN": "ambient-anthropic-auth", "CLAUDE_CODE_OAUTH_TOKEN": "ambient-oauth",
+            "CLAUDE_CONFIG_DIR": str(self.root / "owner-config"),
+        }))
+        self.enterContext(mock.patch.multiple(paths, STATE_DIR=self.state, RUNS_DIR=self.state / "runs"))
+        self.enterContext(mock.patch.object(pi, "KEYS_FILE", self.keys))
+        self.enterContext(mock.patch.object(pi, "owner_dir", return_value=self.root / "pi"))
+        self.snapshot = self.enterContext(mock.patch.object(prices, "load", return_value=None))
+        self.enterContext(mock.patch.object(routing, "auth_hold", return_value=None))
+        self.status = self.enterContext(mock.patch.object(claude, "auth_status", return_value={"loggedIn": True}))
+        self.enterContext(mock.patch.object(claude, "authentication", return_value=accounts.Auth("subscription", "claude")))
+        self.enterContext(mock.patch.object(record, "mark"))
+        self.ledger = self.enterContext(mock.patch.object(record, "steps"))
+        self.enterContext(mock.patch.object(runner, "origin", return_value={"repo": "", "commit": ""}))
+        self.enterContext(mock.patch.object(runner, "secret_files", return_value=[]))
+        self.enterContext(mock.patch.object(runner.run_store, "step_tries", return_value=0))
+        self.enterContext(mock.patch.object(runner.devices_store, "clear_holds"))
+        self.listing()
+
+    def listing(self, cache_write=None):
+        util.write_json(self.state / routing.PRICE_FILE, {
+            "fetched": util.iso(),
+            "models": {self.model: {"input": 0.15, "output": 0.6, "cache_read": 0.003, "cache_write": cache_write}},
+        })
+
+    def settings(self, link=None, instructions=("repo",), routing_toml="", step="plan"):
+        link = link or f'{{ runner = "claude", provider = "openrouter", model = "{self.model}" }}'
+        path = self.root / "config.toml"
+        path.write_text(f'[tiers.test]\nfast = {link}\n[steps.{step}]\ntier = "fast"\n'
+                        f'instructions = {json.dumps(instructions)}\n{routing_toml}')
+        cfg = config.load(path, strict=True)
+        return cfg, steps.resolve(cfg, None, step)
+
+    def call(self, cfg, settings, *, tools=("Read",), **kw):
+        return runner.run("read the file", self.repo, **settings.call, cfg=cfg, settings=settings,
+                          ask_jev=False, wait_out_limits=False, tools=list(tools), **kw)
+
+    def child(self, *, stderr="", cache_write=0, stream_usage=False):
+        self.launches = []
+
+        def stream(cmd, cwd, prompt, env, timeout, on_line):
+            self.launches.append((cmd, env))
+            session = cmd[cmd.index("--resume") + 1] if "--resume" in cmd else cmd[cmd.index("--session-id") + 1]
+            event = {"type": "result", "subtype": "success", "result": "file read", "session_id": session,
+                     "num_turns": 2, "total_cost_usd": 5, "usage": {
+                         "input_tokens": 100_000, "cache_read_input_tokens": 1_000_000,
+                         "cache_creation_input_tokens": cache_write, "output_tokens": 10_000}}
+            out = json.dumps(event) + "\n"
+            if stream_usage:
+                usage = json.dumps({"type": "assistant", "message": {"id": "fixture", "usage": event["usage"]}}) + "\n"
+                on_line(usage)
+                out = usage + out
+            on_line(out)
+            return CompletedProcess(cmd, 0, out, stderr)
+
+        self.enterContext(mock.patch.object(claude.child, "stream", side_effect=stream))
+
+    def test_discovery_uses_the_openrouter_key_and_pi_quote(self):
+        cfg, settings = self.settings()
+        found = routing.Discovery(cfg)
+        route, = found.routes(settings)
+        self.assertEqual((route.runner, route.model, route.credential, route.billing, route.mode, route.provider, route.state),
+                         ("claude", self.model, "cli_key", "paid", "api_key", "openrouter", "ready"))
+        self.assertEqual(route.price, routing.Quote(0.15, 0.6, 0.003, source="openrouter"))
+        pi_link = f'{{ runner = "pi", model = "openrouter/{self.model}" }}'
+        pi_cfg, pi_settings = self.settings(pi_link, instructions=())
+        self.assertEqual(route.price, routing.Discovery(pi_cfg).routes(pi_settings)[0].price)
+        self.status.assert_not_called()
+        self.keys.unlink()
+        missing, = routing.Discovery(cfg).routes(settings)
+        self.assertEqual(missing.state, "missing_key")
+
+    def test_ambient_claude_plan_token_allows_openrouter_cli_key_lookup(self):
+        self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": self.plan_token}))
+        cfg, settings = self.settings()
+        _, pi_settings = self.settings(f'{{ runner = "pi", model = "openrouter/{self.model}" }}', instructions=())
+        _, anthropic = self.settings(f'{{ runner = "claude", model = "{self.anthropic_model}" }}', instructions=())
+        found = routing.Discovery(cfg)
+        self.assertEqual(found.routes(pi_settings)[0].state, "refused")
+        self.assertEqual(found.routes(settings)[0].state, "ready")
+        self.assertEqual(found.routes(pi_settings)[0].state, "refused")
+        self.assertEqual([(r.credential, r.state) for r in found.routes(anthropic)], [
+            ("cli_login", "ready"), ("cli_key", "refused"), ("pi_key", "refused"),
+        ])
+
+        self.keys.unlink()
+        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": self.key}):
+            self.assertEqual(routing.Discovery(cfg).routes(settings)[0].state, "ready")
+        self.keys.write_text(f"OPENROUTER_API_KEY={self.plan_token}\n")
+        self.assertEqual(routing.Discovery(cfg).routes(settings)[0].state, "refused")
+
+    def test_paid_provider_policy_uses_openrouter(self):
+        cfg, settings = self.settings(routing_toml='[routing.paid]\nproviders = ["anthropic"]\n')
+        route, = routing.Discovery(cfg).routes(settings)
+        self.assertEqual(route.state, "policy")
+        self.assertIn("[routing.paid]", route.detail)
+        self.assertIn("openrouter", route.detail)
+
+    def test_quote_uses_pricing_then_snapshot_then_pi_catalog(self):
+        catalog = self.root / "pi" / "models.json"
+        util.write_json(catalog, {"providers": {"openrouter": {"models": [{
+            "id": self.model, "cost": {"input": 2, "output": 3, "cacheRead": 0.02},
+        }]}}})
+        cfg, settings = self.settings()
+        self.assertEqual(routing.Discovery(cfg).routes(settings)[0].price,
+                         routing.Quote(2, 3, 0.02, source="models.json"))
+        self.snapshot.return_value = prices.parse({
+            "schema": 1, "source": "fixture", "observed": "2025-01-01T00:00:00Z", "routes": [{
+                "route": f"pi:openrouter/{self.model}", "kind": "marketplace", "provider": "openrouter",
+                "model": self.model, "currency": "USD", "unit": "per_million_tokens",
+                "rates": [{"input": 4, "output": 5, "cache_read": 0.04}],
+            }],
+        })
+        price = routing.Discovery(cfg).routes(settings)[0].price
+        self.assertEqual((price.input, price.output, price.cache_read, price.source), (4, 5, 0.04, "snapshot"))
+        cfg, settings = self.settings(routing_toml=f'[pricing.models."openrouter/{self.model}"]\ninput=6\noutput=7\n')
+        self.assertEqual(routing.Discovery(cfg).routes(settings)[0].price, routing.Quote(6, 7, source="pricing"))
+
+    def test_instruction_scopes_allow_repo_only(self):
+        cfg, settings = self.settings(instructions=("user", "repo"))
+        route, = routing.Discovery(cfg).routes(settings)
+        self.assertEqual(route.state, "incompatible")
+        self.assertIn("runs without your own claude setup", route.detail)
+        cfg, settings = self.settings(routing_toml="[routing]\nfallback = false\n")
+        route, = routing.Discovery(cfg).routes(settings)
+        self.assertEqual(route.state, "ready")
+        remote = devices.Device("remote", "ssh")
+        self.assertEqual(routing.Discovery(cfg, device=remote).routes(settings), [])
+        request = routing.request_for(cfg, None, settings.runner, settings.model, settings, True, {})
+        self.assertIn("runs locally", routing.fit_refusal(request, remote))
+        self.assertIn("payment_modes", routing.fit_refusal(request, devices.LOCAL, ("subscription",)))
+
+    def test_oncall_repair_admission_uses_the_resolved_step_routes(self):
+        cfg, _ = self.settings()
+        self.keys.write_text(f"OPENROUTER_API_KEY={self.key}\n")
+        os.environ["ANTHROPIC_API_KEY"] = ""
+        self.enterContext(mock.patch.object(routing, "auth_hold", side_effect=lambda auth, *args, **kw:
+                                         {"why": "Claude subscription held", "until": ""}
+                                         if auth.mode == "subscription" else None))
+        repo = config.Repo("fixture", self.repo, layer=self.root / "layer")
+        repo.layer_dir.mkdir()
+        layer_file = repo.layer_dir / "config.toml"
+        repo_only = ('[steps.build]\ntier = "fast"\ninstructions = ["repo"]\n'
+                     '[steps.review]\ntier = "fast"\ninstructions = ["repo"]\n')
+        layer_file.write_text(repo_only)
+        layer = config.load_layer(repo.layer_dir, strict=True)
+        setting = steps.resolve(cfg, layer, "review_repair", "fix")
+        route, = routing.Discovery(cfg, repo, layer=layer).routes(setting)
+        self.assertEqual((route.provider, route.state), ("openrouter", "ready"))
+        self.assertEqual(oncall.route_refusal(cfg, repo), ("", False))
+
+        layer_file.write_text(repo_only + '[steps.review_repair]\ninstructions = ["user", "repo"]\n')
+        why, lasting = oncall.route_refusal(cfg, repo)
+        self.assertIn("review_repair: instructions user cannot load", why)
+        self.assertTrue(lasting)
+
+    def test_turn_environment_uses_only_the_openrouter_auth(self):
+        self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": self.plan_token}))
+        cfg, settings = self.settings()
+        self.child()
+        res = self.call(cfg, settings, trace=("fixture-run", "plan"), extra_env={
+            "CLAUDE_CODE_OAUTH_TOKEN": "injected-oauth", "ANTHROPIC_CUSTOM_HEADERS": "Authorization: fixture",
+            "CLAUDE_CODE_USE_BEDROCK": "1", "OPENROUTER_API_KEY": "injected-key",
+        })
+        self.assertTrue(res.ok, res.error)
+        (cmd, env), = self.launches
+        self.assertEqual(env["ANTHROPIC_BASE_URL"], "https://openrouter.ai/api")
+        self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], self.key)
+        self.assertEqual(env["ANTHROPIC_API_KEY"], "")
+        self.assertEqual(env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"], "1")
+        for name in ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_FABLE_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                     "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL"):
+            self.assertEqual(env[name], self.model)
+        for name in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS", "CLAUDE_CODE_USE_BEDROCK",
+                     "OPENROUTER_API_KEY"):
+            self.assertNotIn(name, env)
+        self.assertNotIn(self.plan_token, env.values())
+        folder = Path(env["CLAUDE_CONFIG_DIR"])
+        self.assertEqual(folder.parent, paths.RUNS_DIR / "fixture-run")
+        self.assertTrue(folder.is_dir())
+        self.assertNotEqual(folder, Path.home() / ".claude")
+        self.assertFalse((folder / ".credentials.json").exists())
+        self.assertEqual(cmd[cmd.index("--setting-sources") + 1], "project,local")
+
+    def test_openrouter_pins_provider_routing_at_launch(self):
+        cfg, settings = self.settings()
+        self.child()
+        other_providers = dict.fromkeys((
+            "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+            "CLAUDE_CODE_USE_ANTHROPIC_AWS", "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+            "CLAUDE_CODE_USE_MANTLE", "CLAUDE_CODE_USE_GATEWAY",
+        ), "1")
+        res = self.call(cfg, settings, extra_env={
+            **other_providers, "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST": "0",
+            "ANTHROPIC_BASE_URL": "https://redirect.invalid/api",
+        })
+        self.assertTrue(res.ok, res.error)
+        (cmd, env), = self.launches
+        self.assertEqual(env.get("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"), "1")
+        self.assertEqual(env["ANTHROPIC_BASE_URL"], "https://openrouter.ai/api")
+        self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], self.key)
+        self.assertFalse(other_providers.keys() & env.keys())
+        self.assertEqual(cmd[cmd.index("--setting-sources") + 1], "project,local")
+
+    def test_custom_claude_profile_stays_protected_on_openrouter(self):
+        profile = self.root / "owner's Claude profile"
+        profile.mkdir()
+        login = profile / ".credentials.json"
+        login.write_text('{"claudeAiOauth": {"accessToken": "fictional-login"}}')
+        self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.root), "CLAUDE_CONFIG_DIR": str(profile)}))
+        self.child()
+        native = f'{{ runner = "claude", model = "{self.anthropic_model}" }}'
+        isolated = paths.RUNS_DIR / "fixture-run" / "claude-openrouter"
+        for link, config_dir in ((native, profile), (None, isolated)):
+            with self.subTest(config_dir=config_dir.name):
+                cfg, settings = self.settings(link, step="build", routing_toml="[jev]\nguard = false\n")
+                res = self.call(cfg, settings, trace=("fixture-run", "build"), tools=("Bash",),
+                                allowed_tools=["Bash(cat *)"])
+                self.assertTrue(res.ok, res.error)
+                cmd, env = self.launches[-1]
+                self.assertEqual(env["CLAUDE_CONFIG_DIR"], str(config_dir))
+                hooks = json.loads(cmd[cmd.index("--settings") + 1])["hooks"]["PreToolUse"]
+                hook, = (hook for group in hooks if "Bash" in group["matcher"].split("|") for hook in group["hooks"])
+                payload = {"cwd": str(self.repo), "tool_name": "Bash",
+                           "tool_input": {"command": shlex.join(["cat", str(login)])}}
+                decision = util.sh(shlex.split(hook["command"]), cwd=self.repo, env=env, inherit=False,
+                                   input=json.dumps(payload))
+                self.assertEqual(decision.returncode, 0, decision.stderr)
+                reply = json.loads(decision.stdout or "{}")
+                self.assertEqual(reply.get("hookSpecificOutput", {}).get("permissionDecision"), "deny", decision.stdout)
+
+    def test_success_with_model_warning_is_recorded_at_the_quote(self):
+        cfg, settings = self.settings()
+        self.child(stderr=f'[claude-code:unrecognized_model] {{"model":"{self.model}","query_source":"sdk"}}\n')
+        res = self.call(cfg, settings, trace=("fixture-run", "plan"))
+        self.assertTrue(res.ok, res.error)
+        self.assertEqual(len(self.launches), 1)
+        self.assertEqual(res.cost_usd, 0.024)
+        self.assertEqual(res.paid_usd, 0.024)
+        self.assertEqual(res.session.spent_usd, 0.024)
+        (charged, _), = self.ledger.call_args.args[2]
+        self.assertEqual(charged.cost_usd, 0.024)
+        path = paths.record_dir("fixture-run") / res.record
+        rows = list(record.lines(path))
+        self.assertEqual(rows[0]["provider"], "openrouter")
+        self.assertEqual(rows[-1]["provider"], "openrouter")
+        self.assertTrue(rows[-1]["ok"])
+        self.assertEqual(rows[-1]["cost_usd"], 0.024)
+        usage, = (event for event in record.events(path) if event["kind"] == "usage")
+        self.assertEqual(usage["cost_usd"], 0.024)
+        self.assertNotIn(self.key, json.dumps(rows))
+
+    def test_dollar_limit_uses_the_quote_for_streamed_usage(self):
+        cfg, settings = self.settings()
+        self.child(stream_usage=True)
+        res = self.call(cfg, settings, max_budget_usd=0.020, hard_cap=True)
+        self.assertFalse(res.ok)
+        self.assertIn("stopped at the $0.0200 left", res.error)
+        self.assertEqual(res.cost_usd, 0.024)
+        (cmd, _), = self.launches
+        self.assertNotIn("--max-budget-usd", cmd)
+
+    def test_resume_keeps_the_config_and_rejects_other_routes(self):
+        self.listing(cache_write=0.3)
+        cfg, settings = self.settings()
+        self.child(cache_write=10_000)
+        first = self.call(cfg, settings, trace=("first-run", "plan"))
+        self.assertTrue(first.ok, first.error)
+        self.assertEqual(first.cost_usd, 0.027)
+        saved = factory.outcome_of({"session": asdict(first.session)}).session
+        again = self.call(cfg, settings, trace=("next-run", "plan"), resume=saved, resume_only=True)
+        self.assertTrue(again.ok, again.error)
+        self.assertEqual(again.session.id, saved.id)
+        self.assertEqual(again.session.spent_usd, 0.054)
+        (first_cmd, first_env), (again_cmd, again_env) = self.launches
+        self.assertNotIn("--resume", first_cmd)
+        self.assertEqual(again_cmd[again_cmd.index("--resume") + 1], saved.id)
+        self.assertEqual(again_env["CLAUDE_CONFIG_DIR"], first_env["CLAUDE_CONFIG_DIR"])
+        for link in ('{ runner = "claude", provider = "openrouter", model = "other/model" }',
+                     f'{{ runner = "claude", model = "{self.anthropic_model}" }}'):
+            with self.subTest(link=link):
+                different_cfg, different = self.settings(link)
+                res = self.call(different_cfg, different, resume=saved, resume_only=True)
+                self.assertFalse(res.ok)
+                self.assertIn("kept session cannot continue", res.error)
+        self.assertEqual(len(self.launches), 2)
+
+    def test_anthropic_routes_and_api_key_are_preserved(self):
+        cfg, settings = self.settings(f'{{ runner = "claude", model = "{self.anthropic_model}" }}',
+                                      instructions=("user", "repo"))
+        routes = routing.Discovery(cfg).routes(settings)
+        self.assertEqual([(r.runner, r.credential, r.provider, r.state) for r in routes], [
+            ("claude", "cli_login", "anthropic", "ready"), ("claude", "cli_key", "anthropic", "ready"),
+            ("pi", "pi_key", "anthropic", "incompatible"),
+        ])
+        self.status.return_value = {}
+        self.child()
+        res = self.call(cfg, settings)
+        self.assertTrue(res.ok, res.error)
+        self.assertEqual(res.credential, "cli_key")
+        (_, env), = self.launches
+        self.assertEqual(env["ANTHROPIC_API_KEY"], self.anthropic_key)
+        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", env)
+        self.assertNotIn("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST", env)
+
+    def test_openrouter_runs_as_a_fallback_when_native_routes_are_unavailable(self):
+        link = (f'[{{ runner = "claude", model = "{self.anthropic_model}" }}, '
+                f'{{ runner = "pi", model = "openrouter/{self.model}" }}, '
+                f'{{ runner = "claude", provider = "openrouter", model = "{self.model}" }}]')
+        cfg, settings = self.settings(link, step="verify")
+        self.keys.write_text(f"OPENROUTER_API_KEY={self.key}\n")
+        os.environ["ANTHROPIC_API_KEY"] = ""
+        self.status.return_value = {}
+        self.child()
+        res = self.call(cfg, settings)
+        self.assertTrue(res.ok, res.error)
+        self.assertEqual((res.runner, res.model, res.provider), ("claude", self.model, "openrouter"))
+        self.assertEqual(len(self.launches), 1)
