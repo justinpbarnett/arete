@@ -116,7 +116,7 @@ class RunnerOutputTests(unittest.TestCase):
     def test_a_class_that_times_out_alone_keeps_its_timeout_report_by_its_traceback(self):
         code, output = self.run_suite("test_sample.Sleeper")
         self.assertEqual(code, 1, output)
-        self.assertRegex(output, r"(?m)^class exceeded (?:1s|[\d.]+s \(deadline 1s x load [\d.]+\))$")
+        self.assertRegex(output, r"(?m)^class exceeded (?:1\.5s|[\d.]+s \(deadline 1\.5s x load [\d.]+\))$")
         self.assertIn("test_sample.Sleeper", output)
         self.assertIn("Python class stack", output)
         self.assertIn("in test_hangs", output)
@@ -128,7 +128,7 @@ class RunnerFailureSummaryTests(unittest.TestCase):
     crowded = "test_sample.Crowded"
     crowded_stack = "in test_crowded_timeout"
     crowded_note = (f"{crowded}: ran past its deadline on its first run, "
-                    "then passed alone within twice its deadline in 0.10s")
+                    "then passed alone within three times its deadline in 0.10s")
 
     def report(self, **details):
         return {"ran": 1, "errors": [], "failures": [], "skipped": [], "unexpected": [],
