@@ -8020,6 +8020,25 @@ class ServeStatusTests(unittest.TestCase):
         self.check_revisions({**self.env, "ARETE_VERIFY_SCRATCH": str(scratch)}, scratch / "state")
 
 
+class ServeLoopCountsTests(unittest.TestCase):
+    def test_serve_line_labels_loop_counts(self):
+        from arete.commands.common import serve_line
+
+        beat = {"alive": True, "pid": 123, "loops": 2, "off": 0}
+        cases = (
+            (0, 2, "0 loop runs running, 2 loop fires waiting"),
+            (1, 1, "1 loop run running, 1 loop fire waiting"),
+            (None, None, "unknown loop runs running, unknown loop fires waiting"),
+        )
+        for running, pending, expected in cases:
+            with self.subTest(running=running, pending=pending):
+                self.assertIn(expected, serve_line(dict(beat, running=running, pending=pending)))
+
+    def test_web_serve_sentence_labels_loop_counts(self):
+        source = (Path(__file__).resolve().parents[1] / "arete" / "web" / "loops.js").read_text()
+        self.assertRegex(source, r"Serve is up since[^\n]*loop runs? running, [^\n]*loop fires? waiting")
+
+
 class SavedRunPolicyTests(unittest.TestCase):
     def test_pre_upgrade_lineage_accepts_unchanged_policy_and_refuses_changes(self):
         repo = config.Repo("fixture", Path("/fixture/repo"), github="fixture/repo")
