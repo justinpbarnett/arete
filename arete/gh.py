@@ -397,7 +397,11 @@ def pr_diff(url: str) -> str:
 
 
 def pr_edit_body(url: str, body: str, link: str = "") -> None:
-    gh(["pr", "edit", url, "--body-file", "-"], input=outgoing(body, link))
+    pr_write_body(url, outgoing(body, link))
+
+
+def pr_write_body(url: str, body: Outgoing) -> None:
+    gh(["pr", "edit", url, "--body-file", "-"], input=body)
 
 
 def pr_comment(url: str, body: str, *, key: str = "", single_attempt: bool = False) -> None:
