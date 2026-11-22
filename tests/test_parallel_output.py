@@ -116,7 +116,7 @@ class RunnerOutputTests(unittest.TestCase):
     def test_a_class_that_times_out_alone_keeps_its_timeout_report_by_its_traceback(self):
         code, output = self.run_suite("test_sample.Sleeper")
         self.assertEqual(code, 1, output)
-        self.assertIn("class exceeded 1s", output)
+        self.assertRegex(output, r"(?m)^class exceeded (?:1s|[\d.]+s \(deadline 1s x load [\d.]+\))$")
         self.assertIn("test_sample.Sleeper", output)
         self.assertIn("Python class stack", output)
         self.assertIn("in test_hangs", output)

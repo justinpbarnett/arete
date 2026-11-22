@@ -39,8 +39,110 @@ from arete.agent import NO_SESSION, Result
 from arete.orchestration_api import OPERATIONS, help_text
 from arete.review import Review, catch_up_problems
 from arete.store import db, orchestration as ledger
+from tests import parallel
 from tests.parallel import stack_env
 from tests.subprocess_helpers import CHILD_HANG_TIMEOUT
+
+
+class ParallelClassDeadlineTests(unittest.TestCase):
+    def run_first_attempt(self, load_ratio):
+        folder = self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True))
+        (Path(folder) / "deadline_worker.py").write_text(
+            "import time\n"
+            "import unittest\n\n"
+            "class Sleeper(unittest.TestCase):\n"
+            "    class_timeout = 1\n\n"
+            "    def test_sleep(self):\n"
+            "        time.sleep(1.5)\n"
+        )
+        batch = parallel.Batch("deadline_worker.Sleeper", 1, timeout=1)
+        runner = parallel.Runner(SimpleNamespace(start=folder, timeout=None, verbose=False))
+        runner.folder = folder
+        runner.lifeline, held = os.pipe()
+        self.addCleanup(os.close, runner.lifeline)
+        self.addCleanup(os.close, held)
+        load = load_ratio * os.cpu_count()
+        with mock.patch.object(os, "getloadavg", return_value=(load, 0, 0)) as getloadavg:
+            runner.child((0, batch))
+            getloadavg.assert_called_once_with()
+        return runner.results[batch.identifier]
+
+    def run_class(self, load, *, cpu_count=8, timeout=None, stretch=1):
+        class Sleeper(unittest.TestCase):
+            class_timeout = 1
+
+            def test_sleep(self):
+                time.sleep(1.5)
+
+        runner = parallel.Runner(SimpleNamespace(start="tests", timeout=timeout, verbose=False))
+        runner.folder = "worker-reports"
+        runner.lifeline = 0
+        batch = parallel.Batch("Sleeper", 1, timeout=Sleeper.class_timeout)
+        process = mock.Mock(returncode=0)
+        result = None
+
+        def open_report(path, mode="r"):
+            if mode == "w":
+                return StringIO()
+            if result is not None:
+                return StringIO(result)
+            raise FileNotFoundError(path)
+
+        def wait(deadline=None):
+            nonlocal result
+            if deadline is None:
+                return
+
+            def sleep(seconds):
+                if seconds > deadline:
+                    raise subprocess.TimeoutExpired(batch.identifier, deadline)
+
+            with mock.patch.object(time, "sleep", side_effect=sleep):
+                Sleeper("test_sleep").test_sleep()
+            result = json.dumps(dict(ran=1, errors=[], failures=[], skipped=[], unexpected=[]))
+
+        def start(*args, **kwargs):
+            getloadavg.assert_called_once_with()
+            return process
+
+        process.wait.side_effect = wait
+        load_sample = {"side_effect": load} if isinstance(load, OSError) else {"return_value": (load, 0, 0)}
+        with (mock.patch.object(os, "cpu_count", return_value=cpu_count),
+              mock.patch.object(os, "getloadavg", **load_sample) as getloadavg,
+              mock.patch.object(subprocess, "Popen", side_effect=start),
+              mock.patch.object(parallel, "open", side_effect=open_report, create=True),
+              mock.patch.multiple(runner, kill=mock.DEFAULT, output=mock.Mock(return_value=""),
+                                  request_stacks=mock.Mock(return_value=[]))):
+            runner.child((0, batch), stretch=stretch)
+            getloadavg.assert_called_once_with()
+        return runner.results[batch.identifier], process.wait.call_args_list[0].args[0]
+
+    def test_double_load_passes_on_first_run(self):
+        report = self.run_first_attempt(2)
+        self.assertFalse(parallel.failed(report), report)
+        self.assertEqual(report["ran"], 1)
+
+    def test_half_load_times_out_on_first_run(self):
+        report = self.run_first_attempt(0.5)
+        self.assertIn("class exceeded 1s", report["timeout"].splitlines(), report)
+        self.assertIn("in test_sleep", report["timeout"])
+
+    def test_factor_is_capped_at_four(self):
+        report, deadline = self.run_class(80)
+        self.assertEqual(deadline, 4)
+        self.assertFalse(parallel.failed(report))
+
+    def test_unavailable_load_or_cpu_count_uses_unscaled_deadline(self):
+        for load, cpu_count in ((OSError("unavailable"), 8), (16, None)):
+            with self.subTest(load=load, cpu_count=cpu_count):
+                report, deadline = self.run_class(load, cpu_count=cpu_count)
+                self.assertEqual(deadline, 1)
+                self.assertIn("class exceeded 1s", report["timeout"].splitlines())
+
+    def test_scaled_timeout_reports_deadline_and_factor_for_stretched_override(self):
+        report, deadline = self.run_class(10.56, timeout=0.375, stretch=2)
+        self.assertAlmostEqual(deadline, 0.99)
+        self.assertIn("class exceeded 0.99s (deadline 0.75s x load 1.32)", report["timeout"].splitlines())
 
 
 class QueueScoringTests(unittest.TestCase):
