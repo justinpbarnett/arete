@@ -44,6 +44,7 @@ from arete import (
     prompt_loader,
     record,
     repairs,
+    requeue,
     run_lines,
     runlimits,
     sandbox,
@@ -1148,6 +1149,106 @@ class OrchestrationLineageTests(Isolated):
                         self.assertEqual((row["status"], row["run_id"]), ("new", None))
                     self.assertEqual(insights_store.feedback_due(self.repo.name, "2026-01-01T00:10:00Z"),
                                      [] if launched else [self.ticket])
+
+
+class ControllerStallTests(Isolated):
+    STALL = {"ok": False, "error": "timed out after 120s", "turns": 0, "cost_usd": 0, "paid_usd": 0}
+
+    def setUp(self):
+        super().setUp()
+        self.patches.enter_context(patch.object(pipeline, "workspace_note", return_value="Fixture workspace"))
+        run = self.made_run()
+        run.path = "orchestrate"
+        self.controller = orchestration.Controller(flows.start(self.cfg, run, {}, continues=""))
+        outcome = factory.Outcome("pass", data={
+            "layer": str(self.repo.layer_dir), "checkouts": [], "ticket": asdict(self.local.get(self.ticket)),
+            "branch": "fixture", "add_dirs": [], "attachments": "", "expertise": "", "triage": "",
+        })
+
+        def prepare_step(*args, **kwargs):
+            self.controller.job.take("prepare", outcome, stored=False)
+            return outcome
+
+        with patch.object(self.controller, "atomic", side_effect=prepare_step):
+            self.assertIsNone(self.controller.prepare())
+        first = self.controller.run.settings("orchestrate")
+        later = replace(first.chain[0], runner="codex", model="gpt-5.5", provider="openai", position=1,
+                        requested=False)
+        self.settings = replace(first, chain=(first.chain[0], later))
+        self.controller.run.resolved_settings["orchestrate"] = self.settings
+
+    def decision(self, turn):
+        response = {"version": PROTOCOL, "decision_id": turn, "rationale": "",
+                    "state_version": ledger.snapshot(self.controller.lease)["version"],
+                    "calls": [{"op": "run.wait", "args": {"timeout_seconds": 0}}]}
+        return {"ok": True, "structured": response, "turns": 1}
+
+    def decide(self, *replies):
+        asked = []
+
+        def make(run, turn, request):
+            worker = Mock(pid=123, identity=456)
+            reply = replies[len(asked)]
+            worker.receive.return_value = [reply(turn) if callable(reply) else reply]
+            asked.append(turn)
+            return worker
+
+        def request(job, turn, prompt, setting, *rest):
+            seen.append(setting)
+            return {}
+
+        seen = []
+        with (patch.object(delegation, "request", side_effect=request),
+              patch.object(delegation, "Worker", side_effect=make)):
+            try:
+                return self.controller.decide(), asked, seen
+            except workspace.RunFailed as error:
+                return error, asked, seen
+
+    def test_a_stalled_first_turn_asks_again_and_applies_the_decision(self):
+        actions, asked, seen = self.decide(self.STALL, self.decision)
+        action, = actions
+        self.assertEqual(action["request"]["timeout_seconds"], 0)
+        self.assertEqual(asked, ["d0001", "d0001"])
+        self.assertEqual(seen, [self.settings, self.settings])
+        snapshot = ledger.snapshot(self.controller.lease)
+        self.assertEqual((snapshot["turns"], snapshot["launches"]), (1, 0))
+        self.assertEqual(self.controller.run.budget.repair_calls, 0)
+        self.assertNotIn("error", self.controller.data)
+
+    def test_a_stall_on_the_same_route_moves_to_the_next_route_in_the_chain(self):
+        actions, asked, seen = self.decide(self.STALL, self.STALL, self.decision)
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(asked, ["d0001"] * 3)
+        self.assertEqual([(s.runner, s.model) for s in seen],
+                         [(self.settings.runner, self.settings.model)] * 2 + [("codex", "gpt-5.5")])
+        self.assertEqual(ledger.snapshot(self.controller.lease)["turns"], 1)
+
+    def test_a_stall_on_every_route_fails_as_an_environment_failure_that_requeue_clears_later(self):
+        error, asked, seen = self.decide(self.STALL, self.STALL, self.STALL)
+        self.assertIsInstance(error, workspace.RunFailed)
+        self.assertEqual(asked, ["d0001"] * 3)
+        self.assertEqual(error.why, "timed out after 120s")
+        run = self.controller.run
+        pipeline._fail(run, error.why, recovery=error.recovery)
+        self.assertEqual(run.failure, {"class": "environment", "reason": "controller-stall"})
+        finished = datetime(2026, 11, 21, 12, 0, tzinfo=UTC)
+        row = {"failure": json.dumps(run.failure), "finished": util.iso(finished)}
+        self.assertEqual(requeue.recorded_failure(row), run.failure)
+        for minutes, cleared in ((9, False), (10, True)):
+            with self.subTest(minutes=minutes), patch.object(util, "now", return_value=finished + timedelta(minutes=minutes)):
+                self.assertIs(requeue.cleared(self.cfg, self.repo, config.RepoLayer(dir=Path()),
+                                              self.local.get(self.ticket), row, run.failure), cleared)
+
+    def test_a_turn_that_replied_and_then_failed_is_not_asked_again(self):
+        error, asked, seen = self.decide({**self.STALL, "turns": 2, "error": "provider closed the stream"})
+        self.assertEqual(asked, ["d0001"])
+        self.assertIsNone(error.recovery)
+
+    def test_a_stall_that_paid_for_usage_is_not_asked_again(self):
+        error, asked, seen = self.decide({**self.STALL, "paid_usd": 0.02})
+        self.assertEqual(asked, ["d0001"])
+        self.assertIsNone(error.recovery)
 
 
 class PolicyRestartLineageTests(Isolated):
