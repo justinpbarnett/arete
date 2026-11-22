@@ -5,7 +5,6 @@ import stat
 import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
-from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TextIO
 from urllib.parse import quote
@@ -24,7 +23,6 @@ SLOT_KINDS = ("pipeline", "experiment")
 FREED_SLOT_FOR_CI = "ci: freed the run slot for the wait"
 SLOT_POLL_SECONDS = 30
 CHECK_SLOT_POLL_SECONDS = 0.25
-CHECK_WAIT_OBSERVER = ContextVar("check_wait_observer", default=nullcontext)
 
 
 def holding(rows: list[dict], lock_kind: str, kinds: tuple[str, ...] = ("pipeline",)) -> list[dict]:
@@ -202,12 +200,6 @@ class CheckSlotSeeker:
 
 
 @contextmanager
-def waiting_for_check(run):
-    with CHECK_WAIT_OBSERVER.get()(), run.waiting("slot"):
-        yield
-
-
-@contextmanager
 def check_slot(run, *, parallel: bool):
     with ExitStack() as locks:
         directory = locks.enter_context(paths.directory_fd(paths.CHECK_LOCKS_DIR, create=True))
@@ -219,7 +211,7 @@ def check_slot(run, *, parallel: bool):
         seeker = CheckSlotSeeker(locks, directory, serial)
         lease, reason = seeker.take_free(limit)
         if lease is None:
-            with waiting_for_check(run):
+            with run.waiting("slot"):
                 run.log(f"checks: waiting for a check slot ({reason})")
                 while lease is None:
                     time.sleep(CHECK_SLOT_POLL_SECONDS)

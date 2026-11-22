@@ -538,8 +538,7 @@ def totals_of(found: list[dict]) -> Totals:
             used.spend += e.get("charged_usd") or 0
             used.calls += e.get("calls") or 0
             used.tokens += (e.get("tokens_in") or 0) + (e.get("tokens_out") or 0)
-            used.seconds += ((e.get("wall_seconds") or 0) + (e.get("wait_seconds") or 0)
-                             - (e.get("check_slot_seconds") or 0))
+            used.seconds += (e.get("wall_seconds") or 0) + (e.get("wait_seconds") or 0)
         elif e.get("event") == "setup" or (e.get("event") == "wait" and attempt_of(e) not in settled):
             used.seconds += e.get("seconds") or 0
     return used
@@ -635,7 +634,7 @@ def usage(exp: Experiment, arm: str, run_id: str) -> dict:
 
 def trial_line(exp: Experiment, path: Path, begun: dict, status: str, wall: float, accepted: bool = False,
                failures: list[str] | None = None, repairs: int = 0, outcomes: dict | None = None,
-               seen: dict | None = None, *, check_slot_seconds: float = 0) -> dict:
+               seen: dict | None = None) -> dict:
     task, arm = begun["task"], begun["arm"]
     seen = seen if seen is not None else begun["seen"]
     used = usage(exp, arm, begun["run"])
@@ -647,13 +646,12 @@ def trial_line(exp: Experiment, path: Path, begun: dict, status: str, wall: floa
             "base": exp.tasks[task].base, "arm": arm, "repeat": begun["repeat"], "attempt": begun["attempt"],
             "run": begun["run"], "status": status, "accepted": accepted, "failures": failures or [],
             "repairs": repairs, "fingerprints": seen["fingerprints"], "engine": seen["engine"],
-            **(outcomes or {}), **used, "wall_seconds": round(wall, 2),
-            "check_slot_seconds": round(check_slot_seconds, 2)}
+            **(outcomes or {}), **used, "wall_seconds": round(wall, 2)}
 
 
-def last_alive(found: list[dict], run_id: str) -> dict:
-    return max((e for e in found if e.get("event") == "alive" and e.get("run") == run_id),
-               key=lambda e: e.get("seconds") or 0, default={})
+def last_alive(found: list[dict], run_id: str) -> float:
+    return max((e.get("seconds") or 0 for e in found if e.get("event") == "alive" and e.get("run") == run_id),
+               default=0.0)
 
 
 def settle_interrupted(exp: Experiment, path: Path) -> None:
@@ -664,14 +662,7 @@ def settle_interrupted(exp: Experiment, path: Path) -> None:
         outcomes = exp.recovered(begun["run"]) if exp.recovered else {}
         if exp.executors:
             outcomes = {**(outcomes or {}), "executor": exp.executors[begun["arm"]], "usage_unknown": True}
-        checkpoint = last_alive(found, begun["run"])
-        append(path, trial_line(exp, path, begun, "interrupted", checkpoint.get("seconds") or 0, outcomes=outcomes,
-                                check_slot_seconds=checkpoint.get("check_slot_seconds") or 0))
-
-
-def slot_wait_seconds(wait: tuple[float, float | None], now: float) -> float:
-    elapsed, since = wait
-    return elapsed + (max(0, now - since) if since is not None else 0)
+        append(path, trial_line(exp, path, begun, "interrupted", last_alive(found, begun["run"]), outcomes=outcomes))
 
 
 @dataclass
@@ -683,7 +674,6 @@ class TrialRun(evals.EvalRun):
     stopped_by: str = ""
     pinned: config.RepoLayer | None = None
     follow: bool = False
-    check_wait: tuple[float, float | None] = field(default=(0.0, None), init=False)
 
     def outcomes(self) -> dict:
         return self.execution
@@ -691,27 +681,9 @@ class TrialRun(evals.EvalRun):
     def used(self) -> Totals:
         rows = run_store.steps(self.id)
         paid = run_store.paid_by_run([self.id], local_providers=self.config.local_providers).get(self.id, 0.0)
-        now = time.monotonic()
         return Totals(self.before.spend + paid, self.before.calls + len(rows),
                       self.before.tokens + sum((r["tokens_in"] or 0) + (r["tokens_out"] or 0) for r in rows),
-                      self.before.seconds + now - self.began - self.check_slot_seconds(now))
-
-    def check_slot_seconds(self, now: float) -> float:
-        return slot_wait_seconds(self.check_wait, now)
-
-    @contextmanager
-    def waiting(self, cause: str):
-        elapsed, since = self.check_wait
-        if cause != "slot" or since is not None:
-            with super().waiting(cause):
-                yield
-            return
-        self.check_wait = elapsed, time.monotonic()
-        try:
-            with super().waiting(cause):
-                yield
-        finally:
-            self.check_wait = self.check_slot_seconds(time.monotonic()), None
+                      self.before.seconds + time.monotonic() - self.began)
 
     def seconds_left(self) -> float:
         return seconds_left(self.limits, self.used())
@@ -839,13 +811,11 @@ def trial_overrides(exp: Experiment, arm: str) -> dict[str, dict]:
 
 
 @contextmanager
-def alive(path: Path, trial: TrialRun, started: float):
+def alive(path: Path, run_id: str, started: float):
     def beat() -> None:
-        now = time.monotonic()
-        append(path, {"event": "alive", "run": trial.id, "seconds": round(now - started, 2),
-                      "check_slot_seconds": round(trial.check_slot_seconds(now), 2)})
+        append(path, {"event": "alive", "run": run_id, "seconds": round(time.monotonic() - started, 2)})
 
-    with util.repeating(ALIVE_SECONDS, beat, f"experiment {trial.id}"):
+    with util.repeating(ALIVE_SECONDS, beat, f"experiment {run_id}"):
         yield
 
 
@@ -882,7 +852,7 @@ def run_trial(exp: Experiment, path: Path, task: str, arm: str, repeat: int, use
             trial = exp.make_run(exp, arm, given) if exp.make_run else TrialRun(**given)
             trial.dir.mkdir(parents=True, exist_ok=True)
             try:
-                with alive(path, trial, started), replay_folder(exp, task, arm, repeat):
+                with alive(path, run_id, started), replay_folder(exp, task, arm, repeat):
                     extra = exp.extras.get(arm, {})
                     prompts = evals.Prompts(Path(extra["prompts"]), paths.short_path(extra["prompts"])) \
                         if "prompts" in extra else evals.Prompts()
@@ -891,9 +861,8 @@ def run_trial(exp: Experiment, path: Path, task: str, arm: str, repeat: int, use
                 seen = observed(exp, arm)
             except (KeyboardInterrupt, pipeline.Stopped):
                 record.settle(run_id, "stopped", summary=record.STOPPED)
-                now = time.monotonic()
-                append(path, trial_line(exp, path, begun, "interrupted", now - started, outcomes=trial.outcomes(),
-                                        check_slot_seconds=trial.check_slot_seconds(now)))
+                append(path, trial_line(exp, path, begun, "interrupted", time.monotonic() - started,
+                                        outcomes=trial.outcomes()))
                 raise
             failures = result.failures or ([result.why] if result.why else [])
             changed = drift(exp, arm, seen)
@@ -902,16 +871,14 @@ def run_trial(exp: Experiment, path: Path, task: str, arm: str, repeat: int, use
             record.settle(run_id, "stopped" if stopped_by else "done",
                           summary=stopped_by if stopped_by else "accepted" if result.passed
                           else f"not accepted: {util.first_line(result.why, 200)}")
-            now = time.monotonic()
             append(path, trial_line(exp, path, begun, "drifted" if changed else "capped" if stopped_by else "done",
-                                    now - started,
+                                    time.monotonic() - started,
                                     result.passed and not stopped_by, failures, result.repairs,
                                     {"checks": result.checks, "verify": result.verify,
                                      "hidden_check": result.hidden, "blocking_findings": result.blocking,
                                      **trial.outcomes(),
                                      **({"drift": changed} if changed else {}),
-                                     **(overrun(exp.limits, trial.used()) if stopped_by else {})}, seen=seen,
-                                    check_slot_seconds=trial.check_slot_seconds(now)))
+                                     **(overrun(exp.limits, trial.used()) if stopped_by else {})}, seen=seen))
             return stopped_by
     finally:
         held.close()

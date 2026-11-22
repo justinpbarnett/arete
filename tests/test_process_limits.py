@@ -6,7 +6,6 @@ import select
 import shlex
 import shutil
 import signal
-import socket
 import sqlite3
 import subprocess
 import sys
@@ -59,7 +58,6 @@ from arete import (
     zte,
 )
 from arete.agent import Result, Session
-from arete.lab import experiment, workflows
 from arete.orchestration_api import MAX_BYTES, OPERATIONS, PROMPTS, PROTOCOL, Catalog, describe_operations
 from arete.store import asks as ask_store
 from arete.store import db as foundation
@@ -417,73 +415,60 @@ pipeline = true
             with self.assertRaisesRegex(pilot.Held, "the admitted ZTE config changed"):
                 zte.for_run(repo, delivery.task, run_id, "running")
 
-    def test_experiment_check_slot_wait_does_not_consume_trial_time(self):
-        limits = {"minutes": 1, "spend_usd": 1, "calls": 1, "tokens": 1}
-        trial = experiment.TrialRun("trial", self.repo, self.root, cfg=self.cfg, limits=limits,
-                                    began=100, before=experiment.Totals(seconds=58), writes_lines=False)
+    def test_check_with_redirected_background_helper_returns_zero_within_a_second(self):
+        pid_file = self.root / "helper-pid"
+        command = f"sleep 30 </dev/null >/dev/null 2>&1 & echo $! > {shlex.quote(str(pid_file))}"
+        layer = config.RepoLayer(self.repo.path, checks={"behavior": command}, parallel_checks=True)
+        run = pipeline.AgentRun("redirected", self.repo, self.root, cfg=self.cfg, writes_lines=False)
+        began = time.monotonic()
+        try:
+            ok, report = pipeline.run_checks(layer, self.repo.path, [], run, 5)
+            elapsed = time.monotonic() - began
+        finally:
+            if pid_file.exists():
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(int(pid_file.read_text()), signal.SIGKILL)
+        self.assertTrue(ok, report)
+        self.assertLess(elapsed, 1)
+        self.assertNotIn("124", report)
+
+    def test_admission_lock_held_by_another_process_is_a_logged_wait_that_is_not_charged(self):
+        with paths.directory_fd(paths.CHECK_LOCKS_DIR, create=True):
+            pass
+        holder_code = ("import fcntl, os, sys\n"
+                       "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)\n"
+                       "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+                       "print('held', flush=True)\n"
+                       "sys.stdin.read()\n")
+        holder = subprocess.Popen(
+            [sys.executable, "-I", "-c", holder_code, str(paths.CHECK_LOCKS_DIR / slots.CHECK_SLOTS_LOCK)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(holder.stdout.close)
+        self.addCleanup(holder.kill)
+        self.assertTrue(select.select([holder.stdout], [], [], self.sync_timeout)[0])
+        self.assertEqual(holder.stdout.readline().strip(), "held")
         layer = config.RepoLayer(self.repo.path, checks={"behavior": "fixture"}, parallel_checks=True)
         clock = [100.0]
-        with contextlib.ExitStack() as held:
-            held.enter_context(slots.check_slot(SimpleNamespace(config=self.cfg), parallel=True))
 
-            def wait_for_slot(_):
-                clock[0] += 65
-                held.close()
+        def execute(command, *args, timeout, **kw):
+            run.budget.charge("checks", "checks")
+            self.assertEqual(run.budget.run_seconds(), 0)
+            return subprocess.CompletedProcess(command, 0, "", "")
 
-            with (patch.object(experiment, "time", SimpleNamespace(monotonic=lambda: clock[0])),
-                  patch.object(slots, "time", SimpleNamespace(sleep=wait_for_slot)),
-                  patch.object(pipeline.environment, "sh", return_value=subprocess.CompletedProcess([], 0, "", "")) as sh):
-                self.assertTrue(pipeline.run_checks(layer, self.repo.path, [], trial, 3)[0])
-                self.assertEqual(sh.call_args.kwargs["timeout"], 2)
-                self.assertEqual(trial.used().seconds, 58)
-        used = experiment.totals_of([{"event": "trial", "wall_seconds": 66,
-                                      "check_slot_seconds": trial.check_slot_seconds(clock[0])}])
-        self.assertEqual(used.seconds, 1)
+        def wait_for_admission(_):
+            clock[0] += 65
+            holder.stdin.close()
+            holder.wait(timeout=self.sync_timeout)
 
-    def test_whole_workflow_check_wait_preserves_the_process_and_launch_budgets(self):
-        limits = {"minutes": 1, "spend_usd": 1, "calls": 1, "tokens": 10}
-        trial = experiment.TrialRun("trial", self.repo, self.root, cfg=self.cfg, limits=limits, began=100)
-        clock = [100.0]
-        process = Mock(args=["fixture"])
-        process.poll.side_effect = [None, None, 0]
+        with (patch.object(runlimits, "time", SimpleNamespace(monotonic=lambda: clock[0])),
+              patch.object(pipeline.environment, "sh", side_effect=execute),
+              patch.object(slots, "time", SimpleNamespace(sleep=wait_for_admission))):
+            run = self.made_run()
+            run.budget.deadline = clock[0] + 60
+            self.assertTrue(pipeline.run_checks(layer, self.repo.path, [], run, 3)[0])
 
-        def wait(timeout):
-            if process.wait.call_count == 1:
-                with candidate.waiting_for_check():
-                    clock[0] += 65
-                    workflows.receive_check_wait(receiver, trial, 102)
-                    self.assertEqual(trial.check_wait, (0, 100))
-                raise subprocess.TimeoutExpired(process.args, timeout)
-            return 0
-
-        process.wait.side_effect = wait
-        receiver, sender = socket.socketpair(type=socket.SOCK_DGRAM)
-        with receiver, sender, patch.object(workflows, "time", SimpleNamespace(monotonic=lambda: clock[0])):
-            candidate = workflows.CandidateBudget(limits, self.repo.name, self.ticket, self.root, 1, sender)
-            workflows.wait_for_candidate(process, trial, receiver, 2)
-            self.assertEqual(process.wait.call_count, 2)
-            self.assertEqual(trial.check_slot_seconds(clock[0]), 65)
-            self.assertEqual(candidate.admit("build", "build", {"runner": "pi"})["timeout"], 60)
-
-    def test_whole_workflow_ignores_repository_marker_and_wait_begun_after_deadline(self):
-        trial = experiment.TrialRun("trial", self.repo, self.root, cfg=self.cfg, began=100)
-        clock = [100.0]
-        process = Mock(args=["fixture"])
-        process.poll.return_value = None
-
-        def wait(timeout):
-            (self.root / "check-wait.json").write_text("[120, 100]")
-            clock[0] = 103
-            sender.send(workflows.CHECK_WAIT_EVENT.pack(clock[0], True))
-            raise subprocess.TimeoutExpired(process.args, timeout)
-
-        process.wait.side_effect = wait
-        receiver, sender = socket.socketpair(type=socket.SOCK_DGRAM)
-        with receiver, sender, patch.object(workflows, "time", SimpleNamespace(monotonic=lambda: clock[0])):
-            with self.assertRaises(subprocess.TimeoutExpired):
-                workflows.wait_for_candidate(process, trial, receiver, 2)
-        self.assertEqual(process.wait.call_count, 1)
-        self.assertEqual(trial.check_slot_seconds(clock[0]), 0)
+        self.assertEqual(run.budget.idled, 65)
+        self.assertIn("waiting for a check slot (another run is admitting checks)", (run.dir / "run.log").read_text())
 
     LEFT_BEHIND_HELPER = """\
 import os, sys, time
@@ -599,37 +584,6 @@ else:
             self.assertFalse(self.held("checks-0"))
         finally:
             release.touch()
-
-    def test_generated_checks_script_takes_a_check_slot_and_logs_the_wait(self):
-        folder, ran = self.root / "script-run", self.root / "script-ran"
-        folder.mkdir()
-        layer = config.RepoLayer(self.repo.path, checks={"behavior": f"touch {shlex.quote(str(ran))}; exit 3"},
-                                 parallel_checks=True)
-        commands, rules = pipeline.check_script(folder, layer, self.repo.path, "fixture#7")
-        script = folder / pipeline.CHECKS_SCRIPT
-        self.assertEqual(commands, [shlex.join([str(script), "behavior"])])
-        self.assertEqual(rules, [f"{shlex.quote(str(script))} *"])
-        with contextlib.ExitStack() as occupied:
-            occupied.enter_context(slots.check_slot(SimpleNamespace(config=self.cfg), parallel=True))
-            env = {key: value for key, value in os.environ.items() if key != paths.SCRATCH_ENV}
-            child = subprocess.Popen([str(script), "behavior"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                     text=True, env=env)
-            self.addCleanup(lambda: child.poll() is None and child.kill())
-            log = folder / "run.log"
-            deadline = time.monotonic() + self.sync_timeout
-            while "waiting for a check slot" not in (log.read_text() if log.exists() else ""):
-                if child.poll() is not None:
-                    self.fail(child.communicate()[0])
-                self.assertLess(time.monotonic(), deadline)
-                time.sleep(0.01)
-            self.assertFalse(ran.exists())
-            self.assertTrue(self.held("checks-0"))
-        output, _ = child.communicate(timeout=self.sync_timeout)
-        self.assertEqual(child.returncode, 3, output)
-        self.assertTrue(ran.exists())
-        self.assertIn("[fixture#7] checks: waiting for a check slot (max_parallel_checks 1)", log.read_text())
-        self.assertIn("waiting for a check slot", output)
-        self.assertFalse(self.held("checks-0"))
 
 
 class CatchUpWorkspaceRecordTests(Isolated):

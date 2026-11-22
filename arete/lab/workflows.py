@@ -3,24 +3,20 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import socket
-import struct
 import subprocess
 import sys
 import tempfile
 import time
-from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
 
-from .. import agent, codebase, config, factory, flows, paths, pipeline, record, slots, util, workspace
+from .. import agent, codebase, config, factory, flows, paths, pipeline, record, util, workspace
 from ..store import db as foundation
 from ..store import runs as run_store
 from ..store import tasks as task_store
 from . import experiment
 
 EXECUTORS = ("fixed", "single-worker", "orchestrated")
-CHECK_WAIT_EVENT = struct.Struct("!d?")
 
 
 def designed(data: dict, carried=None, follow=False):
@@ -51,32 +47,16 @@ def designed(data: dict, carried=None, follow=False):
 
 
 def fingerprint(cfg, layer):
-    settings = asdict(cfg)
-    settings["max_parallel_checks"] = config.Config.max_parallel_checks
-    return experiment.sha_json({"config": json.loads(json.dumps(settings, default=str)),
+    return experiment.sha_json({"config": json.loads(json.dumps(asdict(cfg), default=str)),
         "layer": json.loads(json.dumps(asdict(layer), default=str)),
         "prompts": {path.name: experiment.sha(path.read_bytes()) for path in sorted(paths.PROMPTS_DIR.glob("*.md"))}})
 
 
 class CandidateBudget:
-    def __init__(self, limits, repo, ticket, folder, workers, check_wait_channel):
+    def __init__(self, limits, repo, ticket, folder, workers):
         self.limits, self.repo, self.ticket, self.folder = limits, repo, ticket, folder
         self.started, self.calls, self.pending = time.monotonic(), 0, {}
         self.unknown_usd, self.unknown_tokens, self.width = 0.0, 0, workers + 1
-        self.check_wait: tuple[float, float | None] = (0.0, None)
-        self.check_wait_channel = check_wait_channel
-
-    @contextmanager
-    def waiting_for_check(self):
-        began = time.monotonic()
-        self.check_wait = self.check_wait[0], began
-        self.check_wait_channel.send(CHECK_WAIT_EVENT.pack(began, True))
-        try:
-            yield
-        finally:
-            ended = time.monotonic()
-            self.check_wait = experiment.slot_wait_seconds(self.check_wait, ended), None
-            self.check_wait_channel.send(CHECK_WAIT_EVENT.pack(ended, False))
 
     def save(self):
         util.write_durably(self.folder / "admissions.json", json.dumps({
@@ -96,8 +76,7 @@ class CandidateBudget:
         tokens = sum((r["tokens_in"] or 0) + (r["tokens_out"] or 0) for r in rows)
         usd = self.limits["spend_usd"] - paid - self.unknown_usd - sum(r["max_budget_usd"] for r in self.pending.values())
         remaining = self.limits["tokens"] - tokens - self.unknown_tokens - sum(r["max_tokens"] for r in self.pending.values())
-        now = time.monotonic()
-        seconds = self.limits["minutes"] * 60 - (now - self.started - experiment.slot_wait_seconds(self.check_wait, now))
+        seconds = self.limits["minutes"] * 60 - (time.monotonic() - self.started)
         if self.calls >= self.limits["calls"] or usd <= 0 or remaining < self.width or seconds <= 0:
             raise workspace.RunFailed("whole-workflow trial exhausted its shared launch/resource allowance")
         grant = {"max_tokens": int(remaining // self.width), "max_budget_usd": usd / self.width, "timeout": seconds}
@@ -123,31 +102,21 @@ class CandidateBudget:
 
 
 def child():
-    with socket.socket(fileno=int(sys.argv[2])) as check_wait_channel:
-        check_wait_channel.set_inheritable(False)
-        run_candidate(Path(sys.argv[1]), check_wait_channel)
-
-
-def run_candidate(root: Path, check_wait_channel):
     codebase.load()
+    root = Path(sys.argv[1])
     spec = json.loads((root / "request.json").read_text())
     foundation.migrate()
     cfg = config.load()
     repo = cfg.repo(spec["repo"])
     ticket = task_store.task_add(repo.name, spec["prompt"], spec["title"], "feat")
     layer = config.load_layer(repo.layer_dir)
-    budget = CandidateBudget(spec["limits"], repo.name, ticket, root, layer.orchestration.max_workers,
-                             check_wait_channel)
+    budget = CandidateBudget(spec["limits"], repo.name, ticket, root, layer.orchestration.max_workers)
     path = {"fixed": "feature", "single-worker": "single_worker", "orchestrated": "orchestrate"}[spec["executor"]]
     drive = pipeline.flow_function(cfg, path)
-    observer = slots.CHECK_WAIT_OBSERVER.set(budget.waiting_for_check)
-    try:
-        code = pipeline.run_issue(repo.name, ticket, dry_run=True,
-                                  script=pipeline.Script(path, drive, overrides=spec["overrides"]),
-                                  admission=budget.admit, launch_done=budget.done,
-                                  closed_context=tuple(spec["closed_context"]))
-    finally:
-        slots.CHECK_WAIT_OBSERVER.reset(observer)
+    code = pipeline.run_issue(repo.name, ticket, dry_run=True,
+                              script=pipeline.Script(path, drive, overrides=spec["overrides"]),
+                              admission=budget.admit, launch_done=budget.done,
+                              closed_context=tuple(spec["closed_context"]))
     row = run_store.newest_whole_run(repo.name, ticket)
     prepared = flows.prepared_data(row["id"])
     records = [str(path) for path in record.record_files(row["id"])]
@@ -156,41 +125,6 @@ def run_candidate(root: Path, check_wait_channel):
                "unknown_usage": bool(budget.unknown_usd or budget.unknown_tokens or budget.pending),
                "facts": pipeline.seam_facts(row["id"])}
     util.write_durably(root / "result.json", json.dumps(summary).encode(), 0o600)
-
-
-def receive_check_wait(channel, trial, deadline: float) -> None:
-    while True:
-        try:
-            stamp, waiting = CHECK_WAIT_EVENT.unpack(channel.recv(CHECK_WAIT_EVENT.size))
-        except BlockingIOError:
-            return
-        elapsed, since = trial.check_wait
-        if waiting and since is None and stamp < deadline + elapsed:
-            trial.check_wait = elapsed, stamp
-        elif not waiting and since is not None:
-            trial.check_wait = experiment.slot_wait_seconds(trial.check_wait, stamp), None
-
-
-def wait_for_candidate(process, trial, channel, timeout: float) -> None:
-    now = time.monotonic()
-    deadline = now + timeout - trial.check_slot_seconds(now)
-    channel.setblocking(False)
-    try:
-        while True:
-            exited = process.poll() is not None
-            receive_check_wait(channel, trial, deadline)
-            now = time.monotonic()
-            remaining = deadline - now + trial.check_slot_seconds(now)
-            if remaining <= 0:
-                raise subprocess.TimeoutExpired(process.args, timeout)
-            if exited:
-                return
-            try:
-                process.wait(timeout=min(remaining, slots.CHECK_SLOT_POLL_SECONDS))
-            except subprocess.TimeoutExpired:
-                continue
-    finally:
-        trial.check_wait = trial.check_slot_seconds(time.monotonic()), None
 
 
 def execute(cfg, run, layer, wt, task):
@@ -227,18 +161,13 @@ def execute(cfg, run, layer, wt, task):
                "from arete.lab.workflows import child;child()"), str(root)]
     run.execution = {"executor": run.executor, "usage_unknown": True, "artifacts": paths.short_path(root)}
     with (root / "execution.log").open("w") as output:
-        receiver, sender = socket.socketpair(type=socket.SOCK_DGRAM)
-        with receiver, sender:
-            command.append(str(sender.fileno()))
-            process = subprocess.Popen(command, env=environment, stdout=output, stderr=output,
-                                       start_new_session=True, pass_fds=(sender.fileno(),))
-            sender.close()
-            try:
-                wait_for_candidate(process, run, receiver, max(1, limits["minutes"] * 60))
-            except BaseException:
-                util.stop_group(process)
-                run.stopped_by = "workflow stopped without complete usage; reconcile its retained receipt before continuing"
-                raise
+        process = subprocess.Popen(command, env=environment, stdout=output, stderr=output, start_new_session=True)
+        try:
+            process.wait(timeout=max(1, limits["minutes"] * 60))
+        except BaseException:
+            util.stop_group(process)
+            run.stopped_by = "workflow stopped without complete usage; reconcile its retained receipt before continuing"
+            raise
     if not (root / "result.json").exists():
         run.stopped_by = "workflow ended without complete usage; reconcile its retained receipt before continuing"
         raise workspace.RunFailed("workflow ended without a complete receipt; costs may be unknown")

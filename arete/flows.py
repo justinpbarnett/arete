@@ -843,7 +843,7 @@ class Job:
 
     def use_layer(self, layer: config.RepoLayer) -> None:
         self.layer = layer
-        self.check_commands, self.check_rules = pipeline.check_script(self.run.dir, layer, self.ws, self.run.where)
+        self.check_commands, self.check_rules = pipeline.check_script(self.run.dir, layer, self.ws)
         self.run.cfg, self.run.layer, self.run.kind = self.cfg, layer, self.ticket.kind
 
 
