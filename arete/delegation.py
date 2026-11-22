@@ -254,7 +254,7 @@ def main() -> None:
                            wait_out_limits=False, fresh_prompt=lambda which: launch["prompt"])
         send(channel, {"event": "result", "ok": result.ok, "text": result.text[:65536],
                        "structured": result.structured, "error": result.error[:2000], "session": asdict(result.session),
-                       "cost_usd": run.cost, "paid_usd": run.paid,
+                       "cost_usd": run.cost, "paid_usd": run.paid, "turns": result.turns,
                        "runner": result.runner, "model": result.model, "effort": result.effort,
                        "record": result.record, "recovery": pipeline.runner.start_failure(result, launch["role"])})
     except pipeline.Stopped:
