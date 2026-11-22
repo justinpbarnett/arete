@@ -5342,7 +5342,7 @@ class CatchUpRecoveryTests(MovedBasePublicationFixture, unittest.TestCase):
         worker = mock.Mock(pid=1, identity=None, receive=mock.Mock(side_effect=replies))
         self.enterContext(mock.patch.object(orchestration.delegation, "Worker", return_value=worker))
         self.enterContext(mock.patch.object(orchestration.delegation, "request", return_value={}))
-        self.enterContext(mock.patch.object(self.run, "settings"))
+        self.enterContext(mock.patch.object(self.run, "settings", return_value=mock.Mock(chain=())))
 
     def test_oversized_gate_batch_can_retry_with_four_actions(self):
         self.use_last_repair()
