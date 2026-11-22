@@ -32,6 +32,7 @@ THREAD = re.compile(r"(?:Current thread|Thread) (0x[0-9a-f]+) \(most recent call
 
 
 def stack_env(env):
+    env = {**env, "ARETE_DESKTOP_NOTIFY": "0"}
     if not env.get(_test_stacks.PREFIX_ENV):
         return env
     pythonpath = env.get("PYTHONPATH")
@@ -193,7 +194,8 @@ class Runner:
         result_file = os.path.join(self.folder, f"{index}.json")
         output_file = os.path.join(self.folder, f"{index}.out")
         stack_prefix = f"{index}.stack."
-        env = stack_env({**os.environ, _test_stacks.PREFIX_ENV: os.path.join(self.folder, stack_prefix)})
+        env = stack_env({**os.environ, "ARETE_DRIVE_FLUSH": "0",
+                         _test_stacks.PREFIX_ENV: os.path.join(self.folder, stack_prefix)})
         tail = ["--one", batch.identifier, "--start", self.args.start, "--result", result_file,
                 "--lifeline", str(self.lifeline)]
         command = ([sys.executable, "-m", "tests.parallel"] if __spec__ is not None else
