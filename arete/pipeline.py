@@ -4322,7 +4322,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                     prompt_name, surface=surface_note(v, url, evidence) + fault_controls, notes=v.notes,
                     scratch=scratch.note(attempt),
                     commands=prompt_loader.code_list(bash), checks=check_list(b.layer),
-                    env_example=verify.env_example(v.allow_bash) if prompt_name == "verify" else "",
+                    env_example=verify.env_example(v.allow_bash, url) if prompt_name == "verify" else "",
                     compare=compare_with_fork(b.checkouts), owner=run.owner_note,
                     journeys=journeys.guidance(selected or feature_map), **values),
                                 b.ws, role=role,

@@ -2,7 +2,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from arete import config, guard, jev, pipeline, prompt_loader, scratch, tracker
+from arete import config, guard, jev, paths, pi_shell, pipeline, prompt_loader, scratch, tracker
 from arete.agent import Result
 
 
@@ -28,6 +28,56 @@ class VerifyPromptEnvTests(unittest.TestCase):
         self.assertIn("`./verify-wrapper env ARETE_SERVER=<url> uv run arete task list`", prompt)
         self.assertEqual(prompt.count("env ARETE_SERVER="), 1)
 
+    def test_verify_prompt_preserves_the_first_wrapper_shell_spelling(self):
+        for wrapper in (f"/qa+tools{self.HARNESS}", f"'/qa tools{self.HARNESS}'", f'"/qa tools{self.HARNESS}"',
+                        r"/qa\ tools" + self.HARNESS, "~/verification-runtime/harness/sandbox"):
+            with self.subTest(wrapper=wrapper):
+                prompt = self.render_prompt([f"{wrapper} *", f"{self.HARNESS} *"])
+                self.assertIn(f"For example, run `{wrapper} env ARETE_SERVER=<url> uv run arete task list`", prompt)
+                self.assertEqual(prompt.count("env ARETE_SERVER="), 1)
+
+    def test_verify_prompt_prefers_the_first_bare_wrapper(self):
+        prompt = self.render_prompt(["verify-wrapper *", f"{self.HARNESS} *"])
+        self.assertIn("`verify-wrapper env ARETE_SERVER=<url> uv run arete task list`", prompt)
+        self.assertEqual(prompt.count("env ARETE_SERVER="), 1)
+
+    def test_verify_prompt_prefers_the_first_wrapper_with_options(self):
+        for wrapper in ("/usr/bin/env --", "/usr/bin/env -i --"):
+            with self.subTest(wrapper=wrapper):
+                rule = f"{wrapper} *"
+                prompt = self.render_prompt([rule, f"{self.HARNESS} *"])
+                example = f"{wrapper} env ARETE_SERVER=<url> uv run arete task list"
+                self.assertIn(f"For example, run `{example}`", prompt)
+                self.assertEqual(prompt.count("For example, run"), 1)
+                command = example.replace("<url>", "http://127.0.0.1:51390")
+                self.assertTrue(pi_shell.rules_match(command, (f"Bash({rule})",)))
+
+    def test_verify_prompt_fills_wildcards_in_an_explicit_env_rule(self):
+        for wrapper, assignments, example_assignments in (
+            (self.HARNESS, "ARETE_SERVER=*", "ARETE_SERVER=http://127.0.0.1:51390"),
+            (self.HARNESS, 'ARETE_SERVER="*"', 'ARETE_SERVER="http://127.0.0.1:51390"'),
+            (self.HARNESS, "ARETE_SERVER=http://127.0.0.1:*", "ARETE_SERVER=http://127.0.0.1:51390"),
+            (self.HARNESS, "ARETE_SERVER='http://localhost:*'", "ARETE_SERVER='http://localhost:51390'"),
+            (f"/qa+tools{self.HARNESS}", "ARETE_SERVER=*", "ARETE_SERVER=http://127.0.0.1:51390"),
+            (f"'/qa tools{self.HARNESS}'", "ARETE_SERVER=* API_KEY=*",
+             "ARETE_SERVER=http://127.0.0.1:51390 API_KEY=arete-placeholder-1"),
+            (self.HARNESS, 'LABEL="qa tools" ARETE_SERVER=* API_KEY=*',
+             'LABEL="qa tools" ARETE_SERVER=http://127.0.0.1:51390 API_KEY=arete-placeholder-1'),
+            (self.HARNESS, r"LABEL=qa\ tools EMPTY= ARETE_SERVER=* LABEL2='other tools'",
+             r"LABEL=qa\ tools EMPTY= ARETE_SERVER=http://127.0.0.1:51390 LABEL2='other tools'"),
+        ):
+            with self.subTest(wrapper=wrapper, assignments=assignments):
+                rule = f"{wrapper} env {assignments} uv run arete task list"
+                prompt = self.render_prompt([rule])
+                example = f"{wrapper} env {example_assignments} uv run arete task list"
+                self.assertIn(f"For example, run `{example}`", prompt)
+                self.assertTrue(pi_shell.rules_match(example, (f"Bash({rule})",)))
+
+    def test_verify_prompt_keeps_generic_guidance_without_an_env_rule(self):
+        prompt = self.render_prompt(["sandbox uv *"])
+        self.assertIn("`<allowed command> env NAME=value <program> …`", prompt)
+        self.assertNotIn("For example, run", prompt)
+
     def render_prompt(self, allow_bash):
         root = Path.cwd()
         layer = config.RepoLayer(root, verify=config.Verify(url="", allow_bash=allow_bash))
@@ -36,7 +86,8 @@ class VerifyPromptEnvTests(unittest.TestCase):
         ticket = tracker.Ticket("1", "#1", "List tasks")
         work = pipeline.TicketWork(config.Config(), run, ticket, root, [], layer, 60, "test workspace")
 
-        with (mock.patch.object(scratch, "make", side_effect=ValueError("no scratch authority")),
+        with (mock.patch.object(paths, "dashboard_ports", return_value=frozenset()),
+              mock.patch.object(scratch, "make", side_effect=ValueError("no scratch authority")),
               mock.patch.object(pipeline, "run_folder", return_value=root / "evidence"),
               mock.patch.object(pipeline, "restore_worktrees")):
             pipeline.use_product(work, "verify", "verify", goal="List tasks.", summary="", diff="")
