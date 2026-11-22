@@ -719,6 +719,12 @@ A run's records go into the prompt as quoted data, one prefixed line each, to a 
 Evidence cites `run <id> <record>:<lines>`, the raw line numbers `arete record RUN STEP --raw` prints.
 A proposal for arete or a public repo that names another repository, ticket, run, host or the login name is skipped.
 
+When two distinct owner review comments from the GitHub repository that owns the target file point to a deterministic correction, the miner can save a proposal in `check-proposals/` under the configured layer. For projects with multiple repositories, the target path must belong to exactly one configured part. At least one comment must be in the current mining window. The preceding 30 days of comments can corroborate it. The proposal recommends an API or architecture change when it can remove the invalid choice, or an executable check that Arete verifies in isolation. It lists existing examples to clean up when found.
+
+Executable proposals show the same compiler command used for verification, the observed rejection, and the accepted correction. The supported evaluator compiles Python source without running it and treats syntax warnings as errors. It verifies literal identity diagnostics using examples that differ only by the suggested comparison operator. Unsupported or inconclusive checks are skipped.
+
+Review proposals under **Needs you → By hand** or in `arete status`. Bring any approved change through the repository's usual review process and run its existing checks. Mark done clears the inbox item and leaves the proposal file for reference. A materially revised proposal can return for review.
+
 ### Retention
 
 The hourly prune in `arete serve` removes zero-cost command-loop firing rows, feed entries and run folders after 14 days. Folder deletions are queued in the database and retried after a filesystem failure. Old rowless folders are removed only when their contents match the legacy firing shape: `run.log`, optionally `events.json`, an empty `scratch/`, and `record/` containing only `steps.jsonl.gz`.
@@ -2665,6 +2671,10 @@ Interruption and timeout share the cleanup path; unresolved ownership retains an
 Quota holds exit 75 without starting work or recording a result.
 Scheduler dispatch releases the claimed input and consults the persisted reset before trying again; a concurrent dispatch reports busy.
 Dry-run displays a quota hold without reserving.
+
+The disabled `release-journeys` companion runs configured CLI journeys against a release wheel
+pinned by its archive SHA-256 and metadata version. The release journey guide covers pinning, local findings
+and offline verification. [Release journey guide](arete/loops/README.md#release-journeys)
 
 ## Versioned writes
 

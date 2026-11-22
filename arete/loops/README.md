@@ -234,3 +234,132 @@ merge-check = 1
 
 See the [offline fixture recipe](../../README.md#offline-merge-check-fixture) for disposable origins,
 replay answers, blocked recovery and quota checks.
+
+## Release journeys
+
+`release-journeys` ships disabled. Run it after the merged release has been built and installed.
+Put the selection in `release-journeys.toml` in the Arete config directory and run
+`arete loop try release-journeys` to exercise the build and preview findings. Enable the loop for
+manual starts with `arete loop enable release-journeys`, then start it after each release with
+`arete loop start release-journeys`. A release job can run `arete release-journeys --config FILE` directly.
+
+```toml
+python = "/absolute/path/to/release/bin/python"
+wheel = "/absolute/path/to/arete-0.1.0-py3-none-any.whl"
+build = "0.1.0 sha256.0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+journeys = ["first-run", "config-protection"]
+```
+
+Set `build` to the output of that interpreter's `-I -B -m arete.releasebuild WHEEL`. Install the
+wheel with a tool that records its archive SHA-256 in `direct_url.json`, such as pip installing
+directly from the wheel file. Keep the wheel and its installation immutable throughout the run.
+The probe checks the file's SHA-256 against the installation provenance and verifies the
+installed package and metadata against the archive. Each attempt, including confirmation
+replays, records the archive SHA-256 and the version from the wheel's `METADATA`.
+
+| Journey | Actions and invariants |
+|---|---|
+| `first-run` | Run `init`, validate the generated settings, then run `migrate` and `status --json --offline`, which reads the local store and needs no running server. Check that migration creates state and status shows zero live runs. |
+| `config-protection` | Seed `max_parallel = 2`, run `init`, then `init --force`. Check that the first call refuses and preserves the exact settings and that the forced call replaces them. Validate the replacement settings. |
+
+Each attempt starts with fresh scratch config and state. A run allows at most two journeys, 16 release
+actions including identity probes, and 60 seconds of cumulative action time. Each release action
+has at most 10 seconds and 64 KiB of captured stdout. The controller kills the action process group
+at its deadline, and the group also dies if the controller exits. The report keeps command
+arguments, exit codes, checked invariants and the build identity. Product output and fixture
+contents are discarded.
+The `validate-settings` action runs the selected build's settings loader in the release interpreter
+and requires the generated file. Use a build that includes this validation contract. The
+`first-run` journey requires macOS for confined SQLite. On other hosts it records an environment
+block after the identity probe. `config-protection` can run without confined SQLite support.
+
+A successful action that leaves an expected file missing can fail an invariant. An unsafe or
+unreadable scratch file and malformed selection TOML produce environment blocks. Controller
+file operations run outside the action budget. Scratch removal follows the durable report
+write, and a removal failure logs a warning. An action timeout is recorded on the attempt.
+If action teardown also fails, the report keeps both causes and the first failure decides
+the attempt's outcome. A failed identity probe is a startup outcome, an unverified wheel or
+build mismatch is an environment outcome, and unexpected action exits and command I/O errors
+are infrastructure outcomes.
+
+An invariant has to fail twice on the same pinned build before it becomes a finding. Inconsistent
+replays are inconclusive. Findings are coalesced by journey and invariant across builds. Reports
+remain under `release-journeys/runs/` in the Arete state directory. The first report for each
+fingerprint is linked from `release-journeys/findings/` after its report is durable. A report or
+finding write failure exits 1 and saves `infrastructure.json` beside the run report when storage
+permits. An already saved run report is retained. A trial writes a run report and previews findings
+without reserving their fingerprints. The shipped loop keeps findings local for human review.
+A completed run exits 0, including a confirmed product failure. A blocked run exits 1 unless it also
+has a confirmed finding to report. Read the per-journey outcomes when a run reports `partial`.
+
+### Release verification recipe
+
+On a macOS verification host, use the verification step's approved sandbox and disposable config,
+state, and log directories. Use Python 3.13 and an owned scratch directory that permits wheel
+installation and journey teardown. Record an infrastructure block if the sandbox denies a
+required filesystem operation.
+
+```sh
+git log -1 --format=%H
+release_python=$(command -v python3.13)
+journey_dir=$(mktemp -d "$PWD/.arete-release-journeys.XXXXXX")
+uv build --wheel --offline --python "$release_python" --out-dir "$journey_dir/wheels"
+wheel=$(echo "$journey_dir"/wheels/arete-*.whl)
+shasum -a 256 "$wheel"
+"$release_python" -m venv "$journey_dir/release"
+"$journey_dir/release/bin/python" -m pip install --no-index --no-deps "$wheel"
+"$journey_dir/release/bin/python" -I -B -m arete.releasebuild "$wheel"
+```
+
+Write the selection above to `$journey_dir/release-journeys.toml` using that interpreter's
+absolute path, the absolute wheel path, and the observed build. Run the installed command with
+disposable config, state and logs.
+
+```sh
+env -i PATH=/usr/bin:/bin HOME="$journey_dir" TMPDIR="$journey_dir" \
+  ARETE_CONFIG_DIR="$journey_dir/config" ARETE_STATE_DIR="$journey_dir/state" \
+  ARETE_LOG_DIR="$journey_dir/logs" XDG_STATE_HOME="$journey_dir/client" \
+  "$journey_dir/release/bin/python" -I -B -m arete.cli release-journeys --config "$journey_dir/release-journeys.toml"
+```
+
+Open the reported path under `$journey_dir/state/release-journeys/` and verify that both journeys
+passed, every observed identity matches the pin and `shasum` output, all nine release actions are
+accounted for, and the report has no findings. Keep the source commit, installed identity, and report
+together for each artifact.
+
+For a regression check, build a second wheel from a disposable copy of the same revision with the
+existing-file guard in `arete/commands/setup.py`'s `cmd_init` refusing even when `--force` is
+passed. Install it in a second virtual environment under the same checkout as the candidate
+environment using the same offline procedure. Record its archive digest and installed identity.
+Confirm that the two installed identities differ. Select the seeded interpreter and wheel with
+the candidate pin for `config-protection`. Expect an environment block after a single identity action, the
+seeded identity recorded as observed, and no finding.
+
+Set the seed's identity in `$journey_dir/config/release-journeys.toml` and select only
+`config-protection`. Migrate the disposable state before running the loop commands. The
+`first-run` journey migrates its own scratch database.
+
+```sh
+disposable_arete() {
+  env -i PATH=/usr/bin:/bin HOME="$journey_dir" TMPDIR="$journey_dir" \
+    ARETE_CONFIG_DIR="$journey_dir/config" ARETE_STATE_DIR="$journey_dir/state" \
+    ARETE_LOG_DIR="$journey_dir/logs" XDG_STATE_HOME="$journey_dir/client" \
+    "$journey_dir/release/bin/python" -I -B -m arete.cli "$@"
+}
+
+disposable_arete migrate &&
+  disposable_arete loop try release-journeys &&
+  disposable_arete loop status release-journeys &&
+  disposable_arete loop status merge-check &&
+  disposable_arete merge-check --dry-run </dev/null
+```
+
+The bundled trial should preview one finding, show the seed's identity on both fresh attempts,
+and leave the canonical findings directory empty. Both loops should show as off in untouched
+disposable settings. With empty merge-check history and no configured repositories, the dry-run
+should report nothing merged and zero model calls. Check that it creates no release journey run.
+
+Run the seeded selection directly twice with the same disposable state. Expect two matching
+`forced-init-replaces-config` failures attributed to the seed in each report, one finding
+emitted on the first run, and one canonical finding pointing to that run's report. Retain the
+reports as needed and remove only the disposable resources created for this verification.

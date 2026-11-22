@@ -307,9 +307,10 @@ def fingerprint(p: Path, salt: str) -> str:
         for name in sorted(dirs + files):
             q = Path(root, name)
             st = q.lstat()
-            h.update(f"{q.relative_to(p.parent).as_posix()}\0{st.st_mode}\0{st.st_size}\0{st.st_mtime_ns}\n".encode())
+            entry = f"{q.relative_to(p.parent).as_posix()}\0{st.st_mode}\0{st.st_size}\0{st.st_mtime_ns}\n"
+            h.update(entry.encode(errors="surrogateescape"))
             if stat.S_ISLNK(st.st_mode):
-                h.update(os.readlink(q).encode())
+                h.update(os.readlink(q).encode(errors="surrogateescape"))
             elif stat.S_ISREG(st.st_mode):
                 with open(q, "rb") as f:
                     while chunk := f.read(1 << 20):

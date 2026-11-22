@@ -1,0 +1,7 @@
+kind = "command"
+enabled = false
+description = "Exercise configured user journeys against an identified Arete release"
+
+[run]
+command = "arete release-journeys"
+timeout_minutes = 2

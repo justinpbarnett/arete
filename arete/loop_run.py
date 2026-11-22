@@ -5,6 +5,7 @@ import itertools
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import threading
@@ -197,10 +198,10 @@ class OutputSinks:
 
     def stopped(self, error):
         note = f"[arete] feed stopped: {error}\n"
-        if self.out is not None:
+        if (out := self.out) is not None:
             try:
-                self.out.write(note)
-                self.out.flush()
+                out.write(note)
+                out.flush()
                 return
             except (OSError, ValueError) as e:
                 self.close()
@@ -208,10 +209,10 @@ class OutputSinks:
         self.stderr(note)
 
     def write(self, line, callback=True):
-        if self.out is not None:
+        if (out := self.out) is not None:
             try:
-                self.out.write(line)
-                self.out.flush()
+                out.write(line)
+                out.flush()
             except (OSError, ValueError) as e:
                 self.close()
                 self.stopped(e)
@@ -242,15 +243,36 @@ def copy_output(proc: subprocess.Popen, output: Path | None, lines: list[str], o
             sinks.close()
 
 
-def exits_by(proc: subprocess.Popen, deadline: float) -> bool:
+def exits_by(proc: subprocess.Popen, deadline: float | None) -> bool:
     try:
-        proc.wait(max(0.0, deadline - time.monotonic()))
+        proc.wait(None if deadline is None else max(0.0, deadline - time.monotonic()))
         return True
     except subprocess.TimeoutExpired:
         return False
 
 
-def run_command(argv: list[str], cwd: Path | str, *, timeout: float, env: dict, device: devices.Device,
+@contextmanager
+def defer_loop_stop():
+    if (threading.current_thread() is not threading.main_thread()
+            or signal.getsignal(signal.SIGTERM) is not record.stop_on_term):
+        yield
+        return
+    stopped = False
+
+    def remember_stop(*_):
+        nonlocal stopped
+        stopped = True
+
+    try:
+        signal.signal(signal.SIGTERM, remember_stop)
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, record.stop_on_term)
+        if stopped:
+            raise record.Stopped
+
+
+def run_command(argv: list[str], cwd: Path | str, *, timeout: float | None, env: dict, device: devices.Device,
                 stdin: str = "", output: Path | None = None, on_line=None) -> tuple[int, str]:
     if device.remote:
         lines = []
@@ -291,34 +313,47 @@ def run_command(argv: list[str], cwd: Path | str, *, timeout: float, env: dict, 
     if trusted:
         argv = control.command(argv[1:])
     full = argv
-    deadline = time.monotonic() + timeout
+    deadline = None if timeout is None else time.monotonic() + timeout
     from . import scratch
 
-    proc = scratch.spawn(full, cwd=str(cwd) if local else None, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                             actor_confined=trusted,
-                            stderr=subprocess.STDOUT, text=True, errors="replace", env={**os.environ, **env} if local else None,
-                            **util.own_group_args())
-    threading.Thread(target=feed_stdin, args=(proc, stdin), daemon=True).start()
-    lines: list[str] = []
-    sinks = OutputSinks(output, on_line)
-    copier = threading.Thread(target=copy_output, args=(proc, output, lines, on_line, sinks), daemon=True)
-    copier.start()
-    expired = True
+    proc = sinks = None
+    killed = False
     try:
-        copier.join(max(0.0, deadline - time.monotonic()))
-        expired = copier.is_alive() or not exits_by(proc, deadline)
-    finally:
-        if expired:
-            util.kill_group(proc)
-    if not expired:
+        with defer_loop_stop():
+            proc = scratch.spawn(full, cwd=str(cwd) if local else None, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 actor_confined=trusted, stderr=subprocess.STDOUT, text=True, errors="replace",
+                                 env={**os.environ, **env} if local else None, **util.own_group_args())
+        threading.Thread(target=feed_stdin, args=(proc, stdin), daemon=True).start()
+        lines: list[str] = []
+        sinks = OutputSinks(output, on_line)
+        copier = threading.Thread(target=copy_output, args=(proc, output, lines, on_line, sinks), daemon=True)
+        copier.start()
+        copier.join(None if deadline is None else max(0.0, deadline - time.monotonic()))
+        if not copier.is_alive() and exits_by(proc, deadline):
+            result = proc.returncode, "".join(lines)
+        else:
+            with defer_loop_stop():
+                util.kill_group(proc)
+                killed = True
+            copier.join(OUTPUT_GRACE_SECONDS)
+            exits_by(proc, time.monotonic() + OUTPUT_GRACE_SECONDS)
+            note = f"\n[arete] stopped after {timeout:g}s\n"
+            sinks.write(note, callback=False)
+            result = util.TIMED_OUT, "".join(lines) + note
         sinks.close()
-        return proc.returncode, "".join(lines)
-    copier.join(OUTPUT_GRACE_SECONDS)
-    exits_by(proc, time.monotonic() + OUTPUT_GRACE_SECONDS)
-    note = f"\n[arete] stopped after {timeout:g}s\n"
-    sinks.write(note, callback=False)
-    sinks.close()
-    return util.TIMED_OUT, "".join(lines) + note
+        return result
+    except BaseException:
+        try:
+            if proc is not None:
+                with defer_loop_stop():
+                    if not killed:
+                        util.kill_group(proc)
+                    if proc.returncode is None:
+                        exits_by(proc, time.monotonic() + OUTPUT_GRACE_SECONDS)
+        finally:
+            if sinks is not None:
+                sinks.close()
+        raise
 
 
 def work_dir(run: LoopRun) -> Path | str:
@@ -485,6 +520,8 @@ def reports(row: dict) -> bool:
 
 @loops.runs_kind("command")
 def command_loop(run: LoopRun) -> tuple[str, str]:
+    from . import releasejourneys
+
     loop = run.loop
     env = {"ARETE_RUN_ID": run.id, "ARETE_LOOP": loop.name, "ARETE_LOOP_DIR": str(loop.dir),
            "ARETE_TRIAL": "1" if run.trial else "", "PYTHONUNBUFFERED": "1"}
@@ -492,7 +529,8 @@ def command_loop(run: LoopRun) -> tuple[str, str]:
     argv = loop.try_command if run.trial and loop.try_command else loop.command
     run.log("start", f"$ {shlex.join(argv)}" + (f" on {run.device.name}" if run.device.remote else ""))
     started = time.monotonic()
-    code, text = run_command(argv if run.device.remote else from_loop_folder(argv, loop), work_dir(run), timeout=loop.timeout_minutes * 60, env=env,
+    timeout = None if releasejourneys.builtin(loop) and not run.device.remote else loop.timeout_minutes * 60
+    code, text = run_command(argv if run.device.remote else from_loop_folder(argv, loop), work_dir(run), timeout=timeout, env=env,
                              device=run.device, stdin=stdin, output=run.log_file, on_line=feed_output(run))
     lines = [line for line in text.split("\n") if line.strip()]
     found, said = [], []
@@ -567,9 +605,9 @@ def finding_text(f: dict) -> str:
 
 
 def known_twins(run: LoopRun, unseen: list[dict]) -> dict[int, dict]:
-    from . import mergecheck
+    from . import mergecheck, releasejourneys
 
-    if mergecheck.builtin(run.loop):
+    if mergecheck.builtin(run.loop) or releasejourneys.builtin(run.loop):
         return {}
     if not unseen or not jev.ready(run.cfg, [loop_repo(run)]):
         return {}
