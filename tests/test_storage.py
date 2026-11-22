@@ -1,6 +1,8 @@
 import contextlib
+import fcntl
 import gzip
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -25,6 +27,27 @@ from arete import (
 )
 from arete.store import db as foundation
 from arete.store import runs as run_store
+
+
+class FlushFdTests(unittest.TestCase):
+    @unittest.skipUnless(hasattr(fcntl, "F_FULLFSYNC"), "F_FULLFSYNC is unavailable")
+    def test_default_flushes_the_drive_cache(self):
+        with (mock.patch.dict(os.environ),
+              mock.patch.object(fcntl, "fcntl") as full_flush,
+              mock.patch.object(os, "fsync") as fsync):
+            os.environ.pop("ARETE_DRIVE_FLUSH", None)
+            util.flush_fd(42)
+        full_flush.assert_called_once_with(42, fcntl.F_FULLFSYNC)
+        fsync.assert_not_called()
+
+    def test_opt_out_only_syncs_the_file(self):
+        with (mock.patch.dict(os.environ, {"ARETE_DRIVE_FLUSH": "0"}),
+              mock.patch.object(fcntl, "F_FULLFSYNC", create=True),
+              mock.patch.object(fcntl, "fcntl") as full_flush,
+              mock.patch.object(os, "fsync") as fsync):
+            util.flush_fd(42)
+        full_flush.assert_not_called()
+        fsync.assert_called_once_with(42)
 
 
 class DurableCostTests(unittest.TestCase):

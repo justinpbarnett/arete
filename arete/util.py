@@ -771,7 +771,7 @@ def read_json(p: Path, default):
 
 
 def flush_fd(fd: int) -> None:
-    if hasattr(fcntl, "F_FULLFSYNC"):
+    if os.environ.get("ARETE_DRIVE_FLUSH") != "0" and hasattr(fcntl, "F_FULLFSYNC"):
         try:
             fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
             return
