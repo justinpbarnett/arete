@@ -1803,7 +1803,7 @@ class PollFixture(Isolated):
                 patch.object(poll, "settle_abandoned_runs"), patch.object(outcomes, "sync_outcomes"), \
                 patch.object(outcomes, "sync_moves"), patch.object(outcomes, "sync_landings"), \
                 patch.object(poll, "retry_scratch"), \
-                patch.object(poll, "cleanup_worktrees"), patch.object(poll, "mark_loop"), \
+                patch.object(poll, "mark_loop"), \
                 patch.object(pipeline, "SKIPPED_FILE", self.root / "skipped.json"):
             return poll.poll(dry_run=dry_run)
 
@@ -2466,7 +2466,7 @@ class OwnerAnswerBudgetFixture(PollFixture):
                 tasks_store.task_comment(self.ticket, principals.current(), "An older comment.")
         with patch.object(util, "now", return_value=datetime(2026, 1, 15, tzinfo=UTC)), \
                 patch.object(config, "load", return_value=self.cfg), \
-                patch.object(tasks, "kept_folder_removed", return_value=True):
+                patch.object(tasks, "kept_folder_removed", return_value=workspace.Release("removed")):
             self.assertEqual(len(tasks.expire_asks(self.cfg)), 1)
         self.assertEqual(ask_store.ask_get("ask-fixture")["status"], "expired")
         self.assertIn("Reply here and remove", self.local.get(self.ticket).comments)
@@ -4114,7 +4114,6 @@ class EnvironmentRequeueTests(Isolated):
             (gh, "default_branch", lambda repo: "main"),
             (poll, "network_up_or_skip", lambda *args: True),
             (poll, "mark_loop", lambda *args: None),
-            (poll, "cleanup_worktrees", lambda **kwargs: None),
             (outcomes, "sync_outcomes", lambda cfg: None),
             (outcomes, "sync_moves", lambda cfg: None),
             (outcomes, "sync_landings", lambda cfg: None),

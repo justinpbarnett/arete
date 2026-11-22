@@ -730,27 +730,29 @@ class Run(AgentRun):
         self.say(f"Run `{self.id}` {why}. {self.retry_hint}.")
 
 
-def workspace_owner(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> dict | None:
+def workspace_owner(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> workspace.WorkspaceOwner | None:
     earlier = workspace.owner_in(workspace.made_before(ws))
     if run.alone:
         return earlier
-    created = earlier.get("created") if earlier else None
-    return {"run": run.id, "repo": run.repo.name, "ticket": str(run.tid), "created": created or util.iso(),
-            "checkouts": [{"dir": c.dir, "github": c.github, "src": str(c.src), "wt": str(c.wt)} for c in checkouts]}
+    created = earlier.created if earlier else ""
+    return workspace.WorkspaceOwner(run.id, run.repo.name, str(run.tid), created or util.iso(), checkouts)
 
 
 def release_workspace(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> bool:
+    kept = bool(run.closed_checkouts or run.catch_up_preserved)
     workspace.note_made(ws, checkouts, workspace_owner(run, ws, checkouts), preserve=run.catch_up_preserved,
-                        excluded=run.closed_checkout_paths)
+                        excluded=run.closed_checkout_paths, state="kept" if kept else "released",
+                        kept_reason="operator" if kept else "")
     if run.closed_checkouts:
         run.log(f"workspace kept at {ws}: it contains closed PR worktrees")
         return False
     if run.catch_up_preserved:
         run.log(f"workspace kept at {ws}: it contains files that existed before catch-up")
         return False
-    if workspace.remove_workspace(ws, checkouts):
+    release = workspace.remove_workspace(ws, checkouts)
+    if release.state == "removed":
         return True
-    names = workspace.blocked_by(ws, checkouts)
+    names = release.held_by
     shown = ", ".join(names[:10]) + (f" and {len(names) - 10} more" if len(names) > 10 else "")
     run.log(f"workspace kept at {ws}: removal blocked by {shown or 'the folder could not be deleted'}")
     return False
@@ -2025,7 +2027,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             if not zte_grant:
                 raise
             return settle_zte_failure(repo.name, str(tid), slot, run_id, error, committed=True)
-        pr_url, passed, drive_entered, retaining_catch_up = "", None, False, False
+        status = pr_url = ""
+        passed, drive_entered, retaining_catch_up = None, False, False
 
         def check_work_log():
             pilot.require(time.monotonic() < wall_deadline, "the ZTE authorization expired")
@@ -2151,13 +2154,17 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 run.give_up("crashed before finishing")
         finally:
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
-            if run.workspace and not zte_grant:
-                if not (retaining_catch_up or run.catch_up_preserved) and (
-                        not run.environment_release or ("requirements" in run.facts and flows.retry_passed(flow.ctx.verified))):
-                    keep_edits(run)
-                workspace.note_made(*run.workspace, workspace_owner(run, *run.workspace), preserve=run.catch_up_preserved,
-                                    excluded=run.closed_checkout_paths)
-            slot.free()
+            try:
+                if run.workspace and not zte_grant:
+                    if not (retaining_catch_up or run.catch_up_preserved) and (
+                            not run.environment_release
+                            or ("requirements" in run.facts and flows.retry_passed(flow.ctx.verified))):
+                        keep_edits(run)
+                    workspace.note_made(*run.workspace, workspace_owner(run, *run.workspace),
+                                        preserve=run.catch_up_preserved, excluded=run.closed_checkout_paths,
+                                        settled="" if run.alone else status)
+            finally:
+                slot.free()
         if run.catch_up_cleanup_park and (held := kept_heads(run)):
             try:
                 if parked := runlimits.metadata(run.id, "parked.json"):

@@ -1700,7 +1700,7 @@ class RestoredPRRevisionTests(unittest.TestCase):
               mock.patch.object(poll, "spawn_run", side_effect=start) as spawn,
               mock.patch.multiple(poll, network_up_or_skip=mock.Mock(return_value=True),
                                   settle_abandoned_runs=mock.DEFAULT, sync_labels=mock.DEFAULT,
-                                  retry_scratch=mock.DEFAULT, cleanup_worktrees=mock.DEFAULT, mark_loop=mock.DEFAULT),
+                                  retry_scratch=mock.DEFAULT, mark_loop=mock.DEFAULT),
               mock.patch.multiple(outcomes, sync_outcomes=mock.DEFAULT, sync_moves=mock.DEFAULT,
                                   sync_landings=mock.DEFAULT), redirect_stdout(StringIO()) as output):
             self.assertEqual(poll.poll(), 0, output.getvalue())
@@ -3564,6 +3564,11 @@ class ClosedPRPublicationTests(PublicationFixture):
         branch, controller, b = "arete/7-edit-fixture", self.controller, self.build
         remote = lease
         pushes = []
+        state_dir = other / "state"
+        self.enterContext(mock.patch.multiple(paths, STATE_DIR=state_dir, DB_FILE=state_dir / "arete.db",
+                                             RUNS_DIR=state_dir / "runs", LOCKS_DIR=state_dir / "locks",
+                                             WORKTREES_DIR=other / "worktrees", LOG_DIR=state_dir / "logs"))
+        db.migrate()
 
         def git(args, cwd, **kw):
             nonlocal remote
@@ -3576,8 +3581,7 @@ class ClosedPRPublicationTests(PublicationFixture):
             return ""
 
         pr = "https://github.com/fixture/repo/pull/8"
-        with (mock.patch.object(paths, "WORKTREES_DIR", other / "worktrees"),
-              mock.patch.object(workspace, "fetch") as fetch,
+        with (mock.patch.object(workspace, "fetch") as fetch,
               mock.patch.object(workspace, "remote_head", side_effect=lambda src, branch: remote),
               mock.patch.object(gh, "open_pr_url", return_value=""),
               mock.patch.object(gh, "closed_pr_heads", return_value={lease}),
@@ -6213,7 +6217,9 @@ class CatchUpRecoveryTests(MovedBasePublicationFixture, unittest.TestCase):
         run = self.ctrl.run
         self.assertEqual(errors, [error])
         commit.assert_any_call(run.id, checkout, run.layer)
-        note_made.assert_called_once_with(checkout.wt, [checkout], mock.ANY, preserve=set(), excluded=set())
+        owner = workspace.WorkspaceOwner(run.id, run.repo.name, str(run.tid), mock.ANY, [checkout])
+        note_made.assert_called_once_with(checkout.wt, [checkout], owner, preserve=set(), excluded=set(),
+                                          settled="failed")
         self.assertTrue(self.draft)
         hold_comments = [call.args[2] for call in self.comment.call_args_list if "held on verify" in call.args[2]]
         self.assertEqual(len(hold_comments), 1)
@@ -6264,7 +6270,9 @@ class CatchUpRecoveryTests(MovedBasePublicationFixture, unittest.TestCase):
             self.assertIn(text, parked["reason"])
         self.assertIn(f"crashed: RuntimeError: {error}", (run.dir / "run.log").read_text())
         keep.assert_called_once_with(run)
-        note_made.assert_called_once_with(checkout.wt, [checkout], mock.ANY, preserve=set(), excluded=set())
+        owner = workspace.WorkspaceOwner(run.id, run.repo.name, str(run.tid), mock.ANY, [checkout])
+        note_made.assert_called_once_with(checkout.wt, [checkout], owner, preserve=set(), excluded=set(),
+                                          settled="failed")
 
     def test_budget_expiry_during_limit_cleanup_preserves_catch_up_park(self):
         self.use_last_repair()
@@ -6897,7 +6905,7 @@ class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
 
         def remove_checkout(*_):
             path.unlink()
-            return True
+            return workspace.Release("removed")
 
         with (mock.patch.object(gh, "pr_merge_details", return_value=refs), mock.patch.object(gh, "pr_comment"),
               mock.patch.object(pipeline, "fetch_merge_base", return_value="moved-base"),
@@ -6914,7 +6922,7 @@ class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
               mock.patch.object(flows, "ended", side_effect=lambda flow, outcome: flows.respond(flow, **outcome.data))):
             self.assertEqual(controller.publish()["ending"], "pr")
             self.assertEqual(path.read_bytes(), b"owner's file")
-            self.assertEqual(workspace.blocked_by(checkout.wt, [checkout]),
+            self.assertEqual(workspace.workspace_blockers(checkout.wt, [checkout]),
                              ["ignored/" if kind == "ignored" else "ignored/data.txt"])
         self.assertIn("`main` at `moved-base`", controller.run.facts["merge_held"])
         self.assertIn(f"{kind} file `ignored/data.txt`", controller.run.facts["merge_held"])
@@ -6966,11 +6974,11 @@ class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
               mock.patch.object(pipeline, "abort_merge") as abort,
               mock.patch.object(pipeline, "commit_and_push") as push,
               mock.patch.object(workspace, "scratch_left", return_value=[]), mock.patch.object(paths, "STATE_DIR", root),
-              mock.patch.object(workspace, "remove_workspace", return_value=True) as remove,
+              mock.patch.object(workspace, "remove_workspace", return_value=workspace.Release("removed")) as remove,
               mock.patch.object(pipeline, "record_prs", return_value=checkout.pr),
               mock.patch.object(flows, "ended", side_effect=lambda flow, outcome: flows.respond(flow, **outcome.data))):
             self.assertEqual(controller.publish()["ending"], "pr")
-            self.assertEqual(workspace.blocked_by(checkout.wt, [checkout]), [])
+            self.assertEqual(workspace.workspace_blockers(checkout.wt, [checkout]), [])
         hold = controller.run.facts["merge_held"]
         self.assertIn("`main` at `moved-base`", hold)
         self.assertIn("needs owner input", hold)
@@ -7128,7 +7136,7 @@ class ServeDeploymentTests(ServeDeploymentFixture):
             return subprocess.CompletedProcess(command, 1, "", "connection reset")
 
         def clean():
-            self.assertTrue(workspace.remove_workspace(wt, [checkout]))
+            self.assertEqual(workspace.remove_workspace(wt, [checkout]).state, "removed")
 
         with mock.patch.object(config, "load_or_problem", return_value=(self.cfg, "")):
             server = serve.Server()
@@ -7452,6 +7460,7 @@ class SelfDeployRollbackTests(unittest.TestCase):
 
     def test_deploy_requires_a_full_tick_and_dashboard_readiness(self):
         self.prepare_state()
+        db.migrate()
         self.server.with_dashboard = False
         cfg = config.Config()
         with mock.patch.object(self.server, "deploy") as deploy:
@@ -7476,7 +7485,6 @@ class SelfDeployRollbackTests(unittest.TestCase):
                    "remind")
         with (mock.patch.multiple(self.server, load=mock.Mock(return_value=True),
                                   **{action: mock.DEFAULT for action in actions}) as stages,
-              mock.patch.object(db, "ensure_schema"),
               mock.patch.object(serve.loop_store, "loop_states", return_value={}),
               mock.patch.object(serve.codebase, "RELEASE", ""),
               mock.patch.object(serve_guard, "at_tip", return_value=True),
