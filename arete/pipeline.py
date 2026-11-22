@@ -16,7 +16,7 @@ import sys
 import time
 from collections import Counter
 from collections.abc import Callable, Iterator
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from pathlib import Path
@@ -39,6 +39,7 @@ from . import (
     intake,
     jev,
     journeys,
+    lanes,
     learning,
     local_paths,
     outbound,
@@ -312,6 +313,7 @@ class AgentRun:
             kw = {**s.call, **reach,
                   "resume": self.sessions.get(config.INHERITS.get(s.step, s.step), NO_SESSION)
                   if s.session == "resume" else NO_SESSION, **kw}
+        kw["extra_env"] = {**(kw.get("extra_env") or {}), **self.lane_env()}
         kw = self.fit_route(step, text, s, kw)
         run_with = kw.get("runner", "") or kw.get("resume", NO_SESSION).runner
         which, model = routing.chosen(kw.get("model", ""), run_with, kw.get("cfg") or self.config)
@@ -359,6 +361,15 @@ class AgentRun:
         finally:
             if self.launch_done:
                 self.launch_done(step, bool(res and (res.ok or res.turns)))
+
+    def lane_env(self) -> dict[str, str]:
+        if self.layer is None:
+            return {}
+        names = check_lanes(self.layer, self)
+        with suppress(OSError):
+            for name in names:
+                util.lock_file(name).close()
+        return {lanes.ENV: ",".join(names)}
 
     def fit_route(self, step: str, text: str, s: steps.Settings | None, kw: dict) -> dict:
         cfg = kw.get("cfg") or self.config
@@ -1041,6 +1052,10 @@ def untracked_by_dir(dirs: list[Path]) -> dict[Path, set[str]]:
 
 def untracked_added_since(before: dict[Path, set[str]]) -> list[tuple[Path, str]]:
     return [(d, name) for d, names in before.items() for name in sorted(workspace.untracked_files(d) - names)]
+
+
+def check_lanes(layer: config.RepoLayer, run: AgentRun) -> list[str]:
+    return lanes.names(layer.parallel_checks, run.config.max_parallel_checks)
 
 
 def tail_of_both_streams(stdout: str, stderr: str, n: int) -> str:
