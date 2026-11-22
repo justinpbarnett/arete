@@ -7234,6 +7234,44 @@ class SelfDeployRollbackTests(unittest.TestCase):
         self.assertEqual(self.receipt()["rollback"], "code_only")
         self.assertEqual(list((self.state / serve_guard.HOLDS).iterdir()),
                          [serve_guard.hold_path(self.state, self.tip)])
+        with (mock.patch.object(db.migrations, "load", return_value=db._CHAIN[:9]),
+              self.assertRaisesRegex(db.migrations.Refused, r"m0010_foundation_remote_turns_contract\.py")):
+            db.migrate(contracts=False)
+
+    def test_older_chain_migrates_and_writes_after_expand(self):
+        self.prepare_state()
+        older, newer = db._CHAIN[:4], db._CHAIN[:5]
+        with mock.patch.object(db.migrations, "load", return_value=newer), redirect_stdout(StringIO()):
+            self.assertFalse(db.migrate())
+        contents = paths.DB_FILE.read_bytes()
+        needed = max(m.n for m in older if m.phase != "contract")
+
+        with (mock.patch.object(db.migrations, "load", return_value=older),
+              mock.patch.multiple(db, LATEST=older[-1].n, NEEDED=needed, _CHECKED=set())):
+            self.assertFalse(db.migrate(contracts=False))
+            self.assertEqual(paths.DB_FILE.read_bytes(), contents)
+            with closing(db.checked_connection(timeout=0)) as conn:
+                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], newer[-1].n)
+                with conn:
+                    conn.execute("INSERT INTO schema_meta VALUES ('rollback_fixture', 'written by older code')")
+            with closing(db.checked_connection(timeout=0)) as conn:
+                self.assertEqual(conn.execute("SELECT value FROM schema_meta WHERE key = 'rollback_fixture'").fetchone(),
+                                 ("written by older code",))
+
+        for column in ("name", "sha256"):
+            with self.subTest(column=column), closing(db.connect_db(paths.DB_FILE)) as conn:
+                conn.execute(f"UPDATE schema_migrations SET {column} = 'changed' WHERE n = 1")
+                with self.assertRaisesRegex(db.migrations.Refused, r"m0001_foundation_ledger\.py.*sha256 differs"):
+                    db.migrations.validate(conn, older, newer[-1].n)
+
+    def test_older_chain_refuses_newer_backfill_by_name(self):
+        self.prepare_state()
+        with mock.patch.object(db.migrations, "load", return_value=db._CHAIN[:6]), redirect_stdout(StringIO()):
+            self.assertFalse(db.migrate())
+        for end in (4, 5):
+            with (self.subTest(end=end), mock.patch.object(db.migrations, "load", return_value=db._CHAIN[:end]),
+                  self.assertRaisesRegex(db.migrations.Refused, r"m0006_runs_budget_backfill\.py")):
+                db.migrate(contracts=False)
 
     def test_dashboard_readiness_preserves_normal_access_checks(self):
         self.prepare_state()
@@ -8813,6 +8851,31 @@ class ReviewRepairPromptTests(unittest.TestCase):
         self.assertIn("These fixes are part of what the finding asks.", rules)
         self.assertIn("Name each extra path you fixed in the summary.", rules)
         self.assertIn("Keep all other changes within what the findings ask. No scope growth", rules)
+
+
+class ReviewScopePromptTests(unittest.TestCase):
+    def setUp(self):
+        brief = prompt_loader.Brief("fixture", "test checkout", "#824", "Review scope", "Review the stated scope.")
+        self.rendered = brief.prompt("review", plan="", checks="", evidence="", compare="abc1234", diff="", earlier="")
+
+    def test_regression_uses_the_starting_commit(self):
+        blockers = self.rendered.split("## Blockers\n", 1)[1].split("\n## Notes", 1)[0]
+        blockers = " ".join(blockers.split())
+        self.assertIn("`regression`: something that worked on abc1234, the commit this change starts from", blockers)
+        self.assertIn(
+            "A case that worked in an earlier revision of this PR is a regression only if it also worked on abc1234.",
+            blockers,
+        )
+
+    def test_unnamed_cases_and_existing_command_gaps_are_major_notes(self):
+        notes = self.rendered.split("## Notes\n", 1)[1].split("\n## Evidence", 1)[0]
+        major = " ".join(notes.split("- `major`: ", 1)[1].split("\n- `minor`:", 1)[0].split())
+        self.assertIn(
+            "A defect involving a form of a configured value, an input shape, or a runner the issue does not name "
+            "is a note unless a Done when line names it.",
+            major,
+        )
+        self.assertIn("A gap that the same command also encounters on abc1234 is a note.", major)
 
 
 class ReviewTests(unittest.TestCase):
