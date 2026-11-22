@@ -132,6 +132,24 @@ class Isolated(unittest.TestCase):
         return run
 
 
+HELPER_GUARD = """\
+import os, signal, sys, time
+from pathlib import Path
+signal.alarm(25)
+
+
+def abandoned():
+    try:
+        os.kill(int(sys.argv[1]), 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
+"""
+SHELL_HELPER_SECONDS = 20
+
+
 class ConfiguredCheckSlotTests(Isolated):
     sync_timeout = 12
 
@@ -201,7 +219,7 @@ class ConfiguredCheckSlotTests(Isolated):
         self.assertIn("waiting for a check slot", (second.dir / "run.log").read_text())
 
     def test_sigkill_releases_the_check_slot(self):
-        code = "import sys; print('holding', flush=True); sys.stdin.read()"
+        code = "import signal, sys; signal.alarm(20); print('holding', flush=True); sys.stdin.read()"
         run = SimpleNamespace(config=self.cfg)
         with slots.check_slot(run, parallel=False) as hold_fds:
             child = subprocess.Popen([sys.executable, "-I", "-c", code], pass_fds=hold_fds, stdin=subprocess.PIPE,
@@ -224,11 +242,13 @@ class ConfiguredCheckSlotTests(Isolated):
 
     def start_checks(self, root, command, *, isolated, start_when=None, default_limit=False):
         code = """\
+import signal
 import sys
 import time
 from pathlib import Path
 from arete import config, paths, pipeline
 
+signal.alarm(25)
 host_lock_dir, lock_dir, command, isolated, start_when = sys.argv[1:]
 assert paths.ISOLATED == (isolated == "True"), (paths.ISOLATED, paths.STATE_DIR)
 assert paths.CHECK_LOCKS_DIR == Path(host_lock_dir), paths.CHECK_LOCKS_DIR
@@ -281,28 +301,25 @@ sys.exit(0 if ok else 1)
         started, finish, finished, reused = (self.root / name for name in ("started", "finish", "finished", "reused"))
         release_command = self.root / "release-command"
         command_pid = self.root / "command-pid"
-        helper = """\
-import os, sys, time
-from pathlib import Path
-started, finish, finished = map(Path, sys.argv[1:])
+        helper = HELPER_GUARD + """\
+started, finish, finished = map(Path, sys.argv[2:])
 assert os.getsid(0) == os.getpid()
 started.touch()
-while not finish.exists():
+while not finish.exists() and not abandoned():
     time.sleep(0.01)
 finished.touch()
 """
-        command = """\
-import os, subprocess, sys, time
-from pathlib import Path
-pid_file, release = map(Path, sys.argv[1:3])
+        command = HELPER_GUARD + """\
+import subprocess
+pid_file, release = map(Path, sys.argv[2:4])
 pid_file.write_text(str(os.getpid()))
-subprocess.Popen([sys.executable, "-I", "-c", sys.argv[3], *sys.argv[4:]], start_new_session=True, close_fds=False,
-                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-while not release.exists():
+subprocess.Popen([sys.executable, "-I", "-c", sys.argv[4], sys.argv[1], *sys.argv[5:]], start_new_session=True,
+                 close_fds=False, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+while not release.exists() and not abandoned():
     time.sleep(0.01)
 """
         first = self.start_checks(regular, "exec " + shlex.join(
-            [sys.executable, "-I", "-c", command, str(command_pid), str(release_command), helper,
+            [sys.executable, "-I", "-c", command, str(os.getpid()), str(command_pid), str(release_command), helper,
              str(started), str(finish), str(finished)]), isolated=False)
         end, reuse = map(shlex.quote, map(str, (finished, reused)))
         try:
@@ -339,7 +356,9 @@ while not release.exists():
     def test_successful_check_leaves_a_redirected_helper_for_the_next_command(self):
         started, release, finished = (self.root / name for name in ("started", "release", "finished"))
         start, stop, end = map(shlex.quote, map(str, (started, release, finished)))
-        checks = {"start": f"(: > {start}; while [ ! -e {stop} ]; do sleep .01; done; : > {end}) "
+        keep_waiting = (f'[ ! -e {stop} ] && kill -0 {os.getpid()} 2>/dev/null && [ "$(date +%s)" -lt "$limit" ]')
+        checks = {"start": f"(limit=$(( $(date +%s) + {SHELL_HELPER_SECONDS} )); : > {start}; "
+                           f"while {keep_waiting}; do sleep .01; done; : > {end}) "
                            "</dev/null >/dev/null 2>&1 &",
                   "use": f"while [ ! -e {start} ]; do sleep .01; done; : > {stop}; "
                          f"while [ ! -e {end} ]; do sleep .01; done"}
@@ -417,7 +436,8 @@ pipeline = true
 
     def test_check_with_redirected_background_helper_returns_zero_within_a_second(self):
         pid_file = self.root / "helper-pid"
-        command = f"sleep 30 </dev/null >/dev/null 2>&1 & echo $! > {shlex.quote(str(pid_file))}"
+        command = (f"sleep {SHELL_HELPER_SECONDS} </dev/null >/dev/null 2>&1 & "
+                   f"echo $! > {shlex.quote(str(pid_file))}")
         layer = config.RepoLayer(self.repo.path, checks={"behavior": command}, parallel_checks=True)
         run = pipeline.AgentRun("redirected", self.repo, self.root, cfg=self.cfg, writes_lines=False)
         began = time.monotonic()
@@ -435,7 +455,8 @@ pipeline = true
     def test_admission_lock_held_by_another_process_is_a_logged_wait_that_is_not_charged(self):
         with paths.directory_fd(paths.CHECK_LOCKS_DIR, create=True):
             pass
-        holder_code = ("import fcntl, os, sys\n"
+        holder_code = ("import fcntl, os, signal, sys\n"
+                       "signal.alarm(20)\n"
                        "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)\n"
                        "fcntl.flock(fd, fcntl.LOCK_EX)\n"
                        "print('held', flush=True)\n"

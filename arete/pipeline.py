@@ -104,6 +104,7 @@ RUNS_LOG = "runs.log"
 RUN_START_SECONDS = 10
 SUCCEEDED = ("pr", "noop", "needs-info", "dry-run", "done")
 ANSWER_FILE = "answer.md"
+CHECK_LANE_POLL_SECONDS = 2
 CHECKS_SCRIPT = "checks"
 NO_CHECKS = "(none configured)"
 SUMMARY_CHARS = 3000
@@ -1073,8 +1074,21 @@ def selected_checks(layer: config.RepoLayer, files: list[str]) -> set[str]:
 
 
 @contextmanager
+def worker_suite_lane(layer: config.RepoLayer, run: AgentRun):
+    with ExitStack() as stack:
+        files = [stack.enter_context(util.lock_file(name)) for name in check_lanes(layer, run)]
+        if not lanes.take_free(files):
+            run.log("checks: waiting for an agent's full suite run to finish")
+            with run.waiting("slot"):
+                while not lanes.take_free(files):
+                    time.sleep(CHECK_LANE_POLL_SECONDS)
+        yield
+
+
+@contextmanager
 def check_lane(layer: config.RepoLayer, run: AgentRun):
-    with slots.check_slot(run, parallel=layer.parallel_checks) as lease, check_process.suite(lease) as hold_fds:
+    with (slots.check_slot(run, parallel=layer.parallel_checks) as lease, check_process.suite(lease) as hold_fds,
+          worker_suite_lane(layer, run)):
         yield hold_fds
 
 
