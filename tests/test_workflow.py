@@ -8039,6 +8039,54 @@ class ServeLoopCountsTests(unittest.TestCase):
         self.assertRegex(source, r"Serve is up since[^\n]*loop runs? running, [^\n]*loop fires? waiting")
 
 
+class ServeTicketCountsTests(unittest.TestCase):
+    def test_serve_line_labels_ticket_counts(self):
+        from arete.commands.common import serve_line
+
+        beat = {"alive": True, "pid": 123, "loops": 2, "off": 0, "running": 1, "pending": 2}
+        for tickets, expected in ((3, "3 ticket runs live"), (1, "1 ticket run live"),
+                                  (None, "unknown ticket runs live")):
+            with self.subTest(tickets=tickets):
+                self.assertIn(f"2 loop fires waiting, {expected}", serve_line(dict(beat, tickets=tickets)))
+        self.assertNotIn("ticket run", serve_line(beat))
+
+    def test_beat_counts_live_tickets_and_loop_runs(self):
+        server = object.__new__(serve.Server)
+        server.db_lock = threading.Lock()
+        server.db_future = None
+        server.db_health = {}
+        server.every_loop = server.live = []
+        server.failing = server.errors = {}
+        server.started = util.now()
+        server.ticks = 0
+        server.reloaded = False
+        server.cfg = SimpleNamespace(ignored=())
+        server.config_problem = server.code_problem = ""
+        rows = [
+            {"kind": "pipeline", "repo": "fixture", "issue": 1},
+            {"kind": "pipeline", "repo": "fixture", "issue": 2},
+            {"kind": "loop"},
+        ]
+        with (mock.patch.object(serve.loop_store, "pending", return_value=[]),
+              mock.patch.object(serve.codebase, "checkout_head", return_value="fixture"),
+              mock.patch.object(serve.run_store, "runs_marked_running", return_value=rows) as running,
+              mock.patch.object(util, "lock_is_held", return_value=True),
+              mock.patch.object(util, "write_json") as write):
+            server.beat()
+            running.assert_called_once_with()
+            beat = write.call_args.args[1]
+            self.assertEqual((beat["tickets"], beat["running"]), (2, 1))
+
+            running.side_effect = OSError("run store unavailable")
+            server.beat()
+            beat = write.call_args.args[1]
+            self.assertEqual((beat["tickets"], beat["running"]), (None, None))
+
+    def test_web_serve_sentence_labels_ticket_counts(self):
+        source = (Path(__file__).resolve().parents[1] / "arete" / "web" / "loops.js").read_text()
+        self.assertRegex(source, r'Serve is up since[^;]*loop fires waiting[^;]*"ticket run"')
+
+
 class SavedRunPolicyTests(unittest.TestCase):
     def test_pre_upgrade_lineage_accepts_unchanged_policy_and_refuses_changes(self):
         repo = config.Repo("fixture", Path("/fixture/repo"), github="fixture/repo")
