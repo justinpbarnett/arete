@@ -40,6 +40,15 @@ EVERY_MODEL = "claude"
 LIMIT_SLACK_SECONDS = 60
 LIMIT_RECHECK_SECONDS = 1800
 SETTING_SOURCES = {"user": ("user",), "repo": ("project", "local")}
+OPENROUTER_BASE_URL = "https://openrouter.ai/api"
+MODEL_VARS = ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_FABLE_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+              "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL")
+OPENROUTER_WITHHELD = frozenset({
+    "CLAUDE_CODE_OAUTH_TOKEN", "OPENROUTER_API_KEY", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_USE_ANTHROPIC_AWS", "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+    "CLAUDE_CODE_USE_MANTLE", "CLAUDE_CODE_USE_GATEWAY",
+})
+UNRECOGNIZED_MODEL = "[claude-code:unrecognized_model]"
 
 
 def binary() -> str:
@@ -47,12 +56,18 @@ def binary() -> str:
 
 
 def agent_env(passing: list[str] | None = None, extra: dict[str, str] | None = None, source=None, *,
-              api_key: str = "") -> dict[str, str]:
+              api_key: str = "", openrouter_config: Path | None = None, model: str = "") -> dict[str, str]:
     passing = environment.passed(config.load()) if passing is None else passing
     env = {k: v for k, v in environment.build([*LOGIN_VARS, *passing], {**AGENT_SETS, **(extra or {})},
                                              never=PARENT_SESSION_VARS, source=source).items()
            if k not in PARENT_SESSION_VARS}
-    if api_key:
+    if openrouter_config is not None:
+        env = {k: v for k, v in env.items() if k not in OPENROUTER_WITHHELD and not k.startswith("ANTHROPIC_")}
+        env.update(ANTHROPIC_BASE_URL=OPENROUTER_BASE_URL, ANTHROPIC_AUTH_TOKEN=api_key, ANTHROPIC_API_KEY="",
+                   CLAUDE_CONFIG_DIR=str(openrouter_config), CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST="1",
+                   CLAUDE_CODE_SUBPROCESS_ENV_SCRUB="1")
+        env.update(dict.fromkeys(MODEL_VARS, model))
+    elif api_key:
         env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
         env.update(ANTHROPIC_API_KEY=api_key, CLAUDE_CODE_SUBPROCESS_ENV_SCRUB="1")
     return env
@@ -181,12 +196,15 @@ def _run(
     on_line: Callable[[str], None] = lambda line: None,
     auth: accounts.Auth | None = None,
     api_key: str = "",
+    openrouter_config: Path | None = None,
     leaf: str = "",
 ) -> Result:
+    openrouter = openrouter_config is not None
     fresh_session = "" if resume.id or not persist else str(uuid.uuid4())
     cmd = command(cwd, model=model, effort=effort, tools=tools, allowed_tools=allowed_tools,
                   disallowed_tools=disallowed_tools, permission_mode=permission_mode, json_schema=json_schema,
-                  resume=resume, fresh_session=fresh_session, system=system, max_budget_usd=max_budget_usd,
+                  resume=resume, fresh_session=fresh_session, system=system,
+                  max_budget_usd=None if openrouter else max_budget_usd,
                   persist=persist, add_dirs=add_dirs, mcp_config=mcp_config, remote=remote, settings=settings,
                   instructions=instructions)
     if remote:
@@ -194,7 +212,17 @@ def _run(
         env = {**AGENT_SETS, **extra}
         cmd = ["env", "-u", "ANTHROPIC_API_KEY", *cmd]
     else:
-        env = agent_env(passing, extra_env, api_key=api_key)
+        env = agent_env(passing, extra_env, api_key=api_key, openrouter_config=openrouter_config, model=model)
+        if openrouter_config is not None:
+            try:
+                if openrouter_config.parent.is_symlink() or openrouter_config.is_symlink():
+                    raise OSError("expected a private config folder without symlinks")
+                openrouter_config.mkdir(parents=True, mode=0o700, exist_ok=True)
+                login = openrouter_config / ".credentials.json"
+                if login.is_symlink() or login.exists():
+                    raise OSError("expected a private config folder without credentials")
+            except OSError as e:
+                return Result(ok=False, session=resume, error=f"OpenRouter Claude config: {e}")
     try:
         if remote:
             proc = device_turns.run(remote, cmd, cwd, env, prompt, timeout=timeout, on_line=on_line,
@@ -213,24 +241,28 @@ def _run(
         err = e.stderr or ""
         result = parse(subprocess.CompletedProcess(cmd, 1, out.decode(errors="replace") if isinstance(out, bytes) else out,
                                                   err.decode(errors="replace") if isinstance(err, bytes) else err),
-                       session, model, json_schema)
+                       session, model, json_schema, openrouter=openrouter)
         result.error = f"timed out after {timeout}s"
         return result
     except FileNotFoundError as e:
         return Result(ok=False, session=resume, error=f"claude not found: {e}")
     fallback = Session(fresh_session, 0.0, "claude") if remote and proc.started and fresh_session else resume
-    result = parse(proc, fallback, model, json_schema)
-    if auth and auth.mode == "api_key":
+    result = parse(proc, fallback, model, json_schema, openrouter=openrouter)
+    if auth and auth.mode == "api_key" and not openrouter:
         result.usage_limit = credit_limit([result.error, failure_reason(result.raw), proc.stderr]) if not result.ok else None
     return result
 
 
-def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_schema: dict | None) -> Result:
+def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_schema: dict | None, *,
+          openrouter: bool = False) -> Result:
     out = proc.stdout.strip()
+    stderr = proc.stderr or ""
+    if openrouter:
+        stderr = "".join(line for line in stderr.splitlines(keepends=True) if not line.startswith(UNRECOGNIZED_MODEL))
     if not (data := result_event(out)):
-        error = util.tail(proc.stderr or out or f"exit {proc.returncode}", 1500)
+        error = util.tail(stderr or out or f"exit {proc.returncode}", 1500)
         result = Result(ok=False, session=resume, error=error,
-                        usage_limit=usage_limit({}, proc.stderr + out, model))
+                        usage_limit=usage_limit({}, stderr + out, model))
         seen = {}
         for line in out.splitlines():
             if turn := streamed_turn(line, seen):
@@ -243,8 +275,10 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
         structured = json_from_text(data.get("result", ""))
     is_error = (bool(data.get("is_error") or data.get("api_error") or data.get("errors"))
                 or data.get("subtype", "success") != "success")
-    session = (Session(data["session_id"], float(data.get("total_cost_usd") or 0), "claude") if data.get("session_id")
-               else resume)
+    session = resume
+    if data.get("session_id"):
+        spent = resume.spent_usd if openrouter else float(data.get("total_cost_usd") or 0)
+        session = Session(data["session_id"], spent, "claude")
     return Result(
         ok=not is_error and proc.returncode == 0,
         text=data.get("result", "") or "",
@@ -252,9 +286,9 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
         structured=structured,
         cost_usd=max(0.0, session.spent_usd - resume.spent_usd),
         turns=int(data.get("num_turns") or 0),
-        error=(failure_reason(data) if is_error else "") or (proc.stderr.strip()[:1500] if proc.returncode else ""),
+        error=(failure_reason(data) if is_error else "") or (stderr.strip()[:1500] if proc.returncode else ""),
         connection_failed=data.get("api_error") == "connection_failed",
-        usage_limit=usage_limit(data, failure_reason(data) + proc.stderr, model) if is_error or proc.returncode else None,
+        usage_limit=usage_limit(data, failure_reason(data) + stderr, model) if is_error or proc.returncode else None,
         raw=data,
         **claude_tokens(data.get("usage") or {}),
         api_seconds=round(float(data.get("duration_api_ms") or 0) / 1000, 2),

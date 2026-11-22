@@ -230,7 +230,8 @@ def outcome_of(line: dict) -> Outcome:
                    data=data if isinstance(data, dict) else {},
                    session=Session(str(session.get("id") or ""), float(amount(session, "spent_usd")),
                                    str(session.get("runner") or ""), str(session.get("credential") or ""),
-                                   str(session.get("account") or ""), str(session.get("generation") or "")))
+                                   str(session.get("account") or ""), str(session.get("generation") or ""),
+                                   str(session.get("openrouter_model") or ""), str(session.get("openrouter_run") or "")))
 
 
 def checked(name: str, value) -> Outcome:
