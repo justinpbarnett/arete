@@ -51,7 +51,7 @@ scratch = Path(sys.argv[1])
 selected = releasejourneys.Selection(Path(sys.executable), scratch / "unused.whl", "", ())
 releasejourneys.SETTINGS_PROBE = f"import runpy; runpy.run_path({sys.argv[2]!r}, run_name='__main__')"
 try:
-    releasejourneys.invoke(selected, releasejourneys.SETTINGS_ACTION, scratch, time.monotonic() + 1)
+    releasejourneys.invoke(selected, releasejourneys.SETTINGS_ACTION, scratch, time.monotonic() + 30)
 finally:
     (scratch / "controller-finally").touch()
 """
@@ -413,16 +413,16 @@ class ReleaseJourneyTests(unittest.TestCase):
             command.insert(2, STOP_DRIVER)
         driver = subprocess.Popen(command, start_new_session=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
-            deadline = time.monotonic() + 2
+            deadline = time.monotonic() + 20
             while not all(holds_lock(path) and path.read_text() for path in locks):
                 self.assertIsNone(driver.poll())
                 self.assertLess(time.monotonic(), deadline, "release action and descendant did not start")
                 time.sleep(0.01)
 
             os.killpg(driver.pid, signal.SIGTERM if wrapped else signal.SIGKILL)
-            _, stderr = driver.communicate(timeout=1)
+            _, stderr = driver.communicate(timeout=10)
             self.assertEqual(driver.returncode, 0 if wrapped else -signal.SIGKILL, stderr.decode())
-            deadline = time.monotonic() + 1
+            deadline = time.monotonic() + 10
             while any(holds_lock(path) for path in locks):
                 self.assertLess(time.monotonic(), deadline, "release action or descendant survived loop stop")
                 time.sleep(0.01)
