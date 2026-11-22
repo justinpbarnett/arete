@@ -160,15 +160,22 @@ class DeployStillRunning(RuntimeError):
 def _stop_deploy_process(proc: subprocess.Popen, index_lock: _DeployIndexLock | None) -> None:
     with suppress(ProcessLookupError, PermissionError):
         os.killpg(proc.pid, signal.SIGTERM)
+    exited_on_term = True
     try:
         proc.wait(timeout=DEPLOY_TERMINATION_GRACE)
     except subprocess.TimeoutExpired:
+        exited_on_term = False
         if index_lock is not None:
             with suppress(OSError, RuntimeError):
                 index_lock.observe(proc.pid)
     try:
-        with suppress(ProcessLookupError):
+        try:
             os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            if not exited_on_term:
+                raise
         proc.wait(timeout=DEPLOY_TERMINATION_GRACE)
     except (PermissionError, subprocess.TimeoutExpired) as error:
         raise DeployStillRunning("could not confirm Git stopped after deploy timeout") from error
@@ -764,7 +771,7 @@ def read_json(p: Path, default):
 
 
 def flush_fd(fd: int) -> None:
-    if hasattr(fcntl, "F_FULLFSYNC"):
+    if os.environ.get("ARETE_DRIVE_FLUSH") != "0" and hasattr(fcntl, "F_FULLFSYNC"):
         try:
             fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
             return

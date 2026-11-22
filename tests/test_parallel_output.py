@@ -4,7 +4,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from tests import parallel
 
 ROOT = Path(__file__).resolve().parent.parent
 TAIL = 3000
@@ -34,6 +40,14 @@ class CrowdedTwo(unittest.TestCase):
 class CrowdedThree(unittest.TestCase):
     def test_it(self):
         crowd(self)
+
+
+class DriveFlush(unittest.TestCase):
+    def test_it(self):
+        marker = os.path.join(os.environ["PARALLEL_MARKERS"], "drive-flush")
+        with open(marker, "a") as values:
+            print(os.environ.get("ARETE_DRIVE_FLUSH"), file=values)
+        self.fail("force an alone rerun")
 
 
 class Noisy(unittest.TestCase):
@@ -71,6 +85,14 @@ class RunnerOutputTests(unittest.TestCase):
                               text=True, timeout=self.class_timeout)
         return done.returncode, done.stdout + done.stderr
 
+    def test_drive_flush_is_disabled_in_initial_and_alone_class_processes(self):
+        self.env["ARETE_DRIVE_FLUSH"] = "1"
+        code, output = self.run_suite("test_sample.DriveFlush")
+        self.assertEqual(code, 1, output)
+        marker = Path(self.env["PARALLEL_MARKERS"]) / "drive-flush"
+        self.assertTrue(marker.is_file(), output)
+        self.assertEqual(marker.read_text().splitlines(), ["0", "0"], output)
+
     def test_a_noisy_failing_class_keeps_its_traceback_in_the_tail(self):
         code, output = self.run_suite("test_sample.CrowdedOne", "test_sample.CrowdedTwo",
                                       "test_sample.CrowdedThree", "test_sample.Noisy")
@@ -99,6 +121,44 @@ class RunnerOutputTests(unittest.TestCase):
         self.assertIn("in test_hangs", output)
         self.assertLess(output.rindex("class exceeded"), output.index("Ran "))
         self.assertNotIn("on its first run", output)
+
+
+class RunnerFailureSummaryTests(unittest.TestCase):
+    crowded = "test_sample.Crowded"
+    crowded_stack = "in test_crowded_timeout"
+    crowded_note = (f"{crowded}: ran past its deadline on its first run, "
+                    "then passed alone within twice its deadline in 0.10s")
+
+    def report(self, **details):
+        return {"ran": 1, "errors": [], "failures": [], "skipped": [], "unexpected": [],
+                "seconds": 0.10, "output": "", "timeout": "", **details}
+
+    def finish_suite(self, failures, slowest=0):
+        with (patch.object(parallel, "open", side_effect=OSError, create=True),
+              patch.object(parallel.shutil, "rmtree"), redirect_stdout(StringIO()) as output):
+            runner = parallel.Runner(SimpleNamespace(slowest=slowest))
+            runner.folder = "worker-reports"
+            runner.results = {self.crowded: self.report(), **failures}
+            runner.crowded = [self.crowded]
+            runner.first_failures[self.crowded] = self.report(timeout=f"Python class stack\n{self.crowded_stack}")
+            code = runner.finish(0.25)
+        return code, output.getvalue()
+
+    def test_tail_names_every_failed_class_after_the_reports(self):
+        code, output = self.finish_suite({
+            "test_sample.TimedOut": self.report(ran=0, timeout="class exceeded its retry deadline"),
+            "test_sample.Noisy": self.report(failures=[("test_assertion", "AssertionError: " + "x" * 2000)]),
+        }, slowest=1)
+        self.assertEqual(code, 1, output)
+        tail = output[-1500:]
+        self.assertIn("Failed classes: test_sample.Noisy, test_sample.TimedOut\nRan 2 tests", tail)
+        self.assertEqual(output.count("Failed classes:"), 1)
+        self.assertNotIn(self.crowded_stack, output)
+
+    def test_crowded_only_suite_ends_ok_with_a_one_line_note(self):
+        code, output = self.finish_suite({})
+        self.assertEqual(code, 0, output)
+        self.assertEqual(output.splitlines(), [self.crowded_note, "Ran 1 tests in 0.25s: OK"])
 
 
 if __name__ == "__main__":

@@ -193,7 +193,8 @@ class Runner:
         result_file = os.path.join(self.folder, f"{index}.json")
         output_file = os.path.join(self.folder, f"{index}.out")
         stack_prefix = f"{index}.stack."
-        env = stack_env({**os.environ, _test_stacks.PREFIX_ENV: os.path.join(self.folder, stack_prefix)})
+        env = stack_env({**os.environ, "ARETE_DRIVE_FLUSH": "0",
+                         _test_stacks.PREFIX_ENV: os.path.join(self.folder, stack_prefix)})
         tail = ["--one", batch.identifier, "--start", self.args.start, "--result", result_file,
                 "--lifeline", str(self.lifeline)]
         command = ([sys.executable, "-m", "tests.parallel"] if __spec__ is not None else
@@ -327,13 +328,13 @@ class Runner:
             where = "ran past its deadline" if first["timeout"] else "failed"
             print(f"{identifier}: {where} on its first run, "
                   f"then passed alone within twice its deadline in {report['seconds']:.2f}s", flush=True)
-        suite_failed = False
+        failed_classes = []
         ran = skipped = 0
         for identifier, report in self.results.items():
             ran += report["ran"]
             skipped += len(report["skipped"])
             if failed(report):
-                suite_failed = True
+                failed_classes.append(identifier)
                 if (first := self.first_failures.get(identifier)) and first["timeout"]:
                     self.show_failures(identifier, first)
                 self.show_failures(identifier, report)
@@ -348,9 +349,11 @@ class Runner:
             print("Slowest classes:")
             for name, report in sorted(self.results.items(), key=lambda item: -item[1]["seconds"])[:self.args.slowest]:
                 print(f"  {report['seconds']:.2f}s {name} ({report['ran']} tests)")
-        print(f"Ran {ran} tests in {seconds:.2f}s: {'FAILED' if suite_failed else 'OK'}" +
+        if failed_classes:
+            print(f"Failed classes: {', '.join(sorted(failed_classes))}")
+        print(f"Ran {ran} tests in {seconds:.2f}s: {'FAILED' if failed_classes else 'OK'}" +
               (f" (skipped={skipped})" if skipped else ""), flush=True)
-        if suite_failed:
+        if failed_classes:
             print(f"Worker reports and output retained in: {self.folder}", flush=True)
             return 1
         shutil.rmtree(self.folder)
