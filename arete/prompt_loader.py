@@ -26,6 +26,10 @@ VERIFICATION_POLICY = (
 )
 
 
+class MissingInputs(ValueError):
+    pass
+
+
 def parse_template(name: str, text: str) -> Template:
     template = Template(text)
     if not template.is_valid():
@@ -64,7 +68,7 @@ def prompt(name: str, prompts_dir: Path = paths.PROMPTS_DIR, **values) -> str:
         f"Run the test classes for the files you changed by name, for example `{class_check}`.\n" if class_check else ""
     ))
     if missing := sorted(set(source.get_identifiers()) - values.keys()):
-        raise ValueError(f"prompt {name}: missing inputs: {', '.join(missing)}")
+        raise MissingInputs(f"prompt {name}: missing inputs: {', '.join(missing)}")
     return source.substitute({k: ("" if v is None else str(v)) for k, v in values.items()})
 
 

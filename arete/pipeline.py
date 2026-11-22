@@ -1722,7 +1722,8 @@ def worker_policy_changed() -> str:
     return record.failure(PolicyChanged("worker policy changed after action acceptance"))
 
 
-def settle_zte_refusal(repo: str, tid: str, slot: slots.RunSlot, run_id: str, error: BaseException, *, committed: bool) -> int:
+def settle_zte_failure(repo: str, tid: str, slot: slots.RunSlot, run_id: str, error: BaseException, *,
+                       committed: bool, failure: dict | None = None) -> int:
     from . import launch_lease
     from .store import db
 
@@ -1737,8 +1738,11 @@ def settle_zte_refusal(repo: str, tid: str, slot: slots.RunSlot, run_id: str, er
                     launch_lease.registered(repo, tid)
                 finally:
                     outcome = "stopped" if isinstance(error, Stopped) else "failed"
+                    fields = {"status": outcome, "finished": util.iso(), "summary": str(error)}
+                    if failure:
+                        fields.update(failure=json.dumps(failure), summary=f"crashed: {error}"[:300])
                     with db.tx(timeout=0):
-                        run_store.settle(run_id, {"status": outcome, "finished": util.iso(), "summary": str(error)})
+                        run_store.settle(run_id, fields)
         except (OSError, RuntimeError, sqlite3.Error):
             pass  # The scheduled reaper settles abandoned registered runs.
     return 2
@@ -1958,7 +1962,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                         launch_lease.registered(repo.name, str(tid))
                         check_start_cutoff()
                 except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
-                    return settle_zte_refusal(repo.name, str(tid), slot, run_id, error, committed=committed)
+                    return settle_zte_failure(repo.name, str(tid), slot, run_id, error, committed=committed)
             else:
                 run_id = start()
             scratch.RUN_BASELINES[run_id] = producer_baseline
@@ -1981,7 +1985,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 if not zte_grant:
                     slot.free()
                     raise
-                return settle_zte_refusal(repo.name, str(tid), slot, run_id, error, committed=True)
+                return settle_zte_failure(repo.name, str(tid), slot, run_id, error, committed=True)
             if held_from := earlier["id"] if restarting or run.answering else (
                     script.continues or script.repairs if script else ""):
                 run.ab_held = run_store.ab_held(held_from)
@@ -2020,7 +2024,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
             if not zte_grant:
                 raise
-            return settle_zte_refusal(repo.name, str(tid), slot, run_id, error, committed=True)
+            return settle_zte_failure(repo.name, str(tid), slot, run_id, error, committed=True)
         pr_url, passed, drive_entered, retaining_catch_up = "", None, False, False
 
         def check_work_log():
@@ -2091,23 +2095,23 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 passed = status == "step"
         except runlimits.Parked as e:
             if zte_grant:
-                return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
+                return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True)
             status, summary, pr_url = run.catch_up_cleanup_park or park_run(run, str(e))
         except factory.OnlyDone as e:
             if zte_grant:
-                return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
+                return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True)
             status, summary, passed = flows.alone(flow)
         except factory.Refused as e:
             retaining_catch_up = reconciling_catch_up
             if zte_grant:
-                return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
+                return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True)
             if run.environment_release:
                 status, summary, pr_url = environment_retry_held(run, script.continues, str(e))
             else:
                 status, summary = "failed", str(e)
         except Stopped as e:
             if zte_grant:
-                return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
+                return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True)
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
             status, summary, pr_url = "stopped", record.STOPPED, ""
             run.log(record.STOPPED)
@@ -2121,14 +2125,14 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             run.log(summary)
         except workspace.RunFailed as e:
             if zte_grant:
-                return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
+                return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True)
             if run.environment_release:
                 status, summary, pr_url = environment_retry_held(run, script.continues, e.why)
             else:
                 status, summary, pr_url = _fail(run, e.why, detail=e.detail, recovery=e.recovery)
         except tracker.ERRORS as e:
             if zte_grant:
-                return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
+                return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True)
             why = f"tracker refused {run.ref}: {e}"
             if run.environment_release:
                 status, summary, pr_url = environment_retry_held(run, script.continues, why)
@@ -2136,7 +2140,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 status, summary, pr_url = _fail(run, why)
         except Exception as e:
             if zte_grant:
-                return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
+                failure = crash_failure(e) if isinstance(e, prompt_loader.MissingInputs) else None
+                return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True, failure=failure)
             run.log(f"crashed: {type(e).__name__}: {e}")
             run.failure = crash_failure(e)
             status, summary, pr_url = "failed", f"crashed: {e}"[:300], ""
@@ -2165,7 +2170,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         except (OSError, RuntimeError, ValueError, sqlite3.Error) as e:
             if not zte_grant:
                 raise
-            return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
+            return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True)
         if status == "skipped" and not zte_grant:
             print(f"{name} was not run: {summary}. Pass --force to run it anyway.")
         return 0 if (status in SUCCEEDED if passed is None else passed) else 1
