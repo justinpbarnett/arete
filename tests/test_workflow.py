@@ -7313,35 +7313,6 @@ signal.pause()
         restore.assert_not_called()
         self.assertIn(f"left alone for {tip} ({error})", self.server.say.call_args.args[0])
 
-
-class StopDeployProcessPermissionTests(unittest.TestCase):
-    def process(self, *waits):
-        proc = mock.Mock(pid=4242)
-        proc.wait.side_effect = list(waits)
-        return proc
-
-    def kill(self, signals):
-        def killpg(pid, sig):
-            signals.append(sig)
-            if sig == signal.SIGKILL:
-                raise PermissionError
-        return killpg
-
-    def test_permission_error_after_exit_on_term_still_waits_twice(self):
-        proc = self.process(0, 0)
-        signals = []
-        with mock.patch.object(util.os, "killpg", self.kill(signals)):
-            util._stop_deploy_process(proc, None)
-        self.assertEqual(signals, [signal.SIGTERM, signal.SIGKILL])
-        self.assertEqual(proc.wait.call_count, 2)
-
-    def test_permission_error_while_still_running_raises(self):
-        proc = self.process(subprocess.TimeoutExpired("git", 1), 0)
-        signals = []
-        with (mock.patch.object(util.os, "killpg", self.kill(signals)),
-              self.assertRaisesRegex(util.DeployStillRunning, "could not confirm Git stopped")):
-            util._stop_deploy_process(proc, None)
-
     def test_timed_out_merge_releases_its_lock_and_retries(self):
         (self.writer / "arete" / "fixture.py").write_text("version = 2\n")
         (self.writer / "arete" / "fresh.py").write_text("added = True\n")
@@ -7393,6 +7364,35 @@ class StopDeployProcessPermissionTests(unittest.TestCase):
         lock.unlink()
         self.git(self.checkout, "config", "filter.delay.smudge", "cat")
         self.assertEqual(self.deploy(), tip)
+
+
+class StopDeployProcessPermissionTests(unittest.TestCase):
+    def test_permission_error_after_exit_on_term_still_waits_twice(self):
+        proc = mock.Mock(pid=4242)
+        proc.wait.return_value = 0
+        with mock.patch.object(util.os, "killpg", side_effect=[None, PermissionError]) as killpg:
+            util._stop_deploy_process(proc, None)
+
+        self.assertEqual(killpg.call_args_list, [
+            mock.call(proc.pid, signal.SIGTERM),
+            mock.call(proc.pid, signal.SIGKILL),
+        ])
+        self.assertEqual(proc.wait.call_args_list, [
+            mock.call(timeout=util.DEPLOY_TERMINATION_GRACE),
+        ] * 2)
+
+    def test_permission_error_while_still_running_raises(self):
+        proc = mock.Mock(pid=4242)
+        proc.wait.side_effect = [subprocess.TimeoutExpired("git", 1)]
+        with (mock.patch.object(util.os, "killpg", side_effect=[None, PermissionError]) as killpg,
+              self.assertRaisesRegex(util.DeployStillRunning, "could not confirm Git stopped")):
+            util._stop_deploy_process(proc, None)
+
+        self.assertEqual(killpg.call_args_list, [
+            mock.call(proc.pid, signal.SIGTERM),
+            mock.call(proc.pid, signal.SIGKILL),
+        ])
+        proc.wait.assert_called_once_with(timeout=util.DEPLOY_TERMINATION_GRACE)
 
 
 class CommandConfinementTests(unittest.TestCase):
