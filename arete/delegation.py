@@ -164,10 +164,12 @@ def settings_digest(data) -> str:
     return digest(json.loads(json.dumps(data, default=str)))
 
 
-def worker_settings_digest(value, serialize) -> str:
+def worker_settings_digest(value, serialize, *, include_check_limit: bool = False) -> str:
     data = serialize(value)
     if isinstance(value, config.Config):
         config.remove_controller_only_settings(data)
+        if not include_check_limit:
+            data.pop("max_parallel_checks", None)
     return settings_digest(data)
 
 
@@ -180,7 +182,9 @@ def settings_shas(value) -> set[str]:
 
 
 def legacy_settings_shas(cfg: config.Config) -> set[str]:
-    return {settings_digest(explicit(cfg)), settings_digest(asdict(cfg))}
+    return {settings_digest(explicit(cfg)), settings_digest(asdict(cfg)),
+            worker_settings_digest(cfg, explicit, include_check_limit=True),
+            worker_settings_digest(cfg, asdict, include_check_limit=True)}
 
 
 def request(job, action: str, prompt: str, setting, tools: tuple, rules: list[str], session=NO_SESSION) -> dict:
@@ -254,7 +258,7 @@ def main() -> None:
                            wait_out_limits=False, fresh_prompt=lambda which: launch["prompt"])
         send(channel, {"event": "result", "ok": result.ok, "text": result.text[:65536],
                        "structured": result.structured, "error": result.error[:2000], "session": asdict(result.session),
-                       "cost_usd": run.cost, "paid_usd": run.paid,
+                       "cost_usd": run.cost, "paid_usd": run.paid, "turns": result.turns,
                        "runner": result.runner, "model": result.model, "effort": result.effort,
                        "record": result.record, "recovery": pipeline.runner.start_failure(result, launch["role"])})
     except pipeline.Stopped:
