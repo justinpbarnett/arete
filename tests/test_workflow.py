@@ -4586,7 +4586,7 @@ class CatchUpReviewMergeTests(CatchUpReviewFixture):
         self.assertEqual(self.build.steps["review"], 2)
 
 
-class CatchUpReviewSafetyTests(CatchUpRepairFixture):
+class CatchUpReviewRenameSafetyTests(CatchUpReviewFixture):
     def prepare_renamed_helpers(self):
         renames = {"base": ("base helper.txt", "moved helper.txt"),
                    "resolution": ("resolution helper.txt", "resolved\thelper.txt")}
@@ -4663,6 +4663,8 @@ class CatchUpReviewSafetyTests(CatchUpRepairFixture):
         for n in range(1, len(citations) + 1):
             self.assertIn(f"Incorrect rename citation {n}. (found on catch-up)", self.body)
 
+
+class CatchUpReviewPatchSafetyTests(CatchUpReviewFixture):
     def history_commit(self, files, *parents):
         entries = []
         for name, content in files.items():
