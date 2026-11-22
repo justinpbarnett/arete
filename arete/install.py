@@ -6,6 +6,7 @@ import plistlib
 import re
 import shutil
 import sys
+import time
 from pathlib import Path
 
 from . import config, paths, serve_guard, tracker, util
@@ -16,6 +17,9 @@ SERVE = "serve"
 SERVE_UNIT = "arete-serve.service"
 RETIRED = ("heartbeat", "poll", "mine", "audit", "eval", "triage", "dashboard")
 PLATFORMS = ("mac", "linux")
+BOOTOUT_TIMEOUT = 30
+LAUNCHD_RETRY_DELAY = 0.25
+BOOTSTRAP_ATTEMPTS = 3
 
 
 def label(name: str) -> str:
@@ -160,8 +164,22 @@ def install(dry_run: bool = False, platform: str = "") -> int:
         return 1
     paths.ensure_dirs()
     code = install_launchd() if platform == "mac" else install_systemd()
+    if platform == "mac" and code:
+        return code
     prepare_trackers()
     return code
+
+
+def wait_for_bootout(service: str) -> bool:
+    deadline = time.monotonic() + BOOTOUT_TIMEOUT
+    while (remaining := deadline - time.monotonic()) > 0:
+        res = util.sh(["launchctl", "print", service], timeout=remaining, keeps=("launch",))
+        if res.returncode == util.TIMED_OUT:
+            return False
+        if res.returncode != 0:
+            return True
+        time.sleep(min(LAUNCHD_RETRY_DELAY, max(0, deadline - time.monotonic())))
+    return False
 
 
 def install_launchd() -> int:
@@ -171,11 +189,31 @@ def install_launchd() -> int:
         retire(label(name))
     pl = serve_plist()
     dest = serve_file("mac")
-    util.sh(["launchctl", "bootout", f"{_domain()}/{pl['Label']}"], timeout=30, keeps=("launch",))
+    lb = pl["Label"]
+    domain = _domain()
+    service = f"{domain}/{lb}"
+    util.sh(["launchctl", "bootout", service], timeout=30, keeps=("launch",))
+    if not wait_for_bootout(service):
+        print(f"{lb}: timed out waiting for bootout")
+        return 1
     dest.write_bytes(plistlib.dumps(pl))
-    res = util.sh(["launchctl", "bootstrap", _domain(), str(dest)], timeout=30, keeps=("launch",))
-    print(f"{pl['Label']}: " + ("loaded" if res.returncode == 0 else f"bootstrap failed: {util.first_line(res.stderr)}"))
-    return 0 if res.returncode == 0 else 1
+    for attempt in range(BOOTSTRAP_ATTEMPTS):
+        if attempt:
+            time.sleep(LAUNCHD_RETRY_DELAY)
+        res = util.sh(["launchctl", "bootstrap", domain, str(dest)], timeout=30, keeps=("launch",))
+        if res.returncode == 0:
+            break
+    else:
+        error = util.first_line(res.stderr or res.stdout) or f"exit status {res.returncode}"
+        print(f"{lb}: bootstrap failed: {error}")
+        return 1
+    res = util.sh(["launchctl", "print", service], timeout=30, keeps=("launch",))
+    if res.returncode != 0:
+        error = util.first_line(res.stderr or res.stdout) or f"exit status {res.returncode}"
+        print(f"{lb}: launchctl print failed after bootstrap: {error}")
+        return 1
+    print(f"{lb}: loaded")
+    return 0
 
 
 def install_systemd() -> int:
