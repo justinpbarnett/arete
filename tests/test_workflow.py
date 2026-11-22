@@ -9159,6 +9159,85 @@ class NamedClassCheckTests(unittest.TestCase):
         self.assertFalse(any(str(self.script) in rule for rule in review_allowed))
 
 
+class PromptSnapshotTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        self.prompts = self.root / "arete" / "prompts"
+        self.prompts.mkdir(parents=True)
+        self.file = self.prompts / "x.md"
+        self.file.write_text("a $one")
+        self.enterContext(mock.patch.object(prompt_loader, "TEMPLATES", {}))
+
+    def test_prompt_keeps_startup_template_after_edit(self):
+        prompt_loader.load_templates(self.prompts)
+        self.file.write_text("a $one $two")
+
+        self.assertEqual(prompt_loader.prompt("x", self.prompts, one="1"), "a 1")
+
+    def test_other_folder_reads_current_template_from_disk(self):
+        other = self.root / "other"
+        other.mkdir()
+        file = other / "x.md"
+        file.write_text("original $one")
+        prompt_loader.load_templates(self.prompts)
+        file.write_text("current $one")
+
+        self.assertEqual(prompt_loader.template("x", other).template, "current $one")
+
+    def test_undecodable_template_falls_back_to_disk(self):
+        bad = self.prompts / "bad.md"
+        bad.write_bytes(b"\xff")
+        prompt_loader.load_templates(self.prompts)
+        self.file.write_text("a $one $two")
+
+        self.assertEqual(prompt_loader.prompt("x", self.prompts, one="1"), "a 1")
+        with self.assertRaises(UnicodeDecodeError):
+            prompt_loader.template("bad", self.prompts)
+        bad.write_text("repaired")
+        self.assertEqual(prompt_loader.template("bad", self.prompts).template, "repaired")
+
+    def test_run_child_command_snapshots_templates(self):
+        command = pipeline.script_command(config.Config(), "feature")
+
+        self.assertIn("codebase.load(templates=True)", command[3])
+
+    def test_default_codebase_load_reads_templates_from_disk(self):
+        with (mock.patch.multiple(codebase, CHECKOUT=self.root, STAMP="", RELEASE=""),
+              mock.patch.object(codebase, "import_everything"),
+              mock.patch.object(codebase, "head_and_dirt", return_value=("", False)),
+              mock.patch.object(codebase.arete, "IMPORTED_NS", self.file.stat().st_mtime_ns),
+              mock.patch.object(paths, "PROMPTS_DIR", self.prompts)):
+            codebase.load()
+
+        self.file.write_text("a $one $two")
+        self.assertEqual(prompt_loader.template("x", self.prompts).template, "a $one $two")
+
+    def test_inventory_digest_changes_when_prompt_changes(self):
+        with mock.patch.object(codebase, "CHECKOUT", self.root):
+            before, _ = codebase.inventory()
+            self.file.write_text("a $one $two")
+            after, _ = codebase.inventory()
+
+        self.assertNotEqual(before, after)
+
+    def test_template_change_during_codebase_load_triggers_reload(self):
+        def import_during_deploy():
+            self.file.write_text("deployed $one")
+
+        with (mock.patch.multiple(codebase, CHECKOUT=self.root, STAMP="", RELEASE=""),
+              mock.patch.object(codebase, "import_everything", side_effect=import_during_deploy),
+              mock.patch.object(codebase, "head_and_dirt", return_value=("", False)),
+              mock.patch.object(codebase.arete, "IMPORTED_NS", self.file.stat().st_mtime_ns),
+              mock.patch.object(paths, "PROMPTS_DIR", self.prompts),
+              mock.patch.dict(os.environ, {codebase.RELOADS: "0"}),
+              mock.patch.object(codebase, "reload") as reload):
+            codebase.load(templates=True)
+
+        reload.assert_called_once_with(1)
+        self.file.write_text("later $one $two")
+        self.assertEqual(prompt_loader.prompt("x", self.prompts, one="1"), "deployed 1")
+
+
 class ReviewRepairPromptTests(unittest.TestCase):
     brief = prompt_loader.Brief("fixture", "test checkout", "#817", "Review and repair", "Cover analogous paths.")
 

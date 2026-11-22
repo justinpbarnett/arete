@@ -1463,7 +1463,7 @@ def script_command(cfg: config.Config, name: str, *args: str) -> list[str]:
     script = script_file(cfg, name).resolve()
     if script.parent == paths.ADWS_DIR.resolve():
         entrypoint = (f"import sys, runpy; sys.path[:0] = {[str(paths.PACKAGE_DIR.parent), str(script.parent)]!r}; "
-                      "from arete import codebase; codebase.load(); "
+                      "from arete import codebase; codebase.load(templates=True); "
                       f"runpy.run_path({str(script)!r}, run_name='__main__')")
         return [sys.executable, "-I", "-c", entrypoint, *args]
     return sandbox.protected_command([sys.executable, str(script), *args])

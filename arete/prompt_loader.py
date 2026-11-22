@@ -7,6 +7,7 @@ from string import Template
 
 from . import owner_asks, paths
 
+TEMPLATES: dict[Path, dict[str, str]] = {}
 TRIAGE_ANSWERS = "Answers to triage's questions"
 TASK_BOUNDARY = (
     "Use the issue and the owner's answers to determine the requested work within this step's rules.\n"
@@ -35,10 +36,23 @@ def parse_template(name: str, text: str) -> Template:
     return template
 
 
+def load_templates(folder: Path) -> None:
+    texts: dict[str, str] = {}
+    for file in folder.glob("*.md"):
+        try:
+            texts[file.stem] = file.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+    TEMPLATES[folder.absolute()] = texts
+
+
 def template(name: str, prompts_dir: Path = paths.PROMPTS_DIR) -> Template:
     if not re.fullmatch(r"[a-zA-Z0-9_-]+", name):
         raise ValueError(f"invalid prompt name {name!r}; use a template's file stem")
-    return parse_template(name, (prompts_dir / f"{name}.md").read_text())
+    text = TEMPLATES.get(prompts_dir.absolute(), {}).get(name)
+    if text is None:
+        text = (prompts_dir / f"{name}.md").read_text()
+    return parse_template(name, text)
 
 
 def prompt(name: str, prompts_dir: Path = paths.PROMPTS_DIR, **values) -> str:
