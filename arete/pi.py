@@ -41,6 +41,7 @@ from .agent import (
     UsageLimit,
     credit_limit,
     json_from_text,
+    overload_limit,
     provider_reset,
     usage_totals,
 )
@@ -627,10 +628,12 @@ def usage_limit(auth: accounts.Auth, provider: str, text: str | dict | list, mod
     text = data if isinstance(data, str) else json.dumps(data, default=str)
     native_limit = (claude.usage_limit(data, "\n".join([text, *error_messages(data)]), model)
                     if auth.family == "claude" else None)
+    if native_limit and native_limit.kind == "overloaded":
+        return native_limit
     if (not native_limit and not re.search(r"usage[_ ]limit(?:[_ ]reached)?|subscription.{0,30}limit|"
                                           r"you.ve (?:hit|reached).{0,30}limit|weekly limit|five.hour limit",
                                           text, re.IGNORECASE) and not claude.USAGE_LIMIT_TEXT.search(text)):
-        return None
+        return overload_limit(text, model)
     from . import codex
 
     legacy = claude.LEGACY_LIMIT_RESET.search(text)

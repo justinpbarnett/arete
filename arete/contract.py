@@ -9,7 +9,7 @@ from functools import cache
 
 from . import refusals
 
-MINOR = 1
+MINOR = 3
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -68,6 +68,8 @@ CHAT = obj({"id": INTEGER, **dict.fromkeys(("title", "project", "created", "upda
             "busy": {"type": ["boolean", "integer"]}, "paid_usd": {"type": ["number", "null"]},
             "spent": {"type": ["number", "null"]}, "messages": array(obj({"id": INTEGER, "sender": STRING, "text": NULL_TEXT,
               "cost": NUMBER, "paid_usd": {"type": ["number", "null"]}, "ts": STRING}))}, ["id", "title"])
+HOOK_EVENT = obj({**dict.fromkeys(("ts", "hook", "kind", "cls", "detail", "error"), STRING),
+                  **dict.fromkeys(("tool", "cwd", "session"), JSON), "agent": BOOLEAN}, ["ts", "kind", "cls"])
 RESOURCE = {
     "task": TASK, "run": RUN,
     "project": obj(dict.fromkeys(("id", "name", "github", "path"), STRING)),
@@ -94,6 +96,8 @@ ERRORS = [{"code": code, "status": status, "description": description} for code,
     ("forbidden", 403, "The request was not authorized."),
     ("method_not_allowed", 405, "The route does not accept this method."),
     ("conflict", 409, "The request conflicts with current state."),
+    ("invalid_state", 409, "The task cannot be closed from its current state."),
+    ("task_version_conflict", 409, "The task was updated since the requested base version."),
     ("idempotency_in_flight", 409, "Try again with the same key after Retry-After."),
     ("body_too_large", 413, "The request body exceeds the route's size limit."),
     ("uri_too_long", 414, "The request target is too long."),
@@ -115,12 +119,14 @@ def envelope(properties):
     return obj({"seq": {"type": "string", "pattern": r"^\d+\.\d+$"}, **properties})
 
 
-def operation(name, path, result, inputs=None, example=None, method="GET"):
+def operation(name, path, result, inputs=None, example=None, method="GET", *, errors=()):
     shown = sample(result)
     if "seq" in result.get("properties", {}):
         shown["seq"] = "0.1"
+    new_errors = {"invalid_state", "task_version_conflict"}
     return {"name": name, "method": method, "path": "/api/v1/" + path,
-            "input": inputs or obj({}), "result": result, "errors": [r["code"] for r in ERRORS],
+            "input": inputs or obj({}), "result": result,
+            "errors": [r["code"] for r in ERRORS if r["code"] not in new_errors or r["code"] in errors],
             "example": {"input": example or {}, "result": shown}}
 
 
@@ -140,7 +146,8 @@ def sample(schema):
 for _error in ERRORS:
     _code, _status, _description = (_error[k] for k in ("code", "status", "description"))
     _details = {"unknown_field": {"fields": array(STRING)}, "client_too_old": {"required_version": STRING},
-                "version_conflict": {"current": RUN}, "rate_limited": {"retry_after": INTEGER}}.get(_code, {})
+                "version_conflict": {"current": RUN}, "task_version_conflict": {"current": TASK},
+                "rate_limited": {"retry_after": INTEGER}}.get(_code, {})
     _error["schema"] = obj({"type": {"type": "string", "enum": [f"urn:arete:problem:{_code}"]}, "title": STRING,
                             "status": {"type": "integer", "enum": [_status]}, "detail": STRING, "error": STRING,
                             "code": {"type": "string", "enum": [_code]}, **_details})
@@ -196,6 +203,36 @@ OPERATIONS += [
               obj({"run": STRING, "after": STRING}, ["run"]), {"run": "example"}),
     operation("settings.get", "settings", envelope({"settings": SETTINGS})),
     operation("health.get", "health", envelope({"health": HEALTH})),
+    operation("status.get", "status", envelope({"snapshot": mapping(JSON), "loops": array(mapping(JSON)),
+              "records": PANEL}), obj({"limit": STRING}, [])),
+    operation("task.create", "tasks", envelope({"task": TASK}),
+              obj({"repo": STRING, "body": STRING, "title": STRING, "kind": STRING}, ["repo", "body"]),
+              {"repo": "example", "body": "Work to do"}, "POST"),
+    operation("task.update", "tasks/{id}", envelope({"task": TASK}),
+              obj({"id": STRING, "base_version": {**INTEGER, "minimum": 1}, "title": STRING, "body": STRING,
+                   "kind": STRING, "state": STRING}, ["id", "base_version"]),
+              {"id": "t-a1b2", "title": "Updated title", "base_version": 1}, "PATCH", errors=("task_version_conflict",)),
+    operation("task.close", "tasks/{task}/close", envelope({"task": TASK}), obj({"task": STRING}),
+              {"task": "t-a1b2"}, "POST", errors=("invalid_state",)),
+    operation("comment.create", "tasks/{task}/comments", envelope({"task": TASK}),
+              obj({"task": STRING, "body": STRING}), {"task": "t-a1b2", "body": "Reply"}, "POST"),
+    operation("run.stop", "runs/{run}/stop", envelope({"id": STRING, "stopped": BOOLEAN, "pid": INTEGER,
+              "was": STRING, "ticket": STRING}), obj({"run": STRING, "base_version": {**INTEGER, "minimum": 1}}),
+              {"run": "pip-demo-1", "base_version": 1}, "POST"),
+    operation("run.steer", "runs/{run}/steer", envelope({"id": STRING, "queued": BOOLEAN}),
+              obj({"run": STRING, "text": STRING}), {"run": "session-demo-1", "text": "Continue"}, "POST"),
+    *(operation(f"run.{action}", f"runs/{{run}}/{action}", envelope({"id": STRING}), obj({"run": STRING}),
+                {"run": "pip-demo-1"}, "POST") for action in ("pin", "unpin")),
+    operation("chat.drop", "chats/{chat}", envelope({"chat": mapping(JSON)}), obj({"chat": STRING}),
+              {"chat": "1"}, "DELETE"),
+    operation("serve.install", "serve/install", envelope({"restarting": BOOLEAN, "said": STRING}),
+              method="POST"),
+    operation("hook_event.list", "hook-events", envelope({"events": array(mapping(JSON))}), obj({"since": STRING}, [])),
+    operation("hook.ingest", "hook-events", envelope({"received": INTEGER}),
+              obj({"origin": {**STRING, "pattern": "^[0-9a-f]{32}$"}, "stream": {**STRING, "pattern": "^[0-9a-f]{64}$"},
+                   "offset": {**INTEGER, "minimum": 0}, "events": array(HOOK_EVENT)}, ["origin", "offset", "events"]),
+              {"origin": "0123456789abcdef0123456789abcdef", "offset": 0,
+               "events": [{"ts": "2026-01-01T00:00:00Z", "kind": "skill", "cls": "invoked", "session": None}]}, "POST"),
     operation("batch.run", "batch", envelope({"results": array(mapping(JSON))}),
               obj({"requests": array(obj({"operation": STRING, "input": mapping(JSON)}, ["operation"]))}),
               {"requests": [{"operation": "meta.get"}]}, "POST"),
@@ -203,6 +240,12 @@ OPERATIONS += [
               "view": STRING, "via": STRING, "name": STRING, "ms": INTEGER}, ["kind", "device", "tab", "view"]),
               {"kind": "visit", "device": "desktop", "tab": "0123456789abcdef", "view": "live", "via": "open"}, "POST"),
 ]
+for _op in OPERATIONS:
+    if _op["name"] in ("run.stop", "serve.install"):
+        optional = {"pid", "was", "ticket", "said"}
+        shape = _op["result"]
+        shape["required"] = [key for key in shape["required"] if key not in optional]
+        _op["example"]["result"] = {key: _op["example"]["result"][key] for key in shape["required"]}
 BY_NAME = {op["name"]: op for op in OPERATIONS}
 BY_NAME["batch.run"]["result"]["properties"]["results"]["items"] = {
     "anyOf": [op["result"] for op in OPERATIONS if op["method"] == "GET"]}
@@ -302,9 +345,13 @@ def validate(value, schema, path="input"):
 
 def match(method, path):
     for op in OPERATIONS:
-        if method == op["method"] and (found := re.fullmatch(op["path"].replace("{id}", "([^/]+)"), path)):
-            return op, ({"id": found[1]} if found.groups() else {})
+        if method == op["method"] and (found := re.fullmatch(re.sub(r"\{(\w+)\}", r"(?P<\1>[^/]+)", op["path"]), path)):
+            return op, found.groupdict()
     return None
+
+
+def keyed_write(op):
+    return op["method"] != "GET" and op["name"] not in ("batch.run", "usage.record")
 
 
 def fields(names):

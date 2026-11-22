@@ -37,5 +37,6 @@ Follow the repository's instructions, including whether it asks for tests.
 Do not invent a plan document or run the full check gate unless your delegated goal specifically needs it.
 Arete runs the required independent checks before publication.
 Change at most $max_lines lines and leave all Git writes to Arete.
+Denied paths: $denied.
 These shell commands are available: $commands.
 Report what you actually observed, what changed, remaining risks and any question the owner must answer.

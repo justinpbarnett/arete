@@ -225,6 +225,15 @@ def view(run_id: str, connect=reader) -> dict | None:
                             for action in actions]}
 
 
+def catch_up_push(data: dict) -> dict:
+    intent = data.get("publication_intent") or {}
+    saved = intent.get("catch_up") or {}
+    if (intent.get("phase") == "publish" and data.get("mode") == "orchestrate"
+            and {"action", "pr", "previous", "head", "base", "verified", "review"} <= saved.keys()):
+        return saved
+    return {}
+
+
 def publication_pending(run_id: str) -> bool:
     found = find(run_id)
     if not found:

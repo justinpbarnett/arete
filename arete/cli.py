@@ -1,18 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+from pathlib import Path
 
-from . import __version__, codebase, paths, pilot, principals, zte
-from .commands import api, costs, hooks, lab, loops, records, research, runs, sessions, setup, tasks
-from .commands.common import Parser, serve_line
+__all__ = ["main", "parser", "serve_line"]
+_serve_start_checked = False
 
-__all__ = ["main", "serve_line"]
 
-REGISTRATIONS = (api.register, runs.register, tasks.register, loops.register, sessions.register, hooks.register, costs.register,
-                 records.register, research.register, lab.register, setup.register, pilot.register, zte.register)
+def serve_line(beat: dict) -> str:
+    from .commands.common import serve_line as format_serve_line
 
-PER_CALL_HOOKS = paths.PER_CALL_HOOKS
+    return format_serve_line(beat)
 
 
 class ShowVersion(argparse.Action):
@@ -20,30 +20,99 @@ class ShowVersion(argparse.Action):
         super().__init__(option_strings, dest, nargs=0, default=argparse.SUPPRESS, help="show the version and exit")
 
     def __call__(self, parser, namespace, values, option_string=None):
+        from . import __version__, codebase
+
         print(f"arete {__version__} {codebase.load()}")
         parser.exit()
 
 
-def main(argv: list[str] | None = None) -> int:
-    from . import refusals
+def parser() -> argparse.ArgumentParser:
+    from . import pilot, zte
+    from .commands import api, costs, hooks, lab, loops, records, research, runs, sessions, setup, tasks, verify_fault
+    from .commands.arguments import Parser
 
     ap = argparse.ArgumentParser(prog="arete", description="arete: agents that keep running and keep getting better", formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--version", action=ShowVersion)
     sub = ap.add_subparsers(dest="cmd", required=True, parser_class=Parser)
-    for register in REGISTRATIONS:
-        register(sub)
-    args = ap.parse_args(argv)
-    if args.cmd == "api":
-        return args.fn(args) or 0
-    if args.cmd not in PER_CALL_HOOKS:
-        codebase.load()
+    for group in (api, runs, tasks, loops, sessions, hooks, costs, records, research, lab, setup, pilot, zte, verify_fault):
+        group.register(sub)
+    return ap
+
+
+def status_from_heartbeat(problem: SystemExit) -> int:
+    from . import codebase, local_paths
+
+    _, state, isolated = local_paths.local_dirs(Path.home())
+    print(problem, file=sys.stderr)
     try:
-        recovery = args.cmd in ("init", "migrate") or (args.cmd == "backup" and args.restore)
-        with principals.acting("hand" if recovery else principals.cli_actor()):
+        beat = json.loads(local_paths.read_confined(state / local_paths.SERVE_BEAT_NAME, isolated=isolated))
+    except (OSError, ValueError):
+        beat = None
+    if isinstance(beat, dict) and (revisions := codebase.serve_revisions(beat)):
+        print(f"last recorded serve heartbeat at {beat.get('at', 'unknown time')}, {revisions}", file=sys.stderr)
+    else:
+        print("serve heartbeat has no recorded revisions", file=sys.stderr)
+    return 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["serve"] and not _serve_start_checked:
+        from . import local_paths, serve_guard
+
+        if serve_guard.is_serve_start(argv):
+            home = Path.home()
+            _, state, isolated = local_paths.local_dirs(home)
+            serve_guard.startup(state, Path(__file__).resolve().parent.parent, local_paths.log_dir(home, state, isolated))
+    from . import codebase
+
+    if argv[:1] == ["status"]:
+        from .commands.arguments import Parser, status_arguments
+
+        args = status_arguments(Parser(prog="arete status")).parse_args(argv[1:])
+        try:
+            codebase.load()
+        except SystemExit as problem:
+            if args.json or args.run_id or args.offline:
+                raise
+            return status_from_heartbeat(problem)
+        from .commands.setup import cmd_status
+
+        args.cmd, args.fn = "status", cmd_status
+    else:
+        args = parser().parse_args(argv)
+        if args.cmd in ("api", "verify-fault"):
             return args.fn(args) or 0
-    except refusals.Refusal as e:
+        from .paths import PER_CALL_HOOKS
+
+        if args.cmd not in PER_CALL_HOOKS:
+            codebase.load()
+    from . import client, config, paths, principals, refusals
+    from .store import db as foundation
+
+    try:
+        local_read = getattr(args, "local_read", False)
+        if (local_read(args) if callable(local_read) else local_read) and not paths.DB_FILE.is_file():
+            raise foundation.NoDatabase
+        recovery = args.cmd in ("init", "migrate") or (args.cmd == "backup" and args.restore)
+        upload_on_write = args.cmd not in ("doctor", "install") and not getattr(args, "dry_run", False)
+        with client.invocation(upload_on_write=upload_on_write), principals.acting(
+                "hand" if recovery else principals.cli_actor):
+            return args.fn(args) or 0
+    except client.Down as e:
+        client.emit(e.answer)
+        return 1
+    except client.Failed as e:
+        return client.failed(e)
+    except foundation.NoDatabase as e:
+        message = str(e) or f"no arete.db at {paths.DB_FILE}; run arete serve or arete migrate"
+        client.emit({"error": message, **({"source": "local"} if getattr(args, "offline", False) else {})})
+        return 1
+    except (config.UnknownRepo, refusals.Refusal) as e:
         print(e, file=sys.stderr)
         return 1
+    except (KeyError, TypeError) as e:
+        return client.answer_error(e)
 
 
 if __name__ == "__main__":

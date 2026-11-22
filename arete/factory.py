@@ -125,6 +125,30 @@ def fingerprint(folder: Path | str) -> str:
         index.with_name(index.name + ".lock").unlink(missing_ok=True)
 
 
+def tree_with_paths(folder: Path, base: str, source: str, names: list[str], *,
+                    remove_missing: set[str]) -> str:
+    listed = util.git_records(["ls-tree", "-r", source, "--", *names], folder,
+                              env={"GIT_LITERAL_PATHSPECS": "1"})
+    wanted = set(names)
+    entries = {name: entry for entry in listed if (name := entry.partition("\t")[2]) in wanted}
+    updates = [f"0 {'0' * len(base)}\t{name}" for name in sorted(remove_missing - entries.keys())]
+    updates.extend(entries.values())
+    if not updates:
+        return base
+    handle, name = tempfile.mkstemp(prefix="arete-index-")
+    os.close(handle)
+    index = Path(name)
+    try:
+        index.unlink()
+        env = {"GIT_INDEX_FILE": str(index)}
+        util.git(["read-tree", base], folder, env=env)
+        util.git(["update-index", "-z", "--index-info"], folder, input="\0".join(updates) + "\0", env=env)
+        return util.git(["write-tree"], folder, env=env).strip()
+    finally:
+        index.unlink(missing_ok=True)
+        index.with_name(index.name + ".lock").unlink(missing_ok=True)
+
+
 def first(read: list[dict], event: str) -> dict:
     return next((line for line in read if line.get("event") == event), {})
 
@@ -245,6 +269,7 @@ class Flow:
         self.carrying, self.carry = False, 0
         self.skipped, self.matching, self.done = 0, bool(continues or only), False
         self.redone, self.stepped = 0, False
+        self.work_started = False
         self.reopens = (bool(continues) and not only and again != OPENING and reopening(chained)
                         and bool(self.earlier) and self.earlier[0].get("step") == OPENING)
         if self.matching:
@@ -259,6 +284,8 @@ class Flow:
         if self.refusal:
             self.matching = False
             raise Refused(self.refusal)
+        if name == "revise" and (claim := getattr(self.ctx, "claim_revision_feedback", None)):
+            claim()
         if self.matching and name == self.renew:
             return self.renewed(name, args, kw)
         if not self.matching and self.carrying and (found := self.carried(name, kw)) is not None:
@@ -340,8 +367,11 @@ class Flow:
         line = self.earlier[self.carry] if self.carry < len(self.earlier) else {}
         if (line.get("step") == name and line.get("result") == "pass" and self.ctx.keeps(name, kw)
                 and (not self.again or self.carry < self.again_at)):
-            n = self.tries[name] = self.tries.get(name, 0) + 1
             outcome = outcome_of(line)
+            if not self.accepts(name, outcome, kw):
+                self.carrying = False
+                return None
+            n = self.tries[name] = self.tries.get(name, 0) + 1
             self.end(name, n, outcome, "", Calls(self.run_id, name, n=n), time.monotonic(), kw,
                      carried=self.continues)
             self.carry += 1
@@ -356,8 +386,8 @@ class Flow:
         line = self.earlier[self.at] if self.at < len(self.earlier) else {}
         if line.get("step") != name or not self.takable(line):
             return None
-        accepts = getattr(self.ctx, "accepts", None)
-        if accepts is not None and not accepts(name, outcome_of(line), kw):
+        outcome = outcome_of(line)
+        if not self.accepts(name, outcome, kw):
             return None
         if (self.only or self.again) and line.get("tree") and not os.path.isdir(line["tree"]):
             why = self.ctx.restore(line)
@@ -371,7 +401,11 @@ class Flow:
             now = self.print_of(kw.get("tree") or line["tree"])
             if not now or now != self.expected(self.at, str(line["tree"])):
                 return None
-        return outcome_of(line)
+        return outcome
+
+    def accepts(self, name: str, outcome: Outcome, kw: dict) -> bool:
+        accepts = getattr(self.ctx, "accepts", None)
+        return accepts is None or accepts(name, outcome, kw)
 
     def takable(self, line: dict) -> bool:
         if line.get("result") == "pass":
@@ -408,13 +442,15 @@ class Flow:
         try:
             labels = self.ctx.labels(name, kw)
         except Exception as e:
-            run_lines.write(self.run_id, "step_start", step=name, **{"try": n})
+            run_lines.write(self.run_id, "step_start", step=name, **{"try": n}, preflight=True)
             self.failed(name, n, e, calls, started, kw)
             raise
         began = ({"tree": os.path.abspath(kw["tree"]), "fingerprint": fingerprint(kw["tree"])}
                  if name == self.only and kw.get("tree") else {})
         run_lines.write(self.run_id, "step_start", step=name, **{"try": n}, **labels, **began)
         try:
+            if name != "respond":
+                self.work_started = True
             outcome = self.call(name, calls, args, kw)
         except owner_asks.Asked as e:
             outcome = Outcome("ask", feedback=owner_asks.summary(e.sent), data={"ask_ids": e.ask_ids, "call": e.call},
@@ -505,6 +541,7 @@ def main(fn: Callable, argv: list[str] | None = None) -> None:
                    help="run this step alone, the steps before it from the stored outcomes")
     p.add_argument("--from", dest="again", default="", choices=sorted(STEPS),
                    help="with --continue, run this step again and every step after it")
+    p.add_argument("--environment-release", default="", help=argparse.SUPPRESS)
     p.add_argument("--repair", dest="repairs", default="", metavar="RUN",
                    help="continue the open PR of this held run from its saved internal review")
     p.add_argument("--action", default="", help="rerun a durable adaptive action by ID with --continue")
@@ -517,7 +554,7 @@ def main(fn: Callable, argv: list[str] | None = None) -> None:
     except (ValueError, TypeError) as e:
         p.error(str(e))
     script = pipeline.Script(Path(inspect.getfile(fn)).stem, fn, args.continues, args.only, table, args.again,
-                             args.repairs, args.action, args.only_action)
+                             args.repairs, args.action, args.only_action, args.environment_release)
     try:
         with principals.acting(principals.cli_actor()):
             code = pipeline.run_issue(args.repo, args.ticket, args.dry_run, args.force, script)

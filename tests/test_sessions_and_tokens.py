@@ -2,11 +2,12 @@ import io
 import json
 import unittest
 import urllib.error
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from arete import config, gh, jev, outbound, pipeline, verify, workspace
+from arete import config, gh, jev, outbound, pipeline, slots, tracker, verify, workspace
 from arete.review import Review
 
 READ_ONLY_GRANT = {"repositories": ["widgets"], "permissions": {"contents": "read"}}
@@ -95,19 +96,22 @@ class PushedPrDraftTests(unittest.TestCase):
         self.calls, self.logs = [], []
         self.draft, self.remote_head, self.score, self.fail = True, self.head, 0.1, False
         self.run = SimpleNamespace(id="x", repo=config.Repo(name="fixture", path=self.root), repairs="", feedback=[],
-                                   facts={}, log=self.logs.append)
-        self.layer = SimpleNamespace(trust_level="automerge", checks={"behavior": "true"})
+                                   tid="7", facts={}, log=self.logs.append, waiting=lambda _: nullcontext())
+        self.slot = slots.RunSlot("fixture", "7", 1)
+        self.layer = config.RepoLayer(dir=self.root, trust_level="automerge", checks={"behavior": "true"})
         self.c = workspace.Checkout("", "fixture/repo", self.root, self.root, "main", pr=self.URL, lease=self.head)
         self.tree, self.base = "b" * 40, "c" * 40
-        self.build = SimpleNamespace(run=self.run, layer=self.layer, cfg=config.Config(), checkouts=[self.c],
-                                     ticket=SimpleNamespace(labels=[]),
-                                     checked={"tree": self.tree, "commands": self.layer.checks})
+        self.build = pipeline.Build(run=self.run, layer=self.layer, cfg=config.Config(), checkouts=[self.c],
+                                    ticket=tracker.Ticket("7", "#7", "Fixture"), ws=self.root, workspace="fixture",
+                                    timeout=0, tools=[], deny=[],
+                                    checked={"tree": self.tree, "commands": self.layer.checks})
         self.verified = verify.Verified("pass", checks=[{"passed": True}], native_trees={"": self.tree})
         self.review = Review(verdict="approve", trees={"": self.tree})
         for patch in (mock.patch.object(gh, "gh", self.fake_gh),
                       mock.patch.object(jev, "ready", return_value=True),
                       mock.patch.object(jev, "ask", self.fake_ask),
                       mock.patch.object(pipeline, "git", self.fake_git),
+                      mock.patch.object(workspace, "fetch"),
                       mock.patch.object(pipeline, "checkout_patch", return_value="+a change"),
                       mock.patch.object(pipeline.vault, "values", return_value=set()),
                       mock.patch.object(outbound, "keep_configured_private"),
@@ -153,6 +157,10 @@ class PushedPrDraftTests(unittest.TestCase):
     def names(self, *prefix):
         return [a for a, _ in self.calls if a[:len(prefix)] == list(prefix)]
 
+    def automerge(self, approval, why, verified, review, ready):
+        pipeline.automerge(self.build, approval, why, verified, review, ready, "about",
+                           slot=self.slot, branch="run", goal="verify", plan="plan")
+
     def test_only_approved_review_can_make_current_work_ready_and_merge(self):
         cases = [
             ("missing", Review.stored({}), self.verified, False),
@@ -169,7 +177,7 @@ class PushedPrDraftTests(unittest.TestCase):
                 why = pipeline.draft_reason(review, verified)
                 self.assertEqual(bool(why), not allowed)
                 ready = pipeline.ready_pushed(self.run, [self.c], [], why)
-                pipeline.automerge(self.build, None, why, verified, review, ready, "about")
+                self.automerge(None, why, verified, review, ready)
                 self.assertEqual(ready, [self.c] if allowed else [])
                 self.assertEqual(self.names("pr", "ready"), [["pr", "ready", self.URL]] if allowed else [])
                 self.assertEqual(len(self.names("api", "-X", "PUT")), int(allowed))
@@ -184,7 +192,7 @@ class PushedPrDraftTests(unittest.TestCase):
         self.calls.clear()
         self.assertEqual(pipeline.ready_pushed(self.run, [self.c], [], why), [])
         # Even callers passing a held checkout directly cannot enable merging.
-        pipeline.automerge(self.build, None, why, self.verified, self.review, [self.c], "about")
+        self.automerge(None, why, self.verified, self.review, [self.c])
         self.assertEqual(self.calls, [])
 
     def test_person_only_work_never_automerges(self):
@@ -197,7 +205,7 @@ class PushedPrDraftTests(unittest.TestCase):
                 approval = {"sent_by": "triage"} if reason == "triage" else None
                 ready = pipeline.ready_pushed(self.run, [self.c], [], "")
                 self.assertEqual(ready, [self.c])
-                pipeline.automerge(self.build, approval, "", self.verified, self.review, ready, "about")
+                self.automerge(approval, "", self.verified, self.review, ready)
                 self.assertEqual(self.names("api", "-X", "PUT"), [])
                 if reason == "risk":
                     comments = [body for args, body in self.calls if args[:2] == ["pr", "comment"]]
@@ -217,7 +225,7 @@ class PushedPrDraftTests(unittest.TestCase):
                 self.draft = True
                 ready = pipeline.ready_pushed(self.run, [self.c], stopped, "")
                 self.assertEqual(ready, [])
-                pipeline.automerge(self.build, None, "", self.verified, self.review, ready, "about")
+                self.automerge(None, "", self.verified, self.review, ready)
                 self.draft = False
                 self.assertEqual(pipeline.hold_pushed(self.run, [self.c], stopped, "held"), [])
                 self.assertEqual(self.names("pr", "ready"), [])

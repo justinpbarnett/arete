@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import secrets
 import sys
 import threading
 import time
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
@@ -48,6 +50,7 @@ from . import (
     tasks,
     triage,
     util,
+    verify_faults,
     webhooks,
     webpush,
 )
@@ -67,7 +70,13 @@ WEB_TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf
 CODE_MARK = b'<meta name="arete-code" content="">'
 THEME_MARK = b'<meta name="theme-color" content="">'
 STEERING = ("dismiss", "retry", "cancel")
+EVENT_STREAM_PATHS = ("/api/events", "/api/v1/events")
 EVENTS_PATH = re.compile(r"/api/runs/([^/]+)/events")
+RUN_RESOURCE_PATH = re.compile(r"/api/(?:v1/)?runs/([^/]+)(?:/.*)?")
+RUN_READ_ALIAS_PATH = re.compile(r"/api/(?:log|feed)/([^/]+)")
+SESSION_RUN_PATH = re.compile(r"/api/sessions/([^/]+)/(?:send|stop)")
+CHAT_SESSION_RUN_PATH = re.compile(r"/api/chats/[^/]+/sessions/([^/]+)/(?:report|stop)")
+STEP_RESOURCE_PATH = re.compile(r"/api/v1/steps(?:/[^/]+)?")
 EVENTS_TYPE = "application/x-ndjson"
 EVIDENCE_PATH = "/api/capture/evidence"
 EVIDENCE_ITEM = re.compile(r"/api/capture/evidence/(\d+)")
@@ -77,6 +86,9 @@ SKIP_CHUNK = 1024 * 1024
 RUN_ID = re.compile(r"\w[\w.-]*")
 END_GRACE_SECONDS = 5
 INSTALL_SECONDS = 120
+READY_PATH = "/_arete/ready"
+READY_HEADER = "X-Arete-Readiness"
+READY_TOKEN = secrets.token_urlsafe(32)
 USAGE_KINDS = ("visit", "action")
 USAGE_DEVICES = ("desktop", "phone")
 USAGE_NEEDS = {"visit": ("view", "via"), "action": ("view", "name")}
@@ -227,13 +239,47 @@ def canonical_path(path: str) -> bool:
 def canonical_methods(path: str) -> tuple[str, ...]:
     if path in ("/api/v1/events", "/api/v1/principals") or re.fullmatch(r"/api/v1/principals/[^/]+", path):
         return ("GET",)
-    return tuple(method for method in ("GET", "POST") if contract.match(method, path))
+    return tuple(method for method in ("GET", "POST", "PATCH", "DELETE") if contract.match(method, path))
+
+
+def fault_run_id(path: str, query: dict[str, str]) -> str | None:
+    for route in (RUN_RESOURCE_PATH, RUN_READ_ALIAS_PATH, SESSION_RUN_PATH, CHAT_SESSION_RUN_PATH):
+        if match := route.fullmatch(path):
+            return unquote(match[1])
+    if path == "/api/v1/line-stream" or STEP_RESOURCE_PATH.fullmatch(path):
+        return query.get("run")
+    if path == "/api/v1/screen" and query.get("view") == "run":
+        return query.get("id")
+    if path in EVENT_STREAM_PATHS:
+        run = query.get("run")
+        if not (subject := query.get("subject")):
+            return run
+        subjects = set(subject.split(","))
+        if len(subjects) == 1:
+            kind, _, subject_run = subjects.pop().partition(":")
+            if kind == "run" and subject_run and run in (None, subject_run):
+                return subject_run
+    return None
+
+
+def fault_body(fault: verify_faults.Fault, path: str, query: dict[str, str]) -> bytes:
+    if fault.body:
+        return fault.body
+    problem = next((error for error in contract.ERRORS if error["status"] == fault.status), None)
+    if problem is None:
+        return b""
+    answer = dict(problem["example"])
+    if problem["code"] == "version_conflict" and (run_id := fault_run_id(path, query)):
+        if current := run_store.run_get(run_id):
+            answer["current"] = api.run_object(current)
+    return api_http.json_bytes(api_http.problem(fault.status, answer))
 
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "arete"
     sys_version = ""
     restarting = False
+    verify_controls: verify_faults.Controls | None = None
 
     def parse_request(self) -> bool:
         self.started = time.monotonic()
@@ -258,7 +304,7 @@ class Handler(BaseHTTPRequestHandler):
         except contract.Problem as error:
             self.send_error(error.status, str(error), problem_code=error.code)
             return False
-        if self.command not in ("GET", "POST") and canonical_methods(self.api_path):
+        if self.command not in ("GET", "POST", "PATCH", "DELETE") and canonical_methods(self.api_path):
             self.answer(self.command)
             return False
         return True
@@ -279,13 +325,31 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(code, answer)
 
     def do_GET(self) -> None:
+        if (self.path == READY_PATH and self.server.inside_serve
+                and tailnet.host_name(self.headers.get("Host", "")) in self.server.node.names
+                and secrets.compare_digest(self.headers.get(READY_HEADER, "").encode(), READY_TOKEN.encode())):
+            try:
+                ready = api.meta()["schema"]["version"] >= foundation.NEEDED
+            except Exception:
+                ready = False
+            self.send(204 if ready else 503, b"", "text/plain", "no-store")
+            return
         self.answer("GET")
 
     def do_POST(self) -> None:
+        self.write("POST")
+
+    def do_PATCH(self) -> None:
+        self.write("PATCH")
+
+    def do_DELETE(self) -> None:
+        self.write("DELETE")
+
+    def write(self, method) -> None:
         entered = POSTS_IN_FLIGHT.enter()
         self.restarting = not entered
         try:
-            self.answer("POST")
+            self.answer(method)
         finally:
             if entered:
                 POSTS_IN_FLIGHT.add(-1)
@@ -310,6 +374,8 @@ class Handler(BaseHTTPRequestHandler):
             parts = urlsplit(self.path)
             path = parts.path
             self.admit(method, path)
+            if method in ("POST", "PATCH", "DELETE"):
+                self.check_write_instance()
             if canonical_path(path) and not self.operation and method not in (allowed := canonical_methods(path)) and allowed:
                 self.allowed_methods = allowed
                 raise contract.Problem("method_not_allowed", "The route does not accept this method.")
@@ -319,14 +385,18 @@ class Handler(BaseHTTPRequestHandler):
                 got = webhooks.receive(unquote(path[len(webhooks.HOOK_PATH):]), self.headers, self.hook_body())
                 return self.send_json(202 if got["queued"] else 200, got)
             self.validate_transport(method, path)
+            query = {k: v[-1] for k, v in parse_qs(parts.query).items()}
+            if self.verify_controls is not None and (fault := self.verify_controls.poll(path, parts.query)):
+                kind = "application/problem+json" if canonical_path(path) and fault.status >= 400 else "application/json"
+                body = b"" if fault.status in (204, 205, 304) else fault_body(fault, path, query)
+                return self.send(fault.status, body, kind, "no-store")
             if method == "GET" and path in WEB_BY_PATH:
                 if path == "/ui.html":
                     writes.activate_grace()
                 return self.send(200, *WEB_BY_PATH[path], "no-cache")
-            query = {k: v[-1] for k, v in parse_qs(parts.query).items()}
             if method == "POST" and path == "/api/tasks" and "Idempotency-Key" in self.headers:
                 return self.keyed_start()
-            if method == "GET" and path in ("/api/events", "/api/v1/events"):
+            if method == "GET" and path in EVENT_STREAM_PATHS:
                 return event_stream.serve(self, query, WEB_CODE)
             if method == "POST" and path == EVIDENCE_PATH:
                 return self.send_json(200, self.stage_evidence(query))
@@ -342,11 +412,15 @@ class Handler(BaseHTTPRequestHandler):
                         result = {**result, "seq": self.read_seq}
             else:
                 result = self.api(method, path, query)
-            if method == "POST" and self.write_receipt is None:
+            if method != "GET" and self.write_receipt is None:
                 self.write_receipt = event_store.committed_receipt()
                 if isinstance(result, dict) and isinstance(result.get("run"), str) and result["run"]:
                     self.write_receipt = writes.receipt(f"run:{result['run']}", kind="run.started") or self.write_receipt
-            self.send_json(200, result, conditional=method == "GET" and bool(self.read_seq))
+            conditional = method == "GET" and bool(self.read_seq)
+            tag = None
+            if conditional and self.route == "/api/v1/screen" and query.get("view") == "board":
+                tag = api_http.board_etag(result)
+            self.send_json(200, result, conditional=conditional, tag=tag)
         except Exception as e:
             if self.keyed_delivery:
                 raise
@@ -354,16 +428,31 @@ class Handler(BaseHTTPRequestHandler):
                      1 if isinstance(e, idempotency.InFlight) else getattr(e, "retry_after", 0))
             self.send_json(refusal_status(e) or 500, refusal_answer(e), retry_after=retry)
 
+    def check_write_instance(self):
+        expected = self.headers.get_all("X-Arete-Instance", [])
+        if not expected:
+            return
+        if len(expected) != 1:
+            raise contract.Problem("invalid_framing", "Send at most one X-Arete-Instance.")
+        with foundation.reader() as conn:
+            instance = foundation.metadata(conn).get("instance_id")
+        if expected[0] != instance:
+            raise contract.Problem("conflict", "The server instance changed before this write.")
+
+    def event_connection(self):
+        return self.verify_controls.stream(self.connection) if self.verify_controls else nullcontext()
+
     def validate_transport(self, method, path):
-        if self.api_path and (self.restarting or method == "GET" and POSTS_IN_FLIGHT.draining()):
+        if self.api_path and (self.restarting or
+                              method == "GET" and path != "/api/meta" and POSTS_IN_FLIGHT.draining()):
             raise contract.Problem("draining", RESTARTING)
         client = self.headers.get("X-Arete-Client", "")
         if found := re.fullmatch(r"(cli|mcp|web)/0+\.[0-9]+(?:\..*)?", client):
             required = contract.OLDEST_CLIENT[found[1]]
             raise contract.Problem("client_too_old", f"This client needs version {required}", required_version=required)
-        post = method == "POST"
+        post = method in ("POST", "PATCH", "DELETE")
         legacy = bool(self.alias) and "Idempotency-Key" not in self.headers
-        self.content_size = api_http.content_length(self.headers, required=post and not legacy)
+        self.content_size = api_http.content_length(self.headers, required=post and not legacy and method != "DELETE")
         if not post and self.content_size:
             raise contract.Problem("invalid_framing", "This method does not take a body.")
         if not self.api_path:
@@ -378,6 +467,8 @@ class Handler(BaseHTTPRequestHandler):
                 api_http.check_media(self.headers, {"application/json"}, self.content_size)
             if len(self.headers.get_all("Idempotency-Key", [])) > 1:
                 raise contract.Problem("invalid_framing", "Send at most one Idempotency-Key.")
+            if self.operation and contract.keyed_write(self.operation[0]) and "Idempotency-Key" not in self.headers:
+                raise contract.Problem("invalid_input", "Send an Idempotency-Key for a write.")
             if batch:
                 requests = self.body().get("requests")
                 if isinstance(requests, list) and 2 <= len(requests) <= 50:
@@ -437,6 +528,39 @@ class Handler(BaseHTTPRequestHandler):
             self.write_receipt = claims.receipt(row["last_seq"])
             return json.loads(row["response"])
 
+    def keyed_action(self, method, route, parameters, action, *, atomic=False):
+        key = self.headers.get("Idempotency-Key")
+        if key is None:
+            return action()
+        sha = idempotency.fingerprint(method, route, parameters, self.body())
+        with idempotency.owning(principals.current(), key, sha, route) as context:
+            row = idempotency.matching_claim(context)
+            if row and row["status"]:
+                self.idempotent_replayed = True
+            elif row:
+                raise idempotency.Unconfirmed("The earlier request did not record a result. Check its effect before trying again.")
+            else:
+                row = self.complete_action(context, action, atomic)
+            self.write_receipt = claims.receipt(row["last_seq"])
+            return json.loads(row["response"])
+
+    def complete_action(self, context, action, atomic):
+        if not atomic:
+            claims.claim(context, None)
+        with (foundation.tx() if atomic else nullcontext()), event_store.collect_receipts() as collected:
+            try:
+                result = action()
+            except Exception as e:
+                status = refusal_status(e)
+                if not atomic and (isinstance(e, NoRoute) or status is not None and 400 <= status < 500):
+                    claims.abandon(context)
+                raise
+            receipt = self.write_receipt or event_store.committed_receipt()
+            seq = int(receipt["event_seq"].rsplit(".", 1)[1]) if receipt else None
+            if atomic and collected:
+                seq = collected[-1][0]
+            return claims.complete(context, 200, api_http.json_bytes(result), seq)
+
     def admit(self, method: str, path: str) -> None:
         node: tailnet.Node = self.server.node
         if tailnet.host_name(self.headers.get("Host", "")) not in node.names:
@@ -450,7 +574,7 @@ class Handler(BaseHTTPRequestHandler):
             raise Refusal(403, "The dashboard opens only for its owner's tailnet login.")
         principals.admit(person)
         self.actor = principals.current()
-        if method == "POST" and self.headers.get("X-Arete") != "1":
+        if method in ("POST", "PATCH", "DELETE") and self.headers.get("X-Arete") != "1":
             raise Refusal(403, "A change needs the X-Arete header, which the dashboard page sends.")
 
     def api(self, method: str, path: str, query: dict):
@@ -468,6 +592,9 @@ class Handler(BaseHTTPRequestHandler):
             rest = route_rest(template, path) if verb == method else None
             if rest is not None:
                 try:
+                    if method == "POST" and route in CLI_ALIASES and not (route is post_chat and rest.endswith("/file")):
+                        return self.keyed_action(method, template, {"path": rest}, lambda: route(self, rest, query),
+                                                 atomic=atomic_alias(route, unquote(rest)))
                     return route(self, rest, query)
                 except NoRoute:
                     break
@@ -598,13 +725,13 @@ class Handler(BaseHTTPRequestHandler):
             self.parsed_body = api_http.json_object(api_http.read_body(self.rfile, self.content_size, api_http.MAX_JSON_BYTES))
         return self.parsed_body
 
-    def send_json(self, status: int, data, retry_after: int = 0, *, conditional=False) -> None:
+    def send_json(self, status: int, data, retry_after: int = 0, *, conditional=False, tag=None) -> None:
         kind = "application/json"
         if status >= 400 and canonical_path(getattr(self, "api_path", "")):
             data = api_http.problem(status, data)
             kind = "application/problem+json"
         self.send(status, api_http.json_bytes(data), kind, "private, no-cache" if conditional else "no-store",
-                  retry_after, conditional=conditional)
+                  retry_after, conditional=conditional, tag=tag)
 
     def send_events(self, run_id: str, query: dict) -> None:
         if not RUN_ID.fullmatch(run_id):
@@ -620,10 +747,13 @@ class Handler(BaseHTTPRequestHandler):
         self.head(200, EVENTS_TYPE, "no-store")
         self.close_connection = True
         try:
-            self.end_headers()
-            for line in run_lines.follow(run_id, start, run_ended(run_id)):
-                self.wfile.write(event_line(line))
-                self.wfile.flush()
+            with self.event_connection() as dropped:
+                self.end_headers()
+                ended = run_ended(run_id)
+                until = (lambda: dropped() or ended()) if dropped else ended
+                for line in run_lines.follow(run_id, start, until):
+                    self.wfile.write(event_line(line))
+                    self.wfile.flush()
         except OSError:
             pass
 
@@ -655,11 +785,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
 
-    def send(self, status: int, payload: bytes, kind: str, cache: str, retry_after: int = 0, *, conditional=False) -> None:
-        tag = api_http.etag(payload, kind, self.read_seq) if conditional else None
+    def send(self, status: int, payload: bytes, kind: str, cache: str, retry_after: int = 0, *, conditional=False, tag=None) -> None:
+        if conditional and tag is None:
+            tag = api_http.etag(payload, kind, self.read_seq)
         if tag and api_http.matches_etag(self.headers, tag):
             status, payload = 304, b""
-        self.head(status, kind, cache, None if status == 304 else len(payload))
+        self.head(status, kind, cache, None if status in (204, 304) else len(payload))
         if tag:
             self.send_header("ETag", tag)
         if retry_after:
@@ -735,7 +866,7 @@ def forget_proposal(proposal_id: int) -> dict:
 def approve_rule(proposal_id: int) -> dict:
     if (approvals_store.proposal(proposal_id, connect=foundation.reader) or {}).get("status") not in ("approve", "filing"):
         raise control.NotFound(f"#{proposal_id} is not a rule waiting for approval")
-    control.detach(["file-rule", str(proposal_id)])
+    control.detach(["file-rule", str(proposal_id), "--local"])
     return {"id": proposal_id}
 
 
@@ -937,7 +1068,7 @@ def post_chat(handler, rest, query):
         return handler.publish("/api/chats/{n}/file", {"n": str(number)},
                                lambda publication=None: chat.file_draft(number, publication, draft=draft))
     if action == "drop":
-        return chat.drop_draft(whole_number(chat_id))
+        return drop_chat(chat_id)
     raise NoRoute
 
 
@@ -970,7 +1101,7 @@ def post_run(handler, rest, query):
     base_version = body.get("base_version")
     result = None
     if action == "stop":
-        result = control.stop_run(run_id, base_version, public=True)
+        return stop_run(handler, run_id, base_version, public=True)
     elif action == "answer":
         result = tasks.reply(run_id, str(body.get("text") or ""))
     elif action == "resume":
@@ -981,10 +1112,24 @@ def post_run(handler, rest, query):
         result = tasks.run_step(run_id, action[len("steps/"):], body.get("set") or {}, base_version)
     else:
         raise NoRoute
-    handler.write_receipt = event_store.committed_receipt(f"run:{run_id}", first=action == "stop")
+    handler.write_receipt = event_store.committed_receipt(f"run:{run_id}")
     if result.get("run") and result["run"] != run_id:
         handler.write_receipt = writes.receipt(f"run:{result['run']}", kind="run.started")
     return result
+
+
+def stop_run(handler, run_id, base_version=None, *, public=False):
+    result = control.stop_run(run_id, base_version, public=public)
+    handler.write_receipt = event_store.committed_receipt(f"run:{run_id}", first=True)
+    return result
+
+
+def steer_run(run_id, text):
+    return sessions.send(run_id, text)
+
+
+def drop_chat(chat_id):
+    return chat.drop_draft(whole_number(chat_id))
 
 
 def post_push_subscribe(handler, rest, query):
@@ -1026,9 +1171,9 @@ def post_sessions(handler, rest, query):
 def post_session(handler, rest, query):
     session_id, _, action = unquote(rest).rpartition("/")
     if action == "send":
-        return sessions.send(session_id, str(handler.body().get("text", "")))
+        return steer_run(session_id, str(handler.body().get("text", "")))
     if action == "stop":
-        return control.stop_run(session_id)
+        return stop_run(handler, session_id)
     raise NoRoute
 
 
@@ -1082,6 +1227,31 @@ def post_serve_install(handler, rest, query):
 
 ROUTES = tuple((entry["method"], entry["path"], globals()[entry["provider"]]) for entry in contract.ALIASES
                if not entry.get("transport"))
+CLI_ALIASES = (post_ask, post_chat, post_incident_switch, post_incident, post_loop, post_proposal, post_run,
+               post_serve_install, post_session, post_sessions)
+
+
+def atomic_alias(route, rest):
+    return ((route is post_chat and rest.endswith("/drop"))
+            or (route is post_session and rest.endswith("/send"))
+            or (route is post_proposal and rest.endswith(("/done", "/reject"))))
+
+
+def handlers() -> tailnet.Handlers:
+    state = verify_faults.state_path()
+    if state is None or state != paths.STATE_DIR.absolute():
+        return tailnet.Handlers(Handler, Redirect)
+    try:
+        with verify_faults.scratch_state(state):
+            pass
+    except OSError:
+        return tailnet.Handlers(Handler, Redirect)
+    controls = verify_faults.Controls(state)
+
+    class ScratchHandler(Handler):
+        verify_controls = controls
+
+    return tailnet.Handlers(ScratchHandler, Redirect)
 
 
 def serve(port: int | None = None, inside_serve: bool = False, host: tailnet.Tailscale | None = None) -> NoReturn:
@@ -1104,4 +1274,4 @@ def serve(port: int | None = None, inside_serve: bool = False, host: tailnet.Tai
         with util.lock(serve.SERVE_LOCK) as free:
             if free:
                 capture.recover()
-    tailnet.serve(tailnet.Handlers(Handler, Redirect), cfg, port, inside_serve, host)
+    tailnet.serve(handlers(), cfg, port, inside_serve, host)

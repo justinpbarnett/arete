@@ -4,6 +4,7 @@ import http.client
 import json
 import os
 import re
+import shlex
 import stat
 import subprocess
 import threading
@@ -16,7 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import SplitResult, urlsplit
 
-from . import browser, config, environment, paths, sandbox, scratch, util, vault
+from . import _test_stacks, browser, config, environment, paths, sandbox, scratch, util, vault
 from .util import git
 
 PLAYWRIGHT_TOOLS = tuple("browser_" + n for n in (
@@ -112,13 +113,17 @@ def preflight(v: config.Verify, cwd: Path, cfg: config.Config, repo: config.Repo
         if not passed:
             break
     failed = next((check for check in checks if not check["passed"]), None)
+    if failed:
+        failed["cause"] = "environment"
     return Verified("blocked" if failed else "pass", "Verification prerequisites are unavailable." if failed else
                     "Configured verification prerequisites passed.", checks,
-                    blocked_by=f"{failed['what']}: {failed['saw']}" if failed else "", finished=not bool(failed))
+                    blocked_by=f"{failed['what']}: {failed['saw']}" if failed else "", finished=not bool(failed),
+                    behavior_reached=False)
 
 
 def run_probes(v: config.Verify, cwd: Path, attempt: scratch.Attempt | None,
-               *, journey_drivers: dict[str, str] | None = None) -> Verified | None:
+               *, journey_drivers: dict[str, str] | None = None,
+               stop_on_driver_failure: bool = True) -> Verified | None:
     named = [(f"journey:{name}", v.drivers[driver]) for name, driver in sorted((journey_drivers or {}).items())]
     if not v.probes and not named:
         return None
@@ -128,7 +133,8 @@ def run_probes(v: config.Verify, cwd: Path, attempt: scratch.Attempt | None,
         return Verified("blocked", f"Configured {label} require trusted scratch confinement.",
                         blocked_by=f"{label} could not obtain scratch authority{requested}", finished=False)
     deadline, checks = time.monotonic() + v.probe_seconds, []
-    env = environment.build((), scratch.attempt_env(attempt))
+    failure, blocked_by = "", ""
+    env = environment.build((_test_stacks.PREFIX_ENV,), scratch.attempt_env(attempt))
     env = {name: value for name, value in env.items() if not paths.CREDENTIAL_NAME.search(name)}
 
     def public(text):
@@ -137,7 +143,8 @@ def run_probes(v: config.Verify, cwd: Path, attempt: scratch.Attempt | None,
 
     for index, (name, command) in enumerate((*v.probes.items(), *named)):
         is_driver = index >= len(v.probes)
-        remaining = deadline - time.monotonic()
+        replaying_driver = is_driver and not stop_on_driver_failure
+        remaining = v.probe_seconds if replaying_driver else deadline - time.monotonic()
         cause = "change"
         try:
             if remaining <= 0:
@@ -181,9 +188,19 @@ def run_probes(v: config.Verify, cwd: Path, attempt: scratch.Attempt | None,
             summary = f"Configured {label} failed."
             if named:
                 summary = f"Could not run {name}." if blocked else f"{name} failed."
-            return Verified("blocked" if blocked else "fail", summary, checks,
-                            blocked_by=(blocker if named else f"probes: {blocker}") if blocked else "",
-                            finished=not (named and blocked))
+            if not replaying_driver:
+                return Verified("blocked" if blocked else "fail", summary, checks,
+                                blocked_by=(blocker if named else f"probes: {blocker}") if blocked else "",
+                                finished=not (named and blocked))
+            if blocked:
+                blocked_by = blocked_by or blocker
+            else:
+                failure = failure or summary
+    if failure:
+        return Verified("fail", failure, checks)
+    if blocked_by:
+        return Verified("blocked", "A configured journey driver could not run.", checks,
+                        blocked_by=blocked_by, finished=False)
     return Verified("pass", f"Owner-configured {label} passed under scratch confinement.", checks)
 
 
@@ -307,6 +324,40 @@ def serving(v: config.Verify, cwd: Path, log: Path, cfg: config.Config | None = 
                     pass
 
 
+def fault_note(v: config.Verify) -> str:
+    try:
+        wrapper, *command = shlex.split(v.start)
+    except ValueError:
+        return ""
+    if command[:4] != ["uv", "run", "arete", "dashboard"]:
+        return ""
+    if wrapper == "sandbox":
+        for pattern in v.allow_bash:
+            executable = pattern.removesuffix(" *")
+            if trusted_wrapper(executable) and executable != "sandbox":
+                wrapper = executable
+                break
+    if not trusted_wrapper(wrapper):
+        return ""
+    cli = shlex.quote(wrapper) + " uv run arete verify-fault"
+    return ("\n\n## Scratch fault controls\n\n"
+            "Run these commands from the same worktree as the configured dashboard. Use the CLI to cause the fault, "
+            "then observe the result with the browser tools. Do not use page scripts or write directly to the store.\n\n"
+            f"- `{cli} arm --route ROUTE --status STATUS [--body TEXT] [--count COUNT]` replaces the next "
+            "response on that route by default. Include the query string for an exact query match and quote the route. "
+            "Omit the body to use the contract problem for a documented error status, or quote a JSON body as one argument. "
+            "Pass a count for multiple responses.\n"
+            f"- `{cli} drop-streams` closes the open event streams. New connections can open as usual.\n"
+            f"- `{cli} event --kind KIND --run RUN_ID` emits an event for an existing scratch run.\n"
+            f"- `{cli} clear` clears response faults and pending events.")
+
+
+def trusted_wrapper(executable: str) -> bool:
+    path = Path(executable)
+    return executable == "sandbox" or (
+        path.is_absolute() and path.parts[-3:] == ("verification-runtime", "harness", "sandbox"))
+
+
 def wait_until_ready(proc: subprocess.Popen, url: str, seconds: int, log: Path) -> None:
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
@@ -356,6 +407,7 @@ class Verified:
     finished: bool = True
     saved: str = ""
     native_trees: dict[str, str] = field(default_factory=dict)
+    behavior_reached: bool = True
 
     @classmethod
     def from_agent(cls, found: dict) -> Verified:

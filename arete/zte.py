@@ -462,7 +462,7 @@ def register(sub) -> None:
     modes = parser.add_subparsers(required=True)
     show = modes.add_parser("status", help="inspect the lane's durable state")
     show.add_argument("--dry-run", action="store_true", help="read the finding without reserving a task")
-    show.set_defaults(fn=status)
+    show.set_defaults(fn=status, local_read=True)
     modes.add_parser("pause", help="persist a local Stop interlock").set_defaults(fn=pause)
 
 

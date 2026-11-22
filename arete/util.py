@@ -13,20 +13,24 @@ import shutil
 import signal
 import socket
 import ssl
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-from contextlib import contextmanager, suppress
+from collections.abc import Callable, Iterable
+from contextlib import ExitStack, closing, contextmanager, nullcontext, suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO
 from urllib.parse import SplitResult, urlsplit
 
-from . import paths, sandbox
+from . import check_process, paths, sandbox
 
 PROBE_GRACE_SECONDS = 0.2
+DEPLOY_TERMINATION_GRACE = 1
 TIMED_OUT = 124
 
 
@@ -84,42 +88,90 @@ def sh(
     input: str | None = None,
     inherit: bool = True,
     keeps: tuple[str, ...] = (),
+    hold_fds: tuple[int, ...] = (),
 ) -> subprocess.CompletedProcess:
+    return _sh(cmd, cwd, timeout, check, env, input, inherit, keeps, hold_fds=hold_fds)
+
+
+def _sh(cmd, cwd=None, timeout=600, check=False, env=None, input=None, inherit=True, keeps=(), *,
+        deploy=False, restore_paths=(), binary=False, graceful_timeout=False,
+        index_lock: _DeployIndexLock | None = None, hold_fds: tuple[int, ...] = ()) -> subprocess.CompletedProcess:
     full_env = foreground_maintenance({**(os.environ if inherit else {}), **(env or {})})
-    command = sandbox.protected_command(cmd, cwd, keeps)
+    words = ["/bin/sh", "-c", cmd] if isinstance(cmd, str) else cmd
+    supervised = check_process.launch(words, timeout, hold_fds) if hold_fds else nullcontext((cmd, (), None))
     try:
-        res = run_whole_tree(
-            command,
-            timeout,
-            input,
-            cwd=str(cwd) if cwd else None,
-            shell=isinstance(command, str),
-            text=True,
-            errors="replace",
-            env=full_env,
-        )
+        with supervised as (launch, fds, cancel):
+            command = sandbox.protected_command(launch, cwd, keeps, _deploy=deploy, _restore_paths=restore_paths)
+            res = run_whole_tree(
+                command, timeout, input, cwd=str(cwd) if cwd else None, shell=isinstance(command, str),
+                text=not binary, errors=None if binary else "replace", env=full_env,
+                graceful_timeout=graceful_timeout, index_lock=index_lock,
+                **({"hold_fds": fds, "cancel": cancel} if fds else {}),
+            )
     except subprocess.TimeoutExpired as e:
         res = subprocess.CompletedProcess(
             cmd, TIMED_OUT, stdout=_s(e.stdout), stderr=_s(e.stderr) + f"\n[arete] timed out after {timeout}s"
         )
     except FileNotFoundError as e:
         res = subprocess.CompletedProcess(cmd, 127, stdout="", stderr=str(e))
+    if hold_fds:
+        res.args = cmd
     if check and res.returncode != 0:
         raise RuntimeError(f"{cmd!r} failed ({res.returncode}): {res.stderr.strip() or res.stdout.strip()}")
     return res
 
 
-def run_whole_tree(command, timeout: float | None, input: str | None, **kw) -> subprocess.CompletedProcess:
+def run_whole_tree(command, timeout: float | None, input: str | bytes | None, *,
+                   graceful_timeout: bool = False, index_lock: _DeployIndexLock | None = None,
+                   hold_fds: tuple[int, ...] = (), cancel=None, **kw) -> subprocess.CompletedProcess:
     stdin = subprocess.PIPE if input is not None else None
-    with subprocess.Popen(command, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kw) as proc:
+    if hold_fds:
+        kw["pass_fds"] = hold_fds
+    if graceful_timeout:
+        kw.update(own_group_args())
+    with ExitStack() as cleanup:
+        proc = subprocess.Popen(command, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kw)
+        if graceful_timeout:
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                if stream is not None:
+                    cleanup.enter_context(closing(stream))
+        else:
+            cleanup.enter_context(proc)
         try:
             out, err = proc.communicate(input, timeout=timeout)
         except BaseException:
-            with suppress(Exception):
-                kill_tree(proc.pid)
-            proc.kill()
+            if hold_fds:
+                with suppress(OSError):
+                    cancel.send(b"stop")
+            elif graceful_timeout:
+                _stop_deploy_process(proc, index_lock)
+            else:
+                with suppress(Exception):
+                    kill_tree(proc.pid)
+                proc.kill()
             raise
     return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
+
+
+class DeployStillRunning(RuntimeError):
+    pass
+
+
+def _stop_deploy_process(proc: subprocess.Popen, index_lock: _DeployIndexLock | None) -> None:
+    with suppress(ProcessLookupError, PermissionError):
+        os.killpg(proc.pid, signal.SIGTERM)
+    try:
+        proc.wait(timeout=DEPLOY_TERMINATION_GRACE)
+    except subprocess.TimeoutExpired:
+        if index_lock is not None:
+            with suppress(OSError, RuntimeError):
+                index_lock.observe(proc.pid)
+    try:
+        with suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=DEPLOY_TERMINATION_GRACE)
+    except (PermissionError, subprocess.TimeoutExpired) as error:
+        raise DeployStillRunning("could not confirm Git stopped after deploy timeout") from error
 
 
 NETWORK_ERROR = re.compile(
@@ -183,22 +235,226 @@ def hours_awake_since(timestamp: float) -> float:
     return (now().timestamp() - max(timestamp, last_wake())) / 3600
 
 
-def sh_with_network(cmd: list[str] | str, rerun: re.Pattern = NETWORK_ERROR, **kw) -> subprocess.CompletedProcess:
-    res = sh(cmd, **kw)
+def sh_with_network(cmd: list[str] | str, rerun: re.Pattern = NETWORK_ERROR, *,
+                    before_attempt: Callable[[], None] | None = None, **kw) -> subprocess.CompletedProcess:
+    def attempt():
+        if before_attempt:
+            before_attempt()
+        return sh(cmd, **kw)
+
+    res = attempt()
     if res.returncode == 0 or not rerun.search(res.stdout + res.stderr):
         return res
     print(f"{iso()} network error, waiting for the network: {first_line(res.stderr or res.stdout)}", flush=True)
-    return sh(cmd, **kw) if wait_for_network() else res
+    return attempt() if wait_for_network() else res
 
 
 def git(args: list[str], cwd: Path, timeout: float = 300, check: bool = True, input: str | None = None,
-        env: dict | None = None, *, retry: bool = True) -> str:
+        env: dict | None = None, *, retry: bool = True, before_attempt: Callable[[], None] | None = None) -> str:
     keeps = ("ssh-agent",) if git_command(args).partition(" ")[0] in NETWORK_GIT else ()
     call = sh_with_network if retry else sh
-    res = call(["git", *args], cwd=cwd, timeout=timeout, input=input, env=env, keeps=keeps)
-    if check and res.returncode != 0:
-        raise RuntimeError(f"git {git_command(args)}: {git_error(res.stderr or res.stdout)}")
+    if before_attempt and not retry:
+        before_attempt()
+    attempt = {"before_attempt": before_attempt} if retry and before_attempt else {}
+    res = call(["git", *args], cwd=cwd, timeout=timeout, input=input, env=env, keeps=keeps, **attempt)
+    if check:
+        _check_git(args, res)
     return res.stdout
+
+
+def git_bytes(args: list[str], cwd: Path, timeout: float = 300) -> bytes:
+    res = _sh(["git", *args], cwd=cwd, timeout=timeout, binary=True)
+    _check_git(args, res)
+    return res.stdout
+
+
+def _check_git(args: list[str], res: subprocess.CompletedProcess) -> None:
+    if res.returncode != 0:
+        raise RuntimeError(f"git {git_command(args)}: {git_error(_s(res.stderr or res.stdout))}")
+
+
+def deploy_fast_forward(src: Path, tip: str) -> None:
+    args = ["--no-replace-objects", "merge", "-q", "--ff-only", "--no-autostash", "--no-overwrite-ignore", tip]
+    path = _deploy_index_lock(src)
+    with ExitStack() as cleanup:
+        index_lock = None if path.exists(follow_symlinks=False) else _DeployIndexLock(path, cleanup)
+        result = _deploy_git(src, args, deploy=True, index_lock=index_lock)
+        if result.returncode == TIMED_OUT and index_lock is not None:
+            index_lock.clear(src)
+    _check_git(args, result)
+
+
+@dataclass
+class _DeployIndexLock:
+    path: Path
+    cleanup: ExitStack
+    observed: os.stat_result | None = None
+
+    def observe(self, pid: int) -> None:
+        fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        self.cleanup.callback(os.close, fd)
+        candidate = os.fstat(fd)
+        if stat.S_ISREG(candidate.st_mode) and _process_holds_lock(pid, self.path, candidate):
+            self.observed = candidate
+
+    def clear(self, src: Path) -> None:
+        if self.observed is None:
+            return
+        with suppress(FileNotFoundError):
+            if os.path.samestat(self.path.lstat(), self.observed):
+                _sh(["/bin/rm", "-f", str(self.path)], cwd=src, timeout=10, graceful_timeout=True)
+
+
+def _process_holds_lock(pid: int, path: Path, candidate: os.stat_result) -> bool:
+    if sys.platform == "darwin":
+        result = _sh(["/usr/sbin/lsof", "-nP", "-a", "-p", str(pid), "-FaDi", "--", str(path)],
+                     cwd=path.parent, timeout=1, graceful_timeout=True)
+        if result.returncode != 0:
+            return False
+        identity = {f"D{candidate.st_dev:#x}", f"i{candidate.st_ino}"}
+        for descriptor in result.stdout.split("\nf")[1:]:
+            fields = set(descriptor.splitlines()[1:])
+            if identity <= fields and fields.intersection({"aw", "au"}):
+                return True
+    elif sys.platform == "linux":
+        proc = Path(f"/proc/{pid}")
+        for fd in (proc / "fd").iterdir():
+            with suppress(FileNotFoundError):
+                if not os.path.samestat(fd.stat(), candidate):
+                    continue
+                flags = (proc / "fdinfo" / fd.name).read_text()
+                match = re.search(r"^flags:\s*([0-7]+)$", flags, re.MULTILINE)
+                if match and int(match[1], 8) & os.O_ACCMODE:
+                    return True
+    return False
+
+
+@dataclass(frozen=True)
+class DeployRecovery:
+    head: str
+    tracked: tuple[bytes, ...]
+    additions: tuple[bytes, ...]
+    absent_additions: tuple[bytes, ...]
+
+
+def _deploy_read(src: Path, *args: str) -> bytes:
+    result = _deploy_git(src, ["--no-replace-objects", "--no-optional-locks", *args],
+                         timeout=10, binary=True, graceful_timeout=False)
+    _check_git(list(args), result)
+    return result.stdout
+
+
+def _deploy_path_mode(src: Path, name: bytes) -> int | None:
+    parts = os.fsdecode(name).split("/")
+    try:
+        for part in parts[:-1]:
+            src /= part
+            if not stat.S_ISDIR(src.lstat().st_mode):
+                return None
+        return (src / parts[-1]).lstat().st_mode
+    except FileNotFoundError:
+        return None
+
+
+def _deploy_head(src: Path) -> tuple[str, str]:
+    head, *refs = _deploy_read(src, "rev-parse", "HEAD", "--symbolic-full-name", "HEAD").splitlines()
+    return head.decode("ascii"), os.fsdecode(refs[0]) if refs else ""
+
+
+def _deploy_index_lock(src: Path) -> Path:
+    raw = _deploy_read(src, "rev-parse", "--path-format=absolute", "--git-path", "index")
+    index = Path(os.fsdecode(raw.removesuffix(b"\n"))).resolve()
+    return Path(f"{index}.lock")
+
+
+def deploy_recovery(src: Path, base: str, tip: str) -> DeployRecovery:
+    head, ref = _deploy_head(src)
+    if ref != f"refs/heads/{base}":
+        raise RuntimeError("on another branch")
+    raw = _deploy_read(src, "diff", "--name-status", "-z", "--no-renames", "--no-ext-diff",
+                       "--ignore-submodules=none", head, tip, "--")
+    records = iter(raw.split(b"\0")[:-1])
+    tracked, additions = [], []
+    for status, name in zip(records, records, strict=True):
+        (additions if status == b"A" else tracked).append(name)
+    absent = tuple(name for name in additions if _deploy_path_mode(src, name) is None)
+    return DeployRecovery(head, tuple(tracked), tuple(additions), absent)
+
+
+def restore_deploy_paths(src: Path, base: str, recovery: DeployRecovery) -> list[str]:
+    if _deploy_head(src) != (recovery.head, f"refs/heads/{base}"):
+        raise RuntimeError("HEAD or branch changed during deploy")
+    if _deploy_index_lock(src).exists(follow_symlinks=False):
+        raise RuntimeError("Git index is locked")
+
+    errors = []
+    for restore in (_restore_deploy_index_additions, _remove_deploy_additions, _restore_deploy_tracked):
+        try:
+            restore(src, recovery)
+        except (OSError, RuntimeError) as error:
+            errors.append(str(error))
+    return errors
+
+
+def deploy_porcelain(src: Path) -> str:
+    status = _deploy_read(src, "-c", "core.quotePath=true", "status", "--porcelain=v1", "--untracked-files=all",
+                          "--ignore-submodules=none")
+    return ", ".join(_s(status).splitlines())
+
+
+def _restore_deploy_index_additions(src: Path, recovery: DeployRecovery) -> None:
+    if not recovery.additions:
+        return
+    staged = set(_deploy_read(src, "diff", "--cached", "--name-only", "-z", "--no-renames", "--no-ext-diff",
+                              "--diff-filter=A", "--ignore-submodules=none", recovery.head, "--").split(b"\0"))
+    names = [name for name in recovery.additions if name in staged]
+    if names:
+        args = ["update-index", "--force-remove", "-z", "--stdin"]
+        _check_git(args, _deploy_git(src, args, input=b"\0".join(names) + b"\0", binary=True))
+
+
+def _deploy_engine_paths(src: Path, names: Iterable[bytes], additions: Iterable[bytes] = ()) -> tuple[Path, ...]:
+    root, engine = sandbox.real_path(src), sandbox.real_path(paths.PACKAGE_DIR)
+    files = {root / os.fsdecode(name) for name in names}
+    parents = {parent for path in files for parent in path.parents if parent.is_relative_to(engine)}
+    exceptions = files | {path for path in parents if not path.exists()}
+    for name in additions:
+        path = root / os.fsdecode(name)
+        if path in parents:
+            exceptions.add(path)
+        if files.intersection(path.parents):
+            exceptions.update(parent for parent in path.parents if files.intersection(parent.parents))
+    return tuple(sorted(path for path in exceptions if path.is_relative_to(engine)))
+
+
+def _restore_deploy_tracked(src: Path, recovery: DeployRecovery) -> None:
+    if not recovery.tracked:
+        return
+    args = ["--no-replace-objects", "--literal-pathspecs", "restore", f"--source={recovery.head}", "--staged", "--worktree",
+            "--no-recurse-submodules", "--pathspec-from-file=-", "--pathspec-file-nul"]
+    restore_paths = _deploy_engine_paths(src, recovery.tracked, recovery.additions)
+    _check_git(args, _deploy_git(src, args, input=b"\0".join(recovery.tracked) + b"\0", binary=True,
+                                restore_paths=restore_paths))
+
+
+def _remove_deploy_additions(src: Path, recovery: DeployRecovery) -> None:
+    additions = [(name, _deploy_path_mode(src, name)) for name in recovery.absent_additions]
+    files = [name for name, mode in additions if mode is not None and not stat.S_ISDIR(mode)]
+    empty_dirs = [name for name, mode in additions if mode is not None and stat.S_ISDIR(mode)
+                  and not any((src / os.fsdecode(name)).iterdir())]
+    for command, names in ((["/bin/rm", "-f"], files), (["/bin/rmdir"], empty_dirs)):
+        if not names:
+            continue
+        result = _sh([*command, *("./" + os.fsdecode(name) for name in names)], cwd=src, timeout=10,
+                     restore_paths=_deploy_engine_paths(src, names))
+        if result.returncode != 0:
+            raise RuntimeError(f"removing tip additions: {git_error(result.stderr or result.stdout)}")
+
+
+def _deploy_git(src: Path, args: list[str], *, timeout: float = 30, graceful_timeout: bool = True,
+                **kwargs) -> subprocess.CompletedProcess:
+    return _sh(["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", *args],
+               cwd=src, timeout=timeout, graceful_timeout=graceful_timeout, **kwargs)
 
 
 NETWORK_GIT = frozenset({"fetch", "push", "pull", "clone", "ls-remote"})
@@ -451,12 +707,14 @@ def kill_tree(root: int) -> None:
 
 
 def lock_is_held(name: str) -> bool:
-    with lock_file(name) as f:
-        try:
+    try:
+        with (paths.LOCKS_DIR / f"{name}.lock").open() as f:
             fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return True
-        return False
+    except BlockingIOError:
+        return True
+    except FileNotFoundError:
+        pass
+    return False
 
 
 def read_env_file(path: Path) -> dict[str, str]:

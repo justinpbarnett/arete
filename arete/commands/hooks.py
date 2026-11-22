@@ -3,8 +3,11 @@ from __future__ import annotations
 import json
 import sys
 from collections import Counter
+from datetime import timedelta
+from urllib.parse import urlencode
 
-from .. import config, paths
+from .. import client, config, paths, util
+from ..store import db as foundation
 from ..store import incidents as incident_store
 from .common import when
 
@@ -12,7 +15,15 @@ from .common import when
 def cmd_events(args) -> int:
     from .. import tool_events
 
-    evs = tool_events.read_events(args.hours)
+    if remote := client.configured_server():
+        client.upload_hook_events(remote, wait=True)
+        path = "/api/v1/hook-events"
+        if args.hours != float("inf"):
+            cutoff = util.now() - timedelta(hours=args.hours)
+            path += "?" + urlencode({"since": cutoff.isoformat()})
+        evs = client.field(client.call("GET", path), "events", kind=list)
+    else:
+        evs = tool_events.read_events(args.hours)
     if args.raw:
         for e in evs[max(len(evs) - args.limit, 0):]:
             print(json.dumps(e))
@@ -30,10 +41,10 @@ def cmd_heartbeat(args) -> int:
     return heartbeat.run(dry_run=args.dry_run, force_probes=args.force_probes, quiet=args.quiet)
 
 
-def oncall_scan(args, cfg) -> int:
+def oncall_scan(args) -> int:
     from .. import oncall
 
-    summary = oncall.scan(cfg)
+    summary = oncall.scan(config.load())
     if summary is None:
         print(f"on-call is off; set [oncall] enabled = true in {paths.CONFIG_FILE}")
     elif "skipped" in summary:
@@ -43,22 +54,18 @@ def oncall_scan(args, cfg) -> int:
     return 0
 
 
-def oncall_toggle(args, cfg) -> int:
-    from .. import oncall
-
-    oncall.switch(args.action == "on")
+def oncall_toggle(args) -> int:
+    client.call("POST", "/api/incidents/switch", {"on": args.action == "on"})
     print(f"on-call wakes and rechecks are {args.action}")
     return 0
 
 
-def oncall_incident_action(args, cfg) -> int:
-    from .. import oncall
-
+def oncall_incident_action(args) -> int:
     if not args.id.isdigit():
         print(f"no incident {args.id}" if args.id else f"{args.action} needs an incident number", file=sys.stderr)
         return 1
     number = int(args.id)
-    done = getattr(oncall, args.action)(number)
+    done = client.call("POST", f"/api/incidents/{number}/{args.action}")
     if args.action == "cancel":
         stopped = f"stopped run {done['stopped']}" if done["stopped"] else "no run was live"
         print(f"cancelled incident {number}: {stopped}; cooling down until {done['cooldown_until'] or '-'}")
@@ -69,10 +76,10 @@ def oncall_incident_action(args, cfg) -> int:
     return 0
 
 
-def oncall_show(args, cfg) -> int:
+def oncall_show(args) -> int:
     from .. import oncall
 
-    found = incident_store.incident(int(args.id)) if args.id.isdigit() else None
+    found = incident_store.incident(int(args.id), connect=foundation.reader) if args.id.isdigit() else None
     if not found:
         print(f"no incident {args.id}", file=sys.stderr)
         return 1
@@ -84,6 +91,7 @@ def oncall_show(args, cfg) -> int:
     print(f"decision: {oncall.decision_line(found)}")
     if line := oncall.repair_line(found):
         print(f"repair: {line}")
+    cfg = config.load()
     for n, r in enumerate(found["repairs"], 1):
         print(f"  attempt {n} of {cfg.oncall.max_attempts}: task {r['task'] or '-'}, run {oncall.last_run_id(r)}, "
               f"{r['started']}, {r['outcome'] or ('running' if r['task'] else 'starting')}")
@@ -95,10 +103,10 @@ def oncall_show(args, cfg) -> int:
     return 0
 
 
-def oncall_list(args, cfg) -> int:
+def oncall_list(args) -> int:
     from .. import oncall
 
-    rows = incident_store.incidents()
+    rows = incident_store.incidents(connect=foundation.reader)
     if args.json:
         for row in rows:
             print(json.dumps(row))
@@ -109,7 +117,8 @@ def oncall_list(args, cfg) -> int:
         print(f"      {oncall.decision_line(r)}")
         if line := oncall.repair_line(r):
             print(f"      repair: {line}")
-    now = oncall.status(cfg)
+    cfg = config.load()
+    now = oncall.status(cfg, connect=foundation.reader)
     if not now["enabled"]:
         print(f"on-call is off; `[oncall] enabled = true` in {paths.CONFIG_FILE} turns it on")
     else:
@@ -128,8 +137,7 @@ ONCALL_ACTIONS = {"scan": oncall_scan, "off": oncall_toggle, "on": oncall_toggle
 
 
 def cmd_oncall(args) -> int:
-    cfg = config.load()
-    return ONCALL_ACTIONS[args.action](args, cfg)
+    return ONCALL_ACTIONS[args.action](args)
 
 
 def cmd_hook(args) -> int:
@@ -227,7 +235,7 @@ def register(sub) -> None:
     p = sub.add_parser("mcp-ask", help="stdio MCP server that gives arete's agents the ask_owner tool; with --check, "
                                        "validates one call read from stdin")
     p.add_argument("--check", action="store_true")
-    p.set_defaults(fn=cmd_mcp_ask)
+    p.set_defaults(fn=cmd_mcp_ask, local_read=lambda args: args.check)
 
     p = sub.add_parser("background", help="Stop hook for arete's claude agents: an agent that answers while commands it "
                                           "started in the background still run is told to stop them and answer again "
@@ -252,7 +260,7 @@ def register(sub) -> None:
                                                 "(default: out next to the spec)")
     p.add_argument("--days", type=float, default=7, help="how far back to read (default 7)")
     p.add_argument("--json", action="store_true", help="print JSON")
-    p.set_defaults(fn=cmd_jev)
+    p.set_defaults(fn=cmd_jev, local_read=lambda args: args.action == "report")
 
     p = sub.add_parser("heartbeat", help="loop 0: check jobs, probes, auth, hook, disk")
     p.add_argument("--dry-run", action="store_true", help="print actions instead of opening or closing alerts")
@@ -264,10 +272,10 @@ def register(sub) -> None:
     p.add_argument("--hours", type=float, default=24)
     p.add_argument("--raw", action="store_true")
     p.add_argument("--limit", type=int, default=50)
-    p.set_defaults(fn=cmd_events)
+    p.set_defaults(fn=cmd_events, local_read=lambda args: not client.configured_server())
 
     p = sub.add_parser("oncall", help="the on-call watcher: incidents found in logs, run files and the heartbeat")
     p.add_argument("action", nargs="?", default="list", choices=("list", "show", "scan", "cancel", "dismiss", "retry", "off", "on"))
     p.add_argument("id", nargs="?", default="", help="with show, cancel, dismiss or retry: the incident number")
     p.add_argument("--json", action="store_true", help="one JSON line per incident")
-    p.set_defaults(fn=cmd_oncall)
+    p.set_defaults(fn=cmd_oncall, local_read=lambda args: args.action in ("list", "show"))

@@ -13,7 +13,7 @@ FIELDS = {
                        "files_purged", "mined_until", "stop_asked", "ab_held", "active_seconds", "verify_seconds",
                        "verify_open_seconds", "repair_calls", "measured_at", "schema_version", "label_pending",
                        "landed", "device", "attempts", "model", "runner", "log", "trigger", "queue", "grp", "lock",
-                       "moved", "wait_minutes", "engine_sha", "failure", "dry_run")),
+                       "moved", "wait_minutes", "engine_sha", "failure", "dry_run", "environment_retry_of")),
     "tasks": frozenset(("repo", "title", "body", "kind", "state", "parent", "created", "updated")),
     "task_comments": frozenset(("task", "author", "body", "ts")),
 }
@@ -64,10 +64,18 @@ def fields_for(table, fields):
         raise ValueError(f"invalid {table} fields: {', '.join(sorted(set(fields) - FIELDS[table]))}")
 
 
-def emit(table, identity, row, kind):
+def emit(c, table, identity, row, kind):
+    data = row
+    if table == "runs":
+        data = {**row, "run": identity}
+        issue = row.get("issue")
+        if isinstance(issue, str) and issue.startswith("t-"):
+            task = c.execute("SELECT id, state, updated, version FROM tasks WHERE id = ? AND repo = ?",
+                             (issue, row["repo"])).fetchone()
+            if task:
+                data["board_task"] = dict(task)
     return events.emit(kind, f"{SUBJECT[table]}:{identity}", cls="derived", ver=row["version"],
-                       task=row.get("issue", row.get("task", row.get("id"))),
-                       data={**row, **({"run": identity} if table == "runs" else {})})
+                       task=row.get("issue", row.get("task", row.get("id"))), data=data)
 
 
 def insert(table, fields, identity=None, kind=None):
@@ -80,7 +88,7 @@ def insert(table, fields, identity=None, kind=None):
                            tuple(values.values()))
         identity = identity if identity is not None else cursor.lastrowid
         row = current(c, table, identity)
-        emit(table, identity, row, kind or f"{SUBJECT[table]}.created")
+        emit(c, table, identity, row, kind or f"{SUBJECT[table]}.created")
         return row
 
 
@@ -118,7 +126,7 @@ def update(table, identity, fields, *, base_version=None, expect=(), increments=
             if not changed:
                 raise VersionConflict(current(c, table, identity))
             row = current(c, table, identity)
-        emit(table, identity, row, kind or f"{SUBJECT[table]}.changed")
+        emit(c, table, identity, row, kind or f"{SUBJECT[table]}.changed")
         return row
 
 

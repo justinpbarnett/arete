@@ -1,6 +1,9 @@
 This is an on-call repair. Arete's watcher saw a failure and opened incident $incident ($kind, from $source).
 It was seen $count times, from $first_seen to $last_seen. This is attempt $attempt of $max_attempts.
 $earlier
+
+Denied paths: $denied.
+
 Work in this order:
 
 1. Diagnose and reproduce the failure first. Find the cause in the code or config and show that it fails before you change anything. If you cannot reproduce it, say so and change nothing.

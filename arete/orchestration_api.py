@@ -20,6 +20,7 @@ class Operation:
     description: str
     fields: dict[str, tuple[type, object]]
     constraints: dict[str, dict] = field(default_factory=dict)
+    schemas: dict[str, dict] = field(default_factory=dict)
 
     def arguments(self, value) -> dict:
         if not isinstance(value, dict) or value.keys() - self.fields.keys():
@@ -46,7 +47,7 @@ class Operation:
     def describe(self) -> dict:
         return {"description": self.description, "arguments": {
             name: {"type": kind.__name__, **({"required": True} if default is OPTIONAL else {"default": default}),
-                   **self.constraints.get(name, {})}
+                   **self.constraints.get(name, {}), **({"schema": self.schemas[name]} if name in self.schemas else {})}
             for name, (kind, default) in self.fields.items()}}
 
 
@@ -81,7 +82,10 @@ OPERATIONS = {
                                    {"goal_refs": (list, []), "route_id": required(str), "effort": required(str)}),
     "review.run": Operation("One independent review of the current tree.",
                              {"context_refs": (list, []), "route_id": required(str), "effort": required(str)}),
-    "owner.ask": Operation("Ask through the existing owner-question lifecycle.", {"request": required(dict)}),
+    "owner.ask": Operation("Ask through the existing owner-question lifecycle. request must match its schema: "
+                           "questions holds 1 to 4 questions and why says why you need the answer. "
+                           "A rejected request names what to fix; send it again before finishing failed.",
+                           {"request": required(dict)}, schemas={"request": owner_asks.SCHEMA}),
     "run.wait": Operation("Wait for worker completion, failure or a new progress report. For active work use a single "
                           "run.wait call with timeout_seconds=0 to follow the worker to its step or run deadline. "
                           "A positive timeout caps the wait further and omission defaults to 60 seconds.",
@@ -129,10 +133,14 @@ class Catalog:
         for name, tools in BUNDLES.items():
             key = f"tools:{name}"
             self.entries[key] = {"id": key, "kind": "tools", "tools": list(tools)}
-        self.context = {"task": f"{job.ticket.title}\n\n{job.ticket.body}\n\n{job.ticket.comments or ''}",
-                        "expertise": job.expertise, "attachments": job.attachments,
-                        "feedback": "\n".join(job.run.story)}
+        self.context = {}
+        self.refresh_context()
         self.fingerprint = digest(self.entries)
+
+    def refresh_context(self) -> None:
+        job = self.job
+        self.context.update(task=f"{job.ticket.title}\n\n{job.ticket.body}\n\n{job.ticket.comments or ''}",
+                            expertise=job.expertise, attachments=job.attachments, feedback="\n".join(job.run.story))
 
     def add_context(self, name: str, text: str) -> None:
         self.context[name] = text
@@ -150,8 +158,7 @@ class Catalog:
         found = []
         for key in ids:
             if key in OPERATIONS:
-                found.append({"id": key, **OPERATIONS[key].describe(),
-                              **({"request_schema": owner_asks.SCHEMA} if key == "owner.ask" else {})})
+                found.append({"id": key, **OPERATIONS[key].describe()})
             elif key in self.entries:
                 entry = dict(self.entries[key])
                 if entry["kind"] == "models":
@@ -207,13 +214,14 @@ class Catalog:
         roles = (role, "check_repair", "review_repair", "ci_repair") if writing else (role,)
         return self.route(request["route_id"], request["effort"], roles), name, writing
 
-    def validate(self, response, turn: str, version: int, known: dict[str, dict]) -> dict:
+    def validate(self, response, turn: str, version: int, known: dict[str, dict], *, enforce_size_limit=True) -> dict:
         if (not isinstance(response, dict) or set(response) != {"version", "decision_id", "state_version", "rationale", "calls"}
                 or type(response["version"]) is not int or response["version"] != PROTOCOL
                 or response["decision_id"] != turn or type(response["state_version"]) is not int
                 or response["state_version"] != version or type(response["rationale"]) is not str
                 or len(response["rationale"]) > 2000 or type(response["calls"]) is not list
-                or not 1 <= len(response["calls"]) <= 8 or len(json.dumps(response)) > MAX_BYTES):
+                or not 1 <= len(response["calls"]) <= 8
+                or (enforce_size_limit and len(json.dumps(response)) > MAX_BYTES)):
             raise ValueError("invalid decision envelope or stale state version")
         calls = []
         for call in response["calls"]:
@@ -262,5 +270,9 @@ class Catalog:
         return {**response, "calls": calls}
 
 
+def describe_operations() -> dict:
+    return {name: operation.describe() for name, operation in OPERATIONS.items()}
+
+
 def help_text() -> str:
-    return json.dumps({name: operation.describe() for name, operation in OPERATIONS.items()}, separators=(",", ":"))
+    return json.dumps(describe_operations(), separators=(",", ":"))
