@@ -42,6 +42,14 @@ class CrowdedThree(unittest.TestCase):
         crowd(self)
 
 
+class DriveFlush(unittest.TestCase):
+    def test_it(self):
+        marker = os.path.join(os.environ["PARALLEL_MARKERS"], "drive-flush")
+        with open(marker, "a") as values:
+            print(os.environ.get("ARETE_DRIVE_FLUSH"), file=values)
+        self.fail("force an alone rerun")
+
+
 class Noisy(unittest.TestCase):
     def test_assertion(self):
         for number in range(2000):
@@ -76,6 +84,14 @@ class RunnerOutputTests(unittest.TestCase):
                               check=False, cwd=ROOT, env=self.env, stdin=subprocess.DEVNULL, capture_output=True,
                               text=True, timeout=self.class_timeout)
         return done.returncode, done.stdout + done.stderr
+
+    def test_drive_flush_is_disabled_in_initial_and_alone_class_processes(self):
+        self.env["ARETE_DRIVE_FLUSH"] = "1"
+        code, output = self.run_suite("test_sample.DriveFlush")
+        self.assertEqual(code, 1, output)
+        marker = Path(self.env["PARALLEL_MARKERS"]) / "drive-flush"
+        self.assertTrue(marker.is_file(), output)
+        self.assertEqual(marker.read_text().splitlines(), ["0", "0"], output)
 
     def test_a_noisy_failing_class_keeps_its_traceback_in_the_tail(self):
         code, output = self.run_suite("test_sample.CrowdedOne", "test_sample.CrowdedTwo",
