@@ -41,6 +41,8 @@ from arete.agent import NO_SESSION, Result
 from arete.orchestration_api import OPERATIONS, help_text
 from arete.review import Review, catch_up_problems
 from arete.store import db, orchestration as ledger
+from arete.store import runs as run_store
+from arete.store import tasks as task_store
 from tests import parallel
 from tests.parallel import stack_env
 from tests.subprocess_helpers import CHILD_HANG_TIMEOUT
@@ -535,6 +537,102 @@ class QueueScoringTests(unittest.TestCase):
 
         self.source.todo()
         self.assertEqual(queueing.scores(list(self.source.open_agent_tickets)), {"1": (1, 0)})
+
+
+class PolicyRetryCapTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.state = Path(cls.enterClassContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        cls.template = cls.state / "template.db"
+        cls.enterClassContext(mock.patch.multiple(paths, STATE_DIR=cls.state, DB_FILE=cls.template,
+                                                 RUNS_DIR=cls.state / "runs", LOCKS_DIR=cls.state / "locks",
+                                                 WORKTREES_DIR=cls.state / "worktrees", LOG_DIR=cls.state / "logs"))
+        db.migrate()
+
+    def setUp(self):
+        database = self.state / f"{self._testMethodName}.db"
+        shutil.copyfile(self.template, database)
+        self.enterContext(mock.patch.object(paths, "DB_FILE", database))
+        self.now = util.parse_iso("2026-11-22T16:00:00Z")
+        self.enterContext(mock.patch.object(util, "now", return_value=self.now))
+        self.enterContext(mock.patch.object(poll.pilot, "pickable", return_value=True))
+        self.enterContext(mock.patch.object(poll.zte, "reserved", return_value=False))
+        remote = "fixture/repo"
+        self.repo = config.Repo("fixture", self.state, github=remote, parts=[config.Part("", remote)])
+        self.local = tracker.LocalTracker(self.repo)
+        self.tid = task_store.task_add(self.repo.name, "Retry policy fixture", reserved_id="t-0845")
+        task_store.task_set_state(self.tid, "failed")
+
+    def add_run(self, hours, *, tid=None, repo=None, status="failed", reason="policy-changed", duration=1):
+        tid = self.tid if tid is None else tid
+        repo = self.repo.name if repo is None else repo
+        run_store.insert_run(f"{repo}-{tid}-{hours}-{status}-{reason}", {
+            "kind": "pipeline", "repo": repo, "issue": tid, "status": status,
+            "started": util.iso(self.now - timedelta(hours=hours + duration)),
+            "finished": util.iso(self.now - timedelta(hours=hours)),
+            "summary": pipeline.worker_policy_changed(),
+            "failure": json.dumps({"class": "environment", "reason": reason}),
+        })
+
+    def pick(self, source):
+        output = StringIO()
+        with redirect_stdout(output):
+            ticket = poll.next_ticket(self.repo, source, pipeline.SkipLog({}))
+        return ticket, output.getvalue()
+
+    def test_local_retries_at_three_recent_policy_failures(self):
+        for hours in (1, 2, 3, 24):
+            self.add_run(hours)
+        self.add_run(4, status="stopped")
+        self.add_run(5, reason="engine-crash")
+        self.add_run(6, tid="t-0001")
+        self.add_run(7, repo="other")
+
+        ticket, output = self.pick(self.local)
+
+        self.assertEqual(ticket.id, self.tid)
+        self.assertEqual(output, "")
+
+    def test_local_stays_failed_at_four_recent_policy_failures(self):
+        for hours in (1, 2, 3):
+            self.add_run(hours)
+        self.add_run(4, duration=24)
+
+        with db.reader():
+            ticket, output = self.pick(self.local)
+
+        self.assertIsNone(ticket)
+        self.assertEqual(output.splitlines(), [
+            f"{util.iso(self.now)} {self.repo.name} {self.tid}: kept failed after 3 policy requeues in 24 hours",
+        ])
+
+    def test_local_retries_when_older_policy_failures_age_out(self):
+        for hours in (1, 2, 25, 26):
+            self.add_run(hours)
+
+        ticket, output = self.pick(self.local)
+
+        self.assertEqual(ticket.id, self.tid)
+        self.assertEqual(output, "")
+
+    def test_github_admission_still_depends_on_failed_label_and_park(self):
+        source = tracker.for_repo(config.Config(), self.repo)
+        tid = "845"
+        for hours in (1, 2, 3, 4):
+            self.add_run(hours, tid=tid)
+        issue = {"number": int(tid), "title": "GitHub retry fixture", "author": {"login": source.owner},
+                 "labels": [{"name": "agent"}, {"name": source.label_name("failed")}]}
+        self.enterContext(mock.patch.object(gh, "issues", return_value=[issue]))
+
+        self.assertEqual(self.pick(source), (None, ""))
+        with mock.patch.object(runlimits, "latest_park", return_value=({}, {"reason": "parked"})):
+            ticket, output = self.pick(source)
+        self.assertEqual(ticket.id, tid)
+        self.assertEqual(output, "")
+        issue["labels"].pop()
+        ticket, output = self.pick(source)
+        self.assertEqual(ticket.id, tid)
+        self.assertEqual(output, "")
 
 
 class RestoredPRRevisionTests(unittest.TestCase):
@@ -5860,6 +5958,68 @@ class CatchUpPublicationFailureTests(MovedBasePublicationFixture, unittest.TestC
                     park.assert_not_called()
 
 
+class ParkedTicketCommentTests(unittest.TestCase):
+    def setUp(self):
+        folder = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        self.tracker = mock.Mock(comment=mock.Mock(return_value=""), states=("failed",),
+                                 label=mock.Mock(return_value=""), move=mock.Mock(return_value=""),
+                                 ref=mock.Mock(return_value="#842"))
+        budget = mock.Mock()
+        budget.park.return_value = {"pr_url": ""}
+        self.run = pipeline.Run("parked-run", config.Repo("fixture", folder), folder,
+                                tracker=self.tracker, tid="842", budget=budget)
+        self.enterContext(mock.patch.object(record, "note"))
+        self.reason = "the repair chain used its 3 repair cycles"
+        self.retry = ("Change this ticket's title or body to retry; the next poll starts it again on the kept branch. "
+                      "Run `parked-run`.")
+
+    def save_review(self, name, *problems):
+        (self.run.dir / name).write_text(json.dumps({"structured": {"problems": problems}}))
+
+    def assert_comment(self, *review_lines):
+        pipeline.record_park(self.run, self.reason, {})
+        self.tracker.comment.assert_called_once()
+        ticket, body = self.tracker.comment.call_args.args
+        self.assertEqual(ticket, "842")
+        self.assertEqual([line for line in body.splitlines() if line], [
+            f"{tracker.ARETE_TAG} Parked: {self.reason}.", *review_lines, self.retry,
+        ])
+
+    def test_comments_with_blocking_files_in_numeric_round_order(self):
+        self.run.feedback = [{"pr_url": "https://github.com/fixture/repo/pull/7"}]
+        self.enterContext(mock.patch.object(self.run, "say_on_prs"))
+        self.save_review("review10.json", {"file": "", "severity": "major"})
+        self.save_review("review2.json", {"file": "arete/z.py", "severity": "major", "problem": "PROBE-THREE"})
+        self.save_review("review.json",
+                         {"file": "arete/x.py:12", "severity": "blocker", "problem": "PROBE-ONE", "category": "issue"},
+                         {"file": "tests/y.py", "severity": "minor", "problem": "PROBE-TWO"})
+        (self.run.dir / "review-other.json").write_text("invalid JSON")
+        self.assert_comment("- Review 1 held on `arete/x.py:12` (blocker)",
+                            "- Review 2 held on `arete/z.py` (major)",
+                            "- Review 10 held on (no file) (major)")
+
+    def test_comments_without_review_files_in_this_run(self):
+        earlier = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        (earlier / "review.json").write_text(json.dumps({"structured": {"problems": [
+            {"file": "old.py", "severity": "blocker"},
+        ]}}))
+        self.assert_comment()
+
+    def test_comments_without_review_lines_when_one_review_is_invalid(self):
+        for invalid_round in ("review.json", "review2.json"):
+            with self.subTest(invalid_round=invalid_round):
+                for name in ("review.json", "review2.json"):
+                    self.save_review(name, {"file": "arete/x.py", "severity": "blocker"})
+                (self.run.dir / invalid_round).write_text("invalid JSON")
+                self.assert_comment()
+                self.tracker.comment.reset_mock()
+
+    def test_dry_run_does_not_comment(self):
+        self.run.dry_run = True
+        pipeline.record_park(self.run, self.reason, {})
+        self.tracker.comment.assert_not_called()
+
+
 class CatchUpRecoveryTests(MovedBasePublicationFixture, unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -9463,6 +9623,109 @@ class PromptSnapshotTests(unittest.TestCase):
         reload.assert_called_once_with(1)
         self.file.write_text("later $one $two")
         self.assertEqual(prompt_loader.prompt("x", self.prompts, one="1"), "deployed 1")
+
+
+class MissingPromptInputsTests(unittest.TestCase):
+    message = "prompt x: missing inputs: two"
+
+    def test_prompt_reports_missing_inputs_as_value_error(self):
+        with TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            folder = Path(directory)
+            (folder / "x.md").write_text("a $one $two")
+
+            with self.assertRaises(prompt_loader.MissingInputs) as raised:
+                prompt_loader.prompt("x", folder, one="1")
+
+        self.assertEqual(str(raised.exception), self.message)
+        self.assertIsInstance(raised.exception, ValueError)
+
+    def scratch_state(self):
+        root = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True))).resolve()
+        self.enterContext(mock.patch.multiple(paths, STATE_DIR=root, DB_FILE=root / "arete.db",
+                                             RUNS_DIR=root / "runs", LOCKS_DIR=root / "locks",
+                                             WORKTREES_DIR=root / "worktrees", LOG_DIR=root / "logs"))
+        with redirect_stdout(StringIO()):
+            db.migrate()
+        return root
+
+    def worker_start(self, error, run=None):
+        if run is None:
+            self.scratch_state()
+            run = SimpleNamespace(id=self.id())
+        controller = object.__new__(orchestration.Controller)
+        controller.run = run
+        controller.lease = ledger.acquire(controller.run.id, "", {})
+        controller.perform = mock.Mock(side_effect=error)
+        controller.persist = mock.Mock()
+        version = ledger.snapshot(controller.lease)["version"]
+        turn = ledger.begin(controller.lease, {}, 1)
+        action, = ledger.accept(controller.lease, turn, version, {"calls": [{"op": "worker.start", "args": {}}]}, 1)
+        return controller, action
+
+    def assert_failed_action(self, controller, action, error):
+        saved, = ledger.actions(controller.lease)
+        self.assertEqual((saved["id"], saved["state"], saved["result"]["error"]), (action["id"], "failed", str(error)))
+        line, = orchestration.run_lines.read(controller.run.id)
+        self.assertEqual((line["event"], line["action"], line["op"], line["state"]),
+                         ("action", action["id"], "worker.start", "failed"))
+
+    def test_dispatch_records_and_reraises_missing_inputs(self):
+        error = prompt_loader.MissingInputs(self.message)
+        controller, action = self.worker_start(error)
+
+        with self.assertRaises(prompt_loader.MissingInputs) as raised:
+            controller.dispatch(action)
+
+        self.assertIs(raised.exception, error)
+        self.assert_failed_action(controller, action, error)
+
+    def test_dispatch_records_and_returns_plain_value_error(self):
+        error = ValueError("a dependency has not succeeded")
+        controller, action = self.worker_start(error)
+
+        self.assertIs(controller.dispatch(action), error)
+        self.assert_failed_action(controller, action, error)
+
+    def test_missing_inputs_is_an_engine_crash(self):
+        self.assertEqual(pipeline.crash_failure(prompt_loader.MissingInputs(self.message)),
+                         {"class": "environment", "reason": "engine-crash"})
+
+    def test_scheduled_zte_worker_start_persists_engine_crash(self):
+        from arete import zte
+        from arete.store import zte as zte_store
+
+        root = self.scratch_state()
+        repo = config.Repo("fixture", root, parts=[config.Part("", "owner/fixture")])
+        cfg = config.Config(repos=[repo])
+        deadline = util.iso(util.now() + timedelta(minutes=10))
+        reserved = zte_store.reserve("fixture-policy", repo.name, "a" * 40, deadline,
+                                     "Fixture ZTE task", "fix", "Fixture ZTE specification", {"task_version": 1})
+        grant = zte_store.transition(reserved, "dispatching")
+        slot_lock = pipeline.run_store.run_lock("slot", repo.name, grant.task)
+
+        def drive(flow):
+            self.assertTrue(util.lock_is_held(slot_lock))
+            controller, action = self.worker_start(prompt_loader.MissingInputs(self.message), flow.ctx.run)
+            return controller.dispatch(action)
+
+        script = pipeline.Script("orchestrate", drive)
+        self.addCleanup(signal.signal, signal.SIGTERM, signal.getsignal(signal.SIGTERM))
+        with (mock.patch.object(config, "load", return_value=cfg),
+              mock.patch.multiple(zte, INTERLOCK="fixture-zte", PAUSE_FILE=root / "pause"),
+              mock.patch.object(zte, "admit_run", return_value=grant),
+              mock.patch.object(zte, "require_launch_base"),
+              mock.patch.object(zte, "active"),
+              mock.patch.object(zte, "task_version", return_value=grant.data["task_version"]),
+              mock.patch.multiple(pipeline.scratch, process_ids=dict, service_labels=dict, RUN_BASELINES={}, RUN_LABELS={}),
+              principals.acting("rule:poll"), redirect_stdout(StringIO())):
+            result = pipeline.run_issue(repo.name, grant.task, script=script)
+
+        self.assertNotEqual(result, 0)
+        saved, = pipeline.run_store.ticket_runs(repo.name, grant.task)
+        self.assertEqual(zte_store.find(grant.task).data["run"], saved["id"])
+        self.assertEqual(saved["status"], "failed")
+        self.assertEqual(json.loads(saved["failure"] or "{}"), {"class": "environment", "reason": "engine-crash"})
+        self.assertFalse(util.lock_is_held(slot_lock))
 
 
 class ReviewRepairPromptTests(unittest.TestCase):

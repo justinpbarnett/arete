@@ -336,6 +336,12 @@ def newest_live_whole_run(repo: str, issue: int | str) -> dict | None:
     return next(iter(ticket_runs(repo, issue, limit=1, whole=True, live=True)), None)
 
 
+def failed_ticket_runs_since(repo: str, issue: int | str, since: str) -> list[dict]:
+    with reader() as c:
+        return [dict(r) for r in c.execute("SELECT failure FROM runs WHERE kind = 'pipeline' AND repo = ? AND issue = ? "
+                                           "AND status = 'failed' AND finished > ?", (repo, issue, since))]
+
+
 def pr_gate_refreshes(repo: str, issue: str) -> list[dict]:
     with reader() as c:
         if not migration_applied(20, c):
