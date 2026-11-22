@@ -22,6 +22,7 @@ from contextlib import closing, contextmanager, nullcontext, redirect_stderr, re
 from dataclasses import asdict, replace
 from datetime import timedelta
 from io import StringIO
+from itertools import chain, repeat
 from pathlib import Path
 from socket import socketpair
 from tempfile import TemporaryDirectory
@@ -240,7 +241,7 @@ print("ARETE_FIXTURE_TOKEN" in os.environ)
 
 
 class ParallelClassDeadlineTests(unittest.TestCase):
-    def run_first_attempt(self, load_ratio):
+    def run_first_attempt(self, load_ratio, *, expected_samples):
         folder = self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True))
         (Path(folder) / "deadline_worker.py").write_text(
             "import time\n"
@@ -257,12 +258,19 @@ class ParallelClassDeadlineTests(unittest.TestCase):
         self.addCleanup(os.close, runner.lifeline)
         self.addCleanup(os.close, held)
         load = load_ratio * os.cpu_count()
-        with mock.patch.object(os, "getloadavg", return_value=(load, 0, 0)) as getloadavg:
-            runner.child((0, batch))
+        popen = subprocess.Popen
+
+        def start(*args, **kwargs):
             getloadavg.assert_called_once_with()
+            return popen(*args, **kwargs)
+
+        with (mock.patch.object(os, "getloadavg", return_value=(load, 0, 0)) as getloadavg,
+              mock.patch.object(subprocess, "Popen", side_effect=start)):
+            runner.child((0, batch))
+        self.assertEqual(getloadavg.call_args_list, [mock.call()] * expected_samples)
         return runner.results[batch.identifier]
 
-    def run_class(self, load, *, cpu_count=8, timeout=None, stretch=1):
+    def run_class(self, load, *, expected_samples, cpu_count=8, timeout=None, stretch=1):
         class Sleeper(unittest.TestCase):
             class_timeout = 1
 
@@ -309,35 +317,101 @@ class ParallelClassDeadlineTests(unittest.TestCase):
               mock.patch.multiple(runner, kill=mock.DEFAULT, output=mock.Mock(return_value=""),
                                   request_stacks=mock.Mock(return_value=[]))):
             runner.child((0, batch), stretch=stretch)
-            getloadavg.assert_called_once_with()
+        self.assertEqual(getloadavg.call_args_list, [mock.call()] * expected_samples)
         return runner.results[batch.identifier], process.wait.call_args_list[0].args[0]
 
     def test_double_load_passes_on_first_run(self):
-        report = self.run_first_attempt(2)
+        report = self.run_first_attempt(2, expected_samples=1)
         self.assertFalse(parallel.failed(report), report)
         self.assertEqual(report["ran"], 1)
 
     def test_half_load_times_out_on_first_run(self):
-        report = self.run_first_attempt(0.5)
+        report = self.run_first_attempt(0.5, expected_samples=2)
         self.assertIn("class exceeded 1s", report["timeout"].splitlines(), report)
         self.assertIn("in test_sleep", report["timeout"])
 
     def test_factor_is_capped_at_four(self):
-        report, deadline = self.run_class(80)
+        report, deadline = self.run_class(80, expected_samples=1)
         self.assertEqual(deadline, 4)
         self.assertFalse(parallel.failed(report))
 
     def test_unavailable_load_or_cpu_count_uses_unscaled_deadline(self):
         for load, cpu_count in ((OSError("unavailable"), 8), (16, None)):
             with self.subTest(load=load, cpu_count=cpu_count):
-                report, deadline = self.run_class(load, cpu_count=cpu_count)
+                report, deadline = self.run_class(load, expected_samples=2, cpu_count=cpu_count)
                 self.assertEqual(deadline, 1)
                 self.assertIn("class exceeded 1s", report["timeout"].splitlines())
 
     def test_scaled_timeout_reports_deadline_and_factor_for_stretched_override(self):
-        report, deadline = self.run_class(10.56, timeout=0.375, stretch=2)
+        report, deadline = self.run_class(10.56, expected_samples=2, timeout=0.375, stretch=2)
         self.assertAlmostEqual(deadline, 0.99)
         self.assertIn("class exceeded 0.99s (deadline 0.75s x load 1.32)", report["timeout"].splitlines())
+
+
+class ParallelDeadlineExtensionTests(unittest.TestCase):
+    def sleeper(self, seconds):
+        folder = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        (folder / "deadline_extension_worker.py").write_text(
+            "import time\n"
+            "import unittest\n\n"
+            "class Sleeper(unittest.TestCase):\n"
+            "    class_timeout = 1\n\n"
+            "    def test_sleep(self):\n"
+            f"        time.sleep({seconds})\n"
+        )
+        self.enterContext(mock.patch.object(parallel, "HISTORY", folder / "history.json"))
+        runner = parallel.Runner(SimpleNamespace(start=str(folder), timeout=None, verbose=False, jobs=1, slowest=0))
+        # Stack capture can add a second to each timeout and is covered elsewhere.
+        self.enterContext(mock.patch.object(runner, "request_stacks", return_value=[]))
+        return runner, "deadline_extension_worker.Sleeper"
+
+    def test_pool_timeout_passes_alone_with_triple_deadline(self):
+        # At load factor 1, the 2.5s sleep exceeds both the pool's 1s deadline
+        # and the old 2s rerun deadline. Allow 0.5s for worker overhead on the rerun.
+        runner, identifier = self.sleeper(2.5)
+        self.addCleanup(sys.modules.pop, "deadline_extension_worker", None)
+
+        def remove_reports(path):
+            shutil.rmtree(path, ignore_errors=True)
+
+        # The managed sandbox can deny removal of temporary directories.
+        with (mock.patch.object(sys, "path", [runner.args.start, *sys.path]),
+              mock.patch.object(os, "getloadavg", return_value=(os.cpu_count(), 0, 0)),
+              mock.patch.object(parallel, "shutil", SimpleNamespace(rmtree=remove_reports)),
+              redirect_stdout(StringIO()) as output):
+            code = runner.run([], [identifier])
+        self.addCleanup(shutil.rmtree, runner.folder, ignore_errors=True)
+        self.assertEqual(code, 0, output.getvalue())
+        self.assertIn("class exceeded 1s", runner.first_failures[identifier]["timeout"].splitlines())
+        self.assertEqual(runner.crowded, [identifier])
+        self.assertIn(f"{identifier}: ran past its deadline on its first run, "
+                      "then passed alone within three times its deadline", output.getvalue())
+        self.assertEqual(runner.results[identifier]["ran"], 1)
+
+    def first_attempt(self, deadline_load_ratio):
+        runner, identifier = self.sleeper(2)
+        runner.folder = runner.args.start
+        runner.lifeline, held = os.pipe()
+        self.addCleanup(os.close, runner.lifeline)
+        self.addCleanup(os.close, held)
+        cpus = os.cpu_count()
+        # Sample factor 1 at startup and the chosen factor at the 1s deadline.
+        # The 2s sleep has room to finish within 3s only when the deadline extends.
+        samples = chain([(cpus, 0, 0)], repeat((deadline_load_ratio * cpus, 0, 0)))
+        with mock.patch.object(os, "getloadavg", side_effect=samples) as getloadavg:
+            runner.child((0, parallel.Batch(identifier, 1, timeout=1)))
+        return runner.results[identifier], getloadavg.call_args_list
+
+    def test_rising_load_extends_first_attempt(self):
+        report, samples = self.first_attempt(3)
+        self.assertFalse(parallel.failed(report), report)
+        self.assertEqual(report["ran"], 1)
+        self.assertEqual(samples, [mock.call(), mock.call()])
+
+    def test_steady_load_times_out_on_first_attempt(self):
+        report, samples = self.first_attempt(1)
+        self.assertIn("class exceeded 1s", report["timeout"].splitlines(), report)
+        self.assertEqual(samples, [mock.call(), mock.call()])
 
 
 class QueueScoringTests(unittest.TestCase):
