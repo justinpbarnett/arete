@@ -2415,7 +2415,7 @@ class OwnerAnswerBudgetFixture(PollFixture):
             {"kind": "text", "header": "CI log", "question": question}]}] if structured else None
         if structured:
             run_lines.write(asked.id, "execution", path="feature")
-        with patch.object(pipeline, "release_workspace"):
+        with patch.object(pipeline, "release_workspace"), patch.object(pipeline.alerts, "ask_notice"):
             status, summary, _ = pipeline._ask(asked, self.repo.path, [], question, question, asks,
                                                {} if structured else None)
         self.assertEqual(status, "needs-info")

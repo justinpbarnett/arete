@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 
 from . import gh, outbound, util
@@ -11,6 +12,8 @@ NOTIFY_SCRIPT = ("-e", "on run argv", "-e", "display notification (item 1 of arg
 
 
 def notify(title: str, message: str) -> None:
+    if os.environ.get("ARETE_DESKTOP_NOTIFY") == "0":
+        return
     msg, title = message[:200], title[:100]
     if sys.platform == "darwin":
         util.sh(["osascript", *NOTIFY_SCRIPT, "--", msg, title], timeout=10, keeps=("launch",))

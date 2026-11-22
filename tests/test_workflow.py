@@ -6996,6 +6996,44 @@ class SelfDeployRollbackTests(unittest.TestCase):
             self.server.alert_last.result(timeout=1)
             incidents["alert_clear"].assert_called_once_with(serve.ALERT_KEY)
 
+    def test_desktop_notify_is_disabled_only_by_zero(self):
+        with (mock.patch.object(serve.alerts.sys, "platform", "darwin"),
+              mock.patch.object(util, "sh") as shell,
+              mock.patch.dict(os.environ)):
+            os.environ.pop("ARETE_DESKTOP_NOTIFY", None)
+            serve.alerts.notify("title", "message")
+            shell.assert_called_once_with(
+                ["osascript", *serve.alerts.NOTIFY_SCRIPT, "--", "message", "title"],
+                timeout=10, keeps=("launch",))
+            shell.reset_mock()
+            os.environ["ARETE_DESKTOP_NOTIFY"] = "0"
+            serve.alerts.notify("title", "message")
+            shell.assert_not_called()
+            os.environ["ARETE_DESKTOP_NOTIFY"] = "1"
+            serve.alerts.notify("title", "message")
+            shell.assert_called_once()
+
+    def test_stack_env_disables_desktop_notifications(self):
+        for env in ({}, {"ARETE_DESKTOP_NOTIFY": "1"}):
+            with self.subTest(env=env):
+                self.assertEqual(stack_env(env)["ARETE_DESKTOP_NOTIFY"], "0")
+
+    def test_structured_spent_question_does_not_notify(self):
+        from tests.test_process_limits import OwnerAnswerBudgetFixture
+
+        fixture = OwnerAnswerBudgetFixture()
+        self.addCleanup(fixture.doClassCleanups)
+        fixture.setUpClass()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        with (mock.patch.object(serve.alerts.sys, "platform", "darwin"),
+              mock.patch.object(util, "sh") as shell,
+              mock.patch.dict(os.environ), redirect_stdout(StringIO())):
+            os.environ.pop("ARETE_DESKTOP_NOTIFY", None)
+            fixture.spent_question(structured=True)
+        for call in shell.call_args_list:
+            self.assertNotIn(call.args[0][0], {"osascript", "notify-send"})
+
     def test_rollback_leaves_contract_and_expansion_in_the_database(self):
         self.prepare_checkout({})
         self.write_receipt(starts=3)
