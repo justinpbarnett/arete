@@ -40,6 +40,7 @@ from arete.orchestration_api import OPERATIONS, help_text
 from arete.review import Review, catch_up_problems
 from arete.store import db, orchestration as ledger
 from tests.parallel import stack_env
+from tests.subprocess_helpers import CHILD_HANG_TIMEOUT
 
 
 class QueueScoringTests(unittest.TestCase):
@@ -387,7 +388,8 @@ class RestoredPRRevisionTests(unittest.TestCase):
         return c, shas[advance]
 
     def fixture_git(self, cwd, *args, input=None):
-        result = subprocess.run(["git", *args], cwd=cwd, input=input, capture_output=True, text=True, timeout=5)
+        result = subprocess.run(["git", *args], cwd=cwd, input=input, capture_output=True, text=True,
+                                timeout=CHILD_HANG_TIMEOUT)
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout
 
@@ -3302,7 +3304,8 @@ class ResolverScratchFixture(unittest.TestCase):
     @classmethod
     def create_merge(cls, root, tracked_changed_by="", tracked_added_by_base=False):
         def git(*args, check=True):
-            subprocess.run(["git", *args], cwd=root, check=check, capture_output=True, text=True)
+            subprocess.run(["git", *args], cwd=root, check=check, capture_output=True, text=True,
+                           timeout=CHILD_HANG_TIMEOUT)
 
         git("init", "-q", "-b", "main", "--template=")
         git("config", "user.name", "Fixture")
@@ -3954,7 +3957,7 @@ class CatchUpCleanupTests(unittest.TestCase):
         cls.empty_repo = Path(tempfile.mkdtemp()).resolve()
         cls.addClassCleanup(shutil.rmtree, cls.empty_repo, ignore_errors=True)
         subprocess.run(["git", "init", "-q", "--template=", "-b", "fixture"],
-                       cwd=cls.empty_repo, check=True, capture_output=True)
+                       cwd=cls.empty_repo, check=True, capture_output=True, timeout=CHILD_HANG_TIMEOUT)
 
     def setUp(self):
         root = Path(tempfile.mkdtemp()).resolve()
@@ -3992,7 +3995,8 @@ class CatchUpCleanupTests(unittest.TestCase):
         return [self.checkout]
 
     def repo_git(self, *args, cwd=None):
-        return subprocess.run(["git", *args], cwd=cwd or self.wt, check=True, capture_output=True, text=True).stdout
+        return subprocess.run(["git", *args], cwd=cwd or self.wt, check=True, capture_output=True, text=True,
+                              timeout=CHILD_HANG_TIMEOUT).stdout
 
     def init_repo(self, cwd=None):
         shutil.copytree(self.empty_repo / ".git", (cwd or self.wt) / ".git", dirs_exist_ok=True)
@@ -5412,7 +5416,8 @@ os.kill(os.getpid(), signal.SIGKILL)
 """
         env = {**os.environ, "ARETE_STATE_DIR": str(self.state), "ARETE_LOG_DIR": str(self.state / "logs"),
                "ARETE_WORKTREES_DIR": str(self.state / "worktrees")}
-        done = subprocess.run([sys.executable, "-c", child], capture_output=True, text=True, timeout=2, env=env)
+        done = subprocess.run([sys.executable, "-c", child], capture_output=True, text=True,
+                              timeout=CHILD_HANG_TIMEOUT, env=env)
         self.assertEqual((done.returncode, done.stdout.strip()), (-signal.SIGKILL, "True"), done.stderr)
         self.assertFalse(util.lock_is_held("automerge-fixture%2Frepo"))
         run = SimpleNamespace(repo=SimpleNamespace(name="repo"), tid="2")
@@ -6488,7 +6493,8 @@ class ServeDeploymentFixture(unittest.TestCase):
 
     def git(self, cwd, *args):
         return subprocess.check_output(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
-                                        "-c", "commit.gpgsign=false", *args], cwd=cwd, text=True, timeout=5).strip()
+                                       "-c", "commit.gpgsign=false", *args], cwd=cwd, text=True,
+                                       timeout=CHILD_HANG_TIMEOUT).strip()
 
     def commit(self, cwd, subject):
         self.git(cwd, "add", ".")
@@ -6670,9 +6676,9 @@ class SelfDeployRollbackTests(unittest.TestCase):
 
     def git(self, *args):
         return subprocess.check_output(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
-                                        "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", *args],
+                                       "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", *args],
                                        cwd=self.checkout,
-                                       text=True, timeout=2).strip()
+                                       text=True, timeout=CHILD_HANG_TIMEOUT).strip()
 
     def prepare_state(self):
         root = Path(tempfile.mkdtemp()).resolve()
@@ -6723,7 +6729,8 @@ class SelfDeployRollbackTests(unittest.TestCase):
     def start(self):
         plist = install.serve_plist()
         return subprocess.run(plist["ProgramArguments"], cwd=plist["WorkingDirectory"],
-                              env=plist["EnvironmentVariables"], capture_output=True, text=True, timeout=2)
+                              env=plist["EnvironmentVariables"], capture_output=True, text=True,
+                              timeout=CHILD_HANG_TIMEOUT)
 
     def test_import_rejection_counts_as_a_failed_start(self):
         self.prepare_state()
@@ -6815,7 +6822,7 @@ class SelfDeployRollbackTests(unittest.TestCase):
         self.write_receipt(starts=3, started_at=time.time())
         restored = subprocess.run([sys.executable, "-I", "-S", str(wrapper), "serve"],
                                   cwd=self.checkout, env=install.serve_plist()["EnvironmentVariables"],
-                                  capture_output=True, text=True, timeout=2)
+                                  capture_output=True, text=True, timeout=CHILD_HANG_TIMEOUT)
         self.assertEqual(restored.returncode, 0, restored.stderr)
         self.assertIn("last good started", restored.stdout)
         self.assertEqual(self.git("rev-parse", "HEAD"), self.previous)
@@ -7568,7 +7575,7 @@ class ServeStatusTests(unittest.TestCase):
         installed = Path(sysconfig.get_path("scripts")) / "arete"
         result = subprocess.run([str(installed), "status", *args], cwd=self.root,
                                 env=stack_env({**env, "PYTHONPATH": str(self.root), "PYTHONDONTWRITEBYTECODE": "1"}),
-                                capture_output=True, text=True, timeout=8)
+                                capture_output=True, text=True, timeout=CHILD_HANG_TIMEOUT)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertEqual(result.stdout, "")
         self.assertIn("broken deployment fixture", result.stderr)
