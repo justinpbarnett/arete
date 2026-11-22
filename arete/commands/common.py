@@ -141,7 +141,8 @@ def serve_line(beat: dict) -> str:
     paused +=f"; new code paused: {beat['code_problem']}" if beat.get("code_problem") else ""
     failing = "".join(f"; tick fails at {key}: {found['error']}" for key, found in (beat.get("failing") or {}).items())
     code = serve_revisions(beat)
-    running, pending = ("unknown" if beat[k] is None else beat[k] for k in ("running", "pending"))
+    running = "unknown loop runs" if beat["running"] is None else util.count(beat["running"], "loop run")
+    pending = "unknown loop fires" if beat["pending"] is None else util.count(beat["pending"], "loop fire")
     return (f"serve: up, pid {beat['pid']}, {util.count(beat['loops'], 'loop')} on, {beat['off']} off, "
             f"{running} running, {pending} waiting"
             + (f", {len(beat['broken'])} broken" if beat.get("broken") else "")
