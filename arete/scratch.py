@@ -971,12 +971,18 @@ def hidden_folders(with_state: bool = True) -> tuple[Path, ...]:
 
 
 def service_command(a: Attempt, command: str, browser_port: int | None = None) -> list[str]:
-    if (not sandbox.can_confine(False) or Path(a.workspace) == paths.WORKTREES_DIR.resolve()
-            or not Path(a.workspace).is_relative_to(paths.WORKTREES_DIR.resolve())):
+    workspace, root = Path(a.workspace), Path(a.root)
+    if not sandbox.can_confine(False) or root.parent != workspace:
+        raise sandbox.ConfinementUnavailable("service confinement cannot isolate trusted scratch in this workspace")
+    worktrees, workspace = sandbox.canonical(paths.WORKTREES_DIR), sandbox.canonical(workspace)
+    with root_fd(a) as fd:
+        scratch_root = sandbox.directory_path(fd, root)
+    if (workspace == worktrees or not workspace.is_relative_to(worktrees)
+            or scratch_root != workspace / root.name):
         raise sandbox.ConfinementUnavailable("service confinement cannot isolate trusted scratch in this workspace")
     return sandbox.write_confinement(
-        Path(a.workspace), [], hidden=hidden_folders(), agent_roots=False, peers=paths.WORKTREES_DIR,
-        secrets_denied=True, unix_confined=True,
+        workspace, [], hidden=hidden_folders(), agent_roots=False, peers=paths.WORKTREES_DIR,
+        secrets_denied=True, secret_name_exceptions=(scratch_root,), unix_confined=True,
         denied_ports=(browser_port,) if browser_port else ()) + ["/bin/sh", "-c", command]
 
 

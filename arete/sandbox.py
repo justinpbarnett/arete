@@ -49,6 +49,13 @@ def absolute(path: Path) -> Path:
         raise ConfinementUnavailable(f"{path} cannot be located: {e.strerror}") from e
 
 
+def directory_path(fd: int, fallback: Path) -> Path:
+    if getpath := getattr(fcntl, "F_GETPATH", None):
+        name = fcntl.fcntl(fd, getpath, bytes(1024)).split(b"\0", 1)[0]
+        return Path(os.fsdecode(name))
+    return fallback
+
+
 def canonical(path: Path) -> Path:
     try:
         current, missing = absolute(path).resolve(), []
@@ -66,13 +73,12 @@ def canonical(path: Path) -> Path:
         except OSError as e:
             raise ConfinementUnavailable(f"{path} cannot be checked: {e.strerror}") from e
         try:
-            getpath = getattr(fcntl, "F_GETPATH", None)
-            name = fcntl.fcntl(fd, getpath, bytes(1024)).split(b"\0", 1)[0] if getpath else os.fsencode(current)
+            resolved = directory_path(fd, current)
         except OSError as e:
             raise ConfinementUnavailable(f"{path} cannot be checked: {e.strerror}") from e
         finally:
             os.close(fd)
-        return Path(os.fsdecode(name), *reversed(missing))
+        return resolved.joinpath(*reversed(missing))
 
 
 def can_confine(remote: bool) -> bool:
@@ -129,6 +135,7 @@ def protected_command(command, cwd=None, keeps=(), *, _deploy=False, _restore_pa
 def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = None,
                       *, hidden: tuple[Path, ...] = (), restrict_writes: bool = True,
                       agent_roots: bool = True, peers: Path | None = None, secrets_denied: bool = False,
+                      secret_name_exceptions: tuple[Path, ...] = (),
                       keeps: tuple[str, ...] = (), unix_confined: bool = False, temp_writes: bool = True,
                       state: tuple[Path, tuple[Path, ...]] | None = None,
                       mach: tuple[tuple[str, ...], str] | None = None, tcp_port: int | None = None,
@@ -180,8 +187,20 @@ def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = 
 
         params += ["-D", "NAMES=" + pattern(SECRET_NAMES), "-D", "SAFE=" + pattern(SAFE_NAMES),
                    "-D", "DIRS=" + pattern(SECRET_DIRS, True)]
+        secret_roots = []
+        for i, folder in enumerate(secret_name_exceptions):
+            name = f"SECRET_NAME_ROOT{i}"
+            params += ["-D", f"{name}={folder}"]
+            secret_roots.append(f'(param "{name}")')
+        outside_scratch = "".join(f" (require-not (subpath {root}))" for root in secret_roots)
         profile += ('(deny file-read* file-write* (require-all (regex (param "NAMES")) '
-                    '(require-not (regex (param "SAFE")))))(deny file-read* file-write* (regex (param "DIRS")))')
+                    f'(require-not (regex (param "SAFE"))){outside_scratch}))'
+                    '(deny file-read* file-write* (regex (param "DIRS")))')
+        if secret_roots:
+            scratch_entries = " ".join(f"(literal {root})" for root in secret_roots)
+            profile += (f"(deny file-write-create file-write-unlink {scratch_entries})"
+                        f"(deny file-write-unlink (require-all (vnode-type DIRECTORY){outside_scratch}))"
+                        "(deny file-link file-clone file-mount file-unmount)")
     engine = real_path(paths.PACKAGE_DIR)
     if not _deploy:
         params += ["-D", f"ENGINE={engine}"]

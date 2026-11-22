@@ -2,22 +2,171 @@ import io
 import json
 import os
 import plistlib
+import shlex
 import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import contextmanager, redirect_stdout, suppress
 from dataclasses import asdict, replace
 from pathlib import Path
+from textwrap import dedent
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from arete import launchd, paths, poll, scratch, workspace
+from arete import guard, launchd, paths, pi_shell, poll, sandbox, scratch, workspace
 from arete.lab import experiment, optimize
 
 PROMOTION_FLOOR = {"accept_rate": 0.8, "max_drop": 0.2, "min_saving": 0.1}
+
+
+def requires_native_sandbox(test):
+    if not sandbox.can_confine(False):
+        return unittest.skip("requires macOS sandbox-exec")(test)
+    if sandbox.sandboxed():
+        return unittest.skip("sandbox-exec cannot install a profile inside the test runner's sandbox")(test)
+    return test
+
+
+class VerifyScratchSecretNameTests(unittest.TestCase):
+    command_timeout = 1.5
+
+    def setUp(self):
+        worktrees = Path(self.enterContext(tempfile.TemporaryDirectory(ignore_cleanup_errors=True))).resolve()
+        self.workspace = worktrees / "worktree"
+        self.root = self.workspace / f"{paths.SCRATCH_PREFIX}{'1' * 16}{paths.SCRATCH_SUFFIX}"
+        self.client = self.root / "state" / "client"
+        self.client.mkdir(parents=True)
+        self.attempt = scratch.Attempt("a" * 64, "1" * 16, "run", "verify", str(self.workspace), str(self.root),
+                                       str(worktrees / "run"), {"": scratch.identity(self.root.stat())}, {})
+        self.enterContext(patch.object(paths, "WORKTREES_DIR", worktrees))
+
+    def test_service_profile_guards_the_recorded_scratch_exemption(self):
+        with patch.object(sandbox, "can_confine", return_value=True):
+            profile = scratch.service_command(self.attempt, "true")[:-3]
+        baseline = sandbox.write_confinement(self.workspace, [], hidden=scratch.hidden_folders(), agent_roots=False,
+                                             peers=paths.WORKTREES_DIR, secrets_denied=True, unix_confined=True)
+        root_param = f"SECRET_NAME_ROOT0={sandbox.canonical(self.root)}"
+        index = profile.index(root_param)
+        self.assertEqual(profile[index - 1:index + 1], ["-D", root_param])
+        del profile[index - 1:index + 1]
+        outside = ' (require-not (subpath (param "SECRET_NAME_ROOT0")))'
+        workspace_write_grant = profile[-1].index('(allow file-write* (subpath (param "W0"))')
+        rules = (
+            '(deny file-write-create file-write-unlink (literal (param "SECRET_NAME_ROOT0")))',
+            f'(deny file-write-unlink (require-all (vnode-type DIRECTORY){outside}))',
+            '(deny file-link file-clone file-mount file-unmount)',
+        )
+        for rule in rules:
+            self.assertEqual(profile[-1].count(rule), 1)
+            self.assertGreater(profile[-1].index(rule), workspace_write_grant)
+            profile[-1] = profile[-1].replace(rule, "")
+        self.assertEqual(profile[-1].count(outside), 1)
+        profile[-1] = profile[-1].replace(outside, "")
+        self.assertEqual(profile, baseline)
+
+    def test_service_rejects_a_replaced_scratch_root(self):
+        link = self.workspace / "linked-scratch"
+        link.symlink_to(self.root, target_is_directory=True)
+        replacement = self.workspace / "replacement-scratch"
+        replacement.mkdir()
+        with patch.object(sandbox, "can_confine", return_value=True):
+            for root in (link, replacement):
+                with self.subTest(root=root.name), self.assertRaises(OSError):
+                    scratch.service_command(replace(self.attempt, root=str(root)), "true")
+
+    @requires_native_sandbox
+    def test_service_can_replace_and_read_its_key_while_outside_secrets_stay_denied(self):
+        for name in ("x.key", ".env"):
+            (self.workspace / name).write_text("outside")
+        (self.root / "linked-worktree").symlink_to(self.workspace, target_is_directory=True)
+        program = dedent("""\
+            import sys
+            from pathlib import Path
+
+            def denied(operation):
+                try:
+                    operation()
+                except PermissionError:
+                    return
+                raise AssertionError(f'unexpectedly allowed {operation}')
+
+            root = Path(sys.argv[1])
+            token = root / 'state/client/t.key'
+            token.write_text('first')
+            replacement = token.with_suffix('.new')
+            replacement.write_text('second')
+            replacement.replace(token)
+            assert token.read_text() == 'second'
+
+            for folder in (Path('.'), root / 'linked-worktree'):
+                for name in ('x.key', '.env'):
+                    path = folder / name
+                    denied(path.read_text)
+                    denied(lambda: path.write_text('changed'))
+
+            outside_dir = Path('outside-dir')
+            outside_dir.mkdir()
+            denied(lambda: outside_dir.rename(root / outside_dir))
+            denied(lambda: root.rename('moved-scratch'))
+
+            scratch_dir = root / 'scratch-dir'
+            scratch_dir.mkdir()
+            scratch_dir.rename(root / 'renamed-dir').rmdir()
+
+            ordinary_file = Path('ordinary-file')
+            ordinary_file.write_text('ordinary')
+            ordinary_file = ordinary_file.replace('renamed-file')
+            assert ordinary_file.read_text() == 'ordinary'
+            denied(lambda: (root / 'linked-file').hardlink_to(ordinary_file))
+            """)
+        command = shlex.join([sys.executable, "-I", "-c", program, self.root.name])
+        result = subprocess.run(scratch.service_command(self.attempt, command), cwd=self.workspace,
+                                capture_output=True, text=True, timeout=self.command_timeout)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @requires_native_sandbox
+    def test_service_can_publish_vite_cache(self):
+        cache = self.workspace / "node_modules" / ".vite"
+        published = cache / "deps"
+        staged = cache / "deps_temp_staged"
+        retired = cache / "deps_temp_retired"
+        published.mkdir(parents=True)
+        staged.mkdir()
+        (published / "chunk.js").write_text("old")
+        (staged / "chunk.js").write_text("new")
+        program = dedent("""\
+            import sys
+            from pathlib import Path
+
+            published, staged, retired = map(Path, sys.argv[1:])
+            published.rename(retired)
+            staged.rename(published)
+            """)
+        command = shlex.join([sys.executable, "-I", "-c", program, *map(str, (published, staged, retired))])
+        result = subprocess.run(scratch.service_command(self.attempt, command), cwd=self.workspace,
+                                capture_output=True, text=True, timeout=self.command_timeout)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((published / "chunk.js").read_text(), "new")
+        self.assertEqual((retired / "chunk.js").read_text(), "old")
+        self.assertFalse(staged.exists())
+
+    @requires_native_sandbox
+    def test_pi_shell_cannot_write_a_key_in_the_same_scratch(self):
+        shell = pi_shell.Shell(self.workspace, (), guard.Floor((), (), ()), (), (), {}, (), False,
+                               time.monotonic() + self.command_timeout)
+        with patch.object(pi_shell, "runtime_roots", return_value=()):
+            profile = shell.profile(threading.Event(), shell.deadline)
+        client = shlex.quote(str(self.client.relative_to(self.workspace)))
+        command = f"printf control > {client}/control; printf denied > {client}/t.key"
+        result = subprocess.run([*profile, "/bin/sh", "-ec", command], cwd=self.workspace,
+                                capture_output=True, text=True, timeout=self.command_timeout)
+        self.assertEqual((self.client / "control").read_text(), "control", result.stderr)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.client / "t.key").exists())
 
 
 class BundledXPCScratchTests(unittest.TestCase):
