@@ -41,6 +41,7 @@ export function isPublication(path, body) {
 
 export async function sendPublication(path, body, onResponse) {
   const fresh = prepareWrite(path, body);
+  if (!crypto.subtle) return sendWrite(fresh, onResponse);
   const fingerprint = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify([path, fresh.body])));
   const id = PUBLICATION_PREFIX + Array.from(new Uint8Array(fingerprint), byte => byte.toString(16).padStart(2, "0")).join("");
   const request = publications.get(id) ?? Object.freeze({ ...fresh, key: savedPublication(id) ?? fresh.key });

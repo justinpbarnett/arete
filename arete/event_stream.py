@@ -5,6 +5,7 @@ import math
 import time
 
 from . import control, events
+from .credential_http import problem
 from .store import db as foundation
 
 
@@ -39,11 +40,13 @@ def stream(handler, query, code):
             handler.send_header(key, value)
         handler.end_headers()
         handler.close_connection = True
-        handler.connection.settimeout(30)
+        handler.connection.settimeout(.75 if handler.credential is not None else 30)
 
     started = time.monotonic()
     if fmt == "json":
         while True:
+            if issue := handler.stream_problem():
+                raise problem(issue)
             if handler.verify_controls is not None:
                 handler.verify_controls.poll()
             with foundation.one_read() as c:
@@ -88,11 +91,15 @@ def stream(handler, query, code):
             if fmt == "sse":
                 write(b"retry: 2000\n\n")
             while dropped is None or not dropped():
+                if handler.stream_problem():
+                    return
                 epoch, top, rows, reason, meta = events.scan(c, epoch, seq, selected)
                 if reason:
                     message("reset", {"kind": "reset", "reason": reason})
                     return
                 for row in rows:
+                    if handler.stream_problem():
+                        return
                     position = f"{epoch}.{row['seq']}"
                     message(row["kind"], events.envelope(c, row, epoch), position)
                     if time.monotonic() >= beat:

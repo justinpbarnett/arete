@@ -20,9 +20,9 @@ MAX_JSON_INTEGER = 2**53 - 1
 HEADER = re.compile(rb"[!#$%&'*+.^_`|~0-9a-zA-Z-]+:[\t\x20-\x7e\x80-\xff]*\r\n")
 ETAG = re.compile(r'(?:W/)?("[\x21\x23-\x7e\x80-\xff]*")')
 STATUS_CODES = {
-    400: "invalid_input", 403: "forbidden", 404: "not_found", 405: "method_not_allowed",
+    400: "invalid_input", 401: "unauthenticated", 403: "forbidden", 404: "not_found", 405: "method_not_allowed",
     409: "conflict", 413: "body_too_large", 414: "uri_too_long", 415: "unsupported_media_type",
-    421: "misdirected_request", 422: "invalid_fields", 429: "rate_limited", 431: "headers_too_large",
+    421: "misdirected_request", 422: "invalid_fields", 426: "tls_required", 429: "rate_limited", 431: "headers_too_large",
     500: "internal_error", 501: "not_implemented", 502: "upstream_failed", 503: "draining",
     505: "unsupported_http_version",
 }

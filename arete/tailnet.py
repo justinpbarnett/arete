@@ -18,7 +18,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import NoReturn
 
-from . import codebase, config, paths, principals, util
+from . import codebase, config, credential_http, paths, principals, util
+from .store import tokens
 
 CERT_SECONDS = 120
 RENEW_SECONDS = 7 * 24 * 3600
@@ -106,8 +107,10 @@ class Tailscale:
         profile = next((u for u in users if u.get("LoginName") == login), {})
         return login, profile.get("DisplayName") or login.split("@")[0]
 
-    def whois(self, address: str) -> str:
-        return (tailscale("whois", "--json", address).get("UserProfile") or {}).get("LoginName", "")
+    def whois(self, address: str) -> tuple[str, str]:
+        found = tailscale("whois", "--json", address)
+        node = found.get("Node") or {}
+        return (found.get("UserProfile") or {}).get("LoginName", ""), str(node.get("StableID") or node.get("ID") or "")
 
     def certificate(self, name: str) -> str:
         proc = tailscale_run("cert", "--cert-file", "-", "--key-file", "-", name, timeout=CERT_SECONDS)
@@ -152,19 +155,25 @@ def seed_owner(host, cfg):
 @dataclass
 class Logins:
     host: Tailscale
-    seen: dict[str, tuple[float, str]] = field(default_factory=dict)
+    seen: dict[str, tuple[float, str, str]] = field(default_factory=dict)
     guard: threading.Lock = field(default_factory=threading.Lock)
+    credentials: credential_http.Traffic = field(default_factory=credential_http.Traffic)
 
     def of(self, address: str) -> str:
         with self.guard:
             seen = self.seen.get(address)
         if seen and time.monotonic() - seen[0] < WHOIS_SECONDS:
             return seen[1]
-        login = self.host.whois(address)
-        if login:
+        login, node = self.host.whois(address)
+        if login or node:
             with self.guard:
-                self.seen[address] = (time.monotonic(), login)
+                self.seen[address] = (time.monotonic(), login, node)
         return login
+
+    def node_key(self, address: str) -> str:
+        with self.guard:
+            seen = self.seen.get(address)
+            return seen[2] if seen and seen[2] else address
 
 
 PEM_BLOCK = re.compile(r"-----BEGIN ([A-Z ]+)-----.*?-----END \1-----\n?", re.DOTALL)
@@ -392,6 +401,7 @@ def serve(handlers: Handlers, cfg: config.Config, port: int, inside_serve: bool 
                 if not held:
                     raise OSError(f"another dashboard on this state holds port {port}")
                 seed_owner(host, cfg)
+                tokens.init_owner()
                 front = open_front(host, node, port, logins, inside_serve, handlers, cfg.dashboard_https)
             except OSError as e:
                 if str(e) != waiting_for:

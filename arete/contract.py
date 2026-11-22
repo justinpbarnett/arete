@@ -9,7 +9,7 @@ from functools import cache
 
 from . import refusals
 
-MINOR = 3
+MINOR = 4
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -94,6 +94,15 @@ ERRORS = [{"code": code, "status": status, "description": description} for code,
     ("invalid_json", 400, "Send a UTF-8 JSON object with unique names, at most 32 levels, finite numbers, and "
                           "integers between -9007199254740991 and 9007199254740991."),
     ("forbidden", 403, "The request was not authorized."),
+    ("unauthenticated", 401, "A valid credential is required."),
+    ("ambiguous_credential", 400, "Send either a bearer token or a session cookie."),
+    ("token_expired", 401, "The credential expired."),
+    ("token_rotated", 401, "The credential was rotated."),
+    ("scope_missing", 403, "The credential lacks the required scope."),
+    ("csrf", 403, "A browser write needs X-Arete: 1."),
+    ("bad_origin", 403, "The write must come from this dashboard."),
+    ("tls_required", 426, "This route requires HTTPS."),
+    ("auth_blocked", 429, "Too many failed authentication attempts."),
     ("method_not_allowed", 405, "The route does not accept this method."),
     ("conflict", 409, "The request conflicts with current state."),
     ("invalid_state", 409, "The task cannot be closed from its current state."),
@@ -119,14 +128,22 @@ def envelope(properties):
     return obj({"seq": {"type": "string", "pattern": r"^\d+\.\d+$"}, **properties})
 
 
-def operation(name, path, result, inputs=None, example=None, method="GET", *, errors=()):
+AUTH_ERRORS = {"unauthenticated", "ambiguous_credential", "token_expired", "token_rotated", "scope_missing",
+               "csrf", "bad_origin", "tls_required", "auth_blocked"}
+
+
+def operation(name, path, result, inputs=None, example=None, method="GET", *, errors=(), success_status=200):
     shown = sample(result)
     if "seq" in result.get("properties", {}):
         shown["seq"] = "0.1"
-    new_errors = {"invalid_state", "task_version_conflict"}
+    noun = name.split(".", 1)[0]
+    scope = "read" if method == "GET" or noun == "batch" else f"{'task' if noun == 'comment' else noun}:write"
+    optional_errors = {"invalid_state", "task_version_conflict"}
+    if noun not in ("token", "pairing", "principal") and name != "session.end":
+        optional_errors |= AUTH_ERRORS
     return {"name": name, "method": method, "path": "/api/v1/" + path,
-            "input": inputs or obj({}), "result": result,
-            "errors": [r["code"] for r in ERRORS if r["code"] not in new_errors or r["code"] in errors],
+            "input": inputs or obj({}), "result": result, "scope": scope, "success_status": success_status,
+            "errors": [r["code"] for r in ERRORS if r["code"] not in optional_errors or r["code"] in errors],
             "example": {"input": example or {}, "result": shown}}
 
 
@@ -147,10 +164,13 @@ for _error in ERRORS:
     _code, _status, _description = (_error[k] for k in ("code", "status", "description"))
     _details = {"unknown_field": {"fields": array(STRING)}, "client_too_old": {"required_version": STRING},
                 "version_conflict": {"current": RUN}, "task_version_conflict": {"current": TASK},
-                "rate_limited": {"retry_after": INTEGER}}.get(_code, {})
+                "rate_limited": {"retry_after": INTEGER}, "auth_blocked": {"retry_after": INTEGER},
+                "forbidden": {"reason": STRING}}.get(_code, {})
     _error["schema"] = obj({"type": {"type": "string", "enum": [f"urn:arete:problem:{_code}"]}, "title": STRING,
                             "status": {"type": "integer", "enum": [_status]}, "detail": STRING, "error": STRING,
                             "code": {"type": "string", "enum": [_code]}, **_details})
+    if _code == "forbidden":
+        _error["schema"]["required"].remove("reason")
     _error["example"] = {**sample(_error["schema"]), "type": f"urn:arete:problem:{_code}", "status": _status,
                          "detail": _description, "error": _description}
 
@@ -174,11 +194,20 @@ ERROR = obj({"code": STRING, "status": INTEGER, "description": STRING, "schema":
 OPERATION = obj({"name": STRING, "method": STRING, "path": STRING, "input": mapping(JSON),
                  "result": mapping(JSON), "errors": array(STRING),
                  "example": obj({"input": mapping(JSON), "result": mapping(JSON)}),
-                 "deprecated": BOOLEAN, "sunset": STRING},
+                 "deprecated": BOOLEAN, "sunset": STRING, "scope": STRING, "success_status": INTEGER},
                 ["name", "method", "path", "input", "result", "errors", "example"])
 ALIAS = obj({"method": STRING, "path": STRING, "provider": STRING, "adapter": STRING, "input": mapping(JSON),
              "actions": mapping(mapping(JSON)), "transport": BOOLEAN, "deprecated": BOOLEAN, "sunset": STRING},
             ["method", "path", "provider", "adapter", "input"])
+TOKEN = obj({**dict.fromkeys(("id", "principal", "audience", "label", "created", "fingerprint", "kind"), STRING),
+             **dict.fromkeys(("expires", "revoked_at", "rotated_from", "last_used_at", "last_used_node", "profile",
+                              "grace_until", "created_by", "revoke_reason"), NULL_TEXT),
+             "scopes": array(STRING), "commands": {**array(STRING), "type": ["array", "null"]},
+             "version": INTEGER, "spend_cap_nusd": {"type": ["integer", "null"]}})
+TOKEN_ISSUE = obj({"label": STRING, "scopes": array(STRING), "profile": {**STRING, "enum": ["remote", "full"]},
+                   "expires": STRING, "commands": array(STRING), "spend_cap_usd": {**NUMBER, "minimum": 0}},
+                  ["label", "scopes"])
+TOKEN_ISSUED = envelope({"token": TOKEN, "text": STRING})
 OPERATIONS = [operation("meta.get", "meta", META),
               operation("contract.get", "contract", envelope({"operations": array(OPERATION),
                         "errors": array(ERROR), "aliases": array(ALIAS), "contract_sha": STRING})),
@@ -195,6 +224,22 @@ for _name, _shape in RESOURCE.items():
                    operation(f"{_name}.get", _plural + "/{id}", envelope({_name: _shape}),
                              obj({"id": STRING, **_selectors}), {"id": "example", **{k: "example" for k in _selectors}})]
 OPERATIONS += [
+    operation("token.list", "tokens", envelope({"tokens": array(TOKEN)})),
+    operation("token.issue", "tokens", TOKEN_ISSUED, TOKEN_ISSUE,
+              {"label": "Remote CLI", "scopes": ["read", "task:write"]}, "POST", success_status=201),
+    operation("token.get", "tokens/{token}", envelope({"token": TOKEN}), obj({"token": STRING}), {"token": "abcdef01"}),
+    operation("token.rotate", "tokens/{token}/rotate", TOKEN_ISSUED,
+              obj({"token": STRING, "grace_seconds": {**INTEGER, "minimum": 0}}, ["token"]),
+              {"token": "abcdef01", "grace_seconds": 300}, "POST", success_status=201),
+    operation("token.revoke", "tokens/{token}/revoke", envelope({"token": TOKEN}), obj({"token": STRING}),
+              {"token": "abcdef01"}, "POST"),
+    operation("principal.revoke", "principals/{principal}/revoke", envelope({"principal": STRING, "revoked": INTEGER}),
+              obj({"principal": STRING}), {"principal": "client:abcdef01"}, "POST"),
+    operation("pairing.start", "auth/pairings", envelope({"code": STRING, "link": STRING, "expires": STRING}),
+              method="POST", success_status=201),
+    operation("pairing.claim", "auth/pairings/claim", envelope({"principal": STRING}),
+              obj({"code": STRING}), {"code": "123456"}, "POST", success_status=201),
+    operation("session.end", "auth/logout", envelope({"ended": BOOLEAN}), method="POST"),
     operation("run.diff", "runs/{id}/diff", envelope({"diff": STRING}), obj({"id": STRING}), {"id": "example"}),
     operation("task.history", "tasks/{id}/history", envelope({"comments": array(obj({"version": INTEGER,
               "author": STRING, "body": STRING, "ts": STRING})), "runs": array(RUN)}),
@@ -280,6 +325,7 @@ class Problem(refusals.Stated):
     def __init__(self, code, message, **details):
         super().__init__(next(r["status"] for r in ERRORS if r["code"] == code), message)
         self.code, self.details = code, details
+        self.retry_after = details.get("retry_after", 0)
 
 
 def unknown(value, schema, path=""):

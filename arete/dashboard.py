@@ -27,6 +27,8 @@ from . import (
     config,
     contract,
     control,
+    credential_files,
+    credential_http,
     devices,
     event_stream,
     events,
@@ -61,7 +63,7 @@ from .store import events as event_store
 from .store import idempotency as claims
 from .store import insights as insights_store
 from .store import runs as run_store
-from .store import writes
+from .store import tokens, writes
 
 WEB_DIR = paths.PACKAGE_DIR / "web"
 WEB_TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8",
@@ -123,6 +125,8 @@ def web_snapshot() -> tuple[str, dict[str, tuple[bytes, str]]]:
                            WEB_TYPES[f.suffix])
         elif f.suffix == ".webmanifest":
             served[f"/{f.name}"] = (install_files.manifest(body, colors), WEB_TYPES[f.suffix])
+        elif f.name == "pair.html":
+            served["/pair"] = (body, WEB_TYPES[f.suffix])
         else:
             served[f"/{f.name}"] = (body, WEB_TYPES[f.suffix])
     for path, png in install_files.icons(colors).items():
@@ -362,11 +366,18 @@ class Handler(BaseHTTPRequestHandler):
         self.route = route or ("/api/v1/principals/{id}" if path.startswith("/api/v1/principals/") else
                                path if path in ("/api/v1/events", "/api/v1/principals") else "unmatched")
         with principals.acting("hand"), event_store.request_scope(f"{method} {self.route}"):
+            self.actor = None
             self.write_receipt = None
             self.keyed_delivery = False
             self.idempotent_replayed = False
             self.read_seq = None
             self.parsed_body = None
+            self.credential = None
+            self.set_cookie = None
+            self.success_status = 200
+            self.instance_header = None
+            self.stream_check_at = 0
+            self.stream_marker = None
             return self.answer_as_person(method)
 
     def answer_as_person(self, method: str) -> None:
@@ -420,7 +431,9 @@ class Handler(BaseHTTPRequestHandler):
             tag = None
             if conditional and self.route == "/api/v1/screen" and query.get("view") == "board":
                 tag = api_http.board_etag(result)
-            self.send_json(200, result, conditional=conditional, tag=tag)
+            if self.route == "/api/v1/meta" and method == "GET":
+                self.instance_header = result["instance"]["id"]
+            self.send_json(self.success_status, result, conditional=conditional, tag=tag)
         except Exception as e:
             if self.keyed_delivery:
                 raise
@@ -441,6 +454,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def event_connection(self):
         return self.verify_controls.stream(self.connection) if self.verify_controls else nullcontext()
+
+    def stream_problem(self):
+        if self.credential is None or time.monotonic() < self.stream_check_at:
+            return None
+        self.stream_check_at = time.monotonic() + .5
+        marker = self.stream_marker or (self.credential.generation, self.credential.deadline)
+        issue, self.stream_marker = tokens.stream_status(self.credential, marker)
+        return issue
 
     def validate_transport(self, method, path):
         if self.api_path and (self.restarting or
@@ -484,7 +505,14 @@ class Handler(BaseHTTPRequestHandler):
     def keyed_start(self):
         body = self.body()
         sha = idempotency.fingerprint("POST", "/api/tasks", {}, body)
-        with idempotency.owning(principals.current(), self.headers["Idempotency-Key"], sha) as context:
+        actor = principals.current()
+        key = self.headers["Idempotency-Key"]
+        if actor.startswith("client:") and not claims.lookup(actor, key):
+            person = self.credential.principal
+            previous = claims.lookup(person, key)
+            if previous and previous["route"] == "/api/tasks":
+                actor = person
+        with idempotency.owning(actor, key, sha) as context:
             row = idempotency.matching_claim(context)
             if row and row["status"]:
                 self.write_receipt = claims.receipt(row["last_seq"])
@@ -528,23 +556,29 @@ class Handler(BaseHTTPRequestHandler):
             self.write_receipt = claims.receipt(row["last_seq"])
             return json.loads(row["response"])
 
-    def keyed_action(self, method, route, parameters, action, *, atomic=False):
+    def keyed_action(self, method, route, parameters, action, *, atomic=False, status=200, redact=False):
         key = self.headers.get("Idempotency-Key")
         if key is None:
             return action()
-        sha = idempotency.fingerprint(method, route, parameters, self.body())
+        body = self.body()
+        if route == "/api/v1/auth/pairings/claim":
+            secret = credential_files.read_key(foundation.schema_metadata()["token_key_ref"])
+            body = {"proof": tokens.digest(secret, api_http.json_bytes(body).decode())}
+        sha = idempotency.fingerprint(method, route, parameters, body)
         with idempotency.owning(principals.current(), key, sha, route) as context:
             row = idempotency.matching_claim(context)
             if row and row["status"]:
                 self.idempotent_replayed = True
+                result = json.loads(row["response"])
             elif row:
                 raise idempotency.Unconfirmed("The earlier request did not record a result. Check its effect before trying again.")
             else:
-                row = self.complete_action(context, action, atomic)
+                row, result = self.complete_action(context, action, atomic, status, redact)
+            self.success_status = row["status"]
             self.write_receipt = claims.receipt(row["last_seq"])
-            return json.loads(row["response"])
+            return result
 
-    def complete_action(self, context, action, atomic):
+    def complete_action(self, context, action, atomic, status, redact):
         if not atomic:
             claims.claim(context, None)
         with (foundation.tx() if atomic else nullcontext()), event_store.collect_receipts() as collected:
@@ -559,23 +593,21 @@ class Handler(BaseHTTPRequestHandler):
             seq = int(receipt["event_seq"].rsplit(".", 1)[1]) if receipt else None
             if atomic and collected:
                 seq = collected[-1][0]
-            return claims.complete(context, 200, api_http.json_bytes(result), seq)
+            payload = {**result, "text": "[shown once]"} if redact else result
+            return claims.complete(context, status, api_http.json_bytes(payload), seq), result
 
     def admit(self, method: str, path: str) -> None:
         node: tailnet.Node = self.server.node
-        if tailnet.host_name(self.headers.get("Host", "")) not in node.names:
+        hosts = self.headers.get_all("Host", [])
+        scheme = "https" if self.server.tls is not None else "http"
+        self.origin = credential_http.origin_of(scheme, hosts[0]) if len(hosts) == 1 else None
+        if self.origin is None or self.origin[1] not in node.names:
             raise Refusal(421, "This server answers only to its tailnet name or address.")
         if path.startswith(webhooks.HOOK_PATH):
             if method != "POST":
                 raise Refusal(405, "A webhook takes POST.")
             return
-        person = principals.for_login(self.server.logins.of(self.client_address[0]))
-        if not person:
-            raise Refusal(403, "The dashboard opens only for its owner's tailnet login.")
-        principals.admit(person)
-        self.actor = principals.current()
-        if method in ("POST", "PATCH", "DELETE") and self.headers.get("X-Arete") != "1":
-            raise Refusal(403, "A change needs the X-Arete header, which the dashboard page sends.")
+        credential_http.authenticate(self, method, browser_asset=path in WEB_BY_PATH)
 
     def api(self, method: str, path: str, query: dict):
         if self.operation:
@@ -746,12 +778,19 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, b"".join(map(event_line, found)), EVENTS_TYPE, "private, no-cache", conditional=True)
         self.head(200, EVENTS_TYPE, "no-store")
         self.close_connection = True
+        if self.credential is not None:
+            self.connection.settimeout(.75)
         try:
             with self.event_connection() as dropped:
                 self.end_headers()
                 ended = run_ended(run_id)
-                until = (lambda: dropped() or ended()) if dropped else ended
+
+                def until():
+                    return self.stream_problem() or (dropped and dropped()) or ended()
+
                 for line in run_lines.follow(run_id, start, until):
+                    if self.stream_problem():
+                        return
                     self.wfile.write(event_line(line))
                     self.wfile.flush()
         except OSError:
@@ -765,6 +804,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Deprecation", "true")
         if getattr(self, "read_seq", None):
             self.send_header("Arete-Seq", self.read_seq)
+        if getattr(self, "instance_header", None):
+            self.send_header("Arete-Instance", self.instance_header)
+            credential = getattr(self, "credential", None)
+            if credential is not None and credential.kind == "session":
+                self.send_header("Arete-Session", "paired")
+        if getattr(self, "set_cookie", None):
+            self.send_header("Set-Cookie", self.set_cookie)
         super().end_headers()
 
     def head(self, status: int, kind: str, cache: str, length: int | None = None) -> None:
@@ -815,6 +861,11 @@ class Handler(BaseHTTPRequestHandler):
 
 class Redirect(Handler):
     def answer(self, method: str) -> None:
+        path = request_path(self.path)
+        route = contract.match(method, path)
+        if credential_http.require_tls(route[0] if route else None):
+            error = credential_http.problem("tls_required")
+            return self.send_json(error.status, refusal_answer(error))
         node: tailnet.Node = self.server.node
         path = self.path if self.path.startswith("/") else "/"
         self.send_response(308)
@@ -1274,4 +1325,12 @@ def serve(port: int | None = None, inside_serve: bool = False, host: tailnet.Tai
         with util.lock(serve.SERVE_LOCK) as free:
             if free:
                 capture.recover()
-    tailnet.serve(handlers(), cfg, port, inside_serve, host)
+    with util.repeating(60, maintain_credentials, "credential-maintenance"):
+        tailnet.serve(handlers(), cfg, port, inside_serve, host)
+
+
+def maintain_credentials():
+    try:
+        tokens.maintain()
+    except Exception as error:
+        print(f"Credential maintenance failed ({type(error).__name__})", file=sys.stderr)

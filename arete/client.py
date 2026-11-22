@@ -6,6 +6,7 @@ import hashlib
 import http.client
 import json
 import os
+import re
 import secrets
 import socket
 import ssl
@@ -19,10 +20,12 @@ from dataclasses import dataclass, replace
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote, urlencode, urlsplit
 
-from . import config, paths, run_lines, util
+from . import config, credential_files, paths, run_lines, util
 
 ENV = "ARETE_SERVER"
 MINOR = 3
+META = "/api/v1/meta"
+INSTANCE_ID = re.compile(r"[0-9a-f]{32}")
 CONNECT_SECONDS = 5
 CALL_SECONDS = 120
 RETRY_SECONDS = 2
@@ -73,6 +76,10 @@ class Server:
     port: int
     name: str
     instance: str = ""
+
+    @property
+    def tag(self) -> str:
+        return self.instance[:8] if INSTANCE_ID.fullmatch(self.instance) else ""
 
 
 class Invocation:
@@ -204,11 +211,19 @@ def check_instance(where, instance):
 
 
 def instance_of(resp):
-    answer = decoded(resp, "GET", "/api/meta")
-    instance = field(field(answer, "instance"), "id", "instance.id")
-    if not isinstance(instance, str) or not instance:
-        raise Failed({"error": "the server answer has an invalid instance.id"})
-    return instance
+    try:
+        instance = resp.getheader("Arete-Instance", "")
+        if instance and INSTANCE_ID.fullmatch(instance):
+            return instance
+        if not instance and resp.status == 200:
+            raw = resp.arete_payload if hasattr(resp, "arete_payload") else resp.read()
+            answer = answer_object(raw, "GET", META)
+            legacy = field(field(answer, "instance"), "id", "instance.id")
+            if isinstance(legacy, str) and legacy:
+                return legacy
+        raise Failed({"error": "the server did not provide a valid Arete instance identity"})
+    finally:
+        close_response(resp)
 
 
 def changed_instance(where, saved, instance):
@@ -218,11 +233,25 @@ def changed_instance(where, saved, instance):
 
 def check_replay(where, deadline):
     if where.instance:
-        resp = request_once("GET", "/api/meta", read_seconds=CONNECT_SECONDS, deadline=deadline, where=where,
-                            buffered=True)
-        instance = instance_of(resp)
-        if where.instance != instance:
-            raise changed_instance(where, where.instance, instance)
+        confirm_instance(where, instance_of(instance_response(replace(where, instance=""), deadline)))
+
+
+def instance_response(where, deadline):
+    options = dict(read_seconds=CONNECT_SECONDS, where=where, buffered=True, deadline=deadline)
+    try:
+        return request_once("GET", META, **options)
+    except Restarting as error:
+        if reason(error.answer) != "draining":
+            raise
+    except Failed as error:
+        if not unknown_route(error, "GET", META):
+            raise
+    return request_once("GET", "/api/meta", **options)
+
+
+def confirm_instance(where, instance):
+    if where.instance != instance:
+        raise changed_instance(where, where.instance, instance)
 
 
 def server(deadline=None, *, where=None) -> Server:
@@ -230,7 +259,7 @@ def server(deadline=None, *, where=None) -> Server:
     if current is not None and current.server is not None:
         return current.server
     where = where or discover()
-    resp = request("GET", "/api/meta", read_seconds=CONNECT_SECONDS, where=where, buffered=True, deadline=deadline)
+    resp = request("GET", META, read_seconds=CONNECT_SECONDS, where=where, buffered=True, deadline=deadline)
     instance = instance_of(resp)
     check_instance(where, instance)
     where = replace(resp.arete_server, instance=instance)
@@ -286,8 +315,22 @@ def upload_hooks_before_write():
         upload_hook_events()
 
 
-def headers_for(where: Server) -> dict[str, str]:
-    headers = {"X-Arete": "1", "X-Arete-Client": f"cli/1.{MINOR}"}
+def stored_token(where):
+    try:
+        text = credential_files.read_client(where.tag) if where.tag else None
+    except OSError as e:
+        raise Failed({"error": f"cannot read the stored token: {e}"}) from None
+    if text:
+        parts = credential_files.CLIENT_TEXT.fullmatch(text)
+        if not parts or parts[1] != where.tag:
+            raise Failed({"error": "the stored token does not match this Arete instance"})
+    return text
+
+
+def headers_for(where: Server, *, token=None) -> dict[str, str]:
+    headers = {"X-Arete-Client": f"cli/1.{MINOR}"}
+    if token := (stored_token(where) if token is None else token):
+        headers["Authorization"] = f"Bearer {token}"
     if where.scheme == "http" and where.name != where.host:
         headers["Host"] = f"{where.name}:{where.port}"
     return headers
@@ -384,8 +427,10 @@ def acquired_connection(where, deadline):
 def request(method: str, path: str, body: dict | None = None,
             read_seconds: float | None = CALL_SECONDS, key: str | None = None,
             *, where: Server | None = None, buffered: bool = False,
-            deadline: float | None = None) -> http.client.HTTPResponse:
+            deadline: float | None = None, token: str | None = None) -> http.client.HTTPResponse:
     where = where or server(deadline)
+    if method != "GET" and token is None:
+        token = stored_token(where) or ""
     restart = None
     while True:
         within = None if deadline is None else deadline - time.monotonic()
@@ -395,8 +440,10 @@ def request(method: str, path: str, body: dict | None = None,
             if restart is not None and method != "GET":
                 check_replay(where, deadline)
                 within = budget_left(deadline)
+            if method == "GET" and path == META and not where.instance and token is None:
+                return instance_response(where, deadline)
             return request_once(method, path, body, read_seconds, within, key=key, deadline=deadline, where=where,
-                                buffered=buffered)
+                                buffered=buffered, token=token)
         except Restarting as e:
             if restart is None:
                 limit = time.monotonic() + RESTART_WAIT_SECONDS
@@ -422,7 +469,7 @@ def request(method: str, path: str, body: dict | None = None,
 def request_once(method: str, path: str, body: dict | None = None,
                  read_seconds: float | None = CALL_SECONDS, within: float | None = None,
                  key: str | None = None, *, deadline: float | None = None,
-                 where: Server | None = None, buffered: bool = False) -> http.client.HTTPResponse:
+                 where: Server | None = None, buffered: bool = False, token: str | None = None) -> http.client.HTTPResponse:
     if deadline is None and within is not None:
         deadline = time.monotonic() + within
     where = where or server()
@@ -440,7 +487,7 @@ def request_once(method: str, path: str, body: dict | None = None,
             try:
                 with transport_budget(transport, deadline):
                     transport.settimeout(read_seconds if deadline is None else budget_left(deadline))
-                    headers = headers_for(where)
+                    headers = headers_for(where, token=token)
                     if key is not None:
                         headers["Idempotency-Key"] = key
                     if payload is not None:
@@ -455,10 +502,13 @@ def request_once(method: str, path: str, body: dict | None = None,
                     resp.arete_transport = transport
                     resp.arete_server = where
                 if not followed and (moved := util.https_upgrade(resp, where.port)):
+                    if where.instance:
+                        raise Failed({"error": "the server moved after its instance was verified"}, resp.status)
                     read_response(resp, deadline)
                     where, followed = replace(where, scheme="https", name=moved.hostname), True
                     continue
-                if resp.status < 400:
+                discovery = method == "GET" and path == META and (not where.instance or token)
+                if resp.status < 400 or discovery and resp.status == 403 and resp.getheader("Arete-Instance"):
                     if buffered and deadline is not None:
                         resp.arete_payload = read_response(resp, deadline)
                     returned = True
@@ -694,6 +744,7 @@ def answer_object(raw, method, path):
 def keyed_call(body, key, *, deadline=None):
     deadline = deadline if deadline is not None else time.monotonic() + RESTART_WAIT_SECONDS
     where = server(deadline)
+    token = stored_token(where) or ""
     retries, restart, failure = 0, None, None
     uncertain = False
     replaying = False
@@ -711,7 +762,7 @@ def keyed_call(body, key, *, deadline=None):
                 check_replay(where, deadline)
             replaying = True
             resp = request_once("POST", "/api/tasks", body, within=budget_left(deadline), key=key, deadline=deadline,
-                                where=where)
+                                where=where, token=token)
             answer = answer_object(read_response(resp, deadline), "POST", "/api/tasks")
             budget_left(deadline)
             return answer

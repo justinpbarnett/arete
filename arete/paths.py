@@ -37,6 +37,8 @@ if ISOLATED:
     drop_credentials()
 SCRATCH_CONFIG = confined(CONFIG_DIR) is not None
 SCRATCH_STATE = confined(STATE_DIR) is not None
+TOKEN_CLIENT_DIR = (STATE_DIR if SCRATCH_STATE or STATE_DIR.parent.name == ".arete-sandbox"
+                    else CLIENT_DIR.with_name("arete")) / "client"
 LOG_DIR = local_paths.log_dir(HOME, STATE_DIR, ISOLATED)
 
 CONFIG_FILE = CONFIG_DIR / "config.toml"
