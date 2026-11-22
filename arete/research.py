@@ -425,8 +425,8 @@ def related(src: triage.TriageSource, r: dict, done: list[tuple[str, dict, dict]
 
 
 def budget_for(cfg: config.Config) -> research_budget.Budget:
-    searching = cfg.research_search
-    audited = searching and cfg.research_audit
+    searching = cfg.research.search
+    audited = searching and cfg.research.audit
     return research_budget.Budget(BUDGET_USD, TIMEOUT_SECONDS,
                                   (SEARCHED_RESERVE_USD if searching else REPORT_RESERVE_USD)
                                   + (AUDIT_RESERVE_USD if audited else 0),
@@ -460,14 +460,14 @@ def report_after(cfg, budget, plan, ref, judged, values, where, cwd, add_dirs):
         return spent_error(budget)
     brief = research_plan.brief(plan)
     tools = TOOLS if plan["needs_search"] else READ_TOOLS
-    if plan["needs_search"] and cfg.research_search:
+    if plan["needs_search"] and cfg.research.search:
         found = research_search.run(cfg, budget, plan, ref, judged)
         if found.error:
             return Result(ok=False, error=found.error), budget.spent_usd
         usd, seconds = budget.final()
         if budget.short(usd, seconds):
             return spent_error(budget)
-        if cfg.research_synthesis:
+        if cfg.research.synthesis:
             res = research_synthesis.run(cfg, budget, plan, found.evidence, ref, judged, values, where, cwd, add_dirs)
             return res, budget.spent_usd
         brief, tools = research_search.brief(plan, found.evidence), READ_TOOLS
@@ -478,7 +478,7 @@ def report_after(cfg, budget, plan, ref, judged, values, where, cwd, add_dirs):
 
 
 def research(cfg: config.Config, r: dict, force: bool = False, asked: bool = False) -> tuple[str, str]:
-    started = time.monotonic() if cfg.research_planner else None
+    started = time.monotonic() if cfg.research.planner else None
     ref = r["ref"]
     base = {"source": r["source"], "title": r["title"], "url": r["url"], "updated": r["updated"],
             "run_id": os.environ.get("ARETE_RUN_ID", ""), "answered_by": ""}
@@ -554,7 +554,7 @@ def begin(cfg, r, src, prior, basis, text, done, base):
 
 def ask(cfg, ref, values, h, filed_path, dirs, done, started, judged):
     with nullcontext(dirs[0]) if dirs else tempfile.TemporaryDirectory() as cwd:
-        if cfg.research_planner:
+        if cfg.research.planner:
             res, paid = staged(cfg, ref, values, filing(h, filed_path), cwd, dirs[1:],
                               [o["ref"] for _, o, _ in done], started, judged)
         else:

@@ -446,7 +446,7 @@ def paid_for(cfg: config.Config, repo: config.Repo | None,
     try:
         return config.allowed_paid_routes(cfg, layer or (config.load_layer(repo.layer_dir) if repo else None))
     except (ValueError, TypeError, OSError):
-        return cfg.paid
+        return cfg.routing.paid
 
 
 def policy_fit(which: str, modes: tuple[str, ...], possible: tuple[str, ...] | None = None) -> str:
@@ -558,8 +558,7 @@ def paid_key(found: Candidate) -> tuple:
 class Discovery:
     def __init__(self, cfg: config.Config, repo: config.Repo | None = None, device: devices.Device | str = "local",
                  connect=foundation.reader, priced: bool = True, layer: config.RepoLayer | None = None):
-        self.declared = {key: {**cfg.capabilities.get(key, {}), **(layer.capabilities.get(key, {}) if layer else {})}
-                         for key in dict.fromkeys([*cfg.capabilities, *(layer.capabilities if layer else {})])}
+        self.declared = config.routing_for(cfg, layer).capabilities
         self.cfg = cfg
         self.repo = repo
         self.device = devices.resolve(device)

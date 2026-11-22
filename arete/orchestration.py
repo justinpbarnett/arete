@@ -75,13 +75,13 @@ class RetargetedPR(ValueError):
 
 
 def policy_fingerprint(cfg, layer, closed_context, *, resume=False):
-    effective = asdict(layer)
+    effective = config.policy_dict(layer)
     effective.pop("factory_path")
     if layer.required_check is None:
         effective.pop("required_check")
     if layer.verify:
         effective["verify"] = layer.verify.policy()
-    policy_config = asdict(cfg)
+    policy_config = config.policy_dict(cfg)
     policy_config.pop("server_url")
     policy_config["max_parallel_checks"] = config.Config.max_parallel_checks
     if resume:

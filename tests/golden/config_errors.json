@@ -1,0 +1,675 @@
+{
+  "parent": "a5a7f7450bdab483e251fd54cb596677cc16e624",
+  "errors": {
+    "dashboard flag": [
+      "TypeError",
+      "[dashboard] https must be true or false, not 1"
+    ],
+    "server URL": [
+      "TypeError",
+      "[server] url must be a URL string"
+    ],
+    "factory folder": [
+      "TypeError",
+      "[factory] adws must be a folder path, not False"
+    ],
+    "tier keys": [
+      "ValueError",
+      "[tiers.default] fast: unknown key a, z; use runner, provider, model"
+    ],
+    "tier route": [
+      "ValueError",
+      "[tiers.default] fast: runner 'bad' is not one of claude, pi, codex, replay"
+    ],
+    "step names": [
+      "ValueError",
+      "[steps]: unknown step a, z; use plan, build, verify, review, learn, uat, miner, apply, eval_mine, triage, chat, classify, loop, session, research, research_plan, research_search, research_synthesis, research_audit, explain, document, capture_evidence, check_repair, review_repair, ci_repair, eval_grade, orchestrate, implement"
+    ],
+    "step keys": [
+      "ValueError",
+      "[steps.build]: unknown key a, z; use tier, runner, provider, model, effort, timeout_minutes, tries, tools, mcp, instructions, session, modalities, min_context, structured_output, data_handling, floor, budget_usd, directory_cleanup"
+    ],
+    "step count": [
+      "ValueError",
+      "[steps.build]: tries must be a whole number of at least 1, not True"
+    ],
+    "step amount": [
+      "ValueError",
+      "[steps.build]: budget_usd must be a number of dollars above 0, not nan"
+    ],
+    "step amount bool": [
+      "ValueError",
+      "[steps.build]: budget_usd must be a number of dollars above 0, not True"
+    ],
+    "step flag": [
+      "ValueError",
+      "[steps.build]: structured_output must be true or false, not 1"
+    ],
+    "step cleanup flag": [
+      "ValueError",
+      "[steps.build]: directory_cleanup must be true or false, not 1"
+    ],
+    "step alias": [
+      "ValueError",
+      "[steps.implement] and [steps.build] are the same step; name the step once"
+    ],
+    "kind names": [
+      "ValueError",
+      "[kinds]: unknown kind a, z; use feat, fix"
+    ],
+    "kind keys": [
+      "ValueError",
+      "[kinds.feat]: unknown key z; use steps"
+    ],
+    "kind step names": [
+      "ValueError",
+      "[kinds.feat.steps]: unknown step bad; use plan, build, verify, review, learn, uat, miner, apply, eval_mine, triage, chat, classify, loop, session, research, research_plan, research_search, research_synthesis, research_audit, explain, document, capture_evidence, check_repair, review_repair, ci_repair, eval_grade, orchestrate, implement"
+    ],
+    "pricing number": [
+      "ValueError",
+      "[pricing.models.sonnet] input: price must be a finite nonnegative number"
+    ],
+    "routing keys": [
+      "ValueError",
+      "[routing]: unknown key z; use fallback, payment_modes, capabilities, floors, paid"
+    ],
+    "routing flag": [
+      "ValueError",
+      "[routing] fallback must be true or false, not 0"
+    ],
+    "routing modes": [
+      "ValueError",
+      "[routing] payment_modes must be a nonempty list of distinct values from subscription, api_key, local, not []"
+    ],
+    "capability keys": [
+      "ValueError",
+      "[routing.capabilities.sonnet]: unknown key z; use modalities, context, structured_output, data_handling"
+    ],
+    "capability context": [
+      "ValueError",
+      "[routing.capabilities.sonnet]: context must be a whole number of at least 1, not True"
+    ],
+    "capability flag": [
+      "ValueError",
+      "[routing.capabilities.sonnet]: structured_output must be true or false, not 0"
+    ],
+    "paid keys": [
+      "ValueError",
+      "[routing.paid]: unknown key z; use providers, max_input, max_output"
+    ],
+    "paid number": [
+      "ValueError",
+      "[routing.paid] max_input: price must be a finite nonnegative number"
+    ],
+    "jira state": [
+      "ValueError",
+      "[jira.transitions]: unknown state done, merged; use running, pr, failed, needs-info; research tickets move through [jira.research]; merges move tickets through [jira.landed]"
+    ],
+    "jira number": [
+      "ValueError",
+      "invalid literal for int() with base 10: 'bad'"
+    ],
+    "jev question": [
+      "ValueError",
+      "[jev.screen_lines]: unknown question z; use weakens, secrets, outside, irreversible, feature, removes, renames, reach"
+    ],
+    "jev weight": [
+      "ValueError",
+      "[jev.risk_weights]: unknown weight z; use blast, sensitivity, surprise"
+    ],
+    "jev number": [
+      "ValueError",
+      "could not convert string to float: 'bad'"
+    ],
+    "github app table": [
+      "ValueError",
+      "[github_app] is not a table"
+    ],
+    "github app ID": [
+      "ValueError",
+      "[github_app] installation_id must be digits only"
+    ],
+    "repo tracker": [
+      "ValueError",
+      "repo extra: tracker must be github, jira or local, not 'bad'"
+    ],
+    "job label": [
+      "KeyError",
+      "'label'"
+    ],
+    "probe number": [
+      "ValueError",
+      "invalid literal for int() with base 10: 'bad'"
+    ],
+    "oncall keys": [
+      "ValueError",
+      "[oncall]: unknown key z; use enabled, source, vision, scope, confidence, injection, max_repairs, wakes_per_hour, max_attempts, incident_budget_usd, daily_budget_usd, cooldown_minutes, keep_days"
+    ],
+    "oncall flag": [
+      "ValueError",
+      "[oncall] enabled must be true or false, not 1"
+    ],
+    "oncall whole": [
+      "ValueError",
+      "[oncall] max_attempts must be a whole number 1 or more, not True"
+    ],
+    "oncall amount": [
+      "ValueError",
+      "[oncall] incident_budget_usd must be a number above 0, not 0"
+    ],
+    "oncall inclusive amount": [
+      "ValueError",
+      "[oncall] keep_days must be a number 0 or more, not nan"
+    ],
+    "oncall source keys": [
+      "ValueError",
+      "[[oncall.source]]: unknown key z; use path, pattern, repo, check, vision, scope"
+    ],
+    "oncall source path": [
+      "TypeError",
+      "[[oncall.source]] path must be a string, not True"
+    ],
+    "replay keys": [
+      "ValueError",
+      "[replay]: unknown key z; use all, dir"
+    ],
+    "mcp keys": [
+      "ValueError",
+      "[mcp.example]: unknown key z; use command, args, url"
+    ],
+    "mcp command": [
+      "ValueError",
+      "[mcp.example]: command must be a string, not False"
+    ],
+    "research keys": [
+      "ValueError",
+      "[research]: unknown key z; use planner, search, synthesis, audit, search_workers, search_share"
+    ],
+    "research planner": [
+      "ValueError",
+      "[research] planner must be true or false, not 1"
+    ],
+    "research search": [
+      "ValueError",
+      "[research] search must be true or false, not 1"
+    ],
+    "research synthesis": [
+      "ValueError",
+      "[research] synthesis must be true or false, not 1"
+    ],
+    "research audit": [
+      "ValueError",
+      "[research] audit must be true or false, not 1"
+    ],
+    "research workers": [
+      "ValueError",
+      "[research] search_workers must be a whole number from 1 to 8, not 9"
+    ],
+    "research share": [
+      "ValueError",
+      "[research] search_share must be a number above 0 and under 1, not 1"
+    ],
+    "ask keys": [
+      "ValueError",
+      "[ask]: unknown key z; use max_per_run, settle, expire_days, remind_hours, push_contact"
+    ],
+    "ask count": [
+      "ValueError",
+      "[ask] max_per_run must be a whole number of at least 0, not -1"
+    ],
+    "ask flag": [
+      "ValueError",
+      "[ask] settle must be true or false, not 1"
+    ],
+    "ask expiration": [
+      "ValueError",
+      "[ask] expire_days must be a number above 0 and at most 3650, not inf"
+    ],
+    "ask reminder": [
+      "ValueError",
+      "[ask] remind_hours must be a number above 0 and at most 87600, not True"
+    ],
+    "triage keys": [
+      "ValueError",
+      "[triage]: unknown key z; use auto, route_fixes, auto_per_refresh"
+    ],
+    "triage auto": [
+      "ValueError",
+      "[triage] auto must be true or false"
+    ],
+    "triage route fixes": [
+      "ValueError",
+      "[triage] route_fixes must be true or false"
+    ],
+    "triage count": [
+      "ValueError",
+      "[triage] auto_per_refresh must be a whole number from 0 to 1000"
+    ],
+    "retention keys": [
+      "ValueError",
+      "[retention]: unknown key z; use days, max_gb, lines_days, db_max_mb"
+    ],
+    "retention number": [
+      "ValueError",
+      "[retention] days must be a number above 0, not nan"
+    ],
+    "backup keys": [
+      "ValueError",
+      "[backup]: unknown key z; use copy_to"
+    ],
+    "backup destination": [
+      "ValueError",
+      "[backup] copy_to must be an rsync destination without surrounding spaces, not False"
+    ],
+    "chat keys": [
+      "ValueError",
+      "[chat]: unknown key z; use context_tokens, summary_model, max_sessions, budget_usd"
+    ],
+    "chat count": [
+      "ValueError",
+      "[chat] context_tokens must be a whole number of at least 100, not True"
+    ],
+    "chat number": [
+      "ValueError",
+      "[chat] budget_usd must be a number of dollars above 0, not inf"
+    ],
+    "environment keys": [
+      "ValueError",
+      "[environment]: unknown key z; use pass, providers"
+    ],
+    "environment names": [
+      "ValueError",
+      "[environment] pass: must be a list of variable names, not False"
+    ],
+    "document keys": [
+      "ValueError",
+      "[document]: unknown key z; use enabled, voice, style, words"
+    ],
+    "document flag": [
+      "ValueError",
+      "[document] enabled must be true or false, not 1"
+    ],
+    "capture keys": [
+      "ValueError",
+      "[capture]: unknown key z; use vision, evidence_branch, public_evidence"
+    ],
+    "capture flag": [
+      "TypeError",
+      "[capture] public_evidence must be true or false, not 1"
+    ],
+    "capture order": [
+      "ValueError",
+      "[capture] evidence_branch must be a branch name such as feedback-evidence, not False"
+    ],
+    "ab keys": [
+      "ValueError",
+      "[ab.test]: unknown key z; use step, kind, share, arm"
+    ],
+    "ab step": [
+      "ValueError",
+      "[ab.test]: unknown step []; use plan, build, verify, review, learn, uat, miner, apply, eval_mine, triage, chat, classify, loop, session, research, research_plan, research_search, research_synthesis, research_audit, explain, document, capture_evidence, check_repair, review_repair, ci_repair, eval_grade, orchestrate, implement"
+    ],
+    "ab kind": [
+      "ValueError",
+      "[ab.test]: unknown kind 'bad'; use feat, fix"
+    ],
+    "ab share": [
+      "ValueError",
+      "[ab.test]: share must be a number above 0 and at most 0.5, not True"
+    ],
+    "ab arm keys": [
+      "ValueError",
+      "[ab.test.arm]: unknown key z; use tier, runner, provider, model, effort"
+    ],
+    "section order": [
+      "ValueError",
+      "[routing] fallback must be true or false, not 1"
+    ],
+    "step order": [
+      "ValueError",
+      "[steps.build]: tries must be a whole number of at least 1, not 0"
+    ],
+    "research order": [
+      "ValueError",
+      "[research] search needs planner = true, because the planner sets the search tasks"
+    ],
+    "check policy keys": [
+      "ValueError",
+      "[check_policy] unknown keys: z"
+    ],
+    "limits flag": [
+      "ValueError",
+      "[limits] parallel_checks must be true or false"
+    ],
+    "limits number": [
+      "ValueError",
+      "[limits] max_run_minutes must be a positive integer"
+    ],
+    "verify publish flag": [
+      "ValueError",
+      "[verify] publish_evidence must be true or false"
+    ],
+    "verify patch flag": [
+      "ValueError",
+      "[verify] allow_patch_gaps must be true or false"
+    ],
+    "verify number": [
+      "ValueError",
+      "[verify] preflight_seconds must be greater than 0 and at most 300"
+    ],
+    "verify order": [
+      "ValueError",
+      "[verify] publish_evidence must be true or false"
+    ],
+    "orchestration keys": [
+      "ValueError",
+      "[orchestration] contains unknown settings"
+    ],
+    "orchestration number": [
+      "ValueError",
+      "[orchestration] limits must be integers between 1 and 10000"
+    ],
+    "patch policy keys": [
+      "ValueError",
+      "[factory.patch] unknown keys: z"
+    ],
+    "patch policy number": [
+      "ValueError",
+      "[factory.patch] max_lines must be a positive integer"
+    ],
+    "layer environment keys": [
+      "ValueError",
+      "[environment]: unknown key z; use pass"
+    ]
+  },
+  "roles": {
+    "MODEL_ROLES": [
+      "plan",
+      "build",
+      "verify",
+      "review",
+      "learn",
+      "uat",
+      "miner",
+      "apply",
+      "eval_mine",
+      "triage",
+      "chat",
+      "classify",
+      "loop",
+      "session",
+      "research",
+      "research_plan",
+      "research_search",
+      "research_synthesis",
+      "research_audit",
+      "explain",
+      "document",
+      "capture_evidence"
+    ],
+    "MODEL_FALLBACKS": [
+      [
+        "triage",
+        "haiku"
+      ],
+      [
+        "chat",
+        "opus"
+      ],
+      [
+        "classify",
+        "haiku"
+      ],
+      [
+        "loop",
+        "sonnet"
+      ],
+      [
+        "session",
+        "sonnet"
+      ],
+      [
+        "research",
+        "opus"
+      ],
+      [
+        "research_plan",
+        "opus"
+      ],
+      [
+        "research_search",
+        "sonnet"
+      ],
+      [
+        "research_synthesis",
+        "opus"
+      ],
+      [
+        "research_audit",
+        "opus"
+      ],
+      [
+        "explain",
+        "haiku"
+      ],
+      [
+        "capture_evidence",
+        "sonnet"
+      ]
+    ],
+    "INHERITS": [
+      [
+        "check_repair",
+        "build"
+      ],
+      [
+        "review_repair",
+        "build"
+      ],
+      [
+        "ci_repair",
+        "build"
+      ],
+      [
+        "eval_grade",
+        "verify"
+      ],
+      [
+        "orchestrate",
+        "plan"
+      ]
+    ],
+    "STEP_ROLES": [
+      "plan",
+      "build",
+      "verify",
+      "review",
+      "learn",
+      "uat",
+      "miner",
+      "apply",
+      "eval_mine",
+      "triage",
+      "chat",
+      "classify",
+      "loop",
+      "session",
+      "research",
+      "research_plan",
+      "research_search",
+      "research_synthesis",
+      "research_audit",
+      "explain",
+      "document",
+      "capture_evidence",
+      "check_repair",
+      "review_repair",
+      "ci_repair",
+      "eval_grade",
+      "orchestrate"
+    ],
+    "STEP_NAMES": [
+      "plan",
+      "build",
+      "verify",
+      "review",
+      "learn",
+      "uat",
+      "miner",
+      "apply",
+      "eval_mine",
+      "triage",
+      "chat",
+      "classify",
+      "loop",
+      "session",
+      "research",
+      "research_plan",
+      "research_search",
+      "research_synthesis",
+      "research_audit",
+      "explain",
+      "document",
+      "capture_evidence",
+      "check_repair",
+      "review_repair",
+      "ci_repair",
+      "eval_grade",
+      "orchestrate",
+      "implement"
+    ]
+  },
+  "cli": "96979afbf3569b6b04ad644b8329b39b24015c02ea070dcb9d860c597d47f24c",
+  "settings": {
+    "steps": {
+      "": {
+        "plan": "947098d898004a9fef46133dc53ffc891b759a847c96d638b9cace97ab5d1fad",
+        "build": "e82862f7e0fa3da00f24973a9530d65bee67f0270e1c41debf15a13bca5df091",
+        "verify": "c0892cdd94539b386aba69a4bf011fd0b218351c9a68e5a25fd720560b99f058",
+        "review": "6111ac27e3dc3cb3b698b6e6313427e59c103af1fd2ac61259c106ed67862616",
+        "learn": "2b5b3d6ef462fa2729e2fd34583fdc05c8b67cf6be7846615eb6929a44b8d51a",
+        "uat": "9024e7922ebbf855b4794aaef65794525cf25531d4b2f7752af27124097a7a5b",
+        "miner": "ff9446bb94075e4fced6fcd976cdd64dbced57dbb1c07d18d4f08747522f9aef",
+        "apply": "f24876ae117e3a2934c7f051e0f898a92dbc5c4934ed7b90bdbaba79dabd74bb",
+        "eval_mine": "9c0d1b51f8803aabd6a66124e4086f365faecb4326c76c77cb9e5317056e4af1",
+        "triage": "8760e867ed8ee89c764fb89120a473279218d1b8f226e9fcbf74beb740e37768",
+        "chat": "e612f3deee1a6edb2705b2f11f3b671f813dee66bf135726431c5dfb9a3d89a2",
+        "classify": "259c815cd940e2beb26fb4851a796cb27093935d9d0b5fcdf1fe6e1af6d8aa8c",
+        "loop": "d93c8482f20bba0ac2a9dbc41620671a0aae9edfd4b700305e9770a420b36fc8",
+        "session": "7bec902ad42a14ad79a0ddcff3ee2c689234178edf6117ff1b00ae7dc0654beb",
+        "research": "d1d208f5e4ef8144d8dbaa0e4ea699603d130889ee551444aa81a29bf35cfacb",
+        "research_plan": "25f1cef93166b5c8e77f780a19adbd3328bef15b2c39839d6ec50a28a3fb7aa0",
+        "research_search": "883d8471022c2c948eda973cc00854ad27582aace951943b4e142d4ae8f9cbb5",
+        "research_synthesis": "4e21875eaab89f4598ed3b5ed1379fb2cb606b704d066be88bf48ff73181482c",
+        "research_audit": "b34eb9ad5e118235a8894a14c2229073d2ecff05fb3745d78d9464f279e3a71c",
+        "explain": "0d9b8efcf215487bc8755307ab59d479d2dff2274c603bcbdf5c3007f459009e",
+        "document": "1ca81dfe07fc4e0a7e513e28f3919a4560d664f0a07695897f83ac24ac5f36b4",
+        "capture_evidence": "3682dac48d58de3cd3654673023a0f0054015c5542bdd56561c5d21b07a11716",
+        "check_repair": "22e4b39be34c47f487cf311f79c345c607e23f35d85e673c88daf66a0c704d42",
+        "review_repair": "55516b9b64d2811b2d9ac0bf485875b765266daafac766af1e56bdffc73075ad",
+        "ci_repair": "9c5c2c9e62b50d1f3a349007ffd49b5b38de2b64d3052140f15fd60dd4efcd8e",
+        "eval_grade": "6ba300f6d1c9e91526ccabdfe1cde58d6d82cac98c8f02ec70fa58c44011dbdd",
+        "orchestrate": "115a6a66456d8e22419b73d374bdeec50dc45936f5d2a71ab262b8e533556512",
+        "implement": "e82862f7e0fa3da00f24973a9530d65bee67f0270e1c41debf15a13bca5df091"
+      },
+      "feat": {
+        "plan": "947098d898004a9fef46133dc53ffc891b759a847c96d638b9cace97ab5d1fad",
+        "build": "b140e0fcd41f389665c52213ba3c6038bf5ea26704f7fe8447c14d0e48b33822",
+        "verify": "c0892cdd94539b386aba69a4bf011fd0b218351c9a68e5a25fd720560b99f058",
+        "review": "6111ac27e3dc3cb3b698b6e6313427e59c103af1fd2ac61259c106ed67862616",
+        "learn": "2b5b3d6ef462fa2729e2fd34583fdc05c8b67cf6be7846615eb6929a44b8d51a",
+        "uat": "9024e7922ebbf855b4794aaef65794525cf25531d4b2f7752af27124097a7a5b",
+        "miner": "ff9446bb94075e4fced6fcd976cdd64dbced57dbb1c07d18d4f08747522f9aef",
+        "apply": "f24876ae117e3a2934c7f051e0f898a92dbc5c4934ed7b90bdbaba79dabd74bb",
+        "eval_mine": "9c0d1b51f8803aabd6a66124e4086f365faecb4326c76c77cb9e5317056e4af1",
+        "triage": "8760e867ed8ee89c764fb89120a473279218d1b8f226e9fcbf74beb740e37768",
+        "chat": "e612f3deee1a6edb2705b2f11f3b671f813dee66bf135726431c5dfb9a3d89a2",
+        "classify": "259c815cd940e2beb26fb4851a796cb27093935d9d0b5fcdf1fe6e1af6d8aa8c",
+        "loop": "d93c8482f20bba0ac2a9dbc41620671a0aae9edfd4b700305e9770a420b36fc8",
+        "session": "7bec902ad42a14ad79a0ddcff3ee2c689234178edf6117ff1b00ae7dc0654beb",
+        "research": "d1d208f5e4ef8144d8dbaa0e4ea699603d130889ee551444aa81a29bf35cfacb",
+        "research_plan": "25f1cef93166b5c8e77f780a19adbd3328bef15b2c39839d6ec50a28a3fb7aa0",
+        "research_search": "883d8471022c2c948eda973cc00854ad27582aace951943b4e142d4ae8f9cbb5",
+        "research_synthesis": "4e21875eaab89f4598ed3b5ed1379fb2cb606b704d066be88bf48ff73181482c",
+        "research_audit": "b34eb9ad5e118235a8894a14c2229073d2ecff05fb3745d78d9464f279e3a71c",
+        "explain": "0d9b8efcf215487bc8755307ab59d479d2dff2274c603bcbdf5c3007f459009e",
+        "document": "1ca81dfe07fc4e0a7e513e28f3919a4560d664f0a07695897f83ac24ac5f36b4",
+        "capture_evidence": "3682dac48d58de3cd3654673023a0f0054015c5542bdd56561c5d21b07a11716",
+        "check_repair": "e6f2438aa212525f1b3b41a31776c2ff7552c94ff085bc608530ec064bfdb111",
+        "review_repair": "3efc05e55db7f48fb06a797f73656bfdc4b8fa719b0d9539907fd8601202dba1",
+        "ci_repair": "61108d34bff1ce97753dacb90a69a51f5a720886ec49359d88b56c5a29aada03",
+        "eval_grade": "6ba300f6d1c9e91526ccabdfe1cde58d6d82cac98c8f02ec70fa58c44011dbdd",
+        "orchestrate": "115a6a66456d8e22419b73d374bdeec50dc45936f5d2a71ab262b8e533556512",
+        "implement": "b140e0fcd41f389665c52213ba3c6038bf5ea26704f7fe8447c14d0e48b33822"
+      },
+      "fix": {
+        "plan": "947098d898004a9fef46133dc53ffc891b759a847c96d638b9cace97ab5d1fad",
+        "build": "e82862f7e0fa3da00f24973a9530d65bee67f0270e1c41debf15a13bca5df091",
+        "verify": "c0892cdd94539b386aba69a4bf011fd0b218351c9a68e5a25fd720560b99f058",
+        "review": "ebefd614bceb93c275ef71358ad743ede4bff8bdce78782d27caa34748f23123",
+        "learn": "2b5b3d6ef462fa2729e2fd34583fdc05c8b67cf6be7846615eb6929a44b8d51a",
+        "uat": "9024e7922ebbf855b4794aaef65794525cf25531d4b2f7752af27124097a7a5b",
+        "miner": "ff9446bb94075e4fced6fcd976cdd64dbced57dbb1c07d18d4f08747522f9aef",
+        "apply": "f24876ae117e3a2934c7f051e0f898a92dbc5c4934ed7b90bdbaba79dabd74bb",
+        "eval_mine": "9c0d1b51f8803aabd6a66124e4086f365faecb4326c76c77cb9e5317056e4af1",
+        "triage": "8760e867ed8ee89c764fb89120a473279218d1b8f226e9fcbf74beb740e37768",
+        "chat": "e612f3deee1a6edb2705b2f11f3b671f813dee66bf135726431c5dfb9a3d89a2",
+        "classify": "259c815cd940e2beb26fb4851a796cb27093935d9d0b5fcdf1fe6e1af6d8aa8c",
+        "loop": "d93c8482f20bba0ac2a9dbc41620671a0aae9edfd4b700305e9770a420b36fc8",
+        "session": "7bec902ad42a14ad79a0ddcff3ee2c689234178edf6117ff1b00ae7dc0654beb",
+        "research": "d1d208f5e4ef8144d8dbaa0e4ea699603d130889ee551444aa81a29bf35cfacb",
+        "research_plan": "25f1cef93166b5c8e77f780a19adbd3328bef15b2c39839d6ec50a28a3fb7aa0",
+        "research_search": "883d8471022c2c948eda973cc00854ad27582aace951943b4e142d4ae8f9cbb5",
+        "research_synthesis": "4e21875eaab89f4598ed3b5ed1379fb2cb606b704d066be88bf48ff73181482c",
+        "research_audit": "b34eb9ad5e118235a8894a14c2229073d2ecff05fb3745d78d9464f279e3a71c",
+        "explain": "0d9b8efcf215487bc8755307ab59d479d2dff2274c603bcbdf5c3007f459009e",
+        "document": "1ca81dfe07fc4e0a7e513e28f3919a4560d664f0a07695897f83ac24ac5f36b4",
+        "capture_evidence": "3682dac48d58de3cd3654673023a0f0054015c5542bdd56561c5d21b07a11716",
+        "check_repair": "22e4b39be34c47f487cf311f79c345c607e23f35d85e673c88daf66a0c704d42",
+        "review_repair": "55516b9b64d2811b2d9ac0bf485875b765266daafac766af1e56bdffc73075ad",
+        "ci_repair": "9c5c2c9e62b50d1f3a349007ffd49b5b38de2b64d3052140f15fd60dd4efcd8e",
+        "eval_grade": "6ba300f6d1c9e91526ccabdfe1cde58d6d82cac98c8f02ec70fa58c44011dbdd",
+        "orchestrate": "115a6a66456d8e22419b73d374bdeec50dc45936f5d2a71ab262b8e533556512",
+        "implement": "e82862f7e0fa3da00f24973a9530d65bee67f0270e1c41debf15a13bca5df091"
+      }
+    },
+    "research": {
+      "planner": true,
+      "search": true,
+      "synthesis": true,
+      "audit": true,
+      "search_workers": 4,
+      "search_share": 0.5
+    },
+    "capture": {
+      "evidence_branch": "capture/test",
+      "public_evidence": true
+    },
+    "capture_vision": "capture.md",
+    "payment_modes": [
+      "api_key",
+      "subscription"
+    ],
+    "capabilities": {
+      "sonnet": {
+        "modalities": [
+          "text",
+          "image"
+        ],
+        "context": 16000,
+        "structured_output": true
+      },
+      "opus": {
+        "context": 40000
+      }
+    },
+    "paid": {
+      "providers": [
+        "openai"
+      ],
+      "max_input": 4.0,
+      "max_output": null
+    },
+    "oncall_accepts_inf": true
+  }
+}

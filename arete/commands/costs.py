@@ -204,10 +204,11 @@ def cmd_steps(args) -> int:
         return 1
     found = None if cfg.replay.all else routing.Discovery(cfg, repo, layer=layer)
     for s in sheet:
+        role = config.ROLE_BY_NAME[s.step]
         notes = list(s.notes)
-        if s.step in steps.SEARCHES and (why := research_search.unavailable(s)):
+        if role.web == "search" and (why := research_search.unavailable(s)):
             notes.append(why)
-        if s.step in steps.FETCHES and (why := research_audit.fetch_note(s)):
+        if role.web == "fetch" and (why := research_audit.fetch_note(s)):
             notes.append(why)
         if s.runner == "pi" and not cfg.replay.all:
             selected = routing.pi_route(s.model, cfg, repo)
