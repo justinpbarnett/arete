@@ -737,6 +737,13 @@ class Server:
             self.copy_off_machine(made)
         limits = self.cfg.retention
         try:
+            removed = dbstats.prune()
+        except Exception as e:
+            self.say(f"dbstats prune failed: {type(e).__name__}: {util.first_line(str(e), 300)}")
+        else:
+            if removed > 0:
+                self.say(f"dbstats: removed {removed} files")
+        try:
             store.prune(lines_days=limits.lines_days, keep_days=self.cfg.oncall.keep_days)
         except Exception as e:
             self.say(f"state prune failed: {type(e).__name__}: {util.first_line(str(e), 300)}")

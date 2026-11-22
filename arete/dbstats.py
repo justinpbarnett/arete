@@ -5,6 +5,7 @@ import inspect
 import json
 import math
 import os
+import re
 import stat
 import sys
 import threading
@@ -20,6 +21,7 @@ from . import paths, util
 LOCK = threading.Lock()
 INCARNATION = uuid.uuid4().hex
 SUMMARIES = {}
+SUMMARY_HOUR = re.compile(r"-(\d{4}-\d{2}-\d{2}T\d{2})\.json\Z")
 
 
 def after_fork():
@@ -186,6 +188,25 @@ def runs_bytes():
     return {"record_bytes": record, "other_bytes": other, "total_bytes": record + other}
 
 
+def filename_hour(file):
+    if match := SUMMARY_HOUR.search(file.name):
+        with suppress(ValueError):
+            return datetime.fromisoformat(match[1] + "+00:00")
+    return None
+
+
+def prune(now=None):
+    cutoff = (now or datetime.now(UTC)).astimezone(UTC) - timedelta(hours=48)
+    removed = 0
+    for file in (paths.LOG_DIR / "dbstats").glob("*.json"):
+        hour = filename_hour(file)
+        if hour is not None and hour < cutoff and not file.is_dir():
+            with suppress(FileNotFoundError):
+                file.unlink()
+                removed += 1
+    return removed
+
+
 def transaction_totals(start, end, database):
     count = 0
     maximum = 0.0
@@ -194,6 +215,9 @@ def transaction_totals(start, end, database):
     seen = set()
     for file in (paths.LOG_DIR / "dbstats").glob("*.json"):
         try:
+            named_hour = filename_hour(file)
+            if named_hour is None or not start <= named_hour < end:
+                continue
             summary = json.loads(file.read_text())
             hour = datetime.fromisoformat(summary["hour"])
             identity = (summary["incarnation"], hour)
