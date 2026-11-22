@@ -497,13 +497,14 @@ from pathlib import Path
 started, release = map(Path, sys.argv[1:3])
 if os.fork() == 0:
     os.setsid()
+    limit = time.monotonic() + 20
     with open(os.devnull, "r+b") as quiet:
         for fd in (0, 1, 2):
             os.dup2(quiet.fileno(), fd)
     pending = started.with_suffix(".tmp")
     pending.write_text(str(os.getpid()))
     pending.replace(started)
-    while not release.exists():
+    while not release.exists() and time.monotonic() < limit:
         time.sleep(0.01)
     os._exit(0)
 """
@@ -558,7 +559,7 @@ else:
     pending = note.with_suffix(".tmp")
     pending.write_text(f"{os.getppid()} {os.getpid()}")
     pending.replace(note)
-    time.sleep(60)
+    time.sleep(20)
 """
         pipeline_stand_in = self.start_checks(
             self.root / "orphan", "exec " + shlex.join([sys.executable, "-I", "-c", code, str(started),
