@@ -466,7 +466,7 @@ class CatchUpGateHold(workspace.RunFailed):
         super().__init__(why)
         self.gate, self.head, self.report = gate, head, report
         self.verified, self.review = verified, review
-        self.candidate_restored = False
+        self.candidate_restored = True
 
 
 class CatchUpPushUnconfirmed(workspace.RunFailed):
