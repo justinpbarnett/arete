@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import importlib.util
 import json
@@ -465,6 +466,7 @@ class CatchUpGateHold(workspace.RunFailed):
         super().__init__(why)
         self.gate, self.head, self.report = gate, head, report
         self.verified, self.review = verified, review
+        self.candidate_restored = True
 
 
 class CatchUpPushUnconfirmed(workspace.RunFailed):
@@ -1110,7 +1112,8 @@ def check_lane(layer: config.RepoLayer, run: AgentRun):
 
 
 def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: AgentRun,
-               timeout: float, *, selected: set[str] | None = None) -> tuple[bool, str]:
+               timeout: float, *, selected: set[str] | None = None,
+               defer_failed_cleanup: bool = False) -> tuple[bool, str]:
     commands = layer.checks
     if selected is not None:
         available = layer.checks | layer.targeted_commands
@@ -1123,6 +1126,7 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
     slow = [(name, command) for name, command in commands.items() if name not in layer.quick_checks]
     untracked_before = untracked_by_dir(git_dirs)
     report, ok = [], True
+    cleanup_untracked = not defer_failed_cleanup
 
     def execute(items, hold_fds):
         nonlocal ok
@@ -1148,9 +1152,11 @@ def run_checks(layer: config.RepoLayer, cwd: Path, git_dirs: list[Path], run: Ag
                 report.append("Not run because cheap checks failed: " + ", ".join(name for name, _ in slow))
         if selected is not None and set(commands) != set(layer.checks):
             report.append("Targeted pass only; the full suite is still required before publication.")
+        cleanup_untracked = cleanup_untracked or ok
     finally:
-        for d, name in untracked_added_since(untracked_before):
-            workspace.remove_untracked(d, name)
+        if cleanup_untracked:
+            for d, name in untracked_added_since(untracked_before):
+                workspace.remove_untracked(d, name)
     return ok, "\n\n".join(report)
 
 
@@ -1253,7 +1259,7 @@ class Build(TicketWork):
                               disallowed_tools=routing.NO_GIT_WRITES, fresh_prompt=primed, add_dirs=call_dirs, **kw)
 
     def check(self, *, quick: bool = False, after: str = "the build and its fixes",
-              staged: Staged | None = None) -> bool:
+              staged: Staged | None = None, defer_failed_cleanup: bool = False) -> bool:
         previous, self.checked = self.checked, {}
         self.report = "Checks started but did not complete; no passing result from this attempt."
         try:
@@ -1264,7 +1270,7 @@ class Build(TicketWork):
             elif self.denied_feedback:
                 self.report = self.denied_feedback
             else:
-                return self.check_commands_on_tree(staged, quick, previous)
+                return self.check_commands_on_tree(staged, quick, previous, defer_failed_cleanup=defer_failed_cleanup)
         except BaseException as e:
             self.checked = {}
             self.report = f"Checks did not complete: {type(e).__name__}: {util.first_line(str(e), 300)}"
@@ -1275,11 +1281,13 @@ class Build(TicketWork):
             raise runlimits.Parked(f"{reason}. {self.report}")
         return False
 
-    def check_commands_on_tree(self, staged: Staged, quick: bool, previous: dict) -> bool:
+    def check_commands_on_tree(self, staged: Staged, quick: bool, previous: dict, *,
+                               defer_failed_cleanup: bool = False) -> bool:
         selected = selected_checks(self.layer, staged.files) if quick else None
         full = selected is None or selected == set(self.layer.checks)
         before = factory.fingerprint(self.ws)
-        ok, self.report = run_checks(self.layer, self.ws, self.git_dirs, self.run, self.timeout, selected=selected)
+        ok, self.report = run_checks(self.layer, self.ws, self.git_dirs, self.run, self.timeout, selected=selected,
+                                     defer_failed_cleanup=defer_failed_cleanup)
         if ok:
             after = factory.fingerprint(self.ws)
             if before and after and before != after:
@@ -2706,6 +2714,55 @@ def catch_up_target(b: Build, c: workspace.Checkout, slot: slots.RunSlot) -> tup
     return base_sha, ""
 
 
+def log_catch_up_failure(run: AgentRun, action: str, error: BaseException) -> None:
+    with suppress(Exception):
+        reason = util.first_line(str(error), 300) or type(error).__name__
+        run.log(public_text(run, f"automerge: catch-up {action}: {reason}"))
+
+
+def catch_up_paths(wt: Path) -> set[str]:
+    return workspace.untracked_files(wt) | workspace.ignored_file_paths(wt)
+
+
+def remove_new_paths(run: AgentRun, wt: Path, before: set[str], after: set[str], untracked: set[str]) -> bool:
+    restored = True
+    directories: dict[Path, bool] = {}
+    with local_paths.directory_fd(wt) as root:
+        for name in sorted(after - before):
+            path = Path(name)
+            try:
+                if not path.parts or path.is_absolute() or ".." in path.parts:
+                    raise PermissionError("path is not inside the worktree")
+                if name.endswith("/"):
+                    directories[path] = True
+                    continue
+                try:
+                    with local_paths.directory_fd(path.parent, root) as parent:
+                        os.unlink(path.name, dir_fd=parent)
+                except FileNotFoundError:
+                    pass
+                if name in untracked:
+                    for ancestor in path.parents:
+                        if ancestor.parts:
+                            directories.setdefault(ancestor, False)
+            except Exception as failed:
+                restored = False
+                log_catch_up_failure(run, f"cleanup could not remove {name!r}", failed)
+        for path in sorted(directories, key=lambda p: (len(p.parts), p.as_posix()), reverse=True):
+            record = directories[path]
+            try:
+                with local_paths.directory_fd(path.parent, root) as parent:
+                    os.rmdir(path.name, dir_fd=parent)
+            except FileNotFoundError:
+                continue
+            except Exception as failed:
+                occupied = isinstance(failed, OSError) and failed.errno in (errno.ENOTEMPTY, errno.EEXIST)
+                if record or not occupied:
+                    restored = False
+                    log_catch_up_failure(run, f"cleanup could not remove {path.as_posix() + '/'!r}", failed)
+    return restored
+
+
 def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
                   goal: str, plan: str, prior_review: Review, *,
                   before_push: Callable[[str, verify.Verified, Review], None] | None = None,
@@ -2718,7 +2775,9 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
         raise workspace.RunFailed("the published tree lacks a current approving review")
     before = replace(c)
     checked, report, staged = b.checked, b.report, b.staged
-    worktree_files = workspace.untracked_files(c.wt) | workspace.ignored_file_paths(c.wt)
+    wt = c.wt.resolve()
+    worktree_files = catch_up_paths(c.wt)
+    check_files = None
     blocked = run.owner_questions_blocked
     run.owner_questions_blocked = True
     try:
@@ -2729,7 +2788,8 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
         if workspace.uncommitted(c.wt):
             raise workspace.RunFailed("the worktree has uncommitted files after merging the moved base")
         b.require_valid_diff("catching up the moved base", from_base=True)
-        if not b.check(staged=b.staged):
+        check_files = catch_up_paths(c.wt)
+        if not b.check(staged=b.staged, defer_failed_cleanup=True):
             raise CatchUpGateHold("checks", "the layer's local checks failed", head, b.report)
         if not b.layer.verify:
             raise CatchUpGateHold("verify", "the layer has no behavioral verification configured", head, b.report)
@@ -2745,19 +2805,30 @@ def catch_up_base(b: Build, c: workspace.Checkout, branch: str, base_sha: str,
         if before_push is not None:
             before_push(head, verified, review)
     except BaseException as error:
-        retained = isinstance(error, CatchUpGateHold)
+        log_catch_up_failure(run, "failed", error)
+        gate_hold = error if isinstance(error, CatchUpGateHold) else None
         if isinstance(error, CatchUpPathCollision):
             worktree_files.add(error.name)
             run.catch_up_preserved.add(c.prefix + error.name)
-        abort_merge(c.wt)
-        restore_head = error.head if retained else before.lease
-        if (git(["rev-parse", "HEAD"], c.wt).strip() != restore_head
-                or workspace.uncommitted(c.wt, tracked_only=True)):
-            git(["reset", "--hard", restore_head], c.wt)
-        after = workspace.untracked_files(c.wt) | workspace.ignored_file_paths(c.wt)
-        for name in after - worktree_files:
-            (c.wt / name).unlink(missing_ok=True)
-        if not retained:
+        tracked_restored = paths_restored = False
+        try:
+            abort_merge(c.wt)
+            restore_head = gate_hold.head if gate_hold else before.lease
+            if (git(["rev-parse", "HEAD"], c.wt).strip() != restore_head
+                    or workspace.uncommitted(c.wt, tracked_only=True)):
+                git(["reset", "--hard", restore_head], c.wt)
+            tracked_restored = True
+        except Exception as failed:
+            log_catch_up_failure(run, "cleanup could not restore the worktree head", failed)
+        try:
+            baseline = worktree_files if check_files is None else check_files
+            paths_restored = remove_new_paths(run, wt, baseline, catch_up_paths(c.wt),
+                                              workspace.untracked_files(c.wt))
+        except Exception as failed:
+            log_catch_up_failure(run, f"cleanup could not clean {str(wt)!r}", failed)
+        if gate_hold:
+            gate_hold.candidate_restored = tracked_restored and paths_restored
+        else:
             c.__dict__.update(vars(before))
             b.checked, b.report, b.staged = checked, report, staged
         if isinstance(error, owner_asks.Asked):

@@ -1196,11 +1196,11 @@ class Controller:
             job.verified, job.review = pipeline.catch_up_base(
                 b, checkout, job.branch, base_sha, job.with_left(job.goal), job.with_left(job.plan_text),
                 job.review, before_push=remember_push, **target_check)
-        except pipeline.CatchUpGateHold as error:
-            return self.hold_catch_up(checkout, base_sha, error)
         except pipeline.CatchUpPushUnconfirmed:
             raise
         except (workspace.RunFailed, RuntimeError, OSError) as e:
+            if isinstance(e, pipeline.CatchUpGateHold) and e.candidate_restored:
+                return self.hold_catch_up(checkout, base_sha, e)
             reason = e.why if isinstance(e, workspace.RunFailed) else util.first_line(str(e), 300)
             base = f"`{checkout.base}` at `{base_sha}`" if base_sha else f"`{checkout.base}`"
             failure = f"could not catch up to {base}: {pipeline.public_text(self.run, reason)}"
