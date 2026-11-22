@@ -71,6 +71,7 @@ from .store import insights as insights_store
 from .store import runs as run_store
 from .store import sources as source_store
 from .store import triage as triage_store
+from .store.db import IncompatibleSchema, NoDatabase
 from .util import git
 
 ADW = "adw"
@@ -1626,12 +1627,12 @@ def parent_run(script: Script | None, earlier: dict | None, budget_history: list
     return parent
 
 
-def park_run(run: Run, reason: str) -> tuple[str, str, str]:
+def park_run(run: Run, reason: str, *, comment: bool = True) -> tuple[str, str, str]:
     keep_edits(run)
-    return record_park(run, reason, kept_heads(run))
+    return record_park(run, reason, kept_heads(run), comment=comment)
 
 
-def record_park(run: Run, reason: str, held: dict) -> tuple[str, str, str]:
+def record_park(run: Run, reason: str, held: dict, *, comment: bool = True) -> tuple[str, str, str]:
     status, summary = "failed", (f"parked: {reason}; branch and evidence retained, workspace left in place"
                                  f"{', edits kept in a local commit' if held else ''}. {runlimits.RETRY}")
     kept = run.budget.park(reason, held)
@@ -1639,7 +1640,46 @@ def record_park(run: Run, reason: str, held: dict) -> tuple[str, str, str]:
     pr_url = kept["pr_url"]
     run.log(summary)
     run.enter("failed")
+    if comment:
+        body = [f"Parked: {reason}."]
+        if review_lines := parked_review_lines(run.dir):
+            body.extend(["", *review_lines, ""])
+        body.append("Change this ticket's title or body to retry; the next poll starts it again on the kept branch. "
+                    f"Run `{run.id}`.")
+        try:
+            run.say("\n".join(body), on_ticket=True)
+        except (OSError, sqlite3.Error, NoDatabase, IncompatibleSchema) as error:
+            run.log(f"tracker: {util.first_line(str(error), 300)}")
     return status, summary, pr_url
+
+
+def parked_review_lines(folder: Path) -> list[str]:
+    rounds = []
+    for path in folder.glob("review*.json"):
+        if match := re.fullmatch(r"review([2-9]|[1-9][0-9]+)?\.json", path.name):
+            rounds.append((int(match[1] or 1), path))
+
+    lines = []
+    for round_number, path in sorted(rounds):
+        try:
+            if path.is_symlink():
+                return []
+            problems = json.loads(path.read_text(encoding="utf-8"))["structured"]["problems"]
+        except (OSError, ValueError, KeyError, TypeError, RecursionError):
+            return []
+        if not isinstance(problems, list):
+            return []
+        for problem in problems:
+            if not isinstance(problem, dict):
+                return []
+            severity = problem.get("severity")
+            if severity in ("blocker", "major"):
+                file = problem.get("file", "")
+                if not isinstance(file, str):
+                    return []
+                location = f"`{file}`" if file else "(no file)"
+                lines.append(f"- Review {round_number} held on {location} ({severity})")
+    return lines
 
 
 def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: bool, flow: factory.Flow | None,

@@ -5860,6 +5860,68 @@ class CatchUpPublicationFailureTests(MovedBasePublicationFixture, unittest.TestC
                     park.assert_not_called()
 
 
+class ParkedTicketCommentTests(unittest.TestCase):
+    def setUp(self):
+        folder = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        self.tracker = mock.Mock(comment=mock.Mock(return_value=""), states=("failed",),
+                                 label=mock.Mock(return_value=""), move=mock.Mock(return_value=""),
+                                 ref=mock.Mock(return_value="#842"))
+        budget = mock.Mock()
+        budget.park.return_value = {"pr_url": ""}
+        self.run = pipeline.Run("parked-run", config.Repo("fixture", folder), folder,
+                                tracker=self.tracker, tid="842", budget=budget)
+        self.enterContext(mock.patch.object(record, "note"))
+        self.reason = "the repair chain used its 3 repair cycles"
+        self.retry = ("Change this ticket's title or body to retry; the next poll starts it again on the kept branch. "
+                      "Run `parked-run`.")
+
+    def save_review(self, name, *problems):
+        (self.run.dir / name).write_text(json.dumps({"structured": {"problems": problems}}))
+
+    def assert_comment(self, *review_lines):
+        pipeline.record_park(self.run, self.reason, {})
+        self.tracker.comment.assert_called_once()
+        ticket, body = self.tracker.comment.call_args.args
+        self.assertEqual(ticket, "842")
+        self.assertEqual([line for line in body.splitlines() if line], [
+            f"{tracker.ARETE_TAG} Parked: {self.reason}.", *review_lines, self.retry,
+        ])
+
+    def test_comments_with_blocking_files_in_numeric_round_order(self):
+        self.run.feedback = [{"pr_url": "https://github.com/fixture/repo/pull/7"}]
+        self.enterContext(mock.patch.object(self.run, "say_on_prs"))
+        self.save_review("review10.json", {"file": "", "severity": "major"})
+        self.save_review("review2.json", {"file": "arete/z.py", "severity": "major", "problem": "PROBE-THREE"})
+        self.save_review("review.json",
+                         {"file": "arete/x.py:12", "severity": "blocker", "problem": "PROBE-ONE", "category": "issue"},
+                         {"file": "tests/y.py", "severity": "minor", "problem": "PROBE-TWO"})
+        (self.run.dir / "review-other.json").write_text("invalid JSON")
+        self.assert_comment("- Review 1 held on `arete/x.py:12` (blocker)",
+                            "- Review 2 held on `arete/z.py` (major)",
+                            "- Review 10 held on (no file) (major)")
+
+    def test_comments_without_review_files_in_this_run(self):
+        earlier = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        (earlier / "review.json").write_text(json.dumps({"structured": {"problems": [
+            {"file": "old.py", "severity": "blocker"},
+        ]}}))
+        self.assert_comment()
+
+    def test_comments_without_review_lines_when_one_review_is_invalid(self):
+        for invalid_round in ("review.json", "review2.json"):
+            with self.subTest(invalid_round=invalid_round):
+                for name in ("review.json", "review2.json"):
+                    self.save_review(name, {"file": "arete/x.py", "severity": "blocker"})
+                (self.run.dir / invalid_round).write_text("invalid JSON")
+                self.assert_comment()
+                self.tracker.comment.reset_mock()
+
+    def test_dry_run_does_not_comment(self):
+        self.run.dry_run = True
+        pipeline.record_park(self.run, self.reason, {})
+        self.tracker.comment.assert_not_called()
+
+
 class CatchUpRecoveryTests(MovedBasePublicationFixture, unittest.TestCase):
     @classmethod
     def setUpClass(cls):
