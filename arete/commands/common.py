@@ -143,8 +143,13 @@ def serve_line(beat: dict) -> str:
     code = serve_revisions(beat)
     running = "unknown loop runs" if beat["running"] is None else util.count(beat["running"], "loop run")
     pending = "unknown loop fires" if beat["pending"] is None else util.count(beat["pending"], "loop fire")
+    tickets = ""
+    if "tickets" in beat:
+        count = beat["tickets"]
+        label = "unknown ticket runs" if count is None else util.count(count, "ticket run")
+        tickets = f", {label} live"
     return (f"serve: up, pid {beat['pid']}, {util.count(beat['loops'], 'loop')} on, {beat['off']} off, "
-            f"{running} running, {pending} waiting"
+            f"{running} running, {pending} waiting{tickets}"
             + (f", {len(beat['broken'])} broken" if beat.get("broken") else "")
             + (f", {code}" if code else "") + paused + failing)
 
