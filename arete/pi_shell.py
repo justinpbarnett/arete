@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from . import environment, paths, sandbox, scratch, util
+from . import environment, lanes, paths, sandbox, scratch, util
 
 if TYPE_CHECKING:
     from . import guard
@@ -138,10 +138,11 @@ class Shell:
         if any(root.resolve() not in self.read_roots for root in self.read_roots):
             raise ValueError("read-only command runtime changed after admission")
         runtimes = tuple(dict.fromkeys((*runtime_roots(), *self.read_roots)))
+        lane_locks = lanes.worker_lock_paths(self.env)
         profile = sandbox.write_confinement(
             self.cwd, list(self.add_dirs), agent_roots=False, secrets_denied=True, unix_confined=True,
-            state=(paths.STATE_DIR, self.floor.open), peers=paths.WORKTREES_DIR, private_temporary=True,
-            read_roots=(*SYSTEM_READ_ROOTS, *runtimes),
+            state=(paths.STATE_DIR, (*self.floor.open, *lane_locks)), peers=paths.WORKTREES_DIR,
+            private_temporary=True, read_roots=(*SYSTEM_READ_ROOTS, *runtimes, *lane_locks),
             hidden=(*closed, *self.floor.files, *self.hidden,
                     *self.aliases((self.cwd, *self.add_dirs, *runtimes), stopped, until)))
         profile[-1] += ("(deny file-link)(deny process-info*)(allow process-info* (target self) (target children))"

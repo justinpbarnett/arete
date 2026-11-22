@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from importlib import import_module
 from unittest.loader import _FailedTest
 
-TAIL = 4000
+KEPT_LINES = 40
 DEFAULT_CLASS_TIMEOUT = 10
 STACK_GRACE = 1
 HISTORY = os.path.join(tempfile.gettempdir(), "arete-parallel-durations.json")
@@ -27,6 +27,7 @@ STACK_SITE = os.path.join(TESTS, "_parallel_site")
 if __spec__ is None:
     sys.path.insert(0, os.path.dirname(TESTS))
 _test_stacks = import_module("arete._test_stacks")
+lanes = import_module("arete.lanes")
 THREAD = re.compile(r"(?:Current thread|Thread) (0x[0-9a-f]+) \(most recent call first\):")
 
 
@@ -128,12 +129,12 @@ class Runner:
 
     def output(self, path):
         with open(path, "rb") as handle:
-            size = os.fstat(handle.fileno()).st_size
-            if size <= 2 * TAIL:
-                return handle.read().decode(errors="replace")
-            head = handle.read(TAIL).decode(errors="replace")
-            handle.seek(-TAIL, os.SEEK_END)
-            return head + f"\n... full output: {path} ...\n" + handle.read().decode(errors="replace")
+            lines = handle.read().decode(errors="replace").splitlines()
+        if len(lines) <= KEPT_LINES:
+            return "\n".join(lines)
+        dropped = len(lines) - KEPT_LINES
+        note = f"... {dropped} earlier output lines dropped; all of them are in {path} ..."
+        return "\n".join([note, *lines[-KEPT_LINES:]])
 
     def request_stacks(self, prefix):
         deadline = time.monotonic() + STACK_GRACE
@@ -253,9 +254,12 @@ class Runner:
                 outcome = "FAIL" if failed(report) else "ok"
                 print(f"{batch.identifier}: {report['ran']} tests, {outcome} ({report['seconds']:.2f}s)", flush=True)
 
-    def run(self, tests):
+    def run(self, tests, named=()):
         batches = {}
-        for test in tests:
+        entries = [(test.id().rsplit(".", 1)[0], test) for test in tests]
+        for name in named:
+            entries += [(name, test) for test in flatten(unittest.defaultTestLoader.loadTestsFromName(name))]
+        for identifier, test in entries:
             if isinstance(test, _FailedTest):
                 result = unittest.TestResult()
                 test.run(result)
@@ -264,7 +268,6 @@ class Runner:
                                            "failures": [], "skipped": [], "unexpected": [],
                                            "seconds": 0.0, "output": ""}
                 continue
-            identifier = test.id().rsplit(".", 1)[0]
             test_class = type(test)
             batch = batches.setdefault(identifier, Batch(
                 identifier, 0, serial=getattr(test_class, "serial", False),
@@ -307,20 +310,23 @@ class Runner:
 
     def show_failures(self, identifier, report):
         timeout_report = report.get("timeout")
+        kinds = [kind for kind in ("errors", "failures", "unexpected") if report[kind]]
+        if report["output"] and (timeout_report or kinds):
+            print(report["output"])
         if timeout_report:
             print(f"\n{timeout_report}")
-            if report["output"]:
-                print(report["output"])
-        for kind in ("errors", "failures", "unexpected"):
-            if not report[kind]:
-                continue
+        for kind in kinds:
             print(f"\n{identifier}: {kind}")
             for entry in report[kind]:
                 print(entry if isinstance(entry, str) else "\n".join(entry))
-            if report["output"] and not timeout_report:
-                print(report["output"])
 
     def finish(self, seconds):
+        for identifier in self.crowded:
+            report = self.results[identifier]
+            first = self.first_failures[identifier]
+            where = "ran past its deadline" if first["timeout"] else "failed"
+            print(f"{identifier}: {where} on its first run, "
+                  f"then passed alone within twice its deadline in {report['seconds']:.2f}s", flush=True)
         suite_failed = False
         ran = skipped = 0
         for identifier, report in self.results.items():
@@ -338,12 +344,6 @@ class Runner:
             os.replace(temporary, HISTORY)
         except OSError:
             pass
-        for identifier in self.crowded:
-            report = self.results[identifier]
-            first = self.first_failures[identifier]
-            where = "ran past its deadline" if first["timeout"] else "failed"
-            print(f"{identifier}: {where} on its first run, "
-                  f"then passed alone within twice its deadline in {report['seconds']:.2f}s", flush=True)
         if self.args.slowest:
             print("Slowest classes:")
             for name, report in sorted(self.results.items(), key=lambda item: -item[1]["seconds"])[:self.args.slowest]:
@@ -367,6 +367,7 @@ def main():
     parser.add_argument("--lifeline", type=int)
     parser.add_argument("--one")
     parser.add_argument("--result")
+    parser.add_argument("names", nargs="*", help="classes or tests to run by name; takes no check lane")
     args = parser.parse_args()
     args.start = os.path.abspath(args.start)
     if args.one:
@@ -374,8 +375,12 @@ def main():
     if (args.jobs < 1 or args.slowest < 0
             or (args.timeout is not None and (not math.isfinite(args.timeout) or args.timeout <= 0))):
         parser.error("jobs and timeout must be positive; slowest must be nonnegative")
-    tests = list(flatten(unittest.TestLoader().discover(args.start)))
-    return Runner(args).run(tests)
+    if args.names:
+        sys.path.insert(0, args.start)
+        return Runner(args).run([], args.names)
+    with lanes.held_by_worker(os.environ, lambda note: print(f"tests.parallel: {note}", flush=True)):
+        tests = list(flatten(unittest.TestLoader().discover(args.start)))
+        return Runner(args).run(tests)
 
 
 if __name__ == "__main__":

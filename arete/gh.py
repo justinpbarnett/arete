@@ -12,7 +12,7 @@ import urllib.request
 import uuid
 from collections.abc import Sequence
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from urllib.parse import urlencode
 
@@ -31,6 +31,10 @@ class GhError(RuntimeError):
 
 
 class GhUnsure(GhError):
+    pass
+
+
+class WorkflowNotForPR(GhError):
     pass
 
 
@@ -830,9 +834,13 @@ class Check:
     check_run_id: int = 0
     source: str = "status"
     workflow_run_id: int = 0
+    details_url: str = ""
+    actions_only: bool = False
 
     @property
     def key(self) -> CheckKey:
+        if self.actions_only:
+            return f"actions-job:{self.job}", self.name
         if self.workflow_run_id:
             return f"workflow-job:{self.workflow_run_id}", self.name
         return self.context_key
@@ -840,6 +848,13 @@ class Check:
     @property
     def context_key(self) -> CheckKey:
         return self.source, self.name
+
+    def actions_workflow(self, repo: str) -> int:
+        from_link = actions_run_id(repo, self.link)
+        from_details = actions_run_id(repo, self.details_url)
+        if from_link and from_details and from_link != from_details:
+            return 0
+        return from_link or from_details
 
 
 def check_state(row: dict) -> str:
@@ -853,10 +868,11 @@ def check_state(row: dict) -> str:
 def check_from_run(row: dict) -> Check:
     app = row.get("app") or {}
     actions = app.get("slug") == "github-actions"
+    details_url = row.get("details_url") or ""
     return Check(row["name"], check_state(row), row.get("completed_at") or row.get("started_at") or "",
-                 row.get("html_url") or row.get("details_url") or "", row["id"] if actions else 0,
+                 row.get("html_url") or details_url, row["id"] if actions else 0,
                  ((row.get("output") or {}).get("title") or "").strip(), row["id"],
-                 f"app:{app.get('id') or app.get('slug') or ''}")
+                 f"app:{app.get('id') or app.get('slug') or ''}", details_url=details_url)
 
 
 def check_from_status(row: dict) -> Check:
@@ -864,9 +880,11 @@ def check_from_status(row: dict) -> Check:
                  row.get("target_url") or "", 0, (row.get("description") or "").strip())
 
 
-def commit_checks(repo: str, ref: str, *, timeout: float = 120, retry: bool = True) -> dict[CheckKey, Check]:
+def commit_checks(repo: str, ref: str, *, timeout: float = 120, retry: bool = True,
+                  red_workflows: set[int] | None = None, latest: bool = False) -> dict[CheckKey, Check]:
     path = f"repos/{repo}/commits/{ref}"
-    pages = gh_json(["api", f"{path}/check-runs?filter=all&per_page=100", "--paginate", "--slurp"],
+    filter_runs = "latest" if latest else "all"
+    pages = gh_json(["api", f"{path}/check-runs?filter={filter_runs}&per_page=100", "--paginate", "--slurp"],
                     timeout=timeout, retry=retry)
     if not isinstance(pages, list) or not pages or any(
             not isinstance(page, dict) or not isinstance(page.get("check_runs"), list) for page in pages):
@@ -876,11 +894,83 @@ def commit_checks(repo: str, ref: str, *, timeout: float = 120, retry: bool = Tr
     if not isinstance(statuses, list) or not statuses or any(
             not isinstance(page, list) for page in statuses):
         raise GhError("GitHub did not return commit statuses")
-    newest = {c.key: c for c in runs}
+    newest = ({c.key: c for c in runs} if red_workflows is None
+              else current_workflow_checks(repo, ref, runs, red_workflows, timeout=timeout))
     # GitHub returns commit statuses in reverse chronological order.
     for c in (check_from_status(row) for page in statuses for row in page):
         newest.setdefault(c.key, c)
     return newest
+
+
+def publication_ci_passed(repo: str, head: str, *,
+                          actions_failures: Sequence[tuple[int, str] | tuple[int, str, int]] = ()) -> bool:
+    checks = commit_checks(repo, head, latest=True, red_workflows=set(), retry=False)
+    if any(check.state not in {"pass", "skipped"} for check in checks.values()):
+        return False
+    current_jobs = [(check.job, check.name, check.actions_workflow(repo)) for check in checks.values() if check.job]
+    unresolved = set()
+    for job, name, *workflow in actions_failures:
+        run = workflow[0] if workflow else 0
+        if not name:
+            row = actions_job(repo, head, job, retry=False)
+            name, run = row["name"], row.get("run_id")
+            if not run:
+                return False
+        if job and any(newer > job and current_name == name and (not run or current_run == run)
+                       for newer, current_name, current_run in current_jobs):
+            continue
+        if not run and job:
+            run = actions_job(repo, head, job, retry=False).get("run_id")
+        if type(run) is not int or run <= 0:
+            return False
+        unresolved.add(run)
+    unresolved.update(row["id"] for row in head_workflow_runs(repo, head, retry=False))
+    for run in sorted(unresolved):
+        row = workflow_run(repo, head, run, retry=False)
+        if row.get("status") != "completed":
+            return False
+        failures, _ = workflow_job_failures(repo, head, run, row["run_attempt"], retry=False)
+        if failures or check_state(row) == "fail":
+            return False
+    return bool(checks or unresolved)
+
+
+def run_number(row: dict) -> int:
+    return row["run_number"] if type(row.get("run_number")) is int else 0
+
+
+def head_workflow_runs(repo: str, head: str, **options) -> list[dict]:
+    query = urlencode({"head_sha": head, "per_page": 100})
+    latest: dict[object, dict] = {}
+    for row in actions_rows(f"repos/{repo}/actions/runs?{query}", "workflow_runs", **options):
+        if not isinstance(row, dict) or row.get("head_sha") != head or type(row.get("id")) is not int:
+            continue
+        key = row.get("workflow_id") or ("run", row["id"])
+        if key not in latest or run_number(row) >= run_number(latest[key]):
+            latest[key] = row
+    return list(latest.values())
+
+
+def current_workflow_checks(repo: str, head: str, runs: list[Check], red_workflows: set[int], *,
+                            timeout: float) -> dict[CheckKey, Check]:
+    red_workflows.clear()
+    red_workflows.update(c.actions_workflow(repo) for c in runs if c.state == "fail")
+    current, superseded = {}, set()
+    for run in sorted(red_workflows - {0}):
+        failures, replaced = current_workflow_failures(repo, head, run, timeout=timeout, retry=False)
+        superseded.update(replaced)
+        current.update((job, (run, name)) for job, name in failures.items())
+    runs = [c for c in runs if c.state != "fail" or c.job not in superseded]
+    red_workflows.intersection_update(c.actions_workflow(repo) for c in runs if c.state == "fail")
+    red_workflows.update(run for run, _ in current.values())
+    checks = {c.key: c for c in runs}
+    reported = {c.job for c in checks.values() if c.state == "fail"}
+    for job in sorted(current.keys() - reported):
+        run, name = current[job]
+        check = Check(name, "fail", link=f"https://github.com/{repo}/actions/runs/{run}/job/{job}", job=job,
+                      check_run_id=job, source=f"app:{GITHUB_ACTIONS_APP_ID}", actions_only=True)
+        checks[check.key] = check
+    return checks
 
 
 def branch_sha(repo: str, branch: str) -> str:
@@ -938,20 +1028,51 @@ class WorkflowRerun:
     run: int
     attempt: int
     jobs: dict[str, int]
+    unrelated: dict[str, str] = field(default_factory=dict)
 
     @property
     def check_keys(self) -> set[CheckKey]:
         return {(f"app:{GITHUB_ACTIONS_APP_ID}", name) for name in self.jobs}
 
 
-def workflow_run(repo: str, head: str, run: int, *, attempt: int = 0,
+def workflow_lists_pr(pulls, number: int) -> bool:
+    return (isinstance(pulls, list) and len(pulls) == 1 and isinstance(pulls[0], dict)
+            and type(pulls[0].get("number")) is int and pulls[0]["number"] == number)
+
+
+def workflow_belongs_to_pr(row: dict, number: int) -> bool:
+    return row.get("event") == "pull_request" and workflow_lists_pr(row.get("pull_requests"), number)
+
+
+def workflow_belongs_to_head_branch(row: dict, repo: str, number: int, head: str, **options) -> bool:
+    pulls = row.get("pull_requests")
+    if not row.get("head_branch") or not (pulls == [] or row.get("event") == "push" and isinstance(pulls, list)):
+        return False
+    pull = gh_json(["api", f"repos/{repo}/pulls/{number}"], **options) or {}
+    ref = pull.get("head") or {}
+    branch_repo = (ref.get("repo") or {}).get("full_name")
+    run_repo = (row.get("head_repository") or {}).get("full_name")
+    return (type(pull.get("number")) is int and pull["number"] == number and pull.get("state") == "open"
+            and ref.get("sha") == head and ref.get("ref") == row["head_branch"]
+            and isinstance(branch_repo, str) and isinstance(run_repo, str)
+            and bool(branch_repo) and branch_repo.casefold() == run_repo.casefold())
+
+
+def workflow_run(repo: str, head: str, run: int, *, pr: str = "", allow_head_branch: bool = False, attempt: int = 0,
                  timeout: float = 120, retry: bool = True) -> dict:
     path = f"repos/{repo}/actions/runs/{run}" + (f"/attempts/{attempt}" if attempt else "")
     row = gh_json(["api", path], timeout=timeout, retry=retry) or {}
     actual = row.get("run_attempt")
-    if (row.get("id") != run or row.get("head_sha") != head or type(actual) is not int or actual <= 0
+    if (type(row.get("id")) is not int or row["id"] != run or row.get("head_sha") != head
+            or type(actual) is not int or actual <= 0
             or (attempt and actual != attempt)):
         raise GhError(f"GitHub did not identify the workflow attempt for run {run} on {head}")
+    if pr:
+        number = pr_number(pr)
+        if pr_repo(pr).casefold() != repo.casefold() or not (
+                workflow_belongs_to_pr(row, number) or allow_head_branch and workflow_belongs_to_head_branch(
+                    row, repo, number, head, timeout=timeout, retry=retry)):
+            raise WorkflowNotForPR(f"GitHub did not identify workflow run {run} as belonging to {pr}")
     return row
 
 
@@ -973,12 +1094,66 @@ def workflow_attempt_jobs(repo: str, head: str, run: int, attempt: int, *,
             and isinstance(row.get("name"), str) and row["name"]]
 
 
+def failed_workflow_jobs(repo: str, head: str, run: int, attempt: int) -> dict[int, str]:
+    failed, _ = workflow_job_failures(repo, head, run, attempt)
+    return failed
+
+
+def current_workflow_failures(repo: str, head: str, run: int, **options) -> tuple[dict[int, str], set[int]]:
+    try:
+        row = workflow_run(repo, head, run, **options)
+        if row["run_attempt"] > 1:
+            return workflow_job_failures(repo, head, run, row["run_attempt"], **options)
+    except (GhError, OSError, KeyError, TypeError, ValueError, AttributeError):
+        pass
+    return {}, set()
+
+
+def workflow_job_failures(repo: str, head: str, run: int, attempt: int, **options) -> tuple[dict[int, str], set[int]]:
+    path = f"repos/{repo}/actions/runs/{run}/jobs?filter=all&per_page=100"
+    pages = gh_json(["api", path, "--paginate", "--slurp"], **options)
+    incomplete = f"GitHub did not return complete job results for workflow run {run} on {head}"
+    if not isinstance(pages, list) or not pages or any(
+            not isinstance(page, dict) or not isinstance(page.get("jobs"), list) for page in pages):
+        raise GhError(incomplete)
+    rows = [row for page in pages for row in page["jobs"]]
+    if not rows or any(type(page.get("total_count")) is not int or page["total_count"] != len(rows) for page in pages):
+        raise GhError(incomplete)
+    seen, attempts = set(), set()
+    jobs_by_name: dict[str, dict[int, list[dict]]] = {}
+    for row in rows:
+        if (not isinstance(row, dict) or type(row.get("run_id")) is not int or row["run_id"] != run
+                or row.get("head_sha") != head or type(row.get("run_attempt")) is not int
+                or not 0 < row["run_attempt"] <= attempt or row.get("status") != "completed"
+                or not isinstance(row.get("conclusion"), str) or not row["conclusion"]
+                or not isinstance(row.get("name"), str) or not row["name"]
+                or type(row.get("id")) is not int or row["id"] <= 0 or row["id"] in seen):
+            raise GhError(incomplete)
+        job_attempt = row["run_attempt"]
+        seen.add(row["id"])
+        attempts.add(job_attempt)
+        jobs_by_name.setdefault(row["name"], {}).setdefault(job_attempt, []).append(row)
+    if attempt not in attempts:
+        raise GhError(incomplete)
+    failed, superseded = {}, set()
+    for name, attempts_for_job in jobs_by_name.items():
+        if len(attempts_for_job) > 1 and any(len(jobs) > 1 for jobs in attempts_for_job.values()):
+            raise GhError(f"GitHub returned ambiguous attempts for jobs named {name} in workflow run {run}")
+        latest = max(attempts_for_job)
+        for job_attempt, jobs in attempts_for_job.items():
+            failures = [job["id"] for job in jobs if check_state(job) == "fail"]
+            if job_attempt == latest:
+                failed.update((job, name) for job in failures)
+            else:
+                superseded.update(failures)
+    return failed, superseded
+
+
 def latest_pr_workflows(repo: str, pr: str, head: str, **options) -> dict[int, dict]:
     query = urlencode({"event": "pull_request", "head_sha": head, "per_page": 100})
     number = pr_number(pr)
     candidates = [row for row in actions_rows(f"repos/{repo}/actions/runs?{query}", "workflow_runs", **options)
-                  if (row.get("head_sha"), row.get("event")) == (head, "pull_request")
-                  and [pull.get("number") for pull in row.get("pull_requests") or []] == [number]]
+                  if row.get("head_sha") == head and workflow_belongs_to_pr(row, number)]
     return {row["workflow_id"]: row for row in sorted(candidates, key=lambda row: row["run_number"])}
 
 
@@ -1023,9 +1198,10 @@ def workflow_check(run: dict) -> Check:
                  description=description, source=f"workflow:{run['id']}")
 
 
-def rerun_checks(repo: str, head: str, rerun: WorkflowRerun, run: dict, **options) -> dict[CheckKey, Check]:
+def rerun_checks(repo: str, pr: str, head: str, rerun: WorkflowRerun, run: dict, **options) -> dict[CheckKey, Check]:
     if run["run_attempt"] > rerun.attempt:
-        run = workflow_run(repo, head, rerun.run, attempt=rerun.attempt, **options)
+        run = workflow_run(repo, head, rerun.run, pr=pr, allow_head_branch=bool(rerun.unrelated),
+                           attempt=rerun.attempt, **options)
     if run["run_attempt"] != rerun.attempt or (workflow := workflow_check(run)).state == "pending":
         return {}
     try:
@@ -1053,3 +1229,11 @@ def rerun_checks(repo: str, head: str, rerun: WorkflowRerun, run: dict, **option
 
 def rerun_failed_jobs(repo: str, run: int) -> None:
     gh(["run", "rerun", str(run), "--failed", "--repo", repo], write=True)
+
+
+def actions_run_id(repo: str, link: str) -> int:
+    if not isinstance(link, str):
+        return 0
+    match = re.fullmatch(rf"https://github\.com/{re.escape(repo)}/actions/runs/([1-9][0-9]{{0,19}})(?:[/?#].*)?",
+                         link, re.IGNORECASE)
+    return int(match[1]) if match else 0
