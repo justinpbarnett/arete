@@ -6672,7 +6672,7 @@ class ServeDeploymentRefusalTests(ServeDeploymentFixture):
 
 
 class SelfDeployRollbackTests(unittest.TestCase):
-    class_timeout = 5
+    class_timeout = CHILD_HANG_TIMEOUT + 30
 
     def git(self, *args):
         return subprocess.check_output(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
@@ -7346,8 +7346,9 @@ signal.pause()
                 self.assertTrue(ready.exists())
                 self.assertEqual(lock.read_bytes(), b"partial index")
                 self.assertEqual((package / "fixture.py").read_text(), "version = ")
-                timeout = 0
-            return communicate(proc, input=input, timeout=timeout)
+                return communicate(proc, input=input, timeout=0)
+            timeout = CHILD_HANG_TIMEOUT if timeout is None else timeout
+            return communicate(proc, input=input, timeout=max(CHILD_HANG_TIMEOUT, timeout))
 
         with (mock.patch.object(sandbox, "protected_command", substitute_merge),
               mock.patch.object(subprocess.Popen, "communicate", expire_after_writes)):
@@ -7393,7 +7394,8 @@ signal.pause()
                                                                              str(ready)]))
         self.git(self.checkout, "config", "filter.delay.required", "true")
         self.git(self.checkout, "config", "checkout.workers", "1")
-        communicate, wait = subprocess.Popen.communicate, subprocess.Popen.wait
+        communicate = subprocess.Popen.communicate
+        wait = subprocess.Popen.wait
         interrupted = False
         cleanup_waits = []
 
@@ -7407,8 +7409,9 @@ signal.pause()
                 self.assertTrue(lock.exists())
                 self.assertTrue((self.checkout / "arete" / "fresh.py").is_file())
                 interrupted = True
-                timeout = 0
-            return communicate(proc, input=input, timeout=timeout)
+                return communicate(proc, input=input, timeout=0)
+            timeout = CHILD_HANG_TIMEOUT if timeout is None else timeout
+            return communicate(proc, input=input, timeout=max(CHILD_HANG_TIMEOUT, timeout))
 
         def observe_cleanup(proc, timeout=None):
             if interrupted and "--ff-only" in proc.args:

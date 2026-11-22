@@ -8,6 +8,10 @@ from tests.subprocess_helpers import CHILD_HANG_TIMEOUT
 
 ARETE_IMPORT = re.compile(r"\b(?:from\s+arete\b|import\s+arete\b|(?:import_module|__import__)\(['\"]arete\b)")
 GUARD = "CHILD_HANG_TIMEOUT"
+MERGE_TIMEOUT_BRANCHES = {
+    "expire_after_writes": "str(script) in proc.args",
+    "expire_while_git_holds_lock": "'--ff-only' in proc.args",
+}
 
 
 def argument(call, name):
@@ -53,6 +57,7 @@ class SubprocessAudit(ast.NodeVisitor):
         self.bindings = [{}]
         self.violations = []
         self.expects_timeout = False
+        self.forced_merge_timeouts = set()
 
     def visit_scope(self, node):
         previous = self.scope
@@ -135,6 +140,15 @@ class SubprocessAudit(ast.NodeVisitor):
         self.generic_visit(node)
         self.expects_timeout = previous
 
+    def visit_If(self, node):
+        merge_branch = MERGE_TIMEOUT_BRANCHES.get(self.scope)
+        if (self.filename == "test_workflow.py" and merge_branch is not None
+                and ast.unparse(node.test) == merge_branch
+                and isinstance(node.body[-1], ast.Return)
+                and ast.unparse(node.body[-1].value) == "communicate(proc, input=input, timeout=0)"):
+            self.forced_merge_timeouts.add(node.body[-1].value)
+        self.generic_visit(node)
+
     def visit_Call(self, node):
         method = self.resolve(node.func)
         if isinstance(method, ast.Attribute) and method.attr == "communicate":
@@ -143,7 +157,7 @@ class SubprocessAudit(ast.NodeVisitor):
             timeout = argument(node, "timeout")
             if timeout is None and len(node.args) > 1 + unbound:
                 timeout = node.args[1 + unbound]
-            needs_guard = self.process_needs_guard(process, unbound)
+            needs_guard = self.process_needs_guard(process)
         elif self.subprocess_member(method) in {"run", "check_output"}:
             command = node.args[0] if node.args else argument(node, "args")
             timeout = argument(node, "timeout")
@@ -151,16 +165,14 @@ class SubprocessAudit(ast.NodeVisitor):
         else:
             timeout = None
             needs_guard = False
-        if needs_guard and not self.expects_timeout and not uses_guard(timeout):
+        if needs_guard and node not in self.forced_merge_timeouts and not self.expects_timeout and not uses_guard(timeout):
             self.violations.append(node.lineno)
         self.generic_visit(node)
 
-    def process_needs_guard(self, process, unbound):
+    def process_needs_guard(self, process):
         if isinstance(process, ast.Call) and self.subprocess_member(process.func) == "Popen":
             return self.command_needs_guard(process.args[0] if process.args else argument(process, "args"))
-        # These mocked callbacks force a Git timeout to exercise deploy recovery.
-        return not (unbound and self.filename == "test_workflow.py"
-                    and self.scope in {"expire_after_writes", "expire_while_git_holds_lock"})
+        return True
 
 
 class SubprocessHangGuardTests(unittest.TestCase):
