@@ -32,6 +32,7 @@ THREAD = re.compile(r"(?:Current thread|Thread) (0x[0-9a-f]+) \(most recent call
 
 
 def stack_env(env):
+    env = {**env, "ARETE_DESKTOP_NOTIFY": "0"}
     if not env.get(_test_stacks.PREFIX_ENV):
         return env
     pythonpath = env.get("PYTHONPATH")
