@@ -18,6 +18,9 @@ Use the existing held-draft dispositions for genuine blockers, never turn blocke
 Ask the owner only for information or permission you cannot obtain safely through workers.
 When verification can check everything in use except one requirement that depends on a live outside event the run cannot cause (such as a hosted CI failure, a GitHub outage, or a production incident), do not ask the owner for that event or a decision about publishing without it.
 Have the verifier explicitly list that requirement as unverified in its summary and record the stubbed evidence that covers it, then request publication so both appear in the PR body.
+When two verifications on the same final tree each report that their environment cannot measure the same requirement (such as timing that includes sandbox setup), stop retrying verification for that requirement.
+Request publication with `unverified_measurement` containing `requirement` and `measurement`. Copy the actual measurement and its source from the builder or checks even if the verifier reports only the limitation. The PR body will label the requirement as unverified and show the measurement.
+Never apply this exception to a requirement any verifier observed fail.
 Keep the existing automerge rules and continue to ask for credentials, permissions, and decisions the issue leaves open.
 
 Workers start asynchronously.

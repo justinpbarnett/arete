@@ -101,6 +101,7 @@ NOT_CAUSED_LEFT_FOR_A_PERSON = (f"{LEFT_HEADING}\n\n{LEFT_BY_A_PERSON} A red che
                                 "is not caused by the PR: set `caused_by_pr` to false, say in its reason that it waits "
                                 "on the change left for a person, and do not make it pass another way.\n\n")
 CHECKED_IN_USE_HEADING = "## Checked in use"
+UNVERIFIED_REQUIREMENT_HEADING = "## Unverified requirement"
 RUNS_LOG = "runs.log"
 RUN_START_SECONDS = 10
 SUCCEEDED = ("pr", "noop", "needs-info", "dry-run", "done")
@@ -2600,15 +2601,22 @@ def summary_of(review: Review, build_summary: str) -> str:
     return cut_at_end(str(review.changes or "").strip() or build_summary, SUMMARY_CHARS)
 
 
+def unverified_measurement_section(disclosure: dict) -> str:
+    requirement = verify.one_line(disclosure["requirement"])
+    measurement = verify.one_line(disclosure["measurement"])
+    return f"{UNVERIFIED_REQUIREMENT_HEADING}\n\n{requirement}\n\n**Recorded measurement**\n\n{measurement}\n\n"
+
+
 def report_body(run: Run, *, summary: str, review: Review, verified: verify.Verified, left: str,
                 images: dict[str, str], approval: dict | None, attempts: int, checks: str, plan_text: str,
-                size: str, held: str = "", written: str = "") -> str:
+                size: str, held: str = "", written: str = "", measurement_section: str = "") -> str:
     return public_text(run, (
         f"## Summary\n\n{written or summary_of(review, summary)}\n\n"
         + ("" if run.feedback else triage_block(approval))
         + left_block(left)
         + assumed_block(run)
         + f"{CHECKED_IN_USE_HEADING}\n\n{verified.markdown(images)}\n\n"
+        + measurement_section
         + review.markdown()
         + (f"\n\nHeld as a draft: {held}." if held else "")
         + f"\n\n## Checks\n\nAll passed after {util.count(attempts, 'attempt')}: {checks}\n\n"
@@ -2992,7 +3000,17 @@ def synced_pr_body(run: Run, pr: str, body: str, t: tracker.Ticket, left: str) -
     return (wanted if had else ""), public_text(run, left_synced)
 
 
-def sync_pr_bodies(run, t, with_prs, opened, standing, pushed, report, left, link, stops=None, committed=True):
+def publish_unverified_measurement(run: Run, t: tracker.Ticket, pr: str, section: str) -> None:
+    body = gh.pr_body(pr)
+    links = (run.tracker.pr_link(t, whole=True), run.tracker.pr_link(t, whole=False))
+    kept, text = gh.split_link(body, links)
+    updated = replace_gate_section(text, UNVERIFIED_REQUIREMENT_HEADING, public_text(run, section))
+    if gh.outgoing(updated, kept) != body:
+        gh.pr_edit_body(pr, updated, link=kept)
+
+
+def sync_pr_bodies(run, t, with_prs, opened, standing, pushed, report, left, link, stops=None, committed=True, *,
+                   measurement_section=""):
     stops = stops or {}
     ci_stopped = []
     for c in with_prs:
@@ -3009,6 +3027,8 @@ def sync_pr_bodies(run, t, with_prs, opened, standing, pushed, report, left, lin
         kept, text = synced_pr_body(run, c.pr, body, t, left)
         if opened:
             text = with_siblings(text, others)
+        if measurement_section and c in standing:
+            text = replace_gate_section(text, UNVERIFIED_REQUIREMENT_HEADING, public_text(run, measurement_section))
         if gh.outgoing(text, kept) != body:
             gh.pr_edit_body(c.pr, text, link=kept)
         if c in pushed and c.pr not in run.feedback_prs:
@@ -3966,7 +3986,8 @@ def update_pr_gate_evidence(run: Run, pr: str, evidence: dict, *, expected_head:
 
 
 def replace_gate_section(body: str, heading: str, section: str, *, exact: bool = False) -> str:
-    pattern = re.compile(rf"^{re.escape(heading)}\n.*?(?=^## |\Z)", re.M | re.S)
+    next_section = rf"^(?:## |{re.escape(ci.SECTION_START)}\r?$)"
+    pattern = re.compile(rf"^{re.escape(heading)}\n.*?(?={next_section}|\Z)", re.M | re.S)
     if not pattern.search(body):
         if exact:
             return f"{body}\n\n{section}" if body else section
