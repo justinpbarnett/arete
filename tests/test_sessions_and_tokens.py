@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from arete import config, gh, jev, outbound, pipeline, slots, verify, workspace
+from arete import config, gh, jev, outbound, pipeline, slots, tracker, verify, workspace
 from arete.review import Review
 
 READ_ONLY_GRANT = {"repositories": ["widgets"], "permissions": {"contents": "read"}}
@@ -98,12 +98,13 @@ class PushedPrDraftTests(unittest.TestCase):
         self.run = SimpleNamespace(id="x", repo=config.Repo(name="fixture", path=self.root), repairs="", feedback=[],
                                    tid="7", facts={}, log=self.logs.append, waiting=lambda _: nullcontext())
         self.slot = slots.RunSlot("fixture", "7", 1)
-        self.layer = SimpleNamespace(trust_level="automerge", checks={"behavior": "true"})
+        self.layer = config.RepoLayer(dir=self.root, trust_level="automerge", checks={"behavior": "true"})
         self.c = workspace.Checkout("", "fixture/repo", self.root, self.root, "main", pr=self.URL, lease=self.head)
         self.tree, self.base = "b" * 40, "c" * 40
-        self.build = SimpleNamespace(run=self.run, layer=self.layer, cfg=config.Config(), checkouts=[self.c],
-                                     ticket=SimpleNamespace(labels=[]),
-                                     checked={"tree": self.tree, "commands": self.layer.checks})
+        self.build = pipeline.Build(run=self.run, layer=self.layer, cfg=config.Config(), checkouts=[self.c],
+                                    ticket=tracker.Ticket("7", "#7", "Fixture"), ws=self.root, workspace="fixture",
+                                    timeout=0, tools=[], deny=[],
+                                    checked={"tree": self.tree, "commands": self.layer.checks})
         self.verified = verify.Verified("pass", checks=[{"passed": True}], native_trees={"": self.tree})
         self.review = Review(verdict="approve", trees={"": self.tree})
         for patch in (mock.patch.object(gh, "gh", self.fake_gh),
