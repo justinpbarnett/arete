@@ -77,6 +77,7 @@ def policy_fingerprint(cfg, layer, closed_context, *, resume=False):
 
 class Controller:
     merge_lease: TextIO | None = None
+    starts_new_lineage = False
 
     def __init__(self, flow):
         self.flow, self.job = flow, flow.ctx
@@ -137,8 +138,12 @@ class Controller:
 
     def write_lineage_event(self):
         if event := self.data.get("lineage_event"):
+            started = {"new_lineage": True} if event.get("new_lineage") else {}
             run_lines.write(event["run"], "lineage", event_id=event["event_id"], old=event["old"], new=event["new"],
-                            engine_commit=event["engine_commit"])
+                            engine_commit=event["engine_commit"], **started)
+            if started:
+                self.run.log("lineage: started a new controller lineage; " + ", ".join(
+                    f"{key} {event['old'][key]} → {event['new'][key]}" for key in event["old"]))
             del self.data["lineage_event"]
             ledger.save(self.lease, self.data)
 
@@ -166,6 +171,8 @@ class Controller:
             self.job.layer = pipeline.checked_layer(self.job.cfg, layer_dir, source_file=source_file)
             self.run.cfg, self.run.layer, self.run.kind = self.job.cfg, self.job.layer, prepared["ticket"]["kind"]
             self.lineage()
+            if self.starts_new_lineage:
+                self.discard_gate_state()
             if restore_prs:
                 if ending := self.restore_pr_targets(prepared):
                     return ending
@@ -287,7 +294,8 @@ class Controller:
         if old_lineage:
             self.data["lineage_event"] = {"run": self.run.id, "event_id": uuid4().hex, "old": old_lineage,
                                           "new": {key: lineage[key] for key in old_lineage},
-                                          "engine_commit": util.engine_commit()}
+                                          "engine_commit": util.engine_commit(),
+                                          **({"new_lineage": True} if old_lineage.keys() - REFRESHABLE_LINEAGE else {})}
         self.persist()
         self.write_lineage_event()
         return None
@@ -434,7 +442,21 @@ class Controller:
         launch = {"config_sha": delegation.settings_sha(job.cfg), "layer_sha": delegation.settings_sha(job.layer)}
         delegation.check_policy(launch, job.cfg, layer)
 
+    def discard_gate_state(self):
+        self.data["stale_actions"] = sorted({*self.data.get("stale_actions", ()),
+                                             *(action["id"] for action in ledger.actions(self.lease))})
+        self.data["evidence"] = {}
+        self.data["review"] = pipeline.Review.stored({}).asdict()
+        self.data["verified"] = asdict(Verified("unverified"))
+        for name in ("checked", "report"):
+            self.data.pop(name, None)
+        if "job" in self.data:
+            self.data["job"] = {**self.data["job"], "reviews": 0, "ci_result": ""}
+
     def lineage(self):
+        tid = str(getattr(self.run, "tid", ""))
+        pinned = pilot.is_pilot_task(tid) or zte.reserved(tid)
+        restarts = not pinned and any(c.get("pr") for c in self.data.get("prepared", {}).get("checkouts", ()))
         self.catalog = Catalog(self.job)
         policy = self.policy_sha()
         saved_policy = self.data.get("policy_sha")
@@ -447,10 +469,11 @@ class Controller:
                  "run_settings": ledger.digest([self.run.overrides, self.run.step_overrides])}
         old = {key: self.data[key] for key, value in found.items() if key in self.data and self.data[key] != value}
         changes = ", ".join(f"{key} changed ({str(value)[:8]} → {found[key][:8]})" for key, value in old.items())
-        if old.keys() - REFRESHABLE_LINEAGE:
+        if old.keys() - REFRESHABLE_LINEAGE and not restarts:
             raise factory.Refused(f"{changes}; reconcile before resuming")
         if why := self.continuation_blocker(decision_boundary=bool(old)):
             raise factory.Refused(f"{changes}; {why}; reconcile before resuming" if old else why)
+        self.starts_new_lineage = bool(old.keys() - REFRESHABLE_LINEAGE)
         return found, old
 
     def ci_failures(self, current):
@@ -494,8 +517,11 @@ class Controller:
         for turn in ledger.pending(self.lease):
             ledger.reject(self.lease, turn["id"], "interrupted controller turn; admitted usage may be unknown")
         catch_up = self.data.get("catch_up_hold", {})
+        stale = set(self.data.get("stale_actions", ()))
         for action in ledger.actions(self.lease):
             result = action["result"]
+            gate = {"checks.run": "checks", "verification.run": "verify", "review.run": "review"}.get(action["op"])
+            old_gate = bool(gate) and action["id"] in stale
             if action["id"] == catch_up.get("action"):
                 self.data["evidence"] = {}
             if action["op"] == "owner.ask" and result.get("awaiting_owner"):
@@ -506,18 +532,16 @@ class Controller:
                 state = "reconciliation-required" if action["op"] == "publication.request" else "interrupted"
                 ledger.transition(self.lease, action["id"], state,
                                   {**result, "error": "execution interrupted; usage may be unknown", "usage_unknown": True})
-            if result.get("text"):
+            if result.get("text") and not old_gate:
                 self.catalog.add_context(action["id"], result["text"])
-            gate = {"checks.run": "checks", "verification.run": "verify", "review.run": "review"}.get(action["op"])
-            if gate and action["state"] != "accepted":
+            if gate and not old_gate and action["state"] != "accepted":
                 self.data.setdefault("evidence", {}).pop(gate, None)
             if action["state"] == "succeeded":
                 if result.get("writing"):
                     self.job.build_summary = self.job.b.build_summary = result.get("text", self.job.build_summary)
                 elif result.get("effective", {}).get("prompt_id", "").removeprefix("prompt:") == "plan":
                     self.job.plan_text = self.job.b.plan_text = result.get("text", self.job.plan_text)
-                gate = {"checks.run": "checks", "verification.run": "verify", "review.run": "review"}.get(action["op"])
-                if gate and result.get("evidence"):
+                if gate and not old_gate and result.get("evidence"):
                     self.data.setdefault("evidence", {})[gate] = result["evidence"]
                     if gate == "checks":
                         self.job.b.checked, self.job.b.report = result.get("checked", {}), result.get("report", "")

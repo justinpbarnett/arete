@@ -1150,6 +1150,164 @@ class OrchestrationLineageTests(Isolated):
                                      [] if launched else [self.ticket])
 
 
+class PolicyRestartLineageTests(Isolated):
+    PR = "https://github.com/owner/project/pull/1"
+    GATES = (("checks.run", "checks"), ("verification.run", "verify"), ("review.run", "review"))
+    OLD_POLICY = "0" * 64
+
+    def setUp(self):
+        super().setUp()
+        for target, name, value in ((pipeline, "workspace_note", "Fixture workspace"), (factory, "fingerprint", "fixture-tree"),
+                                    (gh, "pr_merge_details", {"state": "OPEN", "baseRefName": "main"}),
+                                    (workspace, "fetch", None), (pipeline, "merge_moved_bases", []),
+                                    (workspace, "kept_work", ""), (workspace, "scratch_held", []),
+                                    (flows.Job, "reclaim", "")):
+            self.patches.enter_context(patch.object(target, name, return_value=value))
+        worktree = paths.WORKTREES_DIR / "fixture-revision"
+        (worktree / ".git").mkdir(parents=True)
+        self.checkout = workspace.Checkout("", "owner/project", self.repo.path, worktree, "main", self.PR, "fixture-head")
+
+    def controller(self, previous=""):
+        run = self.made_run(previous)
+        run.path = "orchestrate"
+        return orchestration.Controller(flows.start(self.cfg, run, {}, continues=previous))
+
+    def action(self, controller, op, args, state="accepted", **result):
+        lease = controller.lease
+        turn = ledger.begin(lease, {}, 100)
+        action, = ledger.accept(lease, turn, ledger.snapshot(lease)["version"],
+                                {"calls": [{"op": op, "args": OPERATIONS[op].arguments(args)}]}, 100)
+        if state != "accepted":
+            ledger.transition(lease, action["id"], state, result)
+        return action
+
+    def saved(self):
+        controller = self.controller()
+        prepared = factory.Outcome("pass", data={
+            "layer": str(self.repo.layer_dir), "checkouts": [self.checkout.to_row()],
+            "ticket": asdict(self.local.get(self.ticket)), "branch": "fixture", "add_dirs": [], "attachments": "",
+            "expertise": "", "triage": "",
+        })
+
+        def prepare_step(*args, **kwargs):
+            controller.job.take("prepare", prepared, stored=False)
+            return prepared
+
+        with patch.object(controller, "atomic", side_effect=prepare_step):
+            self.assertIsNone(controller.prepare())
+        evidence, produced = {}, {}
+        args = {"checks": {"scope": "full"}, "verify": {"route_id": "verify", "effort": "low"},
+                "review": {"route_id": "review", "effort": "low"}}
+        for op, gate in self.GATES:
+            evidence[gate] = {"tree": "old-tree", "policy": self.OLD_POLICY, "result": {"summary": f"old {gate}"},
+                              "acceptance": controller.data["acceptance"], "producer": "d0000-0",
+                              "observed": "2026-11-20T00:00:00Z"}
+            action = self.action(controller, op, args[gate], "succeeded", text=f"old {gate}", evidence=evidence[gate])
+            produced[gate] = action["id"]
+        job = controller.job
+        job.review = pipeline.Review.stored({"verdict": "approve", "summary": "old review", "problems": []})
+        job.verified, job.reviews, job.ci_result = pipeline.verify.Verified("pass", "old verify"), 1, "old ci"
+        controller.data.update(evidence=evidence, checked={"tree": "old-tree"}, report="old checks",
+                               policy_sha=self.OLD_POLICY)
+        controller.persist()
+        record.move(controller.run.id, "failed", ("running",))
+        return controller, produced
+
+    def audits(self, controller):
+        return [line for line in run_lines.read(controller.run.id) if line["event"] == "lineage"]
+
+    def rerun_gates(self, controller, results):
+        atomic_calls = []
+
+        def atomic(name, **kwargs):
+            atomic_calls.append(name)
+            controller.job.take(name, results[name], stored=False)
+            return results[name]
+
+        with (patch.object(controller, "atomic", side_effect=atomic),
+              patch.object(orchestration.Catalog, "route", side_effect=lambda key, effort, roles: SimpleNamespace(step=roles[0]))):
+            for (op, gate), args in zip(self.GATES, ({"scope": "full"}, {"route_id": "verify", "effort": "low"},
+                                                     {"route_id": "review", "effort": "low"})):
+                done = self.action(controller, op, args)
+                self.assertIsNone(controller.dispatch(done))
+        return atomic_calls
+
+    def test_changed_policy_at_a_decision_boundary_reruns_every_gate_before_the_merge_gate(self):
+        prior, produced = self.saved()
+        resumed = self.controller(prior.run.id)
+        self.assertIsNone(resumed.prepare())
+
+        self.assertEqual(resumed.data["policy_sha"], resumed.policy_sha())
+        self.assertNotEqual(resumed.data["policy_sha"], self.OLD_POLICY)
+        self.assertEqual(resumed.data["evidence"], {})
+        self.assertEqual((resumed.job.review.verdict, resumed.job.verified.verdict), (None, "unverified"))
+        self.assertEqual((resumed.job.b.checked, resumed.job.b.report, resumed.job.reviews, resumed.job.ci_result),
+                         ({}, "", 0, ""))
+        self.assertEqual([c.pr for c in resumed.job.checkouts], [self.PR])
+        self.assertTrue((self.checkout.wt / ".git").exists())
+        for gate in produced:
+            self.assertFalse(resumed.current(gate))
+            self.assertNotIn(produced[gate], resumed.catalog.context)
+        with self.assertRaisesRegex(ValueError, "publication needs current evidence: checks, review, verify"):
+            resumed.publish()
+
+        fresh = {
+            "checks": factory.Outcome("pass", data={"full": True, "report": "fresh checks",
+                                                    "checked": {"tree": "fresh-tree", "commands": {}}}),
+            "verify": factory.Outcome("pass", data={"verified": {"verdict": "pass", "summary": "fresh verify"},
+                                                    "names": []}),
+            "review": factory.Outcome("pass", data={"review": {"verdict": "approve", "summary": "fresh review",
+                                                               "problems": []}, "attempt": 1}),
+        }
+        self.assertEqual(self.rerun_gates(resumed, fresh), ["checks", "verify", "review"])
+        for gate, old_action in produced.items():
+            self.assertTrue(resumed.current(gate))
+            self.assertNotEqual(resumed.data["evidence"][gate]["producer"], old_action)
+        self.assertNotIn("old", json.dumps(resumed.data["evidence"]))
+
+        with (patch.object(pipeline, "automerge_allowed", return_value=True),
+              patch.object(pipeline, "try_automerge", return_value=None) as merge,
+              patch.object(resumed, "take_merge_lease")):
+            self.assertIsNone(resumed.automerge([resumed.job.checkouts[0]]))
+        _, checkout, verified, review, _ = merge.call_args.args
+        self.assertEqual((checkout.pr, verified.summary, review.summary), (self.PR, "fresh verify", "fresh review"))
+        self.assertEqual(resumed.job.b.report, "fresh checks")
+        self.assertEqual(resumed.job.b.checked["tree"], "fresh-tree")
+
+    def test_changed_policy_with_a_live_worker_or_unfinished_action_is_still_refused(self):
+        for state, live in (("running", True), ("accepted", False)):
+            with self.subTest(state=state):
+                prior, produced = self.saved()
+                self.action(prior, "worker.start", {"route_id": "model:build:0", "effort": "low", "goal": "Revise."},
+                            state, pid=4242, identity="fixture")
+                resumed = self.controller(prior.run.id)
+                with (patch.object(delegation, "live", return_value=live),
+                      self.assertRaisesRegex(factory.Refused, r"policy_sha changed \(00000000 → .*; .*; reconcile before resuming")):
+                    resumed.prepare()
+                self.assertEqual(self.audits(resumed), [])
+                data = ledger.snapshot(resumed.lease)["data"]
+                self.assertEqual(data["policy_sha"], self.OLD_POLICY)
+                self.assertEqual(set(data["evidence"]), set(produced))
+                self.assertNotIn("stale_actions", data)
+
+    def test_new_lineage_writes_one_lineage_event_naming_policy_sha(self):
+        prior, _ = self.saved()
+        resumed = self.controller(prior.run.id)
+        self.assertIsNone(resumed.prepare())
+        audit, = self.audits(resumed)
+        self.assertEqual(audit["old"], {"policy_sha": self.OLD_POLICY})
+        self.assertEqual(audit["new"], {"policy_sha": resumed.policy_sha()})
+        self.assertTrue(audit["new_lineage"])
+        self.assertEqual((resumed.run.dir / "run.log").read_text().count("started a new controller lineage"), 1)
+        self.assertNotIn("lineage_event", ledger.snapshot(resumed.lease)["data"])
+
+        record.move(resumed.run.id, "interrupted", ("running",))
+        repeated = self.controller(resumed.run.id)
+        self.assertIsNone(repeated.prepare())
+        self.assertEqual(self.audits(repeated), [])
+        self.assertEqual(self.audits(resumed), [audit])
+
+
 class OrchestrationWaitTests(Isolated):
     def setUp(self):
         super().setUp()
