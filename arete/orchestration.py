@@ -1570,6 +1570,8 @@ class Controller:
         self.persist()
         run_lines.write(self.run.id, "action", action=action["id"], op=action["op"],
                         state="running" if result is None else "failed" if "error" in result else "succeeded")
+        if isinstance(refusal, prompt_loader.MissingInputs):
+            raise refusal
         return refusal
 
     def drive(self):

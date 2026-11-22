@@ -9238,6 +9238,109 @@ class PromptSnapshotTests(unittest.TestCase):
         self.assertEqual(prompt_loader.prompt("x", self.prompts, one="1"), "deployed 1")
 
 
+class MissingPromptInputsTests(unittest.TestCase):
+    message = "prompt x: missing inputs: two"
+
+    def test_prompt_reports_missing_inputs_as_value_error(self):
+        with TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            folder = Path(directory)
+            (folder / "x.md").write_text("a $one $two")
+
+            with self.assertRaises(prompt_loader.MissingInputs) as raised:
+                prompt_loader.prompt("x", folder, one="1")
+
+        self.assertEqual(str(raised.exception), self.message)
+        self.assertIsInstance(raised.exception, ValueError)
+
+    def scratch_state(self):
+        root = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True))).resolve()
+        self.enterContext(mock.patch.multiple(paths, STATE_DIR=root, DB_FILE=root / "arete.db",
+                                             RUNS_DIR=root / "runs", LOCKS_DIR=root / "locks",
+                                             WORKTREES_DIR=root / "worktrees", LOG_DIR=root / "logs"))
+        with redirect_stdout(StringIO()):
+            db.migrate()
+        return root
+
+    def worker_start(self, error, run=None):
+        if run is None:
+            self.scratch_state()
+            run = SimpleNamespace(id=self.id())
+        controller = object.__new__(orchestration.Controller)
+        controller.run = run
+        controller.lease = ledger.acquire(controller.run.id, "", {})
+        controller.perform = mock.Mock(side_effect=error)
+        controller.persist = mock.Mock()
+        version = ledger.snapshot(controller.lease)["version"]
+        turn = ledger.begin(controller.lease, {}, 1)
+        action, = ledger.accept(controller.lease, turn, version, {"calls": [{"op": "worker.start", "args": {}}]}, 1)
+        return controller, action
+
+    def assert_failed_action(self, controller, action, error):
+        saved, = ledger.actions(controller.lease)
+        self.assertEqual((saved["id"], saved["state"], saved["result"]["error"]), (action["id"], "failed", str(error)))
+        line, = orchestration.run_lines.read(controller.run.id)
+        self.assertEqual((line["event"], line["action"], line["op"], line["state"]),
+                         ("action", action["id"], "worker.start", "failed"))
+
+    def test_dispatch_records_and_reraises_missing_inputs(self):
+        error = prompt_loader.MissingInputs(self.message)
+        controller, action = self.worker_start(error)
+
+        with self.assertRaises(prompt_loader.MissingInputs) as raised:
+            controller.dispatch(action)
+
+        self.assertIs(raised.exception, error)
+        self.assert_failed_action(controller, action, error)
+
+    def test_dispatch_records_and_returns_plain_value_error(self):
+        error = ValueError("a dependency has not succeeded")
+        controller, action = self.worker_start(error)
+
+        self.assertIs(controller.dispatch(action), error)
+        self.assert_failed_action(controller, action, error)
+
+    def test_missing_inputs_is_an_engine_crash(self):
+        self.assertEqual(pipeline.crash_failure(prompt_loader.MissingInputs(self.message)),
+                         {"class": "environment", "reason": "engine-crash"})
+
+    def test_scheduled_zte_worker_start_persists_engine_crash(self):
+        from arete import zte
+        from arete.store import zte as zte_store
+
+        root = self.scratch_state()
+        repo = config.Repo("fixture", root, parts=[config.Part("", "owner/fixture")])
+        cfg = config.Config(repos=[repo])
+        deadline = util.iso(util.now() + timedelta(minutes=10))
+        reserved = zte_store.reserve("fixture-policy", repo.name, "a" * 40, deadline,
+                                     "Fixture ZTE task", "fix", "Fixture ZTE specification", {"task_version": 1})
+        grant = zte_store.transition(reserved, "dispatching")
+        slot_lock = pipeline.run_store.run_lock("slot", repo.name, grant.task)
+
+        def drive(flow):
+            self.assertTrue(util.lock_is_held(slot_lock))
+            controller, action = self.worker_start(prompt_loader.MissingInputs(self.message), flow.ctx.run)
+            return controller.dispatch(action)
+
+        script = pipeline.Script("orchestrate", drive)
+        self.addCleanup(signal.signal, signal.SIGTERM, signal.getsignal(signal.SIGTERM))
+        with (mock.patch.object(config, "load", return_value=cfg),
+              mock.patch.multiple(zte, INTERLOCK="fixture-zte", PAUSE_FILE=root / "pause"),
+              mock.patch.object(zte, "admit_run", return_value=grant),
+              mock.patch.object(zte, "require_launch_base"),
+              mock.patch.object(zte, "active"),
+              mock.patch.object(zte, "task_version", return_value=grant.data["task_version"]),
+              mock.patch.multiple(pipeline.scratch, process_ids=dict, service_labels=dict, RUN_BASELINES={}, RUN_LABELS={}),
+              principals.acting("rule:poll"), redirect_stdout(StringIO())):
+            result = pipeline.run_issue(repo.name, grant.task, script=script)
+
+        self.assertNotEqual(result, 0)
+        saved, = pipeline.run_store.ticket_runs(repo.name, grant.task)
+        self.assertEqual(zte_store.find(grant.task).data["run"], saved["id"])
+        self.assertEqual(saved["status"], "failed")
+        self.assertEqual(json.loads(saved["failure"] or "{}"), {"class": "environment", "reason": "engine-crash"})
+        self.assertFalse(util.lock_is_held(slot_lock))
+
+
 class ReviewRepairPromptTests(unittest.TestCase):
     brief = prompt_loader.Brief("fixture", "test checkout", "#817", "Review and repair", "Cover analogous paths.")
 
