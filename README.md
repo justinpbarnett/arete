@@ -1472,11 +1472,13 @@ Each `arete steps` line also holds `chain`, `fallback` and `routes`. `chain` is 
 | credential | meaning |
 |---|---|
 | `cli_login` | the claude or codex CLI on its login (free) |
-| `cli_key` | codex on an API key (paid) |
+| `cli_key` | the codex or claude CLI on an API key (paid), including the claude CLI on an OpenRouter key |
 | `pi_login` | a pi subscription login, such as `openai-codex/<model>` (free); Claude models have none |
 | `pi_oauth` | a pi OAuth login that pays per use, such as OpenRouter's (paid) |
 | `pi_key` | a pi key, such as `anthropic/<model>` on an Anthropic Console key (paid) |
 | `local` | a model on a `local_providers` provider or a local base URL (free) |
+
+Use `{ runner = "claude", provider = "openrouter", model = "deepseek/deepseek-v4.1-flash-1017" }` as a tier link to run an OpenRouter model through the local claude CLI. Set `OPENROUTER_API_KEY` in the runner keys file or environment and set the step's `instructions = ["repo"]` to load repo instructions. The route uses a config folder in the run and keeps its sessions on the same route. It uses the same quote as the corresponding pi OpenRouter route and applies that quote to input, cache and output usage.
 
 A step can declare what a route must offer (`modalities`, `min_context`, `structured_output`, `data_handling`, `floor`, `directory_cleanup`). Route capabilities come from owner tables, `[routing.capabilities."<model>"]` or `[routing.capabilities."<runner>:<model>"]`, keyed like `[pricing.models]`, with `modalities` (names), `context` (tokens), `structured_output` (true or false) and `data_handling` (one label of your own). A layer's table overrides the engine's field by field. They win over two provider sources: pi's `models.json` (`input` and `contextWindow`) and, for `openrouter/...` routes still missing a field, OpenRouter's public list (`architecture.input_modalities`, `context_length`, `supported_parameters`). Data handling comes only from your tables. An unknown capability that the step requires makes the route `ineligible`; its `detail` lists every unmet requirement. `routes` then also carries `capabilities`, each field with its `source` (`config`, `models.json` or `openrouter`), and `arete steps` adds `selection`: the route a run would take, the `skipped` routes with reasons, `requires`, `request_tokens` and `error`.
 
@@ -1545,7 +1547,7 @@ Config load and step resolution refuse, in one line that names the table: a `[ro
 
 ### Price snapshots
 
-An owner can import one normalized price and lifecycle snapshot: `arete prices import FILE`. It is a reference quote only. It orders paid routes and goes into records. It never changes charged cost, budgets, route state, eligibility, `payment_modes`, tiers or `config.toml`, and it fetches nothing. Rankings, candidate lists and real tariffs stay in your private layer or files.
+An owner can import one normalized price and lifecycle snapshot with `arete prices import FILE`. Snapshot quotes order paid routes and go into records. The Claude CLI route on OpenRouter also uses the selected quote to meter its usage. The import reads a local file. Rankings, candidate lists and real tariffs stay in your private layer or files.
 
 One JSON object. Unknown keys, wrong types, negative, `NaN` or infinite prices, a name used twice and a rate with no component are refused in one line naming the place.
 
