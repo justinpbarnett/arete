@@ -151,8 +151,11 @@ def at_default(f, value) -> bool:
 
 def explicit(value):
     if is_dataclass(value) and not isinstance(value, type):
-        return {f.name: explicit(getattr(value, f.name)) for f in fields(value)
+        data = {f.name: explicit(getattr(value, f.name)) for f in fields(value)
                 if not at_default(f, getattr(value, f.name))}
+        if isinstance(value, (config.Config, config.RepoLayer)):
+            return config.policy_dict(value, data)
+        return data
     if isinstance(value, (list, tuple)):
         return [explicit(v) for v in value]
     if isinstance(value, dict):
@@ -178,12 +181,14 @@ def settings_sha(value) -> str:
 
 
 def settings_shas(value) -> set[str]:
-    return {settings_sha(value), worker_settings_digest(value, asdict)}
+    return {settings_sha(value), worker_settings_digest(value, config.policy_dict), worker_settings_digest(value, asdict)}
 
 
 def legacy_settings_shas(cfg: config.Config) -> set[str]:
     return {settings_digest(explicit(cfg)), settings_digest(asdict(cfg)),
+            settings_digest(config.policy_dict(cfg)),
             worker_settings_digest(cfg, explicit, include_check_limit=True),
+            worker_settings_digest(cfg, config.policy_dict, include_check_limit=True),
             worker_settings_digest(cfg, asdict, include_check_limit=True)}
 
 

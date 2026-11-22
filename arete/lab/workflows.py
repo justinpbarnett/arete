@@ -47,8 +47,8 @@ def designed(data: dict, carried=None, follow=False):
 
 
 def fingerprint(cfg, layer):
-    return experiment.sha_json({"config": json.loads(json.dumps(asdict(cfg), default=str)),
-        "layer": json.loads(json.dumps(asdict(layer), default=str)),
+    return experiment.sha_json({"config": json.loads(json.dumps(config.policy_dict(cfg), default=str)),
+        "layer": json.loads(json.dumps(config.policy_dict(layer), default=str)),
         "prompts": {path.name: experiment.sha(path.read_bytes()) for path in sorted(paths.PROMPTS_DIR.glob("*.md"))}})
 
 

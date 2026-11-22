@@ -3,16 +3,21 @@ from __future__ import annotations
 import http.client
 import json
 import math
+import os
 import re
 import urllib.request
 from dataclasses import dataclass, replace
 from datetime import UTC, timedelta
+from typing import TYPE_CHECKING
 
 from . import accounts, claude, codex, config, devices, environment, paths, pi, prices, sandbox, scrub, util
 from .agent import REPLAY, TRAITS, model_scope, traits_of
 from .store import db as foundation
 from .store import devices as devices_store
 from .store import runs as run_store
+
+if TYPE_CHECKING:
+    from .steps import Settings
 
 RUNNERS = tuple(TRAITS)
 CODEX_NAMES = ("gpt-", "codex-")
@@ -85,6 +90,10 @@ class Quote:
     def total(self) -> float | None:
         return None if self.input is None or self.output is None else util.nonnegative_number(self.input + self.output)
 
+    @property
+    def rates(self) -> tuple:
+        return self.input, self.output, self.cache_read, self.cache_write
+
 
 @dataclass(frozen=True)
 class Candidate:
@@ -155,8 +164,17 @@ def nearest_effort(which: str, effort: str) -> str:
     return lower[-1] if lower else ""
 
 
+def claude_openrouter(which: str, provider: str) -> bool:
+    return which == "claude" and provider == OPENROUTER_PROVIDER
+
+
+def way_identity(found: Way | Candidate) -> tuple[str, str]:
+    provider = found.link.provider if isinstance(found, Way) else found.provider
+    return identity(found.runner, found.model, provider)
+
+
 def way_key(found: Way | Candidate) -> tuple:
-    return found.runner, identity(found.runner, found.model), found.credential
+    return found.runner, way_identity(found), found.credential
 
 
 def route_key(found: Candidate) -> tuple:
@@ -168,9 +186,11 @@ def claude_id(name: str) -> str:
     return CLAUDE_PI_MODELS.get(name, name)
 
 
-def identity(which: str, model: str) -> tuple[str, str]:
+def identity(which: str, model: str, provider: str = "") -> tuple[str, str]:
     name = model.lower()
     if which == "claude":
+        if claude_openrouter(which, provider):
+            return OPENROUTER_PROVIDER, name
         return "anthropic", claude_id(name)
     if which == "codex":
         return "openai", name
@@ -185,7 +205,8 @@ def identity(which: str, model: str) -> tuple[str, str]:
 
 def source_route(source: dict) -> tuple[str, str, str]:
     which, name = route(source.get("model", ""), source.get("runner", ""))
-    provider = source.get("provider", "") or provider_of(name)
+    inferred = provider_of(name)
+    provider = source.get("provider", "") or ("" if claude_openrouter(which, inferred) else inferred)
     if which == "pi" and source.get("provider") and not name.startswith(f"{provider}/"):
         name = f"{provider}/{name}"
     return which, name, provider
@@ -201,7 +222,8 @@ def entry_problem(entry: dict) -> str:
     lowered = name.lower()
     wrong = False
     if which == "claude":
-        wrong = "/" in name or lowered.startswith(CODEX_NAMES) or provider not in ("", "anthropic")
+        wrong = not claude_openrouter(which, provider) and (
+            "/" in name or lowered.startswith(CODEX_NAMES) or provider not in ("", "anthropic"))
     elif which == "codex":
         wrong = (lowered.startswith("claude-") or model_scope(name).removeprefix("model:") in CLAUDE_FAMILIES
                  or "/" in name or provider not in ("", "openai"))
@@ -218,6 +240,7 @@ def payment_of(credential: str, auth_mode: str = "") -> str:
 
 def incompatible(way: Way, settings, device: devices.Device) -> str:
     traits = traits_of(way.runner)
+    scopes = ("repo",) if claude_openrouter(way.runner, way.link.provider) else traits.instruction_scopes
     wanted = settings.instructions_on(way.runner)
     if settings.requires.delegation_only and not traits.delegation_only:
         return f"{way.runner} has no tool-free controller profile"
@@ -225,7 +248,7 @@ def incompatible(way: Way, settings, device: devices.Device) -> str:
         return traits.cannot_gate
     if not traits.takes_mcp and settings.mcp:
         return f"mcp {', '.join(settings.mcp)} cannot load on {way.runner}, which runs with --no-mcp"
-    if wanted and not traits.instruction_scopes:
+    if wanted and not scopes:
         return f"instructions {', '.join(wanted)} cannot load on {way.runner}"
     if (not traits.takes_mcp and (WRITING_TOOLS & set(settings.tools) or "Bash" in settings.tools
                                   or settings.requires.directory_cleanup) and not sandbox.can_confine(device.remote)):
@@ -236,7 +259,7 @@ def incompatible(way: Way, settings, device: devices.Device) -> str:
         return f"tools leave out {', '.join(missing)}, which {way.runner} always grants"
     if traits.cannot_stop and fallback and (loose := [d for d in settings.denied if d not in NO_GIT_WRITES]):
         return f"{way.runner} cannot hold the denial of {', '.join(loose)}"
-    if traits.instruction_scopes and (refused := [i for i in wanted if i not in traits.instruction_scopes]):
+    if scopes and (refused := [i for i in wanted if i not in scopes]):
         return (f"instructions {', '.join(refused)} cannot load on {way.runner}, which runs without your own "
                 f"{way.runner} setup")
     return ""
@@ -293,11 +316,11 @@ def limit_scopes(auth: accounts.Auth, model: str) -> tuple[str, ...]:
 
 
 def pi_route(model: str, cfg: config.Config, repo=None, device="local", connect=foundation.reader,
-             mode: str = "") -> pi.Route | None:
+             mode: str = "", *, source=None) -> pi.Route | None:
     if devices.resolve(device).remote:
         return pi.Route(provider_of(model), model, accounts.Auth(), error=pi.REMOTE_AUTH_UNVERIFIED)
     return pi.select(model, environment.passed(cfg, repo), cfg.environment.providers,
-                     held=lambda auth, name: auth_hold(auth, name, connect), mode=mode,
+                     held=lambda auth, name: auth_hold(auth, name, connect), mode=mode, source=source,
                      local_providers=cfg.local_providers)
 
 
@@ -423,25 +446,29 @@ def paid_for(cfg: config.Config, repo: config.Repo | None,
     try:
         return config.allowed_paid_routes(cfg, layer or (config.load_layer(repo.layer_dir) if repo else None))
     except (ValueError, TypeError, OSError):
-        return cfg.paid
+        return cfg.routing.paid
 
 
-def policy_fit(which: str, modes: tuple[str, ...]) -> str:
-    possible = traits_of(which).payment_modes
+def policy_fit(which: str, modes: tuple[str, ...], possible: tuple[str, ...] | None = None) -> str:
+    possible = traits_of(which).payment_modes if possible is None else possible
     if not possible or any(m in modes for m in possible):
         return ""
     return f"[routing] payment_modes allows {', '.join(modes) or 'no mode'}; {which} routes are {' or '.join(possible)}"
 
 
-def fit_refusal(request: Request, device: devices.Device, modes: tuple[str, ...] | None = None) -> str:
+def fit_refusal(request: Request | Settings, device: devices.Device, modes: tuple[str, ...] | None = None) -> str:
     first = ""
     for link in request.chain if request.fallback else request.chain[:1]:
-        vendor, _ = identity(link.runner, link.model)
+        openrouter = claude_openrouter(link.runner, link.provider)
+        if openrouter and device.remote:
+            first = first or "the claude CLI on OpenRouter runs locally"
+            continue
+        vendor, _ = identity(link.runner, link.model, link.provider)
         serving = SERVES.get(vendor, (link.runner,)) if request.fallback else (link.runner,)
         for which in serving:
             way = Way(link, which, link.model, "", "")
-            why = (policy_fit(which, modes) if modes is not None else "") or device_refusal(
-                link.model, which, device) or incompatible(way, request, device)
+            why = (policy_fit(which, modes, ("api_key",) if openrouter else None) if modes is not None else "")
+            why = why or device_refusal(link.model, which, device) or incompatible(way, request, device)
             if not why:
                 return ""
             first = first or why
@@ -531,8 +558,7 @@ def paid_key(found: Candidate) -> tuple:
 class Discovery:
     def __init__(self, cfg: config.Config, repo: config.Repo | None = None, device: devices.Device | str = "local",
                  connect=foundation.reader, priced: bool = True, layer: config.RepoLayer | None = None):
-        self.declared = {key: {**cfg.capabilities.get(key, {}), **(layer.capabilities.get(key, {}) if layer else {})}
-                         for key in dict.fromkeys([*cfg.capabilities, *(layer.capabilities if layer else {})])}
+        self.declared = config.routing_for(cfg, layer).capabilities
         self.cfg = cfg
         self.repo = repo
         self.device = devices.resolve(device)
@@ -566,7 +592,11 @@ class Discovery:
         return self.remembered("codex_auth", lambda: codex.authentication(self.passing))
 
     def cli_key_route(self, way: Way | Candidate) -> pi.Route:
-        vendor, ident = identity(way.runner, way.model)
+        vendor, ident = way_identity(way)
+        if claude_openrouter(way.runner, vendor):
+            return self.remembered(f"openrouter_key:{way.model}", lambda: pi_route(
+                f"{vendor}/{way.model}", self.cfg, self.repo, self.device, self.connect, mode="api_key",
+                source={k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_OAUTH_TOKEN"}))
         return self.probe(f"{vendor}/{ident}", "api_key")
 
     def cli_key_auth(self, way: Way | Candidate) -> accounts.Auth:
@@ -593,6 +623,8 @@ class Discovery:
                 else Way(link, "codex", native, "cli_login", "free"))
 
     def requested_way(self, link: Link) -> Way:
+        if claude_openrouter(link.runner, link.provider):
+            return Way(link, "claude", link.model, "cli_key", "paid", "api_key")
         if link.runner == "pi":
             selected = self.probe(link.model, "")
             local = self.is_local(selected)
@@ -611,6 +643,8 @@ class Discovery:
     def ways(self, link: Link) -> list[Way]:
         if link.runner == REPLAY:
             return [Way(link, REPLAY, link.model, "replay", "free")]
+        if claude_openrouter(link.runner, link.provider):
+            return [] if self.device.remote else [self.requested_way(link)]
         vendor, ident = identity(link.runner, link.model)
         if vendor == "anthropic":
             native = link.model if link.runner == "claude" else link.model.partition("/")[2]
@@ -642,7 +676,9 @@ class Discovery:
     def quote(self, way: Way, request_tokens: int = 0) -> Quote:
         if not (self.priced or self.paid.capped):
             return Quote()
-        vendor, ident = identity(way.runner, way.model)
+        if claude_openrouter(way.runner, way.link.provider):
+            way = replace(way, runner="pi", model=f"{OPENROUTER_PROVIDER}/{way.model}", credential="pi_key")
+        vendor, ident = way_identity(way)
         name = f"{vendor}/{ident}" if way.credential == "cli_key" else way.model
         rate = self.cfg.pricing.get(name) or self.cfg.pricing.get(f"{way.runner}:{way.model}")
         if rate:
@@ -695,7 +731,7 @@ class Discovery:
         reasons = []
         if need.floor and not way.link.requested:
             approved = {identity(*route(m)) for m in need.approved}
-            if identity(way.runner, way.model) not in approved:
+            if way_identity(way) not in approved:
                 reasons.append(f"is not in [routing.floors] {need.floor}")
         if need.modalities:
             offered = have.get("modalities")
@@ -820,7 +856,7 @@ class Discovery:
 
     def provider(self, way: Way) -> str:
         if way.runner == "claude":
-            return "anthropic"
+            return way_identity(way)[0]
         if way.runner == "codex":
             return "openai" if way.credential == "cli_key" else "openai-codex"
         return provider_of(way.model) or way.link.provider
@@ -829,7 +865,8 @@ class Discovery:
         seen = set()
         found = []
         for link in settings.chain if settings.fallback else settings.chain[:1]:
-            ways = self.ways(link) if settings.fallback else [self.requested_way(link)]
+            ways = (self.ways(link) if settings.fallback or claude_openrouter(link.runner, link.provider)
+                    else [self.requested_way(link)])
             for way in ways:
                 key = way_key(way)
                 if key not in seen:

@@ -43,6 +43,7 @@ from .pipeline import (
     check_calls,
     check_list,
     check_script,
+    class_check_example,
     run_checks,
     use_product,
 )
@@ -724,7 +725,8 @@ def run_task(cfg: config.Config, src: Source, task: Task, prompts: Prompts, run:
         brief = prompt_loader.Brief(repo.name, workspace_text, task.name, task.title, task.prompt,
                                     comments="",
                                     attachments="", expertise=expertise, commands=commands,
-                                    max_lines=layer.max_diff_lines, denied=prompt_loader.code_list(denied_paths(layer)))
+                                    max_lines=layer.max_diff_lines, denied=prompt_loader.code_list(denied_paths(layer)),
+                                    class_check=class_check_example(run_dir, layer))
         if run.executor:
             from .lab import workflows
 

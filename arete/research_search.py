@@ -302,8 +302,8 @@ def totals(workers: list[dict], sources: list[dict]) -> dict:
 def document(cfg: config.Config, s: steps.Settings, ref: str, status: str, stop: str, limits: dict,
              workers: list[dict], sources: list[dict], ids: dict[str, str], rounds: list[dict] = ()) -> dict:
     return {"ref": ref, "at": util.iso(), "status": status, "stop": stop, "runner": s.runner, "model": s.model,
-            "tools": list(s.tools), "limits": {"workers": cfg.research_search_workers,
-                                               "share": cfg.research_search_share, **limits},
+            "tools": list(s.tools), "limits": {"workers": cfg.research.search_workers,
+                                               "share": cfg.research.search_share, **limits},
             "workers": workers, "sources": sources, "ids": ids, "totals": totals(workers, sources),
             **({"rounds": list(rounds)} if rounds else {})}
 
@@ -316,7 +316,7 @@ def worker_line(ref: str, w: dict) -> None:
 
 def caps(cfg, budget):
     left_usd, left_seconds = budget.final()
-    share = cfg.research_search_share
+    share = cfg.research.search_share
     cap_usd = min(share * left_usd, left_usd - budget.reserve_usd)
     cap_seconds = min(share * left_seconds, left_seconds - budget.reserve_seconds)
     room = not budget.short(cap_usd, cap_seconds - GRACE_SECONDS)
@@ -351,7 +351,7 @@ def worker_result(future, n, task, round_no):
 
 
 def search_workers(cfg, budget, s, plan, ref, first, round_no, cap, stage_deadline, room):
-    tasks, size = plan["tasks"], cfg.research_search_workers
+    tasks, size = plan["tasks"], cfg.research.search_workers
     outcomes: dict[int, Outcome] = {}
     allowances: dict[int, Decimal] = {}
     pending = list(range(first, first + len(tasks)))
@@ -424,7 +424,7 @@ def run(cfg: config.Config, budget: research_budget.Budget, plan: dict, ref: str
     cap_usd, cap_seconds, room = caps(cfg, budget)
     if gap and not room:
         return capped_result(ref, budget, earlier, rounds, round_no, head)
-    tasks, size = plan["tasks"], cfg.research_search_workers
+    tasks, size = plan["tasks"], cfg.research.search_workers
     cap = dec(cap_usd) if room else Decimal(0)
     stage_deadline = time.monotonic() + cap_seconds if room else 0.0
     util.log_ref(ref, f"{head}searching: {util.count(len(tasks), 'task')}, {size} workers, {s.runner} {s.model}, "

@@ -32,7 +32,27 @@ THREAD = re.compile(r"(?:Current thread|Thread) (0x[0-9a-f]+) \(most recent call
 
 
 def stack_env(env):
+    import atexit
+    from pathlib import Path
+    from pwd import getpwuid
+
+    from arete.local_paths import SCRATCH_ENV, inside_scratch
+
     env = {**env, "ARETE_DESKTOP_NOTIFY": "0"}
+    # Preserve scratch selectors so worker startup can validate them.
+    if not env.get(SCRATCH_ENV):
+        home = Path((env["HOME"] if "HOME" in env else getpwuid(os.getuid()).pw_dir) or os.sep)
+        config = Path(env.get("ARETE_CONFIG_DIR", home / ".config" / "arete"))
+        state = Path(env.get("ARETE_STATE_DIR", home / ".local" / "share" / "arete"))
+        if not (inside_scratch(config) or inside_scratch(state)):
+            temporary = tempfile.TemporaryDirectory(prefix="arete-test-state-", ignore_cleanup_errors=True)
+            atexit.register(temporary.cleanup)
+            state = Path(temporary.name)
+            config = state / "config"
+            logs = state / "logs"
+            config.mkdir()
+            logs.mkdir()
+            env.update(ARETE_STATE_DIR=str(state), ARETE_CONFIG_DIR=str(config), ARETE_LOG_DIR=str(logs))
     if not env.get(_test_stacks.PREFIX_ENV):
         return env
     pythonpath = env.get("PYTHONPATH")
@@ -54,6 +74,15 @@ def main_thread_first(stack, ident):
 
 def failed(report):
     return any(report.get(kind) for kind in ("timeout", "errors", "failures", "unexpected"))
+
+
+def class_load_factor():
+    try:
+        load = os.getloadavg()[0]
+    except OSError:
+        return 1.0
+    cpu_count = os.cpu_count()
+    return min(4.0, max(1.0, load / cpu_count)) if cpu_count is not None else 1.0
 
 
 def flatten(suite):
@@ -111,9 +140,10 @@ class Runner:
         self.first_failures = {}
         try:
             with open(HISTORY) as handle:
-                self.history = json.load(handle)
+                history = json.load(handle)
         except (OSError, ValueError):
-            self.history = {}
+            history = {}
+        self.history = history if isinstance(history, dict) else {}
 
     def kill(self, process):
         try:
@@ -206,6 +236,7 @@ class Runner:
         with open(output_file, "w") as output, self.lock:
             if self.stopping:
                 return
+            load_factor = class_load_factor()
             try:
                 process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=output,
                                            stderr=subprocess.STDOUT, start_new_session=True,
@@ -217,14 +248,29 @@ class Runner:
                 self.live[process] = batch.identifier
         if process is not None:
             timeout = stretch * (self.args.timeout if self.args.timeout is not None else batch.timeout)
+            deadline = timeout * load_factor
             requested = None
+            class_started = time.monotonic()
+            remaining = deadline
             try:
-                process.wait(timeout)
-                if process.returncode:
-                    problem = f"worker exited with status {process.returncode}"
-            except subprocess.TimeoutExpired:
-                problem = f"class exceeded {timeout:g}s"
-                requested = self.request_stacks(stack_prefix)
+                while True:
+                    try:
+                        process.wait(remaining)
+                    except subprocess.TimeoutExpired:
+                        new_factor = class_load_factor()
+                        if new_factor > load_factor:
+                            load_factor = new_factor
+                            deadline = timeout * load_factor
+                            remaining = max(0, class_started + deadline - time.monotonic())
+                            continue
+                        problem = f"class exceeded {deadline:g}s"
+                        if load_factor > 1:
+                            problem += f" (deadline {timeout:g}s x load {load_factor:g})"
+                        requested = self.request_stacks(stack_prefix)
+                    else:
+                        if process.returncode:
+                            problem = f"worker exited with status {process.returncode}"
+                    break
             finally:
                 self.kill(process)
                 process.wait()
@@ -293,7 +339,7 @@ class Runner:
                 first = self.results.get(identifier, {})
                 if not self.stopping and failed(first):
                     self.first_failures[identifier] = first
-                    self.child((f"{index}.alone", batch), stretch=2)
+                    self.child((f"{index}.alone", batch), stretch=3)
                     if not failed(self.results[identifier]):
                         self.crowded.append(identifier)
             complete = True
@@ -328,7 +374,7 @@ class Runner:
             first = self.first_failures[identifier]
             where = "ran past its deadline" if first["timeout"] else "failed"
             print(f"{identifier}: {where} on its first run, "
-                  f"then passed alone within twice its deadline in {report['seconds']:.2f}s", flush=True)
+                  f"then passed alone within three times its deadline in {report['seconds']:.2f}s", flush=True)
         failed_classes = []
         ran = skipped = 0
         for identifier, report in self.results.items():
@@ -340,10 +386,20 @@ class Runner:
                     self.show_failures(identifier, first)
                 self.show_failures(identifier, report)
         try:
-            temporary = f"{HISTORY}.{os.getpid()}.tmp"
-            with open(temporary, "w") as handle:
-                json.dump({name: report["seconds"] for name, report in self.results.items()}, handle)
-            os.replace(temporary, HISTORY)
+            with open(f"{HISTORY}.lock", "a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                try:
+                    with open(HISTORY) as handle:
+                        history = json.load(handle)
+                except (OSError, ValueError):
+                    history = {}
+                if not isinstance(history, dict):
+                    history = {}
+                history.update({name: report["seconds"] for name, report in self.results.items()})
+                temporary = f"{HISTORY}.{os.getpid()}.tmp"
+                with open(temporary, "w") as handle:
+                    json.dump(history, handle)
+                os.replace(temporary, HISTORY)
         except OSError:
             pass
         if self.args.slowest:

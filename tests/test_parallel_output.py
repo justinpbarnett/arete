@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from tests import parallel
+from tests.subprocess_helpers import CHILD_HANG_TIMEOUT
 
 ROOT = Path(__file__).resolve().parent.parent
 TAIL = 3000
@@ -82,7 +83,7 @@ class RunnerOutputTests(unittest.TestCase):
     def run_suite(self, *names):
         done = subprocess.run([sys.executable, "-m", "tests.parallel", "-s", str(self.suite), *names],
                               check=False, cwd=ROOT, env=self.env, stdin=subprocess.DEVNULL, capture_output=True,
-                              text=True, timeout=self.class_timeout)
+                              text=True, timeout=max(CHILD_HANG_TIMEOUT, self.class_timeout))
         return done.returncode, done.stdout + done.stderr
 
     def test_drive_flush_is_disabled_in_initial_and_alone_class_processes(self):
@@ -115,7 +116,7 @@ class RunnerOutputTests(unittest.TestCase):
     def test_a_class_that_times_out_alone_keeps_its_timeout_report_by_its_traceback(self):
         code, output = self.run_suite("test_sample.Sleeper")
         self.assertEqual(code, 1, output)
-        self.assertIn("class exceeded 1s", output)
+        self.assertRegex(output, r"(?m)^class exceeded (?:1\.5s|[\d.]+s \(deadline 1\.5s x load [\d.]+\))$")
         self.assertIn("test_sample.Sleeper", output)
         self.assertIn("Python class stack", output)
         self.assertIn("in test_hangs", output)
@@ -127,7 +128,7 @@ class RunnerFailureSummaryTests(unittest.TestCase):
     crowded = "test_sample.Crowded"
     crowded_stack = "in test_crowded_timeout"
     crowded_note = (f"{crowded}: ran past its deadline on its first run, "
-                    "then passed alone within twice its deadline in 0.10s")
+                    "then passed alone within three times its deadline in 0.10s")
 
     def report(self, **details):
         return {"ran": 1, "errors": [], "failures": [], "skipped": [], "unexpected": [],

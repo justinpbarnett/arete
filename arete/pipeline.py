@@ -71,6 +71,7 @@ from .store import insights as insights_store
 from .store import runs as run_store
 from .store import sources as source_store
 from .store import triage as triage_store
+from .store.db import IncompatibleSchema, NoDatabase
 from .util import git
 
 ADW = "adw"
@@ -327,6 +328,10 @@ class AgentRun:
             kw = {**s.call, **reach,
                   "resume": self.sessions.get(config.INHERITS.get(s.step, s.step), NO_SESSION)
                   if s.session == "resume" else NO_SESSION, **kw}
+        rule = f"Bash({class_check_rule(self.dir)})"
+        if rule in (kw.get("allowed_tools") or ()):
+            kw["allowed_tools"] = [tool for tool in kw["allowed_tools"] if tool != rule]
+            kw["claude_tools"] = (rule,)
         kw["extra_env"] = {**(kw.get("extra_env") or {}), **self.lane_env()}
         kw = self.fit_route(step, text, s, kw)
         run_with = kw.get("runner", "") or kw.get("resume", NO_SESSION).runner
@@ -1469,7 +1474,7 @@ def script_command(cfg: config.Config, name: str, *args: str) -> list[str]:
     script = script_file(cfg, name).resolve()
     if script.parent == paths.ADWS_DIR.resolve():
         entrypoint = (f"import sys, runpy; sys.path[:0] = {[str(paths.PACKAGE_DIR.parent), str(script.parent)]!r}; "
-                      "from arete import codebase; codebase.load(); "
+                      "from arete import codebase; codebase.load(templates=True); "
                       f"runpy.run_path({str(script)!r}, run_name='__main__')")
         return [sys.executable, "-I", "-c", entrypoint, *args]
     return sandbox.protected_command([sys.executable, str(script), *args])
@@ -1632,12 +1637,12 @@ def parent_run(script: Script | None, earlier: dict | None, budget_history: list
     return parent
 
 
-def park_run(run: Run, reason: str) -> tuple[str, str, str]:
+def park_run(run: Run, reason: str, *, comment: bool = True) -> tuple[str, str, str]:
     keep_edits(run)
-    return record_park(run, reason, kept_heads(run))
+    return record_park(run, reason, kept_heads(run), comment=comment)
 
 
-def record_park(run: Run, reason: str, held: dict) -> tuple[str, str, str]:
+def record_park(run: Run, reason: str, held: dict, *, comment: bool = True) -> tuple[str, str, str]:
     status, summary = "failed", (f"parked: {reason}; branch and evidence retained, workspace left in place"
                                  f"{', edits kept in a local commit' if held else ''}. {runlimits.RETRY}")
     kept = run.budget.park(reason, held)
@@ -1645,7 +1650,46 @@ def record_park(run: Run, reason: str, held: dict) -> tuple[str, str, str]:
     pr_url = kept["pr_url"]
     run.log(summary)
     run.enter("failed")
+    if comment:
+        body = [f"Parked: {reason}."]
+        if review_lines := parked_review_lines(run.dir):
+            body.extend(["", *review_lines, ""])
+        body.append("Change this ticket's title or body to retry; the next poll starts it again on the kept branch. "
+                    f"Run `{run.id}`.")
+        try:
+            run.say("\n".join(body), on_ticket=True)
+        except (OSError, sqlite3.Error, NoDatabase, IncompatibleSchema) as error:
+            run.log(f"tracker: {util.first_line(str(error), 300)}")
     return status, summary, pr_url
+
+
+def parked_review_lines(folder: Path) -> list[str]:
+    rounds = []
+    for path in folder.glob("review*.json"):
+        if match := re.fullmatch(r"review([2-9]|[1-9][0-9]+)?\.json", path.name):
+            rounds.append((int(match[1] or 1), path))
+
+    lines = []
+    for round_number, path in sorted(rounds):
+        try:
+            if path.is_symlink():
+                return []
+            problems = json.loads(path.read_text(encoding="utf-8"))["structured"]["problems"]
+        except (OSError, ValueError, KeyError, TypeError, RecursionError):
+            return []
+        if not isinstance(problems, list):
+            return []
+        for problem in problems:
+            if not isinstance(problem, dict):
+                return []
+            severity = problem.get("severity")
+            if severity in ("blocker", "major"):
+                file = problem.get("file", "")
+                if not isinstance(file, str):
+                    return []
+                location = f"`{file}`" if file else "(no file)"
+                lines.append(f"- Review {round_number} held on {location} ({severity})")
+    return lines
 
 
 def settle_run(run: Run, status: str, summary: str, pr_url: str, restarting: bool, flow: factory.Flow | None,
@@ -1688,7 +1732,8 @@ def worker_policy_changed() -> str:
     return record.failure(PolicyChanged("worker policy changed after action acceptance"))
 
 
-def settle_zte_refusal(repo: str, tid: str, slot: slots.RunSlot, run_id: str, error: BaseException, *, committed: bool) -> int:
+def settle_zte_failure(repo: str, tid: str, slot: slots.RunSlot, run_id: str, error: BaseException, *,
+                       committed: bool, failure: dict | None = None) -> int:
     from . import launch_lease
     from .store import db
 
@@ -1703,8 +1748,11 @@ def settle_zte_refusal(repo: str, tid: str, slot: slots.RunSlot, run_id: str, er
                     launch_lease.registered(repo, tid)
                 finally:
                     outcome = "stopped" if isinstance(error, Stopped) else "failed"
+                    fields = {"status": outcome, "finished": util.iso(), "summary": str(error)}
+                    if failure:
+                        fields.update(failure=json.dumps(failure), summary=f"crashed: {error}"[:300])
                     with db.tx(timeout=0):
-                        run_store.settle(run_id, {"status": outcome, "finished": util.iso(), "summary": str(error)})
+                        run_store.settle(run_id, fields)
         except (OSError, RuntimeError, sqlite3.Error):
             pass  # The scheduled reaper settles abandoned registered runs.
     return 2
@@ -1924,7 +1972,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                         launch_lease.registered(repo.name, str(tid))
                         check_start_cutoff()
                 except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
-                    return settle_zte_refusal(repo.name, str(tid), slot, run_id, error, committed=committed)
+                    return settle_zte_failure(repo.name, str(tid), slot, run_id, error, committed=committed)
             else:
                 run_id = start()
             scratch.RUN_BASELINES[run_id] = producer_baseline
@@ -1947,7 +1995,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 if not zte_grant:
                     slot.free()
                     raise
-                return settle_zte_refusal(repo.name, str(tid), slot, run_id, error, committed=True)
+                return settle_zte_failure(repo.name, str(tid), slot, run_id, error, committed=True)
             if held_from := earlier["id"] if restarting or run.answering else (
                     script.continues or script.repairs if script else ""):
                 run.ab_held = run_store.ab_held(held_from)
@@ -1986,7 +2034,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
             if not zte_grant:
                 raise
-            return settle_zte_refusal(repo.name, str(tid), slot, run_id, error, committed=True)
+            return settle_zte_failure(repo.name, str(tid), slot, run_id, error, committed=True)
         pr_url, passed, drive_entered, retaining_catch_up = "", None, False, False
 
         def check_work_log():
@@ -2057,23 +2105,23 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 passed = status == "step"
         except runlimits.Parked as e:
             if zte_grant:
-                return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
+                return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True)
             status, summary, pr_url = run.catch_up_cleanup_park or park_run(run, str(e))
         except factory.OnlyDone as e:
             if zte_grant:
-                return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
+                return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True)
             status, summary, passed = flows.alone(flow)
         except factory.Refused as e:
             retaining_catch_up = reconciling_catch_up
             if zte_grant:
-                return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
+                return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True)
             if run.environment_release:
                 status, summary, pr_url = environment_retry_held(run, script.continues, str(e))
             else:
                 status, summary = "failed", str(e)
         except Stopped as e:
             if zte_grant:
-                return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
+                return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True)
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
             status, summary, pr_url = "stopped", record.STOPPED, ""
             run.log(record.STOPPED)
@@ -2087,14 +2135,14 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             run.log(summary)
         except workspace.RunFailed as e:
             if zte_grant:
-                return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
+                return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True)
             if run.environment_release:
                 status, summary, pr_url = environment_retry_held(run, script.continues, e.why)
             else:
                 status, summary, pr_url = _fail(run, e.why, detail=e.detail, recovery=e.recovery)
         except tracker.ERRORS as e:
             if zte_grant:
-                return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
+                return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True)
             why = f"tracker refused {run.ref}: {e}"
             if run.environment_release:
                 status, summary, pr_url = environment_retry_held(run, script.continues, why)
@@ -2102,7 +2150,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 status, summary, pr_url = _fail(run, why)
         except Exception as e:
             if zte_grant:
-                return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
+                failure = crash_failure(e) if isinstance(e, prompt_loader.MissingInputs) else None
+                return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True, failure=failure)
             run.log(f"crashed: {type(e).__name__}: {e}")
             run.failure = crash_failure(e)
             status, summary, pr_url = "failed", f"crashed: {e}"[:300], ""
@@ -2131,7 +2180,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         except (OSError, RuntimeError, ValueError, sqlite3.Error) as e:
             if not zte_grant:
                 raise
-            return settle_zte_refusal(repo.name, str(tid), slot, run_id, e, committed=True)
+            return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True)
         if status == "skipped" and not zte_grant:
             print(f"{name} was not run: {summary}. Pass --force to run it anyway.")
         return 0 if (status in SUCCEEDED if passed is None else passed) else 1
@@ -2396,7 +2445,8 @@ def _run(cfg: config.Config, run: Run, slot: slots.RunSlot) -> tuple[str, str, s
 
     brief = prompt_loader.Brief(repo.name, workspace_text, t.ref, t.title, t.body,
                                 comments=t.comments, attachments=attachments, expertise=expertise,
-                                commands=commands, max_lines=limit, denied=prompt_loader.code_list(deny))
+                                commands=commands, max_lines=limit, denied=prompt_loader.code_list(deny),
+                                class_check=class_check_example(run.dir, layer))
 
     if run.feedback:
         feedback = feedback_markdown(run.feedback)
@@ -4406,6 +4456,7 @@ def use_product(b: TicketWork, step_name: str, prompt_name: str, role: str = "ve
                     prompt_name, surface=surface_note(v, url, evidence) + fault_controls, notes=v.notes,
                     scratch=scratch.note(attempt),
                     commands=prompt_loader.code_list(bash), checks=check_list(b.layer),
+                    env_example=verify.env_example(v.allow_bash, url) if prompt_name == "verify" else "",
                     compare=compare_with_fork(b.checkouts), owner=run.owner_note,
                     journeys=journeys.guidance(selected or feature_map), **values),
                                 b.ws, role=role,
@@ -4569,17 +4620,42 @@ def check_calls(commands: list[str]) -> str:
     return prompt_loader.code_list(commands) or NO_CHECKS
 
 
+def class_check_example(folder: Path, layer: config.RepoLayer) -> str:
+    if "classes" not in layer.targeted_commands:
+        return ""
+    return shlex.join([str(folder / CHECKS_SCRIPT), "classes", "test_x.SomeTests"])
+
+
+def class_check_rule(folder: Path) -> str:
+    return f"{shlex.quote(str(folder / CHECKS_SCRIPT))} classes *"
+
+
 def check_script(folder: Path, layer: config.RepoLayer, cwd: Path) -> tuple[list[str], list[str]]:
-    if not layer.checks:
+    classes = layer.targeted_commands.get("classes")
+    if not layer.checks and classes is None:
         return [], []
     script = folder / CHECKS_SCRIPT
+    names = list(layer.checks)
     arms = "".join(f"{shlex.quote(name)}) exec sh -c {shlex.quote(cmd)} ;;\n" for name, cmd in layer.checks.items())
-    usage = shlex.quote(f"usage: {script} NAME, where NAME is one of: {', '.join(layer.checks)}")
+    if classes is not None:
+        names.append("classes")
+        command = shlex.join(config.class_command_words(classes))
+        class_usage = shlex.quote(f"usage: {script} classes CLASS [CLASS ...]")
+        arms += ("classes)\n"
+                 f"    usage() {{ echo {class_usage} >&2; exit 2; }}\n"
+                 '    shift\n'
+                 '    [ "$#" -gt 0 ] || usage\n'
+                 '    for arg in "$@"; do\n'
+                 '        case "$arg" in ""|-*) usage ;; esac\n'
+                 '    done\n'
+                 f'    exec {command} "$@" ;;\n')
+    usage = shlex.quote(f"usage: {script} NAME, where NAME is one of: {', '.join(names)}")
     folder.mkdir(parents=True, exist_ok=True)
     script.write_text(f"#!/bin/sh\ncd {shlex.quote(str(cwd))} || exit 1\ncase \"${{1-}}\" in\n{arms}"
                       f"*) echo {usage} >&2\n   exit 2 ;;\nesac\n")
     script.chmod(0o755)
-    return [shlex.join([str(script), name]) for name in layer.checks], [f"{shlex.quote(str(script))} *"]
+    rule = f"{shlex.quote(str(script))} *" if layer.checks else class_check_rule(folder)
+    return [shlex.join([str(script), name]) for name in layer.checks], [rule]
 
 
 def cut_at_end(text: str, limit: int) -> str:

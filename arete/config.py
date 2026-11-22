@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import math
 import re
+import shlex
 import tomllib
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -10,17 +11,53 @@ from typing import Literal
 
 from . import journeys, outbound, paths, refusals, util
 
-MODEL_ROLES = ("plan", "build", "verify", "review", "learn", "uat", "miner", "apply", "eval_mine", "triage", "chat",
-               "classify", "loop", "session", "research", "research_plan", "research_search",
-               "research_synthesis", "research_audit", "explain", "document", "capture_evidence")
-MODEL_FALLBACKS = {"triage": "haiku", "chat": "opus", "classify": "haiku", "loop": "sonnet", "session": "sonnet",
-                   "research": "opus", "research_plan": "opus", "research_search": "sonnet",
-                   "research_synthesis": "opus", "research_audit": "opus", "explain": "haiku",
-                   "capture_evidence": "sonnet"}
+
+@dataclass(frozen=True)
+class Role:
+    name: str
+    fallback_model: str = ""
+    inherits: str = ""
+    reach: Literal["step", "controller"] = "step"
+    read_only: bool = False
+    web: Literal["search", "fetch", "none", ""] = ""
+    keeps_session: bool = True
+
+
+ROLES = (
+    Role("plan"),
+    Role("build"),
+    Role("verify"),
+    Role("review"),
+    Role("learn", read_only=True, keeps_session=False),
+    Role("uat", keeps_session=False),
+    Role("miner"),
+    Role("apply"),
+    Role("eval_mine"),
+    Role("triage", "haiku"),
+    Role("chat", "opus"),
+    Role("classify", "haiku"),
+    Role("loop", "sonnet"),
+    Role("session", "sonnet"),
+    Role("research", "opus"),
+    Role("research_plan", "opus", read_only=True, keeps_session=False),
+    Role("research_search", "sonnet", read_only=True, web="search", keeps_session=False),
+    Role("research_synthesis", "opus", read_only=True, web="none", keeps_session=False),
+    Role("research_audit", "opus", read_only=True, web="fetch", keeps_session=False),
+    Role("explain", "haiku"),
+    Role("document", read_only=True, keeps_session=False),
+    Role("capture_evidence", "sonnet", read_only=True, keeps_session=False),
+    Role("check_repair", inherits="build"),
+    Role("review_repair", inherits="build"),
+    Role("ci_repair", inherits="build"),
+    Role("eval_grade", inherits="verify"),
+    Role("orchestrate", inherits="plan", reach="controller"),
+)
+ROLE_BY_NAME = {role.name: role for role in ROLES}
+MODEL_ROLES = tuple(role.name for role in ROLES if not role.inherits)
+MODEL_FALLBACKS = {role.name: role.fallback_model for role in ROLES if role.fallback_model}
 STEP_ALIASES = {"implement": "build"}
-INHERITS = {"check_repair": "build", "review_repair": "build", "ci_repair": "build", "eval_grade": "verify",
-            "orchestrate": "plan"}
-STEP_ROLES = (*MODEL_ROLES, *INHERITS)
+INHERITS = {role.name: role.inherits for role in ROLES if role.inherits}
+STEP_ROLES = tuple(ROLE_BY_NAME)
 STEP_NAMES = (*STEP_ROLES, *STEP_ALIASES)
 AB_KEYS = ("step", "kind", "share", "arm")
 ARM_KEYS = ("tier", "runner", "provider", "model", "effort")
@@ -64,8 +101,10 @@ class Orchestration:
 
 def orchestration_table(data) -> Orchestration:
     defaults = Orchestration()
-    if not isinstance(data, dict) or set(data) - defaults.__dataclass_fields__.keys():
-        raise ValueError("[orchestration] contains unknown settings")
+    message = "[orchestration] contains unknown settings"
+    if not isinstance(data, dict):
+        raise ValueError(message)
+    only(data, defaults.__dataclass_fields__, "[orchestration]", message=message)
     values = {name: data.get(name, getattr(defaults, name)) for name in defaults.__dataclass_fields__}
     if any(type(value) is not int or not 0 < value <= 10000 for value in values.values()):
         raise ValueError("[orchestration] limits must be integers between 1 and 10000")
@@ -267,6 +306,32 @@ class PaidRoutes:
         return self.max_input is not None or self.max_output is not None
 
 
+@dataclass(frozen=True)
+class Routing:
+    fallback: bool = True
+    capabilities: dict[str, dict] = field(default_factory=dict)
+    floors: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    payment_modes: tuple[str, ...] | None = None
+    paid: PaidRoutes = PaidRoutes()
+
+
+@dataclass
+class ResearchConfig:
+    planner: bool = False
+    search: bool = False
+    synthesis: bool = False
+    audit: bool = False
+    search_workers: int = 3
+    search_share: float = 0.6
+
+
+@dataclass
+class CaptureConfig:
+    vision: str = ""
+    evidence_branch: str = "feedback-evidence"
+    public_evidence: bool = False
+
+
 @dataclass
 class Config:
     alert_repo: str = ""
@@ -299,29 +364,18 @@ class Config:
     session_idle_hours: float = 2
     tiers: dict[str, dict[str, tuple[dict[str, str], ...]]] = field(default_factory=dict)
     tier_map: str = ""
-    routing_fallback: bool = True
-    capabilities: dict[str, dict] = field(default_factory=dict)
-    floors: dict[str, tuple[str, ...]] = field(default_factory=dict)
-    payment_modes: tuple[str, ...] = PAYMENT_MODES
-    paid: PaidRoutes = PaidRoutes()
+    routing: Routing = field(default_factory=lambda: Routing(payment_modes=PAYMENT_MODES))
     adws: Path | None = None
     steps: dict[str, dict] = field(default_factory=dict)
     kinds: dict[str, dict[str, dict]] = field(default_factory=dict)
     mcp: dict[str, dict] = field(default_factory=dict)
-    research_planner: bool = False
-    research_search: bool = False
-    research_synthesis: bool = False
-    research_audit: bool = False
-    research_search_workers: int = 3
-    research_search_share: float = 0.6
+    research: ResearchConfig = field(default_factory=ResearchConfig)
     ask: AskConfig = field(default_factory=AskConfig)
     retention: Retention = field(default_factory=Retention)
     backup: BackupConfig = field(default_factory=BackupConfig)
     chat: ChatConfig = field(default_factory=ChatConfig)
     document: dict = field(default_factory=dict)
-    capture_vision: str = ""
-    capture_evidence_branch: str = "feedback-evidence"
-    capture_public_evidence: bool = False
+    capture: CaptureConfig = field(default_factory=CaptureConfig)
     oncall: OncallConfig = field(default_factory=OncallConfig)
     ab: dict[str, dict] = field(default_factory=dict)
     ignored: tuple[str, ...] = ()
@@ -361,6 +415,24 @@ class Config:
         return sorted(set(self.models) - set(MODEL_ROLES))
 
 
+def policy_dict(value: Config | RepoLayer, data: dict | None = None) -> dict:
+    sparse = data is not None
+    if data is None:
+        data = asdict(value)
+    routing = data.pop("routing", {})
+    if sparse and isinstance(value, Config):
+        if value.routing.payment_modes == PAYMENT_MODES:
+            routing.pop("payment_modes", None)
+        else:
+            routing.setdefault("payment_modes", value.routing.payment_modes)
+    if "fallback" in routing:
+        routing["routing_fallback"] = routing.pop("fallback")
+    data.update(routing)
+    for section in ("research", "capture"):
+        data.update({f"{section}_{name}": item for name, item in data.pop(section, {}).items()})
+    return data
+
+
 def remove_controller_only_settings(data: dict) -> None:
     for name in ("max_parallel", "max_parallel_per_repo"):
         data.pop(name, None)
@@ -385,24 +457,61 @@ def table_of(value, where: str) -> dict:
     return value
 
 
-def known(table: dict, allowed, where: str, ignored: list[str] | None, noun: str = "key") -> dict:
+def only(table: dict, allowed, where: str, noun: str = "key", *, ignored: list[str] | None = None,
+         message: str = "") -> dict:
     if bad := sorted(set(table) - set(allowed)):
         if ignored is None:
-            raise ValueError(f"[{where}]: unknown {noun} {', '.join(bad)}; use {', '.join(allowed)}")
-        ignored.extend(f"[{where}] {name}" for name in bad)
-    return {name: value for name, value in table.items() if name in allowed}
+            names = ", ".join(bad)
+            raise ValueError(message.format(names) if message else
+                             f"{where}: unknown {noun} {names}; use {', '.join(allowed)}")
+        ignored.extend(f"{where} {name}" for name in bad)
+        return {name: value for name, value in table.items() if name in allowed}
+    return table
+
+
+def flag(table: dict, key: str, default: bool, where: str, error=ValueError, tail: bool = True) -> bool:
+    value = table.get(key, default)
+    if type(value) is not bool:
+        suffix = f", not {value!r}" if tail else ""
+        raise error(f"{where} {key} must be true or false{suffix}")
+    return value
+
+
+def within(value, least, above, most) -> bool:
+    return ((least is None or value >= least) and (above is None or value > above)
+            and (most is None or value <= most))
+
+
+def number_error(value, where: str, what: str, least, above, most, bound: str) -> ValueError:
+    if not bound:
+        bound = " and ".join(text for limit, text in (
+            (least, f"at least {least}"), (above, f"above {above}"), (most, f"at most {most}"))
+            if limit is not None)
+    return ValueError(f"{where} must be {what}{' ' + bound if bound else ''}, not {value!r}")
+
+
+def whole(value, where: str, *, least=None, above=None, most=None, bound: str = "") -> int:
+    if type(value) is not int or not within(value, least, above, most):
+        raise number_error(value, where, "a whole number", least, above, most, bound)
+    return value
+
+
+def number(value, where: str, *, least=None, above=None, most=None, finite: bool = False,
+           what: str = "a number", bound: str = "") -> int | float:
+    if (type(value) not in (int, float) or (finite and not math.isfinite(value))
+            or not within(value, least, above, most)):
+        raise number_error(value, where, what, least, above, most, bound)
+    return value
 
 
 def step_table(table, where: str) -> dict:
-    table = table_of(table, where)
-    if bad := sorted(set(table) - set(STEP_KEYS)):
-        raise ValueError(f"[{where}]: unknown key {', '.join(bad)}; use {', '.join(STEP_KEYS)}")
+    table = only(table_of(table, where), STEP_KEYS, f"[{where}]")
     for key in STEP_COUNTS:
-        if key in table and (type(table[key]) is not int or table[key] < 1):
-            raise ValueError(f"[{where}]: {key} must be a whole number of at least 1, not {table[key]!r}")
+        if key in table:
+            whole(table[key], f"[{where}]: {key}", least=1, bound="of at least 1")
     for key in STEP_AMOUNTS:
-        if key in table and (type(table[key]) not in (int, float) or not table[key] > 0):
-            raise ValueError(f"[{where}]: {key} must be a number of dollars above 0, not {table[key]!r}")
+        if key in table:
+            number(table[key], f"[{where}]: {key}", above=0, what="a number of dollars")
     for key in STEP_LISTS:
         if key in table and not (isinstance(table[key], list | tuple) and all(isinstance(v, str) for v in table[key])):
             raise ValueError(f"[{where}]: {key} must be a list of names, not {table[key]!r}")
@@ -410,10 +519,8 @@ def step_table(table, where: str) -> dict:
         raise ValueError(f"[{where}]: instructions {', '.join(map(repr, bad))} is not one of {', '.join(INSTRUCTIONS)}")
     if "session" in table and table["session"] not in SESSIONS:
         raise ValueError(f"[{where}]: session {table['session']!r} is not one of {', '.join(SESSIONS)}")
-    if "structured_output" in table and type(table["structured_output"]) is not bool:
-        raise ValueError(f"[{where}]: structured_output must be true or false, not {table['structured_output']!r}")
-    if "directory_cleanup" in table and type(table["directory_cleanup"]) is not bool:
-        raise ValueError(f"[{where}]: directory_cleanup must be true or false, not {table['directory_cleanup']!r}")
+    flag(table, "structured_output", False, f"[{where}]:")
+    flag(table, "directory_cleanup", False, f"[{where}]:")
     return {k: tuple(dict.fromkeys(v)) if k in STEP_LISTS else float(v) if k in STEP_AMOUNTS
             else v if k in STEP_COUNTS or type(v) is bool else str(v)
             for k, v in table.items()}
@@ -425,8 +532,7 @@ def mcp_tables(data) -> dict[str, dict]:
         where = f"[mcp.{name}]"
         if not MCP_NAME.fullmatch(name):
             raise ValueError(f"{where}: a server name takes only letters, digits, _ and -")
-        if bad := sorted(set(table_of(entry, f"mcp.{name}")) - set(MCP_KEYS)):
-            raise ValueError(f"{where}: unknown key {', '.join(bad)}; use {', '.join(MCP_KEYS)}")
+        entry = only(table_of(entry, f"mcp.{name}"), MCP_KEYS, where)
         if ("command" in entry) == ("url" in entry):
             raise ValueError(f"{where}: set exactly one of command and url")
         for key in ("command", "url"):
@@ -443,7 +549,7 @@ def mcp_tables(data) -> dict[str, dict]:
 
 
 def step_tables(data, where: str, ignored: list[str] | None = None) -> dict[str, dict]:
-    data = known(table_of(data, where), STEP_NAMES, where, ignored, "step")
+    data = only(table_of(data, where), STEP_NAMES, f"[{where}]", "step", ignored=ignored)
     for alias, role in STEP_ALIASES.items():
         if alias in data and role in data:
             raise ValueError(f"[{where}.{alias}] and [{where}.{role}] are the same step; name the step once")
@@ -454,9 +560,7 @@ def ab_tables(data, where: str = "ab") -> dict[str, dict]:
     found = {}
     for name, table in table_of(data, where).items():
         label = f"[{where}.{name}]"
-        table = table_of(table, f"{where}.{name}")
-        if bad := sorted(set(table) - set(AB_KEYS)):
-            raise ValueError(f"{label}: unknown key {', '.join(bad)}; use {', '.join(AB_KEYS)}")
+        table = only(table_of(table, f"{where}.{name}"), AB_KEYS, label)
         step = table.get("step")
         if step not in STEP_NAMES:
             raise ValueError(f"{label}: unknown step {step!r}; use {', '.join(STEP_NAMES)}")
@@ -469,8 +573,7 @@ def ab_tables(data, where: str = "ab") -> dict[str, dict]:
         arm = table_of(table.get("arm"), f"{where}.{name}.arm") if "arm" in table else {}
         if not arm:
             raise ValueError(f"{label}: arm must set at least one of {', '.join(ARM_KEYS)}")
-        if bad := sorted(set(arm) - set(ARM_KEYS)):
-            raise ValueError(f"[{where}.{name}.arm]: unknown key {', '.join(bad)}; use {', '.join(ARM_KEYS)}")
+        arm = only(arm, ARM_KEYS, f"[{where}.{name}.arm]")
         found[name] = {"step": STEP_ALIASES.get(step, step), "kind": kind, "share": float(share),
                        "arm": step_table(arm, f"{where}.{name}.arm")}
     ab_clash(found)
@@ -489,10 +592,10 @@ def ab_clash(tests: dict) -> None:
 
 
 def kind_tables(data, where: str, ignored: list[str] | None = None) -> dict[str, dict[str, dict]]:
-    data = known(table_of(data, where), KINDS, where, ignored, "kind")
+    data = only(table_of(data, where), KINDS, f"[{where}]", "kind", ignored=ignored)
     kinds = {}
     for kind, table in data.items():
-        table = known(table_of(table, f"{where}.{kind}"), ("steps",), f"{where}.{kind}", ignored)
+        table = only(table_of(table, f"{where}.{kind}"), ("steps",), f"[{where}.{kind}]", ignored=ignored)
         kinds[kind] = step_tables(table.get("steps") or {}, f"{where}.{kind}.steps", ignored)
     return kinds
 
@@ -512,9 +615,7 @@ def tier_maps(data, where: str) -> dict[str, dict[str, tuple[dict[str, str], ...
                 label = f"[{where}.{name}] {tier}" + (f" entry {n}" if listed else "")
                 if not isinstance(entry, dict):
                     raise TypeError(f"{label}: must be a table, not {entry!r}")
-                if bad := sorted(set(entry) - set(TIER_KEYS)):
-                    raise ValueError(f"{label}: unknown key {', '.join(bad)}; use {', '.join(TIER_KEYS)}")
-                entry = {k: str(v) for k, v in entry.items()}
+                entry = {k: str(v) for k, v in only(entry, TIER_KEYS, label).items()}
                 if problem := routing.entry_problem(entry):
                     raise ValueError(f"{label}: {problem}")
                 entries.append(entry)
@@ -522,36 +623,22 @@ def tier_maps(data, where: str) -> dict[str, dict[str, tuple[dict[str, str], ...
     return maps
 
 
-@dataclass(frozen=True)
-class Routing:
-    fallback: bool = True
-    capabilities: dict[str, dict] = field(default_factory=dict)
-    floors: dict[str, tuple[str, ...]] = field(default_factory=dict)
-    payment_modes: tuple[str, ...] | None = None
-    paid: PaidRoutes = PaidRoutes()
-
-
 def capability_table(key: str, table) -> dict:
     where = f"[routing.capabilities.{key}]"
-    table = table_of(table, f"routing.capabilities.{key}")
-    if bad := sorted(set(table) - set(CAPABILITY_KEYS)):
-        raise ValueError(f"{where}: unknown key {', '.join(bad)}; use {', '.join(CAPABILITY_KEYS)}")
+    table = only(table_of(table, f"routing.capabilities.{key}"), CAPABILITY_KEYS, where)
     found = table.get("modalities", [])
     if not (isinstance(found, list) and all(isinstance(v, str) and v for v in found)):
         raise ValueError(f"{where}: modalities must be a list of names, not {found!r}")
-    if "context" in table and (type(table["context"]) is not int or table["context"] < 1):
-        raise ValueError(f"{where}: context must be a whole number of at least 1, not {table['context']!r}")
-    if "structured_output" in table and type(table["structured_output"]) is not bool:
-        raise ValueError(f"{where}: structured_output must be true or false, not {table['structured_output']!r}")
+    if "context" in table:
+        whole(table["context"], f"{where}: context", least=1, bound="of at least 1")
+    flag(table, "structured_output", False, f"{where}:")
     if "data_handling" in table and not (isinstance(table["data_handling"], str) and table["data_handling"]):
         raise ValueError(f"{where}: data_handling must be one label, not {table['data_handling']!r}")
     return {**table, **({"modalities": tuple(dict.fromkeys(found))} if "modalities" in table else {})}
 
 
 def paid_table(data) -> PaidRoutes:
-    table = table_of(data, "routing.paid")
-    if bad := sorted(set(table) - {"providers", "max_input", "max_output"}):
-        raise ValueError(f"[routing.paid]: unknown key {', '.join(bad)}; use providers, max_input, max_output")
+    table = only(table_of(data, "routing.paid"), ("providers", "max_input", "max_output"), "[routing.paid]")
     providers = table.get("providers")
     if providers is not None:
         if not (isinstance(providers, list) and all(isinstance(p, str) and p for p in providers)):
@@ -566,21 +653,17 @@ def tighter(a: float | None, b: float | None) -> float | None:
 
 
 def allowed_paid_routes(cfg: Config, layer: RepoLayer | None = None) -> PaidRoutes:
-    own = layer.paid if layer else PaidRoutes()
-    providers = (own.providers if cfg.paid.providers is None else cfg.paid.providers if own.providers is None
-                 else tuple(p for p in cfg.paid.providers if p in own.providers))
-    return PaidRoutes(providers, tighter(cfg.paid.max_input, own.max_input),
-                      tighter(cfg.paid.max_output, own.max_output))
+    paid = cfg.routing.paid
+    own = layer.routing.paid if layer else PaidRoutes()
+    providers = (own.providers if paid.providers is None else paid.providers if own.providers is None
+                 else tuple(p for p in paid.providers if p in own.providers))
+    return PaidRoutes(providers, tighter(paid.max_input, own.max_input), tighter(paid.max_output, own.max_output))
 
 
-def routing_table(data) -> Routing:
-    table = table_of(data, "routing")
-    if bad := sorted(set(table) - {"fallback", "payment_modes", "capabilities", "floors", "paid"}):
-        raise ValueError(f"[routing]: unknown key {', '.join(bad)}; "
-                         "use fallback, payment_modes, capabilities, floors, paid")
-    value = table.get("fallback", True)
-    if type(value) is not bool:
-        raise ValueError(f"[routing] fallback must be true or false, not {value!r}")
+def routing_table(data, *, default_modes: tuple[str, ...] | None = None) -> Routing:
+    keys = ("fallback", "payment_modes", "capabilities", "floors", "paid")
+    table = only(table_of(data, "routing"), keys, "[routing]")
+    fallback = flag(table, "fallback", True, "[routing]")
     capabilities = {str(key): capability_table(str(key), entry)
                     for key, entry in table_of(table.get("capabilities", {}), "routing.capabilities").items()}
     floors = {}
@@ -596,13 +679,25 @@ def routing_table(data) -> Routing:
             raise ValueError(f"[routing] payment_modes must be a nonempty list of distinct values from "
                              f"{', '.join(PAYMENT_MODES)}, not {modes!r}")
         modes = tuple(modes)
-    return Routing(value, capabilities, floors, modes, paid_table(table.get("paid", {})))
+    return Routing(fallback, capabilities, floors, modes or default_modes, paid_table(table.get("paid", {})))
+
+
+def routing_for(cfg: Config, layer: RepoLayer | None = None) -> Routing:
+    base = cfg.routing
+    if layer is None:
+        return base
+    own = layer.routing
+    capabilities = {key: {**base.capabilities.get(key, {}), **own.capabilities.get(key, {})}
+                    for key in dict.fromkeys([*base.capabilities, *own.capabilities])}
+    modes = base.payment_modes
+    if own.payment_modes is not None:
+        modes = tuple(mode for mode in (modes or ()) if mode in own.payment_modes)
+    return Routing(base.fallback and own.fallback, capabilities, {**base.floors, **own.floors}, modes,
+                   allowed_paid_routes(cfg, layer))
 
 
 def allowed_payment_modes(cfg: Config, layer: RepoLayer | None = None) -> tuple[str, ...]:
-    if layer is None or layer.payment_modes is None:
-        return cfg.payment_modes
-    return tuple(m for m in cfg.payment_modes if m in layer.payment_modes)
+    return routing_for(cfg, layer).payment_modes or ()
 
 
 def price_rate(value, where: str) -> float:
@@ -613,23 +708,17 @@ def price_rate(value, where: str) -> float:
 
 
 def replay_table(data, ignored: list[str] | None = None) -> ReplayConfig:
-    table = known(table_of(data, "replay"), REPLAY_KEYS, "replay", ignored)
+    table = only(table_of(data, "replay"), REPLAY_KEYS, "[replay]", ignored=ignored)
     return ReplayConfig(all=bool(table.get("all", False)), dir=paths.expand(table["dir"]) if table.get("dir") else None)
 
 
 def ask_table(data, ignored: list[str] | None = None) -> AskConfig:
-    table = known(table_of(data, "ask"), ASK_KEYS, "ask", ignored)
-    limit, settle = table.get("max_per_run", 3), table.get("settle", True)
-    if type(limit) is not int or limit < 0:
-        raise ValueError(f"[ask] max_per_run must be a whole number of at least 0, not {limit!r}")
-    if type(settle) is not bool:
-        raise ValueError(f"[ask] settle must be true or false, not {settle!r}")
-    days = table.get("expire_days", 7)
-    if type(days) not in (int, float) or not math.isfinite(days) or not 0 < days <= MAX_ASK_EXPIRE_DAYS:
-        raise ValueError(f"[ask] expire_days must be a number above 0 and at most {MAX_ASK_EXPIRE_DAYS}, not {days!r}")
-    hours = table.get("remind_hours", 24)
-    if type(hours) not in (int, float) or not math.isfinite(hours) or not 0 < hours <= MAX_ASK_EXPIRE_DAYS * 24:
-        raise ValueError(f"[ask] remind_hours must be a number above 0 and at most {MAX_ASK_EXPIRE_DAYS * 24}, not {hours!r}")
+    table = only(table_of(data, "ask"), ASK_KEYS, "[ask]", ignored=ignored)
+    limit = whole(table.get("max_per_run", 3), "[ask] max_per_run", least=0, bound="of at least 0")
+    settle = flag(table, "settle", True, "[ask]")
+    days = number(table.get("expire_days", 7), "[ask] expire_days", above=0, most=MAX_ASK_EXPIRE_DAYS, finite=True)
+    hours = number(table.get("remind_hours", 24), "[ask] remind_hours", above=0, most=MAX_ASK_EXPIRE_DAYS * 24,
+                   finite=True)
     contact = table.get("push_contact", "")
     if (not isinstance(contact, str) or len(contact) > 200 or re.search(r"\s", contact)
             or contact and not contact.startswith(("mailto:", "https://"))):
@@ -638,7 +727,7 @@ def ask_table(data, ignored: list[str] | None = None) -> AskConfig:
 
 
 def retention_table(data, ignored: list[str] | None = None) -> Retention:
-    table = known(table_of(data, "retention"), RETENTION_KEYS, "retention", ignored)
+    table = only(table_of(data, "retention"), RETENTION_KEYS, "[retention]", ignored=ignored)
     found = {}
     for key, default in (("days", Retention.days), ("max_gb", Retention.max_gb), ("lines_days", Retention.lines_days),
                         ("db_max_mb", Retention.db_max_mb)):
@@ -652,9 +741,7 @@ def retention_table(data, ignored: list[str] | None = None) -> Retention:
 
 
 def backup_table(data) -> BackupConfig:
-    table = table_of(data, "backup")
-    if bad := sorted(set(table) - set(BACKUP_KEYS)):
-        raise ValueError(f"[backup]: unknown key {', '.join(bad)}; use {', '.join(BACKUP_KEYS)}")
+    table = only(table_of(data, "backup"), BACKUP_KEYS, "[backup]")
     copy_to = table.get("copy_to", BackupConfig.copy_to)
     if not isinstance(copy_to, str) or copy_to != copy_to.strip() or copy_to.startswith("-"):
         raise ValueError(f"[backup] copy_to must be an rsync destination without surrounding spaces, not {copy_to!r}")
@@ -662,7 +749,7 @@ def backup_table(data) -> BackupConfig:
 
 
 def chat_table(data, ignored: list[str] | None = None) -> ChatConfig:
-    table = known(table_of(data, "chat"), CHAT_KEYS, "chat", ignored)
+    table = only(table_of(data, "chat"), CHAT_KEYS, "[chat]", ignored=ignored)
     tokens = table.get("context_tokens", ChatConfig.context_tokens)
     if type(tokens) is not int or tokens < 100:
         raise ValueError(f"[chat] context_tokens must be a whole number of at least 100, not {tokens!r}")
@@ -678,43 +765,32 @@ def chat_table(data, ignored: list[str] | None = None) -> ChatConfig:
     return ChatConfig(context_tokens=tokens, summary_model=model.strip(), max_sessions=most, budget_usd=float(budget))
 
 
-def research_table(data, ignored: list[str] | None = None) -> dict:
+def research_table(data, ignored: list[str] | None = None) -> ResearchConfig:
     keys = ("planner", "search", "synthesis", "audit", "search_workers", "search_share")
-    table = known(table_of(data, "research"), keys, "research", ignored)
-    planner = table.get("planner", False)
-    if type(planner) is not bool:
-        raise ValueError(f"[research] planner must be true or false, not {planner!r}")
-    search = table.get("search", False)
-    if type(search) is not bool:
-        raise ValueError(f"[research] search must be true or false, not {search!r}")
+    table = only(table_of(data, "research"), keys, "[research]", ignored=ignored)
+    planner = flag(table, "planner", ResearchConfig.planner, "[research]")
+    search = flag(table, "search", ResearchConfig.search, "[research]")
     if search and not planner:
         raise ValueError("[research] search needs planner = true, because the planner sets the search tasks")
-    synthesis = table.get("synthesis", False)
-    if type(synthesis) is not bool:
-        raise ValueError(f"[research] synthesis must be true or false, not {synthesis!r}")
+    synthesis = flag(table, "synthesis", ResearchConfig.synthesis, "[research]")
     if synthesis and not search:
         raise ValueError("[research] synthesis needs search = true, because the collator writes from the search "
                          "workers' evidence")
-    audit = table.get("audit", False)
-    if type(audit) is not bool:
-        raise ValueError(f"[research] audit must be true or false, not {audit!r}")
+    audit = flag(table, "audit", ResearchConfig.audit, "[research]")
     if audit and not synthesis:
         raise ValueError("[research] audit needs synthesis = true, because the auditor checks the collator's claims")
-    workers = table.get("search_workers", Config.research_search_workers)
+    workers = table.get("search_workers", ResearchConfig.search_workers)
     if type(workers) is not int or not 1 <= workers <= 8:
         raise ValueError(f"[research] search_workers must be a whole number from 1 to 8, not {workers!r}")
-    share = table.get("search_share", Config.research_search_share)
+    share = table.get("search_share", ResearchConfig.search_share)
     if type(share) not in (int, float) or not 0 < share < 1:
         raise ValueError(f"[research] search_share must be a number above 0 and under 1, not {share!r}")
-    return {"planner": planner, "search": search, "synthesis": synthesis, "audit": audit,
-            "search_workers": workers, "search_share": float(share)}
+    return ResearchConfig(planner, search, synthesis, audit, workers, float(share))
 
 
 def oncall_source(entry, repos: list[Repo]) -> OncallSource:
-    table = table_of(entry, "oncall.source")
     keys = ("path", "pattern", "repo", "check", "vision", "scope")
-    if bad := sorted(set(table) - set(keys)):
-        raise ValueError(f"[[oncall.source]]: unknown key {', '.join(bad)}; use {', '.join(keys)}")
+    table = only(table_of(entry, "oncall.source"), keys, "[[oncall.source]]")
     for key in keys:
         if not isinstance(table.get(key, ""), str):
             raise TypeError(f"[[oncall.source]] {key} must be a string, not {table[key]!r}")
@@ -740,25 +816,20 @@ def oncall_bounds(table: dict) -> dict:
     for key, (kind, least) in ONCALL_BOUNDS.items():
         if key not in table:
             continue
-        value = table[key]
-        spend = key.endswith("_usd")
-        whole = type(value) is int
-        if not (whole if kind is int else whole or type(value) is float) or not (value > least if spend else value >= least):
-            what = "a whole number" if kind is int else "a number"
-            bound = f"above {least}" if spend else f"{least} or more"
-            raise ValueError(f"[oncall] {key} must be {what} {bound}, not {value!r}")
-        found[key] = kind(value)
+        where = f"[oncall] {key}"
+        if key.endswith("_usd"):
+            found[key] = float(number(table[key], where, above=least))
+        elif kind is int:
+            found[key] = whole(table[key], where, least=least, bound=f"{least} or more")
+        else:
+            found[key] = float(number(table[key], where, least=least, bound=f"{least} or more"))
     return found
 
 
 def oncall_table(data, repos: list[Repo]) -> OncallConfig:
-    table = table_of(data, "oncall")
     allowed = ("enabled", "source", "vision", "scope", "confidence", "injection", *ONCALL_BOUNDS)
-    if bad := sorted(set(table) - set(allowed)):
-        raise ValueError(f"[oncall]: unknown key {', '.join(bad)}; use {', '.join(allowed)}")
-    enabled = table.get("enabled", False)
-    if type(enabled) is not bool:
-        raise ValueError(f"[oncall] enabled must be true or false, not {enabled!r}")
+    table = only(table_of(data, "oncall"), allowed, "[oncall]")
+    enabled = flag(table, "enabled", False, "[oncall]")
     entries = table.get("source", [])
     if not isinstance(entries, list):
         raise TypeError(f"[oncall] source must be a list of [[oncall.source]] tables, not {entries!r}")
@@ -789,8 +860,7 @@ def environment_table(data, layer: bool = False) -> Environment:
     if layer and "providers" in table:
         raise ValueError("a layer's [environment] takes pass only; [environment.providers] goes in "
                          f"{paths.short_path(paths.CONFIG_FILE)}")
-    if bad := sorted(set(table) - set(ENV_KEYS)):
-        raise ValueError(f"[environment]: unknown key {', '.join(bad)}; use {'pass' if layer else ', '.join(ENV_KEYS)}")
+    table = only(table, ("pass",) if layer else ENV_KEYS, "[environment]")
     providers = {str(name): variable_names(names, f"[environment.providers] {name}")
                  for name, names in table_of(table.get("providers", {}), "environment.providers").items()}
     return Environment(variable_names(table.get("pass", []), "[environment] pass"), providers)
@@ -807,18 +877,14 @@ def voice_file(entry, folder: Path) -> str:
     return str(found)
 
 
-def capture_table(data, folder: Path) -> tuple[str, str, bool]:
-    table = table_of(data, "capture")
-    if bad := sorted(set(table) - set(CAPTURE_KEYS)):
-        raise ValueError(f"[capture]: unknown key {', '.join(bad)}; use {', '.join(CAPTURE_KEYS)}")
-    branch = table.get("evidence_branch", "feedback-evidence")
+def capture_table(data, folder: Path) -> CaptureConfig:
+    table = only(table_of(data, "capture"), CAPTURE_KEYS, "[capture]")
+    branch = table.get("evidence_branch", CaptureConfig.evidence_branch)
     if (not isinstance(branch, str) or not EVIDENCE_BRANCH.fullmatch(branch) or ".." in branch
             or branch.endswith(("/", ".", ".lock"))):
         raise ValueError(f"[capture] evidence_branch must be a branch name such as feedback-evidence, not {branch!r}")
-    public = table.get("public_evidence", False)
-    if type(public) is not bool:
-        raise TypeError(f"[capture] public_evidence must be true or false, not {public!r}")
-    return capture_vision_file(table, folder), branch, public
+    public = flag(table, "public_evidence", CaptureConfig.public_evidence, "[capture]", error=TypeError)
+    return CaptureConfig(capture_vision_file(table, folder), branch, public)
 
 
 def capture_vision_file(table: dict, folder: Path) -> str:
@@ -844,10 +910,9 @@ def word_range(kind: str, value) -> tuple[int, int]:
 
 def triage_table(data, ignored: list[str] | None = None) -> TriageConfig:
     defaults = TriageConfig()
-    table = known(table_of(data, "triage"), defaults.__dict__, "triage", ignored)
+    table = only(table_of(data, "triage"), defaults.__dict__, "[triage]", ignored=ignored)
     for name in ("auto", "route_fixes"):
-        if type(table.get(name, False)) is not bool:
-            raise ValueError(f"[triage] {name} must be true or false")
+        flag(table, name, False, "[triage]", tail=False)
     limit = table.get("auto_per_refresh", defaults.auto_per_refresh)
     if type(limit) is not int or not 0 <= limit <= 1000:
         raise ValueError("[triage] auto_per_refresh must be a whole number from 0 to 1000")
@@ -855,16 +920,14 @@ def triage_table(data, ignored: list[str] | None = None) -> TriageConfig:
 
 
 def jev_names(jv: dict, name: str, noun: str, ignored: list[str] | None) -> dict:
-    return known(jv.get(name) or {}, JevConfig().__dict__[name], f"jev.{name}", ignored, noun)
+    return only(jv.get(name) or {}, JevConfig().__dict__[name], f"[jev.{name}]", noun, ignored=ignored)
 
 
 def document_table(data, folder: Path, ignored: list[str] | None = None) -> dict:
-    table = known(table_of(data, "document"), DOCUMENT_KEYS, "document", ignored)
+    table = only(table_of(data, "document"), DOCUMENT_KEYS, "[document]", ignored=ignored)
     found = {}
     if "enabled" in table:
-        if type(table["enabled"]) is not bool:
-            raise ValueError(f"[document] enabled must be true or false, not {table['enabled']!r}")
-        found["enabled"] = table["enabled"]
+        found["enabled"] = flag(table, "enabled", False, "[document]")
     if "style" in table:
         if not isinstance(table["style"], str):
             raise ValueError(f"[document] style must be a string, not {table['style']!r}")
@@ -897,9 +960,7 @@ def document_for(cfg: Config, repo: Repo | None = None, layer: RepoLayer | None 
 
 
 def dashboard_https(value: object) -> bool:
-    if not isinstance(value, bool):
-        raise TypeError(f"[dashboard] https must be true or false, not {value!r}")
-    return value
+    return flag({"https": value}, "https", False, "[dashboard]", error=TypeError)
 
 
 def read_data(path: Path | None = None) -> dict:
@@ -948,6 +1009,100 @@ def load_required() -> Config:
     return load(required=True)
 
 
+def jira_table(j: dict) -> JiraConfig:
+    return JiraConfig(
+        env_file=paths.expand(j["env_file"]) if j.get("env_file") else None,
+        project=j.get("project", ""),
+        transitions=moves_table(j, "transitions", STATES, {"merged": "merges move tickets through [jira.landed]",
+                                                            DELIVERED: "research tickets move through [jira.research]"}),
+        research=moves_table(j, "research", RESEARCH_MOVES),
+        landed={str(branch): str(target) for branch, target in (j.get("landed") or {}).items() if target},
+        auto=bool(j.get("auto", False)),
+        auto_per_refresh=max(0, int(j.get("auto_per_refresh", JiraConfig.auto_per_refresh))),
+        sprint_only=bool(j.get("sprint_only", JiraConfig.sprint_only)),
+        skip_types=[str(t) for t in j.get("skip_types") or [] if str(t).strip()],
+    )
+
+
+def jev_table(jv: dict, ignored: list[str] | None = None) -> JevConfig:
+    return JevConfig(
+        enabled=bool(jv.get("enabled", True)),
+        model=str(jv.get("model", JevConfig.model)),
+        confidence=float(jv.get("confidence", JevConfig.confidence)),
+        injection=float(jv.get("injection", JevConfig.injection)),
+        risk_hold=float(jv.get("risk_hold", JevConfig.risk_hold)),
+        irreversible_hold=float(jv.get("irreversible_hold", JevConfig.irreversible_hold)),
+        secrets_hold=float(jv.get("secrets_hold", JevConfig.secrets_hold)),
+        triage_skip=float(jv.get("triage_skip", JevConfig.triage_skip)),
+        screen_lines={**JevConfig().screen_lines,
+                      **{str(k): float(v) for k, v in jev_names(jv, "screen_lines", "question", ignored).items()}},
+        proof_hold=float(jv.get("proof_hold", JevConfig.proof_hold)),
+        fixed_skip=float(jv.get("fixed_skip", JevConfig.fixed_skip)),
+        research_rerun=float(jv.get("research_rerun", JevConfig.research_rerun)),
+        research_answered=float(jv.get("research_answered", JevConfig.research_answered)),
+        feedback_skip=float(jv.get("feedback_skip", JevConfig.feedback_skip)),
+        risk_weights={**JevConfig().risk_weights,
+                      **{str(k): float(v) for k, v in jev_names(jv, "risk_weights", "weight", ignored).items()}},
+        guard=bool(jv.get("guard", True)),
+        compact_tokens=int(jv.get("compact_tokens", JevConfig.compact_tokens)),
+    )
+
+
+def github_app_table(app: dict) -> GithubApp:
+    found = GithubApp(
+        app_id=str(app.get("app_id", "")).strip(),
+        installation_id=str(app.get("installation_id", "")).strip(),
+        private_key=paths.expand(app["private_key"]) if app.get("private_key") else None,
+    )
+    if found.installation_id and not found.installation_id.isdigit():
+        raise ValueError("[github_app] installation_id must be digits only")
+    return found
+
+
+def repo_table(repo: dict) -> Repo:
+    tracker = repo.get("tracker", "github")
+    if tracker not in TRACKERS:
+        raise ValueError(f"repo {repo['name']}: tracker must be github, jira or local, not '{tracker}'")
+    github = repo.get("github", "")
+    parts = [Part(p["dir"].strip("/"), p["github"]) for p in repo.get("part", [])]
+    if parts and (github or tracker != "jira"):
+        raise ValueError(f"repo {repo['name']}: a repo with parts takes its github from each part and needs "
+                         'tracker = "jira"')
+    return Repo(
+        name=repo["name"],
+        path=paths.expand(repo["path"]),
+        github=github,
+        pipeline=bool(repo.get("pipeline", False)),
+        mine=bool(repo.get("mine", True)),
+        public=bool(repo.get("public", False)),
+        tracker=tracker,
+        jira_project=repo.get("jira_project", ""),
+        jira_label=repo.get("jira_label", ""),
+        layer=paths.expand(repo["layer"]) if repo.get("layer") else None,
+        parts=parts or ([Part("", github)] if github else []),
+        jev=bool(repo.get("jev", True)),
+    )
+
+
+def job_table(job: dict) -> Job:
+    return Job(
+        label=job["label"],
+        log=paths.expand(job["log"]) if job.get("log") else None,
+        max_age_hours=job.get("max_age_hours"),
+        keepalive=bool(job.get("keepalive", False)),
+    )
+
+
+def probe_table(probe: dict) -> Probe:
+    return Probe(
+        name=probe["name"],
+        command=list(probe["command"]),
+        expect=probe.get("expect", "ok"),
+        every_hours=float(probe.get("every_hours", 24)),
+        timeout=int(probe.get("timeout", 180)),
+    )
+
+
 def load(path: Path | None = None, strict: bool = False, *, required: bool = False) -> Config:
     path = path or paths.CONFIG_FILE
     ignored: list[str] | None = None if strict else []
@@ -991,107 +1146,17 @@ def load(path: Path | None = None, strict: bool = False, *, required: bool = Fal
     cfg.pricing = {str(m): tuple(price_rate(r[k], f"[pricing.models.{m}] {k}") if k in r else None
                                 for k in ("input", "output"))
                    for m, r in (pricing.get("models") or {}).items()}
-    found = routing_table(data.get("routing", {}))
-    cfg.routing_fallback, cfg.capabilities, cfg.floors = found.fallback, found.capabilities, found.floors
-    cfg.payment_modes = found.payment_modes or PAYMENT_MODES
-    cfg.paid = found.paid
-    j = data.get("jira", {})
-    cfg.jira = JiraConfig(
-        env_file=paths.expand(j["env_file"]) if j.get("env_file") else None,
-        project=j.get("project", ""),
-        transitions=moves_table(j, "transitions", STATES, {"merged": "merges move tickets through [jira.landed]",
-                                                            DELIVERED: "research tickets move through [jira.research]"}),
-        research=moves_table(j, "research", RESEARCH_MOVES),
-        landed={str(branch): str(target) for branch, target in (j.get("landed") or {}).items() if target},
-        auto=bool(j.get("auto", False)),
-        auto_per_refresh=max(0, int(j.get("auto_per_refresh", JiraConfig.auto_per_refresh))),
-        sprint_only=bool(j.get("sprint_only", JiraConfig.sprint_only)),
-        skip_types=[str(t) for t in j.get("skip_types") or [] if str(t).strip()],
-    )
-    jv = data.get("jev", {})
-    cfg.jev = JevConfig(
-        enabled=bool(jv.get("enabled", True)),
-        model=str(jv.get("model", JevConfig.model)),
-        confidence=float(jv.get("confidence", JevConfig.confidence)),
-        injection=float(jv.get("injection", JevConfig.injection)),
-        risk_hold=float(jv.get("risk_hold", JevConfig.risk_hold)),
-        irreversible_hold=float(jv.get("irreversible_hold", JevConfig.irreversible_hold)),
-        secrets_hold=float(jv.get("secrets_hold", JevConfig.secrets_hold)),
-        triage_skip=float(jv.get("triage_skip", JevConfig.triage_skip)),
-        screen_lines={**JevConfig().screen_lines,
-                      **{str(k): float(v) for k, v in jev_names(jv, "screen_lines", "question", ignored).items()}},
-        proof_hold=float(jv.get("proof_hold", JevConfig.proof_hold)),
-        fixed_skip=float(jv.get("fixed_skip", JevConfig.fixed_skip)),
-        research_rerun=float(jv.get("research_rerun", JevConfig.research_rerun)),
-        research_answered=float(jv.get("research_answered", JevConfig.research_answered)),
-        feedback_skip=float(jv.get("feedback_skip", JevConfig.feedback_skip)),
-        risk_weights={**JevConfig().risk_weights,
-                      **{str(k): float(v) for k, v in jev_names(jv, "risk_weights", "weight", ignored).items()}},
-        guard=bool(jv.get("guard", True)),
-        compact_tokens=int(jv.get("compact_tokens", JevConfig.compact_tokens)),
-    )
-    app = section(data, "github_app")
-    cfg.github_app = GithubApp(
-        app_id=str(app.get("app_id", "")).strip(),
-        installation_id=str(app.get("installation_id", "")).strip(),
-        private_key=paths.expand(app["private_key"]) if app.get("private_key") else None,
-    )
-    if cfg.github_app.installation_id and not cfg.github_app.installation_id.isdigit():
-        raise ValueError("[github_app] installation_id must be digits only")
-    for r in data.get("repo", []):
-        tracker = r.get("tracker", "github")
-        if tracker not in TRACKERS:
-            raise ValueError(f"repo {r['name']}: tracker must be github, jira or local, not '{tracker}'")
-        github = r.get("github", "")
-        parts = [Part(p["dir"].strip("/"), p["github"]) for p in r.get("part", [])]
-        if parts and (github or tracker != "jira"):
-            raise ValueError(f"repo {r['name']}: a repo with parts takes its github from each part and needs "
-                             "tracker = \"jira\"")
-        cfg.repos.append(
-            Repo(
-                name=r["name"],
-                path=paths.expand(r["path"]),
-                github=github,
-                pipeline=bool(r.get("pipeline", False)),
-                mine=bool(r.get("mine", True)),
-                public=bool(r.get("public", False)),
-                tracker=tracker,
-                jira_project=r.get("jira_project", ""),
-                jira_label=r.get("jira_label", ""),
-                layer=paths.expand(r["layer"]) if r.get("layer") else None,
-                parts=parts or ([Part("", github)] if github else []),
-                jev=bool(r.get("jev", True)),
-            )
-        )
-    for j in data.get("job", []):
-        cfg.jobs.append(
-            Job(
-                label=j["label"],
-                log=paths.expand(j["log"]) if j.get("log") else None,
-                max_age_hours=j.get("max_age_hours"),
-                keepalive=bool(j.get("keepalive", False)),
-            )
-        )
-    for p in data.get("probe", []):
-        cfg.probes.append(
-            Probe(
-                name=p["name"],
-                command=list(p["command"]),
-                expect=p.get("expect", "ok"),
-                every_hours=float(p.get("every_hours", 24)),
-                timeout=int(p.get("timeout", 180)),
-            )
-        )
+    cfg.routing = routing_table(data.get("routing", {}), default_modes=PAYMENT_MODES)
+    cfg.jira = jira_table(data.get("jira", {}))
+    cfg.jev = jev_table(data.get("jev", {}), ignored)
+    cfg.github_app = github_app_table(section(data, "github_app"))
+    cfg.repos = [repo_table(repo) for repo in data.get("repo", [])]
+    cfg.jobs = [job_table(job) for job in data.get("job", [])]
+    cfg.probes = [probe_table(probe) for probe in data.get("probe", [])]
     cfg.oncall = oncall_table(data.get("oncall") or {}, cfg.repos)
     cfg.replay = replay_table(data.get("replay") or {}, ignored)
     cfg.mcp = mcp_tables(data.get("mcp") or {})
-    research = research_table(data.get("research") or {}, ignored)
-    cfg.research_planner = research["planner"]
-    cfg.research_search = research["search"]
-    cfg.research_synthesis = research["synthesis"]
-    cfg.research_audit = research["audit"]
-    cfg.research_search_workers = research["search_workers"]
-    cfg.research_search_share = research["search_share"]
+    cfg.research = research_table(data.get("research") or {}, ignored)
     cfg.ask = ask_table(data.get("ask") or {}, ignored)
     cfg.triage = triage_table(data.get("triage", {}), ignored)
     cfg.retention = retention_table(data.get("retention") or {}, ignored)
@@ -1099,8 +1164,7 @@ def load(path: Path | None = None, strict: bool = False, *, required: bool = Fal
     cfg.chat = chat_table(data.get("chat") or {}, ignored)
     cfg.environment = environment_table(data.get("environment") or {})
     cfg.document = document_table(data.get("document") or {}, path.parent, ignored)
-    cfg.capture_vision, cfg.capture_evidence_branch, cfg.capture_public_evidence = capture_table(
-        data.get("capture") or {}, path.parent)
+    cfg.capture = capture_table(data.get("capture") or {}, path.parent)
     cfg.ab = ab_tables(data.get("ab") or {})
     from . import steps
     steps.check(cfg, defer_tiers=True)
@@ -1207,11 +1271,7 @@ class RepoLayer:
     verify: Verify | None = None
     research_dir: str = ""
     tiers: dict[str, dict[str, tuple[dict[str, str], ...]]] = field(default_factory=dict)
-    routing_fallback: bool = True
-    capabilities: dict[str, dict] = field(default_factory=dict)
-    floors: dict[str, tuple[str, ...]] = field(default_factory=dict)
-    payment_modes: tuple[str, ...] | None = None
-    paid: PaidRoutes = PaidRoutes()
+    routing: Routing = field(default_factory=Routing)
     steps: dict[str, dict] = field(default_factory=dict)
     kinds: dict[str, dict[str, dict]] = field(default_factory=dict)
     factory_path: str = FACTORY_PATHS[0]
@@ -1251,8 +1311,7 @@ def string_list(value, where: str) -> tuple[str, ...]:
 
 
 def check_policy(layer: RepoLayer, table: dict) -> None:
-    if unknown := set(table) - {"quick", "targeted"}:
-        raise ValueError(f"[check_policy] unknown keys: {', '.join(sorted(unknown))}")
+    only(table, ("quick", "targeted"), "[check_policy]", message="[check_policy] unknown keys: {}")
     if "quick" in table:
         layer.quick_checks = string_list(table["quick"], "check_policy.quick")
         if missing := set(layer.quick_checks) - layer.checks.keys():
@@ -1266,8 +1325,7 @@ def check_policy(layer: RepoLayer, table: dict) -> None:
 
 def patch_policy(table: dict) -> PatchPolicy:
     defaults = PatchPolicy()
-    if unknown := set(table) - set(defaults.__dataclass_fields__):
-        raise ValueError(f"[factory.patch] unknown keys: {', '.join(sorted(unknown))}")
+    only(table, defaults.__dataclass_fields__, "[factory.patch]", message="[factory.patch] unknown keys: {}")
     values = {}
     for name in ("max_lines", "max_files", "review_tries"):
         value = table.get(name, getattr(defaults, name))
@@ -1287,6 +1345,20 @@ def section(data: dict, name: str) -> dict:
         raise ValueError(f"[{name}] is not a table") from None
 
 
+def class_command_words(value: object) -> list[str]:
+    error = "targeted_commands.classes must be a plain command line"
+    if not isinstance(value, str) or "\n" in value or "\0" in value:
+        raise ValueError(error)
+    try:
+        words = shlex.split(value)
+    except ValueError as exc:
+        raise ValueError(error) from exc
+    if (not words or not words[0] or words[0].startswith("-")
+            or any(char in word for word in words for char in ";&|<>()$`#")):
+        raise ValueError(error)
+    return words
+
+
 def load_layer(layer_dir: Path, strict: bool = False, *, source_file: Path | None = None) -> RepoLayer:
     ignored: list[str] | None = None if strict else []
     layer = RepoLayer(dir=layer_dir)
@@ -1299,6 +1371,8 @@ def load_layer(layer_dir: Path, strict: bool = False, *, source_file: Path | Non
     layer.copy = list(setup.get("copy", []))
     for name in ("checks", "targeted_commands"):
         commands = dict(section(data, name))
+        if name == "targeted_commands" and "classes" in commands:
+            class_command_words(commands["classes"])
         if any(not isinstance(command, str) or not command.strip() for command in commands.values()):
             raise ValueError(f"[{name}] must map names to nonempty commands")
         setattr(layer, name, commands)
@@ -1315,9 +1389,7 @@ def load_layer(layer_dir: Path, strict: bool = False, *, source_file: Path | Non
         if type(value) is not int or value <= 0:
             raise ValueError(f"[limits] {name} must be a positive integer")
         setattr(layer, name, value)
-    layer.parallel_checks = lim.get("parallel_checks", False)
-    if type(layer.parallel_checks) is not bool:
-        raise ValueError("[limits] parallel_checks must be true or false")
+    layer.parallel_checks = flag(lim, "parallel_checks", False, "[limits]", tail=False)
     agent = section(data, "agent")
     layer.allow_bash = list(DEFAULT_ALLOW_BASH) + list(agent.get("allow_bash", []))
     layer.read_roots = string_list(agent.get("read_roots", []), "agent.read_roots")
@@ -1338,10 +1410,7 @@ def load_layer(layer_dir: Path, strict: bool = False, *, source_file: Path | Non
     layer.branch = g.get("branch", layer.branch)
     layer.research_dir = str(section(data, "research").get("dir", "")).strip().strip("/")
     layer.tiers = tier_maps(section(data, "tiers"), "tiers")
-    found = routing_table(section(data, "routing"))
-    layer.routing_fallback, layer.capabilities, layer.floors = found.fallback, found.capabilities, found.floors
-    layer.payment_modes = found.payment_modes
-    layer.paid = found.paid
+    layer.routing = routing_table(section(data, "routing"))
     layer.steps = step_tables(section(data, "steps"), "steps", ignored)
     layer.kinds = kind_tables(section(data, "kinds"), "kinds", ignored)
     layer.ab = ab_tables(section(data, "ab"))
@@ -1359,9 +1428,7 @@ def load_layer(layer_dir: Path, strict: bool = False, *, source_file: Path | Non
                                         for name in layer.document["voice"])
     if "verify" in data:
         v = section(data, "verify")
-        publish_evidence = v.get("publish_evidence", True)
-        if type(publish_evidence) is not bool:
-            raise ValueError("[verify] publish_evidence must be true or false")
+        publish_evidence = flag(v, "publish_evidence", True, "[verify]", tail=False)
         preflight = table_of(v.get("preflight", {}), "verify.preflight")
         if any(not isinstance(name, str) or not name.strip() or not isinstance(command, str) or not command.strip()
                for name, command in preflight.items()):
@@ -1376,9 +1443,7 @@ def load_layer(layer_dir: Path, strict: bool = False, *, source_file: Path | Non
         probe_seconds = v.get("probe_seconds", Verify.probe_seconds)
         if isinstance(probe_seconds, bool) or not isinstance(probe_seconds, (int, float)) or not 0 < probe_seconds <= 300:
             raise ValueError("[verify] probe_seconds must be greater than 0 and at most 300")
-        allow_gaps = v.get("allow_patch_gaps", False)
-        if type(allow_gaps) is not bool:
-            raise ValueError("[verify] allow_patch_gaps must be true or false")
+        allow_gaps = flag(v, "allow_patch_gaps", False, "[verify]", tail=False)
         drivers = table_of(v.get("drivers", {}), "verify.drivers")
         if any(not journeys.NAME.fullmatch(name) or not isinstance(cmd, str) or not cmd.strip()
                for name, cmd in drivers.items()):

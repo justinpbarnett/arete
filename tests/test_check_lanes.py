@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 from arete import lanes
+from tests.subprocess_helpers import CHILD_HANG_TIMEOUT
 
 ROOT = Path(__file__).resolve().parent.parent
 LANES = ["checks-0", "checks-1"]
@@ -48,14 +49,14 @@ class WorkerCheckLaneTests(unittest.TestCase):
         self.assertIn(WAITING, proc.stdout.readline())
         self.assertIsNone(proc.poll())
         self.held[0].close()
-        output, _ = proc.communicate(timeout=self.class_timeout)
+        output, _ = proc.communicate(timeout=max(CHILD_HANG_TIMEOUT, self.class_timeout))
         self.assertEqual(proc.returncode, 0, output)
         self.assertIn("Ran 1 tests", output)
         self.assertNotIn(WAITING, output)
 
     def test_named_class_runs_at_once_with_both_lanes_held(self):
         proc = self.launch("test_tiny.Tiny")
-        output, _ = proc.communicate(timeout=self.class_timeout)
+        output, _ = proc.communicate(timeout=max(CHILD_HANG_TIMEOUT, self.class_timeout))
         self.assertEqual(proc.returncode, 0, output)
         self.assertIn("Ran 1 tests", output)
         self.assertNotIn(WAITING, output)

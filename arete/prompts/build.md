@@ -26,7 +26,7 @@ Denied paths: $denied.
 - Write self-documenting code: no docstrings, and a comment only for what the code cannot show, such as a line that looks wrong and is right. Follow the repo's own docs where they ask for more.
 - Arete owns the full check gate and runs it after you finish: $checks.
   Do not duplicate the full suite in this builder step; leave it to the checks step.
-  Run the test classes for the files you changed by name, for example `uv run python -m tests.parallel test_x.SomeTests`;
+  Run the test classes for the files you changed by name, for example `$test_classes`;
   a full suite run here waits for a free check lane and gives you nothing the checks step does not.
   Use short, focused checks or a user-level reproduction when helpful, and report exactly what you ran.
   If a check cannot start in your sandbox, report that and finish; never work around the refusal.

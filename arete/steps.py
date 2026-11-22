@@ -21,13 +21,6 @@ BUILT_IN = {"verify": {"directory_cleanup": True}, "build": {"tools": tuple(BUIL
                                  "modalities": ("image",), "structured_output": True, "budget_usd": 0.25}}
 MODEL_SOURCE = ("runner", "provider")
 STEP_TOOLS = ("Read", "Glob", "Grep", "LS", "Edit", "MultiEdit", "Write", "TodoWrite")
-KEEPS_NO_SESSION = ("learn", "uat", "research_plan", "research_search", "research_synthesis",
-                    "research_audit", "document", "capture_evidence")
-READ_ONLY = ("learn", "research_plan", "research_search", "research_synthesis", "research_audit", "document",
-             "capture_evidence")
-SEARCHES = ("research_search",)
-FETCHES = ("research_audit",)
-NO_WEB = ("research_synthesis",)
 
 
 @dataclass(frozen=True)
@@ -89,7 +82,7 @@ def selected_tiers(cfg: config.Config, layer: config.RepoLayer) -> dict[str, tup
 
 
 def holds_model(entries: tuple[dict[str, str], ...], wanted: tuple[str, str]) -> bool:
-    return any(e.get("model") and routing.identity(*routing.source_route(e)[:2]) == wanted for e in entries)
+    return any(e.get("model") and routing.identity(*routing.source_route(e)) == wanted for e in entries)
 
 
 def tier_of(cfg: config.Config, layer: config.RepoLayer, named: str, wanted: tuple[str, str]) -> tuple[str, tuple]:
@@ -105,11 +98,14 @@ def chain_of(requested: tuple[str, str, str], tier: str, entries: tuple[dict[str
         return routing.Link(name, which, provider, tier, position, position == 0, routing.nearest_effort(which, effort),
                             traits_of(which).default_instructions if explicit is None else explicit)
 
-    wanted = routing.identity(*requested[:2])
+    wanted = routing.identity(*requested)
+    openrouter = routing.claude_openrouter(requested[0], requested[2])
     chain = [link(*requested, 0)]
     for entry in entries:
         which, name, provider = routing.source_route(entry)
-        if entry.get("model") and routing.identity(which, name) != wanted:
+        same_route = (routing.identity(which, name, provider) == wanted
+                      and routing.claude_openrouter(which, provider) == openrouter)
+        if entry.get("model") and not same_route:
             chain.append(link(which, name, provider, len(chain)))
     return tuple(chain)
 
@@ -119,7 +115,7 @@ def chain_for(cfg: config.Config, layer: config.RepoLayer | None, which: str, na
     layer = layer or config.RepoLayer(dir=Path())
     tier, entries = tier_of(cfg, layer, "", routing.identity(which, name))
     requested = routing.source_route({"model": name, "runner": which})
-    return chain_of(requested, tier, entries, effort, explicit), cfg.routing_fallback and layer.routing_fallback
+    return chain_of(requested, tier, entries, effort, explicit), config.routing_for(cfg, layer).fallback
 
 
 def tier_map(cfg: config.Config, layer: config.RepoLayer | None = None) -> tuple[str, dict[str, tuple[dict[str, str], ...]]]:
@@ -181,17 +177,19 @@ def merged(cfg: config.Config, layer: config.RepoLayer, role: str, kind: str, ov
     return settings
 
 
-def check_reach(where: str, cfg: config.Config, role: str, which: str, found: dict, instructions: tuple) -> None:
+def check_reach(where: str, cfg: config.Config, role_info: config.Role, which: str, found: dict,
+                instructions: tuple) -> None:
+    role = role_info.name
     tools, mcp = found["tools"], found["mcp"]
     traits = traits_of(which)
-    web = WEB_TOOLS if role in SEARCHES else ("WebFetch",) if role in FETCHES else ()
-    if role in FETCHES and "WebSearch" in tools:
+    web = WEB_TOOLS if role_info.web == "search" else ("WebFetch",) if role_info.web == "fetch" else ()
+    if role_info.web == "fetch" and "WebSearch" in tools:
         raise ValueError(f"{where}: tools WebSearch cannot load on {role}, which may only fetch again the sources "
                          "it audits")
-    if role in NO_WEB and (found_web := [t for t in tools if t in WEB_TOOLS]):
+    if role_info.web == "none" and (found_web := [t for t in tools if t in WEB_TOOLS]):
         raise ValueError(f"{where}: tools {', '.join(found_web)} cannot load on {role}, which writes only from the "
                          "evidence it is given")
-    if role in READ_ONLY:
+    if role_info.read_only:
         if acting := [t for t in tools if t not in READ_ONLY_TOOLS and t not in web]:
             raise ValueError(f"{where}: tools {', '.join(acting)} would let {role} change files; it is read only, "
                              "so use Read, Glob, Grep and LS")
@@ -201,9 +199,9 @@ def check_reach(where: str, cfg: config.Config, role: str, which: str, found: di
     if bad := [t for t in tools if t not in STEP_TOOLS and t not in web]:
         raise ValueError(f"{where}: tools {', '.join(bad)} is not a built in tool a step takes; use "
                          f"{', '.join(STEP_TOOLS)}, since shell rules come from the layer and servers from mcp")
-    if role == "orchestrate" and (tools or mcp or instructions):
+    if role_info.reach == "controller" and (tools or mcp or instructions):
         raise ValueError(f"{where}: the controller takes no tools, MCP servers or instruction scopes")
-    if (role != "orchestrate" and role not in SEARCHES and traits.always_granted_tools
+    if (role_info.reach != "controller" and role_info.web != "search" and traits.always_granted_tools
             and (missing := [t for t in traits.always_granted_tools if t not in tools])):
         raise ValueError(f"{where}: tools {', '.join(tools) or '[]'} leaves out {', '.join(missing)}, which {which} always "
                          "grants; list them")
@@ -218,7 +216,7 @@ def check_reach(where: str, cfg: config.Config, role: str, which: str, found: di
     if traits.instruction_scopes and (refused := [i for i in instructions if i not in traits.instruction_scopes]):
         raise ValueError(f"{where}: instructions {', '.join(map(repr, refused))} cannot load on {which}, which runs "
                          f"without your own {which} setup; use {json.dumps(list(traits.instruction_scopes))} or []")
-    if role in KEEPS_NO_SESSION and found["session"] == "resume":
+    if not role_info.keeps_session and found["session"] == "resume":
         raise ValueError(f"{where}: session 'resume' needs a kept session and {role} keeps none; use fresh")
 
 
@@ -227,7 +225,7 @@ def resolve(cfg: config.Config, layer: config.RepoLayer | None, step: str, kind:
             ticket: tuple[str, str] | None = None, side: str = "",
             held: tuple[str, str, dict] | None = None) -> Settings:
     role = config.STEP_ALIASES.get(step, step)
-    if role not in config.STEP_ROLES:
+    if (role_info := config.ROLE_BY_NAME.get(role)) is None:
         raise ValueError(f"unknown step '{step}'; use {', '.join(config.STEP_NAMES)}")
     where = f"step {role}" + (f" for {kind} tickets" if kind else "")
     layer = layer or config.RepoLayer(dir=Path())
@@ -261,36 +259,37 @@ def resolve(cfg: config.Config, layer: config.RepoLayer | None, step: str, kind:
     which, name, provider = routing.source_route(source)
     effort = found.get("effort", "")
     instructions = found.get("instructions", traits_of(which).default_instructions)
-    check_reach(where, cfg, role, which, found, instructions)
+    check_reach(where, cfg, role_info, which, found, instructions)
     notes = codex.NOTES if which == "codex" else ()
     link_tier = tier
     if not tier:
-        link_tier, entries = tier_of(cfg, layer, found.get("tier", ""), routing.identity(which, name))
+        link_tier, entries = tier_of(cfg, layer, found.get("tier", ""), routing.identity(which, name, provider))
     if cfg.replay.all:
         name = f"codex:{name}" if which == "codex" and routing.route(name)[0] != which else name
         which = REPLAY
         entries = ()
     explicit = tuple(found["instructions"]) if "instructions" in found else None
     chain = chain_of((which, name, provider), link_tier, entries, effort, explicit)
-    fallback = cfg.routing_fallback and layer.routing_fallback
+    routes = config.routing_for(cfg, layer)
+    fallback = routes.fallback
     runners = {link.runner for link in chain if fallback or link.requested}
     if fallback:
         runners.update({"openai": "codex", "anthropic": "claude"}[vendor]
-                       for link in chain if (vendor := routing.identity(link.runner, link.model)[0])
+                       for link in chain if (vendor := routing.identity(link.runner, link.model, link.provider)[0])
                        in ("openai", "anthropic"))
     supported = {level for run_with in runners for level in TRAITS[run_with].efforts}
     if effort and effort not in supported:
         raise ValueError(f"{where}: effort '{effort}' is not a level its routes take; use "
                          f"{', '.join(level for level in routing.EFFORT_ORDER if level in supported)}")
     floor = found.get("floor", "")
-    floors = {**cfg.floors, **layer.floors}
+    floors = routes.floors
     if floor and floor not in floors:
         raise ValueError(f"{where}: floor '{floor}' is not in [routing.floors]")
     requires = routing.Requirements(
         modalities=tuple(found.get("modalities", ())), min_context=found.get("min_context", 0),
         structured_output=found.get("structured_output", False), data_handling=tuple(found.get("data_handling", ())),
         floor=floor, approved=floors.get(floor, ()), directory_cleanup=found.get("directory_cleanup", False),
-        delegation_only=role == "orchestrate")
+        delegation_only=role_info.reach == "controller")
     return Settings(step=role, tier=tier, runner=which, provider=provider, model=name, effort=effort,
                     timeout_minutes=found["timeout_minutes"], tries=found["tries"], tools=found["tools"],
                     mcp=found["mcp"], instructions=instructions, session=found["session"], notes=notes,

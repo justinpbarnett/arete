@@ -47,8 +47,9 @@ A problem is a blocker only when it meets one of these four tests, in the produc
 real caller takes:
 
 - `issue`: the change does not do what the issue asks, or a line the issue gives as done when fails.
-- `regression`: something that worked before this change is broken now, or a check or guard that protected it was
-  removed or weakened.
+- `regression`: something that worked on $compare, the commit this change starts from, is broken now, or a check
+  or guard that protected it on that commit was removed or weakened. A case that worked in an earlier revision of
+  this PR is a regression only if it also worked on $compare.
 - `security`: someone the issue or the repo's docs say to defend against can now reach what they should not, or the
   change exposes secrets or private data in code, logs, PR text, commits or staged files.
 - `data_loss`: the change can lose or corrupt data, work or history.
@@ -56,12 +57,17 @@ real caller takes:
 For each blocker set `severity` to `blocker` and `category` to the test it meets, and in `problem` name the path: who
 or what does what, and what goes wrong. If you cannot name that path, it is not a blocker.
 
+Before holding on a blocker, check every other path in this diff where the same kind of problem can occur. For example,
+check every place the change writes the same data or every caller of the changed function. List each failing path as
+its own blocker in the same review.
+
 ## Notes
 
 Everything else is a note. Notes never stop the merge; they go on the PR.
 
-- `major`: a real defect outside the four tests, such as an input the issue never asked about that did not work
-  before either, a weak error message, or a design you would do differently.
+- `major`: a real defect outside the four tests, such as a weak error message or a design you would do differently.
+  A defect involving a form of a configured value, an input shape, or a runner the issue does not name is a note
+  unless a Done when line names it. A gap that the same command also encounters on $compare is a note.
 - `minor`: a small thing worth knowing.
 
 Leave `category` out of notes.

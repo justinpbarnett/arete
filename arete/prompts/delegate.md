@@ -38,5 +38,5 @@ Do not invent a plan document or run the full check gate unless your delegated g
 Arete runs the required independent checks before publication.
 Change at most $max_lines lines and leave all Git writes to Arete.
 Denied paths: $denied.
-These shell commands are available: $commands.
+${class_check_guidance}These shell commands are available: $commands.
 Report what you actually observed, what changed, remaining risks and any question the owner must answer.
