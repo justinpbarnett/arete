@@ -86,6 +86,8 @@ class Session:
     credential: str = ""
     account: str = ""
     generation: str = ""
+    openrouter_model: str = ""
+    openrouter_run: str = ""
 
 
 @dataclass(frozen=True)
@@ -274,6 +276,11 @@ def claude_tokens(usage: dict) -> dict:
             "tokens_out": int(usage.get("output_tokens") or 0),
             "cache_read": int(usage.get("cache_read_input_tokens") or 0),
             "cache_write": int(usage.get("cache_creation_input_tokens") or 0)}
+
+
+def token_cost(rates, tokens_in: int, tokens_out: int, cache_read: int, cache_write: int) -> float:
+    counts = (max(0, tokens_in - cache_read - cache_write), tokens_out, cache_read, cache_write)
+    return sum(count * (rate or 0) for count, rate in zip(counts, rates, strict=True)) / 1_000_000
 
 
 class Cut(Exception):
