@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shlex
@@ -27,6 +28,8 @@ CHATGPT_PROVIDER = "chatgpt"
 KEY_PROVIDER = "openai"
 READ_PROFILE, WRITE_PROFILE = "read_only", "workspace_write"
 PROFILE_BASE = {READ_PROFILE: ":read-only", WRITE_PROFILE: ":workspace"}
+TEMP_NAMES = ("TMPDIR", "TMP", "TEMP")
+LOG = logging.getLogger(__name__)
 WRITING_TOOLS = frozenset({"Edit", "MultiEdit", "Write", "NotebookEdit"})
 READ_BASH = re.compile(r"git -C \S+ (?:status|diff|log|show)\*|arete session (?:start|list|report|stop) --chat \d+(?: \*)?")
 FEATURES_OFF = ("plugins", "apps", "tool_suggest", "memories", "image_generation", "goals", "shell_snapshot", "multi_agent", "multi_agent_v2",
@@ -308,12 +311,15 @@ def executables(allowed_tools: list[str] | None, hidden: list[Path | str]) -> di
 
 
 def profile(cwd: Path, add_dirs: list[Path], writing: bool, hidden: list[Path | str],
-            allowed_tools: list[str] | None = None, *, floor: guard.Floor | None = None) -> list[str]:
+            allowed_tools: list[str] | None = None, *, floor: guard.Floor | None = None,
+            temp_dir: Path | None = None) -> list[str]:
     floor = floor or guard.floor(os.environ.get("ARETE_RUN_ID", ""), cwd, add_dirs)
     name = WRITE_PROFILE if writing else READ_PROFILE
     granted = {path: "write" if writing else "read" for path in both(cwd)}
     if writing:
         granted |= {path: "write" for d in add_dirs for path in both(d)}
+    elif temp_dir is not None:
+        granted |= {path: "write" for path in both(temp_dir)}
     metadata = {path: "read" for root in [cwd, *add_dirs] for path in both(root / ".git")}
     result = util.sh(["git", "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"], cwd=cwd,
                      timeout=10, env=agent_env(), inherit=False)
@@ -427,6 +433,7 @@ def command(
     hidden: list[Path | str] = (),
     scratch: tuple[str, ...] = (),
     floor: guard.Floor | None = None,
+    temp_dir: Path | None = None,
 ) -> list[str]:
     try:
         if any((home() / name).exists() for name in ("AGENTS.override.md", "AGENTS.md")):
@@ -450,10 +457,14 @@ def command(
         cmd += ["--disable", feature]
     for key, value in SETTINGS.items():
         cmd += setting(key, value)
-    cmd += profile(cwd, add_dirs, writes(tools, allowed_tools), list(hidden), allowed_tools, floor=floor)
+    cmd += profile(cwd, add_dirs, writes(tools, allowed_tools), list(hidden), allowed_tools, floor=floor,
+                   temp_dir=temp_dir)
+    shell_names = set(command_names(passing or [], extra_env)) - {
+        k for server in servers.values() for k in (server.get("env") or {})}
+    if temp_dir is not None:
+        shell_names.update(TEMP_NAMES)
     cmd += setting("shell_environment_policy", {"inherit": "all", "ignore_default_excludes": True,
-                                                "include_only": sorted(set(command_names(passing or [], extra_env)) -
-                                                    {k for server in servers.values() for k in (server.get("env") or {})})})
+                                                "include_only": sorted(shell_names)})
     cmd += setting("project_doc_max_bytes", 0)
     if instructions is None or "repo" in instructions:
         system = "\n\n".join(filter(None, [system, repo_instructions(cwd)]))
@@ -493,6 +504,35 @@ def launch(cmd, cwd, prompt, env, timeout, on_line, *, hidden=(), scratch=(), ad
                      and paths.WORKTREES_DIR.resolve() in protected
                      and verification_scratch.isolation(attempt, "codex", False, add_dirs, mcp_config)))
     return child.stream(cmd, str(cwd), prompt, env, timeout, on_line, actor_confined=confined)
+
+
+def remove_temp_dir(folder: Path) -> None:
+    try:
+        shutil.rmtree(folder)
+    except OSError as e:
+        LOG.warning("Could not remove Codex temporary directory %s: %s", folder, e)
+
+
+def protected_temp_dir(folder: Path, roots: tuple[Path | str, ...]) -> bool:
+    try:
+        locations = [Path(path) for path in both(folder)]
+        protected = {Path(path) for root in roots for path in both(root)}
+        if any(location.is_relative_to(root) for location in locations for root in protected):
+            return True
+        identities = set()
+        for root in protected:
+            try:
+                info = root.stat()
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            identities.add((info.st_dev, info.st_ino))
+        for ancestor in {p for location in locations for p in (location, *location.parents)}:
+            info = ancestor.stat()
+            if (info.st_dev, info.st_ino) in identities:
+                return True
+    except OSError:
+        return True
+    return False
 
 
 def _run(
@@ -548,35 +588,48 @@ def _run(
         return Result(ok=False, session=resume, error="codex MCP environment contains a reserved login variable",
                       runner="codex", model=model)
     env = {**agent_env(passing, extra_env, api_key=api_key), **mcp_env}
+    temp_dir = None
     try:
-        cmd = command(cwd, model=model, effort=effort, tools=tools, allowed_tools=allowed_tools, resume=resume,
-                      system=system, persist=persist, add_dirs=add_dirs, mcp_config=mcp_config, instructions=instructions,
-                      judge=judge, passing=passing, extra_env=extra_env, hidden=hidden, scratch=scratch, floor=floor)
-    except (ValueError, OSError) as e:
-        return Result(ok=False, session=resume, error=str(e), runner="codex", model=model)
-    if json_schema:
-        prompt = f"{prompt}\n\n{SCHEMA_RULE.format(schema=json.dumps(json_schema))}"
-    provider = KEY_PROVIDER if auth.mode == "api_key" else CHATGPT_PROVIDER
-    before = thread_usage(resume.id)
-    on_line(json.dumps({"arete": "command", "argv": cmd, "usage_before": before}) + "\n")
-    session = resume
+        try:
+            if not writes(tools, allowed_tools) and verification_scratch.PRODUCING.get() is None:
+                temp_dir = Path(tempfile.mkdtemp(prefix="arete-codex-tmp-"))
+                if protected_temp_dir(temp_dir, (cwd, *(add_dirs or []), *sandbox.authority_roots())):
+                    remove_temp_dir(temp_dir)
+                    temp_dir = None
+            cmd = command(cwd, model=model, effort=effort, tools=tools, allowed_tools=allowed_tools, resume=resume,
+                          system=system, persist=persist, add_dirs=add_dirs, mcp_config=mcp_config,
+                          instructions=instructions, judge=judge, passing=passing, extra_env=extra_env, hidden=hidden,
+                          scratch=scratch, floor=floor, temp_dir=temp_dir)
+        except (ValueError, OSError) as e:
+            return Result(ok=False, session=resume, error=str(e), runner="codex", model=model)
+        if temp_dir is not None:
+            env.update(dict.fromkeys(TEMP_NAMES, str(temp_dir)))
+        if json_schema:
+            prompt = f"{prompt}\n\n{SCHEMA_RULE.format(schema=json.dumps(json_schema))}"
+        provider = KEY_PROVIDER if auth.mode == "api_key" else CHATGPT_PROVIDER
+        before = thread_usage(resume.id)
+        on_line(json.dumps({"arete": "command", "argv": cmd, "usage_before": before}) + "\n")
+        session = resume
 
-    def streamed(line: str) -> None:
-        nonlocal session
-        for event in events(line):
-            if event.get("type") == "thread.started" and event.get("thread_id"):
-                session = Session(str(event["thread_id"]), 0.0, "codex")
-        on_line(line)
+        def streamed(line: str) -> None:
+            nonlocal session
+            for event in events(line):
+                if event.get("type") == "thread.started" and event.get("thread_id"):
+                    session = Session(str(event["thread_id"]), 0.0, "codex")
+            on_line(line)
 
-    try:
-        proc = launch(cmd, cwd, prompt, env, timeout, streamed, hidden=hidden, scratch=scratch, add_dirs=add_dirs,
-                      mcp_config=mcp_config)
-    except subprocess.TimeoutExpired:
-        return Result(ok=False, session=session, error=f"timed out after {timeout}s", runner="codex", model=model,
-                      provider=provider)
-    except FileNotFoundError as e:
-        return Result(ok=False, session=resume, error=f"codex not found: {e}", runner="codex", model=model)
-    return parse(proc, resume, model, json_schema, provider, before)
+        try:
+            proc = launch(cmd, cwd, prompt, env, timeout, streamed, hidden=hidden, scratch=scratch, add_dirs=add_dirs,
+                          mcp_config=mcp_config)
+        except subprocess.TimeoutExpired:
+            return Result(ok=False, session=session, error=f"timed out after {timeout}s", runner="codex", model=model,
+                          provider=provider)
+        except FileNotFoundError as e:
+            return Result(ok=False, session=resume, error=f"codex not found: {e}", runner="codex", model=model)
+        return parse(proc, resume, model, json_schema, provider, before)
+    finally:
+        if temp_dir is not None:
+            remove_temp_dir(temp_dir)
 
 
 def isolation_problem(cwd: Path, instructions: list[str] | None) -> str:
