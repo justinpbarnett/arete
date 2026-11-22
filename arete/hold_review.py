@@ -108,11 +108,11 @@ def read_change(approval: dict, wt: Path, base: str, diff: str, model: str, cfg:
     log = util.git(["log", f"-n{COMMITS_SHOWN}", "--date=short", "--format=%h %ad %s", f"origin/{base}", "--", *files],
                    wt) if files else ""
     briefing_without_patch = emit.briefing({**item, "patch": ""})
-    text = prompt_loader.prompt("hold_review", loop=approval["loop"], repo=delivery.repo_of(approval) or "none", base=base,
-                           held=approval["emit"]["held"], mark=secrets.token_hex(8),
-                           briefing=briefing_without_patch[:BRIEFING_SHOWN],
-                           diff=push.shown_patch(diff, f"git diff origin/{base} HEAD", DIFF_SHOWN),
-                           log=log.strip() or "none")
+    text = prompt_loader.live_prompt("hold_review", loop=approval["loop"], repo=delivery.repo_of(approval) or "none",
+                                    base=base, held=approval["emit"]["held"], mark=secrets.token_hex(8),
+                                    briefing=briefing_without_patch[:BRIEFING_SHOWN],
+                                    diff=push.shown_patch(diff, f"git diff origin/{base} HEAD", DIFF_SHOWN),
+                                    log=log.strip() or "none")
     res = runner.run(text, wt, model=model, allowed_tools=REVIEW_TOOLS, disallowed_tools=REVIEW_DENIED, ask_jev=False,
                      json_schema=SCHEMA, persist=False, timeout=TIMEOUT_SECONDS,
                      wait_out_limits=False, trace=(approval["run_id"], f"review #{approval['id']}"), cfg=cfg,

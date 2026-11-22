@@ -245,7 +245,7 @@ def cmd_prompts(args) -> int:
         print("no prompt templates found", file=sys.stderr)
     for name in names:
         try:
-            inputs = prompt_loader.template(name).get_identifiers()
+            inputs = prompt_loader.template(name, paths.PROMPTS_DIR, live=True).get_identifiers()
             row = {"name": name, "valid": True, "inputs": inputs}
         except (OSError, ValueError) as error:
             row = {"name": name, "valid": False, "error": str(error)}

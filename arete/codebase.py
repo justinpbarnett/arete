@@ -23,6 +23,7 @@ RELEASE = ""
 def code_files() -> list[Path]:
     found = [p for p in (CHECKOUT / "arete").rglob("*.py") if "__pycache__" not in p.parts]
     found += (CHECKOUT / "adws").glob("*.py")
+    found += (CHECKOUT / "arete" / "prompts").glob("*.md")
     return sorted(found)
 
 
@@ -105,6 +106,9 @@ def load() -> str:
         return STAMP
     before, _ = inventory()
     import_everything()
+    from . import paths, prompt_loader
+
+    prompt_loader.load_templates(paths.PROMPTS_DIR)
     head, dirty = head_and_dirt()
     release = clean_release(head) if head and not dirty else ""
     after, newest = inventory()

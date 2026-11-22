@@ -127,10 +127,18 @@ class Prompts:
         return f"{harness} with prompts {self.label}" if self.label else harness
 
 
-def prompts_digest(prompts: Prompts) -> str:
+def prompt_files(prompts: Prompts) -> dict[Path, dict[str, bytes]]:
     files = {p.name: p for p in paths.PROMPTS_DIR.glob("*.md")}
     files.update({f"{name}.md": prompts.dir / f"{name}.md" for name in BUILDER_PROMPTS})
-    return util.digest(*(part for name, p in sorted(files.items()) for part in (name, p.read_bytes())))
+    folders: dict[Path, dict[str, bytes]] = {p.absolute(): {} for p in (paths.PROMPTS_DIR, prompts.dir)}
+    for name, file in files.items():
+        folders[file.parent.absolute()][name] = file.read_bytes()
+    return folders
+
+
+def prompts_digest(files: dict[Path, dict[str, bytes]]) -> str:
+    ordered = sorted(item for folder in files.values() for item in folder.items())
+    return util.digest(*(part for name, data in ordered for part in (name, data)))
 
 
 def prompts_from(prompts: Prompts) -> str:
@@ -830,10 +838,11 @@ def run_suite(cfg: config.Config, repo: config.Repo, src: Source, tasks: list[Ta
               prompts: Prompts) -> Arm:
     label = prompts.applied_to(src.label)
     engine = codebase.load()
-    lineage = {"engine_sha": engine, "prompts_sha": prompts_digest(prompts), "prompts_from": prompts_from(prompts)}
+    files = prompt_files(prompts)
+    lineage = {"engine_sha": engine, "prompts_sha": prompts_digest(files), "prompts_from": prompts_from(prompts)}
     run_id = record.start("eval", tag=tag, lock=run_store.run_lock("eval", repo.name), repo=repo.name)
     results = []
-    with record.failed_on_crash(run_id):
+    with record.failed_on_crash(run_id), prompt_loader.scoped_templates(files):
         for t in tasks:
             prior = insights_store.task_history(repo.name, t.name, 3)
             after_step = run_store.last_step_id(run_id)

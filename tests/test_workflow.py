@@ -32,8 +32,8 @@ from unittest import mock
 
 from adws import single_worker
 from arete import (
-    accounts, api_check, ci, claude, codebase, codex, config, dashboard, dbstats, diffguard, evals, factory, flows, gh,
-    guard, install, jev, journeys, launch_lease, loop_run, mergecheck, miner, orchestration, outbound, outcomes, owner_asks,
+    accounts, api_check, capture, ci, claude, codebase, codex, config, dashboard, dbstats, diffguard, evals, factory, flows,
+    gh, guard, install, jev, journeys, launch_lease, loop_run, mergecheck, miner, orchestration, outbound, outcomes, owner_asks,
     paths, pipeline, poll, principals, prompt_loader, queueing, record, routing, runlimits, runner, sandbox, serve,
     serve_guard, slots, tailnet, tasks, tracker, util, verify, workspace,
 )
@@ -9140,6 +9140,211 @@ class NamedClassCheckTests(unittest.TestCase):
         self.assertFalse(any(str(self.script) in rule for rule in review_allowed))
 
 
+class PromptSnapshotTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True)))
+        self.enterContext(mock.patch.object(prompt_loader, "TEMPLATES", {}))
+
+    def test_prompt_keeps_startup_template_after_edit(self):
+        file = self.root / "x.md"
+        file.write_text("a $one")
+        prompt_loader.load_templates(self.root)
+
+        file.write_text("a $one $two")
+
+        self.assertEqual(prompt_loader.prompt("x", self.root, one="1"), "a 1")
+
+    def test_other_folder_reads_current_template_from_disk(self):
+        (self.root / "x.md").write_text("startup $one")
+        other = self.root / "other"
+        other.mkdir()
+        file = other / "x.md"
+        file.write_text("original $one")
+        prompt_loader.load_templates(self.root)
+
+        file.write_text("current $one")
+
+        self.assertEqual(prompt_loader.template("x", other).template, "current $one")
+
+    def test_live_render_reads_repair_without_replacing_snapshot(self):
+        file = self.root / "x.md"
+        file.write_text("broken $")
+        prompt_loader.load_templates(self.root)
+        with self.assertRaisesRegex(ValueError, "invalid placeholder"):
+            prompt_loader.live_prompt("x", self.root, one="1")
+
+        file.write_text("current $one")
+
+        self.assertEqual(prompt_loader.live_prompt("x", self.root, one="1"), "current 1")
+        with self.assertRaisesRegex(ValueError, "invalid placeholder"):
+            prompt_loader.prompt("x", self.root, one="1")
+
+    def test_feedback_writer_uses_repaired_template_on_next_submission(self):
+        file = self.root / "document.md"
+        file.write_text("broken $")
+        prompt_loader.load_templates(self.root)
+        cfg = config.Config(document={"enabled": True})
+        draft = {"id": 1, "kind": "feature", "text": "Add a filter.", "written_print": ""}
+        answer = Result(True, structured={"title": "Add a filter", "text": "Let readers filter results."})
+
+        with (mock.patch.object(paths, "PROMPTS_DIR", self.root),
+              mock.patch.object(capture.document, "ask", return_value=answer) as writer,
+              mock.patch.object(capture.insights_store, "capture_written") as written):
+            capture.write_first(draft, cfg)
+            writer.assert_not_called()
+            self.assertEqual(written.call_args.args[2:4], ("", ""))
+            self.assertIn("invalid placeholder", written.call_args.args[4])
+
+            file.write_text("repaired $draft")
+            capture.write_first({**draft, "id": 2}, cfg)
+
+        self.assertEqual(writer.call_args.args[0], "repaired Add a filter.")
+        self.assertEqual(written.call_args.args, (2, capture.request_print(draft, cfg),
+                                                 "Add a filter", "Let readers filter results.", ""))
+        with self.assertRaisesRegex(ValueError, "invalid placeholder"):
+            prompt_loader.template("document", self.root)
+
+    def test_eval_suite_renders_the_bytes_recorded_in_lineage(self):
+        folder = self.root / "prompts"
+        folder.mkdir()
+        names = ("build", "fix", "plan")
+
+        def deploy(version):
+            for name in names:
+                (folder / f"{name}.md").write_text(f"{version} {name}\n")
+            return util.digest(*(part for name in names for part in (f"{name}.md", f"{version} {name}\n")))
+
+        deploy("startup")
+        prompt_loader.load_templates(folder)
+        first_sha = deploy("first")
+        rendered = []
+        second_sha = None
+
+        def agent(run, step, text, *args, **kwargs):
+            nonlocal second_sha
+            version = "first" if run.repo.name == "one" else "second"
+            name = "fix" if step == "fix2" else step
+            self.assertTrue(text.endswith(f"\n\n{version} {name}\n"), (run.repo.name, step, text))
+            rendered.append((run.repo.name, step))
+            if run.repo.name == "one" and step == "plan":
+                second_sha = deploy("second")
+            return Result(True, structured={"plan": "Make the change."} if step == "plan" else None)
+
+        cfg = config.Config()
+        src = SimpleNamespace(label="fixture")
+        task = evals.Task("fixture", "Fixture", "Make the change.", check="fixture check")
+        prompts = evals.Prompts(folder)
+        with (mock.patch.multiple(paths, PROMPTS_DIR=folder, RUNS_DIR=self.root / "runs",
+                                  WORKTREES_DIR=self.root / "worktrees"),
+              mock.patch.object(codebase, "load", return_value="fixture"),
+              mock.patch.multiple(record, start=mock.Mock(side_effect=["eval-one", "eval-two"]),
+                                  failed_on_crash=mock.Mock(side_effect=lambda _: nullcontext()),
+                                  settle=mock.DEFAULT, metered_spent=mock.Mock(return_value=0)),
+              mock.patch.multiple(evals.insights_store, task_history=mock.Mock(return_value=[]), add_eval=mock.DEFAULT),
+              mock.patch.object(evals.run_store, "last_step_id", return_value=0),
+              mock.patch.multiple(evals, fetch_origin=mock.DEFAULT,
+                                  checkout_without_origin_refs=mock.Mock(return_value="base"),
+                                  prepare=mock.Mock(return_value=config.RepoLayer(self.root)),
+                                  context_digest=mock.Mock(return_value="harness"), git=mock.Mock(return_value=""),
+                                  hidden_check=mock.Mock(return_value=SimpleNamespace(returncode=0, stdout="", stderr=""))),
+              mock.patch.object(evals.vault, "hidden", side_effect=str),
+              mock.patch.object(evals.EvalRun, "gate", side_effect=[(False, "try again"), (True, "")] * 2),
+              mock.patch.object(evals.EvalRun, "agent", autospec=True, side_effect=agent),
+              redirect_stdout(StringIO())):
+            for name in ("one", "two"):
+                arm = evals.run_suite(cfg, config.Repo(name, self.root), src, [task], name, prompts)
+                self.assertEqual(arm.score, "1/1", arm.results[0].why)
+            lineage = [call.args[-1]["prompts_sha"] for call in evals.insights_store.add_eval.call_args_list]
+
+        self.assertEqual(rendered, [(repo, step) for repo in ("one", "two") for step in ("plan", "build", "fix2")])
+        self.assertEqual(lineage, [first_sha, second_sha])
+        self.assertEqual(prompt_loader.template("plan", folder).template, "startup plan\n")
+
+    def test_new_name_still_looks_missing_after_snapshot(self):
+        file = self.root / "new.md"
+        prompt_loader.load_templates(self.root)
+        file.write_text("deployed")
+
+        with self.assertRaises(FileNotFoundError) as missing:
+            prompt_loader.template("new", self.root)
+        self.assertEqual((missing.exception.errno, missing.exception.filename), (errno.ENOENT, str(file)))
+
+    def test_codebase_load_defers_unreadable_and_undecodable_prompts(self):
+        prompts = self.root / "arete" / "prompts"
+        prompts.mkdir(parents=True)
+        (prompts / "plan.md").write_text("plan $one")
+        invalid = prompts / "invalid.md"
+        invalid.write_bytes(b"\xff")
+        unreadable = prompts / "unreadable.md"
+        unreadable.touch()
+
+        def deny_unreadable(read):
+            def read_file(file, *args, **kwargs):
+                if file == unreadable:
+                    raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(file))
+                return read(file, *args, **kwargs)
+            return read_file
+
+        with (mock.patch.multiple(codebase, CHECKOUT=self.root, STAMP="", RELEASE=""),
+              mock.patch.object(codebase, "import_everything"),
+              mock.patch.object(codebase, "head_and_dirt", return_value=("", False)),
+              mock.patch.object(codebase.arete, "IMPORTED_NS", time.time_ns()),
+              mock.patch.object(codebase, "reload") as reload,
+              mock.patch.object(paths, "PROMPTS_DIR", prompts),
+              mock.patch.object(Path, "read_text", deny_unreadable(Path.read_text)),
+              mock.patch.object(Path, "read_bytes", deny_unreadable(Path.read_bytes))):
+            self.assertTrue(codebase.load())
+            reload.assert_not_called()
+
+        self.assertEqual(prompt_loader.prompt("plan", prompts, one="1"), "plan 1")
+        invalid.write_text("repaired")
+        with self.assertRaises(PermissionError) as denied:
+            prompt_loader.template("unreadable", prompts)
+        self.assertEqual((denied.exception.errno, denied.exception.filename), (errno.EACCES, str(unreadable)))
+        with self.assertRaises(UnicodeDecodeError):
+            prompt_loader.template("invalid", prompts)
+
+    def test_prompts_json_reads_current_files_and_reports_each_error(self):
+        from arete.commands.setup import cmd_prompts
+
+        plan = self.root / "plan.md"
+        plan.write_text("old $one")
+        (self.root / "invalid.md").write_bytes(b"\xff")
+        (self.root / "unreadable.md").symlink_to("unavailable")
+        prompt_loader.load_templates(self.root)
+        plan.write_text("current $two")
+
+        with mock.patch.object(paths, "PROMPTS_DIR", self.root):
+            with redirect_stdout(StringIO()) as out:
+                self.assertEqual(cmd_prompts(SimpleNamespace(name="plan", json=True)), 0)
+            valid = {"name": "plan", "valid": True, "inputs": ["two"]}
+            self.assertEqual(json.loads(out.getvalue()), valid)
+            with redirect_stdout(StringIO()) as out:
+                self.assertEqual(cmd_prompts(SimpleNamespace(name="", json=True)), 1)
+        invalid, read, unreadable = map(json.loads, out.getvalue().splitlines())
+        self.assertEqual(read, valid)
+        self.assertEqual((invalid["name"], invalid["valid"]), ("invalid", False))
+        self.assertIn("decode", invalid["error"])
+        self.assertEqual((unreadable["name"], unreadable["valid"]), ("unreadable", False))
+        self.assertIn("No such file", unreadable["error"])
+
+    def test_inventory_digest_changes_when_prompt_changes(self):
+        prompts = self.root / "arete" / "prompts"
+        prompts.mkdir(parents=True)
+        file = prompts / "x.md"
+        file.write_text("a $one")
+        with mock.patch.object(codebase, "CHECKOUT", self.root):
+            before, _ = codebase.inventory()
+
+            file.write_text("a $one $two")
+            after, _ = codebase.inventory()
+
+            file.write_bytes(b"\xff")
+            invalid, _ = codebase.inventory()
+        self.assertNotEqual(before, after)
+        self.assertNotEqual(after, invalid)
+
+
 class ReviewRepairPromptTests(unittest.TestCase):
     brief = prompt_loader.Brief("fixture", "test checkout", "#817", "Review and repair", "Cover analogous paths.")
 
@@ -10487,13 +10692,20 @@ class MinerLifecycleTests(unittest.TestCase):
             run.agent = mock.Mock(side_effect=[Result(ok=True, structured={}),
                                                Result(ok=on_base, error="" if on_base else "runner timed out")])
             run.gate = mock.Mock(return_value=(True, "checks passed"))
-            return run_task(cfg, source, task, evals.Prompts(), run)
+            return run_task(cfg, source, task, prompts, run)
+
+        def export_prompts(repo, ref, dest):
+            prompts = {"plan.md": b"Plan the fixture", "build.md": f"Build the fixture at {ref}".encode(),
+                       "fix.md": b"Fix the fixture"}
+            dest.mkdir(parents=True, exist_ok=True)
+            for name, data in prompts.items():
+                (dest / name).write_bytes(data)
+            return prompts
 
         run_task = evals.run_task
         self.eval.side_effect = self.compare_prompts
-        export = mock.Mock(side_effect=lambda repo, ref, dest: {"build.md": ref.encode()})
         with mock.patch.multiple(
-            evals, export_prompts=export, suites=lambda cfg: [self.repo], paired_tasks=lambda *args: [task],
+            evals, export_prompts=export_prompts, suites=lambda cfg: [self.repo], paired_tasks=lambda *args: [task],
             run_task=execute, fetch_origin=mock.DEFAULT, checkout_without_origin_refs=mock.Mock(return_value=self.BASE),
             prepare=mock.Mock(return_value=layer), context_digest=mock.Mock(return_value="harness"),
             eval_settings=mock.Mock(return_value=""), git=mock.DEFAULT,
@@ -10506,7 +10718,6 @@ class MinerLifecycleTests(unittest.TestCase):
             evals.insights_store, task_history=mock.Mock(return_value=[]), add_eval=mock.DEFAULT,
         ), mock.patch.object(evals.codebase, "load", return_value="fixture"), \
                 mock.patch.object(evals.vault, "hidden", side_effect=str), \
-                mock.patch.object(evals, "prompts_digest", return_value="fixture"), \
                 mock.patch.object(evals.run_store, "last_step_id", return_value=0), \
                 mock.patch.object(evals.paths, "WORKTREES_DIR", self.root / "worktrees"), \
                 mock.patch.object(util, "lock", return_value=nullcontext(True)), \
