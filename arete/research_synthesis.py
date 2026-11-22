@@ -175,7 +175,7 @@ def ask(cfg: config.Config, budget: research_budget.Budget, s: steps.Settings, t
                       claims=research_plan.bullets(plan["claims"]), tasks=research_search.task_lines(evidence),
                       sources=json.dumps(research_search.supplied(evidence), indent=2),
                       gaps="\n".join(research_search.gap_lines(evidence)) or "none",
-                      audit=AUDITED_LEAD if cfg.research_audit else "",
+                      audit=AUDITED_LEAD if cfg.research.audit else "",
                       more=more_text(round_no, got.may_search, ROUNDS_USED if round_no >= MAX_ROUNDS else NO_ROOM))
         res = budget.call(text + feedback, cwd, usd, seconds, reserve=got.may_search, model=s.model, runner=s.runner,
                           effort=s.call["effort"], tools=tools, allowed_tools=tools, instructions=list(s.instructions),
@@ -335,7 +335,7 @@ def run(cfg: config.Config, budget: research_budget.Budget, plan: dict, evidence
         break
     current["synthesis"] = {"at": util.iso(), "runner": s.runner, "model": s.model, "tools": tools, "rounds": rounds,
                             "cited": []}
-    if cfg.research_audit:
+    if cfg.research.audit:
         res = audited(cfg, budget, last, current, extra, ref, judged)
         if not res.ok:
             return res

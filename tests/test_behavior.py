@@ -12,6 +12,7 @@ import threading
 import unittest
 from contextlib import ExitStack, chdir, closing, contextmanager, redirect_stderr, redirect_stdout
 from contextvars import Context
+from dataclasses import asdict, replace
 from http.client import HTTPConnection, HTTPResponse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO, StringIO
@@ -37,6 +38,285 @@ from tests.subprocess_helpers import CHILD_HANG_TIMEOUT
 
 def setUpModule():
     support.isolate_live_state()
+
+
+class ConfigRegistryTests(unittest.TestCase):
+    class_timeout = CHILD_HANG_TIMEOUT
+    golden = Path(__file__).parent / "golden" / "config_errors.json"
+    config_errors = {
+        "dashboard flag": "[dashboard]\nhttps = 1",
+        "server URL": "[server]\nurl = false",
+        "factory folder": "[factory]\nadws = false",
+        "tier keys": '[tiers.default.fast]\nz = 1\na = 2',
+        "tier route": '[tiers.default.fast]\nrunner = "bad"\nmodel = "sonnet"',
+        "step names": "[steps.z]\n[steps.a]",
+        "step keys": "[steps.build]\nz = 1\na = 2",
+        "step count": "[steps.build]\ntries = true",
+        "step amount": "[steps.build]\nbudget_usd = nan",
+        "step amount bool": "[steps.build]\nbudget_usd = true",
+        "step flag": "[steps.build]\nstructured_output = 1",
+        "step cleanup flag": "[steps.build]\ndirectory_cleanup = 1",
+        "step alias": "[steps.implement]\n[steps.build]",
+        "kind names": "[kinds.z]\n[kinds.a]",
+        "kind keys": "[kinds.feat]\nz = 1",
+        "kind step names": "[kinds.feat.steps.bad]",
+        "pricing number": "[pricing.models.sonnet]\ninput = false",
+        "routing keys": "[routing]\nz = 1",
+        "routing flag": "[routing]\nfallback = 0",
+        "routing modes": "[routing]\npayment_modes = []",
+        "capability keys": "[routing.capabilities.sonnet]\nz = 1",
+        "capability context": "[routing.capabilities.sonnet]\ncontext = true",
+        "capability flag": "[routing.capabilities.sonnet]\nstructured_output = 0",
+        "paid keys": "[routing.paid]\nz = 1",
+        "paid number": "[routing.paid]\nmax_input = inf",
+        "jira state": '[jira.transitions]\nmerged = "Done"\ndone = "Done"',
+        "jira number": '[jira]\nauto_per_refresh = "bad"',
+        "jev question": '[jev.screen_lines]\nz = 1',
+        "jev weight": '[jev.risk_weights]\nz = 1',
+        "jev number": '[jev]\nconfidence = "bad"',
+        "github app table": 'github_app = true',
+        "github app ID": '[github_app]\ninstallation_id = "bad"',
+        "repo tracker": '[[repo]]\nname = "extra"\ntracker = "bad"',
+        "job label": "[[job]]\nkeepalive = 1",
+        "probe number": '[[probe]]\nname = "bad"\ncommand = ["test"]\ntimeout = "bad"',
+        "oncall keys": "[oncall]\nz = 1",
+        "oncall flag": "[oncall]\nenabled = 1",
+        "oncall whole": "[oncall]\nmax_attempts = true",
+        "oncall amount": "[oncall]\nincident_budget_usd = 0",
+        "oncall inclusive amount": "[oncall]\nkeep_days = nan",
+        "oncall source keys": "[[oncall.source]]\nz = 1",
+        "oncall source path": "[[oncall.source]]\npath = true",
+        "replay keys": "[replay]\nz = 1",
+        "mcp keys": "[mcp.example]\nz = 1",
+        "mcp command": "[mcp.example]\ncommand = false",
+        "research keys": "[research]\nz = 1",
+        "research planner": "[research]\nplanner = 1",
+        "research search": "[research]\nsearch = 1",
+        "research synthesis": "[research]\nsynthesis = 1",
+        "research audit": "[research]\naudit = 1",
+        "research workers": "[research]\nsearch_workers = 9",
+        "research share": "[research]\nsearch_share = 1",
+        "ask keys": "[ask]\nz = 1",
+        "ask count": "[ask]\nmax_per_run = -1",
+        "ask flag": "[ask]\nsettle = 1",
+        "ask expiration": "[ask]\nexpire_days = inf",
+        "ask reminder": "[ask]\nremind_hours = true",
+        "triage keys": "[triage]\nz = 1",
+        "triage auto": "[triage]\nauto = 1",
+        "triage route fixes": "[triage]\nroute_fixes = 1",
+        "triage count": "[triage]\nauto_per_refresh = true",
+        "retention keys": "[retention]\nz = 1",
+        "retention number": "[retention]\ndays = nan",
+        "backup keys": "[backup]\nz = 1",
+        "backup destination": "[backup]\ncopy_to = false",
+        "chat keys": "[chat]\nz = 1",
+        "chat count": "[chat]\ncontext_tokens = true",
+        "chat number": "[chat]\nbudget_usd = inf",
+        "environment keys": "[environment]\nz = 1",
+        "environment names": "[environment]\npass = false",
+        "document keys": "[document]\nz = 1",
+        "document flag": "[document]\nenabled = 1",
+        "capture keys": "[capture]\nz = 1",
+        "capture flag": "[capture]\npublic_evidence = 1",
+        "capture order": "[capture]\nevidence_branch = false\npublic_evidence = 1\nvision = 1",
+        "ab keys": "[ab.test]\nz = 1",
+        "ab step": "[ab.test]\nstep = []",
+        "ab kind": '[ab.test]\nstep = "build"\nkind = "bad"',
+        "ab share": '[ab.test]\nstep = "build"\nshare = true',
+        "ab arm keys": '[ab.test]\nstep = "build"\nshare = 0.25\n[ab.test.arm]\nz = 1',
+        "section order": "[capture]\npublic_evidence = 1\n[ask]\nsettle = 1\n[routing]\nfallback = 1",
+        "step order": "[steps.build]\ndirectory_cleanup = 1\nbudget_usd = 0\ntries = 0",
+        "research order": "[research]\nsearch = true\nsynthesis = 1\naudit = 1",
+    }
+    layer_errors = {
+        "check policy keys": "[check_policy]\nz = 1",
+        "limits flag": "[limits]\nparallel_checks = 1",
+        "limits number": "[limits]\nmax_run_minutes = false",
+        "verify publish flag": "[verify]\npublish_evidence = 1",
+        "verify patch flag": "[verify]\nallow_patch_gaps = 1",
+        "verify number": "[verify]\npreflight_seconds = true",
+        "verify order": "[verify]\nallow_patch_gaps = 1\npreflight_seconds = true\npublish_evidence = 1",
+        "orchestration keys": "[orchestration]\nz = 1",
+        "orchestration number": "[orchestration]\nmax_actions = true",
+        "patch policy keys": "[factory.patch]\nz = 1",
+        "patch policy number": "[factory.patch]\nmax_lines = true",
+        "layer environment keys": "[environment]\nz = 1",
+    }
+    settings_config = """
+[research]
+planner = true
+search = true
+synthesis = true
+audit = true
+search_workers = 4
+search_share = 0.5
+[capture]
+vision = "capture.md"
+evidence_branch = "capture/test"
+public_evidence = true
+[routing]
+payment_modes = ["api_key", "subscription"]
+[routing.capabilities.sonnet]
+modalities = ["text", "image"]
+context = 8000
+[routing.floors]
+quality = ["opus"]
+global = ["haiku"]
+[routing.paid]
+providers = ["anthropic", "openai"]
+max_input = 8
+[steps.build]
+floor = "quality"
+budget_usd = 3.5
+[steps.verify]
+floor = "global"
+[kinds.fix.steps.review]
+tries = 2
+[oncall]
+keep_days = inf
+daily_budget_usd = inf
+"""
+    settings_layer = """
+[routing]
+fallback = false
+payment_modes = ["local", "subscription", "api_key"]
+[routing.capabilities.sonnet]
+context = 16000
+structured_output = true
+[routing.capabilities.opus]
+context = 40000
+[routing.floors]
+quality = ["sonnet", "opus"]
+[routing.paid]
+providers = ["openai"]
+max_input = 4
+[steps.build]
+min_context = 8000
+[kinds.feat.steps.build]
+timeout_minutes = 40
+"""
+
+    @classmethod
+    def observe(cls, case):
+        with tempfile.TemporaryDirectory(prefix="arete-config-registry-") as directory:
+            root = Path(directory).resolve()
+            command = api_check.child_command(Path(__file__).resolve().parents[1],
+                                              "from tests.test_behavior import ConfigRegistryTests as T; "
+                                              "T.run_case(sys.argv[1])", case)
+            done = subprocess.run(command, cwd=root, env=api_check.isolated_env(root), capture_output=True,
+                                  text=True, timeout=CHILD_HANG_TIMEOUT)
+            if done.returncode:
+                raise AssertionError(done.stdout + done.stderr)
+            return json.loads(done.stdout)
+
+    @classmethod
+    def run_case(cls, case):
+        from arete import loop_run, sources
+        from arete.commands import setup
+
+        with (api_check.offline(), mock.patch.object(pipeline, "spawn_run") as spawn,
+              mock.patch.object(loop_run, "launch") as launch, mock.patch.object(sources, "fire") as fire,
+              mock.patch.object(serve.Server, "scan_oncall") as scan):
+            with redirect_stdout(StringIO()):
+                assert setup.cmd_init(SimpleNamespace(force=False)) == 0
+            root = Path.cwd()
+            lines, _ = api_check.prepare_replay(root)
+            base = "\n".join(lines) + "\n"
+            layer_dir = root / "sample/layer"
+            if case == "errors":
+                result = cls.errors(base, layer_dir)
+            elif case == "roles":
+                result = cls.roles()
+            else:
+                paths.CONFIG_FILE.write_text(base + cls.settings_config)
+                layer_file = layer_dir / "config.toml"
+                layer_file.write_text(layer_file.read_text() + cls.settings_layer)
+                result = cls.steps_output() if case == "cli" else cls.settings(layer_dir)
+            for fake in (spawn, launch, fire, scan):
+                fake.assert_not_called()
+            print(json.dumps(result))
+
+    @classmethod
+    def errors(cls, base, layer_dir):
+        def error(name, read):
+            try:
+                read()
+            except (ValueError, TypeError, KeyError) as exc:
+                return [type(exc).__name__, str(exc)]
+            raise AssertionError(f"expected an error for {name}")
+
+        found = {}
+        for name, snippet in cls.config_errors.items():
+            # The replay sample already declares [replay].
+            paths.CONFIG_FILE.write_text(snippet if name in ("replay keys", "github app table") else base + snippet)
+            found[name] = error(name, lambda: config.load(strict=True))
+        for name, snippet in cls.layer_errors.items():
+            (layer_dir / "config.toml").write_text(snippet)
+            found[name] = error(name, lambda: config.load_layer(layer_dir, strict=True))
+        paths.CONFIG_FILE.write_text(base + "[research]\nz = 1\nplanner = true\n[steps.a]\n")
+        cfg = config.load()
+        assert cfg.ignored == ("[steps] a", "[research] z")
+        assert cfg.research.planner
+        return found
+
+    @staticmethod
+    def roles():
+        from arete import steps
+
+        for name in ("KEEPS_NO_SESSION", "READ_ONLY", "SEARCHES", "FETCHES", "NO_WEB"):
+            assert not hasattr(steps, name), name
+        return {name: list(getattr(config, name)) if isinstance(getattr(config, name), tuple)
+                else list(getattr(config, name).items())
+                for name in ("MODEL_ROLES", "MODEL_FALLBACKS", "INHERITS", "STEP_ROLES", "STEP_NAMES")}
+
+    @staticmethod
+    def steps_output():
+        with redirect_stdout(StringIO()):
+            db.migrate()
+        out, err = StringIO(), StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            status = cli.main(["steps", "--repo", "replay-sample"])
+        assert status == 0 and not err.getvalue(), err.getvalue()
+        return util.digest(out.getvalue())
+
+    @staticmethod
+    def settings(layer_dir):
+        from arete import routing, steps
+
+        cfg, layer = config.load(), config.load_layer(layer_dir)
+        assert config.Config().routing.payment_modes == config.PAYMENT_MODES
+        assert config.RepoLayer(dir=layer_dir).routing.payment_modes is None
+        restricted = replace(layer, routing=replace(layer.routing, payment_modes=("local", "subscription")))
+        assert config.allowed_payment_modes(cfg, restricted) == ("subscription",)
+        local_only = replace(layer, routing=replace(layer.routing, payment_modes=("local",)))
+        assert config.allowed_payment_modes(cfg, local_only) == ()
+        return {
+            "steps": {kind: {step: util.digest(json.dumps(asdict(steps.resolve(cfg, layer, step, kind)), sort_keys=True))
+                             for step in config.STEP_NAMES} for kind in ("", *config.KINDS)},
+            "research": asdict(cfg.research),
+            "capture": {"evidence_branch": cfg.capture.evidence_branch, "public_evidence": cfg.capture.public_evidence},
+            "capture_vision": Path(cfg.capture.vision).relative_to(paths.CONFIG_DIR).as_posix(),
+            "payment_modes": config.allowed_payment_modes(cfg, layer),
+            "capabilities": routing.Discovery(cfg, layer=layer).declared,
+            "paid": asdict(config.allowed_paid_routes(cfg, layer)),
+            "oncall_accepts_inf": cfg.oncall.keep_days == cfg.oncall.daily_budget_usd == float("inf"),
+        }
+
+    def assert_observation(self, case):
+        expected = json.loads(self.golden.read_text())[case]
+        self.assertEqual(self.observe(case), expected)
+
+    def test_config_errors_and_order(self):
+        self.assert_observation("errors")
+
+    def test_roles_and_order(self):
+        self.assert_observation("roles")
+
+    def test_steps_output(self):
+        self.assert_observation("cli")
+
+    def test_resolved_settings(self):
+        self.assert_observation("settings")
 
 
 class _CliThroughServeCase(unittest.TestCase):
