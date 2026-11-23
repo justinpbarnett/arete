@@ -8671,6 +8671,68 @@ class CommandConfinementTests(unittest.TestCase):
             self.assertEqual(command[command.index("-p") + 1], recovery_profile)
 
 
+@unittest.skipUnless(sandbox.can_confine(False), "requires macOS sandbox-exec")
+@unittest.skipIf(sandbox.can_confine(False) and sandbox.sandboxed(),
+                 "sandbox-exec cannot install a profile inside the test runner's sandbox")
+class CredentialConfinementTests(unittest.TestCase):
+    def setUp(self):
+        root = Path(self.enterContext(TemporaryDirectory())).resolve()
+        self.workspace = root / "work"
+        local_client = self.workspace / "local/arete-client"
+        self.live = local_client.with_name("arete") / "client" / "live.token"
+        self.default = self.workspace / "default/arete/client/live.token"
+        state = self.workspace / ".arete-sandbox/state"
+        state.mkdir(parents=True)
+        self.enterContext(mock.patch.multiple(paths, CLIENT_DIR=local_client, TOKEN_CLIENT_DIR=state / "client",
+                                             DEFAULT_TOKEN_CLIENT_DIR=self.default.parent,
+                                             WORKTREES_DIR=root, STATE_DIR=state, SERVER_FILE=state / "server.json"))
+
+    def test_pi_shell_cannot_read_or_write_live_client_tokens(self):
+        from arete import pi_shell
+
+        for token in (self.live, self.default):
+            token.parent.mkdir(parents=True)
+            token.write_text("live fixture")
+        (self.workspace / "control").write_text("control")
+        until = time.monotonic() + 4
+        shell = pi_shell.Shell(self.workspace, (), guard.Floor((), (), ()), ("Bash",), (), {}, (), False, until)
+        with mock.patch.object(pi_shell, "runtime_roots", return_value=()):
+            profile = shell.profile(threading.Event(), until)
+        for token in (self.live, self.default):
+            live = shlex.quote(str(token))
+            for operation in (f"cat {live}", f"printf changed > {live}"):
+                result = subprocess.run([*profile, "/bin/sh", "-c", f"cat control && ( {operation} )"],
+                                        cwd=self.workspace, capture_output=True, text=True, timeout=3)
+                self.assertEqual(result.stdout, "control", result.stderr)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertEqual(token.read_text(), "live fixture")
+
+    def test_verifier_service_can_replace_scratch_client_tokens(self):
+        from arete import scratch
+
+        attempt = SimpleNamespace(workspace=str(self.workspace))
+        command = ("set -eu; umask 077; cd .arete-sandbox; mkdir -p state/client; "
+                   "printf old > state/client/t.token; printf new > state/client/t.token.new; "
+                   "mv state/client/t.token.new state/client/t.token; cat state/client/t.token")
+        result = subprocess.run(scratch.service_command(attempt, command), cwd=self.workspace,
+                                capture_output=True, text=True, timeout=CHILD_HANG_TIMEOUT)
+        self.assertEqual((result.returncode, result.stdout), (0, "new"), result.stderr)
+
+
+class CredentialAuthorityRootTests(unittest.TestCase):
+    def test_live_client_directory_is_protected_and_verification_state_is_available(self):
+        root = Path("/fixture")
+        client_dir = root / "xdg/arete-client"
+        live = client_dir.with_name("arete") / "client"
+        scratch = root / ".arete-sandbox/state/client"
+        with mock.patch.multiple(paths, CLIENT_DIR=client_dir, TOKEN_CLIENT_DIR=live):
+            self.assertIn(live, sandbox.authority_roots())
+            with mock.patch.object(paths, "TOKEN_CLIENT_DIR", scratch):
+                roots = sandbox.authority_roots()
+                self.assertIn(live, roots)
+                self.assertFalse(any(scratch.is_relative_to(path) for path in roots))
+
+
 class CodexReadOnlyTempTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(TemporaryDirectory()))

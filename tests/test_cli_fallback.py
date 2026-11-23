@@ -100,7 +100,7 @@ class CliRouteFallbackTests(unittest.TestCase):
                   "created": "2026-01-01T00:00:00Z", "updated": "2026-01-01T00:00:00Z", "version": 2}
         parent_summary = {key: parent[key] for key in summary}
         stop = {"id": "r1", "stopped": True, "pid": 123}
-        meta = "GET /api/meta"
+        meta = "GET /api/v1/meta"
         info = "GET /api/runs/r1"
         feed = "GET /api/feed/r1?after=0"
         loop = "GET /api/loops/example"
@@ -151,7 +151,7 @@ class CliRouteFallbackTests(unittest.TestCase):
             route = f"{request.command} {path}"
             body = request.rfile.read(int(request.headers.get("Content-Length", "0")))
             seen.append((route, request.headers.get("Idempotency-Key"), body))
-            if old and path.startswith("/api/v1/"):
+            if old and path.startswith("/api/v1/") and route != meta:
                 if historical:
                     return 404, {"error": "Nothing at GET /api/v1/tasks."}, {}
                 return 404, {"code": "unknown_route", "error": "No such route."}, {}
@@ -216,7 +216,7 @@ class CliRouteFallbackTests(unittest.TestCase):
         summaries = [{k: row[k] for k in summary_fields} for row in newest_updates]
         details = {f"/api/tasks/{row['id']}": {**row, "comments": [], "runs": [], "children": []}
                    for row in newest_updates}
-        meta, primary, legacy = "/api/meta", "/api/v1/tasks", "/api/tasks"
+        meta, primary, legacy = "/api/v1/meta", "/api/v1/tasks", "/api/tasks"
         now = 0.0
         pauses = []
         seen = []
@@ -278,7 +278,9 @@ class CliRouteFallbackTests(unittest.TestCase):
 
         def response(request):
             path = request.path
-            if request.command == "GET" and path == "/api/meta":
+            if request.command == "GET" and path in ("/api/v1/meta", "/api/meta"):
+                if path == "/api/v1/meta":
+                    return 404, {"error": f"Nothing at GET {path}."}, {"Arete-API": "1.0"}
                 return 200, {"instance": {"id": "api-1-0"}}, {}
             if request.command == "GET" and path == "/api/runs/r1":
                 return 200, {"run": {"version": 7}}, {}
@@ -310,7 +312,7 @@ class CliRouteFallbackTests(unittest.TestCase):
         legacy_status = 503
 
         def response(request):
-            if request.path == "/api/meta":
+            if request.path == "/api/v1/meta":
                 return 200, {"instance": {"id": "compat-errors"}}, {}
             if request.path == "/api/runs/r1":
                 return 200, {"run": {"version": 7}}, {}
@@ -347,7 +349,7 @@ class CliRouteFallbackTests(unittest.TestCase):
 
         def response(request):
             seen.append((request.command, request.path, request.headers.get("Idempotency-Key")))
-            if request.path == "/api/meta":
+            if request.path == "/api/v1/meta":
                 return 200, {"instance": {"id": "rollback"}}, {}
             if request.path == "/api/runs/r1":
                 return 200, {"run": {"version": 7}}, {}
@@ -359,8 +361,8 @@ class CliRouteFallbackTests(unittest.TestCase):
 
         with self.stub(response):
             code, lines, err = self.cli("stop r1")
-        self.assertEqual(seen, [("GET", "/api/meta", None), ("GET", "/api/runs/r1", None),
-                                ("POST", stop, self.key), ("GET", "/api/meta", None), ("POST", stop, self.key)])
+        self.assertEqual(seen, [("GET", "/api/v1/meta", None), ("GET", "/api/runs/r1", None),
+                                ("POST", stop, self.key), ("GET", "/api/v1/meta", None), ("POST", stop, self.key)])
         self.assertEqual((code, len(lines), err), (1, 1, ""), lines)
         self.assertEqual(json.loads(lines[0])["code"], "unknown_route")
 
@@ -389,7 +391,7 @@ class CliRouteFallbackTests(unittest.TestCase):
 
         def response(request):
             headers = {"Arete-API": "1.1"}
-            if request.path == "/api/meta":
+            if request.path == "/api/v1/meta":
                 return 200, {"instance": {"id": "no-legacy"}, "api": {"version": "1.1"}}, headers
             route = f"{request.command} {request.path}"
             key = request.headers.get("Idempotency-Key")
@@ -430,7 +432,7 @@ class CliRouteFallbackTests(unittest.TestCase):
         def response(request):
             route = f"{request.command} {request.path}"
             headers = {"Arete-API": "1.3"}
-            if route == "GET /api/meta":
+            if route == "GET /api/v1/meta":
                 return 200, {"instance": {"id": "upload-supported"}, "api": {"version": "1.3"}}, headers
             writes.append(route)
             if route == "POST /api/v1/hook-events":
@@ -488,7 +490,7 @@ class CliRouteFallbackTests(unittest.TestCase):
         self.assertTrue(any(line.endswith("[session] session output") for line in lines), lines)
         info = "GET /api/runs/r1"
         feed = "GET /api/feed/r1"
-        self.assertEqual(requests, ["GET /api/meta", "POST /api/sessions", info,
+        self.assertEqual(requests, ["GET /api/v1/meta", "GET /api/meta", "POST /api/sessions", info,
                                     f"{feed}?after=0", info, f"{feed}?after=1", info, f"{feed}?after=1", info])
 
     def test_session_send_retry_after_serve_rollback(self):
@@ -498,7 +500,7 @@ class CliRouteFallbackTests(unittest.TestCase):
         current = True
 
         def response(request):
-            if request.path == "/api/meta":
+            if request.path == "/api/v1/meta":
                 return 200, {"instance": {"id": "rollback"}}, {}
             if request.path == path:
                 if not current:
