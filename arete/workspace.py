@@ -257,12 +257,12 @@ def remove_workspace(ws: Path, checkouts: list[Checkout], *, by: str = "",
         options = {}
         try:
             try:
-                row = workspaces.release(ws)
-            except workspaces.UnstatableSnapshot:
-                row = workspaces.open_for(ws.name)
-                if by != "sweep" or not row or not row["remove_asked_by"]:
+                row = workspaces.release(ws, checkouts, excluded=excluded)
+            except workspaces.SnapshotUnavailable as e:
+                row = workspaces.release(ws, checkouts, excluded=excluded, reconcile=False)
+                if (not isinstance(e, workspaces.UnstatableSnapshot) or by != "sweep"
+                        or not row or not row["remove_asked_by"]):
                     raise
-                row = workspaces.release(ws, reconcile=False)
                 options["check_legacy"] = lambda: workspaces.require_unstatable_record(ws)
             if row and by and by != "sweep" and by == row["owner_run"]:
                 note_made(ws, checkouts, workspaces.owner_of(row), excluded=excluded)
@@ -284,7 +284,7 @@ def remove_workspace(ws: Path, checkouts: list[Checkout], *, by: str = "",
                 if row:
                     workspaces.record_release_error(row, e)
                 raise
-        workspaces.record_release(ws, checkouts, row, release, partial=bool(excluded))
+        workspaces.record_release(ws, checkouts, row, release, excluded=excluded)
         return release
 
 
@@ -364,6 +364,36 @@ def checkout_attachment(ws: Path, wt: Path) -> tuple[bool, Path | None]:
     if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
         return False, path
     return True, None
+
+
+def registered_root_checkout(ws: Path) -> list[Checkout]:
+    attached, _ = checkout_attachment(ws, ws)
+    marker = ws / ".git"
+    if not attached or not stat.S_ISREG(marker.lstat().st_mode):
+        return []
+    resolved = git(["rev-parse", "--resolve-git-dir", str(marker)], ws, check=False).removesuffix("\n")
+    if not resolved:
+        return []
+    gitdir = Path(resolved)
+    try:
+        backlink = os.fsdecode((gitdir / "gitdir").read_bytes().removesuffix(b"\n"))
+    except FileNotFoundError:
+        return []
+    if not backlink or (gitdir / backlink).resolve() != marker.resolve():
+        return []
+    try:
+        listing = git(["worktree", "list", "--porcelain", "-z"], ws)
+    except RuntimeError as e:
+        raise OSError(f"{ws}: {e}") from e
+    entries = [entry.split("\0") for entry in listing.split("\0\0") if entry.startswith("worktree ")]
+    if not entries:
+        return []
+    main, *linked = entries
+    root = ws.resolve()
+    for path, *attrs in linked:
+        if Path(path.removeprefix("worktree ")).resolve() == root and not any(a.startswith("prunable ") for a in attrs):
+            return [Checkout("", "", Path(main[0].removeprefix("worktree ")), ws, "")]
+    return []
 
 
 def checkout_blockers(c: Checkout, made: dict, edits: bool, *, strict: bool) -> list[str]:

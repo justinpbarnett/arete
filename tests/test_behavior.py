@@ -1234,6 +1234,45 @@ assert (other / ".venv/output").is_file() and registered(other)
 """)
 
 
+class WorkspaceHelperRetryTests(_WorkspaceChildCase):
+    def test_reopened_helper_records_its_checkout_for_the_sweep_retry(self):
+        self.run_child(WORKSPACE_REPO + LEGACY_WRITE + r"""
+wt = workspace.make_worktree(repo, "main", "helper", "helper", owner="first-run")
+first_id = workspaces.open_for(wt.name)["id"]
+assert workspace.make_worktree(repo, "main", "helper", "helper", owner="next-run") == wt
+assert workspaces.get(first_id)["state"] == "removed"
+wid = workspaces.open_for(wt.name)["id"]
+c = workspace.Checkout("", repo.github, src, wt, "main")
+workspace.note_made(wt, [c])
+made = workspace.made_before(wt)
+made[workspace.OWNER_KEY]["checkouts"] = []
+legacy_write(wt, made)
+util.git(["worktree", "lock", str(wt)], src)
+workspace.remove_worktree(repo, wt, owner="cleanup-run")
+row = workspaces.get(wid)
+assert row["state"] == "released" and "locked" in row["last_sweep_error"], row
+assert [c["wt"] for c in row["checkouts"]] == [str(wt)], row
+assert registered(wt)
+
+util.git(["worktree", "unlock", str(wt)], src)
+workspaces.sweep(cfg)
+assert workspaces.get(wid)["state"] == "removed" and not wt.exists() and not registered(wt)
+""")
+
+    def test_sweep_recognizes_registered_root_worktree_for_release_without_checkout_data(self):
+        self.run_child(WORKSPACE_REPO + r"""
+wt = workspace.make_worktree(repo, "main", "helper", "helper", owner="run-x")
+row = workspaces.change(workspaces.open_for(wt.name), checkouts=[])
+workspaces.release(wt)
+assert (wt / ".git").is_file() and (wt / "notes.txt").is_file() and registered(wt)
+
+workspaces.sweep(cfg)
+row = workspaces.get(row["id"])
+assert row["state"] == "removed" and row["sweep_attempts"] == 1, row
+assert not wt.exists() and not registered(wt)
+""")
+
+
 class WorkspaceRuleWorkerTests(_WorkspaceChildCase):
     def test_detached_rule_filing_uses_the_proposals_run_for_cleanup(self):
         self.run_child(WORKSPACE_REPO + r"""
@@ -1886,6 +1925,57 @@ class WorkspaceReleaseTests(_WorkspaceWorkflowCase):
         self.assertEqual(row["state"], "released")
         self.assertTrue(row["released_at"])
         self.assertTrue(self.registered(ws))
+
+
+class WorkspaceReleaseSelectionTests(_WorkspaceWorkflowCase):
+    def test_retry_keeps_excluded_worktree_after_snapshot_and_legacy_reconciliation(self):
+        ws, selected, run = self.checkout("7", "pr", part="api")
+        closed = replace(selected, dir="closed", wt=ws / "closed")
+        workspace.add_worktree(closed, "closed-pr", "main")
+        earlier = pipeline.workspace_owner(run, ws, [selected, closed])
+        workspace.note_made(ws, earlier.checkouts, earlier)
+        wid = workspaces.open_for(ws.name)["id"]
+        git = util.git
+        git(["worktree", "lock", str(selected.wt)], selected.src)
+
+        def check_release(args, *a, **kw):
+            if args[:2] == ["worktree", "remove"]:
+                row = workspaces.get(wid)
+                self.assertEqual(row["state"], "released")
+                self.assertEqual(row["checkouts"], replace(earlier, checkouts=[selected]).checkout_rows())
+                self.assertEqual(row["release_excluded"], [str(closed.wt)])
+            return git(args, *a, **kw)
+
+        with mock.patch.object(workspace, "git", check_release), self.assertRaisesRegex(OSError, "locked"):
+            workspace.remove_workspace(ws, [selected], by=run.id, excluded={closed.wt})
+        row = workspaces.get(wid)
+        self.assertIn("locked", row["last_sweep_error"])
+        self.assertTrue(self.registered(selected.wt))
+
+        workspace.note_made(ws, [selected], earlier, excluded={closed.wt})
+        self.assertEqual(workspaces.get(wid)["checkouts"], row["checkouts"])
+        legacy = workspace.made_record(ws)
+        made = json.loads(legacy.read_text())
+        self.assertEqual(made[workspace.OWNER_KEY]["checkouts"], earlier.checkout_rows())
+        modified = legacy.stat().st_mtime_ns + 1_000_000_000
+        made[workspace.OWNER_KEY]["run"] = "older-worker"
+        made["legacy-fingerprint"] = "reconciled"
+        legacy.write_text(json.dumps(made))
+        os.utime(legacy, ns=(modified, modified))
+        (closed.wt / "hand.txt").write_text("keep\n")
+        git(["worktree", "unlock", str(selected.wt)], selected.src)
+
+        workspaces.sweep(self.cfg)
+
+        final = workspaces.get(wid)
+        self.assertEqual((final["state"], final["kept_reason"], final["sweep_attempts"]), ("kept", "operator", 1), final)
+        self.assertEqual(final["checkouts"], row["checkouts"])
+        self.assertEqual(final["owner_run"], run.id)
+        self.assertEqual(workspaces.files(wid)["legacy-fingerprint"], "reconciled")
+        self.assertFalse(selected.wt.exists())
+        self.assertFalse(self.registered(selected.wt))
+        self.assertTrue(self.registered(closed.wt))
+        self.assertEqual((closed.wt / "hand.txt").read_text(), "keep\n")
 
 
 class WorkspaceRemovalGuardTests(_WorkspaceWorkflowCase):

@@ -5,7 +5,7 @@ import os
 import shutil
 import sqlite3
 import stat
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from datetime import UTC, datetime
@@ -18,7 +18,7 @@ from .db import migrate_on_demand, reader
 
 TABLES = {"workspaces": "kept, including removed rows", "workspace_files": "with workspace"}
 
-JSON_FIELDS = ("checkouts", "held_by", "heads", "onto", "retained", "legacy_owner")
+JSON_FIELDS = ("checkouts", "held_by", "heads", "onto", "retained", "legacy_owner", "release_excluded")
 CHANGE_FIELDS = ("state", "kept_reason", "owner_run")
 WRITABLE = frozenset((*JSON_FIELDS, *CHANGE_FIELDS, "repo", "ticket", "remove_asked_by", "made_at",
                       "released_at", "removed_at", "bytes", "salt", "sweep_attempts", "last_sweep_at",
@@ -208,7 +208,8 @@ def claim(ws: Path, repo: str, ticket: str, owner_run: str, *,
     with folder_lock(ws), writes.atomic():
         row = open_for(ws.name)
         fields = dict(repo=repo, ticket=str(ticket), owner_run=owner_run, state="live",
-                      kept_reason="", held_by=[], released_at="", remove_asked_by="", last_sweep_error="")
+                      kept_reason="", held_by=[], released_at="", release_excluded=None,
+                      remove_asked_by="", last_sweep_error="")
         if checkouts is not None:
             fields["checkouts"] = workspace.WorkspaceOwner("", "", "", "", checkouts).checkout_rows()
         return (change(row, **fields) if row else create(ws.name, **fields))["id"]
@@ -288,13 +289,21 @@ def made_before(ws: Path, *, strict: bool = False) -> dict:
     return {}
 
 
-def release(ws: Path, *, reconcile: bool = True) -> dict | None:
+def _release_selection(checkouts: list[workspace.Checkout], excluded: Collection[Path]) -> dict:
+    owner = workspace.WorkspaceOwner("", "", "", "", checkouts)
+    return dict(checkouts=owner.checkout_rows(), release_excluded=sorted(map(str, excluded)))
+
+
+def release(ws: Path, checkouts: list[workspace.Checkout] | None = None, *,
+            excluded: Collection[Path] = (), reconcile: bool = True) -> dict | None:
     with folder_lock(ws):
         row = open_for(ws.name)
         if row and reconcile:
             row, _, _ = _reconcile(ws)
         if row:
-            return _change_current(row, state="released", legacy_mtime_ns=row["legacy_mtime_ns"] or NO_LEGACY_RECORD)
+            selection = _release_selection(checkouts, excluded) if checkouts is not None else {}
+            return _change_current(row, state="released", legacy_mtime_ns=row["legacy_mtime_ns"] or NO_LEGACY_RECORD,
+                                   **selection)
     return None
 
 
@@ -329,7 +338,9 @@ def _save_snapshot(ws: Path, row: dict, made: dict, owner: workspace.WorkspaceOw
                    *, before_replace=None) -> None:
     fields = snapshot_fields(made)
     if owner is not None:
-        fields.update(repo=owner.repo, ticket=owner.ticket, owner_run=owner.run, checkouts=owner.checkout_rows())
+        fields.update(repo=owner.repo, ticket=owner.ticket, owner_run=owner.run)
+        if row["release_excluded"] is None:
+            fields["checkouts"] = owner.checkout_rows()
     if made:
         source = workspace.made_record(ws)
 
@@ -468,8 +479,10 @@ def _reconcile_record(ws: Path, row: dict | None, recorded: tuple[dict | None, i
         removed = util.parse_iso(row["removed_at"]).timestamp()
         if modified // 1_000_000_000 < removed or not ws.is_dir() or ws.is_symlink():
             return None
-    owner = legacy_owner(cfg or config.load(), ws, made)
     snapshot = snapshot_fields(made)
+    if active and active["release_excluded"] is not None:
+        return change(active, legacy_mtime_ns=modified, **snapshot)
+    owner = legacy_owner(cfg or config.load(), ws, made)
     identity = dict(repo=owner.repo, ticket=owner.ticket, owner_run=owner.run, checkouts=owner.checkout_rows())
     if not active:
         return _import_new(ws, owner, modified, identity, snapshot)
@@ -552,8 +565,8 @@ def blockers(ws: Path, names: list[str]) -> list[str]:
 
 
 def record_release(ws: Path, checkouts: list[workspace.Checkout], row: dict | None,
-                   result: workspace.Release, *, partial: bool) -> None:
-    size = workspace.tree_bytes(ws) if result.state == "held" or partial else 0
+                   result: workspace.Release, *, excluded: Collection[Path]) -> None:
+    size = workspace.tree_bytes(ws) if result.state == "held" or excluded else 0
     with writes.atomic():
         row = get(row["id"]) if row else None
         if result.state == "held":
@@ -561,11 +574,10 @@ def record_release(ws: Path, checkouts: list[workspace.Checkout], row: dict | No
             if row:
                 change(row, **fields)
             else:
-                owner = workspace.WorkspaceOwner("", "", "", "", checkouts)
-                create(ws.name, checkouts=owner.checkout_rows(), **fields)
+                create(ws.name, **_release_selection(checkouts, excluded), **fields)
         elif row:
-            if partial:
-                change(row, state="kept", kept_reason="operator", bytes=size)
+            if excluded:
+                change(row, state="kept", kept_reason="operator", held_by=[], bytes=size, last_sweep_error="")
             else:
                 change(row, state="removed", held_by=[], bytes=0, last_sweep_error="")
 
@@ -610,16 +622,20 @@ def _sweep_row(ws: Path, row: dict) -> None:
     if row["state"] != "released" and (row["onto"] or not _ticket_ended(row)):
         return
     checkouts = owner_of(row).checkouts
+    excluded = {Path(wt) for wt in row["release_excluded"] or ()}
     _change_current(row, sweep_attempts=row["sweep_attempts"] + 1, last_sweep_at=util.iso(), last_sweep_error="")
     try:
-        workspace.clear_workspace(ws, checkouts, checkouts[0].src if checkouts else ws, [], by="sweep")
+        if not checkouts and row["release_excluded"] is None:
+            checkouts = workspace.registered_root_checkout(ws)
+        workspace.clear_workspace(ws, checkouts, checkouts[0].src if checkouts else ws, [], by="sweep",
+                                  excluded=excluded)
     except workspace.RunFailed as e:
         if isinstance(e.__cause__, SnapshotUnavailable):
             _change_current(row, last_sweep_error=util.first_line(str(e), 300))
             return
         names = e.held_by
         if names is None:
-            names = workspace.workspace_blockers(ws, checkouts, edits=True)
+            names = workspace.workspace_blockers(ws, checkouts, edits=True, excluded=excluded)
         _change_current(row, state="held", held_by=blockers(ws, names), bytes=workspace.tree_bytes(ws),
                         last_sweep_error=util.first_line(str(e), 300))
     except (OSError, RuntimeError, sqlite3.Error) as e:
