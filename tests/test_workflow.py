@@ -7415,7 +7415,7 @@ class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
 
         def remove_checkout(*_):
             path.unlink()
-            return True
+            return workspace.Release("removed")
 
         with (mock.patch.object(gh, "pr_merge_details", return_value=refs), mock.patch.object(gh, "pr_comment"),
               mock.patch.object(pipeline, "fetch_merge_base", return_value="moved-base"),
@@ -7432,7 +7432,7 @@ class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
               mock.patch.object(flows, "ended", side_effect=lambda flow, outcome: flows.respond(flow, **outcome.data))):
             self.assertEqual(controller.publish()["ending"], "pr")
             self.assertEqual(path.read_bytes(), b"owner's file")
-            self.assertEqual(workspace.blocked_by(checkout.wt, [checkout]),
+            self.assertEqual(workspace.workspace_blockers(checkout.wt, [checkout]),
                              ["ignored/" if kind == "ignored" else "ignored/data.txt"])
         self.assertIn("`main` at `moved-base`", controller.run.facts["merge_held"])
         self.assertIn(f"{kind} file `ignored/data.txt`", controller.run.facts["merge_held"])
@@ -7484,11 +7484,11 @@ class MovedBasePublicationTests(MovedBasePublicationFixture, unittest.TestCase):
               mock.patch.object(pipeline, "abort_merge") as abort,
               mock.patch.object(pipeline, "commit_and_push") as push,
               mock.patch.object(workspace, "scratch_left", return_value=[]), mock.patch.object(paths, "STATE_DIR", root),
-              mock.patch.object(workspace, "remove_workspace", return_value=True) as remove,
+              mock.patch.object(workspace, "remove_workspace", return_value=workspace.Release("removed")) as remove,
               mock.patch.object(pipeline, "record_prs", return_value=checkout.pr),
               mock.patch.object(flows, "ended", side_effect=lambda flow, outcome: flows.respond(flow, **outcome.data))):
             self.assertEqual(controller.publish()["ending"], "pr")
-            self.assertEqual(workspace.blocked_by(checkout.wt, [checkout]), [])
+            self.assertEqual(workspace.workspace_blockers(checkout.wt, [checkout]), [])
         hold = controller.run.facts["merge_held"]
         self.assertIn("`main` at `moved-base`", hold)
         self.assertIn("needs owner input", hold)
@@ -7646,7 +7646,7 @@ class ServeDeploymentTests(ServeDeploymentFixture):
             return subprocess.CompletedProcess(command, 1, "", "connection reset")
 
         def clean():
-            self.assertTrue(workspace.remove_workspace(wt, [checkout]))
+            self.assertEqual(workspace.remove_workspace(wt, [checkout]).state, "removed")
 
         with mock.patch.object(config, "load_or_problem", return_value=(self.cfg, "")):
             server = serve.Server()

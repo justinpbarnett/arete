@@ -740,13 +740,12 @@ class Run(AgentRun):
         self.say(f"Run `{self.id}` {why}. {self.retry_hint}.")
 
 
-def workspace_owner(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> dict | None:
+def workspace_owner(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> workspace.WorkspaceOwner | None:
     earlier = workspace.owner_in(workspace.made_before(ws))
     if run.alone:
         return earlier
-    created = earlier.get("created") if earlier else None
-    return {"run": run.id, "repo": run.repo.name, "ticket": str(run.tid), "created": created or util.iso(),
-            "checkouts": [{"dir": c.dir, "github": c.github, "src": str(c.src), "wt": str(c.wt)} for c in checkouts]}
+    created = earlier.created if earlier else ""
+    return workspace.WorkspaceOwner(run.id, run.repo.name, str(run.tid), created or util.iso(), checkouts)
 
 
 def release_workspace(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -> bool:
@@ -758,9 +757,10 @@ def release_workspace(run: Run, ws: Path, checkouts: list[workspace.Checkout]) -
     if run.catch_up_preserved:
         run.log(f"workspace kept at {ws}: it contains files that existed before catch-up")
         return False
-    if workspace.remove_workspace(ws, checkouts):
+    release = workspace.remove_workspace(ws, checkouts)
+    if release.state == "removed":
         return True
-    names = workspace.blocked_by(ws, checkouts)
+    names = release.held_by
     shown = ", ".join(names[:10]) + (f" and {len(names) - 10} more" if len(names) > 10 else "")
     run.log(f"workspace kept at {ws}: removal blocked by {shown or 'the folder could not be deleted'}")
     return False
