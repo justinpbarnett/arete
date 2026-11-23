@@ -79,40 +79,54 @@ class UnreachableReaderTests(unittest.TestCase):
     model = "openai/gpt-6.2-sol"
 
     def readers(self):
-        yield "codex", lambda text: codex.usage_limit(text, self.model), CODEX_LIMIT
+        for provider, usage in ((codex.CHATGPT_PROVIDER, CODEX_LIMIT), (codex.KEY_PROVIDER, "Insufficient quota")):
+            yield (f"codex {provider}", lambda text, provider=provider: codex.parse(
+                self.failure({"type": "turn.failed", "error": {"message": text}}),
+                agent.NO_SESSION, self.model, None, provider).usage_limit, usage)
         yield "claude", self.claude_limit, CODEX_LIMIT
         for mode, family in (("subscription", "codex"), ("subscription", "claude"), ("api_key", "codex")):
             auth = accounts.Auth(mode=mode, family=family, provider="openai")
-            yield (f"pi {mode} {family}", lambda text, auth=auth: pi.usage_limit(auth, "openai", text, self.model),
+            yield (f"pi {mode} {family}", lambda text, auth=auth: self.pi_error_limit(text, self.model, auth),
                    "Insufficient quota" if mode == "api_key" else CODEX_LIMIT)
 
-    def claude_limit(self, text, status=None):
-        proc = claude_failure(text, status)
-        return claude.parse(proc, agent.NO_SESSION, self.model, None).usage_limit
+    def failure(self, *events, stderr=""):
+        return subprocess.CompletedProcess([], 1, "\n".join(map(json.dumps, events)), stderr)
 
-    def assert_unreachable(self, limit):
+    def claude_limit(self, text):
+        return claude.parse(claude_failure(text), agent.NO_SESSION, self.model, None).usage_limit
+
+    def pi_error_limit(self, text, model, auth, *, api="", stderr=""):
+        reply = {"role": "assistant", "stopReason": "error", "errorMessage": text, "api": api}
+        return pi.parse(self.failure({"type": "agent_end", "messages": [reply]}, stderr=stderr),
+                        agent.NO_SESSION, model, None, auth).usage_limit
+
+    def assert_unreachable(self, limit, model=None):
         self.assertIsNotNone(limit)
-        self.assertEqual((limit.kind, limit.scope), ("unreachable", agent.model_scope(self.model)))
+        self.assertEqual((limit.kind, limit.scope), ("unreachable", agent.model_scope(model or self.model)))
         self.assertAlmostEqual(minutes_ahead(limit), 10, delta=0.5)
 
     def test_incident_timeout_holds_the_model_for_ten_minutes(self):
-        for name, read, _ in self.readers():
-            with self.subTest(reader=name):
-                self.assert_unreachable(read(self.timeout_error))
+        with mock.patch.object(util, "now", return_value=util.now().replace(microsecond=0)):
+            for name, read, _ in self.readers():
+                with self.subTest(reader=name):
+                    limit = read(self.timeout_error)
+                    self.assert_unreachable(limit)
+                    self.assertEqual(minutes_ahead(limit), 10)
 
     def test_each_connection_failure_marker_is_recognized(self):
         for text in ("UND_ERR_CONNECT_TIMEOUT", "Connect Timeout Error", "ECONNRESET", "ECONNREFUSED",
-                     "ENOTFOUND", "EAI_AGAIN", "fetch failed", "Connection error.", "Request timed out."):
+                     "ENOTFOUND", "EAI_AGAIN"):
             with self.subTest(text=text):
                 self.assert_unreachable(agent.unreachable_limit(text, self.model))
 
-    def test_native_api_key_readers_keep_the_model_limit(self):
-        proc = subprocess.CompletedProcess([], 1, "", self.timeout_error)
-        self.assert_unreachable(codex.parse(proc, agent.NO_SESSION, self.model, None, codex.KEY_PROVIDER).usage_limit)
+    def claude_api_key_result(self, proc):
         with (mock.patch.object(claude, "command", return_value=[]),
               mock.patch.object(claude, "agent_env", return_value={}),
-              mock.patch.object(claude.child, "stream", return_value=claude_failure(self.timeout_error))):
-            result = claude.run("review", ".", model=self.model, auth=accounts.Auth(mode="api_key"))
+              mock.patch.object(claude.child, "stream", return_value=proc)):
+            return claude.run("review", ".", model=self.model, auth=accounts.Auth(mode="api_key"))
+
+    def test_claude_api_key_keeps_the_model_limit(self):
+        result = self.claude_api_key_result(claude_failure(self.timeout_error))
         self.assert_unreachable(result.usage_limit)
 
     def test_usage_limit_wins_over_connection_failure(self):
@@ -133,100 +147,168 @@ class UnreachableReaderTests(unittest.TestCase):
 
     def test_ordinary_failures_and_http_errors_are_not_limits(self):
         for name, read, _ in self.readers():
-            for text in ("tests failed", "the sandbox refused the command", "HTTP 500 Internal Server Error",
-                         f"HTTP 400 Bad Request: {self.timeout_error}", f"API Error: 401 {self.timeout_error}",
-                         f"unexpected status 403 Forbidden: {self.timeout_error}",
-                         f"500 Internal Server Error: {self.timeout_error}"):
+            for text in ("tests failed", "the sandbox refused the command", "HTTP error 500: fetch failed",
+                         "API Error: 500 Internal Server Error", "fetch failed", "Connection error.", "Request timed out."):
                 with self.subTest(reader=name, text=text):
                     self.assertIsNone(read(text))
 
-    def test_structured_http_status_excludes_connection_failure(self):
-        self.assertIsNone(self.claude_limit(self.timeout_error, status=500))
-        event = {"type": "turn.failed", "error": {"message": self.timeout_error, "statusCode": 500}}
-        proc = subprocess.CompletedProcess([], 1, json.dumps(event), "")
-        self.assertIsNone(codex.parse(proc, agent.NO_SESSION, self.model, None, codex.CHATGPT_PROVIDER).usage_limit)
-        auth = accounts.Auth(mode="api_key", provider="openai")
-        self.assertIsNone(pi.usage_limit(auth, "openai", event, self.model))
+    def test_claude_structured_http_error_with_connection_code_does_not_hold_the_model(self):
+        proc = claude_failure("Upstream connect ECONNREFUSED", 500)
+        for mode, result in (("subscription", claude.parse(proc, agent.NO_SESSION, self.model, None)),
+                             ("api_key", self.claude_api_key_result(proc))):
+            with self.subTest(mode=mode):
+                self.assertFalse(result.ok)
+                self.assertIsNone(result.usage_limit)
 
-    def test_codex_http_error_in_event_or_stderr_is_not_a_limit(self):
+    def test_http_response_messages_with_connection_codes_do_not_hold_the_model(self):
+        for name, read, _ in self.readers():
+            for text in ("HTTP error 500: upstream connect ECONNREFUSED",
+                         "API Error: 500 Internal Server Error: upstream connect ECONNREFUSED",
+                         'OpenAI API error (500): {"message":"Upstream connect ECONNREFUSED"}'):
+                with self.subTest(reader=name, text=text):
+                    self.assertIsNone(read(text))
+
+    def test_codex_unexpected_status_with_connection_code_does_not_hold_the_model(self):
+        text = "unexpected status 500 Internal Server Error: upstream connect ECONNREFUSED"
+        proc = self.failure({"type": "turn.failed", "error": {"message": text}})
         for provider in (codex.CHATGPT_PROVIDER, codex.KEY_PROVIDER):
-            for prefix in ("Request failed\n", "Error: "):
-                message = f"{prefix}500 Internal Server Error: fetch failed"
-                event = {"type": "turn.failed", "error": {"message": message}}
-                for stdout, stderr in ((json.dumps(event), ""), ("", message)):
-                    with self.subTest(provider=provider, prefix=prefix, stream="stdout" if stdout else "stderr"):
-                        proc = subprocess.CompletedProcess([], 1, stdout, stderr)
-                        result = codex.parse(proc, agent.NO_SESSION, self.model, None, provider)
-                        self.assertFalse(result.ok)
-                        self.assertIsNone(result.usage_limit)
+            with self.subTest(provider=provider):
+                self.assertIsNone(codex.parse(proc, agent.NO_SESSION, self.model, None, provider).usage_limit)
 
-    def test_pi_http_error_in_reply_or_early_failure_is_not_a_limit(self):
-        multiline = "Request failed\n500 Internal Server Error"
-        prefixed = "Error: 500 Internal Server Error: fetch failed"
-        cases = (
-            ({"type": "error", "message": "fetch failed"}, multiline),
-            ({"type": "error", "message": prefixed}, ""),
-            ({"type": "agent_end", "messages": [
-                {"role": "assistant", "stopReason": "error", "errorMessage": f"{multiline}: fetch failed"},
-            ]}, ""),
-            ({"type": "agent_end", "messages": [
-                {"role": "assistant", "stopReason": "error", "errorMessage": prefixed},
-            ]}, ""),
-        )
-        for mode, family in (("subscription", "codex"), ("subscription", "claude"), ("api_key", "codex")):
-            auth = accounts.Auth(mode=mode, family=family, provider="openai")
-            for event, stderr in cases:
-                with self.subTest(mode=mode, family=family, event=event, stderr=stderr):
-                    proc = subprocess.CompletedProcess([], 1, json.dumps(event), stderr)
-                    result = pi.parse(proc, agent.NO_SESSION, self.model, None, auth)
-                    self.assertFalse(result.ok)
-                    self.assertIsNone(result.usage_limit)
+    def test_pi_adapter_http_responses_with_connection_codes_do_not_hold_the_model(self):
+        body = '{"message":"upstream connect ECONNREFUSED"}'
+        google = '{"error":{"code":500,"message":"upstream connect ECONNREFUSED","status":"INTERNAL"}}'
+        for mode in ("subscription", "api_key"):
+            for provider, text in (("github-copilot", f"github-copilot API error (500): {body}"),
+                                   ("openai", f"500: {body}"), ("anthropic", f'500 {{"error":{body}}}'),
+                                   ("radius", "500 Internal Server Error: upstream connect ECONNREFUSED"),
+                                   ("google", google), ("google-vertex", f"got status: INTERNAL. {google}"),
+                                   ("azure", f"Azure OpenAI API error (500): {body}")):
+                with self.subTest(mode=mode, provider=provider, text=text):
+                    auth = accounts.Auth(mode=mode, provider=provider)
+                    model = f"{provider}/model-a"
+                    self.assertIsNone(self.pi_error_limit(text, model, auth, stderr="pi ended after an error"))
+                    self.assert_unreachable(self.pi_error_limit(self.timeout_error, model, auth), model)
 
-    def test_pi_claude_subscription_overload_event_wins_over_weekly_limit_reply(self):
+    def test_pi_sdk_plain_http_response_keeps_its_status(self):
+        for provider, api in (("radius", "anthropic-messages"), ("openai", "openai-completions")):
+            with self.subTest(provider=provider):
+                model = f"{provider}/model-a"
+                auth = accounts.Auth(mode="api_key", provider=provider)
+                self.assertIsNone(self.pi_error_limit("500 upstream connect ECONNREFUSED", model, auth, api=api))
+                transport = "500 ms elapsed: connect ECONNREFUSED upstream.example:500"
+                for text in (transport, f"Connection error.: {transport}"):
+                    self.assert_unreachable(self.pi_error_limit(text, model, auth, api=api), model)
+
+    def test_pi_bedrock_http_response_diagnostic_does_not_hold_the_model(self):
+        model = "amazon-bedrock/model-a"
+        auth = accounts.Auth(mode="api_key", provider="amazon-bedrock")
+        reply = {"role": "assistant", "stopReason": "error", "errorMessage": "upstream connect ECONNREFUSED"}
+        response = dict(reply, diagnostics=[{"type": "bedrock_response_failure", "details": {"status": 500}}])
+        for kind in ("message_end", "agent_end"):
+            with self.subTest(event=kind):
+                proc = self.failure({"type": kind, "message": response, "messages": [response]})
+                self.assertIsNone(pi.parse(proc, agent.NO_SESSION, model, None, auth).usage_limit)
+        self.assert_unreachable(self.pi_error_limit(reply["errorMessage"], model, auth), model)
+
+    def test_claude_structured_output_validation_error_does_not_hold_the_model(self):
+        diagnostic = ("Failed to provide valid structured output after 5 attempts \u2014 last StructuredOutput error: "
+                      "Invalid enum value: ECONNREFUSED")
+        validation = {"type": "result", "subtype": "error_max_structured_output_retries", "is_error": True,
+                      "errors": [diagnostic]}
+        execution = dict(validation, subtype="error_during_execution", errors=[self.timeout_error])
+        for mode, read in (("subscription", lambda proc: claude.parse(proc, agent.NO_SESSION, self.model, None)),
+                           ("api_key", self.claude_api_key_result)):
+            with self.subTest(mode=mode):
+                result = read(self.failure(validation))
+                self.assertFalse(result.ok)
+                self.assertIn(diagnostic, result.error)
+                self.assertIsNone(result.usage_limit)
+                self.assert_unreachable(read(self.failure(validation, stderr=self.timeout_error)).usage_limit)
+                self.assert_unreachable(read(self.failure(execution)).usage_limit)
+
+    def test_claude_refusal_text_does_not_hold_the_model(self):
+        refusal = {"type": "result", "subtype": "success", "is_error": True, "stop_reason": "refusal",
+                   "result": "I can’t help trigger ECONNREFUSED.", "structured_output": {"outcome": "refuse"}}
+        proc = self.failure(refusal)
+        for mode, result in (("subscription", claude.parse(proc, agent.NO_SESSION, self.model, None)),
+                             ("api_key", self.claude_api_key_result(proc))):
+            with self.subTest(mode=mode):
+                self.assertFalse(result.ok)
+                self.assertEqual(result.error, refusal["result"])
+                self.assertIsNone(result.usage_limit)
+
+        genuine_failures = (self.failure(refusal, stderr=self.timeout_error),
+                            self.failure(dict(refusal, api_error=self.timeout_error)),
+                            self.failure(dict(refusal, errors=[self.timeout_error])))
+        for proc in genuine_failures:
+            with self.subTest(stdout=proc.stdout, stderr=proc.stderr):
+                self.assert_unreachable(claude.parse(proc, agent.NO_SESSION, self.model, None).usage_limit)
+
+    def test_ports_and_timeout_durations_do_not_prevent_a_connection_hold(self):
+        for name, read, _ in self.readers():
+            with self.subTest(reader=name):
+                self.assert_unreachable(read("connect ECONNREFUSED api.openai.com:500 (timeout: 500 ms)"))
+
+    def test_pi_claude_subscription_preserves_native_overload_precedence(self):
         model = "anthropic/claude-opus-4-7"
         auth = accounts.Auth(mode="subscription", family="claude", provider="anthropic")
-        error = {"type": "error", "message": "API Error: 529 Overloaded"}
+        error = {"type": "error", "message": f"API Error: 529 Overloaded\n{self.timeout_error}"}
         reply = {"role": "assistant", "stopReason": "error", "errorMessage": "Weekly limit"}
         end = {"type": "agent_end", "messages": [reply]}
-        proc = subprocess.CompletedProcess([], 1, "\n".join(map(json.dumps, (error, end))), "")
-        result = pi.parse(proc, agent.NO_SESSION, model, None, auth)
-        self.assertFalse(result.ok)
-        limit = result.usage_limit
+        limit = pi.parse(self.failure(error, end), agent.NO_SESSION, model, None, auth).usage_limit
         self.assertIsNotNone(limit)
         self.assertEqual((limit.kind, limit.scope), ("overloaded", agent.model_scope(model)))
         self.assertAlmostEqual(minutes_ahead(limit), 10, delta=0.5)
 
-    def test_claude_error_prefix_in_final_result_does_not_hide_http_status(self):
-        result = claude.parse(claude_failure("Error: 500 Internal Server Error: fetch failed"),
-                              agent.NO_SESSION, self.model, None)
+        limit = self.pi_error_limit(f"Weekly limit\n{self.timeout_error}", model, auth)
+        self.assertIsNotNone(limit)
+        self.assertEqual((limit.kind, limit.scope), ("subscription", claude.EVERY_MODEL))
+
+    def test_stream_failures_and_stderr_can_hold_the_model(self):
+        event = {"type": "error", "message": self.timeout_error}
+        pi_error = {"type": "message_end", "message": {"role": "assistant", "stopReason": "error",
+                                                      "errorMessage": self.timeout_error}}
+        claude_error = {"type": "result", "subtype": "error_during_execution", "errors": [self.timeout_error]}
+        stderr = self.failure(stderr=self.timeout_error)
+        for read, cases in ((claude.parse, (stderr, self.failure(claude_error))),
+                            (pi.parse, (stderr, self.failure(event), self.failure(pi_error)))):
+            for proc in cases:
+                with self.subTest(reader=read.__module__, stdout=proc.stdout):
+                    self.assert_unreachable(read(proc, agent.NO_SESSION, self.model, None).usage_limit)
+        for proc in (stderr, self.failure(event)):
+            with self.subTest(reader="codex", stdout=proc.stdout):
+                self.assert_unreachable(codex.parse(proc, agent.NO_SESSION, self.model, None,
+                                                    codex.CHATGPT_PROVIDER).usage_limit)
+
+    def test_stdout_and_nonfailure_fields_do_not_hold_the_model(self):
+        stdout = subprocess.CompletedProcess([], 1, self.timeout_error, "")
+        claude_answer = self.failure({"type": "result", "subtype": "success", "result": self.timeout_error})
+        codex_error = self.failure({"type": "error", "message": "request failed", "context": self.timeout_error})
+        tool = {"type": "message_end", "error": self.timeout_error, "message": {"role": "toolResult"}}
+        pi_error = {"role": "assistant", "stopReason": "error", "errorMessage": "request failed",
+                    "content": [{"type": "text", "text": self.timeout_error}], "context": self.timeout_error}
+        pi_end = {"type": "agent_end", "messages": [tool["message"], pi_error]}
+        for read, cases in ((claude.parse, (stdout, claude_answer)),
+                            (pi.parse, (stdout, self.failure(tool), self.failure(tool, pi_end)))):
+            for proc in cases:
+                with self.subTest(reader=read.__module__, stdout=proc.stdout):
+                    self.assertIsNone(read(proc, agent.NO_SESSION, self.model, None).usage_limit)
+        self.assertIsNone(codex.parse(codex_error, agent.NO_SESSION, self.model, None,
+                                      codex.CHATGPT_PROVIDER).usage_limit)
+
+    def test_claude_tool_result_followed_by_timeout_does_not_hold_the_model(self):
+        tool_result = {"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "shell-1", "content": "Connection failed: ECONNREFUSED"},
+        ]}}
+        timeout = subprocess.TimeoutExpired([], 1, output=json.dumps(tool_result).encode())
+        with (mock.patch.object(claude, "command", return_value=[]),
+              mock.patch.object(claude, "agent_env", return_value={}),
+              mock.patch.object(claude.child, "stream", side_effect=timeout)):
+            result = claude.run("review", ".", model=self.model, timeout=1, auth=accounts.Auth(mode="subscription"))
         self.assertFalse(result.ok)
+        self.assertEqual(result.error, "timed out after 1s")
         self.assertIsNone(result.usage_limit)
-
-    def test_claude_http_status_at_start_of_stderr_is_not_a_limit(self):
-        proc = claude_failure("fetch failed")
-        proc.stderr = "500 Internal Server Error"
-        result = claude.parse(proc, agent.NO_SESSION, self.model, None)
-        self.assertFalse(result.ok)
-        self.assertIsNone(result.usage_limit)
-
-    def test_claude_early_exit_checks_decoded_diagnostics_and_stream_boundaries(self):
-        def assistant_event(message):
-            return json.dumps({"type": "assistant", "error": "unknown",
-                               "message": {"content": [{"type": "text", "text": message}]}})
-
-        prelude = json.dumps({"type": "system", "subtype": "init"})
-        for stdout, stderr in (
-            (f"{prelude}\n{assistant_event('Request failed\n500 Internal Server Error: fetch failed')}", ""),
-            ("500 Internal Server Error", "fetch failed."),
-        ):
-            with self.subTest(stdout=stdout, stderr=stderr):
-                proc = subprocess.CompletedProcess([], 1, stdout, stderr)
-                result = claude.parse(proc, agent.NO_SESSION, self.model, None)
-                self.assertFalse(result.ok)
-                self.assertIsNone(result.usage_limit)
-
-        proc = subprocess.CompletedProcess([], 1, assistant_event(self.timeout_error), "")
-        self.assert_unreachable(claude.parse(proc, agent.NO_SESSION, self.model, None).usage_limit)
 
 
 class OverloadHoldTests(unittest.TestCase):

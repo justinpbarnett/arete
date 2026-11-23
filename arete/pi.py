@@ -68,6 +68,11 @@ ANTHROPIC_KEY_REQUIRED = (f"pi anthropic: {ANTHROPIC_LOGIN_REASON}; "
                           "put an Anthropic Console key in pi.env or use claude:<model>")
 REMOTE_AUTH_UNVERIFIED = ("pi cannot validate or isolate credentials on a remote device; "
                           "run pi locally or use the claude runner")
+STATUS_FIRST_APIS = ("anthropic-messages", "openai-completions")
+STATUS_FIRST_ERROR = re.compile(
+    r"^[45][0-9]{2} +(?!(?:ns|us|µs|ms|s|sec(?:ond)?s?|(?:nano|micro|milli)seconds?|minutes?|mins?)\b)\S",
+    re.IGNORECASE,
+)
 KEY_NAMES = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY", "azure": "AZURE_OPENAI_API_KEY",
              "amazon-bedrock": "AWS_BEARER_TOKEN_BEDROCK",
              "google": "GEMINI_API_KEY", "google-vertex": "GOOGLE_CLOUD_API_KEY", "huggingface": "HF_TOKEN",
@@ -622,19 +627,24 @@ def authentication(model: str, passing=None, providers=None) -> accounts.Auth:
     return select(model, passing, providers).auth
 
 
-def usage_limit(auth: accounts.Auth, provider: str, text: str | dict | list, model: str = "") -> UsageLimit | None:
+def usage_limit(auth: accounts.Auth, provider: str, text: str | dict | list, model: str = "", *,
+                failure_text: str | list[str] | None = None) -> UsageLimit | None:
     data = text
+    if failure_text is None:
+        failure_text = text if isinstance(text, str) else ""
+    if isinstance(data, list) and any(assistant_http_error(accounts.mapping(message)) for message in data):
+        failure_text = []
     if auth.mode != "subscription":
-        return credit_limit(data) or overload_limit(data, model) or unreachable_limit(data, model)
+        return credit_limit(data) or overload_limit(data, model) or unreachable_limit(failure_text, model)
     text = data if isinstance(data, str) else json.dumps(data, default=str)
-    native_limit = (claude.usage_or_overload_limit(data, "\n".join([text, *error_messages(data)]), model)
+    native_limit = (claude.usage_limit(data, "\n".join([text, *error_messages(data)]), model)
                     if auth.family == "claude" else None)
     if native_limit and native_limit.kind == "overloaded":
         return native_limit
     if (not native_limit and not re.search(r"usage[_ ]limit(?:[_ ]reached)?|subscription.{0,30}limit|"
                                           r"you.ve (?:hit|reached).{0,30}limit|weekly limit|five.hour limit",
                                           text, re.IGNORECASE) and not claude.USAGE_LIMIT_TEXT.search(text)):
-        return overload_limit(text, model) or unreachable_limit(data, model)
+        return overload_limit(text, model) or unreachable_limit(failure_text, model)
     from . import codex
 
     legacy = claude.LEGACY_LIMIT_RESET.search(text)
@@ -1009,6 +1019,41 @@ def error_messages(data) -> list[str]:
     return [message for value in values for message in error_messages(value)]
 
 
+def assistant_http_error(message: dict) -> bool:
+    if message.get("role") != "assistant" or message.get("stopReason") != "error":
+        return False
+    text = message.get("errorMessage")
+    if message.get("api") in STATUS_FIRST_APIS and isinstance(text, str) and STATUS_FIRST_ERROR.match(text):
+        return True
+    diagnostics = message.get("diagnostics")
+    if not isinstance(diagnostics, list):
+        return False
+    for diagnostic in map(accounts.mapping, diagnostics):
+        if diagnostic.get("type") == "bedrock_response_failure":
+            status = accounts.mapping(diagnostic.get("details")).get("status")
+            if isinstance(status, int) and 400 <= status < 600:
+                return True
+    return False
+
+
+def stream_failures(stream: list[dict]) -> list[str]:
+    failures = []
+    for event in stream:
+        kind = event.get("type")
+        if kind in ("error", "api_error", "turn.failed"):
+            error = event.get("error") or event.get("api_error")
+            details = accounts.mapping(error)
+            fields = [event.get("message"), event.get("errorMessage"), event.get("code"),
+                      error, details.get("message"), details.get("code")]
+            failures.extend(text for text in fields if isinstance(text, str))
+        elif kind == "message_end":
+            message = accounts.mapping(event.get("message"))
+            if (message.get("role") == "assistant" and message.get("stopReason") == "error"
+                    and isinstance(error := message.get("errorMessage"), str)):
+                failures.append(error)
+    return failures
+
+
 def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_schema: dict | None,
           auth: accounts.Auth | None = None) -> Result:
     provider = model.partition("/")[0]
@@ -1023,18 +1068,24 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
     diagnostics.extend(error_metadata(e["message"]) for e in stream
                        if e.get("type") == "message_end" and isinstance(e.get("message"), dict)
                        and e["message"].get("role") == "assistant" and e["message"].get("stopReason") == "error")
+    failures = [*stream_failures(stream), proc.stderr or ""]
     if not replies:
         error = util.tail(proc.stderr or proc.stdout or f"exit {proc.returncode}", 1500)
         diagnostic = [*diagnostics, proc.stderr] if stream else proc.stderr or proc.stdout
         return Result(ok=False, session=resume, error=error, runner="pi", model=model,
                       connection_failed=util.is_network_error(error),
-                      usage_limit=usage_limit(auth, provider, diagnostic, model))
+                      usage_limit=usage_limit(auth, provider, diagnostic, model, failure_text=failures))
     last = replies[-1]
     text = "".join(c.get("text", "") for c in last.get("content", []) if c.get("type") == "text")
     usages = [m.get("usage") or {} for m in replies]
     totals = usage_totals(usages)
     failed = last.get("stopReason") == "error" or proc.returncode != 0
     error = (last.get("errorMessage") or util.first_line(proc.stderr, 1500) or "pi stopped on an error") if failed else ""
+    limit = None
+    if failed:
+        if isinstance(error, str):
+            failures.append(error)
+        limit = usage_limit(auth, provider, [*diagnostics, error_metadata(last), proc.stderr], model, failure_text=failures)
     return Result(
         ok=not failed,
         text=text,
@@ -1043,7 +1094,7 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
         turns=len(replies),
         error=error,
         connection_failed=failed and util.is_network_error(error),
-        usage_limit=usage_limit(auth, provider, [*diagnostics, error_metadata(last), proc.stderr], model) if failed else None,
+        usage_limit=limit,
         raw={"stopReason": last.get("stopReason"), "usage": usages[-1]},
         **totals,
         first_context_tokens=first_context_tokens(proc.stdout),

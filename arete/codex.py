@@ -684,11 +684,11 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
             turns += item.get("type") != "reasoning"
         elif kind == "turn.completed":
             usage = {k: max(0, int(v or 0) - (before or {}).get(k, 0)) for k, v in (event.get("usage") or {}).items()}
-        elif kind == "turn.failed":
-            failures.append(str((event.get("error") or {}).get("message") or "the turn failed"))
-            diagnostics.append(event)
-        elif kind == "error":
-            failures.append(str(event.get("message") or "codex reported an error"))
+        elif kind in ("turn.failed", "error"):
+            details = accounts.mapping(event.get("error")) if kind == "turn.failed" else event
+            message = details.get("message")
+            fallback = "the turn failed" if kind == "turn.failed" else "codex reported an error"
+            failures.append(message if isinstance(message, str) and message else fallback)
             diagnostics.append(event)
     text = texts[-1] if texts else ""
     ok = proc.returncode == 0 and not failures and bool(thread)
@@ -697,11 +697,10 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
     limit = None
     if not ok:
         errors = "\n".join([*failures, proc.stderr])
-        diagnostic = [*diagnostics, proc.stderr]
         if provider == KEY_PROVIDER:
-            limit = credit_limit(diagnostic) or overload_limit(errors, model) or unreachable_limit(diagnostic, model)
+            limit = credit_limit([*diagnostics, proc.stderr]) or overload_limit(errors, model) or unreachable_limit(errors, model)
         else:
-            limit = usage_limit(errors, model, diagnostic=diagnostic)
+            limit = usage_limit(errors, model)
     return Result(
         ok=ok,
         text=text,
@@ -722,9 +721,9 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
     )
 
 
-def usage_limit(text: str, model: str = "", *, diagnostic: list | None = None) -> UsageLimit | None:
+def usage_limit(text: str, model: str = "") -> UsageLimit | None:
     if not USAGE_LIMIT_TEXT.search(text):
-        return overload_limit(text, model) or unreachable_limit(text if diagnostic is None else diagnostic, model)
+        return overload_limit(text, model) or unreachable_limit(text, model)
     soonest = util.now() + timedelta(seconds=claude.LIMIT_SLACK_SECONDS)
     resets = reset_time(text)
     until = (max(soonest, resets + timedelta(seconds=claude.LIMIT_SLACK_SECONDS)) if resets

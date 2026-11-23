@@ -264,9 +264,7 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
         stderr = "".join(line for line in stderr.splitlines(keepends=True) if not line.startswith(UNRECOGNIZED_MODEL))
     if not (data := result_event(out)):
         error = util.tail(stderr or out or f"exit {proc.returncode}", 1500)
-        limit = usage_or_overload_limit({}, f"{stderr}\n{out}", model)
-        if limit is None:
-            limit = unreachable_limit([stderr, *output_diagnostics(out)], model)
+        limit = usage_limit({}, f"{stderr}\n{out}", model) or unreachable_limit(stderr, model)
         result = Result(ok=False, session=resume, error=error, usage_limit=limit)
         seen = {}
         for line in out.splitlines():
@@ -280,20 +278,34 @@ def parse(proc: subprocess.CompletedProcess, resume: Session, model: str, json_s
         structured = json_from_text(data.get("result", ""))
     is_error = (bool(data.get("is_error") or data.get("api_error") or data.get("errors"))
                 or data.get("subtype", "success") != "success")
+    ok = not is_error and proc.returncode == 0
+    reason = failure_reason(data) if not ok else ""
+    limit = None
+    if not ok:
+        limit = usage_limit(data, f"{reason}\n{stderr}", model)
+        if limit is None and not re.fullmatch(r"[45][0-9]{2}", str(data.get("api_error_status"))):
+            failures = [stderr]
+            if is_error:
+                failures.append(data.get("api_error"))
+                if data.get("subtype", "success") in ("success", "error_during_execution"):
+                    if data.get("stop_reason") != "refusal":
+                        failures.append(data.get("result"))
+                    failures.extend(data.get("errors") or [])
+            limit = unreachable_limit([text for text in failures if isinstance(text, str)], model)
     session = resume
     if data.get("session_id"):
         spent = resume.spent_usd if openrouter else float(data.get("total_cost_usd") or 0)
         session = Session(data["session_id"], spent, "claude")
     return Result(
-        ok=not is_error and proc.returncode == 0,
+        ok=ok,
         text=data.get("result", "") or "",
         session=session,
         structured=structured,
         cost_usd=max(0.0, session.spent_usd - resume.spent_usd),
         turns=int(data.get("num_turns") or 0),
-        error=(failure_reason(data) if is_error else "") or (stderr.strip()[:1500] if proc.returncode else ""),
+        error=(reason if is_error else "") or (stderr.strip()[:1500] if proc.returncode else ""),
         connection_failed=data.get("api_error") == "connection_failed",
-        usage_limit=usage_limit(data, f"{failure_reason(data)}\n{stderr}", model) if is_error or proc.returncode else None,
+        usage_limit=limit,
         raw=data,
         **claude_tokens(data.get("usage") or {}),
         api_seconds=round(float(data.get("duration_api_ms") or 0) / 1000, 2),
@@ -312,16 +324,6 @@ def result_event(out: str) -> dict:
         if isinstance(event, dict) and event.get("type") == "result":
             return event
     return {}
-
-
-def output_diagnostics(out: str) -> list:
-    diagnostics = []
-    for line in out.splitlines():
-        try:
-            diagnostics.append(json.loads(line))
-        except json.JSONDecodeError:
-            diagnostics.append(line)
-    return diagnostics
 
 
 def first_context_tokens(stream: str) -> int:
@@ -353,10 +355,6 @@ def tool_set(tools: list[str] | None, rules: list[str]) -> list[str]:
 
 
 def usage_limit(data: dict | list | str, text: str, model: str = "") -> UsageLimit | None:
-    return usage_or_overload_limit(data, text, model) or unreachable_limit([text, data], model)
-
-
-def usage_or_overload_limit(data: dict | list | str, text: str, model: str) -> UsageLimit | None:
     text = text + "\n" + json.dumps(data, default=str)
     model_only = bool(re.search(r"\bmodel[_ ]requires[_ ]usage[_ ]credits\b|"
                                 r"(?:^|\n)You've reached your Fable limit\. Switch to another model", text, re.IGNORECASE))

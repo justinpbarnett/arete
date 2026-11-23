@@ -4,6 +4,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from http import HTTPStatus
 
 from . import config, util
 
@@ -109,13 +110,22 @@ OVERLOAD_SECONDS = 600
 OVERLOAD_TEXT = re.compile(r"at capacity|\boverloaded\b|(?:status|code|http)\W{0,4}529\b|\b529\b\W{0,3}overloaded",
                            re.IGNORECASE)
 UNREACHABLE_TEXT = re.compile(
-    r"\b(?:UND_ERR_CONNECT_TIMEOUT|Connect Timeout Error|ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|fetch failed)\b"
-    r"|\b(?:Connection error|Request timed out)\.", re.IGNORECASE,
+    r"\b(?:UND_ERR_CONNECT_TIMEOUT|Connect Timeout Error|ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN)\b",
+    re.IGNORECASE,
 )
-PROVIDER_ERROR_STATUS = re.compile(
-    r"""(?:\b(?:api[ _-]error(?:[ _-]status)?|(?:http[ _-]?)?status(?:[ _-]?code)?|code|http(?:/\d(?:\.\d)?)?)"""
-    r"""[\s\\'":=()]+|(?:^|\n|["'])\s*(?:error:\s*)?)[45]\d{2}(?=$|[\s\\'":),}\].])""", re.IGNORECASE,
+HTTP_ERROR_RESPONSE = re.compile(
+    r"^[ \t]*(?:(?:(?:HTTP(?: error|/\d(?:\.\d)?)?|unexpected status)[ \t]+|API error:[ \t]*)"
+    r"[45][0-9]{2}(?=[: \t\r\n]|$)"
+    r"|(?:Azure OpenAI|[a-z0-9][a-z0-9_-]*) API error \([45][0-9]{2}\)[ \t]*:"
+    r"|[45][0-9]{2}(?::(?![0-9])|[ \t]+(?=\{|\[)))",
+    re.IGNORECASE | re.MULTILINE,
 )
+HTTP_ERROR_REASON = re.compile(
+    r"^[ \t]*(?:" + "|".join(f"{status.value} {re.escape(status.phrase)}" for status in HTTPStatus if status >= 400)
+    + r")(?=[: \t\r\n]|$)",
+    re.IGNORECASE | re.MULTILINE,
+)
+GOOGLE_ERROR_PREFIX = re.compile(r"^got status: \w+\. ")
 
 
 def overload_limit(text, model: str) -> UsageLimit | None:
@@ -125,23 +135,25 @@ def overload_limit(text, model: str) -> UsageLimit | None:
     return model_hold(model, "overloaded")
 
 
-def unreachable_limit(text, model: str) -> UsageLimit | None:
-    raw = text if isinstance(text, str) else json.dumps(text, default=str)
-    if not UNREACHABLE_TEXT.search(raw) or PROVIDER_ERROR_STATUS.search(raw):
-        return None
-    if not isinstance(text, str) and has_provider_error_status(text):
+def unreachable_limit(text: str | list[str], model: str) -> UsageLimit | None:
+    failures = [text] if isinstance(text, str) else text
+    if not any(UNREACHABLE_TEXT.search(failure) for failure in failures) or any(map(http_error_response, failures)):
         return None
     return model_hold(model, "unreachable")
 
 
-def has_provider_error_status(data) -> bool:
-    if isinstance(data, str):
-        return bool(PROVIDER_ERROR_STATUS.search(data))
-    if isinstance(data, dict):
-        return any(has_provider_error_status(value) for value in data.values())
-    if isinstance(data, (list, tuple)):
-        return any(has_provider_error_status(value) for value in data)
-    return False
+def http_error_response(text: str) -> bool:
+    if HTTP_ERROR_RESPONSE.search(text) or HTTP_ERROR_REASON.search(text):
+        return True
+    body = GOOGLE_ERROR_PREFIX.sub("", text.lstrip())
+    if not body.startswith("{"):
+        return False
+    try:
+        response = json.loads(body)
+    except (ValueError, RecursionError):
+        return False
+    error = response.get("error")
+    return isinstance(error, dict) and isinstance(code := error.get("code"), int) and 400 <= code < 600
 
 
 def model_hold(model: str, kind: str) -> UsageLimit:
