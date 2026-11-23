@@ -212,6 +212,7 @@ async function sendFeedbackFields() {
     sayFeedback("ok", `Draft saved at ${clock(new Date())}. It is kept, and nothing is filed.`);
   } catch (e) {
     sayFeedback("caution", `${failedFeedback(e)} ${FEEDBACK_ON_DEVICE}`);
+    return e instanceof ErrorAnswer && e.status === 401;
   } finally {
     feedbackSaving = false;
     if (feedbackDirty) saveFeedbackLater(saved ? FEEDBACK_SAVE_MS : FEEDBACK_RETRY_MS);
@@ -316,7 +317,7 @@ function pollFeedbackChecks() {
 function submitFeedback() {
   return inFeedbackTurn(async () => {
     await feedbackUploads;
-    await sendFeedbackFields();
+    if (await sendFeedbackFields()) return;
     if (feedbackDirty || feedbackPending.length || !feedbackDraft) {
       return sayFeedback("caution", feedbackDraft ? "The draft is not saved yet, or a file is still sending. Submit again once it is." : "Write the request before you submit it.");
     }
