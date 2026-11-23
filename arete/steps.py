@@ -2,25 +2,24 @@ from __future__ import annotations
 
 import hashlib
 import json
+import tomllib
 from dataclasses import dataclass, field
+from functools import cache
 from pathlib import Path
 
-from . import codex, config, routing
-from .agent import BUILD_TOOLS, READ_ONLY_TOOLS, READ_TOOLS, REPLAY, TRAITS, WEB_TOOLS, traits_of
+from . import codex, config, configschema, paths, routing
+from .agent import READ_ONLY_TOOLS, REPLAY, TRAITS, WEB_TOOLS, traits_of
 
-DEFAULTS = {"tools": tuple(READ_TOOLS), "mcp": (), "session": "fresh"}
-BUILT_IN = {"verify": {"directory_cleanup": True}, "build": {"tools": tuple(BUILD_TOOLS), "session": "resume"},
-            "orchestrate": {"tools": (), "mcp": (), "instructions": (), "session": "fresh"},
-            "learn": {"timeout_minutes": 15}, "uat": {"timeout_minutes": 10, "tries": 3},
-            "research_plan": {"timeout_minutes": 10, "tries": 2},
-            "research_search": {"timeout_minutes": 10, "tries": 2, "tools": WEB_TOOLS},
-            "research_synthesis": {"timeout_minutes": 10, "tries": 2},
-            "research_audit": {"timeout_minutes": 10, "tries": 2, "tools": (*READ_TOOLS, "WebFetch")},
-            "document": {"timeout_minutes": 10, "tries": 2, "instructions": ()},
-            "capture_evidence": {"timeout_minutes": 3, "tries": 1, "tools": ("Read",), "instructions": (),
-                                 "modalities": ("image",), "structured_output": True, "budget_usd": 0.25}}
 MODEL_SOURCE = ("runner", "provider")
 STEP_TOOLS = ("Read", "Glob", "Grep", "LS", "Edit", "MultiEdit", "Write", "TodoWrite")
+
+
+@cache
+def engine_defaults() -> tuple[dict, dict[str, dict]]:
+    path = paths.DEFAULTS_DIR / "steps.toml"
+    data = tomllib.loads(path.read_text())
+    configschema.validate("step_settings", data, where=str(path))
+    return config.step_table(data["defaults"], "defaults"), config.step_tables(data["steps"], "steps")
 
 
 @dataclass(frozen=True)
@@ -155,12 +154,13 @@ def ab_view(cfg: config.Config, layer: config.RepoLayer | None, role: str, kind:
 
 def merged(cfg: config.Config, layer: config.RepoLayer, role: str, kind: str, overrides: dict,
            inherited: dict | None = None, arm: dict | None = None) -> dict:
+    defaults, built_in = engine_defaults()
     base = config.INHERITS.get(role, "")
     if base:
-        settings, own_route = {**merged(cfg, layer, base, kind, inherited or {}), **BUILT_IN.get(role, {})}, False
+        settings, own_route = {**merged(cfg, layer, base, kind, inherited or {}), **built_in.get(role, {})}, False
     else:
-        settings, own_route = {"timeout_minutes": layer.timeout_minutes, "tries": layer.max_attempts, **DEFAULTS,
-                               **BUILT_IN.get(role, {})}, True
+        settings, own_route = {"timeout_minutes": layer.timeout_minutes, "tries": layer.max_attempts, **defaults,
+                               **built_in.get(role, {})}, True
     explicit_runner = False
     for level in (cfg.steps.get(role), cfg.kinds.get(kind, {}).get(role), layer.steps.get(role),
                   layer.kinds.get(kind, {}).get(role), overrides, arm):

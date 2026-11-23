@@ -97,7 +97,7 @@ class Stdio:
         if key:
             message = {**message, "id": key}
         deadline = time.monotonic() + BUDGET
-        previous, original, terminal, uncertain = None, None, None, False
+        previous, terminal, uncertain = None, None, False
         for attempt in range(RETRIES + 1):
             now = time.monotonic()
             if now >= deadline:
@@ -107,19 +107,15 @@ class Stdio:
                 return {**answer, "id": identity}
             except (client.Down, client.Restarting, client.Failed) as failure:
                 status = getattr(failure, "code", 0)
-                if (previous and status == 409 and failure.headers
-                        and failure.headers.get(mcp_protocol.ROTATION_ACCEPTED_HEADER) == previous
-                        and failure.headers.get("Arete-Instance") == self.where.instance):
-                    previous, original = None, None
-                if status == 401 and client.reason(failure.answer) == "token_rotated" and attempt < RETRIES:
+                if status == 401 and previous is not None:
+                    return failed(identity, key, failure.answer, status)
+                if status == 401 and client.reason(failure.answer) == "token_rotated":
                     try:
                         replacement = client.stored_token(self.where)
                     except client.Failed:
                         replacement = None
                     if replacement and replacement != self.token:
-                        if previous is None:
-                            original = self.token
-                            previous = token_parts(original, self.where)[2]
+                        previous = token_parts(self.token, self.where)[2]
                         self.token = replacement
                         continue
                 retryable = status >= 500 or isinstance(
@@ -136,8 +132,6 @@ class Stdio:
                     break
                 if pause:
                     time.sleep(pause)
-        if previous:
-            self.token = original
         if terminal:
             failure, status = terminal
             return failed(identity, key, failure.answer, status)

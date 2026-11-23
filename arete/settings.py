@@ -3,8 +3,11 @@ from __future__ import annotations
 import json
 import re
 import stat
+import tomllib
+from dataclasses import asdict
+from io import StringIO
 
-from . import config, paths, refusals, util
+from . import config, configschema, paths, refusals, util
 
 PARALLEL_MAX = 8
 RUN_LIMITS = {"max_parallel": "Runs at once", "max_parallel_per_repo": "Runs per repo"}
@@ -12,6 +15,10 @@ MODEL_ALIASES = ("opus", "sonnet", "haiku")
 MODEL_ID = re.compile(r"(claude:)?claude-[a-z0-9.-]+(\[1m\])?|(pi:)?[a-z0-9._-]+/[A-Za-z0-9._:-]+|"
                       r"(?:codex:)?(?:gpt-|codex-)[A-Za-z0-9._:-]+|codex:[A-Za-z0-9._-]+")
 TABLE_HEADER = re.compile(r"\s*\[")
+ASSIGNMENT = re.compile(r"""(?:[A-Za-z0-9_. \t-]|"(?:[^"\\]|\\.)*"|'[^']*')+=[ \t]*""")
+ASSIGNMENT_END = re.compile(r"[#\r\n]")
+INLINE_FIELD_END = re.compile(r"[#,}\r\n]")
+TOML_TRIVIA = re.compile(r"(?:[ \t\r\n]|#[^\r\n]*)*")
 
 
 class Refused(refusals.Invalid, ValueError):
@@ -23,6 +30,136 @@ def current() -> dict:
     return {**{key: getattr(cfg, key) for key in RUN_LIMITS}, "parallel_max": PARALLEL_MAX, "aliases": MODEL_ALIASES,
             "models": {role: cfg.models.get(role, "") for role in config.MODEL_ROLES},
             "defaults": {role: config.MODEL_FALLBACKS.get(role, "") for role in config.MODEL_ROLES}}
+
+
+def attention() -> dict:
+    return asdict(config.ask_table(config.read_data().get("ask", {})))
+
+
+def save_attention(values: dict) -> dict:
+    configschema.validate("attention", values)
+    with util.lock("config", wait=True):
+        text = paths.read_confined(paths.CONFIG_FILE).decode()
+        data = tomllib.loads(text)
+        existing = config.table_of(data.pop("ask", {}), "ask")
+        merged = {**existing, **values}
+        wanted = config.ask_table(merged)
+        if not values:
+            return asdict(wanted)
+        updated = with_attention(text, values)
+
+        def refusal(cfg: config.Config) -> str:
+            other = tomllib.loads(updated)
+            other.pop("ask", None)
+            if cfg.ask != wanted or repr(other) != repr(data):
+                return "The new attention settings did not round trip through config.toml."
+            return ""
+
+        write_checked(updated, refusal)
+        return asdict(wanted)
+
+
+def with_attention(text: str, values: dict) -> str:
+    kept, statement = [], ""
+    remaining = dict(values)
+    at_root, in_ask, dotted = True, False, False
+    insertion = None
+    for line in StringIO(text, newline="\n"):
+        statement += line
+        parsed = complete_toml(statement)
+        if parsed is None:
+            continue
+        if statement.lstrip().startswith("["):
+            at_root, in_ask = False, "ask" in parsed
+            if in_ask:
+                insertion = len(kept) + 1
+        elif parsed and (in_ask or at_root and "ask" in parsed):
+            start = ASSIGNMENT.match(statement).end()
+            if at_root and tomllib.loads(statement[:start] + "0") == {"ask": 0}:
+                statement = inline_attention(statement, start, remaining)
+            else:
+                dotted = at_root
+                insertion = len(kept) + 1
+                key, old = next(iter((parsed["ask"] if dotted else parsed).items()))
+                if key in remaining:
+                    value = remaining.pop(key)
+                    if value != old or type(value) is not type(old):
+                        end = attention_assignment_end(statement, 0, ASSIGNMENT_END)
+                        statement = replace_attention_value(statement, start, end, value)
+        kept.append(statement)
+        statement = ""
+    if remaining:
+        newline = "\r\n" if "\r\n" in text else "\n"
+        additions = []
+        if insertion is None:
+            insertion = len(kept)
+            additions.append(f"[ask]{newline}")
+        if insertion > 0 and not kept[insertion - 1].endswith("\n"):
+            additions.insert(0, newline)
+        prefix = "ask." if dotted else ""
+        additions.extend(f"{prefix}{key} = {attention_value(value)}{newline}" for key, value in remaining.items())
+        kept[insertion:insertion] = additions
+    return "".join(kept)
+
+
+def complete_toml(text: str) -> dict | None:
+    try:
+        return tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return None
+
+
+def attention_value(value) -> str:
+    return json.dumps(value, ensure_ascii=False).replace("\x7f", "\\u007f")
+
+
+def attention_assignment_end(text: str, start: int, delimiters: re.Pattern) -> int:
+    return next((token.start() for token in delimiters.finditer(text, start)
+                 if complete_toml(text[start:token.start()])), len(text))
+
+
+def replace_attention_value(text: str, start: int, end: int, value) -> str:
+    end = start + len(text[start:end].rstrip(" \t\r\n"))
+    return text[:start] + attention_value(value) + text[end:]
+
+
+def inline_attention(statement: str, start: int, remaining: dict) -> str:
+    start += 1
+    kept = [statement[:start]]
+    while True:
+        field_start = TOML_TRIVIA.match(statement, start).end()
+        kept.append(statement[start:field_start])
+        if statement[field_start] == "}":
+            kept.append(inline_additions(remaining))
+            break
+        start = field_start
+        end = attention_assignment_end(statement, start, INLINE_FIELD_END)
+        field = statement[start:end]
+        key, old = next(iter(tomllib.loads(field).items()))
+        if key in remaining:
+            value = remaining.pop(key)
+            if value != old or type(value) is not type(old):
+                field = replace_attention_value(field, ASSIGNMENT.match(field).end(), len(field), value)
+        trimmed = field.rstrip(" \t")
+        delimiter = TOML_TRIVIA.match(statement, end).end()
+        if statement[delimiter] == "}":
+            trivia = field[len(trimmed):] + statement[end:delimiter]
+            if remaining:
+                addition = inline_additions(remaining)
+                trivia = f",{trivia}{addition}" if "#" in trivia else f", {addition}{trivia}"
+            kept.extend((trimmed, trivia))
+            field_start = delimiter
+            break
+        kept.extend((field, statement[end:delimiter + 1]))
+        start = delimiter + 1
+    kept.append(statement[field_start:])
+    return "".join(kept)
+
+
+def inline_additions(remaining: dict) -> str:
+    additions = ", ".join(f"{key} = {attention_value(value)}" for key, value in remaining.items())
+    remaining.clear()
+    return additions
 
 
 def instead_of(text: str) -> str:

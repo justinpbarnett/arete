@@ -1,0 +1,230 @@
+{
+  "type": "object",
+  "properties": {
+    "steps": {"$ref": "step_settings.json#/$defs/steps"},
+    "kinds": {"$ref": "step_settings.json#/$defs/kinds"},
+    "tiers": {"$ref": "routes.json#/$defs/tiers"},
+    "routing": {"$ref": "routes.json"},
+    "ab": {"$ref": "experiment.json#/$defs/experiments"},
+    "document": {
+      "type": "object",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "voice": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "style": {"type": "string"},
+        "words": {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "array",
+              "items": {"type": "integer"}
+            },
+            "ticket": {
+              "type": "array",
+              "items": {"type": "integer"}
+            },
+            "pr": {
+              "type": "array",
+              "items": {"type": "integer"}
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "setup": {
+      "type": "object",
+      "properties": {
+        "commands": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "copy": {
+          "type": "array",
+          "items": {"type": "string"}
+        }
+      },
+      "additionalProperties": false
+    },
+    "checks": {
+      "type": "object",
+      "additionalProperties": {"type": "string"}
+    },
+    "targeted_commands": {
+      "type": "object",
+      "additionalProperties": {"type": "string"}
+    },
+    "check_policy": {
+      "type": "object",
+      "properties": {
+        "quick": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "targeted": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {"type": "string"}
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "limits": {
+      "type": "object",
+      "properties": {
+        "max_diff_lines": {"type": "integer"},
+        "max_attempts": {"type": "integer"},
+        "timeout_minutes": {"type": "integer"},
+        "max_repair_cycles": {"type": "integer"},
+        "max_run_minutes": {"type": "integer"},
+        "max_verify_minutes": {"type": "integer"},
+        "deny": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "parallel_checks": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "agent": {
+      "type": "object",
+      "properties": {
+        "allow_bash": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "read_roots": {
+          "type": "array",
+          "items": {"type": "string"}
+        }
+      },
+      "additionalProperties": false
+    },
+    "trust": {
+      "type": "object",
+      "properties": {
+        "level": {"type": "string"},
+        "automerge_after": {"type": "integer"}
+      },
+      "additionalProperties": false
+    },
+    "git": {
+      "type": "object",
+      "properties": {
+        "base": {"type": "string"},
+        "subject": {"type": "string"},
+        "branch": {"type": "string"},
+        "required_check": {
+          "type": "object",
+          "properties": {
+            "context": {"type": "string"},
+            "app_id": {"type": "integer"}
+          },
+          "additionalProperties": false,
+          "required": ["context", "app_id"]
+        }
+      },
+      "additionalProperties": false
+    },
+    "verify": {
+      "type": "object",
+      "properties": {
+        "publish_evidence": {"type": "boolean"},
+        "allow_patch_gaps": {"type": "boolean"},
+        "start": {"type": "string"},
+        "url": {"type": "string"},
+        "ready": {"type": "string"},
+        "notes": {"type": "string"},
+        "preflight": {
+          "type": "object",
+          "additionalProperties": {"type": "string"}
+        },
+        "probes": {
+          "type": "object",
+          "additionalProperties": {"type": "string"}
+        },
+        "drivers": {
+          "type": "object",
+          "additionalProperties": {"type": "string"}
+        },
+        "journey_drivers": {
+          "type": "object",
+          "additionalProperties": {"type": "string"}
+        },
+        "ready_seconds": {"type": "integer"},
+        "allow_bash": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "preflight_seconds": {"type": "number"},
+        "probe_seconds": {"type": "number"},
+        "feature_map": {"type": ["string", "object"]}
+      },
+      "additionalProperties": false
+    },
+    "research": {
+      "type": "object",
+      "properties": {
+        "dir": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "environment": {
+      "type": "object",
+      "properties": {
+        "pass": {
+          "type": "array",
+          "items": {"type": "string"}
+        }
+      },
+      "additionalProperties": false,
+      "x-arete-reach": true
+    },
+    "factory": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "enum": ["orchestrated", "classic", "adw"],
+          "x-arete-reach": true
+        },
+        "tier_map": {"type": "string"},
+        "patch": {
+          "type": "object",
+          "properties": {
+            "labels": {
+              "type": "array",
+              "items": {"type": "string"}
+            },
+            "sensitive": {
+              "type": "array",
+              "items": {"type": "string"}
+            },
+            "max_lines": {"type": "integer"},
+            "max_files": {"type": "integer"},
+            "review_tries": {"type": "integer"}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "orchestration": {
+      "type": "object",
+      "properties": {
+        "max_decisions": {"type": "integer"},
+        "max_actions": {"type": "integer"},
+        "max_workers": {"type": "integer"},
+        "progress_seconds": {"type": "integer"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

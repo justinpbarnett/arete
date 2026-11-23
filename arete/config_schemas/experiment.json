@@ -1,0 +1,30 @@
+{
+  "type": "object",
+  "properties": {
+    "step": {"type": "string", "enum": ["plan", "build", "verify", "review", "learn", "uat", "miner", "apply", "eval_mine", "triage", "chat", "classify", "loop", "session", "research", "research_plan", "research_search", "research_synthesis", "research_audit", "explain", "document", "capture_evidence", "check_repair", "review_repair", "ci_repair", "eval_grade", "orchestrate", "implement"]},
+    "kind": {"type": "string", "enum": ["", "feat", "fix"]},
+    "share": {"type": "number"},
+    "arm": {"$ref": "#/$defs/arm"}
+  },
+  "additionalProperties": false,
+  "required": ["step", "share", "arm"],
+  "x-arete-reach": true,
+  "$defs": {
+    "arm": {
+      "type": "object",
+      "properties": {
+        "tier": {"type": "string"},
+        "runner": {"type": "string", "x-arete-reach": true},
+        "provider": {"type": "string"},
+        "model": {"type": "string"},
+        "effort": {"type": "string"}
+      },
+      "additionalProperties": false,
+      "x-arete-reach": true
+    },
+    "experiments": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#"}
+    }
+  }
+}

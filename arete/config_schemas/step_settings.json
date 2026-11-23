@@ -1,0 +1,156 @@
+{
+  "type": "object",
+  "properties": {
+    "schema": {"type": "integer", "enum": [1]},
+    "defaults": {"$ref": "#/$defs/defaults"},
+    "steps": {"$ref": "#/$defs/steps"}
+  },
+  "additionalProperties": false,
+  "required": ["schema", "defaults", "steps"],
+  "$defs": {
+    "step": {
+      "type": "object",
+      "properties": {
+        "tier": {"type": "string"},
+        "runner": {"type": "string", "x-arete-reach": true},
+        "provider": {"type": "string"},
+        "model": {"type": "string"},
+        "effort": {"type": "string"},
+        "timeout_minutes": {"type": "integer"},
+        "tries": {"type": "integer"},
+        "tools": {
+          "type": "array",
+          "items": {"type": "string"},
+          "x-arete-reach": true
+        },
+        "mcp": {
+          "type": "array",
+          "items": {"type": "string"},
+          "x-arete-reach": true
+        },
+        "instructions": {
+          "type": "array",
+          "items": {"type": "string", "enum": ["user", "repo"]}
+        },
+        "session": {
+          "type": "string",
+          "enum": ["resume", "fresh"],
+          "x-arete-reach": true
+        },
+        "modalities": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "min_context": {"type": "integer"},
+        "structured_output": {"type": "boolean"},
+        "data_handling": {
+          "type": "array",
+          "items": {"type": "string"},
+          "x-arete-reach": true
+        },
+        "floor": {"type": "string", "x-arete-reach": true},
+        "budget_usd": {"type": "number", "x-arete-reach": true},
+        "directory_cleanup": {"type": "boolean"}
+      },
+      "additionalProperties": false,
+      "x-arete-reach": true
+    },
+    "steps": {
+      "type": "object",
+      "properties": {
+        "plan": {"$ref": "#/$defs/step"},
+        "build": {"$ref": "#/$defs/step"},
+        "verify": {"$ref": "#/$defs/step"},
+        "review": {"$ref": "#/$defs/step"},
+        "learn": {"$ref": "#/$defs/step"},
+        "uat": {"$ref": "#/$defs/step"},
+        "miner": {"$ref": "#/$defs/step"},
+        "apply": {"$ref": "#/$defs/step"},
+        "eval_mine": {"$ref": "#/$defs/step"},
+        "triage": {"$ref": "#/$defs/step"},
+        "chat": {"$ref": "#/$defs/step"},
+        "classify": {"$ref": "#/$defs/step"},
+        "loop": {"$ref": "#/$defs/step"},
+        "session": {"$ref": "#/$defs/step"},
+        "research": {"$ref": "#/$defs/step"},
+        "research_plan": {"$ref": "#/$defs/step"},
+        "research_search": {"$ref": "#/$defs/step"},
+        "research_synthesis": {"$ref": "#/$defs/step"},
+        "research_audit": {"$ref": "#/$defs/step"},
+        "explain": {"$ref": "#/$defs/step"},
+        "document": {"$ref": "#/$defs/step"},
+        "capture_evidence": {"$ref": "#/$defs/step"},
+        "check_repair": {"$ref": "#/$defs/step"},
+        "review_repair": {"$ref": "#/$defs/step"},
+        "ci_repair": {"$ref": "#/$defs/step"},
+        "eval_grade": {"$ref": "#/$defs/step"},
+        "orchestrate": {"$ref": "#/$defs/step"},
+        "implement": {"$ref": "#/$defs/step"}
+      },
+      "additionalProperties": false
+    },
+    "kind": {
+      "type": "object",
+      "properties": {
+        "steps": {"$ref": "#/$defs/steps"}
+      },
+      "additionalProperties": false
+    },
+    "kinds": {
+      "type": "object",
+      "properties": {
+        "feat": {"$ref": "#/$defs/kind"},
+        "fix": {"$ref": "#/$defs/kind"}
+      },
+      "additionalProperties": false
+    },
+    "defaults": {
+      "type": "object",
+      "properties": {
+        "tier": {"type": "string"},
+        "runner": {"type": "string", "x-arete-reach": true},
+        "provider": {"type": "string"},
+        "model": {"type": "string"},
+        "effort": {"type": "string"},
+        "timeout_minutes": {"type": "integer"},
+        "tries": {"type": "integer"},
+        "tools": {
+          "type": "array",
+          "items": {"type": "string"},
+          "x-arete-reach": true
+        },
+        "mcp": {
+          "type": "array",
+          "items": {"type": "string"},
+          "x-arete-reach": true
+        },
+        "instructions": {
+          "type": "array",
+          "items": {"type": "string", "enum": ["user", "repo"]}
+        },
+        "session": {
+          "type": "string",
+          "enum": ["resume", "fresh"],
+          "x-arete-reach": true
+        },
+        "modalities": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "min_context": {"type": "integer"},
+        "structured_output": {"type": "boolean"},
+        "data_handling": {
+          "type": "array",
+          "items": {"type": "string"},
+          "x-arete-reach": true
+        },
+        "floor": {"type": "string", "x-arete-reach": true},
+        "budget_usd": {"type": "number", "x-arete-reach": true},
+        "directory_cleanup": {"type": "boolean"}
+      },
+      "additionalProperties": false,
+      "x-arete-reach": true,
+      "required": ["tools", "mcp", "session"]
+    }
+  }
+}
