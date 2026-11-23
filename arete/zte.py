@@ -148,7 +148,11 @@ def load_policy() -> Policy | None:
 def settings(cfg: config.Config, policy: Policy) -> tuple[config.Repo, config.RepoLayer, str]:
     from .orchestration import policy_fingerprint
 
-    repo = cfg.repo(cfg.arete_repo)
+    repo = cfg.repo(cfg.zte_repo)
+    if repo.name != cfg.arete_repo:
+        arete_repo = cfg.repo(cfg.arete_repo)
+        pilot.require(repo.tracker == "local" and repo.path == arete_repo.path and repo.github == arete_repo.github,
+                      f'zte_repo {repo.name!r} requires tracker = "local" and the same path and github as {arete_repo.name!r}')
     layer = config.load_layer(repo.layer_dir)
     control = steps.resolve(cfg, layer, "orchestrate", "fix")
     check = steps.resolve(cfg, layer, "verify", "fix")

@@ -134,6 +134,122 @@ class Isolated(unittest.TestCase):
         return run
 
 
+class ZteRepoTests(Isolated):
+    def setUp(self):
+        super().setUp()
+        self.ordinary_layer = self.root / "ordinary"
+        self.zte_layer = self.root / "bounded"
+        self.write_layer(self.ordinary_layer, workers=2, minutes=180, repairs=3)
+        self.write_layer(self.zte_layer, workers=1, minutes=40, repairs=1)
+        identity = Identity("owner/fixture", 1, "repo", 2, 3, 4, "a" * 40, 5, 6)
+        self.policy = zte.Policy(identity, "## Before", "## After", True, True, "", True)
+
+    def write_layer(self, directory, *, workers, minutes, repairs):
+        directory.mkdir(exist_ok=True)
+        (directory / "config.toml").write_text(f'''\
+[factory]
+path = "orchestrated"
+[limits]
+max_run_minutes = {minutes}
+max_verify_minutes = 15
+max_repair_cycles = {repairs}
+[orchestration]
+max_workers = {workers}
+max_decisions = 16
+max_actions = 64
+[checks]
+lint = "sh tools/lint-arete"
+compile = "true"
+imports = "true"
+web = "true"
+behavior = "true"
+[routing]
+payment_modes = ["subscription"]
+fallback = false
+[steps.orchestrate]
+runner = "pi"
+model = "openai/gpt-6.2-sol"
+effort = "low"
+[steps.verify]
+runner = "pi"
+[verify]
+''')
+
+    def write_config(self, *, zte_repo="arete-zte", tracker="local", path=None, github="owner/fixture"):
+        selection = "" if zte_repo is None else f"zte_repo = {json.dumps(zte_repo)}\n"
+        paths.CONFIG_FILE.write_text(f'''\
+{selection}arete_repo = "arete"
+[[repo]]
+name = "arete"
+path = {json.dumps(str(self.repo.path))}
+github = "owner/fixture"
+layer = {json.dumps(str(self.ordinary_layer))}
+pipeline = true
+[[repo]]
+name = "arete-zte"
+path = {json.dumps(str(path or self.repo.path))}
+github = {json.dumps(github)}
+layer = {json.dumps(str(self.zte_layer))}
+tracker = {json.dumps(tracker)}
+pipeline = true
+''')
+
+    def test_uses_the_selected_repos_bounded_layer(self):
+        self.write_config()
+        cfg = config.load()
+        repo, layer, _ = zte.settings(cfg, self.policy)
+
+        self.assertEqual(repo, cfg.repo("arete-zte"))
+        self.assertEqual(layer.dir, self.zte_layer)
+        self.assertEqual((layer.orchestration.max_workers, layer.max_run_minutes, layer.max_repair_cycles), (1, 40, 1))
+
+    def test_defaults_to_the_arete_repo_and_refuses_its_unbounded_layer(self):
+        self.write_config(zte_repo=None)
+        cfg = config.load()
+
+        self.assertEqual(cfg.zte_repo, "arete")
+        with self.assertRaisesRegex(pilot.Held, "ZTE requires the bounded subscription-only PR layer"):
+            zte.settings(cfg, self.policy)
+
+    def test_alternate_repo_requires_local_tracker_and_matching_path_and_github(self):
+        for mismatch in ({"tracker": "github"}, {"path": self.root / "other"}, {"github": "owner/other"}):
+            with self.subTest(**mismatch):
+                self.write_config(**mismatch)
+                with self.assertRaisesRegex(pilot.Held, "zte_repo 'arete-zte'"):
+                    zte.settings(config.load(), self.policy)
+
+    def test_unknown_zte_repo_is_refused_at_config_load(self):
+        self.write_config(zte_repo="missing")
+        with self.assertRaisesRegex(config.UnknownRepo, "zte_repo.*missing"):
+            config.load()
+
+    def test_removing_zte_repo_invalidates_an_admitted_delivery(self):
+        self.write_layer(self.ordinary_layer, workers=1, minutes=40, repairs=1)
+        self.write_config()
+        repo, _, digest = zte.settings(config.load(), self.policy)
+        deadline = util.iso(util.now() + timedelta(minutes=1))
+        base = "b" * 40
+        delivery = zte_store.reserve(self.policy.fingerprint, repo.name, base, deadline, pilot.TASK_TITLE,
+                                     pilot.TASK_KIND, self.policy.signal(base).task(),
+                                     {"config": digest, "engine": codebase.STAMP})
+        with principals.acting("rule:poll"):
+            run_id = record.start("pipeline", repo=repo.name, issue=delivery.task)
+        tasks_store.task_set_state(delivery.task, "running")
+        dispatch = zte_store.transition(delivery, "dispatching")
+        running = zte_store.transition(dispatch, "running", run=run_id)
+
+        with (patch.object(zte, "load_policy", return_value=self.policy),
+              patch.object(zte, "PAUSE_FILE", self.root / "pause")):
+            self.assertEqual(zte.for_run(repo, delivery.task, run_id, "running"), (running, self.policy))
+
+            self.write_config(zte_repo=None)
+            fallback, _, fallback_digest = zte.settings(config.load(), self.policy)
+            self.assertEqual(fallback.name, "arete")
+            self.assertNotEqual(fallback_digest, digest)
+            with self.assertRaisesRegex(pilot.Held, "the admitted ZTE config changed"):
+                zte.for_run(repo, delivery.task, run_id, "running")
+
+
 HELPER_GUARD = """\
 import os, signal, sys, time
 from pathlib import Path
