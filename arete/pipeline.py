@@ -1896,8 +1896,8 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
             except (OSError, RuntimeError, ValueError) as error:
                 print(f"could not start the reserved README task: {error}")
                 return 2
-        with slots.admitting(wait=zte_grant is None) as admitting:
-            if not admitting:
+        with ExitStack() as slot_admission:
+            if not slot_admission.enter_context(slots.admitting(wait=zte_grant is None)):
                 print("could not start the reserved README task: slot admission is busy")
                 return 2
             slot = slots.RunSlot(repo.name, str(tid), cfg.max_parallel)
@@ -1906,8 +1906,29 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 if slots.slots_free_to_start(cfg.max_parallel) > 0:
                     slot.hold()
                 elif not due or zte_store.activation_pending():
-                    print(f"{name} was not started: {slots.no_free_slot(cfg.max_parallel)}. Wait for a run to "
-                          f"finish or raise max_parallel in {paths.short_path(paths.CONFIG_FILE)}.")
+                    slot_admission.close()
+                    pass_over = True
+                    try:
+                        if isinstance(tk, tracker.GitHubTracker):
+                            issue = gh.issue(repo.github, int(tid)) or {}
+                            reserved = any(label["name"] == tracker.ZTE_LABEL for label in issue.get("labels", []))
+                            pass_over = bool(issue) and not (reserved or (feedback and issue.get("state") == "CLOSED"))
+                        elif isinstance(tk, tracker.JiraTracker):
+                            fields = tk.client.issue(tid, ["labels", "status"]).get("fields") or {}
+                            reserved = tracker.ZTE_LABEL in (fields.get("labels") or [])
+                            closed = ((fields.get("status") or {}).get("statusCategory") or {}).get("key") == "done"
+                            pass_over = not (reserved or (feedback and closed))
+                        elif feedback and tracker.task_state(tid) in config.TASK_FINISHED:
+                            pass_over = False
+                    except tracker.ERRORS:
+                        pass_over = False
+                    refusal = f"{name} was not started: {slots.no_free_slot(cfg.max_parallel)}."
+                    if pass_over and not zte_grant:
+                        source_store.pass_over(repo.name, str(tid))
+                        print(f"{refusal} Ticket queued for the next poll.")
+                    else:
+                        print(f"{refusal} Wait for a run to finish or raise max_parallel in "
+                              f"{paths.short_path(paths.CONFIG_FILE)}.")
                     return 1
             settled = [done for dead_row in run_store.ticket_runs_marked_running(repo.name, tid)
                        if (done := record.interrupt(dead_row))]

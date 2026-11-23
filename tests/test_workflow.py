@@ -539,6 +539,58 @@ class QueueScoringTests(unittest.TestCase):
         self.assertEqual(queueing.scores(list(self.source.open_agent_tickets)), {"1": (1, 0)})
 
 
+class PipelineNoSlotTests(unittest.TestCase):
+    def setUp(self):
+        root = Path(self.enterContext(TemporaryDirectory(ignore_cleanup_errors=True))).resolve()
+        self.enterContext(mock.patch.multiple(paths, STATE_DIR=root, DB_FILE=root / "arete.db",
+                                             RUNS_DIR=root / "runs", LOCKS_DIR=root / "locks",
+                                             WORKTREES_DIR=root / "worktrees", LOG_DIR=root / "logs"))
+        with redirect_stdout(StringIO()):
+            db.migrate()
+        remote = "fixture/repo"
+        repo = config.Repo("fixture", root, github=remote, layer=root, parts=[config.Part("", remote)])
+        cfg = config.Config(repos=[repo], max_parallel=1)
+        self.enterContext(mock.patch.object(config, "load", return_value=cfg))
+        self.enterContext(mock.patch.multiple(pipeline.scratch, process_ids=set, service_labels=set))
+        self.free_slots = self.enterContext(mock.patch.object(slots, "slots_free_to_start", return_value=0))
+        self.hold_slot = self.enterContext(mock.patch.object(slots.RunSlot, "hold"))
+
+    def refused_child(self, state="OPEN", labels=(), feedback=()):
+        issue = {"state": state, "labels": [{"name": label} for label in labels]}
+        script = pipeline.Script("orchestrate", mock.Mock(side_effect=AssertionError("started without a slot")))
+        log = paths.LOG_DIR / pipeline.RUNS_LOG
+        with (
+            mock.patch.object(gh, "issue", side_effect=[{"labels": []}, issue]),
+            mock.patch.object(pipeline, "pending_feedback", return_value=list(feedback)),
+            log.open("w") as stdout,
+            redirect_stdout(stdout),
+        ):
+            self.assertEqual(pipeline.run_issue("fixture", "765", force=True, script=script), 1)
+        self.free_slots.assert_called_once_with(1)
+        self.hold_slot.assert_not_called()
+        return log.read_text().strip()
+
+    def test_no_slot_queues_ticket_for_next_poll(self):
+        line = self.refused_child()
+        row, = pipeline.source_store.tickets_passed_over()
+        self.assertEqual((row["repo"], row["issue"]), ("fixture", "765"))
+        self.assertEqual(line, "fixture#765 was not started: no run slot is free (max_parallel 1). "
+                               "Ticket queued for the next poll.")
+
+    def test_zte_label_seen_at_refusal_keeps_original_refusal(self):
+        line = self.refused_child(labels=(tracker.ZTE_LABEL,))
+        self.assertEqual(pipeline.source_store.tickets_passed_over(), [])
+        self.assertEqual(line, "fixture#765 was not started: no run slot is free (max_parallel 1). "
+                               "Wait for a run to finish or raise max_parallel in "
+                               f"{paths.short_path(paths.CONFIG_FILE)}.")
+
+    def test_closed_issue_with_pr_feedback_is_not_queued(self):
+        line = self.refused_child(state="CLOSED", feedback=({"status": "new", "run_id": None},))
+        self.assertEqual(pipeline.source_store.tickets_passed_over(), [])
+        self.assertIn("no run slot is free", line)
+        self.assertNotIn("queued", line)
+
+
 class PolicyRetryCapTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
