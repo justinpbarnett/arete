@@ -359,6 +359,8 @@ class Config:
     document: dict = field(default_factory=dict)
     capture: CaptureConfig = field(default_factory=CaptureConfig)
     oncall: OncallConfig = field(default_factory=OncallConfig)
+    unblock_repos: tuple[str, ...] = ()
+    unblock_step: dict = field(default_factory=dict)
     ab: dict[str, dict] = field(default_factory=dict)
     ignored: tuple[str, ...] = ()
 
@@ -1163,6 +1165,20 @@ def load(path: Path | None = None, strict: bool = False, *, required: bool = Fal
     cfg.jobs = [job_table(job) for job in data.get("job", [])]
     cfg.probes = [probe_table(probe) for probe in data.get("probe", [])]
     cfg.oncall = oncall_table(data.get("oncall") or {}, cfg.repos)
+    unblock = only(table_of(data.get("unblock", {}), "unblock"), root_schema("unblock"), "[unblock]")
+    enabled = flag(unblock, "enabled", False, "[unblock]")
+    repos = unblock.get("repos", [])
+    if not isinstance(repos, list) or any(not isinstance(r, str) for r in repos):
+        raise TypeError("[unblock] repos must be a list of repo names")
+    if set(repos) - {repo.name for repo in cfg.repos if repo.pipeline}:
+        raise ValueError("[unblock] repos must name configured pipeline repositories")
+    cfg.unblock_step = step_table(unblock.get("step", {}), "[unblock.step]")
+    if enabled:
+        cfg.unblock_repos = tuple(dict.fromkeys(repos))
+        if not cfg.unblock_repos or not any(k in cfg.unblock_step for k in ("model", "tier")):
+            raise ValueError("[unblock] needs an explicit repo allowlist and [unblock.step] model or tier")
+        if cfg.unblock_step.get("effort") not in ("high", "xhigh", "max"):
+            raise ValueError("[unblock.step] needs high or greater reasoning effort")
     cfg.replay = replay_table(data.get("replay") or {}, ignored)
     cfg.mcp = mcp_tables(data.get("mcp") or {})
     cfg.research = research_table(data.get("research") or {}, ignored)

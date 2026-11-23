@@ -20,7 +20,7 @@ HEARTBEAT_SECONDS = 30
 FOLLOW_POLL_SECONDS = 0.2
 END = "report"
 FIXED = ("ts", "run", "seq", "event")
-WAIT_CAUSES = ("limit", "ci", "slot", "person")
+WAIT_CAUSES = ("limit", "ci", "slot", "person", "unblock")
 TAIL_BYTES = 4096
 GUARDED_TAIL_BYTES = 64 * 1024
 

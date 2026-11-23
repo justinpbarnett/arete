@@ -72,7 +72,7 @@ def ticket_queues(repo: config.Repo, tk: tracker.Tracker) -> list[tracker.Tracke
 
 def next_ticket(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
                 other_routes: set[str] = frozenset(), excluded: set[str] = frozenset(),
-                recovered: tuple[tracker.Ticket, ...] = ()) -> tracker.Ticket | None:
+                recovered: tuple[tracker.Ticket, ...] = (), observe=None) -> tracker.Ticket | None:
     for source in ticket_queues(repo, tk):
         def retry_failed(tid: str) -> bool:
             if runlimits.latest_park(repo.name, tid)[1]:
@@ -93,6 +93,8 @@ def next_ticket(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
         known = {str(t.id) for t in listed}
         extra = [t for t in recovered if str(t.id) not in known] if source is tk else []
         open_tickets = source.open_agent_tickets if isinstance(source, tracker.GitHubTracker) else ()
+        if observe:
+            observe(source, list({t.id: t for t in (*listed, *extra, *open_tickets)}.values()))
         for t in queueing.prioritized([*listed, *extra], open_tickets=open_tickets):
             tid = str(t.id)
             if (tid in excluded or other_routes & set(t.labels) or run_store.issue_running(repo.name, t.id)
@@ -119,7 +121,7 @@ def jira_routes_by_project(cfg: config.Config) -> dict[str, set[str]]:
 
 def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
               other_routes: set[str], excluded: set[str] = frozenset(),
-              recovered: tuple[tracker.Ticket, ...] = ()) -> Pick | None:
+              recovered: tuple[tracker.Ticket, ...] = (), observe=None) -> Pick | None:
     excluded = excluded | oncall.parked(repo.name)
 
     def eligible_again(tid):
@@ -156,15 +158,15 @@ def next_pick(repo: config.Repo, tk: tracker.Tracker, skips: pipeline.SkipLog,
                 skips.note(tracker.ticket_name(repo.name, t.ref), t, blocker, repo.name)
                 continue
             return Pick(t.id, f"{t.title} (you replied to the question)")
-    fresh = next_ticket(repo, tk, skips, other_routes, excluded, recovered)
+    fresh = next_ticket(repo, tk, skips, other_routes, excluded, recovered, observe=observe)
     return Pick(fresh.id, fresh.title, from_queue=True) if fresh else None
 
 
 def step_without_route(cfg: config.Config, repo: config.Repo, ticket: tracker.Ticket,
-                  discovery: routing.Discovery, layer: config.RepoLayer) -> str:
+                  discovery: routing.Discovery, layer: config.RepoLayer, *, mode: str = "", repairing=False) -> str:
     if cfg.replay.all:
         return ""
-    mode = pipeline.dispatch_path(repo, str(ticket.id))
+    mode = mode or pipeline.dispatch_path(repo, str(ticket.id))
     adaptive = mode in (pipeline.ORCHESTRATED, "orchestrate")
     first = ("orchestrate", "build") if adaptive else ("plan", "build")
     if (not adaptive and layer.factory_path == pipeline.ADW and len(repo.parts) <= 1
@@ -173,7 +175,9 @@ def step_without_route(cfg: config.Config, repo: config.Repo, ticket: tracker.Ti
         first = ("build",)
     newest = run_store.newest_whole_run(repo.name, ticket.id)
     feedback = pending_feedback(repo.name, ticket.id)
-    if pipeline.custom_feedback_fallback(cfg, mode, feedback):
+    if repairing:
+        first = ("review_repair",)
+    elif pipeline.custom_feedback_fallback(cfg, mode, feedback):
         first = ("build",)
     elif (layer.factory_path == pipeline.ADW and newest and newest["status"] == "interrupted"
             and repaired_by(newest["id"])):
@@ -235,7 +239,8 @@ def tracker_reply(repo: config.Repo, tk: tracker.Tracker, tid: str, dry_run: boo
             if text:
                 for a in open_asks:
                     if a["id"] in waiting_ids:
-                        ask_store.ask_close(a["id"], "answered", owner_asks.text_answers(a, text))
+                        answers = owner_asks.text_answers(owner_asks.unstaged(a), text)
+                        ask_store.ask_close(a["id"], "answered", owner_asks.combine_staged(a, answers))
             elif from_queue and current_asks == asks:
                 return ""
             if ask_store.asks_of(run_id, "open"):
@@ -403,7 +408,16 @@ def fill_slots(cfg: config.Config, queues: list[RepoQueue], skips: pipeline.Skip
             if repo.name in exhausted or examined >= MAX_STARTS_PER_POLL:
                 continue
             try:
-                pick = next_pick(repo, queue.tracker, skips, queue.other_routes, queue.selected, queue.recovered)
+                if not dry_run and repo.name in cfg.unblock_repos:
+                    from . import unblock
+
+                    def observe(source, tickets):
+                        unblock.publish_queue(repo, source, tickets)
+
+                    pick = next_pick(repo, queue.tracker, skips, queue.other_routes, queue.selected,
+                                     queue.recovered, observe=observe)
+                else:
+                    pick = next_pick(repo, queue.tracker, skips, queue.other_routes, queue.selected, queue.recovered)
                 if not pick:
                     exhausted.add(repo.name)
                     if not dry_run:

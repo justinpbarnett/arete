@@ -28,6 +28,7 @@ from . import (
 )
 from .alerts import issue_link, opened_in
 from .store import approvals as approvals_store
+from .store import asks as asks_store
 from .store import db as foundation
 from .store import devices as devices_store
 from .store import incidents as incident_store
@@ -36,6 +37,7 @@ from .store import loops as loop_store
 from .store import orchestration as orchestration_store
 from .store import runs as run_store
 from .store import triage as triage_store
+from .store import unblock as unblock_store
 
 RECENT_RUNS = 25
 TREND_DAYS = 30
@@ -72,6 +74,7 @@ def snapshot(recent_runs: int = RECENT_RUNS) -> dict:
             "live": panel(lambda: live(running())),
             "skipped": panel(lambda: skipped(running())),
             "waiting": panel(waiting),
+            "recovery": panel(recovery_queue),
             "recent": panel(lambda: run_rows(run_store.runs(limit=recent_runs, connect=foundation.reader))),
             "checks": panel(checks),
             "alerts": panel(alerts),
@@ -239,12 +242,29 @@ def live_board(draft: dict | None) -> dict:
     running = run_store.runs_marked_running(connect=foundation.reader)
     board = functools.cache(lambda: triage.view(connect=foundation.reader))
     return {"now": util.iso(), "live": panel(lambda: live(running)), "waiting": panel(waiting),
+            "recovery": panel(recovery_queue), "recovering_tasks": recovering_tasks(),
             "needs_you": needs_you(running, board, draft)}
+
+
+def recovering_tasks() -> list[str]:
+    asks = asks_store.open_asks(connect=foundation.reader)
+    owner = {a["ticket"] for a in asks if a["recovery_route"] == "owner"}
+    return sorted({a["ticket"] for a in asks if tracker.is_task_id(a["ticket"])} - owner)
+
+
+def recovery_queue() -> list[dict]:
+    return [{k: row[k] for k in ("repo", "ticket", "source", "cause", "phase", "detail", "updated")}
+            for row in unblock_store.cases(connect=foundation.reader)]
+
+
+def skipped_for_owner(running: list[dict]) -> list[dict]:
+    enabled = config.load_or_problem()[0].unblock_repos
+    return [row for row in skipped(running) if row["repo"] not in enabled]
 
 
 def needs_you(running: list[dict], board, draft: dict | None) -> dict:
     return {"approvals": panel(lambda: delivery.waiting(connect=foundation.reader)),
-            "skipped": panel(lambda: skipped(running)), "proposals": panel(proposals),
+            "skipped": panel(lambda: skipped_for_owner(running)), "proposals": panel(proposals),
             "ready": panel(lambda: ready_in_one_click(board())), "draft": draft}
 
 
@@ -351,7 +371,9 @@ def runs_board(filters: dict[str, str], limit: int = RECENT_RUNS) -> dict:
 
 def run_rows(rows: list[dict]) -> list[dict]:
     paid = run_store.paid_by_run([r["id"] for r in rows], connect=foundation.reader)
+    routes = asks_store.routes_of([r["id"] for r in rows if r["status"] == "needs-info"], connect=foundation.reader)
     return [{"id": r["id"], "kind": r["kind"], "ticket": ticket(r), "status": r["status"], "started": r["started"],
+             "ask_route": routes.get(r["id"], ""),
              "finished": r["finished"], "seconds": seconds_between(r["started"], r["finished"]),
              "paid": paid.get(r["id"], 0), "pr_url": r["pr_url"] or "", "summary": r["summary"] or "",
              "loop": r.get("loop") or "", "repo": r["repo"] or ""} for r in rows]
@@ -385,8 +407,12 @@ def run_board(run_id: str) -> dict:
         adaptive = orchestration_store.view(run_id, connect=foundation.reader)
         if adaptive:
             adaptive["workspace_retained"] = not flows.action_workspace_refusal(run_id)
+        recovery = unblock_store.get(r["repo"], str(r["issue"]), connect=foundation.reader) if r["issue"] else {}
+        routes = asks_store.routes_of([run_id], connect=foundation.reader) if r["status"] == "needs-info" else {}
         return {"now": util.iso(),
-                "run": {**r, "ticket": ticket(r), "paid": round(sum(m["paid"] for m in rows), 4)},
+                "run": {**r, "ticket": ticket(r), "paid": round(sum(m["paid"] for m in rows), 4),
+                        "ask_route": routes.get(run_id, "")},
+                "recovery": {k: recovery[k] for k in ("phase", "cause", "detail")} if recovery else None,
                 "models": rows,
                 "orchestration": adaptive,
                 "approvals": [a for a in delivery.waiting(connect=foundation.reader) if a["run_id"] == run_id],
