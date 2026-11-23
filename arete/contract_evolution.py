@@ -15,7 +15,9 @@ from . import contract
 
 SOURCE = "arete/contract.py"
 REGISTRY_INPUTS = (SOURCE, "arete/refusals.py")
-PRODUCERS = (*REGISTRY_INPUTS, "arete/contract_evolution.py")
+REQUIRED_PRODUCERS = (*REGISTRY_INPUTS, "arete/contract_evolution.py")
+CONFIG_REGISTRY = "arete/configkinds.py"
+PRODUCERS = (*REQUIRED_PRODUCERS, CONFIG_REGISTRY)
 OPENAPI = "docs/openapi.json"
 BOOTSTRAP = "arete/contract_v1_baseline.json"
 BOOTSTRAP_SOURCES = {
@@ -198,15 +200,16 @@ def baseline(root, revision):
     def read(path):
         return git(root, "cat-file", "blob", f"{commit}:{path}")
 
-    has_artifact = bool(git(root, "ls-tree", "-z", commit, "--", OPENAPI))
-    if not has_artifact and sources(read, REGISTRY_INPUTS) == BOOTSTRAP_SOURCES:
+    tracked = {entry.split(b"\t", 1)[1].decode() for entry in
+               git(root, "ls-tree", "-z", commit, "--", OPENAPI, *PRODUCERS).split(b"\0") if entry}
+    if OPENAPI not in tracked and sources(read, REGISTRY_INPUTS) == BOOTSTRAP_SOURCES:
         frozen = (root / BOOTSTRAP).read_bytes()
         if sha(frozen) != BOOTSTRAP_DATA_SHA:
             raise ValueError(f"pre-OpenAPI baseline {BOOTSTRAP} was modified")
         return commit, {**json.loads(frozen)["registry"], "oldest_client": BOOTSTRAP_OLDEST_CLIENT}
     try:
         document = json.loads(read(OPENAPI))
-        source_hashes = sources(read)
+        source_hashes = sources(read, PRODUCERS if CONFIG_REGISTRY in tracked else REQUIRED_PRODUCERS)
         saved = document["x-arete-contract-sources-sha256"]
         if saved != source_hashes:
             changed = sorted(path for path in source_hashes if saved.get(path) != source_hashes[path])

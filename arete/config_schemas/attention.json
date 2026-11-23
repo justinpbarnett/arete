@@ -1,0 +1,11 @@
+{
+  "type": "object",
+  "properties": {
+    "max_per_run": {"type": "integer"},
+    "settle": {"type": "boolean"},
+    "expire_days": {"type": "number"},
+    "remind_hours": {"type": "number"},
+    "push_contact": {"type": "string"}
+  },
+  "additionalProperties": false
+}

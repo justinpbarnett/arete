@@ -1,0 +1,28 @@
+{
+  "type": "object",
+  "properties": {
+    "plan": {"type": "string"},
+    "build": {"type": "string"},
+    "verify": {"type": "string"},
+    "review": {"type": "string"},
+    "learn": {"type": "string"},
+    "uat": {"type": "string"},
+    "miner": {"type": "string"},
+    "apply": {"type": "string"},
+    "eval_mine": {"type": "string"},
+    "triage": {"type": "string"},
+    "chat": {"type": "string"},
+    "classify": {"type": "string"},
+    "loop": {"type": "string"},
+    "session": {"type": "string"},
+    "research": {"type": "string"},
+    "research_plan": {"type": "string"},
+    "research_search": {"type": "string"},
+    "research_synthesis": {"type": "string"},
+    "research_audit": {"type": "string"},
+    "explain": {"type": "string"},
+    "document": {"type": "string"},
+    "capture_evidence": {"type": "string"}
+  },
+  "additionalProperties": false
+}

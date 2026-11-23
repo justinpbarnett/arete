@@ -1,0 +1,9 @@
+{
+  "type": "object",
+  "properties": {
+    "domain": {"type": "string", "enum": ["outbox", "intake"]}
+  },
+  "additionalProperties": false,
+  "required": ["domain"],
+  "x-arete-rule-domains": {"outbox": "rule_outbox.json", "intake": "rule_intake.json"}
+}

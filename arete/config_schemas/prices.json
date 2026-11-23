@@ -1,0 +1,77 @@
+{
+  "type": "object",
+  "properties": {
+    "schema": {"type": "integer", "enum": [1]},
+    "source": {"type": "string"},
+    "observed": {"type": "string"},
+    "routes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "route": {"type": "string"},
+          "provider": {"type": "string"},
+          "model": {"type": "string"},
+          "currency": {"type": "string"},
+          "unit": {"type": "string", "enum": ["per_million_tokens", "per_thousand_tokens", "per_token"]},
+          "retired": {"type": ["string", "null"]},
+          "replacement": {"type": ["string", "null"]},
+          "source": {"type": "string"},
+          "observed": {"type": "string"},
+          "kind": {"type": "string", "enum": ["native", "marketplace"]},
+          "aliases": {
+            "type": "array",
+            "items": {"type": "string"}
+          },
+          "rates": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "input": {"type": "number"},
+                "output": {"type": "number"},
+                "cache_read": {"type": "number"},
+                "cache_write": {"type": "number"},
+                "from": {"type": "string"},
+                "until": {"type": "string"},
+                "label": {"type": "string"},
+                "when": {
+                  "type": "object",
+                  "additionalProperties": {"type": ["string", "boolean", "number"]}
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        "additionalProperties": false,
+        "required": ["route", "kind", "provider", "model", "currency", "unit", "rates"]
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": ["schema", "source", "observed", "routes"],
+  "$defs": {
+    "pricing": {
+      "type": "object",
+      "properties": {
+        "local_providers": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "models": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "input": {"type": "number"},
+              "output": {"type": "number"}
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
