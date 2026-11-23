@@ -21,6 +21,7 @@ RETAINED_KEY = "\0retained"
 ENDED = ("merged", "rejected", "done")
 WAITING = ("running", "pr", "needs-info")
 HELD_FILE = paths.STATE_DIR / "held-workspaces.json"
+termination_pending = False
 
 
 @dataclass
@@ -257,6 +258,8 @@ def retained(ws: Path, checkouts: list[Checkout], names: list[str], held: list[P
 
 
 def remove_workspace(ws: Path, checkouts: list[Checkout], *, excluded: Collection[Path] = ()) -> Release:
+    if termination_pending:
+        return Release("held", ["SIGTERM unwinding"])
     made = made_before(ws)
     if names := workspace_blockers(ws, checkouts, excluded=excluded, made=made):
         return Release("held", names)
@@ -480,7 +483,10 @@ def outside_scratch(ws: Path, names: list[str], held: list[Path]) -> list[str]:
 
 
 def note_made(ws: Path, checkouts: list[Checkout], owner: WorkspaceOwner | None = None,
-              *, preserve: Collection[str] = (), excluded: Collection[Path] = ()) -> None:
+              *, preserve: Collection[str] = (), excluded: Collection[Path] = (),
+              during_termination: bool = False) -> None:
+    if termination_pending and not during_termination:
+        return
     try:
         before = made_before(ws) if excluded or not owner else {}
         owner_row = owner.to_row() if owner else before.get(OWNER_KEY)
