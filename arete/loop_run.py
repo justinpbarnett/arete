@@ -566,8 +566,14 @@ def loop_repo(run: LoopRun) -> config.Repo | None:
     return run.loop.routing_repo(run.cfg)
 
 
+def loop_jev_ready(run: LoopRun) -> bool:
+    repo = loop_repo(run)
+    checkout_repo = run.cfg.repo_for_path(repo.path) if repo else None
+    return jev.ready(run.cfg, [repo, checkout_repo])
+
+
 def jev_readable(run: LoopRun, events: list[dict]) -> list[dict]:
-    if not events or not jev.ready(run.cfg, [loop_repo(run)]):
+    if not events or not loop_jev_ready(run):
         return []
     return [e for e in events
             if run.cfg.jev_allowed([emits.config_repo(run.cfg, e["repo"]) if e.get("repo") else None])]
@@ -606,7 +612,7 @@ def known_twins(run: LoopRun, unseen: list[dict]) -> dict[int, dict]:
 
     if mergecheck.builtin(run.loop) or releasejourneys.builtin(run.loop):
         return {}
-    if not unseen or not jev.ready(run.cfg, [loop_repo(run)]):
+    if not unseen or not loop_jev_ready(run):
         return {}
     known = loop_store.findings(run.loop.name, KNOWN_FINDINGS_ASKED)
     if not known:
@@ -994,7 +1000,7 @@ def waiting_fixes(run: LoopRun) -> list[tuple[str, str]]:
 
 def already_fixed(run: LoopRun, ws: Workspace) -> str:
     found = [e["data"] for e in run.events if e.get("type") == loops.FINDING_EVENT and e.get("data")]
-    if run.trial or not found or not jev.ready(run.cfg, [loop_repo(run)]):
+    if run.trial or not found or not loop_jev_ready(run):
         return ""
     candidates = landed_fixes(run, ws, found) + waiting_fixes(run)
     if not candidates:

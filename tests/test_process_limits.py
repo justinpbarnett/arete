@@ -23,6 +23,7 @@ from unittest.mock import Mock, patch
 
 from adws import feature
 from arete import (
+    accounts,
     codebase,
     config,
     dbstats,
@@ -47,8 +48,10 @@ from arete import (
     record,
     repairs,
     requeue,
+    routing,
     run_lines,
     runlimits,
+    runner,
     sandbox,
     scratch,
     slots,
@@ -234,19 +237,16 @@ pipeline = true
         with self.assertRaisesRegex(config.UnknownRepo, "zte_repo.*missing"):
             config.load()
 
-    def test_alias_first_preserves_ordinary_checkout_lookup_and_explicit_alias_selection(self):
-        self.write_config(alias_first=True)
-        cfg = config.load()
+    def test_generic_checkout_lookup_uses_the_first_entry_with_or_without_a_zte_alias(self):
+        for selection in (None, "arete-zte"):
+            with self.subTest(zte_repo=selection):
+                self.write_config(zte_repo=selection, alias_first=True)
+                cfg = config.load()
+                alias = cfg.repo("arete-zte")
 
-        self.assertEqual(cfg.repos[0].name, "arete-zte")
-        self.assertEqual(cfg.repo_for_path(self.repo.path), cfg.repo("arete"))
-        self.assertEqual(cfg.repo_for_work_dir(self.repo.path / "subdir"), cfg.repo("arete"))
-        self.assertEqual(cfg.repo_for_work_dir(paths.WORKTREES_DIR / "arete-zte-fixture"), cfg.repo("arete-zte"))
-        self.assertEqual(zte.settings(cfg, self.policy)[0], cfg.repo("arete-zte"))
-
-        self.write_config(zte_repo=None, alias_first=True)
-        cfg = config.load()
-        self.assertEqual(cfg.repo_for_path(self.repo.path), cfg.repo("arete-zte"))
+                self.assertIs(cfg.repo_for_path(self.repo.path), alias)
+                self.assertIs(cfg.repo_for_work_dir(self.repo.path / "subdir"), alias)
+                self.assertIs(cfg.repo_for_work_dir(paths.WORKTREES_DIR / "arete-zte-fixture"), alias)
 
     def test_named_agent_loops_validate_and_launch_with_their_own_repo(self):
         self.write_layer(self.ordinary_layer, workers=2, minutes=180, repairs=3, payment_mode="local")
@@ -289,6 +289,150 @@ pipeline = true
                       patch.object(vault, "read", side_effect=lambda repo: {"FIXTURE_VALUE": f"{repo}-vault"})):
                     result = loop_run.shell_result(run, command, self.repo.path)
                 self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_agent_loop_without_a_zte_alias_uses_checkout_payment_policy(self):
+        self.write_layer(self.zte_layer, workers=1, minutes=40, repairs=1, payment_mode="local")
+        folder = self.root / "watch"
+        folder.mkdir()
+        (folder / "prompt.md").write_text("Look for findings.\n")
+        (folder / "loop.toml").write_text('[run]\nrepo = "arete-zte"\nmodel = "codex:gpt-6.2-sol"\n')
+
+        for selection in (None, "arete"):
+            with self.subTest(zte_repo=selection):
+                self.write_config(zte_repo=selection)
+                cfg = config.load()
+                loop = loops.load(folder, "user", "", cfg)
+                self.assertEqual(loop.routing_repo(cfg), cfg.repo("arete"))
+
+    def test_loop_at_an_unrelated_shared_checkout_uses_checkout_policy(self):
+        self.write_config(alias_first=True)
+        cfg = config.load()
+        checkout = self.root / "other"
+        first = config.Repo("first", checkout)
+        second = config.Repo("second", checkout)
+        cfg.repos.extend([first, second])
+
+        loop = loops.Loop("fixture", self.root, "user", repo=second.name)
+        self.assertEqual(loop.routing_repo(cfg), first)
+
+    def test_path_loop_routes_with_the_first_checkout_repo(self):
+        self.write_layer(self.ordinary_layer, workers=2, minutes=180, repairs=3, payment_mode="local")
+        self.write_config(alias_first=True)
+        cfg = config.load()
+        third = config.Repo("third", self.repo.path, layer=self.zte_layer)
+        cfg.repos.insert(0, third)
+        folder = self.root / "watch"
+        folder.mkdir()
+        (folder / "prompt.md").write_text("Look for findings.\n")
+        (folder / "loop.toml").write_text(
+            f'[run]\nrepo = {json.dumps(str(self.repo.path))}\nmodel = "codex:gpt-6.2-sol"\n'
+        )
+
+        loop = loops.load(folder, "user", "", cfg)
+        run = loop_run.LoopRun(loop, "fixture", cfg)
+        with patch.object(routing, "outlook", return_value=[]) as outlook:
+            loop.outlooks(cfg)
+        self.assertIs(outlook.call_args.args[1], third)
+        self.assertIs(loop_run.loop_repo(run), third)
+
+        cfg.repos.remove(third)
+        cfg.repos.insert(1, third)
+        self.assertIs(loop.routing_repo(cfg), cfg.repo("arete"))
+        self.assertIs(loop_run.loop_repo(run), cfg.repo("arete"))
+
+    def test_loops_without_a_zte_alias_keep_checkout_environment_and_vault_values(self):
+        self.write_config(zte_repo=None)
+        cfg = config.load()
+        values = {"FIXTURE_ORDINARY": "ordinary-env", "FIXTURE_ZTE": "zte-env"}
+        for layer, allowed in ((self.ordinary_layer, "FIXTURE_ORDINARY"), (self.zte_layer, "FIXTURE_ZTE")):
+            with (layer / "config.toml").open("a") as file:
+                file.write(f'\n[environment]\npass = ["{allowed}"]\n')
+        model = "gpt-6.2-sol"
+        loop = loops.Loop("fixture", self.root, "user", repo="arete-zte", model=f"codex:{model}")
+        run = loop_run.LoopRun(loop, "fixture", cfg)
+        auth = accounts.Auth(mode="subscription", family="codex")
+        candidate = routing.Candidate(order=0, model=model, runner="codex", provider="openai", credential="login",
+                                      billing="subscription", tier="", position=0, requested=True, effort="",
+                                      instructions=(), price=None, state="ready", detail="")
+        picked = runner.Picked(candidate, auth, None, model, "", {auth}, None)
+
+        with (patch.dict(os.environ, values),
+              patch.object(vault, "read", side_effect=lambda repo: {"FIXTURE_VALUE": f"{repo}-vault"})):
+            with (self.subTest(loop="agent"), patch.object(runner, "pick", return_value=(picked, [])),
+                  patch.object(runner, "attempt", return_value=Result(ok=True)) as launch,
+                  patch.object(record, "note"), patch.object(run, "log")):
+                result = run.agent("watch", "Look for findings.", self.repo.path)
+                self.assertTrue(result.ok, result.error)
+                arguments = launch.call_args.args[9]
+                env = runner.codex.agent_env(arguments["passing"], arguments["extra_env"])
+                self.assertEqual(env.get("FIXTURE_ORDINARY"), values["FIXTURE_ORDINARY"])
+                self.assertNotIn("FIXTURE_ZTE", env)
+                self.assertEqual(env.get("FIXTURE_VALUE"), "arete-vault")
+
+            with self.subTest(loop="shell"), patch.object(loop_run, "drop_unstaged"):
+                command = ('test "$FIXTURE_ORDINARY" = ordinary-env && test -z "$FIXTURE_ZTE" '
+                           '&& test "$FIXTURE_VALUE" = arete-vault')
+                result = loop_run.shell_result(run, command, self.repo.path)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_loops_without_a_zte_alias_respect_checkout_jev_opt_out(self):
+        self.write_config(zte_repo=None)
+        cfg = config.load()
+        cfg.repo("arete").jev = False
+        self.assert_loop_respects_jev_opt_out(cfg, "arete-zte")
+
+    def test_path_loop_respects_the_first_checkout_repos_jev_opt_out(self):
+        self.write_config(alias_first=True)
+        cfg = config.load()
+        cfg.repos.insert(0, config.Repo("third", self.repo.path, jev=False))
+        self.assert_loop_respects_jev_opt_out(cfg, str(self.repo.path))
+
+    def test_named_loops_respect_the_jev_opt_out_of_either_repo(self):
+        self.write_config(alias_first=True)
+        cfg = config.load()
+        cfg.repos.insert(0, config.Repo("third", self.repo.path))
+        for selection, opted_out in (("arete", "third"), ("arete-zte", "third"), ("arete", "arete")):
+            with (self.subTest(selection=selection, opted_out=opted_out),
+                  patch.object(cfg.repo(opted_out), "jev", False)):
+                self.assert_loop_respects_jev_opt_out(cfg, selection)
+
+        loop = loops.Loop("fixture", self.root, "user", repo="arete")
+        run = loop_run.LoopRun(loop, "fixture", cfg)
+        event = {"title": "Allowed event"}
+        private = {"title": "Private event", "repo": "arete-zte"}
+        with patch.object(loop_run.jev, "key", return_value="fixture"), patch.object(cfg.repo("arete-zte"), "jev", False):
+            self.assertEqual(loop_run.jev_readable(run, [event, private]), [event])
+
+    def test_path_loop_respects_the_alias_jev_opt_out_when_routing_uses_arete(self):
+        self.write_config(alias_first=True)
+        cfg = config.load()
+        cfg.repo("arete-zte").jev = False
+        self.assert_loop_respects_jev_opt_out(cfg, str(self.repo.path))
+
+    def assert_loop_respects_jev_opt_out(self, cfg, selection):
+        loop = loops.Loop("fixture", self.root, "user", repo=selection)
+        finding = {"title": "Private finding"}
+        run = loop_run.LoopRun(loop, "fixture", cfg, events=[
+            {"trust": "untrusted", "title": "Untagged event", "data": {"body": "Fixture body"}},
+            {"type": "finding", "data": finding},
+        ])
+        script = {"type": "script", "title": "Local script output", "data": {"output": "Fixture output"}}
+
+        unexpected = AssertionError("a loop with jev = false reached JEV")
+        with (patch.object(loop_run.jev, "key", return_value="fixture"),
+              patch.object(loop_run.screening, "screen_many", side_effect=unexpected),
+              patch.object(loop_run.jev, "ask_many", side_effect=unexpected),
+              patch.object(loop_run.jev, "fixed", side_effect=unexpected),
+              patch.object(loop_run.loop_store, "findings", return_value=[{"title": "Known finding"}]),
+              patch.object(loop_run, "landed_fixes", return_value=[("commit", "Fixture diff")])):
+            with self.subTest(operation="screen events"):
+                self.assertIsNone(loop_run.screened(run))
+            with self.subTest(operation="classify script output"):
+                self.assertEqual(loop_run.classify_by_jev(run, {"prompt": "Investigate?"}, [script]), {})
+            with self.subTest(operation="deduplicate findings"):
+                self.assertEqual(loop_run.known_twins(run, [finding]), {})
+            with self.subTest(operation="look for existing fixes"):
+                self.assertEqual(loop_run.already_fixed(run, None), "")
 
     def test_selector_edit_preserves_ordinary_worker_and_workflow_policies(self):
         self.write_config(zte_repo=None, alias_first=True)

@@ -134,11 +134,17 @@ class Loop:
     def routing_repo(self, cfg: config.Config) -> config.Repo | None:
         if not self.repo:
             return None
-        for repo in cfg.repos:
-            if repo.name == self.repo:
-                return repo
         repo = self.work_repo(cfg)
-        return cfg.repo_for_path(repo.path) or repo
+        checkout_repo = cfg.repo_for_path(repo.path) or repo
+        named = self.repo == repo.name
+        if cfg.zte_repo != cfg.arete_repo and (named or checkout_repo.name == cfg.zte_repo):
+            try:
+                ordinary, alias = cfg.repo(cfg.arete_repo), cfg.repo(cfg.zte_repo)
+            except config.UnknownRepo:
+                return checkout_repo
+            if ordinary.path.resolve() == alias.path.resolve() == repo.path.resolve():
+                return repo if named else ordinary
+        return checkout_repo
 
     def outlooks(self, cfg: config.Config, connect=foundation.reader) -> list[list]:
         from . import routing

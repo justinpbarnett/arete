@@ -392,14 +392,9 @@ class Config:
 
     def repo_for_path(self, p: str | Path) -> Repo | None:
         p = Path(p).resolve()
-        arete_path = None
-        if self.zte_repo != self.arete_repo:
-            arete_path = next((r.path.resolve() for r in self.repos if r.name == self.arete_repo), None)
         best = None
         for r in self.repos:
             rp = r.path.resolve()
-            if r.name == self.zte_repo and rp == arete_path:
-                continue
             holds_path = p == rp or rp in p.parents
             if holds_path and (best is None or len(str(rp)) > len(str(best.path.resolve()))):
                 best = r
