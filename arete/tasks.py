@@ -476,12 +476,12 @@ def continue_asked(cfg: config.Config, repo: config.Repo, row: dict, command: li
                   admission=admission)
 
 
-def kept_folder_removed(repo: config.Repo, tid: str, run_id: str) -> bool:
+def kept_folder_removed(repo: config.Repo, tid: str, run_id: str) -> workspace.Release | None:
     try:
         checkouts = [workspace.Checkout.from_row(c)
                      for c in flows.prepared_data(run_id).get("checkouts") or []]
     except (TypeError, KeyError):
-        return False
+        return None
     return workspace.remove_workspace(paths.WORKTREES_DIR / f"{repo.name}-{tid}", checkouts)
 
 
@@ -497,8 +497,11 @@ def let_go(cfg: config.Config, repo: config.Repo, row: dict, status: str) -> dic
             raise control.Refused(f"run {run_id} is no longer waiting for an answer, so it was not stopped")
         ask_store.asks_retire(run_id, "stopped" if status == "closed" else status)
         latest = not run_store.later_run(repo.name, tid, run_id)
-        removed = latest and kept_folder_removed(repo, tid, run_id)
+        release = kept_folder_removed(repo, tid, run_id) if latest else None
+        removed = release is not None and release.state == "removed"
         folder = "its work folder is removed" if removed else "its work folder was left in place"
+        if release and release.held_by:
+            folder += f" (removal blocked by {', '.join(release.held_by[:10])})"
         if status == "closed":
             pipeline.write_report(run_store.run_get(run_id) or row)
             return answer(tid, repo.name, run_id, "stopped", f"run {run_id} stopped because {name} closed; {folder}")
@@ -538,6 +541,18 @@ def expire_asks(cfg: config.Config) -> list[str]:
     return notes
 
 
+def asked_ticket_is_closed(cfg: config.Config, repo: str, tid: str) -> bool:
+    if tracker.is_task_id(tid):
+        return workspace.ticket_closed(tid)
+    configured = next((r for r in cfg.repos if r.name == repo), None)
+    if configured is None:
+        return False
+    try:
+        return not tracker.for_repo(cfg, configured).get(tid).open
+    except Exception:
+        return False
+
+
 def release_closed(cfg: config.Config) -> list[str]:
     notes = []
     for run_id in dict.fromkeys(a["run"] for a in ask_store.open_asks()):
@@ -548,7 +563,7 @@ def release_closed(cfg: config.Config) -> list[str]:
         tid = str(row["issue"])
         if row["status"] != "needs-info" or run_store.later_run(repo.name, row["issue"], run_id) or live_run(repo.name, tid):
             continue
-        if not workspace.ticket_closed(cfg, repo.name, tid, row["status"]):
+        if not asked_ticket_is_closed(cfg, repo.name, tid):
             continue
         with util.lock(STEER_LOCK, wait=True):
             row = run_store.run_get(run_id) or row
