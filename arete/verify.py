@@ -5,8 +5,11 @@ import json
 import os
 import re
 import shlex
+import shutil
+import ssl
 import stat
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.error
@@ -14,11 +17,15 @@ import urllib.request
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, fields, replace
 from fnmatch import fnmatchcase
+from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import SplitResult, urlsplit
 
-from . import _test_stacks, browser, config, environment, paths, sandbox, scratch, util, vault
+from . import (
+    _test_stacks, browser, config, credential_files, environment, paths, sandbox, scratch, tailnet, util, vault,
+    verify_faults,
+)
 from .util import git
 
 PLAYWRIGHT_TOOLS = tuple("browser_" + n for n in (
@@ -291,25 +298,112 @@ def relayed(url: str):
         server.server_close()
 
 
+@dataclass(frozen=True)
+class DashboardSession:
+    start: str
+    cli: str
+    url: str
+    trust: ssl.SSLContext
+
+
+def dashboard_tls():
+    ca = os.environ.get("ARETE_VERIFY_DASHBOARD_CA")
+    bundle = os.environ.get("ARETE_VERIFY_DASHBOARD_TLS")
+    if not ca or not bundle:
+        raise sandbox.ConfinementUnavailable(
+            "Set ARETE_VERIFY_DASHBOARD_CA and ARETE_VERIFY_DASHBOARD_TLS for the configured scratch HTTPS dashboard.")
+    try:
+        pem = credential_files.read_private(Path(bundle), 65536)
+        if not pem:
+            raise ValueError("the private TLS bundle is missing or empty")
+        public = Path(ca).read_bytes()
+        trust = ssl.create_default_context(cadata=public.decode("ascii"))
+    except (OSError, ValueError) as error:
+        raise sandbox.ConfinementUnavailable(f"Scratch dashboard TLS material could not be loaded ({error}).") from None
+    return pem, public, trust
+
+
+@contextmanager
+def dashboard_session(v: config.Verify, lifetime: dict):
+    wrapper = dashboard_wrapper(v)
+    if not wrapper:
+        yield None
+        return
+    original = urlsplit(v.url)
+    if original.port is None:
+        raise sandbox.ConfinementUnavailable("The scratch dashboard verify URL needs an explicit port.")
+    pem, ca, trust = dashboard_tls()
+    url = f"https://{tailnet.VERIFICATION_ADDRESS}:{original.port}"
+    root = Path(tempfile.mkdtemp(prefix=verify_faults.DASHBOARD_PREFIX)).resolve()
+    private = root / "state" / tailnet.VERIFICATION_TLS
+    try:
+        dirs = {"HOME": "home", "XDG_CONFIG_HOME": "config-home", "XDG_STATE_HOME": "xdg", "XDG_DATA_HOME": "data",
+                "XDG_CACHE_HOME": "cache", "TMPDIR": "tmp", "ARETE_CONFIG_DIR": "config",
+                "ARETE_STATE_DIR": "state", "ARETE_LOG_DIR": "logs", "ARETE_WORKTREES_DIR": "worktrees"}
+        for folder in dirs.values():
+            (root / folder).mkdir(mode=0o700)
+        (root / ".arete-owned").write_bytes(verify_faults.MARKER)
+        public = root / "dashboard-ca.crt"
+        public.write_bytes(ca)
+        util.write_bytes_atomic(private, pem)
+        cli = [wrapper, "/usr/bin/env", *(f"{key}={root / folder}" for key, folder in dirs.items()),
+               f"SSL_CERT_FILE={public}", f"ARETE_SERVER={url}", "uv", "run", "arete"]
+        start = shlex.join([*cli, "dashboard", "--port", str(original.port), "--verification-https"])
+        reach = url + original.path.rstrip("/")
+        yield DashboardSession(start, shlex.join(cli), reach, trust)
+    finally:
+        private.unlink(missing_ok=True)
+        if lifetime["stopped"]:
+            shutil.rmtree(root)
+
+
+def dashboard_pairing(dash: DashboardSession, cwd: Path, env: dict, attempt: scratch.Attempt | None,
+                      browser_port: int | None) -> str:
+    command = dash.cli + " pair"
+    command = scratch.service_command(attempt, command, browser_port) if attempt else command
+    with scratch.producing(attempt):
+        proc = scratch.spawn(command, shell=isinstance(command, str), cwd=cwd, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, env=env, actor_confined=bool(attempt),
+                             text=True, **util.own_group_args())
+    try:
+        output, _ = proc.communicate(timeout=15)
+    except subprocess.TimeoutExpired:
+        util.stop_group(proc)
+        raise ServerError("The scratch dashboard pairing command timed out.") from None
+    origin = urlsplit(dash.url).netloc
+    match = re.fullmatch(r"Pairing code ([0-9]{6})\n(https://" + re.escape(origin) + r"/pair#\1)\n", output)
+    if proc.returncode or not match:
+        raise ServerError(f"The scratch dashboard pairing command did not return a link (exit {proc.returncode}).")
+    return match[2]
+
+
 @contextmanager
 def serving(v: config.Verify, cwd: Path, log: Path, cfg: config.Config | None = None,
             repo: config.Repo | None = None, lifetime: dict | None = None,
             attempt: scratch.Attempt | None = None):
-    if lifetime is not None:
-        lifetime["stopped"] = True
+    life = {} if lifetime is None else lifetime
+    life["stopped"] = True
     if not v.start:
         yield ""
         return
-    url = v.url.rstrip("/")
+    with dashboard_session(v, life) as dash:
+        with listener(v, cwd, log, cfg, repo, life, attempt, dash) as url:
+            yield url
+
+
+@contextmanager
+def listener(v, cwd, log, cfg, repo, lifetime, attempt, dash):
+    url = dash.url if dash else v.url.rstrip("/")
     with relayed(url) if attempt and not browser.loopback(url) else nullcontext(url) as reach:
         listen = None
         if attempt:
             app = browser.app_port(attempt, reach)
             listen = browser.listen_port(attempt, app, paths.dashboard_ports())
             browser.update_browser(attempt, listen=listen)
-        command = scratch.service_command(attempt, v.start, listen) if attempt else v.start
-        env, kept = environment.started(cfg or config.load(), repo)
-        if attempt:
+        start = dash.start if dash else v.start
+        command = scratch.service_command(attempt, start, listen) if attempt else start
+        env, kept = (environment.build(()), {}) if dash else environment.started(cfg or config.load(), repo)
+        if attempt and not dash:
             env = {k: v for k, v in env.items() if not paths.CREDENTIAL_NAME.search(k) or kept.get(k) == v}
             env.update(scratch.attempt_env(attempt))
         log.write_text("")
@@ -319,29 +413,37 @@ def serving(v: config.Verify, cwd: Path, log: Path, cfg: config.Config | None = 
                                  actor_confined=bool(attempt), **util.own_group_args())
         pump = threading.Thread(target=write_hidden, args=(proc, log, set(kept.values())), daemon=True)
         pump.start()
-        if lifetime is not None:
-            lifetime["stopped"] = False
+        lifetime["stopped"] = False
         try:
-            wait_until_ready(proc, url + "/" + v.ready.lstrip("/"), v.ready_seconds, log)
+            ready = url + "/" + v.ready.lstrip("/")
+            if dash:
+                wait_until_ready(proc, ready, v.ready_seconds, log, tls=dash.trust)
+                lifetime.update(dashboard_cli=dash.cli,
+                                dashboard_pairing=partial(dashboard_pairing, dash, cwd, env, attempt, listen))
+            else:
+                wait_until_ready(proc, ready, v.ready_seconds, log)
             yield reach
         finally:
             util.stop_group(proc)
             pump.join(util.GROUP_STOP_SECONDS)
-            if lifetime is not None:
-                try:
-                    os.killpg(proc.pid, 0)
-                except ProcessLookupError:
-                    lifetime["stopped"] = True
-                except PermissionError:
-                    pass
+            try:
+                os.killpg(proc.pid, 0)
+            except ProcessLookupError:
+                lifetime["stopped"] = True
+            except PermissionError:
+                pass
 
 
-def fault_note(v: config.Verify) -> str:
+def dashboard_wrapper(v: config.Verify) -> str:
     try:
         wrapper, *command = shlex.split(v.start)
     except ValueError:
         return ""
     if command[:4] != ["uv", "run", "arete", "dashboard"]:
+        return ""
+    options = command[4:]
+    if options and not (len(options) == 2 and options[0] == "--port"
+                        or len(options) == 1 and options[0].startswith("--port=")):
         return ""
     if wrapper == "sandbox":
         for pattern in v.allow_bash:
@@ -349,9 +451,13 @@ def fault_note(v: config.Verify) -> str:
             if trusted_wrapper(executable) and executable != "sandbox":
                 wrapper = executable
                 break
-    if not trusted_wrapper(wrapper):
+    return wrapper if trusted_wrapper(wrapper) else ""
+
+
+def fault_note(v: config.Verify, lifetime: dict | None = None) -> str:
+    if not (wrapper := dashboard_wrapper(v)):
         return ""
-    cli = shlex.quote(wrapper) + " uv run arete verify-fault"
+    cli = (lifetime or {}).get("dashboard_cli", shlex.quote(wrapper) + " uv run arete") + " verify-fault"
     return ("\n\n## Scratch fault controls\n\n"
             "Run these commands from the same worktree as the configured dashboard. Use the CLI to cause the fault, "
             "then observe the result with the browser tools. Do not use page scripts or write directly to the store.\n\n"
@@ -418,17 +524,24 @@ def env_rule_value(name: str, pattern: str, url: str) -> str:
     return pattern.replace("*", EXAMPLE_SERVER_PORT if server else "example")
 
 
-def wait_until_ready(proc: subprocess.Popen, url: str, seconds: int, log: Path) -> None:
+def wait_until_ready(proc: subprocess.Popen, url: str, seconds: int, log: Path, *, tls: ssl.SSLContext | None = None) -> None:
+    open_url = urllib.request.urlopen
+    if tls is not None:
+        open_url = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                               urllib.request.HTTPSHandler(context=tls)).open
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             raise ServerError(f"the start command exited {proc.returncode} before {url} answered{output(log)}")
         try:
-            with urllib.request.urlopen(url, timeout=5):
+            with open_url(url, timeout=5):
                 return
         except urllib.error.HTTPError as e:
             if e.code < 500:
                 return
+        except urllib.error.URLError as e:
+            if tls is not None and isinstance(e.reason, ssl.SSLCertVerificationError):
+                raise sandbox.ConfinementUnavailable(f"Scratch dashboard TLS verification failed ({e.reason.verify_message}).") from None
         except OSError:
             pass
         time.sleep(1)

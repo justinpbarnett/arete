@@ -4,6 +4,8 @@ import base64
 import hmac
 import json
 import os
+import re
+import shlex
 import shutil
 import sqlite3
 import ssl
@@ -30,7 +32,7 @@ from unittest import mock
 from arete import (
     accounts, api, api_check, api_http, backup, chat, cli, client, codebase, config, contract, control, credential_files,
     dashboard, event_stream, events, gh, heartbeat, idempotency, jira, paths, pipeline, principals, record, run_lines,
-    sandbox, screening, serve, tailnet, tasks, tool_events, tracker, triage, util, verify_faults, webpush, workspace,
+    sandbox, screening, serve, tailnet, tasks, tool_events, tracker, triage, util, verify, verify_faults, webpush, workspace,
 )
 from arete.store import approvals as approvals_store
 from arete.store import chats as chats_store
@@ -939,7 +941,7 @@ class ConfigKindRegistryTests(unittest.TestCase):
     def server():
         with redirect_stdout(StringIO()):
             db.migrate()
-            principals.seed_owner(api_check.LOGIN)
+            token = fixture_bearer(principals.seed_owner(api_check.LOGIN)).split()[1]
         node = SimpleNamespace(names={api_check.ADDRESS})
         logins = tailnet.Logins(tailnet.ScratchHost())
         logins.of = lambda _: api_check.LOGIN
@@ -949,7 +951,7 @@ class ConfigKindRegistryTests(unittest.TestCase):
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": .02})
             thread.start()
             try:
-                yield api_check.Check(server.server_port, Path.cwd(), [], token="")
+                yield api_check.Check(server.server_port, Path.cwd(), [], token)
             finally:
                 server.shutdown()
                 thread.join()
@@ -1904,8 +1906,7 @@ class CliThroughServeCommandTests(_CliThroughServeCase):
             send.assert_called_once()
             self.assertEqual(approvals_store.approval(number)["status"], "done")
         self.assertEqual(refused, [True])
-        self.assertIn(("GET", client.META, 503, None), seen)
-        self.assertIn(("GET", "/api/meta", 200, None), seen)
+        self.assertIn(("GET", client.META, 200, None), seen)
         writes = [(code, key) for method, _, code, key in seen if method == "POST"]
         self.assertEqual([code for code, _ in writes], [503, 200])
         self.assertIsNotNone(writes[0][1])
@@ -2656,7 +2657,7 @@ class VerifyFaultTests(unittest.TestCase):
         node = SimpleNamespace(names={address})
         logins = tailnet.Logins(mock.Mock())
         logins.of = lambda _: self.login
-        server = SimpleNamespace(node=node, logins=logins, tls=None, authorization=None)
+        server = SimpleNamespace(node=node, logins=logins, tls=None, authorization=fixture_bearer(self.actor))
         return handlers.open, server
 
     @contextmanager
@@ -2681,10 +2682,7 @@ class VerifyFaultTests(unittest.TestCase):
         if body is not None:
             body = json.dumps(body)
             headers["Content-Type"] = "application/json"
-        if method == "POST":
-            if endpoint[1].authorization is None:
-                endpoint[1].authorization = fixture_bearer(self.actor)
-            headers["Authorization"] = endpoint[1].authorization
+        headers["Authorization"] = endpoint[1].authorization
         with self.client(endpoint) as client:
             client.request(method, path, body, headers)
             with client.getresponse() as result:
@@ -2700,7 +2698,7 @@ class VerifyFaultTests(unittest.TestCase):
 
     @contextmanager
     def stream(self, endpoint, cursor=None):
-        headers = {"Accept": "text/event-stream"}
+        headers = {"Accept": "text/event-stream", "Authorization": endpoint[1].authorization}
         if cursor is not None:
             headers["Last-Event-ID"] = cursor
         with self.client(endpoint) as client:
@@ -3441,14 +3439,15 @@ class VersionedApiTests(unittest.TestCase):
 
     def wire_request(self, method, path, headers, payload=b""):
         request = [f"{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n"]
-        if method != "GET":
-            if self.authorization is None:
-                self.authorization = fixture_bearer(self.actor)
-            request.append(f"Authorization: {self.authorization}\r\n")
+        if self.authorization is None:
+            self.authorization = fixture_bearer(self.actor)
+        request.append(f"Authorization: {self.authorization}\r\n")
         request.extend(f"{name}: {value}\r\n" for name, value in headers.items())
         incoming = BytesIO(("".join(request) + "\r\n").encode() + payload)
         outgoing = bytearray()
-        connection = SimpleNamespace(makefile=lambda *args: incoming, sendall=outgoing.extend, settimeout=lambda _: None)
+        connection = SimpleNamespace(makefile=lambda *args: incoming, sendall=outgoing.extend,
+                                     send=lambda block: outgoing.extend(block) or len(block),
+                                     gettimeout=lambda: None, settimeout=lambda _: None, setblocking=lambda _: None)
         logins = tailnet.Logins(mock.Mock())
         logins.of = lambda _: "fixture@example.test"
         server = SimpleNamespace(node=SimpleNamespace(names={"127.0.0.1"}), logins=logins, tls=None)
@@ -3461,9 +3460,9 @@ class VersionedApiTests(unittest.TestCase):
         def request(path, *, body=None, headers=None, status=200):
             connection = HTTPConnection("127.0.0.1", port, timeout=5)
             try:
-                request_headers = {"Accept": "application/json"}
+                request_headers = {"Accept": "application/json", "Authorization": self.authorization}
                 if body is not None:
-                    request_headers.update({"Content-Type": "application/json", "Authorization": self.authorization})
+                    request_headers["Content-Type"] = "application/json"
                 connection.request("GET" if body is None else "POST", path,
                                    body=None if body is None else json.dumps(body),
                                    headers={**request_headers, **(headers or {})})
@@ -3541,7 +3540,7 @@ class VersionedApiTests(unittest.TestCase):
     def test_board_view(self):
         self.enterContext(mock.patch.object(paths, "DB_FILE", paths.DB_FILE.with_name("board.db")))
         db.migrate()
-        principals.seed_owner("fixture@example.test")
+        self.actor = principals.seed_owner("fixture@example.test")
 
         def request(path, *, headers=None, status=200):
             actual, response, raw = self.wire_request("GET", path, {"Accept": "application/json", **(headers or {})})
@@ -3653,9 +3652,10 @@ class VersionedApiTests(unittest.TestCase):
 
             dashboard.POSTS_IN_FLIGHT.close()
             try:
-                for response in (exchange("GET", meta_route), post(batch_route, b"{}")):
-                    problem(response, 503, "draining")
-                    self.assertEqual(response[1]["Retry-After"], "2")
+                self.assertEqual(exchange("GET", meta_route)[0], 200)
+                response = post(batch_route, b"{}")
+                problem(response, 503, "draining")
+                self.assertEqual(response[1]["Retry-After"], "2")
             finally:
                 dashboard.POSTS_IN_FLIGHT.reopen()
             self.assertEqual(exchange("GET", meta_route)[0], 200)
@@ -3818,15 +3818,15 @@ class PrincipalTests(unittest.TestCase):
                                   logins=logins, tls=None), operation=None, alias=None,
                                   client_address=("127.0.0.1", 1), headers=headers("fixture.test"))
         with principals.acting("hand"):
-            dashboard.Handler.admit(handler, "GET", "/api/tasks")
+            dashboard.Handler.admit(handler, "GET", "/pair")
             self.assertEqual(principals.current(), owner)
-            for host, login, status in (("foreign.test", "fixture@example.test", 421),
-                                        ("fixture.test", "stranger@example.test", 403),
-                                        ("fixture.test", "fixture@example.test", 401)):
+            for path, host, login, status in (("/api/tasks", "foreign.test", "fixture@example.test", 421),
+                                              ("/pair", "fixture.test", "stranger@example.test", 403),
+                                              ("/api/tasks", "fixture.test", "fixture@example.test", 401)):
                 handler.headers = headers(host)
                 handler.server.logins.of.return_value = login
                 with self.subTest(status=status), self.assertRaises(dashboard.Refusal) as got:
-                    dashboard.Handler.admit(handler, "POST", "/api/tasks")
+                    dashboard.Handler.admit(handler, "GET", path)
                 self.assertEqual(got.exception.status, status)
         with self.assertRaises(sqlite3.IntegrityError), db.tx() as c:
             c.execute("INSERT INTO principals (id, kind, role, status, name, created) "
@@ -3852,7 +3852,9 @@ class _CredentialCase(unittest.TestCase):
 
     @staticmethod
     def run_case(case):
-        with mock.patch("urllib.request.urlopen", side_effect=AssertionError("Unexpected network request")):
+        with (mock.patch("urllib.request.urlopen", side_effect=api_check.forbidden),
+              mock.patch.object(accounts, "read", side_effect=api_check.forbidden),
+              mock.patch.object(gh, "gh", side_effect=api_check.forbidden)):
             name, fixture_method = case.split(".")
             fixture = globals()[name]()
             fixture.prepare()
@@ -4149,7 +4151,7 @@ class CredentialWriteTests(_CredentialCase):
             for bearer, count, status in ((self.owner_text, 49, 200), (other, 2, 429)):
                 body = {"requests": [{"operation": "meta.get"}] * count}
                 self.request(server, "POST", "/api/v1/batch", bearer=bearer, body=body, status=status)
-            self.request(server, "GET", self.TASKS, status=429, code="rate_limited")
+            self.request(server, "GET", self.TASKS, bearer=self.owner_text, status=429, code="rate_limited")
         self.assertEqual(len(self.task_actors()), 1)
 
     @credential_test
@@ -4205,10 +4207,11 @@ class CredentialPairingTests(_CredentialCase):
             for headers in ({"Origin": "https://elsewhere.example"}, {"Sec-Fetch-Site": "cross-site"}):
                 self.task(server, cookie=cookie, headers=headers, status=403, code="bad_origin")
             pairing = self.logins.credentials.pairings[self.owner]
-            for bearer in (None, self.owner_text):
-                answer, _ = self.request(server, "POST", self.PAIRINGS, bearer=bearer, status=403, code="forbidden")
-                self.assertEqual(answer["reason"], "presence_required")
-                self.assertIs(self.logins.credentials.pairings[self.owner], pairing)
+            self.request(server, "POST", self.PAIRINGS, status=401, code="unauthenticated")
+            answer, _ = self.request(server, "POST", self.PAIRINGS, bearer=self.owner_text, status=403,
+                                     code="forbidden")
+            self.assertEqual(answer["reason"], "presence_required")
+            self.assertIs(self.logins.credentials.pairings[self.owner], pairing)
             self.request(server, "POST", self.PAIRINGS, cookie=cookie, status=201)
             self.assertRegex(self.owner, r"^u:[0-9a-f]{8}$")
             self.assertEqual(self.task_actors(), [self.owner])
@@ -4325,16 +4328,110 @@ class CredentialClaimTests(_CredentialCase):
 
 
 class CredentialAdmissionTests(_CredentialCase):
+    BOOTSTRAP = {("GET", "/api/v1/meta"), ("POST", _CredentialCase.PAIRINGS + "/claim"),
+                 ("POST", _CredentialCase.TOKENS)}
+
+    @contextmanager
+    def in_memory_server(self, *, secure=True):
+        address = "127.0.0.1"
+        server = SimpleNamespace(node=SimpleNamespace(names={address}), logins=self.logins,
+                                 tls=self.tls if secure else None, inside_serve=False)
+
+        def connect(_):
+            sent, received = BytesIO(), BytesIO()
+            connection = HTTPConnection(address)
+            connection.sock = mock.Mock(sendall=sent.write, makefile=lambda *_: received)
+            getresponse = connection.getresponse
+
+            def respond():
+                sent.seek(0)
+                wire = mock.Mock(makefile=lambda *_: sent, sendall=received.write)
+                dashboard.Handler(wire, (address, 0), server)
+                received.seek(0)
+                return getresponse()
+
+            connection.getresponse = respond
+            return connection
+
+        with mock.patch.object(self, "connect", side_effect=connect):
+            yield server
+
     @credential_test
-    def test_whois_read_only_tls_and_issue_replay(self, _):
+    def test_api_requires_credentials(self, _):
+        with api_check.offline():
+            self.check_api_credentials()
+            with self.in_memory_server(secure=False) as server:
+                self.request(server, "POST", self.TOKENS + "/1/rotate", status=401, code="unauthenticated")
+                for path in (self.TOKENS, self.PAIRINGS + "/claim"):
+                    self.request(server, "POST", path, status=426, code="tls_required")
+
+    def check_api_credentials(self):
+        with self.in_memory_server() as server:
+            for op in contract.OPERATIONS:
+                method, path = op["method"], op["path"]
+                if (method, path) not in self.BOOTSTRAP:
+                    self.request(server, method, re.sub(r"\{\w+\}", "1", path), status=401, code="unauthenticated")
+                    self.assertIn("unauthenticated", op["errors"], op["name"])
+            for alias in contract.ALIASES:
+                method, path = alias["method"], alias["path"].replace("*", "1")
+                for action in ("", *alias.get("actions", {})):
+                    target = path + ("/" + re.sub(r"\{\w+\}", "1", action) if action else "")
+                    self.request(server, method, target + "?timeout=0", status=401, code="unauthenticated")
+            for method, path in (("GET", "/api/v1/events?timeout=0"), ("GET", "/api/v1/principals"),
+                                 ("GET", "/api/v1/principals/me"), ("POST", "/api/v1/meta"),
+                                 ("GET", self.PAIRINGS + "/claim"), ("POST", self.TOKENS + "/"),
+                                 ("PUT", self.TASKS), ("GET", "/api/v1/no-such-route")):
+                self.request(server, method, path, status=401, code="unauthenticated")
+
+            meta, headers = self.request(server, "GET", "/api/v1/meta")
+            self.assertEqual(meta["instance"]["id"], headers["Arete-Instance"])
+            pending, headers = self.request(server, "POST", self.TOKENS,
+                                            body={"label": "Fixture client", "scopes": ["read"]}, status=202)
+            self.assertEqual(pending, {"code": "awaiting_presence"})
+            self.assertIsNone(headers["Set-Cookie"])
+            cookie = self.claim(server, self.code(server))
+            self.request(server, "GET", self.TASKS, cookie=cookie)
+            self.logins.of.assert_called_with("127.0.0.1")
+
+    def test_openapi_requires_credentials(self):
+        self.assertEqual({(op["method"], op["path"]) for op in contract.OPERATIONS if not op.get("credential_required")},
+                         self.BOOTSTRAP)
+        document = json.loads((api_check.SOURCE / "docs/openapi.json").read_bytes())
+        self.assertTrue(document["security"])
+        self.assertEqual({(method.upper(), path) for path, methods in document["paths"].items()
+                          for method, op in methods.items()
+                          if not (security := op.get("security", document["security"])) or {} in security},
+                         self.BOOTSTRAP)
+        for op in contract.OPERATIONS:
+            entry = document["paths"][op["path"]][op["method"].lower()]
+            self.assertEqual(entry["x-arete-errors"], op["errors"], op["name"])
+            if op["credential_required"]:
+                self.assertIn("unauthenticated", entry["x-arete-errors"], op["name"])
+                self.assertIn("401", entry["responses"], op["name"])
+        security = {
+            ("post", self.PAIRINGS + "/claim"): [],
+            ("post", self.TOKENS): [{"session": []}, {}],
+            ("post", self.TOKENS + "/{token}/rotate"): [{"session": []}],
+            ("post", "/api/v1/auth/logout"): [{"session": []}],
+        }
+        for (method, path), mechanisms in security.items():
+            entry = document["paths"][path][method]
+            self.assertEqual(entry["security"], mechanisms)
+            self.assertIn("401", entry["responses"])
+        self.assertIn("202", document["paths"][self.TOKENS]["post"]["responses"])
+        self.assertNotIn("x-arete-anonymous-until-step", json.dumps(document))
+
+    @credential_test
+    def test_whois_requires_credentials_tls_and_issue_replay(self, _):
         only_header = {"X-Arete": "1"}
         with self.listen() as server, self.cli_environment(server):
-            self.request(server, "GET", self.TASKS, headers=only_header)
+            self.request(server, "GET", self.TASKS, headers=only_header, status=401, code="unauthenticated")
             for path in (self.TASKS, "/api/tasks"):
                 self.task(server, path=path, headers=only_header, status=401, code="unauthenticated")
-            for bearer in (None, self.owner_text):
-                result, _ = self.request(server, "POST", self.TOKENS, bearer=bearer, status=403, code="forbidden")
-                self.assertEqual(result["reason"], "presence_required")
+            result, _ = self.request(server, "POST", self.TOKENS, status=202, code="awaiting_presence")
+            self.assertNotIn("text", result)
+            result, _ = self.request(server, "POST", self.TOKENS, bearer=self.owner_text, status=403, code="forbidden")
+            self.assertEqual(result["reason"], "presence_required")
             printed, link = self.cli(["pair"]).splitlines()
             pairing = link.rsplit("#", 1)[1]
             self.assertEqual(printed, f"Pairing code {pairing}")
@@ -4348,7 +4445,7 @@ class CredentialAdmissionTests(_CredentialCase):
             self.assertEqual(self.task_actors(), [])
             text = issued["text"]
             self.logins.of.return_value = "tag:worker"
-            self.request(server, "GET", self.TASKS, status=403)
+            self.request(server, "GET", self.TASKS, status=401, code="unauthenticated")
             self.request(server, "GET", self.TASKS, bearer=text)
             with mock.patch.object(dashboard.webhooks, "receive", return_value={"queued": True}):
                 self.request(server, "POST", "/hook/fixture", headers={"X-Arete-Instance": "unrelated"}, status=202)
@@ -4361,8 +4458,108 @@ class CredentialAdmissionTests(_CredentialCase):
         with self.listen(secure=False) as server:
             for path in (self.TOKENS, self.PAIRINGS + "/claim"):
                 self.request(server, "POST", path, status=426, code="tls_required")
-            self.request(server, "GET", self.TASKS)
+            self.request(server, "GET", self.TASKS, status=401, code="unauthenticated")
+            self.request(server, "GET", self.TASKS, bearer=self.owner_text)
             self.task(server, bearer=self.owner_text)
+
+
+class ScratchDashboardPairingTests(_CredentialCase):
+    def prepare_store(self):
+        pass
+
+    def connect(self, server):
+        return util.NamedTlsConnection("127.0.0.1", server.server_port, "127.0.0.1", 3)
+
+    @credential_test
+    def test_configured_launcher_pairs_a_fresh_browser_and_recovers_from_one_fault(self, _):
+        root = Path.cwd()
+        cert = root / "tls.crt"
+        bundle = root / "bundle"
+        util.write_bytes_atomic(bundle, cert.read_bytes() + (root / "tls-private").read_bytes())
+        configured = config.Verify(start="sandbox uv run arete dashboard --port 4242", url="http://100.64.0.1:4242")
+        settings = {"ARETE_VERIFY_DASHBOARD_CA": str(cert), "ARETE_VERIFY_DASHBOARD_TLS": str(bundle)}
+        link = "https://127.0.0.1:4242/pair#123456"
+        state_root, prefix = None, []
+
+        def spawn(command, **kwargs):
+            nonlocal state_root, prefix
+            start = shlex.split(command)
+            if start[-1] == "pair":
+                self.assertEqual(start[:-1], prefix)
+                return mock.Mock(returncode=0, communicate=lambda **_: (f"Pairing code 123456\n{link}\n", None))
+            self.assertEqual(start[:2], ["sandbox", "/usr/bin/env"])
+            boundary = start.index("uv")
+            prefix, args = start[:boundary + 3], start[boundary + 3:]
+            env = {**kwargs["env"], **dict(arg.split("=", 1) for arg in start[2:boundary])}
+            state_root = Path(env["ARETE_STATE_DIR"]).parent
+            entry = ("from tests.test_behavior import ScratchDashboardPairingTests as Fixture; "
+                     "Fixture().check_dashboard(sys.argv[1:])")
+            done = subprocess.run(api_check.child_command(api_check.SOURCE, entry, *args), cwd=state_root,
+                                  env=env, capture_output=True, text=True, timeout=CHILD_HANG_TIMEOUT)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertFalse((state_root / "state" / tailnet.VERIFICATION_TLS).exists())
+            return mock.Mock(stdout=BytesIO())
+
+        lifetime = {}
+        with (mock.patch.dict(os.environ, settings), mock.patch.object(verify.scratch, "spawn", side_effect=spawn),
+              mock.patch.object(verify, "wait_until_ready") as ready, mock.patch.object(util, "stop_group"),
+              mock.patch.object(verify.os, "killpg", side_effect=ProcessLookupError)):
+            with verify.serving(configured, root, root / "scratch.log", lifetime=lifetime) as url:
+                self.assertEqual(url, "https://127.0.0.1:4242")
+                self.assertTrue(ready.call_args.kwargs["tls"].check_hostname)
+                self.assertEqual(lifetime["dashboard_pairing"](), link)
+                self.assertIn(shlex.join(prefix) + " verify-fault arm", verify.fault_note(configured, lifetime))
+        self.assertTrue(lifetime["stopped"])
+        self.assertFalse(state_root.exists())
+
+    def check_dashboard(self, args):
+        with (api_check.offline(), mock.patch.object(codebase, "load"),
+              mock.patch.object(tailnet, "serve", side_effect=self.exercise_dashboard) as launched):
+            cli.main(args)
+            launched.assert_called_once()
+
+    def exercise_dashboard(self, handlers, cfg, port, inside_serve, host, *, tls):
+        self.assertIsInstance(host, tailnet.VerificationHost)
+        self.assertIsNotNone(tls)
+        self.assertEqual((host.node().addresses, port), (("127.0.0.1",), 4242))
+        tailnet.seed_owner(host, cfg)
+        token_store.init_owner()
+        server = SimpleNamespace(node=host.node(), logins=tailnet.Logins(host), server_port=port, tls=tls,
+                                 inside_serve=inside_serve, RequestHandlerClass=handlers.open, redirect=handlers.redirect)
+        self.keys = iter(range(1000))
+
+        def connect(address, *_args, **_kwargs):
+            self.assertEqual(address, ("127.0.0.1", port))
+            browser, app = socketpair()
+
+            def finish():
+                with app:
+                    tailnet.Server.finish_request(server, app, ("127.0.0.1", port))
+
+            threading.Thread(target=finish, daemon=True).start()
+            browser.settimeout(3)
+            return browser
+
+        with mock.patch("socket.create_connection", side_effect=connect):
+            self.request(server, "GET", self.TASKS, status=401, code="unauthenticated")
+            printed, link = self.cli(["pair"]).splitlines()
+            code = link.rsplit("#", 1)[1]
+            self.assertEqual((printed, link), (f"Pairing code {code}", f"https://127.0.0.1:{port}/pair#{code}"))
+            with closing(self.connect(server)) as browser:
+                browser.request("GET", "/pair")
+                page = browser.getresponse()
+                self.assertEqual(page.status, 200)
+                self.assertIn(b'id="claim-form"', page.read())
+            cookie = self.claim(server, code)
+            before, _ = self.request(server, "GET", self.TASKS, cookie=cookie)
+            self.assertIsInstance(before["tasks"], list)
+            self.cli(["verify-fault", "arm", "--route", self.TASKS, "--status", "503", "--body", '{"fault":"once"}'])
+            self.request(server, "GET", self.TASKS, status=401, code="unauthenticated")
+            fault, _ = self.request(server, "GET", self.TASKS, cookie=cookie, status=503)
+            self.assertEqual(fault, {"fault": "once"})
+            recovered, _ = self.request(server, "GET", self.TASKS, cookie=cookie)
+            self.assertEqual(recovered, before)
+        return 0
 
 
 class CredentialRotationTests(_CredentialCase):
@@ -4552,7 +4749,7 @@ class CredentialAuthTests(_CredentialCase):
                 self.assertIsNone(headers["Set-Cookie"])
             self.request(server, "POST", self.PAIRINGS, status=409, code="conflict", **start)
             for _ in range(3):
-                self.request(server, "POST", self.TOKENS, status=403)
+                self.request(server, "POST", self.TOKENS, status=202, code="awaiting_presence")
             self.request(server, "POST", self.TOKENS, status=429, code="rate_limited")
             self.logins.credentials = type(self.logins.credentials)()
             for _ in range(10):

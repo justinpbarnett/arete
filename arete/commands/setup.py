@@ -262,7 +262,7 @@ def cmd_prompts(args) -> int:
 def cmd_dashboard(args) -> int:
     from .. import dashboard
 
-    return dashboard.serve(args.port)
+    return dashboard.serve(args.port, verification_https=args.verification_https)
 
 
 def register(sub) -> None:
@@ -298,4 +298,5 @@ def register(sub) -> None:
 
     p = sub.add_parser("dashboard", help="serve the dashboard to its owner on the tailnet")
     p.add_argument("--port", type=int, default=None, help="the port to listen on; the config's [dashboard] port by default")
+    p.add_argument("--verification-https", action="store_true", help="serve a prepared verification dashboard on HTTPS loopback")
     p.set_defaults(fn=cmd_dashboard)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import secrets
 import select
@@ -320,7 +321,7 @@ class Handler(BaseHTTPRequestHandler):
         except contract.Problem as error:
             self.send_error(error.status, str(error), problem_code=error.code)
             return False
-        if self.command not in ("GET", "POST", "PATCH", "DELETE") and canonical_methods(self.api_path):
+        if self.command not in ("GET", "POST", "PATCH", "DELETE") and self.api_path:
             self.answer(self.command)
             return False
         return True
@@ -400,6 +401,8 @@ class Handler(BaseHTTPRequestHandler):
             if canonical_path(path) and not self.operation and method not in (allowed := canonical_methods(path)) and allowed:
                 self.allowed_methods = allowed
                 raise contract.Problem("method_not_allowed", "The route does not accept this method.")
+            if method not in ("GET", "POST", "PATCH", "DELETE"):
+                raise credential_http.problem("not_implemented")
             if path.startswith(webhooks.HOOK_PATH):
                 if self.restarting:
                     raise contract.Problem("draining", RESTARTING)
@@ -407,6 +410,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(202 if got["queued"] else 200, got)
             if method in ("POST", "PATCH", "DELETE"):
                 self.check_write_instance()
+            if self.operation and self.operation[0]["name"] == "token.issue" and self.credential is None:
+                return self.send_json(202, {"code": contract.AWAITING_PRESENCE})
             self.validate_transport(method, path)
             query = {k: v[-1] for k, v in parse_qs(parts.query).items()}
             if self.verify_controls is not None and (fault := self.verify_controls.poll(path, parts.query)):
@@ -475,11 +480,19 @@ class Handler(BaseHTTPRequestHandler):
         issue, self.stream_marker = tokens.stream_status(self.credential, marker)
         return issue
 
+    def check_stream_credential(self, *, pristine=True, epoch_reset=False):
+        issue = self.stream_problem()
+        if issue is None or (epoch_reset and issue == tokens.STREAM_EPOCH_CHANGED):
+            return
+        if pristine and issue == tokens.STREAM_EPOCH_CHANGED:
+            raise credential_http.StreamEpochChanged()
+        raise ConnectionAbortedError()
+
     def stream_headers(self):
         self.close_connection = True
         self.end_headers(streaming=self.credential is not None)
 
-    def stream_write(self, block):
+    def stream_write(self, block, *, epoch_reset=False):
         if self.credential is None:
             self.wfile.write(block)
             self.wfile.flush()
@@ -491,8 +504,7 @@ class Handler(BaseHTTPRequestHandler):
         sock.setblocking(False)
         try:
             while pending:
-                if self.stream_problem():
-                    raise ConnectionAbortedError()
+                self.check_stream_credential(pristine=len(pending) == len(block), epoch_reset=epoch_reset)
                 wait = .25 if deadline is None else min(.25, deadline - time.monotonic())
                 if wait <= 0:
                     raise TimeoutError()
@@ -515,7 +527,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def validate_transport(self, method, path):
         if self.api_path and (self.restarting or
-                              method == "GET" and path != "/api/meta" and POSTS_IN_FLIGHT.draining()):
+                              method == "GET" and path not in ("/api/v1/meta", "/api/meta") and POSTS_IN_FLIGHT.draining()):
             raise contract.Problem("draining", RESTARTING)
         client = self.headers.get("X-Arete-Client", "")
         if found := re.fullmatch(r"(cli|mcp|web)/0+\.[0-9]+(?:\..*)?", client):
@@ -650,7 +662,8 @@ class Handler(BaseHTTPRequestHandler):
             if method != "POST":
                 raise Refusal(405, "A webhook takes POST.")
             return
-        credential_http.authenticate(self, method, browser_asset=path in WEB_BY_PATH)
+        credential_http.authenticate(self, method, api_route=path == "/api" or path.startswith("/api/"),
+                                     browser_asset=path in WEB_BY_PATH)
 
     def api(self, method: str, path: str, query: dict):
         if self.operation:
@@ -1350,7 +1363,33 @@ def handlers() -> tailnet.Handlers:
     return tailnet.Handlers(ScratchHandler, Redirect)
 
 
-def serve(port: int | None = None, inside_serve: bool = False, host: tailnet.Tailscale | None = None) -> NoReturn:
+def verification_tls():
+    state = verify_faults.state_path()
+    if state is None or state != paths.STATE_DIR.absolute():
+        raise PermissionError(verify_faults.REFUSAL)
+    root = state.parent
+    if (state.name != "state" or not root.name.startswith(verify_faults.DASHBOARD_PREFIX)
+            or root.resolve() != root or root.stat().st_mode & 0o077
+            or paths.CONFIG_DIR.resolve() != root / "config" or paths.HOME.resolve() != root / "home"
+            or not paths.TOKEN_CLIENT_DIR.resolve().is_relative_to(root)
+            or paths.DB_FILE.exists() or paths.DB_FILE.is_symlink()):
+        raise PermissionError("Verification dashboard TLS requires a fresh private scratch layout.")
+    with verify_faults.scratch_state(state) as directory:
+        with verify_faults.plain_file(directory, tailnet.VERIFICATION_TLS) as bundle:
+            if os.fstat(bundle.fileno()).st_mode & 0o077:
+                raise PermissionError("Verification dashboard TLS needs a private bundle.")
+        context = tailnet.tls_context(state / tailnet.VERIFICATION_TLS)
+        os.unlink(tailnet.VERIFICATION_TLS, dir_fd=directory)
+    return context
+
+
+def serve(port: int | None = None, inside_serve: bool = False, host: tailnet.Tailscale | None = None, *,
+          verification_https=False) -> NoReturn:
+    tls = None
+    if verification_https:
+        tls = verification_tls()
+        host = tailnet.VerificationHost()
+        foundation.migrate()
     cfg = config.load_or_problem()[0]
     port = port or cfg.dashboard_port
     while True:
@@ -1371,7 +1410,7 @@ def serve(port: int | None = None, inside_serve: bool = False, host: tailnet.Tai
             if free:
                 capture.recover()
     with util.repeating(60, maintain_credentials, "credential-maintenance"):
-        tailnet.serve(handlers(), cfg, port, inside_serve, host)
+        tailnet.serve(handlers(), cfg, port, inside_serve, host, tls=tls)
 
 
 def maintain_credentials():

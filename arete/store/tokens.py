@@ -16,6 +16,7 @@ TABLES = {"tokens": "kept"}
 SESSION_DAYS = 400
 TOKEN_ID = credential_files.TAG
 SESSION_SECONDS = SESSION_DAYS * 86400
+STREAM_EPOCH_CHANGED = "restore_epoch_changed"
 TOKEN_ROW = ("SELECT t.*, p.role, p.status AS person_status, p.kind AS person_kind, client.status AS client_status "
              "FROM tokens t JOIN principals p ON p.id = t.principal "
              "LEFT JOIN principals client ON client.id = 'client:' || t.id WHERE t.id = ?")
@@ -292,7 +293,9 @@ def stream_status(credential, marker):
     try:
         with db.one_read(timeout=.1) as c:
             meta = db.metadata(c)
-            if meta["token_key_ref"] != credential.key_ref or meta["restore_epoch"] != credential.epoch:
+            if meta["restore_epoch"] != credential.epoch:
+                return STREAM_EPOCH_CHANGED, marker
+            if meta["token_key_ref"] != credential.key_ref:
                 return "unauthenticated", marker
             generation, deadline = marker
             current = meta["token_generation"]

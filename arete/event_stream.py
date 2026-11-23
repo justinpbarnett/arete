@@ -5,8 +5,9 @@ import math
 import time
 
 from . import control, events
-from .credential_http import problem
+from .credential_http import StreamEpochChanged, problem
 from .store import db as foundation
+from .store.tokens import STREAM_EPOCH_CHANGED
 
 
 def serve(handler, query, code):
@@ -47,7 +48,7 @@ def stream(handler, query, code):
     if fmt == "json":
         while True:
             if issue := handler.stream_problem():
-                raise problem(issue)
+                raise problem("unauthenticated" if issue == STREAM_EPOCH_CHANGED else issue)
             if handler.verify_controls is not None:
                 handler.verify_controls.poll()
             with foundation.one_read() as c:
@@ -70,34 +71,35 @@ def stream(handler, query, code):
     with foundation.one_read() as c:
         instance = foundation.metadata(c)["instance_id"]
         head = events.metadata(c)["head"]
-    if fmt == "sse" and seq is None:
-        epoch, seq = events.cursor(head)
+    if epoch is None:
+        epoch, head_seq = events.cursor(head)
+        if fmt == "sse" and seq is None:
+            seq = head_seq
     with handler.event_connection() as dropped, foundation.reader(streaming=True) as c:
         start("application/x-ndjson" if fmt == "ndjson" else "text/event-stream", instance, head)
 
         def message(kind, data, ident=None):
             if fmt == "ndjson":
-                handler.stream_write((json.dumps(data) + "\n").encode())
+                frame = json.dumps(data) + "\n"
             else:
                 frame = (f"id: {ident}\n" if ident is not None else "")
                 if kind in ("reset", "serve.beat") or query.get("named"):
                     frame += f"event: {kind}\n"
-                handler.stream_write((frame + "data: " + json.dumps(data) + "\n\n").encode())
+                frame += "data: " + json.dumps(data) + "\n\n"
+            handler.stream_write(frame.encode(), epoch_reset=kind == "reset" and data["reason"] == "epoch")
 
         beat = started + 15
         try:
             if fmt == "sse":
                 handler.stream_write(b"retry: 2000\n\n")
             while dropped is None or not dropped():
-                if handler.stream_problem():
-                    return
+                handler.check_stream_credential()
                 epoch, top, rows, reason, meta = events.scan(c, epoch, seq, selected)
                 if reason:
                     message("reset", {"kind": "reset", "reason": reason})
                     return
                 for row in rows:
-                    if handler.stream_problem():
-                        return
+                    handler.check_stream_credential()
                     position = f"{epoch}.{row['seq']}"
                     message(row["kind"], events.envelope(c, row, epoch), position)
                     if time.monotonic() >= beat:
@@ -110,5 +112,7 @@ def stream(handler, query, code):
                                            "head": meta["head"]}, f"{epoch}.{seq}")
                     beat = time.monotonic() + 15
                 time.sleep(0.25)
+        except StreamEpochChanged:
+            message("reset", {"kind": "reset", "reason": "epoch"})
         except (OSError, TimeoutError):
             return

@@ -750,7 +750,7 @@ The phases are `expand` (compatible additions), `backfill` (data conversion) and
 
 A column, status, run.jsonl event or step_end data-key rename needs an earlier expand whose reader accepts both names. Writers use the new name only after the contract row applies; every later removal goes through this gate. Timestamp columns are listed in `store.db.TIME_COLUMNS` and use `store.db.TIME_GLOB`, the UTC shape emitted by `util.iso()`. Migration 2 normalizes legacy offsets and adds triggers rejecting malformed nonempty values. When adding a time column to an existing table, update the mapping and replace that table's triggers in the new migration; new tables declare a CHECK. Tracker equality stamps such as triage.updated and research.updated keep their original format.
 
-`schema_meta` stores the instance id, short tag, name and creation time, plus schema version and oldest compatible writer. The initial name is the operating-system user. `GET /api/meta` returns these instance and schema blocks through the existing authenticated dashboard. Identity is also persisted in `backups/instance.json`, so restoring a snapshot from before the ledger keeps the same name and id.
+`schema_meta` stores the instance id, short tag, name and creation time, plus schema version and oldest compatible writer. The initial name is the operating-system user. `GET /api/v1/meta` returns these instance and schema blocks to admitted tailnet peers without requiring an API credential. Identity is also persisted in `backups/instance.json`, so restoring a snapshot from before the ledger keeps the same name and id.
 
 `arete serve` takes a snapshot of `arete.db` before every prune (the first tick after each restart, then hourly) with `VACUUM INTO`, flushes it, checks it with `PRAGMA quick_check` and keeps it in `backups/` beside the database as `arete-<UTC stamp>-<reason>.db`, with the outcome in `backups/last.json`.
 When a snapshot cannot be taken or fails its check, serve says why and prunes nothing.
@@ -2343,8 +2343,8 @@ When `alert_repo` is set and private, the board is also one issue there, "[arete
 Open `/ui.html` for the new dashboard's Floor, Runs, Triage inbox, Outbox, local task Board, and live Health.
 The classic dashboard stays at `/` and still handles the full intake, console, sessions, configuration, incidents, and usage views.
 It listens only on the machine's tailnet addresses.
-Unpaired browsers can read when their tailnet login maps through `principal_logins` to an active person. A valid bearer token also admits a client on a tagged host.
-Changes require a bearer token with the relevant scope or a paired browser session. The dashboard sends `X-Arete: 1` with its session writes.
+A tailnet login mapped through `principal_logins` to an active person admits the connection. Dashboard reads and writes require a paired browser session over HTTPS. API clients can use a bearer token with the relevant scope, including from a tagged host. The dashboard sends `X-Arete: 1` with its session writes.
+Credential-free requests to the versioned API and legacy aliases get `401 unauthenticated`. Admitted peers can still call `GET /api/v1/meta` for discovery and `POST /api/v1/auth/pairings/claim` over HTTPS to pair. A credential-free `POST /api/v1/tokens` over HTTPS returns `202 awaiting_presence` without issuing a token. Webhooks use their per-hook secret.
 `[dashboard] owner` seeds the first person once; if empty, the seed uses the node's own login.
 The person gets a random `u:` id and the Tailscale display name (or the login's local part).
 Editing `owner` after seeding changes neither admission nor the person's login binding.
@@ -2367,11 +2367,10 @@ A reset has no id and closes the connection: `epoch` follows a restore, `too_old
 and `too_far` means more than 10,000 matching rows wait. Fetch a fresh snapshot before reconnecting after reset.
 `schema` is reserved. Unstored `serve.beat` messages arrive every 15 seconds with the scan cursor as their SSE id.
 Derived events are retained for 90 days, notices for seven, and durable events indefinitely.
-`GET /api/meta` includes `stream.complete`, class trim ids and the head; completeness remains false while older writers may run.
+`GET /api/v1/meta` includes `stream.complete`, class trim ids and the head. Completeness remains false while older writers may run.
 
-By default it answers plain HTTP on the machine's tailnet addresses, calls no `tailscale cert` and makes no `tailscale serve` mapping.
-HTTPS is off until the owner turns it on with `https = true` under `[dashboard]` in the config; the key takes `true` or `false` and defaults to `false`.
-With it on, the dashboard answers over HTTPS on the machine's tailnet name (`https://NAME:PORT`) with a tailnet certificate from `tailscale cert`.
+If you are upgrading a plain HTTP dashboard, set `https = true` under `[dashboard]`, wait for the HTTPS listener, and pair each browser using the steps below. Both dashboard interfaces need pairing to load data.
+The listener's `https` setting defaults to `false`. Set it to `true` to serve the dashboard on the machine's tailnet name (`https://NAME:PORT`) with a tailnet certificate from `tailscale cert`.
 The certificate and key are `dashboard.crt` and `dashboard.key` in the state folder, mode 0600; arete fetches them at start and every week, and keeps the old ones when a renewal fails.
 The first fetch makes Tailscale issue a public certificate, which lists the machine and tailnet name in public certificate transparency logs, and that cannot be undone.
 With HTTPS on, ordinary HTTP requests to the same port redirect with 308. Use the HTTPS address for webhooks and credential routes.
@@ -2381,11 +2380,11 @@ On Linux it needs root or the Tailscale operator: run `sudo tailscale set --oper
 When no certificate comes, the dashboard serves plain HTTP on the tailnet addresses with the reason and tries again every hour.
 arete never makes, changes or removes a `tailscale serve` mapping. A mapping on the dashboard port takes that port's tailnet traffic and is named in the start line.
 A second dashboard on the same state folder and port waits and changes nothing.
-With HTTPS on, scratch state asks for no certificate.
+For browser verification with `sandbox uv run arete dashboard`, set `ARETE_VERIFY_DASHBOARD_CA` in the verifier service environment to its dedicated CA certificate and `ARETE_VERIFY_DASHBOARD_TLS` to a mode-0600 certificate-chain and private-key bundle issued for `127.0.0.1`. Configure the verifier browser to trust that CA. The launcher creates fresh scratch state, serves HTTPS on loopback, and gives the verifier a one-time link from `arete pair`. The fault commands in the verification prompt use the same scratch state.
 
 ### Pair a browser and log in a CLI
 
-1. Set `https = true` under `[dashboard]`. Once serve has a TLS listener, run `arete pair` on the serve host for the first pairing. Open the link in a browser signed in to the same tailnet login and submit the six-digit code. The code expires after five minutes.
+1. Set `https = true` under `[dashboard]`. Once serve has a TLS listener, run `arete pair` on the serve host for the first pairing. Open the HTTPS link in a browser signed in to the same tailnet login and submit the six-digit code. The code expires after five minutes. Then open either dashboard in that browser.
 2. In a paired dashboard, open **Pair a device and manage tokens**. Use **Pair a device** for another browser or **Issue a token** for another CLI or script. Choose the scopes it needs, such as `read` and `task:write`. Copy the token when it is displayed. This page also rotates or revokes tokens and signs out the browser.
 3. On the CLI host, point `ARETE_SERVER` or `[server] url` at the dashboard's HTTPS address. Pipe the issued token into `arete login --token-stdin`. The CLI validates the token and stores it in a mode 0600 `<tag>.token` file under `$XDG_STATE_HOME/arete/client/` (default `~/.local/state/arete/client/`). Run `arete logout` to revoke that token and remove its local copy.
 

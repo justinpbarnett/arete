@@ -28,6 +28,15 @@ BOOTSTRAP_DATA_SHA = "573982524c52d71684edd5fb1d079c8ddc2b54dee2bc6fff33dd604305
 BOOTSTRAP_OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 RESERVED_PATHS = {"/api/v1/events", "/api/v1/principals", "/api/v1/principals/{id}"}
 RESERVED_FIELDS = {"seq", "event_seq", "subject", "ver"}
+SESSION_SECURITY = {"session": []}
+SECURITY = [{"bearer": []}, SESSION_SECURITY]
+OPERATION_SECURITY = {
+    "pairing.claim": ([], "Supply a pairing code over HTTPS to establish a browser session."),
+    "token.issue": ([SESSION_SECURITY, {}], "A paired browser session over HTTPS can issue a token. "
+                    "A request over HTTPS without a credential receives 202."),
+    "token.rotate": ([SESSION_SECURITY], "Rotate a token from a paired browser session over HTTPS."),
+    "session.end": ([SESSION_SECURITY], "End the current paired browser session."),
+}
 
 
 def wire_json(value):
@@ -125,6 +134,15 @@ def openapi(registry, minor, source_hashes, oldest_client):
                     "examples": {code: {"value": errors[code]["example"]} for code in codes}}}}
             responses[str(status)] = {"$ref": f"#/components/responses/{key}"}
         entry = {"operationId": name, "responses": responses, "x-arete-errors": op["errors"]}
+        if name in OPERATION_SECURITY:
+            entry["security"], entry["description"] = OPERATION_SECURITY[name]
+        elif not op["credential_required"]:
+            entry["security"] = [*SECURITY, {}]
+        if name == "token.issue":
+            responses["202"] = {"description": "Awaiting presence in a paired browser. No token was issued.",
+                                "content": {"application/json": {
+                                    "schema": contract.obj({"code": {"const": contract.AWAITING_PRESENCE}}),
+                                    "example": {"code": contract.AWAITING_PRESENCE}}}}
         if "deprecated" in op:
             entry["deprecated"] = op["deprecated"]
         if "sunset" in op:
@@ -140,7 +158,8 @@ def openapi(registry, minor, source_hashes, oldest_client):
         if method == "GET":
             responses["304"] = {"description": "The representation matches If-None-Match"}
         else:
-            entry["parameters"].append({"name": "X-Arete", "in": "header", "required": False,
+            entry["parameters"].append({"name": "X-Arete", "in": "header",
+                                        "required": entry.get("security") == [SESSION_SECURITY],
                                         "description": "Required for writes using a browser session.",
                                         "schema": {"type": "string", "const": "1"}})
             if contract.keyed_write(op):
@@ -158,8 +177,12 @@ def openapi(registry, minor, source_hashes, oldest_client):
     meta["200"]["headers"] = {**identity, "Arete-Session": {"schema": {"const": "paired"}}}
     forbidden = meta["403"]["$ref"].rsplit("/", 1)[-1]
     meta["403"] = {**problems[forbidden], "headers": identity}
+    security_schemes = {"bearer": {"type": "http", "scheme": "bearer"},
+                        "session": {"type": "apiKey", "in": "cookie", "name": "__Host-arete_session"}}
     return {"openapi": "3.1.0", "info": {"title": "Arete API", "version": f"1.{minor}"}, "paths": paths,
-            "components": {"schemas": schemas, "responses": problems}, "x-arete-contract-sources-sha256": source_hashes,
+            "security": SECURITY, "components": {"schemas": schemas, "responses": problems,
+                                                 "securitySchemes": security_schemes},
+            "x-arete-contract-sources-sha256": source_hashes,
             "x-arete-oldest-client": oldest_client, "x-arete-aliases": {route(alias): alias for alias in registry["aliases"]},
             "x-arete-errors": errors}
 
@@ -177,6 +200,9 @@ def from_document(document):
                                 "errors": entry["x-arete-errors"],
                                 **{k: entry[v] for k, v in (("deprecated", "deprecated"), ("sunset", "x-arete-sunset"))
                                    if v in entry}}
+            if "security" in entry or "security" in document:
+                security = entry.get("security", document.get("security"))
+                operations[name]["credential_required"] = bool(security) and {} not in security
     version = document["info"]["version"]
     if not re.fullmatch(r"1\.\d+", version):
         raise ValueError(f"invalid v1 version {version!r}")
