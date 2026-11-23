@@ -11,7 +11,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import jira, paths, secretstore
+from . import paths, secretstore
 from .store import credentials, db, principals
 
 PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
@@ -203,16 +203,18 @@ def record(auth: Auth, *, secret_id: int | None = None) -> dict | None:
     provider = re.sub(r"[^a-z0-9_-]+", "-", auth.provider.lower()).strip("-_") or "provider"
     label = f"{provider[:48]}:{auth.mode}"
     secretstore.validate_account_id(label)
+    if paths.DB_FILE.parent != paths.STATE_DIR or paths.FINGERPRINT_KEY_FILE.parent != paths.STATE_DIR:
+        raise secretstore.StoreError("account registry files must belong to the current state directory")
     with db.tx() as c:
-        holder = principals.owner()
-        if not holder.startswith("u:"):
+        holder = principals.ensure_local_owner(c)
+        if holder is None:
             return None
         key = secretstore.fingerprint_key()
         identity = secretstore.digest(key, "account", auth.provider, auth.mode, auth.family,
                                       auth.identity or (secret_id if secret_id is not None else who))
         digest = secretstore.digest(key, "credential", auth.provider, auth.mode, auth.credential or who)
-        usage = "workspace" if (auth.provider, auth.mode) in (("github", "app"), ("jira", "api_key")) else "personal"
-        return credentials.save_account(c, label, auth.provider, auth.mode, holder, usage, identity, digest, secret_id)
+        return credentials.save_account(c, label, auth.provider, auth.mode, holder, "personal", identity, digest,
+                                        secret_id)
 
 
 def record_resolved(auth: Auth) -> None:
@@ -220,10 +222,3 @@ def record_resolved(auth: Auth) -> None:
         record(auth)
     except (OSError, secretstore.StoreMissing) as error:
         LOG.warning("Could not record a resolved account (%s)", type(error).__name__)
-
-
-def jira_client(env_file: Path | None) -> jira.Client:
-    base, email, token = jira.credentials(env_file)
-    client = jira.Client(base, email, token)
-    record_resolved(Auth("api_key", identity=fingerprint(base, email), credential=token, provider="jira"))
-    return client

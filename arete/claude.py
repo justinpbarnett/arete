@@ -10,7 +10,7 @@ from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
 
-from . import accounts, background, child, config, device_turns, devices, environment, paths, ssh, util
+from . import accounts, background, child, config, device_turns, devices, environment, paths, sandbox, ssh, util
 from .agent import (
     NO_SESSION,
     Result,
@@ -230,7 +230,10 @@ def _run(
                                     on_mark=lambda kind, n: on_line(json.dumps({"arete": kind, "offset": n}) + "\n"),
                                     leaf=leaf or f"agent-{os.getpid()}-{uuid.uuid4().hex}", settle_answer=True)
         else:
+            cmd = sandbox.linux_store_confinement(cmd, cwd)
             proc = child.stream(cmd, str(cwd), prompt, env, timeout, on_line)
+    except sandbox.ConfinementUnavailable as e:
+        return Result(ok=False, session=resume, error=str(e))
     except device_turns.Lost as e:
         session = Session(fresh_session, 0.0, "claude") if e.started and fresh_session else resume
         result = parse(subprocess.CompletedProcess(cmd, 1, e.output, ""), session, model, json_schema)

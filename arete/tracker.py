@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
-from . import accounts, config, gh, jira, principals, util
+from . import config, gh, jira, principals, util
 from .store import runs as run_store
 from .store import tasks as tasks_store
 
@@ -359,7 +359,7 @@ class JiraTracker:
     def client(self) -> jira.Client:
         key = str(self.cfg.env_file or "")
         if key not in _clients:
-            _clients[key] = accounts.jira_client(self.cfg.env_file)
+            _clients[key] = jira.Client.from_env(self.cfg.env_file)
         return _clients[key]
 
     @property

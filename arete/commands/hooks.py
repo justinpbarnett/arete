@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
 from unicodedata import normalize
@@ -156,6 +157,12 @@ def path_spellings(path: Path) -> set[tuple[str, ...]]:
             for spelling in (path.absolute(), path.resolve())}
 
 
+def search_path(text: str) -> Path:
+    prefix = re.split(r"[*?\[]", text, maxsplit=1)[0]
+    path = paths.expand(prefix)
+    return path.parent if prefix != text and not prefix.endswith("/") else path
+
+
 @dataclass(frozen=True)
 class HookFloor:
     base_denies: Callable[[Path], bool]
@@ -180,10 +187,16 @@ def cmd_guard(args) -> int:
         command = str((payload.get("tool_input") or {}).get("command") or "") if tool == "Bash" else ""
         if command and (reason := codex.keychain_refusal(command)):
             return codex.write_guard_decision(reason)
-        floor = guard.floor(os.environ.get("ARETE_RUN_ID", ""), payload.get("cwd") or os.getcwd(), args.open)
-        protected = (*sandbox.secret_store_roots(), *(paths.expand(path) for path in args.closed))
-        roots = {spelling for root in protected for spelling in path_spellings(root)}
+        cwd = Path(payload.get("cwd") or os.getcwd())
+        floor = guard.floor(os.environ.get("ARETE_RUN_ID", ""), cwd, args.open)
+        floor = replace(floor, closed=(*floor.closed, *(paths.expand(path) for path in args.closed)))
+        roots = {spelling for root in sandbox.secret_store_roots() for spelling in path_spellings(root)}
         boundary = HookFloor(floor.denies, roots, tool in ("Grep", "Glob"))
+        if roots and tool == "Glob":
+            values = payload.get("tool_input") or {}
+            target = cwd / paths.expand(values.get("path") or ".") / search_path(values.get("pattern") or "")
+            if boundary.denies(target):
+                return codex.write_guard_decision(guard.reach(str(target)))
         return codex.write_guard_decision(guard.decide(payload, args.judge, boundary))
     except Exception:
         return codex.write_guard_decision("Arete could not verify the agent's file or command permissions.")

@@ -364,7 +364,13 @@ class Handler(BaseHTTPRequestHandler):
         self.write("PATCH")
 
     def do_PUT(self) -> None:
-        self.write("PUT")
+        allowed = canonical_methods(request_path(self.path))
+        if "PUT" in allowed:
+            self.write("PUT")
+        elif allowed:
+            self.answer("PUT")
+        else:
+            self.send_error(501)
 
     def do_DELETE(self) -> None:
         self.write("DELETE")

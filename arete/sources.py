@@ -8,7 +8,7 @@ import re
 import shlex
 from datetime import UTC, datetime, timedelta
 
-from . import accounts, config, cron, gh, paths, util
+from . import config, cron, gh, jira, paths, util
 from .loops import Loop, as_list, blank, github_remote
 from .store import db as foundation
 from .store import loops as loop_store
@@ -290,7 +290,7 @@ class Jira(Source):
     scope = ("jql", "on_update")
 
     def fetch(self, loop: Loop, source: dict, cfg: config.Config, sid: str, cursor) -> tuple[list[dict], object]:
-        client = accounts.jira_client(cfg.jira.env_file)
+        client = jira.Client.from_env(cfg.jira.env_file)
         fields = ["summary", "status", "reporter", "updated", "description", "labels"]
         out = []
         for issue in client.search(source["jql"], fields, limit=int(source.get("limit", 50))):

@@ -15,11 +15,11 @@ def piped_events() -> list[dict]:
 
 
 def cmd_jira_check(args) -> int:
-    from .. import accounts, jira, poll, tracker
+    from .. import jira, poll, tracker
 
     cfg = config.load()
     try:
-        client = accounts.jira_client(cfg.jira.env_file)
+        client = jira.Client.from_env(cfg.jira.env_file)
         me = client.me()
         print(f"jira {client.base} as {me.get('displayName') or me.get('emailAddress') or '?'}")
         routes = poll.jira_routes_by_project(cfg)

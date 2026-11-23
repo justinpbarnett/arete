@@ -420,10 +420,10 @@ def retire_pending(item, raw, expected):
 
 def save_set(c, scope, name, previous, ref, change):
     actor, at = change["actor"], change["at"]
+    rotated = change.get("rotated", bool(previous and previous["status"] == "set"))
     row = credentials.save_secret(c, scope, name, change["kind"], ref.store, str(ref), change["fingerprint"],
-                                  actor, at, change["provider"])
-    event = "rotated" if previous and previous["status"] == "set" else "set"
-    credentials.secret_event(c, row, event, actor, at)
+                                  actor, at, change["provider"], rotated=rotated)
+    credentials.secret_event(c, row, "rotated" if rotated else "set", actor, at)
     credentials.secret_changed(c, row, actor)
     return row
 
@@ -460,11 +460,10 @@ def put(scope: str, name: str, value: str, kind: str, actor: str, *, provider=No
         _, pending, removal = pending_write(item)
         if unresolved_removal(c, row, removal):
             raise StoreError("secret removal is pending; retry the removal before setting a new value")
-        previous = None
-        if pending and (stored := read_item(ref, settings)) is not None:
-            previous = matching_set(pending, ref, item_digest(key, stored))
+        stored = read_item(ref, settings)
+        previous = matching_set(pending, ref, item_digest(key, stored)) if pending and stored is not None else None
         change = dict(reference=str(ref), kind=kind, actor=actor, at=util.iso(), fingerprint=digest(key, value),
-                      provider=provider)
+                      provider=provider, rotated=stored is not None)
         recoverable = [change, previous] if previous and previous["fingerprint"] != change["fingerprint"] else [change]
         raw = json.dumps({"id": secrets.token_hex(16), "sets": recoverable}).encode()
         write_file(*pending_path(item), raw, private=True)

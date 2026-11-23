@@ -31,17 +31,17 @@ def removal_recorded(c, secret_id, receipt):
                      (secret_id, receipt)).fetchone() is not None
 
 
-def save_secret(c, scope, name, kind, store, reference, fingerprint, actor, at, provider):
+def save_secret(c, scope, name, kind, store, reference, fingerprint, actor, at, provider, *, rotated=False):
     return dict(c.execute("""
-        INSERT INTO secrets (scope, name, kind, store, reference, fingerprint, status, set_by, set_at, provider)
-        VALUES (?, ?, ?, ?, ?, ?, 'set', ?, ?, ?)
+        INSERT INTO secrets (scope, name, kind, store, reference, fingerprint, status, set_by, set_at, provider, rotated_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'set', ?, ?, ?, ?)
         ON CONFLICT (name, scope) DO UPDATE SET
             kind = excluded.kind, fingerprint = excluded.fingerprint, status = 'set', missing_since = NULL,
             set_by = excluded.set_by, set_at = excluded.set_at, version = secrets.version + 1,
             provider = COALESCE(excluded.provider, secrets.provider),
-            rotated_at = CASE WHEN secrets.status = 'set' THEN excluded.set_at ELSE secrets.rotated_at END
+            rotated_at = COALESCE(excluded.rotated_at, secrets.rotated_at)
         RETURNING *
-        """, (scope, name, kind, store, reference, fingerprint, actor, at, provider)).fetchone())
+        """, (scope, name, kind, store, reference, fingerprint, actor, at, provider, at if rotated else None)).fetchone())
 
 
 def mark_checked(c, row, ok, at, *, recovered=False):

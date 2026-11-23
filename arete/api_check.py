@@ -173,7 +173,7 @@ def offline():
             (paths.WORKTREES_DIR, "worktrees"), (paths.HOME, "home"), (Path(os.environ["TMPDIR"]), "tmp"))),
             "expected an isolated scratch root")
         for primitive in (patch("urllib.request.urlopen", forbidden), patch.object(accounts, "read", forbidden),
-                          patch.object(gh, "gh", forbidden), patch.object(jira, "credentials", forbidden),
+                          patch.object(gh, "gh", forbidden), patch.object(jira.Client, "from_env", forbidden),
                           patch.object(tailnet, "tailscale_run", forbidden),
                           patch.object(util, "github_token", return_value="")):
             guards.enter_context(primitive)
@@ -276,7 +276,8 @@ class Check:
         require(not problems, ", ".join(problems))
         for op in self.published["operations"]:
             route = re.sub(r"\{\w+\}", "route-check", op["path"])
-            headers, _ = self.request("OPTIONS", route, status=405)
+            method = "OPTIONS" if contract.match("PUT", route) else "PUT"
+            headers, _ = self.request(method, route, status=405)
             require(op["method"] in headers.get("Allow", "").split(", "),
                     f"{op['name']} {route}: registered method missing from Allow")
 

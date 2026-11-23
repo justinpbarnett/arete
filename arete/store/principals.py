@@ -87,17 +87,51 @@ def changed(c, principal):
                 data={k: row[k] for k in ("id", "kind", "role", "status")})
 
 
+def create_owner(c, name):
+    principal = f"u:{secrets.token_hex(4)}"
+    c.execute("INSERT INTO principals (id, kind, role, name, status, created) VALUES (?, 'human', 'owner', ?, 'active', ?)",
+              (principal, name, util.iso()))
+    return principal
+
+
+def ensure_local_owner(c):
+    principal = owner()
+    if principal != "hand":
+        return principal
+    if c.execute("SELECT 1 FROM principals WHERE kind = 'human' LIMIT 1").fetchone():
+        return None
+    principal = create_owner(c, "Local owner")
+    with acting("hand"):
+        changed(c, principal)
+    return principal
+
+
+def has_login(c, principal):
+    return c.execute("SELECT 1 FROM principal_logins WHERE principal = ?", (principal,)).fetchone() is not None
+
+
+def needs_owner_login():
+    with foundation.reader() as c:
+        principal = owner()
+        return not active_human() if principal == "hand" else not has_login(c, principal)
+
+
 def seed_owner(login, name=""):
     with foundation.tx() as c:
-        if row := c.execute("SELECT id FROM principals WHERE kind = 'human' AND status = 'active' LIMIT 1").fetchone():
-            return row[0]
+        principal = owner()
+        if principal == "hand" and (person := active_human()):
+            return person
+        if principal != "hand" and has_login(c, principal):
+            return principal
         if not login:
             raise ValueError("the first person needs a tailnet login")
-        principal, at = f"u:{secrets.token_hex(4)}", util.iso()
-        c.execute("INSERT INTO principals (id, kind, role, name, status, created) VALUES (?, 'human', 'owner', ?, 'active', ?)",
-                  (principal, name or login.split('@')[0], at))
+        name = name or login.split("@")[0]
+        if principal == "hand":
+            principal = create_owner(c, name)
+        else:
+            c.execute("UPDATE principals SET name = ?, version = version + 1 WHERE id = ?", (name, principal))
         c.execute("INSERT INTO principal_logins (id, principal, method, subject, created) VALUES (?, ?, 'tailnet', ?, ?)",
-                  (secrets.token_hex(8), principal, login, at))
+                  (secrets.token_hex(8), principal, login, util.iso()))
         with acting("hand"):
             changed(c, principal)
         return principal

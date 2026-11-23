@@ -239,7 +239,7 @@ def authenticate(handler, method, path, *, browser_asset=False, mcp=False, scrat
     handler.actor = credential.actor if credential else handler.person
     principals.admit(handler.actor)
 
-    write = method in WRITES and name != "batch.run"
+    write = method in WRITES and name != "batch.run" and (method != "PUT" or op is not None)
     if mcp or write and (credential or claim):
         check_origin(handler)
         if cookies and handler.headers.get_all("X-Arete", []) != ["1"]:

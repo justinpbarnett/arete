@@ -59,6 +59,17 @@ GIT_READ_FORMS = {"stash": ("list", "show"), "worktree": ("list",), "remote": ("
 SHELL_BREAKS = ";|&\n()`{}"
 SHELL_TOOLS = frozenset({"Bash", "shell", "shell_command", "exec_command"})
 KEYCHAIN_COMMAND = re.compile(r"(?<![\w.-])security(?![\w.-])", re.IGNORECASE)
+LEADING_REDIRECT = re.compile(r"[0-9]*[<>]{1,3}(.*)", re.DOTALL)
+SCRIPT_TOOLS = {"awk", "gawk", "node", "osascript", "perl", "php", "python", "python3", "ruby", "sed"}
+COMMAND_OPTIONS = {
+    "env": {"-u", "--unset", "-C", "--chdir"},
+    "nice": {"-n", "--adjustment"},
+    "sudo": {"-u", "-g", "-C", "-D", "-h", "-p", "-R", "-r", "-t", "--user", "--group", "--chdir"},
+    "timeout": {"-k", "-s", "--kill-after", "--signal"},
+    "time": {"-f", "-o", "--format", "--output"},
+    "xargs": {"-a", "-d", "-E", "-I", "-L", "-n", "-P", "-s", "--arg-file", "--delimiter", "--replace",
+             "--eof", "--max-lines", "--max-args", "--max-procs", "--max-chars"},
+}
 PATCH_PATHS = re.compile(r"^\*\*\* (?:(?:Add|Update|Delete) File|Move to): (.+)$", re.MULTILINE)
 USAGE_LIMIT_TEXT = re.compile(r"usage limit|hit your [^.\n]{0,40}limit", re.IGNORECASE)
 TRY_AT = re.compile(r"try again at ([^\n]+?)\.?\s*$", re.IGNORECASE | re.MULTILINE)
@@ -791,12 +802,14 @@ def git_write(command: str | list[str], rules: list[str], depth: int = 0) -> str
     return shell_refusal(command, lambda words: denied_git(words, rules), depth)
 
 
-def shell_refusal(command: str | list[str], deny, depth: int = 0) -> str:
+def shell_refusal(command: str | list[str], deny, depth: int = 0, *, unwrap=None) -> str:
     if depth > 12:
         return "nested shell command"
     if isinstance(command, list):
         command = shlex.join(command)
     lexer = shlex.shlex(command, posix=True, punctuation_chars=SHELL_BREAKS)
+    if unwrap:
+        lexer.commenters = ""
     lexer.whitespace = " \t\r"
     lexer.whitespace_split = True
     segments: list[list[str]] = [[]]
@@ -809,32 +822,98 @@ def shell_refusal(command: str | list[str], deny, depth: int = 0) -> str:
     except ValueError:
         return "unparsed shell command"
     for words in segments:
-        while words and (LEADING_WORD.fullmatch(words[0]) or Path(words[0]).name in WRAPPER_WORDS):
-            words = words[1:]
+        if unwrap:
+            try:
+                words = unwrap(words)
+            except ValueError:
+                return "unparsed shell command"
+        else:
+            while words and (LEADING_WORD.fullmatch(words[0]) or Path(words[0]).name in WRAPPER_WORDS):
+                words = words[1:]
         if not words:
             continue
         if Path(words[0]).name in SHELL_WORDS:
-            for i, option in enumerate(words[1:], 1):
+            i = 1
+            while i < len(words):
+                option = words[i]
+                if unwrap and option in ("-o", "+o", "-O", "+O", "--rcfile", "--init-file"):
+                    i += 2
+                    continue
                 if option == "--" or not option.startswith("-"):
                     break
                 if option.startswith("--command="):
-                    if found := shell_refusal(option.partition("=")[2], deny, depth + 1):
+                    if found := shell_refusal(option.partition("=")[2], deny, depth + 1, unwrap=unwrap):
                         return found
                     break
                 if option == "--command" or (not option.startswith("--") and "c" in option[1:]):
-                    if i + 1 < len(words) and (found := shell_refusal(words[i + 1], deny, depth + 1)):
+                    if i + 1 < len(words) and (found := shell_refusal(words[i + 1], deny, depth + 1, unwrap=unwrap)):
                         return found
                     break
+                i += 1
+        if unwrap and words[0] == "eval":
+            if found := shell_refusal(" ".join(words[1:]), deny, depth + 1, unwrap=unwrap):
+                return found
         if denied := deny(words):
             return denied
     return ""
 
 
+def command_words(words: list[str]) -> list[str]:
+    while words:
+        head, *words = words
+        tool = Path(head).name
+        if redirect := LEADING_REDIRECT.fullmatch(head):
+            if not redirect[1]:
+                words = words[1:]
+            continue
+        if re.fullmatch(r"[A-Za-z_]\w*=.*", head, re.DOTALL) or head in (
+                "!", "if", "then", "elif", "else", "do", "while", "until"):
+            continue
+        if tool not in WRAPPER_WORDS and tool != "timeout":
+            return [head, *words]
+        if tool == "command" and words[:1] in (["-v"], ["-V"]):
+            return []
+        takes_value = COMMAND_OPTIONS.get(tool, ())
+        while words and words[0].startswith("-") and words[0] != "-":
+            option, *words = words
+            if option == "--":
+                break
+            if tool == "env" and option in ("-S", "--split-string") and words:
+                words = shlex.split(words[0]) + words[1:]
+                break
+            if tool == "env" and option.startswith(("-S", "--split-string=")):
+                words = shlex.split(option[2:] if option.startswith("-S") else option.partition("=")[2]) + words
+                break
+            if option in takes_value:
+                words = words[1:]
+        if tool == "timeout":
+            words = words[1:]
+    return []
+
+
+def denied_keychain(words: list[str]) -> str:
+    if not words:
+        return ""
+    tool, *args = words
+    program = Path(tool).name.casefold()
+    if program == "security":
+        while args and args[0] in ("-q", "-v"):
+            args = args[1:]
+        if args[:1] == ["verify-cert"]:
+            return ""
+        return guard.reach("security keychain items")
+    if program == "find":
+        for index, arg in enumerate(args[:-1]):
+            if arg in ("-exec", "-execdir", "-ok", "-okdir") and denied_keychain(command_words(args[index + 1:])):
+                return guard.reach("security keychain items")
+    if any(KEYCHAIN_COMMAND.search(word) and (program in SCRIPT_TOOLS or "$(" in word or "`" in word)
+           for word in words):
+        return guard.reach("security keychain items")
+    return ""
+
+
 def keychain_refusal(command: str) -> str:
-    refusal = guard.reach("security keychain items")
-    if KEYCHAIN_COMMAND.search(command):
-        return refusal
-    return shell_refusal(command, lambda words: refusal if any(KEYCHAIN_COMMAND.search(word) for word in words) else "")
+    return shell_refusal(command, denied_keychain, unwrap=command_words)
 
 
 def denied_git(words: list[str], rules: list[str]) -> str:

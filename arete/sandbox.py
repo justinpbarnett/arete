@@ -5,6 +5,7 @@ import fcntl
 import os
 import pwd
 import re
+import shutil
 import sys
 from fnmatch import fnmatch
 from pathlib import Path
@@ -135,6 +136,34 @@ def protected_command(command, cwd=None, keeps=(), *, _deploy=False, _restore_pa
     words = ["/bin/sh", "-c", command] if isinstance(command, str) else list(command)
     return write_confinement(Path(cwd or Path.cwd()), [], restrict_writes=False,
                              keeps=tuple(keeps), _deploy=_deploy, _restore_paths=_restore_paths) + words
+
+
+def linux_store_confinement(command: list[str], cwd: Path | str) -> list[str]:
+    if sys.platform != "linux":
+        return command
+    from . import config, secretstore
+
+    try:
+        settings = config.secret_settings()
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        raise ConfinementUnavailable("Claude could not determine Linux secret store confinement") from error
+    store = settings.store_dir
+    if store is None:
+        return command
+    launcher = shutil.which("bwrap", path=os.defpath)
+    if not launcher:
+        raise ConfinementUnavailable("Claude with a configured store_dir on Linux requires bubblewrap for confinement")
+    work = Path(cwd).resolve()
+    if work.is_relative_to(store):
+        raise ConfinementUnavailable("Claude cannot start inside the secret store")
+    try:
+        with secretstore.file_parent(store / "mount", store, create=True, private=True):
+            pass
+    except OSError as error:
+        raise ConfinementUnavailable("Claude could not prepare the Linux secret store mount") from error
+    return [launcher, "--unshare-user", "--disable-userns", "--unshare-pid", "--unshare-ipc", "--cap-drop", "ALL",
+            "--die-with-parent", "--new-session", "--bind", "/", "/", "--proc", "/proc", "--dev", "/dev",
+            "--tmpfs", str(store), "--remount-ro", str(store), "--chdir", str(work), "--", *command]
 
 
 def write_confinement(cwd: Path, add_dirs: list[Path], auth_path: Path | None = None,
