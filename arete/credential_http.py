@@ -13,17 +13,17 @@ from datetime import UTC, timedelta
 from decimal import Decimal
 from urllib.parse import unquote, urlsplit
 
-from . import api_http, contract, idempotency, principals, util
+from . import api_http, config, contract, idempotency, principals, util
 from .store import db, events, tokens
 from .store import idempotency as claims
 
 COOKIE = "__Host-arete_session"
 PAIRING_START_ROUTE = "/api/v1/auth/pairings"
 PAIRING_CLAIM_ROUTE = "/api/v1/auth/pairings/claim"
-TLS_OPERATIONS = {"token.issue", "token.rotate", "pairing.claim"}
-PRESENCE = {"token.issue", "token.rotate"}
-WRITES = ("POST", "PATCH", "DELETE")
-SCOPE = re.compile(r"read|[a-z_]+:(?:read|write)")
+TLS_OPERATIONS = {"token.issue", "token.rotate", "pairing.claim", "secret.set"}
+PRESENCE = {"token.issue", "token.rotate", "secret.set", "secret.remove"}
+WRITES = ("POST", "PATCH", "PUT", "DELETE")
+SCOPE = re.compile(r"read|[a-z_]+:(?:read|write)|config:activate")
 AUTH_MESSAGES = {error["code"]: error["description"] for error in contract.ERRORS}
 LEGACY_SCOPES = {"skipped": "task", "checks": "check", "sessions": "session", "stage": "capture"}
 
@@ -161,6 +161,10 @@ def require_tls(op):
     return op is not None and op["name"] in TLS_OPERATIONS
 
 
+def registry_operation(name):
+    return isinstance(name, str) and (name.startswith("secret.") or name == "account.list")
+
+
 def origin_of(scheme, host):
     try:
         parsed = urlsplit(f"{scheme}://{host}")
@@ -182,23 +186,27 @@ def check_origin(handler):
             raise problem("bad_origin")
 
 
-def authenticate(handler, method, *, browser_asset=False, mcp=False):
+def authenticate(handler, method, path, *, browser_asset=False, mcp=False, scratch=False):
     op = handler.operation[0] if handler.operation else None
     name = op["name"] if op else ""
     secure = handler.origin[0] == "https"
-    if (mcp or require_tls(op)) and not secure:
+    auth = handler.headers.get_all("Authorization", [])
+    cookies = session_values(handler.headers)
+    claim = name == "pairing.claim"
+    meta = method == "GET" and path in ("/api/meta", "/api/v1/meta")
+    api_route = path == "/api" or path.startswith("/api/")
+    requires_credential = api_route and not (mcp or meta or claim or name == "token.issue"
+                                             or scratch and not registry_operation(name))
+    if (mcp or require_tls(op) and (auth or cookies or not requires_credential)) and not secure:
         raise problem("tls_required")
     peer = handler.client_address[0]
     logins = handler.server.logins
     traffic = logins.credentials
     traffic.check(peer)
-    auth = handler.headers.get_all("Authorization", [])
-    cookies = session_values(handler.headers)
     if mcp and not auth:
         raise problem("unauthenticated")
     if auth and cookies:
         raise problem("ambiguous_credential")
-    claim = name == "pairing.claim"
     if claim and auth:
         raise problem("unauthenticated")
 
@@ -237,7 +245,7 @@ def authenticate(handler, method, *, browser_asset=False, mcp=False):
         if cookies and handler.headers.get_all("X-Arete", []) != ["1"]:
             raise problem("csrf")
     if not (claim or mcp):
-        authorize(handler, op, name, write, secure, peer)
+        authorize(handler, op, name, write, secure, peer, requires_credential=requires_credential)
     if credential:
         logins.of(peer)
         try:
@@ -248,23 +256,31 @@ def authenticate(handler, method, *, browser_asset=False, mcp=False):
             handler.set_cookie = session_cookie(text, tokens.SESSION_SECONDS)
 
 
-def authorize(handler, op, name, write, secure, peer):
+def unauthenticated(handler, write, secure):
+    if write and handler.headers.get_all("X-Arete", []) == ["1"]:
+        message = ("Pair this browser using ‘arete pair’ or Pair a device in a paired browser." if secure else
+                   "Browser pairing needs HTTPS. Set https = true in [dashboard] on the serve host.")
+        return contract.Problem("unauthenticated", message)
+    return problem("unauthenticated")
+
+
+def authorize(handler, op, name, write, secure, peer, *, requires_credential):
     credential = handler.credential
+    if requires_credential and credential is None:
+        raise unauthenticated(handler, write, secure)
+    if name.startswith("secret."):
+        secret_access(unquote(handler.operation[1].get("scope", "")))
+    if name == "pairing.start" and (credential is None or credential.kind != "session"):
+        with db.reader() as c:
+            if tokens.live_session(c):
+                require_presence(credential)
     if name in PRESENCE:
         if credential is None and name == "token.issue":
             logins = handler.server.logins
             logins.credentials.issue(logins.node_key(peer))
         require_presence(credential)
-    if name == "pairing.start" and (credential is None or credential.kind != "session"):
-        with db.reader() as c:
-            if tokens.live_session(c):
-                require_presence(credential)
     if write and credential is None:
-        if handler.headers.get_all("X-Arete", []) == ["1"]:
-            message = ("Pair this browser using ‘arete pair’ or Pair a device in a paired browser." if secure else
-                       "Browser pairing needs HTTPS. Set https = true in [dashboard] on the serve host.")
-            raise contract.Problem("unauthenticated", message)
-        raise problem("unauthenticated")
+        raise unauthenticated(handler, write, secure)
     if name == "session.end" and credential.kind != "session":
         raise problem("unauthenticated")
     if name in ("session.end", "pairing.start") or (name == "token.revoke" and credential.kind == "token"
@@ -276,6 +292,13 @@ def authorize(handler, op, name, write, secure, peer):
         resource = provider.removeprefix("post_").split("_", 1)[0]
         scope = f"{LEGACY_SCOPES.get(resource, resource)}:write" if resource else "*"
     require_scope(credential, scope)
+
+
+def secret_access(scope):
+    if scope.startswith("principal:"):
+        raise problem("not_found")
+    if not config.secret_settings().store:
+        raise problem("secret_store_missing")
 
 
 def issue_grants(values):

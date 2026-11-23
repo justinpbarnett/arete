@@ -85,9 +85,19 @@ def sandboxed() -> bool:
     return lib.sandbox_check(os.getpid(), None, 0) == 1
 
 
+def secret_store_roots() -> tuple[Path, ...]:
+    from . import config
+
+    try:
+        directory = config.secret_settings().store_dir
+    except (OSError, ValueError, TypeError, KeyError):
+        return ()
+    return (directory,) if directory else ()
+
+
 def authority_roots() -> tuple[Path, ...]:
     return (AUTHORITY, paths.ZTE_AUTHORITY, AUTHORITY.parent / "zte-authority", paths.ZTE_STOP,
-            paths.CLIENT_DIR.with_name("arete") / "client", paths.DEFAULT_TOKEN_CLIENT_DIR,
+            paths.CLIENT_DIR.with_name("arete") / "client", paths.DEFAULT_TOKEN_CLIENT_DIR, *secret_store_roots(),
             *(root / "current.json" for root in (paths.ZTE_REHEARSAL_INSTALL, paths.ZTE_LIVE_INSTALL)))
 
 

@@ -555,7 +555,8 @@ def guard_env(floor: guard.Floor, auth_paths: list[Path] | None = None,
               secret_paths: tuple[Path, ...] = (), *, delegation_only: bool = False,
               shell: bool = False) -> dict[str, str]:
     sources = {PI_HOME / "agent", owner_dir(), *(path.parent for path in auth_paths or [])}
-    roots = [*floor.closed, PI_HOME, *sorted(sources), sandbox.AGENT_DIR, sandbox.LOGIN_DIR, sandbox.KEY_DIR,
+    roots = [*floor.closed, *sandbox.secret_store_roots(), PI_HOME, *sorted(sources),
+             sandbox.AGENT_DIR, sandbox.LOGIN_DIR, sandbox.KEY_DIR,
              Path("/proc"), Path("/dev")]
     auth = [PI_HOME / "agent" / "auth.json", owner_dir() / "auth.json", sandbox.AGENT_DIR / "auth.json",
             *(auth_paths or [])]

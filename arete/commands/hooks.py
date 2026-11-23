@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from collections import Counter
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import timedelta
+from pathlib import Path
+from unicodedata import normalize
 from urllib.parse import urlencode
 
 from .. import client, config, paths, util
@@ -146,12 +151,42 @@ def cmd_hook(args) -> int:
     return tool_events.main()
 
 
+def path_spellings(path: Path) -> set[tuple[str, ...]]:
+    return {tuple(normalize("NFD", part.casefold()) for part in spelling.parts)
+            for spelling in (path.absolute(), path.resolve())}
+
+
+@dataclass(frozen=True)
+class HookFloor:
+    base_denies: Callable[[Path], bool]
+    roots: set[tuple[str, ...]]
+    recursive: bool
+
+    def denies(self, path: Path) -> bool:
+        for candidate in path_spellings(path) if self.roots else ():
+            if any(candidate[:len(root)] == root or self.recursive and root[:len(candidate)] == candidate
+                   for root in self.roots):
+                return True
+        return self.base_denies(path)
+
+
 def cmd_guard(args) -> int:
-    from .. import guard, scratch
+    from .. import codex, guard, sandbox, scratch
 
     scratch.HOOK.update(root=args.scratch, id=args.scratch_id, saves=args.scratch_saves)
-    guard.LOGIN_FOLDERS = (*guard.LOGIN_FOLDERS, *(paths.expand(path) for path in getattr(args, "closed", ())))
-    return guard.main(args.judge, args.open)
+    try:
+        payload = json.load(sys.stdin)
+        tool = payload.get("tool_name")
+        command = str((payload.get("tool_input") or {}).get("command") or "") if tool == "Bash" else ""
+        if command and (reason := codex.keychain_refusal(command)):
+            return codex.write_guard_decision(reason)
+        floor = guard.floor(os.environ.get("ARETE_RUN_ID", ""), payload.get("cwd") or os.getcwd(), args.open)
+        protected = (*sandbox.secret_store_roots(), *(paths.expand(path) for path in args.closed))
+        roots = {spelling for root in protected for spelling in path_spellings(root)}
+        boundary = HookFloor(floor.denies, roots, tool in ("Grep", "Glob"))
+        return codex.write_guard_decision(guard.decide(payload, args.judge, boundary))
+    except Exception:
+        return codex.write_guard_decision("Arete could not verify the agent's file or command permissions.")
 
 
 def cmd_upload_guard(args) -> int:

@@ -9,7 +9,7 @@ from functools import cache
 
 from . import configkinds, refusals
 
-MINOR = 5
+MINOR = 6
 VERSION = f"1.{MINOR}"
 OLDEST_CLIENT = dict.fromkeys(("cli", "mcp", "web"), "1.0")
 STRING = {"type": "string"}
@@ -118,6 +118,8 @@ ERRORS = [{"code": code, "status": status, "description": description} for code,
     ("headers_too_large", 431, "A request takes at most 100 headers."),
     ("internal_error", 500, "The server could not complete the request."),
     ("not_implemented", 501, "The server does not implement this method."),
+    ("secret_store_missing", 501, "This instance has no secret store configured."),
+    ("secret_internal", 409, "This secret is managed by its owning service."),
     ("upstream_failed", 502, "The target could not complete the request."),
     ("draining", 503, "Serve is loading new code. Try again after Retry-After."),
     ("unsupported_http_version", 505, "Use HTTP/1.0 or HTTP/1.1."),
@@ -138,8 +140,8 @@ def operation(name, path, result, inputs=None, example=None, method="GET", *, er
         shown["seq"] = "0.1"
     noun = name.split(".", 1)[0]
     scope = "read" if method == "GET" or noun == "batch" else f"{'task' if noun == 'comment' else noun}:write"
-    optional_errors = {"invalid_state", "task_version_conflict"}
-    if noun not in ("token", "pairing", "principal") and name != "session.end":
+    optional_errors = {"invalid_state", "task_version_conflict", "secret_store_missing", "secret_internal"}
+    if noun not in ("token", "pairing", "principal", "secret") and name != "session.end":
         optional_errors |= AUTH_ERRORS
     return {"name": name, "method": method, "path": "/api/v1/" + path,
             "input": inputs or obj({}), "result": result, "scope": scope, "success_status": success_status,
@@ -194,7 +196,8 @@ ERROR = obj({"code": STRING, "status": INTEGER, "description": STRING, "schema":
 OPERATION = obj({"name": STRING, "method": STRING, "path": STRING, "input": mapping(JSON),
                  "result": mapping(JSON), "errors": array(STRING),
                  "example": obj({"input": mapping(JSON), "result": mapping(JSON)}),
-                 "deprecated": BOOLEAN, "sunset": STRING, "scope": STRING, "success_status": INTEGER},
+                 "deprecated": BOOLEAN, "sunset": STRING, "scope": STRING, "success_status": INTEGER,
+                 "body_media": STRING},
                 ["name", "method", "path", "input", "result", "errors", "example"])
 ALIAS = obj({"method": STRING, "path": STRING, "provider": STRING, "adapter": STRING, "input": mapping(JSON),
              "actions": mapping(mapping(JSON)), "transport": BOOLEAN, "deprecated": BOOLEAN, "sunset": STRING},
@@ -230,7 +233,31 @@ CONFIG_NAME = {**STRING, "pattern": f"^(?:{configkinds.NAME_PATTERN}|{configkind
 CONFIG_ID = {"kind": CONFIG_KIND, "name": CONFIG_NAME}
 CONFIG_ITEM = {**CONFIG_ID, "path": STRING}
 CONFIG_EXAMPLE = {"kind": "step_settings", "name": "defaults"}
+SECRET = obj({**dict.fromkeys(("subject", "name", "scope", "reference_kind"), STRING),
+              **dict.fromkeys(("service", "fingerprint", "last_checked", "rotated"), NULL_TEXT),
+              "present": BOOLEAN, "expose": BOOLEAN, "uses": array(STRING),
+              "check_ok": {"type": ["boolean", "null"]}})
+SECRET_HISTORY = obj({"id": INTEGER, "event": STRING, "actor": STRING, "ok": BOOLEAN,
+                      "fingerprint_after": NULL_TEXT, "at": STRING})
+SECRET_TARGET = obj({"scope": STRING, "name": STRING})
+SECRET_EXAMPLE = {"scope": "global", "name": "DEMO_KEY"}
+ACCOUNT = obj({**dict.fromkeys(("id", "service", "mode", "usage", "holder"), STRING), "secret_name": NULL_TEXT})
+
+
+def secret_operation(action, suffix, result, method="GET", internal=False):
+    errors = ("secret_store_missing", "secret_internal") if internal else ("secret_store_missing",)
+    return operation(f"secret.{action}", "secrets/{scope}/{name}" + suffix, envelope({"secret": SECRET, **result}),
+                     SECRET_TARGET, SECRET_EXAMPLE, method, errors=errors)
+
+
 OPERATIONS += [
+    operation("secret.list", "secrets", envelope({"secrets": array(SECRET)}), errors=("secret_store_missing",)),
+    secret_operation("get", "", {}),
+    secret_operation("history", "/history", {"history": array(SECRET_HISTORY)}),
+    {**secret_operation("set", "/value", {}, "PUT", internal=True), "body_media": "text/plain"},
+    secret_operation("remove", "", {}, "DELETE", internal=True),
+    {**secret_operation("check", "/check", {}, "POST", internal=True), "scope": "config:activate"},
+    operation("account.list", "accounts", envelope({"accounts": array(ACCOUNT)})),
     operation("config.list", "config/{kind}", envelope({"items": array(obj(CONFIG_ITEM))}),
               obj({"kind": CONFIG_KIND}), {"kind": "step_settings"}),
     operation("config.read", "config/{kind}/{name}",

@@ -58,6 +58,7 @@ GIT_READ_FORMS = {"stash": ("list", "show"), "worktree": ("list",), "remote": ("
                   "config": ("--get", "--get-all", "--list", "-l")}
 SHELL_BREAKS = ";|&\n()`{}"
 SHELL_TOOLS = frozenset({"Bash", "shell", "shell_command", "exec_command"})
+KEYCHAIN_COMMAND = re.compile(r"(?<![\w.-])security(?![\w.-])", re.IGNORECASE)
 PATCH_PATHS = re.compile(r"^\*\*\* (?:(?:Add|Update|Delete) File|Move to): (.+)$", re.MULTILINE)
 USAGE_LIMIT_TEXT = re.compile(r"usage limit|hit your [^.\n]{0,40}limit", re.IGNORECASE)
 TRY_AT = re.compile(r"try again at ([^\n]+?)\.?\s*$", re.IGNORECASE | re.MULTILINE)
@@ -787,6 +788,10 @@ def login(env: dict | None = None) -> tuple[bool, str, str]:
 
 
 def git_write(command: str | list[str], rules: list[str], depth: int = 0) -> str:
+    return shell_refusal(command, lambda words: denied_git(words, rules), depth)
+
+
+def shell_refusal(command: str | list[str], deny, depth: int = 0) -> str:
     if depth > 12:
         return "nested shell command"
     if isinstance(command, list):
@@ -813,16 +818,23 @@ def git_write(command: str | list[str], rules: list[str], depth: int = 0) -> str
                 if option == "--" or not option.startswith("-"):
                     break
                 if option.startswith("--command="):
-                    if found := git_write(option.partition("=")[2], rules, depth + 1):
+                    if found := shell_refusal(option.partition("=")[2], deny, depth + 1):
                         return found
                     break
                 if option == "--command" or (not option.startswith("--") and "c" in option[1:]):
-                    if i + 1 < len(words) and (found := git_write(words[i + 1], rules, depth + 1)):
+                    if i + 1 < len(words) and (found := shell_refusal(words[i + 1], deny, depth + 1)):
                         return found
                     break
-        if denied := denied_git(words, rules):
+        if denied := deny(words):
             return denied
     return ""
+
+
+def keychain_refusal(command: str) -> str:
+    refusal = guard.reach("security keychain items")
+    if KEYCHAIN_COMMAND.search(command):
+        return refusal
+    return shell_refusal(command, lambda words: refusal if any(KEYCHAIN_COMMAND.search(word) for word in words) else "")
 
 
 def denied_git(words: list[str], rules: list[str]) -> str:
@@ -871,6 +883,8 @@ def guard_reason(payload: dict, judge: bool, rules: list[str], opened=()) -> str
                                   for p in PATCH_PATHS.findall(text))), "")
     if tool != "Bash" or not text.strip():
         return ""
+    if reason := keychain_refusal(text):
+        return reason
     if reason := guard.decide(payload, False, floor):
         return reason
     if re.search(r"(?:auth\.json|(?:\$CODEX_HOME|\$\{CODEX_HOME\}|~[/\\]\.codex))", text):
@@ -885,6 +899,10 @@ def guard_main(judge: bool, rules: list[str], opened=()) -> int:
         reason = guard_reason(json.load(sys.stdin), judge, rules, opened)
     except Exception:
         return 0
+    return write_guard_decision(reason)
+
+
+def write_guard_decision(reason):
     if reason:
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                                  "permissionDecisionReason": reason}}))

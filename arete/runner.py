@@ -359,6 +359,8 @@ def run(prompt: str, cwd: Path | str, *, model: str = "", runner: str = "", trac
                  "skipped": skipped, "launch": launches,
                  **({"request_tokens": final_size} if trip.request.requires.declared else {})}
         launch_kw = admitted(launch_kw, on_launch(route))
+        if picked.selected is None or picked.selected.using_login or picked.selected.key_available:
+            accounts.record_resolved(picked.auth)
         started = util.iso()
         with verification_scratch.producing(launch_kw.pop("verification_attempt", None)):
             res = attempt(chosen_route.runner, picked.name, text, cwd, session, cfg, trace, record_id, target, launch_kw,
@@ -1026,6 +1028,7 @@ def local_claude(kw: dict, cfg: config.Config, run_id: str, ask_jev: bool, say: 
     kw = {**kw, "extra_env": {**(kw.get("extra_env") or {}), **run_env(run_id)}}
     if guard.wanted(kw.get("tools")):
         kw["settings"] = guard.settings(cfg.jev.guard, floor.open)
+        closed_context = (*closed_context, *sandbox.secret_store_roots())
         if closed_context:
             for group in kw["settings"]["hooks"]["PreToolUse"]:
                 for hook in group["hooks"]:

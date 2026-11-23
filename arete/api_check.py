@@ -100,7 +100,7 @@ def launch():
     drained = False
     try:
         with ExitStack() as cleanup:
-            root = Path(tempfile.mkdtemp(prefix="arete-api-check-")).resolve()
+            root = Path(tempfile.mkdtemp(prefix="arete-api-check-", dir=Path("/tmp").resolve()))
             read, write = os.pipe()
             cleanup.callback(os.close, read)
             cleanup.callback(os.close, write)
@@ -173,7 +173,7 @@ def offline():
             (paths.WORKTREES_DIR, "worktrees"), (paths.HOME, "home"), (Path(os.environ["TMPDIR"]), "tmp"))),
             "expected an isolated scratch root")
         for primitive in (patch("urllib.request.urlopen", forbidden), patch.object(accounts, "read", forbidden),
-                          patch.object(gh, "gh", forbidden), patch.object(jira.Client, "from_env", forbidden),
+                          patch.object(gh, "gh", forbidden), patch.object(jira, "credentials", forbidden),
                           patch.object(tailnet, "tailscale_run", forbidden),
                           patch.object(util, "github_token", return_value="")):
             guards.enter_context(primitive)
@@ -246,6 +246,8 @@ class Check:
     def request(self, method, path, body=None, *, status=200, headers=None):
         from . import contract
 
+        if method == "GET":
+            headers = {"Authorization": f"Bearer {self.token}", **(headers or {})}
         with self.response(method, path, body, headers) as response:
             raw = response.read()
             at = f"{method} {path}"
@@ -274,7 +276,7 @@ class Check:
         require(not problems, ", ".join(problems))
         for op in self.published["operations"]:
             route = re.sub(r"\{\w+\}", "route-check", op["path"])
-            headers, _ = self.request("PUT", route, status=405)
+            headers, _ = self.request("OPTIONS", route, status=405)
             require(op["method"] in headers.get("Allow", "").split(", "),
                     f"{op['name']} {route}: registered method missing from Allow")
 
@@ -416,7 +418,7 @@ class Check:
                 require(not response.read(1), f"{path} kept streaming after reset")
 
     def shapes(self):
-        from . import agent, contract, dashboard, paths, principals, record, replay, triage
+        from . import agent, contract, dashboard, paths, principals, record, replay, secretstore, triage
         from .sighting import Sighting
         from .store import chats, incidents, insights, runs, tokens
         from .store import triage as triage_store
@@ -431,6 +433,7 @@ class Check:
         stopped = record.start("loop", pid=0)
         session = record.start("session")
         fixture_token, _ = tokens.issue(principals.owner(), "Contract example", ["read"])
+        secretstore.put("global", "DEMO_KEY", "fixture-contract-key", "api_key", "hand")
         paths.record_dir(session).mkdir(parents=True, exist_ok=True)
         identities = {"task": self.task, "run": self.run, "step": str(runs.steps(self.run)[0]["id"]),
                       "chat": str(chat), "incident": str(incident), "triage": ticket.ref, "research": ticket.ref,
@@ -440,8 +443,7 @@ class Check:
             name, method, path = (op[key] for key in ("name", "method", "path"))
             values = op["example"]["input"].copy()
             resource = name.partition(".")[0]
-            target = {**identities, "id": identities.get(resource, ""),
-                      **(values if resource == "config" else {}),
+            target = {**values, **identities, "id": identities.get(resource, ""),
                       "run": stopped if name == "run.stop" else session if contract.keyed_write(op) else self.run}
             for field in re.findall(r"\{(\w+)\}", path):
                 path = path.replace("{" + field + "}", quote(target[field], safe=""))
@@ -457,7 +459,8 @@ class Check:
                 data = self.read(path + ("?" + urlencode(values) if values else ""))
             else:
                 key = {"Idempotency-Key": f"check-{name}"} if contract.keyed_write(op) else None
-                denied = {"token.issue": 426, "token.rotate": 426, "pairing.claim": 426, "session.end": 401}
+                denied = {"token.issue": 426, "token.rotate": 426, "pairing.claim": 426, "session.end": 401,
+                          "secret.set": 426, "secret.remove": 403}
                 if name in denied:
                     self.request(method, path, values, headers=key, status=denied[name])
                     continue
@@ -511,13 +514,25 @@ def worker(lifeline):
     stage = "scratch startup"
     try:
         with offline(), ExitStack() as cleanup:
-            from . import api_http, codebase, control, credential_files, dashboard, paths, pipeline, principals, tailnet
+            from . import (
+                api_http,
+                codebase,
+                control,
+                credential_files,
+                dashboard,
+                paths,
+                pipeline,
+                principals,
+                tailnet,
+                verify_faults,
+            )
             from .store import db, tokens
 
             root = Path.cwd()
             require(not paths.DB_FILE.exists(), "state database already exists")
+            (root / ".arete-owned").write_bytes(verify_faults.MARKER + b"\n")
             config, has_origin = prepare_replay(root)
-            body = "\n".join(config) + "\n"
+            body = "\n".join(config) + '\n[secrets]\nstore = "pve_store"\nstore_dir = "../store"\n'
             paths.CONFIG_FILE.write_text("max_parallel = 2\n" + body)
             config_fixture_git("init", "-q", "-b", "main")
             config_fixture_git("add", "--", "config.toml")
@@ -544,7 +559,7 @@ def worker(lifeline):
             logins = tailnet.Logins(tailnet.ScratchHost())
             logins.of = lambda _: LOGIN
             stage = f"listen on {ADDRESS}:0"
-            handler = type("FixtureHandler", (dashboard.Handler,), {"disable_nagle_algorithm": True})
+            handler = type("FixtureHandler", (dashboard.handlers().open,), {"disable_nagle_algorithm": True})
             with patch("socket.getfqdn", return_value=ADDRESS):
                 server = tailnet.Server(ADDRESS, 0, node, logins, False, handler, dashboard.Redirect)
             server.daemon_threads = False

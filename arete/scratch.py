@@ -967,6 +967,7 @@ def hidden_folders(with_state: bool = True) -> tuple[Path, ...]:
     home = home_dir()
     state = home / ".local/share/arete"
     return tuple(p for p in (sandbox.AUTHORITY.parent, state, home / "Library/Application Support/arete",
+                             *sandbox.secret_store_roots(),
                              *(home / n for n in (*sandbox.SECRET_DIRS, ".claude", ".codex", ".pi")))
                  if with_state or p != state)
 
