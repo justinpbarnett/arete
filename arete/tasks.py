@@ -47,6 +47,8 @@ TITLE_CHARS = 80
 START_LOCK = "task-start"
 STEER_LOCK = owner_asks.STEER_LOCK
 POLLER_LATER = "the poller starts it when a slot frees"
+SLOT_QUEUE_FAILED = "slot-queue-failed"
+NO_SLOT_AT_START = "no run slot was free when the child tried to start"
 RESUMABLE = ("interrupted", "stopped", "failed")
 MAX_ANSWER_CHARS = 20000
 TICKET_CLOSED = "its ticket closed while it waited for an answer"
@@ -169,6 +171,8 @@ def begin(cfg: config.Config, repo: config.Repo, tid: str, force: bool, poller_p
                                       runlimits.Policy.of(config.load_layer(repo.layer_dir)), force).reason:
             raise control.Refused(why)
         new, state = spawned(repo.name, tid, lambda: pipeline.spawn_run(repo.name, tid, force))
+        if state == SLOT_QUEUE_FAILED:
+            return queued(repo, tid, NO_SLOT_AT_START, poller_picks)
         if state != "exited":
             return answer(tid, repo.name, new, state, "started" if new else "child is starting")
         if why := held(cfg, repo):
@@ -188,10 +192,12 @@ def pending_state(repo_name: str, tid: str) -> tuple[str, str]:
         identity = repo_name, tid
         if identity in PENDING:
             proc, before = PENDING[identity]
-            exited = proc.poll() is not None
+            exit_code = proc.poll()
             row = next((r for r in run_store.ticket_runs(repo_name, tid) if r["id"] not in before), None)
-            if row or exited:
+            if row or exit_code is not None:
                 del PENDING[identity]
+                if not row and exit_code == pipeline.SLOT_QUEUE_FAILED_EXIT:
+                    return "", SLOT_QUEUE_FAILED
                 return (row["id"], row["status"]) if row else ("", "exited")
             return "", "starting"
         return "", "starting" if launch_lease.held(repo_name, tid) else "exited"
@@ -275,6 +281,8 @@ def launch(cfg: config.Config, repo: config.Repo, tid: str, command: list[str], 
             return pending
         free_to_start(cfg, repo, tid, ahead=ahead)
         new, state = spawned(repo.name, tid, admitted_spawn)
+        if state == SLOT_QUEUE_FAILED:
+            return queued(repo, tid, NO_SLOT_AT_START, repo.pipeline)
         if state != "exited":
             return answer(tid, repo.name, new, state, "started" if new else "child is starting")
     raise did_not_show(repo, tid)

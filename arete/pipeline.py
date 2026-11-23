@@ -114,6 +114,7 @@ MEASUREMENT_SECTION = re.compile(
 )
 RUNS_LOG = "runs.log"
 RUN_START_SECONDS = 10
+SLOT_QUEUE_FAILED_EXIT = 75
 SUCCEEDED = ("pr", "noop", "needs-info", "dry-run", "done")
 ANSWER_FILE = "answer.md"
 CHECK_LANE_POLL_SECONDS = 2
@@ -1942,6 +1943,7 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                         except sqlite3.OperationalError:
                             print(f"{refusal} Ticket could not be queued for the next poll because the database "
                                   "was busy. Start the ticket again.")
+                            return SLOT_QUEUE_FAILED_EXIT
                         else:
                             print(f"{refusal} Ticket queued for the next poll.")
                     else:
@@ -5057,6 +5059,10 @@ def run_skipped(name: str) -> dict:
                                       "to finish or raise max_parallel in Settings")
             _, state = tasks.spawned(entry["repo"], str(entry["id"]),
                                      lambda: spawn_run(entry["repo"], entry["id"], force=True))
+            if state == tasks.SLOT_QUEUE_FAILED:
+                repo = cfg.repo(entry["repo"])
+                return {"ticket": name, "id": entry["id"],
+                        **tasks.queued(repo, str(entry["id"]), tasks.NO_SLOT_AT_START, repo.pipeline)}
             if state == "exited":
                 raise control.Refused(f"{name} ended before it showed as running; the end of "
                                       f"{paths.short_path(paths.LOG_DIR / RUNS_LOG)} says why")
