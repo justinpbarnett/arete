@@ -645,15 +645,15 @@ A laptop sleeps and drops its network. When poll, triage or the heartbeat start 
 
 ## When a worktree is kept and when it is removed
 
-A ticket's workspace is the folder `WORKTREES/<repo>-<ticket>` with one git worktree per checkout. The run that makes it owns it: `workspaces/<name>.json` under the state folder holds the owner (run id, repo, ticket, created time and the checkouts) and a fingerprint of every file arete made there, including the setup outputs such as `.venv/`, written when the workspace is made and again before any removal.
+A ticket's workspace is the folder `WORKTREES/<repo>-<ticket>` with one git worktree per checkout. The workspace row in `arete.db` records the owner, checkouts and cleanup state. Arete records fingerprints of files it made, including setup outputs such as `.venv/`, and writes compatible `workspaces/<name>.json` records for rollback.
 
 - Kept after a failed, parked or stopped run, a waiting ask, a dry run, leftover verification scratch, or any file the record does not cover.
 - Removed by the run itself at a `pr`, `done`, no-change or plain needs-info ending. When the removal is blocked, `run.log` says `workspace kept at ...: removal blocked by` and lists the names.
 - Removed by the next run of the same ticket, when the worktree still matches the record.
-- Removed by each poll's sweep when the owning run is `merged`, `rejected` or `done` (or the ticket is a closed local task), no run holds the ticket, and every file still matches the record. The sweep runs `git worktree remove --force` and `git worktree prune` under the repo lock. A workspace waiting for its ticket, or blocked by a file arete did not make, stays.
-- Every poll also runs `git worktree prune` on each configured repo. The local `arete/<n>-...` branch stays.
+- Retried by `arete serve` every ten minutes after release. The sweep also removes kept or held workspaces when the latest whole run is `merged`, `rejected` or `done` (or the ticket is a closed local task). It skips tickets in use and keeps workspaces with saved edits or files that block removal.
+- The sweep runs `git worktree remove --force` and `git worktree prune` under the repo lock and prunes registrations in each configured repo. The local `arete/<n>-...` branch stays.
 
-The sweep writes the workspaces it keeps to `held-workspaces.json` in the state folder. A blocked workspace is listed with the names of the files that block it (ignored, untracked or edited tracked files that the record does not cover). The heartbeat check `workspaces:held` shows their count, size and oldest, and warns when one is blocked; the Health view lists them under Held workspaces. A folder with no owner is removed after 7 days when it holds no file.
+The sweep records cleanup results on the workspace rows. Dashboard Health lists held workspaces with their blocking files or last sweep error. The heartbeat check `workspaces:held` reports their count, size and age and warns about blocked workspaces. The sweep removes unowned folders after seven days when they contain no files or scratch roots, and records old unowned folders with files as held.
 
 ## Records
 
@@ -1005,7 +1005,7 @@ Approval, dependency, running-ticket and capacity checks still decide whether a 
 - Loops: `arete/loops/` here, `~/.config/arete/loops/` for private loops, `<repo>/.agents/loops/` for a repo's own; switches in `~/.config/arete/loop-switches.json`
 - Devices: `~/.config/arete/devices.toml`
 - Provider keys for pi: `~/.config/arete/pi.env`, mode 600
-- State: `~/.local/share/arete/`. Records: `arete.db` (with its SQLite sidecars, and each loop's last health mark in `loop_state`; `loops.json` is retired and the heartbeat deletes a leftover one), `events.jsonl`, `triage.json`, `skipped.json`, `pr_seen.json`, `held-workspaces.json`, `devices.json`, `runs/chat/context/dashboard.json`, `heartbeat.json`, `workspaces/` records, `runs/`, `experiments/`, `benchmarks/`, `captures/` and backups. Process files: `serve.json`, `server.json`. Caches: `openrouter-prices.json`, `price-snapshot.json`, `codex-cleanup.json`. Keys: `dashboard.crt`, `dashboard.key`, `webpush.key`. Serve startup removes an empty regular legacy `state.db` and the obsolete `chat.json.moved` marker. Nonempty legacy databases and symlinks are preserved.
+- State: `~/.local/share/arete/`. Records: `arete.db` (with its SQLite sidecars, workspace cleanup state, and each loop's last health mark in `loop_state`; `loops.json` is retired and the heartbeat deletes a leftover one), `events.jsonl`, `triage.json`, `skipped.json`, `pr_seen.json`, `devices.json`, `runs/chat/context/dashboard.json`, `heartbeat.json`, `workspaces/` rollback records, `runs/`, `experiments/`, `benchmarks/`, `captures/` and backups. Process files: `serve.json`, `server.json`. Caches: `openrouter-prices.json`, `price-snapshot.json`, `codex-cleanup.json`. Keys: `dashboard.crt`, `dashboard.key`, `webpush.key`. Serve startup removes an empty regular legacy `state.db` and the obsolete `chat.json.moved` marker. Nonempty legacy databases and symlinks are preserved.
 - Records: `~/.local/share/arete/runs/<run_id>/record/`, one gzip JSON lines file per agent call and the run's timeline `steps.jsonl.gz` (see Records)
 - Run lines: `~/.local/share/arete/runs/<run_id>/run.jsonl`, one JSON line per run event (see Run lines)
 - Worktrees: `~/Library/Developer/arete/worktrees/`, outside every dot folder. A `**/node_modules/**` ignore glob does not match across a dot segment, so a dev server in a worktree under `~/.local` watches all of node_modules and fails with EMFILE.

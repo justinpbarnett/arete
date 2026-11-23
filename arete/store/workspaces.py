@@ -5,6 +5,7 @@ import os
 import shutil
 import sqlite3
 import stat
+import time
 from collections.abc import Collection, Mapping
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
@@ -230,16 +231,17 @@ def keep(ws: Path, status: str) -> None:
             _change_current(row, state="kept", kept_reason=status, bytes=workspace.tree_bytes(ws))
 
 
-def legacy_owner(cfg: config.Config, folder: Path, made: dict) -> workspace.WorkspaceOwner:
+def legacy_owner(cfg: config.Config, folder: Path, made: dict, *, require_history: bool = False) -> workspace.WorkspaceOwner:
     if owner := workspace.owner_in(made):
         return owner
-    repo = max((r for r in cfg.repos if folder.name.startswith(f"{r.name}-")),
-               key=lambda r: len(r.name), default=None)
-    if repo is None:
-        return workspace.WorkspaceOwner("", "", "", "", [])
-    checkouts = [workspace.Checkout(p.dir, p.github, repo.path / p.dir, folder / p.dir, "")
-                 for p in workspace.parts_of(repo)]
-    return workspace.WorkspaceOwner("", repo.name, folder.name.removeprefix(f"{repo.name}-"), "", checkouts)
+    for repo in sorted(cfg.repos, key=lambda r: len(r.name), reverse=True):
+        ticket = folder.name.removeprefix(f"{repo.name}-")
+        if ticket == folder.name or (require_history and not runs.ticket_runs(repo.name, ticket, limit=1)):
+            continue
+        checkouts = [workspace.Checkout(p.dir, p.github, repo.path / p.dir, folder / p.dir, "")
+                     for p in workspace.parts_of(repo)]
+        return workspace.WorkspaceOwner("", repo.name, ticket, "", checkouts)
+    return workspace.WorkspaceOwner("", "", "", "", [])
 
 
 def _run_for(owner: workspace.WorkspaceOwner) -> dict:
@@ -494,12 +496,15 @@ def _reconcile_record(ws: Path, row: dict | None, recorded: tuple[dict | None, i
             return change(active, **snapshot_fields({}))
         return active
     made, modified, _ = recorded
-    if made is None:
+    invalid = made is None
+    if invalid:
         if active:
             return change(active, legacy_mtime_ns=max(modified, active["legacy_mtime_ns"]), **snapshot_fields({}))
-        return None
+        if cfg is None or not ws.is_dir() or ws.is_symlink():
+            return None
+        made = {}
     if row and modified <= row["legacy_mtime_ns"]:
-        if active and modified < row["legacy_mtime_ns"]:
+        if active and modified < row["legacy_mtime_ns"] and made != _snapshot(active):
             raise SnapshotUnavailable(f"{ws}: legacy workspace record is older than its recorded version")
         return active
     if row and not active:
@@ -528,10 +533,10 @@ def _reconcile_record(ws: Path, row: dict | None, recorded: tuple[dict | None, i
                       **snapshot)
     if preserve_selection:
         return change(active, legacy_mtime_ns=modified, **snapshot)
-    owner = owner or legacy_owner(cfg or config.load(), ws, made)
+    owner = owner or legacy_owner(cfg or config.load(), ws, made, require_history=True)
     identity = dict(repo=owner.repo, ticket=owner.ticket, owner_run=owner.run, checkouts=owner.checkout_rows())
     if not active:
-        return _import_new(ws, owner, modified, identity, snapshot)
+        return _import_new(ws, owner, modified, identity, snapshot) if owner.ticket or not invalid else None
     if not snapshot["legacy_owner"] and active["owner_run"]:
         identity = {}
     if takeover:
@@ -548,7 +553,7 @@ def _background_lock(ws: Path, cfg: config.Config | None = None):
     if row:
         repo, ticket = row["repo"], row["ticket"]
     elif recorded := _read_record(workspace.made_record(ws)):
-        owner = legacy_owner(cfg or config.load(), ws, recorded[0] or {})
+        owner = legacy_owner(cfg or config.load(), ws, recorded[0] or {}, require_history=True)
         repo, ticket = owner.repo, owner.ticket
     else:
         yield None
@@ -584,18 +589,19 @@ def _import_new(folder: Path, owner: workspace.WorkspaceOwner, modified: int, id
                   legacy_mtime_ns=modified, **identity, **snapshot)
 
 
-def backfill(cfg: config.Config) -> int:
+def backfill(cfg: config.Config, *, new_only: bool = False) -> int:
     migrate_on_demand()
     record_dir = paths.STATE_DIR / "workspaces"
     names = {p.name.removesuffix(".json") for p in record_dir.glob("*.json")}
-    with reader() as c:
-        names.update(r[0] for r in c.execute("SELECT name FROM workspaces "
-                                            "WHERE state != 'removed' AND legacy_mtime_ns > 0"))
+    if not new_only:
+        with reader() as c:
+            names.update(r[0] for r in c.execute("SELECT name FROM workspaces "
+                                                "WHERE state != 'removed' AND legacy_mtime_ns > 0"))
     imported = 0
     for name in sorted(names - {"", ".", ".."}):
         ws = paths.WORKTREES_DIR / name
         with _isolated_sweep(ws), _background_lock(ws, cfg) as identity:
-            if identity is not None:
+            if identity is not None and (not new_only or not open_for(name)):
                 _, _, changed = _reconcile(ws, cfg)
                 imported += changed
     return imported
@@ -650,32 +656,47 @@ def _isolated_sweep(ws: Path):
         print(f"{util.iso()} sweeping {ws}: {type(e).__name__}: {util.first_line(str(e), 300)}")
 
 
-def _sweep_row(ws: Path, row: dict) -> None:
+def _sweep_attempt(row: dict, error: str = "", **fields) -> dict | None:
+    return _change_current(row, sweep_attempts=row["sweep_attempts"] + 1, last_sweep_at=util.iso(),
+                           last_sweep_error=error, **fields)
+
+
+def _owner_status(row: dict) -> str:
+    owner = runs.run_get(row["owner_run"]) if row["owner_run"] else None
+    return (owner or {}).get("status") or ""
+
+
+def _sweep_row(ws: Path, row: dict, *, missing: bool = False) -> None:
     if row["state"] == "live":
-        owner = runs.run_get(row["owner_run"]) if row["owner_run"] else None
-        status = (owner or {}).get("status") or ""
+        status = _owner_status(row)
         if status == "running":
             return
         row = _change_current(row, state="kept", kept_reason=status, bytes=workspace.tree_bytes(ws))
         if row is None:
             return
-    try:
-        ws.lstat()
-    except FileNotFoundError:
-        _change_current(row, state="removed", held_by=[], bytes=0)
+    if missing:
+        removed_through = max(row["legacy_mtime_ns"], time.time_ns())
+        with suppress(UnreadableSnapshot):
+            if source := _record_stat(workspace.made_record(ws)):
+                removed_through = max(removed_through, source.st_mtime_ns)
+        _change_current(row, state="removed", held_by=[], bytes=0, last_sweep_error="",
+                        legacy_mtime_ns=removed_through)
         unlink_record(ws)
         return
     if row["kept_reason"] == "operator":
         return
-    if row["kept_reason"] == LEGACY_RESUME and not row["remove_asked_by"]:
-        return
     checkouts = owner_of(row).checkouts
     excluded = {Path(wt) for wt in row["release_excluded"] or ()}
-    if row["state"] != "released" and (
-        _has_attached_onto(ws, checkouts, row["onto"], allow_root=not excluded) or not _ticket_ended(row)
-    ):
+    may_remove = row["kept_reason"] != LEGACY_RESUME or row["remove_asked_by"]
+    remove = may_remove and (
+        row["state"] == "released" or (
+            not _has_attached_onto(ws, checkouts, row["onto"], allow_root=not excluded) and _ticket_ended(row)
+        )
+    )
+    if (remove or row["last_sweep_error"]) and _sweep_attempt(row) is None:
         return
-    _change_current(row, sweep_attempts=row["sweep_attempts"] + 1, last_sweep_at=util.iso(), last_sweep_error="")
+    if not remove:
+        return
     try:
         if not checkouts and not excluded:
             checkouts = workspace.registered_root_checkout(ws)
@@ -700,18 +721,42 @@ def _sweep_owned(cfg: config.Config, ws: Path, row: dict) -> None:
         if not ticket_held or runs.issue_running(repo, ticket):
             return
         with folder_lock(ws, wait=False) as got:
-            if not got:
+            current = open_for(ws.name) if got else None
+            if not current or current["id"] != row["id"] or (current["repo"], current["ticket"]) != (repo, ticket):
+                return
+            if current["state"] == "live" and _owner_status(current) == "running":
                 return
             try:
-                current = _reconcile(ws, cfg)[0] if os.path.lexists(ws) else open_for(ws.name)
-            except UnreadableSnapshot:
-                current = open_for(ws.name)
-            if current and current["id"] == row["id"] and (current["repo"], current["ticket"]) == (repo, ticket):
-                _sweep_row(ws, current)
+                try:
+                    ws.lstat()
+                except FileNotFoundError:
+                    _sweep_row(ws, current, missing=True)
+                    return
+                try:
+                    reconciled = _reconcile(ws, cfg)[0]
+                except UnstatableSnapshot:
+                    if not current["remove_asked_by"]:
+                        raise
+                    reconciled = current
+                if (reconciled and reconciled["id"] == current["id"]
+                        and (reconciled["repo"], reconciled["ticket"]) == (repo, ticket)):
+                    _sweep_row(ws, reconciled)
+            except Exception as e:
+                latest = get(current["id"])
+                if latest and latest["state"] in SWEEP_STATES and latest["kept_reason"] != "operator":
+                    error = util.first_line(str(e), 300) or type(e).__name__
+                    if latest["state"] == "live":
+                        if (status := _owner_status(latest)) != "running":
+                            _sweep_attempt(latest, error, state="kept", kept_reason=status)
+                    elif latest["sweep_attempts"] == current["sweep_attempts"]:
+                        _sweep_attempt(latest, error)
+                    else:
+                        change(latest, last_sweep_error=error)
+                raise
 
 
 def _sweep_unowned(cfg: config.Config, ws: Path, cutoff: float) -> None:
-    if not ws.is_dir() or ws.is_symlink() or open_for(ws.name):
+    if open_for(ws.name) or not ws.is_dir() or ws.is_symlink():
         return
     owner = legacy_owner(cfg, ws, {})
     with ticket_lock(owner.repo, owner.ticket) as ticket_held, folder_lock(ws, wait=False) as got:
@@ -730,7 +775,7 @@ def _sweep_unowned(cfg: config.Config, ws: Path, cutoff: float) -> None:
             if names := workspace.unexamined(ws, set()):
                 _record_orphan(ws, owner.repo, modified, names)
             return
-        if recorded and recorded[0] is not None:
+        if recorded and (recorded[0] is not None or legacy_owner(cfg, ws, {}, require_history=True).ticket):
             return
         version = recorded[2] if recorded else None
         if names := workspace.unexamined(ws, set()):
@@ -748,7 +793,7 @@ def _record_orphan(ws: Path, repo: str, modified: float, names: list[str]) -> No
 
 def sweep(cfg: config.Config) -> None:
     try:
-        backfill(cfg)
+        backfill(cfg, new_only=True)
         for row in by_state(*SWEEP_STATES):
             ws = paths.WORKTREES_DIR / row["name"]
             with _isolated_sweep(ws):
