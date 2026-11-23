@@ -121,6 +121,8 @@ def launch(command: list[str], log_name: str = DETACHED_LOG, keep: tuple[int, ..
     env.pop(WORKER_ENV, None)
     if command[:len(cli_prefix)] == cli_prefix and (kind := worker_kind(command[len(cli_prefix):])):
         env[WORKER_ENV] = kind
+        if kind == "file-rule":
+            env["ARETE_RUN_ID"] = record.new_id(kind)
     with open(paths.LOG_DIR / log_name, "a") as log:
         proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log,
                                 stderr=subprocess.STDOUT, start_new_session=start_new_session, pass_fds=keep,

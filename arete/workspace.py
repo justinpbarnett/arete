@@ -259,13 +259,18 @@ def remove_workspace(ws: Path, checkouts: list[Checkout], *, by: str = "",
     with workspaces.folder_lock(ws):
         options = {}
         try:
+            snapshot_error = None
             try:
                 row = workspaces.release(ws, checkouts, excluded=excluded)
             except workspaces.SnapshotUnavailable as e:
                 row = workspaces.release(ws, checkouts, excluded=excluded, reconcile=False)
-                if (not isinstance(e, workspaces.UnstatableSnapshot) or by != "sweep"
+                snapshot_error = e
+            if row:
+                excluded = {Path(wt) for wt in row["release_excluded"]}
+            if snapshot_error is not None:
+                if (not isinstance(snapshot_error, workspaces.UnstatableSnapshot) or by != "sweep"
                         or not row or not row["remove_asked_by"]):
-                    raise
+                    raise snapshot_error
                 options["check_legacy"] = lambda: workspaces.require_unstatable_record(ws)
             if row and by and by != "sweep" and by == row["owner_run"]:
                 note_made(ws, checkouts, workspaces.owner_of(row), excluded=excluded)
@@ -574,6 +579,9 @@ def note_made(ws: Path, checkouts: list[Checkout], owner: WorkspaceOwner | None 
 
 def _note_made(ws: Path, checkouts: list[Checkout], row: dict, owner: WorkspaceOwner | None,
                preserve: Collection[str], excluded: Collection[Path]) -> None:
+    excluded = set(excluded) | {Path(wt) for wt in row["release_excluded"] or ()}
+    if excluded:
+        checkouts = [c for c in checkouts if c.wt not in excluded]
     owner = owner or workspaces.owner_of(row)
     if not owner.checkouts:
         owner.checkouts = checkouts

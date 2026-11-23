@@ -301,7 +301,13 @@ def release(ws: Path, checkouts: list[workspace.Checkout] | None = None, *,
         if row and reconcile:
             row, _, _ = _reconcile(ws)
         if row:
-            selection = _release_selection(checkouts, excluded) if checkouts is not None else {}
+            selection = {}
+            if checkouts is not None:
+                selected = {c.wt for c in checkouts}
+                omitted = {c.wt for c in owner_of(row).checkouts
+                           if selected and c.wt not in selected and os.path.lexists(c.wt)}
+                earlier = {Path(wt) for wt in row["release_excluded"] or ()}
+                selection = _release_selection(checkouts, set(excluded) | omitted | (earlier - selected))
             return _change_current(row, state="released", legacy_mtime_ns=row["legacy_mtime_ns"] or NO_LEGACY_RECORD,
                                    **selection)
     return None
@@ -455,6 +461,20 @@ def _reconcile(ws: Path, cfg: config.Config | None = None, *,
     return current, version, current is not None and current != row
 
 
+def _legacy_takeover(row: dict, owner: workspace.WorkspaceOwner | None) -> dict | None:
+    if not owner or not owner.run or owner.run == row["owner_run"]:
+        return None
+    if row["owner_run"]:
+        if later := runs.later_run(owner.repo, owner.ticket, row["owner_run"], candidate=owner.run):
+            return later
+        if runs.run_get(row["owner_run"]):
+            return None
+    run = runs.run_get(owner.run)
+    if run and (run["repo"], str(run["issue"])) == (owner.repo, owner.ticket) and run["started"] >= row["released_at"]:
+        return run
+    return None
+
+
 def _reconcile_record(ws: Path, row: dict | None, recorded: tuple[dict | None, int, tuple[int, ...]] | None,
                       cfg: config.Config | None) -> dict | None:
     active = row if row and row["state"] != "removed" else None
@@ -480,16 +500,22 @@ def _reconcile_record(ws: Path, row: dict | None, recorded: tuple[dict | None, i
         if modified // 1_000_000_000 < removed or not ws.is_dir() or ws.is_symlink():
             return None
     snapshot = snapshot_fields(made)
+    owner = workspace.owner_in(made)
+    takeover = None
     if active and active["release_excluded"] is not None:
-        return change(active, legacy_mtime_ns=modified, **snapshot)
-    owner = legacy_owner(cfg or config.load(), ws, made)
+        takeover = _legacy_takeover(active, owner)
+        if not takeover:
+            return change(active, legacy_mtime_ns=modified, **snapshot)
+    owner = owner or legacy_owner(cfg or config.load(), ws, made)
     identity = dict(repo=owner.repo, ticket=owner.ticket, owner_run=owner.run, checkouts=owner.checkout_rows())
     if not active:
         return _import_new(ws, owner, modified, identity, snapshot)
     if not snapshot["legacy_owner"] and active["owner_run"]:
         identity = {}
+    if takeover:
+        identity.update(released_at="", release_excluded=None, remove_asked_by="", held_by=[], last_sweep_error="")
     if any(active[key] != identity[key] for key in ("repo", "ticket", "owner_run") if key in identity):
-        state, reason = _state_for(_run_for(owner).get("status") or "")
+        state, reason = _state_for((takeover or _run_for(owner)).get("status") or "")
         identity.update(state=state, kept_reason=reason)
     return change(active, legacy_mtime_ns=modified, **identity, **snapshot)
 
@@ -619,10 +645,15 @@ def _sweep_row(ws: Path, row: dict) -> None:
         return
     if row["kept_reason"] == "operator":
         return
-    if row["state"] != "released" and (row["onto"] or not _ticket_ended(row)):
-        return
     checkouts = owner_of(row).checkouts
     excluded = {Path(wt) for wt in row["release_excluded"] or ()}
+    if row["state"] != "released":
+        attached_onto = any(row["onto"].get(c.prefix) and workspace.checkout_attachment(ws, c.wt)[0]
+                            for c in checkouts)
+        root_onto = (not checkouts and not excluded and row["onto"].get("")
+                     and workspace.checkout_attachment(ws, ws)[0])
+        if attached_onto or root_onto or not _ticket_ended(row):
+            return
     _change_current(row, sweep_attempts=row["sweep_attempts"] + 1, last_sweep_at=util.iso(), last_sweep_error="")
     try:
         if not checkouts and not excluded:
