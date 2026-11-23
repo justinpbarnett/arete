@@ -20,6 +20,8 @@ from unittest.loader import _FailedTest
 KEPT_LINES = 40
 DEFAULT_CLASS_TIMEOUT = 10
 STACK_GRACE = 1
+LOAD_POLL_INTERVAL = 5
+LOAD_WAIT_BUDGET = 5 * 60
 HISTORY = os.path.join(tempfile.gettempdir(), "arete-parallel-durations.json")
 TESTS = os.path.dirname(os.path.abspath(__file__))
 STACK_SITE = os.path.join(TESTS, "_parallel_site")
@@ -138,6 +140,8 @@ class Runner:
         self.results = {}
         self.crowded = []
         self.first_failures = {}
+        self.first_solo_timeouts = {}
+        self.retry_loads = {}
         try:
             with open(HISTORY) as handle:
                 history = json.load(handle)
@@ -334,14 +338,7 @@ class Runner:
             for item in items:
                 if item[1].serial:
                     self.child(item)
-            for index, batch in items:
-                identifier = batch.identifier
-                first = self.results.get(identifier, {})
-                if not self.stopping and failed(first):
-                    self.first_failures[identifier] = first
-                    self.child((f"{index}.alone", batch), stretch=3)
-                    if not failed(self.results[identifier]):
-                        self.crowded.append(identifier)
+            self.rerun_failed(items)
             complete = True
         finally:
             if not complete:
@@ -355,6 +352,57 @@ class Runner:
             print(f"Worker reports and output retained in: {self.folder}", flush=True)
             return 130
         return self.finish(time.monotonic() - began)
+
+    def wait_for_load(self, identifier, capacity, budget):
+        began = time.monotonic()
+        waited = 0
+        while True:
+            try:
+                load = os.getloadavg()[0]
+            except OSError:
+                load = None
+            if (self.stopping or load is None or capacity is None or load <= capacity
+                    or waited >= budget):
+                break
+            if not waited:
+                print(f"{identifier}: waiting for host load to fall from {load:g} to {capacity} or less", flush=True)
+            time.sleep(min(LOAD_POLL_INTERVAL, budget - waited))
+            waited = time.monotonic() - began
+        if not self.stopping:
+            load_text = f"{load:g}" if load is not None else "unavailable"
+            print(f"{identifier}: starting alone at host load {load_text} after waiting {waited:.2f}s", flush=True)
+        return load, waited
+
+    def rerun_failed(self, items):
+        capacity = os.cpu_count()
+        budget = LOAD_WAIT_BUDGET
+        for index, batch in items:
+            if self.stopping:
+                break
+            identifier = batch.identifier
+            first = self.results.get(identifier, {})
+            if not failed(first):
+                continue
+            self.first_failures[identifier] = first
+            load, waited = self.wait_for_load(identifier, capacity, budget)
+            budget -= waited
+            if self.stopping:
+                break
+            self.child((f"{index}.alone", batch), stretch=3)
+            alone = self.results[identifier]
+            if (not self.stopping and alone["timeout"] and load is not None and capacity is not None
+                    and load > capacity
+                    and not any(alone[kind] for kind in ("failures", "errors", "unexpected"))):
+                retry_load, waited = self.wait_for_load(identifier, capacity, budget)
+                budget -= waited
+                if self.stopping:
+                    break
+                self.retry_loads[identifier] = (load, retry_load)
+                self.child((f"{index}.alone-retry", batch), stretch=3)
+                if failed(self.results[identifier]):
+                    self.first_solo_timeouts[identifier] = alone
+            if not failed(self.results[identifier]):
+                self.crowded.append(identifier)
 
     def show_failures(self, identifier, report):
         timeout_report = report.get("timeout")
@@ -373,6 +421,13 @@ class Runner:
             report = self.results[identifier]
             first = self.first_failures[identifier]
             where = "ran past its deadline" if first["timeout"] else "failed"
+            if identifier in self.retry_loads:
+                load, retry_load = self.retry_loads[identifier]
+                retry_load_text = f"{retry_load:g}" if retry_load is not None else "unavailable"
+                print(f"{identifier}: {where} on its first run, ran past its deadline alone at host load {load:g}, "
+                      f"then passed alone at host load {retry_load_text} within three times its deadline "
+                      f"in {report['seconds']:.2f}s", flush=True)
+                continue
             print(f"{identifier}: {where} on its first run, "
                   f"then passed alone within three times its deadline in {report['seconds']:.2f}s", flush=True)
         failed_classes = []
@@ -384,6 +439,8 @@ class Runner:
                 failed_classes.append(identifier)
                 if (first := self.first_failures.get(identifier)) and first["timeout"]:
                     self.show_failures(identifier, first)
+                if first_solo := self.first_solo_timeouts.get(identifier):
+                    self.show_failures(identifier, first_solo)
                 self.show_failures(identifier, report)
         try:
             with open(f"{HISTORY}.lock", "a") as lock:
