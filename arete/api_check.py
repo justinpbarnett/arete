@@ -246,6 +246,8 @@ class Check:
     def request(self, method, path, body=None, *, status=200, headers=None):
         from . import contract
 
+        if method == "GET":
+            headers = {"Authorization": f"Bearer {self.token}", **(headers or {})}
         with self.response(method, path, body, headers) as response:
             raw = response.read()
             at = f"{method} {path}"
@@ -511,11 +513,23 @@ def worker(lifeline):
     stage = "scratch startup"
     try:
         with offline(), ExitStack() as cleanup:
-            from . import api_http, codebase, control, credential_files, dashboard, paths, pipeline, principals, tailnet
+            from . import (
+                api_http,
+                codebase,
+                control,
+                credential_files,
+                dashboard,
+                paths,
+                pipeline,
+                principals,
+                tailnet,
+                verify_faults,
+            )
             from .store import db, tokens
 
             root = Path.cwd()
             require(not paths.DB_FILE.exists(), "state database already exists")
+            (root / ".arete-owned").write_bytes(verify_faults.MARKER + b"\n")
             config, has_origin = prepare_replay(root)
             body = "\n".join(config) + "\n"
             paths.CONFIG_FILE.write_text("max_parallel = 2\n" + body)
@@ -544,7 +558,7 @@ def worker(lifeline):
             logins = tailnet.Logins(tailnet.ScratchHost())
             logins.of = lambda _: LOGIN
             stage = f"listen on {ADDRESS}:0"
-            handler = type("FixtureHandler", (dashboard.Handler,), {"disable_nagle_algorithm": True})
+            handler = type("FixtureHandler", (dashboard.handlers().open,), {"disable_nagle_algorithm": True})
             with patch("socket.getfqdn", return_value=ADDRESS):
                 server = tailnet.Server(ADDRESS, 0, node, logins, False, handler, dashboard.Redirect)
             server.daemon_threads = False

@@ -182,23 +182,26 @@ def check_origin(handler):
             raise problem("bad_origin")
 
 
-def authenticate(handler, method, *, browser_asset=False, mcp=False):
+def authenticate(handler, method, path, *, browser_asset=False, mcp=False, scratch=False):
     op = handler.operation[0] if handler.operation else None
     name = op["name"] if op else ""
     secure = handler.origin[0] == "https"
-    if (mcp or require_tls(op)) and not secure:
+    auth = handler.headers.get_all("Authorization", [])
+    cookies = session_values(handler.headers)
+    claim = name == "pairing.claim"
+    meta = method == "GET" and path in ("/api/meta", "/api/v1/meta")
+    api_route = path == "/api" or path.startswith("/api/")
+    requires_credential = api_route and not (mcp or scratch or meta or claim or name == "token.issue")
+    if (mcp or require_tls(op) and (auth or cookies or not requires_credential)) and not secure:
         raise problem("tls_required")
     peer = handler.client_address[0]
     logins = handler.server.logins
     traffic = logins.credentials
     traffic.check(peer)
-    auth = handler.headers.get_all("Authorization", [])
-    cookies = session_values(handler.headers)
     if mcp and not auth:
         raise problem("unauthenticated")
     if auth and cookies:
         raise problem("ambiguous_credential")
-    claim = name == "pairing.claim"
     if claim and auth:
         raise problem("unauthenticated")
 
@@ -237,7 +240,7 @@ def authenticate(handler, method, *, browser_asset=False, mcp=False):
         if cookies and handler.headers.get_all("X-Arete", []) != ["1"]:
             raise problem("csrf")
     if not (claim or mcp):
-        authorize(handler, op, name, write, secure, peer)
+        authorize(handler, op, name, write, secure, peer, requires_credential=requires_credential)
     if credential:
         logins.of(peer)
         try:
@@ -248,23 +251,29 @@ def authenticate(handler, method, *, browser_asset=False, mcp=False):
             handler.set_cookie = session_cookie(text, tokens.SESSION_SECONDS)
 
 
-def authorize(handler, op, name, write, secure, peer):
+def unauthenticated(handler, write, secure):
+    if write and handler.headers.get_all("X-Arete", []) == ["1"]:
+        message = ("Pair this browser using ‘arete pair’ or Pair a device in a paired browser." if secure else
+                   "Browser pairing needs HTTPS. Set https = true in [dashboard] on the serve host.")
+        return contract.Problem("unauthenticated", message)
+    return problem("unauthenticated")
+
+
+def authorize(handler, op, name, write, secure, peer, *, requires_credential):
     credential = handler.credential
+    if requires_credential and credential is None:
+        raise unauthenticated(handler, write, secure)
+    if name == "pairing.start" and (credential is None or credential.kind != "session"):
+        with db.reader() as c:
+            if tokens.live_session(c):
+                require_presence(credential)
     if name in PRESENCE:
         if credential is None and name == "token.issue":
             logins = handler.server.logins
             logins.credentials.issue(logins.node_key(peer))
         require_presence(credential)
-    if name == "pairing.start" and (credential is None or credential.kind != "session"):
-        with db.reader() as c:
-            if tokens.live_session(c):
-                require_presence(credential)
     if write and credential is None:
-        if handler.headers.get_all("X-Arete", []) == ["1"]:
-            message = ("Pair this browser using ‘arete pair’ or Pair a device in a paired browser." if secure else
-                       "Browser pairing needs HTTPS. Set https = true in [dashboard] on the serve host.")
-            raise contract.Problem("unauthenticated", message)
-        raise problem("unauthenticated")
+        raise unauthenticated(handler, write, secure)
     if name == "session.end" and credential.kind != "session":
         raise problem("unauthenticated")
     if name in ("session.end", "pairing.start") or (name == "token.revoke" and credential.kind == "token"

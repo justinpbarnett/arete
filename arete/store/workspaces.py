@@ -767,7 +767,7 @@ def held_entry(row: dict) -> dict:
     run = run or {}
     status = run.get("status") or row["kept_reason"]
     why = row["last_sweep_error"]
-    blocked = row["state"] == "held" or (row["state"] == "released" and bool(why))
+    blocked = row["state"] == "held" or bool(why)
     if not why:
         if blocked:
             why = "workspace removal blocked"
