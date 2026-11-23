@@ -1183,11 +1183,22 @@ class Stopped(BaseException):
     pass
 
 
-def stop_on_term(run_id: str) -> Callable:
+class Terminated(Stopped):
+    pass
+
+
+_termination: Terminated | None = None
+
+
+def stop_on_term(run: Run, *, zte_grant: bool) -> Callable:
     def stop(*_) -> None:
-        if record.stop_asked(run_id):
+        global _termination
+        if _termination is None and record.stop_asked(run.id):
             raise Stopped(record.STOPPED)
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        if _termination is None and not zte_grant and run.workspace:
+            _termination = Terminated()
+            raise _termination
         os.kill(os.getpid(), signal.SIGTERM)
     return stop
 
@@ -2045,8 +2056,27 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
         def checkpoint_allowed():
             return time.monotonic() < wall_deadline and not zte.PAUSE_FILE.exists()
 
+        def termination_keep_blocker(error: BaseException | None) -> str:
+            if error is not _termination:
+                return "the termination exception did not survive unwinding"
+            try:
+                while os.waitpid(-1, os.WNOHANG)[0]:
+                    pass
+            except ChildProcessError:
+                pass
+            else:
+                return "a child process is still alive"
+            for checkout in run.workspace[1]:
+                if not (checkout.wt / ".git").exists():
+                    continue
+                git_dir = Path(git(["rev-parse", "--absolute-git-dir"], checkout.wt).rstrip("\n"))
+                states = ("MERGE_HEAD", "rebase-merge", "rebase-apply", "CHERRY_PICK_HEAD", "REVERT_HEAD", "sequencer")
+                if any((git_dir / state).exists() for state in states):
+                    return f"a Git operation is in progress in {checkout.wt}"
+            return ""
+
         try:
-            signal.signal(signal.SIGTERM, stop_on_term(run_id))
+            signal.signal(signal.SIGTERM, stop_on_term(run, zte_grant=zte_grant is not None))
             if not run.claim_feedback_on_revise:
                 run.claim_feedback()
             if run.feedback:
@@ -2103,71 +2133,85 @@ def run_issue(repo_name: str, tid: str | int, dry_run: bool = False, force: bool
                 status, summary, passed = flows.alone(flow)
             elif run.action_only:
                 passed = status == "step"
-        except runlimits.Parked as e:
-            if zte_grant:
-                return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True)
-            status, summary, pr_url = run.catch_up_cleanup_park or park_run(run, str(e))
-        except factory.OnlyDone as e:
-            if zte_grant:
-                return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True)
-            status, summary, passed = flows.alone(flow)
-        except factory.Refused as e:
-            retaining_catch_up = reconciling_catch_up
-            if zte_grant:
-                return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True)
-            if run.environment_release:
-                status, summary, pr_url = environment_retry_held(run, script.continues, str(e))
+        except (runlimits.Parked, Stopped, Exception) as e:
+            if _termination is not None:
+                raise
+            if isinstance(e, runlimits.Parked):
+                if zte_grant:
+                    return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True)
+                status, summary, pr_url = run.catch_up_cleanup_park or park_run(run, str(e))
+            elif isinstance(e, factory.OnlyDone):
+                if zte_grant:
+                    return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True)
+                status, summary, passed = flows.alone(flow)
+            elif isinstance(e, factory.Refused):
+                retaining_catch_up = reconciling_catch_up
+                if zte_grant:
+                    return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True)
+                if run.environment_release:
+                    status, summary, pr_url = environment_retry_held(run, script.continues, str(e))
+                else:
+                    status, summary = "failed", str(e)
+            elif isinstance(e, Stopped):
+                if zte_grant:
+                    return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True)
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                status, summary, pr_url = "stopped", record.STOPPED, ""
+                run.log(record.STOPPED)
+                run.give_up("was stopped by request")
+            elif isinstance(e, CatchUpPushUnconfirmed):
+                retaining_catch_up = True
+                status = "interrupted" if e.retryable and run.path == "orchestrate" else "failed"
+                summary = f"{e.why}. {e.detail}"
+                if status == "interrupted":
+                    summary += " The next poll can reconcile the recorded push."
+                run.log(summary)
+            elif isinstance(e, workspace.RunFailed):
+                if zte_grant:
+                    return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True)
+                if run.environment_release:
+                    status, summary, pr_url = environment_retry_held(run, script.continues, e.why)
+                else:
+                    status, summary, pr_url = _fail(run, e.why, detail=e.detail, recovery=e.recovery)
+            elif isinstance(e, tracker.ERRORS):
+                if zte_grant:
+                    return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True)
+                why = f"tracker refused {run.ref}: {e}"
+                if run.environment_release:
+                    status, summary, pr_url = environment_retry_held(run, script.continues, why)
+                else:
+                    status, summary, pr_url = _fail(run, why)
             else:
-                status, summary = "failed", str(e)
-        except Stopped as e:
-            if zte_grant:
-                return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True)
-            signal.signal(signal.SIGTERM, signal.SIG_IGN)
-            status, summary, pr_url = "stopped", record.STOPPED, ""
-            run.log(record.STOPPED)
-            run.give_up("was stopped by request")
-        except CatchUpPushUnconfirmed as e:
-            retaining_catch_up = True
-            status = "interrupted" if e.retryable and run.path == "orchestrate" else "failed"
-            summary = f"{e.why}. {e.detail}"
-            if status == "interrupted":
-                summary += " The next poll can reconcile the recorded push."
-            run.log(summary)
-        except workspace.RunFailed as e:
-            if zte_grant:
-                return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True)
-            if run.environment_release:
-                status, summary, pr_url = environment_retry_held(run, script.continues, e.why)
-            else:
-                status, summary, pr_url = _fail(run, e.why, detail=e.detail, recovery=e.recovery)
-        except tracker.ERRORS as e:
-            if zte_grant:
-                return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True)
-            why = f"tracker refused {run.ref}: {e}"
-            if run.environment_release:
-                status, summary, pr_url = environment_retry_held(run, script.continues, why)
-            else:
-                status, summary, pr_url = _fail(run, why)
-        except Exception as e:
-            if zte_grant:
-                failure = crash_failure(e) if isinstance(e, prompt_loader.MissingInputs) else None
-                return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True, failure=failure)
-            run.log(f"crashed: {type(e).__name__}: {e}")
-            run.failure = crash_failure(e)
-            status, summary, pr_url = "failed", f"crashed: {e}"[:300], ""
-            if run.environment_release:
-                status, summary, pr_url = environment_retry_held(run, script.continues, summary)
-            else:
-                run.give_up("crashed before finishing")
+                if zte_grant:
+                    failure = crash_failure(e) if isinstance(e, prompt_loader.MissingInputs) else None
+                    return settle_zte_failure(repo.name, str(tid), slot, run_id, e, committed=True, failure=failure)
+                run.log(f"crashed: {type(e).__name__}: {e}")
+                run.failure = crash_failure(e)
+                status, summary, pr_url = "failed", f"crashed: {e}"[:300], ""
+                if run.environment_release:
+                    status, summary, pr_url = environment_retry_held(run, script.continues, summary)
+                else:
+                    run.give_up("crashed before finishing")
         finally:
-            signal.signal(signal.SIGTERM, signal.SIG_DFL)
-            if run.workspace and not zte_grant:
-                if not (retaining_catch_up or run.catch_up_preserved) and (
-                        not run.environment_release or ("requirements" in run.facts and flows.retry_passed(flow.ctx.verified))):
-                    keep_edits(run)
-                workspace.note_made(*run.workspace, workspace_owner(run, *run.workspace), preserve=run.catch_up_preserved,
-                                    excluded=run.closed_checkout_paths)
-            slot.free()
+            try:
+                signal.signal(signal.SIGTERM, signal.SIG_DFL)
+                blocked = termination_keep_blocker(sys.exception()) if _termination is not None else ""
+                if blocked:
+                    run.log(f"SIGTERM: did not keep work because {blocked}")
+                elif run.workspace and not zte_grant:
+                    if not (retaining_catch_up or run.catch_up_preserved) and (
+                            not run.environment_release or ("requirements" in run.facts and flows.retry_passed(flow.ctx.verified))):
+                        keep_edits(run)
+                    workspace.note_made(*run.workspace, workspace_owner(run, *run.workspace), preserve=run.catch_up_preserved,
+                                        excluded=run.closed_checkout_paths)
+                slot.free()
+            except Exception as error:
+                if _termination is None:
+                    raise
+                run.log(f"SIGTERM: could not keep work: {error}")
+            finally:
+                if _termination is not None:
+                    os.kill(os.getpid(), signal.SIGTERM)
         if run.catch_up_cleanup_park and (held := kept_heads(run)):
             try:
                 if parked := runlimits.metadata(run.id, "parked.json"):

@@ -1896,6 +1896,190 @@ class PublicationFixture(unittest.TestCase):
         return job
 
 
+class SigtermKeepWorkTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from functools import cache
+
+        from arete.store import migrations
+
+        seed = Path(tempfile.mkdtemp(prefix="arete-sigterm-seed-")).resolve()
+        cls.addClassCleanup(shutil.rmtree, seed, ignore_errors=True)
+        cls.source = seed / "source"
+        cls.source.mkdir()
+        env = cls.fixture_env(seed)
+        with mock.patch.dict(os.environ, {k: env[k] for k in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM")}):
+            PublicationFixture.create_repository(cls.source)
+            cls.initial_head = util.git(["rev-parse", "HEAD"], cls.source).strip()
+        state = seed / "state"
+        cls.seed_db = state / "arete.db"
+        with (mock.patch.multiple(paths, STATE_DIR=state, DB_FILE=cls.seed_db, RUNS_DIR=state / "runs",
+                                  LOCKS_DIR=state / "locks", WORKTREES_DIR=seed / "worktrees", LOG_DIR=seed / "logs"),
+              mock.patch.object(migrations, "owners", cache(migrations.owners)),
+              redirect_stdout(StringIO())):
+            db.migrate()
+
+    @staticmethod
+    def fixture_env(root):
+        env = {**os.environ, "ARETE_CONFIG_DIR": str(root / "config"), "ARETE_STATE_DIR": str(root / "state"),
+               "ARETE_LOG_DIR": str(root / "logs"), "ARETE_WORKTREES_DIR": str(root / "worktrees"),
+               "ARETE_DESKTOP_NOTIFY": "0", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+        env.pop(paths.SCRATCH_ENV, None)
+        return env
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="arete-sigterm-test-")).resolve()
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.wt = self.root / "ticket"
+        self.state = self.root / "state"
+        self.state.mkdir()
+        shutil.copyfile(self.seed_db, self.state / "arete.db")
+        self.env = self.fixture_env(self.root)
+        self.enterContext(mock.patch.multiple(paths, STATE_DIR=self.state, DB_FILE=self.state / "arete.db",
+                                              RUNS_DIR=self.state / "runs"))
+        util.git(["worktree", "add", "-qb", self.root.name, str(self.wt)], self.source, env=self.env)
+        self.checkout = workspace.Checkout("", "fixture/repo", self.source, self.wt, "main")
+
+    def git(self, *args):
+        return util.git(list(args), self.wt, env=self.env).strip()
+
+    @staticmethod
+    def run_ticket(root, source, case):
+        wt = root / "ticket"
+        repo = config.Repo("fixture", source, parts=[config.Part("", "fixture/repo")])
+        cfg = config.Config(repos=[repo], max_parallel=1)
+        layer = config.RepoLayer(repo.layer_dir, factory_path="classic", checks={"check": "write output"})
+        tid = task_store.task_add(repo.name, "Edit files", "Fixture ticket")
+        children = []
+        enter = pipeline.Run.enter
+
+        def enter_state(run, status):
+            if status == "failed" and case in {"park", "failure"}:
+                os.kill(os.getpid(), signal.SIGTERM)
+            enter(run, status)
+
+        def check(*_args, **_kwargs):
+            (wt / "check-output.txt").write_text("temporary check output\n")
+            os.kill(os.getpid(), signal.SIGTERM)
+
+        def work(_cfg, run, _slot):
+            (root / "run-id").write_text(run.id)
+            run.workspace = wt, [workspace.Checkout("", "fixture/repo", source, wt, "main")]
+            (wt / "file.txt").write_text("tracked edit\n")
+            (wt / "new.txt").write_text("new file\n")
+            if case == "stopped":
+                record.ask_stop(run.id)
+            elif case == "child":
+                children.append(subprocess.Popen(["/bin/cat"], stdin=subprocess.PIPE,
+                                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+            elif case == "park":
+                raise runlimits.Parked("budget exhausted")
+            elif case == "failure":
+                raise workspace.RunFailed("diff refused")
+            try:
+                if case == "check":
+                    pipeline.run_checks(layer, wt, [wt], run, 2)
+                else:
+                    os.kill(os.getpid(), signal.SIGTERM)
+            finally:
+                if case == "unwind":
+                    raise RuntimeError("cleanup failed")
+                if case == "second":
+                    (root / "unwinding").touch()
+                    os.kill(os.getpid(), signal.SIGTERM)
+
+        with (mock.patch.object(config, "load", return_value=cfg),
+              mock.patch.object(config, "load_layer", return_value=layer),
+              mock.patch.object(pipeline.Run, "enter", enter_state),
+              mock.patch.multiple(pipeline.scratch, process_ids=dict, service_labels=dict),
+              mock.patch.object(pipeline, "_run", side_effect=work),
+              mock.patch.object(pipeline, "check_lane", return_value=nullcontext(())),
+              mock.patch.object(pipeline.environment, "sh", side_effect=check)):
+            return pipeline.run_issue(repo.name, tid)
+
+    def run_case(self, case, expected=-signal.SIGTERM):
+        command = ("import sys; from functools import cache; from pathlib import Path;"
+                   " from arete.store import migrations; migrations.owners = cache(migrations.owners);"
+                   " from tests.test_workflow import SigtermKeepWorkTests;"
+                   " raise SystemExit(SigtermKeepWorkTests.run_ticket(Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]))")
+        child = subprocess.run([sys.executable, "-c", command, str(self.root), str(self.source), case],
+                               env=self.env, capture_output=True, text=True, timeout=CHILD_HANG_TIMEOUT)
+        self.assertEqual(child.returncode, expected, child.stdout + child.stderr)
+        run_id = (self.root / "run-id").read_text()
+        self.assertEqual(run_store.run_get(run_id)["status"], "running" if expected == -signal.SIGTERM else "stopped")
+        return run_id
+
+    def assert_kept(self, run_id):
+        head, subject, _, *changed = self.git("show", "--format=%H%n%s", "--name-only", "HEAD").splitlines()
+        self.assertTrue(subject.startswith(f"wip: edits of arete run {run_id},"))
+        self.assertEqual(changed, ["file.txt", "new.txt"])
+        self.assertEqual((self.wt / "file.txt").read_text(), "tracked edit\n")
+        self.assertEqual((self.wt / "new.txt").read_text(), "new file\n")
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        made = workspace.made_before(self.wt)
+        self.assertEqual(workspace.head_recorded(made, self.checkout), head)
+        self.assertEqual(workspace.owner_in(made).run, run_id)
+
+    def assert_not_kept(self, case, gate=""):
+        run_id = self.run_case(case)
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.initial_head)
+        self.assertFalse(workspace.made_record(self.wt).exists())
+        self.assertEqual((self.wt / "file.txt").read_text(), "tracked edit\n")
+        self.assertEqual((self.wt / "new.txt").read_text(), "new file\n")
+        if gate:
+            log = (self.state / "runs" / run_id / "run.log").read_text().splitlines()
+            self.assertEqual(sum(gate in line for line in log if "SIGTERM: did not keep work" in line), 1)
+
+    def test_signal_during_check_keeps_run_edits_for_restart_and_refuses_later_file(self):
+        self.assert_kept(self.run_case("check"))
+        self.assertFalse((self.wt / "check-output.txt").exists())
+        self.assertEqual(workspace.kept_checkout(self.wt, self.checkout, self.source, []), "")
+        (self.wt / "personal.txt").write_text("added after the run died\n")
+        why = workspace.kept_checkout(self.wt, self.checkout, self.source, [])
+        self.assertIn("uncommitted edits that arete has no record of leaving there (personal.txt)", why)
+
+    def test_unwind_error_prevents_keeping(self):
+        self.assert_not_kept("unwind", "the termination exception did not survive unwinding")
+
+    def test_signal_after_park_commit_records_the_kept_head(self):
+        run_id = self.run_case("park")
+        parked = runlimits.metadata(run_id, "parked.json")
+        self.assertEqual(parked["kept"]["."]["head"], self.git("rev-parse", "HEAD"))
+        self.assert_kept(run_id)
+        self.assertEqual(workspace.kept_checkout(self.wt, self.checkout, self.source, []), "")
+
+    def test_signal_during_failure_reporting_keeps_edits(self):
+        self.assert_kept(self.run_case("failure"))
+
+    def test_live_child_prevents_keeping(self):
+        self.assert_not_kept("child", "a child process is still alive")
+
+    def test_merge_in_progress_prevents_keeping(self):
+        git_dir = Path(self.git("rev-parse", "--absolute-git-dir"))
+        merge_head = git_dir / "MERGE_HEAD"
+        merge_head.write_text(self.initial_head + "\n")
+        self.assert_not_kept("merge", "a Git operation is in progress")
+        self.assertTrue(merge_head.exists())
+
+    def test_requested_stop_still_settles_as_stopped(self):
+        self.assert_kept(self.run_case("stopped", expected=1))
+
+    def test_second_signal_kills_during_unwinding(self):
+        self.assert_not_kept("second")
+        self.assertTrue((self.root / "unwinding").exists())
+
+    def test_zte_and_runs_without_a_workspace_use_default_death(self):
+        for checkouts, zte_grant in ((None, False), ((self.wt, [self.checkout]), True)):
+            with (self.subTest(workspace=bool(checkouts), zte_grant=zte_grant),
+                  mock.patch.object(record, "stop_asked", return_value=False),
+                  mock.patch.object(signal, "signal") as set_handler,
+                  mock.patch.object(os, "kill") as kill):
+                run = SimpleNamespace(id="fixture", workspace=checkouts)
+                pipeline.stop_on_term(run, zte_grant=zte_grant)()
+                set_handler.assert_called_once_with(signal.SIGTERM, signal.SIG_DFL)
+                kill.assert_called_once_with(os.getpid(), signal.SIGTERM)
+
+
 class AutomaticCIRerunFixture:
     hold_reason = "GitHub has no fully passing CI result for the verified head"
 
