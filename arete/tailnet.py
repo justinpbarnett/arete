@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import NoReturn
 
 from . import codebase, config, credential_http, paths, principals, util
-from .store import tokens
+from .store import db, tokens
 
 CERT_SECONDS = 120
 RENEW_SECONDS = 7 * 24 * 3600
@@ -336,7 +336,10 @@ def open_front(host: Tailscale, node: Node, port: int, logins: Logins, inside_se
 
 def record_server(node: Node, port: int, front: Front) -> None:
     fields = {"pid": os.getpid(), "engine": codebase.STAMP, "addresses": list(node.addresses), "port": port,
-              "scheme": front.scheme, "host": node.name}
+              "scheme": front.scheme, "host": node.name,
+              "default_token_dir": paths.TOKEN_CLIENT_DIR == paths.DEFAULT_TOKEN_CLIENT_DIR}
+    if fields["default_token_dir"]:
+        fields["instance"] = db.schema_metadata()["instance_id"]
     try:
         util.write_json(paths.SERVER_FILE, {**fields, **paths.state_and_config(), "at": util.iso()})
     except OSError as e:

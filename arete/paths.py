@@ -31,6 +31,7 @@ def drop_credentials() -> None:
 
 
 CLIENT_DIR = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local/state") / "arete-client"
+DEFAULT_TOKEN_CLIENT_DIR = HOME / ".local/state/arete/client"
 GUARD_HOOK = sys.argv[1:2] in (["guard"], ["codex-guard"])
 CONFIG_DIR, STATE_DIR, ISOLATED = local_paths.local_dirs(HOME, guard_hook=GUARD_HOOK)
 if ISOLATED:

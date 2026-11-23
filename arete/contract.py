@@ -165,11 +165,11 @@ for _error in ERRORS:
     _details = {"unknown_field": {"fields": array(STRING)}, "client_too_old": {"required_version": STRING},
                 "version_conflict": {"current": RUN}, "task_version_conflict": {"current": TASK},
                 "rate_limited": {"retry_after": INTEGER}, "auth_blocked": {"retry_after": INTEGER},
-                "forbidden": {"reason": STRING}}.get(_code, {})
+                "forbidden": {"reason": STRING}, "conflict": {"reason": STRING}}.get(_code, {})
     _error["schema"] = obj({"type": {"type": "string", "enum": [f"urn:arete:problem:{_code}"]}, "title": STRING,
                             "status": {"type": "integer", "enum": [_status]}, "detail": STRING, "error": STRING,
                             "code": {"type": "string", "enum": [_code]}, **_details})
-    if _code == "forbidden":
+    if _code in ("forbidden", "conflict"):
         _error["schema"]["required"].remove("reason")
     _error["example"] = {**sample(_error["schema"]), "type": f"urn:arete:problem:{_code}", "status": _status,
                          "detail": _description, "error": _description}

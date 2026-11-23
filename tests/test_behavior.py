@@ -27,7 +27,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from arete import (
-    accounts, api_check, api_http, backup, chat, cli, client, codebase, config, contract, control, credential_files,
+    accounts, api, api_check, api_http, backup, chat, cli, client, codebase, config, contract, control, credential_files,
     dashboard, event_stream, events, gh,
     idempotency, jira, paths, pipeline, principals, record, screening, serve, tailnet, tasks, tool_events, triage, util, verify_faults,
 )
@@ -2062,7 +2062,7 @@ class VersionedApiTests(unittest.TestCase):
         self.cfg = config.Config(repos=[self.repo])
         self.handler = SimpleNamespace(body=mock.Mock(), headers={"Idempotency-Key": self.id()},
                                        send=lambda *args: args, log_error=mock.Mock(), write_receipt=None,
-                                       idempotent_replayed=False, keyed_delivery=False)
+                                       idempotent_replayed=False, keyed_delivery=False, credential=None)
 
     def request(self, body):
         self.handler.body.return_value = body
@@ -2920,13 +2920,10 @@ class _CredentialCase(unittest.TestCase):
 
     def prepare(self):
         root = Path.cwd()
-        paths.CONFIG_FILE.write_text(f'[dashboard]\nowner = "{self.LOGIN}"\nhttps = true\n\n[[repo]]\n'
-                                     f'name = "fixture"\npath = {json.dumps(str(root))}\ntracker = "local"\n')
-        db.migrate()
-        self.owner = principals.seed_owner(config.load().dashboard_owner)
-        token_store.init_owner()
-        self.meta = db.schema_metadata()
-        self.owner_text = credential_files.read_client(self.meta["instance_tag"])
+        paths.CONFIG_FILE.write_text(f'arete_repo = "fixture"\n[dashboard]\nowner = "{self.LOGIN}"\nhttps = true\n'
+                                     f'[[repo]]\nname = "fixture"\npath = {json.dumps(str(root))}\n'
+                                     'tracker = "local"\ngithub = "fixture/repo"\n')
+        self.prepare_store()
         self.logins = tailnet.Logins(mock.Mock())
         self.logins.of = mock.Mock(return_value=self.LOGIN)
         self.keys = iter(range(1000))
@@ -2937,6 +2934,16 @@ class _CredentialCase(unittest.TestCase):
         self.tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self.tls.load_cert_chain(cert, private)
         self.trust = ssl.create_default_context(cafile=str(cert))
+
+    def prepare_store(self):
+        db.migrate()
+        self.owner = principals.seed_owner(self.LOGIN)
+        self.start_credentials()
+
+    def start_credentials(self):
+        token_store.init_owner()
+        self.meta = db.schema_metadata()
+        self.owner_text = credential_files.read_client(self.meta["instance_tag"])
 
     @contextmanager
     def listen(self, secure=True):
@@ -3019,19 +3026,39 @@ def credential_test(check):
     return launch
 
 
-class CredentialWriteTests(_CredentialCase):
+class _CredentialUpgradeCase(_CredentialCase):
+    def prepare_store(self):
+        chain = db.migrations.load()[:-1]
+        self.previous_schema = max(m.n for m in chain if m.phase != "contract")
+        with mock.patch.object(db.migrations, "load", return_value=chain), self.old_schema():
+            db.migrate()
+            self.owner = principals.seed_owner(self.LOGIN)
+
+    def old_schema(self):
+        return mock.patch.object(db, "NEEDED", self.previous_schema)
+
+    def upgrade(self):
+        db.migrate()
+        self.start_credentials()
+
+    def old_claim(self, key, route, body, **parameters):
+        return self.owner, key, route, idempotency.fingerprint("POST", route, parameters, body)
+
+
+class CredentialUpgradeWriteTests(_CredentialUpgradeCase):
     @credential_test
     def test_task_start_replays_the_pre_deploy_person_claim(self, _):
         key = "pre-deploy-task-start"
         body = {"repo": "fixture", "prompt": "Keep the original task", "title": "Original", "kind": "feat"}
-        sha = idempotency.fingerprint("POST", "/api/tasks", {}, body)
+        db.migrate()
         with principals.acting(self.owner):
             task = task_store.task_add(body["repo"], body["prompt"], body["title"], body["kind"],
-                                       claim=(self.owner, key, "/api/tasks", sha))
+                                       claim=self.old_claim(key, "/api/tasks", body))
             run = record.start("pipeline", repo=body["repo"], issue=task)
         command = ["task", "start", "--repo", "fixture", "--key", key, "--title", "Original", "--kind", "feat",
                    body["prompt"]]
         self.assertEqual(claims.lookup(self.owner, key)["status"], 0)
+        self.upgrade()
         with self.listen() as server, self.cli_environment(server):
             result = json.loads(self.cli(command))
         self.assertEqual((result["task"], result["run"]), (task, run))
@@ -3039,6 +3066,97 @@ class CredentialWriteTests(_CredentialCase):
         self.assertEqual([row["id"] for row in task_store.tasks()], [task])
         self.assertEqual([row["id"] for row in run_store.runs()], [run])
 
+    @credential_test
+    def test_versioned_and_alias_replays_keep_old_claims_and_scope(self, _):
+        key, alias_key = "pre-upgrade-task-add", "pre-upgrade-chat-drop"
+        body = {"repo": "fixture", "body": "Original", "title": "", "kind": "feat"}
+        db.migrate()
+        with principals.acting(self.owner):
+            answer = api.mutation("task.create", body, None)
+            task = answer["task"]["id"]
+            claims.complete(self.old_claim(key, self.TASKS, body), 200, api_http.json_bytes(answer), None)
+            chat_id = chats_store.chat_add("fixture")
+            alias = f"{chat_id}/drop"
+            dropped = chat.drop_draft(chat_id)
+            claims.complete(self.old_claim(alias_key, "/api/chats/*", {}, path=alias), 200,
+                            api_http.json_bytes(dropped), None)
+        self.upgrade()
+        with self.listen() as server:
+            with self.cli_environment(server, ARETE_IDEMPOTENCY_KEY=key):
+                self.assertEqual(self.cli(["task", "add", "--repo", "fixture", body["body"]]).strip(), task)
+            with mock.patch.object(chat, "drop_draft", side_effect=AssertionError("Re-executed chat drop")):
+                replay, headers = self.request(server, "POST", f"/api/chats/{alias}", bearer=self.owner_text, key=alias_key)
+                self.assertEqual((replay, headers["Idempotent-Replayed"]), (dropped, "true"))
+            cookie = self.pair(server)
+            limited = self.issue(server, cookie, scopes=("read",))["text"]
+            self.request(server, "POST", self.TASKS, bearer=limited, key=key, body=body, status=403, code="scope_missing")
+            self.request(server, "POST", self.TASKS, bearer=self.owner_text, key=key, body={**body, "body": "Changed"},
+                         status=422, code="idempotency_key_reused")
+            for path, other_body in ((f"{self.TASKS}/{task}/close", {}), (f"/api/chats/{alias}", {}),
+                                     ("/api/tasks", {"repo": "fixture", "prompt": "Do not start a task"})):
+                with self.subTest(path=path):
+                    self.request(server, "POST", path, bearer=self.owner_text, key=key, body=other_body,
+                                 status=422, code="idempotency_key_reused")
+            self.assertEqual(self.task_actors(), [self.owner])
+            self.assertEqual(task_store.task_get(task)["state"], "todo")
+            self.assertEqual(run_store.runs(), [])
+            issued = [self.issue(server, cookie) for _ in range(2)]
+            self.task(server, cookie=cookie, key="new-task-claim")
+            for token in issued:
+                self.task(server, bearer=token["text"], key="new-task-claim")
+        self.assertEqual(self.task_actors(), [self.owner, self.owner, *(f"client:{t['token']['id']}" for t in issued)])
+
+    @credential_test
+    def test_publication_replays_completed_chat_and_resumes_pending_approval(self, _):
+        chat_key, approval_key = "pre-upgrade-filing", "pre-upgrade-approval"
+        github = "fixture/repo"
+        key = "pre-upgrade-write"
+        with self.old_schema():
+            claims.complete(self.old_claim(key, self.TASKS, {}), 200, b"{}", None)
+        db.migrate()
+        with principals.acting(self.owner):
+            chat_id = chats_store.chat_add("fixture")
+            chats_store.chat_say(chat_id, "arete", "Drafted", draft_title="Draft", draft_body="An issue")
+            draft = chat.draft_fingerprint(chat.chat_row(chat_id))
+            publication = idempotency.Publication(self.old_claim(chat_key, "/api/chats/{n}/file", {"draft": draft},
+                                                                n=str(chat_id)), None)
+            with mock.patch.object(gh, "find_issue_marker", return_value=gh.issue_url(github, 1)):
+                filed = chat.file_draft(chat_id, publication, draft=draft)
+            publication.complete(api_http.json_bytes(filed))
+            item = {"repo": "fixture", "title": "Approve delivery", "body": "An issue", "labels": []}
+            approval = approvals_store.add_approval("fixture", "", {"type": "ticket", "item": item}, "File it")
+            context = self.old_claim(approval_key, "/api/approvals/{id}", {"approve": True}, id=str(approval))
+            pending = idempotency.Publication(context, None)
+            claim = approvals_store.claim_approval(approval, util.iso(util.now() + timedelta(minutes=2)))
+            pending.remember({"token": claim, "repo": github, "send_started": True})
+            self.assertTrue(approvals_store.bind_publication(approval, claim, pending.marker))
+        self.upgrade()
+        url = gh.issue_url(github, 2)
+        with (self.listen() as server, mock.patch.object(gh, "find_issue_marker", return_value=url) as lookup,
+              mock.patch.object(gh, "issue_create", side_effect=AssertionError("Duplicate publication"))):
+            with (mock.patch.object(chat, "file_draft") as file_draft, mock.patch.object(control, "decide") as decide,
+                  mock.patch.object(dashboard.Handler, "send_ticket") as send_ticket):
+                for path, body in ((f"/api/chats/{chat_id}/file", {"draft": draft}),
+                                   (f"/api/approvals/{approval}", {"approve": True}), ("/api/triage/7/send", {})):
+                    self.request(server, "POST", path, body=body, bearer=self.owner_text, key=key,
+                                 status=422, code="idempotency_key_reused")
+                for action in (file_draft, decide, send_ticket):
+                    action.assert_not_called()
+            replay, headers = self.request(server, "POST", f"/api/chats/{chat_id}/file", body={"draft": draft},
+                                           bearer=self.owner_text, key=chat_key)
+            self.assertEqual((replay, headers["Idempotent-Replayed"]), (filed, "true"))
+            lookup.assert_not_called()
+            with self.cli_environment(server, ARETE_IDEMPOTENCY_KEY=approval_key):
+                self.assertEqual(json.loads(self.cli(["approve", str(approval)]))["result"], url)
+            lookup.assert_called_once_with(github, pending.marker)
+        saved = claims.lookup(self.owner, approval_key)
+        self.assertEqual(saved["status"], 200)
+        with db.reader() as c:
+            row = c.execute("SELECT actor, kind FROM events_log WHERE seq = ?", (saved["last_seq"],)).fetchone()
+        self.assertEqual(tuple(row), (f"client:{self.owner_text.split('_', 3)[2]}", "publication.sent"))
+
+
+class CredentialWriteTests(_CredentialCase):
     @credential_test
     def test_scopes_and_client_actor(self, _):
         with self.listen() as server:
@@ -3062,19 +3180,62 @@ class CredentialWriteTests(_CredentialCase):
             self.task(server, bearer=issued["text"], status=401)
 
 
+class CredentialUpgradeServiceTests(_CredentialUpgradeCase):
+    @credential_test
+    def test_existing_service_without_xdg_state_home_keeps_cli_writes(self, _):
+        root = Path.cwd()
+        env = api_check.isolated_env(root)
+        env.pop("XDG_STATE_HOME")
+        start = "from arete.store import db, tokens; db.migrate(); tokens.init_owner()"
+        subprocess.run(api_check.child_command(api_check.SOURCE, start), cwd=root, env=env, check=True,
+                       capture_output=True, timeout=CHILD_HANG_TIMEOUT)
+        tag = db.schema_metadata()["instance_tag"]
+        fallback = credential_files.client_path(tag, paths.DEFAULT_TOKEN_CLIENT_DIR)
+        self.assertEqual(fallback.stat().st_mode & 0o777, 0o600)
+        self.assertFalse(credential_files.client_path(tag).exists())
+        with self.listen(secure=False) as server:
+            name = "arete-fixture.invalid"
+            server.node = replace(server.node, name=name, names=server.node.names | {name})
+            with mock.patch.object(paths, "TOKEN_CLIENT_DIR", fallback.parent):
+                tailnet.record_server(server.node, server.server_port, tailnet.Front("http", [server]))
+            endpoint = os.environ[client.ENV]
+            with mock.patch.dict(os.environ, {client.ENV: f"http://{name}:{server.server_port}"}):
+                self.cli(["task", "add", "--repo", "fixture", "Explicit server"])
+            del os.environ[client.ENV]
+            self.cli(["task", "add", "--repo", "fixture", "Local discovery"])
+            with paths.CONFIG_FILE.open("a") as config_file:
+                config_file.write(f'\n[server]\nurl = "{endpoint}"\n')
+            self.cli(["task", "add", "--repo", "fixture", "Configured server"])
+            with self.listen(secure=False):
+                other = client.server()
+                self.assertEqual(other.instance, db.schema_metadata()["instance_id"])
+                self.assertNotIn("Authorization", client.headers_for(other))
+                with self.assertRaises(client.Failed) as error:
+                    client.request("POST", self.TASKS, {"repo": "fixture", "body": "Other endpoint"},
+                                   key="unverified-endpoint", where=other)
+                self.assertEqual(error.exception.code, 401)
+            self.cli(["logout"])
+            self.assertFalse(fallback.exists())
+        actors = self.task_actors()
+        self.assertEqual(len(actors), 3)
+        self.assertTrue(actors[0].startswith("client:"))
+        self.assertEqual(actors, [actors[0]] * 3)
+
+
 class CredentialPairingTests(_CredentialCase):
     @credential_test
     def test_session_csrf_origin_and_presence(self, _):
         with self.listen() as server:
-            code = self.code(server)
-            cookie = self.claim(server, code, key="claim-replay")
-            self.assertEqual(self.claim(server, code, key="claim-replay"), cookie)
+            cookie = self.pair(server)
             self.task(server, cookie=cookie)
             self.task(server, cookie=cookie, headers={"X-Arete": ""}, status=403, code="csrf")
             for headers in ({"Origin": "https://elsewhere.example"}, {"Sec-Fetch-Site": "cross-site"}):
                 self.task(server, cookie=cookie, headers=headers, status=403, code="bad_origin")
-            answer, _ = self.request(server, "POST", self.PAIRINGS, bearer=self.owner_text, status=403)
-            self.assertEqual(answer["reason"], "presence_required")
+            for bearer in (None, self.owner_text):
+                answer, _ = self.request(server, "POST", self.PAIRINGS, bearer=bearer, status=403, code="forbidden")
+                self.assertEqual(answer["reason"], "presence_required")
+                self.assertEqual(self.logins.credentials.pairings, {})
+            self.request(server, "POST", self.PAIRINGS, cookie=cookie, status=201)
             self.assertRegex(self.owner, r"^u:[0-9a-f]{8}$")
             self.assertEqual(self.task_actors(), [self.owner])
             _, headers = self.request(server, "POST", "/api/v1/auth/logout", cookie=cookie)
@@ -3097,6 +3258,81 @@ class CredentialPairingTests(_CredentialCase):
                 row = c.execute("SELECT expires, last_used_at FROM tokens WHERE id = ?", (session["id"],)).fetchone()
             self.assertGreater(row["expires"], util.iso(expiry))
             self.assertEqual(row["last_used_at"], util.iso(expiry + timedelta(seconds=1)))
+
+    @credential_test
+    def test_logout_key_applies_to_each_session(self, _):
+        with self.listen() as server:
+            first = self.pair(server)
+            pairing, _ = self.request(server, "POST", self.PAIRINGS, cookie=first, status=201)
+            second = self.claim(server, pairing["code"], cookie=first)
+            logout = "/api/v1/auth/logout"
+            key = "shared-logout"
+            for cookie in (first, second):
+                self.request(server, "GET", self.TASKS, cookie=cookie)
+                result, headers = self.request(server, "POST", logout, cookie=cookie, key=key)
+                self.assertTrue(result["ended"])
+                self.assertIn("Max-Age=0", headers["Set-Cookie"])
+                self.assertIsNone(headers["Idempotent-Replayed"])
+                self.request(server, "GET", self.TASKS, cookie=cookie, status=401, code="unauthenticated")
+
+
+class CredentialClaimTests(_CredentialCase):
+    @credential_test
+    def test_claim_replay_requires_a_live_cookie_receipt(self, _):
+        with self.listen() as server:
+            code = self.code(server)
+            key = "claim-replay"
+            cookie = self.claim(server, code, key=key)
+            self.assertEqual(self.claim(server, code, key=key), cookie)
+            receipts = self.logins.credentials.claimed
+            identity, = receipts
+            deadline, text = receipts.pop(identity)
+            wrong = "000001" if code == "000000" else "000000"
+            for state, receipt in (("missing", None), ("expired", (0, text)), ("revoked", (deadline, text))):
+                with self.subTest(receipt_state=state):
+                    if receipt is not None:
+                        receipts[identity] = receipt
+                    if state == "revoked":
+                        self.request(server, "POST", "/api/v1/auth/logout", cookie=cookie)
+                    result, headers = self.request(server, "POST", self.PAIRINGS + "/claim", body={"code": code},
+                                                   key=key, status=409, code="conflict")
+                    self.assertEqual(result["reason"], "pairing_claimed")
+                    self.assertIsNone(headers["Set-Cookie"])
+                    _, headers = self.request(server, "POST", self.PAIRINGS + "/claim", body={"code": wrong},
+                                              key=key, status=422, code="idempotency_key_reused")
+                    self.assertIsNone(headers["Set-Cookie"])
+
+    @credential_test
+    def test_database_only_restore_replays_consumed_claim_without_cookie(self, _):
+        claim = self.PAIRINGS + "/claim"
+        key = "restored-claim"
+        with self.listen() as server:
+            code = self.code(server)
+            self.claim(server, code, key=key)
+            wrong = "000001" if code == "000000" else "000000"
+            _, headers = self.request(server, "POST", claim, body={"code": wrong}, key=key,
+                                      status=422, code="idempotency_key_reused")
+            self.assertIsNone(headers["Set-Cookie"])
+            snapshot = backup.snapshot("pairing-claim-test")
+        for original_key_available in (True, False):
+            if not original_key_available:
+                credential_files.key_path(self.meta["token_key_ref"]).unlink()
+            backup.restore(snapshot)
+            with self.listen() as server:
+                status, problem = (422, "idempotency_key_reused") if original_key_available else (409, "conflict")
+                _, headers = self.request(server, "POST", claim, body={"code": wrong}, key=key,
+                                          status=status, code=problem)
+                self.assertIsNone(headers["Set-Cookie"])
+                answer, headers = self.request(server, "POST", claim, body={"code": code}, key=key,
+                                               status=409, code="conflict")
+                self.assertEqual(answer.get("reason"), "pairing_claimed")
+                self.assertIsNone(headers["Set-Cookie"])
+                self.assertNotIn(json.dumps(code), json.dumps(answer))
+        row = claims.lookup(self.owner, key)
+        self.assertEqual(row["status"], 201)
+        self.assertNotIn(json.dumps(code).encode(), row["response"])
+        self.assertNotEqual(row["request_sha"].rsplit(":", 1)[-1],
+                            idempotency.fingerprint("POST", claim, {}, {"code": code}))
 
 
 class CredentialAdmissionTests(_CredentialCase):
@@ -3166,6 +3402,31 @@ class CredentialRotationTests(_CredentialCase):
             durable = [r[0] for r in c.execute("SELECT data FROM events_log WHERE kind = 'token.changed'")]
         self.assertTrue(durable)
         self.assertTrue(all(secret not in data for secret in secrets for data in durable))
+
+
+class CredentialRevocationTests(_CredentialCase):
+    @credential_test
+    def test_revocation_persists_pending_last_use(self, _):
+        with self.listen() as server:
+            cookie = self.pair(server)
+            session = token_store.resolve(cookie.split("=", 1)[1]).id
+            first, second = (self.issue(server, cookie) for _ in range(2))
+            first_id, second_id = (issued["token"]["id"] for issued in (first, second))
+            used_at = util.now()
+            with (mock.patch.object(util, "now", return_value=used_at),
+                  mock.patch.object(self.logins, "node_key", return_value="audit-node")):
+                for issued in (first, second):
+                    self.request(server, "GET", self.TASKS, bearer=issued["text"])
+                self.request(server, "POST", f"{self.TOKENS}/{first_id}/revoke", cookie=cookie)
+                self.request(server, "POST", f"/api/v1/principals/client:{second_id}/revoke", cookie=cookie)
+                self.request(server, "POST", "/api/v1/auth/logout", cookie=cookie)
+        for flush in (False, True):
+            if flush:
+                token_store.maintain()
+            with db.reader() as c:
+                for identity in (first_id, second_id, session):
+                    row = c.execute("SELECT last_used_at, last_used_node FROM tokens WHERE id = ?", (identity,)).fetchone()
+                    self.assertEqual(tuple(row), (util.iso(used_at), "audit-node"), identity)
 
 
 class CredentialRestoreTests(_CredentialCase):

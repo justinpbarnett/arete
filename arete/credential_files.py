@@ -42,14 +42,14 @@ def read_key(ref):
     return key
 
 
-def client_path(tag):
+def client_path(tag, directory=None):
     if not TAG.fullmatch(tag):
         raise ValueError("Invalid Arete instance tag")
-    return paths.TOKEN_CLIENT_DIR / f"{tag}.token"
+    return (directory or paths.TOKEN_CLIENT_DIR) / f"{tag}.token"
 
 
-def read_client(tag):
-    path = client_path(tag)
+def read_client(tag, directory=None):
+    path = client_path(tag, directory)
     try:
         value = read_private(path, 256)
         return value.decode("ascii").strip() if value else None
@@ -74,8 +74,8 @@ def client_lock(path):
         yield
 
 
-def forget_client(tag, text):
-    path = client_path(tag)
+def forget_client(tag, text, directory=None):
+    path = client_path(tag, directory)
     with client_lock(path):
-        if read_client(tag) == text:
+        if read_client(tag, directory) == text:
             path.unlink(missing_ok=True)

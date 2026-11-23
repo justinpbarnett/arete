@@ -2,6 +2,13 @@ PHASE = "expand"
 
 SQL = """
 INSERT INTO schema_meta VALUES ('token_key_ref', ''), ('token_generation', '0');
+ALTER TABLE idempotency ADD COLUMN legacy_person INTEGER NOT NULL DEFAULT 0;
+UPDATE idempotency SET legacy_person = 1 WHERE actor GLOB 'u:*';
+CREATE TRIGGER idempotency_legacy_person AFTER INSERT ON idempotency
+WHEN NEW.actor GLOB 'u:*' AND (SELECT value FROM schema_meta WHERE key = 'token_key_ref') = ''
+BEGIN
+    UPDATE idempotency SET legacy_person = 1 WHERE actor = NEW.actor AND key = NEW.key;
+END;
 CREATE TABLE tokens (
     id TEXT PRIMARY KEY,
     principal TEXT NOT NULL REFERENCES principals(id),

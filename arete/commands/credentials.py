@@ -24,7 +24,7 @@ def cmd_login(args) -> None:
 
 def cmd_logout(args) -> None:
     where = client.server()
-    text = client.stored_token(where)
+    text, directory = client.stored_credential(where)
     if not text:
         print("No stored token for this Arete instance.")
         return
@@ -37,7 +37,7 @@ def cmd_logout(args) -> None:
         if e.code != 401 or client.reason(e.answer) not in ("unauthenticated", "token_rotated", "token_expired"):
             raise
     try:
-        credential_files.forget_client(where.tag, text)
+        credential_files.forget_client(where.tag, text, directory)
     except OSError as e:
         raise client.Failed({"error": f"cannot remove the stored token: {e}"}) from None
     print(f"Logged out of {client.address(where)}.")

@@ -236,9 +236,18 @@ def rotate(identity, person, grace_seconds):
                       spend_cap_nusd=row["spend_cap_nusd"], rotated_from=identity)
 
 
+def flush_uses(c, pending, where="1", params=()):
+    ref = db.metadata(c)["token_key_ref"]
+    c.executemany(f"UPDATE tokens SET last_used_at = ?, last_used_node = ? "
+                  f"WHERE id = ? AND revoked_at IS NULL AND ({where}) AND (last_used_at IS NULL OR last_used_at <= ?)",
+                  ((at, node, identity, *params, at) for (key, identity), (at, node) in pending.items() if key == ref))
+
+
 def mark_revoked(c, reason, where="1", params=()):
-    rows = c.execute(f"UPDATE tokens SET revoked_at = ?, revoke_reason = ?, version = version + 1 "
-                     f"WHERE revoked_at IS NULL AND ({where}) RETURNING *", (util.iso(), reason, *params)).fetchall()
+    with USE_LOCK:
+        flush_uses(c, PENDING_USES, where, params)
+        rows = c.execute(f"UPDATE tokens SET revoked_at = ?, revoke_reason = ?, version = version + 1 "
+                         f"WHERE revoked_at IS NULL AND ({where}) RETURNING *", (util.iso(), reason, *params)).fetchall()
     for row in rows:
         changed(c, row, "expiry" if reason == "expired" else "revoke")
     if rows:
@@ -313,18 +322,12 @@ def note_use(credential, peer):
 
 
 def maintain():
-    with USE_LOCK:
-        pending = dict(PENDING_USES)
-        PENDING_USES.clear()
-    try:
-        with principals.acting("hand"), db.tx() as c:
-            ref = db.metadata(c)["token_key_ref"]
-            c.executemany("UPDATE tokens SET last_used_at = ?, last_used_node = ? "
-                          "WHERE id = ? AND revoked_at IS NULL AND (last_used_at IS NULL OR last_used_at < ?)",
-                          ((at, node, identity, at) for (key, identity), (at, node) in pending.items() if key == ref))
-            mark_revoked(c, "expired", "expires <= ?", (util.iso(),))
-    except Exception:
+    with principals.acting("hand"), db.tx() as c:
         with USE_LOCK:
-            for identity, used in pending.items():
-                PENDING_USES.setdefault(identity, used)
-        raise
+            pending = PENDING_USES.copy()
+        flush_uses(c, pending)
+        mark_revoked(c, "expired", "expires <= ?", (util.iso(),))
+    with USE_LOCK:
+        for identity, used in pending.items():
+            if PENDING_USES.get(identity) is used:
+                del PENDING_USES[identity]

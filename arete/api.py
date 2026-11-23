@@ -230,6 +230,8 @@ def dispatch(handler, op, path_values, query):
                                           status=op["success_status"], redact=name in ("token.issue", "token.rotate"))
             if name == "pairing.claim":
                 credential_http.finish_pairing_claim(handler)
+            elif name == "session.end":
+                handler.set_cookie = credential_http.session_cookie("", 0)
             return result
         return execute(name, values, handler)
     except refusals.Refusal as error:

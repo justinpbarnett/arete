@@ -12,10 +12,12 @@ from datetime import UTC, timedelta
 from decimal import Decimal
 from urllib.parse import unquote, urlsplit
 
-from . import api_http, contract, idempotency, principals, util
+from . import api_http, contract, credential_files, idempotency, principals, util
 from .store import db, events, tokens
+from .store import idempotency as claims
 
 COOKIE = "__Host-arete_session"
+PAIRING_CLAIM_ROUTE = "/api/v1/auth/pairings/claim"
 TLS_OPERATIONS = {"token.issue", "token.rotate", "pairing.claim"}
 PRESENCE = {"token.issue", "token.rotate"}
 WRITES = ("POST", "PATCH", "DELETE")
@@ -239,6 +241,10 @@ def authorize(handler, op, name, write, secure, peer):
             logins = handler.server.logins
             logins.credentials.issue(logins.node_key(peer))
         require_presence(credential)
+    if name == "pairing.start" and (credential is None or credential.kind != "session"):
+        with db.reader() as c:
+            if tokens.live_session(c):
+                require_presence(credential)
     if write and credential is None:
         if handler.headers.get_all("X-Arete", []) == ["1"]:
             message = ("Pair this browser using ‘arete pair’ or Pair a device in a paired browser." if secure else
@@ -288,7 +294,6 @@ def write_operation(name, values, handler):
     person = handler.person
     if name == "session.end":
         tokens.end_session(handler.credential.id)
-        handler.set_cookie = session_cookie("", 0)
         return {"ended": True}
     if name == "principal.revoke":
         principal = values["principal"]
@@ -329,7 +334,40 @@ def issue_or_rotate(name, person, values):
         raise contract.Problem("invalid_input", "Grace period is too large.") from None
 
 
-def finish_pairing_claim(handler):
+def pairing_claim_fingerprint(body, ref):
+    secret = credential_files.read_key(ref)
+    proof = tokens.digest(secret, api_http.json_bytes(body).decode())
+    sha = idempotency.fingerprint("POST", PAIRING_CLAIM_ROUTE, {}, {"proof": proof})
+    return f"{ref}:{sha}"
+
+
+def pairing_claimed():
+    return contract.Problem("conflict", "This pairing was already claimed. Start a new pairing.", reason="pairing_claimed")
+
+
+def matching_pairing_claim(context, body):
+    row = claims.lookup(*context[:2])
+    if row is None:
+        return None
+    if row["route"] == PAIRING_CLAIM_ROUTE:
+        saved = row["request_sha"]
+        ref, _, sha = saved.rpartition(":")
+        current_ref, _, current_sha = context[3].rpartition(":")
+        if ref and ref != current_ref:
+            try:
+                current_sha = pairing_claim_fingerprint(body, ref).rpartition(":")[2]
+            except OSError:
+                if row["status"] == 201:
+                    raise pairing_claimed() from None
+                raise idempotency.Reused("This key was used with different content") from None
+        if hmac.compare_digest(sha, current_sha):
+            return row
+        if not ref and row["status"] == 201:
+            raise pairing_claimed()
+    raise idempotency.Reused("This key was used with different content")
+
+
+def pairing_claim_session(handler):
     ref = db.schema_metadata()["token_key_ref"]
     traffic = handler.server.logins.credentials
     text = traffic.claim_receipt(handler.person, handler.headers["Idempotency-Key"], ref, None)
@@ -337,8 +375,14 @@ def finish_pairing_claim(handler):
         try:
             tokens.resolve(text, kinds=("session",))
         except tokens.InvalidCredential:
-            return
-        handler.set_cookie = session_cookie(text, tokens.SESSION_SECONDS)
+            pass
+        else:
+            return text
+    raise pairing_claimed()
+
+
+def finish_pairing_claim(handler):
+    handler.set_cookie = session_cookie(pairing_claim_session(handler), tokens.SESSION_SECONDS)
 
 
 def start_pairing(handler):

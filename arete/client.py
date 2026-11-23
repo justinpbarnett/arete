@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from email.utils import parsedate_to_datetime
+from ipaddress import ip_address
 from urllib.parse import quote, urlencode, urlsplit
 
 from . import config, credential_files, paths, run_lines, util
@@ -76,6 +77,8 @@ class Server:
     port: int
     name: str
     instance: str = ""
+    default_token_dir: bool = False
+    local_address: str = ""
 
     @property
     def tag(self) -> str:
@@ -176,6 +179,10 @@ def configured_server() -> Server | None:
 def discover() -> Server:
     if configured := configured_server():
         return configured
+    return local_server()[0]
+
+
+def local_server() -> tuple[Server, dict]:
     found, mine = util.read_json(paths.SERVER_FILE, None), paths.state_and_config()
     default = f"http://127.0.0.1:{config.discovery_port()}"
     addresses = found.get("addresses") if isinstance(found, dict) else None
@@ -193,7 +200,26 @@ def discover() -> Server:
         raise Down(address(where), "the server process has ended")
     if {k: found.get(k) for k in mine} != mine:
         raise Down(address(where), "server.json names a different state or config")
-    return where
+    return where, found
+
+
+def local_credential_endpoint(where):
+    if paths.ISOLATED or paths.TOKEN_CLIENT_DIR in (paths.STATE_DIR / "client", paths.DEFAULT_TOKEN_CLIENT_DIR):
+        return where, None
+    try:
+        local, record = local_server()
+        instance = record.get("instance")
+        names = set(record["addresses"])
+        if isinstance(local.name, str):
+            names.update((local.name, local.name.split(".")[0]))
+        if (record.get("default_token_dir") is True and isinstance(instance, str) and INSTANCE_ID.fullmatch(instance)
+                and where.port == local.port and (where.scheme == local.scheme or where.scheme == "http")
+                and where.host.rstrip(".") in names):
+            host = where.host if where.host in record["addresses"] else local.host
+            return replace(where, local_address=str(ip_address(host))), (local.scheme, instance)
+    except (Down, OSError, ValueError, OverflowError):
+        pass
+    return where, None
 
 
 def check_instance(where, instance):
@@ -258,11 +284,12 @@ def server(deadline=None, *, where=None) -> Server:
     current = _invocation.get()
     if current is not None and current.server is not None:
         return current.server
-    where = where or discover()
+    where, local = local_credential_endpoint(where or discover())
     resp = request("GET", META, read_seconds=CONNECT_SECONDS, where=where, buffered=True, deadline=deadline)
     instance = instance_of(resp)
     check_instance(where, instance)
-    where = replace(resp.arete_server, instance=instance)
+    where = resp.arete_server
+    where = replace(where, instance=instance, default_token_dir=local == (where.scheme, instance))
     if current is not None:
         current.server = where
     return where
@@ -315,24 +342,36 @@ def upload_hooks_before_write():
         upload_hook_events()
 
 
-def stored_token(where):
+def stored_credential(where):
+    directory = paths.TOKEN_CLIENT_DIR
+    if not where.tag:
+        return None, directory
     try:
-        text = credential_files.read_client(where.tag) if where.tag else None
+        text = credential_files.read_client(where.tag, directory)
+        if (not text and where.default_token_dir and where.local_address and not paths.ISOLATED
+                and directory not in (paths.STATE_DIR / "client", paths.DEFAULT_TOKEN_CLIENT_DIR)):
+            directory = paths.DEFAULT_TOKEN_CLIENT_DIR
+            text = credential_files.read_client(where.tag, directory)
     except OSError as e:
         raise Failed({"error": f"cannot read the stored token: {e}"}) from None
     if text:
         parts = credential_files.CLIENT_TEXT.fullmatch(text)
         if not parts or parts[1] != where.tag:
             raise Failed({"error": "the stored token does not match this Arete instance"})
-    return text
+    return text, directory
+
+
+def stored_token(where):
+    return stored_credential(where)[0]
 
 
 def headers_for(where: Server, *, token=None) -> dict[str, str]:
     headers = {"X-Arete-Client": f"cli/1.{MINOR}"}
     if token := (stored_token(where) if token is None else token):
         headers["Authorization"] = f"Bearer {token}"
-    if where.scheme == "http" and where.name != where.host:
-        headers["Host"] = f"{where.name}:{where.port}"
+    if where.scheme == "http" and where.name != (where.local_address or where.host):
+        host = f"[{where.name}]" if ":" in where.name else where.name
+        headers["Host"] = f"{host}:{where.port}"
     return headers
 
 
@@ -341,8 +380,9 @@ def address(where: Server) -> str:
 
 
 def connect(where: Server, seconds: float = CONNECT_SECONDS) -> http.client.HTTPConnection:
-    conn = util.NamedTlsConnection(where.host, where.port, where.name, seconds) if where.scheme == "https" \
-        else http.client.HTTPConnection(where.host, where.port, timeout=seconds)
+    host = where.local_address or where.host
+    conn = util.NamedTlsConnection(host, where.port, where.name, seconds) if where.scheme == "https" \
+        else http.client.HTTPConnection(host, where.port, timeout=seconds)
     try:
         conn.connect()
     except ssl.SSLError as e:

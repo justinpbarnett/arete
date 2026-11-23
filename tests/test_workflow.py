@@ -8099,28 +8099,32 @@ class CredentialConfinementTests(unittest.TestCase):
         self.workspace = root / "work"
         local_client = self.workspace / "local/arete-client"
         self.live = local_client.with_name("arete") / "client" / "live.token"
+        self.default = self.workspace / "default/arete/client/live.token"
         state = self.workspace / ".arete-sandbox/state"
         state.mkdir(parents=True)
         self.enterContext(mock.patch.multiple(paths, CLIENT_DIR=local_client, TOKEN_CLIENT_DIR=state / "client",
+                                             DEFAULT_TOKEN_CLIENT_DIR=self.default.parent,
                                              WORKTREES_DIR=root, STATE_DIR=state, SERVER_FILE=state / "server.json"))
 
     def test_pi_shell_cannot_read_or_write_live_client_tokens(self):
         from arete import pi_shell
 
-        self.live.parent.mkdir(parents=True)
-        self.live.write_text("live fixture")
+        for token in (self.live, self.default):
+            token.parent.mkdir(parents=True)
+            token.write_text("live fixture")
         (self.workspace / "control").write_text("control")
         until = time.monotonic() + 4
         shell = pi_shell.Shell(self.workspace, (), guard.Floor((), (), ()), ("Bash",), (), {}, (), False, until)
         with mock.patch.object(pi_shell, "runtime_roots", return_value=()):
             profile = shell.profile(threading.Event(), until)
-        live = shlex.quote(str(self.live))
-        for operation in (f"cat {live}", f"printf changed > {live}"):
-            result = subprocess.run([*profile, "/bin/sh", "-c", f"cat control && ( {operation} )"],
-                                    cwd=self.workspace, capture_output=True, text=True, timeout=3)
-            self.assertEqual(result.stdout, "control", result.stderr)
-            self.assertNotEqual(result.returncode, 0, result.stdout)
-        self.assertEqual(self.live.read_text(), "live fixture")
+        for token in (self.live, self.default):
+            live = shlex.quote(str(token))
+            for operation in (f"cat {live}", f"printf changed > {live}"):
+                result = subprocess.run([*profile, "/bin/sh", "-c", f"cat control && ( {operation} )"],
+                                        cwd=self.workspace, capture_output=True, text=True, timeout=3)
+                self.assertEqual(result.stdout, "control", result.stderr)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertEqual(token.read_text(), "live fixture")
 
     def test_verifier_service_can_replace_scratch_client_tokens(self):
         from arete import scratch

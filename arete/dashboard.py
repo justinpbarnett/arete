@@ -10,6 +10,7 @@ import time
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+from functools import partial
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from io import BytesIO
@@ -27,7 +28,6 @@ from . import (
     config,
     contract,
     control,
-    credential_files,
     credential_http,
     devices,
     event_stream,
@@ -279,6 +279,17 @@ def fault_body(fault: verify_faults.Fault, path: str, query: dict[str, str]) -> 
     return api_http.json_bytes(api_http.problem(fault.status, answer))
 
 
+def write_claim(handler, key, sha, route):
+    credential = handler.credential
+    actor = principals.current()
+    if route == "/api/v1/auth/logout":
+        actor = f"session:{credential.id}"
+    person = credential.principal if credential and credential.kind == "token" else None
+    match = (partial(credential_http.matching_pairing_claim, body=handler.body())
+             if route == credential_http.PAIRING_CLAIM_ROUTE else idempotency.matching_claim)
+    return idempotency.owning_write(actor, key, sha, route, legacy_person=person, match=match)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "arete"
     sys_version = ""
@@ -504,16 +515,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def keyed_start(self):
         body = self.body()
-        sha = idempotency.fingerprint("POST", "/api/tasks", {}, body)
-        actor = principals.current()
+        route = "/api/tasks"
+        sha = idempotency.fingerprint("POST", route, {}, body)
         key = self.headers["Idempotency-Key"]
-        if actor.startswith("client:") and not claims.lookup(actor, key):
-            person = self.credential.principal
-            previous = claims.lookup(person, key)
-            if previous and previous["route"] == "/api/tasks":
-                actor = person
-        with idempotency.owning(actor, key, sha) as context:
-            row = idempotency.matching_claim(context)
+        with write_claim(self, key, sha, route) as (context, row):
             if row and row["status"]:
                 self.write_receipt = claims.receipt(row["last_seq"])
                 self.idempotent_replayed = True
@@ -546,8 +551,7 @@ class Handler(BaseHTTPRequestHandler):
         if "Idempotency-Key" not in self.headers:
             return action()
         sha = idempotency.fingerprint("POST", route, parameters, self.body())
-        with idempotency.owning(principals.current(), self.headers["Idempotency-Key"], sha, route) as context:
-            row = idempotency.matching_claim(context)
+        with write_claim(self, self.headers["Idempotency-Key"], sha, route) as (context, row):
             if row and row["status"]:
                 self.idempotent_replayed = True
             else:
@@ -561,12 +565,10 @@ class Handler(BaseHTTPRequestHandler):
         if key is None:
             return action()
         body = self.body()
-        if route == "/api/v1/auth/pairings/claim":
-            secret = credential_files.read_key(foundation.schema_metadata()["token_key_ref"])
-            body = {"proof": tokens.digest(secret, api_http.json_bytes(body).decode())}
-        sha = idempotency.fingerprint(method, route, parameters, body)
-        with idempotency.owning(principals.current(), key, sha, route) as context:
-            row = idempotency.matching_claim(context)
+        pairing = route == credential_http.PAIRING_CLAIM_ROUTE
+        sha = (credential_http.pairing_claim_fingerprint(body, foundation.schema_metadata()["token_key_ref"])
+               if pairing else idempotency.fingerprint(method, route, parameters, body))
+        with write_claim(self, key, sha, route) as (context, row):
             if row and row["status"]:
                 self.idempotent_replayed = True
                 result = json.loads(row["response"])

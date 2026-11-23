@@ -56,11 +56,26 @@ def owning(actor, key, sha, route="/api/tasks"):
             ACTIVE.pop(identity, None)
 
 
-def matching_claim(context):
+def matching_claim(context, *, legacy=False):
     row = claims.lookup(*context[:2])
+    if legacy and (not row or not row["legacy_person"]):
+        return None
     if row and (row["route"], row["request_sha"]) != context[2:]:
         raise Reused("This key was used with different content")
     return row
+
+
+@contextmanager
+def owning_write(actor, key, sha, route, *, legacy_person=None, match=matching_claim):
+    with owning(actor, key, sha, route) as context:
+        row = match(context)
+        if (row is None and legacy_person and (previous := claims.lookup(legacy_person, key))
+                and previous["legacy_person"]):
+            with owning(legacy_person, key, sha, route) as legacy:
+                if row := matching_claim(legacy, legacy=True):
+                    yield legacy, row
+                    return
+        yield context, row
 
 
 class Publication:
