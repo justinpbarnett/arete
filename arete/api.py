@@ -130,7 +130,9 @@ def event_timestamp(value, field):
 def execute(name, values, handler=None):
     prepare(name, values)
     if name == "usage.record":
-        return provider(handler, "post_usage", "", {})
+        from . import dashboard
+
+        return dashboard.record_usage(handler, values)
     with foundation.one_read() as conn:
         seq = events.metadata(conn)["head"]
         result = read(name, values, handler)
@@ -222,9 +224,7 @@ def dispatch(handler, op, path_values, query):
     try:
         if write:
             prepare(name, values)
-            result = handler.keyed_action(method, op["path"], path_values, lambda: mutation(name, values, handler),
-                                          atomic=name not in ("run.stop", "serve.install"),
-                                          status=op["success_status"], redact=name in ("token.issue", "token.rotate"))
+            result = command(handler, op, values, path_values)
             if name == "pairing.claim":
                 credential_http.finish_pairing_claim(handler)
             elif name == "session.end":
@@ -235,6 +235,14 @@ def dispatch(handler, op, path_values, query):
         if not getattr(error, "code", None) and error.status in (400, 404):
             raise contract.Problem("not_found" if error.status == 404 else "invalid_input", str(error)) from error
         raise
+
+
+def command(handler, op, values, path_values, *, claim=None):
+    name = op["name"]
+    action = execute if name == "usage.record" else mutation
+    return handler.keyed_action(op["method"], op["path"], path_values, lambda: action(name, values, handler),
+                                atomic=name not in ("run.stop", "serve.install"), status=op["success_status"],
+                                redact=name in ("token.issue", "token.rotate"), claim=claim)
 
 
 def mutation(name, values, handler):
